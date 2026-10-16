@@ -1,5 +1,32 @@
 # Canon rule C35 allowlist: reviewed narrowing casts in the XMR lane
-# consensus core. Format: <path> <max count> <reason>. A cast is listed only
-# with its proof (static_assert, documented bound or explicit refusal) and the
-# extreme-value KAT that pins it. Empty at the baseline of 2026-10-04; the
-# casts counted then are recorded as deviation D15.
+# consensus core (scope xmr_consensus_core). Format: <path> <max count> <reason>.
+# A cast is listed only with its proof (static_assert, documented bound or
+# explicit refusal) and the KAT that pins it. The pattern also counts widening
+# casts and C-style casts; those are listed with what they are.
+#
+# Reviewed 2026-10-16 on pathb/s4w-bc-4 (from d22b8d1f6).
+
+src/impl/xmr/pathb/pathb_wide.hpp 7 limb arithmetic: each u64 takes the low limb of a u128 sum or product and the high part goes to the next limb (exact); bp scaling x * bp / 10000 <= x for bp <= 10000; xmr_wide_int_extreme_kat
+src/impl/xmr/pathb/pathb_emission.hpp 10 out_size: base + a varint length (<= 10) in u32; n_rule: num / den <= Z / 2 (u64) and its half form takes z / 2 and OVH (< 2^63) as i64; fee_per_byte: reward * ref / median^2 <= reward, its one caller (f_spend) passes median >= zone(hf) >= ref; f_spend: 659 x fee_per_byte rounded up to 10^4 stays below 2^64, so its u64 clamp is unreachable; all-ones u64 constants; v37_xmr_base_reward_kat, v37_xmr_coinbase_reserve_kat, xmr_wide_int_extreme_kat (N(B) at Z = 2^32 - 1)
+src/impl/xmr/pathb/pathb_block_reward.hpp 1 reward_for_child: r = base x ((2 x median - w) x w) / median / median <= base (the multiplicand <= median^2), documented at the cast; v37_xmr_base_reward_kat
+src/impl/xmr/pathb/pathb_receipt_admission.hpp 3 freshness: h(r), h(tip) (Monero heights < 2^63) and fresh_max (kFreshMax = 2) as i64; xmr_receipt_freshness_kat, v37_xmr_receipt_defer_kat
+src/impl/xmr/pathb/pathb_admit.hpp 5 the alarm sink keys: RowId and Missing (u8 enums) widened to u32; strike_tokens (0 or 1) to u32; v37_xmr_pathb_admit_kat
+src/impl/xmr/pathb/pathb_bin_store.hpp 6 store keys: u32 and u64 to unsigned and unsigned long long (same width) for formatting; a decimal digit (0..9); u32 counts of MMR peaks (<= 64), the rows of one sealed bin and its key references (one per payee), each far below 2^32; v37_xmr_bin_fold_kat, v37_xmr_mmr_golden_kat
+src/impl/xmr/pathb/pathb_bucket_wire.hpp 3 u32 wire counts: the key references of one bucket (one per payee); rows_total and row_first after the explicit refusal of rows.size() > UINT32_MAX; v37_xmr_pathb_bucket_wire_kat
+src/impl/xmr/pathb/pathb_buckets.hpp 3 std::countr_zero of a u64 (<= 64) as unsigned; v37_xmr_bin_fold_kat, v37_xmr_mmr_golden_kat
+src/impl/xmr/pathb/pathb_branch_follower.hpp 1 the u32 count of the RowWeights table (rows kept by the index, far below 2^32); v37_xmr_window_branch_kat
+src/impl/xmr/pathb/pathb_header_index.hpp 1 a body count (size_t) widened to u64; v37_xmr_pathb_bucket_wire_kat
+src/impl/xmr/pathb/pathb_hello.hpp 1 a 4-byte little-endian field read into u64, stored as u32 (< 2^32); v37_xmr_pathb_hello_kat
+src/impl/xmr/pathb/pathb_lane_rules.hpp 1 EMISSION_SPEED_FACTOR_PER_MINUTE (20) widened to u64; v37_xmr_lane_rules_kat
+src/impl/xmr/pathb/pathb_pool_identity.hpp 1 a decimal digit (0..9) widened to u64; v37_xmr_relay_pool_id_kat
+src/impl/xmr/pathb/pathb_store.hpp 1 a stored carrier blob's byte count to u32 (the blob cap is far below 2^32); v37_xmr_pathb_store_kat
+src/impl/xmr/pathb/pathb_ratchet_activation.hpp 1 not a cast: the parameter list (std::uint64_t /*oldest*/) matches the C-style pattern; xmr_epoch_accounting_kat
+src/impl/xmr/native/consensus/xmr_reward.hpp 10 Monero's get_block_reward and emission (cryptonote_basic_impl.cpp): MONEY_SUPPLY = ~u64(0); 1 << i in the 64-bit half it is set in; u128 products and quotients split into hi / lo limbs (exact); a remainder below a u64 divisor; the speed factor (20) as a shift count; target minutes (2) widened; xmr_consensus_state_kat
+src/impl/xmr/native/consensus/xmr_blob_reader.hpp 6 four bytes assembled into u32 (widening); a 7-bit varint group widened to u64 after the overflow refusal (VarintOverflow); a remaining-byte count (size_t) widened to u64; xmr_blob_reader_fuzz_kat, v37_xmr_parse_bounds_kat
+src/impl/xmr/native/consensus/xmr_tx_weight.hpp 2 a count and a blob size widened to u64; xmr_tx_weight_kat
+src/impl/xmr/native/consensus/xmr_block_id.hpp 1 a blob size (size_t) widened to u64; xmr_block_id_kat
+src/impl/xmr/native/consensus/xmr_block_parse.hpp 1 a tx hash count (size_t) widened to u64; xmr_block_id_kat
+src/impl/xmr/native/consensus/xmr_difficulty.hpp 1 the all-ones u64 mask of the low 64 bits; xmr_consensus_state_kat
+src/impl/xmr/pow/randomx_verify.hpp 6 check_hash: hash bytes assembled into u64 limbs (widening); u128 products split into hi / lo limbs (exact); u64(-1) all ones; randomx_verify_kat
+src/sharechain/v37/v37_descriptor_xmr.hpp 1 long division by XMR_GA_SCALE: the running remainder is below the scale, so each quotient limb fits u64; v37_descriptor_xmr_test
+src/sharechain/v37/v37_fixed.hpp 10 the v37 engine's Q62 fixed point: U256 limb sums, differences and products split exact (the carry or borrow to the next limb; overflow excluded by range pinning, documented at the operators); mul_q64 of decay and table factors; decay_per = Q_ONE - Q_ONE x LN2 / (10^6 x half_life) in (Q_ONE / 4, Q_ONE], so inv_per = 2^124 / decay_per < 2^64; v37_test

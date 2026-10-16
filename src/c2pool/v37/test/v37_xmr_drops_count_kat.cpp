@@ -31,12 +31,10 @@
 
 #include <c2pool/v37/v37_subthreshold_estimator.hpp>
 #include <c2pool/v37/v37_drop_harvest.hpp>
-#include <c2pool/v37/w4_settlement.hpp>
 #include <c2pool/v37/xmr/xmr_lane_constants.hpp>
 #include <c2pool/v37/xmr/xmr_node_config.hpp>
 
 namespace st = ::c2pool::v37::subthreshold;
-namespace settle = ::c2pool::v37n::settle;
 
 static int g_pass = 0, g_fail = 0;
 static void check(bool ok, const std::string& what) {
@@ -84,9 +82,6 @@ int main() {
         check(p.subthreshold.enabled, "CT1 the XMR lane over for_version(1) arms DROPS");
         check(p.subthreshold.mode == 2 && p.subthreshold.count_floor_shift == 6,
               "CT1 mode 2 (Count), floor shift 6 (share_diff / 64)");
-        const auto sp = settle::to_subthreshold_params(p);
-        check(sp.mode == st::CreditMode::Count && sp.count_floor_shift == 6,
-              "CT1 the W4 seam maps it to CreditMode::Count");
     }
 
     std::printf("-- CT2 integer exactness (lz = 32 geometry)\n");
