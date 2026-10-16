@@ -666,6 +666,7 @@ public:
         if (o_.discovery) disc_tick();
         drive_ctx();
         node_tick();
+        rerun_due_receipts();
         reoffer_pump_all();
         rx_tick();
     }
@@ -782,6 +783,22 @@ public:
         const NodeGuard g(*this);
         return parked_receipts_.size();
     }
+    // The asks recorded for parked receipts (they leave with their receipt), and the parked receipts due to run again.
+    std::size_t parked_receipt_asks() {
+        const NodeGuard g(*this);
+        std::size_t n = 0;
+        for (const auto& [key, e] : parked_receipts_) n += e.second.asked.size();
+        return n;
+    }
+    std::size_t parked_receipts_due() {
+        const NodeGuard g(*this);
+        return receipt_due_.size();
+    }
+    // A receipt's one-body FB_RECEIPTS frame parked (by its key).
+    bool receipt_parked(const std::vector<std::uint8_t>& frame) {
+        const NodeGuard g(*this);
+        return parked_receipts_.count(receipt_key(frame)) != 0;
+    }
     // The digests indexed for a re-run, every cause.
     std::size_t parked_index_size() {
         const NodeGuard g(*this);
@@ -808,6 +825,8 @@ public:
         }
         run_effects(fx);
     }
+    // KAT hook: the frames parked for `m` run again, as when the cause resolves.
+    void test_rerun(Missing m) { rerun_parked(m); }
     // P-50: the claim-leaf alarm buckets held.
     std::size_t claim_entries() const {
         std::lock_guard<std::mutex> lk(vmtx_);
@@ -962,6 +981,8 @@ private:
         std::uint64_t not_before_ms = 0;
         bool solicited = false;  // a reply to this node's own FC_GETCARRIER: the solicited credit (P-21)
         bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
+        // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
+        std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
@@ -1490,13 +1511,10 @@ private:
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
                     const bool park = r.action == NodeAction::Parked && r.admit.missing && rerun_cause(*r.admit.missing);
-                    const Hash32 rid = park ? receipt_key(r, j.frame) : Hash32{};
-                    if (park)
-                        park_receipt_locked(rid, j);
-                    else if (!receipt_asked_.empty())
-                        receipt_asked_.erase(receipt_key(r, j.frame));  // admitted or judged: its asks go
+                    const Hash32 key = park ? receipt_key(j.frame) : Hash32{};
+                    if (park) park_receipt_locked(key, std::move(j.asked), j);
                     after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited, /*carrier=*/false,
-                                        park ? std::optional<Hash32>(rid) : std::nullopt);
+                                        park ? std::optional<Hash32>(key) : std::nullopt);
                     // a first-seen receipt (held now, or evicted at once by P-09; a copy held before is a duplicate),
                     // or a #7 refusal
                     if ((r.admit.verdict == AdmitVerdict::AdmitPending &&
@@ -1658,7 +1676,7 @@ private:
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
     // TipBodies DEFER bound and placed, the joiner's signal.
     // carrier: the object is a carrier (its Monero context climbs to P-07), else a receipt (P-06).
-    // receipt: a DEFERred receipt this node parked (park_receipt_locked): indexed under its cause by its id; each peer
+    // receipt: a DEFERred receipt this node parked (park_receipt_locked): indexed under its cause by its key; each peer
     // is asked for one cause at most once per parked receipt.
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
@@ -1688,8 +1706,13 @@ private:
                 digest ? std::optional<Hash32>(r.admit.digest != Hash32{} ? r.admit.digest : *digest) : std::nullopt;
         if (d && rerun_cause(m)) parked_by_cause_[m].insert(*d);
         if (receipt) {
+            const auto it = parked_receipts_.find(*receipt);
+            if (it == parked_receipts_.end()) {  // not kept (over the cap at once): nothing to ask for
+                take_rx_failed_locked(fx);
+                return;
+            }
             parked_by_cause_[m].insert(*receipt);
-            if (!receipt_asked_[*receipt].insert(std::make_pair(peer, m)).second) {
+            if (!it->second.second.asked.emplace(peer, m, Hash32{}).second) {
                 take_rx_failed_locked(fx);
                 return;
             }
@@ -1836,25 +1859,32 @@ private:
         bucket_stalled_ = true;
     }
     // The frames parked for these causes, and those marked for a re-walk, run again (each a new job of its sender).
+    // A parked receipt whose cause resolved is due; the due receipts run again, the oldest first, at most the verify
+    // queue's free room at a time (no queued job dropped for them); the rest stay parked and due for the next tick.
     void rerun_parked(const std::vector<Missing>& causes) {
         std::vector<ParkedFrame> again;
         std::vector<Job> again_receipts;
         std::size_t rewalked = 0;
+        std::size_t room = verify_room();
         {
             const NodeGuard g(*this);
             for (const Missing cause : causes) {
                 std::set<Hash32> ds;
                 ds.swap(parked_by_cause_[cause]);
                 for (const Hash32& d : ds) {
-                    if (std::optional<ParkedFrame> f = node_->take_parked(d))
+                    if (std::optional<ParkedFrame> f = node_->take_parked(d)) {
                         again.push_back(std::move(*f));
-                    else if (std::optional<Job> j = take_parked_receipt_locked(d))
-                        again_receipts.push_back(std::move(*j));
+                    } else {
+                        const auto it = parked_receipts_.find(d);
+                        if (it != parked_receipts_.end()) receipt_due_[it->second.first] = d;
+                    }
                 }
             }
             std::vector<ParkedFrame> rw = node_->take_rewalk_frames();
             rewalked = rw.size();
             for (ParkedFrame& f : rw) again.push_back(std::move(f));
+            room = room > again.size() ? room - again.size() : 0;
+            take_due_receipts_locked(room, again_receipts);
         }
         st_.rewalks += rewalked;
         for (ParkedFrame& f : again) {
@@ -1866,39 +1896,74 @@ private:
             enqueue_job(std::move(j));
         }
     }
-    // ---- DEFERred receipts (SPEC DEFER: parked, run again when the missing data arrive) ----
-    // The receipt's id (a DEFER may come before the id is known: the frame's digest then).
-    static Hash32 receipt_key(const NodeEventResult& r, const std::vector<std::uint8_t>& frame) {
-        return r.admit.id != Hash32{} ? r.admit.id : ::v37::sha256d(frame);
+    // The due receipts left by a re-run (the tick): the next ones, at most the verify queue's free room.
+    void rerun_due_receipts() {
+        std::vector<Job> again_receipts;
+        const std::size_t room = verify_room();
+        {
+            const NodeGuard g(*this);
+            if (receipt_due_.empty()) return;
+            take_due_receipts_locked(room, again_receipts);
+        }
+        for (Job& j : again_receipts) {
+            st_.parked_reruns++;
+            enqueue_job(std::move(j));
+        }
     }
-    // Under the node lock: the one-body FB_RECEIPTS job of a DEFERred receipt kept by its id (run again as a re-run:
-    // no token, P-15 counted at its first admission), at most the pending set's cap (P-09): over it the oldest goes.
-    void park_receipt_locked(const Hash32& id, const Job& j) {
-        const auto it = parked_receipts_.find(id);
-        if (it != parked_receipts_.end()) parked_receipt_order_.erase(it->second.first);
-        Job k = j;
-        k.rerun = true;
-        k.not_before_ms = 0;
+    std::size_t verify_room() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return vq_.size() < o_.verify_queue_max ? o_.verify_queue_max - vq_.size() : 0;
+    }
+    // ---- DEFERred receipts (SPEC DEFER: parked, run again when the missing data arrive) ----
+    // A parked receipt's key: its one-body frame's digest (the park, its asks, its index and its due entry).
+    static Hash32 receipt_key(const std::vector<std::uint8_t>& frame) { return ::v37::sha256d(frame); }
+    // Under the node lock: the one-body FB_RECEIPTS job of a DEFERred receipt kept by its key with its asks (run again
+    // as a re-run: no token, P-15 counted at its first admission), at most the pending set's cap (P-09): over it the
+    // oldest goes, with its asks. The same receipt parked again keeps the asks made for it.
+    void park_receipt_locked(const Hash32& key, std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked, const Job& j) {
+        const auto it = parked_receipts_.find(key);
+        if (it != parked_receipts_.end()) {
+            asked.insert(it->second.second.asked.begin(), it->second.second.asked.end());
+            parked_receipt_order_.erase(it->second.first);
+            receipt_due_.erase(it->second.first);
+        }
+        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked)};
         const std::uint64_t seq = ++parked_receipt_seq_;
-        parked_receipts_[id] = std::make_pair(seq, std::move(k));
-        parked_receipt_order_[seq] = id;
+        parked_receipts_[key] = std::make_pair(seq, std::move(k));
+        parked_receipt_order_[seq] = key;
         st_.receipts_parked++;
         const std::uint64_t cap = node_->pending_cap();
         while (parked_receipts_.size() > cap && !parked_receipt_order_.empty()) {
-            const Hash32 old = parked_receipt_order_.begin()->second;
+            const auto [old_seq, old] = *parked_receipt_order_.begin();
             parked_receipt_order_.erase(parked_receipt_order_.begin());
+            receipt_due_.erase(old_seq);
             parked_receipts_.erase(old);
-            receipt_asked_.erase(old);
+            unindex_receipt_locked(old);
             st_.parked_receipt_drops++;
         }
     }
-    std::optional<Job> take_parked_receipt_locked(const Hash32& id) {
-        const auto it = parked_receipts_.find(id);
+    // Under the node lock: a parked receipt out of the park with its asks (they leave with the job).
+    std::optional<Job> take_parked_receipt_locked(const Hash32& key) {
+        const auto it = parked_receipts_.find(key);
         if (it == parked_receipts_.end()) return std::nullopt;
         Job j = std::move(it->second.second);
         parked_receipt_order_.erase(it->second.first);
+        receipt_due_.erase(it->second.first);
         parked_receipts_.erase(it);
+        unindex_receipt_locked(key);
         return j;
+    }
+    void unindex_receipt_locked(const Hash32& key) {
+        for (auto& [cause, ds] : parked_by_cause_) ds.erase(key);
+    }
+    void take_due_receipts_locked(std::size_t room, std::vector<Job>& out) {
+        while (out.size() < room && !receipt_due_.empty()) {
+            const auto [seq, key] = *receipt_due_.begin();
+            receipt_due_.erase(receipt_due_.begin());
+            const auto it = parked_receipts_.find(key);
+            if (it == parked_receipts_.end() || it->second.first != seq) continue;
+            if (std::optional<Job> j = take_parked_receipt_locked(key)) out.push_back(std::move(*j));
+        }
     }
     void rerun_parked(Missing cause) { rerun_parked(std::vector<Missing>{cause}); }
 
@@ -3505,10 +3570,10 @@ private:
     RelayNodeLock lock_;  // the node lock
     // owned by the node lock
     std::map<Missing, std::set<Hash32>> parked_by_cause_;
-    std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by id: (seq, job)
+    std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by key: (seq, job and asks)
     std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
     std::uint64_t parked_receipt_seq_ = 0;
-    std::map<Hash32, std::set<std::pair<std::uint64_t, Missing>>> receipt_asked_;  // (peer, cause) asked once per receipt
+    std::map<std::uint64_t, Hash32> receipt_due_;  // parked receipts whose cause resolved, by seq: run again with room
     bool bucket_stalled_ = false;
     bool reask_due_ = false;
 

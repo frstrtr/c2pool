@@ -4410,6 +4410,122 @@ void revrepend2() {
     check(held, "revrepend2: A and B hold X1's and X2's re-pended receipts (X2's tip X1 on the abandoned branch)");
     check(mined && c1 && c2 && !h[c.node].pending().holds(x1) && !h[c.node].pending().holds(x2),
           "revrepend2: C mines no more; B's next carrier carries X1's and X2's re-pended receipts");
+    std::printf("  park after: A parked %zu asks %zu due %zu; B parked %zu asks %zu due %zu (A parked %llu in all)\n",
+                a.relay->parked_receipts(), a.relay->parked_receipt_asks(), a.relay->parked_receipts_due(),
+                b.relay->parked_receipts(), b.relay->parked_receipt_asks(), b.relay->parked_receipts_due(),
+                (unsigned long long)sa.receipts_parked.load());
+    check(sa.receipts_parked.load() > 0 && a.relay->parked_receipts() == 0 && a.relay->parked_receipt_asks() == 0
+                  && a.relay->parked_receipts_due() == 0 && b.relay->parked_receipts() == 0
+                  && b.relay->parked_receipt_asks() == 0 && b.relay->parked_receipts_due() == 0
+                  && a.relay->parked_index_size() == 0 && b.relay->parked_index_size() == 0,
+          "revrepend2: after the heal A and B park no receipt and keep no ask record or index entry for one");
+}
+
+// ---------------------------------------------------------------------------
+// relayrpark: the receipt park under junk. B (verify queue 4, pending cap 6) gets receipts of A whose tip nobody holds:
+// each DEFERs before any PoW row and is parked under TipUnknown. (a) Ten parked: the cap keeps six, four go with their
+// index entries and asks. (c) Its cause resolving with two honest receipts queued: the re-run takes the queue's free
+// room (two), drops no queued job, keeps its asks (no new header request); the rest run on the next tick. (d) Re-run
+// jobs dropped from the full verify queue leave the park with their asks.
+void relayrpark() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(
+            h, w, table0(net), false, false,
+            [](pb::PathbRelayOptions& o) {
+                o.peer_valid_capacity = 100;
+                o.verify_queue_max = 4;
+            },
+            [](pb::PathbNodeConfig& c) { c.pending_cap = 6; });
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    // six receipts of A: shares of jobs on A's tip after A moved on, not relayed; then A's carrier delivered to B
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 6; ++k)
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, k + 2, 810 + k)) jobs.push_back(*j);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && jobs.size() == 6 && mine_on(h, w, a.node, 1, 820);
+    for (std::uint32_t k = 0; ok && k < 6; ++k)
+        ok = h[a.node].on_own_share(jobs[k], 810 + k, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(h[a.node].tree().best().id), 16)});
+    w.run();
+    std::vector<pb::ReceiptBodyV3> rs;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) rs.push_back(r->body);
+    ok = ok && rs.size() == 6 && h[b.node].pending().size() == 0 && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    std::printf("  relayrpark setup: jobs %zu, A pending %zu, B pending %zu, same best %d\n", jobs.size(), rs.size(),
+                h[b.node].pending().size(), h[b.node].tree().best().id == h[a.node].tree().best().id ? 1 : 0);
+    if (!ok) {
+        check(false, "relayrpark: setup");
+        return;
+    }
+    h.now += 1000;  // B's P-15 bucket full
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t pa = 1;  // A at B
+    const auto frame_of = [](const pb::ReceiptBodyV3& r) {
+        return *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{r}, pb::kRuledLaneParams);
+    };
+    std::vector<std::vector<std::uint8_t>> junk;
+    for (std::uint8_t k = 0; k < 10; ++k) {
+        pb::ReceiptBodyV3 r = rs[0];
+        r.side.tip.fill(0xA5);
+        r.side.tip[0] = static_cast<std::uint8_t>(k + 1);
+        junk.push_back(frame_of(r));
+    }
+    const std::uint64_t parked0 = st.receipts_parked.load(), drops0 = st.parked_receipt_drops.load();
+    for (const std::vector<std::uint8_t>& f : junk) {
+        rb.receive(pa, f);
+        w.run();
+    }
+    const std::uint64_t hdr_a = st.tip_header_requests.load();
+    std::printf("  (a) parked %zu (parked %llu, dropped %llu), index %zu, asks %zu, header requests %llu\n", rb.parked_receipts(),
+                (unsigned long long)(st.receipts_parked.load() - parked0),
+                (unsigned long long)(st.parked_receipt_drops.load() - drops0), rb.parked_index_size(),
+                rb.parked_receipt_asks(), (unsigned long long)hdr_a);
+    check(rb.parked_receipts() == 6 && st.parked_receipt_drops.load() - drops0 == 4 && rb.parked_index_size() == 6
+                  && rb.parked_receipt_asks() == 6,
+          "relayrpark (a): ten junk receipts parked under the cap of six: four go with their index entries and asks");
+    rb.receive(pa, frame_of(rs[0]));
+    rb.receive(pa, frame_of(rs[1]));
+    const std::size_t vq0 = rb.verify_queue_size();
+    const std::uint64_t qd0 = st.queue_dropped.load();
+    rb.test_rerun(pb::Missing::TipUnknown);
+    const std::size_t vq1 = rb.verify_queue_size(), due1 = rb.parked_receipts_due(), parked1 = rb.parked_receipts();
+    w.run();
+    const bool honest = h[b.node].pending().holds(pb::receipt_id(rs[0])) && h[b.node].pending().holds(pb::receipt_id(rs[1]));
+    const std::size_t due2 = rb.parked_receipts_due(), parked2 = rb.parked_receipts();
+    h.now += 1;
+    rb.tick();
+    w.run();
+    std::printf("  (c) queued %zu, after the re-run: queue %zu due %zu parked %zu (dropped %llu); run: honest held %d, due %zu"
+                " parked %zu; tick: due %zu parked %zu asks %zu, header requests %llu\n",
+                vq0, vq1, due1, parked1, (unsigned long long)(st.queue_dropped.load() - qd0), honest ? 1 : 0, due2, parked2,
+                rb.parked_receipts_due(), rb.parked_receipts(), rb.parked_receipt_asks(),
+                (unsigned long long)st.tip_header_requests.load());
+    check(vq0 == 2 && vq1 == 4 && due1 == 4 && parked1 == 4 && st.queue_dropped.load() == qd0 && honest,
+          "relayrpark (c): the re-run takes the verify queue's free room (2 of 6); no queued job dropped; the honest "
+          "receipts admitted");
+    check(due2 == 4 && parked2 == 6 && rb.parked_receipts_due() == 0 && rb.parked_receipts() == 6
+                  && rb.parked_receipt_asks() == 6 && st.tip_header_requests.load() == hdr_a,
+          "relayrpark (c): the rest run on the next tick; every re-run parks again with its asks (no new header request)");
+    rb.test_rerun(pb::Missing::TipUnknown);
+    const std::size_t vq3 = rb.verify_queue_size();
+    for (std::size_t k = 2; k < 6; ++k) rb.receive(pa, frame_of(rs[k]));
+    const std::uint64_t qd3 = st.queue_dropped.load() - qd0;
+    w.run();
+    std::printf("  (d) queued %zu re-runs, %llu dropped by four honest frames: parked %zu asks %zu due %zu index %zu\n", vq3,
+                (unsigned long long)qd3, rb.parked_receipts(), rb.parked_receipt_asks(), rb.parked_receipts_due(),
+                rb.parked_index_size());
+    check(vq3 == 4 && qd3 == 4 && rb.parked_receipts() == 2 && rb.parked_receipt_asks() == 2
+                  && rb.parked_receipts_due() == 2 && rb.parked_index_size() == 0,
+          "relayrpark (d): re-run jobs dropped from the full verify queue leave the park with their asks");
 }
 
 // ---------------------------------------------------------------------------
@@ -4826,6 +4942,7 @@ int main(int argc, char** argv) {
     run("relayp15once", relayp15once);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
+    run("relayrpark", relayrpark);
     run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
