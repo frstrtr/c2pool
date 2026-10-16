@@ -40,8 +40,8 @@ Commands marked `<!-- check -->` in the source of this file are run by
 - The payout address must be a MAIN (standard) address: `4...` on mainnet,
   `5...` on stagenet. Subaddresses and integrated addresses are not
   supported as payees. The node refuses a subaddress for
-  `--node-owner-address` at start. It does not yet check
-  `--payout-address` or a miner's stratum login, so check those yourself.
+  `--node-owner-address` and for `--payout-address` (with `--mine`) at
+  start, and a miner's stratum login with one is refused and closed.
 
 ## 2. Install the release package
 
@@ -581,5 +581,5 @@ cache. Mainnet needs 20 GB of disk for the output set.
 - **Prototype.** No release tag exists yet, and the output-set download is
   not published yet.
 - **Payee addresses.** Only MAIN (standard) addresses are supported as
-  payees. `--payout-address` and miner logins are not checked for this yet.
+  payees: the node refuses the others at start and at the stratum login.
 - **Mainnet** runs follow-only (see [Mainnet](#11-mainnet)).
