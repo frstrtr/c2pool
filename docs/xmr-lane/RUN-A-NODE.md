@@ -2,8 +2,8 @@
 
 This guide takes you from a clean Linux account to a running
 `c2pool-v37-xmr` node that joins a pool and serves work to your miners.
-It covers stagenet today. Mainnet uses the same steps and is marked
-"later" where it differs.
+It covers stagenet. On mainnet the node runs follow-only (see
+[Mainnet](#11-mainnet)).
 
 There are two ways to get the node: install the release package
 (section 2, no compiler needed), or build it from source (section 3). The
@@ -14,7 +14,9 @@ every pool block pays the miners whose shares the pool has booked.
 network over levin (the Monero P2P protocol), keeps its own verified chain
 index, builds block templates itself and sends found blocks over levin. It
 makes no monerod RPC call. It starts from a pinned snapshot instead of
-genesis.
+genesis. The pool's nodes keep the Path B carrier chain of the shares they
+book and relay to each other; every pool block pays the window of that
+chain.
 
 The node is an experimental prototype. Read [Known limits](#known-limits)
 before you point real hashrate at it.
@@ -33,7 +35,7 @@ Commands marked `<!-- check -->` in the source of this file are run by
 - A shell account. You need `sudo` only for a system-wide install or to
   install build packages.
 - For stagenet: a stagenet payout address (`5...`), and from your pool's
-  operator the pool genesis id and one or more relay peers
+  operator the pool identity and one or more relay peers
   (see [Join a pool](#6-join-a-pool)).
 - The payout address must be a MAIN (standard) address: `4...` on mainnet,
   `5...` on stagenet. Subaddresses and integrated addresses are not
@@ -289,13 +291,12 @@ Make a data directory:
 mkdir -p ~/xmr-stagenet/data
 ```
 
-Set these values. Your pool operator gives you `POOL_GENESIS`,
-`RELAY_PEER`, the fee model and the share difficulty. A new pool picks a
-new random genesis id with `openssl rand -hex 32`.
+Set these values. Your pool operator gives you `POOL_IDENTITY` and
+`RELAY_PEER`.
 
 ```sh
 ADDR=5...                       # your stagenet payout address
-POOL_GENESIS=<64 hex digits>    # the pool's genesis id
+POOL_IDENTITY='<H>:<64 hex digits>:<headline>'   # the pool identity
 RELAY_PEER=<host:port>          # a relay address of a node already in the pool
 RELAY_LISTEN=0.0.0.0:<port>     # where this node accepts relay peers
 LEVIN_PEER=<ip>:38080           # a monerod levin port you trust (yours if you have one)
@@ -320,15 +321,13 @@ the network's seed nodes. On a slow link also add
 ### 6.1 With the package
 
 All launch flags live in `node.env` in the data directory, one flag per
-line, each with a comment. Replace every `<placeholder>`: the pool id
-(`--pool-genesis`), the two public relay nodes (`--relay-peer`), your
+line, each with a comment. Replace every `<placeholder>`: the pool identity
+(`--pool-genesis-from`), the two public relay nodes (`--relay-peer`), your
 relay port, and your MAIN payout address. `--give-author-pct 0.1` gives
-0.1% of the credit of every share this node's miners find to the author; set
-it to 0 to opt out.
-`--node-owner-fee-pct` with `--node-owner-address` is optional: it makes a
-job pay the node owner instead of the miner with that probability; it is
-never a fixed output. `--mine` stays commented out. Relative paths in
-`node.env` are under the data directory.
+0.1% of the weight of this node's jobs to the author; set it to 0 to opt
+out. `--node-owner-fee-pct` with `--node-owner-address` is optional: the
+node owner's weight share in this node's jobs. `--mine` stays commented
+out. Relative paths in `node.env` are under the data directory.
 
 Start it by hand:
 
@@ -350,9 +349,8 @@ For a user unit that keeps running after you log out, an admin runs
 
 `run-node.sh` also starts `memguard.sh`. It watches `MemAvailable` and
 stops the node cleanly (SIGINT) when it falls below `MEMGUARD_MIN_MB`
-(1024 MB by default, set in `node.env`), so the node gives way before the
-machine runs out of memory. The unit sets `OOMScoreAdjust=1000` for the
-same reason and a `MemoryMax=4G` hint. Raise that for mainnet.
+(1024 MB by default, set in `node.env`). The unit sets `OOMScoreAdjust=1000`
+and a `MemoryMax=4G` hint.
 
 The dashboard is at `http://127.0.0.1:8080/` (the `--web-host` and
 `--web-port` lines). To see it from another machine, forward the port
@@ -366,14 +364,13 @@ keeps running when you log out:
 ```sh
 cd ~/xmr-stagenet
 nohup ~/c2pool/build/src/c2pool/c2pool-v37-xmr --network stagenet \
-  --coinbase v37 --xmr-template-source native --arm-order p2p-first \
+  --xmr-template-source native --arm-order p2p-first \
   --native-connect "$LEVIN_PEER" \
   --native-output-set ~/xmr-stagenet/xmr_stagenet_output_set.bin \
   --native-snapshot-path ~/xmr-stagenet/data/native.snap \
-  --data-dir ~/xmr-stagenet/data \
-  --randomx --d-conf 60 --fee-model v1 --relay-bind rbind \
-  --pool-genesis "$POOL_GENESIS" --relay-listen "$RELAY_LISTEN" --relay-peer "$RELAY_PEER" \
-  --payout-address "$ADDR" --share-diff 10000 --give-author-pct 0.1 \
+  --data-dir ~/xmr-stagenet/data --randomx \
+  --pool-genesis-from "$POOL_IDENTITY" --relay-listen "$RELAY_LISTEN" --relay-peer "$RELAY_PEER" \
+  --payout-address "$ADDR" --give-author-pct 0.1 \
   --web-port 8080 --web-host 127.0.0.1 --dashboard-dir ~/c2pool/web-static \
   --stratum-bind-host "$STRATUM_BIND" --stratum-port "$STRATUM_PORT" \
   --status-every 30 > ~/xmr-stagenet/node.log 2>&1 &
@@ -384,61 +381,47 @@ What the flags do:
 
 | Flag | Meaning |
 |---|---|
-| `--network stagenet` | the Monero network (`mainnet` later, see [Mainnet](#mainnet-later)) |
-| `--coinbase v37` | build the v37 settlement coinbase, which pays the pool's miners |
+| `--network stagenet` | the Monero network (mainnet: [follow-only](#11-mainnet)) |
 | `--xmr-template-source native` | the embedded node builds the template, not monerod |
 | `--arm-order p2p-first` | the embedded node is the tip and sends found blocks over levin. No monerod RPC. |
 | `--native-connect <ip:port>` | a levin peer to use. Repeat it for more peers. |
 | `--native-seeds` | use the network's seed nodes instead of, or as well as, `--native-connect` |
 | `--native-output-set <file>` | the output-set file. Without `--native-anchor` the node boots from the compiled-in pinned anchor. |
 | `--native-snapshot-path <file>` | save the chain index here so a restart resumes (see [Restart](#9-restart-and-resume)) |
-| `--data-dir <dir>` | the settlement store |
-| `--randomx` | verify RandomX proof of work |
-| `--d-conf 60` | settlement finality depth in blocks. Use the pool's value. |
-| `--fee-model v1` | the pool fee model: one donation output, last, in every pool block (it may carry 0). Use the pool's value. |
-| `--relay-bind rbind` | bind each share to its payee in the proof of work. Required with `--fee-model v1` and on mainnet. |
-| `--pool-genesis <hex64>` | the pool's id. Nodes with a different id refuse each other. |
+| `--data-dir <dir>` | the Path B store (`pathb_db`) |
+| `--randomx` | verify RandomX proof of work (the pool node needs it) |
+| `--pool-genesis-from <H>:<hash64>:"<headline>"` | the pool identity, derived (every network) |
+| `--pool-genesis <hex64>:<H>` | a raw pool genesis with its height (regtest, testnet, stagenet) |
+| `--pathb-launch` | the pool's first node: build templates with no Path B peer |
 | `--relay-listen <host:port>` | accept relay connections from other pool nodes |
 | `--relay-peer <host:port>` | dial a pool node. Repeat it for more peers. |
-| `--no-relay-bootstrap` | do not also dial the built-in bootstrap nodes (mainnet only; see [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md)) |
-| `--payout-address <addr>` | this node's own payout address. The stratum port is served only when it is set. |
-| `--share-diff <n>` | share difficulty for miners. Use the pool's value. 0 means network difficulty (solo). |
+| `--no-relay-bootstrap` | do not dial the network's bootstrap peers (see [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md)) |
+| `--payout-address <addr>` | the payee of the in-process miner's jobs |
 | `--stratum-bind-host <ip>`, `--stratum-port <p>` | where miners connect (default `127.0.0.1:3333`) |
-| `--give-author-pct <p>` | percent of each share's credit given to the author (default 0.1 with `--fee-model v1`; 0 opts out) |
+| `--give-author-pct <p>` | the author's weight share in this node's jobs, in percent |
+| `--node-owner-fee-pct <p>`, `--node-owner-address <addr>` | the node owner's weight share in this node's jobs, and its standard address |
+| `--mine [threads]` | the in-process RandomX CPU miner on this node's jobs |
 | `--web-port <p>`, `--web-host <ip>` | the dashboard (`http://<web-host>:<web-port>/`). Off unless `--web-port` is set. |
 | `--dashboard-dir <dir>` | the dashboard files (`web-static/`). `run-node.sh` sets it for the package. |
 | `--status-every <s>` | seconds between status blocks in the log |
 
-When the relay link is up, the `relay:` status line shows `conns=1 ready=1
-hello ok=1` for one peer.
+When the relay link is up, the `relay:` status line shows `ready=1` and
+`hello ok=1` for one peer.
 
-Every node of one pool must use the same `--pool-genesis`, `--fee-model`,
-`--relay-bind`, `--d-conf` and `--share-diff`. The relay compares the pool id
-in its HELLO and refuses a peer from another pool. The `relay:` status line counts
-those refusals as `tag_mismatch=`.
+Every node of one pool uses the same pool identity. The relay compares the
+pool id in its HELLO and refuses a peer from another pool
+(`TAG_MISMATCH field=pool_id`). The pool's rules are part of the identity.
 
-Every settlement knob is also part of the pool (LANE-RULES,
-[lane-rules.md](lane-rules.md)): the node prints its whole list at startup
-(`lane-rules: digest=... d_conf=60 ...`), and a peer with any other value is
-refused at HELLO by name, for example `LANE_RULES_MISMATCH field=d_conf ours=60
-theirs=61`, counted as `rules_mismatch=`. Its lane blocks are ordinary blocks for
-this pool. `--d-conf` below 60 is refused on every network but regtest.
+The share difficulty is the pool's `d` (the `template` line). Miners get
+jobs at `d`; `--stratum-min-diff-shift <s>` serves stratum shares at
+`max(1, d >> s)`.
 
-Raindrops (DROPS, sub-threshold credit) are on by default. With no
-`--drops-enrol`, every payee enrols at its first share and the enrolment is part
-of the ledger. If you give an explicit `--drops-enrol` list instead, every node of
-one pool must use the identical list: a node with another list is refused at
-HELLO with `ENROL_SET_MISMATCH enrol-set digest differs: ours=… theirs=…`.
-
-Optional fee flags (fee model `v1` only): `--node-owner-fee-pct <p>` with
-`--node-owner-address <addr>` makes a job pay the node owner instead of the
-miner with probability p percent. It is decided per job, never a fixed
-output, and the owner address must be a MAIN address. The owner fee defaults to 0.
-`--give-author-pct <p>` donates p percent of each share's credit to the
-author; it defaults to 0.1 (`--give-author-pct 0` opts out). The share
-carries the value in its proof of work, and every node splits the share's
-weight by it (p2pool's `give_author`), so it is never a separate fee. With
-every miner at 0 the donation output is still in the block, at 0 piconero.
+The author's share: `--give-author-pct <p>` gives p percent of the weight of
+this node's jobs to the author; it defaults to 0.1 (`--give-author-pct 0` opts out).
+The value rides in each share and every node splits the share's weight by
+it, so it is never a separate output. The node owner's share
+(`--node-owner-fee-pct`, `--node-owner-address`, a MAIN address) defaults
+to 0.
 
 ## 7. Point a miner at it
 
@@ -479,48 +462,97 @@ The lines to watch:
 | Line | What it tells you |
 |---|---|
 | `[pinned] output-set snapshot sha256 ... matches the pin` | the output-set file is the pinned one (printed once at boot) |
-| `node: [GATE-4] anchor confirmed` | a live peer served the anchor block and it hashed to the pinned id |
-| `node: [txpool] relay gate OPEN (index synced=1)` | the chain index reached the network tip. `synced=0` means it fell behind. |
-| `status: hw=... cursor=... tip=...` | `tip` is the chain tip. `cursor` is how far settlement has booked the chain. `hw` is the highest block seen. After boot, `cursor` catches up to about `tip - d-conf`. |
-| `status: ... template ... h=` | height of the template your miners get (tip + 1) |
-| `status: ... stratum conn= logins= shares=` | miner connections and accepted shares |
-| `suspend: lane_suspended=` | `no` is normal. `YES (job WITHDRAWN ...) causes=lag` means the cursor is too far behind the tip. This is expected during catch-up after boot. Miners get no job until it clears. |
-| `hold: held_now=` | blocks the settlement is waiting for. It should return to 0. |
-| `cold-boot-2: cursor=... owed_digest=...` | `owed_digest` is a digest of who is owed what at `cursor`. All honest nodes of a pool print the same value at the same cursor. |
-| `relay: conns= ready= hello ok= rej=` | relay links to other pool nodes. `ready` should equal your peer count. |
-| `native: ... verified_frontier=... peers=` | levin peers and the highest RandomX-verified block |
+| `[GATE-4] anchor confirmed: height ...` | a live peer served the anchor block and it hashed to the pinned id |
+| `status: up=... monero=<h> best pos=<n> id=... cum_work=... pending=... template=ok` | `monero` is the Monero tip, `best pos` the position of the best carrier, `pending` the receipts waiting for a carrier |
+| `template <n>: tip=... x=... h=... d=... R=... n_tx=...` | a new template: the carrier tip it builds on, the Monero height `h`, the pool's `d`, the reward `R`, the transactions |
+| `found h=... id=... landed=...` | a Monero block found on this node's job |
+| `relay: peers in= out= ready= ... hello ok= rej= ...` | relay links to other pool nodes. `ready` should equal your peer count. |
+| `stratum: conns= ... own receipts=` | miner connections and the shares this node booked |
+| `txpool: gate= ... warm=` | the transaction pool gate and the warm latch after a restart |
+| `follower: rows= recorded= events ...` | the Monero chain index |
 | `wire RPC to monerod: TOTAL=0` | monerod RPC calls made. It stays 0 in this setup. |
 | `run-node: <binary> <flags>` | printed once by `run-node.sh`: the exact command it started (package installs) |
 | `memguard[<pid>]: watching, stop threshold ...` | memguard is running. `sending SIGINT (clean stop)` means the machine ran low on memory and memguard stopped the node. |
 
-Alarms start with `cba-ALARM` and are counted in the `r6:` line
-(`alarms=`) and the `minority:` line (`state=`, `alarms=`). One
-`cba-ALARM ... SUSPENDED ... cause=lag` at boot is normal. Anything else, or
-`minority: state=DIVERGED`, means this node disagrees with the pool: keep
-the log and tell your pool operator.
-
-A healthy node, some minutes after boot, shows `synced=1`, `cursor` within
-`d-conf` of `tip`, `lane_suspended=no`, `held_now=0`, and a template at
-`tip + 1`.
+A healthy node, some minutes after boot, shows `template=ok`, a `template`
+line at the Monero tip plus one, `ready` equal to its relay peers and
+`TOTAL=0`.
 
 ## 9. Restart and resume
 
 Stop the node with `SIGINT` (Ctrl-C, or `kill -INT <pid>`). It saves the
 chain index to `--native-snapshot-path` on a clean stop, and also every 300
-seconds (`--native-snapshot-every`).
+seconds (`--native-snapshot-every`), with the output-set overlay next to it
+(`<snapshot>.outset`).
 
-Wait until the log ends with `stopped. hw_height=...` and the process has
-exited (`kill -0 <pid>` fails) before you start it again. The node writes the
-snapshot during the stop; a new process started earlier reads an older
-snapshot.
+Wait until the log ends with `c2pool-v37-xmr: stopped` and the process has
+exited (`kill -0 <pid>` fails) before you start it again.
 
 Restart it with the same command. It confirms the anchor again (gate 4),
-then resumes from the saved index if the file matches the anchor. Otherwise
-it boots from the anchor again. The settlement store in `--data-dir` keeps
-the booked state. Do not delete `--data-dir` between restarts.
+then resumes from the saved index when the index and its overlay match.
+Otherwise it re-walks from the anchor. The Path B store in `--data-dir`
+keeps the carrier chain. Do not delete `--data-dir` between restarts.
 
-Keep downtime short. A restart after a long stop re-walks the gap from the
-network and suspends the lane (`causes=lag`) until the cursor catches up.
+## 10. Other modes
+
+**Follow-only.** The node follows Monero and logs the template record of the
+Monero tip for an empty window: no pool, no store, no job, no relay, no
+monerod endpoint. Its start line reads
+`c2pool-v37-xmr: FOLLOW-ONLY network=... pool=none stratum=off relay=off`.
+
+```sh
+~/c2pool/build/src/c2pool/c2pool-v37-xmr --network stagenet --follow-only \
+  --native-connect "$LEVIN_PEER" \
+  --native-output-set ~/xmr-stagenet/xmr_stagenet_output_set.bin \
+  --native-snapshot-path ~/xmr-stagenet/follow.snap --randomx
+```
+
+**Solo (regtest).** A one-node pool without peers, monerod or anchor: the
+chain starts at the locally assembled genesis block. Templates need
+`--pathb-launch`; a found block counts as landed when the node's own index
+accepts it (`landed=own-index`).
+
+```sh
+~/c2pool/build/src/c2pool/c2pool-v37-xmr --network regtest --native-solo \
+  --arm-order p2p-first --xmr-template-source native --randomx \
+  --pool-genesis-height 0 --pathb-launch --payout-address "$ADDR" \
+  --data-dir ~/xmr-regtest --native-snapshot-path ~/xmr-regtest/chain.snap --mine 1
+```
+
+**The regtest K30 set.** `--pathb-regtest-k30 <L,GRACE,TIMEOUT>` sets the
+regtest rig's K30 values; the pool identity's G follows from it. Any other
+network refuses it: `REFUSED: --pathb-regtest-k30 is regtest only`.
+
+## 11. Mainnet
+
+On mainnet the node runs follow-only, behind `--i-understand-mainnet`:
+
+```sh
+~/c2pool/build/src/c2pool/c2pool-v37-xmr --network mainnet --i-understand-mainnet --follow-only \
+  --native-connect <ip>:18080 --native-output-set ~/xmr-mainnet/xmr_mainnet_output_set.bin \
+  --native-snapshot-path ~/xmr-mainnet/follow.snap --randomx
+```
+
+The mainnet output set: `xmr_mainnet_output_set.bin`, 17.1 GiB, sha256
+`506aa2480fcab4ec6d4514f68898ca638065548675de9740e56a1b80b571390d` (H_a
+`3765865`). Mint it with `--net mainnet --height 3765865` and your monerod
+RPC on port 18081. The levin port is 18080.
+
+Every other mainnet start is refused, before anything is written:
+
+| Start | Line |
+|---|---|
+| without `--i-understand-mainnet` | `REFUSED: mainnet requires --i-understand-mainnet (prototype safety)` |
+| without `--follow-only` | `REFUSED: mainnet requires --follow-only` |
+| `--follow-only` with `--pathb-launch` | `REFUSED: mainnet refuses --pathb-launch` |
+| `--follow-only` with a stratum, mining or relay flag | `REFUSED: mainnet refuses <flag>` |
+
+<!-- check -->
+```sh
+cd ~/c2pool
+out=$(./build/src/c2pool/c2pool-v37-xmr --network mainnet --i-understand-mainnet 2>&1 || true)
+echo "$out" | grep -x 'REFUSED: mainnet requires --follow-only'
+```
 
 ## Resources
 
@@ -533,46 +565,21 @@ Measured on stagenet, Ubuntu 26.04, i5-14500T, one levin peer, 2026-09-25:
 | Build: `conan install` from an empty `~/.conan2`, configure, compile `c2pool-v37-xmr` with `JOBS=6` | 148-177 s (Conan downloads prebuilt Boost and builds only gtest and zeromq) |
 | Disk: `~/.conan2` + `~/c2pool` (with `build`) + venv | 171 MB + 107 MB + 80 MB |
 | Disk: output-set file | 1.1 GiB (mainnet 17.1 GiB) |
-| Disk: `--data-dir` after boot | 0.7 MB |
-| Boot to `synced=1` and stratum listening | 36 s (3.4 s of that is the sha256 of the output set) |
-| Boot to first stratum job | 282-287 s (catch-up of about 1,650 blocks behind the anchor) |
-| Clean restart from `--native-snapshot-path` | stratum listening after 10 s; the lane was not suspended |
+| Boot to the chain index synced | 36 s (3.4 s of that is the sha256 of the output set) |
 | Node memory | peak RssAnon 0.99 GB, VmHWM 1.18 GB |
 | Levin traffic in the first 407 s (two levin peers) | 1.6 MB in, 0.11 MB out |
 
 The output-set file is memory-mapped, so it also shows up in the page
-cache. The catch-up time grows with the distance from H_a to the tip: about
-720 blocks a day on stagenet. Mainnet needs more: plan for 20 GB of disk for
-the output set. Mainnet node numbers are not measured yet.
+cache. Mainnet needs 20 GB of disk for the output set.
 
 ## Known limits
 
-- **FCMP++ / Carrot is not supported.** The coming Monero hard fork changes
-  the coinbase and the block header. This node does not follow it yet and
-  will not follow the chain past the fork.
+- **FCMP++ / Carrot is not supported.** The node does not follow the chain
+  past that Monero hard fork.
 - **Block withholding.** A miner can submit shares and keep a found block to
   itself. The pool cannot detect this. The same is true of every pool.
-- **Shares on a foreign template.** A relayed share whose coinbase is not the
-  canonical lane coinbase earns no credit (`coinbase-recompute.md` §6). A
-  block pays the miners of its window as of about 2 hours ago (the anchor),
-  so a new miner's first payment comes about 2 hours after it starts.
-- **Prototype.** The binary prints `EXPERIMENTAL prototype`. No release tag
-  exists yet, and the output-set download is not published yet. Blocks with
-  a merge-mining tag in the coinbase are handled since c2pool #1786.
+- **Prototype.** No release tag exists yet, and the output-set download is
+  not published yet.
 - **Payee addresses.** Only MAIN (standard) addresses are supported as
   payees. `--payout-address` and miner logins are not checked for this yet.
-- **Mainnet** is refused unless you pass `--i-understand-mainnet`.
-
-## Mainnet (later)
-
-The steps are the same, with these changes:
-
-- `--network mainnet --i-understand-mainnet`, and a mainnet address.
-- The mainnet output set: `xmr_mainnet_output_set.bin`, 17.1 GiB, sha256
-  `506aa2480fcab4ec6d4514f68898ca638065548675de9740e56a1b80b571390d`
-  (H_a `3765865`). Mint it with `--net mainnet --height 3765865` and your
-  monerod RPC on port 18081. The levin port is 18080.
-- `--relay-bind rbind` is required for the relay on mainnet.
-- On mainnet the relay also dials the pool's public bootstrap nodes, listed in
-  [BOOTSTRAP-NODES.md](BOOTSTRAP-NODES.md), so `--relay-peer` is optional.
-  `--no-relay-bootstrap` turns that off.
+- **Mainnet** runs follow-only (see [Mainnet](#11-mainnet)).
