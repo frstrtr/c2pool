@@ -91,13 +91,11 @@ scopes:
     extensions: [.hpp, .cpp, .h, .c, .cc, .ipp, .inc, .py, .cmake, .txt]
   xmr_consensus_core:
     include:
-      - src/impl/xmr/settle/**
       - src/impl/xmr/native/consensus/**
       - src/impl/xmr/pow/randomx_verify.hpp
       - src/sharechain/v37/**
     exclude:
       - '**/test/**'
-      - src/impl/xmr/settle/_compile_check/**
     extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
 
 rules:

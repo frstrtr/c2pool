@@ -30,7 +30,6 @@
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
 #include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
-#include "impl/xmr/settle/xmr_drain_rule.hpp"   // THE DRAIN RULE: drain_rule_refusal
 #include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS, kXmrCreditModeCount
 
 namespace c2pool::v37n::xmr {
@@ -54,19 +53,19 @@ inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexc
     return false;
 }
 
-// The XMR lane's default parameters: node_lane_params_no_kind(), and, when the
-// build arms DROPS, the Count estimator in place of the K-min one. K-min spends
-// a fixed budget of K order statistics per identity and branches on J < K, so on
-// the XMR geometry it is biased for small miners and pays for splitting
-// (docs/research/drops-split/). Count is exact and split-neutral, and costs
-// nothing more here: every raindrop is already relayed and verified.
-inline ::v37::LaneParams xmr_lane_params_default() {
-    ::v37::LaneParams p = ::c2pool::v37n::node_lane_params_no_kind();
+// The XMR lane's parameters over a base: when the base arms DROPS, the Count
+// estimator (mode 2, floor shift 6) in place of the K-min one.
+inline ::v37::LaneParams xmr_lane_params_of(::v37::LaneParams p) {
     if (p.subthreshold.enabled) {
         p.subthreshold.mode = kXmrCreditModeCount;
         p.subthreshold.count_floor_shift = kXmrDropsFloorShift;
     }
     return p;
+}
+// The XMR lane's default parameters: over node_lane_params_no_kind() (DROPS off
+// in a default build).
+inline ::v37::LaneParams xmr_lane_params_default() {
+    return xmr_lane_params_of(::c2pool::v37n::node_lane_params_no_kind());
 }
 
 // The Monero network the daemon binds to. Stagenet is the shipped default —
@@ -178,7 +177,7 @@ struct XmrNodeConfig {
     // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
     // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
     // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
-    // DROPS armed: the Count estimator (xmr_lane_params_default above).
+    // DROPS armed: the Count estimator (xmr_lane_params_of above).
     ::v37::LaneParams lane_params = xmr_lane_params_default();
 
     // --- the same-height double-block tie (the native backend's fork tie) ------
@@ -208,41 +207,8 @@ struct XmrNodeConfig {
     // Main-loop cadence: tip poll fallback, template refresh, found-queue drain.
     // 5 s suits stagenet; ~1000 ms for a regtest demo.
     std::uint32_t   poll_ms = 5000;
-    // Pending-FOUND sidecar (pfound.tsv next to settle.img) so a restart inside
-    // the D_conf window does not lose a pending FOUND (D10). --no-found-sidecar.
-    bool            found_sidecar = true;
-    // Optional payee identity (the address boundary's OUTPUT): the raw public
-    // spend + view keys of the payout address, 64 hex each. When both are set,
-    // FOUND/FINALIZE records are amount-honest ({identity_key : reward}); when
-    // absent the block is recorded as a valueless {}/{} record.
-    std::string     payee_spend_key_hex;
-    std::string     payee_view_key_hex;
-    bool            payee_subaddress = false;
     // Seconds between the main loop's one-line status reports (0 = never).
     std::uint32_t   status_every_s = 30;
-
-    // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
-    // The mandated residual sink (REQUIRED for v37 mode with the fee model OFF):
-    // the raw public spend (B) + view (A) keys, 64 hex each, of the XMR wallet
-    // the exact-sum residual is paid to. Torsion-checked at build; the daemon
-    // REFUSES v37 mode without a valid sink. --residual-sink-subaddress builds
-    // an XMR_SUB (D_i, A_main). With --fee-model v1 (LaneParams::fee) the sink
-    // IS the protocol donation address (xmr_fee_model.hpp) and these are refused.
-    std::string     residual_sink_spend_hex;
-    std::string     residual_sink_view_hex;
-    bool            residual_sink_subaddress = false;
-    // The v37 lane parameters (consensus once multi-node; explicit here).
-    //
-    // DRAIN (operator ruling R2): the old-balance drain parameter Q of the
-    // lane-rules list (xmr_lane_rules.hpp field 23). 0 = no drain = master's
-    // coinbase bytes. No CLI flag: apply_network_drain() sets it.
-    std::uint32_t   drain_q = 0;
-    // THE DRAIN RULE's other two lane rules (fields 24 / 25, docs/xmr-lane/
-    // settlement-drain.md): H_cap (heights counted per lane block, at most)
-    // and the rule version (0 = master; 1 = R1/R2/R5 of 2026-10-02). Set by
-    // apply_network_drain(), never by a flag.
-    std::uint32_t   drain_h_cap = 0;
-    std::uint32_t   drain_rule_version = 0;
 
     // --- M2: the NATIVE template source ------------------------------------
     // --xmr-template-source monerod|native. See TemplateSourceMode above.
@@ -496,30 +462,6 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     return {};
 }
 
-// ---------------------------------------------------------------------------
-// Monero's coinbase maturity, and the drain rule's network triple.
-// ---------------------------------------------------------------------------
-inline constexpr std::uint64_t kXmrMinDConf   = 60;   // == XMR_COINBASE_MATURITY (static_assert in xmr_lane_rules_build.hpp)
-inline constexpr std::uint32_t kMainnetDrainQ = 0;    // no drain on mainnet until the drain rule's flag day
-inline constexpr std::uint32_t kMainnetDrainHCap = 0;
-inline constexpr std::uint32_t kMainnetDrainRuleVersion = 0;
-// The drain rule's test-network defaults (rule version 1, B-SPEC section 2):
-// R / 256 per Monero height, at most R / 4 per lane block.
-inline constexpr std::uint32_t kLaneDrainQ = 16;
-inline constexpr std::uint32_t kLaneDrainHCap = 64;
-inline constexpr std::uint32_t kLaneDrainRuleVersion = 1;
-// The network's triple (mainnet 0/0/0). Never a flag.
-inline void apply_network_drain(XmrNodeConfig& c) {
-    if (c.network == MoneroNetwork::Mainnet) {
-        c.drain_q = kMainnetDrainQ;
-        c.drain_h_cap = kMainnetDrainHCap;
-        c.drain_rule_version = kMainnetDrainRuleVersion;
-    } else {
-        c.drain_q = kLaneDrainQ;
-        c.drain_h_cap = kLaneDrainHCap;
-        c.drain_rule_version = kLaneDrainRuleVersion;
-    }
-}
 // ---------------------------------------------------------------------------
 // --native-solo's OWN preconditions, kept as a pure function for the same
 // reason arm_order_refusal() is: the thing the daemon refuses on and the thing

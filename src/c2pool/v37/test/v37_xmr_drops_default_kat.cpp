@@ -5,14 +5,13 @@
 // Affero General Public License, version 3 or (at your option) any later
 // version. See <https://www.gnu.org/licenses/>.
 //
-// v37_xmr_drops_default_kat -- XMR-DROPS-DEFAULT (operator ruling 09-27:
-// "raindrops should be default"). The XMR node and its KATs are built with the
-// V37.1 activation (src/c2pool/CMakeLists.txt c2pool_xmr_drops_default); every
-// other coin keeps the flip at 0. Pins:
-//   DD1  the XMR build is armed: kActivateConsensusV1, kDropsWiringArmed, the
-//        default XmrNodeConfig lane = the DROPS gate of for_version(1) with the
-//        Count estimator (mode 2, floor shift 6), the fee model off, and
-//        make_drops_wiring(default lane) armed.
+// v37_xmr_drops_default_kat -- raindrops are off in the default XMR build
+// (src/c2pool/CMakeLists.txt option V37_XMR_DROPS_DEFAULT OFF; no XMR target
+// defines V37_ACTIVATE_CONSENSUS_V1). Pins:
+//   DD1  V37_XMR_DROPS_DEFAULT is not defined; kActivateConsensusV1 and
+//        kDropsWiringArmed are false; the default XmrNodeConfig lane carries no
+//        DROPS gate, the fee model is off, and make_drops_wiring(default lane)
+//        is not armed.
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -33,24 +32,18 @@ int main() {
     std::printf("v37_xmr_drops_default_kat (V37_ACTIVATE_CONSENSUS_V1=%d, kDropsWiringArmed=%d)\n",
                 (int)V37_ACTIVATE_CONSENSUS_V1, (int)n37::kDropsWiringArmed);
 
-    std::printf("-- DD1 the XMR build arms raindrops by default\n");
+    std::printf("-- DD1 the default XMR build leaves raindrops off\n");
     const ::c2pool::v37n::xmr::XmrNodeConfig cfg;
-    const ::v37::LaneParams on = ::v37::LaneParams::for_version(1);
 #ifdef V37_XMR_DROPS_DEFAULT
-    check(true, "DD1 V37_XMR_DROPS_DEFAULT is defined for this XMR target (CMake c2pool_xmr_drops_default)");
+    check(false, "DD1 V37_XMR_DROPS_DEFAULT is not defined for this XMR target (CMake option OFF)");
 #else
-    check(false, "DD1 V37_XMR_DROPS_DEFAULT is defined for this XMR target (CMake c2pool_xmr_drops_default)");
+    check(true, "DD1 V37_XMR_DROPS_DEFAULT is not defined for this XMR target (CMake option OFF)");
 #endif
-    check(n37::kActivateConsensusV1 && n37::kDropsWiringArmed && n37::kActivationArity == 1,
-          "DD1 kActivateConsensusV1 && kDropsWiringArmed at arity 1 (DROPS only, ridge OFF)");
-    check(cfg.lane_params.subthreshold.enabled && cfg.lane_params.subthreshold.K == on.subthreshold.K &&
-          cfg.lane_params.subthreshold.version == on.subthreshold.version,
-          "DD1 XmrNodeConfig{}.lane_params carries the DROPS gate of for_version(1) (K=" +
-          std::to_string(cfg.lane_params.subthreshold.K) + ")");
-    check(cfg.lane_params.subthreshold.mode == 2 && cfg.lane_params.subthreshold.count_floor_shift == 6,
-          "DD1 the default XMR lane credits raindrops by Count (mode 2, floor shift 6)");
-    check(!cfg.lane_params.fee.enabled, "DD1 the fee model stays opt-in (--fee-model v1)");
-    check(n37::make_drops_wiring(cfg.lane_params).has_value(), "DD1 make_drops_wiring(default lane) is armed");
+    check(!n37::kActivateConsensusV1 && !n37::kDropsWiringArmed,
+          "DD1 kActivateConsensusV1 and kDropsWiringArmed are false");
+    check(!cfg.lane_params.subthreshold.enabled, "DD1 XmrNodeConfig{}.lane_params carries no DROPS gate");
+    check(!cfg.lane_params.fee.enabled, "DD1 the fee model is off");
+    check(!n37::make_drops_wiring(cfg.lane_params).has_value(), "DD1 make_drops_wiring(default lane) is not armed");
 
     std::printf("== v37_xmr_drops_default_kat: %d passed, %d failed -> %s\n", g_pass, g_fail, g_fail ? "FAIL" : "OK");
     return g_fail ? 1 : 0;

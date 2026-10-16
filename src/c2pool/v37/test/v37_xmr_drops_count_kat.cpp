@@ -9,7 +9,8 @@
 // drops floor at the floor's own work (SubthresholdGate mode 2, Count), the
 // work its TARGET expected (paper §5), in the design's integer unit.
 //
-//   CT1 the XMR default lane selects Count (mode 2, floor shift 6).
+//   CT1 DROPS is off in the default XMR build; the XMR lane over armed
+//       parameters (for_version(1)) selects Count (mode 2, floor shift 6).
 //   CT2 integer exactness on the 288-bit normalised geometry (lz = 32):
 //       att(floor) = floor(2^256 / 2^230) = 2^26 = 1/64 of a share's 2^32;
 //       Hhat = (S + J) * 2^26; REPLACE delta = (S + J) * 2^26 - S * 2^32.
@@ -75,10 +76,12 @@ int main() {
     const st::u256 hT = ::c2pool::v37n::drops_detail::h_t_of_lz(::c2pool::v37n::xmr::kXmrDropsLz);   // 2^224 - 1
     const std::uint32_t SH = ::c2pool::v37n::xmr::kXmrDropsFloorShift;
 
-    std::printf("-- CT1 the XMR default lane selects Count\n");
+    std::printf("-- CT1 the XMR lane: DROPS off by default; armed parameters select Count\n");
     {
-        const ::v37::LaneParams p = ::c2pool::v37n::xmr::xmr_lane_params_default();
-        check(p.subthreshold.enabled, "CT1 DROPS is on in the XMR build");
+        check(!::c2pool::v37n::xmr::xmr_lane_params_default().subthreshold.enabled,
+              "CT1 DROPS is off in the default XMR build");
+        const ::v37::LaneParams p = ::c2pool::v37n::xmr::xmr_lane_params_of(::v37::LaneParams::for_version(1));
+        check(p.subthreshold.enabled, "CT1 the XMR lane over for_version(1) arms DROPS");
         check(p.subthreshold.mode == 2 && p.subthreshold.count_floor_shift == 6,
               "CT1 mode 2 (Count), floor shift 6 (share_diff / 64)");
         const auto sp = settle::to_subthreshold_params(p);

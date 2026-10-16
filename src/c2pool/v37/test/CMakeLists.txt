@@ -1600,9 +1600,8 @@ if (BUILD_TESTING)
     add_test(NAME v37_xmr_boost_origin_kat COMMAND v37_xmr_boost_origin_kat)
 endif()
 
-# XMR-DROPS-DEFAULT: every XMR KAT in this directory is built the way the XMR
-# node is (raindrops armed; c2pool_xmr_drops_default in src/c2pool). The non-XMR
-# KATs keep the flip at 0 (v37_drops_activation_kat pins exactly that).
+# V37_XMR_DROPS_DEFAULT: every XMR KAT in this directory is built the way the XMR
+# node is (c2pool_xmr_drops_default in src/c2pool; default OFF).
 if (COMMAND c2pool_xmr_drops_default)
     get_property(_v37_xmr_dd_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_t IN LISTS _v37_xmr_dd_targets)
