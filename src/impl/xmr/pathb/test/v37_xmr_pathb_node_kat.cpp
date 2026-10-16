@@ -113,6 +113,10 @@
 //   ownbound     the kept own shares bounded by the jobs' lifetime: a stale
 //                one leaves though RandomX fails before it; clear()
 //                releases the issued jobs;
+//   blockblob    the block blob of a Path B job (PathbJobSource, a window of
+//                three payees) pinned byte for byte: no transactions, 12
+//                transactions, a set filled to within one candidate of the
+//                weight cap, and a job carrying 16 receipts;
 //   relaystale   a gone peer's events (in flight, posted by its blocked
 //                reader) skipped: no join hold for the gone peer;
 //   relaytip     on_monero_tip from the follower's thread and under the node
@@ -3035,6 +3039,120 @@ void ownbound() {
 }
 
 // ---------------------------------------------------------------------------
+// blockblob: the block blob of a Path B job, as the job source builds it (the header through the nonce, the miner tx
+// prefix and its RCTTypeNull byte, varint(n), the transaction ids), pinned by length and keccak256 for four jobs on a
+// window of three payees. V37_PATHB_BLOB_GOLDEN_PRINT=1 prints the values.
+struct BlobGolden {
+    const char* name;
+    std::size_t len;
+    const char* keccak;
+};
+const BlobGolden kBlobGoldens[] = {
+        {"empty", 291, "9f6134c3b6179437aed084eb9a7490e9b77429ad222150e86c0ec8aa20d4d7de"},     // n_tx 0
+        {"typical", 675, "49be1bf41e5a56ed759916e44fa90ea51896a82403ec18f711db8e2fa079e7a5"},   // n_tx 12
+        {"nearcap", 4420, "e19f65a2734aeaa7ea215c47e379bd4bbfe7b9d7ee1595f93d5b0bc4ef258703"},  // n_tx 129, 299,951 B
+        {"carried", 451, "27c00800e6a18f2ee1994ed2dc8e36a75d29b29eb8fbda93354a1d977dd74042"},   // n_tx 5, 16 carried
+};
+
+std::string hex_of_bytes(const std::uint8_t* p, std::size_t n) {
+    static const char* k = "0123456789abcdef";
+    std::string s;
+    for (std::size_t i = 0; i < n; ++i) {
+        s.push_back(k[p[i] >> 4]);
+        s.push_back(k[p[i] & 15]);
+    }
+    return s;
+}
+
+std::vector<pb::TemplateTx> blob_txs(std::size_t n, std::uint64_t w0, std::uint64_t dw, std::uint8_t salt) {
+    std::vector<pb::TemplateTx> v;
+    for (std::size_t k = 0; k < n; ++k) {
+        pb::TemplateTx t;
+        t.hash = seq32(static_cast<std::uint8_t>(salt + k));
+        t.hash[31] = static_cast<std::uint8_t>(k >> 8);
+        t.hash[30] = static_cast<std::uint8_t>(k);
+        t.weight = w0 + (k * dw) % 2048;
+        t.fee = 30000000 + 7919 * k;
+        v.push_back(t);
+    }
+    return v;
+}
+
+void blockblob() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, 1 + i % 3, 70 + i);
+    }
+    struct Got {
+        std::vector<std::uint8_t> blob;
+        std::size_t n_tx = 0;
+        std::uint64_t w_tx = 0;
+        std::size_t cw = 0;
+        std::size_t carried = 0;
+        std::size_t outs = 0;
+    };
+    auto blob_of = [&](std::size_t payee, std::uint32_t en) {
+        Got g;
+        pb::PathbJobSource js([&](const pb::PathbTemplate& t, const pb::PathbSession& ss) { return h[a].make_job(t, ss); });
+        const pb::PathbTemplate t = h[a].make_template(h.now);
+        if (t.status != pb::TemplateStatus::Ok) return g;
+        const std::uint32_t tid = js.set_template(t, pb::JobNetwork{});
+        js.bind(en, h.session(payee, en));
+        ::v37::xmr::stratum::TemplateJob out;
+        if (!js.get_job(en, out)) return g;
+        const std::optional<pb::IssuedJob> ij = js.issued(tid, en);
+        if (!ij) return g;
+        g.blob = ij->block_blob;
+        g.n_tx = t.txs.size();
+        for (const pb::TemplateTx& x : t.txs) g.w_tx += x.weight;
+        g.cw = ij->job.miner_tx.prefix.size() + 1;
+        g.carried = ij->job.carried.size();
+        g.outs = ij->job.miner_tx.outs.size();
+        return g;
+    };
+    std::vector<std::pair<std::string, Got>> got;
+    h.txs.clear();
+    got.emplace_back("empty", blob_of(1, 11));
+    h.txs = blob_txs(12, 1500, 173, 0x40);
+    got.emplace_back("typical", blob_of(2, 12));
+    h.txs = blob_txs(240, 1400, 37, 0x60);
+    got.emplace_back("nearcap", blob_of(3, 13));
+    h.txs.clear();
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t k = 0; k < 17; ++k) jobs.push_back(*h.job(a, k + 2, 600 + k));
+    h.mine(a, 1, 90);
+    for (std::uint32_t k = 0; k < 17; ++k) (void)h[a].on_own_share(jobs[k], 600 + k, pb::Hash32{});
+    h.txs = blob_txs(5, 2000, 311, 0x80);
+    got.emplace_back("carried", blob_of(1, 14));
+
+    const bool print = std::getenv("V37_PATHB_BLOB_GOLDEN_PRINT") != nullptr;
+    const std::uint64_t z = 300000;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const Got& g = got[i].second;
+        const pb::Hash32 k = pb::keccak256_hash(g.blob);
+        const std::string kh = hex_of_bytes(k.data(), k.size());
+        if (print)
+            std::printf("        {\"%s\", %zu, \"%s\"},   // n_tx %zu, w_tx %llu, cw %zu, outs %zu, carried %zu\n",
+                        got[i].first.c_str(), g.blob.size(), kh.c_str(), g.n_tx, (unsigned long long)g.w_tx, g.cw,
+                        g.outs, g.carried);
+        const BlobGolden& gd = kBlobGoldens[i];
+        check(!g.blob.empty() && got[i].first == gd.name && g.blob.size() == gd.len && kh == gd.keccak,
+              std::string("blockblob: ") + gd.name + ": the job's block blob (" + std::to_string(g.blob.size()) +
+                      " B, n_tx " + std::to_string(g.n_tx) + ") equals the pinned bytes");
+    }
+    check(got[0].second.n_tx == 0 && got[1].second.n_tx == 12, "blockblob: the empty and the typical job hold 0 and 12 transactions");
+    const Got& nc = got[2].second;
+    check(nc.n_tx > 0 && nc.n_tx < 240 && nc.w_tx + nc.cw <= z && z - (nc.w_tx + nc.cw) < 1400 + 2048,
+          "blockblob: the near-cap job is filled to within one candidate of Z = 300,000 (" +
+                  std::to_string(nc.w_tx + nc.cw) + " B)");
+    check(got[3].second.carried == 16 && got[3].second.outs >= 3,
+          "blockblob: the carried job carries 16 receipts on a window of " + std::to_string(got[3].second.outs) + " outputs");
+}
+
+// ---------------------------------------------------------------------------
 // alarmbound: the node's alarm sink does not grow with its life: 1,000 alarms (600 R12 node-internal, 400 R9 claim)
 // are 1,000 counted, 600 of them R12 node-internal read in O(1), the last one kept; no list of entries is held.
 template <class S>
@@ -4351,6 +4469,7 @@ int main(int argc, char** argv) {
     run("relayp15", relayp15);
     run("relayp15rx", relayp15rx);
     run("ownbound", ownbound);
+    run("blockblob", blockblob);
     run("alarmbound", alarmbound);
     run("relaystale", relaystale);
     run("relaytip", relaytip);
