@@ -533,6 +533,7 @@ void partition() {
     h[fa].set_join_transport(&tr);
     h.mon_tip = h_pos(9000) + 1;
     (void)h.hello(fa, fb);
+    const pb::NodeEventResult own = h.mine(fa, 0, 31, false);  // an own carrier on A (watched; orphaned by rule (4))
     const pb::JoinServeFloors f = h[fb].serve_floors_now();
     const std::uint64_t base = h[fa].store().base_pos();
     check(f.headers > base && base > 2000,
@@ -546,6 +547,11 @@ void partition() {
           "partition: the scan asks no header below x0(L') - N_rt; the fork below it, in scope; rule (4) replaces A (kind "
                   + std::to_string(static_cast<int>(o.kind)) + ")"
                   + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    check(own.action == pb::NodeAction::Placed && h[fa].own_carriers() == 1 && h[fa].own_orphaned() == 1
+                  && h[fa].own_watch_size() == 0,
+          "partition: A's own carrier was watched and the joiner switch orphaned it (" +
+                  std::to_string(h[fa].own_orphaned()) + "); the watch is empty (" + std::to_string(h[fa].own_watch_size()) +
+                  ")");
     std::printf("  partition: %.1f s\n", secs_since(t0));
 }
 

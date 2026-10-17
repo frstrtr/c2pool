@@ -523,6 +523,12 @@ public:
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
     // The re-pended receipts still pending (at most the pending cap): each leaves at its placement or its seal.
     std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
+    // Own carriers placed on the best chain since start, and those orphaned (no longer best at their position). Each
+    // is watched until it is below the journal base (confirmed) or orphaned, a joiner switch included: at most J
+    // positions; the watch starts empty at every start.
+    std::uint64_t own_carriers() const noexcept { return own_carriers_; }
+    std::uint64_t own_orphaned() const noexcept { return own_orphaned_; }
+    std::size_t own_watch_size() const noexcept { return own_watch_.size(); }
     // The open state at the best tip (S4.7): the live placements of the open bins (open_bin_placements) and the v3
     // wire bytes of their receipt bodies (each found in its placing carrier's body).
     struct OpenState {
@@ -612,6 +618,7 @@ public:
         if (out.switched) {
             ++switches_.joiner_switches;
             switches_.joiner_lost += out.sw.lost;
+            watch_own_carriers();
         }
         return out;
     }
@@ -1090,6 +1097,11 @@ public:
             c.carried = job.carried;
             const std::optional<std::vector<std::uint8_t>> f = encode_fc_carrier(cfg_.identity.chain_id, c, cfg_.p.r_max);
             if (f) out = complete_carrier(begin_carrier(kOwnPeer, *f, false));
+            if (out.action == NodeAction::Placed || out.action == NodeAction::Switched)
+                if (const CarrierNode* n = tree_->find(own_id); n != nullptr && store_->best_at(n->pos) == own_id) {
+                    own_watch_[own_id] = n->pos;
+                    ++own_carriers_;
+                }
         } else {
             std::vector<std::uint8_t> body;
             encode_receipt_body_v3(r, body);
@@ -2660,6 +2672,24 @@ private:
         });
         for (auto it = repend_watch_.begin(); it != repend_watch_.end();)  // evicted from the pending set meanwhile
             it = pending_.holds(*it) ? std::next(it) : repend_watch_.erase(it);
+        watch_own_carriers();
+    }
+
+    // Each watched own carrier: orphaned when the best chain no longer holds it at its position; confirmed (no longer
+    // watched) once it is below the journal base.
+    void watch_own_carriers() {
+        const std::uint64_t base = store_->base_pos();
+        for (auto it = own_watch_.begin(); it != own_watch_.end();) {
+            const std::optional<Hash32> at = store_->best_at(it->second);
+            if (!at || *at != it->first) {
+                ++own_orphaned_;
+                it = own_watch_.erase(it);
+            } else if (it->second < base) {
+                it = own_watch_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     // The receipts this node holds pending whose origin bin is open at a carrier's parent and that the carrier, with
@@ -2821,6 +2851,9 @@ private:
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
     std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
+    std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos
+    std::uint64_t own_carriers_ = 0;
+    std::uint64_t own_orphaned_ = 0;
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

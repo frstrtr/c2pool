@@ -147,6 +147,9 @@
 //                DoS token, one placed on its re-run (a duplicate: none);
 //   openstate    the open state at the best tip: its live placements and
 //                their receipt bodies' wire bytes, against a sum by hand;
+//   ownorphan    own carriers watched until confirmed (below the journal
+//                base) or orphaned (a lost race): the loser counts one; a
+//                third node extends the chain past J: the watches are empty;
 //   relayomit    the per-peer omission log: a peer's carrier with room that
 //                leaves out a receipt this node holds pending is counted for
 //                that peer's link; every link down empties the log;
@@ -5115,6 +5118,48 @@ void openstate() {
                   std::to_string(o.bytes) + " B; by hand " + std::to_string(n) + ", " + std::to_string(bytes) + " B");
 }
 
+// ownorphan: own carriers are watched (J = 4) until confirmed or orphaned. A mines 3 carriers; A and B race at one
+// position, the links cut; the loser of the tie counts its carrier orphaned. C extends the winner's chain 6 positions:
+// every own carrier A and B watched falls below the journal base: both watches are empty; the counts stay.
+void ownorphan() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true, 4), b = h.add(table0(net), true, 4), c = h.add(table0(net), true, 4);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 30 + i);
+    }
+    const bool three = h[a].own_carriers() == 3 && h[a].own_watch_size() >= 1 && h[a].own_orphaned() == 0;
+    h.cut = {{a, b}, {b, a}, {a, c}, {c, a}, {b, c}, {c, b}};
+    h.mine(a, 2, 940);
+    h.mine(b, 3, 941);
+    const pb::Hash32 ca = h[a].tree().best().id, cb = h[b].tree().best().id;
+    h.cut.clear();
+    const std::vector<std::uint8_t> fa = *pb::encode_fc_carrier(0, *h[a].bodies().get(ca), 16);
+    const std::vector<std::uint8_t> fb = *pb::encode_fc_carrier(0, *h[b].bodies().get(cb), 16);
+    (void)h[a].on_carrier(b, fb);
+    (void)h[b].on_carrier(a, fa);
+    (void)h[c].on_carrier(a, fa);
+    (void)h[c].on_carrier(b, fb);
+    h.pump();
+    const pb::Hash32 winner = ca < cb ? ca : cb;
+    const std::size_t lnode = ca < cb ? b : a, wnode = ca < cb ? a : b;
+    check(three && ca != cb && h[a].tree().best().id == winner && h[b].tree().best().id == winner
+                  && h[lnode].own_orphaned() == 1 && h[wnode].own_orphaned() == 0,
+          "ownorphan: A's 3 carriers watched; the loser of the race counts its carrier orphaned (" +
+                  std::to_string(h[lnode].own_orphaned()) + "), the winner none (" + std::to_string(h[wnode].own_orphaned()) +
+                  ")");
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(c, 4, 950 + i);
+    }
+    check(h[c].tree().best().id == h[a].tree().best().id && h[a].own_watch_size() == 0 && h[b].own_watch_size() == 0
+                  && h[a].own_carriers() == 4 && h[lnode].own_orphaned() == 1,
+          "ownorphan: C extended the chain past J: A's and B's watches are empty (" + std::to_string(h[a].own_watch_size()) +
+                  ", " + std::to_string(h[b].own_watch_size()) + "); A placed " + std::to_string(h[a].own_carriers()) +
+                  " own carriers, the loser's orphan count stays 1");
+}
+
 // relayomit: the per-peer omission log. B holds a receipt pending that never reaches A (B's frames to A dropped); A's
 // next carrier, with room, carries none of it: B logs one omission for A's link. B's link to A goes down: the log is
 // empty, the total kept.
@@ -5655,6 +5700,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("openstate", openstate);
+    run("ownorphan", ownorphan);
     run("relayomit", relayomit);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);

@@ -1533,6 +1533,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::uint64_t leaf_count = 0;
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
+        std::uint64_t own_carriers = 0, own_orphaned = 0;
         pb::PathbNode::OpenState open{};
     };
     const auto node_view = [&]() {
@@ -1557,6 +1558,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
             v.coinbase_internal = n.alarms().count_of(pb::RowId::R12, pb::Missing::NodeInternal);
             v.sw = n.switch_counts();
+            v.own_carriers = n.own_carriers();
+            v.own_orphaned = n.own_orphaned();
             v.open = n.open_state();
             return v;
         });
@@ -1771,7 +1774,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::printf("status: up=%llus monero=%llu best pos=%llu id=%s cum_work=%s epoch=%u H_hold=%llu "
                         "window_root=%s mmr_root=%s leaves=%llu pending=%zu deferred=%zu re-pended(last switch)=%llu "
                         "lost(last switch)=%llu switches=%llu re-pended=%llu carried=%llu sealed-pending=%llu lost=%llu "
-                        "joiner-switches=%llu joiner-lost=%llu template=%s%s%s templates=%llu\n",
+                        "joiner-switches=%llu joiner-lost=%llu own-carriers=%llu own-orphaned=%llu template=%s%s%s "
+                        "templates=%llu\n",
                         static_cast<unsigned long long>(now - t0),
                         static_cast<unsigned long long>(tipm ? tipm->height : 0), static_cast<unsigned long long>(nv.pos),
                         hex_of(nv.best).substr(0, 16).c_str(), nv.cum_work.c_str(), static_cast<unsigned>(nv.hold.epoch_cur),
@@ -1783,7 +1787,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(nv.sw.switches), static_cast<unsigned long long>(nv.sw.repended),
                         static_cast<unsigned long long>(nv.sw.carried), static_cast<unsigned long long>(nv.sw.sealed_pending),
                         static_cast<unsigned long long>(nv.sw.lost), static_cast<unsigned long long>(nv.sw.joiner_switches),
-                        static_cast<unsigned long long>(nv.sw.joiner_lost), template_status_name(tstatus),
+                        static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
+                        static_cast<unsigned long long>(nv.own_orphaned), template_status_name(tstatus),
                         tstatus_why.empty() ? "" : " ", tstatus_why.c_str(), static_cast<unsigned long long>(templates));
             if (nv.poisoned || fork_fuse || template_kept || nv.coinbase_internal != 0 || nv.hold.hold)
                 std::printf("  ALARM:%s%s%s%s%s\n", nv.poisoned ? " store-poisoned(no template; the joiner path at the next start)" : "",
