@@ -164,6 +164,7 @@ public:
 
     std::size_t   size()  const noexcept { return blocks_.size(); }
     std::uint64_t bytes() const noexcept { return bytes_; }
+    std::uint64_t bytes_peak() const noexcept { return bytes_peak_; }  // the most bytes held after an insert
 
     bool contains(const Hash& id) const { return blocks_.count(key_(id)) != 0; }
 
@@ -190,12 +191,14 @@ public:
             bytes_ -= it->second.bytes;
             it->second = std::move(b);
             bytes_ += it->second.bytes;
+            bytes_peak_ = std::max(bytes_peak_, bytes_);
             return true;
         }
         bytes_ += b.bytes;
         children_[key_(b.prev_id)].push_back(k);
         blocks_.emplace(k, std::move(b));
         evict_();
+        bytes_peak_ = std::max(bytes_peak_, bytes_);
         return blocks_.count(k) != 0;
     }
 
@@ -368,6 +371,7 @@ private:
     std::map<Key, AltBlock>            blocks_;
     std::map<Key, std::vector<Key>>    children_;
     std::uint64_t                      bytes_      = 0;
+    std::uint64_t                      bytes_peak_ = 0;
     std::size_t                        max_blocks_ = 512;
     std::uint64_t                      max_bytes_  = 32ull * 1024ull * 1024ull;
 };

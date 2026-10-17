@@ -344,6 +344,18 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// The follower's alt store count in force (--alt-max-blocks, else the index's default, k_alt), set on the rows (the
+// kept rows' bound) before they load; one line when it is below k_alt.
+// ---------------------------------------------------------------------------
+static void apply_alt_max_blocks(const XmrNodeConfig& cfg, pb::PathbFollowerRows& rows, const char* who) {
+    const std::size_t n = cfg.alt_max_blocks ? cfg.alt_max_blocks : native::ChainIndexOptions{}.alt_max_blocks;
+    rows.set_alt_max_blocks(n);
+    if (n < pb::kAltDepth)
+        std::printf("%s: --alt-max-blocks %zu below k_alt %llu: a context climb deeper than %zu alternative blocks is not "
+                    "servable\n", who, n, static_cast<unsigned long long>(pb::kAltDepth), n);
+}
+
+// ---------------------------------------------------------------------------
 // The embedded native Monero node. Returns null on refusal, the reason printed.
 // ---------------------------------------------------------------------------
 static std::unique_ptr<o2::NativeTemplateBackend> start_native_backend(const XmrNodeConfig& cfg,
@@ -468,6 +480,7 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     pb::PathbFollowerRows rows(pmode::follow_only_row_weights_path(dir));
+    apply_alt_max_blocks(cfg, rows, "follow-only");
     std::string why;
     if (!rows.load(why)) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
     else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
@@ -913,6 +926,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::error_code ec;
     std::filesystem::create_directories(follower_dir, ec);
     pb::PathbFollowerRows rows((follower_dir / "row_weights").string());
+    apply_alt_max_blocks(cfg, rows, "follower");
     {
         std::string why;
         if (!rows.load(why)) std::printf("follower: %s -- starting with an empty table\n", why.c_str());
@@ -1784,12 +1798,15 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             {
                 const pb::PathbRelayStats& rs = relay->stats();
                 const pb::OwnShareRunner::Stats os = own_runner.stats();
+                const std::uint64_t alt_bytes_now = nn->index().alt_bytes(), alt_bytes_peak = nn->index().alt_bytes_peak();
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
                             "reoffer_queue_full_drops=%llu live_queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
                             "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
-                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu\n",
+                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu "
+                            "reoffer_cap_drops=%llu parked_receipts=%zu parked_receipts_sealed=%llu alt_blocks_max=%zu "
+                            "alt_bytes=%llu alt_bytes_peak=%llu alt_bytes_max=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1812,7 +1829,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
                             static_cast<unsigned long long>(rs.parked_reruns.load()),
                             static_cast<unsigned long long>(rs.repend_offers.load()),
-                            static_cast<unsigned long long>(rs.repend_offered.load()));
+                            static_cast<unsigned long long>(rs.repend_offered.load()),
+                            static_cast<unsigned long long>(rs.reoffer_cap_drops.load()), relay->parked_receipts(),
+                            static_cast<unsigned long long>(rs.parked_receipts_sealed.load()), nn->index().alt_max_blocks(),
+                            static_cast<unsigned long long>(alt_bytes_now), static_cast<unsigned long long>(alt_bytes_peak),
+                            static_cast<unsigned long long>(nn->index().alt_max_bytes()));
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
@@ -2172,7 +2193,9 @@ static void print_help() {
             "                               locally assembled genesis block. A found block that reached no peer\n"
             "                               counts as landed when OUR OWN index accepts it.\n"
             "  --native-inject  --native-inject-dir <dir>  --native-inject-hex <file>  --native-inject-ttl-blocks <n>\n"
-            "  --same-height-tiebreak <prefer-own|first-seen>  --own-fork-bound-s <n>  --test-unknown-fork-stall-s <n>\n");
+            "  --same-height-tiebreak <prefer-own|first-seen>  --own-fork-bound-s <n>  --test-unknown-fork-stall-s <n>\n"
+            "  --alt-max-blocks <n>         alternative Monero blocks the follower keeps and serves (default 720 = k_alt,\n"
+            "                               one full context climb; at least 1)\n");
 }
 
 int main(int argc, char** argv) {
@@ -2380,6 +2403,10 @@ int main(int argc, char** argv) {
                     throw cs::UsageError("--same-height-tiebreak takes prefer-own or first-seen, not '" + m + "'");
             } else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
             else if (a == "--test-unknown-fork-stall-s") cfg.test_unknown_fork_stall_s = u32();
+            else if (a == "--alt-max-blocks") {
+                cfg.alt_max_blocks = static_cast<std::size_t>(u64(std::numeric_limits<std::uint32_t>::max()));
+                if (cfg.alt_max_blocks == 0) throw cs::UsageError("--alt-max-blocks takes at least 1");
+            }
             else if (a == "--data-dir") cfg.data_dir = value();
             else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
             else if (a == "--randomx") cfg.randomx_enabled = true;

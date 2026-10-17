@@ -190,6 +190,9 @@ struct XmrNodeConfig {
     //   watch's stall period (FORK-FUSE-2; default 30 min) so a regtest rig can
     //   watch a trip and a clear. REFUSED on mainnet. 0 = the default.
     std::uint32_t      test_unknown_fork_stall_s = 0;
+    //   --alt-max-blocks <n>  the native index's alt store: alternative Monero blocks kept (and their blobs kept
+    //   across a restart). Policy; default 0 = k_alt (720, one full P-07 context climb servable); floor 1.
+    std::size_t        alt_max_blocks = 0;
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";

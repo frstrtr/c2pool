@@ -1085,14 +1085,19 @@ static void test_resume_reorg_below() {
            to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
 }
 
-// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows (721 + 512 = 1,233 at the code's values). A well-formed kept
-// file of 1,233 rows loads; one of 1,234 is refused before its rows are read (the main rows load, the message says so).
+// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows, alt_max_blocks = k_alt by default (721 + 720 = 1,441 at
+// the code's values). A well-formed kept file of 1,441 rows loads; one of 1,442 is refused before its rows are read (the
+// main rows load, the message says so). With --alt-max-blocks 10 the bound follows: 731.
 static void test_kept_cap() {
     namespace fs = std::filesystem;
     namespace pbn = c2pool::xmr::pathb;
     const std::uint64_t cap = pbn::kept_rows_cap();
-    checkf(cap == 720 + 1 + ChainIndexOptions{}.alt_max_blocks && cap == 1233, "keptcap: the cap is 721 + 512 = 1,233 (%llu)",
-           static_cast<unsigned long long>(cap));
+    checkf(ChainIndexOptions{}.alt_max_blocks == ChainIndexOptions{}.max_reorg_depth
+                   && ChainIndexOptions{}.alt_max_blocks == pbn::kAltDepth && cap == (pbn::kAltDepth + 1) + pbn::kAltDepth
+                   && cap == 1441,
+           "keptcap: alt_max_blocks = k_alt = 720; the cap is 721 + 720 = 1,441 (%llu)", static_cast<unsigned long long>(cap));
+    checkf(pbn::kept_rows_cap(10) == 731, "keptcap: with --alt-max-blocks 10 the cap is 731 (%llu)",
+           static_cast<unsigned long long>(pbn::kept_rows_cap(10)));
     const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_cap_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);

@@ -774,14 +774,15 @@ void test_evict_far_unresolved_first() {
 void test_far_pushes_not_parked_while_behind() {
     Rig rig;
     if (!rig.ok) return;
-    const std::uint64_t N = 900;
+    // 300 pushes of blocks farther above our tip than the pool holds (alt_max_blocks: k_alt = 720 by default):
+    // pool + 88 .. pool + 387 above the anchor
+    const std::uint64_t pool = native::ChainIndexOptions{}.alt_max_blocks;
+    const std::uint64_t first = pool + 88, N = first + 300;
     for (std::uint64_t k = 0; k < N; ++k) rig.grow(false);
     rig.advertise();
     kat::check(!rig.idx->sync_state().synced, "D2: behind the cohort");
 
-    // 300 pushes of blocks 600..899 above the anchor: every one of them farther
-    // above our tip than the 512-block pool.
-    for (std::uint64_t h = kAnchorHeight + 600; h < kAnchorHeight + N; ++h) rig.push_full(h);
+    for (std::uint64_t h = kAnchorHeight + first; h < kAnchorHeight + N; ++h) rig.push_full(h);
     const std::size_t alt = rig.idx->alt_size();
     const std::size_t rf  = rig.idx->refetch_wanted().size();
     kat::checkf(alt == 0, "D2: far pushes are not parked while behind (alt %zu)", alt);

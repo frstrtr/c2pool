@@ -102,8 +102,9 @@ inline constexpr std::size_t MAX_CHAIN_ENTRY_IDS = 25000;   // BLOCKS_IDS_SYNCHR
 struct ChainIndexOptions {
     XmrNet        net             = XmrNet::Mainnet;
     std::size_t   row_retention   = 2048;                  // D-9, one RandomX epoch
-    std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis
-    std::size_t   alt_max_blocks  = 512;
+    std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis (k_alt, P-07)
+    // the alt store's blocks: one full context climb (max_reorg_depth = k_alt alternative blocks) servable
+    std::size_t   alt_max_blocks  = static_cast<std::size_t>(max_reorg_depth);
     std::uint64_t alt_max_bytes   = 32ull * 1024 * 1024;
     std::size_t   entry_cache     = 1024;                  // bodies kept for re-apply
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
@@ -630,6 +631,18 @@ public:
         return r.outcome == OfferOutcome::Connected || r.outcome == OfferOutcome::Reorged
             || r.outcome == OfferOutcome::Duplicate;
     }
+
+    // The alt store: its bytes now, the most it held, and its caps (blocks, bytes).
+    std::uint64_t alt_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.bytes();
+    }
+    std::uint64_t alt_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.bytes_peak();
+    }
+    std::size_t alt_max_blocks() const noexcept { return opts_.alt_max_blocks; }
+    std::uint64_t alt_max_bytes() const noexcept { return opts_.alt_max_bytes; }
 
     SyncState sync_state() const override {
         std::lock_guard<std::mutex> lk(mu_);
