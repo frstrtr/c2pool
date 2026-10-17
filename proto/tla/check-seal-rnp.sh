@@ -10,6 +10,7 @@
 #                                        V1_rnp_own_n2r4 V1_rnp_carriage_n2r4
 #          with a Monero reorg at a constant height, a node restart, three carried ids:
 #                                        V1_rnp_own_n2r4_reorg V1_rnp_own_n2r4_restart V1_rnp_own_n1r5_k3
+#                                        V1_rnp_own_n2r4_k3
 #   controls (the named invariant is violated):
 #          V1_rnp_neg_openlocal_n2r4   Agreement
 #          V1_rnp_neg_omitlocal_n2r4   Agreement
@@ -68,6 +69,7 @@ run V1_rnp_carriage_n2r4; green V1_rnp_carriage_n2r4 184907 17
 run V1_rnp_own_n2r4_reorg;   green V1_rnp_own_n2r4_reorg   3131274 18
 run V1_rnp_own_n2r4_restart; green V1_rnp_own_n2r4_restart 369814 18
 run V1_rnp_own_n1r5_k3;    green V1_rnp_own_n1r5_k3    1898658 14
+run V1_rnp_own_n2r4_k3;    green V1_rnp_own_n2r4_k3    243326 17
 
 run V1_rnp_neg_openlocal_n2r4;      expect V1_rnp_neg_openlocal_n2r4      'Invariant Agreement is violated'
 run V1_rnp_neg_omitlocal_n2r4;      expect V1_rnp_neg_omitlocal_n2r4      'Invariant Agreement is violated'
