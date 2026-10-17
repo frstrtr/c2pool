@@ -344,12 +344,13 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// The follower's alt store count in force (--alt-max-blocks, else the index's default, k_alt), set on the rows (the
-// kept rows' bound) before they load; one line when it is below k_alt.
+// The follower's alt store caps in force (--alt-max-blocks, else the index's default, k_alt; the index's byte cap), set
+// on the rows (the kept rows' and kept blobs' bounds) before they load; one line when the count is below k_alt.
 // ---------------------------------------------------------------------------
 static void apply_alt_max_blocks(const XmrNodeConfig& cfg, pb::PathbFollowerRows& rows, const char* who) {
     const std::size_t n = cfg.alt_max_blocks ? cfg.alt_max_blocks : native::ChainIndexOptions{}.alt_max_blocks;
     rows.set_alt_max_blocks(n);
+    rows.set_alt_max_bytes(native::ChainIndexOptions{}.alt_max_bytes);
     if (n < pb::kAltDepth)
         std::printf("%s: --alt-max-blocks %zu below k_alt %llu: a context climb deeper than %zu alternative blocks is not "
                     "servable\n", who, n, static_cast<unsigned long long>(pb::kAltDepth), n);
@@ -483,6 +484,7 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
     apply_alt_max_blocks(cfg, rows, "follow-only");
     std::string why;
     if (!rows.load(why)) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
+    else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     if (!plan.native_node) return 2;
 
@@ -930,8 +932,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     {
         std::string why;
         if (!rows.load(why)) std::printf("follower: %s -- starting with an empty table\n", why.c_str());
-        else std::printf("follower: row weights %s (%zu loaded)%s%s\n", rows.path().c_str(), rows.loaded(),
-                         why.empty() ? "" : "; ", why.c_str());
+        else std::printf("follower: row weights %s (%zu loaded, %zu kept blobs)%s%s\n", rows.path().c_str(), rows.loaded(),
+                         rows.kept_blobs_loaded(), why.empty() ? "" : "; ", why.c_str());
     }
     std::unique_ptr<LiveMonerodTransport> transport;
     if (plan.monerod_transport) transport = std::make_unique<LiveMonerodTransport>(cfg.monerod);
@@ -1174,7 +1176,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     relay->attach(*node);
     {
         pb::PathbCtxSource cs;
-        cs.block_blob = [nn](const pb::Hash32& id, std::vector<std::uint8_t>& blob) { return nn->index().block_blob_of(id, blob); };
+        cs.block_blob = pb::served_ctx_blob(
+                [nn](const pb::Hash32& id, std::vector<std::uint8_t>& blob) { return nn->index().block_blob_of(id, blob); }, &rows);
         cs.chain.verified = [nn](const ::v37::bytes32& id) {
             node::Hash h{};
             std::memcpy(h.data(), id.data(), 32);

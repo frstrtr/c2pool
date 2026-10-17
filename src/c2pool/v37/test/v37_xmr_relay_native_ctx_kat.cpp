@@ -56,17 +56,25 @@
 //       carriers whose P_r the node does not hold (the fifth held at P-06),
 //       the receipt class is full; a join attempt's want is still taken at
 //       the join's bound (P-07)
+//   N10 a kept alternative block no native index holds, carried by A's kept
+//       files (row_weights_kept and row_weights_kept_blobs, as a restarted
+//       node loads them): A serves it from the kept blob, C resolves it
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <thread>
 
+#include <unistd.h>
+
 #include "xmr_pathb_relay_test_util.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_follower_rows.hpp"
 
 using namespace pathb_relay_test;
 using namespace std::chrono_literals;
@@ -86,6 +94,7 @@ struct FakeIndex {
 
 struct TNode {
     FakeIndex idx;
+    std::unique_ptr<pb::PathbFollowerRows> kept;  // the kept rows and blobs (row_weights_kept_blobs), loaded on demand
     std::unique_ptr<RNode> n;
     std::mutex amtx;
     std::set<bytes32> accepted;                 // blocks fed into the follower
@@ -96,16 +105,22 @@ struct TNode {
     std::atomic<u64> view_cap{600051};          // P-13 at the node's view
 
     TNode(Rig& rig, std::string name, pb::PathbRelayOptions o) {
+        kept = std::make_unique<pb::PathbFollowerRows>(
+                (std::filesystem::temp_directory_path() / ("ctxkat_" + name + "_" + std::to_string(::getpid())) / "row_weights")
+                        .string());
         n = rig.make(std::move(name), std::move(o));
         pb::PathbCtxSource s;
-        s.block_blob = [this](const pb::Hash32& id, std::vector<u8>& out) {
-            ++idx.blob_calls;
-            std::lock_guard<std::mutex> lk(idx.m);
-            const auto it = idx.bodies.find(id);
-            if (it == idx.bodies.end()) return false;
-            out = it->second;
-            return true;
-        };
+        // the index first, then the kept blobs of before a restart (the daemon's composition)
+        s.block_blob = pb::served_ctx_blob(
+                [this](const pb::Hash32& id, std::vector<u8>& out) {
+                    ++idx.blob_calls;
+                    std::lock_guard<std::mutex> lk(idx.m);
+                    const auto it = idx.bodies.find(id);
+                    if (it == idx.bodies.end()) return false;
+                    out = it->second;
+                    return true;
+                },
+                kept.get());
         // The WORK behind a context is judged against this node's own (fake)
         // index: best-chain rows are held verified; a block above them needs
         // proof of work at a model difficulty of 2, which the zero-hash model
@@ -489,6 +504,39 @@ int main() {
               "N8 a malformed FB_CTX (its length field over the cap, the frame 42 B) is struck, not dropped as over the cap");
         }
         raw.stop();
+    }
+
+    // ── N10 a kept alternative block served after a restart (HP-2) ──────────
+    // W2 (100, on G): no node's native index holds it. A's kept files (written as a save would, then loaded as a
+    // restarted node does) carry W2's row and block: A serves it from the kept blob; C resolves it.
+    {
+        namespace fs = std::filesystem;
+        const SynthBlock W2 = make_block(100, idG, 97, nullptr, 2, 67);
+        const bytes32 idW2 = block_id(W2);
+        const std::string table = A.kept->path();
+        fs::create_directories(fs::path(table).parent_path());
+        std::map<pb::Hash32, pb::KeptRow> rows;
+        pb::KeptRow kr;
+        kr.row.id = idW2;
+        kr.row.prev_id = idG;
+        kr.row.height = 100;
+        kr.w = pb::RowWeights{1, 300000, 300000, 300000, 16};
+        rows.emplace(idW2, kr);
+        const auto put = [](const std::string& path, const std::vector<u8>& b) {
+            std::ofstream(path, std::ios::binary | std::ios::trunc).write(reinterpret_cast<const char*>(b.data()),
+                                                                          static_cast<std::streamsize>(b.size()));
+        };
+        put(table, pb::encode_row_weights_table({}));
+        put(A.kept->kept_path(), pb::encode_kept_rows(rows));
+        put(A.kept->blobs_path(), pb::encode_kept_blobs({{idW2, W2.full_blob}}));
+        std::string lwhy;
+        const bool loaded = A.kept->load(lwhy) && A.kept->kept_blobs_loaded() == 1;
+        const u64 served0 = A.n->st().ctx_served.load();
+        const bool w2_ok = loaded && Cn.n->fetch_context(idW2, 10);
+        C(loaded && w2_ok && Cn.has(idW2) && A.n->st().ctx_served.load() > served0,
+          "N10 a kept alternative block (W2: no index holds it; A's kept files carry its row and block) is served by A from "
+          "its kept blob after a load, and resolves at C (" + lwhy + ")");
+        fs::remove_all(fs::path(table).parent_path());
     }
 
     for (auto* t : {&A, &B, &Cn}) if (C.fail) t->n->dump_logs();

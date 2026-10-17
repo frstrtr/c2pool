@@ -1044,6 +1044,123 @@ static void test_alt_rows_restart() {
     fs::remove_all(dir);
 }
 
+// J. THE KEPT BLOBS: a node holds P (an alternative, its row kept) and saves: the blob file carries P's block; a
+// restarted node that does not hold P loads it and serves it (kept_blob), keeps it across its own save, and keeps a
+// blob only under its own id and only for a kept row. A file that does not decode (garbage, a count over the cap, a
+// len over the byte cap, truncated) is moved aside to <file>.corrupt-<unix s>; the load goes on, with no kept blobs.
+static void test_kept_blobs() {
+    namespace fs = std::filesystem;
+    namespace pbn = c2pool::xmr::pathb;
+    const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_blobs_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string table = (dir / "row_weights").string();
+    Hash p{}, m9{};
+    BlockEntry pe;
+    {
+        Rig f(8);
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(f.idx);
+        f.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::vector<BlockEntry> rival = build_branch(*f.idx, f.main_ids[6], 7, 1, /*salt_base=*/61);
+        pe = rival[0];
+        p = id_of(pe);
+        const OfferResult r = f.idx->offer_block(&f.them, pe, /*own_mined=*/false);
+        const OfferResult r9 = f.idx->offer_block(nullptr, Rig::block_for(f.main_ids[7], 9, agc_at(*f.idx, 8), 0, 0), true);
+        m9 = r9.id;
+        std::string why;
+        checkf(r.outcome == OfferOutcome::StoredAsAlt && r9.outcome == OfferOutcome::Connected && rows.save(why),
+               "keptblobs: P held as an alternative, the main chain at 9, saved (%s)", why.c_str());
+        checkf(fs::exists(rows.blobs_path()), "keptblobs: the save writes %s", rows.blobs_path().c_str());
+    }
+    std::vector<std::uint8_t> blob;
+    {
+        Rig g(8);  // restarted: P not held
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        std::string why;
+        const bool ok = rows.load(why);
+        std::vector<std::uint8_t> b9;
+        checkf(ok && rows.kept_blobs_loaded() == 1 && rows.kept_blob(p, blob) && blob == pe.block_blob && !rows.kept_blob(m9, b9),
+               "keptblobs: after the restart P's block is loaded and served (%zu kept blobs); the main block at 9 is not "
+               "among them (%s)", rows.kept_blobs_loaded(), why.c_str());
+        fs::remove(rows.blobs_path());
+        checkf(rows.save(why) && fs::exists(rows.blobs_path()),
+               "keptblobs: the restarted node (P not held) saves P's loaded block again (%s)", why.c_str());
+    }
+    {
+        Rig g(8);
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        std::string why;
+        std::vector<std::uint8_t> b;
+        checkf(rows.load(why) && rows.kept_blob(p, b) && b == pe.block_blob,
+               "keptblobs: P's block survives a save by a node that does not hold P");
+    }
+    const auto write_blobs = [&](const std::string& path, const std::vector<std::uint8_t>& bytes) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc)
+                .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    {
+        // P's block filed under another kept row's id (the main block at 9), and a block whose id has no kept row: none
+        // of them kept
+        const std::string t2 = (dir / "ids").string();
+        fs::copy_file(table, t2);
+        fs::copy_file(table + "_kept", t2 + "_kept");
+        std::map<pbn::Hash32, std::vector<std::uint8_t>> m;
+        pbn::Hash32 k9{};
+        std::copy(m9.begin(), m9.end(), k9.begin());
+        m.emplace(k9, pe.block_blob);
+        BlockEntry other = Rig::block_for(p, 9, 1, 0, 7);
+        const Hash oid = id_of(other);
+        pbn::Hash32 ko{};
+        std::copy(oid.begin(), oid.end(), ko.begin());
+        m.emplace(ko, other.block_blob);
+        write_blobs(t2 + "_kept_blobs", pbn::encode_kept_blobs(m));
+        Rig g(8);
+        pbn::PathbFollowerRows rows(t2);
+        rows.bind(g.idx);
+        std::string why;
+        std::vector<std::uint8_t> b;
+        checkf(rows.load(why) && rows.kept_blobs_loaded() == 0 && !rows.kept_blob(m9, b) && !rows.kept_blob(oid, b) && !why.empty(),
+               "keptblobs: a block filed under an id not its own, and one with no kept row: not kept (%s)", why.c_str());
+    }
+    {
+        // files that do not decode: each moved aside, the load goes on (the rows load), no kept blobs
+        pbn::Hash32 kp{};
+        std::copy(p.begin(), p.end(), kp.begin());
+        std::vector<std::uint8_t> good = pbn::encode_kept_blobs({{kp, pe.block_blob}});
+        std::vector<std::uint8_t> over_n = good;
+        over_n[0] = 0xff;
+        over_n[1] = 0xff;  // n = 65,535 > alt_max_blocks
+        std::vector<std::uint8_t> over_len = good;
+        for (std::size_t i = 0; i < 4; ++i) over_len[4 + 32 + i] = 0xff;  // len over the byte cap
+        std::vector<std::uint8_t> trunc(good.begin(), good.end() - 3);
+        const std::vector<std::uint8_t> garbage = {0x01, 0x00, 0x00, 0x00, 0x13, 0x37};
+        int k = 0;
+        for (const auto& bad : {over_n, over_len, trunc, garbage}) {
+            const std::string t3 = (dir / ("bad" + std::to_string(++k))).string();
+            fs::copy_file(table, t3);
+            fs::copy_file(table + "_kept", t3 + "_kept");
+            write_blobs(t3 + "_kept_blobs", bad);
+            Rig g(8);
+            pbn::PathbFollowerRows rows(t3);
+            rows.bind(g.idx);
+            std::string why;
+            const bool ok = rows.load(why);
+            bool aside = false;
+            for (const auto& e : fs::directory_iterator(dir))
+                aside = aside || e.path().filename().string().rfind("bad" + std::to_string(k) + "_kept_blobs.corrupt-", 0) == 0;
+            std::vector<std::uint8_t> b;
+            checkf(ok && rows.block(p).has_value() && rows.kept_blobs() == 0 && !rows.kept_blob(p, b) && aside
+                           && !fs::exists(t3 + "_kept_blobs") && why.find("moved aside") != std::string::npos,
+                   "keptblobs: a blob file that does not decode (case %d) is moved aside; the rows load, no kept blobs (%s)", k,
+                   why.c_str());
+        }
+    }
+    fs::remove_all(dir);
+}
+
 // H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
 // resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
 // below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
@@ -1142,6 +1259,7 @@ int main() {
     test_alt_rows_restart();
     test_resume_reorg_below();
     test_kept_cap();
+    test_kept_blobs();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -493,6 +493,15 @@ then resumes from the saved index when the index and its overlay match.
 Otherwise it re-walks from the anchor. The Path B store in `--data-dir`
 keeps the carrier chain. Do not delete `--data-dir` between restarts.
 
+The follower keeps its Monero rows across a restart in the node's data
+directory: `row_weights`, `row_weights_kept` (the rows within 720 blocks of the tip,
+off the main chain too) and `row_weights_kept_blobs` (the blocks of the
+kept rows off the main chain). A restarted node serves those blocks to the
+pool's other nodes. `--alt-max-blocks <n>` sets how many alternative Monero
+blocks it keeps (default 720, at least 1). A `row_weights_kept_blobs` that
+does not decode is moved aside to `row_weights_kept_blobs.corrupt-<time>`
+and the node starts without it.
+
 ## 10. Other modes
 
 **Follow-only.** The node follows Monero and logs the template record of the

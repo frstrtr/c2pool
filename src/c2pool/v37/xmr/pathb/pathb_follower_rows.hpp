@@ -23,7 +23,10 @@
 //                main-chain rows the index holds; `row_weights_kept` (encode_kept_rows) every
 //                row within k_alt (P-07) of the index tip with the row itself (main or off
 //                it, held or not), so it survives a restart as a connected row does; save
-//                drops the rows off the main chain below k_alt
+//                drops the rows off the main chain below k_alt; `row_weights_kept_blobs`
+//                (encode_kept_blobs) the block of each kept row off the main chain the
+//                index holds (or held before a restart), served as a Monero context
+//                (kept_blob) after a restart
 //
 // Threading: on_row runs under the chain index mutex (the native node's verify
 // thread); every other call takes the table mutex without the index mutex held
@@ -35,9 +38,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -50,6 +55,7 @@
 #include <vector>
 
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
+#include "impl/xmr/native/consensus/xmr_block_id.hpp"
 #include "impl/xmr/pathb/pathb_branch_follower.hpp"
 #include "impl/xmr/pathb/pathb_caps.hpp"  // kAltDepth (P-07)
 
@@ -127,6 +133,66 @@ inline std::optional<std::map<Hash32, KeptRow>> decode_kept_rows(std::span<const
         t.emplace(a.row.id, a);
     }
     return t;
+}
+
+// The kept blobs' file (node-local): u32 n | n x (id 32 | u32 len | blob len B), integers LE, ids ascending: the block of
+// each kept row off the main chain. Bounded by the native alt store: n <= alt_max_blocks, the sum of len <=
+// alt_max_bytes (each len checked against what is left before its blob is read).
+inline std::vector<std::uint8_t> encode_kept_blobs(const std::map<Hash32, std::vector<std::uint8_t>>& t) {
+    std::vector<std::uint8_t> out;
+    const auto put_u32 = [&](std::uint32_t x) {
+        for (std::size_t i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
+    };
+    put_u32(static_cast<std::uint32_t>(t.size()));
+    for (const auto& [id, blob] : t) {
+        out.insert(out.end(), id.begin(), id.end());
+        put_u32(static_cast<std::uint32_t>(blob.size()));
+        out.insert(out.end(), blob.begin(), blob.end());
+    }
+    return out;
+}
+// nullopt: the file does not decode within the caps (n, a len, the sum, the order, trailing bytes).
+inline std::optional<std::map<Hash32, std::vector<std::uint8_t>>> decode_kept_blobs(std::span<const std::uint8_t> in,
+                                                                                  std::uint64_t max_blocks,
+                                                                                  std::uint64_t max_bytes) {
+    const auto get_u32 = [&](std::size_t o) {
+        std::uint32_t x = 0;
+        for (std::size_t i = 0; i < 4; ++i) x |= std::uint32_t{in[o + i]} << (8 * i);
+        return x;
+    };
+    if (in.size() < 4) return std::nullopt;
+    const std::uint64_t n = get_u32(0);
+    if (n > max_blocks) return std::nullopt;
+    std::map<Hash32, std::vector<std::uint8_t>> t;
+    std::size_t o = 4;
+    std::uint64_t sum = 0;
+    Hash32 prev{};
+    for (std::uint64_t k = 0; k < n; ++k) {
+        if (in.size() - o < kHashBytes + 4) return std::nullopt;
+        Hash32 id{};
+        std::copy_n(in.begin() + static_cast<std::ptrdiff_t>(o), kHashBytes, id.begin());
+        if (k > 0 && !(prev < id)) return std::nullopt;
+        const std::uint64_t len = get_u32(o + kHashBytes);
+        o += kHashBytes + 4;
+        if (len == 0 || len > max_bytes - sum || in.size() - o < len) return std::nullopt;
+        t.emplace(id, std::vector<std::uint8_t>(in.begin() + static_cast<std::ptrdiff_t>(o),
+                                                in.begin() + static_cast<std::ptrdiff_t>(o + len)));
+        o += static_cast<std::size_t>(len);
+        sum += len;
+        prev = id;
+    }
+    if (o != in.size()) return std::nullopt;
+    return t;
+}
+// A block blob's own id (parsed and identified): nullopt when it does not parse.
+inline std::optional<Hash32> kept_blob_id(const std::vector<std::uint8_t>& blob) {
+    ::c2pool::xmr::native::ParsedBlock pb;
+    ::c2pool::xmr::native::BlockIdentity bi;
+    if (::c2pool::xmr::native::parse_and_identify(blob, pb, bi) != ::c2pool::xmr::native::BlockParseStatus::Ok)
+        return std::nullopt;
+    Hash32 id{};
+    std::copy(bi.id.begin(), bi.id.end(), id.begin());
+    return id;
 }
 
 class PathbFollowerRows final : public IMoneroRows {
@@ -216,6 +282,24 @@ public:
     }
     const std::string& path() const noexcept { return path_; }
 
+    // A kept alternative block's blob (loaded from `row_weights_kept_blobs`) while its row is kept: the Monero context
+    // a restarted node serves when its index no longer holds the block.
+    bool kept_blob(const Hash32& id, std::vector<std::uint8_t>& out) const {
+        std::uint64_t tip_h = 0;
+        if (index_ != nullptr)
+            if (const auto tip = index_->tip()) tip_h = tip->height;
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto b = kept_blobs_.find(id);
+        const auto r = kept_.find(id);
+        if (b == kept_blobs_.end() || r == kept_.end() || r->second.height + alt_keep_ < tip_h) return false;
+        out = b->second;
+        return true;
+    }
+    std::size_t kept_blobs() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return kept_blobs_.size();
+    }
+
     // ---- the table file ----
     // Absent file: an empty table (true). A main table that does not decode: false. Kept rows that do not decode:
     // true, the main rows only, `why` says so.
@@ -259,6 +343,7 @@ public:
             rows_.emplace(id, ar.row);
             kept_.emplace(id, ar.row);
         }
+        load_kept_blobs_locked(why);
         return true;
     }
     // Writes the main-chain rows the index holds to `row_weights` and every row within k_alt of the index tip, with
@@ -283,6 +368,7 @@ public:
             }
         }
         std::vector<std::uint8_t> bytes, kbytes;
+        std::vector<std::pair<std::uint64_t, Hash32>> alt_ids;  // the kept rows off the main chain: (height, id)
         {
             std::lock_guard<std::mutex> lk(mu_);
             std::map<Hash32, RowWeights> main;
@@ -320,8 +406,42 @@ public:
             }
             bytes = encode_row_weights_table(main);
             kbytes = encode_kept_rows(kept);
+            for (const auto& [id, kr] : kept)
+                if (main.count(id) == 0) alt_ids.push_back(std::make_pair(kr.row.height, id));
         }
-        return write_file(path_, bytes, why) && write_file(kept_path(), kbytes, why);
+        // the blob of each kept row off the main chain: the index's (a PoW-checked alternative), else the one loaded
+        // before a restart; the highest rows first within the alt store's caps
+        std::sort(alt_ids.begin(), alt_ids.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+        std::map<Hash32, std::vector<std::uint8_t>> blobs;
+        std::uint64_t sum = 0;
+        for (const auto& [h, id] : alt_ids) {
+            if (blobs.size() >= alt_max_blocks_) break;
+            std::vector<std::uint8_t> blob;
+            bool have = false;
+            if (index_ != nullptr) {
+                ::c2pool::xmr::native::Hash nid{};
+                std::copy(id.begin(), id.end(), nid.begin());
+                have = index_->block_blob_of(nid, blob);
+            }
+            if (!have) {
+                std::lock_guard<std::mutex> lk(mu_);
+                const auto it = kept_blobs_.find(id);
+                if (it != kept_blobs_.end()) {
+                    blob = it->second;
+                    have = true;
+                }
+            }
+            if (!have || blob.empty() || blob.size() > alt_max_bytes_ - sum) continue;
+            sum += blob.size();
+            blobs.emplace(id, std::move(blob));
+        }
+        const std::vector<std::uint8_t> bbytes = encode_kept_blobs(blobs);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (auto it = kept_blobs_.begin(); it != kept_blobs_.end();)  // what is no longer kept leaves memory too
+                it = blobs.count(it->first) ? std::next(it) : kept_blobs_.erase(it);
+        }
+        return write_file(blobs_path(), bbytes, why) && write_file(path_, bytes, why) && write_file(kept_path(), kbytes, why);
     }
     // k_alt (P-07): how far below the index tip a row off the main chain is kept.
     void set_alt_keep(std::uint64_t k) noexcept { alt_keep_ = k; }
@@ -329,9 +449,56 @@ public:
     void set_alt_max_blocks(std::size_t n) noexcept { alt_max_blocks_ = n; }
     std::uint64_t kept_cap() const noexcept { return kept_rows_cap(alt_max_blocks_); }
     std::string kept_path() const { return path_ + "_kept"; }
+    std::string blobs_path() const { return path_ + "_kept_blobs"; }
+    // The native alt store's byte cap (alt_max_bytes): the kept blobs' bound on disk.
+    void set_alt_max_bytes(std::uint64_t n) noexcept { alt_max_bytes_ = n; }
     std::size_t loaded() const noexcept { return loaded_; }
+    std::size_t kept_blobs_loaded() const noexcept { return kept_blobs_loaded_; }
 
 private:
+    // Under mu_: the kept blobs' file read against the caps (n, each len, the sum) before its bytes; each blob's id
+    // recomputed from the blob and kept only for a kept row of that id. A file that does not decode is moved aside to
+    // `<file>.corrupt-<unix s>` (-2, -3 ... if taken; nothing deleted) and the node starts with no kept blobs.
+    void load_kept_blobs_locked(std::string& why) {
+        const std::string path = blobs_path();
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) return;
+        const std::uintmax_t size = std::filesystem::file_size(path, ec);
+        const std::uint64_t max_file = 4 + alt_max_blocks_ * (kHashBytes + 4) + alt_max_bytes_;
+        std::optional<std::map<Hash32, std::vector<std::uint8_t>>> t;
+        if (!ec && size <= max_file) {
+            std::ifstream f(path, std::ios::binary);
+            std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+            if (f && f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
+                t = decode_kept_blobs(bytes, alt_max_blocks_, alt_max_bytes_);
+        }
+        if (!t) {
+            const std::uint64_t now = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            std::string aside = path + ".corrupt-" + std::to_string(now);
+            for (int k = 2; std::filesystem::exists(aside, ec) && k < 1000; ++k)
+                aside = path + ".corrupt-" + std::to_string(now) + "-" + std::to_string(k);
+            std::filesystem::rename(path, aside, ec);
+            why += std::string(why.empty() ? "" : "; ") + "kept blobs " + path + " do not decode: moved aside to " + aside +
+                   "; no kept blobs";
+            return;
+        }
+        std::size_t kept = 0, skipped = 0;
+        for (auto& [id, blob] : *t) {
+            const std::optional<Hash32> own = kept_blob_id(blob);
+            if (!own || *own != id || kept_.count(id) == 0) {
+                ++skipped;
+                continue;
+            }
+            kept_blobs_[id] = std::move(blob);
+            ++kept;
+        }
+        if (skipped > 0)
+            why += std::string(why.empty() ? "" : "; ") + "kept blobs: " + std::to_string(skipped) +
+                   " not kept (id not its own, or no kept row)";
+        kept_blobs_loaded_ = kept;
+    }
+
     static bool write_file(const std::string& path, const std::vector<std::uint8_t>& bytes, std::string& why) {
         const std::string tmp = path + ".tmp";
         {
@@ -371,8 +538,21 @@ private:
     std::map<Hash32, BranchBlock> kept_;  // rows kept across a restart (served by block() when not held)
     std::uint64_t alt_keep_ = kAltDepth;
     std::size_t alt_max_blocks_ = ::c2pool::xmr::native::ChainIndexOptions{}.alt_max_blocks;
+    std::uint64_t alt_max_bytes_ = ::c2pool::xmr::native::ChainIndexOptions{}.alt_max_bytes;
+    std::map<Hash32, std::vector<std::uint8_t>> kept_blobs_;  // kept alternative blocks' blobs from before a restart
+    std::size_t kept_blobs_loaded_ = 0;
     std::uint64_t recorded_ = 0;
     std::size_t loaded_ = 0;
 };
+
+// The Monero context a node serves (FB_GETCTX): a block its index holds (a connected body, or a PoW-checked
+// alternative), else a kept alternative block's blob from before a restart (kept_blob).
+inline std::function<bool(const Hash32&, std::vector<std::uint8_t>&)> served_ctx_blob(
+        std::function<bool(const Hash32&, std::vector<std::uint8_t>&)> held, const PathbFollowerRows* rows) {
+    return [held = std::move(held), rows](const Hash32& id, std::vector<std::uint8_t>& out) {
+        if (held && held(id, out)) return true;
+        return rows != nullptr && rows->kept_blob(id, out);
+    };
+}
 
 }  // namespace c2pool::xmr::pathb
