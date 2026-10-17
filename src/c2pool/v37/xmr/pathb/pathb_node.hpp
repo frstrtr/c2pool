@@ -523,6 +523,33 @@ public:
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
     // The re-pended receipts still pending (at most the pending cap): each leaves at its placement or its seal.
     std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
+    // The open state at the best tip (S4.7): the live placements of the open bins (open_bin_placements) and the v3
+    // wire bytes of their receipt bodies (each found in its placing carrier's body).
+    struct OpenState {
+        std::uint64_t placements = 0;
+        std::uint64_t bytes = 0;
+    };
+    OpenState open_state() const {
+        OpenState o;
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return o;
+        const std::uint64_t H = v.record(v.pos());
+        const std::uint64_t F = cfg_.p.open_bins;
+        std::vector<std::uint8_t> buf;
+        for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b)
+            for (const Placement* e : v.live_entries(b, v.pos())) {
+                ++o.placements;
+                const CarrierBodyV3* c = bodies_->get(e->carrier);
+                if (c == nullptr) continue;
+                const ReceiptBodyV3* r = receipt_id(c->own) == e->id ? &c->own : nullptr;
+                for (std::size_t k = 0; r == nullptr && k < c->carried.size(); ++k)
+                    if (receipt_id(c->carried[k]) == e->id) r = &c->carried[k];
+                if (r == nullptr) continue;
+                buf.clear();
+                if (encode_receipt_body_v3(*r, buf) == WireError::None) o.bytes += buf.size();
+            }
+        return o;
+    }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
     WindowCache& windows() noexcept { return *windows_; }

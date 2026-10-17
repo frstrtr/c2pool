@@ -145,6 +145,8 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
+//   openstate    the open state at the best tip: its live placements and
+//                their receipt bodies' wire bytes, against a sum by hand;
 //   relayomit    the per-peer omission log: a peer's carrier with room that
 //                leaves out a receipt this node holds pending is counted for
 //                that peer's link; every link down empties the log;
@@ -5076,6 +5078,43 @@ void relayrparkseal() {
 }
 
 // ---------------------------------------------------------------------------
+// openstate: A mines 4 carriers, the last carrying a receipt B left pending; the node's open state equals the sum by
+// hand over the best chain's carriers: one placement per own receipt and per carried one, each at its v3 wire size.
+void openstate() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 60 + i);
+    }
+    const std::optional<pb::PathbJob> jb = h.job(b, 2, 70);
+    h.mine(a, 1, 63);
+    const bool pend = jb && h[b].on_own_share(*jb, 70, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.pump();
+    h.mine(a, 1, 64);
+    std::uint64_t n = 0, bytes = 0;
+    std::vector<std::uint8_t> buf;
+    const pb::LaneView v = h[a].store().view_at(h[a].tree().best().id);
+    for (std::uint64_t x = 1; v.ok() && x <= v.pos(); ++x) {
+        const std::optional<pb::Hash32> id = h[a].store().best_at(x);
+        const pb::CarrierBodyV3* c = id ? h[a].bodies().get(*id) : nullptr;
+        if (c == nullptr) continue;
+        std::vector<const pb::ReceiptBodyV3*> rs{&c->own};
+        for (const pb::ReceiptBodyV3& r : c->carried) rs.push_back(&r);
+        for (const pb::ReceiptBodyV3* r : rs) {
+            buf.clear();
+            pb::encode_receipt_body_v3(*r, buf);
+            ++n;
+            bytes += buf.size();
+        }
+    }
+    const pb::PathbNode::OpenState o = h[a].open_state();
+    check(pend && n >= 5 && o.placements == n && o.bytes == bytes,
+          "openstate: the open state at the best tip is " + std::to_string(o.placements) + " placements, " +
+                  std::to_string(o.bytes) + " B; by hand " + std::to_string(n) + ", " + std::to_string(bytes) + " B");
+}
+
 // relayomit: the per-peer omission log. B holds a receipt pending that never reaches A (B's frames to A dropped); A's
 // next carrier, with room, carries none of it: B logs one omission for A's link. B's link to A goes down: the log is
 // empty, the total kept.
@@ -5615,6 +5654,7 @@ int main(int argc, char** argv) {
     run("relayrxbindr", relayrxbindr);
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
+    run("openstate", openstate);
     run("relayomit", relayomit);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);

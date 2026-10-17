@@ -1533,6 +1533,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::uint64_t leaf_count = 0;
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
+        pb::PathbNode::OpenState open{};
     };
     const auto node_view = [&]() {
         return relay->with_node([&](pb::PathbNode& n) {
@@ -1556,6 +1557,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
             v.coinbase_internal = n.alarms().count_of(pb::RowId::R12, pb::Missing::NodeInternal);
             v.sw = n.switch_counts();
+            v.open = n.open_state();
             return v;
         });
     };
@@ -1788,6 +1790,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
+            std::printf("  open-state: placements=%llu bytes=%llu\n", static_cast<unsigned long long>(nv.open.placements),
+                        static_cast<unsigned long long>(nv.open.bytes));
             if (cur && cur->window.window) {
                 const std::vector<pb::SplitOutput> so = pb::split(cur->reward, *cur->window.window);
                 std::printf("  window: payees=%zu R=%llu\n", so.size(), static_cast<unsigned long long>(cur->reward));
