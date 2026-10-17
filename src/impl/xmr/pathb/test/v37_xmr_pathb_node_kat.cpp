@@ -150,6 +150,8 @@
 //   ownorphan    own carriers watched until confirmed (below the journal
 //                base) or orphaned (a lost race): the loser counts one; a
 //                third node extends the chain past J: the watches are empty;
+//   liveness     the liveness line: two nodes at one tip print one hash;
+//                one more placement at one node changes it there;
 //   relayomit    the per-peer omission log: a peer's carrier with room that
 //                leaves out a receipt this node holds pending is counted for
 //                that peer's link; every link down empties the log;
@@ -5160,6 +5162,29 @@ void ownorphan() {
                   " own carriers, the loser's orphan count stays 1");
 }
 
+// liveness: A mines 4 carriers, B follows: at one tip both print the same liveness hash and counts. A mines one more
+// with the links cut: A's hash and live count change, B's stay.
+void liveness() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 80 + i);
+    }
+    const pb::PathbNode::Liveness la = h[a].liveness(), lb = h[b].liveness();
+    check(h[a].tree().best().id == h[b].tree().best().id && la.live >= 4 && la.hash == lb.hash && la.live == lb.live
+                  && la.dead == lb.dead && !(la.hash == pb::Hash32{}),
+          "liveness: A and B at one tip print one hash (" + hex_of_bytes(la.hash.data(), la.hash.size()).substr(0, 16) + ", live " +
+                  std::to_string(la.live) + ", dead " + std::to_string(la.dead) + ")");
+    h.cut = {{a, b}, {b, a}};
+    h.mine(a, 1, 84);
+    const pb::PathbNode::Liveness la2 = h[a].liveness(), lb2 = h[b].liveness();
+    check(!(la2.hash == la.hash) && la2.live == la.live + 1 && lb2.hash == lb.hash,
+          "liveness: one more placement at A changes A's hash (" + hex_of_bytes(la2.hash.data(), la2.hash.size()).substr(0, 16) + ", live " +
+                  std::to_string(la2.live) + "), B's stays");
+}
+
 // relayomit: the per-peer omission log. B holds a receipt pending that never reaches A (B's frames to A dropped); A's
 // next carrier, with room, carries none of it: B logs one omission for A's link. B's link to A goes down: the log is
 // empty, the total kept.
@@ -5701,6 +5726,7 @@ int main(int argc, char** argv) {
     run("relayp15once", relayp15once);
     run("openstate", openstate);
     run("ownorphan", ownorphan);
+    run("liveness", liveness);
     run("relayomit", relayomit);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);

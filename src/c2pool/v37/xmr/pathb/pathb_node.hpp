@@ -535,6 +535,32 @@ public:
         std::uint64_t placements = 0;
         std::uint64_t bytes = 0;
     };
+    // The liveness line at the best tip: the placements of the open bins, live and dead, and sha256d over (id, live)
+    // in bin and id order (equal on nodes at the same tip).
+    struct Liveness {
+        std::uint64_t live = 0;
+        std::uint64_t dead = 0;
+        Hash32 hash{};
+    };
+    Liveness liveness() const {
+        Liveness o;
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return o;
+        const std::uint64_t H = v.record(v.pos());
+        const std::uint64_t F = cfg_.p.open_bins;
+        std::vector<std::uint8_t> pre;
+        for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b) {
+            std::vector<const Placement*> es = v.entries(b, v.pos());
+            std::sort(es.begin(), es.end(), [](const Placement* x, const Placement* y) { return x->id < y->id; });
+            for (const Placement* e : es) {
+                ++(e->live ? o.live : o.dead);
+                pre.insert(pre.end(), e->id.begin(), e->id.end());
+                pre.push_back(e->live ? 1 : 0);
+            }
+        }
+        o.hash = ::v37::sha256d(pre);
+        return o;
+    }
     OpenState open_state() const {
         OpenState o;
         const LaneView v = store_->view_at(store_->best_tip());
