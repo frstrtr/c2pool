@@ -1833,13 +1833,20 @@ struct FakeWire {
     std::vector<FakeLinks*> links;
     std::vector<pb::PathbRelayNode*> relays;
     std::function<void(Msg&)> edit;  // edits a frame in flight
+    // A link's id at node `at` for node `from`: from + 1 on the first link, + 100 per reconnect (link ids not reused).
+    std::map<std::pair<std::size_t, std::size_t>, std::uint64_t> epoch;
+    std::uint64_t id(std::size_t at, std::size_t from) const {
+        const auto it = epoch.find({at, from});
+        return from + 1 + 100 * (it == epoch.end() ? 0 : it->second);
+    }
+    static std::size_t node_of(std::uint64_t p) { return static_cast<std::size_t>((p - 1) % 100); }
     // Delivers one frame, then runs what every relay has queued; false: nothing to deliver.
     bool step() {
         if (q.empty()) return false;
         Msg m = std::move(q.front());
         q.pop_front();
         if (edit) edit(m);
-        if (!m.f.empty() && links[m.to]->live.count(m.from + 1) != 0) links[m.to]->frame(m.from + 1, m.f);
+        if (!m.f.empty() && links[m.to]->live.count(id(m.to, m.from)) != 0) links[m.to]->frame(id(m.to, m.from), m.f);
         for (pb::PathbRelayNode* r : relays) r->pump();
         return true;
     }
@@ -1849,10 +1856,16 @@ struct FakeWire {
         }
     }
     void connect(std::size_t a, std::size_t b) {
-        links[a]->live.insert(b + 1);
-        links[b]->live.insert(a + 1);
-        links[a]->event(b + 1, true);
-        links[b]->event(a + 1, true);
+        links[a]->live.insert(id(a, b));
+        links[b]->live.insert(id(b, a));
+        links[a]->event(id(a, b), true);
+        links[b]->event(id(b, a), true);
+    }
+    // A new link between a and b (new ids at both ends); the old one must be down.
+    void reconnect(std::size_t a, std::size_t b) {
+        ++epoch[{a, b}];
+        ++epoch[{b, a}];
+        connect(a, b);
     }
 };
 
@@ -1865,15 +1878,16 @@ bool FakeLinks::send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) {
         return false;
     }
     const std::lock_guard<std::mutex> lk(wire->qm);
-    wire->q.push_back(FakeWire::Msg{self, static_cast<std::size_t>(p - 1), f});
+    wire->q.push_back(FakeWire::Msg{self, FakeWire::node_of(p), f});
     return true;
 }
 void FakeLinks::disconnect(std::uint64_t p) {
     if (live.erase(p) == 0) return;
-    FakeLinks& o = *wire->links[p - 1];
-    o.live.erase(self + 1);
+    FakeLinks& o = *wire->links[FakeWire::node_of(p)];
+    const std::uint64_t back = wire->id(o.self, self);
+    o.live.erase(back);
     event(p, false);
-    o.event(self + 1, false);
+    o.event(back, false);
 }
 
 struct KatRelay {
@@ -5049,6 +5063,62 @@ void relayrparkseal() {
 }
 
 // ---------------------------------------------------------------------------
+// relayrparkgone: a parked receipt's asks across reconnects. B parks a receipt of an unknown tip sent by A (one ask on
+// A's link); three times A's link goes down and a new one comes up (a new link id) and A sends the receipt again: the
+// gone link's ask records leave the parked receipt at its link down, so its ask set stays one record (the current
+// link's), not one more per reconnect.
+void relayrparkgone() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 840);
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 841);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 842);
+    ok = ok && h[a.node].on_own_share(*j0, 841, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::optional<pb::ReceiptBodyV3> base;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) base = r->body;
+    if (!ok || !base) {
+        check(false, "relayrparkgone: setup");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    pb::ReceiptBodyV3 junk = *base;
+    junk.side.tip.fill(0x6D);
+    const std::vector<std::uint8_t> f = *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{junk}, pb::kRuledLaneParams);
+    h.now += 1000;
+    rb.receive(w.id(b.node, a.node), f);
+    w.run();
+    const std::size_t asks0 = rb.parked_receipt_asks(), parked0 = rb.parked_receipts();
+    std::string trace = std::to_string(asks0);
+    bool up = true;
+    for (int k = 0; k < 3; ++k) {
+        w.links[b.node]->disconnect(w.id(b.node, a.node));
+        w.run();
+        w.reconnect(a.node, b.node);
+        w.run();
+        up = up && rb.hello_ok(w.id(b.node, a.node));
+        h.now += 1;
+        rb.receive(w.id(b.node, a.node), f);
+        w.run();
+        trace += " " + std::to_string(rb.parked_receipt_asks());
+    }
+    std::printf("  relayrparkgone: parked %zu -> %zu; asks per round %s (link at B now %llu, HELLO ok %d)\n", parked0,
+                rb.parked_receipts(), trace.c_str(), (unsigned long long)w.id(b.node, a.node), up ? 1 : 0);
+    check(parked0 == 1 && asks0 == 1 && up && rb.parked_receipts() == 1 && rb.parked_receipt_asks() == 1,
+          "relayrparkgone: a parked receipt's asks stay one record across three reconnects of its sender (a gone link's "
+          "records stripped at its link down)");
+}
+
+// ---------------------------------------------------------------------------
 // revjunkbig: the receipt park at the default caps (P-09 = the pending cap, a verify queue of 4,096) under junk: one
 // more than the cap's worth of receipts of unknown tips from one peer; the park holds the cap with one ask each. A re-run
 // with an honest job queued takes at most the queue's free room and drops no queued job; the rest drain on the ticks,
@@ -5476,6 +5546,7 @@ int main(int argc, char** argv) {
     run("relayhdrctx", relayhdrctx);
     run("relayrbindr", relayrbindr);
     run("relayrparkseal", relayrparkseal);
+    run("relayrparkgone", relayrparkgone);
     run("revjunkbig", revjunkbig);
     run("revdueorder", revdueorder);
     run("relayqfull", relayqfull);

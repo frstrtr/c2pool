@@ -1329,7 +1329,19 @@ private:
         post([this, p] {
             const NodeGuard g(*this);
             node_->disconnect(p);
+            strip_gone_peer_asks_locked(p);
         });
+    }
+    // Under the node lock: a gone link's ask records leave every parked receipt (link ids are not reused, so they
+    // gate nothing; one pass over the park, at most P-09 receipts).
+    void strip_gone_peer_asks_locked(std::uint64_t p) {
+        for (auto& [key, e] : parked_receipts_) {
+            auto& asked = e.second.asked;
+            const auto lo = asked.lower_bound(std::make_tuple(p, static_cast<Missing>(0), Hash32{}));
+            auto hi = lo;
+            while (hi != asked.end() && std::get<0>(*hi) == p) ++hi;
+            asked.erase(lo, hi);
+        }
     }
     // Disconnects and bans run on the maintenance thread (never under the node lock).
     void defer_drop(std::uint64_t p, std::uint64_t src, bool ban) {
@@ -1733,9 +1745,11 @@ private:
                 asked = &it->second.second.asked;
             }
         }
-        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time
+        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time;
+        // a gone link (a re-run of a receipt it sent) is neither asked nor recorded
+        const bool gone = asked != nullptr && !peer_known(peer);
         const auto may = [&](const Hash32& object) {
-            return kept && (asked == nullptr || asked->emplace(peer, m, object).second);
+            return kept && !gone && (asked == nullptr || asked->emplace(peer, m, object).second);
         };
         switch (m) {
             case Missing::TipUnknown:
