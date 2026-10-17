@@ -1532,10 +1532,183 @@ static void test_l4_wanted_beyond_window() {
            static_cast<unsigned long long>(idx.tip()->height), static_cast<unsigned long long>(h + 3));
 }
 
+// L5. A PARENT ASKED FOR AGAIN IS STILL ASKED FOR WHEN IT LANDS. A chain entry names A, B, C; C arrives first and
+// parks, its parent B goes on the refetch list; another peer's chain entry replaces the want list. B arrives with its
+// bodies (its parent A unknown): it parks, a block we asked for; A lands and the tip is C.
+static void test_l5_refetched_parent_parks() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5), p6 = peer(6);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/51, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/52, reward);
+    const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/53, reward);
+    const BlockEntry X = f.sibling(tip, h, /*salt=*/59, reward);
+    want(idx, p5, tip, h - 1, {id_of(A), id_of(B), id_of(C)});
+    const OfferResult rc = idx.offer_block(&p5, C, false);
+    want(idx, p6, tip, h - 1, {id_of(X)});   // another peer's chain entry replaces the want list
+    const std::vector<Hash> rf = idx.refetch_wanted();
+    const bool b_asked = std::find(rf.begin(), rf.end(), id_of(B)) != rf.end();
+    const OfferResult rb = idx.offer_block(&p5, B, false);
+    checkf(rc.outcome == OfferOutcome::ParkedOrphan && b_asked && rb.outcome == OfferOutcome::ParkedOrphan
+                   && idx.have_block(id_of(B)) && idx.unsolicited_dropped() == 0,
+           "l5: C %s; B on the refetch list %d; B, asked for again, landed as %s (%s), held %d, refused %llu",
+           to_string(rc.outcome), b_asked ? 1 : 0, to_string(rb.outcome), rb.why.c_str(), idx.have_block(id_of(B)) ? 1 : 0,
+           static_cast<unsigned long long>(idx.unsolicited_dropped()));
+    idx.offer_block(&p5, A, false);
+    checkf(idx.tip() && idx.tip()->id == id_of(C) && f.fetcher.penalties.empty(),
+           "l5: A landed and the tip is %llu, expected %llu (C)", static_cast<unsigned long long>(idx.tip()->height),
+           static_cast<unsigned long long>(h + 2));
+}
+
+// L6. A RE-SEND KEEPS THE HELD BLOCK'S FIRST SOURCE. X from H is held fail-closed (its proof of work not checkable yet);
+// M sends X again, then a block of its own that fails its proof of work: M is struck and its unproven blocks go, but X
+// stays held (its source is H), and H is not struck.
+static void test_l6_resend_keeps_source() {
+    ScriptedPowSource pow;
+    ChainIndexOptions o;
+    o.net = XmrNet::Stagenet;
+    ChainIndex idx(o, pow);
+    seed_stagenet(idx);
+    fakes::FakeFetcher fetcher;
+    idx.set_fetcher(&fetcher);
+    const PeerRef H = peer(4), M = peer(9);
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const G::GoldenHeader& hdr = header_at(G::TEST_FIRST);
+    const BlockEntry X = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 1,
+                                    G::TEST_FIRST, reward);
+    const BlockEntry Y = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 2,
+                                    G::TEST_FIRST, reward);
+    pow.verdict  = PowVerdict::SeedMissing;
+    pow.resident = true;
+    want(idx, H, stagenet_seed_row().id, G::TEST_FIRST - 1, {id_of(X)});
+    const OfferResult r1 = idx.offer_block(&H, X, false);
+    const OfferResult r2 = idx.offer_block(&M, X, false);
+    pow.verdict = PowVerdict::BelowTarget;
+    const OfferResult r3 = idx.offer_block(&M, Y, false);
+    std::size_t sh = 0, sm = 0;
+    for (const auto& x : fetcher.penalties) {
+        sh += x.peer.addr == H.addr ? 1 : 0;
+        sm += x.peer.addr == M.addr ? 1 : 0;
+    }
+    checkf(r1.outcome == OfferOutcome::StoredAsAlt && r2.outcome == OfferOutcome::StoredAsAlt
+                   && r3.fault == PeerFault::BadPow && idx.have_block(id_of(X)) && idx.source_dropped() == 0 && sh == 0
+                   && sm == 1,
+           "l6: X from H %s, again from M %s, M's bad block %s: X held %d (expected 1), dropped with the source %llu "
+           "(expected 0), H struck %zu, M struck %zu", to_string(r1.outcome), to_string(r2.outcome), to_string(r3.outcome),
+           idx.have_block(id_of(X)) ? 1 : 0, static_cast<unsigned long long>(idx.source_dropped()), sh, sm);
+}
+
+// L7. UNASKED ON THE OTHER TWO PATHS. (a) A block whose parent is held but unresolved (its difficulty not computable
+// yet), not asked for: refused, no strike, not held. (b) A block whose proof of work is not checkable yet, not asked
+// for: refused, no strike, not held; asked for, it is held.
+static void test_l7_unasked_other_paths() {
+    {
+        Fixture f(6);
+        ChainIndex& idx = *f.idx;
+        const PeerRef p5 = peer(5);
+        const std::uint64_t h      = G::TEST_FIRST + 6;
+        const Hash          tip    = f.main_ids.back();
+        const std::uint64_t reward = idx.view().state().expected_base_reward();
+        const BlockEntry A = f.sibling(tip, h, /*salt=*/71, reward);
+        const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/72, reward);
+        const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/73, reward);
+        want(idx, p5, tip, h - 1, {id_of(A), id_of(B)});
+        const OfferResult rb = idx.offer_block(&p5, B, false);
+        const OfferResult rc = idx.offer_block(&p5, C, false);
+        checkf(rb.outcome == OfferOutcome::ParkedOrphan && rc.outcome == OfferOutcome::Rejected && !rc.peer_fault
+                       && !idx.have_block(id_of(C)) && f.fetcher.penalties.empty() && idx.unsolicited_dropped() == 1,
+               "l7a: over an unresolved parent, an unasked block was %s (%s), held %d, %zu strikes", to_string(rc.outcome),
+               rc.why.c_str(), idx.have_block(id_of(C)) ? 1 : 0, f.fetcher.penalties.size());
+    }
+    {
+        ScriptedPowSource pow;
+        ChainIndexOptions o;
+        o.net = XmrNet::Stagenet;
+        ChainIndex idx(o, pow);
+        seed_stagenet(idx);
+        fakes::FakeFetcher fetcher;
+        idx.set_fetcher(&fetcher);
+        const PeerRef p4 = peer(4);
+        const std::uint64_t reward = idx.view().state().expected_base_reward();
+        const G::GoldenHeader& hdr = header_at(G::TEST_FIRST);
+        const BlockEntry X = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 3,
+                                        G::TEST_FIRST, reward);
+        pow.verdict  = PowVerdict::SeedMissing;
+        pow.resident = true;
+        const OfferResult r1 = idx.offer_block(&p4, X, false);
+        const bool held1 = idx.have_block(id_of(X));
+        want(idx, p4, stagenet_seed_row().id, G::TEST_FIRST - 1, {id_of(X)});
+        const OfferResult r2 = idx.offer_block(&p4, X, false);
+        checkf(r1.outcome == OfferOutcome::Rejected && !r1.peer_fault && !held1 && fetcher.penalties.empty()
+                       && r2.outcome == OfferOutcome::StoredAsAlt && idx.have_block(id_of(X)),
+               "l7b: a block whose proof of work is not checkable yet: unasked %s (held %d, %zu strikes), asked %s",
+               to_string(r1.outcome), held1 ? 1 : 0, fetcher.penalties.size(), to_string(r2.outcome));
+    }
+}
+
+// L8. THE SOURCE DROP TAKES ONLY BLOCKS WITHOUT PROVEN WORK, AND MATCHES THE PEER BY ITS ADDRESS. X holds a verified
+// alternative V and an unproven orphan U; Z (the same levin peer_id as X, another address) holds an unproven orphan W.
+// X's block fails its proof of work on arrival: U goes, V and W stay; X is struck once.
+static void test_l8_source_drop_scope() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef x = peer(6);
+    PeerRef z = x;
+    z.addr = "10.0.0.66:38080";
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry V = f.sibling(f.main_ids[4], h - 1, /*salt=*/61, reward);   // a sibling of the tip: verified
+    const BlockEntry U = f.sibling(fake_id(931), h + 1, /*salt=*/62, reward);
+    const BlockEntry W = f.sibling(fake_id(932), h + 1, /*salt=*/63, reward);
+    const BlockEntry Y = f.sibling(tip, h, /*salt=*/64, reward);
+    const OfferResult rv = idx.offer_block(&x, V, false);
+    want(idx, x, tip, h - 1, {id_of(U), id_of(W)});
+    idx.offer_block(&x, U, false);
+    idx.offer_block(&z, W, false);
+    const auto c0 = idx.alt_class_bytes();
+    f.mv.below.push_back(hashing_blob_of(Y));
+    const OfferResult ry = idx.offer_block(&x, Y, false);
+    checkf(rv.outcome == OfferOutcome::StoredAsAlt && c0.first > 0 && ry.fault == PeerFault::BadPow
+                   && !idx.have_block(id_of(U)) && idx.have_block(id_of(V)) && idx.have_block(id_of(W))
+                   && strikes_of(f.fetcher, x) == 1 && strikes_of(f.fetcher, z) == 0 && idx.source_dropped() == 1,
+           "l8: V %s; after X's bad block: U %d (expected gone), V %d and W %d (expected held), X struck %zu, Z struck "
+           "%zu, dropped %llu", to_string(rv.outcome), idx.have_block(id_of(U)) ? 1 : 0, idx.have_block(id_of(V)) ? 1 : 0,
+           idx.have_block(id_of(W)) ? 1 : 0, strikes_of(f.fetcher, x), strikes_of(f.fetcher, z),
+           static_cast<unsigned long long>(idx.source_dropped()));
+}
+
+// L9. A BLOCK WAITING FOR ITS BODIES, ITS PROOF OF WORK PASSED, COUNTS AS PROVEN WORK. A bodiless block on the tip
+// (one transaction missing): NeedsBodies; its bytes are in the verified class, none in the class without proven work.
+static void test_l9_bodies_missing_class() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const G::GoldenHeader& hb = header_at(h);
+    const BlockEntry A = make_bodiless_block(hb.major_version, hb.minor_version, hb.timestamp, tip, 81, h, reward,
+                                             /*salt=*/8, /*ntx=*/1);
+    const OfferResult r = idx.offer_block(&p5, A, false);
+    const auto c = idx.alt_class_bytes();
+    checkf(r.outcome == OfferOutcome::NeedsBodies && c.first > 0 && c.second == 0,
+           "l9: a bodiless block on the tip was %s; verified bytes %llu, without proven work %llu",
+           to_string(r.outcome), static_cast<unsigned long long>(c.first), static_cast<unsigned long long>(c.second));
+}
+
 // =============================================================================
 int main() {
     test_l1_unasked_orphan_refused();
     test_l4_wanted_beyond_window();
+    test_l5_refetched_parent_parks();
+    test_l6_resend_keeps_source();
+    test_l7_unasked_other_paths();
+    test_l8_source_drop_scope();
+    test_l9_bodies_missing_class();
     test_l2_source_drop_on_resolve();
     test_l3_source_drop_on_arrival();
     test_k1_bodiless_park_after_parent_connects();

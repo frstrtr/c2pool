@@ -1305,6 +1305,9 @@ private:
         }
 
         r.id = ev.input.identity.id;
+        // Asked for, read before the arrival leaves the want lists below (booking_wanted_, refetch_): a parent we asked
+        // for again is still one we asked for when it lands.
+        const bool asked_for = own_mined || solicited_locked_(r.id);
 
         // COLD-BOOT: a body the settlement booking asked back
         // (want_body_for_booking). The id was recomputed from these bytes, so
@@ -1440,7 +1443,7 @@ private:
             }
             // Only a block we asked for (or our own) parks without proven work: an unsolicited orphan is dropped with
             // no strike and the sync's chain request fetches it, as monerod does.
-            if (!own_mined && !solicited_locked_(r.id)) {
+            if (!asked_for) {
                 ++unsolicited_dropped_;
                 r.outcome = OfferOutcome::Rejected;
                 r.height  = ev.input.coinbase.height;
@@ -1500,7 +1503,7 @@ private:
                 r.why     = "already parked, unjudgeable: " + why;
                 return r;
             }
-            if (!own_mined && !alt_.contains(r.id) && !solicited_locked_(r.id)) {
+            if (!asked_for && !alt_.contains(r.id)) {
                 ++unsolicited_dropped_;
                 r.outcome = OfferOutcome::Rejected;
                 r.why     = "an unjudgeable block we did not request; the chain request fetches it";
@@ -1518,7 +1521,8 @@ private:
             b.has_entry      = true;
             b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
-            if (peer) b.source = *peer;
+            if (const AltBlock* held = alt_.find(r.id)) b.source = held->source;  // a re-send keeps the first source
+            else if (peer) b.source = *peer;
             alt_.insert(std::move(b));
             if (!was_parked) ++orphans_;
             r.outcome = OfferOutcome::ParkedOrphan;
@@ -1544,7 +1548,7 @@ private:
         if (opts_.require_pow && !pow_ok && pw.verdict != PowVerdict::Skipped) {
             // Fail-closed: hold it rather than build on work we did not check -- only a block we asked for (or our
             // own); any other is dropped with no strike and fetched again by the sync.
-            if (!own_mined && !alt_.contains(r.id) && !solicited_locked_(r.id)) {
+            if (!asked_for && !alt_.contains(r.id)) {
                 ++unsolicited_dropped_;
                 r.outcome = OfferOutcome::Rejected;
                 r.why     = "a block whose proof of work is not checkable yet, not requested; the chain request fetches it";
@@ -1563,7 +1567,8 @@ private:
             b.has_entry      = true;
             b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
-            if (peer) b.source = *peer;
+            if (const AltBlock* held = alt_.find(r.id)) b.source = held->source;  // a re-send keeps the first source
+            else if (peer) b.source = *peer;
             alt_.insert(std::move(b));
             r.outcome = OfferOutcome::StoredAsAlt;
             r.why     = std::string("held: proof of work not checkable yet (")
@@ -1619,6 +1624,7 @@ private:
                 b.cumulative_difficulty = u128_add(parent_cumdiff, difficulty);
                 b.resolved       = true;
                 b.own_mined      = own_mined;
+                b.pow_verified   = pow_ok;  // its proof of work passed the gate (proven work, as a resolved park)
                 b.adoptable      = false;   // no bodies, so nothing is judgeable yet
                 b.entry          = std::move(entry);
                 b.has_entry      = true;

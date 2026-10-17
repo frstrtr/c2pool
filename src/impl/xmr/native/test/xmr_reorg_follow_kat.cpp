@@ -75,6 +75,7 @@
 // ctest with exit 8 (the #1539 lesson).
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
@@ -566,6 +567,13 @@ static void test_walk_to_fork() {
            "walk: the pushed branch tip became %s, expected ParkedOrphan", to_string(top.outcome));
     checkf(idx.have_block(id_of(br[4])), "walk: the parked branch tip was not kept");
 
+    // From here the walk runs on the refetch list alone: another peer's chain entry replaces the want list (it names a
+    // block of its own), so each block below is asked for only because its child parked.
+    {
+        const std::vector<BlockEntry> other = build_branch(idx, f.main_ids[6], 7, 1, /*salt_base=*/29);
+        want(idx, peer(4), f.main_ids[6], 7, {id_of(other[0])});
+    }
+
     // Its parent is named for the fetcher.
     std::vector<Hash> want = idx.refetch_wanted();
     bool names_parent = false;
@@ -590,9 +598,12 @@ static void test_walk_to_fork() {
            "walk: a block above an unresolved parent was DROPPED, not parked");
 
     for (std::size_t i = 3; i-- > 1; ) {
+        const std::vector<Hash> asked = idx.refetch_wanted();
+        checkf(std::find(asked.begin(), asked.end(), id_of(br[i])) != asked.end(),
+               "walk: branch block %zu is not on the refetch list before it arrives", i);
         const OfferResult r = idx.offer_block(&f.them, br[i], /*own_mined=*/false);
         checkf(r.outcome == OfferOutcome::ParkedOrphan,
-               "walk: branch block %zu became %s", i, to_string(r.outcome));
+               "walk: branch block %zu became %s (%s)", i, to_string(r.outcome), r.why.c_str());
         checkf(idx.have_block(id_of(br[i])), "walk: branch block %zu was dropped", i);
     }
     checkf(idx.alt_size() == 4, "walk: alt pool holds %zu of the 4 parked blocks", idx.alt_size());
@@ -1255,6 +1266,23 @@ static void test_alt_classes() {
            static_cast<unsigned long long>(pk.second), static_cast<unsigned long long>(v2.second));
 }
 
+// L. --alt-max-bytes ONLY LOWERS: the derived verified cap is alt_max_blocks x the context block cap (432,036,720 B at
+// 720 and hf 16; 900,060,480 B at hf 17, the most at load); a value above it leaves it, a value below it is taken.
+static void test_alt_bytes_lower_only() {
+    namespace pbn = c2pool::xmr::pathb;
+    const std::uint64_t d = pbn::alt_verified_bytes_cap(720, std::nullopt);
+    const std::uint64_t m = pbn::alt_verified_bytes_cap_max(720);
+    checkf(d == 432036720ull && pbn::alt_verified_bytes_cap(720, std::nullopt, d + 1) == d
+                   && pbn::alt_verified_bytes_cap(720, std::nullopt, 3 * d) == d
+                   && pbn::alt_verified_bytes_cap(720, std::nullopt, 1000) == 1000,
+           "altlower: the derived cap %llu; --alt-max-bytes above it leaves it, below it lowers it",
+           static_cast<unsigned long long>(d));
+    checkf(m == 900060480ull && pbn::alt_verified_bytes_cap_max(720, 2 * m) == m
+                   && pbn::alt_verified_bytes_cap_max(720, 4096) == 4096,
+           "altlower: the load bound %llu; --alt-max-bytes above it leaves it, below it lowers it",
+           static_cast<unsigned long long>(m));
+}
+
 // H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
 // resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
 // below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
@@ -1355,6 +1383,7 @@ int main() {
     test_kept_cap();
     test_kept_blobs();
     test_alt_classes();
+    test_alt_bytes_lower_only();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
