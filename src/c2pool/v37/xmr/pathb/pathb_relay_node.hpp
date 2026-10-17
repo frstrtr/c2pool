@@ -228,6 +228,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
+    std::atomic<std::uint64_t> parked_receipts_sealed{0};  // parked receipts dropped (no strike) as their origin bin sealed
     std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
@@ -668,6 +669,7 @@ public:
         if (o_.discovery) disc_tick();
         drive_ctx();
         node_tick();
+        sweep_sealed_receipts();
         rerun_due_receipts();
         reoffer_pump_all();
         rx_tick();
@@ -997,6 +999,7 @@ private:
         bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
         // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
         std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
+        std::uint64_t origin_h = 0;  // a parked receipt's origin height h(r) (0: its P_r not held yet)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
@@ -1956,7 +1959,7 @@ private:
             parked_receipt_order_.erase(it->second.first);
             receipt_due_.erase(it->second.first);
         }
-        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked)};
+        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked), receipt_origin_locked(j.frame)};
         const std::uint64_t seq = ++parked_receipt_seq_;
         parked_receipts_[key] = std::make_pair(seq, std::move(k));
         parked_receipt_order_[seq] = key;
@@ -1981,6 +1984,31 @@ private:
         parked_receipts_.erase(it);
         unindex_receipt_locked(key);
         return j;
+    }
+    // Under the node lock: the origin height of a one-body FB_RECEIPTS frame's receipt (0: not known).
+    std::uint64_t receipt_origin_locked(const std::vector<std::uint8_t>& frame) const {
+        const std::size_t at = kFrameHeaderBytes + 1;
+        if (frame.size() <= at) return 0;
+        ReceiptBodyV3 r;
+        if (decode_receipt_body_v3(frame.data() + at, frame.size() - at, ReceiptLimits{buffers_.receipt}, r) != WireError::None)
+            return 0;
+        return node_->receipt_origin(r).value_or(0);
+    }
+    // SPEC DEFER: a parked receipt is dropped without strike when its origin bin seals on the best chain (with its asks
+    // and index entries); once per move of the best chain's record H(L) (the tick).
+    void sweep_sealed_receipts() {
+        const NodeGuard g(*this);
+        if (parked_receipts_.empty()) return;
+        const std::optional<std::uint64_t> H = node_->best_record();
+        if (!H || *H == swept_record_) return;
+        swept_record_ = *H;
+        std::vector<Hash32> sealed;
+        for (const auto& [key, e] : parked_receipts_)
+            if (e.second.origin_h != 0 && !open_at(*H, e.second.origin_h, p_.open_bins)) sealed.push_back(key);
+        for (const Hash32& key : sealed) {
+            (void)take_parked_receipt_locked(key);
+            st_.parked_receipts_sealed++;
+        }
     }
     void unindex_receipt_locked(const Hash32& key) {
         for (auto& [cause, ds] : parked_by_cause_) ds.erase(key);
@@ -3654,6 +3682,7 @@ private:
     std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
     std::uint64_t parked_receipt_seq_ = 0;
     std::map<std::uint64_t, Hash32> receipt_due_;  // parked receipts whose cause resolved, by seq: run again with room
+    std::uint64_t swept_record_ = 0;               // the best chain's H(L) at the last seal sweep of the receipt park
     bool bucket_stalled_ = false;
     bool reask_due_ = false;
 

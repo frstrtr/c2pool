@@ -4973,6 +4973,82 @@ RevPark revpark(pb::PathbRelayNode& r) {
 }
 
 // ---------------------------------------------------------------------------
+// relayrparkseal: SPEC DEFER, dropped without strike when its origin bin seals. B parks a relayed receipt whose tip
+// nobody holds (a cause that never resolves; its P_r held, so its origin bin known). While its bin is open it stays
+// parked; once A's chain moves the best record H(L) past the bin's seal (open_bins above its origin), B drops it with
+// its asks and index entries, no strike, no ban.
+void relayrparkseal() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 810);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 820);
+    ok = ok && h[a.node].on_own_share(*j0, 810, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(h[a.node].tree().best().id), 16)});
+    w.run();
+    std::optional<pb::ReceiptBodyV3> base;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) base = r->body;
+    ok = ok && base && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "relayrparkseal: setup");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t pa = 1;  // A at B
+    pb::ReceiptBodyV3 junk = *base;
+    junk.side.tip.fill(0x5E);
+    const std::optional<std::uint64_t> origin = h[b.node].receipt_origin(junk);
+    rb.receive(pa, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{junk}, pb::kRuledLaneParams));
+    w.run();
+    const std::size_t parked0 = rb.parked_receipts(), asks0 = rb.parked_receipt_asks();
+    const std::uint64_t F = h[b.node].config().p.open_bins;
+    // A's chain moves up the Monero chain (a carrier's height at most fresh_max above its parent's)
+    std::size_t open_steps = 0, held_open = 0;
+    for (int i = 0; ok && i < 80; ++i) {
+        const std::optional<std::uint64_t> H = h[b.node].best_record();
+        if (H && origin && *H >= *origin + F) break;
+        h.tick_monero(h[b.node].config().p.fresh_max);
+        ok = mine_on(h, w, a.node, 1, 830 + static_cast<std::uint32_t>(i));
+        h.now += 1;
+        a.relay->tick();
+        rb.tick();
+        w.run();
+        const std::optional<std::uint64_t> H2 = h[b.node].best_record();
+        if (H2 && origin && *H2 < *origin + F) {
+            ++open_steps;
+            held_open += rb.parked_receipts() == 1 ? 1 : 0;
+        }
+    }
+    h.now += 1;
+    rb.tick();
+    w.run();
+    const std::optional<std::uint64_t> H = h[b.node].best_record();
+    std::printf("  relayrparkseal: origin %llu, F %llu; parked %zu asks %zu at first; open for %zu steps (parked in %zu); H(L) %llu: "
+                "parked %zu asks %zu index %zu, sealed %llu, strikes %llu bans %llu\n",
+                (unsigned long long)origin.value_or(0), (unsigned long long)F, parked0, asks0, open_steps, held_open,
+                (unsigned long long)H.value_or(0), rb.parked_receipts(), rb.parked_receipt_asks(), rb.parked_index_size(),
+                (unsigned long long)st.parked_receipts_sealed.load(), (unsigned long long)rb.strikes_of(pa),
+                (unsigned long long)st.bans.load());
+    check(ok && origin && parked0 == 1 && asks0 == 1 && open_steps >= 1 && held_open == open_steps,
+          "relayrparkseal: a receipt parked on a tip nobody holds stays parked while its origin bin is open");
+    check(H && *H >= *origin + F && rb.parked_receipts() == 0 && rb.parked_receipt_asks() == 0 && rb.parked_index_size() == 0
+                  && st.parked_receipts_sealed.load() == 1 && rb.strikes_of(pa) == 0 && st.bans.load() == 0,
+          "relayrparkseal: once its origin bin seals on the best chain it is dropped with its asks and index entries; no "
+          "strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
 // revjunkbig: the receipt park at the default caps (P-09 = the pending cap, a verify queue of 4,096) under junk: one
 // more than the cap's worth of receipts of unknown tips from one peer; the park holds the cap with one ask each. A re-run
 // with an honest job queued takes at most the queue's free room and drops no queued job; the rest drain on the ticks,
@@ -5399,6 +5475,7 @@ int main(int argc, char** argv) {
     run("relayrpark", relayrpark);
     run("relayhdrctx", relayhdrctx);
     run("relayrbindr", relayrbindr);
+    run("relayrparkseal", relayrparkseal);
     run("revjunkbig", revjunkbig);
     run("revdueorder", revdueorder);
     run("relayqfull", relayqfull);

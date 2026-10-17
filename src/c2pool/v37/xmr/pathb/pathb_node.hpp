@@ -490,6 +490,18 @@ public:
         return joined_ != nullptr ? joined_->bound_work() : own_chain_.bound_work();
     }
     const PathbNodeConfig& config() const noexcept { return cfg_; }
+    // A receipt's origin height h(r) = height(P_r) + 1 when the follower holds its P_r.
+    std::optional<std::uint64_t> receipt_origin(const ReceiptBodyV3& r) const {
+        const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(r.blob.prev_id) : PrInfo{};
+        if (pr.status != PrInfo::Status::Held) return std::nullopt;
+        return pr.height + 1;
+    }
+    // H(L) of the best chain (the record at its tip), when its view is held.
+    std::optional<std::uint64_t> best_record() const {
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return std::nullopt;
+        return v.record(v.pos());
+    }
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
     // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals.
