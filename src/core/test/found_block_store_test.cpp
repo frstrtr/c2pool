@@ -460,6 +460,37 @@ TEST(MergedBlockStoreKat, UpdateCoinbaseReachesTheNewestPast1000)
     EXPECT_EQ(store.load_all().size(), 1202u);
 }
 
+TEST(MergedBlockStoreKat, UpdatersLeaveADamagedRowAlone)
+{
+    // A damaged mblk row deserializes to an empty record (block_hash "",
+    // chain_id 0). find_key matches it for an empty hash on chain 0, so
+    // without the guard update_coinbase/update_body rewrote the damaged bytes
+    // as an empty v2 record. fblk update_status already refuses this.
+    auto cut = mblk_v1_record(98, 5400001, kHashB).v;
+    cut.resize(cut.size() - (1 + 6) - 2);
+    ASSERT_TRUE(MergedBlockRecord::deserialize(cut).block_hash.empty());
+
+    TempDb t("mblk_damaged_update");
+    ASSERT_TRUE(t.db.open());
+    MergedBlockStore store(t.db);
+    const std::string empty_key = mblk_key(0, 5400001, "");
+    const std::string doge_key = mblk_key(98, 5400001, kHashB);
+    ASSERT_TRUE(t.db.put(empty_key, cut));
+    ASSERT_TRUE(t.db.put(doge_key, cut));
+
+    EXPECT_FALSE(store.update_coinbase("", 0, 777));
+    EXPECT_FALSE(store.update_body("", 0, hash_n(0xcb), 3));
+    EXPECT_FALSE(store.update_coinbase(kHashB, 98, 777));
+    EXPECT_FALSE(store.update_body(kHashB, 98, hash_n(0xcb), 3));
+
+    std::vector<uint8_t> still;
+    ASSERT_TRUE(t.db.get(empty_key, still));
+    EXPECT_EQ(still, cut);
+    ASSERT_TRUE(t.db.get(doge_key, still));
+    EXPECT_EQ(still, cut);
+    EXPECT_TRUE(store.load_all().empty());
+}
+
 TEST(MergedBlockStoreKat, FindByHashNeedsTheFullHash)
 {
     TempDb t("mblk_find");

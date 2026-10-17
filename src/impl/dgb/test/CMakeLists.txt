@@ -24,7 +24,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
     # which rejected new == floor(0.6*total) when 60*total is not a multiple of
     # 100. Pure-helper boundary KAT. Same folding rule.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp)
+    #
+    # self_connection_ban_test.cpp (#1716 part B): drives the REAL
+    # dgb::NodeImpl::handle_version self-nonce arm over a REAL accepted socket
+    # on 127.0.0.2 and pins the host ban, banscore^2 escalation and hourly
+    # forgiveness. Same folding rule.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp self_connection_ban_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
