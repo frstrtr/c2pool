@@ -7,10 +7,12 @@
 // and grouped them by bare IP (pool.ip_connections / pool.ip_workers keys) to
 // any internet viewer. /peer_list, /pings, /peer_versions and
 // /peer_txpool_sizes did the same for incoming sharechain peers, and
-// /ban_stats for banned IPs. Now a viewer that is not
+// /ban_stats for banned IPs. The JSON-RPC getpeerinfo method (POST on the
+// same port) returned the raw peer list too. Now a viewer that is not
 // core::is_direct_local_request() gets "h:" + 8 hex of HMAC-SHA256 with a
 // per-process random key instead. The port is dropped, the JSON shape is
 // unchanged, and a direct local viewer still sees the raw address.
+// getpeerinfo has no viewer context, so it always masks incoming peers.
 // /peer_addresses drops incoming peers for a viewer that is not direct local
 // instead of masking them (its entries are dial targets). This departs from
 // p2pool on purpose, for non-local viewers only.
@@ -65,6 +67,27 @@ std::string fetch(uint16_t port, const std::string& target, const Headers& heade
     req.set(http::field::host, "127.0.0.1");
     for (const auto& [name, value] : headers)
         req.set(name, value);
+    http::write(sock, req);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(sock, buffer, res);
+    beast::error_code ec;
+    sock.shutdown(tcp::socket::shutdown_both, ec);
+    return res.body();
+}
+
+std::string post(uint16_t port, const std::string& body, const Headers& headers = {})
+{
+    net::io_context ioc;
+    tcp::socket sock(ioc);
+    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port));
+    http::request<http::string_body> req{http::verb::post, "/", 11};
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::content_type, "application/json");
+    for (const auto& [name, value] : headers)
+        req.set(name, value);
+    req.body() = body;
+    req.prepare_payload();
     http::write(sock, req);
     beast::flat_buffer buffer;
     http::response<http::string_body> res;
@@ -288,6 +311,43 @@ TEST(IpMask, PeerViewsMaskIncomingOnly)
     EXPECT_NE(local.find("198.51.100.9:40312"), std::string::npos);
     EXPECT_NE(local.find("192.0.2.4:9326"), std::string::npos);
     EXPECT_NE(local.find("198.51.100.77:50000"), std::string::npos);
+}
+
+// ── JSON-RPC getpeerinfo: no viewer context, always masked ──────────────────
+
+TEST(IpMask, RpcGetPeerInfoAlwaysMasksIncoming)
+{
+    net::io_context ioc;
+    core::WebServer ws(ioc, "127.0.0.1", 0, false);
+    ws.set_stratum_port(0);
+    ws.get_mining_interface()->set_peer_info_fn([] { return peers(); });
+    ws.start();
+    const uint16_t port = ws.bound_port();
+    const std::string rpc = R"({"jsonrpc":"2.0","id":1,"method":"getpeerinfo","params":[]})";
+
+    // Proxied and direct-local callers get the same masked list: the RPC path
+    // never reveals.
+    for (const auto& headers : {kProxied, Headers{}}) {
+        const std::string body = post(port, rpc, headers);
+        EXPECT_EQ(body.find("198.51.100."), std::string::npos) << body;
+        const auto result = nlohmann::json::parse(body).at("result");
+        ASSERT_EQ(result.size(), 3u) << body;
+        EXPECT_EQ(result[0]["address"], core::mask_ip_endpoint("198.51.100.9"));
+        EXPECT_EQ(result[1]["address"], "192.0.2.4:9326");  // outgoing, as /peer_list
+        EXPECT_TRUE(is_token(result[2]["address"].get<std::string>()));
+    }
+
+    // With only incoming and unflagged peers, no IP literal is left anywhere.
+    ws.get_mining_interface()->set_peer_info_fn([] {
+        auto p = peers();
+        p.erase(1);
+        p.push_back({{"address", "[2001:db8::9]:40000"}, {"incoming", true}});
+        return p;
+    });
+    const std::string body = post(port, rpc, kProxied);
+    EXPECT_FALSE(std::regex_search(body, kIpv4)) << body;
+    EXPECT_FALSE(std::regex_search(body, kIpv6)) << body;
+    EXPECT_EQ(nlohmann::json::parse(body).at("result").size(), 3u) << body;
 }
 
 // ── /ban_stats: banned IPs masked, banned addresses shown ───────────────────
