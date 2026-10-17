@@ -74,5 +74,6 @@ RUN wanted="test_stratum_extensions test_stratum_interim_hardening \
       if printf "%s\n" "$known" | grep -qx "$t"; then targets="$targets $t"; \
       else echo "NOTE: test target $t is not defined, skipped"; fi; \
     done; \
+    [ -n "$targets" ] || { echo "NOTE: no test targets to build"; exit 0; }; \
     timeout 600 ninja -C build -k 0 -j"$(nproc)" $targets \
     || echo "WARNING: some test targets did not build (or the build hit its time limit)"
