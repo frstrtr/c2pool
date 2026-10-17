@@ -58,8 +58,6 @@ jobs:
         run: sh proto/tla/check-ratchet.sh "$PWD/tla2tools.jar" "$RUNNER_TEMP/tlc-ratchet"
 
       - name: PathBSealRNP.tla
-        env:
-          TLC_LONG: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
         run: sh proto/tla/check-seal-rnp.sh "$PWD/tla2tools.jar" "$RUNNER_TEMP/tlc-seal"
 
       # Steady-state disk hygiene on the self-hosted runners (same as
