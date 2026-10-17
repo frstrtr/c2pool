@@ -3,16 +3,21 @@
 #
 #   proto/tla/check-seal-rnp.sh <path/to/tla2tools.jar> [out-dir]
 #
-# Configs (two nodes, four receipt ids; a few minutes), one verdict line per run:
+# Configs (two nodes and four receipt ids, or one node and five), one verdict line per run:
 #   GREEN (every seal invariant + Agreement + HonestAccepted + ChainRuledValid +
 #          RecordIsCarrierMax; no error, the whole space explored, distinct
 #          states and depth at or above the floor given on its line):
 #                                        V1_rnp_own_n2r4 V1_rnp_carriage_n2r4
+#          with a Monero reorg at a constant height, a node restart, three carried ids:
+#                                        V1_rnp_own_n2r4_reorg V1_rnp_own_n2r4_restart V1_rnp_own_n1r5_k3
 #   controls (the named invariant is violated):
 #          V1_rnp_neg_openlocal_n2r4   Agreement
 #          V1_rnp_neg_omitlocal_n2r4   Agreement
 #          V1_rnp_nodead_n2r4          LegallyDead
 #          V1_rnp_sharechain_n2r4      OrphanRecovered
+#          V1_rnp_neg_hashlocal_n2r4_reorg        Agreement
+#          V1_rnp_neg_restartlocal_n2r4_restart   SealAgreement
+#          V1_rnp_neg_orderfirst_n2r5_adv_k3      Agreement
 #   witnesses under Adv (the single-check case is reachable, so it is violated):
 #          V1_rnp_probe_order_n2r4_adv_k2  NoOrderRefusal
 #          V1_rnp_probe_closed_n2r4_adv    NoClosedRefusal
@@ -60,6 +65,9 @@ green() {
 
 run V1_rnp_own_n2r4;      green V1_rnp_own_n2r4      184907 17
 run V1_rnp_carriage_n2r4; green V1_rnp_carriage_n2r4 184907 17
+run V1_rnp_own_n2r4_reorg;   green V1_rnp_own_n2r4_reorg   3131274 18
+run V1_rnp_own_n2r4_restart; green V1_rnp_own_n2r4_restart 369814 18
+run V1_rnp_own_n1r5_k3;    green V1_rnp_own_n1r5_k3    1898658 14
 
 run V1_rnp_neg_openlocal_n2r4;      expect V1_rnp_neg_openlocal_n2r4      'Invariant Agreement is violated'
 run V1_rnp_neg_omitlocal_n2r4;      expect V1_rnp_neg_omitlocal_n2r4      'Invariant Agreement is violated'
@@ -67,6 +75,10 @@ run V1_rnp_nodead_n2r4;             expect V1_rnp_nodead_n2r4             'Invar
 run V1_rnp_sharechain_n2r4;         expect V1_rnp_sharechain_n2r4         'Invariant OrphanRecovered is violated'
 run V1_rnp_probe_order_n2r4_adv_k2; expect V1_rnp_probe_order_n2r4_adv_k2 'Invariant NoOrderRefusal is violated'
 run V1_rnp_probe_closed_n2r4_adv;   expect V1_rnp_probe_closed_n2r4_adv   'Invariant NoClosedRefusal is violated'
+run V1_rnp_neg_hashlocal_n2r4_reorg;      expect V1_rnp_neg_hashlocal_n2r4_reorg      'Invariant Agreement is violated'
+run V1_rnp_neg_restartlocal_n2r4_restart; expect V1_rnp_neg_restartlocal_n2r4_restart 'Invariant SealAgreement is violated'
+run V1_rnp_neg_orderfirst_n2r5_adv_k3;    expect V1_rnp_neg_orderfirst_n2r5_adv_k3    'Invariant Agreement is violated'
+
 
 echo "sha256(tla2tools.jar) $(sha256sum "$JAR" | cut -d' ' -f1)"
 exit $FAIL
