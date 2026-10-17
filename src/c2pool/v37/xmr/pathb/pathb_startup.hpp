@@ -20,7 +20,7 @@
 // failure takes the joiner path), which the caller runs.
 // The Path B policy flags not named by their own modules.
 //
-// Header-only. Not included by any running component; included by its KATs only.
+// Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -45,6 +45,19 @@ inline constexpr std::string_view kHeaderKeepFlag = "--pathb-header-keep";
 inline constexpr std::string_view kSideKeepFlag = "--pathb-side-keep";
 // Kind-2 descriptors (test networks only).
 inline constexpr std::string_view kDeploymentsFlag = "--pathb-deployments";
+// The regtest rig's K30 set (ruling 36 DC-9, E-43): L, GRACE, TIMEOUT (regtest only; a test-network rig input).
+inline constexpr std::string_view kRegtestK30Flag = "--pathb-regtest-k30";
+
+// The epoch-0 lane rules of a regtest rig: the network's list with K30 L, GRACE and TIMEOUT from the rig; its G is
+// genesis_digest_for of it (the default set gives the golden regtest G). nullopt: not regtest.
+inline std::optional<PathbLaneRules> regtest_k30_rules(LaneNet n, const RatchetParams& k30) {
+    if (n != LaneNet::Regtest) return std::nullopt;
+    PathbLaneRules r = epoch0_lane_rules(n);
+    r.vote_window = k30.window;
+    r.grace = k30.grace;
+    r.timeout = k30.timeout;
+    return r;
+}
 
 enum class StartupStep : std::uint8_t {
     Ok = 0,
@@ -87,6 +100,13 @@ struct StartupResult {
     bool ok() const noexcept { return refused == StartupStep::Ok; }
 };
 
+// Step 1 alone (the daemon runs it first, before anything starts): the configured sum.
+inline std::optional<std::string> fee_sum_refusal(std::uint32_t owner_fee_bp, std::uint32_t give_author_bp) {
+    const std::uint64_t fee_sum = std::uint64_t{owner_fee_bp} + give_author_bp;
+    if (fee_sum <= 10000u) return std::nullopt;
+    return "--node-owner-fee-pct + --give-author-pct = " + std::to_string(fee_sum) + " bp, above 10000 bp";
+}
+
 inline StartupResult startup_checks(const StartupInputs& in) {
     StartupResult out;
     const auto refuse = [&](StartupStep s, std::string why) {
@@ -95,10 +115,8 @@ inline StartupResult startup_checks(const StartupInputs& in) {
         return out;
     };
     // 1
-    const std::uint64_t fee_sum = std::uint64_t{in.owner_fee_bp} + in.give_author_bp;
-    if (fee_sum > 10000u)
-        return refuse(StartupStep::FeeSum, "--node-owner-fee-pct + --give-author-pct = " + std::to_string(fee_sum) +
-                                                   " bp, above 10000 bp");
+    if (const std::optional<std::string> r = fee_sum_refusal(in.owner_fee_bp, in.give_author_bp))
+        return refuse(StartupStep::FeeSum, *r);
     // 2
     if (const std::optional<std::string> r = journal_depth_refusal(in.p, in.journal_depth))
         return refuse(StartupStep::JournalDepth, *r);

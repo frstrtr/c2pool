@@ -11,10 +11,11 @@
 // The c2pool web dashboard for c2pool-v37-xmr: the SAME core::WebServer +
 // HttpSession + web-static/ UI every other coin binary serves, fed by a
 // READ-ONLY provider. The node publishes a plain XmrWebState (built from state
-// it already holds: its own stratum, its owed ledger, its native chain view,
-// its relay) and reports accepted stratum shares; the provider turns that into
-// the p2pool-compatible JSON endpoints. Nothing here is consensus state, no
-// monerod RPC is issued, and nothing is opened unless --web-port is given.
+// it already holds: its own stratum, its Path B node at the best tip, its
+// native chain view, its relay) and reports accepted stratum shares; the
+// provider turns that into the p2pool-compatible JSON endpoints and the Path B
+// status view (/xmr/pathb). Nothing here is consensus state, no monerod RPC is
+// issued, and nothing is opened unless --web-port is given.
 //
 // This header is deliberately free of core/ and nlohmann includes (pimpl): the
 // daemon TU keeps its own namespace, the web layer lives in the .cpp.
@@ -36,43 +37,65 @@ inline constexpr const char* kPayoutScheme     = "WRS / PPR";
 inline constexpr const char* kPayoutSchemeLong = "Work Receipt Settlement (pay-per-receipt)";
 inline constexpr std::uint64_t kPicoPerXmr = 1000000000000ULL;
 
-struct XmrWebBlock {
+// One found block (the found line): the block, the Path B tip whose window its
+// coinbase pays, the outputs and R, and how it landed.
+struct XmrWebFound {
     std::uint64_t height = 0;
     std::string   id_hex;                 // block id, 64 hex
-    std::uint64_t time = 0;               // unix seconds (found time, else first seen)
-    std::string   status = "pending";     // pending (inside D_conf) | main (settled) | orphan
-    bool          own = false;            // this node's own find (else booked from the chain)
-    bool          coinbase_known = false; // the full coinbase reward is known (own find: its template's reward)
-    std::uint64_t coinbase_total_pico = 0;
-    std::uint64_t booked_pico = 0;        // what the lane booked for this block (sum of its payouts)
-    std::vector<std::pair<std::string, std::uint64_t>> payouts;   // payee (address) -> piconero
+    std::uint64_t time = 0;               // unix seconds (found time)
+    std::string   tip_hex;                // the Path B tip
+    std::string   window_root_hex;
+    std::uint64_t n_outputs = 0;
+    std::uint64_t reward_pico = 0;        // R
+    std::string   landed;                 // monerod | peer | own-index
 };
 
-struct XmrWebPayee {
-    std::string  address;                 // base58 when known, else "key:<hex>"
-    std::int64_t owed_pico = 0;           // EffectiveOwed
+// One payee of the best tip's window (display only).
+struct XmrWebPayeeShare {
+    std::string   payee;                  // base58 when known, else "key:<hex>"
+    double        share = 0;              // its part of the window's weight
+    std::uint64_t amount_pico = 0;        // its output at the current template's R (0: no template)
+};
+
+// The Path B node at its best tip.
+struct XmrWebPathb {
+    std::uint64_t tip_pos = 0;
+    std::string   tip_id_hex;
+    std::string   cum_work;               // decimal
+    std::uint32_t epoch_cur = 0;
+    std::uint64_t h_hold = 0;
+    std::string   window_root_hex, mmr_root_hex;
+    std::uint64_t leaf_count = 0;
+    std::uint64_t pending = 0, deferred = 0;
+    std::vector<std::string> pending_ids;  // the first 64 pending receipt ids, 12 hex digits each
+    std::uint64_t repended_last_switch = 0;
+    std::uint64_t switches = 0;           // switches by the journal (cumulative)
+    std::string   template_status;
+    // alarms
+    bool          hold = false;
+    bool          fork_fuse = false;
+    bool          template_kept = false;  // no new template fits: the previous one kept
+    bool          store_poisoned = false;
+    std::uint64_t coinbase_internal = 0;  // node-internal coinbase-check outcomes
 };
 
 struct XmrWebState {
-    std::string   version, network, coinbase_mode;
+    std::string   version, network;
     std::string   stratum_host;  std::uint16_t stratum_port = 0;
     std::uint64_t chain_height = 0;       // native chain view tip
     std::uint64_t network_difficulty = 0; // the current template's (== the next block's) difficulty
     std::uint64_t template_height = 0;
-    std::uint64_t share_difficulty = 0;   // the stratum share target (0 = network)
-    std::uint64_t d_conf = 0, finalize_cursor = 0, hw = 0, ledger_seq = 0;
-    std::string   owed_digest_hex;
+    std::uint64_t share_difficulty = 0;   // d_at: the stratum share difficulty at the next position
     bool          relay_enabled = false;
     std::size_t   relay_ready = 0, relay_conns = 0;
     std::uint64_t relay_foreign_receipts = 0;    // admitted foreign receipts (cumulative)
-    std::string   fee_model = "off";
     double        give_author_pct = 0, owner_fee_pct = 0;
-    std::string   owner_address, donation_address, payout_address;
+    std::string   owner_address, payout_address;
     std::uint64_t stratum_connections = 0, stratum_active = 0, stratum_shares = 0, stratum_rejected = 0;
-    std::uint64_t found_registered = 0, found_settled = 0, found_orphaned = 0;
     bool          lane_suspended = false;
-    std::vector<XmrWebPayee> owed;        // the owed ledger, one row per payee
-    std::vector<XmrWebBlock> blocks;      // newest first
+    XmrWebPathb   pathb;
+    std::vector<XmrWebPayeeShare> window; // the best tip's window
+    std::vector<XmrWebFound> found;       // newest first
 };
 
 class XmrWebDashboard {

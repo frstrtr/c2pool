@@ -6,32 +6,27 @@
 // version. See COPYING in the repository root.
 //
 // ===========================================================================
-// src/c2pool/v37/test/v37_xmr_next_seed_kat.cpp   (NEXT-SEED ANNOUNCE)
+// src/c2pool/v37/test/v37_xmr_next_seed_kat.cpp
 //
-// Operator ruling 09-26: announce the next RandomX seed ahead of the switch.
-// The settlement provider used to serve next_seed_hash = nullopt (monerod's
-// get_miner_data has no such field), so at a seed switch the ~256 MiB Argon2d
-// cache init ran on the stratum thread inside the new-template hook (a live
-// node stalled a job push ~6 s) and no miner could prepare early.
-//
-// Runs the path that serves miners: the REAL native chain index
-// (ChainStateView, the C4 golden windows re-seeded at heights around an epoch
-// boundary E), NativeMinerDataSource, XmrSettlementTemplateProvider,
-// SettlementStratumTemplateSource and the merged XmrStratumServer, then the
-// daemon's O2RandomXVerifier fed the served jobs exactly as the listener hook
-// feeds it (on_template).
+// The next RandomX seed announced ahead of the switch, on the Path B path that
+// serves miners: the REAL native chain index (ChainStateView, the C4 golden
+// windows re-seeded at heights around an epoch boundary E) ->
+// NativeMinerDataSource -> the template's JobNetwork (seed, next seed of the
+// MinerData of the template's height) -> PathbJobSource -> the stratum job and
+// the merged XmrStratumServer; then the daemon's O2RandomXVerifier fed the
+// served jobs as the listener hook feeds it (on_template).
 //   (A) next_seed_hash is present in the served job for EXACTLY the 64
 //       heights before the switch (monerod get_block_template rule:
 //       rx_seedheights(h) -> seed != next), equal to the block id at the next
 //       seed height; absent everywhere else; the stratum job JSON carries
 //       "next_seed_hash" exactly then.
-//   (C) the daemon arm (get_miner_data has none): the id comes from one
-//       get_block_header_by_height per tip inside the window, none outside.
+//   (C) the daemon arm (MonerodMinerDataSource; get_miner_data has none): the
+//       id comes from one get_block_header_by_height per tip inside the
+//       window, none outside, and reaches the served job.
 //   (B) across the announced switch: no cache initialisation at the switch
 //       job, the previous epoch stays resident, every hash equals a FRESH
 //       cache + FRESH VM reference.
-// RED on the pre-fix tree (nothing announced; the switch keys the cache on
-// the listener), GREEN on the fix. HEAVY (real RandomX, up to 4 x 256 MiB).
+// HEAVY (real RandomX, up to 4 x 256 MiB).
 // ===========================================================================
 #include <chrono>
 #include <cstdio>
@@ -46,9 +41,10 @@
 #include "impl/xmr/native/contracts/fakes/fakes.hpp"
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 
+#include "impl/xmr/native/template/xmr_monerod_miner_data.hpp"
+
+#include "c2pool/v37/xmr/pathb/pathb_job_source.hpp"
 #include "c2pool/v37/xmr/xmr_o2_randomx_verify.hpp"
-#include "c2pool/v37/xmr/xmr_o2_settlement_fixture.hpp"
-#include "c2pool/v37/xmr/xmr_o2_settlement_provider.hpp"
 
 #include "xmr_c4_state_builder.hpp"
 
@@ -58,6 +54,8 @@ using namespace c2pool::xmr::native::testkit;
 namespace o2    = c2pool::v37n::xmr::o2;
 namespace strat = ::v37::xmr::stratum;
 namespace tmpl  = c2pool::xmr::native::tmpl;
+namespace pb    = c2pool::xmr::pathb;
+namespace node  = ::c2pool::xmr::node;
 
 namespace {
 
@@ -72,28 +70,6 @@ void check(bool ok, const std::string& what) {
 std::uint64_t ref_seedheight(std::uint64_t h) {
     return h <= 2048 + 64 ? 0 : (h - 64 - 1) & ~std::uint64_t(2048 - 1);
 }
-
-// ---- the lane fixture (as v37_xmr_m2_native_settlement_kat) ----------------
-std::array<std::uint8_t, 32> point_of(std::uint8_t k) {
-    ::xmr::coin::SecretKey sec{};
-    sec.data()[0] = k;
-    ::xmr::coin::PublicKey pub{};
-    if (!::xmr::coin::secret_key_to_public_key(sec, pub)) return {};
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), pub.data(), 32);
-    return out;
-}
-struct LaneFixture {
-    o2::XmrOwedFixture      ledger{static_cast<::v37::ChainId>(0x0000ABCDu)};
-    o2::XmrSettlementConfig scfg;
-    LaneFixture() {
-        const auto P1 = point_of(1), P2 = point_of(2), P3 = point_of(3), P4 = point_of(4);
-        ledger.seed_owed(::v37::xmr::make_xmr_std(P1, P2), 3'000'000'000ull);
-        ledger.seed_owed(::v37::xmr::make_xmr_std(P3, P2), 2'000'000'000ull);
-        scfg.h_min = 0; scfg.output_cap = 0;
-        scfg.set_residual_sink_std(P4, P2);
-    }
-};
 
 // ---- the C4 golden windows, rolled once (build_state's roll, verbatim) -----
 struct Windows {
@@ -179,20 +155,63 @@ struct Reference {
     }
 };
 
+// The Path B template of the MinerData at its height (P_r = its prev_id) and the
+// job of a bound session: a hashing blob on P_r with nonce 0 (the job source's
+// make_job function; the miner tx is not needed here).
+pb::PathbJobSource::MakeJob make_job_fn() {
+    return [](const pb::PathbTemplate& t, const pb::PathbSession&) -> std::optional<pb::PathbJob> {
+        pb::PathbJob j;
+        j.body.blob.major = t.hf;
+        j.body.blob.minor = t.hf;
+        j.body.blob.timestamp = 1700000000ull + t.h;
+        std::copy(t.p_r.begin(), t.p_r.end(), j.body.blob.prev_id.begin());
+        j.body.blob.tree_root.fill(0x5a);
+        j.body.blob.tx_count = 1;
+        j.h = t.h;
+        j.d = t.d;
+        return j;
+    };
+}
+
+// Serve the MinerData `md` as the Path B job source serves a template (main's
+// JobNetwork: the network values of the template's height); sessions bound for
+// extra_nonce 0..63.
+bool serve(pb::PathbJobSource& jobs, const node::MinerData& md, strat::TemplateJob& tj) {
+    pb::PathbTemplate t;
+    t.status = pb::TemplateStatus::Ok;
+    t.h = md.height;
+    std::copy(md.prev_id.begin(), md.prev_id.end(), t.p_r.begin());
+    t.hf = md.major_version;
+    t.d = 16;
+    pb::JobNetwork net;
+    net.known = true;
+    net.difficulty_lo = md.difficulty.lo;
+    net.difficulty_hi = md.difficulty.hi;
+    std::copy(md.seed_hash.begin(), md.seed_hash.end(), net.seed.begin());
+    if (md.next_seed_hash) {
+        pb::Hash32 n{};
+        std::copy(md.next_seed_hash->begin(), md.next_seed_hash->end(), n.begin());
+        net.next_seed = n;
+    }
+    jobs.set_template(t, net);
+    for (std::uint32_t en = 0; en < 64; ++en) jobs.bind(en, pb::PathbSession{});
+    return jobs.get_job(0, tj);
+}
+
 struct Rig {
     Windows                          w = golden_windows();
     ChainStateView                   view{XmrNet::Stagenet};
     fakes::FakeTxpool                pool;
     tmpl::NativeMinerDataSource      src{view, pool, {}, &pool};
-    LaneFixture                      lane;
-    o2::XmrSettlementTemplateProvider provider{src, lane.ledger, lane.scfg, /*share_diff=*/16};
-    o2::SettlementStratumTemplateSource ts{provider};
+    pb::PathbJobSource               ts{make_job_fn()};
+    std::string                      why;
 
-    // Serve the template for height h; false when the provider refused.
+    // Serve the template for height h; false when the source has none.
     bool job_at(std::uint64_t h, strat::TemplateJob& tj) {
         seed_at(view, w, h);
-        if (!provider.refresh() || provider.current().height != h) return false;
-        return ts.get_job(0, tj);
+        const std::optional<node::MinerData> md = src.snapshot(&why);
+        if (!md || md->height != h) return false;
+        return serve(ts, *md, tj);
     }
 };
 
@@ -212,7 +231,7 @@ void suite_announce(Rig& r) {
     NullSink sink;
     for (std::uint64_t h : hs) {
         strat::TemplateJob tj;
-        if (!r.job_at(h, tj)) { std::printf("  refresh at %llu: %s\n", (unsigned long long)h, r.provider.last_error().c_str()); continue; }
+        if (!r.job_at(h, tj)) { std::printf("  no template at %llu: %s\n", (unsigned long long)h, r.why.c_str()); continue; }
         ++built;
         const std::uint64_t sh = ref_seedheight(h), nh = ref_seedheight(h + 64);
         const bool want = nh != sh;
@@ -242,7 +261,7 @@ void suite_announce(Rig& r) {
 }
 
 void suite_switch(Rig& r) {
-    std::printf("== (B) O2RandomXVerifier across the ANNOUNCED switch (jobs from the provider) ==\n");
+    std::printf("== (B) O2RandomXVerifier across the ANNOUNCED switch (jobs from the Path B job source) ==\n");
     using clk = std::chrono::steady_clock;
     const o2::Seed32 A = synthetic_id(E - 2048), B = synthetic_id(E);
     o2::O2RandomXVerifier v; o2::RandomXPolicy p; p.enabled = true;
@@ -311,7 +330,6 @@ void suite_switch(Rig& r) {
 // A fake monerod: get_miner_data = the C4 golden capture with its height and
 // prev_id moved; get_block_header_by_height(n) answers id synthetic_id(n).
 // ---------------------------------------------------------------------------
-namespace node = ::c2pool::xmr::node;
 class FakeMonerod final : public node::IMonerodTransport {
 public:
     std::uint64_t height = G4::MD_HEIGHT;
@@ -343,20 +361,22 @@ public:
 void suite_daemon_arm() {
     std::printf("== (C) DAEMON arm: next_seed_hash from get_block_header_by_height ==\n");
     FakeMonerod m;
-    LaneFixture lane;
-    o2::XmrSettlementTemplateProvider provider(m, lane.ledger, lane.scfg, 16);
-    o2::SettlementStratumTemplateSource ts(provider);
+    tmpl::MonerodMinerDataSource src(m, tmpl::MonerodArmConfig{0, 3});
+    pb::PathbJobSource ts{make_job_fn()};
     struct Want { std::uint64_t h; bool present; };
     const Want ws[] = {{E + 5, true}, {E + 6, true}, {E + 65, false}, {E + 1000, false}};
     int ok = 0;
     for (const Want& w : ws) {
         m.height = w.h;
         strat::TemplateJob tj;
-        const bool built = provider.refresh() && ts.get_job(0, tj) && tj.height == w.h;
+        std::string why;
+        const bool polled = src.poll(&why);
+        const std::optional<node::MinerData> md = polled ? src.snapshot(&why) : std::nullopt;
+        const bool built = md && md->height == w.h && serve(ts, *md, tj) && tj.height == w.h;
         const bool good = built && (w.present ? (tj.next_seed_hash && *tj.next_seed_hash == synthetic_id(E))
                                               : !tj.next_seed_hash);
-        std::printf("  h=%llu built=%d next_seed_hash %s\n", (unsigned long long)w.h, built ? 1 : 0,
-                    tj.next_seed_hash ? hex(*tj.next_seed_hash).substr(0, 16).c_str() : "absent");
+        std::printf("  h=%llu built=%d next_seed_hash %s %s\n", (unsigned long long)w.h, built ? 1 : 0,
+                    tj.next_seed_hash ? hex(*tj.next_seed_hash).substr(0, 16).c_str() : "absent", why.c_str());
         if (good) ++ok;
     }
     check(ok == 4, "daemon arm: present (= id at E) at E+5, E+6; absent at E+65 and mid-epoch (" + std::to_string(ok) + "/4)");

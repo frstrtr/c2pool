@@ -23,15 +23,27 @@
 //                  | u8 kind (0 none, 1 carrier body, 2 header) | u32 len
 //                  | bytes | u16 n | n x (u64 bin | u64 p_own | u8 live)
 //   16 K_AR        v37s:ar:<chain>:<h_act %020u>    u16 e | u64 h_act | b32 digest
+//   17 K_BWORK     v37s:bwork:<chain>:<h %020u>     u64 h | u128 work
+//                  (A's bound work counted below its prune floor)
+//   18 K_BLO       v37s:blo:<chain>                 u64 lo
+//                  (a joined store: the position x1 + 1 its bound work is
+//                  counted from; absent: from the tree's root)
+//   19 K_BCLAIM    v37s:bclaim:<chain>:<bin %020u>  u64 bin | b32 at_id | b32 at_digest
+//                  (a joined store: a leaf it adopted as a claim, proved
+//                  against that at header; 3.7a, E-72)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
 //   One batch per new best-chain position: K_PCARRIER(x), the lane records
 //   sealed at x and K_BMMR (BinStore), K_AR if x activates, K_PHEAD. A switch
 //   is one batch: K_PCARRIER and K_AR above the fork deleted, the new branch
-//   written. A joined store and the first batch of a pool launched here are
-//   written into an empty store (every key of its prefixes deleted in the same
-//   batch). A failed write leaves the poison mark (a batch of its own).
+//   written. A joined store (with its K_BLO, x1 + 1) and the first batch of a
+//   pool launched here are written into an empty store (every key of its
+//   prefixes deleted in the same batch). A failed write leaves the poison mark
+//   (a batch of its own). A
+//   retention prune is one batch (prune_batch): the records below first_pos
+//   deleted, those below root_pos header records, K_BWORK of the heights
+//   whose counted work the prune moved below the floor.
 //
 //   pathb_load (in order; any fault: the joiner path):
 //     0. no poison mark;
@@ -44,15 +56,20 @@
 //        lc(H(tip - 1)) leaves; its receipts_root == the fold of its carried
 //        ids with rs_root(S_{tip - 1});
 //     4. AR: ascending, at or below the tip, consistent with S_tip (or the
-//        joiner seed of a joined store);
+//        joiner seed of a joined store, at or below its root);
 //     5. q0 = max(base_pos + 1, tip - J + 1); phase 1 (positions s1 .. q0 - 1,
 //        s1 = the first position above the root with H(x) > H(q0 - 1) - F -
 //        Fresh): the stored placements whose bin is open at q0 - 1, with their
 //        stored p_own and live, each body checked against its stored id,
 //        parent link and receipts_root fold; phase 2 (q0 .. tip): every position placed again
 //        as a live node places it (tree, BinStore, rs_step_at, AR), its
-//        stored S, d, cum_work, H, live flags, mmr_root and AR row compared;
-//     6. the lane records at or beyond leaf_count deleted (one batch).
+//        stored S, d, cum_work, H, live flags, mmr_root and AR row compared
+//        (a joined store: the bins at or below H(x0 - 1) + Fresh sealed from
+//        the served buckets its lane records hold, as in the join);
+//     6. the lane records at or beyond leaf_count deleted (one batch);
+//     7. K_BWORK: each key names its own height (the bound work below the
+//        floor; absent: none); K_BLO at least 1 and at most tip + 1, present
+//        in a joined store; K_BCLAIM: each key names its own bin.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -84,6 +101,9 @@ namespace c2pool::xmr::pathb {
 inline constexpr std::uint8_t K_PHEAD = 14;
 inline constexpr std::uint8_t K_PCARRIER = 15;
 inline constexpr std::uint8_t K_AR = 16;
+inline constexpr std::uint8_t K_BWORK = 17;
+inline constexpr std::uint8_t K_BLO = 18;
+inline constexpr std::uint8_t K_BCLAIM = 19;
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -91,6 +111,11 @@ inline std::string pcarrier_prefix(std::uint32_t c) { return "v37s:pcar:" + lane
 inline std::string pcarrier(std::uint32_t c, std::uint64_t pos) { return pcarrier_prefix(c) + lane_keys::index_fmt(pos); }
 inline std::string ar_prefix(std::uint32_t c) { return "v37s:ar:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string ar(std::uint32_t c, std::uint64_t h_act) { return ar_prefix(c) + lane_keys::index_fmt(h_act); }
+inline std::string bwork_prefix(std::uint32_t c) { return "v37s:bwork:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string bwork(std::uint32_t c, std::uint64_t h) { return bwork_prefix(c) + lane_keys::index_fmt(h); }
+inline std::string blo(std::uint32_t c) { return "v37s:blo:" + lane_keys::chain_fmt(c); }
+inline std::string bclaim_prefix(std::uint32_t c) { return "v37s:bclaim:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string bclaim(std::uint32_t c, std::uint64_t bin) { return bclaim_prefix(c) + lane_keys::index_fmt(bin); }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -126,7 +151,7 @@ struct StoreHead {
     std::uint64_t journal_base = 0;
     std::uint64_t first_pos = 0;      // the lowest K_PCARRIER held (0; a joined store: x0 - N_rt)
     std::uint64_t root_pos = 0;       // the lowest position with its S (0; a joined store: x0 - 1)
-    std::uint64_t base_pos = 0;       // the store base (0; a joined store: L_j)
+    std::uint64_t base_pos = 0;       // the store base (0; a joined store: its root x0 - 1)
     std::uint64_t base_leaf_count = 0;
     std::vector<Hash32> base_peaks;
     RatchetStateBytes s_base{};
@@ -335,6 +360,66 @@ inline std::optional<ActivationRow> decode_ar_row(const std::string& v) {
     return a;
 }
 
+inline std::string encode_bwork(std::uint64_t h, const ::c2pool::xmr::native::U128& w_) {
+    lane_rec::Writer w;
+    w.hdr(K_BWORK);
+    w.u64(h);
+    w.u64(w_.lo);
+    w.u64(w_.hi);
+    return w.s;
+}
+
+inline std::optional<std::pair<std::uint64_t, ::c2pool::xmr::native::U128>> decode_bwork(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_BWORK)) return std::nullopt;
+    std::pair<std::uint64_t, ::c2pool::xmr::native::U128> out;
+    out.first = r.u64();
+    out.second.lo = r.u64();
+    out.second.hi = r.u64();
+    if (!r.done()) return std::nullopt;
+    return out;
+}
+
+inline std::string encode_blo(std::uint64_t lo) {
+    lane_rec::Writer w;
+    w.hdr(K_BLO);
+    w.u64(lo);
+    return w.s;
+}
+
+inline std::optional<std::uint64_t> decode_blo(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_BLO)) return std::nullopt;
+    const std::uint64_t lo = r.u64();
+    if (!r.done()) return std::nullopt;
+    return lo;
+}
+
+struct BclaimRecord {
+    std::uint64_t bin = 0;
+    Hash32 at_id{};
+    Hash32 at_digest{};
+};
+inline std::string encode_bclaim(const BclaimRecord& c) {
+    lane_rec::Writer w;
+    w.hdr(K_BCLAIM);
+    w.u64(c.bin);
+    w.bytes(c.at_id);
+    w.bytes(c.at_digest);
+    return w.s;
+}
+
+inline std::optional<BclaimRecord> decode_bclaim(const std::string& v) {
+    lane_rec::Reader r(v);
+    if (!lane_rec::read_hdr(r, K_BCLAIM)) return std::nullopt;
+    BclaimRecord c;
+    c.bin = r.u64();
+    c.at_id = r.bytes<kHashBytes>();
+    c.at_digest = r.bytes<kHashBytes>();
+    if (!r.done()) return std::nullopt;
+    return c;
+}
+
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
@@ -436,10 +521,12 @@ inline LaneBatch switch_batch(std::uint32_t chain, StoreHead& head, const Carrie
 // joiners), the root (x0 - 1, or position 0 of a young chain) with its S (and
 // its header bytes when its body is not held), the span with its bodies and
 // placements; every AR row; K_PHEAD
-// with the store base: base_pos = L, base_leaf_count = first_leaf() =
-// lc(H(x0 - 1)) and base_peaks its peaks (0 and none on a young chain),
-// S_base = S_L. nullopt: a position the store names that the tree does not
-// hold.
+// with the store base: base_pos = the root (x0 - 1; 0 on a young chain): a
+// restart replays the positions the session's journal held, from q0 =
+// max(root + 1, L - J + 1), its journal base the session's, max(L - J, root);
+// base_leaf_count = first_leaf() = lc(H(x0 - 1)) and base_peaks its peaks (0
+// and none on a young chain), S_base = S_L. nullopt: a position the store
+// names that the tree does not hold.
 inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
                                                const BinStore& store, const CarrierBodies& bodies,
                                                const ActivationRecord& ar, std::uint64_t root_pos,
@@ -489,7 +576,7 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
     head_at_tip(head, store);
     head.first_pos = first;
     head.root_pos = root_pos;
-    head.base_pos = store.tip_pos();
+    head.base_pos = root_pos;
     head.base_leaf_count = store.first_leaf();
     head.base_peaks.clear();
     if (store.first_leaf() > 0) {
@@ -504,10 +591,64 @@ inline std::optional<LaneBatch> adoption_batch(std::uint32_t chain, StoreHead& h
     return b;
 }
 
+// The batch of a retention prune at the store's best tip (the node's prune
+// step): K_PCARRIER below `first` deleted; the records of
+// [max(first, root_pos), root) rewritten as header records (no S, no body,
+// no placements; the header bytes from the body, else from `prefix`; the
+// parent from the record below); the records from `root` up unchanged;
+// K_PHEAD with first_pos = first, root_pos = root and base_pos at least
+// root; K_BWORK of each height in `below` (A's bound work below
+// the floor, at those heights). K_BMMR, K_BLHASH, K_BLEAF and K_AR
+// untouched. `head`: the store's
+// head (its first_pos and root_pos the current ones; the floors never move
+// back). nullopt: first above root, root above the tip, or a position the
+// store or the tree does not hold.
+inline std::optional<LaneBatch> prune_batch(std::uint32_t chain, StoreHead& head, const CarrierTree& tree,
+                                            const BinStore& store, const CarrierBodies& bodies, std::uint64_t first,
+                                            std::uint64_t root,
+                                            const std::map<std::uint64_t, CarrierHeader>* prefix = nullptr,
+                                            const std::map<std::uint64_t, ::c2pool::xmr::native::U128>* below = nullptr) {
+    first = std::max(first, head.first_pos);
+    root = std::max(root, head.root_pos);
+    if (first > root || root > store.tip_pos()) return std::nullopt;
+    LaneBatch b;
+    for (std::uint64_t x = head.first_pos; x < first; ++x) b.del(store_keys::pcarrier(chain, x));
+    for (std::uint64_t x = std::max(first, head.root_pos); x < root; ++x) {
+        const std::optional<Hash32> id = store.best_at(x);
+        const CarrierNode* n = id ? tree.find(*id) : nullptr;
+        if (n == nullptr) return std::nullopt;
+        CarrierRecord c = record_of(*n, nullptr, nullptr);
+        c.state.reset();
+        std::optional<std::vector<std::uint8_t>> hb;
+        if (const CarrierBodyV3* body = bodies.get(*id)) {
+            hb = header_bytes(header_of(*body));
+        } else if (prefix != nullptr) {
+            if (const auto it = prefix->find(x); it != prefix->end() && receipt_id(it->second.own) == *id)
+                hb = header_bytes(it->second);
+        }
+        if (hb) {
+            c.kind = RecordBody::Header;
+            c.bytes = *hb;
+        }
+        if (x > store.first_record_pos())
+            if (const std::optional<Hash32> below = store.best_at(x - 1)) c.parent = *below;
+        put_position(b, chain, c, std::nullopt);
+    }
+    head_at_tip(head, store);
+    head.first_pos = first;
+    head.root_pos = root;
+    head.base_pos = std::max(head.base_pos, root);
+    put_head(b, chain, head);
+    if (below != nullptr)
+        for (const auto& [h, w] : *below) b.put(store_keys::bwork(chain, h), encode_bwork(h, w));
+    return b;
+}
+
 // The key prefixes of a store (its records, its lane records, its poison mark).
 inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
+            store_keys::bwork_prefix(chain), store_keys::blo(chain),            store_keys::bclaim_prefix(chain),
             store_keys::poison(chain)};
 }
 
@@ -549,6 +690,8 @@ enum class StoreFault : std::uint8_t {
     Phase2,     // a replayed position differs from its record
     Scan,       // the KV scan failed
     Poisoned,   // the store's poison mark: a write failed before the last stop
+    Work,       // a K_BWORK / K_BCLAIM record torn, not under its key or (K_BCLAIM) out of range; a K_BLO torn, out of
+                // range, or absent (joined)
 };
 
 struct LoadInputs {
@@ -569,6 +712,9 @@ struct LoadedState {
     std::uint64_t phase1_from = 0;
     std::map<Hash32, XmrKeyRef> refs;  // the key references the restored placements and buckets hold, by identity
     std::map<std::uint64_t, CarrierHeader> prefix_headers;  // a joined store's claimed prefix headers, by position
+    std::map<std::uint64_t, ::c2pool::xmr::native::U128> bound_below;  // K_BWORK: bound work below the floor, by height
+    std::uint64_t bound_lo = 0;  // K_BLO: a joined store's x1 + 1 (0: count from the tree's root)
+    std::map<std::uint64_t, BclaimRecord> claimed;  // K_BCLAIM: a joined store's adopted (claimed) leaves, by bin
 };
 
 struct LoadResult {
@@ -700,16 +846,24 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         }
     }
     const RatchetState s_tip = decode_ratchet_state(*recs.back().state);
-    const bool joined = H.root_pos > 0;  // a young-chain adoption (root at position 0) holds the genesis AR, no seed
+    // a joined store (its MMR from c_x0's prefix, base_leaf_count > 0) holds the joiner seed as its first AR row; a
+    // young-chain adoption (root at position 0) and a pool launched here, pruned or not, hold the genesis AR
+    const bool joined = H.root_pos > 0 && H.base_leaf_count > 0;
     const std::uint64_t q0 = std::max(H.base_pos + 1, tip + 1 > in.journal_depth ? tip + 1 - in.journal_depth : 0);
     ActivationRecord ar;
     std::size_t ri = 0;
     if (joined) {
-        // the joiner seed (S_{p0 - 1}.epoch_cur, p0 - 1, S_{p0 - 1}.rules_cur), p0 - 1 = the root
-        const RatchetState s_root = decode_ratchet_state(*rec_at(H.root_pos).state);
-        if (rows.empty() || rows[0] != ActivationRow{s_root.epoch_cur, H.root_pos, s_root.rules_cur})
-            return fail(StoreFault::Ar);
-        ar.seed_joiner(s_root, H.root_pos + 1);
+        // the joiner seed (S_{p0 - 1}.epoch_cur, p0 - 1, S_{p0 - 1}.rules_cur): p0 - 1 = the root, or below it once
+        // the store is pruned
+        if (rows.empty() || rows[0].h_act > H.root_pos) return fail(StoreFault::Ar);
+        RatchetState s_seed = decode_ratchet_state(*rec_at(H.root_pos).state);
+        if (rows[0].h_act == H.root_pos) {
+            if (rows[0] != ActivationRow{s_seed.epoch_cur, H.root_pos, s_seed.rules_cur}) return fail(StoreFault::Ar);
+        } else {
+            s_seed.epoch_cur = rows[0].epoch;
+            s_seed.rules_cur = rows[0].rules_digest;
+        }
+        ar.seed_joiner(s_seed, rows[0].h_act + 1);
         ri = 1;
     }
     std::vector<ActivationRow> replay_rows;
@@ -779,6 +933,15 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         rs.sealed.push_back(std::move(sb));
     }
     rs.placements = std::move(placements);
+    // the join's adopt bound H(x0 - 1) + Fresh (base_leaf_count = lc(H(x0 - 1)) > 0, pruned or not) and its served
+    // buckets above the replay's root (sealed from them, as in the join)
+    std::optional<std::uint64_t> adopt_bound;
+    if (joined) adopt_bound = H.base_leaf_count + H.h0 + p.open_bins - 1 + p.fresh_max;
+    if (joined) {
+        rs.adopt_bound = adopt_bound;
+        for (std::uint64_t i = lc_root; i < ll.bodies.size(); ++i)
+            if (ll.bodies[i] && H.h0 + i <= *rs.adopt_bound) rs.served.push_back(*ll.bodies[i]);
+    }
     std::optional<BinStore> store = BinStore::restored(p, in.journal_depth, std::move(rs), in.chain);
     if (!store) return fail(StoreFault::Lane);
     // the tree at the root
@@ -812,7 +975,15 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         for (std::uint64_t x = std::max({lo, H.first_pos, std::uint64_t{1}}); x <= H.root_pos; ++x)
             inherited.push_back(RetargetEntry{rec_at(x).d, rec_at(x).H});
     }
-    std::optional<CarrierTree> tree = CarrierTree::restored(p, nodes, in.T, inherited, in.rp);
+    // an unpruned joined store (its joiner seed row at the root): the claimed prefix [first_pos, root_pos - 1] as the
+    // joined tree's nodes below the root (claims)
+    std::vector<CarrierTree::PreNode> pre_nodes;
+    if (joined && rows[0].h_act == H.root_pos)
+        for (std::uint64_t x = H.first_pos; x < H.root_pos; ++x) {
+            const CarrierRecord& c = rec_at(x);
+            pre_nodes.push_back(CarrierTree::PreNode{c.id, c.pos, c.h, c.H, c.d});
+        }
+    std::optional<CarrierTree> tree = CarrierTree::restored(p, nodes, in.T, inherited, in.rp, pre_nodes);
     if (!tree) return fail(StoreFault::Records, root);
 
     // 6. phase 2: q0 .. tip placed again
@@ -876,7 +1047,7 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
     for (const std::optional<SealedBin>& sb : ll.bodies)
         if (sb)
             for (const XmrKeyRef& ref : sb->refs) refs[key_ref_identity(ref)] = ref;
-    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}};
+    LoadedState st{H, std::move(*tree), std::move(*store), std::move(ar), std::move(bodies), q0, s1, std::move(refs), {}, {}, 0, {}};
     // a joined store's claimed prefix headers (header records at or below the root)
     for (std::uint64_t x = H.first_pos; x <= std::min(H.root_pos, tip); ++x) {
         const CarrierRecord& c = rec_at(x);
@@ -886,6 +1057,36 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
         if (read_carrier_header(r, p.r_max, h) != WireError::None || r.remaining() != 0 || receipt_id(h.own) != c.id)
             return fail(StoreFault::Records, x);
         st.prefix_headers[x] = std::move(h);
+    }
+    // 7. K_BWORK
+    {
+        LaneKv bw;
+        if (!store_detail::scan(kv, store_keys::bwork_prefix(in.chain), bw)) return fail(StoreFault::Scan);
+        for (const auto& [k, v] : bw) {
+            const auto e = decode_bwork(v);
+            if (!e || k != store_keys::bwork(in.chain, e->first)) return fail(StoreFault::Work);
+            st.bound_below[e->first] = e->second;
+        }
+        const KvRead lo = kv.read(store_keys::blo(in.chain));
+        if (lo.status == KvRead::Status::Error) return fail(StoreFault::Scan);
+        if (lo.status == KvRead::Status::Value) {
+            const std::optional<std::uint64_t> v = decode_blo(lo.value);
+            if (!v || *v == 0 || *v > tip + 1) return fail(StoreFault::Work);
+            st.bound_lo = *v;
+        } else if (joined) {
+            return fail(StoreFault::Work);  // a joined store holds its K_BLO (its adoption batch writes it)
+        }
+        LaneKv bc;
+        if (!store_detail::scan(kv, store_keys::bclaim_prefix(in.chain), bc)) return fail(StoreFault::Scan);
+        for (const auto& [k, v] : bc) {
+            const std::optional<BclaimRecord> c = decode_bclaim(v);
+            if (!c || k != store_keys::bclaim(in.chain, c->bin)) return fail(StoreFault::Work);
+            // a sealed leaf at the tip; in a joined store below its MMR's first leaf or at or below the adopt bound
+            const std::uint64_t lc_tip = bin_leaf_count(rec_at(tip).H, H.h0, p.open_bins);
+            if (c->bin < H.h0 || c->bin - H.h0 >= lc_tip) return fail(StoreFault::Work);
+            if (joined && c->bin - H.h0 >= H.base_leaf_count && c->bin > *adopt_bound) return fail(StoreFault::Work);
+            st.claimed[c->bin] = *c;
+        }
     }
     out.state.emplace(std::move(st));
     out.fault = StoreFault::None;

@@ -34,30 +34,27 @@
 //       trailing bytes refused; counts above the remaining bytes refused
 //       without allocation;
 //   (7) carrier frame: FH = 6 (u8 opcode | u8 frame version | u32 chain_id),
-//       the header of the relay frames in xmr_relay_wire.hpp (FB_RECEIPTS
-//       header = FH + count byte, FB_CTX header = FH + id + length, FB_GETCTX
-//       bytes); frame buffer = FH + 2 + 17 x 945 = 16,073 (14,985 at v17);
-//       consensus FRAME_CAP = FH + 2 + 17 x 913 = 15,529 (14,441 at v17);
-//       kFbMaxReceiptsPerFrame = 1 + R_MAX = 17 (the S2 relay literal 8 is
-//       superseded);
+//       the header of the FB_RECEIPTS v3 and FC_GETHEADERS frames of
+//       pathb_relay_wire.hpp; frame buffer = FH + 2 + 17 x 945 = 16,073
+//       (14,985 at v17); consensus FRAME_CAP = FH + 2 + 17 x 913 = 15,529
+//       (14,441 at v17); kFbMaxReceiptsPerFrame = 1 + R_MAX = 17;
 //   (8) one budget (X-6): PER_RECEIPT_BUDGET (admission) == kFbReceiptBudget
 //       (relay) == the receipt I/O buffer P-10 = 945 (v16) / 881 (v17), and
-//       PER_LANE_BUDGET = R_MAX x P-10; the S2 engine sizes them apart
-//       (relay 1024, admission 768).
+//       PER_LANE_BUDGET = R_MAX x P-10.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"
 #include "impl/xmr/pathb/pathb_caps.hpp"
+#include "impl/xmr/pathb/pathb_relay_wire.hpp"
 #include "pathb_kat_bodies.hpp"
 #include "pathb_kat_check.hpp"
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
-namespace relay = ::c2pool::v37n::xmr::relay;
 
 namespace {
 
@@ -375,18 +372,22 @@ int main() {
     // (7) carrier frame
     {
         check(pb::kFrameHeaderBytes == 6, "FH = opcode 1 + frame version 1 + chain_id 4 = 6");
-        check(pb::kFrameOpcodeBytes == sizeof(relay::FB_RECEIPTS) && pb::kFrameVersionBytes == sizeof(relay::kFbVersion)
-                      && pb::kFrameChainIdBytes == sizeof(relay::u32),
+        check(pb::kFrameOpcodeBytes == sizeof(pb::kOpFbReceipts) && pb::kFrameVersionBytes == sizeof(pb::kFrameVersion2)
+                      && pb::kFrameChainIdBytes == sizeof(pb::GetHeaders::chain_id),
               "FH fields have the widths of the relay opcode, frame version and chain_id");
-        check(relay::kFbReceiptsHeader == pb::kFrameHeaderBytes + pb::kU8Bytes, "relay FB_RECEIPTS header = FH + count byte");
-        check(relay::kCtxHeader == pb::kFrameHeaderBytes + pb::kHashBytes + pb::kU32Bytes,
-              "relay FB_CTX header = FH + id + length");
-        const relay::u32 chain = 0x0a0b0c0du;
-        const std::vector<std::uint8_t> f = relay::encode_getctx(chain, std::vector<relay::bytes32>(1));
-        check(f.size() == pb::kFrameHeaderBytes + pb::kU8Bytes + pb::kHashBytes, "relay FB_GETCTX frame = FH + count + id");
-        check(f.size() > pb::kFrameHeaderBytes && f[0] == relay::FB_GETCTX && f[1] == relay::kFbVersion && f[2] == 0x0d
-                      && f[3] == 0x0c && f[4] == 0x0b && f[5] == 0x0a,
-              "relay frame bytes: opcode | frame version | chain_id little-endian");
+        const std::uint32_t chain = 0x0a0b0c0du;
+        pb::GetHeaders gh;
+        gh.chain_id = chain;
+        const std::vector<std::uint8_t> fc = pb::encode_fc_getheaders(gh);
+        const std::optional<std::vector<std::uint8_t>> fr =
+                pb::encode_fb_receipts(chain, std::vector<pb::ReceiptBodyV3>{make_body(1, false, 3)}, pb::kRuledLaneParams);
+        const auto fh_is = [](const std::vector<std::uint8_t>& f, std::uint8_t op, std::uint8_t ver) {
+            return f.size() > pb::kFrameHeaderBytes && f[0] == op && f[1] == ver && f[2] == 0x0d && f[3] == 0x0c
+                   && f[4] == 0x0b && f[5] == 0x0a;
+        };
+        check(fr.has_value() && fh_is(*fr, pb::kOpFbReceipts, pb::kFrameVersion2)
+                      && fh_is(fc, pb::kOpFcGetHeaders, pb::kFrameVersion1),
+              "relay frame bytes (FB_RECEIPTS v3, FC_GETHEADERS): opcode | frame version | chain_id little-endian");
 
         const std::uint64_t r_max = pb::kRuledLaneParams.r_max;
         const pb::CarrierLimits lim = pb::carrier_limits(buf16, r_max);
@@ -399,10 +400,9 @@ int main() {
         check(pb::frame_cap(849, r_max) == 14441, "consensus FRAME_CAP = 6 + 2 + 17 x 849 = 14,441 at v17");
 
         // kFbMaxReceiptsPerFrame: a carrier frame holds the carrier + R_MAX carried
-        // = 1 + R_MAX = 17 (the S2 relay literal 8 is superseded; v2.4).
+        // = 1 + R_MAX = 17.
         check(pb::max_receipts_per_frame(r_max) == 17 && pb::kFbMaxReceiptsPerFrame == 17,
               "kFbMaxReceiptsPerFrame = 1 + R_MAX = 17 (8 -> 17)");
-        check(relay::kFbMaxReceiptsPerFrame == 8, "the S2 relay literal kFbMaxReceiptsPerFrame is 8 (superseded)");
         check(pb::carrier_body_size(945, r_max) == 2 + pb::max_receipts_per_frame(r_max) * 945,
               "carrier body = 2 + kFbMaxReceiptsPerFrame x receipt");
     }
@@ -425,8 +425,6 @@ int main() {
               "PER_LANE_BUDGET = R_MAX x P-10 = 15,120 (v16) / 14,096 (v17)");
         check(pb::per_receipt_budget(16, UINT64_MAX, r_max) == std::nullopt,
               "a view outside the domain yields no budget");
-        // the S2 engine sizes the two apart: relay 1024, admission 768.
-        check(relay::kFbReceiptBudget == 1024, "the S2 relay budget literal is 1024 (superseded)");
     }
 
     return finish("v37_xmr_pathb_body_v3_kat");

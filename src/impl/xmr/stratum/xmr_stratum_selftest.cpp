@@ -45,6 +45,7 @@ struct FakeTemplateSource : ITemplateSource {
     bool have_next = true;
     std::array<std::uint8_t, HASH_SIZE> next_seed{};
     bool fail_rebuild = false;
+    bool withdrawn = false;               // rebuild_blob reports the template withdrawn
     std::uint32_t last_extra_nonce = 0;
 
     FakeTemplateSource() {
@@ -70,7 +71,7 @@ struct FakeTemplateSource : ITemplateSource {
     }
     bool rebuild_blob(std::uint32_t tid, std::uint32_t extra_nonce, TemplateJob& out) override {
         if (fail_rebuild || tid != template_id) return false;
-        fill(out, extra_nonce); return true;
+        fill(out, extra_nonce); out.withdrawn = withdrawn; return true;
     }
     std::uint32_t max_extra_nonces() const override { return 1u << 20; }
 };
@@ -554,6 +555,26 @@ static void test_known_answer_network_block() {
     CHECK(sk.last.height == ts.height, "KAT-net share carries template height");
 }
 
+// ---------------------------------------------------------------------------
+// KAT: a share on a WITHDRAWN template (rebuild_blob still finds its job) that
+// clears the network target: the block is submitted, the share is answered
+// stale and handed to no receipt sink.
+// ---------------------------------------------------------------------------
+static void test_withdrawn_network_block() {
+    FakeTemplateSource ts; KeyedPowStub pow; FakeSink sk; FakeTransport tx;
+    const std::uint32_t WIN = 0x00000001u;
+    const std::uint64_t ans = KeyedPowStub::answer_top_word(WIN);
+    ts.mainchain_target = ans;
+    ts.lane_target = ans;
+    XmrStratumServer srv(ts, pow, sk, tx);
+    XmrStratumSession s(1);
+    CHECK(srv.handle_login(s, 1, "48addr"), "KAT-withdrawn login");
+    ts.withdrawn = true;
+    std::string r = submit_nonce(srv, s, tx, WIN, std::string(64, '0').c_str());
+    CHECK(sk.network_submits == 1, "KAT-withdrawn the network block is submitted once");
+    CHECK(contains(r, "Stale share") && sk.accepted == 0, "KAT-withdrawn the share is answered stale, no receipt");
+}
+
 int main() {
     test_hex_and_target();
     test_login_string();
@@ -565,6 +586,7 @@ int main() {
     test_job_ring_eviction();
     test_known_answer_nonce();
     test_known_answer_network_block();
+    test_withdrawn_network_block();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

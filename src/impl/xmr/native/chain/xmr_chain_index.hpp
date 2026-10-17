@@ -259,6 +259,11 @@ public:
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
         view_.subscribe([this](const node::MainchainEvent& e) { queued_events_.push_back(e); });
+        // The row sinks: the consensus state right after each connected row
+        // (an Extend is raised after the state took the row), synchronously.
+        view_.subscribe([this](const node::MainchainEvent& e) {
+            if (e.kind == node::MainchainEventKind::Extend) notify_rows_locked_(false);
+        });
         view_.subscribe_txs([this](const BlockTxEvent& e) {
             note_mined_locked_(e);
             queued_tx_events_.push_back(e);
@@ -299,6 +304,7 @@ public:
         }
         seed_long_mirror_(b.long_term_weights);
         anchor_id_ = b.id;
+        notify_rows_locked_(true);
         why.clear();
         return true;
     }
@@ -320,6 +326,7 @@ public:
         rows_.seed_pre_window(tip.height, difficulty_window);
         seed_long_mirror_(long_term_weights);
         anchor_id_ = tip.id;
+        notify_rows_locked_(true);
     }
 
     void set_fetcher(IChainFetcher* f) {
@@ -556,6 +563,52 @@ public:
     void subscribe(EventSink sink) override {
         std::lock_guard<std::mutex> lk(mu_);
         sinks_.push_back(std::move(sink));
+    }
+
+    // --- the follower rows (a Path B node's Monero view) -----------------------------
+    // A row sink runs under the index mutex, on the thread that connected or
+    // seeded the row, with the consensus state whose tip is that row (`seeded`:
+    // an anchor, a direct seed or a snapshot base). It must not call the index.
+    // A block kept as an alternative branch is reported too, with the state on
+    // its own branch (a copy; the best chain's state is not changed).
+    using RowSink = std::function<void(const ConsensusState& state, const ChainRow& tip, bool seeded)>;
+    void subscribe_rows(RowSink sink) {
+        std::lock_guard<std::mutex> lk(mu_);
+        row_sinks_.push_back(std::move(sink));
+    }
+
+    // A held row by id: a main-chain row, or an alt block whose work is
+    // resolved (its timestamp parsed from its own blob).
+    struct HeldRow {
+        Hash          id{};
+        Hash          prev_id{};
+        std::uint64_t height = 0;
+        std::uint64_t timestamp = 0;
+        U128          cumulative_difficulty{};
+        bool          main = false;
+    };
+    std::optional<HeldRow> held_row(const Hash& id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (const RowRecord* r = rows_.by_id(id))
+            return HeldRow{r->row.id, r->row.prev_id, r->row.height, r->row.timestamp, r->row.cumulative_difficulty, true};
+        const AltBlock* a = alt_.find(id);
+        if (a == nullptr || !a->resolved || !a->has_entry) return std::nullopt;
+        return HeldRow{a->id, a->prev_id, a->height, alt_timestamp_(*a), a->cumulative_difficulty, false};
+    }
+    // The oldest main-chain row held.
+    std::optional<HeldRow> oldest_row() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::optional<std::uint64_t> lo = rows_.lowest_height();
+        if (!lo) return std::nullopt;
+        const RowRecord* r = rows_.by_height(*lo);
+        if (r == nullptr) return std::nullopt;
+        return HeldRow{r->row.id, r->row.prev_id, r->row.height, r->row.timestamp, r->row.cumulative_difficulty, true};
+    }
+    // The seeded difficulty row (timestamp, cumulative difficulty) at a height
+    // at or below the seed (anchor or snapshot base).
+    std::optional<DifficultyRow> seeded_row_at(std::uint64_t h) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return rows_.pre_window_row(h);
     }
 
     void subscribe_txs(TxEventSink sink) override {
@@ -1487,6 +1540,7 @@ private:
                 // happened to arrive on it. maybe_switch_locked_() is a no-op
                 // when nothing outweighs the tip, so the cost is one comparison.
                 const bool switched = maybe_switch_locked_();
+                flush_alt_rows_locked_();
                 r.outcome = switched && !rows_.contains(r.id) ? OfferOutcome::StoredAsAlt
                                                               : OfferOutcome::Connected;
                 return r;
@@ -1544,8 +1598,11 @@ private:
         const bool switched = maybe_switch_locked_();
         r.outcome = switched && rows_.contains(r.id) ? OfferOutcome::Reorged
                                                      : OfferOutcome::StoredAsAlt;
-        if (r.outcome == OfferOutcome::StoredAsAlt)
+        if (r.outcome == OfferOutcome::StoredAsAlt) {
             r.why = "kept as an alternative branch";
+            notify_alt_rows_locked_(r.id);   // its state on its own branch, for the row sinks
+        }
+        flush_alt_rows_locked_();            // and the parked descendants it resolved
         return r;
     }
 
@@ -1660,6 +1717,53 @@ private:
         return true;
     }
 
+    // The row sinks, with the state whose tip is the row just connected or seeded.
+    void notify_rows_locked_(bool seeded) {
+        if (row_sinks_.empty()) return;
+        const ChainRow* t = view_.state().tip();
+        if (t == nullptr) return;
+        for (const RowSink& s : row_sinks_) s(view_.state(), *t, seeded);
+    }
+
+    // The row sinks for an alt block held as an alternative branch: the state on
+    // ITS branch right after each block of it (the main chain rolled back to the
+    // fork point on a copy, the branch connected on the copy), so a consumer
+    // keeps per retained row what it keeps for a connected one. Every block of
+    // the branch must be resolved, hold its bodies and have passed the PoW gate;
+    // otherwise nothing is reported.
+    void notify_alt_rows_locked_(const Hash& id) {
+        if (row_sinks_.empty()) return;
+        std::vector<const AltBlock*> branch;
+        Hash fork_parent{};
+        std::string why;
+        if (alt_.branch_to_main(id, [this](const Hash& h) { return rows_.contains(h); },
+                                static_cast<std::size_t>(opts_.max_reorg_depth), branch, fork_parent, why)
+            != AltPool::BranchWalk::Ok)
+            return;
+        const RowRecord* fork_row = rows_.by_id(fork_parent);
+        if (fork_row == nullptr) return;
+        std::vector<const BlockEntry*> entries;
+        entries.reserve(branch.size());
+        for (const AltBlock* b : branch) {
+            if (!b->resolved || !b->has_entry || b->bodies_missing || (opts_.require_pow && !b->adoptable)) return;
+            entries.push_back(&b->entry);
+        }
+        (void)view_.on_branch(fork_row->row.height, entries, /*now=*/0,
+                              [this](const ConsensusState& st, const ChainRow& row) {
+                                  for (const RowSink& s : row_sinks_) s(st, row, false);
+                              });
+    }
+
+    // The parked blocks resolve_descendants_locked_() resolved (adoptable, bodies
+    // held): those still held as alternatives are reported as above; those the
+    // fork choice connected were reported by the connect.
+    void flush_alt_rows_locked_() {
+        std::vector<Hash> ids;
+        ids.swap(alt_resolved_);
+        for (const Hash& id : ids)
+            if (!rows_.contains(id) && alt_.find(id) != nullptr) notify_alt_rows_locked_(id);
+    }
+
     // An alt block's timestamp: parsed from its own blob. Kept out of AltBlock
     // as a separate step so the pool stays a pool of bytes plus work, and the
     // parse happens once here rather than at every insert.
@@ -1736,7 +1840,9 @@ private:
                 // h=3768570, fluffy_req=0 for the whole stall).
                 c.bodies_missing = !ev.input.bodies_complete;
 
+                const bool reportable = c.adoptable && !c.bodies_missing;
                 alt_.insert(std::move(c));
+                if (reportable && !row_sinks_.empty()) alt_resolved_.push_back(child_id);
                 stack.push_back(child_id);
             }
         }
@@ -2330,6 +2436,7 @@ private:
         if (const RowRecord* t = rows_.tip()) resolve_descendants_locked_(t->row.id);
         connect_parked_children_locked_();
         (void)maybe_switch_locked_();
+        flush_alt_rows_locked_();
         update_synced_locked_();
         return n > 0;
     }
@@ -2994,11 +3101,16 @@ private:
         if (depth > 0) {
             const std::uint64_t candidate = tip_h - depth;
             const std::uint64_t oldest    = rows_.oldest_height();
+            // A chain whose rows still reach genesis (a young one: regtest, a fresh from-genesis walk, and the same
+            // chain resumed from its own snapshot) has every window at the candidate in its rows, shorter than full
+            // exactly as the live state's were there.
+            const bool from_genesis = oldest == 0;
             const bool rows_cover =
-                candidate >= oldest + CRYPTONOTE_REWARD_BLOCKS_WINDOW - 1
-                && candidate >= oldest + BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW - 1;
+                from_genesis
+                || (candidate >= oldest + CRYPTONOTE_REWARD_BLOCKS_WINDOW - 1
+                    && candidate >= oldest + BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW - 1);
             if (!rows_cover
-                || !rows_.difficulty_window_ending_at(candidate, DIFFICULTY_BLOCKS_COUNT, dwin)
+                || !rows_.difficulty_window_ending_at(candidate, DIFFICULTY_BLOCKS_COUNT, dwin, from_genesis)
                 || !long_window_at_depth_(depth, lt)) {
                 depth = 0;
                 dwin.clear();
@@ -3234,6 +3346,7 @@ private:
         rows_.seed_pre_window(base.row.height, dwin);
         seed_long_mirror_(lt);
         anchor_id_ = anchor_id;
+        notify_rows_locked_(true);
 
         // --- replay the tail, without re-running RandomX --------------------------------
         for (const Above& a : above) {
@@ -3348,6 +3461,8 @@ private:
 
     std::vector<node::MainchainEvent> queued_events_;
     std::vector<BlockTxEvent>         queued_tx_events_;
+    std::vector<RowSink>              row_sinks_;
+    std::vector<Hash>                 alt_resolved_;   // parked blocks resolved since the last flush_alt_rows_locked_
     std::vector<EventSink>            sinks_;
     std::vector<TxEventSink>          tx_sinks_;
 

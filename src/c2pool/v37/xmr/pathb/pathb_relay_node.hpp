@@ -1,0 +1,3715 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
+// This file is part of c2pool and is distributed under the terms of the GNU
+// Affero General Public License, version 3 or (at your option) any later
+// version. See COPYING in the repository root.
+// ---------------------------------------------------------------------------
+// src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp
+// PathbRelayNode: the Path B relay node of one PathbNode over a link layer
+// (RelayLinks; the shared carrier transport is pathb_relay_links.hpp).
+//
+//   dispatch     FB_HELLO 0x40 (ours on link up and in reply; nothing but
+//                HELLO before a HELLO is accepted; a HELLO the node refuses
+//                or closes: the link closed, no strike), FB_RECEIPTS 0x41,
+//                FC_CARRIER 0x50, FC_GETCARRIER 0x51 / FC_GETHEADERS 0x52 /
+//                FC_GETBUCKETS 0x54 (the reply frames sent), FC_HEADERS 0x53,
+//                FC_BUCKETS 0x55; kept: FB_GETCTX / FB_CTX 0x43 / 0x44,
+//                FB_PING / FB_PONG 0x48 / 0x49, FB_GETADDR / FB_ADDR
+//                0x4c / 0x4d; every other opcode is counted as unknown and the
+//                link kept (0x4a / 0x4b are not used here)
+//   tokens       STRIKE: one token of the sender's invalid-object budget (the
+//                CarrierDosBudget of its source: its bucket and the global
+//                one); BAN: the source address banned for ban_seconds (a
+//                source with no address: the link dropped); DROP, DEFER and
+//                the HELLO outcomes: no token
+//   threading    one node lock serializes every PathbNode call. The owner
+//                thread runs the posted events (HELLO, family C requests and
+//                replies, complete_carrier, apply_join). The verify workers
+//                take the sender's token, then run begin_carrier and the
+//                FB_RECEIPTS admission under the node lock (no token: the
+//                parked list, retried; never a penalty). The join worker runs
+//                attempt_join holding the node lock and releases it at every
+//                wait (FC_* replies, wait_until, FB_GETCTX), around each
+//                RandomX hash of the attempt and between its replay steps, so
+//                the attempt's reads of the adopted state run under the lock
+//   joiner       JoinTransport over the links: the reply frames of a request
+//                reach its ticket (FC_HEADERS in request order, FC_CARRIER by
+//                the asked ids, FC_BUCKETS by (peer, at)); a ticket of a
+//                disconnected peer gets no frame
+//   after HELLO  headers first from the best tip when the peer's
+//                best_cum_work wins fork choice, again while the peer's tip is
+//                not held and still wins; the pending set re-offered (FB_RECEIPTS,
+//                at most 1 + R_MAX bodies a frame); a node at position 0 whose
+//                catch-up from position 0 got a reply with no header offers
+//                the peer's HELLO tip to the joiner
+//   buckets      a DEFER naming a missing bucket: FC_GETBUCKETS at the named
+//                carrier, one peer at a time (one assembly per (peer, at)); the
+//                parked frames run again when a bin arrives, when a request
+//                ends unserved, refused or abandoned, and when the best tip
+//                moves after every peer was closed for the named carrier
+//   transport    liveness (FB_PING / FB_PONG, LINK SILENT), discovery and the
+//                peer book, the node nonce (self-connection, one link per node
+//                pair), address bans, inbound and outbound links counted apart,
+//                the async send queue, the verify pool, the parked cap,
+//                partition_for, the dial targets and the seeds
+//
+// Every clock read goes through RelayClock. Header-only.
+// ---------------------------------------------------------------------------
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <set>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "c2pool/v37/net_addr_ban.hpp"                  // is_addr_key
+#include "c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp"  // verify_block_ctx, judge_block_ctx
+#include "c2pool/v37/xmr/relay/xmr_relay_peerbook.hpp"  // PeerBook, dup_link_rule
+#include "c2pool/v37/xmr/relay/xmr_relay_wire.hpp"      // FB_GETCTX / FB_CTX, FB_PING / FB_PONG, FB_GETADDR / FB_ADDR
+#include "impl/xmr/wire/xmr_carrier_dos_budget.hpp"     // CarrierDosBudget
+
+#include "c2pool/v37/xmr/pathb/pathb_join_link.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_node.hpp"
+
+namespace c2pool::xmr::pathb {
+
+namespace rly = ::c2pool::v37n::xmr::relay;
+
+// ---------------------------------------------------------------------------
+// The relay's clock: the transport timers only (keepalive, silence, HELLO
+// timeout, bans, the parked retry, the join waits, the peer book's times).
+// ---------------------------------------------------------------------------
+struct RelayClock {
+    std::function<std::uint64_t()> mono_ms;  // monotonic, milliseconds
+    std::function<std::uint64_t()> wall_s;   // unix seconds (the peer book)
+    static RelayClock system() {
+        RelayClock c;
+        c.mono_ms = [] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      std::chrono::steady_clock::now().time_since_epoch())
+                                                      .count());
+        };
+        c.wall_s = [] {
+            return static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+        };
+        return c;
+    }
+};
+
+// P-40 (policy, ruling 23): the peers whose HELLO tails name the candidates before a join (two independent best-tip
+// claims); flag --join-min-peers.
+inline constexpr std::size_t kJoinMinPeersDefault = 2;
+
+// ---------------------------------------------------------------------------
+// Options (the generic transport values of the old relay node, kept)
+// ---------------------------------------------------------------------------
+// The class of a Monero context want: an unsolicited receipt's (P-06), a relayed carrier's (P-07) or a join
+// attempt's (P-07); each class has its own cap (PathbRelayOptions).
+enum class CtxClass : std::uint8_t { Receipt = 0, Carrier = 1, Join = 2 };
+
+struct PathbRelayOptions {
+    // links
+    bool listen = false;
+    std::string listen_host = "127.0.0.1";
+    std::uint16_t listen_port = 0;                               // 0: an ephemeral port, read back by listen_port()
+    std::vector<std::pair<std::string, std::uint16_t>> peers;    // permanent dial targets
+    std::vector<std::pair<std::string, std::uint16_t>> seeds;    // discovery candidates (the caller's bootstrap list)
+    std::size_t max_inbound = 101;                               // accepted links
+    std::size_t max_inbound_per_addr = 1;
+    std::size_t max_outbound = 12;                               // dialed links kept up
+    std::size_t send_queue_bytes = 16u << 20;                    // per link (at least two FC_HEADERS frames + prefixes, P-14)
+    std::uint32_t connect_timeout_ms = 3000;                     // discovery dials
+    std::uint32_t hello_timeout_ms = 10000;
+    // the invalid-object budget and the ban (unset: relay_budget_default at verify_threads and max_inbound +
+    // max_outbound links)
+    std::optional<::c2pool::xmr::DosPolicy> dos;
+    std::optional<std::uint32_t> ban_seconds;
+    // the frames that answer this node's own FC_GETCARRIER: verified under a credit of their own (P-21)
+    std::uint32_t solicited_credits = 256;
+    // P-15, the per-peer valid-object budget (unset: rate (1 + R_MAX) / T objects/s, capacity P-09 of the node)
+    std::optional<double> peer_valid_rate;
+    std::optional<double> peer_valid_capacity;
+    // P-50, the claim-leaf alarm budget per peer (unset: (1 + R_MAX) / T alarms/s, burst 1 + R_MAX)
+    std::optional<std::uint64_t> claim_alarm_rate_milli;  // P-50 refill, milli-alarms per second
+    // P-40: the HELLO tails (connected peers past HELLO) a join attempt waits for
+    std::size_t join_min_peers = kJoinMinPeersDefault;
+    // the verify pool
+    std::size_t verify_threads = 1;
+    std::size_t verify_queue_max = 4096;
+    std::size_t parked_max = kRuledLaneParams.open_bins * (1 + kRuledLaneParams.r_max);  // --relay-parked-max
+    // liveness (0: no PING sent or answered, no silence timeout)
+    std::uint32_t keepalive_ms = 5000;
+    std::uint32_t silence_timeout_ms = 25000;
+    // discovery
+    bool discovery = false;
+    std::vector<std::string> self_hosts;
+    std::vector<rly::PeerRecord> book_load;
+    std::function<void(const std::vector<rly::PeerRecord>&)> book_save;
+    rly::PeerBook::Limits book_limits{};
+    std::uint32_t book_save_ms = 15000;
+    std::uint32_t addr_reask_ms = 20000;
+    std::uint32_t addr_answer_min_ms = 5000;
+    std::uint16_t addr_want = 64;
+    std::size_t addr_answer_max = 64;
+    std::size_t addr_learn_per_answer = 64;
+    std::size_t addr_learn_per_peer = 256;
+    // Monero contexts (FB_GETCTX / FB_CTX)
+    std::uint32_t ctx_retry_ms = 2000;
+    std::uint32_t ctx_max_rounds = 30;
+    // context blocks climbed per want: P-06 (Fresh + 1) for an unsolicited receipt, P-07 (k_alt) for a carrier
+    // under verification (a relayed carrier's admission, a join's FB_GETCTX). Three classes of wants, each with its
+    // own cap: unsolicited receipts ctx_want_max, relayed carriers ctx_join_depth, join attempts ctx_join_depth.
+    std::uint32_t ctx_max_depth = static_cast<std::uint32_t>(relay_horizons(kRuledLaneParams).ctx_max_depth);
+    std::uint32_t ctx_join_depth = static_cast<std::uint32_t>(kAltDepth);
+    std::size_t ctx_want_max = 128;  // wants of unsolicited receipts held at once
+    // P-13 (--relay-ctx-block-cap, raise only): a context block's cap above blob_cap_ctx(hf, Z); 0: blob_cap_ctx alone.
+    // The cap is max(this, blob_cap_ctx(hf, Z) of the block's newest known ancestor) when its work is judged; FB_CTX
+    // frames are read and served up to max(this, blob_cap_ctx at the node's view).
+    std::uint64_t ctx_block_cap = 0;
+    // false: no thread; the caller runs pump(), tick() and join_step()
+    bool threads = true;
+};
+
+// The invalid-object budget at its Appendix P defaults: P-16 refill G = (1 + R_MAX) / (2 T) tokens/s (before the
+// first upgrade epoch), P-17 per-address burst C = N verify workers, P-18 global burst G_b = n x C over n links
+// (P-23 + P-24), P-19 ban B = ceil(G_b / G) s; the per-address refill G / n.
+struct RelayBudget {
+    ::c2pool::xmr::DosPolicy dos;
+    std::uint32_t ban_seconds = 0;
+};
+inline RelayBudget relay_budget_default(std::size_t verify_workers, std::size_t links, const LaneParams& p = kRuledLaneParams) {
+    const std::uint64_t num = 1 + p.r_max;  // G = num / den tokens/s
+    const std::uint64_t den = 2 * p.carrier_interval_s;
+    const std::uint64_t n = std::max<std::size_t>(links, 1);
+    const std::uint64_t c = std::max<std::size_t>(verify_workers, 1);
+    const double g = static_cast<double>(num) / static_cast<double>(den);
+    RelayBudget b;
+    b.dos.per_peer_capacity = static_cast<double>(c);
+    b.dos.per_peer_refill = g / static_cast<double>(n);
+    b.dos.global_capacity = static_cast<double>(n * c);
+    b.dos.global_refill = g;
+    b.ban_seconds = static_cast<std::uint32_t>((n * c * den + num - 1) / num);
+    return b;
+}
+// P-21: the solicited credit's refill.
+inline constexpr std::uint32_t kSolicitedRefillPerS = 8;
+
+struct PathbRelayStats {
+    std::atomic<std::uint64_t> hello_sent{0}, hello_ok{0}, hello_rejected{0}, hello_closed{0}, hello_timeout{0};
+    std::atomic<std::uint64_t> hello_tag_mismatch{0}, hello_rules_mismatch{0}, hello_old_version{0};
+    std::atomic<std::uint64_t> pre_hello_dropped{0}, unknown_opcodes{0}, malformed{0}, wrong_chain{0};
+    std::atomic<std::uint64_t> strikes{0}, bans{0}, drops{0}, addr_bans{0}, banned_src_dropped{0};
+    std::atomic<std::uint64_t> queue_dropped{0}, rx_deferred{0}, verify_threads{0};
+    std::atomic<std::uint64_t> flood_frames{0}, reoffer_frames{0}, catchup_requests{0}, empty_store_offers{0};
+    std::atomic<std::uint64_t> bucket_requests{0}, parked_reruns{0}, rewalks{0}, solicited_jobs{0};
+    std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
+    std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
+    std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
+    std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
+    std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
+    std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
+    std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
+    std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
+    std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
+    // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
+    std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
+    std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
+    std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
+    std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
+    std::atomic<std::uint64_t> ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_forged{0}, ctx_deferred{0}, ctx_unchecked{0};
+    std::atomic<std::uint64_t> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
+    std::atomic<std::uint64_t> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
+    std::atomic<std::uint64_t> disc_bad{0}, disc_self{0}, disc_saves{0}, disc_expired{0};
+    std::atomic<std::uint64_t> self_conn{0}, self_skipped{0}, dup_deferred{0};
+    std::atomic<std::uint64_t> dials{0}, dial_fail{0}, over_cap{0};
+};
+
+// ---------------------------------------------------------------------------
+// The link layer the relay node runs on (pathb_relay_links.hpp binds it to
+// the shared carrier transport; a KAT binds a fake).
+// ---------------------------------------------------------------------------
+class RelayLinks {
+public:
+    using FrameFn = std::function<void(std::uint64_t peer, const std::vector<std::uint8_t>& frame)>;
+    using EventFn = std::function<void(std::uint64_t peer, bool up)>;
+    virtual ~RelayLinks() = default;
+    // frame: a frame with frame[0] < 0x80; control: frame[0] >= 0x80; event: a link up / down
+    virtual void bind(FrameFn frame, FrameFn control, EventFn event) = 0;
+    virtual void configure(const PathbRelayOptions& o) = 0;
+    virtual bool listen(const std::string& host, std::uint16_t port) = 0;
+    virtual std::uint16_t listen_port() const = 0;
+    virtual std::uint64_t dial(const std::string& host, std::uint16_t port) = 0;  // the new link; 0: failed
+    virtual bool send_to(std::uint64_t peer, const std::vector<std::uint8_t>& frame) = 0;
+    virtual void disconnect(std::uint64_t peer) = 0;
+    virtual void ban_key(std::uint64_t key, std::uint32_t seconds) = 0;  // every link from key dropped
+    virtual bool is_banned_key(std::uint64_t key) = 0;
+    virtual std::uint64_t addr_key(std::uint64_t peer) const = 0;  // 0: none (127.0.0.1, ::1, gone)
+    virtual bool is_inbound(std::uint64_t peer) const = 0;
+    virtual bool has_peer(std::uint64_t peer) const = 0;
+    virtual std::vector<std::uint64_t> peer_ids() const = 0;
+    virtual std::size_t conns_from(std::uint64_t key) const = 0;
+    virtual std::string remote_ip(std::uint64_t peer) const = 0;
+    virtual std::size_t n_peers() const = 0;
+    virtual void stop() = 0;
+    // the bytes queued on a link and the per-link bound (0: not known)
+    virtual std::size_t queued_bytes(std::uint64_t) const { return 0; }
+    virtual std::size_t send_queue_limit() const { return 0; }
+    // the links the transport dropped because a send would have passed the bound (cumulative)
+    virtual std::uint64_t queue_full_drops() const { return 0; }
+};
+
+// The node's Monero contexts for FB_GETCTX / FB_CTX (the caller binds them to
+// its native node and its follower).
+struct PathbCtxSource {
+    // a block body the node holds (served for FB_GETCTX; tried first for its own wants)
+    std::function<bool(const Hash32& id, std::vector<std::uint8_t>& blob)> block_blob;
+    // the node's own verified chain index (the work behind a served block)
+    rly::CtxChainSource chain;
+    // RandomX of a served block's hashing blob
+    rly::CtxHashFn rx;
+    // a served block judged usable: into the follower
+    std::function<void(const rly::BlockCtx& b, const std::vector<std::uint8_t>& blob)> accept;
+    // P-13 at the node's view (its index tip): blob_cap_ctx(hf, Z) of a child of the tip; unset or 0: hf 16, Z = zone(16)
+    std::function<std::uint64_t()> view_cap;
+};
+
+// ---------------------------------------------------------------------------
+// The node lock: FIFO order, so a waiting owner event runs as soon as the
+// join worker or a verify worker lets the lock go.
+// ---------------------------------------------------------------------------
+class RelayNodeLock {
+public:
+    void lock() {
+        std::unique_lock<std::mutex> l(m_);
+        const std::uint64_t t = next_++;
+        cv_.wait(l, [&] { return serving_ == t; });
+    }
+    void unlock() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            ++serving_;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::uint64_t next_ = 0;
+    std::uint64_t serving_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// PathbRelayNode
+// ---------------------------------------------------------------------------
+class PathbRelayNode {
+public:
+    using LogFn = std::function<void(const std::string&)>;
+    static constexpr std::size_t kMaxVerifyThreads = 16;
+
+    PathbRelayNode(PathbRelayOptions o, RelayLinks& links, RelayClock clock = RelayClock::system(), LogFn log = {})
+        : o_(std::move(o)), links_(links), clock_(std::move(clock)), log_(std::move(log)), budget_(budget_of(o_)),
+          dos_(budget_.dos), port_(*this) {
+        solicited_ = static_cast<double>(o_.solicited_credits);
+        std::random_device rd;
+        do {
+            nonce_ = ((static_cast<std::uint64_t>(rd()) << 32) | rd()) ^ clock_.mono_ms();
+        } while (nonce_ == 0);
+    }
+    ~PathbRelayNode() { stop(); }
+    PathbRelayNode(const PathbRelayNode&) = delete;
+    PathbRelayNode& operator=(const PathbRelayNode&) = delete;
+
+    // ---- binding ----
+    // The node's I/O: send, flood and fetch_context go through this relay; the
+    // join worker's RandomX runs with the node lock released.
+    PathbNodeIo bind_io(PathbNodeIo io) {
+        PathbNodeIo out = std::move(io);
+        out.send = [this](std::uint64_t peer, const std::vector<std::uint8_t>& f) { node_send(peer, f); };
+        out.flood = [this](const std::vector<std::uint8_t>& f, std::optional<std::uint64_t> except) { node_flood(f, except); };
+        out.fetch_context = [this](const Hash32& id, std::uint64_t timeout_s) { return fetch_context(id, timeout_s); };
+        auto rx = std::move(out.verify);
+        out.verify = [this, rx = std::move(rx)](const HashingBlob& b, std::uint64_t d, const Hash32& seed) {
+            if (!rx) return false;
+            const JoinRelease r(*this);
+            const bool ok = rx(b, d, seed);
+            rx_ok_++;  // a hash computed (the RandomX alarm's recovery)
+            return ok;
+        };
+        return out;
+    }
+    // The node this relay serves, built with bind_io's I/O. Before start().
+    void attach(PathbNode& n) {
+        node_ = &n;
+        n.set_join_transport(&port_);
+        n.set_join_step([this] { const JoinRelease r(*this); });
+        const PathbNodeConfig& c = n.config();
+        chain_id_ = c.identity.chain_id;
+        p_ = c.p;
+        buffers_ = c.buffers;
+        headers_frame_ = n.frame_bytes_headers();
+        bucket_frame_ = c.bucket_policy.frame_bytes;
+        abandon_s_ = c.abandon_timeout_s;
+        header_max_ = static_cast<std::uint16_t>(std::clamp<std::uint64_t>(c.journal_depth, 1, UINT16_MAX));
+        valid_rate_ = o_.peer_valid_rate.value_or(static_cast<double>(1 + p_.r_max) / static_cast<double>(p_.carrier_interval_s));
+        valid_cap_ = o_.peer_valid_capacity.value_or(
+                static_cast<double>(c.pending_cap != 0 ? c.pending_cap : relay_horizons(c.p).pending_cap));
+        claim_budget_ = ClaimAlarmBudget(p_, o_.claim_alarm_rate_milli.value_or(0));
+    }
+    // The context source; its RandomX call leaves every exception as RandomxFailure (node-internal).
+    void set_ctx_source(PathbCtxSource s) {
+        if (s.rx)
+            s.rx = [this, rx = std::move(s.rx)](const std::vector<std::uint8_t>& blob, const Hash32& seed, Hash32& pow) {
+                bool ok = false;
+                try {
+                    ok = rx(blob, seed, pow);
+                } catch (const RandomxFailure&) {
+                    throw;
+                } catch (const std::exception& e) {
+                    throw RandomxFailure(e.what());
+                } catch (...) {
+                    throw RandomxFailure("RandomX: unknown failure");
+                }
+                rx_ok_++;
+                return ok;
+            };
+        ctx_ = std::move(s);
+    }
+    // Manual mode: called while a ticket or a wait has nothing to read (deliver one message; false: nothing moved).
+    void set_drive(std::function<bool()> f) { drive_ = std::move(f); }
+
+    // ---- lifecycle ----
+    bool start(std::string& why) {
+        if (node_ == nullptr) {
+            why = "relay: no node attached";
+            return false;
+        }
+        if (o_.send_queue_bytes < 2 * (headers_frame_ + 4)) {
+            why = "relay: send queue " + std::to_string(o_.send_queue_bytes) + " B below two FC_HEADERS frames with their "
+                  "length prefixes (2 x " + std::to_string(headers_frame_ + 4) + " B)";
+            return false;
+        }
+        running_ = true;
+        links_.configure(o_);
+        links_.bind([this](std::uint64_t p, const std::vector<std::uint8_t>& f) { receive(p, f); },
+                    [this](std::uint64_t p, const std::vector<std::uint8_t>& f) { on_control(p, f); },
+                    [this](std::uint64_t p, bool up) { peer_event(p, up); });
+        if (o_.listen) {
+            if (!links_.listen(o_.listen_host, o_.listen_port)) {
+                why = "relay: cannot listen on " + o_.listen_host + ":" + std::to_string(o_.listen_port);
+                return false;
+            }
+            const std::uint16_t lp = links_.listen_port();
+            const bool wild = o_.listen_host.empty() || o_.listen_host == "0.0.0.0";
+            if (!wild) self_keys_.insert(rly::peer_key(o_.listen_host, lp));
+            if (wild || o_.listen_host == "127.0.0.1") self_keys_.insert(rly::peer_key("127.0.0.1", lp));
+            if (wild)
+                for (const std::string& h : o_.self_hosts) self_keys_.insert(rly::peer_key(h, lp));
+        }
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            for (const auto& [h, pt] : o_.peers) {
+                if (self_keys_.count(rly::peer_key(h, pt)) != 0) {
+                    st_.self_skipped++;
+                    log("relay: peer " + rly::peer_key(h, pt) + " is THIS node (our listen address) -> never dialed");
+                    continue;
+                }
+                Target t;
+                t.host = h;
+                t.port = pt;
+                targets_.push_back(t);
+            }
+        }
+        if (o_.discovery) {
+            book_.set_limits(o_.book_limits);
+            const std::uint64_t now = clock_.wall_s();
+            for (const std::string& k : self_keys_) {
+                const auto c = k.rfind(':');
+                book_.mark_self(k.substr(0, c), static_cast<std::uint16_t>(std::stoul(k.substr(c + 1))));
+            }
+            book_.load(o_.book_load, now);
+            for (const auto& [h, pt] : o_.seeds) book_.learn(h, pt, now, now);
+            book_.take_dirty();
+        }
+        disc_slow_ms_ = disc_saved_ms_ = live_tick_ms_ = now_ms();
+        if (o_.threads) {
+            const std::size_t n = std::clamp<std::size_t>(o_.verify_threads, 1, kMaxVerifyThreads);
+            st_.verify_threads = n;
+            owner_ = std::thread([this] { owner_loop(); });
+            for (std::size_t i = 0; i < n; ++i) verify_.emplace_back([this] { verify_loop(); });
+            join_ = std::thread([this] { join_loop(); });
+            maint_ = std::thread([this] { maint_loop(); });
+        } else {
+            st_.verify_threads = 1;
+        }
+        return true;
+    }
+
+    void stop() {
+        if (!running_.exchange(false)) return;
+        { const std::lock_guard<std::mutex> lk(emtx_); }  // a waiter on ecv_ / fcv_ sees running_ false
+        ecv_.notify_all();
+        fcv_.notify_all();
+        vcv_.notify_all();
+        jcv_.notify_all();
+        kcv_.notify_all();
+        ccv_.notify_all();
+        mcv_.notify_all();
+        if (join_.joinable()) join_.join();
+        for (std::thread& t : verify_)
+            if (t.joinable()) t.join();
+        verify_.clear();
+        if (owner_.joinable()) owner_.join();
+        if (maint_.joinable()) maint_.join();
+        links_.stop();
+        if (o_.discovery) save_book(true);
+    }
+
+    // Runs fn(node) under the node lock (the stratum, the miner, the template routine, a status line).
+    template <class F>
+    auto with_node(F&& fn) {
+        const NodeGuard g(*this);
+        return fn(*node_);
+    }
+
+    // ---- the link layer's handlers ----
+    // A frame from `peer` (a reader thread, or the KAT).
+    void receive(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        note_rx(p);
+        if (f.empty()) {
+            st_.malformed++;
+            return;
+        }
+        const std::uint8_t op = f[0];
+        if (op == kOpFbHello) {
+            wait_up_gate(p);
+            HelloLink link;  // the link's addresses as the HELLO arrives (its down event may run before the owner)
+            {
+                std::lock_guard<std::mutex> lk(pmtx_);
+                const auto it = peers_.find(p);
+                if (it != peers_.end()) {
+                    it->second.hello_posted = true;
+                    link.out_host = it->second.out_host;
+                    link.out_port = it->second.out_port;
+                }
+            }
+            if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
+            post_from(p, [this, p, f, link] { handle_hello(p, f, link); });
+            return;
+        }
+        bool ok = false, posted = false;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            ok = it != peers_.end() && it->second.hello_ok;
+            posted = it != peers_.end() && it->second.hello_posted;
+        }
+        if (!ok && posted) {  // its HELLO waits on the owner: the frame goes after it
+            post_from(p, [this, p, f] {
+                if (!hello_ok(p)) {
+                    st_.pre_hello_dropped++;
+                    return;
+                }
+                dispatch(p, f, true);
+            });
+            return;
+        }
+        if (!ok) {
+            st_.pre_hello_dropped++;
+            return;
+        }
+        dispatch(p, f, false);
+    }
+    // A frame from a HELLO-ok link (`owner`: run on the owner thread, after the link's HELLO).
+    void dispatch(std::uint64_t p, const std::vector<std::uint8_t>& f, bool owner) {
+        const auto run = [&](std::function<void()> fn) {
+            if (owner)
+                fn();
+            else
+                post_from(p, std::move(fn));
+        };
+        const std::uint8_t op = f[0];
+        switch (op) {
+            case kOpFbPing:
+            case kOpFbPong:
+                if (o_.keepalive_ms == 0) break;
+                on_ping(p, f);
+                return;
+            case kOpFbGetAddr:
+                if (!o_.discovery) break;
+                on_getaddr(p, f);
+                return;
+            case kOpFbAddr:
+                if (!o_.discovery) break;
+                on_addr(p, f);
+                return;
+            case kOpFbGetCtx: run([this, p, f] { serve_getctx(p, f); }); return;
+            case kOpFbCtx: run([this, p, f] { on_ctx(p, f); }); return;
+            case kOpFbReceipts:
+                if (f.size() > 1 && f[1] != kFrameVersion2) break;  // the old receipts v2 frame: unknown
+                on_receipts_frame(p, f);
+                return;
+            case kOpFcCarrier: {
+                if (route_reply(p, f)) return;
+                if (f.size() > buffers_.frame) {  // above the frame buffer (P-11): DROP, before parsing
+                    token(p, FrameToken::Drop);
+                    return;
+                }
+                const CarrierReply k = carrier_reply(p, f);
+                if (k == CarrierReply::BodySet) {
+                    run([this, p, f] { handle_body_set(p, f); });
+                    return;
+                }
+                enqueue_job(Job{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited});
+                return;
+            }
+            case kOpFcHeaders:
+                if (route_reply(p, f)) return;
+                run([this, p, f] { handle_headers(p, f); });
+                return;
+            case kOpFcBuckets:
+                if (route_reply(p, f)) return;
+                run([this, p, f] { handle_buckets(p, f); });
+                return;
+            case kOpFcGetCarrier:
+            case kOpFcGetHeaders:
+            case kOpFcGetBuckets: run([this, p, f] { serve_request(p, f); }); return;
+            default: break;
+        }
+        st_.unknown_opcodes++;  // FB_BLOCK_WON 0x42, 0x45-0x47, 0x4a / 0x4b, receipts v2, any other: counted, the link kept
+    }
+    // A frame with frame[0] >= 0x80: not handled here (counted, the link kept).
+    void on_control(std::uint64_t p, const std::vector<std::uint8_t>&) {
+        note_rx(p);
+        st_.unknown_opcodes++;
+    }
+    // A link up (the accepting / dialing thread) or down (its reader thread).
+    void peer_event(std::uint64_t p, bool up) {
+        if (up) {
+            on_peer_up(p);
+            open_up_gate(p);
+            return;
+        }
+        std::uint64_t src = 0;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it != peers_.end()) src = it->second.src;
+            peers_.erase(p);
+            up_done_.erase(p);
+        }
+        on_peer_down(p, src != 0 ? src : p);
+    }
+
+    // ---- manual mode (o_.threads false; the KATs) ----
+    // Runs every queued net action, event and verify job until none is left; the count run.
+    std::size_t pump() {
+        std::size_t n = 0;
+        for (;;) {
+            bool any = false;
+            n += run_net_actions();
+            std::deque<std::function<void()>> ev;
+            {
+                std::lock_guard<std::mutex> lk(emtx_);
+                ev.swap(events_);
+            }
+            for (std::function<void()>& e : ev) {
+                e();
+                ++n;
+                any = true;
+            }
+            std::deque<Job> jobs;
+            {
+                std::lock_guard<std::mutex> lk(vmtx_);
+                due_parked_locked();
+                jobs.swap(vq_);
+            }
+            for (Job& j : jobs) {
+                run_job(std::move(j));
+                ++n;
+                any = true;
+            }
+            if (!any) break;
+        }
+        return n;
+    }
+    // One join step: the next pair's attempt (the node lock held, released at its waits), then its outcome applied.
+    std::optional<JoinStep> join_step() { return run_one_join(); }
+    // The maintenance tick (the maintenance thread every 250 ms; manual mode: the caller).
+    void tick() {
+        run_net_actions();
+        hello_timeouts();
+        if (partitioned_ && now_ms() >= partition_until_ms_) {
+            partitioned_ = false;
+            dialing_ = true;
+            log("relay: partition over -- redialing");
+        }
+        dial_targets();
+        drive_liveness();
+        if (o_.discovery) disc_tick();
+        drive_ctx();
+        node_tick();
+        rerun_due_receipts();
+        reoffer_pump_all();
+        rx_tick();
+    }
+
+    // ---- the rig and the status ----
+    // A network partition of `secs` seconds: every link dropped, inbound links refused and nothing dialed until it ends.
+    void partition_for(std::chrono::seconds secs) {
+        partition_until_ms_ = now_ms() + static_cast<std::uint64_t>(secs.count()) * 1000;
+        partitioned_ = true;
+        dialing_ = false;
+        for (std::uint64_t p : links_.peer_ids()) links_.disconnect(p);
+        log("relay: PARTITION for " + std::to_string(secs.count()) + " s (all relay links dropped)");
+    }
+    void set_dialing(bool on) { dialing_ = on; }
+    void drop_peer(std::uint64_t p) { links_.disconnect(p); }
+    void ask_addrs_now() {
+        for (std::uint64_t p : ready_peers()) send_getaddr(p);
+    }
+    void save_book(bool force) {
+        if (!o_.discovery || !o_.book_save) return;
+        if (!book_.take_dirty() && !force) return;
+        o_.book_save(book_.records());
+        st_.disc_saves++;
+    }
+    // Parks a carrier frame of `peer` in the verify parked list with no retry time (the parked-cap KAT).
+    std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame) {
+        Job j{Job::Kind::Carrier, peer, peer, frame, 0};
+        park_job(std::move(j), UINT64_MAX);
+        return parked_size();
+    }
+    bool parked_has(const std::vector<std::uint8_t>& frame) const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        for (const Job& j : parked_)
+            if (j.frame == frame) return true;
+        return false;
+    }
+
+    const PathbRelayStats& stats() const noexcept { return st_; }
+    // The budget in force (relay_budget_default, or the options' values).
+    const RelayBudget& budget() const noexcept { return budget_; }
+    static RelayBudget budget_of(const PathbRelayOptions& o) {
+        RelayBudget b = relay_budget_default(std::clamp<std::size_t>(o.verify_threads, 1, kMaxVerifyThreads),
+                                             o.max_inbound + o.max_outbound);
+        if (o.dos) b.dos = *o.dos;
+        if (o.ban_seconds) b.ban_seconds = *o.ban_seconds;
+        return b;
+    }
+    const PathbRelayOptions& options() const noexcept { return o_; }
+    // The context of an unsolicited receipt wanted (P-06), as a relayed frame's admission asks.
+    void want_context(const Hash32& id, std::uint64_t from) { want_ctx(id, from, 0, CtxClass::Receipt); }
+    // The context wants held now: all, and those of a join's climb (P-07).
+    std::pair<std::size_t, std::size_t> ctx_wants_held() const {
+        const std::array<std::size_t, 3> n = ctx_wants_by_class();
+        return {n[0] + n[1] + n[2], n[2]};
+    }
+    // The context wants held now by class (Receipt, Carrier, Join).
+    std::array<std::size_t, 3> ctx_wants_by_class() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        std::array<std::size_t, 3> n{};
+        for (const auto& kv : ctx_want_) ++n[static_cast<std::size_t>(kv.second.cls)];
+        return n;
+    }
+    // A held want's climb bound (P-06 or P-07); none when not held.
+    std::optional<std::uint32_t> ctx_want_bound(const Hash32& id) const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        const auto it = ctx_want_.find(id);
+        if (it == ctx_want_.end()) return std::nullopt;
+        return it->second.bound;
+    }
+    std::uint64_t node_nonce() const noexcept { return nonce_; }
+    const std::set<std::string>& self_keys() const noexcept { return self_keys_; }
+    RelayLinks& links() noexcept { return links_; }
+    const rly::PeerBook& book() const noexcept { return book_; }
+    std::uint64_t now_s() const { return now_ms() / 1000; }
+    bool peer_known(std::uint64_t p) const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        return peers_.count(p) != 0;
+    }
+    bool hello_ok(std::uint64_t p) const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        const auto it = peers_.find(p);
+        return it != peers_.end() && it->second.hello_ok;
+    }
+    std::vector<std::uint64_t> ready_peers() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::vector<std::uint64_t> v;
+        for (const auto& [p, s] : peers_)
+            if (s.hello_ok) v.push_back(p);
+        return v;
+    }
+    std::size_t peers_in() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::size_t n = 0;
+        for (const auto& [p, s] : peers_) n += s.inbound ? 1 : 0;
+        return n;
+    }
+    std::size_t peers_out() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::size_t n = 0;
+        for (const auto& [p, s] : peers_) n += s.inbound ? 0 : 1;
+        return n;
+    }
+    // The follower's main chain moved (a new tip or a backlog refresh): the frames parked on a Monero input (P_r, its
+    // weights, its seed) run again.
+    void on_monero_tip() {
+        if (t_node_held == this) {  // the node lock is not re-entrant: run it after the holder lets go
+            post([this] { on_monero_tip(); });
+            return;
+        }
+        rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+    }
+    // The DEFERred receipts parked (P-09 at most).
+    std::size_t parked_receipts() {
+        const NodeGuard g(*this);
+        return parked_receipts_.size();
+    }
+    // The asks recorded for parked receipts (they leave with their receipt), and the parked receipts due to run again.
+    std::size_t parked_receipt_asks() {
+        const NodeGuard g(*this);
+        std::size_t n = 0;
+        for (const auto& [key, e] : parked_receipts_) n += e.second.asked.size();
+        return n;
+    }
+    std::size_t parked_receipts_due() {
+        const NodeGuard g(*this);
+        return receipt_due_.size();
+    }
+    // A receipt's one-body FB_RECEIPTS frame parked (by its key).
+    bool receipt_parked(const std::vector<std::uint8_t>& frame) {
+        const NodeGuard g(*this);
+        return parked_receipts_.count(receipt_key(frame)) != 0;
+    }
+    // The digests indexed for a re-run, every cause.
+    std::size_t parked_index_size() {
+        const NodeGuard g(*this);
+        std::size_t n = 0;
+        for (const auto& [cause, ds] : parked_by_cause_) n += ds.size();
+        return n;
+    }
+    std::size_t strike_entries() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return strikes_by_peer_.size();
+    }
+    // KAT hooks: an admission outcome of `peer` parked on `m` (the relay's index and fetch), a strike on `peer`.
+    void test_parked(std::uint64_t peer, Missing m, const Hash32& digest, const Hash32& fetch, bool relayed = true,
+                     bool carrier = true) {
+        NodeEventResult r;
+        r.action = NodeAction::Parked;
+        r.admit.missing = m;
+        r.admit.digest = digest;
+        r.admit.fetch = fetch;
+        Effects fx;
+        {
+            const NodeGuard g(*this);
+            after_result_locked(peer, r, digest, fx, relayed, carrier);
+        }
+        run_effects(fx);
+    }
+    // KAT hook: the frames parked for `m` run again, as when the cause resolves.
+    void test_rerun(Missing m) { rerun_parked(m); }
+    // P-50: the claim-leaf alarm buckets held.
+    std::size_t claim_entries() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return claim_budget_.entries();
+    }
+    void test_strike(std::uint64_t peer) { strike(peer, 1, false); }
+    // P-15: the objects left in `peer`'s valid-object budget; the per-peer buckets held.
+    double peer_valid_left(std::uint64_t peer) { return valid_left(peer); }
+    std::size_t valid_entries() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return valid_.size();
+    }
+    // The strike tokens applied to `peer` while its link is up.
+    std::uint64_t strikes_of(std::uint64_t p) const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        const auto it = strikes_by_peer_.find(p);
+        return it == strikes_by_peer_.end() ? 0 : it->second;
+    }
+    std::size_t parked_size() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return parked_.size();
+    }
+    std::size_t verify_queue_size() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return vq_.size();
+    }
+    std::size_t open_tickets() const {
+        std::lock_guard<std::mutex> lk(kmtx_);
+        return tickets_.size();
+    }
+    // The relay address of every HELLO-ok link ("?": an inbound peer that announced no listen port) and its direction.
+    std::vector<std::pair<std::string, bool>> ready_links() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::vector<std::pair<std::string, bool>> v;
+        for (const auto& [p, s] : peers_)
+            if (s.hello_ok) v.emplace_back(s.addr_key.empty() ? std::string("?") : s.addr_key, !s.out_host.empty());
+        return v;
+    }
+    // The Monero contexts wanted now (FB_GETCTX).
+    std::size_t ctx_wants() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_.size();
+    }
+    // The bytes of the context blocks the wanted contexts hold now (their verified blobs).
+    std::size_t ctx_want_bytes() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        std::size_t n = 0;
+        for (const auto& kv : ctx_want_) n += kv.second.blob.size();
+        return n;
+    }
+    std::string describe() const {
+        char b[768];
+        std::snprintf(b, sizeof b,
+                      "relay: peers in=%zu out=%zu ready=%zu | hello ok=%llu rej=%llu old=%llu closed=%llu tmo=%llu | "
+                      "strikes=%llu bans=%llu drops=%llu unknown=%llu pre_hello=%llu | parked=%zu dropped=%llu q=%zu | "
+                      "silent_drops=%llu legacy=%llu | join tickets=%zu attempts=%llu strikes=%llu | "
+                      "flood=%llu reoffer=%llu catchup=%llu buckets=%llu",
+                      peers_in(), peers_out(), ready_peers().size(), ull(st_.hello_ok), ull(st_.hello_rejected),
+                      ull(st_.hello_old_version), ull(st_.hello_closed), ull(st_.hello_timeout), ull(st_.strikes),
+                      ull(st_.bans), ull(st_.drops), ull(st_.unknown_opcodes), ull(st_.pre_hello_dropped), parked_size(),
+                      ull(st_.queue_dropped), verify_queue_size(), ull(st_.silent_drops), ull(st_.ka_legacy),
+                      open_tickets(), ull(st_.join_attempts), ull(st_.join_strikes), ull(st_.flood_frames),
+                      ull(st_.reoffer_frames), ull(st_.catchup_requests), ull(st_.bucket_requests));
+        return b;
+    }
+    std::string disc_describe() const {
+        std::size_t out = 0, in = 0;
+        std::string links;
+        for (const auto& [k, o] : ready_links()) {
+            (o ? out : in)++;
+            links += (links.empty() ? "" : ",") + k + (o ? ">" : "<");
+        }
+        char b[640];
+        std::snprintf(b, sizeof b,
+                      "relay-disc: %s known=%zu good=%zu bad=%zu | links out=%zu/%zu in=%zu/%zu | dialed=%llu "
+                      "dial_ok=%llu learned=%llu | getaddr tx=%llu rx=%llu throttled=%llu | addr tx=%llu rx=%llu "
+                      "unsolicited=%llu ignored=%llu | dup_dropped=%llu refused=%llu self=%llu saves=%llu "
+                      "expired=%llu | nonce=%016llx self_conn=%llu self_skipped=%llu dup_deferred=%llu | peers=[",
+                      o_.discovery ? "on" : "off", book_.size(), book_.good(), book_.bad_size(), out, o_.max_outbound, in,
+                      o_.max_inbound, ull(st_.disc_dialed), ull(st_.disc_dial_ok), ull(st_.addr_learned),
+                      ull(st_.getaddr_tx), ull(st_.getaddr_rx), ull(st_.getaddr_throttled), ull(st_.addr_tx),
+                      ull(st_.addr_rx), ull(st_.addr_unsolicited), ull(st_.addr_ignored), ull(st_.disc_dup_dropped),
+                      ull(st_.disc_bad), ull(st_.disc_self), ull(st_.disc_saves), ull(st_.disc_expired),
+                      static_cast<unsigned long long>(nonce_), ull(st_.self_conn), ull(st_.self_skipped),
+                      ull(st_.dup_deferred));
+        return std::string(b) + links + "]";
+    }
+
+private:
+    // ---- state ----
+    struct PeerSt {
+        bool hello_ok = false;
+        bool hello_sent = false;
+        bool hello_posted = false;       // a HELLO of the link waits on the owner
+        std::uint64_t connected_ms = 0;
+        std::uint64_t last_rx_ms = 0;
+        std::uint64_t last_ping_ms = 0;  // 0: ping at once
+        bool ka = false;                 // the peer answered or sent a PING on this link
+        std::uint32_t unanswered = 0;    // PINGs sent while !ka
+        bool legacy_noted = false;
+        std::string out_host;            // set iff this node dialed the link
+        std::uint16_t out_port = 0;
+        std::string addr_key;            // the peer's relay address (dialed, or remote ip : HELLO listen port)
+        std::string remote_ip;           // inbound: the socket's remote address
+        std::uint64_t getaddr_tx_ms = 0;
+        std::uint64_t getaddr_rx_ms = 0;
+        bool addr_pending = false;
+        std::size_t addr_learned = 0;
+        std::uint64_t src = 0;           // the budget source: the address key, or the link id with none
+        bool inbound = false;
+        std::uint64_t remote_nonce = 0;
+        std::uint16_t remote_listen = 0;
+    };
+    // A link's addresses as its HELLO arrives: the dialed address, or the socket's remote ip of an accepted link.
+    struct HelloLink {
+        std::string out_host;
+        std::uint16_t out_port = 0;
+        std::string remote_ip;
+    };
+    static constexpr std::uint32_t kLegacyProbes = 3;
+    struct Target {
+        std::string host;
+        std::uint16_t port = 0;
+        std::uint64_t pid = 0;
+        std::uint64_t next_try_ms = 0;
+        int backoff_s = 1;
+        std::uint32_t prehello_fails = 0;
+        bool hello_seen = false;
+        bool hello_timed_out = false;
+        bool learned = false;  // from the book: one link, then retired
+        bool used = false;
+        bool self = false;     // its HELLO carried this node's nonce: never dialed again
+    };
+    static constexpr int kRefusedBackoffCapS = 16;
+    static constexpr int kSilentBackoffCapS = 60;
+    static int prehello_delay_s(Target& t) {
+        if (t.hello_seen) {
+            t.prehello_fails = 0;
+            return 1;
+        }
+        t.prehello_fails += t.hello_timed_out ? 2u : 1u;
+        const int cap = t.hello_timed_out ? kSilentBackoffCapS : kRefusedBackoffCapS;
+        if (t.prehello_fails <= 1) return 1;
+        const std::uint32_t sh = std::min<std::uint32_t>(t.prehello_fails - 1, 6);
+        return std::min(cap, 1 << sh);
+    }
+    struct Job {
+        enum class Kind : std::uint8_t { Carrier, Receipt } kind = Kind::Carrier;
+        std::uint64_t peer = 0;
+        std::uint64_t src = 0;
+        std::vector<std::uint8_t> frame;
+        std::uint64_t not_before_ms = 0;
+        bool solicited = false;  // a reply to this node's own FC_GETCARRIER: the solicited credit (P-21)
+        bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
+        // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
+        std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
+    };
+    static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
+    static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
+    static constexpr std::size_t kAskedMax = 256;       // asked carrier ids kept per peer
+    struct Ticket {
+        std::uint64_t peer = 0;
+        std::uint8_t op = 0;             // the reply opcode
+        std::set<Hash32> ids;            // FC_CARRIER: the asked ids not received yet
+        std::size_t n = 0;               // FC_CARRIER: frames read at most
+        Hash32 at{};                     // FC_BUCKETS
+        std::vector<std::vector<std::uint8_t>> frames;
+        std::uint64_t last_ms = 0;       // the send, then each frame
+        bool closed = false;             // the peer disconnected
+    };
+    struct HdrWait {
+        bool node = true;                // a request of the node (else a ticket's)
+        std::uint64_t ticket = 0;
+        bool dead = false;               // the ticket ended: its reply is dropped
+    };
+    struct Catchup {
+        Hash32 tip{};
+        U128 work{};
+        bool from_pos0 = false;          // the last request asked from position 0
+        Hash32 asked_best{};
+        std::uint64_t asked_ms = 0;
+    };
+    struct CtxWant {
+        std::uint64_t from = 0;
+        std::uint32_t depth = 0;
+        std::uint32_t bound = 0;  // the climb's bound: ctx_max_depth (Receipt), ctx_join_depth (Carrier, Join)
+        CtxClass cls = CtxClass::Receipt;
+        std::set<std::uint64_t> asked;
+        std::uint32_t rounds = 0;
+        std::uint64_t since_ms = 0;
+        std::uint64_t last_ask_ms = 0;
+        std::uint64_t local_ms = 0;
+        bool have_proof = false;
+        rly::BlockCtx proof{};
+        std::vector<std::uint8_t> blob;
+        std::uint64_t proof_from = 0;
+        bool defer_noted = false;
+    };
+    static constexpr std::uint64_t kCtxTtlMs = 10 * 60 * 1000;  // a want is given up after this
+    static constexpr std::uint64_t kCtxLocalMs = 10 * 1000;     // an own-source lookup per want at most this often
+    static constexpr std::size_t kCtxPowKeep = 256;
+    static constexpr int kUpGateWaitMs = 2000;
+
+    // The node lock as a scope; join: the join worker's hold (released at its waits).
+    struct NodeGuard {
+        PathbRelayNode& r;
+        const PathbRelayNode* prev;
+        const PathbRelayNode* prev_held;
+        explicit NodeGuard(PathbRelayNode& rr, bool join = false) : r(rr), prev(t_join_relay), prev_held(t_node_held) {
+            r.lock_.lock();
+            t_join_relay = join ? &r : nullptr;
+            t_node_held = &r;
+        }
+        ~NodeGuard() {
+            t_join_relay = prev;
+            t_node_held = prev_held;
+            r.lock_.unlock();
+        }
+        NodeGuard(const NodeGuard&) = delete;
+        NodeGuard& operator=(const NodeGuard&) = delete;
+    };
+    // Lets the node lock go while the join worker waits or hashes; takes it again after.
+    struct JoinRelease {
+        PathbRelayNode& r;
+        bool held;
+        explicit JoinRelease(PathbRelayNode& rr) : r(rr), held(t_join_relay == &rr) {
+            if (held) {
+                t_node_held = nullptr;
+                r.lock_.unlock();
+            }
+        }
+        ~JoinRelease() {
+            if (held) {
+                r.lock_.lock();
+                t_node_held = &r;
+            }
+        }
+        JoinRelease(const JoinRelease&) = delete;
+        JoinRelease& operator=(const JoinRelease&) = delete;
+    };
+
+    // The JoinTransport of the node's join attempts.
+    class JoinPort final : public JoinTransport {
+    public:
+        explicit JoinPort(PathbRelayNode& r) : r_(r) {}
+        std::uint64_t send(std::uint64_t peer, const std::vector<std::uint8_t>& request) override {
+            return r_.ticket_send(peer, request);
+        }
+        std::vector<std::vector<std::uint8_t>> collect(std::uint64_t ticket, std::uint64_t timeout_s) override {
+            return r_.ticket_collect(ticket, timeout_s);
+        }
+        void drop(std::uint64_t ticket) override { r_.ticket_drop(ticket); }
+        std::uint64_t now_s() const override { return r_.now_s(); }
+        void wait_until(std::uint64_t t_s) override { r_.wait_until_s(t_s); }
+
+    private:
+        PathbRelayNode& r_;
+    };
+
+    static unsigned long long ull(const std::atomic<std::uint64_t>& a) { return static_cast<unsigned long long>(a.load()); }
+    std::uint64_t now_ms() const { return clock_.mono_ms(); }
+    std::int64_t now_ns() const { return static_cast<std::int64_t>(now_ms()) * 1000000; }
+    void log(const std::string& s) const {
+        if (log_) log_(s);
+    }
+    static std::string hex_short(const Hash32& h) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (int i = 0; i < 6; ++i) {
+            s.push_back(d[h[i] >> 4]);
+            s.push_back(d[h[i] & 15]);
+        }
+        return s;
+    }
+
+    // ---- the executor ----
+    void post(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> lk(emtx_);
+            if (!running_) return;
+            events_.push_back(std::move(fn));
+            note_queue_locked();
+        }
+        ecv_.notify_one();
+    }
+    // A reader thread's event for peer `p`: one posted event per peer in flight; the reader waits until the
+    // previous one has run (the link's TCP flow control engages). The readers' events are bounded by the link
+    // count; the workers' posts (a carrier's completion, the join outcome, a link's down, our HELLO) are outside
+    // this gate, bounded by the verify queue and the link count. An event whose peer is gone when it runs is
+    // skipped.
+    void post_from(std::uint64_t p, std::function<void()> fn) {
+        if (!o_.threads) {
+            post([this, p, f = std::move(fn)] {
+                if (!peer_known(p)) {  // its link went down while the event waited
+                    st_.stale_events++;
+                    return;
+                }
+                f();
+            });
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(emtx_);
+            if (inflight_.count(p) != 0) {
+                st_.owner_waits++;
+                fcv_.wait(lk, [&] { return !running_ || inflight_.count(p) == 0; });
+            }
+            if (!running_) return;
+            inflight_.insert(p);
+            events_.push_back([this, p, f = std::move(fn)] {
+                struct Done {
+                    PathbRelayNode* r;
+                    std::uint64_t p;
+                    ~Done() {
+                        {
+                            std::lock_guard<std::mutex> l2(r->emtx_);
+                            r->inflight_.erase(p);
+                        }
+                        r->fcv_.notify_all();
+                    }
+                } done{this, p};
+                if (!peer_known(p)) {  // its link went down while the event waited
+                    st_.stale_events++;
+                    return;
+                }
+                f();
+            });
+            note_queue_locked();
+        }
+        ecv_.notify_one();
+    }
+    void note_queue_locked() {
+        const std::uint64_t n = events_.size();
+        if (n > st_.owner_queue_hwm.load()) st_.owner_queue_hwm = n;
+    }
+    void owner_loop() {
+        while (running_) {
+            std::function<void()> fn;
+            {
+                std::unique_lock<std::mutex> lk(emtx_);
+                ecv_.wait(lk, [&] { return !events_.empty() || !running_; });
+                if (!running_) break;
+                fn = std::move(events_.front());
+                events_.pop_front();
+            }
+            fn();
+        }
+    }
+    void maint_loop() {
+        while (running_) {
+            {
+                std::unique_lock<std::mutex> lk(mmtx_);
+                mcv_.wait_for(lk, std::chrono::milliseconds(250), [&] { return !running_ || maint_wake_; });
+                maint_wake_ = false;
+            }
+            if (!running_) break;
+            tick();
+        }
+    }
+    void wake_maint() {
+        {
+            std::lock_guard<std::mutex> lk(mmtx_);
+            maint_wake_ = true;
+        }
+        mcv_.notify_one();
+    }
+
+    // ---- links ----
+    void note_rx(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        const auto it = peers_.find(p);
+        if (it != peers_.end()) it->second.last_rx_ms = now_ms();
+    }
+    std::uint64_t src_of(std::uint64_t p) const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        const auto it = peers_.find(p);
+        return it != peers_.end() && it->second.src != 0 ? it->second.src : p;
+    }
+    bool src_banned(std::uint64_t src) {
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            if (dos_.is_banned(src)) return true;
+        }
+        return ::c2pool::v37n::net::is_addr_key(src) && links_.is_banned_key(src);
+    }
+    void open_up_gate(std::uint64_t p) {
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            up_done_.insert(p);
+        }
+        upcv_.notify_all();
+        if (!links_.has_peer(p)) {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            up_done_.erase(p);
+        }
+    }
+    // A HELLO read before this node's up event ran for the link waits for it (bounded), so our HELLO goes out first.
+    void wait_up_gate(std::uint64_t p) {
+        if (!o_.threads) return;
+        std::unique_lock<std::mutex> lk(pmtx_);
+        for (int waited = 0; up_done_.count(p) == 0 && waited < kUpGateWaitMs; waited += 20) {
+            upcv_.wait_for(lk, std::chrono::milliseconds(20));
+            if (up_done_.count(p) != 0) break;
+            lk.unlock();
+            const bool gone = !links_.has_peer(p);
+            lk.lock();
+            if (gone) break;
+        }
+    }
+    void on_peer_up(std::uint64_t p) {
+        if (partitioned_) {
+            links_.disconnect(p);
+            return;
+        }
+        bool over = false;
+        const std::uint64_t akey = links_.addr_key(p);
+        const bool inbound = links_.is_inbound(p);
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            PeerSt s;
+            s.src = akey != 0 ? akey : p;
+            s.inbound = inbound;
+            s.connected_ms = s.last_rx_ms = now_ms();
+            if (t_dialing_relay == this) {
+                s.out_host = dial_host_;
+                s.out_port = dial_port_;
+            }
+            peers_[p] = s;
+            if (inbound) {
+                std::size_t n_in = 0;
+                for (const auto& [q, ps] : peers_) n_in += ps.inbound ? 1 : 0;
+                over = n_in > o_.max_inbound;
+            }
+        }
+        if (!links_.has_peer(p)) {  // the link ended before this ran: no down event follows
+            std::lock_guard<std::mutex> lk(pmtx_);
+            peers_.erase(p);
+            return;
+        }
+        if (over) {
+            st_.over_cap++;
+            links_.disconnect(p);
+            return;
+        }
+        post([this, p] { send_our_hello(p); });
+    }
+    void on_peer_down(std::uint64_t p, std::uint64_t src) {
+        {
+            const bool addr = ::c2pool::v37n::net::is_addr_key(src);
+            const bool last = !addr || links_.conns_from(src) == 0;
+            std::lock_guard<std::mutex> lk(vmtx_);
+            if (!addr)
+                dos_.forget(src);
+            else if (last)
+                dos_.release(src, now_ns());
+            strikes_by_peer_.erase(p);
+            valid_.erase(p);
+            claim_budget_.forget(p);
+        }
+        tickets_peer_gone(p);
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            reoffer_.erase(p);
+            reoffer_t0_.erase(p);
+        }
+        {
+            std::lock_guard<std::mutex> lk(cumtx_);
+            catchup_.erase(p);
+            header_wants_.erase(p);
+            headers_on_ctx_.erase(p);
+        }
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            for (Target& t : targets_)
+                if (t.pid == p) {
+                    t.pid = 0;
+                    if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
+                    t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
+                    t.hello_seen = false;
+                    t.hello_timed_out = false;
+                }
+        }
+        post([this, p] {
+            const NodeGuard g(*this);
+            node_->disconnect(p);
+        });
+    }
+    // Disconnects and bans run on the maintenance thread (never under the node lock).
+    void defer_drop(std::uint64_t p, std::uint64_t src, bool ban) {
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            to_drop_.push_back(NetDrop{p, src, ban});
+        }
+        wake_maint();
+    }
+    std::size_t run_net_actions() {
+        std::vector<NetDrop> drops;
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            drops.swap(to_drop_);
+        }
+        for (const NetDrop& d : drops) {
+            const bool addr = ::c2pool::v37n::net::is_addr_key(d.src);
+            if (d.ban && addr && budget_.ban_seconds) {
+                const bool fresh = !links_.is_banned_key(d.src);
+                links_.ban_key(d.src, budget_.ban_seconds);  // every link from src dropped, p included
+                if (fresh) {
+                    st_.addr_bans++;
+                    log("relay: address " + ::c2pool::v37n::net::addr_key_str(d.src) + " (peer " + std::to_string(d.peer) +
+                        ") BANNED for " + std::to_string(budget_.ban_seconds) + " s");
+                }
+            } else {
+                links_.disconnect(d.peer);
+            }
+            if (d.ban && addr) {
+                std::lock_guard<std::mutex> lk(vmtx_);
+                dos_.forget(d.src);
+            }
+        }
+        return drops.size();
+    }
+
+    // ---- tokens ----
+    void token(std::uint64_t p, FrameToken t, std::uint32_t n = 1) {
+        if (t == FrameToken::Strike) strike(p, n, false);
+        if (t == FrameToken::Drop) st_.drops++;
+    }
+    // STRIKE: `n` tokens of the sender's budget (`taken`: one of them was taken already, before RandomX).
+    void strike(std::uint64_t p, std::uint32_t n, bool taken) {
+        if (n == 0) return;
+        st_.strikes += n;
+        const std::uint64_t src = src_of(p);
+        const bool known = peer_known(p);
+        std::lock_guard<std::mutex> lk(vmtx_);
+        if (known) strikes_by_peer_[p] += n;  // a peer whose link is gone keeps no entry
+        for (std::uint32_t k = taken ? 1 : 0; k < n; ++k) (void)dos_.grant_randomx(src, now_ns());
+    }
+    // BAN: the sender's address banned for ban_seconds (no address: the link dropped).
+    void ban(std::uint64_t p) {
+        st_.bans++;
+        log("relay: peer " + std::to_string(p) + " BANNED");
+        defer_drop(p, src_of(p), true);
+    }
+    // The job's token back: the solicited credit, or the source's token (a valid object, or no RandomX spent).
+    void refund(const Job& j) {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        if (j.solicited)
+            solicited_ = std::min<double>(o_.solicited_credits, solicited_ + 1.0);
+        else
+            dos_.on_valid_pow(j.src, now_ns());
+    }
+    void refill_solicited_locked() {
+        const std::uint64_t now = now_ms();
+        if (solicited_ms_ != 0 && now > solicited_ms_)
+            solicited_ = std::min<double>(o_.solicited_credits,
+                                          solicited_ + static_cast<double>(now - solicited_ms_) * kSolicitedRefillPerS / 1000.0);
+        solicited_ms_ = now;
+    }
+
+    // ---- the verify pool ----
+    void enqueue_job(Job j) {
+        // P-15 at arrival: above the peer's valid-object budget an unsolicited frame is DROPPED (counted; no token)
+        if (!j.solicited && !j.rerun && !valid_has(j.peer)) {
+            st_.p15_drops++;
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            if (vq_.size() >= o_.verify_queue_max) {
+                vq_.pop_front();
+                st_.queue_dropped++;
+            }
+            vq_.push_back(std::move(j));
+        }
+        vcv_.notify_one();
+    }
+    void park_job(Job j, std::uint64_t not_before_ms) {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        j.not_before_ms = not_before_ms;
+        if (parked_.size() >= o_.parked_max && !parked_.empty()) {
+            parked_.pop_front();  // the oldest goes: no penalty
+            st_.queue_dropped++;
+        }
+        if (o_.parked_max > 0) parked_.push_back(std::move(j));
+    }
+    void due_parked_locked() {
+        const std::uint64_t t = now_ms();
+        for (auto it = parked_.begin(); it != parked_.end();) {
+            if (it->not_before_ms <= t) {
+                vq_.push_front(std::move(*it));
+                it = parked_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    void verify_loop() {
+        while (running_) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> lk(vmtx_);
+                vcv_.wait_for(lk, std::chrono::milliseconds(200), [&] { return !vq_.empty() || !running_; });
+                if (!running_) break;
+                due_parked_locked();
+                if (vq_.empty()) continue;
+                j = std::move(vq_.front());
+                vq_.pop_front();
+            }
+            run_job(std::move(j));
+        }
+    }
+    // One job: the sender's token, then the admission under the node lock; the token goes back unless the outcome
+    // costs one (STRIKE) or bans.
+    void run_job(Job j) {
+        if (src_banned(j.src)) {
+            st_.banned_src_dropped++;
+            return;
+        }
+        bool granted = false;
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            if (j.solicited) {
+                refill_solicited_locked();
+                if (solicited_ >= 1.0) {
+                    solicited_ -= 1.0;
+                    granted = true;
+                }
+            } else {
+                granted = dos_.grant_randomx(j.src, now_ns());
+            }
+        }
+        if (granted && j.solicited) st_.solicited_jobs++;
+        if (!granted) {
+            st_.rx_deferred++;
+            park_job(std::move(j), now_ms() + kParkRetryMs);
+            return;
+        }
+        if (j.kind == Job::Kind::Carrier) {
+            PathbNode::CarrierTicket t;
+            std::uint64_t fresh = 0;
+            bool rx_fail = false;
+            {
+                const NodeGuard g(*this);
+                if (!running_) {
+                    refund(j);
+                    return;
+                }
+                if (!j.solicited) fresh = new_carried(j.frame);
+                try {
+                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
+                } catch (const RandomxFailure&) {
+                    rx_fail = true;
+                }
+            }
+            if (rx_fail) {
+                rx_failed(std::move(j), "carrier");
+                return;
+            }
+            // the token stays spent for a STRIKE or a BAN (begin_carrier's verdict is final for both); a solicited
+            // frame's STRIKE takes its token from the source as well
+            const bool kept = t.admit.verdict == AdmitVerdict::Strike || t.admit.verdict == AdmitVerdict::Ban;
+            if (!kept) refund(j);
+            const bool taken = kept && !j.solicited;
+            const bool solicited = j.solicited;
+            post([this, t = std::move(t), taken, solicited, fresh]() mutable { complete_job(std::move(t), taken, solicited, fresh); });
+            return;
+        }
+        std::vector<NodeEventResult> rs;
+        Effects fx;
+        bool rx_fail = false;
+        std::uint64_t fresh = 0;
+        {
+            const NodeGuard g(*this);
+            if (!running_) {
+                refund(j);
+                return;
+            }
+            try {
+                rs = node_->on_receipts(j.peer, j.frame);
+            } catch (const RandomxFailure&) {
+                rx_fail = true;
+            }
+            if (!rx_fail)
+                for (const NodeEventResult& r : rs) {
+                    const bool park = r.action == NodeAction::Parked && r.admit.missing && rerun_cause(*r.admit.missing);
+                    const Hash32 key = park ? receipt_key(j.frame) : Hash32{};
+                    if (park) park_receipt_locked(key, std::move(j.asked), j);
+                    after_result_locked(j.peer, r, std::nullopt, fx, !j.solicited, /*carrier=*/false,
+                                        park ? std::optional<Hash32>(key) : std::nullopt);
+                    // a first-seen receipt (held now, or evicted at once by P-09; a copy held before is a duplicate),
+                    // or a #7 refusal
+                    if ((r.admit.verdict == AdmitVerdict::AdmitPending &&
+                         (r.action == NodeAction::Pending || !node_->pending().holds(r.admit.id))) ||
+                        (r.admit.verdict == AdmitVerdict::Refuse && r.admit.row == RowId::R21))
+                        ++fresh;
+                }
+        }
+        if (rx_fail) {
+            rx_failed(std::move(j), "receipt");
+            return;
+        }
+        if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);  // its first placement, a re-run or not
+        bool kept = false;
+        for (const NodeEventResult& r : rs) kept = apply_result(j.peer, r, !kept) || kept;
+        if (!kept) refund(j);
+        run_effects(fx);
+    }
+    // The placement on the owner. The carriers it releases whose admission fails with a RandomX failure come back
+    // from the node (take_rx_failed) and are parked and run again; the placed carrier keeps its result and effects.
+    // A RandomX failure of this frame's own re-admission parks this frame (its solicited state kept).
+    void complete_job(PathbNode::CarrierTicket t, bool token_kept, bool solicited = false, std::uint64_t fresh = 0) {
+        const std::uint64_t peer = t.peer;
+        const Hash32 digest = ::v37::sha256d(t.frame);
+        std::vector<std::uint8_t> frame = t.frame;
+        NodeEventResult r;
+        Effects fx;
+        bool rx_fail = false;
+        {
+            const NodeGuard g(*this);
+            try {
+                r = node_->complete_carrier(std::move(t));
+            } catch (const RandomxFailure&) {
+                rx_fail = true;
+            }
+            if (!rx_fail) after_result_locked(peer, r, digest, fx, !solicited);
+            take_rx_failed_locked(fx);
+        }
+        if (rx_fail) {
+            rx_alarm("carrier placement");
+            park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
+            run_effects(fx);
+            return;
+        }
+        if (!solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
+                           r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
+            valid_count(peer, 1 + fresh);  // its first placement, a re-run or not: its own body and its new carried ones
+        (void)apply_result(peer, r, token_kept);
+        run_effects(fx);
+    }
+    // A RandomX failure (RandomxFailure from the hash) inside an admission: node-internal, a local alarm; the token
+    // goes back and the frame is parked and run again; no strike, no ban.
+    // P-50: a claim-leaf alarm on a frame `p` relayed (not a reply to this node's own request); the bucket empty:
+    // the link dropped, no ban, no token, no verdict changed (the frame is DEFERred either way).
+    void claim_charge(std::uint64_t p) {
+        st_.claim_alarms++;
+        bool ok = true;
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            ok = claim_budget_.charge(p, now_ms() / 1000, true);
+        }
+        if (ok) return;
+        st_.claim_alarm_drops++;
+        log("relay: peer " + std::to_string(p) + ": claim-leaf alarm budget empty (P-50) -> link dropped, no ban");
+        defer_drop(p, src_of(p), false);
+    }
+    void rx_failed(Job j, const char* where) {
+        rx_alarm(where);
+        refund(j);
+        j.rerun = true;  // run again (not gated again; counted at its first placement)
+        park_job(std::move(j), now_ms() + kParkRetryMs);
+    }
+    // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
+    // (rx_tick).
+    void rx_alarm(const std::string& where) {
+        st_.rx_failures++;
+        rx_mark_ = rx_ok_.load();
+        if (!rx_failing_.exchange(true)) log("relay: RandomX failing (" + where + "): frames parked and run again");
+    }
+    void rx_tick() {
+        if (rx_failing_.load() && rx_ok_.load() > rx_mark_.load() && rx_failing_.exchange(false))
+            log("relay: RandomX hashes again");
+    }
+    // Under the node lock: the carried bodies of a carrier frame this node holds no pending copy of.
+    std::uint64_t new_carried(const std::vector<std::uint8_t>& f) {
+        if (f.size() < kFrameHeaderBytes) return 0;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(f.data() + kFrameHeaderBytes, f.size() - kFrameHeaderBytes,
+                                   CarrierLimits{buffers_.receipt, p_.r_max}, c) != WireError::None)
+            return 0;
+        std::uint64_t n = 0;
+        for (const ReceiptBodyV3& b : c.carried) n += node_->pending().holds(receipt_id(b)) ? 0 : 1;
+        return n;
+    }
+    // P-15: one bucket per peer, `valid_rate_` objects/s up to `valid_cap_`; a frame arrives only while one object is
+    // left; the objects are counted after their verdict.
+    bool valid_has(std::uint64_t p) {
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            ok = valid_bucket_locked(p).tokens >= 1.0;
+        }
+        valid_gone(p);
+        return ok;
+    }
+    void valid_count(std::uint64_t p, std::uint64_t n) {
+        {
+            std::lock_guard<std::mutex> lk(vmtx_);
+            valid_bucket_locked(p).tokens -= static_cast<double>(n);
+            st_.p15_counted += n;
+        }
+        valid_gone(p);
+    }
+    // A bucket made for a peer whose link went down meanwhile does not stay (on_peer_down erases the others).
+    void valid_gone(std::uint64_t p) {
+        if (peer_known(p)) return;
+        std::lock_guard<std::mutex> lk(vmtx_);
+        valid_.erase(p);
+    }
+    struct ValidBucket {
+        double tokens = 0;
+        std::uint64_t ms = 0;
+    };
+    ValidBucket& valid_bucket_locked(std::uint64_t p) {
+        const std::uint64_t now = now_ms();
+        const auto [it, fresh] = valid_.try_emplace(p);
+        ValidBucket& b = it->second;
+        if (fresh) {
+            b.tokens = valid_cap_;
+        } else if (now > b.ms) {
+            b.tokens = std::min(valid_cap_, b.tokens + static_cast<double>(now - b.ms) * valid_rate_ / 1000.0);
+        }
+        b.ms = now;
+        return b;
+    }
+    double valid_left(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return valid_bucket_locked(p).tokens;
+    }
+
+    // What follows an admission outcome outside the node lock.
+    struct Effects {
+        bool join = false;
+        std::set<Missing> rerun;                            // causes whose parked frames run again
+        // (a Monero block, the peer that sent the object, the want's class: Carrier for a carrier, Receipt for a receipt)
+        std::vector<std::tuple<Hash32, std::uint64_t, CtxClass>> ctx;
+        std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
+        std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
+        std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
+        std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
+    };
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
+    void take_rx_failed_locked(Effects& fx) {
+        for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
+        for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
+    }
+    // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
+    // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
+    // TipBodies DEFER bound and placed, the joiner's signal.
+    // carrier: the object is a carrier (its Monero context climbs to P-07), else a receipt (P-06).
+    // receipt: a DEFERred receipt this node parked (park_receipt_locked): indexed under its cause by its key; each peer
+    // is asked for one cause and object at most once per parked receipt; a TipBodies bind runs on every re-run.
+    void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
+                             bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
+        if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
+        switch (r.action) {
+            case NodeAction::JoinerPath: fx.join = true; break;
+            case NodeAction::Placed:
+            case NodeAction::Switched:
+                if (r.action == NodeAction::Switched && node_->reask_pending()) {
+                    reask_due_ = true;  // a joined store (its session or a restart): the claimed leaves asked again
+                    fx.join = true;
+                }
+                if (bucket_stalled_) {  // every peer was closed for the named carrier: a later carrier of the chain
+                    bucket_stalled_ = false;
+                    fx.rerun.insert(Missing::MissingBucket);
+                }
+                // a placed carrier may be the tip, a walked carrier or a reference a parked frame waits on
+                for (const Missing m : {Missing::TipUnknown, Missing::TipHeaders, Missing::TipBodies, Missing::ClosureBodies,
+                                        Missing::Bodies, Missing::MissingRef})
+                    if (!parked_by_cause_[m].empty()) fx.rerun.insert(m);
+                break;
+            default: break;
+        }
+        if (r.action != NodeAction::Parked || !r.admit.missing) return;
+        const Missing m = *r.admit.missing;
+        const std::optional<Hash32> d =
+                digest ? std::optional<Hash32>(r.admit.digest != Hash32{} ? r.admit.digest : *digest) : std::nullopt;
+        if (d && rerun_cause(m)) parked_by_cause_[m].insert(*d);
+        std::set<std::tuple<std::uint64_t, Missing, Hash32>>* asked = nullptr;
+        bool kept = true;
+        if (receipt) {
+            const auto it = parked_receipts_.find(*receipt);
+            kept = it != parked_receipts_.end();  // not kept (over the cap at once): nothing asked for it
+            if (kept) {
+                parked_by_cause_[m].insert(*receipt);
+                asked = &it->second.second.asked;
+            }
+        }
+        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time
+        const auto may = [&](const Hash32& object) {
+            return kept && (asked == nullptr || asked->emplace(peer, m, object).second);
+        };
+        switch (m) {
+            case Missing::TipUnknown:
+            case Missing::TipHeaders:
+                if (may(r.admit.fetch)) request_tip_headers(peer, r.admit.fetch_from, r.admit.fetch, d);
+                break;
+            case Missing::ClosureBodies:
+                if (may(r.admit.fetch)) request_body_set(peer, r.admit.fetch, d);
+                break;
+            case Missing::Bodies:
+                if (may(r.admit.fetch)) request_carrier(peer, r.admit.fetch);
+                break;
+            case Missing::TipBodies: {
+                const PathbNode::WalkBind wb = node_->bind_walked_branch(r.admit.bind);
+                if (wb.rx_failed) {
+                    // node-internal (the walk stopped at a RandomX failure; what it found stays): the alarm; the
+                    // parked frame runs again after kParkRetryMs (no token)
+                    rx_alarm("walked carrier");
+                    if (d) {
+                        parked_by_cause_[m].erase(*d);
+                        if (std::optional<ParkedFrame> f = node_->take_parked(*d)) fx.rx_rerun.push_back(std::move(*f));
+                    }
+                }
+                st_.walk_placed += wb.placed.size();
+                fx.bans.insert(fx.bans.end(), wb.banned.begin(), wb.banned.end());
+                fx.strikes.insert(fx.strikes.end(), wb.struck.begin(), wb.struck.end());
+                if (!wb.need_bodies.empty() && (!d || node_->may_ask(*d, peer)))
+                    for (const Hash32& id : wb.need_bodies)
+                        if (may(id)) request_body_set(peer, id, std::nullopt);
+                if (!wb.placed.empty()) fx.rerun.insert(Missing::TipBodies);
+                break;
+            }
+            case Missing::MoneroBlock:
+            case Missing::MissingBlock:
+            case Missing::MissingWeights:
+                if (r.admit.fetch != Hash32{} && may(r.admit.fetch))
+                    fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? CtxClass::Carrier : CtxClass::Receipt);
+                break;
+            case Missing::MissingBucket:
+                if (may(r.admit.fetch)) bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer);
+                break;
+            default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
+        }
+        take_rx_failed_locked(fx);
+    }
+    static bool rerun_cause(Missing m) {
+        switch (m) {
+            case Missing::TipUnknown:
+            case Missing::TipHeaders:
+            case Missing::ClosureBodies:
+            case Missing::Bodies:
+            case Missing::TipBodies:
+            case Missing::MoneroBlock:
+            case Missing::MissingBlock:
+            case Missing::MissingWeights:
+            case Missing::MissingBucket:
+            case Missing::MissingRef:
+            case Missing::Seed: return true;
+            default: return false;
+        }
+    }
+    // FC_GETHEADERS of t's branch to the sender (one in flight per peer: else at the next tick): from c's chain at
+    // pos(parent(c)) - J_0 (the admission's fetch_from; with none, the best chain at pos(best) - J_0) to t.
+    void request_tip_headers(std::uint64_t peer, Hash32 from, const Hash32& stop, const std::optional<Hash32>& digest) {
+        if (peer == PathbNode::kOwnPeer || !hello_ok(peer)) return;
+        if (digest && !node_->may_ask(*digest, peer)) return;
+        if (from == Hash32{}) {
+            const CarrierNode& b = node_->tree().best();
+            const std::uint64_t j0 = admit_j0(p_);
+            from = node_->store().best_at(b.pos > j0 ? b.pos - j0 : 0).value_or(b.id);
+        }
+        if (node_->tree().find(from) == nullptr) return;
+        if (node_->request_headers(peer, from, stop, header_max_, now_s())) {
+            st_.tip_header_requests++;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(cumtx_);
+        header_wants_[peer] = std::make_pair(from, stop);
+    }
+    // FC_GETCARRIER (want_bodies 1) of a walked carrier to the sender: its reply is that peer's body set.
+    void request_body_set(std::uint64_t peer, const Hash32& id, const std::optional<Hash32>& digest) {
+        if (peer == PathbNode::kOwnPeer || !hello_ok(peer)) return;
+        if (digest && !node_->may_ask(*digest, peer)) return;
+        GetCarrier q;
+        q.chain_id = chain_id_;
+        q.ids = {id};
+        q.want_bodies = true;
+        const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, p_);
+        if (!f) return;
+        {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            std::set<Hash32>& a = bodyset_asked_[peer];
+            if (a.size() >= kAskedMax) a.clear();
+            a.insert(id);
+        }
+        if (send_link(peer, *f)) st_.body_set_requests++;
+    }
+    // FC_GETCARRIER (want_bodies 1) of a carrier to the sender: its reply is admitted as a frame.
+    void request_carrier(std::uint64_t peer, const Hash32& id) {
+        if (peer == PathbNode::kOwnPeer || !hello_ok(peer)) return;
+        GetCarrier q;
+        q.chain_id = chain_id_;
+        q.ids = {id};
+        q.want_bodies = true;
+        if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, p_)) node_send(peer, *f);
+    }
+    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN).
+    bool apply_result(std::uint64_t peer, const NodeEventResult& r, bool token_taken) {
+        for (const auto& [q, n] : r.admit.peer_tokens) strike(q, n, false);
+        switch (r.admit.verdict) {
+            case AdmitVerdict::Strike: strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken); return true;
+            case AdmitVerdict::Ban: ban(peer); return true;
+            case AdmitVerdict::Drop: st_.drops++; return false;
+            default: return false;
+        }
+    }
+    void run_effects(Effects& fx) {
+        for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
+            rx_alarm("released carrier");
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
+                     now_ms() + kParkRetryMs);
+        }
+        for (ParkedFrame& f : fx.rx_rerun)
+            park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
+                     now_ms() + kParkRetryMs);
+        for (const auto& [peer, n] : fx.p15) valid_count(peer, n);  // a released carrier's first placement (P-15)
+        fx.rx_retry.clear();
+        fx.rx_rerun.clear();
+        fx.p15.clear();
+        for (std::uint64_t q : fx.bans) ban(q);
+        for (std::uint64_t q : fx.strikes) strike(q, 1, false);
+        for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
+        if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
+        if (fx.join) signal_join();
+        repend_offer();
+    }
+    // FC_GETBUCKETS at the named carrier (one assembly per (peer, at)): the object's sender first, then every other
+    // ready peer; none: a later carrier of the same chain (the parked frames run again when the best tip moves).
+    void bucket_fetch(const Hash32& at, std::uint64_t bin, std::uint64_t prefer) {
+        std::vector<std::uint64_t> order;
+        const std::vector<std::uint64_t> ready = ready_peers();
+        if (std::find(ready.begin(), ready.end(), prefer) != ready.end()) order.push_back(prefer);
+        for (std::uint64_t q : ready)
+            if (q != prefer) order.push_back(q);
+        for (std::uint64_t q : order)
+            if (node_->request_buckets(q, at, bin, bin, now_s())) {
+                st_.bucket_requests++;
+                return;
+            }
+        bucket_stalled_ = true;
+    }
+    // The frames parked for these causes, and those marked for a re-walk, run again (each a new job of its sender).
+    // A parked receipt whose cause resolved is due; the due receipts run again, the oldest first, at most the verify
+    // queue's free room at a time (no queued job dropped for them); the rest stay parked and due for the next tick.
+    void rerun_parked(const std::vector<Missing>& causes) {
+        std::vector<ParkedFrame> again;
+        std::vector<Job> again_receipts;
+        std::size_t rewalked = 0;
+        std::size_t room = verify_room();
+        {
+            const NodeGuard g(*this);
+            for (const Missing cause : causes) {
+                std::set<Hash32> ds;
+                ds.swap(parked_by_cause_[cause]);
+                for (const Hash32& d : ds) {
+                    if (std::optional<ParkedFrame> f = node_->take_parked(d)) {
+                        again.push_back(std::move(*f));
+                    } else {
+                        const auto it = parked_receipts_.find(d);
+                        if (it != parked_receipts_.end()) receipt_due_[it->second.first] = d;
+                    }
+                }
+            }
+            std::vector<ParkedFrame> rw = node_->take_rewalk_frames();
+            rewalked = rw.size();
+            for (ParkedFrame& f : rw) again.push_back(std::move(f));
+            room = room > again.size() ? room - again.size() : 0;
+            take_due_receipts_locked(room, again_receipts);
+        }
+        st_.rewalks += rewalked;
+        for (ParkedFrame& f : again) {
+            st_.parked_reruns++;
+            enqueue_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true});
+        }
+        for (Job& j : again_receipts) {
+            st_.parked_reruns++;
+            enqueue_job(std::move(j));
+        }
+        if (std::find(causes.begin(), causes.end(), Missing::MoneroBlock) != causes.end()) reask_headers_on_ctx();
+    }
+    // The due receipts left by a re-run (the tick): the next ones, at most the verify queue's free room.
+    void rerun_due_receipts() {
+        std::vector<Job> again_receipts;
+        const std::size_t room = verify_room();
+        {
+            const NodeGuard g(*this);
+            if (receipt_due_.empty()) return;
+            take_due_receipts_locked(room, again_receipts);
+        }
+        for (Job& j : again_receipts) {
+            st_.parked_reruns++;
+            enqueue_job(std::move(j));
+        }
+    }
+    std::size_t verify_room() const {
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return vq_.size() < o_.verify_queue_max ? o_.verify_queue_max - vq_.size() : 0;
+    }
+    // ---- DEFERred receipts (SPEC DEFER: parked, run again when the missing data arrive) ----
+    // A parked receipt's key: its one-body frame's digest (the park, its asks, its index and its due entry).
+    static Hash32 receipt_key(const std::vector<std::uint8_t>& frame) { return ::v37::sha256d(frame); }
+    // Under the node lock: the one-body FB_RECEIPTS job of a DEFERred receipt kept by its key with its asks (run again
+    // as a re-run: the sender's RandomX token taken and given back like any job's, no P-15 gate at its arrival, P-15
+    // counted at its first admission), at most the pending set's cap (P-09; a first-in-first-out store of its own,
+    // not the pending set's overflow order): over it the oldest goes, with its asks. The same receipt parked again
+    // keeps the asks made for it.
+    void park_receipt_locked(const Hash32& key, std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked, const Job& j) {
+        const auto it = parked_receipts_.find(key);
+        if (it != parked_receipts_.end()) {
+            asked.insert(it->second.second.asked.begin(), it->second.second.asked.end());
+            parked_receipt_order_.erase(it->second.first);
+            receipt_due_.erase(it->second.first);
+        }
+        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked)};
+        const std::uint64_t seq = ++parked_receipt_seq_;
+        parked_receipts_[key] = std::make_pair(seq, std::move(k));
+        parked_receipt_order_[seq] = key;
+        st_.receipts_parked++;
+        const std::uint64_t cap = node_->pending_cap();
+        while (parked_receipts_.size() > cap && !parked_receipt_order_.empty()) {
+            const auto [old_seq, old] = *parked_receipt_order_.begin();
+            parked_receipt_order_.erase(parked_receipt_order_.begin());
+            receipt_due_.erase(old_seq);
+            parked_receipts_.erase(old);
+            unindex_receipt_locked(old);
+            st_.parked_receipt_drops++;
+        }
+    }
+    // Under the node lock: a parked receipt out of the park with its asks (they leave with the job).
+    std::optional<Job> take_parked_receipt_locked(const Hash32& key) {
+        const auto it = parked_receipts_.find(key);
+        if (it == parked_receipts_.end()) return std::nullopt;
+        Job j = std::move(it->second.second);
+        parked_receipt_order_.erase(it->second.first);
+        receipt_due_.erase(it->second.first);
+        parked_receipts_.erase(it);
+        unindex_receipt_locked(key);
+        return j;
+    }
+    void unindex_receipt_locked(const Hash32& key) {
+        for (auto& [cause, ds] : parked_by_cause_) ds.erase(key);
+    }
+    void take_due_receipts_locked(std::size_t room, std::vector<Job>& out) {
+        while (out.size() < room && !receipt_due_.empty()) {
+            const auto [seq, key] = *receipt_due_.begin();
+            receipt_due_.erase(receipt_due_.begin());
+            const auto it = parked_receipts_.find(key);
+            if (it == parked_receipts_.end() || it->second.first != seq) continue;
+            if (std::optional<Job> j = take_parked_receipt_locked(key)) out.push_back(std::move(*j));
+        }
+    }
+    void rerun_parked(Missing cause) { rerun_parked(std::vector<Missing>{cause}); }
+
+    // ---- the node's sends ----
+    void node_send(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
+        if (!f.empty() && f[0] == kOpFcGetHeaders) {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            hdr_fifo_[peer].push_back(HdrWait{true, 0, false});
+        }
+        if (!f.empty() && f[0] == kOpFcGetCarrier) {  // its reply frames are solicited
+            GetCarrier q;
+            if (decode_fc_getcarrier(f, chain_id_, p_, q).ok()) {
+                std::lock_guard<std::mutex> lk(kmtx_);
+                std::set<Hash32>& a = asked_carriers_[peer];
+                if (a.size() + q.ids.size() > kAskedMax) a.clear();  // a peer that does not answer: bounded
+                a.insert(q.ids.begin(), q.ids.end());
+            }
+        }
+        (void)send_link(peer, f);
+    }
+    // An FC_CARRIER of `peer` that answers this node's own request: a body set it asked for, or a carrier.
+    enum class CarrierReply : std::uint8_t { None, Solicited, BodySet };
+    CarrierReply carrier_reply(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
+        {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            const auto a = asked_carriers_.find(peer);
+            const auto b = bodyset_asked_.find(peer);
+            if ((a == asked_carriers_.end() || a->second.empty()) && (b == bodyset_asked_.end() || b->second.empty()))
+                return CarrierReply::None;
+        }
+        CarrierBodyV3 c;
+        if (!check_fc_carrier(f, chain_id_, buffers_).ok()
+            || decode_carrier_body_v3(f.data() + kFrameHeaderBytes, f.size() - kFrameHeaderBytes,
+                                      CarrierLimits{buffers_.receipt, p_.r_max}, c)
+                       != WireError::None)
+            return CarrierReply::None;
+        const Hash32 id = receipt_id(c.own);
+        std::lock_guard<std::mutex> lk(kmtx_);
+        if (const auto b = bodyset_asked_.find(peer); b != bodyset_asked_.end() && b->second.erase(id) != 0)
+            return CarrierReply::BodySet;
+        if (const auto a = asked_carriers_.find(peer); a != asked_carriers_.end() && a->second.erase(id) != 0)
+            return CarrierReply::Solicited;
+        return CarrierReply::None;
+    }
+    // A walked carrier's body set from `peer`: the parked frames that need it run again.
+    void handle_body_set(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        bool ok = false;
+        {
+            const NodeGuard g(*this);
+            ok = node_->on_body_set(p, f);
+        }
+        if (!ok) return;
+        st_.body_sets++;
+        rerun_parked(std::vector<Missing>{Missing::ClosureBodies, Missing::TipBodies});
+    }
+    // Relay policy: every HELLO-ok link but the sender's.
+    void node_flood(const std::vector<std::uint8_t>& f, std::optional<std::uint64_t> except) {
+        for (std::uint64_t p : ready_peers()) {
+            if (except && *except == p) continue;
+            if (send_link(p, f)) st_.flood_frames++;
+        }
+    }
+
+    // ---- HELLO ----
+    void send_our_hello(std::uint64_t p) {
+        PathbHello ours;
+        {
+            const NodeGuard g(*this);
+            ours = node_->our_hello(nonce_, links_.listen_port());
+        }
+        send_hello(p, ours);
+    }
+    void send_hello(std::uint64_t p, const PathbHello& ours) {
+        const std::optional<std::vector<std::uint8_t>> f = encode_pathb_hello(ours);
+        if (!f || !send_link(p, *f)) return;
+        st_.hello_sent++;
+        std::lock_guard<std::mutex> lk(pmtx_);
+        const auto it = peers_.find(p);
+        if (it != peers_.end()) it->second.hello_sent = true;
+    }
+    void handle_hello(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloLink& link) {
+        PathbHello ours;
+        HelloCheck c;
+        bool join = false;
+        {
+            const NodeGuard g(*this);
+            ours = node_->our_hello(nonce_, links_.listen_port());
+            c = node_->on_hello(p, f, ours);
+            join = node_->joiner().queue().size() > 0;
+        }
+        if (join) signal_join();
+        const PathbHelloDecode d = decode_pathb_hello(f);
+        if (c.verdict != HelloVerdict::Accept || d.error != HelloError::None) {
+            hello_refused(p, f, c, d, link);
+            return;
+        }
+        bool first = false, need_send = false;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end()) return;
+            first = !it->second.hello_ok;
+            it->second.hello_ok = true;
+            it->second.remote_nonce = d.hello.node_nonce;
+            it->second.remote_listen = d.hello.listen_port;
+            need_send = !it->second.hello_sent;
+            it->second.hello_sent = true;
+        }
+        if (need_send) send_hello(p, ours);
+        if (!first) return;
+        st_.hello_ok++;
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            for (Target& t : targets_)
+                if (t.pid == p) {
+                    t.hello_seen = true;
+                    t.prehello_fails = 0;
+                }
+        }
+        log("relay: peer " + std::to_string(p) + " HELLO ok (listen=" + std::to_string(d.hello.listen_port) + ")");
+        if (o_.discovery && !disc_hello_ok(p, d.hello.node_nonce, d.hello.listen_port)) return;
+        after_hello(p, d.hello.tail);
+    }
+    // A HELLO the node refuses (TAG_MISMATCH, LANE_RULES_MISMATCH, K22 (frame version 0x01 or codec 1), malformed),
+    // closes (mmr_leaf_count) or names this node: the link closed, no strike.
+    void hello_refused(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloCheck& c, const PathbHelloDecode& d,
+                       const HelloLink& link) {
+        const bool self = c.verdict == HelloVerdict::SelfConnection;
+        if (c.verdict == HelloVerdict::Close) {
+            st_.hello_closed++;
+        } else if (!self) {
+            st_.hello_rejected++;
+            if (c.reason == HelloReason::K22 && f.size() > 1 && f[1] != kHelloFrameVersion) st_.hello_old_version++;
+            if (c.reason == HelloReason::Network || c.reason == HelloReason::ChainId || c.reason == HelloReason::PoolId)
+                st_.hello_tag_mismatch++;
+            if (c.reason == HelloReason::LaneRules) st_.hello_rules_mismatch++;
+        }
+        log("relay: peer " + std::to_string(p) + " HELLO REFUSED: " + c.text + " -> drop");
+        if (self) {
+            st_.self_conn++;
+            on_self_hello(p, link);
+        }
+        if (o_.discovery) disc_refused(c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0, link);
+        defer_drop(p, src_of(p), false);
+    }
+    // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
+    // taken under the node lock; the frames paged by reoffer_pump).
+    void after_hello(std::uint64_t p, const HelloTail& tail) {
+        std::vector<Hash32> ids;
+        {
+            const NodeGuard g(*this);
+            if (node_->rests_on_claims() || node_->poisoned()) return;
+            catchup_start(p, tail);
+            for (const PendingReceipt* r : node_->pending().all()) ids.push_back(r->id);
+        }
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            reoffer_[p] = std::deque<Hash32>(ids.begin(), ids.end());
+            reoffer_t0_[p] = now_ms();
+        }
+        reoffer_pump(p);
+    }
+    // The re-offer of one peer, paged: a frame is queued only while the link's queued bytes with it (and its u32 length
+    // prefix) stay within the link's bound less one FC_HEADERS frame with its prefix (P-14: room for a serve reply
+    // and live traffic);
+    // the rest waits for the queue to drain (the maintenance tick). Bodies no longer pending are skipped. One pump per
+    // peer at a time (HELLO and the tick).
+    void reoffer_pump(std::uint64_t p) {
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            if (reoffer_.count(p) == 0 || !pumping_.insert(p).second) return;
+        }
+        struct Done {
+            PathbRelayNode* r;
+            std::uint64_t p;
+            ~Done() {
+                std::lock_guard<std::mutex> lk(r->rmtx_);
+                r->pumping_.erase(p);
+            }
+        } done{this, p};
+        const std::size_t per = static_cast<std::size_t>(fc_ids_max(p_));
+        for (;;) {
+            std::vector<Hash32> ids;
+            {
+                std::lock_guard<std::mutex> lk(rmtx_);
+                const auto it = reoffer_.find(p);
+                if (it == reoffer_.end()) return;
+                if (it->second.empty()) {
+                    reoffer_.erase(it);
+                    reoffer_finished_locked(p);
+                    return;
+                }
+                for (std::size_t i = 0; i < per && i < it->second.size(); ++i) ids.push_back(it->second[i]);
+            }
+            std::vector<ReceiptBodyV3> chunk;
+            {
+                const NodeGuard g(*this);
+                for (const Hash32& id : ids)
+                    if (const PendingReceipt* r = node_->pending().get(id)) chunk.push_back(r->body);
+            }
+            std::optional<std::vector<std::uint8_t>> fr;
+            if (!chunk.empty()) fr = encode_fb_receipts(chain_id_, chunk, p_);
+            if (fr) {
+                const std::size_t bound = links_.send_queue_limit();
+                if (bound != 0 && links_.queued_bytes(p) + fr->size() + 4 + headers_frame_ + 4 > bound) {
+                    st_.reoffer_paused++;
+                    return;
+                }
+                if (!send_link(p, *fr)) {
+                    std::lock_guard<std::mutex> lk(rmtx_);
+                    reoffer_.erase(p);
+                    reoffer_t0_.erase(p);
+                    return;
+                }
+                st_.reoffer_frames++;
+            }
+            std::lock_guard<std::mutex> lk(rmtx_);
+            const auto it = reoffer_.find(p);
+            if (it == reoffer_.end()) return;
+            for (std::size_t i = 0; i < ids.size() && !it->second.empty(); ++i) it->second.pop_front();
+        }
+    }
+    // Under rmtx_: a re-offer sent to its end (soak: the time it took).
+    void reoffer_finished_locked(std::uint64_t p) {
+        const auto t = reoffer_t0_.find(p);
+        if (t == reoffer_t0_.end()) return;
+        const std::uint64_t now = now_ms();
+        const std::uint64_t d = now > t->second ? now - t->second : 0;
+        reoffer_t0_.erase(t);
+        st_.reoffer_done++;
+        st_.reoffer_last_ms = d;
+        if (d > st_.reoffer_max_ms.load()) st_.reoffer_max_ms = d;
+    }
+    // Every relay send. A send at which the transport drops the link for a full queue (its count moved during the
+    // send) is counted: a re-offer drop when the peer's re-offer was paging as the send began (the drop's link-down
+    // ends it), else a live-traffic drop.
+    bool send_link(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        bool paging = false;
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            paging = reoffer_.count(p) != 0;
+        }
+        const std::uint64_t q0 = links_.queue_full_drops();
+        const bool ok = links_.send_to(p, f);
+        if (!ok && links_.queue_full_drops() > q0) (paging ? st_.reoffer_queue_full : st_.live_queue_full)++;
+        return ok;
+    }
+    void reoffer_pump_all() {
+        std::vector<std::uint64_t> ps;
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            for (const auto& [p, q] : reoffer_) ps.push_back(p);
+        }
+        for (const std::uint64_t p : ps) reoffer_pump(p);
+    }
+    // E11: the receipts a switch by the journal re-pended (either switch path: a placement or the drain of the
+    // carriers it released) relayed as FB_RECEIPTS v3 to every ready peer, paged as the re-offer: appended to each
+    // peer's re-offer queue, which reoffer_pump sends within the link's bound (P-67), skipping bodies no longer
+    // pending. Run after each admission outcome's effects (run_effects; an own share extends the best tip and
+    // never switches); never under the node lock (the ids then wait for the next call).
+    void repend_offer() {
+        if (t_node_held == this) return;
+        std::vector<Hash32> ids;
+        {
+            const NodeGuard g(*this);
+            ids = node_->take_repended();
+            if (ids.empty() || node_->rests_on_claims() || node_->poisoned()) return;
+        }
+        const std::vector<std::uint64_t> ready = ready_peers();
+        st_.repend_offers++;
+        st_.repend_offered += ids.size();
+        std::string line = "relay: re-pend offer " + std::to_string(ids.size()) + " receipt(s) to " +
+                           std::to_string(ready.size()) + " peer(s):";
+        for (std::size_t i = 0; i < ids.size() && i < kRependLogIds; ++i) line += " " + hex_short(ids[i]);
+        log(line);
+        if (ready.empty()) return;  // a peer's HELLO re-offers the pending set
+        {
+            std::lock_guard<std::mutex> lk(rmtx_);
+            for (const std::uint64_t p : ready) {
+                std::deque<Hash32>& q = reoffer_[p];
+                if (reoffer_t0_.count(p) == 0) reoffer_t0_[p] = now_ms();
+                q.insert(q.end(), ids.begin(), ids.end());
+            }
+        }
+        for (const std::uint64_t p : ready) reoffer_pump(p);
+    }
+
+    // ---- headers first (the caller's catch-up loop) ----
+    // Under the node lock.
+    void catchup_start(std::uint64_t p, const HelloTail& tail) {
+        const CarrierNode& b = node_->tree().best();
+        if (node_->tree().find(tail.best_tip) != nullptr) return;
+        if (!fork_choice_prefers(ChainTip{tail.best_cum_work, tail.best_tip}, ChainTip{b.cum_work, b.id})) return;
+        std::lock_guard<std::mutex> lk(cumtx_);
+        Catchup& c = catchup_[p];
+        c.tip = tail.best_tip;
+        c.work = tail.best_cum_work;
+        catchup_ask_locked(p, c);
+    }
+    // Under the node lock and cumtx_: FC_GETHEADERS from the best tip to the peer's tip (one in flight per peer).
+    void catchup_ask_locked(std::uint64_t p, Catchup& c) {
+        const CarrierNode& b = node_->tree().best();
+        if (!node_->request_headers(p, b.id, c.tip, header_max_, now_s())) return;
+        c.from_pos0 = b.pos == 0;
+        c.asked_best = b.id;
+        c.asked_ms = now_ms();
+        st_.catchup_requests++;
+    }
+    void handle_headers(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        using K = PathbNode::HeadersOutcome::Kind;
+        PathbNode::HeadersOutcome o;
+        bool join = false;
+        {
+            const NodeGuard g(*this);
+            try {
+                o = node_->on_headers(p, f, now_s());
+            } catch (const RandomxFailure&) {  // node-internal, a local alarm; no token; the catch-up asks again
+                rx_alarm("headers");
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(cumtx_);
+                const auto it = catchup_.find(p);
+                if (it != catchup_.end()) {
+                    switch (o.kind) {
+                        case K::Keep:
+                            // the reply to a request from position 0 carried no header: the peer serves nothing after
+                            // position 0 (the empty-store start's joiner path)
+                            if (o.ids.empty() && it->second.from_pos0 && node_->offer_empty_store_tip(p)) {
+                                st_.empty_store_offers++;
+                                join = true;
+                            }
+                            catchup_.erase(it);
+                            break;
+                        case K::JoinerPath:
+                        case K::Ban:
+                        case K::Undecodable: catchup_.erase(it); break;
+                        default: break;
+                    }
+                }
+            }
+            if (o.kind == K::JoinerPath) join = true;
+            if (o.kind != K::OverBuffer && o.kind != K::Unsolicited) header_wants_locked(p);
+        }
+        switch (o.kind) {
+            case K::OverBuffer:   // above the FC_HEADERS buffer: DROP (the request stays open)
+            case K::Unsolicited: token(p, FrameToken::Drop); break;
+            case K::Undecodable: token(p, FrameToken::Strike); break;
+            case K::Ban: ban(p); break;
+            default: break;
+        }
+        if (o.kind == K::Defer && o.fetch != Hash32{}) {
+            // a header's P_r not held: fetched (FB_GETCTX, the carrier class), the request asked again once it resolves
+            {
+                std::lock_guard<std::mutex> lk(cumtx_);
+                headers_on_ctx_[p] = std::make_pair(o.from, o.stop);
+            }
+            st_.headers_ctx_deferred++;
+            want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+        }
+        if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
+        if (join) signal_join();
+    }
+    // The header requests deferred on a P_r (one per peer), asked again with the MoneroBlock re-run (a context
+    // resolved, or the follower's chain moved); one still missing defers again.
+    void reask_headers_on_ctx() {
+        std::map<std::uint64_t, std::pair<Hash32, Hash32>> due;
+        {
+            std::lock_guard<std::mutex> lk(cumtx_);
+            due.swap(headers_on_ctx_);
+        }
+        if (due.empty()) return;
+        const NodeGuard g(*this);
+        for (const auto& [p, w] : due) {
+            if (!hello_ok(p) || node_->tree().find(w.first) == nullptr) continue;
+            if (node_->request_headers(p, w.first, w.second, header_max_, now_s())) {
+                st_.headers_ctx_reasks++;
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(cumtx_);
+            header_wants_[p] = w;
+        }
+    }
+    // Under the node lock: the waiting request of t's branch to `peer` (every peer: 0), when that peer has none in
+    // flight.
+    void header_wants_locked(std::uint64_t only) {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        for (auto it = header_wants_.begin(); it != header_wants_.end();) {
+            if (only != 0 && it->first != only) {
+                ++it;
+                continue;
+            }
+            if (!hello_ok(it->first) || node_->tree().find(it->second.first) == nullptr) {
+                it = header_wants_.erase(it);
+                continue;
+            }
+            if (node_->request_headers(it->first, it->second.first, it->second.second, header_max_, now_s())) {
+                st_.tip_header_requests++;
+                it = header_wants_.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
+
+    // ---- FC_BUCKETS (the node's own requests) ----
+    void handle_buckets(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        BucketsEventResult r;
+        {
+            const NodeGuard g(*this);
+            r = node_->on_buckets(p, f, now_s());
+        }
+        if (r.action == NodeAction::NodeInternal) return;
+        switch (r.frame.verdict) {
+            case BucketsFrameVerdict::Refused:
+                token(p, FrameToken::Strike, std::max<std::uint32_t>(r.frame.strike, 1));
+                rerun_parked(Missing::MissingBucket);  // another peer for that carrier
+                break;
+            case BucketsFrameVerdict::NotServed: rerun_parked(Missing::MissingBucket); break;
+            case BucketsFrameVerdict::Drop: token(p, FrameToken::Drop); break;
+            case BucketsFrameVerdict::Accepted:  // the bins and their references
+                if (r.frame.bins_completed > 0) rerun_parked(std::vector<Missing>{Missing::MissingBucket, Missing::MissingRef});
+                break;
+            default: break;
+        }
+    }
+
+    // ---- family C requests ----
+    void serve_request(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        ServeResult s;
+        {
+            const NodeGuard g(*this);
+            switch (f[0]) {
+                case kOpFcGetCarrier: s = node_->serve_getcarrier(p, f, now_s()); break;
+                case kOpFcGetHeaders: s = node_->serve_getheaders(p, f, now_s()); break;
+                case kOpFcGetBuckets: s = node_->serve_getbuckets(p, f, now_s()); break;
+                default: return;
+            }
+        }
+        token(p, s.token);
+        for (const std::vector<std::uint8_t>& fr : s.frames) (void)send_link(p, fr);
+    }
+
+    // ---- FB_RECEIPTS ----
+    // The frame checked as a whole (above the buffer: DROP; does not decode: refuse + 1 strike), then one job per body.
+    void on_receipts_frame(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        ReceiptsFrame rf;
+        const FrameDecode d = decode_fb_receipts(f, chain_id_, buffers_, p_, rf);
+        if (!d.ok()) {
+            token(p, d.error == FrameWireError::OverBuffer ? FrameToken::Drop : FrameToken::Strike);
+            return;
+        }
+        const std::uint64_t src = src_of(p);
+        for (const std::vector<std::uint8_t>& body : rf.bodies) {
+            std::vector<std::uint8_t> one;
+            one.reserve(kFrameHeaderBytes + 1 + body.size());
+            one.push_back(kOpFbReceipts);
+            one.push_back(kFrameVersion2);
+            for (int i = 0; i < 4; ++i) one.push_back(static_cast<std::uint8_t>(chain_id_ >> (8 * i)));
+            one.push_back(1);
+            one.insert(one.end(), body.begin(), body.end());
+            enqueue_job(Job{Job::Kind::Receipt, p, src, std::move(one), 0});
+        }
+    }
+
+    // ---- the join worker ----
+    void signal_join() {
+        {
+            std::lock_guard<std::mutex> lk(jmtx_);
+            join_due_ = true;
+        }
+        jcv_.notify_one();
+    }
+    void join_loop() {
+        while (running_) {
+            {
+                std::unique_lock<std::mutex> lk(jmtx_);
+                jcv_.wait(lk, [&] { return join_due_ || !running_; });
+                if (!running_) break;
+                join_due_ = false;
+            }
+            if (now_ms() < join_not_before_ms_) continue;  // the tick signals again
+            (void)run_one_join();
+        }
+    }
+    std::map<std::uint64_t, std::uint32_t> link_strikes_locked() const {
+        std::map<std::uint64_t, std::uint32_t> m;
+        for (std::uint64_t p : ready_peers())
+            if (const PathbJoinLink* l = node_->join_link(p)) m[p] = l->strikes();
+        return m;
+    }
+    std::optional<JoinStep> run_one_join() {
+        JoinAttempted t;
+        std::map<std::uint64_t, std::uint32_t> before, after;
+        {
+            const NodeGuard g(*this, true);
+            if (!running_ || node_->poisoned()) return std::nullopt;
+            const bool queued = node_->joiner().queue().size() != 0;
+            if (!queued && !reask_due_) return std::nullopt;
+            // P-40: a queued pair is attempted once HELLO tails of at least join_min_peers peers name the candidates
+            const bool tails = ready_peers().size() >= o_.join_min_peers;
+            if (queued && !tails) st_.join_waits++;
+            if (!reask_due_ && !tails) return std::nullopt;
+            reask_due_ = false;
+            before = link_strikes_locked();
+            if (queued && tails) st_.join_attempts++;
+            t = node_->attempt_join(tails);
+            after = link_strikes_locked();
+        }
+        // an undecodable reply frame of the attempt's server: one strike each (the link counted it)
+        for (const auto& [p, n] : after) {
+            const auto b = before.find(p);
+            const std::uint32_t was = b == before.end() ? 0 : b->second;
+            if (n > was) {
+                strike(p, n - was, false);
+                st_.join_strikes += n - was;
+            }
+        }
+        std::optional<JoinStep> s;
+        if (o_.threads) {
+            struct Shared {
+                std::mutex m;
+                std::condition_variable cv;
+                bool done = false;
+                JoinAttempted t;
+                JoinStep s;
+            };
+            auto sh = std::make_shared<Shared>();
+            sh->t = std::move(t);
+            post([this, sh] {
+                JoinStep r;
+                {
+                    const NodeGuard g(*this);
+                    r = node_->apply_join(std::move(sh->t));
+                }
+                std::lock_guard<std::mutex> lk(sh->m);
+                sh->s = std::move(r);
+                sh->done = true;
+                sh->cv.notify_all();
+            });
+            std::unique_lock<std::mutex> lk(sh->m);
+            while (!sh->done && running_) sh->cv.wait_for(lk, std::chrono::milliseconds(200));
+            if (!sh->done) return std::nullopt;
+            s = std::move(sh->s);
+        } else {
+            const NodeGuard g(*this);
+            s = node_->apply_join(std::move(t));
+        }
+        if (s->report) {
+            const AttemptReport& rep = *s->report;
+            log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
+                std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
+                ", tokens " + std::to_string(rep.strike) + (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted" : ""));
+            if (s->report->strike > 0) {
+                strike(s->report->server, s->report->strike, false);
+                st_.join_strikes += s->report->strike;
+            }
+            // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
+            // after a non-service
+            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt");
+            if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
+                join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
+        }
+        return s;
+    }
+
+    // ---- the tickets (JoinTransport) ----
+    std::uint64_t ticket_send(std::uint64_t peer, const std::vector<std::uint8_t>& req) {
+        Ticket t;
+        t.peer = peer;
+        t.last_ms = now_ms();
+        const std::uint8_t op = req.empty() ? 0 : req[0];
+        if (op == kOpFcGetHeaders) {
+            t.op = kOpFcHeaders;
+        } else if (op == kOpFcGetCarrier) {
+            t.op = kOpFcCarrier;
+            GetCarrier q;
+            if (decode_fc_getcarrier(req, chain_id_, p_, q).ok()) {
+                t.ids.insert(q.ids.begin(), q.ids.end());
+                t.n = q.ids.size();
+            }
+        } else if (op == kOpFcGetBuckets) {
+            t.op = kOpFcBuckets;
+            GetBuckets q;
+            if (decode_getbuckets(req, chain_id_, q) == BucketsWireError::None) t.at = q.at;
+        }
+        const bool live = links_.has_peer(peer);
+        std::uint64_t id = 0;
+        {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            id = ++next_ticket_;
+            t.closed = !live;
+            if (t.op == kOpFcHeaders && live) hdr_fifo_[peer].push_back(HdrWait{false, id, false});
+            tickets_.emplace(id, std::move(t));
+        }
+        st_.join_tickets++;
+        if (live && !send_link(peer, req)) {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            const auto it = tickets_.find(id);
+            if (it != tickets_.end()) it->second.closed = true;
+        }
+        return id;
+    }
+    // The reply frames of a ticket: FC_HEADERS one frame; FC_CARRIER at most n frames; each within timeout_s of the
+    // one before (the first of the send); FC_BUCKETS until timeout_s passes with no frame. A closed ticket: none.
+    std::vector<std::vector<std::uint8_t>> ticket_collect(std::uint64_t id, std::uint64_t timeout_s) {
+        const JoinRelease rel(*this);
+        std::vector<std::vector<std::uint8_t>> out;
+        std::unique_lock<std::mutex> lk(kmtx_);
+        for (;;) {
+            const auto it = tickets_.find(id);
+            if (it == tickets_.end()) return out;
+            Ticket& t = it->second;
+            const bool full = (t.op == kOpFcHeaders && std::any_of(t.frames.begin(), t.frames.end(),
+                                                                   [&](const auto& fr) { return fr.size() <= headers_frame_; }))
+                              || (t.op == kOpFcCarrier && t.n > 0 && t.frames.size() >= t.n);
+            const std::uint64_t now = now_ms();
+            const std::uint64_t deadline = t.last_ms + timeout_s * 1000;
+            if (t.closed || full || now >= deadline || !running_) {
+                if (!t.closed) out = std::move(t.frames);
+                finish_ticket_locked(it);
+                return out;
+            }
+            if (!o_.threads) {
+                lk.unlock();
+                const bool moved = drive_ && drive_();
+                lk.lock();
+                if (moved) continue;
+                const auto jt = tickets_.find(id);
+                if (jt == tickets_.end()) return out;
+                if (!jt->second.closed) out = std::move(jt->second.frames);
+                finish_ticket_locked(jt);
+                return out;
+            }
+            kcv_.wait_for(lk, std::chrono::milliseconds(deadline - now));
+        }
+    }
+    void ticket_drop(std::uint64_t id) {
+        std::lock_guard<std::mutex> lk(kmtx_);
+        const auto it = tickets_.find(id);
+        if (it != tickets_.end()) finish_ticket_locked(it);
+    }
+    void finish_ticket_locked(std::map<std::uint64_t, Ticket>::iterator it) {
+        const auto q = hdr_fifo_.find(it->second.peer);
+        if (q != hdr_fifo_.end())
+            for (HdrWait& h : q->second)
+                if (!h.node && h.ticket == it->first) h.dead = true;
+        tickets_.erase(it);
+    }
+    void tickets_peer_gone(std::uint64_t p) {
+        {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            for (auto& [id, t] : tickets_)
+                if (t.peer == p) t.closed = true;
+            hdr_fifo_.erase(p);
+            asked_carriers_.erase(p);
+            bodyset_asked_.erase(p);
+        }
+        kcv_.notify_all();
+    }
+    void wait_until_s(std::uint64_t t_s) {
+        const JoinRelease rel(*this);
+        if (!o_.threads) {
+            while (now_s() < t_s && drive_ && drive_()) {
+            }
+            return;
+        }
+        std::unique_lock<std::mutex> lk(kmtx_);
+        for (;;) {
+            const std::uint64_t now = now_ms();
+            if (!running_ || now >= t_s * 1000) return;
+            kcv_.wait_for(lk, std::chrono::milliseconds(t_s * 1000 - now));
+        }
+    }
+    // A reply frame of an open ticket goes to it (true); any other frame to the node (false).
+    bool open_ticket(std::uint64_t peer, std::uint8_t op) const {
+        std::lock_guard<std::mutex> lk(kmtx_);
+        for (const auto& [k, t] : tickets_)
+            if (t.peer == peer && t.op == op && !t.closed) return true;
+        return false;
+    }
+    bool route_reply(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
+        const std::uint8_t op = f[0];
+        if (op == kOpFcHeaders) {  // one FC_HEADERS frame answers one FC_GETHEADERS, in request order
+            std::lock_guard<std::mutex> lk(kmtx_);
+            const auto q = hdr_fifo_.find(peer);
+            if (q == hdr_fifo_.end() || q->second.empty()) return false;
+            const HdrWait h = q->second.front();
+            q->second.pop_front();
+            if (h.node) return false;
+            const auto it = tickets_.find(h.ticket);
+            if (h.dead || it == tickets_.end()) {
+                st_.drops++;  // the reply of an ended request: DROP
+                return true;
+            }
+            it->second.frames.push_back(f);
+            it->second.last_ms = now_ms();
+            kcv_.notify_all();
+            return true;
+        }
+        if (op == kOpFcCarrier) {
+            if (f.size() > buffers_.frame || !open_ticket(peer, kOpFcCarrier)) return false;
+            std::optional<Hash32> id;
+            CarrierBodyV3 c;
+            if (check_fc_carrier(f, chain_id_, buffers_).ok()
+                && decode_carrier_body_v3(f.data() + kFrameHeaderBytes, f.size() - kFrameHeaderBytes,
+                                          CarrierLimits{buffers_.receipt, p_.r_max}, c)
+                           == WireError::None)
+                id = receipt_id(c.own);
+            std::lock_guard<std::mutex> lk(kmtx_);
+            Ticket* oldest = nullptr;
+            for (auto& [k, t] : tickets_) {
+                if (t.peer != peer || t.op != kOpFcCarrier || t.closed || t.frames.size() >= t.n) continue;
+                if (oldest == nullptr) oldest = &t;
+                if (id && t.ids.erase(*id) != 0) {
+                    t.frames.push_back(f);
+                    t.last_ms = now_ms();
+                    kcv_.notify_all();
+                    return true;
+                }
+            }
+            if (!id && oldest != nullptr) {  // does not decode: the asked server's reply (its link strikes it)
+                oldest->frames.push_back(f);
+                oldest->last_ms = now_ms();
+                kcv_.notify_all();
+                return true;
+            }
+            return false;
+        }
+        if (op == kOpFcBuckets) {
+            if (f.size() > bucket_frame_ || !open_ticket(peer, kOpFcBuckets)) return false;
+            BucketsFrameView v;
+            const bool ok = decode_buckets_view(f, chain_id_, v) == BucketsWireError::None;
+            std::lock_guard<std::mutex> lk(kmtx_);
+            Ticket* oldest = nullptr;
+            for (auto& [k, t] : tickets_) {
+                if (t.peer != peer || t.op != kOpFcBuckets || t.closed) continue;
+                if (oldest == nullptr) oldest = &t;
+                if (ok && t.at == v.at) {
+                    t.frames.push_back(f);
+                    t.last_ms = now_ms();
+                    kcv_.notify_all();
+                    return true;
+                }
+            }
+            if (!ok && oldest != nullptr) {
+                oldest->frames.push_back(f);
+                oldest->last_ms = now_ms();
+                kcv_.notify_all();
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // ---- the maintenance work ----
+    void hello_timeouts() {
+        std::vector<std::uint64_t> stale;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const std::uint64_t now = now_ms();
+            for (const auto& [p, s] : peers_)
+                if (!s.hello_ok && now - s.connected_ms > o_.hello_timeout_ms) stale.push_back(p);
+        }
+        for (std::uint64_t p : stale) {
+            st_.hello_timeout++;
+            {
+                std::lock_guard<std::mutex> lk(tmtx_);
+                for (Target& t : targets_)
+                    if (t.pid == p) t.hello_timed_out = true;
+            }
+            if (links_.has_peer(p)) {
+                links_.disconnect(p);
+                continue;
+            }
+            std::lock_guard<std::mutex> lk(pmtx_);
+            peers_.erase(p);
+        }
+    }
+    std::set<std::string> linked_keys() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::set<std::string> k;
+        for (const auto& [p, s] : peers_) {
+            if (!s.addr_key.empty()) k.insert(s.addr_key);
+            if (!s.out_host.empty()) k.insert(rly::peer_key(s.out_host, s.out_port));
+        }
+        return k;
+    }
+    static constexpr std::size_t kAddrNonceMax = 4096;
+    std::set<std::string> linked_node_keys() const {
+        std::lock_guard<std::mutex> lk(pmtx_);
+        std::set<std::uint64_t> live;
+        for (const auto& [p, s] : peers_)
+            if (s.hello_ok) live.insert(s.remote_nonce);
+        std::set<std::string> v;
+        for (const auto& [k, n] : addr_nonce_)
+            if (live.count(n) != 0) v.insert(k);
+        return v;
+    }
+    void dial_targets() {
+        if (!dialing_) {
+            std::vector<std::uint64_t> out;
+            {
+                std::lock_guard<std::mutex> lk(tmtx_);
+                for (Target& t : targets_)
+                    if (t.pid != 0) {
+                        out.push_back(t.pid);
+                        t.pid = 0;
+                    }
+            }
+            for (std::uint64_t p : out) links_.disconnect(p);
+            return;
+        }
+        std::vector<std::size_t> due;
+        const std::vector<std::uint64_t> live = links_.peer_ids();
+        const std::set<std::string> linked = o_.discovery ? linked_keys() : std::set<std::string>{};
+        const std::set<std::string> aliased = o_.discovery ? linked_node_keys() : std::set<std::string>{};
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            const std::uint64_t now = now_ms();
+            for (std::size_t i = 0; i < targets_.size(); ++i) {
+                Target& t = targets_[i];
+                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
+                if (t.self) continue;
+                if (t.pid == 0 && now >= t.next_try_ms) {
+                    const std::string k = rly::peer_key(t.host, t.port);
+                    if (linked.count(k) != 0 || aliased.count(k) != 0) {
+                        t.next_try_ms = now + 5000;
+                        if (t.learned) t.used = true;
+                        continue;
+                    }
+                    due.push_back(i);
+                }
+            }
+        }
+        for (std::size_t i : due) {
+            std::string host;
+            std::uint16_t port = 0;
+            {
+                std::lock_guard<std::mutex> lk(tmtx_);
+                if (i >= targets_.size()) continue;
+                host = targets_[i].host;
+                port = targets_[i].port;
+            }
+            st_.dials++;
+            dial_host_ = host;
+            dial_port_ = port;
+            t_dialing_relay = this;
+            const std::uint64_t pid = links_.dial(host, port);
+            t_dialing_relay = nullptr;
+            dial_host_.clear();
+            dial_port_ = 0;
+            const bool hello_now = pid != 0 && hello_ok(pid);
+            std::lock_guard<std::mutex> lk(tmtx_);
+            if (i >= targets_.size()) continue;
+            Target& t = targets_[i];
+            if (pid != 0) {
+                t.backoff_s = 1;
+                t.hello_seen = hello_now;
+                t.hello_timed_out = false;
+                if (links_.has_peer(pid)) {
+                    t.pid = pid;
+                    if (hello_now) t.prehello_fails = 0;
+                } else {
+                    t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
+                    t.hello_seen = false;
+                    if (o_.discovery && !hello_now) book_.mark_failed(host, port, clock_.wall_s());
+                }
+                if (t.learned) t.used = true;
+            } else {
+                st_.dial_fail++;
+                if (o_.discovery) book_.mark_failed(t.host, t.port, clock_.wall_s());
+                if (t.learned) t.used = true;
+                t.next_try_ms = now_ms() + static_cast<std::uint64_t>(t.backoff_s) * 1000;
+                t.backoff_s = std::min(60, t.backoff_s * 2);
+            }
+        }
+    }
+    void node_tick() {
+        bool rerun = false, join = false;
+        Effects rfx;  // released carriers whose admission failed with a RandomX failure (an own share's placement)
+        {
+            const NodeGuard g(*this);
+            take_rx_failed_locked(rfx);
+            if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
+            std::lock_guard<std::mutex> lk(cumtx_);
+            for (auto it = catchup_.begin(); it != catchup_.end();) {
+                const CarrierNode& b = node_->tree().best();
+                const bool done = node_->tree().find(it->second.tip) != nullptr
+                                  || !fork_choice_prefers(ChainTip{it->second.work, it->second.tip}, ChainTip{b.cum_work, b.id})
+                                  || node_->rests_on_claims();
+                if (done) {
+                    it = catchup_.erase(it);
+                    continue;
+                }
+                // again from the new best tip, or after a request that got no reply within P-53
+                if (it->second.asked_best != b.id || now_ms() >= it->second.asked_ms + abandon_s_ * 1000)
+                    catchup_ask_locked(it->first, it->second);
+                ++it;
+            }
+            join = (node_->joiner().queue().size() > 0 || reask_due_) && now_ms() >= join_not_before_ms_;
+        }
+        {
+            const NodeGuard g(*this);
+            header_wants_locked(0);
+        }
+        if (rerun) rerun_parked(Missing::MissingBucket);
+        if (join) signal_join();
+        run_effects(rfx);
+    }
+
+    // ---- liveness (FB_PING / FB_PONG) ----
+    void on_ping(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        std::uint8_t op = 0;
+        std::uint64_t n = 0;
+        if (!rly::decode_ping(f, op, n)) {
+            st_.malformed++;
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it != peers_.end()) {
+                it->second.ka = true;
+                it->second.unanswered = 0;
+            }
+        }
+        if (op == kOpFbPong) {
+            st_.pong_rx++;
+            return;
+        }
+        st_.ping_rx++;
+        if (send_link(p, rly::encode_ping(kOpFbPong, n))) st_.pong_tx++;
+    }
+    void drive_liveness() {
+        if (o_.keepalive_ms == 0) return;
+        const std::uint64_t now = now_ms();
+        const std::uint64_t gap = now - live_tick_ms_;
+        live_tick_ms_ = now;
+        // a gap far over the tick: this process was not running; the peers' frames wait unread, so re-arm
+        const bool rearm = gap > std::max<std::uint64_t>(2000, o_.keepalive_ms);
+        std::vector<std::uint64_t> ping, silent;
+        std::vector<std::string> msgs;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            if (rearm && !peers_.empty()) {
+                st_.ka_rearm++;
+                msgs.push_back("relay: liveness: maintenance paused " + std::to_string(gap) +
+                               " ms -- every link's silence clock re-armed");
+                for (auto& [p, s] : peers_) s.last_rx_ms = now;
+            }
+            for (auto& [p, s] : peers_) {
+                if (!s.hello_ok) continue;
+                const std::uint64_t quiet = now - s.last_rx_ms;
+                if (s.ka && o_.silence_timeout_ms && quiet > o_.silence_timeout_ms) {
+                    silent.push_back(p);
+                    msgs.push_back("relay: LINK SILENT -- peer " + std::to_string(p) + " sent NOTHING for " +
+                                   std::to_string(quiet) + " ms (silence timeout " + std::to_string(o_.silence_timeout_ms) +
+                                   " ms) while the link is up: dropping the link and redialing");
+                    continue;
+                }
+                if (!s.ka && s.unanswered >= kLegacyProbes) {
+                    if (!s.legacy_noted) {
+                        s.legacy_noted = true;
+                        st_.ka_legacy++;
+                        msgs.push_back("relay: liveness: peer " + std::to_string(p) + " answered none of " +
+                                       std::to_string(kLegacyProbes) + " PINGs: its silence is not timed out");
+                    }
+                    continue;
+                }
+                if (s.last_ping_ms == 0 || now - s.last_ping_ms >= o_.keepalive_ms) {
+                    s.last_ping_ms = now;
+                    if (!s.ka) ++s.unanswered;
+                    ping.push_back(p);
+                }
+            }
+        }
+        for (const std::string& m : msgs) log(m);
+        for (std::uint64_t p : silent) {
+            st_.silent_drops++;
+            links_.disconnect(p);
+        }
+        for (std::uint64_t p : ping)
+            if (send_link(p, rly::encode_ping(kOpFbPing, ++ping_nonce_))) st_.ping_tx++;
+    }
+
+    // ---- discovery (FB_GETADDR / FB_ADDR) and the node nonce ----
+    static bool dialable_v4(const rly::AddrEntry& e) { return e.family == rly::kAddrFamV4 && e.ip[0] != 0 && e.port != 0; }
+    static bool is_public_host(const std::string& ip) {
+        rly::AddrEntry e;
+        return rly::addr_entry_of(ip, 1, 0, e) && rly::addr_routable(e);
+    }
+    void send_getaddr(std::uint64_t p) {
+        const std::vector<std::uint8_t> f = rly::encode_getaddr(chain_id_, o_.addr_want);
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end() || !it->second.hello_ok) return;
+            it->second.addr_pending = true;
+            it->second.getaddr_tx_ms = now_ms();
+        }
+        if (send_link(p, f)) st_.getaddr_tx++;
+    }
+    // A HELLO refused on a link this node dialed: that address is never good and never learned again.
+    void disc_refused(const std::string& why, bool self, std::uint16_t their_listen, const HelloLink& link) {
+        const std::string& h = link.out_host;
+        const std::uint16_t port = link.out_port;
+        if (h.empty()) {
+            // the accepting end of a self-dial: the announced address (socket ip : HELLO listen port) is ours
+            if (self && their_listen != 0 && !link.remote_ip.empty()) book_.mark_self(link.remote_ip, their_listen);
+            return;
+        }
+        if (self) {
+            st_.disc_self++;
+            book_.mark_self(h, port);
+            log("relay-disc: " + rly::peer_key(h, port) + " is THIS node (HELLO node nonce equal) -> marked self");
+            return;
+        }
+        st_.disc_bad++;
+        book_.mark_bad(h, port);
+        log("relay-disc: " + rly::peer_key(h, port) + " refused at HELLO -> never good, not learned again (" + why + ")");
+    }
+    // A HELLO carrying this node's nonce: the dial target behind the link is retired for good.
+    void on_self_hello(std::uint64_t p, const HelloLink& link) {
+        const std::string& oh = link.out_host;
+        const std::uint16_t op = link.out_port;
+        std::lock_guard<std::mutex> lk(tmtx_);
+        for (Target& t : targets_)
+            if (!t.self && (t.pid == p || (!oh.empty() && t.host == oh && t.port == op))) {
+                t.self = true;
+                if (t.learned) t.used = true;
+                log("relay: dial target " + rly::peer_key(t.host, t.port) + " is THIS node -> never dialed again");
+            }
+    }
+    // HELLO ok: a dialed address becomes good, so does an inbound peer's announced address; a second link to the
+    // same node is dropped (both ends keep the link dialed by the lower node nonce). false: this link is dropped.
+    bool disc_hello_ok(std::uint64_t p, std::uint64_t their_nonce, std::uint16_t their_listen) {
+        const std::uint64_t now = clock_.wall_s();
+        std::string out_host;
+        std::uint16_t out_port = 0;
+        std::uint64_t dup = 0;
+        bool dup_out = false;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end()) return false;
+            out_host = it->second.out_host;
+            out_port = it->second.out_port;
+            for (const auto& [q, s] : peers_)
+                if (q != p && s.hello_ok && s.remote_nonce == their_nonce) {
+                    dup = q;
+                    dup_out = !s.out_host.empty();
+                    break;
+                }
+        }
+        std::string key, rip;
+        if (!out_host.empty()) {
+            book_.mark_good(out_host, out_port, now);
+            key = rly::peer_key(out_host, out_port);
+            bool learned = false;
+            {
+                std::lock_guard<std::mutex> lk(tmtx_);
+                for (const Target& t : targets_)
+                    if (t.learned && t.host == out_host && t.port == out_port) learned = true;
+            }
+            if (learned) st_.disc_dial_ok++;
+        } else {
+            rip = links_.remote_ip(p);
+            if (!rip.empty() && their_listen != 0) {
+                key = rly::peer_key(rip, their_listen);
+                book_.mark_good(rip, their_listen, now);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end()) return false;
+            it->second.addr_key = key;
+            it->second.remote_ip = rip;
+            if (!key.empty()) {
+                if (addr_nonce_.size() >= kAddrNonceMax && addr_nonce_.count(key) == 0) addr_nonce_.erase(addr_nonce_.begin());
+                addr_nonce_[key] = their_nonce;
+            }
+        }
+        if (dup != 0) {
+            const rly::DupPick pick = rly::dup_link_rule(nonce_, their_nonce, !out_host.empty(), dup_out);
+            if (pick == rly::DupPick::Defer) {
+                st_.dup_deferred++;
+            } else {
+                const bool drop_p = pick == rly::DupPick::DropNew;
+                st_.disc_dup_dropped++;
+                links_.disconnect(drop_p ? p : dup);
+                if (drop_p) return false;
+            }
+        }
+        send_getaddr(p);
+        return true;
+    }
+    void on_getaddr(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        std::uint32_t chain = 0;
+        std::uint16_t want = 0;
+        if (!rly::decode_getaddr(f, chain, want)) {
+            st_.malformed++;
+            return;
+        }
+        if (chain != chain_id_) {
+            st_.wrong_chain++;
+            return;
+        }
+        st_.getaddr_rx++;
+        std::string asker_key, asker_ip;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end()) return;
+            PeerSt& s = it->second;
+            const std::uint64_t now = now_ms();
+            if (s.getaddr_rx_ms != 0 && now - s.getaddr_rx_ms < o_.addr_answer_min_ms) {
+                st_.getaddr_throttled++;
+                return;
+            }
+            s.getaddr_rx_ms = now;
+            asker_key = s.addr_key;
+            asker_ip = s.out_host.empty() ? s.remote_ip : s.out_host;
+        }
+        const bool asker_public = is_public_host(asker_ip);
+        const auto sample = book_.sample_good(std::min<std::size_t>(want, o_.addr_answer_max), [&](const rly::PeerRecord& r) {
+            if (rly::peer_key(r.host, r.port) == asker_key) return false;
+            rly::AddrEntry e;
+            if (!rly::addr_entry_of(r.host, r.port, r.last_seen, e)) return false;
+            return !asker_public || rly::addr_routable(e);
+        });
+        std::vector<rly::AddrEntry> v;
+        for (const rly::PeerRecord& r : sample) {
+            rly::AddrEntry e;
+            if (rly::addr_entry_of(r.host, r.port, r.last_seen, e)) v.push_back(e);
+        }
+        if (send_link(p, rly::encode_addr(chain_id_, v))) st_.addr_tx++;
+    }
+    void on_addr(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        std::uint32_t chain = 0;
+        std::vector<rly::AddrEntry> v;
+        if (!rly::decode_addr(f, chain, v)) {
+            st_.malformed++;
+            return;
+        }
+        if (chain != chain_id_) {
+            st_.wrong_chain++;
+            return;
+        }
+        std::string src_ip;
+        std::size_t budget = 0;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            const auto it = peers_.find(p);
+            if (it == peers_.end()) return;
+            PeerSt& s = it->second;
+            if (!s.addr_pending) {  // an FB_ADDR this node did not ask for: ignored
+                st_.addr_unsolicited++;
+                return;
+            }
+            s.addr_pending = false;
+            src_ip = s.out_host.empty() ? s.remote_ip : s.out_host;
+            budget = s.addr_learned >= o_.addr_learn_per_peer ? 0 : o_.addr_learn_per_peer - s.addr_learned;
+        }
+        st_.addr_rx++;
+        const bool src_public = is_public_host(src_ip);
+        const std::size_t take = std::min({v.size(), o_.addr_learn_per_answer, budget});
+        const std::uint64_t now = clock_.wall_s();
+        std::size_t learned = 0;
+        for (std::size_t i = 0; i < take; ++i) {
+            const rly::AddrEntry& e = v[i];
+            if (!dialable_v4(e) || (src_public && !rly::addr_routable(e))) {
+                st_.addr_ignored++;
+                continue;
+            }
+            if (book_.is_self(rly::addr_host(e), e.port)) {
+                st_.self_skipped++;
+                continue;
+            }
+            if (book_.learn(rly::addr_host(e), e.port, e.last_seen, now)) ++learned;
+        }
+        st_.addr_ignored += v.size() - take;
+        st_.addr_learned += learned;
+        std::lock_guard<std::mutex> lk(pmtx_);
+        const auto it = peers_.find(p);
+        if (it != peers_.end()) it->second.addr_learned += take;
+    }
+    // About once a second: retire used learned targets, dial candidates up to max_outbound, ask addresses again while
+    // below it, refresh the connected good peers, expire stale entries, save a dirty book.
+    void disc_tick() {
+        const std::uint64_t nowc = now_ms();
+        if (nowc - disc_tick_ms_ < 1000) return;
+        disc_tick_ms_ = nowc;
+        const std::uint64_t now = clock_.wall_s();
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            targets_.erase(std::remove_if(targets_.begin(), targets_.end(),
+                                          [](const Target& t) { return t.learned && t.used && t.pid == 0; }),
+                           targets_.end());
+        }
+        std::size_t out = 0;
+        std::vector<std::pair<std::string, std::uint16_t>> outs;
+        std::vector<std::uint64_t> reask;
+        {
+            std::lock_guard<std::mutex> lk(pmtx_);
+            for (const auto& [p, s] : peers_) {
+                if (s.hello_ok && s.out_host.empty() && !s.remote_ip.empty() && s.remote_listen != 0)
+                    outs.emplace_back(s.remote_ip, s.remote_listen);
+                if (s.out_host.empty()) continue;
+                ++out;
+                if (s.hello_ok) outs.emplace_back(s.out_host, s.out_port);
+            }
+            for (const auto& [p, s] : peers_)
+                if (s.hello_ok && nowc - s.getaddr_tx_ms >= o_.addr_reask_ms) reask.push_back(p);
+        }
+        std::set<std::string> skip = linked_keys();
+        for (const std::string& k : linked_node_keys()) skip.insert(k);
+        {
+            std::lock_guard<std::mutex> lk(tmtx_);
+            for (const Target& t : targets_) {
+                skip.insert(rly::peer_key(t.host, t.port));
+                if (t.learned && !t.used) ++out;
+            }
+        }
+        if (dialing_ && !partitioned_ && out < o_.max_outbound) {
+            const auto c = book_.dial_candidates(o_.max_outbound - out, now, skip);
+            std::lock_guard<std::mutex> lk(tmtx_);
+            for (const rly::PeerRecord& r : c) {
+                Target t;
+                t.host = r.host;
+                t.port = r.port;
+                t.learned = true;
+                targets_.push_back(t);
+                st_.disc_dialed++;
+            }
+        }
+        if (out < o_.max_outbound)
+            for (std::uint64_t p : reask) send_getaddr(p);
+        if (nowc - disc_slow_ms_ >= 60000) {
+            disc_slow_ms_ = nowc;
+            for (const auto& [h, pt] : outs) book_.mark_good(h, pt, now);
+            st_.disc_expired += book_.expire(now);
+        }
+        if (nowc - disc_saved_ms_ >= o_.book_save_ms) {
+            disc_saved_ms_ = nowc;
+            save_book(false);
+        }
+    }
+
+    // ---- Monero contexts (FB_GETCTX / FB_CTX) ----
+    void serve_getctx(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        std::uint32_t chain = 0;
+        std::vector<Hash32> ids;
+        std::string why;
+        if (!rly::decode_getctx(f, chain, ids, &why)) {
+            st_.malformed++;
+            token(p, FrameToken::Strike);
+            return;
+        }
+        if (chain != chain_id_) {
+            st_.wrong_chain++;
+            return;
+        }
+        std::vector<std::uint8_t> blob;
+        for (const Hash32& id : ids) {
+            blob.clear();
+            const std::size_t cap = ctx_frame_cap();
+            const bool have = ctx_.block_blob && ctx_.block_blob(id, blob) && !blob.empty() && blob.size() <= cap;
+            if (!have) blob.clear();
+            const std::vector<std::uint8_t> r = rly::encode_ctx(chain_id_, id, blob, cap);
+            if (r.empty() || !send_link(p, r)) continue;
+            if (have)
+                st_.ctx_served++;
+            else
+                st_.ctx_unknown_tx++;
+        }
+    }
+    void on_ctx(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+        std::uint32_t chain = 0;
+        Hash32 id{};
+        std::vector<std::uint8_t> blob;
+        std::string why;
+        const std::size_t cap = ctx_frame_cap();
+        if (f.size() >= rly::kCtxHeader && f[0] == rly::FB_CTX && rly::le::get32(f.data() + 38) > cap &&
+            f.size() == rly::kCtxHeader + rly::le::get32(f.data() + 38)) {
+            st_.ctx_over_cap++;  // P-13: a well-formed frame of a block over the cap is dropped (no token)
+            return;
+        }
+        if (!rly::decode_ctx(f, chain, id, blob, cap, &why)) {
+            st_.malformed++;
+            token(p, FrameToken::Strike);
+            return;
+        }
+        if (chain != chain_id_) {
+            st_.wrong_chain++;
+            return;
+        }
+        st_.ctx_rx++;
+        (void)offer_ctx(id, blob, p);
+    }
+    // P-13 for an FB_CTX frame read or served: max(the policy, blob_cap_ctx at the node's view), never below
+    // blob_cap_ctx(16, zone(16)) (a view that answers 0, or none).
+    std::size_t ctx_frame_cap() const {
+        const std::uint64_t floor = blob_cap_ctx(kHf16, zone(kHf16)).value_or(0);
+        const std::uint64_t view = ctx_.view_cap ? ctx_.view_cap() : 0;
+        return static_cast<std::size_t>(std::max({view, floor, o_.ctx_block_cap}));
+    }
+    std::uint32_t ctx_bound_of(CtxClass c) const noexcept {
+        return c == CtxClass::Receipt ? o_.ctx_max_depth : o_.ctx_join_depth;
+    }
+    std::size_t ctx_cap_of(CtxClass c) const noexcept {
+        return c == CtxClass::Receipt ? o_.ctx_want_max : static_cast<std::size_t>(o_.ctx_join_depth);
+    }
+    // A want of class `cls`: counted in its own class only. A held want is raised to a higher class (and its bound)
+    // within that class's cap; a new want past its class's cap is held as a receipt's (P-06) within that cap.
+    void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, CtxClass cls) {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        std::array<std::size_t, 3> n{};
+        for (const auto& kv : ctx_want_) ++n[static_cast<std::size_t>(kv.second.cls)];
+        const auto ci = static_cast<std::size_t>(cls);
+        const auto it = ctx_want_.find(id);
+        if (it != ctx_want_.end()) {
+            if (it->second.from == 0 && from != 0) it->second.from = from;
+            if (cls > it->second.cls && n[ci] < ctx_cap_of(cls)) {
+                it->second.cls = cls;
+                it->second.bound = ctx_bound_of(cls);
+            }
+            return;
+        }
+        if (cls != CtxClass::Receipt && n[ci] >= ctx_cap_of(cls)) cls = CtxClass::Receipt;  // past its class's cap
+        const std::uint32_t bound = ctx_bound_of(cls);
+        if (depth >= bound) return;
+        if (cls == CtxClass::Receipt && n[0] >= ctx_cap_of(CtxClass::Receipt)) return;
+        CtxWant w;
+        w.from = from;
+        w.depth = depth;
+        w.bound = bound;
+        w.cls = cls;
+        w.since_ms = now_ms();
+        ctx_want_.emplace(id, std::move(w));
+        st_.ctx_wanted++;
+    }
+    bool ctx_resolved(const Hash32& id) const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return std::find(ctx_done_.begin(), ctx_done_.end(), id) != ctx_done_.end();
+    }
+    // A block blob for a wanted id, from a peer or this node's own source (from 0): verified, its work judged, then
+    // fed to the follower. True: resolved.
+    bool offer_ctx(const Hash32& id, const std::vector<std::uint8_t>& blob, std::uint64_t from) {
+        if (from != 0 && !ctx_.chain && !blob.empty()) {  // nothing to judge a peer's block against
+            st_.ctx_unchecked++;
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(cmtx_);
+            const auto it = ctx_want_.find(id);
+            if (it == ctx_want_.end() || it->second.have_proof) return false;
+            if (blob.empty()) {
+                if (from != 0) {
+                    st_.ctx_unknown_rx++;
+                    it->second.last_ask_ms = 0;  // "unknown here": the next peer is asked now
+                }
+                return false;
+            }
+        }
+        rly::BlockCtx bc;
+        std::string why;
+        if (!rly::verify_block_ctx(id, blob, bc, &why)) {
+            st_.ctx_bad++;
+            log("relay: context " + hex_short(id) + " from peer " + std::to_string(from) + " REJECTED: " + why);
+            if (from != 0) token(from, FrameToken::Strike);
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(cmtx_);
+            const auto it = ctx_want_.find(id);
+            if (it == ctx_want_.end()) return false;
+            it->second.have_proof = true;
+            it->second.proof = bc;
+            it->second.blob = blob;
+            it->second.proof_from = from;
+        }
+        return judge_ctx(id);
+    }
+    // The work behind a held proof (the node's own chain index); usable: accepted; forged: its sender banned; not
+    // judgeable now: kept (its parent wanted while within ctx_max_depth).
+    bool judge_ctx(Hash32 id) {
+        for (std::size_t guard = 0; guard < o_.ctx_want_max + 2 * std::size_t{o_.ctx_join_depth}; ++guard) {
+            CtxWant w;
+            {
+                std::lock_guard<std::mutex> lk(cmtx_);
+                const auto it = ctx_want_.find(id);
+                if (it == ctx_want_.end() || !it->second.have_proof) return false;
+                w = it->second;
+            }
+            rly::CtxPowVerdict v;
+            if (ctx_.chain) {
+                try {
+                    v = rly::judge_block_ctx(
+                            w.proof, ctx_.chain,
+                            [this](const Hash32& b) -> std::optional<rly::CtxPowRec> {
+                                std::lock_guard<std::mutex> lk(cmtx_);
+                                const auto it = ctx_pow_.find(b);
+                                if (it == ctx_pow_.end()) return std::nullopt;
+                                return it->second;
+                            },
+                            w.bound, ctx_.rx, o_.ctx_block_cap);
+                } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
+                    rx_alarm("context " + hex_short(id));
+                    return false;
+                }
+            } else {
+                v.kind = rly::CtxPow::Indexed;  // this node's own source, with no index wired
+            }
+            if (v.kind == rly::CtxPow::Forged) {
+                st_.ctx_forged++;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    ctx_want_.erase(id);
+                }
+                log("relay: context " + hex_short(id) + " FORGED (" + v.why + ")");
+                if (w.proof_from != 0) ban(w.proof_from);
+                return false;
+            }
+            if (v.kind == rly::CtxPow::OverCap) {  // P-13: dropped before hashing; no token; another peer may serve it
+                st_.ctx_over_cap++;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    const auto it = ctx_want_.find(id);
+                    if (it != ctx_want_.end()) {
+                        it->second.have_proof = false;
+                        it->second.proof = rly::BlockCtx{};
+                        it->second.blob.clear();
+                        it->second.last_ask_ms = 0;
+                    }
+                }
+                log("relay: context " + hex_short(id) + " DROPPED (" + v.why + ")");
+                return false;
+            }
+            if (v.kind == rly::CtxPow::Defer) {
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    const auto it = ctx_want_.find(id);
+                    if (it != ctx_want_.end() && !it->second.defer_noted) {
+                        it->second.defer_noted = true;
+                        first = true;
+                    }
+                }
+                if (first) st_.ctx_deferred++;
+                const bool parent_known = ctx_.chain && ctx_.chain.verified(w.proof.parent);
+                bool parent_pow = false;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    parent_pow = ctx_pow_.count(w.proof.parent) != 0;
+                }
+                if (!parent_known && !parent_pow && w.depth + 1 < w.bound)
+                    want_ctx(w.proof.parent, w.proof_from != 0 ? w.proof_from : w.from, w.depth + 1, w.cls);
+                return false;
+            }
+            if (v.kind == rly::CtxPow::Accept) {
+                std::lock_guard<std::mutex> lk(cmtx_);
+                if (ctx_pow_.emplace(id, rly::CtxPowRec{w.proof.parent, v.step}).second) {
+                    ctx_pow_order_.push_back(id);
+                    while (ctx_pow_order_.size() > kCtxPowKeep) {
+                        ctx_pow_.erase(ctx_pow_order_.front());
+                        ctx_pow_order_.pop_front();
+                    }
+                }
+            }
+            if (ctx_.accept) {
+                const NodeGuard g(*this);
+                ctx_.accept(w.proof, w.blob);
+            }
+            st_.ctx_resolved++;
+            Hash32 child{};
+            bool has_child = false;
+            {
+                std::lock_guard<std::mutex> lk(cmtx_);
+                ctx_want_.erase(id);
+                ctx_done_.push_back(id);
+                while (ctx_done_.size() > o_.ctx_want_max + 2 * std::size_t{o_.ctx_join_depth}) ctx_done_.pop_front();
+                for (const auto& [cid, cw] : ctx_want_)
+                    if (cw.have_proof && cw.proof.parent == id) {
+                        child = cid;
+                        has_child = true;
+                        break;
+                    }
+            }
+            ccv_.notify_all();
+            rerun_parked(std::vector<Missing>{Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights,
+                                              Missing::Seed});
+            if (!has_child) return true;
+            id = child;
+        }
+        return false;
+    }
+    // Maintenance: own source first, then the sender, then every other ready peer, each once per round (bounded
+    // rounds); a kept proof judged again at the ask pace.
+    void drive_ctx() {
+        const std::vector<std::uint64_t> ready = ready_peers();
+        const std::uint64_t now = now_ms();
+        std::map<std::uint64_t, std::vector<Hash32>> ask;
+        std::vector<Hash32> retry, local;
+        {
+            std::lock_guard<std::mutex> lk(cmtx_);
+            for (auto it = ctx_want_.begin(); it != ctx_want_.end();) {
+                CtxWant& w = it->second;
+                if (now - w.since_ms > kCtxTtlMs) {
+                    st_.ctx_gave_up++;
+                    it = ctx_want_.erase(it);
+                    continue;
+                }
+                if (w.have_proof) {
+                    if (now - w.last_ask_ms >= o_.ctx_retry_ms) {
+                        w.last_ask_ms = now;
+                        retry.push_back(it->first);
+                    }
+                    ++it;
+                    continue;
+                }
+                if (ctx_.block_blob && (w.local_ms == 0 || now - w.local_ms >= kCtxLocalMs)) {
+                    w.local_ms = now;
+                    local.push_back(it->first);
+                }
+                if (w.last_ask_ms != 0 && now - w.last_ask_ms < o_.ctx_retry_ms) {
+                    ++it;
+                    continue;
+                }
+                if (!ctx_.chain) {  // nothing to check a peer's block against: own sources only
+                    ++it;
+                    continue;
+                }
+                std::uint64_t pick = 0;
+                if (w.from != 0 && w.asked.count(w.from) == 0 && std::find(ready.begin(), ready.end(), w.from) != ready.end())
+                    pick = w.from;
+                for (std::uint64_t q : ready)
+                    if (pick == 0 && w.asked.count(q) == 0) pick = q;
+                if (pick == 0) {
+                    if (!ready.empty() && !w.asked.empty()) {
+                        w.asked.clear();
+                        ++w.rounds;
+                        w.last_ask_ms = now;
+                    }
+                    if (w.rounds >= o_.ctx_max_rounds) {
+                        st_.ctx_gave_up++;
+                        it = ctx_want_.erase(it);
+                        continue;
+                    }
+                    ++it;
+                    continue;
+                }
+                std::vector<Hash32>& v = ask[pick];
+                if (v.size() >= rly::kCtxMaxIds) {
+                    ++it;
+                    continue;
+                }
+                v.push_back(it->first);
+                w.asked.insert(pick);
+                w.last_ask_ms = now;
+                ++it;
+            }
+        }
+        for (const Hash32& id : local) {
+            std::vector<std::uint8_t> blob;
+            if (ctx_.block_blob(id, blob) && !blob.empty()) (void)offer_ctx(id, blob, 0);
+        }
+        for (const auto& [p, ids] : ask) {
+            const std::vector<std::uint8_t> f = rly::encode_getctx(chain_id_, ids);
+            if (!f.empty() && send_link(p, f)) st_.ctx_asked += ids.size();
+        }
+        for (const Hash32& id : retry) (void)judge_ctx(id);
+    }
+    // PathbNodeIo::fetch_context (a join attempt's Monero context): the block from this node's own source or any
+    // peer within timeout_s.
+    bool fetch_context(const Hash32& id, std::uint64_t timeout_s) {
+        const JoinRelease rel(*this);
+        const std::uint64_t deadline = now_ms() + timeout_s * 1000;
+        if (ctx_.block_blob) {
+            std::vector<std::uint8_t> blob;
+            want_ctx(id, 0, 0, CtxClass::Join);
+            if (ctx_.block_blob(id, blob) && !blob.empty() && offer_ctx(id, blob, 0)) return true;
+        }
+        want_ctx(id, 0, 0, CtxClass::Join);
+        drive_ctx();
+        if (!o_.threads) {
+            while (!ctx_resolved(id) && now_ms() < deadline && drive_ && drive_()) {
+            }
+            return ctx_resolved(id);
+        }
+        std::unique_lock<std::mutex> lk(ccv_m_);
+        while (running_ && now_ms() < deadline) {
+            if (ctx_resolved(id)) return true;
+            ccv_.wait_for(lk, std::chrono::milliseconds(std::min<std::uint64_t>(deadline - now_ms(), o_.ctx_retry_ms)));
+            lk.unlock();
+            drive_ctx();
+            lk.lock();
+        }
+        return ctx_resolved(id);
+    }
+
+    // ---- members ----
+    struct NetDrop {
+        std::uint64_t peer = 0;
+        std::uint64_t src = 0;
+        bool ban = false;
+    };
+
+    PathbRelayOptions o_;
+    RelayLinks& links_;
+    RelayClock clock_;
+    LogFn log_;
+    PathbNode* node_ = nullptr;
+    PathbCtxSource ctx_;
+    std::function<bool()> drive_;
+    std::uint64_t nonce_ = 0;
+    std::set<std::string> self_keys_;
+    PathbRelayStats st_;
+    RelayBudget budget_;
+
+    // the node's values (attach)
+    std::uint32_t chain_id_ = 0;
+    LaneParams p_ = kRuledLaneParams;
+    RelayBuffers buffers_{};
+    std::uint64_t headers_frame_ = 0;
+    std::uint64_t bucket_frame_ = 0;
+    std::uint64_t abandon_s_ = kAbandonTimeoutDefault;
+    std::uint16_t header_max_ = 1;
+
+    RelayNodeLock lock_;  // the node lock
+    // owned by the node lock
+    std::map<Missing, std::set<Hash32>> parked_by_cause_;
+    std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by key: (seq, job and asks)
+    std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
+    std::uint64_t parked_receipt_seq_ = 0;
+    std::map<std::uint64_t, Hash32> receipt_due_;  // parked receipts whose cause resolved, by seq: run again with room
+    bool bucket_stalled_ = false;
+    bool reask_due_ = false;
+
+    std::mutex rmtx_;  // re-offer cursors
+    std::map<std::uint64_t, std::deque<Hash32>> reoffer_;
+    std::map<std::uint64_t, std::uint64_t> reoffer_t0_;  // a re-offer's start (ms), by peer
+    std::set<std::uint64_t> pumping_;  // the peers whose re-offer a thread is pumping
+    std::atomic<std::uint64_t> rx_ok_{0};    // RandomX hashes computed (node and context)
+    std::atomic<std::uint64_t> rx_mark_{0};  // rx_ok_ at the last RandomX failure
+    std::atomic<bool> rx_failing_{false};    // a RandomX failure since the last hash computed
+    mutable std::mutex emtx_;  // events
+    std::condition_variable ecv_;
+    std::condition_variable fcv_;      // a reader waiting for its peer's event in flight
+    std::set<std::uint64_t> inflight_;  // peers with a posted event in flight (emtx_)
+    std::deque<std::function<void()>> events_;
+
+    mutable std::mutex vmtx_;  // verify queue, parked list, the budget, the strikes
+    std::condition_variable vcv_;
+    std::deque<Job> vq_;
+    std::deque<Job> parked_;
+    ::c2pool::xmr::CarrierDosBudget dos_;
+    std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
+    std::map<std::uint64_t, ValidBucket> valid_;  // P-15 (vmtx_)
+    ClaimAlarmBudget claim_budget_{kRuledLaneParams};  // P-50 (vmtx_)
+    double valid_rate_ = 0;
+    double valid_cap_ = 0;
+    double solicited_ = 0;          // P-21 credits
+    std::uint64_t solicited_ms_ = 0;
+
+    mutable std::mutex pmtx_;  // peers
+    std::map<std::uint64_t, PeerSt> peers_;
+    std::set<std::uint64_t> up_done_;
+    std::condition_variable upcv_;
+    std::map<std::string, std::uint64_t> addr_nonce_;
+
+    mutable std::mutex tmtx_;  // dial targets, deferred drops
+    std::vector<Target> targets_;
+    std::vector<NetDrop> to_drop_;
+
+    mutable std::mutex kmtx_;  // tickets
+    std::condition_variable kcv_;
+    std::map<std::uint64_t, Ticket> tickets_;
+    std::map<std::uint64_t, std::deque<HdrWait>> hdr_fifo_;
+    std::map<std::uint64_t, std::set<Hash32>> asked_carriers_;  // ids of the node's own FC_GETCARRIER, per peer
+    std::map<std::uint64_t, std::set<Hash32>> bodyset_asked_;   // walked carriers whose body set is asked, per peer
+    std::uint64_t next_ticket_ = 0;
+    JoinPort port_;
+
+    mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
+    std::map<std::uint64_t, Catchup> catchup_;
+    std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
+    std::map<std::uint64_t, std::pair<Hash32, Hash32>> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop)
+
+    mutable std::mutex cmtx_;  // contexts
+    std::map<Hash32, CtxWant> ctx_want_;
+    std::deque<Hash32> ctx_done_;
+    std::map<Hash32, rly::CtxPowRec> ctx_pow_;
+    std::deque<Hash32> ctx_pow_order_;
+    std::mutex ccv_m_;
+    std::condition_variable ccv_;
+
+    std::mutex jmtx_;  // the join worker
+    std::condition_variable jcv_;
+    bool join_due_ = false;
+    std::atomic<std::uint64_t> join_not_before_ms_{0};
+
+    std::mutex mmtx_;  // the maintenance thread
+    std::condition_variable mcv_;
+    bool maint_wake_ = false;
+
+    rly::PeerBook book_;
+    std::string dial_host_;  // the address being dialed (the maintenance thread)
+    std::uint16_t dial_port_ = 0;
+    std::uint64_t disc_tick_ms_ = 0;
+    std::uint64_t disc_slow_ms_ = 0;
+    std::uint64_t disc_saved_ms_ = 0;
+    std::uint64_t live_tick_ms_ = 0;
+    std::atomic<std::uint64_t> ping_nonce_{0};
+    std::atomic<bool> dialing_{true};
+    std::atomic<bool> partitioned_{false};
+    std::atomic<std::uint64_t> partition_until_ms_{0};
+
+    std::atomic<bool> running_{false};
+    std::thread owner_;
+    std::vector<std::thread> verify_;
+    std::thread join_;
+    std::thread maint_;
+
+    static inline thread_local const PathbRelayNode* t_node_held = nullptr;  // the relay whose node lock this thread holds
+    static inline thread_local const PathbRelayNode* t_join_relay = nullptr;     // the join worker's relay
+    static inline thread_local const PathbRelayNode* t_dialing_relay = nullptr;  // the relay dialing on this thread
+};
+
+}  // namespace c2pool::xmr::pathb

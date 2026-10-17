@@ -130,9 +130,7 @@ struct NativeChainSource {
     }
 };
 
-// Lowercase hex of a Monero block id, in the spelling the OwedLedger keys on
-// (the same one xmr_node.hpp's hex_of produces; repeated here so this header
-// does not have to pull the engine in to format 32 bytes).
+// Lowercase hex of a Monero block id (64 characters).
 inline std::string chain_id_hex(const ::c2pool::xmr::node::Hash& h) {
     static const char* k = "0123456789abcdef";
     std::string s;

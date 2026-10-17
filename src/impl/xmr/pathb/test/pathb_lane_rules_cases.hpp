@@ -157,6 +157,16 @@ inline int run() {
         blk[1] ^= 1;
         check(pb::decode_rules_block(blk).error != pb::LaneRulesError::None, "a wrong rules_len is refused");
     }
+    // peers at the same epoch_cur: their TLVs compared (a differing K is refused), equal TLVs accepted
+    {
+        pb::PathbLaneRules other = base;
+        other.d_min = 1;
+        const pb::LaneRulesCompare same = pb::hello_rules_compare(1, ours, 1, pb::rules_block(base));
+        const pb::LaneRulesCompare diff = pb::hello_rules_compare(1, ours, 1, pb::rules_block(other));
+        check(same.verdict == pb::LaneRulesVerdict::Equal && diff.verdict == pb::LaneRulesVerdict::Mismatch &&
+                      diff.text.rfind(std::string(pb::kLaneRulesMismatchText), 0) == 0,
+              "peers at the same epoch_cur: equal TLVs accepted, a differing K refused (" + diff.text.substr(0, 40) + ")");
+    }
     // peers at another epoch_cur are accepted, their TLVs not compared
     {
         pb::PathbLaneRules other = base;

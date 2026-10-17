@@ -14,8 +14,6 @@
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -33,22 +31,6 @@ pb::Hash32 id_of(std::uint8_t a) {
     pb::Hash32 h{};
     h.fill(a);
     return h;
-}
-
-std::string read_file(const std::string& path) {
-    std::ifstream f(path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-// the quoted value of `name[] = "..."` in a source text
-std::string quoted(const std::string& text, const std::string& name) {
-    const std::size_t at = text.find(name + "[]");
-    if (at == std::string::npos) return {};
-    const std::size_t q0 = text.find('"', at);
-    const std::size_t q1 = text.find('"', q0 + 1);
-    return text.substr(q0 + 1, q1 - q0 - 1);
 }
 
 }  // namespace
@@ -105,9 +87,19 @@ int main() {
                            "7fa3b4863ab50ab27505ca97b483169dfa1f65177e3de563de6eaa2e51938623",
                            "315230ba6c46179c1f0b1ded16329ff3f5da7a30a7804fb16ff9a46de21cd9d6",
                            "257bc98f17b786625362a8e56819ca1b4ce7e5c06cfa038ce015dfa97978a618"};
-    const char* suffix[4] = {"", "Testnet", "Stagenet", "Regtest"};
-    const std::string fee_model = read_file(std::string(C2POOL_SRC_DIR) + "/c2pool/v37/xmr/xmr_fee_model.hpp");
-    check(!fee_model.empty(), "master's xmr_fee_model.hpp read");
+    // master's donation keys per network as author_ref (kind 0x10 | len 64 | spend | view, 66 B)
+    const char* ref66[4] = {"1040"
+                            "14d413e6ccb14f0ba30999b97c8912a07321d893789b7f149810b7885b2cd7c7"
+                            "b3157741ab68969aeb7fe9ebd4fa3ec5ce4dcdc7b43249fdb40311cb03779e03",
+                            "1040"
+                            "a7731abbe9bb2cf3264395231a8645172ffd7f08c6097e3402197f3f1c6ffcbb"
+                            "ef3c9a659a67c3bf081a352e7cfbfb94cc5e11921a3e8953223fca1ed14e2200",
+                            "1040"
+                            "7f095705904be1df109bdf44b0027c339fde3ece7d85069f8bdfb19fd8c16c41"
+                            "0abca326ba53a6f5387785822296c1d15df03e6c51cd44d7dbe270667b5fe34c",
+                            "1040"
+                            "3091e80a51918c67eb67b6fefaf77e374dd898240953bbb75d47b82b8615c638"
+                            "c5d453f0d54332e4f48f12abab2551132f00037f0c51892ebe3b41928ab5bec1"};
     for (int i = 0; i < 4; ++i) {
         const pb::LaneNet n = pb::kLaneNets[i];
         const pb::XmrKeyRef r = pb::author_ref(n);
@@ -118,8 +110,9 @@ int main() {
         std::copy(r.view.begin(), r.view.end(), A.begin());
         const ::v37::bytes32 master_id = ::v37::xmr::xmr_identity_key(::v37::xmr::make_xmr_std(B, A));
         check(std::equal(master_id.begin(), master_id.end(), idn.begin()), "identity == xmr_identity_key(make_xmr_std(B, A))");
-        const std::string spend = quoted(fee_model, std::string("kDonationSpendHex") + suffix[i]);
-        const std::string view = quoted(fee_model, std::string("kDonationViewHex") + suffix[i]);
+        const std::string ref = ref66[i];
+        const std::string spend = ref.substr(4, 64);
+        const std::string view = ref.substr(68, 64);
         check(hex(r.spend.data(), 32) == spend && hex(r.view.data(), 32) == view && !spend.empty(),
               std::string("author_ref equals master's donation keys byte for byte: ") + std::string(pb::lane_net_name(n)));
         // K16 on the TLV: give_author_bp | 0x10 | 0x40 | spend | view (put_key_ref; the TLV golden holds these bytes)

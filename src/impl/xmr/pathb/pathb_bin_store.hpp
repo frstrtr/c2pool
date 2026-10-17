@@ -66,6 +66,8 @@
 //                   read of a dropped bin is MissingEntries / MissingBucket
 //                   (DEFER), never an empty bin. restore_bucket takes a served
 //                   body back when it hashes to the held leaf.
+//                   drop_records_below(x): the best chain's ids and records
+//                   below x go (P-51; at most the view horizon and L - J - J_0).
 //
 // Lane records (node-local; a different layout forks nothing). Kinds proposed
 // for the store census (registered by S4): K_BMMR 11, K_BLEAF 12, K_BLHASH 13.
@@ -668,6 +670,10 @@ public:
         std::vector<Hash32> peaks0;              // at lc0
         std::vector<SealedBin> sealed;           // leaves lc0 .. lc(H(root)) - 1, in order
         std::vector<Placement> placements;
+        // a joined store: H(x0 - 1) + Fresh and the served buckets of the bins at or below it sealed above the root
+        // (the lane records hold them), so the replay seals them as the join did
+        std::optional<std::uint64_t> adopt_bound;
+        std::vector<SealedBin> served;
     };
     static std::optional<BinStore> restored(const LaneParams& p, std::uint64_t journal_depth, RestoredStart r,
                                             std::uint32_t chain = 0) {
@@ -696,6 +702,13 @@ public:
         s.chain_ = r.ids;
         for (std::size_t i = 0; i < r.ids.size(); ++i) s.chain_pos_[r.ids[i]] = r.first_pos + i;
         s.mmr_ = std::move(*m);
+        s.adopt_bound_ = r.adopt_bound;
+        for (const SealedBin& sb : r.served) {
+            if (!r.adopt_bound || sb.bucket.bin_lo > *r.adopt_bound || !bucket_consistent(sb.bucket)
+                || mmr_leaf_of(sb.bucket) != sb.leaf)
+                return std::nullopt;
+            s.served_.emplace(sb.bucket.bin_lo, sb);
+        }
         for (Placement& x : r.placements) {
             if (x.q < r.first_pos || x.q > root_pos || x.bin < r.b0) return std::nullopt;
             s.placed_q_[x.id] = PlacedAt{x.bin, x.q};
@@ -1092,6 +1105,36 @@ public:
     void apply_retention(const LaneRetention& r) {
         if (r.entry_keep_from > b0_) prune_entries(r.entry_keep_from);
         if (r.bucket_keep_from > b0_) prune_buckets(r.bucket_keep_from);
+    }
+
+    // Drops the best chain's ids and records below position `pos`, clamped to
+    // the view horizon base_pos - J_0 and to L - J - J_0 (the record
+    // entry_floor_limit reads); a delta below it (the old root's) goes, and
+    // the root position moves up to it. The MMR, its leaves and buckets, and
+    // the placements stay. Returns the first record position.
+    std::uint64_t drop_records_below(std::uint64_t pos) {
+        const std::uint64_t base = base_pos();
+        const std::uint64_t horizon = base > j0_ ? base - j0_ : 0;
+        const std::uint64_t back = j_ > UINT64_MAX - j0_ ? UINT64_MAX : j_ + j0_;
+        const std::uint64_t at = tip_pos() > back ? tip_pos() - back : 0;
+        const std::uint64_t to = std::min({pos, horizon, at});
+        if (to <= off_) return off_;
+        const std::size_t n = static_cast<std::size_t>(to - off_);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto it = chain_pos_.find(chain_[i]);
+            if (it != chain_pos_.end() && it->second == off_ + i) chain_pos_.erase(it);
+        }
+        chain_.erase(chain_.begin(), chain_.begin() + static_cast<std::ptrdiff_t>(n));
+        records_.erase(records_.begin(), records_.begin() + static_cast<std::ptrdiff_t>(n));
+        for (auto it = journal_.begin(); it != journal_.end();) {
+            if (it->second.pos < to)
+                it = journal_.erase(it);
+            else
+                ++it;
+        }
+        off_ = to;
+        root_pos_ = std::max(root_pos_, to);
+        return off_;
     }
 
     // A served body of a best-chain sealed bin whose body is not held: taken

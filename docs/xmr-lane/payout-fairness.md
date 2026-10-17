@@ -1,5 +1,11 @@
 # XMR lane — payout rules, fees and known fairness limits
 
+> Removed at the S4w flag day: this page describes the old payout path (the
+> owed ledger, the lane coinbase recompute, the settlement knobs). `c2pool-v37-xmr`
+> runs Path B and refuses the old path's flags ("removed at the S4w flag day").
+> The pages it names under `docs/xmr-lane/` that describe that path were removed
+> with it.
+
 Status: disclosure of record for the v37 XMR lane, written in response to the
 external review "Fairness gaps in the c2pool payout ledger" (2026-09-19,
 https://gist.github.com/SChernykh/636eca0b73181277ea85401b6b1e24ba) and the
@@ -7,8 +13,8 @@ issues it opened (#1860 to #1869). It states what the code on `master` does
 since #1884 (every node recomputes the lane coinbase). Where an older paper or
 design note says otherwise, the code is the rule. The lane pays by Work
 Receipt Settlement (WRS), also called pay-per-receipt (PPR). The design
-records behind this page are [`coinbase-recompute.md`](coinbase-recompute.md)
-and [`payout-threshold.md`](payout-threshold.md); the review is answered
+records behind this page are `coinbase-recompute.md`
+and `payout-threshold.md`; the review is answered
 finding by finding in [`review-criticals.md`](review-criticals.md).
 
 ## 1. Who gets paid, in what order
@@ -91,7 +97,7 @@ found block for itself and still be credited for its shares.
 
 **The builder.** A template for height T is built only when the builder's
 finalize cursor stands at T - 1 - D_conf, the state every receiver recomputes
-from (the booking-point gate, [`coinbase-recompute.md`](coinbase-recompute.md)
+from (the booking-point gate, `coinbase-recompute.md`
 §5). This removes the honest case in which two consecutive blocks pay one
 balance twice (#1861, closed by #1884).
 
@@ -121,10 +127,10 @@ floor (`fee_per_byte_at_floor`) times the weight of one ring-16 CLSAG input
 (`kInputWeight`, 659), rounded up to Monero's fee quantization (`spend_floor`,
 `src/impl/xmr/settle/xmr_coinbase.cpp`). Every node computes it from the
 block's own total. At a reward of 0.6 XMR, c is about 0.0000125 XMR
-([`payout-threshold.md`](payout-threshold.md) §2).
+(`payout-threshold.md` §2).
 
 **The drain rule** (operator rulings 2026-10-02,
-[`settlement-drain.md`](settlement-drain.md)). Old balances are paid only out
+`settlement-drain.md`). Old balances are paid only out
 of a bounded slice of the block, `Delta = min(F, R × min(dh, 64) / 256)`:
 F is the sum of every positive balance in the ledger, dh the Monero heights
 since this pool's previous lane block (ledger state, `V37Z`). That is R/256
@@ -135,7 +141,7 @@ canonical block creates no new balance and the float falls to 0. With no old
 balance the block is master's, byte for byte. The three numbers (Q = 16,
 H_cap = 64, rule version 1) are lane rules 23-25: a node with other values is
 refused at HELLO and sees our lane blocks as ordinary blocks
-([`lane-rules.md`](lane-rules.md)).
+(`lane-rules.md`).
 
 **Owed pass.** Balances are paid oldest first, by `first_eligible` ascending
 (K_fair). Equal ages are the normal case. They are ordered by
@@ -215,7 +221,7 @@ which was the gap described in #1865.
 On the XMR lane a balance arises only when a block cannot pay a credit in
 full: a short pool, or a payee without a slot. In steady state every block
 pays out what it credits and the owed queue is empty
-([`payout-threshold.md`](payout-threshold.md) §3).
+(`payout-threshold.md` §3).
 
 **No negative balances from honest blocks.** The owed pass never takes more
 than a key's EffectiveOwed, pay-now never pays more than E_b, and a dust
@@ -259,7 +265,7 @@ node that never saw the raindrop rebuilds the same coinbase. The earlier due
 path (V37U, `drops_due`) is still switched on but carries nothing under the
 window rule. All three are part of `owed_digest`, and a peer with another
 rule set is refused at HELLO (`DROPS_RULE_MISMATCH`). Details: the due and
-the registry in [`coinbase-recompute.md`](coinbase-recompute.md) §6, the
+the registry in `coinbase-recompute.md` §6, the
 window in the comments of `OwedLedgerRules` (`w4_settlement.hpp`), and the
 paper's §8 (`src/sharechain/v37/PURPLE-PAPER.md`).
 
@@ -346,7 +352,7 @@ mainnet these settings are pinned, and the node refuses to start otherwise
   operator's flag day, 16 / 64 / 1 on the test networks.
 
 The fee model is part of the relay handshake, and so is the DROPS rule set.
-Since the lane-rules list ([`lane-rules.md`](lane-rules.md)) every other
+Since the lane-rules list (`lane-rules.md`) every other
 setting above, the drain rule's three included, is in the HELLO and in the
 pool_tag: a node with another value is refused by name and books our lane
 blocks as ordinary blocks, never debit-only. `--give-author-pct` and `--node-owner-fee-pct` may differ between
@@ -370,7 +376,7 @@ changes a job's payee.
   than D_conf = 60 blocks) is a priced loss: the amount is recorded and
   surfaced, never re-owed. The loss falls on the payees of that block. Nodes
   that followed different chains through such a reorg also keep different
-  ledgers ([`finality-boundary.md`](finality-boundary.md)).
+  ledgers (`finality-boundary.md`).
 - **Late receipts.** A receipt more than 30 bins (about one hour) behind the
   highest bin already in the lane order is dropped and not credited
   (`kLateTailBins`, `src/c2pool/v37/xmr/relay/xmr_order_rule.hpp`). This bound
@@ -384,7 +390,7 @@ changes a job's payee.
   unit KATs.
 - **Repair answers.** A relayed receipt that this node could not decide, but
   admitted as part of a winner's lane repair, is trusted on the winner's
-  word ([`coinbase-recompute.md`](coinbase-recompute.md) §6).
+  word (`coinbase-recompute.md` §6).
 - **Test flakes.** #1885, #1889 and #1890 are timing-sensitive relay tests.
   They do not touch the payout rules.
 - **Merged mining.** The V36 merged-mining path has no V37 counterpart: there
@@ -400,6 +406,6 @@ changes a job's payee.
   cadence, at most 25 % of one block); after that, nothing. A lane that finds
   a block less often than every 64 Monero heights drains in more days: at
   P2Pool-mini cadence 1.2 XMR takes about 1.4 days, at nano cadence about 16
-  days ([`settlement-drain.md`](settlement-drain.md)). In an overflowing pool
+  days (`settlement-drain.md`). In an overflowing pool
   the sub-c waiters lose their share of those blocks to the admitted payees
   (P2Pool's rule, ruling R4).

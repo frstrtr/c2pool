@@ -91,29 +91,14 @@ scopes:
     extensions: [.hpp, .cpp, .h, .c, .cc, .ipp, .inc, .py, .cmake, .txt]
   xmr_consensus_core:
     include:
-      - src/impl/xmr/receipt/**
-      - src/impl/xmr/settle/**
+      - src/impl/xmr/pathb/**
       - src/impl/xmr/native/consensus/**
       - src/impl/xmr/pow/randomx_verify.hpp
-      - src/c2pool/v37/xmr/relay/xmr_order_rule.hpp
-      - src/c2pool/v37/xmr/relay/xmr_share_verdict.hpp
-      - src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp
-      - src/c2pool/v37/xmr/relay/xmr_rbind_registry.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules.hpp
-      - src/c2pool/v37/xmr/xmr_lane_rules_build.hpp
-      - src/c2pool/v37/xmr/xmr_credit_cut.hpp
-      - src/c2pool/v37/xmr/xmr_cut_payees.hpp
-      - src/c2pool/v37/xmr/xmr_coinbase_authority.hpp
-      - src/c2pool/v37/xmr/xmr_coinbase_recompute.hpp
-      - src/c2pool/v37/xmr/xmr_settlement_coinbase_shape.hpp
-      - src/c2pool/v37/xmr/xmr_paynow.hpp
-      - src/c2pool/v37/xmr/xmr_fee_model.hpp
-      - src/c2pool/v37/xmr/xmr_pool_tag.hpp
-      - src/c2pool/v37/xmr/xmr_drops_wiring.hpp
-      - src/sharechain/v37/**
+      - src/sharechain/v37/v37_fixed.hpp
+      - src/sharechain/v37/v37_hash.hpp
+      - src/sharechain/v37/v37_descriptor_xmr.hpp
     exclude:
       - '**/test/**'
-      - src/impl/xmr/settle/_compile_check/**
     extensions: [.hpp, .cpp, .h, .cc, .ipp, .inc]
 
 rules:
@@ -133,7 +118,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D1, D39]
 
   - id: C02
@@ -151,7 +136,7 @@ rules:
       - name: receipt-id-dedup-kat
         type: required_kat
         kats: [v37_xmr_receipt_id_kat]
-    status_now: fail
+    status_now: pass
     deviation: [D2]
 
   - id: C03
@@ -212,7 +197,7 @@ rules:
       - name: freshness-kat
         type: required_kat
         kats: [xmr_receipt_freshness_kat]
-    status_now: fail
+    status_now: pass
     deviation: [D3, D18]
 
   - id: C04
@@ -227,7 +212,14 @@ rules:
         pattern: '\b(?:OwedLedger|allocate_exact_sum|drain_delta|drain_rule_refusal|drain_reward_fixpoint|kDrainRefCadence|kDrainRuleVersion|kDrainFixpointPasses)\b'
         scope: xmr_lane_code
         code_only: true
-    status_now: fail
+      - name: no-w4-include
+        type: forbidden
+        pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*w4_settlement\.hpp[>"]'
+        paths: [src/c2pool/v37/xmr/**, src/impl/xmr/**, src/c2pool/v37/main_v37_xmr.cpp]
+        exclude: ['**/test/**', src/impl/xmr/third_party/**, src/impl/xmr/coin/vendor/**]
+        code_only: false
+        note: 'The product XMR targets; their tests are out of scope.'
+    status_now: pass
     deviation: [D4, D36]
 
   - id: C05
@@ -257,14 +249,14 @@ rules:
         kats: [xmr_receipt_kat, xmr_receipt_bind_v2_kat, v37_w2_ingestion_test]
       - name: r1-stage-admission
         type: required
-        pattern: 'AdmitStage::R1Target'
-        paths: [src/impl/xmr/receipt/xmr_admission.hpp]
+        pattern: '\bretarget_row\s*\([^;]*RowId::R25\b'
+        paths: [src/impl/xmr/pathb/pathb_admit.hpp]
         code_only: true
         min_count: 2
       - name: r1-stage-relay
         type: required
-        pattern: '\bCheckStage::R1\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_receipt_mint.hpp]
+        pattern: '\b(?:admit_frame_from|admit_receipt_from)\s*\('
+        paths: [src/c2pool/v37/xmr/pathb/pathb_node.hpp]
         code_only: true
         min_count: 1
       - name: no-credit-from-achieved
@@ -284,7 +276,7 @@ rules:
     checks:
       - name: exact-sum-kats
         type: required_kat
-        kats: [xmr_coinbase_kat, xmr_e2e_kat]
+        kats: [v37_xmr_pathb_coinbase_kat, v37_xmr_pathb_e2e_kat]
       - name: pathb-exact-sum-kat
         type: required_kat
         kats: [v37_xmr_pathb_e2e_kat]
@@ -309,7 +301,7 @@ rules:
         scope: xmr_lane_code
         code_only: true
         allowlist: allowlist/C08-clock.txt
-    status_now: fail
+    status_now: pass
     deviation: [D1, D4]
 
   - id: C09
@@ -373,7 +365,7 @@ rules:
         max: 2160
       - name: retarget-min-dh
         type: constant
-        pattern: '\bkRetargetMinDh\s*=\s*([0-9]+)'
+        pattern: 'static_assert\s*\(\s*retarget_min_span\s*\(\s*kRuledLaneParams\s*\)\s*==\s*([0-9]+)'
         scope: xmr_lane_code
         min: 9
         max: 9
@@ -387,7 +379,7 @@ rules:
         pattern: '\b(?:d_min|kDMin|share_diff_min|kShareDiffMin)\w*\s*=\s*20000\b'
         scope: xmr_lane_code
         code_only: true
-    status_now: fail
+    status_now: pass
     deviation: [D6]
 
   - id: C12
@@ -437,7 +429,7 @@ rules:
         pattern: '\b(?:kReserveNum|kReserveDen|kReserveWindow|ReserveState)\b'
         scope: xmr_consensus_core
         code_only: true
-    status_now: fail
+    status_now: pass
     deviation: [D7]
 
   - id: C14
@@ -523,8 +515,8 @@ rules:
         kats: [v37_xmr_drops_count_kat, v37_xmr_drops_default_kat]
     open_items:
       - 'epoch values (ref: the:K14): floor max(d >> 6, 1434); 128 raindrop slots; raindrop body 105 bytes; Count estimator, class per identity fixed ex ante; per-identity floor w x B >= W x f_spend (C38)'
-      - 'epoch KATs: xmr_raindrop_kat, v37_xmr_raindrop_dos_kat, v37_xmr_raindrop_enrol_kat'
-    status_now: fail
+      - 'epoch KATs (S5): xmr_raindrop_kat, v37_xmr_raindrop_dos_kat, v37_xmr_raindrop_enrol_kat (the stratum enrolment proof)'
+    status_now: pass
     deviation: [D28]
 
   - id: C19
@@ -573,7 +565,7 @@ rules:
       - name: window-split-kat
         type: required_kat
         kats: [xmr_window_split_kat]
-    status_now: fail
+    status_now: pass
     deviation: [D4, D40]
 
   - id: C22
@@ -597,7 +589,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D1, D3]
 
   - id: C23
@@ -639,7 +631,7 @@ rules:
         scope: xmr_lane_code
         code_only: true
     status_now: pass
-    deviation: [D11, D36, D39]
+    deviation: [D11, D36, D39, D46]
 
   - id: C24
     title: accounting across rule epochs
@@ -657,7 +649,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D11]
 
   - id: C25
@@ -669,13 +661,13 @@ rules:
     checks:
       - name: receipt-bindings
         type: required
-        pattern: '(?s)struct\s+ReceiptSideData\s*\{.*?\bt_origin\b.*?\bpayout_identity\b.*?\bchain_id\b.*?\};|struct\s+ReceiptSideDataV3\s*\{.*?\bpool_id\b.*?\bpayee\b.*?\bt_origin\b.*?\};'
-        paths: [src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '(?s)struct\s+SideDataV3\s*\{(?:(?!\n\};).)*?\bpool_id\b(?:(?!\n\};).)*?\brules_epoch\b(?:(?!\n\};).)*?\bballot\b(?:(?!\n\};).)*?\bpayee\b(?:(?!\n\};).)*?\bt_origin\b(?:(?!\n\};).)*?\btip\b(?:(?!\n\};).)*?\breceipts_root\b(?:(?!\n\};).)*?\bwindow_root\b(?:(?!\n\};).)*?\bmmr_root\b(?:(?!\n\};).)*?\bfee_rate(?:_bp)?\b(?:(?!\n\};).)*?\bowner\b(?:(?!\n\};).)*?\bgive_author_bp\b(?:(?!\n\};).)*?\n\};'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: side-data-v3-struct
         type: required
-        pattern: '(?s)struct\s+ReceiptSideDataV3\s*\{.*?\bpool_id\b.*?\brules_epoch\b.*?\bballot\b.*?\bpayee\b.*?\bt_origin\b.*?\btip\b.*?\breceipts_root\b.*?\bwindow_root\b.*?\bmmr_root\b.*?\bfee_rate\b.*?\bowner\b.*?\bgive_author_bp\b.*?\};'
-        paths: [src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '(?s)struct\s+SideDataV3\s*\{(?:(?!\n\};).)*?\bpool_id\b(?:(?!\n\};).)*?\brules_epoch\b(?:(?!\n\};).)*?\bballot\b(?:(?!\n\};).)*?\bpayee\b(?:(?!\n\};).)*?\bt_origin\b(?:(?!\n\};).)*?\btip\b(?:(?!\n\};).)*?\breceipts_root\b(?:(?!\n\};).)*?\bwindow_root\b(?:(?!\n\};).)*?\bmmr_root\b(?:(?!\n\};).)*?\bfee_rate(?:_bp)?\b(?:(?!\n\};).)*?\bowner\b(?:(?!\n\};).)*?\bgive_author_bp\b(?:(?!\n\};).)*?\n\};'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: provable-work-kats
         type: required_kat
@@ -691,7 +683,7 @@ rules:
         kats: [v37_xmr_bin_fold_kat]
     open_items:
       - 'retirement plan: v37_xmr_light_proof_kat is not required; slice S4 deletes its code; successors v37_xmr_side_data_v3_kat and v37_xmr_mmr_golden_kat'
-    status_now: fail
+    status_now: pass
     deviation: [D30, D38, D44]
 
   - id: C26
@@ -703,13 +695,13 @@ rules:
     checks:
       - name: give-author-in-preimage
         type: required
-        pattern: '\bu16\s+give_author(?:_bp)?\b'
-        paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp, src/impl/xmr/receipt/xmr_receipt.hpp]
+        pattern: '\b(?:u16|std::uint16_t)\s+give_author(?:_bp)?\b'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         code_only: true
       - name: donation-marker-absent
         type: forbidden
         pattern: '\bkDonationMarkerPico\b'
-        paths: [src/c2pool/v37/xmr/xmr_fee_model.hpp, src/c2pool/v37/main_v37_xmr.cpp]
+        paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: true
       - name: donation-bp-default
         type: constant
@@ -751,30 +743,30 @@ rules:
         kats: [v37_xmr_donation_split_kat]
     open_items:
       - 'retirement plan: v37_xmr_fee_model_kat is not required; slice S4 deletes its code; successors v37_xmr_donation_split_kat and xmr_owner_fee_receipt_kat (C19)'
-    status_now: fail
+    status_now: pass
     deviation: [D12, D31]
 
   - id: C27
     title: pool identity binds every lane rule
-    statement: 'Every lane rule is committed in the relay HELLO and the pool_tag; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field; the Path B FB_HELLO = head 0x40 | frame version 0x02 | magic ''C2XR'' | u8 network | u32 chain_id | pool_id[32] | u64 node_nonce | u16 listen_port (53 B), then the tail (330 B at epoch 0), then the node key slot 32 B (zeros until slice S6), then the trailer 68 B: 483 B at epoch 0; the Path B HELLO tail = u8 codec (K22 = 2) | u16 rules_len | rules TLV of u8 id | u8 len | value entries, id = the K number, ids strictly ascending; the HELLO tag = network, chain_id and the pool identity (C23), a differing chain_id or pool identity is TAG_MISMATCH; the pool identity is not in the rules TLV; the rules TLV (the geometry K01-K08 and K23 included) is compared only when both peers report the same epoch_cur.'
+    statement: 'Every lane rule is committed in the relay HELLO; the pool identity carries no rules digest; the Monero constants enter as one monero_rules_digest; node policy values are not lane rules and are not committed; a node with different lane parameters is refused with LANE_RULES_MISMATCH naming the field; the Path B FB_HELLO = head 0x40 | frame version 0x02 | magic ''C2XR'' | u8 network | u32 chain_id | pool_id[32] | u64 node_nonce | u16 listen_port (53 B), then the tail (330 B at epoch 0), then the node key slot 32 B (zeros until slice S6), then the trailer 68 B: 483 B at epoch 0; the Path B HELLO tail = u8 codec (K22 = 2) | u16 rules_len | rules TLV of u8 id | u8 len | value entries, id = the K number, ids strictly ascending; the HELLO tag = network, chain_id and the pool identity (C23), a differing chain_id or pool identity is TAG_MISMATCH; the pool identity is not in the rules TLV; the rules TLV (the geometry K01-K08 and K23 included) is compared only when both peers report the same epoch_cur.'
     source: 'ref: the:C27'
     ruling: 'ref: the:C27'
     scope: [src/c2pool/v37/xmr/]
     checks:
       - name: mismatch-refusal
         type: required
-        pattern: 'kLaneRulesMismatch\[\]\s*=\s*"LANE_RULES_MISMATCH"'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        pattern: '\bkLaneRulesMismatchText\s*=\s*"LANE_RULES_MISMATCH"'
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: false
-      - name: rules-digest-in-pool-tag
+      - name: rules-digest-in-lane-rules
         type: required
         pattern: '\brules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_pool_tag.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: single-digest-field
         type: required
         pattern: '\bmonero_rules_digest\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kats
         type: required_kat
@@ -787,7 +779,7 @@ rules:
         kats: [v37_xmr_pathb_hello_kat]
     open_items:
       - 'retirement plan: v37_xmr_pool_lineage_kat is not required; slice S4 deletes its code (C37 no-clear-pool-tag); successor the pool identity case of v37_xmr_side_data_v3_kat (C25)'
-    status_now: fail
+    status_now: pass
     deviation: [D16, D32]
 
   - id: C28
@@ -899,7 +891,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D1]
 
   - id: C34
@@ -937,7 +929,7 @@ rules:
         pattern: '\b\w*[Ss]aturat\w*\b|\bsat_(?:add|sub|mul)\w*\b'
         scope: xmr_consensus_core
         code_only: true
-    status_now: fail
+    status_now: pass
     deviation: [D15]
 
   - id: C36
@@ -960,12 +952,12 @@ rules:
         max: 16
       - name: frame-count
         type: constant
-        pattern: '\bkFbMaxReceiptsPerFrame\s*=\s*([0-9]+)'
-        paths: [src/c2pool/v37/xmr/relay/**]
+        pattern: 'static_assert\s*\(\s*kFbMaxReceiptsPerFrame\s*==\s*([0-9]+)'
+        paths: [src/impl/xmr/pathb/pathb_wire_v3.hpp]
         extensions: [.hpp, .cpp, .h]
         min: 17
         max: 17
-    status_now: fail
+    status_now: pass
     deviation: [D19, D33]
 
   - id: C37
@@ -980,9 +972,8 @@ rules:
         kats: [xmr_receipt_solo_leech_kat, v37_xmr_pathb_admit_kat]
       - name: receipt-admission-coinbase-check
         type: required
-        pattern: '\bcanonical_coinbase_matches\s*\('
-        paths: [src/impl/xmr/receipt/**]
-        exclude: ['**/test/**']
+        pattern: '\bcanonical_coinbase_check\s*\('
+        paths: [src/impl/xmr/pathb/pathb_admit.hpp]
         code_only: true
         min_count: 1
       - name: coinbase-layout-kats
@@ -1008,6 +999,7 @@ rules:
         pattern: '\bXMR_SUB\b'
         scope: xmr_consensus_core
         code_only: true
+        allowlist: allowlist/C37-subaddress.txt
       - name: pathb-coinbase-kats
         type: required_kat
         kats: [v37_xmr_pathb_coinbase_kat, v37_xmr_pathb_miner_tx_kat]
@@ -1019,7 +1011,7 @@ rules:
         code_only: false
     open_items:
       - 'hf 17 amount rule: open (ref: the:SPEC24/O-01); no receipt for hf >= 17 is built or admitted until it is ruled'
-    status_now: fail
+    status_now: pass
     deviation: [D20]
 
   - id: C38
@@ -1045,7 +1037,7 @@ rules:
         pattern: '\b(?:47885|12530000|kFeeMedianFloor)\b'
         scope: xmr_consensus_core
         code_only: true
-    status_now: fail
+    status_now: pass
     deviation: [D21, D22, D38, D40]
 
   - id: C39
@@ -1104,7 +1096,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D21, D38]
 
   - id: C42
@@ -1123,7 +1115,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D1]
 
   - id: C43
@@ -1155,7 +1147,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D1, D25, D34, D35, D37, D38, D39]
 
   - id: C44
@@ -1180,8 +1172,8 @@ rules:
     checks:
       - name: one-budget
         type: required
-        pattern: 'static_assert\s*\(\s*kFbReceiptBudget\s*==\s*[\w:]*PER_RECEIPT_BUDGET'
-        paths: [src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp]
+        pattern: 'static_assert\s*\(\s*per_receipt_budget\s*\([^;]*==\s*fb_receipt_budget\s*\('
+        paths: [src/impl/xmr/pathb/pathb_caps.hpp]
         code_only: true
         min_count: 1
       - name: buffer-not-below-cap
@@ -1205,8 +1197,8 @@ rules:
         code_only: true
       - name: no-horizon-literals
         type: forbidden
-        pattern: '\b(?:index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|verify_queue_max|FOUND_BLOCK_MAX_BLOB|kCtxMaxBlob|kMaxCarrierFrame)\s*=\s*[0-9]+'
-        paths: [src/c2pool/v37/xmr/relay/**, src/impl/xmr/native/relay/**, src/c2pool/v37/carrier_net.hpp]
+        pattern: '\b(?:index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|verify_queue_max|FOUND_BLOCK_MAX_BLOB|blob_cap_ctx|kMaxCarrierFrame)\s*=\s*[0-9]+'
+        paths: [src/c2pool/v37/xmr/relay/**, src/impl/xmr/native/relay/**, src/c2pool/v37/carrier_net.hpp, src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp]
         exclude: ['**/test/**']
         code_only: true
       - name: wire-cap-kat
@@ -1228,7 +1220,7 @@ rules:
       - name: no-policy-in-lane-rules
         type: forbidden
         pattern: '\b(?:journal_depth|index_horizon|backfill_positions|ctx_window|ctx_max_depth|index_retention_blocks|pending_cap|verify_threads|per_peer_capacity|solicited_credits)\b'
-        paths: [src/c2pool/v37/xmr/xmr_lane_rules.hpp]
+        paths: [src/impl/xmr/pathb/pathb_lane_rules.hpp]
         code_only: true
       - name: lane-rules-kat
         type: required_kat
@@ -1267,13 +1259,19 @@ rules:
       - name: base-reward-kat
         type: required_kat
         kats: [v37_xmr_base_reward_kat, v37_xmr_pathb_node_kat]
+      - name: no-expected-reward
+        type: forbidden
+        pattern: '\bexpected_reward\b'
+        paths: [src/c2pool/v37/xmr/pathb/pathb_node.hpp, src/c2pool/v37/xmr/pathb/pathb_template_select.hpp, src/c2pool/v37/xmr/pathb/pathb_follow_template.hpp, src/impl/xmr/pathb/**]
+        exclude: ['**/test/**']
+        code_only: true
       - name: pathb-in-force
         type: required
         in_force: true
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D36]
 
   - id: C49
@@ -1293,7 +1291,7 @@ rules:
         pattern: '^[ \t]*#[ \t]*include[ \t]*[<"][^>"\n]*impl/xmr/pathb/'
         paths: [src/c2pool/v37/main_v37_xmr.cpp]
         code_only: false
-    status_now: fail
+    status_now: pass
     deviation: [D36, D45]
 
   - id: C50

@@ -11,10 +11,14 @@
 // WriteBatch; point reads verify checksums (scans do not; the load's anchors
 // cover them); a read error is never "absent"; a scan fails closed.
 //   <data>/<network>/pathb_db/<pool_id hex>-<G hex>   (store_dir_name)
-// Not linked into any running target.
+// A store LevelDB cannot read (a full scan fails) is moved aside to a sibling
+// <dir>.corrupt-<unix s> (nothing deleted) and an empty store opened in its
+// place (move_store_aside).
+// Linked into c2pool-v37-xmr.
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,5 +28,14 @@ namespace c2pool::xmr::pathb {
 
 // nullptr: the directory does not open.
 std::unique_ptr<PathbKv> open_pathb_store(const std::string& dir);
+
+// A full scan of the store (every key). false: LevelDB could not read it (a corrupt block, an IO error).
+bool store_readable(PathbKv& kv);
+
+// The store in `dir` is closed and moved aside to the sibling `<dir>.corrupt-<unix_s>` (with -2, -3, ... when that
+// name exists; nothing is deleted), and an empty store is opened in `dir`. `moved`: the sibling's path. nullptr and
+// `why` when the move or the open fails.
+std::unique_ptr<PathbKv> move_store_aside(std::unique_ptr<PathbKv> kv, const std::string& dir, std::uint64_t unix_s,
+                                          std::string& moved, std::string& why);
 
 }  // namespace c2pool::xmr::pathb
