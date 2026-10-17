@@ -1835,7 +1835,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             "reoffer_queue_full_drops=%llu live_queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
-                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
+                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_want_bytes_peak=%zu "
+                            "ctx_wanted=%llu "
                             "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu "
                             "reoffer_cap_drops=%llu parked_receipts=%zu parked_receipts_sealed=%llu alt_blocks_max=%zu "
                             "alt_verified_bytes=%llu alt_verified_bytes_peak=%llu alt_verified_bytes_max=%llu "
@@ -1859,7 +1860,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.claim_alarms.load()),
                             static_cast<unsigned long long>(rs.claim_alarm_drops.load()),
                             static_cast<unsigned long long>(rs.join_waits.load()), relay->ctx_wants(),
-                            relay->ctx_want_bytes(), static_cast<unsigned long long>(rs.ctx_wanted.load()),
+                            relay->ctx_want_bytes(), relay->ctx_want_bytes_peak(),
+                            static_cast<unsigned long long>(rs.ctx_wanted.load()),
                             static_cast<unsigned long long>(rs.ctx_resolved.load()),
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
                             static_cast<unsigned long long>(rs.parked_reruns.load()),

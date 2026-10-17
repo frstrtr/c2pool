@@ -896,6 +896,11 @@ public:
         for (const auto& kv : ctx_want_) n += kv.second.blob.size();
         return n;
     }
+    // The most bytes the wanted contexts held at once (taken at every blob that enters a want).
+    std::size_t ctx_want_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_bytes_peak_;
+    }
     std::string describe() const {
         char b[768];
         std::snprintf(b, sizeof b,
@@ -3450,6 +3455,9 @@ private:
             it->second.proof = bc;
             it->second.blob = blob;
             it->second.proof_from = from;
+            std::size_t held = 0;
+            for (const auto& kv : ctx_want_) held += kv.second.blob.size();
+            if (held > ctx_want_bytes_peak_) ctx_want_bytes_peak_ = held;
         }
         return judge_ctx(id);
     }
@@ -3765,6 +3773,7 @@ private:
 
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;
+    std::size_t ctx_want_bytes_peak_ = 0;  // the most blob bytes ctx_want_ held at once
     std::deque<Hash32> ctx_done_;
     std::map<Hash32, rly::CtxPowRec> ctx_pow_;
     std::deque<Hash32> ctx_pow_order_;

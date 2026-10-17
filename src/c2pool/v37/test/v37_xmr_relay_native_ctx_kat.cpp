@@ -221,6 +221,9 @@ int main() {
       Cn.n->st().ctx_gave_up.load() == 0,
       "N1 every context want is cleared (" + std::to_string(Cn.n->st().ctx_resolved.load()) + " resolved of " +
       std::to_string(Cn.n->st().ctx_wanted.load()) + ")");
+    C(Cn.n->r().ctx_want_bytes() == 0 && Cn.n->r().ctx_want_bytes_peak() >= W.full_blob.size(),
+      "N2 the wanted contexts' peak bytes hold W's block (" + std::to_string(Cn.n->r().ctx_want_bytes_peak()) + " B, W " +
+      std::to_string(W.full_blob.size()) + " B) while none is held now");
 
     // ── N3 a RandomX exception judging a context ────────────────────────────
     const SynthBlock Y = make_block(100, idG, 95, nullptr, 3, 65);
