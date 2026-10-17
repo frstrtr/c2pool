@@ -766,9 +766,10 @@ struct Fixture {
     std::vector<std::uint64_t> main_ts;
     Hash seed_tip{};
 
-    explicit Fixture(std::uint64_t n_main = 6, std::uint64_t max_reorg = 720) {
+    explicit Fixture(std::uint64_t n_main = 6, std::uint64_t max_reorg = 720, std::size_t alt_max_blocks = 0) {
         opts.net             = XmrNet::Stagenet;
         opts.max_reorg_depth = max_reorg;
+        if (alt_max_blocks) opts.alt_max_blocks = alt_max_blocks;
         idx = new ChainIndex(opts, src);
         seed_stagenet(*idx);
         idx->set_fetcher(&fetcher);
@@ -1496,9 +1497,45 @@ static void test_l3_source_drop_on_arrival() {
            strikes_of(f.fetcher, x), strikes_of(f.fetcher, y));
 }
 
+// L4. ONLY THE PART OF THE WANT LIST HANDED OUT. With an alt store of 4 the fetch window is 2: a chain entry names A,
+// B, C, D (heights h .. h + 3 above the tip at h - 1). D, beyond the window, pushed: refused with no strike; B, within
+// it, parks. A lands: A and B connect, the window moves up to h + 3, and D, pushed again, parks; C lands and the tip
+// is D.
+static void test_l4_wanted_beyond_window() {
+    Fixture f(6, 720, /*alt_max_blocks=*/4);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/31, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/32, reward);
+    const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/33, reward);
+    const BlockEntry D = f.sibling(id_of(C), h + 3, /*salt=*/34, reward);
+    want(idx, p5, tip, h - 1, {id_of(A), id_of(B), id_of(C), id_of(D)});
+    const OfferResult rd = idx.offer_block(&p5, D, false);
+    const OfferResult rb = idx.offer_block(&p5, B, false);
+    checkf(rd.outcome == OfferOutcome::Rejected && !rd.peer_fault && !idx.have_block(id_of(D))
+                   && rb.outcome == OfferOutcome::ParkedOrphan && f.fetcher.penalties.empty()
+                   && idx.unsolicited_dropped() == 1,
+           "l4: a wanted id beyond the fetch window was %s (held %d), one within it %s (%zu strikes): expected refused "
+           "with no strike, and parked", to_string(rd.outcome), idx.have_block(id_of(D)) ? 1 : 0, to_string(rb.outcome),
+           f.fetcher.penalties.size());
+    idx.offer_block(&p5, A, false);
+    const std::uint64_t t1 = idx.tip()->height;
+    const OfferResult rd2 = idx.offer_block(&p5, D, false);
+    idx.offer_block(&p5, C, false);
+    checkf(t1 == h + 1 && rd2.outcome == OfferOutcome::ParkedOrphan && idx.tip()->id == id_of(D)
+                   && f.fetcher.penalties.empty(),
+           "l4: after A landed (tip %llu, expected %llu) D within the moved window was %s, the tip is %llu (expected "
+           "%llu)", static_cast<unsigned long long>(t1), static_cast<unsigned long long>(h + 1), to_string(rd2.outcome),
+           static_cast<unsigned long long>(idx.tip()->height), static_cast<unsigned long long>(h + 3));
+}
+
 // =============================================================================
 int main() {
     test_l1_unasked_orphan_refused();
+    test_l4_wanted_beyond_window();
     test_l2_source_drop_on_resolve();
     test_l3_source_drop_on_arrival();
     test_k1_bodiless_park_after_parent_connects();

@@ -820,9 +820,10 @@ void test_far_pushes_not_parked_while_behind() {
     rig.push_full(kAnchorHeight + 10);
     kat::check(rig.idx->have_block(rig.at(kAnchorHeight + 10).id), "D2: a near push named by the chain entry parks");
 
-    // And the refetch list is bounded on this path too. Synced (so pushes park
-    // wherever they claim to be), 450 parks with distinct unknown parents name
-    // at most 256 of them; on master the list grew by one per park, unbounded.
+    // And the refetch list is bounded on this path too. Synced, 450 pushes with
+    // distinct unknown parents, named by a chain entry: those within the fetch
+    // window park, and their parents name at most 256 of them; on master the
+    // list grew by one per park, unbounded.
     Rig r2;
     if (!r2.ok) return;
     r2.idx->force_synced(true);

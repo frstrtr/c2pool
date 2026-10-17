@@ -1038,13 +1038,11 @@ public:
         // An entry id that has since connected is done with, whether or not
         // its body is still cached (the entry cache is smaller than a 2048-id
         // entry); one below the retained rows can no longer be used at all.
-        std::uint64_t limit = rows_.tip_height() + fetch_window_();
         // COLD-BOOT-2: never download past the consumer's booked frontier + window.
-        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
         // COLD-BOOT-3: the consumer's mainchain-event queue is full enough that
         // more bulk download would overflow it -- hand out nothing above the tip
         // until it drains (backpressure without blocking the verify thread).
-        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
+        const std::uint64_t limit = want_limit_locked_();
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
@@ -2774,14 +2772,29 @@ private:
              ? pb.tx_hashes.size() - b->entry.txs.size() : 0;
     }
 
-    // How far above our tip the chain-entry want list is handed out: half the
-    // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
-    // A block we asked for: in the chain entry's wanted ids, the parents asked again, or the bodies the booking asked
-    // back. Only these may wait in the alt store without proven work.
+    // A block we asked for: a chain entry's wanted id within the part handed out now (want_limit_locked_), a parent
+    // asked again, or a body the booking asked back. Only these may wait in the alt store without proven work.
     bool solicited_locked_(const Hash& id) const {
-        return contains_hash_(wanted_, id) || contains_hash_(refetch_, id) || contains_hash_(booking_wanted_, id);
+        if (contains_hash_(refetch_, id) || contains_hash_(booking_wanted_, id)) return true;
+        const std::uint64_t limit = want_limit_locked_();
+        for (std::size_t k = 0; k < wanted_.size(); ++k) {
+            if (wanted_heights_[k] > limit) break;  // the rest of the want list is not asked for yet
+            if (wanted_[k] == id) return true;
+        }
+        return false;
     }
 
+    // The highest want-list height handed out now: the fetch window above our tip, lowered to the consumer's booked
+    // frontier + window (COLD-BOOT-2), and to the tip while the consumer holds the download (COLD-BOOT-3).
+    std::uint64_t want_limit_locked_() const {
+        std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
+        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
+        return limit;
+    }
+
+    // How far above our tip the chain-entry want list is handed out: half the
+    // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
     std::uint64_t fetch_window_() const {
         if (!opts_.alt_max_blocks) return MAX_SPAN_IDS;
         return opts_.alt_max_blocks >= 2 ? opts_.alt_max_blocks / 2 : 1;
