@@ -363,6 +363,16 @@ static std::vector<BlockEntry> build_branch(const ChainIndex& idx, const Hash& f
     return out;
 }
 
+// The chain request's answer: a chain entry from `p` naming `ids` after the splice `from` (ours, at height `h`).
+static void want(ChainIndex& idx, const PeerRef& p, const Hash& from, std::uint64_t h, const std::vector<Hash>& ids) {
+    ChainEntry e;
+    e.ids.push_back(from);
+    for (const Hash& x : ids) e.ids.push_back(x);
+    e.start_height = h;
+    e.total_height = h + e.ids.size();
+    idx.on_chain_entry(p, std::move(e));
+}
+
 // =============================================================================
 // A. the young-chain window, at RowStore level
 // =============================================================================
@@ -534,6 +544,20 @@ static void test_walk_to_fork() {
     // A branch of five off height 5: heights 6..10, two blocks longer than the
     // three above the fork point, so strictly more work.
     std::vector<BlockEntry> br = build_branch(idx, fork_id, fork_height, 5, /*salt_base=*/21);
+
+    // Pushed unasked, the branch tip is refused: no strike, nothing held, no parent asked for. The chain request
+    // fetches it (a chain entry names the branch).
+    const OfferResult unasked = idx.offer_block(&f.them, br[4], /*own_mined=*/false);
+    checkf(unasked.outcome == OfferOutcome::Rejected && !unasked.peer_fault && !idx.have_block(id_of(br[4]))
+                   && f.fetcher.penalties.empty() && idx.refetch_wanted().empty(),
+           "walk: the unasked branch tip became %s (held %d, %zu strikes, %zu asked), expected refused",
+           to_string(unasked.outcome), idx.have_block(id_of(br[4])) ? 1 : 0, f.fetcher.penalties.size(),
+           idx.refetch_wanted().size());
+    {
+        std::vector<Hash> ids;
+        for (const BlockEntry& e : br) ids.push_back(id_of(e));
+        want(idx, f.them, fork_id, fork_height, ids);
+    }
 
     // Deliver it TOP DOWN, which is what a push followed by refetches does: the
     // tip first, then its parent, then its parent...
@@ -882,6 +906,7 @@ static void test_alt_rows_out_of_order() {
     const Hash our_tip = f.main_ids[7];
     std::vector<BlockEntry> rival = build_branch(idx, f.main_ids[4], 5, 2, /*salt_base=*/41);
     const Hash c0 = id_of(rival[0]), c1 = id_of(rival[1]);
+    want(idx, f.them, f.main_ids[4], 5, {c0, c1});  // the chain request named the branch
     const OfferResult o1 = idx.offer_block(&f.them, rival[1], /*own_mined=*/false);
     checkf(o1.outcome == OfferOutcome::ParkedOrphan, "altooo: the child first became %s (%s), expected ParkedOrphan",
            to_string(o1.outcome), o1.why.c_str());
@@ -1162,9 +1187,10 @@ static void test_kept_blobs() {
 }
 
 // K. THE ALT STORE'S TWO BYTE CLASSES: resolved, PoW-verified alternatives (the ones served and saved) count against
-// the verified cap; blocks without proven work (orphans whose parent is unknown) against their own cap. A flood of
-// orphans fills only its class: every verified alternative stays held and served, its bytes untouched; the verified
-// class holds up to its cap (the lightest goes over it).
+// the verified cap; blocks without proven work (orphans whose parent is unknown) are held only when asked for, and never
+// count against it. An unasked orphan flood is refused with no strike; the same orphans asked for fill only their class:
+// every verified alternative stays held and served, its bytes untouched; the verified class holds up to its cap (the
+// lightest goes over it).
 static void test_alt_classes() {
     Rig f(8);
     ChainIndex& idx = *f.idx;
@@ -1180,12 +1206,25 @@ static void test_alt_classes() {
            static_cast<unsigned long long>(v0.first), static_cast<unsigned long long>(v0.second));
     const std::uint64_t per = v0.first / 3;
     idx.set_alt_verified_max_bytes(4 * per + per / 2);  // room for four
-    idx.set_alt_unverified_max_bytes(5 * per);
-    // the flood: 40 orphans (an unknown parent each) near the tip
-    std::size_t parked = 0;
+    // the flood: 40 orphans (an unknown parent each) near the tip, pushed unasked: refused, nobody struck, none held
+    std::vector<BlockEntry> flood;
+    std::vector<Hash> flood_ids;
     for (std::uint64_t k = 0; k < 40; ++k) {
-        Hash prev = tag_id(0x5000 + k);
-        BlockEntry e = Rig::block_for(prev, 9, 1, static_cast<std::uint8_t>(k), 3);
+        flood.push_back(Rig::block_for(tag_id(0x5000 + k), 9, 1, static_cast<std::uint8_t>(k), 3));
+        flood_ids.push_back(id_of(flood.back()));
+    }
+    std::size_t refused = 0;
+    for (const BlockEntry& e : flood) {
+        const OfferResult r = idx.offer_block(&f.them, e, /*own_mined=*/false);
+        refused += r.outcome == OfferOutcome::Rejected && !r.peer_fault ? 1 : 0;
+    }
+    checkf(refused == 40 && idx.alt_class_bytes().second == 0 && f.fetcher.penalties.empty() && idx.unsolicited_dropped() == 40,
+           "altclass: 40 unasked orphans are refused with no strike and none held (%zu refused, %llu B held, %zu strikes)",
+           refused, static_cast<unsigned long long>(idx.alt_class_bytes().second), f.fetcher.penalties.size());
+    // the same 40 asked for (a chain entry names them): parked, in their own class
+    want(idx, f.them, f.main_ids[7], 8, flood_ids);
+    std::size_t parked = 0;
+    for (const BlockEntry& e : flood) {
         const OfferResult r = idx.offer_block(&f.them, e, /*own_mined=*/false);
         parked += r.outcome == OfferOutcome::ParkedOrphan ? 1 : 0;
     }
@@ -1195,10 +1234,10 @@ static void test_alt_classes() {
         std::vector<std::uint8_t> blob;
         served = served && idx.block_blob_of(id, blob) && !blob.empty();
     }
-    checkf(parked >= 10 && v1.second <= 5 * per && v1.second > 0 && v1.first == v0.first && served,
-           "altclass: %zu orphans parked fill only their class (%llu B <= %llu B); the verified alternatives stay held and "
-           "served (%llu B)", parked, static_cast<unsigned long long>(v1.second), static_cast<unsigned long long>(5 * per),
-           static_cast<unsigned long long>(v1.first));
+    checkf(parked == 40 && v1.second > 4 * per + per / 2 && v1.first == v0.first && served,
+           "altclass: %zu asked-for orphans parked fill only their class (%llu B, above the verified cap %llu B); the "
+           "verified alternatives stay held and served (%llu B)", parked, static_cast<unsigned long long>(v1.second),
+           static_cast<unsigned long long>(4 * per + per / 2), static_cast<unsigned long long>(v1.first));
     // the verified class up to its cap: three more verified alternatives, room for four
     std::size_t more = 0;
     for (std::uint8_t k = 0; k < 12 && more < 3; ++k) {
@@ -1209,7 +1248,7 @@ static void test_alt_classes() {
     const auto v2 = idx.alt_class_bytes();
     const auto pk = idx.alt_class_bytes_peak();
     checkf(more == 3 && v2.first <= 4 * per + per / 2 && v2.first >= 4 * per && v2.second == v1.second
-                   && pk.first <= 4 * per + per / 2 && pk.second <= 5 * per,
+                   && pk.first <= 4 * per + per / 2 && pk.second == v1.second,
            "altclass: the verified class holds up to its cap (%llu B of %llu B; peaks %llu / %llu); the orphans' bytes "
            "unchanged (%llu B)", static_cast<unsigned long long>(v2.first),
            static_cast<unsigned long long>(4 * per + per / 2), static_cast<unsigned long long>(pk.first),

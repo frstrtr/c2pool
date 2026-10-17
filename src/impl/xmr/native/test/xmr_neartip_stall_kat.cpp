@@ -443,6 +443,23 @@ struct Rig {
         boot->on_objects(pa, std::move(blocks), {}, net_top() + 1);
     }
 
+    // The chain request's answer from pa: a chain entry from our tip naming `ids` (by default the network's blocks
+    // above our tip up to `hi`). Only a block it names (or a parent the index asked for) may park without proven work.
+    void name_ids(const std::vector<Hash>& ids) {
+        native::ChainEntry e;
+        const std::uint64_t t = tip_height();
+        e.ids.push_back(idx->tip()->id);
+        for (const Hash& x : ids) e.ids.push_back(x);
+        e.start_height = t;
+        e.total_height = t + e.ids.size();
+        boot->on_chain_entry(pa, std::move(e));
+    }
+    void name_up_to(std::uint64_t hi) {
+        std::vector<Hash> ids;
+        for (std::uint64_t h = tip_height() + 1; h <= hi; ++h) ids.push_back(at(h).id);
+        name_ids(ids);
+    }
+
     void push_fluffy(std::uint64_t h) {
         boot->on_new_block(pb, at(h).bodiless(), net_top() + 1, /*fluffy=*/true);
     }
@@ -500,7 +517,9 @@ void test_strand_after_gap() {
                 (unsigned long long)(h - 1), (unsigned long long)rig.tip_height());
 
     // While we are still behind, the peers push the two newest blocks as fluffy
-    // blocks (blob, no transactions). Their parents are not in the index yet.
+    // blocks (blob, no transactions). Their parents are not in the index yet; the
+    // catch-up's chain entry named them (an unasked orphan is refused).
+    rig.name_up_to(G + 2);
     rig.push_fluffy(G + 1);
     rig.push_fluffy(G + 2);
     kat::check(rig.idx->have_block(rig.at(G + 1).id) && rig.idx->have_block(rig.at(G + 2).id),
@@ -601,7 +620,9 @@ void test_held_parent_drains_child() {
     rig.grow(true);                                   // C = G+2
     rig.advertise();
 
-    // The child arrives first (complete), and is parked: parent unknown.
+    // The child arrives first (complete), and is parked: parent unknown (both named
+    // by the chain entry).
+    rig.name_up_to(G + 2);
     rig.push_full(G + 2);
     kat::check(rig.idx->have_block(rig.at(G + 2).id), "B: the child is parked");
 
@@ -746,7 +767,7 @@ void test_cohort_ignores_peers_behind_us() {
 // D1 ---------------------------------------------------------------------
 void test_evict_far_unresolved_first() {
     native::AltPool pool;
-    pool.set_caps(4, 0);
+    pool.set_caps(4);
     std::uint64_t seq = 0;
     auto park = [&](std::uint64_t height) {
         native::AltBlock b;
@@ -790,10 +811,14 @@ void test_far_pushes_not_parked_while_behind() {
     kat::checkf(rig.idx->orphans_parked() == 0, "D2: none counted as parked (%llu)",
                 (unsigned long long)rig.idx->orphans_parked());
 
-    // A push NEAR the tip still parks (it is what a chain entry is about to
-    // explain), and its parent is asked for.
+    // A push NEAR the tip, unasked, is refused with no strike too; once a chain
+    // entry names it, it parks (and its parent is asked for).
     rig.push_full(kAnchorHeight + 10);
-    kat::check(rig.idx->have_block(rig.at(kAnchorHeight + 10).id), "D2: a near push still parks");
+    kat::check(!rig.idx->have_block(rig.at(kAnchorHeight + 10).id) && rig.fetcher.penalties.empty(),
+               "D2: an unasked near push is refused with no strike");
+    rig.name_up_to(kAnchorHeight + 10);
+    rig.push_full(kAnchorHeight + 10);
+    kat::check(rig.idx->have_block(rig.at(kAnchorHeight + 10).id), "D2: a near push named by the chain entry parks");
 
     // And the refetch list is bounded on this path too. Synced (so pushes park
     // wherever they claim to be), 450 parks with distinct unknown parents name
@@ -802,6 +827,11 @@ void test_far_pushes_not_parked_while_behind() {
     if (!r2.ok) return;
     r2.idx->force_synced(true);
     for (std::uint64_t k = 0; k < 900; ++k) r2.grow(false);
+    {
+        std::vector<Hash> named;   // the pushed blocks, named (their parents are not)
+        for (std::uint64_t h = kAnchorHeight + 3; h < kAnchorHeight + 900; h += 2) named.push_back(r2.at(h).id);
+        r2.name_ids(named);
+    }
     for (std::uint64_t h = kAnchorHeight + 3; h < kAnchorHeight + 900; h += 2) r2.push_full(h);
     kat::checkf(r2.idx->refetch_wanted().size() <= 256,
                 "D2: the refetch list stays bounded (%zu)", r2.idx->refetch_wanted().size());

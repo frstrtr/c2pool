@@ -308,8 +308,16 @@ int main() {
 
     // ── C3 serving: a parked (unverified) alternative block is not served ──
     {
-        const nat::BlockEntry e = native_block(b32_of(88), kH + 2, tsG + 2, 19);   // parent unknown -> parked
-        const nat::OfferResult r = idx.offer_block(nullptr, e, false);
+        const nat::BlockEntry e = native_block(b32_of(88), kH + 2, tsG + 2, 19);   // parent unknown
+        const nat::OfferResult u = idx.offer_block(nullptr, e, false);               // unasked: refused, no strike
+        C(u.outcome == nat::OfferOutcome::Rejected && !u.peer_fault && !idx.have_block(u.id),
+          std::string("C3 an unasked orphan is refused with no strike (") + nat::to_string(u.outcome) + ")");
+        nat::ChainEntry ce;                                                         // the chain request names it
+        ce.ids = {nh(idG), u.id};
+        ce.start_height = kH;
+        ce.total_height = kH + 2;
+        idx.on_chain_entry(nat::PeerRef{}, std::move(ce));
+        const nat::OfferResult r = idx.offer_block(nullptr, e, false);               // asked for -> parked
         std::vector<std::uint8_t> out;
         C(r.outcome == nat::OfferOutcome::ParkedOrphan && idx.alt_size() >= 1 && !idx.block_blob_of(r.id, out),
           std::string("C3 a parked orphan is held but NOT served as a context (") + nat::to_string(r.outcome) + ": " + r.why + ")");

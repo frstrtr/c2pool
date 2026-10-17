@@ -153,8 +153,8 @@ inline std::uint64_t alt_verified_bytes_cap_max(std::size_t alt_max_blocks, std:
 }
 
 // The kept blobs' file (node-local): u32 n | n x (id 32 | u32 len | blob len B), integers LE, ids ascending: the block of
-// each kept row off the main chain. Bounded by the native alt store: n <= alt_max_blocks, the sum of len <=
-// alt_max_bytes (each len checked against what is left before its blob is read).
+// each kept row off the main chain. Bounded by the native alt store: n <= alt_max_blocks, the sum of len <= its verified
+// class byte cap (each len checked against what is left before its blob is read).
 inline std::vector<std::uint8_t> encode_kept_blobs(const std::map<Hash32, std::vector<std::uint8_t>>& t) {
     std::vector<std::uint8_t> out;
     const auto put_u32 = [&](std::uint32_t x) {
@@ -468,7 +468,7 @@ public:
     std::uint64_t kept_cap() const noexcept { return kept_rows_cap(alt_max_blocks_); }
     std::string kept_path() const { return path_ + "_kept"; }
     std::string blobs_path() const { return path_ + "_kept_blobs"; }
-    // The native alt store's byte cap (alt_max_bytes): the kept blobs' bound on disk.
+    // The native alt store's verified class byte cap (alt_verified_bytes_cap): the kept blobs' bound on disk.
     void set_alt_max_bytes(std::uint64_t n) noexcept { alt_max_bytes_ = n; }
     std::size_t loaded() const noexcept { return loaded_; }
     std::size_t kept_blobs_loaded() const noexcept { return kept_blobs_loaded_; }
@@ -554,7 +554,7 @@ private:
     std::map<Hash32, BranchBlock> kept_;  // rows kept across a restart (served by block() when not held)
     std::uint64_t alt_keep_ = kAltDepth;
     std::size_t alt_max_blocks_ = ::c2pool::xmr::native::ChainIndexOptions{}.alt_max_blocks;
-    std::uint64_t alt_max_bytes_ = ::c2pool::xmr::native::ChainIndexOptions{}.alt_max_bytes;
+    std::uint64_t alt_max_bytes_ = alt_verified_bytes_cap_max(::c2pool::xmr::native::ChainIndexOptions{}.alt_max_blocks);
     std::map<Hash32, std::vector<std::uint8_t>> kept_blobs_;  // kept alternative blocks' blobs from before a restart
     std::size_t kept_blobs_loaded_ = 0;
     std::uint64_t recorded_ = 0;

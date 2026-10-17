@@ -153,11 +153,11 @@ struct AltBlock {
 // --- the pool -----------------------------------------------------------------------
 class AltPool {
 public:
-    // max_blocks: both classes; max_bytes: the blocks without proven work; the verified class's byte cap is set apart
-    // (set_verified_bytes_cap; 0 = none but the count).
-    void set_caps(std::size_t max_blocks, std::uint64_t max_bytes) {
+    // max_blocks: both classes; the verified class's byte cap is set apart (set_verified_bytes_cap; 0 = none but the
+    // count). The blocks without proven work have no byte cap of their own: only a block we asked for (or our own) is
+    // held without proven work (the chain index's rule), so their bytes are bounded by what we ask for.
+    void set_caps(std::size_t max_blocks) {
         max_blocks_ = max_blocks;
-        max_bytes_  = max_bytes;
         evict_();
     }
     void set_verified_bytes_cap(std::uint64_t max_vbytes) {
@@ -223,6 +223,18 @@ public:
     }
 
     void erase(const Hash& id) { erase_key_(key_(id)); }
+
+    // Every block without proven work that `src` served (a peer whose block failed its PoW); the count erased.
+    std::size_t erase_unproven_from(const PeerRef& src) {
+        if (src.peer_id == 0 && src.addr.empty()) return 0;
+        std::vector<Key> ks;
+        for (const auto& kv : blocks_)
+            if (!kv.second.verified_class && kv.second.source.peer_id == src.peer_id && kv.second.source.addr == src.addr)
+                ks.push_back(kv.first);
+        std::size_t n = 0;
+        for (const Key& k : ks) n += erase_key_(k) ? 1 : 0;
+        return n;
+    }
 
     // Drop a block and everything descended from it: what a PoW failure or a
     // consensus refusal means for a branch is that the whole branch above the
@@ -381,18 +393,17 @@ private:
     // use yet. Unresolved blocks go farthest claimed height first, newest
     // arrival breaking a tie. Resolved ordering is unchanged.
     //
-    // Two byte classes: a block without proven work (unresolved, or its PoW not checkable yet) counts against
-    // max_bytes_ and an over-cap there evicts only such blocks; a resolved PoW-verified block counts against
-    // max_vbytes_ and an over-cap there evicts only verified blocks; over the shared count, a block without proven
-    // work goes first. So a flood of blocks without work never evicts a verified block nor takes its bytes.
+    // Two byte classes: a resolved PoW-verified block counts against max_vbytes_ and an over-cap there evicts only
+    // verified blocks; a block without proven work (unresolved, or its PoW not checkable yet) never counts against it;
+    // over the shared count, a block without proven work goes first. So blocks without work never evict a verified
+    // block nor take its bytes.
     void evict_() {
         for (;;) {
             const bool over_count = max_blocks_ && blocks_.size() > max_blocks_;
-            const bool over_u     = max_bytes_ && ubytes_ > max_bytes_;
             const bool over_v     = max_vbytes_ && vbytes_ > max_vbytes_;
-            if (!over_count && !over_u && !over_v) return;
+            if (!over_count && !over_v) return;
             // the class an over-cap evicts from: none = either (the count: unverified first)
-            const int want = over_u ? 0 : over_v ? 1 : -1;
+            const int want = over_v ? 1 : -1;
             const AltBlock* victim = nullptr;
             for (int pass = 0; pass < 2 && !victim; ++pass) {
                 for (const auto& kv : blocks_) {
@@ -432,7 +443,6 @@ private:
     std::uint64_t                      ubytes_peak_ = 0;
     std::uint64_t                      max_vbytes_ = 0;   // 0: the verified class has no byte cap but the count
     std::size_t                        max_blocks_ = 512;
-    std::uint64_t                      max_bytes_  = 32ull * 1024ull * 1024ull;
 };
 
 } // namespace c2pool::xmr::native

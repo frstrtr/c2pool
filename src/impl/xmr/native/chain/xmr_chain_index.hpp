@@ -105,10 +105,10 @@ struct ChainIndexOptions {
     std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis (k_alt, P-07)
     // the alt store's blocks: one full context climb (max_reorg_depth = k_alt alternative blocks) servable
     std::size_t   alt_max_blocks  = static_cast<std::size_t>(max_reorg_depth);
-    // the alt store's bytes of blocks without proven work (unresolved, or PoW not checkable yet): policy, the existing
-    // 32 MiB ("blocks without proven work"); the verified class's byte cap is the consumer's (set_alt_verified_max_bytes)
-    std::uint64_t alt_max_bytes   = 32ull * 1024 * 1024;
-    std::uint64_t alt_verified_max_bytes = 0;              // 0: the count only
+    // the alt store's bytes of resolved, PoW-verified blocks: the consumer derives the cap (set_alt_verified_max_bytes);
+    // 0: the count only. Blocks without proven work have no byte cap: only a block we asked for (or our own) is held
+    // without proven work, so they are bounded by what we ask for (the fetch window, the refetch list, the booking list).
+    std::uint64_t alt_verified_max_bytes = 0;
     std::size_t   entry_cache     = 1024;                  // bodies kept for re-apply
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
     std::uint64_t burial_depth    = 60;                    // Monero D_conf
@@ -258,7 +258,7 @@ public:
         rows_.set_retention(opts_.row_retention);
         rows_.set_trim_observer([this](const RowRecord& r) { keep_trimmed_locked_(r); });   // COLD-BOOT-4
         uf_watch_ = UnknownForkWatch(opts_.unknown_fork_stall_ms);
-        alt_.set_caps(opts_.alt_max_blocks, opts_.alt_max_bytes);
+        alt_.set_caps(opts_.alt_max_blocks);
         alt_.set_verified_bytes_cap(opts_.alt_verified_max_bytes);
         view_.state().set_row_retention(opts_.row_retention);
         // One sink into the state view; it queues rather than dispatches, so no
@@ -636,6 +636,16 @@ public:
             || r.outcome == OfferOutcome::Duplicate;
     }
 
+    // Unproven blocks refused as unsolicited, and unproven blocks dropped with a source whose block failed its PoW.
+    std::uint64_t unsolicited_dropped() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return unsolicited_dropped_;
+    }
+    std::uint64_t source_dropped() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return source_dropped_;
+    }
+
     // The alt store: its bytes now, the most it held, and its caps (blocks, bytes).
     std::uint64_t alt_bytes() const {
         std::lock_guard<std::mutex> lk(mu_);
@@ -658,18 +668,12 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return alt_.verified_bytes_cap();
     }
-    // The verified class's byte cap (the consumer derives it: alt_max_blocks x the context blob cap at its view); and,
-    // for a test, the cap of the blocks without proven work.
+    // The verified class's byte cap (the consumer derives it: alt_max_blocks x the context blob cap at its view).
     void set_alt_verified_max_bytes(std::uint64_t n) {
         std::lock_guard<std::mutex> lk(mu_);
         alt_.set_verified_bytes_cap(n);
     }
-    void set_alt_unverified_max_bytes(std::uint64_t n) {
-        std::lock_guard<std::mutex> lk(mu_);
-        alt_.set_caps(opts_.alt_max_blocks, n);
-    }
     std::size_t alt_max_blocks() const noexcept { return opts_.alt_max_blocks; }
-    std::uint64_t alt_max_bytes() const noexcept { return opts_.alt_max_bytes; }
 
     SyncState sync_state() const override {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1436,6 +1440,15 @@ private:
                 r.why     = "parent unknown and below the retained window; ignored";
                 return r;
             }
+            // Only a block we asked for (or our own) parks without proven work: an unsolicited orphan is dropped with
+            // no strike and the sync's chain request fetches it, as monerod does.
+            if (!own_mined && !solicited_locked_(r.id)) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "an orphan we did not request; the chain request fetches it";
+                return r;
+            }
             AltBlock b;
             b.id             = r.id;
             b.prev_id        = prev;
@@ -1489,6 +1502,12 @@ private:
                 r.why     = "already parked, unjudgeable: " + why;
                 return r;
             }
+            if (!own_mined && !alt_.contains(r.id) && !solicited_locked_(r.id)) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "an unjudgeable block we did not request; the chain request fetches it";
+                return r;
+            }
             const bool was_parked = alt_.contains(r.id);
             AltBlock b;
             b.id             = r.id;
@@ -1519,12 +1538,20 @@ private:
             r.fault      = PeerFault::BadPow;
             r.why        = "proof of work does not meet the difficulty we computed";
             alt_.erase_branch(r.id);
+            if (peer) source_dropped_ += alt_.erase_unproven_from(*peer);  // every unproven block that peer served
             penalize_locked_(peer, PeerFault::BadPow, r.why);
             return r;
         }
         const bool pow_ok = pow_verdict_is_verified(pw.verdict);
         if (opts_.require_pow && !pow_ok && pw.verdict != PowVerdict::Skipped) {
-            // Fail-closed: hold it rather than build on work we did not check.
+            // Fail-closed: hold it rather than build on work we did not check -- only a block we asked for (or our
+            // own); any other is dropped with no strike and fetched again by the sync.
+            if (!own_mined && !alt_.contains(r.id) && !solicited_locked_(r.id)) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "a block whose proof of work is not checkable yet, not requested; the chain request fetches it";
+                return r;
+            }
             AltBlock b;
             b.id             = r.id;
             b.prev_id        = prev;
@@ -1820,6 +1847,12 @@ private:
     // difficulty of its own.
     void resolve_descendants_locked_(const Hash& id) {
         std::vector<Hash> stack{id};
+        std::vector<PeerRef> dropped;  // sources whose block failed its PoW in this walk
+        const auto from_dropped = [&dropped](const PeerRef& s) {
+            for (const PeerRef& d : dropped)
+                if (d.peer_id == s.peer_id && d.addr == s.addr) return true;
+            return false;
+        };
         std::size_t guard = 0;
         while (!stack.empty() && ++guard < 4096) {
             const Hash cur = stack.back();
@@ -1838,6 +1871,7 @@ private:
             for (const AltBlock* child : alt_.children_of(cur)) kids.push_back(*child);
             for (AltBlock& c : kids) {
                 const Hash child_id = c.id;
+                if (!alt_.contains(child_id) && from_dropped(c.source)) continue;  // dropped with its source
                 if (c.resolved && c.adoptable) { stack.push_back(child_id); continue; }
                 c.height = height + 1;
                 std::string why;
@@ -1866,6 +1900,8 @@ private:
                                      "a parked block's proof of work does not meet the "
                                      "difficulty we computed for it");
                     alt_.erase_branch(child_id);
+                    source_dropped_ += alt_.erase_unproven_from(src);  // every unproven block that peer served
+                    dropped.push_back(src);
                     continue;
                 }
                 c.pow_verified = pow_verdict_is_verified(pw.verdict);
@@ -2740,6 +2776,12 @@ private:
 
     // How far above our tip the chain-entry want list is handed out: half the
     // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
+    // A block we asked for: in the chain entry's wanted ids, the parents asked again, or the bodies the booking asked
+    // back. Only these may wait in the alt store without proven work.
+    bool solicited_locked_(const Hash& id) const {
+        return contains_hash_(wanted_, id) || contains_hash_(refetch_, id) || contains_hash_(booking_wanted_, id);
+    }
+
     std::uint64_t fetch_window_() const {
         if (!opts_.alt_max_blocks) return MAX_SPAN_IDS;
         return opts_.alt_max_blocks >= 2 ? opts_.alt_max_blocks / 2 : 1;
@@ -3483,6 +3525,8 @@ private:
 
     std::map<std::string, PeerSyncData> peers_;   // keyed by peer_key_()
     std::vector<Hash> wanted_;
+    std::uint64_t unsolicited_dropped_ = 0;   // unproven blocks refused: not requested
+    std::uint64_t source_dropped_      = 0;   // unproven blocks dropped with a source whose block failed its PoW
     std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
     std::vector<Hash> booking_wanted_;            // COLD-BOOT: bodies the booking asked back (bounded)
