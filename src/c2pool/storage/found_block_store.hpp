@@ -497,6 +497,8 @@ public:
         std::vector<uint8_t> data;
         if (!m_store.get(*key, data)) return false;
         auto rec = MergedBlockRecord::deserialize(data);
+        if (rec.block_hash.empty())
+            return false; // damaged row; don't overwrite it with an empty one
         rec.coinbase_value = coinbase_value;
         return m_store.put(*key, rec.serialize());
     }
@@ -510,6 +512,8 @@ public:
         std::vector<uint8_t> data;
         if (!m_store.get(*key, data)) return false;
         auto rec = MergedBlockRecord::deserialize(data);
+        if (rec.block_hash.empty())
+            return false; // damaged row; don't overwrite it with an empty one
         rec.coinbase_txid = coinbase_txid;
         rec.tx_count = tx_count;
         return m_store.put(*key, rec.serialize());
