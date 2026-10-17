@@ -1536,6 +1536,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::uint64_t own_carriers = 0, own_orphaned = 0;
         pb::PathbNode::OpenState open{};
         pb::PathbNode::Liveness liveness{};
+        pb::PathbNode::WindowFlagCounts wflags{};
     };
     const auto node_view = [&]() {
         return relay->with_node([&](pb::PathbNode& n) {
@@ -1563,6 +1564,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.own_orphaned = n.own_orphaned();
             v.open = n.open_state();
             v.liveness = n.liveness();
+            v.wflags = n.window_flags();
             return v;
         });
     };
@@ -1799,11 +1801,18 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             nv.hold.hold ? " hold" : "");
             std::printf("  open-state: placements=%llu bytes=%llu\n", static_cast<unsigned long long>(nv.open.placements),
                         static_cast<unsigned long long>(nv.open.bytes));
+            std::printf("  windows: evaluated=%llu n-dropped-bins=%llu n-cut-position=%llu merged-back=%llu\n",
+                        static_cast<unsigned long long>(nv.wflags.evaluated),
+                        static_cast<unsigned long long>(nv.wflags.n_dropped_bins),
+                        static_cast<unsigned long long>(nv.wflags.n_cut_position),
+                        static_cast<unsigned long long>(nv.wflags.merged_back));
             std::printf("  liveness: live=%llu dead=%llu hash=%s\n", static_cast<unsigned long long>(nv.liveness.live),
                         static_cast<unsigned long long>(nv.liveness.dead), hex_of(nv.liveness.hash).substr(0, 16).c_str());
             if (cur && cur->window.window) {
                 const std::vector<pb::SplitOutput> so = pb::split(cur->reward, *cur->window.window);
-                std::printf("  window: payees=%zu R=%llu\n", so.size(), static_cast<unsigned long long>(cur->reward));
+                std::printf("  window: payees=%zu R=%llu n-dropped-bins=%d n-cut-position=%d merged-back=%d\n", so.size(),
+                            static_cast<unsigned long long>(cur->reward), cur->window.n_dropped_bins ? 1 : 0,
+                            cur->window.n_cut_position ? 1 : 0, cur->window.merged_back ? 1 : 0);
             }
             const o2::StratumListenerStats ls = listener.stats();
             std::printf("  stratum: conns=%llu active=%llu logins=%llu parked=%llu shares=%llu rejected=%llu "

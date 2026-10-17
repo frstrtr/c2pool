@@ -521,6 +521,15 @@ public:
         std::uint64_t joiner_lost = 0;
     };
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
+    // The windows evaluated since start (each once, the cache) and how many had the N rule drop bins, cut the newest bin
+    // by position, or merge an owner or the author back (logs only).
+    struct WindowFlagCounts {
+        std::uint64_t evaluated = 0;
+        std::uint64_t n_dropped_bins = 0;
+        std::uint64_t n_cut_position = 0;
+        std::uint64_t merged_back = 0;
+    };
+    const WindowFlagCounts& window_flags() const noexcept { return win_flags_; }
     // The re-pended receipts still pending (at most the pending cap): each leaves at its placement or its seal.
     std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
     // Own carriers placed on the best chain since start, and those orphaned (no longer best at their position). Each
@@ -1861,7 +1870,16 @@ private:
 
     TipWindow window_of(const Hash32& tip, const Hash32& p_t, std::uint8_t v) {
         const Hash32 author_id = key_ref_identity(cfg_.author);
-        return windows_->get(tip, v, [&] { return evaluate_window_at(*store_, tip, p_t, *io_.monero, v, author_id); });
+        return windows_->get(tip, v, [&] {
+            TipWindow w = evaluate_window_at(*store_, tip, p_t, *io_.monero, v, author_id);
+            if (w.ok()) {  // each window evaluated once (the cache): what fired
+                ++win_flags_.evaluated;
+                win_flags_.n_dropped_bins += w.n_dropped_bins ? 1 : 0;
+                win_flags_.n_cut_position += w.n_cut_position ? 1 : 0;
+                win_flags_.merged_back += w.merged_back ? 1 : 0;
+            }
+            return w;
+        });
     }
 
     BucketsAnchor anchor_of(const Hash32& at) const {
@@ -2880,6 +2898,7 @@ private:
     std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos
     std::uint64_t own_carriers_ = 0;
     std::uint64_t own_orphaned_ = 0;
+    WindowFlagCounts win_flags_;
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

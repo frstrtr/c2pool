@@ -152,6 +152,8 @@
 //                third node extends the chain past J: the watches are empty;
 //   liveness     the liveness line: two nodes at one tip print one hash;
 //                one more placement at one node changes it there;
+//   wingolden    the job, coinbase and digest bytes of a fixed run equal
+//                the recorded golden;
 //   relayomit    the per-peer omission log: a peer's carrier with room that
 //                leaves out a receipt this node holds pending is counted for
 //                that peer's link; every link down empties the log;
@@ -5185,6 +5187,49 @@ void liveness() {
                   std::to_string(la2.live) + "), B's stays");
 }
 
+// wingolden: A mines 6 carriers (B's receipts pending between them); for each job the receipt body, the miner tx
+// prefix and hash, the template's window_root and the lane digest after placement go into one hash, equal to the
+// recorded golden.
+void wingolden() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    std::vector<std::uint8_t> all;
+    std::vector<std::uint8_t> buf;
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        if (i % 2 == 1)
+            if (const std::optional<pb::PathbJob> jb = h.job(b, 2, 90 + i)) {
+                h.mine(a, 1, 120 + i);
+                (void)h[b].on_own_share(*jb, 90 + i, pb::Hash32{});
+                h.pump();
+            }
+        const pb::PathbTemplate t = h[a].make_template(h.now);
+        const std::optional<pb::PathbJob> j = t.status == pb::TemplateStatus::Ok
+                                                  ? std::optional<pb::PathbJob>(h[a].make_job(t, h.session(1, 100 + i)))
+                                                  : std::nullopt;
+        if (!j) continue;
+        buf.clear();
+        pb::encode_receipt_body_v3(j->body, buf);
+        all.insert(all.end(), buf.begin(), buf.end());
+        all.insert(all.end(), j->miner_tx.prefix.begin(), j->miner_tx.prefix.end());
+        all.insert(all.end(), j->miner_tx.tx_hash.begin(), j->miner_tx.tx_hash.end());
+        all.insert(all.end(), t.window.window_root.begin(), t.window.window_root.end());
+        (void)h[a].on_own_share(*j, 100 + i, pb::Hash32{});
+        h.pump();
+        const std::string ld = h[a].lane_digest();
+        all.insert(all.end(), ld.begin(), ld.end());
+    }
+    const pb::Hash32 g = ::v37::sha256d(all);
+    const std::string d = hex_of_bytes(g.data(), g.size());
+    check(d == "9e8d753920ed4b11e71a761584fa580cf2d9368ddd50e31c99b6bdc78578abd0", "wingolden: the jobs, coinbases and digests of the fixed run equal the golden (" + d + ")");
+    const pb::PathbNode::WindowFlagCounts wf = h[a].window_flags();
+    check(wf.evaluated >= 1 && wf.n_dropped_bins == 0 && wf.n_cut_position == 0 && wf.merged_back <= wf.evaluated,
+          "wingolden: A counted its evaluated windows (" + std::to_string(wf.evaluated) + "; N-rule drops " +
+                  std::to_string(wf.n_dropped_bins) + ", position cuts " + std::to_string(wf.n_cut_position) +
+                  ", merge-backs " + std::to_string(wf.merged_back) + ")");
+}
+
 // relayomit: the per-peer omission log. B holds a receipt pending that never reaches A (B's frames to A dropped); A's
 // next carrier, with room, carries none of it: B logs one omission for A's link. B's link to A goes down: the log is
 // empty, the total kept.
@@ -5727,6 +5772,7 @@ int main(int argc, char** argv) {
     run("openstate", openstate);
     run("ownorphan", ownorphan);
     run("liveness", liveness);
+    run("wingolden", wingolden);
     run("relayomit", relayomit);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
