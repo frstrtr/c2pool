@@ -45,6 +45,14 @@
 #   solo      E: no template without --pathb-launch; with it found blocks
 #             landed=own-index paying the tip's window split; nothing
 #             booked; a restart reloads the store
+#   altctx    (not in the default set; with chain only) A (mine, launch), B (mine), F
+#             (no miner, peers A, B); the pool mines on a branch X of M1;
+#             generateblocks from X's fork point orphans X; A and B stopped.
+#             v1: a fresh C (peer F only) catches up to F's best (the header
+#             path fetches the alternative Monero parents from F); v2: F
+#             restarted, a fresh H (peer F only) catches up to F's best (F
+#             serves the kept alternative blocks it saved,
+#             row_weights_kept_blobs)
 #   hold      K (--native-solo, --pathb-launch, --mine): the rig's K30 set
 #             (--pathb-regtest-k30 2,4,8: G of its own) and a kind-2
 #             deployment file naming epoch 1, which the build lacks: HOLD at
@@ -73,6 +81,8 @@ import urllib.request
 
 SKIP = 77
 PARTS_ALL = ["chain", "pool", "old", "partition", "restart", "fo", "solo", "hold"]
+PARTS_KNOWN = PARTS_ALL + ["altctx"]
+CTX_RE = re.compile(r"ctx_wants=(\d+) ctx_want_bytes=(\d+) ctx_wanted=(\d+) ctx_resolved=(\d+) ctx_gave_up=(\d+)")
 
 # The default regtest monerod endpoint of c2pool-v37-xmr (RPC, ZMQ).
 DEFAULT_RPC_PORT = 18081
@@ -426,6 +436,7 @@ class Rig:
             "stratum_A": b + 20, "stratum_B": b + 21, "stratum_C": b + 22, "stratum_E": b + 23, "stratum_O": b + 24,
             "web_A": b + 30, "web_B": b + 31, "web_C": b + 32, "web_E": b + 33,
             "stratum_K": b + 25, "web_K": b + 34,
+            "relay_F": b + 14, "relay_H": b + 16, "stratum_F": b + 26, "stratum_H": b + 28, "web_F": b + 35, "web_H": b + 37,
         }
         self.addr = {}
         self.genesis = None
@@ -591,6 +602,111 @@ class Rig:
             raise Fail("node %s exited: see %s" % (n, p.logpath))
         self.web.watch(n, self.p["web_" + n])
         return p
+
+    # ---- part altctx ----
+    def start_alt_node(self, n, mine, launch, peers):
+        argv, d = self.pool_argv(n, mine, launch, peers)
+        p = self.start(n, argv, cwd=d)
+        self.nodes[n] = p
+        wait_for(lambda: "stratum: listening on" in p.text() or not p.alive(), 240, "node %s stratum" % n)
+        if not p.alive():
+            raise Fail("node %s exited: see %s" % (n, p.logpath))
+        self.web.watch(n, self.p["web_" + n])
+        return p
+
+    def best_of(self, n):
+        j = self.web.get(n)
+        if not j:
+            return None
+        bt = j["pathb"]["best_tip"]
+        return (bt["pos"], bt["id"])
+
+    def ctx_of(self, n):
+        m = CTX_RE.findall(self.nodes[n].text())
+        return m[-1] if m else None
+
+    def catch_up(self, n, target, secs):
+        t0 = now()
+        while now() - t0 < secs:
+            b = self.best_of(n)
+            if b and target and b[1] == target[1]:
+                return True, now() - t0, b
+            time.sleep(2)
+        return False, now() - t0, self.best_of(n)
+
+    def part_altctx(self):
+        a = self.a
+        self.addr["F"] = self.addr["E"]
+        self.addr["H"] = self.addr["O"]
+        self.start_alt_node("A", True, True, [])
+        self.start_alt_node("B", True, False, ["A"])
+        self.start_alt_node("F", False, False, ["A", "B"])
+        wait_for(lambda: self.relay_ready("F") >= 2, 180, "F's relay links")
+        wait_for(lambda: (self.best_of("F") or (0, ""))[0] >= 3, 400, "F at position 3")
+        h0 = self.chain_tip()
+        P0 = self.hash_at(h0)
+        f0 = self.best_of("F")
+        self.res.note("altctx", "fork point h0=%d %s; F at %s" % (h0, P0, f0))
+        time.sleep(a.altctx_window_s)
+        h1 = self.chain_tip()
+        X = [self.hash_at(h) for h in range(h0 + 1, h1 + 1)]
+        f1 = self.best_of("F")
+        self.res.check("altctx", f1 is not None and f0 is not None and f1[0] >= f0[0] + 2,
+                       "carriers placed on branch X (%d Monero blocks): F %s -> %s" % (len(X), f0, f1))
+        r = rpc(self.m1(), "generateblocks", {"amount_of_blocks": (h1 - h0) + 30, "wallet_address": self.addr["fund"],
+                                              "prev_block": P0})
+        self.res.note("altctx", "generateblocks %d from %s: height %s" % ((h1 - h0) + 30, P0[:16], r.get("height")))
+        time.sleep(15)
+        self.res.check("altctx", bool(X) and self.hash_at(h0 + 1) != X[0], "M1 reorged: branch X is off the main chain")
+        newh = self.chain_tip()
+
+        def followed():
+            st = last_status(self.nodes["F"].text())
+            return st if st is not None and int(st.group(2)) >= newh else None
+        try:
+            wait_for(followed, 180, "F's follower on M1's new chain", 2)
+        except Fail:
+            pass
+        st = last_status(self.nodes["F"].text())
+        self.res.check("altctx", followed() is not None,
+                       "F's follower followed the reorg (monero=%s, M1 at %d): X is an alternative there" %
+                       (st.group(2) if st else "-", newh))
+        for n in "AB":
+            self.web.unwatch(n)
+            self.nodes[n].stop(signal.SIGINT, 90)
+        time.sleep(5)
+        ft = self.best_of("F")
+        self.res.note("altctx", "A, B stopped; F at %s; F ctx %s" % (ft, self.ctx_of("F")))
+        # v1: the holder F running
+        self.start_alt_node("C", False, False, ["F"])
+        ok1, dt1, b1 = self.catch_up("C", ft, a.altctx_catch_s)
+        self.res.check("altctx", ok1, "v1 (holder F running): C reaches F's best %s in %.0f s (C at %s); C ctx %s" %
+                       (ft, dt1, b1, self.ctx_of("C")))
+        self.web.unwatch("C")
+        self.nodes["C"].stop(signal.SIGINT, 60)
+        # v2: every holder restarted (F; A and B stay stopped)
+        self.web.unwatch("F")
+        self.nodes["F"].stop(signal.SIGINT, 90)
+        self.start_alt_node("F", False, False, [])
+        time.sleep(10)
+        fr = self.best_of("F")
+        kept = re.findall(r"follower: row weights .*\((\d+) loaded, (\d+) kept blobs\)", self.nodes["F"].text())
+        self.res.note("altctx", "F restarted: at %s; loaded %s" % (fr, kept[-1] if kept else "-"))
+        self.start_alt_node("H", False, False, ["F"])
+        ok2, dt2, b2 = self.catch_up("H", fr or ft, a.altctx_catch_s)
+
+        def h_resolved():  # H took at least one alternative block from F's context serving
+            c = self.ctx_of("H")
+            return c if c is not None and int(c[3]) >= 1 else None
+        try:
+            wait_for(h_resolved, 90, "H's context resolved", 2)
+        except Fail:
+            pass
+        hc = self.ctx_of("H")
+        self.res.check("altctx", ok2 and bool(kept) and int(kept[-1][1]) >= 1 and hc is not None and int(hc[3]) >= 1,
+                       "v2 (every holder restarted): F serves its kept alternative blocks (%s kept blobs); H reaches F's best "
+                       "%s in %.0f s (H at %s); H ctx_resolved >= 1: H ctx %s; F ctx %s" %
+                       (kept[-1][1] if kept else "-", fr or ft, dt2, b2, hc, self.ctx_of("F")))
 
     def relay_ready(self, n):
         m = last_relay(self.nodes[n].text())
@@ -1364,6 +1480,10 @@ class Rig:
     # ---- the run ----
     def run(self):
         parts = self.a.parts
+        if "altctx" in parts:
+            self.part_chain()
+            self.part_altctx()
+            return
         need_chain = any(x in parts for x in ["chain", "pool", "old", "partition", "restart", "fo"])
         if need_chain:
             self.part_chain()
@@ -1416,13 +1536,18 @@ def main():
     ap.add_argument("--solo-nolaunch-s", type=int, default=30)
     ap.add_argument("--solo-s", type=int, default=300)
     ap.add_argument("--hold-s", type=int, default=600)
+    ap.add_argument("--altctx-window-s", type=int, default=60)
+    ap.add_argument("--altctx-catch-s", type=int, default=180)
     a = ap.parse_args()
     a.mine_threads = {k: int(v) for k, v in (x.split("=") for x in a.mine_threads.split(","))}
     a.parts = [x for x in a.parts.split(",") if x]
     for x in a.parts:
-        if x not in PARTS_ALL:
+        if x not in PARTS_KNOWN:
             print("unknown part %s" % x)
             return 2
+    if "altctx" in a.parts and not set(a.parts) <= {"chain", "altctx"}:
+        print("the part altctx runs with chain only")
+        return 2
     a.monerod = os.environ.get("XMR_REGTEST_MONEROD", "")
     a.wallet_rpc = os.environ.get("XMR_REGTEST_WALLET_RPC", "")
     if a.monerod and not a.wallet_rpc:
