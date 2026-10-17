@@ -65,7 +65,8 @@
 //   relay glue        offer_empty_store_tip (an empty store whose catch-up
 //                     from position 0 got no header: the peer's HELLO tip a
 //                     join candidate), take_parked (a parked frame run again),
-//                     set_join_step (the join worker's step callback),
+//                     take_repended (the receipts a switch re-pended, to
+//                     relay), set_join_step (the join worker's step callback),
 //                     may_ask / take_rewalk_frames (the re-walk of parked
 //                     frames), on_body_set (a walked carrier's bodies from a
 //                     reply to the node's own FC_GETCARRIER),
@@ -305,6 +306,7 @@ class PendingSet {
 public:
     explicit PendingSet(std::uint64_t cap) : cap_(cap) {}
     std::size_t size() const noexcept { return by_id_.size(); }
+    std::uint64_t cap() const noexcept { return cap_; }
     bool holds(const Hash32& id) const { return by_id_.count(id) != 0; }
     const PendingReceipt* get(const Hash32& id) const {
         const auto it = by_id_.find(id);
@@ -480,6 +482,7 @@ public:
     const CarrierBodies& bodies() const noexcept { return *bodies_; }
     const HeaderIndex& headers() const noexcept { return *headers_; }
     const PendingSet& pending() const noexcept { return pending_; }
+    std::uint64_t pending_cap() const noexcept { return pending_.cap(); }  // P-09
     const DeferredCarriers& deferred() const noexcept { return deferred_; }
     const AlarmSink& alarms() const noexcept { return alarm_; }
     // A's bound-work profile (rule (4)): the joined state's in its session, else the node's own chain's.
@@ -666,6 +669,9 @@ public:
         std::uint64_t objects = 0;
     };
     std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
+    // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
+    // call: the caller relays them as FB_RECEIPTS v3 (a receipt no longer pending then is skipped there).
+    std::vector<Hash32> take_repended() { return std::exchange(repended_out_, {}); }
     std::vector<ParkedFrame> take_rewalk_frames() {
         std::vector<ParkedFrame> out;
         if (poisoned_) return out;
@@ -1301,6 +1307,11 @@ public:
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
         std::vector<Hash32> ids;
+        // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
+        // again once it resolves
+        Hash32 fetch{};
+        Hash32 from{};
+        Hash32 stop{};
     };
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
@@ -1335,6 +1346,9 @@ public:
             const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(h.own.blob.prev_id) : PrInfo{};
             if (pr.status == PrInfo::Status::Missing) {
                 out.kind = HeadersOutcome::Kind::Defer;
+                out.fetch = h.own.blob.prev_id;
+                out.from = req.fork;
+                out.stop = req.stop;
                 return out;
             }
             if (pr.status == PrInfo::Status::BadServed) {
@@ -2670,7 +2684,10 @@ private:
                 }
                 const CarrierNode* t = tree_->find(r.side.tip);
                 // the verified body: no second RandomX; one the pending set evicts at once is not counted
-                if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) ++out.repended;
+                if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) {
+                    ++out.repended;
+                    repended_out_.push_back(rid);  // relayed as FB_RECEIPTS v3 (take_repended)
+                }
             }
         }
         if (joined_store()) reask_pending_ = true;  // E-72: the claimed leaves asked again at the new chain
@@ -2724,6 +2741,7 @@ private:
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
+    std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

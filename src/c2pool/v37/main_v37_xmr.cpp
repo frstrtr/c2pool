@@ -262,7 +262,7 @@ static std::string u128_dec(std::uint64_t lo, std::uint64_t hi) {
 
 // <data>: --data-dir, else the config path.
 static std::filesystem::path data_root(const XmrNodeConfig& cfg) {
-    if (!cfg.settle_db_path.empty()) return std::filesystem::path(cfg.settle_db_path);
+    if (!cfg.data_dir.empty()) return std::filesystem::path(cfg.data_dir);
     return core::filesystem::config_path();
 }
 
@@ -779,7 +779,7 @@ static void name_other_stores(const XmrNodeConfig& cfg, const std::filesystem::p
     std::error_code ec;
     std::vector<std::filesystem::path> old;
     old.push_back(netdir / "v37_settle_db");
-    if (!cfg.settle_db_path.empty()) old.push_back(std::filesystem::path(cfg.settle_db_path));
+    if (!cfg.data_dir.empty()) old.push_back(std::filesystem::path(cfg.data_dir));
     for (const std::filesystem::path& p : old)
         if (std::filesystem::exists(p / "settle.img", ec))
             std::printf("store: old-path store at %s: not read, flag day S4w\n", p.string().c_str());
@@ -1486,6 +1486,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::size_t pending = 0;
         std::size_t deferred = 0;
         std::uint64_t pending_digest = 0;
+        std::vector<std::string> pending_ids;  // the first 64, 12 hex digits each (the relay log's form)
         std::uint64_t leaf_count = 0;
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
@@ -1506,6 +1507,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 std::uint64_t x = 0;
                 for (std::size_t i = 0; i < 8; ++i) x |= std::uint64_t{r->id[i]} << (8 * i);
                 v.pending_digest ^= x;
+                if (v.pending_ids.size() < 64) v.pending_ids.push_back(hex_of(r->id).substr(0, 12));
             }
             const pb::LaneView lv = n.store().view_at(b.id);
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
@@ -1783,13 +1785,16 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 const pb::PathbRelayStats& rs = relay->stats();
                 const pb::OwnShareRunner::Stats os = own_runner.stats();
                 std::printf("  soak: p15_drops=%llu reoffer_paused=%llu queued_bytes_hwm=%zu queue_full_drops=%llu "
+                            "reoffer_queue_full_drops=%llu live_queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
                             "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
-                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu\n",
+                            "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
+                            static_cast<unsigned long long>(rs.reoffer_queue_full.load()),
+                            static_cast<unsigned long long>(rs.live_queue_full.load()),
                             static_cast<unsigned long long>(rs.rx_failures.load()),
                             static_cast<unsigned long long>(os.rx_failures), own_runner.kept(),
                             static_cast<unsigned long long>(os.stale),
@@ -1805,7 +1810,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             relay->ctx_want_bytes(), static_cast<unsigned long long>(rs.ctx_wanted.load()),
                             static_cast<unsigned long long>(rs.ctx_resolved.load()),
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
-                            static_cast<unsigned long long>(rs.parked_reruns.load()));
+                            static_cast<unsigned long long>(rs.parked_reruns.load()),
+                            static_cast<unsigned long long>(rs.repend_offers.load()),
+                            static_cast<unsigned long long>(rs.repend_offered.load()));
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
@@ -1851,7 +1858,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             w.pathb.leaf_count = nv.leaf_count;
             w.pathb.pending = nv.pending;
             w.pathb.deferred = nv.deferred;
+            w.pathb.pending_ids = nv.pending_ids;
             w.pathb.repended_last_switch = nv.sw.last_repended;
+            w.pathb.switches = nv.sw.switches;
             w.pathb.template_status = template_status_name(tstatus);
             w.pathb.hold = nv.hold.hold;
             w.pathb.fork_fuse = fork_fuse;
@@ -2371,7 +2380,7 @@ int main(int argc, char** argv) {
                     throw cs::UsageError("--same-height-tiebreak takes prefer-own or first-seen, not '" + m + "'");
             } else if (a == "--own-fork-bound-s") cfg.own_fork_bound_s = u32();
             else if (a == "--test-unknown-fork-stall-s") cfg.test_unknown_fork_stall_s = u32();
-            else if (a == "--data-dir") cfg.settle_db_path = value();
+            else if (a == "--data-dir") cfg.data_dir = value();
             else if (a == "--i-understand-mainnet") cfg.i_understand_mainnet = true;
             else if (a == "--randomx") cfg.randomx_enabled = true;
             else if (a == "--randomx-large-pages") cfg.randomx_large_pages = true;

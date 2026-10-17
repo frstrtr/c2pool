@@ -8,15 +8,14 @@
 // ===========================================================================
 // src/c2pool/v37/xmr/xmr_native_template_backend.hpp   (M2)
 //
-// THE M2 REBIND, from the consumer side: the option-B K_fair settlement
-// coinbase, built from the NATIVE Monero node instead of from a daemon RPC.
+// THE M2 REBIND, from the consumer side: the Path B template's miner data,
+// from the NATIVE Monero node instead of from a daemon RPC.
 //
 // M0 assembled the native node and proved it follows a live tip over levin. M1
 // proved its transaction pool equals monerod's, per transaction. C4 landed the
 // IMinerDataSource seam and both of its arms. What was left -- and what this
 // file is -- is the wire between them: a running NativeNode, its serving arm
-// resolved per refresh, handed to the UNMODIFIED XmrSettlementTemplateProvider
-// so the assembler above the seam builds the same coinbase it always did from
+// resolved per refresh, handed to the Path B template build as its miner data,
 // numbers no daemon supplied.
 //
 //   NativeNode (C1 levin + C2 chain index + C3 txpool)
@@ -27,10 +26,10 @@
 //        (MonerodMinerDataSource is the SHADOW arm, read only by C6)
 //                                                       |
 //                                                       v  IMinerDataSource
-//                             XmrSettlementTemplateProvider  (UNCHANGED)
+//                             the Path B template build (PathbNode)
 //                                                       |
 //                                                       v
-//                             the K_fair settlement coinbase, in a block
+//                             the Path B miner tx, in a block
 //
 // WHAT "NATIVE" MEANS HERE, precisely. With `--xmr-template-source native` and
 // the fallback off, the template path performs ZERO monerod calls: height,
@@ -154,9 +153,7 @@ struct NativeTemplateConfig {
     std::uint32_t            ready_timeout_s = 120;
 
     // D-14 / c2pool#1551: the fork choice's rule at EQUAL cumulative difficulty
-    // at the same height. Driven from the same --same-height-tiebreak flag the
-    // settlement accounting reads, so "what we build on" and "what we nominate"
-    // cannot be configured apart.
+    // at the same height. Driven from the --same-height-tiebreak flag.
     native::TieBreak         fork_tie = native::TieBreak::PreferOwn;
     // Own-fork liveness guard bound (--own-fork-bound-s); 0 disables.
     std::uint64_t            own_fork_bound_ms = 240'000;
@@ -239,7 +236,8 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
 
     n.snapshot_path    = cfg.native_snapshot_path;
     n.snapshot_every_s = cfg.native_snapshot_every_s;
-    // COLD-BOOT-2: the settlement paces the catch-up download (p2p-first anchor boot only).
+    // COLD-BOOT-2: the Path B follower's recorded frontier paces the catch-up download (p2p-first anchor
+    // boot only).
     // COLD-BOOT-4: ONE predicate, the boot mode -- an explicit --native-anchor and the
     // compiled-in PINNED snapshot (no anchor path) are the same anchor boot. The old
     // path test left the pinned default unpaced: the whole post-anchor gap was
@@ -288,7 +286,7 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
     n.ready_timeout_s      = cfg.native_ready_timeout_s;
     n.backlog_refresh_s    = cfg.native_backlog_refresh_s;
     // D-14 lever (1): what the fork choice adopts at EQUAL work at the same
-    // height. Same flag as the accounting tiebreak -- see xmr_same_height_race.hpp.
+    // height: --same-height-tiebreak (SameHeightTieBreak, xmr_node_config.hpp).
     n.fork_tie = (cfg.same_height_tiebreak == SameHeightTieBreak::PreferOwn)
                      ? native::TieBreak::PreferOwn
                      : native::TieBreak::FirstSeen;
@@ -385,11 +383,11 @@ public:
             const native::MinerDataReadiness r =
                 want ? want->readiness() : native::MinerDataReadiness{};
             if (r.ok()) { why.clear(); return true; }
-            // COLD-BOOT-2: the catch-up download is paused at the settlement's
-            // ceiling (anchor + window before the settlement exists): the index
-            // cannot sync until the settlement books, and the settlement books
-            // from the serve loop. Proceed; the arm becomes ready as the gap is
-            // booked (the serve loop parks miners until the first template).
+            // COLD-BOOT-2: the catch-up download is paused at the follower's
+            // ceiling (anchor + window before the follower records a row): the
+            // index cannot sync until the follower records, and it records from
+            // the serve loop. Proceed; the arm becomes ready as the gap is
+            // recorded (the serve loop parks miners until the first template).
             if (node_ && node_->index().consumer_held()) {
                 why = "catch-up held at the settlement ceiling h=" + std::to_string(node_->index().consumer_ceiling()) +
                       " (tip " + std::to_string(node_->index().sync_state().header_frontier) + "; " + r.why + ")";

@@ -10,7 +10,8 @@
 // work its TARGET expected (paper §5), in the design's integer unit.
 //
 //   CT1 DROPS is off in the default XMR build; the XMR lane over armed
-//       parameters (for_version(1)) selects Count (mode 2, floor shift 6).
+//       parameters (for_version(1)) selects Count (mode 2, floor shift 6); the
+//       W4 seam (to_subthreshold_params) maps it to CreditMode::Count.
 //   CT2 integer exactness on the 288-bit normalised geometry (lz = 32):
 //       att(floor) = floor(2^256 / 2^230) = 2^26 = 1/64 of a share's 2^32;
 //       Hhat = (S + J) * 2^26; REPLACE delta = (S + J) * 2^26 - S * 2^32.
@@ -30,8 +31,7 @@
 #include <vector>
 
 #include <c2pool/v37/v37_subthreshold_estimator.hpp>
-#include <c2pool/v37/v37_drop_harvest.hpp>
-#include <c2pool/v37/w4_settlement.hpp>
+#include <c2pool/v37/v37_drop_harvest.hpp>  // (w4_settlement.hpp, the W4 seam, through it)
 #include <c2pool/v37/xmr/xmr_lane_constants.hpp>
 #include <c2pool/v37/xmr/xmr_node_config.hpp>
 
@@ -85,8 +85,8 @@ int main() {
         check(p.subthreshold.mode == 2 && p.subthreshold.count_floor_shift == 6,
               "CT1 mode 2 (Count), floor shift 6 (share_diff / 64)");
         const auto sp = settle::to_subthreshold_params(p);
-        check(sp.mode == st::CreditMode::Count && sp.count_floor_shift == 6,
-              "CT1 the W4 seam maps it to CreditMode::Count");
+        check(sp.enabled && sp.mode == st::CreditMode::Count && sp.count_floor_shift == 6,
+              "CT1 the W4 seam maps mode 2 to CreditMode::Count, floor shift 6");
     }
 
     std::printf("-- CT2 integer exactness (lz = 32 geometry)\n");

@@ -135,8 +135,7 @@ and does not yet exist, so the work can be judged on what it actually is.
   TLC (green over the bounded configurations checked in). This is a proof over a
   *model*, not evidence at scale. `proto/tla/Settlement.tla` revision 2 records
   the owed-sign decisions (a per-key floor, a non-negative aggregate, no
-  clawback; PR #1846), and `proto/tla/SettlementCanon.tla` models the XMR lane
-  ledger under the coinbase recompute and the drain rule (PR #1892).
+  clawback; PR #1846).
 - **A v37 engine consumer tree implemented in C++** under `src/c2pool/v37/` — the
   Work Receipts / Roundabout settlement pipeline as a **reference/prototype engine
   behind CI, not a production node.** Merged behind CI: the W1 O1 executor and W2

@@ -104,9 +104,8 @@ inline const char* to_string(TemplateSourceMode m) {
     return m == TemplateSourceMode::Native ? "native" : "monerod";
 }
 
-// M3 (R-ARMORDER): which arm drives the FIND path -- the parent tip the
-// template is built on, the block-presence test the finalize driver asks, and
-// the arm a found block goes out on.
+// M3: which arm drives the FIND path -- the parent tip the template is built
+// on, the block-presence test, and the arm a found block goes out on.
 //
 //   DaemonFirst (the DEFAULT, and what M0..M2h shipped): monerod drives. The
 //     tip arrives through LiveMonerodTransport's get_miner_data poll (or ZMQ),
@@ -116,8 +115,8 @@ inline const char* to_string(TemplateSourceMode m) {
 //     is what M2h proved; the daemon stays on the find path either way.
 //
 //   P2PFirst: the embedded native node drives, end to end. Its levin-driven C2
-//     chain index is the tip, the same index answers the finalize driver's
-//     canonical test, and a found block goes out over levin as a 2008
+//     chain index is the tip, the same index answers the canonical
+//     (block-presence) test, and a found block goes out over levin as a 2008
 //     NOTIFY_NEW_FLUFFY_BLOCK (C5 ARM A, ArmOrder::P2pOnly). monerod is NOT
 //     consulted anywhere on that path -- not for the tip, not for the
 //     template, not for the submit. It may still be configured, and is then
@@ -270,11 +269,11 @@ struct XmrNodeConfig {
     // Seconds between periodic saves. 0 = only on a clean stop.
     std::uint64_t   native_snapshot_every_s = 300;
     // COLD-BOOT-2: the native node downloads the catch-up gap at most this many
-    // heights above the settlement's booked frontier (its finalize cursor), so
-    // the gap is booked while it downloads, in bounded chain-ordered batches,
-    // and no unbooked block leaves the index's row retention (2048) or body
-    // cache (1024) first. p2p-first anchor boots only. 0 = off (pre-fix shape:
-    // the whole gap is downloaded before the settlement books any of it).
+    // heights above the Path B follower's recorded frontier, so the gap is
+    // recorded while it downloads, in bounded chain-ordered batches, and no
+    // unrecorded block leaves the index's row retention (2048) or body cache
+    // (1024) first. p2p-first anchor boots only. 0 = off (the whole gap is
+    // downloaded before the follower records any of it).
     std::uint64_t   native_catchup_window = 256;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
@@ -355,8 +354,8 @@ struct XmrNodeConfig {
     // --native-solo. p2p-first already removes the daemon from the find path;
     // this removes the NETWORK from it as well. One process, its own chain from
     // the locally assembled genesis block, its own template, its own hashing
-    // (--mine), its own find, its own finalize -- with nothing else running on
-    // the machine and nothing on the wire.
+    // (--mine), its own find -- with nothing else running on the machine and
+    // nothing on the wire.
     //
     // It is a STRICT EXTENSION of p2p-first and turns three things on together,
     // because any one of them without the others is a broken configuration
@@ -379,7 +378,7 @@ struct XmrNodeConfig {
 
     // --- storage ------------------------------------------------------------
     // --data-dir: the node's data directory (empty: the default under config_path()).
-    std::string     settle_db_path;
+    std::string     data_dir;
 
     // --- RandomX verify (X pow/) -------------------------------------------
     // Heavy (256 MiB light cache + light VM). Disabled by default for local /
