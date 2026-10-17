@@ -845,6 +845,14 @@ node is dashd-attached and the `--embedded-*` levers default OFF unless named.
 Only the daemonless trust anchor applies to a daemonless node — see
 [DASH daemonless masternode-set checkpoint](#dash-daemonless-masternode-set-checkpoint--trust-anchor).
 
+**Time to first work on a fresh node.** A fresh daemonless node serves its first
+template after about one hour (measured 2026-10-09: about 56 minutes from a cold
+start on default flags). The wait is the UTXO maturity gate: the embedded fee lane
+has to connect enough blocks before a template may carry mempool transactions, and
+by default the node refuses to serve until it has. Add
+`--embedded-utxo-immature-serve-empty` to serve coinbase-only work during that
+window. A fix that backfills the window at start is in progress.
+
 **Modes and control plane**
 
 | Flag | Meaning |
