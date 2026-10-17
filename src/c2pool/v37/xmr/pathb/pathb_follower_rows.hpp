@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -303,7 +302,8 @@ public:
     // ---- the table file ----
     // Absent file: an empty table (true). A main table that does not decode: false. Kept rows that do not decode:
     // true, the main rows only, `why` says so.
-    bool load(std::string& why) {
+    // `unix_s`: the caller's clock for the name of a kept blobs' file moved aside (the rows read no clock).
+    bool load(std::string& why, std::uint64_t unix_s = 0) {
         std::ifstream f(path_, std::ios::binary);
         if (!f) return true;
         const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -343,7 +343,7 @@ public:
             rows_.emplace(id, ar.row);
             kept_.emplace(id, ar.row);
         }
-        load_kept_blobs_locked(why);
+        load_kept_blobs_locked(why, unix_s);
         return true;
     }
     // Writes the main-chain rows the index holds to `row_weights` and every row within k_alt of the index tip, with
@@ -459,7 +459,7 @@ private:
     // Under mu_: the kept blobs' file read against the caps (n, each len, the sum) before its bytes; each blob's id
     // recomputed from the blob and kept only for a kept row of that id. A file that does not decode is moved aside to
     // `<file>.corrupt-<unix s>` (-2, -3 ... if taken; nothing deleted) and the node starts with no kept blobs.
-    void load_kept_blobs_locked(std::string& why) {
+    void load_kept_blobs_locked(std::string& why, std::uint64_t unix_s) {
         const std::string path = blobs_path();
         std::error_code ec;
         if (!std::filesystem::exists(path, ec)) return;
@@ -473,11 +473,9 @@ private:
                 t = decode_kept_blobs(bytes, alt_max_blocks_, alt_max_bytes_);
         }
         if (!t) {
-            const std::uint64_t now = static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-            std::string aside = path + ".corrupt-" + std::to_string(now);
+            std::string aside = path + ".corrupt-" + std::to_string(unix_s);
             for (int k = 2; std::filesystem::exists(aside, ec) && k < 1000; ++k)
-                aside = path + ".corrupt-" + std::to_string(now) + "-" + std::to_string(k);
+                aside = path + ".corrupt-" + std::to_string(unix_s) + "-" + std::to_string(k);
             std::filesystem::rename(path, aside, ec);
             why += std::string(why.empty() ? "" : "; ") + "kept blobs " + path + " do not decode: moved aside to " + aside +
                    "; no kept blobs";

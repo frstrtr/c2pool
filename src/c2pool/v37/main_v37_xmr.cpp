@@ -347,6 +347,8 @@ private:
 // The follower's alt store caps in force (--alt-max-blocks, else the index's default, k_alt; the index's byte cap), set
 // on the rows (the kept rows' and kept blobs' bounds) before they load; one line when the count is below k_alt.
 // ---------------------------------------------------------------------------
+static std::uint64_t unix_now_s();  // the wall clock in unix seconds (defined below)
+
 static void apply_alt_max_blocks(const XmrNodeConfig& cfg, pb::PathbFollowerRows& rows, const char* who) {
     const std::size_t n = cfg.alt_max_blocks ? cfg.alt_max_blocks : native::ChainIndexOptions{}.alt_max_blocks;
     rows.set_alt_max_blocks(n);
@@ -483,7 +485,7 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
     pb::PathbFollowerRows rows(pmode::follow_only_row_weights_path(dir));
     apply_alt_max_blocks(cfg, rows, "follow-only");
     std::string why;
-    if (!rows.load(why)) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
+    if (!rows.load(why, unix_now_s())) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
     else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     if (!plan.native_node) return 2;
@@ -931,7 +933,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     apply_alt_max_blocks(cfg, rows, "follower");
     {
         std::string why;
-        if (!rows.load(why)) std::printf("follower: %s -- starting with an empty table\n", why.c_str());
+        if (!rows.load(why, unix_now_s())) std::printf("follower: %s -- starting with an empty table\n", why.c_str());
         else std::printf("follower: row weights %s (%zu loaded, %zu kept blobs)%s%s\n", rows.path().c_str(), rows.loaded(),
                          rows.kept_blobs_loaded(), why.empty() ? "" : "; ", why.c_str());
     }
