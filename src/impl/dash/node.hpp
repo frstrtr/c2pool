@@ -1251,6 +1251,18 @@ public:
 
     void set_on_best_share_changed(std::function<void()> fn) { m_on_best_share_changed = std::move(fn); }
     void set_block_rel_height_fn(std::function<int32_t(uint256)> fn) { m_block_rel_height_fn = std::move(fn); }
+    /// Block hash -> block height for the naughty seed rule (share_tracker.hpp
+    /// mark_naughty; active on the DASH v36 network only). Set it before the
+    /// io_context runs; when it is wired after init_storage, call
+    /// reseed_naughty() so the restored shares are seeded too.
+    void set_block_abs_height_fn(std::function<std::optional<uint32_t>(const uint256&)> fn)
+    {
+        std::unique_lock lock(m_tracker_mutex);
+        m_tracker.set_block_abs_height_fn(std::move(fn));
+    }
+    /// Re-run the naughty seed + propagation over every verified share
+    /// (exclusive tracker lock).
+    void reseed_naughty();
 
     // ── #157 M2: peer tx-injection SINK seam ─────────────────────────────
     // The tx_inject handler routes a peer's tx through the SAME M1 gate the
