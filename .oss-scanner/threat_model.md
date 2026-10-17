@@ -129,6 +129,8 @@ lower severity (see below).
   `/src/build/src/c2pool/`; the test and KAT executables sit under
   `/src/build`, mirroring the source tree. `ctest --test-dir /src/build -N`
   lists them.
+- Only the named set is prebuilt; `ninja -C build <target>` builds any other
+  target offline.
 - The KATs make good drivers: they feed known byte strings through the same
   parsers the network paths use. There are fuzz-style harnesses for the Monero
   levin codec and blob reader (`xmr_levin_fuzz_kat`,
