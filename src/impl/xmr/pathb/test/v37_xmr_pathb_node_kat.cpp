@@ -182,6 +182,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -3831,7 +3832,8 @@ void ownrx() {
 // ---------------------------------------------------------------------------
 // relayrxbindr: the bind path on the RECEIPT path (FB_RECEIPTS of a receipt whose tip is a walked carrier): a RandomX
 // failure in the bind of the walked carrier (the first hash of a body only the losing sibling carries) is counted and
-// alarmed; no token, no ban; nothing leaves the relay.
+// alarmed; no token, no ban; nothing leaves the relay. The bind is left to do: the same peer's next offer DEFERs on
+// TipBodies again and its bind (run on every TipBodies DEFER) places the walked carrier; the receipt is admitted.
 void relayrxbindr() {
     const KatNet net;
     Harness h(net);
@@ -3910,14 +3912,36 @@ void relayrxbindr() {
     } catch (const std::exception& e) {
         esc = e.what();
     }
-    w.edit = nullptr;
     const bool thrown = h.throw_pow.count(u) == 0;
-    std::printf("  relayrxbindr: offers=%d thrown=%d escaped='%s' rx_failures=%llu walk_placed=%llu loser@X=%d\n", offers,
-                thrown, esc.c_str(), (unsigned long long)st.rx_failures.load(), (unsigned long long)st.walk_placed.load(),
-                h[x.node].tree().find(loser) != nullptr);
+    const bool loser_at_fail = h[x.node].tree().find(loser) != nullptr;
+    const std::uint64_t parked_at_fail = st.receipts_parked.load();
+    // the bind left to do: the same peer's next offer of rk DEFERs on TipBodies again; its bind places the loser and rk
+    // is admitted
+    int again = 0;
+    try {
+        for (; again < 8 && !h[x.node].pending().holds(pb::receipt_id(rk)); ++again) {
+            x.relay->receive(lo + 1, frk);
+            w.run();
+            h.now += 1;
+            x.relay->tick();
+            w.run();
+        }
+    } catch (const std::exception& e) {
+        esc = e.what();
+    }
+    w.edit = nullptr;
+    std::printf("  relayrxbindr: offers=%d thrown=%d escaped='%s' rx_failures=%llu walk_placed=%llu loser@X=%d (at the failure %d); "
+                "again %d: rk held %d, parked %llu -> %llu\n",
+                offers, thrown, esc.c_str(), (unsigned long long)st.rx_failures.load(), (unsigned long long)st.walk_placed.load(),
+                h[x.node].tree().find(loser) != nullptr, loser_at_fail, again, h[x.node].pending().holds(pb::receipt_id(rk)),
+                (unsigned long long)parked_at_fail, (unsigned long long)st.receipts_parked.load());
     check(thrown && esc.empty() && st.rx_failures.load() >= 1 && st.strikes.load() == 0 && st.bans.load() == 0,
           "relayrxbindr: a RandomX failure in the bind on the receipt path: counted (" + std::to_string(st.rx_failures.load())
                   + "), nothing out of the relay; no strike, no ban");
+    check(!loser_at_fail && h[x.node].tree().find(loser) != nullptr && h[x.node].pending().holds(pb::receipt_id(rk))
+                  && st.receipts_parked.load() > parked_at_fail,
+          "relayrxbindr: the bind left to do runs at the same peer's next TipBodies DEFER: the walked carrier placed, the "
+          "receipt admitted");
 }
 
 
@@ -4857,6 +4881,159 @@ void relayrbindr() {
           "the bind places both, the receipt admitted");
 }
 
+struct RevPark {
+    std::size_t parked = 0, asks = 0, due = 0, index = 0;
+};
+RevPark revpark(pb::PathbRelayNode& r) {
+    return RevPark{r.parked_receipts(), r.parked_receipt_asks(), r.parked_receipts_due(), r.parked_index_size()};
+}
+
+// ---------------------------------------------------------------------------
+// revjunkbig: the receipt park at the default caps (P-09 = the pending cap, a verify queue of 4,096) under junk: one
+// more than the cap's worth of receipts of unknown tips from one peer; the park holds the cap with one ask each. A re-run
+// with an honest job queued takes at most the queue's free room and drops no queued job; the rest drain on the ticks,
+// each tick within the room; every junk receipt parks again with its asks (no new header request).
+void revjunkbig() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 810);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 820);
+    ok = ok && h[a.node].on_own_share(*j0, 810, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(h[a.node].tree().best().id), 16)});
+    w.run();
+    std::optional<pb::ReceiptBodyV3> base;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) base = r->body;
+    ok = ok && base && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "revjunkbig: setup");
+        return;
+    }
+    h.now += 1000;
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t pa = 1;
+    const auto frame_of = [](const pb::ReceiptBodyV3& r) {
+        return *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{r}, pb::kRuledLaneParams);
+    };
+    const std::size_t cap = h[b.node].pending_cap();
+    const std::size_t n = cap + 1500;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t qd_pre = st.queue_dropped.load();
+    for (std::size_t q = 0; q < n; ++q) {
+        pb::ReceiptBodyV3 r = *base;
+        r.side.tip.fill(0x3C);
+        std::memcpy(r.side.tip.data(), &q, sizeof q);
+        rb.receive(pa, frame_of(r));
+        if (q % 1000 == 999) w.run();
+    }
+    w.run();
+    const auto t1 = std::chrono::steady_clock::now();
+    const RevPark p0 = revpark(rb);
+    std::printf("  revjunkbig: cap %zu, %zu junk sent in %.1f s: parked %zu (drops %llu) asks %zu due %zu index %zu; "
+                "queue dropped %llu; tip header requests %llu\n", cap, n,
+                std::chrono::duration<double>(t1 - t0).count(), p0.parked,
+                (unsigned long long)st.parked_receipt_drops.load(), p0.asks, p0.due, p0.index,
+                (unsigned long long)(st.queue_dropped.load() - qd_pre), (unsigned long long)st.tip_header_requests.load());
+    rb.receive(pa, frame_of(*base));  // an honest job queued
+    const std::size_t vq0 = rb.verify_queue_size();
+    const std::uint64_t qd0 = st.queue_dropped.load(), hdr0 = st.tip_header_requests.load();
+    rb.test_rerun(pb::Missing::TipUnknown);
+    const std::size_t vq1 = rb.verify_queue_size(), due1 = rb.parked_receipts_due();
+    w.run();
+    const bool honest = h[b.node].pending().holds(pb::receipt_id(*base));
+    int ticks = 0;
+    for (; ticks < 20 && rb.parked_receipts_due() > 0; ++ticks) {
+        h.now += 1;
+        rb.tick();
+        w.run();
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const RevPark p1 = revpark(rb);
+    std::printf("  revjunkbig: re-run burst: queue %zu -> %zu, due %zu; honest held %d; ticks to drain %d (%.1f s): parked %zu asks %zu "
+                "due %zu index %zu; queue dropped +%llu; tip header requests +%llu\n", vq0, vq1, due1, honest ? 1 : 0, ticks,
+                std::chrono::duration<double>(t2 - t1).count(), p1.parked, p1.asks, p1.due, p1.index,
+                (unsigned long long)(st.queue_dropped.load() - qd0), (unsigned long long)(st.tip_header_requests.load() - hdr0));
+    check(p0.parked == cap && p0.asks == cap && p0.index == cap && p0.due == 0, "revjunkbig: the park holds the cap, one ask each");
+    check(vq1 <= 4096 && st.queue_dropped.load() == qd0 && honest, "revjunkbig: the re-run burst within the verify queue's room; the honest job kept");
+    check(p1.parked == cap && p1.asks == cap && p1.due == 0 && st.tip_header_requests.load() == hdr0,
+          "revjunkbig: the junk re-run and parked again: maps at the cap, no new ask");
+}
+
+// ---------------------------------------------------------------------------
+// revdueorder: six parked receipts (verify queue 4, pending cap 6), two honest jobs queued: the re-run takes the free
+// room (two), the two OLDEST parked receipts first.
+void revdueorder() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(
+            h, w, table0(net), false, false,
+            [](pb::PathbRelayOptions& o) {
+                o.peer_valid_capacity = 100;
+                o.verify_queue_max = 4;
+            },
+            [](pb::PathbNodeConfig& c) { c.pending_cap = 6; });
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    std::vector<pb::PathbJob> jobs;
+    for (std::uint32_t q = 0; q < 2; ++q)
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, q + 2, 810 + q)) jobs.push_back(*j);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && jobs.size() == 2 && mine_on(h, w, a.node, 1, 820);
+    for (std::uint32_t q = 0; ok && q < 2; ++q)
+        ok = h[a.node].on_own_share(jobs[q], 810 + q, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(h[a.node].tree().best().id), 16)});
+    w.run();
+    std::vector<pb::ReceiptBodyV3> rs;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) rs.push_back(r->body);
+    ok = ok && rs.size() == 2;
+    if (!ok) {
+        check(false, "revdueorder: setup");
+        return;
+    }
+    h.now += 1000;
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;
+    const auto frame_of = [](const pb::ReceiptBodyV3& r) {
+        return *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{r}, pb::kRuledLaneParams);
+    };
+    std::vector<std::vector<std::uint8_t>> junk;
+    for (std::uint8_t q = 0; q < 6; ++q) {
+        pb::ReceiptBodyV3 r = rs[0];
+        r.side.tip.fill(0x77);
+        r.side.tip[0] = static_cast<std::uint8_t>(q + 1);
+        junk.push_back(frame_of(r));
+        rb.receive(pa, junk.back());
+        w.run();
+    }
+    rb.receive(pa, frame_of(rs[0]));
+    rb.receive(pa, frame_of(rs[1]));
+    rb.test_rerun(pb::Missing::TipUnknown);
+    std::string taken;
+    for (std::size_t q = 0; q < junk.size(); ++q) taken += rb.receipt_parked(junk[q]) ? "." : "x";
+    std::printf("  revdueorder: after the re-run with two honest jobs queued (room 2): taken out of the park %s (oldest first: xx....)\n",
+                taken.c_str());
+    w.run();
+    check(taken == "xx....", "revdueorder: the due receipts run oldest first within the free room");
+}
+
 // ---------------------------------------------------------------------------
 // ownrxrun: the own share path (W-E5, W-E5b): RandomX fails on a carried receipt of an own share (its memo entry gone):
 // the runner keeps the share (no exit) with one alarm line; its re-run places it (a second line). A kept share whose
@@ -5138,6 +5315,8 @@ int main(int argc, char** argv) {
     run("relayrpark", relayrpark);
     run("relayhdrctx", relayhdrctx);
     run("relayrbindr", relayrbindr);
+    run("revjunkbig", revjunkbig);
+    run("revdueorder", revdueorder);
     run("relayqfull", relayqfull);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
