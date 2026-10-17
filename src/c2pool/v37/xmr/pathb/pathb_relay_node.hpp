@@ -1723,6 +1723,12 @@ private:
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
             case NodeAction::Switched:
+                if (r.action == NodeAction::Switched) {
+                    const PathbNode::SwitchCounts& sc = node_->switch_counts();
+                    log("relay: switch by the journal: re-pended " + std::to_string(r.repended) + ", lost " +
+                        std::to_string(r.lost) + " (re-pended since start " + std::to_string(sc.repended) + ", carried " +
+                        std::to_string(sc.carried) + ", sealed pending " + std::to_string(sc.sealed_pending) + ")");
+                }
                 if (r.action == NodeAction::Switched && node_->reask_pending()) {
                     reask_due_ = true;  // a joined store (its session or a restart): the claimed leaves asked again
                     fx.join = true;
@@ -2619,7 +2625,8 @@ private:
                 std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
                 ", tokens " + std::to_string(rep.strike) +
                 (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
-                (rep.what.empty() ? "" : ": " + rep.what) + ")" + (s->switched ? " -> adopted" : ""));
+                (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
                 if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;

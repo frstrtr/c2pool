@@ -317,6 +317,10 @@ void race() {
     const pb::LaneView v = h[a].store().view_at(h[a].tree().best().id);
     check(v.ok() && v.placed_open(loser) && h[a].tree().best().id == h[b].tree().best().id,
           "race: the losing receipt is placed on the best chain at both nodes (credited in its open origin bin)");
+    check(h[lnode].switch_counts().carried >= 1 && h[lnode].repend_watch_size() == 0,
+          "race: the losing node counts its re-pended receipt carried (" +
+                  std::to_string(h[lnode].switch_counts().carried) + ") and watches none (" +
+                  std::to_string(h[lnode].repend_watch_size()) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -4318,6 +4322,12 @@ void relayrepend() {
         check(mined && carried && h[c.node].tree().best().id == tb && !h[c.node].pending().holds(rid),
               tag + "C mines no more; B's next carrier carries C's re-pended receipt (" + std::to_string(carried) +
                       "), placed on C too: C's pending no longer holds it");
+        const pb::PathbNode::SwitchCounts& scc = h[c.node].switch_counts();
+        check(scc.switches == 1 && scc.repended >= 1 && scc.carried >= 1 && scc.carried + scc.sealed_pending <= scc.repended
+                      && h[c.node].repend_watch_size() == 0,
+              tag + "C's switch counts: re-pended " + std::to_string(scc.repended) + ", carried " +
+                      std::to_string(scc.carried) + " (B's carrier), sealed pending " + std::to_string(scc.sealed_pending) +
+                      "; none left watched (" + std::to_string(h[c.node].repend_watch_size()) + ")");
     }
 }
 

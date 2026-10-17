@@ -504,15 +504,23 @@ public:
     }
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
-    // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals.
+    // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals; of the
+    // re-pended receipts, those later carried on the best chain and those whose bin sealed while they were pending;
+    // the joiner-path switches (rule (4) replaced or adopted the state) and the placements they lost.
     struct SwitchCounts {
         std::uint64_t switches = 0;
         std::uint64_t last_repended = 0;
         std::uint64_t last_lost = 0;
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        std::uint64_t carried = 0;
+        std::uint64_t sealed_pending = 0;
+        std::uint64_t joiner_switches = 0;
+        std::uint64_t joiner_lost = 0;
     };
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
+    // The re-pended receipts still pending (at most the pending cap): each leaves at its placement or its seal.
+    std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
     WindowCache& windows() noexcept { return *windows_; }
@@ -572,6 +580,10 @@ public:
         for (const std::uint64_t peer : left_) joiner_->disconnect(peer);  // re-queued pairs of a gone server
         left_.clear();
         if (out.report && (out.sw.adopted || out.sw.replaced)) out.switched = adopt(out.batch_written);
+        if (out.switched) {
+            ++switches_.joiner_switches;
+            switches_.joiner_lost += out.sw.lost;
+        }
         return out;
     }
     // Both halves in one call (the KATs' single-threaded form).
@@ -2610,7 +2622,14 @@ private:
         const LaneView v = store_->view_at(store_->best_tip());
         if (!v.ok()) return;
         const std::uint64_t H = v.record(v.pos());
-        pending_.erase_if([&](const PendingReceipt& r) { return v.placed_open(r.id) || !open_at(H, r.h, cfg_.p.open_bins); });
+        pending_.erase_if([&](const PendingReceipt& r) {
+            const bool placed = v.placed_open(r.id);
+            const bool gone = placed || !open_at(H, r.h, cfg_.p.open_bins);
+            if (gone && repend_watch_.erase(r.id) != 0) ++(placed ? switches_.carried : switches_.sealed_pending);
+            return gone;
+        });
+        for (auto it = repend_watch_.begin(); it != repend_watch_.end();)  // evicted from the pending set meanwhile
+            it = pending_.holds(*it) ? std::next(it) : repend_watch_.erase(it);
     }
 
     // ---- E11: a switch by the journal, with the re-pend step ----
@@ -2699,6 +2718,7 @@ private:
                 if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) {
                     ++out.repended;
                     repended_out_.push_back(rid);  // relayed as FB_RECEIPTS v3 (take_repended)
+                    repend_watch_.insert(rid);
                 }
             }
         }
@@ -2754,6 +2774,7 @@ private:
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
+    std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

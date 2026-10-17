@@ -500,6 +500,9 @@ void deep() {
     check(lost_expected > 0 && st.sw.lost == lost_expected,
           "deep: the lost count = the replaced own chain's open-bin placements (" + std::to_string(st.sw.lost) + " of "
                   + std::to_string(lost_expected) + ")");
+    check(h[fa].switch_counts().joiner_switches == 1 && h[fa].switch_counts().joiner_lost == lost_expected,
+          "deep: the node counts the joiner-path switch (" + std::to_string(h[fa].switch_counts().joiner_switches) +
+                  ") and its lost placements (" + std::to_string(h[fa].switch_counts().joiner_lost) + ")");
     check(h[fa].joined() != nullptr && h[fa].tree().best().id == b.store.best_tip()
                   && digest_wo_work(h[fa].lane_digest()) == digest_wo_work(h[fb].lane_digest()) && !h[fa].attempting(),
           "deep: the node runs on the adopted state at b's tip (lane digest == B's, work from its root)");
