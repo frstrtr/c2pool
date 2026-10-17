@@ -1841,7 +1841,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             "reoffer_cap_drops=%llu parked_receipts=%zu parked_receipts_sealed=%llu alt_blocks_max=%zu "
                             "alt_verified_bytes=%llu alt_verified_bytes_peak=%llu alt_verified_bytes_max=%llu "
                             "alt_unproven_bytes=%llu alt_unproven_bytes_peak=%llu alt_unsolicited_drops=%llu "
-                            "alt_source_drops=%llu\n",
+                            "alt_source_drops=%llu join_side_attempts=%llu join_side_completed=%llu "
+                            "join_side_not_served=%llu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1871,7 +1872,10 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(nn->index().alt_verified_max_bytes()),
                             static_cast<unsigned long long>(alt_now.second), static_cast<unsigned long long>(alt_peak.second),
                             static_cast<unsigned long long>(nn->index().unsolicited_dropped()),
-                            static_cast<unsigned long long>(nn->index().source_dropped()));
+                            static_cast<unsigned long long>(nn->index().source_dropped()),
+                            static_cast<unsigned long long>(rs.join_side_attempts.load()),
+                            static_cast<unsigned long long>(rs.join_side_completed.load()),
+                            static_cast<unsigned long long>(rs.join_side_not_served.load()));
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),

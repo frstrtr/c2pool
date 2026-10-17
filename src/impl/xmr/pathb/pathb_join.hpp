@@ -975,6 +975,8 @@ struct AttemptReport {
     std::shared_ptr<const BoundWork> a_profile;  // A's bound work, read when the attempt took its L
     bool a_profile_read = false;
     bool force_young = false;              // ruling 47: the next attempt of this pair runs the young path
+    std::uint32_t side_needs = 0;          // side branches forking at a prefix node below the root whose state (S(f),
+                                           // or bins sealed on the branch) the attempt took from the server
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -1586,6 +1588,7 @@ private:
             const CarrierNode* fn = s.tree->find(y.own.side.tip);  // the fork: the first side carrier's parent
             if (fn == nullptr || fn->pos >= root_pos || fn->pos < first_pos) continue;  // not a PRE node below the root
             if (!span_s_done_.insert(t).second) continue;      // S(f) for this side branch already attempted
+            ++rep_.side_needs;                                 // a side branch's state from the server (soak count)
             const std::uint64_t lc = bin_leaf_count(fn->H, in_.b0, in_.p.open_bins);
             if (lc == 0) return SpanFold::Young;               // no bin sealed at or before f (ruling 47): the young path
             std::vector<Hash32> cids;
@@ -1627,6 +1630,7 @@ private:
         JoinedState& s = *st_;
         const LaneDelta* d = s.store->delta(pn.id);
         if (d == nullptr || d->pending.empty()) return true;
+        ++rep_.side_needs;  // a side branch's bins from the server (soak count)
         const std::vector<std::uint64_t> bins = d->pending;
         const AtHeader at{receipt_id(c.own), join_detail::digest_of(header_of(c)).value_or(Hash32{})};
         const BucketsAnchor anchor{true, pn.H, c.own.side.mmr_root, c.own.side.receipts_root, ids_of(c)};

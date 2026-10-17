@@ -225,6 +225,9 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
+    // join attempts that took a side branch's state from the server (a span on a side branch forking at a prefix node
+    // below the root); of them: completed, not served
+    std::atomic<std::uint64_t> join_side_attempts{0}, join_side_completed{0}, join_side_not_served{0};
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
@@ -2609,8 +2612,14 @@ private:
             const AttemptReport& rep = *s->report;
             log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
                 std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
-                ", tokens " + std::to_string(rep.strike) + (rep.what.empty() ? "" : ": " + rep.what) + ")" +
-                (s->switched ? " -> adopted" : ""));
+                ", tokens " + std::to_string(rep.strike) +
+                (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
+                (rep.what.empty() ? "" : ": " + rep.what) + ")" + (s->switched ? " -> adopted" : ""));
+            if (rep.side_needs > 0) {
+                st_.join_side_attempts++;
+                if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;
+                if (rep.end == AttemptEnd::NotServed) st_.join_side_not_served++;
+            }
             if (s->report->strike > 0) {
                 strike(s->report->server, s->report->strike, false);
                 st_.join_strikes += s->report->strike;
