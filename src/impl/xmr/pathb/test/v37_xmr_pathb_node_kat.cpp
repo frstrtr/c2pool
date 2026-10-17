@@ -4309,7 +4309,7 @@ void relayrepend() {
 
 
 // ---------------------------------------------------------------------------
-// relayreoffercap: a flapping best chain and a slow peer. A and B mine competing branches apart; C (pending cap 4) gets
+// relayreoffercap: a flapping best chain and a slow peer. A and B mine competing branches apart; C (pending cap 6) gets
 // them in turns, each turn one longer than the other side, so it switches back and forth by its journal and re-pends the
 // receipts of the branch it leaves, again and again; C's links are full (every re-offer paused). Each peer's re-offer
 // queue holds each id once and at most the pending cap of them (the oldest dropped); once the link drains it empties.
@@ -4319,7 +4319,7 @@ void relayreoffercap() {
     FakeWire w;
     KatRelay a = kat_relay(h, w, table0(net), true);
     KatRelay b = kat_relay(h, w, table0(net), true);
-    KatRelay c = kat_relay(h, w, table0(net), true, false, nullptr, [](pb::PathbNodeConfig& cfg) { cfg.pending_cap = 4; });
+    KatRelay c = kat_relay(h, w, table0(net), true, false, nullptr, [](pb::PathbNodeConfig& cfg) { cfg.pending_cap = 6; });
     KatRelay sl = kat_relay(h, w, table0(net), false);
     w.connect(0, 1);
     w.connect(0, 2);
@@ -4359,7 +4359,7 @@ void relayreoffercap() {
     bool distinct = true;
     int switches = 0;
     feed(a, pa, la, 1);
-    for (int round = 0; ok && round < 6; ++round) {
+    for (int round = 0; ok && round < 8; ++round) {
         const pb::Hash32 before = h[c.node].tree().best().id;
         if (round % 2 == 0)
             feed(b, pb_, lb, la + 1);
@@ -4380,10 +4380,10 @@ void relayreoffercap() {
                 "worst %zu, each id once %d; cap drops %llu\n",
                 ok ? 1 : 0, switches, (unsigned long long)sc.repend_offers.load(), (unsigned long long)sc.repend_offered.load(),
                 at_slow, worst, distinct ? 1 : 0, (unsigned long long)sc.reoffer_cap_drops.load());
-    check(ok && switches >= 5 && sc.repend_offered.load() > 4 && worst <= 4 && at_slow >= 1 && distinct
+    check(ok && switches >= 7 && sc.repend_offered.load() > 6 && worst <= 6 && at_slow >= 1 && distinct
                   && sc.reoffer_cap_drops.load() > 0,
           "relayreoffercap: a flapping best chain with every link full: each peer's re-offer queue holds each id once and at "
-          "most the pending cap (4), the oldest dropped");
+          "most the pending cap (6), the oldest dropped");
     c.links->queued = 0;
     h.now += 1;
     c.relay->tick();
