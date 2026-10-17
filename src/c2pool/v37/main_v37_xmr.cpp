@@ -510,7 +510,6 @@ static int run_follow_only(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::string why;
     if (!rows.load(why, unix_now_s())) std::printf("follow-only: %s -- starting with an empty table\n", why.c_str());
     else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
-    else if (!why.empty()) std::printf("follow-only: %s\n", why.c_str());
     if (!plan.native_node) return 2;
 
     std::printf("%s\n", pb::follow_only_start_line(to_string(cfg.network),

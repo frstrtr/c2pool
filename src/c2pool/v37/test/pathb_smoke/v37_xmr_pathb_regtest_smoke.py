@@ -694,10 +694,19 @@ class Rig:
         self.res.note("altctx", "F restarted: at %s; loaded %s" % (fr, kept[-1] if kept else "-"))
         self.start_alt_node("H", False, False, ["F"])
         ok2, dt2, b2 = self.catch_up("H", fr or ft, a.altctx_catch_s)
-        self.res.check("altctx", ok2 and bool(kept) and int(kept[-1][1]) >= 1,
+
+        def h_resolved():  # H took at least one alternative block from F's context serving
+            c = self.ctx_of("H")
+            return c if c is not None and int(c[3]) >= 1 else None
+        try:
+            wait_for(h_resolved, 90, "H's context resolved", 2)
+        except Fail:
+            pass
+        hc = self.ctx_of("H")
+        self.res.check("altctx", ok2 and bool(kept) and int(kept[-1][1]) >= 1 and hc is not None and int(hc[3]) >= 1,
                        "v2 (every holder restarted): F serves its kept alternative blocks (%s kept blobs); H reaches F's best "
-                       "%s in %.0f s (H at %s); H ctx %s; F ctx %s" % (kept[-1][1] if kept else "-", fr or ft, dt2, b2,
-                                                                      self.ctx_of("H"), self.ctx_of("F")))
+                       "%s in %.0f s (H at %s); H ctx_resolved >= 1: H ctx %s; F ctx %s" %
+                       (kept[-1][1] if kept else "-", fr or ft, dt2, b2, hc, self.ctx_of("F")))
 
     def relay_ready(self, n):
         m = last_relay(self.nodes[n].text())
