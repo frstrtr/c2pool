@@ -1777,9 +1777,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             const auto tipm = nn->index().tip();
             std::printf("status: up=%llus monero=%llu best pos=%llu id=%s cum_work=%s epoch=%u H_hold=%llu "
                         "window_root=%s mmr_root=%s leaves=%llu pending=%zu deferred=%zu re-pended(last switch)=%llu "
-                        "lost(last switch)=%llu switches=%llu re-pended=%llu carried=%llu sealed-pending=%llu lost=%llu "
-                        "joiner-switches=%llu joiner-lost=%llu own-carriers=%llu own-orphaned=%llu template=%s%s%s "
-                        "templates=%llu\n",
+                        "lost(last switch)=%llu switches=%llu template=%s%s%s templates=%llu\n",
                         static_cast<unsigned long long>(now - t0),
                         static_cast<unsigned long long>(tipm ? tipm->height : 0), static_cast<unsigned long long>(nv.pos),
                         hex_of(nv.best).substr(0, 16).c_str(), nv.cum_work.c_str(), static_cast<unsigned>(nv.hold.epoch_cur),
@@ -1788,17 +1786,20 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         cur ? hex_of(cur->window.mmr_root).substr(0, 16).c_str() : "-",
                         static_cast<unsigned long long>(nv.leaf_count), nv.pending, nv.deferred,
                         static_cast<unsigned long long>(nv.sw.last_repended), static_cast<unsigned long long>(nv.sw.last_lost),
-                        static_cast<unsigned long long>(nv.sw.switches), static_cast<unsigned long long>(nv.sw.repended),
-                        static_cast<unsigned long long>(nv.sw.carried), static_cast<unsigned long long>(nv.sw.sealed_pending),
-                        static_cast<unsigned long long>(nv.sw.lost), static_cast<unsigned long long>(nv.sw.joiner_switches),
-                        static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
-                        static_cast<unsigned long long>(nv.own_orphaned), template_status_name(tstatus),
+                        static_cast<unsigned long long>(nv.sw.switches), template_status_name(tstatus),
                         tstatus_why.empty() ? "" : " ", tstatus_why.c_str(), static_cast<unsigned long long>(templates));
             if (nv.poisoned || fork_fuse || template_kept || nv.coinbase_internal != 0 || nv.hold.hold)
                 std::printf("  ALARM:%s%s%s%s%s\n", nv.poisoned ? " store-poisoned(no template; the joiner path at the next start)" : "",
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
+            std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu lost=%llu joiner-switches=%llu "
+                        "joiner-lost=%llu own-carriers=%llu own-orphaned=%llu\n",
+                        static_cast<unsigned long long>(nv.sw.repended), static_cast<unsigned long long>(nv.sw.carried),
+                        static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.lost),
+                        static_cast<unsigned long long>(nv.sw.joiner_switches),
+                        static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
+                        static_cast<unsigned long long>(nv.own_orphaned));
             std::printf("  open-state: placements=%llu bytes=%llu\n", static_cast<unsigned long long>(nv.open.placements),
                         static_cast<unsigned long long>(nv.open.bytes));
             std::printf("  windows: evaluated=%llu n-dropped-bins=%llu n-cut-position=%llu merged-back=%llu\n",
@@ -1861,14 +1862,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             "reoffer_queue_full_drops=%llu live_queue_full_drops=%llu "
                             "rx_failures=%llu own_rx_failures=%llu own_kept=%zu own_stale=%llu stale_events=%llu owner_waits=%llu "
                             "owner_queue_hwm=%llu reoffer_done=%llu reoffer_last_ms=%llu reoffer_max_ms=%llu "
-                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_want_bytes_peak=%zu "
-                            "ctx_wanted=%llu "
+                            "claim_alarms=%llu claim_alarm_drops=%llu join_waits=%llu ctx_wants=%zu ctx_want_bytes=%zu ctx_wanted=%llu "
                             "ctx_resolved=%llu ctx_gave_up=%llu parked_reruns=%llu repend_offers=%llu repend_offered=%llu "
                             "reoffer_cap_drops=%llu parked_receipts=%zu parked_receipts_sealed=%llu alt_blocks_max=%zu "
                             "alt_verified_bytes=%llu alt_verified_bytes_peak=%llu alt_verified_bytes_max=%llu "
                             "alt_unproven_bytes=%llu alt_unproven_bytes_peak=%llu alt_unsolicited_drops=%llu "
                             "alt_source_drops=%llu join_side_attempts=%llu join_side_completed=%llu "
-                            "join_side_not_served=%llu\n",
+                            "join_side_not_served=%llu ctx_want_bytes_peak=%zu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1886,8 +1886,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.claim_alarms.load()),
                             static_cast<unsigned long long>(rs.claim_alarm_drops.load()),
                             static_cast<unsigned long long>(rs.join_waits.load()), relay->ctx_wants(),
-                            relay->ctx_want_bytes(), relay->ctx_want_bytes_peak(),
-                            static_cast<unsigned long long>(rs.ctx_wanted.load()),
+                            relay->ctx_want_bytes(), static_cast<unsigned long long>(rs.ctx_wanted.load()),
                             static_cast<unsigned long long>(rs.ctx_resolved.load()),
                             static_cast<unsigned long long>(rs.ctx_gave_up.load()),
                             static_cast<unsigned long long>(rs.parked_reruns.load()),
@@ -1902,7 +1901,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(nn->index().source_dropped()),
                             static_cast<unsigned long long>(rs.join_side_attempts.load()),
                             static_cast<unsigned long long>(rs.join_side_completed.load()),
-                            static_cast<unsigned long long>(rs.join_side_not_served.load()));
+                            static_cast<unsigned long long>(rs.join_side_not_served.load()), relay->ctx_want_bytes_peak());
             }
             {
                 const std::map<std::uint64_t, std::uint64_t> om = relay->omission_counts();
