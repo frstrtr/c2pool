@@ -1882,6 +1882,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.join_side_completed.load()),
                             static_cast<unsigned long long>(rs.join_side_not_served.load()));
             }
+            {
+                const std::map<std::uint64_t, std::uint64_t> om = relay->omission_counts();
+                std::string per;
+                for (const auto& [link, n] : om) per += " " + std::to_string(link) + ":" + std::to_string(n);
+                std::printf("  omissions: total=%llu peers=%zu%s\n", static_cast<unsigned long long>(relay->omitted_total()),
+                            om.size(), per.c_str());
+            }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
                         static_cast<unsigned long long>(tip_extends), static_cast<unsigned long long>(tip_reorgs),

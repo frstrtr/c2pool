@@ -195,6 +195,8 @@ struct NodeEventResult {
     std::optional<WriteOutcome> write;
     std::uint64_t repended = 0;  // the re-pend count of a switch
     std::uint64_t lost = 0;      // abandoned placements whose bin is sealed on the new branch
+    std::uint64_t omitted = 0;   // a peer's placed carrier with room: the receipts this node holds pending in bins open
+                                 // at its parent that it did not carry (relay policy, never a verdict)
 };
 
 // A family C frame's token class for the relay node (it applies the token):
@@ -2516,6 +2518,7 @@ private:
         }
         for (const ReceiptBodyV3& b : r.carrier->carried) learn_refs(b);
         learn_refs(r.carrier->own);
+        if (peer != kOwnPeer) out.omitted = omissions_of(*r.carrier);
         NodeStore ns{*store_, faults_};
         WriteResult w = place_admitted(*tree_, ns, *ar_, *bodies_, r, &alarm_);
         out.write = w.outcome;
@@ -2630,6 +2633,22 @@ private:
         });
         for (auto it = repend_watch_.begin(); it != repend_watch_.end();)  // evicted from the pending set meanwhile
             it = pending_.holds(*it) ? std::next(it) : repend_watch_.erase(it);
+    }
+
+    // The receipts this node holds pending whose origin bin is open at a carrier's parent and that the carrier, with
+    // room for more (fewer than R_MAX carried), did not carry (carried_omissions; S2.3 #14).
+    std::uint64_t omissions_of(const CarrierBodyV3& c) const {
+        if (c.carried.size() >= cfg_.p.r_max) return 0;
+        const LaneView pv = store_->view_at(c.own.side.tip);
+        if (!pv.ok()) return 0;
+        const std::uint64_t H = pv.record(pv.pos());
+        const Hash32 own = receipt_id(c.own);
+        std::vector<Hash32> carried;
+        for (const ReceiptBodyV3& b : c.carried) carried.push_back(receipt_id(b));
+        std::vector<Hash32> known;
+        for (const PendingReceipt* p : pending_.all())
+            if (p->id != own && open_at(H, p->h, cfg_.p.open_bins)) known.push_back(p->id);
+        return carried_omissions(carried, known);
     }
 
     // ---- E11: a switch by the journal, with the re-pend step ----
