@@ -102,9 +102,13 @@ inline constexpr std::size_t MAX_CHAIN_ENTRY_IDS = 25000;   // BLOCKS_IDS_SYNCHR
 struct ChainIndexOptions {
     XmrNet        net             = XmrNet::Mainnet;
     std::size_t   row_retention   = 2048;                  // D-9, one RandomX epoch
-    std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis
-    std::size_t   alt_max_blocks  = 512;
-    std::uint64_t alt_max_bytes   = 32ull * 1024 * 1024;
+    std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis (k_alt, P-07)
+    // the alt store's blocks: one full context climb (max_reorg_depth = k_alt alternative blocks) servable
+    std::size_t   alt_max_blocks  = static_cast<std::size_t>(max_reorg_depth);
+    // the alt store's bytes of resolved, PoW-verified blocks: the consumer derives the cap (set_alt_verified_max_bytes);
+    // 0: the count only. Blocks without proven work have no byte cap: only a block we asked for (or our own) is held
+    // without proven work, so they are bounded by what we ask for (the fetch window, the refetch list, the booking list).
+    std::uint64_t alt_verified_max_bytes = 0;
     std::size_t   entry_cache     = 1024;                  // bodies kept for re-apply
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
     std::uint64_t burial_depth    = 60;                    // Monero D_conf
@@ -254,7 +258,8 @@ public:
         rows_.set_retention(opts_.row_retention);
         rows_.set_trim_observer([this](const RowRecord& r) { keep_trimmed_locked_(r); });   // COLD-BOOT-4
         uf_watch_ = UnknownForkWatch(opts_.unknown_fork_stall_ms);
-        alt_.set_caps(opts_.alt_max_blocks, opts_.alt_max_bytes);
+        alt_.set_caps(opts_.alt_max_blocks);
+        alt_.set_verified_bytes_cap(opts_.alt_verified_max_bytes);
         view_.state().set_row_retention(opts_.row_retention);
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
@@ -631,6 +636,45 @@ public:
             || r.outcome == OfferOutcome::Duplicate;
     }
 
+    // Unproven blocks refused as unsolicited, and unproven blocks dropped with a source whose block failed its PoW.
+    std::uint64_t unsolicited_dropped() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return unsolicited_dropped_;
+    }
+    std::uint64_t source_dropped() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return source_dropped_;
+    }
+
+    // The alt store: its bytes now, the most it held, and its caps (blocks, bytes).
+    std::uint64_t alt_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.bytes();
+    }
+    std::uint64_t alt_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.bytes_peak();
+    }
+    // The two byte classes: (verified, without proven work) now and their peaks; the verified class's cap.
+    std::pair<std::uint64_t, std::uint64_t> alt_class_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return {alt_.verified_bytes(), alt_.unverified_bytes()};
+    }
+    std::pair<std::uint64_t, std::uint64_t> alt_class_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return {alt_.verified_bytes_peak(), alt_.unverified_bytes_peak()};
+    }
+    std::uint64_t alt_verified_max_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.verified_bytes_cap();
+    }
+    // The verified class's byte cap (the consumer derives it: alt_max_blocks x the context blob cap at its view).
+    void set_alt_verified_max_bytes(std::uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alt_.set_verified_bytes_cap(n);
+    }
+    std::size_t alt_max_blocks() const noexcept { return opts_.alt_max_blocks; }
+
     SyncState sync_state() const override {
         std::lock_guard<std::mutex> lk(mu_);
         SyncState s = view_.sync_state();
@@ -994,13 +1038,11 @@ public:
         // An entry id that has since connected is done with, whether or not
         // its body is still cached (the entry cache is smaller than a 2048-id
         // entry); one below the retained rows can no longer be used at all.
-        std::uint64_t limit = rows_.tip_height() + fetch_window_();
         // COLD-BOOT-2: never download past the consumer's booked frontier + window.
-        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
         // COLD-BOOT-3: the consumer's mainchain-event queue is full enough that
         // more bulk download would overflow it -- hand out nothing above the tip
         // until it drains (backpressure without blocking the verify thread).
-        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
+        const std::uint64_t limit = want_limit_locked_();
         for (std::size_t k = 0; k < wanted_.size(); ++k) {
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
@@ -1263,6 +1305,9 @@ private:
         }
 
         r.id = ev.input.identity.id;
+        // Asked for, read before the arrival leaves the want lists below (booking_wanted_, refetch_): a parent we asked
+        // for again is still one we asked for when it lands.
+        const bool asked_for = own_mined || solicited_locked_(r.id);
 
         // COLD-BOOT: a body the settlement booking asked back
         // (want_body_for_booking). The id was recomputed from these bytes, so
@@ -1396,6 +1441,15 @@ private:
                 r.why     = "parent unknown and below the retained window; ignored";
                 return r;
             }
+            // Only a block we asked for (or our own) parks without proven work: an unsolicited orphan is dropped with
+            // no strike and the sync's chain request fetches it, as monerod does.
+            if (!asked_for) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "an orphan we did not request; the chain request fetches it";
+                return r;
+            }
             AltBlock b;
             b.id             = r.id;
             b.prev_id        = prev;
@@ -1449,6 +1503,12 @@ private:
                 r.why     = "already parked, unjudgeable: " + why;
                 return r;
             }
+            if (!asked_for && !alt_.contains(r.id)) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "an unjudgeable block we did not request; the chain request fetches it";
+                return r;
+            }
             const bool was_parked = alt_.contains(r.id);
             AltBlock b;
             b.id             = r.id;
@@ -1461,7 +1521,8 @@ private:
             b.has_entry      = true;
             b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
-            if (peer) b.source = *peer;
+            if (const AltBlock* held = alt_.find(r.id)) b.source = held->source;  // a re-send keeps the first source
+            else if (peer) b.source = *peer;
             alt_.insert(std::move(b));
             if (!was_parked) ++orphans_;
             r.outcome = OfferOutcome::ParkedOrphan;
@@ -1479,12 +1540,20 @@ private:
             r.fault      = PeerFault::BadPow;
             r.why        = "proof of work does not meet the difficulty we computed";
             alt_.erase_branch(r.id);
+            if (peer) source_dropped_ += alt_.erase_unproven_from(*peer);  // every unproven block that peer served
             penalize_locked_(peer, PeerFault::BadPow, r.why);
             return r;
         }
         const bool pow_ok = pow_verdict_is_verified(pw.verdict);
         if (opts_.require_pow && !pow_ok && pw.verdict != PowVerdict::Skipped) {
-            // Fail-closed: hold it rather than build on work we did not check.
+            // Fail-closed: hold it rather than build on work we did not check -- only a block we asked for (or our
+            // own); any other is dropped with no strike and fetched again by the sync.
+            if (!asked_for && !alt_.contains(r.id)) {
+                ++unsolicited_dropped_;
+                r.outcome = OfferOutcome::Rejected;
+                r.why     = "a block whose proof of work is not checkable yet, not requested; the chain request fetches it";
+                return r;
+            }
             AltBlock b;
             b.id             = r.id;
             b.prev_id        = prev;
@@ -1498,7 +1567,8 @@ private:
             b.has_entry      = true;
             b.bodies_missing = bodiless;
             b.first_seen_seq = ++seq_;
-            if (peer) b.source = *peer;
+            if (const AltBlock* held = alt_.find(r.id)) b.source = held->source;  // a re-send keeps the first source
+            else if (peer) b.source = *peer;
             alt_.insert(std::move(b));
             r.outcome = OfferOutcome::StoredAsAlt;
             r.why     = std::string("held: proof of work not checkable yet (")
@@ -1554,6 +1624,7 @@ private:
                 b.cumulative_difficulty = u128_add(parent_cumdiff, difficulty);
                 b.resolved       = true;
                 b.own_mined      = own_mined;
+                b.pow_verified   = pow_ok;  // its proof of work passed the gate (proven work, as a resolved park)
                 b.adoptable      = false;   // no bodies, so nothing is judgeable yet
                 b.entry          = std::move(entry);
                 b.has_entry      = true;
@@ -1780,6 +1851,12 @@ private:
     // difficulty of its own.
     void resolve_descendants_locked_(const Hash& id) {
         std::vector<Hash> stack{id};
+        std::vector<PeerRef> dropped;  // sources whose block failed its PoW in this walk
+        const auto from_dropped = [&dropped](const PeerRef& s) {
+            for (const PeerRef& d : dropped)
+                if (d.peer_id == s.peer_id && d.addr == s.addr) return true;
+            return false;
+        };
         std::size_t guard = 0;
         while (!stack.empty() && ++guard < 4096) {
             const Hash cur = stack.back();
@@ -1798,6 +1875,7 @@ private:
             for (const AltBlock* child : alt_.children_of(cur)) kids.push_back(*child);
             for (AltBlock& c : kids) {
                 const Hash child_id = c.id;
+                if (!alt_.contains(child_id) && from_dropped(c.source)) continue;  // dropped with its source
                 if (c.resolved && c.adoptable) { stack.push_back(child_id); continue; }
                 c.height = height + 1;
                 std::string why;
@@ -1826,6 +1904,8 @@ private:
                                      "a parked block's proof of work does not meet the "
                                      "difficulty we computed for it");
                     alt_.erase_branch(child_id);
+                    source_dropped_ += alt_.erase_unproven_from(src);  // every unproven block that peer served
+                    dropped.push_back(src);
                     continue;
                 }
                 c.pow_verified = pow_verdict_is_verified(pw.verdict);
@@ -2698,6 +2778,27 @@ private:
              ? pb.tx_hashes.size() - b->entry.txs.size() : 0;
     }
 
+    // A block we asked for: a chain entry's wanted id within the part handed out now (want_limit_locked_), a parent
+    // asked again, or a body the booking asked back. Only these may wait in the alt store without proven work.
+    bool solicited_locked_(const Hash& id) const {
+        if (contains_hash_(refetch_, id) || contains_hash_(booking_wanted_, id)) return true;
+        const std::uint64_t limit = want_limit_locked_();
+        for (std::size_t k = 0; k < wanted_.size(); ++k) {
+            if (wanted_heights_[k] > limit) break;  // the rest of the want list is not asked for yet
+            if (wanted_[k] == id) return true;
+        }
+        return false;
+    }
+
+    // The highest want-list height handed out now: the fetch window above our tip, lowered to the consumer's booked
+    // frontier + window (COLD-BOOT-2), and to the tip while the consumer holds the download (COLD-BOOT-3).
+    std::uint64_t want_limit_locked_() const {
+        std::uint64_t limit = rows_.tip_height() + fetch_window_();
+        if (const std::uint64_t ceil = consumer_ceiling_locked_(); ceil != 0 && ceil < limit) limit = ceil;
+        if (download_hold_ && download_hold_()) limit = rows_.tip_height();
+        return limit;
+    }
+
     // How far above our tip the chain-entry want list is handed out: half the
     // alt pool, so the blocks in flight plus whatever parks meanwhile fit in it.
     std::uint64_t fetch_window_() const {
@@ -3443,6 +3544,8 @@ private:
 
     std::map<std::string, PeerSyncData> peers_;   // keyed by peer_key_()
     std::vector<Hash> wanted_;
+    std::uint64_t unsolicited_dropped_ = 0;   // unproven blocks refused: not requested
+    std::uint64_t source_dropped_      = 0;   // unproven blocks dropped with a source whose block failed its PoW
     std::vector<std::uint64_t> wanted_heights_;   // parallel to wanted_
     std::vector<Hash> refetch_;
     std::vector<Hash> booking_wanted_;            // COLD-BOOT: bodies the booking asked back (bounded)

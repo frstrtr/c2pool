@@ -453,6 +453,8 @@ const std::vector<FlagRow>& flag_table() {
         {"--zmq-port", Cls::Kept, {{"1"}}},
         {"-V", Cls::Kept, {}},
         {"-h", Cls::Kept, {}},
+        {"--alt-max-blocks", Cls::New, {{"720"}, {"1"}}},
+        {"--alt-max-bytes", Cls::New, {{"33554432"}}},
         {"--follow-only", Cls::New, {{}}},
         {"--join-min-peers", Cls::New, {{"2"}}},
         {"--journal-depth", Cls::New, {{"1152"}}},

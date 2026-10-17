@@ -1833,13 +1833,20 @@ struct FakeWire {
     std::vector<FakeLinks*> links;
     std::vector<pb::PathbRelayNode*> relays;
     std::function<void(Msg&)> edit;  // edits a frame in flight
+    // A link's id at node `at` for node `from`: from + 1 on the first link, + 100 per reconnect (link ids not reused).
+    std::map<std::pair<std::size_t, std::size_t>, std::uint64_t> epoch;
+    std::uint64_t id(std::size_t at, std::size_t from) const {
+        const auto it = epoch.find({at, from});
+        return from + 1 + 100 * (it == epoch.end() ? 0 : it->second);
+    }
+    static std::size_t node_of(std::uint64_t p) { return static_cast<std::size_t>((p - 1) % 100); }
     // Delivers one frame, then runs what every relay has queued; false: nothing to deliver.
     bool step() {
         if (q.empty()) return false;
         Msg m = std::move(q.front());
         q.pop_front();
         if (edit) edit(m);
-        if (!m.f.empty() && links[m.to]->live.count(m.from + 1) != 0) links[m.to]->frame(m.from + 1, m.f);
+        if (!m.f.empty() && links[m.to]->live.count(id(m.to, m.from)) != 0) links[m.to]->frame(id(m.to, m.from), m.f);
         for (pb::PathbRelayNode* r : relays) r->pump();
         return true;
     }
@@ -1849,10 +1856,16 @@ struct FakeWire {
         }
     }
     void connect(std::size_t a, std::size_t b) {
-        links[a]->live.insert(b + 1);
-        links[b]->live.insert(a + 1);
-        links[a]->event(b + 1, true);
-        links[b]->event(a + 1, true);
+        links[a]->live.insert(id(a, b));
+        links[b]->live.insert(id(b, a));
+        links[a]->event(id(a, b), true);
+        links[b]->event(id(b, a), true);
+    }
+    // A new link between a and b (new ids at both ends); the old one must be down.
+    void reconnect(std::size_t a, std::size_t b) {
+        ++epoch[{a, b}];
+        ++epoch[{b, a}];
+        connect(a, b);
     }
 };
 
@@ -1865,15 +1878,16 @@ bool FakeLinks::send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) {
         return false;
     }
     const std::lock_guard<std::mutex> lk(wire->qm);
-    wire->q.push_back(FakeWire::Msg{self, static_cast<std::size_t>(p - 1), f});
+    wire->q.push_back(FakeWire::Msg{self, FakeWire::node_of(p), f});
     return true;
 }
 void FakeLinks::disconnect(std::uint64_t p) {
     if (live.erase(p) == 0) return;
-    FakeLinks& o = *wire->links[p - 1];
-    o.live.erase(self + 1);
+    FakeLinks& o = *wire->links[FakeWire::node_of(p)];
+    const std::uint64_t back = wire->id(o.self, self);
+    o.live.erase(back);
     event(p, false);
-    o.event(self + 1, false);
+    o.event(back, false);
 }
 
 struct KatRelay {
@@ -4309,6 +4323,90 @@ void relayrepend() {
 
 
 // ---------------------------------------------------------------------------
+// relayreoffercap: a flapping best chain and a slow peer. A and B mine competing branches apart; C (pending cap 6) gets
+// them in turns, each turn one longer than the other side, so it switches back and forth by its journal and re-pends the
+// receipts of the branch it leaves, again and again; C's links are full (every re-offer paused). Each peer's re-offer
+// queue holds each id once and at most the pending cap of them (the oldest dropped); once the link drains it empties.
+void relayreoffercap() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true, false, nullptr, [](pb::PathbNodeConfig& cfg) { cfg.pending_cap = 6; });
+    KatRelay sl = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.connect(2, 3);  // the slow peer: C's only
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 500 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 t0 = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().id == t0 && h[c.node].tree().best().id == t0;
+    // A, B, C apart from each other (C gets A's and B's carriers by hand); C's links full: the re-offers wait
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from < 3 && m.to < 3) m.f.clear();
+    };
+    c.links->limit = std::size_t{1} << 20;
+    c.links->queued = c.links->limit;
+    const pb::PathbRelayStats& sc = c.relay->stats();
+    const std::uint64_t pa = 1, pb_ = 2, ps = 4;  // A, B and the slow peer at C
+    std::uint32_t nonce = 600;
+    std::size_t la = 0, lb = 0;  // the branch lengths C holds
+    const auto feed = [&](const KatRelay& m, std::uint64_t peer, std::size_t& len, std::size_t to) {
+        while (ok && len < to) {
+            ok = mine_on(h, w, m.node, m.node == a.node ? 2 : 3, nonce++);
+            const pb::Hash32 id = h[m.node].tree().best().id;
+            c.relay->receive(peer, *pb::encode_fc_carrier(0, *h[m.node].bodies().get(id), 16));
+            w.run();
+            h.now += 1;  // the sender's RandomX tokens refill; a parked job runs again on the tick
+            c.relay->tick();
+            w.run();
+            ++len;
+        }
+    };
+    std::size_t worst = 0;
+    bool distinct = true;
+    int switches = 0;
+    feed(a, pa, la, 1);
+    for (int round = 0; ok && round < 8; ++round) {
+        const pb::Hash32 before = h[c.node].tree().best().id;
+        if (round % 2 == 0)
+            feed(b, pb_, lb, la + 1);
+        else
+            feed(a, pa, la, lb + 1);
+        if (h[c.node].tree().best().id != before) ++switches;
+        std::printf("  relayreoffercap round %d: la %zu lb %zu; C at %llu; offers %llu receipts %llu; queues %zu %zu %zu\n", round, la,
+                    lb, (unsigned long long)h[c.node].tree().best().pos, (unsigned long long)sc.repend_offers.load(),
+                    (unsigned long long)sc.repend_offered.load(), c.relay->reoffer_queued(pa), c.relay->reoffer_queued(pb_),
+                    c.relay->reoffer_queued(ps));
+        for (const std::uint64_t p : {pa, pb_, ps}) {
+            worst = std::max(worst, c.relay->reoffer_queued(p));
+            distinct = distinct && c.relay->reoffer_distinct(p);
+        }
+    }
+    const std::size_t at_slow = c.relay->reoffer_queued(ps);
+    std::printf("  relayreoffercap: setup %d; C switched %d times, re-pend offers %llu (receipts %llu); queue at the slow peer %zu, "
+                "worst %zu, each id once %d; cap drops %llu\n",
+                ok ? 1 : 0, switches, (unsigned long long)sc.repend_offers.load(), (unsigned long long)sc.repend_offered.load(),
+                at_slow, worst, distinct ? 1 : 0, (unsigned long long)sc.reoffer_cap_drops.load());
+    check(ok && switches >= 7 && sc.repend_offered.load() > 6 && worst <= 6 && at_slow >= 1 && distinct
+                  && sc.reoffer_cap_drops.load() > 0,
+          "relayreoffercap: a flapping best chain with every link full: each peer's re-offer queue holds each id once and at "
+          "most the pending cap (6), the oldest dropped");
+    c.links->queued = 0;
+    h.now += 1;
+    c.relay->tick();
+    w.run();
+    check(c.relay->reoffer_queued(ps) == 0 && c.relay->reoffer_queued(pa) == 0 && c.relay->reoffer_queued(pb_) == 0,
+          "relayreoffercap: once the links drain the re-offer queues empty (paged within the link's bound)");
+}
+
+// ---------------------------------------------------------------------------
 // relayqfull: a link the transport drops at a relay send for a full queue is counted apart: while the peer's re-offer
 // pages (the link full, the re-offer paused) as a re-offer drop; otherwise as a live-traffic drop.
 void relayqfull() {
@@ -4889,6 +4987,138 @@ RevPark revpark(pb::PathbRelayNode& r) {
 }
 
 // ---------------------------------------------------------------------------
+// relayrparkseal: SPEC DEFER, dropped without strike when its origin bin seals. B parks a relayed receipt whose tip
+// nobody holds (a cause that never resolves; its P_r held, so its origin bin known). While its bin is open it stays
+// parked; once A's chain moves the best record H(L) past the bin's seal (open_bins above its origin), B drops it with
+// its asks and index entries, no strike, no ban.
+void relayrparkseal() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 810);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 820);
+    ok = ok && h[a.node].on_own_share(*j0, 810, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(h[a.node].tree().best().id), 16)});
+    w.run();
+    std::optional<pb::ReceiptBodyV3> base;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) base = r->body;
+    ok = ok && base && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "relayrparkseal: setup");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t pa = 1;  // A at B
+    pb::ReceiptBodyV3 junk = *base;
+    junk.side.tip.fill(0x5E);
+    const std::optional<std::uint64_t> origin = h[b.node].receipt_origin(junk);
+    rb.receive(pa, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{junk}, pb::kRuledLaneParams));
+    w.run();
+    const std::size_t parked0 = rb.parked_receipts(), asks0 = rb.parked_receipt_asks();
+    const std::uint64_t F = h[b.node].config().p.open_bins;
+    // A's chain moves up the Monero chain (a carrier's height at most fresh_max above its parent's)
+    std::size_t open_steps = 0, held_open = 0;
+    for (int i = 0; ok && i < 80; ++i) {
+        const std::optional<std::uint64_t> H = h[b.node].best_record();
+        if (H && origin && *H >= *origin + F) break;
+        h.tick_monero(h[b.node].config().p.fresh_max);
+        ok = mine_on(h, w, a.node, 1, 830 + static_cast<std::uint32_t>(i));
+        h.now += 1;
+        a.relay->tick();
+        rb.tick();
+        w.run();
+        const std::optional<std::uint64_t> H2 = h[b.node].best_record();
+        if (H2 && origin && *H2 < *origin + F) {
+            ++open_steps;
+            held_open += rb.parked_receipts() == 1 ? 1 : 0;
+        }
+    }
+    h.now += 1;
+    rb.tick();
+    w.run();
+    const std::optional<std::uint64_t> H = h[b.node].best_record();
+    std::printf("  relayrparkseal: origin %llu, F %llu; parked %zu asks %zu at first; open for %zu steps (parked in %zu); H(L) %llu: "
+                "parked %zu asks %zu index %zu, sealed %llu, strikes %llu bans %llu\n",
+                (unsigned long long)origin.value_or(0), (unsigned long long)F, parked0, asks0, open_steps, held_open,
+                (unsigned long long)H.value_or(0), rb.parked_receipts(), rb.parked_receipt_asks(), rb.parked_index_size(),
+                (unsigned long long)st.parked_receipts_sealed.load(), (unsigned long long)rb.strikes_of(pa),
+                (unsigned long long)st.bans.load());
+    check(ok && origin && parked0 == 1 && asks0 == 1 && open_steps >= 1 && held_open == open_steps,
+          "relayrparkseal: a receipt parked on a tip nobody holds stays parked while its origin bin is open");
+    check(H && *H >= *origin + F && rb.parked_receipts() == 0 && rb.parked_receipt_asks() == 0 && rb.parked_index_size() == 0
+                  && st.parked_receipts_sealed.load() == 1 && rb.strikes_of(pa) == 0 && st.bans.load() == 0,
+          "relayrparkseal: once its origin bin seals on the best chain it is dropped with its asks and index entries; no "
+          "strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// relayrparkgone: a parked receipt's asks across reconnects. B parks a receipt of an unknown tip sent by A (one ask on
+// A's link); three times A's link goes down and a new one comes up (a new link id) and A sends the receipt again: the
+// gone link's ask records leave the parked receipt at its link down, so its ask set stays one record (the current
+// link's), not one more per reconnect.
+void relayrparkgone() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 840);
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 841);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 842);
+    ok = ok && h[a.node].on_own_share(*j0, 841, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    w.edit = nullptr;
+    std::optional<pb::ReceiptBodyV3> base;
+    for (const pb::PendingReceipt* r : h[a.node].pending().all()) base = r->body;
+    if (!ok || !base) {
+        check(false, "relayrparkgone: setup");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    pb::ReceiptBodyV3 junk = *base;
+    junk.side.tip.fill(0x6D);
+    const std::vector<std::uint8_t> f = *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{junk}, pb::kRuledLaneParams);
+    h.now += 1000;
+    rb.receive(w.id(b.node, a.node), f);
+    w.run();
+    const std::size_t asks0 = rb.parked_receipt_asks(), parked0 = rb.parked_receipts();
+    std::string trace = std::to_string(asks0);
+    bool up = true;
+    for (int k = 0; k < 3; ++k) {
+        w.links[b.node]->disconnect(w.id(b.node, a.node));
+        w.run();
+        w.reconnect(a.node, b.node);
+        w.run();
+        up = up && rb.hello_ok(w.id(b.node, a.node));
+        h.now += 1;
+        rb.receive(w.id(b.node, a.node), f);
+        w.run();
+        trace += " " + std::to_string(rb.parked_receipt_asks());
+    }
+    std::printf("  relayrparkgone: parked %zu -> %zu; asks per round %s (link at B now %llu, HELLO ok %d)\n", parked0,
+                rb.parked_receipts(), trace.c_str(), (unsigned long long)w.id(b.node, a.node), up ? 1 : 0);
+    check(parked0 == 1 && asks0 == 1 && up && rb.parked_receipts() == 1 && rb.parked_receipt_asks() == 1,
+          "relayrparkgone: a parked receipt's asks stay one record across three reconnects of its sender (a gone link's "
+          "records stripped at its link down)");
+}
+
+// ---------------------------------------------------------------------------
 // revjunkbig: the receipt park at the default caps (P-09 = the pending cap, a verify queue of 4,096) under junk: one
 // more than the cap's worth of receipts of unknown tips from one peer; the park holds the cap with one ask each. A re-run
 // with an honest job queued takes at most the queue's free room and drops no queued job; the rest drain on the ticks,
@@ -5315,9 +5545,12 @@ int main(int argc, char** argv) {
     run("relayrpark", relayrpark);
     run("relayhdrctx", relayhdrctx);
     run("relayrbindr", relayrbindr);
+    run("relayrparkseal", relayrparkseal);
+    run("relayrparkgone", relayrparkgone);
     run("revjunkbig", revjunkbig);
     run("revdueorder", revdueorder);
     run("relayqfull", relayqfull);
+    run("relayreoffercap", relayreoffercap);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
     run("relayp40", relayp40);

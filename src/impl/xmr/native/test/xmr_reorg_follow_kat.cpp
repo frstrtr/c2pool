@@ -75,6 +75,7 @@
 // ctest with exit 8 (the #1539 lesson).
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
@@ -363,6 +364,16 @@ static std::vector<BlockEntry> build_branch(const ChainIndex& idx, const Hash& f
     return out;
 }
 
+// The chain request's answer: a chain entry from `p` naming `ids` after the splice `from` (ours, at height `h`).
+static void want(ChainIndex& idx, const PeerRef& p, const Hash& from, std::uint64_t h, const std::vector<Hash>& ids) {
+    ChainEntry e;
+    e.ids.push_back(from);
+    for (const Hash& x : ids) e.ids.push_back(x);
+    e.start_height = h;
+    e.total_height = h + e.ids.size();
+    idx.on_chain_entry(p, std::move(e));
+}
+
 // =============================================================================
 // A. the young-chain window, at RowStore level
 // =============================================================================
@@ -535,12 +546,33 @@ static void test_walk_to_fork() {
     // three above the fork point, so strictly more work.
     std::vector<BlockEntry> br = build_branch(idx, fork_id, fork_height, 5, /*salt_base=*/21);
 
+    // Pushed unasked, the branch tip is refused: no strike, nothing held, no parent asked for. The chain request
+    // fetches it (a chain entry names the branch).
+    const OfferResult unasked = idx.offer_block(&f.them, br[4], /*own_mined=*/false);
+    checkf(unasked.outcome == OfferOutcome::Rejected && !unasked.peer_fault && !idx.have_block(id_of(br[4]))
+                   && f.fetcher.penalties.empty() && idx.refetch_wanted().empty(),
+           "walk: the unasked branch tip became %s (held %d, %zu strikes, %zu asked), expected refused",
+           to_string(unasked.outcome), idx.have_block(id_of(br[4])) ? 1 : 0, f.fetcher.penalties.size(),
+           idx.refetch_wanted().size());
+    {
+        std::vector<Hash> ids;
+        for (const BlockEntry& e : br) ids.push_back(id_of(e));
+        want(idx, f.them, fork_id, fork_height, ids);
+    }
+
     // Deliver it TOP DOWN, which is what a push followed by refetches does: the
     // tip first, then its parent, then its parent...
     const OfferResult top = idx.offer_block(&f.them, br[4], /*own_mined=*/false);
     checkf(top.outcome == OfferOutcome::ParkedOrphan,
            "walk: the pushed branch tip became %s, expected ParkedOrphan", to_string(top.outcome));
     checkf(idx.have_block(id_of(br[4])), "walk: the parked branch tip was not kept");
+
+    // From here the walk runs on the refetch list alone: another peer's chain entry replaces the want list (it names a
+    // block of its own), so each block below is asked for only because its child parked.
+    {
+        const std::vector<BlockEntry> other = build_branch(idx, f.main_ids[6], 7, 1, /*salt_base=*/29);
+        want(idx, peer(4), f.main_ids[6], 7, {id_of(other[0])});
+    }
 
     // Its parent is named for the fetcher.
     std::vector<Hash> want = idx.refetch_wanted();
@@ -566,9 +598,12 @@ static void test_walk_to_fork() {
            "walk: a block above an unresolved parent was DROPPED, not parked");
 
     for (std::size_t i = 3; i-- > 1; ) {
+        const std::vector<Hash> asked = idx.refetch_wanted();
+        checkf(std::find(asked.begin(), asked.end(), id_of(br[i])) != asked.end(),
+               "walk: branch block %zu is not on the refetch list before it arrives", i);
         const OfferResult r = idx.offer_block(&f.them, br[i], /*own_mined=*/false);
         checkf(r.outcome == OfferOutcome::ParkedOrphan,
-               "walk: branch block %zu became %s", i, to_string(r.outcome));
+               "walk: branch block %zu became %s (%s)", i, to_string(r.outcome), r.why.c_str());
         checkf(idx.have_block(id_of(br[i])), "walk: branch block %zu was dropped", i);
     }
     checkf(idx.alt_size() == 4, "walk: alt pool holds %zu of the 4 parked blocks", idx.alt_size());
@@ -882,6 +917,7 @@ static void test_alt_rows_out_of_order() {
     const Hash our_tip = f.main_ids[7];
     std::vector<BlockEntry> rival = build_branch(idx, f.main_ids[4], 5, 2, /*salt_base=*/41);
     const Hash c0 = id_of(rival[0]), c1 = id_of(rival[1]);
+    want(idx, f.them, f.main_ids[4], 5, {c0, c1});  // the chain request named the branch
     const OfferResult o1 = idx.offer_block(&f.them, rival[1], /*own_mined=*/false);
     checkf(o1.outcome == OfferOutcome::ParkedOrphan, "altooo: the child first became %s (%s), expected ParkedOrphan",
            to_string(o1.outcome), o1.why.c_str());
@@ -1044,6 +1080,209 @@ static void test_alt_rows_restart() {
     fs::remove_all(dir);
 }
 
+// J. THE KEPT BLOBS: a node holds P (an alternative, its row kept) and saves: the blob file carries P's block; a
+// restarted node that does not hold P loads it and serves it (kept_blob), keeps it across its own save, and keeps a
+// blob only under its own id and only for a kept row. A file that does not decode (garbage, a count over the cap, a
+// len over the byte cap, truncated) is moved aside to <file>.corrupt-<unix s>; the load goes on, with no kept blobs.
+static void test_kept_blobs() {
+    namespace fs = std::filesystem;
+    namespace pbn = c2pool::xmr::pathb;
+    const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_blobs_" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string table = (dir / "row_weights").string();
+    Hash p{}, m9{};
+    BlockEntry pe;
+    {
+        Rig f(8);
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(f.idx);
+        f.idx->subscribe_rows([&rows](const ConsensusState& st, const ChainRow& row, bool seeded) { rows.on_row(st, row, seeded); });
+        std::vector<BlockEntry> rival = build_branch(*f.idx, f.main_ids[6], 7, 1, /*salt_base=*/61);
+        pe = rival[0];
+        p = id_of(pe);
+        const OfferResult r = f.idx->offer_block(&f.them, pe, /*own_mined=*/false);
+        const OfferResult r9 = f.idx->offer_block(nullptr, Rig::block_for(f.main_ids[7], 9, agc_at(*f.idx, 8), 0, 0), true);
+        m9 = r9.id;
+        std::string why;
+        checkf(r.outcome == OfferOutcome::StoredAsAlt && r9.outcome == OfferOutcome::Connected && rows.save(why),
+               "keptblobs: P held as an alternative, the main chain at 9, saved (%s)", why.c_str());
+        checkf(fs::exists(rows.blobs_path()), "keptblobs: the save writes %s", rows.blobs_path().c_str());
+    }
+    std::vector<std::uint8_t> blob;
+    {
+        Rig g(8);  // restarted: P not held
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        std::string why;
+        const bool ok = rows.load(why);
+        std::vector<std::uint8_t> b9;
+        checkf(ok && rows.kept_blobs_loaded() == 1 && rows.kept_blob(p, blob) && blob == pe.block_blob && !rows.kept_blob(m9, b9),
+               "keptblobs: after the restart P's block is loaded and served (%zu kept blobs); the main block at 9 is not "
+               "among them (%s)", rows.kept_blobs_loaded(), why.c_str());
+        fs::remove(rows.blobs_path());
+        checkf(rows.save(why) && fs::exists(rows.blobs_path()),
+               "keptblobs: the restarted node (P not held) saves P's loaded block again (%s)", why.c_str());
+    }
+    {
+        Rig g(8);
+        pbn::PathbFollowerRows rows(table);
+        rows.bind(g.idx);
+        std::string why;
+        std::vector<std::uint8_t> b;
+        checkf(rows.load(why) && rows.kept_blob(p, b) && b == pe.block_blob,
+               "keptblobs: P's block survives a save by a node that does not hold P");
+    }
+    const auto write_blobs = [&](const std::string& path, const std::vector<std::uint8_t>& bytes) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc)
+                .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    {
+        // P's block filed under another kept row's id (the main block at 9), and a block whose id has no kept row: none
+        // of them kept
+        const std::string t2 = (dir / "ids").string();
+        fs::copy_file(table, t2);
+        fs::copy_file(table + "_kept", t2 + "_kept");
+        std::map<pbn::Hash32, std::vector<std::uint8_t>> m;
+        pbn::Hash32 k9{};
+        std::copy(m9.begin(), m9.end(), k9.begin());
+        m.emplace(k9, pe.block_blob);
+        BlockEntry other = Rig::block_for(p, 9, 1, 0, 7);
+        const Hash oid = id_of(other);
+        pbn::Hash32 ko{};
+        std::copy(oid.begin(), oid.end(), ko.begin());
+        m.emplace(ko, other.block_blob);
+        write_blobs(t2 + "_kept_blobs", pbn::encode_kept_blobs(m));
+        Rig g(8);
+        pbn::PathbFollowerRows rows(t2);
+        rows.bind(g.idx);
+        std::string why;
+        std::vector<std::uint8_t> b;
+        checkf(rows.load(why) && rows.kept_blobs_loaded() == 0 && !rows.kept_blob(m9, b) && !rows.kept_blob(oid, b) && !why.empty(),
+               "keptblobs: a block filed under an id not its own, and one with no kept row: not kept (%s)", why.c_str());
+    }
+    {
+        // files that do not decode: each moved aside, the load goes on (the rows load), no kept blobs
+        pbn::Hash32 kp{};
+        std::copy(p.begin(), p.end(), kp.begin());
+        std::vector<std::uint8_t> good = pbn::encode_kept_blobs({{kp, pe.block_blob}});
+        std::vector<std::uint8_t> over_n = good;
+        over_n[0] = 0xff;
+        over_n[1] = 0xff;  // n = 65,535 > alt_max_blocks
+        std::vector<std::uint8_t> over_len = good;
+        for (std::size_t i = 0; i < 4; ++i) over_len[4 + 32 + i] = 0xff;  // len over the byte cap
+        std::vector<std::uint8_t> trunc(good.begin(), good.end() - 3);
+        const std::vector<std::uint8_t> garbage = {0x01, 0x00, 0x00, 0x00, 0x13, 0x37};
+        int k = 0;
+        for (const auto& bad : {over_n, over_len, trunc, garbage}) {
+            const std::string t3 = (dir / ("bad" + std::to_string(++k))).string();
+            fs::copy_file(table, t3);
+            fs::copy_file(table + "_kept", t3 + "_kept");
+            write_blobs(t3 + "_kept_blobs", bad);
+            Rig g(8);
+            pbn::PathbFollowerRows rows(t3);
+            rows.bind(g.idx);
+            std::string why;
+            const bool ok = rows.load(why);
+            bool aside = false;
+            for (const auto& e : fs::directory_iterator(dir))
+                aside = aside || e.path().filename().string().rfind("bad" + std::to_string(k) + "_kept_blobs.corrupt-", 0) == 0;
+            std::vector<std::uint8_t> b;
+            checkf(ok && rows.block(p).has_value() && rows.kept_blobs() == 0 && !rows.kept_blob(p, b) && aside
+                           && !fs::exists(t3 + "_kept_blobs") && why.find("moved aside") != std::string::npos,
+                   "keptblobs: a blob file that does not decode (case %d) is moved aside; the rows load, no kept blobs (%s)", k,
+                   why.c_str());
+        }
+    }
+    fs::remove_all(dir);
+}
+
+// K. THE ALT STORE'S TWO BYTE CLASSES: resolved, PoW-verified alternatives (the ones served and saved) count against
+// the verified cap; blocks without proven work (orphans whose parent is unknown) are held only when asked for, and never
+// count against it. An unasked orphan flood is refused with no strike; the same orphans asked for fill only their class:
+// every verified alternative stays held and served, its bytes untouched; the verified class holds up to its cap (the
+// lightest goes over it).
+static void test_alt_classes() {
+    Rig f(8);
+    ChainIndex& idx = *f.idx;
+    std::vector<Hash> ver;
+    for (std::uint8_t k = 0; k < 6; ++k) {  // 1-block siblings of the main block at 8: resolved, PoW-checked, not heavier
+        std::vector<BlockEntry> b = build_branch(idx, f.main_ids[6], 7, 1, static_cast<std::uint8_t>(90 + k));
+        const OfferResult r = idx.offer_block(&f.them, b[0], /*own_mined=*/false);
+        if (r.outcome == OfferOutcome::StoredAsAlt) ver.push_back(r.id);
+        if (ver.size() == 3) break;
+    }
+    const auto v0 = idx.alt_class_bytes();
+    checkf(ver.size() == 3 && v0.first > 0 && v0.second == 0, "altclass: three verified alternatives held (%llu B, unproven %llu B)",
+           static_cast<unsigned long long>(v0.first), static_cast<unsigned long long>(v0.second));
+    const std::uint64_t per = v0.first / 3;
+    idx.set_alt_verified_max_bytes(4 * per + per / 2);  // room for four
+    // the flood: 40 orphans (an unknown parent each) near the tip, pushed unasked: refused, nobody struck, none held
+    std::vector<BlockEntry> flood;
+    std::vector<Hash> flood_ids;
+    for (std::uint64_t k = 0; k < 40; ++k) {
+        flood.push_back(Rig::block_for(tag_id(0x5000 + k), 9, 1, static_cast<std::uint8_t>(k), 3));
+        flood_ids.push_back(id_of(flood.back()));
+    }
+    std::size_t refused = 0;
+    for (const BlockEntry& e : flood) {
+        const OfferResult r = idx.offer_block(&f.them, e, /*own_mined=*/false);
+        refused += r.outcome == OfferOutcome::Rejected && !r.peer_fault ? 1 : 0;
+    }
+    checkf(refused == 40 && idx.alt_class_bytes().second == 0 && f.fetcher.penalties.empty() && idx.unsolicited_dropped() == 40,
+           "altclass: 40 unasked orphans are refused with no strike and none held (%zu refused, %llu B held, %zu strikes)",
+           refused, static_cast<unsigned long long>(idx.alt_class_bytes().second), f.fetcher.penalties.size());
+    // the same 40 asked for (a chain entry names them): parked, in their own class
+    want(idx, f.them, f.main_ids[7], 8, flood_ids);
+    std::size_t parked = 0;
+    for (const BlockEntry& e : flood) {
+        const OfferResult r = idx.offer_block(&f.them, e, /*own_mined=*/false);
+        parked += r.outcome == OfferOutcome::ParkedOrphan ? 1 : 0;
+    }
+    const auto v1 = idx.alt_class_bytes();
+    bool served = true;
+    for (const Hash& id : ver) {
+        std::vector<std::uint8_t> blob;
+        served = served && idx.block_blob_of(id, blob) && !blob.empty();
+    }
+    checkf(parked == 40 && v1.second > 4 * per + per / 2 && v1.first == v0.first && served,
+           "altclass: %zu asked-for orphans parked fill only their class (%llu B, above the verified cap %llu B); the "
+           "verified alternatives stay held and served (%llu B)", parked, static_cast<unsigned long long>(v1.second),
+           static_cast<unsigned long long>(4 * per + per / 2), static_cast<unsigned long long>(v1.first));
+    // the verified class up to its cap: three more verified alternatives, room for four
+    std::size_t more = 0;
+    for (std::uint8_t k = 0; k < 12 && more < 3; ++k) {
+        std::vector<BlockEntry> b = build_branch(idx, f.main_ids[6], 7, 1, static_cast<std::uint8_t>(120 + k));
+        const OfferResult r = idx.offer_block(&f.them, b[0], /*own_mined=*/false);
+        more += r.outcome == OfferOutcome::StoredAsAlt ? 1 : 0;
+    }
+    const auto v2 = idx.alt_class_bytes();
+    const auto pk = idx.alt_class_bytes_peak();
+    checkf(more == 3 && v2.first <= 4 * per + per / 2 && v2.first >= 4 * per && v2.second == v1.second
+                   && pk.first <= 4 * per + per / 2 && pk.second == v1.second,
+           "altclass: the verified class holds up to its cap (%llu B of %llu B; peaks %llu / %llu); the orphans' bytes "
+           "unchanged (%llu B)", static_cast<unsigned long long>(v2.first),
+           static_cast<unsigned long long>(4 * per + per / 2), static_cast<unsigned long long>(pk.first),
+           static_cast<unsigned long long>(pk.second), static_cast<unsigned long long>(v2.second));
+}
+
+// L. --alt-max-bytes ONLY LOWERS: the derived verified cap is alt_max_blocks x the context block cap (432,036,720 B at
+// 720 and hf 16; 900,060,480 B at hf 17, the most at load); a value above it leaves it, a value below it is taken.
+static void test_alt_bytes_lower_only() {
+    namespace pbn = c2pool::xmr::pathb;
+    const std::uint64_t d = pbn::alt_verified_bytes_cap(720, std::nullopt);
+    const std::uint64_t m = pbn::alt_verified_bytes_cap_max(720);
+    checkf(d == 432036720ull && pbn::alt_verified_bytes_cap(720, std::nullopt, d + 1) == d
+                   && pbn::alt_verified_bytes_cap(720, std::nullopt, 3 * d) == d
+                   && pbn::alt_verified_bytes_cap(720, std::nullopt, 1000) == 1000,
+           "altlower: the derived cap %llu; --alt-max-bytes above it leaves it, below it lowers it",
+           static_cast<unsigned long long>(d));
+    checkf(m == 900060480ull && pbn::alt_verified_bytes_cap_max(720, 2 * m) == m
+                   && pbn::alt_verified_bytes_cap_max(720, 4096) == 4096,
+           "altlower: the load bound %llu; --alt-max-bytes above it leaves it, below it lowers it",
+           static_cast<unsigned long long>(m));
+}
+
 // H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
 // resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
 // below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
@@ -1085,14 +1324,19 @@ static void test_resume_reorg_below() {
            to_string(last), static_cast<unsigned long long>(restored.tip() ? restored.tip()->height : 0));
 }
 
-// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows (721 + 512 = 1,233 at the code's values). A well-formed kept
-// file of 1,233 rows loads; one of 1,234 is refused before its rows are read (the main rows load, the message says so).
+// I. THE KEPT FILE'S CAP: (k_alt + 1) + alt_max_blocks rows, alt_max_blocks = k_alt by default (721 + 720 = 1,441 at
+// the code's values). A well-formed kept file of 1,441 rows loads; one of 1,442 is refused before its rows are read (the
+// main rows load, the message says so). With --alt-max-blocks 10 the bound follows: 731.
 static void test_kept_cap() {
     namespace fs = std::filesystem;
     namespace pbn = c2pool::xmr::pathb;
     const std::uint64_t cap = pbn::kept_rows_cap();
-    checkf(cap == 720 + 1 + ChainIndexOptions{}.alt_max_blocks && cap == 1233, "keptcap: the cap is 721 + 512 = 1,233 (%llu)",
-           static_cast<unsigned long long>(cap));
+    checkf(ChainIndexOptions{}.alt_max_blocks == ChainIndexOptions{}.max_reorg_depth
+                   && ChainIndexOptions{}.alt_max_blocks == pbn::kAltDepth && cap == (pbn::kAltDepth + 1) + pbn::kAltDepth
+                   && cap == 1441,
+           "keptcap: alt_max_blocks = k_alt = 720; the cap is 721 + 720 = 1,441 (%llu)", static_cast<unsigned long long>(cap));
+    checkf(pbn::kept_rows_cap(10) == 731, "keptcap: with --alt-max-blocks 10 the cap is 731 (%llu)",
+           static_cast<unsigned long long>(pbn::kept_rows_cap(10)));
     const fs::path dir = fs::temp_directory_path() / ("xmr_reorg_follow_kat_cap_" + std::to_string(::getpid()));
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1137,6 +1381,9 @@ int main() {
     test_alt_rows_restart();
     test_resume_reorg_below();
     test_kept_cap();
+    test_kept_blobs();
+    test_alt_classes();
+    test_alt_bytes_lower_only();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;
