@@ -540,6 +540,24 @@ protected:
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
 
+    // #1716 part B: self-nonce attempts per non-loopback host, canonical
+    // Node.self_nonce_attempts (p2pool-dash p2p.py:740). Not persisted, as
+    // canonical. IO thread only, like m_ip_ban_list.
+    struct SelfNonceAttempts
+    {
+        int count;
+        std::chrono::steady_clock::time_point first;
+    };
+    std::map<std::string, SelfNonceAttempts> m_self_nonce_attempts;
+    static constexpr int SELF_NONCE_TOLERATED = 3;                  // p2p.py:195
+    static constexpr std::chrono::seconds SELF_NONCE_WINDOW{600};   // p2p.py:188
+    static constexpr std::chrono::seconds SELF_NONCE_BAN{300};      // p2p.py:197
+    // Clock for the 600 s window. A seam for the window KATs; the ban expiry
+    // stays on steady_clock like every other ban.
+    std::function<std::chrono::steady_clock::time_point()> m_self_nonce_now = [] {
+        return std::chrono::steady_clock::now();
+    };
+
 public:
     // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
     // atomically off any thread; the dashboard's /version_signaling surfaces this
@@ -708,6 +726,78 @@ public:
         return false;
     }
     void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
+
+    // ── Self-connection rate limit (#1716 part B) ───────────────────────
+    // Port of the DASH canonical, frstrtr/p2pool-dash @81bf1618
+    // p2pool/p2p.py:168-206. A version carrying our own nonce is a self-dial
+    // (a second ISP, or our own address handed back by a peer) or a peer
+    // spoofing our nonce, and every attempt is dropped. A loopback attempt
+    // (127.0.0.0/8 or ::1, is_loopback :20-28) is only dropped. It is never
+    // counted or banned (:179-183): a 127.0.0.1 ban RSTs every co-located
+    // reconnect (p2pool-dash #757). Any other host is counted (:192-201). Its
+    // count resets once its first attempt is more than 600 s old (:186-189).
+    // The attempt that finds 3 already counted, i.e. the 4th inside the
+    // window, bans the host for a flat 300 s (:195-199). Before this the
+    // attempt was dropped uncounted and the self endpoint was redialled on
+    // every maintenance pass.
+    //
+    // This is the DASH canonical, not the sibling lanes' shape: no
+    // 3600*banscore^2 and no hourly forgiveness. The ban is host-keyed
+    // (m_ip_ban_list), so connected() and the dialer refuse the host on any
+    // port through is_banned(), as canonical buildProtocol (:560) and _think
+    // (:692) do. Like every other ban here it does not bind a whitelisted seed.
+    //
+    // INLINE: handle_version is inline for the link-deferred KAT targets.
+    // IO thread only, like m_ip_ban_list.
+    void note_self_nonce(const NetService& addr)
+    {
+        const std::string host = addr.address();
+        if (::classify_address(host) == ::AddrClass::loopback)
+        {
+            LOG_DEBUG_P2P << "[Pool] Loopback self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting (no ban)";
+            return;
+        }
+        const auto now = m_self_nonce_now();
+        auto it = m_self_nonce_attempts.find(host);
+        if (it != m_self_nonce_attempts.end() && now - it->second.first > SELF_NONCE_WINDOW)
+        {
+            m_self_nonce_attempts.erase(it);
+            it = m_self_nonce_attempts.end();
+        }
+        if (it == m_self_nonce_attempts.end())
+        {
+            m_self_nonce_attempts.emplace(host, SelfNonceAttempts{1, now});
+            LOG_DEBUG_P2P << "[Pool] Self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting";
+            return;
+        }
+        const int seen = it->second.count++;
+        if (seen < SELF_NONCE_TOLERATED)
+        {
+            LOG_DEBUG_P2P << "[Pool] Self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting";
+            return;
+        }
+        LOG_WARNING << "[Pool] Peer " << addr.to_string() << " sent our nonce "
+                    << (seen + 1) << " times - possible attack, banning host "
+                    << host << " for " << SELF_NONCE_BAN.count() << "s";
+        m_ip_ban_list[host] = std::chrono::steady_clock::now() + SELF_NONCE_BAN;
+    }
+
+    // Drop counts whose window has passed. Canonical drops one only when its
+    // host comes back (p2p.py:186-189) and never otherwise, so its map grows
+    // without bound. Dropping it early gives every later attempt the same
+    // result and keeps the map bounded. Run from the think-cycle ban sweep.
+    void prune_self_nonce_attempts()
+    {
+        const auto now = m_self_nonce_now();
+        for (auto it = m_self_nonce_attempts.begin(); it != m_self_nonce_attempts.end(); )
+        {
+            if (now - it->second.first > SELF_NONCE_WINDOW) it = m_self_nonce_attempts.erase(it);
+            else ++it;
+        }
+    }
 
     void connected(std::shared_ptr<core::Socket> socket) override
     {
@@ -913,9 +1003,14 @@ public:
         peer->m_other_version = msg->m_version;
         peer->m_other_subversion = msg->m_subversion;
 
-        // Self-connection guard: we dialled our own advertised nonce.
+        // Self-connection guard: we dialled our own advertised nonce. Every
+        // attempt is dropped; a non-loopback host's 4th inside 600 s also
+        // bans it (#1716 part B, note_self_nonce).
         if (m_nonce == msg->m_nonce)
+        {
+            note_self_nonce(peer->addr());
             return std::nullopt;
+        }
 
         // Duplicate-connection guard: already peered with this nonce.
         if (m_peers.contains(msg->m_nonce))

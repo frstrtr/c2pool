@@ -899,6 +899,8 @@ void NodeImpl::run_think()
                     if (it->second <= now) it = m_ip_ban_list.erase(it);
                     else ++it;
                 }
+                // #1716 part B: forget self-nonce counts whose window passed.
+                prune_self_nonce_attempts();
             }
             // #1829: forget misbehaviour scores that decayed to ~0.
             prune_misbehaviour();
