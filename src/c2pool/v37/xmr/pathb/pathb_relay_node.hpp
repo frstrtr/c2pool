@@ -906,6 +906,14 @@ public:
         std::lock_guard<std::mutex> lk(omtx_);
         return omitted_total_;
     }
+    // The admission verdicts of peers' objects since start, by row (RowId, 0 = none) and verdict (AdmitVerdict).
+    static constexpr std::size_t kRowKinds = static_cast<std::size_t>(RowId::R31) + 1;
+    static constexpr std::size_t kVerdictKinds = static_cast<std::size_t>(AdmitVerdict::Drop) + 1;
+    using VerdictCounts = std::array<std::array<std::uint64_t, kVerdictKinds>, kRowKinds>;
+    VerdictCounts verdict_counts() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return verdicts_;
+    }
     // The most bytes the wanted contexts held at once (taken at every blob that enters a want).
     std::size_t ctx_want_bytes_peak() const {
         std::lock_guard<std::mutex> lk(cmtx_);
@@ -1731,6 +1739,10 @@ private:
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
+        if (peer != 0 && r.action != NodeAction::None && r.action != NodeAction::NodeInternal) {  // verdicts by row
+            std::lock_guard<std::mutex> lk(omtx_);
+            ++verdicts_[static_cast<std::size_t>(r.admit.row)][static_cast<std::size_t>(r.admit.verdict)];
+        }
         if (r.omitted != 0 && peer != 0) {  // the per-peer omission log (relay policy; erased at link down)
             std::lock_guard<std::mutex> lk(omtx_);
             omissions_[peer] += r.omitted;
@@ -3798,6 +3810,7 @@ private:
     mutable std::mutex omtx_;                          // the omission log
     std::map<std::uint64_t, std::uint64_t> omissions_;  // link id -> receipts omitted (at most the links up)
     std::uint64_t omitted_total_ = 0;
+    VerdictCounts verdicts_{};  // [row][verdict]
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;
     std::size_t ctx_want_bytes_peak_ = 0;  // the most blob bytes ctx_want_ held at once

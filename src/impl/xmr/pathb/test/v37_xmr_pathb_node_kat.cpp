@@ -5111,6 +5111,26 @@ void relayomit() {
     check(ok && before == 0 && om.size() == 1 && om.count(la) == 1 && om.at(la) == 1 && b.relay->omitted_total() == 1,
           "relayomit: A's carrier left out B's pending receipt: B logs one omission for A's link (" +
                   std::to_string(om.count(la) ? om.at(la) : 0) + ", links logged " + std::to_string(om.size()) + ")");
+    // the verdicts by row: A's carriers placed (no row), and a receipt of A's on a tip nobody holds DEFERred at its row
+    if (jb) {
+        pb::ReceiptBodyV3 junk = jb->body;
+        junk.blob.nonce = 841;
+        junk.side.tip.fill(0x6D);
+        b.relay->receive(la, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{junk}, pb::kRuledLaneParams));
+        w.run();
+    }
+    const pb::PathbRelayNode::VerdictCounts vc = b.relay->verdict_counts();
+    std::uint64_t deferred_rows = 0, carriers = 0;
+    std::string seen;
+    for (std::size_t row = 0; row < vc.size(); ++row)
+        for (std::size_t k = 0; k < vc[row].size(); ++k) {
+            if (vc[row][k] != 0) seen += " " + std::to_string(row) + "/" + std::to_string(k) + "=" + std::to_string(vc[row][k]);
+            if (row != 0 && k == static_cast<std::size_t>(pb::AdmitVerdict::Defer)) deferred_rows += vc[row][k];
+            if (k == static_cast<std::size_t>(pb::AdmitVerdict::AdmitCarrier)) carriers += vc[row][k];
+        }
+    check(carriers >= 2 && deferred_rows == 1,
+          "relayomit: B's verdicts by row: " + std::to_string(carriers) + " carriers placed, " +
+                  std::to_string(deferred_rows) + " receipt DEFERred at its row (row/verdict:" + seen + ")");
     w.links[b.node]->disconnect(la);
     w.run();
     check(b.relay->omission_counts().empty() && b.relay->omitted_total() == 1,

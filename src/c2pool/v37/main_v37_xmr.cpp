@@ -1888,6 +1888,17 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 for (const auto& [link, n] : om) per += " " + std::to_string(link) + ":" + std::to_string(n);
                 std::printf("  omissions: total=%llu peers=%zu%s\n", static_cast<unsigned long long>(relay->omitted_total()),
                             om.size(), per.c_str());
+                static const char* const kVerdictName[] = {"strike", "refuse", "defer", "duplicate", "ban", "carrier",
+                                                           "pending", "drop"};
+                static_assert(std::size(kVerdictName) == pb::PathbRelayNode::kVerdictKinds, "a name per verdict");
+                const pb::PathbRelayNode::VerdictCounts vc = relay->verdict_counts();
+                std::string vs;
+                for (std::size_t row = 0; row < vc.size(); ++row)
+                    for (std::size_t v = 0; v < vc[row].size(); ++v)
+                        if (vc[row][v] != 0)
+                            vs += " " + (row == 0 ? std::string("-") : "R" + std::to_string(row)) + "/" + kVerdictName[v] +
+                                  "=" + std::to_string(vc[row][v]);
+                std::printf("  verdicts:%s\n", vs.empty() ? " none" : vs.c_str());
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
