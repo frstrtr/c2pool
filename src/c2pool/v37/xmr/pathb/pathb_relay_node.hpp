@@ -231,6 +231,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
+    std::atomic<std::uint64_t> reoffer_cap_drops{0};  // re-offer ids dropped over a peer queue's cap (P-09), the oldest
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
@@ -778,6 +779,18 @@ public:
             return;
         }
         rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+    }
+    // A peer's re-offer queue: the ids queued, and whether each is queued once.
+    std::size_t reoffer_queued(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(rmtx_);
+        const auto it = reoffer_.find(p);
+        return it == reoffer_.end() ? 0 : it->second.q.size();
+    }
+    bool reoffer_distinct(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(rmtx_);
+        const auto it = reoffer_.find(p);
+        if (it == reoffer_.end()) return true;
+        return std::set<Hash32>(it->second.q.begin(), it->second.q.end()).size() == it->second.q.size();
     }
     // The DEFERred receipts parked (P-09 at most).
     std::size_t parked_receipts() {
@@ -2129,15 +2142,18 @@ private:
     // taken under the node lock; the frames paged by reoffer_pump).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
         std::vector<Hash32> ids;
+        std::size_t cap = 0;
         {
             const NodeGuard g(*this);
             if (node_->rests_on_claims() || node_->poisoned()) return;
             catchup_start(p, tail);
             for (const PendingReceipt* r : node_->pending().all()) ids.push_back(r->id);
+            cap = static_cast<std::size_t>(node_->pending_cap());
         }
         {
             std::lock_guard<std::mutex> lk(rmtx_);
-            reoffer_[p] = std::deque<Hash32>(ids.begin(), ids.end());
+            reoffer_[p] = ReofferQueue{};
+            reoffer_append_locked(p, ids, cap);
             reoffer_t0_[p] = now_ms();
         }
         reoffer_pump(p);
@@ -2167,12 +2183,12 @@ private:
                 std::lock_guard<std::mutex> lk(rmtx_);
                 const auto it = reoffer_.find(p);
                 if (it == reoffer_.end()) return;
-                if (it->second.empty()) {
+                if (it->second.q.empty()) {
                     reoffer_.erase(it);
                     reoffer_finished_locked(p);
                     return;
                 }
-                for (std::size_t i = 0; i < per && i < it->second.size(); ++i) ids.push_back(it->second[i]);
+                for (std::size_t i = 0; i < per && i < it->second.q.size(); ++i) ids.push_back(it->second.q[i]);
             }
             std::vector<ReceiptBodyV3> chunk;
             {
@@ -2199,7 +2215,25 @@ private:
             std::lock_guard<std::mutex> lk(rmtx_);
             const auto it = reoffer_.find(p);
             if (it == reoffer_.end()) return;
-            for (std::size_t i = 0; i < ids.size() && !it->second.empty(); ++i) it->second.pop_front();
+            // the ids sent leave the front (by identity: the cap may have dropped the front meanwhile)
+            for (const Hash32& id : ids)
+                if (!it->second.q.empty() && it->second.q.front() == id) {
+                    it->second.ids.erase(id);
+                    it->second.q.pop_front();
+                }
+        }
+    }
+    // Under rmtx_: ids appended to a peer's re-offer queue, each id at most once (a duplicate of a queued id is not
+    // appended), at most `cap` ids (the pending set's cap, P-09: no peer needs more distinct re-offers): over it the
+    // oldest go.
+    void reoffer_append_locked(std::uint64_t p, const std::vector<Hash32>& ids, std::size_t cap) {
+        ReofferQueue& r = reoffer_[p];
+        for (const Hash32& id : ids)
+            if (r.ids.insert(id).second) r.q.push_back(id);
+        while (r.q.size() > cap && !r.q.empty()) {
+            r.ids.erase(r.q.front());
+            r.q.pop_front();
+            st_.reoffer_cap_drops++;
         }
     }
     // Under rmtx_: a re-offer sent to its end (soak: the time it took).
@@ -2243,10 +2277,12 @@ private:
     void repend_offer() {
         if (t_node_held == this) return;
         std::vector<Hash32> ids;
+        std::size_t cap = 0;
         {
             const NodeGuard g(*this);
             ids = node_->take_repended();
             if (ids.empty() || node_->rests_on_claims() || node_->poisoned()) return;
+            cap = static_cast<std::size_t>(node_->pending_cap());
         }
         const std::vector<std::uint64_t> ready = ready_peers();
         st_.repend_offers++;
@@ -2259,9 +2295,8 @@ private:
         {
             std::lock_guard<std::mutex> lk(rmtx_);
             for (const std::uint64_t p : ready) {
-                std::deque<Hash32>& q = reoffer_[p];
                 if (reoffer_t0_.count(p) == 0) reoffer_t0_[p] = now_ms();
-                q.insert(q.end(), ids.begin(), ids.end());
+                reoffer_append_locked(p, ids, cap);
             }
         }
         for (const std::uint64_t p : ready) reoffer_pump(p);
@@ -3623,7 +3658,11 @@ private:
     bool reask_due_ = false;
 
     std::mutex rmtx_;  // re-offer cursors
-    std::map<std::uint64_t, std::deque<Hash32>> reoffer_;
+    struct ReofferQueue {
+        std::deque<Hash32> q;  // the ids to offer, oldest first
+        std::set<Hash32> ids;  // the ids in q (each queued once)
+    };
+    std::map<std::uint64_t, ReofferQueue> reoffer_;
     std::map<std::uint64_t, std::uint64_t> reoffer_t0_;  // a re-offer's start (ms), by peer
     std::set<std::uint64_t> pumping_;  // the peers whose re-offer a thread is pumping
     std::atomic<std::uint64_t> rx_ok_{0};    // RandomX hashes computed (node and context)

@@ -4309,6 +4309,90 @@ void relayrepend() {
 
 
 // ---------------------------------------------------------------------------
+// relayreoffercap: a flapping best chain and a slow peer. A and B mine competing branches apart; C (pending cap 4) gets
+// them in turns, each turn one longer than the other side, so it switches back and forth by its journal and re-pends the
+// receipts of the branch it leaves, again and again; C's links are full (every re-offer paused). Each peer's re-offer
+// queue holds each id once and at most the pending cap of them (the oldest dropped); once the link drains it empties.
+void relayreoffercap() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true, false, nullptr, [](pb::PathbNodeConfig& cfg) { cfg.pending_cap = 4; });
+    KatRelay sl = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.connect(2, 3);  // the slow peer: C's only
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 500 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 t0 = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().id == t0 && h[c.node].tree().best().id == t0;
+    // A, B, C apart from each other (C gets A's and B's carriers by hand); C's links full: the re-offers wait
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from < 3 && m.to < 3) m.f.clear();
+    };
+    c.links->limit = std::size_t{1} << 20;
+    c.links->queued = c.links->limit;
+    const pb::PathbRelayStats& sc = c.relay->stats();
+    const std::uint64_t pa = 1, pb_ = 2, ps = 4;  // A, B and the slow peer at C
+    std::uint32_t nonce = 600;
+    std::size_t la = 0, lb = 0;  // the branch lengths C holds
+    const auto feed = [&](const KatRelay& m, std::uint64_t peer, std::size_t& len, std::size_t to) {
+        while (ok && len < to) {
+            ok = mine_on(h, w, m.node, m.node == a.node ? 2 : 3, nonce++);
+            const pb::Hash32 id = h[m.node].tree().best().id;
+            c.relay->receive(peer, *pb::encode_fc_carrier(0, *h[m.node].bodies().get(id), 16));
+            w.run();
+            h.now += 1;  // the sender's RandomX tokens refill; a parked job runs again on the tick
+            c.relay->tick();
+            w.run();
+            ++len;
+        }
+    };
+    std::size_t worst = 0;
+    bool distinct = true;
+    int switches = 0;
+    feed(a, pa, la, 1);
+    for (int round = 0; ok && round < 6; ++round) {
+        const pb::Hash32 before = h[c.node].tree().best().id;
+        if (round % 2 == 0)
+            feed(b, pb_, lb, la + 1);
+        else
+            feed(a, pa, la, lb + 1);
+        if (h[c.node].tree().best().id != before) ++switches;
+        std::printf("  relayreoffercap round %d: la %zu lb %zu; C at %llu; offers %llu receipts %llu; queues %zu %zu %zu\n", round, la,
+                    lb, (unsigned long long)h[c.node].tree().best().pos, (unsigned long long)sc.repend_offers.load(),
+                    (unsigned long long)sc.repend_offered.load(), c.relay->reoffer_queued(pa), c.relay->reoffer_queued(pb_),
+                    c.relay->reoffer_queued(ps));
+        for (const std::uint64_t p : {pa, pb_, ps}) {
+            worst = std::max(worst, c.relay->reoffer_queued(p));
+            distinct = distinct && c.relay->reoffer_distinct(p);
+        }
+    }
+    const std::size_t at_slow = c.relay->reoffer_queued(ps);
+    std::printf("  relayreoffercap: setup %d; C switched %d times, re-pend offers %llu (receipts %llu); queue at the slow peer %zu, "
+                "worst %zu, each id once %d; cap drops %llu\n",
+                ok ? 1 : 0, switches, (unsigned long long)sc.repend_offers.load(), (unsigned long long)sc.repend_offered.load(),
+                at_slow, worst, distinct ? 1 : 0, (unsigned long long)sc.reoffer_cap_drops.load());
+    check(ok && switches >= 5 && sc.repend_offered.load() > 4 && worst <= 4 && at_slow >= 1 && distinct
+                  && sc.reoffer_cap_drops.load() > 0,
+          "relayreoffercap: a flapping best chain with every link full: each peer's re-offer queue holds each id once and at "
+          "most the pending cap (4), the oldest dropped");
+    c.links->queued = 0;
+    h.now += 1;
+    c.relay->tick();
+    w.run();
+    check(c.relay->reoffer_queued(ps) == 0 && c.relay->reoffer_queued(pa) == 0 && c.relay->reoffer_queued(pb_) == 0,
+          "relayreoffercap: once the links drain the re-offer queues empty (paged within the link's bound)");
+}
+
+// ---------------------------------------------------------------------------
 // relayqfull: a link the transport drops at a relay send for a full queue is counted apart: while the peer's re-offer
 // pages (the link full, the re-offer paused) as a re-offer drop; otherwise as a live-traffic drop.
 void relayqfull() {
@@ -5318,6 +5402,7 @@ int main(int argc, char** argv) {
     run("revjunkbig", revjunkbig);
     run("revdueorder", revdueorder);
     run("relayqfull", relayqfull);
+    run("relayreoffercap", relayreoffercap);
     run("relayrxbind2", relayrxbind2);
     run("ownrxrun", ownrxrun);
     run("relayp40", relayp40);
