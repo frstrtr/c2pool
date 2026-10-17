@@ -135,6 +135,9 @@ struct AltBlock {
 
     std::uint64_t first_seen_seq = 0;
     std::uint64_t bytes          = 0;
+    // Its byte class in the pool (set at insert): resolved and PoW-verified (or adoptable with PoW checking off),
+    // or a block without proven work (unresolved, or its PoW not checkable yet).
+    bool          verified_class = false;
 
     BranchTip as_tip() const {
         BranchTip t;
@@ -150,21 +153,36 @@ struct AltBlock {
 // --- the pool -----------------------------------------------------------------------
 class AltPool {
 public:
+    // max_blocks: both classes; max_bytes: the blocks without proven work; the verified class's byte cap is set apart
+    // (set_verified_bytes_cap; 0 = none but the count).
     void set_caps(std::size_t max_blocks, std::uint64_t max_bytes) {
         max_blocks_ = max_blocks;
         max_bytes_  = max_bytes;
         evict_();
     }
+    void set_verified_bytes_cap(std::uint64_t max_vbytes) {
+        max_vbytes_ = max_vbytes;
+        evict_();
+    }
+    std::uint64_t verified_bytes_cap() const noexcept { return max_vbytes_; }
+
+    static bool verified_class_of(const AltBlock& b) noexcept { return b.resolved && (b.pow_verified || b.adoptable); }
 
     void clear() {
         blocks_.clear();
         children_.clear();
         bytes_ = 0;
+        vbytes_ = 0;
+        ubytes_ = 0;
     }
 
     std::size_t   size()  const noexcept { return blocks_.size(); }
     std::uint64_t bytes() const noexcept { return bytes_; }
     std::uint64_t bytes_peak() const noexcept { return bytes_peak_; }  // the most bytes held after an insert
+    std::uint64_t verified_bytes() const noexcept { return vbytes_; }
+    std::uint64_t unverified_bytes() const noexcept { return ubytes_; }
+    std::uint64_t verified_bytes_peak() const noexcept { return vbytes_peak_; }
+    std::uint64_t unverified_bytes_peak() const noexcept { return ubytes_peak_; }
 
     bool contains(const Hash& id) const { return blocks_.count(key_(id)) != 0; }
 
@@ -185,20 +203,22 @@ public:
         const Key k = key_(b.id);
         b.bytes = static_cast<std::uint64_t>(b.entry.block_blob.size());
         for (const TxBlobEntry& t : b.entry.txs) b.bytes += t.blob.size();
+        b.verified_class = verified_class_of(b);
 
         const auto it = blocks_.find(k);
         if (it != blocks_.end()) {
-            bytes_ -= it->second.bytes;
+            account_(it->second, false);
             it->second = std::move(b);
-            bytes_ += it->second.bytes;
-            bytes_peak_ = std::max(bytes_peak_, bytes_);
-            return true;
+            account_(it->second, true);
+            evict_();
+            note_peaks_();
+            return blocks_.count(k) != 0;
         }
-        bytes_ += b.bytes;
+        account_(b, true);
         children_[key_(b.prev_id)].push_back(k);
         blocks_.emplace(k, std::move(b));
         evict_();
-        bytes_peak_ = std::max(bytes_peak_, bytes_);
+        note_peaks_();
         return blocks_.count(k) != 0;
     }
 
@@ -304,10 +324,27 @@ private:
         return Key(reinterpret_cast<const char*>(h.data()), h.size());
     }
 
+    // A block's bytes into (or out of) the total and its class.
+    void account_(const AltBlock& b, bool in) {
+        std::uint64_t& c = b.verified_class ? vbytes_ : ubytes_;
+        if (in) {
+            bytes_ += b.bytes;
+            c += b.bytes;
+        } else {
+            bytes_ -= b.bytes;
+            c -= b.bytes;
+        }
+    }
+    void note_peaks_() {
+        bytes_peak_ = std::max(bytes_peak_, bytes_);
+        vbytes_peak_ = std::max(vbytes_peak_, vbytes_);
+        ubytes_peak_ = std::max(ubytes_peak_, ubytes_);
+    }
+
     bool erase_key_(const Key& k) {
         const auto it = blocks_.find(k);
         if (it == blocks_.end()) return false;
-        bytes_ -= it->second.bytes;
+        account_(it->second, false);
         const Key pk = key_(it->second.prev_id);
         const auto ch = children_.find(pk);
         if (ch != children_.end()) {
@@ -343,25 +380,42 @@ private:
     // pool evicted the next block we needed and kept the far ones it could not
     // use yet. Unresolved blocks go farthest claimed height first, newest
     // arrival breaking a tie. Resolved ordering is unchanged.
+    //
+    // Two byte classes: a block without proven work (unresolved, or its PoW not checkable yet) counts against
+    // max_bytes_ and an over-cap there evicts only such blocks; a resolved PoW-verified block counts against
+    // max_vbytes_ and an over-cap there evicts only verified blocks; over the shared count, a block without proven
+    // work goes first. So a flood of blocks without work never evicts a verified block nor takes its bytes.
     void evict_() {
-        while ((max_blocks_ && blocks_.size() > max_blocks_)
-               || (max_bytes_ && bytes_ > max_bytes_)) {
+        for (;;) {
+            const bool over_count = max_blocks_ && blocks_.size() > max_blocks_;
+            const bool over_u     = max_bytes_ && ubytes_ > max_bytes_;
+            const bool over_v     = max_vbytes_ && vbytes_ > max_vbytes_;
+            if (!over_count && !over_u && !over_v) return;
+            // the class an over-cap evicts from: none = either (the count: unverified first)
+            const int want = over_u ? 0 : over_v ? 1 : -1;
             const AltBlock* victim = nullptr;
-            for (const auto& kv : blocks_) {
-                const AltBlock& b = kv.second;
-                if (!victim) { victim = &b; continue; }
-                if (victim->resolved && !b.resolved) { victim = &b; continue; }
-                if (victim->resolved != b.resolved) continue;
-                if (!b.resolved) {
-                    if (b.height > victim->height
-                        || (b.height == victim->height && b.first_seen_seq > victim->first_seen_seq))
+            for (int pass = 0; pass < 2 && !victim; ++pass) {
+                for (const auto& kv : blocks_) {
+                    const AltBlock& b = kv.second;
+                    if (pass == 0 && want >= 0 && b.verified_class != (want == 1)) continue;
+                    if (!victim) { victim = &b; continue; }
+                    if (want < 0 && victim->verified_class != b.verified_class) {
+                        if (victim->verified_class) victim = &b;  // the count: a block without proven work first
+                        continue;
+                    }
+                    if (victim->resolved && !b.resolved) { victim = &b; continue; }
+                    if (victim->resolved != b.resolved) continue;
+                    if (!b.resolved) {
+                        if (b.height > victim->height
+                            || (b.height == victim->height && b.first_seen_seq > victim->first_seen_seq))
+                            victim = &b;
+                        continue;
+                    }
+                    if (u128_less(b.cumulative_difficulty, victim->cumulative_difficulty))
                         victim = &b;
-                    continue;
+                    else if (!u128_greater(b.cumulative_difficulty, victim->cumulative_difficulty)
+                             && b.first_seen_seq < victim->first_seen_seq) victim = &b;
                 }
-                if (u128_less(b.cumulative_difficulty, victim->cumulative_difficulty))
-                    victim = &b;
-                else if (!u128_greater(b.cumulative_difficulty, victim->cumulative_difficulty)
-                         && b.first_seen_seq < victim->first_seen_seq) victim = &b;
             }
             if (!victim) return;
             erase_key_(key_(victim->id));
@@ -372,6 +426,11 @@ private:
     std::map<Key, std::vector<Key>>    children_;
     std::uint64_t                      bytes_      = 0;
     std::uint64_t                      bytes_peak_ = 0;
+    std::uint64_t                      vbytes_     = 0;   // resolved, PoW-verified blocks
+    std::uint64_t                      ubytes_     = 0;   // blocks without proven work
+    std::uint64_t                      vbytes_peak_ = 0;
+    std::uint64_t                      ubytes_peak_ = 0;
+    std::uint64_t                      max_vbytes_ = 0;   // 0: the verified class has no byte cap but the count
     std::size_t                        max_blocks_ = 512;
     std::uint64_t                      max_bytes_  = 32ull * 1024ull * 1024ull;
 };

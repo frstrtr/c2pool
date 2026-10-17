@@ -1161,6 +1161,61 @@ static void test_kept_blobs() {
     fs::remove_all(dir);
 }
 
+// K. THE ALT STORE'S TWO BYTE CLASSES: resolved, PoW-verified alternatives (the ones served and saved) count against
+// the verified cap; blocks without proven work (orphans whose parent is unknown) against their own cap. A flood of
+// orphans fills only its class: every verified alternative stays held and served, its bytes untouched; the verified
+// class holds up to its cap (the lightest goes over it).
+static void test_alt_classes() {
+    Rig f(8);
+    ChainIndex& idx = *f.idx;
+    std::vector<Hash> ver;
+    for (std::uint8_t k = 0; k < 6; ++k) {  // 1-block siblings of the main block at 8: resolved, PoW-checked, not heavier
+        std::vector<BlockEntry> b = build_branch(idx, f.main_ids[6], 7, 1, static_cast<std::uint8_t>(90 + k));
+        const OfferResult r = idx.offer_block(&f.them, b[0], /*own_mined=*/false);
+        if (r.outcome == OfferOutcome::StoredAsAlt) ver.push_back(r.id);
+        if (ver.size() == 3) break;
+    }
+    const auto v0 = idx.alt_class_bytes();
+    checkf(ver.size() == 3 && v0.first > 0 && v0.second == 0, "altclass: three verified alternatives held (%llu B, unproven %llu B)",
+           static_cast<unsigned long long>(v0.first), static_cast<unsigned long long>(v0.second));
+    const std::uint64_t per = v0.first / 3;
+    idx.set_alt_verified_max_bytes(4 * per + per / 2);  // room for four
+    idx.set_alt_unverified_max_bytes(5 * per);
+    // the flood: 40 orphans (an unknown parent each) near the tip
+    std::size_t parked = 0;
+    for (std::uint64_t k = 0; k < 40; ++k) {
+        Hash prev = tag_id(0x5000 + k);
+        BlockEntry e = Rig::block_for(prev, 9, 1, static_cast<std::uint8_t>(k), 3);
+        const OfferResult r = idx.offer_block(&f.them, e, /*own_mined=*/false);
+        parked += r.outcome == OfferOutcome::ParkedOrphan ? 1 : 0;
+    }
+    const auto v1 = idx.alt_class_bytes();
+    bool served = true;
+    for (const Hash& id : ver) {
+        std::vector<std::uint8_t> blob;
+        served = served && idx.block_blob_of(id, blob) && !blob.empty();
+    }
+    checkf(parked >= 10 && v1.second <= 5 * per && v1.second > 0 && v1.first == v0.first && served,
+           "altclass: %zu orphans parked fill only their class (%llu B <= %llu B); the verified alternatives stay held and "
+           "served (%llu B)", parked, static_cast<unsigned long long>(v1.second), static_cast<unsigned long long>(5 * per),
+           static_cast<unsigned long long>(v1.first));
+    // the verified class up to its cap: three more verified alternatives, room for four
+    std::size_t more = 0;
+    for (std::uint8_t k = 0; k < 12 && more < 3; ++k) {
+        std::vector<BlockEntry> b = build_branch(idx, f.main_ids[6], 7, 1, static_cast<std::uint8_t>(120 + k));
+        const OfferResult r = idx.offer_block(&f.them, b[0], /*own_mined=*/false);
+        more += r.outcome == OfferOutcome::StoredAsAlt ? 1 : 0;
+    }
+    const auto v2 = idx.alt_class_bytes();
+    const auto pk = idx.alt_class_bytes_peak();
+    checkf(more == 3 && v2.first <= 4 * per + per / 2 && v2.first >= 4 * per && v2.second == v1.second
+                   && pk.first <= 4 * per + per / 2 && pk.second <= 5 * per,
+           "altclass: the verified class holds up to its cap (%llu B of %llu B; peaks %llu / %llu); the orphans' bytes "
+           "unchanged (%llu B)", static_cast<unsigned long long>(v2.first),
+           static_cast<unsigned long long>(4 * per + per / 2), static_cast<unsigned long long>(pk.first),
+           static_cast<unsigned long long>(pk.second), static_cast<unsigned long long>(v2.second));
+}
+
 // H. A RESUME CAN REORG BELOW ITS RESUME POINT (a young chain): an index from genesis at 100 is snapshotted (base 36),
 // resumed and snapshotted again, and a fresh index loads the second snapshot; a heavier branch forking at 98 (two blocks
 // below the resume point) is adopted -- each snapshot took its base snapshot_depth (64) below the tip from the rows it
@@ -1260,6 +1315,7 @@ int main() {
     test_resume_reorg_below();
     test_kept_cap();
     test_kept_blobs();
+    test_alt_classes();
 
     std::printf("xmr_native_reorg_follow_kat: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail == 0 ? 0 : 1;

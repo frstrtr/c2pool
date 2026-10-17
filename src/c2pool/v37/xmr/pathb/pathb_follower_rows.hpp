@@ -56,7 +56,8 @@
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/consensus/xmr_block_id.hpp"
 #include "impl/xmr/pathb/pathb_branch_follower.hpp"
-#include "impl/xmr/pathb/pathb_caps.hpp"  // kAltDepth (P-07)
+#include "impl/xmr/pathb/pathb_caps.hpp"  // kAltDepth (P-07), blob_cap_ctx, zone
+#include "impl/xmr/pathb/pathb_emission.hpp"  // kHf16
 
 namespace c2pool::xmr::pathb {
 
@@ -132,6 +133,23 @@ inline std::optional<std::map<Hash32, KeptRow>> decode_kept_rows(std::span<const
         t.emplace(a.row.id, a);
     }
     return t;
+}
+
+// The alt store's verified class byte cap: alt_max_blocks x blob_cap_ctx(hf, Z) of a child of the index tip (`tip_w`,
+// its RowWeights), at least at hf 16 (the relay's context frame floor); `lower` (--alt-max-bytes, 0 = none) only
+// lowers it. alt_verified_bytes_cap_max: the most at any hf the code knows (a saved kept-blobs file's bound at load).
+inline std::uint64_t alt_verified_bytes_cap(std::size_t alt_max_blocks, const std::optional<RowWeights>& tip_w,
+                                            std::uint64_t lower = 0) {
+    std::uint64_t per = blob_cap_ctx(kHf16, zone(kHf16)).value_or(0);
+    if (tip_w) per = std::max(per, blob_cap_ctx(tip_w->hf_child, tip_w->z_child).value_or(0));
+    const std::uint64_t cap = static_cast<std::uint64_t>(alt_max_blocks) * per;
+    return lower != 0 ? std::min(cap, lower) : cap;
+}
+inline std::uint64_t alt_verified_bytes_cap_max(std::size_t alt_max_blocks, std::uint64_t lower = 0) {
+    const std::uint64_t per = std::max(blob_cap_ctx(kHf16, zone(kHf16)).value_or(0),
+                                       blob_cap_ctx(HF_VERSION_FCMP_PLUS_PLUS, zone(HF_VERSION_FCMP_PLUS_PLUS)).value_or(0));
+    const std::uint64_t cap = static_cast<std::uint64_t>(alt_max_blocks) * per;
+    return lower != 0 ? std::min(cap, lower) : cap;
 }
 
 // The kept blobs' file (node-local): u32 n | n x (id 32 | u32 len | blob len B), integers LE, ids ascending: the block of

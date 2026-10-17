@@ -105,7 +105,10 @@ struct ChainIndexOptions {
     std::uint64_t max_reorg_depth = 720;                   // bounded; never genesis (k_alt, P-07)
     // the alt store's blocks: one full context climb (max_reorg_depth = k_alt alternative blocks) servable
     std::size_t   alt_max_blocks  = static_cast<std::size_t>(max_reorg_depth);
+    // the alt store's bytes of blocks without proven work (unresolved, or PoW not checkable yet): policy, the existing
+    // 32 MiB ("blocks without proven work"); the verified class's byte cap is the consumer's (set_alt_verified_max_bytes)
     std::uint64_t alt_max_bytes   = 32ull * 1024 * 1024;
+    std::uint64_t alt_verified_max_bytes = 0;              // 0: the count only
     std::size_t   entry_cache     = 1024;                  // bodies kept for re-apply
     std::uint64_t entry_cache_bytes = 64ull * 1024 * 1024;
     std::uint64_t burial_depth    = 60;                    // Monero D_conf
@@ -256,6 +259,7 @@ public:
         rows_.set_trim_observer([this](const RowRecord& r) { keep_trimmed_locked_(r); });   // COLD-BOOT-4
         uf_watch_ = UnknownForkWatch(opts_.unknown_fork_stall_ms);
         alt_.set_caps(opts_.alt_max_blocks, opts_.alt_max_bytes);
+        alt_.set_verified_bytes_cap(opts_.alt_verified_max_bytes);
         view_.state().set_row_retention(opts_.row_retention);
         // One sink into the state view; it queues rather than dispatches, so no
         // consumer callback ever runs with our mutex held.
@@ -640,6 +644,29 @@ public:
     std::uint64_t alt_bytes_peak() const {
         std::lock_guard<std::mutex> lk(mu_);
         return alt_.bytes_peak();
+    }
+    // The two byte classes: (verified, without proven work) now and their peaks; the verified class's cap.
+    std::pair<std::uint64_t, std::uint64_t> alt_class_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return {alt_.verified_bytes(), alt_.unverified_bytes()};
+    }
+    std::pair<std::uint64_t, std::uint64_t> alt_class_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return {alt_.verified_bytes_peak(), alt_.unverified_bytes_peak()};
+    }
+    std::uint64_t alt_verified_max_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return alt_.verified_bytes_cap();
+    }
+    // The verified class's byte cap (the consumer derives it: alt_max_blocks x the context blob cap at its view); and,
+    // for a test, the cap of the blocks without proven work.
+    void set_alt_verified_max_bytes(std::uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alt_.set_verified_bytes_cap(n);
+    }
+    void set_alt_unverified_max_bytes(std::uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        alt_.set_caps(opts_.alt_max_blocks, n);
     }
     std::size_t alt_max_blocks() const noexcept { return opts_.alt_max_blocks; }
     std::uint64_t alt_max_bytes() const noexcept { return opts_.alt_max_bytes; }
