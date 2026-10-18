@@ -163,6 +163,15 @@
 //   relayomitgone a carrier run again after its link went down (a
 //                RandomX park): counted in the total, no entry for the
 //                gone link;
+//   omitrules    the omission count (E3's carriable list at the parent):
+//                a full carrier none; a receipt left out by one with room
+//                1; the carrier's own receipt pending first not counted;
+//   omitfresh    a healed partition's old carrier and a receipt on a newer
+//                Monero height (h(r) > h(c) + Fresh): none;
+//   omitopen     a receipt open at the best tip, sealed at a sibling's
+//                child carrier's parent: none;
+//   omithonest   an all-honest three-node run (a partition, a switch by
+//                the journal, the heal, three rounds): no omission logged;
 //   relayrepend  a switch relays its re-pended receipts as FB_RECEIPTS v3
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
@@ -5409,6 +5418,271 @@ void relayomitgone() {
                   "); no entry for the gone link (links logged " + std::to_string(om.size()) + ")");
 }
 
+// Node a's best carrier as a frame; the frames its mining queued are not delivered.
+std::vector<std::uint8_t> best_frame(Harness& h, std::size_t a) {
+    h.q.clear();
+    return *pb::encode_fc_carrier(0, *h[a].bodies().get(h[a].tree().best().id), pb::kRuledLaneParams.r_max);
+}
+
+// omitrules: the omission count of a peer's carrier (E3's carriable list at its parent). B makes 17 receipts A also
+// holds: A's carrier carries the first 16 (full): no omission for the 17th. B holds a receipt A never gets: A's next
+// carrier, with room, leaves it out: 1. B holds A's next carrier's own receipt pending before the carrier: not counted
+// (1, the other receipt).
+void omitrules() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    const std::uint64_t r_max = pb::kRuledLaneParams.r_max;
+    const pb::PathbTemplate t = h[b].make_template(h.now);
+    std::vector<pb::PathbJob> js;
+    for (std::uint32_t i = 0; t.status == pb::TemplateStatus::Ok && i < r_max + 1; ++i)
+        if (const std::optional<pb::PathbJob> j = h[b].make_job(t, h.session(2 + (i % 3), 500 + i))) js.push_back(*j);
+    h.mine(a, 1, 310);
+    std::size_t pend = 0;
+    for (std::uint32_t i = 0; i < js.size(); ++i)
+        pend += h[b].on_own_share(js[i], 600 + i, pb::Hash32{}).action == pb::NodeAction::Pending ? 1 : 0;
+    h.pump();
+    const bool both = pend == r_max + 1 && h[a].pending().size() == r_max + 1 && h[b].pending().size() == r_max + 1;
+    (void)h.mine(a, 1, 311, false);
+    const std::vector<std::uint8_t> full = best_frame(h, a);
+    const pb::NodeEventResult rf = h[b].on_carrier(a, full);
+    const std::size_t carried_full = h[a].bodies().get(h[a].tree().best().id)->carried.size();
+    check(both && rf.action == pb::NodeAction::Placed && carried_full == r_max && rf.omitted == 0 && h[b].pending().size() == 1,
+          "omitrules: A's carrier carries " + std::to_string(carried_full) + " of B's " + std::to_string(pend) +
+                  " receipts (full): no omission for the one left (" + std::to_string(rf.omitted) + ")");
+    // a receipt of B's that A never gets
+    h.cut = {{b, a}};
+    const std::optional<pb::PathbJob> jq = h.job(b, 2, 700);
+    h.mine(a, 1, 312);  // carries the 17th
+    const bool q_pend = jq && h[b].on_own_share(*jq, 700, pb::Hash32{}).action == pb::NodeAction::Pending &&
+                        h[b].pending().size() == 1 && h[a].pending().size() == 0;
+    (void)h.mine(a, 1, 313, false);
+    const pb::NodeEventResult rq = h[b].on_carrier(a, best_frame(h, a));
+    check(q_pend && rq.action == pb::NodeAction::Placed && rq.omitted == 1,
+          "omitrules: A's carrier with room leaves out the receipt only B holds: 1 omission (" + std::to_string(rq.omitted) +
+                  ")");
+    // B holds A's next carrier's own receipt pending first (a receipt relayed before its carrier)
+    (void)h.mine(a, 1, 314, false);
+    const std::vector<std::uint8_t> fo = best_frame(h, a);
+    const pb::ReceiptBodyV3 own = h[a].bodies().get(h[a].tree().best().id)->own;
+    const std::vector<pb::NodeEventResult> ro =
+            h[b].on_receipts(a, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{own}, pb::kRuledLaneParams));
+    const bool own_pend = ro.size() == 1 && ro[0].action == pb::NodeAction::Pending && h[b].pending().size() == 2;
+    const pb::NodeEventResult rc = h[b].on_carrier(a, fo);
+    check(own_pend && rc.action == pb::NodeAction::Placed && rc.omitted == 1,
+          "omitrules: the carrier's own receipt, pending at B before it, is not counted (" + std::to_string(rc.omitted) +
+                  " omission, the receipt only B holds)");
+}
+
+// omitfresh: E3's Fresh bound. A and B are partitioned after a common tip; A mines c on it; B's branch moves on four
+// Monero heights and B holds a receipt q pending on its newer tip. At the heal c reaches B (a side branch): h(q) >
+// h(c) + Fresh, so c could not carry q: no omission.
+void omitfresh() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    bool ok = h[a].tree().best().id == h[b].tree().best().id;
+    h.cut = {{a, b}, {b, a}};
+    ok = ok && h.mine(a, 1, 310).action == pb::NodeAction::Placed;
+    const pb::Hash32 c = h[a].tree().best().id;
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        ok = ok && h.mine(b, 3, 320 + static_cast<std::uint32_t>(i)).action == pb::NodeAction::Placed;
+    }
+    const std::optional<pb::PathbJob> jb = h.job(b, 2, 330);
+    h.tick_monero();
+    ok = ok && h.mine(b, 3, 331).action == pb::NodeAction::Placed;
+    const pb::NodeEventResult rq = jb ? h[b].on_own_share(*jb, 330, pb::Hash32{}) : pb::NodeEventResult{};
+    ok = ok && rq.action == pb::NodeAction::Pending && h[b].pending().size() == 1;
+    std::uint64_t hq = 0;
+    for (const pb::PendingReceipt* p : h[b].pending().all()) hq = p->h;
+    const pb::CarrierBodyV3* cb = h[a].bodies().get(c);
+    const std::optional<std::uint64_t> hc = cb ? h[b].receipt_origin(cb->own) : std::nullopt;
+    h.cut.clear();
+    const pb::NodeEventResult r = h[b].on_carrier(a, *pb::encode_fc_carrier(0, *cb, pb::kRuledLaneParams.r_max));
+    const std::uint64_t fresh = pb::kRuledLaneParams.fresh_max;
+    check(ok && r.admit.verdict == pb::AdmitVerdict::AdmitCarrier && hc && hq > *hc + fresh && cb->carried.empty(),
+          "omitfresh: A's old carrier admitted at B; h(q) " + std::to_string(hq) + " > h(c) " +
+                  std::to_string(hc.value_or(0)) + " + Fresh " + std::to_string(fresh));
+    check(r.omitted == 0, "omitfresh: no omission for a receipt the carrier could not carry (" + std::to_string(r.omitted) + ")");
+}
+
+// omitopen: E3's open bin at the carrier's parent. B holds a receipt q no other node gets. A's chain moves up the
+// Monero chain until q's bin is the oldest open one at B's best x (A's); C, cut from A before x, mines x's sibling p one
+// Monero height later (q's bin sealed at p; x stays B's best, the lower id) and then c on p: c reaches B with room and
+// without q: no omission (q's bin is sealed at c's parent).
+void omitopen() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true), c = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 300 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{b, a}, {b, c}};  // B's frames reach nobody
+    const std::optional<pb::PathbJob> jq = h.job(b, 2, 400);
+    h.mine(a, 1, 401);
+    bool ok = jq && h[b].on_own_share(*jq, 400, pb::Hash32{}).action == pb::NodeAction::Pending;
+    std::uint64_t hq = 0;
+    for (const pb::PendingReceipt* p : h[b].pending().all()) hq = p->h;
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins, fresh = pb::kRuledLaneParams.fresh_max;
+    std::uint32_t nonce = 410;
+    for (int i = 0; ok && i < 80; ++i) {  // to H(best) = h(q) + F - 2 at B: x's parent
+        const std::uint64_t H = h[b].best_record().value_or(0);
+        if (H + 2 >= hq + F) break;
+        h.tick_monero(std::min<std::uint64_t>(fresh, hq + F - 2 - H));
+        ok = h.mine(a, 1, nonce++).action == pb::NodeAction::Placed;
+    }
+    const std::uint64_t H_g = h[b].best_record().value_or(0);
+    h.cut = {{b, a}, {b, c}, {a, c}};
+    h.tick_monero();
+    ok = ok && h.mine(a, 1, nonce++).action == pb::NodeAction::Placed;  // x: q's bin the oldest open one at B
+    const pb::Hash32 x = h[a].tree().best().id;
+    const std::uint64_t H_x = h[b].best_record().value_or(0);
+    h.tick_monero();
+    std::optional<pb::PathbJob> jp;
+    std::uint32_t np = 0;
+    for (std::uint32_t n = 900; n < 1000 && !jp; ++n) {  // C's sibling p of x with a higher id (x stays best at B)
+        std::optional<pb::PathbJob> j = h.job(c, 3, n);
+        if (!j) break;
+        pb::ReceiptBodyV3 rb = j->body;
+        rb.blob.nonce = n;
+        if (x < pb::receipt_id(rb)) {
+            jp = j;
+            np = n;
+        }
+    }
+    ok = ok && jp && h[c].on_own_share(*jp, np, pb::Hash32{}).action == pb::NodeAction::Placed;
+    const pb::Hash32 p = h[c].tree().best().id;
+    h.pump();
+    const pb::CarrierNode* pn = h[b].tree().find(p);
+    const bool side = pn != nullptr && h[b].tree().best().id == x && h[b].pending().size() == 1;
+    (void)h.mine(c, 3, nonce++, false);
+    const pb::NodeEventResult r = h[b].on_carrier(c, best_frame(h, c));
+    check(ok && side && H_g + 2 == hq + F && H_x + 1 == hq + F && pn->H >= hq + F,
+          "omitopen: q (bin " + std::to_string(hq) + ") open at B's best x (H " + std::to_string(H_x) +
+                  "), sealed at its sibling p (H " + std::to_string(pn ? pn->H : 0) + "); F " + std::to_string(F));
+    check(r.admit.verdict == pb::AdmitVerdict::AdmitCarrier && r.omitted == 0,
+          "omitopen: C's carrier on p reaches B with room and without q: no omission, q's bin sealed at its parent (" +
+                  std::to_string(r.omitted) + ")");
+}
+
+// omithonest: an all-honest three-node run charges no omission. A partition {A, B} | {C}: B's receipt rb is carried on
+// A's branch Y (y1, y2); C mines X (x1; x2 above y2 in id order; x3). B moves to C's side: X reaches B, which switches
+// at x3 by its journal and re-pends rb and Y's own receipts (relayed to C). A, alone, mines y3 on Y; at the heal y3
+// reaches B (whose pending receipts are placed on y3's parent chain) and C. Then three rounds: a receipt between
+// carriers, each node mining in turn. Every node ends at one tip; no relay logs an omission.
+void omithonest() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.run();
+    const std::vector<KatRelay*> rs{&a, &b, &c};
+    const auto settle = [&] {
+        for (int i = 0; i < 4; ++i) {
+            h.now += 1;
+            for (KatRelay* r : rs) r->relay->tick();
+            w.run();
+        }
+    };
+    const auto alone = [&w](std::size_t n) {  // n's frames and the frames to n are dropped
+        w.edit = [n](FakeWire::Msg& m) {
+            if ((m.from == n) != (m.to == n)) m.f.clear();
+        };
+    };
+    const auto frame_at = [&h](std::size_t n, const pb::Hash32& id) {
+        return *pb::encode_fc_carrier(0, *h[n].bodies().get(id), pb::kRuledLaneParams.r_max);
+    };
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 100 + static_cast<std::uint32_t>(i));
+    }
+    alone(c.node);
+    const std::optional<pb::PathbJob> jb = h.job(b.node, 2, 200);
+    ok = ok && mine_on(h, w, a.node, 1, 201);  // y1
+    ok = ok && jb && h[b.node].on_own_share(*jb, 200, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    ok = ok && mine_on(h, w, a.node, 1, 202);  // y2 carries rb
+    const pb::Hash32 y2 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].bodies().get(y2)->carried.size() == 1;
+    ok = ok && mine_on(h, w, c.node, 3, 300);  // x1
+    std::optional<pb::PathbJob> xj;
+    std::uint32_t xn = 0;
+    for (std::uint32_t n = 310; n < 400 && !xj; ++n) {
+        std::optional<pb::PathbJob> j = h.job(c.node, 3, n);
+        if (!j) break;
+        pb::ReceiptBodyV3 rb = j->body;
+        rb.blob.nonce = n;
+        if (y2 < pb::receipt_id(rb)) {
+            xj = j;
+            xn = n;
+        }
+    }
+    ok = ok && xj && h[c.node].on_own_share(*xj, xn, pb::Hash32{}).action == pb::NodeAction::Placed;  // x2
+    w.run();
+    ok = ok && mine_on(h, w, c.node, 3, 401);  // x3
+    // B moves to C's side; X reaches B in order
+    alone(a.node);
+    for (std::uint64_t x = 4; x <= 6; ++x)
+        if (const std::optional<pb::Hash32> id = h[c.node].store().best_at(x))
+            w.q.push_back(FakeWire::Msg{c.node, b.node, frame_at(c.node, *id)});
+    w.run();
+    settle();
+    const pb::PathbNode::SwitchCounts sb = h[b.node].switch_counts();
+    ok = ok && h[b.node].tree().best().id == h[c.node].tree().best().id && sb.switches == 1 && sb.repended == 3;
+    ok = ok && mine_on(h, w, a.node, 1, 203);  // y3, A alone
+    const pb::Hash32 y3 = h[a.node].tree().best().id;
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{a.node, b.node, frame_at(a.node, y3)});
+    w.q.push_back(FakeWire::Msg{a.node, c.node, frame_at(a.node, y3)});
+    w.run();
+    settle();
+    const bool y3_held = h[b.node].tree().find(y3) != nullptr && h[c.node].tree().find(y3) != nullptr;
+    std::uint32_t nonce = 500;
+    for (int r = 0; r < 3; ++r) {
+        h.tick_monero();
+        KatRelay& m = *rs[static_cast<std::size_t>(r + 1) % 3];
+        KatRelay& k = *rs[static_cast<std::size_t>(r + 2) % 3];
+        const std::optional<pb::PathbJob> jr = h.job(k.node, 2, nonce++);
+        ok = ok && mine_on(h, w, m.node, 1, nonce++);
+        ok = ok && jr && h[k.node].on_own_share(*jr, nonce++, pb::Hash32{}).action == pb::NodeAction::Pending;
+        w.run();
+        settle();
+    }
+    ok = ok && mine_on(h, w, a.node, 1, nonce++);  // carries the last round's receipt
+    settle();
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    std::string totals;
+    std::uint64_t total = 0, logged = 0;
+    bool one_tip = true, none_pending = true;
+    for (KatRelay* r : rs) {
+        totals += " " + std::to_string(r->relay->omitted_total());
+        total += r->relay->omitted_total();
+        logged += r->relay->omission_counts().size();
+        one_tip = one_tip && h[r->node].tree().best().id == tip;
+        none_pending = none_pending && h[r->node].pending().size() == 0;
+    }
+    check(ok && y3_held && one_tip && none_pending,
+          "omithonest: the partition, B's switch, the heal and three rounds ran; every node at one tip, nothing pending (B "
+          "re-pended " + std::to_string(sb.repended) + ")");
+    check(total == 0 && logged == 0, "omithonest: no relay logs an omission (totals A B C:" + totals + ")");
+}
+
 // relayrparkgone: a parked receipt's asks across reconnects. B parks a receipt of an unknown tip sent by A (one ask on
 // A's link); three times A's link goes down and a new one comes up (a new link id) and A sends the receipt again: the
 // gone link's ask records leave the parked receipt at its link down, so its ask set stays one record (the current
@@ -5893,6 +6167,10 @@ int main(int argc, char** argv) {
     run("wingolden", wingolden);
     run("relayomit", relayomit);
     run("relayomitgone", relayomitgone);
+    run("omitrules", omitrules);
+    run("omitfresh", omitfresh);
+    run("omitopen", omitopen);
+    run("omithonest", omithonest);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);

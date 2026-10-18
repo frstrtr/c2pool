@@ -2622,10 +2622,12 @@ private:
         }
         for (const ReceiptBodyV3& b : r.carrier->carried) learn_refs(b);
         learn_refs(r.carrier->own);
-        if (peer != kOwnPeer) out.omitted = omissions_of(*r.carrier);
+        // a peer's carrier's omissions at its parent, counted at its first placement (a copy of a placed carrier: none)
+        const std::uint64_t omitted = peer != kOwnPeer && tree_->find(r.id) == nullptr ? omissions_of(r) : 0;
         NodeStore ns{*store_, faults_};
         WriteResult w = place_admitted(*tree_, ns, *ar_, *bodies_, r, &alarm_);
         out.write = w.outcome;
+        if (w.outcome != WriteOutcome::Duplicate && w.outcome != WriteOutcome::NodeInternal) out.omitted = omitted;
         switch (w.outcome) {
             case WriteOutcome::NodeInternal:
                 // a store write failure of 3.3: the store poisoned, templates stop, the joiner path at the next start
@@ -2757,19 +2759,40 @@ private:
         }
     }
 
-    // The receipts this node holds pending whose origin bin is open at a carrier's parent and that the carrier, with
-    // room for more (fewer than R_MAX carried), did not carry (carried_omissions; S2.3 #14).
-    std::uint64_t omissions_of(const CarrierBodyV3& c) const {
+    // The receipts this node holds pending that a carrier with room for more (fewer than R_MAX carried) did not carry
+    // although the honest carried list at its parent holds them (E3, carried_list's predicate at the carrier's parent):
+    // the origin bin open there, h(r) <= h(c) + Fresh, not placed on the parent's chain, the tip's branch passing the
+    // S3b-4a walk from it (on the chain, or placed within J_0); never the carrier's own receipt (carried_omissions;
+    // S2.3 #14).
+    std::uint64_t omissions_of(const AdmitResult& a) {
+        const CarrierBodyV3& c = *a.carrier;
         if (c.carried.size() >= cfg_.p.r_max) return 0;
-        const LaneView pv = store_->view_at(c.own.side.tip);
+        if (a.store_placements.empty()) return 0;
+        const Hash32& parent = c.own.side.tip;
+        const LaneView pv = store_->view_at(parent);
         if (!pv.ok()) return 0;
         const std::uint64_t H = pv.record(pv.pos());
+        const std::uint64_t h_c = a.store_placements.back().bin;  // the own body's origin bin
         const Hash32 own = receipt_id(c.own);
         std::vector<Hash32> carried;
         for (const ReceiptBodyV3& b : c.carried) carried.push_back(receipt_id(b));
+        const AdmitEnv e = env();
+        std::optional<OwnChain> chain;  // the walk from the parent, built at the first receipt that needs it
+        std::optional<ClosureWalk> walk;
         std::vector<Hash32> known;
-        for (const PendingReceipt* p : pending_.all())
-            if (p->id != own && open_at(H, p->h, cfg_.p.open_bins)) known.push_back(p->id);
+        for (const PendingReceipt* p : pending_.all()) {
+            if (p->id == own) continue;
+            if (!open_at(H, p->h, cfg_.p.open_bins)) continue;
+            if (!carried_upper_ok(p->h, h_c, cfg_.p.fresh_max)) continue;
+            if (pv.placed_open(p->id)) continue;
+            if (!walk) {
+                chain.emplace(e, parent);
+                walk.emplace(e, *chain);
+            }
+            const WalkResult w = walk->walk_tip(p->body.side.tip);
+            if (w.v != WalkVerdict::OnChain && w.v != WalkVerdict::Placed) continue;  // Boundary, Closure, not held
+            known.push_back(p->id);
+        }
         return carried_omissions(carried, known);
     }
 
