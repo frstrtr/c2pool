@@ -28,7 +28,8 @@
 //   deep       a full node's own chain as A (JC-6 / B-1): headers first from a
 //              fork below the journal base -> the joiner path (D37); A builds
 //              templates, judges and relays while the attempt runs (3.3a);
-//              rule (4) replaces A, the lost count;
+//              rule (4) replaces A, the lost count; the adoption clears
+//              the re-pend watch;
 //   partition  a fork below the server's header floor (a server at its P-51
 //              floors): in scope without a header below x0(L') - N_rt (E-82);
 //   x1         a joined node: a fork at or below x1 (above the journal base)
@@ -432,8 +433,9 @@ pb::PathbNode::HeadersOutcome headers_first(Harness& h, std::size_t to, std::siz
 // deep (D37; JC-6 / B-1; 3.3a): a full node whose own chain is A. b forks from a at 3,000; a holds b's carriers to
 // 3,560 as a side branch at or above its base, then a's base passes 3,000; b heavier. Headers first from b's server:
 // the fork below the journal base -> the joiner path, b's tip with that server a candidate; the attempt runs while A
-// builds templates, judges and relays a carrier; the fork with A's BEST chain (not the held side top) decides: in
-// scope, rule (4) replaces A, the lost count = A's open-bin placements.
+// builds templates, judges and relays a carrier (a switch by its journal from A's own carrier, its receipt re-pended
+// and watched); the fork with A's BEST chain (not the held side top) decides: in scope, rule (4) replaces A, the lost
+// count = A's open-bin placements; the adoption clears the re-pend watch.
 void deep() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -461,6 +463,22 @@ void deep() {
     h.mon_tip = h_pos(4201) + 1;
     KatTransport tr(h, fa);
     h[fa].set_join_transport(&tr);
+    // an own carrier of A at a_next's position with a higher id: a_next's placement while the attempt runs switches A
+    // by its journal, A's own receipt re-pended and watched; the adoption clears the watch
+    std::optional<pb::PathbJob> oj;
+    std::uint32_t on = 0;
+    for (std::uint32_t n = 40; n < 400 && !oj; ++n) {
+        std::optional<pb::PathbJob> j = h.job(fa, 0, n);
+        if (!j) break;
+        pb::ReceiptBodyV3 rb = j->body;
+        rb.blob.nonce = n;
+        if (a_next.at(0) < pb::receipt_id(rb)) {
+            oj = j;
+            on = n;
+        }
+    }
+    const bool own_placed = oj && h[fa].on_own_share(*oj, on, pb::Hash32{}).action == pb::NodeAction::Placed;
+    h.q.clear();
     const pb::CarrierNode* qn = h[fa].tree().find(q);
     const std::uint64_t base = h[fa].store().base_pos();
     check(placed == 560 && qn != nullptr && h[fa].store().best_at(qn->pos) != q && base > 3000 && qn->pos >= base,
@@ -478,6 +496,7 @@ void deep() {
     pb::TemplateStatus tst = pb::TemplateStatus::RestsOnClaims;
     pb::NodeAction placed_action = pb::NodeAction::None;
     std::uint64_t lost_expected = 0;
+    std::size_t watched = 0;
     tr.on_request = [&]() {
         if (during || tr.log.size() != 3) return;
         during = true;
@@ -489,17 +508,23 @@ void deep() {
         for (const Msg& m : h.q) flooded = flooded || (m.from == fa && !m.frame.empty() && m.frame[0] == pb::kOpFcCarrier);
         h.q.clear();
         lost_expected = pb::open_bin_placements(h[fa].store());
+        watched = h[fa].repend_watch_size();
     };
     const pb::JoinStep st = h[fa].run_join();
-    check(during && attempting && tst == pb::TemplateStatus::Ok && placed_action == pb::NodeAction::Placed && flooded,
-          "deep: while the attempt runs A builds a template, places a relayed carrier and relays it (template "
-                  + std::to_string(static_cast<int>(tst)) + ", action " + std::to_string(static_cast<int>(placed_action)) + ")");
+    check(during && attempting && tst == pb::TemplateStatus::Ok && own_placed && placed_action == pb::NodeAction::Switched
+                  && flooded && watched == 1,
+          "deep: while the attempt runs A builds a template, places a relayed carrier (a switch by its journal from its own "
+          "carrier, the own receipt re-pended and watched) and relays it (template "
+                  + std::to_string(static_cast<int>(tst)) + ", action " + std::to_string(static_cast<int>(placed_action)) +
+                  ", watched " + std::to_string(watched) + ")");
     check(st.report && st.report->end == pb::AttemptEnd::Completed && st.sw.replaced && st.switched,
           "deep: the fork with A's best chain, not the held side top, decides: below A's base, in scope; rule "
           "(4) replaces A" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
     check(lost_expected > 0 && st.sw.lost == lost_expected,
           "deep: the lost count = the replaced own chain's open-bin placements (" + std::to_string(st.sw.lost) + " of "
                   + std::to_string(lost_expected) + ")");
+    check(h[fa].repend_watch_size() == 0,
+          "deep: the adoption cleared the re-pend watch (" + std::to_string(h[fa].repend_watch_size()) + ")");
     check(h[fa].switch_counts().joiner_switches == 1 && h[fa].switch_counts().joiner_lost == lost_expected,
           "deep: the node counts the joiner-path switch (" + std::to_string(h[fa].switch_counts().joiner_switches) +
                   ") and its lost placements (" + std::to_string(h[fa].switch_counts().joiner_lost) + ")");

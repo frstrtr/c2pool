@@ -1534,6 +1534,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
         std::uint64_t own_carriers = 0, own_orphaned = 0;
+        std::size_t repend_watched = 0;
         pb::PathbNode::OpenState open{};
         std::uint64_t open_evaluated = 0;
         pb::PathbNode::Liveness liveness{};
@@ -1563,6 +1564,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.sw = n.switch_counts();
             v.own_carriers = n.own_carriers();
             v.own_orphaned = n.own_orphaned();
+            v.repend_watched = n.repend_watch_size();
             // computed once per status period (the status line's); the kept values on the other passes
             const pb::PathbNode::StatusSample& ss = n.status_sample(now_s, cfg.status_every_s);
             v.open = ss.open;
@@ -1797,10 +1799,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
-            std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu lost=%llu joiner-switches=%llu "
-                        "joiner-lost=%llu own-carriers=%llu own-orphaned=%llu\n",
+            std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu evicted=%llu watched=%zu lost=%llu "
+                        "joiner-switches=%llu joiner-lost=%llu own-carriers=%llu own-orphaned=%llu\n",
                         static_cast<unsigned long long>(nv.sw.repended), static_cast<unsigned long long>(nv.sw.carried),
-                        static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.lost),
+                        static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.evicted),
+                        nv.repend_watched, static_cast<unsigned long long>(nv.sw.lost),
                         static_cast<unsigned long long>(nv.sw.joiner_switches),
                         static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
                         static_cast<unsigned long long>(nv.own_orphaned));

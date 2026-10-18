@@ -507,8 +507,9 @@ public:
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
     // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals; of the
-    // re-pended receipts, those later carried on the best chain and those whose bin sealed while they were pending;
-    // the joiner-path switches (rule (4) replaced or adopted the state) and the placements they lost.
+    // re-pended receipts, those later carried on the best chain, those whose bin sealed while they were pending and
+    // those the pending set evicted (P-09) while watched; the joiner-path switches (rule (4) replaced or adopted the
+    // state) and the placements they lost.
     struct SwitchCounts {
         std::uint64_t switches = 0;
         std::uint64_t last_repended = 0;
@@ -517,6 +518,7 @@ public:
         std::uint64_t lost = 0;
         std::uint64_t carried = 0;
         std::uint64_t sealed_pending = 0;
+        std::uint64_t evicted = 0;
         std::uint64_t joiner_switches = 0;
         std::uint64_t joiner_lost = 0;
     };
@@ -530,7 +532,8 @@ public:
         std::uint64_t merged_back = 0;
     };
     const WindowFlagCounts& window_flags() const noexcept { return win_flags_; }
-    // The re-pended receipts still pending (at most the pending cap): each leaves at its placement or its seal.
+    // The re-pended receipts still pending (at most the pending cap): each leaves at its placement, its seal, its
+    // eviction or an adoption (the joiner path).
     std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
     // Own carriers placed on the best chain since start, and those orphaned (no longer best at their position). Each
     // is watched until it is below the journal base (confirmed) or orphaned, a joiner switch included: at most J
@@ -2400,6 +2403,7 @@ private:
         own_refs_.clear();
         own_prefix_.clear();
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
+        repend_watch_.clear();  // the re-pended receipts left with the pending set
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
         header_req_.clear();
         assemblies_.clear();
@@ -2753,8 +2757,14 @@ private:
             if (gone && repend_watch_.erase(r.id) != 0) ++(placed ? switches_.carried : switches_.sealed_pending);
             return gone;
         });
-        for (auto it = repend_watch_.begin(); it != repend_watch_.end();)  // evicted from the pending set meanwhile
-            it = pending_.holds(*it) ? std::next(it) : repend_watch_.erase(it);
+        for (auto it = repend_watch_.begin(); it != repend_watch_.end();) {  // evicted from the pending set meanwhile
+            if (pending_.holds(*it)) {
+                ++it;
+                continue;
+            }
+            ++switches_.evicted;
+            it = repend_watch_.erase(it);
+        }
         watch_own_carriers();
     }
 

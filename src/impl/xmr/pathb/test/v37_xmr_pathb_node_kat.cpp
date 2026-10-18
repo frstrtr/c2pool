@@ -145,6 +145,8 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
+//   repevict     a re-pended receipt evicted by P-09 while watched: counted
+//                evicted, the watch empty;
 //   openstate    the open state at the best tip: its placements and
 //                their receipt bodies' wire bytes, against a sum by hand;
 //   opendead     a legally dead placement in an open bin counts in the
@@ -5109,6 +5111,47 @@ void relayrparkseal() {
 }
 
 // ---------------------------------------------------------------------------
+// repevict: a re-pended receipt the pending set evicts (P-09, 1 here) while watched is counted evicted and leaves the
+// watch. A and B race at one position (the links cut); the loser switches and re-pends its own receipt (watched); its
+// share on its old tip at a newer Monero height is a receipt in a newer bin: the pending set keeps it and evicts the
+// re-pended one; at the winner's next carrier the watch is empty: re-pended 1 = carried 0 + sealed pending 0 +
+// evicted 1.
+void repevict() {
+    const KatNet net;
+    Harness h(net);
+    h.pending_cap = 1;
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 30 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.tick_monero();
+    h.mine(a, 2, 940);
+    h.mine(b, 3, 941);
+    const pb::Hash32 ca = h[a].tree().best().id, cb = h[b].tree().best().id;
+    const std::size_t lnode = ca < cb ? b : a, wnode = ca < cb ? a : b;
+    h.tick_monero();
+    const std::optional<pb::PathbJob> jl = h.job(lnode, 4, 950);  // the loser's job on its own tip, a newer Monero height
+    h.cut.clear();
+    (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(cb), pb::kRuledLaneParams.r_max));
+    (void)h[b].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(ca), pb::kRuledLaneParams.r_max));
+    h.pump();
+    const pb::PathbNode::SwitchCounts s1 = h[lnode].switch_counts();
+    const bool watched = s1.switches == 1 && s1.repended == 1 && h[lnode].repend_watch_size() == 1;
+    const pb::NodeEventResult rq = jl ? h[lnode].on_own_share(*jl, 950, pb::Hash32{}) : pb::NodeEventResult{};
+    h.pump();
+    h.mine(wnode, 1, 960);
+    const pb::PathbNode::SwitchCounts& s2 = h[lnode].switch_counts();
+    check(watched && rq.action == pb::NodeAction::Pending && h[lnode].tree().best().id == h[wnode].tree().best().id,
+          "repevict: the loser re-pended its receipt (watched " + std::to_string(s1.repended) + "); its next share is a "
+          "receipt in a newer bin");
+    check(s2.evicted == 1 && s2.carried == 0 && s2.sealed_pending == 0 && h[lnode].repend_watch_size() == 0,
+          "repevict: the re-pended receipt evicted by P-09 is counted (evicted " + std::to_string(s2.evicted) +
+                  ", carried " + std::to_string(s2.carried) + ", sealed pending " + std::to_string(s2.sealed_pending) +
+                  "); the watch is empty (" + std::to_string(h[lnode].repend_watch_size()) + ")");
+}
+
 // The open state by hand over node a's best chain (every bin open in these short runs): one placement per own receipt
 // and per carried one, each at its v3 wire size.
 std::pair<std::uint64_t, std::uint64_t> open_by_hand(Harness& h, std::size_t a) {
@@ -6269,6 +6312,7 @@ int main(int argc, char** argv) {
     run("relayrxbindr", relayrxbindr);
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
+    run("repevict", repevict);
     run("openstate", openstate);
     run("opendead", opendead);
     run("statusperiod", statusperiod);
