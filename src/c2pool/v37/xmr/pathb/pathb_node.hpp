@@ -2652,7 +2652,7 @@ private:
         NodeStore ns{*store_, faults_};
         WriteResult w = place_admitted(*tree_, ns, *ar_, *bodies_, r, &alarm_);
         out.write = w.outcome;
-        if (w.outcome != WriteOutcome::Duplicate && w.outcome != WriteOutcome::NodeInternal) out.omitted = omitted;
+        if (w.outcome != WriteOutcome::NodeInternal) out.omitted = omitted;
         switch (w.outcome) {
             case WriteOutcome::NodeInternal:
                 // a store write failure of 3.3: the store poisoned, templates stop, the joiner path at the next start
