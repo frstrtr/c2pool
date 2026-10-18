@@ -30,6 +30,9 @@
 //              templates, judges and relays while the attempt runs (3.3a);
 //              rule (4) replaces A, the lost count; the adoption clears
 //              the re-pend watch;
+//   omitownspan a copy of a carrier's own receipt with a tip below x1 (no
+//              #12 there, D35): refused by freshness; held pending, it is
+//              not counted against the carrier;
 //   partition  a fork below the server's header floor (a server at its P-51
 //              floors): in scope without a header below x0(L') - N_rt (E-82);
 //   x1         a joined node: a fork at or below x1 (above the journal base)
@@ -88,6 +91,13 @@
 
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
+
+// The KAT's view of a node's private state.
+namespace c2pool::xmr::pathb {
+struct PathbNodeTestAccess {
+    static void add_pending(PathbNode& n, PendingReceipt r) { n.pending_.add(std::move(r)); }
+};
+}  // namespace c2pool::xmr::pathb
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
@@ -601,6 +611,49 @@ Joined join_at(Harness& h, const JoinNet& net, KatNode& a, std::uint64_t J) {
     const pb::JoinStep st = h[o.jn.j].run_join();
     o.ok = st.switched && h[o.jn.j].joined() != nullptr && h[o.jn.j].tree().best().id == a.store.best_tip();
     return o;
+}
+
+// omitownspan: a copy of a carrier's own receipt with another tip is never counted against the carrier. A node joined
+// at L does not run #12 for a tip below x1 (D35), so the copy's id does not bind its tip there. The server mines c on L;
+// copies of c's own body with the tip moved into the claimed span (and one near L) are refused at admission by the
+// freshness row (the span lies more than F + Fresh Monero heights below L). Held pending anyway (put in the pending set),
+// the copy is not counted when c reaches the joined node with room: 0 omissions.
+void omitownspan() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok && !h[jd.jn.j].joined()->young, "omitownspan: joined at L (not young)");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j, s = jd.s;
+    const pb::JoinedState& js = *h[j].joined();
+    h.mon_tip = h_pos(L) + 1;
+    const pb::NodeEventResult rc = h.mine(s, 1, 77, false);  // c on L at the server
+    h.q.clear();
+    const pb::CarrierBodyV3 cb = *h[s].bodies().get(h[s].tree().best().id);
+    bool refused = rc.action == pb::NodeAction::Placed;
+    for (const std::uint64_t tp : {js.x1 - 1, js.x0, L - 20}) {
+        pb::ReceiptBodyV3 copy = cb.own;
+        copy.side.tip = at_pos(a, tp);
+        const std::vector<pb::NodeEventResult> rr =
+                h[j].on_receipts(s, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{copy}, pb::kRuledLaneParams));
+        refused = refused && pb::receipt_id(copy) == pb::receipt_id(cb.own) && rr.size() == 1 &&
+                  rr[0].admit.verdict == pb::AdmitVerdict::Refuse && rr[0].admit.row == pb::RowId::R20;
+    }
+    check(refused && h[j].pending().size() == 0,
+          "omitownspan: copies of c's own body with a tip in the claimed span (below x1 " + std::to_string(js.x1) +
+                  ") or near L are refused by the freshness row");
+    pb::ReceiptBodyV3 copy = cb.own;
+    copy.side.tip = at_pos(a, js.x1 - 1);
+    pb::PathbNodeTestAccess::add_pending(h[j], pb::PendingReceipt{pb::receipt_id(copy), copy,
+                                                                  h[j].receipt_origin(cb.own).value_or(0), js.x1 - 1, 0});
+    const bool held = h[j].pending().size() == 1;
+    const pb::NodeEventResult r = h[j].on_carrier(s, *pb::encode_fc_carrier(0, cb, pb::kRuledLaneParams.r_max));
+    check(held && r.admit.verdict == pb::AdmitVerdict::AdmitCarrier && cb.carried.empty() && r.omitted == 0,
+          "omitownspan: a pending copy of c's own receipt with a tip below x1: c is not charged for it (" +
+                  std::to_string(r.omitted) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,6 +2134,7 @@ int main(int argc, char** argv) {
     run("fetchahead", fetchahead);
     run("deep", deep);
     run("partition", partition);
+    run("omitownspan", omitownspan);
     run("x1", x1);
     run("reask", reask);
     run("adoptbelow", adoptbelow);
