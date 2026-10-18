@@ -36,7 +36,8 @@
    MonReorg(h) (at most MaxReorg times): the Monero blocks at heights h..mon are replaced by others at the same heights
    (mon unchanged; a changed hash, mh).  A carrier records the hash version of its height when found (rec.ver).  The
    ruled checks, the record, liveness and the seals read heights only, so a reorg at a constant height changes no
-   verdict and no seal.
+   verdict and no seal.  Under "ruled" this holds by construction; the test of it is the hashlocal control
+   (V1_rnp_neg_hashlocal_n2r4_reorg), where a rule that reads the hash violates Agreement.
    Restart(n) (at most MaxRestart times): node n keeps the carriers it holds (its store) and loses its seals and its
    pending pool; it seals again from its chain.
 

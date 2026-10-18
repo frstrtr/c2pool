@@ -3,14 +3,19 @@
 #
 #   proto/tla/check-seal-rnp.sh <path/to/tla2tools.jar> [out-dir]
 #
-# Configs (two nodes and four receipt ids, or one node and five), one verdict line per run:
+# Configs (two nodes and four receipt ids, except V1_rnp_own_n1r5_k3: one node and five, and
+# V1_rnp_neg_orderfirst_n2r5_adv_k3: two nodes and five), one verdict line per run:
 #   GREEN (every seal invariant + Agreement + HonestAccepted + ChainRuledValid +
 #          RecordIsCarrierMax; no error, the whole space explored, distinct
 #          states and depth at or above the floor given on its line):
 #                                        V1_rnp_own_n2r4 V1_rnp_carriage_n2r4
-#          with a Monero reorg at a constant height, a node restart, three carried ids:
-#                                        V1_rnp_own_n2r4_reorg V1_rnp_own_n2r4_restart V1_rnp_own_n1r5_k3
-#                                        V1_rnp_own_n2r4_k3
+#          with a Monero reorg at a constant height, a node restart:
+#                                        V1_rnp_own_n2r4_reorg V1_rnp_own_n2r4_restart
+#          with carried pairs (MaxCarry 2; at four receipt ids a carrier carries at most two ids), two nodes:
+#                                        V1_rnp_own_n2r4_k2
+#          with three carried ids (MaxCarry 3), one node:
+#                                        V1_rnp_own_n1r5_k3
+#          (V1_rnp_own_n2r5_k3, two nodes with three carried ids, is not run here: README.md)
 #   controls (the named invariant is violated):
 #          V1_rnp_neg_openlocal_n2r4   Agreement
 #          V1_rnp_neg_omitlocal_n2r4   Agreement
@@ -69,7 +74,7 @@ run V1_rnp_carriage_n2r4; green V1_rnp_carriage_n2r4 184907 17
 run V1_rnp_own_n2r4_reorg;   green V1_rnp_own_n2r4_reorg   3131274 18
 run V1_rnp_own_n2r4_restart; green V1_rnp_own_n2r4_restart 369814 18
 run V1_rnp_own_n1r5_k3;    green V1_rnp_own_n1r5_k3    1898658 14
-run V1_rnp_own_n2r4_k3;    green V1_rnp_own_n2r4_k3    243326 17
+run V1_rnp_own_n2r4_k2;    green V1_rnp_own_n2r4_k2    243326 17
 
 run V1_rnp_neg_openlocal_n2r4;      expect V1_rnp_neg_openlocal_n2r4      'Invariant Agreement is violated'
 run V1_rnp_neg_omitlocal_n2r4;      expect V1_rnp_neg_omitlocal_n2r4      'Invariant Agreement is violated'
