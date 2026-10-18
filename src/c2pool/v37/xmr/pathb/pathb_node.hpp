@@ -2797,8 +2797,9 @@ private:
     // The receipts this node holds pending that a carrier with room for more (fewer than R_MAX carried) did not carry
     // although the honest carried list at its parent holds them (E3, carried_list's predicate at the carrier's parent):
     // the origin bin open there, h(r) <= h(c) + Fresh, not placed on the parent's chain, the tip's branch passing the
-    // S3b-4a walk from it (on the chain, or placed within J_0); never the carrier's own receipt (carried_omissions;
-    // S2.3 #14).
+    // S3b-4a walk from it (on the chain, or placed within J_0); never a receipt whose tip is the carrier's parent: it
+    // competes for the carrier's own position (the carrier's own receipt among them), so the carrier could not carry it
+    // (carried_omissions; S2.3 #14).
     std::uint64_t omissions_of(const AdmitResult& a) {
         const CarrierBodyV3& c = *a.carrier;
         if (c.carried.size() >= cfg_.p.r_max) return 0;
@@ -2808,7 +2809,6 @@ private:
         if (!pv.ok()) return 0;
         const std::uint64_t H = pv.record(pv.pos());
         const std::uint64_t h_c = a.store_placements.back().bin;  // the own body's origin bin
-        const Hash32 own = receipt_id(c.own);
         std::vector<Hash32> carried;
         for (const ReceiptBodyV3& b : c.carried) carried.push_back(receipt_id(b));
         const AdmitEnv e = env();
@@ -2816,7 +2816,7 @@ private:
         std::optional<ClosureWalk> walk;
         std::vector<Hash32> known;
         for (const PendingReceipt* p : pending_.all()) {
-            if (p->id == own) continue;
+            if (p->body.side.tip == parent) continue;  // competes for the carrier's own position
             if (!open_at(H, p->h, cfg_.p.open_bins)) continue;
             if (!carried_upper_ok(p->h, h_c, cfg_.p.fresh_max)) continue;
             if (pv.placed_open(p->id)) continue;
