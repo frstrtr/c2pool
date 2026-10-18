@@ -57,9 +57,9 @@ TLC_LONG=1 proto/tla/check-ratchet.sh path/to/tla2tools.jar
 proto/tla/check-seal-rnp.sh path/to/tla2tools.jar [out-dir]
 ```
 
-`V1_rnp_own_n2r4_k3` with five receipt ids (`Rids = {1, 2, 3, 4, 5}`) is not in the set. An exploration on
-4 workers reached 42,918,405 distinct states at depth 16 with 8,469,429 states left on queue; it is not
-exhausted and is not a floor.
+`V1_rnp_own_n2r4_k3` with five receipt ids (`Rids = {1, 2, 3, 4, 5}`) is not in the set. One exploration on
+4 workers ended with no error: 52,026,352 distinct states, an empty queue, depth 20 (about 3 h 50 min, resumed
+once from a TLC checkpoint). It is not a floor.
 
 The `.github/workflows/tla-model-check.yml` lane runs both scripts on every PR
 that touches `proto/tla/**` (a pinned, sha256-verified `tla2tools.jar`), and
