@@ -176,6 +176,8 @@
 //                Monero height (h(r) > h(c) + Fresh): none;
 //   omitopen     a receipt open at the best tip, sealed at a sibling's
 //                child carrier's parent: none;
+//   omitwalk     a receipt whose tip forks more than J_0 below the
+//                carrier's parent (the honest list leaves it out): none;
 //   omithonest   an all-honest three-node run (a partition, a switch by
 //                the journal, the heal, three rounds): no omission logged;
 //   relayswitchlog a switch line per switch and a carrier admission counted
@@ -255,6 +257,7 @@ struct PathbNodeTestAccess {
         n.memo_order_.clear();
     }
     static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
+    static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -5775,6 +5778,45 @@ void omitopen() {
                   std::to_string(r.omitted) + ")");
 }
 
+// omitwalk: E3's walk condition for an omission (the boundary KAT's shape). r on a side tip t forking at f, pending
+// at a node whose best is f + J_0 + 1 (the honest carried list leaves r out there), and r2 on the best chain. A peer's
+// carrier c on the best tip with room carries neither: one omission (r2), not two (r's tip forks more than J_0 below
+// c's parent).
+void omitwalk() {
+    const KatNet net;
+    KatNode n(net, 1152);
+    const std::uint64_t f = 10;
+    const auto hb = [](std::uint64_t) { return kLaneB0; };
+    std::vector<pb::Hash32> main = scaffold_chain(n, n.tree.genesis().id, f, 0x91, hb);
+    const std::vector<pb::Hash32> m2 = scaffold_chain(n, main.back(), 2, 0x95, hb);
+    const pb::CarrierBodyV3 tc = scaffold_body(n, main.back(), kLaneB0, 0x92, 777, 3);
+    const bool side = place_direct(n, tc).outcome == pb::WriteOutcome::SideBranch;
+    const pb::Hash32 t = pb::receipt_id(tc.own);
+    const std::uint64_t j0 = pb::admit_j0(pb::kRuledLaneParams);
+    scaffold_chain(n, m2.back(), j0 - 2, 0x93, hb);
+    const pb::ReceiptBodyV3 r = body_on(n, t, kLaneB0 + 1, 4, 4242);
+    const pb::Hash32 on = n.tree.best().id;
+    const pb::ReceiptBodyV3 r2 = body_on(n, on, kLaneB0 + 1, 5, 4343);
+    scaffold_chain(n, n.tree.best().id, 1, 0x94, hb);
+    const pb::CarrierNode& best = n.tree.best();
+    Harness h(net);
+    h.nodes.push_back(node_from(h, n, 1152, 0));
+    pb::PathbNodeTestAccess::add_pending(h[0], pb::PendingReceipt{pb::receipt_id(r), r, kLaneB0 + 1, f + 1, 0});
+    pb::PathbNodeTestAccess::add_pending(h[0], pb::PendingReceipt{pb::receipt_id(r2), r2, kLaneB0 + 1, best.pos - 1, 0});
+    const std::vector<pb::ReceiptBodyV3> cl = pb::PathbNodeTestAccess::carried(h[0], best.pos + 1, kLaneB0);
+    const pb::CarrierBodyV3 c = scaffold_body(n, best.id, kLaneB0, 0x96, 999, 1);
+    pb::AdmitResult a;
+    a.verdict = pb::AdmitVerdict::AdmitCarrier;
+    a.id = pb::receipt_id(c.own);
+    a.carrier = c;
+    a.store_placements.push_back(pb::admit_detail::placement_of(c.own, a.id, kLaneB0, best.pos + 1));
+    const std::uint64_t om = pb::PathbNodeTestAccess::omissions(h[0], a);
+    check(side && best.pos == f + j0 + 1 && h[0].pending().size() == 2 && cl.size() == 1 &&
+                  pb::receipt_id(cl[0]) == pb::receipt_id(r2),
+          "omitwalk: r's tip forks more than J_0 below the best tip, r2 on the chain; the honest carried list holds r2 only");
+    check(om == 1, "omitwalk: c's omissions are the honest list's (r2): " + std::to_string(om));
+}
+
 // omithonest: an all-honest three-node run charges no omission. A partition {A, B} | {C}: B's receipt rb is carried on
 // A's branch Y (y1, y2); C mines X (x1; x2 above y2 in id order; x3). B moves to C's side: X reaches B, which switches
 // at x3 by its journal and re-pends rb and Y's own receipts (relayed to C). A, alone, mines y3 on Y; at the heal y3
@@ -6373,6 +6415,7 @@ int main(int argc, char** argv) {
     run("omitrules", omitrules);
     run("omitfresh", omitfresh);
     run("omitopen", omitopen);
+    run("omitwalk", omitwalk);
     run("omithonest", omithonest);
     run("relayswitchlog", relayswitchlog);
     run("relayrepend", relayrepend);
