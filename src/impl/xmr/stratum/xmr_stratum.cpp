@@ -415,6 +415,13 @@ bool XmrStratumServer::handle_submit(XmrStratumSession& s, std::uint32_t req_id,
     if (network_block) {
         m_sink.submit_network_block(sj.template_id, ps.nonce, sj.extra_nonce);
     }
+    // a withdrawn template: the share is stale (its network block, if any, went out above)
+    if (tj.withdrawn) {
+        return m_transport.send_line(
+            s.client_id(),
+            StratumDialect::build_error(req_id,
+                                        submit_error_message(SubmitError::Stale)));
+    }
 
     // (2) does it clear the job (lane) target? -> accepted share, else low diff
     if (!m_verifier.meets_target(pow_hash, sj.target)) {

@@ -18,19 +18,42 @@
 //   No reorg depth limit. A switch whose fork point the journal holds
 //   rewinds (RewindVerdict::Rewound); a deeper one rebuilds
 //   (RewindVerdict::RebuildRequired).
-//   A carrier whose parent is not held waits (Deferred) and is placed when
-//   the parent is placed.
-//   receipts_root: a carrier's receipts_root must equal
-//     sha256d("c2pool-v37-carry" || carried_root || rs_root(S(parent)))
-//   with carried_root 0 (a carrier here carries nothing); otherwise
-//   FoldMismatch (strike) in place(), after the parent and height checks,
-//   and a failed side header. S(c) = rs_step(S(parent), pos(c), {d(c), ballot(c)})
-//   (pathb_ratchet_state.hpp); genesis S = epoch 0, rules_cur = the genesis
-//   rules digest.
+//   A carrier whose parent is not held waits (Deferred); a waiting entry is
+//   the pair (id, claimed parent), so the same id naming another parent is
+//   judged on its own. When a carrier is placed, its other waiting entries are
+//   dropped and the carriers waiting on it are released
+//   (PlaceOutcome::released): the caller admits each again on the parent's
+//   view and places it. A carrier refused NotCarrier or FoldMismatch discards
+//   the carriers waiting on it, and those waiting on them, except a carrier
+//   that still waits under another claimed parent (PlaceOutcome::discarded:
+//   the (id, claimed parent) pairs). unwait(id, parent) removes one waiting
+//   entry and nothing else.
+//   receipts_root (S1.3 #10): a carrier's receipts_root must equal
+//     sha256d("c2pool-v37-carry" || carried_root(ids) || rs_root(S(parent)))
+//   over the ids of its carried list in list order (check_carried_fold,
+//   pathb_receipt_admission.hpp; carried_root 0 when it carries nothing);
+//   otherwise FoldMismatch (strike) in place(), after the parent and height
+//   checks.
+//   S(c) = rs_step_at(S(parent), pos(c), placements at pos(c), T)
+//   (pathb_ratchet_activation.hpp): step (1) at H_act of the table T, then
+//   step (2) over every placement at pos(c): each carried receipt at its
+//   credited work, 0 when dead, then the carrier at d(c); the activation row
+//   it returns is kept on the carrier node. Genesis S = epoch 0, rules_cur =
+//   the genesis rules digest.
+//   joined(): the tree of a join rooted at x0 - 1 (slice S3b-4b), absolute
+//   positions, the retarget-prefix entries as its inherited window, the
+//   claimed prefix nodes [x_pre, x0 - 2] below the root (ruling 53, E-99).
+//   Below the root of a joined tree (ruling 53, E-99, E-105): the d of a
+//   carrier at a position x <= x0 - 1 is its own claimed t_origin (never a
+//   window); a window that leaves the held prefix has no value; no node below
+//   the root (a prefix node, or a side branch forking at one) is eligible for
+//   the best tip.
+//   reroot(): the tree of a node that prunes, rooted at a best-chain carrier
+//   with the retarget entries through it as its inherited window.
 //   Headers-first: an announced side header weighs its retarget d on the
 //   side chain; it fails on a parent link that does not continue the side
-//   chain, a height below the record of its parent, a receipts_root that
-//   does not fold over the side chain's S, or a failed PoW at that d.
+//   chain, a height below the record of its parent, or a failed PoW at that
+//   d. A header carries no carried bodies: no fold and no S on this path.
 //   decide_side_branch (pathb_headers_first.hpp) decides on the result.
 //
 // Header-only. Not included by any running component.
@@ -52,7 +75,9 @@
 #include "pathb_headers_first.hpp"
 #include "pathb_journal.hpp"
 #include "pathb_params.hpp"
+#include "pathb_ratchet_activation.hpp"  // EpochTable, ActivationRow, rs_step_at
 #include "pathb_ratchet_state.hpp"
+#include "pathb_receipt_admission.hpp"   // carrier_receipts_root_over, check_carried_fold
 #include "pathb_retarget.hpp"
 
 namespace c2pool::xmr::pathb {
@@ -82,6 +107,21 @@ struct CarrierAnnounce {
     std::uint64_t h = 0;       // template height
     Hash32 receipts_root{};    // side_data_v3 receipts_root
     std::uint16_t ballot = 0;  // side_data_v3 ballot
+    std::uint64_t t_origin = 0;  // side_data_v3 t_origin: its d at a position at or below a joined root (a claim)
+};
+
+// A receipt of a carrier's carried list as placed at the carrier's position:
+// its id, its credited work work(T_origin) (R-1, S2.3 #11), its ballot
+// (side_data_v3) and its liveness at placement on the placing chain (S2.3
+// #17, decided by the placement). A dead placement adds 0 to S.
+// A waiting entry: (carrier id, claimed parent id).
+using WaitKey = std::pair<Hash32, Hash32>;
+
+struct CarriedPlacement {
+    Hash32 id{};
+    std::uint64_t work = 0;
+    std::uint16_t ballot = 0;
+    bool live = false;
 };
 
 struct CarrierNode {
@@ -94,10 +134,13 @@ struct CarrierNode {
     ::c2pool::xmr::native::U128 cum_work{};
     Hash32 receipts_root{};
     std::uint16_t ballot = 0;
-    RatchetState rs{};         // S after this position
-    bool verified = false;     // header checks and PoW at d passed
-    bool bodies = false;       // bodies held
-    bool chain_valid = false;  // verified and bodies on every carrier back to genesis
+    RatchetState rs{};                        // S after this position
+    std::optional<ActivationRow> activation;  // the AR row of an activation at this position
+    bool verified = false;                    // header checks and PoW at d passed
+    bool bodies = false;                      // bodies held
+    bool chain_valid = false;                 // verified and bodies on every carrier back to genesis
+    bool below_root = false;                  // a joined tree's prefix node, or a carrier on a branch forking at one
+    std::uint64_t pre_fork_H = 0;             // below_root: the record of the prefix node its branch forks at
     std::size_t parent_index = 0;
     std::vector<std::size_t> children;
 };
@@ -106,10 +149,11 @@ enum class PlaceVerdict : std::uint8_t { Placed, Deferred, Duplicate, NotCarrier
 
 struct PlaceOutcome {
     PlaceVerdict verdict = PlaceVerdict::Deferred;
-    std::vector<Hash32> placed;         // this carrier, then the waiting carriers placed behind it, in order
-    std::vector<Hash32> not_carrier;    // waiting carriers with h < H(parent), discarded with their waiting descendants
-    std::vector<Hash32> fold_mismatch;  // waiting carriers whose receipts_root does not fold (strike), discarded
-                                        // with their waiting descendants
+    std::vector<Hash32> released;   // Placed: the carriers that waited on this one, in arrival order; each is
+                                    // admitted again by the caller and placed
+    std::vector<WaitKey> discarded;  // NotCarrier / FoldMismatch: the waiting entries dropped (the carriers that
+                                     // waited on this one, and on them while they have no other waiting entry),
+                                     // each with the claimed parent it waited under
 };
 
 struct SwitchPlan {
@@ -126,12 +170,13 @@ public:
     // inherited record), cum_work 0, verified, bodies held, S =
     // genesis_ratchet_state(genesis_rules_digest). `inherited`: the
     // predecessor's carriers, oldest first; the newest N_rt open the window
-    // of position 1. Preconditions: retarget_params_valid(p),
-    // ratchet_params_valid(rp).
-    CarrierTree(const LaneParams& p, const Hash32& genesis_id, std::uint64_t genesis_height,
+    // of position 1. `table`: the node's compiled epoch table T, read by
+    // rs_step_at at every position (no default).
+    // Preconditions: retarget_params_valid(p), ratchet_params_valid(rp).
+    CarrierTree(const LaneParams& p, const Hash32& genesis_id, std::uint64_t genesis_height, const EpochTable& table,
                 std::span<const RetargetEntry> inherited = {}, const RatchetParams& rp = kRuledRatchetParams,
                 const Hash32& genesis_rules_digest = Hash32{})
-        : p_(p), rp_(rp) {
+        : p_(p), rp_(rp), table_(table) {
         const std::size_t keep =
                 static_cast<std::size_t>(std::min<std::uint64_t>(inherited.size(), p.retarget_span));
         inherited_.assign(inherited.end() - static_cast<std::ptrdiff_t>(keep), inherited.end());
@@ -146,10 +191,147 @@ public:
         index_.emplace(genesis_id, 0);
     }
 
+    // A retarget-prefix header the joined tree holds as a claimed node on the
+    // joined chain, below the root (RULED 47, E-84; from x_pre, ruling 53,
+    // E-99): id, pos, h, H and d = the header's t_origin, values from the
+    // attempt's server's passing assignment. The ratchet state below the root is not tracked (the root's
+    // S_{x0-1} is the start), so a receipt whose tip is a PRE node is credited
+    // at its origin bin and its #11 is a claim not computed (JoinClaims::basis).
+    struct PreNode {
+        Hash32 id{};
+        std::uint64_t pos = 0;
+        std::uint64_t h = 0;
+        std::uint64_t H = 0;
+        std::uint64_t d = 0;
+    };
+
+    // The joined tree of a join (slice S3b-4b; ABSOLUTE positions): its root is
+    // the carrier at root_pos = x0 - 1 (id, template height root_h, its record
+    // the newest entry of `pre`) with the adopted ratchet state root_s (a claim
+    // of the join) and cum_work 0; `pre`: the retarget-prefix entries ending at
+    // the root (d = each header's t_origin, H; claims), oldest first, the newest
+    // of them the root's own (the newest N_rt are kept). `pre_nodes`: the
+    // prefix headers below the root, [x_pre, x0 - 2], oldest first, as claimed
+    // nodes on the joined chain (E-84, E-99), so the row-17 walk meets a tree
+    // node for every tip S2.3 #6 and #7 allow below x0 - 1. Position 0 (x0 = 1)
+    // is the genesis tree with root_s = S_0. The replay places x0 .. L on it as
+    // on a follower: rs_step_at at every absolute position; the window of a
+    // span carrier stops at the root (node 0) and reads `pre` as inherited_;
+    // the window of a carrier on a branch forking at a prefix node walks the
+    // prefix nodes and has no value when it leaves them (B6 unreachable).
+    static CarrierTree joined(const LaneParams& p, const Hash32& root_id, std::uint64_t root_pos, std::uint64_t root_h,
+                              const RatchetState& root_s, const EpochTable& table, std::span<const RetargetEntry> pre,
+                              const RatchetParams& rp = kRuledRatchetParams, std::span<const PreNode> pre_nodes = {}) {
+        CarrierTree t(p, root_id, root_h, table, pre, rp);
+        CarrierNode& r = t.nodes_[0];
+        r.pos = root_pos;
+        r.rs = root_s;
+        // the root's own d: its claimed t_origin, the newest `pre` entry (the window reads it from inherited_, never
+        // from node 0; its record keeps it, so a restart's window reads the same value)
+        if (!pre.empty()) r.d = pre.back().d;
+        // the PRE nodes below the root (claims; reached only by find() for the row-17 walk, never by window_after)
+        for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
+            const PreNode& pn = pre_nodes[k];
+            CarrierNode n;
+            n.id = pn.id;
+            n.pos = pn.pos;
+            n.h = pn.h;
+            n.H = pn.H;
+            n.d = pn.d;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.below_root = true;  // never the best tip (ruling 53, E-105)
+            n.pre_fork_H = pn.H;
+            n.parent = k > 0 ? pre_nodes[k - 1].id : pn.id;  // oldest first; the lowest is its own parent
+            const std::size_t idx = t.nodes_.size();
+            n.parent_index = k > 0 ? t.index_.at(pre_nodes[k - 1].id) : idx;
+            t.nodes_.push_back(std::move(n));
+            t.index_.emplace(pn.id, idx);
+        }
+        return t;
+    }
+
+    // A tree restored from the node's own store at a restart (slice S4w-a):
+    // `chain` = its best chain from the lowest position it holds (genesis, or
+    // a joined store's root at x0 - 1), oldest first, with the values stored
+    // for each position; the lowest is node 0, `inherited` the retarget
+    // entries below it (none at genesis; a joined root's prefix, the newest
+    // of them the root's own). Every node is verified, its bodies held and
+    // chain-valid; the best tip is the last. Empty `chain` or a parent link
+    // that does not continue it: nullopt.
+    struct RestoredNode {
+        Hash32 id{};
+        Hash32 parent{};
+        std::uint64_t pos = 0;
+        std::uint64_t h = 0;
+        std::uint64_t H = 0;
+        std::uint64_t d = 0;
+        ::c2pool::xmr::native::U128 cum_work{};
+        Hash32 receipts_root{};
+        std::uint16_t ballot = 0;
+        RatchetState rs{};
+        std::optional<ActivationRow> activation;
+    };
+    // `pre_nodes`: an unpruned joined store's claimed prefix [x_pre, x0 - 2] (its records), restored as the
+    // joined tree holds them (below the root, claims; `joined`).
+    static std::optional<CarrierTree> restored(const LaneParams& p, std::span<const RestoredNode> chain,
+                                               const EpochTable& table, std::span<const RetargetEntry> inherited = {},
+                                               const RatchetParams& rp = kRuledRatchetParams,
+                                               std::span<const PreNode> pre_nodes = {}) {
+        if (chain.empty()) return std::nullopt;
+        for (std::size_t k = 1; k < chain.size(); ++k)
+            if (chain[k].parent != chain[k - 1].id || chain[k].pos != chain[k - 1].pos + 1) return std::nullopt;
+        CarrierTree t(p, chain[0].id, chain[0].h, table, inherited, rp);
+        for (std::size_t k = 0; k < chain.size(); ++k) {
+            const RestoredNode& r = chain[k];
+            CarrierNode n;
+            n.id = r.id;
+            n.parent = k == 0 ? r.id : r.parent;
+            n.pos = r.pos;
+            n.h = r.h;
+            n.H = r.H;
+            n.d = r.d;
+            n.cum_work = r.cum_work;
+            n.receipts_root = r.receipts_root;
+            n.ballot = r.ballot;
+            n.rs = r.rs;
+            n.activation = r.activation;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.parent_index = k == 0 ? 0 : k - 1;
+            if (k == 0) {
+                t.nodes_[0] = std::move(n);
+                continue;
+            }
+            t.nodes_.push_back(std::move(n));
+            t.nodes_[k - 1].children.push_back(k);
+            if (!t.index_.emplace(r.id, k).second) return std::nullopt;
+        }
+        t.best_ = chain.size() - 1;
+        for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
+            const PreNode& pn = pre_nodes[k];
+            if (pn.pos >= chain[0].pos || (k > 0 && pn.pos != pre_nodes[k - 1].pos + 1)) return std::nullopt;
+            CarrierNode n;
+            n.id = pn.id;
+            n.pos = pn.pos;
+            n.h = pn.h;
+            n.H = pn.H;
+            n.d = pn.d;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.below_root = true;  // never the best tip (ruling 53, E-105)
+            n.pre_fork_H = pn.H;
+            n.parent = k > 0 ? pre_nodes[k - 1].id : pn.id;
+            const std::size_t idx = t.nodes_.size();
+            n.parent_index = k > 0 ? t.index_.at(pre_nodes[k - 1].id) : idx;
+            t.nodes_.push_back(std::move(n));
+            if (!t.index_.emplace(pn.id, idx).second) return std::nullopt;
+        }
+        return t;
+    }
+
     const LaneParams& params() const noexcept { return p_; }
     const RatchetParams& ratchet_params() const noexcept { return rp_; }
+    const EpochTable& epoch_table() const noexcept { return table_; }
     std::size_t size() const noexcept { return index_.size(); }
-    std::size_t waiting() const noexcept { return waiting_ids_.size(); }
+    std::size_t waiting() const noexcept { return waiting_keys_.size(); }
     const CarrierNode& genesis() const noexcept { return nodes_[0]; }
     const CarrierNode& best() const noexcept { return nodes_[best_]; }
 
@@ -158,12 +340,35 @@ public:
         return it == index_.end() ? nullptr : &nodes_[it->second];
     }
 
+    // Sets the ratchet state of a claimed PRE node below the root (RULED 47
+    // ruling 47, E-83): S(f) fetched for a side branch forking at that node, so
+    // the row-17 walk folds the side carrier over it. Only a claimed node below
+    // the root (never a placed carrier); false otherwise.
+    bool set_claimed_rs(const Hash32& id, const RatchetState& rs) {
+        const auto it = index_.find(id);
+        if (it == index_.end() || it->second == best_) return false;
+        CarrierNode& n = nodes_[it->second];
+        if (n.pos >= nodes_[0].pos) return false;  // below the root only
+        n.rs = rs;
+        return true;
+    }
+
     // The retarget window of the carrier after `tip` (its newest N_rt
-    // carriers, then inherited entries).
+    // carriers, then inherited entries); nullopt when tip is not held or the
+    // window leaves the held prefix of a joined tree (ruling 53, E-99).
     std::optional<RetargetWindow> window_after(const Hash32& tip) const {
         const auto it = index_.find(tip);
         if (it == index_.end()) return std::nullopt;
         return window_after_index(it->second);
+    }
+
+    // The newest m retarget entries of tip's chain ending at tip (oldest
+    // first; fewer when the chain is shorter); nullopt when tip is not held or
+    // the entries leave the held prefix of a joined tree.
+    std::optional<std::vector<RetargetEntry>> window_entries(const Hash32& tip, std::size_t m) const {
+        const auto it = index_.find(tip);
+        if (it == index_.end()) return std::nullopt;
+        return entries_after_index(it->second, m);
     }
 
     // d_at(chain of tip, pos(tip) + 1): the d of a carrier on top of `tip`
@@ -174,65 +379,131 @@ public:
         return w->next_difficulty();
     }
 
-    // The receipts_root of a carrier on top of `tip` (carried_root 0).
-    std::optional<Hash32> next_receipts_root(const Hash32& tip) const {
+    // The receipts_root of a carrier on top of `tip` that carries `carried_ids`
+    // (in list order): the fold of carried_root(carried_ids) with rs_root(S(tip)).
+    std::optional<Hash32> next_receipts_root(const Hash32& tip, std::span<const Hash32> carried_ids) const {
         const auto it = index_.find(tip);
         if (it == index_.end()) return std::nullopt;
-        return carrier_receipts_root(kNoCarriedRoot, nodes_[it->second].rs);
+        return carrier_receipts_root_over(carried_ids, nodes_[it->second].rs);
     }
 
-    PlaceOutcome place(const CarrierAnnounce& c) {
+    // Places carrier c with its carried list (in list order). c.id held, or
+    // (c.id, c.parent) already waiting: Duplicate. Parent not held: Deferred
+    // (c waits on its parent). Then h(c) >= H(parent), else NotCarrier; then
+    // the fold of S1.3 #10 over the carried ids against S(parent), else
+    // FoldMismatch; then c is placed at pos(parent) + 1 and S advances by
+    // rs_step_at over every placement there.
+    // Preconditions of the caller:
+    //   - with c.parent held, place() follows S1.3 #1a-#9 (the coinbase check
+    //     binds side_data, and so the claimed parent, to c.id);
+    //   - the carried bodies are held and S2.3 #14 passed; missing bodies are
+    //     DEFERred before place() (place(c, {}) for a carrier that carries
+    //     receipts is FoldMismatch);
+    //   - `carried` is read on the placing chain (the branch through c.parent):
+    //     the ids of the carried list in body order, work = the #11 t_origin,
+    //     ballot = the side_data_v3 ballot, live = #17;
+    //   - a FoldMismatch judges these bytes (the carrier and its carried
+    //     list), not c.id: the tree keeps no refusal, and the same id with
+    //     other bytes is judged again;
+    //   - place() is not called at x >= H_hold (the hold is the caller's).
+    PlaceOutcome place(const CarrierAnnounce& c, std::span<const CarriedPlacement> carried) {
         PlaceOutcome out;
-        if (index_.count(c.id) != 0 || waiting_ids_.count(c.id) != 0) {
+        if (index_.count(c.id) != 0 || waiting_keys_.count(WaitKey{c.id, c.parent}) != 0) {
             out.verdict = PlaceVerdict::Duplicate;
             return out;
         }
         const auto pit = index_.find(c.parent);
         if (pit == index_.end()) {
-            waiting_[c.parent].push_back(c);
-            waiting_ids_.insert(c.id);
+            waiting_[c.parent].push_back(c.id);
+            waiting_keys_.insert(WaitKey{c.id, c.parent});
             out.verdict = PlaceVerdict::Deferred;
             return out;
         }
         if (!carrier_height_admissible(nodes_[pit->second].H, c.h)) {
             out.verdict = PlaceVerdict::NotCarrier;
+            out.discarded = discard_waiting(c.id);
             return out;
         }
-        if (!fold_matches(nodes_[pit->second].rs, c)) {
+        if (fold_verdict(nodes_[pit->second].rs, c, carried) != FoldVerdict::Match) {
             out.verdict = PlaceVerdict::FoldMismatch;
+            out.discarded = discard_waiting(c.id);
             return out;
         }
         out.verdict = PlaceVerdict::Placed;
-        place_under(pit->second, c);
-        out.placed.push_back(c.id);
-        // Waiting carriers whose parent is now placed, breadth first.
-        for (std::size_t q = 0; q < out.placed.size(); ++q) {
-            const auto wit = waiting_.find(out.placed[q]);
-            if (wit == waiting_.end()) continue;
-            std::vector<CarrierAnnounce> ready = std::move(wit->second);
-            waiting_.erase(wit);
-            const std::size_t pi = index_.at(out.placed[q]);
-            for (const CarrierAnnounce& w : ready) {
-                waiting_ids_.erase(w.id);
-                if (!carrier_height_admissible(nodes_[pi].H, w.h)) {
-                    out.not_carrier.push_back(w.id);
-                    discard_waiting(w.id);
-                    continue;
-                }
-                if (!fold_matches(nodes_[pi].rs, w)) {
-                    out.fold_mismatch.push_back(w.id);
-                    discard_waiting(w.id);
-                    continue;
-                }
-                place_under(pi, w);
-                out.placed.push_back(w.id);
-            }
-        }
+        place_under(pit->second, c, carried);
+        drop_claims(c.id);
+        out.released = release_waiting(c.id);
         return out;
     }
 
     bool mark_verified(const Hash32& id) { return mark(id, true, false); }
     bool mark_bodies(const Hash32& id) { return mark(id, false, true); }
+
+    // Undoes mark_verified and mark_bodies of a carrier with no child (the
+    // write step's undo): it is neither verified nor chain-valid, and the best
+    // tip is the greatest of the other chain-valid carriers. false: not held,
+    // genesis, or a carrier with a child.
+    bool unmark(const Hash32& id) {
+        const auto it = index_.find(id);
+        if (it == index_.end() || it->second == 0 || !nodes_[it->second].children.empty()) return false;
+        CarrierNode& n = nodes_[it->second];
+        n.verified = n.bodies = n.chain_valid = false;
+        if (best_ == it->second) {
+            best_ = 0;
+            for (const auto& [hid, i] : index_)
+                if (nodes_[i].chain_valid && !nodes_[i].below_root
+                    && fork_choice_prefers(ChainTip{nodes_[i].cum_work, nodes_[i].id}, ChainTip{nodes_[best_].cum_work, nodes_[best_].id}))
+                    best_ = i;
+        }
+        return true;
+    }
+
+    // Removes the one waiting entry (id, parent); entries waiting on id stay.
+    // false: no such entry.
+    bool unwait(const Hash32& id, const Hash32& parent) {
+        if (waiting_keys_.erase(WaitKey{id, parent}) == 0) return false;
+        const auto wit = waiting_.find(parent);
+        if (wit != waiting_.end()) {
+            std::vector<Hash32>& v = wit->second;
+            v.erase(std::remove(v.begin(), v.end(), id), v.end());
+            if (v.empty()) waiting_.erase(wit);
+        }
+        return true;
+    }
+
+    // The ancestor of `id` at position `pos` on id's chain (id itself at
+    // pos(id)); nullopt when id is not held or pos > pos(id). Each parent
+    // step counts in walk_steps().
+    std::optional<Hash32> ancestor_at(const Hash32& id, std::uint64_t pos) const {
+        const auto it = index_.find(id);
+        if (it == index_.end() || nodes_[it->second].pos < pos) return std::nullopt;
+        std::size_t i = it->second;
+        while (nodes_[i].pos > pos) {
+            i = nodes_[i].parent_index;
+            ++walk_steps_;
+        }
+        return nodes_[i].id;
+    }
+
+    // The newest carrier on id's chain (id itself first) for which on(id', pos')
+    // holds; nullopt when id is not held or none does. Each parent step counts
+    // in walk_steps().
+    template <class On>
+    std::optional<Hash32> newest_ancestor_where(const Hash32& id, On&& on) const {
+        const auto it = index_.find(id);
+        if (it == index_.end()) return std::nullopt;
+        std::size_t i = it->second;
+        for (;;) {
+            if (on(nodes_[i].id, nodes_[i].pos)) return nodes_[i].id;
+            if (i == 0) return std::nullopt;
+            i = nodes_[i].parent_index;
+            ++walk_steps_;
+        }
+    }
+
+    // Parent steps taken by ancestor_at, newest_ancestor_where and the
+    // common-ancestor walk.
+    std::uint64_t walk_steps() const noexcept { return walk_steps_; }
 
     // Removes a carrier that is not chain-valid, with its descendants (none of
     // them is chain-valid, so the best tip does not change). Waiting carriers
@@ -252,6 +523,61 @@ public:
             nodes_[i].children.clear();
         }
         return true;
+    }
+
+    // Re-roots the tree at its best chain's carrier at position `pos` (above
+    // the current root, at or below the best tip): the carriers below it go,
+    // and so does every side branch whose fork with the best chain lies below
+    // max(pos, side_floor); the new root keeps its values and S, is its own
+    // parent, and the retarget entries of the N_rt positions through it
+    // become its inherited window (as a tree restored from that root).
+    // Waiting entries stay. Returns the ids that left the tree; nullopt:
+    // nothing changed.
+    std::optional<std::vector<Hash32>> reroot(std::uint64_t pos, std::uint64_t side_floor) {
+        if (pos <= nodes_[0].pos || pos > nodes_[best_].pos) return std::nullopt;
+        std::vector<bool> on_best(nodes_.size(), false);
+        std::size_t r = best_;
+        for (;;) {
+            on_best[r] = true;
+            if (nodes_[r].pos == pos) break;
+            r = nodes_[r].parent_index;
+        }
+        std::optional<std::vector<RetargetEntry>> inherited = entries_after_index(r, p_.retarget_span);
+        if (!inherited) return std::nullopt;
+        const std::uint64_t side_lo = std::max(pos, side_floor);
+        std::vector<std::size_t> keep{r};
+        for (std::size_t k = 0; k < keep.size(); ++k) {
+            const std::size_t i = keep[k];
+            for (std::size_t ch : nodes_[i].children)
+                if (on_best[ch] || !on_best[i] || nodes_[i].pos >= side_lo) keep.push_back(ch);
+        }
+        std::vector<std::size_t> remap(nodes_.size(), nodes_.size());
+        for (std::size_t k = 0; k < keep.size(); ++k) remap[keep[k]] = k;
+        std::vector<Hash32> dropped;
+        for (const auto& [id, i] : index_)
+            if (remap[i] >= keep.size()) dropped.push_back(id);
+        std::vector<CarrierNode> out;
+        out.reserve(keep.size());
+        for (std::size_t k = 0; k < keep.size(); ++k) {
+            CarrierNode n = std::move(nodes_[keep[k]]);
+            if (k == 0) {
+                n.parent = n.id;
+                n.parent_index = 0;
+            } else {
+                n.parent_index = remap[n.parent_index];
+            }
+            std::vector<std::size_t> ch;
+            for (std::size_t c : n.children)
+                if (remap[c] < keep.size()) ch.push_back(remap[c]);
+            n.children = std::move(ch);
+            out.push_back(std::move(n));
+        }
+        best_ = remap[best_];
+        nodes_ = std::move(out);
+        index_.clear();
+        for (std::size_t k = 0; k < nodes_.size(); ++k) index_.emplace(nodes_[k].id, k);
+        inherited_ = std::move(*inherited);
+        return dropped;
     }
 
     // The newest common ancestor of a and b.
@@ -286,17 +612,19 @@ public:
     // Headers-first: the side headers after `fork` (chain order) with their
     // retarget d as work. pow_ok(header, d) is the caller's PoW check. Headers
     // after the first failed one are marked failed. nullopt: fork not held.
+    // A header carries no carried bodies: no receipts_root fold and no S here;
+    // both are checked when the carrier is placed with its carried list.
     template <class PowCheck>
     std::optional<std::vector<SideHeader>> check_side_headers(const Hash32& fork,
                                                               std::span<const CarrierAnnounce> headers,
                                                               PowCheck&& pow_ok) const {
         const auto fi = index_.find(fork);
         if (fi == index_.end()) return std::nullopt;
-        RetargetWindow w = window_after_index(fi->second);
+        const std::optional<RetargetWindow> w0 = window_after_index(fi->second);
+        if (!w0) return std::nullopt;  // the window leaves the held prefix of a joined tree
+        RetargetWindow w = *w0;
         Hash32 prev = fork;
         std::uint64_t prev_record = nodes_[fi->second].H;
-        std::uint64_t pos = nodes_[fi->second].pos;
-        RatchetState rs = nodes_[fi->second].rs;
         bool failed = false;
         std::vector<SideHeader> out;
         out.reserve(headers.size());
@@ -309,16 +637,12 @@ public:
                 continue;
             }
             s.work = w.next_difficulty();
-            if (hdr.parent != prev || !carrier_height_admissible(prev_record, hdr.h) || !fold_matches(rs, hdr)
-                || !pow_ok(hdr, s.work)) {
+            if (hdr.parent != prev || !carrier_height_admissible(prev_record, hdr.h) || !pow_ok(hdr, s.work)) {
                 s.check = HeaderCheck::Failed;
                 failed = true;
             } else {
                 prev_record = record_height(prev_record, hdr.h);
                 w.push(RetargetEntry{s.work, prev_record});
-                ++pos;
-                const RatchetPlacement own{s.work, hdr.ballot};
-                rs = rs_step(rp_, rs, pos, std::span<const RatchetPlacement>(&own, 1));
                 prev = hdr.id;
             }
             out.push_back(s);
@@ -355,37 +679,81 @@ public:
     }
 
 private:
-    // receipts_root of c against S at its parent (carried_root 0).
-    static bool fold_matches(const RatchetState& parent_rs, const CarrierAnnounce& c) {
-        return check_carrier_fold(c.receipts_root, kNoCarriedRoot, parent_rs) == FoldVerdict::Match;
+    // S1.3 #10: receipts_root of c against carried_root(ids of `carried`) and S at its parent.
+    static FoldVerdict fold_verdict(const RatchetState& parent_rs, const CarrierAnnounce& c,
+                                    std::span<const CarriedPlacement> carried) {
+        std::vector<Hash32> ids;
+        ids.reserve(carried.size());
+        for (const CarriedPlacement& r : carried) ids.push_back(r.id);
+        return check_carried_fold(c.receipts_root, ids, parent_rs);
     }
 
-    RetargetWindow window_after_index(std::size_t i) const {
+    // The placements at c's position for rs_step step (2): the carried list in
+    // its order, each at its credited work (0 when dead), then c at d(c).
+    static std::vector<RatchetPlacement> placements_at(std::uint64_t d, const CarrierAnnounce& c,
+                                                       std::span<const CarriedPlacement> carried) {
+        std::vector<RatchetPlacement> out;
+        out.reserve(carried.size() + 1);
+        for (const CarriedPlacement& r : carried) out.push_back(RatchetPlacement{r.live ? r.work : 0, r.ballot});
+        out.push_back(RatchetPlacement{d, c.ballot});
+        return out;
+    }
+
+    // The newest m entries ending at node i. The lowest prefix node of a joined
+    // tree is its own parent: the entries end there when it lies at position 1
+    // (no position below it), and leave the held prefix (nullopt) otherwise.
+    std::optional<std::vector<RetargetEntry>> entries_after_index(std::size_t i, std::size_t m) const {
         std::vector<RetargetEntry> rev;
-        while (i != 0 && rev.size() < p_.retarget_span) {
+        bool at_root = true;
+        while (i != 0 && rev.size() < m) {
             rev.push_back(RetargetEntry{nodes_[i].d, nodes_[i].H});
+            if (nodes_[i].parent_index == i) {  // the lowest prefix node below a joined root
+                if (rev.size() < m && nodes_[i].pos > 1) return std::nullopt;
+                at_root = false;
+                break;
+            }
             i = nodes_[i].parent_index;
         }
-        for (auto it = inherited_.rbegin(); it != inherited_.rend() && rev.size() < p_.retarget_span; ++it) {
-            rev.push_back(*it);
-        }
+        if (at_root)
+            for (auto it = inherited_.rbegin(); it != inherited_.rend() && rev.size() < m; ++it) rev.push_back(*it);
         std::reverse(rev.begin(), rev.end());
-        return RetargetWindow(p_, rev);
+        return rev;
     }
 
-    void place_under(std::size_t pi, const CarrierAnnounce& c) {
+    std::optional<RetargetWindow> window_after_index(std::size_t i) const {
+        const std::optional<std::vector<RetargetEntry>> e = entries_after_index(i, p_.retarget_span);
+        if (!e) return std::nullopt;
+        return RetargetWindow(p_, *e);
+    }
+
+    // d of a carrier placed on node pi (ruling 53, E-99): at a position at or
+    // below the root of a joined tree, its own claimed t_origin; elsewhere
+    // d_at(chain, pos) from the window, which is held there (its bottom lies at
+    // or above the prefix start x_pre <= x0 - N_rt, or at position 1).
+    std::uint64_t d_on(std::size_t pi, const CarrierAnnounce& c) const {
+        if (nodes_[pi].pos < nodes_[0].pos) return c.t_origin;
+        const std::optional<RetargetWindow> w = window_after_index(pi);
+        // Unreachable fallback: above the root this window reaches no lower than x0 - N_rt >= x_pre, or position 1, all held.
+        return w ? w->next_difficulty() : c.t_origin;
+    }
+
+    void place_under(std::size_t pi, const CarrierAnnounce& c, std::span<const CarriedPlacement> carried) {
         CarrierNode n;
         n.id = c.id;
         n.parent = c.parent;
         n.pos = nodes_[pi].pos + 1;
         n.h = c.h;
         n.H = record_height(nodes_[pi].H, c.h);
-        n.d = window_after_index(pi).next_difficulty();
+        n.d = d_on(pi, c);
+        n.below_root = nodes_[pi].below_root;
+        n.pre_fork_H = nodes_[pi].pre_fork_H;
         n.cum_work = ::c2pool::xmr::native::u128_add(nodes_[pi].cum_work, ::c2pool::xmr::native::U128{n.d, 0});
         n.receipts_root = c.receipts_root;
         n.ballot = c.ballot;
-        const RatchetPlacement own{n.d, c.ballot};
-        n.rs = rs_step(rp_, nodes_[pi].rs, n.pos, std::span<const RatchetPlacement>(&own, 1));
+        const std::vector<RatchetPlacement> placed = placements_at(n.d, c, carried);
+        StepAt st = rs_step_at(rp_, nodes_[pi].rs, n.pos, placed, table_);
+        n.rs = st.s;
+        n.activation = st.row;
         n.parent_index = pi;
         const std::size_t idx = nodes_.size();
         nodes_.push_back(std::move(n));
@@ -407,7 +775,9 @@ private:
             CarrierNode& c = nodes_[i];
             if (c.chain_valid || !c.verified || !c.bodies || !nodes_[c.parent_index].chain_valid) continue;
             c.chain_valid = true;
-            if (fork_choice_prefers(ChainTip{c.cum_work, c.id}, ChainTip{nodes_[best_].cum_work, nodes_[best_].id})) {
+            // no node below a joined root becomes the best tip (ruling 53, E-105: a reading of rulings 44, 45)
+            if (!c.below_root &&
+                fork_choice_prefers(ChainTip{c.cum_work, c.id}, ChainTip{nodes_[best_].cum_work, nodes_[best_].id})) {
                 best_ = i;
             }
             for (std::size_t ch : c.children) stack.push_back(ch);
@@ -415,40 +785,86 @@ private:
         return true;
     }
 
-    // Discards the carriers waiting on `parent`, and those waiting on them.
-    void discard_waiting(const Hash32& parent) {
-        std::vector<Hash32> stack{parent};
+    // true when `id` has a waiting entry under some claimed parent.
+    bool waiting_on_any(const Hash32& id) const {
+        const auto it = waiting_keys_.lower_bound(WaitKey{id, Hash32{}});
+        return it != waiting_keys_.end() && it->first == id;
+    }
+
+    // Drops every waiting entry of `id` (its claims of other parents) once id is placed.
+    void drop_claims(const Hash32& id) {
+        auto it = waiting_keys_.lower_bound(WaitKey{id, Hash32{}});
+        while (it != waiting_keys_.end() && it->first == id) {
+            const auto wit = waiting_.find(it->second);
+            if (wit != waiting_.end()) {
+                std::vector<Hash32>& v = wit->second;
+                v.erase(std::remove(v.begin(), v.end(), id), v.end());
+                if (v.empty()) waiting_.erase(wit);
+            }
+            it = waiting_keys_.erase(it);
+        }
+    }
+
+    // The carriers waiting on `parent` (arrival order), no longer waiting.
+    std::vector<Hash32> release_waiting(const Hash32& parent) {
+        const auto wit = waiting_.find(parent);
+        if (wit == waiting_.end()) return {};
+        std::vector<Hash32> out = std::move(wit->second);
+        waiting_.erase(wit);
+        for (const Hash32& id : out) waiting_keys_.erase(WaitKey{id, parent});
+        return out;
+    }
+
+    // Discards the waiting entries under `parent` when `parent` has no waiting
+    // entry of its own, and then those under each discarded carrier that has
+    // no other waiting entry left.
+    std::vector<WaitKey> discard_waiting(const Hash32& parent) {
+        std::vector<WaitKey> out;
+        std::vector<Hash32> stack;
+        if (!waiting_on_any(parent)) stack.push_back(parent);
         while (!stack.empty()) {
             const Hash32 p = stack.back();
             stack.pop_back();
             const auto wit = waiting_.find(p);
             if (wit == waiting_.end()) continue;
-            for (const CarrierAnnounce& w : wit->second) {
-                waiting_ids_.erase(w.id);
-                stack.push_back(w.id);
-            }
+            const std::vector<Hash32> ids = std::move(wit->second);
             waiting_.erase(wit);
+            for (const Hash32& id : ids) {
+                waiting_keys_.erase(WaitKey{id, p});
+                out.push_back(WaitKey{id, p});
+                if (!waiting_on_any(id)) stack.push_back(id);
+            }
         }
+        return out;
     }
 
     std::size_t common_ancestor(std::size_t a, std::size_t b) const {
-        while (nodes_[a].pos > nodes_[b].pos) a = nodes_[a].parent_index;
-        while (nodes_[b].pos > nodes_[a].pos) b = nodes_[b].parent_index;
+        while (nodes_[a].pos > nodes_[b].pos) {
+            a = nodes_[a].parent_index;
+            ++walk_steps_;
+        }
+        while (nodes_[b].pos > nodes_[a].pos) {
+            b = nodes_[b].parent_index;
+            ++walk_steps_;
+        }
         while (a != b) {
             a = nodes_[a].parent_index;
             b = nodes_[b].parent_index;
+            ++walk_steps_;
         }
         return a;
     }
 
     LaneParams p_;
     RatchetParams rp_;
+    EpochTable table_;
     std::vector<RetargetEntry> inherited_;
     std::vector<CarrierNode> nodes_;           // index 0 = genesis; dropped carriers stay, unindexed
     std::map<Hash32, std::size_t> index_;
-    std::map<Hash32, std::vector<CarrierAnnounce>> waiting_;  // by parent id
-    std::set<Hash32> waiting_ids_;
+    std::map<Hash32, std::vector<Hash32>> waiting_;  // waiting carrier ids by claimed parent id
+    std::set<WaitKey> waiting_keys_;                 // (carrier id, claimed parent id)
     std::size_t best_ = 0;
+    mutable std::uint64_t walk_steps_ = 0;
 };
 
 }  // namespace c2pool::xmr::pathb

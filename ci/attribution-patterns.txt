@@ -4,8 +4,10 @@
 # the local commit-msg and pre-push hooks (scripts/ci/hooks/). One extended
 # regular expression per line, matched case-insensitively against commit
 # messages, the pull request title and body, the branch name and every line a
-# change adds to a tracked file. This file is the only tracked file the gate
-# does not scan. The list is the marker list of the gate of
+# change adds to a tracked file. This file and
+# ci/attribution-identity-patterns.txt (commit author and committer) are the
+# only tracked files the gate does not scan. The list is the marker list of the
+# gate of
 # frstrtr/c2pool-monero (pull request #1) plus the markers this repository's
 # gate already refused.
 co-authored-by:.*(claude|anthropic|openai|chatgpt|copilot|gpt|gemini)

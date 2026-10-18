@@ -3,7 +3,9 @@ name: attribution-gate
 # Standing rule: ZERO AI or tool attribution anywhere. This required check
 # fails a pull request when a commit message in its range, its title or body,
 # its branch name, or any line it adds to a tracked file matches a marker in
-# ci/attribution-patterns.txt (scripts/ci/attribution_gate.sh). The same check
+# ci/attribution-patterns.txt, or when the author or committer of a commit in
+# its range matches ci/attribution-identity-patterns.txt
+# (scripts/ci/attribution_gate.sh). The same check
 # runs locally from scripts/ci/hooks/commit-msg and scripts/ci/hooks/pre-push.
 # Server-side backstop so no clone or worktree can reintroduce it.
 

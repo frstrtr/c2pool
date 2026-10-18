@@ -20,9 +20,8 @@
 # it is built. The ed25519 path builds WITHOUT libsodium via the authored
 # coin/compat/sodium/crypto_verify_32.h shim.
 #
-# The coinbase-output-derivation surface (settle/, template/) is fenced
-# PRE-CARROT, pinned per Monero hard-fork major_version (<= 16). See
-# docs/xmr-lane/w5-xmr-coinbase-rule.md §6 and xmr_pow_select.hpp.
+# The coinbase-output-derivation surface (pathb/, template/) is fenced
+# PRE-CARROT, pinned per Monero hard-fork major_version (<= 16).
 # ─────────────────────────────────────────────────────────────────────────────
 
 # X1: light coin-primitives library (unconditional — it is lane production code
@@ -34,11 +33,11 @@ add_subdirectory(coin)
 # X2 node KAT in test/, or later W3 wire / W5 coinbase legs) is built.
 add_subdirectory(node)
 
-# X9 OPTION B: the whole-block template builder library (xmr_template =
-# the clean-room xmr_block_template.cpp + the authored xmr_coin_primitives.cpp seam
-# bodies over xmr_coin). Unconditional like coin/node — its TUs compile only when
-# a dependent target links it (the c2pool-v37-xmr daemon behind --coinbase v37,
-# and the assembly KAT in test/). See template/CMakeLists.txt.
+# The block template library (xmr_template = the clean-room
+# xmr_block_template.cpp + the authored xmr_coin_primitives.cpp seam bodies over
+# xmr_coin) and the Path B block assembly header. Unconditional like coin/node —
+# its TUs compile only when a dependent target links it. See
+# template/CMakeLists.txt.
 add_subdirectory(template)
 
 # X8 / O-2: librandomx from the VENDORED tevador/RandomX tree (consensus pin

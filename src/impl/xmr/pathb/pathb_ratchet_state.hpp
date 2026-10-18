@@ -19,10 +19,11 @@
 //
 //   ballot (side_data_v3, u16) = own flag (bit 15) | epoch_no (bits 0..14)
 //
-//   rs_step(S_{x-1}, x, receipts placed at x):
-//     (1) the activation of an open deployment at its H_act; no deployment
-//         is open before the deployment table exists, so epoch_cur stays 0
-//         and rules_cur stays the genesis digest
+//   rs_step(S_{x-1}, x, receipts placed at x, act, act_digest):
+//     (1) act (the activation of the open deployment at its H_act,
+//         pathb_ratchet_activation.hpp act()): epoch_cur += 1,
+//         rules_cur = act_digest, y1 = y2, y2 = 0, every level l -> max(l - 1, 0);
+//         without act S is unchanged by step (1)
 //     (2) per receipt placed at x (carrier and carried; work 0 when dead):
 //           all += work;  epoch_no(ballot) >= epoch_cur + 1: y1 += work;
 //           epoch_no(ballot) >= epoch_cur + 2: y2 += work
@@ -38,7 +39,8 @@
 //   pos(tip), else STRIKE. A carried or pending receipt's fold is not
 //   compared.
 //
-//   K30: L = 34,881 positions, GRACE = 120,960 positions; kept windows
+//   K30: L = 34,881 positions, GRACE = 120,960 positions, TIMEOUT = 941,760
+//   positions; vote windows N_W = floor(TIMEOUT / L) = 26; kept windows
 //   W_R = floor((GRACE - 1) / L) + 1 = 4; a configuration with W_R > 4 is
 //   refused (ratchet_params_valid).
 //
@@ -68,13 +70,24 @@ using RsWork = ::v37::U256;
 // Parameters (K30)
 // ---------------------------------------------------------------------------
 struct RatchetParams {
-    std::uint64_t window = 0;  // K30 L (positions)
-    std::uint64_t grace = 0;   // K30 GRACE (positions)
+    std::uint64_t window = 0;   // K30 L (positions)
+    std::uint64_t grace = 0;    // K30 GRACE (positions)
+    std::uint64_t timeout = 0;  // K30 TIMEOUT (positions)
 };
 
+// K30b L, K30c GRACE, K30d TIMEOUT (positions).
+inline constexpr std::uint64_t kVoteWindowPositions = 34881;
+inline constexpr std::uint64_t kGracePositions = 120960;
+inline constexpr std::uint64_t kTimeoutPositions = 941760;
+
+// K30e N_W: the whole vote windows inside TIMEOUT.
+inline constexpr std::uint64_t kVoteWindows = kTimeoutPositions / kVoteWindowPositions;
+static_assert(kVoteWindows == 26);
+
 inline constexpr RatchetParams kRuledRatchetParams{
-    /*window=*/34881,
-    /*grace=*/120960,
+    /*window=*/kVoteWindowPositions,
+    /*grace=*/kGracePositions,
+    /*timeout=*/kTimeoutPositions,
 };
 
 // Lock-in levels S holds.
@@ -89,8 +102,14 @@ inline constexpr bool ratchet_params_valid(const RatchetParams& p) noexcept {
     return p.window > 0 && p.grace > 0 && ratchet_kept_windows(p) <= kRatchetKeptWindows;
 }
 
+// N_W = floor(TIMEOUT / L).
+inline constexpr std::uint64_t ratchet_vote_windows(const RatchetParams& p) noexcept {
+    return p.window > 0 ? p.timeout / p.window : 0;
+}
+
 static_assert(ratchet_params_valid(kRuledRatchetParams));
 static_assert(ratchet_kept_windows(kRuledRatchetParams) == kRatchetKeptWindows);
+static_assert(ratchet_vote_windows(kRuledRatchetParams) == kVoteWindows);
 
 // Lock-in threshold: kLockInYes x yes >= kLockInAll x all.
 inline constexpr std::uint64_t kLockInYes = 4;
@@ -172,6 +191,23 @@ inline RatchetStateBytes encode_ratchet_state(const RatchetState& s) noexcept {
     return out;
 }
 
+// The inverse of encode_ratchet_state: every 134-byte string decodes, and
+// encode_ratchet_state(decode_ratchet_state(b)) == b.
+inline RatchetState decode_ratchet_state(const RatchetStateBytes& b) noexcept {
+    RatchetState s;
+    std::size_t o = 0;
+    for (std::size_t i = 0; i < rs_layout::kU16Bytes; ++i)
+        s.epoch_cur = static_cast<std::uint16_t>(s.epoch_cur | (std::uint16_t{b[o++]} << (CHAR_BIT * i)));
+    for (std::uint8_t& x : s.rules_cur) x = b[o++];
+    for (RsWork* w : {&s.all, &s.y1, &s.y2})
+        for (std::uint64_t& limb : w->v) {
+            limb = 0;
+            for (std::size_t i = 0; i < rs_layout::kLimbBytes; ++i) limb |= std::uint64_t{b[o++]} << (CHAR_BIT * i);
+        }
+    for (std::uint8_t& l : s.levels) l = b[o++];
+    return s;
+}
+
 // ---------------------------------------------------------------------------
 // rs_step
 // ---------------------------------------------------------------------------
@@ -214,6 +250,22 @@ inline RatchetState rs_step(const RatchetParams& p, const RatchetState& prev, st
         s.all = s.y1 = s.y2 = RsWork{};
     }
     return s;
+}
+
+// S_x from S_{x-1} with step (1). act = false is the four-argument rs_step,
+// byte for byte. Precondition: ratchet_params_valid(p); with act,
+// prev.epoch_cur < kBallotEpochMask (the deployment table keeps epoch_no
+// <= kBallotEpochMask).
+inline RatchetState rs_step(const RatchetParams& p, const RatchetState& prev, std::uint64_t x,
+                            std::span<const RatchetPlacement> placed, bool act, const Hash32& act_digest) {
+    if (!act) return rs_step(p, prev, x, placed);
+    RatchetState s = prev;
+    s.epoch_cur = static_cast<std::uint16_t>(s.epoch_cur + 1);
+    s.rules_cur = act_digest;
+    s.y1 = s.y2;
+    s.y2 = RsWork{};
+    for (std::uint8_t& l : s.levels) l = l > kLevelNone ? static_cast<std::uint8_t>(l - 1) : kLevelNone;
+    return rs_step(p, s, x, placed);
 }
 
 // ---------------------------------------------------------------------------

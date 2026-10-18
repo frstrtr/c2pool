@@ -1,5 +1,9 @@
 # XMR lane — real sharechain relay (GAP-2): stage-1 design
 
+> Removed at the S4w flag day: the relay this page designs
+> (`relay/xmr_relay_node.hpp`, the receipt intake and its flags) was removed. The
+> Path B relay node is `src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp`.
+
 Status: DESIGN (read-only inventory + specification). Branch `v37/xmr-gap2-relay`
 (worktree on origin/master `f91242945`). Nothing here changes a consensus byte;
 every place where it would is marked **SEAM** and handed over.

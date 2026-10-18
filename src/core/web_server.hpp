@@ -78,7 +78,19 @@ private:
     void process_request();
     void send_response(http::response<http::string_body> response);
     void handle_error(beast::error_code ec, char const* what);
+    bool is_direct_local() const;
 };
+
+/// True when an HTTP request came straight from this host: the peer address
+/// is loopback and the request has no reverse-proxy forwarding header
+/// (X-Forwarded-For, Forwarded, X-Real-IP, X-Forwarded-Host,
+/// X-Forwarded-Proto). A reverse proxy on the same host connects from
+/// 127.0.0.1, so a loopback peer alone does not mean a local user. Caddy's
+/// reverse_proxy adds X-Forwarded-For, -Proto and -Host by default; nginx
+/// adds none unless configured
+/// (proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for).
+bool is_direct_local_request(const boost::asio::ip::address& peer,
+                             const http::fields& headers);
 
 /// Best-tip snapshot of the sharechain.
 ///
@@ -156,6 +168,9 @@ public:
     nlohmann::json rest_users();
     nlohmann::json rest_fee();
     nlohmann::json rest_recent_blocks();
+    // GET /found_block/<hash> (#946): one row in the /recent_blocks shape, or
+    // JSON null when the hash is not a recorded found block (route answers 404).
+    nlohmann::json rest_found_block(const std::string& hash);
     // Coin-generic block-explorer URL prefix (block deep link, DASH first-class).
     // Honors an operator custom explorer, else the per-coin default; empty when
     // the coin is unknown so callers emit null rather than a wrong-coin link.
@@ -486,7 +501,9 @@ public:
         int64_t  share_version{36};
         uint64_t desired_version{36};
     };
-    using create_share_fn_t = std::function<void(const ShareCreationParams& params)>;
+    /// Returns the hash of the share it minted, or a null hash when none was
+    /// (#946: an own-find DOGE row names the share its submit produced).
+    using create_share_fn_t = std::function<uint256(const ShareCreationParams& params)>;
     void set_create_share_fn(create_share_fn_t fn) { m_create_share_fn = std::move(fn); }
 
     // Operator-controlled V36 message blob to embed into locally created shares.
@@ -920,6 +937,15 @@ public:
         // and the log states it in words. Unlabelled stays `unknown`, which
         // the log reports as unknown rather than guessing.
         BlockAuthorship authorship{BlockAuthorship::unknown};
+        // Explorer fields (#946). Empty string / nullopt = not known, emitted
+        // as JSON null — never "" or 0. parent_* are set on merged (DOGE) rows
+        // only: the LTC block the aux solve rode, and the LTC height it was
+        // mined at. tx_count stays unset on peer-found rows until the full
+        // block is seen (v34+ shares carry no tx list).
+        std::string             parent_hash;
+        std::optional<uint64_t> parent_height;
+        std::string             coinbase_txid;
+        std::optional<uint32_t> tx_count;
         // Provenance for the dashboard (#57 oracle parity). true when this row
         // was restored from persistent storage at startup rather than recorded
         // live this session. DISPLAY-ONLY, never persisted (a restored row is
@@ -1154,6 +1180,58 @@ public:
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
 
+    /// #946: fill the explorer body fields (coinbase_txid, tx_count) on the
+    /// already-recorded row(s) for this block hash. Fill-only: a known value
+    /// is never overwritten, and an unknown hash is a no-op (no new row).
+    /// Persists any row it changes.
+    void set_found_block_body(const std::string& block_hash,
+                              const std::string& coinbase_txid,
+                              std::optional<uint32_t> tx_count);
+
+    /// #946: fill parent_hash / parent_height on the already-recorded merged
+    /// (DOGE) row(s) for this block hash. Same fill-only rules as
+    /// set_found_block_body; parent_height 0 means unknown and is ignored.
+    void set_found_block_parent(const std::string& block_hash,
+                                const std::string& parent_hash,
+                                std::optional<uint64_t> parent_height);
+
+    /// #946: what the stratum submit knows about an aux (DOGE) solve that
+    /// MergedMiningManager does not -- the parent LTC block id (SHA256d of
+    /// the header; the manager only ever sees the scrypt PoW hash), the LTC
+    /// template height it was mined at, and the miner's address. Installed on
+    /// the submitting thread for the duration of check_merged_mining; the
+    /// merged-found callback fires synchronously inside it.
+    struct MergedSubmitContext {
+        std::string             parent_hash;
+        std::optional<uint64_t> parent_height;
+        std::string             miner;
+        // The job's template previousblockhash. When parent_height is unset,
+        // the height is read from the live template only if it still builds
+        // on this prev (rare path: runs only for a found aux block).
+        std::string             parent_prev_hash;
+        // The share this submit minted; empty when it missed the share
+        // target, so the row's "share" stays null.
+        std::string             share_hash;
+    };
+    class MergedSubmitScope {
+    public:
+        explicit MergedSubmitScope(MergedSubmitContext ctx);
+        ~MergedSubmitScope();
+        MergedSubmitScope(const MergedSubmitScope&) = delete;
+        MergedSubmitScope& operator=(const MergedSubmitScope&) = delete;
+    private:
+        MergedSubmitContext        m_ctx;
+        const MergedSubmitContext* m_prev;
+    };
+
+    /// #946: record a merged (DOGE) block this node submitted. Fills miner,
+    /// subsidy and parent_* from the active MergedSubmitScope when there is
+    /// one; outside a scope the miner falls back to the node payout address
+    /// and parent_* stay null (unknown), never "" or 0.
+    void record_merged_found_block(const std::string& symbol, int height,
+                                   const std::string& block_hash, bool accepted,
+                                   uint64_t coinbase_value);
+
     /// Retain the block-header field lookups so paths OTHER than the one-shot
     /// startup backfill can re-derive a missing network_difficulty from the
     /// header chain. backfill_block_fields runs exactly once, before the
@@ -1173,6 +1251,10 @@ private:
     /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
     /// after backfill_block_fields fills a previously-missing network_difficulty.
     void recompute_found_block_luck_locked();
+    /// One /recent_blocks row. Shared by rest_recent_blocks and
+    /// rest_found_block so the two can never drift apart.
+    /// CALLER MUST HOLD m_blocks_mutex.
+    nlohmann::json found_block_row_locked(const FoundBlock& b) const;
 public:
 
     /// Merged block persistence — opaque store pointer, cast in .cpp.
@@ -1269,7 +1351,9 @@ private:
     bool check_merged_mining(const std::string& block_hex,
                              const std::string& extranonce1,
                              const std::string& extranonce2,
-                             const JobSnapshot* job = nullptr);
+                             const JobSnapshot* job = nullptr,
+                             const std::string& miner = "",
+                             const uint256& share_hash = uint256());
     
     // Internal state
     uint64_t m_work_id_counter;

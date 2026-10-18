@@ -475,7 +475,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (disconnect, inbound refusal, decay, per-offence weights, public-network
     # oracle parity, whitelist). Same harness and link set; folded in for the
     # same reason.
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp)
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1876,7 +1876,8 @@ if (BUILD_TESTING AND GTest_FOUND)
 
     # Interim hardening fix KATs: strict per-node miner cap (refused
     # connections + counter), FIFO+TTL job eviction under a 600-notify stale
-    # storm, and the flat-RSS shared-payload pointer-identity scaffold.
+    # storm, the flat-RSS shared-payload pointer-identity scaffold, and the
+    # inbound line cap (StratumSession::kMaxStratumLineBytes).
     # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
     # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
     # checks live in the dash lane against the frstrtr/p2pool-dash oracle

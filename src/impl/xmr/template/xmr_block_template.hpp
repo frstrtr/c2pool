@@ -11,9 +11,8 @@
 // BSD-3-Clause: the block and transaction wire format, get_block_hashing_blob,
 // calculate_transaction_hash, get_block_reward and the tx-pool template fill
 // rule) and the public RPC/ZMQ/stratum/CryptoNote protocol; not derived from
-// p2pool. The interface is the one the c2pool callers use (xmr_block_assembly.hpp,
-// the o2 settlement source, the template KATs); the behaviour is what those
-// callers and the KATs pin.
+// p2pool. The behaviour is what the template KAT (xmr_template_primitives_kat)
+// pins.
 //
 // What a template is
 //   One Monero block for one parent (prev_id, height): a header, a v2 coinbase
@@ -29,7 +28,7 @@
 //   varint(extra_len) extra 00
 //   output = varint(amount) 03 one_time_key[32] view_tag[1]        (tagged key)
 //   extra  = 01 R[32]
-//            02 varint(len) [worker nonce LE32 | bind | zero pad | tail]
+//            02 04 worker nonce (LE32)
 //            03 varint(len) varint(merkle_tree_data) root[32]       (last field)
 //
 // Weight invariance
@@ -37,11 +36,10 @@
 //   transaction, whose output amounts depend on the reward. update() sizes the
 //   miner transaction with the settlement source's SIZING amounts, selects the
 //   transactions and computes the final reward against that weight, then asks
-//   for the FINAL amounts and pads the extra nonce by exactly the bytes the
-//   amount varints shrank, so the final transaction has the weight the reward
-//   was computed for. If that cannot be made to hold (pad out of range, or a
-//   length varint changes size) update() re-sizes once with the final amounts;
-//   if it still cannot hold, update() leaves the previous template in place.
+//   for the FINAL amounts; the final transaction must have the weight the
+//   reward was computed for. If it does not (an amount varint changed length)
+//   update() re-sizes once with the final amounts; if it still does not hold,
+//   update() leaves the previous template in place.
 #pragma once
 
 #include <cstddef>
@@ -57,9 +55,6 @@ namespace c2pool::xmr {
 
 inline constexpr std::size_t NONCE_SIZE            = 4;     // block header nonce
 inline constexpr std::size_t EXTRA_NONCE_SIZE      = 4;     // worker nonce (LE32) in the 0x02 field
-inline constexpr std::size_t EXTRA_NONCE_MAX_SIZE  = EXTRA_NONCE_SIZE + 10;  // worker nonce + weight pad
-inline constexpr std::size_t EXTRA_NONCE_BIND_MAX  = 32;    // per-job binding after the worker nonce
-inline constexpr std::size_t TX_EXTRA_NONCE_MAX    = 255;   // Monero TX_EXTRA_NONCE_MAX_COUNT
 inline constexpr std::size_t HASHING_BLOB_MIN_SIZE = 76;    // v16 header with a 5-byte timestamp
 inline constexpr std::size_t HASHING_BLOB_MAX_SIZE = 128;
 inline constexpr std::size_t MAX_BLOCK_TEMPLATE_BLOB = 128 * 1024;   // whole block blob cap
@@ -122,12 +117,6 @@ public:
     virtual hash commitment_leaf(std::uint32_t extra_nonce) const = 0;
     // The varint written before that root in the 0x03 field.
     virtual std::uint64_t merkle_tree_data() const = 0;
-
-    // Bytes appended to the 0x02 payload after the padded worker nonce.
-    virtual std::vector<std::uint8_t> extra_nonce_tail() const { return {}; }
-    // Size of the per-job binding written right after the worker nonce (<= EXTRA_NONCE_BIND_MAX).
-    virtual std::size_t extra_nonce_bind_size() const { return 0; }
-    virtual bool extra_nonce_bind(std::uint32_t /*extra_nonce*/, std::uint8_t* /*out*/) const { return false; }
 };
 
 class XmrBlockTemplate {

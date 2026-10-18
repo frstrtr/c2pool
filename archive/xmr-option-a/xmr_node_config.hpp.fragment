@@ -1,0 +1,22 @@
+enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
+inline const char* to_string(CoinbaseMode m) {
+    switch (m) {
+        case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
+        case CoinbaseMode::V37Settlement:   return "v37-settlement (option B)";
+    }
+    return "monerod-template (option A)";
+}
+    // get_block_template reserve_size (tx_extra nonce reservation). 0 = none:
+    // one blob for every worker (max_extra_nonces == 1). Per-client extra_nonce
+    // (>= 4) is a follow-on of the template source.
+    std::uint32_t   template_reserve_size = 0;
+    // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
+    // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
+    // block the pool assembles + submits is the settlement coinbase, not
+    // monerod's get_block_template — so --payout-address is not consulted for
+    // the coinbase bytes (it may stay empty; the serve port opens when the
+    // residual sink is set, mirroring option A's payout_address gate).
+    CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
+    if (c.coinbase != CoinbaseMode::V37Settlement)
+        return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
+               "get_block_template, so a daemonless find of it is a contradiction";

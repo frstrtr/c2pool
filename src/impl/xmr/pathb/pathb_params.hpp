@@ -102,14 +102,21 @@ struct LaneParams {
     std::uint64_t retarget_growth_den = 0;
 };
 
+// The ruled lane values by name (K04, K07, K08, K02, K03 N_rt).
+inline constexpr std::uint64_t kOpenBins = 96;        // K04 F
+inline constexpr std::uint64_t kFreshMax = 2;         // K07 Fresh
+inline constexpr std::uint64_t kRMax = 16;            // K08 R_MAX
+inline constexpr std::uint64_t kDMin = 18180;         // K02 d_min
+inline constexpr std::uint64_t kRetargetSpan = 2160;  // K03 N_rt
+
 inline constexpr LaneParams kRuledLaneParams{
     /*carrier_interval_s=*/10,
-    /*open_bins=*/96,
-    /*fresh_max=*/2,
-    /*r_max=*/16,
+    /*open_bins=*/kOpenBins,
+    /*fresh_max=*/kFreshMax,
+    /*r_max=*/kRMax,
     /*heal_period_h=*/3,
-    /*d_min=*/18180,
-    /*retarget_span=*/2160,
+    /*d_min=*/kDMin,
+    /*retarget_span=*/kRetargetSpan,
     /*retarget_growth_num=*/101,
     /*retarget_growth_den=*/100,
 };

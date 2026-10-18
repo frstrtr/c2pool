@@ -73,12 +73,6 @@ std::size_t varint_size(std::uint64_t v) {
     return n;
 }
 
-std::size_t amounts_weight(const std::vector<std::uint64_t>& amounts) {
-    std::size_t w = 0;
-    for (std::uint64_t a : amounts) w += varint_size(a);
-    return w;
-}
-
 coin::Hash256 to_h256(const hash& h) {
     coin::Hash256 o;
     std::memcpy(o.data(), h.h, HASH_SIZE);
@@ -112,9 +106,6 @@ struct XmrBlockTemplate::Snapshot {
 
     std::vector<unsigned char> outputs_head;  // coinbase prefix up to (not incl.) the extra length
     hash tx_pubkey;
-    std::size_t nonce_field_size = EXTRA_NONCE_SIZE;   // worker nonce + weight pad
-    std::size_t bind_size = 0;
-    std::vector<std::uint8_t> tail;
     std::uint64_t mm_data = 0;
 
     std::vector<hash> tx_ids;                 // block order
@@ -131,20 +122,10 @@ struct MinerTx {
     hash mm_root;
 };
 
-std::vector<std::uint8_t> nonce_payload(std::uint32_t extra_nonce, std::size_t nonce_field_size,
-                                        std::size_t bind_size, const std::vector<std::uint8_t>& tail,
-                                        const IXmrSettlementSource* seam) {
+std::vector<std::uint8_t> nonce_payload(std::uint32_t extra_nonce) {
     std::vector<std::uint8_t> p;
-    p.reserve(nonce_field_size + bind_size + tail.size());
+    p.reserve(EXTRA_NONCE_SIZE);
     for (int i = 0; i < 4; ++i) p.push_back(static_cast<std::uint8_t>(extra_nonce >> (8 * i)));
-    if (bind_size) {
-        std::vector<std::uint8_t> bind(bind_size, 0);
-        if (!seam || !seam->extra_nonce_bind(extra_nonce, bind.data()))
-            std::fill(bind.begin(), bind.end(), 0);   // no binding available: zeros (the share will not verify)
-        p.insert(p.end(), bind.begin(), bind.end());
-    }
-    p.insert(p.end(), nonce_field_size - EXTRA_NONCE_SIZE, 0);
-    p.insert(p.end(), tail.begin(), tail.end());
     return p;
 }
 
@@ -178,8 +159,7 @@ MinerTx build_miner_tx(const std::vector<unsigned char>& outputs_head, const has
 }
 
 MinerTx miner_tx_for(const XmrBlockTemplate::Snapshot& s, std::uint32_t extra_nonce) {
-    const std::vector<std::uint8_t> payload =
-        nonce_payload(extra_nonce, s.nonce_field_size, s.bind_size, s.tail, s.seam);
+    const std::vector<std::uint8_t> payload = nonce_payload(extra_nonce);
     const hash root = s.seam ? s.seam->commitment_leaf(extra_nonce) : hash{};
     return build_miner_tx(s.outputs_head, s.tx_pubkey, payload, s.mm_data, root);
 }
@@ -199,7 +179,6 @@ struct Attempt {
     std::vector<std::uint64_t> amounts;   // final amounts
     std::vector<std::size_t> selected;    // indices into the candidate list
     std::uint64_t reward = 0;
-    std::size_t nonce_field_size = EXTRA_NONCE_SIZE;
     std::size_t tx_weight = 0;            // miner tx weight the reward was computed for
 };
 
@@ -269,18 +248,14 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
         coin::write_block_header_prefix(data.major_version, minor, timestamp, to_h256(data.prev_id), 0);
     const std::size_t nonce_offset = header.size() - NONCE_SIZE;
 
-    const std::size_t bind_size = m_seam->extra_nonce_bind_size();
-    if (bind_size > EXTRA_NONCE_BIND_MAX) return;
-
     const std::vector<coin::PublicKey> zero_keys(n_out);
     const std::vector<coin::ViewTag> zero_tags(n_out);
 
     // Miner transaction size for a set of amounts (keys do not change the size).
-    auto tx_size = [&](const std::vector<std::uint64_t>& amounts, std::size_t nonce_field,
-                       const std::vector<std::uint8_t>& tail) -> std::size_t {
+    auto tx_size = [&](const std::vector<std::uint64_t>& amounts) -> std::size_t {
         const std::vector<unsigned char> head = coin::write_coinbase_prefix_head(
             data.height, amounts.data(), zero_keys.data(), zero_tags.data(), n_out);
-        const std::vector<std::uint8_t> payload(nonce_field + bind_size + tail.size(), 0);
+        const std::vector<std::uint8_t> payload(EXTRA_NONCE_SIZE, 0);
         return build_miner_tx(head, hash{}, payload, mm_data, hash{}).bytes.size();
     };
 
@@ -319,22 +294,14 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     // the miner transaction is sized with.
     auto attempt = [&](const std::vector<std::uint64_t>& sizing, Attempt& out) -> bool {
         if (sizing.size() != n_out) return false;
-        const std::vector<std::uint8_t> tail = m_seam->extra_nonce_tail();
-        const std::size_t w_dry = tx_size(sizing, EXTRA_NONCE_SIZE, tail);
+        const std::size_t w_dry = tx_size(sizing);
         std::uint64_t reward = 0;
         if (!select(w_dry, out.selected, reward)) return false;
         std::vector<std::uint64_t> final_amounts;
         if (!m_seam->split_reward(reward, final_amounts) || final_amounts.size() != n_out) return false;
-        const std::size_t aw_dry = amounts_weight(sizing), aw_final = amounts_weight(final_amounts);
-        if (aw_final > aw_dry) return false;                          // amounts grew: re-size
-        const std::size_t nonce_field = EXTRA_NONCE_SIZE + (aw_dry - aw_final);
-        if (nonce_field > EXTRA_NONCE_MAX_SIZE) return false;          // pad out of range: re-size
-        const std::vector<std::uint8_t> tail2 = m_seam->extra_nonce_tail();   // read after the final split
-        if (nonce_field + bind_size + tail2.size() > TX_EXTRA_NONCE_MAX) return false;
-        if (tx_size(final_amounts, nonce_field, tail2) != w_dry) return false;   // a length varint moved
+        if (tx_size(final_amounts) != w_dry) return false;   // an amount varint changed length: re-size
         out.amounts = std::move(final_amounts);
         out.reward = reward;
-        out.nonce_field_size = nonce_field;
         out.tx_weight = w_dry;
         return true;
     };
@@ -348,7 +315,7 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
         std::uint64_t reward = 0;
         std::vector<std::size_t> sel;
         if (sizing.size() != n_out) return;
-        if (!select(tx_size(sizing, EXTRA_NONCE_SIZE, m_seam->extra_nonce_tail()), sel, reward)) return;
+        if (!select(tx_size(sizing), sel, reward)) return;
         std::vector<std::uint64_t> resized;
         if (!m_seam->split_reward(reward, resized)) return;
         a = Attempt{};
@@ -368,9 +335,6 @@ void XmrBlockTemplate::update(const XmrMinerData& data, const std::vector<XmrTxM
     }
     s->outputs_head = coin::write_coinbase_prefix_head(data.height, a.amounts.data(), keys.data(), tags.data(), n_out);
     s->tx_pubkey = m_seam->tx_public_key();
-    s->tail = m_seam->extra_nonce_tail();
-    s->nonce_field_size = a.nonce_field_size;
-    s->bind_size = bind_size;
     s->mm_data = mm_data;
     s->seam = m_seam;
     s->height = data.height;
