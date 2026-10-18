@@ -32,6 +32,7 @@ set(source
     web_server.hpp web_server.cpp
     graph_history.hpp graph_history.cpp
     http_session.cpp
+    ip_mask.hpp ip_mask.cpp
     stratum_server.hpp stratum_server.cpp
     stratum_types.hpp
     stratum_work_source.hpp
