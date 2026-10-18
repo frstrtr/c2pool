@@ -1733,16 +1733,17 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
     };
-    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the released
-    // carriers a drain ran, counted as received frames are.
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
         for (const PathbNode::DrainedResult& d : node_->take_drained())
             account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
     }
-    // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a released
-    // carrier's the node's drain ran: the verdict by row, the per-peer omission log, the line of a switch by the journal.
+    // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
+    // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
+    // by the journal.
     void account_locked(std::uint64_t peer, NodeAction action, RowId row, AdmitVerdict verdict, std::uint64_t omitted,
                         std::uint64_t repended, std::uint64_t lost) {
         const bool from_peer = peer != 0 && peer != PathbNode::kOwnPeer;

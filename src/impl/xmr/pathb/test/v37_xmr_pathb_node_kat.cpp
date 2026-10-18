@@ -182,6 +182,8 @@
 //                the journal, the heal, three rounds): no omission logged;
 //   relayswitchlog a switch line per switch and a carrier admission counted
 //                once on both switch paths (a direct placement, the drain);
+//   relaybindswitch a carrier a receipt's walk binds and places (switching
+//                the node) is counted: its switch line, its admission;
 //   relayrepend  a switch relays its re-pended receipts as FB_RECEIPTS v3
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
@@ -5621,6 +5623,80 @@ void relayswitchlog() {
                   ", drain " + std::to_string(admits[1]) + ")");
 }
 
+// relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
+// off, mines z1 and z2 (carrying nothing) while A and X take A's y1. X gets a receipt of L's on z2 and no carrier of L:
+// the receipt's walk fetches the branch's headers and the bind places z1 and z2, switching X to z2 by its journal. X's
+// relay logs the switch line and counts every carrier X placed as an admitted carrier once.
+void relaybindswitch() {
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay l = kat_relay(h, w, table0(net), true);
+    KatRelay x = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.run();
+    bool ok = true;
+    std::vector<pb::Hash32> ids;
+    for (int i = 0; i < 3; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, 1, 600 + static_cast<std::uint32_t>(i));
+        ids.push_back(h[a.node].tree().best().id);
+    }
+    w.edit = [](FakeWire::Msg& m) {  // L cut off
+        if ((m.from == 1) != (m.to == 1)) m.f.clear();
+    };
+    ok = ok && mine_on(h, w, a.node, 1, 610);  // y1 at A and X
+    ids.push_back(h[a.node].tree().best().id);
+    ok = ok && mine_on(h, w, l.node, 3, 620) && mine_on(h, w, l.node, 3, 621);  // z1, z2 at L alone
+    const pb::Hash32 z2 = h[l.node].tree().best().id;
+    ids.push_back(*h[l.node].store().best_at(h[l.node].tree().best().pos - 1));
+    ids.push_back(z2);
+    const std::optional<pb::PathbJob> jz = h.job(l.node, 4, 630);
+    w.edit = [](FakeWire::Msg& m) {  // L's carriers reach nobody; its headers reach X; A and L stay apart
+        if ((m.from == 1 && !m.f.empty() && m.f[0] == pb::kOpFcCarrier) || (m.from == 0 && m.to == 1) ||
+            (m.from == 1 && m.to == 0))
+            m.f.clear();
+    };
+    const auto carrier_admits = [&x] {
+        const pb::PathbRelayNode::VerdictCounts vc = x.relay->verdict_counts();
+        std::uint64_t n = 0;
+        for (std::size_t row = 0; row < vc.size(); ++row) n += vc[row][static_cast<std::size_t>(pb::AdmitVerdict::AdmitCarrier)];
+        return n;
+    };
+    const std::uint64_t admits0 = carrier_admits();
+    if (jz) {
+        pb::ReceiptBodyV3 rz = jz->body;
+        rz.blob.nonce = 630;
+        x.relay->receive(w.id(x.node, l.node), *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{rz}, pb::kRuledLaneParams));
+    }
+    w.run();
+    for (int i = 0; i < 4 && h[x.node].tree().best().id != z2; ++i) {
+        h.now += 1;
+        x.relay->tick();
+        w.run();
+    }
+    w.edit = nullptr;
+    g_relay_lines = nullptr;
+    std::size_t n_lines = 0;
+    for (const std::string& s : lines[x.node]) n_lines += s.find("relay: switch by the journal") != std::string::npos ? 1 : 0;
+    const std::uint64_t admits = carrier_admits() - admits0;
+    bool held = true;
+    for (const pb::Hash32& id : ids) held = held && h[x.node].tree().find(id) != nullptr;
+    const pb::PathbNode::SwitchCounts& sc = h[x.node].switch_counts();
+    check(ok && jz && held && h[x.node].tree().best().id == z2 && sc.switches == 1 && x.relay->stats().walk_placed.load() == 2,
+          "relaybindswitch: the receipt's walk bound and placed z1 and z2 at X (walk placed " +
+                  std::to_string(x.relay->stats().walk_placed.load()) + "), X switched once by its journal (" +
+                  std::to_string(sc.switches) + ")");
+    check(n_lines == 1 && admits == 2,
+          "relaybindswitch: X logs one switch line (" + std::to_string(n_lines) + ") and counts the two bound carriers "
+          "admitted (" + std::to_string(admits) + ")");
+}
+
 // Node a's best carrier as a frame; the frames its mining queued are not delivered.
 std::vector<std::uint8_t> best_frame(Harness& h, std::size_t a) {
     h.q.clear();
@@ -5817,11 +5893,12 @@ void omitwalk() {
     check(om == 1, "omitwalk: c's omissions are the honest list's (r2): " + std::to_string(om));
 }
 
-// omithonest: an all-honest three-node run charges no omission. A partition {A, B} | {C}: B's receipt rb is carried on
-// A's branch Y (y1, y2); C mines X (x1; x2 above y2 in id order; x3). B moves to C's side: X reaches B, which switches
-// at x3 by its journal and re-pends rb and Y's own receipts (relayed to C). A, alone, mines y3 on Y; at the heal y3
-// reaches B (whose pending receipts are placed on y3's parent chain) and C. Then three rounds: a receipt between
-// carriers, each node mining in turn. Every node ends at one tip; no relay logs an omission.
+// omithonest: an all-honest three-node run charges no omission. B's receipt rb reaches all three; a partition {A, B} |
+// {C}: A's branch Y (y1 carrying rb, y2), C's X (x1 carrying rb; x2 above y2 in id order; x3). B moves to C's side: X
+// reaches B, which switches at x3 by its journal and re-pends Y's own receipts (relayed to C, whose walk binds y1). A,
+// alone, mines y3 on Y; at the heal y3 reaches B (whose pending receipts are placed on y3's parent chain) and C. Then
+// three rounds: a receipt between carriers, each node mining in turn. Every node ends at one tip; no relay logs an
+// omission.
 void omithonest() {
     const KatNet net;
     Harness h(net);
@@ -5850,19 +5927,22 @@ void omithonest() {
         return *pb::encode_fc_carrier(0, *h[n].bodies().get(id), pb::kRuledLaneParams.r_max);
     };
     bool ok = true;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         h.tick_monero();
         ok = ok && mine_on(h, w, a.node, 1, 100 + static_cast<std::uint32_t>(i));
     }
-    alone(c.node);
     const std::optional<pb::PathbJob> jb = h.job(b.node, 2, 200);
-    ok = ok && mine_on(h, w, a.node, 1, 201);  // y1
-    ok = ok && jb && h[b.node].on_own_share(*jb, 200, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.tick_monero();
+    ok = ok && mine_on(h, w, a.node, 1, 102);
+    ok = ok && jb && h[b.node].on_own_share(*jb, 200, pb::Hash32{}).action == pb::NodeAction::Pending;  // rb, at all three
     w.run();
-    ok = ok && mine_on(h, w, a.node, 1, 202);  // y2 carries rb
+    alone(c.node);
+    ok = ok && mine_on(h, w, a.node, 1, 201);  // y1 carries rb
+    const pb::Hash32 y1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].bodies().get(y1)->carried.size() == 1;
+    ok = ok && mine_on(h, w, a.node, 1, 202);  // y2
     const pb::Hash32 y2 = h[a.node].tree().best().id;
-    ok = ok && h[a.node].bodies().get(y2)->carried.size() == 1;
-    ok = ok && mine_on(h, w, c.node, 3, 300);  // x1
+    ok = ok && mine_on(h, w, c.node, 3, 300);  // x1 carries rb
     std::optional<pb::PathbJob> xj;
     std::uint32_t xn = 0;
     for (std::uint32_t n = 310; n < 400 && !xj; ++n) {
@@ -5886,7 +5966,7 @@ void omithonest() {
     w.run();
     settle();
     const pb::PathbNode::SwitchCounts sb = h[b.node].switch_counts();
-    ok = ok && h[b.node].tree().best().id == h[c.node].tree().best().id && sb.switches == 1 && sb.repended == 3;
+    ok = ok && h[b.node].tree().best().id == h[c.node].tree().best().id && sb.switches == 1 && sb.repended == 2;
     ok = ok && mine_on(h, w, a.node, 1, 203);  // y3, A alone
     const pb::Hash32 y3 = h[a.node].tree().best().id;
     w.edit = nullptr;
@@ -6418,6 +6498,7 @@ int main(int argc, char** argv) {
     run("omitwalk", omitwalk);
     run("omithonest", omithonest);
     run("relayswitchlog", relayswitchlog);
+    run("relaybindswitch", relaybindswitch);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);

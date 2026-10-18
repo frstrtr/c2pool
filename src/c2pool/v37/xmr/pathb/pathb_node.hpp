@@ -793,9 +793,11 @@ public:
         std::uint64_t objects = 0;
     };
     std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
-    // The outcomes of the released carriers a drain ran (drain_released), since the last call: the sender, the action,
-    // the row and verdict, the omissions and the switch counts, for the relay's accounting of a received frame (the
-    // verdict by row, the omission log, the switch line); at most the release queue's length per drain.
+    // The outcomes of the carriers the node placed on its own, since the last call: the released carriers a drain ran
+    // (drain_released; at most the release queue's length per drain) and the walked carriers a bind placed
+    // (bind_walked_branch; at most the walked ids). The sender, the action, the row and verdict, the omissions and the
+    // switch counts, for the relay's accounting of a received frame (the verdict by row, the omission log, the switch
+    // line).
     struct DrainedResult {
         std::uint64_t peer = 0;
         NodeAction action = NodeAction::None;
@@ -902,7 +904,9 @@ public:
                         break;
                     }
                     if (r.verdict == AdmitVerdict::AdmitCarrier) {
-                        (void)settle_carrier(servers[k], *frame, r, false);
+                        const NodeEventResult sr = settle_carrier(servers[k], *frame, r, false);
+                        drained_.push_back(DrainedResult{servers[k], sr.action, sr.admit.row, sr.admit.verdict, sr.omitted,
+                                                         sr.repended, sr.lost});
                         if (tree_->find(id) != nullptr) {
                             out.placed.push_back(id);
                             progress = true;
@@ -2968,7 +2972,7 @@ private:
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
-    std::vector<DrainedResult> drained_;          // the outcomes of the released carriers a drain ran (take_drained)
+    std::vector<DrainedResult> drained_;          // the outcomes of the drained and walk-bound carriers (take_drained)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
     std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
     std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos
