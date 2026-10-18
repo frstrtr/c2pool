@@ -539,7 +539,7 @@ public:
     std::uint64_t own_orphaned() const noexcept { return own_orphaned_; }
     std::size_t own_watch_size() const noexcept { return own_watch_.size(); }
     // The open state at the best tip (S4.7): the live placements of the open bins (open_bin_placements) and the v3
-    // wire bytes of their receipt bodies (each found in its placing carrier's body).
+    // wire bytes of their receipt bodies (each placing carrier's bodies encoded once).
     struct OpenState {
         std::uint64_t placements = 0;
         std::uint64_t bytes = 0;
@@ -571,25 +571,46 @@ public:
         return o;
     }
     OpenState open_state() const {
+        ++open_state_calls_;
         OpenState o;
         const LaneView v = store_->view_at(store_->best_tip());
         if (!v.ok()) return o;
         const std::uint64_t H = v.record(v.pos());
         const std::uint64_t F = cfg_.p.open_bins;
-        std::vector<std::uint8_t> buf;
+        std::map<Hash32, std::set<Hash32>> placed_by;  // placing carrier -> the receipt ids it placed in the open bins
         for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b)
             for (const Placement* e : v.live_entries(b, v.pos())) {
                 ++o.placements;
-                const CarrierBodyV3* c = bodies_->get(e->carrier);
-                if (c == nullptr) continue;
-                const ReceiptBodyV3* r = receipt_id(c->own) == e->id ? &c->own : nullptr;
-                for (std::size_t k = 0; r == nullptr && k < c->carried.size(); ++k)
-                    if (receipt_id(c->carried[k]) == e->id) r = &c->carried[k];
-                if (r == nullptr) continue;
-                buf.clear();
-                if (encode_receipt_body_v3(*r, buf) == WireError::None) o.bytes += buf.size();
+                placed_by[e->carrier].insert(e->id);
             }
+        std::vector<std::uint8_t> buf;
+        for (const auto& [carrier, ids] : placed_by) {
+            const CarrierBodyV3* c = bodies_->get(carrier);
+            if (c == nullptr) continue;
+            const auto add = [&](const ReceiptBodyV3& r) {
+                if (ids.count(receipt_id(r)) == 0) return;
+                buf.clear();
+                if (encode_receipt_body_v3(r, buf) == WireError::None) o.bytes += buf.size();
+            };
+            add(c->own);
+            for (const ReceiptBodyV3& r : c->carried) add(r);
+        }
         return o;
+    }
+    // open_state() evaluations since start.
+    std::uint64_t open_state_calls() const noexcept { return open_state_calls_; }
+    // The open state and the liveness line of the daemon's status line, computed once per status period: a call
+    // less than period_s after the last computation returns the kept values (period_s 0: no status line, none).
+    struct StatusSample {
+        OpenState open;
+        Liveness liveness;
+    };
+    const StatusSample& status_sample(std::uint64_t now_s, std::uint64_t period_s) {
+        if (period_s != 0 && (!sample_s_ || now_s >= *sample_s_ + period_s)) {
+            sample_ = StatusSample{open_state(), liveness()};
+            sample_s_ = now_s;
+        }
+        return sample_;
     }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
@@ -2899,6 +2920,9 @@ private:
     std::uint64_t own_carriers_ = 0;
     std::uint64_t own_orphaned_ = 0;
     WindowFlagCounts win_flags_;
+    mutable std::uint64_t open_state_calls_ = 0;
+    StatusSample sample_;                    // the status line's open state and liveness (status_sample)
+    std::optional<std::uint64_t> sample_s_;  // when they were computed
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

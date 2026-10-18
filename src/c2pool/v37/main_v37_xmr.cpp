@@ -1535,10 +1535,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         pb::PathbNode::SwitchCounts sw{};
         std::uint64_t own_carriers = 0, own_orphaned = 0;
         pb::PathbNode::OpenState open{};
+        std::uint64_t open_evaluated = 0;
         pb::PathbNode::Liveness liveness{};
         pb::PathbNode::WindowFlagCounts wflags{};
     };
-    const auto node_view = [&]() {
+    const auto node_view = [&](std::uint64_t now_s) {
         return relay->with_node([&](pb::PathbNode& n) {
             NodeView v;
             const pb::CarrierNode& b = n.tree().best();
@@ -1562,8 +1563,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.sw = n.switch_counts();
             v.own_carriers = n.own_carriers();
             v.own_orphaned = n.own_orphaned();
-            v.open = n.open_state();
-            v.liveness = n.liveness();
+            // computed once per status period (the status line's); the kept values on the other passes
+            const pb::PathbNode::StatusSample& ss = n.status_sample(now_s, cfg.status_every_s);
+            v.open = ss.open;
+            v.open_evaluated = n.open_state_calls();
+            v.liveness = ss.liveness;
             v.wflags = n.window_flags();
             return v;
         });
@@ -1606,7 +1610,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         }
 
         // 2. the best tip and hold()
-        const NodeView nv = node_view();
+        const NodeView nv = node_view(now);
         const bool best_moved = !have_state || nv.best != last_best;
 
         // 3. the template (E2), at a new best tip, a Monero tip, the source's epoch or the pending set
@@ -1800,8 +1804,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(nv.sw.joiner_switches),
                         static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
                         static_cast<unsigned long long>(nv.own_orphaned));
-            std::printf("  open-state: placements=%llu bytes=%llu\n", static_cast<unsigned long long>(nv.open.placements),
-                        static_cast<unsigned long long>(nv.open.bytes));
+            std::printf("  open-state: placements=%llu bytes=%llu evaluated=%llu\n",
+                        static_cast<unsigned long long>(nv.open.placements), static_cast<unsigned long long>(nv.open.bytes),
+                        static_cast<unsigned long long>(nv.open_evaluated));
             std::printf("  windows: evaluated=%llu n-dropped-bins=%llu n-cut-position=%llu merged-back=%llu\n",
                         static_cast<unsigned long long>(nv.wflags.evaluated),
                         static_cast<unsigned long long>(nv.wflags.n_dropped_bins),

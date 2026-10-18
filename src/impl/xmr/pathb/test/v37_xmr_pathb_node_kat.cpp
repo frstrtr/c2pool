@@ -147,6 +147,9 @@
 //                DoS token, one placed on its re-run (a duplicate: none);
 //   openstate    the open state at the best tip: its live placements and
 //                their receipt bodies' wire bytes, against a sum by hand;
+//   statusperiod the status line's open state and liveness, computed once
+//                per status period (2 evaluations in 40 passes over 2
+//                periods), against a sum by hand;
 //   ownorphan    own carriers watched until confirmed (below the journal
 //                base) or orphaned (a lost race): the loser counts one; a
 //                third node extends the chain past J: the watches are empty;
@@ -5085,21 +5088,9 @@ void relayrparkseal() {
 }
 
 // ---------------------------------------------------------------------------
-// openstate: A mines 4 carriers, the last carrying a receipt B left pending; the node's open state equals the sum by
-// hand over the best chain's carriers: one placement per own receipt and per carried one, each at its v3 wire size.
-void openstate() {
-    const KatNet net;
-    Harness h(net);
-    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
-    for (int i = 0; i < 3; ++i) {
-        h.tick_monero();
-        h.mine(a, 1, 60 + i);
-    }
-    const std::optional<pb::PathbJob> jb = h.job(b, 2, 70);
-    h.mine(a, 1, 63);
-    const bool pend = jb && h[b].on_own_share(*jb, 70, pb::Hash32{}).action == pb::NodeAction::Pending;
-    h.pump();
-    h.mine(a, 1, 64);
+// The open state by hand over node a's best chain (every bin open in these short runs): one placement per own receipt
+// and per carried one, each at its v3 wire size.
+std::pair<std::uint64_t, std::uint64_t> open_by_hand(Harness& h, std::size_t a) {
     std::uint64_t n = 0, bytes = 0;
     std::vector<std::uint8_t> buf;
     const pb::LaneView v = h[a].store().view_at(h[a].tree().best().id);
@@ -5116,10 +5107,82 @@ void openstate() {
             bytes += buf.size();
         }
     }
+    return {n, bytes};
+}
+
+// openstate: A mines 4 carriers, the last carrying a receipt B left pending; the node's open state equals the sum by
+// hand over the best chain's carriers: one placement per own receipt and per carried one, each at its v3 wire size.
+void openstate() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 60 + i);
+    }
+    const std::optional<pb::PathbJob> jb = h.job(b, 2, 70);
+    h.mine(a, 1, 63);
+    const bool pend = jb && h[b].on_own_share(*jb, 70, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.pump();
+    h.mine(a, 1, 64);
+    const auto [n, bytes] = open_by_hand(h, a);
     const pb::PathbNode::OpenState o = h[a].open_state();
     check(pend && n >= 5 && o.placements == n && o.bytes == bytes,
           "openstate: the open state at the best tip is " + std::to_string(o.placements) + " placements, " +
                   std::to_string(o.bytes) + " B; by hand " + std::to_string(n) + ", " + std::to_string(bytes) + " B");
+}
+
+// statusperiod: the status line's open state and liveness line come from status_sample, computed once per status
+// period. A's carriers carry 6 receipts of B each (B's shares on the tip before); 40 main-loop passes 0.25 s apart over
+// 10 s at a 5 s status period evaluate the open state twice; a carrier placed during the first period shows from the
+// second; the open state equals the sum by hand (each carrier's bodies encoded once).
+void statusperiod() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    h.tick_monero();
+    h.mine(a, 1, 1);
+    std::uint32_t nonce = 2000;
+    for (int k = 0; k < 5; ++k) {
+        h.tick_monero();
+        const pb::PathbTemplate t = h[b].make_template(h.now);
+        std::vector<pb::PathbJob> js;
+        if (t.status == pb::TemplateStatus::Ok)
+            for (std::uint32_t i = 0; i < 6; ++i)
+                if (const std::optional<pb::PathbJob> j = h[b].make_job(t, h.session(2 + (i % 3), nonce + i))) js.push_back(*j);
+        h.mine(a, 1, nonce + 100);  // carries the receipts of the round before
+        for (std::uint32_t i = 0; i < js.size(); ++i) (void)h[b].on_own_share(js[i], nonce + 200 + i, pb::Hash32{});
+        h.pump();
+        nonce += 1000;
+    }
+    std::size_t max_carried = 0;
+    for (std::uint64_t x = 1; x <= h[a].tree().best().pos; ++x)
+        if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+            if (const pb::CarrierBodyV3* c = h[a].bodies().get(*id)) max_carried = std::max(max_carried, c->carried.size());
+    const std::uint64_t c0 = h[a].open_state_calls();
+    std::uint64_t first = 0, kept = 0;
+    pb::PathbNode::StatusSample s{};
+    for (int i = 0; i < 40; ++i) {
+        s = h[a].status_sample(1000 + static_cast<std::uint64_t>(i / 4), 5);
+        if (i == 0) {
+            first = s.open.placements;
+            h.mine(a, 1, nonce + 1);  // the last receipts carried: placed during the first period
+        }
+        if (i == 19) kept = s.open.placements;  // 4.75 s: the first period's values
+    }
+    const std::uint64_t evals = h[a].open_state_calls() - c0;
+    const auto [n, bytes] = open_by_hand(h, a);
+    const pb::PathbNode::OpenState o = h[a].open_state();
+    check(evals == 2 && max_carried == 6 && first > 0 && kept == first && s.open.placements == n && n > first,
+          "statusperiod: 40 passes over 2 status periods evaluate the open state " + std::to_string(evals) +
+                  " times; the first period keeps its values (" + std::to_string(kept) + " placements), the second shows the "
+                  "carrier placed meanwhile (" + std::to_string(s.open.placements) + ")");
+    check(o.placements == n && o.bytes == bytes && s.open.bytes == bytes && s.liveness.live + s.liveness.dead == n,
+          "statusperiod: the open state is " + std::to_string(o.placements) + " placements, " + std::to_string(o.bytes) +
+                  " B; by hand " + std::to_string(n) + ", " + std::to_string(bytes) + " B; the liveness line counts them all");
+    const pb::PathbNode::StatusSample& none = h[a].status_sample(2000, 0);
+    check(none.open.placements == s.open.placements && h[a].open_state_calls() == c0 + evals + 1,
+          "statusperiod: no status period (0): nothing evaluated");
 }
 
 // ownorphan: own carriers are watched (J = 4) until confirmed or orphaned. A mines 3 carriers; A and B race at one
@@ -5770,6 +5833,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("openstate", openstate);
+    run("statusperiod", statusperiod);
     run("ownorphan", ownorphan);
     run("liveness", liveness);
     run("wingolden", wingolden);
