@@ -785,6 +785,19 @@ public:
         std::uint64_t objects = 0;
     };
     std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
+    // The outcomes of the released carriers a drain ran (drain_released), since the last call: the sender, the action,
+    // the row and verdict, the omissions and the switch counts, for the relay's accounting of a received frame (the
+    // verdict by row, the omission log, the switch line); at most the release queue's length per drain.
+    struct DrainedResult {
+        std::uint64_t peer = 0;
+        NodeAction action = NodeAction::None;
+        RowId row = RowId::None;
+        AdmitVerdict verdict = AdmitVerdict::Defer;
+        std::uint64_t omitted = 0;
+        std::uint64_t repended = 0;
+        std::uint64_t lost = 0;
+    };
+    std::vector<DrainedResult> take_drained() { return std::exchange(drained_, {}); }
     // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
     // call: the caller relays them as FB_RECEIPTS v3 (a receipt no longer pending then is skipped there).
     std::vector<Hash32> take_repended() { return std::exchange(repended_out_, {}); }
@@ -2395,6 +2408,7 @@ private:
         release_q_.clear();
         rx_failed_.clear();
         placed_released_.clear();
+        drained_.clear();
         resumed_x1_.reset();
         resumed_claimed_.clear();
         jbelow_.clear();
@@ -2591,6 +2605,8 @@ private:
                 try {
                     const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
                     const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
+                    drained_.push_back(DrainedResult{f.peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended,
+                                                     r.lost});
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
@@ -2937,6 +2953,7 @@ private:
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
+    std::vector<DrainedResult> drained_;          // the outcomes of the released carriers a drain ran (take_drained)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
     std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
     std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos

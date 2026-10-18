@@ -1733,10 +1733,37 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
     };
-    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the released
+    // carriers a drain ran, counted as received frames are.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
+        for (const PathbNode::DrainedResult& d : node_->take_drained())
+            account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
+    }
+    // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a released
+    // carrier's the node's drain ran: the verdict by row, the per-peer omission log, the line of a switch by the journal.
+    void account_locked(std::uint64_t peer, NodeAction action, RowId row, AdmitVerdict verdict, std::uint64_t omitted,
+                        std::uint64_t repended, std::uint64_t lost) {
+        const bool from_peer = peer != 0 && peer != PathbNode::kOwnPeer;
+        if (from_peer && action != NodeAction::None && action != NodeAction::NodeInternal) {  // verdicts by row
+            std::lock_guard<std::mutex> lk(omtx_);
+            ++verdicts_[static_cast<std::size_t>(row)][static_cast<std::size_t>(verdict)];
+        }
+        if (omitted != 0 && from_peer) {  // the per-peer omission log (relay policy; erased at link down)
+            {
+                std::lock_guard<std::mutex> lk(omtx_);
+                omissions_[peer] += omitted;
+                omitted_total_ += omitted;
+            }
+            omission_gone(peer);
+        }
+        if (action == NodeAction::Switched) {
+            const PathbNode::SwitchCounts& sc = node_->switch_counts();
+            log("relay: switch by the journal: re-pended " + std::to_string(repended) + ", lost " + std::to_string(lost) +
+                " (re-pended since start " + std::to_string(sc.repended) + ", carried " + std::to_string(sc.carried) +
+                ", sealed pending " + std::to_string(sc.sealed_pending) + ")");
+        }
     }
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
@@ -1747,28 +1774,11 @@ private:
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
-        if (peer != 0 && r.action != NodeAction::None && r.action != NodeAction::NodeInternal) {  // verdicts by row
-            std::lock_guard<std::mutex> lk(omtx_);
-            ++verdicts_[static_cast<std::size_t>(r.admit.row)][static_cast<std::size_t>(r.admit.verdict)];
-        }
-        if (r.omitted != 0 && peer != 0) {  // the per-peer omission log (relay policy; erased at link down)
-            {
-                std::lock_guard<std::mutex> lk(omtx_);
-                omissions_[peer] += r.omitted;
-                omitted_total_ += r.omitted;
-            }
-            omission_gone(peer);
-        }
+        account_locked(peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended, r.lost);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
             case NodeAction::Switched:
-                if (r.action == NodeAction::Switched) {
-                    const PathbNode::SwitchCounts& sc = node_->switch_counts();
-                    log("relay: switch by the journal: re-pended " + std::to_string(r.repended) + ", lost " +
-                        std::to_string(r.lost) + " (re-pended since start " + std::to_string(sc.repended) + ", carried " +
-                        std::to_string(sc.carried) + ", sealed pending " + std::to_string(sc.sealed_pending) + ")");
-                }
                 if (r.action == NodeAction::Switched && node_->reask_pending()) {
                     reask_due_ = true;  // a joined store (its session or a restart): the claimed leaves asked again
                     fx.join = true;

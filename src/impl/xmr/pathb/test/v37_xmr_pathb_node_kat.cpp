@@ -174,6 +174,8 @@
 //                child carrier's parent: none;
 //   omithonest   an all-honest three-node run (a partition, a switch by
 //                the journal, the heal, three rounds): no omission logged;
+//   relayswitchlog a switch line per switch and a carrier admission counted
+//                once on both switch paths (a direct placement, the drain);
 //   relayrepend  a switch relays its re-pended receipts as FB_RECEIPTS v3
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
@@ -1923,6 +1925,9 @@ void FakeLinks::disconnect(std::uint64_t p) {
     o.event(back, false);
 }
 
+// The relays' log lines by node, while a vector sets it (kat_relay's log sink).
+std::map<std::size_t, std::vector<std::string>>* g_relay_lines = nullptr;
+
 struct KatRelay {
     std::unique_ptr<FakeLinks> links;
     std::unique_ptr<pb::PathbRelayNode> relay;
@@ -1947,7 +1952,9 @@ KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch
     pb::RelayClock clock;
     clock.mono_ms = [&h] { return h.now * 1000; };
     clock.wall_s = [&h] { return h.now; };
-    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock);
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock, [n = h.nodes.size()](const std::string& line) {
+        if (g_relay_lines != nullptr) (*g_relay_lines)[n].push_back(line);
+    });
     k.node = h.nodes.size();
     pb::PathbNodeIo io = k.relay->bind_io(h.io(k.node));
     if (io_tweak) io_tweak(io);
@@ -5448,6 +5455,78 @@ void relayomitgone() {
                   "); no entry for the gone link (links logged " + std::to_string(om.size()) + ")");
 }
 
+// relayswitchlog: the relay logs one line per switch by the journal and counts a carrier's admission once, on both
+// switch paths (relayrepend's scenario): C, cut off, mines X; A mines Y1 and Y2; at the heal Y1 and Y2 reach C in
+// order (a direct placement switches) or Y2 alone (parked, then the drain of Y1's placement switches). Both paths: one
+// switch line for C's one switch, and C's carrier admissions by row equal.
+void relayswitchlog() {
+    std::uint64_t admits[2] = {0, 0};
+    for (const bool drain : {false, true}) {
+        const std::string tag = drain ? "relayswitchlog (b) the drain: " : "relayswitchlog (a) a direct placement: ";
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        const KatNet net;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), true);
+        KatRelay c = kat_relay(h, w, table0(net), true);
+        w.connect(0, 1);
+        w.connect(0, 2);
+        w.connect(1, 2);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 500 + static_cast<std::uint32_t>(i));
+        }
+        w.edit = [](FakeWire::Msg& m) {
+            if (m.from == 2 || m.to == 2) m.f.clear();
+        };
+        ok = ok && mine_on(h, w, a.node, 2, 510);
+        const pb::Hash32 y1 = h[a.node].tree().best().id;
+        std::optional<pb::PathbJob> xj;
+        std::uint32_t xn = 0;
+        for (std::uint32_t n = 520; n < 600 && !xj; ++n) {
+            std::optional<pb::PathbJob> j = h.job(c.node, 7, n);
+            if (!j) break;
+            pb::ReceiptBodyV3 rb = j->body;
+            rb.blob.nonce = n;
+            const pb::Hash32 id = pb::receipt_id(rb);
+            if (drain ? id < y1 : y1 < id) {
+                xj = j;
+                xn = n;
+            }
+        }
+        ok = ok && xj && h[c.node].on_own_share(*xj, xn, pb::Hash32{}).action == pb::NodeAction::Placed;
+        w.run();
+        ok = ok && mine_on(h, w, a.node, 3, 511);
+        const pb::Hash32 y2 = h[a.node].tree().best().id;
+        w.edit = nullptr;
+        if (!drain) w.q.push_back(FakeWire::Msg{0, 2, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(y1), 16)});
+        w.q.push_back(FakeWire::Msg{0, 2, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(y2), 16)});
+        w.run();
+        for (int i = 0; i < 3; ++i) {
+            h.now += 1;
+            c.relay->tick();
+            w.run();
+        }
+        g_relay_lines = nullptr;
+        const pb::PathbNode::SwitchCounts& sc = h[c.node].switch_counts();
+        std::size_t n_lines = 0;
+        for (const std::string& l : lines[c.node]) n_lines += l.find("relay: switch by the journal") != std::string::npos ? 1 : 0;
+        const pb::PathbRelayNode::VerdictCounts vc = c.relay->verdict_counts();
+        for (std::size_t row = 0; row < vc.size(); ++row)
+            admits[drain ? 1 : 0] += vc[row][static_cast<std::size_t>(pb::AdmitVerdict::AdmitCarrier)];
+        check(ok && h[c.node].tree().best().id == y2 && sc.switches == 1, tag + "C switched once by its journal");
+        check(n_lines == sc.switches, tag + "one switch line per switch (" + std::to_string(n_lines) + " lines, " +
+                                              std::to_string(sc.switches) + " switches)");
+    }
+    check(admits[0] == admits[1] && admits[0] >= 5,
+          "relayswitchlog: C's carrier admissions by row equal on both paths (direct " + std::to_string(admits[0]) +
+                  ", drain " + std::to_string(admits[1]) + ")");
+}
+
 // Node a's best carrier as a frame; the frames its mining queued are not delivered.
 std::vector<std::uint8_t> best_frame(Harness& h, std::size_t a) {
     h.q.clear();
@@ -6202,6 +6281,7 @@ int main(int argc, char** argv) {
     run("omitfresh", omitfresh);
     run("omitopen", omitopen);
     run("omithonest", omithonest);
+    run("relayswitchlog", relayswitchlog);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);
