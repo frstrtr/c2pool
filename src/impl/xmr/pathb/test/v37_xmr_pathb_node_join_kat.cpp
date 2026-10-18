@@ -15,8 +15,8 @@
 //              empty store reloads at its base with no re-join (F-5: base at
 //              lc(H(x0 - 1)), its peaks), the poison mark and the old
 //              records deleted; resting on claims nothing is relayed;
-//   young      a young chain joined in full; its store (root 0, the genesis
-//              AR) reloads;
+//   young      a young chain joined in full (an adoption, no joiner-path
+//              switch counted); its store (root 0, the genesis AR) reloads;
 //   scope      a joined node offered an unheld tip forking above its x1 and
 //              at or above its base: OutOfScope at the first reply (R46B-3);
 //   scopepow   a top page failing its PoW at a joined node, its fork above x1:
@@ -228,7 +228,8 @@ Joining joining_node(Harness& h, const KatNet& net, std::uint64_t J) {
 }
 
 // ---------------------------------------------------------------------------
-// young: a young chain (L < N_rt + 1,176) joined in full; the adoption's store (root at 0, the genesis AR) reloads.
+// young: a young chain (L < N_rt + 1,176) joined in full (an adoption, no joiner-path switch); the adoption's store
+// (root at 0, the genesis AR) reloads.
 void young() {
     JoinNet net(900);
     KatNode a(net, kJ);
@@ -242,6 +243,10 @@ void young() {
     const pb::JoinStep st = h[j].run_join();
     check(st.switched && h[j].joined() && h[j].joined()->young && h[j].tree().best().id == at_pos(a, 600),
           "young: the young chain [1, L] joined in full" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+    check(st.sw.adopted && h[j].switch_counts().joiner_switches == 0 && h[j].switch_counts().joiner_adopted == 1,
+          "young: an adoption at a fresh start is no joiner-path switch (switches " +
+                  std::to_string(h[j].switch_counts().joiner_switches) + ", adoptions " +
+                  std::to_string(h[j].switch_counts().joiner_adopted) + ")");
     if (!st.switched) return;
     MemoryKv& kv = *h.kvs.back();
     const pb::StoreHead hd = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
@@ -525,7 +530,8 @@ void deep() {
                   + std::to_string(lost_expected) + ")");
     check(h[fa].repend_watch_size() == 0,
           "deep: the adoption cleared the re-pend watch (" + std::to_string(h[fa].repend_watch_size()) + ")");
-    check(h[fa].switch_counts().joiner_switches == 1 && h[fa].switch_counts().joiner_lost == lost_expected,
+    check(h[fa].switch_counts().joiner_switches == 1 && h[fa].switch_counts().joiner_adopted == 0
+                  && h[fa].switch_counts().joiner_lost == lost_expected,
           "deep: the node counts the joiner-path switch (" + std::to_string(h[fa].switch_counts().joiner_switches) +
                   ") and its lost placements (" + std::to_string(h[fa].switch_counts().joiner_lost) + ")");
     check(h[fa].joined() != nullptr && h[fa].tree().best().id == b.store.best_tip()

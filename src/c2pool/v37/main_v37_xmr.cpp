@@ -1800,12 +1800,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
             std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu evicted=%llu watched=%zu lost=%llu "
-                        "joiner-switches=%llu joiner-lost=%llu own-carriers=%llu own-orphaned=%llu\n",
+                        "joiner-switches=%llu joiner-lost=%llu joiner-adopted=%llu own-carriers=%llu own-orphaned=%llu\n",
                         static_cast<unsigned long long>(nv.sw.repended), static_cast<unsigned long long>(nv.sw.carried),
                         static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.evicted),
                         nv.repend_watched, static_cast<unsigned long long>(nv.sw.lost),
                         static_cast<unsigned long long>(nv.sw.joiner_switches),
-                        static_cast<unsigned long long>(nv.sw.joiner_lost), static_cast<unsigned long long>(nv.own_carriers),
+                        static_cast<unsigned long long>(nv.sw.joiner_lost),
+                        static_cast<unsigned long long>(nv.sw.joiner_adopted), static_cast<unsigned long long>(nv.own_carriers),
                         static_cast<unsigned long long>(nv.own_orphaned));
             std::printf("  open-state: placements=%llu bytes=%llu evaluated=%llu\n",
                         static_cast<unsigned long long>(nv.open.placements), static_cast<unsigned long long>(nv.open.bytes),

@@ -508,8 +508,8 @@ public:
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
     // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals; of the
     // re-pended receipts, those later carried on the best chain, those whose bin sealed while they were pending and
-    // those the pending set evicted (P-09) while watched; the joiner-path switches (rule (4) replaced or adopted the
-    // state) and the placements they lost.
+    // those the pending set evicted (P-09) while watched; the joiner-path switches (rule (4) replaced the running
+    // state) and the placements they lost; the adoptions with no state before (a fresh start, a load failure).
     struct SwitchCounts {
         std::uint64_t switches = 0;
         std::uint64_t last_repended = 0;
@@ -521,6 +521,7 @@ public:
         std::uint64_t evicted = 0;
         std::uint64_t joiner_switches = 0;
         std::uint64_t joiner_lost = 0;
+        std::uint64_t joiner_adopted = 0;
     };
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
     // The windows evaluated since start (each once, the cache) and how many had the N rule drop bins, cut the newest bin
@@ -675,8 +676,12 @@ public:
         left_.clear();
         if (out.report && (out.sw.adopted || out.sw.replaced)) out.switched = adopt(out.batch_written);
         if (out.switched) {
-            ++switches_.joiner_switches;
-            switches_.joiner_lost += out.sw.lost;
+            if (out.sw.replaced) {
+                ++switches_.joiner_switches;
+                switches_.joiner_lost += out.sw.lost;
+            } else {
+                ++switches_.joiner_adopted;
+            }
             watch_own_carriers();
         }
         return out;
