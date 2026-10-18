@@ -538,8 +538,8 @@ public:
     std::uint64_t own_carriers() const noexcept { return own_carriers_; }
     std::uint64_t own_orphaned() const noexcept { return own_orphaned_; }
     std::size_t own_watch_size() const noexcept { return own_watch_.size(); }
-    // The open state at the best tip (S4.7): the live placements of the open bins (open_bin_placements) and the v3
-    // wire bytes of their receipt bodies (each placing carrier's bodies encoded once).
+    // The open state at the best tip (S4.7): every placement held for the open bins, live and dead, and the v3 wire
+    // bytes of their receipt bodies (each placing carrier's bodies encoded once).
     struct OpenState {
         std::uint64_t placements = 0;
         std::uint64_t bytes = 0;
@@ -579,7 +579,7 @@ public:
         const std::uint64_t F = cfg_.p.open_bins;
         std::map<Hash32, std::set<Hash32>> placed_by;  // placing carrier -> the receipt ids it placed in the open bins
         for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b)
-            for (const Placement* e : v.live_entries(b, v.pos())) {
+            for (const Placement* e : v.entries(b, v.pos())) {
                 ++o.placements;
                 placed_by[e->carrier].insert(e->id);
             }

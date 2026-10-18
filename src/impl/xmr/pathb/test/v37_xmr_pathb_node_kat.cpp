@@ -145,8 +145,10 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
-//   openstate    the open state at the best tip: its live placements and
+//   openstate    the open state at the best tip: its placements and
 //                their receipt bodies' wire bytes, against a sum by hand;
+//   opendead     a legally dead placement in an open bin counts in the
+//                open state (6 of 6 placements, 2,382 B);
 //   statusperiod the status line's open state and liveness, computed once
 //                per status period (2 evaluations in 40 passes over 2
 //                periods), against a sum by hand;
@@ -5144,6 +5146,34 @@ void openstate() {
                   std::to_string(o.bytes) + " B; by hand " + std::to_string(n) + ", " + std::to_string(bytes) + " B");
 }
 
+// opendead: S4.7's open-state bound counts every placement held for the open bins. B's receipt on the older Monero
+// height is placed dead after A's carrier at the newer height; the open state counts it with the live ones: 6 of 6
+// placements, 2,382 B, as the sum by hand; the liveness line shows it dead.
+void opendead() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 60 + i);
+    }
+    const std::optional<pb::PathbJob> jb = h.job(b, 2, 70);
+    h.tick_monero();  // A's next carrier at a newer Monero height: B's receipt (on the older one) dies at that position
+    h.mine(a, 1, 63);
+    const bool pend = jb && h[b].on_own_share(*jb, 70, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.pump();
+    h.mine(a, 1, 64);
+    const pb::PathbNode::Liveness lv = h[a].liveness();
+    const pb::PathbNode::OpenState o = h[a].open_state();
+    const auto [n, bytes] = open_by_hand(h, a);
+    check(pend && lv.dead == 1 && lv.live + lv.dead == n,
+          "opendead: one dead placement in an open bin (live " + std::to_string(lv.live) + ", dead " + std::to_string(lv.dead) +
+                  ")");
+    check(o.placements == n && o.bytes == bytes && n == 6 && bytes == 2382,
+          "opendead: the open state counts every placement held for the open bins (" + std::to_string(o.placements) +
+                  " of " + std::to_string(n) + ", " + std::to_string(o.bytes) + " B of " + std::to_string(bytes) + " B)");
+}
+
 // statusperiod: the status line's open state and liveness line come from status_sample, computed once per status
 // period. A's carriers carry 6 receipts of B each (B's shares on the tip before); 40 main-loop passes 0.25 s apart over
 // 10 s at a 5 s status period evaluate the open state twice; a carrier placed during the first period shows from the
@@ -6161,6 +6191,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("openstate", openstate);
+    run("opendead", opendead);
     run("statusperiod", statusperiod);
     run("ownorphan", ownorphan);
     run("liveness", liveness);
