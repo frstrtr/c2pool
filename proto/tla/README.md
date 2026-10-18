@@ -10,7 +10,7 @@ state machine. Runnable artifacts for the V37 prototyping line (off `master`).
 | `Settlement.tla` | finality-gated owed/overlay state machine (revision 2: signed owed) -- `BlockFound→OverlayAdded` with a signed DROPS-composed credit row, `BlockFinalized→OwedSettled+OverlayCleared`, `BlockOrphaned→OverlayReverted`, `DeepOrphan→priced residual` | `Settlement.cfg` (full), `Settlement_small.cfg` (fast), `Settlement_noC4.cfg` / `Settlement_clawback.cfg` / `Settlement_nomass.cfg` (negative controls) |
 | `Lanes.tla` | per-lane Push/Tick decay vs ground-truth windowed recompute; invariants I1 (dedup), I2 (mono), I3 (no-stale / acc-bounded / determinism), I4 (bin-clock) | `Lanes.cfg` (canonical), `Lanes_wide.cfg` (wider), `Lanes_free.cfg` (negative control) |
 | `PathBRatchet.tla` | the Path B rules ratchet: a committed ratchet state S (epoch_cur, rules_cur, work tallies, a window-level journal) folded by `rs_step`; nodes on different releases derive every quantity (base, open, locked, E_impl, H_hold, the attempt states, the ballot) from (S, position, their compiled table), build until H_hold and then hold; 13 invariants — `SameActivation`, `PrefixEImpl`, `FollowerNeverDiverges`, `HoldOnlyOnConfirmedLockIn`, `NoSpuriousHold`, `ActiveEqualsHoldTrigger`, `JoinerAgreesWithFollower`, `RsRootIsFunctionOfChain`, `GraceFromLockIn`, `OneOpenDeployment`, `OneOpenAcrossReleases`, `ReProposalOpen`, `BoundedState` | `G_A_n22` / `G_S_n22` / `G_B_n24` / `G_BS_n24` (GREEN, all 13); `P_overlap36_MT` (GREEN; layout MT: a re-proposal starts at or after timeout + GRACE of every earlier attempt of its epoch number, except an attempt that ends at `R1To` (gated by `Release`); the layout is a start-up `ASSUME` (`SpacedAcross`)); the `C*` controls and `P_*` probes (each violates one named invariant; `P_overlap28_MS`: layout MS, the re-proposal of epoch 2 at the earlier attempt's timeout); the `W_*` witnesses (reachability); every GREEN run has a floor on distinct states and depth; `check-ratchet.sh` runs the per-PR set, `TLC_LONG=1` adds `G_T_adv2_n18`, `G_M_n38` and `G_MT_n40` |
-| `PathBSealRNP.tla` | the Path B settlement / seal state machine: carriers chain through tip pointers, each carrying a canonically-ordered list of receipt ids; a height record = max carrier height over a chain prefix; a carried bin opens at the carrier's parent record; bins fold after F confirmations and seal after Dfin; a per-node verdict (defer / accept / refuse) and the `Agreement` invariant, plus the eight seal invariants, `ChainRuledValid` and `RecordIsCarrierMax` | `V1_rnp_own_n2r4` / `V1_rnp_carriage_n2r4` (GREEN, with a floor on distinct states and depth), `V1_rnp_neg_openlocal` / `V1_rnp_neg_omitlocal` (`Agreement`), `V1_rnp_nodead` (`LegallyDead`), `V1_rnp_sharechain` (`OrphanRecovered`), `V1_rnp_probe_order` / `V1_rnp_probe_closed` (single-check witnesses); `check-seal-rnp.sh` |
+| `PathBSealRNP.tla` | the Path B settlement / seal state machine: carriers chain through tip pointers, each carrying a canonically-ordered list of receipt ids; a height record = max carrier height over a chain prefix; a carried bin opens at the carrier's parent record; bins fold after F confirmations and seal after Dfin; a per-node verdict (defer / accept / refuse) and the `Agreement` invariant, plus the eight seal invariants, `ChainRuledValid` and `RecordIsCarrierMax`; a Monero reorg at a constant height (`MonReorg`, the blocks at h..mon get new hashes; at most `MaxReorg`), a node restart (`Restart`: carriers kept, seals and pending pool lost; at most `MaxRestart`), and up to three carried ids (`MaxCarry` 3) | `V1_rnp_own_n2r4` / `V1_rnp_carriage_n2r4` / `V1_rnp_own_n2r4_reorg` / `V1_rnp_own_n2r4_restart` / `V1_rnp_own_n2r4_k2` (two nodes, carried pairs) / `V1_rnp_own_n1r5_k3` (one node, three carried ids) (GREEN, every invariant above, with a floor on distinct states and depth), `V1_rnp_own_n2r5_k3` (two nodes, three carried ids; a one-off exploration, not in `check-seal-rnp.sh`, see Run), `V1_rnp_neg_openlocal` / `V1_rnp_neg_omitlocal` / `V1_rnp_neg_hashlocal_n2r4_reorg` / `V1_rnp_neg_orderfirst_n2r5_adv_k3` (`Agreement`), `V1_rnp_neg_restartlocal_n2r4_restart` (`SealAgreement`), `V1_rnp_nodead` (`LegallyDead`), `V1_rnp_sharechain` (`OrphanRecovered`), `V1_rnp_probe_order` / `V1_rnp_probe_closed` (single-check witnesses); `check-seal-rnp.sh` |
 
 ## Verified results
 
@@ -57,9 +57,23 @@ TLC_LONG=1 proto/tla/check-ratchet.sh path/to/tla2tools.jar
 proto/tla/check-seal-rnp.sh path/to/tla2tools.jar [out-dir]
 ```
 
+At four receipt ids a carrier carries at most two ids, so `V1_rnp_own_n2r4_k2` (MaxCarry 2) is the two-node
+config with carried pairs in the per-PR set, and three carried ids are in that set at one node only
+(`V1_rnp_own_n1r5_k3`).
+`V1_rnp_own_n2r5_k3` (two nodes, five receipt ids, MaxCarry 3, every invariant) is a one-off exploration, too long
+for the CI budget, and `check-seal-rnp.sh` does not run it:
+
+```
+java -Xmx4g -cp tla2tools.jar tlc2.TLC -workers 4 -config V1_rnp_own_n2r5_k3.cfg PathBSealRNP.tla
+```
+
+One run on 4 workers ended with no error: 52,026,352 distinct states, an empty queue, depth 20 (about 3 h 50 min,
+resumed once from a TLC checkpoint). It is not a floor.
+
 The `.github/workflows/tla-model-check.yml` lane runs both scripts on every PR
-that touches `proto/tla/**` (a pinned, sha256-verified `tla2tools.jar`), and
-nightly and on manual dispatch with `TLC_LONG=1`.
+that touches `proto/tla/**` (a pinned, sha256-verified `tla2tools.jar`), nightly
+and on manual dispatch; `TLC_LONG=1` (nightly and manual dispatch) applies to
+`check-ratchet.sh` only.
 
 Owed-sign checks (revision 2: base-red, spec GREEN, three negative controls, two
 reachability witnesses) in one go, one verdict line per run:
