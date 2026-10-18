@@ -280,6 +280,8 @@ public:
     bool placed_open(const Hash32& id) const;
     // The live placements of a bin on this chain with q <= q_max, by (q, list order).
     std::vector<const Placement*> live_entries(std::uint64_t bin, std::uint64_t q_max) const;
+    // Every placement of a bin on this chain (live and dead) with q <= q_max, by (q, list order).
+    std::vector<const Placement*> entries(std::uint64_t bin, std::uint64_t q_max) const;
     // false when the placements of the bin are no longer held (P-37).
     bool entries_held(std::uint64_t bin) const;
     // Placements on this chain (live and dead), for counts.
@@ -1321,6 +1323,23 @@ inline std::vector<const Placement*> LaneView::live_entries(std::uint64_t bin, s
         if (d->pos > q_max) break;
         for (const Placement& x : d->placed)
             if (x.bin == bin && x.live) out.push_back(&x);
+    }
+    return out;
+}
+
+inline std::vector<const Placement*> LaneView::entries(std::uint64_t bin, std::uint64_t q_max) const {
+    std::vector<const Placement*> out;
+    const std::uint64_t q_best = std::min(q_max, fork_);
+    if (const auto it = s_->by_bin_.find(bin); it != s_->by_bin_.end()) {
+        for (const Placement& x : it->second) {
+            if (x.q > q_best) break;
+            out.push_back(&x);
+        }
+    }
+    for (const LaneDelta* d : side_) {
+        if (d->pos > q_max) break;
+        for (const Placement& x : d->placed)
+            if (x.bin == bin) out.push_back(&x);
     }
     return out;
 }

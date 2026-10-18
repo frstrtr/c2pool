@@ -15,8 +15,8 @@
 //              empty store reloads at its base with no re-join (F-5: base at
 //              lc(H(x0 - 1)), its peaks), the poison mark and the old
 //              records deleted; resting on claims nothing is relayed;
-//   young      a young chain joined in full; its store (root 0, the genesis
-//              AR) reloads;
+//   young      a young chain joined in full (an adoption, no joiner-path
+//              switch counted); its store (root 0, the genesis AR) reloads;
 //   scope      a joined node offered an unheld tip forking above its x1 and
 //              at or above its base: OutOfScope at the first reply (R46B-3);
 //   scopepow   a top page failing its PoW at a joined node, its fork above x1:
@@ -28,7 +28,11 @@
 //   deep       a full node's own chain as A (JC-6 / B-1): headers first from a
 //              fork below the journal base -> the joiner path (D37); A builds
 //              templates, judges and relays while the attempt runs (3.3a);
-//              rule (4) replaces A, the lost count;
+//              rule (4) replaces A, the lost count; the adoption clears
+//              the re-pend watch;
+//   omitownspan a copy of a carrier's own receipt with a tip below x1 (no
+//              #12 there, D35): refused by freshness; held pending, it is
+//              not counted against the carrier;
 //   partition  a fork below the server's header floor (a server at its P-51
 //              floors): in scope without a header below x0(L') - N_rt (E-82);
 //   x1         a joined node: a fork at or below x1 (above the journal base)
@@ -87,6 +91,13 @@
 
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
+
+// The KAT's view of a node's private state.
+namespace c2pool::xmr::pathb {
+struct PathbNodeTestAccess {
+    static void add_pending(PathbNode& n, PendingReceipt r) { n.pending_.add(std::move(r)); }
+};
+}  // namespace c2pool::xmr::pathb
 
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
@@ -227,7 +238,8 @@ Joining joining_node(Harness& h, const KatNet& net, std::uint64_t J) {
 }
 
 // ---------------------------------------------------------------------------
-// young: a young chain (L < N_rt + 1,176) joined in full; the adoption's store (root at 0, the genesis AR) reloads.
+// young: a young chain (L < N_rt + 1,176) joined in full (an adoption, no joiner-path switch); the adoption's store
+// (root at 0, the genesis AR) reloads.
 void young() {
     JoinNet net(900);
     KatNode a(net, kJ);
@@ -241,6 +253,10 @@ void young() {
     const pb::JoinStep st = h[j].run_join();
     check(st.switched && h[j].joined() && h[j].joined()->young && h[j].tree().best().id == at_pos(a, 600),
           "young: the young chain [1, L] joined in full" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
+    check(st.sw.adopted && h[j].switch_counts().joiner_switches == 0 && h[j].switch_counts().joiner_adopted == 1,
+          "young: an adoption at a fresh start is no joiner-path switch (switches " +
+                  std::to_string(h[j].switch_counts().joiner_switches) + ", adoptions " +
+                  std::to_string(h[j].switch_counts().joiner_adopted) + ")");
     if (!st.switched) return;
     MemoryKv& kv = *h.kvs.back();
     const pb::StoreHead hd = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
@@ -432,8 +448,9 @@ pb::PathbNode::HeadersOutcome headers_first(Harness& h, std::size_t to, std::siz
 // deep (D37; JC-6 / B-1; 3.3a): a full node whose own chain is A. b forks from a at 3,000; a holds b's carriers to
 // 3,560 as a side branch at or above its base, then a's base passes 3,000; b heavier. Headers first from b's server:
 // the fork below the journal base -> the joiner path, b's tip with that server a candidate; the attempt runs while A
-// builds templates, judges and relays a carrier; the fork with A's BEST chain (not the held side top) decides: in
-// scope, rule (4) replaces A, the lost count = A's open-bin placements.
+// builds templates, judges and relays a carrier (a switch by its journal from A's own carrier, its receipt re-pended
+// and watched); the fork with A's BEST chain (not the held side top) decides: in scope, rule (4) replaces A, the lost
+// count = A's open-bin placements; the adoption clears the re-pend watch.
 void deep() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -461,6 +478,22 @@ void deep() {
     h.mon_tip = h_pos(4201) + 1;
     KatTransport tr(h, fa);
     h[fa].set_join_transport(&tr);
+    // an own carrier of A at a_next's position with a higher id: a_next's placement while the attempt runs switches A
+    // by its journal, A's own receipt re-pended and watched; the adoption clears the watch
+    std::optional<pb::PathbJob> oj;
+    std::uint32_t on = 0;
+    for (std::uint32_t n = 40; n < 400 && !oj; ++n) {
+        std::optional<pb::PathbJob> j = h.job(fa, 0, n);
+        if (!j) break;
+        pb::ReceiptBodyV3 rb = j->body;
+        rb.blob.nonce = n;
+        if (a_next.at(0) < pb::receipt_id(rb)) {
+            oj = j;
+            on = n;
+        }
+    }
+    const bool own_placed = oj && h[fa].on_own_share(*oj, on, pb::Hash32{}).action == pb::NodeAction::Placed;
+    h.q.clear();
     const pb::CarrierNode* qn = h[fa].tree().find(q);
     const std::uint64_t base = h[fa].store().base_pos();
     check(placed == 560 && qn != nullptr && h[fa].store().best_at(qn->pos) != q && base > 3000 && qn->pos >= base,
@@ -478,6 +511,7 @@ void deep() {
     pb::TemplateStatus tst = pb::TemplateStatus::RestsOnClaims;
     pb::NodeAction placed_action = pb::NodeAction::None;
     std::uint64_t lost_expected = 0;
+    std::size_t watched = 0;
     tr.on_request = [&]() {
         if (during || tr.log.size() != 3) return;
         during = true;
@@ -489,17 +523,27 @@ void deep() {
         for (const Msg& m : h.q) flooded = flooded || (m.from == fa && !m.frame.empty() && m.frame[0] == pb::kOpFcCarrier);
         h.q.clear();
         lost_expected = pb::open_bin_placements(h[fa].store());
+        watched = h[fa].repend_watch_size();
     };
     const pb::JoinStep st = h[fa].run_join();
-    check(during && attempting && tst == pb::TemplateStatus::Ok && placed_action == pb::NodeAction::Placed && flooded,
-          "deep: while the attempt runs A builds a template, places a relayed carrier and relays it (template "
-                  + std::to_string(static_cast<int>(tst)) + ", action " + std::to_string(static_cast<int>(placed_action)) + ")");
+    check(during && attempting && tst == pb::TemplateStatus::Ok && own_placed && placed_action == pb::NodeAction::Switched
+                  && flooded && watched == 1,
+          "deep: while the attempt runs A builds a template, places a relayed carrier (a switch by its journal from its own "
+          "carrier, the own receipt re-pended and watched) and relays it (template "
+                  + std::to_string(static_cast<int>(tst)) + ", action " + std::to_string(static_cast<int>(placed_action)) +
+                  ", watched " + std::to_string(watched) + ")");
     check(st.report && st.report->end == pb::AttemptEnd::Completed && st.sw.replaced && st.switched,
           "deep: the fork with A's best chain, not the held side top, decides: below A's base, in scope; rule "
           "(4) replaces A" + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string()));
     check(lost_expected > 0 && st.sw.lost == lost_expected,
           "deep: the lost count = the replaced own chain's open-bin placements (" + std::to_string(st.sw.lost) + " of "
                   + std::to_string(lost_expected) + ")");
+    check(h[fa].repend_watch_size() == 0,
+          "deep: the adoption cleared the re-pend watch (" + std::to_string(h[fa].repend_watch_size()) + ")");
+    check(h[fa].switch_counts().joiner_switches == 1 && h[fa].switch_counts().joiner_adopted == 0
+                  && h[fa].switch_counts().joiner_lost == lost_expected,
+          "deep: the node counts the joiner-path switch (" + std::to_string(h[fa].switch_counts().joiner_switches) +
+                  ") and its lost placements (" + std::to_string(h[fa].switch_counts().joiner_lost) + ")");
     check(h[fa].joined() != nullptr && h[fa].tree().best().id == b.store.best_tip()
                   && digest_wo_work(h[fa].lane_digest()) == digest_wo_work(h[fb].lane_digest()) && !h[fa].attempting(),
           "deep: the node runs on the adopted state at b's tip (lane digest == B's, work from its root)");
@@ -530,6 +574,7 @@ void partition() {
     h[fa].set_join_transport(&tr);
     h.mon_tip = h_pos(9000) + 1;
     (void)h.hello(fa, fb);
+    const pb::NodeEventResult own = h.mine(fa, 0, 31, false);  // an own carrier on A (watched; orphaned by rule (4))
     const pb::JoinServeFloors f = h[fb].serve_floors_now();
     const std::uint64_t base = h[fa].store().base_pos();
     check(f.headers > base && base > 2000,
@@ -543,6 +588,11 @@ void partition() {
           "partition: the scan asks no header below x0(L') - N_rt; the fork below it, in scope; rule (4) replaces A (kind "
                   + std::to_string(static_cast<int>(o.kind)) + ")"
                   + (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    check(own.action == pb::NodeAction::Placed && h[fa].own_carriers() == 1 && h[fa].own_orphaned() == 1
+                  && h[fa].own_watch_size() == 0,
+          "partition: A's own carrier was watched and the joiner switch orphaned it (" +
+                  std::to_string(h[fa].own_orphaned()) + "); the watch is empty (" + std::to_string(h[fa].own_watch_size()) +
+                  ")");
     std::printf("  partition: %.1f s\n", secs_since(t0));
 }
 
@@ -561,6 +611,49 @@ Joined join_at(Harness& h, const JoinNet& net, KatNode& a, std::uint64_t J) {
     const pb::JoinStep st = h[o.jn.j].run_join();
     o.ok = st.switched && h[o.jn.j].joined() != nullptr && h[o.jn.j].tree().best().id == a.store.best_tip();
     return o;
+}
+
+// omitownspan: a copy of a carrier's own receipt with another tip is never counted against the carrier. A node joined
+// at L does not run #12 for a tip below x1 (D35), so the copy's id does not bind its tip there. The server mines c on L;
+// copies of c's own body with the tip moved into the claimed span (and one near L) are refused at admission by the
+// freshness row (the span lies more than F + Fresh Monero heights below L). Held pending anyway (put in the pending set),
+// the copy is not counted when c reaches the joined node with room: 0 omissions.
+void omitownspan() {
+    JoinNet net(900);
+    const std::uint64_t L = 4704;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, kJ);
+    check(jd.ok && !h[jd.jn.j].joined()->young, "omitownspan: joined at L (not young)");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j, s = jd.s;
+    const pb::JoinedState& js = *h[j].joined();
+    h.mon_tip = h_pos(L) + 1;
+    const pb::NodeEventResult rc = h.mine(s, 1, 77, false);  // c on L at the server
+    h.q.clear();
+    const pb::CarrierBodyV3 cb = *h[s].bodies().get(h[s].tree().best().id);
+    bool refused = rc.action == pb::NodeAction::Placed;
+    for (const std::uint64_t tp : {js.x1 - 1, js.x0, L - 20}) {
+        pb::ReceiptBodyV3 copy = cb.own;
+        copy.side.tip = at_pos(a, tp);
+        const std::vector<pb::NodeEventResult> rr =
+                h[j].on_receipts(s, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{copy}, pb::kRuledLaneParams));
+        refused = refused && pb::receipt_id(copy) == pb::receipt_id(cb.own) && rr.size() == 1 &&
+                  rr[0].admit.verdict == pb::AdmitVerdict::Refuse && rr[0].admit.row == pb::RowId::R20;
+    }
+    check(refused && h[j].pending().size() == 0,
+          "omitownspan: copies of c's own body with a tip in the claimed span (below x1 " + std::to_string(js.x1) +
+                  ") or near L are refused by the freshness row");
+    pb::ReceiptBodyV3 copy = cb.own;
+    copy.side.tip = at_pos(a, js.x1 - 1);
+    pb::PathbNodeTestAccess::add_pending(h[j], pb::PendingReceipt{pb::receipt_id(copy), copy,
+                                                                  h[j].receipt_origin(cb.own).value_or(0), js.x1 - 1, 0});
+    const bool held = h[j].pending().size() == 1;
+    const pb::NodeEventResult r = h[j].on_carrier(s, *pb::encode_fc_carrier(0, cb, pb::kRuledLaneParams.r_max));
+    check(held && r.admit.verdict == pb::AdmitVerdict::AdmitCarrier && cb.carried.empty() && r.omitted == 0,
+          "omitownspan: a pending copy of c's own receipt with a tip below x1: c is not charged for it (" +
+                  std::to_string(r.omitted) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -2041,6 +2134,7 @@ int main(int argc, char** argv) {
     run("fetchahead", fetchahead);
     run("deep", deep);
     run("partition", partition);
+    run("omitownspan", omitownspan);
     run("x1", x1);
     run("reask", reask);
     run("adoptbelow", adoptbelow);
