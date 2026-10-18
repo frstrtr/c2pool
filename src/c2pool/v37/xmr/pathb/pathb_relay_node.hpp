@@ -1692,6 +1692,14 @@ private:
         std::lock_guard<std::mutex> lk(vmtx_);
         valid_.erase(p);
     }
+    // An omission entry made for a link that went down meanwhile does not stay (a carrier run again after its link's
+    // down: a RandomX park, a parked frame's re-run, a queued verify job); the total keeps the count. The link-down
+    // handler erases the others, so the log holds only links that are up.
+    void omission_gone(std::uint64_t p) {
+        if (peer_known(p)) return;
+        std::lock_guard<std::mutex> lk(omtx_);
+        omissions_.erase(p);
+    }
     struct ValidBucket {
         double tokens = 0;
         std::uint64_t ms = 0;
@@ -1744,9 +1752,12 @@ private:
             ++verdicts_[static_cast<std::size_t>(r.admit.row)][static_cast<std::size_t>(r.admit.verdict)];
         }
         if (r.omitted != 0 && peer != 0) {  // the per-peer omission log (relay policy; erased at link down)
-            std::lock_guard<std::mutex> lk(omtx_);
-            omissions_[peer] += r.omitted;
-            omitted_total_ += r.omitted;
+            {
+                std::lock_guard<std::mutex> lk(omtx_);
+                omissions_[peer] += r.omitted;
+                omitted_total_ += r.omitted;
+            }
+            omission_gone(peer);
         }
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;

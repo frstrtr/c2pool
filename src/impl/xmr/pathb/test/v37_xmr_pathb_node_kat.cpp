@@ -160,6 +160,9 @@
 //   relayomit    the per-peer omission log: a peer's carrier with room that
 //                leaves out a receipt this node holds pending is counted for
 //                that peer's link; every link down empties the log;
+//   relayomitgone a carrier run again after its link went down (a
+//                RandomX park): counted in the total, no entry for the
+//                gone link;
 //   relayrepend  a switch relays its re-pended receipts as FB_RECEIPTS v3
 //                (paged; both switch paths: a direct placement, the drain);
 //                the switching node mines no more, a peer's carrier carries
@@ -5355,6 +5358,57 @@ void relayomit() {
                   std::to_string(b.relay->omission_counts().size()) + " links), the total kept");
 }
 
+// relayomitgone: a carrier run again after its link went down keeps no omission entry. B holds a receipt pending that
+// A never gets; A's next carrier (with room, without it) hits a RandomX failure at B and is parked; A's link at B goes
+// down (the log is empty); the re-run places the carrier: the omission counts in the total, the log stays empty.
+void relayomitgone() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 840);
+    const std::optional<pb::PathbJob> jb = h.job(b.node, 2, 841);
+    w.edit = [](FakeWire::Msg& m) {
+        if (m.from == 1 && m.to == 0) m.f.clear();
+    };
+    ok = ok && jb && mine_on(h, w, a.node, 1, 842);
+    ok = ok && h[b.node].on_own_share(*jb, 841, pb::Hash32{}).action == pb::NodeAction::Pending;
+    w.run();
+    pb::Hash32 q{};
+    if (jb) {
+        pb::ReceiptBodyV3 rb = jb->body;
+        rb.blob.nonce = 841;
+        q = pb::receipt_id(rb);
+    }
+    ok = ok && h[b.node].pending().holds(q) && !h[a.node].pending().holds(q);
+    const std::optional<pb::PathbJob> ja = h.job(a.node, 1, 843);
+    ok = ok && ja && h[a.node].on_own_share(*ja, 843, pb::Hash32{}).action == pb::NodeAction::Placed;
+    const pb::Hash32 cid = h[a.node].tree().best().id;
+    h.throw_pow.insert(cid);  // B's first RandomX call on A's carrier throws: node-internal, parked, run again
+    w.run();
+    const bool parked = h.throw_pow.count(cid) == 0 && h[b.node].tree().find(cid) == nullptr;
+    const std::uint64_t la = w.id(b.node, a.node);
+    w.edit = nullptr;
+    w.links[b.node]->disconnect(la);
+    w.run();
+    const bool empty_at_down = b.relay->omission_counts().empty() && b.relay->omitted_total() == 0;
+    for (int i = 0; i < 6; ++i) {
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
+    const bool placed = h[b.node].tree().find(cid) != nullptr;
+    const std::map<std::uint64_t, std::uint64_t> om = b.relay->omission_counts();
+    check(ok && parked && empty_at_down && placed && !b.relay->peer_known(la),
+          "relayomitgone: A's carrier parked on a RandomX failure at B, A's link down, the re-run placed it");
+    check(om.empty() && b.relay->omitted_total() == 1,
+          "relayomitgone: the re-run's omission counts in the total (" + std::to_string(b.relay->omitted_total()) +
+                  "); no entry for the gone link (links logged " + std::to_string(om.size()) + ")");
+}
+
 // relayrparkgone: a parked receipt's asks across reconnects. B parks a receipt of an unknown tip sent by A (one ask on
 // A's link); three times A's link goes down and a new one comes up (a new link id) and A sends the receipt again: the
 // gone link's ask records leave the parked receipt at its link down, so its ask set stays one record (the current
@@ -5838,6 +5892,7 @@ int main(int argc, char** argv) {
     run("liveness", liveness);
     run("wingolden", wingolden);
     run("relayomit", relayomit);
+    run("relayomitgone", relayomitgone);
     run("relayrepend", relayrepend);
     run("revrepend2", revrepend2);
     run("relayrpark", relayrpark);
