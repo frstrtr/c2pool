@@ -430,7 +430,7 @@ rules:
         scope: xmr_consensus_core
         code_only: true
     status_now: pass
-    deviation: [D7]
+    deviation: [D7, D47]
 
   - id: C14
     title: no whale rule, no identity map
@@ -631,7 +631,7 @@ rules:
         scope: xmr_lane_code
         code_only: true
     status_now: pass
-    deviation: [D11, D36, D39, D46]
+    deviation: [D11, D36, D39, D46, D47]
 
   - id: C24
     title: accounting across rule epochs
@@ -958,7 +958,7 @@ rules:
         min: 17
         max: 17
     status_now: pass
-    deviation: [D19, D33]
+    deviation: [D19, D33, D47]
 
   - id: C37
     title: payout from pre-block state
@@ -1012,7 +1012,7 @@ rules:
     open_items:
       - 'hf 17 amount rule: open (ref: the:SPEC24/O-01); no receipt for hf >= 17 is built or admitted until it is ruled'
     status_now: pass
-    deviation: [D20]
+    deviation: [D20, D47]
 
   - id: C38
     title: window by work, W_max, merge-back
