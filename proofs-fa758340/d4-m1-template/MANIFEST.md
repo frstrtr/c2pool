@@ -55,9 +55,9 @@ Milestone budget was 60 minutes.
 
 ## Captured artifacts
 
-    embedded_template.2026-09-10T09:43:28Z.json  sha256 79359c8fce06cbee5f178974bab28db934fbe8ba04fa97cd8d4a0ca6b7a7b45e
-    embedded_template.2026-09-10T09:44:28Z.json  sha256 c6c58bbdecf54d7110bac2887949525945672968733ac97fc16c10d5b1169d6a
-    embedded_template.2026-09-10T09:45:28Z.json  sha256 793f642dbae6ecc75181818b8da3038380fcf25bb022a11b6d44eeb0938b3c73
+    embedded_template.2026-09-10T09-43-28Z.json  sha256 79359c8fce06cbee5f178974bab28db934fbe8ba04fa97cd8d4a0ca6b7a7b45e
+    embedded_template.2026-09-10T09-44-28Z.json  sha256 c6c58bbdecf54d7110bac2887949525945672968733ac97fc16c10d5b1169d6a
+    embedded_template.2026-09-10T09-45-28Z.json  sha256 793f642dbae6ecc75181818b8da3038380fcf25bb022a11b6d44eeb0938b3c73
 
 Capture #1, the first served template:
 
