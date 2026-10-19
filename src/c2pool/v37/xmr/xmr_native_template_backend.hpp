@@ -159,6 +159,8 @@ struct NativeTemplateConfig {
     std::uint64_t            own_fork_bound_ms = 240'000;
     // FORK-FUSE-2 test-only knob (--test-unknown-fork-stall-s); 0 = default.
     std::uint64_t            unknown_fork_stall_ms = 0;
+    // The alt store's block count (--alt-max-blocks); 0 = the index's default (k_alt).
+    std::size_t              alt_max_blocks = 0;
 
     // OPERATOR TX-INJECTION (2026-09-19 ruling), default OFF. When on, the node
     // accepts operator-submitted signed txs through submit_operator_inject() and
@@ -292,6 +294,7 @@ inline NativeTemplateConfig native_template_config_of(const XmrNodeConfig& cfg) 
                      : native::TieBreak::FirstSeen;
     n.own_fork_bound_ms = static_cast<std::uint64_t>(cfg.own_fork_bound_s) * 1000;
     n.unknown_fork_stall_ms = static_cast<std::uint64_t>(cfg.test_unknown_fork_stall_s) * 1000;
+    n.alt_max_blocks = cfg.alt_max_blocks;
     // #1680 lever, and OPERATOR TX-INJECTION (default OFF): forwarded here so a
     // consumer that builds its config through this function -- main and the
     // mainnet-readiness KAT -- does not silently drop them on the way to the node.
@@ -341,6 +344,7 @@ public:
         nc.fork_tie             = cfg_.fork_tie;
         nc.own_fork_bound_ms    = cfg_.own_fork_bound_ms;
         nc.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
+        nc.alt_max_blocks        = cfg_.alt_max_blocks;
         nc.operator_inject            = cfg_.operator_inject;
         nc.operator_inject_ttl_blocks = cfg_.operator_inject_ttl_blocks;
         nc.txpool_warm_timeout_ms     = cfg_.txpool_warm_timeout_ms;

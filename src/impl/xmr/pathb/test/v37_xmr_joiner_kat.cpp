@@ -184,6 +184,8 @@ void span() {
         j.offer(at_pos(a, L), s);
         const std::optional<pb::AttemptReport> r = j.run_next();
         check(r && r->end == pb::AttemptEnd::Completed, tag + ": the honest attempt completes" + (r ? ": " + rep_desc(*r) : ""));
+        check(r && r->side_needs == 0, tag + ": no side branch's state taken from the server (side needs " +
+                                               std::to_string(r ? r->side_needs : 0) + ")");
         if (!j.adopted()) continue;
         pb::JoinedState& js = *j.adopted();
         const pb::SpanBounds ref = span_reference(L, shape.hof);
@@ -987,6 +989,9 @@ void span_claims_iii(const JoinNet& net) {
         check(hr != nullptr && hr->end == pb::AttemptEnd::Completed && j.adopted() &&
                       digest_of(*j.adopted(), at_pos(a, L)) == dL,
               "span claims (iii) honest: the attempt completes; J's digest == A's");
+        check(hr != nullptr && hr->side_needs >= 1,
+              "span claims (iii) honest: the report counts the side branch's state taken from the server (side needs " +
+                      std::to_string(hr != nullptr ? hr->side_needs : 0) + ")");
     }
 }
 
@@ -1073,6 +1078,8 @@ void span_fold_lc0(const JoinNet& net) {
                       !j.queue().excluded(peer),
               tag + ": the first attempt ends NotServed (no alarm, no token, no exclusion), the pair marked young" +
                       (r1 ? ": " + rep_desc(*r1) : ""));
+        check(r1 && r1->side_needs >= 1, tag + ": the report counts the side branch it needed (side needs " +
+                                                 std::to_string(r1 ? r1->side_needs : 0) + ")");
         check(j.queue().size() == 1 && j.queue().pairs().front().young,
               tag + ": the pair is re-queued with the young mark (the next attempt runs the young path)");
         const std::optional<pb::AttemptReport> r2 = j.run_next();

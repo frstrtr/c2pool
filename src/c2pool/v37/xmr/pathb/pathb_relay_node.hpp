@@ -225,12 +225,17 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
+    // join attempts that took a side branch's state from the server (a span on a side branch forking at a prefix node
+    // below the root); of them: completed, not served
+    std::atomic<std::uint64_t> join_side_attempts{0}, join_side_completed{0}, join_side_not_served{0};
     std::atomic<std::uint64_t> claim_alarms{0}, claim_alarm_drops{0};  // P-50: relayed frames' claim-leaf alarms; drops
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
+    std::atomic<std::uint64_t> parked_receipts_sealed{0};  // parked receipts dropped (no strike) as their origin bin sealed
     std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
+    std::atomic<std::uint64_t> reoffer_cap_drops{0};  // re-offer ids dropped over a peer queue's cap (P-09), the oldest
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
@@ -667,6 +672,7 @@ public:
         if (o_.discovery) disc_tick();
         drive_ctx();
         node_tick();
+        sweep_sealed_receipts();
         rerun_due_receipts();
         reoffer_pump_all();
         rx_tick();
@@ -779,6 +785,18 @@ public:
         }
         rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
     }
+    // A peer's re-offer queue: the ids queued, and whether each is queued once.
+    std::size_t reoffer_queued(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(rmtx_);
+        const auto it = reoffer_.find(p);
+        return it == reoffer_.end() ? 0 : it->second.q.size();
+    }
+    bool reoffer_distinct(std::uint64_t p) {
+        std::lock_guard<std::mutex> lk(rmtx_);
+        const auto it = reoffer_.find(p);
+        if (it == reoffer_.end()) return true;
+        return std::set<Hash32>(it->second.q.begin(), it->second.q.end()).size() == it->second.q.size();
+    }
     // The DEFERred receipts parked (P-09 at most).
     std::size_t parked_receipts() {
         const NodeGuard g(*this);
@@ -877,6 +895,29 @@ public:
         std::size_t n = 0;
         for (const auto& kv : ctx_want_) n += kv.second.blob.size();
         return n;
+    }
+    // The per-peer omission log: link id -> the receipts its placed carriers left out that this node held pending (an
+    // entry leaves at link down), and the total since start.
+    std::map<std::uint64_t, std::uint64_t> omission_counts() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return omissions_;
+    }
+    std::uint64_t omitted_total() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return omitted_total_;
+    }
+    // The admission verdicts of peers' objects since start, by row (RowId, 0 = none) and verdict (AdmitVerdict).
+    static constexpr std::size_t kRowKinds = static_cast<std::size_t>(RowId::R31) + 1;
+    static constexpr std::size_t kVerdictKinds = static_cast<std::size_t>(AdmitVerdict::Drop) + 1;
+    using VerdictCounts = std::array<std::array<std::uint64_t, kVerdictKinds>, kRowKinds>;
+    VerdictCounts verdict_counts() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return verdicts_;
+    }
+    // The most bytes the wanted contexts held at once (taken at every blob that enters a want).
+    std::size_t ctx_want_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_bytes_peak_;
     }
     std::string describe() const {
         char b[768];
@@ -984,6 +1025,7 @@ private:
         bool rerun = false;      // a frame run again (P-15 gated at its first arrival only; counted once, at its first placement)
         // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
         std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
+        std::uint64_t origin_h = 0;  // a parked receipt's origin height h(r) (0: its P_r not held yet)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
@@ -1313,7 +1355,21 @@ private:
         post([this, p] {
             const NodeGuard g(*this);
             node_->disconnect(p);
+            strip_gone_peer_asks_locked(p);
+            std::lock_guard<std::mutex> lk(omtx_);
+            omissions_.erase(p);
         });
+    }
+    // Under the node lock: a gone link's ask records leave every parked receipt (link ids are not reused, so they
+    // gate nothing; one pass over the park, at most P-09 receipts).
+    void strip_gone_peer_asks_locked(std::uint64_t p) {
+        for (auto& [key, e] : parked_receipts_) {
+            auto& asked = e.second.asked;
+            const auto lo = asked.lower_bound(std::make_tuple(p, static_cast<Missing>(0), Hash32{}));
+            auto hi = lo;
+            while (hi != asked.end() && std::get<0>(*hi) == p) ++hi;
+            asked.erase(lo, hi);
+        }
     }
     // Disconnects and bans run on the maintenance thread (never under the node lock).
     void defer_drop(std::uint64_t p, std::uint64_t src, bool ban) {
@@ -1636,6 +1692,14 @@ private:
         std::lock_guard<std::mutex> lk(vmtx_);
         valid_.erase(p);
     }
+    // An omission entry made for a link that went down meanwhile does not stay (a carrier run again after its link's
+    // down: a RandomX park, a parked frame's re-run, a queued verify job); the total keeps the count. The link-down
+    // handler erases the others, so the log holds only links that are up.
+    void omission_gone(std::uint64_t p) {
+        if (peer_known(p)) return;
+        std::lock_guard<std::mutex> lk(omtx_);
+        omissions_.erase(p);
+    }
     struct ValidBucket {
         double tokens = 0;
         std::uint64_t ms = 0;
@@ -1669,10 +1733,38 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
     };
-    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
+        for (const PathbNode::DrainedResult& d : node_->take_drained())
+            account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
+    }
+    // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
+    // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
+    // by the journal.
+    void account_locked(std::uint64_t peer, NodeAction action, RowId row, AdmitVerdict verdict, std::uint64_t omitted,
+                        std::uint64_t repended, std::uint64_t lost) {
+        const bool from_peer = peer != 0 && peer != PathbNode::kOwnPeer;
+        if (from_peer && action != NodeAction::None && action != NodeAction::NodeInternal) {  // verdicts by row
+            std::lock_guard<std::mutex> lk(omtx_);
+            ++verdicts_[static_cast<std::size_t>(row)][static_cast<std::size_t>(verdict)];
+        }
+        if (omitted != 0 && from_peer) {  // the per-peer omission log (relay policy; erased at link down)
+            {
+                std::lock_guard<std::mutex> lk(omtx_);
+                omissions_[peer] += omitted;
+                omitted_total_ += omitted;
+            }
+            omission_gone(peer);
+        }
+        if (action == NodeAction::Switched) {
+            const PathbNode::SwitchCounts& sc = node_->switch_counts();
+            log("relay: switch by the journal: re-pended " + std::to_string(repended) + ", lost " + std::to_string(lost) +
+                " (re-pended since start " + std::to_string(sc.repended) + ", carried " + std::to_string(sc.carried) +
+                ", sealed pending " + std::to_string(sc.sealed_pending) + ")");
+        }
     }
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
@@ -1683,6 +1775,7 @@ private:
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
+        account_locked(peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended, r.lost);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
@@ -1717,9 +1810,11 @@ private:
                 asked = &it->second.second.asked;
             }
         }
-        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time
+        // a parked receipt asks each peer for one cause and object at most once; its TipBodies bind runs every time;
+        // a gone link (a re-run of a receipt it sent) is neither asked nor recorded
+        const bool gone = asked != nullptr && !peer_known(peer);
         const auto may = [&](const Hash32& object) {
-            return kept && (asked == nullptr || asked->emplace(peer, m, object).second);
+            return kept && !gone && (asked == nullptr || asked->emplace(peer, m, object).second);
         };
         switch (m) {
             case Missing::TipUnknown:
@@ -1943,7 +2038,7 @@ private:
             parked_receipt_order_.erase(it->second.first);
             receipt_due_.erase(it->second.first);
         }
-        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked)};
+        Job k{j.kind, j.peer, j.src, j.frame, 0, j.solicited, true, std::move(asked), receipt_origin_locked(j.frame)};
         const std::uint64_t seq = ++parked_receipt_seq_;
         parked_receipts_[key] = std::make_pair(seq, std::move(k));
         parked_receipt_order_[seq] = key;
@@ -1968,6 +2063,31 @@ private:
         parked_receipts_.erase(it);
         unindex_receipt_locked(key);
         return j;
+    }
+    // Under the node lock: the origin height of a one-body FB_RECEIPTS frame's receipt (0: not known).
+    std::uint64_t receipt_origin_locked(const std::vector<std::uint8_t>& frame) const {
+        const std::size_t at = kFrameHeaderBytes + 1;
+        if (frame.size() <= at) return 0;
+        ReceiptBodyV3 r;
+        if (decode_receipt_body_v3(frame.data() + at, frame.size() - at, ReceiptLimits{buffers_.receipt}, r) != WireError::None)
+            return 0;
+        return node_->receipt_origin(r).value_or(0);
+    }
+    // SPEC DEFER: a parked receipt is dropped without strike when its origin bin seals on the best chain (with its asks
+    // and index entries); once per move of the best chain's record H(L) (the tick).
+    void sweep_sealed_receipts() {
+        const NodeGuard g(*this);
+        if (parked_receipts_.empty()) return;
+        const std::optional<std::uint64_t> H = node_->best_record();
+        if (!H || *H == swept_record_) return;
+        swept_record_ = *H;
+        std::vector<Hash32> sealed;
+        for (const auto& [key, e] : parked_receipts_)
+            if (e.second.origin_h != 0 && !open_at(*H, e.second.origin_h, p_.open_bins)) sealed.push_back(key);
+        for (const Hash32& key : sealed) {
+            (void)take_parked_receipt_locked(key);
+            st_.parked_receipts_sealed++;
+        }
     }
     void unindex_receipt_locked(const Hash32& key) {
         for (auto& [cause, ds] : parked_by_cause_) ds.erase(key);
@@ -2129,15 +2249,18 @@ private:
     // taken under the node lock; the frames paged by reoffer_pump).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
         std::vector<Hash32> ids;
+        std::size_t cap = 0;
         {
             const NodeGuard g(*this);
             if (node_->rests_on_claims() || node_->poisoned()) return;
             catchup_start(p, tail);
             for (const PendingReceipt* r : node_->pending().all()) ids.push_back(r->id);
+            cap = static_cast<std::size_t>(node_->pending_cap());
         }
         {
             std::lock_guard<std::mutex> lk(rmtx_);
-            reoffer_[p] = std::deque<Hash32>(ids.begin(), ids.end());
+            reoffer_[p] = ReofferQueue{};
+            reoffer_append_locked(p, ids, cap);
             reoffer_t0_[p] = now_ms();
         }
         reoffer_pump(p);
@@ -2167,12 +2290,12 @@ private:
                 std::lock_guard<std::mutex> lk(rmtx_);
                 const auto it = reoffer_.find(p);
                 if (it == reoffer_.end()) return;
-                if (it->second.empty()) {
+                if (it->second.q.empty()) {
                     reoffer_.erase(it);
                     reoffer_finished_locked(p);
                     return;
                 }
-                for (std::size_t i = 0; i < per && i < it->second.size(); ++i) ids.push_back(it->second[i]);
+                for (std::size_t i = 0; i < per && i < it->second.q.size(); ++i) ids.push_back(it->second.q[i]);
             }
             std::vector<ReceiptBodyV3> chunk;
             {
@@ -2199,7 +2322,25 @@ private:
             std::lock_guard<std::mutex> lk(rmtx_);
             const auto it = reoffer_.find(p);
             if (it == reoffer_.end()) return;
-            for (std::size_t i = 0; i < ids.size() && !it->second.empty(); ++i) it->second.pop_front();
+            // the ids sent leave the front (by identity: the cap may have dropped the front meanwhile)
+            for (const Hash32& id : ids)
+                if (!it->second.q.empty() && it->second.q.front() == id) {
+                    it->second.ids.erase(id);
+                    it->second.q.pop_front();
+                }
+        }
+    }
+    // Under rmtx_: ids appended to a peer's re-offer queue, each id at most once (a duplicate of a queued id is not
+    // appended), at most `cap` ids (the pending set's cap, P-09: no peer needs more distinct re-offers): over it the
+    // oldest go.
+    void reoffer_append_locked(std::uint64_t p, const std::vector<Hash32>& ids, std::size_t cap) {
+        ReofferQueue& r = reoffer_[p];
+        for (const Hash32& id : ids)
+            if (r.ids.insert(id).second) r.q.push_back(id);
+        while (r.q.size() > cap && !r.q.empty()) {
+            r.ids.erase(r.q.front());
+            r.q.pop_front();
+            st_.reoffer_cap_drops++;
         }
     }
     // Under rmtx_: a re-offer sent to its end (soak: the time it took).
@@ -2243,10 +2384,12 @@ private:
     void repend_offer() {
         if (t_node_held == this) return;
         std::vector<Hash32> ids;
+        std::size_t cap = 0;
         {
             const NodeGuard g(*this);
             ids = node_->take_repended();
             if (ids.empty() || node_->rests_on_claims() || node_->poisoned()) return;
+            cap = static_cast<std::size_t>(node_->pending_cap());
         }
         const std::vector<std::uint64_t> ready = ready_peers();
         st_.repend_offers++;
@@ -2259,9 +2402,8 @@ private:
         {
             std::lock_guard<std::mutex> lk(rmtx_);
             for (const std::uint64_t p : ready) {
-                std::deque<Hash32>& q = reoffer_[p];
                 if (reoffer_t0_.count(p) == 0) reoffer_t0_[p] = now_ms();
-                q.insert(q.end(), ids.begin(), ids.end());
+                reoffer_append_locked(p, ids, cap);
             }
         }
         for (const std::uint64_t p : ready) reoffer_pump(p);
@@ -2532,8 +2674,15 @@ private:
             const AttemptReport& rep = *s->report;
             log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
                 std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
-                ", tokens " + std::to_string(rep.strike) + (rep.what.empty() ? "" : ": " + rep.what) + ")" +
-                (s->switched ? " -> adopted" : ""));
+                ", tokens " + std::to_string(rep.strike) +
+                (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
+                (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
+            if (rep.side_needs > 0) {
+                st_.join_side_attempts++;
+                if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;
+                if (rep.end == AttemptEnd::NotServed) st_.join_side_not_served++;
+            }
             if (s->report->strike > 0) {
                 strike(s->report->server, s->report->strike, false);
                 st_.join_strikes += s->report->strike;
@@ -3364,6 +3513,9 @@ private:
             it->second.proof = bc;
             it->second.blob = blob;
             it->second.proof_from = from;
+            std::size_t held = 0;
+            for (const auto& kv : ctx_want_) held += kv.second.blob.size();
+            if (held > ctx_want_bytes_peak_) ctx_want_bytes_peak_ = held;
         }
         return judge_ctx(id);
     }
@@ -3619,11 +3771,16 @@ private:
     std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
     std::uint64_t parked_receipt_seq_ = 0;
     std::map<std::uint64_t, Hash32> receipt_due_;  // parked receipts whose cause resolved, by seq: run again with room
+    std::uint64_t swept_record_ = 0;               // the best chain's H(L) at the last seal sweep of the receipt park
     bool bucket_stalled_ = false;
     bool reask_due_ = false;
 
     std::mutex rmtx_;  // re-offer cursors
-    std::map<std::uint64_t, std::deque<Hash32>> reoffer_;
+    struct ReofferQueue {
+        std::deque<Hash32> q;  // the ids to offer, oldest first
+        std::set<Hash32> ids;  // the ids in q (each queued once)
+    };
+    std::map<std::uint64_t, ReofferQueue> reoffer_;
     std::map<std::uint64_t, std::uint64_t> reoffer_t0_;  // a re-offer's start (ms), by peer
     std::set<std::uint64_t> pumping_;  // the peers whose re-offer a thread is pumping
     std::atomic<std::uint64_t> rx_ok_{0};    // RandomX hashes computed (node and context)
@@ -3672,8 +3829,13 @@ private:
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop)
 
+    mutable std::mutex omtx_;                          // the omission log
+    std::map<std::uint64_t, std::uint64_t> omissions_;  // link id -> receipts omitted (at most the links up)
+    std::uint64_t omitted_total_ = 0;
+    VerdictCounts verdicts_{};  // [row][verdict]
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;
+    std::size_t ctx_want_bytes_peak_ = 0;  // the most blob bytes ctx_want_ held at once
     std::deque<Hash32> ctx_done_;
     std::map<Hash32, rly::CtxPowRec> ctx_pow_;
     std::deque<Hash32> ctx_pow_order_;

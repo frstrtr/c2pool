@@ -195,6 +195,8 @@ struct NodeEventResult {
     std::optional<WriteOutcome> write;
     std::uint64_t repended = 0;  // the re-pend count of a switch
     std::uint64_t lost = 0;      // abandoned placements whose bin is sealed on the new branch
+    std::uint64_t omitted = 0;   // a peer's placed carrier with room: the receipts this node holds pending in bins open
+                                 // at its parent that it did not carry (relay policy, never a verdict)
 };
 
 // A family C frame's token class for the relay node (it applies the token):
@@ -490,17 +492,130 @@ public:
         return joined_ != nullptr ? joined_->bound_work() : own_chain_.bound_work();
     }
     const PathbNodeConfig& config() const noexcept { return cfg_; }
+    // A receipt's origin height h(r) = height(P_r) + 1 when the follower holds its P_r.
+    std::optional<std::uint64_t> receipt_origin(const ReceiptBodyV3& r) const {
+        const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(r.blob.prev_id) : PrInfo{};
+        if (pr.status != PrInfo::Status::Held) return std::nullopt;
+        return pr.height + 1;
+    }
+    // H(L) of the best chain (the record at its tip), when its view is held.
+    std::optional<std::uint64_t> best_record() const {
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return std::nullopt;
+        return v.record(v.pos());
+    }
     bool poisoned() const noexcept { return poisoned_; }
     std::uint64_t verify_calls() const noexcept { return verify_calls_; }
-    // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals.
+    // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals; of the
+    // re-pended receipts, those later carried on the best chain, those whose bin sealed while they were pending and
+    // those the pending set evicted (P-09) while watched; the joiner-path switches (rule (4) replaced the running
+    // state) and the placements they lost; the adoptions with no state before (a fresh start, a load failure).
     struct SwitchCounts {
         std::uint64_t switches = 0;
         std::uint64_t last_repended = 0;
         std::uint64_t last_lost = 0;
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        std::uint64_t carried = 0;
+        std::uint64_t sealed_pending = 0;
+        std::uint64_t evicted = 0;
+        std::uint64_t joiner_switches = 0;
+        std::uint64_t joiner_lost = 0;
+        std::uint64_t joiner_adopted = 0;
     };
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
+    // The windows evaluated since start (each once, the cache) and how many had the N rule drop bins, cut the newest bin
+    // by position, or merge an owner or the author back (logs only).
+    struct WindowFlagCounts {
+        std::uint64_t evaluated = 0;
+        std::uint64_t n_dropped_bins = 0;
+        std::uint64_t n_cut_position = 0;
+        std::uint64_t merged_back = 0;
+    };
+    const WindowFlagCounts& window_flags() const noexcept { return win_flags_; }
+    // The re-pended receipts still pending (at most the pending cap): each leaves at its placement, its seal, its
+    // eviction or an adoption (the joiner path).
+    std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
+    // Own carriers placed on the best chain since start, and those orphaned (no longer best at their position). Each
+    // is watched until it is below the journal base (confirmed) or orphaned, a joiner switch included: at most J
+    // positions; the watch starts empty at every start.
+    std::uint64_t own_carriers() const noexcept { return own_carriers_; }
+    std::uint64_t own_orphaned() const noexcept { return own_orphaned_; }
+    std::size_t own_watch_size() const noexcept { return own_watch_.size(); }
+    // The open state at the best tip (S4.7): every placement held for the open bins, live and dead, and the v3 wire
+    // bytes of their receipt bodies (each placing carrier's bodies encoded once).
+    struct OpenState {
+        std::uint64_t placements = 0;
+        std::uint64_t bytes = 0;
+    };
+    // The liveness line at the best tip: the placements of the open bins, live and dead, and sha256d over (id, live)
+    // in bin and id order (equal on nodes at the same tip).
+    struct Liveness {
+        std::uint64_t live = 0;
+        std::uint64_t dead = 0;
+        Hash32 hash{};
+    };
+    Liveness liveness() const {
+        Liveness o;
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return o;
+        const std::uint64_t H = v.record(v.pos());
+        const std::uint64_t F = cfg_.p.open_bins;
+        std::vector<std::uint8_t> pre;
+        for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b) {
+            std::vector<const Placement*> es = v.entries(b, v.pos());
+            std::sort(es.begin(), es.end(), [](const Placement* x, const Placement* y) { return x->id < y->id; });
+            for (const Placement* e : es) {
+                ++(e->live ? o.live : o.dead);
+                pre.insert(pre.end(), e->id.begin(), e->id.end());
+                pre.push_back(e->live ? 1 : 0);
+            }
+        }
+        o.hash = ::v37::sha256d(pre);
+        return o;
+    }
+    OpenState open_state() const {
+        ++open_state_calls_;
+        OpenState o;
+        const LaneView v = store_->view_at(store_->best_tip());
+        if (!v.ok()) return o;
+        const std::uint64_t H = v.record(v.pos());
+        const std::uint64_t F = cfg_.p.open_bins;
+        std::map<Hash32, std::set<Hash32>> placed_by;  // placing carrier -> the receipt ids it placed in the open bins
+        for (std::uint64_t b = H > F ? H - F + 1 : store_->b0(); b <= H + cfg_.p.fresh_max; ++b)
+            for (const Placement* e : v.entries(b, v.pos())) {
+                ++o.placements;
+                placed_by[e->carrier].insert(e->id);
+            }
+        std::vector<std::uint8_t> buf;
+        for (const auto& [carrier, ids] : placed_by) {
+            const CarrierBodyV3* c = bodies_->get(carrier);
+            if (c == nullptr) continue;
+            const auto add = [&](const ReceiptBodyV3& r) {
+                if (ids.count(receipt_id(r)) == 0) return;
+                buf.clear();
+                if (encode_receipt_body_v3(r, buf) == WireError::None) o.bytes += buf.size();
+            };
+            add(c->own);
+            for (const ReceiptBodyV3& r : c->carried) add(r);
+        }
+        return o;
+    }
+    // open_state() evaluations since start.
+    std::uint64_t open_state_calls() const noexcept { return open_state_calls_; }
+    // The open state and the liveness line of the daemon's status line, computed once per status period: a call
+    // less than period_s after the last computation returns the kept values (period_s 0: no status line, none).
+    struct StatusSample {
+        OpenState open;
+        Liveness liveness;
+    };
+    const StatusSample& status_sample(std::uint64_t now_s, std::uint64_t period_s) {
+        if (period_s != 0 && (!sample_s_ || now_s >= *sample_s_ + period_s)) {
+            sample_ = StatusSample{open_state(), liveness()};
+            sample_s_ = now_s;
+        }
+        return sample_;
+    }
     std::uint64_t best_changes() const noexcept { return generation_; }
     StoreFaults& faults() noexcept { return faults_; }
     WindowCache& windows() noexcept { return *windows_; }
@@ -560,6 +675,15 @@ public:
         for (const std::uint64_t peer : left_) joiner_->disconnect(peer);  // re-queued pairs of a gone server
         left_.clear();
         if (out.report && (out.sw.adopted || out.sw.replaced)) out.switched = adopt(out.batch_written);
+        if (out.switched) {
+            if (out.sw.replaced) {
+                ++switches_.joiner_switches;
+                switches_.joiner_lost += out.sw.lost;
+            } else {
+                ++switches_.joiner_adopted;
+            }
+            watch_own_carriers();
+        }
         return out;
     }
     // Both halves in one call (the KATs' single-threaded form).
@@ -669,6 +793,21 @@ public:
         std::uint64_t objects = 0;
     };
     std::vector<PlacedRelease> take_placed_released() { return std::exchange(placed_released_, {}); }
+    // The outcomes of the carriers the node placed on its own, since the last call: the released carriers a drain ran
+    // (drain_released; at most the release queue's length per drain) and the walked carriers a bind placed
+    // (bind_walked_branch; at most the walked ids). The sender, the action, the row and verdict, the omissions and the
+    // switch counts, for the relay's accounting of a received frame (the verdict by row, the omission log, the switch
+    // line).
+    struct DrainedResult {
+        std::uint64_t peer = 0;
+        NodeAction action = NodeAction::None;
+        RowId row = RowId::None;
+        AdmitVerdict verdict = AdmitVerdict::Defer;
+        std::uint64_t omitted = 0;
+        std::uint64_t repended = 0;
+        std::uint64_t lost = 0;
+    };
+    std::vector<DrainedResult> take_drained() { return std::exchange(drained_, {}); }
     // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
     // call: the caller relays them as FB_RECEIPTS v3 (a receipt no longer pending then is skipped there).
     std::vector<Hash32> take_repended() { return std::exchange(repended_out_, {}); }
@@ -765,7 +904,9 @@ public:
                         break;
                     }
                     if (r.verdict == AdmitVerdict::AdmitCarrier) {
-                        (void)settle_carrier(servers[k], *frame, r, false);
+                        const NodeEventResult sr = settle_carrier(servers[k], *frame, r, false);
+                        drained_.push_back(DrainedResult{servers[k], sr.action, sr.admit.row, sr.admit.verdict, sr.omitted,
+                                                         sr.repended, sr.lost});
                         if (tree_->find(id) != nullptr) {
                             out.placed.push_back(id);
                             progress = true;
@@ -1037,6 +1178,11 @@ public:
             c.carried = job.carried;
             const std::optional<std::vector<std::uint8_t>> f = encode_fc_carrier(cfg_.identity.chain_id, c, cfg_.p.r_max);
             if (f) out = complete_carrier(begin_carrier(kOwnPeer, *f, false));
+            if (out.action == NodeAction::Placed || out.action == NodeAction::Switched)
+                if (const CarrierNode* n = tree_->find(own_id); n != nullptr && store_->best_at(n->pos) == own_id) {
+                    own_watch_[own_id] = n->pos;
+                    ++own_carriers_;
+                }
         } else {
             std::vector<std::uint8_t> body;
             encode_receipt_body_v3(r, body);
@@ -1770,7 +1916,16 @@ private:
 
     TipWindow window_of(const Hash32& tip, const Hash32& p_t, std::uint8_t v) {
         const Hash32 author_id = key_ref_identity(cfg_.author);
-        return windows_->get(tip, v, [&] { return evaluate_window_at(*store_, tip, p_t, *io_.monero, v, author_id); });
+        return windows_->get(tip, v, [&] {
+            TipWindow w = evaluate_window_at(*store_, tip, p_t, *io_.monero, v, author_id);
+            if (w.ok()) {  // each window evaluated once (the cache): what fired
+                ++win_flags_.evaluated;
+                win_flags_.n_dropped_bins += w.n_dropped_bins ? 1 : 0;
+                win_flags_.n_cut_position += w.n_cut_position ? 1 : 0;
+                win_flags_.merged_back += w.merged_back ? 1 : 0;
+            }
+            return w;
+        });
     }
 
     BucketsAnchor anchor_of(const Hash32& at) const {
@@ -2257,6 +2412,7 @@ private:
         own_refs_.clear();
         own_prefix_.clear();
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
+        repend_watch_.clear();  // the re-pended receipts left with the pending set
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
         header_req_.clear();
         assemblies_.clear();
@@ -2265,6 +2421,7 @@ private:
         release_q_.clear();
         rx_failed_.clear();
         placed_released_.clear();
+        drained_.clear();
         resumed_x1_.reset();
         resumed_claimed_.clear();
         jbelow_.clear();
@@ -2461,6 +2618,8 @@ private:
                 try {
                     const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
                     const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
+                    drained_.push_back(DrainedResult{f.peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended,
+                                                     r.lost});
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
@@ -2492,9 +2651,12 @@ private:
         }
         for (const ReceiptBodyV3& b : r.carrier->carried) learn_refs(b);
         learn_refs(r.carrier->own);
+        // a peer's carrier's omissions at its parent, counted at its first placement (a copy of a placed carrier: none)
+        const std::uint64_t omitted = peer != kOwnPeer && tree_->find(r.id) == nullptr ? omissions_of(r) : 0;
         NodeStore ns{*store_, faults_};
         WriteResult w = place_admitted(*tree_, ns, *ar_, *bodies_, r, &alarm_);
         out.write = w.outcome;
+        if (w.outcome != WriteOutcome::NodeInternal) out.omitted = omitted;
         switch (w.outcome) {
             case WriteOutcome::NodeInternal:
                 // a store write failure of 3.3: the store poisoned, templates stop, the joiner path at the next start
@@ -2598,7 +2760,78 @@ private:
         const LaneView v = store_->view_at(store_->best_tip());
         if (!v.ok()) return;
         const std::uint64_t H = v.record(v.pos());
-        pending_.erase_if([&](const PendingReceipt& r) { return v.placed_open(r.id) || !open_at(H, r.h, cfg_.p.open_bins); });
+        pending_.erase_if([&](const PendingReceipt& r) {
+            const bool placed = v.placed_open(r.id);
+            const bool gone = placed || !open_at(H, r.h, cfg_.p.open_bins);
+            if (gone && repend_watch_.erase(r.id) != 0) ++(placed ? switches_.carried : switches_.sealed_pending);
+            return gone;
+        });
+        for (auto it = repend_watch_.begin(); it != repend_watch_.end();) {  // evicted from the pending set meanwhile
+            if (pending_.holds(*it)) {
+                ++it;
+                continue;
+            }
+            ++switches_.evicted;
+            it = repend_watch_.erase(it);
+        }
+        watch_own_carriers();
+    }
+
+    // Each watched own carrier: orphaned when the best chain no longer holds it at its position; confirmed (no longer
+    // watched) once it is below the journal base.
+    void watch_own_carriers() {
+        const std::uint64_t base = store_->base_pos();
+        for (auto it = own_watch_.begin(); it != own_watch_.end();) {
+            const std::optional<Hash32> at = store_->best_at(it->second);
+            if (!at || *at != it->first) {
+                ++own_orphaned_;
+                it = own_watch_.erase(it);
+            } else if (it->second < base) {
+                it = own_watch_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // The receipts this node holds pending that a carrier with room for more (fewer than R_MAX carried) did not carry
+    // although the honest carried list at its parent holds them (E3, carried_list's predicate at the carrier's parent):
+    // the origin bin open there, h(r) <= h(c) + Fresh, not placed on the parent's chain, the tip's branch passing the
+    // S3b-4a walk from it (on the chain, or placed within J_0); never a receipt whose tip is the carrier's parent: it
+    // competes for the carrier's own position, so the carrier could not carry it; never the carrier's own receipt, also
+    // when a copy with its id holds another tip (a joined node does not run #12 for a tip below x1, D35)
+    // (carried_omissions; S2.3 #14).
+    std::uint64_t omissions_of(const AdmitResult& a) {
+        const CarrierBodyV3& c = *a.carrier;
+        if (c.carried.size() >= cfg_.p.r_max) return 0;
+        if (a.store_placements.empty()) return 0;
+        const Hash32& parent = c.own.side.tip;
+        const LaneView pv = store_->view_at(parent);
+        if (!pv.ok()) return 0;
+        const std::uint64_t H = pv.record(pv.pos());
+        const std::uint64_t h_c = a.store_placements.back().bin;  // the own body's origin bin
+        const Hash32 own = receipt_id(c.own);
+        std::vector<Hash32> carried;
+        for (const ReceiptBodyV3& b : c.carried) carried.push_back(receipt_id(b));
+        const AdmitEnv e = env();
+        std::optional<OwnChain> chain;  // the walk from the parent, built at the first receipt that needs it
+        std::optional<ClosureWalk> walk;
+        std::vector<Hash32> known;
+        for (const PendingReceipt* p : pending_.all()) {
+            if (p->body.side.tip == parent) continue;  // competes for the carrier's own position
+            if (p->id == own) continue;
+            if (!open_at(H, p->h, cfg_.p.open_bins)) continue;
+            if (!carried_upper_ok(p->h, h_c, cfg_.p.fresh_max)) continue;
+            if (pv.placed_open(p->id)) continue;
+            if (!walk) {
+                chain.emplace(e, parent);
+                walk.emplace(e, *chain);
+            }
+            const WalkResult w = walk->walk_tip(p->body.side.tip);
+            if (w.v != WalkVerdict::OnChain && w.v != WalkVerdict::Placed) continue;  // Boundary, Closure, not held
+            known.push_back(p->id);
+        }
+        return carried_omissions(carried, known);
     }
 
     // ---- E11: a switch by the journal, with the re-pend step ----
@@ -2687,6 +2920,7 @@ private:
                 if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) {
                     ++out.repended;
                     repended_out_.push_back(rid);  // relayed as FB_RECEIPTS v3 (take_repended)
+                    repend_watch_.insert(rid);
                 }
             }
         }
@@ -2741,7 +2975,16 @@ private:
     std::deque<ParkedFrame> release_q_;
     std::vector<ParkedFrame> rx_failed_;  // released carriers whose admission failed with a RandomX failure
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
+    std::vector<DrainedResult> drained_;          // the outcomes of the drained and walk-bound carriers (take_drained)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
+    std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
+    std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos
+    std::uint64_t own_carriers_ = 0;
+    std::uint64_t own_orphaned_ = 0;
+    WindowFlagCounts win_flags_;
+    mutable std::uint64_t open_state_calls_ = 0;
+    StatusSample sample_;                    // the status line's open state and liveness (status_sample)
+    std::optional<std::uint64_t> sample_s_;  // when they were computed
     std::map<std::uint64_t, U128> jbelow_;      // a joined node: the bound work its prunes moved below the floor
     std::set<std::uint64_t> jbelow_unwritten_;  // its heights not yet in the store
     std::uint64_t jbelow_done_ = 0;             // the positions below this one are in jbelow_

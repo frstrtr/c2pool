@@ -109,6 +109,7 @@ struct Window {
     Work W{};
     std::vector<BucketRow> rows;    // one per (miner, owner) group, pre-merge-back
     bool empty_finder_only = false; // no window payee: one output of R to the finder
+    bool merged_back = false;       // output only (logs): an owner or the author, below the floor, was merged back
 };
 
 namespace detail_win {
@@ -230,6 +231,7 @@ inline Window resolve_rows(std::vector<BucketRow> rows, const Work& W, std::uint
             if (r.owner == oid) miner_w[r.miner] += r.w_owner;
         owner_w[oid] = Work{};  // merged back: no owner share
     }
+    w.merged_back = !owners_merging.empty() || (have_author && !author_w.is_zero() && author_merges);
     if (author_merges) {
         for (const BucketRow& r : w.rows) miner_w[r.miner] += r.w_author;
     }
@@ -431,6 +433,10 @@ struct WinEval {
     Window window;
     std::uint64_t read = 0;        // bins read from the source
     std::uint64_t oldest_bin = 0;  // the oldest bin left in the window (0: none)
+    // output only (logs; never a digest, verdict, coinbase or wire value): the N rule dropped the oldest bins; the
+    // newest bin was cut by carrier position
+    bool n_dropped_bins = false;
+    bool n_cut_position = false;
 };
 
 // window(source, D_net, B, f_spend, N, author): the whole payout window (D2.7
@@ -461,8 +467,10 @@ inline WinEval window_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64
             if (pc.count() > N) break;
         }
         if (k >= 1) {
+            if (k < sel.size()) out.n_dropped_bins = true;
             sel.resize(k);  // the oldest bins leave the window
         } else {
+            if (sel.size() > 1) out.n_dropped_bins = true;
             sel.resize(1);
             if (sel.front().sealed != nullptr) {
                 out.status = WinStatus::SealedCut;
@@ -478,6 +486,7 @@ inline WinEval window_from(Pull&& pull, DNet D_net, std::uint64_t B, std::uint64
                 if (cut.count() > N) break;  // monotone: once over N, no later prefix fits
                 keep = i + 1;
             }
+            if (keep < e.size()) out.n_cut_position = true;
             e.resize(keep);
         }
     }

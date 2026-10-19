@@ -162,6 +162,85 @@ static void s3b_n_count_after_shares() {
           "(iii) N 3: payees {A, B, author} fill N, bin 1 (C) leaves the window");
 }
 
+// The WinEval outputs that enter results: status, missing bin, bins read, oldest bin, weights, W, rows, finder-only.
+static void put_u64(std::vector<std::uint8_t>& o, std::uint64_t x) {
+    for (int i = 0; i < 8; ++i) o.push_back(static_cast<std::uint8_t>(x >> (8 * i)));
+}
+static void eval_bytes(const pb::WinEval& e, std::vector<std::uint8_t>& o) {
+    o.push_back(static_cast<std::uint8_t>(e.status));
+    put_u64(o, e.missing_bin);
+    put_u64(o, e.read);
+    put_u64(o, e.oldest_bin);
+    for (const auto& [id, w] : e.window.weight) {
+        o.insert(o.end(), id.begin(), id.end());
+        const auto lw = pb::le256(w);
+        o.insert(o.end(), lw.begin(), lw.end());
+    }
+    const auto lW = pb::le256(e.window.W);
+    o.insert(o.end(), lW.begin(), lW.end());
+    for (const pb::BucketRow& r : e.window.rows) {
+        const auto rb = pb::bucket_row_bytes(r);
+        o.insert(o.end(), rb.begin(), rb.end());
+    }
+    o.push_back(e.window.empty_finder_only ? 1 : 0);
+}
+
+// winflags: four windows (the N rule drops the oldest bin; the newest bin cut by position; an owner and the author
+// merged back; none of them): the WinEval results are byte-identical to the recorded golden.
+static pb::WinEntry flagged(std::uint64_t miner, std::uint64_t pos) {
+    pb::WinEntry e;
+    e.miner = id_of(miner);
+    e.work = 20000;
+    e.position = pos;
+    e.id = id_of(0x2000 + miner);
+    return e;
+}
+static void s4w_winflags() {
+    const std::uint64_t f = pb::f_spend(kB, 300000, 16);
+    std::vector<pb::WinEval> ev;
+    {   // the N rule: N 3 over {A, B, author} in bin 2: bin 1 leaves
+        pb::WinEntry a = flagged(0x1A, 31), b = flagged(0x1B, 30), c = flagged(0x1C, 10);
+        a.give_author_bp = 10;
+        const std::vector<pb::WinBin> bins{{2, {a, b}}, {1, {c}}};
+        ev.push_back(pb::window_from(pb::ListedBins{bins}, kHugeDnet, kB, f, 3, id_of(0xAA)));
+    }
+    {   // the position cut: one bin of five payees, N 3
+        std::vector<pb::WinEntry> es;
+        for (std::uint64_t i = 0; i < 5; ++i) es.push_back(flagged(0x30 + i, 50 - i));
+        const std::vector<pb::WinBin> bins{{5, es}};
+        ev.push_back(pb::window_from(pb::ListedBins{bins}, kHugeDnet, kB, f, 3, pb::Hash32{}));
+    }
+    {   // merge-back: an owner at p 1 bp and the author at 10 bp, both below the floor
+        pb::WinEntry x = flagged(0x40, 20);
+        x.owner = id_of(0x41);
+        x.p = 1;
+        x.give_author_bp = 10;
+        pb::WinEntry heavy = flagged(0x42, 19);
+        heavy.work = 900000000;  // the owner's and the author's shares of R fall below f_spend (within W_max)
+        const std::vector<pb::WinBin> bins{{7, {x, heavy}}};
+        ev.push_back(pb::window_from(pb::ListedBins{bins}, kHugeDnet, kB, f, 3747, id_of(0xAA)));
+    }
+    {   // none: two bins, no cut, no merge
+        const std::vector<pb::WinBin> bins{{9, {flagged(0x50, 40)}}, {8, {flagged(0x51, 39)}}};
+        ev.push_back(pb::window_from(pb::ListedBins{bins}, kHugeDnet, kB, 1, 3747, pb::Hash32{}));
+    }
+    std::vector<std::uint8_t> all;
+    for (const pb::WinEval& e : ev) eval_bytes(e, all);
+    const std::string d = hx(::v37::sha256d(all));
+    check(d == "fa4df7b6b5f126464aed337100fcefdad1db90e26f303fbfa51d7a9f75dae0cc", "winflags: the WinEval results of the four windows equal the golden (" + d + ")");
+    check(ev.size() == 4 && ev[0].n_dropped_bins && !ev[0].n_cut_position && !ev[1].n_dropped_bins && ev[1].n_cut_position
+                  && ev[2].window.merged_back && !ev[2].n_dropped_bins && !ev[2].n_cut_position && !ev[3].n_dropped_bins
+                  && !ev[3].n_cut_position && !ev[3].window.merged_back && !ev[0].window.merged_back,
+          "winflags: the N rule dropped a bin (1st), cut the newest bin by position (2nd), a merge-back (3rd), none (4th):"
+                  + [&] {
+                        std::string f;
+                        for (const pb::WinEval& e : ev)
+                            f += " " + std::to_string(e.n_dropped_bins) + std::to_string(e.n_cut_position) +
+                                 std::to_string(e.window.merged_back) + "/" + std::to_string(e.window.weight.size());
+                        return f;
+                    }());
+}
+
 // (iv) the (tip, v) window cache.
 static void s3b_window_cache() {
     const pb::LaneParams P = pb::kRuledLaneParams;
@@ -340,6 +419,7 @@ int main() {
     run_part("s3b_n_count_after_shares", s3b_n_count_after_shares);
     run_part("s3b_window_cache", s3b_window_cache);
     run_part("s3b_dnet_u128", s3b_dnet_u128);
+    run_part("s4w_winflags", s4w_winflags);
 
     return finish("xmr_window_kat");
 }

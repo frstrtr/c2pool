@@ -410,7 +410,7 @@ void HttpSession::process_request()
             else if (target == "/connected_miners")
                 rest_result = mining_interface_->rest_connected_miners();
             else if (target == "/stratum_stats")
-                rest_result = mining_interface_->rest_stratum_stats();
+                rest_result = mining_interface_->rest_stratum_stats(is_direct_local());
             else if (target == "/global_stats")
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
@@ -535,19 +535,19 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_user_stales();
             else if (target == "/peer_addresses") {
                 response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_peer_addresses();
+                response.body() = mining_interface_->rest_peer_addresses(is_direct_local());
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;
             }
             else if (target == "/peer_versions")
-                rest_result = mining_interface_->rest_peer_versions();
+                rest_result = mining_interface_->rest_peer_versions(is_direct_local());
             else if (target == "/peer_txpool_sizes")
-                rest_result = mining_interface_->rest_peer_txpool_sizes();
+                rest_result = mining_interface_->rest_peer_txpool_sizes(is_direct_local());
             else if (target == "/peer_list")
-                rest_result = mining_interface_->rest_peer_list();
+                rest_result = mining_interface_->rest_peer_list(is_direct_local());
             else if (target == "/pings")
-                rest_result = mining_interface_->rest_pings();
+                rest_result = mining_interface_->rest_pings(is_direct_local());
             else if (target == "/stale_rates")
                 rest_result = mining_interface_->rest_stale_rates();
             else if (target == "/node_info")
@@ -602,7 +602,7 @@ void HttpSession::process_request()
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")
-                rest_result = mining_interface_->rest_ban_stats();
+                rest_result = mining_interface_->rest_ban_stats(is_direct_local());
             else if (target == "/stratum_security")
                 rest_result = mining_interface_->rest_stratum_security();
             else if (target == "/best_share")

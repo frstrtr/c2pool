@@ -177,6 +177,10 @@ struct TipWindow {
     Hash32 mmr_root{};          // mmr_root_at(t) on t's chain
     std::uint64_t bins_read = 0;   // bins read newest first from H(pos(t)) + Fresh
     std::uint64_t oldest_bin = 0;  // the oldest bin in the window (0: none)
+    // output only (logs): the N rule dropped bins / cut the newest bin by position; a merge-back fired
+    bool n_dropped_bins = false;
+    bool n_cut_position = false;
+    bool merged_back = false;
 
     bool ok() const noexcept { return defer == WindowDefer::None && window != nullptr; }
 };
@@ -221,6 +225,9 @@ inline TipWindow tip_window(const BinStore& s, const Hash32& t, const WindowPara
     WinEval e = window_from(src, wp.d_net, wp.B, wp.f_spend, wp.N, wp.author);
     out.bins_read = e.read;
     out.oldest_bin = e.oldest_bin;
+    out.n_dropped_bins = e.n_dropped_bins;
+    out.n_cut_position = e.n_cut_position;
+    out.merged_back = e.window.merged_back;
     if (e.status != WinStatus::Ok) {
         out.defer = defer_of(e.status);
         out.missing_bin = e.missing_bin;

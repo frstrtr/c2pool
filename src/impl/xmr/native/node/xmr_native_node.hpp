@@ -320,6 +320,8 @@ struct NativeNodeConfig {
     // FORK-FUSE-2: the unknown-fork watch's stall period
     // (ChainIndexOptions::unknown_fork_stall_ms). 0 = the 30 min default.
     std::uint64_t            unknown_fork_stall_ms = 0;
+    // The alt store's block count (ChainIndexOptions::alt_max_blocks). 0 = its default (k_alt).
+    std::size_t              alt_max_blocks = 0;
 
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
@@ -1475,6 +1477,7 @@ private:
         o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
         o.consumer_window = cfg_.consumer_window;   // COLD-BOOT-2
         if (cfg_.unknown_fork_stall_ms) o.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
+        if (cfg_.alt_max_blocks) o.alt_max_blocks = cfg_.alt_max_blocks;
         return o;
     }
 

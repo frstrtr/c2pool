@@ -121,7 +121,7 @@ const std::vector<std::string> kAllFlags = {
         "--native-allow-unverified-pow", "--native-seeds", "--seeds", "--native-parity-monerod", "--native-snapshot-path",
         "--native-snapshot-every", "--native-catchup-window", "--native-backlog-refresh", "--backlog-refresh",
         "--anchor-confirm-peers", "--anchor-confirm-timeout-ms", "--anchor-confirm-peer-ms", "--native-ready-timeout",
-        "--native-template-fallback",
+        "--native-template-fallback", "--alt-max-blocks", "--alt-max-bytes",
         // Path B
         "--pool-genesis-from", "--pool-genesis-height", "--vote", "--journal-depth", "--pathb-launch",
         "--pathb-deployments", "--pathb-key-cache-mb", "--pathb-penalty-fill", "--pathb-body-keep",
