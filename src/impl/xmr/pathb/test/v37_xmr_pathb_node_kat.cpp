@@ -208,7 +208,34 @@
 //                it alarmed, no token; the next attempt joins;
 //   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
 //                its own with a rig set, a kind-2 file for epoch 1 accepted
-//                at fixed = start + GRACE, refused off regtest.
+//                at fixed = start + GRACE, refused off regtest;
+//   jobslot      the CPU miner's own slot: a job on every template after
+//                66,000 stratum binds; every bind taken by its get_job (no
+//                template, make_job failed, a cached job, an issue); a skip
+//                counted once per template, none under a HOLD;
+//   ctxgate      frames parked on a Monero input run again per (cause, id)
+//                only when that input is held: no storm on a P_r held
+//                without its weights, no context asked for it; the seed;
+//                the seal sweep by the frame's own P_r;
+//   parkidx      the park index keeps only objects that wait: frames
+//                evicted past the deferred store's cap leave it (at most
+//                the cap more indexed);
+//   catchjoin    a store not caught up whose catch-up step stays deferred
+//                on a P_r no node serves: the record stays, the tip offered
+//                to the joiner after kCtxTtlMs, the pair paced on that P_r;
+//   catchwalk    the same past position 0: a parent walk places the
+//                carriers below the P_r no node serves; the tip is still
+//                offered to the joiner after kCtxTtlMs and attempted;
+//   catchgate    the template gate of a store not caught up: the first
+//                round in flight, verified headers whose bodies are in
+//                flight; a node caught up keeps its templates;
+//   catchrestart the record across a restart; a launch node writes none;
+//   catchlocator the catch-up's locator steps after a partition;
+//   floorpr      the floor reading of #9: a carrier on a P_r held without
+//                its weights admitted; one above the floor DEFERs with no
+//                context and passes on the exact weights; #12 stays exact;
+//                a join replay on a band DEFER ends NotServed (no fetch, no
+//                loop) and waits on the weights.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1946,11 +1973,12 @@ struct KatRelay {
 };
 
 // A relay node in manual mode on the harness's clock with its own PathbNode (a load failure when `failed`;
-// `tweak`: its options changed; `cfg_tweak`: its node's configuration; `io_tweak`: its node's I/O).
+// `tweak`: its options changed; `cfg_tweak`: its node's configuration; `io_tweak`: its node's I/O; `persist`: an empty
+// store of its own in h.kvs).
 KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch, bool failed = false,
                    const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr,
                    const std::function<void(pb::PathbNodeConfig&)>& cfg_tweak = nullptr,
-                   const std::function<void(pb::PathbNodeIo&)>& io_tweak = nullptr) {
+                   const std::function<void(pb::PathbNodeIo&)>& io_tweak = nullptr, bool persist = false) {
     KatRelay k;
     k.links = std::make_unique<FakeLinks>();
     k.links->wire = &w;
@@ -1974,6 +2002,9 @@ KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch
     if (failed) {
         h.kvs.push_back(std::make_unique<MemoryKv>());
         h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    } else if (persist) {
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), h.kvs.back().get()));
     } else {
         h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io)));
     }
@@ -3412,7 +3443,7 @@ void relaytip() {
     watchdog(d1, "from the follower's thread");
     follower.join();
     const std::size_t a1 = r.parked_index_size();
-    r.test_parked(1, pb::Missing::MoneroBlock, seq32(0x63), seq32(0x64));
+    r.test_parked(1, pb::Missing::MoneroBlock, seq32(0x63), mon_block(kPoolH));  // a P_r the follower resolves
     const std::size_t i2 = r.parked_index_size();
     std::atomic<bool> d2{false};
     std::thread hook([&] {
@@ -4762,17 +4793,38 @@ void relayrpark() {
 // three on a Monero block M that B's follower does not hold yet. B's catch-up from A's HELLO reaches the first header on
 // M: the reply DEFERs; B wants M (FB_GETCTX, the carrier class) and asks the headers again once M resolves (here the
 // follower's chain moving to M): B reaches A's tip with no strike and no ban.
+// The follower's rows with some blocks not held (Monero blocks this node has not seen).
+struct HiddenRows final : pb::IMoneroRows {
+    const pb::IMoneroRows& inner;
+    const std::set<pb::Hash32>& hidden;
+    HiddenRows(const pb::IMoneroRows& i, const std::set<pb::Hash32>& h) : inner(i), hidden(h) {}
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.block(id);
+    }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
+        return inner.block_at_or_below_anchor(height);
+    }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.weights(id);
+    }
+    pb::BranchBlock anchor() const override { return inner.anchor(); }
+    pb::Hash32 main_tip() const override { return inner.main_tip(); }
+};
+
 void relayhdrctx() {
     const KatNet net;
     Harness h(net);
     FakeWire w;
     std::set<pb::Hash32> hidden;  // Monero blocks B's follower does not hold
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
     KatRelay a = kat_relay(h, w, table0(net), true);
-    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&hidden](pb::PathbNodeIo& io) {
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&hidden, &hview](pb::PathbNodeIo& io) {
         const auto inner = io.resolve_pr;
         io.resolve_pr = [inner, &hidden](const pb::Hash32& p_r) {
             return hidden.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);
         };
+        io.monero = &hview;
     });
     bool mined = true;
     for (int i = 0; i < 6; ++i) {
@@ -6454,6 +6506,956 @@ void relayjoint() {
     ra.stop();
 }
 
+// ---------------------------------------------------------------------------
+// ctxgate: a frame parked on a Monero input runs again only when that input is held, per (cause, id):
+//   storm   ten sibling carriers whose own P_r S the follower holds without its weights (a bodiless alternative):
+//           50 follower events run none of them again (one context asked for S); a DEFER waiting for the weights of
+//           a held block asks none;
+//   target  S's weights recorded: one event runs each of S's ten once and places them; a key on another P_r S2
+//           without its weights stays;
+//   seed    a key on a P_r whose seed is not known stays until the seed is known;
+//   sweep   a frame parked on its own P_r X and indexed again on an older P_r Y (a carried receipt's) survives Y's
+//           seal and is dropped without strike at X's.
+struct SiblingFrame {
+    pb::Hash32 id{};
+    std::vector<std::uint8_t> frame;
+};
+SiblingFrame sibling_frame(Harness& h, std::size_t node, std::size_t payee, std::uint32_t nonce) {
+    SiblingFrame s;
+    const std::optional<pb::PathbJob> j = h.job(node, payee, nonce);
+    if (!j) return s;
+    pb::CarrierBodyV3 c;
+    c.own = j->body;
+    c.own.blob.nonce = nonce;
+    c.carried = j->carried;
+    s.id = pb::receipt_id(c.own);
+    s.frame = pb::encode_fc_carrier(0, c, 16).value_or(std::vector<std::uint8_t>{});
+    return s;
+}
+std::function<void(pb::PathbNodeIo&)> hide_inputs(std::set<pb::Hash32>& noweights, std::set<pb::Hash32>& noseed) {
+    return [&noweights, &noseed](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner, &noweights](const pb::Hash32& p_r) {
+            return noweights.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);  // held, its RowWeights not recorded
+        };
+        const auto seed = io.seed_of;
+        io.seed_of = [seed, &noseed](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
+            if (noseed.count(p_r) != 0) return std::nullopt;
+            return seed(p_r);
+        };
+    };
+}
+// ---------------------------------------------------------------------------
+// parkidx: the park index keeps a digest only while its object waits. A's carriers on a P_r B does not resolve park at
+// B, indexed under (MoneroBlock, S). With B's deferred store capped at 4, three times as many frames (12): the store
+// evicts past 4, and the index keeps at most the store's frames and 4 more (the prune once 4 digests were indexed);
+// a disconnect of A drops no parked frame (only its ask records), and the index keeps the frames the store holds.
+void parkidx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights, noseed;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.waiting_cap = 4; },
+                           hide_inputs(noweights, noseed));
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1500 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    h.tick_monero();
+    const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S);
+    std::size_t peak = 0;
+    for (std::uint32_t k = 0; k < 12; ++k) {
+        const SiblingFrame f = sibling_frame(h, a.node, k % 5, 1600 + k);
+        b.relay->receive(1, f.frame);
+        w.run();
+        peak = std::max(peak, b.relay->parked_index_size());
+    }
+    const std::size_t idx = b.relay->parked_index_size();
+    const std::size_t held = h[b.node].deferred().size();
+    for (const std::uint64_t p : b.links->peer_ids()) b.links->disconnect(p);
+    w.run();
+    const std::size_t idx_gone = b.relay->parked_index_size();
+    check(ok && held == 4 && peak <= 8 && idx <= 8 && idx >= held && idx_gone == idx,
+          "parkidx: twelve frames on a P_r B does not resolve past a deferred store of 4: at most 4 + 4 indexed (peak " +
+                  std::to_string(peak) + ", end " + std::to_string(idx) + ", held " + std::to_string(held) +
+                  "); A's disconnect keeps the held frames indexed (" + std::to_string(idx_gone) + ")");
+}
+
+void ctxgate() {
+    const KatNet net;
+    {
+        Harness h(net);
+        FakeWire w;
+        std::set<pb::Hash32> noweights, noseed;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+        bool ok = true;
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1100 + static_cast<std::uint32_t>(i));
+        }
+        w.connect(0, 1);
+        w.run();
+        ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+        h.tick_monero();
+        const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+        noweights.insert(S);
+        pb::PathbRelayNode& rb = *b.relay;
+        const std::uint64_t wanted0 = rb.stats().ctx_wanted.load();
+        std::vector<pb::Hash32> sib;
+        for (std::uint32_t k = 0; k < 10; ++k) {
+            const SiblingFrame f = sibling_frame(h, a.node, k % 5, 1200 + k);
+            sib.push_back(f.id);
+            rb.receive(1, f.frame);
+            w.run();
+        }
+        const std::size_t parked = rb.parked_ctx_size(pb::Missing::MoneroBlock, S);
+        const std::uint64_t r0 = rb.stats().parked_reruns.load();
+        for (int k = 0; k < 50; ++k) {
+            rb.on_monero_tip();
+            w.run();
+            h.now += 1;
+            rb.tick();
+            w.run();
+        }
+        const std::uint64_t storm = rb.stats().parked_reruns.load() - r0;
+        std::printf("  ctxgate: parked on S %zu; re-runs over 50 events %llu; contexts wanted %llu; held %llu\n", parked,
+                    (unsigned long long)storm, (unsigned long long)(rb.stats().ctx_wanted.load() - wanted0),
+                    (unsigned long long)rb.stats().ctx_held.load());
+        check(ok && parked == 10 && storm == 0 && rb.parked_ctx_size(pb::Missing::MoneroBlock, S) == 10
+                      && rb.stats().ctx_wanted.load() <= wanted0 + 1,
+              "ctxgate: ten carriers on a P_r held without its weights: 50 follower events run none again, one context "
+              "asked (" + std::to_string(storm) + " re-runs, " + std::to_string(rb.stats().ctx_wanted.load() - wanted0) +
+                      " wanted)");
+        // a DEFER waiting for the weights of a block the follower holds asks no context
+        const std::uint64_t held0 = rb.stats().ctx_held.load(), wanted1 = rb.stats().ctx_wanted.load();
+        rb.test_parked(1, pb::Missing::MissingWeights, seq32(0x70), S);
+        check(rb.stats().ctx_held.load() == held0 + 1 && rb.stats().ctx_wanted.load() == wanted1
+                      && rb.parked_ctx_size(pb::Missing::MissingWeights, S) == 1,
+              "ctxgate: a DEFER for the weights of a held block asks no context");
+        // target: a key on S2 (held, no weights) stays when S resolves
+        const pb::Hash32 S2 = mon_block(kPoolH + 3);
+        noweights.insert(S2);
+        rb.test_parked(1, pb::Missing::MoneroBlock, seq32(0x71), S2);
+        noweights.erase(S);
+        const std::uint64_t r1 = rb.stats().parked_reruns.load();
+        rb.on_monero_tip();
+        w.run();
+        std::size_t placed = 0;
+        for (const pb::Hash32& id : sib) placed += h[b.node].tree().find(id) != nullptr ? 1 : 0;
+        check(rb.stats().parked_reruns.load() - r1 == 10 && placed == 10
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, S) == 0
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, S2) == 1 && rb.stats().strikes.load() == 0,
+              "ctxgate: S's weights recorded: one event runs S's ten once and places them (" + std::to_string(placed) +
+                      "); the key on S2 stays");
+        // seed: a key on a P_r whose seed is not known
+        const pb::Hash32 S3 = mon_block(kPoolH + 4);
+        noseed.insert(S3);
+        rb.test_parked(1, pb::Missing::Seed, seq32(0x72), S3);
+        for (int k = 0; k < 5; ++k) rb.on_monero_tip();
+        const std::size_t kept = rb.parked_ctx_size(pb::Missing::Seed, S3);
+        noseed.erase(S3);
+        rb.on_monero_tip();
+        check(kept == 1 && rb.parked_ctx_size(pb::Missing::Seed, S3) == 0,
+              "ctxgate: a key on a P_r with no seed stays through five events and runs once its seed is known");
+    }
+    {  // sweep
+        Harness h(net);
+        FakeWire w;
+        std::set<pb::Hash32> noweights, noseed;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1400 + static_cast<std::uint32_t>(i));
+        }
+        w.connect(0, 1);
+        w.run();
+        ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+        h.tick_monero();
+        const pb::Hash32 X = h[a.node].make_template(h.now).p_r;
+        const pb::FollowerBranchView mon(net.rows);
+        const std::optional<pb::BranchBlock> bx = mon.block(X);
+        const std::uint64_t hx = bx ? bx->height : 0;
+        const pb::Hash32 Y = mon_block(hx - 40);
+        noweights.insert(X);
+        noweights.insert(Y);
+        pb::PathbRelayNode& rb = *b.relay;
+        rb.receive(1, sibling_frame(h, a.node, 1, 1500).frame);
+        w.run();
+        const std::set<pb::Hash32> ds = rb.parked_ctx_digests(pb::Missing::MoneroBlock, X);
+        ok = ok && hx != 0 && ds.size() == 1;
+        if (!ok) {
+            check(false, "ctxgate: sweep setup (a frame parked on its own P_r)");
+            return;
+        }
+        const pb::Hash32 d = *ds.begin();
+        rb.test_parked(1, pb::Missing::MoneroBlock, d, Y);  // also DEFERred on an older P_r (a carried receipt's)
+        const std::uint64_t F = pb::kRuledLaneParams.open_bins;
+        bool kept_past_y = true, y_passed = false, dropped = false;
+        h.tick_monero(2);
+        for (std::uint32_t i = 0; i < 160 && !dropped; ++i) {
+            h.tick_monero();
+            (void)mine_on(h, w, b.node, i % 5, 1600 + i);
+            rb.tick();
+            w.run();
+            const std::uint64_t H = h[b.node].best_record().value_or(0);
+            const bool held = h[b.node].deferred().holds(d);
+            if (H >= hx - 40 + 1 + F && H < hx + 1 + F) {
+                y_passed = true;
+                kept_past_y = kept_past_y && held;
+            }
+            if (H >= hx + 1 + F) dropped = !held;
+        }
+        check(y_passed && kept_past_y && dropped && rb.stats().parked_frames_sealed.load() == 1
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, X) == 0 && rb.stats().strikes.load() == 0,
+              "ctxgate: a frame indexed on an older P_r survives that bin's seal and is dropped without strike at its own "
+              "P_r's (sealed " + std::to_string(rb.stats().parked_frames_sealed.load()) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// catchjoin: a store not caught up (its record K_NCU) whose catch-up DEFERs on a P_r no node serves, before any PoW:
+// the record stays (no reply that DEFERs ends the catch-up), templates continue with the unverified claim noted; once
+// the step stays deferred kCtxTtlMs the peer's tip is offered to the joiner; the attempt ends NotServed on that P_r and
+// the pair waits on it (no attempt per tick); a new Path B peer releases it once; the P_r resolving releases it and
+// the node reaches the tip, caught up, its record gone.
+std::function<void(pb::PathbNodeIo&)> hide_blocks(std::set<pb::Hash32>& hidden, const pb::FollowerBranchView& view) {
+    return [&hidden, &view](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner, &hidden](const pb::Hash32& p_r) {
+            return hidden.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);
+        };
+        io.monero = &view;
+    };
+}
+// ---------------------------------------------------------------------------
+// catchwalk: a join after a parent walk. A's chain of 8 carriers; X, the P_r of positions 4..6, no node serves J. J
+// connects (its catch-up DEFERs on X); a new tip of A flooded to J is walked down: J places positions 1..3 and DEFERs
+// at 4, so J's best is past position 0 when the step's context runs out. kCtxTtlMs after the step deferred, A's tip is
+// still offered to the joiner and attempted.
+void catchwalk() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2500 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+    const std::optional<pb::Hash32> c4 = h[a.node].store().best_at(4);
+    const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+    const pb::CarrierBodyV3* b4 = c4 ? h[a.node].bodies().get(*c4) : nullptr;
+    if (!ok || b1 == nullptr || b4 == nullptr || b1->own.blob.prev_id == b4->own.blob.prev_id) {
+        check(false, "catchwalk: setup (A's chain, a P_r at 4 apart from 1's)");
+        return;
+    }
+    const pb::Hash32 X = b4->own.blob.prev_id;
+    hidden.insert(X);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview), true);
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    ok = mine_on(h, w, a.node, 1, 2590);  // A's new tip, flooded to J: walked down to the P_r J cannot resolve
+    for (int k = 0; k < 4; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    const std::uint64_t walked_pos = h[j.node].tree().best().pos;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+    }
+    const std::uint64_t offers = rj.stats().catchup_join_offers.load();
+    const std::optional<pb::JoinStep> s1 = rj.join_step();
+    w.run();
+    std::printf("  catchwalk: J walked to %llu of %llu; join offers %llu; attempts %llu\n", (unsigned long long)walked_pos,
+                (unsigned long long)h[a.node].tree().best().pos, (unsigned long long)offers,
+                (unsigned long long)rj.stats().join_attempts.load());
+    check(ok && walked_pos >= 1 && !h[j.node].caught_up() && offers >= 1 && s1 && s1->report
+                  && rj.stats().join_attempts.load() >= 1,
+          "catchwalk: J past position 0 after a parent walk (at " + std::to_string(walked_pos) +
+                  "): kCtxTtlMs after the step deferred, A's tip is offered to the joiner and attempted (offers " +
+                  std::to_string(offers) + ")");
+}
+
+void catchjoin() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2100 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+    const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+    if (!ok || b1 == nullptr) {
+        check(false, "catchjoin: setup (A's chain)");
+        return;
+    }
+    const pb::Hash32 X = b1->own.blob.prev_id;
+    hidden.insert(X);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview), true);
+    MemoryKv& kvj = *h.kvs.back();
+    const std::string ncu = pb::store_keys::ncu(0);
+    const bool rec0 = kvj.data.count(ncu) != 0;
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    const pb::TemplateStatus t1 = h[j.node].make_template(h.now).status;
+    check(rec0 && kvj.data.count(ncu) != 0 && !h[j.node].caught_up() && h[j.node].tree().best().pos == 0
+                  && rj.stats().headers_ctx_deferred.load() >= 1 && t1 != pb::TemplateStatus::CatchingUp
+                  && t1 != pb::TemplateStatus::NoPathbPeer && h[j.node].unverified_claims()
+                  && h[j.node].joiner().queue().size() == 0,
+          "catchjoin: the catch-up DEFERs on a P_r no node serves, before any PoW: not caught up, the record stays, no "
+          "template gate (the unverified claim noted), no join yet");
+    std::uint64_t offers_before = 0;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+        if (k == 116) offers_before = rj.stats().catchup_join_offers.load();  // 585 s
+    }
+    check(offers_before == 0 && rj.stats().catchup_join_offers.load() == 1 && h[j.node].joiner().queue().size() == 1,
+          "catchjoin: kCtxTtlMs after the step deferred, A's tip is offered to the joiner (" +
+                  std::to_string(rj.stats().catchup_join_offers.load()) + ")");
+    const std::optional<pb::JoinStep> s1 = rj.join_step();
+    w.run();
+    const bool ns = s1 && s1->report && s1->report->end == pb::AttemptEnd::NotServed && s1->report->unresolved_pr
+                    && *s1->report->unresolved_pr == X;
+    const std::uint64_t att1 = rj.stats().join_attempts.load();
+    for (int k = 0; k < 20; ++k) {
+        h.now += 5;
+        rj.tick();
+        w.run();
+        (void)rj.join_step();
+        w.run();
+    }
+    check(ns && h[j.node].joiner().queue().size() == 1 && h[j.node].joiner().queue().ready() == 0
+                  && rj.stats().join_attempts.load() == att1 && att1 >= 1,
+          "catchjoin: the attempt ends NotServed on that P_r; the pair waits on it: 20 ticks attempt nothing (attempts " +
+                  std::to_string(rj.stats().join_attempts.load()) + ")");
+    KatRelay c = kat_relay(h, w, table0(net), true);  // a new Path B peer
+    w.connect(2, 1);
+    w.run();
+    const bool released = h[j.node].joiner().queue().ready() == 1;
+    const std::optional<pb::JoinStep> s2 = rj.join_step();
+    w.run();
+    check(released && s2 && s2->report && s2->report->end == pb::AttemptEnd::NotServed
+                  && h[j.node].joiner().queue().ready() == 0 && !h[j.node].caught_up(),
+          "catchjoin: a new Path B peer releases the waiting pair once: one attempt, NotServed again, waiting again");
+    hidden.erase(X);
+    rj.on_monero_tip();
+    w.run();
+    for (int k = 0; k < 12 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        (void)rj.join_step();
+        w.run();
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    std::printf("  catchjoin: J at %llu of %llu; caught up %d; releases %llu; attempts %llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos,
+                h[j.node].caught_up() ? 1 : 0, (unsigned long long)rj.stats().join_releases.load(),
+                (unsigned long long)rj.stats().join_attempts.load());
+    bool rec_gone = true;
+    for (const auto& kv : h.kvs) rec_gone = rec_gone && (kv.get() != &kvj || kvj.data.count(ncu) == 0);
+    check(h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].caught_up() && rec_gone
+                  && rj.stats().join_releases.load() >= 1 && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
+          "catchjoin: the P_r resolves: the pair released, J reaches A's tip, caught up, its record gone; no token");
+    (void)c;
+}
+
+// ---------------------------------------------------------------------------
+// catchgate: the template gate of a store not caught up reads verified header work only:
+//   round     the first catch-up round in flight (a peer whose replies never come): CatchingUp; no reply within P-53
+//             ends it; a later connection never opens it again;
+//   verified  headers J verified win while their bodies are in flight: CatchingUp; no progress within P-53 lapses it,
+//             and that tip does not hold the gate again;
+//   caught    a node caught up (its record gone) whose peer reconnects every 11 s with heavier verified headers and
+//             bodies in flight: templates continue.
+pb::TemplateStatus tstatus(Harness& h, std::size_t i) { return h[i].make_template(h.now).status; }
+void catchgate() {
+    const KatNet net;
+    const auto drop = [](std::uint8_t op) {
+        return [op](FakeWire::Msg& m) {
+            if (m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == op) m.f.clear();
+        };
+    };
+    {  // round
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2300 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        w.edit = drop(pb::kOpFcHeaders);
+        w.connect(0, 1);
+        w.run();
+        const pb::TemplateStatus s1 = tstatus(h, j.node);
+        const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+        for (std::uint64_t k = 0; k <= p53 + 1; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+        }
+        const pb::TemplateStatus s2 = tstatus(h, j.node);
+        w.links[1]->disconnect(w.id(1, 0));
+        w.run();
+        w.reconnect(0, 1);
+        w.run();
+        const pb::TemplateStatus s3 = tstatus(h, j.node);
+        w.edit = nullptr;
+        check(ok && s1 == pb::TemplateStatus::CatchingUp && s2 != pb::TemplateStatus::CatchingUp
+                      && s3 != pb::TemplateStatus::CatchingUp && !h[j.node].caught_up(),
+              "catchgate: the first round in flight holds templates (CatchingUp); no reply within P-53 ends it; a later "
+              "connection does not open it again (" + std::to_string(static_cast<int>(s1)) + "/" +
+                      std::to_string(static_cast<int>(s2)) + "/" + std::to_string(static_cast<int>(s3)) + ")");
+    }
+    {  // verified
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2400 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        w.edit = drop(pb::kOpFcCarrier);
+        w.connect(0, 1);
+        w.run();
+        const pb::TemplateStatus s1 = tstatus(h, j.node);
+        const bool round_over = !h[j.node].first_round_open();
+        const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+        bool held = true;
+        for (std::uint64_t k = 0; k < p53 + 2 * p53 + 4; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+            if (k + 2 < p53) held = held && tstatus(h, j.node) == pb::TemplateStatus::CatchingUp;
+        }
+        const pb::TemplateStatus s2 = tstatus(h, j.node);
+        w.edit = nullptr;
+        check(ok && round_over && s1 == pb::TemplateStatus::CatchingUp && held && s2 != pb::TemplateStatus::CatchingUp,
+              "catchgate: verified heavier headers whose bodies are in flight hold templates; no progress within P-53 "
+              "lapses it and the same tip does not hold them again (" + std::to_string(static_cast<int>(s2)) + ")");
+    }
+    {  // caught
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2500 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        MemoryKv& kvj = *h.kvs.back();
+        w.connect(0, 1);
+        w.run();
+        for (int k = 0; k < 3; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+        }
+        const bool caught = h[j.node].caught_up() && kvj.data.count(pb::store_keys::ncu(0)) == 0
+                            && h[j.node].tree().best().id == h[a.node].tree().best().id;
+        bool cont = true;
+        for (int r = 0; r < 3; ++r) {
+            w.links[1]->disconnect(w.id(1, 0));
+            w.run();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(r), 2600 + static_cast<std::uint32_t>(r));
+            h.now += 11;
+            w.edit = drop(pb::kOpFcCarrier);
+            w.reconnect(0, 1);
+            w.run();
+            cont = cont && tstatus(h, j.node) != pb::TemplateStatus::CatchingUp;
+            w.edit = nullptr;
+        }
+        check(ok && caught && cont, "catchgate: a node caught up (its record gone) keeps its templates while its peer "
+                                    "reconnects every 11 s with heavier headers and bodies in flight");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// catchrestart: a store not caught up keeps its record across a restart: J placed three carriers by a partial walk,
+// restarted with no peer: NoPathbPeer; a peer whose claim wins opens the first round (CatchingUp) and P-53 with nothing
+// in flight ends it; caught up, the record leaves and a restart builds templates; a launch node writes no record.
+void catchrestart() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        h.mine(a, static_cast<std::size_t>(i), 2700 + static_cast<std::uint32_t>(i));
+    }
+    const std::size_t jn = h.add(table0(net), false, 1152, true);
+    MemoryKv& kvj = *h.kvs.back();
+    const std::string ncu = pb::store_keys::ncu(0);
+    for (std::uint64_t x = 1; x <= 3; ++x) {
+        const std::optional<pb::Hash32> id = h[a].store().best_at(x);
+        if (id) (void)h[jn].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+        h.pump();
+    }
+    const bool walked = h[jn].tree().best().pos == 3 && !h[jn].caught_up() && kvj.data.count(ncu) != 0;
+    const std::size_t j2 = load_node(h, kvj, h.config(table0(net)));
+    MemoryKv& kv2 = *h.kvs.back();
+    const pb::TemplateStatus s0 = tstatus(h, j2);
+    h.hello(j2, a);
+    const pb::TemplateStatus s1 = tstatus(h, j2);
+    const std::uint64_t p53 = h[j2].config().abandon_timeout_s;
+    h[j2].tick(h.now);
+    h.now += p53 + 1;
+    h[j2].tick(h.now);
+    const pb::TemplateStatus s2 = tstatus(h, j2);
+    check(walked && h[j2].tree().best().pos == 3 && !h[j2].caught_up() && s0 == pb::TemplateStatus::NoPathbPeer
+                  && s1 == pb::TemplateStatus::CatchingUp && s2 != pb::TemplateStatus::CatchingUp
+                  && s2 != pb::TemplateStatus::NoPathbPeer,
+          "catchrestart: restarted at position 3 not caught up: no template with no peer; the first round with a peer; "
+          "P-53 with nothing in flight ends it (" + std::to_string(static_cast<int>(s0)) + "/" +
+                  std::to_string(static_cast<int>(s1)) + "/" + std::to_string(static_cast<int>(s2)) + ")");
+    h[j2].note_caught_up();
+    const std::size_t j3 = load_node(h, kv2, h.config(table0(net)));
+    const std::size_t al = h.add(table0(net), true, 1152, true);
+    MemoryKv& kva = *h.kvs.back();
+    const std::size_t a2 = load_node(h, kva, h.config(table0(net), true));
+    check(kv2.data.count(ncu) == 0 && h[j3].caught_up() && tstatus(h, j3) != pb::TemplateStatus::NoPathbPeer
+                  && kva.data.count(ncu) == 0 && h[al].caught_up() && h[a2].caught_up()
+                  && tstatus(h, a2) == pb::TemplateStatus::Ok,
+          "catchrestart: caught up, the record leaves and a restart builds templates; a launch node writes none");
+}
+
+// ---------------------------------------------------------------------------
+// catchlocator: after a partition B's own branch is unknown at A: the catch-up from B's tip gets empty replies and
+// steps down B's chain (pos - 1, pos - 2, pos - 4) to a carrier A holds, then follows A's heavier chain.
+void catchlocator() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2800 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, b.node, static_cast<std::size_t>(i), 2900 + static_cast<std::uint32_t>(i));
+    }
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 3000 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().pos == 9 && h[a.node].tree().best().pos == 12;
+    w.reconnect(0, 1);
+    w.run();
+    for (int k = 0; k < 6 && h[b.node].tree().best().id != tip_a; ++k) {
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
+    check(ok && h[b.node].tree().best().id == tip_a && b.relay->stats().catchup_steps.load() >= 3
+                  && b.relay->stats().strikes.load() == 0,
+          "catchlocator: B's catch-up from its own tip steps down its chain to a carrier A holds and reaches A's tip "
+          "(steps " + std::to_string(b.relay->stats().catchup_steps.load()) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
+//   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
+//           the floor and admits A's carriers on it (B follows A's branch);
+//   band    a carrier of 413 transactions (above the floor's 411 + 1) on S2, held at B without its weights: DEFER
+//           (MissingWeights), no context asked; S2's weights recorded: it runs again and passes on the exact Z;
+//   hfirst  headers first over a header above the floor on a P_r without its weights: DEFER, never a BAN;
+//   join    a joiner whose span headers rest on S reads their heights (height_of) and completes;
+//   joinband   a join replay meeting the band DEFER on S2 (held, its weights not) with an own source that answers held
+//           blocks at once ends NotServed on S2 with no fetch; the pair waits on S2's weights, then completes;
+//   joinrepeat a fetched input that leaves the same DEFER ends the attempt NotServed on it after one fetch;
+//   exact12 #12 keeps exact weights: a carrier whose window reads a block without its weights DEFERs, no token.
+// The follower's rows with the RowWeights of some blocks not recorded (their blocks held).
+struct WeightlessRows final : pb::IMoneroRows {
+    const pb::IMoneroRows& inner;
+    const std::set<pb::Hash32>& hidden;
+    WeightlessRows(const pb::IMoneroRows& i, const std::set<pb::Hash32>& h) : inner(i), hidden(h) {}
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override { return inner.block(id); }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
+        return inner.block_at_or_below_anchor(height);
+    }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.weights(id);
+    }
+    pb::BranchBlock anchor() const override { return inner.anchor(); }
+    pb::Hash32 main_tip() const override { return inner.main_tip(); }
+};
+constexpr std::uint64_t kExactZ = 600000;  // Z(P_r) above the zone (the KAT's exact value for #9)
+void floorpr() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights;
+    const WeightlessRows wrows(net.rows, noweights);
+    const pb::FollowerBranchView wview(wrows);
+    const auto exact_z = [](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner](const pb::Hash32& p_r) {
+            pb::PrInfo r = inner(p_r);
+            r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    };
+    const auto floor_io = [&wview, &wrows](pb::PathbNodeIo& io) {
+        io.monero = &wview;
+        io.resolve_pr = [&wview, &wrows](const pb::Hash32& p_r) {
+            pb::PrInfo r = pb::resolve_pr_on_branch(wview, wrows, p_r, [&wview](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                return wview.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+            });
+            if (r.status == pb::PrInfo::Status::Held && !r.in.floor) r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    };
+    KatRelay a = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, exact_z);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, floor_io);
+    pb::PathbRelayNode& rb = *b.relay;
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 3100 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    // fa
+    h.tick_monero();
+    const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S);
+    const pb::PrInfo prs = pb::resolve_pr_on_branch(wview, wrows, S, [&wview](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+        return wview.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+    });
+    bool fa = true;
+    for (int i = 0; i < 3; ++i) fa = fa && mine_on(h, w, a.node, static_cast<std::size_t>(i), 3200 + static_cast<std::uint32_t>(i));
+    check(ok && prs.status == pb::PrInfo::Status::Held && prs.in.floor && prs.in.z == 300000 && prs.in.z_lt == 300000
+                  && fa && h[b.node].tree().best().id == h[a.node].tree().best().id && rb.stats().strikes.load() == 0
+                  && rb.stats().bans.load() == 0,
+          "floorpr: a carrier on a P_r B holds without its weights resolves on the floor and is admitted (B at A's tip)");
+    // band
+    h.tick_monero();
+    const pb::Hash32 S2 = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S2);
+    h.txs = blob_txs(412, 400, 1, 0x30);
+    const std::uint64_t wanted0 = rb.stats().ctx_wanted.load();
+    const pb::NodeEventResult ra = h[a.node].on_own_share(*h.job(a.node, 2, 3300), 3300, pb::Hash32{});
+    const pb::Hash32 big = h[a.node].tree().best().id;
+    const pb::CarrierBodyV3* bb = h[a.node].bodies().get(big);
+    w.run();
+    const bool band_parked = rb.parked_ctx_size(pb::Missing::MissingWeights, S2) == 1 && h[b.node].tree().find(big) == nullptr
+                             && rb.stats().ctx_wanted.load() == wanted0;
+    check(ra.action == pb::NodeAction::Placed && bb != nullptr && bb->own.blob.tx_count == 413 && band_parked
+                  && rb.stats().strikes.load() == 0 && rb.stats().bans.load() == 0,
+          "floorpr: 413 transactions on a P_r without its weights (above the floor): DEFER MissingWeights, no context, "
+          "no token");
+    noweights.erase(S2);
+    rb.on_monero_tip();
+    w.run();
+    check(h[b.node].tree().find(big) != nullptr && rb.parked_ctx_size(pb::Missing::MissingWeights, S2) == 0,
+          "floorpr: its weights recorded, it runs again and passes on the exact Z(P_r)");
+    h.txs.clear();
+    // headers first: a fresh node C2 catching up over the 413-transaction carrier, S2 held there without its weights:
+    // the header path DEFERs on S2 (its weights), no token; S2's weights recorded: it asks again and reaches A's tip
+    std::set<pb::Hash32> noweights2{S2};
+    const WeightlessRows wrows2(net.rows, noweights2);
+    const pb::FollowerBranchView wview2(wrows2);
+    KatRelay c2 = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&wview2, &wrows2](pb::PathbNodeIo& io) {
+        io.monero = &wview2;
+        io.resolve_pr = [&wview2, &wrows2](const pb::Hash32& p_r) {
+            pb::PrInfo r = pb::resolve_pr_on_branch(wview2, wrows2, p_r, [&wview2](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                return wview2.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+            });
+            if (r.status == pb::PrInfo::Status::Held && !r.in.floor) r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    });
+    w.connect(0, 2);
+    w.run();
+    pb::PathbRelayNode& rc2 = *c2.relay;
+    const bool hdr_deferred = rc2.stats().headers_ctx_deferred.load() >= 1 && h[c2.node].tree().find(big) == nullptr
+                              && rc2.stats().bans.load() == 0 && rc2.stats().strikes.load() == 0;
+    noweights2.erase(S2);
+    rc2.on_monero_tip();
+    w.run();
+    for (int k = 0; k < 6 && h[c2.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        rc2.tick();
+        w.run();
+    }
+    check(hdr_deferred && h[c2.node].tree().best().id == h[a.node].tree().best().id && rc2.stats().bans.load() == 0
+                  && rc2.stats().headers_ctx_reasks.load() >= 1,
+          "floorpr: headers first over a header above the floor on a P_r without its weights: DEFER, no ban; its weights "
+          "recorded, the headers asked again and A's tip reached");
+    // join: a joiner (a load failure) whose span's headers rest on S, held without its weights: their heights are read
+    // (height_of on the floor's Held) and the attempt completes
+    KatRelay jj = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            floor_io);
+    w.connect(0, 3);
+    w.run();
+    const std::optional<pb::JoinStep> sj = jj.relay->join_step();
+    w.run();
+    check(sj && sj->report && sj->report->end == pb::AttemptEnd::Completed && sj->switched
+                  && h[jj.node].tree().best().id == h[a.node].tree().best().id,
+          "floorpr: a join whose headers rest on a P_r held without its weights reads their heights and completes (" +
+                  std::string(sj && sj->report ? pb::attempt_end_name(sj->report->end) : "none") + ")");
+    // joinband: a joiner whose own source answers every Monero block it holds at once (the production relay's
+    // FB_GETCTX: its own index, Indexed, no hash), S2 held there without its weights: the replay meets the 413-transaction
+    // carrier's band DEFER (MissingWeights on S2) and ends NotServed on S2 within one step, no context fetched for it;
+    // the pair waits on S2's weights (no attempt meanwhile); S2's weights recorded: the pair is tried again and completes.
+    // The own source answers at most 64 fetches per id (a watchdog for a re-admission loop).
+    std::set<pb::Hash32> noweights3{S2};
+    const WeightlessRows wrows3(net.rows, noweights3);
+    const pb::FollowerBranchView wview3(wrows3);
+    std::map<pb::Hash32, std::uint64_t> fetches3;
+    const auto own_source_io = [&fetches3](const pb::FollowerBranchView& v, const pb::IMoneroRows& r) {
+        return [&fetches3, &v, &r](pb::PathbNodeIo& io) {
+            io.monero = &v;
+            io.resolve_pr = [&v, &r](const pb::Hash32& p_r) {
+                pb::PrInfo x = pb::resolve_pr_on_branch(v, r, p_r, [&v](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                    return v.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+                });
+                if (x.status == pb::PrInfo::Status::Held && !x.in.floor) x.in.z = x.in.z_lt = kExactZ;
+                return x;
+            };
+            io.fetch_context = [&fetches3, &v](const pb::Hash32& id, std::uint64_t) {
+                return ++fetches3[id] <= 64 && v.block(id).has_value();
+            };
+        };
+    };
+    KatRelay jb = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            own_source_io(wview3, wrows3));
+    w.connect(0, 4);
+    w.run();
+    const std::optional<pb::JoinStep> sb1 = jb.relay->join_step();
+    w.run();
+    const pb::Joiner& jbj = h[jb.node].joiner();
+    const std::vector<std::pair<pb::Missing, pb::Hash32>> jw = jbj.queue().waits();
+    const bool band_ns = sb1 && sb1->report && sb1->report->end == pb::AttemptEnd::NotServed && sb1->report->unresolved_pr
+                         && *sb1->report->unresolved_pr == S2 && sb1->report->unresolved_cause == pb::Missing::MissingWeights
+                         && fetches3[S2] == 0 && jw.size() == 1 && jw.front().first == pb::Missing::MissingWeights
+                         && jw.front().second == S2 && jbj.queue().ready() == 0;
+    jb.relay->on_monero_tip();  // a follower event with S2's weights still absent: the pair keeps waiting
+    w.run();
+    const std::optional<pb::JoinStep> sb2 = jb.relay->join_step();
+    const bool waited = (!sb2 || !sb2->report) && h[jb.node].joiner().queue().ready() == 0;
+    noweights3.erase(S2);
+    jb.relay->on_monero_tip();
+    w.run();
+    std::optional<pb::JoinStep> sb3;
+    for (int k = 0; k < 4 && !(sb3 && sb3->report && sb3->report->end == pb::AttemptEnd::Completed); ++k) {
+        sb3 = jb.relay->join_step();
+        w.run();
+    }
+    check(band_ns && waited && sb3 && sb3->report && sb3->report->end == pb::AttemptEnd::Completed
+                  && h[jb.node].tree().best().id == h[a.node].tree().best().id && fetches3[S2] == 0,
+          "floorpr: joinband: a join replay meeting a band DEFER on a held block ends NotServed on it at once (fetches " +
+                  std::to_string(fetches3[S2]) + "), the pair waits on its weights, and completes once they are recorded (" +
+                  std::string(sb1 && sb1->report ? pb::attempt_end_name(sb1->report->end) : "none") + ", " +
+                  std::string(sb3 && sb3->report ? pb::attempt_end_name(sb3->report->end) : "none") + ")");
+    // joinrepeat: a joiner whose source answers every fetch as resolved, one block of the span's timestamp windows not
+    // held there: the replay's DEFER on it is fetched once (true), deferred again on the same input, and the attempt
+    // ends NotServed on it (no second fetch, no re-admission loop)
+    const pb::FollowerBranchView mon4(net.rows);
+    const std::optional<pb::BranchBlock> tb4 = mon4.block(h[a.node].make_template(h.now).p_r);
+    const pb::Hash32 gap = mon_block(tb4 && tb4->height > 30 ? tb4->height - 30 : 0);
+    std::set<pb::Hash32> hidden4{gap};
+    const HiddenRows hrows4(net.rows, hidden4);
+    const pb::FollowerBranchView hview4(hrows4);
+    const auto base4 = own_source_io(hview4, hrows4);
+    KatRelay jr = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            [&base4, &fetches3](pb::PathbNodeIo& io) {
+                                base4(io);
+                                io.fetch_context = [&fetches3](const pb::Hash32& id, std::uint64_t) { return ++fetches3[id] <= 64; };
+                            });
+    fetches3.clear();
+    w.connect(0, 5);
+    w.run();
+    const std::optional<pb::JoinStep> sr = jr.relay->join_step();
+    w.run();
+    const std::uint64_t fgap = fetches3[gap];
+    check(sr && sr->report && sr->report->end == pb::AttemptEnd::NotServed && sr->report->unresolved_pr
+                  && *sr->report->unresolved_pr == gap && fgap == 1,
+          "floorpr: joinrepeat: a fetched Monero input that leaves the same DEFER ends the attempt NotServed on it (fetches " +
+                  std::to_string(fgap) + ", " + std::string(sr && sr->report ? pb::attempt_end_name(sr->report->end) : "none") +
+                  ", cause " + std::to_string(sr && sr->report ? static_cast<int>(sr->report->unresolved_cause) : -1) + ", " +
+                  (sr && sr->report ? sr->report->what : std::string("-")) + ")");
+    // exact12: the window's weights at A_t never read the floor
+    h.tick_monero();
+    const pb::PathbTemplate t3 = h[a.node].make_template(h.now);
+    const pb::FollowerBranchView mon(net.rows);
+    const std::optional<pb::BranchBlock> b3 = mon.block(t3.p_r);
+    const std::uint64_t h3 = b3 ? b3->height : 0;
+    for (std::uint64_t k = 1; k <= 100 && k < h3; ++k) noweights.insert(mon_block(h3 - k));
+    const bool m3 = mine_on(h, w, a.node, 4, 3400);
+    const pb::Hash32 c3 = h[a.node].tree().best().id;
+    check(m3 && h3 != 0 && h[b.node].tree().find(c3) == nullptr && rb.stats().bans.load() == 0 && rb.stats().strikes.load() == 0
+                  && rb.parked_index_size() >= 1,
+          "floorpr: #12 keeps exact weights: a carrier whose window reads a block without its weights DEFERs, no token");
+}
+
+// ---------------------------------------------------------------------------
+// jobslot: the CPU miner's own slot (bind_own) is never evicted by stratum jobs: over 66 templates of 1,000 stratum
+// bind + get_job pairs each (66,000 > 65,536 binds) the miner's job follows every template; a stratum bind is taken by
+// its get_job on every return path (no template, make_job failed, a cached job, an issue), so the sessions held stay
+// the own slot; an issued extra_nonce gets a peek on the next template; MinerSlot over 30,000 templates with three
+// stratum sessions each follows every template with no skip, a HOLD (clear()) adds none, and a slot with no session is
+// counted once per template with its line.
+pb::PathbTemplate slot_template(std::uint64_t k) {
+    pb::PathbTemplate t;
+    t.status = pb::TemplateStatus::Ok;
+    t.h = 1000 + k;
+    t.p_r = seq32(static_cast<std::uint8_t>(k));
+    t.p_r[30] = static_cast<std::uint8_t>(k >> 8);
+    t.p_r[31] = static_cast<std::uint8_t>(k >> 16);
+    t.hf = 16;
+    t.d = 16;
+    return t;
+}
+pb::PathbJobSource::MakeJob slot_make(const bool* fail) {
+    return [fail](const pb::PathbTemplate& t, const pb::PathbSession&) -> std::optional<pb::PathbJob> {
+        if (fail != nullptr && *fail) return std::nullopt;
+        pb::PathbJob j;
+        j.body.blob.major = t.hf;
+        j.body.blob.minor = t.hf;
+        j.body.blob.timestamp = 1700000000ull + t.h;
+        std::copy(t.p_r.begin(), t.p_r.end(), j.body.blob.prev_id.begin());
+        j.body.blob.tree_root.fill(0x5a);
+        j.body.blob.tx_count = 1;
+        j.h = t.h;
+        j.d = t.d;
+        return j;
+    };
+}
+void jobslot() {
+    const pb::PathbSession s{};
+    bool fail = false;
+    {  // the pin
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t M = 0x00ffffffu;
+        js.bind_own(M, s);
+        std::uint32_t en = 0x01000000u;
+        std::size_t followed = 0;
+        for (std::uint64_t k = 0; k < 66; ++k) {
+            const std::uint32_t tid = js.set_template(slot_template(k), pb::JobNetwork{});
+            for (int i = 0; i < 1000; ++i) {
+                js.bind(en, s);
+                ::v37::xmr::stratum::TemplateJob o;
+                (void)js.get_job(en++, o);
+            }
+            ::v37::xmr::stratum::TemplateJob m;
+            if (js.get_job(M, m) && !m.blob.empty() && m.template_id == tid) ++followed;
+        }
+        check(followed == 66 && js.sessions_held() == 1,
+              "jobslot: the miner's own slot gets a job on each of 66 templates after 66,000 stratum binds (followed " +
+                      std::to_string(followed) + ", sessions held " + std::to_string(js.sessions_held()) + ")");
+    }
+    {  // no leak: under clear() and with make_job failing every bind is taken by its get_job
+        pb::PathbJobSource js(slot_make(&fail));
+        js.bind_own(7, s);
+        js.clear();
+        bool none = true;
+        for (std::uint32_t e = 100; e < 1100; ++e) {
+            js.bind(e, s);
+            ::v37::xmr::stratum::TemplateJob o;
+            none = none && !js.get_job(e, o);
+        }
+        const std::size_t after_clear = js.sessions_held();
+        (void)js.set_template(slot_template(1), pb::JobNetwork{});
+        fail = true;
+        for (std::uint32_t e = 2000; e < 3000; ++e) {
+            js.bind(e, s);
+            ::v37::xmr::stratum::TemplateJob o;
+            none = none && !js.get_job(e, o);
+        }
+        fail = false;
+        check(none && after_clear == 1 && js.sessions_held() == 1 && js.make_failed() == 1000,
+              "jobslot: 1,000 binds under clear() and 1,000 with make_job failing leave the own slot only (held " +
+                      std::to_string(after_clear) + ", then " + std::to_string(js.sessions_held()) + ")");
+    }
+    {  // an issued extra_nonce: its job again on the same template, a peek on the next
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t t1 = js.set_template(slot_template(1), pb::JobNetwork{});
+        js.bind(9, s);
+        ::v37::xmr::stratum::TemplateJob a, b, c;
+        const bool ga = js.get_job(9, a), gb = js.get_job(9, b);
+        const std::uint32_t t2 = js.set_template(slot_template(2), pb::JobNetwork{});
+        const bool gc = js.get_job(9, c);
+        check(ga && gb && gc && !a.blob.empty() && b.blob == a.blob && a.template_id == t1 && c.blob.empty()
+                      && c.template_id == t2 && js.issued(t1, 9).has_value() && !js.issued(t2, 9).has_value(),
+              "jobslot: an issued extra_nonce gets its job again on its template and a peek on the next");
+    }
+    {  // MinerSlot over 30,000 templates; a HOLD; a slot with no session
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t M = 0x00ffff00u;
+        js.bind_own(M, s);
+        pb::MinerSlot slot(M), orphan(0x00ffff01u);
+        std::uint32_t en = 0x02000000u;
+        std::size_t followed = 0, lines = 0, orphan_lines = 0;
+        const std::size_t n = 30000;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::uint32_t tid = js.set_template(slot_template(k), pb::JobNetwork{});
+            for (int i = 0; i < 3; ++i) {
+                js.bind(en, s);
+                ::v37::xmr::stratum::TemplateJob o;
+                (void)js.get_job(en++, o);
+            }
+            for (int tick = 0; tick < 2; ++tick) {
+                if (const std::optional<::v37::xmr::stratum::TemplateJob> j = slot.next(js)) slot.pushed(j->template_id);
+                if (slot.settle()) ++lines;
+                if (const std::optional<::v37::xmr::stratum::TemplateJob> j = orphan.next(js)) orphan.pushed(j->template_id);
+                if (orphan.settle()) ++orphan_lines;
+            }
+            if (slot.job_template() == tid) ++followed;
+            if (k == n / 2) {  // a HOLD: the template withdrawn for 100 ticks
+                js.clear();
+                for (int tick = 0; tick < 100; ++tick) {
+                    if (slot.next(js)) ++lines;
+                    if (slot.settle()) ++lines;
+                }
+            }
+        }
+        check(followed == n && slot.skipped() == 0 && lines == 0,
+              "jobslot: MinerSlot follows every one of 30,000 templates, no skip, a HOLD adds none (followed " +
+                      std::to_string(followed) + ", skipped " + std::to_string(slot.skipped()) + ")");
+        check(orphan.skipped() == n && orphan_lines == n,
+              "jobslot: a slot whose job has no blob is counted once per template with its line (" +
+                      std::to_string(orphan.skipped()) + " of " + std::to_string(n) + ")");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6556,5 +7558,14 @@ int main(int argc, char** argv) {
     run("prune_side", prune_side);
     run("prune_hold", prune_hold);
     run("below", below);
+    run("jobslot", jobslot);
+    run("ctxgate", ctxgate);
+    run("parkidx", parkidx);
+    run("catchjoin", catchjoin);
+    run("catchwalk", catchwalk);
+    run("catchgate", catchgate);
+    run("catchrestart", catchrestart);
+    run("catchlocator", catchlocator);
+    run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }

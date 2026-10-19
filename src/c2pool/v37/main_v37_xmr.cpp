@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <ifaddrs.h>
@@ -844,6 +845,7 @@ static const char* template_status_name(pb::TemplateStatus s) {
     switch (s) {
         case pb::TemplateStatus::Ok: return "ok";
         case pb::TemplateStatus::NoPathbPeer: return "no Path B peer (--pathb-launch for the pool's first node)";
+        case pb::TemplateStatus::CatchingUp: return "catching up (the first catch-up round, or verified headers being fetched)";
         case pb::TemplateStatus::Poisoned: return "store poisoned";
         case pb::TemplateStatus::RestsOnClaims: return "rests on claims (joiner path)";
         case pb::TemplateStatus::Hold: return "hold";
@@ -1102,17 +1104,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::vector<pb::TemplateTx> cur_cands;   // the serve loop's ready snapshot (read by make_template, main thread)
     pb::PathbNodeIo io;
     io.monero = &view;
-    io.resolve_pr = [&view, &rows](const pb::Hash32& p_r) {
-        pb::PrInfo out;
-        const std::optional<pb::BranchBlock> b = view.block(p_r);
-        const std::optional<pb::RowWeights> w = rows.weights(p_r);
-        if (!b || !w) return out;
-        out.status = pb::PrInfo::Status::Held;
-        out.height = b->height;
-        std::optional<std::uint64_t> m;
-        const pb::BranchStatus st = pb::timestamp_median_for_child(view, p_r, m);
-        out.in = pb::HeaderInputs{w->hf_child, st.selected() ? m : std::nullopt, w->z_child, w->ltem_child};
-        return out;
+    // P_r resolved on a verified branch: exact inputs with its RowWeights, else (the floor reading, operator ruling)
+    // the floor's inputs for a block the index holds verified
+    io.resolve_pr = [&view, &rows, nn](const pb::Hash32& p_r) {
+        return pb::resolve_pr_on_branch(view, rows, p_r,
+                                        [nn](const pb::Hash32& id) { return nn->index().verified_child_version(id); });
     };
     io.seed_of = [&view, nn](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
         const std::optional<pb::BranchBlock> b = view.block(p_r);
@@ -1226,8 +1222,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::uint64_t h = 0;
             const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
             if (!nn->index().context_target(a, rws, mv, d, seed, h, why)) return false;
-            if (const std::optional<pb::RowWeights> w = rows.weights(anchor))   // P-13 at the newest known ancestor
-                out.blob_cap = pb::blob_cap_ctx(w->hf_child, w->z_child).value_or(0);
+            out.blob_cap = pb::ctx_anchor_cap(rows, anchor);   // P-13 at the newest ancestor with RowWeights
             out.diff_lo = d.lo;
             out.diff_hi = d.hi;
             out.height = h;
@@ -1403,7 +1398,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     std::unique_ptr<mine::CpuMiner> cpu_miner;
     const std::uint32_t mine_en = en_base - 1;
-    std::uint32_t mine_job_tid = 0;
+    pb::MinerSlot mine_slot(mine_en);
     std::uint64_t mine_pushed = 0, mine_blocks = 0, mine_hits = 0;
     std::string mine_last_error;
     if (cfg.mine_enabled && mine_payee) {
@@ -1415,7 +1410,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         cpu_miner = std::make_unique<mine::CpuMiner>(mo);
         pb::PathbSession ms;
         ms.payee = *mine_payee;
-        jobs.bind(mine_en, ms);
+        jobs.bind_own(mine_en, ms);
         std::printf("cpu-miner: ENABLED threads=%u mode=%s payee=%s extra_nonce=%u\n", cpu_miner->threads_wanted(),
                     cfg.mine_fast ? "FAST" : "LIGHT", cfg.payout_address.c_str(), mine_en);
         ::c2pool::xmr::msr::Options mopt;
@@ -1512,6 +1507,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::uint64_t last_refresh_s = 0, last_prune_s = 0, last_save_s = 0, last_status_s = 0, last_web_s = 0;
     pb::TemplateStatus tstatus = pb::TemplateStatus::NoTemplate, last_tstatus = pb::TemplateStatus::Ok;
     std::string tstatus_why, last_tstatus_why;
+    bool last_unverified_claims = false;
     bool template_kept = false, fork_fuse = false;
     std::uint64_t templates = 0, tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, prunes = 0;
     pb::PathbNode::PruneReport last_prune{};
@@ -1672,6 +1668,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
         }
 
+        {  // a store not caught up building templates while a peer claims more work no verified header shows
+            const bool uc = relay->with_node([](pb::PathbNode& n) { return n.unverified_claims(); });
+            if (uc != last_unverified_claims) {
+                last_unverified_claims = uc;
+                if (uc) std::printf("catch-up: peers claim more work; no verified header wins: templates continue\n");
+            }
+        }
         if (tstatus != last_tstatus || tstatus_why != last_tstatus_why) {
             if (tstatus != pb::TemplateStatus::Ok)
                 std::printf("template: none -- %s%s%s\n", template_status_name(tstatus), tstatus_why.empty() ? "" : ": ",
@@ -1703,8 +1706,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 mine::MinerHit dropped;
                 while (cpu_miner->pop_hit(dropped)) {}
             } else {
-                strat::TemplateJob tj;
-                if (jobs.get_job(mine_en, tj) && !tj.blob.empty() && tj.template_id != mine_job_tid) {
+                if (const std::optional<strat::TemplateJob> mt = mine_slot.next(jobs)) {
+                    const strat::TemplateJob& tj = *mt;
                     rx.on_template(tj);
                     mine::MinerJob mj;
                     mj.blob = tj.blob;
@@ -1717,13 +1720,18 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                     std::copy(tj.seed_hash.begin(), tj.seed_hash.end(), mj.seed_hash.begin());
                     std::string mwhy;
                     if (cpu_miner->set_job(mj, &mwhy)) {
-                        mine_job_tid = tj.template_id;
+                        mine_slot.pushed(tj.template_id);
                         ++mine_pushed;
-                    } else if (mwhy != mine_last_error) {
-                        mine_last_error = mwhy;
-                        std::printf("  [cpu-miner] job refused: %s\n", mwhy.c_str());
+                    } else {
+                        mine_slot.refused(mwhy);
+                        if (mwhy != mine_last_error) {
+                            mine_last_error = mwhy;
+                            std::printf("  [cpu-miner] job refused: %s\n", mwhy.c_str());
+                        }
                     }
                 }
+                if (const std::optional<std::string> skip = mine_slot.settle())
+                    std::printf("  [cpu-miner] %s\n", skip->c_str());
                 mine::MinerHit h;
                 while (cpu_miner->pop_hit(h)) {
                     if (h.network) {
@@ -1838,7 +1846,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(listener.min_difficulty_effective()), gate_closed ? "closed" : "open");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
             if (cpu_miner)
-                std::printf("  %s jobs=%llu hits=%llu blocks=%llu\n", cpu_miner->describe().c_str(),
+                std::printf("  %s skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n", cpu_miner->describe().c_str(),
+                            static_cast<unsigned long long>(mine_slot.skipped()), jobs.sessions_held(),
                             static_cast<unsigned long long>(mine_pushed), static_cast<unsigned long long>(mine_hits),
                             static_cast<unsigned long long>(mine_blocks));
 #endif
@@ -1911,6 +1920,16 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.join_side_attempts.load()),
                             static_cast<unsigned long long>(rs.join_side_completed.load()),
                             static_cast<unsigned long long>(rs.join_side_not_served.load()), relay->ctx_want_bytes_peak());
+                const auto cu = relay->with_node([](pb::PathbNode& n) {
+                    return std::make_tuple(n.caught_up(), n.joiner().queue().size(), n.joiner().queue().ready());
+                });
+                std::printf("  catchup: caught_up=%d steps=%llu join_offers=%llu join_pairs=%zu join_ready=%zu "
+                            "join_releases=%llu parked_frames_sealed=%llu ctx_held=%llu\n",
+                            std::get<0>(cu) ? 1 : 0, static_cast<unsigned long long>(rs.catchup_steps.load()),
+                            static_cast<unsigned long long>(rs.catchup_join_offers.load()), std::get<1>(cu), std::get<2>(cu),
+                            static_cast<unsigned long long>(rs.join_releases.load()),
+                            static_cast<unsigned long long>(rs.parked_frames_sealed.load()),
+                            static_cast<unsigned long long>(rs.ctx_held.load()));
             }
             {
                 const std::map<std::uint64_t, std::uint64_t> om = relay->omission_counts();

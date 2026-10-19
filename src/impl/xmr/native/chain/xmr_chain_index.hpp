@@ -844,6 +844,27 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return holds_verified_locked_(id);
     }
+    // The major version a child of a block held verified (holds_verified) carries: next_major_version's rule, the
+    // height table at the child's height or the block's own version when ahead of it (an alternative's read from its
+    // own blob); nullopt: not held verified, or no blob to read.
+    std::optional<std::uint8_t> verified_child_version(const Hash& id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::uint64_t h = 0;
+        std::uint64_t major = 0;
+        if (const RowRecord* r = rows_.by_id(id)) {
+            h = r->row.height;
+            major = r->row.major_version;
+        } else {
+            const AltBlock* a = alt_.find(id);
+            if (a == nullptr || !a->resolved || !(a->pow_verified || a->adoptable) || !a->has_entry) return std::nullopt;
+            ParsedBlock pb;
+            if (parse_block(a->entry.block_blob, pb) != BlockParseStatus::Ok) return std::nullopt;
+            h = a->height;
+            major = pb.header.major_version;
+        }
+        const std::uint8_t table = hf_version_for_height(opts_.net, h + 1);
+        return major > table ? static_cast<std::uint8_t>(std::min<std::uint64_t>(major, 255)) : table;
+    }
 
     // The difficulty, height and RandomX seed of the block that would follow
     // `anchor_id` (held verified here) extended by `above`: blocks the caller
