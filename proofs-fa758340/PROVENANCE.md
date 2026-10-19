@@ -101,6 +101,17 @@ Nothing else was altered. The artifacts are otherwise byte-for-byte as captured,
 which is why the one-line gtest header and the absolute paths in the logs were
 left alone.
 
+## Filenames
+
+The three `d4-m1-template/embedded_template.*.json` captures were first committed
+with the capture time written as `T09:43:28Z`. Windows does not allow `:` in a
+filename, so `actions/checkout` failed on the Windows runner. The files were
+renamed to `T09-43-28Z` (and the same for :44 and :45). The file contents did not
+change, and their sha256 sums are the same as before. The only edit inside
+`MANIFEST.md` is the same rename in its artifact list, so its sum below is new.
+The timestamps in `INDEX.txt` and elsewhere in the text are times, not filenames,
+and keep the `:`.
+
 ## sha256
 
 ```
@@ -110,10 +121,10 @@ b41c8742a9f38a0301e44982c5fa2dd2aa38ab8fa861db7689aaede74e846d79  d3_fee_oldcoin
 3849ae65f118572add356d195fc86bb53e23ea3ce7d3436077a61dc7f8bc0f3b  d3fee.out
 95bcd9a9fb8ad5fa4d39f1dc476bdf83bf8d4faf550fac6ff39bace6bc5dd642  d3fee.py
 fbcdae8ef0c08dbe54774fed9919566ef0d7e51133b2665c6b96d3e3ec6b3252  d4-m1-template/INDEX.txt
-df4700894b9e4f721aca294acff1cbdb2ce5539ee8c38d704ad1d63a5948a5e1  d4-m1-template/MANIFEST.md
-79359c8fce06cbee5f178974bab28db934fbe8ba04fa97cd8d4a0ca6b7a7b45e  d4-m1-template/embedded_template.2026-09-10T09:43:28Z.json
-c6c58bbdecf54d7110bac2887949525945672968733ac97fc16c10d5b1169d6a  d4-m1-template/embedded_template.2026-09-10T09:44:28Z.json
-793f642dbae6ecc75181818b8da3038380fcf25bb022a11b6d44eeb0938b3c73  d4-m1-template/embedded_template.2026-09-10T09:45:28Z.json
+b2628437e92126cebf045c6eff9a2a1a614296c5cf6bfbe37ca8b535c78b24a1  d4-m1-template/MANIFEST.md
+79359c8fce06cbee5f178974bab28db934fbe8ba04fa97cd8d4a0ca6b7a7b45e  d4-m1-template/embedded_template.2026-09-10T09-43-28Z.json
+c6c58bbdecf54d7110bac2887949525945672968733ac97fc16c10d5b1169d6a  d4-m1-template/embedded_template.2026-09-10T09-44-28Z.json
+793f642dbae6ecc75181818b8da3038380fcf25bb022a11b6d44eeb0938b3c73  d4-m1-template/embedded_template.2026-09-10T09-45-28Z.json
 ae3218b336b43e07e64f8761b0685e8cc8c3eb115622a40d723ae073e39b4179  external_operator_node_spec.md
 ```
 
