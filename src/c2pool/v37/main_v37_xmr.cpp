@@ -1222,8 +1222,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::uint64_t h = 0;
             const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
             if (!nn->index().context_target(a, rws, mv, d, seed, h, why)) return false;
-            if (const std::optional<pb::RowWeights> w = rows.weights(anchor))   // P-13 at the newest known ancestor
-                out.blob_cap = pb::blob_cap_ctx(w->hf_child, w->z_child).value_or(0);
+            out.blob_cap = pb::ctx_anchor_cap(rows, anchor);   // P-13 at the newest ancestor with RowWeights
             out.diff_lo = d.lo;
             out.diff_hi = d.hi;
             out.height = h;

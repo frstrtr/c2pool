@@ -2086,4 +2086,21 @@ inline PrInfo resolve_pr_on_branch(const FollowerBranchView& view, const IMonero
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// P-13 at a Monero context block's anchor (FB_GETCTX; the anchor: its newest ancestor held verified): blob_cap_ctx(hf,
+// Z) of a child of the newest ancestor with RowWeights, the anchor first, climbing the parent links of the blocks the
+// follower holds (a bodiless alternative has none; its branch's fork point on the main chain has them), at most
+// kAltDepth (P-07) links; 0: none within the climb.
+// ---------------------------------------------------------------------------
+inline std::uint64_t ctx_anchor_cap(const IMoneroRows& rows, const Hash32& anchor) {
+    Hash32 cur = anchor;
+    for (std::uint64_t k = 0; k <= kAltDepth; ++k) {
+        if (const std::optional<RowWeights> w = rows.weights(cur)) return blob_cap_ctx(w->hf_child, w->z_child).value_or(0);
+        const std::optional<BranchBlock> b = rows.block(cur);
+        if (!b || b->height == 0) return 0;
+        cur = b->prev_id;
+    }
+    return 0;
+}
+
 }  // namespace c2pool::xmr::pathb
