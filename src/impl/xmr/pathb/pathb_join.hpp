@@ -867,7 +867,9 @@ inline ReaskReplay reask_replay(std::uint64_t seal_pos, std::uint64_t base_pos) 
 // Each pair is attempted once; a non-service re-queues it at the end; an
 // alarm, a contradiction or an unplaceable span carrier excludes the server
 // with all its pairs in this join; a pair lives while its server is
-// connected. Neither claimed work nor the tip id orders.
+// connected. Neither claimed work nor the tip id orders. A pair whose attempt
+// ended NotServed on a P_r it could not resolve waits, queued, until that
+// P_r's input moves (release_waits: the id, or every id at a new peer).
 // ---------------------------------------------------------------------------
 class AttemptQueue {
 public:
@@ -877,6 +879,7 @@ public:
         U128 claimed_work{};  // the HELLO claim (orders nothing)
         std::uint64_t seq = 0;
         bool young = false;   // the pair runs the young path (the ruling-47 fallback; not attempt state)
+        std::optional<Hash32> waits_on;  // a P_r the pair's last attempt could not resolve (NotServed)
     };
 
     void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}) {
@@ -887,13 +890,34 @@ public:
         q_.push_back(Pair{candidate, server, claimed_work, ++seq_});
     }
 
-    // The next pair (removed from the queue).
+    // The next pair not waiting on a P_r (removed from the queue).
     std::optional<Pair> next() {
-        if (q_.empty()) return std::nullopt;
-        const auto pick = q_.begin();
+        const auto pick = std::find_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on.has_value(); });
+        if (pick == q_.end()) return std::nullopt;
         Pair p = *pick;
         q_.erase(pick);
         return p;
+    }
+    // The pairs that may be attempted now (not waiting on a P_r).
+    std::size_t ready() const {
+        return static_cast<std::size_t>(std::count_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on; }));
+    }
+    // The P_r ids pairs wait on.
+    std::vector<Hash32> waits() const {
+        std::vector<Hash32> v;
+        for (const Pair& p : q_)
+            if (p.waits_on && std::find(v.begin(), v.end(), *p.waits_on) == v.end()) v.push_back(*p.waits_on);
+        return v;
+    }
+    // The pairs waiting on `id` (nullopt: on any id) may be attempted again; their count.
+    std::size_t release_waits(const std::optional<Hash32>& id) {
+        std::size_t n = 0;
+        for (Pair& p : q_)
+            if (p.waits_on && (!id || *p.waits_on == *id)) {
+                p.waits_on.reset();
+                ++n;
+            }
+        return n;
     }
 
     void requeue(const Pair& p) {
@@ -977,6 +1001,7 @@ struct AttemptReport {
     bool force_young = false;              // ruling 47: the next attempt of this pair runs the young path
     std::uint32_t side_needs = 0;          // side branches forking at a prefix node below the root whose state (S(f),
                                            // or bins sealed on the branch) the attempt took from the server
+    std::optional<Hash32> unresolved_pr;   // NotServed on a P_r not resolved: that P_r (the pair waits on it)
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -1152,7 +1177,11 @@ private:
     std::optional<std::uint64_t> h_of(const ReceiptBodyV3& r) {
         std::uint64_t h = join_detail::height_of(in_, r);
         if (h == 0 && in_.fetch_context && in_.fetch_context(r.blob.prev_id, timeout_)) h = join_detail::height_of(in_, r);
-        if (h == 0) return std::nullopt;
+        if (h == 0) {
+            rep_.unresolved_pr = r.blob.prev_id;  // the attempt ends NotServed on it: the pair waits on it
+            return std::nullopt;
+        }
+        rep_.unresolved_pr.reset();
         return h;
     }
     const CarrierHeader* header_at(std::uint64_t x) const {
@@ -1905,6 +1934,7 @@ public:
     bool rests_on_claims() const noexcept { return a() == nullptr; }
 
     const AttemptQueue& queue() const noexcept { return queue_; }
+    std::size_t release_waits(const std::optional<Hash32>& id) { return queue_.release_waits(id); }
     const SwitchReport& last_switch() const noexcept { return switch_; }
 
     // Observes the attempt state while it runs (the caller's work between
@@ -1956,6 +1986,7 @@ public:
                 // ruling 47: the pair's next attempt runs the young path (the mark rides the queue)
                 AttemptQueue::Pair q = *p;
                 q.young = q.young || rep.force_young;
+                q.waits_on = rep.unresolved_pr;  // re-attempted once that P_r's input moves (release_waits)
                 queue_.requeue(q);
                 break;
             }

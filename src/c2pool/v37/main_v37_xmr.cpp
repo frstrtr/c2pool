@@ -64,6 +64,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <ifaddrs.h>
@@ -844,6 +845,7 @@ static const char* template_status_name(pb::TemplateStatus s) {
     switch (s) {
         case pb::TemplateStatus::Ok: return "ok";
         case pb::TemplateStatus::NoPathbPeer: return "no Path B peer (--pathb-launch for the pool's first node)";
+        case pb::TemplateStatus::CatchingUp: return "catching up (the first catch-up round, or verified headers being fetched)";
         case pb::TemplateStatus::Poisoned: return "store poisoned";
         case pb::TemplateStatus::RestsOnClaims: return "rests on claims (joiner path)";
         case pb::TemplateStatus::Hold: return "hold";
@@ -1512,6 +1514,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::uint64_t last_refresh_s = 0, last_prune_s = 0, last_save_s = 0, last_status_s = 0, last_web_s = 0;
     pb::TemplateStatus tstatus = pb::TemplateStatus::NoTemplate, last_tstatus = pb::TemplateStatus::Ok;
     std::string tstatus_why, last_tstatus_why;
+    bool last_unverified_claims = false;
     bool template_kept = false, fork_fuse = false;
     std::uint64_t templates = 0, tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, prunes = 0;
     pb::PathbNode::PruneReport last_prune{};
@@ -1672,6 +1675,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
         }
 
+        {  // a store not caught up building templates while a peer claims more work no verified header shows
+            const bool uc = relay->with_node([](pb::PathbNode& n) { return n.unverified_claims(); });
+            if (uc != last_unverified_claims) {
+                last_unverified_claims = uc;
+                if (uc) std::printf("catch-up: peers claim more work; no verified header wins: templates continue\n");
+            }
+        }
         if (tstatus != last_tstatus || tstatus_why != last_tstatus_why) {
             if (tstatus != pb::TemplateStatus::Ok)
                 std::printf("template: none -- %s%s%s\n", template_status_name(tstatus), tstatus_why.empty() ? "" : ": ",
@@ -1917,6 +1927,16 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(rs.join_side_attempts.load()),
                             static_cast<unsigned long long>(rs.join_side_completed.load()),
                             static_cast<unsigned long long>(rs.join_side_not_served.load()), relay->ctx_want_bytes_peak());
+                const auto cu = relay->with_node([](pb::PathbNode& n) {
+                    return std::make_tuple(n.caught_up(), n.joiner().queue().size(), n.joiner().queue().ready());
+                });
+                std::printf("  catchup: caught_up=%d steps=%llu join_offers=%llu join_pairs=%zu join_ready=%zu "
+                            "join_releases=%llu parked_frames_sealed=%llu ctx_held=%llu\n",
+                            std::get<0>(cu) ? 1 : 0, static_cast<unsigned long long>(rs.catchup_steps.load()),
+                            static_cast<unsigned long long>(rs.catchup_join_offers.load()), std::get<1>(cu), std::get<2>(cu),
+                            static_cast<unsigned long long>(rs.join_releases.load()),
+                            static_cast<unsigned long long>(rs.parked_frames_sealed.load()),
+                            static_cast<unsigned long long>(rs.ctx_held.load()));
             }
             {
                 const std::map<std::uint64_t, std::uint64_t> om = relay->omission_counts();

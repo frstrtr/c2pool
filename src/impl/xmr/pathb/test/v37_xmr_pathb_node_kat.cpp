@@ -216,7 +216,15 @@
 //   ctxgate      frames parked on a Monero input run again per (cause, id)
 //                only when that input is held: no storm on a P_r held
 //                without its weights, no context asked for it; the seed;
-//                the seal sweep by the frame's own P_r.
+//                the seal sweep by the frame's own P_r;
+//   catchjoin    a store not caught up whose catch-up step stays deferred
+//                on a P_r no node serves: the record stays, the tip offered
+//                to the joiner after kCtxTtlMs, the pair paced on that P_r;
+//   catchgate    the template gate of a store not caught up: the first
+//                round in flight, verified headers whose bodies are in
+//                flight; a node caught up keeps its templates;
+//   catchrestart the record across a restart; a launch node writes none;
+//   catchlocator the catch-up's locator steps after a partition.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1954,11 +1962,12 @@ struct KatRelay {
 };
 
 // A relay node in manual mode on the harness's clock with its own PathbNode (a load failure when `failed`;
-// `tweak`: its options changed; `cfg_tweak`: its node's configuration; `io_tweak`: its node's I/O).
+// `tweak`: its options changed; `cfg_tweak`: its node's configuration; `io_tweak`: its node's I/O; `persist`: an empty
+// store of its own in h.kvs).
 KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch, bool failed = false,
                    const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr,
                    const std::function<void(pb::PathbNodeConfig&)>& cfg_tweak = nullptr,
-                   const std::function<void(pb::PathbNodeIo&)>& io_tweak = nullptr) {
+                   const std::function<void(pb::PathbNodeIo&)>& io_tweak = nullptr, bool persist = false) {
     KatRelay k;
     k.links = std::make_unique<FakeLinks>();
     k.links->wire = &w;
@@ -1982,6 +1991,9 @@ KatRelay kat_relay(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch
     if (failed) {
         h.kvs.push_back(std::make_unique<MemoryKv>());
         h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    } else if (persist) {
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), h.kvs.back().get()));
     } else {
         h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io)));
     }
@@ -6657,6 +6669,315 @@ void ctxgate() {
 }
 
 // ---------------------------------------------------------------------------
+// catchjoin: a store not caught up (its record K_NCU) whose catch-up DEFERs on a P_r no node serves, before any PoW:
+// the record stays (no reply that DEFERs ends the catch-up), templates continue with the unverified claim noted; once
+// the step stays deferred kCtxTtlMs the peer's tip is offered to the joiner; the attempt ends NotServed on that P_r and
+// the pair waits on it (no attempt per tick); a new Path B peer releases it once; the P_r resolving releases it and
+// the node reaches the tip, caught up, its record gone.
+std::function<void(pb::PathbNodeIo&)> hide_blocks(std::set<pb::Hash32>& hidden, const pb::FollowerBranchView& view) {
+    return [&hidden, &view](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner, &hidden](const pb::Hash32& p_r) {
+            return hidden.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);
+        };
+        io.monero = &view;
+    };
+}
+void catchjoin() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2100 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+    const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+    if (!ok || b1 == nullptr) {
+        check(false, "catchjoin: setup (A's chain)");
+        return;
+    }
+    const pb::Hash32 X = b1->own.blob.prev_id;
+    hidden.insert(X);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview), true);
+    MemoryKv& kvj = *h.kvs.back();
+    const std::string ncu = pb::store_keys::ncu(0);
+    const bool rec0 = kvj.data.count(ncu) != 0;
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    const pb::TemplateStatus t1 = h[j.node].make_template(h.now).status;
+    check(rec0 && kvj.data.count(ncu) != 0 && !h[j.node].caught_up() && h[j.node].tree().best().pos == 0
+                  && rj.stats().headers_ctx_deferred.load() >= 1 && t1 != pb::TemplateStatus::CatchingUp
+                  && t1 != pb::TemplateStatus::NoPathbPeer && h[j.node].unverified_claims()
+                  && h[j.node].joiner().queue().size() == 0,
+          "catchjoin: the catch-up DEFERs on a P_r no node serves, before any PoW: not caught up, the record stays, no "
+          "template gate (the unverified claim noted), no join yet");
+    std::uint64_t offers_before = 0;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+        if (k == 116) offers_before = rj.stats().catchup_join_offers.load();  // 585 s
+    }
+    check(offers_before == 0 && rj.stats().catchup_join_offers.load() == 1 && h[j.node].joiner().queue().size() == 1,
+          "catchjoin: kCtxTtlMs after the step deferred, A's tip is offered to the joiner (" +
+                  std::to_string(rj.stats().catchup_join_offers.load()) + ")");
+    const std::optional<pb::JoinStep> s1 = rj.join_step();
+    w.run();
+    const bool ns = s1 && s1->report && s1->report->end == pb::AttemptEnd::NotServed && s1->report->unresolved_pr
+                    && *s1->report->unresolved_pr == X;
+    const std::uint64_t att1 = rj.stats().join_attempts.load();
+    for (int k = 0; k < 20; ++k) {
+        h.now += 5;
+        rj.tick();
+        w.run();
+        (void)rj.join_step();
+        w.run();
+    }
+    check(ns && h[j.node].joiner().queue().size() == 1 && h[j.node].joiner().queue().ready() == 0
+                  && rj.stats().join_attempts.load() == att1 && att1 >= 1,
+          "catchjoin: the attempt ends NotServed on that P_r; the pair waits on it: 20 ticks attempt nothing (attempts " +
+                  std::to_string(rj.stats().join_attempts.load()) + ")");
+    KatRelay c = kat_relay(h, w, table0(net), true);  // a new Path B peer
+    w.connect(2, 1);
+    w.run();
+    const bool released = h[j.node].joiner().queue().ready() == 1;
+    const std::optional<pb::JoinStep> s2 = rj.join_step();
+    w.run();
+    check(released && s2 && s2->report && s2->report->end == pb::AttemptEnd::NotServed
+                  && h[j.node].joiner().queue().ready() == 0 && !h[j.node].caught_up(),
+          "catchjoin: a new Path B peer releases the waiting pair once: one attempt, NotServed again, waiting again");
+    hidden.erase(X);
+    rj.on_monero_tip();
+    w.run();
+    for (int k = 0; k < 12 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        (void)rj.join_step();
+        w.run();
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    std::printf("  catchjoin: J at %llu of %llu; caught up %d; releases %llu; attempts %llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos,
+                h[j.node].caught_up() ? 1 : 0, (unsigned long long)rj.stats().join_releases.load(),
+                (unsigned long long)rj.stats().join_attempts.load());
+    bool rec_gone = true;
+    for (const auto& kv : h.kvs) rec_gone = rec_gone && (kv.get() != &kvj || kvj.data.count(ncu) == 0);
+    check(h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].caught_up() && rec_gone
+                  && rj.stats().join_releases.load() >= 1 && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
+          "catchjoin: the P_r resolves: the pair released, J reaches A's tip, caught up, its record gone; no token");
+    (void)c;
+}
+
+// ---------------------------------------------------------------------------
+// catchgate: the template gate of a store not caught up reads verified header work only:
+//   round     the first catch-up round in flight (a peer whose replies never come): CatchingUp; no reply within P-53
+//             ends it; a later connection never opens it again;
+//   verified  headers J verified win while their bodies are in flight: CatchingUp; no progress within P-53 lapses it,
+//             and that tip does not hold the gate again;
+//   caught    a node caught up (its record gone) whose peer reconnects every 11 s with heavier verified headers and
+//             bodies in flight: templates continue.
+pb::TemplateStatus tstatus(Harness& h, std::size_t i) { return h[i].make_template(h.now).status; }
+void catchgate() {
+    const KatNet net;
+    const auto drop = [](std::uint8_t op) {
+        return [op](FakeWire::Msg& m) {
+            if (m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == op) m.f.clear();
+        };
+    };
+    {  // round
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2300 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        w.edit = drop(pb::kOpFcHeaders);
+        w.connect(0, 1);
+        w.run();
+        const pb::TemplateStatus s1 = tstatus(h, j.node);
+        const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+        for (std::uint64_t k = 0; k <= p53 + 1; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+        }
+        const pb::TemplateStatus s2 = tstatus(h, j.node);
+        w.links[1]->disconnect(w.id(1, 0));
+        w.run();
+        w.reconnect(0, 1);
+        w.run();
+        const pb::TemplateStatus s3 = tstatus(h, j.node);
+        w.edit = nullptr;
+        check(ok && s1 == pb::TemplateStatus::CatchingUp && s2 != pb::TemplateStatus::CatchingUp
+                      && s3 != pb::TemplateStatus::CatchingUp && !h[j.node].caught_up(),
+              "catchgate: the first round in flight holds templates (CatchingUp); no reply within P-53 ends it; a later "
+              "connection does not open it again (" + std::to_string(static_cast<int>(s1)) + "/" +
+                      std::to_string(static_cast<int>(s2)) + "/" + std::to_string(static_cast<int>(s3)) + ")");
+    }
+    {  // verified
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2400 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        w.edit = drop(pb::kOpFcCarrier);
+        w.connect(0, 1);
+        w.run();
+        const pb::TemplateStatus s1 = tstatus(h, j.node);
+        const bool round_over = !h[j.node].first_round_open();
+        const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+        bool held = true;
+        for (std::uint64_t k = 0; k < p53 + 2 * p53 + 4; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+            if (k + 2 < p53) held = held && tstatus(h, j.node) == pb::TemplateStatus::CatchingUp;
+        }
+        const pb::TemplateStatus s2 = tstatus(h, j.node);
+        w.edit = nullptr;
+        check(ok && round_over && s1 == pb::TemplateStatus::CatchingUp && held && s2 != pb::TemplateStatus::CatchingUp,
+              "catchgate: verified heavier headers whose bodies are in flight hold templates; no progress within P-53 "
+              "lapses it and the same tip does not hold them again (" + std::to_string(static_cast<int>(s2)) + ")");
+    }
+    {  // caught
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 2500 + static_cast<std::uint32_t>(i));
+        KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+        MemoryKv& kvj = *h.kvs.back();
+        w.connect(0, 1);
+        w.run();
+        for (int k = 0; k < 3; ++k) {
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+        }
+        const bool caught = h[j.node].caught_up() && kvj.data.count(pb::store_keys::ncu(0)) == 0
+                            && h[j.node].tree().best().id == h[a.node].tree().best().id;
+        bool cont = true;
+        for (int r = 0; r < 3; ++r) {
+            w.links[1]->disconnect(w.id(1, 0));
+            w.run();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(r), 2600 + static_cast<std::uint32_t>(r));
+            h.now += 11;
+            w.edit = drop(pb::kOpFcCarrier);
+            w.reconnect(0, 1);
+            w.run();
+            cont = cont && tstatus(h, j.node) != pb::TemplateStatus::CatchingUp;
+            w.edit = nullptr;
+        }
+        check(ok && caught && cont, "catchgate: a node caught up (its record gone) keeps its templates while its peer "
+                                    "reconnects every 11 s with heavier headers and bodies in flight");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// catchrestart: a store not caught up keeps its record across a restart: J placed three carriers by a partial walk,
+// restarted with no peer: NoPathbPeer; a peer whose claim wins opens the first round (CatchingUp) and P-53 with nothing
+// in flight ends it; caught up, the record leaves and a restart builds templates; a launch node writes no record.
+void catchrestart() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero();
+        h.mine(a, static_cast<std::size_t>(i), 2700 + static_cast<std::uint32_t>(i));
+    }
+    const std::size_t jn = h.add(table0(net), false, 1152, true);
+    MemoryKv& kvj = *h.kvs.back();
+    const std::string ncu = pb::store_keys::ncu(0);
+    for (std::uint64_t x = 1; x <= 3; ++x) {
+        const std::optional<pb::Hash32> id = h[a].store().best_at(x);
+        if (id) (void)h[jn].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+        h.pump();
+    }
+    const bool walked = h[jn].tree().best().pos == 3 && !h[jn].caught_up() && kvj.data.count(ncu) != 0;
+    const std::size_t j2 = load_node(h, kvj, h.config(table0(net)));
+    MemoryKv& kv2 = *h.kvs.back();
+    const pb::TemplateStatus s0 = tstatus(h, j2);
+    h.hello(j2, a);
+    const pb::TemplateStatus s1 = tstatus(h, j2);
+    const std::uint64_t p53 = h[j2].config().abandon_timeout_s;
+    h[j2].tick(h.now);
+    h.now += p53 + 1;
+    h[j2].tick(h.now);
+    const pb::TemplateStatus s2 = tstatus(h, j2);
+    check(walked && h[j2].tree().best().pos == 3 && !h[j2].caught_up() && s0 == pb::TemplateStatus::NoPathbPeer
+                  && s1 == pb::TemplateStatus::CatchingUp && s2 != pb::TemplateStatus::CatchingUp
+                  && s2 != pb::TemplateStatus::NoPathbPeer,
+          "catchrestart: restarted at position 3 not caught up: no template with no peer; the first round with a peer; "
+          "P-53 with nothing in flight ends it (" + std::to_string(static_cast<int>(s0)) + "/" +
+                  std::to_string(static_cast<int>(s1)) + "/" + std::to_string(static_cast<int>(s2)) + ")");
+    h[j2].note_caught_up();
+    const std::size_t j3 = load_node(h, kv2, h.config(table0(net)));
+    const std::size_t al = h.add(table0(net), true, 1152, true);
+    MemoryKv& kva = *h.kvs.back();
+    const std::size_t a2 = load_node(h, kva, h.config(table0(net), true));
+    check(kv2.data.count(ncu) == 0 && h[j3].caught_up() && tstatus(h, j3) != pb::TemplateStatus::NoPathbPeer
+                  && kva.data.count(ncu) == 0 && h[al].caught_up() && h[a2].caught_up()
+                  && tstatus(h, a2) == pb::TemplateStatus::Ok,
+          "catchrestart: caught up, the record leaves and a restart builds templates; a launch node writes none");
+}
+
+// ---------------------------------------------------------------------------
+// catchlocator: after a partition B's own branch is unknown at A: the catch-up from B's tip gets empty replies and
+// steps down B's chain (pos - 1, pos - 2, pos - 4) to a carrier A holds, then follows A's heavier chain.
+void catchlocator() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2800 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, b.node, static_cast<std::size_t>(i), 2900 + static_cast<std::uint32_t>(i));
+    }
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 3000 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip_a = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().pos == 9 && h[a.node].tree().best().pos == 12;
+    w.reconnect(0, 1);
+    w.run();
+    for (int k = 0; k < 6 && h[b.node].tree().best().id != tip_a; ++k) {
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
+    check(ok && h[b.node].tree().best().id == tip_a && b.relay->stats().catchup_steps.load() >= 3
+                  && b.relay->stats().strikes.load() == 0,
+          "catchlocator: B's catch-up from its own tip steps down its chain to a carrier A holds and reaches A's tip "
+          "(steps " + std::to_string(b.relay->stats().catchup_steps.load()) + ")");
+}
+
+// ---------------------------------------------------------------------------
 // jobslot: the CPU miner's own slot (bind_own) is never evicted by stratum jobs: over 66 templates of 1,000 stratum
 // bind + get_job pairs each (66,000 > 65,536 binds) the miner's job follows every template; a stratum bind is taken by
 // its get_job on every return path (no template, make_job failed, a cached job, an issue), so the sessions held stay
@@ -6890,5 +7211,9 @@ int main(int argc, char** argv) {
     run("below", below);
     run("jobslot", jobslot);
     run("ctxgate", ctxgate);
+    run("catchjoin", catchjoin);
+    run("catchgate", catchgate);
+    run("catchrestart", catchrestart);
+    run("catchlocator", catchlocator);
     return finish("v37_xmr_pathb_node_kat");
 }
