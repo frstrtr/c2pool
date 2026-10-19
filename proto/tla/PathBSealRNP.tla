@@ -20,28 +20,48 @@
                   (pool[n]) is refused.
      "prevlocal" / "unique" / "prevalt" / "joiner"  kept so earlier configs parse; in this model they compute the
                   ruled verdict.
+     "hashlocal"  negative control: a carrier (and each carried receipt) is valid only if the Monero block it names is
+                  the one node n sees at its height (mview[n]); with MonReorg nodes see a reorg at different times.
+     "restartlocal"  negative control: a node that restarted re-seals a bin judging liveness against its current tip
+                  record instead of the record at each placement.
+     "orderfirst" negative control: the Joiner node checks the order of the first two carried ids only.
    Fork choice and seals always use the ruled validity (Lineage), so a negative control changes only the verdict the
    invariant compares, never the explored chains (no circularity: Verdict may read ChainOf, ChainOf never reads Verdict).
 
    Adv = TRUE: Find may also mint invalid carriers (carried list out of order, a carried bin closed at the parent);
    they exist, are delivered and judged; no node's chain contains them.
-   MaxCarry: at most this many carried ids per receipt (1; 2 lets the order rule bind).
+   MaxCarry: at most this many carried ids per receipt (1; 2 lets the order rule bind; 3 lets it bind past the first
+   pair).
+
+   MonReorg(h) (at most MaxReorg times): the Monero blocks at heights h..mon are replaced by others at the same heights
+   (mon unchanged; a changed hash, mh).  A carrier records the hash version of its height when found (rec.ver).  The
+   ruled checks, the record, liveness and the seals read heights only, so a reorg at a constant height changes no
+   verdict and no seal.  Under "ruled" this holds by construction; the test of it is the hashlocal control
+   (V1_rnp_neg_hashlocal_n2r4_reorg), where a rule that reads the hash violates Agreement.
+   Restart(n) (at most MaxRestart times): node n keeps the carriers it holds (its store) and loses its seals and its
+   pending pool; it seals again from its chain.
+
+   Dfin: the seal position is the fold position + Dfin - 1, so Dfin = 1 seals at the fold carrier itself (a consensus
+   seal depth of 0).
 
    Delta is fixed at 1.  (This is the variant without the prev_own_share field.) *)
 EXTENDS Naturals, FiniteSets, Sequences, TLC
 
-CONSTANTS Nodes, Rids, Payees, F, Dfin, MaxH, Reward, Variant, Fresh, CatchUp, MaxCarry, Adv, Rule, JoinWin, Joiner
+CONSTANTS Nodes, Rids, Payees, F, Dfin, MaxH, Reward, Variant, Fresh, CatchUp, MaxCarry, Adv, Rule, JoinWin, Joiner,
+          MaxReorg, MaxRestart
 
-ASSUME F >= 1 /\ Dfin >= 1 /\ Fresh >= 0 /\ CatchUp \in BOOLEAN /\ Adv \in BOOLEAN /\ MaxCarry \in {1, 2}
+ASSUME F >= 1 /\ Dfin >= 1 /\ Fresh >= 0 /\ CatchUp \in BOOLEAN /\ Adv \in BOOLEAN /\ MaxCarry \in {1, 2, 3}
        /\ Variant \in {"own", "carriage", "nodead", "sharechain"}
-       /\ Rule \in {"ruled", "openlocal", "prevlocal", "omitlocal", "unique", "joiner", "prevalt"}
-       /\ JoinWin >= 1
+       /\ Rule \in {"ruled", "openlocal", "prevlocal", "omitlocal", "unique", "joiner", "prevalt", "hashlocal",
+                    "restartlocal", "orderfirst"}
+       /\ JoinWin >= 1 /\ MaxReorg \in Nat /\ MaxRestart \in Nat
 
-VARIABLES mon, rec, nextId, known, sealed, pool
+VARIABLES mon, rec, nextId, known, sealed, pool, mh, mview, nreorg, nrestart, restarted
 
 NONE == [kind |-> "none"]
 UNSEALED == [done |-> FALSE, s |-> {}, pre |-> << >>]
-vars == <<mon, rec, nextId, known, sealed, pool>>
+mvars == <<mh, mview, nreorg, nrestart, restarted>>
+vars == <<mon, rec, nextId, known, sealed, pool, mh, mview, nreorg, nrestart, restarted>>
 
 IsCarrier(r) == rec[r].kind = "carrier"
 InSeq(s, x) == \E i \in 1..Len(s) : s[i] = x
@@ -59,6 +79,7 @@ HeightAt(chain, p) == rec[chain[p]].bin           \* hot path; = RecMax (RecordI
 (* Canonical key and order. *)
 Less(x, y) == rec[x].bin < rec[y].bin \/ (rec[x].bin = rec[y].bin /\ x < y)
 InOrder(s) == \A i \in 1..(Len(s) - 1) : Less(s[i], s[i + 1])
+InOrderFirst(s) == Len(s) < 2 \/ Less(s[1], s[2])
 
 (* Placements of a chain in order: per position, the carried list (first placements only) then the carrier. *)
 RECURSIVE PlSeq(_)
@@ -121,6 +142,12 @@ Placed(chain, r, p) == chain[p] = r \/ (Variant # "sharechain" /\ InSeq(rec[chai
 BinSet(chain, b, upto) ==
   { r \in Rids : rec[r].kind # "none" /\ rec[r].bin = b
        /\ \E p \in 1..upto : Placed(chain, r, p) /\ Live(chain, r, p) = "live" }
+(* Control "restartlocal": liveness judged against the chain's tip record instead of at each placement. *)
+BinSetTip(chain, b, upto) ==
+  { r \in Rids : rec[r].kind # "none" /\ rec[r].bin = b
+       /\ \E p \in 1..upto : Placed(chain, r, p) /\ rec[r].bin >= HeightAt(chain, Len(chain)) }
+BinSetBy(n, chain, b, upto) ==
+  IF Rule = "restartlocal" /\ restarted[n] THEN BinSetTip(chain, b, upto) ELSE BinSet(chain, b, upto)
 
 FoldPos(chain, b) == IF \E p \in 1..Len(chain) : HeightAt(chain, p) >= b + F
                      THEN CHOOSE p \in 1..Len(chain) : HeightAt(chain, p) >= b + F
@@ -140,7 +167,10 @@ OmitsKnown(n, c) == Len(rec[c].carries) < MaxCarry
                     /\ \E y \in pool[n] : /\ y < c /\ y # rec[c].tip /\ ~InSeq(rec[c].carries, y)   \* y older than c: its builder could hold it
                                           /\ ~InSeq(PlSeqBy(n, GLin(rec[c].tip)), y)
                                           /\ OpenAt(c, y)
-LocalValid(n, c) == /\ InOrder(rec[c].carries)
+(* Control "hashlocal": the Monero block a record names is the one node n sees at its height. *)
+HashSeen(n, x) == rec[x].ver = mview[n][rec[x].bin]
+LocalValid(n, c) == /\ IF Rule = "orderfirst" /\ n = Joiner THEN InOrderFirst(rec[c].carries) ELSE InOrder(rec[c].carries)
+                    /\ (Rule = "hashlocal" => HashSeen(n, c) /\ \A i \in 1..Len(rec[c].carries) : HashSeen(n, rec[c].carries[i]))
                     /\ \A i \in 1..Len(rec[c].carries) : OpenBy(n, c, rec[c].carries[i])
                     /\ (Rule = "omitlocal" => ~OmitsKnown(n, c))
 Accepts(n, c) == \A a \in Range(GLin(c)) : LocalValid(n, a)
@@ -153,13 +183,21 @@ Init == /\ mon = 1
         /\ known = [n \in Nodes |-> {}]
         /\ sealed = [n \in Nodes |-> [b \in 1..MaxH |-> UNSEALED]]
         /\ pool = [n \in Nodes |-> {}]
+        /\ mh = [h \in 1..MaxH |-> 0]
+        /\ mview = [n \in Nodes |-> [h \in 1..MaxH |-> 0]]
+        /\ nreorg = 0
+        /\ nrestart = 0
+        /\ restarted = [n \in Nodes |-> FALSE]
 
 Tick == /\ mon < MaxH
         /\ mon' = mon + 1
         /\ UNCHANGED <<rec, nextId, known, sealed, pool>>
+        /\ UNCHANGED mvars
 
 CarrySeqs == {<< >>} \cup { << x >> : x \in Rids }
              \cup (IF MaxCarry >= 2 THEN { q \in Rids \X Rids : q[1] # q[2] } ELSE {})
+             \cup (IF MaxCarry >= 3 THEN { q \in Rids \X Rids \X Rids : q[1] # q[2] /\ q[1] # q[3] /\ q[2] # q[3] }
+                   ELSE {})
 
 
 (* A hash at carrier difficulty with a carried sequence.  Honest (Adv = FALSE): list in canonical order, every
@@ -177,35 +215,63 @@ Find(pay, h, tip, cs) ==
           /\ \A i \in 1..Len(cs) : tip = 0 \/ rec[cs[i]].bin + F > rec[tip].bin
   /\ LET isCar == \/ tip = 0
                   \/ \E n \in Nodes : tip \in Tips(n)
-     IN rec' = [rec EXCEPT ![nextId] = [payee |-> pay, bin |-> h, tip |-> tip, carries |-> cs,
+     IN rec' = [rec EXCEPT ![nextId] = [payee |-> pay, bin |-> h, tip |-> tip, carries |-> cs, ver |-> mh[h],
                                           kind |-> IF isCar THEN "carrier" ELSE "orphan"]]
   /\ nextId' = nextId + 1
   /\ UNCHANGED <<mon, known, sealed, pool>>
+  /\ UNCHANGED mvars
 
 Deliver(n, r) == /\ IsCarrier(r) /\ r \notin known[n]
                  /\ known' = [known EXCEPT ![n] = @ \cup {r}]
                  /\ UNCHANGED <<mon, rec, nextId, sealed, pool>>
+                 /\ UNCHANGED mvars
 
 (* Pending-receipt relay: only the omitlocal control reads it, so it is enabled only there (other spaces unchanged). *)
 DeliverPending(n, r) == /\ Rule = "omitlocal"
                         /\ rec[r].kind = "orphan" /\ r \notin pool[n]
                         /\ pool' = [pool EXCEPT ![n] = @ \cup {r}]
                         /\ UNCHANGED <<mon, rec, nextId, known, sealed>>
+                        /\ UNCHANGED mvars
 
 Prefix(ch, b) == SubSeq(ch, 1, SealPos(ch, b))
 
 Seal(n, b) == /\ LET ch == ChainOf(n) IN
                  /\ Sealable(ch, b)
                  /\ (~sealed[n][b].done \/ sealed[n][b].pre # Prefix(ch, b))
-                 /\ sealed' = [sealed EXCEPT ![n][b] = [done |-> TRUE, s |-> BinSet(ch, b, SealPos(ch, b)),
+                 /\ sealed' = [sealed EXCEPT ![n][b] = [done |-> TRUE, s |-> BinSetBy(n, ch, b, SealPos(ch, b)),
                                                            pre |-> Prefix(ch, b)]]
               /\ UNCHANGED <<mon, rec, nextId, known, pool>>
+              /\ UNCHANGED mvars
+
+(* A Monero reorg at a constant height: the blocks at heights h..mon get new hashes. *)
+MonReorg(h) == /\ nreorg < MaxReorg
+               /\ h \in 1..mon
+               /\ mh' = [k \in 1..MaxH |-> IF k >= h /\ k <= mon THEN mh[k] + 1 ELSE mh[k]]
+               /\ nreorg' = nreorg + 1
+               /\ UNCHANGED <<mon, rec, nextId, known, sealed, pool, mview, nrestart, restarted>>
+
+(* Node n follows the Monero chain it is shown (read only by the "hashlocal" control, so enabled only there). *)
+MonSync(n) == /\ Rule = "hashlocal"
+              /\ mview[n] # mh
+              /\ mview' = [mview EXCEPT ![n] = mh]
+              /\ UNCHANGED <<mon, rec, nextId, known, sealed, pool, mh, nreorg, nrestart, restarted>>
+
+(* A node restart: the carriers it holds are kept (its store); its seals and its pending pool are lost. *)
+Restart(n) == /\ nrestart < MaxRestart
+              /\ sealed' = [sealed EXCEPT ![n] = [b \in 1..MaxH |-> UNSEALED]]
+              /\ pool' = [pool EXCEPT ![n] = {}]
+              /\ nrestart' = nrestart + 1
+              /\ restarted' = IF Rule = "restartlocal" THEN [restarted EXCEPT ![n] = TRUE] ELSE restarted
+              /\ UNCHANGED <<mon, rec, nextId, known, mh, mview, nreorg>>
 
 Next == \/ Tick
         \/ \E p \in Payees, h \in 1..MaxH, t \in {0} \cup Rids, cs \in CarrySeqs : Find(p, h, t, cs)
         \/ \E n \in Nodes, r \in Rids : Deliver(n, r)
         \/ \E n \in Nodes, r \in Rids : DeliverPending(n, r)
         \/ \E n \in Nodes, b \in 1..MaxH : Seal(n, b)
+        \/ \E h \in 1..MaxH : MonReorg(h)
+        \/ \E n \in Nodes : MonSync(n)
+        \/ \E n \in Nodes : Restart(n)
 
 Spec == Init /\ [][Next]_vars
 
@@ -213,6 +279,7 @@ Spec == Init /\ [][Next]_vars
 TypeOK == /\ mon \in 1..MaxH
           /\ nextId \in 1..(Cardinality(Rids) + 1)
           /\ \A n \in Nodes : known[n] \subseteq Rids /\ pool[n] \subseteq Rids
+          /\ nreorg \in 0..MaxReorg /\ nrestart \in 0..MaxRestart
 
 Current(n, b) == LET ch == ChainOf(n) IN
                  sealed[n][b].done /\ Sealable(ch, b) /\ sealed[n][b].pre = Prefix(ch, b)

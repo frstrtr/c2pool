@@ -86,6 +86,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_template_underfill_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
+        found_block_peer_txid_test.cpp
         head_retention_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp

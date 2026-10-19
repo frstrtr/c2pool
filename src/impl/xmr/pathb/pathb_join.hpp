@@ -294,6 +294,7 @@ struct JoinInputs {
     std::uint64_t headers_frame_bytes = 0;   // what one FC_HEADERS frame holds (P-14, the caller's)
     std::uint64_t bucket_frame_bytes = 0;    // P-39
     std::uint32_t chain_id = 0;
+    std::size_t key_cache_bytes = kKeyCacheBytesDefault;  // P-36: the key cache of a joined state
     std::function<PrInfo(const Hash32& p_r)> resolve_pr;
     std::function<std::optional<Hash32>(const Hash32& p_r)> seed_of;
     std::function<bool(const HashingBlob&, std::uint64_t d, const Hash32& seed)> randomx;
@@ -403,7 +404,8 @@ struct AtHeader {
 // ---------------------------------------------------------------------------
 class JoinedState final : public AdoptedChain {
 public:
-    JoinedState(const JoinInputs& in, std::uint64_t server) : in_(&in), server_(server), claims_(*this) {
+    JoinedState(const JoinInputs& in, std::uint64_t server)
+        : in_(&in), server_(server), claims_(*this), own_keys_(in.key_cache_bytes) {
         windows_ = &own_windows_;
         keys_ = &own_keys_;
     }
@@ -442,6 +444,7 @@ public:
     const JoinClaims& claims() const noexcept { return claims_; }
     WindowCache& windows() noexcept { return *windows_; }
     KeyCache& keys() noexcept { return *keys_; }
+    const KeyCache& keys() const noexcept { return *keys_; }
     // The cache instances this state uses (its own unless set otherwise).
     void use_caches(WindowCache& w, KeyCache& k) noexcept {
         windows_ = &w;
@@ -626,7 +629,9 @@ inline Basis JoinClaims::base_basis(RowClass k, const Hash32& tip, std::uint64_t
             // a carried receipt whose tip lies below the root x0 - 1 (ruling 47, E-84): its d_at window lies below the
             // PRE the joiner holds, a claim it does not compute
             if (replay && s.x0 > 1 && x <= s.x0 - 1) return Basis::NotComputed;
-            return replay && x <= x1 + s.inputs().p.retarget_span ? Basis::ClaimSpan : Basis::Computed;
+            // a window that reads the claimed prefix or span: a claim (after L, a mismatch is ClaimLeaf, never a BAN)
+            if (x <= x1 + s.inputs().p.retarget_span) return replay ? Basis::ClaimSpan : Basis::ClaimLeaf;
+            return Basis::Computed;
         case RowClass::Coinbase:
             if (x <= x1) return Basis::NotComputed;  // a tip below x1 (D35)
             if (replay) return x == x1 + 1 || st_->window_reads_claimed(tip) ? Basis::ClaimSpan : Basis::Computed;
@@ -930,7 +935,23 @@ enum class AttemptEnd : std::uint8_t {
     Header,         // the header phase (header checks (4), (5)): the end, the server excluded with all its pairs, no token
     OutOfScope,     // 3.3 step 2a: L held by A, or forking above A's x1 and at or above its base: dropped
     Known,          // 3.3a (5): a completed candidate that did not replace A: dropped
+    NodeInternal,   // a RandomX failure inside the attempt (node-internal): the end, a local alarm, no token, re-queued
 };
+
+inline constexpr const char* attempt_end_name(AttemptEnd e) noexcept {
+    switch (e) {
+        case AttemptEnd::Completed: return "Completed";
+        case AttemptEnd::Alarm: return "Alarm";
+        case AttemptEnd::NotServed: return "NotServed";
+        case AttemptEnd::Contradiction: return "Contradiction";
+        case AttemptEnd::Unplaceable: return "Unplaceable";
+        case AttemptEnd::Header: return "Header";
+        case AttemptEnd::OutOfScope: return "OutOfScope";
+        case AttemptEnd::Known: return "Known";
+        case AttemptEnd::NodeInternal: return "NodeInternal";
+    }
+    return "?";
+}
 
 inline constexpr bool attempt_excludes(AttemptEnd e) noexcept {
     return e == AttemptEnd::Alarm || e == AttemptEnd::Contradiction || e == AttemptEnd::Unplaceable ||
@@ -954,6 +975,8 @@ struct AttemptReport {
     std::shared_ptr<const BoundWork> a_profile;  // A's bound work, read when the attempt took its L
     bool a_profile_read = false;
     bool force_young = false;              // ruling 47: the next attempt of this pair runs the young path
+    std::uint32_t side_needs = 0;          // side branches forking at a prefix node below the root whose state (S(f),
+                                           // or bins sealed on the branch) the attempt took from the server
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -1565,6 +1588,7 @@ private:
             const CarrierNode* fn = s.tree->find(y.own.side.tip);  // the fork: the first side carrier's parent
             if (fn == nullptr || fn->pos >= root_pos || fn->pos < first_pos) continue;  // not a PRE node below the root
             if (!span_s_done_.insert(t).second) continue;      // S(f) for this side branch already attempted
+            ++rep_.side_needs;                                 // a side branch's state from the server (soak count)
             const std::uint64_t lc = bin_leaf_count(fn->H, in_.b0, in_.p.open_bins);
             if (lc == 0) return SpanFold::Young;               // no bin sealed at or before f (ruling 47): the young path
             std::vector<Hash32> cids;
@@ -1606,6 +1630,7 @@ private:
         JoinedState& s = *st_;
         const LaneDelta* d = s.store->delta(pn.id);
         if (d == nullptr || d->pending.empty()) return true;
+        ++rep_.side_needs;  // a side branch's bins from the server (soak count)
         const std::vector<std::uint64_t> bins = d->pending;
         const AtHeader at{receipt_id(c.own), join_detail::digest_of(header_of(c)).value_or(Hash32{})};
         const BucketsAnchor anchor{true, pn.H, c.own.side.mmr_root, c.own.side.receipts_root, ids_of(c)};
@@ -1908,7 +1933,17 @@ public:
             JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
             att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
             att.set_force_young(p->young);
-            return Attempted{*p, att.run(p->candidate)};
+            try {
+                return Attempted{*p, att.run(p->candidate)};
+            } catch (const RandomxFailure& e) {  // node-internal: the attempt ends; no token; the pair stays queued
+                AttemptReport rep;
+                rep.end = AttemptEnd::NodeInternal;
+                rep.server = p->server;
+                rep.candidate = p->candidate;
+                rep.alarms = 1;
+                rep.what = e.what();
+                return Attempted{*p, std::move(rep)};
+            }
         }
     }
     AttemptReport apply(Attempted&& t) {
@@ -1924,6 +1959,7 @@ public:
                 queue_.requeue(q);
                 break;
             }
+            case AttemptEnd::NodeInternal: queue_.requeue(*p); break;
             case AttemptEnd::Alarm:
             case AttemptEnd::Contradiction:
             case AttemptEnd::Unplaceable:

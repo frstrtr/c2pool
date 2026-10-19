@@ -309,6 +309,7 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
         if (m_nonce == msg->m_nonce)
         {
                 LOG_WARNING << "[Pool] was connected to self";
+                ban_self_connection(peer->addr());
                 return std::nullopt;
         }
 
@@ -1694,6 +1695,67 @@ dgb::SupersedeHint NodeImpl::gate_supersede_convergence(dgb::SupersedeHint hint)
     return hint;
 }
 
+// The dgb canonical is frstrtr/p2pool-dgb-scrypt @22761e7, the oracle our dgb
+// network runs. p2p.py:160-161 raises PeerMisbehavingError on our own nonce.
+// badPeerHappened (:96-105) turns that into a ban on the HOST, never 127.0.0.1,
+// for 3600 * banscore^2 seconds. The ban is host-keyed (m_ip_ban_list), so the
+// dial loop and connected() both refuse it through is_banned() on any port.
+// Without it the endpoint stayed in the AddrStore and was redialled every think
+// tick.
+void NodeImpl::ban_self_connection(const NetService& addr)
+{
+    const std::string host = addr.address();
+    if (host == "127.0.0.1")
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    run_forgiveness(now);
+    const long long score = ++m_banscores[host];
+    const auto duration = std::chrono::seconds(3600LL * score * score);
+    m_ip_ban_list[host] = now + duration;
+    LOG_WARNING << "[Pool] Self-connection via " << addr.to_string()
+                << ": banning host " << host << " for " << duration.count()
+                << "s (banscore " << score << ")";
+}
+
+// One hourly pass: every scored host loses one point, clamped at zero. Only the
+// score is forgiven. A ban already written to m_ip_ban_list runs to its expiry,
+// as canonical's self.bans does.
+//
+// This DIVERGES from the letter of the anchor on purpose. 22761e7
+// forgive_transgressions (p2p.py:715-719) reads self.banscore, singular, so its
+// first pass raises AttributeError inside the LoopingCall (:712-713), the task
+// stops, and the dgb oracle never forgives at all. The intent is plain from the
+// loop, and the bch anchor (p2poolBCH @6603b79) carries the same pass with the
+// right name. This port forgives, as bch and ltc do.
+//
+// Canonical keeps a host at score 0 rather than deleting it. The next offence
+// scores 1 either way, so the entry is dropped here to keep the map bounded.
+void NodeImpl::forgive_transgressions()
+{
+    for (auto it = m_banscores.begin(); it != m_banscores.end();)
+    {
+        if (--it->second <= 0)
+            it = m_banscores.erase(it);
+        else
+            ++it;
+    }
+}
+
+// Canonical runs the pass from a LoopingCall started with the node (:712-713,
+// every 3600 s). Here the passes that fell due since the node started are
+// applied on the next think cycle, or before a new offence is scored.
+void NodeImpl::run_forgiveness(std::chrono::steady_clock::time_point now)
+{
+    if (now <= m_forgiveness_epoch)
+        return;
+    const auto due = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_forgiveness_epoch).count()
+        / FORGIVENESS_INTERVAL.count());
+    for (; m_forgiveness_passes < due; ++m_forgiveness_passes)
+        forgive_transgressions();
+}
+
 void NodeImpl::run_think()
 {
     // Skip if a think() is already running on the compute thread.
@@ -1874,6 +1936,8 @@ void NodeImpl::run_think()
                 if (it->second <= now) it = m_ban_list.erase(it);
                 else ++it;
             }
+            // #1716 part B: apply the hourly banscore forgiveness.
+            run_forgiveness(now);
 
             // Clear stale download set (p2pool node.py:108-141)
             m_downloading_shares.clear();

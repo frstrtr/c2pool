@@ -38,12 +38,20 @@
 //       another pool or G has its own directory name; an adoption clears
 //       every key of the old store;
 //   (8) the LevelDB archive: the same store written through it, reopened,
-//       loads to the live state.
+//       loads to the live state;
+//  (8b) a store LevelDB cannot read: its load and an adoption's clear batch
+//       fail; moved aside once to <dir>.corrupt-<unix s>, an empty store in
+//       its place takes the adoption and loads; no second move, no poison;
+//  (10) a pruned store (prune_batch): records below first_pos deleted, header
+//       records to root_pos, the root's record whole; K_BLHASH, K_BLEAF and
+//       K_AR untouched; a store launched here and a joined store (its AR seed
+//       below the pruned root) reload live-equal from the root.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <optional>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -99,6 +107,7 @@ const char* fault_name(pb::StoreFault f) {
         case pb::StoreFault::Phase2: return "Phase2";
         case pb::StoreFault::Scan: return "Scan";
         case pb::StoreFault::Poisoned: return "Poisoned";
+        case pb::StoreFault::Work: return "Work";
     }
     return "?";
 }
@@ -318,6 +327,9 @@ void prefix_and_joined() {
     const pb::LaneLoad ll = pb::load_lane_prefix(lane, 0, kLaneB0, 96, n.store.best_tip(), n.store.tip_pos(),
                                                  tv.record(tv.pos()), h.base_leaf_count, h.base_peaks);
     check(ll.fault == pb::LoadFault::None && ll.mmr.root() == n.store.head().root, "(4) the prefix load from the base's peaks");
+    // a joined store holds its K_BLO (x1 + 1; here x1 = the root); without it the load fails (Work)
+    check(reload(net, kv, 64).r.fault == pb::StoreFault::Work, "(4) a joined-shape store without K_BLO: Work");
+    kv.data[pb::store_keys::blo(0)] = pb::encode_blo(root + 1);
     Reloaded r = reload(net, kv, 64);
     check(r.r.fault == pb::StoreFault::None, "(4) the joined-shape store loads: " + why(r.r));
     if (r.n) {
@@ -326,6 +338,34 @@ void prefix_and_joined() {
                       && r.n->tree.best().id == n.tree.best().id && r.n->tree.best().rs == n.tree.best().rs
                       && r.n->ar.rows().size() == 1 && r.n->ar.joiner_p0() == root + 1,
               "(4) the joined-shape store: the live window and roots, S at the tip, AR = the joiner seed");
+    }
+    // K_BCLAIM's range: a sealed leaf at the tip, below the first leaf or at or below the adopt bound H(x0 - 1) + Fresh
+    {
+        const pb::LaneParams& p = pb::kRuledLaneParams;
+        const std::uint64_t lc_tip = pb::bin_leaf_count(n.tree.best().H, kLaneB0, p.open_bins);
+        const std::uint64_t bound = h.base_leaf_count + kLaneB0 + p.open_bins - 1 + p.fresh_max;
+        const auto with_claim = [&](std::uint64_t bin) {
+            MemoryKv k3 = kv;
+            k3.data[pb::store_keys::bclaim(0, bin)] = pb::encode_bclaim(pb::BclaimRecord{bin, seq32(0x61), seq32(0x62)});
+            return reload(net, k3, 64);
+        };
+        // a full store (no adopt bound): a sealed leaf at the tip loads, the first unsealed bin is Work
+        const auto full_with_claim = [&](std::uint64_t bin) {
+            MemoryKv k4 = sn.kv;
+            k4.data[pb::store_keys::bclaim(0, bin)] = pb::encode_bclaim(pb::BclaimRecord{bin, seq32(0x63), seq32(0x64)});
+            return reload(net, k4, 64).r.fault;
+        };
+        check(full_with_claim(kLaneB0 + lc_tip - 1) == pb::StoreFault::None
+                      && full_with_claim(kLaneB0 + lc_tip) == pb::StoreFault::Work,
+              "(4) K_BCLAIM in a full store: a sealed leaf at the tip loads; an unsealed bin: Work");
+        const Reloaded below = with_claim(kLaneB0 + h.base_leaf_count - 1);
+        const Reloaded at_bound = with_claim(bound);
+        const Reloaded above_bound = with_claim(bound + 1);
+        const Reloaded unsealed = with_claim(kLaneB0 + lc_tip);
+        check(bound + 1 < kLaneB0 + lc_tip && below.r.fault == pb::StoreFault::None && below.r.state->claimed.size() == 1
+                      && at_bound.r.fault == pb::StoreFault::None && above_bound.r.fault == pb::StoreFault::Work
+                      && unsealed.r.fault == pb::StoreFault::Work,
+              "(4) K_BCLAIM below the first leaf and at the adopt bound load; above the bound and on an unsealed bin: Work");
     }
     // one position after the base
     {
@@ -614,6 +654,173 @@ void archive() {
     std::filesystem::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// (8b) a store LevelDB cannot read: written through the archive, a table file's middle bytes flipped. Its load fails,
+// a full scan fails and so does an adoption's clear batch (the poison of a write failure); moved aside once to the
+// sibling <dir>.corrupt-<unix s> (nothing deleted), an empty store in its place takes the adoption (clear batch +
+// the joined store's records) and loads it; the next start reads it whole (no second move, no poison).
+void archive_corrupt() {
+    namespace fs = std::filesystem;
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 300, 0xC1, 2, 71);
+    const fs::path base = fs::temp_directory_path() / ("pathb_store_kat_corrupt_" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    const fs::path dir = base / pb::store_dir_name(net.pool_id, net.rules_g);
+    fs::create_directories(dir);
+    {
+        std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+        pb::LaneBatch all;
+        for (const auto& [k, v] : sn.kv.data) all.put(k, v);
+        check(db && pb::commit_lane_batch(*db, all), "(8b) the store written through the archive");
+    }
+    { std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string()); }  // reopened: the log goes into a table file
+    fs::path victim;
+    std::uintmax_t vsz = 0;
+    for (const auto& de : fs::directory_iterator(dir))
+        if (de.path().extension() == ".ldb" && de.file_size() > vsz) {
+            victim = de.path();
+            vsz = de.file_size();
+        }
+    check(!victim.empty(), "(8b) a table file to corrupt");
+    if (victim.empty()) return;
+    {
+        std::FILE* f = std::fopen(victim.string().c_str(), "r+b");
+        std::vector<unsigned char> blk(64);
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        const std::size_t n = std::fread(blk.data(), 1, blk.size(), f);
+        for (std::size_t i = 0; i < n; ++i) blk[i] ^= 0xa5;
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        std::fwrite(blk.data(), 1, n, f);
+        std::fclose(f);
+    }
+    std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+    check(db != nullptr, "(8b) the corrupted store opens");
+    if (!db) return;
+    KatNode probe(net, 64);
+    const pb::LoadResult r = pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64));
+    pb::LaneBatch clear;
+    check(r.fault != pb::StoreFault::None && r.fault != pb::StoreFault::NoHead && !pb::store_readable(*db)
+                  && !pb::clear_store_batch(*db, 0, clear),
+          "(8b) the corrupted store: a load failure, a full scan fails, an adoption's clear batch cannot be built: " + why(r));
+    std::string moved, mwhy;
+    db = pb::move_store_aside(std::move(db), dir.string(), 1000, moved, mwhy);
+    std::size_t siblings = 0;
+    for (const auto& de : fs::directory_iterator(base)) siblings += de.path().filename().string().find(".corrupt-") != std::string::npos;
+    check(db != nullptr && moved == dir.string() + ".corrupt-1000" && fs::exists(fs::path(moved) / victim.filename())
+                  && siblings == 1 && pb::store_readable(*db) && !db->get(pb::store_keys::phead(0)),
+          "(8b) moved aside to <dir>.corrupt-1000 (its files kept), an empty store in its place: " + mwhy);
+    if (!db) return;
+    pb::LaneBatch adopt;
+    bool ok = pb::clear_store_batch(*db, 0, adopt);
+    for (const auto& [k, v] : sn.kv.data) adopt.put(k, v);
+    ok = ok && pb::commit_lane_batch(*db, adopt);
+    const pb::LoadResult r2 = pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64));
+    check(ok && r2.fault == pb::StoreFault::None && r2.state && r2.state->tree.best().id == sn.n.tree.best().id
+                  && !db->get(pb::store_keys::poison(0)),
+          "(8b) the empty store takes the adoption batch and loads it, no poison mark: " + why(r2));
+    db.reset();
+    std::unique_ptr<pb::PathbKv> again = pb::open_pathb_store(dir.string());
+    const pb::LoadResult r3 = again ? pb::pathb_load(*again, net.pool_id, net.rules_g, inputs(probe, 64)) : pb::LoadResult{};
+    std::size_t siblings2 = 0;
+    for (const auto& de : fs::directory_iterator(base)) siblings2 += de.path().filename().string().find(".corrupt-") != std::string::npos;
+    check(again && r3.fault == pb::StoreFault::None && pb::store_readable(*again) && siblings2 == 1,
+          "(8b) the next start loads it whole: no second move, no poison loop: " + why(r3));
+    again.reset();
+    fs::remove_all(base);
+}
+
+// ---------------------------------------------------------------------------
+// (10) a pruned store (prune_batch): K_PCARRIER below first deleted, [first, root) header records, the record at the
+// root whole, K_PHEAD first_pos / root_pos / base_pos >= root; K_BLHASH, K_BLEAF and K_AR untouched. A store launched
+// here (no AR seed) and a joined store (its AR seed below the pruned root) reload live-equal (the tree from the root,
+// its retarget window from the records), the header records as prefix headers; the reloaded node places the next
+// carriers as the live one.
+std::size_t keys_under(const MemoryKv& kv, const std::string& prefix) {
+    std::size_t n = 0;
+    for (auto it = kv.data.lower_bound(prefix); it != kv.data.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it)
+        ++n;
+    return n;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> window_through(const pb::CarrierTree& t, const pb::Hash32& id) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+    if (const auto e = t.window_entries(id, pb::kRuledLaneParams.retarget_span))
+        for (const pb::RetargetEntry& r : *e) out.emplace_back(r.d, r.H);
+    return out;
+}
+
+void pruned() {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 3700, 0x87, 2, 27);
+    KatNode& n = sn.n;
+    const auto header_only = [](const std::optional<std::string>& v) {
+        const std::optional<pb::CarrierRecord> c = v ? pb::decode_pcarrier(*v) : std::nullopt;
+        return c && !c->state && c->kind == pb::RecordBody::Header && c->placements.empty();
+    };
+    const auto whole = [](const std::optional<std::string>& v) {
+        const std::optional<pb::CarrierRecord> c = v ? pb::decode_pcarrier(*v) : std::nullopt;
+        return c && c->state && c->kind == pb::RecordBody::Carrier;
+    };
+    {
+        const std::uint64_t first = 100, root = 2400;  // first <= root + 1 - N_rt: the root's retarget window held
+        MemoryKv kv = sn.kv;
+        pb::StoreHead h = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        const std::size_t blhash = keys_under(kv, pb::lane_keys::blhash_prefix(0)),
+                          bleaf = keys_under(kv, pb::lane_keys::bleaf_prefix(0));
+        const std::optional<pb::LaneBatch> b = pb::prune_batch(0, h, n.tree, n.store, n.bodies, first, root);
+        check(b && pb::commit_lane_batch(kv, *b), "(10) the prune batch of a store launched here commits");
+        const pb::StoreHead hd = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        check(!kv.get(pb::store_keys::pcarrier(0, first - 1)) && header_only(kv.get(pb::store_keys::pcarrier(0, first)))
+                      && header_only(kv.get(pb::store_keys::pcarrier(0, root - 1))) && whole(kv.get(pb::store_keys::pcarrier(0, root)))
+                      && hd.first_pos == first && hd.root_pos == root && hd.base_pos >= root
+                      && keys_under(kv, pb::lane_keys::blhash_prefix(0)) == blhash && keys_under(kv, pb::lane_keys::bleaf_prefix(0)) == bleaf
+                      && keys_under(kv, pb::store_keys::ar_prefix(0)) == 0,
+              "(10) records below first deleted, header records to the root, the root's whole; K_BLHASH, K_BLEAF untouched");
+        Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::None, "(10) the pruned store reloads: " + why(r.r));
+        if (r.n) {
+            const pb::Hash32 root_id = *n.store.best_at(root);
+            check(lane_digest(*r.n) == lane_digest(n) && r.n->tree.genesis().id == root_id && r.n->store.first_record_pos() == first
+                          && r.r.state->prefix_headers.size() == root - first && r.n->ar.rows().empty() && !r.n->ar.joiner_p0()
+                          && window_through(r.n->tree, root_id) == window_through(n.tree, root_id)
+                          && window_through(n.tree, root_id).size() == pb::kRuledLaneParams.retarget_span,
+                  "(10) live-equal from the root (" + std::to_string(root) + "), the root's retarget window, the prefix headers, "
+                  "the genesis AR");
+            KatNode live(n);
+            bool same = true;
+            for (std::uint64_t k = 0; k < 5; ++k) {
+                const pb::CarrierNode& best = live.tree.best();
+                const pb::CarrierBodyV3 c = scaffold_carrier(live, best.id, h_pos(best.pos + 1), 0x88, 9000 + k, 2, {});
+                same = same && place_direct(live, c).outcome == pb::WriteOutcome::Extended
+                       && place_direct(*r.n, c).outcome == pb::WriteOutcome::Extended && lane_digest(live) == lane_digest(*r.n);
+            }
+            check(same, "(10) the reloaded node places the next carriers as the live one");
+        }
+    }
+    {
+        // a joined store (root 2,300, its AR seed there, base 3,600) pruned at root 2,450 (the seed below it; at or
+        // below the phase-1 start of a restart at J 64), its records from 200 (the root's retarget window held)
+        const std::uint64_t first = 200, root = 2450;
+        MemoryKv kv = joined_shape(sn.kv, n, 2300, 3600);
+        pb::StoreHead h = *pb::decode_phead(*kv.get(pb::store_keys::phead(0)));
+        const std::string seed = *kv.get(pb::store_keys::ar(0, 2300));
+        const std::optional<pb::LaneBatch> b = pb::prune_batch(0, h, n.tree, n.store, n.bodies, first, root);
+        check(b && pb::commit_lane_batch(kv, *b) && kv.get(pb::store_keys::ar(0, 2300)) == seed,
+              "(10) the prune batch of a joined store commits; its AR seed row kept");
+        Reloaded r = reload(net, kv, 64);
+        check(r.r.fault == pb::StoreFault::None, "(10) the pruned joined store reloads: " + why(r.r));
+        if (r.n) {
+            const pb::TipWindow a = n.window(n.tree.best().id), c = r.n->window(r.n->tree.best().id);
+            check(a.ok() && c.ok() && a.window_root == c.window_root && a.mmr_root == c.mmr_root
+                          && r.n->tree.best().id == n.tree.best().id && r.n->tree.best().rs == n.tree.best().rs
+                          && r.n->tree.genesis().pos == root && r.n->ar.rows().size() == 1 && r.n->ar.joiner_p0() == 2301,
+                  "(10) the pruned joined store: the live window and roots, S at the tip, AR = the joiner seed below the root");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -632,5 +839,7 @@ int main(int argc, char** argv) {
     run("phase1link", phase1_link);
     run("directory", directory);
     run("archive", archive);
+    run("archivecorrupt", archive_corrupt);
+    run("pruned", pruned);
     return finish("v37_xmr_pathb_store_kat");
 }

@@ -48,6 +48,8 @@
 //   window); a window that leaves the held prefix has no value; no node below
 //   the root (a prefix node, or a side branch forking at one) is eligible for
 //   the best tip.
+//   reroot(): the tree of a node that prunes, rooted at a best-chain carrier
+//   with the retarget entries through it as its inherited window.
 //   Headers-first: an announced side header weighs its retarget d on the
 //   side chain; it fails on a parent link that does not continue the side
 //   chain, a height below the record of its parent, or a failed PoW at that
@@ -224,6 +226,9 @@ public:
         CarrierNode& r = t.nodes_[0];
         r.pos = root_pos;
         r.rs = root_s;
+        // the root's own d: its claimed t_origin, the newest `pre` entry (the window reads it from inherited_, never
+        // from node 0; its record keeps it, so a restart's window reads the same value)
+        if (!pre.empty()) r.d = pre.back().d;
         // the PRE nodes below the root (claims; reached only by find() for the row-17 walk, never by window_after)
         for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
             const PreNode& pn = pre_nodes[k];
@@ -266,9 +271,12 @@ public:
         RatchetState rs{};
         std::optional<ActivationRow> activation;
     };
+    // `pre_nodes`: an unpruned joined store's claimed prefix [x_pre, x0 - 2] (its records), restored as the
+    // joined tree holds them (below the root, claims; `joined`).
     static std::optional<CarrierTree> restored(const LaneParams& p, std::span<const RestoredNode> chain,
                                                const EpochTable& table, std::span<const RetargetEntry> inherited = {},
-                                               const RatchetParams& rp = kRuledRatchetParams) {
+                                               const RatchetParams& rp = kRuledRatchetParams,
+                                               std::span<const PreNode> pre_nodes = {}) {
         if (chain.empty()) return std::nullopt;
         for (std::size_t k = 1; k < chain.size(); ++k)
             if (chain[k].parent != chain[k - 1].id || chain[k].pos != chain[k - 1].pos + 1) return std::nullopt;
@@ -298,6 +306,24 @@ public:
             if (!t.index_.emplace(r.id, k).second) return std::nullopt;
         }
         t.best_ = chain.size() - 1;
+        for (std::size_t k = 0; k < pre_nodes.size(); ++k) {
+            const PreNode& pn = pre_nodes[k];
+            if (pn.pos >= chain[0].pos || (k > 0 && pn.pos != pre_nodes[k - 1].pos + 1)) return std::nullopt;
+            CarrierNode n;
+            n.id = pn.id;
+            n.pos = pn.pos;
+            n.h = pn.h;
+            n.H = pn.H;
+            n.d = pn.d;
+            n.verified = n.bodies = n.chain_valid = true;
+            n.below_root = true;  // never the best tip (ruling 53, E-105)
+            n.pre_fork_H = pn.H;
+            n.parent = k > 0 ? pre_nodes[k - 1].id : pn.id;
+            const std::size_t idx = t.nodes_.size();
+            n.parent_index = k > 0 ? t.index_.at(pre_nodes[k - 1].id) : idx;
+            t.nodes_.push_back(std::move(n));
+            if (!t.index_.emplace(pn.id, idx).second) return std::nullopt;
+        }
         return t;
     }
 
@@ -497,6 +523,61 @@ public:
             nodes_[i].children.clear();
         }
         return true;
+    }
+
+    // Re-roots the tree at its best chain's carrier at position `pos` (above
+    // the current root, at or below the best tip): the carriers below it go,
+    // and so does every side branch whose fork with the best chain lies below
+    // max(pos, side_floor); the new root keeps its values and S, is its own
+    // parent, and the retarget entries of the N_rt positions through it
+    // become its inherited window (as a tree restored from that root).
+    // Waiting entries stay. Returns the ids that left the tree; nullopt:
+    // nothing changed.
+    std::optional<std::vector<Hash32>> reroot(std::uint64_t pos, std::uint64_t side_floor) {
+        if (pos <= nodes_[0].pos || pos > nodes_[best_].pos) return std::nullopt;
+        std::vector<bool> on_best(nodes_.size(), false);
+        std::size_t r = best_;
+        for (;;) {
+            on_best[r] = true;
+            if (nodes_[r].pos == pos) break;
+            r = nodes_[r].parent_index;
+        }
+        std::optional<std::vector<RetargetEntry>> inherited = entries_after_index(r, p_.retarget_span);
+        if (!inherited) return std::nullopt;
+        const std::uint64_t side_lo = std::max(pos, side_floor);
+        std::vector<std::size_t> keep{r};
+        for (std::size_t k = 0; k < keep.size(); ++k) {
+            const std::size_t i = keep[k];
+            for (std::size_t ch : nodes_[i].children)
+                if (on_best[ch] || !on_best[i] || nodes_[i].pos >= side_lo) keep.push_back(ch);
+        }
+        std::vector<std::size_t> remap(nodes_.size(), nodes_.size());
+        for (std::size_t k = 0; k < keep.size(); ++k) remap[keep[k]] = k;
+        std::vector<Hash32> dropped;
+        for (const auto& [id, i] : index_)
+            if (remap[i] >= keep.size()) dropped.push_back(id);
+        std::vector<CarrierNode> out;
+        out.reserve(keep.size());
+        for (std::size_t k = 0; k < keep.size(); ++k) {
+            CarrierNode n = std::move(nodes_[keep[k]]);
+            if (k == 0) {
+                n.parent = n.id;
+                n.parent_index = 0;
+            } else {
+                n.parent_index = remap[n.parent_index];
+            }
+            std::vector<std::size_t> ch;
+            for (std::size_t c : n.children)
+                if (remap[c] < keep.size()) ch.push_back(remap[c]);
+            n.children = std::move(ch);
+            out.push_back(std::move(n));
+        }
+        best_ = remap[best_];
+        nodes_ = std::move(out);
+        index_.clear();
+        for (std::size_t k = 0; k < nodes_.size(); ++k) index_.emplace(nodes_[k].id, k);
+        inherited_ = std::move(*inherited);
+        return dropped;
     }
 
     // The newest common ancestor of a and b.

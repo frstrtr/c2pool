@@ -233,7 +233,7 @@ inline std::string lane_digest(KatNode& n) {
 // A joined-shape copy of a node's store: first_pos = root + 1 - N_rt, root_pos
 // = root (its S kept, the AR joiner seed there), base_pos = base, the base's
 // leaf count and peaks at the joined MMR's start lc(H(root)) (F-5; the leaves
-// below it gone), the records below the root headers without S.
+// below it gone), the records below the root headers without S, K_BLO = root + 1.
 inline MemoryKv joined_shape(const MemoryKv& from, KatNode& n, std::uint64_t root, std::uint64_t base) {
     MemoryKv kv = from;
     pb::StoreHead h = *pb::decode_phead(kv.data[pb::store_keys::phead(0)]);
@@ -248,6 +248,7 @@ inline MemoryKv joined_shape(const MemoryKv& from, KatNode& n, std::uint64_t roo
     h.s_base = pb::encode_ratchet_state(n.tree.find(*n.store.best_at(base))->rs);
     kv.data[pb::store_keys::phead(0)] = pb::encode_phead(h);
     kv.data[pb::store_keys::ar(0, root)] = pb::encode_ar_row(pb::ActivationRow{s_root.epoch_cur, root, s_root.rules_cur});
+    kv.data[pb::store_keys::blo(0)] = pb::encode_blo(root + 1);  // a joined store's K_BLO (x1 + 1; here x1 = the root)
     for (std::uint64_t x = 0; x < first; ++x) kv.data.erase(pb::store_keys::pcarrier(0, x));
     for (std::uint64_t i = 0; i < h.base_leaf_count; ++i) {
         kv.data.erase(pb::lane_keys::blhash(0, i));

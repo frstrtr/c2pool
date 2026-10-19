@@ -460,6 +460,7 @@ inline const char* end_name(pb::AttemptEnd e) {
         case pb::AttemptEnd::Header: return "Header";
         case pb::AttemptEnd::OutOfScope: return "OutOfScope";
         case pb::AttemptEnd::Known: return "Known";
+        case pb::AttemptEnd::NodeInternal: return "NodeInternal";
     }
     return "?";
 }

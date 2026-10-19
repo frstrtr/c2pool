@@ -85,7 +85,7 @@ Boost throw site now reads `conan-home/p/boostf82ae2881fe5c/p/include/boost/asio
 where it used to read `/home/<user>/.conan2/p/…`. A diff of base and fix
 disassembly, normalised for addresses, is identical, and so are all the
 symbol sizes except `_DYNAMIC`, which is one entry shorter because the RUNPATH
-is gone. `--help` output is byte-identical, and `--mock-smoke` passes 83/83 on
+is gone. `--help` output is byte-identical, and `--mock-smoke` (a flag removed at the S4w flag day) passes 83/83 on
 both. `-fmacro-prefix-map` (implied by `-ffile-prefix-map`) rewrites
 `__FILE__` only. It never rewrites string literals or `-D…="${CMAKE_SOURCE_DIR}/…"`
 definitions, so tests that locate data through such defines are unaffected.

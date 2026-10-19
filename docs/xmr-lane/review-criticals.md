@@ -1,5 +1,11 @@
 # XMR lane: the external payout review, finding by finding
 
+> Removed at the S4w flag day: this page describes the old payout path (the
+> owed ledger, the lane coinbase recompute, the settlement knobs). `c2pool-v37-xmr`
+> runs Path B and refuses the old path's flags ("removed at the S4w flag day").
+> The pages it names under `docs/xmr-lane/` that describe that path were removed
+> with it.
+
 Review: [Fairness gaps in the c2pool payout ledger](https://gist.github.com/SChernykh/636eca0b73181277ea85401b6b1e24ba)
 (19 September 2026; mirror: https://gist.github.com/frstrtr/24e51a4a64bb0cc3faf0af653718cece).
 Tracking issues #1860 to #1869. Audit response: v37 payout fairness audit, 2026-09-28.

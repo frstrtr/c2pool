@@ -8,9 +8,9 @@
 //
 // THE THREAT (v37-monero-randomx-lane-scoping.md §1.3 item 3 / §1.4 item 3, and
 // the annex P1 §2.4):
-//   Family-B receipt verification runs RandomX LAST (xmr_admission.hpp), so a
-//   carrier reaches the ~10-15 ms light-mode RandomX hash only after passing the
-//   microsecond dedup/expiry/structural/R-1 checks. Those cheap checks are
+//   Path B admission runs RandomX LAST (pathb_admit.hpp), so a carrier reaches
+//   the ~10-15 ms light-mode RandomX hash only after passing the microsecond
+//   dedup / freshness / structural / origin-target checks. Those cheap checks are
 //   satisfiable by a STRUCTURALLY valid carrier whose PoW simply does not meet
 //   the opened T_origin — trivial and free for an attacker to mint (any nonce
 //   that misses target), yet each one costs the verifier one full RandomX hash.
@@ -25,20 +25,16 @@
 //   "UNSTABLE HARDWARE DETECTED" before trusting the failure).
 //
 // WHERE THE TOKEN IS SPENT (the load-bearing seam):
-//   The bucket meters RANDOMX EVALUATIONS, not messages. A token is taken at the
-//   moment a carrier is about to be handed to the RandomX step (admission stage 5),
-//   i.e. only AFTER stages 1-4 passed. The relay wires this by having the
-//   admission `seed_for_bin` hook consult grant_randomx() (see
-//   xmr_carrier_relay.hpp): no token => the hook returns false => admission
-//   reports stage-5 reject with spent_randomx == FALSE (a "not verifiable now"
-//   defer, NO penalty), and rx_check is never called. rx_check therefore runs
-//   ONLY on a granted token, so its outcome is unambiguous:
-//       * PoW meets target  -> Accept, spent_randomx == true  -> refund the token
+//   The bucket meters RANDOMX EVALUATIONS, not messages. The Path B relay node
+//   (pathb_relay_node.hpp) takes the sender's token before a frame's admission
+//   runs: no token => the frame waits (a "not verifiable now" defer, NO
+//   penalty) and nothing is hashed. The admission therefore runs ONLY on a
+//   granted token, so its outcome is unambiguous:
+//       * PoW meets target  -> admitted -> refund the token
 //                              (honest work; it is already PoW-rate-limited).
-//       * PoW below target  -> stage-5 reject, spent_randomx == true -> the token
-//                              stays spent AND the peer is (optionally re-verified
-//                              then) BANNED: an unmet target on a completed hash
-//                              is incontrovertible proof of a bogus carrier.
+//       * PoW below target  -> STRIKE or BAN -> the token stays spent: an unmet
+//                              target on a completed hash is incontrovertible
+//                              proof of a bogus carrier.
 //   With refund-on-valid (default), the per-peer bucket depletes ONLY on wasted
 //   (invalid) RandomX. A flooder is throttled to `refill` wasted hashes/s until
 //   the ban lands; an honest peer never depletes it.
@@ -60,8 +56,8 @@
 // ISOLATION: header-only, per-instance policy objects + pure predicates, in the
 // spirit of src/impl/dash/min_protocol_gate.hpp. NO consensus state, NO wire
 // bytes, NO RandomX dependency. The LIVE call site (relay ingress, peer
-// disconnect/ban-list) is xmr_carrier_relay.hpp + the reception slice, out of
-// scope here. A monotone injected clock is the only environment coupling.
+// disconnect / ban list) is the Path B relay node (pathb_relay_node.hpp). A
+// monotone injected clock is the only environment coupling.
 
 #include <cstddef>
 #include <cstdint>

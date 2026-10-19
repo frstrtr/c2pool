@@ -52,6 +52,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -74,6 +75,14 @@
 #include "pathb_wire_v3.hpp"
 
 namespace c2pool::xmr::pathb {
+
+// A RandomX failure: the hash could not be computed (the engine, its seed
+// cache, memory). Node-internal, never a verdict on the object judged. Every
+// exception from PathbNodeIo::verify leaves the node as this type
+// (verify_memo); a relay and a join attempt catch this type only.
+struct RandomxFailure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // ---------------------------------------------------------------------------
 // Rows, roles, DEFER causes
@@ -115,7 +124,8 @@ enum class Missing : std::uint8_t {
     CopyDeferred,    // nothing here; the owner fetches its own copy
 };
 
-// Node-internal and claim outcomes: a local alarm with the row and the basis.
+// Node-internal and claim outcomes: a local alarm with the row and the basis. Kept as counts by (row, cause) and the
+// last entry: the sink does not grow with the node's life, and a reader counts in O(1).
 struct AlarmSink {
     struct Entry {
         RowId row = RowId::None;
@@ -123,9 +133,22 @@ struct AlarmSink {
         Hash32 id{};
         Missing cause = Missing::NodeInternal;
     };
-    std::vector<Entry> entries;
-    void raise(RowId row, Basis basis, const Hash32& id, Missing cause) { entries.push_back(Entry{row, basis, id, cause}); }
-    std::size_t count() const noexcept { return entries.size(); }
+    void raise(RowId row, Basis basis, const Hash32& id, Missing cause) {
+        ++total_;
+        ++by_[{static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(cause)}];
+        last_ = Entry{row, basis, id, cause};
+    }
+    std::size_t count() const noexcept { return static_cast<std::size_t>(total_); }
+    std::uint64_t count_of(RowId row, Missing cause) const {
+        const auto it = by_.find({static_cast<std::uint32_t>(row), static_cast<std::uint32_t>(cause)});
+        return it == by_.end() ? 0 : it->second;
+    }
+    const std::optional<Entry>& last() const noexcept { return last_; }
+
+private:
+    std::uint64_t total_ = 0;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> by_;
+    std::optional<Entry> last_;
 };
 
 struct AdmitResult {
@@ -1665,6 +1688,7 @@ struct ParkedFrame {
     std::uint64_t seq = 0;
     bool rewalk = false;
     std::uint64_t walks = 0;
+    bool solicited = false;  // a reply to the node's own request (P-21; not counted in P-15)
 };
 
 class DeferredCarriers {
@@ -1862,14 +1886,32 @@ private:
 // bucket with refill P-15 = (1 + R_MAX) / T alarms per second and burst
 // 1 + R_MAX, counted on the frames a peer relays (a reply to the node's own
 // request is not counted). An empty bucket: disconnect the peer (no ban, no
-// token, never a verdict).
+// token, never a verdict). --pathb-claim-alarm-rate raises the refill (raise
+// only; floor = the formula); the burst stays 1 + R_MAX.
 // ---------------------------------------------------------------------------
 inline constexpr std::string_view kClaimAlarmRateFlag = "--pathb-claim-alarm-rate";
 
+// Rates in milli-alarms per second (integers: no float in the Path B core).
+// The floor of the P-50 refill: (1 + R_MAX) / T alarms per second, rounded up to a milli-alarm.
+inline std::uint64_t claim_alarm_rate_floor_milli(const LaneParams& p) {
+    return ((1 + p.r_max) * 1000 + p.carrier_interval_s - 1) / p.carrier_interval_s;
+}
+// The largest rate the budget takes: rate x T must fit 64 bits.
+inline std::uint64_t claim_alarm_rate_max_milli(const LaneParams& p) {
+    return UINT64_MAX / p.carrier_interval_s;
+}
+
 class ClaimAlarmBudget {
 public:
-    explicit ClaimAlarmBudget(const LaneParams& p)
-        : per_s_(1 + p.r_max), unit_(p.carrier_interval_s), cap_((1 + p.r_max) * p.carrier_interval_s) {}
+    // Units: one alarm = T x kScale units; the refill (1 + R_MAX) x kScale units per second (rate_milli x T at a
+    // raised rate); the burst (1 + R_MAX) alarms.
+    static constexpr std::uint64_t kScale = 1000;
+    explicit ClaimAlarmBudget(const LaneParams& p, std::uint64_t rate_milli = 0)
+        : per_s_(rate_milli > claim_alarm_rate_floor_milli(p)
+                         ? std::min(rate_milli, claim_alarm_rate_max_milli(p)) * p.carrier_interval_s
+                         : (1 + p.r_max) * kScale),
+          unit_(p.carrier_interval_s * kScale),
+          cap_((1 + p.r_max) * p.carrier_interval_s * kScale) {}
 
     // A ClaimLeaf alarm on a frame from `peer`. false: the bucket is empty, disconnect the peer.
     bool charge(std::uint64_t peer, std::uint64_t now_s, bool relayed) {
@@ -1889,6 +1931,9 @@ public:
         b.units -= unit_;
         return true;
     }
+    // A gone peer: its bucket dropped.
+    void forget(std::uint64_t peer) { buckets_.erase(peer); }
+    std::size_t entries() const noexcept { return buckets_.size(); }
 
 private:
     struct Bucket {
