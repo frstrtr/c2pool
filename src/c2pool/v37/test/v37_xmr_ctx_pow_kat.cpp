@@ -29,8 +29,6 @@
 //         a height its parent does not imply   -> forged (ban), no hash spent
 //         an unknown parent                    -> deferred, never banned
 //         an anchor that answers no P-13       -> deferred, never banned
-//         an anchor with only the floor's P-13 (its RowWeights not held; the floor reading, operator ruling)
-//                                              -> a blob inside it judged; above it deferred, no hash
 //         depth 3                              -> deferred, never banned, no hash
 //         a verifier that cannot hash          -> deferred, never banned
 //         no index wired                       -> deferred
@@ -117,14 +115,12 @@ public:
 };
 
 // main_v37_xmr.cpp's binding of the native index, verbatim in behaviour; P-13 at the anchor from its RowWeights
-// there, here the model index's hf 16, Z = zone(16) (cap 0: an anchor that answers none; floor: the floor's cap of
-// an anchor without RowWeights, pb::ctx_anchor_cap there).
-static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::blob_cap_ctx(16, pb::zone(16)).value_or(0),
-                                 std::uint64_t floor = 0) {
+// there, here the model index's hf 16, Z = zone(16) (cap 0: an anchor that answers none).
+static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::blob_cap_ctx(16, pb::zone(16)).value_or(0)) {
     CtxChainSource cs;
     cs.verified = [&idx](const bytes32& id) { return idx.holds_verified(nh(id)); };
-    cs.target = [&idx, cap, floor](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
-                                   CtxTarget& out, std::string& why) {
+    cs.target = [&idx, cap](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
+                            CtxTarget& out, std::string& why) {
         std::vector<std::pair<std::uint64_t, nat::U128>> rows;
         for (const auto& st : above) { nat::U128 d{}; d.lo = st.diff_lo; d.hi = st.diff_hi; rows.emplace_back(st.timestamp, d); }
         nat::U128 d{}; nat::Hash seed{}; std::uint64_t h = 0;
@@ -132,21 +128,10 @@ static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::b
         if (!idx.context_target(nh(anchor), rows, mv, d, seed, h, why)) return false;
         out.diff_lo = d.lo; out.diff_hi = d.hi; out.height = h; out.seed = bb(seed);
         out.blob_cap = cap;
-        out.blob_floor = floor;
         return true;
     };
     return cs;
 }
-
-// The follower's rows at one anchor: its RowWeights held or not (pb::ctx_anchor_cap reads only weights()).
-struct AnchorRows final : pb::IMoneroRows {
-    std::optional<pb::RowWeights> w;
-    std::optional<pb::BranchBlock> block(const pb::Hash32&) const override { return std::nullopt; }
-    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t) const override { return std::nullopt; }
-    std::optional<pb::RowWeights> weights(const pb::Hash32&) const override { return w; }
-    pb::BranchBlock anchor() const override { return {}; }
-    pb::Hash32 main_tip() const override { return {}; }
-};
 
 // A structurally real Monero block in the native KATs' shape (one tagged-key
 // coinbase output, a bare pubkey extra, no transactions) for the index itself.
@@ -312,37 +297,6 @@ int main() {
         const auto v = judge_block_ctx(ctx_of(B1), nocap, rec_of, 2, rx.fn());
         C(v.kind == CtxPow::Defer && !v.ban() && !v.usable() && rx.calls == c0,
           "C2 an anchor that answers no P-13 is DEFERRED, never unchecked, no hash spent: " + v.why);
-    }
-    {   // the floor reading (operator ruling): an anchor held verified without its RowWeights answers the floor's cap
-        const u64 floor16 = pb::blob_cap_ctx(16, pb::zone(16)).value_or(0);
-        const auto v = judge_block_ctx(ctx_of(B1), bind_index(idx, 0, floor16), rec_of, 2, rx.fn());
-        C(v.kind == CtxPow::Accept && v.usable(),
-          "C2 an anchor with only the floor's P-13 (" + std::to_string(floor16) + "): a blob inside it is judged and used: " + v.why);
-        const u64 c0 = rx.calls;
-        const auto v2 = judge_block_ctx(ctx_of(B1), bind_index(idx, 0, ctx_of(B1).blob_bytes - 1), rec_of, 2, rx.fn());
-        C(v2.kind == CtxPow::Defer && !v2.ban() && !v2.usable() && rx.calls == c0,
-          "C2 ...a blob above the floor's cap is DEFERRED, never banned, no hash spent: " + v2.why);
-        const auto v3 = judge_block_ctx(ctx_of(B1), bind_index(idx, ctx_of(B1).blob_bytes - 1, floor16), rec_of, 2, rx.fn());
-        C(v3.kind == CtxPow::OverCap && !v3.ban(), "C2 ...and an exact cap is read before the floor: " + v3.why);
-    }
-    {   // pb::ctx_anchor_cap: P-13 at the anchor from its RowWeights, else the floor at its child version
-        AnchorRows rows;
-        const auto v16 = [](const pb::Hash32&) { return std::optional<std::uint8_t>(16); };
-        rows.w = pb::RowWeights{};
-        rows.w->hf_child = 16;
-        rows.w->z_child = 400000;
-        const pb::CtxAnchorCap a = pb::ctx_anchor_cap(rows, pb::Hash32{}, v16);
-        C(a.cap == pb::blob_cap_ctx(16, 400000).value_or(1) && a.floor == 0,
-          "C2 ctx_anchor_cap with the anchor's RowWeights: the exact cap " + std::to_string(a.cap) + ", no floor");
-        rows.w.reset();
-        const pb::CtxAnchorCap b = pb::ctx_anchor_cap(rows, pb::Hash32{}, v16);
-        C(b.cap == 0 && b.floor == 600051 && b.floor == pb::blob_cap_ctx(16, pb::zone(16)).value_or(0),
-          "C2 ctx_anchor_cap without them, a child of version 16: the floor's cap blob_cap_ctx(16, zone(16)) = " +
-                  std::to_string(b.floor));
-        const pb::CtxAnchorCap c = pb::ctx_anchor_cap(rows, pb::Hash32{}, [](const pb::Hash32&) { return std::optional<std::uint8_t>(17); });
-        const pb::CtxAnchorCap d = pb::ctx_anchor_cap(rows, pb::Hash32{}, [](const pb::Hash32&) { return std::optional<std::uint8_t>(); });
-        C(c.cap == 0 && c.floor == 0 && d.cap == 0 && d.floor == 0,
-          "C2 ctx_anchor_cap: no floor at a version FORK-FUSE refuses (17) or for an anchor not held verified");
     }
     {   // the bound is the relay's default
         pb::PathbRelayOptions ro;
