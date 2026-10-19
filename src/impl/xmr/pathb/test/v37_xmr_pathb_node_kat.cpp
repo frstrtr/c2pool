@@ -223,6 +223,9 @@
 //   catchjoin    a store not caught up whose catch-up step stays deferred
 //                on a P_r no node serves: the record stays, the tip offered
 //                to the joiner after kCtxTtlMs, the pair paced on that P_r;
+//   catchwalk    the same past position 0: a parent walk places the
+//                carriers below the P_r no node serves; the tip is still
+//                offered to the joiner after kCtxTtlMs and attempted;
 //   catchgate    the template gate of a store not caught up: the first
 //                round in flight, verified headers whose bodies are in
 //                flight; a node caught up keeps its templates;
@@ -6733,6 +6736,64 @@ std::function<void(pb::PathbNodeIo&)> hide_blocks(std::set<pb::Hash32>& hidden, 
         io.monero = &view;
     };
 }
+// ---------------------------------------------------------------------------
+// catchwalk: a join after a parent walk. A's chain of 8 carriers; X, the P_r of positions 4..6, no node serves J. J
+// connects (its catch-up DEFERs on X); a new tip of A flooded to J is walked down: J places positions 1..3 and DEFERs
+// at 4, so J's best is past position 0 when the step's context runs out. kCtxTtlMs after the step deferred, A's tip is
+// still offered to the joiner and attempted.
+void catchwalk() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2500 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+    const std::optional<pb::Hash32> c4 = h[a.node].store().best_at(4);
+    const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+    const pb::CarrierBodyV3* b4 = c4 ? h[a.node].bodies().get(*c4) : nullptr;
+    if (!ok || b1 == nullptr || b4 == nullptr || b1->own.blob.prev_id == b4->own.blob.prev_id) {
+        check(false, "catchwalk: setup (A's chain, a P_r at 4 apart from 1's)");
+        return;
+    }
+    const pb::Hash32 X = b4->own.blob.prev_id;
+    hidden.insert(X);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview), true);
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    ok = mine_on(h, w, a.node, 1, 2590);  // A's new tip, flooded to J: walked down to the P_r J cannot resolve
+    for (int k = 0; k < 4; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    const std::uint64_t walked_pos = h[j.node].tree().best().pos;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+    }
+    const std::uint64_t offers = rj.stats().catchup_join_offers.load();
+    const std::optional<pb::JoinStep> s1 = rj.join_step();
+    w.run();
+    std::printf("  catchwalk: J walked to %llu of %llu; join offers %llu; attempts %llu\n", (unsigned long long)walked_pos,
+                (unsigned long long)h[a.node].tree().best().pos, (unsigned long long)offers,
+                (unsigned long long)rj.stats().join_attempts.load());
+    check(ok && walked_pos >= 1 && !h[j.node].caught_up() && offers >= 1 && s1 && s1->report
+                  && rj.stats().join_attempts.load() >= 1,
+          "catchwalk: J past position 0 after a parent walk (at " + std::to_string(walked_pos) +
+                  "): kCtxTtlMs after the step deferred, A's tip is offered to the joiner and attempted (offers " +
+                  std::to_string(offers) + ")");
+}
+
 void catchjoin() {
     const KatNet net;
     Harness h(net);
@@ -7501,6 +7562,7 @@ int main(int argc, char** argv) {
     run("ctxgate", ctxgate);
     run("parkidx", parkidx);
     run("catchjoin", catchjoin);
+    run("catchwalk", catchwalk);
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);

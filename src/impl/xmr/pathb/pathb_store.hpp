@@ -109,7 +109,8 @@ inline constexpr std::uint8_t K_AR = 16;
 inline constexpr std::uint8_t K_BWORK = 17;
 inline constexpr std::uint8_t K_BLO = 18;
 inline constexpr std::uint8_t K_BCLAIM = 19;
-inline constexpr std::uint8_t K_NCU = 20;
+inline constexpr std::uint8_t K_NCU = 20;  // a node-local store layout kind, the next after K_BCLAIM; no chain byte,
+                                           // digest, frame or verdict reads it
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
