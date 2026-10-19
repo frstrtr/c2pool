@@ -212,7 +212,11 @@
 //   jobslot      the CPU miner's own slot: a job on every template after
 //                66,000 stratum binds; every bind taken by its get_job (no
 //                template, make_job failed, a cached job, an issue); a skip
-//                counted once per template, none under a HOLD.
+//                counted once per template, none under a HOLD;
+//   ctxgate      frames parked on a Monero input run again per (cause, id)
+//                only when that input is held: no storm on a P_r held
+//                without its weights, no context asked for it; the seed;
+//                the seal sweep by the frame's own P_r.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -3416,7 +3420,7 @@ void relaytip() {
     watchdog(d1, "from the follower's thread");
     follower.join();
     const std::size_t a1 = r.parked_index_size();
-    r.test_parked(1, pb::Missing::MoneroBlock, seq32(0x63), seq32(0x64));
+    r.test_parked(1, pb::Missing::MoneroBlock, seq32(0x63), mon_block(kPoolH));  // a P_r the follower resolves
     const std::size_t i2 = r.parked_index_size();
     std::atomic<bool> d2{false};
     std::thread hook([&] {
@@ -4766,17 +4770,38 @@ void relayrpark() {
 // three on a Monero block M that B's follower does not hold yet. B's catch-up from A's HELLO reaches the first header on
 // M: the reply DEFERs; B wants M (FB_GETCTX, the carrier class) and asks the headers again once M resolves (here the
 // follower's chain moving to M): B reaches A's tip with no strike and no ban.
+// The follower's rows with some blocks not held (Monero blocks this node has not seen).
+struct HiddenRows final : pb::IMoneroRows {
+    const pb::IMoneroRows& inner;
+    const std::set<pb::Hash32>& hidden;
+    HiddenRows(const pb::IMoneroRows& i, const std::set<pb::Hash32>& h) : inner(i), hidden(h) {}
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.block(id);
+    }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
+        return inner.block_at_or_below_anchor(height);
+    }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.weights(id);
+    }
+    pb::BranchBlock anchor() const override { return inner.anchor(); }
+    pb::Hash32 main_tip() const override { return inner.main_tip(); }
+};
+
 void relayhdrctx() {
     const KatNet net;
     Harness h(net);
     FakeWire w;
     std::set<pb::Hash32> hidden;  // Monero blocks B's follower does not hold
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
     KatRelay a = kat_relay(h, w, table0(net), true);
-    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&hidden](pb::PathbNodeIo& io) {
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&hidden, &hview](pb::PathbNodeIo& io) {
         const auto inner = io.resolve_pr;
         io.resolve_pr = [inner, &hidden](const pb::Hash32& p_r) {
             return hidden.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);
         };
+        io.monero = &hview;
     });
     bool mined = true;
     for (int i = 0; i < 6; ++i) {
@@ -6459,6 +6484,179 @@ void relayjoint() {
 }
 
 // ---------------------------------------------------------------------------
+// ctxgate: a frame parked on a Monero input runs again only when that input is held, per (cause, id):
+//   storm   ten sibling carriers whose own P_r S the follower holds without its weights (a bodiless alternative):
+//           50 follower events run none of them again (one context asked for S); a DEFER waiting for the weights of
+//           a held block asks none;
+//   target  S's weights recorded: one event runs each of S's ten once and places them; a key on another P_r S2
+//           without its weights stays;
+//   seed    a key on a P_r whose seed is not known stays until the seed is known;
+//   sweep   a frame parked on its own P_r X and indexed again on an older P_r Y (a carried receipt's) survives Y's
+//           seal and is dropped without strike at X's.
+struct SiblingFrame {
+    pb::Hash32 id{};
+    std::vector<std::uint8_t> frame;
+};
+SiblingFrame sibling_frame(Harness& h, std::size_t node, std::size_t payee, std::uint32_t nonce) {
+    SiblingFrame s;
+    const std::optional<pb::PathbJob> j = h.job(node, payee, nonce);
+    if (!j) return s;
+    pb::CarrierBodyV3 c;
+    c.own = j->body;
+    c.own.blob.nonce = nonce;
+    c.carried = j->carried;
+    s.id = pb::receipt_id(c.own);
+    s.frame = pb::encode_fc_carrier(0, c, 16).value_or(std::vector<std::uint8_t>{});
+    return s;
+}
+std::function<void(pb::PathbNodeIo&)> hide_inputs(std::set<pb::Hash32>& noweights, std::set<pb::Hash32>& noseed) {
+    return [&noweights, &noseed](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner, &noweights](const pb::Hash32& p_r) {
+            return noweights.count(p_r) != 0 ? pb::PrInfo{} : inner(p_r);  // held, its RowWeights not recorded
+        };
+        const auto seed = io.seed_of;
+        io.seed_of = [seed, &noseed](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
+            if (noseed.count(p_r) != 0) return std::nullopt;
+            return seed(p_r);
+        };
+    };
+}
+void ctxgate() {
+    const KatNet net;
+    {
+        Harness h(net);
+        FakeWire w;
+        std::set<pb::Hash32> noweights, noseed;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+        bool ok = true;
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1100 + static_cast<std::uint32_t>(i));
+        }
+        w.connect(0, 1);
+        w.run();
+        ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+        h.tick_monero();
+        const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+        noweights.insert(S);
+        pb::PathbRelayNode& rb = *b.relay;
+        const std::uint64_t wanted0 = rb.stats().ctx_wanted.load();
+        std::vector<pb::Hash32> sib;
+        for (std::uint32_t k = 0; k < 10; ++k) {
+            const SiblingFrame f = sibling_frame(h, a.node, k % 5, 1200 + k);
+            sib.push_back(f.id);
+            rb.receive(1, f.frame);
+            w.run();
+        }
+        const std::size_t parked = rb.parked_ctx_size(pb::Missing::MoneroBlock, S);
+        const std::uint64_t r0 = rb.stats().parked_reruns.load();
+        for (int k = 0; k < 50; ++k) {
+            rb.on_monero_tip();
+            w.run();
+            h.now += 1;
+            rb.tick();
+            w.run();
+        }
+        const std::uint64_t storm = rb.stats().parked_reruns.load() - r0;
+        std::printf("  ctxgate: parked on S %zu; re-runs over 50 events %llu; contexts wanted %llu; held %llu\n", parked,
+                    (unsigned long long)storm, (unsigned long long)(rb.stats().ctx_wanted.load() - wanted0),
+                    (unsigned long long)rb.stats().ctx_held.load());
+        check(ok && parked == 10 && storm == 0 && rb.parked_ctx_size(pb::Missing::MoneroBlock, S) == 10
+                      && rb.stats().ctx_wanted.load() <= wanted0 + 1,
+              "ctxgate: ten carriers on a P_r held without its weights: 50 follower events run none again, one context "
+              "asked (" + std::to_string(storm) + " re-runs, " + std::to_string(rb.stats().ctx_wanted.load() - wanted0) +
+                      " wanted)");
+        // a DEFER waiting for the weights of a block the follower holds asks no context
+        const std::uint64_t held0 = rb.stats().ctx_held.load(), wanted1 = rb.stats().ctx_wanted.load();
+        rb.test_parked(1, pb::Missing::MissingWeights, seq32(0x70), S);
+        check(rb.stats().ctx_held.load() == held0 + 1 && rb.stats().ctx_wanted.load() == wanted1
+                      && rb.parked_ctx_size(pb::Missing::MissingWeights, S) == 1,
+              "ctxgate: a DEFER for the weights of a held block asks no context");
+        // target: a key on S2 (held, no weights) stays when S resolves
+        const pb::Hash32 S2 = mon_block(kPoolH + 3);
+        noweights.insert(S2);
+        rb.test_parked(1, pb::Missing::MoneroBlock, seq32(0x71), S2);
+        noweights.erase(S);
+        const std::uint64_t r1 = rb.stats().parked_reruns.load();
+        rb.on_monero_tip();
+        w.run();
+        std::size_t placed = 0;
+        for (const pb::Hash32& id : sib) placed += h[b.node].tree().find(id) != nullptr ? 1 : 0;
+        check(rb.stats().parked_reruns.load() - r1 == 10 && placed == 10
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, S) == 0
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, S2) == 1 && rb.stats().strikes.load() == 0,
+              "ctxgate: S's weights recorded: one event runs S's ten once and places them (" + std::to_string(placed) +
+                      "); the key on S2 stays");
+        // seed: a key on a P_r whose seed is not known
+        const pb::Hash32 S3 = mon_block(kPoolH + 4);
+        noseed.insert(S3);
+        rb.test_parked(1, pb::Missing::Seed, seq32(0x72), S3);
+        for (int k = 0; k < 5; ++k) rb.on_monero_tip();
+        const std::size_t kept = rb.parked_ctx_size(pb::Missing::Seed, S3);
+        noseed.erase(S3);
+        rb.on_monero_tip();
+        check(kept == 1 && rb.parked_ctx_size(pb::Missing::Seed, S3) == 0,
+              "ctxgate: a key on a P_r with no seed stays through five events and runs once its seed is known");
+    }
+    {  // sweep
+        Harness h(net);
+        FakeWire w;
+        std::set<pb::Hash32> noweights, noseed;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1400 + static_cast<std::uint32_t>(i));
+        }
+        w.connect(0, 1);
+        w.run();
+        ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+        h.tick_monero();
+        const pb::Hash32 X = h[a.node].make_template(h.now).p_r;
+        const pb::FollowerBranchView mon(net.rows);
+        const std::optional<pb::BranchBlock> bx = mon.block(X);
+        const std::uint64_t hx = bx ? bx->height : 0;
+        const pb::Hash32 Y = mon_block(hx - 40);
+        noweights.insert(X);
+        noweights.insert(Y);
+        pb::PathbRelayNode& rb = *b.relay;
+        rb.receive(1, sibling_frame(h, a.node, 1, 1500).frame);
+        w.run();
+        const std::set<pb::Hash32> ds = rb.parked_ctx_digests(pb::Missing::MoneroBlock, X);
+        ok = ok && hx != 0 && ds.size() == 1;
+        if (!ok) {
+            check(false, "ctxgate: sweep setup (a frame parked on its own P_r)");
+            return;
+        }
+        const pb::Hash32 d = *ds.begin();
+        rb.test_parked(1, pb::Missing::MoneroBlock, d, Y);  // also DEFERred on an older P_r (a carried receipt's)
+        const std::uint64_t F = pb::kRuledLaneParams.open_bins;
+        bool kept_past_y = true, y_passed = false, dropped = false;
+        h.tick_monero(2);
+        for (std::uint32_t i = 0; i < 160 && !dropped; ++i) {
+            h.tick_monero();
+            (void)mine_on(h, w, b.node, i % 5, 1600 + i);
+            rb.tick();
+            w.run();
+            const std::uint64_t H = h[b.node].best_record().value_or(0);
+            const bool held = h[b.node].deferred().holds(d);
+            if (H >= hx - 40 + 1 + F && H < hx + 1 + F) {
+                y_passed = true;
+                kept_past_y = kept_past_y && held;
+            }
+            if (H >= hx + 1 + F) dropped = !held;
+        }
+        check(y_passed && kept_past_y && dropped && rb.stats().parked_frames_sealed.load() == 1
+                      && rb.parked_ctx_size(pb::Missing::MoneroBlock, X) == 0 && rb.stats().strikes.load() == 0,
+              "ctxgate: a frame indexed on an older P_r survives that bin's seal and is dropped without strike at its own "
+              "P_r's (sealed " + std::to_string(rb.stats().parked_frames_sealed.load()) + ")");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // jobslot: the CPU miner's own slot (bind_own) is never evicted by stratum jobs: over 66 templates of 1,000 stratum
 // bind + get_job pairs each (66,000 > 65,536 binds) the miner's job follows every template; a stratum bind is taken by
 // its get_job on every return path (no template, make_job failed, a cached job, an issue), so the sessions held stay
@@ -6691,5 +6889,6 @@ int main(int argc, char** argv) {
     run("prune_hold", prune_hold);
     run("below", below);
     run("jobslot", jobslot);
+    run("ctxgate", ctxgate);
     return finish("v37_xmr_pathb_node_kat");
 }

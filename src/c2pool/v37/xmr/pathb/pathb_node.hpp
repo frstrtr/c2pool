@@ -772,6 +772,38 @@ public:
         if (poisoned_) return std::nullopt;
         return deferred_.take(*tree_, digest);
     }
+    // The relay's re-run gate (node-local; no verdict reads it): the Monero input a DEFER names is held now:
+    // MoneroBlock its P_r resolved, Seed its seed, MissingBlock the block, MissingWeights its weight inputs.
+    bool monero_input_held(Missing m, const Hash32& id) const {
+        switch (m) {
+            case Missing::MoneroBlock: return io_.resolve_pr && io_.resolve_pr(id).status == PrInfo::Status::Held;
+            case Missing::Seed: return io_.seed_of && io_.seed_of(id).has_value();
+            case Missing::MissingBlock: return io_.monero != nullptr && io_.monero->block(id).has_value();
+            case Missing::MissingWeights: return io_.monero != nullptr && io_.monero->weights_at(id).has_value();
+            default: return false;
+        }
+    }
+    // The follower holds the Monero block (with or without its weights).
+    bool monero_block_held(const Hash32& id) const { return io_.monero != nullptr && io_.monero->block(id).has_value(); }
+    // An object's origin height h = height(P_r) + 1 by its own P_r held with or without its weights (the seal sweep of
+    // parked objects); nullopt: P_r not held.
+    std::optional<std::uint64_t> held_origin(const Hash32& p_r) const {
+        const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(p_r) : PrInfo{};
+        if (pr.status == PrInfo::Status::Held) return pr.height + 1;
+        if (io_.monero != nullptr)
+            if (const std::optional<BranchBlock> b = io_.monero->block(p_r)) return b->height + 1;
+        return std::nullopt;
+    }
+    // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
+    std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
+        const ParkedFrame* f = deferred_.get(digest);
+        if (f == nullptr || f->frame.size() <= kFrameHeaderBytes) return std::nullopt;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(f->frame.data() + kFrameHeaderBytes, f->frame.size() - kFrameHeaderBytes,
+                                   CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c) != WireError::None)
+            return std::nullopt;
+        return c.own.blob.prev_id;
+    }
     // Called between the replay steps of a join attempt (on the join worker).
     void set_join_step(std::function<void()> f) {
         if (!f) {

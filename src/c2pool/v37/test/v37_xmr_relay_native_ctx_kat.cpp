@@ -56,6 +56,9 @@
 //       carriers whose P_r the node does not hold (the fifth held at P-06),
 //       the receipt class is full; a join attempt's want is still taken at
 //       the join's bound (P-07)
+//   N11 a context resolved while the node's P_r stays unresolved (held without
+//       weights) runs none of the frames parked on it again; the own source is
+//       looked at once per kCtxLocalMs per id across wants
 //   N10 a kept alternative block no native index holds, carried by A's kept
 //       files (row_weights_kept and row_weights_kept_blobs, as a restarted
 //       node loads them): A serves it from the kept blob, C resolves it
@@ -406,6 +409,33 @@ int main() {
         C(c3[2] == 1 && E.n->r().ctx_want_bound(b32_of(171)) == std::optional<std::uint32_t>(4),
           "N9 a join attempt's want is taken at the join's bound (P-07), not pushed to P-06 nor refused (receipt / "
           "carrier / join wants " + std::to_string(c3[0]) + " / " + std::to_string(c3[1]) + " / " + std::to_string(c3[2]) + ")");
+    }
+
+    // ── N11 a context that resolves while its P_r stays unresolved at the node runs no parked frame again ─
+    // F's own native body serves V (verified, judged, into the follower), but F's Path B node does not resolve V (no
+    // weights): ten frames parked on V one after another stay parked; the own source is looked at once per
+    // kCtxLocalMs per id across the wants (one look, one RandomX judge, not one per want).
+    {
+        TNode Fn(rig, "F", opts(false, {}));
+        std::string w;
+        C(Fn.n->start(w), "F starts " + w);
+        Fn.idx.main(G); Fn.idx.main(H1); Fn.idx.main(H2);
+        const SynthBlock V = make_block(100, idG, 150, nullptr, 2, 120);
+        const bytes32 idV = block_id(V);
+        Fn.idx.alt(V);
+        const u64 calls0 = Fn.idx.blob_calls.load(), res0 = Fn.n->st().ctx_resolved.load(), rx0 = Fn.ctx_rx.load();
+        for (int k = 0; k < 10; ++k) {
+            Fn.n->r().test_parked(0, pb::Missing::MoneroBlock, b32_of(static_cast<std::uint8_t>(180 + k)), idV,
+                                  /*relayed=*/true, /*carrier=*/true);
+            std::this_thread::sleep_for(300ms);
+        }
+        const std::size_t kept = Fn.n->r().parked_ctx_size(pb::Missing::MoneroBlock, idV);
+        const u64 looks = Fn.idx.blob_calls.load() - calls0, res = Fn.n->st().ctx_resolved.load() - res0,
+                  rx = Fn.ctx_rx.load() - rx0;
+        C(kept == 10 && looks == 1 && res == 1 && rx <= 1,
+          "N11 a context resolved while its P_r stays unresolved: the ten frames parked on it stay (" + std::to_string(kept) +
+                  "); one own-source look (" + std::to_string(looks) + "), one resolution (" + std::to_string(res) +
+                  "), " + std::to_string(rx) + " RandomX over ten wants");
     }
 
     // ── N8 N6's three cases as real frames from a peer of C's pool ─
