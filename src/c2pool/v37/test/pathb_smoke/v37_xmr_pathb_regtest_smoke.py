@@ -108,6 +108,8 @@ RELAY_RE = re.compile(r"^  relay: peers in=(\d+) out=(\d+) ready=(\d+) \| hello 
 JOIN_RE = re.compile(r"\| join tickets=(\d+) attempts=(\d+) strikes=(\d+)")
 OWN_RE = re.compile(r"own receipts=(\d+) \(carrier (\d+), pending (\d+)")
 REPEND_RE = re.compile(r"relay: re-pend offer (\d+) receipt\(s\) to (\d+) peer\(s\):((?: [0-9a-f]{12})*)")
+PEND_RE = re.compile(r"^  verdicts: .*R30/pending=(\d+)", re.M)
+SWACC_RE = re.compile(r"switches: re-pended=(\d+) carried=(\d+) sealed-pending=(\d+) evicted=(\d+) watched=(\d+) lost=(\d+)")
 FOLLOW_RE = re.compile(r"^\[follow-only\] follow h=(\d+) id=([0-9a-f]{64}) prev=([0-9a-f]{64}) "
                        r"event=(extend|reorg|orphan) depth=(\d+) tip=(\d+)")
 TEMPLATE_RE = re.compile(r"^\[follow-only\] template h=(\d+) (.*)$")
@@ -896,6 +898,10 @@ class Rig:
             own0 = OWN_RE.findall(self.nodes["C"].text())
             c_carriers0 = int(own0[-1][1]) if own0 else 0
             offers0 = {n: len(REPEND_RE.findall(self.nodes[n].text())) for n in "ABC"}
+            acc0 = {n: SWACC_RE.findall(self.nodes[n].text()) for n in "ABC"}
+            acc0 = {n: tuple(int(x) for x in v[-1]) if v else (0, 0, 0, 0, 0, 0) for n, v in acc0.items()}
+            pend0 = {n: PEND_RE.findall(self.nodes[n].text()) for n in "ABC"}
+            pend0 = {n: int(v[-1]) if v else 0 for n, v in pend0.items()}
             wsw0 = {n: int((self.web.get(n) or {}).get("pathb", {}).get("switches", -1)) for n in "ABC"}
             self.web.clear_pending()
             os.kill(self.nodes["C"].pid, signal.SIGUSR1)
@@ -976,12 +982,26 @@ class Rig:
             # be held after the switch by a peer that did not hold it before
             fresh = {m: ids - before[m] for m in after}
             proven = set().union(*[after[m] & fresh[m] for m in after]) if after else set()
-            self.res.check("partition", t_sw is not None and bool(ids) and proven == ids and any(k >= 1 for _, k in sent),
+            # or by the accounting: the offer reached a peer, a peer admitted receipts as pending (its R30/pending
+            # count rose), and every receipt the switching node re-pended since the attempt began ends carried,
+            # sealed-pending, evicted or watched, at least the named ones carried (a peer's pending set is a transient a
+            # sampled view can miss when a carrier carries the receipts between two samples)
+            acc1 = SWACC_RE.findall(self.nodes[n].text())
+            acc1 = tuple(int(x) for x in acc1[-1]) if acc1 else acc0[n]
+            d = [acc1[k] - acc0[n][k] for k in range(6)]
+            pend1 = {m: PEND_RE.findall(self.nodes[m].text()) for m in "ABC" if m != n}
+            pend_up = {m: (int(v[-1]) if v else 0) - pend0[m] for m, v in pend1.items()}
+            accounted = (bool(ids) and d[0] >= len(ids) and d[0] == d[1] + d[2] + d[3] + d[4] and d[1] >= len(ids)
+                         and any(k >= 1 for k in pend_up.values()))
+            reached = any(k >= 1 for _, k in sent)
+            self.res.check("partition", t_sw is not None and bool(ids) and reached and (proven == ids or accounted),
                            "%s relayed its re-pended receipts: offers (receipts, peers) %s; %d named; held pending after "
-                           "the switch by a peer that did not hold it before: %s; all: %s" %
+                           "the switch by a peer that did not hold it before: %s; all: %s; accounting since the attempt "
+                           "(re-pended, carried, sealed-pending, evicted, watched, lost) %s, peers' R30/pending up %s: %s" %
                            (n, sent, len(ids),
                             ", ".join("%s %d of %d" % (m, len(after[m] & fresh[m]), len(fresh[m])) for m in sorted(after)),
-                            "%d of %d" % (len(proven), len(ids))))
+                            "%d of %d" % (len(proven), len(ids)), tuple(d), pend_up,
+                            "re-pended = carried + sealed-pending + evicted + watched" if accounted else "not accounted"))
             own_n = OWN_RE.findall(self.nodes[n].text())
             self.res.check("partition", "carried" in seen,
                            "%s: none of its re-pended receipts pending in a view published after the switch (carried)"
