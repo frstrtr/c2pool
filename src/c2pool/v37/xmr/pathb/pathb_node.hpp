@@ -809,8 +809,10 @@ public:
     }
     // The P_r ids queued join pairs wait on (a NotServed on an unresolved P_r), and their release: the id resolved,
     // or (nullopt) every id.
-    std::vector<Hash32> join_waits() const { return joiner_->queue().waits(); }
-    std::size_t release_join_waits(const std::optional<Hash32>& id) { return joiner_->release_waits(id); }
+    std::vector<std::pair<Missing, Hash32>> join_waits() const { return joiner_->queue().waits(); }
+    std::size_t release_join_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
+        return joiner_->release_waits(id, cause);
+    }
 
     // A frame this node parked, by its digest, taken out of the deferred store to be run again; nullopt: not held.
     std::optional<ParkedFrame> take_parked(const Hash32& digest) {

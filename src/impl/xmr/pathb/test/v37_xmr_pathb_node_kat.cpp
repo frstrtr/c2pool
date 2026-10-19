@@ -227,7 +227,9 @@
 //   catchlocator the catch-up's locator steps after a partition;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
-//                context and passes on the exact weights; #12 stays exact.
+//                context and passes on the exact weights; #12 stays exact;
+//                a join replay on a band DEFER ends NotServed (no fetch, no
+//                loop) and waits on the weights.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -6988,6 +6990,9 @@ void catchlocator() {
 //           (MissingWeights), no context asked; S2's weights recorded: it runs again and passes on the exact Z;
 //   hfirst  headers first over a header above the floor on a P_r without its weights: DEFER, never a BAN;
 //   join    a joiner whose span headers rest on S reads their heights (height_of) and completes;
+//   joinband   a join replay meeting the band DEFER on S2 (held, its weights not) with an own source that answers held
+//           blocks at once ends NotServed on S2 with no fetch; the pair waits on S2's weights, then completes;
+//   joinrepeat a fetched input that leaves the same DEFER ends the attempt NotServed on it after one fetch;
 //   exact12 #12 keeps exact weights: a carrier whose window reads a block without its weights DEFERs, no token.
 // The follower's rows with the RowWeights of some blocks not recorded (their blocks held).
 struct WeightlessRows final : pb::IMoneroRows {
@@ -7120,6 +7125,87 @@ void floorpr() {
                   && h[jj.node].tree().best().id == h[a.node].tree().best().id,
           "floorpr: a join whose headers rest on a P_r held without its weights reads their heights and completes (" +
                   std::string(sj && sj->report ? pb::attempt_end_name(sj->report->end) : "none") + ")");
+    // joinband: a joiner whose own source answers every Monero block it holds at once (the production relay's
+    // FB_GETCTX: its own index, Indexed, no hash), S2 held there without its weights: the replay meets the 413-transaction
+    // carrier's band DEFER (MissingWeights on S2) and ends NotServed on S2 within one step, no context fetched for it;
+    // the pair waits on S2's weights (no attempt meanwhile); S2's weights recorded: the pair is tried again and completes.
+    // The own source answers at most 64 fetches per id (a watchdog for a re-admission loop).
+    std::set<pb::Hash32> noweights3{S2};
+    const WeightlessRows wrows3(net.rows, noweights3);
+    const pb::FollowerBranchView wview3(wrows3);
+    std::map<pb::Hash32, std::uint64_t> fetches3;
+    const auto own_source_io = [&fetches3](const pb::FollowerBranchView& v, const pb::IMoneroRows& r) {
+        return [&fetches3, &v, &r](pb::PathbNodeIo& io) {
+            io.monero = &v;
+            io.resolve_pr = [&v, &r](const pb::Hash32& p_r) {
+                pb::PrInfo x = pb::resolve_pr_on_branch(v, r, p_r, [&v](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                    return v.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+                });
+                if (x.status == pb::PrInfo::Status::Held && !x.in.floor) x.in.z = x.in.z_lt = kExactZ;
+                return x;
+            };
+            io.fetch_context = [&fetches3, &v](const pb::Hash32& id, std::uint64_t) {
+                return ++fetches3[id] <= 64 && v.block(id).has_value();
+            };
+        };
+    };
+    KatRelay jb = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            own_source_io(wview3, wrows3));
+    w.connect(0, 4);
+    w.run();
+    const std::optional<pb::JoinStep> sb1 = jb.relay->join_step();
+    w.run();
+    const pb::Joiner& jbj = h[jb.node].joiner();
+    const std::vector<std::pair<pb::Missing, pb::Hash32>> jw = jbj.queue().waits();
+    const bool band_ns = sb1 && sb1->report && sb1->report->end == pb::AttemptEnd::NotServed && sb1->report->unresolved_pr
+                         && *sb1->report->unresolved_pr == S2 && sb1->report->unresolved_cause == pb::Missing::MissingWeights
+                         && fetches3[S2] == 0 && jw.size() == 1 && jw.front().first == pb::Missing::MissingWeights
+                         && jw.front().second == S2 && jbj.queue().ready() == 0;
+    jb.relay->on_monero_tip();  // a follower event with S2's weights still absent: the pair keeps waiting
+    w.run();
+    const std::optional<pb::JoinStep> sb2 = jb.relay->join_step();
+    const bool waited = (!sb2 || !sb2->report) && h[jb.node].joiner().queue().ready() == 0;
+    noweights3.erase(S2);
+    jb.relay->on_monero_tip();
+    w.run();
+    std::optional<pb::JoinStep> sb3;
+    for (int k = 0; k < 4 && !(sb3 && sb3->report && sb3->report->end == pb::AttemptEnd::Completed); ++k) {
+        sb3 = jb.relay->join_step();
+        w.run();
+    }
+    check(band_ns && waited && sb3 && sb3->report && sb3->report->end == pb::AttemptEnd::Completed
+                  && h[jb.node].tree().best().id == h[a.node].tree().best().id && fetches3[S2] == 0,
+          "floorpr: joinband: a join replay meeting a band DEFER on a held block ends NotServed on it at once (fetches " +
+                  std::to_string(fetches3[S2]) + "), the pair waits on its weights, and completes once they are recorded (" +
+                  std::string(sb1 && sb1->report ? pb::attempt_end_name(sb1->report->end) : "none") + ", " +
+                  std::string(sb3 && sb3->report ? pb::attempt_end_name(sb3->report->end) : "none") + ")");
+    // joinrepeat: a joiner whose source answers every fetch as resolved, one block of the span's timestamp windows not
+    // held there: the replay's DEFER on it is fetched once (true), deferred again on the same input, and the attempt
+    // ends NotServed on it (no second fetch, no re-admission loop)
+    const pb::FollowerBranchView mon4(net.rows);
+    const std::optional<pb::BranchBlock> tb4 = mon4.block(h[a.node].make_template(h.now).p_r);
+    const pb::Hash32 gap = mon_block(tb4 && tb4->height > 30 ? tb4->height - 30 : 0);
+    std::set<pb::Hash32> hidden4{gap};
+    const HiddenRows hrows4(net.rows, hidden4);
+    const pb::FollowerBranchView hview4(hrows4);
+    const auto base4 = own_source_io(hview4, hrows4);
+    KatRelay jr = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            [&base4, &fetches3](pb::PathbNodeIo& io) {
+                                base4(io);
+                                io.fetch_context = [&fetches3](const pb::Hash32& id, std::uint64_t) { return ++fetches3[id] <= 64; };
+                            });
+    fetches3.clear();
+    w.connect(0, 5);
+    w.run();
+    const std::optional<pb::JoinStep> sr = jr.relay->join_step();
+    w.run();
+    const std::uint64_t fgap = fetches3[gap];
+    check(sr && sr->report && sr->report->end == pb::AttemptEnd::NotServed && sr->report->unresolved_pr
+                  && *sr->report->unresolved_pr == gap && fgap == 1,
+          "floorpr: joinrepeat: a fetched Monero input that leaves the same DEFER ends the attempt NotServed on it (fetches " +
+                  std::to_string(fgap) + ", " + std::string(sr && sr->report ? pb::attempt_end_name(sr->report->end) : "none") +
+                  ", cause " + std::to_string(sr && sr->report ? static_cast<int>(sr->report->unresolved_cause) : -1) + ", " +
+                  (sr && sr->report ? sr->report->what : std::string("-")) + ")");
     // exact12: the window's weights at A_t never read the floor
     h.tick_monero();
     const pb::PathbTemplate t3 = h[a.node].make_template(h.now);

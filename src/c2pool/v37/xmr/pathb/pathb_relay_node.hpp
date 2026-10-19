@@ -2050,10 +2050,11 @@ private:
                 ds.insert(ds.end(), it->second.begin(), it->second.end());
                 it = parked_ctx_.erase(it);
             }
-            // the join pairs waiting on a P_r that resolves now are tried again
-            for (const Hash32& id : node_->join_waits())
-                if ((!only || id == *only) && node_->monero_input_held(Missing::MoneroBlock, id))
-                    released += node_->release_join_waits(id);
+            // the join pairs waiting on a Monero input held now (a P_r resolved, a held block's weights recorded) are
+            // tried again
+            for (const auto& [cause, id] : node_->join_waits())
+                if ((!only || id == *only) && node_->monero_input_held(cause, id))
+                    released += node_->release_join_waits(id, cause);
         }
         rerun_digests(ds, false);
         reask_headers_on_ctx(only, true);
@@ -3200,7 +3201,7 @@ private:
                     again.swap(ctx_remade_);
                 }
                 for (const Hash32& id : again)
-                    if (const std::size_t n = node_->release_join_waits(id); n > 0) st_.join_releases += n;
+                    if (const std::size_t n = node_->release_join_waits(id, Missing::MoneroBlock); n > 0) st_.join_releases += n;
             }
             std::lock_guard<std::mutex> lk(cumtx_);
             bool done_any = false;
