@@ -179,6 +179,9 @@ struct CtxTarget {              // what the index says the next block must meet
     std::uint64_t height = 0;
     bytes32       seed{};
     std::uint64_t blob_cap = 0;   // P-13 at the anchor (the newest known ancestor): blob_cap_ctx(hf, Z); 0 = none
+    // with no blob_cap (the anchor's RowWeights not held): P-13 on the floor reading (operator ruling),
+    // blob_cap_ctx(hf, zone(hf)) of a child of the anchor; a blob inside it is judged, one above it deferred; 0 = none
+    std::uint64_t blob_floor = 0;
 };
 // The node's own verified chain index, as the relay sees it (main binds it to
 // the native node's index; a KAT binds a model).
@@ -218,7 +221,8 @@ using CtxHashFn  = std::function<bool(const std::vector<u8>& hashing_blob, const
 using CtxRecFn   = std::function<std::optional<CtxPowRec>(const bytes32& id)>;
 
 // policy_cap: a raised P-13 (the node's policy, 0: none); the cap is max(P-13 at the anchor, policy_cap). A blob above
-// it is OverCap: dropped before hashing (no verdict on the sender, no token, no ban).
+// it is OverCap: dropped before hashing (no verdict on the sender, no token, no ban). An anchor with only the floor's
+// cap (CtxTarget::blob_floor): a blob above it is deferred, one inside it judged as any other.
 inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& src, const CtxRecFn& rec_of,
                                      std::uint32_t max_depth, const CtxHashFn& rx, std::uint64_t policy_cap = 0) {
     CtxPowVerdict v;
@@ -241,8 +245,11 @@ inline CtxPowVerdict judge_block_ctx(const BlockCtx& b, const CtxChainSource& sr
     CtxTarget t; std::string why;
     if (!src.target(cur, above, b.major_version, t, why)) return defer("cannot judge it now: " + why);
     if (t.diff_lo == 0 && t.diff_hi == 0) return defer("the index answered no difficulty");
-    if (t.blob_cap == 0) return defer("the index answered no context block cap (P-13) at the anchor");
-    const std::uint64_t cap = std::max(t.blob_cap, policy_cap);
+    if (t.blob_cap == 0 && t.blob_floor == 0) return defer("the index answered no context block cap (P-13) at the anchor");
+    if (t.blob_cap == 0 && b.blob_bytes > t.blob_floor)   // above the floor: the exact cap is not held here
+        return defer("block blob of " + std::to_string(b.blob_bytes) + " B above the floor's context block cap " +
+                     std::to_string(t.blob_floor) + " (P-13); the anchor's RowWeights are not held");
+    const std::uint64_t cap = t.blob_cap != 0 ? std::max(t.blob_cap, policy_cap) : t.blob_floor;
     if (b.blob_bytes > cap) {   // P-13 at the newest known ancestor: dropped before hashing
         v.kind = CtxPow::OverCap;
         v.why = "block blob of " + std::to_string(b.blob_bytes) + " B over the context block cap " + std::to_string(cap);

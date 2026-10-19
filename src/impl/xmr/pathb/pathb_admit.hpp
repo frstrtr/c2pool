@@ -2086,4 +2086,29 @@ inline PrInfo resolve_pr_on_branch(const FollowerBranchView& view, const IMonero
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// P-13 at a Monero context block's anchor (the newest ancestor held verified; FB_GETCTX): `cap` = blob_cap_ctx(hf, Z)
+// of a child of the anchor from its RowWeights. Without them, the floor reading (operator ruling): `floor` =
+// blob_cap_ctx(hf, zone(hf)) at the anchor's child version (`child_version`, as resolve_pr_on_branch), none outside the
+// floor's versions (header_inputs_floor). judge_block_ctx judges a blob inside the floor and defers one above it.
+// ---------------------------------------------------------------------------
+struct CtxAnchorCap {
+    std::uint64_t cap = 0;
+    std::uint64_t floor = 0;
+};
+template <class ChildVersionFn>
+inline CtxAnchorCap ctx_anchor_cap(const IMoneroRows& rows, const Hash32& anchor, ChildVersionFn&& child_version) {
+    CtxAnchorCap out;
+    if (const std::optional<RowWeights> w = rows.weights(anchor)) {
+        out.cap = blob_cap_ctx(w->hf_child, w->z_child).value_or(0);
+        return out;
+    }
+    const std::optional<std::uint8_t> v = child_version(anchor);
+    if (!v) return out;
+    const std::optional<HeaderInputs> in = header_inputs_floor(*v, std::nullopt);
+    if (!in) return out;
+    out.floor = blob_cap_ctx(in->hf, in->z).value_or(0);
+    return out;
+}
+
 }  // namespace c2pool::xmr::pathb
