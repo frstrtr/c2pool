@@ -1403,7 +1403,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
 #if defined(V37_XMR_O2_WITH_RANDOMX)
     std::unique_ptr<mine::CpuMiner> cpu_miner;
     const std::uint32_t mine_en = en_base - 1;
-    std::uint32_t mine_job_tid = 0;
+    pb::MinerSlot mine_slot(mine_en);
     std::uint64_t mine_pushed = 0, mine_blocks = 0, mine_hits = 0;
     std::string mine_last_error;
     if (cfg.mine_enabled && mine_payee) {
@@ -1415,7 +1415,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         cpu_miner = std::make_unique<mine::CpuMiner>(mo);
         pb::PathbSession ms;
         ms.payee = *mine_payee;
-        jobs.bind(mine_en, ms);
+        jobs.bind_own(mine_en, ms);
         std::printf("cpu-miner: ENABLED threads=%u mode=%s payee=%s extra_nonce=%u\n", cpu_miner->threads_wanted(),
                     cfg.mine_fast ? "FAST" : "LIGHT", cfg.payout_address.c_str(), mine_en);
         ::c2pool::xmr::msr::Options mopt;
@@ -1703,8 +1703,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 mine::MinerHit dropped;
                 while (cpu_miner->pop_hit(dropped)) {}
             } else {
-                strat::TemplateJob tj;
-                if (jobs.get_job(mine_en, tj) && !tj.blob.empty() && tj.template_id != mine_job_tid) {
+                if (const std::optional<strat::TemplateJob> mt = mine_slot.next(jobs)) {
+                    const strat::TemplateJob& tj = *mt;
                     rx.on_template(tj);
                     mine::MinerJob mj;
                     mj.blob = tj.blob;
@@ -1717,13 +1717,18 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                     std::copy(tj.seed_hash.begin(), tj.seed_hash.end(), mj.seed_hash.begin());
                     std::string mwhy;
                     if (cpu_miner->set_job(mj, &mwhy)) {
-                        mine_job_tid = tj.template_id;
+                        mine_slot.pushed(tj.template_id);
                         ++mine_pushed;
-                    } else if (mwhy != mine_last_error) {
-                        mine_last_error = mwhy;
-                        std::printf("  [cpu-miner] job refused: %s\n", mwhy.c_str());
+                    } else {
+                        mine_slot.refused(mwhy);
+                        if (mwhy != mine_last_error) {
+                            mine_last_error = mwhy;
+                            std::printf("  [cpu-miner] job refused: %s\n", mwhy.c_str());
+                        }
                     }
                 }
+                if (const std::optional<std::string> skip = mine_slot.settle())
+                    std::printf("  [cpu-miner] %s\n", skip->c_str());
                 mine::MinerHit h;
                 while (cpu_miner->pop_hit(h)) {
                     if (h.network) {
@@ -1838,7 +1843,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(listener.min_difficulty_effective()), gate_closed ? "closed" : "open");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
             if (cpu_miner)
-                std::printf("  %s jobs=%llu hits=%llu blocks=%llu\n", cpu_miner->describe().c_str(),
+                std::printf("  %s skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n", cpu_miner->describe().c_str(),
+                            static_cast<unsigned long long>(mine_slot.skipped()), jobs.sessions_held(),
                             static_cast<unsigned long long>(mine_pushed), static_cast<unsigned long long>(mine_hits),
                             static_cast<unsigned long long>(mine_blocks));
 #endif

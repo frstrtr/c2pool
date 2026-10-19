@@ -208,7 +208,11 @@
 //                it alarmed, no token; the next attempt joins;
 //   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
 //                its own with a rig set, a kind-2 file for epoch 1 accepted
-//                at fixed = start + GRACE, refused off regtest.
+//                at fixed = start + GRACE, refused off regtest;
+//   jobslot      the CPU miner's own slot: a job on every template after
+//                66,000 stratum binds; every bind taken by its get_job (no
+//                template, make_job failed, a cached job, an issue); a skip
+//                counted once per template, none under a HOLD.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -6454,6 +6458,136 @@ void relayjoint() {
     ra.stop();
 }
 
+// ---------------------------------------------------------------------------
+// jobslot: the CPU miner's own slot (bind_own) is never evicted by stratum jobs: over 66 templates of 1,000 stratum
+// bind + get_job pairs each (66,000 > 65,536 binds) the miner's job follows every template; a stratum bind is taken by
+// its get_job on every return path (no template, make_job failed, a cached job, an issue), so the sessions held stay
+// the own slot; an issued extra_nonce gets a peek on the next template; MinerSlot over 30,000 templates with three
+// stratum sessions each follows every template with no skip, a HOLD (clear()) adds none, and a slot with no session is
+// counted once per template with its line.
+pb::PathbTemplate slot_template(std::uint64_t k) {
+    pb::PathbTemplate t;
+    t.status = pb::TemplateStatus::Ok;
+    t.h = 1000 + k;
+    t.p_r = seq32(static_cast<std::uint8_t>(k));
+    t.p_r[30] = static_cast<std::uint8_t>(k >> 8);
+    t.p_r[31] = static_cast<std::uint8_t>(k >> 16);
+    t.hf = 16;
+    t.d = 16;
+    return t;
+}
+pb::PathbJobSource::MakeJob slot_make(const bool* fail) {
+    return [fail](const pb::PathbTemplate& t, const pb::PathbSession&) -> std::optional<pb::PathbJob> {
+        if (fail != nullptr && *fail) return std::nullopt;
+        pb::PathbJob j;
+        j.body.blob.major = t.hf;
+        j.body.blob.minor = t.hf;
+        j.body.blob.timestamp = 1700000000ull + t.h;
+        std::copy(t.p_r.begin(), t.p_r.end(), j.body.blob.prev_id.begin());
+        j.body.blob.tree_root.fill(0x5a);
+        j.body.blob.tx_count = 1;
+        j.h = t.h;
+        j.d = t.d;
+        return j;
+    };
+}
+void jobslot() {
+    const pb::PathbSession s{};
+    bool fail = false;
+    {  // the pin
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t M = 0x00ffffffu;
+        js.bind_own(M, s);
+        std::uint32_t en = 0x01000000u;
+        std::size_t followed = 0;
+        for (std::uint64_t k = 0; k < 66; ++k) {
+            const std::uint32_t tid = js.set_template(slot_template(k), pb::JobNetwork{});
+            for (int i = 0; i < 1000; ++i) {
+                js.bind(en, s);
+                ::v37::xmr::stratum::TemplateJob o;
+                (void)js.get_job(en++, o);
+            }
+            ::v37::xmr::stratum::TemplateJob m;
+            if (js.get_job(M, m) && !m.blob.empty() && m.template_id == tid) ++followed;
+        }
+        check(followed == 66 && js.sessions_held() == 1,
+              "jobslot: the miner's own slot gets a job on each of 66 templates after 66,000 stratum binds (followed " +
+                      std::to_string(followed) + ", sessions held " + std::to_string(js.sessions_held()) + ")");
+    }
+    {  // no leak: under clear() and with make_job failing every bind is taken by its get_job
+        pb::PathbJobSource js(slot_make(&fail));
+        js.bind_own(7, s);
+        js.clear();
+        bool none = true;
+        for (std::uint32_t e = 100; e < 1100; ++e) {
+            js.bind(e, s);
+            ::v37::xmr::stratum::TemplateJob o;
+            none = none && !js.get_job(e, o);
+        }
+        const std::size_t after_clear = js.sessions_held();
+        (void)js.set_template(slot_template(1), pb::JobNetwork{});
+        fail = true;
+        for (std::uint32_t e = 2000; e < 3000; ++e) {
+            js.bind(e, s);
+            ::v37::xmr::stratum::TemplateJob o;
+            none = none && !js.get_job(e, o);
+        }
+        fail = false;
+        check(none && after_clear == 1 && js.sessions_held() == 1 && js.make_failed() == 1000,
+              "jobslot: 1,000 binds under clear() and 1,000 with make_job failing leave the own slot only (held " +
+                      std::to_string(after_clear) + ", then " + std::to_string(js.sessions_held()) + ")");
+    }
+    {  // an issued extra_nonce: its job again on the same template, a peek on the next
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t t1 = js.set_template(slot_template(1), pb::JobNetwork{});
+        js.bind(9, s);
+        ::v37::xmr::stratum::TemplateJob a, b, c;
+        const bool ga = js.get_job(9, a), gb = js.get_job(9, b);
+        const std::uint32_t t2 = js.set_template(slot_template(2), pb::JobNetwork{});
+        const bool gc = js.get_job(9, c);
+        check(ga && gb && gc && !a.blob.empty() && b.blob == a.blob && a.template_id == t1 && c.blob.empty()
+                      && c.template_id == t2 && js.issued(t1, 9).has_value() && !js.issued(t2, 9).has_value(),
+              "jobslot: an issued extra_nonce gets its job again on its template and a peek on the next");
+    }
+    {  // MinerSlot over 30,000 templates; a HOLD; a slot with no session
+        pb::PathbJobSource js(slot_make(&fail));
+        const std::uint32_t M = 0x00ffff00u;
+        js.bind_own(M, s);
+        pb::MinerSlot slot(M), orphan(0x00ffff01u);
+        std::uint32_t en = 0x02000000u;
+        std::size_t followed = 0, lines = 0, orphan_lines = 0;
+        const std::size_t n = 30000;
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::uint32_t tid = js.set_template(slot_template(k), pb::JobNetwork{});
+            for (int i = 0; i < 3; ++i) {
+                js.bind(en, s);
+                ::v37::xmr::stratum::TemplateJob o;
+                (void)js.get_job(en++, o);
+            }
+            for (int tick = 0; tick < 2; ++tick) {
+                if (const std::optional<::v37::xmr::stratum::TemplateJob> j = slot.next(js)) slot.pushed(j->template_id);
+                if (slot.settle()) ++lines;
+                if (const std::optional<::v37::xmr::stratum::TemplateJob> j = orphan.next(js)) orphan.pushed(j->template_id);
+                if (orphan.settle()) ++orphan_lines;
+            }
+            if (slot.job_template() == tid) ++followed;
+            if (k == n / 2) {  // a HOLD: the template withdrawn for 100 ticks
+                js.clear();
+                for (int tick = 0; tick < 100; ++tick) {
+                    if (slot.next(js)) ++lines;
+                    if (slot.settle()) ++lines;
+                }
+            }
+        }
+        check(followed == n && slot.skipped() == 0 && lines == 0,
+              "jobslot: MinerSlot follows every one of 30,000 templates, no skip, a HOLD adds none (followed " +
+                      std::to_string(followed) + ", skipped " + std::to_string(slot.skipped()) + ")");
+        check(orphan.skipped() == n && orphan_lines == n,
+              "jobslot: a slot whose job has no blob is counted once per template with its line (" +
+                      std::to_string(orphan.skipped()) + " of " + std::to_string(n) + ")");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6556,5 +6690,6 @@ int main(int argc, char** argv) {
     run("prune_side", prune_side);
     run("prune_hold", prune_hold);
     run("below", below);
+    run("jobslot", jobslot);
     return finish("v37_xmr_pathb_node_kat");
 }
