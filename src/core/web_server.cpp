@@ -4,9 +4,11 @@
 #include "stratum_server.hpp"
 #include <cctype>     // rewrite_payout_scheme_label: identifier-character test
 #include <algorithm>   // std::max — authorship only ever climbs, never downgrades
+#include <cctype>      // std::tolower — /found_block/<hash> case-folding
 #include <memory>
 #include "address_utils.hpp"
 #include "coin_registry.hpp"
+#include "ip_mask.hpp"
 #include "socket.hpp"
 
 // Real coin daemon access (optional - only active when set_coin_node() is called)
@@ -18,6 +20,7 @@
 #include <impl/ltc/share_messages.hpp>
 
 #include <core/hash.hpp>   // Hash(a,b) double-SHA256 for merkle computation
+#include <core/block_body_summary.hpp> // #946 coinbase_txid + tx_count of a submitted block
 #include <core/random.hpp> // core::random::random_float for probabilistic fee
 #include <core/target_utils.hpp> // chain::bits_to_target
 #include <btclibs/util/strencodings.h>  // ParseHex, HexStr
@@ -409,7 +412,9 @@ std::string MiningInterface::get_node_fee_hash160() const
 bool MiningInterface::check_merged_mining(const std::string& block_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
-                                          const JobSnapshot* job)
+                                          const JobSnapshot* job,
+                                          const std::string& miner,
+                                          const uint256& share_hash)
 {
     if (!m_mm_manager) return false;
 
@@ -433,6 +438,15 @@ bool MiningInterface::check_merged_mining(const std::string& block_hex,
         coinbase_hex = cb1 + extranonce1 + extranonce2 + cb2;
         merkle_branches_copy = job ? job->merkle_branches : m_cached_merkle_branches;
     }
+
+    // #946: the explorer's parent_hash is the LTC block id (SHA256d), not
+    // the scrypt PoW hash the aux-target check needs.
+    MergedSubmitContext ctx;
+    ctx.parent_hash = Hash(hdr_bytes).GetHex();
+    if (job) ctx.parent_prev_hash = job->gbt_prevhash;
+    ctx.miner = miner;
+    if (!share_hash.IsNull()) ctx.share_hash = share_hash.GetHex();
+    MergedSubmitScope submit_scope(std::move(ctx));
 
     auto before = m_mm_manager->get_discovered_blocks().size();
     m_mm_manager->try_submit_merged_blocks(
@@ -1894,6 +1908,17 @@ void MiningInterface::mark_block_submitted(const uint256& block_hash)
 
 nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const std::string& request_id)
 {
+    // Every found-block callback goes through here. The callback records the
+    // row from the header alone; the explorer body fields (#946 coinbase_txid,
+    // tx_count) need the full block, which only this function holds, so they
+    // are filled right after the row exists. Body parse failure leaves them null.
+    auto fire_block_submitted = [&](int stale_info) {
+        m_on_block_submitted(hex_data.substr(0, 160), stale_info);
+        if (auto body = core::summarize_block_body(ParseHex(hex_data)))
+            set_found_block_body(Hash(ParseHex(hex_data.substr(0, 160))).GetHex(),
+                                 body->coinbase_txid, body->tx_count);
+    };
+
     LOG_TRACE << "[LTC] submitblock: received " << hex_data.length() / 2 << " bytes";
 
     // Block header is 80 bytes = 160 hex chars minimum
@@ -1975,7 +2000,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 // record_found_block dedups by block hash, so firing at verdict time
                 // is double-record-safe.
                 if (m_on_block_submitted && hex_data.size() >= 160) {
-                    m_on_block_submitted(hex_data.substr(0, 160), 0);
+                    fire_block_submitted(0);
                 }
                 // Relay full block via P2P for fast propagation
                 if (m_on_block_relay) {
@@ -1991,7 +2016,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                 // (block already accepted via P2P), which must not be mis-counted.
                 LOG_WARNING << "submitblock: coin daemon rejected the block (or already had it)";
                 if (is_stale && m_on_block_submitted && hex_data.size() >= 160) {
-                    m_on_block_submitted(hex_data.substr(0, 160), 253);
+                    fire_block_submitted(253);
                 }
                 return {{"error", "block rejected by coin daemon"}};
             }
@@ -2000,7 +2025,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
             // DOA (RPC transport failure — no verdict). Fire the single callback:
             // 253 for a stale/race block, else 254.
             if (m_on_block_submitted && hex_data.size() >= 160) {
-                m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 254);
+                fire_block_submitted(is_stale ? 253 : 254);
             }
             return {{"error", std::string(e.what())}};
         }
@@ -2051,7 +2076,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         // feedback below). A stale/race block is recorded as ORPHAN (253); a fresh
         // block as WON (0). The block is still relayed via P2P regardless.
         if (m_on_block_submitted && hex_data.size() >= 160)
-            m_on_block_submitted(hex_data.substr(0, 160), is_stale ? 253 : 0);
+            fire_block_submitted(is_stale ? 253 : 0);
 
         // Thread the slow parts (P2P relay + RPC) so stratum isn't blocked.
         // P2P relay runs FIRST — fast propagation is critical for block acceptance.
@@ -2086,7 +2111,7 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
         // No verdict and no forward path: a stale/race block is genuinely lost
         // here, so record it as ORPHAN (253) to keep the race visible in metrics.
         if (is_stale && m_on_block_submitted && hex_data.size() >= 160)
-            m_on_block_submitted(hex_data.substr(0, 160), 253);
+            fire_block_submitted(253);
     }
 
     return nullptr; // null = accepted in getblocktemplate spec
@@ -2335,8 +2360,10 @@ nlohmann::json MiningInterface::getpeerinfo(const std::string& request_id)
     // embedded prod build m_node->get_connected_peers_count() returns 0 while
     // the node is fully peered -- the same founding-charter lie that getinfo/
     // getstats already route around. getpeerinfo must report the real peers.
+    // #1985: the JSON-RPC POST path has no viewer context and sits on the
+    // public dashboard port, so incoming peers are always masked (fail closed).
     if (m_peer_info_fn) {
-        auto pi = m_peer_info_fn();
+        auto pi = peer_info_for_viewer(/*reveal_ips=*/false);
         if (pi.is_array())
             return pi;
     }
@@ -2578,10 +2605,9 @@ std::string MiningInterface::block_explorer_prefix() const
     }
 }
 
-nlohmann::json MiningInterface::rest_recent_blocks()
+nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) const
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
-    nlohmann::json arr = nlohmann::json::array();
 
     // actual_hash_difficulty: how far below target the WINNING hash landed,
     // = diff1 / block_hash (the p2pool-dash formula, web.py:1754). It is the
@@ -2619,6 +2645,128 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             return nlohmann::json(nullptr);
         return nlohmann::json(explorer_prefix + hash_hex);
     };
+    // Node-role honesty (#942): a block with no local share_hash AND no
+    // miner address is one this node did NOT find -- it was learned from a
+    // peer over P2P relay. A relay node therefore has no local timing for
+    // it, so luck_method must not fabricate a computed-luck label
+    // ("first_block" wrongly implied a luck computation was attempted), and
+    // the timing-derived fields are honest-absent (null) rather than a
+    // real-looking 0.
+    //
+    // NAMING (2026-08-07): this predicate asks "do we hold a local record
+    // of the block", NOT "did we find it" — a sharechain peer's block
+    // satisfies it, because the gossiped share carries both fields. The
+    // two questions were conflated under one name; authorship now has its
+    // own field (b.authorship, emitted as found_by) set at the call site
+    // that knows. The wire key `found_locally` keeps its existing meaning
+    // and its existing consumers; read `found_by` for authorship.
+    const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    std::string method;
+    if (!have_local_record)                    method = "relayed";
+    else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
+    else if (b.time_to_find > 0)               method = "netdiff_unavailable";
+    else                                       method = "first_block";
+    // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
+    // two distinct rows. A genuine first block has no earlier same-chain row,
+    // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
+    // but no luck HAS a predecessor — its luck was uncomputable only because
+    // network_difficulty was never captured at find time. Labelling the
+    // second case "first_block" made the UI tooltip claim it was the pool's
+    // first block, which is false for any row after the first. The netdiff
+    // repair paths normally fill that difficulty and this row becomes
+    // "simple_avg"; the label survives only for a row whose header is still
+    // unavailable (never synced), where it correctly reads "unavailable".
+    // #942 second slice, extended to EVERY unmeasured field (production node,
+    // 2026-08-05): the primary's rows for our own blocks rendered
+    // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
+    // were data. A zero that was never measured is emitted as null — the
+    // same honesty rule the timing fields already follow — so the UI
+    // renders '-' instead of a fabricated measurement. A luck of 0 on a
+    // found_locally row means "not computed" (first block, or recorded
+    // with no difficulty), never "0% lucky": also null.
+    auto num_or_null = [](double v) {
+        return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
+    };
+    // A luck value exists only on a row we hold locally that actually
+    // computed one (time_to_find>0 && luck>0). Those rows feed both the
+    // per-row luck_approximate flag and rest_recent_blocks' pool aggregate.
+    const bool luck_present = have_local_record && b.luck > 0.0
+                              && b.time_to_find > 0.0;
+    // block_reward: the raw-duff subsidy expressed in whole coins, kept
+    // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
+    // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
+    nlohmann::json block_reward = b.subsidy != 0
+        ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
+        : nlohmann::json(nullptr);
+    auto str_or_null = [](const std::string& s) {
+        return s.empty() ? nlohmann::json(nullptr) : nlohmann::json(s);
+    };
+    // Sample-count provenance. c2pool derives luck from ONE difficulty and
+    // ONE hashrate reading captured at find time, so the "average used" is
+    // that single value and the sample count is 1 when present, 0 when the
+    // input was never measured (honest-null, #942).
+    return {
+        {"ts", b.ts},
+        {"hash", b.hash},
+        {"number", b.height},
+        {"height", b.height},
+        {"status", status_str[static_cast<int>(b.status)]},
+        {"verified", b.status == BlockStatus::confirmed},
+        {"checks", b.check_count},
+        {"chain", b.chain},
+        {"confirmations", b.confirmations},
+        {"miner", b.miner},
+        // #946: no share behind the find (e.g. an aux solve that missed the
+        // share target) is null, never "".
+        {"share", str_or_null(b.share_hash)},
+        {"found_locally", have_local_record},
+        // Authorship, set at the call site that knows. "unknown" is a real
+        // answer -- a coin lane that has not labelled its sites -- and the
+        // UI must render it as unknown rather than folding it into either
+        // claim.
+        {"found_by", b.authorship == BlockAuthorship::this_node
+                         ? "this_node"
+                         : b.authorship == BlockAuthorship::sharechain_peer
+                               ? "sharechain_peer" : "unknown"},
+        {"network_difficulty", num_or_null(b.network_difficulty)},
+        {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
+        {"share_difficulty", num_or_null(b.share_difficulty)},
+        {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
+        {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
+                                   : nlohmann::json(nullptr)},
+        {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
+        {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
+        {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
+        {"luck_method", method},
+        // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
+        {"block_reward", block_reward},
+        {"explorer_url", explorer_url(b.hash)},
+        {"from_history", b.from_history},
+        // The luck value is a single-sample approximation whenever it
+        // exists; null (not false) when no luck was computed, so the UI
+        // renders '-' rather than claiming a precise measurement.
+        {"luck_approximate", luck_present ? nlohmann::json(true)
+                                          : nlohmann::json(nullptr)},
+        {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
+        {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
+        {"avg_difficulty_used", num_or_null(b.network_difficulty)},
+        {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0},
+        // #946 explorer fields. Missing = null, never "" or 0 (restored
+        // pre-#946 records included).
+        {"parent_hash", str_or_null(b.parent_hash)},
+        {"parent_height", b.parent_height && *b.parent_height > 0
+                              ? nlohmann::json(*b.parent_height)
+                              : nlohmann::json(nullptr)},
+        {"coinbase_txid", str_or_null(b.coinbase_txid)},
+        {"tx_count", b.tx_count ? nlohmann::json(*b.tx_count)
+                                : nlohmann::json(nullptr)}
+    };
+}
+
+nlohmann::json MiningInterface::rest_recent_blocks()
+{
+    nlohmann::json arr = nlohmann::json::array();
+
     // Pool luck aggregate, accumulated over the rows as we build them. c2pool
     // derives each block's luck from ONE network-difficulty and ONE pool-
     // hashrate reading sampled at find time -- it does not interval-average
@@ -2629,109 +2777,11 @@ nlohmann::json MiningInterface::rest_recent_blocks()
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& b : m_found_blocks) {
-        // Node-role honesty (#942): a block with no local share_hash AND no
-        // miner address is one this node did NOT find -- it was learned from a
-        // peer over P2P relay. A relay node therefore has no local timing for
-        // it, so luck_method must not fabricate a computed-luck label
-        // ("first_block" wrongly implied a luck computation was attempted), and
-        // the timing-derived fields are honest-absent (null) rather than a
-        // real-looking 0.
-        //
-        // NAMING (2026-08-07): this predicate asks "do we hold a local record
-        // of the block", NOT "did we find it" — a sharechain peer's block
-        // satisfies it, because the gossiped share carries both fields. The
-        // two questions were conflated under one name; authorship now has its
-        // own field (b.authorship, emitted as found_by) set at the call site
-        // that knows. The wire key `found_locally` keeps its existing meaning
-        // and its existing consumers; read `found_by` for authorship.
-        const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
-        std::string method;
-        if (!have_local_record)                    method = "relayed";
-        else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
-        else if (b.time_to_find > 0)               method = "netdiff_unavailable";
-        else                                       method = "first_block";
-        // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
-        // two distinct rows. A genuine first block has no earlier same-chain row,
-        // so time_to_find is 0 and no luck can exist. A row with time_to_find>0
-        // but no luck HAS a predecessor — its luck was uncomputable only because
-        // network_difficulty was never captured at find time. Labelling the
-        // second case "first_block" made the UI tooltip claim it was the pool's
-        // first block, which is false for any row after the first. The netdiff
-        // repair paths normally fill that difficulty and this row becomes
-        // "simple_avg"; the label survives only for a row whose header is still
-        // unavailable (never synced), where it correctly reads "unavailable".
-        // #942 second slice, extended to EVERY unmeasured field (hotel,
-        // 2026-08-05): the primary's rows for our own blocks rendered
-        // network_difficulty=0.0, subsidy=0, pool_hashrate=0.0 as if they
-        // were data. A zero that was never measured is emitted as null — the
-        // same honesty rule the timing fields already follow — so the UI
-        // renders '-' instead of a fabricated measurement. A luck of 0 on a
-        // found_locally row means "not computed" (first block, or recorded
-        // with no difficulty), never "0% lucky": also null.
-        auto num_or_null = [](double v) {
-            return v > 0.0 ? nlohmann::json(v) : nlohmann::json(nullptr);
-        };
-        // A luck value exists only on a row we hold locally that actually
-        // computed one (time_to_find>0 && luck>0). Those rows feed both the
-        // per-row luck_approximate flag and the first-row pool aggregate below.
-        const bool luck_present = have_local_record && b.luck > 0.0
-                                  && b.time_to_find > 0.0;
-        if (luck_present) { luck_sum += b.luck; ++luck_count; }
-        // block_reward: the raw-duff subsidy expressed in whole coins, kept
-        // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
-        // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
-        nlohmann::json block_reward = b.subsidy != 0
-            ? nlohmann::json(static_cast<double>(b.subsidy) / 1e8)
-            : nlohmann::json(nullptr);
-        // Sample-count provenance. c2pool derives luck from ONE difficulty and
-        // ONE hashrate reading captured at find time, so the "average used" is
-        // that single value and the sample count is 1 when present, 0 when the
-        // input was never measured (honest-null, #942).
-        arr.push_back({
-            {"ts", b.ts},
-            {"hash", b.hash},
-            {"number", b.height},
-            {"height", b.height},
-            {"status", status_str[static_cast<int>(b.status)]},
-            {"verified", b.status == BlockStatus::confirmed},
-            {"checks", b.check_count},
-            {"chain", b.chain},
-            {"confirmations", b.confirmations},
-            {"miner", b.miner},
-            {"share", b.share_hash},
-            {"found_locally", have_local_record},
-            // Authorship, set at the call site that knows. "unknown" is a real
-            // answer -- a coin lane that has not labelled its sites -- and the
-            // UI must render it as unknown rather than folding it into either
-            // claim.
-            {"found_by", b.authorship == BlockAuthorship::this_node
-                             ? "this_node"
-                             : b.authorship == BlockAuthorship::sharechain_peer
-                                   ? "sharechain_peer" : "unknown"},
-            {"network_difficulty", num_or_null(b.network_difficulty)},
-            {"actual_hash_difficulty", actual_hash_difficulty(b.hash)},
-            {"share_difficulty", num_or_null(b.share_difficulty)},
-            {"pool_hashrate_at_find", num_or_null(b.pool_hashrate)},
-            {"subsidy", b.subsidy != 0 ? nlohmann::json(b.subsidy)
-                                       : nlohmann::json(nullptr)},
-            {"expected_time", have_local_record ? num_or_null(b.expected_time) : nlohmann::json(nullptr)},
-            {"time_to_find", have_local_record ? num_or_null(b.time_to_find) : nlohmann::json(nullptr)},
-            {"luck", have_local_record ? num_or_null(b.luck) : nlohmann::json(nullptr)},
-            {"luck_method", method},
-            // #57 oracle-parity residual fields (all DISPLAY-ONLY, honest-null):
-            {"block_reward", block_reward},
-            {"explorer_url", explorer_url(b.hash)},
-            {"from_history", b.from_history},
-            // The luck value is a single-sample approximation whenever it
-            // exists; null (not false) when no luck was computed, so the UI
-            // renders '-' rather than claiming a precise measurement.
-            {"luck_approximate", luck_present ? nlohmann::json(true)
-                                              : nlohmann::json(nullptr)},
-            {"avg_hashrate_used", num_or_null(b.pool_hashrate)},
-            {"hashrate_samples_used", b.pool_hashrate > 0.0 ? 1 : 0},
-            {"avg_difficulty_used", num_or_null(b.network_difficulty)},
-            {"diff_samples_used", b.network_difficulty > 0.0 ? 1 : 0}
-        });
+        auto row = found_block_row_locked(b);
+        // luck_approximate is true exactly on the rows that computed a luck,
+        // so those rows feed the first-row pool aggregate below.
+        if (row["luck_approximate"].is_boolean()) { luck_sum += b.luck; ++luck_count; }
+        arr.push_back(std::move(row));
     }
 
     // First-row pool luck aggregate (#57), mirroring the oracle shape: the
@@ -2756,6 +2806,19 @@ nlohmann::json MiningInterface::rest_recent_blocks()
             "interval-averaged between blocks).";
     }
     return arr;
+}
+
+nlohmann::json MiningInterface::rest_found_block(const std::string& hash)
+{
+    // Stored hashes are uint256::GetHex() (lowercase); accept any case.
+    std::string want = hash;
+    for (auto& c : want)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::lock_guard<std::mutex> lock(m_blocks_mutex);
+    for (const auto& b : m_found_blocks)
+        if (b.hash == want)
+            return found_block_row_locked(b);
+    return nlohmann::json(nullptr);
 }
 
 nlohmann::json MiningInterface::rest_checkpoint()
@@ -2798,10 +2861,12 @@ nlohmann::json MiningInterface::rest_connected_miners()
     return arr;
 }
 
-nlohmann::json MiningInterface::rest_stratum_stats()
+nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
 {
     // p2pool format: { pool: {...}, workers: {...} }
     // stratum.html reads data.pool.* and data.workers.*
+    // #1985: unless reveal_ips, every miner address below (remote_endpoint and
+    // the ip_connections / ip_workers keys) is a mask_ip_endpoint() token.
     nlohmann::json result = nlohmann::json::object();
     auto workers = effective_stratum_workers();
     auto now = std::time(nullptr);
@@ -2812,9 +2877,13 @@ nlohmann::json MiningInterface::rest_stratum_stats()
     std::set<std::string> unique_addrs;
     std::map<std::string, int> ip_connections;   // IP → connection count
     std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+    const auto liveness = observe_worker_liveness(workers, now_steady);
+    int connections_silent = 0;
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
+        const WorkerLiveness& lv = liveness.at(sid);
+        if (lv.silent) ++connections_silent;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
@@ -2826,6 +2895,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
         // stratum producer), so group by the bare host across both families.
         std::string ip = core::parse_host_port(w.remote_endpoint).host;
         if (!ip.empty()) {
+            if (!reveal_ips)
+                ip = core::mask_ip_endpoint(ip);
             ip_connections[ip]++;
             ip_workers_set[ip].insert(w.username);
         }
@@ -2854,6 +2925,14 @@ nlohmann::json MiningInterface::rest_stratum_stats()
             // Keep earliest first_seen
             if (first_seen_ts < workers_json[worker_key]["first_seen"].get<uint64_t>())
                 workers_json[worker_key]["first_seen"] = first_seen_ts;
+            // #959: a worker is silent only if every one of its connections is;
+            // report the freshest connection's silence.
+            auto& wj = workers_json[worker_key];
+            wj["silent"] = wj["silent"].get<bool>() && lv.silent;
+            if (lv.silent_seconds < wj["silent_seconds"].get<int64_t>()) {
+                wj["silent_seconds"] = lv.silent_seconds;
+                wj["silent_threshold_seconds"] = lv.threshold_seconds;
+            }
         } else {
             workers_json[worker_key] = {
                 {"hash_rate", w.hashrate},
@@ -2868,8 +2947,13 @@ nlohmann::json MiningInterface::rest_stratum_stats()
                 {"stale", w.stale},
                 {"shares", w.accepted + w.stale},
                 {"connected_seconds", elapsed},
-                {"remote_endpoint", w.remote_endpoint},
-                {"rtt_ms", w.rtt_ms}
+                {"remote_endpoint", reveal_ips || w.remote_endpoint.empty()
+                                        ? w.remote_endpoint
+                                        : core::mask_ip_endpoint(w.remote_endpoint)},
+                {"rtt_ms", w.rtt_ms},
+                {"silent", lv.silent},
+                {"silent_seconds", lv.silent_seconds},
+                {"silent_threshold_seconds", lv.threshold_seconds}
             };
         }
     }
@@ -2886,6 +2970,8 @@ nlohmann::json MiningInterface::rest_stratum_stats()
 
     result["pool"] = {
         {"connections", static_cast<int>(workers.size())},
+        {"connections_active", static_cast<int>(workers.size()) - connections_silent},
+        {"connections_silent", connections_silent},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
         {"total_accepted", total_accepted},
@@ -3083,7 +3169,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["network_hashrate"] = net_hashrate;
     result["shares_in_chain"] = total_shares;
     result["unique_miners"] = unique_miners;
-    // WHAT unique_miners COUNTS, stated so the card can label it (hotel,
+    // WHAT unique_miners COUNTS, stated so the card can label it (production node,
     // 2026-08-05: the operator read 5 against ~33 connected rigs and called
     // it wrong — it was counting something else). It is the number of
     // DISTINCT PAYOUT ADDRESSES holding shares in the sharechain window,
@@ -3101,7 +3187,7 @@ nlohmann::json MiningInterface::rest_global_stats()
     result["uptime_seconds"] = rest_uptime();
     result["status"] = "operational";
     // last_block: was a hardcoded 0 since the field's introduction — never
-    // set on any chain (both hotel nodes showed 0 with 100+ ledger rows).
+    // set on any chain (both production nodes showed 0 with 100+ ledger rows).
     // Sourced from the found-block ledger (persistent, so a restart does not
     // zero it): the newest row for THIS node's primary chain.
     {
@@ -3692,7 +3778,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
 
-    // ── MEASUREMENT FALLBACKS (hotel, 2026-08-05) ────────────────────────
+    // ── MEASUREMENT FALLBACKS (production node, 2026-08-05) ────────────────────────
     // Both record paths passed mi->get_network_difficulty(), which reads a
     // cache that is only refreshed when somebody polls /local_stats — so a
     // block found before the first dashboard hit was recorded with
@@ -3731,7 +3817,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
         }
     }
 
-    // Runtime dedup — with ENRICHMENT. Measured (hotel primary): rows for
+    // Runtime dedup — with ENRICHMENT. Measured (primary node): rows for
     // OUR OWN blocks h=2516911/2516914 sat as miner="" share="" subsidy=0
     // junk forever, because they were persisted by an older binary before
     // attribution existed, restored at startup, and the plain early-return
@@ -3907,6 +3993,125 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // duplicates, so twin / replayed notifications never double-reset. Tied to
     // the block-found event, not a timer.
     reset_best_difficulty_round(ts);
+}
+
+void MiningInterface::set_found_block_body(const std::string& block_hash,
+                                           const std::string& coinbase_txid,
+                                           std::optional<uint32_t> tx_count)
+{
+    std::string h = block_hash;
+    for (auto& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::vector<FoundBlock> changed;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& blk : m_found_blocks) {
+            if (blk.hash != h) continue;
+            bool dirty = false;
+            if (blk.coinbase_txid.empty() && !coinbase_txid.empty()) {
+                blk.coinbase_txid = coinbase_txid;
+                dirty = true;
+            }
+            if (!blk.tx_count && tx_count) {
+                blk.tx_count = tx_count;
+                dirty = true;
+            }
+            if (dirty) changed.push_back(blk);
+        }
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& blk : changed) {
+            try { m_persist_block_fn(blk); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found-block body fields: " << e.what();
+            }
+        }
+    }
+}
+
+void MiningInterface::set_found_block_parent(const std::string& block_hash,
+                                             const std::string& parent_hash,
+                                             std::optional<uint64_t> parent_height)
+{
+    if (parent_height && *parent_height == 0) parent_height.reset();
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string h = lower(block_hash);
+    const std::string ph = lower(parent_hash);
+    std::vector<FoundBlock> changed;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (auto& blk : m_found_blocks) {
+            if (blk.hash != h) continue;
+            bool dirty = false;
+            if (blk.parent_hash.empty() && !ph.empty()) {
+                blk.parent_hash = ph;
+                dirty = true;
+            }
+            if (!blk.parent_height && parent_height) {
+                blk.parent_height = parent_height;
+                dirty = true;
+            }
+            if (dirty) changed.push_back(blk);
+        }
+    }
+    // Outside m_blocks_mutex: m_persist_block_fn is the LevelDB writer.
+    if (m_persist_block_fn) {
+        for (const auto& blk : changed) {
+            try { m_persist_block_fn(blk); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found-block parent fields: " << e.what();
+            }
+        }
+    }
+}
+
+namespace {
+// The submitting thread's MergedSubmitScope (null outside check_merged_mining).
+thread_local const MiningInterface::MergedSubmitContext* t_merged_submit_ctx = nullptr;
+} // namespace
+
+MiningInterface::MergedSubmitScope::MergedSubmitScope(MergedSubmitContext ctx)
+    : m_ctx(std::move(ctx)), m_prev(t_merged_submit_ctx)
+{
+    t_merged_submit_ctx = &m_ctx;
+}
+
+MiningInterface::MergedSubmitScope::~MergedSubmitScope()
+{
+    t_merged_submit_ctx = m_prev;
+}
+
+void MiningInterface::record_merged_found_block(const std::string& symbol, int height,
+                                                const std::string& block_hash, bool accepted,
+                                                uint64_t coinbase_value)
+{
+    const MergedSubmitContext* ctx = t_merged_submit_ctx;
+    uint256 h;
+    h.SetHex(block_hash);
+    const std::string miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
+    // share = the one this submit minted; "" (JSON null) when the solve
+    // missed the share target. Network difficulty is still the parent's (#1738).
+    const std::string share = ctx ? ctx->share_hash : std::string();
+    record_found_block(static_cast<uint64_t>(height), h, 0, symbol,
+                       miner, share, get_network_difficulty(), 0, get_local_hashrate(),
+                       coinbase_value, BlockAuthorship::this_node);
+    if (ctx) {
+        std::optional<uint64_t> parent_height = ctx->parent_height;
+        if (!parent_height && !ctx->parent_prev_hash.empty()) {
+            auto tmpl = get_current_work_template();
+            if (tmpl.is_object() && tmpl.contains("previousblockhash") && tmpl.contains("height")
+                && tmpl["previousblockhash"].is_string()
+                && tmpl["previousblockhash"].get<std::string>() == ctx->parent_prev_hash
+                && tmpl["height"].is_number_unsigned())
+                parent_height = tmpl["height"].get<uint64_t>();
+        }
+        set_found_block_parent(h.GetHex(), ctx->parent_hash, parent_height);
+    }
+    if (accepted)
+        schedule_block_verification(block_hash);
 }
 
 void MiningInterface::set_found_block_persistence(block_store_fn_t persist_fn, block_load_fn_t load_fn)
@@ -4466,6 +4671,41 @@ nlohmann::json MiningInterface::rest_local_stats()
     else
         result["local_hashps"] = nullptr;
 
+    // #942 node_role -- what kind of node this is, so the dashboard can say
+    // "not applicable here" instead of rendering zero miners / 0 H/s as a
+    // measurement. "mining" = a miner-facing Stratum acceptor runs on this
+    // node; "relay" = none does (e.g. c2pool-dash without --stratum), so it
+    // only relays the sharechain and cannot have local miners. The signal is
+    // the same seam local_hashps reads: every acceptor (WebServer's own on
+    // the LTC path; c2pool-dash, btc and bip110 their own) wires
+    // set_stratum_hashrate_fn only once it is actually listening. Display
+    // only; reads a std::function set at startup, no tracker or peer state,
+    // so no new lock surface.
+    result["node_role"] = m_stratum_hashrate_fn ? "mining" : "relay";
+
+    // #959 active/total: a session count alone hides dead rigs that stay
+    // authorized, so the headline splits live contributors from SILENT
+    // sessions (authorized, no accepted share past the threshold). Reads the
+    // worker registry copy under its own short mutex, no tracker/peer lock.
+    {
+        const auto workers = effective_stratum_workers();
+        const auto liveness = observe_worker_liveness(
+            workers, std::chrono::steady_clock::now());
+        int silent = 0;
+        for (const auto& [sid, lv] : liveness)
+            if (lv.silent) ++silent;
+        const int total = static_cast<int>(workers.size());
+        result["stratum_sessions"] = {
+            {"total", total},
+            {"active", total - silent},
+            {"silent", silent},
+            {"silent_floor_seconds", kSilentFloorSeconds}
+        };
+        // #959 slice B: name the silent workers and how long each has been
+        // silent, so the operator sees which rig died, not just a count.
+        result["workers_silent"] = silent_workers_list(workers, liveness);
+    }
+
     // shares — {total, orphan, dead}
     // Sharechain stats now use O(log n) StatsSkipList — no caching needed.
     nlohmann::json cached_sc;
@@ -4537,7 +4777,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     double burn_amount = 0.0;
     if (block_value == 0.0 && coin_work.valid) {
         block_value    = static_cast<double>(coin_work.coinbase_value_sat) / 1e8;
-        // MEASURED WRONG SPLIT (hotel, 2026-08-05, DASH mainnet). The
+        // MEASURED WRONG SPLIT (production node, 2026-08-05, DASH mainnet). The
         // dashboard said miner_gross=0.9404 (53% of the block) while the
         // ACCEPTED coinbase of our own h=2516911 paid miners 0.4428 (25%):
         // payment_amount_sat carries only the projected MN payee — it rides
@@ -4555,7 +4795,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["block_value"] = block_value;
     // WHICH template the number describes, and how old it is. block_value
     // renders identically whether the template is live or was last sourced
-    // an hour ago (hotel primary: 0 local miners => nothing refreshes it) —
+    // an hour ago (primary node: 0 local miners => nothing refreshes it) —
     // the height + age let the dashboard say so instead of presenting a
     // stale number as current.
     if (coin_work.valid) {
@@ -4852,7 +5092,7 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     result["donation_proportion"] = m_pool_fee_percent / 100.0;
     result["fee"] = m_pool_fee_percent;  // percentage (e.g. 1.0)
-    // UNITS, stated (hotel, 2026-08-05: the operator could not tell from the
+    // UNITS, stated (production node, 2026-08-05: the operator could not tell from the
     // payload whether fee=1.0 meant 1% or a proportion of 1.0 = 100%, because
     // the sibling donation_proportion IS a proportion where 1.0 would mean
     // 100%). `fee` and /fee stay p2pool-compat percent; these two name their
@@ -5537,12 +5777,18 @@ nlohmann::json MiningInterface::rest_user_stales()
     return nlohmann::json::object();
 }
 
-std::string MiningInterface::rest_peer_addresses()
+std::string MiningInterface::rest_peer_addresses(bool reveal_ips)
 {
     std::string result;
     if (m_peer_info_fn) {
         auto peers = m_peer_info_fn();
         for (const auto& p : peers) {
+            // #1985: this list is read as host:port dial targets, so a masked
+            // entry would be a broken target. Unless reveal_ips, incoming peers
+            // are dropped instead; a peer without an "incoming" flag is dropped
+            // too (fail closed). Outgoing peers are public listeners we dialed.
+            if (!reveal_ips && (!p.is_object() || p.value("incoming", true)))
+                continue;
             if (!result.empty()) result += ' ';
             result += p.value("address", "");
         }
@@ -5550,40 +5796,50 @@ std::string MiningInterface::rest_peer_addresses()
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_versions()
+nlohmann::json MiningInterface::peer_info_for_viewer(bool reveal_ips)
+{
+    if (!m_peer_info_fn)
+        return nlohmann::json::array();
+    auto peers = m_peer_info_fn();
+    if (reveal_ips || !peers.is_array())
+        return peers;
+    // #1985: an incoming peer's address is the remote host that dialed us.
+    // A peer without an "incoming" flag is masked too (fail closed).
+    for (auto& p : peers) {
+        if (!p.is_object() || !p.contains("address") || !p["address"].is_string())
+            continue;
+        if (p.value("incoming", true))
+            p["address"] = core::mask_ip_endpoint(p["address"].get<std::string>());
+    }
+    return peers;
+}
+
+nlohmann::json MiningInterface::rest_peer_versions(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
-    if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
-        for (const auto& p : peers)
-            result[p.value("address", "")] = p.value("version", "unknown");
-    }
+    for (const auto& p : peer_info_for_viewer(reveal_ips))
+        result[p.value("address", "")] = p.value("version", "unknown");
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_txpool_sizes()
+nlohmann::json MiningInterface::rest_peer_txpool_sizes(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
-    if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
-        for (const auto& p : peers)
-            result[p.value("address", "")] = p.value("txpool_size", 0);
-    }
+    for (const auto& p : peer_info_for_viewer(reveal_ips))
+        result[p.value("address", "")] = p.value("txpool_size", 0);
     return result;
 }
 
-nlohmann::json MiningInterface::rest_peer_list()
+nlohmann::json MiningInterface::rest_peer_list(bool reveal_ips)
 {
-    if (m_peer_info_fn)
-        return m_peer_info_fn();
-    return nlohmann::json::array();
+    return peer_info_for_viewer(reveal_ips);
 }
 
-nlohmann::json MiningInterface::rest_pings()
+nlohmann::json MiningInterface::rest_pings(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
     if (m_peer_info_fn) {
-        auto peers = m_peer_info_fn();
+        auto peers = peer_info_for_viewer(reveal_ips);
         for (const auto& p : peers)
             result[p.value("address", "")] = p.value("ping_ms", 0.0);
     }
@@ -5928,7 +6184,7 @@ nlohmann::json MiningInterface::rest_luck_stats()
         // luck==0 is "never computed" (relay-learned row, or recorded with
         // no network difficulty), not "0% lucky". The chart previously drew
         // those as 0-value points, which is exactly the wrong-luck-trend the
-        // hotel dashboards showed on 2026-08-05: emit null so the trend
+        // production dashboards showed on 2026-08-05: emit null so the trend
         // SKIPS them instead of plotting a fabricated catastrophe.
         blocks.push_back({{"ts", b.ts}, {"hash", b.hash},
                           {"luck", b.luck > 0.0 ? nlohmann::json(b.luck)
@@ -5958,14 +6214,17 @@ nlohmann::json MiningInterface::rest_luck_stats()
     return result;
 }
 
-nlohmann::json MiningInterface::rest_ban_stats()
+nlohmann::json MiningInterface::rest_ban_stats(bool reveal_ips)
 {
     nlohmann::json result = nlohmann::json::object();
     std::lock_guard<std::mutex> lock(m_control_mutex);
     result["total_banned"] = static_cast<uint64_t>(m_banned_targets.size());
     nlohmann::json banned = nlohmann::json::array();
+    // #1985: a banned IP is masked for a non-local viewer; a banned payout
+    // address or worker name is not an IP and is shown as-is.
     for (const auto& t : m_banned_targets)
-        banned.push_back(t);
+        banned.push_back(!reveal_ips && core::is_ip_endpoint(t)
+                             ? core::mask_ip_endpoint(t) : t);
     result["banned_targets"] = banned;
     return result;
 }
@@ -6322,10 +6581,13 @@ nlohmann::json MiningInterface::rest_version_signaling(const nlohmann::json* cac
     // ETA cadence for the propagation countdown (display only): DASH mints one
     // share every 20s, the LTC-family every 10s.
     const int share_period_sec = (m_blockchain == Blockchain::DASH) ? 20 : 10;
+    // Wire type 36 is MergedMiningShare on the LTC family and DashV36Share on
+    // DASH (the private/isolated DASH v36 sharechain's share type).
     const std::map<int, std::string> share_type_names = {
         {16, "DashShare"},
         {17, "Share"}, {32, "PreSegwitShare"}, {33, "NewShare"},
-        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"}, {36, "MergedMiningShare"}
+        {34, "SegwitMiningShare"}, {35, "PaddingBugfixShare"},
+        {36, m_blockchain == Blockchain::DASH ? "DashV36Share" : "MergedMiningShare"}
     };
 
     nlohmann::json result = nlohmann::json::object();
@@ -7878,6 +8140,110 @@ std::map<std::string, MiningInterface::WorkerInfo> MiningInterface::effective_st
     return {};
 }
 
+MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
+    const WorkerInfo& w,
+    std::optional<std::chrono::steady_clock::time_point> last_share_at,
+    std::chrono::steady_clock::time_point now)
+{
+    WorkerLiveness out;
+    out.has_shared = last_share_at.has_value();
+
+    // Expected seconds between accepted shares at this session's vardiff.
+    double expected_s = 0.0;
+    if (w.hashrate > 0.0 && w.difficulty > 0.0)
+        expected_s = w.difficulty * 4294967296.0 / w.hashrate;
+    double scaled = expected_s * kSilentExpectedIntervals;
+    int64_t thr = kSilentFloorSeconds;
+    if (scaled > static_cast<double>(thr))
+        thr = scaled >= static_cast<double>(kSilentCapSeconds)
+            ? kSilentCapSeconds : static_cast<int64_t>(std::ceil(scaled));
+    out.threshold_seconds = thr;
+
+    // No share and no known connect time: nothing to measure from, so never
+    // call it silent.
+    if (!last_share_at && w.connected_at == std::chrono::steady_clock::time_point{})
+        return out;
+
+    const auto ref = last_share_at ? *last_share_at : w.connected_at;
+    out.silent_seconds = std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::seconds>(now - ref).count());
+    out.silent = out.silent_seconds >= thr;
+    return out;
+}
+
+std::map<std::string, MiningInterface::WorkerLiveness>
+MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>& workers,
+                                         std::chrono::steady_clock::time_point now) const
+{
+    std::map<std::string, WorkerLiveness> out;
+    std::lock_guard<std::mutex> lock(m_share_seen_mutex);
+    for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
+        if (workers.count(it->first)) ++it;
+        else it = m_share_seen.erase(it);   // session gone
+    }
+    for (const auto& [sid, w] : workers) {
+        auto [it, fresh] = m_share_seen.try_emplace(sid);
+        ShareSeen& seen = it->second;
+        if (fresh || w.accepted != seen.accepted) {
+            if (w.accepted > 0)
+                seen.last_share_at = now;
+            else
+                seen.last_share_at.reset();
+            seen.accepted = w.accepted;
+        }
+        out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+    }
+    return out;
+}
+
+nlohmann::json MiningInterface::silent_workers_list(
+    const std::map<std::string, WorkerInfo>& workers,
+    const std::map<std::string, WorkerLiveness>& liveness)
+{
+    struct Agg {
+        bool silent{true};
+        bool has_shared{false};
+        int64_t silent_seconds{std::numeric_limits<int64_t>::max()};
+        int64_t threshold_seconds{0};
+        int connections{0};
+    };
+    std::map<std::string, Agg> by_worker;
+    for (const auto& [sid, w] : workers) {
+        auto lv_it = liveness.find(sid);
+        if (lv_it == liveness.end()) continue;
+        const WorkerLiveness& lv = lv_it->second;
+        const std::string key = w.worker_name.empty()
+            ? w.username : w.username + "." + w.worker_name;
+        Agg& a = by_worker[key];
+        a.silent = a.silent && lv.silent;
+        a.has_shared = a.has_shared || lv.has_shared;
+        ++a.connections;
+        if (lv.silent_seconds < a.silent_seconds) {
+            a.silent_seconds = lv.silent_seconds;
+            a.threshold_seconds = lv.threshold_seconds;
+        }
+    }
+
+    std::vector<std::pair<std::string, Agg>> silent;
+    for (const auto& [key, a] : by_worker)
+        if (a.silent) silent.emplace_back(key, a);
+    std::stable_sort(silent.begin(), silent.end(), [](const auto& x, const auto& y) {
+        return x.second.silent_seconds > y.second.silent_seconds;
+    });
+
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& [key, a] : silent) {
+        out.push_back({
+            {"worker", key},
+            {"silent_seconds", a.silent_seconds},
+            {"threshold_seconds", a.threshold_seconds},
+            {"has_shared", a.has_shared},
+            {"connections", a.connections}
+        });
+    }
+    return out;
+}
+
 // ──────────── /web/ sub-endpoints (share chain inspection) ───────────────
 
 nlohmann::json MiningInterface::rest_web_heads()
@@ -8344,7 +8710,7 @@ void MiningInterface::update_stat_log()
     // workers the local registry is empty, but the pool still has miners — the
     // distinct sharechain payout addresses. Use the SAME count /global_stats
     // reports as unique_miners (shares_by_miner.size()) so the graph matches the
-    // live card. Only when the local registry is genuinely empty; a hotel node
+    // live card. Only when the local registry is genuinely empty; a production node
     // with local rigs keeps its byte-identical local count. connected_miners /
     // worker_count / local_hash_rate stay local-scoped (0 is the truth there).
     if (entry.miner_count == 0 && m_sharechain_stats_fn) {
@@ -9098,7 +9464,7 @@ void MiningInterface::load_stat_log()
 }
 
 // ── ALL-TIME best share: survives restarts ──────────────────────────────
-// Measured (hotel primary, 2026-08-05, uptime 36 min): /local_stats
+// Measured (primary node, 2026-08-05, uptime 36 min): /local_stats
 // best_share reported all_time == session == round because the all-time leg
 // lived only in memory — every restart re-founded "all time", and the card
 // silently redefined the word. Only the all-time leg is persisted: session
@@ -9290,7 +9656,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                                                             payout_address);
 
                 // Check PoW hash against the blockchain target before submitting
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
@@ -9470,6 +9837,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         // probabilistically replaced with the node operator's address for the
         // primary chain node fee).  Merged addresses are passed through
         // unmodified — Python p2pool does NOT apply node fee to merged chains.
+        uint256 created_share;  // #946: named on an own-find DOGE row
         if (m_create_share_fn) {
             ShareCreationParams params;
             // Miner display name: PRIMARY_ADDR.WORKER (strip merged addrs, keep worker)
@@ -9683,7 +10051,7 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                 // (m_share_max_bits is 0 when compute_share_target returns {0,0})
             }
             if (!params.payout_script.empty() && params.bits != 0) {
-                m_create_share_fn(params);
+                created_share = m_create_share_fn(params);
             }
         }
         
@@ -9692,7 +10060,8 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
             std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
             if (!block_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job);
+                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                                                        primary_addr, created_share);
 
                 auto block_bytes = ParseHex(block_hex.substr(0, 160));
                 if (block_bytes.size() == 80) {
@@ -10176,7 +10545,7 @@ void WebServer::execute_debounced_work_refresh()
 
 void WebServer::trigger_work_refresh_debounced()
 {
-    // ── Notify debounce (hotel interim fix #3) ──
+    // ── Notify debounce (interim hardening fix #3) ──
     // Share-arrival storms used to fan out into one full refresh_work() +
     // notify_all() per share (the old body here was a no-op stub that called
     // refresh immediately). Semantics now:

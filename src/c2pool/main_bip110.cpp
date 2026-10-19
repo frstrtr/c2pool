@@ -1733,7 +1733,7 @@ int run_embedded(bool coin_p2p_discover,
         // Self-advertised public IP for the miner-config URL + peer endpoint.
         // Without this /node_info emits external_ip "0.0.0.0" (the miner-config
         // card then shows 0.0.0.0:port). The operator-supplied --coin-externalip
-        // (the reachable public IP of this host, e.g. 158.220.92.171) is the same
+        // (the reachable public IP of this host, e.g. 203.0.113.10) is the same
         // address the sharechain :9337 + coin-p2p :8333 listeners bind on; surface
         // it. Auto-detect from peer echoes still fills it later when unset. LTC
         // ref main_ltc.cpp:1778.

@@ -2,7 +2,7 @@
 /// DASH template-builder underfill guard — port of the LTC/DOGE guard
 /// (src/impl/ltc/coin/template_builder.hpp / src/impl/doge/coin/
 /// template_builder.hpp) to the DASH embedded GBT path (embedded_gbt.hpp),
-/// for the mining-hotel deployment.
+/// for the production deployment.
 ///
 /// What the guard defends against: the tx selector returning a near-empty
 /// template (< UNDERFILL_MIN_FILL_BYTES packed) while the local mempool holds

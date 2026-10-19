@@ -455,6 +455,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 9 -- no production factory can select the EstimateOnly arm. The module
+    // default is Combined, and every LaneParams factory that turns the gate on
+    // maps (through the W4 seam) to Combined.
+    {
+        bool ok = sub::SubthresholdParams{}.mode == sub::CreditMode::Combined;
+        std::string d = ok ? "" : "module default is not Combined; ";
+        auto combined_if_on = [&](const LaneParams& lp, const std::string& name) {
+            const sub::SubthresholdParams sp = S::to_subthreshold_params(lp);
+            if (sp.enabled && sp.mode != sub::CreditMode::Combined) {
+                ok = false;
+                d += name + " enables EstimateOnly; ";
+            }
+        };
+        const ::v37::LaneKind kinds[] = {::v37::LaneKind::BTC, ::v37::LaneKind::LTC,
+                                         ::v37::LaneKind::DASH, ::v37::LaneKind::DOGE};
+        for (std::uint32_t v = 0; v < 8; ++v) {
+            combined_if_on(LaneParams::for_version(v), "for_version(" + std::to_string(v) + ")");
+            for (auto k : kinds)
+                combined_if_on(LaneParams::for_version(v, k),
+                               "for_version(" + std::to_string(v) + ", kind " +
+                                   std::to_string(static_cast<std::uint32_t>(k)) + ")");
+        }
+        combined_if_on(LaneParams::shipped(), "shipped()");
+        combined_if_on(LaneParams::family_a(), "family_a()");
+        check(ok, "9 every gate-ON factory selects Combined",
+              d.empty() ? "module default Combined; all factories Combined when enabled" : d);
+    }
+
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

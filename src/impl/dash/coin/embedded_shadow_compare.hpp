@@ -153,7 +153,7 @@ inline const char* shadow_txset_mode_name(ShadowTxSetMode m)
 /// --embedded-serve-mempool-txs on. Set membership is the wrong question in
 /// two directions at once —
 ///   * UNREACHABLE: two independently-connected nodes never hold identical
-///     mempools. MEASURED on the production hotel over 6056 samples,
+///     mempools. MEASURED on the production node over 6056 samples,
 ///     ours_only == 0 in 91.2% and > 0 in 8.8%, mean 65.3 when non-zero, max
 ///     287; over the LAST 200 samples it was zero only 37% of the time.
 ///   * BLIND to the case that costs money: FEWER transactions than dashd but

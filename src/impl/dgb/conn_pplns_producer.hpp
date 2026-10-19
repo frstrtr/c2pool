@@ -37,9 +37,11 @@
 // ============================================================================
 
 #include "share_check.hpp"                       // dgb::compute_ref_hash_for_work, dgb::RefHashParams
+#include "config_pool.hpp"                       // dgb::PoolConfig::get_donation_script
 #include <impl/dgb/coin/connection_coinbase.hpp> // dgb::coin::ConnCoinbasePplnsInputs
 
 #include <core/coin_params.hpp>
+#include <core/version_gate.hpp>
 #include <core/uint256.hpp>
 
 #include <map>
@@ -93,7 +95,30 @@ inline dgb::coin::ConnCoinbasePplnsInputs make_conn_pplns_inputs(
     out.donation_script          = in.donation_script;
     out.ref_hash                 = ref_hash;
     out.last_txout_nonce         = last_txout_nonce;
+    // #884: the version the ref preimage was built at IS the version the share
+    // must be minted at -- one source, carried to the job via the snapshot.
+    out.share_version            = in.ref_params.share_version;
+    out.desired_version          = in.ref_params.desired_version;
     return out;
+}
+
+// #884 (ruled 2026-10-02): set the coinbase fields that depend on the share
+// version from the ONE ratchet-selected mint version, mirroring what the
+// verifier derives from the minted share (generate_share_transaction):
+//   use_v36_pplns   == is_v36_active(version)  (V36 decay vs pre-V36 walk+split)
+//   finder_script   == the share's payout script (pre-V36 0.5% finder fee;
+//                      ignored by the V36 split)
+//   donation_script == get_donation_script(version) (P2PK v35 / P2SH v36)
+// The caller stamps the same version onto ref_params, so make_conn_pplns_inputs
+// carries it to the job and on to the mint.
+inline void apply_conn_mint_version(ConnPplnsAssemblyInputs& ain,
+                                    int64_t share_version,
+                                    const std::vector<unsigned char>& payout_script)
+{
+    ain.use_v36_pplns   = core::version_gate::is_v36_active(share_version);
+    ain.finder_script   = ain.use_v36_pplns ? std::vector<unsigned char>{}
+                                            : payout_script;
+    ain.donation_script = PoolConfig::get_donation_script(share_version);
 }
 
 } // namespace dgb

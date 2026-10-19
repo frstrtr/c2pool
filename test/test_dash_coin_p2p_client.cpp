@@ -191,7 +191,7 @@ TEST(DashCoinP2PLiveness, quiet_peer_is_pinged_not_killed)
 // THE ESSENTIAL PROPERTY (the live defect, stated as a test):
 // a peer that completes the handshake and then sends nothing but valid pongs
 // must stay connected indefinitely — and in particular far past the retired
-// 100s deadline that was killing every hotel peer at 101s.
+// 100s deadline that was killing every production peer at 101s.
 TEST(DashCoinP2PLiveness, peer_answering_only_pongs_is_never_dropped)
 {
     PeerLiveness lv;

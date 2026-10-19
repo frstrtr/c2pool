@@ -2113,7 +2113,7 @@ public:
     ///
     /// OBSERVABILITY (2026-08-06). This used to return SILENTLY when there was
     /// no primary peer, and logged nothing on the way out either. That made a
-    /// whole class of stall undiagnosable: when the hotel node's SML sat behind
+    /// whole class of stall undiagnosable: when the production node's SML sat behind
     /// the tip for 156 s there was no way to tell from the log whether the
     /// request had been sent and gone unanswered, or had never been sent at
     /// all. Those two have completely different fixes, and the absence of this

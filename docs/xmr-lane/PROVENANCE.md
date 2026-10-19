@@ -1,5 +1,13 @@
 # PROVENANCE — XMR lane (Family B) license & porting plan
 
+> **Status 2026-10-04 (operator ruling 20:27 +04).** The p2pool-derived whole-block
+> template (`src/impl/xmr/template/xmr_block_template.{hpp,cpp}`, GPL-3.0-only) was
+> replaced by a clean-room implementation, frstrtr's own code written from Monero-core
+> v0.18.5.1 and the public CryptoNote protocol without p2pool source, under the c2pool
+> AGPL-3.0-or-later header. No GPL-3.0-only file remains in the XMR lane, and the lane
+> keeps the repository licence (design canon C32). The text below is the earlier plan,
+> kept as a record.
+
 **Scope.** The authoritative license/provenance plan for `src/impl/xmr/` — the
 new Monero/RandomX settlement lane ("Family B") of c2pool (frstrtr/c2pool,
 **AGPL-3.0**). It states, per upstream: the license, the exact files/symbols

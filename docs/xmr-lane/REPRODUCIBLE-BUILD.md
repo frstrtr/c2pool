@@ -85,7 +85,7 @@ Boost throw site now reads `conan-home/p/boostf82ae2881fe5c/p/include/boost/asio
 where it used to read `/home/<user>/.conan2/p/…`. A diff of base and fix
 disassembly, normalised for addresses, is identical, and so are all the
 symbol sizes except `_DYNAMIC`, which is one entry shorter because the RUNPATH
-is gone. `--help` output is byte-identical, and `--mock-smoke` passes 83/83 on
+is gone. `--help` output is byte-identical, and `--mock-smoke` (a flag removed at the S4w flag day) passes 83/83 on
 both. `-fmacro-prefix-map` (implied by `-ffile-prefix-map`) rewrites
 `__FILE__` only. It never rewrites string literals or `-D…="${CMAKE_SOURCE_DIR}/…"`
 definitions, so tests that locate data through such defines are unaffected.
@@ -118,9 +118,16 @@ switches them off.
    `c2pool-v37-xmr`, and no extra `CFLAGS`, `CXXFLAGS` or `LDFLAGS` in the
    environment.
 
-No compiled-in pinned snapshot exists on master yet. When one lands as data
-compiled into the daemon, the same check covers it, because it is part of the
-binary.
+The pinned snapshot (the stagenet and mainnet anchors, and the size and
+sha256 of each output-set file) is compiled into the daemon on master
+(c2pool #1777). The same check covers it, because it is part of the binary:
+`c2pool-v37-xmr --version` prints the pinned heights and block ids, and
+[PINNED-SNAPSHOTS.md](PINNED-SNAPSHOTS.md) lists every pinned value.
+
+The release package (`scripts/xmr-node/build-release.sh`) links libgcc
+statically (`-static-libgcc`) and strips the binary, so its bytes differ from the
+plain build described here. Run it with `STATIC_RUNTIME=0` and compare the
+unstripped binary in its build directory to reproduce the recipe above.
 
 ## Cross-host (not in this slice)
 

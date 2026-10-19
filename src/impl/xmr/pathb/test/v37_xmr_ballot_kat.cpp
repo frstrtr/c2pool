@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
+// This file is part of c2pool and is distributed under the terms of the GNU
+// Affero General Public License, version 3 or (at your option) any later
+// version. See COPYING in the repository root.
+// ---------------------------------------------------------------------------
+// v37_xmr_ballot_kat (C23; ballot_to_write, side_data_v3 offset 35):
+//   the ballot is under the receipt's own PoW (a changed ballot changes the
+//   mm_root the tree root binds); a ballot for e' is yes for every e <= e'; a
+//   ballot <= epoch_cur is no; any u16 decodes (no range check); default yes
+//   on an upgraded build (source default); --vote no writes epoch_cur
+//   (opt-out); a stated vote=n sets the own flag (own), vote=0 is own no; the
+//   login reply's vote object; a stated vote expires with its deployment;
+//   a --vote change applies to the next ballot written.
+//   S4w-a (pathb_stratum.hpp, pathb_policy.hpp): the stratum password "vote=<n>" parsed (n
+//   decimal, 0 .. 2^15 - 1; vote=0 own no); anything else ignored (no stated
+//   vote, never a refusal); the parsed value through ballot_to_write to the
+//   login reply's vote object; the moved policy helpers: parse_pct_exact /
+//   pct_to_bp (10 bp from "0.1"), a login payee XMR_STD only (the mainnet
+//   donation address decodes to the K16 author keys).
+// ---------------------------------------------------------------------------
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <algorithm>
+#include <vector>
+
+#include "c2pool/v37/xmr/pathb/pathb_stratum.hpp"
+#include "impl/xmr/pathb/pathb_lane_rules.hpp"
+#include "impl/xmr/pathb/pathb_ratchet_activation.hpp"
+#include "impl/xmr/pathb/pathb_wire_v3.hpp"
+#include "pathb_kat_check.hpp"
+#include "pathb_ratchet_sim.hpp"
+
+using namespace pathb_kat;
+using namespace ratchet_sim;
+
+// CryptoNote base58 (8-byte blocks -> 11 characters; the last block by kEncSizes).
+std::string cn_base58_encode(const std::vector<std::uint8_t>& data) {
+    static const char kAlpha[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    static const int kEnc[9] = {0, 2, 3, 5, 6, 7, 9, 10, 11};
+    std::string out;
+    for (std::size_t o = 0; o < data.size(); o += 8) {
+        const std::size_t n = std::min<std::size_t>(8, data.size() - o);
+        std::uint64_t num = 0;
+        for (std::size_t i = 0; i < n; ++i) num = (num << 8) | data[o + i];
+        std::string blk(static_cast<std::size_t>(kEnc[n]), '1');
+        for (int i = kEnc[n] - 1; i >= 0 && num > 0; --i) {
+            blk[static_cast<std::size_t>(i)] = kAlpha[static_cast<int>(num % 58)];
+            num /= 58;
+        }
+        out += blk;
+    }
+    return out;
+}
+
+std::string std_address(std::uint64_t prefix, const pb::Hash32& spend, const pb::Hash32& view) {
+    std::vector<std::uint8_t> raw;
+    for (std::uint64_t v = prefix;;) {
+        const std::uint8_t b = static_cast<std::uint8_t>(v & 0x7f);
+        v >>= 7;
+        raw.push_back(static_cast<std::uint8_t>(b | (v ? 0x80 : 0)));
+        if (!v) break;
+    }
+    raw.insert(raw.end(), spend.begin(), spend.end());
+    raw.insert(raw.end(), view.begin(), view.end());
+    const ::xmr::coin::Hash256 h = ::xmr::coin::keccak256(raw.data(), raw.size());
+    raw.insert(raw.end(), h.data(), h.data() + 4);
+    return cn_base58_encode(raw);
+}
+
+std::string lp_mainnet() {
+    return "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF";
+}
+
+pb::Hash32 non_point_key() {
+    for (unsigned i = 0; i < 256; ++i) {
+        pb::Hash32 k{};
+        for (std::size_t j = 0; j < k.size(); ++j) k[j] = static_cast<std::uint8_t>(i + j);
+        if (!pb::point_decompresses(k)) return k;
+    }
+    return pb::Hash32{};
+}
+
+int main() {
+    const pb::RatchetParams P = pb::kRuledRatchetParams;
+    const std::uint64_t L = P.window;
+
+    // under the receipt's own PoW: the ballot is a side_data_v3 byte pair at offset 35
+    pb::SideDataV3 sd;
+    sd.ballot = pb::make_ballot(1, false);
+    std::vector<std::uint8_t> bytes;
+    check(pb::encode_side_data_v3(sd, bytes) == pb::WireError::None && pb::side_v3::kBallotOff == 35
+              && bytes[35] == 0x01 && bytes[36] == 0x00,
+          "ballot u16 at side_data_v3 offset 35, little-endian");
+    pb::SideDataV3 sd2 = sd;
+    sd2.ballot = pb::make_ballot(2, false);
+    check(pb::mm_root_of(sd) != pb::mm_root_of(sd2), "a changed ballot changes mm_root (fails the tree root before RandomX)");
+    // any u16 decodes: no range check against a table
+    bool all = true;
+    for (std::uint32_t b = 0; b <= 0xffff; b += 251) {
+        pb::SideDataV3 s = sd;
+        s.ballot = static_cast<std::uint16_t>(b);
+        std::vector<std::uint8_t> v;
+        pb::SideDataV3 back;
+        all = all && pb::encode_side_data_v3(s, v) == pb::WireError::None
+              && pb::decode_side_data_v3(v.data(), v.size(), back) == pb::WireError::None && back.ballot == s.ballot;
+    }
+    {
+        pb::SideDataV3 s = sd;
+        s.ballot = 0xffff;
+        std::vector<std::uint8_t> v;
+        pb::SideDataV3 back;
+        all = all && pb::encode_side_data_v3(s, v) == pb::WireError::None
+              && pb::decode_side_data_v3(v.data(), v.size(), back) == pb::WireError::None && back.ballot == 0xffff;
+    }
+    check(all, "any u16 ballot is admitted by the codec");
+
+    // yes(r, e) = epoch_no(r) >= e: a ballot for e' is yes for every e <= e'; <= epoch_cur is no
+    pb::RatchetState s = pb::genesis_ratchet_state(kG);
+    s.epoch_cur = 3;
+    const pb::RatchetPlacement for5{10, pb::make_ballot(5, true)};
+    const pb::RatchetState t = pb::rs_step(P, s, 7, std::span<const pb::RatchetPlacement>(&for5, 1));
+    check(t.y1 == pb::RsWork(10) && t.y2 == pb::RsWork(10), "a ballot for e' = 5 counts yes for e = 4 and e = 5 at epoch_cur 3");
+    const pb::RatchetPlacement for3{10, pb::make_ballot(3, false)};
+    const pb::RatchetState u = pb::rs_step(P, s, 7, std::span<const pb::RatchetPlacement>(&for3, 1));
+    check(u.y1.is_zero() && u.y2.is_zero() && u.all == pb::RsWork(10), "a ballot <= epoch_cur is no");
+    check(pb::ballot_epoch(pb::make_ballot(5, true)) == 5 && pb::ballot_own(pb::make_ballot(5, true)), "own flag bit 15, epoch bits 0..14");
+
+    // the writer
+    const pb::EpochTable T = release({vote(P, 1, kR1, 0)});
+    const pb::RatchetState g = pb::genesis_ratchet_state(kG);
+    const pb::BallotChoice def = pb::ballot_to_write(P, g, 10, T, std::nullopt, false);
+    check(def.ballot == pb::make_ballot(1, false) && def.source == pb::BallotSource::Default, "default yes on an upgraded build (source default)");
+    const pb::BallotChoice opt = pb::ballot_to_write(P, g, 10, T, std::nullopt, true);
+    check(opt.ballot == pb::make_ballot(0, false) && opt.source == pb::BallotSource::OptOut, "--vote no writes epoch_cur (source opt-out)");
+    const pb::BallotChoice own1 = pb::ballot_to_write(P, g, 10, T, 1u, true);
+    check(own1.ballot == pb::make_ballot(1, true) && own1.source == pb::BallotSource::Own, "a stated vote=1 sets the own flag (source own)");
+    const pb::BallotChoice own0 = pb::ballot_to_write(P, g, 10, T, 0u, false);
+    check(own0.ballot == pb::make_ballot(0, true) && own0.source == pb::BallotSource::Own, "vote=0 is own no");
+    check(pb::vote_json(def) == "\"vote\": {\"ballot\": \"0x0001\", \"source\": \"default\"}"
+              && pb::vote_json(own0) == "\"vote\": {\"ballot\": \"0x8000\", \"source\": \"own\"}"
+              && pb::vote_json(opt) == "\"vote\": {\"ballot\": \"0x0000\", \"source\": \"opt-out\"}",
+          "the login reply echoes the ballot and its source: " + pb::vote_json(def));
+    // a stated vote for an epoch that is not the open one is written as the default
+    const pb::BallotChoice v7 = pb::ballot_to_write(P, g, 10, T, 7u, false);
+    check(v7 == def, "a stated vote=7 (not open) is written as the default");
+    // the stated vote expires with its deployment: past timeout_D the default is written
+    const std::uint64_t after = pb::own_attempt(T, 1)->timeout;
+    const pb::BallotChoice exp = pb::ballot_to_write(P, g, after, T, 1u, false);
+    check(exp.ballot == pb::make_ballot(0, false) && exp.source == pb::BallotSource::Default,
+          "a stated vote=1 past timeout_D is written as the default (epoch_cur)");
+    // LOCKED_IN before timeout_D is open: the default yes continues
+    pb::RatchetState locked = g;
+    locked.levels = {0, 0, 0, 1};
+    const std::uint64_t x_lock = 4 * L + 3;  // window 3 is kept with level 1
+    check(pb::locked(P, locked, x_lock, T) && pb::open(P, locked, x_lock, T)
+              && pb::ballot_to_write(P, locked, x_lock, T, std::nullopt, false).ballot == pb::make_ballot(1, false),
+          "LOCKED_IN before timeout_D: open, default yes");
+    // a --vote change applies to the next ballot written (the writer is a function of the setting)
+    check(pb::ballot_to_write(P, g, 11, T, std::nullopt, false) != pb::ballot_to_write(P, g, 11, T, std::nullopt, true),
+          "a --vote change applies to new jobs");
+    // nothing open: the default is epoch_cur
+    check(pb::ballot_to_write(P, g, 10, release({}), std::nullopt, false).ballot == pb::make_ballot(0, false),
+          "no deployment open: the default is epoch_cur");
+    // S4w-a: the stratum password and the moved policy helpers
+    {
+        namespace pol = ::c2pool::xmr::pathb::policy;
+        namespace st = ::c2pool::xmr::pathb::stratum;
+        check(st::parse_vote_pass("vote=3") == std::optional<std::uint32_t>(3), "password vote=3 -> stated 3");
+        check(st::parse_vote_pass("vote=0") == std::optional<std::uint32_t>(0), "password vote=0 -> stated 0 (own no)");
+        check(st::parse_vote_pass("vote=32767") == std::optional<std::uint32_t>(32767), "vote=32767 (2^15 - 1) accepted");
+        bool ignored = true;
+        for (const char* junk : {"x", "", "vote=", "vote=32768", "vote=3x", "Vote=3", " vote=3", "vote=-1", "vote=99999999999"})
+            ignored = ignored && !st::parse_vote_pass(junk).has_value();
+        check(ignored, "any other password: no stated vote (ignored, never a refusal)");
+        const pb::RatchetState g0 = pb::genesis_ratchet_state(pb::Hash32{});
+        const pb::BallotChoice own0 = pb::ballot_to_write(P, g0, 10, release({}), st::parse_vote_pass("vote=0"), false);
+        check(own0.ballot == pb::make_ballot(0, true) && own0.source == pb::BallotSource::Own
+                  && pb::vote_json(own0).find("\"source\": \"own\"") != std::string::npos
+                  && pb::vote_json(own0).find("0x8000") != std::string::npos,
+              "vote=0 from the password: own no in the ballot and the login reply's vote object");
+        const pb::BallotChoice none = pb::ballot_to_write(P, g0, 10, release({}), st::parse_vote_pass("x"), false);
+        check(none.source == pb::BallotSource::Default, "password x: the default ballot");
+        const pol::ExactPct pct = pol::parse_pct_exact("0.1");
+        check(pct.ok && pol::pct_to_bp(pct) == pb::kDonationBp && pol::pct_to_bp(pol::parse_pct_exact("100")) == 10000
+                  && !pol::parse_pct_exact("1.").ok && !pol::parse_pct_exact("-1").ok && !pol::parse_pct_exact("1e2").ok,
+              "--give-author-pct 0.1 -> 10 bp in integers; malformed text refused");
+        const st::LoginPayee lp = st::login_payee(
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF",
+                pb::LaneNet::Mainnet);
+        check(lp.refusal.empty() && lp.ref == pb::author_ref(pb::LaneNet::Mainnet),
+              "the mainnet donation address decodes to the K16 author keys (XMR_STD payee)");
+        pol::DecodedAddress sub = pol::decode_xmr_address(
+                "42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPF");
+        sub.subaddress = true;
+        check(!pol::payee_refusal(sub).empty(), "a subaddress is refused as a login payee");
+        check(!pol::decode_xmr_address("42QtUEQ6E4v2wtkG2h72osTqZgLo7vtjg4SngeG47AnaaQLUUQrGvPXSuvCmHcRVuPa5xxUU5Mfo6jSEqYYUk34Z1PM1oPG").ok,
+              "a checksum mismatch is refused");
+        // another network's address; keys that do not decompress
+        const char* testnet = "9yWhJcSRcNFhfrZJAkgh5N4swx92cHLP79hYbP8YJwJKYSCcdKXpgrvYxFHZ5kvfUERtXjvwNTJN4EuW7FypyDZ3114t5rG";
+        check(!st::login_payee(testnet, pb::LaneNet::Mainnet).refusal.empty()
+                      && st::login_payee(testnet, pb::LaneNet::Testnet).refusal.empty()
+                      && st::login_payee(lp_mainnet(), pb::LaneNet::Regtest).refusal.empty(),
+              "a login address of another network refused (regtest takes the mainnet bytes)");
+        check(std_address(pol::kPrefixMainnetStd, pb::author_ref(pb::LaneNet::Mainnet).spend,
+                          pb::author_ref(pb::LaneNet::Mainnet).view) == lp_mainnet(),
+              "the KAT's address encoder reproduces the mainnet donation address");
+        const std::string np = std_address(pol::kPrefixMainnetStd, non_point_key(), pb::author_ref(pb::LaneNet::Mainnet).view);
+        check(pol::decode_xmr_address(np).ok && !st::login_payee(np, pb::LaneNet::Mainnet).refusal.empty(),
+              "a login address whose spend key does not decompress refused");
+    }
+    return finish("v37_xmr_ballot_kat");
+}

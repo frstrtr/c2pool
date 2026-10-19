@@ -308,6 +308,30 @@ TEST(DgbWorkSource, MiningSubmitShareAcceptDispatchesMint)
     EXPECT_EQ(seen.subsidy, 500000000ULL);      // subsidy carried from the job
 }
 
+// #884: the mint receives the {mint, vote} version pair frozen on the job
+// (JobSnapshot::frozen_ref) -- not a hardcoded 36 -- so a job built for v35
+// while the ratchet is VOTING mints v35.
+TEST(DgbWorkSource, MiningSubmitForwardsJobFrozenVersionToMint)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        Fixture fx;
+        auto ws = fx.make();
+        dgb::stratum::DGBWorkSource::MintShareInputs seen;
+        ws->set_mint_share_fn(
+            [&](const dgb::stratum::DGBWorkSource::MintShareInputs& got) -> uint256 {
+                seen = got;
+                return uint256();
+            });
+        auto job = make_job(/*share_bits=*/0x2100ffffu, /*block_nbits=*/"03000001");
+        job.frozen_ref.share_version   = ver;
+        job.frozen_ref.desired_version = 36;
+        ws->mining_submit("DGBaddr.worker1", "job-ver", kEN1, kEN2, kNT, kNON, "rid",
+                          /*merged_addresses=*/{}, &job);
+        EXPECT_EQ(seen.share_version, ver);
+        EXPECT_EQ(seen.desired_version, 36u);
+    }
+}
+
 // -- #887 WonBlock -> mint SEAM reachability (PRE-WIRING ONLY on DGB) ---------
 //
 // block_target <= share_target, so a WonBlock solve clears the share target
@@ -901,6 +925,29 @@ TEST(DgbWorkSource, ConnectionCoinbaseDelegatesToPplnsSsotByteIdentical)
     EXPECT_EQ(wired.snapshot.frozen_ref.ref_hash, inputs.ref_hash);
     EXPECT_EQ(wired.snapshot.frozen_ref.last_txout_nonce, inputs.last_txout_nonce);
     EXPECT_EQ(wired.snapshot.subsidy, inputs.subsidy);
+}
+
+// #884: the producer's ratchet-selected version pair is frozen onto the
+// snapshot, which the stratum server copies onto the job for the mint.
+TEST(DgbWorkSource, ConnectionCoinbaseFreezesProducerVersionOnSnapshot)
+{
+    for (int64_t ver : {int64_t(35), int64_t(36)}) {
+        Fixture fx;
+        auto ws = fx.make();
+        auto inputs = sample_pplns_inputs();
+        inputs.share_version   = ver;
+        inputs.desired_version = 36;
+        ws->set_pplns_inputs_fn(
+            [&](const uint256&, const std::string&, const Script&,
+                const std::vector<std::pair<uint32_t, Script>>&)
+                -> std::optional<dgb::coin::ConnCoinbasePplnsInputs> {
+                return inputs;
+            });
+        auto wired = ws->build_connection_coinbase(
+            uint256(std::vector<unsigned char>(32, 0x11)), "cafef00d", Script{0x01}, {});
+        EXPECT_EQ(wired.snapshot.frozen_ref.share_version, ver);
+        EXPECT_EQ(wired.snapshot.frozen_ref.desired_version, 36u);
+    }
 }
 
 TEST(DgbWorkSource, ConnectionCoinbaseProducerNulloptYieldsEmptyJob)

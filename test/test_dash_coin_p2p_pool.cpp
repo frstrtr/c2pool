@@ -1400,7 +1400,7 @@ TEST(DashCoinP2PPool, body_arrival_disarms_the_watchdog)
 // stayed at have_tip=0 forever — the embedded arm never served. The fresh
 // soak's sequential catch-up (getheaders->getdata to the primary it was
 // syncing from) never exercised the inv-driven announcer!=primary path, which
-// is why only the warm hotel node surfaced it.
+// is why only the warm production node surfaced it.
 //
 // FAILS-ON-MASTER: request_block writes unconditionally to m_primary, so the
 // getdata lands on peer 1 (primary), never on the announcing peer 3.

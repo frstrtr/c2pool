@@ -91,8 +91,20 @@ class StratumServer;
 /// NiceHash extranonce protocol, and mining.suggest_difficulty.
 class StratumSession : public std::enable_shared_from_this<StratumSession>
 {
+public:
+    /// Longest inbound Stratum line, excluding the '\n' delimiter. Same bound
+    /// as p2pool: its stratum peer is twisted's LineOnlyReceiver
+    /// (p2pool util/jsonrpc.py LineBasedPeer, MAX_LENGTH not overridden), and
+    /// twisted drops the connection once a line exceeds MAX_LENGTH = 16384.
+    /// The read buffer holds kMaxStratumLineBytes + 1 bytes so a line of
+    /// exactly kMaxStratumLineBytes plus its '\n' is still accepted.
+    static constexpr std::size_t kMaxStratumLineBytes = 16384;
+
+private:
     tcp::socket socket_;
-    boost::asio::streambuf buffer_;
+    // Bounded line buffer: a peer whose line runs past kMaxStratumLineBytes
+    // without a '\n' is dropped (see read_message()).
+    boost::asio::streambuf buffer_{kMaxStratumLineBytes + 1};
     std::deque<std::string> write_queue_;  // async write queue (non-blocking)
     bool writing_ = false;                 // true while an async_write is in flight
     std::shared_ptr<IWorkSource> mining_interface_;
@@ -116,8 +128,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // Active jobs for stale detection (job_id → prevhash at time of issue)
     struct JobEntry {
         // Heavyweight per-generation template data, refcounted and SHARED
-        // across all jobs a session issues for one work generation (hotel
-        // interim fix #2 — de-dup of the per-job memory bomb). coinb2 carries
+        // across all jobs a session issues for one work generation (interim
+        // hardening fix #2 — de-dup of the per-job memory bomb). coinb2 carries
         // the PPLNS payout outputs, the dominant per-job allocation. Contents
         // are immutable after construction; a new payload is only allocated
         // when any byte differs from the previous job's payload (byte-identical
@@ -168,7 +180,7 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         double issued_difficulty{0.0};
     };
     std::unordered_map<std::string, JobEntry> active_jobs_;
-    // Insertion-order companion to active_jobs_ (hotel interim fix #1).
+    // Insertion-order companion to active_jobs_ (interim hardening fix #1).
     // unordered_map::begin() is ARBITRARY, so the old
     // `erase(active_jobs_.begin())` capacity eviction could drop the job the
     // miner is CURRENTLY hashing — the nondeterministic stale-reject bug.
@@ -327,9 +339,13 @@ class StratumServer
     mutable std::mutex sessions_mutex_;
     std::set<std::shared_ptr<StratumSession>> sessions_;
 
-    // STRICT per-node miner cap (hotel interim fix #5): connections refused
+    // STRICT per-node miner cap (interim hardening fix #5): connections refused
     // because sessions_.size() >= StratumConfig::max_stratum_connections.
     std::atomic<uint64_t> refused_connections_{0};
+
+    // Sessions dropped because an inbound line exceeded
+    // StratumSession::kMaxStratumLineBytes without a '\n'.
+    std::atomic<uint64_t> oversized_line_drops_{0};
 
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
@@ -396,6 +412,9 @@ public:
 
     /// Connections refused by the strict per-node miner cap (fix #5).
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
+    /// Sessions dropped for an over-length line (no '\n' within the cap).
+    uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
+    void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
     size_t get_session_count() const;
     /// Diagnostics: {distinct SharedJobPayload blocks, total active jobs}

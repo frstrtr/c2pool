@@ -5,7 +5,7 @@
 /// miners a height the network has already passed".
 ///
 /// ─────────────────────────────────────────────────────────────────────────
-/// THE INCIDENT (hotel 109.161.52.148, DASH mainnet, 2026-08-07)
+/// THE INCIDENT (production node, DASH mainnet, 2026-08-07)
 /// ─────────────────────────────────────────────────────────────────────────
 ///
 /// The node served h=2518006 to 26 rigs for ONE HOUR while dashd advanced to
@@ -132,7 +132,7 @@ struct ServeStalenessConfig {
     /// arithmetic that retired it, with every input measured rather than
     /// assumed:
     ///
-    ///   * one send_notify_work costs ~733 ms on the hotel node — the pre-emit
+    ///   * one send_notify_work costs ~733 ms on the production node — the pre-emit
     ///     gate held across it (stratum/work_source.cpp:853 records the same
     ///     733 ms figure from the incident capture);
     ///   * notify_all runs those SERIALLY over the session snapshot, on the io

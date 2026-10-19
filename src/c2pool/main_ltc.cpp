@@ -599,7 +599,7 @@ int main(int argc, char* argv[]) {
     // Initialize logging
     core::log::Logger::init();
 
-    // Mining-hotel interim fix #4: raise RLIMIT_NOFILE to 65536 at startup.
+    // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup.
     // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
     // 1024 starves the accept loop under miner churn. Log the effective limit.
     {
@@ -1669,11 +1669,14 @@ int main(int argc, char* argv[]) {
         
         // Log payout configuration
         LOG_INFO << "C2Pool Payout Configuration:";
-        LOG_INFO << "  Developer fee: " << payout_manager->get_developer_config().get_total_developer_fee() << "%";
-        LOG_INFO << "  Developer address: " << payout_manager->get_developer_address();
+        LOG_INFO << "  Donation (give-author): " << payout_manager->get_developer_config().get_total_developer_fee()
+                 << "% of each share's weight (no floor; 0 leaves only the 1-satoshi marker)";
+        LOG_INFO << "  Donation address: " << payout_manager->get_developer_address();
         if (payout_manager->has_node_owner_fee()) {
             const auto& node_config = payout_manager->get_node_owner_config();
-            LOG_INFO << "  Node owner fee: " << node_config.fee_percent << "%";
+            LOG_INFO << "  Node owner fee: " << node_config.fee_percent
+                     << "% (P2P: that share of this node's jobs pays the owner instead of the miner; "
+                        "solo: an owner output of that share of the reward)";
             LOG_INFO << "  Node owner address: " << payout_manager->get_node_owner_address();
             
             // Show address source
@@ -2142,6 +2145,13 @@ int main(int argc, char* argv[]) {
                             rec.pool_hashrate = blk.pool_hashrate;
                             rec.share_hash = blk.share_hash;
                             rec.authorship = static_cast<uint8_t>(blk.authorship);
+                            // #946: explorer fields (fblk v3).
+                            rec.coinbase_txid = blk.coinbase_txid;
+                            rec.tx_count = blk.tx_count;
+                            // #946: DOGE parent (fblk v4); set_found_block_parent
+                            // re-persists the row, so it survives a restart.
+                            rec.parent_hash = blk.parent_hash;
+                            rec.parent_height = blk.parent_height;
                             return fblk_store->store(rec);
                         },
                         [fblk_store, fblk_leveldb]() -> std::vector<MI::FoundBlock> {
@@ -2165,6 +2175,12 @@ int main(int argc, char* argv[]) {
                                 blk.pool_hashrate = rec.pool_hashrate;
                                 blk.share_hash = rec.share_hash;
                                 blk.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
+                                // #946: v1/v2 records leave these unknown (null).
+                                blk.coinbase_txid = rec.coinbase_txid;
+                                blk.tx_count = rec.tx_count;
+                                // #946: v1-v3 records leave the parent unknown (null).
+                                blk.parent_hash = rec.parent_hash;
+                                blk.parent_height = rec.parent_height;
                                 result.push_back(std::move(blk));
                             }
                             return result;
@@ -4535,6 +4551,15 @@ int main(int argc, char* argv[]) {
                         is_testnet ? "tLTC" : "LTC",
                         miner_addr, share_hash.GetHex(), net_diff, share_diff, pool_hr, 0,
                         core::MiningInterface::BlockAuthorship::sharechain_peer);
+                    // coinbase_txid = the gentx hash the share commits to.
+                    // tx_count stays null: v34+ shares carry no tx list.
+                    try {
+                        mi->set_found_block_body(block_hash.GetHex(),
+                            ltc::derive_gentx_hash(*s, p2p_node->coin_params()).GetHex(),
+                            std::nullopt);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] peer found-block coinbase_txid: " << e.what();
+                    }
                     mi->schedule_block_verification(block_hash.GetHex());
                 });
             };
@@ -5084,7 +5109,7 @@ int main(int argc, char* argv[]) {
             // Wire the share creation hook so mining_submit() creates a real
             // V36 share in the tracker and broadcasts it to peers.
             web_server.get_mining_interface()->set_create_share_fn(
-                [&p2p_node, dev_donation, &share_creation_ready, &embedded_node](const core::MiningInterface::ShareCreationParams& p) {
+                [&p2p_node, dev_donation, &share_creation_ready, &embedded_node](const core::MiningInterface::ShareCreationParams& p) -> uint256 {
                 // Counters for periodic status reporting
                 static std::atomic<uint64_t> s_call_count{0};
                 static std::atomic<uint64_t> s_guard_blocked{0};
@@ -5130,7 +5155,7 @@ int main(int argc, char* argv[]) {
                             LOG_WARNING << "[Pool] create_share dropped: tracker busy"
                                         << " (compute thread holds exclusive lock — miner will retry)";
                         }
-                        return;
+                        return uint256();
                     }
                     if (p.prev_share_hash.IsNull()) {
                         auto chain_sz = p2p_node->tracker().chain.size();
@@ -5143,7 +5168,7 @@ int main(int argc, char* argv[]) {
                                 s_last_wait.store(now);
                                 LOG_WARNING << "[Pool] WAIT mode: blocking genesis (waiting for peers)";
                             }
-                            return;
+                            return uint256();
                         }
                         // Chain has shares but prev is null → sync issue (best not computed yet)
                         if (chain_sz > 0) {
@@ -5156,7 +5181,7 @@ int main(int argc, char* argv[]) {
                                             << " (chain=" << chain_sz
                                             << " verified=" << p2p_node->tracker().verified.size() << ")";
                             }
-                            return;
+                            return uint256();
                         }
                     }
 
@@ -5244,7 +5269,7 @@ int main(int argc, char* argv[]) {
                     // Only broadcast if self-validation passed (non-null hash)
                     if (share_hash.IsNull()) {
                         ++s_pow_failed;
-                        return;  // share failed PoW or validation; don't broadcast
+                        return uint256();  // share failed PoW or validation; don't broadcast
                     }
                     ++s_created;
 
@@ -5307,9 +5332,11 @@ int main(int argc, char* argv[]) {
                              << " " << share_hash.GetHex().substr(0, 8)
                              << " prev " << prev_share.GetHex().substr(0, 8)
                              << (age_str.empty() ? "" : " age " + age_str);
+                    return share_hash;
                 } catch (const std::exception& e) {
                     LOG_ERROR << "create_share_fn failed (before broadcast): " << e.what();
                 }
+                return uint256();
             });
 
           } else if (custodial_mode) {
@@ -6669,19 +6696,14 @@ int main(int argc, char* argv[]) {
 
                     // Wire merged block found → unified verification via FoundBlock
                     auto* mi_ptr = web_server.get_mining_interface();
+                    // #946: miner, subsidy and parent_* come from the stratum
+                    // submit (MergedSubmitScope) via record_merged_found_block.
                     mm_manager->set_on_merged_block_found(
                         [mi_ptr](const std::string& symbol, int height,
-                                 const std::string& block_hash, bool accepted) {
-                            uint256 h;
-                            h.SetHex(block_hash);
-                            double net_diff = mi_ptr->get_network_difficulty();
-                            double pool_hr = mi_ptr->get_local_hashrate();
-                            std::string miner_addr = mi_ptr->get_payout_address();
-                            mi_ptr->record_found_block(
-                                static_cast<uint64_t>(height), h, 0, symbol,
-                                miner_addr, "", net_diff, 0, pool_hr, 0);
-                            if (accepted)
-                                mi_ptr->schedule_block_verification(block_hash);
+                                 const std::string& block_hash, bool accepted,
+                                 uint64_t coinbase_value) {
+                            mi_ptr->record_merged_found_block(
+                                symbol, height, block_hash, accepted, coinbase_value);
                         });
 
                     // When merged mining aux work changes (new DOGE block),

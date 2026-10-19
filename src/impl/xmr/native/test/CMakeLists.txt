@@ -77,7 +77,8 @@ if (BUILD_TESTING)
             xmr_levin_codec_kat
             xmr_epee_storage_kat
             xmr_levin_messages_kat
-            xmr_levin_fuzz_kat)
+            xmr_levin_fuzz_kat
+            xmr_native_epee_budget_kat)   # message-wide array-element limit
         add_executable(${_c1a_kat} ${_c1a_kat}.cpp)
         target_include_directories(${_c1a_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -135,6 +136,30 @@ if (BUILD_TESTING)
         target_include_directories(xmr_native_consensus_state_kat PRIVATE ${Boost_INCLUDE_DIRS})
     endif()
     add_test(NAME xmr_native_consensus_state_kat COMMAND xmr_native_consensus_state_kat)
+
+    # 5b) Monero's transaction count ceilings and nothing tighter: a block whose
+    #     coinbase has 5,000 (and exactly 3,125,000 = MAX_COINBASE_VOUT_COUNT)
+    #     outputs parses, evaluates and connects; counts above Monero's
+    #     ceilings are refused; a truncated buffer with a huge count is refused
+    #     without a large allocation; the v17 miner-output rule
+    #     (FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS) is keyed on the major version.
+    #     Peak memory ~110 MB (one 3,125,000-output block blob). Added to BOTH
+    #     --target lists in build.yml.
+    add_executable(xmr_native_coinbase_outputs_limit_kat xmr_coinbase_outputs_limit_kat.cpp)
+    target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE xmr_native_txpool xmr_coin)
+    target_compile_features(xmr_native_coinbase_outputs_limit_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_coinbase_outputs_limit_kat COMMAND xmr_native_coinbase_outputs_limit_kat)
+    set_tests_properties(xmr_native_coinbase_outputs_limit_kat PROPERTIES TIMEOUT 300)
 
     # -----------------------------------------------------------------------
     # Wave 1, component C2b: the trust-anchor bundle (../anchor/). One target,
@@ -307,7 +332,8 @@ if (BUILD_TESTING)
     # -----------------------------------------------------------------------
     foreach(_c1b_kat
             xmr_levin_socket_kat
-            xmr_levin_link_kat)
+            xmr_levin_link_kat
+            xmr_native_levin_unsolicited_cap_kat)   # unsolicited 2004/2007 refused at header time
         add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
         target_include_directories(${_c1b_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -446,14 +472,11 @@ if (BUILD_TESTING)
     #     ctest runs.
     #
     #   xmr_native_template_coinbase_kat
-    #     The other half of the C4 claim: the option-B K_fair settlement
-    #     coinbase is unchanged by the rebind. Builds the X6 coinbase from the
-    #     native derivation (../../settle/xmr_coinbase.cpp -- the same executor
-    #     and the same file the daemon-ful path uses) and pins the owed payee
-    #     set, the exact-sum residual sink, the owed_digest under the tx_extra
-    #     0x03 merge-mining tag, the byte-identity of the two arms' coinbases
-    #     and the pre-CARROT fence. Same shape and cost as the existing
-    #     xmr_coinbase_kat target, which has been on both CI legs since X6.
+    #     The other half of the C4 claim: the Path B miner tx
+    #     (build_miner_tx_hf16) from the native miner data equals the one from
+    #     the monerod arm's identical values: R from the native emission and
+    #     the backlog's fees, Sum(vout) == R, mm_root under 0x03, every rebound
+    #     field load-bearing, the hf-17 amount fork fuse. Links xmr_pathb.
     #
     # Same drift-guard rule as every target above: all six (C1c's four, C4's
     # two) are added to BOTH
@@ -493,6 +516,28 @@ if (BUILD_TESTING)
     # Loopback TCP with compressed deadlines: seconds on an idle runner, but
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
+
+    # xmr_native_peer_pool_budget_kat: the pool charges a peer's inbound byte
+    # budget before decoding a 2002 body; an over-budget frame is dropped and the
+    # peer kept. Real pool + fakes against a loopback stand-in with a 50-byte
+    # byte budget. Listed in BOTH build.yml --target lists.
+    add_executable(xmr_native_peer_pool_budget_kat xmr_native_peer_pool_budget_kat.cpp)
+    target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_peer_pool_budget_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_peer_pool_budget_kat COMMAND xmr_native_peer_pool_budget_kat)
+    set_tests_properties(xmr_native_peer_pool_budget_kat PROPERTIES TIMEOUT 300)
 
     # D3a: the block DoS bucket against honest relay of VALID blocks. The REAL
     # pool and the REAL chain index (the reorg-follow KAT's from-genesis regtest
@@ -640,13 +685,11 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_txpool_parity_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_txpool_parity_kat COMMAND xmr_native_txpool_parity_kat)
 
-    add_executable(xmr_native_template_coinbase_kat
-        xmr_native_template_coinbase_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../settle/xmr_coinbase.cpp)
+    add_executable(xmr_native_template_coinbase_kat xmr_native_template_coinbase_kat.cpp)
     target_include_directories(xmr_native_template_coinbase_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(xmr_native_template_coinbase_kat PRIVATE xmr_coin)
+    target_link_libraries(xmr_native_template_coinbase_kat PRIVATE xmr_pathb)
     target_compile_features(xmr_native_template_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_template_coinbase_kat COMMAND xmr_native_template_coinbase_kat)
 

@@ -719,9 +719,23 @@
                     // Group workers by base address - use stratum_stats as source
                     var minerGroups = {};
                     var stratumWorkers = (stratum_stats && stratum_stats.workers) || {};
-                    
-                    for (var workerName in stratumWorkers) {
-                        var workerData = stratumWorkers[workerName];
+                    // #1142 item 4: stratum_stats only lists this node's stratum sessions, so a miner
+                    // whose shares reach the node another way vanished from this table. Add every
+                    // local_stats.miner_hash_rates key with no stratum session under its base address
+                    // as a hashrate-only row (no connection data), without double-counting stratum miners.
+                    var stratumBases = {};
+                    for (var sw in stratumWorkers) stratumBases[extractAddress(sw)] = true;
+                    var minerRates = local_stats.miner_hash_rates || {};
+                    var allWorkers = {};
+                    for (var sw2 in stratumWorkers) allWorkers[sw2] = stratumWorkers[sw2];
+                    for (var mk in minerRates) {
+                        if (minerRates[mk] > 0 && !stratumBases[extractAddress(mk)] && !allWorkers[mk]) {
+                            allWorkers[mk] = { hash_rate: minerRates[mk], connections: 0, last_seen: 0, non_stratum: true };
+                        }
+                    }
+
+                    for (var workerName in allWorkers) {
+                        var workerData = allWorkers[workerName];
                         var baseAddress = extractAddress(workerName);
                         var mergedAddr = extractMergedAddress(workerName);
                         
@@ -781,6 +795,7 @@
                         minerGroups[baseAddress].totalHashrate += hashrate;
                         minerGroups[baseAddress].totalDoa += doa_hashrate;
                         minerGroups[baseAddress].totalConnections += (workerData.connections || 0);
+                        if (workerData.non_stratum) minerGroups[baseAddress].nonStratum = true;
                         if (isEstimated) {
                             minerGroups[baseAddress].hasEstimatedHashrate = true;
                         }

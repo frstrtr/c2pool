@@ -1333,7 +1333,7 @@ inline vendor::CCbTx build_embedded_cbtx(
     // "CalcMerkleRoot() caches upstream" and budgeted the ~450 KB copy it
     // took to call it "per 5s shadow tick"; BOTH clauses were false — this
     // builder runs on the live serve path, and that assumed-cheap root
-    // recompute is the class behind the 2026-08-07/08 hotel freeze (26
+    // recompute is the class behind the 2026-08-07/08 production freeze (26
     // rigs -> 0, twice). The serve-time re-derivations are memoized at
     // NodeCoinState level (root-memo epoch); this build-time call runs once
     // per template build, directly on the caller's list, no copy.

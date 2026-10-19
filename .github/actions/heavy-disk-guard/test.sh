@@ -10,6 +10,11 @@
 #      3h floor, so a tree younger than 3h is SPARED (not reaped) even though the
 #      requested 1h would have reaped it. Guards the "someone lowers STALE_HOURS
 #      near job runtime and starts reaping live sibling trees" foot-gun.
+#   E. a TMPDIR on the SAME filesystem as the build volume (even one not yet
+#      created) is recognised as covered by the build floor, not gated twice;
+#   F. a TMPDIR on a DIFFERENT filesystem is measured on its own and an
+#      unreachable temp floor fails fast with the infra error;
+#   G. the same separate filesystem with a reachable temp floor passes.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,12 +23,14 @@ SBX="$(mktemp -d)"
 trap 'rm -rf "$SBX"' EXIT
 
 fails=0
-ok  () { echo "PASS: $*"; }
+passes=0
+ok  () { echo "PASS: $*"; passes=$((passes+1)); }
 bad () { echo "FAIL: $*"; fails=$((fails+1)); }
 
 export CCACHE_DIR="$SBX/ccache"   # never touch a real ccache
 export HEAVY_DISK_CCACHE_MAX="1G"
 export HEAVY_DISK_BUILD_VOLUME="$SBX"   # a real, writable volume with space
+export HEAVY_DISK_TMP_VOLUME="$SBX"     # A-D: temp dir on the build volume (E-G vary it)
 
 # ---- fixture: a fake pair of co-resident runner homes on one disk ----------
 plant () {
@@ -80,7 +87,45 @@ rcD=$?
 grep -qi "clamped to 3h" "$SBX/d.log" && ok "D: emits clamp warning"       || bad "D: missing clamp warning"
 [ -d "$NEAR" ]     && ok "D: 2h tree spared by clamp (would die at 1h)"    || bad "D: clamp failed -- 2h tree reaped: $NEAR"
 
+# ---- CASE E: TMPDIR on the build volume -> covered, not separately gated ---
+HEAVY_DISK_FLOOR_GB=1 HEAVY_DISK_STALE_HOURS=6 HEAVY_DISK_TMP_FLOOR_GB=999999999 \
+  HEAVY_DISK_TMP_VOLUME="$SBX/_temp/not-yet-created" \
+  HEAVY_DISK_SWEEP_ROOTS="$SBX/actions-runner*" \
+  bash "$GUARD" >"$SBX/e.log" 2>&1
+rcE=$?
+[ $rcE -eq 0 ] && ok "E: same-filesystem TMPDIR passes (covered by the build floor)" || bad "E: expected exit 0, got $rcE"
+grep -q "is on the build volume" "$SBX/e.log" && ok "E: logs temp dir as on the build volume" || bad "E: missing same-volume line"
+
+# ---- CASE F/G: TMPDIR on a different filesystem -> measured on its own ------
+OTHER=""
+for cand in /dev/shm /run /dev; do
+  [ -d "$cand" ] || continue
+  if [ "$(stat -L -c %d "$cand" 2>/dev/null)" != "$(stat -L -c %d "$SBX")" ] \
+     && df -P "$cand" >/dev/null 2>&1; then OTHER="$cand"; break; fi
+done
+if [ -z "$OTHER" ]; then
+  echo "SKIP: F/G -- no second filesystem visible on this host"
+else
+  HEAVY_DISK_FLOOR_GB=1 HEAVY_DISK_STALE_HOURS=6 HEAVY_DISK_TMP_FLOOR_GB=999999999 \
+    HEAVY_DISK_TMP_VOLUME="$OTHER" \
+    HEAVY_DISK_SWEEP_ROOTS="$SBX/actions-runner*" \
+    bash "$GUARD" >"$SBX/f.log" 2>&1
+  rcF=$?
+  [ $rcF -ne 0 ] && ok "F: separate-filesystem TMPDIR ($OTHER) below its floor blocks (exit $rcF)" || bad "F: guard did NOT fail on an unreachable temp floor"
+  grep -q "insufficient temp disk" "$SBX/f.log" && ok "F: emits ::error:: insufficient temp disk" || bad "F: missing temp infra error"
+  grep -q "NOT this diff" "$SBX/f.log" && ok "F: names it as infra, not the diff" || bad "F: missing 'NOT this diff' framing"
+
+  HEAVY_DISK_FLOOR_GB=1 HEAVY_DISK_STALE_HOURS=6 HEAVY_DISK_TMP_FLOOR_GB=0 \
+    HEAVY_DISK_TMP_VOLUME="$OTHER" \
+    HEAVY_DISK_SWEEP_ROOTS="$SBX/actions-runner*" \
+    bash "$GUARD" >"$SBX/g.log" 2>&1
+  rcG=$?
+  [ $rcG -eq 0 ] && ok "G: separate-filesystem TMPDIR above its floor passes" || bad "G: expected exit 0, got $rcG"
+  grep -q "is on a separate filesystem" "$SBX/g.log" && ok "G: logs the separate temp filesystem and its free space" || bad "G: missing separate-filesystem line"
+fi
+
 echo "-----"
+echo "RESULT: ${passes} passed, ${fails} failed"
 if [ "$fails" -eq 0 ]; then
   echo "heavy-disk-guard honesty gate: ALL PASS"
   exit 0

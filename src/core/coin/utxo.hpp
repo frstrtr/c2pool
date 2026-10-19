@@ -62,9 +62,7 @@ static constexpr ChainLimits DGB_LIMITS = {2'100'000'000'000'000'000LL, 100, 0};
 ///   height + 60), no pegout. Sibling of the LTC/DOGE/DGB rows for the XMR
 ///   settlement lane (Family B).
 /// coinbase_maturity = 60: monero-project cryptonote_config.h
-///   CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW = 60 (~2 h at the 120 s v2 target);
-///   this is the D_conf floor the XMR settlement executor enforces
-///   (src/impl/xmr/settle/xmr_coinbase.hpp XMR_COINBASE_MATURITY, scoping §2.1).
+///   CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW = 60 (~2 h at the 120 s v2 target).
 /// pegout_maturity = 0: Monero has no MWEB/pegout.
 /// max_money: DENOMINATION AND RANGE CAVEAT. Monero amounts are piconero
 ///   (1 XMR = 1e12 atomic units — NOT the 1e8-sat convention of the BTC

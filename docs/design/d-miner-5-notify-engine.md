@@ -56,3 +56,15 @@ TOFU public /subscribe (D-MINER.4) populates it. Until then: operator-seeded.
 P1 event evaluator + notification core + email adapter (shippable solo, web-owned).
 P2 V36 P2P relay adapter (cross-steward with transport/consensus stewards).
 P3 Telegram adapter (release-gated on operator token).
+
+## Silent kind (#959 slice C)
+
+`silent` (warn) alerts a worker that is connected and authorized but has sent
+no accepted share past the node's threshold. Source is the dashboard's own
+`/local_stats` `workers_silent` list, recorded by the sampler into
+`silent_polls` / `silent_samples`, so the alert and the Active Miners card
+agree. One alert per episode: the `silent_state` latch re-arms when the worker
+leaves the list (it shared again, or every connection closed). A node that
+does not emit the field writes no poll row, so nothing fires and nothing
+re-arms. Alerts name `ADDRESS.worker`; routing uses an exact subscription,
+else the address's. The usual throttle and undelivered-is-recorded rules apply.

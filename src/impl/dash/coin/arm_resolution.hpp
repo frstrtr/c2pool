@@ -26,7 +26,7 @@
 /// invocation. This resolver makes the EMBEDDED OPT-IN imply its own feed, so
 /// one flag arms both halves end to end.
 ///
-/// ★ REWARD-SAFETY INVARIANT (hotel incident: `--coin-p2p-connect` once
+/// ★ REWARD-SAFETY INVARIANT (production incident: `--coin-p2p-connect` once
 /// activated an unguarded embedded arm on a live production node) ★
 /// The implication is ONE-WAY and runs only in the safe direction:
 ///
@@ -110,7 +110,7 @@ inline ArmResolution resolve_embedded_arm(const ArmInputs& in)
 
     if (!r.embedded_arm_enabled) {
         // Mainnet with no opt-in. A requested feed still runs (block relay,
-        // witness) but cannot move the arm — the hotel-incident invariant.
+        // witness) but cannot move the arm — the production-incident invariant.
         r.arm    = WorkArm::DashdFallback;
         r.reason = explicit_feed ? ArmReason::MainnetGateOff : ArmReason::NoOptIn;
     } else if (!r.coin_feed_armed) {

@@ -2,7 +2,7 @@
 // SEAM red witness — the operator surface must carry a SERVED-vs-OBSERVED
 // staleness block.
 //
-// ── THE DEFECT THIS PINS (hotel 109.161.52.148, 2026-08-07 mainnet) ─────────
+// ── THE DEFECT THIS PINS (production node, 2026-08-07 mainnet) ─────────
 //
 // For one hour the node handed h=2518006 to 26 rigs while the network was at
 // h=2518028. Every share those rigs produced was unpayable, and NOTHING in the

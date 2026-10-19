@@ -41,7 +41,7 @@ int main()
     // ── (1) ASN GROUP ASSIGNMENT ─────────────────────────────────────────────
     // Representative provider IPs resolve to the bundled ASN. These anchor the
     // table: a regeneration that breaks one of these fails CI (see UPDATE PATH).
-    CHECK(peer_asn("109.161.57.3") == 51167);   // Contabo (hotel host /16)
+    CHECK(peer_asn("62.171.57.3") == 51167);   // Contabo (AS51167 /16)
     CHECK(peer_asn("88.198.5.10")  == 24940);   // Hetzner
     CHECK(peer_asn("159.65.1.1")   == 14061);   // DigitalOcean
     CHECK(peer_asn("3.5.6.7")      == 16509);   // Amazon AWS (3.0.0.0/9)
@@ -51,7 +51,7 @@ int main()
 
     // Group LABELS mirror the ASN, and unknowns fall back to a /16 netgroup
     // bucket (NOT a single shared "unknown").
-    CHECK(peer_asn_group("109.161.57.3") == "AS51167");
+    CHECK(peer_asn_group("62.171.57.3") == "AS51167");
     CHECK(peer_asn_group("88.198.5.10")  == "AS24940");
     CHECK(peer_asn("192.0.2.1")          == 0);          // TEST-NET-1: no ASN
     CHECK(peer_asn_group("192.0.2.1")    == "ng:192.0"); // /16 fallback
@@ -68,9 +68,9 @@ int main()
     // score order. enforce must PROMOTE it so the top-2 span 2 ASNs.
     {
         std::vector<Cand> ranked = {
-            {"109.161.57.3"},  // Contabo   (best score)
-            {"109.161.58.9"},  // Contabo   (same ASN)
-            {"109.161.59.4"},  // Contabo   (same ASN)
+            {"62.171.57.3"},  // Contabo   (best score)
+            {"62.171.58.9"},  // Contabo   (same ASN)
+            {"62.171.59.4"},  // Contabo   (same ASN)
             {"88.198.5.10"},   // Hetzner   (the diversifier, lower score)
         };
         CHECK(!race_set_spans_min_asns(ranked, group_of, SLOTS, MIN)); // top-2 == 1 ASN
@@ -79,7 +79,7 @@ int main()
         CHECK(race_set_spans_min_asns(out, group_of, SLOTS, MIN));     // objective met
         CHECK(race_set_distinct_asns(out, group_of, SLOTS) == 2);
         // Fast path keeps the best-scored peer; backup is the diversifier.
-        CHECK(out[0].host == "109.161.57.3");
+        CHECK(out[0].host == "62.171.57.3");
         CHECK(peer_asn(out[1].host) == 24940);                         // Hetzner promoted
     }
 
@@ -87,7 +87,7 @@ int main()
     // order), so the flag-on path costs nothing when the pool is already good.
     {
         std::vector<Cand> ranked = {
-            {"109.161.57.3"},  // Contabo
+            {"62.171.57.3"},  // Contabo
             {"88.198.5.10"},   // Hetzner
             {"159.65.1.1"},    // DigitalOcean
         };
@@ -102,7 +102,7 @@ int main()
     // score order and reports the honest span (1) — it never fabricates a peer.
     {
         std::vector<Cand> ranked = {
-            {"109.161.57.3"}, {"109.161.58.9"}, {"109.161.59.4"},
+            {"62.171.57.3"}, {"62.171.58.9"}, {"62.171.59.4"},
         };
         CHECK(!race_set_spans_min_asns(ranked, group_of, SLOTS, MIN));
         auto out = enforce_asn_diversity(ranked, group_of, SLOTS, MIN);
@@ -129,14 +129,14 @@ int main()
 
     // (2e) Degenerate guards: min_asns<=1, empty, single-element => input as-is.
     {
-        std::vector<Cand> ranked = {{"109.161.57.3"}, {"88.198.5.10"}};
+        std::vector<Cand> ranked = {{"62.171.57.3"}, {"88.198.5.10"}};
         auto a = enforce_asn_diversity(ranked, group_of, SLOTS, /*min*/1);
         CHECK(a.size() == 2 && a[0].host == ranked[0].host && a[1].host == ranked[1].host);
         std::vector<Cand> empty;
         CHECK(enforce_asn_diversity(empty, group_of, SLOTS, MIN).empty());
-        std::vector<Cand> one = {{"109.161.57.3"}};
+        std::vector<Cand> one = {{"62.171.57.3"}};
         auto o = enforce_asn_diversity(one, group_of, SLOTS, MIN);
-        CHECK(o.size() == 1 && o[0].host == "109.161.57.3");
+        CHECK(o.size() == 1 && o[0].host == "62.171.57.3");
     }
 
     if (g_fail == 0) std::printf("dash_asn_diversity_kat: ALL PASS\n");

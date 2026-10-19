@@ -550,7 +550,7 @@ TEST(DashMempoolValidityGate, MissingOrSpentIsNeverExemptedEvenWithAnInSetParent
 // ── 6. THE TWO DIRECTIONS THE OLD CONDITION GOT WRONG ───────────────────────
 
 TEST(DashMempoolValidityGate, SetDivergenceOfAnySizeCannotCloseTheGate) {
-    // Reproduces the hotel's worst measured sample: 287 transactions we hold
+    // Reproduces the production node's worst measured sample: 287 transactions we hold
     // that dashd's template did not carry. Under `ours_only == 0` that is a
     // hard block. Under VALIDITY, if dashd accepts all of them, it is a clean
     // height — because the question is whether the transactions are

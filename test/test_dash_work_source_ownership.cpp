@@ -1,7 +1,7 @@
 // D-DASH.WORKSOURCE-OWNERSHIP (#1134) — source-structural guard pinning WHICH
 // THREAD is allowed to read NodeCoinState from the SERVE path.
 //
-// THE DEFECT THIS PINS (the sibling of the 2026-08-05 hotel SIGABRT that PR
+// THE DEFECT THIS PINS (the sibling of the 2026-08-05 production SIGABRT that PR
 // #1135 fixed, on the path that builds the templates our miners work on):
 //
 //   coin::NodeCoinState (impl/dash/coin/node_coin_state.hpp) has ZERO mutexes,

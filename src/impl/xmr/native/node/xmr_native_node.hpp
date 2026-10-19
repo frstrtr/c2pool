@@ -320,6 +320,8 @@ struct NativeNodeConfig {
     // FORK-FUSE-2: the unknown-fork watch's stall period
     // (ChainIndexOptions::unknown_fork_stall_ms). 0 = the 30 min default.
     std::uint64_t            unknown_fork_stall_ms = 0;
+    // The alt store's block count (ChainIndexOptions::alt_max_blocks). 0 = its default (k_alt).
+    std::size_t              alt_max_blocks = 0;
 
     // READ-ONLY PROBE against somebody else's daemon: handshake, TIMED_SYNC,
     // one NOTIFY_REQUEST_CHAIN, and not one block requested. See
@@ -339,6 +341,9 @@ struct NativeNodeConfig {
     // pool is warm -- the first txpool-complement (2010) answer was admitted --
     // or this many ms passed, whichever comes first. 0 = no warm gate.
     std::uint64_t            txpool_warm_timeout_ms = 30'000;
+    // A row sink on the chain index (ChainIndex::subscribe_rows), registered
+    // before the boot so the seeded and restored rows reach it too. Empty: none.
+    ChainIndex::RowSink      row_sink;
     std::size_t              verify_queue   = 4096;
     std::size_t              txpool_queue   = 2048;
 
@@ -467,7 +472,9 @@ public:
           txpool_(make_txpool_config_()),
           tx_sink_(pool_loop_, txpool_),
           native_src_(index_, txpool_, make_template_policy_(), &txpool_),
-          tick_(io_) {}
+          tick_(io_) {
+        if (cfg_.row_sink) index_.subscribe_rows(cfg_.row_sink);
+    }
 
     NativeNode(const NativeNode&)            = delete;
     NativeNode& operator=(const NativeNode&) = delete;
@@ -1470,6 +1477,7 @@ private:
         o.own_fork_bound_ms = cfg_.own_fork_bound_ms;
         o.consumer_window = cfg_.consumer_window;   // COLD-BOOT-2
         if (cfg_.unknown_fork_stall_ms) o.unknown_fork_stall_ms = cfg_.unknown_fork_stall_ms;
+        if (cfg_.alt_max_blocks) o.alt_max_blocks = cfg_.alt_max_blocks;
         return o;
     }
 
@@ -2013,50 +2021,14 @@ private:
                 + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
             return;
         }
-        // Through the BOOT, not straight into the index, and on the verify
-        // thread, which owns block application.
-        //
-        // The thread hop was always needed: an inbound blob may already be in
-        // flight by now, and a load that raced one would reset the index
-        // underneath it. Going through ChainBoot is the other half, and it is
-        // the one a live genesis-boot run found missing. A snapshot carries its
-        // own trust root, but loading it at the index left ChainBoot still
-        // owed a genesis seed, so the first inbound blob after this line ran
-        // try_seed_() -> seed_direct() -> reset: the resumed chain was wiped to
-        // height 0 and re-walked, PoW and all. resume_from_snapshot() installs
-        // the image AND records that the boot is discharged, in that order, on
-        // this thread -- so there is no window in which an inbound blob can
-        // find a loaded index with an un-booted gate in front of it. It re-
-        // checks gate 4 itself and refuses over an unconfirmed anchor.
-        bool ok = false;
-        std::string load_why;
-        verify_loop_.call([&] { ok = boot_.resume_from_snapshot(image, load_why); });
-        if (!ok) {
-            note_("[snapshot] REFUSED: " + load_why + "; starting from the "
-                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
-            return;
-        }
-        // outputs_ (the output-set / spent-key-image view) is NOT in the v1
-        // image, so reconcile it fail-closed: re-seat its numbering base to the
-        // resumed tip -- legal here because no live block has connected yet and
-        // the output-set combination was excluded above, so the set is empty --
-        // and DISABLE ring resolution. The outputs below the resume point are
-        // not in this image; a ring reaching below it must be RingUnresolved
-        // (fail-closed) rather than mis-resolved and an honest peer mis-scored.
-        // The spent-key-image view therefore tracks from the resume point
-        // forward, and post-resume blocks number from the right base. A future
-        // snapshot v2 that persists outputs_ restores full below-resume
-        // resolution; until then this is the honest posture for a resumed node.
-        verify_loop_.call([&] {
-            outputs_.reset_base(index_.view().rct_output_count());
-            outputs_.disable_resolution();
-        });
-        const SyncState st = index_.sync_state();
-        note_resumed_(st.header_frontier);   // COLD-BOOT-3
-        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
-            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
-            + " bytes); no re-IBD from the anchor -- ring resolution disabled "
-              "(spent-set tracks from the resume point; v1 image carries no output set)");
+        // Every boot writes the output set it built beside the image (the boot overlay); with it the resume keeps
+        // ring resolution. Without a usable one (an image of a build that wrote none, a crash between the two
+        // writes, a torn file) the image is not resumed: the boot starts from its root and re-walks, so the set is
+        // built again and the next save writes the image with its overlay.
+        if (resume_with_boot_overlay_(image)) return;
+        note_("[snapshot] no resume: no output-set overlay usable with " + cfg_.snapshot_path + "; starting from the "
+            + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis")
+            + " (re-walk; the next save writes the image with its output-set overlay)");
     }
 
     // Called on snap_loop_ (periodic) or on the caller's thread (clean stop).
@@ -2068,6 +2040,8 @@ private:
             save_snapshot_with_output_set_(occasion);
             return;
         }
+        // every other boot: the image and the output set it built since the boot (the boot overlay), together
+        if (save_snapshot_with_output_set_(occasion)) return;
         if (!index_.save_snapshot(image, why)) {
             snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why);
             return;
@@ -2099,7 +2073,7 @@ private:
     // The overlay file is written FIRST and carries sha256(image): a crash
     // between the two writes leaves an overlay bound to an image that is not
     // on disk, which the load refuses (re-walk), never a mismatched pair.
-    void save_snapshot_with_output_set_(const char* occasion) {
+    bool save_snapshot_with_output_set_(const char* occasion) {
         std::vector<std::uint8_t> image, ovl;
         std::string why;
         bool ok = false;
@@ -2117,10 +2091,11 @@ private:
             ok = outputs_.serialize_overlay(ovl, why);
         });
         if (!ok) {
-            snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why
-                + " (index tip " + std::to_string(idx_h) + ", output-set tip "
-                + std::to_string(set_h) + ")");
-            return;
+            if (outputs_.has_anchor_snapshot())
+                snap_log_(false, std::string("[snapshot] not written (") + occasion + "): " + why
+                    + " (index tip " + std::to_string(idx_h) + ", output-set tip "
+                    + std::to_string(set_h) + ")");
+            return false;
         }
         const Hash bind = image_digest_(image);
         std::vector<std::uint8_t> ofile;
@@ -2129,18 +2104,80 @@ private:
         ofile.insert(ofile.end(), ovl.begin(), ovl.end());
         if (!write_snapshot_file(overlay_path_(), ofile, why)) {
             snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
-            return;
+            return true;
         }
         const std::vector<std::uint8_t> file =
             encode_snapshot_envelope(snapshot_key_(), image);
         if (!write_snapshot_file(cfg_.snapshot_path, file, why)) {
             snap_log_(false, std::string("[snapshot] WRITE FAILED (") + occasion + "): " + why);
-            return;
+            return true;
         }
         snap_log_(true, std::string("[snapshot] wrote ") + std::to_string(file.size()) + " bytes to "
             + cfg_.snapshot_path + " + " + std::to_string(ofile.size())
             + " bytes output-set overlay (" + std::to_string(outputs_.overlay_block_count())
-            + " post-anchor blocks, tip " + std::to_string(set_h) + ") (" + occasion + ")");
+            + (outputs_.has_anchor_snapshot() ? " post-anchor blocks" : " blocks since the boot")
+            + ", tip " + std::to_string(set_h) + ") (" + occasion + ")");
+        return true;
+    }
+
+    // A boot with no seeded output set: the image resumes together with the boot overlay written beside it (bound
+    // to the image by digest), so the set is the one the node built and ring resolution stays on. False: no usable
+    // overlay (absent, bound to another image, refused); the set is left empty and the caller re-walks from the
+    // boot's root. True: handled (resumed, or the image refused).
+    bool resume_with_boot_overlay_(const std::vector<std::uint8_t>& image) {
+        std::vector<std::uint8_t> ofile;
+        {
+            std::ifstream f(overlay_path_(), std::ios::binary);
+            if (!f) return false;
+            ofile.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        const Hash bind = image_digest_(image);
+        if (ofile.size() < 32 || !std::equal(bind.begin(), bind.end(), ofile.begin())) {
+            note_("[snapshot] output-set overlay at " + overlay_path_()
+                + " is not bound to this image");
+            return false;
+        }
+        const std::vector<std::uint8_t> ovl(ofile.begin() + 32, ofile.end());
+        bool ok = false;
+        std::string load_why;
+        verify_loop_.call([&] { ok = outputs_.load_overlay(ovl, load_why); });
+        if (!ok) {
+            note_("[snapshot] output-set overlay refused: " + load_why);
+            return false;
+        }
+        bool tip_ok = false;
+        std::uint64_t idx_h = 0, set_h = 0;
+        verify_loop_.call([&] {
+            ok = boot_.resume_from_snapshot(image, load_why);
+            if (!ok) { outputs_.drop_overlay(); return; }
+            const auto t = index_.tip();
+            idx_h  = t ? t->height : 0;
+            set_h  = outputs_.tip_height();
+            tip_ok = t && t->height == set_h && t->id == outputs_.tip_id();
+            if (tip_ok) index_.reseat_rct_output_count(outputs_.frontier());
+            else        outputs_.disable_resolution();
+        });
+        if (!ok) {
+            note_("[snapshot] REFUSED: " + load_why + "; starting from the "
+                + (cfg_.boot == BootMode::Anchor ? "confirmed anchor" : "genesis"));
+            return true;
+        }
+        if (!tip_ok) {
+            note_("[snapshot] ALARM: resumed index tip " + std::to_string(idx_h)
+                + " != output-set overlay tip " + std::to_string(set_h)
+                + "; ring resolution DISABLED (fail-closed)");
+            return true;
+        }
+        const SyncState st = index_.sync_state();
+        note_resumed_(st.header_frontier);   // COLD-BOOT-3
+        note_("[snapshot] RESUMED at height " + std::to_string(st.header_frontier)
+            + " from " + cfg_.snapshot_path + " (" + std::to_string(image.size())
+            + " bytes) + output-set overlay (" + std::to_string(outputs_.overlay_block_count())
+            + " blocks since the boot, frontier " + std::to_string(outputs_.frontier())
+            + ", spent " + std::to_string(outputs_.spent_count())
+            + "); no re-IBD -- ring resolution "
+            + (outputs_.resolution_enabled() ? "intact" : "disabled (the boot's own posture)"));
+        return true;
     }
 
     // The output-set flavour of load_snapshot_(). Fail-closed at every step:

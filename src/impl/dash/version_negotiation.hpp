@@ -24,7 +24,7 @@
 // desired-version tally in the [9/10 .. 10/10] tail of the CHAIN_LENGTH window; a switch with
 // fewer than CHAIN_LENGTH ancestors is rejected ("without enough history").
 
-#include "share_chain.hpp"   // dash::ShareChain, dash::DashShare
+#include "share_chain.hpp"   // dash::ShareChain, dash::DashShare, dash::DashV36Share
 
 #include <core/target_utils.hpp>  // chain::target_to_average_attempts, bits_to_target
 #include <core/uint256.hpp>       // uint256, uint288
@@ -64,7 +64,7 @@ get_desired_version_counts(ShareChain& chain, const uint256& start_hash, uint64_
         (void)h;
         data.share.invoke([&](auto* obj) {
             using S = std::remove_pointer_t<decltype(obj)>;
-            if constexpr (std::is_same_v<S, dash::DashShare>)
+            if constexpr (dash::is_live_share<S>)   // DashShare, DashV36Share
                 res[obj->m_desired_version] += 1;
         });
     }
@@ -92,7 +92,7 @@ get_desired_version_weights(ShareChain& chain, const uint256& start_hash, uint64
         const uint288 w = data.index->work;
         data.share.invoke([&](auto* obj) {
             using S = std::remove_pointer_t<decltype(obj)>;
-            if constexpr (std::is_same_v<S, dash::DashShare>)
+            if constexpr (dash::is_live_share<S>)   // DashShare, DashV36Share
                 res[obj->m_desired_version] += w;
         });
     }

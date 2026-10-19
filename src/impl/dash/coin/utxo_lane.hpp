@@ -42,7 +42,7 @@
 ///     connects them the lane is dormant and byte-inert.
 ///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in
-/// embedded path in main_dash.cpp; the dashd-RPC fallback (mining-hotel
+/// embedded path in main_dash.cpp; the dashd-RPC fallback (production
 /// prod) never touches this file.
 
 #include "block.hpp"

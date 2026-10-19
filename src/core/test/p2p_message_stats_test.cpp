@@ -50,6 +50,8 @@ TEST(P2PMessageStats, MapsEveryCanonicalCommand)
         {"forget_tx",   P2PMessage::forget_tx},
         {"bestblock",   P2PMessage::bestblock},
         {"tx_inject",   P2PMessage::tx_inject},   // #157 M2
+        {"alert",       P2PMessage::alert},       // D-MINER.7
+        {"alertack",    P2PMessage::alertack},    // D-MINER.7
     };
     ASSERT_EQ(expected.size(), P2P_MESSAGE_COUNT - 1)  // -1 for the unknown bucket
         << "message list drifted from the enum";

@@ -1550,7 +1550,7 @@ TEST(DashMnCheckpointSmlRecovery, RevivalTxLaterInWindowFiresOffTheRecoveredBan)
 // 7. PoSe REMOVALS — the replay must SUBTRACT, and must survive a ban BURST
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// MEASURED, mainnet, hotel dashd 23.1.7, 2026-08-02:
+// MEASURED, mainnet, production dashd 23.1.7, 2026-08-02:
 //
 //     protx list valid false 2513000  -> 2068 entries   (the anchor)
 //     protx list valid false 2514874  -> 2059 entries   the chain FELL by 9
@@ -3102,7 +3102,7 @@ TEST(DashMnCheckpointPoseFold, SnapshotWithNoExpectedHeightIsRefused)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // THE MEASUREMENT this section is built from. contabo daemonless soak against
-// mainnet, anchor 2513000, fold interval 500; the chain asked directly (hotel
+// mainnet, anchor 2513000, fold interval 500; the chain asked directly (production
 // dashd 23.1.7 with addressindex, 2026-08-02):
 //
 //     h=2513000  protx list valid 2068  projected payee e8626fcd57f6394d…
@@ -4339,7 +4339,7 @@ TEST(DashMnCheckpointReseed, ReArmDropsThePreservedMismatchOfAFailedBridge)
 //     PRESENT and INELIGIBLE, never absent.
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// TRACED ON CHAIN (hotel dashd 23.1.7, mainnet):
+// TRACED ON CHAIN (production dashd 23.1.7, mainnet):
 //
 //   proTx 7afbd798…  PoSe-banned at h=2511957
 //                    REVIVED by a ProUpServTx in block 2513357
@@ -4699,7 +4699,7 @@ TEST(DashMnPayeeTiebreak, ScoreOutranksTheHashWhenTheTieIsBroken)
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // MEASURED (mainnet, anchor 2513000, fold interval 500, replay to 2515511;
-// hotel dashd 23.1.7 asked directly for the PRE-BLOCK state of every
+// production dashd 23.1.7 asked directly for the PRE-BLOCK state of every
 // ProUpServTx in the window, 2026-08-03):
 //
 //   22 ProUpServTx in 2513001..2515530

@@ -96,7 +96,7 @@ inline void apply_endpoint_override(const std::string& hostport, RpcConf& out)
 // ---------------------------------------------------------------------------
 // DASHD-CUT arm authority (daemonless cut mode).
 //
-// THE DEFECT THIS CLOSES (hotel-reserve thrash, 2026-08-15):
+// THE DEFECT THIS CLOSES (reserve node thrash, 2026-08-15):
 // removing --coin-rpc was COSMETIC. conf.armed() alone (creds resolved from the
 // DEFAULT ~/.dashcore/dash.conf) re-armed the dashd-fallback CoindRPC to
 // 127.0.0.1:9998. When the operator then stopped dashd, the armed-but-dead RPC

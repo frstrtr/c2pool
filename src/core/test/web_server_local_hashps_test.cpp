@@ -53,3 +53,32 @@ TEST(LocalHashpsSeam, LiveCounterSurfacesRealValue) {
     EXPECT_DOUBLE_EQ(r["local_hashps"].get<double>(), kLocalHs)
         << "live local_hashps must equal the real stratum work-rate counter";
 }
+
+// ---------------------------------------------------------------------------
+// #942 node_role: the dashboard needs to know whether this node CAN have local
+// miners, so a relay node's zero miners render as "not applicable" rather than
+// as a measurement. Same seam as local_hashps: no Stratum acceptor wired means
+// relay, a wired one (even reporting 0 H/s) means mining.
+// FAIL WITHOUT THE FIX: rest_local_stats emitted no node_role key.
+// ---------------------------------------------------------------------------
+
+TEST(NodeRoleSeam, NoStratumAcceptorIsRelay) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+
+    auto r = mi.rest_local_stats();
+    ASSERT_TRUE(r.contains("node_role"));
+    EXPECT_EQ(r["node_role"], "relay")
+        << "a node with no Stratum acceptor cannot have local miners";
+}
+
+TEST(NodeRoleSeam, IdleStratumAcceptorIsStillMining) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::LITECOIN);
+    mi.set_stratum_hashrate_fn([]() { return 0.0; });  // listening, no miners yet
+
+    auto r = mi.rest_local_stats();
+    ASSERT_TRUE(r.contains("node_role"));
+    EXPECT_EQ(r["node_role"], "mining")
+        << "an acceptor with zero miners is an idle mining node, not a relay";
+}
