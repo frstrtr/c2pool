@@ -1074,6 +1074,7 @@ private:
         Hash32 from{};
         Hash32 stop{};
         Hash32 fetch{};               // the P_r
+        Missing cause = Missing::MoneroBlock;  // its input: the block resolved, or (the floor reading) its weights
         std::uint64_t since_ms = 0;   // the first DEFER on this P_r
         bool offered = false;         // the peer's tip offered to the joiner for it (a store not caught up)
     };
@@ -2624,7 +2625,8 @@ private:
             default: break;
         }
         if (o.kind == K::Defer && o.fetch != Hash32{}) {
-            // a header's P_r not held: fetched (FB_GETCTX, the carrier class), the request asked again once it resolves
+            // a header's P_r not resolved: fetched (FB_GETCTX, the carrier class); a header waiting for the weights of a
+            // block the follower holds asks no context; the request asked again once its input is held
             {
                 std::lock_guard<std::mutex> lk(cumtx_);
                 HdrOnCtx& w = headers_on_ctx_[p];
@@ -2632,9 +2634,18 @@ private:
                 w.from = o.from;
                 w.stop = o.stop;
                 w.fetch = o.fetch;
+                w.cause = o.cause;
             }
             st_.headers_ctx_deferred++;
-            want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+            bool held = false;
+            {
+                const NodeGuard g(*this);
+                held = o.cause == Missing::MissingWeights && node_->monero_block_held(o.fetch);
+            }
+            if (held)
+                st_.ctx_held++;
+            else
+                want_ctx(o.fetch, p, 0, CtxClass::Carrier);
         }
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
@@ -2657,7 +2668,7 @@ private:
         if (due.empty()) return;
         const NodeGuard g(*this);
         for (const auto& [p, w] : due) {
-            if (gated && !node_->monero_input_held(Missing::MoneroBlock, w.fetch)) {  // still not resolved: kept
+            if (gated && !node_->monero_input_held(w.cause, w.fetch)) {  // its input not held yet: kept
                 std::lock_guard<std::mutex> lk(cumtx_);
                 headers_on_ctx_.emplace(p, w);
                 continue;
@@ -3209,7 +3220,7 @@ private:
                 // kCtxTtlMs: the peer's tip becomes a join candidate (the joiner path; paced on that P_r)
                 if (deferred && !node_->caught_up() && !hd->second.offered && hd->second.since_ms != 0
                     && now_ms() >= hd->second.since_ms + kCtxTtlMs
-                    && !node_->monero_input_held(Missing::MoneroBlock, hd->second.fetch)) {
+                    && !node_->monero_input_held(hd->second.cause, hd->second.fetch)) {
                     hd->second.offered = true;
                     if (node_->offer_empty_store_tip(it->first)) {
                         st_.catchup_join_offers++;

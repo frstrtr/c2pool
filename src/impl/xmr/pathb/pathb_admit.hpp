@@ -1139,7 +1139,10 @@ inline std::optional<AdmitResult> epoch_row(const AdmitEnv& env, const Body& b, 
 
 // S1.3 #7 / S2.3 #9: header fields, the vote rule, the size rules and the cap.
 inline std::optional<AdmitResult> header_row(const Body& b, RowId row, std::size_t idx) {
-    if (header_fields_verdict(header_fields(*b.r, b.bytes, b.in))) return verdict(AdmitVerdict::Strike, row, idx);
+    const HeaderFault f = header_fields(*b.r, b.bytes, b.in);
+    // the floor reading (operator ruling): a size rule the floor leaves undecided waits for P_r's weights
+    if (f == HeaderFault::SizeUndecided) return defer(Missing::MissingWeights, row, idx, b.r->blob.prev_id);
+    if (header_fields_verdict(f)) return verdict(AdmitVerdict::Strike, row, idx);
     return std::nullopt;
 }
 
@@ -2049,6 +2052,37 @@ inline BindReport bind_walked(const AdmitEnv& env, NodeRefs n, const std::vector
             }
         }
     }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The node's P_r resolution (S1.3 #4, S2.3 #5; io.resolve_pr): P_r resolved when the follower holds its block. With
+// its RowWeights the header inputs are P_r's exact values. Held verified on its branch without them (a bodiless
+// alternative; `child_version`: the version of a child of a block held verified, else nullopt), the floor reading
+// (operator ruling): Held with the floor's inputs (header_inputs_floor), the blob being enough. Else Missing.
+// ---------------------------------------------------------------------------
+template <class ChildVersionFn>
+inline PrInfo resolve_pr_on_branch(const FollowerBranchView& view, const IMoneroRows& rows, const Hash32& p_r,
+                                   ChildVersionFn&& child_version) {
+    PrInfo out;
+    const std::optional<BranchBlock> b = view.block(p_r);
+    if (!b) return out;
+    std::optional<std::uint64_t> m;
+    const BranchStatus st = timestamp_median_for_child(view, p_r, m);
+    const std::optional<std::uint64_t> median = st.selected() ? m : std::nullopt;
+    if (const std::optional<RowWeights> w = rows.weights(p_r)) {
+        out.status = PrInfo::Status::Held;
+        out.height = b->height;
+        out.in = HeaderInputs{w->hf_child, median, w->z_child, w->ltem_child};
+        return out;
+    }
+    const std::optional<std::uint8_t> v = child_version(p_r);
+    if (!v) return out;
+    const std::optional<HeaderInputs> in = header_inputs_floor(*v, median);
+    if (!in) return out;
+    out.status = PrInfo::Status::Held;
+    out.height = b->height;
+    out.in = *in;
     return out;
 }
 

@@ -224,7 +224,10 @@
 //                round in flight, verified headers whose bodies are in
 //                flight; a node caught up keeps its templates;
 //   catchrestart the record across a restart; a launch node writes none;
-//   catchlocator the catch-up's locator steps after a partition.
+//   catchlocator the catch-up's locator steps after a partition;
+//   floorpr      the floor reading of #9: a carrier on a P_r held without
+//                its weights admitted; one above the floor DEFERs with no
+//                context and passes on the exact weights; #12 stays exact.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -6978,6 +6981,160 @@ void catchlocator() {
 }
 
 // ---------------------------------------------------------------------------
+// floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
+//   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
+//           the floor and admits A's carriers on it (B follows A's branch);
+//   band    a carrier of 413 transactions (above the floor's 411 + 1) on S2, held at B without its weights: DEFER
+//           (MissingWeights), no context asked; S2's weights recorded: it runs again and passes on the exact Z;
+//   hfirst  headers first over a header above the floor on a P_r without its weights: DEFER, never a BAN;
+//   join    a joiner whose span headers rest on S reads their heights (height_of) and completes;
+//   exact12 #12 keeps exact weights: a carrier whose window reads a block without its weights DEFERs, no token.
+// The follower's rows with the RowWeights of some blocks not recorded (their blocks held).
+struct WeightlessRows final : pb::IMoneroRows {
+    const pb::IMoneroRows& inner;
+    const std::set<pb::Hash32>& hidden;
+    WeightlessRows(const pb::IMoneroRows& i, const std::set<pb::Hash32>& h) : inner(i), hidden(h) {}
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override { return inner.block(id); }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t height) const override {
+        return inner.block_at_or_below_anchor(height);
+    }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        return hidden.count(id) != 0 ? std::nullopt : inner.weights(id);
+    }
+    pb::BranchBlock anchor() const override { return inner.anchor(); }
+    pb::Hash32 main_tip() const override { return inner.main_tip(); }
+};
+constexpr std::uint64_t kExactZ = 600000;  // Z(P_r) above the zone (the KAT's exact value for #9)
+void floorpr() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights;
+    const WeightlessRows wrows(net.rows, noweights);
+    const pb::FollowerBranchView wview(wrows);
+    const auto exact_z = [](pb::PathbNodeIo& io) {
+        const auto inner = io.resolve_pr;
+        io.resolve_pr = [inner](const pb::Hash32& p_r) {
+            pb::PrInfo r = inner(p_r);
+            r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    };
+    const auto floor_io = [&wview, &wrows](pb::PathbNodeIo& io) {
+        io.monero = &wview;
+        io.resolve_pr = [&wview, &wrows](const pb::Hash32& p_r) {
+            pb::PrInfo r = pb::resolve_pr_on_branch(wview, wrows, p_r, [&wview](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                return wview.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+            });
+            if (r.status == pb::PrInfo::Status::Held && !r.in.floor) r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    };
+    KatRelay a = kat_relay(h, w, table0(net), true, false, nullptr, nullptr, exact_z);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, floor_io);
+    pb::PathbRelayNode& rb = *b.relay;
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 2 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 3100 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    // fa
+    h.tick_monero();
+    const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S);
+    const pb::PrInfo prs = pb::resolve_pr_on_branch(wview, wrows, S, [&wview](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+        return wview.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+    });
+    bool fa = true;
+    for (int i = 0; i < 3; ++i) fa = fa && mine_on(h, w, a.node, static_cast<std::size_t>(i), 3200 + static_cast<std::uint32_t>(i));
+    check(ok && prs.status == pb::PrInfo::Status::Held && prs.in.floor && prs.in.z == 300000 && prs.in.z_lt == 300000
+                  && fa && h[b.node].tree().best().id == h[a.node].tree().best().id && rb.stats().strikes.load() == 0
+                  && rb.stats().bans.load() == 0,
+          "floorpr: a carrier on a P_r B holds without its weights resolves on the floor and is admitted (B at A's tip)");
+    // band
+    h.tick_monero();
+    const pb::Hash32 S2 = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S2);
+    h.txs = blob_txs(412, 400, 1, 0x30);
+    const std::uint64_t wanted0 = rb.stats().ctx_wanted.load();
+    const pb::NodeEventResult ra = h[a.node].on_own_share(*h.job(a.node, 2, 3300), 3300, pb::Hash32{});
+    const pb::Hash32 big = h[a.node].tree().best().id;
+    const pb::CarrierBodyV3* bb = h[a.node].bodies().get(big);
+    w.run();
+    const bool band_parked = rb.parked_ctx_size(pb::Missing::MissingWeights, S2) == 1 && h[b.node].tree().find(big) == nullptr
+                             && rb.stats().ctx_wanted.load() == wanted0;
+    check(ra.action == pb::NodeAction::Placed && bb != nullptr && bb->own.blob.tx_count == 413 && band_parked
+                  && rb.stats().strikes.load() == 0 && rb.stats().bans.load() == 0,
+          "floorpr: 413 transactions on a P_r without its weights (above the floor): DEFER MissingWeights, no context, "
+          "no token");
+    noweights.erase(S2);
+    rb.on_monero_tip();
+    w.run();
+    check(h[b.node].tree().find(big) != nullptr && rb.parked_ctx_size(pb::Missing::MissingWeights, S2) == 0,
+          "floorpr: its weights recorded, it runs again and passes on the exact Z(P_r)");
+    h.txs.clear();
+    // headers first: a fresh node C2 catching up over the 413-transaction carrier, S2 held there without its weights:
+    // the header path DEFERs on S2 (its weights), no token; S2's weights recorded: it asks again and reaches A's tip
+    std::set<pb::Hash32> noweights2{S2};
+    const WeightlessRows wrows2(net.rows, noweights2);
+    const pb::FollowerBranchView wview2(wrows2);
+    KatRelay c2 = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, [&wview2, &wrows2](pb::PathbNodeIo& io) {
+        io.monero = &wview2;
+        io.resolve_pr = [&wview2, &wrows2](const pb::Hash32& p_r) {
+            pb::PrInfo r = pb::resolve_pr_on_branch(wview2, wrows2, p_r, [&wview2](const pb::Hash32& id) -> std::optional<std::uint8_t> {
+                return wview2.block(id) ? std::optional<std::uint8_t>(16) : std::nullopt;
+            });
+            if (r.status == pb::PrInfo::Status::Held && !r.in.floor) r.in.z = r.in.z_lt = kExactZ;
+            return r;
+        };
+    });
+    w.connect(0, 2);
+    w.run();
+    pb::PathbRelayNode& rc2 = *c2.relay;
+    const bool hdr_deferred = rc2.stats().headers_ctx_deferred.load() >= 1 && h[c2.node].tree().find(big) == nullptr
+                              && rc2.stats().bans.load() == 0 && rc2.stats().strikes.load() == 0;
+    noweights2.erase(S2);
+    rc2.on_monero_tip();
+    w.run();
+    for (int k = 0; k < 6 && h[c2.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        rc2.tick();
+        w.run();
+    }
+    check(hdr_deferred && h[c2.node].tree().best().id == h[a.node].tree().best().id && rc2.stats().bans.load() == 0
+                  && rc2.stats().headers_ctx_reasks.load() >= 1,
+          "floorpr: headers first over a header above the floor on a P_r without its weights: DEFER, no ban; its weights "
+          "recorded, the headers asked again and A's tip reached");
+    // join: a joiner (a load failure) whose span's headers rest on S, held without its weights: their heights are read
+    // (height_of on the floor's Held) and the attempt completes
+    KatRelay jj = kat_relay(h, w, table0(net), false, true, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                            floor_io);
+    w.connect(0, 3);
+    w.run();
+    const std::optional<pb::JoinStep> sj = jj.relay->join_step();
+    w.run();
+    check(sj && sj->report && sj->report->end == pb::AttemptEnd::Completed && sj->switched
+                  && h[jj.node].tree().best().id == h[a.node].tree().best().id,
+          "floorpr: a join whose headers rest on a P_r held without its weights reads their heights and completes (" +
+                  std::string(sj && sj->report ? pb::attempt_end_name(sj->report->end) : "none") + ")");
+    // exact12: the window's weights at A_t never read the floor
+    h.tick_monero();
+    const pb::PathbTemplate t3 = h[a.node].make_template(h.now);
+    const pb::FollowerBranchView mon(net.rows);
+    const std::optional<pb::BranchBlock> b3 = mon.block(t3.p_r);
+    const std::uint64_t h3 = b3 ? b3->height : 0;
+    for (std::uint64_t k = 1; k <= 100 && k < h3; ++k) noweights.insert(mon_block(h3 - k));
+    const bool m3 = mine_on(h, w, a.node, 4, 3400);
+    const pb::Hash32 c3 = h[a.node].tree().best().id;
+    check(m3 && h3 != 0 && h[b.node].tree().find(c3) == nullptr && rb.stats().bans.load() == 0 && rb.stats().strikes.load() == 0
+                  && rb.parked_index_size() >= 1,
+          "floorpr: #12 keeps exact weights: a carrier whose window reads a block without its weights DEFERs, no token");
+}
+
+// ---------------------------------------------------------------------------
 // jobslot: the CPU miner's own slot (bind_own) is never evicted by stratum jobs: over 66 templates of 1,000 stratum
 // bind + get_job pairs each (66,000 > 65,536 binds) the miner's job follows every template; a stratum bind is taken by
 // its get_job on every return path (no template, make_job failed, a cached job, an issue), so the sessions held stay
@@ -7215,5 +7372,6 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }

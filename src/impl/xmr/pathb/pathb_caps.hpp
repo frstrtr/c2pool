@@ -131,7 +131,8 @@ inline constexpr std::uint64_t kBlockWeightLimitPerMedian = 2;
 // ---------------------------------------------------------------------------
 // Receipt cap
 // ---------------------------------------------------------------------------
-// D_max(hf, A); nullopt when 2 x SURGE x max(zone, Z_lt) exceeds u64.
+// D_max(hf, A); nullopt when 2 x SURGE x max(zone, Z_lt) exceeds u64 (an overflow guard no real median reaches:
+// Monero's medians are bounded by block weights, far below u64 / (2 x SURGE)).
 inline constexpr std::optional<std::uint64_t> d_max(std::uint8_t hf, std::uint64_t z_lt) noexcept {
     const std::uint64_t z = std::max(zone(hf), z_lt);
     const std::uint64_t mult = kBlockWeightLimitPerMedian * surge_factor(hf);
@@ -266,6 +267,7 @@ enum class SizeRule : std::uint8_t { Ok, TxCount, Depth };
 inline constexpr SizeRule receipt_size_rules(std::uint8_t hf, std::uint64_t z_parent, std::uint64_t tx_count,
                                              std::uint64_t depth) noexcept {
     if (tx_count < kMinerTxCount) return SizeRule::TxCount;
+    // an overflow guard no real median reaches (Z <= SURGE x Z_lt, both bounded by block weights)
     if (z_parent > UINT64_MAX / kBlockWeightLimitPerMedian) return SizeRule::TxCount;
     if (tx_count - kMinerTxCount > max_tx_count(z_parent)) return SizeRule::TxCount;
     if (depth != receipt_depth_for(hf, tx_count)) return SizeRule::Depth;

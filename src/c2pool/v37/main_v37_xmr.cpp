@@ -1104,17 +1104,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::vector<pb::TemplateTx> cur_cands;   // the serve loop's ready snapshot (read by make_template, main thread)
     pb::PathbNodeIo io;
     io.monero = &view;
-    io.resolve_pr = [&view, &rows](const pb::Hash32& p_r) {
-        pb::PrInfo out;
-        const std::optional<pb::BranchBlock> b = view.block(p_r);
-        const std::optional<pb::RowWeights> w = rows.weights(p_r);
-        if (!b || !w) return out;
-        out.status = pb::PrInfo::Status::Held;
-        out.height = b->height;
-        std::optional<std::uint64_t> m;
-        const pb::BranchStatus st = pb::timestamp_median_for_child(view, p_r, m);
-        out.in = pb::HeaderInputs{w->hf_child, st.selected() ? m : std::nullopt, w->z_child, w->ltem_child};
-        return out;
+    // P_r resolved on a verified branch: exact inputs with its RowWeights, else (the floor reading, operator ruling)
+    // the floor's inputs for a block the index holds verified
+    io.resolve_pr = [&view, &rows, nn](const pb::Hash32& p_r) {
+        return pb::resolve_pr_on_branch(view, rows, p_r,
+                                        [nn](const pb::Hash32& id) { return nn->index().verified_child_version(id); });
     };
     io.seed_of = [&view, nn](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
         const std::optional<pb::BranchBlock> b = view.block(p_r);

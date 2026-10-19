@@ -1538,6 +1538,7 @@ public:
         // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
         // again once it resolves
         Hash32 fetch{};
+        Missing cause = Missing::MoneroBlock;  // the input the request waits for (MissingWeights: the floor reading)
         Hash32 from{};
         Hash32 stop{};
     };
@@ -1601,6 +1602,8 @@ public:
         // DEFER), never a BAN
         std::optional<std::size_t> claim_fail;
         Basis claim_basis = Basis::Computed;
+        // a size rule the floor reading leaves undecided (P_r without its weights): DEFER on that P_r, never a BAN
+        std::optional<std::size_t> size_undecided;
         const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
             const std::size_t i = k++;
             const CarrierHeader& h = req.got[i];
@@ -1613,7 +1616,9 @@ public:
                 return false;
             }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
-            if (header_fields_verdict(header_fields(h.own, encoded_length(h.own), pr.in))) return false;
+            const HeaderFault hf = header_fields(h.own, encoded_length(h.own), pr.in);
+            if (hf == HeaderFault::SizeUndecided && !size_undecided) size_undecided = i;
+            if (header_fields_verdict(hf)) return false;
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
             return seed.has_value() && verify_memo(h.own.blob, d, *seed);
         };
@@ -1628,6 +1633,14 @@ public:
                 if (claim_fail && *claim_fail == i) {  // #8 on a claim: alarm + DEFER, no token, nothing indexed
                     alarm_.raise(RowId::R9, claim_basis, sh.id, Missing::ClaimAlarm);
                     out.kind = HeadersOutcome::Kind::Defer;
+                    return out;
+                }
+                if (size_undecided && *size_undecided == i) {  // the floor reading: DEFER until P_r's weights, no token
+                    out.kind = HeadersOutcome::Kind::Defer;
+                    out.fetch = req.got[i].own.blob.prev_id;
+                    out.cause = Missing::MissingWeights;
+                    out.from = req.fork;
+                    out.stop = req.stop;
                     return out;
                 }
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
