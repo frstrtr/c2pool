@@ -217,6 +217,9 @@
 //                only when that input is held: no storm on a P_r held
 //                without its weights, no context asked for it; the seed;
 //                the seal sweep by the frame's own P_r;
+//   parkidx      the park index keeps only objects that wait: frames
+//                evicted past the deferred store's cap leave it (at most
+//                the cap more indexed);
 //   catchjoin    a store not caught up whose catch-up step stays deferred
 //                on a P_r no node serves: the record stays, the tip offered
 //                to the joiner after kCtxTtlMs, the pair paced on that P_r;
@@ -6539,6 +6542,48 @@ std::function<void(pb::PathbNodeIo&)> hide_inputs(std::set<pb::Hash32>& noweight
         };
     };
 }
+// ---------------------------------------------------------------------------
+// parkidx: the park index keeps a digest only while its object waits. A's carriers on a P_r B does not resolve park at
+// B, indexed under (MoneroBlock, S). With B's deferred store capped at 4, three times as many frames (12): the store
+// evicts past 4, and the index keeps at most the store's frames and 4 more (the prune once 4 digests were indexed);
+// a disconnect of A drops no parked frame (only its ask records), and the index keeps the frames the store holds.
+void parkidx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights, noseed;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.waiting_cap = 4; },
+                           hide_inputs(noweights, noseed));
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1500 + static_cast<std::uint32_t>(i));
+    }
+    w.connect(0, 1);
+    w.run();
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    h.tick_monero();
+    const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
+    noweights.insert(S);
+    std::size_t peak = 0;
+    for (std::uint32_t k = 0; k < 12; ++k) {
+        const SiblingFrame f = sibling_frame(h, a.node, k % 5, 1600 + k);
+        b.relay->receive(1, f.frame);
+        w.run();
+        peak = std::max(peak, b.relay->parked_index_size());
+    }
+    const std::size_t idx = b.relay->parked_index_size();
+    const std::size_t held = h[b.node].deferred().size();
+    for (const std::uint64_t p : b.links->peer_ids()) b.links->disconnect(p);
+    w.run();
+    const std::size_t idx_gone = b.relay->parked_index_size();
+    check(ok && held == 4 && peak <= 8 && idx <= 8 && idx >= held && idx_gone == idx,
+          "parkidx: twelve frames on a P_r B does not resolve past a deferred store of 4: at most 4 + 4 indexed (peak " +
+                  std::to_string(peak) + ", end " + std::to_string(idx) + ", held " + std::to_string(held) +
+                  "); A's disconnect keeps the held frames indexed (" + std::to_string(idx_gone) + ")");
+}
+
 void ctxgate() {
     const KatNet net;
     {
@@ -7454,6 +7499,7 @@ int main(int argc, char** argv) {
     run("below", below);
     run("jobslot", jobslot);
     run("ctxgate", ctxgate);
+    run("parkidx", parkidx);
     run("catchjoin", catchjoin);
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);

@@ -245,6 +245,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
+    std::atomic<std::uint64_t> parked_index_pruned{0};  // prunes of the park index (frames that left the deferred store)
     std::atomic<std::uint64_t> ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_forged{0}, ctx_deferred{0}, ctx_unchecked{0};
     std::atomic<std::uint64_t> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
     std::atomic<std::uint64_t> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
@@ -1893,12 +1894,29 @@ private:
     static bool ctx_cause(Missing m) {
         return m == Missing::MoneroBlock || m == Missing::MissingBlock || m == Missing::MissingWeights || m == Missing::Seed;
     }
-    // Under the node lock: a parked digest indexed for its re-run (a Monero input by (cause, id), else by cause).
+    // Under the node lock: a parked digest indexed for its re-run (a Monero input by (cause, id), else by cause). Past
+    // the deferred store's cap (J_0) of digests indexed since the last prune, the index is pruned: it holds at most the
+    // objects that wait (the frames the store holds, the parked receipts) and J_0 more.
     void index_parked_locked(Missing m, const Hash32& fetch, const Hash32& d) {
         if (ctx_cause(m) && fetch != Hash32{})
             parked_ctx_[std::make_pair(m, fetch)].insert(d);
         else
             parked_by_cause_[m].insert(d);
+        if (++index_adds_ >= node_->deferred_cap()) prune_parked_index_locked();
+    }
+    // Under the node lock: a digest whose object no longer waits (its frame left the deferred store: an eviction past
+    // J_0, a purge, a release or a take; not a parked receipt) leaves the index, and an emptied key with it. A peer's
+    // disconnect drops no frame (forget_peer clears its ask records only).
+    void prune_parked_index_locked() {
+        index_adds_ = 0;
+        const auto gone = [this](const Hash32& d) { return !node_->parked_held(d) && parked_receipts_.count(d) == 0; };
+        for (auto it = parked_ctx_.begin(); it != parked_ctx_.end();) {
+            for (auto d = it->second.begin(); d != it->second.end();) d = gone(*d) ? it->second.erase(d) : std::next(d);
+            it = it->second.empty() ? parked_ctx_.erase(it) : std::next(it);
+        }
+        for (auto& [cause, ds] : parked_by_cause_)
+            for (auto d = ds.begin(); d != ds.end();) d = gone(*d) ? ds.erase(d) : std::next(d);
+        st_.parked_index_pruned++;
     }
     static bool rerun_cause(Missing m) {
         switch (m) {
@@ -3995,7 +4013,8 @@ private:
     // owned by the node lock
     std::map<Missing, std::set<Hash32>> parked_by_cause_;
     std::map<std::pair<Missing, Hash32>, std::set<Hash32>> parked_ctx_;  // Monero-input DEFERs by (cause, id)
-    std::uint64_t swept_frames_record_ = 0;  // the best chain's H(L) at the last seal sweep of the parked frames
+    std::uint64_t swept_frames_record_ = 0;
+    std::uint64_t index_adds_ = 0;  // digests indexed since the last prune of the park index  // the best chain's H(L) at the last seal sweep of the parked frames
     std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by key: (seq, job and asks)
     std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
     std::uint64_t parked_receipt_seq_ = 0;

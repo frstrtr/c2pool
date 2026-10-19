@@ -841,6 +841,9 @@ public:
             if (const std::optional<BranchBlock> b = io_.monero->block(p_r)) return b->height + 1;
         return std::nullopt;
     }
+    // The deferred store holds a frame of this digest; its cap (J_0).
+    bool parked_held(const Hash32& digest) const { return deferred_.holds(digest); }
+    std::uint64_t deferred_cap() const noexcept { return deferred_.cap(); }
     // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
     std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
         const ParkedFrame* f = deferred_.get(digest);
