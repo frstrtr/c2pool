@@ -1533,8 +1533,14 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::uint64_t leaf_count = 0;
         std::uint64_t coinbase_internal = 0;
         pb::PathbNode::SwitchCounts sw{};
+        std::uint64_t own_carriers = 0, own_orphaned = 0;
+        std::size_t repend_watched = 0;
+        pb::PathbNode::OpenState open{};
+        std::uint64_t open_evaluated = 0;
+        pb::PathbNode::Liveness liveness{};
+        pb::PathbNode::WindowFlagCounts wflags{};
     };
-    const auto node_view = [&]() {
+    const auto node_view = [&](std::uint64_t now_s) {
         return relay->with_node([&](pb::PathbNode& n) {
             NodeView v;
             const pb::CarrierNode& b = n.tree().best();
@@ -1556,6 +1562,15 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.leaf_count = lv.ok() ? lv.leaf_count() : 0;
             v.coinbase_internal = n.alarms().count_of(pb::RowId::R12, pb::Missing::NodeInternal);
             v.sw = n.switch_counts();
+            v.own_carriers = n.own_carriers();
+            v.own_orphaned = n.own_orphaned();
+            v.repend_watched = n.repend_watch_size();
+            // computed once per status period (the status line's); the kept values on the other passes
+            const pb::PathbNode::StatusSample& ss = n.status_sample(now_s, cfg.status_every_s);
+            v.open = ss.open;
+            v.open_evaluated = n.open_state_calls();
+            v.liveness = ss.liveness;
+            v.wflags = n.window_flags();
             return v;
         });
     };
@@ -1597,7 +1612,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         }
 
         // 2. the best tip and hold()
-        const NodeView nv = node_view();
+        const NodeView nv = node_view(now);
         const bool best_moved = !have_state || nv.best != last_best;
 
         // 3. the template (E2), at a new best tip, a Monero tip, the source's epoch or the pending set
@@ -1784,9 +1799,30 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
+            std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu evicted=%llu watched=%zu lost=%llu "
+                        "joiner-switches=%llu joiner-lost=%llu joiner-adopted=%llu own-carriers=%llu own-orphaned=%llu\n",
+                        static_cast<unsigned long long>(nv.sw.repended), static_cast<unsigned long long>(nv.sw.carried),
+                        static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.evicted),
+                        nv.repend_watched, static_cast<unsigned long long>(nv.sw.lost),
+                        static_cast<unsigned long long>(nv.sw.joiner_switches),
+                        static_cast<unsigned long long>(nv.sw.joiner_lost),
+                        static_cast<unsigned long long>(nv.sw.joiner_adopted), static_cast<unsigned long long>(nv.own_carriers),
+                        static_cast<unsigned long long>(nv.own_orphaned));
+            std::printf("  open-state: placements=%llu bytes=%llu evaluated=%llu\n",
+                        static_cast<unsigned long long>(nv.open.placements), static_cast<unsigned long long>(nv.open.bytes),
+                        static_cast<unsigned long long>(nv.open_evaluated));
+            std::printf("  windows: evaluated=%llu n-dropped-bins=%llu n-cut-position=%llu merged-back=%llu\n",
+                        static_cast<unsigned long long>(nv.wflags.evaluated),
+                        static_cast<unsigned long long>(nv.wflags.n_dropped_bins),
+                        static_cast<unsigned long long>(nv.wflags.n_cut_position),
+                        static_cast<unsigned long long>(nv.wflags.merged_back));
+            std::printf("  liveness: live=%llu dead=%llu hash=%s\n", static_cast<unsigned long long>(nv.liveness.live),
+                        static_cast<unsigned long long>(nv.liveness.dead), hex_of(nv.liveness.hash).substr(0, 16).c_str());
             if (cur && cur->window.window) {
                 const std::vector<pb::SplitOutput> so = pb::split(cur->reward, *cur->window.window);
-                std::printf("  window: payees=%zu R=%llu\n", so.size(), static_cast<unsigned long long>(cur->reward));
+                std::printf("  window: payees=%zu R=%llu n-dropped-bins=%d n-cut-position=%d merged-back=%d\n", so.size(),
+                            static_cast<unsigned long long>(cur->reward), cur->window.n_dropped_bins ? 1 : 0,
+                            cur->window.n_cut_position ? 1 : 0, cur->window.merged_back ? 1 : 0);
             }
             const o2::StratumListenerStats ls = listener.stats();
             std::printf("  stratum: conns=%llu active=%llu logins=%llu parked=%llu shares=%llu rejected=%llu "
@@ -1841,7 +1877,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             "alt_verified_bytes=%llu alt_verified_bytes_peak=%llu alt_verified_bytes_max=%llu "
                             "alt_unproven_bytes=%llu alt_unproven_bytes_peak=%llu alt_unsolicited_drops=%llu "
                             "alt_source_drops=%llu join_side_attempts=%llu join_side_completed=%llu "
-                            "join_side_not_served=%llu\n",
+                            "join_side_not_served=%llu ctx_want_bytes_peak=%zu\n",
                             static_cast<unsigned long long>(rs.p15_drops.load()),
                             static_cast<unsigned long long>(rs.reoffer_paused.load()), links.net().queued_bytes_hwm(),
                             static_cast<unsigned long long>(links.net().peers_dropped_queue_full()),
@@ -1874,7 +1910,25 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(nn->index().source_dropped()),
                             static_cast<unsigned long long>(rs.join_side_attempts.load()),
                             static_cast<unsigned long long>(rs.join_side_completed.load()),
-                            static_cast<unsigned long long>(rs.join_side_not_served.load()));
+                            static_cast<unsigned long long>(rs.join_side_not_served.load()), relay->ctx_want_bytes_peak());
+            }
+            {
+                const std::map<std::uint64_t, std::uint64_t> om = relay->omission_counts();
+                std::string per;
+                for (const auto& [link, n] : om) per += " " + std::to_string(link) + ":" + std::to_string(n);
+                std::printf("  omissions: total=%llu peers=%zu%s\n", static_cast<unsigned long long>(relay->omitted_total()),
+                            om.size(), per.c_str());
+                static const char* const kVerdictName[] = {"strike", "refuse", "defer", "duplicate", "ban", "carrier",
+                                                           "pending", "drop"};
+                static_assert(std::size(kVerdictName) == pb::PathbRelayNode::kVerdictKinds, "a name per verdict");
+                const pb::PathbRelayNode::VerdictCounts vc = relay->verdict_counts();
+                std::string vs;
+                for (std::size_t row = 0; row < vc.size(); ++row)
+                    for (std::size_t v = 0; v < vc[row].size(); ++v)
+                        if (vc[row][v] != 0)
+                            vs += " " + (row == 0 ? std::string("-") : "R" + std::to_string(row)) + "/" + kVerdictName[v] +
+                                  "=" + std::to_string(vc[row][v]);
+                std::printf("  verdicts:%s\n", vs.empty() ? " none" : vs.c_str());
             }
             std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),

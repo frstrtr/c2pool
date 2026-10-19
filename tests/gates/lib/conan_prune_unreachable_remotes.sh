@@ -146,3 +146,34 @@ PY
     return 1
   fi
 }
+
+# A remote can pass every probe above and then drop mid-resolve: the primary
+# "lan" mirror (.181:9300) accepts the TCP connect, then refuses or times out
+# during the "checking for binary" phase. Pass 1 does not apply to it because it
+# is a primary, so a single `conan install` still goes red before the gate body
+# runs. conan_install_resilient takes the same args as `conan install` and
+# degrades in two steps:
+#   1. On failure, re-run prune_unreachable_conan_remotes (the dropped remote now
+#      fails its probe and gets disabled), then retry once.
+#   2. If that also fails, retry cache-only with --no-remote (-nr), matching
+#      build.yml's "Conan install (offline; --no-remote)" step.
+# A genuinely missing dependency still fails: when the -nr attempt fails too,
+# this returns nonzero, so it cannot produce a fake green.
+# Selftest: tests/gates/lib/test_conan_install_resilient.sh
+conan_install_resilient() {
+  local rc
+  conan install "$@" && return 0
+  rc=$?
+  echo "[conan-remote-prune] conan install failed (rc=$rc) after a clean probe — a remote likely dropped mid-resolve; re-probing and retrying" >&2
+  prune_unreachable_conan_remotes || return $?
+  conan install "$@" && return 0
+  rc=$?
+  echo "[conan-remote-prune] conan install failed again (rc=$rc); retrying cache-only (--no-remote)" >&2
+  conan install "$@" -nr && {
+    echo "[conan-remote-prune] resolved from local cache only (--no-remote)" >&2
+    return 0
+  }
+  rc=$?
+  echo "[conan-remote-prune] FATAL: conan install failed with remotes and cache-only (rc=$rc)" >&2
+  return "$rc"
+}

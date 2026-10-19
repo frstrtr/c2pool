@@ -896,6 +896,29 @@ public:
         for (const auto& kv : ctx_want_) n += kv.second.blob.size();
         return n;
     }
+    // The per-peer omission log: link id -> the receipts its placed carriers left out that this node held pending (an
+    // entry leaves at link down), and the total since start.
+    std::map<std::uint64_t, std::uint64_t> omission_counts() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return omissions_;
+    }
+    std::uint64_t omitted_total() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return omitted_total_;
+    }
+    // The admission verdicts of peers' objects since start, by row (RowId, 0 = none) and verdict (AdmitVerdict).
+    static constexpr std::size_t kRowKinds = static_cast<std::size_t>(RowId::R31) + 1;
+    static constexpr std::size_t kVerdictKinds = static_cast<std::size_t>(AdmitVerdict::Drop) + 1;
+    using VerdictCounts = std::array<std::array<std::uint64_t, kVerdictKinds>, kRowKinds>;
+    VerdictCounts verdict_counts() const {
+        std::lock_guard<std::mutex> lk(omtx_);
+        return verdicts_;
+    }
+    // The most bytes the wanted contexts held at once (taken at every blob that enters a want).
+    std::size_t ctx_want_bytes_peak() const {
+        std::lock_guard<std::mutex> lk(cmtx_);
+        return ctx_want_bytes_peak_;
+    }
     std::string describe() const {
         char b[768];
         std::snprintf(b, sizeof b,
@@ -1333,6 +1356,8 @@ private:
             const NodeGuard g(*this);
             node_->disconnect(p);
             strip_gone_peer_asks_locked(p);
+            std::lock_guard<std::mutex> lk(omtx_);
+            omissions_.erase(p);
         });
     }
     // Under the node lock: a gone link's ask records leave every parked receipt (link ids are not reused, so they
@@ -1667,6 +1692,14 @@ private:
         std::lock_guard<std::mutex> lk(vmtx_);
         valid_.erase(p);
     }
+    // An omission entry made for a link that went down meanwhile does not stay (a carrier run again after its link's
+    // down: a RandomX park, a parked frame's re-run, a queued verify job); the total keeps the count. The link-down
+    // handler erases the others, so the log holds only links that are up.
+    void omission_gone(std::uint64_t p) {
+        if (peer_known(p)) return;
+        std::lock_guard<std::mutex> lk(omtx_);
+        omissions_.erase(p);
+    }
     struct ValidBucket {
         double tokens = 0;
         std::uint64_t ms = 0;
@@ -1700,10 +1733,38 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
     };
-    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park.
+    // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
+        for (const PathbNode::DrainedResult& d : node_->take_drained())
+            account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
+    }
+    // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
+    // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
+    // by the journal.
+    void account_locked(std::uint64_t peer, NodeAction action, RowId row, AdmitVerdict verdict, std::uint64_t omitted,
+                        std::uint64_t repended, std::uint64_t lost) {
+        const bool from_peer = peer != 0 && peer != PathbNode::kOwnPeer;
+        if (from_peer && action != NodeAction::None && action != NodeAction::NodeInternal) {  // verdicts by row
+            std::lock_guard<std::mutex> lk(omtx_);
+            ++verdicts_[static_cast<std::size_t>(row)][static_cast<std::size_t>(verdict)];
+        }
+        if (omitted != 0 && from_peer) {  // the per-peer omission log (relay policy; erased at link down)
+            {
+                std::lock_guard<std::mutex> lk(omtx_);
+                omissions_[peer] += omitted;
+                omitted_total_ += omitted;
+            }
+            omission_gone(peer);
+        }
+        if (action == NodeAction::Switched) {
+            const PathbNode::SwitchCounts& sc = node_->switch_counts();
+            log("relay: switch by the journal: re-pended " + std::to_string(repended) + ", lost " + std::to_string(lost) +
+                " (re-pended since start " + std::to_string(sc.repended) + ", carried " + std::to_string(sc.carried) +
+                ", sealed pending " + std::to_string(sc.sealed_pending) + ")");
+        }
     }
     // Under the node lock: the requests a DEFER names, sent to the object's sender (FC_GETHEADERS of t's branch,
     // FC_GETCARRIER of a walked carrier's bodies or of a carrier, FB_GETCTX, FC_GETBUCKETS), the walked branch of a
@@ -1714,6 +1775,7 @@ private:
     void after_result_locked(std::uint64_t peer, const NodeEventResult& r, std::optional<Hash32> digest, Effects& fx,
                              bool relayed = true, bool carrier = true, std::optional<Hash32> receipt = std::nullopt) {
         if (relayed && r.admit.missing == Missing::ClaimAlarm) claim_charge(peer);
+        account_locked(peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended, r.lost);
         switch (r.action) {
             case NodeAction::JoinerPath: fx.join = true; break;
             case NodeAction::Placed:
@@ -2614,7 +2676,8 @@ private:
                 std::to_string(rep.L) + ", at " + std::to_string(rep.at) + ", row " + std::to_string(static_cast<int>(rep.row)) +
                 ", tokens " + std::to_string(rep.strike) +
                 (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
-                (rep.what.empty() ? "" : ": " + rep.what) + ")" + (s->switched ? " -> adopted" : ""));
+                (rep.what.empty() ? "" : ": " + rep.what) + ")" +
+                (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
                 if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;
@@ -3450,6 +3513,9 @@ private:
             it->second.proof = bc;
             it->second.blob = blob;
             it->second.proof_from = from;
+            std::size_t held = 0;
+            for (const auto& kv : ctx_want_) held += kv.second.blob.size();
+            if (held > ctx_want_bytes_peak_) ctx_want_bytes_peak_ = held;
         }
         return judge_ctx(id);
     }
@@ -3763,8 +3829,13 @@ private:
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop)
 
+    mutable std::mutex omtx_;                          // the omission log
+    std::map<std::uint64_t, std::uint64_t> omissions_;  // link id -> receipts omitted (at most the links up)
+    std::uint64_t omitted_total_ = 0;
+    VerdictCounts verdicts_{};  // [row][verdict]
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;
+    std::size_t ctx_want_bytes_peak_ = 0;  // the most blob bytes ctx_want_ held at once
     std::deque<Hash32> ctx_done_;
     std::map<Hash32, rly::CtxPowRec> ctx_pow_;
     std::deque<Hash32> ctx_pow_order_;
