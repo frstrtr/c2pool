@@ -20,9 +20,8 @@
 # source/CMakeLists yet — so it cannot be turned on in CI in this wave; a later
 # wave vendors the tevador/RandomX source (submodule) and flips it into build.yml.
 #
-# Dependency-gated harnesses still NOT declared as add_executable (plain source
-# only): ../settle/_compile_check/ (W5 stubbed-crypto driver) and this dir's
-# rx_probe.cpp (light-mode RandomX probe). The X0 python harness (x0_harness.py
+# Dependency-gated harness still NOT declared as add_executable (plain source
+# only): this dir's rx_probe.cpp (light-mode RandomX probe). The X0 python harness (x0_harness.py
 # + x0-kat-*.json + x0_vectors/) is exercised out of band, not a CMake target.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,29 +61,17 @@ if (BUILD_TESTING)
     target_compile_features(xmr_x2_node_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_x2_node_kat COMMAND xmr_x2_node_kat)
 
-    # 3) X4 (W2) receipt-envelope KAT. SUPERSEDES the foundation's
-    #    xmr_receipt_admission_check scaffold: exercises the FINALIZED admission
-    #    pipeline (xmr_admission.hpp) + the real verify bodies
-    #    (xmr_receipt_verify.cpp) over X1's coin primitives (xmr_blob via
-    #    xmr_coin). RandomX is CI-gated INSIDE the test (rx_check null ->
-    #    stage-5 SkippedCIGated), so this target carries NO RandomX dependency
-    #    and runs in the ordinary lane. Links xmr_coin for the coinbase
-    #    serializer used by KAT-2.
-    add_executable(xmr_receipt_kat
-        xmr_receipt_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp)
-    target_link_libraries(xmr_receipt_kat PRIVATE xmr_coin)
-    target_include_directories(xmr_receipt_kat PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../coin)
+    # 3) the Path B receipt (v3 body): block 3000000's tree fold, the S2.3 order of
+    #    admit_receipt, credit = work(t_origin). Header-only Path B (xmr_pathb).
+    add_executable(xmr_receipt_kat xmr_receipt_kat.cpp)
+    target_link_libraries(xmr_receipt_kat PRIVATE xmr_pathb)
+    target_include_directories(xmr_receipt_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_receipt_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_receipt_kat COMMAND xmr_receipt_kat)
 
-    # 4) W3 carrier wire codec + RandomX DoS budget. STL-only.
+    # 4) the RandomX DoS budget (wire/xmr_carrier_dos_budget.hpp). STL-only.
     add_executable(xmr_wire_dos_check xmr_wire_dos_check.cpp)
-    target_include_directories(xmr_wire_dos_check PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt)
+    target_include_directories(xmr_wire_dos_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_wire_dos_check PRIVATE cxx_std_20)
     add_test(NAME xmr_wire_dos_check COMMAND xmr_wire_dos_check)
 
@@ -103,58 +90,19 @@ if (BUILD_TESTING)
     target_compile_features(xmr_provenance_gate PRIVATE cxx_std_20)
     add_test(NAME xmr_provenance_gate COMMAND xmr_provenance_gate)
 
-    # 6b) X6 (W5) coinbase-settlement KAT. Finalizes the OWED -> miner_tx
-    #     executor (../settle/xmr_coinbase.cpp): deterministic-r reproducibility
-    #     (same inputs -> same R and same P_i set; changed lane_commitment /
-    #     prev_id / height -> a fresh r), R = r*G anchored to an OFFICIAL monero
-    #     generate_keys vector, a stealth one-time key against monero-project
-    #     tests/crypto/tests.txt (generate_key_derivation + derive_public_key)
-    #     plus a coinbase-path reproduction of every P_i, exact-sum (Sum(vout) ==
-    #     base_reward+fees to the piconero incl. residual sink -- HF13, no burn),
-    #     the weight-aware output cap, and the CARROT/FCMP++ fence trip
-    #     (major_version 17 -> CarrotFence, no coinbase). Compiles the settle TU
-    #     and links xmr_coin for the REAL vendored ed25519 (ge_*) + keccak; the
-    #     src/ root resolves the "impl/xmr/..." and read-only "sharechain/v37/..."
-    #     (v37_descriptor_xmr.hpp value-consumer) includes. NO RandomX, monerod,
-    #     libsodium or boost -- runs in the ordinary lane.
-    add_executable(xmr_coinbase_kat
-        xmr_coinbase_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp)
-    target_link_libraries(xmr_coinbase_kat PRIVATE xmr_coin)
+    # 6b) case 4 through the Path B coinbase: Sum(vout) == R (mainnet block 3,755,897's
+    #     payees; regtest), deterministic r and keys, R_tx = r G, hf 17 fused.
+    add_executable(xmr_coinbase_kat xmr_coinbase_kat.cpp)
+    target_link_libraries(xmr_coinbase_kat PRIVATE xmr_pathb)
     target_include_directories(xmr_coinbase_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_coinbase_kat COMMAND xmr_coinbase_kat)
 
-    # 6c) X8 END-TO-END integration KAT. Stitches the whole XMR-lane path the
-    #     per-slice KATs each cover only in isolation: block-template context feeds
-    #     the coinbase inputs; the settle leg (../settle/xmr_coinbase.cpp) builds
-    #     the canonical miner_tx from a finality-gated OWED ledger (exact-sum, no
-    #     burn; owed outputs are real 8rA stealth keys); the stratum front-end
-    #     (../stratum/xmr_stratum.cpp) serves the coinbase-framed hashing blob, a
-    #     miner grinds it and submits a share that the deterministic W3 PoW oracle
-    #     accepts (the blob the miner signs is byte-identical to the receipt's);
-    #     the carrier wire (../wire, header-only) encodes/decodes the receipt
-    #     byte-for-byte; and the receipt verifier (../receipt/xmr_receipt_verify.cpp)
-    #     accepts the well-formed carrier and REJECTS a tampered one at the
-    #     STRUCTURAL stage, before RandomX. The single stitch: the settle
-    #     owed_digest (lane_commitment) IS the receipt side-data info_digest, so the
-    #     coinbase's tx_extra 0x03 leaf == the leaf the receipt path recomputes.
-    #     Links xmr_coin for the REAL vendored ed25519 (ge_*) + keccak; the src/
-    #     root resolves the "impl/xmr/..." and read-only "sharechain/v37/..."
-    #     includes. RandomX is CI-gated INSIDE the test (deterministic oracle, no
-    #     256-MiB cache / JIT) so this target carries NO RandomX dependency and runs
-    #     in the ordinary lane on BOTH build.yml legs. NO monerod, libsodium, boost.
-    add_executable(xmr_e2e_kat
-        xmr_e2e_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt/xmr_receipt_verify.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum/xmr_stratum.cpp)
-    target_link_libraries(xmr_e2e_kat PRIVATE xmr_coin)
-    target_include_directories(xmr_e2e_kat PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+    # 6c) case 4 end to end through the Path B coinbase: window -> split -> the hf-16
+    #     miner tx -> tree_root -> the v3 receipt -> #12 Match; Sum(vout) == R.
+    add_executable(xmr_e2e_kat xmr_e2e_kat.cpp)
+    target_link_libraries(xmr_e2e_kat PRIVATE xmr_pathb)
+    target_include_directories(xmr_e2e_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_compile_features(xmr_e2e_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_e2e_kat COMMAND xmr_e2e_kat)
 
@@ -199,55 +147,21 @@ if (BUILD_TESTING)
     # 9b) cross-impl goldens: the LOAD-BEARING Family-B golden regression gate
     #     (the analogue of the Bitcoin-family proto/ decay-table golden). It
     #     recomputes the deterministic XMR-lane outputs — difficulty check_hash
-    #     boundaries, CryptoNote stealth one-time keys, deterministic coinbase
-    #     r/R=r*G/mm-root, receipt cheap-id + info digest, and the wire carrier
-    #     codec bytes — through the merged primitives and byte-compares each to
+    #     boundaries, CryptoNote stealth one-time keys and deterministic coinbase
+    #     r/R=r*G/mm-root — through the merged primitives and byte-compares each to
     #     the frozen cross-impl-goldens/xmr_lane_goldens_golden.hpp (emitted by
     #     cross-impl-goldens/gen_xmr_goldens.cpp, which is a dev tool, NOT a CMake
     #     target — mirroring tools/gen_decay_canonical.py). LIGHT: links xmr_coin
-    #     (keccak/ed25519/boost-free check_hash) + the header-only receipt/wire
-    #     codec; NO RandomX / libsodium / boost. Negative-controlled internally.
+    #     (keccak/ed25519/boost-free check_hash); NO RandomX / libsodium / boost.
     #     Added to BOTH build.yml light legs by this wave (drift-guard clean).
     add_executable(xmr_goldens_kat
         ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens/xmr_goldens_kat.cpp)
     target_link_libraries(xmr_goldens_kat PRIVATE xmr_coin)
     target_include_directories(xmr_goldens_kat PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens
-        ${CMAKE_CURRENT_SOURCE_DIR}/../receipt
-        ${CMAKE_CURRENT_SOURCE_DIR}/../wire)
+        ${CMAKE_CURRENT_SOURCE_DIR}/cross-impl-goldens)
     target_compile_features(xmr_goldens_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_goldens_kat COMMAND xmr_goldens_kat)
 
-    # 9c) Milestone-A miner->block end-to-end smoke (Track A2 / Family-B). Binds
-    #     the X5 stratum seams (ITemplateSource / IPowVerifier / IShareSink) to
-    #     the live-node components and drives the whole block-winning path:
-    #       accepted network-block share -> read the finality-gated OWED ledger
-    #       (W4 OwedLedger) -> build the X6 canonical coinbase (settle/xmr_coinbase,
-    #       FCMP-fenced, exact-sum, real 8rA stealth one-time keys) -> submit_block
-    #       via the X2 IMonerodTransport (MockMonerodTransport). It ALSO exercises
-    #       the F1 finalize driver (per-height, in-order on_block_finalized, never
-    #       the live tip) and an FCMP-fence negative control (a post-CARROT
-    #       major_version is REFUSED, no submit fired). PoW is a deterministic
-    #       known-answer mock: NO RandomX / monerod / libsodium (sanitizer-safe,
-    #       OOM-safe). Links xmr_coin for the vendored ed25519 (ge_*) + keccak and
-    #       compiles the ref10 point-check backend with V37_XMR_HAVE_MONERO_CRYPTO
-    #       so XMR descriptors validate live (SAFETY (4)). Its own harness (nonzero
-    #       exit on any failed stage). Listed on BOTH build.yml legs + drift-guard
-    #       clean (see .github/workflows/build.yml).
-    add_executable(xmr_miner_block_path_smoke
-        miner_block_path_smoke.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum/xmr_stratum.cpp
-        ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-    target_link_libraries(xmr_miner_block_path_smoke PRIVATE xmr_coin)
-    target_include_directories(xmr_miner_block_path_smoke PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../mbp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../stratum
-        ${CMAKE_CURRENT_SOURCE_DIR}/../coin)
-    target_compile_definitions(xmr_miner_block_path_smoke PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
-    target_compile_features(xmr_miner_block_path_smoke PRIVATE cxx_std_20)
-    add_test(NAME xmr_miner_block_path_smoke COMMAND xmr_miner_block_path_smoke)
 
     # 10) randomx-verify: the REAL RandomX engine, now vendored and wired.
     #     ../pow/randomx_verify_kat.cpp runs three suites against librandomx.a
@@ -359,24 +273,18 @@ if (BUILD_TESTING)
     add_test(NAME xmr_msr_boost_kat COMMAND xmr_msr_boost_kat)
 
     # =========================================================================
-    # X9 OPTION B — whole-block settlement coinbase (consumer-tree; no consensus
-    # digest). Both link xmr_template (the p2pool block-template port + the
-    # authored xmr_coin_primitives.cpp seam bodies), so the primitive bodies are
-    # provided ONCE by the library and neither TU defines
-    # XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES (the ODR rule).
+    # The block template (xmr_template: the clean-room XmrBlockTemplate + the
+    # xmr_coin_primitives.cpp seam bodies) and the Path B block assembly.
     #
-    # ci-allowlist-exempt: xmr_template_primitives_kat  -- heavy option-B leg (pulls the whole template port); NOT built in build.yml this wave, so it is guarded behind the OFF-by-default XMR_BUILD_OPTION_B_KATS option below. Library compile-coverage is still had at PR time via the c2pool-v37-xmr daemon target (which links xmr_template) on the non-san Linux leg; a later wave flips this option ON in build.yml.
-    # ci-allowlist-exempt: xmr_block_assembly_kat  -- heavy option-B leg (template + X6 settle + ref10 point-check); same gating as above.
-    #
-    # Both add_executable/add_test are gated behind XMR_BUILD_OPTION_B_KATS
-    # (default OFF, run locally with -DXMR_BUILD_OPTION_B_KATS=ON). Without this
-    # guard the add_test() below registers in every BUILD_TESTING build while the
-    # binaries are (deliberately) absent from build.yml's --target list, so ctest
-    # reports them ***Not Run and CTest exits 8 -- a red that is NOT a test
-    # failure. This mirrors the ltc_embedded_bootstrap_gate exempt idiom: exempt
-    # from the allowlist AND unregistered unless its own option is set.
+    # RUN-COVERAGE (#1543): both KATs are built + registered on the
+    # non-sanitizer Linux leg, which configures with -DXMR_BUILD_OPTION_B_KATS=ON
+    # and lists xmr_template_primitives_kat + xmr_block_assembly_kat in its
+    # `cmake --build --target` allowlist, so they are allowlisted, not exempt.
+    # The option still defaults OFF so a minimal local build (or the ASan leg,
+    # which leaves it OFF) does not register an add_test whose binary is
+    # absent -- that combination makes ctest report ***Not Run and exit 8.
     option(XMR_BUILD_OPTION_B_KATS
-           "Build the heavy X9 option-B XMR KATs (local; not in the CI --target allowlist)" OFF)
+           "Build the heavy X9 option-B XMR KATs (CI non-san leg passes this ON; default OFF for minimal local builds)" OFF)
     if (XMR_BUILD_OPTION_B_KATS)
         # (1) primitive seam byte-identity + template in-situ (component 1 + the leg).
         add_executable(xmr_template_primitives_kat xmr_template_primitives_kat.cpp)
@@ -384,20 +292,11 @@ if (BUILD_TESTING)
         target_compile_features(xmr_template_primitives_kat PRIVATE cxx_std_20)
         add_test(NAME xmr_template_primitives_kat COMMAND xmr_template_primitives_kat)
 
-        # (2) whole-block assembly self-check K0..K6 ("the X6 K_fair coinbase IS the
-        #     block's coinbase"): xmr_block_assembly.hpp over the X6 executor
-        #     (settle/xmr_coinbase.cpp) + the ed25519 point-check registrar
-        #     (v37_descriptor_xmr_point_check_ref10.cpp, V37_XMR_HAVE_MONERO_CRYPTO).
-        add_executable(xmr_block_assembly_kat
-            xmr_block_assembly_selfcheck.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/../settle/xmr_coinbase.cpp
-            ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
-        target_link_libraries(xmr_block_assembly_kat PRIVATE xmr_template)
-        target_include_directories(xmr_block_assembly_kat PRIVATE
-            ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/../coin/vendor
-            ${CMAKE_CURRENT_SOURCE_DIR}/../coin/compat)
-        target_compile_definitions(xmr_block_assembly_kat PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+        # (2) the Path B block assembly (xmr_block_assembly.hpp): the captured stagenet
+        #     blocks re-assembled byte for byte, the Path B miner tx's extra, a block of it.
+        add_executable(xmr_block_assembly_kat xmr_block_assembly_selfcheck.cpp)
+        target_link_libraries(xmr_block_assembly_kat PRIVATE xmr_template xmr_pathb)
+        target_include_directories(xmr_block_assembly_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
         target_compile_features(xmr_block_assembly_kat PRIVATE cxx_std_20)
         add_test(NAME xmr_block_assembly_kat COMMAND xmr_block_assembly_kat)
     endif()

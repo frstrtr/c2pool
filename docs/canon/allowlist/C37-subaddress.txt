@@ -1,0 +1,6 @@
+# Canon rule C37 allowlist: reviewed XMR_SUB occurrences in the XMR lane
+# consensus core. Format: <path> <max count> <reason>.
+#
+# Reviewed 2026-10-16 on pathb/s4w-bc-4 (from d22b8d1f6).
+
+src/sharechain/v37/v37_descriptor_xmr.hpp 5 the shared descriptor names the subaddress kind (0x11), its size, its identity preimage and its KAT row; Path B refuses it: the side-data decoder refuses a payee_ref or owner_ref kind other than XMR_STD (PayeeRefKind, OwnerRefKind) and the login refuses a subaddress payee; v37_xmr_side_data_v3_kat, v37_descriptor_xmr_test

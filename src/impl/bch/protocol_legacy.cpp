@@ -81,7 +81,16 @@ void Legacy::HANDLER(addrs)
 
 void Legacy::HANDLER(addrme)
 {
-    if (peer->addr().address() == "127.0.0.0")
+    // #1716 (sibling half of #882): the loopback HOST address, not the loopback
+    // NETWORK address. The BCH canonical, p2poolBCH p2p.py:267 (@6603b79),
+    // compares `host == 127.0.0.1`, and so does the Actual generation
+    // (protocol_actual.cpp:94). Legacy shipped "127.0.0.0", which no peer can
+    // present as its source IP, so this branch was unreachable and every addrme,
+    // including one arriving over loopback, fell into the else arm below: it
+    // recorded 127.0.0.1:<port> in our AddrStore as if it were a routable peer
+    // and then gossiped that loopback record onward in an addrs message. #915
+    // fixed the same line on DASH only.
+    if (peer->addr().address() == "127.0.0.1")
     {
         if (!m_peers.empty() && (core::random::random_float(0, 1) < 0.8))
         {

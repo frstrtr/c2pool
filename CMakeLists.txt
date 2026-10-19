@@ -3,6 +3,10 @@ project(c2pool C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Reproducible builds: remap source/build/Conan-cache absolute paths in compiled
+# output (docs/xmr-lane/REPRODUCIBLE-BUILD.md). Before any add_subdirectory().
+include(${CMAKE_SOURCE_DIR}/cmake/ReproducibleBuild.cmake)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -204,7 +208,22 @@ include_directories(src)
 # MSVC/Windows carries no legacy *system* Boost under /usr/include, so it has
 # nothing to leak and does not need (or resolve) this force-include. Gating to
 # non-MSVC avoids C1083 on the MSVC path while keeping the Linux/macOS fix.
+#
+# The shim starts with #include <boost/version.hpp>, so every TU that gets it
+# needs a Boost include dir -- including targets that link no Boost at all
+# (vendored randomx, xmr_node's monero_rpc.cpp, the POSIX-only KATs). Without
+# one, those TUs resolved <boost/version.hpp> from whatever *system* Boost the
+# host had (/usr/include, e.g. apt 1.83 next to conan's pinned 1.90: a silently
+# mixed Boost), or failed outright on a host with no system Boost. Pair the
+# force-include with the SAME Boost headers every Boost-linked target uses
+# (Boost::headers from conan), as a SYSTEM dir so it is searched ahead of
+# /usr/include: every C++ TU now sees the pinned Boost, never the host's.
 if(NOT MSVC)
+  if(TARGET Boost::headers)
+    include_directories(SYSTEM "$<$<COMPILE_LANGUAGE:CXX>:$<TARGET_PROPERTY:Boost::headers,INTERFACE_INCLUDE_DIRECTORIES>>")
+  elseif(Boost_INCLUDE_DIRS)
+    include_directories(SYSTEM "$<$<COMPILE_LANGUAGE:CXX>:${Boost_INCLUDE_DIRS}>")
+  endif()
   add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;core/boost_asio_compat.hpp>")
 endif()
 

@@ -100,6 +100,11 @@ public:
         std::vector<uint256>       merkle_branches;  ///< coinbase txid -> merkle root branches
         std::vector<unsigned char> payout_script;    ///< finder's scriptPubKey
         bool                       segwit_active = false;
+        /// #884: {mint, vote} version pair frozen into the job at template time
+        /// (JobSnapshot::frozen_ref). The mint stamps these -- it never re-asks
+        /// the AutoRatchet, so the share matches the coinbase the miner hashed.
+        int64_t                    share_version = 36;
+        uint64_t                   desired_version = 36;
     };
 
     /// Callback invoked when `mining_submit` validates a submission whose

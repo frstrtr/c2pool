@@ -565,6 +565,10 @@ core::stratum::CoinbaseResult DGBWorkSource::build_connection_coinbase(
     out.snapshot.subsidy                   = inputs->subsidy;
     out.snapshot.frozen_ref.ref_hash       = inputs->ref_hash;
     out.snapshot.frozen_ref.last_txout_nonce = inputs->last_txout_nonce;
+    // #884: freeze the ratchet-selected version pair the coinbase was built at,
+    // so the stratum server carries it on the job back to mining_submit's mint.
+    out.snapshot.frozen_ref.share_version   = inputs->share_version;
+    out.snapshot.frozen_ref.desired_version = inputs->desired_version;
     return out;
 }
 
@@ -763,6 +767,9 @@ nlohmann::json DGBWorkSource::mining_submit(
             }
         }
         in.segwit_active   = job->segwit_active;
+        // #884: mint at the version pair frozen when this job's coinbase was built.
+        in.share_version   = job->frozen_ref.share_version;
+        in.desired_version = job->frozen_ref.desired_version;
 
         uint256 share_hash;
         try {

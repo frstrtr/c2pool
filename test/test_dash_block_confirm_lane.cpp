@@ -5,7 +5,7 @@
 // THE GAP (on master). DASH wired NONE of the confirmation seam —
 // main_dash.cpp calls neither set_block_verify_fn nor
 // schedule_block_verification (LTC wires both). So a DASH found block sat
-// "pending" on the dashboard forever and orphans (e.g. hotel block 2508008)
+// "pending" on the dashboard forever and orphans (e.g. production block 2508008)
 // were discovered by humans, not the board. NoVerifierLeavesPending below is
 // the master baseline: with no verifier armed, a recorded block never leaves
 // pending no matter how many verification passes run.
@@ -51,7 +51,7 @@ uint256 blk_hash(unsigned char b)
     return h;
 }
 
-constexpr uint32_t kHeight   = 2508008;      // the real hotel orphan height
+constexpr uint32_t kHeight   = 2508008;      // the real production orphan height
 constexpr uint32_t kTime     = 1753000000;
 constexpr uint64_t kSubsidy  = 155000000;
 

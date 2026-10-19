@@ -17,9 +17,10 @@
 //      leaking in, etc.) fails the test.
 //
 //   2. ROUND-TRIP through the REAL chain::ShareVariants dispatch: pack -> RawShare
-//      (type 36) -> dash::load_v36_share -> field equality -> re-pack byte-
+//      (type 36) -> dash::load_share on the private/isolated v36 sharechain
+//      identity (custom --network-id) -> field equality -> re-pack byte-
 //      identical. Proves version-36 dispatch (LoadMethods[36] -> DashV36Share,
-//      DashFormatter::ReadV36/WriteV36) round-trips.
+//      DashFormatter::ReadV36/WriteV36) round-trips through the live ShareType.
 //
 //   3. MERGED fields are INERT and follow the non-merged cross-coin convention:
 //      empty merged_addresses / merged_coinbase_info => a single VarInt(0) byte;
@@ -33,9 +34,11 @@
 
 #include <gtest/gtest.h>
 
-#include <impl/dash/share_chain.hpp>   // DashFormatter, ShareType, V36ShareType, load_share, load_v36_share
+#include <impl/dash/share_chain.hpp>   // DashFormatter, ShareType, load_share
+#include <impl/dash/config_pool.hpp>   // SharechainConfig (private/isolated identity)
 #include <impl/dash/share.hpp>         // dash::DashShare, dash::DashV36Share
 #include <impl/dash/share_types.hpp>   // dash::v36::* shared types, dash::PackedPayment
+#include "dash_v36_share_fixture.hpp"   // make_canonical_v36, to_hex, pack_hex (shared fixture)
 
 #include <sharechain/share.hpp>        // chain::RawShare
 #include <core/netaddress.hpp>
@@ -50,72 +53,6 @@
 #include <vector>
 
 namespace {
-
-std::string to_hex(const std::span<const unsigned char> bytes)
-{
-    static const char* h = "0123456789abcdef";
-    std::string out;
-    out.reserve(bytes.size() * 2);
-    for (unsigned char b : bytes) { out.push_back(h[b >> 4]); out.push_back(h[b & 0xf]); }
-    return out;
-}
-
-std::string pack_hex(const PackStream& ps)
-{
-    auto& m = const_cast<PackStream&>(ps);
-    return to_hex(std::span<const unsigned char>(
-        reinterpret_cast<const unsigned char*>(m.data()), m.size()));
-}
-
-// A canonical, fully-populated DASH v36 share. Distinctive scalar values so a
-// misordered/misencoded field is visible; merged fields left EMPTY (DASH is
-// standalone X11 — no AuxPoW child), DASH suffix populated.
-dash::DashV36Share make_canonical_v36()
-{
-    dash::DashV36Share s;
-    s.m_min_header.m_version = 2;
-    s.m_min_header.m_previous_block.SetHex(
-        "00000000000000000000000000000000000000000000000000000000000000aa");
-    s.m_min_header.m_timestamp = 0x11223344;
-    s.m_min_header.m_bits = 0x1e0ffff0;
-    s.m_min_header.m_nonce = 0x55667788;
-
-    s.m_prev_hash.SetHex(
-        "0000000000000000000000000000000000000000000000000000000000000001");
-    s.m_coinbase = BaseScript(std::vector<unsigned char>{0xab, 0xcd});
-    s.m_nonce = 0x0a0b0c0d;
-    s.m_pubkey_hash.SetHex("00000000000000000000000000000000deadbeef");
-    s.m_pubkey_type = 0;                 // DASH always P2PKH
-    s.m_subsidy = 5000000000ULL;         // > 2^32 => 9-byte VarInt
-    s.m_donation = 0x1234;
-    s.m_stale_info = dash::StaleInfo::none;
-    s.m_desired_version = 36;            // the version-vote
-
-    // merged_addresses: EMPTY (inert)
-    s.m_far_share_hash.SetHex(
-        "0000000000000000000000000000000000000000000000000000000000000002");
-    s.m_max_bits = 0x1e0fffff;
-    s.m_bits = 0x1d00ffff;
-    s.m_timestamp = 0x99aabbcc;
-    s.m_absheight = 0x00010203;
-    s.m_abswork = uint128(0x0102030405060708ULL);
-
-    // merged_coinbase_info: EMPTY (inert); merged_payout_hash: zero (inert)
-    s.m_last_txout_nonce = 0xdeadbeefcafef00dULL;
-    s.m_hash_link.m_state.m_data.assign(32, 0x00);
-    for (int i = 0; i < 32; ++i) s.m_hash_link.m_state.m_data[i] = static_cast<unsigned char>(i);
-    s.m_hash_link.m_extra_data = BaseScript(std::vector<unsigned char>{0xaa, 0xbb, 0xcc});
-    s.m_hash_link.m_length = 128;
-    // ref_merkle_link / merkle_link: empty branches
-    // message_data: EMPTY (Phase A — messaging is Phase B)
-
-    // ── DASH suffix ──
-    s.m_coinbase_payload = BaseScript(std::vector<unsigned char>{0x01, 0x02});
-    s.m_payment_amount = 0x00000000abcdef01ULL;
-    s.m_packed_payments.push_back(dash::PackedPayment{"!6a0401020304", 12345});
-    s.m_coinbase_payload_outer = BaseScript(std::vector<unsigned char>{0x02, 0x01, 0x02});
-    return s;
-}
 
 // Independently rebuild the STANDARDIZED prefix (min_header .. message_data) in
 // the BCH v36 Formatter field order, using the same core primitives. This is the
@@ -222,45 +159,54 @@ TEST(DashV36ShareRoundTrip, ThroughVersion36Dispatch)
     auto s = make_canonical_v36();
     PackStream wire = pack_v36(s);
 
-    // Wrap as a RawShare(type=36) and load via the real ShareVariants dispatch.
+    // Wrap as a RawShare(type=36) and load via the real ShareVariants dispatch
+    // of the live load_share, on the private/isolated v36 sharechain identity
+    // (the only profile that loads wire type 36).
+    struct IdentityReset {
+        IdentityReset()  { dash::SharechainConfig::reset_network_id(); }
+        ~IdentityReset() { dash::SharechainConfig::reset_network_id(); }
+    } identity_reset;
+    dash::SharechainConfig::set_network_id("d3a5c0920263617", "0badc0ffee11");
     chain::RawShare rshare(uint64_t{36}, wire);
     ASSERT_EQ(rshare.type, 36u);
-    auto loaded = dash::load_v36_share(rshare, NetService{"test", 0});
+    auto loaded = dash::load_share(rshare, NetService{"test", 0});
 
     loaded.invoke([&](auto* obj) {
         using T = std::remove_pointer_t<decltype(obj)>;
-        static_assert(std::is_same_v<T, dash::DashV36Share>,
-                      "type-36 wire must dispatch to DashV36Share");
-        EXPECT_EQ(obj->m_min_header.m_version, s.m_min_header.m_version);
-        EXPECT_EQ(obj->m_min_header.m_bits, s.m_min_header.m_bits);
-        EXPECT_EQ(obj->m_prev_hash, s.m_prev_hash);
-        EXPECT_EQ(obj->m_coinbase.m_data, s.m_coinbase.m_data);
-        EXPECT_EQ(obj->m_nonce, s.m_nonce);
-        EXPECT_EQ(obj->m_pubkey_hash, s.m_pubkey_hash);
-        EXPECT_EQ(obj->m_pubkey_type, s.m_pubkey_type);
-        EXPECT_EQ(obj->m_subsidy, s.m_subsidy);
-        EXPECT_EQ(obj->m_donation, s.m_donation);
-        EXPECT_EQ(obj->m_desired_version, s.m_desired_version);
-        EXPECT_EQ(obj->m_far_share_hash, s.m_far_share_hash);
-        EXPECT_EQ(obj->m_max_bits, s.m_max_bits);
-        EXPECT_EQ(obj->m_bits, s.m_bits);
-        EXPECT_EQ(obj->m_timestamp, s.m_timestamp);
-        EXPECT_EQ(obj->m_absheight, s.m_absheight);
-        EXPECT_EQ(obj->m_abswork.GetLow64(), s.m_abswork.GetLow64());
-        EXPECT_TRUE(obj->m_merged_addresses.empty());
-        EXPECT_TRUE(obj->m_merged_coinbase_info.empty());
-        EXPECT_EQ(obj->m_merged_payout_hash, s.m_merged_payout_hash);
-        EXPECT_EQ(obj->m_last_txout_nonce, s.m_last_txout_nonce);
-        EXPECT_EQ(obj->m_hash_link.m_state.m_data, s.m_hash_link.m_state.m_data);
-        EXPECT_EQ(obj->m_hash_link.m_extra_data.m_data, s.m_hash_link.m_extra_data.m_data);
-        EXPECT_EQ(obj->m_hash_link.m_length, s.m_hash_link.m_length);
-        // DASH suffix
-        EXPECT_EQ(obj->m_coinbase_payload.m_data, s.m_coinbase_payload.m_data);
-        EXPECT_EQ(obj->m_payment_amount, s.m_payment_amount);
-        ASSERT_EQ(obj->m_packed_payments.size(), s.m_packed_payments.size());
-        EXPECT_EQ(obj->m_packed_payments[0].m_payee, s.m_packed_payments[0].m_payee);
-        EXPECT_EQ(obj->m_packed_payments[0].m_amount, s.m_packed_payments[0].m_amount);
-        EXPECT_EQ(obj->m_coinbase_payload_outer.m_data, s.m_coinbase_payload_outer.m_data);
+        if constexpr (!std::is_same_v<T, dash::DashV36Share>) {
+            ADD_FAILURE() << "type-36 wire must dispatch to DashV36Share";
+        } else {
+            EXPECT_EQ(obj->m_min_header.m_version, s.m_min_header.m_version);
+            EXPECT_EQ(obj->m_min_header.m_bits, s.m_min_header.m_bits);
+            EXPECT_EQ(obj->m_prev_hash, s.m_prev_hash);
+            EXPECT_EQ(obj->m_coinbase.m_data, s.m_coinbase.m_data);
+            EXPECT_EQ(obj->m_nonce, s.m_nonce);
+            EXPECT_EQ(obj->m_pubkey_hash, s.m_pubkey_hash);
+            EXPECT_EQ(obj->m_pubkey_type, s.m_pubkey_type);
+            EXPECT_EQ(obj->m_subsidy, s.m_subsidy);
+            EXPECT_EQ(obj->m_donation, s.m_donation);
+            EXPECT_EQ(obj->m_desired_version, s.m_desired_version);
+            EXPECT_EQ(obj->m_far_share_hash, s.m_far_share_hash);
+            EXPECT_EQ(obj->m_max_bits, s.m_max_bits);
+            EXPECT_EQ(obj->m_bits, s.m_bits);
+            EXPECT_EQ(obj->m_timestamp, s.m_timestamp);
+            EXPECT_EQ(obj->m_absheight, s.m_absheight);
+            EXPECT_EQ(obj->m_abswork.GetLow64(), s.m_abswork.GetLow64());
+            EXPECT_TRUE(obj->m_merged_addresses.empty());
+            EXPECT_TRUE(obj->m_merged_coinbase_info.empty());
+            EXPECT_EQ(obj->m_merged_payout_hash, s.m_merged_payout_hash);
+            EXPECT_EQ(obj->m_last_txout_nonce, s.m_last_txout_nonce);
+            EXPECT_EQ(obj->m_hash_link.m_state.m_data, s.m_hash_link.m_state.m_data);
+            EXPECT_EQ(obj->m_hash_link.m_extra_data.m_data, s.m_hash_link.m_extra_data.m_data);
+            EXPECT_EQ(obj->m_hash_link.m_length, s.m_hash_link.m_length);
+            // DASH suffix
+            EXPECT_EQ(obj->m_coinbase_payload.m_data, s.m_coinbase_payload.m_data);
+            EXPECT_EQ(obj->m_payment_amount, s.m_payment_amount);
+            ASSERT_EQ(obj->m_packed_payments.size(), s.m_packed_payments.size());
+            EXPECT_EQ(obj->m_packed_payments[0].m_payee, s.m_packed_payments[0].m_payee);
+            EXPECT_EQ(obj->m_packed_payments[0].m_amount, s.m_packed_payments[0].m_amount);
+            EXPECT_EQ(obj->m_coinbase_payload_outer.m_data, s.m_coinbase_payload_outer.m_data);
+        }
     });
 
     // Re-serialize the loaded share: must be byte-identical to the original wire.

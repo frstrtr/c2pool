@@ -44,6 +44,10 @@ public:
     std::map<std::string, BlockEntry> served_blocks;
     bool                              accept_own_block = true;
     std::string                       reject_reason = "fake rejects";
+    // tx id / key image -> the height it was mined / spent at, for probe_mined().
+    std::map<std::string, std::uint64_t> mined;
+    std::map<std::string, std::uint64_t> spent;
+    mutable std::uint64_t             probe_calls = 0;
 
     // --- recorded inbound calls ---------------------------------------------
     struct SyncDataCall  { PeerRef peer; PeerSyncData data; };
@@ -127,6 +131,28 @@ public:
 
     SyncState sync_state() const override { return state; }
 
+    // Template / own-block hygiene oracle: answers from the canned `mined` and
+    // `spent` maps (id -> height mined at), bounded to the chain ending at
+    // `parent_id`, exactly like the real index.
+    bool probe_mined(const Hash& parent_id, const std::vector<Hash>& tx_ids,
+                     const std::vector<Hash>& key_images, std::vector<Hash>& mined_out,
+                     std::vector<Hash>& spent_out) const override {
+        ++probe_calls;
+        mined_out.clear();
+        spent_out.clear();
+        const auto ph = height_of(parent_id);
+        if (!ph) return false;
+        for (const Hash& id : tx_ids) {
+            const auto it = mined.find(key_of(id));
+            if (it != mined.end() && it->second <= *ph) mined_out.push_back(id);
+        }
+        for (const Hash& ki : key_images) {
+            const auto it = spent.find(key_of(ki));
+            if (it != spent.end() && it->second <= *ph) spent_out.push_back(ki);
+        }
+        return true;
+    }
+
     // --- IChainServing -------------------------------------------------------
     PeerSyncData our_sync_data() const override {
         PeerSyncData d;
@@ -183,6 +209,9 @@ public:
     std::size_t tx_sink_count() const { return tx_sinks_.size(); }
 
     void serve(const Hash& id, BlockEntry e) { served_blocks[key_of(id)] = std::move(e); }
+
+    void mark_mined(const Hash& id, std::uint64_t h) { mined[key_of(id)] = h; }
+    void mark_spent(const Hash& ki, std::uint64_t h) { spent[key_of(ki)] = h; }
 
     static std::string key_of(const Hash& h) {
         return std::string(reinterpret_cast<const char*>(h.data()), h.size());

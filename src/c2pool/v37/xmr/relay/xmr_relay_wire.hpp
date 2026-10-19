@@ -6,70 +6,37 @@
 // version. See COPYING in the repository root.
 //
 // ===========================================================================
-// src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp   (GAP-2 stage 1)
+// src/c2pool/v37/xmr/relay/xmr_relay_wire.hpp
 //
-// The Family-B (Monero / RandomX) c2pool-to-c2pool RECEIPT RELAY wire: the
-// frames that replace the --credit-feed file and the --wire-in/--wire-out
-// directory drop of main_v37_xmr.cpp with real TCP P2P
-// (docs/xmr-lane/gap2-sharechain-relay-design.md §3).
+// The kept Family-B relay frames of the Path B relay node (on the carrier_net.hpp
+// CarrierPeerNode framing [u32 LE len][frame]; the first byte is the opcode):
 //
-// Transport = carrier_net.hpp CarrierPeerNode framing [u32 LE len][frame]. The
-// FIRST BYTE of a frame selects the codec:
+//     0x43 FB_GETCTX     ask for Monero blocks by id (u8 n <= 8 ids)
+//     0x44 FB_CTX        one Monero block blob (at most the caller's cap, P-13) or none
+//     0x48 FB_PING       keepalive probe (u64 nonce)
+//     0x49 FB_PONG       its echo (same nonce)
+//     0x4a / 0x4b        reserved for LANE-EPOCH
+//     0x4c FB_GETADDR    ask for relay addresses of this pool
+//     0x4d FB_ADDR       the answer: <= 256 x (family, ip, port, last_seen)
 //
-//     0x01..0x3f   Family-A CarrierWire versions (0x01/0x02 live) -> counted, ignored
-//     0x40..0x4f   ★ Family-B relay (this file; claimed range, KAT-pinned)
-//         0x40 FB_HELLO      the pool/consensus-id gate, first frame both ways
-//         0x41 FB_RECEIPTS   1..8 PoW-carrying receipts (flood / re-offer)
-//         0x42 FB_BLOCK_WON  the block-winner cut descriptor (fast path A)
-//     0x80..0x83   carrier_supply.hpp GETORDER/ORDER/GETFRAMES/FRAMES (reused)
-//
-// Every integer is little-endian, every decoder is TOTAL and BOUNDED (a bad
-// frame is reported, never thrown past this header, never allocates more than
-// its bound), and the receipt body reuses the ratified MoneroReceipt codec
-// (impl/xmr/wire/xmr_carrier_wire.hpp encode_receipt/decode_receipt) verbatim.
-//
-// THE RECEIPT ON THE WIRE (fb_receipt), and what makes it re-verifiable:
-//
-//   u16 len ; len bytes = encode_receipt(MoneroReceipt)
-//       hashing_blob (the exact RandomX input, nonce included) + the coinbase
-//       OPENING (Keccak midstate + tail + tx_extra in the clear) + the leaf-0
-//       tree branch + info_digest. A receiver resumes the midstate, forms the
-//       coinbase tx hash, walks the branch and requires the root it gets to be
-//       the tree_root INSIDE the RandomX-hashed blob; then RandomX(blob) must
-//       meet the lane's share difficulty. A forged or altered blob/coinbase
-//       fails one of those two checks.
-//   side_data_v2 (56 B) = t_origin.lo u64 | t_origin.hi u64 | identity b32 |
-//       chain_id u32 | give_author u16 | reserved u16
-//   payee ref (66 B)    = u8 kind (0x10 XMR_STD | 0x11 XMR_SUB) | u8 len=64 | 64 B
-//
-//   info_digest == side_digest_v2(side) (self-consistency), identity ==
-//   xmr_identity_key(payee). The PoW BINDING of side_data_v2 (payee, give-
-//   author) is rbind_v1(chain_id, side) inside the coinbase 0x02 region
-//   [extra_nonce 4 | rbind 32] -- SEAM-1 (template/coinbase bytes, operator's
-//   hand). BindMode::Rbind enforces it; BindMode::None (the only mode a
-//   pre-SEAM-1 template can serve) relays PoW-verified receipts whose payee is
-//   carried, dedup-keyed on the blob, but NOT PoW-bound. HELLO pins the mode so
-//   two nodes can never disagree on it silently.
-//
-// This header defines NO consensus digest and includes nothing from
-// src/sharechain/v37 beyond the descriptor / lane-param TYPES it reads.
+// Path B's own frames (HELLO 0x40, FB_RECEIPTS 0x41, family C 0x50-0x55) are in
+// impl/xmr/pathb/pathb_relay_wire.hpp. Every integer is little-endian; every
+// decoder is total and bounded.
 // ===========================================================================
 #pragma once
+
+#include <arpa/inet.h>   // inet_pton / inet_ntop
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <optional>
 #include <string>
 #include <vector>
 
 #include <sharechain/v37/v37_hash.hpp>             // ::v37::bytes32
-#include <sharechain/v37/v37_descriptor_xmr.hpp>   // ScriptRef, XMR_STD/XMR_SUB, xmr_identity_key
-#include <sharechain/v37/v37_lane.hpp>             // ::v37::LaneParams (read-only, for the HELLO digest)
-
-#include "impl/xmr/receipt/xmr_receipt.hpp"        // ::v37::xmr::MoneroReceipt
-#include "impl/xmr/wire/xmr_carrier_wire.hpp"      // encode_receipt / decode_receipt (the ratified codec)
 #include "impl/xmr/coin/xmr_keccak_midstate.hpp"   // ::xmr::coin::keccak256
 
 namespace c2pool::v37n::xmr::relay {
@@ -80,41 +47,17 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using bytes32 = ::v37::bytes32;
 
-// ── the first-byte namespace ────────────────────────────────────────────────
-inline constexpr u8  FB_NS_FIRST  = 0x40;
-inline constexpr u8  FB_NS_LAST   = 0x4f;
-inline constexpr u8  FB_HELLO     = 0x40;
-inline constexpr u8  FB_RECEIPTS  = 0x41;
-inline constexpr u8  FB_BLOCK_WON = 0x42;
+inline constexpr u8  FB_GETCTX    = 0x43;
+inline constexpr u8  FB_CTX       = 0x44;
+inline constexpr u8  FB_PING      = 0x48;
+inline constexpr u8  FB_PONG      = 0x49;
+// 0x4a / 0x4b are reserved for LANE-EPOCH: never reuse them here.
+inline constexpr u8  FB_GETADDR   = 0x4c;
+inline constexpr u8  FB_ADDR      = 0x4d;
 inline constexpr u8  kFbVersion   = 0x01;
-inline constexpr u32 kFbMagic     = 0x52583243u;   // bytes 'C','2','X','R' little-endian
 
-inline constexpr bool is_family_b_opcode(u8 b) { return b >= FB_NS_FIRST && b <= FB_NS_LAST; }
-
-// ── bounds ──────────────────────────────────────────────────────────────────
-// SEAM-2: the digest-committed per-receipt budget for the XMR lane is 768 B
-// (v37::xmr::budget::PER_RECEIPT_BUDGET). A settlement coinbase that carries the
-// 44-byte credit-cut tail (and, after SEAM-1, the 32-byte rbind) opens to a
-// larger tx_extra than the 768 figure was sized for, so the relay decodes
-// against 1024 B. Raising the committed value is the operator's ruling; until
-// then this relay-local bound is what an honest maximal receipt needs.
-inline constexpr std::size_t kFbReceiptBudget       = 1024;
-inline constexpr std::size_t kFbMaxReceiptsPerFrame = 8;
-inline constexpr std::size_t kSideV2Bytes           = 56;
-inline constexpr std::size_t kPayeeBytes            = 66;   // kind + len + 64
-inline constexpr std::size_t kFbReceiptMaxBytes     = 2 + kFbReceiptBudget + kSideV2Bytes + kPayeeBytes;
-inline constexpr std::size_t kFbReceiptsHeader      = 1 + 1 + 4 + 1;
-inline constexpr std::size_t kFbMaxFrame            = kFbReceiptsHeader + kFbMaxReceiptsPerFrame * kFbReceiptMaxBytes;
-inline constexpr std::size_t kHelloBytes            = 1 + 1 + 4 + 1 + 4 + 32 + 8 + 8 + 2 + 8 + 32 + 1;   // 102
-inline constexpr std::size_t kBlockWonBytes         = 1 + 1 + 4 + 32 + 8 + 8 + 32 + 8 + 1 + 32;       // 127
-
-// The work one receipt contributes to the lane (LaneRecord::push w). Every
-// receipt is admitted at EXACTLY the lane share difficulty (R-1, HELLO-pinned),
-// so one receipt = one unit -- the same "idx 1" the credit-feed stand-in wrote.
-inline constexpr u64 kReceiptWeight = 1;
-
-enum class BindMode : u8 { None = 0, Rbind = 1 };
-inline const char* to_string(BindMode m) { return m == BindMode::Rbind ? "rbind" : "none"; }
+inline constexpr std::size_t kCtxMaxIds             = 8;                 // ids per FB_GETCTX
+inline constexpr std::size_t kCtxHeader             = 1 + 1 + 4 + 32 + 4; // op ver chain id len
 
 // ── little-endian helpers ───────────────────────────────────────────────────
 namespace le {
@@ -133,300 +76,187 @@ inline bytes32 keccak_bytes(const std::vector<u8>& v) {
     bytes32 out; std::memcpy(out.data(), h.data(), 32); return out;
 }
 
-// ── side_data_v2 ────────────────────────────────────────────────────────────
-struct SideDataV2 {
-    u64     t_lo = 0, t_hi = 0;      // T_origin (R-1: == the lane share difficulty)
-    bytes32 identity{};              // xmr_identity_key(payee)
-    u32     chain_id = 0;            // lane ChainId
-    u16     give_author = 0;         // PR c2pool#1710's receipt-carried donation u16 (SEAM-3)
-    u16     reserved = 0;            // must be 0
-
-    std::vector<u8> bytes() const {
-        std::vector<u8> b; b.reserve(kSideV2Bytes);
-        le::put64(b, t_lo); le::put64(b, t_hi); le::putb(b, identity);
-        le::put32(b, chain_id); le::put16(b, give_author); le::put16(b, reserved);
-        return b;
-    }
-    static SideDataV2 from(const u8* p) {
-        SideDataV2 s;
-        s.t_lo = le::get64(p); s.t_hi = le::get64(p + 8); s.identity = le::getb(p + 16);
-        s.chain_id = le::get32(p + 48); s.give_author = le::get16(p + 52); s.reserved = le::get16(p + 54);
-        return s;
-    }
-    bool operator==(const SideDataV2&) const = default;
-};
-
-inline constexpr char kSideV2Domain[] = "c2pool-v37-xmr-side-v2";
-inline constexpr char kRbindDomain[]  = "c2pool-v37-xmr-rbind-v1";
-inline constexpr char kLaneParamsDomain[] = "c2pool-v37-xmr-lane-params-v1";
-
-// info_digest of a v2 receipt = keccak256(domain || side_data_v2 bytes).
-inline bytes32 side_digest_v2(const SideDataV2& s) {
-    std::vector<u8> b(kSideV2Domain, kSideV2Domain + sizeof(kSideV2Domain) - 1);
-    const auto sb = s.bytes(); b.insert(b.end(), sb.begin(), sb.end());
-    return keccak_bytes(b);
+// ── FB_GETCTX (0x43) / FB_CTX (0x44) ───────────────────────────────────────
+//   GETCTX : u8 0x43 ; u8 ver ; u32 chain_id ; u8 n (1..8) ; n x id(32)
+//   CTX    : u8 0x44 ; u8 ver ; u32 chain_id ; id(32) ; u32 len (<= the caller's cap, P-13) ; blob
+inline std::vector<u8> encode_getctx(u32 chain_id, const std::vector<bytes32>& ids) {
+    if (ids.empty() || ids.size() > kCtxMaxIds) return {};
+    std::vector<u8> f; f.reserve(7 + 32 * ids.size());
+    f.push_back(FB_GETCTX); f.push_back(kFbVersion); le::put32(f, chain_id);
+    f.push_back(static_cast<u8>(ids.size()));
+    for (const auto& id : ids) le::putb(f, id);
+    return f;
 }
-
-// SEAM-1 binding value: what the per-worker coinbase 0x02 region carries after
-// the 4-byte extra_nonce once the template writes it.
-inline bytes32 rbind_v1(u32 chain_id, const SideDataV2& s) {
-    std::vector<u8> b(kRbindDomain, kRbindDomain + sizeof(kRbindDomain) - 1);
-    le::put32(b, chain_id);
-    const auto sb = s.bytes(); b.insert(b.end(), sb.begin(), sb.end());
-    return keccak_bytes(b);
-}
-
-// ── the relayed receipt ─────────────────────────────────────────────────────
-struct FbReceipt {
-    ::v37::xmr::MoneroReceipt receipt;
-    SideDataV2                side;
-    ::v37::ScriptRef          payee;
-};
-
-// receipt_id = keccak256(hashing_blob) -- byte-identical to
-// v37::xmr::verify::cheap_receipt_id (KAT-pinned), the admission dedup key.
-inline bytes32 receipt_id_of_blob(const std::vector<u8>& blob) { return keccak_bytes(blob); }
-inline bytes32 receipt_id(const FbReceipt& r) { return receipt_id_of_blob(r.receipt.hashing_blob.bytes); }
-
-// Encode one fb_receipt. Empty on an unencodable input (never throws).
-inline std::vector<u8> encode_fb_receipt(const FbReceipt& r) {
-    std::vector<u8> body;
-    try {
-        ::v37::xmr::wire::Writer w;
-        ::v37::xmr::wire::encode_receipt(w, r.receipt);
-        body = std::move(w.out);
-    } catch (...) { return {}; }
-    if (body.empty() || body.size() > kFbReceiptBudget) return {};
-    if (!::v37::xmr::is_xmr_kind(r.payee.kind) || r.payee.payload.size() != 64) return {};
-    std::vector<u8> out; out.reserve(2 + body.size() + kSideV2Bytes + kPayeeBytes);
-    le::put16(out, static_cast<u16>(body.size()));
-    out.insert(out.end(), body.begin(), body.end());
-    const auto sb = r.side.bytes(); out.insert(out.end(), sb.begin(), sb.end());
-    out.push_back(static_cast<u8>(r.payee.kind));
-    out.push_back(64);
-    out.insert(out.end(), r.payee.payload.begin(), r.payee.payload.end());
-    return out;
-}
-
-// Decode one fb_receipt starting at p (n bytes available). `used` = bytes
-// consumed. Total: false + why on ANY malformation, never throws.
-inline bool decode_fb_receipt(const u8* p, std::size_t n, std::size_t& used, FbReceipt& out,
-                              std::string* why = nullptr) {
+inline bool decode_getctx(const std::vector<u8>& f, u32& chain_id, std::vector<bytes32>& ids, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (n < 2) return bad("fb_receipt: short (len)");
-    const std::size_t len = le::get16(p);
-    if (len == 0 || len > kFbReceiptBudget) return bad("fb_receipt: receipt len over the relay budget");
-    if (n < 2 + len + kSideV2Bytes + kPayeeBytes) return bad("fb_receipt: short (body/side/payee)");
-    try {
-        ::v37::xmr::wire::Reader rd(p + 2, len);
-        out.receipt = ::v37::xmr::wire::decode_receipt(rd, kFbReceiptBudget);
-        if (!rd.eof()) return bad("fb_receipt: trailing bytes inside the receipt body");
-    } catch (const std::exception& e) {
-        if (why) *why = std::string("fb_receipt: ") + e.what();
-        return false;
-    }
-    const u8* q = p + 2 + len;
-    out.side = SideDataV2::from(q);
-    q += kSideV2Bytes;
-    const u8 kind = q[0], plen = q[1];
-    if (!::v37::xmr::is_xmr_kind(static_cast<::v37::ScriptKind>(kind))) return bad("fb_receipt: payee kind is not XMR_STD/XMR_SUB");
-    if (plen != 64) return bad("fb_receipt: payee payload length != 64");
-    out.payee.kind = static_cast<::v37::ScriptKind>(kind);
-    out.payee.payload.assign(q + 2, q + 2 + 64);
-    used = 2 + len + kSideV2Bytes + kPayeeBytes;
-    return true;
-}
-inline bool decode_fb_receipt(const std::vector<u8>& b, FbReceipt& out, std::string* why = nullptr) {
-    std::size_t used = 0;
-    if (!decode_fb_receipt(b.data(), b.size(), used, out, why)) return false;
-    if (used != b.size()) { if (why) *why = "fb_receipt: trailing bytes"; return false; }
-    return true;
-}
-
-// ── FB_RECEIPTS (0x41) ──────────────────────────────────────────────────────
-// u8 0x41 ; u8 ver ; u32 chain_id ; u8 n (1..8) ; n x fb_receipt
-// Built from already-ENCODED fb_receipt bytes (the vault stores exactly those,
-// so a flood, a re-offer and a GETFRAMES serve are the same bytes).
-inline std::vector<u8> encode_receipts_frame(u32 chain_id, const std::vector<const std::vector<u8>*>& encoded) {
-    if (encoded.empty() || encoded.size() > kFbMaxReceiptsPerFrame) return {};
-    std::vector<u8> f; f.reserve(kFbReceiptsHeader + encoded.size() * 800);
-    f.push_back(FB_RECEIPTS); f.push_back(kFbVersion); le::put32(f, chain_id);
-    f.push_back(static_cast<u8>(encoded.size()));
-    for (const auto* e : encoded) { if (!e || e->empty()) return {}; f.insert(f.end(), e->begin(), e->end()); }
-    return f.size() <= kFbMaxFrame ? f : std::vector<u8>{};
-}
-
-struct ReceiptsFrame {
-    u32 chain_id = 0;
-    std::vector<FbReceipt>       receipts;
-    std::vector<std::vector<u8>> raw;       // each receipt's exact fb_receipt bytes
-};
-
-inline bool decode_receipts_frame(const std::vector<u8>& f, ReceiptsFrame& out, std::string* why = nullptr) {
-    auto bad = [&](const std::string& m) { if (why) *why = m; return false; };
-    if (f.size() > kFbMaxFrame) return bad("receipts: frame over kFbMaxFrame");
-    if (f.size() < kFbReceiptsHeader) return bad("receipts: short header");
-    if (f[0] != FB_RECEIPTS) return bad("receipts: wrong opcode");
-    if (f[1] != kFbVersion) return bad("receipts: unknown version");
-    out.chain_id = le::get32(f.data() + 2);
+    if (f.size() < 7) return bad("getctx: short");
+    if (f[0] != FB_GETCTX) return bad("getctx: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getctx: unknown version");
+    chain_id = le::get32(f.data() + 2);
     const std::size_t n = f[6];
-    if (n == 0 || n > kFbMaxReceiptsPerFrame) return bad("receipts: n out of range (1..8)");
-    out.receipts.clear(); out.raw.clear();
-    std::size_t off = kFbReceiptsHeader;
-    for (std::size_t i = 0; i < n; ++i) {
-        FbReceipt r; std::size_t used = 0; std::string w;
-        if (!decode_fb_receipt(f.data() + off, f.size() - off, used, r, &w))
-            return bad("receipts[" + std::to_string(i) + "]: " + w);
-        out.raw.emplace_back(f.begin() + static_cast<std::ptrdiff_t>(off),
-                             f.begin() + static_cast<std::ptrdiff_t>(off + used));
-        out.receipts.push_back(std::move(r));
-        off += used;
-    }
-    if (off != f.size()) return bad("receipts: trailing bytes after the last receipt");
+    if (n == 0 || n > kCtxMaxIds) return bad("getctx: n out of range (1..8)");
+    if (f.size() != 7 + 32 * n) return bad("getctx: wrong length");
+    ids.clear();
+    for (std::size_t i = 0; i < n; ++i) ids.push_back(le::getb(f.data() + 7 + 32 * i));
     return true;
 }
-
-// ── FB_HELLO (0x40) ─────────────────────────────────────────────────────────
-struct Hello {
-    u8      network = 0;              // 0 mainnet 1 testnet 2 stagenet 3 regtest
-    u32     chain_id = 0;
-    bytes32 lane_params_digest{};
-    u64     share_diff = 0;
-    u64     node_nonce = 0;           // per process; self-connect detection
-    u16     listen_port = 0;          // 0 = dial-only
-    u64     lane_next_pos = 0;        // our lane tip (diagnostic + backfill hint)
-    bytes32 lane_digest{};            // LaneSnapshot digest at that tip (diagnostic)
-    BindMode bind = BindMode::None;
-    bool operator==(const Hello&) const = default;
-};
-
-inline std::vector<u8> encode_hello(const Hello& h) {
-    std::vector<u8> f; f.reserve(kHelloBytes);
-    f.push_back(FB_HELLO); f.push_back(kFbVersion); le::put32(f, kFbMagic);
-    f.push_back(h.network); le::put32(f, h.chain_id); le::putb(f, h.lane_params_digest);
-    le::put64(f, h.share_diff); le::put64(f, h.node_nonce); le::put16(f, h.listen_port);
-    le::put64(f, h.lane_next_pos); le::putb(f, h.lane_digest); f.push_back(static_cast<u8>(h.bind));
+// cap: the blob cap (P-13: blob_cap_ctx(hf, Z), the caller's).
+inline std::vector<u8> encode_ctx(u32 chain_id, const bytes32& id, const std::vector<u8>& blob, std::size_t cap) {
+    if (blob.size() > cap || blob.size() > UINT32_MAX) return {};
+    std::vector<u8> f; f.reserve(kCtxHeader + blob.size());
+    f.push_back(FB_CTX); f.push_back(kFbVersion); le::put32(f, chain_id); le::putb(f, id);
+    le::put32(f, static_cast<u32>(blob.size()));
+    f.insert(f.end(), blob.begin(), blob.end());
     return f;
 }
-
-inline bool decode_hello(const std::vector<u8>& f, Hello& h, std::string* why = nullptr) {
+inline bool decode_ctx(const std::vector<u8>& f, u32& chain_id, bytes32& id, std::vector<u8>& blob, std::size_t cap,
+                       std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kHelloBytes) return bad("hello: wrong length");
-    if (f[0] != FB_HELLO) return bad("hello: wrong opcode");
-    if (f[1] != kFbVersion) return bad("hello: unknown version");
-    if (le::get32(f.data() + 2) != kFbMagic) return bad("hello: bad magic (not a c2pool XMR relay)");
-    const u8* p = f.data() + 6;
-    h.network = p[0]; p += 1;
-    h.chain_id = le::get32(p); p += 4;
-    h.lane_params_digest = le::getb(p); p += 32;
-    h.share_diff = le::get64(p); p += 8;
-    h.node_nonce = le::get64(p); p += 8;
-    h.listen_port = le::get16(p); p += 2;
-    h.lane_next_pos = le::get64(p); p += 8;
-    h.lane_digest = le::getb(p); p += 32;
-    if (p[0] > static_cast<u8>(BindMode::Rbind)) return bad("hello: unknown bind mode");
-    h.bind = static_cast<BindMode>(p[0]);
+    if (f.size() < kCtxHeader) return bad("ctx: short");
+    if (f[0] != FB_CTX) return bad("ctx: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ctx: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    id = le::getb(f.data() + 6);
+    const std::size_t len = le::get32(f.data() + 38);
+    if (len > cap) return bad("ctx: blob over the cap");
+    if (f.size() != kCtxHeader + len) return bad("ctx: wrong length");
+    blob.assign(f.begin() + static_cast<std::ptrdiff_t>(kCtxHeader), f.end());
     return true;
 }
 
-// Why a peer's HELLO does not match ours ("" = compatible). The fields are the
-// ones that decide whether two nodes can fold the same lane: a mismatch is an
-// EXPLICIT refusal with a reason, never a silent divergence (the memory-recorded
-// "mismatched-LaneParams nodes must reject explicitly" gap).
-inline std::string hello_mismatch(const Hello& ours, const Hello& theirs) {
-    if (theirs.network != ours.network)   return "network " + std::to_string(theirs.network) + " != ours " + std::to_string(ours.network);
-    if (theirs.chain_id != ours.chain_id) return "lane chain_id " + std::to_string(theirs.chain_id) + " != ours " + std::to_string(ours.chain_id);
-    if (theirs.share_diff != ours.share_diff)
-        return "share_diff " + std::to_string(theirs.share_diff) + " != ours " + std::to_string(ours.share_diff) + " (R-1 pin)";
-    if (theirs.bind != ours.bind) return std::string("bind mode ") + to_string(theirs.bind) + " != ours " + to_string(ours.bind);
-    if (theirs.lane_params_digest != ours.lane_params_digest) return "lane_params_digest differs (different LaneParams geometry/gates)";
-    if (theirs.node_nonce == ours.node_nonce) return "self-connection (node_nonce equal)";
-    return "";
-}
-
-// ── FB_BLOCK_WON (0x42) ─────────────────────────────────────────────────────
-// The frozen v0x02 CutDescriptor field list (w3_relay.hpp), flat.
-struct BlockWon {
-    u32     chain_id = 0;
-    bytes32 bid{};
-    u64     h_b = 0;
-    u64     cut_next_pos = 0;
-    bytes32 cut_spine_digest{};
-    u64     reward = 0;
-    bool    payout_emitted = false;
-    bytes32 owed_digest_at_win{};
-    bool operator==(const BlockWon&) const = default;
-};
-
-inline std::vector<u8> encode_block_won(const BlockWon& b) {
-    std::vector<u8> f; f.reserve(kBlockWonBytes);
-    f.push_back(FB_BLOCK_WON); f.push_back(kFbVersion); le::put32(f, b.chain_id);
-    le::putb(f, b.bid); le::put64(f, b.h_b); le::put64(f, b.cut_next_pos); le::putb(f, b.cut_spine_digest);
-    le::put64(f, b.reward); f.push_back(b.payout_emitted ? 1 : 0); le::putb(f, b.owed_digest_at_win);
+// ── FB_PING (0x48) / FB_PONG (0x49): keepalive ──────────────────────────────
+//   PING : u8 0x48 ; u8 ver ; u64 nonce      (10 B)
+//   PONG : u8 0x49 ; u8 ver ; u64 nonce      (10 B, the PING nonce echoed)
+inline constexpr std::size_t kPingBytes = 1 + 1 + 8;
+inline std::vector<u8> encode_ping(u8 op, u64 nonce) {
+    if (op != FB_PING && op != FB_PONG) return {};
+    std::vector<u8> f; f.reserve(kPingBytes);
+    f.push_back(op); f.push_back(kFbVersion); le::put64(f, nonce);
     return f;
 }
-
-inline bool decode_block_won(const std::vector<u8>& f, BlockWon& b, std::string* why = nullptr) {
+inline bool decode_ping(const std::vector<u8>& f, u8& op, u64& nonce, std::string* why = nullptr) {
     auto bad = [&](const char* m) { if (why) *why = m; return false; };
-    if (f.size() != kBlockWonBytes) return bad("block_won: wrong length");
-    if (f[0] != FB_BLOCK_WON) return bad("block_won: wrong opcode");
-    if (f[1] != kFbVersion) return bad("block_won: unknown version");
-    const u8* p = f.data() + 2;
-    b.chain_id = le::get32(p); p += 4;
-    b.bid = le::getb(p); p += 32;
-    b.h_b = le::get64(p); p += 8;
-    b.cut_next_pos = le::get64(p); p += 8;
-    b.cut_spine_digest = le::getb(p); p += 32;
-    b.reward = le::get64(p); p += 8;
-    if (p[0] > 1) return bad("block_won: payout_emitted not 0/1");
-    b.payout_emitted = p[0] != 0; p += 1;
-    b.owed_digest_at_win = le::getb(p);
+    if (f.size() != kPingBytes) return bad("ping: wrong length");
+    if (f[0] != FB_PING && f[0] != FB_PONG) return bad("ping: wrong opcode");
+    if (f[1] != kFbVersion) return bad("ping: unknown version");
+    op = f[0];
+    nonce = le::get64(f.data() + 2);
     return true;
 }
 
-// ── SEAM-4: the lane-parameter digest HELLO carries ─────────────────────────
-// A canonical serialization of every LaneParams field that decides the lane
-// digest or the fold (geometry + the four ADD-ONLY gates), the R-1 share
-// difficulty, the bind mode and the per-receipt weight rule. Two nodes whose
-// digests differ would fold different lanes from identical receipts; they now
-// refuse each other at HELLO instead. The field order is pinned by a golden in
-// xmr_relay_wire_kat -- a LaneParams field added later must be appended here.
-inline bytes32 lane_params_digest(const ::v37::LaneParams& p, u64 share_diff, BindMode bind) {
-    std::vector<u8> b(kLaneParamsDomain, kLaneParamsDomain + sizeof(kLaneParamsDomain) - 1);
-    le::put64(b, p.window); le::put64(b, p.c0); le::put64(b, p.rollup);
-    le::put32(b, static_cast<u32>(p.level_caps.size()));
-    for (u64 c : p.level_caps) le::put64(b, c);
-    le::put64(b, p.half_life); le::put64(b, p.journal_depth);
-    // subthreshold (RDWR-OQ2)
-    b.push_back(p.subthreshold.enabled ? 1 : 0);
-    le::put32(b, p.subthreshold.K); le::put32(b, p.subthreshold.mode); le::put32(b, p.subthreshold.version);
-    // mrr
-    le::put64(b, p.mrr.activation_pos); le::put64(b, p.mrr.ckpt_retain);
-    // win
-    le::put64(b, p.win.win_activation_pos); le::put32(b, p.win.win_version);
-    le::put64(b, p.win.coverage_blocks); le::put64(b, p.win.bin_seconds); le::put64(b, p.win.w_min_bins);
-    le::put64(b, p.win.w_default_bins); le::put64(b, p.win.w_max_bins); le::put64(b, p.win.retarget_bins);
-    le::put64(b, p.win.damp_factor); le::put64(b, p.win.burial_depth); le::put64(b, p.win.lambda_levels);
-    // nr
-    le::put64(b, p.nr.nr_activation_pos); le::put32(b, p.nr.nr_version); le::put64(b, p.nr.fold_cap);
-    le::put64(b, p.nr.open_horizon_bins); le::put64(b, p.nr.w_min_bins); le::put64(b, p.nr.w_max_bins);
-    le::put64(b, p.nr.w_default_bins); le::put64(b, p.nr.coverage_blocks); le::put64(b, p.nr.bin_seconds);
-    le::put64(b, p.nr.retarget_bins); le::put64(b, p.nr.ckpt_bins); le::put64(b, p.nr.n_ctx_bins);
-    b.push_back(p.nr.allow_digit_repeat ? 1 : 0);
-    // STEP-0 hotfix: the coinbase no-dust floor (LaneParams::k_floor). Appended
-    // ONLY when non-zero, exactly as the canon lane header's KFL1 block, so the
-    // XMR lane (k_floor 0: Monero has no dust rule, its floor is the absolute
-    // piconero settle_h_min) keeps the pinned golden and HELLO-compatibility
-    // with pre-hotfix peers, while any node that sets a floor is refused here.
-    if (p.k_floor != ::v37::K_FLOOR_NONE) {
-        b.insert(b.end(), {'K', 'F', 'L', '1'});
-        le::put64(b, p.k_floor);
+// ── FB_GETADDR (0x4c) / FB_ADDR (0x4d): relay addresses of this pool ─────────
+//   GETADDR : u8 0x4c ; u8 ver ; u32 chain_id ; u16 want (1..256)          (8 B)
+//   ADDR    : u8 0x4d ; u8 ver ; u32 chain_id ; u16 n (0..256) ; n x entry
+//   entry   : u8 family (4|6) ; ip 16 B (IPv4 = 4 B + 12 zero B) ; u16 port (!= 0) ; u64 last_seen (unix s)
+inline constexpr std::size_t kAddrMaxEntries  = 256;
+inline constexpr std::size_t kGetAddrBytes    = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrHeader      = 1 + 1 + 4 + 2;
+inline constexpr std::size_t kAddrEntryBytes  = 1 + 16 + 2 + 8;
+inline constexpr std::size_t kAddrMaxFrame    = kAddrHeader + kAddrMaxEntries * kAddrEntryBytes;
+inline constexpr u8          kAddrFamV4 = 4, kAddrFamV6 = 6;
+
+struct AddrEntry {
+    u8 family = kAddrFamV4;
+    std::array<u8, 16> ip{};
+    u16 port = 0;
+    u64 last_seen = 0;
+    bool operator==(const AddrEntry&) const = default;
+};
+
+// "a.b.c.d" / IPv6 literal -> entry. false on anything else (no DNS here).
+inline bool addr_entry_of(const std::string& host, u16 port, u64 last_seen, AddrEntry& e) {
+    e = AddrEntry{}; e.port = port; e.last_seen = last_seen;
+    in_addr a4{};
+    if (::inet_pton(AF_INET, host.c_str(), &a4) == 1) { e.family = kAddrFamV4; std::memcpy(e.ip.data(), &a4, 4); return port != 0; }
+    in6_addr a6{};
+    if (::inet_pton(AF_INET6, host.c_str(), &a6) == 1) { e.family = kAddrFamV6; std::memcpy(e.ip.data(), &a6, 16); return port != 0; }
+    return false;
+}
+inline std::string addr_host(const AddrEntry& e) {
+    char b[INET6_ADDRSTRLEN] = {0};
+    if (e.family == kAddrFamV4) ::inet_ntop(AF_INET, e.ip.data(), b, sizeof b);
+    else ::inet_ntop(AF_INET6, e.ip.data(), b, sizeof b);
+    return b;
+}
+// Publicly routable? false for unspecified, loopback, RFC1918, CGNAT, link-local,
+// multicast / reserved (v4) and ::, ::1, fc00::/7, fe80::/10, ff00::/8, v4-mapped
+// private (v6). A private address is never handed to a public peer.
+inline bool addr_routable(const AddrEntry& e) {
+    const u8* p = e.ip.data();
+    auto v4 = [](const u8* q) {
+        if (q[0] == 0 || q[0] == 10 || q[0] == 127 || q[0] >= 224) return false;
+        if (q[0] == 169 && q[1] == 254) return false;
+        if (q[0] == 172 && (q[1] & 0xf0) == 16) return false;
+        if (q[0] == 192 && q[1] == 168) return false;
+        if (q[0] == 100 && (q[1] & 0xc0) == 64) return false;
+        return true;
+    };
+    if (e.family == kAddrFamV4) return v4(p);
+    static const u8 mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::memcmp(p, mapped, 12) == 0) return v4(p + 12);
+    bool zero15 = true;
+    for (int i = 0; i < 15; ++i) zero15 = zero15 && p[i] == 0;
+    if (zero15 && (p[15] == 0 || p[15] == 1)) return false;          // :: and ::1
+    if ((p[0] & 0xfe) == 0xfc) return false;                          // fc00::/7
+    if (p[0] == 0xfe && (p[1] & 0xc0) == 0x80) return false;          // fe80::/10
+    if (p[0] == 0xff) return false;                                   // multicast
+    return true;
+}
+
+inline std::vector<u8> encode_getaddr(u32 chain_id, u16 want) {
+    if (want == 0 || want > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kGetAddrBytes);
+    f.push_back(FB_GETADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, want);
+    return f;
+}
+inline bool decode_getaddr(const std::vector<u8>& f, u32& chain_id, u16& want, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    if (f.size() != kGetAddrBytes) return bad("getaddr: wrong length");
+    if (f[0] != FB_GETADDR) return bad("getaddr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("getaddr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    want = le::get16(f.data() + 6);
+    if (want == 0 || want > kAddrMaxEntries) return bad("getaddr: want out of range");
+    return true;
+}
+inline std::vector<u8> encode_addr(u32 chain_id, const std::vector<AddrEntry>& v) {
+    if (v.size() > kAddrMaxEntries) return {};
+    std::vector<u8> f; f.reserve(kAddrHeader + v.size() * kAddrEntryBytes);
+    f.push_back(FB_ADDR); f.push_back(kFbVersion); le::put32(f, chain_id); le::put16(f, static_cast<u16>(v.size()));
+    for (const auto& e : v) {
+        if ((e.family != kAddrFamV4 && e.family != kAddrFamV6) || e.port == 0) return {};
+        f.push_back(e.family);
+        if (e.family == kAddrFamV4) { f.insert(f.end(), e.ip.begin(), e.ip.begin() + 4); f.insert(f.end(), 12, 0); }
+        else f.insert(f.end(), e.ip.begin(), e.ip.end());
+        le::put16(f, e.port); le::put64(f, e.last_seen);
     }
-    // relay-level consensus pins
-    le::put64(b, share_diff);
-    b.push_back(static_cast<u8>(bind));
-    le::put64(b, kReceiptWeight);
-    return keccak_bytes(b);
+    return f;
+}
+inline bool decode_addr(const std::vector<u8>& f, u32& chain_id, std::vector<AddrEntry>& out, std::string* why = nullptr) {
+    auto bad = [&](const char* m) { if (why) *why = m; return false; };
+    out.clear();
+    if (f.size() < kAddrHeader || f.size() > kAddrMaxFrame) return bad("addr: wrong length");
+    if (f[0] != FB_ADDR) return bad("addr: wrong opcode");
+    if (f[1] != kFbVersion) return bad("addr: unknown version");
+    chain_id = le::get32(f.data() + 2);
+    const std::size_t n = le::get16(f.data() + 6);
+    if (n > kAddrMaxEntries) return bad("addr: too many entries");
+    if (f.size() != kAddrHeader + n * kAddrEntryBytes) return bad("addr: length != n entries");
+    out.reserve(n);
+    const u8* p = f.data() + kAddrHeader;
+    for (std::size_t i = 0; i < n; ++i, p += kAddrEntryBytes) {
+        AddrEntry e;
+        e.family = p[0];
+        if (e.family != kAddrFamV4 && e.family != kAddrFamV6) { out.clear(); return bad("addr: unknown family"); }
+        std::memcpy(e.ip.data(), p + 1, 16);
+        if (e.family == kAddrFamV4)
+            for (int k = 4; k < 16; ++k) if (e.ip[k] != 0) { out.clear(); return bad("addr: ipv4 padding not zero"); }
+        e.port = le::get16(p + 17);
+        if (e.port == 0) { out.clear(); return bad("addr: port 0"); }
+        e.last_seen = le::get64(p + 19);
+        out.push_back(e);
+    }
+    return true;
 }
 
 } // namespace c2pool::v37n::xmr::relay

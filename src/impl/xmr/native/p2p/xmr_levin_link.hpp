@@ -145,6 +145,11 @@ struct LinkConfig {
     Millis timed_sync_interval_ms  = P2P_DEFAULT_HANDSHAKE_INTERVAL_MS;
     Millis timed_sync_jitter_ms    = TIMED_SYNC_JITTER_MS;
     Millis peer_timeout_ms         = PEER_TIMEOUT_MS;
+    // monerod's NON_RESPONSIVE_PEER_KICK_TIME: a 2003 / 2006 still unanswered
+    // this long after we sent it closes the connection. Without it a peer that
+    // never answers a GET_OBJECTS holds the span (and its slot in the pool's
+    // D-3 budget) until IDLE_PEER_KICK_TIME, 240 s later.
+    Millis request_kick_ms         = NON_RESPONSIVE_PEER_KICK_MS;
 
     // How often deadlines are scanned. Everything here is measured in tens of
     // seconds, so a one-second tick costs nothing and keeps the timer logic to
@@ -218,6 +223,11 @@ public:
             });
         socket_->set_close_handler(
             [raw](const std::string& why) { raw->on_socket_closed(why); });
+        // Reject an unsolicited 2004/2007 at header time, before the socket
+        // sizes and reads its body. Runs on the io thread, the same thread the
+        // expect-response latch is armed and disarmed on.
+        socket_->set_header_gate(
+            [raw](const BucketHead& h) -> bool { return raw->header_admits(h); });
         socket_->start();
         // This post DOES hold a strong reference, deliberately and briefly: it
         // keeps the link alive until the handshake is on the wire, and releases
@@ -276,8 +286,20 @@ public:
     const InvokeQueue&    invokes()   const noexcept { return invokes_; }
     const ExpectResponse& expect()    const noexcept { return expect_; }
     const InboundLiveness& liveness() const noexcept { return live_; }
+
+    // relay_silent() measured on THIS link's clock. InboundLiveness stores
+    // stamps taken from now_ms() below, whose origin is this link's own
+    // construction; a caller comparing them against any other clock (the
+    // pool's, which starts when the pool does) sees every link created more
+    // than `window_ms` after that other origin as permanently silent. So the
+    // comparison lives here, where both sides of it share one epoch.
+    bool relay_silent(Millis window_ms = 240'000) const {
+        return live_.relay_silent(now_ms(), window_ms);
+    }
     std::uint64_t timed_syncs_sent()     const noexcept { return timed_syncs_sent_; }
     std::uint64_t timed_syncs_answered() const noexcept { return timed_syncs_answered_; }
+    // True when the NON_RESPONSIVE_PEER_KICK_TIME rule closed this link.
+    bool          request_kicked() const noexcept { return request_kicked_; }
     LinkClose     close_reason()  const noexcept { return close_reason_; }
     const std::string& close_why() const noexcept { return close_why_; }
     std::shared_ptr<LevinSocket> socket() const noexcept { return socket_; }
@@ -456,6 +478,23 @@ private:
         socket_->send(make_response(cmd, {}, RC_ERROR_HANDLER_NOT_DEFINED));
     }
 
+    // Header-time admission (io thread). A 2004/2007 is a NOTIFICATION with no
+    // id; the only thing that makes it legitimate is an outstanding request we
+    // sent, so one that arrives unarmed is refused before its body is read.
+    // Every other command is already bounded by the per-command cap in
+    // read_header. Refusing it here fails the link as Unsolicited first, so the
+    // socket's own close path (which fires next) is a no-op and the close reason
+    // is the accurate one -- identical to the post-body rejection in
+    // on_notify_frame, only without ever reading the body.
+    bool header_admits(const BucketHead& h) {
+        if (h.command == CMD_RESPONSE_GET_OBJECTS || h.command == CMD_RESPONSE_CHAIN_ENTRY) {
+            if (expect_.armed() && expect_.expected() == h.command) return true;
+            fail(LinkClose::Unsolicited, std::string("unrequested ") + command_name(h.command) + " at header");
+            return false;
+        }
+        return true;
+    }
+
     // --- the demux ------------------------------------------------------------
     void on_frame(const BucketHead& h, const std::uint8_t* body, std::size_t n) {
         if (closed_) return;
@@ -601,6 +640,17 @@ private:
             fail(LinkClose::PeerUnresponsive, "no inbound bytes inside the peer timeout");
             return;
         }
+        if (expect_.kick_due(now, cfg_.request_kick_ms)) {
+            // monerod's own two-stage rule (kick_idle_peers): an outstanding
+            // 2003/2006 past the short deadline drops the peer, so the pool
+            // releases its spans and re-plans a dial now, not 240 s from now.
+            request_kicked_ = true;
+            fail(LinkClose::PeerUnresponsive,
+                 std::string("no ") + command_name(expect_.expected())
+                 + " inside NON_RESPONSIVE_PEER_KICK_TIME ("
+                 + std::to_string(cfg_.request_kick_ms) + " ms)");
+            return;
+        }
         if (expect_.idle_drop_due(now)) {
             fail(LinkClose::PeerUnresponsive,
                  std::string("no ") + command_name(expect_.expected())
@@ -660,6 +710,7 @@ private:
     std::uint64_t timed_syncs_answered_ = 0;
 
     bool        closed_       = false;
+    bool        request_kicked_ = false;
     LinkClose   close_reason_ = LinkClose::None;
     std::string close_why_;
 };

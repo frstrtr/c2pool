@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "rpc.hpp"
 
-#ifndef _WIN32
-#include <sys/socket.h>          // setsockopt SO_SND/RCVTIMEO (Send() deadline, #744/#787 M2)
-#include <sys/time.h>            // struct timeval
-#endif
+#include <algorithm>
+#include <chrono>
+#include <climits>
+
+#include <boost/asio/detail/socket_ops.hpp>   // poll_read/poll_write: portable readiness wait with a timeout
 
 #include <impl/btc/config_pool.hpp>
 #include <impl/btc/coin/softfork_check.hpp>
@@ -18,6 +19,102 @@ namespace btc
 
 namespace coin
 {
+
+namespace
+{
+
+// Sync stream over the RPC socket that bounds every read_some/write_some by
+// one absolute deadline (P0-SUBMIT-CSMAIN). The socket is in user
+// non-blocking mode (apply_socket_timeouts), so asio hands would_block back
+// instead of parking in poll(fd, -1); we then wait for readiness ourselves,
+// for at most the time left, and fail with timed_out once it is spent.
+// Satisfies beast's SyncReadStream/SyncWriteStream, so http::read/write run
+// on it unchanged.
+class DeadlineStream
+{
+    io::ip::tcp::socket& m_sock;
+    const std::chrono::steady_clock::time_point m_deadline;
+
+    bool wait_ready(bool for_read, boost::system::error_code& ec)
+    {
+        namespace ops = io::detail::socket_ops;
+        for (;;)
+        {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                m_deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0)
+            {
+                ec = io::error::timed_out;
+                return false;
+            }
+            const int msec = static_cast<int>(std::min<long long>(left, INT_MAX));
+            const int ready = for_read ? ops::poll_read(m_sock.native_handle(), 0, msec, ec)
+                                       : ops::poll_write(m_sock.native_handle(), 0, msec, ec);
+            if (ready > 0)
+                return true;
+            if (ready < 0 && ec != io::error::interrupted)
+                return false;
+            // 0 = poll timed out (the clock check above ends the wait), or EINTR
+        }
+    }
+
+    static bool would_block(const boost::system::error_code& ec)
+    {
+        return ec == io::error::would_block || ec == io::error::try_again;
+    }
+
+public:
+    DeadlineStream(io::ip::tcp::socket& sock, std::chrono::steady_clock::time_point deadline)
+        : m_sock(sock), m_deadline(deadline) {}
+
+    template <class MutableBufferSequence>
+    std::size_t read_some(const MutableBufferSequence& buffers, boost::system::error_code& ec)
+    {
+        for (;;)
+        {
+            const std::size_t n = m_sock.read_some(buffers, ec);
+            if (!would_block(ec))
+                return n;
+            if (!wait_ready(true, ec))
+                return 0;
+        }
+    }
+
+    template <class MutableBufferSequence>
+    std::size_t read_some(const MutableBufferSequence& buffers)
+    {
+        boost::system::error_code ec;
+        const std::size_t n = read_some(buffers, ec);
+        if (ec)
+            throw boost::system::system_error(ec);
+        return n;
+    }
+
+    template <class ConstBufferSequence>
+    std::size_t write_some(const ConstBufferSequence& buffers, boost::system::error_code& ec)
+    {
+        for (;;)
+        {
+            const std::size_t n = m_sock.write_some(buffers, ec);
+            if (!would_block(ec))
+                return n;
+            if (!wait_ready(false, ec))
+                return 0;
+        }
+    }
+
+    template <class ConstBufferSequence>
+    std::size_t write_some(const ConstBufferSequence& buffers)
+    {
+        boost::system::error_code ec;
+        const std::size_t n = write_some(buffers, ec);
+        if (ec)
+            throw boost::system::system_error(ec);
+        return n;
+    }
+};
+
+} // namespace
 
 NodeRPC::NodeRPC(io::io_context* context, btc::interfaces::Node* coin, bool testnet)
     : m_context(context), IS_TESTNET(testnet), m_resolver(*context), m_stream(*context), 
@@ -146,80 +243,103 @@ void NodeRPC::sync_reconnect()
 
 void NodeRPC::apply_socket_timeouts()
 {
-	// Force the socket back to BLOCKING mode, then set kernel send/receive
-	// timeouts. async_connect leaves asio's non_blocking flag set; under it a
-	// synchronous recv returns EAGAIN immediately and SO_RCVTIMEO is a no-op. In
-	// blocking mode the sync http::write/http::read inside Send() do true
-	// blocking send()/recv() which the kernel bounds by SO_SND/RCVTIMEO, so a
-	// wedged bitcoind returns an error after RPC_IO_TIMEOUT_SECONDS instead of
-	// hanging the whole ioc. (beast tcp_stream::expires_after governs only ASYNC
-	// ops; Send() drives the sync path, so the socket-option deadline is the
-	// correct lever -- same reasoning as the DASH #781 impl.) POSIX-only; on
-	// Windows this is a no-op (pre-PR behaviour: no deadline). #744/#787 M2.
-#ifndef _WIN32
+	// Put the socket in user NON-blocking mode so Send()'s DeadlineStream owns
+	// every wait. The old lever (blocking socket + SO_RCVTIMEO/SO_SNDTIMEO,
+	// #744/#787 M2, after DASH #781) never fired on Linux: asio's sync recv/send
+	// treat the EAGAIN the kernel timeout produces as would_block and fall
+	// through to poll(fd, -1), an unbounded wait (.234 rig: 178 s ioc stall
+	// behind one submitblock, zero "read failed" lines). In user non-blocking
+	// mode asio returns would_block to the caller, and DeadlineStream waits for
+	// at most the time left. asio's readiness wait is portable (select() on
+	// Windows), so Windows gets the deadline too. P0-SUBMIT-CSMAIN.
 	if (!m_stream.socket().is_open())
 		return;
 	boost::system::error_code ec;
-	m_stream.socket().non_blocking(false, ec);   // guarantee SO_*TIMEO applies
+	m_stream.socket().non_blocking(true, ec);
 	if (ec)
-		LOG_WARNING << "CoindRPC: could not set blocking mode: " << ec.message();
-	struct timeval tv;
-	tv.tv_sec  = RPC_IO_TIMEOUT_SECONDS;
-	tv.tv_usec = 0;
-	const int fd = m_stream.socket().native_handle();
-	::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
+		LOG_WARNING << "CoindRPC: could not set non-blocking mode (RPC deadline disarmed): " << ec.message();
 }
 
 std::string NodeRPC::Send(const std::string &request)
 {
-	// Retry once after synchronous reconnect on write/read failure
+	// ONE deadline for the whole call, retry included: the ioc waits at most
+	// m_io_timeout here, however long the daemon sits on the request.
+	const auto deadline = std::chrono::steady_clock::now() + m_io_timeout;
+
+	// Retry once after synchronous reconnect on write/read failure, but never
+	// after a timeout (below). A non-idempotent call (submitblock) is re-sent
+	// only if it was never delivered -- see submit_flood_gate.hpp
+	// (P0-SUBMIT-CSMAIN).
+	m_last_send = SendOutcome::NotDelivered;
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
 		m_http_request.body() = request;
 		m_http_request.prepare_payload();
-		try
+		DeadlineStream io_stream(m_stream.socket(), deadline);
+		beast::error_code ec;
+
+		http::write(io_stream, m_http_request, ec);
+		if (ec)
 		{
-			http::write(m_stream, m_http_request);
-		}
-		catch(const std::exception& e)
-		{
-			LOG_WARNING << "CoindRPC write failed: " << e.what()
-			            << (attempt == 0 ? " — reconnecting..." : "");
-			if (attempt == 0) {
+			// Out of time mid-write: part of the request is on the wire and the
+			// budget is spent. Drop the socket; the next call reconnects.
+			const bool timed_out = ec == io::error::timed_out;
+			const bool retry = attempt == 0 && !timed_out
+			                   && rpc_may_resend(RpcFailure::Write, m_non_idempotent);
+			LOG_WARNING << "CoindRPC write failed: " << ec.message()
+			            << (retry ? " — reconnecting..." : timed_out ? " — dropping connection" : "");
+			if (retry) {
 				sync_reconnect();
 				continue;
 			}
+			if (timed_out)
+				m_stream.close();
 			return {};
 		}
+		m_last_send = SendOutcome::Delivered;
 
 		beast::flat_buffer buffer;
 		boost::beast::http::response<boost::beast::http::dynamic_body> response;
 
-		try
+		http::read(io_stream, buffer, response, ec);
+		if (ec)
 		{
-			boost::beast::http::read(m_stream, buffer, response);
-		}
-		catch (const std::exception& ex)
-		{
-			LOG_WARNING << "CoindRPC read failed: " << ex.what()
-			            << (attempt == 0 ? " — reconnecting..." : "");
-			if (attempt == 0) {
+			// Out of time waiting for the answer: the daemon HAS the request and
+			// is still on it (submitblock queued behind cs_main). A re-send would
+			// queue a second copy behind the first and double the stall, so give
+			// up on this call. A delivered non-idempotent call is never re-sent
+			// either, timeout or not. Whenever we give up, drop the socket so the
+			// late reply is never read as the answer to the NEXT call (every
+			// request carries the same id); the next Send() fails its write on
+			// the closed stream and reconnects.
+			const bool timed_out = ec == io::error::timed_out;
+			const bool retry = attempt == 0 && !timed_out
+			                   && rpc_may_resend(RpcFailure::Read, m_non_idempotent);
+			LOG_WARNING << "CoindRPC read failed: " << ec.message()
+			            << (retry ? " — reconnecting..."
+			                      : " — request delivered, not re-sending; dropping connection");
+			if (retry) {
 				sync_reconnect();
 				continue;
 			}
+			m_stream.close();
 			return {};
 		}
 
 		auto body = boost::beast::buffers_to_string(response.body().data());
+		// 503 "Work queue depth exceeded": bitcoind refused the call unrun.
+		if (response.result() == http::status::service_unavailable)
+			m_last_send = SendOutcome::NotDelivered;
+		else if (!body.empty())
+			m_last_send = SendOutcome::Answered;
 		if (body.empty()) {
 			static int _empty_count = 0;
 			if (_empty_count++ < 5)
 				LOG_WARNING << "CoindRPC empty response: HTTP " << response.result_int()
 				            << " content-length=" << response[http::field::content_length]
 				            << " connection=" << response[http::field::connection];
-			if (attempt == 0 && response.result_int() != 200) {
+			if (attempt == 0 && response.result_int() != 200
+			    && rpc_may_resend(RpcFailure::EmptyNon200, m_non_idempotent)) {
 				sync_reconnect();
 				continue;
 			}
@@ -232,6 +352,18 @@ std::string NodeRPC::Send(const std::string &request)
 nlohmann::json NodeRPC::CallAPIMethod(const std::string& method, const jsonrpccxx::positional_parameter& params)
 {
 	return m_client.CallMethod<nlohmann::json>(ID, method, params);
+}
+
+nlohmann::json NodeRPC::call_submitblock(const std::string& block_hex)
+{
+	// Mark the call non-idempotent for the duration of Send() so a delivered
+	// submitblock is never re-sent (submit_flood_gate.hpp).
+	struct Scope {
+		bool& flag;
+		explicit Scope(bool& f) : flag(f) { flag = true; }
+		~Scope() { flag = false; }
+	} scope(m_non_idempotent);
+	return m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
 }
 
 bool NodeRPC::check()
@@ -423,7 +555,7 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 	// BTC: segwit + taproot are required forks; full-block packing always
 	// includes witness data. No MWEB tail to append.
 	PackStream packed_block = pack<btc::coin::BlockType>(block);
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {HexStr(packed_block.get_span())});
+	auto result = call_submitblock(HexStr(packed_block.get_span()));
 	bool success = result.is_null();
 
 	auto block_header = pack<btc::coin::BlockHeaderType>(block); // cast to header?
@@ -437,11 +569,37 @@ void NodeRPC::submit_block(BlockType& block, bool ignore_failure)
 bool NodeRPC::submit_block_hex(const std::string& block_hex, bool ignore_failure)
 {
 	(void)ignore_failure;
-	auto result = m_client.CallMethod<nlohmann::json>(ID, "submitblock", {block_hex});
+	// P0-SUBMIT-CSMAIN (b): the stratum connect path and the won-block dispatch
+	// both submit the same block. Collapse them onto ONE delivered submitblock
+	// and replay its verdict instead of queueing another copy behind cs_main.
+	const auto key = SubmitDedupe::key_of(block_hex);
+	if (auto prior = m_submit_dedupe.lookup(key))
+	{
+		LOG_INFO << "submit_block_hex: block already delivered, skipping resubmit (prior verdict "
+		         << SubmitDedupe::name(*prior) << ")";
+		return SubmitDedupe::reached(*prior);
+	}
+	nlohmann::json result;
+	try
+	{
+		result = call_submitblock(block_hex);
+	}
+	catch (...)
+	{
+		// Answered = the daemon replied with an RPC error (a reject). Delivered
+		// = the reply was lost (read timeout); bitcoind still holds the block.
+		if (m_last_send == SendOutcome::Answered)
+			m_submit_dedupe.record(key, SubmitDedupe::Verdict::Rejected);
+		else if (m_last_send == SendOutcome::Delivered)
+			m_submit_dedupe.record(key, SubmitDedupe::Verdict::DeliveredUnknown);
+		throw;
+	}
 	// Dual-path contract: a "duplicate"/"inconclusive"/already-have result means
 	// the block already reached the network (our P2P relay, or a peer won the
 	// race) — that is SUCCESS, not failure. See core::coin::submitblock_result_accepted.
 	const bool success = core::coin::submitblock_result_accepted(result);
+	m_submit_dedupe.record(key, success ? SubmitDedupe::Verdict::Accepted
+	                                    : SubmitDedupe::Verdict::Rejected);
 	if (success)
 		LOG_INFO << "submit_block_hex accepted"
 		         << (result.is_null() ? std::string{} : " (" + result.dump() + ")");

@@ -66,6 +66,21 @@ sudo apt-get install -y \
 
 > All other dependencies (Boost 1.90, nlohmann_json, yaml-cpp, GoogleTest, zlib,
 > bzip2, libbacktrace) are downloaded and compiled automatically by Conan.
+>
+> **libsecp256k1 is the one library that must come from the system.** It is not
+> in `conanfile.txt`, so `conan install` never provides it; CMake finds it with
+> `find_library`/`find_path` (then `find_package(secp256k1)`). Without sudo,
+> unpack the distro packages into a user prefix and point CMake at it:
+> ```bash
+> apt-get download libsecp256k1-dev libsecp256k1-1
+> for d in libsecp256k1*.deb; do dpkg -x "$d" "$HOME/local"; done
+> # then add to the cmake configure line:  -DCMAKE_PREFIX_PATH=$HOME/local/usr
+> ```
+>
+> **No system Boost is needed (`libboost-dev` is not a dependency).** Every C++
+> translation unit, including the ones that link no Boost (vendored RandomX,
+> the XMR node's `monero_rpc.cpp`), resolves Boost headers from Conan's pinned
+> Boost only; a system Boost under `/usr/include`, if installed, is never used.
 
 ---
 

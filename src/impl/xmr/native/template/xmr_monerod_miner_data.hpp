@@ -104,6 +104,7 @@
 #include "impl/xmr/native/contracts/miner_data.hpp"
 #include "impl/xmr/node/monero_rpc.hpp"          // body_get_miner_data / parse_miner_data
 #include "impl/xmr/node/monerod_transport.hpp"   // IMonerodTransport / RpcResponse
+#include "impl/xmr/coin/xmr_seedheight.hpp"      // rx_seedheights (next_seed_hash)
 
 namespace c2pool::xmr::native::tmpl {
 
@@ -162,6 +163,8 @@ public:
             return false;
         }
 
+        announce_next_seed_(md);
+
         const std::uint64_t fp  = backlog_fingerprint_(md);
         const std::uint64_t now = now_ms_();
 
@@ -194,6 +197,9 @@ public:
         if (why) why->clear();
         return true;
     }
+
+    // get_block_header_by_height round trips made for next_seed_hash (status/KATs).
+    std::uint64_t next_seed_fetches() const noexcept { return next_fetches_; }
 
     MinerDataReadiness readiness() const override {
         MinerDataReadiness r;
@@ -312,6 +318,33 @@ private:
         return w;
     }
 
+    // NEXT-SEED ANNOUNCE (operator ruling 09-26). get_miner_data carries no
+    // next_seed_hash; monerod's get_block_template publishes it as
+    //   rx_seedheights(height, &seed, &next); next != seed -> id(next).
+    // Inside that 64-block lag window the next seed block is already in the
+    // chain, so ONE get_block_header_by_height resolves it, re-asked only when
+    // the tip moves (a reorg across the seed block is followed; 0 extra RPCs
+    // outside the window). A failed lookup announces nothing; poll() succeeds.
+    void announce_next_seed_(node::MinerData& md) {
+        std::uint64_t seed_h = 0, next_h = 0;
+        ::xmr::coin::rx_seedheights(md.height, seed_h, next_h);
+        if (next_h == seed_h) return;
+        if (!(next_ok_ && next_h_ == next_h && next_tip_ == md.prev_id)) {
+            next_ok_ = false;
+            ++next_fetches_;
+            tx_.rpc_post(node::MoneroDaemonRpc::body_get_block_header_by_height(next_h),
+                         [&](const node::RpcResponse& r) {
+                             if (!r.ok()) return;
+                             const auto b = node::MoneroDaemonRpc::parse_block_header(r.body);
+                             if (b && b->height == next_h && !node::is_zero(b->id)) {
+                                 next_id_ = b->id; next_ok_ = true;
+                             }
+                         });
+            next_h_ = next_h; next_tip_ = md.prev_id;
+        }
+        if (next_ok_ && !(next_id_ == md.seed_hash)) md.next_seed_hash = next_id_;
+    }
+
     void set_error_(std::string e, std::string* why) {
         std::lock_guard<std::mutex> lk(mtx_);
         last_error_ = std::move(e);
@@ -320,6 +353,12 @@ private:
     }
 
     node::IMonerodTransport& tx_;
+    // next_seed_hash lookup cache (poll() / main thread only)
+    node::Hash    next_id_{};
+    node::Hash    next_tip_{};
+    std::uint64_t next_h_ = 0;
+    bool          next_ok_ = false;
+    std::uint64_t next_fetches_ = 0;
     MonerodArmConfig         cfg_{};
     ClockFn                  clock_;
 

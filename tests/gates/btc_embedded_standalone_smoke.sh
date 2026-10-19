@@ -75,20 +75,49 @@ base_h="$(grep -oE '\[BTC\] HeaderChain initialized:.*height=[0-9]+' "$LOG" | gr
 base_h="${base_h:-0}"
 echo "[btc-smoke] baseline header height=$base_h"
 
-# 3) HeaderChain tip advances within the bounded window
-deadline=$(( SECONDS + SMOKE_WINDOW ))
-while [ "$SECONDS" -lt "$deadline" ]; do
-  if ! kill -0 "$NODE_PID" 2>/dev/null; then
-    echo "::error::c2pool-btc exited mid-smoke"; echo "---- node.log ----"; cat "$LOG"; exit 1
+# 3) HeaderChain tip advances within the bounded window. A slow-but-live node
+#    gets up to TIP_ATTEMPTS windows (#1471). Every extra window emits a titled
+#    ::warning:: annotation (countable across runs via the check-run annotations
+#    API) and the count goes to the step summary, so a pass that needed a retry
+#    is never silent and a persistent stall still goes red. Liveness is
+#    re-checked before each retry: a dead process or a failing /node_info fails
+#    at once. Retries forgive a slow tip, never a broken node.
+TIP_ATTEMPTS="${TIP_ATTEMPTS:-3}"
+tip_retries=0
+cur_h="$base_h"
+report_retries() {
+  echo "[btc-smoke] tip_advance_retries=$tip_retries (of $(( TIP_ATTEMPTS - 1 )) allowed)"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "btc-smoke tip-advance retries used: $tip_retries of $(( TIP_ATTEMPTS - 1 )) allowed" >> "$GITHUB_STEP_SUMMARY"
   fi
-  cur_h="$(grep -oE '\[BTC\] new_headers:.*chain_height=[0-9]+' "$LOG" | grep -oE 'chain_height=[0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
-  cur_h="${cur_h:-0}"
-  if [ "$cur_h" -gt "$base_h" ]; then
-    echo "[btc-smoke] PASS — HeaderChain tip advanced $base_h -> $cur_h (engine red-line green)"
-    exit 0
+}
+for attempt in $(seq 1 "$TIP_ATTEMPTS"); do
+  if [ "$attempt" -gt 1 ]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/node_info" || true)"
+    if ! kill -0 "$NODE_PID" 2>/dev/null || [ "$code" != "200" ]; then
+      echo "::error::node not live before tip-advance attempt $attempt/$TIP_ATTEMPTS (/node_info '$code') — a dead node is never retried"
+      report_retries; echo "---- node.log (tail) ----"; tail -120 "$LOG"; exit 1
+    fi
+    tip_retries=$(( attempt - 1 ))
+    echo "::warning title=btc-smoke tip-advance retry::attempt $attempt/$TIP_ATTEMPTS: chain_height=$cur_h (baseline $base_h) after ${SMOKE_WINDOW}s; node live, /node_info 200, re-polling"
   fi
-  sleep 5
+  deadline=$(( SECONDS + SMOKE_WINDOW ))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! kill -0 "$NODE_PID" 2>/dev/null; then
+      echo "::error::c2pool-btc exited mid-smoke"; report_retries; echo "---- node.log ----"; cat "$LOG"; exit 1
+    fi
+    cur_h="$(grep -oE '\[BTC\] new_headers:.*chain_height=[0-9]+' "$LOG" | grep -oE 'chain_height=[0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
+    cur_h="${cur_h:-0}"
+    if [ "$cur_h" -gt "$base_h" ]; then
+      if [ "$tip_retries" -gt 0 ]; then
+        echo "::warning title=btc-smoke tip-advance retry::PASS only on attempt $attempt/$TIP_ATTEMPTS (retries used: $tip_retries)"
+      fi
+      echo "[btc-smoke] PASS — HeaderChain tip advanced $base_h -> $cur_h (engine red-line green)"
+      report_retries; exit 0
+    fi
+    sleep 5
+  done
 done
 
-echo "::error::HeaderChain tip did not advance past $base_h within ${SMOKE_WINDOW}s (no headers climbing)"
-echo "---- node.log (tail) ----"; tail -120 "$LOG"; exit 1
+echo "::error::HeaderChain tip did not advance past $base_h within ${SMOKE_WINDOW}s on any of $TIP_ATTEMPTS attempts (no headers climbing)"
+report_retries; echo "---- node.log (tail) ----"; tail -120 "$LOG"; exit 1

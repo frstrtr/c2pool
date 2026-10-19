@@ -88,7 +88,7 @@ void Socket::init()
 
     // ── Per-socket TCP liveness (pure transport; cannot corrupt protocol state).
     // Motivation: a stateful ISP-side per-flow DPI blackhole (TSPU-class CGN on
-    // the hotel uplink) can silently wedge a flow both directions without ever
+    // the private host uplink) can silently wedge a flow both directions without ever
     // sending FIN/RST. is_open() never falsifies for such a half-open drop, so
     // a pending async_read/async_write can linger 15-30 min before anything
     // notices — the sharechain sync stalls for that whole window.

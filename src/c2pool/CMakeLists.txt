@@ -118,6 +118,16 @@ function(c2pool_wire_version _tgt)
     add_dependencies(${_tgt} c2pool_version_header)
     target_include_directories(${_tgt} PRIVATE ${C2POOL_VERSION_HEADER_DIR})
 endfunction()
+# V37_XMR_DROPS_DEFAULT: a test-only knob. The XMR node and its KATs carry
+# V37_XMR_DROPS_DEFAULT=1 when ON; only v37_xmr_drops_default_kat (DD1) reads
+# the macro, so the option has no product effect. Default OFF: raindrops are not
+# armed, and no XMR target defines V37_ACTIVATE_CONSENSUS_V1.
+option(V37_XMR_DROPS_DEFAULT "test-only: V37_XMR_DROPS_DEFAULT defined on the XMR targets (read by DD1 only)" OFF)
+function(c2pool_xmr_drops_default _tgt)
+    if (V37_XMR_DROPS_DEFAULT)
+        target_compile_definitions(${_tgt} PRIVATE V37_XMR_DROPS_DEFAULT=1)
+    endif()
+endfunction()
 
 # Main C2Pool Enhanced Application (refactored with mining_shares/p2p_shares separation)
 add_executable(c2pool main_ltc.cpp)
@@ -866,29 +876,22 @@ target_link_libraries(c2pool-v37-w6-leveldb-compile-check PRIVATE core Threads::
 # EXPERIMENTAL — prototype / stagenet / regtest only (see the file banner).
 # Built on demand (like c2pool-v37); the non-san CI leg lists it for a compile
 # gate. The V37Engine/OwedLedger consensus stays header-only + untouched.
-# X9 OPTION B (--coinbase v37): the v37 K_fair SETTLEMENT coinbase. main_v37_xmr
-# includes the settlement provider/fixture (header-only, src/c2pool/v37/xmr/),
-# which drive the X6 executor (settle/xmr_coinbase.cpp, compiled in here) and the
-# whole-block template builder (xmr_template, linked below). No consensus digest
-# is defined; src/sharechain/v37 is untouched. Option A stays the default.
+# The Path B coinbase and block assembly are header-only (src/impl/xmr/pathb/,
+# src/impl/xmr/template/xmr_block_assembly.hpp).
 add_executable(c2pool-v37-xmr
     v37/main_v37_xmr.cpp
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/stratum/xmr_stratum.cpp
-    ${CMAKE_SOURCE_DIR}/src/impl/xmr/settle/xmr_coinbase.cpp
-    ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp
-    # GAP-2 (xmr/relay/): the receipt opening/verify bodies the relay mints and checks with.
-    ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt/xmr_receipt_verify.cpp)
+    ${CMAKE_SOURCE_DIR}/src/sharechain/v37/v37_descriptor_xmr_point_check_ref10.cpp)
 c2pool_wire_version(c2pool-v37-xmr)
 target_include_directories(c2pool-v37-xmr PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/src/impl/xmr/receipt   # GAP-2: impl/xmr/wire/xmr_carrier_wire.hpp includes "xmr_receipt.hpp"
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/vendor
     ${CMAKE_SOURCE_DIR}/src/impl/xmr/coin/compat)
 target_compile_definitions(c2pool-v37-xmr PRIVATE V37_XMR_HAVE_MONERO_CRYPTO)
+c2pool_xmr_drops_default(c2pool-v37-xmr)   # V37_XMR_DROPS_DEFAULT (default OFF; see the helper)
 target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
-# xmr_template carries the p2pool block-template port + the authored primitive
-# seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE and NEVER define
-# XMR_BLOCK_ASSEMBLY_IMPLEMENT_PRIMITIVES here (that ODR path is KAT-only).
+# xmr_template carries the clean-room block template + the authored primitive
+# seam bodies (xmr_coin_primitives.cpp). Link it EXACTLY ONCE.
 # M2 (--xmr-template-source native): the embedded native-minimal Monero node.
 # xmr_native_txpool is the ONE compiled part of src/impl/xmr/native/ (the C3
 # pool and its Bulletproof+ verifier); everything else the node assembles --
@@ -898,6 +901,59 @@ target_compile_features(c2pool-v37-xmr PRIVATE cxx_std_20)
 # include path, not a new runtime dependency.
 target_link_libraries(c2pool-v37-xmr PRIVATE xmr_template xmr_node xmr_coin
                                              xmr_native_txpool Threads::Threads)
+# XMR-WEB (--web-port, OFF by default): the read-only provider behind the shared
+# core::WebServer dashboard (the same web server + web-static UI every coin
+# binary serves). A STATIC archive that links core PRIVATE, so the daemon TU
+# never sees core's include paths (src/btclibs/compat/cpuid.h would shadow the
+# toolchain <cpuid.h> xmr_msr_boost.hpp needs) and only the core objects the
+# web layer references are pulled in. The OBJECT-lib SCC is named directly, the
+# exact set core_test links for the web_server_* KATs (#22/#39).
+add_library(xmr_web_dashboard STATIC v37/xmr/xmr_web_dashboard.cpp)
+target_compile_features(xmr_web_dashboard PRIVATE cxx_std_20)
+target_include_directories(xmr_web_dashboard PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The release daemon stays static apart from glibc. web_server.cpp references
+# secp256k1 (the transition-message signature check, ltc/share_messages.hpp),
+# and core carries the SHARED ${SECP256K1_LIBRARIES}. Name the static archive
+# that sits next to it FIRST, so those references resolve from libsecp256k1.a
+# and the linker's --as-needed drops the .so (no libsecp256k1.so DT_NEEDED).
+# No sibling archive (or a non-.so secp256k1, e.g. a Conan target) = unchanged.
+set(XMR_WEB_SECP256K1_STATIC "")
+if (SECP256K1_LIBRARIES MATCHES "\\.so(\\.[0-9]+)*$")
+    get_filename_component(_xmr_web_secp_dir "${SECP256K1_LIBRARIES}" DIRECTORY)
+    find_library(XMR_WEB_SECP256K1_ARCHIVE NAMES libsecp256k1.a
+                 HINTS "${_xmr_web_secp_dir}" NO_DEFAULT_PATH)
+    if (XMR_WEB_SECP256K1_ARCHIVE)
+        set(XMR_WEB_SECP256K1_STATIC "${XMR_WEB_SECP256K1_ARCHIVE}")
+        message(STATUS "c2pool-v37-xmr web layer: static secp256k1 ${XMR_WEB_SECP256K1_ARCHIVE}")
+    endif()
+endif()
+target_link_libraries(xmr_web_dashboard PRIVATE ${XMR_WEB_SECP256K1_STATIC}
+                                                core c2pool_merged_mining c2pool_payout
+                                                c2pool_hashrate ltc_coin)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_web_dashboard)
+# RELAY-DISCOVERY: the relay's persistent peer book on core::AddrStore
+# (v37/xmr/relay/xmr_relay_peerstore.hpp). Same pattern as xmr_web_dashboard:
+# a STATIC archive linking core PRIVATE, behind a core-free header, so the
+# daemon TU never sees core's include paths.
+add_library(xmr_relay_peerstore STATIC v37/xmr/relay/xmr_relay_peerstore.cpp)
+target_compile_features(xmr_relay_peerstore PRIVATE cxx_std_20)
+target_include_directories(xmr_relay_peerstore PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(xmr_relay_peerstore PRIVATE core)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_relay_peerstore)
+# PATHB-STORE: the Path B store archive (v37/xmr/pathb/xmr_pathb_store.hpp),
+# a STATIC archive linking core PRIVATE behind a core-free header, as above.
+# Linked into the daemon (which never defines W6_ENABLE_LEVELDB) and by its KAT.
+add_library(xmr_pathb_store STATIC v37/xmr/pathb/xmr_pathb_store.cpp)
+target_compile_features(xmr_pathb_store PRIVATE cxx_std_20)
+target_include_directories(xmr_pathb_store PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(xmr_pathb_store PRIVATE core)
+target_link_libraries(c2pool-v37-xmr PRIVATE xmr_pathb_store)
+# Reproducible release (docs/xmr-lane/REPRODUCIBLE-BUILD.md): the daemon links
+# only static archives, Boost headers and system libs, so the build RUNPATH CMake
+# derives from the Conan link dirs (<CONAN_HOME>/p/boost.../p/lib, which holds no
+# shared object) is never used to resolve anything -- but it bakes the builder's
+# $CONAN_HOME into .dynamic. Do not emit it.
+set_target_properties(c2pool-v37-xmr PROPERTIES SKIP_BUILD_RPATH ON)
 if (TARGET Boost::headers)
     target_link_libraries(c2pool-v37-xmr PRIVATE Boost::headers)
 elseif (TARGET Boost::boost)

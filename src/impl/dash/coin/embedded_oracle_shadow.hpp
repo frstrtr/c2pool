@@ -662,7 +662,7 @@ public:
     /// gap, never a wrong count — and on the ~2.6 min interval the worker keeps
     /// up with room to spare).
     ///
-    /// OWNERSHIP (heap-corruption fix, hotel SIGABRT 2026-08-05 21:52:38 MSK):
+    /// OWNERSHIP (heap-corruption fix, production SIGABRT 2026-08-05 21:52:38 MSK):
     /// the embedded arm is resolved HERE, on the tip/io thread that exclusively
     /// owns NodeCoinState, and the worker is handed a DEEP COPY. It used to be
     /// resolved on the WORKER thread (process_tip called coin_state_.
@@ -1013,7 +1013,7 @@ private:
     // into its live containers out of select_work(); it may be read ONLY from
     // the thread that mutates it (the io/tip thread). The single legal use of
     // this reference is inside on_new_tip(). The worker thread must never
-    // reach it — that was the 2026-08-05 hotel heap corruption.
+    // reach it — that was the 2026-08-05 production heap corruption.
     const NodeCoinState&          coin_state_;
     std::function<DashWorkData()> dashd_gbt_;
     ProposalFn                    proposal_fn_;

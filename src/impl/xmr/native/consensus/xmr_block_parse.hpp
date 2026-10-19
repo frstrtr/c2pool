@@ -155,7 +155,10 @@ inline BlockParseStatus parse_block(const std::uint8_t* data, std::size_t size,
     // Parsed in place: the coinbase sits in the middle of the blob, so its end
     // is not known until it is parsed. Wave 0's two stages are used directly
     // rather than parse_tx_full(), which requires a buffer that ends exactly at
-    // the end of the transaction.
+    // the end of the transaction. The prefix parser applies Monero's coinbase
+    // output ceiling, MAX_COINBASE_VOUT_COUNT (3,125,000), to this transaction;
+    // the version-dependent miner-output rule is judged at connect time
+    // (miner_tx_output_count_ok below), where Monero judges it.
     out.miner_tx_offset = r.offset();
     {
         TxParseStatus ts = detail::parse_tx_prefix(r, out.miner_tx);
@@ -191,6 +194,61 @@ inline BlockParseStatus parse_block(const std::uint8_t* data, std::size_t size,
 
 inline BlockParseStatus parse_block(const std::vector<std::uint8_t>& blob, ParsedBlock& out) {
     return parse_block(blob.data(), blob.size(), out);
+}
+
+// ---------------------------------------------------------------------------
+// HEADER-FIRST VERSION PEEK (unknown-fork fuse).
+//
+// Reads ONLY the block header and, when the bytes are there, the height in the
+// coinbase's txin_gen: the part of a block that no Monero fork so far has
+// changed. It judges nothing. It exists so that a caller can learn a block's
+// major_version BEFORE parse_block() applies the body rules of the versions
+// this build implements. A block from a fork above that range fails
+// parse_block() for reasons that say nothing about the sender's honesty
+// (FCMP++/Carrot v17 appends two tree fields after tx_hashes and changes the
+// coinbase output type), and the caller uses this peek to tell "not
+// understood" from "invalid".
+//
+// Returns false when the header itself does not read (truncated, or a
+// major/minor that cannot be a uint8). The caller then falls through to
+// parse_block(), which reports exactly the failure it always did.
+// `height_known` is false when the coinbase prefix does not read as a single
+// txin_gen input.
+// ---------------------------------------------------------------------------
+struct BlockHeaderPeek {
+    BlockHeaderFields header{};
+    std::size_t       header_size     = 0;
+    bool              height_known    = false;
+    std::uint64_t     coinbase_height = 0;
+};
+
+inline bool peek_block_header(const std::uint8_t* data, std::size_t size,
+                              BlockHeaderPeek& out) {
+    out = BlockHeaderPeek{};
+    if (!data || !size) return false;
+    BlobReader r(data, size);
+    if (!r.read_varint(out.header.major_version)) return false;
+    if (!r.read_varint(out.header.minor_version)) return false;
+    if (!r.read_varint(out.header.timestamp))     return false;
+    if (!r.read_bytes(out.header.prev_id.data(), 32)) return false;
+    if (!r.read_u32_le(out.header.nonce))         return false;
+    if (out.header.major_version == 0 || out.header.major_version > 0xff) return false;
+    if (out.header.minor_version > 0xff) return false;
+    out.header_size = r.offset();
+
+    // miner_tx prefix: version, unlock_time, one input, txin_gen, height.
+    std::uint64_t ver = 0, unlock = 0, n_in = 0, height = 0;
+    std::uint8_t  tag = 0;
+    if (r.read_varint(ver) && r.read_varint(unlock) && r.read_varint(n_in) && n_in == 1
+        && r.read_byte(tag) && tag == TX_IN_GEN && r.read_varint(height)) {
+        out.height_known    = true;
+        out.coinbase_height = height;
+    }
+    return true;
+}
+
+inline bool peek_block_header(const std::vector<std::uint8_t>& blob, BlockHeaderPeek& out) {
+    return peek_block_header(blob.data(), blob.size(), out);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,8 +298,11 @@ inline bool parse_coinbase_fields(const std::uint8_t* block_blob, const ParsedBl
     if (!r.read_byte(tag) || tag != TX_IN_GEN) return false;
     if (!r.read_varint(out.height)) return false;
 
+    // Same ceiling and the same bytes-present floor as the first pass, so the
+    // reserve below is bounded by the bytes of the miner tx even when this is
+    // called on a span parse_block() never saw.
     std::uint64_t n_out = 0;
-    if (!r.read_varint(n_out)) return false;
+    if (!r.read_count(n_out, MAX_COINBASE_VOUT_COUNT, TX_MIN_OUTPUT_BYTES)) return false;
     out.n_outputs = static_cast<std::size_t>(n_out);
     if (capture) out.outputs.reserve(out.n_outputs);
     for (std::uint64_t i = 0; i < n_out; ++i) {
@@ -264,6 +325,39 @@ inline bool parse_coinbase_fields(const std::uint8_t* block_blob, const ParsedBl
         if (capture) out.outputs.emplace_back(amount, pk);
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// MINER-TX OUTPUT COUNT, by hard-fork version.
+//
+// Up to and including v16 Monero has no miner-output rule beyond the parse
+// ceiling MAX_COINBASE_VOUT_COUNT (monero-project master f6a591c:
+// cryptonote_basic.h:59; prevalidate_miner_transaction has no count check).
+// The FCMP++/Carrot fork adds one in Blockchain::prevalidate_miner_transaction
+// (seraphis-migration/monero fcmp++-stage 55f004d87, blockchain.cpp:1461-1466;
+// cryptonote_config.h:209, :233):
+//
+//   if (hf_version >= HF_VERSION_REJECT_MANY_MINER_OUTPUTS)
+//       vout.size() <= FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS
+//
+// Monero's fork check makes a block's major_version equal hf_version for every
+// block it accepts, so the block's own major version is the key here. This
+// build refuses to judge a block above MAX_IMPLEMENTED_HF_VERSION (16; see
+// evaluate_block's UnknownFork), so the v17 branch is dormant until the v17
+// rules are implemented; it is here so the ceiling moves with the fork.
+// ---------------------------------------------------------------------------
+inline constexpr std::uint64_t HF_VERSION_REJECT_MANY_MINER_OUTPUTS = 17;
+inline constexpr std::uint64_t FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS     = 10000;
+
+inline constexpr std::uint64_t max_miner_tx_outputs(std::uint64_t hf_version) noexcept {
+    return hf_version >= HF_VERSION_REJECT_MANY_MINER_OUTPUTS
+               ? FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS
+               : MAX_COINBASE_VOUT_COUNT;
+}
+
+inline constexpr bool miner_tx_output_count_ok(std::uint64_t hf_version,
+                                               std::uint64_t n_outputs) noexcept {
+    return n_outputs <= max_miner_tx_outputs(hf_version);
 }
 
 // ---------------------------------------------------------------------------

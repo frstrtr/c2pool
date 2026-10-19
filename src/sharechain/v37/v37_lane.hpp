@@ -55,8 +55,13 @@ using MinerId = std::uint32_t;
 struct SubthresholdGate {
     bool enabled = false;        // ★ DEFAULT OFF (RDWR-OQ2; flip = consensus change)
     std::uint32_t K = 4;         // K-best near-misses; estimator enforces K >= 3
-    std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined (sybil-neutral)
+    std::uint32_t mode = 0;      // 0 = EstimateOnly (S==0 only), 1 = Combined, 2 = Count
     std::uint32_t version = 0;   // consensus version marker: 0 = base; 1 = V37.1 estimator-on
+    // Count (mode 2) only: the drops floor is the share target times
+    // 2^count_floor_shift; every hash below it is credited the floor's work.
+    // 0 everywhere else. A lane that selects Count sets it with the floor it
+    // serves (XMR: share_diff / 64 => 6).
+    std::uint32_t count_floor_shift = 0;
 
     // ── CANONICAL version → gate map (the ADD-ONLY consensus version marker).
     // for_version() is the SINGLE SOURCE OF TRUTH translating a V37.x consensus
@@ -304,16 +309,30 @@ inline bool w_is_r_aligned(u64 w, u64 R) { return R == 0 || (w % R) == 0; }
 //
 // Degenerate (ruling F): raw_total_prev_epoch == 0 or W_cur == 0 (bootstrap, no
 // demonstrated work) => W_default, deterministically, with no division.
-inline u64 retarget_width(const U256& d_net_at_base, u64 w_cur_bins,
-                          u128 raw_total_prev_epoch, const WinGate& w) {
-    if (raw_total_prev_epoch == 0 || w_cur_bins == 0)
+//
+// MEASURED SPAN. The pool's work rate is raw / span, where span is the number
+// of bins the raw work was measured over. retarget_width_over() takes the span
+// explicitly; retarget_width() is the positional-window form, which measures
+// over the prior full window (span == W_cur) and is bit-identical to it.
+// The native ridge measures over ONE retarget period (span == R_b bins, or the
+// part of it since the flip) and MUST pass that span: dividing C * D * W_cur
+// by one period's raw work leaves a stray W_cur / R_b factor, and W then runs
+// to W_MAX (or W_MIN) by the damper instead of settling at C * D / rate
+// (v37_1_width_law_kat WL-3, fixed 2026-09-30).
+inline u64 retarget_width_over(const U256& d_net_at_base, u64 w_cur_bins,
+                               u128 raw_over_span, u64 span_bins, const WinGate& w) {
+    if (raw_over_span == 0 || w_cur_bins == 0 || span_bins == 0)
         return floor_to_R(clamp_u64(w.w_default_bins, w.w_min_bins, w.w_max_bins),
                           w.retarget_bins);
-    const U256 num = d_net_at_base.mul_small(w.coverage_blocks).mul_small(w_cur_bins);
-    u64 w_target = num.div_u128_to_u64(raw_total_prev_epoch);   // truncate toward zero
+    const U256 num = d_net_at_base.mul_small(w.coverage_blocks).mul_small(span_bins);
+    u64 w_target = num.div_u128_to_u64(raw_over_span);          // truncate toward zero
     w_target = damp_ratio(w_cur_bins, w_target, w.damp_factor); // ruling F
     w_target = clamp_u64(w_target, w.w_min_bins, w.w_max_bins); // ruling C
     return floor_to_R(w_target, w.retarget_bins);               // ND-R14: LAST
+}
+inline u64 retarget_width(const U256& d_net_at_base, u64 w_cur_bins,
+                          u128 raw_total_prev_epoch, const WinGate& w) {
+    return retarget_width_over(d_net_at_base, w_cur_bins, raw_total_prev_epoch, w_cur_bins, w);
 }
 
 } // namespace winlaw
@@ -377,6 +396,28 @@ struct NrGate {
     bool allow_digit_repeat = false;                // ND-R4 closure; default = strict golden subset
 };
 
+// Fee-model gate (the v36 fee model on the XMR lane, rulings S1-S4;
+// consumer: src/c2pool/v37/xmr/xmr_fee_model.hpp). ADD-ONLY and, like the
+// gates above, NOT part of the digested lane geometry: it changes nothing the
+// lane folds by itself. What it changes is WHAT the consumer builds and pushes:
+// the lane coinbase carries the mandatory donation output (1 + residual), the
+// residual sink IS the donation address, and every PoW-committed receipt is
+// pushed at weight 65535 split by its own give-author u16. enabled == false
+// (the default) => master-identical coinbase and credit. Two nodes whose gates
+// differ fold different lanes from identical receipts, so the gate is folded
+// into every peer-facing lane tag (the XMR relay's lane_params_digest), and a
+// mixed fleet refuses EXPLICITLY at HELLO -- never a silent divergence.
+struct FeeModelGate {
+    bool enabled = false;          // ★ DEFAULT OFF (flip = consensus change)
+    std::uint32_t version = 0;     // 0 = off; 1 = v36 fee model (S1-S4)
+
+    static FeeModelGate for_version(std::uint32_t v) {
+        FeeModelGate g{};          // unknown version => OFF (fail-safe)
+        if (v == 1) { g.enabled = true; g.version = 1; }
+        return g;
+    }
+};
+
 // ── K_FLOOR: the coinbase no-dust floor coefficient (STEP-0 hotfix) ────────
 // W5 (src/c2pool/v37/w5_coinbase.hpp) emits an owed balance as a coinbase
 // output only when it clears h_min(kind) = k_floor * output_size(kind); below
@@ -433,6 +474,9 @@ struct LaneParams {
     // native-ridge gate, default OFF (nr_version 0, UINT64_MAX) =>
     // byte-identical to the p1+p2 lane on every schedule.
     NrGate nr{};
+    // ADD-ONLY, digest-neutral by construction (see FeeModelGate): the v36
+    // fee model on the XMR lane, default OFF => master-identical.
+    FeeModelGate fee{};
     // STEP-0 hotfix: the coinbase no-dust floor coefficient (see K_FLOOR_NONE
     // above). h_min(kind) = k_floor * output_size(kind). DIGEST-COMMITTED when
     // non-zero ("KFL1" in the V37H header leaf); 0 = no floor, digest-neutral.
@@ -3803,8 +3847,10 @@ private:
     //   * D_net@base — the entering atom's committed read (ruling D: a single
     //     read at the boundary; it IS the first fresh atom at or past it);
     //   * the divisor — the raw work admitted over the period JUST ENDED
-    //     (ruling E's one-period lag, which is what cancels W_cur and makes
-    //     the fixed point independent of the current width);
+    //     (ruling E's one-period lag), measured over that period's span in
+    //     bins (R_b, or the part of it since the flip), so the rate is
+    //     raw / span and the fixed point C * D / rate does not depend on the
+    //     current width (winlaw::retarget_width_over; WL-3);
     //   * formula / floor-to-R / x4-div4 damping / clamp — shadow_widthlaw.hpp
     //     unchanged (ruling F), the same pure function the S4 KATs pin.
     // A ZERO read HOLDS W [ND-R11 default, OWED — the alternative is
@@ -3816,6 +3862,10 @@ private:
         const u64 Rb = m_p.nr.retarget_bins;
         const u64 due = (m_nr_t / Rb) * Rb;
         if (due <= m_nr_last_retarget_bin) return;
+        // The period just ended: [last boundary, due), but the work of the
+        // flip's own period only counts from the flip (t0).
+        const u64 span_lo = std::max(m_nr_last_retarget_bin, m_nr_t0);
+        const u64 span = due > span_lo ? due - span_lo : 0;
         Op op; op.type = Op::Type::NrWidth;
         op.nr_flag = true;
         op.nr_a = m_W_bins;
@@ -3828,14 +3878,14 @@ private:
         m_nr_raw_cur = 0;
         m_nr_dnet_at_base = a.d_net;
         if (!a.d_net.is_zero()) {
-            // The width law is winlaw::retarget_width — the SAME pure function
+            // The width law is winlaw::retarget_width(_over) — the SAME pure function
             // the positional window declares and the S4 KATs pin (width-matrix
             // 9253fa42..., ND-R14 order: damp -> clamp -> floor-to-R LAST). It
             // is NOT re-implemented here. What is built below is a PARAMETER
             // VIEW of NrGate, never a gate: the ridge's own operator-baked
             // constants, in the shape the law reads them.
-            m_W_bins = winlaw::retarget_width(a.d_net, m_W_bins, m_nr_raw_prev,
-                                              nr_width_params());
+            m_W_bins = winlaw::retarget_width_over(a.d_net, m_W_bins, m_nr_raw_prev,
+                                                   span, nr_width_params());
         }
         ++m_nr_retargets;
         m_journal.push_back(std::move(op));

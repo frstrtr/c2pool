@@ -72,6 +72,23 @@ def connect(db_path):
             stale_pct    REAL NOT NULL,
             PRIMARY KEY (day, worker)
         )""")
+    # #959: silent-worker snapshots for the notify engine. A poll row is
+    # written only when the API carried workers_silent; older binaries omit
+    # it, so missing data is never read as "nobody silent".
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS silent_polls (
+            ts INTEGER NOT NULL PRIMARY KEY
+        )""")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS silent_samples (
+            ts                INTEGER NOT NULL,
+            worker            TEXT    NOT NULL,
+            silent_seconds    INTEGER NOT NULL,
+            threshold_seconds INTEGER NOT NULL,
+            has_shared        INTEGER NOT NULL,
+            connections       INTEGER NOT NULL,
+            PRIMARY KEY (ts, worker)
+        )""")
     con.commit()
     return con
 
@@ -99,6 +116,16 @@ def record_sample(con, stats):
     con.execute(
         "INSERT OR REPLACE INTO pool_samples(ts,shares_total,shares_orphan,shares_dead) VALUES(?,?,?,?)",
         (ts, int(sh.get("total", 0)), int(sh.get("orphan", 0)), int(sh.get("dead", 0))))
+    silent = stats.get("workers_silent")
+    if isinstance(silent, list):
+        con.execute("INSERT OR REPLACE INTO silent_polls(ts) VALUES(?)", (ts,))
+        con.executemany(
+            "INSERT OR REPLACE INTO silent_samples(ts,worker,silent_seconds,"
+            "threshold_seconds,has_shared,connections) VALUES(?,?,?,?,?,?)",
+            [(ts, str(s["worker"]), int(s.get("silent_seconds", 0)),
+              int(s.get("threshold_seconds", 0)), 1 if s.get("has_shared") else 0,
+              int(s.get("connections", 0)))
+             for s in silent if isinstance(s, dict) and s.get("worker")])
     con.commit()
     return len(rows)
 
@@ -162,6 +189,8 @@ def rollup(con, interval):
     cutoff = now_ts() - RAW_RETENTION_DAYS * 86400
     con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
     con.execute("DELETE FROM pool_samples WHERE ts < ?", (cutoff,))
+    con.execute("DELETE FROM silent_samples WHERE ts < ?", (cutoff,))
+    con.execute("DELETE FROM silent_polls WHERE ts < ?", (cutoff,))
     con.commit()
     print(f"rolled up {n_rows} per-worker/day rows; pruned raw < {RAW_RETENTION_DAYS}d")
 
@@ -325,6 +354,31 @@ def _selftest():
     check("ingest: empty payload -> no worker rows", n == 0)
     check("ingest: empty payload -> pool row still written zeroed",
           con.execute("SELECT COUNT(*) FROM pool_samples").fetchone()[0] == 1)
+
+    # 10) #959 workers_silent ingest. A present list is a poll (even when
+    #     empty: nobody silent); an absent or JSON-null field (older binary)
+    #     writes NO poll row, so the notify engine cannot mistake missing data
+    #     for a recovery.
+    con = fresh()
+    record_sample(con, {"workers_silent": [{"worker": "A.r1", "silent_seconds": 900,
+                                            "threshold_seconds": 600,
+                                            "has_shared": True, "connections": 2}]})
+    check("silent ingest: list -> one poll row",
+          con.execute("SELECT COUNT(*) FROM silent_polls").fetchone()[0] == 1)
+    check("silent ingest: named worker carried with its fields",
+          con.execute("SELECT worker,silent_seconds,threshold_seconds,has_shared,"
+                      "connections FROM silent_samples").fetchall()
+          == [("A.r1", 900, 600, 1, 2)])
+    con = fresh()
+    record_sample(con, {"workers_silent": []})
+    check("silent ingest: empty list is a poll with no silent rows",
+          con.execute("SELECT COUNT(*) FROM silent_polls").fetchone()[0] == 1
+          and con.execute("SELECT COUNT(*) FROM silent_samples").fetchone()[0] == 0)
+    con = fresh()
+    record_sample(con, {})
+    record_sample(con, {"workers_silent": None})
+    check("silent ingest: absent/null field -> no poll row",
+          con.execute("SELECT COUNT(*) FROM silent_polls").fetchone()[0] == 0)
 
     print("\nSELFTEST PASS" if not fails else "\nSELFTEST FAIL: " + ", ".join(fails))
     return 1 if fails else 0

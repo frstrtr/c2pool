@@ -61,6 +61,25 @@ public:
     // Score a peer down / ban it. PeerFault::BadPow is a 24 h ban on its own.
     virtual void penalize(const PeerRef&, PeerFault, const std::string& why) = 0;
 
+    // The block this peer just PUSHED (NOTIFY_NEW_BLOCK 2001 / NOTIFY_NEW_FLUFFY_BLOCK
+    // 2008) is one the index HAS: on the best chain (it just connected, or it was
+    // already there), or held as a valid, resolved alt candidate. The push was
+    // charged to the peer's block DoS bucket on arrival, before anyone could know
+    // that; this hands the token back. Under a fast cadence every honest peer
+    // relays every block -- one link delivers the copy that connects, the others
+    // deliver duplicates of it -- and a bucket sized for one block per 120 s would
+    // otherwise drain in seconds and drop every monerod link (D3a).
+    //
+    // NEVER called for a block the index could not take as valid: an unknown
+    // parent (a parked orphan), a bodiless announcement still waiting for its
+    // transactions, a block held because its proof of work could not be checked,
+    // or a rejected one. Those keep their charge, so invalid blocks and floods of
+    // unknown blocks are scored exactly as before.
+    //
+    // Called on the verify thread with the index lock held, like penalize(), so an
+    // implementation must only post. Default: nothing (no bucket to refund).
+    virtual void credit_known_block(const PeerRef&) {}
+
     // Currently handshaked peers and their last advertised sync data, so C2 can
     // pick sync sources and compute the cohort height.
     virtual std::vector<std::pair<PeerRef, PeerSyncData>> peers() const = 0;

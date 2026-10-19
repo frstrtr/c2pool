@@ -40,18 +40,34 @@
 namespace c2pool::xmr::native {
 
 // --- stagenet ---------------------------------------------------------------
-// Minted from a synced monerod 0.18.5.1 over read-only RPC; see the '#' header
-// inside the file for tip, date and burial depth.
+// THE PINNED ONE: format 2 at H_a 2213803, committing the output/spent roots of
+// the release's stagenet output-set snapshot. Its file sha256 and the
+// snapshot's are pinned in xmr_anchor_pinned.hpp and listed in
+// docs/xmr-lane/PINNED-SNAPSHOTS.md. Minted from a synced monerod 0.18.5.1
+// over read-only RPC; see the '#' header inside the file for tip, date and
+// burial depth.
 inline constexpr const char* ANCHOR_EMBEDDED_STAGENET =
+#include "impl/xmr/native/anchor/xmr_chain_anchor_stagenet_f2.inc"
+;
+
+// The earlier FORMAT-1 stagenet bundle (H_a 2204000, no committed output
+// set). No longer what a stagenet node boots from; kept compiled so the codec
+// KAT keeps a real format-1 bundle to read back byte for byte.
+inline constexpr const char* ANCHOR_EMBEDDED_STAGENET_F1 =
 #include "impl/xmr/native/anchor/xmr_chain_anchor_stagenet.inc"
 ;
 
-// --- mainnet / testnet / regtest --------------------------------------------
-// Not yet minted. Wave 1 runs on stagenet (plan section 8, M0-M4), mainnet is
-// pinned at the release that first claims it, and regtest has no stable chain
-// to pin at all -- a regtest node is expected to pass --anchor-path or to start
-// from its own daemon.
-inline constexpr const char* ANCHOR_EMBEDDED_MAINNET = nullptr;
+// --- mainnet ----------------------------------------------------------------
+// THE PINNED ONE: format 2 at H_a 3765865, minted from the operator's own
+// synced monerod and pinned like stagenet. The 18 GB output-set snapshot it
+// commits to ships beside the release, not inside the binary.
+inline constexpr const char* ANCHOR_EMBEDDED_MAINNET =
+#include "impl/xmr/native/anchor/xmr_chain_anchor_mainnet_f2.inc"
+;
+
+// --- testnet / regtest ------------------------------------------------------
+// Not minted. Regtest has no stable chain to pin at all -- a regtest node is
+// expected to pass --anchor-path or to start from its own daemon.
 inline constexpr const char* ANCHOR_EMBEDDED_TESTNET = nullptr;
 inline constexpr const char* ANCHOR_EMBEDDED_REGTEST = nullptr;
 

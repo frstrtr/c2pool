@@ -1,0 +1,67 @@
+name: TLA model check
+
+# Runs TLC on the Path B TLA+ models in proto/tla/ (PathBRatchet.tla and
+# PathBSealRNP.tla) so a change that breaks a modelled invariant fails the PR.
+# Per-PR configs use the small model bounds (L 4 / GRACE 6 / TIMEOUT 9; about
+# 18 minutes on 4 workers). The extended runs (TLC_LONG=1; see proto/tla/README.md) run on
+# the nightly schedule and on manual dispatch. Path-scoped to proto/tla/** on
+# push and PR, so it adds zero load to any coin lane.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'proto/tla/**'
+      - '.github/workflows/tla-model-check.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'proto/tla/**'
+      - '.github/workflows/tla-model-check.yml'
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Match the fleet fail-fast-on-stalled-fetch convention (see pplns-parse-seedpin.yml).
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '20'
+  TLA_TOOLS_URL: 'https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar'
+  TLA_TOOLS_SHA256: '936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88'
+
+jobs:
+  tlc:
+    name: tlc ratchet + seal
+    # Self-hosted for trusted events; fork PRs fall back to GitHub-hosted
+    # (never run untrusted fork code self-hosted) -- the proto-harness.yml pattern.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Fetch TLC (pinned, sha256-verified)
+        run: |
+          curl -fsSL --retry 3 -o tla2tools.jar "$TLA_TOOLS_URL"
+          echo "$TLA_TOOLS_SHA256  tla2tools.jar" | sha256sum -c -
+
+      - name: PathBRatchet.tla
+        env:
+          TLC_LONG: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
+        run: sh proto/tla/check-ratchet.sh "$PWD/tla2tools.jar" "$RUNNER_TEMP/tlc-ratchet"
+
+      - name: PathBSealRNP.tla
+        run: sh proto/tla/check-seal-rnp.sh "$PWD/tla2tools.jar" "$RUNNER_TEMP/tlc-seal"
+
+      # Steady-state disk hygiene on the self-hosted runners (same as
+      # proto-harness.yml). Always runs; no-op on GitHub-hosted.
+      - name: Prune runner workspace
+        if: always()
+        uses: ./.github/actions/prune-runner-workspace

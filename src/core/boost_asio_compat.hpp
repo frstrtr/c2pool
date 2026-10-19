@@ -27,6 +27,21 @@
 // eviction. Guarded so it stays inert on any Boost that still ships the
 // namespace itself.
 //
+// The top-level CMakeLists.txt pairs the force-include with conan's
+// Boost::headers include dir, so every TU resolves <boost/version.hpp> from the
+// pinned Boost. The __has_include guard keeps the shim inert (instead of a hard
+// "boost/version.hpp: No such file" error) for a TU compiled with no Boost on
+// its include path at all: such a TU includes no Boost.Asio, so it has nothing
+// for the shim to fix.
+#if defined(__has_include)
+#  if __has_include(<boost/version.hpp>)
+#    define C2POOL_BOOST_ASIO_COMPAT_HAVE_BOOST 1
+#  endif
+#else
+#  define C2POOL_BOOST_ASIO_COMPAT_HAVE_BOOST 1
+#endif
+
+#ifdef C2POOL_BOOST_ASIO_COMPAT_HAVE_BOOST
 #include <boost/version.hpp>
 
 #if BOOST_VERSION >= 108400
@@ -55,3 +70,4 @@ inline void invoke(const Function& function, Context& /*context*/)
 
 #endif // BOOST_ASIO_DETAIL_HANDLER_INVOKE_HELPERS_HPP
 #endif // BOOST_VERSION >= 108400
+#endif // C2POOL_BOOST_ASIO_COMPAT_HAVE_BOOST

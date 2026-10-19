@@ -122,7 +122,8 @@ enum class ConnectStatus : std::uint8_t {
     FutureTimestamp,    // ahead of local time: SOFT, retry, never a ban
     BodiesMissing,      // weight not computable yet (fluffy, uncompleted)
     BlockTooBig,        // weight > 2 * median: unpayable
-    BadCoinbase,        // coinbase amount does not match the reward rule
+    BadCoinbase,        // coinbase amount does not match the reward rule, or
+                        // the miner tx has more outputs than its fork allows
     BelowAnchor,        // refuses to touch pinned history
 };
 
@@ -353,6 +354,19 @@ public:
             return ConnectStatus::HeightMismatch;
         }
 
+        // Miner-tx output count by fork, as Monero's prevalidate_miner_transaction
+        // judges it (HF_VERSION_REJECT_MANY_MINER_OUTPUTS /
+        // FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS, see xmr_block_parse.hpp). Keyed on
+        // the block's own major version, which is Monero's hf_version for any
+        // block its fork check accepts; up to v16 the bound is the parse
+        // ceiling and this never fires.
+        if (!miner_tx_output_count_ok(h.major_version, in.parsed.miner_tx.n_outputs)) {
+            why = "miner tx carries " + std::to_string(in.parsed.miner_tx.n_outputs)
+                + " outputs, the limit at major version " + std::to_string(h.major_version)
+                + " is " + std::to_string(max_miner_tx_outputs(h.major_version));
+            return ConnectStatus::BadCoinbase;
+        }
+
         const TimestampStatus ts = timestamps_.check(h.timestamp, now);
         if (ts == TimestampStatus::TooFarInFuture) {
             why = "block timestamp " + std::to_string(h.timestamp)
@@ -460,7 +474,20 @@ public:
 
     // The fuse is per-state and never resets while the state lives; exposed for
     // the telemetry surface.
-    bool allows(HfCapability c) const noexcept { return fuse_.allows(c); }
+    bool allows(HfCapability c) const noexcept {
+        return fuse_.allows(c) && (!unknown_fork_tripped_ || hf_capability_survives_roll(c));
+    }
+
+    // The chain has moved to a fork this build cannot even PARSE: the index's
+    // UnknownForkWatch saw above-version blocks from >= 2 distinct peers AND a
+    // stalled tip (FORK-FUSE-2). Such blocks never reach connect(), so the
+    // gate is set here. Same capability withdrawal as the latch (no template,
+    // no tx admission), but NOT a latch: an unauthenticated above-version
+    // header cannot be PoW-checked, so the watch clears the gate again when
+    // the v16 chain extends the tip by 2 blocks. The rolled-fork latch
+    // (fuse_) is untouched.
+    void set_unknown_fork_tripped(bool v) noexcept { unknown_fork_tripped_ = v; }
+    bool unknown_fork_tripped() const noexcept { return unknown_fork_tripped_; }
 
 private:
     void trim_rows_() {
@@ -478,6 +505,7 @@ private:
     std::uint64_t          verified_frontier_ = 0;
     std::uint64_t          epoch_seq_         = 0;
     HfFuse                 fuse_{};
+    bool                   unknown_fork_tripped_ = false;   // FORK-FUSE-2 gate, clearable
 };
 
 } // namespace c2pool::xmr::native

@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sharechain/v37/v37_hash.hpp>   // bytes32, sha256, sha256d
@@ -210,6 +211,13 @@ struct WorkEvent {
     bytes32 prev_own_share{};      // miner's previous chained share (preimage)
     std::uint32_t lz_bits = 0;     // the target this work was mined against
     u64 nonce = 0;
+    // Fee model S3 (v36 share_data.donation): the give-author u16 over 65535,
+    // PoW-COMMITTED -- appended to the preimage (le16, after the nonce) iff
+    // non-zero, so donation == 0 hashes byte-identically to the 112-byte
+    // v0x01/v0x02 preimage (every existing golden holds) while a non-zero
+    // value cannot be altered without redoing the work. The fold reads it
+    // HERE (donation_split), never from a feed line.
+    std::uint16_t donation = 0;
     ::v37::PayoutDescriptor descriptor;  // real descriptor (self-carriage push)
     std::string tag;                     // bookkeeping only (NOT in preimage)
 
@@ -224,7 +232,17 @@ struct WorkEvent {
             v.push_back((std::uint8_t)(lz_bits >> (8 * i)));
         for (int i = 0; i < 8; ++i)
             v.push_back((std::uint8_t)(nonce >> (8 * i)));
+        if (donation != 0) {   // S3: fixed-length forms 112 (d = 0) | 114 (d != 0) -- unambiguous
+            v.push_back((std::uint8_t)(donation & 0xff));
+            v.push_back((std::uint8_t)(donation >> 8));
+        }
         return v;
+    }
+    // v36 weights: miner att*(65535 - d), donation att*d, as two exact integer
+    // parts of the work w (sum == w; the miner keeps the floor remainder).
+    std::pair<u64, u64> donation_split(u64 w) const {
+        const u64 don = (u64)(((unsigned __int128)w * donation) / 65535u);
+        return {w - don, don};
     }
     bytes32 hash() const { return sha256d(preimage()); }
     bool meets_own_target() const {

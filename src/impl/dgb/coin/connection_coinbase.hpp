@@ -135,6 +135,14 @@ struct ConnCoinbasePplnsInputs
     uint256  ref_hash;                            // p2pool ref_hash (32B)
     uint64_t last_txout_nonce{0};                 // OP_RETURN nonce (extranonce slot)
 
+    // #884: the {mint, vote} version pair the AutoRatchet selected ONCE for this
+    // template. Not read by the coinbase build below (the version-dependent
+    // fields are use_v36_pplns / finder_script / donation_script); the work
+    // source freezes it onto the job so the mint stamps the SAME version the
+    // miner's coinbase was built for. Default 36 == the pre-#884 hardcode.
+    int64_t  share_version{36};
+    uint64_t desired_version{36};
+
     // DGB-as-DOGE-parent merged-mining commitment (-DAUX_DOGE=ON path only).
     // The pre-built 44-byte AuxPoW MM tag (magic fabe6d6d || aux_merkle_root32 BE
     // || size4 LE || nonce4 LE) produced by dgb::coin::build_aux_mm_commitment

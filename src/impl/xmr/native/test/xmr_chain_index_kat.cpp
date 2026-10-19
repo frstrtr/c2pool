@@ -58,6 +58,7 @@
 // here would pin nothing new.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -158,6 +159,23 @@ static Hash id_of(const BlockEntry& e) {
     return ev.input.identity.id;
 }
 
+static std::vector<std::uint8_t> hashing_blob_of(const BlockEntry& e) {
+    EvaluatedBlock ev;
+    std::string    why;
+    if (evaluate_block(e, ev, why) != EvalStatus::Ok) return {};
+    return ev.input.identity.hashing_blob;
+}
+
+// The chain request's answer: a chain entry from `p` naming `ids` after the splice `from` (ours, at height `h`).
+static void want(ChainIndex& idx, const PeerRef& p, const Hash& from, std::uint64_t h, const std::vector<Hash>& ids) {
+    ChainEntry e;
+    e.ids.push_back(from);
+    for (const Hash& x : ids) e.ids.push_back(x);
+    e.start_height = h;
+    e.total_height = h + e.ids.size();
+    idx.on_chain_entry(p, std::move(e));
+}
+
 // =============================================================================
 // a model RandomX verifier, shaped exactly like c2pool::xmr::LightVerifier
 // =============================================================================
@@ -178,15 +196,19 @@ public:
         return nxt_ && *nxt_ == s;
     }
 
-    VerifyStatus verify(const std::uint8_t*, std::size_t, const Hash& seed,
+    VerifyStatus verify(const std::uint8_t* blob, std::size_t len, const Hash& seed,
                         std::uint64_t, std::uint64_t, std::uint8_t out[32]) {
         if (down_) return VerifyStatus::NotInitialized;
         if (!seed_resident(seed)) return VerifyStatus::SeedNotResident;
         ++hashes;
         for (int i = 0; i < 32; ++i) out[i] = static_cast<std::uint8_t>(i);
         seeds_used.push_back(seed);
+        for (const std::vector<std::uint8_t>& b : below)
+            if (b.size() == len && std::equal(b.begin(), b.end(), blob)) return VerifyStatus::BelowTarget;
         return fail_next_ ? VerifyStatus::BelowTarget : VerifyStatus::Accept;
     }
+
+    std::vector<std::vector<std::uint8_t>> below;   // hashing blobs whose proof of work is below target
 
     void fail_next(bool v) { fail_next_ = v; }
     void set_down(bool v)  { down_ = v; }
@@ -374,17 +396,33 @@ static void test_wire_validation() {
     idx.on_chain_entry(p, entry_with({fake_id(777), fake_id(778)}, 10, 1000, {}));
     checkf(idx.chain_entries_refused() == 5, "wire: unknown splice point was not refused");
 
-    // 6. A well-formed entry is accepted, and what we do not have becomes a
-    //    fetch request -- chunked to monerod's 100-id request cap by the fetcher.
+    // 6. A well-formed entry is accepted, and what we do not have becomes the
+    //    want list the sync driver fetches from (refetch_wanted()). The index
+    //    itself puts nothing on the wire: a whole entry sent as one span was
+    //    the mainnet catch-up livelock (nothing connects until all ~21 chunks
+    //    of a 2048-id span are in, and a peer drop loses all of it).
     std::vector<Hash> ids{known};
     for (std::uint64_t i = 0; i < 250; ++i) ids.push_back(fake_id(1000 + i));
     idx.on_chain_entry(p, entry_with(ids, G::TEST_FIRST - 1, G::TEST_FIRST + 400, {}));
     checkf(idx.chain_entries_accepted() == 1, "wire: a well-formed chain entry was refused");
     checkf(idx.refetch_wanted().size() == 250,
            "wire: expected 250 wanted ids, got %zu", idx.refetch_wanted().size());
-    checkf(fetcher.chunking_ok(), "wire: an objects request broke the 100-id cap");
-    checkf(fetcher.object_requests.size() == 3,
-           "wire: 250 ids should chunk into 3 requests, got %zu", fetcher.object_requests.size());
+    checkf(fetcher.object_requests.empty(),
+           "wire: the index put %zu objects requests on the wire itself",
+           fetcher.object_requests.size());
+    checkf(idx.sync_state().chain_entries == 1, "wire: SyncState does not count the entry");
+
+    // 7. THE FETCH WINDOW: of a 2000-id entry only the part within half the alt
+    //    pool above our tip is handed out, in order -- fetching further ahead
+    //    than the pool can hold only feeds its eviction.
+    std::vector<Hash> big{known};
+    for (std::uint64_t i = 0; i < 2000; ++i) big.push_back(fake_id(5000 + i));
+    idx.on_chain_entry(p, entry_with(big, G::TEST_FIRST - 1, G::TEST_FIRST + 4000, {}));
+    const std::vector<Hash> win = idx.refetch_wanted();
+    checkf(win.size() == o.alt_max_blocks / 2,
+           "wire: a 2000-id entry hands out %zu ids, expected the %zu-id window",
+           win.size(), o.alt_max_blocks / 2);
+    checkf(!win.empty() && win.front() == big[1], "wire: the window does not start at the tip");
 }
 
 // =============================================================================
@@ -728,9 +766,10 @@ struct Fixture {
     std::vector<std::uint64_t> main_ts;
     Hash seed_tip{};
 
-    explicit Fixture(std::uint64_t n_main = 6, std::uint64_t max_reorg = 720) {
+    explicit Fixture(std::uint64_t n_main = 6, std::uint64_t max_reorg = 720, std::size_t alt_max_blocks = 0) {
         opts.net             = XmrNet::Stagenet;
         opts.max_reorg_depth = max_reorg;
+        if (alt_max_blocks) opts.alt_max_blocks = alt_max_blocks;
         idx = new ChainIndex(opts, src);
         seed_stagenet(*idx);
         idx->set_fetcher(&fetcher);
@@ -885,11 +924,11 @@ static void test_reorg_refusals() {
         ChainIndex& idx = *f.idx;
         const std::uint64_t reward = idx.view().state().expected_base_reward();
         // A block whose parent is the anchor's own parent: not in the index at
-        // all, so it parks as an orphan rather than being judged -- which is the
-        // correct refusal for something we cannot even place.
+        // all, and nobody asked for it, so it is refused with no strike rather
+        // than judged -- the correct refusal for something we cannot even place.
         BlockEntry e = f.sibling(stagenet_seed_row().prev_id, G::TEST_FIRST - 1, 5, reward);
         const OfferResult r = idx.offer_block(&f.peer_, e, false);
-        checkf(r.outcome == OfferOutcome::ParkedOrphan,
+        checkf(r.outcome == OfferOutcome::Rejected && !r.peer_fault && !idx.have_block(id_of(e)),
                "refusal: a pre-anchor block was %s", to_string(r.outcome));
         checkf(idx.tip()->height == G::TEST_FIRST + 2, "refusal: the tip moved");
     }
@@ -933,8 +972,9 @@ static void test_reorg_rollback_is_exact() {
     // admission (structure, identity, work) and fails only when the switch tries
     // to connect it -- exactly the case that must leave no trace.
     //
-    // The branch is OFFERED YOUNGEST FIRST, so every block but the first parks
-    // as an orphan and the whole branch resolves at once when its root lands.
+    // The branch is OFFERED YOUNGEST FIRST (named by a chain entry first), so
+    // every block but the first parks as an orphan and the whole branch
+    // resolves at once when its root lands.
     // That is what makes the switch attempt the full five blocks in one go --
     // including the invalid one -- instead of adopting the valid prefix first
     // and then merely refusing to extend it.
@@ -947,6 +987,11 @@ static void test_reorg_rollback_is_exact() {
         BlockEntry e = f.sibling(prev, h, static_cast<std::uint8_t>(40 + i), reward);
         prev = id_of(e);
         alt_entries.push_back(std::move(e));
+    }
+    {   // the chain request named the branch: its blocks may wait without proven work
+        std::vector<Hash> ids;
+        for (const BlockEntry& e : alt_entries) ids.push_back(id_of(e));
+        want(idx, f.peer_, f.main_ids[0], G::TEST_FIRST, ids);
     }
     for (std::size_t i = alt_entries.size(); i-- > 0; )
         idx.offer_block(&f.peer_, alt_entries[i], false);
@@ -1009,9 +1054,11 @@ static void test_bad_pow_is_banned() {
     checkf(idx.bans() == 1, "badpow: the peer was not banned");
     checkf(idx.tip()->height == G::TEST_FIRST - 1, "badpow: the tip moved on a bad proof");
 
-    // Fail-closed: a proof we could not check does not join the chain either.
+    // Fail-closed: a proof we could not check does not join the chain either
+    // (held: a block we asked for).
     pow.verdict  = PowVerdict::SeedMissing;
     pow.resident = true;
+    want(idx, p4, stagenet_seed_row().id, G::TEST_FIRST - 1, {id_of(e)});
     const OfferResult r2 = idx.offer_block(&p4, e, false);
     checkf(r2.outcome == OfferOutcome::StoredAsAlt,
            "failclosed: an uncheckable block was %s, expected StoredAsAlt",
@@ -1291,6 +1338,7 @@ static void test_k1_bodiless_park_after_parent_connects() {
     BlockEntry C = make_bodiless_block(hc.major_version, hc.minor_version, hc.timestamp,
                                        b_id, 78, h + 2, reward, /*salt=*/3, /*ntx=*/1);
     const Hash c_id = id_of(C);
+    want(*f.idx, pr, tip, h - 1, {a_id, b_id, c_id});   // the chain request named them
 
     OfferResult r = f.idx->offer_block(&pr, B, false);
     checkf(r.outcome == OfferOutcome::ParkedOrphan, "k1: push B was %s", to_string(r.outcome));
@@ -1337,6 +1385,7 @@ static void test_k2_held_parent_keeps_children_edges() {
     const Hash a_id = id_of(A);
     BlockEntry B = f.sibling(a_id, h + 1, /*salt=*/2, reward);
     const Hash b_id = id_of(B);
+    want(*f.idx, pr, tip, h - 1, {a_id, b_id});   // the chain request named them
 
     OfferResult r = f.idx->offer_block(&pr, B, false);
     checkf(r.outcome == OfferOutcome::ParkedOrphan, "k2: B was %s", to_string(r.outcome));
@@ -1353,8 +1402,315 @@ static void test_k2_held_parent_keeps_children_edges() {
            (unsigned long long)f.idx->tip()->height, (unsigned long long)(h + 1));
 }
 
+// L1. ONLY A BLOCK WE ASKED FOR WAITS WITHOUT PROVEN WORK. An orphan pushed unasked is refused: no strike, nothing
+// held, no parent asked for. The chain request names it; the same block, an answer now, parks; its parent lands and
+// both connect.
+static void test_l1_unasked_orphan_refused() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/1, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/2, reward);
+
+    const OfferResult r = idx.offer_block(&p5, B, false);
+    checkf(r.outcome == OfferOutcome::Rejected && !r.peer_fault && !idx.have_block(id_of(B))
+                   && f.fetcher.penalties.empty() && idx.unsolicited_dropped() == 1 && idx.refetch_wanted().empty(),
+           "l1: an unasked orphan push was %s (held %d, %zu strikes, %zu asked): expected refused, no strike, nothing "
+           "asked", to_string(r.outcome), idx.have_block(id_of(B)) ? 1 : 0, f.fetcher.penalties.size(),
+           idx.refetch_wanted().size());
+
+    want(idx, p5, tip, h - 1, {id_of(A), id_of(B)});
+    idx.on_objects(p5, std::vector<BlockEntry>{B}, {}, h + 2);
+    checkf(idx.have_block(id_of(B)) && idx.tip()->height == h - 1,
+           "l1: the same block, asked for, does not park (held %d, tip %llu)", idx.have_block(id_of(B)) ? 1 : 0,
+           static_cast<unsigned long long>(idx.tip()->height));
+    idx.on_objects(p5, std::vector<BlockEntry>{A}, {}, h + 2);
+    checkf(idx.tip() && idx.tip()->id == id_of(B) && f.fetcher.penalties.empty(),
+           "l1: its parent landed and the tip is %llu, expected %llu (%zu strikes)",
+           static_cast<unsigned long long>(idx.tip()->height), static_cast<unsigned long long>(h + 1),
+           f.fetcher.penalties.size());
+}
+
+// L2. A SOURCE'S BLOCKS WITHOUT PROVEN WORK GO WITH ITS BAD WORK. Peer X serves B and C (a branch above A) and D (an
+// orphan elsewhere), all asked for; peer Y serves E (an orphan) and then A. A connects; B, the earliest block X served,
+// resolves and fails its proof of work: B's branch goes, and with it every block without proven work X served (D);
+// X is struck once; Y's E stays. L3: the same when X's failing block is judged on arrival (its parent is ours).
+static std::size_t strikes_of(const fakes::FakeFetcher& f, const PeerRef& p) {
+    std::size_t n = 0;
+    for (const auto& x : f.penalties) n += x.peer.addr == p.addr && x.fault == PeerFault::BadPow ? 1 : 0;
+    return n;
+}
+
+static void test_l2_source_drop_on_resolve() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef x = peer(6), y = peer(7);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/11, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/12, reward);
+    const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/13, reward);
+    const BlockEntry D = f.sibling(fake_id(901), h + 1, /*salt=*/14, reward);
+    const BlockEntry E = f.sibling(fake_id(902), h + 1, /*salt=*/15, reward);
+    want(idx, x, tip, h - 1, {id_of(A), id_of(B), id_of(C), id_of(D), id_of(E)});
+    for (const BlockEntry* e : {&B, &C, &D}) idx.offer_block(&x, *e, false);
+    idx.offer_block(&y, E, false);
+    checkf(idx.have_block(id_of(B)) && idx.have_block(id_of(C)) && idx.have_block(id_of(D)) && idx.have_block(id_of(E)),
+           "l2: the four asked-for orphans are parked");
+
+    f.mv.below.push_back(hashing_blob_of(B));
+    const OfferResult r = idx.offer_block(&y, A, false);
+    checkf(r.outcome == OfferOutcome::Connected && idx.tip()->id == id_of(A), "l2: A became %s (%s)",
+           to_string(r.outcome), r.why.c_str());
+    checkf(!idx.have_block(id_of(B)) && !idx.have_block(id_of(C)) && !idx.have_block(id_of(D)) && idx.have_block(id_of(E)),
+           "l2: after X's B failed its proof of work: B %d C %d D %d (expected gone) E %d (expected held)",
+           idx.have_block(id_of(B)) ? 1 : 0, idx.have_block(id_of(C)) ? 1 : 0, idx.have_block(id_of(D)) ? 1 : 0,
+           idx.have_block(id_of(E)) ? 1 : 0);
+    checkf(strikes_of(f.fetcher, x) == 1 && strikes_of(f.fetcher, y) == 0 && idx.source_dropped() == 1,
+           "l2: X struck %zu (expected 1), Y struck %zu (expected 0), dropped with the source %llu (expected 1)",
+           strikes_of(f.fetcher, x), strikes_of(f.fetcher, y), static_cast<unsigned long long>(idx.source_dropped()));
+}
+
+static void test_l3_source_drop_on_arrival() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef x = peer(6), y = peer(7);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/21, reward);
+    const BlockEntry D = f.sibling(fake_id(911), h + 1, /*salt=*/24, reward);
+    const BlockEntry E = f.sibling(fake_id(912), h + 1, /*salt=*/25, reward);
+    want(idx, x, tip, h - 1, {id_of(A), id_of(D), id_of(E)});
+    idx.offer_block(&x, D, false);
+    idx.offer_block(&y, E, false);
+    f.mv.below.push_back(hashing_blob_of(A));
+    const OfferResult r = idx.offer_block(&x, A, false);
+    checkf(r.outcome == OfferOutcome::Rejected && r.fault == PeerFault::BadPow && !idx.have_block(id_of(D))
+                   && idx.have_block(id_of(E)) && strikes_of(f.fetcher, x) == 1 && strikes_of(f.fetcher, y) == 0,
+           "l3: X's A was %s; D %d (expected gone), E %d (expected held), X struck %zu, Y struck %zu",
+           to_string(r.outcome), idx.have_block(id_of(D)) ? 1 : 0, idx.have_block(id_of(E)) ? 1 : 0,
+           strikes_of(f.fetcher, x), strikes_of(f.fetcher, y));
+}
+
+// L4. ONLY THE PART OF THE WANT LIST HANDED OUT. With an alt store of 4 the fetch window is 2: a chain entry names A,
+// B, C, D (heights h .. h + 3 above the tip at h - 1). D, beyond the window, pushed: refused with no strike; B, within
+// it, parks. A lands: A and B connect, the window moves up to h + 3, and D, pushed again, parks; C lands and the tip
+// is D.
+static void test_l4_wanted_beyond_window() {
+    Fixture f(6, 720, /*alt_max_blocks=*/4);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/31, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/32, reward);
+    const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/33, reward);
+    const BlockEntry D = f.sibling(id_of(C), h + 3, /*salt=*/34, reward);
+    want(idx, p5, tip, h - 1, {id_of(A), id_of(B), id_of(C), id_of(D)});
+    const OfferResult rd = idx.offer_block(&p5, D, false);
+    const OfferResult rb = idx.offer_block(&p5, B, false);
+    checkf(rd.outcome == OfferOutcome::Rejected && !rd.peer_fault && !idx.have_block(id_of(D))
+                   && rb.outcome == OfferOutcome::ParkedOrphan && f.fetcher.penalties.empty()
+                   && idx.unsolicited_dropped() == 1,
+           "l4: a wanted id beyond the fetch window was %s (held %d), one within it %s (%zu strikes): expected refused "
+           "with no strike, and parked", to_string(rd.outcome), idx.have_block(id_of(D)) ? 1 : 0, to_string(rb.outcome),
+           f.fetcher.penalties.size());
+    idx.offer_block(&p5, A, false);
+    const std::uint64_t t1 = idx.tip()->height;
+    const OfferResult rd2 = idx.offer_block(&p5, D, false);
+    idx.offer_block(&p5, C, false);
+    checkf(t1 == h + 1 && rd2.outcome == OfferOutcome::ParkedOrphan && idx.tip()->id == id_of(D)
+                   && f.fetcher.penalties.empty(),
+           "l4: after A landed (tip %llu, expected %llu) D within the moved window was %s, the tip is %llu (expected "
+           "%llu)", static_cast<unsigned long long>(t1), static_cast<unsigned long long>(h + 1), to_string(rd2.outcome),
+           static_cast<unsigned long long>(idx.tip()->height), static_cast<unsigned long long>(h + 3));
+}
+
+// L5. A PARENT ASKED FOR AGAIN IS STILL ASKED FOR WHEN IT LANDS. A chain entry names A, B, C; C arrives first and
+// parks, its parent B goes on the refetch list; another peer's chain entry replaces the want list. B arrives with its
+// bodies (its parent A unknown): it parks, a block we asked for; A lands and the tip is C.
+static void test_l5_refetched_parent_parks() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5), p6 = peer(6);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry A = f.sibling(tip, h, /*salt=*/51, reward);
+    const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/52, reward);
+    const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/53, reward);
+    const BlockEntry X = f.sibling(tip, h, /*salt=*/59, reward);
+    want(idx, p5, tip, h - 1, {id_of(A), id_of(B), id_of(C)});
+    const OfferResult rc = idx.offer_block(&p5, C, false);
+    want(idx, p6, tip, h - 1, {id_of(X)});   // another peer's chain entry replaces the want list
+    const std::vector<Hash> rf = idx.refetch_wanted();
+    const bool b_asked = std::find(rf.begin(), rf.end(), id_of(B)) != rf.end();
+    const OfferResult rb = idx.offer_block(&p5, B, false);
+    checkf(rc.outcome == OfferOutcome::ParkedOrphan && b_asked && rb.outcome == OfferOutcome::ParkedOrphan
+                   && idx.have_block(id_of(B)) && idx.unsolicited_dropped() == 0,
+           "l5: C %s; B on the refetch list %d; B, asked for again, landed as %s (%s), held %d, refused %llu",
+           to_string(rc.outcome), b_asked ? 1 : 0, to_string(rb.outcome), rb.why.c_str(), idx.have_block(id_of(B)) ? 1 : 0,
+           static_cast<unsigned long long>(idx.unsolicited_dropped()));
+    idx.offer_block(&p5, A, false);
+    checkf(idx.tip() && idx.tip()->id == id_of(C) && f.fetcher.penalties.empty(),
+           "l5: A landed and the tip is %llu, expected %llu (C)", static_cast<unsigned long long>(idx.tip()->height),
+           static_cast<unsigned long long>(h + 2));
+}
+
+// L6. A RE-SEND KEEPS THE HELD BLOCK'S FIRST SOURCE. X from H is held fail-closed (its proof of work not checkable yet);
+// M sends X again, then a block of its own that fails its proof of work: M is struck and its unproven blocks go, but X
+// stays held (its source is H), and H is not struck.
+static void test_l6_resend_keeps_source() {
+    ScriptedPowSource pow;
+    ChainIndexOptions o;
+    o.net = XmrNet::Stagenet;
+    ChainIndex idx(o, pow);
+    seed_stagenet(idx);
+    fakes::FakeFetcher fetcher;
+    idx.set_fetcher(&fetcher);
+    const PeerRef H = peer(4), M = peer(9);
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const G::GoldenHeader& hdr = header_at(G::TEST_FIRST);
+    const BlockEntry X = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 1,
+                                    G::TEST_FIRST, reward);
+    const BlockEntry Y = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 2,
+                                    G::TEST_FIRST, reward);
+    pow.verdict  = PowVerdict::SeedMissing;
+    pow.resident = true;
+    want(idx, H, stagenet_seed_row().id, G::TEST_FIRST - 1, {id_of(X)});
+    const OfferResult r1 = idx.offer_block(&H, X, false);
+    const OfferResult r2 = idx.offer_block(&M, X, false);
+    pow.verdict = PowVerdict::BelowTarget;
+    const OfferResult r3 = idx.offer_block(&M, Y, false);
+    std::size_t sh = 0, sm = 0;
+    for (const auto& x : fetcher.penalties) {
+        sh += x.peer.addr == H.addr ? 1 : 0;
+        sm += x.peer.addr == M.addr ? 1 : 0;
+    }
+    checkf(r1.outcome == OfferOutcome::StoredAsAlt && r2.outcome == OfferOutcome::StoredAsAlt
+                   && r3.fault == PeerFault::BadPow && idx.have_block(id_of(X)) && idx.source_dropped() == 0 && sh == 0
+                   && sm == 1,
+           "l6: X from H %s, again from M %s, M's bad block %s: X held %d (expected 1), dropped with the source %llu "
+           "(expected 0), H struck %zu, M struck %zu", to_string(r1.outcome), to_string(r2.outcome), to_string(r3.outcome),
+           idx.have_block(id_of(X)) ? 1 : 0, static_cast<unsigned long long>(idx.source_dropped()), sh, sm);
+}
+
+// L7. UNASKED ON THE OTHER TWO PATHS. (a) A block whose parent is held but unresolved (its difficulty not computable
+// yet), not asked for: refused, no strike, not held. (b) A block whose proof of work is not checkable yet, not asked
+// for: refused, no strike, not held; asked for, it is held.
+static void test_l7_unasked_other_paths() {
+    {
+        Fixture f(6);
+        ChainIndex& idx = *f.idx;
+        const PeerRef p5 = peer(5);
+        const std::uint64_t h      = G::TEST_FIRST + 6;
+        const Hash          tip    = f.main_ids.back();
+        const std::uint64_t reward = idx.view().state().expected_base_reward();
+        const BlockEntry A = f.sibling(tip, h, /*salt=*/71, reward);
+        const BlockEntry B = f.sibling(id_of(A), h + 1, /*salt=*/72, reward);
+        const BlockEntry C = f.sibling(id_of(B), h + 2, /*salt=*/73, reward);
+        want(idx, p5, tip, h - 1, {id_of(A), id_of(B)});
+        const OfferResult rb = idx.offer_block(&p5, B, false);
+        const OfferResult rc = idx.offer_block(&p5, C, false);
+        checkf(rb.outcome == OfferOutcome::ParkedOrphan && rc.outcome == OfferOutcome::Rejected && !rc.peer_fault
+                       && !idx.have_block(id_of(C)) && f.fetcher.penalties.empty() && idx.unsolicited_dropped() == 1,
+               "l7a: over an unresolved parent, an unasked block was %s (%s), held %d, %zu strikes", to_string(rc.outcome),
+               rc.why.c_str(), idx.have_block(id_of(C)) ? 1 : 0, f.fetcher.penalties.size());
+    }
+    {
+        ScriptedPowSource pow;
+        ChainIndexOptions o;
+        o.net = XmrNet::Stagenet;
+        ChainIndex idx(o, pow);
+        seed_stagenet(idx);
+        fakes::FakeFetcher fetcher;
+        idx.set_fetcher(&fetcher);
+        const PeerRef p4 = peer(4);
+        const std::uint64_t reward = idx.view().state().expected_base_reward();
+        const G::GoldenHeader& hdr = header_at(G::TEST_FIRST);
+        const BlockEntry X = make_block(hdr.major_version, hdr.minor_version, hdr.timestamp, stagenet_seed_row().id, 3,
+                                        G::TEST_FIRST, reward);
+        pow.verdict  = PowVerdict::SeedMissing;
+        pow.resident = true;
+        const OfferResult r1 = idx.offer_block(&p4, X, false);
+        const bool held1 = idx.have_block(id_of(X));
+        want(idx, p4, stagenet_seed_row().id, G::TEST_FIRST - 1, {id_of(X)});
+        const OfferResult r2 = idx.offer_block(&p4, X, false);
+        checkf(r1.outcome == OfferOutcome::Rejected && !r1.peer_fault && !held1 && fetcher.penalties.empty()
+                       && r2.outcome == OfferOutcome::StoredAsAlt && idx.have_block(id_of(X)),
+               "l7b: a block whose proof of work is not checkable yet: unasked %s (held %d, %zu strikes), asked %s",
+               to_string(r1.outcome), held1 ? 1 : 0, fetcher.penalties.size(), to_string(r2.outcome));
+    }
+}
+
+// L8. THE SOURCE DROP TAKES ONLY BLOCKS WITHOUT PROVEN WORK, AND MATCHES THE PEER BY ITS ADDRESS. X holds a verified
+// alternative V and an unproven orphan U; Z (the same levin peer_id as X, another address) holds an unproven orphan W.
+// X's block fails its proof of work on arrival: U goes, V and W stay; X is struck once.
+static void test_l8_source_drop_scope() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef x = peer(6);
+    PeerRef z = x;
+    z.addr = "10.0.0.66:38080";
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const BlockEntry V = f.sibling(f.main_ids[4], h - 1, /*salt=*/61, reward);   // a sibling of the tip: verified
+    const BlockEntry U = f.sibling(fake_id(931), h + 1, /*salt=*/62, reward);
+    const BlockEntry W = f.sibling(fake_id(932), h + 1, /*salt=*/63, reward);
+    const BlockEntry Y = f.sibling(tip, h, /*salt=*/64, reward);
+    const OfferResult rv = idx.offer_block(&x, V, false);
+    want(idx, x, tip, h - 1, {id_of(U), id_of(W)});
+    idx.offer_block(&x, U, false);
+    idx.offer_block(&z, W, false);
+    const auto c0 = idx.alt_class_bytes();
+    f.mv.below.push_back(hashing_blob_of(Y));
+    const OfferResult ry = idx.offer_block(&x, Y, false);
+    checkf(rv.outcome == OfferOutcome::StoredAsAlt && c0.first > 0 && ry.fault == PeerFault::BadPow
+                   && !idx.have_block(id_of(U)) && idx.have_block(id_of(V)) && idx.have_block(id_of(W))
+                   && strikes_of(f.fetcher, x) == 1 && strikes_of(f.fetcher, z) == 0 && idx.source_dropped() == 1,
+           "l8: V %s; after X's bad block: U %d (expected gone), V %d and W %d (expected held), X struck %zu, Z struck "
+           "%zu, dropped %llu", to_string(rv.outcome), idx.have_block(id_of(U)) ? 1 : 0, idx.have_block(id_of(V)) ? 1 : 0,
+           idx.have_block(id_of(W)) ? 1 : 0, strikes_of(f.fetcher, x), strikes_of(f.fetcher, z),
+           static_cast<unsigned long long>(idx.source_dropped()));
+}
+
+// L9. A BLOCK WAITING FOR ITS BODIES, ITS PROOF OF WORK PASSED, COUNTS AS PROVEN WORK. A bodiless block on the tip
+// (one transaction missing): NeedsBodies; its bytes are in the verified class, none in the class without proven work.
+static void test_l9_bodies_missing_class() {
+    Fixture f(6);
+    ChainIndex& idx = *f.idx;
+    const PeerRef p5 = peer(5);
+    const std::uint64_t h      = G::TEST_FIRST + 6;
+    const Hash          tip    = f.main_ids.back();
+    const std::uint64_t reward = idx.view().state().expected_base_reward();
+    const G::GoldenHeader& hb = header_at(h);
+    const BlockEntry A = make_bodiless_block(hb.major_version, hb.minor_version, hb.timestamp, tip, 81, h, reward,
+                                             /*salt=*/8, /*ntx=*/1);
+    const OfferResult r = idx.offer_block(&p5, A, false);
+    const auto c = idx.alt_class_bytes();
+    checkf(r.outcome == OfferOutcome::NeedsBodies && c.first > 0 && c.second == 0,
+           "l9: a bodiless block on the tip was %s; verified bytes %llu, without proven work %llu",
+           to_string(r.outcome), static_cast<unsigned long long>(c.first), static_cast<unsigned long long>(c.second));
+}
+
 // =============================================================================
 int main() {
+    test_l1_unasked_orphan_refused();
+    test_l4_wanted_beyond_window();
+    test_l5_refetched_parent_parks();
+    test_l6_resend_keeps_source();
+    test_l7_unasked_other_paths();
+    test_l8_source_drop_scope();
+    test_l9_bodies_missing_class();
+    test_l2_source_drop_on_resolve();
+    test_l3_source_drop_on_arrival();
     test_k1_bodiless_park_after_parent_connects();
     test_k2_held_parent_keeps_children_edges();
     test_wire_validation();

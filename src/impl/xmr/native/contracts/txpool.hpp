@@ -121,6 +121,13 @@ struct TxRelayVerdict {
                            //   with InputConsensus. No drop.
         RingMemberLocked,  // a ring member is not yet unlocked / younger than
                            //   the spendable age. No drop.
+        AlreadyMined,      // the tx is already in the best chain (or one of
+                           //   its key images is spent there) per the chain
+                           //   index's mined oracle -- a reorg re-admit or a
+                           //   late relay of a mined tx. No drop.
+        NotUnderstood,     // the tx declares a format above the implemented
+                           //   fork (tx version > 2, or rct type > 6, e.g.
+                           //   FCMP++): not judged, never admitted. No drop.
     };
 
     Reason reason = Reason::Accepted;
@@ -152,6 +159,8 @@ inline const char* to_string(TxRelayVerdict::Reason r) noexcept {
         case TxRelayVerdict::Reason::KeyImageSpent:    return "KeyImageSpent";
         case TxRelayVerdict::Reason::RingUnresolved:   return "RingUnresolved";
         case TxRelayVerdict::Reason::RingMemberLocked: return "RingMemberLocked";
+        case TxRelayVerdict::Reason::AlreadyMined:     return "AlreadyMined";
+        case TxRelayVerdict::Reason::NotUnderstood:    return "NotUnderstood";
     }
     return "?";
 }
@@ -177,6 +186,20 @@ public:
     // Ids we already hold, for the txpool complement exchange (2010).
     // At most MAX_TXPOOL_COMPLEMENT_IDS entries.
     virtual std::vector<Hash> complement_request_ids() const = 0;
+
+    // TXPOOL-RESUME: the 2002 that answers OUR NOTIFY_GET_TXPOOL_COMPLEMENT
+    // (2010). monerod's tx_memory_pool::get_complement returns only the txs its
+    // pool relays publicly (relay_method fluff or block), so the batch is
+    // admitted as FLUFFED -- through exactly the same validation as any relayed
+    // transaction. Called once per answer, EMPTY batches included, so a sink
+    // can tell that a back-fill round finished even when there was nothing to
+    // fill. Default: plain fluffed admission.
+    virtual std::vector<TxRelayVerdict> on_complement(
+            const PeerRef&                         from,
+            std::vector<std::vector<std::uint8_t>> blobs) {
+        if (blobs.empty()) return {};
+        return on_relayed(from, std::move(blobs), /*dandelionpp_fluff=*/true);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -262,6 +285,14 @@ public:
 
     // Monotone; bumps whenever selectable_backlog() could differ.
     virtual std::uint64_t backlog_version() const = 0;
+
+    // The key images a pooled transaction spends, so the template can check
+    // them against the chain it extends (IChainView::probe_mined). Empty when
+    // the id is not pooled, or the pool does not track key images.
+    virtual std::vector<Hash> key_images_of(const Hash& id) const {
+        (void)id;
+        return {};
+    }
 };
 
 // ---------------------------------------------------------------------------

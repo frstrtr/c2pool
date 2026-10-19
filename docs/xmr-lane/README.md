@@ -29,10 +29,13 @@ Bitcoin-family lane and Monero pins FCMP++/CARROT timing. See the scoping note
 | X4 | [`family-b-receipt-envelope-addendum.md`](family-b-receipt-envelope-addendum.md) | Family-B receipt envelope + inverted `keyed_heavy` admission order |
 | — | [`x-template-builder.md`](x-template-builder.md) | whole-block template builder (p2pool plumbing, pool model excised) |
 | X5 | [`x5-stratum.md`](x5-stratum.md) | CryptoNote / XMRig stratum dialect |
-| X6 | [`w5-xmr-coinbase-rule.md`](w5-xmr-coinbase-rule.md) | W5-XMR coinbase: deterministic `r`, exact-sum residual sink, MM-tree commitment, CARROT fence |
 | X7 | [`x7-w3-wire.md`](x7-w3-wire.md) | W3 carrier/receipt wire type + RandomX DoS budget |
 | X0 | `src/impl/xmr/test/X0-PROVENANCE.md` | feasibility KATs (hashing-blob / block-id / tx-hash triple, Keccak-midstate opening) on real mainnet blocks |
-| X9 | [`finality-boundary.md`](finality-boundary.md) | settlement finality boundary (reorg depth >= D_conf, mainnet D_conf=60) + chain-ordered booking both sides (R4/R6) + the divergence cap (loud, bounded halt) |
+| — | [`payout-fairness.md`](payout-fairness.md) | (removed at the S4w flag day; the old payout path) the payout rules as the code on `master` applies them, with file and function references: payment order (oldest first, E-1), the every-node coinbase recompute and the ledger alarms, pay-now, dust and the residual, the owed ledger (no negative balance from an honest block, dust decay), fees on the XMR lane, minimum payout, settings pinned on mainnet, known limits |
+| RV | [`review-criticals.md`](review-criticals.md) | (the old payout path) the external payout review ([gist](https://gist.github.com/SChernykh/636eca0b73181277ea85401b6b1e24ba)) finding by finding against the recomputed coinbase: what is closed natively, what the threshold design closes, what stays open |
+| RUN | [`RUN-A-NODE.md`](RUN-A-NODE.md) | run a Path B node: build, the pinned snapshot, join a pool, follow-only, solo, mainnet (follow-only) |
+| PF | [`performance.md`](performance.md) | per-block cost: measured primitives, ledger scaling, the output-mapping and derivation-cache fixes, next steps |
+| CMP | [`comparison.md`](comparison.md) | the lane next to classical p2pool, Monero P2Pool, p2poolv2 and Braidpool, axis by axis, including a pool-majority attack; where v37 is weaker |
 
 ## Open questions carried (route to operator / integrator)
 

@@ -66,6 +66,8 @@ enum class P2PMessage : std::size_t
     forget_tx,
     bestblock,
     tx_inject,   // #157 M2: miner/user tx-injection over the sharechain p2p
+    alert,       // D-MINER.7: miner-offline alert relay (dash, non-consensus)
+    alertack,    // D-MINER.7: signed relay ack for an alert
     unknown,     // catch-all bucket; MUST stay last
     COUNT
 };
@@ -77,6 +79,7 @@ inline constexpr std::array<std::string_view, P2P_MESSAGE_COUNT> P2P_MESSAGE_NAM
     "shares", "sharereq", "sharereply",
     "have_tx", "losing_tx", "remember_tx", "forget_tx", "bestblock",
     "tx_inject",
+    "alert", "alertack",
     "unknown"
 };
 

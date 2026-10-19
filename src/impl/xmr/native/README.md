@@ -234,7 +234,10 @@ that: how a bundle is spelled on disk, how it is loaded, and how it is minted.
 | `xmr_anchor_load.hpp` | `load_anchor()` — the four gates: source, form, meaning, and the boot duty it cannot discharge |
 | `xmr_anchor_generate.hpp` | `generate_anchor()` — the minting rules behind an abstract read-only `MoneroDaemonRpc` port |
 | `xmr_anchor_embedded.hpp` | the release-pinned bundles compiled into the binary, one per network |
-| `xmr_chain_anchor_stagenet.inc` | the stagenet bundle itself, minted from a synced monerod |
+| `xmr_anchor_pinned.hpp` | the PINNED snapshot per network: anchor .inc sha256 + output-set sha256/size the node enforces when booted without `--native-anchor` (docs/xmr-lane/PINNED-SNAPSHOTS.md) |
+| `xmr_chain_anchor_stagenet_f2.inc` | the pinned stagenet bundle (format 2, H_a 2213803), minted from a synced monerod |
+| `xmr_chain_anchor_mainnet_f2.inc` | the pinned mainnet bundle (format 2, H_a 3765865), minted from the operator's synced monerod |
+| `xmr_chain_anchor_stagenet.inc` | the earlier format-1 stagenet bundle (H_a 2204000), kept for the codec KAT |
 
 **R-ANCHOR** is a release-pinned self-generated bundle: we mint it, we review
 it, we freeze it into the release — the same class of artefact as monerod's own
@@ -512,15 +515,15 @@ difficulty and all, the PR #1529 shape — which is what makes "the monerod arm 
 the old path" a statement about the real decode path rather than about a
 re-typed struct.
 
-`xmr_native_template_coinbase_kat` answers the other half: the K_fair
-settlement coinbase does not move. It builds the X6 coinbase from the native
-derivation, through the same `settle/xmr_coinbase.cpp` executor the daemon-ful
-path uses, and pins the owed payee set in K_fair order, the exact-sum residual
-sink (Monero has no burn-the-remainder escape hatch), the owed_digest under the
-`tx_extra` `0x03` merge-mining tag, the byte-identity of the two arms' coinbases,
-and the pre-CARROT fence. It also proves each rebound field is load-bearing —
-without that, "the arms agree" would be consistent with the coinbase ignoring
-the miner data entirely.
+`xmr_native_template_coinbase_kat` answers the other half: the Path B miner
+transaction (`build_miner_tx_hf16`) built from the native chain's miner data is
+byte-identical to the one built from monerod's identical values. The reward is
+the emission base reward at the native `already_generated_coins` plus the
+backlog's fees, split over the window's payees: one output per payee, distinct
+one-time keys, Sum(vout) equal to the reward, the PBX1 extra. It also proves
+each rebound field (height, prev_id, `already_generated_coins`) is load-bearing —
+without that, "the arms agree" would be consistent with the miner transaction
+ignoring the miner data entirely.
 
 Three suites in `xmr_native_template_kat` are REGRESSION pins, one per defect
 the C4 review found — `R-C4-1` body/id alignment across a missing body,
@@ -536,12 +539,10 @@ deliberately not what ctest runs.
 
 ### The rebind, in the consumer tree
 
-`src/c2pool/v37/xmr/xmr_o2_settlement_provider.hpp` gains an
-`IMinerDataSource&` constructor and keeps its `IMonerodTransport&` one, which
-now owns a `MonerodMinerDataSource` and pumps it once per refresh — the same one
-RPC per refresh it always did. `assemble()` is byte-for-byte the function it
-was. `SettlementSnapshot` gains `source_name` and the `MinerDataEpoch`, so a
-parity sample can always be attributed to an arm.
+`src/c2pool/v37/xmr/xmr_native_template_backend.hpp` resolves the serving arm
+per refresh (`ResolvedMinerDataSource`: the native arm, monerod's
+`MonerodMinerDataSource` as the shadow) and hands its miner data to the Path B
+template build.
 
 ## Wave 1 / C5 — the block relay, and why it mostly refuses
 

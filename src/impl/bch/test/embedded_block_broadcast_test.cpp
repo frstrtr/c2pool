@@ -65,6 +65,10 @@ struct SinkThrew : std::exception {
 // executed in CI without a new --target the token cannot add to build.yml.
 int run_share_broadcast_gate_checks();
 
+// #1716 Legacy addrme self-probe KATs (legacy_addrme_self_probe_test.cpp). Same
+// fold-in: its own TU, run from this already-allowlisted executable.
+int run_legacy_addrme_self_probe_checks();
+
 int main() {
     boost::asio::io_context ioc;
     TestConfig config;
@@ -164,6 +168,9 @@ int main() {
 
     // Share-broadcast completeness gate + mark-after-send (separate TU).
     failures += run_share_broadcast_gate_checks();
+
+    // #1716: Legacy/Actual addrme self-probe over a real loopback socket.
+    failures += run_legacy_addrme_self_probe_checks();
 
     if (failures == 0) {
         std::cout << "embedded_block_broadcast_test: ALL PASS\n";

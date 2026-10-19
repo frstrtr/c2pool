@@ -282,6 +282,9 @@ public:
     void send_ping(peer_ptr peer) override;
     std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
 
+    /// Ban the host behind a self-connection, as canonical does (#1716 part B).
+    void ban_self_connection(const NetService& addr);
+
     // ltc
     void send_version(peer_ptr peer);
     void processing_shares(HandleSharesData& data, NetService addr);
@@ -670,6 +673,9 @@ public:
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
+    // Per-host self-connection offence count (canonical Node.banscores). In
+    // memory only, as canonical. Touched on the IO thread only.
+    std::map<std::string, int> m_banscores;
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;

@@ -1297,7 +1297,7 @@ TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
     { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
 
     auto mnstates = single_mn(p2pkh_script(0x30));
-    // suppress_mempool_txs=true — the production hotel posture; the pin must
+    // suppress_mempool_txs=true — the production node posture; the pin must
     // ride the coinbase-only body regardless.
     auto w = build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/true);
 

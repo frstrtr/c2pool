@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-/// D2 root memo — the REMAINING half of the 2026-08-07/08 hotel freeze class
+/// D2 root memo — the REMAINING half of the 2026-08-07/08 production freeze class
 /// (26 rigs -> 0, twice). D1 (test_dash_submit_gate_scaling.cpp) took the
 /// serve gate off the per-share submit path; this suite pins that the gate
 /// itself no longer re-hashes the world on every evaluation that remains

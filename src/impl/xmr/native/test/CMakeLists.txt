@@ -77,7 +77,8 @@ if (BUILD_TESTING)
             xmr_levin_codec_kat
             xmr_epee_storage_kat
             xmr_levin_messages_kat
-            xmr_levin_fuzz_kat)
+            xmr_levin_fuzz_kat
+            xmr_native_epee_budget_kat)   # message-wide array-element limit
         add_executable(${_c1a_kat} ${_c1a_kat}.cpp)
         target_include_directories(${_c1a_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -135,6 +136,30 @@ if (BUILD_TESTING)
         target_include_directories(xmr_native_consensus_state_kat PRIVATE ${Boost_INCLUDE_DIRS})
     endif()
     add_test(NAME xmr_native_consensus_state_kat COMMAND xmr_native_consensus_state_kat)
+
+    # 5b) Monero's transaction count ceilings and nothing tighter: a block whose
+    #     coinbase has 5,000 (and exactly 3,125,000 = MAX_COINBASE_VOUT_COUNT)
+    #     outputs parses, evaluates and connects; counts above Monero's
+    #     ceilings are refused; a truncated buffer with a huge count is refused
+    #     without a large allocation; the v17 miner-output rule
+    #     (FCMP_PLUS_PLUS_MAX_MINER_OUTPUTS) is keyed on the major version.
+    #     Peak memory ~110 MB (one 3,125,000-output block blob). Added to BOTH
+    #     --target lists in build.yml.
+    add_executable(xmr_native_coinbase_outputs_limit_kat xmr_coinbase_outputs_limit_kat.cpp)
+    target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE xmr_native_txpool xmr_coin)
+    target_compile_features(xmr_native_coinbase_outputs_limit_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_coinbase_outputs_limit_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_coinbase_outputs_limit_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    add_test(NAME xmr_native_coinbase_outputs_limit_kat COMMAND xmr_native_coinbase_outputs_limit_kat)
+    set_tests_properties(xmr_native_coinbase_outputs_limit_kat PROPERTIES TIMEOUT 300)
 
     # -----------------------------------------------------------------------
     # Wave 1, component C2b: the trust-anchor bundle (../anchor/). One target,
@@ -229,7 +254,16 @@ if (BUILD_TESTING)
             xmr_native_rct_verify_kat
             xmr_native_txpool_kat
             xmr_native_clsag_verify_kat
-            xmr_native_output_set_kat)
+            xmr_native_output_set_kat
+            # output-set RAM: the format-2 anchor snapshot is served in place
+            # from a read-only mapping (heap growth, equivalence, overlay/reorg,
+            # fail-closed); also the load/equivalence harness of the smoke.
+            xmr_native_output_set_mmap_kat
+            # restart cost: the post-anchor overlay persisted beside the chain
+            # snapshot and replayed onto the seeded set (round trip, continue +
+            # reorg below the resume point, fail-closed); also the live smoke's
+            # --compare harness (two nodes' overlays, ring + spent lookups).
+            xmr_native_output_set_overlay_kat)
         # The sources are named after the component, not the target prefix.
         string(REPLACE "xmr_native_" "xmr_" _c3_src ${_c3_kat})
         add_executable(${_c3_kat} ${_c3_src}.cpp)
@@ -298,7 +332,8 @@ if (BUILD_TESTING)
     # -----------------------------------------------------------------------
     foreach(_c1b_kat
             xmr_levin_socket_kat
-            xmr_levin_link_kat)
+            xmr_levin_link_kat
+            xmr_native_levin_unsolicited_cap_kat)   # unsolicited 2004/2007 refused at header time
         add_executable(${_c1b_kat} ${_c1b_kat}.cpp)
         target_include_directories(${_c1b_kat} PRIVATE
             ${CMAKE_SOURCE_DIR}/src
@@ -437,14 +472,11 @@ if (BUILD_TESTING)
     #     ctest runs.
     #
     #   xmr_native_template_coinbase_kat
-    #     The other half of the C4 claim: the option-B K_fair settlement
-    #     coinbase is unchanged by the rebind. Builds the X6 coinbase from the
-    #     native derivation (../../settle/xmr_coinbase.cpp -- the same executor
-    #     and the same file the daemon-ful path uses) and pins the owed payee
-    #     set, the exact-sum residual sink, the owed_digest under the tx_extra
-    #     0x03 merge-mining tag, the byte-identity of the two arms' coinbases
-    #     and the pre-CARROT fence. Same shape and cost as the existing
-    #     xmr_coinbase_kat target, which has been on both CI legs since X6.
+    #     The other half of the C4 claim: the Path B miner tx
+    #     (build_miner_tx_hf16) from the native miner data equals the one from
+    #     the monerod arm's identical values: R from the native emission and
+    #     the backlog's fees, Sum(vout) == R, mm_root under 0x03, every rebound
+    #     field load-bearing, the hf-17 amount fork fuse. Links xmr_pathb.
     #
     # Same drift-guard rule as every target above: all six (C1c's four, C4's
     # two) are added to BOTH
@@ -484,6 +516,83 @@ if (BUILD_TESTING)
     # Loopback TCP with compressed deadlines: seconds on an idle runner, but
     # never unbounded.
     set_tests_properties(xmr_native_peer_pool_kat PROPERTIES TIMEOUT 300)
+
+    # xmr_native_peer_pool_budget_kat: the pool charges a peer's inbound byte
+    # budget before decoding a 2002 body; an over-budget frame is dropped and the
+    # peer kept. Real pool + fakes against a loopback stand-in with a 50-byte
+    # byte budget. Listed in BOTH build.yml --target lists.
+    add_executable(xmr_native_peer_pool_budget_kat xmr_native_peer_pool_budget_kat.cpp)
+    target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_features(xmr_native_peer_pool_budget_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_peer_pool_budget_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_peer_pool_budget_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_peer_pool_budget_kat COMMAND xmr_native_peer_pool_budget_kat)
+    set_tests_properties(xmr_native_peer_pool_budget_kat PROPERTIES TIMEOUT 300)
+
+    # D3a: the block DoS bucket against honest relay of VALID blocks. The REAL
+    # pool and the REAL chain index (the reorg-follow KAT's from-genesis regtest
+    # boot, model RandomX verifier) wired as the node wires them, against
+    # loopback monerod stand-ins: 3 links x 40 valid blocks must cost no frame,
+    # no ban and no link, while floods of unknown blocks, unparseable blocks and
+    # invalid blocks on the tip are dropped / banned at exactly the pre-fix
+    # message counts. Links xmr_coin for the block ids (keccak, tree hash), like
+    # the other C2 targets. Added to BOTH --target lists in build.yml.
+    add_executable(xmr_native_dos_dup_block_kat xmr_dos_dup_block_kat.cpp)
+    target_include_directories(xmr_native_dos_dup_block_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE xmr_coin)
+    target_compile_features(xmr_native_dos_dup_block_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_dos_dup_block_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_dos_dup_block_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_dos_dup_block_kat COMMAND xmr_native_dos_dup_block_kat)
+    set_tests_properties(xmr_native_dos_dup_block_kat PROPERTIES TIMEOUT 300)
+
+    # FORK-FUSE: the node must survive an unknown Monero hard fork safely. A
+    # block whose header major_version is above MAX_IMPLEMENTED_HF_VERSION is
+    # refused WITHOUT a peer penalty and trips the unknown-fork fuse (templates
+    # and tx admission withdrawn); a relayed tx of a format above the
+    # implemented one is NotUnderstood, never a drop offence; malformed v16
+    # blocks and txs keep their exact verdicts. Real index + real txpool, and a
+    # live levin leg over loopback with the real peer pool. Builds against the
+    # pre-fix tree too (and fails there). Added to BOTH --target lists in
+    # build.yml.
+    add_executable(xmr_native_unknown_fork_fuse_kat xmr_unknown_fork_fuse_kat.cpp)
+    target_include_directories(xmr_native_unknown_fork_fuse_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE xmr_native_txpool xmr_coin)
+    target_compile_features(xmr_native_unknown_fork_fuse_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_unknown_fork_fuse_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_unknown_fork_fuse_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_unknown_fork_fuse_kat COMMAND xmr_native_unknown_fork_fuse_kat)
+    set_tests_properties(xmr_native_unknown_fork_fuse_kat PROPERTIES TIMEOUT 300)
 
     add_executable(xmr_native_template_kat xmr_native_template_kat.cpp)
     target_include_directories(xmr_native_template_kat PRIVATE
@@ -576,13 +685,11 @@ if (BUILD_TESTING)
     target_compile_features(xmr_native_txpool_parity_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_txpool_parity_kat COMMAND xmr_native_txpool_parity_kat)
 
-    add_executable(xmr_native_template_coinbase_kat
-        xmr_native_template_coinbase_kat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../settle/xmr_coinbase.cpp)
+    add_executable(xmr_native_template_coinbase_kat xmr_native_template_coinbase_kat.cpp)
     target_include_directories(xmr_native_template_coinbase_kat PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(xmr_native_template_coinbase_kat PRIVATE xmr_coin)
+    target_link_libraries(xmr_native_template_coinbase_kat PRIVATE xmr_pathb)
     target_compile_features(xmr_native_template_coinbase_kat PRIVATE cxx_std_20)
     add_test(NAME xmr_native_template_coinbase_kat COMMAND xmr_native_template_coinbase_kat)
 
@@ -881,6 +988,70 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME xmr_native_neartip_stall_kat COMMAND xmr_native_neartip_stall_kat)
     set_tests_properties(xmr_native_neartip_stall_kat PROPERTIES TIMEOUT 300)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   xmr_native_template_dup_tx_kat -- template / own-block hygiene on the
+    #   REAL chain index: a template on a new tip never carries a tx the chain
+    #   it extends already mined (or a tx spending a key image spent there),
+    #   even when the pool has not been told yet; our own found block is
+    #   refused before PREFER-OWN adopts it when it carries one; a reorg hands
+    #   the rolled-back bodies back to the pool; and an own fork no peer adopts
+    #   is abandoned after a bound. Pins the publish-arm verify's 8b2efacf at
+    #   h=513 (tx 86f666b7 mined in 512, re-mined in A's template id=35). RED
+    #   on 00bb77c0. Links xmr_native_txpool for the tx decoder; no RandomX,
+    #   no sockets.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml (the #1539 lesson).
+    add_executable(xmr_native_template_dup_tx_kat xmr_template_dup_tx_kat.cpp)
+    target_include_directories(xmr_native_template_dup_tx_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_template_dup_tx_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_template_dup_tx_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_template_dup_tx_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_template_dup_tx_kat COMMAND xmr_native_template_dup_tx_kat)
+    set_tests_properties(xmr_native_template_dup_tx_kat PROPERTIES TIMEOUT 300)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   xmr_native_txpool_resume_kat -- TXPOOL-RESUME (mainnet dry run 2): a
+    #   resumed node admits relays as soon as its relay gate opens (the pool's
+    #   tip is seated from the index; the gate is the template predicate), a
+    #   fresh pool is back-filled from a peer's txpool complement (2010 -> 2002,
+    #   admitted fluffed, on a solicited DoS credit), and no template is served
+    #   before the pool is warm -- after which the selection is unchanged. Real
+    #   mainnet txs with their real rings; no sockets, no RandomX. RED on
+    #   269eb722.
+    #
+    # DRIFT-GUARD: also listed in BOTH `--target` lists in
+    # .github/workflows/build.yml (the #1539 lesson).
+    add_executable(xmr_native_txpool_resume_kat xmr_txpool_resume_kat.cpp)
+    target_include_directories(xmr_native_txpool_resume_kat PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(xmr_native_txpool_resume_kat PRIVATE xmr_native_txpool)
+    target_compile_features(xmr_native_txpool_resume_kat PRIVATE cxx_std_20)
+    if (TARGET Boost::headers)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Boost::headers)
+    elseif (TARGET Boost::boost)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Boost::boost)
+    elseif (DEFINED Boost_INCLUDE_DIRS)
+        target_include_directories(xmr_native_txpool_resume_kat PRIVATE ${Boost_INCLUDE_DIRS})
+    endif()
+    if (TARGET Threads::Threads)
+        target_link_libraries(xmr_native_txpool_resume_kat PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME xmr_native_txpool_resume_kat COMMAND xmr_native_txpool_resume_kat)
+    set_tests_properties(xmr_native_txpool_resume_kat PROPERTIES TIMEOUT 300)
 
     add_executable(xmr_native_m4_ptpl_backlog_gate_kat xmr_m4_ptpl_backlog_gate_kat.cpp)
     target_include_directories(xmr_native_m4_ptpl_backlog_gate_kat PRIVATE

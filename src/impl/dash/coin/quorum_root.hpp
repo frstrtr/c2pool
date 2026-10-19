@@ -49,7 +49,7 @@
 namespace dash {
 namespace coin {
 
-/// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 hotel freeze
+/// TEST SEAM (D2 root-memo regression gates, the 2026-08-07/08 production freeze
 /// class): process-wide count of FULL quorum-root computations (each one
 /// re-serializes + SHA256d's every active commitment). Mirrors
 /// vendor::sml_calc_merkle_root_count() — the memo tests count the actual

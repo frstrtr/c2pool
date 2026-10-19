@@ -1,187 +1,146 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
 //
-// xmr_relay_wire_kat -- GAP-2 stage 1, KAT 1 (RandomX-free).
-//
-// Pins the Family-B receipt-relay wire (xmr/relay/xmr_relay_wire.hpp):
-//   W1  first-byte namespace: 0x40..0x4f never collides with a Family-A
-//       CarrierWire version (w3_wire_freeze kAcceptedVersions) nor with the
-//       control opcodes (>= kCtrlOpcodeBase)
-//   W2  FB_HELLO: golden bytes, round trip, every refusal (length, opcode,
-//       version, magic, bind mode) and hello_mismatch's reasons
-//   W3  FB_BLOCK_WON: golden bytes, round trip, refusals
-//   W4  side_data_v2 digest, rbind_v1 and lane_params_digest goldens; the
-//       lane digest moves with every field it covers
-//   W5  fb_receipt / FB_RECEIPTS: round trip of a minted receipt; decode is
-//       TOTAL under truncation at every length, oversize n, oversize len, a
-//       non-XMR payee kind, trailing bytes -- never throws, never accepts
-//   W6  receipt_id == v37::xmr::verify::cheap_receipt_id (the admission key)
+// xmr_relay_wire_kat -- the kept Family-B relay frames (xmr/relay/xmr_relay_wire.hpp; RandomX-free):
+//   W1  opcodes: FB_GETCTX 0x43, FB_CTX 0x44, FB_PING 0x48, FB_PONG 0x49, FB_GETADDR 0x4c, FB_ADDR 0x4d, distinct,
+//       equal to the Path B relay wire's (impl/xmr/pathb/pathb_relay_wire.hpp), none on 0x4a / 0x4b, none a
+//       Family-A CarrierWire version, all below the control opcodes (0x80)
+//   W2  FB_GETCTX / FB_CTX: golden bytes, round trip, refusals (opcode, version, n 0 / 9, length, blob over
+//       the caller's cap, here P-13 at hf 16 = 600,051); both decoders total under truncation
+//   W3  FB_PING / FB_PONG: golden bytes, round trip, refusals
 //   W7  base58 address decode (checksum, prefixes) of a known address
-// Regenerate goldens: V37_GAP2_KAT_PRINT=1.
-#include <cstdlib>
+//   W8  FB_GETADDR / FB_ADDR: golden bytes, round trip, bounds, refusals, the routable filter
+#include <cstdio>
 #include <set>
+#include <string>
+#include <vector>
 
-#include "xmr_relay_test_util.hpp"
-#include <c2pool/v37/xmr/relay/xmr_address.hpp>
 #include <c2pool/v37/carrier_net.hpp>
 #include <c2pool/v37/w3_wire_freeze.hpp>
+#include <c2pool/v37/xmr/relay/xmr_address.hpp>
+#include <c2pool/v37/xmr/relay/xmr_relay_wire.hpp>
+#include "impl/xmr/pathb/pathb_caps.hpp"
+#include "impl/xmr/pathb/pathb_relay_wire.hpp"
 
-using namespace gap2test;
+using namespace c2pool::v37n::xmr::relay;
+namespace pb = ::c2pool::xmr::pathb;
 
-static bool g_print = false;
-static void golden(Checker& C, const std::string& name, const std::string& got, const char* want) {
-    if (g_print || !*want) std::printf("    GOLDEN %s = \"%s\"\n", name.c_str(), got.c_str());
-    C(got == want, name + " golden");
+namespace {
+int g_checks = 0, g_fail = 0;
+void C(bool ok, const std::string& what) {
+    ++g_checks;
+    if (!ok) { ++g_fail; std::printf("  FAIL: %s\n", what.c_str()); }
 }
+std::string hex(const std::vector<u8>& v) {
+    static const char* d = "0123456789abcdef";
+    std::string s;
+    for (u8 b : v) { s.push_back(d[b >> 4]); s.push_back(d[b & 15]); }
+    return s;
+}
+bytes32 fill32(u8 b) { bytes32 h; h.fill(b); return h; }
+std::string rep(const char* two, int n) { std::string s; for (int i = 0; i < n; ++i) s += two; return s; }
+}  // namespace
 
 int main() {
-    g_print = std::getenv("V37_GAP2_KAT_PRINT") != nullptr;
-    Checker C;
     std::printf("== xmr_relay_wire_kat ==\n");
 
-    // ── W1 namespace ────────────────────────────────────────────────────────
+    // ── W1 opcodes ──────────────────────────────────────────────────────────
     {
-        bool clash = false;
-        for (std::uint8_t v : c2pool::v37n::wire_freeze::kAcceptedVersions)
-            if (is_family_b_opcode(v)) clash = true;
-        C(!clash, "W1 no Family-A accepted CarrierWire version lies in 0x40..0x4f");
-        C(FB_NS_LAST < c2pool::v37n::kCtrlOpcodeBase, "W1 0x40..0x4f is below the control-opcode base 0x80");
-        C(is_family_b_opcode(FB_HELLO) && is_family_b_opcode(FB_RECEIPTS) && is_family_b_opcode(FB_BLOCK_WON),
-          "W1 HELLO/RECEIPTS/BLOCK_WON are in the claimed range");
-        C(!is_family_b_opcode(0x01) && !is_family_b_opcode(0x02) && !is_family_b_opcode(0x80),
-          "W1 0x01/0x02/0x80 are NOT Family-B opcodes");
-        C(kHelloBytes == 102 && kBlockWonBytes == 127 && kSideV2Bytes == 56, "W1 fixed frame sizes 102/127, side_data_v2 56 B");
-        C(kFbMaxFrame < c2pool::v37n::kMaxCarrierFrame, "W1 the largest FB_RECEIPTS frame fits the transport ceiling");
-    }
-
-    // ── W2 HELLO ────────────────────────────────────────────────────────────
-    Hello h;
-    h.network = 3; h.chain_id = 7; h.lane_params_digest = b32_of(1); h.share_diff = 2000; h.node_nonce = 0x1122334455667788ull;
-    h.listen_port = 45000; h.lane_next_pos = 4242; h.lane_digest = b32_of(2); h.bind = BindMode::None;
-    {
-        const auto f = encode_hello(h);
-        C(f.size() == kHelloBytes, "W2 hello encodes to 102 bytes");
-        golden(C, "W2 hello", hex(f),
-               "400143325852030700000020272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9d0070000000000008877665544332211c8af92100000000000003f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a111800");
-        Hello back; std::string why;
-        C(decode_hello(f, back, &why) && back == h, "W2 hello round trip");
-        auto t = f; t.pop_back();                 C(!decode_hello(t, back, &why), "W2 hello short -> refused");
-        t = f; t.push_back(0);                     C(!decode_hello(t, back, &why), "W2 hello long -> refused");
-        t = f; t[0] = FB_RECEIPTS;                 C(!decode_hello(t, back, &why), "W2 hello wrong opcode -> refused");
-        t = f; t[1] = 2;                           C(!decode_hello(t, back, &why), "W2 hello unknown version -> refused");
-        t = f; t[2] ^= 1;                          C(!decode_hello(t, back, &why), "W2 hello bad magic -> refused");
-        t = f; t.back() = 7;                       C(!decode_hello(t, back, &why), "W2 hello unknown bind mode -> refused");
-        Hello o = h; o.node_nonce = 1;
-        C(hello_mismatch(h, o).empty(), "W2 identical params, other nonce -> compatible");
-        Hello m = o; m.share_diff = 2001;          C(hello_mismatch(h, m).find("share_diff") != std::string::npos, "W2 share_diff mismatch named");
-        m = o; m.chain_id = 8;                     C(hello_mismatch(h, m).find("chain_id") != std::string::npos, "W2 chain mismatch named");
-        m = o; m.network = 2;                      C(hello_mismatch(h, m).find("network") != std::string::npos, "W2 network mismatch named");
-        m = o; m.bind = BindMode::Rbind;           C(hello_mismatch(h, m).find("bind") != std::string::npos, "W2 bind-mode mismatch named");
-        m = o; m.lane_params_digest = b32_of(9);   C(hello_mismatch(h, m).find("lane_params_digest") != std::string::npos, "W2 LaneParams mismatch named");
-        C(hello_mismatch(h, h).find("self") != std::string::npos, "W2 own nonce -> self-connection");
-    }
-
-    // ── W3 BLOCK_WON ────────────────────────────────────────────────────────
-    {
-        BlockWon b; b.chain_id = 7; b.bid = b32_of(3); b.h_b = 150; b.cut_next_pos = 99; b.cut_spine_digest = b32_of(4);
-        b.reward = 600000000000ull; b.payout_emitted = true; b.owed_digest_at_win = b32_of(5);
-        const auto f = encode_block_won(b);
-        C(f.size() == kBlockWonBytes, "W3 block_won encodes to 127 bytes");
-        golden(C, "W3 block_won", hex(f),
-               "4201070000005e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b22293037960000000000000063000000000000007d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f560070c9b28b000000019ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e75");
-        BlockWon back; std::string why;
-        C(decode_block_won(f, back, &why) && back == b, "W3 block_won round trip");
-        auto t = f; t.pop_back();                  C(!decode_block_won(t, back, &why), "W3 short -> refused");
-        t = f; t[f.size() - 33] = 2;               C(!decode_block_won(t, back, &why), "W3 payout_emitted not 0/1 -> refused");
-        t = f; t[1] = 9;                           C(!decode_block_won(t, back, &why), "W3 unknown version -> refused");
-    }
-
-    // ── W4 digests ──────────────────────────────────────────────────────────
-    const ::v37::ScriptRef payA = payee_of("A");
-    {
-        const SideDataV2 s = side_for(payA, 7, 2000, 5);
-        C(s.bytes().size() == kSideV2Bytes && SideDataV2::from(s.bytes().data()) == s, "W4 side_data_v2 56-byte round trip");
-        golden(C, "W4 side_digest_v2", hex(side_digest_v2(s)), "b8b09a4358b09d5702273ef064633f007f0bfdcc47a0ca7c2e16df52a0865430");
-        golden(C, "W4 rbind_v1", hex(rbind_v1(7, s)), "2875c5ba6ecf23bb13106b3de55fbd6fae3c5eb811d1cd23a5a9b5ce6fad1ad1");
-        SideDataV2 s2 = s; s2.give_author = 6;
-        C(side_digest_v2(s2) != side_digest_v2(s) && rbind_v1(7, s2) != rbind_v1(7, s), "W4 give_author moves the digest and the binding");
-        C(rbind_v1(8, s) != rbind_v1(7, s), "W4 rbind is chain-scoped");
-        const ::v37::LaneParams lp{};
-        const bytes32 d0 = lane_params_digest(lp, 2000, BindMode::None);
-        golden(C, "W4 lane_params_digest(default, 2000, none)", hex(d0), "8f49947a8716dc16cf3cbceb01529ba9eb930042693da93f8a43a4186157da3f");
-        std::set<bytes32> seen{d0};
-        auto moved = [&](const ::v37::LaneParams& p, u64 sd, BindMode bm) { return seen.insert(lane_params_digest(p, sd, bm)).second; };
-        ::v37::LaneParams p = lp; p.window = 8641;            C(moved(p, 2000, BindMode::None), "W4 window moves the lane digest");
-        p = lp; p.level_caps.push_back(1);                    C(moved(p, 2000, BindMode::None), "W4 level_caps move it");
-        p = lp; p.subthreshold.enabled = true;                C(moved(p, 2000, BindMode::None), "W4 subthreshold gate moves it");
-        p = lp; p.win.win_version = 1;                        C(moved(p, 2000, BindMode::None), "W4 win gate moves it");
-        p = lp; p.nr.nr_version = 1;                          C(moved(p, 2000, BindMode::None), "W4 nr gate moves it");
-        p = lp; p.mrr.activation_pos = 0;                     C(moved(p, 2000, BindMode::None), "W4 mrr gate moves it");
-        // STEP-0 hotfix: LaneParams::k_floor (the coinbase no-dust floor) is
-        // folded iff non-zero, so the XMR default (0) keeps the golden above
-        // and any node that sets a floor is refused at HELLO.
-        p = lp; p.k_floor = 1;                                C(moved(p, 2000, BindMode::None), "W4 k_floor 1 moves it");
-        p = lp; p.k_floor = ::v37::K_FLOOR_F_REF;             C(moved(p, 2000, BindMode::None), "W4 k_floor 10 moves it");
-        golden(C, "W4 lane_params_digest(family_a, 2000, none)",
-               hex(lane_params_digest(::v37::LaneParams::family_a(), 2000, BindMode::None)), "bef300a00a350c1ab405c6c002d2ef3dc217e02e7dbb7a50cface332303f5ba1");
-        {
-            Hello a; a.network = 3; a.chain_id = 7; a.share_diff = 2000; a.node_nonce = 1;
-            a.lane_params_digest = d0;
-            Hello b = a; b.node_nonce = 2;
-            b.lane_params_digest = lane_params_digest(::v37::LaneParams::family_a(), 2000, BindMode::None);
-            C(hello_mismatch(a, b).find("lane_params_digest") != std::string::npos,
-              "W4 a peer on another k_floor is REFUSED at HELLO, by name");
-            b.lane_params_digest = d0;
-            C(hello_mismatch(a, b).empty(), "W4 ...and the same k_floor is compatible");
+        const std::vector<u8> ops = {FB_GETCTX, FB_CTX, FB_PING, FB_PONG, FB_GETADDR, FB_ADDR};
+        C(FB_GETCTX == 0x43 && FB_CTX == 0x44 && FB_PING == 0x48 && FB_PONG == 0x49 && FB_GETADDR == 0x4c && FB_ADDR == 0x4d,
+          "W1 the kept opcodes 0x43 0x44 0x48 0x49 0x4c 0x4d");
+        C(std::set<u8>(ops.begin(), ops.end()).size() == ops.size(), "W1 the kept opcodes are distinct");
+        C(FB_GETCTX == pb::kOpFbGetCtx && FB_CTX == pb::kOpFbCtx && FB_PING == pb::kOpFbPing && FB_PONG == pb::kOpFbPong &&
+          FB_GETADDR == pb::kOpFbGetAddr && FB_ADDR == pb::kOpFbAddr,
+          "W1 equal to the Path B relay wire's opcodes");
+        bool clash = false, reserved = false, ctrl = false;
+        for (u8 o : ops) {
+            for (std::uint8_t v : c2pool::v37n::wire_freeze::kAcceptedVersions) clash = clash || o == v;
+            reserved = reserved || o == 0x4a || o == 0x4b;
+            ctrl = ctrl || o >= c2pool::v37n::kCtrlOpcodeBase;
         }
-        C(moved(lp, 2001, BindMode::None), "W4 share_diff moves it");
-        C(moved(lp, 2000, BindMode::Rbind), "W4 bind mode moves it");
+        C(!clash, "W1 no kept opcode is a Family-A accepted CarrierWire version");
+        C(!reserved, "W1 no kept opcode uses 0x4a / 0x4b");
+        C(!ctrl, "W1 every kept opcode lies below the control opcodes (0x80)");
+        const std::size_t cap16 = ::c2pool::xmr::pathb::blob_cap_ctx(16, ::c2pool::xmr::pathb::zone(16)).value_or(0);
+        C(cap16 == 600051 && kCtxHeader + cap16 < c2pool::v37n::kMaxCarrierFrame &&
+                  kAddrMaxFrame < c2pool::v37n::kMaxCarrierFrame,
+          "W1 the FB_CTX frame at P-13 (hf 16: 600,051) and the largest FB_ADDR frame fit the transport ceiling");
     }
 
-    // ── W5 receipts ─────────────────────────────────────────────────────────
+    // ── W2 FB_GETCTX / FB_CTX ───────────────────────────────────────────────
     {
-        const SynthBlock sb = make_block(150, b32_of(11), 3, nullptr, 5, 1);
-        FbReceipt r; std::string why;
-        C(mint_on(sb, 77, payA, 7, 2000, r, &why), "W5 mint a receipt on a 6-tx synthetic lane block " + why);
-        const auto raw = encode_fb_receipt(r);
-        C(!raw.empty() && raw.size() <= kFbReceiptMaxBytes, "W5 fb_receipt encodes (" + std::to_string(raw.size()) + " B)");
-        FbReceipt back;
-        C(decode_fb_receipt(raw, back, &why) && encode_fb_receipt(back) == raw, "W5 fb_receipt round trip is byte-exact");
-        bool total = true, never = true;
-        for (std::size_t n = 0; n < raw.size(); ++n) {
-            std::vector<u8> t(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(n));
-            try { FbReceipt x; if (decode_fb_receipt(t, x)) never = false; } catch (...) { total = false; }
+        const std::vector<u8> g = encode_getctx(7, {fill32(0x11), fill32(0x12)});
+        C(hex(g) == "4301" "07000000" "02" + rep("11", 32) + rep("12", 32), "W2 getctx(7, [11.., 12..]) golden");
+        u32 ch = 0; std::vector<bytes32> ids; std::string why;
+        C(decode_getctx(g, ch, ids, &why) && ch == 7 && ids.size() == 2 && ids[0] == fill32(0x11) && ids[1] == fill32(0x12),
+          "W2 getctx round-trip");
+        C(encode_getctx(7, {}).empty() && encode_getctx(7, std::vector<bytes32>(kCtxMaxIds + 1, fill32(1))).empty(),
+          "W2 getctx with 0 or 9 ids not encodable");
+        C(encode_getctx(7, std::vector<bytes32>(kCtxMaxIds, fill32(1))).size() == 7 + 32 * kCtxMaxIds, "W2 getctx with 8 ids");
+        std::vector<u8> b = g; b[0] = FB_CTX;   C(!decode_getctx(b, ch, ids), "W2 getctx wrong opcode refused");
+        b = g; b[1] = 2;                         C(!decode_getctx(b, ch, ids), "W2 getctx unknown version refused");
+        b = g; b[6] = 0;                         C(!decode_getctx(b, ch, ids), "W2 getctx n 0 refused");
+        b = g; b[6] = 9;                         C(!decode_getctx(b, ch, ids), "W2 getctx n 9 refused");
+        {   // nine ids, the length matching nine
+            std::vector<u8> nine = {FB_GETCTX, kFbVersion, 7, 0, 0, 0, 9};
+            for (int i = 0; i < 9; ++i) { const bytes32 id = fill32(static_cast<u8>(0x20 + i)); nine.insert(nine.end(), id.begin(), id.end()); }
+            C(!decode_getctx(nine, ch, ids), "W2 getctx with 9 ids (length consistent) refused");
         }
-        C(total, "W5 decode is TOTAL (no throw) under truncation at every one of " + std::to_string(raw.size()) + " lengths");
-        C(never, "W5 no truncation of a receipt decodes");
-        auto t = raw; t.push_back(0);              C(!decode_fb_receipt(t, back), "W5 trailing byte -> refused");
-        t = raw; t[0] = 0x01; t[1] = 0x04;         C(!decode_fb_receipt(t, back), "W5 receipt len 1025 > relay budget -> refused");
-        t = raw; t[raw.size() - 66] = 0x01;        C(!decode_fb_receipt(t, back), "W5 non-XMR payee kind -> refused");
-        t = raw; t[raw.size() - 65] = 32;          C(!decode_fb_receipt(t, back), "W5 payee length != 64 -> refused");
-        const auto f1 = encode_receipts_frame(7, {&raw});
-        ReceiptsFrame rf;
-        C(decode_receipts_frame(f1, rf, &why) && rf.chain_id == 7 && rf.receipts.size() == 1 && rf.raw[0] == raw,
-          "W5 FB_RECEIPTS n=1 round trip (raw slice == encoded receipt)");
-        std::vector<const std::vector<u8>*> eight(8, &raw), nine(9, &raw);
-        const auto f8 = encode_receipts_frame(7, eight);
-        C(!f8.empty() && f8.size() <= kFbMaxFrame && decode_receipts_frame(f8, rf) && rf.receipts.size() == 8, "W5 n=8 frame fits and decodes");
-        C(encode_receipts_frame(7, nine).empty(), "W5 n=9 refused at encode");
-        t = f1; t[6] = 9;                          C(!decode_receipts_frame(t, rf), "W5 n=9 header -> refused");
-        t = f1; t[6] = 0;                          C(!decode_receipts_frame(t, rf), "W5 n=0 -> refused");
-        t = f1; t[6] = 2;                          C(!decode_receipts_frame(t, rf), "W5 n claims 2, carries 1 -> refused");
-        bool ftotal = true;
-        for (std::size_t n = 0; n < f8.size(); n += 7) {
-            std::vector<u8> tt(f8.begin(), f8.begin() + static_cast<std::ptrdiff_t>(n));
-            try { ReceiptsFrame x; (void)decode_receipts_frame(tt, x); } catch (...) { ftotal = false; }
-        }
-        C(ftotal, "W5 FB_RECEIPTS decode is total under truncation");
-        std::vector<u8> huge(kFbMaxFrame + 1, 0); huge[0] = FB_RECEIPTS; huge[1] = 1; huge[6] = 1;
-        C(!decode_receipts_frame(huge, rf), "W5 frame over kFbMaxFrame -> refused before parsing");
+        b = g; b.push_back(0);                   C(!decode_getctx(b, ch, ids), "W2 getctx trailing byte refused");
+        b = g; b.pop_back();                     C(!decode_getctx(b, ch, ids), "W2 getctx truncated refused");
 
-        // ── W6 the dedup key ────────────────────────────────────────────────
-        C(receipt_id(r) == ::v37::xmr::verify::cheap_receipt_id(r.receipt.hashing_blob), "W6 receipt_id == cheap_receipt_id(hashing_blob)");
-        FbReceipt r2; mint_on(sb, 78, payA, 7, 2000, r2);
-        C(receipt_id(r2) != receipt_id(r), "W6 another nonce is another receipt id");
+        // cap: P-13 at hf 16, Z = zone(16) (blob_cap_ctx = 600,051)
+        const std::size_t cap = ::c2pool::xmr::pathb::blob_cap_ctx(16, ::c2pool::xmr::pathb::zone(16)).value_or(0);
+        const std::vector<u8> blob = {'a', 'b', 'c'};
+        const std::vector<u8> c = encode_ctx(7, fill32(0x22), blob, cap);
+        C(hex(c) == "4401" "07000000" + rep("22", 32) + "03000000" "616263", "W2 ctx(7, 22.., \"abc\") golden");
+        bytes32 id{}; std::vector<u8> got;
+        C(decode_ctx(c, ch, id, got, cap, &why) && ch == 7 && id == fill32(0x22) && got == blob, "W2 ctx round-trip");
+        const std::vector<u8> none = encode_ctx(7, fill32(0x22), {}, cap);
+        C(none.size() == kCtxHeader && decode_ctx(none, ch, id, got, cap) && got.empty(),
+          "W2 ctx with an empty blob (unknown here)");
+        C(encode_ctx(7, fill32(1), std::vector<u8>(cap + 1, 0), cap).empty(), "W2 ctx blob over the cap not encodable");
+        const std::vector<u8> full = encode_ctx(7, fill32(1), std::vector<u8>(cap, 0), cap);
+        C(full.size() == kCtxHeader + cap && decode_ctx(full, ch, id, got, cap) && got.size() == cap,
+          "W2 ctx blob at the cap (600,051 B) accepted");
+        b = c; b[38] = 0; b[39] = 0; b[40] = 8; b[41] = 0;   // claims 0x00080000 = 524288 bytes, carries 3
+        C(!decode_ctx(b, ch, id, got, cap), "W2 ctx len != the frame's bytes refused");
+        std::vector<u8> over(kCtxHeader, 0); over[0] = FB_CTX; over[1] = kFbVersion;
+        const std::size_t cap1 = cap + 1;   // 600,052
+        over[38] = static_cast<u8>(cap1); over[39] = static_cast<u8>(cap1 >> 8); over[40] = static_cast<u8>(cap1 >> 16);
+        over[41] = static_cast<u8>(cap1 >> 24);
+        C(!decode_ctx(over, ch, id, got, cap), "W2 ctx len over the cap refused");
+        over.resize(kCtxHeader + cap1, 0);   // the frame carries the cap + 1 bytes it claims
+        C(!decode_ctx(over, ch, id, got, cap), "W2 ctx of the cap + 1 (length consistent) refused");
+        C(decode_ctx(over, ch, id, got, cap1) && got.size() == cap1, "W2 the same frame under a cap one byte higher decodes");
+        b = c; b[0] = FB_GETCTX;                 C(!decode_ctx(b, ch, id, got, cap), "W2 ctx wrong opcode refused");
+        b = c; b[1] = 2;                         C(!decode_ctx(b, ch, id, got, cap), "W2 ctx unknown version refused");
+        bool total = true;
+        for (std::size_t n = 0; n <= c.size(); ++n) {
+            const std::vector<u8> t(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(n));
+            try {
+                u32 x = 0; bytes32 y{}; std::vector<u8> z; std::vector<bytes32> w;
+                const bool ok1 = decode_ctx(t, x, y, z, cap);
+                (void)decode_getctx(t, x, w);
+                if (ok1 != (n == c.size())) total = false;
+            } catch (...) { total = false; }
+        }
+        C(total, "W2 the FB_CTX / FB_GETCTX decoders are total under truncation (only the whole frame decodes)");
+    }
+
+    // ── W3 FB_PING / FB_PONG ────────────────────────────────────────────────
+    {
+        const std::vector<u8> p = encode_ping(FB_PING, 0x1122334455667788ull);
+        C(hex(p) == "4801" "8877665544332211", "W3 ping golden");
+        u8 op = 0; u64 n = 0;
+        C(decode_ping(p, op, n) && op == FB_PING && n == 0x1122334455667788ull, "W3 ping round-trip");
+        const std::vector<u8> q = encode_ping(FB_PONG, 7);
+        C(hex(q) == "4901" "0700000000000000" && decode_ping(q, op, n) && op == FB_PONG && n == 7, "W3 pong golden + round-trip");
+        C(encode_ping(FB_GETCTX, 1).empty(), "W3 another opcode not encodable");
+        std::vector<u8> b = p; b.pop_back();     C(!decode_ping(b, op, n), "W3 wrong length refused");
+        b = p; b[1] = 2;                         C(!decode_ping(b, op, n), "W3 unknown version refused");
+        b = p; b[0] = FB_GETADDR;                C(!decode_ping(b, op, n), "W3 wrong opcode refused");
     }
 
     // ── W7 base58 ───────────────────────────────────────────────────────────
@@ -190,8 +149,10 @@ int main() {
         const auto d = decode_address(addr);
         C(d.has_value() && d->prefix == 18 && !d->subaddress && !d->integrated, "W7 mainnet/regtest standard address decodes (prefix 18, checksum ok)");
         if (d) {
-            golden(C, "W7 spend", hex(std::vector<u8>(d->spend.begin(), d->spend.end())), "a03ab8e2191c928bffa5c875c42834f793a356c12cd6d319310619055bcc7005");
-            golden(C, "W7 view", hex(std::vector<u8>(d->view.begin(), d->view.end())), "099b5b60c9a497e55985b3843c3fda8da741814c39f0cda7fab35c0c4c1c023d");
+            C(hex(std::vector<u8>(d->spend.begin(), d->spend.end())) == "a03ab8e2191c928bffa5c875c42834f793a356c12cd6d319310619055bcc7005",
+              "W7 spend golden");
+            C(hex(std::vector<u8>(d->view.begin(), d->view.end())) == "099b5b60c9a497e55985b3843c3fda8da741814c39f0cda7fab35c0c4c1c023d",
+              "W7 view golden");
             C(::v37::xmr::xmr_ref_valid(d->ref()), "W7 decoded keys are valid ed25519 points (payee ref valid)");
         }
         std::string bad = addr; bad[20] = (bad[20] == 'a') ? 'b' : 'a';
@@ -199,5 +160,58 @@ int main() {
         C(!decode_address(addr.substr(0, 90)).has_value(), "W7 truncated address -> refused");
         C(!decode_address("0OIl" + addr.substr(4)).has_value(), "W7 non-alphabet characters -> refused");
     }
-    return C.done("xmr_relay_wire_kat");
+
+    // ── W8 FB_GETADDR (0x4c) / FB_ADDR (0x4d) ───────────────────────────────
+    {
+        const auto g = encode_getaddr(7, 64);
+        C(hex(g) == "4c01070000004000", "W8 getaddr(7,64) golden");
+        u32 ch = 0; u16 want = 0; std::string why;
+        C(decode_getaddr(g, ch, want, &why) && ch == 7 && want == 64, "W8 getaddr round-trip");
+        C(encode_getaddr(7, 0).empty() && encode_getaddr(7, 257).empty(), "W8 getaddr want 0 / 257 not encodable");
+        auto gb = g; gb[6] = 0; gb[7] = 0;
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr want 0 refused");
+        gb = g; gb.push_back(0);
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr trailing byte refused");
+        gb = g; gb[1] = 2;
+        C(!decode_getaddr(gb, ch, want), "W8 getaddr unknown version refused");
+
+        AddrEntry a4, a6;
+        C(addr_entry_of("203.0.113.9", 59321, 1700000000, a4) && a4.family == kAddrFamV4, "W8 IPv4 literal -> entry");
+        C(addr_entry_of("2001:db8::7", 59321, 1700000001, a6) && a6.family == kAddrFamV6, "W8 IPv6 literal -> entry");
+        C(!addr_entry_of("pool.example", 1, 0, a4 = AddrEntry{}), "W8 a DNS name is not an entry (no resolution on the wire)");
+        addr_entry_of("203.0.113.9", 59321, 1700000000, a4);
+        const auto f = encode_addr(7, {a4, a6});
+        C(f.size() == kAddrHeader + 2 * kAddrEntryBytes, "W8 addr frame = 8 + 2 x 27 bytes");
+        C(hex(f) == "4d0107000000020004cb007109000000000000000000000000b9e700f15365000000000620010db8000000000000000000000007b9e701f1536500000000",
+          "W8 addr(7,[v4,v6]) golden");
+        std::vector<AddrEntry> v;
+        C(decode_addr(f, ch, v, &why) && ch == 7 && v.size() == 2 && v[0] == a4 && v[1] == a6, "W8 addr round-trip (v4 + v6)");
+        C(addr_host(v[0]) == "203.0.113.9" && addr_host(v[1]) == "2001:db8::7", "W8 entry -> host literal");
+        std::vector<u8> empty = encode_addr(7, {});
+        C(decode_addr(empty, ch, v) && v.empty(), "W8 an empty ADDR (nothing known) decodes");
+        std::vector<AddrEntry> many(kAddrMaxEntries, a4), over(kAddrMaxEntries + 1, a4);
+        const auto fm = encode_addr(7, many);
+        C(fm.size() == kAddrMaxFrame && decode_addr(fm, ch, v) && v.size() == kAddrMaxEntries, "W8 256 entries = the bound, accepted");
+        C(encode_addr(7, over).empty(), "W8 257 entries not encodable");
+        auto fb = fm; fb[6] = 1; fb[7] = 1;   // n = 257 claimed
+        C(!decode_addr(fb, ch, v) && v.empty(), "W8 n > 256 refused");
+        fb = f; fb.pop_back();
+        C(!decode_addr(fb, ch, v), "W8 truncated entry refused");
+        fb = f; fb[8] = 5;
+        C(!decode_addr(fb, ch, v) && v.empty(), "W8 unknown address family refused (total: no partial output)");
+        fb = f; fb[8 + 1 + 5] = 1;
+        C(!decode_addr(fb, ch, v), "W8 IPv4 entry with non-zero padding refused");
+        fb = f; fb[8 + 17] = 0; fb[8 + 18] = 0;
+        C(!decode_addr(fb, ch, v), "W8 port 0 refused");
+        AddrEntry z = a4; z.port = 0;
+        C(encode_addr(7, {z}).empty(), "W8 port 0 not encodable");
+        auto is_pub = [](const char* h) { AddrEntry e; return addr_entry_of(h, 1, 0, e) && addr_routable(e); };
+        C(is_pub("1.1.1.1") && is_pub("8.8.8.8") && is_pub("2001:4860::1"), "W8 public addresses are routable");
+        C(!is_pub("127.0.0.1") && !is_pub("10.1.2.3") && !is_pub("192.168.86.114") && !is_pub("172.20.0.1") &&
+          !is_pub("100.64.0.1") && !is_pub("169.254.1.1") && !is_pub("0.0.0.0") && !is_pub("224.0.0.1") &&
+          !is_pub("::1") && !is_pub("fd00::1") && !is_pub("fe80::1") && !is_pub("::ffff:192.168.1.1"),
+          "W8 loopback / RFC1918 / CGNAT / link-local / unspecified / multicast / ULA / mapped-private are NOT routable");
+    }
+    std::printf("xmr_relay_wire_kat: %s: %d checks, %d failures\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
+    return g_fail ? 1 : 0;
 }

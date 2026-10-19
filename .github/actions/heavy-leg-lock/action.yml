@@ -13,7 +13,12 @@ inputs:
     description: Base path of the per-slot holder markers.
     default: /tmp/c2pool-heavy-leg.holder
   slots:
-    description: Number of concurrent slots on the host.
+    description: >-
+      Number of concurrent slots on the host. A runner host may override it for
+      one lock with a positive integer (1-8) in
+      $HOME/.config/c2pool-ci/<basename of lock-file>.slots; with no such file
+      (the default everywhere) this input is used unchanged, and an invalid
+      value falls back to it with a warning.
     default: "2"
   wait:
     description: Max seconds to wait for a free slot before failing.

@@ -97,4 +97,34 @@ if [ "${FREE:-0}" -lt "$FLOOR_GB" ]; then
   exit 1
 fi
 
+# (3) Temp volume. A leg's scratch files (test scratch dirs, compiler temps) go
+#     to $TMPDIR, default /tmp, which need NOT be the build volume: on a heavy
+#     host whose runner _work is a separate data disk, /tmp is the (small) root
+#     filesystem or a RAM-backed tmpfs. The sanitizer legs therefore export
+#     TMPDIR under $RUNNER_TEMP (= <_work>/_temp, the build volume) before this
+#     guard runs, and the guard measures whatever TMPDIR resolves to: on the same
+#     filesystem as the build volume the floor above already covers it; on a
+#     different one it must clear its own (smaller) floor, or fail fast as infra.
+TMP_VOLUME="${HEAVY_DISK_TMP_VOLUME:-${TMPDIR:-/tmp}}"
+TMP_FLOOR_GB="${HEAVY_DISK_TMP_FLOOR_GB:-4}"
+case "$TMP_FLOOR_GB" in ''|*[!0-9]*) TMP_FLOOR_GB=4 ;; esac
+# A not-yet-created TMPDIR is measured at its nearest existing ancestor.
+_tv="$TMP_VOLUME"
+while [ ! -e "$_tv" ] && [ "$_tv" != / ]; do _tv="$(dirname "$_tv")"; done
+_dev_build="$(stat -L -c %d "$BUILD_VOLUME" 2>/dev/null || echo b)"
+_dev_tmp="$(stat -L -c %d "$_tv" 2>/dev/null || echo t)"
+TMP_MOUNT="$(df -P "$_tv" 2>/dev/null | awk 'NR==2{print $6}')"
+if [ "$_dev_build" = "$_dev_tmp" ]; then
+  echo "heavy-disk-guard: temp dir ${TMP_VOLUME} is on the build volume (${TMP_MOUNT:-?}) -- covered by the ${FLOOR_GB}G floor"
+else
+  TMP_FREE="$(avail_gb "$_tv")"
+  : "${TMP_FREE:=0}"
+  echo "heavy-disk-guard: temp dir ${TMP_VOLUME} is on a separate filesystem ${TMP_MOUNT:-?}: ${TMP_FREE}G free (floor ${TMP_FLOOR_GB}G)"
+  if [ "${TMP_FREE:-0}" -lt "$TMP_FLOOR_GB" ]; then
+    df -h "$_tv" 2>/dev/null || true
+    echo "::error::insufficient temp disk on ${RUNNER}, ${TMP_FREE} GB free on ${TMP_MOUNT:-?} for TMPDIR ${TMP_VOLUME} (floor ${TMP_FLOOR_GB} GB) -- transient infra, NOT this diff. Point TMPDIR at the build volume or free space on ${TMP_MOUNT:-?}."
+    exit 1
+  fi
+fi
+
 echo "heavy-disk-guard: OK -- ${FREE}G >= ${FLOOR_GB}G floor"

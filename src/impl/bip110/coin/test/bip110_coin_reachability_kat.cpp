@@ -145,7 +145,7 @@ void t2_self_nonce_registry()
 void t3_version_addr_from()
 {
     LocalAddrTable t(8333);
-    t.seen_local("158.220.92.171");        // contabo public IP (routable)
+    t.seen_local("1.0.0.1");               // a public IP (routable)
     auto best = t.best_local();
     CHECK(best.has_value());
 
@@ -158,7 +158,7 @@ void t3_version_addr_from()
         uint64_t{0}, std::string("/c2pool:0.1/bip110/frstrtr/"), uint32_t{0});
 
     auto parsed = message_version::make(ps);   // round-trip decode
-    CHECK(parsed->m_addr_from.m_endpoint.address() == "158.220.92.171");
+    CHECK(parsed->m_addr_from.m_endpoint.address() == "1.0.0.1");
     CHECK(parsed->m_addr_from.m_endpoint.port() == 8333);
     CHECK((parsed->m_addr_from.m_services & COIN_NODE_BLAKE2B) != 0);
     // The old untruthful literal is gone.
@@ -174,7 +174,7 @@ void t3_version_addr_from()
 void t4_self_addr_record()
 {
     LocalAddrTable t(8333);
-    t.seen_local("158.220.92.171");
+    t.seen_local("1.0.0.1");
     auto best = t.best_local();
     CHECK(best.has_value());
 
@@ -186,7 +186,7 @@ void t4_self_addr_record()
     PackStream ps = message_addr::make(std::vector<btc_addr_record_t>{rec});
     auto parsed = message_addr::make(ps);
     CHECK(parsed->m_addrs.size() == 1);
-    CHECK(parsed->m_addrs[0].m_endpoint.address() == "158.220.92.171");
+    CHECK(parsed->m_addrs[0].m_endpoint.address() == "1.0.0.1");
     CHECK(parsed->m_addrs[0].m_endpoint.port() == 8333);
     CHECK((parsed->m_addrs[0].m_services & COIN_NODE_BLAKE2B) != 0);
     CHECK((parsed->m_addrs[0].m_services & NODE_WITNESS) != 0);
@@ -201,7 +201,7 @@ void t4_self_addr_record()
 void t5_getaddr_self_and_services()
 {
     LocalAddrTable t(8333);
-    t.seen_local("158.220.92.171");
+    t.seen_local("1.0.0.1");
     auto best = t.best_local();
     CHECK(best.has_value());
 
@@ -231,7 +231,7 @@ void t5_getaddr_self_and_services()
     auto parsed = message_addr::make(ps);
     CHECK(parsed->m_addrs.size() == 3);
     // our own reachable addr is served (so a crawler learns US directly).
-    CHECK(parsed->m_addrs[0].m_endpoint.address() == "158.220.92.171");
+    CHECK(parsed->m_addrs[0].m_endpoint.address() == "1.0.0.1");
     CHECK(parsed->m_addrs[0].m_endpoint.port() == 8333);
     // every served record advertises the FULL fork service set incl NODE_WITNESS.
     for (const auto& r : parsed->m_addrs) {

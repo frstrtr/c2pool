@@ -189,6 +189,7 @@ struct TemplateInputs {
         m.height        = height;
         m.prev_id       = prev_id;
         m.seed_hash     = seed_hash;
+        m.next_seed_hash = next_seed_hash;   // announce the next RandomX seed (lag window only)
         m.difficulty    = difficulty;
         m.median_weight = median_weight;
         m.already_generated_coins = already_generated_coins;
@@ -277,6 +278,7 @@ struct SyncState {
     std::uint64_t alt_rows = 0;
     std::uint64_t orphans = 0;
     std::uint64_t reorgs  = 0;
+    std::uint64_t chain_entries = 0;  // RESPONSE_CHAIN_ENTRYs accepted: answers to the driver's asks
 
     std::uint64_t pow_verified = 0;
     std::uint64_t pow_failed   = 0;

@@ -1,0 +1,7 @@
+# Canon rule C30 allowlist: reviewed float and double uses in the XMR lane
+# consensus core. Format: <path> <max count> <reason>. A new use, or one more
+# in a listed file, fails rule C30.
+#
+# Reviewed 2026-10-04 at frstrtr/c2pool master 65b90571a; re-reviewed
+# 2026-10-16 on pathb/s4w-bc-4: none listed.
+

@@ -29,9 +29,44 @@
 #include <sharechain/v37/v37_lane.hpp>       // ::v37::LaneParams
 #include <sharechain/v37/v37_roundabout.hpp> // ::v37::ChainId
 #include "impl/xmr/node/xmr_node_types.hpp"  // c2pool::xmr::node::DaemonEndpoint
-#include "xmr_same_height_race.hpp"          // SameHeightPolicy, SameHeightTieBreak
+#include <c2pool/v37/v37_node_lane_activation.hpp>  // T1: node_lane_params_no_kind()
+#include "xmr_lane_constants.hpp"            // kXmrDropsFloorShift, kXmrTargetIntervalS, kXmrCreditModeCount
 
 namespace c2pool::v37n::xmr {
+
+// kXmrDropsFloorShift (k), kXmrTargetIntervalS (T) and kXmrCreditModeCount: xmr_lane_constants.hpp.
+// DROPS WINDOW (A4b): log2 of one share's work in the estimator unit (== drops::kXmrDropsLz).
+inline constexpr unsigned kXmrDropsWorkLz = 32;
+
+// The same-height tie-break of --same-height-tiebreak: prefer-own (default) |
+// first-seen. The native backend's fork tie reads it.
+enum class SameHeightTieBreak : std::uint8_t { FirstSeen = 0, PreferOwn = 1 };
+
+inline const char* to_string(SameHeightTieBreak t) noexcept {
+    return t == SameHeightTieBreak::PreferOwn ? "prefer-own" : "first-seen";
+}
+
+// The CLI spelling. Returns false (and leaves `out` alone) on anything else.
+inline bool parse_tie_break(const std::string& s, SameHeightTieBreak& out) noexcept {
+    if (s == "prefer-own" || s == "prefer_own" || s == "own") { out = SameHeightTieBreak::PreferOwn; return true; }
+    if (s == "first-seen" || s == "first_seen" || s == "firstseen") { out = SameHeightTieBreak::FirstSeen; return true; }
+    return false;
+}
+
+// The XMR lane's parameters over a base: when the base arms DROPS, the Count
+// estimator (mode 2, floor shift 6) in place of the K-min one.
+inline ::v37::LaneParams xmr_lane_params_of(::v37::LaneParams p) {
+    if (p.subthreshold.enabled) {
+        p.subthreshold.mode = kXmrCreditModeCount;
+        p.subthreshold.count_floor_shift = kXmrDropsFloorShift;
+    }
+    return p;
+}
+// The XMR lane's default parameters: over node_lane_params_no_kind() (DROPS off
+// in a default build).
+inline ::v37::LaneParams xmr_lane_params_default() {
+    return xmr_lane_params_of(::c2pool::v37n::node_lane_params_no_kind());
+}
 
 // The Monero network the daemon binds to. Stagenet is the shipped default —
 // a v37 XMR node is prototype-grade and must never default to real value.
@@ -53,23 +88,8 @@ inline const char* to_string(MoneroNetwork n) {
     return "stagenet";
 }
 
-// The <net> path segment used under config_path()/<net>/v37_settle_db — one
-// isolated settlement store per network so a stagenet run can never read or
-// clobber a mainnet store (mirrors the per-coin datadir isolation the Bitcoin
-// family uses via core::config).
+// The <net> path segment of the node's data directory (one per network).
 inline const char* net_dir(MoneroNetwork n) { return to_string(n); }
-
-// Which coinbase the serve side builds, serves and submits.
-//   MonerodTemplate (option A, default, PR #1534): monerod's own get_block_template
-//     block — a single coinbase to --payout-address, nonce patched. A genuine,
-//     monerod-validated block, but NOT the v37 settlement coinbase.
-//   V37Settlement (option B): a v37-BUILT Monero block whose miner_tx is the
-//     K_fair settlement coinbase (oldest-owed-first EffectiveOwed payees ++
-//     mandated fixed outputs ++ exact-sum residual sink), assembled from
-//     get_miner_data over the W4 OwedLedger. Requires a torsion-valid residual
-//     sink (--residual-sink-spend-hex/--residual-sink-view-hex). Fail-closed:
-//     without a valid sink the daemon refuses to serve.
-enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 };
 
 // M2: which miner-data source the option-B assembler is fed from.
 //   Monerod (default): the get_miner_data RPC path -- the arm option B has used
@@ -78,17 +98,14 @@ enum class CoinbaseMode : std::uint8_t { MonerodTemplate = 0, V37Settlement = 1 
 //     index + relayed txpool). The template path then makes NO monerod call at
 //     all; the daemon stays configured as the C6 parity judge and as the block
 //     submit arm, both of which are off the template path.
-// Only meaningful with --coinbase v37; option A is monerod's own template by
-// definition and ignores this.
 enum class TemplateSourceMode : std::uint8_t { Monerod = 0, Native = 1 };
 
 inline const char* to_string(TemplateSourceMode m) {
     return m == TemplateSourceMode::Native ? "native" : "monerod";
 }
 
-// M3 (R-ARMORDER): which arm drives the FIND path -- the parent tip the
-// template is built on, the block-presence test the finalize driver asks, and
-// the arm a found block goes out on.
+// M3: which arm drives the FIND path -- the parent tip the template is built
+// on, the block-presence test, and the arm a found block goes out on.
 //
 //   DaemonFirst (the DEFAULT, and what M0..M2h shipped): monerod drives. The
 //     tip arrives through LiveMonerodTransport's get_miner_data poll (or ZMQ),
@@ -98,8 +115,8 @@ inline const char* to_string(TemplateSourceMode m) {
 //     is what M2h proved; the daemon stays on the find path either way.
 //
 //   P2PFirst: the embedded native node drives, end to end. Its levin-driven C2
-//     chain index is the tip, the same index answers the finalize driver's
-//     canonical test, and a found block goes out over levin as a 2008
+//     chain index is the tip, the same index answers the canonical
+//     (block-presence) test, and a found block goes out over levin as a 2008
 //     NOTIFY_NEW_FLUFFY_BLOCK (C5 ARM A, ArmOrder::P2pOnly). monerod is NOT
 //     consulted anywhere on that path -- not for the tip, not for the
 //     template, not for the submit. It may still be configured, and is then
@@ -115,13 +132,11 @@ inline const char* to_string(ArmOrderMode m) {
     return m == ArmOrderMode::P2PFirst ? "p2p-first" : "daemon-first";
 }
 
-inline const char* to_string(CoinbaseMode m) {
-    switch (m) {
-        case CoinbaseMode::MonerodTemplate: return "monerod-template (option A)";
-        case CoinbaseMode::V37Settlement:   return "v37-settlement (option B)";
-    }
-    return "monerod-template (option A)";
-}
+// A flag given on the command line and its value ("" for a switch).
+struct GivenFlag {
+    std::string name;
+    std::string value;
+};
 
 // Default monerod RPC/ZMQ ports per network (monerod >= v0.18.0.0). The X2
 // adapter needs get_miner_data + the three ZMQ topics, all >= v0.18.
@@ -155,71 +170,41 @@ struct XmrNodeConfig {
     // is issued for exactly this chain at start (single-node, single lane).
     ::v37::ChainId  lane_chain = 0;
 
-    // The digest-committed lane geometry. Defaults to the OQ-5 ratified default
-    // (LaneParams{}), the only geometry W4's geometry_is_ratified() admits.
-    ::v37::LaneParams lane_params{};
+    // The digest-committed lane geometry. ★ T1 seam, XMR arm: XMR has NO
+    // ratified LaneKind row (nr_ladder.hpp declares BTC/LTC/DASH/DOGE only), so
+    // it takes node_lane_params_no_kind() — the OQ-5 ratified default
+    // (LaneParams{}) today, and, if the build takes the V37.1 activation, the
+    // consensus version WITHOUT ridge dimensions. An XMR ridge row is a canon
+    // edit (ND-R6) with non-derivable constants: an operator ruling, not a port.
+    // DROPS armed: the Count estimator (xmr_lane_params_of above).
+    ::v37::LaneParams lane_params = xmr_lane_params_default();
 
-    // --- settlement finality (F1 driver) ------------------------------------
-    // D_conf: blocks a found (coinbase-carrying) Monero block must be buried on
-    // the best chain before its settlement is FINALIZED. The finalize driver
-    // advances one coin-height at a time; a block at height h finalizes when the
-    // best-chain high-water reaches h + D_conf. Coinbase maturity is 60 on XMR,
-    // so D_conf >= 60 is the safe floor (XMR_COINBASE_MATURITY, scoping §2.1).
-    std::uint64_t   d_conf = 60;
-
-    // MainchainIndex retention below the tip (>= D_conf so a finalizing block is
-    // always resident; seed anchors are pinned on top regardless).
-    std::uint64_t   index_retain_recent = 720;
-
-    // --- c2pool#1551: the same-height double-block tiebreak -----------------
-    // Two Monero blocks at the same parent height, one of them ours. The policy
-    // sets the LEVERS (what we build on, what we re-announce, what we nominate)
-    // and carries the D_conf the credit gate uses; no setting here can make an
-    // unburied or an orphaned block creditable (xmr_same_height_race.hpp).
-    //
-    // `d_conf` above stays the single source of truth for the burial bar:
-    // same_height_policy() copies it in, so the accounting gate and the F1
-    // finalize driver cannot be configured apart.
+    // --- the same-height double-block tie (the native backend's fork tie) ------
     //   --same-height-tiebreak prefer-own (default) | first-seen
-    //   --same-height-renotify <n>   (0 disables the bounded re-announce)
     SameHeightTieBreak same_height_tiebreak = SameHeightTieBreak::PreferOwn;
-    std::uint32_t      same_height_renotify = 3;
-    // Per-height verdict journal. "" = race.log next to settle.img; "off" =
-    // none. Two nodes that watched the same race must agree on every height
-    // either of them credited, and a journal is what turns that claim into a
-    // diff an auditor can run.
-    std::string        same_height_journal;
-
-    // The policy as the accounting layer consumes it -- assembled HERE so the
-    // D_conf coupling is structural rather than a convention every call site
-    // has to remember.
-    SameHeightPolicy same_height_policy() const {
-        SameHeightPolicy p;
-        p.tie_break    = same_height_tiebreak;
-        p.d_conf       = d_conf;
-        p.max_renotify = same_height_renotify;
-        return p;
-    }
+    //   --own-fork-bound-s <n>  the native index's own-fork liveness guard: an
+    //   own-mined tip that no peer adopts for this long is abandoned and the
+    //   node follows the peers' chain (0 disables). Default 2 x target.
+    std::uint32_t      own_fork_bound_s = 240;
+    //   --test-unknown-fork-stall-s <n>  TEST-ONLY: shorten the unknown-fork
+    //   watch's stall period (FORK-FUSE-2; default 30 min) so a regtest rig can
+    //   watch a trip and a clear. REFUSED on mainnet. 0 = the default.
+    std::uint32_t      test_unknown_fork_stall_s = 0;
+    //   --alt-max-blocks <n>  the native index's alt store: alternative Monero blocks kept (and their blobs kept
+    //   across a restart). Policy; default 0 = k_alt (720, one full P-07 context climb servable); floor 1.
+    std::size_t        alt_max_blocks = 0;
+    //   --alt-max-bytes <n>  only lowers the alt store's verified class byte cap (derived: alt_max_blocks x the
+    //   context blob cap at the view); 0 = the derived cap.
+    std::uint64_t      alt_max_bytes = 0;
 
     // --- stratum front-end (X5) --------------------------------------------
     std::string     stratum_bind_host = "127.0.0.1";
     std::uint16_t   stratum_bind_port = 3333;   // XMRig default; single-node
 
     // --- O-2 serve side (stratum listener + live submit) --------------------
-    // The wallet address monerod's get_block_template pays the block reward to
-    // (network-prefixed standard address; regtest = mainnet '4…' format). EMPTY
-    // = the stratum port is NOT served and the daemon runs observe-side only
-    // (index + settlement + F1 driver), exactly as the X9 bring-up did.
-    //
-    // HONEST SCOPE (option A): the block bytes served and submitted are
-    // monerod's own template — a single coinbase to this address — with the
-    // winning nonce patched. That is a genuine, monerod-validated block end to
-    // end, but NOT yet the v37 K_fair settlement coinbase (option B follow-on).
+    // --payout-address: a standard address of the node's network (regtest =
+    // mainnet '4…' format), the payee of the in-process miner's jobs (--mine).
     std::string     payout_address;
-    // get_block_template reserve_size (tx_extra nonce reservation). 0 = none:
-    // one blob for every worker (max_extra_nonces == 1). Per-client extra_nonce
-    // (>= 4) is a follow-on of the template source.
-    std::uint32_t   template_reserve_size = 0;
     // Share (lane) difficulty served to miners. 0 = solo: the job target IS the
     // network target, so every accepted share is a network block. A lower value
     // (e.g. 1000 on regtest) makes miners report shares between blocks.
@@ -227,57 +212,8 @@ struct XmrNodeConfig {
     // Main-loop cadence: tip poll fallback, template refresh, found-queue drain.
     // 5 s suits stagenet; ~1000 ms for a regtest demo.
     std::uint32_t   poll_ms = 5000;
-    // Pending-FOUND sidecar (pfound.tsv next to settle.img) so a restart inside
-    // the D_conf window does not lose a pending FOUND (D10). --no-found-sidecar.
-    bool            found_sidecar = true;
-    // Optional payee identity (the address boundary's OUTPUT): the raw public
-    // spend + view keys of the payout address, 64 hex each. When both are set,
-    // FOUND/FINALIZE records are amount-honest ({identity_key : reward}); when
-    // absent the block is recorded as a valueless {}/{} record.
-    std::string     payee_spend_key_hex;
-    std::string     payee_view_key_hex;
-    bool            payee_subaddress = false;
     // Seconds between the main loop's one-line status reports (0 = never).
     std::uint32_t   status_every_s = 30;
-
-    // --- O-2 OPTION B: the v37 K_fair settlement coinbase -------------------
-    // --coinbase monerod (option A, default) | v37 (option B). In v37 mode the
-    // block the pool assembles + submits is the settlement coinbase, not
-    // monerod's get_block_template — so --payout-address is not consulted for
-    // the coinbase bytes (it may stay empty; the serve port opens when the
-    // residual sink is set, mirroring option A's payout_address gate).
-    CoinbaseMode    coinbase = CoinbaseMode::MonerodTemplate;
-    // The mandated residual sink (REQUIRED for v37 mode): the raw public spend
-    // (B) + view (A) keys, 64 hex each, of the XMR wallet the exact-sum residual
-    // is paid to. Torsion-checked at build; the daemon REFUSES v37 mode without
-    // a valid sink. --residual-sink-subaddress builds an XMR_SUB (D_i, A_main).
-    std::string     residual_sink_spend_hex;
-    std::string     residual_sink_view_hex;
-    bool            residual_sink_subaddress = false;
-    // The v37 lane parameters (consensus once multi-node; explicit here).
-    //
-    // STEP-0 k_floor hotfix — why the XMR floor is NOT moved into LaneParams
-    // (unlike Family A, where btc_node.hpp's coinbase_budget() now reads the
-    // digest-committed LaneParams::k_floor): the XMR lane settles under
-    // COINBASE AUTHORITY (xmr_coinbase_authority.hpp, RECON ruling "read from
-    // block"). Every node books the winner's ON-CHAIN coinbase — payout =
-    // CoinbaseBooking::payout decoded from the block — and never deducts a
-    // locally rebuilt coinbase, so a node running a different settle_h_min
-    // (or settle_output_cap) mines a different but VALID coinbase that every
-    // peer books identically; the K_fair recompute is a cross-check alarm only.
-    // A differing floor therefore cannot fork owed_digest here. The XMR lane
-    // keeps LaneParams::k_floor = 0 (Monero has no dust rule; the lane digest,
-    // the lane tag and the relay HELLO lane_params_digest stay byte-identical).
-    // If XMR ever settles by rebuild instead of by reading the block, this
-    // floor must move into LaneParams exactly as Family A's did.
-    std::uint64_t   settle_h_min      = 0;      // piconero floor per owed output (0 on XMR)
-    std::uint32_t   settle_output_cap = 0;      // TOTAL outputs cap; 0 => weight-aware default
-    // Optional demo owed entry seeded into the (otherwise empty) proof ledger so
-    // the assembled coinbase carries a real K_fair OWED payee alongside the sink
-    // (a multi-output settlement coinbase). 0 => empty ledger (sink-only).
-    // The owed payee is a distinct torsion-valid payee derived from the sink
-    // material with spend/view swapped (see main). Proof-only; no live ledger yet.
-    std::uint64_t   owed_demo_amount = 0;
 
     // --- M2: the NATIVE template source ------------------------------------
     // --xmr-template-source monerod|native. See TemplateSourceMode above.
@@ -338,6 +274,13 @@ struct XmrNodeConfig {
     std::string     native_snapshot_path;
     // Seconds between periodic saves. 0 = only on a clean stop.
     std::uint64_t   native_snapshot_every_s = 300;
+    // COLD-BOOT-2: the native node downloads the catch-up gap at most this many
+    // heights above the Path B follower's recorded frontier, so the gap is
+    // recorded while it downloads, in bounded chain-ordered batches, and no
+    // unrecorded block leaves the index's row retention (2048) or body cache
+    // (1024) first. p2p-first anchor boots only. 0 = off (the whole gap is
+    // downloaded before the follower records any of it).
+    std::uint64_t   native_catchup_window = 256;
     // Serve from the OTHER arm when the configured one is not ready. ON is the
     // production posture; OFF is what makes "the template path made no daemon
     // call" falsifiable rather than merely asserted.
@@ -390,9 +333,8 @@ struct XmrNodeConfig {
 
     // --- M3: the arm order on the FIND path ---------------------------------
     // --arm-order daemon-first (default) | p2p-first. See ArmOrderMode above.
-    // p2p-first is fail-closed on its preconditions: it REFUSES to start unless
-    // the coinbase is the v37 settlement coinbase built from the native arm,
-    // because a daemonless find whose template came from a daemon is not one.
+    // p2p-first is fail-closed on its preconditions (arm_order_refusal): the
+    // native template source and a levin address source.
     ArmOrderMode    arm_order = ArmOrderMode::DaemonFirst;
     // --no-daemon-rpc: do not configure a monerod RPC endpoint for the embedded
     // node AT ALL. Meaningful only with p2p-first, where it is the difference
@@ -401,14 +343,25 @@ struct XmrNodeConfig {
     // one line). The C6 parity oracle then has no judge and scores its samples
     // VOID, which is the honest cost and is exactly why this is not the default.
     bool            no_daemon_rpc = false;
+    // D6d: --native-parity-monerod. Under p2p-first the embedded node is the
+    // tip, the RandomX seed (hash + height, switching at every 2048-block epoch
+    // with the 64-block lag) and the difficulty/height source, all read off its
+    // own chain index -- so by DEFAULT it is handed no monerod endpoint at all,
+    // and the C6 parity judge's status-cadence round trips (get_miner_data for
+    // the shadow arm, get_info + get_last_block_header for the tip) are gone.
+    // This flag opts the judge back in as a COMPARE-ONLY oracle: it is read on
+    // the status cadence, never on the find path, and never decides anything.
+    // Daemon-first is unaffected (the daemon is its parity judge and submit arm
+    // either way); --no-daemon-rpc still wins over it.
+    bool            native_parity_monerod = false;
 
     // --- the SOLO (fully self-contained, peerless) configuration ------------
     //
     // --native-solo. p2p-first already removes the daemon from the find path;
     // this removes the NETWORK from it as well. One process, its own chain from
     // the locally assembled genesis block, its own template, its own hashing
-    // (--mine), its own find, its own finalize -- with nothing else running on
-    // the machine and nothing on the wire.
+    // (--mine), its own find -- with nothing else running on the machine and
+    // nothing on the wire.
     //
     // It is a STRICT EXTENSION of p2p-first and turns three things on together,
     // because any one of them without the others is a broken configuration
@@ -420,7 +373,8 @@ struct XmrNodeConfig {
     //       cohort and there is no cohort, so without this the template arm's
     //       readiness gate never opens;
     //   (3) a found block that reached no peer but that our OWN chain index
-    //       accepted is booked as found (P2pBlockPublisher::enable_solo_own_index).
+    //       accepted is counted as landed (Path B books nothing)
+    //       (P2pBlockPublisher::enable_solo_own_index).
     //
     // WHAT IT COSTS, stated rather than hidden: a solo find is attested by our
     // own index and by nothing else. That is the correct and only available
@@ -429,9 +383,8 @@ struct XmrNodeConfig {
     bool            native_solo = false;
 
     // --- storage ------------------------------------------------------------
-    // When empty, config_path()/<net>/v37_settle_db is used (see xmr_node.hpp).
-    // Set to override the settlement-store directory (tests set a temp dir).
-    std::string     settle_db_path;
+    // --data-dir: the node's data directory (empty: the default under config_path()).
+    std::string     data_dir;
 
     // --- RandomX verify (X pow/) -------------------------------------------
     // Heavy (256 MiB light cache + light VM). Disabled by default for local /
@@ -475,10 +428,18 @@ struct XmrNodeConfig {
     // the register-value provenance and the restore-on-exit contract.
     bool            mine_msr = false;
 
-    // Resolve the on-disk settlement-store directory (settle_db_path override or
-    // config_path()/<net>/v37_settle_db). Declared here, defined in xmr_node.hpp
-    // to keep this header free of <filesystem>/core includes for cheap inclusion.
-    std::string resolved_settle_db_path() const;
+    // --- Path B ---------------------------------------------------------------
+    // --follow-only
+    bool            follow_only = false;
+    // --relay-listen HOST:PORT
+    std::string     relay_listen;
+    // --relay-peer HOST:PORT (repeatable)
+    std::vector<std::string> relay_peers;
+    // --native-txpool-warm-timeout-ms (0 = no warm gate)
+    std::uint64_t   native_txpool_warm_timeout_ms = 30'000;
+    // Every flag given on the command line, in order.
+    std::vector<GivenFlag> given_flags;
+
 };
 
 // M3: the arm-order preconditions, as a PURE function of the configuration, so
@@ -487,17 +448,13 @@ struct XmrNodeConfig {
 //
 // A daemonless FIND is a claim about three things at once -- the tip, the
 // template and the publish -- and only the first of them is the arm order's own.
-// Option A's block bytes ARE monerod's get_block_template, and the monerod
-// template source is a get_miner_data round trip per refresh; either of them
-// under p2p-first would leave a daemon on the find path while the flag said
+// The monerod template source is a get_miner_data round trip per refresh;
+// under p2p-first it would leave a daemon on the find path while the flag said
 // otherwise. Refusing is the only honest answer, and it is given before
 // anything starts rather than degraded into a mode whose name has stopped
 // describing it.
 inline std::string arm_order_refusal(const XmrNodeConfig& c) {
     if (c.arm_order != ArmOrderMode::P2PFirst) return {};
-    if (c.coinbase != CoinbaseMode::V37Settlement)
-        return "--arm-order p2p-first requires --coinbase v37: option A's block IS monerod's "
-               "get_block_template, so a daemonless find of it is a contradiction";
     if (c.template_source != TemplateSourceMode::Native)
         return "--arm-order p2p-first requires --xmr-template-source native: a find path whose "
                "template came from get_miner_data is not daemonless";
@@ -516,8 +473,8 @@ inline std::string arm_order_refusal(const XmrNodeConfig& c) {
 // the KAT pins must be one piece of code.
 //
 // Solo is fail-closed on its network. A node that mines a chain nobody else
-// has, and books the proceeds on the strength of its own index alone, is a
-// correct regtest rig and a catastrophic mainnet one -- and on testnet or
+// has, and counts its blocks as landed on the strength of its own index alone,
+// is a correct regtest rig and a catastrophic mainnet one -- and on testnet or
 // stagenet it would silently fork away from the real chain at the genesis
 // block, which is a confusing way to waste a day rather than a danger. So the
 // mode is regtest-only, by refusal and not by documentation.
@@ -544,6 +501,8 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
     if (c.native_use_seeds)
         return "--native-solo builds a private chain of its own with no network to relay to, so "
                "--native-seeds (bootstrap from the network's seed nodes) contradicts it: pick one";
+    if (!c.relay_listen.empty()) return "--native-solo takes no --relay-listen";
+    if (!c.relay_peers.empty()) return "--native-solo takes no --relay-peer";
     return {};
 }
 
@@ -565,14 +524,22 @@ inline std::string solo_refusal(const XmrNodeConfig& c) {
 inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const* argv,
                                   int i, std::string& err) {
     const std::string a = argv[i];
-    const bool have_value = (i + 1 < argc);
+    // CLI-STRICT: a following token that is itself a long flag is not a value
+    // (`--native-connect --seeds` is a missing address, not an address "--seeds").
+    const bool have_value = (i + 1 < argc) &&
+                            std::string(argv[i + 1]).rfind("--", 0) != 0;
     const std::string v = have_value ? argv[i + 1] : std::string();
 
     // A value flag with nothing after it is an ERROR, not a silent default: an
     // operator who typed `--native-snapshot-path` last on the line meant a path.
+    // CLI-STRICT: the number is the WHOLE token in decimal digits -- std::stoull
+    // alone takes "12abc" as 12 and "-1" as 2^64-1.
     auto need = [&](std::uint64_t& out) -> int {
         if (!have_value) { err = a + " wants a value"; return -1; }
+        const bool digits = !v.empty() && v.size() <= 20 &&
+            v.find_first_not_of("0123456789") == std::string::npos;
         try {
+            if (!digits) throw std::invalid_argument(v);
             out = std::stoull(v);
         } catch (const std::exception&) {
             err = a + " wants a number, got '" + v + "'";
@@ -599,12 +566,14 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
     if (a == "--native-force-synced")          { c.native_force_synced = true; return 1; }
     if (a == "--native-allow-unverified-pow")  { c.native_allow_unverified_pow = true; return 1; }
     if (a == "--native-seeds" || a == "--seeds") { c.native_use_seeds = true; return 1; }
+    if (a == "--native-parity-monerod")        { c.native_parity_monerod = true; return 1; }   // D6d
     if (a == "--native-snapshot-path") {
         if (!have_value || v.empty()) { err = "--native-snapshot-path wants <file>"; return -1; }
         c.native_snapshot_path = v;
         return 2;
     }
     if (a == "--native-snapshot-every")  return need(c.native_snapshot_every_s);
+    if (a == "--native-catchup-window")  return need(c.native_catchup_window);   // COLD-BOOT-2
     if (a == "--native-backlog-refresh" || a == "--backlog-refresh")
         return need(c.native_backlog_refresh_s);
     if (a == "--anchor-confirm-peers") {
@@ -642,8 +611,13 @@ inline int apply_native_node_flag(XmrNodeConfig& c, int argc, const char* const*
         return used;
     }
     if (a == "--native-template-fallback") {
-        if (!have_value) { err = "--native-template-fallback wants on|off"; return -1; }
-        c.native_template_fallback = !(v == "off" || v == "0" || v == "false");
+        const bool off = (v == "off" || v == "0" || v == "false");
+        const bool on  = (v == "on"  || v == "1" || v == "true");
+        if (!have_value || !(on || off)) {
+            err = "--native-template-fallback wants on|off, got '" + v + "'";
+            return -1;
+        }
+        c.native_template_fallback = !off;
         return 2;
     }
     return 0;

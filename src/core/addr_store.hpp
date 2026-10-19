@@ -58,6 +58,25 @@ private:
 public:
     AddrStore(const std::string& coin_name) : m_path(core::filesystem::config_path() / coin_name / default_filename)
     {
+        open_or_create();
+    }
+
+    // An explicit file (the v37 XMR relay keeps one per pool id + network in
+    // its data dir). Same on-disk format and semantics as the coin_name form.
+    struct at_file_t {};
+    AddrStore(at_file_t, std::filesystem::path file) : m_path(std::move(file))
+    {
+        open_or_create();
+    }
+
+    const std::filesystem::path& path() const { return m_path; }
+
+    // Replace the whole set and save once (a caller that keeps its own book).
+    void replace_all(const std::vector<AddrStorePair>& v);
+
+private:
+    void open_or_create()
+    {
         // check for exist path + make default
         if (std::filesystem::exists(m_path))
         {
@@ -69,7 +88,8 @@ public:
         }
         else
         {
-            std::filesystem::create_directory(m_path.parent_path());
+            std::error_code ec;
+            std::filesystem::create_directories(m_path.parent_path(), ec);
         
             std::ofstream file(m_path);
             file << nlohmann::json{}.dump();
@@ -78,6 +98,8 @@ public:
             LOG_WARNING << "Config (" << m_path << "): not found, created default.";
         }
     }
+
+public:
 
     void save() const;
     bool check(const NetService& addr) const { return m_data.contains(addr); }

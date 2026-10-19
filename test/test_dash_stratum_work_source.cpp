@@ -28,6 +28,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
 #include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
+#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: dashd templates only)
 #include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
 
 #include <core/stratum_work_source.hpp>
@@ -1272,7 +1273,7 @@ TEST(DashStratumWorkSource, ReconnectInvalidatesOnlyWhenTipChanged)
     EXPECT_EQ(notify_count, 2);                            // fail-safe invalidate fired
 }
 
-// ── io-thread-decouple KAT (mining-hotel stratum-stall fix, v0.2.3.8) ────────
+// ── io-thread-decouple KAT (production stratum-stall fix, v0.2.3.8) ────────
 // The stall fix: the stratum io_context thread must NEVER block on the dashd
 // fallback getblocktemplate. cached_work() re-sources through a background
 // executor (the dedicated rpc_pool in main_dash.cpp) as a SINGLE-FLIGHT job and
@@ -2045,7 +2046,7 @@ TEST(DashStratumC1MainnetGate, GbtXcheckServesDashdOnQuorumRootMismatch)
 // Byte-neutral proof: when the embedded merkleRootQuorums (and merkleRootMNList
 // and creditPool) already MATCH dashd's, the unconditional xcheck adds NO swap and
 // the served bytes ARE the embedded template's, unchanged. This is why extending
-// the xcheck changes nothing on today's non-null hotel templates (whose roots
+// the xcheck changes nothing on today's non-null production templates (whose roots
 // match dashd byte-for-byte).
 TEST(DashStratumC1MainnetGate, GbtXcheckQuorumRootMatchServesEmbeddedUnchanged)
 {
@@ -2703,7 +2704,7 @@ TEST(DashStratumCoinP2pTipInvalidate, BumpAloneServesStaleUnderRefreshExecutor)
 // the embedded opt-in imply its own feed.
 //
 // ★ The converse must NEVER hold. A transport flag moving the arm is the exact
-// shape of the live-hotel incident (--coin-p2p-connect activating an unguarded
+// shape of the live-production incident (--coin-p2p-connect activating an unguarded
 // embedded arm on a production node, real money). The two REWARD-SAFETY pins
 // below are load-bearing: a default `--run` and `--coin-p2p-connect` alone must
 // BOTH still resolve dashd-fallback.
@@ -2769,7 +2770,7 @@ TEST(DashRunArmResolution, DefaultRunResolvesDashdFallback)
     EXPECT_EQ(served_arm_for(argv_bare()), dash::coin::WorkSource::DashdFallback);
 }
 
-// ── REWARD-SAFETY PIN 2: the hotel incident. A transport flag alone must NOT
+// ── REWARD-SAFETY PIN 2: the production incident. A transport flag alone must NOT
 // flip the arm — on its own it brings up the coin-network connection and
 // NOTHING else. This is the pin that would have caught that incident. ─────────
 TEST(DashRunArmResolution, CoinP2pConnectAloneStillResolvesDashdFallback)
@@ -2893,7 +2894,7 @@ using dash::coin::ServeGateJournal;
 using Trig = dash::coin::ServeGateJournal::Trigger;
 
 // ── Episode DURATION: the metric that actually ranks the causes ─────────────
-// Measured on the hotel node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
+// Measured on the production node over 5h33m (2026-08-06): 109 `dmn-stale` episodes
 // vs 3 `qc-plan-underivable`. BY COUNT dmn-stale is 97% of the problem. BY TIME
 // OFF THE EMBEDDED ARM, 104 of those 109 lasted under a second (~54 ms each,
 // 5.6 s in total — the ordinary tip-change -> getmnlistd round trip) while the
@@ -4099,4 +4100,91 @@ TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
             << "the served pin's 50000 sat was added to the loss: "
             << w.m_pin_drop_alarm;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The DASH v36 network takes mining work from dashd getblocktemplate only.
+//
+// A v36 share commits the template's txs through the coinbase merkle_link and
+// the finder assembles the won block from the bodies dashd served, so the v36
+// network must not serve embedded (daemonless) templates to miners yet, and
+// without a dashd RPC arm it serves no mining work at all. The public profile
+// is unchanged.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(DashV36WorkPolicy, ResolveV36WorkPolicy)
+{
+    using dash::coin::resolve_v36_work_policy;
+    for (bool rpc : {false, true}) {
+        const auto pub = resolve_v36_work_policy(/*v36_network=*/false, rpc);
+        EXPECT_FALSE(pub.dashd_templates_only) << "public profile unchanged (rpc=" << rpc << ")";
+        EXPECT_TRUE(pub.serve_stratum);
+        EXPECT_STREQ(pub.reason, "public-profile");
+    }
+    const auto with_rpc = resolve_v36_work_policy(true, true);
+    EXPECT_TRUE(with_rpc.dashd_templates_only);
+    EXPECT_TRUE(with_rpc.serve_stratum);
+    EXPECT_STREQ(with_rpc.reason, "v36-network-dashd-templates");
+    const auto no_rpc = resolve_v36_work_policy(true, false);
+    EXPECT_TRUE(no_rpc.dashd_templates_only);
+    EXPECT_FALSE(no_rpc.serve_stratum) << "no dashd RPC arm -> no mining work on the v36 network";
+    EXPECT_STREQ(no_rpc.reason, "v36-network-requires-coin-rpc");
+}
+
+// Testnet with a populated, viable coin-state serves the EMBEDDED template
+// (DashStratumC1MainnetGate.TestnetPopulatedCoinStateServesEmbedded). With
+// set_dashd_templates_only(true) the same work source serves dashd's template
+// -- its transactions and merkle branches -- and names the policy as the
+// decline cause.
+TEST(DashV36WorkPolicy, DashdTemplatesOnlyDeclinesEmbeddedArm)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    EXPECT_FALSE(ws.dashd_templates_only()) << "default OFF";
+    ws.set_dashd_templates_only(true);
+    ASSERT_TRUE(ws.dashd_templates_only());
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "dashd's template, not the embedded one";
+    EXPECT_EQ(tmpl.value("height", 0u), 424242u);
+    EXPECT_EQ(ws.get_stratum_merkle_branches().size(), 2u)
+        << "the dashd template's two transactions reach the miner's merkle branches";
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(gw.work.m_height, 424242u);
+    EXPECT_EQ(gw.work.m_tx_hashes.size(), 2u);
+
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", ""), "dashd-fallback");
+    EXPECT_EQ(st.value("no_work_reason", ""), "dashd-templates-only");
+    EXPECT_EQ(st.value("no_work_value", ""), "v36-network");
+    EXPECT_EQ(st.value("no_work_threshold", ""), "--coin-rpc");
+
+    // The same work source with the policy OFF (the public profile) serves the
+    // embedded template exactly as before.
+    dash::stratum::DASHWorkSource pub(cs, fallback, submit,
+                                      core::stratum::StratumConfig{},
+                                      /*is_testnet=*/true);
+    const auto pt = pub.get_current_work_template();
+    ASSERT_FALSE(pt.empty());
+    EXPECT_NE(pt.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(pub.get_work(job_in).source, dash::coin::WorkSource::Embedded);
 }

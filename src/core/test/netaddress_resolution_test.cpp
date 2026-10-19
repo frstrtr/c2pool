@@ -15,7 +15,7 @@
 //     p2pool, so the fix must not move a single byte for numeric input. Every
 //     dotted-quad KAT below is the byte string this serializer produced before
 //     the fix and must keep producing — including a genuine
-//     `--addnode 127.0.0.1:18999`, which the hotel legitimately runs.
+//     `--addnode 127.0.0.1:18999`, which the production node legitimately runs.
 //
 //  2. THE DEFECT. A hostname must not serialize to loopback, and once the
 //     outbound-connect resolver has resolved it, it must serialize to that A
@@ -78,7 +78,7 @@ std::vector<uint8_t> wire_quad(const NetAddress& addr)
 
 const std::vector<uint8_t> LOOPBACK_QUAD{0x7f, 0x00, 0x00, 0x01};
 
-// The two DNS names from the production hotel's --addnode list, and the
+// The two DNS names from the production node's --addnode list, and the
 // addresses they actually resolve to (issue #910).
 constexpr const char* HOST_ROV = "rov.p2p-spb.xyz";
 constexpr const char* HOST_USA = "usa.p2p-spb.xyz";
@@ -119,7 +119,7 @@ TEST_F(ResolvedHostsFixture, DottedQuadWireBytesAreUnchanged)
 
 TEST_F(ResolvedHostsFixture, GenuineLoopbackStillSerializesAndRoundTrips)
 {
-    // The hotel legitimately runs `--addnode 127.0.0.1:18999`. A real loopback
+    // The production node legitimately runs `--addnode 127.0.0.1:18999`. A real loopback
     // address is NOT what #910 is about and must keep working untouched.
     EXPECT_EQ(wire_quad(NetAddress(std::string("127.0.0.1"))), LOOPBACK_QUAD);
 

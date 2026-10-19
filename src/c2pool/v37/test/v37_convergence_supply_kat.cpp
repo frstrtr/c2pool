@@ -1002,7 +1002,13 @@ static void test_cs8_zero_consensus_movement() {
     const auto pl = B.net->peer_ids();
     if (!pl.empty()) {
         CHECK(B.fetch->request_order(pl.front(), CHAIN, 0, 3, b_dig, 64));
-        CHECK(wait_until([&] { return B.fetch->stats().orders_ok == 1; }));
+        // orders_ok is bumped BEFORE on_order runs: wait for the callback's
+        // copy of the order, not only the counter.
+        CHECK(wait_until([&] {
+            if (B.fetch->stats().orders_ok != 1) return false;
+            std::lock_guard<std::mutex> lk(B.last_mtx);
+            return B.last_order.has_value();
+        }));
         std::vector<bytes32> ids;
         {
             std::lock_guard<std::mutex> lk(B.last_mtx);
@@ -1133,7 +1139,15 @@ static void test_cs9_reply_ceiling_and_continuation() {
         if (!pl.empty()) {
             CHECK(B.fetch->request_frames(pl.front(), CHAIN, ids));
             // ★ IT COMPLETES. Not "the first chunk arrives" — all 20.
-            CHECK(wait_until([&] { return B.n_all_frames() == 20; }, 20000));
+            // The reader thread hands the last chunk to on_frames BEFORE it
+            // bumps fetches_completed, so wait for the counter and the freed
+            // slot as well as the frames; reading stats on frames==20 alone
+            // races that bump.
+            CHECK(wait_until([&] {
+                return B.n_all_frames() == 20 &&
+                       B.fetch->stats().fetches_completed == 1 &&
+                       !B.fetch->busy(pl.front());
+            }, 20000));
             CHECK(B.n_all_frames() == 20);
             CHECK(B.fetch->stats().frames_verified == 20);
             CHECK(B.fetch->stats().fetches_completed == 1);
@@ -1198,7 +1212,13 @@ static void test_cs9_reply_ceiling_and_continuation() {
         CHECK(!pl.empty());
         if (!pl.empty()) {
             CHECK(B.fetch->request_frames(pl.front(), CHAIN, {mined[0].hash(), huge_id}));
-            CHECK(wait_until([&] { return B.n_unservable() == 1; }));
+            // on_unservable runs BEFORE the UNSERVABLE_ID failure and the
+            // fetches_completed bump (same reader thread): wait for the
+            // completion, which is the last of the three.
+            CHECK(wait_until([&] {
+                return B.n_unservable() == 1 &&
+                       B.fetch->stats().fetches_completed == 1;
+            }));
             // ★ EXPLICIT, and DISTINCT from a missing id.
             CHECK(B.saw_failure(SupplyFailure::UNSERVABLE_ID));
             CHECK(!B.saw_failure(SupplyFailure::MISSING_ID));

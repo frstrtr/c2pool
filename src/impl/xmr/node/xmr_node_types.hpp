@@ -50,6 +50,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,12 @@ struct MinerData {
     std::vector<TxBacklogEntry> tx_backlog;    // fee-sorted candidate txs
 
     std::uint64_t local_recv_ns = 0; // local monotonic stamp set by the adapter
+
+    // v37 addition (not in p2pool's MinerData; get_miner_data carries none):
+    // the NEXT RandomX seed block id, set only while it differs from
+    // seed_hash -- the 64 heights before a seed switch -- exactly as monerod's
+    // get_block_template publishes next_seed_hash. In-memory only.
+    std::optional<Hash> next_seed_hash;
 
     bool valid() const noexcept {
         return height != 0 && !is_zero(prev_id) && !difficulty.empty();

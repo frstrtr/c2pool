@@ -67,7 +67,7 @@ int main()
     // Single-instant window (everything at once): both spans zero, sum zero.
     check_window(4000, 4000, 4000, 4000, 0, 0, 0);
     // Large window that survives the sub-second tip round trip proportions
-    // measured on the hotel (issue #1154): 54 ms wire, rest fold.
+    // measured on the production node (issue #1154): 54 ms wire, rest fold.
     check_window(5000, 5054, 5100, 5891, 54, 837, 891);
 
     // ── ORDER / DUPLICATE GUARDS ─────────────────────────────────────────────

@@ -14,8 +14,8 @@
 
 int main() {
     using namespace c2pool::xmr::provenance;
-    if (kManifest.size() != 14) {
-        std::printf("FAIL: XMR provenance manifest has %zu rows, expected 14\n",
+    if (kManifest.size() != 13) {
+        std::printf("FAIL: XMR provenance manifest has %zu rows, expected 13\n",
                     kManifest.size());
         return 1;
     }
