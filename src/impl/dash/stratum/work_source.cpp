@@ -494,12 +494,29 @@ nlohmann::json DASHWorkSource::embedded_template_json() const
         out["cbtx"] = nullptr;
     }
 
-    // ── Superblock placeholder (govsync port pending: wf wxrmpvbao) ───────
-    // The field is emitted now so the harness can read it unconditionally;
-    // it flips to active with real payouts once the govsync lane lands.
-    out["superblock"] = nlohmann::json{
-        {"active",  false},
-        {"payouts", nlohmann::json::array()}};
+    // ── Superblock (governance treasury) outputs this coinbase pays ───────
+    // Read from the snapshot's own m_superblock_payments -- the payees the
+    // builder appended to m_packed_payments -- so it cannot disagree with
+    // coinbase_hex. This used to be a hardcoded {active:false} placeholder:
+    // at mainnet superblock 2558864 the served coinbase paid all six treasury
+    // payees while this field reported none. active=false with no payouts on
+    // an ordinary block or an unfunded superblock height. Payee is base58, or
+    // "!"+script hex for a non-standard script (the m_packed_payments form).
+    {
+        nlohmann::json payouts = nlohmann::json::array();
+        uint64_t sb_total = 0;
+        for (const auto& pp : wd->m_superblock_payments) {
+            payouts.push_back(nlohmann::json{
+                {"payee",        pp.payee},
+                {"amount_duffs", pp.amount}});
+            sb_total += pp.amount;
+        }
+        const bool active = !payouts.empty();
+        out["superblock"] = nlohmann::json{
+            {"active",      active},
+            {"payouts",     std::move(payouts)},
+            {"total_duffs", sb_total}};
+    }
 
     return out;
 }
