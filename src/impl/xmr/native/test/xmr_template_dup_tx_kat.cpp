@@ -42,6 +42,10 @@
 //                   with a peer on a rival -> abandoned after the bound (and
 //                   not before), the rival followed; solo -> never; every peer
 //                   lost -> abandoned.
+//   F  OWN FORK  -- the guard against the peers' chains: our block at h is on
+//                   the peer's chain, the peer's block at h+1 came first and our
+//                   own sibling at h+1 won D-14; past the bound only the sibling
+//                   is abandoned and the node is on the peer's branch.
 //
 // All five are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
 // with the fix. Registered in BOTH `--target` lists in
@@ -580,14 +584,119 @@ void test_e_guard() {
     }
 }
 
+// ===========================================================================
+// F. the own-fork guard against the peers' chains
+// ===========================================================================
+//   A    the anchor
+//   b1   OUR block at A+1; the peer's chain carries it
+//   p2   the peer's block on b1 at A+2, connected first
+//   o2   OUR block on b1 at A+2: D-14 PREFER-OWN switches to it (p2 is parked)
+//   p3   the peer's next block, on p2 at A+3
+bool has_alt(const native::ChainIndex& idx, const Hash& id) {
+    for (const auto& t : idx.alt_tips()) if (t.id == id) return true;
+    return false;
+}
+
+struct OwnForkShape {
+    Chain      c;
+    BlockEntry b1, p2, o2, p3;
+    Hash       b1_id{}, p2_id{}, o2_id{}, p3_id{};
+    std::uint64_t h1 = kAnchorHeight + 1;
+    OwnForkShape() {
+        std::string why;
+        b1 = c.make(c.anchor_id, h1, {}, 0x91);
+        b1_id = id_of_blob(b1.block_blob);
+        kat::check(c.idx->submit_own_block(b1, why) && c.tip_id() == b1_id, "F setup: our b1 is the tip");
+        p2 = c.make(b1_id, h1 + 1, {}, 0x92);
+        p2_id = id_of_blob(p2.block_blob);
+        const auto r = c.offer(p2, c.pa);
+        kat::checkf(r.outcome == OfferOutcome::Connected && c.tip_id() == p2_id,
+                    "F setup: the peer's p2 on b1 connects (%s)", native::to_string(r.outcome));
+        c.advertise(c.pa, p2_id, h1 + 1);
+        o2 = c.make(b1_id, h1 + 1, {}, 0x93);
+        o2_id = id_of_blob(o2.block_blob);
+        kat::check(c.idx->submit_own_block(o2, why) && c.tip_id() == o2_id,
+                   "F setup: our o2 at the same height, D-14 switches to it");
+        kat::check(has_alt(*c.idx, p2_id), "F setup: p2 is held as an alternative");
+        p3 = c.make(p2_id, h1 + 2, {}, 0x94);
+        p3_id = id_of_blob(p3.block_blob);
+    }
+    // Past the bound, the tracking started at t0.
+    bool fire(std::string* why = nullptr, std::uint64_t t0 = 1000) {
+        (void)c.idx->check_own_fork(t0);
+        return c.idx->check_own_fork(t0 + kBoundMs + 1, why);
+    }
+};
+
+// F1: the fork base is taken above the height the peers' chains share with ours.
+void test_f1_common_height() {
+    std::printf("== F1. own-fork guard: the base above the peers' common height ==\n");
+    {   // OF-1 (the calib4 WC shape), OF-2, OF-3
+        OwnForkShape s;
+        Chain& c = s.c;
+        std::string why;
+        const bool ab = s.fire(&why);
+        std::printf("   guard: %s\n", why.c_str());
+        char from[48];
+        std::snprintf(from, sizeof from, "own fork from h=%llu ", (unsigned long long)(s.h1 + 1));
+        kat::checkf(ab && why.find(from) != std::string::npos && why.find("ABANDONED 1 ") != std::string::npos,
+                    "OF-1a only o2 is abandoned: the base is h=%llu, above b1, which the peer's chain carries",
+                    (unsigned long long)(s.h1 + 1));
+        kat::checkf(c.tip_id() == s.p2_id, "OF-1b the node is on the peer's p2 at once (tip h=%llu %s)",
+                    (unsigned long long)c.tip_height(), hex8(c.tip_id()).c_str());
+        kat::check(c.idx->is_on_best_chain(s.b1_id) && c.idx->is_on_best_chain(s.p2_id),
+                   "OF-1c b1 and p2 are on the best chain");
+        const auto r3 = c.offer(s.p3, c.pa);
+        kat::checkf(r3.outcome == OfferOutcome::Connected && c.tip_id() == s.p3_id,
+                    "OF-2 the peer's p3 extends the tip (%s)", native::to_string(r3.outcome));
+        std::string w;
+        kat::checkf(!c.idx->submit_own_block(s.o2, w) && c.tip_id() == s.p3_id,
+                    "OF-3 the abandoned o2 is not re-adopted on a re-submit (%s)", w.c_str());
+        kat::check(c.idx->own_forks_abandoned() == 1, "OF-1d one abandonment counted");
+    }
+    {   // OF-5: two peers; the greatest common height counts
+        OwnForkShape s;
+        Chain& c = s.c;
+        const BlockEntry r1 = c.make(c.anchor_id, s.h1, {}, 0x95);   // a lighter rival on A, from pb
+        const Hash r1_id = id_of_blob(r1.block_blob);
+        (void)c.offer(r1, c.pb);
+        kat::check(has_alt(*c.idx, r1_id), "OF-5 setup: pb's rival r1 on A is held");
+        c.advertise(c.pb, r1_id, s.h1);
+        std::string why;
+        const bool ab = s.fire(&why);
+        kat::checkf(ab && why.find("ABANDONED 1 ") != std::string::npos && c.tip_id() == s.p2_id,
+                    "OF-5 pa's chain carries b1, pb's forks at A: only o2 is abandoned, the tip is p2 (tip %s)",
+                    hex8(c.tip_id()).c_str());
+    }
+    {   // OF-11: no own block on the tip: the guard never tracks
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0x96), q2 = c.make(c.anchor_id, h1, {}, 0x97);
+        (void)c.offer(q1, c.pa);
+        (void)c.offer(q2, c.pb);
+        c.advertise(c.pa, id_of_blob(q1.block_blob), h1);
+        c.advertise(c.pb, id_of_blob(q2.block_blob), h1);
+        bool ab = c.idx->check_own_fork(0);
+        ab = c.idx->check_own_fork(kBoundMs * 10) || ab;
+        kat::check(!ab && !c.idx->own_fork_tracking() && c.idx->own_forks_abandoned() == 0,
+                   "OF-11 a node with no own block on its tip never tracks or abandons");
+    }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("=== xmr_template_dup_tx_kat ===\n");
-    test_a_oracle();
-    test_b_own_block();
-    test_c_reorg();
-    test_d_template();
-    test_e_guard();
+    const std::string only = argc > 1 ? argv[1] : "";
+    const auto run = [&](const char* name, void (*fn)()) {
+        if (only.empty() || only == name) fn();
+    };
+    run("a", test_a_oracle);
+    run("b", test_b_own_block);
+    run("c", test_c_reorg);
+    run("d", test_d_template);
+    run("e", test_e_guard);
+    run("f1", test_f1_common_height);
     return kat::report("xmr_template_dup_tx_kat");
 }

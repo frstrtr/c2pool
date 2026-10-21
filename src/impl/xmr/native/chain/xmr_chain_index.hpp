@@ -150,8 +150,11 @@ struct ChainIndexOptions {
     // Monero rule). When the best chain ends in blocks WE mined and, for longer
     // than this, no connected peer advertises a top on that fork -- every peer
     // is on some other tip, or every peer dropped us -- the index leaves its own
-    // fork: the own-mined suffix is disconnected and abandoned, and the node
-    // follows the peers' chain. A levin-only node cannot see WHY a monerod
+    // fork: the own-mined blocks above the height the peers' chains share with
+    // ours (a peer's top on our chain, or the fork point of the branch we hold
+    // for it) are disconnected and abandoned, and the node follows the peers'
+    // chain. An own block a peer's chain carries is never abandoned while that
+    // peer is connected. A levin-only node cannot see WHY a monerod
     // refused our block; "nobody adopted it" is the evidence it does have.
     // 0 disables. Default: two target block times.
     std::uint64_t own_fork_bound_ms = 240'000;
@@ -2428,14 +2431,22 @@ private:
             own_fork_tracking_ = false;
             return false;
         }
-        // The fork base: the lowest block of the own-mined suffix of the chain.
+        // The height of our best chain the peers' chains share: the highest
+        // block of ours that some peer's advertised chain contains.
+        std::string at;
+        const std::optional<std::uint64_t> adopted = peers_common_height_locked_(&at);
+        own_fork_adopted_ = adopted;
+        // The fork base: the lowest block of the own-mined suffix of the chain
+        // above that height. Our own blocks at or below it are on a peer's chain.
         const RowRecord* base = tip;
         for (std::uint64_t h = tip->row.height; h > rows_.oldest_height(); --h) {
             const RowRecord* below = rows_.by_height(h - 1);
             if (!below || !below->own_mined) break;
+            if (adopted && below->row.height <= *adopted) break;
             base = below;
         }
         const std::uint64_t base_h = base->row.height;
+        own_fork_base_h_ = base_h;
         if (!own_fork_tracking_ || !(own_fork_base_ == base->row.id)) {
             own_fork_tracking_    = true;
             own_fork_base_        = base->row.id;
@@ -2445,15 +2456,12 @@ private:
             own_fork_losses_base_ = losses_prev;
             return false;
         }
-        // Adopted? A peer whose advertised top is on our chain at or above the
-        // fork base has taken our block; the fork is not suspect.
-        for (const auto& kv : peers_) {
-            const auto ph = rows_.height_of(kv.second.top_id);
-            if (ph && *ph >= base_h) {
-                own_fork_since_ms_    = now_ms;
-                own_fork_losses_base_ = peer_losses_;
-                return false;
-            }
+        // Adopted? A peer's chain carries our block at or above the fork base;
+        // the fork is not suspect.
+        if (adopted && *adopted >= base_h) {
+            own_fork_since_ms_    = now_ms;
+            own_fork_losses_base_ = peer_losses_;
+            return false;
         }
         // Somebody must have been there to disagree: a node that never had a
         // peer (a solo regtest miner) is not abandoned by anyone.
@@ -2464,9 +2472,36 @@ private:
             *why = "own fork from h=" + std::to_string(base_h) + " (" + hex_(base->row.id)
                  + ") unadopted for " + std::to_string(age) + " ms, peers="
                  + std::to_string(peers_.size()) + " lost="
-                 + std::to_string(peer_losses_ - own_fork_losses_base_);
+                 + std::to_string(peer_losses_ - own_fork_losses_base_) + " peers_common="
+                 + (adopted ? std::to_string(*adopted) : std::string("-")) + at;
         if (age < opts_.own_fork_bound_ms) return false;
         return abandon_own_fork_locked_(base_h, why);
+    }
+
+    // Per connected peer, the height of the highest block of our best chain its
+    // advertised top's chain contains: the top itself when it is on our best
+    // chain, else the fork point of the alternative branch we hold for it. The
+    // greatest over the peers; none when no peer's top is placeable (unknown,
+    // or a branch that does not reach the best chain within max_reorg_depth).
+    std::optional<std::uint64_t> peers_common_height_locked_(std::string* detail) const {
+        std::optional<std::uint64_t> best;
+        for (const auto& kv : peers_) {
+            std::optional<std::uint64_t> a = rows_.height_of(kv.second.top_id);
+            if (!a && alt_.contains(kv.second.top_id)) {
+                std::vector<const AltBlock*> branch;
+                Hash        fork_parent{};
+                std::string w;
+                if (alt_.branch_to_main(kv.second.top_id, [this](const Hash& id) { return rows_.contains(id); },
+                                        static_cast<std::size_t>(opts_.max_reorg_depth), branch, fork_parent, w)
+                    == AltPool::BranchWalk::Ok)
+                    a = rows_.height_of(fork_parent);
+            }
+            if (detail)
+                *detail += " [" + kv.first + " top " + hex_(kv.second.top_id).substr(0, 16) + " common "
+                         + (a ? std::to_string(*a) : std::string("-")) + "]";
+            if (a && (!best || *a > *best)) best = a;
+        }
+        return best;
     }
 
     // Disconnect the own-mined suffix down to (not including) its parent,
@@ -3623,6 +3658,8 @@ private:
     // --- the own-fork liveness guard --------------------------------------------
     bool          own_fork_tracking_    = false;
     Hash          own_fork_base_{};
+    std::uint64_t own_fork_base_h_      = 0;
+    std::optional<std::uint64_t> own_fork_adopted_;   // the peers' common height at the last check
     std::uint64_t own_fork_since_ms_    = 0;
     std::uint64_t own_fork_losses_base_ = 0;
     std::uint64_t peer_losses_          = 0;
