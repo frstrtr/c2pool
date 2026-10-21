@@ -732,6 +732,26 @@ public:
     // Own blocks refused at submit because they carry a tx already mined, a key
     // image already spent, or a duplicate within the block.
     std::uint64_t own_blocks_refused_invalid() const { std::lock_guard<std::mutex> lk(mu_); return own_invalid_refused_; }
+    // Own blocks refused because their parent is an own block the guard abandoned.
+    std::uint64_t own_on_abandoned_refused() const { std::lock_guard<std::mutex> lk(mu_); return own_on_abandoned_refused_; }
+    // Did the own-fork guard abandon this block (the bounded set it remembers)?
+    bool abandoned_own(const Hash& id) const { std::lock_guard<std::mutex> lk(mu_); return abandoned_own_.count(key_(id)) != 0; }
+    // May a Monero block on `prev_id` be published? Only on a parent this index
+    // holds verified (a best-chain row, or a resolved alternative block the gate
+    // passed: a same-height race the job's tip just lost) and that the own-fork
+    // guard did not abandon. false + why otherwise.
+    bool network_parent_publishable(const Hash& prev_id, std::string* why = nullptr) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (abandoned_own_.count(key_(prev_id))) {
+            if (why) *why = "its parent " + hex_(prev_id).substr(0, 16) + " was abandoned by the own-fork guard";
+            return false;
+        }
+        if (!holds_verified_locked_(prev_id)) {
+            if (why) *why = "its parent " + hex_(prev_id).substr(0, 16) + " is not held verified";
+            return false;
+        }
+        return true;
+    }
     // How many tx ids / key images the mined oracle currently covers.
     std::size_t mined_tx_count() const { std::lock_guard<std::mutex> lk(mu_); return mined_tx_.size(); }
 
@@ -1364,6 +1384,15 @@ private:
             if (abandoned_own_.count(key_(r.id))) {
                 r.outcome = OfferOutcome::Rejected;
                 r.why     = "own block was abandoned by the own-fork liveness guard";
+                return r;
+            }
+            // A block of ours on a parent the guard abandoned extends a fork the
+            // node left (a job built before the abandon): refused, never parked.
+            if (abandoned_own_.count(key_(ev.input.parsed.header.prev_id))) {
+                ++own_on_abandoned_refused_;
+                r.outcome = OfferOutcome::Rejected;
+                r.height  = ev.input.coinbase.height;
+                r.why     = "own block extends a block the own-fork liveness guard abandoned";
                 return r;
             }
             std::string bad;
@@ -3667,6 +3696,7 @@ private:
     std::uint64_t peer_losses_          = 0;
     std::uint64_t losses_at_prev_check_ = 0;
     std::uint64_t own_forks_abandoned_  = 0;
+    std::uint64_t own_on_abandoned_refused_ = 0;
     std::set<Key>   abandoned_own_;
     std::deque<Key> abandoned_order_;
 };

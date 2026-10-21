@@ -701,6 +701,34 @@ void test_f2_no_erase() {
                "OF-6c the abandoned own blocks are not parked (no D-14 way back)");
 }
 
+// F3: after the abandon, an own block on the abandoned parent is refused (never
+// parked); a Monero block is publishable only on a parent held verified that the
+// guard did not abandon.
+void test_f3_abandoned_parent() {
+    std::printf("== F3. own-fork guard: the abandoned parent ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    std::string w;
+    kat::checkf(c.idx->network_parent_publishable(s.o2_id, &w) && c.idx->network_parent_publishable(s.p2_id, &w),
+                "OF-13a before the abandon: publishable on the tip o2 and on the held p2 (a lost race) (%s)", w.c_str());
+    kat::check(!c.idx->network_parent_publishable(tag_hash(5, 0x55), &w) && w.find("not held") != std::string::npos,
+               "OF-13b a parent the index does not hold: not publishable");
+    std::string why;
+    kat::check(s.fire(&why) && c.tip_id() == s.p2_id, "F3 setup: o2 abandoned, the tip is p2");
+    kat::checkf(!c.idx->network_parent_publishable(s.o2_id, &w) && w.find("abandoned") != std::string::npos,
+                "OF-13c on the abandoned o2: not publishable (%s)", w.c_str());
+    kat::check(c.idx->network_parent_publishable(s.p2_id) && c.idx->abandoned_own(s.o2_id)
+                   && !c.idx->abandoned_own(s.b1_id),
+               "OF-13d on the new tip p2: publishable; o2 is abandoned, b1 is not");
+    const BlockEntry o3 = c.make(s.o2_id, s.h1 + 2, {}, 0x98);   // found on the stale job built on o2
+    const Hash o3_id = id_of_blob(o3.block_blob);
+    const bool adopted = c.idx->submit_own_block(o3, w);
+    kat::checkf(!adopted && w.find("abandoned") != std::string::npos && c.idx->own_on_abandoned_refused() == 1,
+                "OF-4a an own block on the abandoned o2 is refused (%s)", w.c_str());
+    kat::check(!has_alt(*c.idx, o3_id) && !c.idx->have_block(o3_id) && c.tip_id() == s.p2_id,
+               "OF-4b it is not parked and the tip stays p2");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -716,5 +744,6 @@ int main(int argc, char** argv) {
     run("e", test_e_guard);
     run("f1", test_f1_common_height);
     run("f2", test_f2_no_erase);
+    run("f3", test_f3_abandoned_parent);
     return kat::report("xmr_template_dup_tx_kat");
 }

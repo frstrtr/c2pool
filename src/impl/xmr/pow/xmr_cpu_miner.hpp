@@ -360,6 +360,15 @@ public:
 
     void stop() { halt_workers(); }
 
+    // Withdraw the work: the node has no current job for the miner (its template
+    // was withdrawn). The workers stop and the queued hits are dropped; the next
+    // set_job starts them again.
+    void clear_job() {
+        halt_workers();
+        std::lock_guard<std::mutex> lk(m_hit_mtx);
+        m_hits.clear();
+    }
+
     bool running() const noexcept { return m_running.load(std::memory_order_relaxed); }
 
     MinerStats stats() const {

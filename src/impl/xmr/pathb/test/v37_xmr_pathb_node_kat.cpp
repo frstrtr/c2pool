@@ -213,6 +213,8 @@
 //                66,000 stratum binds; every bind taken by its get_job (no
 //                template, make_job failed, a cached job, an issue); a skip
 //                counted once per template, none under a HOLD;
+//   minerwithdraw  a template withdrawn while the CPU miner holds a job:
+//                the job is withdrawn once; the next template is pushed;
 //   ctxgate      frames parked on a Monero input run again per (cause, id)
 //                only when that input is held: no storm on a P_r held
 //                without its weights, no context asked for it; the seed;
@@ -7456,6 +7458,34 @@ void jobslot() {
     }
 }
 
+// minerwithdraw: a template withdrawn (clear(): a DEFER, a HOLD, FORK-FUSE) while the CPU miner holds a job of it: the
+// miner's job is withdrawn once (no job is current), never while a template is current or the slot holds no job, and
+// the next template is pushed as a new job.
+void minerwithdraw() {
+    const pb::PathbSession s{};
+    bool fail = false;
+    pb::PathbJobSource js(slot_make(&fail));
+    const std::uint32_t M = 0x00fffe00u;
+    js.bind_own(M, s);
+    pb::MinerSlot slot(M);
+    const bool none_before = !slot.withdraw_due(js);
+    const std::uint32_t t1 = js.set_template(slot_template(1), pb::JobNetwork{});
+    const std::optional<::v37::xmr::stratum::TemplateJob> j1 = slot.next(js);
+    if (j1) slot.pushed(j1->template_id);
+    const bool none_current = !slot.withdraw_due(js);
+    js.clear();
+    const bool once = slot.withdraw_due(js);
+    const bool not_twice = !slot.withdraw_due(js) && !slot.next(js) && !slot.settle();
+    const std::uint32_t t2 = js.set_template(slot_template(2), pb::JobNetwork{});
+    const std::optional<::v37::xmr::stratum::TemplateJob> j2 = slot.next(js);
+    if (j2) slot.pushed(j2->template_id);
+    check(none_before && j1 && j1->template_id == t1 && none_current && once && not_twice && slot.withdrawn() == 1,
+          "minerwithdraw: a withdrawn template withdraws the miner's job once (withdrawn " +
+                  std::to_string(slot.withdrawn()) + "), never with a current template or no job");
+    check(j2 && j2->template_id == t2 && slot.job_template() == t2 && !slot.withdraw_due(js),
+          "minerwithdraw: the next template is pushed as a new job");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -7559,6 +7589,7 @@ int main(int argc, char** argv) {
     run("prune_hold", prune_hold);
     run("below", below);
     run("jobslot", jobslot);
+    run("minerwithdraw", minerwithdraw);
     run("ctxgate", ctxgate);
     run("parkidx", parkidx);
     run("catchjoin", catchjoin);

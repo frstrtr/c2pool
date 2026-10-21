@@ -1291,7 +1291,22 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::lock_guard<std::mutex> lk(found_mtx);
         found_new.push_back(std::move(f));
     };
-    const auto lookup = [&jobs](std::uint32_t tid, std::uint32_t en, sub::BlockCandidate& c) { return jobs.candidate(tid, en, c); };
+    // A Monero block is published only on a parent the native index holds verified and the own-fork guard did not
+    // abandon (a job built before the abandon, or on a parent no longer held, is not published).
+    std::atomic<std::uint64_t> parent_refused{0};
+    const auto lookup = [&jobs, nn, &parent_refused, &relay_log, &relay_log_mtx](std::uint32_t tid, std::uint32_t en,
+                                                                                 sub::BlockCandidate& c) {
+        if (!jobs.candidate(tid, en, c)) return false;
+        std::string why;
+        if (!nn->index().network_parent_publishable(c.prev_id, &why)) {
+            parent_refused.fetch_add(1);
+            std::lock_guard<std::mutex> lk(relay_log_mtx);
+            relay_log.push_back("publish: NOT PUBLISHED: template " + std::to_string(tid) + " h=" + std::to_string(c.height) +
+                                ": " + why);
+            return false;
+        }
+        return true;
+    };
     std::unique_ptr<sub::LiveBlockSubmitter> submitter;
     std::unique_ptr<sub::LiveSubmitShareSink> live_sink;
     std::unique_ptr<o2::P2pBlockPublisher> publisher;
@@ -1702,6 +1717,10 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         // 5. --mine (W-E5b): the miner's job is PathbNode::make_job for its own session
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (cpu_miner) {
+            if (mine_slot.withdraw_due(jobs)) {  // the template is withdrawn: no job is current for the miner
+                cpu_miner->clear_job();
+                std::printf("  [cpu-miner] job withdrawn: no template (%s)\n", template_status_name(tstatus));
+            }
             if (gate_closed) {
                 mine::MinerHit dropped;
                 while (cpu_miner->pop_hit(dropped)) {}
@@ -1846,7 +1865,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(listener.min_difficulty_effective()), gate_closed ? "closed" : "open");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
             if (cpu_miner)
-                std::printf("  %s skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n", cpu_miner->describe().c_str(),
+                std::printf("  %s withdrawn=%llu skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n",
+                            cpu_miner->describe().c_str(), static_cast<unsigned long long>(mine_slot.withdrawn()),
                             static_cast<unsigned long long>(mine_slot.skipped()), jobs.sessions_held(),
                             static_cast<unsigned long long>(mine_pushed), static_cast<unsigned long long>(mine_hits),
                             static_cast<unsigned long long>(mine_blocks));
@@ -1857,11 +1877,12 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(sink.rejected()), static_cast<unsigned long long>(sink.refused()),
                         static_cast<unsigned long long>(sink.stale()), sink.last().c_str());
             if (publisher)
-                std::printf("  publish: relayed=%llu solo_landed=%llu failed=%llu refused=%llu parked=%zu (%s)\n",
+                std::printf("  publish: relayed=%llu solo_landed=%llu failed=%llu refused=%llu parent_refused=%llu parked=%zu (%s)\n",
                             static_cast<unsigned long long>(publisher->relayed()),
                             static_cast<unsigned long long>(publisher->solo_landed()),
                             static_cast<unsigned long long>(publisher->failed()),
-                            static_cast<unsigned long long>(publisher->refused()), publisher->parked(),
+                            static_cast<unsigned long long>(publisher->refused()),
+                            static_cast<unsigned long long>(parent_refused.load()), publisher->parked(),
                             publisher->solo_own_index_enabled() ? "SOLO own-index on" : "own-index off");
             if (live_sink)
                 std::printf("  submit: found=%llu unnamed=%llu ok=%llu rejected=%llu refused=%llu last_error=%s\n",

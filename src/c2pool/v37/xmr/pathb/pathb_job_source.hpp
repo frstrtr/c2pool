@@ -344,6 +344,16 @@ public:
         return tj;
     }
     void pushed(std::uint32_t template_id) { job_tid_ = template_id; }
+    // True once when the source has no template while the miner holds a job (a
+    // withdrawn template: no job is current): the caller withdraws the miner's job.
+    // The next template is pushed as a new job.
+    bool withdraw_due(const PathbJobSource& jobs) {
+        if (job_tid_ == 0 || jobs.template_id() != 0) return false;
+        job_tid_ = 0;
+        ++withdrawn_;
+        return true;
+    }
+    std::uint64_t withdrawn() const noexcept { return withdrawn_; }
     void refused(const std::string& why) { why_ = "refused: " + why; }
     std::optional<std::string> settle() {
         if (cur_ == 0 || cur_ == job_tid_ || cur_ == skipped_tid_) return std::nullopt;
@@ -362,6 +372,7 @@ private:
     std::uint32_t job_tid_ = 0;
     std::uint32_t skipped_tid_ = 0;
     std::uint64_t skipped_ = 0;
+    std::uint64_t withdrawn_ = 0;
     std::string why_;
 };
 
