@@ -652,8 +652,9 @@ void test_f1_common_height() {
         kat::checkf(r3.outcome == OfferOutcome::Connected && c.tip_id() == s.p3_id,
                     "OF-2 the peer's p3 extends the tip (%s)", native::to_string(r3.outcome));
         std::string w;
-        kat::checkf(!c.idx->submit_own_block(s.o2, w) && c.tip_id() == s.p3_id,
-                    "OF-3 the abandoned o2 is not re-adopted on a re-submit (%s)", w.c_str());
+        const bool back = c.idx->submit_own_block(s.o2, w);
+        kat::checkf(!back && c.tip_id() == s.p3_id, "OF-3 the abandoned o2 is not re-adopted on a re-submit (%s)",
+                    w.c_str());
         kat::check(c.idx->own_forks_abandoned() == 1, "OF-1d one abandonment counted");
     }
     {   // OF-5: two peers; the greatest common height counts
@@ -711,13 +712,16 @@ void test_f3_abandoned_parent() {
     OwnForkShape s;
     Chain& c = s.c;
     std::string w;
-    kat::checkf(c.idx->network_parent_publishable(s.o2_id, &w) && c.idx->network_parent_publishable(s.p2_id, &w),
+    const bool on_tip = c.idx->network_parent_publishable(s.o2_id, &w);
+    const bool on_alt = c.idx->network_parent_publishable(s.p2_id, &w);
+    kat::checkf(on_tip && on_alt,
                 "OF-13a before the abandon: publishable on the tip o2 and on the held p2 (a lost race) (%s)", w.c_str());
     kat::check(!c.idx->network_parent_publishable(tag_hash(5, 0x55), &w) && w.find("not held") != std::string::npos,
                "OF-13b a parent the index does not hold: not publishable");
     std::string why;
     kat::check(s.fire(&why) && c.tip_id() == s.p2_id, "F3 setup: o2 abandoned, the tip is p2");
-    kat::checkf(!c.idx->network_parent_publishable(s.o2_id, &w) && w.find("abandoned") != std::string::npos,
+    const bool on_abandoned = c.idx->network_parent_publishable(s.o2_id, &w);
+    kat::checkf(!on_abandoned && w.find("abandoned") != std::string::npos,
                 "OF-13c on the abandoned o2: not publishable (%s)", w.c_str());
     kat::check(c.idx->network_parent_publishable(s.p2_id) && c.idx->abandoned_own(s.o2_id)
                    && !c.idx->abandoned_own(s.b1_id),
