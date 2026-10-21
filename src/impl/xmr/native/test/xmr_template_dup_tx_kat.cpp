@@ -68,6 +68,7 @@
 #include "impl/xmr/native/consensus/xmr_block_parse.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_txpool.hpp"
+#include "impl/xmr/native/node/xmr_sync_driver.hpp"
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
 #include "xmr_input_consensus_golden.hpp"
@@ -729,6 +730,123 @@ void test_f3_abandoned_parent() {
                "OF-4b it is not parked and the tip stays p2");
 }
 
+// The peer side of a resync: a chain request is answered with `ids` (from the
+// splice point up), an objects request with the blocks of `served` it names.
+struct PeerServes {
+    std::vector<Hash>       ids;
+    std::uint64_t           start = 0;
+    std::vector<BlockEntry> served;
+    std::size_t             chain_seen = 0, objects_seen = 0, chain_answers = 0;
+    std::vector<Hash>       asked;
+    void step(Chain& c, const PeerRef& p) {
+        for (; chain_seen < c.fetcher.chain_requests.size(); ++chain_seen) {
+            native::ChainEntry e;
+            e.start_height = start;
+            e.total_height = start + ids.size();
+            e.ids = ids;
+            c.idx->on_chain_entry(p, std::move(e));
+            ++chain_answers;
+        }
+        for (; objects_seen < c.fetcher.object_requests.size(); ++objects_seen) {
+            std::vector<BlockEntry> out;
+            for (const Hash& id : c.fetcher.object_requests[objects_seen].ids) {
+                asked.push_back(id);
+                for (const BlockEntry& b : served)
+                    if (id_of_blob(b.block_blob) == id) out.push_back(b);
+            }
+            c.idx->on_objects(p, std::move(out), {}, start + ids.size());
+        }
+    }
+};
+
+PeerSyncData claim(const Hash& top, std::uint64_t top_height) {
+    PeerSyncData d;
+    d.current_height = top_height + 1;
+    d.top_id = top;
+    d.top_version = 16;
+    d.cumulative_difficulty = U128{~0ull, ~0ull >> 1};   // above any chain of this rig
+    d.support_flags = 1;
+    return d;
+}
+
+// F4a: a body the entry cache kept for a detached block does not count as held:
+// the resync asks the peer for it, and the peer's branch connects.
+void test_f4a_resync() {
+    std::printf("== F4a. own-fork guard: the resync re-asks a detached block ==\n");
+    {   // OF-6d, OF-7a: the peer's top unknown at the bound (the calib4 WC outcome), then the resync
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(78, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = s.h1 + 3;
+        e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, s.b1_id) && has(want, s.p3_id) && !has(want, s.p2_id),
+                    "OF-6d the chain entry wants b1 (its body only in the entry cache) and p3, not the held p2 "
+                    "(%zu ids)", want.size());
+        c.idx->on_objects(c.pa, {s.b1, s.p3}, {}, s.h1 + 3);
+        kat::checkf(c.tip_id() == s.p3_id, "OF-6e b1 and p3 delivered: the node is on the peer's p3 (tip h=%llu)",
+                    (unsigned long long)c.tip_height());
+    }
+    {   // OF-7a: the sync driver over the same state, the peer answering what it is asked
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(79, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        c.fetcher.chain_requests.clear();
+        c.fetcher.object_requests.clear();
+        c.fetcher.peer_table = {{c.pa, claim(s.p3_id, s.h1 + 2)}};
+        PeerServes peer;
+        peer.start = kAnchorHeight;
+        peer.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        peer.served = {s.b1, s.p2, s.p3};
+        native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                                   [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); });
+        std::uint64_t now = 100000;
+        int ticks = 0;
+        for (; ticks < 40 && c.tip_id() != s.p3_id; ++ticks, now += 500) {
+            drv.tick(now);
+            peer.step(c, c.pa);
+        }
+        kat::checkf(has(peer.asked, s.b1_id) && c.tip_id() == s.p3_id,
+                    "OF-7a the driver asks the peer for b1 and the node reaches p3 in %d ticks (%zu chain requests)",
+                    ticks, c.fetcher.chain_requests.size());
+    }
+    {   // OF-8: every peer lost, the whole suffix abandoned; the redialled peer's chain carries it
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        std::string w;
+        const BlockEntry b1 = c.make(c.anchor_id, h1, {}, 0xa1);
+        const Hash b1_id = id_of_blob(b1.block_blob);
+        kat::check(c.idx->submit_own_block(b1, w), "OF-8 setup: our b1");
+        const BlockEntry c2 = c.make(b1_id, h1 + 1, {}, 0xa2);
+        const Hash c2_id = id_of_blob(c2.block_blob);
+        kat::check(c.idx->submit_own_block(c2, w) && c.tip_id() == c2_id, "OF-8 setup: our c2 on b1");
+        c.advertise(c.pa, c2_id, h1 + 1);                       // the peer's chain carries both
+        (void)c.idx->check_own_fork(0);
+        c.idx->on_peer_gone(c.pa);
+        (void)c.idx->check_own_fork(1);
+        kat::check(c.idx->check_own_fork(kBoundMs + 2) && c.tip_id() == c.anchor_id,
+                   "OF-8a every peer lost past the bound: the whole own suffix is abandoned, tip A");
+        c.advertise(c.pa, c2_id, h1 + 1);                       // the peer redials
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = h1 + 2;
+        e.ids = {c.anchor_id, b1_id, c2_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, b1_id) && has(want, c2_id), "OF-8b the redialled peer's chain entry wants b1 and c2 "
+                    "(%zu ids)", want.size());
+        c.idx->on_objects(c.pa, {b1, c2}, {}, h1 + 2);
+        kat::checkf(c.tip_id() == c2_id, "OF-8c served by the peer, b1 and c2 connect again (tip h=%llu)",
+                    (unsigned long long)c.tip_height());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -745,5 +863,6 @@ int main(int argc, char** argv) {
     run("f1", test_f1_common_height);
     run("f2", test_f2_no_erase);
     run("f3", test_f3_abandoned_parent);
+    run("f4a", test_f4a_resync);
     return kat::report("xmr_template_dup_tx_kat");
 }

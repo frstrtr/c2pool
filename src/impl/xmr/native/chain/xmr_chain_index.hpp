@@ -1068,7 +1068,10 @@ public:
     // "we are not making progress" indistinguishable from "the peer is not
     // answering". Membership is not enough: a bodiless fluffy announcement and
     // a row whose body has been evicted are both "known" and both still need
-    // fetching, so the test is whether we have bytes we could re-apply.
+    // fetching, so the test is whether we have bytes we could re-apply -- for a
+    // block that is still attached (attached_body_locked_): a body the entry cache
+    // kept for a block that is neither a row nor an alternative any more is
+    // re-asked, or the branch above it can never connect.
     //
     // THE FETCH WINDOW. Only the part of `wanted_` within fetch_window_() of
     // our tip is handed out: whatever we fetch beyond what the alt pool can
@@ -1091,10 +1094,10 @@ public:
             if (wanted_heights_[k] > limit) break;
             if (wanted_heights_[k] < rows_.oldest_height() || rows_.contains(wanted_[k])) continue;
             if (uf_id_held_locked_(wanted_[k])) continue;
-            if (!have_body_locked_(wanted_[k])) out.push_back(wanted_[k]);
+            if (!attached_body_locked_(wanted_[k])) out.push_back(wanted_[k]);
         }
         for (const Hash& id : refetch_)
-            if (!have_body_locked_(id) && !contains_hash_(out, id) && !uf_id_held_locked_(id))
+            if (!attached_body_locked_(id) && !contains_hash_(out, id) && !uf_id_held_locked_(id))
                 out.push_back(id);
         return out;
     }
@@ -2916,6 +2919,16 @@ private:
         if (entries_.find(key_(id)) != entries_.end()) return true;
         const AltBlock* b = alt_.find(id);
         return b && b->has_entry;
+    }
+
+    // The want lists' "held": bytes we could re-apply for a block that is still
+    // attached -- a best-chain row with its cached body, or an alternative block
+    // with its entry. A body left in the entry cache by a block that is neither
+    // (disconnected and not parked, e.g. by the own-fork guard) is not held: a
+    // peer whose chain carries the block is asked for it again.
+    bool attached_body_locked_(const Hash& id) const {
+        if (const AltBlock* b = alt_.find(id)) return b->has_entry;
+        return rows_.contains(id) && entries_.find(key_(id)) != entries_.end();
     }
 
     // A best-chain row, or a resolved alternative block the gate passed (or
