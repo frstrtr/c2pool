@@ -824,7 +824,8 @@ TEST(DashMintRunloopPoolShareCap, MinerSuppliedTargetReplacesCap1WithinBand)
 
     auto build = [&](std::optional<uint256> supplied) {
         return build_producer_job(tracker.chain, params, uint256(), payout_script,
-                                  wd, wd.m_curtime, 7, 0, "c2pool", 43e12, supplied);
+                                  wd, wd.m_curtime, 7, 0, "c2pool", 43e12,
+                                  /*message_data=*/{}, supplied);
     };
 
     auto capped = build(std::nullopt);
