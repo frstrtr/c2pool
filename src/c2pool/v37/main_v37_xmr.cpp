@@ -1975,6 +1975,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(tip_extends), static_cast<unsigned long long>(tip_reorgs),
                         static_cast<unsigned long long>(tip_orphans), chain.catchup_held && chain.catchup_held() ? 1 : 0,
                         static_cast<unsigned long long>(prunes));
+            std::printf("  %s\n", nn->native_sync_line().c_str());
             for (const std::string& l : pb::kept_status_lines(kept_status_values(cfg, *backend, transport.get())))
                 std::printf("%s\n", l.c_str());
             std::fflush(stdout);

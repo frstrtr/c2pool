@@ -69,6 +69,7 @@
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_txpool.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
+#include "impl/xmr/native/node/xmr_sync_telemetry.hpp"
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
 #include "xmr_input_consensus_golden.hpp"
@@ -879,6 +880,78 @@ void test_f4b_quiet_ask() {
                 (unsigned long long)drv.stats().chain_quiet_waits);
 }
 
+// F5: the sync telemetry: the guard line names what it abandoned and where the
+// node is; the no-progress edge; the status line and the chain-answer line.
+void test_f5_telemetry() {
+    std::printf("== F5. sync telemetry ==\n");
+    {   // OF-14a the guard line
+        OwnForkShape s;
+        std::string why;
+        (void)s.fire(&why);
+        const std::string popped = "[" + std::to_string(s.h1 + 1) + ":" + native::rt::sync_hex16(s.o2_id) + "]";
+        const std::string now_on = ", now on h=" + std::to_string(s.h1 + 1) + " " + native::rt::sync_hex16(s.p2_id);
+        kat::checkf(why.find(popped) != std::string::npos && why.find(now_on) != std::string::npos
+                        && why.find("peers_common=" + std::to_string(s.h1)) != std::string::npos,
+                    "OF-14a the guard line names the common height, the abandoned o2 and the tip p2 (%s)", why.c_str());
+    }
+    {   // OF-14b the no-progress edge: raised past stall_report_ms with answers, cleared when the height moves
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0xc1);
+        const Hash q1_id = id_of_blob(q1.block_blob);
+        (void)c.offer(q1, c.pa);
+        c.fetcher.peer_table = {{c.pa, claim(tag_hash(81, 0x7e), h1 + 5)}};
+        PeerServes peer;
+        peer.start = h1;
+        peer.ids = {q1_id};
+        native::rt::SyncDriverConfig cfg;
+        cfg.stall_report_ms = kBoundMs;
+        native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                                   [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); },
+                                   cfg);
+        std::uint64_t now = 100000;
+        bool early = false;
+        for (int t = 0; t < 60; ++t, now += 500) {   // 30 s
+            drv.tick(now);
+            peer.step(c, c.pa);
+            if (now - 100000 < kBoundMs && drv.stats().stalled) early = true;
+        }
+        const native::rt::SyncDriver::Stats st = drv.stats();
+        kat::checkf(!early && st.stalled && st.stall_edges == 1 && st.stall_answers > 0,
+                    "OF-14b no progress for the bound with chain answers: raised once (edges %llu, %llu answers)",
+                    (unsigned long long)st.stall_edges, (unsigned long long)st.stall_answers);
+        const std::string line = native::rt::format_native_sync_stall(st, c.idx->sync_telemetry());
+        kat::checkf(line.find("NO PROGRESS") != std::string::npos && line.find("198.51.100.1:38080") != std::string::npos,
+                    "OF-14c the edge line: %s", line.c_str());
+        (void)c.offer(c.make(q1_id, h1 + 1, {}, 0xc2), c.pa);   // the height moves
+        drv.tick(now);
+        kat::check(!drv.stats().stalled && drv.stats().stall_clears == 1, "OF-14d the height moved: cleared once");
+    }
+    {   // OF-14e the status line and the chain-answer line in the resync state
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(82, 0x7e), s.h1 + 2);
+        (void)s.fire();
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = s.h1 + 3;
+        e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const native::ChainIndex::SyncTelemetry x = c.idx->sync_telemetry();
+        const std::string line = native::rt::format_native_sync(native::rt::SyncDriver::Stats{}, x, 2000);
+        const std::string ans = native::rt::format_native_sync_answer(x.last_answer);
+        kat::checkf(line.find("native-sync: tip=" + std::to_string(kAnchorHeight) + ":") == 0
+                        && line.find(" want=2 detached=1 ") != std::string::npos
+                        && line.find(" abandoned=1 ") != std::string::npos
+                        && line.find(" last_answer=" + std::to_string(kAnchorHeight) + "/3/1/2/1") != std::string::npos,
+                    "OF-14e the status line: %s", line.c_str());
+        kat::checkf(ans.find("split " + std::to_string(kAnchorHeight) + ", 3 ids: 1 held, 2 wanted (1 detached)")
+                        != std::string::npos,
+                    "OF-14f the chain-answer line: %s", ans.c_str());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -897,5 +970,6 @@ int main(int argc, char** argv) {
     run("f3", test_f3_abandoned_parent);
     run("f4a", test_f4a_resync);
     run("f4b", test_f4b_quiet_ask);
+    run("f5", test_f5_telemetry);
     return kat::report("xmr_template_dup_tx_kat");
 }

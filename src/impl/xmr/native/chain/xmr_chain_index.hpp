@@ -442,12 +442,20 @@ public:
             // FORK-FUSE-3: who announced this want list. Only ids THAT peer
             // announced may be held back when it serves an above-version block.
             wanted_src_ = peer_key_(p);
+            ChainAnswer a;
+            a.peer  = peer_key_(p);
+            a.split = base;
+            a.ids   = e.ids.size() - 1;
+            a.seq   = chain_entries_accepted_;
             for (std::size_t i = 1; i < e.ids.size(); ++i) {
-                if (rows_.contains(e.ids[i]) || alt_.contains(e.ids[i])) continue;
+                if (rows_.contains(e.ids[i]) || alt_.contains(e.ids[i])) { ++a.held; continue; }
+                if (wanted_.size() >= MAX_SPAN_IDS) continue;
                 wanted_.push_back(e.ids[i]);
                 wanted_heights_.push_back(base + i);
-                if (wanted_.size() >= MAX_SPAN_IDS) break;
+                ++a.wanted;
+                if (detached_body_locked_(e.ids[i])) ++a.detached;
             }
+            last_answer_ = a;
         }
         flush_events_();
     }
@@ -1080,6 +1088,69 @@ public:
     // As the tip moves, the window moves with it.
     std::vector<Hash> refetch_wanted() const {
         std::lock_guard<std::mutex> lk(mu_);
+        return refetch_wanted_locked_();
+    }
+
+    // The sync telemetry (the node's native-sync status line and edge lines).
+    struct ChainAnswer {
+        std::string   peer;            // "" = none yet
+        std::uint64_t split  = 0;      // the height of the splice point (ours)
+        std::size_t   ids    = 0;      // ids after the splice point
+        std::size_t   held   = 0;      // of which a row or an alternative block
+        std::size_t   wanted = 0;      // of which wanted
+        std::size_t   detached = 0;    // of which wanted with a body only in the entry cache
+        std::uint64_t seq    = 0;      // answers accepted (chain_entries_accepted)
+        bool same_content(const ChainAnswer& o) const {
+            return peer == o.peer && split == o.split && ids == o.ids && held == o.held && wanted == o.wanted
+                && detached == o.detached;
+        }
+    };
+    struct SyncTelemetry {
+        std::uint64_t tip_height = 0;
+        Hash          tip_id{};
+        bool          synced     = false;
+        std::uint64_t chain_entries = 0, chain_entries_refused = 0;
+        std::size_t   want = 0, detached = 0, refetch_list = 0;
+        std::uint64_t parked = 0, unsolicited = 0, unproven_bytes = 0;
+        bool          own_fork_tracking = false;
+        std::uint64_t own_fork_base_h = 0, own_fork_since_ms = 0;
+        std::optional<std::uint64_t> peers_common;
+        std::uint64_t abandoned = 0, on_abandoned_refused = 0;
+        ChainAnswer   last_answer{};
+    };
+    SyncTelemetry sync_telemetry() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        SyncTelemetry x;
+        if (const RowRecord* tp = rows_.tip()) {
+            x.tip_height = tp->row.height;
+            x.tip_id     = tp->row.id;
+        }
+        x.synced                = synced_;
+        x.chain_entries         = chain_entries_accepted_;
+        x.chain_entries_refused = chain_entries_refused_;
+        const std::vector<Hash> want = refetch_wanted_locked_();
+        x.want = want.size();
+        for (const Hash& id : want) if (detached_body_locked_(id)) ++x.detached;
+        x.refetch_list       = refetch_.size();
+        x.parked             = orphans_;
+        x.unsolicited        = unsolicited_dropped_;
+        x.unproven_bytes     = alt_.unverified_bytes();
+        x.own_fork_tracking  = own_fork_tracking_;
+        x.own_fork_base_h    = own_fork_base_h_;
+        x.own_fork_since_ms  = own_fork_since_ms_;
+        x.peers_common       = own_fork_adopted_;
+        x.abandoned          = own_forks_abandoned_;
+        x.on_abandoned_refused = own_on_abandoned_refused_;
+        x.last_answer        = last_answer_;
+        return x;
+    }
+    ChainAnswer last_chain_answer() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return last_answer_;
+    }
+
+private:
+    std::vector<Hash> refetch_wanted_locked_() const {
         std::vector<Hash> out;
         out.reserve(wanted_.size() + refetch_.size());
         // An entry id that has since connected is done with, whether or not
@@ -1102,6 +1173,7 @@ public:
         return out;
     }
 
+public:
     // #1680: fluffy blocks parked WITH a body blob but WITHOUT their
     // transactions (bodies_missing). have_body_locked_() reports these as
     // "have body" (they hold the bodiless blob), so refetch_wanted() omits them;
@@ -2572,6 +2644,7 @@ private:
 
         const std::uint64_t seq = journal_.plan(rec);
         std::uint64_t n = 0;
+        std::string   popped_ids;
         for (std::uint64_t h = tip_h; h > fork_height; --h) {
             const RowRecord* rr = rows_.by_height(h);
             if (!rr) break;
@@ -2589,6 +2662,8 @@ private:
             // the alternative blocks above it may be the peers' chain. The popped
             // block itself is not parked; a peer whose chain carries it serves it.
             remember_abandoned_(popped.row.id);
+            popped_ids += (popped_ids.empty() ? "" : " ") + std::to_string(popped.row.height) + ":"
+                        + hex_(popped.row.id).substr(0, 16);
             ++n;
         }
         journal_.set_phase(seq, ReorgPhase::Disconnected);
@@ -2608,6 +2683,11 @@ private:
         (void)maybe_switch_locked_();
         flush_alt_rows_locked_();
         update_synced_locked_();
+        if (why) {
+            *why += " [" + popped_ids + "]";
+            if (const RowRecord* t = rows_.tip())
+                *why += ", now on h=" + std::to_string(t->row.height) + " " + hex_(t->row.id).substr(0, 16);
+        }
         return n > 0;
     }
 
@@ -2929,6 +3009,11 @@ private:
     bool attached_body_locked_(const Hash& id) const {
         if (const AltBlock* b = alt_.find(id)) return b->has_entry;
         return rows_.contains(id) && entries_.find(key_(id)) != entries_.end();
+    }
+    // A body only the entry cache holds, for a block that is neither a row nor an
+    // alternative block (telemetry: the class the want lists re-ask).
+    bool detached_body_locked_(const Hash& id) const {
+        return entries_.find(key_(id)) != entries_.end() && !rows_.contains(id) && !alt_.contains(id);
     }
 
     // A best-chain row, or a resolved alternative block the gate passed (or
@@ -3710,6 +3795,7 @@ private:
     std::uint64_t losses_at_prev_check_ = 0;
     std::uint64_t own_forks_abandoned_  = 0;
     std::uint64_t own_on_abandoned_refused_ = 0;
+    ChainAnswer   last_answer_{};
     std::set<Key>   abandoned_own_;
     std::deque<Key> abandoned_order_;
 };
