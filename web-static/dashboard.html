@@ -2011,6 +2011,7 @@
                             <tr>
                                 <th>Address / Worker</th>
                                 <th title="Current hashrate based on pseudoshares">Hashrate</th>
+                                <th title="Mean of this node's last-24h hashrate samples for the worker, counting only samples where it was reporting (offline time is not averaged in as zero). Blank when the node has no samples for it.">24h Avg HR</th>
                                 <th title="Pseudoshare difficulty (local work)">Pseudo Diff</th>
                                 <th title="Estimated time to find a valid P2Pool share">Time to Share</th>
                                 <th title="Last pseudoshare received">Last Seen</th>
@@ -2721,7 +2722,7 @@
                 
                 if (display.length === 0) {
                     d3.select('#active_miners tbody').append('tr').append('td')
-                        .attr('colspan', '9')
+                        .attr('colspan', '10')
                         .attr('style', 'text-align: center; color: #888;')
                         .text(showHistorical ? 'No miners found' : 'No miners currently connected via stratum');
                     return;
@@ -2730,6 +2731,25 @@
                 // Fetch payout data (both main chain and merged)
                 d3.json('../current_payouts', function(payouts_data) {
                 d3.json('../current_merged_payouts', function(merged_payouts_data) {
+                d3.json('../web/graph_data/miner_hash_rates/last_day', function(hr_day) {
+                // #1142 item 6: per-worker 24h average, same derivation as the
+                // miners.html card aggregate. A worker is averaged only over the
+                // samples it appears in; no samples means no average (shown '-').
+                var avg_24h = {};
+                if (hr_day && hr_day.length > 0) {
+                    var hr_tot = {}, hr_cnt = {};
+                    hr_day.forEach(function(point) {
+                        if (!point || !point[1]) return;
+                        for (var wn in point[1]) {
+                            var v = point[1][wn];
+                            if (typeof v !== 'number' || !isFinite(v)) continue;
+                            hr_tot[wn] = (hr_tot[wn] || 0) + v;
+                            hr_cnt[wn] = (hr_cnt[wn] || 0) + 1;
+                        }
+                    });
+                    for (var wn2 in hr_tot) avg_24h[wn2] = hr_tot[wn2] / hr_cnt[wn2];
+                }
+                function avgCellText(a) { return a === undefined ? '-' : format_hashrate(a); }
                 var payouts = {};
                 if (payouts_data) {
                     for (var addr in payouts_data) {
@@ -2837,7 +2857,14 @@
                     } else {
                         hashrateCell.text('Connecting...');
                     }
-                    
+
+                    // 24h Avg HR - sum of the workers' averages (miners.html card rule)
+                    var minerAvg;
+                    miner.workers.forEach(function(w) {
+                        if (avg_24h[w.name] !== undefined) minerAvg = (minerAvg || 0) + avg_24h[w.name];
+                    });
+                    minerRow.append('td').text(avgCellText(minerAvg));
+
                     // Pseudoshare Difficulty (max across workers)
                     minerRow.append('td').text(d3.format('.2f')(miner.maxDifficulty));
                     
@@ -2913,7 +2940,8 @@
                         } else {
                             workerHashrateCell.text('-');
                         }
-                        
+                        workerRow.append('td').text(avgCellText(avg_24h[worker.name]));
+
                         workerRow.append('td').text(d3.format('.2f')(worker.difficulty));
                         
                         // Time to share for this worker
@@ -2949,6 +2977,7 @@
                         // standalone parents (body.no-merged-child).
                         workerRow.append('td').attr('class', 'merged-child-hint').text('-');
                     });
+                });
                 });
                 });
                 });
