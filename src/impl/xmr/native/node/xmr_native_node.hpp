@@ -836,7 +836,8 @@ public:
         // --- the sync driver -------------------------------------------------
         SyncDriverConfig dcfg;
         dcfg.probe_only = cfg_.probe_only;
-        dcfg.stall_report_ms = cfg_.own_fork_bound_ms;   // telemetry: two target block times
+        // telemetry: the own-fork bound (two target block times); its default when the guard is off
+        dcfg.stall_report_ms = cfg_.own_fork_bound_ms != 0 ? cfg_.own_fork_bound_ms : ChainIndexOptions{}.own_fork_bound_ms;
         driver_ = std::make_unique<SyncDriver>(
             *pool_, boot_, index_, p2p::genesis_id(nets_.wire),
             [this] { return boot_.booted(); },

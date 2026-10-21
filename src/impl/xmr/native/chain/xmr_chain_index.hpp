@@ -153,8 +153,11 @@ struct ChainIndexOptions {
     // fork: the own-mined blocks above the height the peers' chains share with
     // ours (a peer's top on our chain, or the fork point of the branch we hold
     // for it) are disconnected and abandoned, and the node follows the peers'
-    // chain. An own block a peer's chain carries is never abandoned while that
-    // peer is connected. A levin-only node cannot see WHY a monerod
+    // chain. An own block a connected peer's chain carries is not abandoned when
+    // that peer's advertised top is placed (on the best chain or on a held
+    // branch); a top that cannot be placed counts for nothing, and with no
+    // placeable top the whole own suffix goes, as when every peer is lost (the
+    // resync then re-asks it from a peer that carries it). A levin-only node cannot see WHY a monerod
     // refused our block; "nobody adopted it" is the evidence it does have.
     // 0 disables. Default: two target block times.
     std::uint64_t own_fork_bound_ms = 240'000;

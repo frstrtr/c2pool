@@ -633,7 +633,7 @@ struct OwnForkShape {
 // F1: the fork base is taken above the height the peers' chains share with ours.
 void test_f1_common_height() {
     std::printf("== F1. own-fork guard: the base above the peers' common height ==\n");
-    {   // OF-1 (the calib4 WC shape), OF-2, OF-3
+    {   // OF-1 (the shape), OF-2, OF-3
         OwnForkShape s;
         Chain& c = s.c;
         std::string why;
@@ -778,7 +778,7 @@ PeerSyncData claim(const Hash& top, std::uint64_t top_height) {
 // the resync asks the peer for it, and the peer's branch connects.
 void test_f4a_resync() {
     std::printf("== F4a. own-fork guard: the resync re-asks a detached block ==\n");
-    {   // OF-6d, OF-7a: the peer's top unknown at the bound (the calib4 WC outcome), then the resync
+    {   // OF-6d, OF-7a: the peer's top unknown at the bound, then the resync
         OwnForkShape s;
         Chain& c = s.c;
         c.advertise(c.pa, tag_hash(78, 0x7e), s.h1 + 2);
@@ -795,6 +795,26 @@ void test_f4a_resync() {
         c.idx->on_objects(c.pa, {s.b1, s.p3}, {}, s.h1 + 3);
         kat::checkf(c.tip_id() == s.p3_id, "OF-6e b1 and p3 delivered: the node is on the peer's p3 (tip h=%llu)",
                     (unsigned long long)c.tip_height());
+    }
+    {   // OF-6g: a solicited block on the abandoned o2 parks and puts o2 on the refetch list; o2 (its body only in
+        // the entry cache) is wanted from it
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(84, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        const BlockEntry q = c.make(s.o2_id, s.h1 + 2, {}, 0x9a);
+        const Hash q_id = id_of_blob(q.block_blob);
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = kAnchorHeight + 2;
+        e.ids = {c.anchor_id, q_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        c.idx->on_objects(c.pa, {q}, {}, s.h1 + 3);
+        kat::check(has_alt(*c.idx, q_id), "OF-6g setup: the solicited q on o2 parks (its parent not held)");
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, s.o2_id) && !has(want, q_id),
+                    "OF-6g the refetch list wants o2 (a detached block, its body only cached), not the held q (%zu ids)",
+                    want.size());
     }
     {   // OF-7a: the sync driver over the same state, the peer answering what it is asked
         OwnForkShape s;
@@ -882,6 +902,14 @@ void test_f4b_quiet_ask() {
                 bound);
     kat::checkf(drv.stats().chain_quiet_waits > 0, "OF-7c the waits are counted (%llu)",
                 (unsigned long long)drv.stats().chain_quiet_waits);
+    // OF-7d: the height moves inside a wait: the chain is asked again on the next tick
+    const std::size_t before = c.fetcher.chain_requests.size();
+    const BlockEntry q2 = c.make(q1_id, h1 + 1, {}, 0xb2);
+    kat::check(c.offer(q2, c.pa).outcome == OfferOutcome::Connected, "F4b setup: q2 extends the tip");
+    drv.tick(now);
+    kat::checkf(c.fetcher.chain_requests.size() == before + 1,
+                "OF-7d the height moved: the wait ends and the chain is asked on the next tick (%zu new)",
+                c.fetcher.chain_requests.size() - before);
 }
 
 // F5: the sync telemetry: the guard line names what it abandoned and where the
