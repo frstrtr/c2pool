@@ -956,6 +956,37 @@ void test_f5_telemetry() {
     }
 }
 
+// F3b: an own block the guard abandoned that a peer's chain brings back to the
+// best chain is no longer abandoned: blocks on it are publishable, and an own block
+// on it is not refused.
+void test_f3b_readopted() {
+    std::printf("== F3b. own-fork guard: an abandoned block back on the best chain ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    c.advertise(c.pa, tag_hash(83, 0x7e), s.h1 + 2);   // a top we do not hold: the whole own suffix goes
+    kat::check(s.fire() && c.tip_id() == c.anchor_id, "F3b setup: b1 and o2 abandoned, tip A");
+    native::ChainEntry e;
+    e.start_height = kAnchorHeight;
+    e.total_height = s.h1 + 3;
+    e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+    c.idx->on_chain_entry(c.pa, std::move(e));
+    c.idx->on_objects(c.pa, {s.b1, s.p3}, {}, s.h1 + 3);
+    kat::check(c.tip_id() == s.p3_id && c.idx->is_on_best_chain(s.b1_id),
+               "F3b setup: the peer served b1; the node is on p3 with b1 on the best chain");
+    std::string w;
+    const bool pub = c.idx->network_parent_publishable(s.b1_id, &w);
+    kat::checkf(pub && !c.idx->abandoned_own(s.b1_id),
+                "OF-13e b1, back on the best chain, is not abandoned and blocks on it are publishable (%s)", w.c_str());
+    const bool pub_tip = c.idx->network_parent_publishable(s.p3_id, &w);
+    kat::check(pub_tip && !c.idx->network_parent_publishable(s.o2_id),
+               "OF-13f on the tip p3: publishable; on o2 (abandoned, off the best chain): not");
+    const BlockEntry q2 = c.make(s.b1_id, s.h1 + 1, {}, 0x99);   // our block on the re-adopted b1
+    const bool kept = c.idx->submit_own_block(q2, w);
+    (void)kept;
+    kat::checkf(c.idx->own_on_abandoned_refused() == 0 && w.find("abandoned") == std::string::npos,
+                "OF-4c an own block on the re-adopted b1 is not refused as on an abandoned parent (%s)", w.c_str());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -972,6 +1003,7 @@ int main(int argc, char** argv) {
     run("f1", test_f1_common_height);
     run("f2", test_f2_no_erase);
     run("f3", test_f3_abandoned_parent);
+    run("f3b", test_f3b_readopted);
     run("f4a", test_f4a_resync);
     run("f4b", test_f4b_quiet_ask);
     run("f5", test_f5_telemetry);

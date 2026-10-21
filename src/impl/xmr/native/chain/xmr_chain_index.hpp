@@ -742,15 +742,16 @@ public:
     std::uint64_t own_blocks_refused_invalid() const { std::lock_guard<std::mutex> lk(mu_); return own_invalid_refused_; }
     // Own blocks refused because their parent is an own block the guard abandoned.
     std::uint64_t own_on_abandoned_refused() const { std::lock_guard<std::mutex> lk(mu_); return own_on_abandoned_refused_; }
-    // Did the own-fork guard abandon this block (the bounded set it remembers)?
-    bool abandoned_own(const Hash& id) const { std::lock_guard<std::mutex> lk(mu_); return abandoned_own_.count(key_(id)) != 0; }
+    // Did the own-fork guard abandon this block (the bounded set it remembers),
+    // and is it off the best chain? A block a peer's chain brought back is not.
+    bool abandoned_own(const Hash& id) const { std::lock_guard<std::mutex> lk(mu_); return abandoned_locked_(id); }
     // May a Monero block on `prev_id` be published? Only on a parent this index
     // holds verified (a best-chain row, or a resolved alternative block the gate
     // passed: a same-height race the job's tip just lost) and that the own-fork
     // guard did not abandon. false + why otherwise.
     bool network_parent_publishable(const Hash& prev_id, std::string* why = nullptr) const {
         std::lock_guard<std::mutex> lk(mu_);
-        if (abandoned_own_.count(key_(prev_id))) {
+        if (abandoned_locked_(prev_id)) {
             if (why) *why = "its parent " + hex_(prev_id).substr(0, 16) + " was abandoned by the own-fork guard";
             return false;
         }
@@ -1463,7 +1464,7 @@ private:
             }
             // A block of ours on a parent the guard abandoned extends a fork the
             // node left (a job built before the abandon): refused, never parked.
-            if (abandoned_own_.count(key_(ev.input.parsed.header.prev_id))) {
+            if (abandoned_locked_(ev.input.parsed.header.prev_id)) {
                 ++own_on_abandoned_refused_;
                 r.outcome = OfferOutcome::Rejected;
                 r.height  = ev.input.coinbase.height;
@@ -2689,6 +2690,12 @@ private:
                 *why += ", now on h=" + std::to_string(t->row.height) + " " + hex_(t->row.id).substr(0, 16);
         }
         return n > 0;
+    }
+
+    // An own block the guard abandoned that is not on the best chain now: a block
+    // a peer's chain brought back to the best chain is no longer abandoned.
+    bool abandoned_locked_(const Hash& id) const {
+        return abandoned_own_.count(key_(id)) != 0 && !rows_.contains(id);
     }
 
     void remember_abandoned_(const Hash& id) {
