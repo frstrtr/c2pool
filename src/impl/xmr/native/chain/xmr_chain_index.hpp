@@ -2553,7 +2553,9 @@ private:
             rows_.pop(popped);
             pop_long_mirror_();
             if (ReorgRecord* jr = journal_.find(seq)) jr->disconnected.push_back(popped.row.id);
-            alt_.erase_branch(popped.row.id);
+            // Nothing held is erased: an abandoned own block is not bad data, and
+            // the alternative blocks above it may be the peers' chain. The popped
+            // block itself is not parked; a peer whose chain carries it serves it.
             remember_abandoned_(popped.row.id);
             ++n;
         }

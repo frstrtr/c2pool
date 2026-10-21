@@ -684,6 +684,23 @@ void test_f1_common_height() {
     }
 }
 
+// F2: the abandon erases nothing held: the peer's branch above an abandoned own
+// block stays (here the peer's top is unknown, so the whole own suffix goes).
+void test_f2_no_erase() {
+    std::printf("== F2. own-fork guard: nothing held is erased ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    c.advertise(c.pa, tag_hash(77, 0x7e), s.h1 + 2);   // a top we do not hold
+    std::string why;
+    const bool ab = s.fire(&why);
+    kat::checkf(ab && why.find("ABANDONED 2 ") != std::string::npos && c.tip_id() == c.anchor_id,
+                "OF-6a with no placeable peer top the whole own suffix is abandoned, tip A (%s)", why.c_str());
+    kat::check(has_alt(*c.idx, s.p2_id) && c.idx->have_block(s.p2_id),
+               "OF-6b the peer's p2 (a child of the abandoned b1) is still held");
+    kat::check(!has_alt(*c.idx, s.b1_id) && !has_alt(*c.idx, s.o2_id),
+               "OF-6c the abandoned own blocks are not parked (no D-14 way back)");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -698,5 +715,6 @@ int main(int argc, char** argv) {
     run("d", test_d_template);
     run("e", test_e_guard);
     run("f1", test_f1_common_height);
+    run("f2", test_f2_no_erase);
     return kat::report("xmr_template_dup_tx_kat");
 }
