@@ -847,6 +847,38 @@ void test_f4a_resync() {
     }
 }
 
+// F4b: a chain answer that moves nothing (no height, nothing to fetch) is asked
+// again after chain_request_timeout_ms, not on every tick; it is never dropped.
+void test_f4b_quiet_ask() {
+    std::printf("== F4b. sync driver: no-progress answers are re-asked per timeout ==\n");
+    Chain c;
+    if (!c.ok) return;
+    const std::uint64_t h1 = kAnchorHeight + 1;
+    const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0xb1);
+    const Hash q1_id = id_of_blob(q1.block_blob);
+    (void)c.offer(q1, c.pa);
+    kat::check(c.tip_id() == q1_id, "F4b setup: the peer's q1 is the tip");
+    c.fetcher.peer_table = {{c.pa, claim(tag_hash(80, 0x7e), h1 + 5)}};   // claims more than it serves
+    PeerServes peer;
+    peer.start = h1;
+    peer.ids = {q1_id};
+    native::rt::SyncDriverConfig cfg;
+    native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                               [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); }, cfg);
+    std::uint64_t now = 100000;
+    for (int t = 0; t < 120; ++t, now += 500) {   // 60 s of 500 ms ticks
+        drv.tick(now);
+        peer.step(c, c.pa);
+    }
+    const std::size_t asked = c.fetcher.chain_requests.size();
+    const std::size_t bound = static_cast<std::size_t>(60000 / cfg.chain_request_timeout_ms) + 1;
+    kat::checkf(asked >= 2 && asked <= bound && peer.chain_answers == asked,
+                "OF-7b over 60 s of answers that move nothing: %zu chain requests (re-asked, at most %zu)", asked,
+                bound);
+    kat::checkf(drv.stats().chain_quiet_waits > 0, "OF-7c the waits are counted (%llu)",
+                (unsigned long long)drv.stats().chain_quiet_waits);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -864,5 +896,6 @@ int main(int argc, char** argv) {
     run("f2", test_f2_no_erase);
     run("f3", test_f3_abandoned_parent);
     run("f4a", test_f4a_resync);
+    run("f4b", test_f4b_quiet_ask);
     return kat::report("xmr_template_dup_tx_kat");
 }
