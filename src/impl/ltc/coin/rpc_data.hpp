@@ -22,6 +22,7 @@ struct WorkData
     std::vector<Transaction> m_txs;
     std::vector<uint256> m_hashes; // transaction hashes
     time_t m_latency;
+    uint64_t m_newtx_bytes{0};     // G2: new-tx bytes committed (embedded build only)
 
     WorkData() {}
     WorkData(nlohmann::json data, std::vector<Transaction> txs, std::vector<uint256> txhashes, time_t latency) 
