@@ -215,6 +215,10 @@
 //                counted once per template, none under a HOLD;
 //   minerwithdraw  a template withdrawn while the CPU miner holds a job:
 //                the job is withdrawn once; the next template is pushed;
+//   minerflush   the withdraw hands the miner's queued hits on: a Monero
+//                block on a held parent is submitted, one on an abandoned
+//                parent refused and logged by the gated lookup; with the
+//                lane gate closed they are dropped and counted;
 //   ctxgate      frames parked on a Monero input run again per (cause, id)
 //                only when that input is held: no storm on a P_r held
 //                without its weights, no context asked for it; the seed;
@@ -7486,6 +7490,76 @@ void minerwithdraw() {
           "minerwithdraw: the next template is pushed as a new job");
 }
 
+// minerflush: the withdraw of the CPU miner's job hands its queued hits on (none is dropped with the lane gate open):
+// the Monero block found on a held parent's template is submitted, the one on an abandoned parent's template is refused
+// and logged by the gated candidate lookup (the publish arms'), a share is handed on; with the gate closed (HOLD,
+// FORK-FUSE) the hits are dropped and counted.
+struct FlushHit {
+    std::uint32_t template_id = 0, extra_nonce = 0, nonce = 0;
+    bool network = false, share = false;
+};
+struct FlushMiner {
+    std::vector<FlushHit> queued;
+    int cleared = 0;
+    std::vector<FlushHit> clear_job() {
+        ++cleared;
+        std::vector<FlushHit> out;
+        out.swap(queued);
+        return out;
+    }
+};
+void minerflush() {
+    const pb::PathbSession s{};
+    bool fail = false;
+    pb::PathbJobSource js(slot_make(&fail));
+    const std::uint32_t M = 0x00fffd00u;
+    js.bind_own(M, s);
+    const pb::PathbTemplate held = slot_template(11), gone = slot_template(12);
+    const std::uint32_t t_held = js.set_template(held, pb::JobNetwork{});
+    ::v37::xmr::stratum::TemplateJob j1, j2;
+    const bool g1 = js.get_job(M, j1);
+    const std::uint32_t t_gone = js.set_template(gone, pb::JobNetwork{});
+    const bool g2 = js.get_job(M, j2);
+    js.clear();   // the template withdrawn (a DEFER)
+    std::vector<std::string> log;
+    const pb::GatedCandidateLookup lookup(
+            js,
+            [&](const pb::GatedCandidateLookup::Candidate& c, std::string* why) {
+                const bool ok = std::equal(c.prev_id.begin(), c.prev_id.end(), held.p_r.begin());
+                if (!ok && why) *why = "its parent was abandoned by the own-fork guard";
+                return ok;
+            },
+            [&](const std::string& l) { log.push_back(l); });
+    FlushMiner miner;
+    miner.queued = {FlushHit{t_held, M, 1, true, false}, FlushHit{t_gone, M, 2, true, false},
+                    FlushHit{t_gone, M, 3, false, true}};
+    std::vector<std::uint32_t> published;
+    std::size_t shares = 0;
+    const auto on_hit = [&](const FlushHit& h) {
+        if (h.network) {
+            pb::GatedCandidateLookup::Candidate c;
+            if (lookup(h.template_id, h.extra_nonce, c)) published.push_back(h.template_id);
+        }
+        if (h.share || h.network) ++shares;
+    };
+    const pb::MinerWithdraw w = pb::withdraw_miner_job(miner, false, on_hit);
+    const bool logged = log.size() == 1 && log[0].find("NOT PUBLISHED: template " + std::to_string(t_gone)) == 0;
+    check(g1 && g2 && miner.cleared == 1 && w.submitted == 3 && w.network == 2 && w.dropped == 0 && shares == 3
+                  && published.size() == 1 && published[0] == t_held,
+          "minerflush: the withdraw hands on 3 queued hits (" + std::to_string(w.submitted) + "): the Monero block on the "
+                  "held parent is submitted (" + std::to_string(published.size()) + " published)");
+    check(lookup.refused() == 1 && logged,
+          "minerflush: the Monero block on the abandoned parent is refused and logged (" +
+                  std::to_string(lookup.refused()) + " refused, " + (log.empty() ? std::string("no line") : log[0]) + ")");
+    FlushMiner closed;
+    closed.queued = {FlushHit{t_held, M, 4, true, false}, FlushHit{t_held, M, 5, false, true}};
+    std::size_t handed = 0;
+    const pb::MinerWithdraw wc = pb::withdraw_miner_job(closed, true, [&](const FlushHit&) { ++handed; });
+    check(closed.cleared == 1 && wc.dropped == 2 && wc.submitted == 0 && handed == 0,
+          "minerflush: with the lane gate closed the queued hits are dropped and counted (" + std::to_string(wc.dropped) +
+                  ")");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -7590,6 +7664,7 @@ int main(int argc, char** argv) {
     run("below", below);
     run("jobslot", jobslot);
     run("minerwithdraw", minerwithdraw);
+    run("minerflush", minerflush);
     run("ctxgate", ctxgate);
     run("parkidx", parkidx);
     run("catchjoin", catchjoin);

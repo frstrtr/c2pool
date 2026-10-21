@@ -361,12 +361,14 @@ public:
     void stop() { halt_workers(); }
 
     // Withdraw the work: the node has no current job for the miner (its template
-    // was withdrawn). The workers stop and the queued hits are dropped; the next
-    // set_job starts them again.
-    void clear_job() {
+    // was withdrawn). The workers stop and the hits still queued are returned to
+    // the caller (none is dropped here); the next set_job starts the workers again.
+    std::vector<MinerHit> clear_job() {
         halt_workers();
         std::lock_guard<std::mutex> lk(m_hit_mtx);
+        std::vector<MinerHit> out(m_hits.begin(), m_hits.end());
         m_hits.clear();
+        return out;
     }
 
     bool running() const noexcept { return m_running.load(std::memory_order_relaxed); }

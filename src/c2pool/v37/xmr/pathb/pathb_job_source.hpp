@@ -37,10 +37,12 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -325,6 +327,62 @@ private:
 // The CPU miner's job per template (W-E5b): next() gives the own slot's job of the current template while the miner
 // holds no job of it; the caller reports pushed() or refused(); settle() counts a template the miner holds no job
 // for once and returns its line (no template: nothing counted).
+// The withdraw of the CPU miner's job (the source has no template): the miner stops and hands back its queued hits.
+// With the lane gate open each goes to `hit` (a Monero block among them goes to the publish arms, whose candidate
+// lookup refuses an abandoned or unheld parent); with it closed (HOLD, FORK-FUSE) they are dropped and counted.
+struct MinerWithdraw {
+    std::size_t submitted = 0;   // hits handed to `hit`
+    std::size_t network   = 0;   // of which Monero blocks
+    std::size_t dropped   = 0;   // hits dropped: the lane gate is closed
+};
+template <class Miner, class HitFn>
+MinerWithdraw withdraw_miner_job(Miner& miner, bool gate_closed, HitFn&& hit) {
+    MinerWithdraw w;
+    auto hits = miner.clear_job();
+    for (const auto& h : hits) {
+        if (gate_closed) {
+            ++w.dropped;
+            continue;
+        }
+        if (h.network) ++w.network;
+        hit(h);
+        ++w.submitted;
+    }
+    return w;
+}
+
+// The publish arms' candidate lookup: the job source's candidate, published only when `parent_ok` admits its parent
+// (the native index: held verified and not abandoned). A refusal is counted and logged with its reason.
+class GatedCandidateLookup {
+public:
+    using Candidate = ::c2pool::v37n::xmr::submit::BlockCandidate;
+    using ParentOk  = std::function<bool(const Candidate&, std::string*)>;
+    using Log       = std::function<void(const std::string&)>;
+
+    GatedCandidateLookup(const PathbJobSource& jobs, ParentOk ok, Log log)
+        : jobs_(&jobs), ok_(std::move(ok)), log_(std::move(log)),
+          refused_(std::make_shared<std::atomic<std::uint64_t>>(0)) {}
+
+    bool operator()(std::uint32_t template_id, std::uint32_t extra_nonce, Candidate& c) const {
+        if (!jobs_->candidate(template_id, extra_nonce, c)) return false;
+        std::string why;
+        if (!ok_(c, &why)) {
+            refused_->fetch_add(1);
+            if (log_) log_("NOT PUBLISHED: template " + std::to_string(template_id) + " h=" + std::to_string(c.height) +
+                           ": " + why);
+            return false;
+        }
+        return true;
+    }
+    std::uint64_t refused() const { return refused_->load(); }
+
+private:
+    const PathbJobSource*                         jobs_;
+    ParentOk                                      ok_;
+    Log                                           log_;
+    std::shared_ptr<std::atomic<std::uint64_t>>   refused_;
+};
+
 class MinerSlot {
 public:
     explicit MinerSlot(std::uint32_t extra_nonce) : en_(extra_nonce) {}

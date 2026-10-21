@@ -1293,20 +1293,15 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     };
     // A Monero block is published only on a parent the native index holds verified and the own-fork guard did not
     // abandon (a job built before the abandon, or on a parent no longer held, is not published).
-    std::atomic<std::uint64_t> parent_refused{0};
-    const auto lookup = [&jobs, nn, &parent_refused, &relay_log, &relay_log_mtx](std::uint32_t tid, std::uint32_t en,
-                                                                                 sub::BlockCandidate& c) {
-        if (!jobs.candidate(tid, en, c)) return false;
-        std::string why;
-        if (!nn->index().network_parent_publishable(c.prev_id, &why)) {
-            parent_refused.fetch_add(1);
-            std::lock_guard<std::mutex> lk(relay_log_mtx);
-            relay_log.push_back("publish: NOT PUBLISHED: template " + std::to_string(tid) + " h=" + std::to_string(c.height) +
-                                ": " + why);
-            return false;
-        }
-        return true;
-    };
+    const pb::GatedCandidateLookup lookup(
+            jobs,
+            [nn](const sub::BlockCandidate& c, std::string* why) {
+                return nn->index().network_parent_publishable(c.prev_id, why);
+            },
+            [&relay_log, &relay_log_mtx](const std::string& l) {
+                std::lock_guard<std::mutex> lk(relay_log_mtx);
+                relay_log.push_back("publish: " + l);
+            });
     std::unique_ptr<sub::LiveBlockSubmitter> submitter;
     std::unique_ptr<sub::LiveSubmitShareSink> live_sink;
     std::unique_ptr<o2::P2pBlockPublisher> publisher;
@@ -1414,7 +1409,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::unique_ptr<mine::CpuMiner> cpu_miner;
     const std::uint32_t mine_en = en_base - 1;
     pb::MinerSlot mine_slot(mine_en);
-    std::uint64_t mine_pushed = 0, mine_blocks = 0, mine_hits = 0;
+    std::uint64_t mine_pushed = 0, mine_blocks = 0, mine_hits = 0, mine_gate_dropped = 0;
     std::string mine_last_error;
     if (cfg.mine_enabled && mine_payee) {
         mine::MinerOptions mo;
@@ -1717,13 +1712,41 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         // 5. --mine (W-E5b): the miner's job is PathbNode::make_job for its own session
 #if defined(V37_XMR_O2_WITH_RANDOMX)
         if (cpu_miner) {
+            const auto on_hit = [&](const mine::MinerHit& h) {
+                if (h.network) {
+                    ++mine_blocks;
+                    sink.submit_network_block(h.template_id, h.nonce, h.extra_nonce);
+                }
+                if (h.share || h.network) {
+                    ++mine_hits;
+                    strat::AcceptedShare acc;
+                    acc.template_id = h.template_id;
+                    acc.extra_nonce = h.extra_nonce;
+                    acc.nonce = h.nonce;
+                    acc.pow_hash = h.pow_hash;
+                    acc.achieved_target = h.achieved_target;
+                    acc.height = h.height;
+                    acc.is_network_block = h.network;
+                    acc.worker = "cpu-miner";
+                    acc.address = cfg.payout_address;
+                    sink.on_accepted_share(acc);
+                }
+            };
             if (mine_slot.withdraw_due(jobs)) {  // the template is withdrawn: no job is current for the miner
-                cpu_miner->clear_job();
-                std::printf("  [cpu-miner] job withdrawn: no template (%s)\n", template_status_name(tstatus));
+                const pb::MinerWithdraw w = pb::withdraw_miner_job(*cpu_miner, gate_closed, on_hit);
+                mine_gate_dropped += w.dropped;
+                std::printf("  [cpu-miner] job withdrawn: no template (%s); queued hits: %zu submitted (%zu Monero "
+                            "blocks), %zu dropped (lane gate closed)\n",
+                            template_status_name(tstatus), w.submitted, w.network, w.dropped);
             }
             if (gate_closed) {
                 mine::MinerHit dropped;
-                while (cpu_miner->pop_hit(dropped)) {}
+                std::size_t n = 0;
+                while (cpu_miner->pop_hit(dropped)) ++n;
+                if (n != 0) {
+                    mine_gate_dropped += n;
+                    std::printf("  [cpu-miner] %zu hits dropped: lane gate closed\n", n);
+                }
             } else {
                 if (const std::optional<strat::TemplateJob> mt = mine_slot.next(jobs)) {
                     const strat::TemplateJob& tj = *mt;
@@ -1752,26 +1775,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 if (const std::optional<std::string> skip = mine_slot.settle())
                     std::printf("  [cpu-miner] %s\n", skip->c_str());
                 mine::MinerHit h;
-                while (cpu_miner->pop_hit(h)) {
-                    if (h.network) {
-                        ++mine_blocks;
-                        sink.submit_network_block(h.template_id, h.nonce, h.extra_nonce);
-                    }
-                    if (h.share || h.network) {
-                        ++mine_hits;
-                        strat::AcceptedShare acc;
-                        acc.template_id = h.template_id;
-                        acc.extra_nonce = h.extra_nonce;
-                        acc.nonce = h.nonce;
-                        acc.pow_hash = h.pow_hash;
-                        acc.achieved_target = h.achieved_target;
-                        acc.height = h.height;
-                        acc.is_network_block = h.network;
-                        acc.worker = "cpu-miner";
-                        acc.address = cfg.payout_address;
-                        sink.on_accepted_share(acc);
-                    }
-                }
+                while (cpu_miner->pop_hit(h)) on_hit(h);
             }
         }
 #endif
@@ -1865,8 +1869,9 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(listener.min_difficulty_effective()), gate_closed ? "closed" : "open");
 #if defined(V37_XMR_O2_WITH_RANDOMX)
             if (cpu_miner)
-                std::printf("  %s withdrawn=%llu skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n",
+                std::printf("  %s withdrawn=%llu gate_dropped=%llu skipped=%llu sessions=%zu jobs=%llu hits=%llu blocks=%llu\n",
                             cpu_miner->describe().c_str(), static_cast<unsigned long long>(mine_slot.withdrawn()),
+                            static_cast<unsigned long long>(mine_gate_dropped),
                             static_cast<unsigned long long>(mine_slot.skipped()), jobs.sessions_held(),
                             static_cast<unsigned long long>(mine_pushed), static_cast<unsigned long long>(mine_hits),
                             static_cast<unsigned long long>(mine_blocks));
@@ -1882,7 +1887,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             static_cast<unsigned long long>(publisher->solo_landed()),
                             static_cast<unsigned long long>(publisher->failed()),
                             static_cast<unsigned long long>(publisher->refused()),
-                            static_cast<unsigned long long>(parent_refused.load()), publisher->parked(),
+                            static_cast<unsigned long long>(lookup.refused()), publisher->parked(),
                             publisher->solo_own_index_enabled() ? "SOLO own-index on" : "own-index off");
             if (live_sink)
                 std::printf("  submit: found=%llu unnamed=%llu ok=%llu rejected=%llu refused=%llu last_error=%s\n",
