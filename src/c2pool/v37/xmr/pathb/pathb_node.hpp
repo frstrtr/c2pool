@@ -247,7 +247,8 @@ struct JoinAttempted {
 
 enum class TemplateStatus : std::uint8_t {
     Ok,
-    NoPathbPeer,  // an empty store with no Path B peer and no --pathb-launch
+    NoPathbPeer,  // an empty store with no Path B peer and no --pathb-launch; a store not caught up with no Path B peer
+    CatchingUp,   // a store not caught up: its first catch-up round in flight, or verified heavier headers being fetched
     Poisoned,     // the store failed a write: no template until the joiner path at the next start
     RestsOnClaims,  // no adopted state (a load failure), or the adopted state still replayed to its L
     Hold,         // E13
@@ -438,7 +439,11 @@ private:
             const bool cleared = clear_store_batch(*kv_, cfg_.record_chain, b);
             const LaneBatch g = genesis_batch(cfg_.record_chain, head_, *tree_, *store_);
             b.ops.insert(b.ops.end(), g.ops.begin(), g.ops.end());
+            // a store that starts empty and is not launched here has not caught up (K_NCU, cleared when it does)
+            if (!cfg_.launch) b.put(store_keys::ncu(cfg_.record_chain), encode_ncu());
             if (!cleared || !commit_lane_batch(*kv_, b)) poison(tree_->genesis().id);
+            not_caught_up_ = !cfg_.launch;
+            first_round_ = not_caught_up_;
         }
         init_join();
     }
@@ -471,6 +476,8 @@ public:
             resumed_.set_x1(loaded.bound_lo - 1);
             claims_ = &resumed_;
         }
+        not_caught_up_ = loaded.not_caught_up && !cfg_.launch;  // K_NCU: still not caught up after the restart
+        first_round_ = not_caught_up_;
         init_join();
     }
 
@@ -728,7 +735,14 @@ public:
                 },
                 store_->b0(), cfg_.p.open_bins, &theirs);
         if (c.verdict == HelloVerdict::Accept) {
+            const bool fresh = peers_.count(peer) == 0;
             peers_[peer] = theirs.tail;
+            if (fresh) joiner_->release_waits(std::nullopt);  // a new Path B peer: the pairs waiting on a P_r are tried
+            // the first catch-up round after the start opens at the first tail whose claim wins (the template gate)
+            if (gate_applies() && first_round_ && !first_round_open_ && tree_->find(theirs.tail.best_tip) == nullptr
+                && fork_choice_prefers(ChainTip{theirs.tail.best_cum_work, theirs.tail.best_tip},
+                                       ChainTip{tree_->best().cum_work, tree_->best().id}))
+                first_round_open_ = true;
             if (transport_ != nullptr && links_.count(peer) == 0)
                 links_[peer] = std::make_shared<PathbJoinLink>(peer, *transport_, cfg_.identity.chain_id, cfg_.p,
                                                                cfg_.buffers, frame_bytes_headers(), window_);
@@ -750,13 +764,13 @@ public:
     bool has_pathb_peer() const noexcept { return !peers_.empty(); }
 
     // ---- the relay node's glue (pathb_relay_node.hpp) ----
-    // An empty store at position 0: the caller's headers-first catch-up from position 0 to
-    // `peer` got a reply with no header (n = 0: the peer serves nothing after position 0). The peer's HELLO tip becomes
-    // a join candidate with that peer as its server when this node holds position 0 only (no load failure, no adopted
-    // state, not poisoned) and the tip is not position 0, not held here and its claimed work wins fork choice against
-    // position 0. True: the pair was queued.
+    // A store that never caught up (at position 0, or not caught up by its record K_NCU): the caller's headers-first
+    // catch-up to `peer` got a reply with no header from position 0 (the peer serves nothing after it), or a catch-up
+    // step stayed deferred on a P_r past its context's time. The peer's HELLO tip becomes a join candidate with that
+    // peer as its server (no load failure, no adopted state, not poisoned) when the tip is not position 0, not held here
+    // and its claimed work wins fork choice against the best tip. True: the pair was queued.
     bool offer_empty_store_tip(std::uint64_t peer) {
-        if (poisoned_ || load_failed_ || joined_ != nullptr || tree_->best().pos != 0) return false;
+        if (poisoned_ || load_failed_ || joined_ != nullptr || (tree_->best().pos != 0 && !not_caught_up_)) return false;
         const auto it = peers_.find(peer);
         if (it == peers_.end()) return false;
         const HelloTail& t = it->second;
@@ -767,10 +781,78 @@ public:
         offer(t.best_tip, peer, t.best_cum_work);
         return joiner_->queue().size() > before;
     }
+    // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
+    // the caller's catch-up ends by its done test (every HELLO tip held, or no claim winning) or a join adopts.
+    bool caught_up() const noexcept { return !not_caught_up_; }
+    // The first catch-up round after the start is in flight (the template gate's first clause).
+    bool first_round_open() const noexcept { return first_round_open_; }
+    // The caller's catch-up ended by its done test: the record leaves the store (one batch).
+    void note_caught_up() {
+        if (!not_caught_up_) return;
+        not_caught_up_ = false;
+        first_round_ = first_round_open_ = false;
+        verified_win_.reset();
+        if (kv_ == nullptr || poisoned_) return;
+        LaneBatch b;
+        b.del(store_keys::ncu(cfg_.record_chain));
+        if (!commit_lane_batch(*kv_, b)) poison(tree_->best().id);
+    }
+    // Not caught up, templates built: a HELLO tail's claim wins with no verified header winning (the caller logs it).
+    bool unverified_claims() const {
+        if (!gate_applies() || first_round_open_ || verified_win_open()) return false;
+        const CarrierNode& b = tree_->best();
+        for (const auto& [peer, t] : peers_)
+            if (tree_->find(t.best_tip) == nullptr && fork_choice_prefers(ChainTip{t.best_cum_work, t.best_tip},
+                                                                          ChainTip{b.cum_work, b.id}))
+                return true;
+        return false;
+    }
+    // The P_r ids queued join pairs wait on (a NotServed on an unresolved P_r), and their release: the id resolved,
+    // or (nullopt) every id.
+    std::vector<std::pair<Missing, Hash32>> join_waits() const { return joiner_->queue().waits(); }
+    std::size_t release_join_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
+        return joiner_->release_waits(id, cause);
+    }
+
     // A frame this node parked, by its digest, taken out of the deferred store to be run again; nullopt: not held.
     std::optional<ParkedFrame> take_parked(const Hash32& digest) {
         if (poisoned_) return std::nullopt;
         return deferred_.take(*tree_, digest);
+    }
+    // The relay's re-run gate (node-local; no verdict reads it): the Monero input a DEFER names is held now:
+    // MoneroBlock its P_r resolved, Seed its seed, MissingBlock the block, MissingWeights its weight inputs.
+    bool monero_input_held(Missing m, const Hash32& id) const {
+        switch (m) {
+            case Missing::MoneroBlock: return io_.resolve_pr && io_.resolve_pr(id).status == PrInfo::Status::Held;
+            case Missing::Seed: return io_.seed_of && io_.seed_of(id).has_value();
+            case Missing::MissingBlock: return io_.monero != nullptr && io_.monero->block(id).has_value();
+            case Missing::MissingWeights: return io_.monero != nullptr && io_.monero->weights_at(id).has_value();
+            default: return false;
+        }
+    }
+    // The follower holds the Monero block (with or without its weights).
+    bool monero_block_held(const Hash32& id) const { return io_.monero != nullptr && io_.monero->block(id).has_value(); }
+    // An object's origin height h = height(P_r) + 1 by its own P_r held with or without its weights (the seal sweep of
+    // parked objects); nullopt: P_r not held.
+    std::optional<std::uint64_t> held_origin(const Hash32& p_r) const {
+        const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(p_r) : PrInfo{};
+        if (pr.status == PrInfo::Status::Held) return pr.height + 1;
+        if (io_.monero != nullptr)
+            if (const std::optional<BranchBlock> b = io_.monero->block(p_r)) return b->height + 1;
+        return std::nullopt;
+    }
+    // The deferred store holds a frame of this digest; its cap (J_0).
+    bool parked_held(const Hash32& digest) const { return deferred_.holds(digest); }
+    std::uint64_t deferred_cap() const noexcept { return deferred_.cap(); }
+    // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
+    std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
+        const ParkedFrame* f = deferred_.get(digest);
+        if (f == nullptr || f->frame.size() <= kFrameHeaderBytes) return std::nullopt;
+        CarrierBodyV3 c;
+        if (decode_carrier_body_v3(f->frame.data() + kFrameHeaderBytes, f->frame.size() - kFrameHeaderBytes,
+                                   CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c) != WireError::None)
+            return std::nullopt;
+        return c.own.blob.prev_id;
     }
     // Called between the replay steps of a join attempt (on the join worker).
     void set_join_step(std::function<void()> f) {
@@ -928,6 +1010,7 @@ public:
 
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
+        if (verified_win_ && verified_win_peer_ == peer) verified_win_.reset();
         headers_->release_peer(peer);
         deferred_.forget_peer(peer);
         header_req_.erase(peer);
@@ -1044,8 +1127,12 @@ public:
         PathbTemplate t;
         if (poisoned_) return status(t, TemplateStatus::Poisoned);
         if (rests_on_claims()) return status(t, TemplateStatus::RestsOnClaims);
-        if (started_empty_ && !cfg_.launch && peers_.empty() && tree_->best().pos == 0)
+        if (!cfg_.launch && peers_.empty() && ((started_empty_ && tree_->best().pos == 0) || not_caught_up_))
             return status(t, TemplateStatus::NoPathbPeer);
+        // not caught up (K_NCU): no template while the first catch-up round after the start is in flight, or while
+        // headers this node verified (PoW at d on its header path) win against its best tip and their fetch is in
+        // flight; a HELLO claim alone holds no template past that round
+        if (gate_applies() && (first_round_open_ || verified_win_open())) return status(t, TemplateStatus::CatchingUp);
         const CarrierNode& tip = tree_->best();
         t.tip = tip.id;
         t.x = tip.pos + 1;
@@ -1456,6 +1543,7 @@ public:
         // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
         // again once it resolves
         Hash32 fetch{};
+        Missing cause = Missing::MoneroBlock;  // the input the request waits for (MissingWeights: the floor reading)
         Hash32 from{};
         Hash32 stop{};
     };
@@ -1475,6 +1563,7 @@ public:
         HeaderRequest req = std::move(it->second);
         header_req_.erase(it);
         timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
+        end_first_round();  // a reply ends the first catch-up round (whatever it holds)
         HeadersReply rep;
         if (!decode_fc_headers(frame, cfg_.identity.chain_id, frame_bytes_headers(), cfg_.p, rep).ok()) {
             out.kind = HeadersOutcome::Kind::Undecodable;
@@ -1518,6 +1607,8 @@ public:
         // DEFER), never a BAN
         std::optional<std::size_t> claim_fail;
         Basis claim_basis = Basis::Computed;
+        // a size rule the floor reading leaves undecided (P_r without its weights): DEFER on that P_r, never a BAN
+        std::optional<std::size_t> size_undecided;
         const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
             const std::size_t i = k++;
             const CarrierHeader& h = req.got[i];
@@ -1530,7 +1621,9 @@ public:
                 return false;
             }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
-            if (header_fields_verdict(header_fields(h.own, encoded_length(h.own), pr.in))) return false;
+            const HeaderFault hf = header_fields(h.own, encoded_length(h.own), pr.in);
+            if (hf == HeaderFault::SizeUndecided && !size_undecided) size_undecided = i;
+            if (header_fields_verdict(hf)) return false;
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
             return seed.has_value() && verify_memo(h.own.blob, d, *seed);
         };
@@ -1545,6 +1638,14 @@ public:
                 if (claim_fail && *claim_fail == i) {  // #8 on a claim: alarm + DEFER, no token, nothing indexed
                     alarm_.raise(RowId::R9, claim_basis, sh.id, Missing::ClaimAlarm);
                     out.kind = HeadersOutcome::Kind::Defer;
+                    return out;
+                }
+                if (size_undecided && *size_undecided == i) {  // the floor reading: DEFER until P_r's weights, no token
+                    out.kind = HeadersOutcome::Kind::Defer;
+                    out.fetch = req.got[i].own.blob.prev_id;
+                    out.cause = Missing::MissingWeights;
+                    out.from = req.fork;
+                    out.stop = req.stop;
                     return out;
                 }
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
@@ -1564,6 +1665,15 @@ public:
         const SideBranchDecision dec =
                 decide_side_branch(b.cum_work, b.id, fork->cum_work, *side, 0, std::numeric_limits<std::uint64_t>::max());
         out.fork_pos = fork->pos;
+        if (dec.action == SideBranchAction::FetchBodies && gate_applies() && !out.ids.empty()
+            && out.ids.back() != verified_lapsed_) {
+            // headers this node verified win: the template gate holds while their fetch is in flight (a tip whose
+            // fetch lapsed once does not hold it again)
+            verified_win_ = ChainTip{dec.claimed_work, out.ids.back()};
+            verified_win_peer_ = peer;
+            verified_win_s_ = now_s;
+            verified_best_ = b.id;
+        }
         if (dec.action == SideBranchAction::FetchBodies) {
             // one depth measure: the journal base (never fork_depth against J); a joined node at or below its x1
             if (deep_switch(fork->pos)) {
@@ -1702,12 +1812,14 @@ public:
             ++n;
             if (r.kind == ReqKind::Headers) {
                 header_req_.erase(r.peer);
+                end_first_round();  // no reply within P-53 ends the first round
                 continue;
             }
             const auto key = std::make_pair(r.peer, r.at);
             if (assemblies_.erase(key) != 0) abandoned_.insert(key);  // its later frames DROP (no assembly)
             closed_.insert(key);
         }
+        catchup_gate_tick(now_s);
         return n;
     }
 
@@ -2430,6 +2542,9 @@ private:
         load_failed_ = false;
         poisoned_ = false;
         reask_pending_ = false;
+        not_caught_up_ = false;  // an adoption catches up (its empty store holds no K_NCU)
+        first_round_ = first_round_open_ = false;
+        verified_win_.reset();
         ++generation_;
         if (kv_ == nullptr) return true;
         LaneBatch b;
@@ -2960,7 +3075,54 @@ private:
     BucketServeBudget budget_;
     PathbKv* kv_ = nullptr;
     StoreHead head_;
+    // The template gate's state: not caught up (K_NCU), not launched here.
+    bool gate_applies() const noexcept { return not_caught_up_ && !cfg_.launch; }
+    // The first round ends at its reply or at its request's P-53.
+    void end_first_round() {
+        if (!first_round_open_) return;
+        first_round_open_ = false;
+        first_round_ = false;
+    }
+    // Verified heavier headers whose fetch is in flight: not held yet, still winning.
+    bool verified_win_open() const {
+        if (!verified_win_) return false;
+        const CarrierNode& b = tree_->best();
+        return tree_->find(verified_win_->id) == nullptr && fork_choice_prefers(*verified_win_, ChainTip{b.cum_work, b.id});
+    }
+    // The template gate's timers (P-53): an open first round with no request in flight, and verified headers whose fetch
+    // placed nothing within P-53, end.
+    void catchup_gate_tick(std::uint64_t now_s) {
+        if (first_round_open_ && header_req_.empty()) {
+            if (first_round_s_ == 0) first_round_s_ = now_s;
+            if (now_s >= first_round_s_ + cfg_.abandon_timeout_s) end_first_round();
+        } else {
+            first_round_s_ = 0;
+        }
+        if (!verified_win_) return;
+        if (!verified_win_open()) {
+            verified_win_.reset();
+            return;
+        }
+        const Hash32 best = tree_->best().id;
+        if (best != verified_best_) {
+            verified_best_ = best;
+            verified_win_s_ = now_s;
+        } else if (now_s >= verified_win_s_ + cfg_.abandon_timeout_s) {
+            verified_lapsed_ = verified_win_->id;
+            verified_win_.reset();
+        }
+    }
+
     bool started_empty_ = false;
+    bool not_caught_up_ = false;          // K_NCU
+    bool first_round_ = false;            // the first catch-up round after the start not run yet
+    bool first_round_open_ = false;       // ... and in flight (opened by a HELLO tail whose claim wins)
+    std::uint64_t first_round_s_ = 0;     // since when it is open with no request in flight
+    std::optional<ChainTip> verified_win_;  // headers this node verified that win (their tip and work)
+    std::uint64_t verified_win_peer_ = 0;
+    std::uint64_t verified_win_s_ = 0;    // the last progress of their fetch
+    Hash32 verified_best_{};
+    Hash32 verified_lapsed_{};            // the last tip whose fetch lapsed (it does not hold the gate again)
     bool poisoned_ = false;
     StoreFaults faults_;
     std::uint64_t generation_ = 0;

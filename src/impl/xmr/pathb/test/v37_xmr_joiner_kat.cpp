@@ -1458,7 +1458,12 @@ void attempts() {
               "unresolved P_r: the header phase ends the attempt NotServed (no body asked, no alarm, no token, re-queued)" +
                       (r ? ": " + rep_desc(*r) : ""));
         je.unservable.erase(pr);
+        // the pair waits on that P_r (named by the report): no attempt until its input moves
+        const bool paced = r && r->unresolved_pr == std::optional<pb::Hash32>(pr) && j.queue().ready() == 0
+                           && !j.run_next().has_value() && j.queue().size() == 1;
+        const std::size_t released = j.release_waits(pr);
         const std::optional<pb::AttemptReport> r2 = j.run_next();
+        check(paced && released == 1, "unresolved P_r: the pair waits on it (no attempt) until it is released");
         check(r2 && r2->end == pb::AttemptEnd::Completed && j.adopted() && digest_of(*j.adopted(), at_pos(a, L)) == dL,
               "unresolved P_r: with the block served, the pair's next attempt completes and reaches A's digest" +
                       (r2 ? ": " + rep_desc(*r2) : ""));
