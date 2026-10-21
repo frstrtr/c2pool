@@ -987,6 +987,53 @@ void test_f3b_readopted() {
                 "OF-4c an own block on the re-adopted b1 is not refused as on an abandoned parent (%s)", w.c_str());
 }
 
+// F2b: an alternative block whose branch left the pool (an own block above an
+// abandoned one) never hides a candidate that reaches the best chain: the node
+// switches to the peer's heavier branch at once.
+void test_f2b_switch_reaches() {
+    std::printf("== F2b. the switch takes the heaviest candidate that reaches the best chain ==\n");
+    Chain c;
+    if (!c.ok) return;
+    const std::uint64_t A = kAnchorHeight;
+    std::string w;
+    const BlockEntry r1 = c.make(c.anchor_id, A + 1, {}, 0xd1);
+    const Hash r1_id = id_of_blob(r1.block_blob);
+    (void)c.offer(r1, c.pa);
+    const BlockEntry r2 = c.make(r1_id, A + 2, {}, 0xd2);
+    const Hash r2_id = id_of_blob(r2.block_blob);
+    (void)c.offer(r2, c.pa);
+    const BlockEntry b3 = c.make(r2_id, A + 3, {}, 0xd3);
+    const Hash b3_id = id_of_blob(b3.block_blob);
+    kat::check(c.idx->submit_own_block(b3, w), "F2b setup: our b3 on the peer's r2");
+    const BlockEntry o4 = c.make(b3_id, A + 4, {}, 0xd4);
+    kat::check(c.idx->submit_own_block(o4, w) && c.tip_id() == id_of_blob(o4.block_blob), "F2b setup: our o4 is the tip");
+    const BlockEntry o4x = c.make(b3_id, A + 4, {}, 0xd5);   // our sibling of o4 (a stale job): held
+    const Hash o4x_id = id_of_blob(o4x.block_blob);
+    (void)c.idx->submit_own_block(o4x, w);
+    kat::check(has_alt(*c.idx, o4x_id), "F2b setup: our sibling o4x is held as an alternative");
+    const BlockEntry s2 = c.make(r1_id, A + 2, {}, 0xd6);    // the other peer's branch, forked at r1
+    const Hash s2_id = id_of_blob(s2.block_blob);
+    (void)c.offer(s2, c.pb);
+    const BlockEntry s3 = c.make(s2_id, A + 3, {}, 0xd7);
+    const Hash s3_id = id_of_blob(s3.block_blob);
+    (void)c.offer(s3, c.pb);
+    const BlockEntry s4 = c.make(s3_id, A + 4, {}, 0xd8);
+    const Hash s4_id = id_of_blob(s4.block_blob);
+    (void)c.offer(s4, c.pb);
+    kat::check(has_alt(*c.idx, s4_id) && c.tip_id() == id_of_blob(o4.block_blob),
+               "F2b setup: the peer's s2-s4 are held (equal work: the tip stays o4)");
+    c.advertise(c.pa, r2_id, A + 2);
+    c.advertise(c.pb, s4_id, A + 4);
+    (void)c.idx->check_own_fork(1000);
+    std::string why;
+    const bool ab = c.idx->check_own_fork(1000 + kBoundMs + 1, &why);
+    kat::checkf(ab && why.find("ABANDONED 2 ") != std::string::npos, "F2b the guard abandons b3 and o4 (%s)",
+                why.c_str());
+    kat::checkf(c.tip_id() == s4_id,
+                "OF-6f our sibling o4x (its parent b3 abandoned) does not hide the peer's heavier s4: tip %s h=%llu",
+                hex8(c.tip_id()).c_str(), (unsigned long long)c.tip_height());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1002,6 +1049,7 @@ int main(int argc, char** argv) {
     run("e", test_e_guard);
     run("f1", test_f1_common_height);
     run("f2", test_f2_no_erase);
+    run("f2b", test_f2b_switch_reaches);
     run("f3", test_f3_abandoned_parent);
     run("f3b", test_f3b_readopted);
     run("f4a", test_f4a_resync);

@@ -2111,6 +2111,13 @@ private:
         if (!tip) return false;
         const AltBlock* cand = alt_.heaviest();
         if (!cand) return false;
+        // A candidate whose branch left the pool (its ancestor is neither held nor
+        // on the best chain, e.g. above an own block the guard abandoned) cannot be
+        // adopted; it never hides a lighter candidate that reaches the best chain.
+        if (!reaches_best_chain_locked_(cand->id)) {
+            cand = heaviest_reaching_best_chain_locked_();
+            if (!cand) return false;
+        }
 
         BranchTip best;
         best.id                    = tip->row.id;
@@ -2374,6 +2381,51 @@ private:
         journal_.close_committed(seq);
         update_synced_locked_();
         return true;
+    }
+
+    // Does the branch of alternative block `id` reach the best chain through the
+    // pool? A walk longer than max_reorg_depth counts as reaching (the switch then
+    // refuses it as TooDeep, as before); only a branch that leaves the pool does not.
+    bool reaches_best_chain_locked_(const Hash& id) const {
+        Hash cursor = id;
+        for (std::size_t n = 0; n <= static_cast<std::size_t>(opts_.max_reorg_depth); ++n) {
+            const AltBlock* b = alt_.find(cursor);
+            if (!b) return false;
+            if (rows_.contains(b->prev_id)) return true;
+            cursor = b->prev_id;
+        }
+        return true;
+    }
+
+    // The heaviest resolved alternative block whose branch reaches the best chain
+    // (AltPool::heaviest()'s order: cumulative difficulty, then the first seen).
+    const AltBlock* heaviest_reaching_best_chain_locked_() const {
+        std::map<Key, bool> reach;   // memo: does this block's branch reach the best chain
+        const auto reaches = [&](const AltBlock& start) {
+            std::vector<Key> path;
+            Hash cursor = start.id;
+            bool r = true;
+            for (std::size_t n = 0; n <= static_cast<std::size_t>(opts_.max_reorg_depth); ++n) {
+                const Key k = key_(cursor);
+                if (const auto m = reach.find(k); m != reach.end()) { r = m->second; break; }
+                const AltBlock* b = alt_.find(cursor);
+                if (!b) { r = false; break; }
+                path.push_back(k);
+                if (rows_.contains(b->prev_id)) { r = true; break; }
+                cursor = b->prev_id;
+            }
+            for (const Key& k : path) reach[k] = r;
+            return r;
+        };
+        const AltBlock* best = nullptr;
+        alt_.for_each([&](const AltBlock& b) {
+            if (!b.resolved || !reaches(b)) return;
+            if (!best || u128_greater(b.cumulative_difficulty, best->cumulative_difficulty)
+                || (!u128_less(b.cumulative_difficulty, best->cumulative_difficulty)
+                    && b.first_seen_seq < best->first_seen_seq))
+                best = &b;
+        });
+        return best;
     }
 
     void park_disconnected_locked_(const RowRecord& rr, const CachedEntry& ce) {
