@@ -145,7 +145,7 @@
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
-#include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: dashd templates only)
+#include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/stratum/tip_refresh.hpp>   // dash::stratum::fire_share_tip_refresh — bump + notify_all + dashboard refresh
 #include <impl/dash/local_mint_ledger.hpp>     // dash::mint::LocalMintLedger — display-only local orphan/sibling gauge
 #include <impl/dash/share_messages.hpp>        // dash::validate_message_data — operator message-blob validation (EMIT side, mirrors main_ltc.cpp)
@@ -3987,7 +3987,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     const dash::coin::V36WorkPolicy v36_work_policy = dash::coin::resolve_v36_work_policy(
         v36_network,
         static_cast<bool>(rpc),
-        run_arm.arm == dash::coin::WorkArm::EmbeddedEligible);
+        // An operator who asked for dashd (--coin-rpc / --coin-rpc-auth /
+        // --submit-block) but whose creds did not resolve gets no work rather
+        // than embedded templates they did not ask for: fail closed to intent.
+        run_arm.arm == dash::coin::WorkArm::EmbeddedEligible && !coin_rpc_requested);
     work_source->set_dashd_templates_only(v36_work_policy.dashd_templates_only);
     if (v36_work_policy.dashd_templates_only) {
         if (v36_work_policy.serve_stratum)
@@ -3995,8 +3998,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "getblocktemplate only (embedded template arm not served)\n";
         else
             std::cout << "[run] the DASH v36 network has no mining work source: give "
-                         "--coin-rpc/--coin-daemon (with creds) for dashd templates, or "
-                         "--embedded-mainnet with a coin-P2P feed for embedded templates; "
+                         "--coin-rpc/--coin-daemon (with resolvable creds) for dashd "
+                         "templates, or drop them and run the embedded arm (--embedded-"
+                         "mainnet on mainnet) with a coin-P2P feed for embedded templates; "
                          "stratum NOT started (sharechain relay only)\n";
     } else if (v36_network) {
         std::cout << "[run] the DASH v36 network takes mining work from the embedded "

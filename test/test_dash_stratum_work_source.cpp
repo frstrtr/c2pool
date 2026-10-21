@@ -28,7 +28,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
 #include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
-#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: dashd templates only)
+#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
 
 #include <core/stratum_work_source.hpp>
@@ -4242,8 +4242,12 @@ TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
 
     const auto gw = ws.get_work(job_in);
     EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
-    EXPECT_EQ(gw.work.m_tx_hashes.size(), gw.work.m_tx_data_hex.size())
-        << "every served tx carries its body: the v36 producer job freezes them";
+    // The seeded coin-state has no mempool and no pins: a coinbase-only
+    // template, which the v36 finder frames as [gentx]. That every served tx
+    // carries its own body is pinned by
+    // DashEmbeddedGbt.EveryTemplateTxCarriesItsOwnBody.
+    EXPECT_TRUE(gw.work.m_tx_hashes.empty());
+    EXPECT_TRUE(gw.work.m_tx_data_hex.empty());
 
     auto cb = ws.build_connection_coinbase(uint256::ZERO, "deadbeef",
                                            fixture_miner_script(), {});

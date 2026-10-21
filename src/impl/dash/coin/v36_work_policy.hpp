@@ -26,7 +26,9 @@
 //
 // "Embedded arm eligible" is ArmResolution::arm == WorkArm::EmbeddedEligible:
 // the arm is enabled (--testnet or --embedded-mainnet, which the daemonless
-// posture turns on by default) and a coin-state feed is armed.
+// posture turns on by default) and a coin-state feed is armed. The caller also
+// passes false when the operator asked for dashd but its creds did not
+// resolve, so that node gets no work instead of templates it did not ask for.
 //
 // Pure: the caller passes the profile's share version decision, whether the
 // dashd RPC arm was constructed, and the embedded arm resolution; main_dash.cpp

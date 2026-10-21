@@ -29,7 +29,10 @@
 #      tracker arm (the finder) rebuilds the full block from its frozen job,
 #      B's refuses (no template bodies) and never rebuilds it
 #   3  empty mempool -> a coinbase-only block (ntx == 1) still mints
-#   4  the v36 network without --coin-rpc: stratum is NOT started
+#   4  the v36 network without --coin-rpc, embedded arm eligible (--testnet +
+#      a coin-P2P feed): embedded templates, stratum started
+#   5  the v36 network with no work source (no --coin-rpc, no feed): stratum
+#      is NOT started
 # Every command and the block hashes are printed for the evidence record.
 set -u
 BIN="${BIN:?set BIN to the c2pool-dash under test}"
