@@ -524,7 +524,7 @@ public:
                 }
             }
             if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
-            post_from(p, [this, p, f, link] { handle_hello(p, f, link); });
+            post_from(p, [this, p, f, link] { handle_hello(p, f, link); }, [this, p, f, link] { hello_gone(p, f, link); });
             return;
         }
         bool ok = false, posted = false;
@@ -1009,6 +1009,7 @@ private:
         std::string host;
         std::uint16_t port = 0;
         std::uint64_t pid = 0;
+        std::uint64_t gone_ms = 0;  // its link left the link table before its down event ran (0: not seen)
         std::uint64_t next_try_ms = 0;
         int backoff_s = 1;
         std::uint32_t prehello_fails = 0;
@@ -1030,6 +1031,15 @@ private:
         if (t.prehello_fails <= 1) return 1;
         const std::uint32_t sh = std::min<std::uint32_t>(t.prehello_fails - 1, 6);
         return std::min(cap, 1 << sh);
+    }
+    // A dial target whose link is gone: redialed after the pre-HELLO backoff (tmtx_ held).
+    void release_target_locked(Target& t) {
+        t.pid = 0;
+        t.gone_ms = 0;
+        if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
+        t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
+        t.hello_seen = false;
+        t.hello_timed_out = false;
     }
     struct Job {
         enum class Kind : std::uint8_t { Carrier, Receipt } kind = Kind::Carrier;
@@ -1185,12 +1195,13 @@ private:
     // previous one has run (the link's TCP flow control engages). The readers' events are bounded by the link
     // count; the workers' posts (a carrier's completion, the join outcome, a link's down, our HELLO) are outside
     // this gate, bounded by the verify queue and the link count. An event whose peer is gone when it runs is
-    // skipped.
-    void post_from(std::uint64_t p, std::function<void()> fn) {
+    // skipped (`gone` runs instead, when given).
+    void post_from(std::uint64_t p, std::function<void()> fn, std::function<void()> gone = {}) {
         if (!o_.threads) {
-            post([this, p, f = std::move(fn)] {
+            post([this, p, f = std::move(fn), g = std::move(gone)] {
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -1205,7 +1216,7 @@ private:
             }
             if (!running_) return;
             inflight_.insert(p);
-            events_.push_back([this, p, f = std::move(fn)] {
+            events_.push_back([this, p, f = std::move(fn), g = std::move(gone)] {
                 struct Done {
                     PathbRelayNode* r;
                     std::uint64_t p;
@@ -1219,6 +1230,7 @@ private:
                 } done{this, p};
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -1370,13 +1382,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(tmtx_);
             for (Target& t : targets_)
-                if (t.pid == p) {
-                    t.pid = 0;
-                    if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
-                    t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
-                    t.hello_seen = false;
-                    t.hello_timed_out = false;
-                }
+                if (t.pid == p) release_target_locked(t);
         }
         post([this, p] {
             const NodeGuard g(*this);
@@ -2384,6 +2390,23 @@ private:
         if (o_.discovery) disc_refused(c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0, link);
         defer_drop(p, src_of(p), false);
     }
+    // A HELLO whose link went down before it ran: only a self-connection verdict is applied (the dial target behind
+    // the link, the book); nothing of the gone link is kept.
+    void hello_gone(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloLink& link) {
+        PathbHello ours;
+        {
+            const NodeGuard g(*this);
+            ours = node_->our_hello(nonce_, links_.listen_port());
+        }
+        PathbHello theirs;
+        const HelloCheck c = pathb_hello_receive(
+                ours, f, [](const Hash32&) -> std::optional<std::uint64_t> { return std::nullopt; }, 0, 0, &theirs);
+        if (c.verdict != HelloVerdict::SelfConnection) return;
+        st_.self_conn++;
+        log("relay: peer " + std::to_string(p) + " HELLO REFUSED (link gone): " + c.text);
+        on_self_hello(p, link);
+        if (o_.discovery) disc_refused(c.text, true, theirs.listen_port, link);
+    }
     // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
     // taken under the node lock; the frames paged by reoffer_pump).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
@@ -3135,6 +3158,7 @@ private:
                     if (t.pid != 0) {
                         out.push_back(t.pid);
                         t.pid = 0;
+                        t.gone_ms = 0;
                     }
             }
             for (std::uint64_t p : out) links_.disconnect(p);
@@ -3149,7 +3173,12 @@ private:
             const std::uint64_t now = now_ms();
             for (std::size_t i = 0; i < targets_.size(); ++i) {
                 Target& t = targets_[i];
-                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
+                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) {
+                    // its down event releases it; one not run within hello_timeout_ms releases it here
+                    if (t.gone_ms == 0) t.gone_ms = now;
+                    if (now - t.gone_ms < o_.hello_timeout_ms) continue;
+                    release_target_locked(t);
+                }
                 if (t.self) continue;
                 if (t.pid == 0 && now >= t.next_try_ms) {
                     const std::string k = rly::peer_key(t.host, t.port);
@@ -3189,6 +3218,7 @@ private:
                 t.hello_timed_out = false;
                 if (links_.has_peer(pid)) {
                     t.pid = pid;
+                    t.gone_ms = 0;
                     if (hello_now) t.prehello_fails = 0;
                 } else {
                     t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
