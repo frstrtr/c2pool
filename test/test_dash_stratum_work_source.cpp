@@ -280,6 +280,38 @@ TEST(DashStratumWorkSource, WorkerRegistryRoundTrip)
     SUCCEED();
 }
 
+// The dashboard's per-connection Latency column reads WorkerInfo::rtt_ms from
+// this registry. The stratum session samples the kernel RTT at authorize
+// (into the registered WorkerInfo) and again on every accepted submit through
+// update_stratum_worker_rtt. The registry must take the fresh sample; a
+// connect-time reading (taken while many rigs connect at once) must not stick.
+TEST(DashStratumWorkSource, WorkerRttRefreshesAfterRegistration)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    core::stratum::WorkerInfo info;
+    info.username    = "Xaddr.D14";
+    info.worker_name = "D14";
+    info.rtt_ms      = 90.4;   // sampled at authorize
+    ws->register_stratum_worker("sess-1", info);
+    ASSERT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 90.4);
+
+    ws->update_stratum_worker_rtt("sess-1", 23.1);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1)
+        << "a submit-time RTT sample replaces the connect-time one";
+
+    // The share-stats update leaves the fresh RTT alone.
+    ws->update_stratum_worker("sess-1", 1.0e9, 0.0, 16.0, 4, 0, 0);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1);
+
+    // An unknown session is dropped, never inserted.
+    ws->update_stratum_worker_rtt("sess-unknown", 5.0);
+    EXPECT_EQ(ws->get_stratum_workers().count("sess-unknown"), 0u);
+
+    ws->unregister_stratum_worker("sess-1");
+    EXPECT_TRUE(ws->get_stratum_workers().empty());
+}
+
 // The fused adapter: with an UNPOPULATED coin-state, get_work() routes to the
 // RETAINED dashd fallback (always-reachable safety + [GBT-XCHECK] arm).
 TEST(DashStratumWorkSource, GetWorkRoutesToDashdFallbackWhenCoinStateUnpopulated)
