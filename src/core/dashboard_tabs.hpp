@@ -67,13 +67,19 @@ inline bool valid_symbol(const std::string& s) {
     return true;
 }
 
-// Absolute http:// or https:// URL with a non-empty host, printable ASCII,
-// and none of the characters that could break out of an href attribute.
+// Absolute http(s) URL with a non-empty host, printable ASCII, and none of
+// the characters that could break out of an href attribute. The scheme is
+// split off first and checked on its own, then the "//" and the authority.
+// This is a shape check for a link the operator configured; it makes no
+// trust or authentication decision.
 inline bool valid_url(const std::string& u) {
-    std::string rest;
-    if (u.rfind("http://", 0) == 0)       rest = u.substr(7);
-    else if (u.rfind("https://", 0) == 0) rest = u.substr(8);
-    else return false;
+    const auto colon = u.find(':');
+    if (colon == std::string::npos) return false;
+    const std::string scheme = u.substr(0, colon);
+    if (scheme != "http" && scheme != "https") return false;
+    if (u.size() < colon + 3 || u[colon + 1] != '/' || u[colon + 2] != '/')
+        return false;
+    const std::string rest = u.substr(colon + 3);
     if (rest.empty() || rest[0] == '/' || rest[0] == ':' || rest[0] == '?' || rest[0] == '#')
         return false;
     for (char c : u) {

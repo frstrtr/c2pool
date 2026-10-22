@@ -63,7 +63,9 @@ TEST(DashboardTabs, InvalidPeerSpecsAreRejected) {
                             "DASH=javascript:alert(1)", "DASH=//dash.example.com", "DASH=https://",
                             "DASH=https:///path", "DA SH=https://x.example", "DASH=https://x.example/a b",
                             "DASH=https://x.example/\"onmouseover=", "DASH=https://x.example/<b>",
-                            "WAYTOOLONGSYMBOL1=https://x.example"}) {
+                            "WAYTOOLONGSYMBOL1=https://x.example", "DASH=http:/x.example",
+                            "DASH=https:x.example", "DASH=httpx://x.example", "DASH=ftp://x.example",
+                            "DASH=HTTPS://x.example", "DASH=x.example:8080/https://y"}) {
         EXPECT_FALSE(parse_dashboard_peer(bad).has_value()) << bad;
     }
     EXPECT_TRUE(parse_dashboard_peer("BTC=http://10.0.0.5:8080/").has_value());
