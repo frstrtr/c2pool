@@ -287,6 +287,12 @@ if(BUILD_TESTING)
     # handle_version, which this target already compiles (node.cpp). Invoked
     # from main() via run_self_connection_ban_checks(); no new executable.
     target_sources(bch_embedded_block_broadcast_test PRIVATE self_connection_ban_test.cpp)
+    # Stratum latency refresh KAT (stratum_worker_rtt_test.cpp, BCH half of the
+    # DASH fix in #2033) rides the same EXISTING allowlisted target: it drives
+    # the real BCHWorkSource worker registry, which this target already compiles
+    # (stratum/work_source.cpp). Invoked from main() via
+    # run_stratum_worker_rtt_checks(); no new executable, no build.yml change.
+    target_sources(bch_embedded_block_broadcast_test PRIVATE stratum_worker_rtt_test.cpp)
 
     # #1437 topology KAT (child-without-parent + intra-template double-spend)
     # rides this EXISTING allowlisted target (bch tree is plain main()/CHECK,
