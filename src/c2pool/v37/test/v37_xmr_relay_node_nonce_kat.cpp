@@ -11,8 +11,9 @@
 //   N4 self-connection: a node given its own address (--relay-peer, exact and
 //      an alias; an FB_ADDR naming it) never keeps a link to itself, dials an
 //      alias at most once, marks it SELF in the book, never hands it out
-//   N5 duplicate in/out pair: exactly one link per node pair, the SAME socket
-//      on both ends, no churn, no penalty (dup_link_rule both-ends agreement);
+//   N5 duplicate in/out pair (both dials made before any HELLO): exactly one
+//      link per node pair, the SAME socket on both ends, no churn, no penalty
+//      (dup_link_rule both-ends agreement);
 //      a same-dialer pair: only the dialer closes, the acceptor defers
 //   N6 dial target release (manual node, logical clock): a target whose link
 //      left the link table waits for the link's down event, then the pre-HELLO
@@ -187,14 +188,62 @@ static void n4_self(Checker& C, Rig& rig) {
     C(!B->r().book().contains("127.0.0.1", B->port()), "N4 B's own address is not in its book");
 }
 
+// A logical relay clock (ms), moved by the KAT.
+struct StepClock {
+    std::shared_ptr<std::atomic<u64>> ms = std::make_shared<std::atomic<u64>>(1000000);
+    pb::RelayClock clock() const {
+        pb::RelayClock c = pb::RelayClock::system();
+        c.mono_ms = [m = ms] { return m->load(); };
+        return c;
+    }
+    void add(u64 d) const { *ms += d; }
+};
+// Holds every FB_HELLO frame on its reader thread, before the relay node sees it, until opened.
+struct HelloGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool open = false;
+    int arrived = 0;
+    void tap(const std::vector<u8>& f) {
+        if (f.empty() || f[0] != pb::kOpFbHello) return;
+        std::unique_lock<std::mutex> lk(m);
+        ++arrived;
+        cv.notify_all();
+        cv.wait(lk, [&] { return open; });
+    }
+    int count() {
+        std::lock_guard<std::mutex> lk(m);
+        return arrived;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+struct GateOpener {
+    HelloGate& g;
+    ~GateOpener() { g.release(); }
+};
+
 static void n5_dup(Checker& C, Rig& rig) {
     std::printf("-- N5 duplicate in/out pair\n");
     const u16 pp = free_port(), pq = free_port();
     pb::PathbRelayOptions op = nopts("127.0.0.1", {{"127.0.0.1", pq}}); op.listen_port = pp;
     pb::PathbRelayOptions oq = nopts("127.0.0.1", {{"127.0.0.1", pp}}); oq.listen_port = pq;
+    HelloGate gpq;  // the HELLOs reach P and Q once each has dialed the other
     auto P = rig.make("P", op);
     auto Q = rig.make("Q", oq);
-    C(P->start() && Q->start(), "N5 P and Q each dial the other");
+    P->links.set_tap([&gpq](u64, const std::vector<u8>& f) { gpq.tap(f); });
+    Q->links.set_tap([&gpq](u64, const std::vector<u8>& f) { gpq.tap(f); });
+    GateOpener gopq{gpq};
+    C(P->start() && Q->start(), "N5 P and Q start");
+    C(wait_until([&] { return P->links.net().n_peers() == 2 && Q->links.net().n_peers() == 2; }, 8000ms, 5ms) &&
+          P->st().dials.load() == 1 && Q->st().dials.load() == 1,
+      "N5 P and Q each dial the other (two links each before any HELLO)");
+    gpq.release();
     C(wait_until([&] { return links(*P) == 1 && links(*Q) == 1; }, 8000ms, 50ms), "N5 one link each");
     std::this_thread::sleep_for(2000ms);
     const u64 hp = P->st().hello_ok.load(), hq = Q->st().hello_ok.load();
@@ -273,45 +322,6 @@ static void n5_dup(Checker& C, Rig& rig) {
     C(agree, "N5 cross pair: both ends close the link dialed by the HIGHER nonce, in any arrival order; same dialer: only it closes");
 }
 
-// A logical relay clock (ms), moved by the KAT.
-struct StepClock {
-    std::shared_ptr<std::atomic<u64>> ms = std::make_shared<std::atomic<u64>>(1000000);
-    pb::RelayClock clock() const {
-        pb::RelayClock c = pb::RelayClock::system();
-        c.mono_ms = [m = ms] { return m->load(); };
-        return c;
-    }
-    void add(u64 d) const { *ms += d; }
-};
-// Holds every FB_HELLO frame on its reader thread, before the relay node sees it, until opened.
-struct HelloGate {
-    std::mutex m;
-    std::condition_variable cv;
-    bool open = false;
-    int arrived = 0;
-    void tap(const std::vector<u8>& f) {
-        if (f.empty() || f[0] != pb::kOpFbHello) return;
-        std::unique_lock<std::mutex> lk(m);
-        ++arrived;
-        cv.notify_all();
-        cv.wait(lk, [&] { return open; });
-    }
-    int count() {
-        std::lock_guard<std::mutex> lk(m);
-        return arrived;
-    }
-    void release() {
-        {
-            std::lock_guard<std::mutex> lk(m);
-            open = true;
-        }
-        cv.notify_all();
-    }
-};
-struct GateOpener {
-    HelloGate& g;
-    ~GateOpener() { g.release(); }
-};
 // A manual node (no threads) on `clk`: listens on 0.0.0.0:P, --relay-peer = 127.0.1.1:P (itself).
 static std::unique_ptr<RNode> self_alias_node(Rig& rig, const char* name, u16 P, const StepClock& clk, HelloGate& g) {
     pb::PathbRelayOptions o = nopts("0.0.0.0", {{"127.0.1.1", P}});
