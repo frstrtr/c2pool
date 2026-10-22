@@ -2876,7 +2876,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
     uint64_t total_accepted = 0, total_rejected = 0, total_stale = 0;
     std::set<std::string> unique_addrs;
     std::map<std::string, int> ip_connections;   // IP → connection count
-    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique worker keys ("ADDRESS.worker")
     const auto liveness = observe_worker_liveness(workers, now_steady);
     int connections_silent = 0;
 
@@ -2890,6 +2890,11 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         total_stale += w.stale;
         unique_addrs.insert(w.username);
 
+        // Key by worker name: "ADDRESS.worker" (like p2pool)
+        std::string worker_key = w.worker_name.empty()
+            ? w.username
+            : w.username + "." + w.worker_name;
+
         // Track connections per IP
         // #965 Phase-2: IPv6-aware split (endpoint is bracketed for v6 at the
         // stratum producer), so group by the bare host across both families.
@@ -2898,17 +2903,15 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
             if (!reveal_ips)
                 ip = core::mask_ip_endpoint(ip);
             ip_connections[ip]++;
-            ip_workers_set[ip].insert(w.username);
+            // A farm behind one NAT often pays every rig to one address and
+            // tells them apart by the worker suffix; count those as separate
+            // workers, or stratum.html flags ~1 conn/rig as "High".
+            ip_workers_set[ip].insert(worker_key);
         }
 
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             now_steady - w.connected_at).count();
         auto first_seen_ts = static_cast<uint64_t>(now) - static_cast<uint64_t>(elapsed);
-
-        // Key by worker name: "ADDRESS.worker" (like p2pool)
-        std::string worker_key = w.worker_name.empty()
-            ? w.username
-            : w.username + "." + w.worker_name;
 
         // Aggregate multiple connections for the same worker (p2pool behavior)
         if (workers_json.contains(worker_key)) {
@@ -7399,13 +7402,17 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
         }
     }
 
-    // Filter out entries with 0 LTC and no merged payouts
+    // Filter out entries with a zero primary amount and no merged payouts.
+    // Only zero: the donation output is emitted even at --give-author 0 as a
+    // 1-satoshi/duff dust marker (1e-8), which a "< 1e-6" cut dropped from
+    // the "Current Payouts" card while /current_payouts still listed it.
+    // p2pool web.py lists every payout regardless of amount.
     nlohmann::json filtered = nlohmann::json::object();
     for (auto& [key, entry] : result.items()) {
         double ltc_amount = entry.value("amount", 0.0);
         auto& merged = entry["merged"];
         bool has_merged = merged.is_array() && !merged.empty();
-        if (ltc_amount < 0.000001 && !has_merged) continue;
+        if (ltc_amount <= 0.0 && !has_merged) continue;
         // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong).
         // Exempt source="donation": p2pool web.py forces donation_reward to >=1
         // satoshi when the V36-signaling shares all set m_donation=0, so the
@@ -7421,7 +7428,7 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
                     good.push_back(m);
             }
             entry["merged"] = good;
-            if (ltc_amount < 0.000001 && good.empty()) continue;
+            if (ltc_amount <= 0.0 && good.empty()) continue;
         }
         filtered[key] = entry;
     }
