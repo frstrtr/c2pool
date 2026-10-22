@@ -13,8 +13,13 @@
 //      alias at most once, marks it SELF in the book, never hands it out
 //   N5 duplicate in/out pair: exactly one link per node pair, the SAME socket
 //      on both ends, no churn, no penalty (dup_link_rule both-ends agreement)
+//   N6 dial target release (manual node, logical clock): a target whose link
+//      left the link table waits for the link's down event, then the pre-HELLO
+//      backoff (A: the down event held); a down event that never comes
+//      releases it at hello_timeout_ms
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -246,6 +251,130 @@ static void n5_dup(Checker& C, Rig& rig) {
     C(agree, "N5 cross pair: both ends close the link dialed by the HIGHER nonce, in any arrival order; same dialer: only it closes");
 }
 
+// A logical relay clock (ms), moved by the KAT.
+struct StepClock {
+    std::shared_ptr<std::atomic<u64>> ms = std::make_shared<std::atomic<u64>>(1000000);
+    pb::RelayClock clock() const {
+        pb::RelayClock c = pb::RelayClock::system();
+        c.mono_ms = [m = ms] { return m->load(); };
+        return c;
+    }
+    void add(u64 d) const { *ms += d; }
+};
+// Holds every FB_HELLO frame on its reader thread, before the relay node sees it, until opened.
+struct HelloGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool open = false;
+    int arrived = 0;
+    void tap(const std::vector<u8>& f) {
+        if (f.empty() || f[0] != pb::kOpFbHello) return;
+        std::unique_lock<std::mutex> lk(m);
+        ++arrived;
+        cv.notify_all();
+        cv.wait(lk, [&] { return open; });
+    }
+    int count() {
+        std::lock_guard<std::mutex> lk(m);
+        return arrived;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+struct GateOpener {
+    HelloGate& g;
+    ~GateOpener() { g.release(); }
+};
+// A manual node (no threads) on `clk`: listens on 0.0.0.0:P, --relay-peer = 127.0.1.1:P (itself).
+static std::unique_ptr<RNode> self_alias_node(Rig& rig, const char* name, u16 P, const StepClock& clk, HelloGate& g) {
+    pb::PathbRelayOptions o = nopts("0.0.0.0", {{"127.0.1.1", P}});
+    o.listen_port = P;
+    o.threads = false;
+    auto A = rig.make(name, o, false, false, clk.clock());
+    A->links.set_tap([&g](u64, const std::vector<u8>& f) { g.tap(f); });
+    return A;
+}
+// One tick dials the alias; both HELLOs are sent and reach the relay node, where each waits on the owner queue
+// (not pumped). out / in: the dialed and the accepted link.
+static bool self_pair(RNode& A, HelloGate& g, u64& out, u64& in) {
+    A.r().tick();
+    if (!wait_until([&] { return A.links.net().n_peers() == 2; }, 8000ms, 5ms)) return false;
+    if (!wait_until([&] { A.r().pump(); return A.st().hello_sent.load() == 2; }, 8000ms, 5ms)) return false;
+    if (!wait_until([&] { return g.count() == 2; }, 8000ms, 5ms)) return false;
+    g.release();
+    if (!wait_until([&] { return A.links.handled(pb::kOpFbHello) == 2; }, 8000ms, 5ms)) return false;
+    out = in = 0;
+    for (u64 id : A.links.net().peer_ids()) (A.links.net().is_inbound(id) ? in : out) = id;
+    return out != 0 && in != 0 && A.st().dials.load() == 1;
+}
+
+static void n6_release(Checker& C, Rig& rig) {
+    std::printf("-- N6 dial target release\n");
+    {   // A: the dialed link leaves the link table and its peer entry (hello_timeout_ms 3000); its down event is held
+        StepClock clk;
+        HelloGate g;
+        const u16 P = free_port();
+        auto A = self_alias_node(rig, "N6A", P, clk, g);
+        GateOpener go{g};
+        u64 out = 0, in = 0;
+        C(A->start() && self_pair(*A, g, out, in), "N6 A: one dial of the alias, both HELLOs queued on the relay node");
+        A->links.hold_downs();
+        A->r().drop_peer(in);
+        const bool gone = wait_until([&] { return A->links.held_downs() == 2 && !A->links.has_peer(out); }, 8000ms, 5ms);
+        clk.add(3001);
+        A->r().tick();
+        C(gone && A->st().hello_timeout.load() == 2 && A->st().dials.load() == 1,
+          "N6 A: the dialed link gone from the link table and its peer entry, its down event not run: no redial");
+        A->links.release_downs();
+        clk.add(1999);
+        A->r().tick();
+        C(A->links.downs() == 2 && A->st().dials.load() == 1,
+          "N6 A: after its down event, no redial within its pre-HELLO backoff (2 s after a HELLO timeout)");
+        A->r().pump();
+    }
+    {   // a down event that never comes: released at hello_timeout_ms (3000), redialed after the backoff (1 s)
+        StepClock clk;
+        CarrierPeerNode srv;
+        C(srv.listen("127.0.0.1", 0), "N6 bound: a raw listener S");
+        pb::PathbRelayOptions o = nopts("127.0.0.1", {{"127.0.0.1", srv.listen_port()}});
+        o.threads = false;
+        auto B = rig.make("N6T", o, false, false, clk.clock());
+        C(B->start(), "N6 bound: a manual node dialing S starts");
+        B->r().tick();
+        const bool up = wait_until([&] { return srv.n_peers() == 1 && B->links.net().n_peers() == 1; }, 8000ms, 5ms);
+        B->links.hold_downs();
+        for (u64 id : srv.peer_ids()) srv.disconnect(id);
+        const bool gone = wait_until([&] { return B->links.held_downs() == 1 && B->links.net().n_peers() == 0; }, 8000ms, 5ms);
+        B->r().tick();
+        clk.add(2999);
+        B->r().tick();
+        const u64 d_wait = B->st().dials.load();
+        clk.add(1);
+        B->r().tick();
+        clk.add(999);
+        B->r().tick();
+        const u64 d_backoff = B->st().dials.load();
+        clk.add(1);
+        B->r().tick();
+        const u64 d_after = B->st().dials.load();
+        std::printf("    dials: %llu (2999 ms) %llu (3999 ms) %llu (4000 ms)\n", (unsigned long long)d_wait,
+                    (unsigned long long)d_backoff, (unsigned long long)d_after);
+        C(up && gone && d_wait == 1 && d_backoff == 1 && d_after == 2,
+          "N6 bound: no redial before hello_timeout_ms with the down event held; released then, redialed 1 s later");
+        B->links.release_downs();
+        B->r().tick();
+        C(B->st().dials.load() == 2 && wait_until([&] { return srv.n_peers() == 1; }, 8000ms, 5ms),
+          "N6 bound: the late down event leaves the new link alone");
+        B.reset();
+        srv.stop();
+    }
+}
+
 int main() {
     Checker C;
     std::printf("== v37_xmr_relay_node_nonce_kat ==\n");
@@ -255,5 +384,6 @@ int main() {
     n3_seeds(C, rig);
     n4_self(C, rig);
     n5_dup(C, rig);
+    n6_release(C, rig);
     return C.done("v37_xmr_relay_node_nonce_kat");
 }

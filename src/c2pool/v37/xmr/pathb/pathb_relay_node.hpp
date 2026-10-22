@@ -1009,6 +1009,7 @@ private:
         std::string host;
         std::uint16_t port = 0;
         std::uint64_t pid = 0;
+        std::uint64_t gone_ms = 0;  // its link left the link table before its down event ran (0: not seen)
         std::uint64_t next_try_ms = 0;
         int backoff_s = 1;
         std::uint32_t prehello_fails = 0;
@@ -1030,6 +1031,15 @@ private:
         if (t.prehello_fails <= 1) return 1;
         const std::uint32_t sh = std::min<std::uint32_t>(t.prehello_fails - 1, 6);
         return std::min(cap, 1 << sh);
+    }
+    // A dial target whose link is gone: redialed after the pre-HELLO backoff (tmtx_ held).
+    void release_target_locked(Target& t) {
+        t.pid = 0;
+        t.gone_ms = 0;
+        if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
+        t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
+        t.hello_seen = false;
+        t.hello_timed_out = false;
     }
     struct Job {
         enum class Kind : std::uint8_t { Carrier, Receipt } kind = Kind::Carrier;
@@ -1370,13 +1380,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(tmtx_);
             for (Target& t : targets_)
-                if (t.pid == p) {
-                    t.pid = 0;
-                    if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
-                    t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
-                    t.hello_seen = false;
-                    t.hello_timed_out = false;
-                }
+                if (t.pid == p) release_target_locked(t);
         }
         post([this, p] {
             const NodeGuard g(*this);
@@ -3135,6 +3139,7 @@ private:
                     if (t.pid != 0) {
                         out.push_back(t.pid);
                         t.pid = 0;
+                        t.gone_ms = 0;
                     }
             }
             for (std::uint64_t p : out) links_.disconnect(p);
@@ -3149,7 +3154,12 @@ private:
             const std::uint64_t now = now_ms();
             for (std::size_t i = 0; i < targets_.size(); ++i) {
                 Target& t = targets_[i];
-                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
+                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) {
+                    // its down event releases it; one not run within hello_timeout_ms releases it here
+                    if (t.gone_ms == 0) t.gone_ms = now;
+                    if (now - t.gone_ms < o_.hello_timeout_ms) continue;
+                    release_target_locked(t);
+                }
                 if (t.self) continue;
                 if (t.pid == 0 && now >= t.next_try_ms) {
                     const std::string k = rly::peer_key(t.host, t.port);
@@ -3189,6 +3199,7 @@ private:
                 t.hello_timed_out = false;
                 if (links_.has_peer(pid)) {
                     t.pid = pid;
+                    t.gone_ms = 0;
                     if (hello_now) t.prehello_fails = 0;
                 } else {
                     t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
