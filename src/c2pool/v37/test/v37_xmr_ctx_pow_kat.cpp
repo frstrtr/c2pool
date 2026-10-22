@@ -28,6 +28,9 @@
 //                                              -> forged (ban)
 //         a height its parent does not imply   -> forged (ban), no hash spent
 //         an unknown parent                    -> deferred, never banned
+//         an anchor that answers no P-13       -> deferred, never banned
+//         P-13 at the newest ancestor with RowWeights (ctx_anchor_cap: the anchor first, a 2-deep alternative's fork
+//         point, none past k_alt or with no such ancestor held)
 //         depth 3                              -> deferred, never banned, no hash
 //         a verifier that cannot hash          -> deferred, never banned
 //         no index wired                       -> deferred
@@ -41,12 +44,13 @@
 #include <string>
 #include <vector>
 
-#include "xmr_relay_test_util.hpp"
-#include <c2pool/v37/xmr/relay/xmr_relay_node.hpp>
+#include "xmr_pathb_relay_test_util.hpp"
+#include <c2pool/v37/xmr/relay/xmr_relay_native_ctx.hpp>
 #include "impl/xmr/native/chain/xmr_chain_index.hpp"
 #include "impl/xmr/native/chain/xmr_pow_gate.hpp"
+#include "impl/xmr/pathb/pathb_caps.hpp"
 
-using namespace gap2test;
+using namespace pathb_relay_test;
 namespace nat = c2pool::xmr::native;
 
 static constexpr u64 kH    = 5000;   // G's height
@@ -54,13 +58,6 @@ static constexpr u64 kWin  = 100;    // difficulty rows ending at G
 static constexpr u64 kStep = 1000;   // cumulative difficulty per row -> next difficulty 1000
 static constexpr u64 kCum0 = 5'000'000;
 
-static bytes32 block_id(const SynthBlock& sb) {   // keccak256(varint(len) | hashing_blob)
-    std::vector<u8> pre;
-    put_varint(pre, sb.hashing_blob.size());
-    pre.insert(pre.end(), sb.hashing_blob.begin(), sb.hashing_blob.end());
-    const auto h = ::xmr::coin::keccak256(pre.data(), pre.size());
-    bytes32 b; std::memcpy(b.data(), h.data(), 32); return b;
-}
 static nat::Hash nh(const bytes32& b) { nat::Hash h{}; std::memcpy(h.data(), b.data(), 32); return h; }
 static bytes32 bb(const nat::Hash& h) { bytes32 b{}; std::memcpy(b.data(), h.data(), 32); return b; }
 
@@ -119,22 +116,62 @@ public:
     }
 };
 
-// main_v37_xmr.cpp's binding of the native index, verbatim in behaviour.
-static CtxChainSource bind_index(nat::ChainIndex& idx) {
+// main_v37_xmr.cpp's binding of the native index, verbatim in behaviour; P-13 at the anchor from its RowWeights
+// there, here the model index's hf 16, Z = zone(16) (cap 0: an anchor that answers none).
+static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::blob_cap_ctx(16, pb::zone(16)).value_or(0)) {
     CtxChainSource cs;
     cs.verified = [&idx](const bytes32& id) { return idx.holds_verified(nh(id)); };
-    cs.target = [&idx](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
-                       CtxTarget& out, std::string& why) {
+    cs.target = [&idx, cap](const bytes32& anchor, const std::vector<CtxStep>& above, std::uint64_t major,
+                            CtxTarget& out, std::string& why) {
         std::vector<std::pair<std::uint64_t, nat::U128>> rows;
         for (const auto& st : above) { nat::U128 d{}; d.lo = st.diff_lo; d.hi = st.diff_hi; rows.emplace_back(st.timestamp, d); }
         nat::U128 d{}; nat::Hash seed{}; std::uint64_t h = 0;
         const std::uint8_t mv = static_cast<std::uint8_t>(major > 255 ? 255 : major);
         if (!idx.context_target(nh(anchor), rows, mv, d, seed, h, why)) return false;
         out.diff_lo = d.lo; out.diff_hi = d.hi; out.height = h; out.seed = bb(seed);
+        out.blob_cap = cap;
         return true;
     };
     return cs;
 }
+
+// The follower's rows of a few chains: held blocks by id, RowWeights for some (pb::ctx_anchor_cap reads block() and
+// weights()).
+static pb::Hash32 b32h(u8 tag, u64 h) {
+    pb::Hash32 id{};
+    id[0] = tag;
+    for (int i = 0; i < 8; ++i) id[1 + i] = static_cast<u8>(h >> (8 * i));
+    return id;
+}
+struct ChainRows final : pb::IMoneroRows {
+    std::map<pb::Hash32, pb::BranchBlock> blocks;
+    std::map<pb::Hash32, pb::RowWeights> w;
+    pb::Hash32 add(u8 tag, u64 h, const pb::Hash32& prev, bool weights) {
+        pb::BranchBlock b;
+        b.id = b32h(tag, h);
+        b.prev_id = prev;
+        b.height = h;
+        blocks[b.id] = b;
+        if (weights) {
+            pb::RowWeights rw{};
+            rw.hf_child = 16;
+            rw.z_child = 400000;
+            w[b.id] = rw;
+        }
+        return b.id;
+    }
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override {
+        const auto it = blocks.find(id);
+        return it == blocks.end() ? std::nullopt : std::optional<pb::BranchBlock>(it->second);
+    }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t) const override { return std::nullopt; }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        const auto it = w.find(id);
+        return it == w.end() ? std::nullopt : std::optional<pb::RowWeights>(it->second);
+    }
+    pb::BranchBlock anchor() const override { return {}; }
+    pb::Hash32 main_tip() const override { return {}; }
+};
 
 // A structurally real Monero block in the native KATs' shape (one tagged-key
 // coinbase output, a bare pubkey extra, no transactions) for the index itself.
@@ -294,15 +331,50 @@ int main() {
         const auto v = judge_block_ctx(ctx_of(B1), CtxChainSource{}, rec_of, 2, rx.fn());
         C(v.kind == CtxPow::Defer && !v.ban(), "C2 with no chain index wired nothing is used and nobody is banned");
     }
+    {   // an anchor with no context block cap (P-13): its RowWeights unknown
+        const CtxChainSource nocap = bind_index(idx, 0);
+        const u64 c0 = rx.calls;
+        const auto v = judge_block_ctx(ctx_of(B1), nocap, rec_of, 2, rx.fn());
+        C(v.kind == CtxPow::Defer && !v.ban() && !v.usable() && rx.calls == c0,
+          "C2 an anchor that answers no P-13 is DEFERRED, never unchecked, no hash spent: " + v.why);
+    }
+    {   // pb::ctx_anchor_cap: P-13 at the newest ancestor with RowWeights, the anchor first (the climb)
+        ChainRows rows;
+        const pb::Hash32 F = rows.add(0x0F, 5000, pb::Hash32{}, true);   // the fork point on the main chain
+        const pb::Hash32 A1 = rows.add(0xA1, 5001, F, false);            // a 2-deep alternative, bodiless
+        const pb::Hash32 A2 = rows.add(0xA2, 5002, A1, false);
+        const u64 capF = pb::blob_cap_ctx(16, 400000).value_or(1);
+        C(pb::ctx_anchor_cap(rows, F) == capF, "C2 ctx_anchor_cap at an anchor with RowWeights: its own Z (" + std::to_string(capF) + ")");
+        C(pb::ctx_anchor_cap(rows, A2) == capF && pb::ctx_anchor_cap(rows, A1) == capF,
+          "C2 ctx_anchor_cap at the upper block of a 2-deep alternative without RowWeights: its fork point's Z (the climb)");
+        const pb::Hash32 U = rows.add(0x55, 5003, b32h(0x77, 5002), false);   // its parent not held
+        C(pb::ctx_anchor_cap(rows, U) == 0, "C2 ctx_anchor_cap with no ancestor with RowWeights held: none (the judge defers)");
+        pb::Hash32 top = F;
+        for (u64 k = 1; k <= pb::kAltDepth + 1; ++k) top = rows.add(0xB0, 5000 + k, top, false);
+        const pb::Hash32 at_bound = b32h(0xB0, 5000 + pb::kAltDepth);
+        C(pb::ctx_anchor_cap(rows, at_bound) == capF && pb::ctx_anchor_cap(rows, top) == 0,
+          "C2 ctx_anchor_cap climbs at most k_alt (" + std::to_string(pb::kAltDepth) + ") links");
+    }
     {   // the bound is the relay's default
-        RelayOptions ro;
-        C(ro.ctx_max_depth == 2, "C2 RelayOptions::ctx_max_depth defaults to 2 (the tip-freshness bound)");
+        pb::PathbRelayOptions ro;
+        C(ro.ctx_max_depth == 3 && ro.ctx_max_depth == pb::relay_horizons(pb::kRuledLaneParams).ctx_max_depth,
+          "C2 PathbRelayOptions::ctx_max_depth defaults to P-06 = Fresh + 1 = 3 (an unsolicited receipt)");
+        C(ro.ctx_join_depth == 720 && ro.ctx_join_depth == pb::kAltDepth,
+          "C2 PathbRelayOptions::ctx_join_depth defaults to P-07 = k_alt = 720 (a carrier under verification)");
     }
 
     // ── C3 serving: a parked (unverified) alternative block is not served ──
     {
-        const nat::BlockEntry e = native_block(b32_of(88), kH + 2, tsG + 2, 19);   // parent unknown -> parked
-        const nat::OfferResult r = idx.offer_block(nullptr, e, false);
+        const nat::BlockEntry e = native_block(b32_of(88), kH + 2, tsG + 2, 19);   // parent unknown
+        const nat::OfferResult u = idx.offer_block(nullptr, e, false);               // unasked: refused, no strike
+        C(u.outcome == nat::OfferOutcome::Rejected && !u.peer_fault && !idx.have_block(u.id),
+          std::string("C3 an unasked orphan is refused with no strike (") + nat::to_string(u.outcome) + ")");
+        nat::ChainEntry ce;                                                         // the chain request names it
+        ce.ids = {nh(idG), u.id};
+        ce.start_height = kH;
+        ce.total_height = kH + 2;
+        idx.on_chain_entry(nat::PeerRef{}, std::move(ce));
+        const nat::OfferResult r = idx.offer_block(nullptr, e, false);               // asked for -> parked
         std::vector<std::uint8_t> out;
         C(r.outcome == nat::OfferOutcome::ParkedOrphan && idx.alt_size() >= 1 && !idx.block_blob_of(r.id, out),
           std::string("C3 a parked orphan is held but NOT served as a context (") + nat::to_string(r.outcome) + ": " + r.why + ")");

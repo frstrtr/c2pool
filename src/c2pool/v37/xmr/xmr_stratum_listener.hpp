@@ -49,9 +49,11 @@
 //     submits delays the others by at most one hash per pass;
 //   * per-connection submit budget (submit_burst, then a refill per s): a
 //     submit over it is dropped unverified and the connection is BANNED. The
-//     refill is submit_rate (2 x 2^k / T = 12.8/s). With submit_vardiff (off
-//     by default) the refill is 2 x S_t from the tip, S_t = 2^k x n* / t_W,
-//     t_W = COVERAGE x 120 / s, clamped at s = 100 %; s unknown: submit_rate;
+//     refill is submit_rate (2 x 2^s / T, s = --stratum-min-diff-shift; 0.2/s
+//     at s 0), or the budget set from d_at (set_stratum_budget). With
+//     submit_vardiff (off by default) the refill is 2 x S_t from the tip,
+//     S_t = 2^s x n* / t_W, t_W = COVERAGE x 120 / s_pool, clamped at
+//     s_pool = 100 %; s_pool unknown: the refill above;
 //   * a repeated (job id, nonce) is refused unverified ("Duplicate share");
 //   * share score per connection: a low-difficulty or duplicate share
 //     bad_share_points, an accepted one good_share_points (capped at
@@ -60,7 +62,14 @@
 //   * BANNED = closed, and its address (IPv4, IPv6 /64; never 127.0.0.1 /
 //     ::1) refused at accept for ban_seconds;
 //   * a miner's "+diff" below min_difficulty is raised to it
-//     (XmrStratumServer::set_min_difficulty).
+//     (XmrStratumServer::set_min_difficulty); the budget set from d_at
+//     replaces min_difficulty with max(1, d_at >> s).
+//
+// LOGIN: params["login"] and params["pass"] go to the login hook (when set),
+// which refuses the login (an error reply, the connection closed) or accepts
+// it with the session's stated vote; the login reply hook gives the members
+// added to that login reply's result; the session binder gets (extra_nonce,
+// address, stated vote) right before each job of the session is built.
 //
 // Startup race handled: a miner that logs in BEFORE the daemon has its first
 // template (or while the lane is SUSPENDED) is PARKED (no reply) and answered
@@ -78,8 +87,8 @@
 //   listener thread: sockets, sessions, XmrStratumServer, ITemplateSource reads
 //                    (get_job/rebuild_blob — the source must be safe for a
 //                    concurrent reader), IPowVerifier, IShareSink callbacks.
-//   any thread:      notify_new_template(), request_stop(), stats(),
-//                    drain_log(), bound_port().
+//   any thread:      notify_new_template(), set_stratum_budget(),
+//                    request_stop(), stats(), drain_log(), bound_port().
 //   main thread:     bind(), start(), stop() (joins), destructor.
 //
 // CONSUMER-TREE ONLY: defines no consensus digest; calls only the merged X5
@@ -97,6 +106,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -121,23 +131,26 @@
 #include "impl/xmr/node/minijson.hpp"          // xmrig JSON tokeniser (header-only)
 #include "impl/xmr/stratum/xmr_stratum.hpp"    // X5 seams + XmrStratumServer
 #include "c2pool/v37/net_addr_ban.hpp"         // NET-DOS: address keys + ban table
-#include "c2pool/v37/xmr/xmr_lane_constants.hpp"   // k (kXmrDropsFloorShift), T (kXmrTargetIntervalS)
+#include "c2pool/v37/xmr/xmr_lane_constants.hpp"   // T (kXmrTargetIntervalS)
+#include "c2pool/v37/xmr/pathb/pathb_stratum_hooks.hpp"   // the stratum budget from d_at
 
 namespace c2pool::v37n::xmr::o2 {
 
 namespace strat = ::v37::xmr::stratum;
 namespace mj    = ::c2pool::xmr::node::minijson;
+namespace pbs   = ::c2pool::xmr::pathb::stratum;
 
-// NET-DOS submit-budget defaults (no vardiff): burst 24; refill 2 x 2^k / T
-// submits/s; address ban ceil(burst / refill) s = ceil(burst x T / (2 x 2^k)),
-// integer arithmetic.
+// NET-DOS submit-budget defaults (no vardiff): burst 24; refill 2 x 2^s / T
+// submits/s (s = --stratum-min-diff-shift, default 0); address ban
+// ceil(burst / refill) s = ceil(burst x T / (2 x 2^s)), integer arithmetic.
 inline constexpr std::uint32_t kStratumSubmitBurst   = 24;
-inline constexpr std::uint32_t kStratumRefillPerT    = 2u << kXmrDropsFloorShift;   // 2 x 2^k submits per T
+inline constexpr std::uint32_t kStratumRefillPerT    =
+    std::uint32_t(pbs::kStratumRefillFactor << pbs::kStratumMinDiffShiftDefault);   // 2 x 2^s submits per T
 inline constexpr double        kStratumSubmitRate    = double(kStratumRefillPerT) / double(kXmrTargetIntervalS);
 inline constexpr int           kStratumBanSeconds    =
     int((kStratumSubmitBurst * kXmrTargetIntervalS + kStratumRefillPerT - 1) / kStratumRefillPerT);
-static_assert(kStratumRefillPerT == 128 && kXmrTargetIntervalS == 10 && kStratumBanSeconds == 2,
-              "stratum submit-budget defaults: 12.8/s, ban 2 s at k 6, T 10 s, burst 24");
+static_assert(kStratumRefillPerT == 2 && kXmrTargetIntervalS == 10 && kStratumBanSeconds == 120,
+              "stratum submit-budget defaults: 0.2/s, ban 120 s at s 0, T 10 s, burst 24");
 
 // ---------------------------------------------------------------------------
 // Tunables. Defaults suit a single-rig regtest/stagenet demo.
@@ -160,24 +173,27 @@ struct StratumListenerOptions {
     int           parked_keepalive_ms = 10000;
     int           max_json_depth = 8;        // login/submit are depth-3 objects; guards the recursive parser
     std::size_t   max_log_lines = 2048;      // bounded log (oldest dropped)
+    std::size_t   max_empty_lines = 64;      // consecutive blank request lines before close
+    std::size_t   max_log_field = 64;        // bytes of a peer-supplied string kept in a log line
     // NET-DOS (see the header note). Every value below is network policy.
     std::uint64_t min_difficulty = 16000;    // a "+diff" request below this is raised to it
-    double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^k / T = 12.8)
+    double        submit_rate = kStratumSubmitRate;      // submits/s per connection, sustained (2 x 2^s / T = 0.2)
     double        submit_burst = kStratumSubmitBurst;    // submits per connection, burst (24)
     std::size_t   max_pending_submits = kStratumSubmitBurst;   // submits queued per connection for verification (= submit_burst)
     int           login_timeout_ms = 5000;   // no login by then: banned (0 = off)
-    int           ban_seconds = kStratumBanSeconds;      // address ban, ceil(submit_burst / submit_rate) = 2 (127.0.0.1 / ::1: closed only)
+    int           ban_seconds = kStratumBanSeconds;      // address ban, ceil(submit_burst / submit_rate) = 120 (127.0.0.1 / ::1: closed only)
     int           bad_share_points = -3;     // low-difficulty or duplicate share
     int           good_share_points = 1;     // accepted share
     int           ban_score = -9;            // banned at or below this score
     int           max_score = 0;             // the score never rises above this
     std::size_t   max_seen_submits = 256;    // (job id, nonce) pairs remembered per connection
     // VARDIFF (policy). Off (the default): the refill is submit_rate. On: the
-    // refill is 2 x S_t, S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / s, s read
-    // from the job's lane target vs the Monero target, S_t clamped at
-    // s = 100 % (0.80/s -> refill 1.6/s); s unknown: submit_rate.
+    // refill is 2 x S_t, S_t = 2^s x n* / t_W, t_W = COVERAGE x 120 / s_pool,
+    // s_pool read from the job's lane target vs the Monero target, S_t clamped
+    // at s_pool = 100 %; s_pool unknown: submit_rate.
     bool          submit_vardiff = false;
     std::uint32_t vardiff_shares_per_window = kXmrVardiffSharesPerWindow;   // n*
+    std::uint32_t min_diff_shift = pbs::kStratumMinDiffShiftDefault;        // s (--stratum-min-diff-shift)
 };
 
 // Point-in-time counters (all monotone since start(), except `active`).
@@ -230,6 +246,7 @@ public:
           m_tap(*this, sink),
           m_server(templates, verifier, m_tap, *this) {
         m_server.set_min_difficulty(m_opts.min_difficulty);   // NET-DOS
+        m_min_diff_effective.store(m_opts.min_difficulty, std::memory_order_relaxed);
         m_submit_rate_effective.store(m_opts.submit_rate, std::memory_order_relaxed);   // VARDIFF: floor until the first tip
     }
 
@@ -251,6 +268,41 @@ public:
     void set_job_binder(::v37::xmr::stratum::XmrStratumServer::JobBinder f) { m_server.set_job_binder(std::move(f)); }
     // FEE DISCLOSURE (see XmrStratumServer::set_login_extra). Call before start().
     void set_login_extra(std::string json_members) { m_server.set_login_extra(std::move(json_members)); }
+
+    // LOGIN HOOK (listener thread): params["login"] and params["pass"] of a
+    // login request; a refusal is answered as an error and the connection
+    // closed; else the session's stated vote. Call before start().
+    struct LoginDecision {
+        std::string refusal;                      // "" = accepted
+        std::optional<std::uint32_t> vote;        // the session's stated vote
+    };
+    using LoginHook = std::function<LoginDecision(const std::string& login, const std::string& pass)>;
+    void set_login_hook(LoginHook h) { m_login_hook = std::move(h); }
+    // LOGIN REPLY HOOK (listener thread): the members added to this login
+    // reply's result, from the session's stated vote. Call before start().
+    using LoginReplyHook = std::function<std::string(const std::optional<std::uint32_t>& vote)>;
+    void set_login_reply_hook(LoginReplyHook h) { m_login_reply_hook = std::move(h); }
+    // SESSION BINDER (listener thread): (extra_nonce, the session's login
+    // address, its stated vote) right before each of its jobs is built (in
+    // place of set_job_binder). Call before start().
+    using SessionBinder =
+        std::function<void(std::uint32_t extra_nonce, const std::string& address, const std::optional<std::uint32_t>& vote)>;
+    void set_session_binder(SessionBinder b) {
+        m_session_binder = std::move(b);
+        m_server.set_job_binder([this](std::uint32_t extra_nonce, const std::string& address) {
+            if (m_session_binder) m_session_binder(extra_nonce, address, m_bind_vote);
+        });
+    }
+
+    // THE STRATUM BUDGET FROM d_at (any thread): the "+diff" floor and the
+    // submit refill (submits per T); applied on the listener thread at the
+    // next template peek. A refill of 0 keeps submit_rate.
+    void set_stratum_budget(std::uint64_t min_diff, std::uint64_t refill_per_t) {
+        m_budget_min_diff.store(min_diff, std::memory_order_relaxed);
+        m_budget_refill.store(refill_per_t, std::memory_order_relaxed);
+        m_budget_dirty.store(true, std::memory_order_release);
+    }
+    std::uint64_t min_difficulty_effective() const { return m_min_diff_effective.load(std::memory_order_relaxed); }
 
     ~StratumListener() override { stop(); }
 
@@ -347,14 +399,10 @@ public:
 
     bool running() const { return m_running.load(std::memory_order_acquire); }
 
-    // R-C (defect 4): WITHDRAW the lane job + refuse new shares. Set when the
-    // settlement ledger DIVERGED (terminal) or the builder lag-gate suspended
-    // lane production: a diverged/lagging node must not keep serving a stale-root
-    // job (template refresh stops but the outstanding job would otherwise linger,
-    // and its shares be accepted -> bounded stale-root submit exposure). Refuses
-    // "submit" for the lane while set; the node's non-lane function stays alive.
-    // Any thread. One-way in practice for divergence (terminal); the lag-gate may
-    // clear it once the finalize cursor catches up.
+    // WITHDRAW the lane job + refuse new shares. Set while the node holds
+    // (HOLD) or the Monero fork fuse is blown (FORK-FUSE): the template stops
+    // and the outstanding job must not linger. Refuses "submit" for the lane
+    // while set; the node's non-lane function stays alive. Any thread.
     //
     // R-C rework-2: the flag alone was only an atomic flip -- nothing was pushed,
     // so a miner kept hashing the withdrawn (stale-root) job. Now the false->true
@@ -495,8 +543,11 @@ private:
         std::string peer;                  // "ip:port" for the log
         std::string rbuf;                  // unframed inbound bytes
         std::string wbuf;                  // unsent outbound bytes (slow reader)
+        std::size_t empty_run = 0;         // consecutive blank lines seen so far
+        std::size_t scan_pos = 0;          // rbuf bytes already scanned for '\n' (partial line)
         std::optional<ParkedLogin> parked; // login waiting for the first template
         std::unique_ptr<strat::XmrStratumSession> session;
+        std::optional<std::uint32_t> vote;  // the session's stated vote (login hook)
         bool        last_reply_error = false;
         std::string last_reply_msg;
         // STRATUM-RESUME: template id of the last job this session was handed
@@ -545,7 +596,7 @@ private:
             m_owner.log("share ACCEPTED height=" + std::to_string(s.height) +
                         " template=" + std::to_string(s.template_id) +
                         " nonce=" + hex_u32(s.nonce) +
-                        " worker='" + s.worker + "'" +
+                        " worker='" + log_clip(s.worker, m_owner.m_opts.max_log_field) + "'" +
                         (s.is_network_block ? " NETWORK-BLOCK" : ""));
             m_inner.on_accepted_share(s);
         }
@@ -609,6 +660,17 @@ private:
         return b;
     }
 
+    // A peer-supplied string for a log line: at most n bytes (then "..."),
+    // control bytes written as '?'.
+    static std::string log_clip(const std::string& s, std::size_t n) {
+        std::string out = s.size() <= n ? s : s.substr(0, n) + "...";
+        for (char& ch : out) {
+            const unsigned char u = static_cast<unsigned char>(ch);
+            if (u < 0x20 || u == 0x7f) ch = '?';
+        }
+        return out;
+    }
+
     // Request id: xmrig sends a JSON number; tolerate a numeric string.
     static std::uint32_t req_id_of(const mj::Value& v) {
         if (v.is_number()) return v.as_u32();
@@ -616,8 +678,8 @@ private:
         return 0;
     }
 
-    // Reject pathologically nested input before it reaches the recursive
-    // minijson parser (which is KAT-grade, not adversarial-hardened).
+    // Pre-check: bracket nesting outside strings at most max_depth. The parser
+    // then applies max_json_depth itself and requires four hex digits after \u.
     static bool depth_ok(std::string_view s, int max_depth) {
         int depth = 0;
         bool in_str = false, esc = false;
@@ -826,20 +888,41 @@ private:
             close_client(cid, std::string("recv failed: ") + std::strerror(errno));
             return;
         }
-        // Drain complete newline-framed requests.
+        // Drain complete newline-framed requests: advance an offset, compact
+        // the buffer once at the end, and resume the '\n' scan of a partial
+        // line where the previous read left it (scan_pos). The line cap counts
+        // the line without its terminating "\n" or "\r\n".
+        std::size_t rpos = 0;
         for (;;) {
             c = live(cid);
             if (!c) return;                          // dispatch closed us
-            const std::size_t nl = c->rbuf.find('\n');
+            const std::size_t nl = c->rbuf.find('\n', std::max(rpos, c->scan_pos));
             if (nl == std::string::npos) {
-                if (c->rbuf.size() > m_opts.max_line_bytes)
+                if (rpos) c->rbuf.erase(0, rpos);
+                c->scan_pos = c->rbuf.size();
+                const std::size_t pend = c->rbuf.size();
+                const std::size_t cr = (pend && c->rbuf.back() == '\r') ? 1 : 0;
+                if (pend - cr > m_opts.max_line_bytes)
                     close_client(cid, "request line too long");
-                break;
+                return;
             }
-            std::string line = c->rbuf.substr(0, nl);
-            c->rbuf.erase(0, nl + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
+            c->scan_pos = 0;
+            std::size_t len = nl - rpos;
+            if (len && c->rbuf[nl - 1] == '\r') --len;   // "\r\n" terminator
+            if (len > m_opts.max_line_bytes) {
+                close_client(cid, "request line too long");
+                return;
+            }
+            std::string line = c->rbuf.substr(rpos, len);
+            rpos = nl + 1;
+            if (line.empty()) {
+                if (++c->empty_run > m_opts.max_empty_lines) {
+                    close_client(cid, "too many empty request lines");
+                    return;
+                }
+                continue;
+            }
+            c->empty_run = 0;
             dispatch(cid, line);
         }
     }
@@ -854,7 +937,7 @@ private:
             return;
         }
         mj::Value req;
-        if (!mj::parse(line, req) || !req.is_object()) {
+        if (!mj::parse(line, req, static_cast<std::size_t>(m_opts.max_json_depth)) || !req.is_object()) {
             m_stats.malformed.fetch_add(1, std::memory_order_relaxed);
             send_line(cid, strat::StratumDialect::build_error(0, "Malformed request"));
             close_client(cid, "malformed JSON");
@@ -868,6 +951,7 @@ private:
         if (method == "login") {
             c->login_seen = true;   // NET-DOS: the login deadline is met by the request (a parked login too)
             const std::string login = params["login"].as_string();
+            const std::string pass  = params["pass"].as_string();
             const std::string agent = params["agent"].as_string();
             if (s.logged_in()) { close_client(cid, "duplicate login"); return; }   // p2pool semantics
             if (c->parked)     { close_client(cid, "login while a login is pending"); return; }
@@ -875,6 +959,15 @@ private:
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Missing login"));
                 close_client(cid, "empty login");
                 return;
+            }
+            if (m_login_hook) {
+                const LoginDecision d = m_login_hook(login, pass);
+                if (!d.refusal.empty()) {
+                    send_line(cid, strat::StratumDialect::build_error(req_id, d.refusal));
+                    close_client(cid, "login refused: " + log_clip(d.refusal, m_opts.max_log_field));
+                    return;
+                }
+                c->vote = d.vote;
             }
             strat::TemplateJob peek;
             const bool suspended = m_lane_suspended.load(std::memory_order_acquire);
@@ -887,7 +980,8 @@ private:
                 c->parked = ParkedLogin{req_id, login, agent, t, t, t};
                 m_stats.parked_logins.fetch_add(1, std::memory_order_relaxed);
                 log("client " + std::to_string(cid) + " login PARKED (" +
-                    (suspended ? "lane suspended" : "no template yet") + ") agent='" + agent + "'");
+                    (suspended ? "lane suspended" : "no template yet") + ") agent='" +
+                    log_clip(agent, m_opts.max_log_field) + "'");
                 return;
             }
             update_submit_rate(peek);   // VARDIFF: retarget the budget to this tip's lane window
@@ -901,14 +995,11 @@ private:
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Unauthenticated"));
                 return;
             }
-            // R-C (defect 4): the lane job is WITHDRAWN (settlement diverged, or the
-            // builder lag-gate suspended production). Refuse the share rather than
-            // serve a stale-root job -- a diverged ledger must not accept a share
-            // that would submit a block committing a stale owed_digest root.
+            // The lane job is WITHDRAWN (HOLD or FORK-FUSE): the share is refused.
             if (m_lane_suspended.load(std::memory_order_acquire)) {
                 m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
                 send_line(cid, strat::StratumDialect::build_error(req_id,
-                    "lane suspended (settlement diverged / builder lag): share refused, job withdrawn"));
+                    "lane suspended: share refused, job withdrawn"));
                 log("client " + std::to_string(cid) + " submit REFUSED: lane suspended (job withdrawn)");
                 return;
             }
@@ -937,7 +1028,7 @@ private:
                 return;
             }
             send_line(cid, strat::StratumDialect::build_status_ok(req_id));
-            if (push_job(s)) m_stats.job_pushes.fetch_add(1, std::memory_order_relaxed);
+            if (Client* cl = live(cid); cl && push_job(*cl)) m_stats.job_pushes.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -971,6 +1062,8 @@ private:
                 log("client " + std::to_string(cid) + " login RE-PARKED: the template source has no job right now");
                 return;
             }
+            if (m_login_reply_hook) m_server.set_login_extra(m_login_reply_hook(c->vote));
+            m_bind_vote = c->vote;
             ok = m_server.handle_login(s, req_id, login);
         }
         if (!ok) {
@@ -981,10 +1074,11 @@ private:
             if (Client* cl = live(cid)) cl->served_tid = probe.template_id;
             m_stats.logins.fetch_add(1, std::memory_order_relaxed);
             const strat::LoginString& ls = s.login();
-            log("client " + std::to_string(cid) + " LOGIN OK address=" + ls.address +
-                " worker='" + ls.worker + "'" +
+            log("client " + std::to_string(cid) + " LOGIN OK address=" +
+                log_clip(ls.address, m_opts.max_log_field) +
+                " worker='" + log_clip(ls.worker, m_opts.max_log_field) + "'" +
                 (ls.custom_diff ? " custom_diff=" + std::to_string(*ls.custom_diff) : "") +
-                " agent='" + agent + "' -> first job sent");
+                " agent='" + log_clip(agent, m_opts.max_log_field) + "' -> first job sent");
         } else {
             // Race: template vanished between the peek and handle_login; the
             // server already answered "No job available" and xmrig will retry.
@@ -1109,13 +1203,14 @@ private:
     //
     // STRATUM-RESUME: the template push passes its template id; a session that
     // already holds that template (served_tid) is not pushed it again (*holds).
-    bool push_job(strat::XmrStratumSession& s) {
+    bool push_job(Client& c) {
         std::lock_guard<std::mutex> g(m_gate_mtx);
         if (m_lane_suspended.load(std::memory_order_acquire)) {
             m_stats.suspended_push_refused.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        m_server.broadcast_job(s);
+        m_bind_vote = c.vote;
+        m_server.broadcast_job(*c.session);
         return true;
     }
     bool push_job(Client& c, std::uint32_t tid, bool* holds) {
@@ -1126,6 +1221,7 @@ private:
                 return false;
             }
             if (tid != 0 && c.served_tid == tid) { *holds = true; return false; }
+            m_bind_vote = c.vote;
             m_server.broadcast_job(*c.session);
         }
         c.served_tid = tid;
@@ -1137,30 +1233,42 @@ private:
         return m_now_fn ? m_now_fn() : std::chrono::steady_clock::now();
     }
 
-    // VARDIFF: the per-connection submit-rate budget refill for `peek` (the
-    // current tip), submits/s. Listener thread; call on every template peek.
+    // The per-connection submit-rate budget refill for `peek` (the current
+    // tip), submits/s, and the budget set from d_at. Listener thread; call on
+    // every template peek.
     void update_submit_rate(const strat::TemplateJob& peek) {
+        if (m_budget_dirty.exchange(false, std::memory_order_acq_rel)) {
+            const std::uint64_t md = m_budget_min_diff.load(std::memory_order_relaxed);
+            if (md != 0) {
+                m_server.set_min_difficulty(md);
+                m_min_diff_effective.store(md, std::memory_order_relaxed);
+            }
+        }
+        const std::uint64_t refill = m_budget_refill.load(std::memory_order_relaxed);
+        const double floor = refill ? double(refill) / double(kXmrTargetIntervalS) : m_opts.submit_rate;
         m_submit_rate_effective.store(
-            m_opts.submit_vardiff ? vardiff_submit_rate(peek.lane_target, peek.mainchain_target)
-                                  : m_opts.submit_rate,
+            m_opts.submit_vardiff ? vardiff_submit_rate(peek.lane_target, peek.mainchain_target, floor) : floor,
             std::memory_order_relaxed);
     }
-    // VARDIFF: 2 x S_t from the tip. s = the pool's share of Monero hashrate =
-    // (D_lane / T) / (D_net / 120), D_lane = MAX_TARGET / lane_target,
-    // D_net = MAX_TARGET / mainchain_target, so s = 120 x mainchain_target /
-    // (T x lane_target). S_t = 2^k x n* / t_W, t_W = COVERAGE x 120 / min(s, 1)
-    // (the clamp is the S_t upper bound at s = 100 %). No lane/Monero target at
-    // the tip (s not computable): the honest-safe floor submit_rate.
-    double vardiff_submit_rate(std::uint64_t lane_target, std::uint64_t mainchain_target) const {
+    // VARDIFF: 2 x S_t from the tip. s_pool = the pool's share of Monero
+    // hashrate = (D_lane / T) / (D_net / 120), D_lane = MAX_TARGET / lane_target,
+    // D_net = MAX_TARGET / mainchain_target, so s_pool = 120 x mainchain_target /
+    // (T x lane_target). S_t = 2^s x n* / t_W, t_W = COVERAGE x 120 /
+    // min(s_pool, 1) (the clamp is the S_t upper bound at s_pool = 100 %); 2^s =
+    // the refill per T / 2. No lane/Monero target at the tip (s_pool not
+    // computable): `floor`.
+    double vardiff_submit_rate(std::uint64_t lane_target, std::uint64_t mainchain_target, double floor) const {
         namespace xc = ::c2pool::v37n::xmr;
-        if (lane_target == 0 || mainchain_target == 0) return m_opts.submit_rate;   // s unknown -> floor
+        if (lane_target == 0 || mainchain_target == 0) return floor;   // s_pool unknown -> floor
         const double s = 120.0 * double(mainchain_target) /
                          (double(xc::kXmrTargetIntervalS) * double(lane_target));
-        if (!(s > 0.0)) return m_opts.submit_rate;                                  // s unknown -> floor
-        const double s_eff = s < 1.0 ? s : 1.0;                                     // clamp at s = 100 %
+        if (!(s > 0.0)) return floor;                                  // s_pool unknown -> floor
+        const double s_eff = s < 1.0 ? s : 1.0;                        // clamp at s_pool = 100 %
         const double t_W = double(xc::kXmrWindowCoverage) * double(xc::kXmrMoneroBlockIntervalS) / s_eff;
-        const double two_k = double(std::uint64_t(1) << xc::kXmrDropsFloorShift);
-        const double S_t = two_k * double(m_opts.vardiff_shares_per_window) / t_W;
+        const std::uint64_t refill = m_budget_refill.load(std::memory_order_relaxed);
+        const double two_s = refill ? double(refill) / double(pbs::kStratumRefillFactor)
+                                    : double(std::uint64_t(1) << m_opts.min_diff_shift);
+        const double S_t = two_s * double(m_opts.vardiff_shares_per_window) / t_W;
         return 2.0 * S_t;
     }
 
@@ -1213,7 +1321,9 @@ private:
                 m_stats.submits_duplicate.fetch_add(1, std::memory_order_relaxed);
                 m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
                 send_line(cid, strat::StratumDialect::build_error(req_id, "Duplicate share"));
-                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+                log("client " + std::to_string(cid) + " submit REJECTED: duplicate (job_id=" +
+                    log_clip(f.job_id, m_opts.max_log_field) + " nonce=" +
+                    log_clip(f.nonce, m_opts.max_log_field) + ")");
                 score_share(cid, false, "duplicate share");
                 return;
             }
@@ -1267,7 +1377,7 @@ private:
         if (m_lane_suspended.load(std::memory_order_acquire)) {   // suspended while it waited in the queue
             m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
             send_line(cid, strat::StratumDialect::build_error(req_id,
-                "lane suspended (settlement diverged / builder lag): share refused, job withdrawn"));
+                "lane suspended: share refused, job withdrawn"));
             return;
         }
         c->last_reply_error = false;
@@ -1280,8 +1390,10 @@ private:
         if (!c) return;
         if (c->last_reply_error) {
             m_stats.rejected_submits.fetch_add(1, std::memory_order_relaxed);
-            log("client " + std::to_string(cid) + " submit REJECTED: " + c->last_reply_msg +
-                " (job_id=" + f.job_id + " nonce=" + f.nonce + ")");
+            log("client " + std::to_string(cid) + " submit REJECTED: " +
+                log_clip(c->last_reply_msg, m_opts.max_log_field) +
+                " (job_id=" + log_clip(f.job_id, m_opts.max_log_field) +
+                " nonce=" + log_clip(f.nonce, m_opts.max_log_field) + ")");
             if (c->last_reply_msg == strat::submit_error_message(strat::SubmitError::LowDiff))
                 score_share(cid, false, "low difficulty share");
         } else {
@@ -1309,6 +1421,13 @@ private:
     SinkTap                  m_tap;
     strat::XmrStratumServer  m_server;
     TemplateHook             m_hook;
+    LoginHook                m_login_hook;           // set before start()
+    LoginReplyHook           m_login_reply_hook;     // set before start()
+    SessionBinder            m_session_binder;       // set before start()
+    std::optional<std::uint32_t> m_bind_vote;        // listener thread: the vote of the session whose job is built
+    std::atomic<std::uint64_t> m_budget_min_diff{0}, m_budget_refill{0};   // set_stratum_budget (0 = not set)
+    std::atomic<bool>        m_budget_dirty{false};
+    std::atomic<std::uint64_t> m_min_diff_effective{0};
 
     int                      m_listen_fd = -1;
     int                      m_wake[2] = {-1, -1};

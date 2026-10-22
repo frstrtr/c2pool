@@ -489,7 +489,23 @@ void test_out_of_order_push_connects() {
     b2.block_blob = from_hex(REGTEST_BLOCK_2_HEX);
     kat::check(!b1.block_blob.empty() && !b2.block_blob.empty(), "the two blobs decode");
 
-    // Out of order, exactly as the wire delivered them: the child first.
+    // Out of order, exactly as the wire delivered them: the child first. Pushed unasked it is refused with no
+    // strike; the chain request names both, and the child, an answer now, is parked.
+    const native::OfferResult r2u = index.offer_block(nullptr, b2, /*own_mined=*/false);
+    kat::checkf(r2u.outcome == native::OfferOutcome::Rejected && !r2u.peer_fault,
+                "an unasked block whose parent is unknown is refused with no strike (got %s)",
+                native::to_string(r2u.outcome));
+    {
+        native::EvaluatedBlock ev;
+        std::string why;
+        const bool ok1 = native::evaluate_block(b1, ev, why) == native::EvalStatus::Ok;
+        ChainEntry e;
+        e.ids = {index.tip()->id, ev.input.identity.id, r2u.id};
+        e.start_height = 0;
+        e.total_height = 3;
+        index.on_chain_entry(peer("127.0.0.1:18080", 1), std::move(e));
+        kat::check(ok1, "the parent's id is read");
+    }
     const native::OfferResult r2 = index.offer_block(nullptr, b2, /*own_mined=*/false);
     kat::checkf(r2.outcome == native::OfferOutcome::ParkedOrphan,
                 "a block whose parent is unknown is parked (got %s)",

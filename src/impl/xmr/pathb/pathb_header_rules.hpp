@@ -10,10 +10,15 @@
 //
 //   S2.3 #9 (every receipt) and S1.3 #7 (carriers), one rule set, STRIKE:
 //     major == hf_version(h)                    (hf_version_for_height on the lane's network)
+//     vote(minor) >= hf_version(h)              (vote(m) = m, minor 0 counts as 1; E-48)
 //     timestamp >= median60(P_r branch)         (pathb_branch.hpp timestamp_median_for_child;
 //                                                no median below 60 blocks: the rule does not apply)
 //     n_tx <= floor(2 Z(P_r) / w_min); D == floor(log2(n_tx + 1 + X(hf)))
 //     body length <= RECEIPT_CAP(hf, P_r)
+//   The floor reading (operator ruling): where the node holds P_r verified on its branch without its weight state,
+//   Z and Z_lt read Monero's floor min_block_weight(hf of a child of P_r), a lower bound of both medians; a receipt
+//   inside the floor's size bounds passes, one outside them is SizeUndecided: DEFER (MissingWeights), never STRIKE
+//   or BAN; the exact weights decide it. Only these two size rules read the floor.
 //   No clock input: a timestamp ahead of local time is not judged here (the
 //   future bound is relay policy P-29).
 //
@@ -43,17 +48,23 @@ namespace c2pool::xmr::pathb {
 enum class HeaderFault : std::uint8_t {
     None,
     MajorVersion,          // major != hf_version(h)
+    MinorVote,             // vote(minor) < hf_version(h), minor 0 counting as 1
     TimestampBelowMedian,  // timestamp < median60(P_r branch)
     TxCount,               // n_tx above floor(2 Z(P_r) / w_min), or no miner tx
     Depth,                 // D != floor(log2(n_tx + 1 + X(hf)))
     OverCap,               // body length above RECEIPT_CAP(hf, P_r)
+    SizeUndecided,         // the floor reading: n_tx or the length above the floor's bounds (DEFER, MissingWeights)
 };
 
-// The two header rules. `hf`: the version Monero requires at the receipt's
+// Monero's block vote: the minor version, 0 counting as 1.
+inline constexpr std::uint64_t block_vote(std::uint64_t minor) noexcept { return minor == 0 ? 1 : minor; }
+
+// The header rules. `hf`: the version Monero requires at the receipt's
 // height; `median60`: empty when the branch is below 60 blocks.
 inline constexpr HeaderFault header_rules(const HashingBlob& b, std::uint8_t hf,
                                           std::optional<std::uint64_t> median60) noexcept {
     if (b.major != hf) return HeaderFault::MajorVersion;
+    if (block_vote(b.minor) < hf) return HeaderFault::MinorVote;
     if (median60.has_value() && b.timestamp < *median60) return HeaderFault::TimestampBelowMedian;
     return HeaderFault::None;
 }
@@ -64,7 +75,31 @@ struct HeaderInputs {
     std::optional<std::uint64_t> median60;  // timestamp_median_for_child(P_r)
     std::uint64_t z = 0;                    // Z(P_r): the n_tx rule
     std::uint64_t z_lt = 0;                 // Z_lt(P_r): RECEIPT_CAP
+    bool floor = false;                     // z and z_lt are Monero's floor (lower bounds), not P_r's exact values
 };
+
+// The floor reading (operator ruling): Monero floors the effective median at min_block_weight(hf) of the child's
+// version and the long-term median at ZONE_V5; for hf 5..16 both equal the lane's zone(hf).
+inline constexpr bool floor_matches_zone(std::uint8_t lo, std::uint8_t hi) noexcept {
+    for (std::uint8_t hf = lo; hf <= hi; ++hf)
+        if (::c2pool::xmr::native::min_block_weight(hf) != zone(hf)
+            || ::c2pool::xmr::native::min_block_weight(hf) != CRYPTONOTE_BLOCK_GRANTED_FULL_REWARD_ZONE_V5)
+            return false;
+    return true;
+}
+static_assert(floor_matches_zone(5, 16), "the floor reading: min_block_weight(hf) == zone(hf) == ZONE_V5 for hf 5..16");
+// FORK-FUSE: hf 17 (zone(17) = ZONE_V17, min_block_weight(17) = ZONE_V5) stays unimplemented until the two are aligned.
+static_assert(::c2pool::xmr::native::MAX_IMPLEMENTED_HF_VERSION < HF_VERSION_FCMP_PLUS_PLUS
+                      || floor_matches_zone(HF_VERSION_FCMP_PLUS_PLUS, HF_VERSION_FCMP_PLUS_PLUS),
+              "the floor reading: align min_block_weight and zone() at hf 17 before it is implemented");
+
+// The header inputs of a P_r held verified without its weight state, for a child of version `hf`: Z = Z_lt = the
+// floor; nullopt at a version FORK-FUSE refuses (hf >= 17) or below the V5 zone.
+inline constexpr std::optional<HeaderInputs> header_inputs_floor(std::uint8_t hf, std::optional<std::uint64_t> median60) noexcept {
+    if (hf < 5 || hf > ::c2pool::xmr::native::MAX_IMPLEMENTED_HF_VERSION) return std::nullopt;
+    const std::uint64_t f = ::c2pool::xmr::native::min_block_weight(hf);
+    return HeaderInputs{hf, median60, f, f, true};
+}
 
 // #9 / #7: the header rules, then the size rules, then the consensus cap.
 // `body_bytes` is the length of the body as received.
@@ -72,16 +107,18 @@ inline HeaderFault header_fields(const ReceiptBodyV3& r, std::uint64_t body_byte
     if (const HeaderFault f = header_rules(r.blob, in.hf, in.median60); f != HeaderFault::None) return f;
     switch (receipt_size_rules(in.hf, in.z, r.blob.tx_count, r.branch.size())) {
         case SizeRule::Ok: break;
-        case SizeRule::TxCount: return HeaderFault::TxCount;
-        case SizeRule::Depth: return HeaderFault::Depth;
+        case SizeRule::TxCount:  // on the floor: no miner tx is exact; n_tx above the floor's bound waits for Z(P_r)
+            return in.floor && r.blob.tx_count >= kMinerTxCount ? HeaderFault::SizeUndecided : HeaderFault::TxCount;
+        case SizeRule::Depth: return HeaderFault::Depth;  // reads no Z
     }
-    if (!within_receipt_cap(in.hf, in.z_lt, body_bytes)) return HeaderFault::OverCap;
+    if (!within_receipt_cap(in.hf, in.z_lt, body_bytes)) return in.floor ? HeaderFault::SizeUndecided : HeaderFault::OverCap;
     return HeaderFault::None;
 }
 
-// The verdict of #9 / #7: none when the row passes, else STRIKE.
+// The verdict of #9 / #7: none when the row passes, DEFER when the floor leaves a size rule undecided, else STRIKE.
 inline constexpr std::optional<AdmitVerdict> header_fields_verdict(HeaderFault f) noexcept {
     if (f == HeaderFault::None) return std::nullopt;
+    if (f == HeaderFault::SizeUndecided) return AdmitVerdict::Defer;
     return AdmitVerdict::Strike;
 }
 

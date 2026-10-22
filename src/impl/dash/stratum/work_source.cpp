@@ -937,8 +937,9 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
     // run the embedded arm. Even when enabled, the NodeCoinState viability gate
     // (SML+quorum fresh at the tip, non-superblock, credit-pool seed height at
     // tip, bestCL fresh) fails safe to the fallback, so no invalid template mines.
-    // The DASH v36 network (set_dashd_templates_only) never serves the
-    // embedded arm: its templates come from dashd only.
+    // set_dashd_templates_only (the DASH v36 network with a dashd RPC arm, or
+    // with no work source at all) never serves the embedded arm. A daemonless
+    // v36 node leaves it OFF and serves the embedded arm like the public profile.
     const bool embedded_arm_enabled =
         (is_testnet_ || embedded_mainnet_) && !dashd_templates_only_;
     try {

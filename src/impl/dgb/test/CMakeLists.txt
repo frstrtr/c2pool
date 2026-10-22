@@ -24,7 +24,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
     # which rejected new == floor(0.6*total) when 60*total is not a multiple of
     # 100. Pure-helper boundary KAT. Same folding rule.
-    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp)
+    #
+    # self_connection_ban_test.cpp (#1716 part B): drives the REAL
+    # dgb::NodeImpl::handle_version self-nonce arm over a REAL accepted socket
+    # on 127.0.0.2 and pins the host ban, banscore^2 escalation and hourly
+    # forgiveness. Same folding rule.
+    #
+    # known_txs_evict_wiring_test.cpp (D-DGB.EVICT): m_known_txs stays bounded
+    # at m_max_known_txs over N shares via the clean_tracker IO-phase evictor,
+    # plus a node.cpp source guard (reads DGB_NODE_SRC) that the live call
+    # exists. RED on the pre-fix tree. Same folding rule.
+    add_executable(dgb_share_test share_test.cpp known_txs_retention_test.cpp broadcast_gate_test.cpp race913_lock_guard_test.cpp share_remove_owns_data_test.cpp sharechain_bootstrap_test.cpp restart_reorg_supersede_test.cpp legacy_addrme_self_probe_test.cpp mint_follows_autoratchet_test.cpp version_switch_floor_test.cpp self_connection_ban_test.cpp known_txs_evict_wiring_test.cpp)
     target_link_libraries(dgb_share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
@@ -755,6 +765,25 @@ if (BUILD_TESTING AND GTest_FOUND)
         c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
         dgb_coin pool sharechain)
     gtest_add_tests(dgb_aux_doge_dc_proof_test "" AUTO)
+
+    # --- DGB+DOGE (phase DA) -- "one parent per DOGE block" AuxPoW invariant ----
+    # Pins the core merged-mining consensus invariant this deployment rests on: a
+    # DOGE block is merge-mined under EXACTLY ONE parent (DGB here -- a SEPARATE
+    # deployment from canonical LTC+DOGE, never both). Structural (static_assert:
+    # one CPureBlockHeader + one DGB-typed CMerkleTx, two parents unrepresentable)
+    # plus a parse round-trip (one recovered DGB parent coinbase + header, re-parse
+    # idempotent). Distinct from the dual-target (fire) and dc_proof (byte-parity)
+    # siblings. Links ltc_coin like them -- the -DAUX_DOGE consumption path couples
+    # to ltc by design. Test-only; consumes the shared module, modifies nothing.
+    # MUST appear in BOTH this registration AND the build.yml --target allowlist.
+    add_executable(dgb_aux_one_parent_invariant_test aux_one_parent_invariant_test.cpp)
+    target_compile_definitions(dgb_aux_one_parent_invariant_test PRIVATE AUX_DOGE)
+    target_link_libraries(dgb_aux_one_parent_invariant_test PRIVATE
+        GTest::gtest_main GTest::gtest
+        core dgb ltc_coin
+        c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage
+        dgb_coin pool sharechain)
+    gtest_add_tests(dgb_aux_one_parent_invariant_test "" AUTO)
 
     # --- DGB+DOGE (M3) -- bind_aux_doge_parsers() PRODUCTION-binding KAT --------
     # Proves the production dgb node seam coin/node.hpp's bind_aux_doge_parsers()

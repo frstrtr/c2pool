@@ -19,7 +19,16 @@
 //   (5) a child below height 60 has no median: the rule does not apply;
 //   (6) a missing block of the 60 -> Defer naming its id;
 //   (7) through header_fields: the header rules run before the size rules
-//       and the cap; the verdict is STRIKE with one strike token.
+//       and the cap; the verdict is STRIKE with one strike token;
+//   (8) the vote rule (E-48): vote(minor) >= hf_version(h), minor 0 counting
+//       as 1: at hf 16 minor 0 and 15 refused (STRIKE), 16 and 17 admitted;
+//       at hf 1 minor 0 admitted (it votes 1);
+//   (9) the floor reading (operator ruling): P_r held without its weights
+//       reads Z = Z_lt = min_block_weight(hf) (300,000 at hf 16; none at
+//       hf 17); n_tx or a length above the floor's bounds is undecided
+//       (DEFER), the exact weights decide it; on a shared vector set the
+//       floor node gives the exact node's verdict or DEFERs, never a STRIKE
+//       the exact node would not give.
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
@@ -112,6 +121,28 @@ int main() {
         check(pb::header_fields_verdict(pb::HeaderFault::MajorVersion) == pb::AdmitVerdict::Strike
                       && pb::strike_tokens(pb::AdmitVerdict::Strike) == 1,
               "a wrong major is STRIKE (one token)");
+    }
+
+    // (8) the vote rule
+    {
+        const auto with_minor = [](std::uint64_t major, std::uint64_t minor) {
+            pb::HashingBlob b = blob(major, kBase);
+            b.minor = minor;
+            return b;
+        };
+        check(pb::block_vote(0) == 1 && pb::block_vote(1) == 1 && pb::block_vote(16) == 16, "vote(0) = 1, vote(m) = m");
+        check(pb::header_rules(with_minor(16, 0), 16, std::nullopt) == pb::HeaderFault::MinorVote,
+              "vote: minor 0 at hf 16 refused (votes 1)");
+        check(pb::header_rules(with_minor(16, 15), 16, std::nullopt) == pb::HeaderFault::MinorVote,
+              "vote: minor 15 at hf 16 refused");
+        check(pb::header_rules(with_minor(16, 16), 16, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 16 at hf 16 admitted");
+        check(pb::header_rules(with_minor(16, 17), 16, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 17 at hf 16 admitted");
+        check(pb::header_rules(with_minor(1, 0), 1, std::nullopt) == pb::HeaderFault::None,
+              "vote: minor 0 at hf 1 admitted");
+        check(pb::header_fields_verdict(pb::HeaderFault::MinorVote) == pb::AdmitVerdict::Strike,
+              "vote: a refused vote is STRIKE");
     }
 
     // Branches: main 0..200 at kBase + 120 h; side 151..200 on main 150 at kBase + 120 h + kSideShift.
@@ -212,6 +243,70 @@ int main() {
         pb::ReceiptBodyV3 depth = r;
         depth.branch.push_back(seq32(0x98));
         check(pb::header_fields(depth, enc(depth).size(), in) == pb::HeaderFault::Depth, "#9: wrong D STRIKE");
+    }
+
+    // (9) the floor reading (operator ruling): P_r held verified without its weights reads Monero's floor
+    {
+        const std::optional<pb::HeaderInputs> f16 = pb::header_inputs_floor(16, m_main);
+        check(f16 && f16->hf == 16 && f16->z == 300000 && f16->z_lt == 300000 && f16->floor && f16->median60 == m_main
+                      && !pb::header_inputs_floor(17, m_main) && !pb::header_inputs_floor(4, m_main),
+              "the floor: Z = Z_lt = min_block_weight(hf) = 300,000 at hf 16; none at hf 17 (FORK-FUSE) or below hf 5");
+        check(pb::max_tx_count(300000) == 411, "the floor's n_tx bound at hf 16: 411 (2 x 300,000 / w_min)");
+        // n_tx - 1 = 412: above the floor's bound
+        pb::ReceiptBodyV3 band = make_body(8, false, 5);
+        band.blob.major = 16;
+        band.blob.timestamp = expect_main;
+        band.blob.tx_count = 413;  // D 8
+        const std::uint64_t blen = enc(band).size();
+        const pb::HeaderInputs ex1{16, m_main, 300000, 300000}, ex2{16, m_main, 600000, 600000};
+        const pb::HeaderFault ff = pb::header_fields(band, blen, *f16);
+        check(ff == pb::HeaderFault::SizeUndecided && pb::header_fields_verdict(ff) == pb::AdmitVerdict::Defer,
+              "the floor: 413 transactions (above 411 + 1) is undecided: DEFER, never STRIKE");
+        check(pb::header_fields(band, blen, ex1) == pb::HeaderFault::TxCount && pb::header_fields(band, blen, ex2) == pb::HeaderFault::None,
+              "the exact weights decide it: STRIKE at Z = 300,000, PASS at Z = 600,000");
+        // a length above RECEIPT_CAP at the floor
+        const std::uint64_t cap = pb::receipt_cap(16, 300000).value_or(0);
+        pb::ReceiptBodyV3 small = make_body(2, false, 5);
+        small.blob.major = 16;
+        small.blob.timestamp = expect_main;
+        small.blob.tx_count = 6;
+        check(cap > 0 && pb::header_fields(small, cap + 1, *f16) == pb::HeaderFault::SizeUndecided
+                      && pb::header_fields(small, cap + 1, ex1) == pb::HeaderFault::OverCap
+                      && pb::header_fields(small, cap, *f16) == pb::HeaderFault::None,
+              "the floor: a length above RECEIPT_CAP(16, floor) is undecided (exact: STRIKE at the zone); at the cap PASS");
+        check(pb::header_fields(small, 0, pb::HeaderInputs{16, m_main, 300000, 300000, true}) == pb::HeaderFault::None,
+              "the floor: a receipt inside the floor's bounds passes");
+        // a shared vector set: the floor node's verdict equals the exact node's, or it DEFERs; it never STRIKEs where
+        // the exact node passes, and at Z = the zone it differs only by DEFERring an exact size STRIKE
+        int same = 0, deferred = 0, bad = 0;
+        const std::uint64_t txs[] = {0, 1, 2, 6, 100, 412, 413, 800, 5000};
+        const std::uint64_t zs[] = {300000, 450000, 600000, 3000000};
+        for (const std::uint64_t n : txs)
+            for (const int dshift : {0, 1})
+                for (const std::uint64_t major : {16u, 15u})
+                    for (const std::uint64_t z : zs)
+                        for (const std::uint64_t len : {std::uint64_t{0}, cap, cap + 1, 4 * cap}) {
+                            const std::uint64_t d = (n == 0 ? 0 : pb::receipt_depth_for(16, n)) + dshift;
+                            pb::ReceiptBodyV3 r = make_body(d, false, 5);
+                            r.blob.major = major;
+                            r.blob.timestamp = expect_main;
+                            r.blob.tx_count = n;
+                            const pb::HeaderFault e = pb::header_fields(r, len, pb::HeaderInputs{16, m_main, z, z});
+                            const pb::HeaderFault fl = pb::header_fields(r, len, *f16);
+                            if (fl == e) {
+                                ++same;
+                            } else if (fl == pb::HeaderFault::SizeUndecided) {
+                                ++deferred;
+                                if (z == 300000 && e != pb::HeaderFault::TxCount && e != pb::HeaderFault::OverCap
+                                    && e != pb::HeaderFault::Depth)
+                                    ++bad;
+                            } else {
+                                ++bad;
+                            }
+                        }
+        check(bad == 0 && same > 0 && deferred > 0,
+              "the floor and the exact node: " + std::to_string(same) + " vectors the same verdict, " +
+                      std::to_string(deferred) + " DEFERred on the floor, 0 differing otherwise (" + std::to_string(bad) + ")");
     }
 
     return finish("v37_xmr_receipt_header_rules_kat");

@@ -15,13 +15,15 @@ report, and exits non-zero on any NEW violation:
   * a pull request that touches consensus paths without a "Canon:" line in its
     body, or that names an unknown rule, without a "KAT:" line naming
     registered tests (rule C31), or without a "Design:" line naming a
-    reference (rule C40) (only with --pr-body);
+    reference (rule C40), or without a "Conformance:" line (rule C47) (only
+    with --pr-body);
   * a register that does not match the canon (rule C09).
 
 It also reports what can be tightened: a deviation whose rules all pass now
 (close it in the register), a forbidden count below the baseline (lower the
 baseline with --write-baseline), and a check that failed in the baseline and
-passes now.
+passes now. A deviation is closable only when every rule it maps to passes,
+including the rule's in_force check, and not on KAT presence alone.
 
 Python 3 standard library only. The repository does not use PyYAML, so
 CANON.yaml is read by the small YAML subset parser below; --selftest compares
@@ -817,6 +819,38 @@ def parse_design_line(body):
     return True, refs, "Design: %s" % ", ".join(refs)
 
 
+CONFORMANCE_LINE_RE = re.compile(r"^[ \t>*_-]*Conformance:[ \t]*(.+?)[ \t*_]*$", re.M)
+
+
+def parse_conformance_line(body, register):
+    """Returns (ok, ids, message). Rule C47: a 'Conformance:' line names at
+    least one invariant id (the:INV-nn) and 'departures: none' or the D rows it
+    departs under; every named D row is in the register with status open; the
+    token UNRULED fails."""
+    m = CONFORMANCE_LINE_RE.search(body or "")
+    if not m:
+        return False, [], "no 'Conformance:' line in the PR body"
+    val = m.group(1).strip()
+    if re.search(r"\bUNRULED\b", val):
+        return False, [], "the 'Conformance:' line carries UNRULED"
+    invs = re.findall(r"\bthe:INV-[0-9]+\b", val)
+    if not invs:
+        return False, [], "the 'Conformance:' line names no invariant id (the:INV-nn)"
+    d = re.search(r"\bdepartures:[ \t]*(.*)$", val, re.I)
+    if not d:
+        return False, invs, "the 'Conformance:' line has no 'departures:' part"
+    dep = d.group(1).strip()
+    if re.match(r"^none\b", dep, re.I):
+        return True, invs, "Conformance: %s; departures: none" % ", ".join(invs)
+    rows = re.findall(r"\bD[0-9]+\b", dep)
+    if not rows:
+        return False, invs, "'departures:' is neither 'none' nor a list of D rows"
+    bad = [x for x in rows if (register or {}).get(x, {}).get("state") not in OPEN_WORDS]
+    if bad:
+        return False, invs + rows, "departure row(s) not open in the register: %s" % ", ".join(bad)
+    return True, invs + rows, "Conformance: %s; departures: %s" % (", ".join(invs), ", ".join(rows))
+
+
 def check_pr_body(tree, canon, canon_dir, chk, ctx):
     if ctx.pr_body is None:
         return {"status": "n/a", "detail": "no --pr-body given"}
@@ -833,6 +867,8 @@ def check_pr_body(tree, canon, canon_dir, chk, ctx):
         ok, ids, msg = parse_kat_line(ctx.pr_body, set(ctx.tests(tree)))
     elif line == "Design":
         ok, ids, msg = parse_design_line(ctx.pr_body)
+    elif line == "Conformance":
+        ok, ids, msg = parse_conformance_line(ctx.pr_body, ctx.register)
     else:
         raise CanonError("check %s: unknown pr_body line %r" % (chk.get("name"), line))
     return {"status": "pass" if ok else "fail", "detail": msg, "touched": touched[:20], "named": ids}
@@ -848,6 +884,7 @@ class Ctx:
         self.pr_body = pr_body
         self.changed_files = changed_files
         self.rule_ids = set()
+        self.register = {}
         self._tests = None
         self._targets = False
 
@@ -881,6 +918,7 @@ def run(tree, canon, canon_dir, register, baseline, ctx):
     if not rules:
         raise CanonError("CANON.yaml has no rules")
     ctx.rule_ids = {r.get("id") for r in rules}
+    ctx.register = register
     results, new, notes = [], [], []
     seen = set()
     for r in rules:
@@ -920,7 +958,10 @@ def run(tree, canon, canon_dir, register, baseline, ctx):
                 c = {"status": "pending"}
             else:
                 raise CanonError("rule %s check %s: unknown type %r" % (rid, name, typ))
+            if chk.get("in_force") and typ != "required":
+                raise CanonError("rule %s check %s: an in_force check is of type required" % (rid, name))
             c["name"], c["type"] = name, typ
+            c["in_force"] = bool(chk.get("in_force"))
             res["checks"].append(c)
         results.append(res)
 
@@ -995,15 +1036,24 @@ def run(tree, canon, canon_dir, register, baseline, ctx):
         for m in res["new"]:
             new.append("%s %s" % (rid, m))
 
+    # Closability: every rule the deviation maps to passes, including its
+    # in_force check (an in_force check is an ordinary check of the rule), and
+    # at least one passing check is not a required_kat: KAT presence alone
+    # never closes a deviation.
     closable = []
     for did, row in sorted(register.items(), key=lambda kv: int(kv[0][1:])):
         if row["state"] not in OPEN_WORDS:
             continue
         mapped = [x for x in results if did in x["deviations"]]
-        if mapped and all(x["status"] == "pass" for x in mapped):
-            closable.append(did)
-            notes.append("%s: every rule it maps to (%s) passes now; close it in the register with the closing PR" % (
-                did, ", ".join(x["id"] for x in mapped)))
+        if not mapped or not all(x["status"] == "pass" for x in mapped):
+            continue
+        if all(c["type"] == "required_kat" for x in mapped for c in x["checks"] if c["status"] == "pass"):
+            notes.append("%s: the rules it maps to (%s) pass on KAT presence only; KAT presence alone never closes "
+                         "a deviation" % (did, ", ".join(x["id"] for x in mapped)))
+            continue
+        closable.append(did)
+        notes.append("%s: every rule it maps to (%s) passes now; close it in the register with the closing PR" % (
+            did, ", ".join(x["id"] for x in mapped)))
     return results, new, notes, closable
 
 
@@ -1157,6 +1207,17 @@ def selftest(canon_path):
     ok(not parse_design_line("Design: none")[0], "design line none without reason")
     ok(not parse_design_line("Design: see the design")[0], "design line without a reference")
     ok(not parse_design_line("no line")[0], "design line missing")
+    reg = {"D36": {"state": "open"}, "D5": {"state": "rejected"}}
+    ok(parse_conformance_line("x\nConformance: the:INV-12, the:INV-16; departures: none\n", reg)[1] ==
+       ["the:INV-12", "the:INV-16"], "conformance line none")
+    ok(parse_conformance_line("Conformance: the:INV-11; departures: D36", reg)[0], "conformance line open row")
+    ok(not parse_conformance_line("Conformance: the:INV-11; departures: D5", reg)[0], "conformance line closed row")
+    ok(not parse_conformance_line("Conformance: the:INV-11; departures: D99", reg)[0], "conformance line unknown row")
+    ok(not parse_conformance_line("Conformance: the:INV-11 UNRULED; departures: none", reg)[0],
+       "conformance line UNRULED")
+    ok(not parse_conformance_line("Conformance: departures: none", reg)[0], "conformance line without INV id")
+    ok(not parse_conformance_line("Conformance: the:INV-11", reg)[0], "conformance line without departures")
+    ok(not parse_conformance_line("no line", reg)[0], "conformance line missing")
     cm = ("set(L a_kat b_kat)\nforeach(k IN LISTS L)\n  add_test(NAME ${k} COMMAND ${k})\nendforeach()\n"
           "foreach(z c_kat d_kat)\n add_test(NAME ${z} COMMAND ${z})\nendforeach()\n"
           "add_test(NAME e_kat COMMAND e_bin --x) # add_test(NAME f_kat COMMAND f)\n")
@@ -1186,6 +1247,25 @@ def selftest(canon_path):
             print("selftest: CANON.yaml parsed identically by the subset parser and PyYAML %s" % yaml.__version__)
         except ImportError:
             print("selftest: PyYAML not installed; subset parser only")
+        # Multi-line patterns: the C43 journal-not-in-digest check is scoped to
+        # the body of lane_params_digest; the field may sit on any body line.
+        hit = ("inline bytes32 lane_params_digest(const P& p, u64 d, u8 n = 0) {\n"
+               "    std::vector<u8> b;\n"
+               "    le::put64(b, p.half_life); le::put64(b, p.journal_depth);\n"
+               "    return sha(b);\n}\n")
+        miss = ("inline bytes32 lane_params_digest(const P& p) {\n    le::put64(b, p.window);\n    return sha(b);\n}\n"
+                "u64 journal_depth = 64;\nauto x = lane_params_digest(p); u64 y = p.journal_depth;\n")
+        for r in (mine or {}).get("rules") or []:
+            for chk in r.get("checks") or []:
+                if r.get("id") == "C43" and chk.get("name") == "journal-not-in-digest":
+                    rx = _compile(chk)
+                    ok(len(list(rx.finditer(strip_c_comments(hit)))) == 1, "C43 pattern: field on a body line")
+                    ok(not list(rx.finditer(strip_c_comments(miss))), "C43 pattern: field outside the body")
+                if chk.get("in_force"):
+                    rx = _compile(chk)
+                    ok(rx.search('#include "impl/xmr/pathb/pathb_node.hpp"\n'), "%s in_force: include" % r.get("id"))
+                    ok(not rx.search('// #include "impl/xmr/pathb/pathb_node.hpp"\n'),
+                       "%s in_force: commented include" % r.get("id"))
     for f in fails:
         print("SELFTEST FAIL: %s" % f)
     print("selftest: %s" % ("FAIL" if fails else "ok"))

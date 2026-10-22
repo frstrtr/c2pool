@@ -28,7 +28,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
 #include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
-#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: dashd templates only)
+#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
 
 #include <core/stratum_work_source.hpp>
@@ -4103,32 +4103,42 @@ TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// The DASH v36 network takes mining work from dashd getblocktemplate only.
+// Where the DASH v36 network takes its mining work from.
 //
 // A v36 share commits the template's txs through the coinbase merkle_link and
-// the finder assembles the won block from the bodies dashd served, so the v36
-// network must not serve embedded (daemonless) templates to miners yet, and
-// without a dashd RPC arm it serves no mining work at all. The public profile
-// is unchanged.
+// the finder assembles the won block from the bodies it served. With a dashd
+// RPC arm the work comes from dashd getblocktemplate only; without one the
+// embedded (daemonless) arm serves it when eligible; with neither there is no
+// mining work at all. The public profile is unchanged.
 // ═════════════════════════════════════════════════════════════════════════════
 
 TEST(DashV36WorkPolicy, ResolveV36WorkPolicy)
 {
     using dash::coin::resolve_v36_work_policy;
     for (bool rpc : {false, true}) {
-        const auto pub = resolve_v36_work_policy(/*v36_network=*/false, rpc);
-        EXPECT_FALSE(pub.dashd_templates_only) << "public profile unchanged (rpc=" << rpc << ")";
-        EXPECT_TRUE(pub.serve_stratum);
-        EXPECT_STREQ(pub.reason, "public-profile");
+        for (bool emb : {false, true}) {
+            const auto pub = resolve_v36_work_policy(/*v36_network=*/false, rpc, emb);
+            EXPECT_FALSE(pub.dashd_templates_only)
+                << "public profile unchanged (rpc=" << rpc << " emb=" << emb << ")";
+            EXPECT_TRUE(pub.serve_stratum);
+            EXPECT_STREQ(pub.reason, "public-profile");
+        }
     }
-    const auto with_rpc = resolve_v36_work_policy(true, true);
-    EXPECT_TRUE(with_rpc.dashd_templates_only);
-    EXPECT_TRUE(with_rpc.serve_stratum);
-    EXPECT_STREQ(with_rpc.reason, "v36-network-dashd-templates");
-    const auto no_rpc = resolve_v36_work_policy(true, false);
-    EXPECT_TRUE(no_rpc.dashd_templates_only);
-    EXPECT_FALSE(no_rpc.serve_stratum) << "no dashd RPC arm -> no mining work on the v36 network";
-    EXPECT_STREQ(no_rpc.reason, "v36-network-requires-coin-rpc");
+    for (bool emb : {false, true}) {
+        const auto with_rpc = resolve_v36_work_policy(true, true, emb);
+        EXPECT_TRUE(with_rpc.dashd_templates_only) << "dashd RPC armed wins (emb=" << emb << ")";
+        EXPECT_TRUE(with_rpc.serve_stratum);
+        EXPECT_STREQ(with_rpc.reason, "v36-network-dashd-templates");
+    }
+    const auto embedded = resolve_v36_work_policy(true, false, true);
+    EXPECT_FALSE(embedded.dashd_templates_only)
+        << "no dashd RPC arm, embedded arm eligible -> embedded templates on the v36 network";
+    EXPECT_TRUE(embedded.serve_stratum);
+    EXPECT_STREQ(embedded.reason, "v36-network-embedded-templates");
+    const auto none = resolve_v36_work_policy(true, false, false);
+    EXPECT_TRUE(none.dashd_templates_only);
+    EXPECT_FALSE(none.serve_stratum) << "no work source -> no mining work on the v36 network";
+    EXPECT_STREQ(none.reason, "v36-network-requires-coin-rpc");
 }
 
 // Testnet with a populated, viable coin-state serves the EMBEDDED template
@@ -4187,4 +4197,69 @@ TEST(DashV36WorkPolicy, DashdTemplatesOnlyDeclinesEmbeddedArm)
     ASSERT_FALSE(pt.empty());
     EXPECT_NE(pt.value("previousblockhash", ""), std::string(kPrevHashHex));
     EXPECT_EQ(pub.get_work(job_in).source, dash::coin::WorkSource::Embedded);
+}
+
+// The daemonless v36 node: no dashd RPC arm, so the fallback is the unarmed
+// empty DashWorkData (main_dash.cpp binds no GBT fetch without --coin-rpc).
+// With the embedded arm eligible the policy leaves set_dashd_templates_only
+// OFF, so the work source serves the embedded template and freezes its bodies
+// for the v36 finder. With the arm ineligible the policy turns the flag ON and
+// the same work source has no work at all (stratum is not started).
+TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto unarmed = []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+    auto submit  = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+    const auto pol = dash::coin::resolve_v36_work_policy(/*v36_network=*/true,
+                                                         /*rpc_armed=*/false,
+                                                         /*embedded_eligible=*/true);
+    ASSERT_TRUE(pol.serve_stratum);
+    dash::stratum::DASHWorkSource ws(cs, unarmed, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_dashd_templates_only(pol.dashd_templates_only);
+    EXPECT_FALSE(ws.dashd_templates_only());
+
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+    const auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty()) << "the v36 network serves the embedded template without dashd";
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), emb_prev.GetHex());
+    EXPECT_EQ(tmpl.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    const auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+    // The seeded coin-state has no mempool and no pins: a coinbase-only
+    // template, which the v36 finder frames as [gentx]. That every served tx
+    // carries its own body is pinned by
+    // DashEmbeddedGbt.EveryTemplateTxCarriesItsOwnBody.
+    EXPECT_TRUE(gw.work.m_tx_hashes.empty());
+    EXPECT_TRUE(gw.work.m_tx_data_hex.empty());
+
+    auto cb = ws.build_connection_coinbase(uint256::ZERO, "deadbeef",
+                                           fixture_miner_script(), {});
+    EXPECT_FALSE(cb.coinb1.empty()) << "a miner gets a coinbase to work on";
+
+    // No work source at all: the policy turns the flag ON, nothing is served.
+    const auto none = dash::coin::resolve_v36_work_policy(true, false, false);
+    ASSERT_FALSE(none.serve_stratum);
+    dash::stratum::DASHWorkSource ws_none(cs, unarmed, submit,
+                                          core::stratum::StratumConfig{},
+                                          /*is_testnet=*/true);
+    ws_none.set_dashd_templates_only(none.dashd_templates_only);
+    EXPECT_TRUE(ws_none.get_current_work_template().empty())
+        << "dashd-templates-only with no dashd arm serves no template";
 }

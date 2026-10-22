@@ -22,6 +22,13 @@ namespace c2pool::v37n::xmr {
 // (SubthresholdGate mode 2, Count).
 inline constexpr std::uint32_t kXmrDropsFloorShift = 6;
 
+// lz: the leading-zero geometry of the XMR raindrop and share-count rows; one
+// share is 2^lz normalised attempts.
+inline constexpr unsigned kXmrDropsLz = 32;
+
+// SubthresholdGate mode 2: the Count estimator.
+inline constexpr std::uint32_t kXmrCreditModeCount = 2;
+
 // T: the lane's target carrier interval, seconds (canon C11).
 inline constexpr std::uint32_t kXmrTargetIntervalS = 10;
 

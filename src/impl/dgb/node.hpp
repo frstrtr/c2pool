@@ -97,7 +97,8 @@ protected:
     // Protocol handlers look up tx hashes here when processing shares.
     std::map<uint256, coin::Transaction> m_known_txs;
     // Insertion-order recency sidecar for m_known_txs. Recorded at each NEW
-    // remember_tx insert; consumed by prune_shares to evict OLDEST-first down to
+    // remember_tx insert; consumed by evict_known_txs_io_phase (once per
+    // clean_tracker cycle, io thread) to evict OLDEST-first down to
     // m_max_known_txs instead of the old wholesale clear() (which dropped every
     // forwardable tx byte at once -> canonical "referenced unknown transaction"
     // disconnect). Tx-forwarding only; no consensus/mint state. See
@@ -261,6 +262,13 @@ public:
 
     // ltc
     void send_version(peer_ptr peer);
+
+    /// Ban the host behind a self-connection, as canonical does (#1716 part B).
+    void ban_self_connection(const NetService& addr);
+    /// One hourly pass over m_banscores (p2pool-dgb-scrypt p2p.py:715).
+    void forgive_transgressions();
+    /// Apply every forgiveness pass due by `now` since the node started.
+    void run_forgiveness(std::chrono::steady_clock::time_point now);
     void processing_shares(HandleSharesData& data, NetService addr);
     void processing_shares_phase2(HandleSharesData& data, NetService addr);
     /// Direct tracker access — compute-thread-only (already holds exclusive lock)
@@ -468,12 +476,11 @@ public:
     // coinbase, payee or won-block state is read or written here.
     void advertise_known_txs(peer_ptr only_peer = nullptr)
     {
-        // m_known_txs is mutated by the COMPUTE thread inside prune_shares()
-        // (core::evict_known_txs_to_cap) under the exclusive tracker lock. This
-        // runs on the IO thread, so take the same NON-BLOCKING shared lock the
-        // other IO-thread readers use (the #828 freed-memory GP-fault class)
-        // and simply skip if the compute thread is mid-cycle — the next sweep
-        // carries the identical delta 10s later.
+        // Every live m_known_txs mutator (remember_tx inserts, and the cap
+        // eviction in evict_known_txs_io_phase) runs on the IO thread, as does
+        // this sweep. The NON-BLOCKING shared lock is kept as the established
+        // #828 discipline for IO-thread readers; skip if the compute thread is
+        // mid-cycle — the next sweep carries the identical delta 10s later.
         std::set<uint256> current;
         {
             std::shared_lock<std::shared_mutex> lk(m_tracker_mutex, std::try_to_lock);
@@ -558,6 +565,12 @@ public:
     /// Matches p2pool's clean_tracker() (node.py:355-402).
     void clean_tracker();
 
+    /// Enforce m_max_known_txs on the m_known_txs tx-forward cache and publish
+    /// the /p2p_stats known_txs gauges. IO-THREAD ONLY: remember_tx inserts
+    /// into m_known_txs lock-free on the io thread. Called once per
+    /// clean_tracker() cycle from its IO-phase post.
+    void evict_known_txs_io_phase();
+
     /// Drain share batches queued while think() held the tracker mutex.
     /// Called on the IO thread after think() releases the lock.
     void drain_pending_adds();
@@ -629,6 +642,13 @@ public:
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
+    // Per-host self-connection offence count (canonical Node.banscores). In
+    // memory only, as canonical. Touched on the IO thread only.
+    std::map<std::string, int> m_banscores;
+    // Hourly forgiveness clock (canonical forgiveness_task, p2p.py:712-713).
+    static constexpr std::chrono::seconds FORGIVENESS_INTERVAL{3600};
+    std::chrono::steady_clock::time_point m_forgiveness_epoch = std::chrono::steady_clock::now();
+    uint64_t m_forgiveness_passes = 0;
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;

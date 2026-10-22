@@ -253,6 +253,31 @@ void HttpSession::run()
     read_request();
 }
 
+bool is_direct_local_request(const boost::asio::ip::address& peer,
+                             const http::fields& headers)
+{
+    bool loopback = peer.is_loopback();
+    if (!loopback && peer.is_v6() && peer.to_v6().is_v4_mapped())
+        loopback = boost::asio::ip::make_address_v4(
+            boost::asio::ip::v4_mapped, peer.to_v6()).is_loopback();
+    if (!loopback)
+        return false;
+    for (const char* name : {"X-Forwarded-For", "Forwarded", "X-Real-IP",
+                             "X-Forwarded-Host", "X-Forwarded-Proto"})
+        if (headers.count(name) != 0)
+            return false;
+    return true;
+}
+
+bool HttpSession::is_direct_local() const
+{
+    boost::system::error_code ec;
+    const auto ep = socket_.remote_endpoint(ec);
+    if (ec)
+        return false;
+    return is_direct_local_request(ep.address(), request_);
+}
+
 void HttpSession::read_request()
 {
     auto self = shared_from_this();
@@ -333,11 +358,14 @@ void HttpSession::process_request()
             };
 
             // ── Auth gate for sensitive endpoints ──────────────────────
-            if (mining_interface_->auth_required()) {
-                bool needs_auth = (target.substr(0, 9) == "/control/"
-                                || target == "/web/log"
-                                || target == "/logs/export");
-                if (needs_auth) {
+            // The logs show peer and miner IP addresses and /control/ changes
+            // pool state. With an auth token set they need ?token=. Without
+            // one they answer only direct local requests (is_direct_local()).
+            const bool needs_auth = (target.substr(0, 9) == "/control/"
+                                  || target == "/web/log"
+                                  || target == "/logs/export");
+            if (needs_auth) {
+                if (mining_interface_->auth_required()) {
                     const std::string token = getQueryParam("token");
                     if (!mining_interface_->verify_auth_token(token)) {
                         response.result(http::status::unauthorized);
@@ -346,6 +374,12 @@ void HttpSession::process_request()
                         send_response(std::move(response));
                         return;
                     }
+                } else if (!is_direct_local()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"Logs and control are local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
                 }
             }
 
@@ -376,7 +410,7 @@ void HttpSession::process_request()
             else if (target == "/connected_miners")
                 rest_result = mining_interface_->rest_connected_miners();
             else if (target == "/stratum_stats")
-                rest_result = mining_interface_->rest_stratum_stats();
+                rest_result = mining_interface_->rest_stratum_stats(is_direct_local());
             else if (target == "/global_stats")
                 rest_result = mining_interface_->rest_global_stats();
             else if (target == "/sharechain/stats")
@@ -501,19 +535,19 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_user_stales();
             else if (target == "/peer_addresses") {
                 response.set(http::field::content_type, "text/plain; charset=utf-8");
-                response.body() = mining_interface_->rest_peer_addresses();
+                response.body() = mining_interface_->rest_peer_addresses(is_direct_local());
                 response.prepare_payload();
                 send_response(std::move(response));
                 return;
             }
             else if (target == "/peer_versions")
-                rest_result = mining_interface_->rest_peer_versions();
+                rest_result = mining_interface_->rest_peer_versions(is_direct_local());
             else if (target == "/peer_txpool_sizes")
-                rest_result = mining_interface_->rest_peer_txpool_sizes();
+                rest_result = mining_interface_->rest_peer_txpool_sizes(is_direct_local());
             else if (target == "/peer_list")
-                rest_result = mining_interface_->rest_peer_list();
+                rest_result = mining_interface_->rest_peer_list(is_direct_local());
             else if (target == "/pings")
-                rest_result = mining_interface_->rest_pings();
+                rest_result = mining_interface_->rest_pings(is_direct_local());
             else if (target == "/stale_rates")
                 rest_result = mining_interface_->rest_stale_rates();
             else if (target == "/node_info")
@@ -537,8 +571,7 @@ void HttpSession::process_request()
                 // same posture as /api/config: it reveals whether the injection
                 // lane is armed, which is local-operator information. SHOWS
                 // state only — never arms, submits, or writes config.
-                auto remote_addr = socket_.remote_endpoint().address();
-                if (!remote_addr.is_loopback()) {
+                if (!is_direct_local()) {
                     response.result(http::status::forbidden);
                     response.body() = R"({"error":"tx-inject status is local-only"})";
                     response.prepare_payload();
@@ -548,8 +581,7 @@ void HttpSession::process_request()
                 rest_result = build_tx_inject_status_json();
             }
             else if (target == "/api/config" || target == "/api/config/schema") {
-                auto remote_addr = socket_.remote_endpoint().address();
-                if (!remote_addr.is_loopback()) {
+                if (!is_direct_local()) {
                     response.result(http::status::forbidden);
                     response.body() = R"({"error":"Config API is local-only"})";
                     response.prepare_payload();
@@ -570,7 +602,7 @@ void HttpSession::process_request()
             else if (target == "/luck_stats")
                 rest_result = mining_interface_->rest_luck_stats();
             else if (target == "/ban_stats")
-                rest_result = mining_interface_->rest_ban_stats();
+                rest_result = mining_interface_->rest_ban_stats(is_direct_local());
             else if (target == "/stratum_security")
                 rest_result = mining_interface_->rest_stratum_security();
             else if (target == "/best_share")
@@ -683,6 +715,26 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
+            else if (target.substr(0, 13) == "/found_block/") {
+                // #946: one found-block row (the /recent_blocks shape) by
+                // full block hash; an unknown hash is a 404, not an empty row.
+                std::string hash = url_decode(target.substr(13));
+                if (!is_valid_hex_hash(hash)) {
+                    response.result(http::status::bad_request);
+                    response.body() = R"({"error":"Invalid hash – expected 64 hex characters"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = mining_interface_->rest_found_block(hash);
+                if (rest_result.is_null()) {
+                    response.result(http::status::not_found);
+                    response.body() = R"({"error":"unknown found block"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+            }
             else if (target.substr(0, 11) == "/web/share/") {
                 std::string hash = url_decode(target.substr(11));
                 if (!is_valid_hex_hash(hash)) {
@@ -738,8 +790,7 @@ void HttpSession::process_request()
             else {
                 // ── Admin API endpoints (loopback-only) ───────────────────
                 if (target.substr(0, 16) == "/api/admin/pool/") {
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
+                    if (!is_direct_local()) {
                         response.result(http::status::forbidden);
                         response.body() = R"({"error":"Admin API is local-only"})";
                         response.prepare_payload();
@@ -812,8 +863,7 @@ void HttpSession::process_request()
                 }
                 // ── Admin API: embedded-coin peer management ──────────────
                 else if (target.substr(0, 16) == "/api/admin/coin/") {
-                    auto remote_addr = socket_.remote_endpoint().address();
-                    if (!remote_addr.is_loopback()) {
+                    if (!is_direct_local()) {
                         response.result(http::status::forbidden);
                         response.body() = R"({"error":"Admin API is local-only"})";
                         response.prepare_payload();
@@ -1159,8 +1209,7 @@ void HttpSession::process_request()
             // two-phase money nonce (bound to the exact diff) + AddressValidator
             // + M0 tripwire for money-path keys — never a silent default.
             if (std::string(request_.target()) == "/api/config/apply") {
-                auto remote_addr = socket_.remote_endpoint().address();
-                if (!remote_addr.is_loopback()) {
+                if (!is_direct_local()) {
                     response.result(http::status::forbidden);
                     response.body() = R"({"error":"Config API is local-only"})";
                     response.prepare_payload();
@@ -1196,8 +1245,7 @@ void HttpSession::process_request()
             // is never touched from the WEB thread. Reward path untouched: an
             // inject is an ordinary block-body tx.
             if (std::string(request_.target()) == "/api/tx-inject/submit") {
-                auto remote_addr = socket_.remote_endpoint().address();
-                if (!remote_addr.is_loopback()) {
+                if (!is_direct_local()) {
                     response.result(http::status::forbidden);
                     response.body() = R"({"error":"tx-inject API is local-only"})";
                     response.prepare_payload();
