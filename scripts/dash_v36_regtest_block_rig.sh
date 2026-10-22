@@ -29,7 +29,10 @@
 #      tracker arm (the finder) rebuilds the full block from its frozen job,
 #      B's refuses (no template bodies) and never rebuilds it
 #   3  empty mempool -> a coinbase-only block (ntx == 1) still mints
-#   4  the v36 network without --coin-rpc: stratum is NOT started
+#   4  the v36 network without --coin-rpc, embedded arm eligible (--testnet +
+#      a coin-P2P feed): embedded templates, stratum started
+#   5  the v36 network with no work source (no --coin-rpc, no feed): stratum
+#      is NOT started
 # Every command and the block hashes are printed for the evidence record.
 set -u
 BIN="${BIN:?set BIN to the c2pool-dash under test}"
@@ -234,13 +237,27 @@ mine_round r2 3 2 99 "$T4" "$T5"
   || fail "3: mempool not empty"
 mine_round r3 1 0 0
 
-# ── round 4: the v36 network without --coin-rpc serves no mining work ──────
+# ── round 4: the v36 network without --coin-rpc, embedded arm eligible ──────
+# --testnet enables the embedded arm and --coin-p2p-connect arms its feed, so the
+# v36 network serves embedded (daemonless) templates and starts stratum.
 start C "$W/C.log" "$BIN" --run --testnet --network-id "$(fresh_hex)" --prefix "$(fresh_hex)" --web-host 127.0.0.1 \
   --coin-p2p-connect 127.0.0.1:1 --data-dir "$W/C" --listen 127.0.0.1:19813 --web-port 19093 --stratum 127.0.0.1:19923
-wait_for 60 "C: requires --coin-rpc" grep -q "is REQUIRED; stratum NOT started" "$W/C.log"
-grep -m1 "is REQUIRED; stratum NOT started" "$W/C.log" | sed 's/^/   C: /'
-! grep -q "stratum listening" "$W/C.log" || fail "4: stratum started without --coin-rpc"
-pass "4 the DASH v36 network without --coin-rpc: stratum not started"
+wait_for 60 "C: embedded templates" grep -q "takes mining work from the embedded template arm" "$W/C.log"
+grep -m1 "takes mining work from the embedded template arm" "$W/C.log" | sed 's/^/   C: /'
+wait_for 60 "C: stratum listening" grep -q "stratum listening" "$W/C.log"
+! grep -q "stratum NOT started" "$W/C.log" || fail "4: stratum refused with the embedded arm eligible"
+pass "4 the DASH v36 network without --coin-rpc, embedded arm eligible: stratum started"
+
+# ── round 5: the v36 network with no work source at all ─────────────────────
+# --testnet with no coin-P2P feed and --embedded-mainnet=false (so the
+# daemonless posture does not imply discovery) leaves the embedded arm
+# ineligible (NoCoinStateFeed), and there is no --coin-rpc: no work, no stratum.
+start D "$W/D.log" "$BIN" --run --testnet --network-id "$(fresh_hex)" --prefix "$(fresh_hex)" --web-host 127.0.0.1 \
+  --embedded-mainnet=false --data-dir "$W/D" --listen 127.0.0.1:19814 --web-port 19094 --stratum 127.0.0.1:19924
+wait_for 60 "D: no work source" grep -q "has no mining work source" "$W/D.log"
+grep -m1 "has no mining work source" "$W/D.log" | sed 's/^/   D: /'
+! grep -q "stratum listening" "$W/D.log" || fail "5: stratum started with no work source"
+pass "5 the DASH v36 network with no work source: stratum not started"
 
 echo "== blocks: $(tr '\n' ' ' <"$W/blocks.txt")"
 echo "RIG DONE"
