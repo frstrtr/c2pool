@@ -12,7 +12,8 @@
 //      an alias; an FB_ADDR naming it) never keeps a link to itself, dials an
 //      alias at most once, marks it SELF in the book, never hands it out
 //   N5 duplicate in/out pair: exactly one link per node pair, the SAME socket
-//      on both ends, no churn, no penalty (dup_link_rule both-ends agreement)
+//      on both ends, no churn, no penalty (dup_link_rule both-ends agreement);
+//      a same-dialer pair: only the dialer closes, the acceptor defers
 //   N6 dial target release (manual node, logical clock): a target whose link
 //      left the link table waits for the link's down event, then the pre-HELLO
 //      backoff (A: the down event held); a down event that never comes
@@ -229,8 +230,27 @@ static void n5_dup(Checker& C, Rig& rig) {
     std::printf("    P2 %s\n    Q2 %s\n", P2->r().disc_describe().c_str(), Q2->r().disc_describe().c_str());
     C(links(*P2) == 2 && links(*Q2) == 2, "N5 same-dialer duplicate: exactly ONE link per pair (P2, Q2 each: the other + R)");
     C(P2->st().hello_ok.load() == hp2 && Q2->st().hello_ok.load() == hq2, "N5 same-dialer duplicate: no redial churn over 6 s");
-    C(Q2->st().dup_deferred.load() >= 1 && Q2->st().disc_dup_dropped.load() == 0 && P2->st().disc_dup_dropped.load() == 1,
-      "N5 only the dialer (P2) closes the duplicate; the acceptor defers");
+    C(Q2->st().disc_dup_dropped.load() == 0 && P2->st().disc_dup_dropped.load() == 1,
+      "N5 only the dialer (P2) closes the duplicate; the acceptor (Q2) closes none");
+    // The acceptor of a same-dialer pair: a dialer that keeps both links open (one node nonce), the second HELLO sent
+    // after the first link is HELLO ok on the acceptor.
+    auto Q3 = rig.make("Q3", nopts("127.0.0.1", {}));
+    C(Q3->start(), "N5 Q3 starts (no peers)");
+    {
+        CarrierPeerNode d;
+        const std::vector<u8> hello = Q3->hello_bytes(Q3->r().node_nonce() ^ 0xd1a1ull, 0);
+        const auto l1 = d.add_peer_id("127.0.0.1", Q3->port());
+        const bool sent1 = l1 != 0 && d.send_to(l1, hello);
+        const bool one = sent1 && wait_until([&] { return links(*Q3) == 1; }, 8000ms, 20ms);
+        const auto l2 = one ? d.add_peer_id("127.0.0.1", Q3->port()) : 0;
+        const bool sent2 = l2 != 0 && d.send_to(l2, hello);
+        const bool two = sent2 && wait_until([&] { return Q3->st().dup_deferred.load() >= 1; }, 8000ms, 20ms);
+        std::printf("    Q3 %s\n", Q3->r().disc_describe().c_str());
+        C(one && two && Q3->st().dup_deferred.load() == 1 && Q3->st().disc_dup_dropped.load() == 0 && links(*Q3) == 2 &&
+              d.has_peer(l1) && d.has_peer(l2),
+          "N5 the acceptor defers: both links of one dialer stay up on Q3, which closes neither");
+        d.stop();
+    }
     std::printf("-- N5 dup_link_rule: both ends close the same socket\n");
     // Links are named by their dialer; each end sees the two links in either order.
     bool agree = true;
