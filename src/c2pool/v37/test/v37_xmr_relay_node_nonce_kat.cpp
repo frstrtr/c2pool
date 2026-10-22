@@ -16,7 +16,9 @@
 //   N6 dial target release (manual node, logical clock): a target whose link
 //      left the link table waits for the link's down event, then the pre-HELLO
 //      backoff (A: the down event held); a down event that never comes
-//      releases it at hello_timeout_ms
+//      releases it at hello_timeout_ms; a HELLO run after its link's down
+//      event still applies a self-connection verdict (B) and keeps nothing of
+//      the gone link (C)
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -336,6 +338,55 @@ static void n6_release(Checker& C, Rig& rig) {
         C(A->links.downs() == 2 && A->st().dials.load() == 1,
           "N6 A: after its down event, no redial within its pre-HELLO backoff (2 s after a HELLO timeout)");
         A->r().pump();
+        clk.add(2001);
+        A->r().tick();
+        C(A->st().dials.load() == 1 && A->st().self_conn.load() == 2 && A->r().book().is_self("127.0.1.1", P),
+          "N6 A: the queued HELLOs of the gone links mark the alias SELF; no redial after the backoff");
+    }
+    {   // B: both down events run before the queued HELLOs
+        StepClock clk;
+        HelloGate g;
+        const u16 P = free_port();
+        auto A = self_alias_node(rig, "N6B", P, clk, g);
+        GateOpener go{g};
+        u64 out = 0, in = 0;
+        C(A->start() && self_pair(*A, g, out, in), "N6 B: one dial of the alias, both HELLOs queued on the relay node");
+        A->r().drop_peer(in);
+        const bool down = wait_until([&] { return A->links.downs() == 2; }, 8000ms, 5ms);
+        const u64 stale0 = A->st().stale_events.load();
+        A->r().pump();
+        clk.add(1001);
+        A->r().tick();
+        C(down && A->st().stale_events.load() == stale0 + 2 && A->st().self_conn.load() == 2 &&
+              A->r().book().is_self("127.0.1.1", P) && A->count_logs("is THIS node -> never dialed again") == 1 &&
+              A->st().dials.load() == 1,
+          "N6 B: a HELLO run after its link's down event still marks the alias SELF; no redial after the backoff (1 s)");
+        C(links(*A) == 0 && !A->r().with_node([](pb::PathbNode& n) { return n.has_pathb_peer(); }),
+          "N6 B: nothing of the gone links is kept (no relay link, no Path B peer)");
+    }
+    {   // C: another node's HELLO that arrives after its link's down event
+        StepClock clk;
+        HelloGate g;
+        pb::PathbRelayOptions o = nopts("127.0.0.1", {});
+        o.threads = false;
+        auto G = rig.make("N6C", o, false, false, clk.clock());
+        G->links.set_tap([&g](u64, const std::vector<u8>& f) { g.tap(f); });
+        GateOpener go{g};
+        C(G->start(), "N6 C: a manual node G starts");
+        CarrierPeerNode d;
+        const auto dl = d.add_peer_id("127.0.0.1", G->port());
+        const bool sent = dl != 0 && d.send_to(dl, G->hello_bytes(G->r().node_nonce() ^ 0x77ull, 4242));
+        const bool held = sent && wait_until([&] { return g.count() == 1; }, 8000ms, 5ms);
+        for (u64 id : G->links.net().peer_ids()) G->r().drop_peer(id);
+        const bool down = wait_until([&] { return G->links.downs() == 1; }, 8000ms, 5ms);
+        g.release();
+        const bool queued = wait_until([&] { return G->links.handled(pb::kOpFbHello) == 1; }, 8000ms, 5ms);
+        G->r().pump();
+        C(held && down && queued && G->st().hello_ok.load() == 0 && G->st().self_conn.load() == 0 && links(*G) == 0 &&
+              !G->r().with_node([](pb::PathbNode& n) { return n.has_pathb_peer(); }) &&
+              !G->r().book().contains("127.0.0.1", 4242),
+          "N6 C: a HELLO run after its link's down event (another node) keeps nothing (no Path B peer, no book entry)");
+        d.stop();
     }
     {   // a down event that never comes: released at hello_timeout_ms (3000), redialed after the backoff (1 s)
         StepClock clk;

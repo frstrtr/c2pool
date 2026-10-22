@@ -524,7 +524,7 @@ public:
                 }
             }
             if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
-            post_from(p, [this, p, f, link] { handle_hello(p, f, link); });
+            post_from(p, [this, p, f, link] { handle_hello(p, f, link); }, [this, p, f, link] { hello_gone(p, f, link); });
             return;
         }
         bool ok = false, posted = false;
@@ -1195,12 +1195,13 @@ private:
     // previous one has run (the link's TCP flow control engages). The readers' events are bounded by the link
     // count; the workers' posts (a carrier's completion, the join outcome, a link's down, our HELLO) are outside
     // this gate, bounded by the verify queue and the link count. An event whose peer is gone when it runs is
-    // skipped.
-    void post_from(std::uint64_t p, std::function<void()> fn) {
+    // skipped (`gone` runs instead, when given).
+    void post_from(std::uint64_t p, std::function<void()> fn, std::function<void()> gone = {}) {
         if (!o_.threads) {
-            post([this, p, f = std::move(fn)] {
+            post([this, p, f = std::move(fn), g = std::move(gone)] {
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -1215,7 +1216,7 @@ private:
             }
             if (!running_) return;
             inflight_.insert(p);
-            events_.push_back([this, p, f = std::move(fn)] {
+            events_.push_back([this, p, f = std::move(fn), g = std::move(gone)] {
                 struct Done {
                     PathbRelayNode* r;
                     std::uint64_t p;
@@ -1229,6 +1230,7 @@ private:
                 } done{this, p};
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -2387,6 +2389,23 @@ private:
         }
         if (o_.discovery) disc_refused(c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0, link);
         defer_drop(p, src_of(p), false);
+    }
+    // A HELLO whose link went down before it ran: only a self-connection verdict is applied (the dial target behind
+    // the link, the book); nothing of the gone link is kept.
+    void hello_gone(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloLink& link) {
+        PathbHello ours;
+        {
+            const NodeGuard g(*this);
+            ours = node_->our_hello(nonce_, links_.listen_port());
+        }
+        PathbHello theirs;
+        const HelloCheck c = pathb_hello_receive(
+                ours, f, [](const Hash32&) -> std::optional<std::uint64_t> { return std::nullopt; }, 0, 0, &theirs);
+        if (c.verdict != HelloVerdict::SelfConnection) return;
+        st_.self_conn++;
+        log("relay: peer " + std::to_string(p) + " HELLO REFUSED (link gone): " + c.text);
+        on_self_hello(p, link);
+        if (o_.discovery) disc_refused(c.text, true, theirs.listen_port, link);
     }
     // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
     // taken under the node lock; the frames paged by reoffer_pump).
