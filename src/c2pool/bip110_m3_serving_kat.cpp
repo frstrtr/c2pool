@@ -19,6 +19,12 @@
 //       to the satoshi.
 //   (6) MERKLE/COMMITMENT SSOT: the txid-merkle over [coinbase]++txids equals an
 //       independent pairwise SHA256d fold; witness_merkle_root([]) == 0.
+//   (7) STRATUM LATENCY REFRESH: the dashboard's per-connection Latency column
+//       reads WorkerInfo::rtt_ms from Bip110WorkSource's worker registry. The
+//       stratum session re-samples the kernel RTT on every accepted submit via
+//       update_stratum_worker_rtt; the registered session must take the fresh
+//       sample (not freeze at the authorize-time one) and an unknown session is
+//       dropped, never inserted. Same fix as the DASH work source (PR #2033).
 //
 // A failure here is a money-path defect (over-claim / invalid block), so this KAT
 // gates the M3 serve path exactly as the M2 workshape KAT gates mining.
@@ -32,6 +38,9 @@
 #include <impl/bip110/coin/sigops.hpp>
 #include <impl/bip110/coin/utxo_reorg.hpp>
 #include <impl/bip110/stratum/serve_xcheck.hpp>
+#include <impl/bip110/stratum/work_source.hpp>
+#include <impl/bip110/coin/header_chain.hpp>
+#include <core/stratum_types.hpp>
 
 #include <core/coin/utxo_view_db.hpp>
 #include <core/coin/utxo_view_cache.hpp>
@@ -704,6 +713,38 @@ int main() {
         auto h2 = mk_tx_multi({{fund2, 0}}, {180000});
         auto rok = bip110::stratum::xcheck_resum_fees({ ser(h1), ser(h2) }, utxo_get, core::coin::LTC_LIMITS);
         expect("xcheck honest distinct-outpoint pair re-sums (70000)", rok.has_value() && *rok == 70000);
+    }
+
+    // ── (7) stratum latency refresh ──────────────────────────────────────
+    {
+        auto params = bip110::coin::BTCChainParams::mainnet();
+        bip110::coin::HeaderChain chain(params);
+        bip110::stratum::Bip110WorkSource ws(
+            chain, /*is_testnet=*/false,
+            [](const std::vector<unsigned char>&, uint32_t) { return true; });
+
+        core::stratum::WorkerInfo info;
+        info.username    = "bc1qexampleaddr.r14";
+        info.worker_name = "r14";
+        info.rtt_ms      = 90.4;   // sampled at authorize
+        ws.register_stratum_worker("sess-1", info);
+        expect("rtt: authorize-time sample registered (90.4)",
+               ws.snapshot_stratum_workers().at("sess-1").rtt_ms == 90.4);
+
+        ws.update_stratum_worker_rtt("sess-1", 23.1);
+        expect("rtt: submit-time sample replaces the connect-time one (23.1)",
+               ws.snapshot_stratum_workers().at("sess-1").rtt_ms == 23.1);
+
+        ws.update_stratum_worker("sess-1", 1.0e12, 0.0, 16.0, 4, 0, 0);
+        expect("rtt: share-stats update leaves the fresh RTT alone",
+               ws.snapshot_stratum_workers().at("sess-1").rtt_ms == 23.1);
+
+        ws.update_stratum_worker_rtt("sess-unknown", 5.0);
+        expect("rtt: unknown session dropped, never inserted",
+               ws.snapshot_stratum_workers().count("sess-unknown") == 0);
+
+        ws.unregister_stratum_worker("sess-1");
+        expect("rtt: registry empty after unregister", ws.snapshot_stratum_workers().empty());
     }
 
     std::printf("%s\n", g_fail == 0 ? "bip110_m3_serving_kat PASS" : "bip110_m3_serving_kat FAIL");
