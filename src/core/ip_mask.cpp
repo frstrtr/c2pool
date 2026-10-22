@@ -11,6 +11,11 @@
 #include <sys/random.h>   // getrandom(2)
 #endif
 #ifdef _WIN32
+// asio must see winsock2.h before windows.h drags in winsock.h (MSVC C1189).
+#include <boost/asio/ip/address.hpp>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <bcrypt.h>       // BCryptGenRandom (system CSPRNG)
 #pragma comment(lib, "bcrypt")
