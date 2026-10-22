@@ -523,6 +523,7 @@ void print_help() {
     std::cout << "  --payout-window N         PPLNS payout window in seconds (default: 86400)\n";
     std::cout << "  --storage-save-interval N Periodic sharechain save interval in seconds (default: 300)\n";
     std::cout << "  --dashboard-dir PATH      Dashboard static files directory (default: web-static)\n";
+    std::cout << "  --dashboard-peer SYM=URL  Sibling coin dashboard shown as a tab, e.g. DASH=https://dash.example.com (repeatable)\n";
     std::cout << "  --analytics-id ID         Google Analytics measurement ID (e.g. G-XXXXXXXXXX)\n\n";
 
     std::cout << "BLOCKCHAIN SUPPORT:\n";
@@ -729,6 +730,10 @@ int main(int argc, char* argv[]) {
 
     // Dashboard directory (web-static/ by default, relative to CWD)
     std::string dashboard_dir = "web-static";
+
+    // Sibling coin dashboards for the #pool-tabs coin switcher (#926),
+    // "SYM=URL" each. --dashboard-peer (repeatable) or YAML dashboard_peers.
+    std::vector<std::string> dashboard_peer_specs;
 
     // Google Analytics measurement ID (e.g. G-XXXXXXXXXX)
     std::string analytics_id;
@@ -1199,6 +1204,10 @@ int main(int argc, char* argv[]) {
             dashboard_dir = argv[++i];
             cli_explicit.insert("dashboard_dir");
         }
+        else if (arg == "--dashboard-peer" && i + 1 < argc) {
+            dashboard_peer_specs.push_back(argv[++i]);
+            cli_explicit.insert("dashboard_peers");
+        }
         else if (arg == "--analytics-id" && i + 1 < argc) {
             analytics_id = argv[++i];
             cli_explicit.insert("analytics_id");
@@ -1401,6 +1410,12 @@ int main(int argc, char* argv[]) {
                 storage_save_interval = cfg["storage_save_interval"].as<int>();
             if (!cli_explicit.count("dashboard_dir") && cfg["dashboard_dir"])
                 dashboard_dir = cfg["dashboard_dir"].as<std::string>();
+            // CLI --dashboard-peer replaces the YAML list rather than merging.
+            if (!cli_explicit.count("dashboard_peers") && cfg["dashboard_peers"]
+                && cfg["dashboard_peers"].IsSequence()) {
+                for (const auto& item : cfg["dashboard_peers"])
+                    dashboard_peer_specs.push_back(item.as<std::string>());
+            }
             if (!cli_explicit.count("analytics_id") && cfg["analytics_id"])
                 analytics_id = cfg["analytics_id"].as<std::string>();
             if (cfg["explorer"])
@@ -1804,6 +1819,17 @@ int main(int argc, char* argv[]) {
             // (non-blocking, detached threads). Only fetches if not configured.
             web_server.get_mining_interface()->auto_detect_external_info();
             web_server.set_dashboard_dir(dashboard_dir);
+            {
+                std::vector<core::DashboardPeer> dashboard_peers;
+                for (const auto& spec : dashboard_peer_specs) {
+                    if (auto p = core::parse_dashboard_peer(spec))
+                        dashboard_peers.push_back(std::move(*p));
+                    else
+                        LOG_WARNING << "Ignoring --dashboard-peer \"" << spec
+                                    << "\": expected SYM=http(s)://host...";
+                }
+                web_server.get_mining_interface()->set_dashboard_peers(std::move(dashboard_peers));
+            }
             if (!analytics_id.empty())
                 web_server.set_analytics_id(analytics_id);
             if (explorer_enabled) {

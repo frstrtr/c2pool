@@ -31,6 +31,7 @@
 #include <core/address_validator.hpp>
 #include <core/hashrate_ring.hpp>
 #include <core/featured_node.hpp>
+#include <core/dashboard_tabs.hpp>
 #include <core/stratum_types.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
@@ -584,6 +585,13 @@ public:
     using node_topology_fn_t = std::function<nlohmann::json()>;
     void set_node_topology_fn(node_topology_fn_t fn) { m_node_topology_fn = std::move(fn); }
     nlohmann::json rest_node_topology();              // /api/node_topology
+
+    // #926 coin switcher: the tab set for the dashboard #pool-tabs strip --
+    // this node's own coins from rest_node_topology() plus the operator-
+    // configured sibling dashboards (--dashboard-peer SYM=URL). See
+    // core/dashboard_tabs.hpp for the shape and the honesty rules.
+    void set_dashboard_peers(std::vector<core::DashboardPeer> peers) { m_dashboard_peers = std::move(peers); }
+    nlohmann::json rest_dashboard_tabs() { return core::build_dashboard_tabs(rest_node_topology(), m_dashboard_peers); }  // /api/dashboard_tabs
 
     // Embedded ORACLE-SHADOW validator stats seam (/embedded_oracle). When set
     // by a wiring layer (main_dash.cpp), returns the per-block dashd cross-check
@@ -1466,6 +1474,7 @@ private:
     spv_progress_fn_t m_spv_progress_fn;
     coin_peers_fn_t m_coin_peers_fn;
     node_topology_fn_t m_node_topology_fn;  // D0.3 per-coin stats provider (optional)
+    std::vector<core::DashboardPeer> m_dashboard_peers;  // #926 sibling dashboards (set before start())
     embedded_oracle_fn_t m_embedded_oracle_fn;  // /embedded_oracle shadow-validator stats (optional)
     embedded_template_fn_t m_embedded_template_fn;  // /embedded_template last-served snapshot (optional)
     config_json_fn_t m_config_fn;         // GET /api/config — resolved launch config (optional)
