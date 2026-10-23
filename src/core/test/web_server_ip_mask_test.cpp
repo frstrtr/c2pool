@@ -265,6 +265,36 @@ TEST(IpMask, StratumStatsRawForDirectLocalViewerAndSameShape)
         EXPECT_EQ(keys(w), keys(proxied["workers"][name])) << name;
 }
 
+// stratum.html rates each IP by connections per worker ("~1 conn per worker" =
+// normal multi-rig farm). A farm behind one NAT that pays every rig to one
+// address, told apart by the worker suffix, has as many workers as rigs.
+TEST(IpMask, StratumStatsCountsWorkersPerIpByWorkerName)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    for (int i = 1; i <= 25; ++i)
+        mi.register_stratum_worker("f" + std::to_string(i),
+                                   worker("D" + std::to_string(i),
+                                          "198.51.100.20:" + std::to_string(1200 + i)));
+    // D1 keeps a second connection open, like a rig reconnecting.
+    mi.register_stratum_worker("f1b", worker("D1", "198.51.100.20:1999"));
+    // A worker with no suffix counts by its address.
+    auto bare = worker("", "192.0.2.50:4000");
+    bare.username = "OtherAddr";
+    mi.register_stratum_worker("b1", bare);
+
+    const auto j = mi.rest_stratum_stats(/*reveal_ips=*/true);
+    EXPECT_EQ(j["pool"]["ip_connections"]["198.51.100.20"], 26);
+    EXPECT_EQ(j["pool"]["ip_workers"]["198.51.100.20"], 25)
+        << "one address, 25 worker suffixes = 25 workers, not 1";
+    EXPECT_EQ(j["pool"]["ip_workers"]["192.0.2.50"], 1);
+    EXPECT_EQ(j["pool"]["unique_addresses"], 2) << "unique_addresses still counts payout addresses";
+
+    // Masked view: same counts under the token keys.
+    const auto m = mi.rest_stratum_stats(/*reveal_ips=*/false);
+    EXPECT_EQ(m["pool"]["ip_workers"][core::mask_ip_endpoint("198.51.100.20")], 25);
+}
+
 // Fail closed: a caller that does not say who is viewing gets tokens.
 TEST(IpMask, StratumStatsDefaultIsMasked)
 {
