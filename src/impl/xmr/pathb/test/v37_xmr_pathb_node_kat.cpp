@@ -75,9 +75,11 @@
 //   timers       P-53 per request restarted per frame, a timeout is
 //                non-service; the FC_BUCKETS window (FIX-1);
 //   j1stale      a FC_HEADERS reply to a request P-53 abandoned, after a
-//                re-ask from a moved best: DROP, no BAN, the re-ask open;
+//                re-ask from a moved best: DROP, no BAN, the re-ask open; a
+//                reply broken inside or failing PoW: BAN with its reason;
 //   relayj1stale the same through the relay's catch-up loop: no ban, the
-//                DROP logged, J at the server's tip;
+//                DROP logged, J at the server's tip; a BANNED line names
+//                its check;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5752,6 +5754,37 @@ void j1stale() {
               "j1stale (same from): F1 answers R2 (FetchBodies), R2's own reply DROPs (kinds "
                       + std::to_string(static_cast<int>(o1.kind)) + ", " + std::to_string(static_cast<int>(o2.kind)) + ")");
     }
+    {
+        // a reply that starts at the request and breaks inside: BAN, the reason names the check
+        Harness h(net);
+        std::size_t s = 0, j = 0;
+        j1stale_chain(h, net, s, j);
+        const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id;
+        check(h[j].request_headers(s, g, tip, 64, h.now), "j1stale (break): R1");
+        const std::vector<std::uint8_t> f1 = h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0);
+        h.q.clear();
+        pb::HeadersReply rep;
+        (void)pb::decode_fc_headers(f1, 0, h[j].frame_bytes_headers(), pb::kRuledLaneParams, rep);
+        std::swap(rep.headers[2], rep.headers[3]);
+        const pb::PathbNode::HeadersOutcome o = h[j].on_headers(s, *pb::encode_fc_headers(rep, h[j].frame_bytes_headers()), h.now);
+        check(o.kind == K::Ban && o.why.find("link") != std::string::npos,
+              "j1stale (break): a link broken inside the reply: BAN with its reason (kind "
+                      + std::to_string(static_cast<int>(o.kind)) + ", why '" + o.why + "')");
+    }
+    {
+        // a header failing its PoW at d: BAN, the reason names S1.3 #11
+        Harness h(net);
+        std::size_t s = 0, j = 0;
+        j1stale_chain(h, net, s, j);
+        const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id;
+        h.bad_pow.insert(*h[s].store().best_at(3));
+        check(h[j].request_headers(s, g, tip, 64, h.now), "j1stale (pow): R1");
+        const std::vector<std::uint8_t> f1 = h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0);
+        h.q.clear();
+        const pb::PathbNode::HeadersOutcome o = h[j].on_headers(s, f1, h.now);
+        check(o.kind == K::Ban && o.why.find("#11") != std::string::npos,
+              "j1stale (pow): a header failing its PoW at d: BAN with its reason (why '" + o.why + "')");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5810,6 +5843,36 @@ void relayj1stale() {
     check(mined && !held.empty() && moved && asked >= 2, "relayj1stale: a held reply, J's best moved, the re-ask");
     check(bans == 0 && rj.stats().bans.load() == 0 && dropped && h[j.node].tree().best().id == tip_a,
           "relayj1stale: the late reply DROPs (logged), no ban; J at A's tip");
+    {
+        // a due ban (a header failing its PoW at d): its BANNED line names S1.3 #11
+        std::map<std::size_t, std::vector<std::string>> lines2;
+        g_relay_lines = &lines2;
+        Harness h2(net);
+        FakeWire w2;
+        KatRelay a2 = kat_relay(h2, w2, table0(net), true);
+        KatRelay j2 = kat_relay(h2, w2, table0(net), false);
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h2.tick_monero();
+            const std::uint32_t nonce = 970 + static_cast<std::uint32_t>(i);
+            const std::optional<pb::PathbJob> jb = h2.job(a2.node, static_cast<std::size_t>(i % 5), nonce);
+            if (jb) (void)h2[a2.node].on_own_share(*jb, nonce, pb::Hash32{});
+        }
+        h2.bad_pow.insert(*h2[a2.node].store().best_at(3));
+        w2.connect(0, 1);
+        w2.run();
+        g_relay_lines = nullptr;
+        bool reasoned = false, bare = false;
+        for (const auto& [n, ls] : lines2)
+            for (const std::string& l : ls) {
+                if (l.find(" BANNED: ") != std::string::npos && l.find("#11") != std::string::npos) reasoned = true;
+                if (l.find(" BANNED") != std::string::npos && l.find(" BANNED: ") == std::string::npos
+                    && l.find(" BANNED for ") == std::string::npos)
+                    bare = true;
+            }
+        check(j2.relay->stats().bans.load() >= 1 && reasoned && !bare,
+              "relayj1stale (pow): a header failing its PoW: BAN, its BANNED line names S1.3 #11 (bans "
+                      + std::to_string(j2.relay->stats().bans.load()) + ")");
+    }
 }
 
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut

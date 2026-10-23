@@ -923,6 +923,7 @@ public:
     struct WalkBind {
         std::vector<Hash32> placed;
         std::vector<std::uint64_t> banned;
+        std::vector<std::string> banned_why;  // one per entry of banned
         std::vector<std::uint64_t> struck;
         std::vector<Hash32> need_bodies;  // bound, carrying bodies, no body set held
         bool rx_failed = false;           // a Closure admission failed with RandomxFailure: the walk stopped there
@@ -951,6 +952,10 @@ public:
                         if (hb.bind == HeaderBind::Mismatch) {
                             std::vector<std::uint64_t>& to = hb.word == AdmitVerdict::Ban ? out.banned : out.struck;
                             to.insert(to.end(), y->peers.begin(), y->peers.end());
+                            if (hb.word == AdmitVerdict::Ban)
+                                out.banned_why.resize(out.banned.size(), "walked header " + hex32(id).substr(0, 16) +
+                                                                                 ": bind mismatch at row R" +
+                                                                                 std::to_string(static_cast<int>(hb.row)));
                             headers_->refute(id, dg);
                             progress = true;
                         }
@@ -997,6 +1002,10 @@ public:
                     }
                     if (!sets[k].empty() && (r.verdict == AdmitVerdict::Ban || r.verdict == AdmitVerdict::Strike)) {
                         (r.verdict == AdmitVerdict::Ban ? out.banned : out.struck).push_back(servers[k]);
+                        if (r.verdict == AdmitVerdict::Ban)
+                            out.banned_why.resize(out.banned.size(), "walked carrier " + hex32(id).substr(0, 16) +
+                                                                             ": body set refuted at row R" +
+                                                                             std::to_string(static_cast<int>(r.row)));
                         headers_->drop_body_set(servers[k], id);
                         progress = true;
                         break;
@@ -1599,6 +1608,7 @@ public:
             }
             if (pr.status == PrInfo::Status::BadServed) {
                 out.kind = HeadersOutcome::Kind::Ban;  // its earlier variants released as on every BAN
+                out.why = "FC_HEADERS: S1.3 #4 P_r " + hex32(h.own.blob.prev_id).substr(0, 16) + " served failing its branch PoW";
                 headers_->release_peer(peer);
                 return out;
             }
@@ -1620,6 +1630,7 @@ public:
         Basis claim_basis = Basis::Computed;
         // a size rule the floor reading leaves undecided (P_r without its weights): DEFER on that P_r, never a BAN
         std::optional<std::size_t> size_undecided;
+        std::string pow_why;  // the check pow_ok refused on
         const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
             const std::size_t i = k++;
             const CarrierHeader& h = req.got[i];
@@ -1629,14 +1640,26 @@ public:
                     claim_fail = i;
                     claim_basis = b;
                 }
+                pow_why = "S1.3 #8 t_origin " + std::to_string(h.own.side.t_origin) + " != d " + std::to_string(d);
                 return false;
             }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
             const HeaderFault hf = header_fields(h.own, encoded_length(h.own), pr.in);
             if (hf == HeaderFault::SizeUndecided && !size_undecided) size_undecided = i;
-            if (header_fields_verdict(hf)) return false;
+            if (header_fields_verdict(hf)) {
+                pow_why = "S1.3 #7 header fault " + std::to_string(static_cast<int>(hf));
+                return false;
+            }
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
-            return seed.has_value() && verify_memo(h.own.blob, d, *seed);
+            if (!seed) {
+                pow_why = "S1.3 #11 no seed for P_r " + hex32(h.own.blob.prev_id).substr(0, 16);
+                return false;
+            }
+            if (!verify_memo(h.own.blob, d, *seed)) {
+                pow_why = "S1.3 #11 PoW below d " + std::to_string(d);
+                return false;
+            }
+            return true;
         };
         const std::optional<std::vector<SideHeader>> side = tree_->check_side_headers(req.fork, ann, pow_ok);
         if (!side) {
@@ -1660,6 +1683,15 @@ public:
                     return out;
                 }
                 out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
+                {
+                    const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
+                    const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) +
+                                                                              " != " + hex32(prev).substr(0, 16) + ")"
+                                              : k == i + 1         ? pow_why
+                                                                   : "S1.3 #6 h " + std::to_string(ann[i].h) + " below H";
+                    out.why = "FC_HEADERS header " + std::to_string(i) + " (" + hex32(sh.id).substr(0, 16) + ", pos " +
+                              std::to_string(fork->pos + 1 + i) + "): " + cause;
+                }
                 headers_->release_peer(peer);
                 return out;
             }

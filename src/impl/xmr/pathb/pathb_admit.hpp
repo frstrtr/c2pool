@@ -1962,6 +1962,7 @@ enum class HeaderBind : std::uint8_t { Match, Mismatch, Wait };
 struct HeaderBindResult {
     HeaderBind bind = HeaderBind::Wait;
     AdmitVerdict word = AdmitVerdict::Defer;  // Mismatch: the computed word (BAN at #9, STRIKE at #2 / #7 / #8)
+    RowId row = RowId::None;                  // Mismatch: the deciding row
 };
 
 // A header variant's own S1.3 #3-#9 at this node (its claimed parent placed; role Closure).
@@ -1973,7 +1974,7 @@ inline HeaderBindResult bind_header(const AdmitEnv& env, const HeaderVariant& y)
             admit_detail::own_rows(env, y.header.own, encoded_length(y.header.own), y.id, CarrierRole::Closure, own);
     if (!r) return own.not_carrier ? HeaderBindResult{} : HeaderBindResult{HeaderBind::Match, AdmitVerdict::AdmitCarrier};
     if ((r->verdict == AdmitVerdict::Ban || r->verdict == AdmitVerdict::Strike) && r->row != RowId::R5)
-        return HeaderBindResult{HeaderBind::Mismatch, r->verdict};
+        return HeaderBindResult{HeaderBind::Mismatch, r->verdict, r->row};
     return {};
 }
 
