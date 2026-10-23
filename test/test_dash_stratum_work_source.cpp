@@ -44,7 +44,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 #include <memory>
 #include <mutex>
@@ -4294,4 +4296,40 @@ TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
     ws_none.set_dashd_templates_only(none.dashd_templates_only);
     EXPECT_TRUE(ws_none.get_current_work_template().empty())
         << "dashd-templates-only with no dashd arm serves no template";
+}
+
+// main_dash.cpp binds its own core::StratumServer (the dashboard WebServer's
+// acceptor is disabled), so it must wire every stratum seam WebServer::
+// start_stratum wires for LTC. Without set_local_rates_fn the local-hashrate
+// history graph falls back to the per-session estimate, which freezes for
+// sessions that stay connected but stop submitting (a backup pool) instead of
+// decaying with the RateMonitor window.
+TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    // Drop /* */ and // comments so a quoted expression in a doc block cannot
+    // satisfy it.
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    const auto hashrate_seam = code.find("mi->set_stratum_hashrate_fn(");
+    ASSERT_NE(hashrate_seam, std::string::npos);
+    const auto local_seam = code.find("mi->set_local_rates_fn(", hashrate_seam);
+    ASSERT_NE(local_seam, std::string::npos)
+        << "main_dash.cpp must feed the local-hashrate graph from its StratumServer";
+    const auto getter = code.find("ss->get_local_rates()", local_seam);
+    ASSERT_NE(getter, std::string::npos);
+    EXPECT_LT(getter - local_seam, 200u) << "the seam is fed by this StratumServer";
+    EXPECT_LT(local_seam - hashrate_seam, 2000u)
+        << "wired in the same block as the other stratum dashboard seams";
 }
