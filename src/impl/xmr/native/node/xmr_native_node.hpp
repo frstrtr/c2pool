@@ -106,6 +106,7 @@
 #include "impl/xmr/native/node/xmr_genesis_blob.hpp"
 #include "impl/xmr/native/node/xmr_monerod_http.hpp"
 #include "impl/xmr/native/node/xmr_sync_driver.hpp"
+#include "impl/xmr/native/node/xmr_sync_telemetry.hpp"
 #include "impl/xmr/native/node/xmr_tx_relay_gate.hpp"
 #include "impl/xmr/native/node/xmr_worker_loops.hpp"
 #include "impl/xmr/native/p2p/chain_seeds.hpp"
@@ -835,6 +836,8 @@ public:
         // --- the sync driver -------------------------------------------------
         SyncDriverConfig dcfg;
         dcfg.probe_only = cfg_.probe_only;
+        // telemetry: the own-fork bound (two target block times); its default when the guard is off
+        dcfg.stall_report_ms = cfg_.own_fork_bound_ms != 0 ? cfg_.own_fork_bound_ms : ChainIndexOptions{}.own_fork_bound_ms;
         driver_ = std::make_unique<SyncDriver>(
             *pool_, boot_, index_, p2p::genesis_id(nets_.wire),
             [this] { return boot_.booted(); },
@@ -1570,7 +1573,10 @@ private:
             if (ec || !running_) return;
             const std::uint64_t now = now_ms_();
             verify_loop_.post([this, now] {
-                                  if (driver_) driver_->tick(now);
+                                  if (driver_) {
+                                      driver_->tick(now);
+                                      sync_edges_();
+                                  }
                                   // Own-fork liveness guard: an own-mined
                                   // tip no peer adopts past the bound is
                                   // abandoned (ChainIndex::check_own_fork).
@@ -2269,6 +2275,32 @@ private:
             + "); no re-walk from the anchor -- ring resolution intact");
     }
 
+    // The sync telemetry's edge lines (verify thread): a no-progress raise or
+    // clear, and a chain answer that names blocks we hold or a detached block
+    // when its content changed (a plain catch-up answer names none).
+    void sync_edges_() {
+        const SyncDriver::Stats& ds = driver_->stats();
+        if (ds.stall_edges + ds.stall_clears != sync_edges_seen_) {
+            sync_edges_seen_ = ds.stall_edges + ds.stall_clears;
+            note_(format_native_sync_stall(ds, index_.sync_telemetry()));
+        }
+        const ChainIndex::ChainAnswer a = index_.last_chain_answer();
+        if (a.seq != 0 && (a.held > 0 || a.detached > 0) && !a.same_content(last_answer_noted_)) {
+            last_answer_noted_ = a;
+            note_(format_native_sync_answer(a));
+        }
+    }
+
+public:
+    // The native-sync status line (any thread; the driver's stats are read on
+    // the verify thread).
+    std::string native_sync_line() {
+        SyncDriver::Stats ds{};
+        verify_loop_.call([this, &ds] { if (driver_) ds = driver_->stats(); });
+        return format_native_sync(ds, index_.sync_telemetry(), now_ms_());
+    }
+
+private:
     void note_(const std::string& line) {
         std::lock_guard<std::mutex> lk(rec_mu_);
         log_.push_back(line);
@@ -2356,6 +2388,8 @@ private:
     std::unique_ptr<relay::LevinBlockRelay>          block_relay_;
     std::unique_ptr<parity::ParityOracle>            oracle_;
     std::unique_ptr<SyncDriver>                      driver_;
+    std::uint64_t                                    sync_edges_seen_ = 0;   // verify thread
+    ChainIndex::ChainAnswer                          last_answer_noted_{};   // verify thread
 
     std::atomic<bool>                     running_{false};
     // Set only once gate 4 has settled Confirmed (or the genesis boot needed no

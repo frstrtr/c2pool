@@ -136,6 +136,12 @@ struct SyncDriverConfig {
     // v16 block that connected).
     std::uint64_t unproductive_backoff_min_ms = 5'000;
     std::uint64_t unproductive_backoff_max_ms = 300'000;
+
+    // TELEMETRY ONLY (no request depends on it): how long the best peer may claim
+    // more cumulative difficulty than our tip while chain answers arrive and our
+    // height does not move before Stats::stalled is raised. 0 = never raised. The
+    // node sets its own-fork bound (two target block times).
+    std::uint64_t stall_report_ms = 0;
 };
 
 class SyncDriver {
@@ -158,6 +164,17 @@ public:
         std::uint64_t chain_requests_unproductive = 0;
         std::uint64_t unproductive_backoff_skips  = 0;
         std::size_t   unproductive_peers          = 0;
+        // Ticks on which the chain ask waited because the last answer moved
+        // nothing (no height, no want list).
+        std::uint64_t chain_quiet_waits = 0;
+        // No progress: the best peer claims more cumulative difficulty than our
+        // tip, chain answers arrive, and our height has not moved for
+        // stall_report_ms. Raised and cleared as edges (telemetry only).
+        bool          stalled       = false;
+        std::uint64_t stall_edges   = 0;
+        std::uint64_t stall_clears  = 0;
+        std::uint64_t stall_ms      = 0;   // how long the height has not moved while behind
+        std::uint64_t stall_answers = 0;   // chain answers accepted meanwhile
     };
 
     // `booted` is a predicate rather than a flag so the driver never caches the
@@ -263,9 +280,29 @@ public:
         const SyncState st = view_.sync_state();
         stats_.our_height  = st.header_frontier;
 
+        // --- no progress (telemetry) ------------------------------------------
+        {
+            const bool behind = u128_less(st.best_cumulative_difficulty, sync.cumulative_difficulty);
+            if (!behind || st.header_frontier != stall_frontier_) {
+                stall_frontier_ = st.header_frontier;
+                stall_mark_ms_  = now_ms;
+                stall_entries_  = st.chain_entries;
+            }
+            stats_.stall_ms      = behind ? now_ms - stall_mark_ms_ : 0;
+            stats_.stall_answers = st.chain_entries - stall_entries_;
+            const bool stalled   = cfg_.stall_report_ms != 0 && behind && stats_.stall_ms >= cfg_.stall_report_ms
+                                && stats_.stall_answers > 0;
+            if (stalled != stats_.stalled) {
+                stats_.stalled = stalled;
+                if (stalled) ++stats_.stall_edges;
+                else ++stats_.stall_clears;
+            }
+        }
+
         // Progress is the height moving, or a chain entry being accepted (the
         // index now holds a want list to work through).
         const bool answered = st.chain_entries != entries_at_request_;
+        if (st.header_frontier != last_frontier_) quiet_ = false;
         if (st.header_frontier != last_frontier_ || st.chain_entries != last_entries_) {
             last_frontier_    = st.header_frontier;
             last_entries_     = st.chain_entries;
@@ -274,8 +311,14 @@ public:
 
         // Our height moved since the request went out, or its answer was
         // accepted: it was answered, and the want list says what to fetch.
-        if (in_flight_ && (st.header_frontier != height_at_request_ || answered))
+        if (in_flight_ && (st.header_frontier != height_at_request_ || answered)) {
             in_flight_ = false;
+            // An answer that left our height where the request found it: the
+            // next chain ask waits chain_request_timeout_ms unless the height
+            // moves first (it is re-asked, never dropped).
+            quiet_         = st.header_frontier == height_at_request_;
+            quiet_from_ms_ = now_ms;
+        }
 
         // --- the want list: the chain entry's window, and parked parents ----
         // Done before the height comparison: an orphan's parent is missing
@@ -395,6 +438,11 @@ public:
             // queue behind the span chunks on the same wire). Ask again once
             // it runs out, or once it has stopped moving for a timeout.
             return;
+        } else if (quiet_ && want.empty() && now_ms - quiet_from_ms_ < cfg_.chain_request_timeout_ms) {
+            // The last answer moved nothing and left nothing to fetch: the same
+            // question on every tick only restates it.
+            ++stats_.chain_quiet_waits;
+            return;
         }
 
         const PeerRef* ask = &cpeer;
@@ -486,6 +534,11 @@ private:
     std::uint64_t last_entries_      = 0;
     std::uint64_t last_progress_ms_  = 0;
     bool          chain_asked_       = false;
+    std::uint64_t stall_frontier_    = 0;       // no progress: the height, since when, the answers then
+    std::uint64_t stall_mark_ms_     = 0;
+    std::uint64_t stall_entries_     = 0;
+    bool          quiet_             = false;   // the last chain answer moved nothing
+    std::uint64_t quiet_from_ms_     = 0;
     std::string   avoid_;
     Stats         stats_{};
 };

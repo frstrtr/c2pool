@@ -178,7 +178,7 @@ struct CtxTarget {              // what the index says the next block must meet
     std::uint64_t diff_lo = 0, diff_hi = 0;
     std::uint64_t height = 0;
     bytes32       seed{};
-    std::uint64_t blob_cap = 0;   // P-13 at the anchor (the newest known ancestor): blob_cap_ctx(hf, Z); 0 = none
+    std::uint64_t blob_cap = 0;   // P-13: blob_cap_ctx(hf, Z) of the anchor's newest ancestor with known state; 0 = none
 };
 // The node's own verified chain index, as the relay sees it (main binds it to
 // the native node's index; a KAT binds a model).

@@ -232,6 +232,12 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> reoffer_done{0}, reoffer_last_ms{0}, reoffer_max_ms{0};  // re-offers finished; their time
     std::atomic<std::uint64_t> repend_offers{0}, repend_offered{0};  // switches whose re-pended receipts were relayed; receipts
     std::atomic<std::uint64_t> parked_receipts_sealed{0};  // parked receipts dropped (no strike) as their origin bin sealed
+    std::atomic<std::uint64_t> parked_frames_sealed{0};    // parked carrier frames dropped (no strike) at their own bin's seal
+    std::atomic<std::uint64_t> ctx_held{0};  // Monero-input DEFERs on a block the follower holds: no context asked
+    // the catch-up's locator steps; a store not caught up: its peers' tips offered to the joiner after a catch-up step
+    // stayed deferred on a P_r past kCtxTtlMs; join pairs released (their P_r resolved, a new peer, a want re-made);
+    // when it caught up (ms; 0: not since start)
+    std::atomic<std::uint64_t> catchup_steps{0}, catchup_join_offers{0}, join_releases{0}, caught_up_at_ms{0};
     std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
@@ -239,6 +245,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> ping_tx{0}, ping_rx{0}, pong_tx{0}, pong_rx{0}, silent_drops{0}, ka_legacy{0}, ka_rearm{0};
     std::atomic<std::uint64_t> ctx_wanted{0}, ctx_asked{0}, ctx_rx{0}, ctx_resolved{0}, ctx_bad{0}, ctx_unknown_rx{0};
     std::atomic<std::uint64_t> ctx_over_cap{0};  // context blocks over P-13, dropped before hashing
+    std::atomic<std::uint64_t> parked_index_pruned{0};  // prunes of the park index (frames that left the deferred store)
     std::atomic<std::uint64_t> ctx_gave_up{0}, ctx_served{0}, ctx_unknown_tx{0}, ctx_forged{0}, ctx_deferred{0}, ctx_unchecked{0};
     std::atomic<std::uint64_t> getaddr_tx{0}, getaddr_rx{0}, getaddr_throttled{0}, addr_tx{0}, addr_rx{0}, addr_unsolicited{0};
     std::atomic<std::uint64_t> addr_learned{0}, addr_ignored{0}, disc_dialed{0}, disc_dial_ok{0}, disc_dup_dropped{0};
@@ -517,7 +524,7 @@ public:
                 }
             }
             if (link.out_host.empty()) link.remote_ip = links_.remote_ip(p);
-            post_from(p, [this, p, f, link] { handle_hello(p, f, link); });
+            post_from(p, [this, p, f, link] { handle_hello(p, f, link); }, [this, p, f, link] { hello_gone(p, f, link); });
             return;
         }
         bool ok = false, posted = false;
@@ -673,6 +680,7 @@ public:
         drive_ctx();
         node_tick();
         sweep_sealed_receipts();
+        sweep_sealed_frames();
         rerun_due_receipts();
         reoffer_pump_all();
         rx_tick();
@@ -776,14 +784,14 @@ public:
         for (const auto& [p, s] : peers_) n += s.inbound ? 0 : 1;
         return n;
     }
-    // The follower's main chain moved (a new tip or a backlog refresh): the frames parked on a Monero input (P_r, its
-    // weights, its seed) run again.
+    // The follower's main chain moved, or a RowWeights record was written: the frames parked on a Monero input (P_r,
+    // its weights, its seed) whose input the follower holds now run again (each (cause, id) checked once).
     void on_monero_tip() {
         if (t_node_held == this) {  // the node lock is not re-entrant: run it after the holder lets go
             post([this] { on_monero_tip(); });
             return;
         }
-        rerun_parked(std::vector<Missing>{Missing::Seed, Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights});
+        rerun_ready_ctx(std::nullopt);
     }
     // A peer's re-offer queue: the ids queued, and whether each is queued once.
     std::size_t reoffer_queued(std::uint64_t p) {
@@ -823,7 +831,15 @@ public:
         const NodeGuard g(*this);
         std::size_t n = 0;
         for (const auto& [cause, ds] : parked_by_cause_) n += ds.size();
+        for (const auto& [key, ds] : parked_ctx_) n += ds.size();
         return n;
+    }
+    // The digests indexed on a Monero input (cause, id).
+    std::size_t parked_ctx_size(Missing m, const Hash32& id) { return parked_ctx_digests(m, id).size(); }
+    std::set<Hash32> parked_ctx_digests(Missing m, const Hash32& id) {
+        const NodeGuard g(*this);
+        const auto it = parked_ctx_.find(std::make_pair(m, id));
+        return it == parked_ctx_.end() ? std::set<Hash32>{} : it->second;
     }
     std::size_t strike_entries() const {
         std::lock_guard<std::mutex> lk(vmtx_);
@@ -993,6 +1009,7 @@ private:
         std::string host;
         std::uint16_t port = 0;
         std::uint64_t pid = 0;
+        std::uint64_t gone_ms = 0;  // its link left the link table before its down event ran (0: not seen)
         std::uint64_t next_try_ms = 0;
         int backoff_s = 1;
         std::uint32_t prehello_fails = 0;
@@ -1014,6 +1031,15 @@ private:
         if (t.prehello_fails <= 1) return 1;
         const std::uint32_t sh = std::min<std::uint32_t>(t.prehello_fails - 1, 6);
         return std::min(cap, 1 << sh);
+    }
+    // A dial target whose link is gone: redialed after the pre-HELLO backoff (tmtx_ held).
+    void release_target_locked(Target& t) {
+        t.pid = 0;
+        t.gone_ms = 0;
+        if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
+        t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
+        t.hello_seen = false;
+        t.hello_timed_out = false;
     }
     struct Job {
         enum class Kind : std::uint8_t { Carrier, Receipt } kind = Kind::Carrier;
@@ -1049,8 +1075,19 @@ private:
         Hash32 tip{};
         U128 work{};
         bool from_pos0 = false;          // the last request asked from position 0
+        bool from_root = false;          // ... from the lowest position the node holds (no step below it)
+        std::uint32_t step = 0;          // the locator step of `from`: the best tip, then pos - 1, pos - 2, pos - 4, ...
         Hash32 asked_best{};
         std::uint64_t asked_ms = 0;
+    };
+    // A catch-up or headers-first request deferred on a P_r: asked again once that P_r resolves.
+    struct HdrOnCtx {
+        Hash32 from{};
+        Hash32 stop{};
+        Hash32 fetch{};               // the P_r
+        Missing cause = Missing::MoneroBlock;  // its input: the block resolved, or (the floor reading) its weights
+        std::uint64_t since_ms = 0;   // the first DEFER on this P_r
+        bool offered = false;         // the peer's tip offered to the joiner for it (a store not caught up)
     };
     struct CtxWant {
         std::uint64_t from = 0;
@@ -1061,7 +1098,6 @@ private:
         std::uint32_t rounds = 0;
         std::uint64_t since_ms = 0;
         std::uint64_t last_ask_ms = 0;
-        std::uint64_t local_ms = 0;
         bool have_proof = false;
         rly::BlockCtx proof{};
         std::vector<std::uint8_t> blob;
@@ -1069,7 +1105,7 @@ private:
         bool defer_noted = false;
     };
     static constexpr std::uint64_t kCtxTtlMs = 10 * 60 * 1000;  // a want is given up after this
-    static constexpr std::uint64_t kCtxLocalMs = 10 * 1000;     // an own-source lookup per want at most this often
+    static constexpr std::uint64_t kCtxLocalMs = 10 * 1000;     // an own-source lookup per id at most this often
     static constexpr std::size_t kCtxPowKeep = 256;
     static constexpr int kUpGateWaitMs = 2000;
 
@@ -1159,12 +1195,13 @@ private:
     // previous one has run (the link's TCP flow control engages). The readers' events are bounded by the link
     // count; the workers' posts (a carrier's completion, the join outcome, a link's down, our HELLO) are outside
     // this gate, bounded by the verify queue and the link count. An event whose peer is gone when it runs is
-    // skipped.
-    void post_from(std::uint64_t p, std::function<void()> fn) {
+    // skipped (`gone` runs instead, when given).
+    void post_from(std::uint64_t p, std::function<void()> fn, std::function<void()> gone = {}) {
         if (!o_.threads) {
-            post([this, p, f = std::move(fn)] {
+            post([this, p, f = std::move(fn), g = std::move(gone)] {
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -1179,7 +1216,7 @@ private:
             }
             if (!running_) return;
             inflight_.insert(p);
-            events_.push_back([this, p, f = std::move(fn)] {
+            events_.push_back([this, p, f = std::move(fn), g = std::move(gone)] {
                 struct Done {
                     PathbRelayNode* r;
                     std::uint64_t p;
@@ -1193,6 +1230,7 @@ private:
                 } done{this, p};
                 if (!peer_known(p)) {  // its link went down while the event waited
                     st_.stale_events++;
+                    if (g) g();
                     return;
                 }
                 f();
@@ -1344,13 +1382,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(tmtx_);
             for (Target& t : targets_)
-                if (t.pid == p) {
-                    t.pid = 0;
-                    if (o_.discovery && !t.hello_seen) book_.mark_failed(t.host, t.port, clock_.wall_s());
-                    t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
-                    t.hello_seen = false;
-                    t.hello_timed_out = false;
-                }
+                if (t.pid == p) release_target_locked(t);
         }
         post([this, p] {
             const NodeGuard g(*this);
@@ -1799,14 +1831,14 @@ private:
         const Missing m = *r.admit.missing;
         const std::optional<Hash32> d =
                 digest ? std::optional<Hash32>(r.admit.digest != Hash32{} ? r.admit.digest : *digest) : std::nullopt;
-        if (d && rerun_cause(m)) parked_by_cause_[m].insert(*d);
+        if (d && rerun_cause(m)) index_parked_locked(m, r.admit.fetch, *d);
         std::set<std::tuple<std::uint64_t, Missing, Hash32>>* asked = nullptr;
         bool kept = true;
         if (receipt) {
             const auto it = parked_receipts_.find(*receipt);
             kept = it != parked_receipts_.end();  // not kept (over the cap at once): nothing asked for it
             if (kept) {
-                parked_by_cause_[m].insert(*receipt);
+                index_parked_locked(m, r.admit.fetch, *receipt);
                 asked = &it->second.second.asked;
             }
         }
@@ -1850,8 +1882,12 @@ private:
             case Missing::MoneroBlock:
             case Missing::MissingBlock:
             case Missing::MissingWeights:
-                if (r.admit.fetch != Hash32{} && may(r.admit.fetch))
-                    fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? CtxClass::Carrier : CtxClass::Receipt);
+                if (r.admit.fetch == Hash32{}) break;
+                if (m == Missing::MissingWeights && node_->monero_block_held(r.admit.fetch)) {
+                    st_.ctx_held++;  // the block is held: a context brings no weights (the frame waits for its input)
+                    break;
+                }
+                if (may(r.admit.fetch)) fx.ctx.emplace_back(r.admit.fetch, peer, carrier ? CtxClass::Carrier : CtxClass::Receipt);
                 break;
             case Missing::MissingBucket:
                 if (may(r.admit.fetch)) bucket_fetch(r.admit.fetch, r.admit.fetch_bin, peer);
@@ -1859,6 +1895,34 @@ private:
             default: break;  // ParentUnknown: the node's own FC_GETCARRIER; MissingRef: a served bucket's references
         }
         take_rx_failed_locked(fx);
+    }
+    // A DEFER on a Monero input: indexed by (cause, id), run again when that input is held.
+    static bool ctx_cause(Missing m) {
+        return m == Missing::MoneroBlock || m == Missing::MissingBlock || m == Missing::MissingWeights || m == Missing::Seed;
+    }
+    // Under the node lock: a parked digest indexed for its re-run (a Monero input by (cause, id), else by cause). Past
+    // the deferred store's cap (J_0) of digests indexed since the last prune, the index is pruned: it holds at most the
+    // objects that wait (the frames the store holds, the parked receipts) and J_0 more.
+    void index_parked_locked(Missing m, const Hash32& fetch, const Hash32& d) {
+        if (ctx_cause(m) && fetch != Hash32{})
+            parked_ctx_[std::make_pair(m, fetch)].insert(d);
+        else
+            parked_by_cause_[m].insert(d);
+        if (++index_adds_ >= node_->deferred_cap()) prune_parked_index_locked();
+    }
+    // Under the node lock: a digest whose object no longer waits (its frame left the deferred store: an eviction past
+    // J_0, a purge, a release or a take; not a parked receipt) leaves the index, and an emptied key with it. A peer's
+    // disconnect drops no frame (forget_peer clears its ask records only).
+    void prune_parked_index_locked() {
+        index_adds_ = 0;
+        const auto gone = [this](const Hash32& d) { return !node_->parked_held(d) && parked_receipts_.count(d) == 0; };
+        for (auto it = parked_ctx_.begin(); it != parked_ctx_.end();) {
+            for (auto d = it->second.begin(); d != it->second.end();) d = gone(*d) ? it->second.erase(d) : std::next(d);
+            it = it->second.empty() ? parked_ctx_.erase(it) : std::next(it);
+        }
+        for (auto& [cause, ds] : parked_by_cause_)
+            for (auto d = ds.begin(); d != ds.end();) d = gone(*d) ? ds.erase(d) : std::next(d);
+        st_.parked_index_pruned++;
     }
     static bool rerun_cause(Missing m) {
         switch (m) {
@@ -1969,28 +2033,82 @@ private:
     // The frames parked for these causes, and those marked for a re-walk, run again (each a new job of its sender).
     // A parked receipt whose cause resolved is due; the due receipts run again, the oldest first, at most the verify
     // queue's free room at a time (no queued job dropped for them); the rest stay parked and due for the next tick.
+    // A Monero input's cause: every (cause, id) key runs again whatever the input (the KAT hook; the follower's events
+    // and a resolved context take rerun_ready_ctx).
     void rerun_parked(const std::vector<Missing>& causes) {
+        std::vector<Hash32> ds;
+        {
+            const NodeGuard g(*this);
+            for (const Missing cause : causes) {
+                std::set<Hash32> s;
+                s.swap(parked_by_cause_[cause]);
+                ds.insert(ds.end(), s.begin(), s.end());
+                if (!ctx_cause(cause)) continue;
+                for (auto it = parked_ctx_.begin(); it != parked_ctx_.end();) {
+                    if (it->first.first != cause) {
+                        ++it;
+                        continue;
+                    }
+                    ds.insert(ds.end(), it->second.begin(), it->second.end());
+                    it = parked_ctx_.erase(it);
+                }
+            }
+        }
+        rerun_digests(ds, true);
+        if (std::find(causes.begin(), causes.end(), Missing::MoneroBlock) != causes.end()) reask_headers_on_ctx(std::nullopt, false);
+    }
+    // The frames parked on a Monero input (cause, id) whose input the follower holds now run again: every key, or the
+    // keys of `only` (a context of that id resolved). The header requests deferred on a P_r follow their input. A key
+    // whose input is not held stays parked (no re-run, no new context).
+    void rerun_ready_ctx(const std::optional<Hash32>& only) {
+        std::vector<Hash32> ds;
+        std::size_t released = 0;
+        {
+            const NodeGuard g(*this);
+            for (auto it = parked_ctx_.begin(); it != parked_ctx_.end();) {
+                const auto& [cause, id] = it->first;
+                if ((only && id != *only) || !node_->monero_input_held(cause, id)) {
+                    ++it;
+                    continue;
+                }
+                ds.insert(ds.end(), it->second.begin(), it->second.end());
+                it = parked_ctx_.erase(it);
+            }
+            // the join pairs waiting on a Monero input held now (a P_r resolved, a held block's weights recorded) are
+            // tried again
+            for (const auto& [cause, id] : node_->join_waits())
+                if ((!only || id == *only) && node_->monero_input_held(cause, id))
+                    released += node_->release_join_waits(id, cause);
+        }
+        rerun_digests(ds, false);
+        reask_headers_on_ctx(only, true);
+        if (released > 0) {
+            st_.join_releases += released;
+            signal_join();
+        }
+    }
+    // The parked digests run again (each a new job of its sender; a parked receipt is due), with the frames marked for a
+    // re-walk when `rewalk`.
+    void rerun_digests(const std::vector<Hash32>& ds, bool rewalk) {
         std::vector<ParkedFrame> again;
         std::vector<Job> again_receipts;
         std::size_t rewalked = 0;
         std::size_t room = verify_room();
         {
             const NodeGuard g(*this);
-            for (const Missing cause : causes) {
-                std::set<Hash32> ds;
-                ds.swap(parked_by_cause_[cause]);
-                for (const Hash32& d : ds) {
-                    if (std::optional<ParkedFrame> f = node_->take_parked(d)) {
-                        again.push_back(std::move(*f));
-                    } else {
-                        const auto it = parked_receipts_.find(d);
-                        if (it != parked_receipts_.end()) receipt_due_[it->second.first] = d;
-                    }
+            for (const Hash32& d : ds) {
+                if (std::optional<ParkedFrame> f = node_->take_parked(d)) {
+                    again.push_back(std::move(*f));
+                } else {
+                    const auto it = parked_receipts_.find(d);
+                    if (it != parked_receipts_.end()) receipt_due_[it->second.first] = d;
                 }
             }
-            std::vector<ParkedFrame> rw = node_->take_rewalk_frames();
-            rewalked = rw.size();
-            for (ParkedFrame& f : rw) again.push_back(std::move(f));
+            if (rewalk) {
+                std::vector<ParkedFrame> rw = node_->take_rewalk_frames();
+                rewalked = rw.size();
+                for (ParkedFrame& f : rw) again.push_back(std::move(f));
+            }
             room = room > again.size() ? room - again.size() : 0;
             take_due_receipts_locked(room, again_receipts);
         }
@@ -2003,7 +2121,6 @@ private:
             st_.parked_reruns++;
             enqueue_job(std::move(j));
         }
-        if (std::find(causes.begin(), causes.end(), Missing::MoneroBlock) != causes.end()) reask_headers_on_ctx();
     }
     // The due receipts left by a re-run (the tick): the next ones, at most the verify queue's free room.
     void rerun_due_receipts() {
@@ -2064,14 +2181,15 @@ private:
         unindex_receipt_locked(key);
         return j;
     }
-    // Under the node lock: the origin height of a one-body FB_RECEIPTS frame's receipt (0: not known).
+    // Under the node lock: the origin height of a one-body FB_RECEIPTS frame's receipt by its own P_r, held with or
+    // without its weights (0: not known).
     std::uint64_t receipt_origin_locked(const std::vector<std::uint8_t>& frame) const {
         const std::size_t at = kFrameHeaderBytes + 1;
         if (frame.size() <= at) return 0;
         ReceiptBodyV3 r;
         if (decode_receipt_body_v3(frame.data() + at, frame.size() - at, ReceiptLimits{buffers_.receipt}, r) != WireError::None)
             return 0;
-        return node_->receipt_origin(r).value_or(0);
+        return node_->held_origin(r.blob.prev_id).value_or(0);
     }
     // SPEC DEFER: a parked receipt is dropped without strike when its origin bin seals on the best chain (with its asks
     // and index entries); once per move of the best chain's record H(L) (the tick).
@@ -2091,6 +2209,33 @@ private:
     }
     void unindex_receipt_locked(const Hash32& key) {
         for (auto& [cause, ds] : parked_by_cause_) ds.erase(key);
+        for (auto it = parked_ctx_.begin(); it != parked_ctx_.end();) {
+            it->second.erase(key);
+            it = it->second.empty() ? parked_ctx_.erase(it) : std::next(it);
+        }
+    }
+    // SPEC DEFER for parked carrier frames: a frame indexed for a re-run is dropped without strike when the origin bin
+    // of its OWN receipt (its body's own P_r, held with or without its weights: h = height + 1) seals on the best chain;
+    // a frame whose own P_r is not held stays (the deferred store's cap bounds it). Once per move of H(L) (the tick).
+    void sweep_sealed_frames() {
+        const NodeGuard g(*this);
+        const std::optional<std::uint64_t> H = node_->best_record();
+        if (!H || *H == swept_frames_record_) return;
+        swept_frames_record_ = *H;
+        std::set<std::pair<Hash32, Hash32>> ds;  // (digest, the DEFER's id: zero for a cause with no Monero input)
+        for (const auto& [key, s] : parked_ctx_)
+            for (const Hash32& d : s) ds.emplace(d, key.second);
+        for (const auto& [cause, s] : parked_by_cause_)
+            for (const Hash32& d : s) ds.emplace(d, Hash32{});
+        for (const auto& [d, id] : ds) {
+            // the object's OWN P_r keys its bin; the DEFER's id (a carried receipt's or a walked body's P_r) does not
+            const std::optional<Hash32> own = node_->parked_own_pr(d);
+            if (!own) continue;
+            const std::optional<std::uint64_t> h = node_->held_origin(*own);
+            if (!h || open_at(*H, *h, p_.open_bins)) continue;
+            if (node_->take_parked(d)) st_.parked_frames_sealed++;
+            unindex_receipt_locked(d);
+        }
     }
     void take_due_receipts_locked(std::size_t room, std::vector<Job>& out) {
         while (out.size() < room && !receipt_due_.empty()) {
@@ -2188,7 +2333,7 @@ private:
             const NodeGuard g(*this);
             ours = node_->our_hello(nonce_, links_.listen_port());
             c = node_->on_hello(p, f, ours);
-            join = node_->joiner().queue().size() > 0;
+            join = node_->joiner().queue().ready() > 0;
         }
         if (join) signal_join();
         const PathbHelloDecode d = decode_pathb_hello(f);
@@ -2244,6 +2389,23 @@ private:
         }
         if (o_.discovery) disc_refused(c.text, self, d.error == HelloError::None ? d.hello.listen_port : 0, link);
         defer_drop(p, src_of(p), false);
+    }
+    // A HELLO whose link went down before it ran: only a self-connection verdict is applied (the dial target behind
+    // the link, the book); nothing of the gone link is kept.
+    void hello_gone(std::uint64_t p, const std::vector<std::uint8_t>& f, const HelloLink& link) {
+        PathbHello ours;
+        {
+            const NodeGuard g(*this);
+            ours = node_->our_hello(nonce_, links_.listen_port());
+        }
+        PathbHello theirs;
+        const HelloCheck c = pathb_hello_receive(
+                ours, f, [](const Hash32&) -> std::optional<std::uint64_t> { return std::nullopt; }, 0, 0, &theirs);
+        if (c.verdict != HelloVerdict::SelfConnection) return;
+        st_.self_conn++;
+        log("relay: peer " + std::to_string(p) + " HELLO REFUSED (link gone): " + c.text);
+        on_self_hello(p, link);
+        if (o_.discovery) disc_refused(c.text, true, theirs.listen_port, link);
     }
     // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
     // taken under the node lock; the frames paged by reoffer_pump).
@@ -2413,22 +2575,46 @@ private:
     // Under the node lock.
     void catchup_start(std::uint64_t p, const HelloTail& tail) {
         const CarrierNode& b = node_->tree().best();
-        if (node_->tree().find(tail.best_tip) != nullptr) return;
-        if (!fork_choice_prefers(ChainTip{tail.best_cum_work, tail.best_tip}, ChainTip{b.cum_work, b.id})) return;
         std::lock_guard<std::mutex> lk(cumtx_);
+        if (node_->tree().find(tail.best_tip) != nullptr
+            || !fork_choice_prefers(ChainTip{tail.best_cum_work, tail.best_tip}, ChainTip{b.cum_work, b.id})) {
+            caught_up_locked();  // nothing to catch up from this peer (the done test at the start)
+            return;
+        }
         Catchup& c = catchup_[p];
         c.tip = tail.best_tip;
         c.work = tail.best_cum_work;
+        c.step = 0;
         catchup_ask_locked(p, c);
     }
-    // Under the node lock and cumtx_: FC_GETHEADERS from the best tip to the peer's tip (one in flight per peer).
+    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended by their done test (every HELLO
+    // tip held, or its claim no longer winning) is caught up (its record leaves the store).
+    void caught_up_locked() {
+        if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
+        node_->note_caught_up();
+        st_.caught_up_at_ms = now_ms();
+        log("relay: caught up (the catch-up from every HELLO peer ended by its done test)");
+    }
+    // Under the node lock and cumtx_: FC_GETHEADERS to the peer's tip (one in flight per peer), from the best tip,
+    // then, after empty replies, a locator step down the best chain: pos - 1, pos - 2, pos - 4, ..., then the lowest
+    // position held (position 0 on an unpruned store): at most floor(log2 pos) + 2 requests per round.
     void catchup_ask_locked(std::uint64_t p, Catchup& c) {
         const CarrierNode& b = node_->tree().best();
-        if (!node_->request_headers(p, b.id, c.tip, header_max_, now_s())) return;
-        c.from_pos0 = b.pos == 0;
+        const CarrierNode& root = node_->tree().genesis();
+        Hash32 from = b.id;
+        if (c.step > 0) {
+            const std::uint64_t back = c.step - 1 < 63 ? std::uint64_t{1} << (c.step - 1) : UINT64_MAX;
+            const std::uint64_t pos = b.pos > root.pos && b.pos - root.pos > back ? b.pos - back : root.pos;
+            from = pos == root.pos ? root.id : node_->store().best_at(pos).value_or(root.id);
+        }
+        if (!node_->request_headers(p, from, c.tip, header_max_, now_s())) return;
+        const CarrierNode* fn = node_->tree().find(from);
+        c.from_root = fn == nullptr || fn->pos <= root.pos;
+        c.from_pos0 = fn != nullptr && fn->pos == 0;
         c.asked_best = b.id;
         c.asked_ms = now_ms();
         st_.catchup_requests++;
+        if (c.step > 0) st_.catchup_steps++;
     }
     void handle_headers(std::uint64_t p, const std::vector<std::uint8_t>& f) {
         using K = PathbNode::HeadersOutcome::Kind;
@@ -2448,8 +2634,15 @@ private:
                 if (it != catchup_.end()) {
                     switch (o.kind) {
                         case K::Keep:
+                            // an empty reply to a request from above the lowest position held: the server's chain does
+                            // not hold that `from`; the next locator step down the best chain
+                            if (o.ids.empty() && !it->second.from_root) {
+                                ++it->second.step;
+                                catchup_ask_locked(p, it->second);
+                                break;
+                            }
                             // the reply to a request from position 0 carried no header: the peer serves nothing after
-                            // position 0 (the empty-store start's joiner path)
+                            // position 0 (a store that never caught up: the joiner path)
                             if (o.ids.empty() && it->second.from_pos0 && node_->offer_empty_store_tip(p)) {
                                 st_.empty_store_offers++;
                                 join = true;
@@ -2474,35 +2667,61 @@ private:
             default: break;
         }
         if (o.kind == K::Defer && o.fetch != Hash32{}) {
-            // a header's P_r not held: fetched (FB_GETCTX, the carrier class), the request asked again once it resolves
+            // a header's P_r not resolved: fetched (FB_GETCTX, the carrier class); a header waiting for the weights of a
+            // block the follower holds asks no context; the request asked again once its input is held
             {
                 std::lock_guard<std::mutex> lk(cumtx_);
-                headers_on_ctx_[p] = std::make_pair(o.from, o.stop);
+                HdrOnCtx& w = headers_on_ctx_[p];
+                if (w.fetch != o.fetch || w.since_ms == 0) w.since_ms = now_ms();
+                w.from = o.from;
+                w.stop = o.stop;
+                w.fetch = o.fetch;
+                w.cause = o.cause;
             }
             st_.headers_ctx_deferred++;
-            want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+            bool held = false;
+            {
+                const NodeGuard g(*this);
+                held = o.cause == Missing::MissingWeights && node_->monero_block_held(o.fetch);
+            }
+            if (held)
+                st_.ctx_held++;
+            else
+                want_ctx(o.fetch, p, 0, CtxClass::Carrier);
         }
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
     }
-    // The header requests deferred on a P_r (one per peer), asked again with the MoneroBlock re-run (a context
-    // resolved, or the follower's chain moved); one still missing defers again.
-    void reask_headers_on_ctx() {
-        std::map<std::uint64_t, std::pair<Hash32, Hash32>> due;
+    // The header requests deferred on a P_r (one per peer), asked again once that P_r resolves (gated: a context of
+    // that id resolved (`only`), or the follower's chain moved); ungated: the KAT hook's re-run.
+    void reask_headers_on_ctx(const std::optional<Hash32>& only, bool gated) {
+        std::map<std::uint64_t, HdrOnCtx> due;
         {
             std::lock_guard<std::mutex> lk(cumtx_);
-            due.swap(headers_on_ctx_);
+            for (auto it = headers_on_ctx_.begin(); it != headers_on_ctx_.end();) {
+                if (only && it->second.fetch != *only) {
+                    ++it;
+                    continue;
+                }
+                due.insert(*it);
+                it = headers_on_ctx_.erase(it);
+            }
         }
         if (due.empty()) return;
         const NodeGuard g(*this);
         for (const auto& [p, w] : due) {
-            if (!hello_ok(p) || node_->tree().find(w.first) == nullptr) continue;
-            if (node_->request_headers(p, w.first, w.second, header_max_, now_s())) {
+            if (gated && !node_->monero_input_held(w.cause, w.fetch)) {  // its input not held yet: kept
+                std::lock_guard<std::mutex> lk(cumtx_);
+                headers_on_ctx_.emplace(p, w);
+                continue;
+            }
+            if (!hello_ok(p) || node_->tree().find(w.from) == nullptr) continue;
+            if (node_->request_headers(p, w.from, w.stop, header_max_, now_s())) {
                 st_.headers_ctx_reasks++;
                 continue;
             }
             std::lock_guard<std::mutex> lk(cumtx_);
-            header_wants_[p] = w;
+            header_wants_[p] = std::make_pair(w.from, w.stop);
         }
     }
     // Under the node lock: the waiting request of t's branch to `peer` (every peer: 0), when that peer has none in
@@ -2619,7 +2838,7 @@ private:
         {
             const NodeGuard g(*this, true);
             if (!running_ || node_->poisoned()) return std::nullopt;
-            const bool queued = node_->joiner().queue().size() != 0;
+            const bool queued = node_->joiner().queue().ready() != 0;  // pairs waiting on a P_r are not attempted
             if (!queued && !reask_due_) return std::nullopt;
             // P-40: a queued pair is attempted once HELLO tails of at least join_min_peers peers name the candidates
             const bool tails = ready_peers().size() >= o_.join_min_peers;
@@ -2939,6 +3158,7 @@ private:
                     if (t.pid != 0) {
                         out.push_back(t.pid);
                         t.pid = 0;
+                        t.gone_ms = 0;
                     }
             }
             for (std::uint64_t p : out) links_.disconnect(p);
@@ -2953,7 +3173,12 @@ private:
             const std::uint64_t now = now_ms();
             for (std::size_t i = 0; i < targets_.size(); ++i) {
                 Target& t = targets_[i];
-                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) t.pid = 0;
+                if (t.pid != 0 && std::find(live.begin(), live.end(), t.pid) == live.end()) {
+                    // its down event releases it; one not run within hello_timeout_ms releases it here
+                    if (t.gone_ms == 0) t.gone_ms = now;
+                    if (now - t.gone_ms < o_.hello_timeout_ms) continue;
+                    release_target_locked(t);
+                }
                 if (t.self) continue;
                 if (t.pid == 0 && now >= t.next_try_ms) {
                     const std::string k = rly::peer_key(t.host, t.port);
@@ -2993,6 +3218,7 @@ private:
                 t.hello_timed_out = false;
                 if (links_.has_peer(pid)) {
                     t.pid = pid;
+                    t.gone_ms = 0;
                     if (hello_now) t.prehello_fails = 0;
                 } else {
                     t.next_try_ms = now_ms() + static_cast<std::uint64_t>(prehello_delay_s(t)) * 1000;
@@ -3016,22 +3242,53 @@ private:
             const NodeGuard g(*this);
             take_rx_failed_locked(rfx);
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
+            {  // the wants re-made for an id a join pair waits on (it gave up before): the pairs are tried again
+                std::vector<Hash32> again;
+                {
+                    std::lock_guard<std::mutex> lk(cmtx_);
+                    again.swap(ctx_remade_);
+                }
+                for (const Hash32& id : again)
+                    if (const std::size_t n = node_->release_join_waits(id, Missing::MoneroBlock); n > 0) st_.join_releases += n;
+            }
             std::lock_guard<std::mutex> lk(cumtx_);
+            bool done_any = false;
             for (auto it = catchup_.begin(); it != catchup_.end();) {
                 const CarrierNode& b = node_->tree().best();
                 const bool done = node_->tree().find(it->second.tip) != nullptr
                                   || !fork_choice_prefers(ChainTip{it->second.work, it->second.tip}, ChainTip{b.cum_work, b.id})
                                   || node_->rests_on_claims();
                 if (done) {
+                    done_any = done_any || !node_->rests_on_claims();
                     it = catchup_.erase(it);
                     continue;
                 }
-                // again from the new best tip, or after a request that got no reply within P-53
-                if (it->second.asked_best != b.id || now_ms() >= it->second.asked_ms + abandon_s_ * 1000)
+                const auto hd = headers_on_ctx_.find(it->first);
+                const bool deferred = hd != headers_on_ctx_.end();
+                // a store not caught up whose catch-up step stays deferred on a P_r its context did not bring within
+                // kCtxTtlMs: the peer's tip becomes a join candidate (the joiner path; paced on that P_r)
+                if (deferred && !node_->caught_up() && !hd->second.offered && hd->second.since_ms != 0
+                    && now_ms() >= hd->second.since_ms + kCtxTtlMs
+                    && !node_->monero_input_held(hd->second.cause, hd->second.fetch)) {
+                    hd->second.offered = true;
+                    if (node_->offer_empty_store_tip(it->first)) {
+                        st_.catchup_join_offers++;
+                        log("relay: catch-up from peer " + std::to_string(it->first) + " deferred on P_r " +
+                            hex_short(hd->second.fetch) + " past its context's time: its tip offered to the joiner");
+                    }
+                }
+                // again from the new best tip (the locator from its step 0), or after a request that got no reply
+                // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
+                if (it->second.asked_best != b.id) {
+                    it->second.step = 0;
                     catchup_ask_locked(it->first, it->second);
+                } else if (!deferred && now_ms() >= it->second.asked_ms + abandon_s_ * 1000) {
+                    catchup_ask_locked(it->first, it->second);
+                }
                 ++it;
             }
-            join = (node_->joiner().queue().size() > 0 || reask_due_) && now_ms() >= join_not_before_ms_;
+            if (done_any) caught_up_locked();
+            join = (node_->joiner().queue().ready() > 0 || reask_due_) && now_ms() >= join_not_before_ms_;
         }
         {
             const NodeGuard g(*this);
@@ -3448,6 +3705,7 @@ private:
     // A want of class `cls`: counted in its own class only. A held want is raised to a higher class (and its bound)
     // within that class's cap; a new want past its class's cap is held as a receipt's (P-06) within that cap.
     void want_ctx(const Hash32& id, std::uint64_t from, std::uint32_t depth, CtxClass cls) {
+        const bool by_object = cls != CtxClass::Join;  // a frame's or a catch-up's DEFER (not a join attempt's own)
         std::lock_guard<std::mutex> lk(cmtx_);
         std::array<std::size_t, 3> n{};
         for (const auto& kv : ctx_want_) ++n[static_cast<std::size_t>(kv.second.cls)];
@@ -3473,6 +3731,17 @@ private:
         w.since_ms = now_ms();
         ctx_want_.emplace(id, std::move(w));
         st_.ctx_wanted++;
+        if (const auto g = std::find(ctx_gave_up_ids_.begin(), ctx_gave_up_ids_.end(), id);
+            by_object && g != ctx_gave_up_ids_.end()) {
+            ctx_gave_up_ids_.erase(g);  // re-made by a DEFER after it gave up: a join pair waiting on it is tried again
+            ctx_remade_.push_back(id);
+        }
+    }
+    // Under cmtx_: a want that gave up, kept by id (at most the wants' bound, the oldest out first).
+    void note_gave_up_locked(const Hash32& id) {
+        if (std::find(ctx_gave_up_ids_.begin(), ctx_gave_up_ids_.end(), id) != ctx_gave_up_ids_.end()) return;
+        ctx_gave_up_ids_.push_back(id);
+        while (ctx_gave_up_ids_.size() > o_.ctx_want_max + 2 * std::size_t{o_.ctx_join_depth}) ctx_gave_up_ids_.pop_front();
     }
     bool ctx_resolved(const Hash32& id) const {
         std::lock_guard<std::mutex> lk(cmtx_);
@@ -3625,8 +3894,7 @@ private:
                     }
             }
             ccv_.notify_all();
-            rerun_parked(std::vector<Missing>{Missing::MoneroBlock, Missing::MissingBlock, Missing::MissingWeights,
-                                              Missing::Seed});
+            rerun_ready_ctx(id);  // the frames parked on this id's inputs, those held now
             if (!has_child) return true;
             id = child;
         }
@@ -3641,10 +3909,13 @@ private:
         std::vector<Hash32> retry, local;
         {
             std::lock_guard<std::mutex> lk(cmtx_);
+            for (auto it = ctx_local_ms_.begin(); it != ctx_local_ms_.end();)  // the looks older than the pace leave
+                it = now - it->second >= kCtxLocalMs ? ctx_local_ms_.erase(it) : std::next(it);
             for (auto it = ctx_want_.begin(); it != ctx_want_.end();) {
                 CtxWant& w = it->second;
                 if (now - w.since_ms > kCtxTtlMs) {
                     st_.ctx_gave_up++;
+                    note_gave_up_locked(it->first);
                     it = ctx_want_.erase(it);
                     continue;
                 }
@@ -3656,9 +3927,12 @@ private:
                     ++it;
                     continue;
                 }
-                if (ctx_.block_blob && (w.local_ms == 0 || now - w.local_ms >= kCtxLocalMs)) {
-                    w.local_ms = now;
-                    local.push_back(it->first);
+                if (ctx_.block_blob) {  // the own source at most once per kCtxLocalMs per id, across wants
+                    const auto [lm, fresh] = ctx_local_ms_.emplace(it->first, now);
+                    if (fresh || now - lm->second >= kCtxLocalMs) {
+                        lm->second = now;
+                        local.push_back(it->first);
+                    }
                 }
                 if (w.last_ask_ms != 0 && now - w.last_ask_ms < o_.ctx_retry_ms) {
                     ++it;
@@ -3681,6 +3955,7 @@ private:
                     }
                     if (w.rounds >= o_.ctx_max_rounds) {
                         st_.ctx_gave_up++;
+                        note_gave_up_locked(it->first);
                         it = ctx_want_.erase(it);
                         continue;
                     }
@@ -3767,6 +4042,9 @@ private:
     RelayNodeLock lock_;  // the node lock
     // owned by the node lock
     std::map<Missing, std::set<Hash32>> parked_by_cause_;
+    std::map<std::pair<Missing, Hash32>, std::set<Hash32>> parked_ctx_;  // Monero-input DEFERs by (cause, id)
+    std::uint64_t swept_frames_record_ = 0;
+    std::uint64_t index_adds_ = 0;  // digests indexed since the last prune of the park index  // the best chain's H(L) at the last seal sweep of the parked frames
     std::map<Hash32, std::pair<std::uint64_t, Job>> parked_receipts_;  // DEFERred receipts by key: (seq, job and asks)
     std::map<std::uint64_t, Hash32> parked_receipt_order_;             // by seq: the oldest first (P-09)
     std::uint64_t parked_receipt_seq_ = 0;
@@ -3827,7 +4105,7 @@ private:
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
     std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
-    std::map<std::uint64_t, std::pair<Hash32, Hash32>> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop)
+    std::map<std::uint64_t, HdrOnCtx> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop, P_r, since)
 
     mutable std::mutex omtx_;                          // the omission log
     std::map<std::uint64_t, std::uint64_t> omissions_;  // link id -> receipts omitted (at most the links up)
@@ -3835,6 +4113,9 @@ private:
     VerdictCounts verdicts_{};  // [row][verdict]
     mutable std::mutex cmtx_;  // contexts
     std::map<Hash32, CtxWant> ctx_want_;
+    std::map<Hash32, std::uint64_t> ctx_local_ms_;  // the last own-source look per id (kept for kCtxLocalMs)
+    std::deque<Hash32> ctx_gave_up_ids_;            // ids whose want gave up (the wants' bound)
+    std::vector<Hash32> ctx_remade_;                // ... wanted again since (the join pairs on them released)
     std::size_t ctx_want_bytes_peak_ = 0;  // the most blob bytes ctx_want_ held at once
     std::deque<Hash32> ctx_done_;
     std::map<Hash32, rly::CtxPowRec> ctx_pow_;

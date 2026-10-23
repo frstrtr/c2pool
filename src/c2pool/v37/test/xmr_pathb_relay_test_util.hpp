@@ -15,7 +15,7 @@
 //                  stub per node, the node's log; its carriers, jobs and
 //                  receipt bodies; its HELLO bytes for a raw peer
 //   CountingLinks  CarrierLinks that counts the frames it delivers, by opcode,
-//                  and shows each to a tap
+//                  shows each to a tap, and can hold the link-down events
 // Test-only.
 // ---------------------------------------------------------------------------
 #pragma once
@@ -217,17 +217,55 @@ public:
     pb::CarrierLinks& inner() noexcept { return in_; }
     ::c2pool::v37n::CarrierPeerNode& net() noexcept { return in_.net(); }
     std::uint64_t frames(u8 op) const noexcept { return n_[op].load(); }
+    // The frames the relay node returned from, by opcode.
+    std::uint64_t handled(u8 op) const noexcept { return h_[op].load(); }
     // Sees every frame before the relay node does (set before start()).
     void set_tap(Tap t) { tap_ = std::move(t); }
+    // While held, a link-down event is kept here (the link is already gone from the link table);
+    // release_downs() ends the hold and hands the kept ones to the relay node in order.
+    void hold_downs() {
+        std::lock_guard<std::mutex> lk(dm_);
+        hold_ = true;
+    }
+    std::size_t held_downs() const {
+        std::lock_guard<std::mutex> lk(dm_);
+        return held_.size();
+    }
+    void release_downs() {
+        std::vector<std::uint64_t> v;
+        {
+            std::lock_guard<std::mutex> lk(dm_);
+            hold_ = false;
+            v.swap(held_);
+        }
+        for (std::uint64_t p : v) {
+            ev_(p, false);
+            downs_++;
+        }
+    }
+    // The link-down events the relay node returned from.
+    std::uint64_t downs() const noexcept { return downs_.load(); }
 
     void bind(FrameFn frame, FrameFn control, EventFn event) override {
+        ev_ = std::move(event);
         in_.bind(
                 [this, frame = std::move(frame)](std::uint64_t p, const std::vector<std::uint8_t>& f) {
                     if (!f.empty()) n_[f[0]]++;
                     if (tap_) tap_(p, f);
                     frame(p, f);
+                    if (!f.empty()) h_[f[0]]++;
                 },
-                std::move(control), std::move(event));
+                std::move(control), [this](std::uint64_t p, bool up) {
+                    if (!up) {
+                        std::lock_guard<std::mutex> lk(dm_);
+                        if (hold_) {
+                            held_.push_back(p);
+                            return;
+                        }
+                    }
+                    ev_(p, up);
+                    if (!up) downs_++;
+                });
     }
     void configure(const pb::PathbRelayOptions& o) override { in_.configure(o); }
     bool listen(const std::string& host, std::uint16_t port) override { return in_.listen(host, port); }
@@ -250,8 +288,13 @@ public:
 
 private:
     pb::CarrierLinks in_;
-    std::array<std::atomic<std::uint64_t>, 256> n_{};
+    std::array<std::atomic<std::uint64_t>, 256> n_{}, h_{};
     Tap tap_;
+    EventFn ev_;
+    mutable std::mutex dm_;
+    bool hold_ = false;
+    std::vector<std::uint64_t> held_;
+    std::atomic<std::uint64_t> downs_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -347,11 +390,12 @@ struct Rig {
     }
 
     // A relay node with its own PathbNode: `launch` builds templates with no Path B peer; `other_pool` names
-    // another pool identity (TAG_MISMATCH at HELLO).
-    std::unique_ptr<RNode> make(std::string name, pb::PathbRelayOptions o, bool launch = false, bool another_pool = false) {
+    // another pool identity (TAG_MISMATCH at HELLO); `clock` is the relay's clock.
+    std::unique_ptr<RNode> make(std::string name, pb::PathbRelayOptions o, bool launch = false, bool another_pool = false,
+                                pb::RelayClock clock = pb::RelayClock::system()) {
         auto n = std::make_unique<RNode>(std::move(name));
         RNode* rn = n.get();
-        n->relay = std::make_unique<pb::PathbRelayNode>(std::move(o), n->links, pb::RelayClock::system(),
+        n->relay = std::make_unique<pb::PathbRelayNode>(std::move(o), n->links, std::move(clock),
                                                         [rn](const std::string& l) {
                                                             std::lock_guard<std::mutex> lk(rn->lmtx);
                                                             rn->logs.push_back(l);
