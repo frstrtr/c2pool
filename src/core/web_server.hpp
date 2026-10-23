@@ -899,6 +899,16 @@ public:
     bool get_segwit_active() const;
     // Return the cached MWEB extension data (empty if none)
     std::string get_cached_mweb() const;
+    // Return whether the cached template's rules name MWEB
+    bool get_cached_mweb_active() const;
+
+    // MWEB submit-path counters (also in /local_stats).
+    //   mweb_refusals          — blocks refused at assembly on the MWEB shape check
+    //   mweb_template_refusals — templates refused at ingress (HOLD)
+    //   mweb_hold_seconds      — total time spent holding the previous template
+    uint64_t get_mweb_refusals() const { return m_mweb_block_refusals.load(std::memory_order_relaxed); }
+    uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
+    double get_mweb_hold_seconds() const;
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
@@ -1342,6 +1352,17 @@ private:
     // Reconstruct merkle root from coinbase hex + Stratum merkle branches
     static uint256 reconstruct_merkle_root(const std::string& coinbase_hex,
                                            const std::vector<std::string>& merkle_branches);
+    // Serialize the 80-byte block header from Stratum/GBT fields. prevhash_hex
+    // is BE display hex; ntime, nbits and nonce are 8-char BE hex as sent by
+    // the miner / GBT. Returns an empty vector when any field has the wrong
+    // length. The one header serializer for block assembly, the submit-path
+    // PoW check and the scrypt share-difficulty calculation.
+    static std::vector<unsigned char> build_header_bytes(uint32_t version,
+                                                         const std::string& prevhash_hex,
+                                                         const uint256& merkle_root,
+                                                         const std::string& ntime,
+                                                         const std::string& nbits,
+                                                         const std::string& nonce);
     private:
     // Build full block hex from Stratum submit parameters.
     // When job is provided, uses its frozen template data instead of the live m_cached_template.
@@ -1350,6 +1371,19 @@ private:
                                          const std::string& ntime,
                                          const std::string& nonce,
                                          const JobSnapshot* job = nullptr) const;
+
+    // Header hex (160 chars) for a submitted share, built from the job snapshot
+    // (or the live cache when job is null). Caller holds m_work_mutex.
+    // Returns "" when no header can be derived.
+    std::string block_header_hex_locked(const std::string& extranonce1,
+                                        const std::string& extranonce2,
+                                        const std::string& ntime,
+                                        const std::string& nonce,
+                                        const JobSnapshot* job) const;
+
+    // Template-ingress MWEB HOLD bookkeeping (refresh_work only).
+    void note_mweb_template_refusal(const std::string& why);
+    void note_mweb_template_accepted();
 
     // Try submitting to merged-mined aux chains if their target is met
     // Returns true if a merged block was found (for twin block detection)
@@ -1562,6 +1596,15 @@ private:
     mutable std::vector<CachedMergedHeaderInfo> m_last_merged_header_infos;
     uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
+    bool m_cached_mweb_active{false};  // template rules named MWEB (Litecoin)
+
+    // MWEB submit-path counters (see get_mweb_refusals()).
+    mutable std::atomic<uint64_t> m_mweb_block_refusals{0};  // bumped in const build_block_from_stratum
+    std::atomic<uint64_t> m_mweb_template_refusals{0};
+    // Template-ingress HOLD window: steady-clock ms when the open window
+    // started (0 = not holding) and the total of the closed windows.
+    std::atomic<int64_t>  m_mweb_hold_since_ms{0};
+    std::atomic<int64_t>  m_mweb_hold_total_ms{0};
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;

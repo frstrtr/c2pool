@@ -113,6 +113,12 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # web_server_ip_mask_test.cpp: issue #1985 miner/peer IP masking for web
     # viewers that are not direct local (/stratum_stats, peer views,
     # /ban_stats). Same fold-into-core_test reasoning as every TU here.
+    # web_server_mweb_hogex_test.cpp: the LTC MWEB release-gate KAT. A found
+    # block reaches submitblock and the P2P relay as ... | HogEx | 01 mweb;
+    # mweb without a trailing HogEx, or a HogEx without mweb, never reaches
+    # the daemon but still reaches the merged-mining check; a template failing
+    # the shape check is refused at ingress with HOLD semantics. Same
+    # fold-into-core_test reasoning as every TU here (ltc_coin already linked).
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -154,6 +160,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_mweb_hogex_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp
         web_server_worker_liveness_test.cpp
