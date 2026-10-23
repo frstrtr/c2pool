@@ -554,6 +554,8 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_node_info();
             else if (target == "/api/node_topology")
                 rest_result = mining_interface_->rest_node_topology();
+            else if (target == "/api/dashboard_tabs")
+                rest_result = mining_interface_->rest_dashboard_tabs();
             else if (target == "/embedded_oracle")
                 rest_result = mining_interface_->rest_embedded_oracle();
             else if (target == "/embedded_template")

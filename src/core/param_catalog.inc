@@ -347,6 +347,9 @@ C2P_PARAM("web.dashboard_dir", WebOps, PATH, RESTART, C_DASH|C_LTC, LIT, "web-st
   C2P_ALIAS("web.dashboard_dir", BIN_DASH, "--dashboard-dir", VALUE)
   C2P_ALIAS("web.dashboard_dir", BIN_LTC, "--dashboard-dir", VALUE)
 
+C2P_PARAM("web.dashboard_peers", WebOps, STRING, RESTART, C_LTC, LIT, "", NONE, "sibling coin dashboard tab SYM=URL (repeatable)")
+  C2P_ALIAS("web.dashboard_peers", BIN_LTC, "--dashboard-peer", VALUE)
+
 C2P_PARAM("web.explorer", WebOps, TRISTATE_BOOL, RESTART, C_DASH|C_BIP110, NONE, "", NONE, "loopback-only /api/explorer surface (default on)")
   C2P_ALIAS("web.explorer", BIN_DASH, "--explorer", FLAG)
   C2P_ALIAS("web.explorer", BIN_DASH, "--no-explorer", FLAG_NO_PREFIX)

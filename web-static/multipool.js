@@ -11,7 +11,9 @@
  *
  * The script:
  *  1. Auto-detects the current pool from /web/currency_info
- *  2. Renders pool selector tabs in the #pool-tabs container
+ *  2. Renders pool selector tabs in the #pool-tabs container. On a direct
+ *     (non-proxy) node the tab set comes from /api/dashboard_tabs (#926):
+ *     this node's own coins plus the operator-configured sibling dashboards.
  *  3. Overrides d3.json() to prepend the active pool's API base URL
  *  4. Provides pool configuration management (add/remove/switch)
  */
@@ -245,10 +247,10 @@
                     }
                 } catch(e) {}
             }
-            initFromDirect();
+            initFromServerTabs();
         };
-        xhr.onerror = function() { initFromDirect(); };
-        xhr.ontimeout = function() { initFromDirect(); };
+        xhr.onerror = function() { initFromServerTabs(); };
+        xhr.ontimeout = function() { initFromServerTabs(); };
         xhr.send();
     }
 
@@ -278,6 +280,95 @@
 
         // Refresh data through the correct proxy route
         reloadCurrencyAndRefresh();
+    }
+
+    // ── Server tab set (#926) ────────────────────────────────────────────
+    // /api/dashboard_tabs returns {tabs:[{coin, symbol, active, location}]}.
+    // location is "/" for the coin this dashboard serves, an http(s) URL for
+    // a configured sibling dashboard, or null for a coin this node also runs
+    // that has no page of its own yet. Never a dead link:
+    //   * active          -> the existing highlighted label, left as-is
+    //   * URL location    -> <a class="pool-tab" href=...>
+    //   * null location   -> non-clickable <span class="pool-tab">
+    //   * anything else   -> no tab at all
+    // A node without the endpoint (older build) or with nothing beyond its
+    // own coin keeps exactly today's behaviour.
+    function tabHref(location) {
+        if (typeof location !== 'string') return null;
+        if (/^https?:\/\/[^\/\s"'<>`\\:?#][^\s"'<>`\\]*$/.test(location)) return location;
+        if (/^\/(?!\/)[^\s"'<>`\\]*$/.test(location)) return location;
+        return null;
+    }
+
+    // Pure: server tabs -> render plan. Exported for testing.
+    function planServerTabs(tabs) {
+        var plan = { active: null, others: [] };
+        if (!Array.isArray(tabs)) return plan;
+        tabs.forEach(function(t) {
+            if (!t || typeof t.symbol !== 'string' || !t.symbol) return;
+            if (t.active === true) {
+                if (!plan.active && tabHref(t.location)) plan.active = { symbol: t.symbol };
+                return;
+            }
+            if (t.location === null) {
+                plan.others.push({ symbol: t.symbol, href: null });
+                return;
+            }
+            var href = tabHref(t.location);
+            if (href) plan.others.push({ symbol: t.symbol, href: href });
+        });
+        return plan;
+    }
+
+    function renderServerTabs(plan) {
+        var container = document.getElementById('pool-tabs');
+        if (!container) return;
+
+        // Keep the page's own active label (it carries ids/classes the page
+        // code writes the coin symbol into); create one only if the page
+        // ships an empty container.
+        var activeEl = container.querySelector('.pool-tab.active');
+        if (!activeEl) {
+            activeEl = document.createElement('span');
+            activeEl.className = 'pool-tab active';
+            activeEl.textContent = plan.active.symbol;
+            container.appendChild(activeEl);
+        }
+        var stale = container.querySelectorAll('[data-dashboard-tab]');
+        for (var i = 0; i < stale.length; i++) stale[i].parentNode.removeChild(stale[i]);
+
+        plan.others.forEach(function(o) {
+            var el;
+            if (o.href) {
+                el = document.createElement('a');
+                el.href = o.href;
+                el.rel = 'noopener';
+                el.title = o.symbol + ' dashboard';
+                el.style.textDecoration = 'none';
+            } else {
+                el = document.createElement('span');
+                el.title = o.symbol + ' is mined on this node';
+                el.style.cursor = 'default';
+                el.style.transform = 'none';
+            }
+            el.className = 'pool-tab';
+            el.setAttribute('data-dashboard-tab', o.symbol);
+            el.textContent = o.symbol;
+            container.appendChild(el);
+        });
+    }
+
+    function initFromServerTabs() {
+        _origD3Json('../api/dashboard_tabs', function(data) {
+            var plan = planServerTabs(data && data.tabs);
+            if (!plan.active) {
+                // Endpoint missing or no local coin known: today's behaviour.
+                initFromDirect();
+                return;
+            }
+            window.multipoolApiBase = '';
+            renderServerTabs(plan);  // single coin: leaves the label as-is
+        });
     }
 
     function initFromDirect() {
@@ -326,7 +417,8 @@
         addPool: addPool,
         switchToPool: switchToPool,
         renderTabs: renderTabs,
-        getChainColor: getChainColor
+        getChainColor: getChainColor,
+        planServerTabs: planServerTabs
     };
 
 })();
