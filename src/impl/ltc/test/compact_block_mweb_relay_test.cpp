@@ -9,7 +9,8 @@
 // that ends with a HogEx must therefore be relayed as a full block.
 //
 // Also pins the sendcmpct fold: litecoind sends v3, v2, v1 in that order;
-// the peer's version is the highest one announced, not the last one.
+// for an MWEB peer the version is the highest one announced, not the last
+// one. Peers of the other chains sharing this P2P node keep the last one.
 //
 // Folded into the allowlisted share_test target (NOT a standalone executable)
 // to avoid the #769 "Not Run" CI trap.
@@ -37,7 +38,9 @@ using ltc::coin::TxIn;
 using ltc::coin::TxOut;
 using ltc::coin::block_has_hogex;
 using ltc::coin::fold_cmpct_version;
+using ltc::coin::relay_cmpct_version;
 using ltc::coin::relay_mode_for;
+using ltc::coin::NODE_MWEB_SERVICE;
 
 namespace {
 
@@ -135,6 +138,26 @@ TEST(LtcCompactMwebRelay, SendcmpctFoldKeepsHighestVersion)
     for (uint64_t announced : {1u, 2u})
         v = fold_cmpct_version(v, announced);
     EXPECT_EQ(v, 2u);
+}
+
+// The fold applies to MWEB peers only. DOGE/NMC peers share this P2P node and
+// keep the last announced version (the old behaviour), so a peer that sends
+// v2 then v1 stays on full blocks there.
+TEST(LtcCompactMwebRelay, FoldOnlyForMwebPeers)
+{
+    const uint64_t ltc_services  = 1 | (1 << 3) | NODE_MWEB_SERVICE;  // NETWORK|WITNESS|MWEB
+    const uint64_t other_services = 1 | (1 << 3);
+
+    // litecoind: v3, v2, v1 -> last 1, highest 3 -> 3 (HogEx -> Full either way)
+    EXPECT_EQ(relay_cmpct_version(ltc_services, 1, 3), 3u);
+    // non-MWEB peer: v2, v1 -> 1 (last), not 2
+    EXPECT_EQ(relay_cmpct_version(other_services, 1, 2), 1u);
+    EXPECT_EQ(relay_mode_for(relay_cmpct_version(other_services, 1, 2), make_block(false)),
+              RelayMode::Full);
+    // non-MWEB peer: v1, v2 -> 2 -> Compact, as before
+    EXPECT_EQ(relay_cmpct_version(other_services, 2, 2), 2u);
+    EXPECT_EQ(relay_mode_for(relay_cmpct_version(other_services, 2, 2), make_block(false)),
+              RelayMode::Compact);
 }
 
 TEST(LtcCompactMwebRelay, CompactEncodingDropsMwebFullBlockKeepsIt)

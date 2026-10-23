@@ -245,6 +245,19 @@ inline uint64_t fold_cmpct_version(uint64_t current, uint64_t announced) {
     return std::max(current, announced);
 }
 
+/// NODE_MWEB service bit (litecoind).
+constexpr uint64_t NODE_MWEB_SERVICE = 1ULL << 24;
+
+/// The compact-block version our relay decision uses for a peer. An MWEB peer
+/// (litecoind) announces v3, v2, v1: use the highest. Every other chain that
+/// shares this P2P node (DOGE, NMC) keeps the last announced version, exactly
+/// as before, so their relay does not change.
+inline uint64_t relay_cmpct_version(uint64_t peer_services,
+                                    uint64_t last_announced,
+                                    uint64_t highest_announced) {
+    return (peer_services & NODE_MWEB_SERVICE) ? highest_announced : last_announced;
+}
+
 /// True when the block's last transaction is the MWEB HogEx.
 inline bool block_has_hogex(const BlockType& block) {
     return !block.m_txs.empty() && block.m_txs.back().m_hogEx;
@@ -256,7 +269,8 @@ inline bool block_has_hogex(const BlockType& block) {
 /// litecoind drops a v1/v2 cmpctblock and never sees the block. A HogEx block
 /// therefore always goes out as a full block, which carries "01" + mweb. A
 /// compact block is sent only to a v2 peer and only for a block without a
-/// HogEx (v3 is not announced or encoded here).
+/// HogEx (v3 is not announced or encoded here). Outside Litecoin, BIP 152
+/// versions are 1 and 2 only, so "== 2" is the old ">= 2" gate there.
 inline RelayMode relay_mode_for(uint64_t peer_cmpct_version, const BlockType& block) {
     if (block_has_hogex(block))
         return RelayMode::Full;
