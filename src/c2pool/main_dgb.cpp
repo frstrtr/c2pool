@@ -2546,6 +2546,17 @@ int run_node(const core::CoinParams& params, bool testnet,
             return static_cast<double>(aps.GetLow64());
         });
 
+        // (5b) stratum worker registry — DGB stratum sessions register and
+        //      refresh (hashrate, RTT) on DGBWorkSource, not on this
+        //      MiningInterface (whose acceptor is unused). Without this bridge
+        //      /local_stats + stratum.html read MiningInterface's own empty
+        //      registry. Mirrors btc/bip110/dash. Display-only; p2pool-merged-v36
+        //      surface: NONE.
+        mi->set_stratum_workers_fn([ws = work_source.get()]() {
+            return ws ? ws->get_stratum_workers()
+                      : std::map<std::string, core::stratum::WorkerInfo>{};
+        });
+
         // (6) share-peers — the pool node sharechain P2P peer snapshot
         //     (IO-thread-published, lock-free; NEVER iterates the live
         //     m_peers map). Feeds core MiningInterface::update_stat_log ->
