@@ -1497,12 +1497,17 @@ public:
             if (const std::optional<Hash32> id = store_->best_at(x))
                 if (const CarrierBodyV3* body = bodies_->get(*id)) (*pre)[x] = header_of(*body);
         pre->erase(pre->begin(), pre->lower_bound(first));
+        std::set<Hash32> side_gone;  // K_PSIDE rows of the carriers the re-root drops
         if (root > out.root)
             if (const std::optional<std::vector<Hash32>> gone = tree_->reroot(root, out.floors.sides))
-                for (const Hash32& id : *gone) bodies_->erase(id);
-        if (PathbKv* kv = store_kv()) {  // K_PSIDE: the rows of the side carriers the tree no longer holds
-            LaneBatch sb;               // (a failed scan: none this step)
-            if (side_prune_batch(*kv, cfg_.record_chain, *tree_, sb) && !sb.ops.empty() && !commit_lane_batch(*kv, sb)) {
+                for (const Hash32& id : *gone) {
+                    bodies_->erase(id);
+                    side_gone.insert(id);
+                }
+        if (PathbKv* kv = store_kv()) {  // K_PSIDE at floors.sides (a failed scan: none this step)
+            LaneBatch sb;
+            if (side_prune_batch(*kv, cfg_.record_chain, out.floors.sides, side_gone, sb) && !sb.ops.empty() &&
+                !commit_lane_batch(*kv, sb)) {
                 poison(store_->best_tip());
                 return out;
             }

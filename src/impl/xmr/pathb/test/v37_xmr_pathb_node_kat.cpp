@@ -2805,8 +2805,10 @@ void prune_side() {
 
 // ---------------------------------------------------------------------------
 // sideprune: K_PSIDE at the prune. The prune chain's three side carriers (forking at the body floor - 1, at it, above
-// it) written as K_PSIDE rows; the node loaded from that store holds them; its prune at floors.sides deletes the row of
-// the branch forking below the floor and keeps the other two; restarted, it holds those two only.
+// it) written as K_PSIDE rows, and two rows that do not place (another id beside a body): one at a position above the
+// floor, one below it; the node loaded from that store holds the three; its prune at floors.sides deletes the row of
+// the branch forking below the floor and the row below the floor, and keeps the other three; restarted, it holds the
+// two side carriers at and above the floor only.
 void sideprune() {
     PruneChain& c = prune_chain();
     Harness h(c.net);
@@ -2818,6 +2820,22 @@ void sideprune() {
             put = put && pb::put_side(b, 0, c.sn->n.tree, c.sn->n.store, c.sn->n.bodies, id);
         check(put && pb::commit_lane_batch(src, b), "sideprune: the three K_PSIDE rows written");
     }
+    pb::Hash32 above_id{}, below_id{};
+    above_id[0] = 0xa1;
+    below_id[0] = 0xb1;
+    {
+        std::optional<pb::CarrierRecord> r = pb::decode_pside(src.data.at(pb::store_keys::pside(0, c.side_above)));
+        check(r.has_value(), "sideprune: a K_PSIDE row decodes");
+        if (!r) return;
+        pb::LaneBatch b;
+        r->id = above_id;
+        r->pos = c.fb + 2;
+        b.put(pb::store_keys::pside(0, above_id), pb::encode_pside(*r));
+        r->id = below_id;
+        r->pos = c.fb - 5;
+        b.put(pb::store_keys::pside(0, below_id), pb::encode_pside(*r));
+        check(pb::commit_lane_batch(src, b), "sideprune: two rows that do not place written");
+    }
     const std::size_t a = load_node(h, src, h.config(kat_table(c.net), true, kPruneJ));
     MemoryKv& kv = *h.kvs.back();
     bool held = true;
@@ -2827,9 +2845,12 @@ void sideprune() {
     const pb::PathbNode::PruneReport r = h[a].prune(h.now);
     check(r.written && r.floors.sides == c.fb && kv.data.count(pb::store_keys::pside(0, c.side_below)) == 0
                   && kv.data.count(pb::store_keys::pside(0, c.side_at)) == 1
-                  && kv.data.count(pb::store_keys::pside(0, c.side_above)) == 1,
+                  && kv.data.count(pb::store_keys::pside(0, c.side_above)) == 1
+                  && kv.data.count(pb::store_keys::pside(0, above_id)) == 1
+                  && kv.data.count(pb::store_keys::pside(0, below_id)) == 0,
           "sideprune: the prune at floors.sides " + std::to_string(r.floors.sides) +
-                  " deletes the row of the branch forking below it and keeps the rows at and above it");
+                  " deletes the row of the branch forking below it and the row below it; keeps the rows at and above "
+                  "it (one that did not place)");
     pb::StoreFault f = pb::StoreFault::None;
     const std::size_t b = reload_node(h, kv, kPruneJ, &f);
     check(f == pb::StoreFault::None && b != SIZE_MAX && h[b].tree().find(c.side_at) != nullptr

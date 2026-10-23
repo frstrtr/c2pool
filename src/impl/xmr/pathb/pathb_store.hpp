@@ -40,25 +40,23 @@
 //                  placements: written when it is placed as a side carrier
 //                  and by an adoption for the adopted tree's side carriers;
 //                  a switch moves the abandoned branch's carriers here and
-//                  deletes the rows of the new branch; the prune deletes the
-//                  rows of the side carriers the tree no longer holds (side
-//                  branches forking below floors.sides); reloaded under their
-//                  parents at a restart (step 9). A torn row is moved aside to
+//                  deletes the rows of the new branch; the prune step deletes
+//                  the rows below floors.sides and those of the side branches
+//                  its re-root drops (forking below floors.sides); reloaded
+//                  under their parents at a restart (step 9). A torn row is moved aside to
 //                  v37s:psideaside:<chain>:<id hex>, never deleted, never a
 //                  load failure; a scan LevelDB cannot read is a Scan fault
 //                  (the store moved aside, an empty store in its place).
-//                  Disk: one row per side carrier the tree holds with its
-//                  body (the side branches forking at or above floors.sides:
-//                  the view horizon base_pos - J_0 = L - P-01 - J_0, lower
-//                  with P-51's body floor, --pathb-side-keep or an open join
-//                  hold), plus the rows of side carriers left since the last
-//                  prune step; each row at most 256 + 17 x 17 + FRAME_CAP =
+//                  Disk: one row per side carrier at a position at or above
+//                  floors.sides (the view horizon base_pos - J_0 = L - P-01 -
+//                  J_0, lower with P-51's body floor, --pathb-side-keep or an
+//                  open join hold), plus those placed since the last prune
+//                  step; each row at most 256 + 17 x 17 + FRAME_CAP =
 //                  16,074 bytes at hf 16 (the fixed fields, 1 + R_MAX = 17
 //                  placements of 17 bytes, the body at most FRAME_CAP =
 //                  15,529). With k side carriers per position kept over n
 //                  positions: at most k x n x 16,074 bytes (n = P-01 + J_0 =
-//                  2,304 at the defaults: k x 37.0 MB), the bodies the node
-//                  already holds in memory.)
+//                  2,304 at the defaults: k x 37.0 MB).)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
@@ -102,8 +100,9 @@
 //     9. K_PSIDE (a failed scan: Scan; no row is a load failure): each row
 //        decodes under its key (else moved aside); ascending by position, a
 //        row whose parent the tree holds is placed as a side carrier (the
-//        tree, the BinStore while its fork is in view, the body), its stored
-//        d, H, cum_work and S compared; a row that does not place is skipped.
+//        tree, the BinStore while its fork is at or above the journal base,
+//        the body), its stored d, H, cum_work and S compared; a row that does
+//        not place is skipped.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -741,13 +740,14 @@ inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
             store_keys::ncu(chain),          store_keys::poison(chain),          store_keys::pside_prefix(chain)};
 }
 
-// The prune's K_PSIDE part: the rows of the side carriers the tree no longer holds (after its re-root at floors.sides)
-// deleted; false: the scan failed.
-inline bool side_prune_batch(PathbKv& kv, std::uint32_t chain, const CarrierTree& tree, LaneBatch& b) {
+// The prune's K_PSIDE part at floors.sides: the rows at positions below `sides_floor`, and the rows of the carriers the
+// step's re-root dropped (`gone`: side branches forking below the floor), deleted; false: the scan failed.
+inline bool side_prune_batch(PathbKv& kv, std::uint32_t chain, std::uint64_t sides_floor, const std::set<Hash32>& gone,
+                             LaneBatch& b) {
     const std::string prefix = store_keys::pside_prefix(chain);
     return kv.for_each_prefix(prefix, [&](const std::string& k, const std::string& v) {
         const std::optional<CarrierRecord> c = decode_pside(v);
-        if (c && k == store_keys::pside(chain, c->id) && tree.find(c->id) == nullptr) b.del(k);
+        if (c && k == store_keys::pside(chain, c->id) && (c->pos < sides_floor || gone.count(c->id) != 0)) b.del(k);
         return true;
     });
 }
@@ -851,8 +851,8 @@ inline Placement placement_from(const ReceiptBodyV3& r, const StoredPlacement& s
 // under the aside prefix); the others, ascending by position, are placed as side carriers under parents the tree
 // holds, their stored d, H, cum_work and S compared, the marks set and the body kept:
 //   - a row with its placements: placed as place_admitted places one (the tree; the BinStore add / ingest / seal
-//     while its fork is in view, else the tree only, as a running node holds it once BinStore::prune dropped its
-//     delta);
+//     while its fork is at or above the journal base); the tree only otherwise, or when the BinStore cannot place it
+//     again, as a running node holds a side carrier once BinStore::prune dropped its delta;
 //   - a row without them (written once its delta had left the BinStore): restored in the tree from its values.
 // A row that does not place, or would become the best tip, is skipped (its partial placement undone).
 inline bool load_side_carriers(PathbKv& kv, std::uint32_t chain, const LaneParams& p, LoadedState& st) {
@@ -900,20 +900,24 @@ inline bool load_side_carriers(PathbKv& kv, std::uint32_t chain, const LaneParam
             sp.push_back(admit_detail::placement_of(b->own, c.id, c.placements.back().bin, c.placements.back().p_own));
             ok = tree.place(CarrierAnnounce{c.id, c.parent, c.h, b->own.side.receipts_root, b->own.side.ballot}, cp)
                          .verdict == PlaceVerdict::Placed;
-            const AddVerdict av = ok ? store.add_carrier(c.id, c.parent, c.h) : AddVerdict::ParentUnknown;
+            // the BinStore only for a fork at or above its journal base (a switch by the journal can reach it; the
+            // restored store holds every entry its seals read)
+            const LaneView pv = store.view_at(c.parent);
+            const bool in_journal = pv.ok() && pv.fork_pos() >= store.base_pos();
+            const AddVerdict av = ok && in_journal ? store.add_carrier(c.id, c.parent, c.h) : AddVerdict::Deep;
             in_store = av == AddVerdict::Added;
-            ok = ok && (in_store || av == AddVerdict::Deep ||
-                        (av == AddVerdict::ParentUnknown && store.delta(c.parent) == nullptr));
-            for (std::size_t i = 0; in_store && ok && i < sp.size(); ++i) {
+            for (std::size_t i = 0; in_store && i < sp.size(); ++i) {
                 const std::optional<Ingest> ig = store.ingest(c.id, sp[i]);
-                ok = ig.has_value() && *ig == Ingest::Accepted;
+                in_store = ig.has_value() && *ig == Ingest::Accepted;
             }
-            if (in_store && ok) {
+            if (in_store) {
                 const LaneDelta* d = store.delta(c.id);
-                ok = d != nullptr && d->placed.size() == c.placements.size();
-                for (std::size_t k = 0; ok && k < d->placed.size(); ++k) ok = d->placed[k].live == c.placements[k].live;
-                ok = ok && store.seal(c.id).has_value();
+                in_store = d != nullptr && d->placed.size() == c.placements.size();
+                for (std::size_t k = 0; in_store && k < d->placed.size(); ++k)
+                    in_store = d->placed[k].live == c.placements[k].live;
+                in_store = in_store && store.seal(c.id).has_value();
             }
+            if (av == AddVerdict::Added && !in_store) (void)store.drop_side(c.id);  // the tree only
         } else {
             CarrierTree::RestoredNode rn;
             rn.id = c.id;

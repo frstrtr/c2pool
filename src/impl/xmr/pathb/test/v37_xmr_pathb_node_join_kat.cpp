@@ -70,6 +70,8 @@
 //              the switch, reloaded under its parents, walked by a joiner
 //              that completes; the joined node's side branch kept by its
 //              adoption batch; a server without it: Unplaceable, excluded;
+//   sidedeep   a side branch whose bins the BinStore no longer holds at the
+//              restart: reloaded in the tree only, served, the join completes;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
 //              restarted: the journal base the session's; a heavier branch
 //              forking in (base, x1] takes the joiner path by its headers,
@@ -2231,6 +2233,72 @@ void sidekeep() {
     std::printf("  sidekeep: %.1f s\n", secs_since(t0));
 }
 
+// ---------------------------------------------------------------------------
+// sidedeep: a side branch whose bins the BinStore no longer holds at the restart. As sidekeep after 150 positions (one
+// Monero height each: s1 and s2 seal bins), then A mines 1,300 positions more (past P-01 = 1,152), one Monero height
+// per four. Restarted from its store, A holds s1 and s2 in the tree only (the BinStore cannot seal them again:
+// no delta), with their bodies; a node joining from it walks the side branch and completes.
+void sidedeep() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    Harness h(net);
+    const std::size_t a = h.add(kat_table(net), true, kJ, true);
+    MemoryKv& akv = *h.kvs.back();
+    const std::size_t b = h.add(kat_table(net), true);
+    for (int i = 0; i < 150; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.tick_monero();
+    h.mine(a, 2, 900);
+    const pb::Hash32 s1 = h[a].tree().best().id;
+    h.tick_monero();
+    h.mine(a, 2, 901);
+    const pb::Hash32 s2 = h[a].tree().best().id;
+    std::vector<pb::Hash32> bb;
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(b, 3, 950 + i);
+        bb.push_back(h[b].tree().best().id);
+    }
+    h.cut.clear();
+    h.q.clear();
+    for (const pb::Hash32& id : bb)
+        (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(id), pb::kRuledLaneParams.r_max));
+    h.pump();
+    h.cut = {{a, b}, {b, a}};
+    for (int i = 0; i < 1300; ++i) {
+        if (i % 4 == 0) h.tick_monero();
+        h.mine(a, 4 + static_cast<std::size_t>(i % 3), 2000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::Hash32 tip = h[a].tree().best().id;
+    check(h[a].tree().best().pos == 1453 && h[a].tree().find(s1) != nullptr && akv.data.count(pb::store_keys::pside(0, s1)) == 1,
+          "sidedeep: A at position 1,453 (past P-01), s1 and s2 side carriers in K_PSIDE (A at " +
+                  std::to_string(h[a].tree().best().pos) + ")");
+    pb::LoadResult rl = pb::pathb_load(akv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    check(rl.fault == pb::StoreFault::None && rl.state && rl.state->side_loaded == 2 && rl.state->tree.find(s1) != nullptr
+                  && rl.state->tree.find(s2) != nullptr && rl.state->bodies.get(s2) != nullptr
+                  && rl.state->store.delta(s1) == nullptr && rl.state->store.delta(s2) == nullptr,
+          "sidedeep: A's store reloads s1 and s2 in the tree only, with their bodies (" +
+                  std::to_string(rl.state ? rl.state->side_loaded : 0) + " placed, " +
+                  std::to_string(rl.state ? rl.state->side_skipped : 0) + " skipped)");
+    if (!rl.state) return;
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(r), std::move(*rl.state), nullptr));
+    Joining k = joining_node(h, net, kJ);
+    h.hello(k.j, r);
+    const pb::JoinStep st = h[k.j].run_join();
+    h.q.clear();
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[k.j].tree().best().id == tip
+                  && h[k.j].tree().find(s1) != nullptr,
+          "sidedeep: a node joining from A restarted walks the side branch to s1 and completes" +
+                  (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    std::printf("  sidedeep: %.1f s\n", secs_since(t0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2275,5 +2343,6 @@ int main(int argc, char** argv) {
     run("joinrx", joinrx);
     run("keycache", keycache);
     run("sidekeep", sidekeep);
+    run("sidedeep", sidedeep);
     return finish("v37_xmr_pathb_node_join_kat");
 }
