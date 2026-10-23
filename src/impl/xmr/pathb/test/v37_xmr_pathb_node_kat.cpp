@@ -75,8 +75,8 @@
 //   timers       P-53 per request restarted per frame, a timeout is
 //                non-service; the FC_BUCKETS window (FIX-1);
 //   catchpage    an empty-store catch-up of 1,300 positions from three servers
-//                finishes; one page in flight per server; each body asked
-//                once while its ask is open;
+//                finishes; one page in flight per server; the bodies asked
+//                within the deferred store's free room;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5689,8 +5689,8 @@ void relayswitchlog() {
 // ---------------------------------------------------------------------------
 // catchpage: the empty-store catch-up beyond one page. A, B and C hold one chain of 1,300 positions (more than
 // P-01 = P-47 = 1,152); J, empty, catches up from all three while the wire carries at most 100 frames per second of
-// the clock. J reaches the tip; one page in flight per server (catch-up requests bounded by the pages); each body
-// asked once while its ask is open (bodies asked <= the chain + one page).
+// the clock. J reaches the tip; one page in flight per server (catch-up requests bounded by the pages); the bodies
+// asked within the deferred store's free room (bodies asked <= the chain + P-47).
 void catchpage() {
     const KatNet net;
     Harness h(net);
@@ -5739,7 +5739,7 @@ void catchpage() {
     check(mined && held && h[a.node].tree().best().pos == n, "catchpage: A, B and C at 1,300 positions");
     check(h[j.node].tree().best().id == tip, "catchpage: J reaches the tip");
     check(asks <= 3 * (n / 1152 + 3), "catchpage: one page in flight per server (catch-up asks " + std::to_string(asks) + ")");
-    check(bodies_asked <= n + 1152, "catchpage: each body asked once while its ask is open (bodies asked " + std::to_string(bodies_asked) + ")");
+    check(bodies_asked <= n + 1152, "catchpage: the bodies asked within the deferred store's free room (bodies asked " + std::to_string(bodies_asked) + ")");
 }
 
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
