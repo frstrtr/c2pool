@@ -24,6 +24,7 @@
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/log.hpp>
+#include <core/coin/mweb_shape.hpp>
 
 #include <btclibs/util/strencodings.h>
 
@@ -142,7 +143,8 @@ inline std::string bits_to_hex(uint32_t bits) {
 ///   curtime           — current wall-clock timestamp
 ///   coinbasevalue     — miner subsidy in satoshis (no fees — no UTXO set)
 ///   transactions      — array with "data" (hex) and "txid" per tx
-///   rules             — ["csv", "!segwit", "taproot", "mweb"]
+///   rules             — ["csv", "!segwit", "taproot", "mweb"] once MWEB is active,
+///                       else ["segwit"]
 ///   coinbaseflags     — "" (empty)
 ///   mweb              — serialized mw::Block hex (empty MWEB block with carry-forward roots)
 ///   sigoplimit        — 80000
@@ -171,12 +173,18 @@ public:
     /// Build a WorkData template from the current chain tip + mempool.
     /// When mweb_tracker is provided and has state, the template includes
     /// a HogEx transaction (last tx) and MWEB block data.
-    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis).
+    /// MWEB is active once the tracker has seen an MWEB block or the next
+    /// height reaches ChainParams::mweb_activation_height; an MWEB-active
+    /// template without a HogEx + mweb is never emitted.
+    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis)
+    /// or the built template fails the MWEB shape check.
+    /// max_weight bounds the mempool selection (the HogEx is appended after it).
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         bool               is_testnet = false,
-        const MWEBTracker* mweb_tracker = nullptr)
+        const MWEBTracker* mweb_tracker = nullptr,
+        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -223,7 +231,7 @@ public:
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE);
+            pool.get_sorted_txs_with_fees(max_weight);
 
         // coinbasevalue = block reward + included transaction fees
         // Matches litecoind's getblocktemplate coinbasevalue field.
@@ -284,6 +292,10 @@ public:
         // ── MWEB: HogEx transaction + empty MWEB block ────────────────────
         std::string mweb_hex;
         bool has_mweb = false;
+        const uint32_t mweb_seen = mweb_tracker ? mweb_tracker->mweb_seen_height() : 0;
+        const uint32_t mweb_activation = chain.params().mweb_activation_height;
+        const bool mweb_active = mweb_seen > 0
+            || (mweb_activation != 0 && next_h >= mweb_activation);
 
         if (mweb_tracker) {
             auto mweb_state = mweb_tracker->get_state();
@@ -323,8 +335,10 @@ public:
         data["curtime"]           = static_cast<int64_t>(now_ts);
         data["coinbasevalue"]     = static_cast<int64_t>(coinbasevalue);
         data["transactions"]      = std::move(tx_array);
-        // Match litecoind GBT rules exactly
-        data["rules"]             = has_mweb
+        // Match litecoind GBT rules exactly. Keyed on MWEB being active, not
+        // on whether this build found tracker state: a template must never
+        // claim "segwit only" on an MWEB chain.
+        data["rules"]             = mweb_active
             ? nlohmann::json::array({"csv", "!segwit", "taproot", "mweb"})
             : nlohmann::json::array({"segwit"});
         data["coinbaseflags"]     = "";
@@ -333,6 +347,21 @@ public:
         data["sizelimit"]         = 4'000'000;
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+
+        // Post-build MWEB shape check: an MWEB-active template without a
+        // trailing HogEx + mweb can only yield "mweb-missing" blocks.
+        {
+            const auto& txs = data["transactions"];
+            const std::string* last_tx_hex = txs.empty()
+                ? nullptr : &txs.back()["data"].get_ref<const std::string&>();
+            if (auto why = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active)) {
+                LOG_ERROR << "[EMB-LTC] TemplateBuilder: template REFUSED at height " << next_h
+                          << ": " << *why << " (mweb_seen=" << mweb_seen
+                          << " activation=" << mweb_activation
+                          << " tracker_state=" << (has_mweb ? "yes" : "no") << ")";
+                return std::nullopt;
+            }
+        }
 
         LOG_INFO << "[EMB-LTC] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
@@ -379,10 +408,22 @@ public:
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
         auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker);
+        if (!result && m_chain.tip()) {
+            // The builder refused its template on the MWEB shape check (logged
+            // there). HOLD, not a work failure: refresh_work keeps the previous
+            // template and leaves m_work_valid alone.
+            throw core::coin::MwebTemplateHold(
+                "EmbeddedCoinNode::getwork: MWEB is active but there is no MWEB state "
+                "(HogEx + mweb) for the next block yet");
+        }
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
+        // Re-check what leaves the coin node with the same view refresh_work's
+        // ingress guard uses.
+        if (auto why = core::coin::check_template_shape(result->m_data))
+            throw core::coin::MwebTemplateHold("EmbeddedCoinNode::getwork: " + *why);
         return *result;
     }
 

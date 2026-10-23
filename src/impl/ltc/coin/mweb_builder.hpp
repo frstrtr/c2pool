@@ -443,7 +443,18 @@ public:
             return false;
         }
         m_state = std::move(new_state);
+        if (height > m_seen_height)
+            m_seen_height = height;
         return true;
+    }
+
+    /// Highest height of a block whose MWEB state was accepted (0 = never).
+    /// Monotonic: invalidate() does not clear it, so once an MWEB block has
+    /// been seen the chain is known to be MWEB-active even while the state
+    /// itself is being re-fetched.
+    uint32_t mweb_seen_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_seen_height;
     }
 
     /// Get current MWEB state (thread-safe copy).
@@ -460,7 +471,8 @@ public:
     }
 
     /// Invalidate current MWEB state (e.g., after a chain reorg).
-    /// Blocks will not include MWEB data until a fresh full block is received.
+    /// Templates are refused (HOLD) until a fresh full block is received;
+    /// mweb_seen_height() is kept.
     void invalidate() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_state.valid) {
@@ -473,6 +485,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     MWEBState m_state;
+    uint32_t  m_seen_height{0};
 };
 
 } // namespace coin

@@ -78,6 +78,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # other_tx_hashes in GBT order -- by driving the REAL LTC production path
     # (generate_share_transaction, compute_ref_hash_for_work, the share
     # Formatter); no coinbase re-implementation in the test. Same folding rule.
+    #
+    # template_hogex_survives_truncation_test.cpp: the LTC MWEB template shape.
+    # Drives the REAL TemplateBuilder: a max_weight-truncated selection still
+    # ends with the HogEx and carries mweb, an MWEB-active builder without MWEB
+    # state returns nullopt (never a "segwit"-only template), and pins the
+    # mainnet/testnet activation heights. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -111,6 +117,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        template_hogex_survives_truncation_test.cpp
         template_topology_spend_test.cpp
         version_switch_floor_test.cpp
         wirecompat_runtime_test.cpp
