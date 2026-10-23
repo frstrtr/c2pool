@@ -347,10 +347,12 @@ static CollateralRequest k1_request()
 {
     CollateralRequest req = inject_request(testvec::kDonationAddress);
     req.preserve_input_order = true;
-    // Legacy sighash commits no input amounts, so the chain does not record how
-    // the 101627675 duffs split across the eight inputs; only the sum is pinned
-    // (out0 + out1, fee 0). The split below is illustrative: four prior-change
-    // outputs and four coinbase donation slices.
+    // Legacy sighash commits no input amounts, so the unsigned skeleton does not
+    // depend on them. The chain tx itself paid a 1271-duff fee (inputs 101628946,
+    // Relay tool at 1000 duffs/kB). Here the amounts sum to its outputs
+    // (kOnchainSumOut), so the zero-fee inject planner lands on the identical
+    // skeleton: input order, OP_RETURN and change script. The per-input split
+    // is illustrative: four prior-change outputs, four coinbase donation slices.
     const int64_t amounts[8] = {25000000, 25000000, 25000000, 25000000,
                                 406919, 406919, 406919, 406918};
     for (int i = 0; i < 8; ++i) {
@@ -362,7 +364,7 @@ static CollateralRequest k1_request()
 
 static void test_k1_onchain_collateral()
 {
-    std::printf("[K1 on-chain collateral 3d8fd96e: inject-only, direct hash, byte-exact]\n");
+    std::printf("[K1 on-chain collateral 3d8fd96e: inject planner reproduces its unsigned skeleton]\n");
     const std::vector<uint8_t> raw = H(testvec::kOnchainCollateralHex);
     CHECK(raw.size() == 1267, "pinned on-chain tx is 1267 bytes");
     CHECK(c2w::artifact::sha256d_display(raw) == testvec::kOnchainCollateralTxid,
@@ -375,7 +377,7 @@ static void test_k1_onchain_collateral()
     CHECK(hexstr(plan.op_return_script) == testvec::kOnchainOpReturn, "OP_RETURN == 6a20 + reversed(display hash)");
     CHECK(plan.gov_hash_display == testvec::kOnchainGovHash, "plan carries the direct display hash");
     CHECK(plan.fee == 0 && plan.fee_mode == FeeMode::InjectOnlyZeroFee, "fee 0, inject-only");
-    CHECK(plan.total_in == testvec::kOnchainTotalIn, "total in = 101627675");
+    CHECK(plan.total_in == testvec::kOnchainSumOut, "KAT inputs sum to the chain tx's outputs (101627675)");
     CHECK(plan.change == testvec::kOnchainChange, "change = 1627675");
     auto outs = parse_outputs(plan.unsigned_tx);
     CHECK(outs.size() == 2 && outs[0].value == kCoin && hexstr(outs[1].script) == testvec::kDonationSpk,
@@ -439,6 +441,18 @@ static void test_k2_fee_flags()
     CHECK(tx.size <= inj_plan.est_signed_bytes, "signed size within the estimate");
     CHECK(!aborts([&] { verify_signed_funding_tx(tx.hex, DUMMY_ADDR0, false); }), "inject collateral re-verifies");
 
+    // The unsigned bytes carry no amounts, so an edited amount passes the bytes
+    // check; the sign-time sum identity is what refuses it.
+    CollateralPlan amt = inj_plan;
+    amt.selected[0].satoshis += 1;
+    CHECK(amt.unsigned_tx == inj_plan.unsigned_tx, "an amount edit leaves the unsigned bytes unchanged");
+    CHECK(aborts_with([&] { sign_collateral(amt, key, true); }, "does not balance"),
+          "sign: inputs != 1 DASH + change + fee aborts (inject)");
+    CollateralPlan relay_fee = plan_collateral(make_request(DUMMY_ADDR0));
+    relay_fee.fee += 1;
+    CHECK(aborts_with([&] { sign_collateral(relay_fee, key, true); }, "does not balance"),
+          "sign: inputs != 1 DASH + change + fee aborts (Relay)");
+
     CollateralPlan edited = inj_plan;
     edited.unsigned_tx[edited.unsigned_tx.size() - 5] ^= 0x01;
     CHECK(aborts_with([&] { sign_collateral(edited, key, true); }, "not the planned one"), "sign: edited plan bytes abort");
@@ -501,7 +515,22 @@ static void test_k4_maturity()
     Utxo nc = mk_utxo(txid_of_byte("dd"), 0, 1, 0, spk, false);
     CHECK(confirmations_needed(cb, 50) == kCoinbaseMaturity && confirmations_needed(cb, 120) == 120,
           "known coinbase: never below 100");
-    CHECK(confirmations_needed(unk, 50) == 50 && confirmations_needed(nc, 101) == 1, "unknown: min_conf; non-coinbase: 1");
+    CHECK(confirmations_needed(unk, 50) == kCoinbaseMaturity && confirmations_needed(unk, 120) == 120,
+          "unknown (treated as coinbase): never below 100 either");
+    CHECK(confirmations_needed(nc, 101) == 1, "known non-coinbase: 1");
+
+    // A lowered min_confirmations cannot let a possibly-coinbase UTXO through.
+    CollateralRequest low = inject_request(DUMMY_ADDR0);
+    low.min_confirmations = 6;
+    low.utxos = {mk_utxo(txid_of_byte("e1"), 0, 50000000, 99, spk),           // unknown at 99
+                 mk_utxo(txid_of_byte("e2"), 0, 80000000, 100, spk),          // unknown at 100
+                 mk_utxo(txid_of_byte("e3"), 0, 30000000, 1, spk, false)};    // non-coinbase at 1
+    CollateralPlan lp = plan_collateral(low);
+    CHECK(lp.skipped_immature.size() == 1 && lp.skipped_immature[0].txid == txid_of_byte("e1"),
+          "min_conf 6: unknown at conf 99 excluded");
+    CHECK(lp.selected.size() == 2 && lp.selected[0].txid == txid_of_byte("e2") &&
+              lp.selected[1].txid == txid_of_byte("e3"),
+          "min_conf 6: unknown at conf 100 and known non-coinbase at conf 1 included");
 
     CollateralRequest none = req;
     for (Utxo& u : none.utxos) { u.confirmations = 3; u.coinbase = std::nullopt; }
@@ -785,6 +814,15 @@ static void test_k12_refusals()
     CollateralRequest dup = k1_request();
     dup.utxos.push_back(dup.utxos[0]);
     CHECK(aborts_with([&] { plan_collateral(dup); }, "listed twice"), "inject: a duplicate outpoint aborts");
+    CollateralRequest relay_dup = make_request(DUMMY_ADDR0);
+    relay_dup.utxos.push_back(relay_dup.utxos[0]);
+    CHECK(aborts_with([&] { plan_collateral(relay_dup); }, "listed twice"),
+          "Relay select_coins: a duplicate outpoint aborts too");
+    CollateralRequest relay_dup_case = make_request(DUMMY_ADDR0);
+    relay_dup_case.utxos.push_back(relay_dup_case.utxos[0]);
+    relay_dup_case.utxos.back().txid = std::string(64, 'A'); // same outpoint, other hex case
+    CHECK(aborts_with([&] { plan_collateral(relay_dup_case); }, "listed twice"),
+          "a duplicate outpoint differing only in hex case aborts");
 
     SweepRequest sw = sweep_of(3, 1000);
     sw.utxos[1].script_pubkey_hex = spk_hex_of(DUMMY_ADDR1);

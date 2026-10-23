@@ -10,8 +10,9 @@
 // The intake is public data only. Amounts are taken from the integer
 // `satoshis` field; the floating `amount` field is ignored. Insight carries no
 // coinbase flag, so every parsed UTXO has coinbase == nullopt and is held to
-// min_confirmations (a coinbase output dropped into a template before it
-// matures is dropped silently by the node, so this gate is the only guard).
+// the coinbase rule, max(min_confirmations, 100) (a coinbase output dropped into
+// a template before it matures is dropped silently by the node, so this gate is
+// the only guard).
 //
 // std-only header; the .cpp sits on the btclibs closure (hdkeys MiniJson / hex).
 
@@ -31,9 +32,9 @@ namespace c2w::dash {
 // empty, which a strict screen then refuses.
 std::vector<Utxo> parse_insight_utxos(const std::string& json, std::string& err);
 
-// Confirmations a UTXO needs before a plan may spend it: 1 for a known
-// non-coinbase output, otherwise min_confirmations, and never below
-// kCoinbaseMaturity for a known coinbase output.
+// Confirmations a UTXO needs before a plan may spend it: 1 for an output KNOWN
+// not to be coinbase; otherwise (coinbase, or unknown) max(min_confirmations,
+// kCoinbaseMaturity).
 int64_t confirmations_needed(const Utxo& u, int64_t min_confirmations);
 
 struct UtxoScreen {
@@ -44,8 +45,9 @@ struct UtxoScreen {
 
 // Screen `raw` for a plan funded by `funding_h160`. Throws DashAbort on a
 // malformed entry (bad txid, negative value) or a scriptPubKey that is present
-// and does not pay the funding P2PKH. With `strict` (inject mode, sweep_all and
-// SweepTx) a missing scriptPubKey and a duplicate outpoint are refused as well.
+// and does not pay the funding P2PKH, and on an outpoint listed twice (in every
+// mode: a tx spending it twice is invalid). With `strict` (inject mode,
+// sweep_all and SweepTx) a missing scriptPubKey is refused as well.
 UtxoScreen screen_utxos(const std::vector<Utxo>& raw,
                         const std::array<uint8_t, 20>& funding_h160,
                         int64_t min_confirmations,

@@ -100,7 +100,7 @@ std::vector<Utxo> parse_insight_utxos(const std::string& json, std::string& err)
             u.script_pubkey_hex = lower_ascii(spk->str);
         }
 
-        // Insight has no coinbase flag: leave it unknown (held to min_confirmations).
+        // Insight has no coinbase flag: leave it unknown (held to the coinbase rule).
         u.coinbase = std::nullopt;
         out.push_back(std::move(u));
     }
@@ -109,9 +109,11 @@ std::vector<Utxo> parse_insight_utxos(const std::string& json, std::string& err)
 
 int64_t confirmations_needed(const Utxo& u, int64_t min_confirmations)
 {
+    // Only a UTXO KNOWN not to be coinbase escapes the coinbase rule; an unknown
+    // one is treated as coinbase, so lowering min_confirmations can never let a
+    // possibly-coinbase output through before it matures.
     if (u.coinbase.has_value() && !*u.coinbase) return 1;
-    if (u.coinbase.value_or(false)) return std::max(min_confirmations, kCoinbaseMaturity);
-    return min_confirmations;
+    return std::max(min_confirmations, kCoinbaseMaturity);
 }
 
 UtxoScreen screen_utxos(const std::vector<Utxo>& raw,
@@ -142,7 +144,7 @@ UtxoScreen screen_utxos(const std::vector<Utxo>& raw,
                 throw DashAbort("UTXO " + u.txid + " scriptPubKey does NOT pay the funding "
                                 "address — refusing to touch it");
         }
-        if (strict && !seen.insert({lower_ascii(u.txid), u.vout}).second)
+        if (!seen.insert({lower_ascii(u.txid), u.vout}).second)
             throw DashAbort("UTXO " + u.txid + ":" + std::to_string(u.vout) +
                             " is listed twice — a tx spending it twice is invalid");
 

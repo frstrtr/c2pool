@@ -61,8 +61,8 @@ struct Utxo {
     int64_t confirmations = 0;
     std::string script_pubkey_hex;   // validated against the funding script when present;
                                      // REQUIRED in inject mode, with sweep_all, and for SweepTx
-    // nullopt => treated as coinbase (min_confirmations applies); false => one
-    // confirmation is enough; true => min_confirmations, never below kCoinbaseMaturity.
+    // true or nullopt (unknown, treated as coinbase) => max(min_confirmations,
+    // kCoinbaseMaturity) confirmations; false => one confirmation is enough.
     std::optional<bool> coinbase = std::nullopt;
 };
 
@@ -121,9 +121,9 @@ struct CollateralRequest {
 // Compute the collateral hash, select coins, and produce the dry-run summary.
 // Signs nothing and needs no key. Throws DashAbort on a wrong network / bad
 // address, an --expected-hash mismatch, a foreign UTXO scriptPubKey, or
-// insufficient mature funds. Also, for the fee modes: a zero fee_rate in Relay
-// mode; InjectOnlyZeroFee with a non-zero fee_rate or without sweep_all; a
-// missing scriptPubKey or a duplicate outpoint in inject mode or with
+// insufficient mature funds, or an outpoint listed twice. Also, for the fee
+// modes: a zero fee_rate in Relay mode; InjectOnlyZeroFee with a non-zero
+// fee_rate or without sweep_all; a missing scriptPubKey in inject mode or with
 // sweep_all; a direct hash that is not 64 hex or disagrees with the hash
 // derived from time_/data_hex; every UTXO immature or dust; and, in inject mode
 // or with sweep_all, a tx over the node caps (est. signed bytes or inputs) —
@@ -134,9 +134,11 @@ CollateralPlan plan_collateral(const CollateralRequest& req);
 // vendored interpreter, refuse on oversize, and return the signed hex. Throws
 // DashAbort unless `confirm_spend` is true (the typed-SPEND gate), if the key's
 // address is not the funding address or its hash160 is not the funding script's,
-// if the bytes about to be signed differ from plan.unsigned_tx, if a zero-fee
-// plan is not marked InjectOnlyZeroFee, or if any input fails self-verify. An
-// inject plan's signed size is re-checked against the node cap after signing.
+// if the selected amounts do not sum to 1 DASH + change + fee, if the bytes
+// about to be signed differ from plan.unsigned_tx, if a zero fee and
+// InjectOnlyZeroFee do not go together, if an inject plan is over the input
+// cap, or if any input fails self-verify. An inject plan's signed size is
+// re-checked against the node cap after signing.
 SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool confirm_spend);
 
 } // namespace c2w::dash

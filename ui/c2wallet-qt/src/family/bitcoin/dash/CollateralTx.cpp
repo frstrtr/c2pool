@@ -202,9 +202,9 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
     }
     plan.op_return_script = collateral_op_return_script(plan.gov_hash_internal);
 
-    // Inject mode and sweep_all are strict: every UTXO must carry its
-    // scriptPubKey and no outpoint may appear twice. The classic Relay selection
-    // keeps its optional scriptPubKey.
+    // No outpoint may appear twice in any mode. Inject mode and sweep_all are
+    // also strict: every UTXO must carry its scriptPubKey. The classic Relay
+    // selection keeps its optional scriptPubKey.
     const UtxoScreen screen = screen_utxos(req.utxos, funding_h160, req.min_confirmations,
                                            req.dust_floor, inject || req.sweep_all);
     plan.skipped_immature = screen.immature;
@@ -320,6 +320,18 @@ SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool c
         throw DashAbort("an INJECT-ONLY plan must pay a fee of exactly 0 — refusing to sign");
     if (inject && plan.selected.size() > caps::kMaxInjectInputs)
         throw DashAbort("the plan exceeds the node's inject input cap — refusing to sign");
+
+    // Legacy sighash commits no input amounts, so an edited amount would sign
+    // cleanly: the selected amounts must still pay exactly burn + change + fee.
+    int64_t sum_in = 0;
+    for (const Utxo& u : plan.selected)
+        if (u.satoshis < 0 || __builtin_add_overflow(sum_in, u.satoshis, &sum_in))
+            throw DashAbort("the plan's input amounts are malformed — refusing to sign");
+    if (plan.fee < 0 || plan.change < 0 ||
+        sum_in != kGovernanceProposalFee + plan.change + plan.fee)
+        throw DashAbort("the plan does not balance: inputs " + std::to_string(sum_in) +
+                        " != 1 DASH + change " + std::to_string(plan.change) + " + fee " +
+                        std::to_string(plan.fee) + " duffs — refusing to sign");
 
     const std::array<uint8_t, 20> funding_h160 = addr_to_h160(plan.funding_address, plan.testnet);
     if (signer::hash160(key.pub) != h160_bytes(funding_h160))

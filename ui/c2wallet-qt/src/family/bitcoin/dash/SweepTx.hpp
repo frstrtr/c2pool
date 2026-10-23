@@ -64,7 +64,7 @@ struct SweepBatchPlan {
 };
 
 // Screen the UTXOs (strict: scriptPubKey required and must pay the funding
-// address, no duplicate outpoint), drop dust and immature ones (listed in the
+// address; no outpoint twice), drop dust and immature ones (listed in the
 // summary), order them, and split greedily so every tx stays within
 // min(max_inputs_per_tx, kMaxInjectInputs) inputs and min(max_tx_bytes,
 // kMaxInjectTxBytes) estimated signed bytes. More txs than one node's inject

@@ -6,10 +6,16 @@
 // K1 — the on-chain governance collateral tx
 //   3d8fd96eae63e65c8723bbc20f40d26c0976658d71a897d94d3e8753565c81cd
 // for gobject fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631,
-// built zero-fee from and with change to the c2pool donation address
+// funded from and with change to the c2pool donation address
 // XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u (dash::DONATION_SCRIPT). Version 2,
 // locktime 0, 8 inputs at sequence ffffffff (NOT sorted by outpoint),
-// out0 = 1.00000000 DASH OP_RETURN, out1 = 0.01627675 DASH change, fee 0.
+// out0 = 1.00000000 DASH OP_RETURN, out1 = 0.01627675 DASH change.
+// The chain tx was NOT zero-fee: it was built by the Relay tool at 1000
+// duffs/kB, its inputs sum to 101628946 duffs, and it paid a 1271-duff fee.
+// Legacy sighash commits no input amounts, so the unsigned skeleton (input
+// order, OP_RETURN, change script) does not depend on them: the KAT feeds
+// amounts that sum to the outputs (kOnchainSumOut) and the zero-fee inject
+// planner reproduces the identical unsigned bytes.
 // The raw bytes are the mainnet transaction as served by getrawtransaction; the
 // KAT re-derives its txid before trusting them.
 //
@@ -35,7 +41,7 @@ inline const char* const kOnchainOpReturn =
 inline const char* const kDonationAddress = "XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u";
 inline const char* const kDonationSpk = "76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac";
 inline const long long kOnchainChange = 1627675;
-inline const long long kOnchainTotalIn = 101627675;
+inline const long long kOnchainSumOut = 101627675; // out0 + out1; the chain inputs were 101628946
 
 inline const char* const kOnchainCollateralHex =
     "02000000089e37dd515ffb4eea8497e3d82363b2ac18296d871773463ad0258cefb5836e5900"
