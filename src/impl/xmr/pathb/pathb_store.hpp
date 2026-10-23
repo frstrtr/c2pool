@@ -31,6 +31,10 @@
 //   19 K_BCLAIM    v37s:bclaim:<chain>:<bin %020u>  u64 bin | b32 at_id | b32 at_digest
 //                  (a joined store: a leaf it adopted as a claim, proved
 //                  against that at header; 3.7a, E-72)
+//   20 K_NCU       v37s:ncu:<chain>                 (no field)
+//                  (a store that started empty, not launched here, and has
+//                  not caught up yet: written in its first batch, deleted
+//                  when it catches up; an adoption's empty store holds none)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
@@ -69,7 +73,8 @@
 //     6. the lane records at or beyond leaf_count deleted (one batch);
 //     7. K_BWORK: each key names its own height (the bound work below the
 //        floor; absent: none); K_BLO at least 1 and at most tip + 1, present
-//        in a joined store; K_BCLAIM: each key names its own bin.
+//        in a joined store; K_BCLAIM: each key names its own bin;
+//     8. K_NCU: present (not caught up) or absent.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -104,6 +109,8 @@ inline constexpr std::uint8_t K_AR = 16;
 inline constexpr std::uint8_t K_BWORK = 17;
 inline constexpr std::uint8_t K_BLO = 18;
 inline constexpr std::uint8_t K_BCLAIM = 19;
+inline constexpr std::uint8_t K_NCU = 20;  // a node-local store layout kind, the next after K_BCLAIM; no chain byte,
+                                           // digest, frame or verdict reads it
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -116,6 +123,7 @@ inline std::string bwork(std::uint32_t c, std::uint64_t h) { return bwork_prefix
 inline std::string blo(std::uint32_t c) { return "v37s:blo:" + lane_keys::chain_fmt(c); }
 inline std::string bclaim_prefix(std::uint32_t c) { return "v37s:bclaim:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string bclaim(std::uint32_t c, std::uint64_t bin) { return bclaim_prefix(c) + lane_keys::index_fmt(bin); }
+inline std::string ncu(std::uint32_t c) { return "v37s:ncu:" + lane_keys::chain_fmt(c); }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -395,6 +403,17 @@ inline std::optional<std::uint64_t> decode_blo(const std::string& v) {
     return lo;
 }
 
+inline std::string encode_ncu() {
+    lane_rec::Writer w;
+    w.hdr(K_NCU);
+    return w.s;
+}
+
+inline bool decode_ncu(const std::string& v) {
+    lane_rec::Reader r(v);
+    return lane_rec::read_hdr(r, K_NCU) && r.done();
+}
+
 struct BclaimRecord {
     std::uint64_t bin = 0;
     Hash32 at_id{};
@@ -649,7 +668,7 @@ inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
             store_keys::bwork_prefix(chain), store_keys::blo(chain),            store_keys::bclaim_prefix(chain),
-            store_keys::poison(chain)};
+            store_keys::ncu(chain),          store_keys::poison(chain)};
 }
 
 // An adoption (the first completed join, or a replacement by rule (4)) and the
@@ -691,7 +710,7 @@ enum class StoreFault : std::uint8_t {
     Scan,       // the KV scan failed
     Poisoned,   // the store's poison mark: a write failed before the last stop
     Work,       // a K_BWORK / K_BCLAIM record torn, not under its key or (K_BCLAIM) out of range; a K_BLO torn, out of
-                // range, or absent (joined)
+                // range, or absent (joined); a K_NCU torn
 };
 
 struct LoadInputs {
@@ -715,6 +734,7 @@ struct LoadedState {
     std::map<std::uint64_t, ::c2pool::xmr::native::U128> bound_below;  // K_BWORK: bound work below the floor, by height
     std::uint64_t bound_lo = 0;  // K_BLO: a joined store's x1 + 1 (0: count from the tree's root)
     std::map<std::uint64_t, BclaimRecord> claimed;  // K_BCLAIM: a joined store's adopted (claimed) leaves, by bin
+    bool not_caught_up = false;                     // K_NCU: the store started empty and has not caught up yet
 };
 
 struct LoadResult {
@@ -1086,6 +1106,15 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
             if (c->bin < H.h0 || c->bin - H.h0 >= lc_tip) return fail(StoreFault::Work);
             if (joined && c->bin - H.h0 >= H.base_leaf_count && c->bin > *adopt_bound) return fail(StoreFault::Work);
             st.claimed[c->bin] = *c;
+        }
+    }
+    // 8. K_NCU
+    {
+        const KvRead nc = kv.read(store_keys::ncu(in.chain));
+        if (nc.status == KvRead::Status::Error) return fail(StoreFault::Scan);
+        if (nc.status == KvRead::Status::Value) {
+            if (!decode_ncu(nc.value)) return fail(StoreFault::Work);
+            st.not_caught_up = true;
         }
     }
     out.state.emplace(std::move(st));

@@ -280,6 +280,11 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    /// Refresh the session's TCP round-trip latency (ms). The stratum session
+    /// samples it from the kernel on every accepted submit; without this
+    /// override the base no-op kept the value sampled at authorize, so the
+    /// dashboard's Latency column froze at the connect-time reading.
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
 
     /// Thread-safe snapshot of the per-connection worker registry
     /// (session_id -> WorkerInfo). The DASH stratum acceptor is a standalone
@@ -358,8 +363,9 @@ public:
     /// not a superblock height — else it fails safe to the dashd fallback.
     void set_embedded_mainnet(bool v) { embedded_mainnet_ = v; }
 
-    /// The DASH v36 network takes its mining work from dashd getblocktemplate
-    /// only (coin/v36_work_policy.hpp): when ON, the embedded template arm is
+    /// The DASH v36 network with a dashd RPC arm takes its mining work from
+    /// dashd getblocktemplate only (coin/v36_work_policy.hpp; a daemonless v36
+    /// node leaves this OFF and serves the embedded arm): when ON, the embedded template arm is
     /// never served -- on testnet/regtest and under --embedded-mainnet alike --
     /// and every template comes from the dashd fallback, whose tx bodies the
     /// finder assembles the won block from. The decline is published as
@@ -836,7 +842,7 @@ private:
     bool is_testnet_{false};
     bool is_regtest_{false};  // #961: --regtest payout-address acceptance set
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
-    bool dashd_templates_only_{false};   // DASH v36 network: never serve the embedded arm
+    bool dashd_templates_only_{false};   // DASH v36 network with dashd RPC (or no work source): never serve the embedded arm
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
     bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)
     // Observability for the own-set referee (lock-free; published in embedded_arm_status_json).

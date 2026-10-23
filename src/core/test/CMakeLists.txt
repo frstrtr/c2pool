@@ -125,6 +125,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         coin_addrman_test.cpp
         coin_registry_symbol_test.cpp
         core_merkle_branches_test.cpp
+        dual_family_dial_test.cpp
         events_test.cpp
         factory_connect_failed_uaf_test.cpp
         filesystem_test.cpp

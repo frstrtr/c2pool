@@ -4,6 +4,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(btc_share_test
         auto_ratchet_sim_test.cpp
+        bip34_height_push_test.cpp
         block_assembly_test.cpp
         block_broadcast_connect_test.cpp
         block_broadcast_guard_test.cpp

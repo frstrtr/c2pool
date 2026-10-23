@@ -9,8 +9,10 @@
 //   set_template  the shared template of the best tip (one template id per
 //                 template), with the Monero network difficulty and the RandomX
 //                 seeds of its height; clear(): no template
-//   bind          the session of an extra_nonce (payee and stated vote; the
-//                 listener's session binder, the CPU miner's own slot)
+//   bind          the session of one job's extra_nonce (payee and stated vote;
+//                 the listener's session binder): taken by the next get_job of
+//                 that extra_nonce on every return path
+//   bind_own      the CPU miner's own slot: kept for every template
 //   get_job       PathbNode::make_job for the extra_nonce's session (through
 //                 the caller's make_job function, under the node lock); the
 //                 job's hashing blob (nonce 0) and its block blob; an
@@ -24,20 +26,27 @@
 //   clear()       the template withdrawn; the issued jobs stay for a Monero
 //                 block found on them, withdrawn for own shares
 // Issued jobs are kept for the last kKeptTemplates templates (a found block's
-// job lives as long); sessions for the last kKeptSessions extra_nonces.
+// job lives as long): a stratum session's job ring (JOBS_RING) names jobs of at
+// most that many templates. The sessions held are the binds whose get_job has
+// not run yet (a bind and its get_job run in one make_job) and the own slot.
+// MinerSlot: the CPU miner's job per template; a template the miner got no job
+// for is counted once and named.
 //
 // Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -98,8 +107,7 @@ inline std::vector<std::uint8_t> job_block_blob(const PathbJob& j, const std::ve
 
 class PathbJobSource final : public ::v37::xmr::stratum::ITemplateSource {
 public:
-    static constexpr std::size_t kKeptTemplates = 4;
-    static constexpr std::size_t kKeptSessions = 65536;
+    static constexpr std::size_t kKeptTemplates = ::v37::xmr::stratum::XmrStratumSession::JOBS_RING;
     using MakeJob = std::function<std::optional<PathbJob>(const PathbTemplate&, const PathbSession&)>;
 
     explicit PathbJobSource(MakeJob make) : make_(std::move(make)) {}
@@ -141,17 +149,22 @@ public:
         return tpl_;
     }
 
+    // The session of one job's extra_nonce: the next get_job of that extra_nonce takes it.
     void bind(std::uint32_t extra_nonce, const PathbSession& s) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (sessions_.emplace(extra_nonce, s).second) {
-            session_order_.push_back(extra_nonce);
-            while (session_order_.size() > kKeptSessions) {
-                sessions_.erase(session_order_.front());
-                session_order_.pop_front();
-            }
-        } else {
-            sessions_[extra_nonce] = s;
-        }
+        if (own_ && own_->first == extra_nonce) return;
+        sessions_[extra_nonce] = s;
+    }
+    // The CPU miner's own slot: its session stays for every template.
+    void bind_own(std::uint32_t extra_nonce, const PathbSession& s) {
+        std::lock_guard<std::mutex> lk(mu_);
+        sessions_.erase(extra_nonce);
+        own_ = std::make_pair(extra_nonce, s);
+    }
+    // The sessions held now (the binds not yet taken by a get_job, and the own slot).
+    std::size_t sessions_held() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return sessions_.size() + (own_ ? 1 : 0);
     }
 
     bool get_job(std::uint32_t extra_nonce, ::v37::xmr::stratum::TemplateJob& out) override {
@@ -161,12 +174,15 @@ public:
         std::optional<PathbSession> s;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (own_ && own_->first == extra_nonce) {
+                s = own_->second;
+            } else if (auto node = sessions_.extract(extra_nonce)) {
+                s = std::move(node.mapped());
+            }
             if (!tpl_) return false;
             t = *tpl_;
             net = net_;
             tid = tid_;
-            const auto it = sessions_.find(extra_nonce);
-            if (it != sessions_.end()) s = it->second;
             const auto j = jobs_.find({tid, extra_nonce});
             if (j != jobs_.end()) {
                 fill(j->second, out);
@@ -303,9 +319,119 @@ private:
     std::set<std::uint32_t> withdrawn_;  // kept templates withdrawn by clear() (own shares stale)
     std::map<std::pair<std::uint32_t, std::uint32_t>, IssuedJob> jobs_;
     std::map<std::uint32_t, PathbSession> sessions_;
-    std::deque<std::uint32_t> session_order_;
+    std::optional<std::pair<std::uint32_t, PathbSession>> own_;  // the CPU miner's slot
     std::uint64_t issued_ = 0;
     std::uint64_t make_failed_ = 0;
+};
+
+// The CPU miner's job per template (W-E5b): next() gives the own slot's job of the current template while the miner
+// holds no job of it; the caller reports pushed() or refused(); settle() counts a template the miner holds no job
+// for once and returns its line (no template: nothing counted).
+// The withdraw of the CPU miner's job (the source has no template): the miner stops and hands back its queued hits.
+// With the lane gate open each goes to `hit` (a Monero block among them goes to the publish arms, whose candidate
+// lookup refuses an abandoned or unheld parent); with it closed (HOLD, FORK-FUSE) they are dropped and counted.
+struct MinerWithdraw {
+    std::size_t submitted = 0;   // hits handed to `hit`
+    std::size_t network   = 0;   // of which Monero blocks
+    std::size_t dropped   = 0;   // hits dropped: the lane gate is closed
+};
+template <class Miner, class HitFn>
+MinerWithdraw withdraw_miner_job(Miner& miner, bool gate_closed, HitFn&& hit) {
+    MinerWithdraw w;
+    auto hits = miner.clear_job();
+    for (const auto& h : hits) {
+        if (gate_closed) {
+            ++w.dropped;
+            continue;
+        }
+        if (h.network) ++w.network;
+        hit(h);
+        ++w.submitted;
+    }
+    return w;
+}
+
+// The publish arms' candidate lookup: the job source's candidate, published only when `parent_ok` admits its parent
+// (the native index: held verified and not abandoned). A refusal is counted and logged with its reason.
+class GatedCandidateLookup {
+public:
+    using Candidate = ::c2pool::v37n::xmr::submit::BlockCandidate;
+    using ParentOk  = std::function<bool(const Candidate&, std::string*)>;
+    using Log       = std::function<void(const std::string&)>;
+
+    GatedCandidateLookup(const PathbJobSource& jobs, ParentOk ok, Log log)
+        : jobs_(&jobs), ok_(std::move(ok)), log_(std::move(log)),
+          refused_(std::make_shared<std::atomic<std::uint64_t>>(0)) {}
+
+    bool operator()(std::uint32_t template_id, std::uint32_t extra_nonce, Candidate& c) const {
+        if (!jobs_->candidate(template_id, extra_nonce, c)) return false;
+        std::string why;
+        if (!ok_(c, &why)) {
+            refused_->fetch_add(1);
+            if (log_) log_("NOT PUBLISHED: template " + std::to_string(template_id) + " h=" + std::to_string(c.height) +
+                           ": " + why);
+            return false;
+        }
+        return true;
+    }
+    std::uint64_t refused() const { return refused_->load(); }
+
+private:
+    const PathbJobSource*                         jobs_;
+    ParentOk                                      ok_;
+    Log                                           log_;
+    std::shared_ptr<std::atomic<std::uint64_t>>   refused_;
+};
+
+class MinerSlot {
+public:
+    explicit MinerSlot(std::uint32_t extra_nonce) : en_(extra_nonce) {}
+
+    std::optional<::v37::xmr::stratum::TemplateJob> next(PathbJobSource& jobs) {
+        cur_ = jobs.template_id();
+        if (cur_ == 0 || cur_ == job_tid_) return std::nullopt;
+        ::v37::xmr::stratum::TemplateJob tj;
+        if (!jobs.get_job(en_, tj)) {
+            why_ = "no job (make_job failed)";
+            return std::nullopt;
+        }
+        if (tj.blob.empty()) {
+            why_ = "no blob (the slot has no session)";
+            return std::nullopt;
+        }
+        return tj;
+    }
+    void pushed(std::uint32_t template_id) { job_tid_ = template_id; }
+    // True once when the source has no template while the miner holds a job (a
+    // withdrawn template: no job is current): the caller withdraws the miner's job.
+    // The next template is pushed as a new job.
+    bool withdraw_due(const PathbJobSource& jobs) {
+        if (job_tid_ == 0 || jobs.template_id() != 0) return false;
+        job_tid_ = 0;
+        ++withdrawn_;
+        return true;
+    }
+    std::uint64_t withdrawn() const noexcept { return withdrawn_; }
+    void refused(const std::string& why) { why_ = "refused: " + why; }
+    std::optional<std::string> settle() {
+        if (cur_ == 0 || cur_ == job_tid_ || cur_ == skipped_tid_) return std::nullopt;
+        skipped_tid_ = cur_;
+        ++skipped_;
+        return "template " + std::to_string(cur_) + " skipped (miner job of template " + std::to_string(job_tid_) +
+               "): " + why_;
+    }
+    std::uint32_t job_template() const noexcept { return job_tid_; }
+    std::uint64_t skipped() const noexcept { return skipped_; }
+    std::uint32_t extra_nonce() const noexcept { return en_; }
+
+private:
+    std::uint32_t en_ = 0;
+    std::uint32_t cur_ = 0;
+    std::uint32_t job_tid_ = 0;
+    std::uint32_t skipped_tid_ = 0;
+    std::uint64_t skipped_ = 0;
+    std::uint64_t withdrawn_ = 0;
+    std::string why_;
 };
 
 }  // namespace c2pool::xmr::pathb

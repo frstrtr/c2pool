@@ -70,6 +70,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # oracle FLOOR threshold (sum*60//100), not the cross-multiplied real 60%,
     # which rejected new == floor(0.6*total) when 60*total is not a multiple of
     # 100. Pure-helper boundary KAT. Same folding rule.
+    #
+    # ltc_gentx_golden_kat_test.cpp (T5): cross-impl gentx golden-vector KAT.
+    # Reproduces the six frozen fixtures from frstrtr/p2pool-merged-v36 f38d6bb7
+    # p2pool/test/golden/ (embedded verbatim in ltc_gentx_golden_fixtures.hpp)
+    # byte-equal -- witness gentx, stripped gentx, packed share_info, and
+    # other_tx_hashes in GBT order -- by driving the REAL LTC production path
+    # (generate_share_transaction, compute_ref_hash_for_work, the share
+    # Formatter); no coinbase re-implementation in the test. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -93,6 +101,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        ltc_gentx_golden_kat_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp

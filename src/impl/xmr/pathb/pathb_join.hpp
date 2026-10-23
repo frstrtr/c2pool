@@ -68,6 +68,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -867,7 +868,10 @@ inline ReaskReplay reask_replay(std::uint64_t seal_pos, std::uint64_t base_pos) 
 // Each pair is attempted once; a non-service re-queues it at the end; an
 // alarm, a contradiction or an unplaceable span carrier excludes the server
 // with all its pairs in this join; a pair lives while its server is
-// connected. Neither claimed work nor the tip id orders.
+// connected. Neither claimed work nor the tip id orders. A pair whose attempt
+// ended NotServed on a Monero input it could not resolve (a P_r, or the
+// weights of a held block) waits, queued, until that input moves
+// (release_waits: the id and its cause, or every id at a new peer).
 // ---------------------------------------------------------------------------
 class AttemptQueue {
 public:
@@ -877,6 +881,8 @@ public:
         U128 claimed_work{};  // the HELLO claim (orders nothing)
         std::uint64_t seq = 0;
         bool young = false;   // the pair runs the young path (the ruling-47 fallback; not attempt state)
+        std::optional<Hash32> waits_on;  // a Monero input the pair's last attempt could not resolve (NotServed)
+        Missing waits_cause = Missing::MoneroBlock;  // its cause: MoneroBlock (a P_r), MissingWeights (a held block's)
     };
 
     void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}) {
@@ -887,13 +893,37 @@ public:
         q_.push_back(Pair{candidate, server, claimed_work, ++seq_});
     }
 
-    // The next pair (removed from the queue).
+    // The next pair not waiting on a P_r (removed from the queue).
     std::optional<Pair> next() {
-        if (q_.empty()) return std::nullopt;
-        const auto pick = q_.begin();
+        const auto pick = std::find_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on.has_value(); });
+        if (pick == q_.end()) return std::nullopt;
         Pair p = *pick;
         q_.erase(pick);
         return p;
+    }
+    // The pairs that may be attempted now (not waiting on a P_r).
+    std::size_t ready() const {
+        return static_cast<std::size_t>(std::count_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on; }));
+    }
+    // The (cause, id) inputs pairs wait on.
+    std::vector<std::pair<Missing, Hash32>> waits() const {
+        std::vector<std::pair<Missing, Hash32>> v;
+        for (const Pair& p : q_) {
+            if (!p.waits_on) continue;
+            const std::pair<Missing, Hash32> k{p.waits_cause, *p.waits_on};
+            if (std::find(v.begin(), v.end(), k) == v.end()) v.push_back(k);
+        }
+        return v;
+    }
+    // The pairs waiting on `id` (nullopt: on any id) for `cause` (nullopt: any) may be attempted again; their count.
+    std::size_t release_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
+        std::size_t n = 0;
+        for (Pair& p : q_)
+            if (p.waits_on && (!id || *p.waits_on == *id) && (!cause || p.waits_cause == *cause)) {
+                p.waits_on.reset();
+                ++n;
+            }
+        return n;
     }
 
     void requeue(const Pair& p) {
@@ -977,6 +1007,8 @@ struct AttemptReport {
     bool force_young = false;              // ruling 47: the next attempt of this pair runs the young path
     std::uint32_t side_needs = 0;          // side branches forking at a prefix node below the root whose state (S(f),
                                            // or bins sealed on the branch) the attempt took from the server
+    std::optional<Hash32> unresolved_pr;   // NotServed on a Monero input not resolved: its id (the pair waits on it)
+    Missing unresolved_cause = Missing::MoneroBlock;  // its cause: MoneroBlock (a P_r), MissingWeights (a held block's)
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -1152,7 +1184,12 @@ private:
     std::optional<std::uint64_t> h_of(const ReceiptBodyV3& r) {
         std::uint64_t h = join_detail::height_of(in_, r);
         if (h == 0 && in_.fetch_context && in_.fetch_context(r.blob.prev_id, timeout_)) h = join_detail::height_of(in_, r);
-        if (h == 0) return std::nullopt;
+        if (h == 0) {
+            rep_.unresolved_pr = r.blob.prev_id;  // the attempt ends NotServed on it: the pair waits on it
+            rep_.unresolved_cause = Missing::MoneroBlock;
+            return std::nullopt;
+        }
+        rep_.unresolved_pr.reset();
         return h;
     }
     const CarrierHeader* header_at(std::uint64_t x) const {
@@ -1657,6 +1694,9 @@ private:
             CarrierRole role;
         };
         std::vector<Item> stack{Item{c0, role0}};
+        // the Monero input a context fetch just resolved for one item: the same item deferring on it again ends the
+        // attempt (no second fetch, no re-admission loop)
+        std::optional<std::tuple<Hash32, Missing, Hash32>> fetched;
         while (!stack.empty()) {
             const Item it = stack.back();
             const Hash32 id = receipt_id(it.c.own);
@@ -1749,10 +1789,25 @@ private:
                 case Missing::MoneroBlock:
                 case Missing::Seed:
                 case Missing::MissingBlock:
-                case Missing::MissingWeights:
+                case Missing::MissingWeights: {
+                    // the weights of a block the follower holds (a band DEFER on the floor): no context to fetch; the
+                    // pair waits on a RowWeights record
+                    if (*r.missing == Missing::MissingWeights && in_.monero != nullptr && in_.monero->block(r.fetch)) {
+                        rep_.unresolved_pr = r.fetch;
+                        rep_.unresolved_cause = Missing::MissingWeights;
+                        return fail(AttemptEnd::NotServed, "the weights of a held Monero block, not recorded");
+                    }
+                    const std::tuple<Hash32, Missing, Hash32> k{id, *r.missing, r.fetch};
+                    if (fetched && *fetched == k) {
+                        rep_.unresolved_pr = r.fetch;
+                        rep_.unresolved_cause = *r.missing;
+                        return fail(AttemptEnd::NotServed, "a fetched Monero input that did not resolve the DEFER");
+                    }
                     if (!in_.fetch_context || !in_.fetch_context(r.fetch, timeout_))
                         return fail(AttemptEnd::NotServed, "data any peer may serve, not resolved");
+                    fetched = k;
                     break;
+                }
                 case Missing::MissingBucket:
                     if (!fetch_below(r.fetch_bin)) return false;
                     break;
@@ -1905,6 +1960,9 @@ public:
     bool rests_on_claims() const noexcept { return a() == nullptr; }
 
     const AttemptQueue& queue() const noexcept { return queue_; }
+    std::size_t release_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
+        return queue_.release_waits(id, cause);
+    }
     const SwitchReport& last_switch() const noexcept { return switch_; }
 
     // Observes the attempt state while it runs (the caller's work between
@@ -1956,6 +2014,8 @@ public:
                 // ruling 47: the pair's next attempt runs the young path (the mark rides the queue)
                 AttemptQueue::Pair q = *p;
                 q.young = q.young || rep.force_young;
+                q.waits_on = rep.unresolved_pr;  // re-attempted once that input moves (release_waits)
+                q.waits_cause = rep.unresolved_cause;
                 queue_.requeue(q);
                 break;
             }

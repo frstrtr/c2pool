@@ -29,6 +29,8 @@
 //         a height its parent does not imply   -> forged (ban), no hash spent
 //         an unknown parent                    -> deferred, never banned
 //         an anchor that answers no P-13       -> deferred, never banned
+//         P-13 at the newest ancestor with RowWeights (ctx_anchor_cap: the anchor first, a 2-deep alternative's fork
+//         point, none past k_alt or with no such ancestor held)
 //         depth 3                              -> deferred, never banned, no hash
 //         a verifier that cannot hash          -> deferred, never banned
 //         no index wired                       -> deferred
@@ -132,6 +134,44 @@ static CtxChainSource bind_index(nat::ChainIndex& idx, std::uint64_t cap = pb::b
     };
     return cs;
 }
+
+// The follower's rows of a few chains: held blocks by id, RowWeights for some (pb::ctx_anchor_cap reads block() and
+// weights()).
+static pb::Hash32 b32h(u8 tag, u64 h) {
+    pb::Hash32 id{};
+    id[0] = tag;
+    for (int i = 0; i < 8; ++i) id[1 + i] = static_cast<u8>(h >> (8 * i));
+    return id;
+}
+struct ChainRows final : pb::IMoneroRows {
+    std::map<pb::Hash32, pb::BranchBlock> blocks;
+    std::map<pb::Hash32, pb::RowWeights> w;
+    pb::Hash32 add(u8 tag, u64 h, const pb::Hash32& prev, bool weights) {
+        pb::BranchBlock b;
+        b.id = b32h(tag, h);
+        b.prev_id = prev;
+        b.height = h;
+        blocks[b.id] = b;
+        if (weights) {
+            pb::RowWeights rw{};
+            rw.hf_child = 16;
+            rw.z_child = 400000;
+            w[b.id] = rw;
+        }
+        return b.id;
+    }
+    std::optional<pb::BranchBlock> block(const pb::Hash32& id) const override {
+        const auto it = blocks.find(id);
+        return it == blocks.end() ? std::nullopt : std::optional<pb::BranchBlock>(it->second);
+    }
+    std::optional<pb::BranchBlock> block_at_or_below_anchor(std::uint64_t) const override { return std::nullopt; }
+    std::optional<pb::RowWeights> weights(const pb::Hash32& id) const override {
+        const auto it = w.find(id);
+        return it == w.end() ? std::nullopt : std::optional<pb::RowWeights>(it->second);
+    }
+    pb::BranchBlock anchor() const override { return {}; }
+    pb::Hash32 main_tip() const override { return {}; }
+};
 
 // A structurally real Monero block in the native KATs' shape (one tagged-key
 // coinbase output, a bare pubkey extra, no transactions) for the index itself.
@@ -297,6 +337,23 @@ int main() {
         const auto v = judge_block_ctx(ctx_of(B1), nocap, rec_of, 2, rx.fn());
         C(v.kind == CtxPow::Defer && !v.ban() && !v.usable() && rx.calls == c0,
           "C2 an anchor that answers no P-13 is DEFERRED, never unchecked, no hash spent: " + v.why);
+    }
+    {   // pb::ctx_anchor_cap: P-13 at the newest ancestor with RowWeights, the anchor first (the climb)
+        ChainRows rows;
+        const pb::Hash32 F = rows.add(0x0F, 5000, pb::Hash32{}, true);   // the fork point on the main chain
+        const pb::Hash32 A1 = rows.add(0xA1, 5001, F, false);            // a 2-deep alternative, bodiless
+        const pb::Hash32 A2 = rows.add(0xA2, 5002, A1, false);
+        const u64 capF = pb::blob_cap_ctx(16, 400000).value_or(1);
+        C(pb::ctx_anchor_cap(rows, F) == capF, "C2 ctx_anchor_cap at an anchor with RowWeights: its own Z (" + std::to_string(capF) + ")");
+        C(pb::ctx_anchor_cap(rows, A2) == capF && pb::ctx_anchor_cap(rows, A1) == capF,
+          "C2 ctx_anchor_cap at the upper block of a 2-deep alternative without RowWeights: its fork point's Z (the climb)");
+        const pb::Hash32 U = rows.add(0x55, 5003, b32h(0x77, 5002), false);   // its parent not held
+        C(pb::ctx_anchor_cap(rows, U) == 0, "C2 ctx_anchor_cap with no ancestor with RowWeights held: none (the judge defers)");
+        pb::Hash32 top = F;
+        for (u64 k = 1; k <= pb::kAltDepth + 1; ++k) top = rows.add(0xB0, 5000 + k, top, false);
+        const pb::Hash32 at_bound = b32h(0xB0, 5000 + pb::kAltDepth);
+        C(pb::ctx_anchor_cap(rows, at_bound) == capF && pb::ctx_anchor_cap(rows, top) == 0,
+          "C2 ctx_anchor_cap climbs at most k_alt (" + std::to_string(pb::kAltDepth) + ") links");
     }
     {   // the bound is the relay's default
         pb::PathbRelayOptions ro;
