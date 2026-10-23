@@ -45,12 +45,16 @@
 //  (10) a pruned store (prune_batch): records below first_pos deleted, header
 //       records to root_pos, the root's record whole; K_BLHASH, K_BLEAF and
 //       K_AR untouched; a store launched here and a joined store (its AR seed
-//       below the pruned root) reload live-equal from the root.
+//       below the pruned root) reload live-equal from the root;
+//  (11) K_PSIDE: a torn row (truncated, or under another id's key) moved
+//       aside with its bytes, never a load failure; a corrupted table file of
+//       K_PSIDE rows: a load failure, the store moved aside (8b).
 // ---------------------------------------------------------------------------
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <unistd.h>
 #include <string>
 #include <vector>
@@ -731,6 +735,121 @@ void archive_corrupt() {
 }
 
 // ---------------------------------------------------------------------------
+// sidetorn: K_PSIDE rows that do not decode under their key (a truncated row; a row under another id's key) are moved
+// aside, their bytes kept under v37s:psideaside:, never deleted and never a load failure; the good row is placed; the
+// next load moves nothing.
+void side_torn() {
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 40, 0x73, 1, 13);
+    KatNode& n = sn.n;
+    std::vector<pb::Hash32> side;
+    for (const std::uint64_t fork : {35u, 36u}) {
+        const pb::CarrierBodyV3 c = scaffold_carrier(n, *n.store.best_at(fork), h_pos(fork + 1), 0x74, 50000 + fork, 3, {});
+        check(place_direct(n, c).outcome == pb::WriteOutcome::SideBranch, "sidetorn: a side carrier at " + std::to_string(fork + 1));
+        side.push_back(pb::receipt_id(c.own));
+    }
+    pb::LaneBatch b;
+    check(pb::put_side(b, 0, n.tree, n.store, n.bodies, side[0]) && pb::put_side(b, 0, n.tree, n.store, n.bodies, side[1])
+                  && pb::commit_lane_batch(sn.kv, b),
+          "sidetorn: two K_PSIDE rows written");
+    MemoryKv kv = sn.kv;
+    const std::string k1 = pb::store_keys::pside(0, side[1]);
+    std::string torn = kv.data.at(k1);
+    torn.pop_back();
+    kv.data[k1] = torn;
+    pb::Hash32 other{};
+    other[0] = 0x5a;
+    const std::string ko = pb::store_keys::pside(0, other);
+    const std::string moved = kv.data.at(pb::store_keys::pside(0, side[0]));
+    kv.data[ko] = moved;
+    KatNode probe(net, 64);
+    const pb::LoadResult r = pb::pathb_load(kv, net.pool_id, net.rules_g, inputs(probe, 64));
+    const std::string aside = pb::store_keys::pside_aside_prefix(0);
+    const std::string prefix = pb::store_keys::pside_prefix(0);
+    check(r.fault == pb::StoreFault::None && r.state && r.state->side_loaded == 1 && r.state->side_aside == 2
+                  && r.state->tree.find(side[0]) != nullptr && r.state->tree.find(side[1]) == nullptr,
+          "sidetorn: the load stands; the good row placed, the two torn rows moved aside: " + why(r));
+    check(kv.data.count(k1) == 0 && kv.data.count(ko) == 0 && kv.data.count(aside + k1.substr(prefix.size())) == 1
+                  && kv.data.at(aside + k1.substr(prefix.size())) == torn && kv.data.at(aside + ko.substr(prefix.size())) == moved,
+          "sidetorn: their bytes kept under the aside prefix (nothing deleted)");
+    const pb::LoadResult r2 = pb::pathb_load(kv, net.pool_id, net.rules_g, inputs(probe, 64));
+    check(r2.fault == pb::StoreFault::None && r2.state && r2.state->side_loaded == 1 && r2.state->side_aside == 0
+                  && kv.data.count(aside + k1.substr(prefix.size())) == 1,
+          "sidetorn: the next load moves nothing and keeps the aside rows: " + why(r2));
+}
+
+// ---------------------------------------------------------------------------
+// sidecorrupt: a corrupted table file of K_PSIDE rows (AC-08b): the load fails at a scan LevelDB cannot complete, the
+// store is unreadable, it is moved aside to <dir>.corrupt-<unix s> with its files (nothing deleted) and an empty store
+// opens in its place (the node starts on the joiner path).
+void side_corrupt() {
+    namespace fs = std::filesystem;
+    const KatNet net;
+    KatStoreNode sn(net, 64);
+    store_chain(sn, 300, 0xC3, 2, 73);
+    const fs::path base = fs::temp_directory_path() / ("pathb_store_kat_sidecorrupt_" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    const fs::path dir = base / pb::store_dir_name(net.pool_id, net.rules_g);
+    fs::create_directories(dir);
+    {
+        std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+        pb::LaneBatch all;
+        for (const auto& [k, v] : sn.kv.data) all.put(k, v);
+        check(db && pb::commit_lane_batch(*db, all), "sidecorrupt: the store written");
+    }
+    std::set<fs::path> before;
+    { std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string()); }  // the log into a table file
+    for (const auto& de : fs::directory_iterator(dir))
+        if (de.path().extension() == ".ldb") before.insert(de.path());
+    {
+        // K_PSIDE rows in a table file of their own
+        std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+        pb::LaneBatch sides;
+        for (std::uint64_t x = 1; x <= 300; ++x) {
+            const std::optional<pb::CarrierRecord> c = pb::decode_pcarrier(sn.kv.data.at(pb::store_keys::pcarrier(0, x)));
+            if (c) sides.put(pb::store_keys::pside(0, c->id), pb::encode_pside(*c));
+        }
+        check(db && pb::commit_lane_batch(*db, sides), "sidecorrupt: 300 K_PSIDE rows written");
+    }
+    { std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string()); }
+    fs::path victim;
+    std::uintmax_t vsz = 0;
+    for (const auto& de : fs::directory_iterator(dir))
+        if (de.path().extension() == ".ldb" && before.count(de.path()) == 0 && de.file_size() > vsz) {
+            victim = de.path();
+            vsz = de.file_size();
+        }
+    check(!victim.empty(), "sidecorrupt: the K_PSIDE table file");
+    if (victim.empty()) return;
+    {
+        std::FILE* f = std::fopen(victim.string().c_str(), "r+b");
+        std::vector<unsigned char> blk(64);
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        const std::size_t nr = std::fread(blk.data(), 1, blk.size(), f);
+        for (std::size_t i = 0; i < nr; ++i) blk[i] ^= 0xa5;
+        std::fseek(f, static_cast<long>(vsz / 2), SEEK_SET);
+        std::fwrite(blk.data(), 1, nr, f);
+        std::fclose(f);
+    }
+    std::unique_ptr<pb::PathbKv> db = pb::open_pathb_store(dir.string());
+    check(db != nullptr, "sidecorrupt: the corrupted store opens");
+    if (!db) return;
+    KatNode probe(net, 64);
+    const pb::LoadResult r = pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64));
+    check(r.fault != pb::StoreFault::None && r.fault != pb::StoreFault::NoHead && !pb::store_readable(*db),
+          "sidecorrupt: a load failure, a full scan fails: " + why(r));
+    std::string moved, mwhy;
+    db = pb::move_store_aside(std::move(db), dir.string(), 1000, moved, mwhy);
+    check(db != nullptr && moved == dir.string() + ".corrupt-1000" && fs::exists(fs::path(moved) / victim.filename())
+                  && pb::store_readable(*db) && !db->get(pb::store_keys::phead(0))
+                  && pb::pathb_load(*db, net.pool_id, net.rules_g, inputs(probe, 64)).fault == pb::StoreFault::NoHead,
+          "sidecorrupt: moved aside with its files, an empty store in its place: " + mwhy);
+    db.reset();
+    fs::remove_all(base);
+}
+
+// ---------------------------------------------------------------------------
 // (10) a pruned store (prune_batch): K_PCARRIER below first deleted, [first, root) header records, the record at the
 // root whole, K_PHEAD first_pos / root_pos / base_pos >= root; K_BLHASH, K_BLEAF and K_AR untouched. A store launched
 // here (no AR seed) and a joined store (its AR seed below the pruned root) reload live-equal (the tree from the root,
@@ -841,5 +960,7 @@ int main(int argc, char** argv) {
     run("archive", archive);
     run("archivecorrupt", archive_corrupt);
     run("pruned", pruned);
+    run("sidetorn", side_torn);
+    run("sidecorrupt", side_corrupt);
     return finish("v37_xmr_pathb_store_kat");
 }

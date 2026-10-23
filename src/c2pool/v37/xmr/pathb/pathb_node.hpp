@@ -1500,6 +1500,13 @@ public:
         if (root > out.root)
             if (const std::optional<std::vector<Hash32>> gone = tree_->reroot(root, out.floors.sides))
                 for (const Hash32& id : *gone) bodies_->erase(id);
+        if (PathbKv* kv = store_kv()) {  // K_PSIDE: the rows of the side carriers the tree no longer holds
+            LaneBatch sb;               // (a failed scan: none this step)
+            if (side_prune_batch(*kv, cfg_.record_chain, *tree_, sb) && !sb.ops.empty() && !commit_lane_batch(*kv, sb)) {
+                poison(store_->best_tip());
+                return out;
+            }
+        }
         out.first = store_->drop_records_below(first);
         out.root = tree_->genesis().pos;
         if (const std::optional<Hash32> s = store_->best_at(std::max(out.floors.sides, out.first)))
@@ -2552,6 +2559,7 @@ private:
         const std::optional<LaneBatch> ab = adoption_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, *ar_,
                                                            js->young ? 0 : js->x0 - 1, &js->prefix_headers);
         if (ab) b.ops.insert(b.ops.end(), ab->ops.begin(), ab->ops.end());
+        put_sides(b, cfg_.record_chain, *tree_, *store_, *bodies_);  // the adopted tree's side carriers (K_PSIDE)
         // the lower edge of A's bound work (x1 + 1), read at a restart (K_BLO)
         if (!js->young) b.put(store_keys::blo(cfg_.record_chain), encode_blo(js->x1 + 1));
         for (const auto& [bin, at] : js->claimed)  // the leaves adopted as claims (K_BCLAIM)
@@ -2779,7 +2787,18 @@ private:
                 out.action = NodeAction::NodeInternal;
                 return out;
             case WriteOutcome::Duplicate: out.action = NodeAction::Verdict; return out;
-            case WriteOutcome::SideBranch: out.action = NodeAction::SideBranch; break;
+            case WriteOutcome::SideBranch: {
+                out.action = NodeAction::SideBranch;
+                if (PathbKv* kv = store_kv()) {  // K_PSIDE: the side carrier kept across a restart
+                    LaneBatch b;
+                    if (put_side(b, cfg_.record_chain, *tree_, *store_, *bodies_, r.id) && !commit_lane_batch(*kv, b)) {
+                        poison(r.id);
+                        out.action = NodeAction::NodeInternal;
+                        return out;
+                    }
+                }
+                break;
+            }
             case WriteOutcome::Extended: {
                 out.action = NodeAction::Placed;
                 ++generation_;
@@ -2989,10 +3008,12 @@ private:
             poison(new_tip);
             return out;
         }
+        std::vector<Hash32> added_ids;  // the new branch (K_PSIDE rows leave with the switch)
         {
             std::vector<const CarrierNode*> added;
             for (const CarrierNode* n = tree_->find(new_tip); n != nullptr && n->pos > fork; n = tree_->find(n->parent))
                 added.push_back(n);
+            for (const CarrierNode* a : added) added_ids.push_back(a->id);
             for (auto it = added.rbegin(); it != added.rend(); ++it)
                 if ((*it)->activation && !ar_->append(*(*it)->activation)) {
                     poison(new_tip);  // nothing committed
@@ -3001,8 +3022,9 @@ private:
                 }
         }
         if (PathbKv* kv = store_kv()) {
-            const LaneBatch b = switch_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, fork, old_pos, ar_before,
-                                             *ar_, std::move(lane));
+            LaneBatch b = switch_batch(cfg_.record_chain, head_, *tree_, *store_, *bodies_, fork, old_pos, ar_before, *ar_,
+                                       std::move(lane));
+            side_moves(b, cfg_.record_chain, *tree_, *store_, *bodies_, undone, added_ids);  // the abandoned branch kept
             if (!commit_lane_batch(*kv, b)) {
                 poison(new_tip);
                 out.internal = true;

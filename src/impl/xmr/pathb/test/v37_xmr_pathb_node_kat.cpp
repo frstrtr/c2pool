@@ -2804,6 +2804,40 @@ void prune_side() {
 }
 
 // ---------------------------------------------------------------------------
+// sideprune: K_PSIDE at the prune. The prune chain's three side carriers (forking at the body floor - 1, at it, above
+// it) written as K_PSIDE rows; the node loaded from that store holds them; its prune at floors.sides deletes the row of
+// the branch forking below the floor and keeps the other two; restarted, it holds those two only.
+void sideprune() {
+    PruneChain& c = prune_chain();
+    Harness h(c.net);
+    MemoryKv src = c.sn->kv;
+    {
+        pb::LaneBatch b;
+        bool put = true;
+        for (const pb::Hash32& id : {c.side_at, c.side_below, c.side_above})
+            put = put && pb::put_side(b, 0, c.sn->n.tree, c.sn->n.store, c.sn->n.bodies, id);
+        check(put && pb::commit_lane_batch(src, b), "sideprune: the three K_PSIDE rows written");
+    }
+    const std::size_t a = load_node(h, src, h.config(kat_table(c.net), true, kPruneJ));
+    MemoryKv& kv = *h.kvs.back();
+    bool held = true;
+    for (const pb::Hash32& id : {c.side_at, c.side_below, c.side_above})
+        held = held && h[a].tree().find(id) != nullptr && h[a].bodies().get(id) != nullptr;
+    check(held, "sideprune: the loaded node holds the three side carriers with their bodies (K_PSIDE)");
+    const pb::PathbNode::PruneReport r = h[a].prune(h.now);
+    check(r.written && r.floors.sides == c.fb && kv.data.count(pb::store_keys::pside(0, c.side_below)) == 0
+                  && kv.data.count(pb::store_keys::pside(0, c.side_at)) == 1
+                  && kv.data.count(pb::store_keys::pside(0, c.side_above)) == 1,
+          "sideprune: the prune at floors.sides " + std::to_string(r.floors.sides) +
+                  " deletes the row of the branch forking below it and keeps the rows at and above it");
+    pb::StoreFault f = pb::StoreFault::None;
+    const std::size_t b = reload_node(h, kv, kPruneJ, &f);
+    check(f == pb::StoreFault::None && b != SIZE_MAX && h[b].tree().find(c.side_at) != nullptr
+                  && h[b].tree().find(c.side_above) != nullptr && h[b].tree().find(c.side_below) == nullptr,
+          "sideprune: restarted, the side carriers forking at and above the floor are held, none below it");
+}
+
+// ---------------------------------------------------------------------------
 // prune_hold: an open join hold keeps its floors (taken at its first request) while the best tip moves on; once the
 // hold ends the floors of the current tip apply.
 void prune_hold() {
@@ -7660,6 +7694,7 @@ int main(int argc, char** argv) {
     run("prune_default", prune_default);
     run("prune_flags", prune_flags);
     run("prune_side", prune_side);
+    run("sideprune", sideprune);
     run("prune_hold", prune_hold);
     run("below", below);
     run("jobslot", jobslot);

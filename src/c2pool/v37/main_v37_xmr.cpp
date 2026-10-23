@@ -1187,9 +1187,13 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         std::printf("store: %s empty: position 0 = (pool_id, H + 1 = %llu)\n", store_dir.string().c_str(),
                     static_cast<unsigned long long>(sr.identity.height + 1));
     } else if (lr.fault == pb::StoreFault::None && lr.state) {
+        const std::size_t side_loaded = lr.state->side_loaded, side_skipped = lr.state->side_skipped,
+                          side_aside = lr.state->side_aside;
         node = std::make_unique<pb::PathbNode>(nc, io, std::move(*lr.state), kv.get());
         std::printf("store: %s loaded: best position %llu\n", store_dir.string().c_str(),
                     static_cast<unsigned long long>(node->tree().best().pos));
+        std::printf("store: side carriers (K_PSIDE): %zu placed, %zu skipped, %zu torn rows moved aside\n",
+                    side_loaded, side_skipped, side_aside);
     } else {
         node = std::make_unique<pb::PathbNode>(nc, io, kv.get(), pb::PathbNode::LoadFailed{});
         std::printf("store: %s load failed (fault %u at %llu, check %u): the joiner path\n", store_dir.string().c_str(),
