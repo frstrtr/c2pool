@@ -40,13 +40,13 @@
 
 #include <gtest/gtest.h>
 
-#include <fstream>
-#include <sstream>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 #include <memory>
 #include <mutex>
@@ -4310,7 +4310,12 @@ TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
     ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
     std::stringstream buf; buf << in.rdbuf();
     std::string src = buf.str();
-    // Drop // comments so a quoted expression in a doc block cannot satisfy it.
+    // Drop /* */ and // comments so a quoted expression in a doc block cannot
+    // satisfy it.
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
     std::string code;
     std::istringstream lines(src);
     for (std::string line; std::getline(lines, line);) {
@@ -4322,7 +4327,9 @@ TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
     const auto local_seam = code.find("mi->set_local_rates_fn(", hashrate_seam);
     ASSERT_NE(local_seam, std::string::npos)
         << "main_dash.cpp must feed the local-hashrate graph from its StratumServer";
-    EXPECT_NE(code.find("ss->get_local_rates()", local_seam), std::string::npos);
+    const auto getter = code.find("ss->get_local_rates()", local_seam);
+    ASSERT_NE(getter, std::string::npos);
+    EXPECT_LT(getter - local_seam, 200u) << "the seam is fed by this StratumServer";
     EXPECT_LT(local_seam - hashrate_seam, 2000u)
         << "wired in the same block as the other stratum dashboard seams";
 }
