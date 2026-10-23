@@ -661,11 +661,42 @@ void NodeImpl::apply_min_protocol_ratchet()
     auto weights = dash::version_negotiation::get_desired_version_weights(
         m_tracker.chain, anchor, window_size);
 
+    // #920 distinct-origin precondition: reception origins of the YES-votes over the
+    // SAME window (same anchor, same min(size, height) clamp as the weighted tally).
+    std::vector<dash::VoteOrigin> origins;
+    if (m_tracker.chain.contains(anchor)) {
+        const uint64_t n = std::min<uint64_t>(window_size,
+            static_cast<uint64_t>(m_tracker.chain.get_height(anchor)));
+        origins.reserve(n);
+        for (auto&& [h, data] : m_tracker.chain.get_chain(anchor, n)) {
+            (void)h;
+            data.share.invoke([&](auto* obj) {
+                origins.push_back({static_cast<int64_t>(obj->m_desired_version),
+                                   obj->peer_addr});
+            });
+        }
+    }
+    const int distinct_origins = dash::count_distinct_yes_origins(origins, best_desired);
+
     // apply_min_protocol_ratchet_decision applies the full-window guard (parent_height
-    // >= CHAIN_LENGTH) the pure ratchet omits, then delegates to the floor-divided 95%
-    // work-weighted gate.
+    // >= CHAIN_LENGTH) the pure ratchet omits, then the #920 distinct-origin guard,
+    // then delegates to the floor-divided 95% work-weighted gate.
     const uint32_t lifted = dash::apply_min_protocol_ratchet_decision(
-        parent_height, CL, weights, best_desired, current, target);
+        parent_height, CL, weights, best_desired, current, target, distinct_origins);
+
+    // Name the blocker once per episode: the weight gate alone WOULD lift, but the
+    // supermajority traces to a single origin (#920).
+    const bool origin_blocked = lifted == current && parent_height >= CL
+        && distinct_origins < dash::MIN_DISTINCT_ORIGINS
+        && dash::ratchet_min_protocol_version(weights, best_desired, current, target) != current;
+    if (origin_blocked && !m_ratchet_origin_blocked_logged) {
+        LOG_WARNING << "[min-proto-ratchet] blocked-by=single-origin: >=95% window work"
+                    << " desires v" << best_desired << " but distinct_origins="
+                    << distinct_origins << " (need " << dash::MIN_DISTINCT_ORIGINS
+                    << ") -- floor stays " << current;
+    }
+    m_ratchet_origin_blocked_logged = origin_blocked;
+
     if (lifted != current) {
         // Publish via the ATOMIC only. The IO-thread handshake (handle_version)
         // reads m_runtime_min_protocol_version.load() and composes it with the

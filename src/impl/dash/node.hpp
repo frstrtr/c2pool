@@ -424,6 +424,10 @@ protected:
     // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
         SharechainConfig::share_profile().ratchet_floor_protocol_version};
+    // #920: true while the 95% weight gate would lift but the YES-votes trace to a
+    // single origin, so the blocked-by=single-origin line logs once per episode.
+    // Compute thread only, under the exclusive m_tracker_mutex.
+    bool m_ratchet_origin_blocked_logged{false};
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
