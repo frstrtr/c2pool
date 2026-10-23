@@ -1545,6 +1545,7 @@ public:
             FetchBodies,  // heavier: FC_GETCARRIER of its bodies (same peer)
             JoinerPath,   // heavier, its fork below the journal base: the joiner path, no body fetched
             Defer,        // a P_r not resolved yet
+            Strike,       // a header failed S1.3 #7 or #8: refuse + 1 strike (the request ends)
         } kind = Kind::Unsolicited;
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
@@ -1631,6 +1632,7 @@ public:
         // a size rule the floor reading leaves undecided (P_r without its weights): DEFER on that P_r, never a BAN
         std::optional<std::size_t> size_undecided;
         std::string pow_why;  // the check pow_ok refused on
+        int pow_row = 0;      // its S1.3 row (7, 8 or 11)
         const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
             const std::size_t i = k++;
             const CarrierHeader& h = req.got[i];
@@ -1641,6 +1643,7 @@ public:
                     claim_basis = b;
                 }
                 pow_why = "S1.3 #8 t_origin " + std::to_string(h.own.side.t_origin) + " != d " + std::to_string(d);
+                pow_row = 8;
                 return false;
             }
             const PrInfo pr = io_.resolve_pr(h.own.blob.prev_id);
@@ -1648,15 +1651,18 @@ public:
             if (hf == HeaderFault::SizeUndecided && !size_undecided) size_undecided = i;
             if (header_fields_verdict(hf)) {
                 pow_why = "S1.3 #7 header fault " + std::to_string(static_cast<int>(hf));
+                pow_row = 7;
                 return false;
             }
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
             if (!seed) {
                 pow_why = "S1.3 #11 no seed for P_r " + hex32(h.own.blob.prev_id).substr(0, 16);
+                pow_row = 11;
                 return false;
             }
             if (!verify_memo(h.own.blob, d, *seed)) {
                 pow_why = "S1.3 #11 PoW below d " + std::to_string(d);
+                pow_row = 11;
                 return false;
             }
             return true;
@@ -1682,17 +1688,18 @@ public:
                     out.stop = req.stop;
                     return out;
                 }
-                out.kind = HeadersOutcome::Kind::Ban;  // BAN the server; no variant of it indexed, its earlier ones released
-                {
-                    const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
-                    const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) +
-                                                                              " != " + hex32(prev).substr(0, 16) + ")"
-                                              : k == i + 1         ? pow_why
-                                                                   : "S1.3 #6 h " + std::to_string(ann[i].h) + " below H";
-                    out.why = "FC_HEADERS header " + std::to_string(i) + " (" + hex32(sh.id).substr(0, 16) + ", pos " +
-                              std::to_string(fork->pos + 1 + i) + "): " + cause;
-                }
-                headers_->release_peer(peer);
+                const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
+                const bool checked = ann[i].parent == prev && k == i + 1;  // pow_ok ran on this header
+                // S1.3 #7 header fields (major == hf(h); timestamp >= median60(branch of P_r); the size verdict):
+                // "STRIKE"; #8 t_origin == d_at(chain, pos(tip) + 1): "STRIKE"; #11 RandomX meets d: "BAN"
+                out.kind = checked && (pow_row == 7 || pow_row == 8) ? HeadersOutcome::Kind::Strike : HeadersOutcome::Kind::Ban;
+                const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) + " != " +
+                                                                          hex32(prev).substr(0, 16) + ")"
+                                          : checked           ? pow_why
+                                                              : "S1.3 #6 h " + std::to_string(ann[i].h) + " below H";
+                out.why = "FC_HEADERS header " + std::to_string(i) + " (" + hex32(sh.id).substr(0, 16) + ", pos " +
+                          std::to_string(fork->pos + 1 + i) + "): " + cause;
+                headers_->release_peer(peer);  // no variant of the reply indexed, the server's earlier ones released
                 return out;
             }
             out.ids.push_back(sh.id);

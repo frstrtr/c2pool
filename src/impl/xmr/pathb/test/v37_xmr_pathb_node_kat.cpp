@@ -80,6 +80,8 @@
 //   relayj1stale the same through the relay's catch-up loop: no ban, the
 //                DROP logged, J at the server's tip; a BANNED line names
 //                its check;
+//   hdrstrike    a header failing S1.3 #7 or #8 on the header path: STRIKE,
+//                nothing indexed; the relay strikes once and logs it;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5875,6 +5877,69 @@ void relayj1stale() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// hdrstrike: on the header path a header failing S1.3 #7 (header fields) or #8 (t_origin) is refuse + 1 strike, not a
+// ban; nothing of the reply indexed; the relay strikes the server once and keeps the link.
+void hdrstrike() {
+    const KatNet net;
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    const auto run = [&net](const char* tag, const std::function<void(pb::ReceiptBodyV3&)>& edit, const char* row) {
+        Harness h(net);
+        std::size_t s = 0, j = 0;
+        j1stale_chain(h, net, s, j);
+        const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id;
+        check(h[j].request_headers(s, g, tip, 64, h.now), std::string("hdrstrike ") + tag + ": R1");
+        const std::vector<std::uint8_t> f1 = h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0);
+        h.q.clear();
+        pb::HeadersReply rep;
+        (void)pb::decode_fc_headers(f1, 0, h[j].frame_bytes_headers(), pb::kRuledLaneParams, rep);
+        edit(rep.headers.back().own);  // the last header: no later link reads its id
+        const pb::PathbNode::HeadersOutcome o = h[j].on_headers(s, *pb::encode_fc_headers(rep, h[j].frame_bytes_headers()), h.now);
+        check(o.kind == K::Strike && o.indexed == 0 && pb::PathbNodeTestAccess::headers(h[j]).size() == 0
+                      && o.why.find(row) != std::string::npos,
+              std::string("hdrstrike ") + tag + ": STRIKE, nothing indexed, the reason names " + row + " (kind "
+                      + std::to_string(static_cast<int>(o.kind)) + ", why '" + o.why + "')");
+    };
+    run("#7", [](pb::ReceiptBodyV3& b) { b.blob.major = static_cast<std::uint8_t>(b.blob.major + 1); }, "#7");
+    run("#8", [](pb::ReceiptBodyV3& b) { b.side.t_origin += 1; }, "#8");
+    {
+        // the relay: one strike for the server, no ban, the link kept
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay j = kat_relay(h, w, table0(net), false);
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            const std::uint32_t nonce = 990 + static_cast<std::uint32_t>(i);
+            const std::optional<pb::PathbJob> jb = h.job(a.node, static_cast<std::size_t>(i % 5), nonce);
+            if (jb) (void)h[a.node].on_own_share(*jb, nonce, pb::Hash32{});
+        }
+        bool edited = false;
+        w.edit = [&h, &edited](FakeWire::Msg& m) {  // A's first FC_HEADERS to J: its last header's t_origin off by one
+            if (edited || m.from != 0 || m.to != 1 || m.f.empty() || m.f[0] != pb::kOpFcHeaders) return;
+            edited = true;
+            pb::HeadersReply rep;
+            if (!pb::decode_fc_headers(m.f, 0, h[1].frame_bytes_headers(), pb::kRuledLaneParams, rep).ok() || rep.headers.empty())
+                return;
+            rep.headers.back().own.side.t_origin += 1;
+            m.f = *pb::encode_fc_headers(rep, h[1].frame_bytes_headers());
+        };
+        w.connect(0, 1);
+        w.run();
+        w.edit = nullptr;
+        g_relay_lines = nullptr;
+        const std::uint64_t pa = w.id(j.node, a.node);
+        bool logged = false;
+        for (const std::string& l : lines[j.node])
+            if (l.find(" STRIKE: ") != std::string::npos && l.find("#8") != std::string::npos) logged = true;
+        check(j.relay->strikes_of(pa) == 1 && j.relay->stats().bans.load() == 0 && logged,
+              "hdrstrike (relay): one strike for the server, no ban, the STRIKE line names #8 (strikes "
+                      + std::to_string(j.relay->strikes_of(pa)) + ", bans " + std::to_string(j.relay->stats().bans.load()) + ")");
+    }
+}
+
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
 // off, mines z1 and z2 (carrying nothing) while A and X take A's y1. X gets a receipt of L's on z2 and no carrier of L:
 // the receipt's walk fetches the branch's headers and the bind places z1 and z2, switching X to z2 by its journal. X's
@@ -7787,6 +7852,7 @@ int main(int argc, char** argv) {
     run("timers", timers);
     run("j1stale", j1stale);
     run("relayj1stale", relayj1stale);
+    run("hdrstrike", hdrstrike);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);

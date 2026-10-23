@@ -2656,6 +2656,7 @@ private:
                             break;
                         case K::JoinerPath:
                         case K::Ban:
+                        case K::Strike:
                         case K::Undecodable: catchup_.erase(it); break;
                         default: break;
                     }
@@ -2670,6 +2671,10 @@ private:
             case K::Unsolicited: token(p, FrameToken::Drop); break;
             case K::Undecodable: token(p, FrameToken::Strike); break;
             case K::Ban: ban(p, o.why); break;
+            case K::Strike:
+                log("relay: peer " + std::to_string(p) + " STRIKE: " + o.why);
+                token(p, FrameToken::Strike);
+                break;
             default: break;
         }
         if (o.kind == K::Defer && o.fetch != Hash32{}) {
