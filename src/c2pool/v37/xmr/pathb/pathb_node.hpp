@@ -1545,7 +1545,7 @@ public:
             FetchBodies,  // heavier: FC_GETCARRIER of its bodies (same peer)
             JoinerPath,   // heavier, its fork below the journal base: the joiner path, no body fetched
             Defer,        // a P_r not resolved yet
-            Strike,       // a header failed S1.3 #7 or #8: refuse + 1 strike (the request ends)
+            Strike,       // a header failed S1.3 #6, #7 or #8: refuse + 1 strike (the request ends)
         } kind = Kind::Unsolicited;
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
@@ -1690,9 +1690,12 @@ public:
                 }
                 const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
                 const bool checked = ann[i].parent == prev && k == i + 1;  // pow_ok ran on this header
-                // S1.3 #7 header fields (major == hf(h); timestamp >= median60(branch of P_r); the size verdict):
-                // "STRIKE"; #8 t_origin == d_at(chain, pos(tip) + 1): "STRIKE"; #11 RandomX meets d: "BAN"
-                out.kind = checked && (pow_row == 7 || pow_row == 8) ? HeadersOutcome::Kind::Strike : HeadersOutcome::Kind::Ban;
+                const bool monotone = ann[i].parent == prev && k == i;     // h below the record H
+                // S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major == hf(h); timestamp >=
+                // median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin == d_at(chain, pos(tip) + 1):
+                // "STRIKE"; #11 RandomX meets d: "BAN"
+                out.kind = monotone || (checked && (pow_row == 7 || pow_row == 8)) ? HeadersOutcome::Kind::Strike
+                                                                                   : HeadersOutcome::Kind::Ban;
                 const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) + " != " +
                                                                           hex32(prev).substr(0, 16) + ")"
                                           : checked           ? pow_why

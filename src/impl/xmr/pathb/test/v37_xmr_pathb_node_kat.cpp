@@ -80,7 +80,7 @@
 //   relayj1stale the same through the relay's catch-up loop: no ban, the
 //                DROP logged, J at the server's tip; a BANNED line names
 //                its check;
-//   hdrstrike    a header failing S1.3 #7 or #8 on the header path: STRIKE,
+//   hdrstrike    a header failing S1.3 #6, #7 or #8 on the header path: STRIKE,
 //                nothing indexed; the relay strikes once and logs it;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
@@ -5878,8 +5878,8 @@ void relayj1stale() {
 }
 
 // ---------------------------------------------------------------------------
-// hdrstrike: on the header path a header failing S1.3 #7 (header fields) or #8 (t_origin) is refuse + 1 strike, not a
-// ban; nothing of the reply indexed; the relay strikes the server once and keeps the link.
+// hdrstrike: on the header path a header failing S1.3 #6 (monotone h), #7 (header fields) or #8 (t_origin) is refuse
+// + 1 strike, not a ban; nothing of the reply indexed; the relay strikes the server once and keeps the link.
 void hdrstrike() {
     const KatNet net;
     using K = pb::PathbNode::HeadersOutcome::Kind;
@@ -5902,6 +5902,7 @@ void hdrstrike() {
     };
     run("#7", [](pb::ReceiptBodyV3& b) { b.blob.major = static_cast<std::uint8_t>(b.blob.major + 1); }, "#7");
     run("#8", [](pb::ReceiptBodyV3& b) { b.side.t_origin += 1; }, "#8");
+    run("#6", [](pb::ReceiptBodyV3& b) { b.blob.prev_id = mon_block(kPoolH); }, "#6");  // h below the record H
     {
         // the relay: one strike for the server, no ban, the link kept
         std::map<std::size_t, std::vector<std::string>> lines;
