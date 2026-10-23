@@ -69,7 +69,7 @@
 //   sidekeep   a server's side branch across a restart (K_PSIDE): moved at
 //              the switch, reloaded under its parents, walked by a joiner
 //              that completes; the joined node's side branch kept by its
-//              adoption batch;
+//              adoption batch; a server without it: Unplaceable, excluded;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
 //              restarted: the journal base the session's; a heavier branch
 //              forking in (base, x1] takes the joiner path by its headers,
@@ -2127,7 +2127,9 @@ void keycache() {
 // sidekeep: a server's side branch across a restart (K_PSIDE). A (a written store) mines s1, s2 while cut from B;
 // B's heavier branch reaches A: A switches, s1 and s2 move to K_PSIDE; A's next carrier carries s2's own receipt (its
 // tip s1, a side carrier). A restarted from its store holds s1 and s2; a node joining from it walks the side branch
-// and completes; that joined node, restarted, holds the walked side branch and serves a second join.
+// and completes; that joined node, restarted, holds the walked side branch and serves a second join. A server
+// restarted without its K_PSIDE rows answers the side headers empty: the attempt ends Unplaceable and the server is
+// excluded (its pair is not queued again).
 void sidekeep() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -2206,6 +2208,26 @@ void sidekeep() {
               "sidekeep: a second node joins from the joined node restarted" +
                       (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string(": no attempt")));
     }
+    // a server restarted without its K_PSIDE rows: the side headers answered empty, the server excluded
+    MemoryKv bare = akv;
+    for (auto it = bare.data.begin(); it != bare.data.end();)
+        it = it->first.rfind(pb::store_keys::pside_prefix(0), 0) == 0 ? bare.data.erase(it) : std::next(it);
+    pb::LoadResult r3l = pb::pathb_load(bare, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    if (!r3l.state) {
+        check(false, "sidekeep: the store without K_PSIDE loads");
+        return;
+    }
+    const std::size_t r3 = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(r3), std::move(*r3l.state), nullptr));
+    Joining k3 = joining_node(h, net, kJ);
+    h.hello(k3.j, r3);
+    const pb::JoinStep st3 = h[k3.j].run_join();
+    const pb::JoinStep st4 = h[k3.j].run_join();
+    h.q.clear();
+    check(st3.report && st3.report->end == pb::AttemptEnd::Unplaceable && h[k3.j].joiner().queue().excluded(r3)
+                  && h[k3.j].joiner().queue().size() == 0 && !st4.report,
+          "sidekeep: a server without the side branch answers its side headers empty: Unplaceable, the server excluded, "
+          "no further attempt" + (st3.report ? std::string(": ") + rep_desc(*st3.report) : std::string(": no attempt")));
     std::printf("  sidekeep: %.1f s\n", secs_since(t0));
 }
 

@@ -1821,7 +1821,10 @@ private:
     bool fetch_side_headers(const Hash32& id) {
         JoinedState& s = *st_;
         const ChainHeaders r = link_.headers(id, header_page(), timeout_);
-        if (r.status != LinkStatus::Served || r.headers.empty()) return fail(AttemptEnd::NotServed, "side headers not served");
+        // no reply within P-53: non-service; a reply with no header: the server holds no such branch, the span carrier
+        // cannot be placed with nothing left to fetch from it (excluded)
+        if (r.status != LinkStatus::Served) return fail(AttemptEnd::NotServed, "side headers not served");
+        if (r.headers.empty()) return fail(AttemptEnd::Unplaceable, "side headers: the server holds no such branch");
         bool fresh = false;
         for (const CarrierHeader& h : r.headers) {
             const Hash32 hid = receipt_id(h.own);
