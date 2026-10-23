@@ -1546,6 +1546,7 @@ public:
         Missing cause = Missing::MoneroBlock;  // the input the request waits for (MissingWeights: the floor reading)
         Hash32 from{};
         Hash32 stop{};
+        std::string why;  // the deciding check, for the relay's log line
     };
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
@@ -1560,12 +1561,22 @@ public:
             out.kind = HeadersOutcome::Kind::OverBuffer;
             return out;
         }
+        HeadersReply rep;
+        const bool decoded = decode_fc_headers(frame, cfg_.identity.chain_id, frame_bytes_headers(), cfg_.p, rep).ok();
+        // a reply whose first header's parent is not the open request's `from` is a reply to another request of this
+        // peer: DROP (no verdict, no token); the open request and its P-53 clock stay
+        if (decoded && !rep.headers.empty() && rep.headers.front().own.side.tip != it->second.from) {
+            out.kind = HeadersOutcome::Kind::Unsolicited;
+            out.why = "FC_HEADERS reply to another request (first header's parent " +
+                      hex32(rep.headers.front().own.side.tip).substr(0, 16) + ", open request from " +
+                      hex32(it->second.from).substr(0, 16) + ")";
+            return out;
+        }
         HeaderRequest req = std::move(it->second);
         header_req_.erase(it);
         timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
         end_first_round();  // a reply ends the first catch-up round (whatever it holds)
-        HeadersReply rep;
-        if (!decode_fc_headers(frame, cfg_.identity.chain_id, frame_bytes_headers(), cfg_.p, rep).ok()) {
+        if (!decoded) {
             out.kind = HeadersOutcome::Kind::Undecodable;
             headers_->release_peer(peer);
             return out;

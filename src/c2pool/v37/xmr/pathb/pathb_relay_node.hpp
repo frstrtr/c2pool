@@ -2659,6 +2659,7 @@ private:
             if (o.kind == K::JoinerPath) join = true;
             if (o.kind != K::OverBuffer && o.kind != K::Unsolicited) header_wants_locked(p);
         }
+        if (o.kind == K::Unsolicited && !o.why.empty()) log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
             case K::OverBuffer:   // above the FC_HEADERS buffer: DROP (the request stays open)
             case K::Unsolicited: token(p, FrameToken::Drop); break;
