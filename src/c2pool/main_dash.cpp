@@ -4780,6 +4780,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         return {s.hashrate, s.effective_dt, s.total_datums,
                                 s.dead_datums};
                     });
+                // The local-hashrate history graph reads the RateMonitor's
+                // windowed per-user rates, as WebServer::start_stratum wires it
+                // for its own acceptor. Without this seam the graph falls back
+                // to the per-session estimate, which only moves on an accepted
+                // pseudoshare: sessions that stay connected but stop submitting
+                // (rigs holding a backup pool) froze the "Local" series at the
+                // last value instead of decaying to zero. Display only.
+                mi->set_local_rates_fn([ss]() { return ss->get_local_rates(); });
                 // ── REAL per-worker registry into the dashboard ────────────
                 // The DASH stratum acceptor's StratumSessions register/update
                 // their per-connection hashrate + share/difficulty state into

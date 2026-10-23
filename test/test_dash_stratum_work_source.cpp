@@ -40,6 +40,8 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <sstream>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -4294,4 +4296,33 @@ TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
     ws_none.set_dashd_templates_only(none.dashd_templates_only);
     EXPECT_TRUE(ws_none.get_current_work_template().empty())
         << "dashd-templates-only with no dashd arm serves no template";
+}
+
+// main_dash.cpp binds its own core::StratumServer (the dashboard WebServer's
+// acceptor is disabled), so it must wire every stratum seam WebServer::
+// start_stratum wires for LTC. Without set_local_rates_fn the local-hashrate
+// history graph falls back to the per-session estimate, which freezes for
+// sessions that stay connected but stop submitting (a backup pool) instead of
+// decaying with the RateMonitor window.
+TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    // Drop // comments so a quoted expression in a doc block cannot satisfy it.
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    const auto hashrate_seam = code.find("mi->set_stratum_hashrate_fn(");
+    ASSERT_NE(hashrate_seam, std::string::npos);
+    const auto local_seam = code.find("mi->set_local_rates_fn(", hashrate_seam);
+    ASSERT_NE(local_seam, std::string::npos)
+        << "main_dash.cpp must feed the local-hashrate graph from its StratumServer";
+    EXPECT_NE(code.find("ss->get_local_rates()", local_seam), std::string::npos);
+    EXPECT_LT(local_seam - hashrate_seam, 2000u)
+        << "wired in the same block as the other stratum dashboard seams";
 }
