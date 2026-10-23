@@ -169,9 +169,9 @@ if (BUILD_TESTING)
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     # v37_xmr_pathb_store_kat also runs its store through the LevelDB archive.
     target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
-    # v37_xmr_joiner_kat runs as the shards v37_xmr_joiner_kat_s0 .. _s3 (--shard=i/4); the test
-    # v37_xmr_joiner_kat gathers their results (--gather=4) and requires them as a fixture.
-    set(_joiner_shards 0 1 2 3)
+    # v37_xmr_joiner_kat runs as the shards v37_xmr_joiner_kat_s0 .. _s7 (--shard=i/8); the test
+    # v37_xmr_joiner_kat gathers their results (--gather=8) and requires them as a fixture.
+    set(_joiner_shards 0 1 2 3 4 5 6 7)
     list(LENGTH _joiner_shards _joiner_n)
     set(_joiner_out ${CMAKE_CURRENT_BINARY_DIR}/v37_xmr_joiner_kat.result)
     foreach(_joiner_shard IN LISTS _joiner_shards)
