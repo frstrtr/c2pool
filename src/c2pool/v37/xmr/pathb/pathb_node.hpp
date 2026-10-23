@@ -1631,6 +1631,8 @@ public:
         Basis claim_basis = Basis::Computed;
         // a size rule the floor reading leaves undecided (P_r without its weights): DEFER on that P_r, never a BAN
         std::optional<std::size_t> size_undecided;
+        // S1.3 #11 SeedMissing: DEFER (no token) until the seed is held, never a BAN
+        std::optional<std::size_t> seed_missing;
         std::string pow_why;  // the check pow_ok refused on
         int pow_row = 0;      // its S1.3 row (7, 8 or 11)
         const auto pow_ok = [&](const CarrierAnnounce& a, std::uint64_t d) {
@@ -1656,6 +1658,7 @@ public:
             }
             const std::optional<Hash32> seed = io_.seed_of ? io_.seed_of(h.own.blob.prev_id) : std::nullopt;
             if (!seed) {
+                if (!seed_missing) seed_missing = i;
                 pow_why = "S1.3 #11 no seed for P_r " + hex32(h.own.blob.prev_id).substr(0, 16);
                 pow_row = 11;
                 return false;
@@ -1684,6 +1687,14 @@ public:
                     out.kind = HeadersOutcome::Kind::Defer;
                     out.fetch = req.got[i].own.blob.prev_id;
                     out.cause = Missing::MissingWeights;
+                    out.from = req.fork;
+                    out.stop = req.stop;
+                    return out;
+                }
+                if (seed_missing && *seed_missing == i) {  // S1.3 #11 SeedMissing: DEFER, no token; asked again when held
+                    out.kind = HeadersOutcome::Kind::Defer;
+                    out.fetch = req.got[i].own.blob.prev_id;
+                    out.cause = Missing::Seed;
                     out.from = req.fork;
                     out.stop = req.stop;
                     return out;

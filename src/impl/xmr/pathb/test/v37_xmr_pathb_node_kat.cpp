@@ -82,6 +82,8 @@
 //                its check;
 //   hdrstrike    a header failing S1.3 #6, #7 or #8 on the header path: STRIKE,
 //                nothing indexed; the relay strikes once and logs it;
+//   hdrseed      a header whose P_r's seed is not held: DEFER (Seed), no
+//                ban; asked again once held, J at the tip;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5941,6 +5943,48 @@ void hdrstrike() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// hdrseed: on the header path a header whose P_r's seed is not held (S1.3 #11 SeedMissing) DEFERs: no token, no ban,
+// nothing indexed; once the seed is held the request asked again reaches the server's tip.
+void hdrseed() {
+    const KatNet net;
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    bool no_seed = true;
+    pb::Hash32 hidden{};
+    pb::PathbNodeIo io = h.io(1);
+    const auto inner = io.seed_of;
+    io.seed_of = [&no_seed, &hidden, inner](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
+        if (no_seed && p_r == hidden) return std::nullopt;
+        return inner(p_r);
+    };
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(table0(net), false), std::move(io), nullptr));
+    const std::size_t j = 1;
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 730 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id;
+    hidden = h[s].bodies().get(*h[s].store().best_at(6))->own.blob.prev_id;
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrseed: R1");
+    const pb::PathbNode::HeadersOutcome o1 = h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    h.q.clear();
+    check(o1.kind == K::Defer && o1.cause == pb::Missing::Seed && o1.fetch == hidden && o1.indexed == 0
+                  && pb::PathbNodeTestAccess::headers(h[j]).size() == 0,
+          "hdrseed: the seed of a header's P_r not held: DEFER on that P_r (Seed), nothing indexed, no BAN (kind "
+                  + std::to_string(static_cast<int>(o1.kind)) + ")");
+    no_seed = false;
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrseed: asked again once the seed is held");
+    const pb::PathbNode::HeadersOutcome o2 = h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    check(o2.kind == K::FetchBodies, "hdrseed: then FetchBodies (kind " + std::to_string(static_cast<int>(o2.kind)) + ")");
+    h.pump();
+    check(h[j].tree().best().id == tip, "hdrseed: J at S's tip");
+}
+
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
 // off, mines z1 and z2 (carrying nothing) while A and X take A's y1. X gets a receipt of L's on z2 and no carrier of L:
 // the receipt's walk fetches the branch's headers and the bind places z1 and z2, switching X to z2 by its journal. X's
@@ -7854,6 +7898,7 @@ int main(int argc, char** argv) {
     run("j1stale", j1stale);
     run("relayj1stale", relayj1stale);
     run("hdrstrike", hdrstrike);
+    run("hdrseed", hdrseed);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);

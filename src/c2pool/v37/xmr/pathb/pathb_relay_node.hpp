@@ -2695,10 +2695,13 @@ private:
                 const NodeGuard g(*this);
                 held = o.cause == Missing::MissingWeights && node_->monero_block_held(o.fetch);
             }
-            if (held)
+            if (o.cause == Missing::Seed) {
+                // the seed cache: no context brings it; the request is asked again once the seed is held
+            } else if (held) {
                 st_.ctx_held++;
-            else
+            } else {
                 want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+            }
         }
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
