@@ -1546,6 +1546,7 @@ public:
         Missing cause = Missing::MoneroBlock;  // the input the request waits for (MissingWeights: the floor reading)
         Hash32 from{};
         Hash32 stop{};
+        Hash32 fetch_last{};  // FetchBodies: the last body asked (none asked: the page's tip)
     };
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
@@ -1682,12 +1683,29 @@ public:
                 return out;
             }
             out.kind = HeadersOutcome::Kind::FetchBodies;
+            // the bodies this node neither holds nor has parked nor asked within P-53 (an asked body is on its way to
+            // the deferred store), at most the deferred store's free room and at least the first of them; the rest with
+            // a later page
+            for (auto a = bodies_asked_.begin(); a != bodies_asked_.end();)
+                a = tree_->find(a->first) != nullptr || now_s >= a->second + cfg_.abandon_timeout_s ? bodies_asked_.erase(a)
+                                                                                                   : std::next(a);
+            const std::uint64_t used = deferred_.size() + bodies_asked_.size();
+            std::uint64_t room = deferred_.cap() > used ? deferred_.cap() - used : 0;
+            std::vector<Hash32> want;
+            for (const Hash32& id : out.ids) {
+                if (room == 0 && !want.empty()) break;
+                if (tree_->find(id) != nullptr || tree_->is_waiting(id) || bodies_asked_.count(id) != 0) continue;
+                want.push_back(id);
+                bodies_asked_[id] = now_s;
+                if (room > 0) --room;
+            }
+            out.fetch_last = want.empty() ? out.ids.back() : want.back();
             const std::size_t per = static_cast<std::size_t>(max_receipts_per_frame(cfg_.p.r_max));
-            for (std::size_t i = 0; i < out.ids.size(); i += per) {
+            for (std::size_t i = 0; i < want.size(); i += per) {
                 GetCarrier q;
                 q.chain_id = cfg_.identity.chain_id;
                 q.want_bodies = true;
-                for (std::size_t j = i; j < out.ids.size() && q.ids.size() < per; ++j) q.ids.push_back(out.ids[j]);
+                for (std::size_t j = i; j < want.size() && q.ids.size() < per; ++j) q.ids.push_back(want[j]);
                 if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, cfg_.p)) send(peer, *f);
             }
             return out;
@@ -3129,6 +3147,7 @@ private:
     std::uint64_t verify_calls_ = 0;
     std::map<std::uint64_t, HelloTail> peers_;
     std::map<std::uint64_t, HeaderRequest> header_req_;
+    std::map<Hash32, std::uint64_t> bodies_asked_;  // FetchBodies ids not placed yet: their ask time (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
     std::set<std::pair<std::uint64_t, Hash32>> closed_;

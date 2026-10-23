@@ -74,6 +74,9 @@
 //                forks more than J_0 below the carrier's parent (ruling 40);
 //   timers       P-53 per request restarted per frame, a timeout is
 //                non-service; the FC_BUCKETS window (FIX-1);
+//   catchpage    an empty-store catch-up of 1,300 positions from three servers
+//                finishes; one page in flight per server; each body asked
+//                once while its ask is open;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5683,6 +5686,62 @@ void relayswitchlog() {
                   ", drain " + std::to_string(admits[1]) + ")");
 }
 
+// ---------------------------------------------------------------------------
+// catchpage: the empty-store catch-up beyond one page. A, B and C hold one chain of 1,300 positions (more than
+// P-01 = P-47 = 1,152); J, empty, catches up from all three while the wire carries at most 100 frames per second of
+// the clock. J reaches the tip; one page in flight per server (catch-up requests bounded by the pages); each body
+// asked once while its ask is open (bodies asked <= the chain + one page).
+void catchpage() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;  // P-14: one FC_HEADERS frame holds a full page of P-01 headers
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t n = 1300;
+    bool mined = true;
+    for (std::uint64_t i = 0; i < n && mined; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        mined = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 20000 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    const bool held = h[b.node].tree().best().id == tip && h[c.node].tree().best().id == tip;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    std::uint64_t bodies_asked = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) bodies_asked += q.ids.size();
+    };
+    w.connect(3, 0);
+    w.connect(3, 1);
+    w.connect(3, 2);
+    int secs = 0;
+    for (; secs < 1800 && h[j.node].tree().best().id != tip; ++secs) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
+    w.edit = nullptr;
+    const std::uint64_t asks = j.relay->stats().catchup_requests.load();
+    std::printf("  catchpage: mined %d (A at %llu, B and C held %d); J at %llu after %d s; catch-up asks %llu; bodies asked %llu\n",
+                mined ? 1 : 0, (unsigned long long)h[a.node].tree().best().pos, held ? 1 : 0,
+                (unsigned long long)h[j.node].tree().best().pos, secs, (unsigned long long)asks, (unsigned long long)bodies_asked);
+    check(mined && held && h[a.node].tree().best().pos == n, "catchpage: A, B and C at 1,300 positions");
+    check(h[j.node].tree().best().id == tip, "catchpage: J reaches the tip");
+    check(asks <= 3 * (n / 1152 + 3), "catchpage: one page in flight per server (catch-up asks " + std::to_string(asks) + ")");
+    check(bodies_asked <= n + 1152, "catchpage: each body asked once while its ask is open (bodies asked " + std::to_string(bodies_asked) + ")");
+}
+
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
 // off, mines z1 and z2 (carrying nothing) while A and X take A's y1. X gets a receipt of L's on z2 and no carrier of L:
 // the receipt's walk fetches the branch's headers and the bind places z1 and z2, switching X to z2 by its journal. X's
@@ -6571,6 +6630,11 @@ void parkidx() {
     }
     w.connect(0, 1);
     w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().best().id != h[a.node].tree().best().id; ++i) {  // one page in flight
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
     ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
     h.tick_monero();
     const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
@@ -7593,6 +7657,7 @@ int main(int argc, char** argv) {
     run("base", base);
     run("boundary", boundary);
     run("timers", timers);
+    run("catchpage", catchpage);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);
