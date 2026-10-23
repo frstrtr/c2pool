@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <cstdio>
@@ -177,14 +178,17 @@ public:
     /// height reaches ChainParams::mweb_activation_height; an MWEB-active
     /// template without a HogEx + mweb is never emitted.
     /// Returns std::nullopt if the chain has no tip yet (not synced to genesis)
-    /// or the built template fails the MWEB shape check.
+    /// or the built template fails the MWEB shape check; in the latter case the
+    /// refused template is handed out through `refused` when given (the caller
+    /// decides between HOLD and a degraded start).
     /// max_weight bounds the mempool selection (the HogEx is appended after it).
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         bool               is_testnet = false,
         const MWEBTracker* mweb_tracker = nullptr,
-        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE)
+        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
+        std::optional<rpc::WorkData>* refused = nullptr)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -350,16 +354,24 @@ public:
 
         // Post-build MWEB shape check: an MWEB-active template without a
         // trailing HogEx + mweb can only yield "mweb-missing" blocks.
+        std::optional<std::string> refusal;
         {
             const auto& txs = data["transactions"];
             const std::string* last_tx_hex = txs.empty()
                 ? nullptr : &txs.back()["data"].get_ref<const std::string&>();
-            if (auto why = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active)) {
+            refusal = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active);
+        }
+        if (refusal) {
+            // Every refresh rebuilds the template; one ERROR per tip height.
+            static std::atomic<uint32_t> s_last_refused_height{0};
+            if (s_last_refused_height.exchange(next_h) != next_h) {
                 LOG_ERROR << "[EMB-LTC] TemplateBuilder: template REFUSED at height " << next_h
-                          << ": " << *why << " (mweb_seen=" << mweb_seen
+                          << ": " << *refusal << " (mweb_seen=" << mweb_seen
                           << " activation=" << mweb_activation
                           << " tracker_state=" << (has_mweb ? "yes" : "no") << ")";
-                return std::nullopt;
+            } else {
+                LOG_DEBUG_COIND << "[EMB-LTC] TemplateBuilder: template refused at height "
+                                << next_h << ": " << *refusal;
             }
         }
 
@@ -376,7 +388,13 @@ public:
                  << " synced=" << chain.is_synced();
         auto t1 = std::chrono::steady_clock::now();
         auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-        return rpc::WorkData{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        rpc::WorkData wd{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        if (refusal) {
+            if (refused)
+                *refused = std::move(wd);
+            return std::nullopt;
+        }
+        return wd;
     }
 
 };
@@ -407,23 +425,23 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
-        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_testnet, m_mweb_tracker);
-        if (!result && m_chain.tip()) {
-            // The builder refused its template on the MWEB shape check (logged
-            // there). HOLD, not a work failure: refresh_work keeps the previous
-            // template and leaves m_work_valid alone.
-            throw core::coin::MwebTemplateHold(
-                "EmbeddedCoinNode::getwork: MWEB is active but there is no MWEB state "
-                "(HogEx + mweb) for the next block yet");
+        std::optional<rpc::WorkData> refused;
+        auto result = TemplateBuilder::build_template(
+            m_chain, m_pool, m_testnet, m_mweb_tracker,
+            TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused);
+        if (!result && refused) {
+            // MWEB is active but there is no MWEB state for the next block yet
+            // (logged by the builder). Not a work failure: hand the template to
+            // refresh_work's ingress guard, which keeps the previous valid
+            // template (HOLD) or, with none, serves this one degraded. Its rules
+            // name "mweb" and it has no mweb data, so block assembly refuses
+            // every LTC block from it.
+            return std::move(*refused);
         }
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
-        // Re-check what leaves the coin node with the same view refresh_work's
-        // ingress guard uses.
-        if (auto why = core::coin::check_template_shape(result->m_data))
-            throw core::coin::MwebTemplateHold("EmbeddedCoinNode::getwork: " + *why);
         return *result;
     }
 

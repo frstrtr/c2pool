@@ -905,12 +905,18 @@ public:
     // MWEB / merged-mining submit-path counters (also in /local_stats).
     //   aux_checks             — shares offered to the merged-mining check
     //   mweb_refusals          — blocks refused at assembly on the MWEB shape check
-    //   mweb_template_refusals — templates refused at ingress (HOLD)
+    //   mweb_template_refusals — templates failing the shape check at ingress
+    //                            (held off, or served degraded)
     //   mweb_hold_seconds      — total time spent holding the previous template
     uint64_t get_aux_checks() const { return m_aux_checks.load(std::memory_order_relaxed); }
     uint64_t get_mweb_refusals() const { return m_mweb_block_refusals.load(std::memory_order_relaxed); }
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
+    // True while the cached template failed the MWEB shape check and was
+    // served only because there was no valid template to hold (degraded start).
+    bool is_work_degraded() const { return m_work_degraded.load(std::memory_order_relaxed); }
+    // True while refresh_work holds the previous template (MWEB HOLD).
+    bool is_mweb_holding() const { return m_mweb_hold_since_ms.load(std::memory_order_relaxed) != 0; }
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
@@ -1400,8 +1406,9 @@ private:
                                           const std::string& nonce,
                                           const JobSnapshot* job) const;
 
-    // Template-ingress MWEB HOLD bookkeeping (refresh_work only).
+    // Template-ingress MWEB HOLD / degraded-start bookkeeping (refresh_work only).
     void note_mweb_template_refusal(const std::string& why);
+    void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
 
     // Try submitting to merged-mined aux chains if their target is met.
@@ -1627,6 +1634,8 @@ private:
     // started (0 = not holding) and the total of the closed windows.
     std::atomic<int64_t>  m_mweb_hold_since_ms{0};
     std::atomic<int64_t>  m_mweb_hold_total_ms{0};
+    // The cached template failed the shape check (served degraded).
+    std::atomic<bool>     m_work_degraded{false};
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;

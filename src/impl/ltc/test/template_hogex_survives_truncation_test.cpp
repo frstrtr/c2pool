@@ -8,7 +8,9 @@
 //     counts only the fees of the transactions that ship;
 //   - once MWEB is active (an MWEB block was seen, or the next height reaches
 //     ChainParams::mweb_activation_height) a builder without MWEB state
-//     returns nullopt -- never a HogEx-less "segwit"-only template;
+//     returns nullopt -- never a HogEx-less "segwit"-only template; the
+//     refused template it hands out still names "mweb", so core ingress and
+//     block assembly both reject it as an LTC block;
 //   - before activation the plain segwit template is unchanged;
 //   - the activation heights are the ones litecoind's chain shows.
 // max_weight is the seam the #1708 block-budget work rebases onto: its budget
@@ -28,6 +30,7 @@
 #include <core/coin/mweb_shape.hpp>
 
 #include <impl/ltc/coin/mempool.hpp>
+#include <impl/ltc/coin/rpc_data.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 
@@ -215,8 +218,20 @@ TEST(LtcTemplateHogex, InvalidatedStateNeverYieldsSegwitOnlyTemplate)
     EXPECT_FALSE(tracker.has_state());
     EXPECT_EQ(tracker.mweb_seen_height(), 1u) << "invalidate() keeps the seen height";
 
-    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
-    EXPECT_FALSE(wd) << "MWEB active without state: no template (HOLD at ingress)";
+    std::optional<ltc::coin::rpc::WorkData> refused;
+    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker,
+                                              TemplateBuilder::MAX_BLOCK_WEIGHT
+                                                  - TemplateBuilder::COINBASE_RESERVE,
+                                              &refused);
+    EXPECT_FALSE(wd) << "MWEB active without state: no valid template";
+
+    // The refused template (what getwork hands to the ingress guard for HOLD
+    // or a degraded start) still names MWEB and has no mweb data, so block
+    // assembly refuses any LTC block built from it.
+    ASSERT_TRUE(refused);
+    EXPECT_TRUE(rules_have(refused->m_data, "mweb"));
+    EXPECT_TRUE(refused->m_data["mweb"].get<std::string>().empty());
+    EXPECT_TRUE(core::coin::check_template_shape(refused->m_data));
 }
 
 // Before activation, with no MWEB block seen, the plain segwit template is

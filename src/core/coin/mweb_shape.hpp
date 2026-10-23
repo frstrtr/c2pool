@@ -18,7 +18,6 @@
 
 #include <cstdint>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -119,14 +118,5 @@ inline std::optional<std::string> check_template_shape(const nlohmann::json& tmp
         ? tmpl["mweb"].get_ref<const std::string&>() : kEmpty;
     return check_block_shape(last_tx_hex, mweb, template_rules_have_mweb(tmpl));
 }
-
-/// Thrown by a coin-side template source that refuses its own template on
-/// the MWEB shape check. refresh_work() treats it as HOLD: the previous
-/// template stays in place and m_work_valid is not touched. Any other
-/// exception from get_work_view() still invalidates the work.
-class MwebTemplateHold : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
 
 } // namespace core::coin

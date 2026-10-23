@@ -2,12 +2,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -39,9 +41,13 @@
 // a HogEx without mweb (N2) never reach the daemon. Both shares still reach
 // the merged-mining check (DOGE aux validity needs only the header).
 //
-// Template ingress (choke 2): a template failing the shape check is refused
-// with HOLD semantics — the previous template stays, m_work_valid is not
-// touched, the refusal is counted.
+// Template ingress (choke 2): with a valid template cached, a template failing
+// the shape check is refused with HOLD semantics — the previous template
+// stays, m_work_valid is not touched, the refusal is counted, a block found
+// meanwhile is telemetry-stale, and the dashboard says HOLD. With no valid
+// template (cold/warm start before the first MWEB state) it is served
+// DEGRADED: work is valid for shares and merged mining, and block assembly
+// refuses every LTC block from it.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -52,14 +58,11 @@ struct MockCoinNode : public core::coin::ICoinNode {
     nlohmann::json work_data;
     bool           accept          = true;
     bool           throw_on_submit = false;
-    bool           throw_hold      = false;  // coin-side MWEB refusal
-    bool           throw_failure   = false;  // any other template failure
+    bool           throw_failure   = false;  // a template failure (not MWEB)
     int            submit_calls    = 0;
     std::string    last_submitted_hex;
 
     core::coin::WorkView get_work_view() override {
-        if (throw_hold)
-            throw core::coin::MwebTemplateHold("mock: MWEB state not bootstrapped");
         if (throw_failure)
             throw std::runtime_error("mock: chain not synced");
         core::coin::WorkView v;
@@ -263,6 +266,60 @@ nlohmann::json mweb_template(const std::vector<std::pair<std::string, std::strin
     };
 }
 
+void stub_ref_hash(MiningInterface& mi)
+{
+    mi.set_ref_hash_fn([](const uint256&, const std::vector<unsigned char>&,
+                          const std::vector<unsigned char>&, uint64_t, uint32_t, uint32_t,
+                          bool, const std::string&, const uint256&,
+                          const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
+                          const std::vector<uint256>&) {
+        MiningInterface::RefHashResult r;
+        r.ref_hash.SetHex(rep("5", 64));
+        r.bits = 0x207fffff;
+        return r;
+    });
+}
+
+// A job frozen from the cached template the way the stratum server freezes
+// it (build_connection_coinbase -> WorkSnapshot -> JobSnapshot), plus the
+// nonce that meets the block target.
+struct FrozenJob {
+    MiningInterface::JobSnapshot snap;
+    std::string nonce;
+};
+
+FrozenJob freeze_cached_job(MiningInterface& mi, const std::string& prev)
+{
+    const std::vector<unsigned char> payout{0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x88, 0xac};
+    auto cbr = mi.build_connection_coinbase(uint256(), kEn1, payout, {});
+    EXPECT_FALSE(cbr.coinb1.empty());
+    FrozenJob j;
+    j.snap.coinb1 = cbr.coinb1;
+    j.snap.coinb2 = cbr.coinb2;
+    j.snap.gbt_prevhash = prev;
+    j.snap.nbits = kBits;
+    j.snap.block_nbits = kBits;
+    j.snap.version = kVersion;
+    j.snap.merkle_branches = cbr.snapshot.merkle_branches;
+    j.snap.tx_data = cbr.snapshot.tx_data;
+    j.snap.mweb = cbr.snapshot.mweb;
+    j.snap.mweb_active = cbr.snapshot.mweb_active;
+    j.snap.segwit_active = cbr.snapshot.segwit_active;
+    const uint256 root = MiningInterface::reconstruct_merkle_root(
+        j.snap.coinb1 + kEn1 + kEn2 + j.snap.coinb2, j.snap.merkle_branches);
+    j.nonce = find_block_nonce(kVersion, prev, root, kBits);
+    return j;
+}
+
+bool has_warning_prefix(const nlohmann::json& stats, const std::string& prefix)
+{
+    if (!stats.contains("warnings") || !stats["warnings"].is_array()) return false;
+    for (const auto& w : stats["warnings"])
+        if (w.is_string() && w.get<std::string>().rfind(prefix, 0) == 0) return true;
+    return false;
+}
+
 } // namespace
 
 // ------------------------------ fixtures are sound -------------------------
@@ -357,47 +414,20 @@ TEST(LtcMwebHogex, FoundBlockFromRefreshedTemplate)
     Fixture f;
     const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
     f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
-    f.mi.set_ref_hash_fn([](const uint256&, const std::vector<unsigned char>&,
-                            const std::vector<unsigned char>&, uint64_t, uint32_t, uint32_t,
-                            bool, const std::string&, const uint256&,
-                            const std::vector<std::pair<uint32_t, std::vector<unsigned char>>>&,
-                            const std::vector<uint256>&) {
-        MiningInterface::RefHashResult r;
-        r.ref_hash.SetHex(rep("5", 64));
-        r.bits = 0x207fffff;
-        return r;
-    });
+    stub_ref_hash(f.mi);
     f.mi.refresh_work();
     ASSERT_FALSE(f.mi.get_current_work_template().is_null());
     EXPECT_EQ(f.mi.get_cached_mweb(), kMweb);
     EXPECT_TRUE(f.mi.get_cached_mweb_active());
+    EXPECT_FALSE(f.mi.is_work_degraded());
 
-    const std::vector<unsigned char> payout{0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                            11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x88, 0xac};
-    auto cbr = f.mi.build_connection_coinbase(uint256(), kEn1, payout, {});
-    ASSERT_FALSE(cbr.coinb1.empty());
-    EXPECT_EQ(cbr.snapshot.mweb, kMweb);
-    EXPECT_TRUE(cbr.snapshot.mweb_active);
-    ASSERT_TRUE(cbr.snapshot.tx_data);
-    ASSERT_EQ(cbr.snapshot.tx_data->size(), 2u);
+    FrozenJob j = freeze_cached_job(f.mi, kPrev);
+    EXPECT_EQ(j.snap.mweb, kMweb);
+    EXPECT_TRUE(j.snap.mweb_active);
+    ASSERT_TRUE(j.snap.tx_data);
+    ASSERT_EQ(j.snap.tx_data->size(), 2u);
 
-    MiningInterface::JobSnapshot snap;
-    snap.coinb1 = cbr.coinb1;
-    snap.coinb2 = cbr.coinb2;
-    snap.gbt_prevhash = kPrev;
-    snap.nbits = kBits;
-    snap.block_nbits = kBits;
-    snap.version = kVersion;
-    snap.merkle_branches = cbr.snapshot.merkle_branches;
-    snap.tx_data = cbr.snapshot.tx_data;
-    snap.mweb = cbr.snapshot.mweb;
-    snap.mweb_active = cbr.snapshot.mweb_active;
-    snap.segwit_active = cbr.snapshot.segwit_active;
-    const uint256 root = MiningInterface::reconstruct_merkle_root(
-        snap.coinb1 + kEn1 + kEn2 + snap.coinb2, snap.merkle_branches);
-    const std::string nonce = find_block_nonce(kVersion, kPrev, root, kBits);
-
-    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, nonce, "1", {}, &snap);
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
 
     ASSERT_EQ(f.node.submit_calls, 1);
     EXPECT_TRUE(ends_with(f.node.last_submitted_hex, "01" + kMweb));
@@ -489,45 +519,104 @@ TEST(LtcMwebHogex, N3_IngressRefusalHoldsPreviousTemplate)
     f.mi.refresh_work();
     EXPECT_EQ(f.mi.get_current_work_template(), good);
     EXPECT_EQ(f.mi.get_mweb_template_refusals(), 3u);
-    EXPECT_GE(f.mi.get_mweb_hold_seconds(), 0.0);
+    EXPECT_FALSE(f.mi.is_work_degraded()) << "a valid template was cached: HOLD, not degraded";
 
-    // The next good template ends the HOLD.
+    // HOLD time accrues while the window is open...
+    ASSERT_TRUE(f.mi.is_mweb_holding());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_GE(f.mi.get_mweb_hold_seconds(), 0.025);
+    // ...and the dashboard says HOLD, not LOST CONTACT.
+    EXPECT_TRUE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
+
+    // The next good template ends the HOLD and freezes the HOLD total.
     f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, new_prev);
     f.mi.refresh_work();
     EXPECT_EQ(f.mi.get_current_gbt_prevhash(), new_prev);
     EXPECT_EQ(f.mi.get_mweb_template_refusals(), 3u);
+    EXPECT_FALSE(f.mi.is_mweb_holding());
+    const double total = f.mi.get_mweb_hold_seconds();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(f.mi.get_mweb_hold_seconds(), total);
+    EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
 }
 
-TEST(LtcMwebHogex, N3_IngressRefusalLeavesWorkInvalidUntouched)
+// A block found on the held template builds on the previous tip: submitblock
+// still forwards it but records it as a stale race, so a daemon reject shows
+// as ORPHAN (253) instead of firing nothing.
+TEST(LtcMwebHogex, BlockDuringHoldIsTelemetryStale)
 {
     Fixture f;
-    f.node.work_data = mweb_template({{kTx1, txid_hex(kTx1)}}, kMweb);
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    stub_ref_hash(f.mi);
     f.mi.refresh_work();
-    EXPECT_TRUE(f.mi.get_current_work_template().is_null())
-        << "no previous template: nothing to serve, and the refused one is never cached";
-    EXPECT_EQ(f.mi.get_mweb_template_refusals(), 1u);
+    FrozenJob j = freeze_cached_job(f.mi, kPrev);
+
+    f.node.work_data = mweb_template({{kTx1, t1}}, kMweb, rep("0", 62) + "cd");
+    f.mi.refresh_work();
+    ASSERT_TRUE(f.mi.is_mweb_holding());
+
+    f.node.accept = false;
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
+    EXPECT_EQ(f.node.submit_calls, 1) << "a HOLD never stops a block from reaching the daemon";
+    EXPECT_EQ(f.fires, std::vector<int>{253}) << "rejected during HOLD: recorded as a stale race";
 }
 
-// The coin-side builder's refusal (EmbeddedCoinNode::getwork) is the same
-// HOLD; any other template failure still invalidates the work.
-TEST(LtcMwebHogex, CoinSideHoldKeepsWorkValid)
+// Cold/warm start: MWEB is active but there is no MWEB state yet, so the only
+// template is HogEx-less (what EmbeddedCoinNode::getwork hands out). With no
+// valid template to hold it is served degraded: work is valid, the merged
+// check runs on every share, and no LTC block reaches the daemon.
+TEST(LtcMwebHogex, DegradedStartServesWorkButNeverSubmitsLtcBlocks)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}}, "");  // rules name mweb; no HogEx, no mweb
+    stub_ref_hash(f.mi);
+    f.mi.refresh_work();
+
+    ASSERT_FALSE(f.mi.get_current_work_template().is_null()) << "degraded start serves work";
+    EXPECT_TRUE(f.mi.is_work_degraded());
+    EXPECT_FALSE(f.mi.is_mweb_holding());
+    EXPECT_TRUE(f.mi.get_cached_mweb_active());
+    EXPECT_EQ(f.mi.get_mweb_template_refusals(), 1u);
+
+    FrozenJob j = freeze_cached_job(f.mi, kPrev);
+    EXPECT_TRUE(j.snap.mweb_active);
+    EXPECT_TRUE(j.snap.mweb.empty());
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
+    EXPECT_EQ(f.node.submit_calls, 0) << "no LTC block from a degraded template";
+    EXPECT_TRUE(f.fires.empty());
+    EXPECT_EQ(f.mi.get_mweb_refusals(), 1u);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u) << "the merged-mining check still sees the share";
+
+    // A newer degraded template (tip moved, MWEB state still missing) replaces
+    // the degraded one: there is nothing valid to hold.
+    const std::string new_prev = rep("0", 62) + "cd";
+    f.node.work_data = mweb_template({{kTx1, t1}}, "", new_prev);
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_gbt_prevhash(), new_prev);
+    EXPECT_TRUE(f.mi.is_work_degraded());
+    EXPECT_FALSE(f.mi.is_mweb_holding());
+
+    // MWEB state lands: a valid template ends the degraded start.
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, new_prev);
+    f.mi.refresh_work();
+    EXPECT_FALSE(f.mi.is_work_degraded());
+    EXPECT_EQ(f.mi.get_cached_mweb(), kMweb);
+}
+
+// A template failure that is not an MWEB shape refusal still invalidates the
+// work, as before.
+TEST(LtcMwebHogex, NonMwebTemplateFailureStillInvalidatesWork)
 {
     Fixture f;
     f.node.work_data = mweb_template({{kTx1, txid_hex(kTx1)}, {kHogex, txid_hex(kHogexStripped)}}, kMweb);
     f.mi.refresh_work();
-    const auto good = f.mi.get_current_work_template();
-    ASSERT_FALSE(good.is_null());
+    ASSERT_FALSE(f.mi.get_current_work_template().is_null());
 
-    f.node.throw_hold = true;
-    f.mi.refresh_work();
-    EXPECT_EQ(f.mi.get_current_work_template(), good) << "HOLD keeps the previous template";
-    EXPECT_EQ(f.mi.get_mweb_template_refusals(), 1u);
-
-    f.node.throw_hold = false;
     f.node.throw_failure = true;
     f.mi.refresh_work();
-    EXPECT_TRUE(f.mi.get_current_work_template().is_null())
-        << "a non-MWEB template failure still invalidates the work";
+    EXPECT_TRUE(f.mi.get_current_work_template().is_null());
 }
 
 TEST(LtcMwebHogex, CountersInLocalStats)
@@ -535,9 +624,52 @@ TEST(LtcMwebHogex, CountersInLocalStats)
     Fixture f;
     Job j = make_job({kTx1}, {txid_hex(kTx1)}, kMweb, /*mweb_active=*/true);
     submit(f, j);
+    f.node.work_data = mweb_template({{kTx1, txid_hex(kTx1)}}, "");  // degraded start
+    f.mi.refresh_work();
+
     auto stats = f.mi.rest_local_stats();
     EXPECT_EQ(stats.value("aux_checks", uint64_t(0)), 1u);
     EXPECT_EQ(stats.value("mweb_refusals", uint64_t(0)), 1u);
-    EXPECT_TRUE(stats.contains("mweb_template_refusals"));
-    EXPECT_TRUE(stats.contains("mweb_hold_seconds"));
+    EXPECT_EQ(stats.value("mweb_template_refusals", uint64_t(0)), 1u);
+    EXPECT_EQ(stats.value("mweb_degraded", false), true);
+    ASSERT_TRUE(stats.contains("mweb_hold_seconds") && stats["mweb_hold_seconds"].is_number());
+    EXPECT_EQ(stats["mweb_hold_seconds"].get<double>(), 0.0) << "a degraded start is not a HOLD";
+}
+
+// HOLD ends on the MWEB update: main_ltc calls the immediate
+// WebServer::trigger_work_refresh() once MWEBTracker::update succeeds (the
+// debounced variant can drop a call that lands within 300 ms of the
+// tip-change refresh). The refresh replaces the held template at once and
+// the HOLD total stops rising.
+TEST(LtcMwebHogex, HoldEndsOnImmediateRefreshAfterMwebUpdate)
+{
+    boost::asio::io_context ioc;
+    core::WebServer ws(ioc, "127.0.0.1", 0, /*testnet=*/true);
+    MockCoinNode node;
+    MiningInterface* mi = ws.get_mining_interface();
+    ASSERT_NE(mi, nullptr);
+    mi->set_coin_node(&node);
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    const std::string new_prev = rep("0", 62) + "cd";
+
+    node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    ws.trigger_work_refresh();
+    ASSERT_EQ(mi->get_current_gbt_prevhash(), kPrev);
+
+    // New tip, MWEB state invalidated: the builder's template has no HogEx.
+    node.work_data = mweb_template({{kTx1, t1}}, "", new_prev);
+    ws.trigger_work_refresh();
+    ASSERT_TRUE(mi->is_mweb_holding());
+    EXPECT_EQ(mi->get_current_gbt_prevhash(), kPrev) << "HOLD keeps the previous template";
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_GE(mi->get_mweb_hold_seconds(), 0.025);
+
+    // MWEB state for the new tip lands -> the immediate refresh.
+    node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, new_prev);
+    ws.trigger_work_refresh();
+    EXPECT_FALSE(mi->is_mweb_holding());
+    EXPECT_EQ(mi->get_current_gbt_prevhash(), new_prev) << "template replaced on the update";
+    const double total = mi->get_mweb_hold_seconds();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(mi->get_mweb_hold_seconds(), total) << "HOLD seconds stop rising";
 }

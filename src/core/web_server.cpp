@@ -1488,14 +1488,28 @@ void MiningInterface::refresh_work()
 
         // MWEB ingress guard (Litecoin): a template whose MWEB half is missing
         // or orphaned can only yield blocks litecoind rejects ("mweb-missing").
-        // HOLD: return and keep the previous template. Never throw from here —
-        // the catch below would clear m_work_valid, which zeroes share
-        // difficulty for every submit until the next good template.
+        // With a valid template cached: HOLD — return and keep it. Never throw
+        // from here: the catch below would clear m_work_valid, which zeroes
+        // share difficulty for every submit until the next good template.
+        // With none (cold/warm start before the first MWEB state, or a cached
+        // template that is itself degraded): serve this one DEGRADED, so
+        // shares and merged mining work. Block assembly runs the same check
+        // on the frozen job and refuses every LTC block from it.
+        bool degraded = false;
         if (auto why = core::coin::check_template_shape(wd.m_data)) {
-            note_mweb_template_refusal(*why);
-            return;
+            if (m_work_valid && !m_work_degraded) {
+                note_mweb_template_refusal(*why);
+                // Keep the DOGE blocks' PPLNS current while holding: new jobs
+                // on the held template read the merged commitment fresh.
+                if (m_mm_manager && m_mm_manager->is_pplns_dirty())
+                    m_mm_manager->rebuild_cached_blocks();
+                return;
+            }
+            note_mweb_degraded_template(*why);
+            degraded = true;
+        } else {
+            note_mweb_template_accepted();
         }
-        note_mweb_template_accepted();
         const bool mweb_active = core::coin::template_rules_have_mweb(wd.m_data);
 
         // Collect tx hashes from WorkData
@@ -1701,6 +1715,7 @@ void MiningInterface::refresh_work()
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
         m_cached_mweb_active      = mweb_active;
+        m_work_degraded           = degraded;
         m_work_valid              = true;
         ++m_work_generation;
         m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1738,10 +1753,6 @@ void MiningInterface::refresh_work()
                 }
             } catch (...) {}
         }
-    } catch (const core::coin::MwebTemplateHold& e) {
-        // The coin-side builder refused its own template on the MWEB shape
-        // check: same HOLD as the ingress guard, m_work_valid untouched.
-        note_mweb_template_refusal(e.what());
     } catch (const std::exception& e) {
         LOG_WARNING << "refresh_work failed: " << e.what();
         m_work_valid = false;
@@ -1751,23 +1762,39 @@ void MiningInterface::refresh_work()
 void MiningInterface::note_mweb_template_refusal(const std::string& why)
 {
     const uint64_t n = m_mweb_template_refusals.fetch_add(1, std::memory_order_relaxed) + 1;
-    LOG_ERROR << "[MWEB] Template REFUSED at ingress: " << why
-              << " — keeping the previous template (refusal #" << n << ")";
     const int64_t now_ms = std::max<int64_t>(1,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     int64_t expected = 0;
     if (m_mweb_hold_since_ms.compare_exchange_strong(expected, now_ms)) {
-        LOG_WARNING << "[MWEB] HOLD: miners keep working on the previous template"
-                    << (m_work_valid ? "" : " (none cached yet: no work until a valid template)")
-                    << " until a template with a trailing HogEx and mweb data arrives."
-                    << " Shares, PPLNS and merged mining continue; an LTC block found"
-                    << " meanwhile builds on the previous tip.";
+        // First refusal of this window: the one ERROR line.
+        LOG_ERROR << "[MWEB] Template REFUSED at ingress: " << why
+                  << " — HOLD: miners keep working on the previous template until a"
+                  << " template with a trailing HogEx and mweb data arrives. Shares,"
+                  << " PPLNS and merged mining continue; an LTC block found meanwhile"
+                  << " builds on the previous tip.";
+    } else {
+        LOG_DEBUG_COIND << "[MWEB] Template refused at ingress (HOLD, refusal #" << n << "): " << why;
+    }
+}
+
+void MiningInterface::note_mweb_degraded_template(const std::string& why)
+{
+    m_mweb_template_refusals.fetch_add(1, std::memory_order_relaxed);
+    if (!m_work_degraded) {
+        LOG_WARNING << "[MWEB] DEGRADED start: no valid template to hold (" << why << ")."
+                    << " Serving this template so shares and merged mining work; block"
+                    << " assembly refuses every LTC block from it until MWEB state for"
+                    << " the tip arrives.";
+    } else {
+        LOG_DEBUG_COIND << "[MWEB] Degraded template replaced by a newer degraded one: " << why;
     }
 }
 
 void MiningInterface::note_mweb_template_accepted()
 {
+    if (m_work_degraded)
+        LOG_INFO << "[MWEB] Degraded start ended — template with MWEB state accepted";
     const int64_t since = m_mweb_hold_since_ms.exchange(0);
     if (since == 0)
         return;
@@ -2134,6 +2161,15 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                                 << " — forwarding to daemon anyway (daemon is authority)";
                     is_stale = true;
                 }
+            }
+
+            // MWEB HOLD: the cached template is the held one, built on the
+            // previous tip, so the prev check above matches it. A block found
+            // now is a race on the previous tip: telemetry only, still forwarded.
+            if (!is_stale && m_mweb_hold_since_ms.load(std::memory_order_relaxed) != 0) {
+                LOG_WARNING << "[LTC] submitblock: block built on the template held during"
+                            << " an MWEB HOLD (previous tip) — forwarding to daemon anyway";
+                is_stale = true;
             }
 
             // Reconstruct expected merkle_root from coinbase + merkle branches
@@ -5144,7 +5180,14 @@ nlohmann::json MiningInterface::rest_local_stats()
             const bool tip_stalled =
                 m_last_work_update_time > 0 &&
                 now_s - m_last_work_update_time > threshold;
-            if (tip_stalled && have_coin_peers) {
+            // An MWEB HOLD keeps the previous template, so the work timestamp
+            // stops while blocks still arrive: say so instead of LOST CONTACT.
+            const int64_t hold_since_ms = m_mweb_hold_since_ms.load(std::memory_order_relaxed);
+            if (hold_since_ms != 0) {
+                warnings.push_back("MWEB HOLD for "
+                    + std::to_string(std::max<int64_t>(0, now_s - hold_since_ms / 1000))
+                    + "s: waiting for MWEB state of the new tip");
+            } else if (tip_stalled && have_coin_peers) {
                 std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
                 warnings.push_back("LOST CONTACT WITH " + src + " for "
                     + std::to_string(now_s - m_last_work_update_time) + "s! "
@@ -5376,6 +5419,7 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_refusals"] = get_mweb_refusals();
     result["mweb_template_refusals"] = get_mweb_template_refusals();
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
+    result["mweb_degraded"] = is_work_degraded();
 
     return result;
 }
@@ -9860,6 +9904,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
                                                               ntime, nonce, job);
                     if (!block_hex.empty()) {
+                        // The job-less fallback may have rebuilt the block under
+                        // a newer header: dedup and log the block as assembled.
+                        block_bytes = ParseHex(block_hex.substr(0, 160));
                         // Validate merkle root before submitting
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
@@ -10269,6 +10316,9 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                         block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
                                                               ntime, nonce, job);
                     if (!block_hex.empty()) {
+                        // The job-less fallback may have rebuilt the block under
+                        // a newer header: dedup and log the block as assembled.
+                        block_bytes = ParseHex(block_hex.substr(0, 160));
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
 
