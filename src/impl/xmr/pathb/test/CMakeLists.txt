@@ -152,7 +152,9 @@ if (BUILD_TESTING)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
-        add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
+        if (NOT _pathb_kat STREQUAL "v37_xmr_joiner_kat")
+            add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
+        endif()
     endforeach()
     # v37_xmr_pathb_miner_tx_kat: a test-only TU compares the author key references
     # with the K16 references of pathb_lane_rules.hpp and pathb's keys with the
@@ -167,8 +169,20 @@ if (BUILD_TESTING)
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     # v37_xmr_pathb_store_kat also runs its store through the LevelDB archive.
     target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
-    # v37_xmr_joiner_kat replays several chains of 4,700+ carriers (ASan ~12 min).
-    set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
+    # v37_xmr_joiner_kat runs as the shards v37_xmr_joiner_kat_s0 .. _s3 (--shard=i/4); the test
+    # v37_xmr_joiner_kat gathers their results (--gather=4) and requires them as a fixture.
+    set(_joiner_shards 0 1 2 3)
+    list(LENGTH _joiner_shards _joiner_n)
+    set(_joiner_out ${CMAKE_CURRENT_BINARY_DIR}/v37_xmr_joiner_kat.result)
+    foreach(_joiner_shard IN LISTS _joiner_shards)
+        add_test(NAME v37_xmr_joiner_kat_s${_joiner_shard}
+                COMMAND v37_xmr_joiner_kat --shard=${_joiner_shard}/${_joiner_n} --out=${_joiner_out})
+        set_tests_properties(v37_xmr_joiner_kat_s${_joiner_shard} PROPERTIES
+                LABELS slow FIXTURES_SETUP v37_xmr_joiner_kat_shards)
+    endforeach()
+    add_test(NAME v37_xmr_joiner_kat COMMAND v37_xmr_joiner_kat --gather=${_joiner_n} --out=${_joiner_out})
+    set_tests_properties(v37_xmr_joiner_kat PROPERTIES
+            LABELS slow FIXTURES_REQUIRED v37_xmr_joiner_kat_shards)
     # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
     set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
     # v37_xmr_pathb_node_kat runs the relay node and its threads; deferfound submits a found block through the monerod
