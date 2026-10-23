@@ -2879,11 +2879,21 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
     std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique worker keys ("ADDRESS.worker")
     const auto liveness = observe_worker_liveness(workers, now_steady);
     int connections_silent = 0;
+    int connections_hashing = 0, connections_standby = 0, connections_stalled = 0;
+    // A worker with several connections takes its most active one's state:
+    // hashing > stalled > standby.
+    auto state_rank = [](const std::string& s) {
+        return s == "hashing" ? 2 : s == "stalled" ? 1 : 0;
+    };
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
         const WorkerLiveness& lv = liveness.at(sid);
         if (lv.silent) ++connections_silent;
+        const std::string state = session_state(lv);
+        if (state == "hashing") ++connections_hashing;
+        else if (state == "standby") ++connections_standby;
+        else ++connections_stalled;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
@@ -2936,6 +2946,14 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 wj["silent_seconds"] = lv.silent_seconds;
                 wj["silent_threshold_seconds"] = lv.threshold_seconds;
             }
+            if (state_rank(state) > state_rank(wj["state"].get<std::string>()))
+                wj["state"] = state;
+            if (lv.has_shared) {
+                wj["ever_submitted"] = true;
+                if (wj["last_share_age_s"].is_null()
+                    || lv.silent_seconds < wj["last_share_age_s"].get<int64_t>())
+                    wj["last_share_age_s"] = lv.silent_seconds;
+            }
         } else {
             workers_json[worker_key] = {
                 {"hash_rate", w.hashrate},
@@ -2956,7 +2974,14 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 {"rtt_ms", w.rtt_ms},
                 {"silent", lv.silent},
                 {"silent_seconds", lv.silent_seconds},
-                {"silent_threshold_seconds", lv.threshold_seconds}
+                {"silent_threshold_seconds", lv.threshold_seconds},
+                {"state", state},
+                {"ever_submitted", lv.has_shared},
+                // Seconds since this worker's last accepted share on this node
+                // (poll resolution); null when it never shared here.
+                {"last_share_age_s", lv.has_shared
+                                         ? nlohmann::json(lv.silent_seconds)
+                                         : nlohmann::json(nullptr)}
             };
         }
     }
@@ -2975,6 +3000,9 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         {"connections", static_cast<int>(workers.size())},
         {"connections_active", static_cast<int>(workers.size()) - connections_silent},
         {"connections_silent", connections_silent},
+        {"connections_hashing", connections_hashing},
+        {"connections_standby", connections_standby},
+        {"connections_stalled", connections_stalled},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
         {"total_accepted", total_accepted},
@@ -4694,14 +4722,22 @@ nlohmann::json MiningInterface::rest_local_stats()
         const auto workers = effective_stratum_workers();
         const auto liveness = observe_worker_liveness(
             workers, std::chrono::steady_clock::now());
-        int silent = 0;
-        for (const auto& [sid, lv] : liveness)
+        int silent = 0, hashing = 0, standby = 0, stalled = 0;
+        for (const auto& [sid, lv] : liveness) {
             if (lv.silent) ++silent;
+            const std::string st = session_state(lv);
+            if (st == "hashing") ++hashing;
+            else if (st == "standby") ++standby;
+            else ++stalled;
+        }
         const int total = static_cast<int>(workers.size());
         result["stratum_sessions"] = {
             {"total", total},
             {"active", total - silent},
             {"silent", silent},
+            {"hashing", hashing},
+            {"standby", standby},
+            {"stalled", stalled},
             {"silent_floor_seconds", kSilentFloorSeconds}
         };
         // #959 slice B: name the silent workers and how long each has been
@@ -8110,6 +8146,8 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
     std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
     auto it = m_stratum_workers.find(session_id);
     if (it != m_stratum_workers.end()) {
+        if (accepted > it->second.accepted)
+            it->second.last_accepted_at = std::chrono::steady_clock::now();
         it->second.hashrate = hashrate;
         it->second.dead_hashrate = dead_hashrate;
         it->second.difficulty = difficulty;
@@ -8178,6 +8216,12 @@ MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
     return out;
 }
 
+const char* MiningInterface::session_state(const WorkerLiveness& lv)
+{
+    if (!lv.has_shared) return "standby";
+    return lv.silent ? "stalled" : "hashing";
+}
+
 std::map<std::string, MiningInterface::WorkerLiveness>
 MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>& workers,
                                          std::chrono::steady_clock::time_point now) const
@@ -8198,6 +8242,11 @@ MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>
                 seen.last_share_at.reset();
             seen.accepted = w.accepted;
         }
+        // A registry that stamps the share time gives the exact age; the
+        // poll stamp above is the fallback for one that does not.
+        if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
+            && w.last_accepted_at <= now)
+            seen.last_share_at = w.last_accepted_at;
         out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
     }
     return out;
@@ -8245,6 +8294,7 @@ nlohmann::json MiningInterface::silent_workers_list(
             {"silent_seconds", a.silent_seconds},
             {"threshold_seconds", a.threshold_seconds},
             {"has_shared", a.has_shared},
+            {"state", a.has_shared ? "stalled" : "standby"},
             {"connections", a.connections}
         });
     }

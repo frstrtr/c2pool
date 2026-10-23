@@ -2171,6 +2171,14 @@ public:
         int64_t silent_seconds{0};       // since last share, else since connect
         int64_t threshold_seconds{0};
     };
+    // Session state for display and alerting, derived from WorkerLiveness.
+    // All nodes are peers: a rig may hold a failover connection to this node
+    // while it hashes on another one, so "never shared on this connection" is
+    // a normal state of its own, not a fault.
+    //   hashing  -- has shared on this connection and is not silent
+    //   standby  -- authorized and connected, never shared on this connection
+    //   stalled  -- shared on this connection, then went silent
+    static const char* session_state(const WorkerLiveness& lv);
     static constexpr int64_t kSilentFloorSeconds = 900;
     static constexpr int64_t kSilentCapSeconds = 7 * 24 * 3600;
     static constexpr double kSilentExpectedIntervals = 6.0;
@@ -2183,6 +2191,8 @@ public:
     // (LTC's own or a coin target's), so no per-coin work source changes. The
     // first sighting of a session that already has shares is stamped `now`
     // (silence is never overstated); resolution is the gap between polls.
+    // A registry that stamps WorkerInfo::last_accepted_at (core, DASH) gives
+    // the exact age instead.
     std::map<std::string, WorkerLiveness> observe_worker_liveness(
         const std::map<std::string, WorkerInfo>& workers,
         std::chrono::steady_clock::time_point now) const;

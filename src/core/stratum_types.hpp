@@ -256,6 +256,9 @@ struct WorkerInfo {
     std::chrono::steady_clock::time_point connected_at;
     std::string remote_endpoint;  // "ip:port"
     double rtt_ms{0.0};           // TCP round-trip latency in ms (Linux tcpi_rtt); 0 = unknown / non-Linux
+    // When `accepted` last moved; default = no accepted share on this
+    // connection (or a registry that does not stamp it).
+    std::chrono::steady_clock::time_point last_accepted_at;
 };
 
 }  // namespace core::stratum
