@@ -84,6 +84,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ends with the HogEx and carries mweb, an MWEB-active builder without MWEB
     # state returns nullopt (never a "segwit"-only template), and pins the
     # mainnet/testnet activation heights. Same folding rule.
+    #
+    # compact_block_mweb_relay_test.cpp: relay_mode_for (a HogEx block always
+    # goes out as a full block: a v2 cmpctblock cannot carry mweb) and the
+    # sendcmpct highest-version fold. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -95,6 +99,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
         compact_block_merkle_test.cpp
+        compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_template_underfill_test.cpp

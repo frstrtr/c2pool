@@ -23,6 +23,7 @@
 #include <core/hash.hpp>
 #include <btclibs/crypto/siphash.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <map>
@@ -231,6 +232,35 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
     }
 
     return cb;
+}
+
+// ─── Relay mode ──────────────────────────────────────────────────────────────
+
+/// How to relay a block we found to one peer.
+enum class RelayMode { Full, Compact };
+
+/// A peer may send several sendcmpct messages (litecoind sends v3, v2, v1 in
+/// that order). Keep the highest version it announced, not the last one.
+inline uint64_t fold_cmpct_version(uint64_t current, uint64_t announced) {
+    return std::max(current, announced);
+}
+
+/// True when the block's last transaction is the MWEB HogEx.
+inline bool block_has_hogex(const BlockType& block) {
+    return !block.m_txs.empty() && block.m_txs.back().m_hogEx;
+}
+
+/// Relay mode for a block to a peer whose highest sendcmpct version is
+/// peer_cmpct_version. Our CompactBlock is the v2 (BIP 152 witness) encoding,
+/// which has no room for the MWEB extension block: after MWEB activation
+/// litecoind drops a v1/v2 cmpctblock and never sees the block. A HogEx block
+/// therefore always goes out as a full block, which carries "01" + mweb. A
+/// compact block is sent only to a v2 peer and only for a block without a
+/// HogEx (v3 is not announced or encoded here).
+inline RelayMode relay_mode_for(uint64_t peer_cmpct_version, const BlockType& block) {
+    if (block_has_hogex(block))
+        return RelayMode::Full;
+    return peer_cmpct_version == 2 ? RelayMode::Compact : RelayMode::Full;
 }
 
 // ─── Reconstruction ─────────────────────────────────────────────────────────

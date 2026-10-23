@@ -140,6 +140,11 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
+        // sendcmpct versions fold to the highest one per connection; start
+        // each connection from nothing negotiated.
+        m_peer_supports_cmpct = false;
+        m_peer_cmpct_version = 0;
+        m_peer_wants_cmpct_announce = false;
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
         // Require version/verack progress soon after connect.
@@ -362,18 +367,27 @@ public:
     void enable_mempool_request() { m_request_mempool_on_connect = true; }
 
     /// Relay a pre-serialized block via P2P.
-    /// Uses compact block format (BIP 152 v2) for peers that support it,
-    /// falling back to full block otherwise.
+    /// Uses compact block format (BIP 152 v2) for v2 peers when the block has
+    /// no HogEx (see relay_mode_for), falling back to full block otherwise.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return;
 
-        if (m_peer_supports_cmpct && m_peer_cmpct_version >= 2) {
-            // Deserialize the block to build a compact representation
+        if (m_peer_supports_cmpct && m_peer_cmpct_version == 2) {
+            // Deserialize the block to pick the relay mode and, for a compact
+            // relay, build the compact representation.
             try {
                 PackStream ps(block_bytes);
                 BlockType block;
                 ps >> block;
+                if (relay_mode_for(m_peer_cmpct_version, block) == RelayMode::Full) {
+                    // A v2 compact block cannot carry the MWEB extension data;
+                    // the full block bytes already include "01" + mweb.
+                    LOG_INFO << "[" << m_chain_label << "] HogEx block: sending full block ("
+                             << block_bytes.size() << " bytes) instead of a v2 compact block";
+                    submit_block_full(block_bytes);
+                    return;
+                }
                 auto cb = BuildCompactBlock(
                     static_cast<BlockHeaderType&>(block), block.m_txs);
                 auto rmsg = message_cmpctblock::make_raw(cb);
@@ -397,7 +411,7 @@ public:
                             << "), sending full block: " << e.what();
             }
         } else {
-            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer does not support compact blocks"
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] No v2 compact relay to this peer"
                      << " (cmpct=" << m_peer_supports_cmpct
                      << " ver=" << m_peer_cmpct_version
                      << "), sending full block (" << block_bytes.size() << " bytes)";
@@ -802,7 +816,7 @@ private:
     {
         // BIP 152: Compact block negotiation — record peer capability
         m_peer_supports_cmpct = true;
-        m_peer_cmpct_version = msg->m_version;
+        m_peer_cmpct_version = fold_cmpct_version(m_peer_cmpct_version, msg->m_version);
         m_peer_wants_cmpct_announce = msg->m_announce;
         LOG_INFO << "[" << m_chain_label << "] Peer supports compact blocks v"
                  << msg->m_version << " (announce=" << msg->m_announce << ")";
