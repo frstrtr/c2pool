@@ -36,7 +36,8 @@
 // last and M as the extension block, and the P2P relay gets the same bytes.
 //
 // Negatives (choke 1, block assembly): mweb without a trailing HogEx (N1) and
-// a HogEx without mweb (N2) never reach the daemon.
+// a HogEx without mweb (N2) never reach the daemon. Both shares still reach
+// the merged-mining check (DOGE aux validity needs only the header).
 //
 // Template ingress (choke 2): a template failing the shape check is refused
 // with HOLD semantics — the previous template stays, m_work_valid is not
@@ -345,6 +346,7 @@ TEST(LtcMwebHogex, FoundBlockCarriesHogexAndMweb)
     EXPECT_TRUE(rb.m_txs.back().m_hogEx);
     EXPECT_EQ(rb.m_mweb_raw, b.m_mweb_raw);
 
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u);
     EXPECT_EQ(f.mi.get_mweb_refusals(), 0u);
 }
 
@@ -420,6 +422,8 @@ TEST(LtcMwebHogex, N1_MwebWithoutHogexNeverSubmitted)
     EXPECT_TRUE(f.fires.empty());
     EXPECT_EQ(f.relay_calls, 0);
     EXPECT_EQ(f.mi.get_mweb_refusals(), 1u);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u)
+        << "the merged-mining check must still see the share (DOGE needs only the header)";
 }
 
 // N2: HogEx present, mweb empty.
@@ -434,6 +438,7 @@ TEST(LtcMwebHogex, N2_HogexWithoutMwebNeverSubmitted)
     EXPECT_EQ(f.node.submit_calls, 0);
     EXPECT_TRUE(f.fires.empty());
     EXPECT_EQ(f.mi.get_mweb_refusals(), 1u);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u);
 }
 
 // Non-MWEB chain (e.g. NMC): segwit without mweb is a valid block. Master
@@ -531,6 +536,7 @@ TEST(LtcMwebHogex, CountersInLocalStats)
     Job j = make_job({kTx1}, {txid_hex(kTx1)}, kMweb, /*mweb_active=*/true);
     submit(f, j);
     auto stats = f.mi.rest_local_stats();
+    EXPECT_EQ(stats.value("aux_checks", uint64_t(0)), 1u);
     EXPECT_EQ(stats.value("mweb_refusals", uint64_t(0)), 1u);
     EXPECT_TRUE(stats.contains("mweb_template_refusals"));
     EXPECT_TRUE(stats.contains("mweb_hold_seconds"));

@@ -902,10 +902,12 @@ public:
     // Return whether the cached template's rules name MWEB
     bool get_cached_mweb_active() const;
 
-    // MWEB submit-path counters (also in /local_stats).
+    // MWEB / merged-mining submit-path counters (also in /local_stats).
+    //   aux_checks             — shares offered to the merged-mining check
     //   mweb_refusals          — blocks refused at assembly on the MWEB shape check
     //   mweb_template_refusals — templates refused at ingress (HOLD)
     //   mweb_hold_seconds      — total time spent holding the previous template
+    uint64_t get_aux_checks() const { return m_aux_checks.load(std::memory_order_relaxed); }
     uint64_t get_mweb_refusals() const { return m_mweb_block_refusals.load(std::memory_order_relaxed); }
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
@@ -1373,21 +1375,40 @@ private:
                                          const JobSnapshot* job = nullptr) const;
 
     // Header hex (160 chars) for a submitted share, built from the job snapshot
-    // (or the live cache when job is null). Caller holds m_work_mutex.
+    // (or the live cache when job is null) with the same field defaults as
+    // build_block_from_stratum. Takes m_work_mutex for the read only.
     // Returns "" when no header can be derived.
+    std::string derive_block_header_hex(const std::string& extranonce1,
+                                        const std::string& extranonce2,
+                                        const std::string& ntime,
+                                        const std::string& nonce,
+                                        const JobSnapshot* job) const;
+    // Same, for callers that already hold m_work_mutex.
     std::string block_header_hex_locked(const std::string& extranonce1,
                                         const std::string& extranonce2,
                                         const std::string& ntime,
                                         const std::string& nonce,
                                         const JobSnapshot* job) const;
+    // Full block hex for a share whose header_hex met the block target
+    // (build_block_from_stratum). If the live cache moved under a job-less
+    // share, the rebuilt block is judged by its own header instead.
+    // Returns "" when assembly is refused or that block misses its target.
+    std::string assemble_block_for_header(const std::string& header_hex,
+                                          const std::string& extranonce1,
+                                          const std::string& extranonce2,
+                                          const std::string& ntime,
+                                          const std::string& nonce,
+                                          const JobSnapshot* job) const;
 
     // Template-ingress MWEB HOLD bookkeeping (refresh_work only).
     void note_mweb_template_refusal(const std::string& why);
     void note_mweb_template_accepted();
 
-    // Try submitting to merged-mined aux chains if their target is met
+    // Try submitting to merged-mined aux chains if their target is met.
+    // Needs only the 80-byte parent header (first 160 hex chars of header_hex),
+    // the coinbase parts and the merkle branches — never the block body.
     // Returns true if a merged block was found (for twin block detection)
-    bool check_merged_mining(const std::string& block_hex,
+    bool check_merged_mining(const std::string& header_hex,
                              const std::string& extranonce1,
                              const std::string& extranonce2,
                              const JobSnapshot* job = nullptr,
@@ -1598,7 +1619,8 @@ private:
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
     bool m_cached_mweb_active{false};  // template rules named MWEB (Litecoin)
 
-    // MWEB submit-path counters (see get_mweb_refusals()).
+    // MWEB / merged-mining submit-path counters (see get_aux_checks()).
+    std::atomic<uint64_t> m_aux_checks{0};
     mutable std::atomic<uint64_t> m_mweb_block_refusals{0};  // bumped in const build_block_from_stratum
     std::atomic<uint64_t> m_mweb_template_refusals{0};
     // Template-ingress HOLD window: steady-clock ms when the open window

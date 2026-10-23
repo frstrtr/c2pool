@@ -410,18 +410,20 @@ std::string MiningInterface::get_node_fee_hash160() const
     return h160;
 }
 
-bool MiningInterface::check_merged_mining(const std::string& block_hex,
+bool MiningInterface::check_merged_mining(const std::string& header_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
                                           const JobSnapshot* job,
                                           const std::string& miner,
                                           const uint256& share_hash)
 {
+    // Counted before the manager check so the call path itself is observable.
+    m_aux_checks.fetch_add(1, std::memory_order_relaxed);
     if (!m_mm_manager) return false;
 
     // Extract 80-byte parent header (first 160 hex chars)
-    if (block_hex.size() < 160) return false;
-    std::string parent_header_hex = block_hex.substr(0, 160);
+    if (header_hex.size() < 160) return false;
+    std::string parent_header_hex = header_hex.substr(0, 160);
 
     // Compute parent block hash (scrypt for LTC)
     auto hdr_bytes = ParseHex(parent_header_hex);
@@ -643,6 +645,49 @@ MiningInterface::block_header_hex_locked(const std::string& extranonce1,
     if (header.empty())
         return {};
     return HexStr(std::span<const unsigned char>(header.data(), header.size()));
+}
+
+std::string
+MiningInterface::derive_block_header_hex(const std::string& extranonce1,
+                                         const std::string& extranonce2,
+                                         const std::string& ntime,
+                                         const std::string& nonce,
+                                         const JobSnapshot* job) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return block_header_hex_locked(extranonce1, extranonce2, ntime, nonce, job);
+}
+
+std::string
+MiningInterface::assemble_block_for_header(const std::string& header_hex,
+                                           const std::string& extranonce1,
+                                           const std::string& extranonce2,
+                                           const std::string& ntime,
+                                           const std::string& nonce,
+                                           const JobSnapshot* job) const
+{
+    std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
+    if (block_hex.empty() || block_hex.compare(0, header_hex.size(), header_hex) == 0)
+        return block_hex;
+
+    // A job snapshot is frozen, so its header cannot change. A job-less share
+    // reads the live cache, which refresh_work() may have replaced since the
+    // PoW check, so the block was assembled under a different header. Judge
+    // that block by its own header, as the submit path did before the header
+    // and the body were split.
+    auto hdr = ParseHex(block_hex.substr(0, 160));
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr.data()), pow_hash_bytes);
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+    const uint32_t bits = hdr[72] | (hdr[73] << 8) | (hdr[74] << 16) | (hdr[75] << 24);
+    const uint256 target = chain::bits_to_target(bits);
+    if (target.IsNull() || pow_hash > target) {
+        LOG_WARNING << "[BLOCK] Template changed between the PoW check and body assembly"
+                    << " (job-less share); the rebuilt block misses its target — not submitted";
+        return {};
+    }
+    return block_hex;
 }
 
 // ─── Build full block from Stratum parameters ────────────────────────────────
@@ -5325,8 +5370,9 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["version"] = m_pool_version;
     result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
 
-    // Submit-path health: blocks and templates refused on the MWEB shape
-    // check, time spent in HOLD.
+    // Submit-path health: shares offered to the merged-mining check, blocks
+    // and templates refused on the MWEB shape check, time spent in HOLD.
+    result["aux_checks"] = get_aux_checks();
     result["mweb_refusals"] = get_mweb_refusals();
     result["mweb_template_refusals"] = get_mweb_template_refusals();
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
@@ -9783,14 +9829,17 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Check if share meets network difficulty and attempt block submission
         if (m_coin_node && !extranonce1.empty()) {
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
-            if (!block_hex.empty()) {
+            // Header first: the merged-mining check needs only the header, the
+            // coinbase parts and the branches, so every share reaches it even
+            // when the block body is refused (MWEB shape check).
+            std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
+            if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                bool solo_merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
                                                              payout_address);
 
                 // Check PoW hash against the blockchain target before submitting
-                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
                     char pow_hash_bytes[32];
                     scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
@@ -9805,7 +9854,12 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                            (block_bytes[74] << 16) | (block_bytes[75] << 24);
                     uint256 block_target = chain::bits_to_target(header_bits);
 
-                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                    // Assemble the body only for a block-target hit ("" = refused, logged).
+                    std::string block_hex;
+                    if (!block_target.IsNull() && pow_hash <= block_target)
+                        block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
+                                                              ntime, nonce, job);
+                    if (!block_hex.empty()) {
                         // Validate merkle root before submitting
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
@@ -10187,13 +10241,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Attempt block construction + submission only when PoW meets blockchain target.
         if (m_coin_node && !extranonce1.empty()) {
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
-            if (!block_hex.empty()) {
+            // Header first: the merged-mining check needs only the header, the
+            // coinbase parts and the branches, so every share reaches it even
+            // when the block body is refused (MWEB shape check).
+            std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
+            if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                bool merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
                                                         primary_addr, created_share);
 
-                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
                     char pow_hash_bytes[32];
                     scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
@@ -10206,7 +10263,12 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                            (block_bytes[74] << 16) | (block_bytes[75] << 24);
                     uint256 block_target = chain::bits_to_target(header_bits);
 
-                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                    // Assemble the body only for a block-target hit ("" = refused, logged).
+                    std::string block_hex;
+                    if (!block_target.IsNull() && pow_hash <= block_target)
+                        block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
+                                                              ntime, nonce, job);
+                    if (!block_hex.empty()) {
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
 
