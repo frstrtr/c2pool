@@ -3522,19 +3522,6 @@ private:
                         c.fetch_tip = Hash32{};
                     }
                 }
-                // a page whose bodies are in flight: no new ask until its tip is placed, or the best did not move within
-                // P-53 (the page lapsed)
-                Catchup& c = it->second;
-                if (c.fetch_tip != Hash32{}) {
-                    if (node_->tree().find(c.fetch_tip) != nullptr) {
-                        c.fetch_tip = Hash32{};
-                    } else if (b.id != c.fetch_best) {
-                        c.fetch_best = b.id;
-                        c.fetch_ms = now_ms();
-                    } else if (now_ms() >= c.fetch_ms + abandon_s_ * 1000) {
-                        c.fetch_tip = Hash32{};
-                    }
-                }
                 // again from the new best tip (the locator from its step 0), or after a request that got no reply
                 // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
                 if (c.fetch_tip == Hash32{} && c.asked_best != b.id) {
