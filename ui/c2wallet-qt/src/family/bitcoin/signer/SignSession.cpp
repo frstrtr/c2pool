@@ -48,9 +48,8 @@ Bytes script_bytes(const CScript& s) { return Bytes(s.begin(), s.end()); }
 CScript cscript(const Bytes& b) { return CScript(b.data(), b.data() + b.size()); }
 
 // ── raw (non-witness) tx parser — std-only, no dashscript deserializer ──────
-struct RawIn  { Bytes txid; uint32_t index = 0; Bytes scriptsig; uint32_t seq = 0; };
-struct RawOut { int64_t value = 0; Bytes spk; };
-struct RawTx  { int32_t version = 0; uint32_t locktime = 0; std::vector<RawIn> vin; std::vector<RawOut> vout; };
+// The view types are exported with parse_raw_legacy_tx (SignSession.hpp).
+using RawTx = RawTxView;
 
 struct Reader {
     const Bytes& b; size_t pos = 0; bool bad = false;
@@ -187,6 +186,10 @@ std::string lower_ascii(std::string s) {
 }
 
 } // namespace
+
+bool parse_raw_legacy_tx(const Bytes& raw, RawTxView& tx, std::string& err) {
+    return parse_raw_tx(raw, tx, err);
+}
 
 int64_t default_absurd_fee_sats(const std::string& coin) {
     // Strip a "-t"/"-test" testnet suffix and lowercase.

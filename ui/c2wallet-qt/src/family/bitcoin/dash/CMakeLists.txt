@@ -6,7 +6,9 @@ cmake_minimum_required(VERSION 3.21)
 # builder) + §4.1.2 (message sign/verify). Ported byte-exact from the operator's
 # frstrtr/dash-proposal-collateral (see PROVENANCE below).
 #
-# HIGH money-path: sign_collateral() produces a spendable tx that burns 1 DASH.
+# HIGH money-path: sign_collateral() produces a spendable tx that burns 1 DASH,
+# and the zero-fee inject builders (FeeMode::InjectOnlyZeroFee, SweepTx) spend
+# every mature UTXO of an address for a c2pool node's own block.
 # DELIBERATELY Qt-FREE and NETWORK-FREE — inherits the M0 network-incapable
 # property; its KATs build and run without the Qt app.
 #
@@ -60,11 +62,15 @@ if(NOT TARGET c2wallet-signer)
 endif()
 
 # ── btclibs-closure lib: hash / address / key-scan / message ────────────────
+# plus the key-free half of the zero-fee inject builders: UTXO intake/screening
+# and the sweep planner / unsigned serializer / loader-file emit.
 add_library(c2wallet-dash-common STATIC
     GovCollateral.cpp
     DashAddress.cpp
     KeyScan.cpp
     DashMessage.cpp
+    UtxoIntake.cpp
+    SweepTx.cpp
 )
 target_include_directories(c2wallet-dash-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # PRIVATE on purpose: this lib's .cpp need the hdkeys (btclibs) include tree,
@@ -75,7 +81,8 @@ target_include_directories(c2wallet-dash-common PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(c2wallet-dash-common PRIVATE c2wallet-hdkeys)
 
 # ── dashscript-closure lib: the tx assembly, via the M3-A signer ────────────
-add_library(c2wallet-dash-tx STATIC CollateralTx.cpp)
+# (collateral build + sign, and the signing half of the sweep builder)
+add_library(c2wallet-dash-tx STATIC CollateralTx.cpp SweepSign.cpp)
 target_include_directories(c2wallet-dash-tx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # c2wallet-signer FIRST so the dashscript <hash.h>/<uint256.h> win for this TU;
 # c2wallet-dash-common provides the std-only address/key/gov declarations it
@@ -85,9 +92,15 @@ target_link_libraries(c2wallet-dash-tx PUBLIC c2wallet-signer c2wallet-dash-comm
 option(C2WALLET_QT_BUILD_TESTS "Build the DASH special-tx KAT test" OFF)
 if(C2WALLET_QT_BUILD_TESTS OR _dash_standalone)
     enable_testing()
+    # The inject KATs (K9) round-trip the emitted loader file through the M5-A
+    # artifact library's SignedContainer / accept_as_signed. Test-only link.
+    if(NOT TARGET c2wallet-artifact)
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../artifact ${CMAKE_BINARY_DIR}/_dash_artifact)
+    endif()
     add_executable(c2wallet-dash-test tests/test_dash.cpp)
     # signer first on the link line (matches the proven link order).
-    target_link_libraries(c2wallet-dash-test PRIVATE c2wallet-dash-tx c2wallet-dash-common)
+    target_link_libraries(c2wallet-dash-test PRIVATE c2wallet-dash-tx c2wallet-dash-common
+                          c2wallet-artifact)
     add_test(NAME dash_kats COMMAND c2wallet-dash-test)
 
     # The "drive the proven Python as the oracle" leg: proto_hash_oracle.py (the
