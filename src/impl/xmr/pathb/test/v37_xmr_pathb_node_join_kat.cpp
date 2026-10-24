@@ -75,6 +75,7 @@
 //   x8claim    a header of that branch whose t_origin is not the window's d
 //              at a position whose window reads a claim: ClaimLeaf (alarm,
 //              DEFER, no BAN), before and after the restart.
+// Shards and their gather: pathb_kat_shard.hpp.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <chrono>
@@ -91,6 +92,7 @@
 
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
+#include "pathb_kat_shard.hpp"
 
 // The KAT's view of a node's private state.
 namespace c2pool::xmr::pathb {
@@ -2122,44 +2124,43 @@ void keycache() {
 
 int main(int argc, char** argv) {
     std::printf("v37_xmr_pathb_node_join_kat\n");
-    const std::string only = argc > 1 ? argv[1] : "";
-    const auto run = [&](const char* name, void (*fn)()) {
-        if (only.empty() || only == name) run_part(name, fn);
-    };
-    run("loadfail", loadfail);
-    run("young", young);
-    run("scope", scope);
-    run("scopepow", scopepow);
-    run("tokens", tokens);
-    run("fetchahead", fetchahead);
-    run("deep", deep);
-    run("partition", partition);
-    run("omitownspan", omitownspan);
-    run("x1", x1);
-    run("reask", reask);
-    run("adoptbelow", adoptbelow);
-    run("e81", e81);
-    run("caps", caps);
-    run("disconnect", disconnect);
-    run("floors", floors);
-    run("emptystore", emptystore);
-    run("split", split);
-    run("restart", restart);
-    run("j2", j2);
-    run("below", below);
-    run("bwjoin", bwjoin);
-    run("bwkeep", bwkeep);
-    run("bwyoung", bwyoung);
-    run("youngr", youngr);
-    run("bwrr", bwrr);
-    run("reaskr", reaskr);
-    run("adoptbelowr", adoptbelowr);
-    run("x1r", x1r);
-    run("x1l", x1l);
-    run("x8claim", x8claim);
-    run("prunedj", prunedj);
-    run("reaskrelay", reaskrelay);
-    run("joinrx", joinrx);
-    run("keycache", keycache);
-    return finish("v37_xmr_pathb_node_join_kat");
+    return run_sections("v37_xmr_pathb_node_join_kat",
+                        {
+                                {"loadfail", loadfail, 39},
+                                {"young", young, 4},
+                                {"scope", scope, 27},
+                                {"scopepow", scopepow, 27},
+                                {"tokens", tokens, 2},
+                                {"fetchahead", fetchahead, 38},
+                                {"deep", deep, 46},
+                                {"partition", partition, 55},
+                                {"omitownspan", omitownspan, 28},
+                                {"x1", x1, 82},
+                                {"reask", reask, 25},
+                                {"adoptbelow", adoptbelow, 27},
+                                {"e81", e81, 8},
+                                {"caps", caps, 0},
+                                {"disconnect", disconnect, 17},
+                                {"floors", floors, 103},
+                                {"emptystore", emptystore, 3},
+                                {"split", split, 3},
+                                {"restart", restart, 0},
+                                {"j2", j2, 54},
+                                {"below", below, 59},
+                                {"bwjoin", bwjoin, 45},
+                                {"bwkeep", bwkeep, 60},
+                                {"bwyoung", bwyoung, 13},
+                                {"youngr", youngr, 3},
+                                {"bwrr", bwrr, 39},
+                                {"reaskr", reaskr, 24},
+                                {"adoptbelowr", adoptbelowr, 25},
+                                {"x1r", x1r, 41},
+                                {"x1l", x1l, 29},
+                                {"x8claim", x8claim, 31},
+                                {"prunedj", prunedj, 43},
+                                {"reaskrelay", reaskrelay, 28},
+                                {"joinrx", joinrx, 27},
+                                {"keycache", keycache, 17},
+                        },
+                        argc, argv);
 }
