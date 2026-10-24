@@ -15,6 +15,17 @@
 //   - the activation heights are the ones litecoind's chain shows.
 // max_weight is the seam the #1708 block-budget work rebases onto: its budget
 // break sits inside the selection, the HogEx is appended after it.
+//
+// The template's transactions (PR-L3):
+//   - txs with an MWEB part (the real peg-in and peg-out mempool txs) never
+//     reach it: the HogEx is its only flag-0x08 entry (listed with fee 0),
+//     every entry has inputs and outputs and no pegin output, coinbasevalue =
+//     subsidy + listed fees, and it passes core::coin::check_template_txs;
+//     a tx no block can carry that got into the pool anyway is dropped and
+//     counted (template_tx_dropped);
+//   - a non-empty mempool not yet cleaned for the tip (remove_for_block has
+//     not seen the tip's body) refuses the template:
+//     mempool-not-cleaned-for-tip, marked for the ingress HOLD.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -28,11 +39,16 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/template_txs_check.hpp>
 
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/rpc_data.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
+
+#include <btclibs/util/strencodings.h>
+
+#include "ltc_mweb_tx_fixtures.hpp"
 
 namespace {
 
@@ -166,6 +182,24 @@ void feed_tracker(MWEBTracker& tracker, uint32_t height, const BlockHeaderType& 
     ASSERT_TRUE(tracker.update(b, height, raw));
 }
 
+// Run `hdr`'s (empty) block body through the pool's cleanup, as the
+// full-block handler does before the tip's template is built.
+void clean_for(Mempool& pool, const BlockHeaderType& hdr)
+{
+    BlockType b;
+    static_cast<BlockHeaderType&>(b) = hdr;
+    pool.remove_for_block(b);
+}
+
+MutableTransaction parse_tx(const char* hex)
+{
+    auto bytes = ParseHex(hex);
+    PackStream ps(bytes);
+    MutableTransaction tx;
+    ps >> TX_WITH_WITNESS(tx);
+    return tx;
+}
+
 bool rules_have(const nlohmann::json& d, const std::string& rule)
 {
     for (const auto& r : d["rules"])
@@ -209,6 +243,7 @@ TEST(LtcTemplateHogex, HogexSurvivesTruncation)
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, tip_hdr);
     EXPECT_EQ(tracker.mweb_seen_height(), kTipHeight);
+    clean_for(pool, tip_hdr);
 
     // Uncut: all three mempool txs + HogEx.
     auto full = TemplateBuilder::build_template(*chain, pool, false, &tracker);
@@ -333,4 +368,140 @@ TEST(LtcTemplateHogex, StaleMwebStateIsNotUsed)
         auto other_n = mainnet_chain_at(kTipHeight, block_hash_of(synthetic_header(3)));
         EXPECT_FALSE(TemplateBuilder::build_template(*other_n, pool, false, &tracker));
     }
+}
+
+// The real peg-in and peg-out mempool txs never reach a template: only the
+// three ordinary txs and the HogEx ship, and the template is one litecoind
+// can accept structurally.
+TEST(LtcTemplateHogex, MwebCarryingTxsNeverReachTheTemplate)
+{
+    namespace fx = ltc_mweb_tx_fixture;
+    const auto tip_hdr = synthetic_header(1);
+    auto chain = mainnet_chain_at(kTipHeight, block_hash_of(tip_hdr));
+    Mempool pool;
+    const MutableTransaction a = pay(FUND_A, 0, 100000);
+    const MutableTransaction b = pay(FUND_B, 0, 100000);
+    const MutableTransaction c = pay(FUND_C, 0, 100000);
+    for (const auto* t : {&a, &b, &c})
+        ASSERT_TRUE(pool.add_tx(*t));
+    pool.set_tx_fee(compute_txid(a), 1000);
+    pool.set_tx_fee(compute_txid(b), 2000);
+    pool.set_tx_fee(compute_txid(c), 3000);
+
+    const MutableTransaction pegin = parse_tx(fx::kPeginTxHex);
+    const MutableTransaction pegout = parse_tx(fx::kPegoutTxHex);
+    ASSERT_TRUE(pegin.HasMWEBTx());
+    ASSERT_TRUE(pegout.IsMWEBOnly());
+    EXPECT_FALSE(pool.add_tx(pegin));
+    EXPECT_FALSE(pool.add_tx(pegout));
+    pool.set_tx_fee(compute_txid(pegin), 4064);   // no-ops: not in the pool
+    pool.set_tx_fee(compute_txid(pegout), 2262);
+    EXPECT_EQ(pool.size(), 3u);
+
+    MWEBTracker tracker;
+    feed_tracker(tracker, kTipHeight, tip_hdr);
+    clean_for(pool, tip_hdr);
+    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd);
+    const auto& txs = wd->m_data["transactions"];
+    ASSERT_EQ(txs.size(), 4u) << "three ordinary txs + HogEx";
+    int64_t fees = 0;
+    for (size_t i = 0; i < txs.size(); ++i) {
+        const MutableTransaction t = parse_tx(txs[i]["data"].get<std::string>().c_str());
+        EXPECT_FALSE(t.vin.empty()) << i;
+        EXPECT_FALSE(t.vout.empty()) << i;
+        EXPECT_FALSE(t.HasMWEBTx()) << i;
+        EXPECT_EQ(t.m_hogEx, i + 1 == txs.size()) << "the HogEx is the only flag-0x08 entry and last";
+        for (const auto& out : t.vout)
+            EXPECT_FALSE(mweb_wire::pegin_kernel_of(out.scriptPubKey)) << i;
+        EXPECT_NE(txs[i]["txid"].get<std::string>(), compute_txid(pegin).GetHex());
+        EXPECT_NE(txs[i]["txid"].get<std::string>(), compute_txid(pegout).GetHex());
+        if (txs[i].contains("fee") && txs[i]["fee"].is_number_integer())
+            fees += txs[i]["fee"].get<int64_t>();
+    }
+    EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>(), 5000000000LL + fees);
+    EXPECT_EQ(fees, 6000);
+    EXPECT_EQ(pool.reject_stats().template_tx_dropped.load(), 0u);
+    // The HogEx lists fee 0 (litecoind does: an empty MWEB body has no fee),
+    // and the template passes the structural check ingress runs.
+    ASSERT_TRUE(txs.back().contains("fee"));
+    EXPECT_EQ(txs.back()["fee"], 0);
+    EXPECT_FALSE(core::coin::check_template_txs(wd->m_data));
+}
+
+// A tx no block can carry that got into the pool anyway (here: past the
+// admission rules) is dropped from the template and counted.
+TEST(LtcTemplateHogex, TxNoBlockCanCarryIsDroppedAndCounted)
+{
+    namespace fx = ltc_mweb_tx_fixture;
+    const auto tip_hdr = synthetic_header(1);
+    auto chain = mainnet_chain_at(kTipHeight, block_hash_of(tip_hdr));
+    Mempool pool;
+    const MutableTransaction a = pay(FUND_A, 0, 100000);
+    ASSERT_TRUE(pool.add_tx(a));
+    pool.set_tx_fee(compute_txid(a), 1000);
+    const MutableTransaction pegout = parse_tx(fx::kPegoutTxHex);
+    ASSERT_TRUE(pool.add_tx_unchecked(pegout));
+    pool.set_tx_fee(compute_txid(pegout), 2262);  // selectable as far as fees go
+
+    MWEBTracker tracker;
+    feed_tracker(tracker, kTipHeight, tip_hdr);
+    clean_for(pool, tip_hdr);
+    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd);
+    const auto& txs = wd->m_data["transactions"];
+    ASSERT_EQ(txs.size(), 2u) << "the ordinary tx + HogEx";
+    EXPECT_EQ(txs[0]["txid"].get<std::string>(), compute_txid(a).GetHex());
+    EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>(), 5000000000LL + 1000);
+    EXPECT_EQ(pool.reject_stats().template_tx_dropped.load(), 1u);
+}
+
+// The first template on a new tip waits for the mempool cleanup of the tip's
+// body: a non-empty pool not cleaned for the tip refuses the template (HOLD
+// at ingress); once remove_for_block saw the tip it builds. A late copy of an
+// older block cleaned afterwards does not undo it.
+TEST(LtcTemplateHogex, MempoolNotCleanedForTipRefuses)
+{
+    const auto hdr_n = synthetic_header(1);
+    const auto hdr_n1 = synthetic_header(2);
+    auto chain = mainnet_chain_at(kTipHeight, block_hash_of(hdr_n));
+    Mempool pool;
+    const MutableTransaction a = pay(FUND_A, 0, 100000);
+    ASSERT_TRUE(pool.add_tx(a));
+    pool.set_tx_fee(compute_txid(a), 1000);
+    MWEBTracker tracker;
+    feed_tracker(tracker, kTipHeight, hdr_n);
+
+    // Never cleaned.
+    std::optional<ltc::coin::rpc::WorkData> refused;
+    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker,
+                                              TemplateBuilder::MAX_BLOCK_WEIGHT
+                                                  - TemplateBuilder::COINBASE_RESERVE,
+                                              &refused);
+    EXPECT_FALSE(wd) << "the pool may still hold txs the tip confirmed";
+    ASSERT_TRUE(refused);
+    EXPECT_EQ(core::coin::template_refusal_code(refused->m_data),
+              std::optional<std::string>("mempool-not-cleaned-for-tip"));
+    EXPECT_TRUE(core::coin::check_template_shape(refused->m_data)) << "ingress HOLDs it";
+
+    // Cleaned for another block only.
+    clean_for(pool, hdr_n1);
+    EXPECT_EQ(pool.last_block_hash(), block_hash_of(hdr_n1));
+    EXPECT_FALSE(TemplateBuilder::build_template(*chain, pool, false, &tracker));
+
+    // Cleaned for the tip.
+    clean_for(pool, hdr_n);
+    EXPECT_TRUE(pool.cleaned_for(block_hash_of(hdr_n)));
+    wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd);
+    EXPECT_FALSE(core::coin::template_refusal_code(wd->m_data));
+    EXPECT_EQ(wd->m_data["transactions"].size(), 2u);
+
+    // A late copy of another block cleaned after the tip's.
+    clean_for(pool, synthetic_header(3));
+    EXPECT_TRUE(TemplateBuilder::build_template(*chain, pool, false, &tracker));
+
+    // An empty pool needs no cleanup.
+    Mempool empty;
+    EXPECT_TRUE(TemplateBuilder::build_template(*chain, empty, false, &tracker));
 }

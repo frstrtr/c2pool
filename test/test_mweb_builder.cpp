@@ -11,6 +11,7 @@
 #include <impl/ltc/coin/mweb_builder.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -96,7 +97,9 @@ BlockType make_fake_block_with_hogex(const uint256& hogex_txid_unused) {
     return block;
 }
 
-/// Build raw MWEB block bytes from a synthetic header.
+/// Build raw MWEB block bytes from a synthetic header. The body is empty, so
+/// the header's kernel count is 0 (mw::Block::Validate; the tracker refuses a
+/// header that disagrees with its body).
 std::vector<unsigned char> make_test_mweb_raw() {
     MWEBBlock mweb_block;
     mweb_block.header.height = 1000;
@@ -106,7 +109,7 @@ std::vector<unsigned char> make_test_mweb_raw() {
     mweb_block.header.kernel_offset.fill(0x44);
     mweb_block.header.stealth_offset.fill(0x55);
     mweb_block.header.output_mmr_size = 500;
-    mweb_block.header.kernel_mmr_size = 200;
+    mweb_block.header.kernel_mmr_size = 0;
 
     PackStream ps;
     ps << mweb_block;
@@ -435,6 +438,10 @@ TEST(MWEBBuilder, BuildEmptyMwebBlockNonEmpty) {
     EXPECT_GT(raw.size(), 50u);
 }
 
+// make_test_state()'s block had kernels (kernel_mmr_size 200, a kernel root
+// and a stealth offset). The next block's body is empty, so its header is
+// built as libmw's CoinsViewCache::BuildNextBlock builds it: the cumulative
+// fields carry over, the per-block fields are zero.
 TEST(MWEBBuilder, BuildEmptyMwebBlockRoundTrip) {
     auto state = make_test_state();
     uint32_t next_height = 1001;
@@ -447,12 +454,19 @@ TEST(MWEBBuilder, BuildEmptyMwebBlockRoundTrip) {
 
     // Height should be updated
     EXPECT_EQ(block.header.height, static_cast<int64_t>(next_height));
-    // Roots should carry forward from state
+    // Cumulative chain state carries forward from state
     EXPECT_EQ(block.header.output_root, state.prev_header.output_root);
-    EXPECT_EQ(block.header.kernel_root, state.prev_header.kernel_root);
     EXPECT_EQ(block.header.leafset_root, state.prev_header.leafset_root);
     EXPECT_EQ(block.header.output_mmr_size, state.prev_header.output_mmr_size);
-    EXPECT_EQ(block.header.kernel_mmr_size, state.prev_header.kernel_mmr_size);
+    EXPECT_EQ(block.header.kernel_offset, state.prev_header.kernel_offset);
+    // Per-block fields describe the (empty) body
+    EXPECT_TRUE(block.header.kernel_root.IsNull());
+    EXPECT_EQ(block.header.kernel_mmr_size, 0u);
+    EXPECT_EQ(block.header.stealth_offset, (std::array<uint8_t, 32>{}));
+
+    // The HogAddr commits to that same header.
+    EXPECT_EQ(MWEBBuilder::compute_mweb_hash(state, next_height),
+              blake3_hash_serialized(block.header));
 }
 
 TEST(MWEBBuilder, BuildEmptyMwebBlockHeightUpdated) {

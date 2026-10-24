@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ios>
 #include <string>
 #include <utility>
 #include <memory>
@@ -62,6 +63,15 @@ private:
                     // in a catch that logs and drops the message.
                     throw;
                 }
+            }
+            // A message type that declares strict framing must be consumed
+            // exactly: bytes left over mean the parser and the sender disagree
+            // on the format, so the parsed value cannot be trusted. Opt-in:
+            // several messages legitimately carry fields c2pool does not read
+            // (e.g. the version message's relay flag).
+            if constexpr (requires { MsgT::k_strict_framing; }) {
+                if (rmsg->m_data.cursor_size() != 0)
+                    throw std::ios_base::failure("trailing bytes in " + rmsg->m_command);
             }
             return res;
         };

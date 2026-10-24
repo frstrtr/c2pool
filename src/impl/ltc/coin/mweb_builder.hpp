@@ -120,14 +120,18 @@ struct MWEBHeader {
     }
 };
 
-// ─── MWEB TxBody (empty) ───────────────────────────────────────────────────
+// ─── MWEB TxBody ───────────────────────────────────────────────────────────
 
-/// Empty MWEB transaction body — 3 zero-varint vectors.
+/// MWEB transaction body (libmw TxBody: vec<Input> vec<Output> vec<Kernel>,
+/// CompactSize lengths). Embedded mode only produces empty bodies, so
+/// Serialize writes three empty vectors; Unserialize walks a real body item
+/// by item (mweb_tx_wire.hpp) and keeps its summary.
 struct MWEBTxBody {
-    // For carry-forward with no MWEB activity, all vectors are empty.
+    mweb_wire::MwebBodySummary summary;
+
     template <typename Stream>
     void Serialize(Stream& s) const {
-        // inputs: varint(0), outputs: varint(0), kernels: varint(0)
+        // inputs, outputs, kernels: CompactSize(0) each
         uint8_t zero = 0;
         ::Serialize(s, zero);
         ::Serialize(s, zero);
@@ -136,12 +140,7 @@ struct MWEBTxBody {
 
     template <typename Stream>
     void Unserialize(Stream& s) {
-        // Skip varint-encoded vector lengths
-        uint64_t n_inputs, n_outputs, n_kernels;
-        ::Unserialize(s, VARINT(n_inputs));
-        ::Unserialize(s, VARINT(n_outputs));
-        ::Unserialize(s, VARINT(n_kernels));
-        // We don't parse individual items — embedded mode only produces empty bodies
+        summary = mweb_wire::read_mw_body(s);
     }
 };
 
@@ -198,7 +197,8 @@ struct MWEBState {
     uint32_t prev_hogex_vout{0};  // always 0 (first output)
     int64_t  hogaddr_value{0};    // carry-forward value in satoshis
 
-    // MWEB header fields to carry forward (roots don't change without MWEB activity)
+    // The previous block's MWEB header. The next empty-body header takes its
+    // cumulative fields and zeroes the per-block ones (next_empty_header).
     MWEBHeader prev_header;
 
     // The raw serialized MWEB block from the previous block (for reference)
@@ -223,6 +223,17 @@ public:
             LOG_DEBUG_COIND << "[MWEB] Block has " << block.m_txs.size()
                            << " txs, need >=2 for HogEx";
             return false;
+        }
+
+        // A block's transactions never carry MWEB data: litecoind strips it
+        // from a peg-in and keeps MWEB-only txs out of vtx; a block with it
+        // is mutated (mweb_node.cpp CheckBlock: unexpected-mweb-data).
+        for (size_t i = 0; i < block.m_txs.size(); ++i) {
+            if (block.m_txs[i].HasMWEBTx()) {
+                LOG_WARNING << "[MWEB] Block at height " << block_height
+                            << " refused: unexpected-mweb-data (tx " << i << ")";
+                return false;
+            }
         }
 
         // Last transaction should be HogEx
@@ -269,6 +280,9 @@ public:
     /// Extract MWEB header from raw MWEB block bytes.
     /// These bytes come after the transaction list in the full block serialization,
     /// prefixed by the OptionalPtr 0x01 byte.
+    /// The bytes must be exactly one mw::Block (header + body walked to the
+    /// end), and the header's kernel count must be the body's
+    /// (mw::Block::Validate); otherwise the block is not trusted for state.
     static bool extract_mweb_header_from_raw(const std::vector<unsigned char>& mweb_raw,
                                               MWEBState& state) {
         if (mweb_raw.empty()) {
@@ -281,12 +295,26 @@ public:
             // The raw bytes ARE the mw::Block (Header + TxBody), no OptionalPtr wrapper
             MWEBBlock mweb_block;
             ps >> mweb_block;
+            if (ps.cursor_size() != 0) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: " << ps.cursor_size()
+                            << " bytes after the mw::Block (" << mweb_raw.size() << " B)";
+                return false;
+            }
+            if (mweb_block.header.kernel_mmr_size != mweb_block.body.summary.kernels.size()) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: header kernel count "
+                            << mweb_block.header.kernel_mmr_size << " != body kernels "
+                            << mweb_block.body.summary.kernels.size();
+                return false;
+            }
             state.prev_header = mweb_block.header;
             state.prev_mweb_raw = mweb_raw;
 
             LOG_INFO << "[MWEB] Parsed header: height=" << mweb_block.header.height
                      << " output_mmr=" << mweb_block.header.output_mmr_size
-                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size;
+                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size
+                     << " body=" << mweb_block.body.summary.n_inputs << "/"
+                     << mweb_block.body.summary.n_outputs << "/"
+                     << mweb_block.body.summary.kernels.size();
             return true;
         } catch (const std::exception& e) {
             LOG_WARNING << "[MWEB] Failed to parse MWEB block: " << e.what();
@@ -294,20 +322,41 @@ public:
         }
     }
 
-    /// Build an empty MWEB block for the given height.
-    /// Carries forward all roots/sizes from the previous block.
+    /// The MWEB header of the next block when its body is empty, built the way
+    /// libmw builds it (CoinsViewCache::BuildNextBlock):
+    ///   - cumulative chain state carries over from `prev`: output_root and
+    ///     output_mmr_size (the output PMMR), leafset_root (the unspent-output
+    ///     leafset) and kernel_offset (the running total of kernel offsets) --
+    ///     an empty block adds no output, spends none and adds a zero offset;
+    ///   - per-block fields are zero: kernel_root and kernel_mmr_size (a fresh
+    ///     kernel MMR over this block's kernels; with no leaves its root is the
+    ///     null hash) and stealth_offset (this block's own offset).
+    /// Copying the per-block fields from a block that had kernels is rejected
+    /// by litecoind (bad-blk-mweb: mw::Block::Validate checks the kernel count,
+    /// the stealth sum and the kernel root against the body).
+    static MWEBHeader next_empty_header(const MWEBHeader& prev, uint32_t next_height)
+    {
+        MWEBHeader hdr;
+        hdr.height = static_cast<int64_t>(next_height);
+        hdr.output_root = prev.output_root;
+        hdr.leafset_root = prev.leafset_root;
+        hdr.output_mmr_size = prev.output_mmr_size;
+        hdr.kernel_offset = prev.kernel_offset;
+        hdr.kernel_root.SetNull();
+        hdr.kernel_mmr_size = 0;
+        hdr.stealth_offset.fill(0);
+        return hdr;
+    }
+
+    /// Build an empty MWEB block for the given height: next_empty_header() and
+    /// an empty body (no inputs/outputs/kernels).
     /// Returns the serialized mw::Block bytes (WITHOUT OptionalPtr wrapper).
     static std::vector<unsigned char> build_empty_mweb_block(
         const MWEBState& state,
         uint32_t next_height)
     {
         MWEBBlock block;
-        // Carry forward header roots and sizes
-        block.header = state.prev_header;
-        // Update height to next block
-        block.header.height = static_cast<int64_t>(next_height);
-        // Offsets stay zero for empty MWEB activity
-        // Body is empty (no inputs/outputs/kernels)
+        block.header = next_empty_header(state.prev_header, next_height);
 
         PackStream ps;
         ps << block;
@@ -317,11 +366,10 @@ public:
             reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
     }
 
-    /// Compute the blake3 hash of an MWEB block's header.
+    /// Compute the blake3 hash of the next (empty-body) block's MWEB header.
     /// This hash goes into the HogAddr output script.
     static uint256 compute_mweb_hash(const MWEBState& state, uint32_t next_height) {
-        MWEBHeader hdr = state.prev_header;
-        hdr.height = static_cast<int64_t>(next_height);
+        MWEBHeader hdr = next_empty_header(state.prev_header, next_height);
         // Debug: dump serialized header for hash verification
         PackStream dbg_ps;
         dbg_ps << hdr;

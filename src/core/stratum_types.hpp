@@ -191,6 +191,7 @@ struct JobSnapshot {
     std::shared_ptr<const std::vector<std::string>> tx_data;   // raw tx hex from GBT (a1: shared/lazy)
     std::string mweb;                    // empty for non-MWEB coins
     bool        mweb_active{false};      // template rules named MWEB (frozen with mweb)
+    bool        degraded{false};         // built on a template ingress refused: never submit a block
     bool        segwit_active{false};
     uint256     prev_share_hash;  // share chain tip when this job was built
     uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
@@ -210,6 +211,7 @@ struct WorkSnapshot {
     bool segwit_active{false};
     std::string mweb;             // empty for non-MWEB coins
     bool mweb_active{false};      // template rules named MWEB (frozen with mweb)
+    bool degraded{false};         // template ingress refused (served degraded)
     uint64_t subsidy{0};
     std::string witness_commitment_hex;
     uint256 witness_root;
