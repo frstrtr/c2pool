@@ -1530,7 +1530,7 @@ void x1l() {
 // (x <= x1 + N_rt): ClaimLeaf (alarm + DEFER: no token, nothing indexed, no BAN) in the session and after a restart.
 // S1.3 #6 (per operator ruling): a header whose h is below the fork's record H only, the fork at x <= x1 (its record
 // a claim): ClaimLeaf, no STRIKE, in the session and after a restart; the fork in (x1, x1 + N_rt - 1]: STRIKE; at a
-// full node: STRIKE.
+// full node: STRIKE. The edges: a fork at x1 (ClaimLeaf) and at x1 + 1 (STRIKE), served by A's full store.
 void x8claim() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -1646,6 +1646,23 @@ void x8claim() {
                   && al7[1] == 0,
           "x8claim (#6): a fork in (x1, x1 + N_rt - 1]: STRIKE, no alarm (kind " + std::to_string(static_cast<int>(o7[0].kind))
                   + " in the session, " + std::to_string(static_cast<int>(o7[1].kind)) + " after the restart)");
+    // the edges of x <= x1: forks at x1 and x1 + 1, one header of A's chain above each, served by A's full store
+    (void)h.hello(j, full);
+    (void)h.hello(r, full);
+    for (const std::uint64_t fe : {x1, x1 + 1}) {
+        for (const std::size_t to : {j, r}) {
+            const std::vector<std::uint8_t> te =
+                    early != nullptr ? tampered_at(to, full, fe, a.store.best_tip(), low_h) : std::vector<std::uint8_t>{};
+            const std::size_t a0 = h[to].alarms().count();
+            const pb::PathbNode::HeadersOutcome oe = te.empty() ? pb::PathbNode::HeadersOutcome{} : h[to].on_headers(full, te, h.now);
+            const std::size_t ae = h[to].alarms().count() - a0;
+            const bool claim = fe <= x1;
+            check(!te.empty() && oe.indexed == 0 && (claim ? (oe.kind == K::Defer && ae == 1) : (oe.kind == K::Strike && ae == 0)),
+                  std::string("x8claim (#6): the fork at x1") + (claim ? ": ClaimLeaf, no STRIKE" : " + 1: STRIKE, no alarm") +
+                          (to == j ? " (the session; kind " : " (after the restart; kind ") +
+                          std::to_string(static_cast<int>(oe.kind)) + ")");
+        }
+    }
     std::printf("  x8claim: %.1f s\n", secs_since(t0));
 }
 
