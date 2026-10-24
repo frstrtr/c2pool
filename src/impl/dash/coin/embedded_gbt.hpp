@@ -1100,6 +1100,7 @@ inline DashWorkData build_embedded_workdata(
                 pp.payee = "!" + hex_script;
             }
             pp.amount = static_cast<uint64_t>(sp.amount);
+            w.m_superblock_payments.push_back(pp);
             w.m_packed_payments.push_back(std::move(pp));
             superblock_total += sp.amount;
         }

@@ -816,6 +816,20 @@ TEST(DashSuperblockHistorical, Mainnet2525632CoinbaseBytesMatchOnChain) {
                   static_cast<uint64_t>(kSb2525632[i].duffs))
             << "appended superblock output " << i << " amount/order diverges";
     }
+
+    // 6) OBSERVABILITY MIRROR: m_superblock_payments is exactly the appended
+    //    tail of m_packed_payments (same payee, amount, order) and nothing else
+    //    -- the masternode payee / platform burn ahead of it are not reported
+    //    as treasury outputs. /embedded_template reads this field.
+    EXPECT_TRUE(base.m_superblock_payments.empty())
+        << "an ordinary block must report no superblock outputs";
+    ASSERT_EQ(sb.m_superblock_payments.size(), kSb2525632.size());
+    for (size_t i = 0; i < kSb2525632.size(); ++i) {
+        EXPECT_EQ(sb.m_superblock_payments[i].payee,
+                  sb.m_packed_payments[off + i].payee) << "mirror payee " << i;
+        EXPECT_EQ(sb.m_superblock_payments[i].amount,
+                  sb.m_packed_payments[off + i].amount) << "mirror amount " << i;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
