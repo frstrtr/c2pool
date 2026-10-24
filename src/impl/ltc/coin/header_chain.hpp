@@ -426,6 +426,25 @@ public:
         return true;
     }
 
+    /// Would `header` pass add_header's checks: it connects to a known
+    /// header, its PoW meets its bits, and its bits are the expected
+    /// difficulty? Nothing is stored. Screens announced headers (compact
+    /// blocks) before acting on them; the scrypt runs outside the lock.
+    bool check_header(const BlockHeaderType& header) const {
+        uint32_t new_height = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto prev_it = m_headers.find(header.m_previous_block);
+            if (prev_it == m_headers.end())
+                return false;
+            new_height = prev_it->second.height + 1;
+        }
+        if (!check_pow(pow_hash(header, m_params.pow_func), header.m_bits, m_params.pow_limit))
+            return false;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return validate_difficulty(header, new_height);
+    }
+
     /// Set the estimated network tip height (from peer's version message).
     /// Used to skip scrypt PoW validation for old headers during initial sync.
     /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
@@ -707,7 +726,7 @@ private:
     }
 
     /// Validate that the header's nBits matches the expected difficulty.
-    bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
+    bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) const {
         int64_t interval = m_params.difficulty_adjustment_interval();
         if (new_height < 2) return true; // genesis + first block
 
