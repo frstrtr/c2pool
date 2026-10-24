@@ -1529,26 +1529,53 @@ public:
     }
 
     // ---- headers first (E11; the header path) ----
-    // A request FC_GETHEADERS(from, stop, max) to `peer` (one in flight per
-    // peer; its continuations go to the same peer). `from` is held: the fork.
+    // The owner of a header request: the catch-up of the peer, or a tip-header want; a context re-ask and a
+    // continuation page keep the owner of the request they continue. Only the owner acts on its outcome.
+    enum class HeaderOwner : std::uint8_t { None, CatchUp, Tip };
+    // A request FC_GETHEADERS(from, stop, max) to `peer`. One is in flight per peer, from its send until a frame of
+    // its reply arrives or the link drops; one without a frame within P-53 is retired and still in flight (no new
+    // request to the peer until its reply arrives, which then DROPs). Its continuations go to the same peer. `from`
+    // is held: the fork.
     bool request_headers(std::uint64_t peer, const Hash32& from, const Hash32& stop, std::uint16_t max,
-                         std::uint64_t now_s) {
+                         std::uint64_t now_s, HeaderOwner owner = HeaderOwner::CatchUp) {
         if (poisoned_ || header_req_.count(peer) != 0 || tree_->find(from) == nullptr) return false;
         HeaderRequest r;
         r.fork = from;
         r.from = from;
         r.stop = stop;
         r.max = max;
+        r.owner = owner;
+        r.sent_s = now_s;
         header_req_[peer] = std::move(r);
         timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
         send(peer, encode_fc_getheaders(GetHeaders{cfg_.identity.chain_id, from, stop, max}));
         return true;
     }
+    // A frame answering this node's FC_GETHEADERS to `peer` arrived (the caller pairs by link order; its handling may
+    // wait behind the node lock): the request is answered, its P-53 clock stops. A retired request stays retired.
+    void headers_arrived(std::uint64_t peer) {
+        const auto it = header_req_.find(peer);
+        if (it == header_req_.end() || it->second.retired || it->second.arrived) return;
+        it->second.arrived = true;
+        timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
+    }
+    // The header request in flight to `peer` (open or retired), if any.
+    struct HeaderSlot {
+        HeaderOwner owner = HeaderOwner::None;
+        Hash32 from{};  // the request's fork
+        Hash32 stop{};
+        bool retired = false;
+    };
+    std::optional<HeaderSlot> header_slot(std::uint64_t peer) const {
+        const auto it = header_req_.find(peer);
+        if (it == header_req_.end()) return std::nullopt;
+        return HeaderSlot{it->second.owner, it->second.fork, it->second.stop, it->second.retired};
+    }
 
     struct HeadersOutcome {
         enum class Kind : std::uint8_t {
-            Unsolicited,  // no request in flight: DROP
-            OverBuffer,   // above the FC_HEADERS frame buffer: DROP (no token; the request stays open)
+            Unsolicited,  // no request in flight, or a frame that does not start at the open request's from: DROP
+            OverBuffer,   // above the FC_HEADERS frame buffer: DROP (no token; the request ends: one frame, one request)
             Undecodable,  // the frame does not decode: refuse + 1 strike (the request ends)
             NodeInternal, // the store poisoned: nothing judged
             Ban,          // a header failed its cheap rows or its PoW at d, or a P_r served bad: BAN the server
@@ -1558,7 +1585,10 @@ public:
             JoinerPath,   // heavier, its fork below the journal base: the joiner path, no body fetched
             Defer,        // a P_r not resolved yet
             Strike,       // a header failed S1.3 #6, #7 or #8: refuse + 1 strike (the request ends)
+            Retired,      // the reply to a request retired at P-53: DROP (no verdict, no token, nothing indexed)
         } kind = Kind::Unsolicited;
+        // the request this frame answered: its owner, fork and stop (None: no request consumed)
+        HeaderOwner owner = HeaderOwner::None;
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
         std::vector<Hash32> ids;
@@ -1580,25 +1610,49 @@ public:
         }
         const auto it = header_req_.find(peer);
         if (it == header_req_.end()) return out;
+        // the next FC_HEADERS of a peer answers the request in flight to it (one frame, one request)
+        if (it->second.retired) {  // its reply, whatever it holds: DROP, nothing judged; the slot frees
+            out.kind = HeadersOutcome::Kind::Retired;
+            out.owner = it->second.owner;
+            out.from = it->second.fork;
+            out.stop = it->second.stop;
+            out.why = "FC_HEADERS reply to a retired request (from " + hex32(it->second.from).substr(0, 16) +
+                      ", no frame within P-53)";
+            header_req_.erase(it);
+            return out;
+        }
         if (frame.size() > frame_bytes_headers()) {
             out.kind = HeadersOutcome::Kind::OverBuffer;
+            out.owner = it->second.owner;
+            out.from = it->second.fork;
+            out.stop = it->second.stop;
+            if (it->second.owner == HeaderOwner::CatchUp) end_first_round();
+            header_req_.erase(it);
+            timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
             return out;
         }
         HeadersReply rep;
         const bool decoded = decode_fc_headers(frame, cfg_.identity.chain_id, frame_bytes_headers(), cfg_.p, rep).ok();
-        // a reply whose first header's parent is not the open request's `from` is a reply to another request of this
-        // peer: DROP (no verdict, no token); the open request and its P-53 clock stay
+        // a reply whose first header's parent is not the open request's `from` answers no request of this node: DROP
+        // (no verdict, no token); the open request and its P-53 clock stay
         if (decoded && !rep.headers.empty() && rep.headers.front().own.side.tip != it->second.from) {
             out.kind = HeadersOutcome::Kind::Unsolicited;
             out.why = "FC_HEADERS reply to another request (first header's parent " +
                       hex32(rep.headers.front().own.side.tip).substr(0, 16) + ", open request from " +
                       hex32(it->second.from).substr(0, 16) + ")";
+            if (it->second.arrived) {  // the frame counted as its reply's arrival did not answer it: the clock again
+                it->second.arrived = false;
+                timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, it->second.sent_s);
+            }
             return out;
         }
         HeaderRequest req = std::move(it->second);
         header_req_.erase(it);
         timers_.done(Req{peer, ReqKind::Headers, Hash32{}});
-        end_first_round();  // a reply ends the first catch-up round (whatever it holds)
+        out.owner = req.owner;
+        out.from = req.fork;
+        out.stop = req.stop;
+        if (req.owner == HeaderOwner::CatchUp) end_first_round();  // the catch-up's reply ends its first round
         if (!decoded) {
             out.kind = HeadersOutcome::Kind::Undecodable;
             headers_->release_peer(peer);
@@ -1715,11 +1769,26 @@ public:
                 const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
                 const bool checked = ann[i].parent == prev && k == i + 1;  // pow_ok ran on this header
                 const bool monotone = ann[i].parent == prev && k == i;     // h below the record H
-                // S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major == hf(h); timestamp >=
-                // median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin == d_at(chain, pos(tip) + 1):
-                // "STRIKE"; #11 RandomX meets d: "BAN"
-                out.kind = monotone || (checked && (pow_row == 7 || pow_row == 8)) ? HeadersOutcome::Kind::Strike
-                                                                                   : HeadersOutcome::Kind::Ban;
+                if (monotone) {
+                    // #6 below the fork's record H alone (no header of the reply raised the record above h) where that
+                    // record is a claim (a fork node at x <= x1 of a joined store): alarm + DEFER, no token, nothing
+                    // indexed (per operator ruling); every other #6 failure STRIKE
+                    std::uint64_t own = 0;
+                    for (std::size_t j = 0; j < i; ++j) own = std::max(own, ann[j].h);
+                    const Basis hb = basis_of(claims_, RowClass::ForkRecord, req.fork, fork->pos + 1);
+                    if (ann[i].h >= own && is_claim_basis(hb)) {
+                        alarm_.raise(RowId::R7, hb, sh.id, Missing::ClaimAlarm);
+                        out.kind = HeadersOutcome::Kind::Defer;
+                        return out;
+                    }
+                }
+                // a link broken inside the reply (a header's parent not the id of the header before it): STRIKE (per
+                // operator ruling); S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major ==
+                // hf(h); timestamp >= median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin ==
+                // d_at(chain, pos(tip) + 1): "STRIKE"; #11 RandomX meets d: "BAN"
+                const bool link = ann[i].parent != prev;
+                out.kind = link || monotone || (checked && (pow_row == 7 || pow_row == 8)) ? HeadersOutcome::Kind::Strike
+                                                                                           : HeadersOutcome::Kind::Ban;
                 const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) + " != " +
                                                                           hex32(prev).substr(0, 16) + ")"
                                           : checked           ? pow_why
@@ -1791,6 +1860,8 @@ public:
         if (!rep.headers.empty() && out.ids.back() != req.stop && req.got.size() < req.max) {
             out.kind = HeadersOutcome::Kind::Continue;
             req.from = out.ids.back();
+            req.sent_s = now_s;
+            req.arrived = false;
             const GetHeaders q{cfg_.identity.chain_id, req.from, req.stop, req.max};
             header_req_[peer] = std::move(req);
             timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
@@ -1899,14 +1970,20 @@ public:
 
     // ---- timers ----
     // The requests with no next frame within P-53: non-service (no alarm, no
-    // token, no exclusion); a bucket request's server is abandoned for that at.
+    // token, no exclusion); a bucket request's server is abandoned for that at;
+    // a header request is retired (still in flight until its reply arrives or
+    // the link drops; the peer gets no new header request meanwhile).
     std::size_t tick(std::uint64_t now_s) {
         std::size_t n = 0;
         for (const Req& r : timers_.expired(now_s)) {
             ++n;
             if (r.kind == ReqKind::Headers) {
-                header_req_.erase(r.peer);
-                end_first_round();  // no reply within P-53 ends the first round
+                const auto it = header_req_.find(r.peer);
+                if (it == header_req_.end() || it->second.retired) continue;
+                it->second.retired = true;
+                it->second.got.clear();
+                it->second.heights.clear();
+                if (it->second.owner == HeaderOwner::CatchUp) end_first_round();  // its P-53 ends the first round
                 continue;
             }
             const auto key = std::make_pair(r.peer, r.at);
@@ -1961,6 +2038,10 @@ private:
         Hash32 from{};  // this page's from
         Hash32 stop{};
         std::uint16_t max = 0;
+        HeaderOwner owner = HeaderOwner::CatchUp;
+        std::uint64_t sent_s = 0;  // this page's send
+        bool arrived = false;      // a frame of its reply arrived: its P-53 clock stopped
+        bool retired = false;      // no frame within P-53: its reply DROPs when it arrives
         std::vector<CarrierHeader> got;      // the branch's headers so far, oldest first
         std::vector<std::uint64_t> heights;  // h(y) of each
     };
@@ -2524,6 +2605,8 @@ private:
             switch (k) {
                 case RowClass::Retarget:  // a window that reads the claimed prefix or span
                     return x <= x1_ + n_->cfg_.p.retarget_span ? Basis::ClaimLeaf : Basis::Computed;
+                case RowClass::ForkRecord:  // a fork node at x <= x1 (per operator ruling)
+                    return x <= x1_ + 1 ? Basis::ClaimLeaf : Basis::Computed;
                 case RowClass::Coinbase:
                     if (x <= x1_) return Basis::NotComputed;
                     return n_->window_reads_claimed_now(tip) ? Basis::ClaimLeaf : Basis::Computed;
@@ -2620,7 +2703,12 @@ private:
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
         repend_watch_.clear();  // the re-pended receipts left with the pending set
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
-        header_req_.clear();
+        for (auto& [p, r] : header_req_) {  // still in flight: retired (their replies DROP; no new request before them)
+            r.retired = true;
+            r.got.clear();
+            r.heights.clear();
+            timers_.done(Req{p, ReqKind::Headers, Hash32{}});
+        }
         assemblies_.clear();
         abandoned_.clear();
         closed_.clear();
@@ -3198,10 +3286,16 @@ private:
         const CarrierNode& b = tree_->best();
         return tree_->find(verified_win_->id) == nullptr && fork_choice_prefers(*verified_win_, ChainTip{b.cum_work, b.id});
     }
-    // The template gate's timers (P-53): an open first round with no request in flight, and verified headers whose fetch
-    // placed nothing within P-53, end.
+    // An open catch-up request (not retired) to any peer.
+    bool catchup_request_open() const {
+        for (const auto& [p, r] : header_req_)
+            if (r.owner == HeaderOwner::CatchUp && !r.retired) return true;
+        return false;
+    }
+    // The template gate's timers (P-53): an open first round with no catch-up request in flight, and verified headers
+    // whose fetch placed nothing within P-53, end.
     void catchup_gate_tick(std::uint64_t now_s) {
-        if (first_round_open_ && header_req_.empty()) {
+        if (first_round_open_ && !catchup_request_open()) {
             if (first_round_s_ == 0) first_round_s_ = now_s;
             if (now_s >= first_round_s_ + cfg_.abandon_timeout_s) end_first_round();
         } else {

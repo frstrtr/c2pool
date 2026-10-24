@@ -41,7 +41,8 @@ enum class RowClass : std::uint8_t {
     OriginBin,  // S2.3 #7: the H records of the placing chain
     Dedup,      // S2.3 #8: the placements of the placing chain
     Live,       // S2.3 #17 on the placing chain
-    Walk        // S2.3 #3: the values a walk takes on a path it cannot bind
+    Walk,       // S2.3 #3: the values a walk takes on a path it cannot bind
+    ForkRecord  // S1.3 #6 on the header path: the record H of the fork node (tip = the fork, x = its position + 1)
 };
 
 struct ClaimView {

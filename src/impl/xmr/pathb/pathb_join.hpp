@@ -352,6 +352,8 @@ class JoinedState;
 //              of the span carriers at x <= x1, bound by the first computed #9)
 //     Retarget ClaimSpan for x <= x1 + N_rt (a d_at window holding the
 //              retarget prefix or a span carrier at x <= x1)
+//     ForkRecord ClaimSpan for x <= x1 + 1 (the record H of a fork node at
+//              x <= x1)
 //     Coinbase NotComputed for tips below x1; ClaimSpan at x1 and where the
 //              window reads a leaf adopted at an at header (c_x0; c_L before L)
 //     Roots    NotComputed for tips below x1; else ClaimSpan (c_x0's peaks)
@@ -362,8 +364,10 @@ class JoinedState;
 //              where the window at the tip reads a bin open at f (H(t) <
 //              H(f) + F + Fresh) or a bin sealed at the tip that no carrier of
 //              the branch serves (placements below x0 are claims, none held)
-//   after L: Coinbase ClaimLeaf where the window reads an adopted leaf, Roots
-//     ClaimLeaf (the mmr_root commits the adopted leaves), Computed otherwise.
+//   after L: Retarget ClaimLeaf for x <= x1 + N_rt, ForkRecord ClaimLeaf for
+//     x <= x1 + 1, Coinbase ClaimLeaf where the window reads an adopted leaf,
+//     Roots ClaimLeaf (the mmr_root commits the adopted leaves), Computed
+//     otherwise.
 //   The young chain: Computed everywhere.
 //   judge_copy: during the replay the attempt's server only; after L every
 //   peer. leaf_servable: no adopted leaf, nothing before the first computed
@@ -632,6 +636,9 @@ inline Basis JoinClaims::base_basis(RowClass k, const Hash32& tip, std::uint64_t
             if (replay && s.x0 > 1 && x <= s.x0 - 1) return Basis::NotComputed;
             // a window that reads the claimed prefix or span: a claim (after L, a mismatch is ClaimLeaf, never a BAN)
             if (x <= x1 + s.inputs().p.retarget_span) return replay ? Basis::ClaimSpan : Basis::ClaimLeaf;
+            return Basis::Computed;
+        case RowClass::ForkRecord:  // a fork node at x <= x1: its record H rests on the span (per operator ruling)
+            if (x <= x1 + 1) return replay ? Basis::ClaimSpan : Basis::ClaimLeaf;
             return Basis::Computed;
         case RowClass::Coinbase:
             if (x <= x1) return Basis::NotComputed;  // a tip below x1 (D35)
