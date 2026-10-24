@@ -838,7 +838,7 @@ TEST(DashUtxoLane, ColdStartBootstrapWindowPlan)
 
     std::vector<uint32_t> requested;
     lane.set_request_block_fn(
-        [&requested](uint32_t h) { requested.push_back(h); });
+        [&requested](uint32_t h) { requested.push_back(h); return true; });
 
     const uint32_t tip = 500;
     auto cbt = make_coinbase({100'000}, /*salt=*/7);
@@ -865,6 +865,120 @@ TEST(DashUtxoLane, ColdStartBootstrapWindowPlan)
     lane.on_block_connected(make_block({cb214}, /*salt=*/9), start + 2);
     EXPECT_EQ(lane.cache()->blocks_connected(), 1u)
         << "height-order drain must stall on the missing block";
+}
+
+// Fresh-node first-work regression (#1963 step 2). The bootstrap fires on the
+// first bridge block, BEFORE the pre-anchor header backfill installs, so all
+// 16 window requests die on the header-by-height lookup. Pre-fix the seam was
+// fire-and-forget and the only re-request ran inside on_block_connected, one
+// height per stall, so the dead window came back one live block at a time
+// (~55 min on mainnet). The dead sends must be re-asked as soon as the
+// headers exist, with no live block in between.
+TEST(DashUtxoLane, BootstrapReissuesDeadSendsWithoutLiveBlock)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    auto t = UtxoLane::Clock::time_point{} + std::chrono::hours(1);
+    lane.set_clock_fn([&t] { return t; });
+
+    bool headers_held = false;
+    std::vector<uint32_t> sent;
+    lane.set_request_block_fn([&](uint32_t h) {
+        if (!headers_held) return false;   // header not installed yet
+        sent.push_back(h);
+        return true;
+    });
+
+    const uint32_t tip = 500;
+    const uint32_t start = tip - DASH_MIN_BLOCKS_TO_KEEP;   // 212
+    lane.on_block_connected(make_block({make_coinbase({100'000}, 20)}, 20), tip);
+    ASSERT_TRUE(sent.empty());
+    EXPECT_EQ(lane.dead_sends(), 16u)
+        << "every window request died on the missing header";
+
+    // The backfill installs 5 s later; one watchdog pass, no block event and
+    // well inside STALL_TIMEOUT_SEC.
+    headers_held = true;
+    t += std::chrono::seconds(5);
+    lane.service_bootstrap();
+    ASSERT_EQ(sent.size(), 16u) << "the whole dead window must be re-sent";
+    for (uint32_t i = 0; i < 16; ++i)
+        EXPECT_EQ(sent[i], start + i);
+    EXPECT_EQ(lane.dead_sends(), 0u);
+
+    // The bodies answer; the window drains in height order.
+    for (uint32_t i = 0; i < 16; ++i)
+        lane.on_block_connected(
+            make_block({make_coinbase({50'000}, 100 + i)}, 100 + i), start + i);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 16u);
+}
+
+// A stall must re-ask every outstanding unbuffered height in the window, not
+// only next_height: each lost getdata is otherwise recovered one stall (and,
+// pre-fix, one live block) at a time.
+TEST(DashUtxoLane, BootstrapStallReasksWholeOutstandingWindow)
+{
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+
+    auto t = UtxoLane::Clock::time_point{} + std::chrono::hours(1);
+    lane.set_clock_fn([&t] { return t; });
+
+    std::vector<uint32_t> sent;
+    lane.set_request_block_fn([&](uint32_t h) { sent.push_back(h); return true; });
+
+    const uint32_t tip = 500;
+    const uint32_t start = tip - DASH_MIN_BLOCKS_TO_KEEP;   // 212
+    lane.on_block_connected(make_block({make_coinbase({100'000}, 30)}, 30), tip);
+    ASSERT_EQ(sent.size(), 16u);
+
+    // Only start+2 answers; the other 15 getdatas were lost on the wire.
+    lane.on_block_connected(make_block({make_coinbase({50'000}, 31)}, 31), start + 2);
+    EXPECT_EQ(lane.cache()->blocks_connected(), 0u);
+
+    sent.clear();
+    t += std::chrono::seconds(UtxoLane::BootstrapState::STALL_TIMEOUT_SEC + 1);
+    lane.service_bootstrap();
+
+    std::vector<uint32_t> want;
+    for (uint32_t h = start; h < start + 16; ++h)
+        if (h != start + 2) want.push_back(h);
+    EXPECT_EQ(sent, want) << "every unbuffered outstanding height is re-asked";
+}
+
+// The DASH arm never armed the bootstrap stall timer (LTC/DOGE do,
+// main_ltc.cpp:2444/6031). Armed before the bootstrap, it must start ticking
+// when the bootstrap triggers and recover the dead window on its own.
+TEST(DashUtxoLane, BootstrapStallTimerRecoversWithoutLiveBlock)
+{
+    boost::asio::io_context ioc;
+    UtxoLane lane;
+    ASSERT_TRUE(lane.open(""));
+    Mempool mp;
+    lane.attach(mp);
+    lane.arm_stall_timer(ioc, std::chrono::milliseconds(5));
+
+    bool headers_held = false;
+    std::vector<uint32_t> sent;
+    lane.set_request_block_fn([&](uint32_t h) {
+        if (!headers_held) return false;
+        sent.push_back(h);
+        return true;
+    });
+
+    lane.on_block_connected(make_block({make_coinbase({100'000}, 40)}, 40), 500);
+    ASSERT_EQ(lane.dead_sends(), 16u);
+
+    headers_held = true;
+    for (int i = 0; i < 100 && sent.size() < 16; ++i)
+        ioc.run_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(sent.size(), 16u) << "the timer tick alone must re-send the window";
+    EXPECT_EQ(lane.dead_sends(), 0u);
 }
 
 // The 106-deep coinbase-maturity mining gate (100 + 6, utxo_adapter.hpp).

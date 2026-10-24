@@ -600,6 +600,50 @@ TEST(DashStratumWorkSource, MiningSubmitRejectsLowDifficulty)
     EXPECT_FALSE(rig.fx.submit_called);
 }
 
+// The DASH registry stamps when a session's accepted counter last moved, so the
+// dashboard's share age and stalled state are exact.
+TEST(DashStratumWorkSource, UpdateStratumWorkerStampsLastAccepted)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo w;
+    w.username = "XfixtureMinerAddress";
+    rig.ws->register_stratum_worker("s", w);
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 0, 1, 0);
+    EXPECT_EQ(rig.ws->get_stratum_workers().at("s").last_accepted_at,
+              std::chrono::steady_clock::time_point{});
+    const auto before = std::chrono::steady_clock::now();
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 3, 1, 0);
+    EXPECT_GE(rig.ws->get_stratum_workers().at("s").last_accepted_at, before);
+}
+
+// The per-session counters belong to the stratum session (update_stratum_worker
+// by session id). mining_submit must not credit another session of the same
+// address: a rig's idle failover connection would then read as hashing.
+TEST(DashStratumWorkSource, MiningSubmitLeavesSessionCountersToTheSession)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo idle;
+    idle.username = "XfixtureMinerAddress";
+    idle.worker_name = "rig1";
+    rig.ws->register_stratum_worker("a-failover", idle);   // sorts first
+    core::stratum::WorkerInfo live = idle;
+    rig.ws->register_stratum_worker("b-hashing", live);
+
+    // A low-difficulty reject, then a share accept, from the same address.
+    rig.job.share_bits  = 0x1c00ffffu;
+    rig.job.block_nbits = "1c00ffff";
+    const uint256 hard_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    auto r1 = rig.submit(rig.find_nonce([&](const uint256& pow) { return pow > hard_target; }));
+    ASSERT_TRUE(r1.is_array());
+
+    const auto w = rig.ws->get_stratum_workers();
+    EXPECT_EQ(w.at("a-failover").accepted, 0u);
+    EXPECT_EQ(w.at("a-failover").rejected, 0u)
+        << "the failover session was credited a sibling's submit";
+    EXPECT_EQ(w.at("b-hashing").rejected, 0u)
+        << "mining_submit writes no registry counters";
+}
+
 TEST(DashStratumWorkSource, MiningSubmitWonBlockAssemblesAndBroadcasts)
 {
     SubmitRig rig;

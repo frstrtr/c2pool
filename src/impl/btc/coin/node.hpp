@@ -218,7 +218,8 @@ public:
     /// submit_block_with_fallback (P2P-primary, RPC only on relay-fail), the
     /// connect path fires the submitblock RPC UNCONDITIONALLY because a P2P
     /// cmpctblock announce-success does NOT guarantee the daemon connects the
-    /// block (it requests the body via getblocktxn, which we do not serve).
+    /// block (it asks for missing txs via getblocktxn, answered only for the
+    /// last cmpctblock sent on that connection).
     /// submitblock is connect-authoritative; P2P relay still fires for fast
     /// propagation. BTC-fenced - does not change the cross-coin fallback
     /// contract. Returns true iff the block reached at least one sink.

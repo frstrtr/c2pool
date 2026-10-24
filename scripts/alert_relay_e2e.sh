@@ -30,7 +30,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PARITY_SECS="${PARITY_SECS:-120}"
 NETID=a1e27a1e27a1e27a
 PREFIX=a1e27a1e27a1e27b
-SUB="dash_testnet_${NETID}"
+SUB="dash_testnet_${NETID}_v36"   # custom network-id state dir (v36 profile suffix)
 # --coin-p2p-connect to a dead loopback port: an explicitly named coin transport
 # keeps the daemonless node from discovering public Dash testnet peers, so the
 # rig stays entirely on 127.0.0.1.
