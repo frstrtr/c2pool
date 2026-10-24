@@ -2584,6 +2584,10 @@ int main(int argc, char* argv[]) {
                                         ltc_bs->stop_stall_timer();
                                         LOG_INFO << "[EMB-LTC] Bootstrap complete: "
                                                  << ltc_bs->processed << " blocks";
+                                        // The drain fed MWEB state up to the tip: end
+                                        // a degraded start / HOLD now (immediate, see
+                                        // the normal-path update below).
+                                        web_server.trigger_work_refresh();
                                     }
                                     return;
                                 }
@@ -2642,6 +2646,14 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "[EMB-LTC] MWEB state updated from " << peer
                                          << " h=" << height
                                          << " mweb=" << block.m_mweb_raw.size() << "B";
+                                // MWEB state for the tip is what an MWEB HOLD (or a
+                                // degraded start) waits for: rebuild the template now.
+                                // Immediate, like the new-block path: the debounced
+                                // refresh coalesces calls within 300 ms and gates its
+                                // trailing edge on a sharechain change, so a call
+                                // right after the tip-change refresh would be dropped.
+                                // Main ioc; the tracker mutex is already released.
+                                web_server.trigger_work_refresh();
                             }
 
                             auto pit = pending_merged_resolve->find(block_hash);
@@ -6915,6 +6927,18 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[EMB-LTC] Synced: headers=" << embedded_chain->height()
                          << " utxo_blocks=" << (ltc_utxo_cache ? ltc_utxo_cache->blocks_connected() : 0)
                          << " — starting Stratum";
+                // Warm start: with the UTXO already at the tip no bootstrap block
+                // is fetched, and MWEB state is not persisted. Ask for the tip's
+                // full block once so the degraded start ends without waiting for
+                // the next LTC block.
+                if (mweb_tracker && !mweb_tracker->has_state() && embedded_broadcaster) {
+                    if (auto tip = embedded_chain->tip()) {
+                        LOG_INFO << "[EMB-LTC] No MWEB state yet — requesting the tip's full block "
+                                 << tip->block_hash.GetHex().substr(0, 16)
+                                 << " (h=" << tip->height << ")";
+                        embedded_broadcaster->request_full_block(tip->block_hash);
+                    }
+                }
             }
 
             // ── Explorer API callbacks ────────────────────────────────────────

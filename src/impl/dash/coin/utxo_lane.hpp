@@ -57,13 +57,18 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace dash {
 namespace coin {
@@ -73,7 +78,14 @@ public:
     /// Bootstrap window-refill / stall re-request seam. E1/E2a wires this to
     /// the coin P2P transport's request-full-block-by-height path (the analog
     /// of the LTC broadcaster->request_full_block(header_by_height(h).hash)).
-    using RequestBlockFn = std::function<void(uint32_t height)>;
+    ///
+    /// Returns the truth of the wire, the MnCheckpointLane #138 contract:
+    /// FALSE when the request died locally (the header for h is not held
+    /// yet, or no peer route exists), so the lane keeps the height on its
+    /// dead-send list and re-asks it, instead of treating it as in flight.
+    using RequestBlockFn = std::function<bool(uint32_t height)>;
+    using Clock = std::chrono::steady_clock;
+    using BootstrapState = ::core::coin::BlockBootstrapState<BlockType>;
 
     UtxoLane() = default;
     UtxoLane(const UtxoLane&) = delete;
@@ -130,6 +142,57 @@ public:
     }
 
     void set_request_block_fn(RequestBlockFn fn) { m_request_fn = std::move(fn); }
+
+    /// Test seam: the bootstrap stall clock. Defaults to steady_clock.
+    void set_clock_fn(std::function<Clock::time_point()> fn) { m_now_fn = std::move(fn); }
+
+    /// Arm the bootstrap watchdog timer (the main_ltc.cpp:2444 /
+    /// main_ltc.cpp:6031 start_stall_timer analog the DASH arm never had).
+    /// The timer runs only while a bootstrap is active: it starts when the
+    /// bootstrap triggers and stops when it completes. Each tick runs
+    /// service_bootstrap(), so recovery no longer waits for the next live
+    /// block. Must be the io_context thread that delivers block_connected.
+    void arm_stall_timer(boost::asio::io_context& ioc,
+                         std::chrono::milliseconds interval =
+                             std::chrono::seconds(BootstrapState::STALL_CHECK_SEC))
+    {
+        m_stall_timer = std::make_unique<boost::asio::steady_timer>(ioc);
+        m_stall_interval = interval;
+        schedule_stall_tick();
+    }
+
+    /// Bootstrap watchdog, run from every block_connected event and every
+    /// stall-timer tick:
+    ///   1. re-ask every DEAD SEND (a request the seam reported as not put
+    ///      on the wire). On a fresh node the bootstrap fires on the first
+    ///      bridge block, before the pre-anchor header backfill installs, so
+    ///      the whole first window dies on the missing header lookup.
+    ///   2. on a STALL_TIMEOUT_SEC stall, re-ask the WHOLE outstanding window
+    ///      (every unbuffered height in [next_height, next_request)), not
+    ///      only next_height. Re-asking one height per stall recovered a
+    ///      16-block dead window one live block at a time (~55 min).
+    void service_bootstrap()
+    {
+        if (!m_bs.active) return;
+
+        retry_dead_sends();
+
+        const auto now = now_();
+        const auto stall = std::chrono::duration_cast<std::chrono::seconds>(
+            now - m_bs.last_drain_time).count();
+        if (stall >= m_bs.STALL_TIMEOUT_SEC) {
+            int reasked = 0;
+            for (uint32_t h = m_bs.next_height; h < m_bs.next_request; ++h)
+                if (!m_bs.buffer.count(h) && request_block(h)) ++reasked;
+            LOG_WARNING << "[EMB-DASH] Bootstrap stall h=" << m_bs.next_height
+                        << " (" << stall << "s) — re-requested " << reasked
+                        << " outstanding window block(s)";
+            m_bs.last_drain_time = now;
+        }
+    }
+
+    /// Heights whose request died locally and are waiting to be re-asked.
+    size_t dead_sends() const { return m_dead_sends.size(); }
 
     /// Coinbase-maturity mining gate (main_ltc.cpp ~1785-1801): embedded
     /// templates must not INCLUDE MEMPOOL TXS until the UTXO view is at least
@@ -221,22 +284,23 @@ public:
                 m_bs.next_request = start_from;
                 m_bs.total        = height - start_from + 1;
                 m_bs.buffer[height] = {block, block_hash};
-                m_bs.last_drain_time = std::chrono::steady_clock::now();
+                m_bs.last_drain_time = now_();
 
                 int requested = 0;
                 while (m_bs.next_request <= m_bs.end_height &&
                        (m_bs.next_request - m_bs.next_height)
                            < m_bs.WINDOW_SIZE) {
-                    if (!m_bs.buffer.count(m_bs.next_request)) {
-                        request_block(m_bs.next_request);
+                    if (!m_bs.buffer.count(m_bs.next_request)
+                        && request_block(m_bs.next_request))
                         ++requested;
-                    }
                     ++m_bs.next_request;
                 }
                 LOG_INFO << "[EMB-DASH] Bootstrap pipeline: " << m_bs.total
                          << " blocks [" << start_from << ".." << height << "]"
                          << " window=" << m_bs.WINDOW_SIZE
-                         << " requests=" << requested;
+                         << " requests=" << requested
+                         << " dead=" << m_dead_sends.size();
+                schedule_stall_tick();
                 return;
             }
             LOG_INFO << "[EMB-DASH] UTXO warm restart: best=" << utxo_best
@@ -257,17 +321,8 @@ public:
                                         std::make_pair(block, block_hash));
             }
 
-            // Stall detection: re-request the missing block if stuck.
-            const auto now = std::chrono::steady_clock::now();
-            const auto stall = std::chrono::duration_cast<std::chrono::seconds>(
-                now - m_bs.last_drain_time).count();
-            if (stall >= m_bs.STALL_TIMEOUT_SEC) {
-                LOG_WARNING << "[EMB-DASH] Bootstrap stall h="
-                            << m_bs.next_height << " (" << stall
-                            << "s) — re-request fallback";
-                request_block(m_bs.next_height);
-                m_bs.last_drain_time = now;
-            }
+            // Dead-send retry + stall re-request (also run by the timer).
+            service_bootstrap();
 
             // Drain consecutive blocks in height order.
             bool drained_any = false;
@@ -278,7 +333,7 @@ public:
                 drained_any = true;
                 ++m_bs.next_height;
                 ++m_bs.processed;
-                m_bs.last_drain_time = std::chrono::steady_clock::now();
+                m_bs.last_drain_time = now_();
             }
 
             static int bs_log = 0;
@@ -298,7 +353,8 @@ public:
 
             if (m_bs.next_height > m_bs.end_height) {
                 m_bs.active = false;
-                m_bs.stop_stall_timer();
+                m_dead_sends.clear();
+                if (m_stall_timer) m_stall_timer->cancel();
                 LOG_INFO << "[EMB-DASH] Bootstrap complete: "
                          << m_bs.processed << " blocks";
             }
@@ -353,9 +409,16 @@ private:
             m_pool->recompute_unknown_fees(m_cache.get());
     }
 
-    void request_block(uint32_t height)
+    /// Returns whether the request reached the wire. A dead send is kept on
+    /// m_dead_sends for retry_dead_sends(); a live one clears it.
+    bool request_block(uint32_t height)
     {
-        if (m_request_fn) { m_request_fn(height); return; }
+        if (m_request_fn) {
+            const bool sent = m_request_fn(height);
+            if (sent) m_dead_sends.erase(height);
+            else      m_dead_sends.insert(height);
+            return sent;
+        }
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -364,14 +427,54 @@ private:
                            " (set_request_block_fn — the E1/E2a live-feed leg);"
                            " relying on inbound delivery only";
         }
+        return false;
     }
+
+    /// Re-ask every dead send still inside the outstanding window; drop the
+    /// ones already drained or buffered.
+    void retry_dead_sends()
+    {
+        if (m_dead_sends.empty()) return;
+        const std::vector<uint32_t> pending(m_dead_sends.begin(),
+                                            m_dead_sends.end());
+        int recovered = 0;
+        for (uint32_t h : pending) {
+            if (h < m_bs.next_height || m_bs.buffer.count(h)) {
+                m_dead_sends.erase(h);
+                continue;
+            }
+            if (request_block(h)) ++recovered;
+        }
+        if (recovered > 0)
+            LOG_INFO << "[EMB-DASH] Bootstrap: re-sent " << recovered
+                     << " request(s) that had died locally, "
+                     << m_dead_sends.size() << " still dead";
+    }
+
+    void schedule_stall_tick()
+    {
+        if (!m_stall_timer || !m_bs.active) return;
+        m_stall_timer->expires_after(m_stall_interval);
+        m_stall_timer->async_wait([this](const boost::system::error_code& ec) {
+            if (ec || !m_bs.active) return;
+            service_bootstrap();
+            schedule_stall_tick();
+        });
+    }
+
+    Clock::time_point now_() const { return m_now_fn ? m_now_fn() : Clock::now(); }
 
     std::unique_ptr<UtxoViewDB>    m_db;
     std::unique_ptr<UtxoViewCache> m_cache;
     Mempool*                       m_pool{nullptr};
     RequestBlockFn                 m_request_fn;
-    ::core::coin::BlockBootstrapState<BlockType> m_bs;
+    BootstrapState                 m_bs;
     bool                           m_bootstrap_done{false};
+    std::set<uint32_t>             m_dead_sends;
+    std::function<Clock::time_point()> m_now_fn;
+    std::unique_ptr<boost::asio::steady_timer> m_stall_timer;
+    std::chrono::milliseconds      m_stall_interval{
+        std::chrono::seconds(BootstrapState::STALL_CHECK_SEC)};
 };
 
 } // namespace coin

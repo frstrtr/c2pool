@@ -5041,6 +5041,36 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             LOG_WARNING << "[alert-relay] --alert-relay-origin without --stratum: no workers can"
                            " ever be observed on this node";
         alert_relay->publish_status(core::timestamp());
+        // RETURNED rule: newest sharechain share per payout address minted on
+        // ANOTHER node (received from a peer), so a rig that moved there
+        // (failback) is not paged here. Read on the alert tick (IO thread)
+        // through the tracker's try-lock, cached 30 s; a cache older than 120 s
+        // reads as "unknown" and the detector waits (bounded) instead of
+        // guessing.
+        if (alert_relay->config().origin) {
+            struct AddrActivity { int64_t built_at{0}; bool valid{false}; std::map<std::string, int64_t> newest; };
+            auto act = std::make_shared<AddrActivity>();
+            std::weak_ptr<dash::Node> wnode = p2p_node_holder;
+            alert_relay->set_address_activity(
+                [act, wnode](const std::string& addr) -> std::optional<int64_t> {
+                    const int64_t now = static_cast<int64_t>(core::timestamp());
+                    if (!act->valid || now - act->built_at >= 30) {
+                        if (auto node = wnode.lock()) {
+                            auto guard = node->read_tracker();
+                            if (guard) {
+                                act->newest = dash::dashboard::newest_share_time_by_address(
+                                    *guard, dash::SharechainConfig::is_testnet, now - 3600, 400,
+                                    /*peer_received_only=*/true);
+                                act->built_at = now;
+                                act->valid = true;
+                            }
+                        }
+                    }
+                    if (!act->valid || now - act->built_at > 120) return std::nullopt;
+                    auto it = act->newest.find(addr);
+                    return it == act->newest.end() ? int64_t{0} : it->second;
+                });
+        }
         alert_relay_timer = std::make_unique<core::Timer>(&ioc, true);
         // run_tick() catches anything the sampling or the tick throws (logged,
         // counted in the status "tick.errors"): core::Timer does not re-arm
@@ -7663,9 +7693,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (embedded_utxo && utxo_lane.live()) {
             utxo_lane.set_request_block_fn(
                 [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    // Report the truth of the wire (#138 contract): on a fresh
+                    // node the bootstrap fires on the first bridge block,
+                    // before the pre-anchor header backfill installs, so the
+                    // header lookup misses. A false return keeps h on the
+                    // lane's dead-send list, and it is re-asked once the
+                    // header exists instead of being dropped silently.
                     auto e = hc->get_header_by_height(h);
-                    if (e) cp->request_block(e->hash);
+                    if (!e) return false;
+                    return cp->request_block(e->hash);
                 });
+            // The bootstrap watchdog the DASH arm never armed (LTC/DOGE:
+            // main_ltc.cpp start_stall_timer). It ticks only while a bootstrap
+            // is active, so dead sends and lost bodies recover without waiting
+            // for the next live block.
+            utxo_lane.arm_stall_timer(ioc);
         }
 
         // Peer's reported chain height -> header-chain sync-progress gauge.

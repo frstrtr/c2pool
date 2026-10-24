@@ -78,7 +78,55 @@ if (BUILD_TESTING AND GTest_FOUND)
     # other_tx_hashes in GBT order -- by driving the REAL LTC production path
     # (generate_share_transaction, compute_ref_hash_for_work, the share
     # Formatter); no coinbase re-implementation in the test. Same folding rule.
-    add_executable(share_test share_test.cpp f11_donation_invariance_test.cpp emergency_decay_overflow_test.cpp wirecompat_runtime_test.cpp desired_version_tally_test.cpp auto_ratchet_sim_test.cpp auto_ratchet_tail_guard_test.cpp auto_ratchet_blocked_by_test.cpp chain_walk_window_test.cpp doge_template_underfill_test.cpp broadcast_tx_completeness_test.cpp broadcast_lock_discipline_test.cpp compact_block_merkle_test.cpp share_remove_owns_data_test.cpp share_message_unpack_bounds_test.cpp restart_reorg_supersede_test.cpp peer_block_pow_carry_test.cpp head_retention_test.cpp share_fetch_failover_test.cpp desired_request_pacer_test.cpp build_stops_test.cpp pool_rate_head_select_test.cpp template_topology_spend_test.cpp ingest_bounds_test.cpp ingest_ownership_test.cpp ingest_convergence_test.cpp chain_topology_endpoints_kat_test.cpp per_peer_ingest_test.cpp invalid_pow_score_test.cpp legacy_addrme_self_probe_test.cpp self_connection_ban_test.cpp version_switch_floor_test.cpp found_block_peer_txid_test.cpp ltc_gentx_golden_kat_test.cpp)
+    #
+    # template_hogex_survives_truncation_test.cpp: the LTC MWEB template shape.
+    # Drives the REAL TemplateBuilder: a max_weight-truncated selection still
+    # ends with the HogEx and carries mweb, an MWEB-active builder without MWEB
+    # state returns nullopt (never a "segwit"-only template), and pins the
+    # mainnet/testnet activation heights. Same folding rule.
+    #
+    # compact_block_mweb_relay_test.cpp: relay_mode_for (a HogEx block always
+    # goes out as a full block: a v2 cmpctblock cannot carry mweb) and the
+    # sendcmpct highest-version fold. Same folding rule.
+    # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
+    add_executable(share_test
+        auto_ratchet_blocked_by_test.cpp
+        auto_ratchet_sim_test.cpp
+        auto_ratchet_tail_guard_test.cpp
+        broadcast_lock_discipline_test.cpp
+        broadcast_tx_completeness_test.cpp
+        build_stops_test.cpp
+        chain_topology_endpoints_kat_test.cpp
+        chain_walk_window_test.cpp
+        compact_block_merkle_test.cpp
+        compact_block_mweb_relay_test.cpp
+        desired_request_pacer_test.cpp
+        desired_version_tally_test.cpp
+        doge_template_underfill_test.cpp
+        emergency_decay_overflow_test.cpp
+        f11_donation_invariance_test.cpp
+        found_block_peer_txid_test.cpp
+        head_retention_test.cpp
+        ingest_bounds_test.cpp
+        ingest_convergence_test.cpp
+        ingest_ownership_test.cpp
+        invalid_pow_score_test.cpp
+        legacy_addrme_self_probe_test.cpp
+        ltc_gentx_golden_kat_test.cpp
+        peer_block_pow_carry_test.cpp
+        per_peer_ingest_test.cpp
+        pool_rate_head_select_test.cpp
+        restart_reorg_supersede_test.cpp
+        self_connection_ban_test.cpp
+        share_fetch_failover_test.cpp
+        share_message_unpack_bounds_test.cpp
+        share_remove_owns_data_test.cpp
+        share_test.cpp
+        template_hogex_survives_truncation_test.cpp
+        template_topology_spend_test.cpp
+        version_switch_floor_test.cpp
+        wirecompat_runtime_test.cpp
+    )
     target_link_libraries(share_test PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

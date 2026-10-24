@@ -67,7 +67,8 @@ private:
     std::string m_chain_label = "CoinP2P";
     // BIP 152 compact block state
     bool m_peer_supports_cmpct{false};
-    uint64_t m_peer_cmpct_version{0};
+    uint64_t m_peer_cmpct_version{0};      // last sendcmpct version received
+    uint64_t m_peer_cmpct_version_max{0};  // highest this connection (MWEB peers)
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
@@ -140,6 +141,8 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
+        // The highest-version fold is per connection.
+        m_peer_cmpct_version_max = 0;
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
         // Require version/verack progress soon after connect.
@@ -362,18 +365,29 @@ public:
     void enable_mempool_request() { m_request_mempool_on_connect = true; }
 
     /// Relay a pre-serialized block via P2P.
-    /// Uses compact block format (BIP 152 v2) for peers that support it,
-    /// falling back to full block otherwise.
+    /// Uses compact block format (BIP 152 v2) for v2 peers when the block has
+    /// no HogEx (see relay_mode_for), falling back to full block otherwise.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return;
 
-        if (m_peer_supports_cmpct && m_peer_cmpct_version >= 2) {
-            // Deserialize the block to build a compact representation
+        const uint64_t cmpct_version = relay_cmpct_version(
+            m_peer_services, m_peer_cmpct_version, m_peer_cmpct_version_max);
+        if (m_peer_supports_cmpct && cmpct_version == 2) {
+            // Deserialize the block to pick the relay mode and, for a compact
+            // relay, build the compact representation.
             try {
                 PackStream ps(block_bytes);
                 BlockType block;
                 ps >> block;
+                if (relay_mode_for(cmpct_version, block) == RelayMode::Full) {
+                    // A v2 compact block cannot carry the MWEB extension data;
+                    // the full block bytes already include "01" + mweb.
+                    LOG_INFO << "[" << m_chain_label << "] HogEx block: sending full block ("
+                             << block_bytes.size() << " bytes) instead of a v2 compact block";
+                    submit_block_full(block_bytes);
+                    return;
+                }
                 auto cb = BuildCompactBlock(
                     static_cast<BlockHeaderType&>(block), block.m_txs);
                 auto rmsg = message_cmpctblock::make_raw(cb);
@@ -397,9 +411,9 @@ public:
                             << "), sending full block: " << e.what();
             }
         } else {
-            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer does not support compact blocks"
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] No v2 compact relay to this peer"
                      << " (cmpct=" << m_peer_supports_cmpct
-                     << " ver=" << m_peer_cmpct_version
+                     << " ver=" << cmpct_version
                      << "), sending full block (" << block_bytes.size() << " bytes)";
         }
 
@@ -803,6 +817,7 @@ private:
         // BIP 152: Compact block negotiation — record peer capability
         m_peer_supports_cmpct = true;
         m_peer_cmpct_version = msg->m_version;
+        m_peer_cmpct_version_max = fold_cmpct_version(m_peer_cmpct_version_max, msg->m_version);
         m_peer_wants_cmpct_announce = msg->m_announce;
         LOG_INFO << "[" << m_chain_label << "] Peer supports compact blocks v"
                  << msg->m_version << " (announce=" << msg->m_announce << ")";

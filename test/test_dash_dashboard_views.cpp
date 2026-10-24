@@ -30,10 +30,12 @@
 #include <impl/dash/share_check.hpp>
 
 #include <core/address_utils.hpp>
+#include <core/netaddress.hpp>
 #include <core/uint256.hpp>
 
 #include <nlohmann/json.hpp>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -362,4 +364,58 @@ TEST(DashDashboardViews, FeeSharesAreMarkedByHash160)
     EXPECT_TRUE(w["shares"][0].contains("fee"));    // share 3
     EXPECT_FALSE(w["shares"][1].contains("fee"));   // share 2
     EXPECT_EQ(w["fee_hash160"].get<std::string>(), ctx.fee_hash160);
+}
+
+// ── Newest share per payout address (alert relay RETURNED rule) ─────────────
+// Cross-checked against the grid's own per-share address ("m") and time ("t").
+TEST(DashDashboardViews, NewestShareTimePerAddressMatchesTheWindow)
+{
+    ChainHarness h(50);
+    auto& tracker = h.node.tracker();
+    const auto w = dash::dashboard::build_window(tracker, h.ctx());
+    std::map<std::string, int64_t> expect;
+    for (const auto& c : w["shares"]) {
+        const std::string m = c["m"].get<std::string>();
+        const int64_t t = c["t"].get<int64_t>();
+        if (!expect.count(m) || t > expect[m]) expect[m] = t;
+    }
+    ASSERT_EQ(expect.size(), 2u);
+
+    auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    EXPECT_EQ(all, expect);
+
+    // Bounded walk: the tip alone names only the tip's miner.
+    auto tip_only = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 1);
+    ASSERT_EQ(tip_only.size(), 1u);
+    EXPECT_EQ(tip_only.begin()->second, static_cast<int64_t>(V_BASE_TIME + 49));
+
+    // Time filter: nothing at or after a time newer than every share.
+    EXPECT_TRUE(dash::dashboard::newest_share_time_by_address(
+        tracker, false, V_BASE_TIME + 1000, 4320).empty());
+    // ... and a filter inside the window keeps each address's newest share.
+    EXPECT_EQ(dash::dashboard::newest_share_time_by_address(tracker, false, V_BASE_TIME + 40, 4320),
+              expect);
+}
+
+// Only shares received from a pool peer count as "minted on another node": a
+// share minted here (or loaded from the local store) has no peer port.
+TEST(DashDashboardViews, NewestShareTimeCanCountPeerReceivedSharesOnly)
+{
+    dash::NodeImpl node;
+    uint256 prev = uint256::ZERO;
+    for (unsigned int i = 0; i < 20; ++i) {
+        auto* sh = make_view_share(i, prev, static_cast<unsigned char>(0xa0 + (i % 2)));
+        if (i % 2 == 0 && i < 10) sh->peer_addr = NetService("10.0.0.2", 8996);   // pkh 0xa0, from a peer
+        node.tracker().chain.add(sh);
+        prev = sh->m_hash;
+    }
+    auto& tracker = node.tracker();
+    auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    ASSERT_EQ(all.size(), 2u);
+    auto peers = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320,
+                                                               /*peer_received_only=*/true);
+    ASSERT_EQ(peers.size(), 1u) << "the 0xa1 miner's shares were all minted here";
+    EXPECT_EQ(peers.begin()->second, static_cast<int64_t>(V_BASE_TIME + 8))
+        << "newest PEER-received share, not the newest share of that address (n=18)";
+    EXPECT_EQ(all.at(peers.begin()->first), static_cast<int64_t>(V_BASE_TIME + 18));
 }

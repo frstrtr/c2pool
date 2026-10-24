@@ -40,6 +40,11 @@
 //      still served, and pipelined lines whose total exceeds the cap are all
 //      answered (only the bytes since the last '\n' count).
 //
+//   6. MWEB FIELDS — WorkSnapshot -> JobEntry -> JobSnapshot carries mweb and
+//      mweb_active into mining_submit. Block assembly keys the MWEB shape
+//      check on mweb_active; if the copy were lost, an empty-mweb block on an
+//      MWEB chain would pass assembly.
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -87,6 +92,11 @@ class FakeWorkSource : public core::stratum::IWorkSource {
 public:
     core::stratum::StratumConfig cfg;
     std::atomic<uint64_t> generation{1};
+    // MWEB fields put into every WorkSnapshot (defaults: a non-MWEB coin).
+    std::string snap_mweb;
+    bool        snap_mweb_active{false};
+    // The JobSnapshot the last mining_submit received (io thread only).
+    std::optional<core::stratum::JobSnapshot> last_job;
 
     FakeWorkSource()
     {
@@ -129,6 +139,8 @@ public:
         r.coinb2 = "0000000000f2052a010000001976a914000000000000000000000000000000"
                    "000000000088ac00000000";
         r.snapshot.tx_data = tx_data_;
+        r.snapshot.mweb = snap_mweb;
+        r.snapshot.mweb_active = snap_mweb_active;
         return r;
     }
 
@@ -137,8 +149,9 @@ public:
                                  const std::string&, const std::string&,
                                  const std::string&,
                                  const std::map<uint32_t, std::vector<unsigned char>>&,
-                                 const core::stratum::JobSnapshot*) override
+                                 const core::stratum::JobSnapshot* job) override
     {
+        if (job) last_job = *job;
         json r;
         r["result"] = true;
         r["error"]  = nullptr;
@@ -681,4 +694,34 @@ TEST(StratumInterimHardening, LineCapPipelinedLinesOverCapInTotalAllServed)
             << resp->dump();
     }
     EXPECT_EQ(h.on_io([&] { return h.server->get_oversized_line_drops(); }), 0u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 6 — MWEB fields survive the job freeze: the JobSnapshot handed to
+// mining_submit carries the mweb data and mweb_active of the WorkSnapshot the
+// job was built from (stratum_server.cpp JobEntry fill + submit snapshot).
+// ════════════════════════════════════════════════════════════════════════════
+TEST(StratumInterimHardening, JobSnapshotCarriesMwebFields)
+{
+    struct Case { std::string mweb; bool active; };
+    for (const Case& cs : {Case{"", true}, Case{"abab", true}, Case{"", false}}) {
+        ServerHarness h;
+        h.ws->snap_mweb = cs.mweb;
+        h.ws->snap_mweb_active = cs.active;
+        ASSERT_TRUE(h.start());
+
+        Client c;
+        ASSERT_TRUE(c.connect(h.port));
+        ASSERT_TRUE(c.subscribe());
+        ASSERT_TRUE(c.authorize("mwebsnapshotworker"));
+        ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+
+        auto resp = c.submit("mwebsnapshotworker", c.jobs.back(), 40);
+        ASSERT_TRUE(resp.has_value());
+
+        const auto seen = h.on_io([&] { return h.ws->last_job; });
+        ASSERT_TRUE(seen.has_value()) << "mining_submit never saw the job";
+        EXPECT_EQ(seen->mweb_active, cs.active) << "mweb_active lost in the job freeze";
+        EXPECT_EQ(seen->mweb, cs.mweb);
+    }
 }

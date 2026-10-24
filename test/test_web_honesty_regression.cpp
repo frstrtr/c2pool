@@ -1933,3 +1933,39 @@ TEST(WebHonestyRegression, V36CrossingSummaryLatchesWhenNodeProducesV36) {
     EXPECT_TRUE(r["v36_active"].get<bool>())
         << "/global_stats v36_active must follow the live latch to V36";
 }
+
+// ===========================================================================
+// Stratum session states on the Active-Miners table. All nodes are peers: a
+// rig may hold a failover connection to this node while it hashes on another.
+// Such a STANDBY connection must not read as a fault (no warning line, no
+// hashrate estimated from its authorize-time difficulty); only a STALLED
+// session (shared here, then stopped) is named as a warning.
+// ===========================================================================
+TEST(DashboardSessionStates, StandbyIsMutedAndOnlyStalledWarns) {
+    const auto html = read_dashboard();
+    // The table renders the per-worker state the API reports.
+    EXPECT_NE(html.find("var state = workerData.state || null;"), std::string::npos)
+        << "the miners table ignores /stratum_stats workers[].state";
+    // A standby connection never gets a hashrate estimated from difficulty.
+    EXPECT_NE(html.find("var noLiveRate = workerData.state === 'stalled' || workerData.state === 'standby';"),
+              std::string::npos);
+    EXPECT_NE(html.find("var estimatedHashrate = noLiveRate ? 0 : estimateHashrate(difficulty);"),
+              std::string::npos)
+        << "a connection that never submitted (or stopped) shows an invented hashrate";
+    // Header chips from /local_stats stratum_sessions.{hashing,standby,stalled}.
+    EXPECT_NE(html.find("id=\"miners_state_chips\""), std::string::npos);
+    EXPECT_NE(html.find("_ss.standby"), std::string::npos);
+    EXPECT_NE(html.find("_ss.stalled"), std::string::npos);
+    // The warning line names stalled workers only, never standby ones.
+    EXPECT_NE(html.find("return sw.state === 'stalled';"), std::string::npos)
+        << "the warning line still lists standby (failover) sessions as silent";
+    // Standby rows are collapsed behind one muted summary row.
+    EXPECT_NE(html.find("standby-summary"), std::string::npos);
+    EXPECT_NE(html.find("tr.row-standby td"), std::string::npos);
+    EXPECT_NE(html.find("tr.row-stalled"), std::string::npos);
+    // The column shows the last accepted share, not the stats poll time.
+    EXPECT_NE(html.find(">Last Share</th>"), std::string::npos);
+    EXPECT_EQ(html.find(">Last Seen</th>"), std::string::npos)
+        << "'Last Seen' was the stats poll time, which is always 'now' for a "
+           "connected session; it hid a stalled rig";
+}
