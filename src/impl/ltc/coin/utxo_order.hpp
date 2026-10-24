@@ -20,8 +20,10 @@
 #include <core/coin/block_bootstrapper.hpp>
 #include <core/uint256.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <string>
 #include <utility>
 
 namespace ltc {
@@ -76,23 +78,111 @@ void ordered_buffer(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t height
     bs.buffer.try_emplace(height, std::make_pair(block, hash));
 }
 
-/// Drain consecutive buffered blocks from next_height, calling
-/// connect(block, hash, height) for each, in order. Returns how many.
-template <typename BlockT, typename ConnectFn>
-uint32_t ordered_drain(core::coin::BlockBootstrapState<BlockT>& bs, ConnectFn&& connect)
+/// Why a block may (not) be connected to the UTXO set now.
+enum class ConnectCheck {
+    Ok,
+    NotNext,         // not utxo_best + 1: connecting it would leave a gap
+    NotBestChain,    // not the best chain's block at its height
+    ParentMismatch,  // its parent is not the UTXO set's best block
+};
+
+inline const char* connect_check_name(ConnectCheck c)
 {
-    uint32_t n = 0;
+    switch (c) {
+    case ConnectCheck::Ok:             return "ok";
+    case ConnectCheck::NotNext:        return "not-next-height";
+    case ConnectCheck::NotBestChain:   return "not-best-chain";
+    case ConnectCheck::ParentMismatch: return "parent-is-not-utxo-best";
+    }
+    return "unknown";
+}
+
+/// The check at every UTXO connect point: block `hash` (parent `prev`) at
+/// `height` is the UTXO set's next height, the best chain's block there
+/// (`best_chain_hash`: the header chain's hash at `height`), and builds on
+/// the UTXO set's best block. An empty UTXO set (null best block) starts at
+/// any height of the best chain (the cold-start bootstrap).
+inline ConnectCheck utxo_connect_check(uint32_t utxo_best, const uint256& utxo_best_block,
+                                       uint32_t height, const uint256& hash,
+                                       const uint256& prev, const uint256& best_chain_hash)
+{
+    if (best_chain_hash.IsNull() || best_chain_hash != hash)
+        return ConnectCheck::NotBestChain;
+    if (utxo_best_block.IsNull())
+        return ConnectCheck::Ok;
+    if (height != utxo_best + 1)
+        return ConnectCheck::NotNext;
+    if (prev != utxo_best_block)
+        return ConnectCheck::ParentMismatch;
+    return ConnectCheck::Ok;
+}
+
+struct DrainResult {
+    uint32_t     connected{0};
+    ConnectCheck refused{ConnectCheck::Ok};  // Ok = nothing refused
+    uint32_t     refused_height{0};
+};
+
+/// Drain consecutive buffered blocks from next_height in order. Each block
+/// goes through check(block, hash, height) -> ConnectCheck first; Ok ->
+/// connect(block, hash, height). The first refused block is dropped and the
+/// drain stops (the caller recovers, see ordered_recover).
+template <typename BlockT, typename CheckFn, typename ConnectFn>
+DrainResult ordered_drain(core::coin::BlockBootstrapState<BlockT>& bs, CheckFn&& check,
+                          ConnectFn&& connect)
+{
+    DrainResult r;
     while (bs.buffer.count(bs.next_height)) {
         auto node = bs.buffer.extract(bs.next_height);
         auto& [b, bh] = node.mapped();
         const uint32_t h = bs.next_height;
+        const ConnectCheck c = check(b, bh, h);
+        if (c != ConnectCheck::Ok) {
+            r.refused = c;
+            r.refused_height = h;
+            return r;
+        }
         connect(b, bh, h);
         ++bs.next_height;
         ++bs.processed;
         bs.last_drain_time = std::chrono::steady_clock::now();
-        ++n;
+        ++r.connected;
     }
-    return n;
+    return r;
+}
+
+/// After a refused block: restart the pipeline at the UTXO set's real next
+/// height (stale buffer dropped) up to at least `to`. A parent mismatch
+/// means the UTXO set itself is on another branch, which refetching cannot
+/// fix (the reorg handler has to disconnect it): the pipeline stops.
+/// Returns true when the pipeline was re-armed (the caller refills).
+template <typename BlockT>
+bool ordered_recover(core::coin::BlockBootstrapState<BlockT>& bs, ConnectCheck why,
+                     uint32_t utxo_best, uint32_t to)
+{
+    if (why == ConnectCheck::ParentMismatch || to <= utxo_best) {
+        bs.active = false;
+        bs.buffer.clear();
+        return false;
+    }
+    const std::string phase = bs.phase;
+    ordered_arm(bs, utxo_best + 1, std::max(to, bs.end_height));
+    bs.phase = phase;
+    return true;
+}
+
+/// Reorg: whatever the pipeline was doing, restart it from the UTXO set's
+/// real best (after the disconnect) to the new tip. Its buffer may hold
+/// blocks of the old branch and its next height may be above the fork.
+/// Returns true when armed (the caller refills).
+template <typename BlockT>
+bool ordered_rearm_after_reorg(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t utxo_best,
+                               uint32_t new_height)
+{
+    if (new_height <= utxo_best)
+        return false;
+    ordered_arm(bs, utxo_best + 1, new_height);
+    return true;
 }
 
 /// Keep up to WINDOW_SIZE requests in flight: request(height) for every

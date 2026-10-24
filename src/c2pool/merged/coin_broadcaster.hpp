@@ -442,6 +442,23 @@ public:
         }
     }
 
+    /// Request a full block from the peer `peer_key` ("host:port", as the
+    /// event callbacks name it). Returns false when that peer is gone or has
+    /// not finished its handshake (the caller asks someone else).
+    bool request_full_block_from(const std::string& peer_key, const uint256& block_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_peers.find(peer_key);
+        if (it == m_peers.end() || !it->second || !it->second->node_p2p.is_handshake_complete())
+            return false;
+        try {
+            it->second->node_p2p.request_full_block(block_hash);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     /// Number of connected peers (for bootstrap round-robin).
     size_t peer_count() const
     {

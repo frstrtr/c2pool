@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace core {
@@ -43,6 +44,9 @@ struct BlockBootstrapState {
     uint32_t processed{0};
     uint32_t total{0};
     size_t peer_rotation{0};     // round-robin counter for peer assignment
+    // What the pipeline is doing, for its log lines ("Bootstrap" for the
+    // cold-start download; callers that reuse the pipeline name their own).
+    std::string phase{"Bootstrap"};
 
     // Buffer: height → (block, block_hash)
     // Blocks arrive out-of-order; we drain consecutive from next_height.
@@ -94,7 +98,7 @@ private:
                 auto stall = std::chrono::duration_cast<std::chrono::seconds>(
                     now - last_drain_time).count();
                 if (stall >= STALL_TIMEOUT_SEC) {
-                    LOG_WARNING << "[" << lbl << "] Bootstrap stall h="
+                    LOG_WARNING << "[" << lbl << "] " << phase << " stall h="
                         << next_height << " (" << stall
                         << "s) — timer re-request";
                     fn(next_height);

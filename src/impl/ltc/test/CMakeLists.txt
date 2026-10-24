@@ -111,7 +111,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     # utxo_order_test.cpp: embedded LTC blocks reach the UTXO set strictly in
     # height order (a REAL UTXOViewCache/UTXOViewDB through the utxo_order.hpp
     # helpers the full-block handler uses): out-of-order arrival, a wide gap,
-    # a sibling reorg. Same folding rule.
+    # a sibling reorg, a reorg while a fill is running, the connect-point check
+    # (stale buffered blocks, a pipeline above the UTXO set, a UTXO set on
+    # another branch). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
