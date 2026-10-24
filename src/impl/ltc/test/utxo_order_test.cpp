@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -145,13 +146,16 @@ struct Feed {
     std::vector<uint32_t> requested;   // heights asked for
     std::map<uint32_t, core::coin::BlockUndo> undo;
     std::map<uint32_t, uint256> best_chain;
+    std::map<uint256, uint256> headers;  // every header seen: hash -> parent
     ConnectCheck last_refusal{ConnectCheck::Ok};
 
     void set_chain(const std::vector<BlockType>& blocks, uint32_t first_height)
     {
         best_chain.clear();
-        for (size_t i = 0; i < blocks.size(); ++i)
+        for (size_t i = 0; i < blocks.size(); ++i) {
             best_chain[first_height + static_cast<uint32_t>(i)] = hash_of(blocks[i]);
+            headers[hash_of(blocks[i])] = blocks[i].m_previous_block;
+        }
     }
     uint32_t tip_height() const { return best_chain.empty() ? 0 : best_chain.rbegin()->first; }
 
@@ -176,6 +180,41 @@ struct Feed {
         ordered_refill(bs, [&](uint32_t rh) { requested.push_back(rh); });
     }
 
+    // main_ltc's utxo_heal: walk the UTXO set back to the best chain (undo
+    // data, at most LTC_KEEP), flush, re-arm from its real best.
+    bool heal(uint32_t target, bool rearm_always)
+    {
+        const auto rw = rewind_to_best_chain(
+            288, utxo.get_best_height(), utxo.get_best_block(),
+            [&](uint32_t h) {
+                auto it = best_chain.find(h);
+                return it == best_chain.end() ? uint256() : it->second;
+            },
+            [&](const uint256& hh) -> std::optional<uint256> {
+                auto it = headers.find(hh);
+                if (it == headers.end())
+                    return std::nullopt;
+                return it->second;
+            },
+            [&](uint32_t h) {
+                auto it = undo.find(h);
+                if (it == undo.end())
+                    return false;
+                utxo.disconnect_from_undo(it->second);
+                undo.erase(it);
+                return true;
+            });
+        if (rw.disconnected > 0)
+            utxo.flush(rw.hash, rw.height);
+        if (!rw.ok)
+            return false;
+        if (rw.disconnected == 0 && !rearm_always)
+            return true;
+        if (ordered_rearm_after_reorg(bs, utxo.get_best_height(), target))
+            refill();
+        return true;
+    }
+
     // The active branch after buffering.
     void pump()
     {
@@ -184,8 +223,14 @@ struct Feed {
             [&](const BlockType& b, const uint256& h, uint32_t hh) { connect(b, h, hh); });
         if (r.refused != ConnectCheck::Ok) {
             last_refusal = r.refused;
-            if (ordered_recover(bs, r.refused, utxo.get_best_height(), tip_height()))
+            if (r.refused == ConnectCheck::ParentMismatch) {
+                if (!heal(tip_height(), true)) {
+                    bs.active = false;
+                    bs.buffer.clear();
+                }
+            } else if (ordered_recover(bs, r.refused, utxo.get_best_height(), tip_height())) {
                 refill();
+            }
         }
         if (bs.active)
             refill();
@@ -214,26 +259,18 @@ struct Feed {
         }
         if (act == UtxoConnect::Connect) {
             const auto c = check(b, h, height);
-            if (c == ConnectCheck::Ok)
+            if (c == ConnectCheck::Ok) {
                 connect(b, h, height);
-            else
+            } else {
                 last_refusal = c;
+                if (c == ConnectCheck::ParentMismatch && heal(tip_height(), true) && bs.active)
+                    ordered_buffer(bs, height, b, h);
+            }
         }
     }
 
-    // The reorg handler: disconnect above the fork, then the new branch in
-    // order from the UTXO set's real best.
-    void reorg(uint32_t fork_height, const uint256& fork_hash, uint32_t new_height)
-    {
-        const uint32_t best = utxo.get_best_height();
-        if (best > fork_height) {
-            for (uint32_t h = best; h > fork_height; --h)
-                utxo.disconnect_from_undo(undo[h]);
-            utxo.flush(fork_hash, fork_height);
-        }
-        if (ordered_rearm_after_reorg(bs, utxo.get_best_height(), new_height))
-            refill();
-    }
+    // The reorg handler: utxo_heal to the new tip.
+    void reorg(uint32_t new_height) { heal(new_height, true); }
 };
 
 bool has(core::coin::UTXOViewCache& utxo, const MutableTransaction& tx, uint32_t index = 0)
@@ -373,7 +410,7 @@ TEST(LtcUtxoOrder, SiblingReorgConnectsTheNewBranch)
     EXPECT_EQ(t.cache->get_best_block(), hash_of(a[1]));
 
     // Reorg handler: disconnect to the fork, refetch the new branch in order.
-    f.reorg(1, hash_of(a[0]), 2);
+    f.reorg(2);
     ASSERT_EQ(t.cache->get_best_height(), 1u);
     EXPECT_TRUE(f.bs.active);
     EXPECT_EQ(f.requested, (std::vector<uint32_t>{2}));
@@ -412,7 +449,7 @@ TEST(LtcUtxoOrder, ReorgMidFillRestartsFromTheUtxoBest)
     // The chain switches to b3..b5 (fork at 2).
     f.set_chain({a[0], a[1], b[0], b[1], b[2]}, 1);
     f.requested.clear();
-    f.reorg(2, hash_of(a[1]), 5);
+    f.reorg(5);
     EXPECT_EQ(t.cache->get_best_height(), 2u);
     EXPECT_EQ(t.cache->get_best_block(), hash_of(a[1]));
     EXPECT_TRUE(f.bs.active);
@@ -479,9 +516,10 @@ TEST(LtcUtxoOrder, StaleBufferedBlockNeverConnects)
     EXPECT_EQ(t.cache->get_best_block(), hash_of(b[1]));
 }
 
-// The UTXO set itself on another branch (its best block is not the parent):
-// the best chain's next block is not connected over it.
-TEST(LtcUtxoOrder, ParentMismatchIsNotConnected)
+// The UTXO set itself on another branch (its best block is not the parent
+// of the best chain's next block): it is walked back to the best chain and
+// the best chain is connected from there.
+TEST(LtcUtxoOrder, ParentMismatchRewindsAndHeals)
 {
     TempDb t;
     Feed f{*t.cache, *t.db};
@@ -496,7 +534,75 @@ TEST(LtcUtxoOrder, ParentMismatchIsNotConnected)
     f.set_chain({a[0], b[0], b[1]}, 1);
     f.deliver(b[1], 3);
     EXPECT_EQ(f.last_refusal, ConnectCheck::ParentMismatch);
-    EXPECT_EQ(t.cache->get_best_block(), hash_of(a[1]));
+    EXPECT_EQ(t.cache->get_best_height(), 1u) << "walked back to the best chain";
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(a[0]));
+    EXPECT_TRUE(f.bs.active);
+    EXPECT_EQ(f.bs.next_height, 2u);
+    f.deliver(b[0], 2);                                    // b2, then the kept b3
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_height(), 3u);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b[1]));
+    EXPECT_FALSE(has(*t.cache, a[1].m_txs[0]));
+    EXPECT_TRUE(has(*t.cache, b[0].m_txs[0]));
+    EXPECT_TRUE(has(*t.cache, b[1].m_txs[0]));
+}
+
+// A crash after a reorg's tip was persisted but before its UTXO disconnect
+// ran: on restart there is no tip change. The startup check walks the UTXO
+// set back and refills the new branch; on a UTXO set already on the best
+// chain it does nothing. Past the undo data it gives up (ERROR stop).
+TEST(LtcUtxoOrder, StartupHealsACrashBetweenTipAndDisconnect)
+{
+    TempDb t;
+    Feed f{*t.cache, *t.db};
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000b1");
+    const auto a = make_chain(g, 1, 3, 0xd0);              // a1..a3
+    const auto b = make_chain(hash_of(a[0]), 2, 3, 0xe0);  // b2..b4, fork at a1
+    f.set_chain(a, 1);
+    for (uint32_t h = 1; h <= 3; ++h)
+        f.deliver(a[h - 1], h);
+    ASSERT_EQ(t.cache->get_best_block(), hash_of(a[2]));
+
+    // Already on the best chain: the startup check is a no-op.
+    EXPECT_TRUE(f.heal(3, false));
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_height(), 3u);
+
+    // Header chain now b2..b4; the UTXO set never heard of it.
+    f.set_chain({a[0], b[0], b[1], b[2]}, 1);
+    f.requested.clear();
+    EXPECT_TRUE(f.heal(4, false));
+    EXPECT_EQ(t.cache->get_best_height(), 1u);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(a[0]));
+    EXPECT_TRUE(f.bs.active);
+    EXPECT_EQ(f.requested, (std::vector<uint32_t>{2, 3, 4}));
+    f.deliver(b[0], 2);
+    f.deliver(b[1], 3);
+    f.deliver(b[2], 4);
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b[2]));
+    EXPECT_FALSE(has(*t.cache, a[1].m_txs[0]));
+    EXPECT_FALSE(has(*t.cache, a[2].m_txs[0]));
+    EXPECT_TRUE(has(*t.cache, b[2].m_txs[0]));
+}
+
+TEST(LtcUtxoOrder, HealGivesUpWithoutUndoData)
+{
+    TempDb t;
+    Feed f{*t.cache, *t.db};
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000b2");
+    const auto a = make_chain(g, 1, 3, 0xf0);              // a1..a3
+    const auto b = make_chain(hash_of(a[0]), 2, 2, 0x10);  // b2, b3
+    f.set_chain(a, 1);
+    for (uint32_t h = 1; h <= 3; ++h)
+        f.deliver(a[h - 1], h);
+    f.set_chain({a[0], b[0], b[1]}, 1);
+    f.undo.erase(2);                                       // pruned
+    EXPECT_FALSE(f.heal(3, true)) << "cannot reach the best chain";
+    EXPECT_EQ(t.cache->get_best_height(), 2u) << "a3 undone, a2 has no undo data";
+    EXPECT_FALSE(f.bs.active) << "no fill armed on a UTXO set off the best chain";
 }
 
 TEST(LtcUtxoOrder, TipChangeIsReorg)

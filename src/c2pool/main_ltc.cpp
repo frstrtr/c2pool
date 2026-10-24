@@ -2470,6 +2470,108 @@ int main(int argc, char* argv[]) {
                 // next-height / parent checks. 0 = none.
                 auto utxo_jump_from = std::make_shared<uint32_t>(0);
 
+                // Bring the UTXO set back onto the best chain: walk its best back by
+                // height (undo data, at most LTC_KEEP blocks) until its block is the
+                // header chain's block at that height, flush, then connect the best
+                // chain from there in order (the ordered pipeline, from the UTXO
+                // set's real best to target_height). Used by the reorg handler, by
+                // both connect points on a parent mismatch (e.g. a crash between a
+                // reorg's persisted tip and its UTXO disconnect: no tip change on
+                // restart), and once at startup. rearm_always re-arms even when
+                // nothing had to be disconnected. Returns false when the UTXO set
+                // cannot be brought back (no undo data / deeper than LTC_KEEP).
+                using UtxoHealFn = std::function<bool(const char*, uint32_t, bool)>;
+                auto utxo_heal = std::make_shared<UtxoHealFn>(
+                    [chain = embedded_chain.get(), utxo = ltc_utxo_cache.get(),
+                     utxo_db = ltc_utxo_db.get(), bcaster = embedded_broadcaster.get(),
+                     ltc_bs, fill_rr, utxo_jump_from, &ioc](
+                        const char* reason, uint32_t target_height, bool rearm_always) -> bool {
+                        if (!chain || !utxo || !utxo_db)
+                            return false;
+                        const uint32_t before = utxo->get_best_height();
+                        const auto rw = ltc::coin::rewind_to_best_chain(
+                            core::coin::LTC_MIN_BLOCKS_TO_KEEP, before, utxo->get_best_block(),
+                            [&](uint32_t h) {
+                                auto e = chain->get_header_by_height(h);
+                                return e ? e->block_hash : uint256();
+                            },
+                            [&](const uint256& hh) -> std::optional<uint256> {
+                                auto e = chain->get_header(hh);
+                                if (!e)
+                                    return std::nullopt;
+                                return e->prev_hash;
+                            },
+                            [&](uint32_t h) {
+                                core::coin::BlockUndo undo;
+                                if (!utxo_db->get_block_undo(h, undo))
+                                    return false;
+                                utxo->disconnect_from_undo(undo);
+                                utxo_db->remove_block_undo(h);
+                                return true;
+                            });
+                        if (rw.disconnected > 0) {
+                            utxo->flush(rw.hash, rw.height);
+                            LOG_WARNING << "[EMB-LTC] UTXO rewound to the best chain (" << reason
+                                        << "): disconnected " << rw.disconnected << " blocks (h="
+                                        << before << "→" << rw.height << ") best="
+                                        << rw.hash.GetHex().substr(0, 16);
+                        }
+                        if (!rw.ok) {
+                            LOG_ERROR << "[EMB-LTC] UTXO set cannot be brought back to the best chain ("
+                                      << reason << "): stuck at h=" << rw.height << " "
+                                      << rw.hash.GetHex().substr(0, 16)
+                                      << "... (undo data missing or deeper than "
+                                      << core::coin::LTC_MIN_BLOCKS_TO_KEEP << " blocks)";
+                            return false;
+                        }
+                        if (rw.disconnected == 0 && !rearm_always)
+                            return true;
+                        // Connect the best chain in order from the UTXO set's REAL
+                        // best, whatever the pipeline was doing (it may have drained
+                        // past the fork and may hold old-branch blocks). An empty
+                        // UTXO set (cold-start bootstrap, nothing drained yet)
+                        // restarts at the bootstrap's own start instead.
+                        const bool empty_utxo = utxo->get_best_block().IsNull()
+                            || (ltc_bs->active && *utxo_jump_from != 0);
+                        const bool was_cold_start = ltc_bs->active && ltc_bs->phase == "Bootstrap";
+                        const uint32_t best_now = empty_utxo
+                            ? (ltc_bs->active && ltc_bs->next_height > 0 ? ltc_bs->next_height - 1 : 0)
+                            : utxo->get_best_height();
+                        if (bcaster && (!empty_utxo || ltc_bs->active)
+                            && ltc::coin::ordered_rearm_after_reorg(*ltc_bs, best_now, target_height)) {
+                            if (!was_cold_start) {
+                                ltc_bs->phase = "UTXO reorg fill";
+                                *utxo_jump_from = 0;
+                            }
+                            LOG_WARNING << "[EMB-LTC] UTXO reorg fill (" << reason << "): connecting "
+                                        << best_now + 1 << ".." << target_height << " in order";
+                            ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
+                                auto e = chain->get_header_by_height(rh);
+                                if (!e)
+                                    return;
+                                if (!bcaster->request_full_block_targeted(e->block_hash, (*fill_rr)++))
+                                    bcaster->request_full_block(e->block_hash);
+                            });
+                            ltc_bs->start_stall_timer(ioc,
+                                [chain, bcaster](uint32_t h) {
+                                    auto e = chain->get_header_by_height(h);
+                                    if (e && bcaster)
+                                        bcaster->request_full_block(e->block_hash);
+                                }, "EMB-LTC");
+                        }
+                        return true;
+                    });
+                // Once at startup: a reorg whose tip was persisted but whose UTXO
+                // disconnect never ran (crash in between) fires no tip change.
+                boost::asio::post(ioc, [utxo_heal, chain = embedded_chain.get()]() {
+                    try {
+                        if (chain && chain->tip())
+                            (*utxo_heal)("startup", chain->height(), false);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING << "[EMB-LTC] UTXO startup check error: " << e.what();
+                    }
+                });
+
                 auto log_mweb_window = [](const ltc::coin::MwebWindowStats::Closed& c) {
                     LOG_INFO << "[EMB-LTC] MWEB window closed h=" << c.height
                              << " tip=" << c.tip.GetHex().substr(0, 16)
@@ -2609,7 +2711,7 @@ int main(int argc, char* argv[]) {
                          explorer_enabled, explorer_depth_ltc,
                          pending_merged_resolve, on_full_block_merged,
                          ltc_bs, mweb_retry, mweb_stats, seen_blocks, on_mweb_state, fill_rr,
-                         utxo_jump_from,
+                         utxo_jump_from, utxo_heal,
                          ltc_mweb_activation, self = std::weak_ptr<FullBlockFn>(full_block_fn),
                          &ioc, &web_server](
                             const std::string& peer,
@@ -2875,7 +2977,8 @@ int main(int argc, char* argv[]) {
                                             pool->remove_for_block(b);
                                         }
 
-                                        if (tracker && tracker->update(b, h, b.m_mweb_raw))
+                                        if (tracker && tracker->state_hash() != bh
+                                            && tracker->update(b, h, b.m_mweb_raw))
                                             on_mweb_state(bh, MwebSource::Bootstrap);
                                         seen_blocks->insert(bh);
 
@@ -2908,18 +3011,27 @@ int main(int argc, char* argv[]) {
                                         const uint32_t recover_base = from_pipeline
                                             ? (ltc_bs->next_height > 0 ? ltc_bs->next_height - 1 : 0)
                                             : utxo->get_best_height();
-                                        if (ltc::coin::ordered_recover(*ltc_bs, drained.refused,
-                                                                       recover_base,
-                                                                       chain->height())) {
+                                        if (drained.refused == ltc::coin::ConnectCheck::ParentMismatch) {
+                                            // The UTXO set itself is on another branch: walk
+                                            // it back to the best chain and refill from there.
+                                            if (!(*utxo_heal)("parent mismatch", chain->height(), true)) {
+                                                ltc_bs->active = false;
+                                                ltc_bs->buffer.clear();
+                                                ltc_bs->stop_stall_timer();
+                                                *utxo_jump_from = 0;
+                                            }
+                                        } else if (ltc::coin::ordered_recover(*ltc_bs, drained.refused,
+                                                                              recover_base,
+                                                                              chain->height())) {
                                             ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
                                                 fill_request(rh, false);
                                             });
                                         } else {
                                             ltc_bs->stop_stall_timer();
-                                            LOG_ERROR << "[EMB-LTC] UTXO set is not on the best chain at h="
+                                            *utxo_jump_from = 0;
+                                            LOG_ERROR << "[EMB-LTC] " << ltc_bs->phase << " stopped at h="
                                                       << utxo->get_best_height() << " ("
-                                                      << utxo->get_best_block().GetHex().substr(0, 16)
-                                                      << "...) — ordered fill stopped";
+                                                      << ltc::coin::connect_check_name(drained.refused) << ")";
                                         }
                                     }
                                     // Fees and inputs once per drain, as the normal path does.
@@ -3023,6 +3135,7 @@ int main(int argc, char* argv[]) {
                                     }
                                     ltc::coin::ordered_arm(*ltc_bs, utxo_best + 1, height);
                                     ltc_bs->phase = "UTXO gap fill";
+                                    *utxo_jump_from = 0;
                                     ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
                                     ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
                                         fill_request(rh, true);
@@ -3035,12 +3148,20 @@ int main(int argc, char* argv[]) {
                                     : ltc::coin::ConnectCheck::Ok;
                                 if (act == ltc::coin::UtxoConnect::Connect
                                     && check != ltc::coin::ConnectCheck::Ok) {
-                                    LOG_ERROR << "[EMB-LTC] Block h=" << height << " "
-                                              << block_hash.GetHex().substr(0, 16)
-                                              << "... not connected to the UTXO set ("
-                                              << ltc::coin::connect_check_name(check)
-                                              << "), UTXO at h=" << utxo_best << " "
-                                              << utxo->get_best_block().GetHex().substr(0, 16) << "...";
+                                    // NotBestChain here is the benign race between the
+                                    // on_best_chain look-up and the check (the index moved).
+                                    LOG_WARNING << "[EMB-LTC] Block h=" << height << " "
+                                                << block_hash.GetHex().substr(0, 16)
+                                                << "... not connected to the UTXO set ("
+                                                << ltc::coin::connect_check_name(check)
+                                                << "), UTXO at h=" << utxo_best << " "
+                                                << utxo->get_best_block().GetHex().substr(0, 16) << "...";
+                                    if (check == ltc::coin::ConnectCheck::ParentMismatch
+                                        && (*utxo_heal)("parent mismatch", chain->height(), true)
+                                        && ltc_bs->active) {
+                                        // Keep this block for the refill instead of fetching it again.
+                                        ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
+                                    }
                                 }
                                 if (act == ltc::coin::UtxoConnect::Connect
                                     && check == ltc::coin::ConnectCheck::Ok) {
@@ -3247,8 +3368,8 @@ int main(int argc, char* argv[]) {
                      chain = embedded_chain.get(),
                      utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(),
-                     mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, fill_rr,
-                     utxo_jump_from, ltc_mweb_activation, ltc_mweb_fetch_retry,
+                     mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
+                     ltc_mweb_activation, ltc_mweb_fetch_retry,
                      &web_server, &ioc](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -3259,8 +3380,7 @@ int main(int argc, char* argv[]) {
                         const auto tip_seen_at = std::chrono::steady_clock::now();
                         boost::asio::post(ioc,
                             [tracker, bcaster, chain, utxo, utxo_db, &web_server, &ioc,
-                             mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, fill_rr,
-                             utxo_jump_from,
+                             mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
                              ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at,
                              old_tip, old_height, new_tip, new_height]() {
                       try {
@@ -3292,89 +3412,14 @@ int main(int argc, char* argv[]) {
                         // Uses undo data (added_outpoints + spent_coins) so full blocks
                         // are NOT needed for the old fork.
                         if (is_reorg && utxo && utxo_db && chain) {
-                            // Find fork point: walk old_tip backward until we find
-                            // a hash that's an ancestor of new_tip
-                            std::set<uint256> new_ancestors;
-                            {
-                                uint256 cur = new_tip;
-                                while (!cur.IsNull()) {
-                                    new_ancestors.insert(cur);
-                                    auto e = chain->get_header(cur);
-                                    if (!e) break;
-                                    cur = e->prev_hash;
-                                }
-                            }
-                            uint256 fork_hash;
-                            uint32_t fork_height = 0;
-                            {
-                                uint256 cur = old_tip;
-                                while (!cur.IsNull()) {
-                                    if (new_ancestors.count(cur)) {
-                                        fork_hash = cur;
-                                        auto e = chain->get_header(cur);
-                                        if (e) fork_height = e->height;
-                                        break;
-                                    }
-                                    auto e = chain->get_header(cur);
-                                    if (!e) break;
-                                    cur = e->prev_hash;
-                                }
-                            }
-
-                            // Disconnect what the UTXO set actually connected above
-                            // the fork (it may lag the old tip), and never move its
-                            // best height up to the fork if it was below it.
-                            const uint32_t utxo_best = utxo->get_best_height();
-                            if (!fork_hash.IsNull() && fork_height < old_height
-                                && utxo_best > fork_height) {
-                                int disconnected = 0;
-                                for (uint32_t h = utxo_best; h > fork_height; --h) {
-                                    core::coin::BlockUndo undo;
-                                    if (utxo_db->get_block_undo(h, undo)) {
-                                        utxo->disconnect_from_undo(undo);
-                                        utxo_db->remove_block_undo(h);
-                                        ++disconnected;
-                                    }
-                                }
-                                utxo->flush(fork_hash, fork_height);
-                                LOG_WARNING << "[EMB-LTC] UTXO reorg: disconnected " << disconnected
-                                            << " blocks (h=" << utxo_best << "→" << fork_height
-                                            << ") fork=" << fork_hash.GetHex().substr(0, 16);
-                            }
-                            // Connect the new branch in order from the UTXO set's
-                            // REAL best, whatever the pipeline was doing: a running
-                            // fill may have drained past the fork and may hold
-                            // old-branch blocks. Blocks of the new branch already
-                            // delivered (dropped as copies, or checked against the
-                            // old branch) are fetched again.
-                            // An empty UTXO set (cold-start bootstrap, nothing drained
-                            // yet) restarts at the bootstrap's own start instead.
-                            const bool empty_utxo = utxo->get_best_block().IsNull()
-                                || (ltc_bs->active && *utxo_jump_from != 0);
-                            const bool was_cold_start = ltc_bs->active && ltc_bs->phase == "Bootstrap";
-                            const uint32_t best_now = empty_utxo
-                                ? (ltc_bs->active && ltc_bs->next_height > 0 ? ltc_bs->next_height - 1 : 0)
-                                : utxo->get_best_height();
-                            if (bcaster && (!empty_utxo || ltc_bs->active)
-                                && ltc::coin::ordered_rearm_after_reorg(*ltc_bs, best_now, new_height)) {
-                                if (!was_cold_start)
-                                    ltc_bs->phase = "UTXO reorg fill";
-                                LOG_WARNING << "[EMB-LTC] UTXO reorg fill: connecting "
-                                            << best_now + 1 << ".." << new_height << " in order";
-                                ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
-                                    auto e = chain->get_header_by_height(rh);
-                                    if (!e)
-                                        return;
-                                    if (!bcaster->request_full_block_targeted(e->block_hash, (*fill_rr)++))
-                                        bcaster->request_full_block(e->block_hash);
-                                });
-                                ltc_bs->start_stall_timer(ioc,
-                                    [chain, bcaster](uint32_t h) {
-                                        auto e = chain->get_header_by_height(h);
-                                        if (e && bcaster)
-                                            bcaster->request_full_block(e->block_hash);
-                                    }, "EMB-LTC");
-                            }
+                            // Walk the UTXO set back to the (new) best chain — what it
+                            // actually connected above the fork, never moving its best
+                            // up to a fork it had not reached — then connect the new
+                            // branch in order from there, whatever the pipeline was
+                            // doing. Blocks of the new branch already delivered
+                            // (dropped as copies, or checked against the old branch)
+                            // are fetched again.
+                            (*utxo_heal)("reorg", new_height, true);
                         }
 
                         // Drop MWEB state that is not the new tip's (its HogEx is
