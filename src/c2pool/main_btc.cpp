@@ -1738,9 +1738,11 @@ int main(int argc, char* argv[])
                  << " height=" << height << " (via stratum)";
         // CONNECT-AUTHORITATIVE: P2P relay (fast propagation) + submitblock RPC
         // fired UNCONDITIONALLY so the won block actually connects. A P2P
-        // cmpctblock announce-success alone does NOT connect the tip (daemon
-        // requests the body via getblocktxn, which we do not serve) - the
-        // silent-loss this path closes. BTC-fenced; cross-coin fallback intact.
+        // cmpctblock announce-success alone does NOT connect the tip: the
+        // daemon asks for the missing txs via getblocktxn, which the P2P node
+        // answers only for the last cmpctblock it sent on that connection, so
+        // reconstruction is not guaranteed - the silent-loss this path closes.
+        // BTC-fenced; cross-coin fallback intact.
         return coin_node.submit_block_for_connect(block_bytes);
     };
 
