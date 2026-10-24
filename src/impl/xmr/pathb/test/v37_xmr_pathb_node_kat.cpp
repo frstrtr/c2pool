@@ -115,6 +115,8 @@
 //                not at a tip reply;
 //   hp_guard     a frame that does not start at the open request's from: DROP,
 //                the request open with its clock;
+//   hp_crawl     a catch-up of one page from three servers: one catch-up
+//                request per server;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -9012,6 +9014,36 @@ void hp_guard() {
     }
 }
 
+// hp_crawl (V2 with #2047's catch-up vectors): A, B and C hold 300 positions (one page); J, empty, catches up from all
+// three: one catch-up request per server (its page in flight until its last asked body is placed, then J holds every
+// HELLO tip); J at the tip within 60 s; 0 bans.
+void hp_crawl() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    const std::uint64_t n = 300;
+    const bool ok = catch_chain(h, w, a, b, c, n, 39000);
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    w.connect(3, 0);
+    w.connect(3, 1);
+    w.connect(3, 2);
+    int secs = 0;
+    for (; secs < 600 && h[j.node].tree().best().id != tip; ++secs)
+        catch_second(h, w, {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()});
+    const std::uint64_t asks = j.relay->stats().catchup_requests.load();
+    std::printf("  hp_crawl: chain %d; J at %llu of %llu after %d s; catch-up asks %llu; bans %llu\n", ok ? 1 : 0,
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)n, secs, (unsigned long long)asks,
+                (unsigned long long)j.relay->stats().bans.load());
+    check(ok && h[j.node].tree().best().id == tip && secs <= 60 && j.relay->stats().bans.load() == 0,
+          "hp_crawl: J reaches the tip within 60 s (" + std::to_string(secs) + " s); 0 bans");
+    check(asks == 3, "hp_crawl: one catch-up request per server for a chain of one page (asks " + std::to_string(asks) + ")");
+}
+
 int main(int argc, char** argv) {
     std::printf("v37_xmr_pathb_node_kat\n");
     const std::string only = argc > 1 ? argv[1] : "";
@@ -9061,6 +9093,7 @@ int main(int argc, char** argv) {
     run("hp_ctxslot", hp_ctxslot);
     run("hp_firstround", hp_firstround);
     run("hp_guard", hp_guard);
+    run("hp_crawl", hp_crawl);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);
