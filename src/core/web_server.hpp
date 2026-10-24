@@ -922,8 +922,13 @@ public:
     // above: the function returns a JSON object whose keys are copied into
     // the payload (LTC embedded: {"ltc_mweb": {...}}). Called from whichever
     // thread serves the request, so it must read thread-safe state only.
+    // May be set while the HTTP server is already serving: the hook itself
+    // is swapped and read under a lock.
     using coin_metrics_fn_t = std::function<nlohmann::json()>;
-    void set_coin_metrics_fn(coin_metrics_fn_t fn) { m_coin_metrics_fn = std::move(fn); }
+    void set_coin_metrics_fn(coin_metrics_fn_t fn) {
+        std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
+        m_coin_metrics_fn = std::move(fn);
+    }
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
@@ -1645,6 +1650,7 @@ private:
     // The cached template failed the shape check (served degraded).
     std::atomic<bool>     m_work_degraded{false};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
+    mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;
 
     // Share creation hook

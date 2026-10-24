@@ -5434,9 +5434,14 @@ nlohmann::json MiningInterface::rest_local_stats()
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).
-    if (m_coin_metrics_fn) {
+    coin_metrics_fn_t coin_metrics;
+    {
+        std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
+        coin_metrics = m_coin_metrics_fn;
+    }
+    if (coin_metrics) {
         try {
-            const nlohmann::json extra = m_coin_metrics_fn();
+            const nlohmann::json extra = coin_metrics();
             if (extra.is_object())
                 for (auto it = extra.begin(); it != extra.end(); ++it)
                     result[it.key()] = it.value();
