@@ -74,9 +74,10 @@
 //                forks more than J_0 below the carrier's parent (ruling 40);
 //   timers       P-53 per request restarted per frame, a timeout is
 //                non-service; the FC_BUCKETS window (FIX-1);
-//   j1stale      a FC_HEADERS reply to a request P-53 abandoned, after a
-//                re-ask from a moved best: DROP, no BAN, the re-ask open; a
-//                reply broken inside or failing PoW: BAN with its reason;
+//   j1stale      a FC_HEADERS reply to a request P-53 retired: DROP, no BAN,
+//                no re-ask while it is retired; a frame on another from: DROP,
+//                the request open; a reply broken inside: STRIKE; failing PoW:
+//                BAN with its reason;
 //   relayj1stale the same through the relay's catch-up loop: no ban, the
 //                DROP logged, J at the server's tip; a BANNED line names
 //                its check;
@@ -5867,7 +5868,8 @@ void j1stale() {
                       + std::to_string(static_cast<int>(o1.kind)) + ", " + std::to_string(static_cast<int>(o2.kind)) + ")");
     }
     {
-        // a reply that starts at the request and breaks inside: BAN, the reason names the check
+        // a reply that starts at the request and breaks inside: STRIKE (per operator ruling), no BAN, nothing indexed;
+        // the reason names the link
         Harness h(net);
         std::size_t s = 0, j = 0;
         j1stale_chain(h, net, s, j);
@@ -5879,8 +5881,10 @@ void j1stale() {
         (void)pb::decode_fc_headers(f1, 0, h[j].frame_bytes_headers(), pb::kRuledLaneParams, rep);
         std::swap(rep.headers[2], rep.headers[3]);
         const pb::PathbNode::HeadersOutcome o = h[j].on_headers(s, *pb::encode_fc_headers(rep, h[j].frame_bytes_headers()), h.now);
-        check(o.kind == K::Ban && o.why.find("link") != std::string::npos,
-              "j1stale (break): a link broken inside the reply: BAN with its reason (kind "
+        check(o.kind == K::Strike && o.indexed == 0 && pb::PathbNodeTestAccess::headers(h[j]).size() == 0
+                      && o.why.find("link") != std::string::npos,
+              "j1stale (break): a link broken inside the reply: STRIKE, no BAN, nothing indexed, the reason names the "
+              "link (kind "
                       + std::to_string(static_cast<int>(o.kind)) + ", why '" + o.why + "')");
     }
     {

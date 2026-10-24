@@ -1769,11 +1769,13 @@ public:
                 const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
                 const bool checked = ann[i].parent == prev && k == i + 1;  // pow_ok ran on this header
                 const bool monotone = ann[i].parent == prev && k == i;     // h below the record H
-                // S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major == hf(h); timestamp >=
-                // median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin == d_at(chain, pos(tip) + 1):
-                // "STRIKE"; #11 RandomX meets d: "BAN"
-                out.kind = monotone || (checked && (pow_row == 7 || pow_row == 8)) ? HeadersOutcome::Kind::Strike
-                                                                                   : HeadersOutcome::Kind::Ban;
+                // a link broken inside the reply (a header's parent not the id of the header before it): STRIKE (per
+                // operator ruling); S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major ==
+                // hf(h); timestamp >= median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin ==
+                // d_at(chain, pos(tip) + 1): "STRIKE"; #11 RandomX meets d: "BAN"
+                const bool link = ann[i].parent != prev;
+                out.kind = link || monotone || (checked && (pow_row == 7 || pow_row == 8)) ? HeadersOutcome::Kind::Strike
+                                                                                           : HeadersOutcome::Kind::Ban;
                 const std::string cause = ann[i].parent != prev ? "link (parent " + hex32(ann[i].parent).substr(0, 16) + " != " +
                                                                           hex32(prev).substr(0, 16) + ")"
                                           : checked           ? pow_why
