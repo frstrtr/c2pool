@@ -866,6 +866,35 @@ public:
     }
     // KAT hook: the frames parked for `m` run again, as when the cause resolves.
     void test_rerun(Missing m) { rerun_parked(m); }
+    // KAT hooks: a tip-header request to `peer` as a TipUnknown admission asks it (from zero: the best chain at
+    // pos(best) - J_0); the peers with a catch-up entry; the header requests waiting for `peer`'s slot.
+    void test_tip_headers(std::uint64_t peer, const Hash32& from, const Hash32& stop) {
+        const NodeGuard g(*this);
+        request_tip_headers(peer, from, stop, std::nullopt);
+    }
+    std::size_t catchup_peers() const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        return catchup_.size();
+    }
+    std::size_t header_waiting(std::uint64_t peer) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = header_wants_.find(peer);
+        return it == header_wants_.end() ? 0 : it->second.size();
+    }
+    // KAT hooks: the catch-up entry of `peer` (its page in flight and its last ask); the join attempts' transport.
+    struct CatchupView {
+        Hash32 fetch_tip{};
+        std::uint64_t fetch_ms = 0;
+        std::uint64_t asked_ms = 0;
+        std::uint32_t step = 0;
+    };
+    std::optional<CatchupView> catchup_view(std::uint64_t peer) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = catchup_.find(peer);
+        if (it == catchup_.end()) return std::nullopt;
+        return CatchupView{it->second.fetch_tip, it->second.fetch_ms, it->second.asked_ms, it->second.step};
+    }
+    JoinTransport& test_join_transport() { return port_; }
     // P-50: the claim-leaf alarm buckets held.
     std::size_t claim_entries() const {
         std::lock_guard<std::mutex> lk(vmtx_);
