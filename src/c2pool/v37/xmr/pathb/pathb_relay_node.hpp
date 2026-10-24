@@ -1453,10 +1453,10 @@ private:
         if (known) strikes_by_peer_[p] += n;  // a peer whose link is gone keeps no entry
         for (std::uint32_t k = taken ? 1 : 0; k < n; ++k) (void)dos_.grant_randomx(src, now_ns());
     }
-    // BAN: the sender's address banned for ban_seconds (no address: the link dropped).
-    void ban(std::uint64_t p) {
+    // BAN: the sender's address banned for ban_seconds (no address: the link dropped); the line names the check.
+    void ban(std::uint64_t p, const std::string& why) {
         st_.bans++;
-        log("relay: peer " + std::to_string(p) + " BANNED");
+        log("relay: peer " + std::to_string(p) + " BANNED: " + (why.empty() ? std::string("(no reason given)") : why));
         defer_drop(p, src_of(p), true);
     }
     // The job's token back: the solicited credit, or the source's token (a valid object, or no RandomX spent).
@@ -1760,6 +1760,7 @@ private:
         // (a Monero block, the peer that sent the object, the want's class: Carrier for a carrier, Receipt for a receipt)
         std::vector<std::tuple<Hash32, std::uint64_t, CtxClass>> ctx;
         std::vector<std::uint64_t> bans;                    // servers of refuted walked variants or body sets
+        std::vector<std::string> bans_why;                  // one per entry of bans
         std::vector<std::uint64_t> strikes;                 // servers of walked body sets struck once
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
@@ -1872,6 +1873,8 @@ private:
                 }
                 st_.walk_placed += wb.placed.size();
                 fx.bans.insert(fx.bans.end(), wb.banned.begin(), wb.banned.end());
+                fx.bans_why.insert(fx.bans_why.end(), wb.banned_why.begin(), wb.banned_why.end());
+                fx.bans_why.resize(fx.bans.size());
                 fx.strikes.insert(fx.strikes.end(), wb.struck.begin(), wb.struck.end());
                 if (!wb.need_bodies.empty() && (!d || node_->may_ask(*d, peer)))
                     for (const Hash32& id : wb.need_bodies)
@@ -1990,7 +1993,9 @@ private:
         for (const auto& [q, n] : r.admit.peer_tokens) strike(q, n, false);
         switch (r.admit.verdict) {
             case AdmitVerdict::Strike: strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken); return true;
-            case AdmitVerdict::Ban: ban(peer); return true;
+            case AdmitVerdict::Ban:
+                ban(peer, "admission row R" + std::to_string(static_cast<int>(r.admit.row)) + " of " + hex_short(r.admit.id));
+                return true;
             case AdmitVerdict::Drop: st_.drops++; return false;
             default: return false;
         }
@@ -2008,7 +2013,7 @@ private:
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
         fx.p15.clear();
-        for (std::uint64_t q : fx.bans) ban(q);
+        for (std::size_t i = 0; i < fx.bans.size(); ++i) ban(fx.bans[i], i < fx.bans_why.size() ? fx.bans_why[i] : std::string());
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
         if (!fx.rerun.empty()) rerun_parked(std::vector<Missing>(fx.rerun.begin(), fx.rerun.end()));
@@ -2651,6 +2656,7 @@ private:
                             break;
                         case K::JoinerPath:
                         case K::Ban:
+                        case K::Strike:
                         case K::Undecodable: catchup_.erase(it); break;
                         default: break;
                     }
@@ -2659,11 +2665,16 @@ private:
             if (o.kind == K::JoinerPath) join = true;
             if (o.kind != K::OverBuffer && o.kind != K::Unsolicited) header_wants_locked(p);
         }
+        if (o.kind == K::Unsolicited && !o.why.empty()) log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
             case K::OverBuffer:   // above the FC_HEADERS buffer: DROP (the request stays open)
             case K::Unsolicited: token(p, FrameToken::Drop); break;
             case K::Undecodable: token(p, FrameToken::Strike); break;
-            case K::Ban: ban(p); break;
+            case K::Ban: ban(p, o.why); break;
+            case K::Strike:
+                log("relay: peer " + std::to_string(p) + " STRIKE: " + o.why);
+                token(p, FrameToken::Strike);
+                break;
             default: break;
         }
         if (o.kind == K::Defer && o.fetch != Hash32{}) {
@@ -2684,10 +2695,13 @@ private:
                 const NodeGuard g(*this);
                 held = o.cause == Missing::MissingWeights && node_->monero_block_held(o.fetch);
             }
-            if (held)
+            if (o.cause == Missing::Seed) {
+                // the seed cache: no context brings it; the request is asked again once the seed is held
+            } else if (held) {
                 st_.ctx_held++;
-            else
+            } else {
                 want_ctx(o.fetch, p, 0, CtxClass::Carrier);
+            }
         }
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
@@ -3825,7 +3839,7 @@ private:
                     ctx_want_.erase(id);
                 }
                 log("relay: context " + hex_short(id) + " FORGED (" + v.why + ")");
-                if (w.proof_from != 0) ban(w.proof_from);
+                if (w.proof_from != 0) ban(w.proof_from, "context " + hex_short(id) + " FORGED (" + v.why + ")");
                 return false;
             }
             if (v.kind == rly::CtxPow::OverCap) {  // P-13: dropped before hashing; no token; another peer may serve it
