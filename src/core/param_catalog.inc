@@ -495,6 +495,9 @@ C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "
 C2P_PARAM("embedded.doge_header_checkpoint", Embedded, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "DOGE header checkpoint H:HASH")
   C2P_ALIAS("embedded.doge_header_checkpoint", BIN_LTC, "--doge-header-checkpoint", VALUE)
 
+C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
+  C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
+
 C2P_PARAM("embedded.anchor", Embedded, STRING, RESTART, C_BCH, LIT, "", NONE, "BCH anchor H:HASH")
   C2P_ALIAS("embedded.anchor", BIN_BCH, "--anchor", VALUE)
 
