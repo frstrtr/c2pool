@@ -18,8 +18,9 @@
 //
 // The template's transactions (PR-L3):
 //   - txs with an MWEB part (the real peg-in and peg-out mempool txs) never
-//     reach it: the HogEx is its only flag-0x08 entry, every entry has inputs
-//     and outputs and no pegin output, coinbasevalue = subsidy + listed fees;
+//     reach it: the HogEx is its only flag-0x08 entry (listed with fee 0),
+//     every entry has inputs and outputs and no pegin output, coinbasevalue =
+//     subsidy + listed fees, and it passes core::coin::check_template_txs;
 //     a tx no block can carry that got into the pool anyway is dropped and
 //     counted (template_tx_dropped);
 //   - a non-empty mempool not yet cleaned for the tip (remove_for_block has
@@ -38,6 +39,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/template_txs_check.hpp>
 
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/rpc_data.hpp>
@@ -420,6 +422,11 @@ TEST(LtcTemplateHogex, MwebCarryingTxsNeverReachTheTemplate)
     EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>(), 5000000000LL + fees);
     EXPECT_EQ(fees, 6000);
     EXPECT_EQ(pool.reject_stats().template_tx_dropped.load(), 0u);
+    // The HogEx lists fee 0 (litecoind does: an empty MWEB body has no fee),
+    // and the template passes the structural check ingress runs.
+    ASSERT_TRUE(txs.back().contains("fee"));
+    EXPECT_EQ(txs.back()["fee"], 0);
+    EXPECT_FALSE(core::coin::check_template_txs(wd->m_data));
 }
 
 // A tx no block can carry that got into the pool anyway (here: past the

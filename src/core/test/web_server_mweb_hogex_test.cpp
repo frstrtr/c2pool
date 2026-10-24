@@ -48,6 +48,12 @@
 // template (cold/warm start before the first MWEB state) it is served
 // DEGRADED: work is valid for shares and merged mining, and block assembly
 // refuses every LTC block from it.
+//
+// The template-tx check (core::coin::check_template_txs) rides the same HOLD
+// at ingress and refuses at assembly: a tx without inputs (the old MWEB
+// stub) holds the previous template, is counted by code, and never reaches
+// the daemon in a block; warn mode only counts. A template the coin node
+// marked refused is held and counted under its code.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -130,6 +136,10 @@ bool ends_with(const std::string& s, const std::string& tail)
 {
     return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
 }
+
+// The 10-byte stub the old parser made of an MWEB-only tx: version | no vin |
+// no vout | locktime (its own stripped serialization).
+const std::string kStub = "02000000" "00" "00" "8c848df9";
 
 // The 80-byte header built field by field, independently of production code.
 std::vector<unsigned char> test_header(uint32_t version, const std::string& prev_hex,
@@ -540,6 +550,78 @@ TEST(LtcMwebHogex, N3_IngressRefusalHoldsPreviousTemplate)
     EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
 }
 
+// ------------------------------ template-tx check -------------------------
+
+TEST(LtcMwebHogex, TemplateTxCheckHoldsAndRefusesAtAssembly)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped), ts = txid_hex(kStub);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    stub_ref_hash(f.mi);
+    f.mi.refresh_work();
+    const auto good = f.mi.get_current_work_template();
+    ASSERT_FALSE(good.is_null());
+
+    // A tx without inputs before the HogEx: HOLD, counted by code.
+    const std::string new_prev = rep("0", 62) + "cd";
+    f.node.work_data = mweb_template({{kTx1, t1}, {kStub, ts}, {kHogex, th}}, kMweb, new_prev);
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good) << "previous template must stay (HOLD)";
+    EXPECT_TRUE(f.mi.is_mweb_holding());
+    EXPECT_FALSE(f.mi.is_work_degraded());
+    auto refusals = f.mi.get_template_tx_refusals_json();
+    EXPECT_EQ(refusals["total"], 1);
+    EXPECT_EQ(refusals["by_code"]["tx-vin-empty"], 1);
+    EXPECT_EQ(refusals["last"]["index"], 1);
+    EXPECT_EQ(refusals["last"]["txid"], ts);
+    auto stats = f.mi.rest_local_stats();
+    EXPECT_EQ(stats["template_tx_refusals"]["by_code"]["tx-vin-empty"], 1);
+    EXPECT_EQ(stats["template_tx_check"], "strict");
+
+    // A block from a job frozen with that tx never reaches the daemon.
+    Job j = make_job({kTx1, kStub, kHogex}, {t1, ts, th}, kMweb, /*mweb_active=*/true);
+    submit(f, j);
+    EXPECT_EQ(f.node.submit_calls, 0);
+    EXPECT_TRUE(f.fires.empty());
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["tx-vin-empty"], 1);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u) << "the merged-mining check still sees the share";
+
+    // Warn mode: counted and served; the block is submitted.
+    f.mi.set_template_tx_check_strict(false);
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_gbt_prevhash(), new_prev);
+    EXPECT_FALSE(f.mi.is_mweb_holding());
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["tx-vin-empty"], 2);
+    submit(f, j);
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["tx-vin-empty"], 2);
+}
+
+TEST(LtcMwebHogex, TemplateTxCheckRefusesWrongTxidAndCountsCoinRefusals)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    f.mi.refresh_work();
+    const auto good = f.mi.get_current_work_template();
+    ASSERT_FALSE(good.is_null());
+
+    // The merkle branches and shares use the template's txids.
+    f.node.work_data = mweb_template({{kTx1, rep("0", 64)}, {kHogex, th}}, kMweb, rep("0", 62) + "cd");
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["txid-mismatch"], 1);
+
+    // The embedded builder refused its own template (handed out for HOLD).
+    auto marked = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, rep("0", 62) + "ef");
+    marked[core::coin::kTemplateRefusalKey] = "mempool-not-cleaned-for-tip";
+    f.node.work_data = marked;
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["mempool-not-cleaned-for-tip"], 1);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["total"], 2);
+}
+
 // A block found on the held template builds on the previous tip: submitblock
 // still forwards it but records it as a stale race, so a daemon reject shows
 // as ORPHAN (253) instead of firing nothing.
@@ -727,4 +809,32 @@ TEST(LtcMwebHogex, DegradedAfterHoldClosesTheHoldWindow)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(f.mi.get_mweb_hold_seconds(), total) << "HOLD clock must stop";
     EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
+}
+
+// Coin-side metrics (LTC embedded: "ltc_mweb") are merged into /local_stats
+// next to the MWEB counters; a non-object result or a throwing provider
+// leaves the payload intact.
+TEST(LtcMwebHogex, CoinMetricsMergedIntoLocalStats)
+{
+    Fixture f;
+    auto stats = f.mi.rest_local_stats();
+    EXPECT_FALSE(stats.contains("ltc_mweb")) << "nothing without a provider";
+
+    f.mi.set_coin_metrics_fn([]() {
+        return nlohmann::json{{"ltc_mweb", {{"window_count", 7}, {"cmpct_received", 3}}}};
+    });
+    stats = f.mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("ltc_mweb"));
+    EXPECT_EQ(stats["ltc_mweb"]["window_count"].get<int>(), 7);
+    EXPECT_EQ(stats["ltc_mweb"]["cmpct_received"].get<int>(), 3);
+    EXPECT_TRUE(stats.contains("mweb_hold_seconds"));
+
+    f.mi.set_coin_metrics_fn([]() { return nlohmann::json::array({1, 2}); });
+    stats = f.mi.rest_local_stats();
+    EXPECT_FALSE(stats.contains("ltc_mweb"));
+    EXPECT_TRUE(stats.contains("mweb_hold_seconds"));
+
+    f.mi.set_coin_metrics_fn([]() -> nlohmann::json { throw std::runtime_error("boom"); });
+    stats = f.mi.rest_local_stats();
+    EXPECT_TRUE(stats.contains("mweb_hold_seconds")) << "a failing provider never breaks the payload";
 }
