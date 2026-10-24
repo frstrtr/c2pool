@@ -571,4 +571,13 @@ inline constexpr const char* kBlock3200601PeginKernelId = "79005b1f1cd58cb48c0da
 inline constexpr const char* kBlock3200601PegoutKernelId = "5a29886f42aa9060456ff313f18efd03bf2df4c72dd9f1c761a83c02d7e19f82";
 inline constexpr const char* kBlock3200601PegoutScript = "76a914696588177b35de99ca03c9b68284f3263d40ffc288ac";
 
+// ─── a HogEx outside a block ────────────────────────────────────────────────
+// The HogEx of 3200601: vin[0] the previous HogEx, vin[1] the pegin output
+// 92dd3109..:0; vout[0] HogAddr, vout[1] a pegout.
+// 172 B
+inline constexpr const char* kBlock3200601HogexHex =
+    "0200000000080296b8af9e749058803e12577dc70528859a3730d90a90f39159e376fdd36803cf0000000000ffffffffe1affeba95ba764c0c985dd176cf06079c1c0f96963ebba0e7c0e1f80931dd920000000000ffffffff02c5c19f889e2800002258"
+    "2029ca8d9f2a1fc2d293d9bf2f6f26a1a787fbd37ace88f4cadedd77c40217ade380c3c901000000001976a914696588177b35de99ca03c9b68284f3263d40ffc288ac0000000000";
+inline constexpr const char* kBlock3200601HogexTxid = "c6fcaa819738d022e305b876df3a6251ba0b2aa0223cdf597269d0a140cd2e8a";
+
 } // namespace ltc_mweb_tx_fixture

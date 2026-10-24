@@ -9,6 +9,18 @@
 /// for optimal block template building.
 ///
 /// Thread-safe via internal mutex.
+///
+/// Admission (Mempool::admit) keeps out every tx an embedded LTC template
+/// can never carry. Embedded c2pool emits an empty-body mw::Block and a
+/// one-in/one-out HogEx, so its blocks hold no pegin output, no pegout and no
+/// kernel, and no block tx may carry an mw::Transaction (litecoind
+/// mweb_node.cpp CheckBlock / ContextualCheckBlock / ValidateMWEBBlock):
+///   - a tx with an MWEB part (peg-in, peg-out, MWEB-to-MWEB or mixed);
+///   - a pegin output without its kernel (mweb_policy.cpp kernel-mismatch);
+///   - empty vin or vout, unless MWEB-only (consensus/tx_check.cpp);
+///   - a HogEx (valid only in a block; validation.cpp PreChecks).
+/// Children of a refused tx need no rule: their input is in neither the UTXO
+/// set nor the pool, so their fee stays unknown and they are never selected.
 
 #include "block.hpp"
 #include "transaction.hpp"
@@ -19,8 +31,11 @@
 #include <core/log.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -119,19 +134,152 @@ public:
     Mempool(const Mempool&) = delete;
     Mempool& operator=(const Mempool&) = delete;
 
+    // ─── Admission ───────────────────────────────────────────────────────
+
+    /// Why admit() refused a transaction.
+    struct Reject {
+        enum Code {
+            mweb_only,               // MWEB-to-MWEB (no canonical data, no peg kernel)
+            mweb_pegin,              // a PEGIN kernel or a pegin output
+            mweb_pegout,             // a PEGOUT kernel
+            mweb_mixed,              // canonical data and an MWEB part, no peg
+            pegin_output_no_kernel,  // a pegin output (OP_9 PUSH32) without an MWEB part
+            vin_empty,
+            vout_empty,
+            hogex,                   // a HogEx outside a block
+            malformed,               // an MWEB part that does not walk
+            duplicate,               // already in the pool
+            count
+        };
+        Code     code{malformed};
+        uint256  txid;               // litecoind's txid (an MWEB-only tx: its kernel id)
+        uint256  kernel_id;          // first kernel of the MWEB part (raw bytes), if any
+        int64_t  mweb_fee{0};        // kernel fees of the MWEB part
+        size_t   n_pegins{0};
+    };
+
+    static const char* reject_code_name(Reject::Code c) {
+        switch (c) {
+            case Reject::mweb_only:              return "mweb_only";
+            case Reject::mweb_pegin:             return "mweb_pegin";
+            case Reject::mweb_pegout:            return "mweb_pegout";
+            case Reject::mweb_mixed:             return "mweb_mixed";
+            case Reject::pegin_output_no_kernel: return "pegin_output_no_kernel";
+            case Reject::vin_empty:              return "vin_empty";
+            case Reject::vout_empty:             return "vout_empty";
+            case Reject::hogex:                  return "hogex";
+            case Reject::malformed:              return "malformed";
+            case Reject::duplicate:              return "duplicate";
+            case Reject::count:                  break;
+        }
+        return "unknown";
+    }
+
+    /// Admission counters (lock-free reads for the stats endpoint).
+    struct RejectStats {
+        std::atomic<uint64_t> by_code[Reject::count] = {};
+        std::atomic<uint64_t> admitted{0};
+        std::atomic<uint64_t> mweb_txs_seen{0};         // deliveries of txs with an MWEB part
+        std::atomic<uint64_t> mweb_fee_skipped_sat{0};  // their kernel fees
+        std::atomic<uint64_t> pegins_seen{0};           // peg-in kernels among them
+        std::atomic<uint64_t> pegouts_seen{0};          // peg-out coins among them
+        std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
+    };
+
+    /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
+    /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
+    /// pegin output without one (litecoind PreChecks refuses each of these);
+    /// then the pool's own duplicate check. Fees are computed as add_tx does.
+    std::optional<Reject> admit(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+        Reject r;
+        r.txid = compute_txid(tx);
+        auto refuse = [&](Reject::Code c) -> std::optional<Reject> {
+            r.code = c;
+            m_stats.by_code[c].fetch_add(1, std::memory_order_relaxed);
+            return r;
+        };
+
+        if (!tx.IsMWEBOnly()) {
+            if (tx.vin.empty())
+                return refuse(Reject::vin_empty);
+            if (tx.vout.empty())
+                return refuse(Reject::vout_empty);
+        }
+        if (tx.m_hogEx)
+            return refuse(Reject::hogex);
+
+        bool pegin_output = false;
+        for (const auto& out : tx.vout)
+            pegin_output = pegin_output || mweb_wire::pegin_kernel_of(out.scriptPubKey).has_value();
+
+        if (tx.HasMWEBTx()) {
+            m_stats.mweb_txs_seen.fetch_add(1, std::memory_order_relaxed);
+            auto mw = mweb_wire::summarize_mw_transaction(tx.mweb_tx_raw);
+            if (!mw)
+                return refuse(Reject::malformed);
+            r.kernel_id = mw->kernels.front().kernel_id;
+            r.mweb_fee = mw->total_fee();
+            r.n_pegins = mw->n_pegins();
+            m_stats.mweb_fee_skipped_sat.fetch_add(static_cast<uint64_t>(r.mweb_fee),
+                                                   std::memory_order_relaxed);
+            m_stats.pegins_seen.fetch_add(r.n_pegins, std::memory_order_relaxed);
+            m_stats.pegouts_seen.fetch_add(mw->n_pegouts(), std::memory_order_relaxed);
+            if (mw->has_pegin() || pegin_output)
+                return refuse(Reject::mweb_pegin);
+            if (mw->has_pegout())
+                return refuse(Reject::mweb_pegout);
+            return refuse(tx.IsMWEBOnly() ? Reject::mweb_only : Reject::mweb_mixed);
+        }
+        if (pegin_output)
+            return refuse(Reject::pegin_output_no_kernel);
+
+        if (!add_tx_unchecked(tx, utxo))
+            return refuse(Reject::duplicate);
+        m_stats.admitted.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+
+    const RejectStats& reject_stats() const { return m_stats; }
+
+    /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
+    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped"}
+    nlohmann::json reject_stats_json() const {
+        nlohmann::json rejected = nlohmann::json::object();
+        for (int c = 0; c < Reject::count; ++c)
+            rejected[reject_code_name(static_cast<Reject::Code>(c))] =
+                m_stats.by_code[c].load(std::memory_order_relaxed);
+        return {
+            {"admitted", m_stats.admitted.load(std::memory_order_relaxed)},
+            {"rejected", std::move(rejected)},
+            {"mweb_txs_seen", m_stats.mweb_txs_seen.load(std::memory_order_relaxed)},
+            {"mweb_fee_skipped_sat", m_stats.mweb_fee_skipped_sat.load(std::memory_order_relaxed)},
+            {"pegins_seen", m_stats.pegins_seen.load(std::memory_order_relaxed)},
+            {"pegouts_seen", m_stats.pegouts_seen.load(std::memory_order_relaxed)},
+            {"template_tx_dropped", m_stats.template_tx_dropped.load(std::memory_order_relaxed)},
+        };
+    }
+
     // ─── Mutation ────────────────────────────────────────────────────────
 
     /// Add a transaction to the pool (no fee computation).
-    /// Returns false if already known or if the tx is malformed.
+    /// Returns false if refused (admit) or already known.
     bool add_tx(const MutableTransaction& tx) {
         return add_tx(tx, nullptr);
     }
 
-    /// Add a transaction to the pool with optional UTXO-based fee computation.
+    /// Add a transaction to the pool with optional UTXO-based fee computation
+    /// (admit() without the reason).
+    bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+        return !admit(tx, utxo);
+    }
+
+    /// Add a transaction WITHOUT the admission rules (tests of the template
+    /// side's own checks; production code uses add_tx / admit).
     /// When utxo is non-null, computes fee = sum(input_values) - sum(output_values).
     /// Falls back to fee_known=false if any input is missing from the UTXO set
     /// or from a parent mempool transaction (chain-of-unconfirmed / CPFP).
-    bool add_tx(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+    /// Returns false if the txid is already in the pool.
+    bool add_tx_unchecked(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo = nullptr) {
         uint256 txid = compute_txid(tx);
 
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -207,8 +355,10 @@ public:
     /// Phase 2: remove mempool txs that spend the same outputs as block txs
     ///          (double-spend / conflict detection via m_spent_outputs).
     void remove_for_block(const BlockType& block) {
+        const uint256 block_hash = Hash(pack(static_cast<const BlockHeaderType&>(block)).get_span());
         std::lock_guard<std::mutex> lock(m_mutex);
         int removed = 0, conflicts = 0;
+        note_block_cleaned_locked(block_hash);
 
         // Phase 1: remove confirmed txs by txid
         for (const auto& mtx : block.m_txs) {
@@ -323,6 +473,40 @@ public:
         return sum;
     }
 
+    /// Header hash of the last block remove_for_block() ran for (null = none).
+    uint256 last_block_hash() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_last_block_hash;
+    }
+
+    /// True when remove_for_block() ran for `block_hash` (one of the last
+    /// CLEANED_BLOCKS_KEPT blocks it saw): the txs that block confirmed are
+    /// gone. Late copies of an older block or a stale sibling's body also run
+    /// through remove_for_block after the tip's, so the tip need not be the
+    /// last one.
+    bool cleaned_for(const uint256& block_hash) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return std::find(m_cleaned_blocks.begin(), m_cleaned_blocks.end(), block_hash)
+            != m_cleaned_blocks.end();
+    }
+
+    /// Unix time of the last remove_for_block() (0 = never).
+    time_t last_cleaned_time() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_last_cleaned_time;
+    }
+
+    /// What a block transaction may be: inputs and outputs, no MWEB part,
+    /// not a HogEx, no pegin output (the template side of admit()'s rules).
+    static bool block_can_carry(const MutableTransaction& tx) {
+        if (tx.vin.empty() || tx.vout.empty() || tx.HasMWEBTx() || tx.m_hogEx)
+            return false;
+        for (const auto& out : tx.vout)
+            if (mweb_wire::pegin_kernel_of(out.scriptPubKey))
+                return false;
+        return true;
+    }
+
     std::optional<MempoolEntry> get_entry(const uint256& txid) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_pool.find(txid);
@@ -401,6 +585,18 @@ public:
 
         auto* utxo = m_utxo.load();
 
+        // Belt under admit(): a tx no block can carry never joins a template,
+        // however it reached the pool. Counted per template; expected 0.
+        std::set<uint256> barred;
+        for (const auto& [txid, entry] : m_pool)
+            if (!block_can_carry(entry.tx))
+                barred.insert(txid);
+        if (!barred.empty()) {
+            m_stats.template_tx_dropped.fetch_add(barred.size(), std::memory_order_relaxed);
+            LOG_WARNING << "[EMB] Mempool: " << barred.size()
+                        << " tx(s) no block can carry kept out of the template";
+        }
+
         // Can `entry` join the template given the current selection state?
         //   - refuse if any input outpoint is already consumed (double-spend)
         //   - if an input is funded by another MEMPOOL tx (parent), that parent
@@ -413,6 +609,8 @@ public:
         //     confirmed coin we cannot see (unchanged legacy behaviour; the fee
         //     was computable, so the input resolved at add time).
         auto admissible = [&](const MempoolEntry& entry) -> bool {
+            if (barred.count(entry.txid))
+                return false;
             for (const auto& vin : entry.tx.vin) {
                 std::pair<uint256, uint32_t> op(vin.prevout.hash, vin.prevout.index);
                 if (consumed.count(op)) return false;  // intra-template double-spend
@@ -815,6 +1013,17 @@ private:
         remove_tx_locked(txid);
     }
 
+    void note_block_cleaned_locked(const uint256& block_hash) {
+        m_last_block_hash = block_hash;
+        m_last_cleaned_time = std::time(nullptr);
+        if (std::find(m_cleaned_blocks.begin(), m_cleaned_blocks.end(), block_hash)
+                == m_cleaned_blocks.end()) {
+            m_cleaned_blocks.push_back(block_hash);
+            if (m_cleaned_blocks.size() > CLEANED_BLOCKS_KEPT)
+                m_cleaned_blocks.pop_front();
+        }
+    }
+
     // ─── State ───────────────────────────────────────────────────────────
 
     mutable std::mutex m_mutex;
@@ -837,6 +1046,14 @@ private:
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
     uint32_t m_tip_height{0};           // current chain tip (for maturity checks)
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
+
+    // Blocks remove_for_block() ran for (most recent last), for cleaned_for().
+    static constexpr size_t CLEANED_BLOCKS_KEPT = 16;
+    std::deque<uint256> m_cleaned_blocks;
+    uint256 m_last_block_hash;
+    time_t  m_last_cleaned_time{0};
+
+    mutable RejectStats m_stats;   // template_tx_dropped counts in const selection
 };
 
 } // namespace coin

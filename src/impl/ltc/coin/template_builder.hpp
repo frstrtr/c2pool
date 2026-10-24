@@ -177,10 +177,14 @@ public:
     /// MWEB is active once the tracker has seen an MWEB block or the next
     /// height reaches ChainParams::mweb_activation_height; an MWEB-active
     /// template without a HogEx + mweb is never emitted.
-    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis)
-    /// or the built template fails the MWEB shape check; in the latter case the
-    /// refused template is handed out through `refused` when given (the caller
-    /// decides between HOLD and a degraded start).
+    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis),
+    /// the built template fails the MWEB shape check, or the mempool has not
+    /// been cleaned for the tip yet (its block body has not run through
+    /// Mempool::remove_for_block, so txs the tip confirmed may still be in it);
+    /// in the latter cases the refused template is handed out through
+    /// `refused` when given (the caller decides between HOLD and a degraded
+    /// start; a refusal the shape check cannot see is named under
+    /// core::coin::kTemplateRefusalKey).
     /// max_weight bounds the mempool selection (the HogEx is appended after it).
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
@@ -232,6 +236,13 @@ public:
 
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
+
+        // ── Mempool cleaned for this tip ───────────────────────────────────
+        // The txs the tip confirmed leave the pool when the tip's body runs
+        // through remove_for_block. Until then a template on the tip could
+        // carry them (bad-txns-inputs-missingorspent), whatever path brought
+        // the tip or its MWEB state first.
+        const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         auto [selected_txs, total_fees] =
@@ -373,6 +384,10 @@ public:
                 ? nullptr : &txs.back()["data"].get_ref<const std::string&>();
             refusal = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active);
         }
+        if (!refusal && !pool_cleaned) {
+            refusal = "mempool-not-cleaned-for-tip";
+            data[core::coin::kTemplateRefusalKey] = *refusal;
+        }
         if (refusal) {
             // Every refresh rebuilds the template; one ERROR per tip height.
             static std::atomic<uint32_t> s_last_refused_height{0};
@@ -442,10 +457,11 @@ public:
             m_chain, m_pool, m_testnet, m_mweb_tracker,
             TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused);
         if (!result && refused) {
-            // MWEB is active but there is no MWEB state for the next block yet
-            // (logged by the builder). Not a work failure: hand the template to
-            // refresh_work's ingress guard, which keeps the previous valid
-            // template (HOLD) or, with none, serves this one degraded. Its rules
+            // MWEB is active but there is no MWEB state for the next block yet,
+            // or the mempool is not cleaned for the tip yet (logged by the
+            // builder). Not a work failure: hand the template to refresh_work's
+            // ingress guard, which keeps the previous valid template (HOLD) or,
+            // with none, serves this one degraded. Without MWEB state its rules
             // name "mweb" and it has no mweb data, so block assembly refuses
             // every LTC block from it.
             return std::move(*refused);

@@ -101,6 +101,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # malformed MWEB parts are refused; mw::Block bodies walk exactly with
     # CompactSize lengths; a block with MWEB data in a transaction is refused
     # (unexpected-mweb-data). Same folding rule.
+    #
+    # mempool_mweb_admission_test.cpp: the embedded LTC mempool refuses what
+    # its empty-body MWEB blocks can never carry -- txs with an MWEB part
+    # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
+    # a loose HogEx -- counted by code with the kernel fees given up. Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -126,6 +132,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        mempool_mweb_admission_test.cpp
         mweb_next_header_test.cpp
         mweb_tx_wire_test.cpp
         peer_block_pow_carry_test.cpp
