@@ -717,8 +717,7 @@ private:
         // reconstructed compact block is checked the same way. Standard
         // 80-byte-header chains only: AuxPoW chains (DOGE re-parse, NMC
         // header sink) are left as they were.
-        if (standard_header_chain()
-            && ComputeTxMerkleRoot(block.m_txs) != block.m_merkle_root) {
+        if (standard_header_chain() && !block_merkle_ok(block)) {
             LOG_WARNING << "[" << m_chain_label << "] Full block "
                         << blockhash.GetHex().substr(0, 16) << "..."
                         << " FAILED the header Merkle check (txs=" << block.m_txs.size()

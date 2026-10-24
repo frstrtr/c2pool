@@ -524,6 +524,12 @@ inline std::vector<unsigned char> mweb_for_reconstruction(const CompactBlock& cb
     return cb.mweb_raw;
 }
 
+/// The header commits to these transactions. Checked on every block message
+/// before anything trusts it, as ReconstructBlock does for compact blocks.
+inline bool block_merkle_ok(const BlockType& block) {
+    return ComputeTxMerkleRoot(block.m_txs) == block.m_merkle_root;
+}
+
 /// Attempt to reconstruct a full block from a compact block + known transactions.
 /// @param cb        The received compact block.
 /// @param known_txs Map of wtxid → transaction (BIP 152 v2 uses wtxid for short ID matching).

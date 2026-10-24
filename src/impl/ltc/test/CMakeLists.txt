@@ -96,6 +96,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # forged/flipped/replayed commitments never becoming state, BIP 152 SipHash
     # keys, the 65535 limit and the sendcmpct announce order. Same folding rule.
     #
+    # cmpct_litecoind_vector_test.cpp: BIP 152 short ids, parse and re-encoding
+    # pinned to compact blocks litecoind 0.21.5.6 produced for a regtest block
+    # (ltc_regtest_cmpct_fixtures.hpp documents how). Same folding rule.
+    #
     # mweb_fetch_retry_test.cpp: the tip full-block fetch retry state machine
     # (schedule, one peer then all, cancel, re-arm, give-up cadence), the MWEB
     # window metrics and the seen-blocks LRU. Same folding rule.
@@ -118,6 +122,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         build_stops_test.cpp
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
+        cmpct_litecoind_vector_test.cpp
         cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp

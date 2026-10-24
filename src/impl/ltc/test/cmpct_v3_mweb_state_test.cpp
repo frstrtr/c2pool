@@ -22,11 +22,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <core/uint256.hpp>
@@ -545,4 +547,55 @@ TEST(LtcCmpctV3MwebState, HeaderScreenBeforeReconstruction)
     BlockHeaderType orphan = hdr;
     orphan.m_previous_block.SetHex("1111111111111111111111111111111111111111111111111111111111111111");
     EXPECT_FALSE(chain.check_header(orphan)) << "unknown parent";
+}
+
+// A HogEx prefilled anywhere but the last slot: no HogEx for reconstruction,
+// and the handler goes to the full block ("hogex-not-last").
+TEST(LtcCmpctV3MwebState, HogexNotLastFallsBackToFullBlock)
+{
+    const BlockType b = vector_block();
+    CompactBlock cb = BuildCompactBlockV3(b, 21);
+    ASSERT_EQ(cb.prefilled_txns.size(), 2u);
+    // HogEx moved to index 24, the real tx 24 prefilled after it at 25: same
+    // tx count, the HogEx is no longer the last prefilled tx.
+    cb.prefilled_txns[1].index = static_cast<uint32_t>(fx::kTxCount - 2);
+    cb.prefilled_txns.push_back(PrefilledTransaction{static_cast<uint32_t>(fx::kTxCount - 1),
+                                                     b.m_txs[fx::kTxCount - 2]});
+    cb.short_ids.pop_back();
+    cb = parse_cmpct(serialize_cmpct(cb));
+    ASSERT_EQ(cb.BlockTxCount(), fx::kTxCount);
+    EXPECT_EQ(hogex_from_cmpct(cb), nullptr);
+    const auto v = cmpct_mweb_verdict(cb, true);
+    EXPECT_EQ(v.fallback, CmpctFallback::FullBlock);
+    EXPECT_STREQ(v.reason, "hogex-not-last");
+    EXPECT_TRUE(mweb_for_reconstruction(cb).empty());
+}
+
+// Presence byte 1 with no mw::Block after it is malformed.
+TEST(LtcCmpctV3MwebState, PresenceOneWithoutBodyIsRefused)
+{
+    const BlockType b = vector_block();
+    CompactBlock cb = BuildCompactBlockV3(b, 22);
+    cb.mweb_raw.clear();                 // serializes presence 0 last
+    auto wire = serialize_cmpct(cb);
+    ASSERT_EQ(wire.back(), 0x00);
+    wire.back() = 0x01;                  // presence 1, nothing follows
+    EXPECT_THROW(parse_cmpct(wire), std::ios_base::failure);
+}
+
+// The block message check (p2p_node.hpp "block" handler): the txs must be
+// the ones the header commits to.
+TEST(LtcCmpctV3MwebState, BlockMerkleCheck)
+{
+    const BlockType b = vector_block();
+    EXPECT_TRUE(block_merkle_ok(b));
+    BlockType swapped = b;
+    std::swap(swapped.m_txs[1], swapped.m_txs[2]);
+    EXPECT_FALSE(block_merkle_ok(swapped)) << "reordered txs";
+    BlockType dropped = b;
+    dropped.m_txs.erase(dropped.m_txs.begin() + 3);
+    EXPECT_FALSE(block_merkle_ok(dropped)) << "a tx missing";
+    BlockType forged = b;
+    forged.m_txs.back().vout[0].value += 1;
+    EXPECT_FALSE(block_merkle_ok(forged)) << "a forged HogEx";
 }
