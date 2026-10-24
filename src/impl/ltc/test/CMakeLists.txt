@@ -88,6 +88,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # compact_block_mweb_relay_test.cpp: relay_mode_for (a HogEx block always
     # goes out as a full block: a v2 cmpctblock cannot carry mweb) and the
     # sendcmpct highest-version fold. Same folding rule.
+    #
+    # mweb_state_hash_binding_test.cpp: MWEB state is bound to the hash of its
+    # block; the template builder HOLDs on a sibling's state and builds the
+    # HogEx template on the tip's (real block 3200424). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -113,6 +117,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        mweb_state_hash_binding_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp

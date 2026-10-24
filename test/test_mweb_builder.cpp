@@ -51,8 +51,23 @@ MWEBState make_test_state() {
     return state;
 }
 
+/// The synthetic MWEB header make_test_mweb_raw() serializes (height 1000).
+MWEBHeader make_test_mweb_header() {
+    MWEBHeader hdr;
+    hdr.height = 1000;
+    hdr.output_root = make_uint256(0x11);
+    hdr.kernel_root = make_uint256(0x22);
+    hdr.leafset_root = make_uint256(0x33);
+    hdr.kernel_offset.fill(0x44);
+    hdr.stealth_offset.fill(0x55);
+    hdr.output_mmr_size = 500;
+    hdr.kernel_mmr_size = 200;
+    return hdr;
+}
+
 /// Build a minimal fake block with a HogEx-like last transaction.
-/// Used for MWEBTracker::update() tests.
+/// Used for MWEBTracker::update() tests. The HogAddr commits to
+/// make_test_mweb_header() (blake3), as MWEBTracker::update requires.
 BlockType make_fake_block_with_hogex(const uint256& hogex_txid_unused) {
     BlockType block;
     block.m_version = 0x20000000;
@@ -89,7 +104,8 @@ BlockType make_fake_block_with_hogex(const uint256& hogex_txid_unused) {
     hog_out.scriptPubKey.m_data.resize(34);
     hog_out.scriptPubKey.m_data[0] = 0x58;
     hog_out.scriptPubKey.m_data[1] = 0x20;
-    std::memset(hog_out.scriptPubKey.m_data.data() + 2, 0xCC, 32);
+    const uint256 mweb_hash = blake3_hash_serialized(make_test_mweb_header());
+    std::memcpy(hog_out.scriptPubKey.m_data.data() + 2, mweb_hash.data(), 32);
     hogex.vout.push_back(std::move(hog_out));
     block.m_txs.push_back(std::move(hogex));
 
@@ -99,14 +115,7 @@ BlockType make_fake_block_with_hogex(const uint256& hogex_txid_unused) {
 /// Build raw MWEB block bytes from a synthetic header.
 std::vector<unsigned char> make_test_mweb_raw() {
     MWEBBlock mweb_block;
-    mweb_block.header.height = 1000;
-    mweb_block.header.output_root = make_uint256(0x11);
-    mweb_block.header.kernel_root = make_uint256(0x22);
-    mweb_block.header.leafset_root = make_uint256(0x33);
-    mweb_block.header.kernel_offset.fill(0x44);
-    mweb_block.header.stealth_offset.fill(0x55);
-    mweb_block.header.output_mmr_size = 500;
-    mweb_block.header.kernel_mmr_size = 200;
+    mweb_block.header = make_test_mweb_header();
 
     PackStream ps;
     ps << mweb_block;

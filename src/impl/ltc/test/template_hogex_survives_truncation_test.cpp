@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -122,8 +123,9 @@ uint256 block_hash_of(const BlockHeaderType& hdr)
 constexpr uint32_t kTipHeight = 1000;
 
 // A synthetic MWEB block with header `hdr` at `height`: coinbase + HogEx whose
-// first output is the HogAddr (OP_8 PUSH32 <hash>), plus the raw empty
-// mw::Block.
+// first output is the HogAddr OP_8 PUSH32 blake3(MWEB header at `height`),
+// plus that empty mw::Block -- the commitment litecoind checks
+// (MWEBTracker::update refuses anything else).
 void feed_tracker(MWEBTracker& tracker, uint32_t height, const BlockHeaderType& hdr)
 {
     BlockType b;
@@ -149,17 +151,21 @@ void feed_tracker(MWEBTracker& tracker, uint32_t height, const BlockHeaderType& 
     hin.prevout.index = 0;
     hin.sequence = 0xffffffff;
     hog.vin.push_back(hin);
+    MWEBBlock mweb;
+    mweb.header.height = height;
+    const uint256 mweb_hash = blake3_hash_serialized(mweb.header);
     TxOut hout;
     hout.value = 123456789;
     hout.scriptPubKey.m_data.assign(34, 0x77);
     hout.scriptPubKey.m_data[0] = 0x58;  // OP_8
     hout.scriptPubKey.m_data[1] = 0x20;  // PUSH 32
+    std::memcpy(hout.scriptPubKey.m_data.data() + 2, mweb_hash.data(), 32);
     hog.vout.push_back(hout);
 
     b.m_txs = {cb, hog};
 
     PackStream ps;
-    ps << MWEBBlock{};
+    ps << mweb;
     auto sp = ps.get_span();
     std::vector<unsigned char> raw(reinterpret_cast<const unsigned char*>(sp.data()),
                                    reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
