@@ -119,6 +119,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # the daemon but still reaches the merged-mining check; a template failing
     # the shape check is refused at ingress with HOLD semantics. Same
     # fold-into-core_test reasoning as every TU here (ltc_coin already linked).
+    # template_txs_check_test.cpp: the structural check of a Litecoin
+    # template's transactions (core/coin/template_txs_check.hpp) on REAL
+    # mainnet bytes: litecoind's 3200605 template and block 3200572's peg-in
+    # pass; each rule (undecodable, unknown flags, MWEB data in a tx, empty
+    # vin/vout, HogEx not last / missing, txid, pegin outputs vs HogEx inputs,
+    # fees vs coinbasevalue) refuses the template that breaks it. Same
+    # fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -149,6 +156,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
         socket_write_queue_test.cpp
+        template_txs_check_test.cpp
         tx_advertiser_test.cpp
         version_gate_test.cpp
         web_server_config_endpoint_test.cpp

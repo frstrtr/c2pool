@@ -2,9 +2,11 @@
 #pragma once
 
 // LTC transaction types: import generic primitives from bitcoin_family,
-// extend Transaction/MutableTransaction with MWEB (HogEx flag 0x08).
+// extend Transaction/MutableTransaction with MWEB (serialization flag 0x08:
+// a HogEx, or a tx carrying an mw::Transaction).
 
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
+#include "mweb_tx_wire.hpp"
 
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
@@ -24,6 +26,14 @@ using bitcoin_family::coin::TxPrevOut;
 using bitcoin_family::coin::TxIn;
 using bitcoin_family::coin::TxOut;
 
+// Serialization modes (litecoind SERIALIZE_TRANSACTION_NO_WITNESS and
+// SERIALIZE_NO_MWEB are independent bits; MWEB data is written only together
+// with witnesses here):
+//   TX_WITH_WITNESS  witness + MWEB  -- P2P, block bodies, template "data"
+//   TX_NO_WITNESS    neither         -- txid
+//   TX_WTXID         witness only    -- wtxid
+constexpr static TxParams TX_WTXID {.allow_witness = true, .allow_mweb = false};
+
 struct MutableTransaction;
 
 class Transaction
@@ -37,6 +47,9 @@ public:
     int32_t version;
     uint32_t locktime;
     bool m_hogEx{false};  // MWEB HogEx indicator (memory-only, not in txid)
+    // The serialized mw::Transaction this tx carries (litecoind mweb_tx);
+    // empty = none. Relayed txs only: block transactions never carry one.
+    std::vector<unsigned char> mweb_tx_raw;
 
 private:
     bool m_has_witness;
@@ -55,6 +68,9 @@ public:
     }
 
     bool HasWitness() const { return m_has_witness; }
+    bool HasMWEBTx() const { return !mweb_tx_raw.empty(); }
+    /// MWEB-to-MWEB only: an MWEB part and no canonical inputs or outputs.
+    bool IsMWEBOnly() const { return HasMWEBTx() && vin.empty() && vout.empty(); }
 };
 
 /** A mutable version of Transaction. */
@@ -65,6 +81,9 @@ struct MutableTransaction
     int32_t version;
     uint32_t locktime;
     bool m_hogEx{false};  // MWEB HogEx indicator (memory-only, not in txid)
+    // The serialized mw::Transaction this tx carries (litecoind mweb_tx);
+    // empty = none. Relayed txs only: block transactions never carry one.
+    std::vector<unsigned char> mweb_tx_raw;
 
     explicit MutableTransaction();
     explicit MutableTransaction(const Transaction& tx);
@@ -90,6 +109,10 @@ struct MutableTransaction
         }
         return false;
     }
+
+    bool HasMWEBTx() const { return !mweb_tx_raw.empty(); }
+    /// MWEB-to-MWEB only: an MWEB part and no canonical inputs or outputs.
+    bool IsMWEBOnly() const { return HasMWEBTx() && vin.empty() && vout.empty(); }
 };
 
 /**
@@ -107,18 +130,22 @@ struct MutableTransaction
  * - std::vector<TxOut> vout
  * - if (flags & 1):
  *   - OPScriptWitness scriptWitness; (deserialized into TxIn)
+ * - if (flags & 8):
+ *   - uint8_t presence; 1 = an mw::Transaction follows, else none (HogEx)
  * - uint32_t locktime
  */
 template<typename StreamType, typename TxType>
 void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
-    const bool fAllowMWEB = true;
+    const bool fAllowMWEB = params.allow_witness && params.allow_mweb;
 
     s >> tx.version;
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
+    tx.mweb_tx_raw.clear();
+    tx.m_hogEx = false;
     /* Try to read the vin. In case the dummy is there, this will be read as an empty vector. */
     s >> tx.vin;
     if (tx.vin.size() == 0 && fAllowWitness) 
@@ -155,25 +182,21 @@ void UnserializeTransaction(TxType& tx, StreamType& s, const TxParams& params)
         /* The MWEB flag is present, and we support MWEB. */
         flags ^= 8;
 
-        // Read the MWEB tx (OptionalPtr: 0x00 = null, 0x01 = present)
+        // MWEB::Tx is an OptionalPtr: the mw::Transaction follows only when
+        // the presence byte is 1; any other value leaves it null
+        // (serialize.h OptionalPtr::Unserialize), which makes a HogEx.
         unsigned char mweb_presence = 0;
         s >> mweb_presence;
-        if (mweb_presence == 0x00) {
-            // Null MWEB tx — this is a HogEx transaction
+        if (mweb_presence == 0x01) {
+            // No length prefix anywhere: walk the grammar to its end, so the
+            // locktime is read from the right offset, and keep the bytes.
+            tx.mweb_tx_raw = mweb_wire::read_mw_transaction(s).raw;
+        } else {
             if (tx.vout.empty()) {
+                /* It's illegal to include a HogEx with no outputs. */
                 throw std::ios_base::failure("Missing HogEx output");
             }
             tx.m_hogEx = true;
-        } else {
-            // Non-null MWEB tx — skip the MWEB transaction data.
-            // We don't process MWEB transactions (no peg-in/peg-out support),
-            // but we must consume the bytes to keep the stream position correct.
-            // The MWEB tx is a full mw::Transaction which we skip by reading
-            // until locktime. This is safe because MWEB txs only appear in
-            // mempool relay, not in blocks (blocks use mweb_block instead).
-            // For now, just mark as non-HogEx and hope the remaining bytes
-            // are consumed correctly. In practice, MWEB txs in blocks are
-            // always null (HogEx), and mempool MWEB txs are handled separately.
         }
     }
 
@@ -189,6 +212,7 @@ template<typename StreamType, typename TxType>
 void SerializeTransaction(const TxType& tx, StreamType& s, const TxParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
+    const bool fAllowMWEB = params.allow_witness && params.allow_mweb;
 
     s << tx.version;
     unsigned char flags = 0;
@@ -200,8 +224,11 @@ void SerializeTransaction(const TxType& tx, StreamType& s, const TxParams& param
         {
             flags |= 1;
         }
-        /* Check whether MWEB flag needs to be serialized (HogEx). */
-        if (tx.m_hogEx)
+    }
+    if (fAllowMWEB)
+    {
+        /* Check whether the MWEB flag needs to be serialized (HogEx or MWEB tx). */
+        if (tx.m_hogEx || tx.HasMWEBTx())
         {
             flags |= 8;
         }
@@ -224,9 +251,14 @@ void SerializeTransaction(const TxType& tx, StreamType& s, const TxParams& param
     }
     if (flags & 8)
     {
-        /* Write null MWEB tx (OptionalPtr null = 0x00). */
-        unsigned char null_mweb = 0x00;
-        s << null_mweb;
+        /* OptionalPtr: 0x01 + the mw::Transaction, or 0x00 (HogEx). */
+        unsigned char presence = tx.HasMWEBTx() ? 0x01 : 0x00;
+        s << presence;
+        if (presence)
+        {
+            s.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(tx.mweb_tx_raw.data()), tx.mweb_tx_raw.size()));
+        }
     }
     s << tx.locktime;
 }

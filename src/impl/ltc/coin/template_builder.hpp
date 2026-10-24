@@ -25,6 +25,7 @@
 #include <core/pack.hpp>
 #include <core/log.hpp>
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/template_txs_check.hpp>
 
 #include <btclibs/util/strencodings.h>
 
@@ -177,18 +178,27 @@ public:
     /// MWEB is active once the tracker has seen an MWEB block or the next
     /// height reaches ChainParams::mweb_activation_height; an MWEB-active
     /// template without a HogEx + mweb is never emitted.
-    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis)
-    /// or the built template fails the MWEB shape check; in the latter case the
-    /// refused template is handed out through `refused` when given (the caller
-    /// decides between HOLD and a degraded start).
+    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis),
+    /// the built template fails the MWEB shape check, or the mempool has not
+    /// been cleaned for the tip yet (its block body has not run through
+    /// Mempool::remove_for_block, so txs the tip confirmed may still be in it);
+    /// in the latter cases the refused template is handed out through
+    /// `refused` when given (the caller decides between HOLD and a degraded
+    /// start; a refusal the shape check cannot see is named under
+    /// core::coin::kTemplateRefusalKey).
     /// max_weight bounds the mempool selection (the HogEx is appended after it).
+    /// The built template also passes core::coin::check_template_txs and
+    /// coinbasevalue == subsidy + listed fees (fee-reconcile); with
+    /// template_tx_check_strict a failure refuses it like the shape check,
+    /// otherwise it is logged only.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         bool               is_testnet = false,
         const MWEBTracker* mweb_tracker = nullptr,
         uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
-        std::optional<rpc::WorkData>* refused = nullptr)
+        std::optional<rpc::WorkData>* refused = nullptr,
+        bool               template_tx_check_strict = true)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -233,6 +243,13 @@ public:
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
 
+        // ── Mempool cleaned for this tip ───────────────────────────────────
+        // The txs the tip confirmed leave the pool when the tip's body runs
+        // through remove_for_block. Until then a template on the tip could
+        // carry them (bad-txns-inputs-missingorspent), whatever path brought
+        // the tip or its MWEB state first.
+        const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
+
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         auto [selected_txs, total_fees] =
             pool.get_sorted_txs_with_fees(max_weight);
@@ -251,8 +268,8 @@ public:
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
             selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
-            // wtxid = SHA256d of witness serialization (for witness merkle tree)
-            uint256     wtxid    = Hash(packed.get_span());
+            // wtxid for the witness merkle tree (litecoind GetWitnessHash)
+            uint256     wtxid    = compute_wtxid(stx.tx);
 
             nlohmann::json entry;
             entry["data"] = hex_data;
@@ -325,6 +342,7 @@ public:
                 hogex_entry["data"] = hogex_hex;
                 hogex_entry["txid"] = hogex_txid.GetHex();
                 hogex_entry["hash"] = hogex_txid.GetHex();  // HogEx: wtxid == txid (no witness)
+                hogex_entry["fee"] = 0;  // empty MWEB body: no MWEB fee (litecoind lists 0)
                 tx_array.push_back(std::move(hogex_entry));
 
                 tx_objects.push_back(Transaction(hogex));
@@ -372,6 +390,37 @@ public:
             const std::string* last_tx_hex = txs.empty()
                 ? nullptr : &txs.back()["data"].get_ref<const std::string&>();
             refusal = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active);
+        }
+        if (!refusal && !pool_cleaned) {
+            refusal = "mempool-not-cleaned-for-tip";
+            data[core::coin::kTemplateRefusalKey] = *refusal;
+        }
+        // Structural check of the transactions (what litecoind would reject
+        // the block for) and the fee total: c2pool's own selection must never
+        // yield either; refusing turns such a bug into a HOLD.
+        if (!refusal) {
+            std::optional<std::string> code, detail;
+            if (auto r = core::coin::check_template_txs(data)) {
+                code = r->code;
+                detail = "tx " + std::to_string(r->index) + " " + r->txid + ": " + r->detail;
+            } else {
+                int64_t listed = 0;
+                for (const auto& e : data["transactions"])
+                    if (e.contains("fee") && e["fee"].is_number_integer())
+                        listed += e["fee"].get<int64_t>();
+                if (static_cast<int64_t>(coinbasevalue) != static_cast<int64_t>(subsidy) + listed) {
+                    code = "fee-reconcile";
+                    detail = "coinbasevalue " + std::to_string(coinbasevalue) + " != subsidy "
+                           + std::to_string(subsidy) + " + fees " + std::to_string(listed);
+                }
+            }
+            if (code && template_tx_check_strict) {
+                refusal = *code + " (" + *detail + ")";
+                data[core::coin::kTemplateRefusalKey] = *code;
+            } else if (code) {
+                LOG_WARNING << "[EMB-LTC] TemplateBuilder: template-tx check " << *code
+                            << " at height " << next_h << " (" << *detail << ") — warn mode, served";
+            }
         }
         if (refusal) {
             // Every refresh rebuilds the template; one ERROR per tip height.
@@ -440,14 +489,17 @@ public:
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker,
-            TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused);
+            TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused,
+            m_template_tx_check_strict.load(std::memory_order_relaxed));
         if (!result && refused) {
-            // MWEB is active but there is no MWEB state for the next block yet
-            // (logged by the builder). Not a work failure: hand the template to
-            // refresh_work's ingress guard, which keeps the previous valid
-            // template (HOLD) or, with none, serves this one degraded. Its rules
-            // name "mweb" and it has no mweb data, so block assembly refuses
-            // every LTC block from it.
+            // MWEB is active but there is no MWEB state for the next block yet,
+            // the mempool is not cleaned for the tip yet, or the template fails
+            // the template-tx check (logged by the builder). Not a work
+            // failure: hand the template to refresh_work's ingress guard,
+            // which keeps the previous valid template (HOLD) or, with none,
+            // serves this one degraded. Without MWEB state its rules name
+            // "mweb" and it has no mweb data, so block assembly refuses every
+            // LTC block from it.
             return std::move(*refused);
         }
         if (!result) {
@@ -489,6 +541,12 @@ public:
     /// enough depth for coinbase maturity validation (100 blocks for LTC).
     void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
 
+    /// Template-tx check mode for the built templates (see build_template):
+    /// strict refuses, warn logs only (config template_tx_check).
+    void set_template_tx_check_strict(bool strict) {
+        m_template_tx_check_strict.store(strict, std::memory_order_relaxed);
+    }
+
     bool is_synced() const override {
         if (!m_chain.is_synced()) return false;
         if (m_utxo_ready && !m_utxo_ready()) return false;
@@ -501,6 +559,7 @@ private:
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
+    std::atomic<bool> m_template_tx_check_strict{true};
 };
 
 } // namespace coin

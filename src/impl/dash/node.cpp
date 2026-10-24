@@ -747,9 +747,10 @@ dash::SupersedeHint NodeImpl::gate_supersede_convergence(dash::SupersedeHint hin
 
 void NodeImpl::run_think()
 {
-    // THREAD-CONFINEMENT (enforced, not assumed — register_template_txs
-    // precedent): the think-slot flags (m_think_running / m_rethink_pending)
-    // are IO-thread-only. Every caller is on the single ioc.run() thread: the
+    // THREAD-CONFINEMENT (asserted in debug builds, not assumed —
+    // register_template_txs precedent; the assert compiles out in Release):
+    // the think-slot flags (m_think_running / m_rethink_pending) are
+    // IO-thread-only. Every caller is on the single ioc.run() thread: the
     // mint hook (add_local_share), the reception path (add_verified_shares,
     // which posts itself back to m_context after the verify pool), the 2 s
     // advert drain, and both cycles' IO-phase epilogues. The compute thread
@@ -774,10 +775,13 @@ void NodeImpl::run_think()
             LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (re-think queued)";
         return;
     }
+    // #857: from here every exit releases the slot unless commit() hands it
+    // to the posted cycle — a throwing post() can no longer leak it.
+    dash::think::ThinkSlotGuard slot(m_think_running, m_rethink_pending);
     if (!m_context) {
         // Rig-free (KAT/standalone) node: no IO context to hop back to, so
-        // there is nowhere to post a queued re-think either — drop it.
-        (void)dash::think::release_think_slot(m_think_running, m_rethink_pending);
+        // there is nowhere to post a queued re-think either — the guard
+        // releases and drops it.
         return;
     }
 
@@ -876,6 +880,13 @@ void NodeImpl::run_think()
           // escaping this handler would propagate out of ioc.run() and
           // TERMINATE the node (Exit 134) — e.g. a chain-walk throw over a
           // fragmented/unrooted restart chain. Catch, log, and keep serving.
+          //
+          // #857: this handler owns the slot the prologue committed to the
+          // cycle. The guard releases it exactly once — in the try below, in a
+          // catch, or on scope exit — so a throw anywhere here, including from
+          // the re-post after a successful release, cannot leak it or release
+          // it twice.
+          dash::think::ThinkSlotGuard io_slot(m_think_running, m_rethink_pending);
           try {
             // Ban peers that provided invalid/unverifiable shares (btc
             // node.cpp:1585-1603 port). Whitelisted bootstrap seeds are
@@ -946,27 +957,27 @@ void NodeImpl::run_think()
 
             drain_pending_adds();
 
-            // #854: release_think_slot() reports whether a run_think() request
-            // was dropped while this cycle held the slot — e.g. the mint that
+            // #854: the release reports whether a run_think() request was
+            // dropped while this cycle held the slot — e.g. the mint that
             // drain_pending_adds()/add_local_share() just landed. Serve it, or
             // that share's election (and the miner notify it drives) is lost
             // until the next timer tick.
-            const bool rethink_owed =
-                dash::think::release_think_slot(m_think_running, m_rethink_pending);
+            const bool rethink_owed = io_slot.release();
 
             if (needs_continue || rethink_owed)
                 boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
-            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+            if (io_slot.release())   // no-op if the try already released
                 boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
-            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+            if (io_slot.release())
                 boost::asio::post(*m_context, [this]() { run_think(); });
           }
         });
     });
+    slot.commit();   // the cycle's IO-phase now owns the slot
 }
 
 void NodeImpl::drain_pending_adds()
@@ -1282,6 +1293,10 @@ void NodeImpl::clean_tracker()
         m_clean_running.store(false);
         return;
     }
+    // #857: a throwing post() below releases both the slot and
+    // m_clean_running instead of denying every later think and clean.
+    dash::think::ThinkSlotGuard slot(m_think_running, m_rethink_pending,
+                                     &m_clean_running);
 
     // Post the entire body to the compute thread: chain modifications happen
     // under the exclusive lock, never concurrent with think() or IO reads.
@@ -1505,6 +1520,10 @@ void NodeImpl::clean_tracker()
       }
       // Lock released — IO-phase: work refresh + drain, no lock held.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
+        // #857: owns the committed slot and m_clean_running; released once,
+        // below or on scope exit.
+        dash::think::ThinkSlotGuard io_slot(m_think_running, m_rethink_pending,
+                                            &m_clean_running);
         try {
             if (clean_best_changed) {
                 LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
@@ -1525,13 +1544,12 @@ void NodeImpl::clean_tracker()
         // #854: the clean cycle holds the think slot too, so run_think()
         // requests that arrived during it (a mint, a peer best-advert) were
         // queued rather than dropped — serve them now.
-        const bool rethink_owed =
-            dash::think::release_think_slot(m_think_running, m_rethink_pending);
-        m_clean_running.store(false);
+        const bool rethink_owed = io_slot.release();   // slot, then m_clean_running
         if (rethink_owed)
             boost::asio::post(*m_context, [this]() { run_think(); });
       });
     });
+    slot.commit();   // the clean cycle's IO-phase now owns the slot
 }
 
 uint256 NodeImpl::best_share_hash()

@@ -2457,10 +2457,10 @@ int main(int argc, char** argv) {
                                 {"reaskrelay", reaskrelay, 28},
                                 {"joinrx", joinrx, 27},
                                 {"keycache", keycache, 17},
-                                {"sidekeep", sidekeep, 0},
-                                {"sidedeep", sidedeep, 9},
-                                {"sideempty", sideempty, 0},
-                                {"sideoffer", sideoffer, 0},
+                                {"sidekeep", sidekeep, 1},
+                                {"sidedeep", sidedeep, 40},
+                                {"sideempty", sideempty, 1},
+                                {"sideoffer", sideoffer, 1},
                         },
                         argc, argv);
 }
