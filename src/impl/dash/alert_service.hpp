@@ -258,6 +258,9 @@ public:
     const Counters& counters() const { return m_c; }
     const std::map<uint64_t, PendingEvent>& pending() const { return m_pending; }
     const AlertDetector& detector() const { return m_detector; }
+    // Origin: per-address sharechain activity for the detector's RETURNED
+    // rule (a worker that moved to another node is not paged here).
+    void set_address_activity(AddressActivityFn fn) { m_detector.set_address_activity(std::move(fn)); }
     const NodeAlertSeen& seen() const { return m_seen; }
     const std::optional<KeyPair>& keys() const { return m_keys; }
     FileWriter& io() { return *m_io; }

@@ -55,7 +55,7 @@ wiring it to this transport is a follow-up.
 | `--alert-relay-online-after S` | back this long ⇒ BACK_ONLINE | 60 |
 | `--alert-relay-min-interval S` | min gap between OFFLINE alerts per worker | 600 |
 | `--alert-relay-startup-grace S` | no OFFLINE right after start | 600 |
-| `--alert-relay-stall-after S` | connected but no accepted share this long ⇒ down (0 = off) | 900 |
+| `--alert-relay-stall-after S` | connected but no accepted share this long ⇒ down (0 = presence only: a connection is up) | 900 |
 | `--alert-relay-retry-every S` | retransmit an unacked alert | 60 |
 | `--alert-relay-retry-max N` | total transmissions before "undelivered" | 60 |
 
@@ -64,17 +64,42 @@ wiring it to this transport is a follow-up.
 Every 5 s the node samples the same per-session stratum registry that feeds
 `/local_stats` (`DASHWorkSource::get_stratum_workers()`), keyed `ADDRESS.worker`.
 A worker is **up** while at least one session maps to its key and (if the stall
-check is on) it produced live evidence — a new session or an advancing accepted
-counter — within `stall-after`. Hashrate is not used as evidence: it is a 1000 s
-sliding average that keeps a dead rig "alive" for ~17 minutes.
+check is on) it produced live evidence — an advancing accepted-share counter —
+within `stall-after`. A connection alone is not evidence: all nodes are peers,
+and a rig keeps a failover (standby) connection to a node it does not mine on.
+With `stall-after 0` the check is off and a connection counts as up (presence
+only). Hashrate is not used as evidence: it is a 1000 s sliding average that
+keeps a dead rig "alive" for ~17 minutes.
+
+- **Standby.** A worker that never shared on this node is never paged: on
+  connect, flap, disconnect or after a restart (it is not persisted).
+- **Mining on another node.** A worker that hashed here and then went down
+  (disconnected, or connected but stalled) is not paged when its payout address
+  has a share minted on another node (received from a pool peer) more than
+  60 s after the worker's last share here and within the last 900 s, while no
+  worker of that address is up here. It becomes standby here; the node it now
+  mines on is the one that pages if it dies. The sharechain is read through
+  the tracker's try-lock (newest peer-received share per address over the last
+  400 shares) and cached for 30 s; a cache older than 120 s counts as
+  unreadable, and the decision then waits up to 120 s more before it pages.
+  Share times come from the minting node's clock (NTP-synced peers assumed).
+- Shares carry the payout address, not the worker name. With rigs of one
+  address on two nodes, a hung rig here is masked while none of its siblings
+  hashes here, and a rig that returned to its first pool is paged while a
+  sibling still hashes here. The dashboard shows each rig's own state.
+- Upgrade: an older build persisted standby workers too. Restored entries are
+  treated as rigs that hashed here; one that reconnects and never shares is
+  paged once at the end of the startup grace unless it is mining on another
+  node. Clear `workers` in `state.json` on a node that ran with standby rigs to
+  start clean.
 
 - OFFLINE fires after `offline-after` continuous seconds down, never inside the
   startup grace, and at most once per `min-interval` per worker.
 - BACK_ONLINE fires only after an emitted OFFLINE, once the worker has been up
   for `online-after`.
-- A worker never seen up never alerts. Known workers (and whether an OFFLINE is
-  outstanding) persist in `state.json`, so a restart neither forgets a rig that
-  never reconnects nor re-pages one already reported.
+- A worker never seen up never alerts. Known workers that hashed here (and
+  whether an OFFLINE is outstanding) persist in `state.json`, so a restart
+  neither forgets a rig that never reconnects nor re-pages one already reported.
 - Global cap: 30 events per rolling hour; the first refused event produces one
   digest message and refused events stay pending (they fire when the window frees).
 

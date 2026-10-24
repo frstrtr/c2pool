@@ -190,6 +190,7 @@ struct JobSnapshot {
     std::vector<std::string> merkle_branches;
     std::shared_ptr<const std::vector<std::string>> tx_data;   // raw tx hex from GBT (a1: shared/lazy)
     std::string mweb;                    // empty for non-MWEB coins
+    bool        mweb_active{false};      // template rules named MWEB (frozen with mweb)
     bool        segwit_active{false};
     uint256     prev_share_hash;  // share chain tip when this job was built
     uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
@@ -208,6 +209,7 @@ struct JobSnapshot {
 struct WorkSnapshot {
     bool segwit_active{false};
     std::string mweb;             // empty for non-MWEB coins
+    bool mweb_active{false};      // template rules named MWEB (frozen with mweb)
     uint64_t subsidy{0};
     std::string witness_commitment_hex;
     uint256 witness_root;
@@ -256,6 +258,9 @@ struct WorkerInfo {
     std::chrono::steady_clock::time_point connected_at;
     std::string remote_endpoint;  // "ip:port"
     double rtt_ms{0.0};           // TCP round-trip latency in ms (Linux tcpi_rtt); 0 = unknown / non-Linux
+    // When `accepted` last moved; default = no accepted share on this
+    // connection (or a registry that does not stamp it).
+    std::chrono::steady_clock::time_point last_accepted_at;
 };
 
 }  // namespace core::stratum

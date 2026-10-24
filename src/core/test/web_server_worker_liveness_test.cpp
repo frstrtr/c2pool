@@ -172,3 +172,111 @@ TEST(WorkerLiveness, SilentListGroupsByWorkerAndSorts) {
     EXPECT_EQ(out[1]["silent_seconds"], 1000);
     EXPECT_EQ(out[1]["connections"], 2);
 }
+
+// All nodes are peers: a rig may hold a failover connection to a node while it
+// hashes on another. Never sharing on a connection is "standby" (normal);
+// sharing and then going silent is "stalled" (a rig problem).
+TEST(WorkerLiveness, SessionStateSeparatesStandbyFromStalled) {
+    const auto now = Clock::now();
+    // Connected an hour ago, never shared: standby, even though silent.
+    auto never = MiningInterface::classify_worker_liveness(
+        worker(now - seconds(3600)), std::nullopt, now);
+    ASSERT_TRUE(never.silent);
+    EXPECT_STREQ(MiningInterface::session_state(never), "standby");
+    // Fresh connection, no share yet: standby.
+    EXPECT_STREQ(MiningInterface::session_state(MiningInterface::classify_worker_liveness(
+                     worker(now - seconds(10)), std::nullopt, now)),
+                 "standby");
+    // Shared 10 s ago: hashing.
+    EXPECT_STREQ(MiningInterface::session_state(MiningInterface::classify_worker_liveness(
+                     worker(now - seconds(3600), 0.0, 1.0, 5), now - seconds(10), now)),
+                 "hashing");
+    // Shared, then silent past the threshold: stalled.
+    auto stalled = MiningInterface::classify_worker_liveness(
+        worker(now - seconds(7200), 0.0, 1.0, 5), now - seconds(3600), now);
+    ASSERT_TRUE(stalled.silent);
+    EXPECT_STREQ(MiningInterface::session_state(stalled), "stalled");
+}
+
+// /stratum_stats and /local_stats carry the state, per worker and as counts. A
+// failover connection that never shared is standby, not a silent fault.
+TEST(WorkerLiveness, StatsReportHashingAndStandbySessions) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    mi.register_stratum_worker("failover", worker(now - seconds(3600)));   // D2, never shares
+    auto hasher = worker(now - seconds(3600));
+    hasher.worker_name = "D4";
+    mi.register_stratum_worker("hasher", hasher);
+    mi.update_stratum_worker("hasher", 1e9, 0.0, 1.0, 10, 0, 0);
+
+    auto s = mi.rest_stratum_stats();
+    EXPECT_EQ(s["pool"]["connections_hashing"], 1);
+    EXPECT_EQ(s["pool"]["connections_standby"], 1);
+    EXPECT_EQ(s["pool"]["connections_stalled"], 0);
+    const auto& d2 = s["workers"]["XaddrD9.D2"];
+    EXPECT_EQ(d2["state"], "standby");
+    EXPECT_FALSE(d2["ever_submitted"].get<bool>());
+    EXPECT_TRUE(d2["last_share_age_s"].is_null());
+    const auto& d4 = s["workers"]["XaddrD9.D4"];
+    EXPECT_EQ(d4["state"], "hashing");
+    EXPECT_TRUE(d4["ever_submitted"].get<bool>());
+    ASSERT_TRUE(d4["last_share_age_s"].is_number());
+    EXPECT_LT(d4["last_share_age_s"].get<int64_t>(), 5);
+
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["stratum_sessions"]["hashing"], 1);
+    EXPECT_EQ(r["stratum_sessions"]["standby"], 1);
+    EXPECT_EQ(r["stratum_sessions"]["stalled"], 0);
+    ASSERT_EQ(r["workers_silent"].size(), 1u);
+    EXPECT_EQ(r["workers_silent"][0]["state"], "standby");
+}
+
+// A worker with a hashing connection and a failover connection reads hashing.
+TEST(WorkerLiveness, WorkerStateTakesItsMostActiveConnection) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    mi.register_stratum_worker("a-idle", worker(now - seconds(3600)));
+    mi.register_stratum_worker("b-live", worker(now - seconds(3600)));
+    mi.update_stratum_worker("b-live", 1e9, 0.0, 1.0, 7, 0, 0);
+
+    auto s = mi.rest_stratum_stats();
+    const auto& d2 = s["workers"]["XaddrD9.D2"];
+    EXPECT_EQ(d2["connections"], 2);
+    EXPECT_EQ(d2["state"], "hashing");
+    EXPECT_TRUE(d2["ever_submitted"].get<bool>());
+}
+
+// The registry stamps when `accepted` moved, so the share age is exact rather
+// than the time of the poll that first saw the counter (a session first seen
+// with shares was stamped "now" and read hashing however long it had stalled).
+TEST(WorkerLiveness, ShareAgeComesFromTheRegistryStamp) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    auto w = worker(now - seconds(7200), 0.0, 1.0, 5);
+    w.last_accepted_at = now - seconds(3600);
+    mi.register_stratum_worker("s", w);
+
+    auto s = mi.rest_stratum_stats();
+    const auto& d2 = s["workers"]["XaddrD9.D2"];
+    EXPECT_EQ(d2["state"], "stalled")
+        << "first poll of a session whose last share is an hour old";
+    EXPECT_GE(d2["last_share_age_s"].get<int64_t>(), 3600);
+}
+
+// update_stratum_worker stamps the time only when `accepted` advances.
+TEST(WorkerLiveness, UpdateStampsLastAcceptedOnlyOnAdvance) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.register_stratum_worker("s", worker(Clock::now() - seconds(60)));
+    mi.update_stratum_worker("s", 1e9, 0.0, 1.0, 0, 1, 0);   // a reject only
+    EXPECT_EQ(mi.get_stratum_workers().at("s").last_accepted_at, Clock::time_point{});
+    const auto before = Clock::now();
+    mi.update_stratum_worker("s", 1e9, 0.0, 1.0, 1, 1, 0);
+    const auto stamped = mi.get_stratum_workers().at("s").last_accepted_at;
+    EXPECT_GE(stamped, before);
+    mi.update_stratum_worker("s", 1e9, 0.0, 2.0, 1, 2, 0);   // no new accept
+    EXPECT_EQ(mi.get_stratum_workers().at("s").last_accepted_at, stamped);
+}

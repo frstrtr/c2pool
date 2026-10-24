@@ -93,6 +93,9 @@ inline LTCChainParams make_ltc_chain_params_mainnet() {
     p.no_retargeting = false;
     p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     p.genesis_hash.SetHex("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2");
+    // MWEB (LIP-0002/3/4): nStartHeight 2217600, active from 2217600 + 6 x 8064.
+    // Block 2265984 is the first mainnet block whose last tx is a HogEx.
+    p.mweb_activation_height = 2265984;
     p.halving_interval = 840000;
     p.initial_subsidy = 5000000000ULL;
     p.pow_func = core::pow::scrypt;
@@ -108,6 +111,9 @@ inline LTCChainParams make_ltc_chain_params_testnet() {
     p.no_retargeting = false;
     p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
+    // MWEB: nStartHeight 2209536, active from 2209536 + 3 x 2016. Block 2215584
+    // is the first testnet4 block whose last tx is a HogEx.
+    p.mweb_activation_height = 2215584;
     p.halving_interval = 840000;
     p.initial_subsidy = 5000000000ULL;
     p.pow_func = core::pow::scrypt;
