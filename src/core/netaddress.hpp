@@ -51,6 +51,21 @@ namespace core
 
     /// Test/reset hook. Not called from production paths.
     void clear_resolved_hosts();
+
+    // ── Dial-family memo (#965 Phase-3) ──────────────────────────────────────
+    // Which address family last COMPLETED an outbound connect to `host`, so the
+    // next dial to a dual-family name leads with it (core/dial.hpp). Kept apart
+    // from the memo above on purpose: that one feeds the WIRE (A records only,
+    // see wire_ipv4_literal); this one only reorders our own dial attempts and
+    // never reaches a peer. Written only for mixed-family dials; literals are
+    // never stored.
+    enum class DialFamily { V4, V6 };
+
+    void record_dial_family(const std::string& host, DialFamily family);
+    std::optional<DialFamily> preferred_dial_family(const std::string& host);
+
+    /// Test/reset hook. Not called from production paths.
+    void clear_dial_families();
 }
 
 inline auto parse_address(std::string_view address_spec, std::string_view default_service = "https")

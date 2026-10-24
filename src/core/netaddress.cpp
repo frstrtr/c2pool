@@ -38,6 +38,18 @@ namespace
         return m;
     }
 
+    std::shared_mutex& dial_families_mutex()
+    {
+        static std::shared_mutex m;
+        return m;
+    }
+
+    std::unordered_map<std::string, core::DialFamily>& dial_families()
+    {
+        static std::unordered_map<std::string, core::DialFamily> m;
+        return m;
+    }
+
     bool is_numeric_address(const std::string& s)
     {
         boost::system::error_code ec;
@@ -102,6 +114,43 @@ void clear_resolved_hosts()
 {
     std::unique_lock lock(resolved_hosts_mutex());
     resolved_hosts().clear();
+}
+
+void record_dial_family(const std::string& host, DialFamily family)
+{
+    if (host.empty() || is_numeric_address(host))
+        return;
+
+    std::unique_lock lock(dial_families_mutex());
+    auto& map = dial_families();
+
+    auto it = map.find(host);
+    if (it != map.end())
+    {
+        it->second = family;
+        return;
+    }
+    // Same ceiling as the resolved-host memo, same reason. A full memo only
+    // costs the prior-success hint, never a dial.
+    if (map.size() >= MAX_RESOLVED_HOSTS)
+        return;
+    map.emplace(host, family);
+}
+
+std::optional<DialFamily> preferred_dial_family(const std::string& host)
+{
+    std::shared_lock lock(dial_families_mutex());
+    const auto& map = dial_families();
+    auto it = map.find(host);
+    if (it == map.end())
+        return std::nullopt;
+    return it->second;
+}
+
+void clear_dial_families()
+{
+    std::unique_lock lock(dial_families_mutex());
+    dial_families().clear();
 }
 
 } // namespace core
