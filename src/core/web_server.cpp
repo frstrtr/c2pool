@@ -5432,6 +5432,19 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
 
+    // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
+    // compact-block and full-block fetch counters).
+    if (m_coin_metrics_fn) {
+        try {
+            const nlohmann::json extra = m_coin_metrics_fn();
+            if (extra.is_object())
+                for (auto it = extra.begin(); it != extra.end(); ++it)
+                    result[it.key()] = it.value();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[Stats] coin metrics unavailable: " << e.what();
+        }
+    }
+
     return result;
 }
 

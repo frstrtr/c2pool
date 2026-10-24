@@ -917,6 +917,13 @@ public:
     bool is_work_degraded() const { return m_work_degraded.load(std::memory_order_relaxed); }
     // True while refresh_work holds the previous template (MWEB HOLD).
     bool is_mweb_holding() const { return m_mweb_hold_since_ms.load(std::memory_order_relaxed) != 0; }
+
+    // Coin-side metrics merged into /local_stats next to the MWEB counters
+    // above: the function returns a JSON object whose keys are copied into
+    // the payload (LTC embedded: {"ltc_mweb": {...}}). Called from whichever
+    // thread serves the request, so it must read thread-safe state only.
+    using coin_metrics_fn_t = std::function<nlohmann::json()>;
+    void set_coin_metrics_fn(coin_metrics_fn_t fn) { m_coin_metrics_fn = std::move(fn); }
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
@@ -1637,6 +1644,8 @@ private:
     std::atomic<int64_t>  m_mweb_hold_total_ms{0};
     // The cached template failed the shape check (served degraded).
     std::atomic<bool>     m_work_degraded{false};
+    // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
+    coin_metrics_fn_t     m_coin_metrics_fn;
 
     // Share creation hook
     create_share_fn_t m_create_share_fn;

@@ -96,6 +96,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # forged/flipped/replayed commitments never becoming state, BIP 152 SipHash
     # keys, the 65535 limit and the sendcmpct announce order. Same folding rule.
     #
+    # mweb_fetch_retry_test.cpp: the tip full-block fetch retry state machine
+    # (schedule, one peer then all, cancel, re-arm, give-up cadence), the MWEB
+    # window metrics and the seen-blocks LRU. Same folding rule.
+    #
     # mweb_state_hash_binding_test.cpp: MWEB state is bound to the hash of its
     # block; the template builder HOLDs on a sibling's state and builds the
     # HogEx template on the tip's (real block 3200424). Same folding rule.
@@ -125,6 +129,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        mweb_fetch_retry_test.cpp
         mweb_state_hash_binding_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
