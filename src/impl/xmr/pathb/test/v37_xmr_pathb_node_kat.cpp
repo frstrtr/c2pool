@@ -9057,7 +9057,8 @@ void hp_crawl() {
 // server) completes. (b) deferred store 16, receipt park 6: 16 junk receipts wait (10 of them tied to receipts the park
 // dropped); the 17th: the entries of the dropped receipts leave, the queue holds the parked receipts' requests only.
 // (c) the deferrals: the catch-up keeps one; tip deferrals within P-47, those whose objects no longer wait leaving
-// first.
+// first. (d) receipt park 6: 20,000 junk receipts with one unknown tip (distinct nonces): one waiting request; the
+// objects it carries at most the parked ones.
 void hp_qbound() {
     const KatNet net;
     const auto junk = [](const pb::ReceiptBodyV3& base, std::uint32_t k) {
@@ -9171,6 +9172,36 @@ void hp_qbound() {
         check(d16 == 16 && d17 == 1 && d37 == 16 && dc == 1,
               "hp_qbound (c): tip deferrals within P-47 (those whose objects no longer wait leave first); the catch-up "
               "keeps one deferral");
+    }
+    {
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& cf) { cf.pending_cap = 6; });
+        std::optional<pb::ReceiptBodyV3> base;
+        const bool ok = retired_b(h, w, a, b, base);
+        pb::PathbRelayNode& rb = *b.relay;
+        const std::uint64_t pa = w.id(b.node, a.node);
+        std::size_t peak = 0, peak_parked = 0;
+        bool within = true;
+        for (std::uint32_t k = 0; ok && k < 20000; ++k) {
+            pb::ReceiptBodyV3 r = *base;
+            r.side.tip.fill(0x6D);
+            r.blob.nonce = 50000 + k;
+            rb.receive(pa, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{r}, pb::kRuledLaneParams));
+            w.run();
+            const std::size_t objs = rb.header_waiting_objects(pa), parked = rb.parked_receipts() + h[b.node].deferred().size();
+            peak = std::max(peak, objs);
+            peak_parked = std::max(peak_parked, parked);
+            within = within && objs <= parked;
+        }
+        std::printf("  hp_qbound (d): 20,000 junk receipts, one tip: waiting %zu, objects %zu (peak %zu), parked %zu (peak %zu); "
+                    "strikes %llu, bans %llu\n",
+                    rb.header_waiting(pa), rb.header_waiting_objects(pa), peak, rb.parked_receipts(), peak_parked,
+                    (unsigned long long)rb.strikes_of(pa), (unsigned long long)rb.stats().bans.load());
+        check(ok && rb.header_waiting(pa) == 1 && within && peak <= 7 && rb.strikes_of(pa) == 0 && rb.stats().bans.load() == 0,
+              "hp_qbound (d): one waiting request for one tip; the objects it carries at most the parked ones (peak " +
+                      std::to_string(peak) + "); 0 strikes, 0 bans");
     }
 }
 

@@ -883,6 +883,15 @@ public:
         const auto it = header_wants_.find(peer);
         return it == header_wants_.end() ? 0 : it->second.size();
     }
+    // KAT hook: the parked objects the waiting header requests of `peer` carry.
+    std::size_t header_waiting_objects(std::uint64_t peer) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = header_wants_.find(peer);
+        std::size_t n = 0;
+        if (it != header_wants_.end())
+            for (const HdrWant& w : it->second) n += w.objs.ids.size();
+        return n;
+    }
     // KAT hooks: a header request of `peer` deferred on the P_r `fetch` (under `owner`, for `object`); the deferrals of
     // `peer` (of `owner`).
     void test_defer_headers(std::uint64_t peer, PathbNode::HeaderOwner owner, const Hash32& from, const Hash32& stop,
@@ -894,7 +903,7 @@ public:
         w.from = from;
         w.stop = stop;
         w.fetch = fetch;
-        if (object) w.objs.insert(*object);
+        if (object) w.objs.add(*object);
         note_ctx_locked(peer, w);
     }
     std::size_t header_deferred(std::uint64_t peer, PathbNode::HeaderOwner owner) const {
@@ -1140,17 +1149,31 @@ private:
         std::uint64_t fetch_ms = 0;      // ... and its time
     };
     // A header request waiting for its peer's slot (one in flight per peer), served oldest first when the slot frees.
+    // The parked objects (frame digests, receipt keys) waiting on a tip-header entry, in the order they came.
+    struct TipObjects {
+        std::set<Hash32> ids;
+        std::deque<Hash32> order;
+        bool tied = false;  // an object came (an entry made with none is not tied)
+        void add(const Hash32& o) {
+            tied = true;
+            if (ids.insert(o).second) order.push_back(o);
+        }
+        void add(const TipObjects& t) {
+            tied = tied || t.tied;
+            for (const Hash32& o : t.order) add(o);
+        }
+    };
     struct HdrWant {
         PathbNode::HeaderOwner owner = PathbNode::HeaderOwner::Tip;
         Hash32 from{};
         Hash32 stop{};
-        std::set<Hash32> objs;  // the parked objects waiting on it (frame digests, receipt keys)
+        TipObjects objs;  // the parked objects waiting on it
     };
     // The tip-header request in flight to a peer and the objects it serves (its deferral takes them).
     struct HdrSent {
         Hash32 from{};
         Hash32 stop{};
-        std::set<Hash32> objs;
+        TipObjects objs;
     };
     // A catch-up or headers-first request deferred on a P_r: asked again once that P_r resolves, under its owner.
     struct HdrOnCtx {
@@ -1161,7 +1184,7 @@ private:
         Missing cause = Missing::MoneroBlock;  // its input: the block resolved, or (the floor reading) its weights
         std::uint64_t since_ms = 0;   // the first DEFER on this P_r
         bool offered = false;         // the peer's tip offered to the joiner for it (a store not caught up)
-        std::set<Hash32> objs;        // a tip request's: the parked objects waiting on it
+        TipObjects objs;              // a tip request's: the parked objects waiting on it
     };
     struct CtxWant {
         std::uint64_t from = 0;
@@ -2031,8 +2054,8 @@ private:
             from = node_->store().best_at(b.pos > j0 ? b.pos - j0 : 0).value_or(b.id);
         }
         if (node_->tree().find(from) == nullptr) return;
-        std::set<Hash32> objs;
-        if (object) objs.insert(*object);
+        TipObjects objs;
+        if (object) objs.add(*object);
         std::lock_guard<std::mutex> lk(cumtx_);
         want_headers_locked(peer, PathbNode::HeaderOwner::Tip, from, stop, objs);
     }
@@ -2041,10 +2064,26 @@ private:
     // Under the node lock: an entry tied to objects none of which still waits (an entry with none is not tied).
     template <class E>
     bool objects_gone_locked(const E& e) const {
-        if (e.objs.empty()) return false;
-        for (const Hash32& o : e.objs)
+        if (!e.objs.tied) return false;
+        for (const Hash32& o : e.objs.order)
             if (object_waits_locked(o)) return false;
         return true;
+    }
+    // Under the node lock: the objects of `t` that no longer wait leave, the oldest first while they are gone, and all
+    // of them when more remain than the node holds parked (its deferred frames and parked receipts).
+    void prune_objects_locked(TipObjects& t) const {
+        while (!t.order.empty() && !object_waits_locked(t.order.front())) {
+            t.ids.erase(t.order.front());
+            t.order.pop_front();
+        }
+        if (t.ids.size() <= node_->deferred().size() + parked_receipts_.size()) return;
+        std::deque<Hash32> keep;
+        for (const Hash32& o : t.order)
+            if (object_waits_locked(o))
+                keep.push_back(o);
+            else
+                t.ids.erase(o);
+        t.order.swap(keep);
     }
     // Under the node lock and cumtx_: room for one more tip-header entry of a peer (its waiting requests or its
     // deferrals): at P-47 (the deferred store's cap) the tip entries whose objects no longer wait leave, then the
@@ -2068,21 +2107,27 @@ private:
     // stop) open or waiting takes it (merged, its objects added); else it waits in the peer's queue (the catch-up keeps
     // only its latest; the tip requests within the peer's bound; no other request's entry replaced), served oldest
     // first while the peer's slot is free. True: sent now.
+    bool want_headers_locked(std::uint64_t peer, PathbNode::HeaderOwner owner, const Hash32& from, const Hash32& stop) {
+        return want_headers_locked(peer, owner, from, stop, TipObjects{});
+    }
     bool want_headers_locked(std::uint64_t peer, PathbNode::HeaderOwner owner, const Hash32& from, const Hash32& stop,
-                             const std::set<Hash32>& objs = {}) {
+                             const TipObjects& objs) {
         const std::optional<PathbNode::HeaderSlot> s = node_->header_slot(peer);
         if (s && !s->retired && s->owner == owner && s->from == from && s->stop == stop) {
             st_.header_wants_merged++;
             const auto sent = hdr_sent_.find(peer);
-            if (sent != hdr_sent_.end() && sent->second.from == from && sent->second.stop == stop)
-                sent->second.objs.insert(objs.begin(), objs.end());
+            if (sent != hdr_sent_.end() && sent->second.from == from && sent->second.stop == stop) {
+                sent->second.objs.add(objs);
+                prune_objects_locked(sent->second.objs);
+            }
             return false;
         }
         std::deque<HdrWant>& q = header_wants_[peer];
         for (HdrWant& w : q)
             if (w.owner == owner && w.from == from && w.stop == stop) {
                 st_.header_wants_merged++;
-                w.objs.insert(objs.begin(), objs.end());
+                w.objs.add(objs);
+                prune_objects_locked(w.objs);
                 return false;
             }
         if (owner == PathbNode::HeaderOwner::CatchUp)
@@ -2816,7 +2861,7 @@ private:
                 std::lock_guard<std::mutex> lk(cumtx_);
                 // the request this frame answered (a continuation page goes on): a tip request's objects go with its
                 // deferral
-                std::set<Hash32> objs;
+                TipObjects objs;
                 if (o.owner != PathbNode::HeaderOwner::None && o.kind != K::Continue) {
                     const auto sn = hdr_sent_.find(p);
                     if (sn != hdr_sent_.end()) {
@@ -2920,7 +2965,8 @@ private:
                 e.stop = w.stop;
                 e.fetch = w.fetch;
                 e.cause = w.cause;
-                e.objs.insert(w.objs.begin(), w.objs.end());
+                e.objs.add(w.objs);
+                prune_objects_locked(e.objs);
                 return;
             }
         if (w.owner == PathbNode::HeaderOwner::Tip) tip_room_locked(v);
