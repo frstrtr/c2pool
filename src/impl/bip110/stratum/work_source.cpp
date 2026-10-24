@@ -1002,6 +1002,14 @@ void Bip110WorkSource::update_stratum_worker(const std::string& id, double hr, d
     it->second.accepted = acc; it->second.rejected = rej; it->second.stale = stale;
 }
 
+void Bip110WorkSource::update_stratum_worker_rtt(const std::string& id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    auto it = workers_.find(id);
+    if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    it->second.rtt_ms = rtt_ms;
+}
+
 void Bip110WorkSource::gc_freezes() const
 {
     // caller holds freeze_mutex_
