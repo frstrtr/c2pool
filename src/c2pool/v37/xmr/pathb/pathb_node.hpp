@@ -1771,11 +1771,11 @@ public:
                 const bool monotone = ann[i].parent == prev && k == i;     // h below the record H
                 if (monotone) {
                     // #6 below the fork's record H alone (no header of the reply raised the record above h) where that
-                    // record is a claim (the joined span's H, read with the retarget window as #8): alarm + DEFER, no
-                    // token, nothing indexed
+                    // record is a claim (a fork node at x <= x1 of a joined store): alarm + DEFER, no token, nothing
+                    // indexed (per operator ruling); every other #6 failure STRIKE
                     std::uint64_t own = 0;
                     for (std::size_t j = 0; j < i; ++j) own = std::max(own, ann[j].h);
-                    const Basis hb = basis_of(claims_, RowClass::Retarget, req.fork, fork->pos + 1);
+                    const Basis hb = basis_of(claims_, RowClass::ForkRecord, req.fork, fork->pos + 1);
                     if (ann[i].h >= own && is_claim_basis(hb)) {
                         alarm_.raise(RowId::R7, hb, sh.id, Missing::ClaimAlarm);
                         out.kind = HeadersOutcome::Kind::Defer;
@@ -2605,6 +2605,8 @@ private:
             switch (k) {
                 case RowClass::Retarget:  // a window that reads the claimed prefix or span
                     return x <= x1_ + n_->cfg_.p.retarget_span ? Basis::ClaimLeaf : Basis::Computed;
+                case RowClass::ForkRecord:  // a fork node at x <= x1 (per operator ruling)
+                    return x <= x1_ + 1 ? Basis::ClaimLeaf : Basis::Computed;
                 case RowClass::Coinbase:
                     if (x <= x1_) return Basis::NotComputed;
                     return n_->window_reads_claimed_now(tip) ? Basis::ClaimLeaf : Basis::Computed;
