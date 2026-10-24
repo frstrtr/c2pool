@@ -117,6 +117,8 @@
 //                the request open with its clock;
 //   hp_crawl     a catch-up of one page from three servers: one catch-up
 //                request per server;
+//   hp_qbound    a peer's waiting tip requests and tip deferrals within P-47,
+//                those of objects no longer waiting first; 20,000 junk receipts;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -9044,6 +9046,130 @@ void hp_crawl() {
     check(asks == 3, "hp_crawl: one catch-up request per server for a chain of one page (asks " + std::to_string(asks) + ")");
 }
 
+// hp_qbound (B-1): a peer's waiting tip-header requests and its tip deferrals are bounded by P-47 (the deferred store's
+// cap), the entries whose parked objects no longer wait leaving first. B's header request to A is retired (A's reply
+// held past P-53); A then sends junk receipts with distinct unknown tips (each DEFERs TipUnknown before any PoW row).
+// (a) 20,000 of them: B's queue for A stays within P-47; 0 strikes, 0 bans; B's catch-up from C (an honest second
+// server) completes. (b) deferred store 16, receipt park 6: 16 junk receipts wait (10 of them tied to receipts the park
+// dropped); the 17th: the entries of the dropped receipts leave, the queue holds the parked receipts' requests only.
+// (c) the deferrals: the catch-up keeps one; tip deferrals within P-47, those whose objects no longer wait leaving
+// first.
+void hp_qbound() {
+    const KatNet net;
+    const auto junk = [](const pb::ReceiptBodyV3& base, std::uint32_t k) {
+        pb::ReceiptBodyV3 r = base;
+        r.side.tip.fill(0x5C);
+        for (int i = 0; i < 4; ++i) r.side.tip[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(k >> (8 * i));
+        return *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{r}, pb::kRuledLaneParams);
+    };
+    // A (0) and the server C (2) hold A's chain; B (1) connects to A with A's FC_HEADERS to B held past P-53
+    const auto retired_b = [](Harness& h, FakeWire& w, KatRelay& a, KatRelay& b, std::optional<pb::ReceiptBodyV3>& base) {
+        bool ok = true;
+        for (int i = 0; i < 2; ++i) {
+            h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 3900 + static_cast<std::uint32_t>(i));
+        }
+        if (const std::optional<pb::PathbJob> j = h.job(a.node, 3, 3910)) {
+            pb::ReceiptBodyV3 r = j->body;
+            r.blob.nonce = 3910;
+            base = r;
+        }
+        w.edit = [](FakeWire::Msg& m) {
+            if (m.from == 0 && m.to == 1 && !m.f.empty() && m.f[0] == pb::kOpFcHeaders) m.f.clear();
+        };
+        w.connect(1, 0);
+        w.run();
+        h.now += pb::kAbandonTimeoutDefault + 1;
+        b.relay->tick();
+        w.run();
+        w.edit = nullptr;
+        const std::uint64_t pa = w.id(b.node, a.node);
+        const std::optional<pb::PathbNode::HeaderSlot> s = b.relay->with_node([&](pb::PathbNode& n) { return n.header_slot(pa); });
+        return ok && base.has_value() && s && s->retired;
+    };
+    {
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        KatRelay c = kat_relay(h, w, table0(net), true);
+        w.connect(0, 2);
+        w.run();
+        std::optional<pb::ReceiptBodyV3> base;
+        const bool ok = retired_b(h, w, a, b, base) && h[c.node].tree().best().id == h[a.node].tree().best().id;
+        pb::PathbRelayNode& rb = *b.relay;
+        const std::uint64_t pa = w.id(b.node, a.node);
+        const std::size_t bound = static_cast<std::size_t>(h[b.node].deferred_cap());
+        std::size_t peak = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t k = 0; ok && k < 20000; ++k) {
+            rb.receive(pa, junk(*base, k));
+            w.run();
+            peak = std::max(peak, rb.header_waiting(pa));
+        }
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const pb::PathbRelayStats& st = rb.stats();
+        const std::size_t waiting = rb.header_waiting(pa);
+        w.connect(1, 2);
+        w.run();
+        const pb::Hash32 tip = h[c.node].tree().best().id;
+        for (int i = 0; i < 20 && h[b.node].tree().best().id != tip; ++i) {
+            h.now += 1;
+            rb.tick();
+            w.run();
+        }
+        std::printf("  hp_qbound (a): 20,000 junk receipts in %.1f s: B's queue for A %zu (peak %zu, P-47 %zu), parked "
+                    "receipts %zu, reclaimed %llu, dropped %llu; strikes %llu, bans %llu; B at %llu of %llu\n",
+                    secs, waiting, peak, bound, rb.parked_receipts(), (unsigned long long)st.header_wants_reclaimed.load(),
+                    (unsigned long long)st.header_wants_dropped.load(), (unsigned long long)rb.strikes_of(pa),
+                    (unsigned long long)st.bans.load(), (unsigned long long)h[b.node].tree().best().pos,
+                    (unsigned long long)h[c.node].tree().best().pos);
+        check(ok && peak <= bound && waiting >= 1 && rb.strikes_of(pa) == 0 && st.bans.load() == 0,
+              "hp_qbound (a): 20,000 junk receipts from a peer whose slot is retired: its queue within P-47 (peak " +
+                      std::to_string(peak) + " of " + std::to_string(bound) + "); 0 strikes, 0 bans");
+        check(h[b.node].tree().best().id == tip, "hp_qbound (a): B's catch-up from the honest server C completes");
+    }
+    {
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& cf) {
+            cf.waiting_cap = 16;
+            cf.pending_cap = 6;
+        });
+        std::optional<pb::ReceiptBodyV3> base;
+        const bool ok = retired_b(h, w, a, b, base);
+        pb::PathbRelayNode& rb = *b.relay;
+        const std::uint64_t pa = w.id(b.node, a.node);
+        for (std::uint32_t k = 0; ok && k < 16; ++k) {
+            rb.receive(pa, junk(*base, 100 + k));
+            w.run();
+        }
+        const std::size_t w16 = rb.header_waiting(pa);
+        rb.receive(pa, junk(*base, 200));
+        w.run();
+        const std::size_t w17 = rb.header_waiting(pa), parked = rb.parked_receipts();
+        // (c) the deferrals of A at B
+        const pb::Hash32 g = h[b.node].tree().genesis().id, x = mon_block(kPoolH);
+        for (std::uint8_t k = 0; k < 3; ++k) rb.test_defer_headers(pa, HpOwner::CatchUp, seq32(0x40 + k), seq32(0x50), x);
+        for (std::uint8_t k = 0; k < 16; ++k) rb.test_defer_headers(pa, HpOwner::Tip, g, seq32(0x60 + k), x, seq32(0x90 + k));
+        const std::size_t d16 = rb.header_deferred(pa, HpOwner::Tip);
+        rb.test_defer_headers(pa, HpOwner::Tip, g, seq32(0x80), x);  // untied
+        const std::size_t d17 = rb.header_deferred(pa, HpOwner::Tip);
+        for (std::uint8_t k = 0; k < 20; ++k) rb.test_defer_headers(pa, HpOwner::Tip, g, seq32(0xA0 + k), x);
+        const std::size_t d37 = rb.header_deferred(pa, HpOwner::Tip), dc = rb.header_deferred(pa, HpOwner::CatchUp);
+        std::printf("  hp_qbound (b): queue %zu after 16, %zu after 17 (parked receipts %zu); (c) tip deferrals %zu, %zu, "
+                    "%zu; the catch-up's %zu\n",
+                    w16, w17, parked, d16, d17, d37, dc);
+        check(ok && w16 == 16 && parked == 6 && w17 == parked,
+              "hp_qbound (b): at P-47 the requests of receipts the park dropped leave first: the queue holds the parked "
+              "receipts' (" + std::to_string(w17) + ")");
+        check(d16 == 16 && d17 == 1 && d37 == 16 && dc == 1,
+              "hp_qbound (c): tip deferrals within P-47 (those whose objects no longer wait leave first); the catch-up "
+              "keeps one deferral");
+    }
+}
+
 int main(int argc, char** argv) {
     std::printf("v37_xmr_pathb_node_kat\n");
     const std::string only = argc > 1 ? argv[1] : "";
@@ -9094,6 +9220,7 @@ int main(int argc, char** argv) {
     run("hp_firstround", hp_firstround);
     run("hp_guard", hp_guard);
     run("hp_crawl", hp_crawl);
+    run("hp_qbound", hp_qbound);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);
