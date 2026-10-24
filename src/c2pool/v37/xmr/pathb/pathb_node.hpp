@@ -1598,6 +1598,7 @@ public:
         Missing cause = Missing::MoneroBlock;  // the input the request waits for (MissingWeights: the floor reading)
         Hash32 from{};
         Hash32 stop{};
+        Hash32 fetch_last{};  // FetchBodies: the last body asked (none asked: the page's tip)
         std::string why;  // the deciding check, for the relay's log line
         Hash32 fetch_last{};  // FetchBodies: the last body asked (none asked: the page's tip)
     };
