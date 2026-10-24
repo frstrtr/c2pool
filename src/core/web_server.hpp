@@ -918,6 +918,23 @@ public:
     // True while refresh_work holds the previous template (MWEB HOLD).
     bool is_mweb_holding() const { return m_mweb_hold_since_ms.load(std::memory_order_relaxed) != 0; }
 
+    // Structural check of a Litecoin template's transactions
+    // (core::coin::check_template_txs) at ingress and, rules 1-5, at block
+    // assembly. Strict (default): a refusal HOLDs at ingress like the MWEB
+    // shape check and refuses the block at assembly. Warn: both log and
+    // count only (rollback, should litecoind's own template ever trip a
+    // rule in RPC mode).
+    //   template_tx_refusals  — ingress refusals by code (also the coin
+    //                           node's own refusals marked on its template),
+    //                           the total and the last one
+    //   template_fee_outliers — templates with a tx fee above 1 coin
+    //   mweb_refusals_by_code — blocks refused at assembly, by code
+    void set_template_tx_check_strict(bool strict) { m_template_tx_check_strict.store(strict, std::memory_order_relaxed); }
+    bool template_tx_check_strict() const { return m_template_tx_check_strict.load(std::memory_order_relaxed); }
+    nlohmann::json get_template_tx_refusals_json() const;
+    nlohmann::json get_mweb_refusals_by_code_json() const;
+    uint64_t get_template_fee_outliers() const { return m_template_fee_outliers.load(std::memory_order_relaxed); }
+
     // Coin-side metrics merged into /local_stats next to the MWEB counters
     // above: the function returns a JSON object whose keys are copied into
     // the payload (LTC embedded: {"ltc_mweb": {...}}). Called from whichever
@@ -1423,6 +1440,10 @@ private:
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
     void close_mweb_hold_window(const char* reason);
+    // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
+    // (height, code).
+    void note_template_tx_refusal(const std::string& code, uint32_t height, size_t index,
+                                  const std::string& txid, const std::string& detail, bool held);
 
     // Try submitting to merged-mined aux chains if their target is met.
     // Needs only the 80-byte parent header (first 160 hex chars of header_hex),
@@ -1649,6 +1670,23 @@ private:
     std::atomic<int64_t>  m_mweb_hold_total_ms{0};
     // The cached template failed the shape check (served degraded).
     std::atomic<bool>     m_work_degraded{false};
+    // Template-tx check (see set_template_tx_check_strict).
+    std::atomic<bool>     m_template_tx_check_strict{true};
+    std::atomic<uint64_t> m_template_fee_outliers{0};
+    struct TemplateTxRefusalLog {
+        std::map<std::string, uint64_t> by_code;
+        uint64_t    total{0};
+        std::string last_code;
+        uint32_t    last_height{0};
+        size_t      last_index{0};
+        std::string last_txid;
+        int64_t     last_ms{0};          // steady clock
+        uint32_t    logged_height{0};    // last (height, code) given an ERROR line
+        std::string logged_code;
+    };
+    mutable std::mutex m_template_tx_mutex;
+    TemplateTxRefusalLog m_template_tx_refusals;                     // ingress
+    mutable std::map<std::string, uint64_t> m_mweb_refusals_by_code; // assembly (const path)
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;

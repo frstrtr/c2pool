@@ -150,6 +150,7 @@ private:
         std::shared_ptr<const std::vector<std::string>> tx_data;     // raw tx hex from GBT template (a1: shared/lazy)
         std::string mweb;                      // MWEB extension data
         bool        mweb_active{false};        // template rules named MWEB
+        bool        degraded{false};           // template ingress refused (served degraded)
         bool        segwit_active{false};
         uint256     prev_share_hash;  // share chain tip when this job was built
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation

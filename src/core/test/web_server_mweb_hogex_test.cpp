@@ -48,6 +48,12 @@
 // template (cold/warm start before the first MWEB state) it is served
 // DEGRADED: work is valid for shares and merged mining, and block assembly
 // refuses every LTC block from it.
+//
+// The template-tx check (core::coin::check_template_txs) rides the same HOLD
+// at ingress and refuses at assembly: a tx without inputs (the old MWEB
+// stub) holds the previous template, is counted by code, and never reaches
+// the daemon in a block; warn mode only counts. A template the coin node
+// marked refused is held and counted under its code.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -130,6 +136,10 @@ bool ends_with(const std::string& s, const std::string& tail)
 {
     return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
 }
+
+// The 10-byte stub the old parser made of an MWEB-only tx: version | no vin |
+// no vout | locktime (its own stripped serialization).
+const std::string kStub = "02000000" "00" "00" "8c848df9";
 
 // The 80-byte header built field by field, independently of production code.
 std::vector<unsigned char> test_header(uint32_t version, const std::string& prev_hex,
@@ -305,6 +315,7 @@ FrozenJob freeze_cached_job(MiningInterface& mi, const std::string& prev)
     j.snap.tx_data = cbr.snapshot.tx_data;
     j.snap.mweb = cbr.snapshot.mweb;
     j.snap.mweb_active = cbr.snapshot.mweb_active;
+    j.snap.degraded = cbr.snapshot.degraded;
     j.snap.segwit_active = cbr.snapshot.segwit_active;
     const uint256 root = MiningInterface::reconstruct_merkle_root(
         j.snap.coinb1 + kEn1 + kEn2 + j.snap.coinb2, j.snap.merkle_branches);
@@ -540,6 +551,78 @@ TEST(LtcMwebHogex, N3_IngressRefusalHoldsPreviousTemplate)
     EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
 }
 
+// ------------------------------ template-tx check -------------------------
+
+TEST(LtcMwebHogex, TemplateTxCheckHoldsAndRefusesAtAssembly)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped), ts = txid_hex(kStub);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    stub_ref_hash(f.mi);
+    f.mi.refresh_work();
+    const auto good = f.mi.get_current_work_template();
+    ASSERT_FALSE(good.is_null());
+
+    // A tx without inputs before the HogEx: HOLD, counted by code.
+    const std::string new_prev = rep("0", 62) + "cd";
+    f.node.work_data = mweb_template({{kTx1, t1}, {kStub, ts}, {kHogex, th}}, kMweb, new_prev);
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good) << "previous template must stay (HOLD)";
+    EXPECT_TRUE(f.mi.is_mweb_holding());
+    EXPECT_FALSE(f.mi.is_work_degraded());
+    auto refusals = f.mi.get_template_tx_refusals_json();
+    EXPECT_EQ(refusals["total"], 1);
+    EXPECT_EQ(refusals["by_code"]["tx-vin-empty"], 1);
+    EXPECT_EQ(refusals["last"]["index"], 1);
+    EXPECT_EQ(refusals["last"]["txid"], ts);
+    auto stats = f.mi.rest_local_stats();
+    EXPECT_EQ(stats["template_tx_refusals"]["by_code"]["tx-vin-empty"], 1);
+    EXPECT_EQ(stats["template_tx_check"], "strict");
+
+    // A block from a job frozen with that tx never reaches the daemon.
+    Job j = make_job({kTx1, kStub, kHogex}, {t1, ts, th}, kMweb, /*mweb_active=*/true);
+    submit(f, j);
+    EXPECT_EQ(f.node.submit_calls, 0);
+    EXPECT_TRUE(f.fires.empty());
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["tx-vin-empty"], 1);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u) << "the merged-mining check still sees the share";
+
+    // Warn mode: counted and served; the block is submitted.
+    f.mi.set_template_tx_check_strict(false);
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_gbt_prevhash(), new_prev);
+    EXPECT_FALSE(f.mi.is_mweb_holding());
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["tx-vin-empty"], 2);
+    submit(f, j);
+    EXPECT_EQ(f.node.submit_calls, 1);
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["tx-vin-empty"], 2);
+}
+
+TEST(LtcMwebHogex, TemplateTxCheckRefusesWrongTxidAndCountsCoinRefusals)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    f.mi.refresh_work();
+    const auto good = f.mi.get_current_work_template();
+    ASSERT_FALSE(good.is_null());
+
+    // The merkle branches and shares use the template's txids.
+    f.node.work_data = mweb_template({{kTx1, rep("0", 64)}, {kHogex, th}}, kMweb, rep("0", 62) + "cd");
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["txid-mismatch"], 1);
+
+    // The embedded builder refused its own template (handed out for HOLD).
+    auto marked = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, rep("0", 62) + "ef");
+    marked[core::coin::kTemplateRefusalKey] = "mempool-not-cleaned-for-tip";
+    f.node.work_data = marked;
+    f.mi.refresh_work();
+    EXPECT_EQ(f.mi.get_current_work_template(), good);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["mempool-not-cleaned-for-tip"], 1);
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["total"], 2);
+}
+
 // A block found on the held template builds on the previous tip: submitblock
 // still forwards it but records it as a stale race, so a daemon reject shows
 // as ORPHAN (253) instead of firing nothing.
@@ -603,6 +686,31 @@ TEST(LtcMwebHogex, DegradedStartServesWorkButNeverSubmitsLtcBlocks)
     f.mi.refresh_work();
     EXPECT_FALSE(f.mi.is_work_degraded());
     EXPECT_EQ(f.mi.get_cached_mweb(), kMweb);
+}
+
+// A cold start whose first template has its HogEx and mweb but that ingress
+// refuses for another reason (here a wrong txid): with nothing valid to hold
+// it is served degraded, and the job carries that. Block assembly's shape
+// check passes, so only the degraded flag keeps the block from the daemon.
+TEST(LtcMwebHogex, DegradedStartOnANonShapeRefusalNeverSubmitsLtcBlocks)
+{
+    Fixture f;
+    const std::string th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, rep("0", 64)}, {kHogex, th}}, kMweb);
+    stub_ref_hash(f.mi);
+    f.mi.refresh_work();
+
+    ASSERT_FALSE(f.mi.get_current_work_template().is_null()) << "degraded start serves work";
+    EXPECT_TRUE(f.mi.is_work_degraded());
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["txid-mismatch"], 1);
+
+    FrozenJob j = freeze_cached_job(f.mi, kPrev);
+    EXPECT_TRUE(j.snap.degraded);
+    EXPECT_FALSE(j.snap.mweb.empty()) << "the shape check alone would pass this job";
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
+    EXPECT_EQ(f.node.submit_calls, 0) << "no LTC block from a degraded job";
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["degraded-job"], 1);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u) << "the merged-mining check still sees the share";
 }
 
 // A template failure that is not an MWEB shape refusal still invalidates the

@@ -292,11 +292,8 @@ inline CompactBlock BuildCompactBlock(const BlockHeaderType& header,
     if (txs.size() > 1) {
         uint64_t k0, k1;
         cb.GetSipHashKeys(k0, k1);
-        for (size_t i = 1; i < txs.size(); ++i) {
-            auto packed = pack(TX_WITH_WITNESS(txs[i]));
-            uint256 wtxid = Hash(packed.get_span());
-            cb.short_ids.push_back(CompactBlock::GetShortID(k0, k1, wtxid));
-        }
+        for (size_t i = 1; i < txs.size(); ++i)
+            cb.short_ids.push_back(CompactBlock::GetShortID(k0, k1, compute_wtxid(txs[i])));
     }
 
     return cb;

@@ -491,7 +491,9 @@ void print_help() {
     std::cout << "  --ltc-cmpct-hb-peers N    LTC peers asked to push compact blocks (default: 0 = all)\n";
     std::cout << "  --no-ltc-mweb-fetch-retry Fetch each announced LTC block from every announcing peer\n";
     std::cout << "                            (pre-retry behaviour) instead of the tip's block once\n";
-    std::cout << "  --ltc-mweb-cmpct-provisional  Reserved; not implemented in this build\n\n";
+    std::cout << "  --ltc-mweb-cmpct-provisional  Reserved; not implemented in this build\n";
+    std::cout << "  --template-tx-check MODE  LTC template transaction check: strict (refuse /\n";
+    std::cout << "                            HOLD, default) or warn (log and count only)\n\n";
 
     std::cout << "COINBASE CUSTOMIZATION:\n";
     std::cout << "  --coinbase-text TEXT       Custom text in coinbase scriptSig (replaces /c2pool/ tag)\n";
@@ -691,6 +693,11 @@ int main(int argc, char* argv[]) {
     uint32_t ltc_cmpct_hb_peers = 0;
     bool     ltc_mweb_fetch_retry = true;
     bool     ltc_mweb_cmpct_provisional = false;
+    // Litecoin template-tx check (core::coin::check_template_txs) at template
+    // ingress, block assembly and in the embedded template builder:
+    // "strict" refuses (HOLD at ingress, no block at assembly), "warn" logs
+    // and counts only (rollback should litecoind's own template trip a rule).
+    std::string template_tx_check = "strict";  // --template-tx-check MODE
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
     std::string blockchain_label = "ltc";  // Raw coin string -> web layer node_symbol() fallback (config-driven labeling)
 
@@ -1010,6 +1017,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--ltc-mweb-cmpct-provisional") {
             ltc_mweb_cmpct_provisional = true;
             cli_explicit.insert("ltc_mweb_cmpct_provisional");
+        }
+        else if (arg == "--template-tx-check" && i + 1 < argc) {
+            template_tx_check = argv[++i];
+            cli_explicit.insert("template_tx_check");
         }
         else if (arg == "--doge-p2p-address" && i + 1 < argc) {
             doge_p2p_address = argv[++i];
@@ -1390,6 +1401,10 @@ int main(int argc, char* argv[]) {
                 ltc_mweb_fetch_retry = cfg["ltc_mweb_fetch_retry"].as<bool>();
             if (!cli_explicit.count("ltc_mweb_cmpct_provisional") && cfg["ltc_mweb_cmpct_provisional"])
                 ltc_mweb_cmpct_provisional = cfg["ltc_mweb_cmpct_provisional"].as<bool>();
+
+            // Template-tx check mode (see the declaration)
+            if (!cli_explicit.count("template_tx_check") && cfg["template_tx_check"])
+                template_tx_check = cfg["template_tx_check"].as<std::string>();
 
             // Coin daemon P2P broadcaster
             if (!cli_explicit.count("coind_p2p_port") && cfg["coind_p2p_port"])
@@ -1839,6 +1854,17 @@ int main(int argc, char* argv[]) {
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            // Template-tx check mode (template ingress and block assembly).
+            if (template_tx_check != "strict" && template_tx_check != "warn") {
+                LOG_WARNING << "[Config] template_tx_check \"" << template_tx_check
+                            << "\" is neither strict nor warn: using strict";
+                template_tx_check = "strict";
+            }
+            const bool template_tx_check_strict = template_tx_check == "strict";
+            web_server.get_mining_interface()->set_template_tx_check_strict(template_tx_check_strict);
+            if (!template_tx_check_strict)
+                LOG_WARNING << "[Config] template_tx_check=warn: template transaction refusals are"
+                            << " logged and counted only; templates and blocks are not refused";
             // Control-plane M1 (SAFE): install the READ-ONLY config endpoints
             // (lambdas read the immutable snapshot published in main()). POST
             // /api/config/apply stays inert (503); runtime mutation not armed.
@@ -2004,6 +2030,7 @@ int main(int argc, char* argv[]) {
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
+                embedded_node->set_template_tx_check_strict(template_tx_check_strict);
                 // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
@@ -2071,15 +2098,38 @@ int main(int argc, char* argv[]) {
 
                 // Feed mempool transactions into Mempool
                 LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
+                // Admission refuses what an embedded block can never carry
+                // (Mempool::admit: txs with an MWEB part, pegin outputs
+                // without a kernel, empty vin/vout, a loose HogEx).
                 embedded_broadcaster->set_on_new_tx(
                     [pool = embedded_pool.get(),
                      utxo = ltc_utxo_cache.get()](const std::string& peer_key,
                                                    const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
-                        bool added = pool->add_tx(mtx, utxo);
-                        if (added) {
+                        auto reject = pool->admit(mtx, utxo);
+                        if (!reject) {
                             LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key
                                       << " added to mempool (size=" << pool->size() << ")";
+                            return;
+                        }
+                        if (reject->code == ltc::coin::Mempool::Reject::duplicate)
+                            return;
+                        LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key << " refused: "
+                                        << ltc::coin::Mempool::reject_code_name(reject->code)
+                                        << " txid=" << reject->txid.GetHex()
+                                        << (reject->kernel_id.IsNull() ? std::string()
+                                            : " kernel=" + HexStr(std::span<const unsigned char>(
+                                                  reject->kernel_id.data(), 32)))
+                                        << " mweb_fee=" << reject->mweb_fee
+                                        << " pegins=" << reject->n_pegins;
+                        static uint64_t refused = 0;  // ioc thread only
+                        if (++refused % 100 == 0) {
+                            const auto st = pool->reject_stats_json();
+                            LOG_INFO << "[EMB-LTC] Mempool: " << refused << " txs refused at admission"
+                                     << " (by code " << st["rejected"].dump()
+                                     << ", MWEB txs " << st["mweb_txs_seen"].get<uint64_t>()
+                                     << ", kernel fees given up " << st["mweb_fee_skipped_sat"].get<uint64_t>()
+                                     << " sat)";
                         }
                     });
 
@@ -2698,16 +2748,32 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
-                // Coin-side metrics in /local_stats.
+                // Coin-side metrics in /local_stats: "ltc_mweb" (the MWEB state
+                // window and relay counters, plus state_kernels: the kernel count
+                // of the block the MWEB state came from -- templates after a block
+                // with kernels are where the next header's per-block fields
+                // matter) and "ltc_mempool" (admission: refusals by code, MWEB txs
+                // seen, kernel fees given up, template drops, the last block the
+                // pool was cleaned for).
                 mi->set_coin_metrics_fn(
-                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry]() {
+                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry,
+                     pool = embedded_pool.get(), tracker = mweb_tracker.get()]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
                             {"cmpct_v3", ltc_cmpct_v3},
                             {"cmpct_hb_peers", ltc_cmpct_hb_peers},
                             {"mweb_fetch_retry", ltc_mweb_fetch_retry},
                         };
-                        return nlohmann::json{{"ltc_mweb", j}};
+                        auto st = tracker ? tracker->get_state() : std::nullopt;
+                        j["state_kernels"] = st ? nlohmann::json(st->prev_header.kernel_mmr_size)
+                                                : nlohmann::json(nullptr);
+                        nlohmann::json mp = pool->reject_stats_json();
+                        mp["last_block_hash"] = pool->last_block_hash().GetHex();
+                        const time_t cleaned = pool->last_cleaned_time();
+                        mp["last_cleaned_ago_s"] = cleaned
+                            ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
+                            : nlohmann::json(nullptr);
+                        return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)}};
                     });
 
                 // Full block handler: MWEB state extraction + mempool cleanup.

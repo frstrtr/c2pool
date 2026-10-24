@@ -16,6 +16,7 @@
 #include <impl/ltc/coin/node_interface.hpp>
 #include <core/coin/node_iface.hpp>
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/template_txs_check.hpp>
 // Phase 4: embedded coin node interface
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -736,10 +737,51 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     const bool mweb_active = job ? job->mweb_active : m_cached_mweb_active;
     if (auto why = core::coin::check_block_shape(txs_hex, mweb_data, mweb_active)) {
         m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+            ++m_mweb_refusals_by_code["mweb-shape"];
+        }
         LOG_ERROR << "[MWEB] Block assembly REFUSED: " << *why
                   << " (txs=" << txs_hex.size() << " mweb=" << mweb_data.size() / 2 << "B"
                   << " mweb_active=" << mweb_active << ") — block not submitted";
         return {};
+    }
+    // A degraded job was built on a template that ingress refused (a fresh
+    // start with no valid template yet): shares and merged blocks only. The
+    // shape check above catches a template without MWEB state; this catches
+    // every other refusal code.
+    if (job ? job->degraded : m_work_degraded.load(std::memory_order_relaxed)) {
+        m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+            ++m_mweb_refusals_by_code["degraded-job"];
+        }
+        LOG_ERROR << "[MWEB] Block assembly REFUSED: the job was built on a degraded template"
+                  << " (refused at ingress) — block not submitted";
+        return {};
+    }
+    // Litecoin: every tx of the frozen job decodes as exactly one tx with
+    // inputs and outputs and no MWEB data, and only the last one carries the
+    // HogEx flag (template-tx check rules 1-5). In warn mode the block is
+    // still submitted: refusing a block on a false positive would lose it.
+    if (m_blockchain == Blockchain::LITECOIN) {
+        std::vector<std::string_view> views(txs_hex.begin(), txs_hex.end());
+        if (auto r = core::coin::check_tx_list(views, mweb_active)) {
+            const bool strict = m_template_tx_check_strict.load(std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+                ++m_mweb_refusals_by_code[r->code];
+            }
+            if (strict) {
+                m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR << "[MWEB] Block assembly REFUSED: " << r->code << " at tx " << r->index
+                          << (r->txid.empty() ? "" : " " + r->txid) << " (" << r->detail
+                          << ") — block not submitted";
+                return {};
+            }
+            LOG_WARNING << "[MWEB] Block assembly: template-tx check " << r->code << " at tx "
+                        << r->index << " (" << r->detail << ") — submitted anyway (warn mode)";
+        }
     }
 
     std::ostringstream block;
@@ -1086,6 +1128,7 @@ MiningInterface::build_connection_coinbase(
         bool segwit_active{false};
         std::string mweb;
         bool mweb_active{false};
+        bool degraded{false};
         std::string coinbase_text;
         std::vector<unsigned char> donation_script;
         std::vector<std::string> merkle_branches;
@@ -1112,6 +1155,7 @@ MiningInterface::build_connection_coinbase(
         ws.segwit_active = m_segwit_active;
         ws.mweb = m_cached_mweb;
         ws.mweb_active = m_cached_mweb_active;
+        ws.degraded = m_work_degraded;
         ws.coinbase_text = m_coinbase_text;
         ws.donation_script = m_donation_script;
         ws.share_version = m_cached_share_version;
@@ -1450,6 +1494,7 @@ MiningInterface::build_connection_coinbase(
     snap.segwit_active = ws.segwit_active;
     snap.mweb = ws.mweb;
     snap.mweb_active = ws.mweb_active;
+    snap.degraded = ws.degraded;
     snap.subsidy = subsidy;
     snap.witness_commitment_hex = ws.witness_commitment;
     snap.witness_root = effective_witness_root;
@@ -1495,8 +1540,41 @@ void MiningInterface::refresh_work()
         // template that is itself degraded): serve this one DEGRADED, so
         // shares and merged mining work. Block assembly runs the same check
         // on the frozen job and refuses every LTC block from it.
+        //
+        // The same HOLD answers the template-tx check (Litecoin): a template
+        // whose transactions can only yield a block litecoind rejects. A
+        // template the coin node marked refused is counted under its code.
         bool degraded = false;
-        if (auto why = core::coin::check_template_shape(wd.m_data)) {
+        std::optional<std::string> why = core::coin::check_template_shape(wd.m_data);
+        {
+            const uint32_t tmpl_height = wd.m_data.is_object() && wd.m_data.contains("height")
+                                             && wd.m_data["height"].is_number_integer()
+                ? static_cast<uint32_t>(wd.m_data["height"].get<int64_t>()) : 0;
+            if (auto code = core::coin::template_refusal_code(wd.m_data))
+                note_template_tx_refusal(*code, tmpl_height, 0, "", "refused by the coin node", true);
+            if (!why && m_blockchain == Blockchain::LITECOIN) {
+                try {
+                    size_t outliers = 0;
+                    auto r = core::coin::check_template_txs(wd.m_data, &outliers);
+                    if (r) {
+                        const bool strict = m_template_tx_check_strict.load(std::memory_order_relaxed);
+                        note_template_tx_refusal(r->code, tmpl_height, r->index, r->txid, r->detail, strict);
+                        if (strict)
+                            why = "template tx " + std::to_string(r->index) + " " + r->code
+                                + " (" + r->detail + ")";
+                    }
+                    if (outliers > 0) {
+                        m_template_fee_outliers.fetch_add(1, std::memory_order_relaxed);
+                        LOG_WARNING << "[MWEB] template-fee-outlier: " << outliers
+                                    << " tx(s) with a fee above " << core::coin::kTemplateFeeOutlierSat
+                                    << " sat in the template for height " << tmpl_height;
+                    }
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[MWEB] template-tx check failed to run: " << e.what();
+                }
+            }
+        }
+        if (why) {
             if (m_work_valid && !m_work_degraded) {
                 note_mweb_template_refusal(*why);
                 // Keep the DOGE blocks' PPLNS current while holding: new jobs
@@ -1770,7 +1848,7 @@ void MiningInterface::note_mweb_template_refusal(const std::string& why)
         // First refusal of this window: the one ERROR line.
         LOG_ERROR << "[MWEB] Template REFUSED at ingress: " << why
                   << " — HOLD: miners keep working on the previous template until a"
-                  << " template with a trailing HogEx and mweb data arrives. Shares,"
+                  << " template that passes the ingress checks arrives. Shares,"
                   << " PPLNS and merged mining continue; an LTC block found meanwhile"
                   << " builds on the previous tip.";
     } else {
@@ -1793,6 +1871,64 @@ void MiningInterface::note_mweb_degraded_template(const std::string& why)
     } else {
         LOG_DEBUG_COIND << "[MWEB] Degraded template replaced by a newer degraded one: " << why;
     }
+}
+
+void MiningInterface::note_template_tx_refusal(const std::string& code, uint32_t height, size_t index,
+                                               const std::string& txid, const std::string& detail,
+                                               bool held)
+{
+    bool log_error = false;
+    {
+        std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+        auto& t = m_template_tx_refusals;
+        ++t.by_code[code];
+        ++t.total;
+        t.last_code = code;
+        t.last_height = height;
+        t.last_index = index;
+        t.last_txid = txid;
+        t.last_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (t.logged_height != height || t.logged_code != code) {
+            t.logged_height = height;
+            t.logged_code = code;
+            log_error = true;
+        }
+    }
+    if (log_error) {
+        LOG_ERROR << "[MWEB] Template-tx check: " << code << " at height " << height
+                  << " tx " << index << (txid.empty() ? "" : " " + txid) << " (" << detail << ")"
+                  << (held ? " — template refused" : " — counted only (warn mode)");
+    } else {
+        LOG_DEBUG_COIND << "[MWEB] Template-tx check: " << code << " at height " << height
+                        << " (repeat)";
+    }
+}
+
+nlohmann::json MiningInterface::get_template_tx_refusals_json() const
+{
+    std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+    const auto& t = m_template_tx_refusals;
+    nlohmann::json by_code = nlohmann::json::object();
+    for (const auto& [code, n] : t.by_code)
+        by_code[code] = n;
+    nlohmann::json out = {{"total", t.total}, {"by_code", std::move(by_code)}};
+    if (t.total > 0) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        out["last"] = {{"code", t.last_code}, {"height", t.last_height}, {"index", t.last_index},
+                       {"txid", t.last_txid}, {"ago_s", (now_ms - t.last_ms) / 1000}};
+    }
+    return out;
+}
+
+nlohmann::json MiningInterface::get_mweb_refusals_by_code_json() const
+{
+    std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+    nlohmann::json out = nlohmann::json::object();
+    for (const auto& [code, n] : m_mweb_refusals_by_code)
+        out[code] = n;
+    return out;
 }
 
 void MiningInterface::note_mweb_template_accepted()
@@ -1889,6 +2025,7 @@ MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
     s.segwit_active = m_segwit_active;
     s.mweb = m_cached_mweb;
     s.mweb_active = m_cached_mweb_active;
+    s.degraded = m_work_degraded;
     s.subsidy = m_cached_template.is_null() ? 0
                 : m_cached_template.value("coinbasevalue", uint64_t(0));
     s.witness_commitment_hex = m_cached_witness_commitment;
@@ -5467,6 +5604,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_template_refusals"] = get_mweb_template_refusals();
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
+    result["mweb_refusals_by_code"] = get_mweb_refusals_by_code_json();
+    result["template_tx_refusals"] = get_template_tx_refusals_json();
+    result["template_fee_outliers"] = get_template_fee_outliers();
+    result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

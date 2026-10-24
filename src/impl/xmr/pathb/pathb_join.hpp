@@ -871,7 +871,10 @@ inline ReaskReplay reask_replay(std::uint64_t seal_pos, std::uint64_t base_pos) 
 // connected. Neither claimed work nor the tip id orders. A pair whose attempt
 // ended NotServed on a Monero input it could not resolve (a P_r, or the
 // weights of a held block) waits, queued, until that input moves
-// (release_waits: the id and its cause, or every id at a new peer).
+// (release_waits: the id and its cause, or every id at a new peer). A pair
+// whose attempt ended NotServed on a side-headers reply with no header waits,
+// queued, until its server offers a new candidate (then it is queued after
+// that candidate's pair).
 // ---------------------------------------------------------------------------
 class AttemptQueue {
 public:
@@ -883,6 +886,7 @@ public:
         bool young = false;   // the pair runs the young path (the ruling-47 fallback; not attempt state)
         std::optional<Hash32> waits_on;  // a Monero input the pair's last attempt could not resolve (NotServed)
         Missing waits_cause = Missing::MoneroBlock;  // its cause: MoneroBlock (a P_r), MissingWeights (a held block's)
+        bool waits_offer = false;  // its last attempt: no side header served; it waits for a new candidate of its server
     };
 
     void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}) {
@@ -891,19 +895,33 @@ public:
         if (known_.count(k) != 0) return;  // queued, or attempted once
         known_.insert(k);
         q_.push_back(Pair{candidate, server, claimed_work, ++seq_});
+        // the server's pairs waiting for a new candidate: queued again, after it
+        std::vector<Pair> moved;
+        for (auto it = q_.begin(); it != q_.end();) {
+            if (it->server == server && it->waits_offer) {
+                moved.push_back(*it);
+                moved.back().waits_offer = false;
+                it = q_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        q_.insert(q_.end(), moved.begin(), moved.end());
     }
 
-    // The next pair not waiting on a P_r (removed from the queue).
+    // The next pair not waiting on a P_r or a new candidate (removed from the queue).
     std::optional<Pair> next() {
-        const auto pick = std::find_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on.has_value(); });
+        const auto pick =
+                std::find_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on.has_value() && !p.waits_offer; });
         if (pick == q_.end()) return std::nullopt;
         Pair p = *pick;
         q_.erase(pick);
         return p;
     }
-    // The pairs that may be attempted now (not waiting on a P_r).
+    // The pairs that may be attempted now (not waiting on a P_r or a new candidate).
     std::size_t ready() const {
-        return static_cast<std::size_t>(std::count_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on; }));
+        return static_cast<std::size_t>(
+                std::count_if(q_.begin(), q_.end(), [](const Pair& p) { return !p.waits_on && !p.waits_offer; }));
     }
     // The (cause, id) inputs pairs wait on.
     std::vector<std::pair<Missing, Hash32>> waits() const {
@@ -1009,6 +1027,8 @@ struct AttemptReport {
                                            // or bins sealed on the branch) the attempt took from the server
     std::optional<Hash32> unresolved_pr;   // NotServed on a Monero input not resolved: its id (the pair waits on it)
     Missing unresolved_cause = Missing::MoneroBlock;  // its cause: MoneroBlock (a P_r), MissingWeights (a held block's)
+    bool side_unserved = false;            // NotServed on a side-headers reply with no header: the pair waits for a
+                                           // new candidate of its server
     std::unique_ptr<JoinedState> state;    // Completed: the attempt's state
 };
 
@@ -1821,7 +1841,12 @@ private:
     bool fetch_side_headers(const Hash32& id) {
         JoinedState& s = *st_;
         const ChainHeaders r = link_.headers(id, header_page(), timeout_);
-        if (r.status != LinkStatus::Served || r.headers.empty()) return fail(AttemptEnd::NotServed, "side headers not served");
+        if (r.status != LinkStatus::Served) return fail(AttemptEnd::NotServed, "side headers not served");
+        // a reply with no header: NotServed, the pair waits for a new candidate of its server
+        if (r.headers.empty()) {
+            rep_.side_unserved = true;
+            return fail(AttemptEnd::NotServed, "side headers: the server holds no such branch");
+        }
         bool fresh = false;
         for (const CarrierHeader& h : r.headers) {
             const Hash32 hid = receipt_id(h.own);
@@ -2016,6 +2041,7 @@ public:
                 q.young = q.young || rep.force_young;
                 q.waits_on = rep.unresolved_pr;  // re-attempted once that input moves (release_waits)
                 q.waits_cause = rep.unresolved_cause;
+                q.waits_offer = rep.side_unserved;  // re-attempted once its server offers a new candidate
                 queue_.requeue(q);
                 break;
             }

@@ -84,6 +84,21 @@ inline std::optional<std::string> check_block_shape(const std::vector<std::strin
     return check_block_shape(txs_hex.empty() ? nullptr : &txs_hex.back(), mweb, mweb_active);
 }
 
+/// Key under which a coin node names why it refused a template it still
+/// hands out (the embedded LTC getwork's refused handoff) for a reason the
+/// shape check cannot see, e.g. "mempool-not-cleaned-for-tip".
+/// check_template_shape refuses such a template, so ingress HOLDs it.
+inline constexpr const char* kTemplateRefusalKey = "refusal";
+
+/// The refusal code a coin node put on the template, if any.
+inline std::optional<std::string> template_refusal_code(const nlohmann::json& tmpl)
+{
+    if (!tmpl.is_object() || !tmpl.contains(kTemplateRefusalKey)
+        || !tmpl[kTemplateRefusalKey].is_string())
+        return std::nullopt;
+    return tmpl[kTemplateRefusalKey].get<std::string>();
+}
+
 /// True when a getblocktemplate-shaped "rules" array names the MWEB
 /// deployment ("mweb", or "!mweb" for the forced-rule spelling).
 inline bool template_rules_have_mweb(const nlohmann::json& tmpl)
@@ -99,10 +114,13 @@ inline bool template_rules_have_mweb(const nlohmann::json& tmpl)
 /// check_block_shape over a getblocktemplate-shaped json. Uses the same view
 /// of the template the block assembler uses: the last "transactions" entry
 /// that carries "data", the "mweb" field, and MWEB-active from the rules.
+/// A template the coin node marked refused (kTemplateRefusalKey) fails too.
 inline std::optional<std::string> check_template_shape(const nlohmann::json& tmpl)
 {
     if (!tmpl.is_object())
         return std::nullopt;
+    if (auto code = template_refusal_code(tmpl))
+        return "the coin node refused this template: " + *code;
     const std::string* last_tx_hex = nullptr;
     if (tmpl.contains("transactions") && tmpl["transactions"].is_array()) {
         const auto& txs = tmpl["transactions"];

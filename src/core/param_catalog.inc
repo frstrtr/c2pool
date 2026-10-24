@@ -509,6 +509,9 @@ C2P_PARAM("embedded.ltc_mweb_fetch_retry", Embedded, TRISTATE_BOOL, RESTART, C_L
 C2P_PARAM("embedded.ltc_mweb_cmpct_provisional", Embedded, BOOL, RESTART, C_LTC, LIT, "false", NONE, "reserved: MWEB state from an unverified compact block (not implemented)")
   C2P_ALIAS("embedded.ltc_mweb_cmpct_provisional", BIN_LTC, "--ltc-mweb-cmpct-provisional", FLAG)
 
+C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
+  C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
+
 C2P_PARAM("embedded.anchor", Embedded, STRING, RESTART, C_BCH, LIT, "", NONE, "BCH anchor H:HASH")
   C2P_ALIAS("embedded.anchor", BIN_BCH, "--anchor", VALUE)
 

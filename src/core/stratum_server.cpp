@@ -1318,6 +1318,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
     snapshot.mweb_active     = job.mweb_active;
+    snapshot.degraded        = job.degraded;
     snapshot.segwit_active   = job.segwit_active;
     snapshot.prev_share_hash = job.prev_share_hash;
     snapshot.subsidy         = job.subsidy;
@@ -1975,6 +1976,7 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         je.segwit_active = cbr.snapshot.segwit_active;
         je.mweb = std::move(cbr.snapshot.mweb);
         je.mweb_active = cbr.snapshot.mweb_active;
+        je.degraded = cbr.snapshot.degraded;
         je.subsidy = cbr.snapshot.subsidy;
         je.witness_commitment_hex = std::move(cbr.snapshot.witness_commitment_hex);
         je.witness_root = cbr.snapshot.witness_root;

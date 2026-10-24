@@ -335,6 +335,10 @@ public:
         return it == bodies_.end() ? nullptr : &it->second;
     }
     std::size_t size() const noexcept { return bodies_.size(); }
+    template <class F>
+    void for_each_id(F&& f) const {
+        for (const auto& kv : bodies_) f(kv.first);
+    }
 
 private:
     std::map<Hash32, CarrierBodyV3> bodies_;
