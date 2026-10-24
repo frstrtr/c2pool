@@ -17,22 +17,15 @@
 // ratchet (rs_step_at in the joined tree), jc1-jc5 (ruling 53: the claimed
 // prefix from x_pre, d below the root a claim, the claimed view at a prefix
 // fork, side bins from served buckets, no below-root best; V1-V16, V2b).
-// --shard=i/n runs the sections of shard i of n (shard_plan); with --out=<p>
-// it writes its result to <p>.i. --gather=n --out=<p> reads the n results and
-// passes when every section ran in exactly one shard and no check failed.
+// Shards and their gather: pathb_kat_shard.hpp.
 // ---------------------------------------------------------------------------
-#include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
-#include <iterator>
-#include <numeric>
 #include <string>
-#include <system_error>
 #include <vector>
 #include "pathb_kat_join.hpp"
+#include "pathb_kat_shard.hpp"
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
 namespace {
@@ -3356,160 +3349,28 @@ void jc6() {
     jc_n3();
 }
 
-// ---------------------------------------------------------------------------
-// The sections, in run order, with their cost (seconds under ASan+UBSan).
-// ---------------------------------------------------------------------------
-struct Section {
-    const char* name;
-    void (*run)();
-    std::uint64_t cost;
-};
-const Section kSections[] = {
-        {"span", span, 173},
-        {"young", young, 194},
-        {"buckets", buckets, 39},
-        {"afterl", afterl, 23},
-        {"claims", claims, 307},
-        {"attempts", attempts, 82},
-        {"candidates", candidates, 102},
-        {"scope", scope, 101},
-        {"header", header, 47},
-        {"d1", d1, 41},
-        {"fastpool", fastpool, 22},
-        {"ratchet", ratchet, 24},
-        {"jc1", jc1, 156},  // ruling 53: V1, V5, V16
-        {"jc2", jc2, 281},  // ruling 53: V2, V2b, V3, V15
-        {"jc3", jc3, 183},  // ruling 53: V4, V6, V14
-        {"jc4", jc4, 253},  // ruling 53: V7, V8, V9, V10, V11, V12
-        {"jc5", jc5, 94},   // ruling 53: V13
-        {"jc6", jc6, 31},   // N-1 (E-86): the FC_HEADERS v0x02 frame head; N-3 (E-102): the header floor
-};
-constexpr std::size_t kSectionCount = std::size(kSections);
-
-// The shard of each section for n shards: the sections by cost, highest first (run order on equal cost), each to the
-// least loaded shard (the lowest index on equal load).
-std::vector<std::size_t> shard_plan(std::size_t n) {
-    std::vector<std::size_t> order(kSectionCount), shard(kSectionCount);
-    std::iota(order.begin(), order.end(), std::size_t{0});
-    std::stable_sort(order.begin(), order.end(),
-                     [](std::size_t a, std::size_t b) { return kSections[a].cost > kSections[b].cost; });
-    std::vector<std::uint64_t> load(n, 0);
-    for (const std::size_t k : order) {
-        const auto s = static_cast<std::size_t>(std::min_element(load.begin(), load.end()) - load.begin());
-        shard[k] = s;
-        load[s] += kSections[k].cost;
-    }
-    return shard;
-}
-
-bool parse_size(const char* b, const char* e, std::size_t& v) {
-    const auto r = std::from_chars(b, e, v);
-    return b != e && r.ec == std::errc{} && r.ptr == e;
-}
-
-// "i/n", n >= 1, i < n.
-bool parse_shard(const std::string& s, std::size_t& i, std::size_t& n) {
-    const auto slash = s.find('/');
-    return slash != std::string::npos && parse_size(s.data(), s.data() + slash, i) &&
-           parse_size(s.data() + slash + 1, s.data() + s.size(), n) && n >= 1 && i < n;
-}
-
-std::string shard_file(const std::string& out, std::size_t i) { return out + "." + std::to_string(i); }
-
-// --gather=n --out=<p>: the results <p>.0 .. <p>.(n - 1) of the n shards; every section in exactly one shard, no
-// failure. The result files are removed once read.
-int gather(const std::string& out, std::size_t n) {
-    long long checks = 0, fails = 0;
-    bool ok = true;
-    std::vector<int> seen(kSectionCount, 0);
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::string path = shard_file(out, i);
-        std::ifstream f(path);
-        std::size_t fi = 0, fn = 0;
-        long long c = 0, fl = 0;
-        if (!(f >> fi >> fn >> c >> fl) || fi != i || fn != n) {
-            std::printf("  FAIL: no result of shard %zu/%zu in %s\n", i, n, path.c_str());
-            ok = false;
-            continue;
-        }
-        std::string ran, name;
-        while (f >> name) {
-            std::size_t k = 0;
-            while (k < kSectionCount && name != kSections[k].name) ++k;
-            if (k == kSectionCount) {
-                std::printf("  FAIL: shard %zu/%zu ran an unknown section %s\n", i, n, name.c_str());
-                ok = false;
-            } else {
-                ++seen[k];
-            }
-            ran += " " + name;
-        }
-        f.close();
-        std::remove(path.c_str());
-        std::printf("[shard %zu/%zu] %lld checks, %lld failures:%s\n", i, n, c, fl, ran.c_str());
-        checks += c;
-        fails += fl;
-    }
-    for (std::size_t k = 0; k < kSectionCount; ++k)
-        if (seen[k] != 1) {
-            std::printf("  FAIL: section %s ran in %d shards\n", kSections[k].name, seen[k]);
-            ok = false;
-        }
-    ok = ok && fails == 0;
-    std::printf("v37_xmr_joiner_kat: %s: %lld checks, %lld failures (%zu shards)\n", ok ? "PASS" : "FAIL", checks,
-                fails, n);
-    return ok ? 0 : 1;
-}
-
-int usage() {
-    std::fprintf(stderr, "usage: v37_xmr_joiner_kat [<section> | --shard=i/n [--out=<p>] | --gather=n --out=<p>]\n");
-    return 2;
-}
-
 }  // namespace
 int main(int argc, char** argv) {
-    std::string only, out;
-    std::size_t shard = 0, shards = 0, gather_n = 0;
-    for (int a = 1; a < argc; ++a) {
-        const std::string arg = argv[a];
-        if (arg.rfind("--shard=", 0) == 0) {
-            if (!parse_shard(arg.substr(8), shard, shards)) return usage();
-        } else if (arg.rfind("--gather=", 0) == 0) {
-            const std::string v = arg.substr(9);
-            if (!parse_size(v.data(), v.data() + v.size(), gather_n) || gather_n == 0) return usage();
-        } else if (arg.rfind("--out=", 0) == 0 && arg.size() > 6) {
-            out = arg.substr(6);
-        } else if (arg.rfind("--", 0) != 0 && only.empty()) {
-            only = arg;
-        } else {
-            return usage();
-        }
-    }
-    if (gather_n) return shards || !only.empty() || out.empty() ? usage() : gather(out, gather_n);
-    if ((shards && !only.empty()) || (!out.empty() && !shards)) return usage();
-    const std::vector<std::size_t> plan = shard_plan(shards ? shards : 1);
-    if (!out.empty()) std::remove(shard_file(out, shard).c_str());
-    std::string ran;
-    for (std::size_t k = 0; k < kSectionCount; ++k) {
-        const Section& s = kSections[k];
-        if ((!only.empty() && only != s.name) || (shards && plan[k] != shard)) continue;
-        const auto t0 = std::chrono::steady_clock::now();
-        const int f0 = g_fail;
-        run_part(s.name, s.run);
-        std::printf("[%s] %.1f s%s\n", s.name, secs(t0), g_fail != f0 ? " FAIL" : "");
-        std::fflush(stdout);
-        ran += std::string(" ") + s.name;
-    }
-    if (!shards) return finish("v37_xmr_joiner_kat");
-    const std::string label = "v37_xmr_joiner_kat shard " + std::to_string(shard) + "/" + std::to_string(shards);
-    int rc = finish(label.c_str());
-    if (!out.empty()) {
-        std::ofstream f(shard_file(out, shard));
-        f << shard << ' ' << shards << ' ' << g_checks << ' ' << g_fail << '\n' << ran << '\n';
-        if (!f) {
-            std::printf("  FAIL: cannot write %s\n", shard_file(out, shard).c_str());
-            rc = 1;
-        }
-    }
-    return rc;
+    return run_sections("v37_xmr_joiner_kat",
+                        {
+                                {"span", span, 173},
+                                {"young", young, 194},
+                                {"buckets", buckets, 39},
+                                {"afterl", afterl, 23},
+                                {"claims", claims, 307},
+                                {"attempts", attempts, 82},
+                                {"candidates", candidates, 102},
+                                {"scope", scope, 101},
+                                {"header", header, 47},
+                                {"d1", d1, 41},
+                                {"fastpool", fastpool, 22},
+                                {"ratchet", ratchet, 24},
+                                {"jc1", jc1, 156},  // ruling 53: V1, V5, V16
+                                {"jc2", jc2, 281},  // ruling 53: V2, V2b, V3, V15
+                                {"jc3", jc3, 183},  // ruling 53: V4, V6, V14
+                                {"jc4", jc4, 253},  // ruling 53: V7, V8, V9, V10, V11, V12
+                                {"jc5", jc5, 94},   // ruling 53: V13
+                                {"jc6", jc6, 31},   // N-1 (E-86): the FC_HEADERS v0x02 frame head; N-3 (E-102): the header floor
+                        },
+                        argc, argv);
 }
