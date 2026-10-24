@@ -11,6 +11,7 @@
 #include <impl/ltc/coin/mweb_builder.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -435,6 +436,10 @@ TEST(MWEBBuilder, BuildEmptyMwebBlockNonEmpty) {
     EXPECT_GT(raw.size(), 50u);
 }
 
+// make_test_state()'s block had kernels (kernel_mmr_size 200, a kernel root
+// and a stealth offset). The next block's body is empty, so its header is
+// built as libmw's CoinsViewCache::BuildNextBlock builds it: the cumulative
+// fields carry over, the per-block fields are zero.
 TEST(MWEBBuilder, BuildEmptyMwebBlockRoundTrip) {
     auto state = make_test_state();
     uint32_t next_height = 1001;
@@ -447,12 +452,19 @@ TEST(MWEBBuilder, BuildEmptyMwebBlockRoundTrip) {
 
     // Height should be updated
     EXPECT_EQ(block.header.height, static_cast<int64_t>(next_height));
-    // Roots should carry forward from state
+    // Cumulative chain state carries forward from state
     EXPECT_EQ(block.header.output_root, state.prev_header.output_root);
-    EXPECT_EQ(block.header.kernel_root, state.prev_header.kernel_root);
     EXPECT_EQ(block.header.leafset_root, state.prev_header.leafset_root);
     EXPECT_EQ(block.header.output_mmr_size, state.prev_header.output_mmr_size);
-    EXPECT_EQ(block.header.kernel_mmr_size, state.prev_header.kernel_mmr_size);
+    EXPECT_EQ(block.header.kernel_offset, state.prev_header.kernel_offset);
+    // Per-block fields describe the (empty) body
+    EXPECT_TRUE(block.header.kernel_root.IsNull());
+    EXPECT_EQ(block.header.kernel_mmr_size, 0u);
+    EXPECT_EQ(block.header.stealth_offset, (std::array<uint8_t, 32>{}));
+
+    // The HogAddr commits to that same header.
+    EXPECT_EQ(MWEBBuilder::compute_mweb_hash(state, next_height),
+              blake3_hash_serialized(block.header));
 }
 
 TEST(MWEBBuilder, BuildEmptyMwebBlockHeightUpdated) {
