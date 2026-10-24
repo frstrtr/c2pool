@@ -1240,10 +1240,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             std::memcpy(out.seed.data(), seed.data(), 32);
             return true;
         };
-        cs.rx = [&node_rx](const std::vector<std::uint8_t>& blob, const ::v37::bytes32& seed, ::v37::bytes32& pow) {
-            o2::Hash32 s{}, out{};
+        // a hash not computed leaves as RandomxFailure (the relay's alarm; the context judged again later)
+        cs.rx = [node_hash](const std::vector<std::uint8_t>& blob, const ::v37::bytes32& seed, ::v37::bytes32& pow) {
+            pb::Hash32 s{}, out{};
             std::memcpy(s.data(), seed.data(), 32);
-            if (!node_rx.randomx_hash(blob.data(), blob.size(), 0, s, out)) return false;
+            pb::rx_hash_or_fail(node_hash, blob, s, out);
             std::memcpy(pow.data(), out.data(), 32);
             return true;
         };
