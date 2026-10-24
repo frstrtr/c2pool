@@ -251,8 +251,8 @@ public:
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
             selected_bytes += packed.get_span().size();
             std::string hex_data = HexStr(packed.get_span());
-            // wtxid = SHA256d of witness serialization (for witness merkle tree)
-            uint256     wtxid    = Hash(packed.get_span());
+            // wtxid for the witness merkle tree (litecoind GetWitnessHash)
+            uint256     wtxid    = compute_wtxid(stx.tx);
 
             nlohmann::json entry;
             entry["data"] = hex_data;

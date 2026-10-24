@@ -53,21 +53,39 @@ struct MempoolEntry {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Compute txid = SHA256d of legacy (non-witness) serialization.
+/// Compute the txid as litecoind does (CTransaction::ComputeHash): an
+/// MWEB-only tx is identified by its first kernel id; any other tx by the
+/// SHA256d of its serialization without witness and MWEB data.
 inline uint256 compute_txid(const MutableTransaction& tx) {
+    if (tx.IsMWEBOnly()) {
+        auto mw = mweb_wire::summarize_mw_transaction(tx.mweb_tx_raw);
+        if (mw && !mw->kernels.empty())
+            return mw->kernels.front().kernel_id;
+    }
     auto packed = pack(TX_NO_WITNESS(tx));
     return Hash(packed.get_span());
 }
 
+/// Compute the wtxid as litecoind does (CTransaction::ComputeWitnessHash):
+/// the txid when there is no witness, else the SHA256d of the serialization
+/// with witness and without MWEB data.
+inline uint256 compute_wtxid(const MutableTransaction& tx) {
+    if (!tx.HasWitness())
+        return compute_txid(tx);
+    auto packed = pack(TX_WTXID(tx));
+    return Hash(packed.get_span());
+}
+
 /// Compute BIP 141 weight: base_size*4 + witness_size.
-/// base_size = legacy serialized bytes; full_size = with-witness bytes.
+/// base_size = legacy serialized bytes; full_size = with-witness bytes; both
+/// without MWEB data (litecoind GetTransactionWeight).
 inline void compute_tx_weight(const MutableTransaction& tx,
                                uint32_t& base_size,
                                uint32_t& witness_size,
                                uint32_t& weight)
 {
     auto legacy = pack(TX_NO_WITNESS(tx));
-    auto full   = pack(TX_WITH_WITNESS(tx));
+    auto full   = pack(TX_WTXID(tx));
     base_size    = static_cast<uint32_t>(legacy.size());
     uint32_t full_sz = static_cast<uint32_t>(full.size());
     witness_size = full_sz > base_size ? full_sz - base_size : 0;
@@ -576,11 +594,8 @@ public:
     std::map<uint256, MutableTransaction> all_txs_map_wtxid() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::map<uint256, MutableTransaction> out;
-        for (const auto& [txid, entry] : m_pool) {
-            auto packed = pack(TX_WITH_WITNESS(entry.tx));
-            uint256 wtxid = Hash(packed.get_span());
-            out[wtxid] = entry.tx;
-        }
+        for (const auto& [txid, entry] : m_pool)
+            out[compute_wtxid(entry.tx)] = entry.tx;
         return out;
     }
 

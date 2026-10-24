@@ -97,7 +97,9 @@ BlockType make_fake_block_with_hogex(const uint256& hogex_txid_unused) {
     return block;
 }
 
-/// Build raw MWEB block bytes from a synthetic header.
+/// Build raw MWEB block bytes from a synthetic header. The body is empty, so
+/// the header's kernel count is 0 (mw::Block::Validate; the tracker refuses a
+/// header that disagrees with its body).
 std::vector<unsigned char> make_test_mweb_raw() {
     MWEBBlock mweb_block;
     mweb_block.header.height = 1000;
@@ -107,7 +109,7 @@ std::vector<unsigned char> make_test_mweb_raw() {
     mweb_block.header.kernel_offset.fill(0x44);
     mweb_block.header.stealth_offset.fill(0x55);
     mweb_block.header.output_mmr_size = 500;
-    mweb_block.header.kernel_mmr_size = 200;
+    mweb_block.header.kernel_mmr_size = 0;
 
     PackStream ps;
     ps << mweb_block;

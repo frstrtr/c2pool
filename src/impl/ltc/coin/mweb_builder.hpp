@@ -120,14 +120,18 @@ struct MWEBHeader {
     }
 };
 
-// ─── MWEB TxBody (empty) ───────────────────────────────────────────────────
+// ─── MWEB TxBody ───────────────────────────────────────────────────────────
 
-/// Empty MWEB transaction body — 3 zero-varint vectors.
+/// MWEB transaction body (libmw TxBody: vec<Input> vec<Output> vec<Kernel>,
+/// CompactSize lengths). Embedded mode only produces empty bodies, so
+/// Serialize writes three empty vectors; Unserialize walks a real body item
+/// by item (mweb_tx_wire.hpp) and keeps its summary.
 struct MWEBTxBody {
-    // For carry-forward with no MWEB activity, all vectors are empty.
+    mweb_wire::MwebBodySummary summary;
+
     template <typename Stream>
     void Serialize(Stream& s) const {
-        // inputs: varint(0), outputs: varint(0), kernels: varint(0)
+        // inputs, outputs, kernels: CompactSize(0) each
         uint8_t zero = 0;
         ::Serialize(s, zero);
         ::Serialize(s, zero);
@@ -136,12 +140,7 @@ struct MWEBTxBody {
 
     template <typename Stream>
     void Unserialize(Stream& s) {
-        // Skip varint-encoded vector lengths
-        uint64_t n_inputs, n_outputs, n_kernels;
-        ::Unserialize(s, VARINT(n_inputs));
-        ::Unserialize(s, VARINT(n_outputs));
-        ::Unserialize(s, VARINT(n_kernels));
-        // We don't parse individual items — embedded mode only produces empty bodies
+        summary = mweb_wire::read_mw_body(s);
     }
 };
 
@@ -226,6 +225,17 @@ public:
             return false;
         }
 
+        // A block's transactions never carry MWEB data: litecoind strips it
+        // from a peg-in and keeps MWEB-only txs out of vtx; a block with it
+        // is mutated (mweb_node.cpp CheckBlock: unexpected-mweb-data).
+        for (size_t i = 0; i < block.m_txs.size(); ++i) {
+            if (block.m_txs[i].HasMWEBTx()) {
+                LOG_WARNING << "[MWEB] Block at height " << block_height
+                            << " refused: unexpected-mweb-data (tx " << i << ")";
+                return false;
+            }
+        }
+
         // Last transaction should be HogEx
         const auto& hogex_tx = block.m_txs.back();
         if (hogex_tx.vout.empty()) {
@@ -270,6 +280,9 @@ public:
     /// Extract MWEB header from raw MWEB block bytes.
     /// These bytes come after the transaction list in the full block serialization,
     /// prefixed by the OptionalPtr 0x01 byte.
+    /// The bytes must be exactly one mw::Block (header + body walked to the
+    /// end), and the header's kernel count must be the body's
+    /// (mw::Block::Validate); otherwise the block is not trusted for state.
     static bool extract_mweb_header_from_raw(const std::vector<unsigned char>& mweb_raw,
                                               MWEBState& state) {
         if (mweb_raw.empty()) {
@@ -282,12 +295,26 @@ public:
             // The raw bytes ARE the mw::Block (Header + TxBody), no OptionalPtr wrapper
             MWEBBlock mweb_block;
             ps >> mweb_block;
+            if (ps.cursor_size() != 0) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: " << ps.cursor_size()
+                            << " bytes after the mw::Block (" << mweb_raw.size() << " B)";
+                return false;
+            }
+            if (mweb_block.header.kernel_mmr_size != mweb_block.body.summary.kernels.size()) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: header kernel count "
+                            << mweb_block.header.kernel_mmr_size << " != body kernels "
+                            << mweb_block.body.summary.kernels.size();
+                return false;
+            }
             state.prev_header = mweb_block.header;
             state.prev_mweb_raw = mweb_raw;
 
             LOG_INFO << "[MWEB] Parsed header: height=" << mweb_block.header.height
                      << " output_mmr=" << mweb_block.header.output_mmr_size
-                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size;
+                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size
+                     << " body=" << mweb_block.body.summary.n_inputs << "/"
+                     << mweb_block.body.summary.n_outputs << "/"
+                     << mweb_block.body.summary.kernels.size();
             return true;
         } catch (const std::exception& e) {
             LOG_WARNING << "[MWEB] Failed to parse MWEB block: " << e.what();

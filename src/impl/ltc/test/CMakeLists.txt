@@ -94,6 +94,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # carried; kernel root, kernel count and stealth offset zero), byte-equal to
     # REAL mainnet blocks 3200604 and litecoind's 3200605 template
     # (ltc_mweb_tx_fixtures.hpp). Same folding rule.
+    #
+    # mweb_tx_wire_test.cpp: txs carrying an mw::Transaction (REAL mainnet
+    # peg-in and peg-out) parse to the end of the message with litecoind's
+    # txid / wtxid / locktime / re-encoding; truncation, trailing bytes and
+    # malformed MWEB parts are refused; mw::Block bodies walk exactly with
+    # CompactSize lengths; a block with MWEB data in a transaction is refused
+    # (unexpected-mweb-data). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -120,6 +127,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mweb_next_header_test.cpp
+        mweb_tx_wire_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
         pool_rate_head_select_test.cpp
