@@ -2520,7 +2520,12 @@ int main(int argc, char* argv[]) {
                                 return true;
                             });
                         if (rw.disconnected > 0) {
-                            utxo->flush(rw.hash, rw.height);
+                            if (!utxo->flush(rw.hash, rw.height)) {
+                                LOG_ERROR << "[EMB-LTC] UTXO flush failed after disconnecting "
+                                          << rw.disconnected << " blocks (" << reason
+                                          << "); undo data kept, UTXO DB still at h=" << before;
+                                return false;
+                            }
                             for (uint32_t h : undone)
                                 utxo_db->remove_block_undo(h);
                             LOG_WARNING << "[EMB-LTC] UTXO rewound to the best chain (" << reason
@@ -2532,8 +2537,9 @@ int main(int argc, char* argv[]) {
                             LOG_ERROR << "[EMB-LTC] UTXO set cannot be brought back to the best chain ("
                                       << reason << "): stuck at h=" << rw.height << " "
                                       << rw.hash.GetHex().substr(0, 16)
-                                      << "... (undo data missing or deeper than "
-                                      << core::coin::LTC_MIN_BLOCKS_TO_KEEP << " blocks)";
+                                      << "... (undo data missing, deeper than "
+                                      << core::coin::LTC_MIN_BLOCKS_TO_KEEP
+                                      << " blocks, or a height the header chain cannot judge)";
                             return false;
                         }
                         if (rw.disconnected == 0 && kind == UtxoHeal::ParentMismatch) {
