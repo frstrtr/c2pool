@@ -160,7 +160,8 @@ struct PathbNodeIo {
     const FollowerBranchView* monero = nullptr;
     std::function<PrInfo(const Hash32& p_r)> resolve_pr;
     std::function<std::optional<Hash32>(const Hash32& p_r)> seed_of;
-    // RandomX of a hashing blob at d with the seed (the verify workers)
+    // RandomX of a hashing blob at d with the seed (the verify workers): false = the hash computed does not meet d;
+    // a hash not computed throws (RandomxFailure: verify_rx_at_d)
     std::function<bool(const HashingBlob&, std::uint64_t d, const Hash32& seed)> verify;
     // the follower's main chain: its tip height and the block at a height
     std::function<std::optional<std::uint64_t>()> monero_tip;
@@ -173,6 +174,27 @@ struct PathbNodeIo {
     // FB_GETCTX of a Monero block from any peer into the follower within the timeout (a join attempt's context)
     std::function<bool(const Hash32& id, std::uint64_t timeout_s)> fetch_context;
 };
+
+// RandomX through a hash function `hash(bytes, seed, pow, why)`: true with the hash in `pow`, or false with `why`
+// when it computed no hash (the verifier not ready, a seed whose cache cannot be keyed, a VM error). No hash computed
+// is node-internal: it leaves as RandomxFailure with its reason, never as a PoW verdict.
+template <class HashFn>
+void rx_hash_or_fail(HashFn&& hash, const std::vector<std::uint8_t>& bytes, const Hash32& seed, Hash32& pow) {
+    std::string why;
+    if (!hash(bytes, seed, pow, why))
+        throw RandomxFailure("RandomX computed no hash: " + (why.empty() ? std::string("no reason given") : why));
+}
+// PathbNodeIo::verify over such a hash function: the hash computed is judged at d (false: it does not meet d).
+template <class HashFn>
+bool verify_rx_at_d(HashFn&& hash, const HashingBlob& b, std::uint64_t d, const Hash32& seed) {
+    std::vector<std::uint8_t> bytes;
+    encode_hashing_blob(b, bytes);
+    Hash32 pow{};
+    rx_hash_or_fail(hash, bytes, seed, pow);
+    unsigned char h[32];
+    std::copy(pow.begin(), pow.end(), h);
+    return ::xmr::coin::check_hash(h, d);
+}
 
 // ---------------------------------------------------------------------------
 // Outcomes

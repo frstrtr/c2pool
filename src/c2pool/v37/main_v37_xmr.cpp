@@ -1115,14 +1115,21 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         if (!b) return std::nullopt;
         return nn->index().seed_hash_for_height(b->height + 1);
     };
-    io.verify = [&node_rx](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& seed) {
-        std::vector<std::uint8_t> bytes;
-        pb::encode_hashing_blob(b, bytes);
-        o2::Hash32 out{};
-        if (!node_rx.randomx_hash(bytes.data(), bytes.size(), 0, seed, out)) return false;
-        unsigned char h[32];
-        std::copy(out.begin(), out.end(), h);
-        return ::xmr::coin::check_hash(h, d);
+    // RandomX on the node's verifier: the hash, or false with the reason it computed none
+    const auto node_hash = [&node_rx](const std::vector<std::uint8_t>& bytes, const pb::Hash32& seed, pb::Hash32& pow,
+                                      std::string& why) {
+        if (node_rx.randomx_hash(bytes.data(), bytes.size(), 0, seed, pow)) return true;
+        if (!node_rx.ready())
+            why = std::string("the node verifier is not ready (") + o2::O2RandomXVerifier::to_string(node_rx.mode()) + ")";
+        else if (!node_rx.seed_resident(seed))
+            why = "the seed " + hex_of(seed).substr(0, 16) + " is not keyed (its cache could not be built)";
+        else
+            why = "the VM gave no hash with the seed " + hex_of(seed).substr(0, 16);
+        return false;
+    };
+    // a hash not computed leaves as RandomxFailure (node-internal), never as a PoW verdict
+    io.verify = [node_hash](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& seed) {
+        return pb::verify_rx_at_d(node_hash, b, d, seed);
     };
     io.monero_tip = [nn]() -> std::optional<std::uint64_t> {
         const auto t = nn->index().tip();
