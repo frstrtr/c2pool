@@ -84,6 +84,19 @@
 //                nothing indexed; the relay strikes once and logs it;
 //   hdrseed      a header whose P_r's seed is not held: DEFER (Seed), no
 //                ban; asked again once held, J at the tip;
+//   catchpage    an empty-store catch-up of 1,300 positions from three servers
+//                finishes; one page in flight per server; the bodies asked
+//                within the deferred store's free room;
+//   catchhold    a server answers headers and serves no body: the other
+//                servers are asked the bodies; J reaches the tip in 60 s;
+//   catchslow    a server serves one body per 10 s: J reaches the tip in 60 s;
+//   catchgone    a server leaves with a page of its own branch in flight: its
+//                asks leave the deferred store's room at P-53; J reaches the
+//                other servers' tip in 60 s;
+//   catchlost    the only server loses J's first body request: the page lapses
+//                at P-53; J reaches the tip in 60 s;
+//   catchfull    a full deferred store: at least the first missing body per
+//                page; J reaches the tip in 60 s;
 //   buckets      a full node's FC_GETBUCKETS: one assembly per (peer, at), a
 //                prefix assembled across frames P-53 - 1 s apart, a gap of
 //                P-53 + 1 s ends it and the late frame DROPs, 0 tokens;
@@ -5985,6 +5998,318 @@ void hdrseed() {
     check(h[j].tree().best().id == tip, "hdrseed: J at S's tip");
 }
 
+// ---------------------------------------------------------------------------
+// catchpage: the empty-store catch-up beyond one page. A, B and C hold one chain of 1,300 positions (more than
+// P-01 = P-47 = 1,152); J, empty, catches up from all three while the wire carries at most 100 frames per second of
+// the clock. J reaches the tip; one page in flight per server (catch-up requests bounded by the pages); the bodies
+// asked within the deferred store's free room (bodies asked <= the chain + P-47).
+void catchpage() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;  // P-14: one FC_HEADERS frame holds a full page of P-01 headers
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t n = 1300;
+    bool mined = true;
+    for (std::uint64_t i = 0; i < n && mined; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        mined = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 20000 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    const bool held = h[b.node].tree().best().id == tip && h[c.node].tree().best().id == tip;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    std::uint64_t bodies_asked = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) bodies_asked += q.ids.size();
+    };
+    w.connect(3, 0);
+    w.connect(3, 1);
+    w.connect(3, 2);
+    int secs = 0;
+    for (; secs < 1800 && h[j.node].tree().best().id != tip; ++secs) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
+    w.edit = nullptr;
+    const std::uint64_t asks = j.relay->stats().catchup_requests.load();
+    std::printf("  catchpage: mined %d (A at %llu, B and C held %d); J at %llu after %d s; catch-up asks %llu; bodies asked %llu\n",
+                mined ? 1 : 0, (unsigned long long)h[a.node].tree().best().pos, held ? 1 : 0,
+                (unsigned long long)h[j.node].tree().best().pos, secs, (unsigned long long)asks, (unsigned long long)bodies_asked);
+    check(mined && held && h[a.node].tree().best().pos == n, "catchpage: A, B and C at 1,300 positions");
+    check(h[j.node].tree().best().id == tip, "catchpage: J reaches the tip");
+    check(asks <= 3 * (n / 1152 + 3), "catchpage: one page in flight per server (catch-up asks " + std::to_string(asks) + ")");
+    check(bodies_asked <= n + 1152, "catchpage: the bodies asked within the deferred store's free room (bodies asked " + std::to_string(bodies_asked) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// The catch-up against servers that do not serve the bodies they are asked. catch_chain: A, B and C hold one chain of
+// n positions (A mines; B and C follow over the wire). catch_second: one second of the clock, every relay's tick and
+// pump, then at most 100 frames on the wire.
+bool catch_chain(Harness& h, FakeWire& w, KatRelay& a, KatRelay& b, KatRelay& c, std::uint64_t n, std::uint32_t seed) {
+    w.connect(a.node, b.node);
+    w.connect(a.node, c.node);
+    w.connect(b.node, c.node);
+    w.run();
+    bool mined = true;
+    for (std::uint64_t i = 0; i < n && mined; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        mined = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), seed + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    return mined && h[b.node].tree().best().id == tip && h[c.node].tree().best().id == tip
+           && h[a.node].tree().best().pos == n;
+}
+void catch_second(Harness& h, FakeWire& w, std::initializer_list<pb::PathbRelayNode*> rs) {
+    h.now += 1;
+    for (pb::PathbRelayNode* r : rs) {
+        r->tick();
+        r->pump();
+    }
+    for (int m = 0; m < 100 && w.step(); ++m) {
+    }
+}
+
+// catchhold: A, B and C hold 300 positions; A answers J's FC_GETHEADERS first and serves no body (J's FC_GETCARRIER to
+// A dropped); B and C serve. J, empty, reaches the tip within 60 s: B and C are asked the bodies.
+void catchhold() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    const std::uint64_t n = 300;
+    const bool ok = catch_chain(h, w, a, b, c, n, 30000);
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    std::uint64_t to[3] = {0, 0, 0};
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier || m.to > 2) return;
+        pb::GetCarrier q;
+        if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) to[m.to] += q.ids.size();
+        if (m.to == 0) m.f.clear();  // A serves no body
+    };
+    w.connect(3, 0);
+    w.connect(3, 1);
+    w.connect(3, 2);
+    int secs = 0;
+    for (; secs < 600 && h[j.node].tree().best().id != tip; ++secs)
+        catch_second(h, w, {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()});
+    w.edit = nullptr;
+    std::printf("  catchhold: chain %d; J at %llu of %llu after %d s; bodies asked of A %llu, B %llu, C %llu; catch-up asks %llu\n",
+                ok ? 1 : 0, (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)n, secs,
+                (unsigned long long)to[0], (unsigned long long)to[1], (unsigned long long)to[2],
+                (unsigned long long)j.relay->stats().catchup_requests.load());
+    check(ok, "catchhold: A, B and C at 300 positions");
+    check(h[j.node].tree().best().id == tip && secs <= 60 && to[1] + to[2] > 0,
+          "catchhold: J reaches the tip within 60 s although A serves no body (" + std::to_string(secs) + " s)");
+}
+
+// catchslow: A, B and C hold 300 positions; A answers J's FC_GETHEADERS first and serves one body every 10 s (in the
+// order J asked them); B and C serve. J, empty, reaches the tip within 60 s.
+void catchslow() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    const std::uint64_t n = 300;
+    const bool ok = catch_chain(h, w, a, b, c, n, 31000);
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    std::uint64_t to[3] = {0, 0, 0};
+    std::deque<pb::Hash32> pend;
+    std::set<pb::Hash32> passing;
+    std::optional<pb::GetCarrier> proto;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier || m.to > 2) return;
+        pb::GetCarrier q;
+        if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
+        if (m.to == 0 && q.ids.size() == 1 && passing.erase(q.ids[0]) != 0) return;  // the body A serves now
+        to[m.to] += q.ids.size();
+        if (m.to != 0) return;
+        if (!proto) proto = q;
+        for (const pb::Hash32& id : q.ids) pend.push_back(id);
+        m.f.clear();
+    };
+    w.connect(3, 0);
+    w.connect(3, 1);
+    w.connect(3, 2);
+    int secs = 0;
+    std::uint64_t last = 0, served = 0;
+    for (; secs < 600 && h[j.node].tree().best().id != tip; ++secs) {
+        if (!pend.empty() && h.now >= last + 10 && proto) {
+            pb::GetCarrier q1 = *proto;
+            q1.ids = {pend.front()};
+            pend.pop_front();
+            passing.insert(q1.ids[0]);
+            if (const std::optional<std::vector<std::uint8_t>> f = pb::encode_fc_getcarrier(q1, pb::kRuledLaneParams)) {
+                const std::lock_guard<std::mutex> lk(w.qm);
+                w.q.push_back(FakeWire::Msg{j.links->self, 0, *f});
+            }
+            last = h.now;
+            ++served;
+        }
+        catch_second(h, w, {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()});
+    }
+    w.edit = nullptr;
+    std::printf("  catchslow: chain %d; J at %llu of %llu after %d s; A served %llu; bodies asked of A %llu, B %llu, C %llu; catch-up asks %llu\n",
+                ok ? 1 : 0, (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)n, secs,
+                (unsigned long long)served, (unsigned long long)to[0], (unsigned long long)to[1],
+                (unsigned long long)to[2], (unsigned long long)j.relay->stats().catchup_requests.load());
+    check(ok, "catchslow: A, B and C at 300 positions");
+    check(h[j.node].tree().best().id == tip && secs <= 60,
+          "catchslow: J reaches the tip within 60 s although A serves one body per 10 s (" + std::to_string(secs) + " s)");
+}
+
+// catchgone: J's deferred store holds 8. A holds 12 positions of its own branch, answers J's FC_GETHEADERS, serves no
+// body, and its link drops once J asked it for bodies (a page in flight); then J links to B and C, which hold another
+// chain of 100 positions. A's asks are never answered and leave the store's room at P-53: J reaches the tip of B and C
+// within 60 s.
+void catchgone() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), false);
+    bool ok = true;
+    for (std::uint32_t i = 0; i < 12; ++i)  // A's own branch (A linked to nobody)
+        ok = ok && mine_on(h, w, a.node, i % 5, 32000 + i);
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t n = 100;
+    for (std::uint64_t i = 0; i < n && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, b.node, static_cast<std::size_t>(i % 5), 32100 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[b.node].tree().best().id;
+    ok = ok && h[c.node].tree().best().id == tip && h[b.node].tree().best().pos == n && h[a.node].tree().best().pos == 12;
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& cf) { cf.waiting_cap = 8; });
+    std::uint64_t asked_a = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.to != 0 || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) asked_a += q.ids.size();
+        m.f.clear();  // A serves no body
+    };
+    w.connect(3, 0);
+    int secs = 0;
+    for (; secs < 60 && asked_a == 0; ++secs) catch_second(h, w, {a.relay.get(), j.relay.get()});
+    j.links->disconnect(w.id(3, 0));
+    w.run();
+    const int t_gone = secs;
+    w.connect(3, 1);
+    w.connect(3, 2);
+    for (secs = 0; secs < 600 && h[j.node].tree().best().id != tip; ++secs)
+        catch_second(h, w, {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()});
+    w.edit = nullptr;
+    std::printf("  catchgone: chain %d; A asked %llu bodies of its branch, its link dropped at %d s; J at %llu of %llu after %d s; catch-up asks %llu\n",
+                ok ? 1 : 0, (unsigned long long)asked_a, t_gone, (unsigned long long)h[j.node].tree().best().pos,
+                (unsigned long long)n, secs, (unsigned long long)j.relay->stats().catchup_requests.load());
+    check(ok && asked_a == 8, "catchgone: A at 12 of its own, B and C at 100; A asked the store's room (8)");
+    check(h[j.node].tree().best().id == tip && secs <= 60,
+          "catchgone: J reaches the tip within 60 s after A left with a page in flight (" + std::to_string(secs) + " s)");
+}
+
+// catchlost: A, J's only server, holds 100 positions; J's first body request to A (every FC_GETCARRIER frame of its
+// first page) is lost on the wire. The page lapses at P-53 and J asks again: J reaches the tip within 60 s.
+void catchlost() {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    const std::uint64_t n = 100;
+    for (std::uint64_t i = 0; i < n && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 33000 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    std::uint64_t requests = 0, lost = 0, first_s = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.from != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcGetCarrier) return;
+        if (requests++ == 0) first_s = h.now;
+        if (h.now == first_s) {  // the first body request lost
+            m.f.clear();
+            ++lost;
+        }
+    };
+    w.connect(1, 0);
+    int secs = 0;
+    for (; secs < 600 && h[j.node].tree().best().id != tip; ++secs) catch_second(h, w, {a.relay.get(), j.relay.get()});
+    w.edit = nullptr;
+    std::printf("  catchlost: chain %d; J at %llu of %llu after %d s; body request frames %llu, lost %llu; catch-up asks %llu\n",
+                ok ? 1 : 0, (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)n, secs,
+                (unsigned long long)requests, (unsigned long long)lost,
+                (unsigned long long)j.relay->stats().catchup_requests.load());
+    check(ok && h[a.node].tree().best().pos == n, "catchlost: A at 100 positions");
+    check(h[j.node].tree().best().id == tip && secs <= 60,
+          "catchlost: J reaches the tip within 60 s after its first body request was lost (" + std::to_string(secs) + " s)");
+}
+
+// catchfull: J's deferred store (cap 4) is full of frames that never resolve: positions 2..6 of E's branch (its
+// position 1 never sent), parked on their parents. J then catches up 20 positions from A alone: the room is 0, and at
+// least the first missing body per page carries it within 60 s.
+void catchfull() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay d = kat_relay(h, w, table0(net), false);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.waiting_cap = 4; });
+    KatRelay e = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 6; ++i)  // E's own branch (E linked to nobody)
+        ok = ok && mine_on(h, w, e.node, static_cast<std::size_t>(i % 5), 1700 + static_cast<std::uint32_t>(i));
+    w.connect(2, 1);
+    w.run();
+    for (std::uint64_t x = 2; x <= 6; ++x) {
+        const std::optional<pb::Hash32> id = h[e.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[e.node].bodies().get(*id) : nullptr;
+        if (body == nullptr) continue;
+        j.relay->receive(w.id(2, 1), *pb::encode_fc_carrier(0, *body, 16));
+        w.run();
+    }
+    const std::size_t held = h[j.node].deferred().size();
+    for (int i = 0; i < 20; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 1800 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    w.connect(2, 0);
+    int secs = 0;
+    for (; secs < 600 && h[j.node].tree().best().id != tip; ++secs)
+        catch_second(h, w, {a.relay.get(), d.relay.get(), j.relay.get(), e.relay.get()});
+    std::printf("  catchfull: E at %llu, parked at J %zu (cap %llu, waiting %zu); A at %llu; J at %llu after %d s; parked at the end %zu; catch-up asks %llu\n",
+                (unsigned long long)h[e.node].tree().best().pos, held, (unsigned long long)h[j.node].deferred_cap(),
+                h[j.node].tree().waiting(), (unsigned long long)h[a.node].tree().best().pos,
+                (unsigned long long)h[j.node].tree().best().pos, secs, h[j.node].deferred().size(),
+                (unsigned long long)j.relay->stats().catchup_requests.load());
+    check(ok && held == 4, "catchfull: E at 6, A at 20; J's deferred store full (4 of 4) before the catch-up");
+    check(h[j.node].tree().best().id == tip && secs <= 60,
+          "catchfull: J reaches the tip within 60 s with a full deferred store (" + std::to_string(secs) + " s)");
+}
+
 // relaybindswitch: a carrier the walk of a receipt binds and places is counted as a received frame. A, L and X: L, cut
 // off, mines z1 and z2 (carrying nothing) while A and X take A's y1. X gets a receipt of L's on z2 and no carrier of L:
 // the receipt's walk fetches the branch's headers and the bind places z1 and z2, switching X to z2 by its journal. X's
@@ -6873,6 +7198,11 @@ void parkidx() {
     }
     w.connect(0, 1);
     w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().best().id != h[a.node].tree().best().id; ++i) {  // one page in flight
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
     ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id;
     h.tick_monero();
     const pb::Hash32 S = h[a.node].make_template(h.now).p_r;
@@ -7899,6 +8229,12 @@ int main(int argc, char** argv) {
     run("relayj1stale", relayj1stale);
     run("hdrstrike", hdrstrike);
     run("hdrseed", hdrseed);
+    run("catchpage", catchpage);
+    run("catchhold", catchhold);
+    run("catchslow", catchslow);
+    run("catchgone", catchgone);
+    run("catchlost", catchlost);
+    run("catchfull", catchfull);
     run("buckets", buckets);
     run("relaytok", relaytok);
     run("relaym4", relaym4);

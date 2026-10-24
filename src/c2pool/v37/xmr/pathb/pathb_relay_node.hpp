@@ -1079,6 +1079,9 @@ private:
         std::uint32_t step = 0;          // the locator step of `from`: the best tip, then pos - 1, pos - 2, pos - 4, ...
         Hash32 asked_best{};
         std::uint64_t asked_ms = 0;
+        Hash32 fetch_tip{};              // the last FetchBodies page's tip, while its bodies are in flight
+        Hash32 fetch_best{};             // the best tip at the page's last progress
+        std::uint64_t fetch_ms = 0;      // ... and its time
     };
     // A catch-up or headers-first request deferred on a P_r: asked again once that P_r resolves.
     struct HdrOnCtx {
@@ -2658,6 +2661,14 @@ private:
                         case K::Ban:
                         case K::Strike:
                         case K::Undecodable: catchup_.erase(it); break;
+                        case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
+                                              // the page lapses
+                            if (o.fetch_last != Hash32{}) {
+                                it->second.fetch_tip = o.fetch_last;
+                                it->second.fetch_best = node_->tree().best().id;
+                                it->second.fetch_ms = now_ms();
+                            }
+                            break;
                         default: break;
                     }
                 }
@@ -3291,13 +3302,26 @@ private:
                             hex_short(hd->second.fetch) + " past its context's time: its tip offered to the joiner");
                     }
                 }
+                // a page whose bodies are in flight: no new ask until its tip is placed, or the best did not move within
+                // P-53 (the page lapsed)
+                Catchup& c = it->second;
+                if (c.fetch_tip != Hash32{}) {
+                    if (node_->tree().find(c.fetch_tip) != nullptr) {
+                        c.fetch_tip = Hash32{};
+                    } else if (b.id != c.fetch_best) {
+                        c.fetch_best = b.id;
+                        c.fetch_ms = now_ms();
+                    } else if (now_ms() >= c.fetch_ms + abandon_s_ * 1000) {
+                        c.fetch_tip = Hash32{};
+                    }
+                }
                 // again from the new best tip (the locator from its step 0), or after a request that got no reply
                 // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
-                if (it->second.asked_best != b.id) {
-                    it->second.step = 0;
-                    catchup_ask_locked(it->first, it->second);
-                } else if (!deferred && now_ms() >= it->second.asked_ms + abandon_s_ * 1000) {
-                    catchup_ask_locked(it->first, it->second);
+                if (c.fetch_tip == Hash32{} && c.asked_best != b.id) {
+                    c.step = 0;
+                    catchup_ask_locked(it->first, c);
+                } else if (c.fetch_tip == Hash32{} && !deferred && now_ms() >= c.asked_ms + abandon_s_ * 1000) {
+                    catchup_ask_locked(it->first, c);
                 }
                 ++it;
             }
