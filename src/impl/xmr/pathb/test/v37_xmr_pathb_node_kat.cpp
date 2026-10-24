@@ -1486,16 +1486,20 @@ void tokens() {
                       && h[a].serve_getcarrier(b, big, h.now).token == pb::FrameToken::Drop
                       && h[a].serve_getheaders(b, big, h.now).token == pb::FrameToken::Drop,
               "tokens: an undecodable FC_GETCARRIER / FC_GETHEADERS / FC_GETBUCKETS: STRIKE; above the buffer: DROP");
-        // an FC_HEADERS reply above the buffer: DROP, the request stays open; one that does not decode: refuse + 1 strike
+        // an FC_HEADERS reply above the buffer: DROP, no token (the request ends: one frame, one request); one that does
+        // not decode: refuse + 1 strike (the request ends); then none open: DROP
         check(h[b].request_headers(a, h[b].tree().genesis().id, h[a].tree().best().id, 8, h.now) || true, "tokens: a request");
         std::vector<std::uint8_t> bigh(h[b].frame_bytes_headers() + 1, 0x53);
         const pb::PathbNode::HeadersOutcome o1 = h[b].on_headers(a, bigh, h.now);
+        const bool again = h[b].request_headers(a, h[b].tree().genesis().id, h[a].tree().best().id, 8, h.now);
         const std::vector<std::uint8_t> badh{0x53, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
         const pb::PathbNode::HeadersOutcome o2 = h[b].on_headers(a, badh, h.now);
         const pb::PathbNode::HeadersOutcome o3 = h[b].on_headers(a, badh, h.now);
-        check(o1.kind == pb::PathbNode::HeadersOutcome::Kind::OverBuffer && o2.kind == pb::PathbNode::HeadersOutcome::Kind::Undecodable
+        check(o1.kind == pb::PathbNode::HeadersOutcome::Kind::OverBuffer && again
+                      && o2.kind == pb::PathbNode::HeadersOutcome::Kind::Undecodable
                       && o3.kind == pb::PathbNode::HeadersOutcome::Kind::Unsolicited,
-              "tokens: FC_HEADERS above the buffer DROP (request open); then undecodable: STRIKE (request ended)");
+              "tokens: FC_HEADERS above the buffer DROP (the request ends); asked again, undecodable: STRIKE (request ended); "
+              "then none open: DROP");
     }
     {
         // N-14: the pending set reports its own eviction
@@ -2090,14 +2094,19 @@ void relaytok() {
               "relaytok: " + op_hex(op) + " that does not decode: 1 strike (" + std::to_string(u.first) +
                       "); above the frame buffer: DROP, no token (" + std::to_string(o.first) + " strikes)");
     }
-    // FC_HEADERS from an asked server
-    const bool asked = rb.with_node([&](pb::PathbNode& n) { return n.request_headers(pa, n.tree().genesis().id, tip_a, 8, h.now); });
-    w.q.clear();  // A's own reply is not delivered
+    // FC_HEADERS from an asked server (one frame answers one request)
+    const auto ask = [&] {
+        const bool ok = rb.with_node([&](pb::PathbNode& n) { return n.request_headers(pa, n.tree().genesis().id, tip_a, 8, h.now); });
+        w.q.clear();  // A's own reply is not delivered
+        return ok;
+    };
+    const bool asked = ask();
     const auto ho = tok(big(pb::kOpFcHeaders, 0x02, h[b.node].frame_bytes_headers() + 1));
+    const bool asked2 = ask();
     const auto hu = tok({pb::kOpFcHeaders, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01});
-    check(asked && ho.first == 0 && ho.second == 1 && hu.first == 1 && hu.second == 0,
-          "relaytok: 0x53 from an asked server: above the buffer DROP, no token; then one that does not decode: 1 strike (" +
-                  std::to_string(hu.first) + ")");
+    check(asked && asked2 && ho.first == 0 && ho.second == 1 && hu.first == 1 && hu.second == 0,
+          "relaytok: 0x53 from an asked server: above the buffer DROP, no token; asked again, one that does not decode: "
+          "1 strike (" + std::to_string(hu.first) + ")");
     // FC_BUCKETS from an asked server; then from a peer with no open request
     const bool askb = rb.with_node([&](pb::PathbNode& n) { return n.request_buckets(pa, tip_a, n.store().b0(), n.store().b0(), h.now); });
     w.q.clear();
@@ -5762,9 +5771,10 @@ void relayswitchlog() {
 }
 
 // ---------------------------------------------------------------------------
-// j1stale: an empty store J asks S for headers from position 0 (R1); P-53 abandons R1 while its reply F1 waits; J's
-// best moves to position 1 and J asks from there (R2); then F1 arrives: DROP, no verdict, nothing indexed, R2 open; R2's
-// own reply catches J up. The same `from`: F1 answers the re-ask (FetchBodies) and the re-ask's own reply DROPs.
+// j1stale: an empty store J asks S for headers from position 0 (R1); no frame of R1's reply F1 arrives within P-53: R1
+// is retired, and J's best moving to position 1 sends S no new request while it is; then F1 arrives: DROP, no verdict,
+// nothing indexed; R2 from position 1; a copy of F1 while R2 is open is no reply to R2: DROP, R2 open; R2's own reply
+// catches J up. The same `from`: no re-ask goes out while R1 is retired; F1 DROPs and the re-ask then gets its own reply.
 void j1stale_chain(Harness& h, const KatNet& net, std::size_t& s, std::size_t& j) {
     s = h.add(table0(net), true);
     j = h.add(table0(net), false);
@@ -5789,18 +5799,24 @@ void j1stale() {
         const std::vector<std::uint8_t> f1 = h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0);
         h.q.clear();
         h.now += pb::kAbandonTimeoutDefault + 1;
-        check(h[j].tick(h.now) == 1, "j1stale: R1 abandoned (P-53) while F1 waits");
+        check(h[j].tick(h.now) == 1, "j1stale: R1 retired (P-53) while F1 has not arrived");
         (void)h[j].on_carrier(s, *pb::encode_fc_carrier(0, *h[s].bodies().get(c1), 16));
         h.q.clear();
         check(h[j].tree().best().id == c1, "j1stale: J's best at position 1");
+        check(!h[j].request_headers(s, c1, tip, 64, h.now) && h.q.empty(),
+              "j1stale: no new FC_GETHEADERS to S while R1 is retired");
+        const pb::PathbNode::HeadersOutcome o0 = h[j].on_headers(s, f1, h.now);
+        check(o0.kind == K::Retired && o0.indexed == 0 && pb::PathbNodeTestAccess::headers(h[j]).size() == 0,
+              "j1stale: F1 answers the retired R1: DROP, no BAN, nothing indexed (kind "
+                      + std::to_string(static_cast<int>(o0.kind)) + ")");
         check(h[j].request_headers(s, c1, tip, 64, h.now), "j1stale: R2 = FC_GETHEADERS(from position 1)");
         const std::vector<std::uint8_t> r2 = h.q.back().frame;
         h.q.clear();
-        const pb::PathbNode::HeadersOutcome o1 = h[j].on_headers(s, f1, h.now);
+        const pb::PathbNode::HeadersOutcome o1 = h[j].on_headers(s, f1, h.now);  // a copy of F1 S was not asked for
         check(o1.kind == K::Unsolicited && o1.indexed == 0 && pb::PathbNodeTestAccess::headers(h[j]).size() == 0
-                      && !o1.why.empty(),
-              "j1stale: F1 is no reply to R2: DROP, no BAN, nothing indexed (kind " + std::to_string(static_cast<int>(o1.kind))
-                      + ")");
+                      && !o1.why.empty() && h[j].header_slot(s).has_value(),
+              "j1stale: F1 is no reply to R2: DROP, no BAN, nothing indexed, R2 open (kind "
+                      + std::to_string(static_cast<int>(o1.kind)) + ")");
         const pb::PathbNode::HeadersOutcome o2 = h[j].on_headers(s, h[s].serve_getheaders(j, r2, h.now).frames.at(0), h.now);
         check(o2.kind == K::FetchBodies && o2.fork_pos == 1,
               "j1stale: R2 stays open: its reply is heavier, FC_GETCARRIER of its bodies (kind "
@@ -5817,13 +5833,15 @@ void j1stale() {
         const std::vector<std::uint8_t> f1 = h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0);
         h.q.clear();
         h.now += pb::kAbandonTimeoutDefault + 1;
-        check(h[j].tick(h.now) == 1 && h[j].request_headers(s, g, tip, 64, h.now), "j1stale (same from): R1 abandoned, R2 sent");
+        check(h[j].tick(h.now) == 1 && !h[j].request_headers(s, g, tip, 64, h.now) && h.q.empty(),
+              "j1stale (same from): R1 retired, no re-ask while it is");
+        const pb::PathbNode::HeadersOutcome o1 = h[j].on_headers(s, f1, h.now);
+        check(h[j].request_headers(s, g, tip, 64, h.now), "j1stale (same from): R2 once F1 arrived");
         const std::vector<std::uint8_t> r2 = h.q.back().frame;
         h.q.clear();
-        const pb::PathbNode::HeadersOutcome o1 = h[j].on_headers(s, f1, h.now);
         const pb::PathbNode::HeadersOutcome o2 = h[j].on_headers(s, h[s].serve_getheaders(j, r2, h.now).frames.at(0), h.now);
-        check(o1.kind == K::FetchBodies && o2.kind == K::Unsolicited,
-              "j1stale (same from): F1 answers R2 (FetchBodies), R2's own reply DROPs (kinds "
+        check(o1.kind == K::Retired && o2.kind == K::FetchBodies,
+              "j1stale (same from): F1 DROPs (its request retired), R2's own reply answers R2 (FetchBodies) (kinds "
                       + std::to_string(static_cast<int>(o1.kind)) + ", " + std::to_string(static_cast<int>(o2.kind)) + ")");
     }
     {
@@ -5861,8 +5879,8 @@ void j1stale() {
 
 // ---------------------------------------------------------------------------
 // relayj1stale: the same through the relay node's catch-up loop. J HELLOs A; A's first FC_HEADERS to J is held in
-// flight; A's carrier 1 reaches J; the tick past P-53 abandons the request and the catch-up asks again from position 1;
-// the held reply arrives: no ban, the link kept, J at A's tip.
+// flight; A's carrier 1 reaches J; the tick past P-53 retires the request and the catch-up sends A nothing while it is;
+// the held reply arrives: DROP (logged), no ban, the link kept; then the catch-up asks again and J reaches A's tip.
 void relayj1stale() {
     std::map<std::size_t, std::vector<std::string>> lines;
     g_relay_lines = &lines;
@@ -5894,7 +5912,7 @@ void relayj1stale() {
     const bool moved = h[j.node].tree().best().id == c1;
     h.now += pb::kAbandonTimeoutDefault + 1;
     rj.tick();
-    const std::uint64_t asked = rj.stats().catchup_requests.load();
+    const std::uint64_t asked_retired = rj.stats().catchup_requests.load();
     rj.receive(w.id(j.node, a.node), held);
     rj.pump();
     const std::uint64_t bans = rj.stats().bans.load();
@@ -5906,13 +5924,16 @@ void relayj1stale() {
         w.run();
     }
     g_relay_lines = nullptr;
+    const std::uint64_t asked = rj.stats().catchup_requests.load();
     bool dropped = false;
     for (const std::string& l : lines[j.node])
-        if (l.find(" DROP: FC_HEADERS reply to another request") != std::string::npos) dropped = true;
+        if (l.find(" DROP: FC_HEADERS reply to a retired request") != std::string::npos) dropped = true;
     std::printf("  relayj1stale: mined %d, held %zu B, J moved %d, catch-up asks %llu, bans %llu, J at %llu of %llu\n",
                 mined ? 1 : 0, held.size(), moved ? 1 : 0, (unsigned long long)asked, (unsigned long long)bans,
                 (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos);
-    check(mined && !held.empty() && moved && asked >= 2, "relayj1stale: a held reply, J's best moved, the re-ask");
+    check(mined && !held.empty() && moved && asked_retired == 1 && asked >= 2,
+          "relayj1stale: a held reply, J's best moved; no re-ask while the request is retired (asks "
+                  + std::to_string(asked_retired) + "), the re-ask after its reply");
     check(bans == 0 && rj.stats().bans.load() == 0 && dropped && h[j.node].tree().best().id == tip_a,
           "relayj1stale: the late reply DROPs (logged), no ban; J at A's tip");
     {

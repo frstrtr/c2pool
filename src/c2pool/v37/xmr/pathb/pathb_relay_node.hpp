@@ -224,6 +224,8 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
     std::atomic<std::uint64_t> tip_header_requests{0}, body_set_requests{0}, body_sets{0}, walk_placed{0};
     std::atomic<std::uint64_t> headers_ctx_deferred{0}, headers_ctx_reasks{0};  // header replies deferred on a P_r; asked again
+    // replies to header requests retired at P-53, DROPped; header requests merged with an equal one in flight or waiting
+    std::atomic<std::uint64_t> headers_retired_dropped{0}, header_wants_merged{0};
     std::atomic<std::uint64_t> join_tickets{0}, join_attempts{0}, join_strikes{0}, join_waits{0};
     // join attempts that took a side branch's state from the server (a span on a side branch forking at a prefix node
     // below the root); of them: completed, not served
@@ -593,10 +595,12 @@ public:
                 enqueue_job(Job{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited});
                 return;
             }
-            case kOpFcHeaders:
-                if (route_reply(p, f)) return;
-                run([this, p, f] { handle_headers(p, f); });
+            case kOpFcHeaders: {
+                bool node_reply = false;  // the frame answers this node's own request in link order
+                if (route_reply(p, f, &node_reply)) return;
+                run([this, p, f, node_reply] { handle_headers(p, f, node_reply); });
                 return;
+            }
             case kOpFcBuckets:
                 if (route_reply(p, f)) return;
                 run([this, p, f] { handle_buckets(p, f); });
@@ -1083,8 +1087,15 @@ private:
         Hash32 fetch_best{};             // the best tip at the page's last progress
         std::uint64_t fetch_ms = 0;      // ... and its time
     };
-    // A catch-up or headers-first request deferred on a P_r: asked again once that P_r resolves.
+    // A header request waiting for its peer's slot (one in flight per peer), served oldest first when the slot frees.
+    struct HdrWant {
+        PathbNode::HeaderOwner owner = PathbNode::HeaderOwner::Tip;
+        Hash32 from{};
+        Hash32 stop{};
+    };
+    // A catch-up or headers-first request deferred on a P_r: asked again once that P_r resolves, under its owner.
     struct HdrOnCtx {
+        PathbNode::HeaderOwner owner = PathbNode::HeaderOwner::CatchUp;
         Hash32 from{};
         Hash32 stop{};
         Hash32 fetch{};               // the P_r
@@ -1946,8 +1957,8 @@ private:
             default: return false;
         }
     }
-    // FC_GETHEADERS of t's branch to the sender (one in flight per peer: else at the next tick): from c's chain at
-    // pos(parent(c)) - J_0 (the admission's fetch_from; with none, the best chain at pos(best) - J_0) to t.
+    // FC_GETHEADERS of t's branch to the sender (one in flight per peer: else it waits in the peer's queue): from c's
+    // chain at pos(parent(c)) - J_0 (the admission's fetch_from; with none, the best chain at pos(best) - J_0) to t.
     void request_tip_headers(std::uint64_t peer, Hash32 from, const Hash32& stop, const std::optional<Hash32>& digest) {
         if (peer == PathbNode::kOwnPeer || !hello_ok(peer)) return;
         if (digest && !node_->may_ask(*digest, peer)) return;
@@ -1957,12 +1968,57 @@ private:
             from = node_->store().best_at(b.pos > j0 ? b.pos - j0 : 0).value_or(b.id);
         }
         if (node_->tree().find(from) == nullptr) return;
-        if (node_->request_headers(peer, from, stop, header_max_, now_s())) {
-            st_.tip_header_requests++;
-            return;
-        }
         std::lock_guard<std::mutex> lk(cumtx_);
-        header_wants_[peer] = std::make_pair(from, stop);
+        want_headers_locked(peer, PathbNode::HeaderOwner::Tip, from, stop);
+    }
+    // Under the node lock and cumtx_: a header request of `owner` to `peer`. An equal request (owner, from, stop) open
+    // or waiting takes it (merged); else it waits in the peer's queue (the catch-up keeps only its latest; no other
+    // owner's entry replaced), served oldest first while the peer's slot is free. True: sent now.
+    bool want_headers_locked(std::uint64_t peer, PathbNode::HeaderOwner owner, const Hash32& from, const Hash32& stop) {
+        const std::optional<PathbNode::HeaderSlot> s = node_->header_slot(peer);
+        if (s && !s->retired && s->owner == owner && s->from == from && s->stop == stop) {
+            st_.header_wants_merged++;
+            return false;
+        }
+        std::deque<HdrWant>& q = header_wants_[peer];
+        for (const HdrWant& w : q)
+            if (w.owner == owner && w.from == from && w.stop == stop) {
+                st_.header_wants_merged++;
+                return false;
+            }
+        if (owner == PathbNode::HeaderOwner::CatchUp)
+            q.erase(std::remove_if(q.begin(), q.end(), [](const HdrWant& w) { return w.owner == PathbNode::HeaderOwner::CatchUp; }),
+                    q.end());
+        q.push_back(HdrWant{owner, from, stop});
+        serve_header_wants_locked(peer);
+        const auto it = header_wants_.find(peer);
+        if (it == header_wants_.end()) return true;
+        for (const HdrWant& w : it->second)
+            if (w.owner == owner && w.from == from && w.stop == stop) return false;
+        return true;
+    }
+    // Under the node lock and cumtx_: the waiting header requests of `peer` (every peer: 0), the oldest first, while
+    // its slot is free (one in flight per peer).
+    void serve_header_wants_locked(std::uint64_t only) {
+        for (auto it = header_wants_.begin(); it != header_wants_.end();) {
+            if (only != 0 && it->first != only) {
+                ++it;
+                continue;
+            }
+            std::deque<HdrWant>& q = it->second;
+            while (!q.empty()) {
+                const HdrWant w = q.front();
+                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr) {
+                    q.pop_front();
+                    continue;
+                }
+                if (!node_->request_headers(it->first, w.from, w.stop, header_max_, now_s(), w.owner)) break;
+                q.pop_front();
+                if (w.owner == PathbNode::HeaderOwner::Tip) st_.tip_header_requests++;
+                break;  // one in flight per peer
+            }
+            it = q.empty() ? header_wants_.erase(it) : std::next(it);
+        }
     }
     // FC_GETCARRIER (want_bodies 1) of a walked carrier to the sender: its reply is that peer's body set.
     void request_body_set(std::uint64_t peer, const Hash32& id, const std::optional<Hash32>& digest) {
@@ -2615,7 +2671,14 @@ private:
             const std::uint64_t pos = b.pos > root.pos && b.pos - root.pos > back ? b.pos - back : root.pos;
             from = pos == root.pos ? root.id : node_->store().best_at(pos).value_or(root.id);
         }
-        if (!node_->request_headers(p, from, c.tip, header_max_, now_s())) return;
+        if (!node_->request_headers(p, from, c.tip, header_max_, now_s(), PathbNode::HeaderOwner::CatchUp)) return;
+        const auto q = header_wants_.find(p);  // the catch-up keeps only its latest request
+        if (q != header_wants_.end()) {
+            q->second.erase(std::remove_if(q->second.begin(), q->second.end(),
+                                           [](const HdrWant& w) { return w.owner == PathbNode::HeaderOwner::CatchUp; }),
+                            q->second.end());
+            if (q->second.empty()) header_wants_.erase(q);
+        }
         const CarrierNode* fn = node_->tree().find(from);
         c.from_root = fn == nullptr || fn->pos <= root.pos;
         c.from_pos0 = fn != nullptr && fn->pos == 0;
@@ -2624,12 +2687,18 @@ private:
         st_.catchup_requests++;
         if (c.step > 0) st_.catchup_steps++;
     }
-    void handle_headers(std::uint64_t p, const std::vector<std::uint8_t>& f) {
+    // `node_reply`: the frame answered the node's own request in link order (its arrival was counted).
+    void handle_headers(std::uint64_t p, const std::vector<std::uint8_t>& f, bool node_reply) {
         using K = PathbNode::HeadersOutcome::Kind;
         PathbNode::HeadersOutcome o;
         bool join = false;
         {
             const NodeGuard g(*this);
+            if (node_reply) {  // handled now: no longer waiting for the owner
+                std::lock_guard<std::mutex> lk(kmtx_);
+                const auto a = hdr_arrived_.find(p);
+                if (a != hdr_arrived_.end() && --a->second == 0) hdr_arrived_.erase(a);
+            }
             try {
                 o = node_->on_headers(p, f, now_s());
             } catch (const RandomxFailure&) {  // node-internal, a local alarm; no token; the catch-up asks again
@@ -2638,7 +2707,8 @@ private:
             }
             {
                 std::lock_guard<std::mutex> lk(cumtx_);
-                const auto it = catchup_.find(p);
+                // only the catch-up's own outcomes act on the catch-up (a tip request's outcome leaves it as it is)
+                const auto it = o.owner == PathbNode::HeaderOwner::CatchUp ? catchup_.find(p) : catchup_.end();
                 if (it != catchup_.end()) {
                     switch (o.kind) {
                         case K::Keep:
@@ -2672,13 +2742,15 @@ private:
                         default: break;
                     }
                 }
+                serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
             if (o.kind == K::JoinerPath) join = true;
-            if (o.kind != K::OverBuffer && o.kind != K::Unsolicited) header_wants_locked(p);
         }
-        if (o.kind == K::Unsolicited && !o.why.empty()) log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
+        if ((o.kind == K::Unsolicited || o.kind == K::Retired) && !o.why.empty())
+            log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
-            case K::OverBuffer:   // above the FC_HEADERS buffer: DROP (the request stays open)
+            case K::Retired: st_.headers_retired_dropped++; [[fallthrough]];
+            case K::OverBuffer:   // above the FC_HEADERS buffer: DROP (the request ends)
             case K::Unsolicited: token(p, FrameToken::Drop); break;
             case K::Undecodable: token(p, FrameToken::Strike); break;
             case K::Ban: ban(p, o.why); break;
@@ -2693,12 +2765,13 @@ private:
             // block the follower holds asks no context; the request asked again once its input is held
             {
                 std::lock_guard<std::mutex> lk(cumtx_);
-                HdrOnCtx& w = headers_on_ctx_[p];
-                if (w.fetch != o.fetch || w.since_ms == 0) w.since_ms = now_ms();
+                HdrOnCtx w;
+                w.owner = o.owner;
                 w.from = o.from;
                 w.stop = o.stop;
                 w.fetch = o.fetch;
                 w.cause = o.cause;
+                note_ctx_locked(p, w);
             }
             st_.headers_ctx_deferred++;
             bool held = false;
@@ -2717,19 +2790,46 @@ private:
         if (o.indexed > 0) rerun_parked(std::vector<Missing>{Missing::TipUnknown, Missing::TipHeaders});
         if (join) signal_join();
     }
-    // The header requests deferred on a P_r (one per peer), asked again once that P_r resolves (gated: a context of
-    // that id resolved (`only`), or the follower's chain moved); ungated: the KAT hook's re-run.
+    // Under cumtx_: a header request of `p` deferred on a P_r, kept per (owner, from, stop) (an equal one updated: its
+    // since restarts only for another P_r; nothing of another owner or request replaced).
+    void note_ctx_locked(std::uint64_t p, const HdrOnCtx& w) {
+        std::vector<HdrOnCtx>& v = headers_on_ctx_[p];
+        for (HdrOnCtx& e : v)
+            if (e.owner == w.owner && e.from == w.from && e.stop == w.stop) {
+                if (e.fetch != w.fetch || e.since_ms == 0) e.since_ms = w.since_ms != 0 ? w.since_ms : now_ms();
+                e.fetch = w.fetch;
+                e.cause = w.cause;
+                return;
+            }
+        v.push_back(w);
+        if (v.back().since_ms == 0) v.back().since_ms = now_ms();
+    }
+    // Under cumtx_: the catch-up's own deferral of peer `p` (none: nullptr).
+    HdrOnCtx* catchup_ctx_locked(std::uint64_t p) {
+        const auto it = headers_on_ctx_.find(p);
+        if (it == headers_on_ctx_.end()) return nullptr;
+        for (HdrOnCtx& e : it->second)
+            if (e.owner == PathbNode::HeaderOwner::CatchUp) return &e;
+        return nullptr;
+    }
+    // The header requests deferred on a P_r (per peer and request), asked again under their owners once that P_r
+    // resolves (gated: a context of that id resolved (`only`), or the follower's chain moved); ungated: the KAT hook's
+    // re-run.
     void reask_headers_on_ctx(const std::optional<Hash32>& only, bool gated) {
-        std::map<std::uint64_t, HdrOnCtx> due;
+        std::vector<std::pair<std::uint64_t, HdrOnCtx>> due;
         {
             std::lock_guard<std::mutex> lk(cumtx_);
             for (auto it = headers_on_ctx_.begin(); it != headers_on_ctx_.end();) {
-                if (only && it->second.fetch != *only) {
-                    ++it;
-                    continue;
+                std::vector<HdrOnCtx>& v = it->second;
+                for (auto e = v.begin(); e != v.end();) {
+                    if (only && e->fetch != *only) {
+                        ++e;
+                        continue;
+                    }
+                    due.emplace_back(it->first, *e);
+                    e = v.erase(e);
                 }
-                due.insert(*it);
-                it = headers_on_ctx_.erase(it);
+                it = v.empty() ? headers_on_ctx_.erase(it) : std::next(it);
             }
         }
         if (due.empty()) return;
@@ -2737,38 +2837,19 @@ private:
         for (const auto& [p, w] : due) {
             if (gated && !node_->monero_input_held(w.cause, w.fetch)) {  // its input not held yet: kept
                 std::lock_guard<std::mutex> lk(cumtx_);
-                headers_on_ctx_.emplace(p, w);
+                note_ctx_locked(p, w);
                 continue;
             }
             if (!hello_ok(p) || node_->tree().find(w.from) == nullptr) continue;
-            if (node_->request_headers(p, w.from, w.stop, header_max_, now_s())) {
-                st_.headers_ctx_reasks++;
-                continue;
-            }
             std::lock_guard<std::mutex> lk(cumtx_);
-            header_wants_[p] = std::make_pair(w.from, w.stop);
+            want_headers_locked(p, w.owner, w.from, w.stop);
+            st_.headers_ctx_reasks++;
         }
     }
-    // Under the node lock: the waiting request of t's branch to `peer` (every peer: 0), when that peer has none in
-    // flight.
+    // Under the node lock: the waiting header requests of `peer` (every peer: 0), while that peer has none in flight.
     void header_wants_locked(std::uint64_t only) {
         std::lock_guard<std::mutex> lk(cumtx_);
-        for (auto it = header_wants_.begin(); it != header_wants_.end();) {
-            if (only != 0 && it->first != only) {
-                ++it;
-                continue;
-            }
-            if (!hello_ok(it->first) || node_->tree().find(it->second.first) == nullptr) {
-                it = header_wants_.erase(it);
-                continue;
-            }
-            if (node_->request_headers(it->first, it->second.first, it->second.second, header_max_, now_s())) {
-                st_.tip_header_requests++;
-                it = header_wants_.erase(it);
-                continue;
-            }
-            ++it;
-        }
+        serve_header_wants_locked(only);
     }
 
     // ---- FC_BUCKETS (the node's own requests) ----
@@ -3029,6 +3110,7 @@ private:
             for (auto& [id, t] : tickets_)
                 if (t.peer == p) t.closed = true;
             hdr_fifo_.erase(p);
+            hdr_arrived_.erase(p);
             asked_carriers_.erase(p);
             bodyset_asked_.erase(p);
         }
@@ -3055,7 +3137,8 @@ private:
             if (t.peer == peer && t.op == op && !t.closed) return true;
         return false;
     }
-    bool route_reply(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
+    // `node_reply`: an FC_HEADERS frame that answers the node's own request (its arrival recorded for its P-53 clock).
+    bool route_reply(std::uint64_t peer, const std::vector<std::uint8_t>& f, bool* node_reply = nullptr) {
         const std::uint8_t op = f[0];
         if (op == kOpFcHeaders) {  // one FC_HEADERS frame answers one FC_GETHEADERS, in request order
             std::lock_guard<std::mutex> lk(kmtx_);
@@ -3063,7 +3146,11 @@ private:
             if (q == hdr_fifo_.end() || q->second.empty()) return false;
             const HdrWait h = q->second.front();
             q->second.pop_front();
-            if (h.node) return false;
+            if (h.node) {
+                ++hdr_arrived_[peer];  // node_tick stops the request's P-53 clock while the frame waits for the owner
+                if (node_reply != nullptr) *node_reply = true;
+                return false;
+            }
             const auto it = tickets_.find(h.ticket);
             if (h.dead || it == tickets_.end()) {
                 st_.drops++;  // the reply of an ended request: DROP
@@ -3266,6 +3353,15 @@ private:
         {
             const NodeGuard g(*this);
             take_rx_failed_locked(rfx);
+            {  // a header request whose reply frame arrived and waits for the owner is answered: its P-53 clock stops
+                std::vector<std::uint64_t> arrived;
+                {
+                    std::lock_guard<std::mutex> lk(kmtx_);
+                    for (const auto& [p, n] : hdr_arrived_)
+                        if (n > 0) arrived.push_back(p);
+                }
+                for (const std::uint64_t p : arrived) node_->headers_arrived(p);
+            }
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
             {  // the wants re-made for an id a join pair waits on (it gave up before): the pairs are tried again
                 std::vector<Hash32> again;
@@ -3288,18 +3384,17 @@ private:
                     it = catchup_.erase(it);
                     continue;
                 }
-                const auto hd = headers_on_ctx_.find(it->first);
-                const bool deferred = hd != headers_on_ctx_.end();
+                HdrOnCtx* const hd = catchup_ctx_locked(it->first);  // the catch-up's own deferral only
+                const bool deferred = hd != nullptr;
                 // a store not caught up whose catch-up step stays deferred on a P_r its context did not bring within
                 // kCtxTtlMs: the peer's tip becomes a join candidate (the joiner path; paced on that P_r)
-                if (deferred && !node_->caught_up() && !hd->second.offered && hd->second.since_ms != 0
-                    && now_ms() >= hd->second.since_ms + kCtxTtlMs
-                    && !node_->monero_input_held(hd->second.cause, hd->second.fetch)) {
-                    hd->second.offered = true;
+                if (deferred && !node_->caught_up() && !hd->offered && hd->since_ms != 0
+                    && now_ms() >= hd->since_ms + kCtxTtlMs && !node_->monero_input_held(hd->cause, hd->fetch)) {
+                    hd->offered = true;
                     if (node_->offer_empty_store_tip(it->first)) {
                         st_.catchup_join_offers++;
                         log("relay: catch-up from peer " + std::to_string(it->first) + " deferred on P_r " +
-                            hex_short(hd->second.fetch) + " past its context's time: its tip offered to the joiner");
+                            hex_short(hd->fetch) + " past its context's time: its tip offered to the joiner");
                     }
                 }
                 // a page whose bodies are in flight: no new ask until its tip is placed, or the best did not move within
@@ -4135,6 +4230,7 @@ private:
     std::condition_variable kcv_;
     std::map<std::uint64_t, Ticket> tickets_;
     std::map<std::uint64_t, std::deque<HdrWait>> hdr_fifo_;
+    std::map<std::uint64_t, std::uint64_t> hdr_arrived_;  // replies to node requests arrived, not handled yet (kmtx_)
     std::map<std::uint64_t, std::set<Hash32>> asked_carriers_;  // ids of the node's own FC_GETCARRIER, per peer
     std::map<std::uint64_t, std::set<Hash32>> bodyset_asked_;   // walked carriers whose body set is asked, per peer
     std::uint64_t next_ticket_ = 0;
@@ -4142,8 +4238,8 @@ private:
 
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
-    std::map<std::uint64_t, std::pair<Hash32, Hash32>> header_wants_;  // peer -> (from, stop)
-    std::map<std::uint64_t, HdrOnCtx> headers_on_ctx_;  // deferred on a P_r: peer -> (from, stop, P_r, since)
+    std::map<std::uint64_t, std::deque<HdrWant>> header_wants_;  // peer -> its waiting header requests, oldest first
+    std::map<std::uint64_t, std::vector<HdrOnCtx>> headers_on_ctx_;  // deferred on a P_r: peer -> per (owner, from, stop)
 
     mutable std::mutex omtx_;                          // the omission log
     std::map<std::uint64_t, std::uint64_t> omissions_;  // link id -> receipts omitted (at most the links up)
