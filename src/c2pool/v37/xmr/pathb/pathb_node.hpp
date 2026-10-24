@@ -1769,6 +1769,19 @@ public:
                 const Hash32 prev = i == 0 ? req.fork : ann[i - 1].id;
                 const bool checked = ann[i].parent == prev && k == i + 1;  // pow_ok ran on this header
                 const bool monotone = ann[i].parent == prev && k == i;     // h below the record H
+                if (monotone) {
+                    // #6 below the fork's record H alone (no header of the reply raised the record above h) where that
+                    // record is a claim (the joined span's H, read with the retarget window as #8): alarm + DEFER, no
+                    // token, nothing indexed
+                    std::uint64_t own = 0;
+                    for (std::size_t j = 0; j < i; ++j) own = std::max(own, ann[j].h);
+                    const Basis hb = basis_of(claims_, RowClass::Retarget, req.fork, fork->pos + 1);
+                    if (ann[i].h >= own && is_claim_basis(hb)) {
+                        alarm_.raise(RowId::R7, hb, sh.id, Missing::ClaimAlarm);
+                        out.kind = HeadersOutcome::Kind::Defer;
+                        return out;
+                    }
+                }
                 // a link broken inside the reply (a header's parent not the id of the header before it): STRIKE (per
                 // operator ruling); S1.3 #6 monotone h >= H: STRIKE (per operator ruling); #7 header fields (major ==
                 // hf(h); timestamp >= median60(branch of P_r); the size verdict): "STRIKE"; #8 t_origin ==

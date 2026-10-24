@@ -1528,6 +1528,8 @@ void x1l() {
 // ---------------------------------------------------------------------------
 // x8claim: a header whose t_origin is not the d of its window, at a position whose window reads the claimed prefix
 // (x <= x1 + N_rt): ClaimLeaf (alarm + DEFER: no token, nothing indexed, no BAN) in the session and after a restart.
+// The same for a header whose h is below the fork's record H only, where that record is a claim (S1.3 #6): no STRIKE;
+// at a full node that header is STRIKE.
 void x8claim() {
     const auto t0 = std::chrono::steady_clock::now();
     JoinNet net(900);
@@ -1547,8 +1549,12 @@ void x8claim() {
     MemoryKv& kv = *h.kvs.back();
     const std::size_t sb_ = h.nodes.size();
     h.nodes.push_back(server_from(h, b, kJ, sb_));
-    // one header of b above the fork, its t_origin changed
-    const auto tampered = [&](std::size_t to) {
+    // one header of b above the fork, edited: its t_origin changed (#8), or its P_r an early block of a (#6: its h below
+    // the fork's record H)
+    const pb::CarrierBodyV3* early = a.bodies.get(at_pos(a, 10));
+    const auto t_origin = [](pb::ReceiptBodyV3& b) { b.side.t_origin += 1; };
+    const auto low_h = [&early](pb::ReceiptBodyV3& b) { b.blob.prev_id = early->own.blob.prev_id; };
+    const auto tampered = [&](std::size_t to, const std::function<void(pb::ReceiptBodyV3&)>& edit) {
         h.q.clear();
         std::vector<std::uint8_t> out;
         if (!h[to].request_headers(sb_, at_pos(a, f), b.store.best_tip(), 1, h.now)) return out;
@@ -1558,7 +1564,7 @@ void x8claim() {
             pb::HeadersReply rep;
             if (r.empty() || !pb::decode_fc_headers(r[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok() || rep.headers.empty()) break;
             rep.headers.resize(1);
-            rep.headers[0].own.side.t_origin += 1;
+            edit(rep.headers[0].own);
             out = *pb::encode_fc_headers(rep, 1u << 22);
             break;
         }
@@ -1567,7 +1573,7 @@ void x8claim() {
     };
     using K = pb::PathbNode::HeadersOutcome::Kind;
     (void)h.hello(j, sb_);
-    const std::vector<std::uint8_t> t1 = tampered(j);
+    const std::vector<std::uint8_t> t1 = tampered(j, t_origin);
     const std::size_t a1 = h[j].alarms().count();
     const pb::PathbNode::HeadersOutcome o1 = t1.empty() ? pb::PathbNode::HeadersOutcome{} : h[j].on_headers(sb_, t1, h.now);
     const std::size_t a1b = h[j].alarms().count();
@@ -1579,7 +1585,7 @@ void x8claim() {
     const std::size_t r = h.nodes.size();
     h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, J), h.io(r), std::move(*rl.state), &kv));
     (void)h.hello(r, sb_);
-    const std::vector<std::uint8_t> t2 = tampered(r);
+    const std::vector<std::uint8_t> t2 = tampered(r, t_origin);
     const std::size_t a2 = h[r].alarms().count();
     const pb::PathbNode::HeadersOutcome o2 = t2.empty() ? pb::PathbNode::HeadersOutcome{} : h[r].on_headers(sb_, t2, h.now);
     const std::size_t a2b = h[r].alarms().count();
@@ -1588,6 +1594,27 @@ void x8claim() {
           "x8claim: #8 on a claimed window: ClaimLeaf, no BAN (kind " + std::to_string(static_cast<int>(o1.kind))
                   + " in the session, " + std::to_string(static_cast<int>(o2.kind)) + " after the restart; alarms +"
                   + std::to_string(a1b - a1) + " / +" + std::to_string(a2b - a2) + ")");
+    // #6 on the claimed record H of the fork: the same (the joined node in its session and after the restart); a full
+    // node (A's own store) computes that H: STRIKE
+    const std::size_t full = h.nodes.size();
+    h.nodes.push_back(server_from(h, a, kJ, full));
+    (void)h.hello(full, sb_);
+    std::vector<pb::PathbNode::HeadersOutcome> o6;
+    std::vector<std::size_t> al;
+    for (const std::size_t to : {j, r, full}) {
+        const std::vector<std::uint8_t> t6 = early != nullptr ? tampered(to, low_h) : std::vector<std::uint8_t>{};
+        const std::size_t a0 = h[to].alarms().count();
+        o6.push_back(t6.empty() ? pb::PathbNode::HeadersOutcome{} : h[to].on_headers(sb_, t6, h.now));
+        al.push_back(h[to].alarms().count() - a0);
+    }
+    check(early != nullptr && o6[0].kind == K::Defer && o6[1].kind == K::Defer && o6[0].indexed == 0 && o6[1].indexed == 0
+                  && al[0] == 1 && al[1] == 1,
+          "x8claim (#6): h below the fork's claimed record H: ClaimLeaf, no STRIKE (kind " +
+                  std::to_string(static_cast<int>(o6[0].kind)) + " in the session, " +
+                  std::to_string(static_cast<int>(o6[1].kind)) + " after the restart; alarms +" + std::to_string(al[0]) +
+                  " / +" + std::to_string(al[1]) + ")");
+    check(o6[2].kind == K::Strike && al[2] == 0,
+          "x8claim (#6): at a full node the same header: STRIKE (kind " + std::to_string(static_cast<int>(o6[2].kind)) + ")");
     std::printf("  x8claim: %.1f s\n", secs_since(t0));
 }
 
