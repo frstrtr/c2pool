@@ -204,8 +204,10 @@ struct MWEBState {
     // The raw serialized MWEB block from the previous block (for reference)
     std::vector<unsigned char> prev_mweb_raw;
 
-    // Height at which this state was captured
+    // Block this state was captured from (height + SHA256d header hash). A
+    // template may only use it when building on exactly that block.
     uint32_t captured_at_height{0};
+    uint256  captured_block_hash;
     bool     valid{false};
 };
 
@@ -249,6 +251,10 @@ public:
         state.prev_hogex_vout = 0;
         state.hogaddr_value = hogaddr_out.value;
         state.captured_at_height = block_height;
+        {
+            auto packed_hdr = pack(static_cast<const BlockHeaderType&>(block));
+            state.captured_block_hash = Hash(packed_hdr.get_span());
+        }
         state.valid = true;
 
         LOG_INFO << "[MWEB] Extracted state from height " << block_height

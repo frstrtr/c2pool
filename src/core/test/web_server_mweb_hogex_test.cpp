@@ -673,3 +673,58 @@ TEST(LtcMwebHogex, HoldEndsOnImmediateRefreshAfterMwebUpdate)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(mi->get_mweb_hold_seconds(), total) << "HOLD seconds stop rising";
 }
+
+// A degraded template (MWEB active, no MWEB state yet) is never handed to an
+// external getblocktemplate client: it would build LTC blocks no daemon
+// accepts. The placeholder is served until MWEB state lands.
+TEST(LtcMwebHogex, GetblocktemplateWithholdsDegradedTemplate)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}}, "");  // degraded start
+    f.mi.refresh_work();
+    ASSERT_TRUE(f.mi.is_work_degraded());
+    ASSERT_FALSE(f.mi.get_current_work_template().is_null());
+
+    auto gbt = f.mi.getblocktemplate(nlohmann::json::object(), "1");
+    EXPECT_NE(gbt.value("previousblockhash", std::string()), kPrev)
+        << "the degraded template leaked to GBT";
+
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    f.mi.refresh_work();
+    ASSERT_FALSE(f.mi.is_work_degraded());
+    gbt = f.mi.getblocktemplate(nlohmann::json::object(), "2");
+    EXPECT_EQ(gbt.value("previousblockhash", std::string()), kPrev);
+    EXPECT_EQ(gbt.value("mweb", std::string()), kMweb);
+}
+
+// HOLD, then the held template is lost (a non-MWEB failure invalidates the
+// work), then the next template is served degraded. Nothing is held any more:
+// the HOLD window closes, its clock stops and the dashboard stops saying HOLD
+// (and submitblock stops marking blocks stale for it).
+TEST(LtcMwebHogex, DegradedAfterHoldClosesTheHoldWindow)
+{
+    Fixture f;
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    const std::string new_prev = rep("0", 62) + "cd";
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    f.mi.refresh_work();
+    f.node.work_data = mweb_template({{kTx1, t1}}, "", new_prev);
+    f.mi.refresh_work();
+    ASSERT_TRUE(f.mi.is_mweb_holding());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    f.node.throw_failure = true;
+    f.mi.refresh_work();
+    ASSERT_TRUE(f.mi.get_current_work_template().is_null());
+    f.node.throw_failure = false;
+    f.mi.refresh_work();  // same HogEx-less template, nothing valid to hold
+
+    EXPECT_TRUE(f.mi.is_work_degraded());
+    EXPECT_FALSE(f.mi.is_mweb_holding()) << "degraded work must close the HOLD window";
+    const double total = f.mi.get_mweb_hold_seconds();
+    EXPECT_GE(total, 0.025);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(f.mi.get_mweb_hold_seconds(), total) << "HOLD clock must stop";
+    EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
+}

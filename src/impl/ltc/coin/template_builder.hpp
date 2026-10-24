@@ -303,6 +303,18 @@ public:
 
         if (mweb_tracker) {
             auto mweb_state = mweb_tracker->get_state();
+            // The HogEx spends the HogEx output of the block we build on. State
+            // from any other block (e.g. a late body that lands after the tip
+            // moved on) would spend an output the tip already spent and still
+            // pass the shape check, so it counts as no state: refused -> HOLD.
+            if (mweb_state && (mweb_state->captured_at_height != tip.height
+                               || mweb_state->captured_block_hash != tip.block_hash)) {
+                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
+                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
+                                << ", tip is h=" << tip.height << " "
+                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
+                mweb_state.reset();
+            }
             if (mweb_state) {
                 // Build HogEx transaction (last tx in block)
                 auto hogex = MWEBBuilder::build_hogex(*mweb_state, next_h);

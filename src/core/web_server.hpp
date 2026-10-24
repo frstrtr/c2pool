@@ -1410,6 +1410,7 @@ private:
     void note_mweb_template_refusal(const std::string& why);
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
+    void close_mweb_hold_window(const char* reason);
 
     // Try submitting to merged-mined aux chains if their target is met.
     // Needs only the 80-byte parent header (first 160 hex chars of header_hex),

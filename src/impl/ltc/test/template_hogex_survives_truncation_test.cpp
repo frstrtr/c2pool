@@ -82,13 +82,16 @@ std::unique_ptr<HeaderChain> mainnet_chain_at_genesis()
     return chain;
 }
 
-// A chain whose tip is a fast-start checkpoint at `height` (no real headers).
-std::unique_ptr<HeaderChain> mainnet_chain_at(uint32_t height)
+// A chain whose tip is a fast-start checkpoint at `height` (no real headers)
+// with block hash `tip_hash`.
+std::unique_ptr<HeaderChain> mainnet_chain_at(
+    uint32_t height,
+    const uint256& tip_hash = h("00000000000000000000000000000000000000000000000000000000c0ffee01"))
 {
     auto p = make_ltc_chain_params_mainnet();
     LTCChainParams::Checkpoint cp;
     cp.height = height;
-    cp.hash = h("00000000000000000000000000000000000000000000000000000000c0ffee01");
+    cp.hash = tip_hash;
     p.fast_start_checkpoint = cp;
     auto chain = std::make_unique<HeaderChain>(p);
     EXPECT_TRUE(chain->init());
@@ -96,11 +99,35 @@ std::unique_ptr<HeaderChain> mainnet_chain_at(uint32_t height)
     return chain;
 }
 
-// A synthetic MWEB block at height 1: coinbase + HogEx whose first output is
-// the HogAddr (OP_8 PUSH32 <hash>), plus the raw empty mw::Block.
-void feed_tracker(MWEBTracker& tracker, uint32_t height)
+// A distinct synthetic block header per tag, and its SHA256d block hash.
+BlockHeaderType synthetic_header(uint32_t tag)
+{
+    BlockHeaderType hdr;
+    hdr.m_version = 0x20000000;
+    hdr.m_previous_block = h("00000000000000000000000000000000000000000000000000000000000000ee");
+    hdr.m_merkle_root.SetNull();
+    hdr.m_timestamp = 1600000000 + tag;
+    hdr.m_bits = 0x1e0ffff0;
+    hdr.m_nonce = tag;
+    return hdr;
+}
+
+uint256 block_hash_of(const BlockHeaderType& hdr)
+{
+    auto packed = pack(hdr);
+    return Hash(packed.get_span());
+}
+
+// Height of the synthetic MWEB chain tip used by the template KATs.
+constexpr uint32_t kTipHeight = 1000;
+
+// A synthetic MWEB block with header `hdr` at `height`: coinbase + HogEx whose
+// first output is the HogAddr (OP_8 PUSH32 <hash>), plus the raw empty
+// mw::Block.
+void feed_tracker(MWEBTracker& tracker, uint32_t height, const BlockHeaderType& hdr)
 {
     BlockType b;
+    static_cast<BlockHeaderType&>(b) = hdr;
     MutableTransaction cb;
     cb.version = 1;
     cb.locktime = 0;
@@ -163,7 +190,8 @@ TEST(LtcTemplateHogex, MwebActivationHeightsPinned)
 // tx and the fees of the cut txs are not in coinbasevalue.
 TEST(LtcTemplateHogex, HogexSurvivesTruncation)
 {
-    auto chain = mainnet_chain_at_genesis();
+    const auto tip_hdr = synthetic_header(1);
+    auto chain = mainnet_chain_at(kTipHeight, block_hash_of(tip_hdr));
     Mempool pool;
     MutableTransaction a = pay(FUND_A, 0, 100000);
     MutableTransaction b = pay(FUND_B, 0, 100000);
@@ -179,8 +207,8 @@ TEST(LtcTemplateHogex, HogexSurvivesTruncation)
     const uint32_t one_tx_weight = entry->weight;
 
     MWEBTracker tracker;
-    feed_tracker(tracker, 1);
-    EXPECT_EQ(tracker.mweb_seen_height(), 1u);
+    feed_tracker(tracker, kTipHeight, tip_hdr);
+    EXPECT_EQ(tracker.mweb_seen_height(), kTipHeight);
 
     // Uncut: all three mempool txs + HogEx.
     auto full = TemplateBuilder::build_template(*chain, pool, false, &tracker);
@@ -208,15 +236,16 @@ TEST(LtcTemplateHogex, HogexSurvivesTruncation)
 // HogEx-less "segwit"-only template.
 TEST(LtcTemplateHogex, InvalidatedStateNeverYieldsSegwitOnlyTemplate)
 {
-    auto chain = mainnet_chain_at_genesis();
+    const auto tip_hdr = synthetic_header(1);
+    auto chain = mainnet_chain_at(kTipHeight, block_hash_of(tip_hdr));
     Mempool pool;
     MWEBTracker tracker;
-    feed_tracker(tracker, 1);
+    feed_tracker(tracker, kTipHeight, tip_hdr);
     ASSERT_TRUE(TemplateBuilder::build_template(*chain, pool, false, &tracker));
 
     tracker.invalidate();
     EXPECT_FALSE(tracker.has_state());
-    EXPECT_EQ(tracker.mweb_seen_height(), 1u) << "invalidate() keeps the seen height";
+    EXPECT_EQ(tracker.mweb_seen_height(), kTipHeight) << "invalidate() keeps the seen height";
 
     std::optional<ltc::coin::rpc::WorkData> refused;
     auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker,
@@ -264,4 +293,44 @@ TEST(LtcTemplateHogex, ActivationHeightBoundary)
     EXPECT_FALSE(TemplateBuilder::build_template(*at, pool, false, &tracker))
         << "next block must carry a HogEx; without MWEB state there is no template";
     EXPECT_FALSE(TemplateBuilder::build_template(*at, pool, false, nullptr));
+}
+
+// MWEB state must belong to the block the template builds on. Here the sync
+// gate asked for tip N, the tip moved to N+1, and N's body landed afterwards:
+// a HogEx built from N's state would spend N's HogEx output, which N+1 already
+// spent, and would still pass the shape check. The builder treats such state
+// as no state (refused -> HOLD at ingress) until N+1's own body arrives.
+TEST(LtcTemplateHogex, StaleMwebStateIsNotUsed)
+{
+    Mempool pool;
+    const auto hdr_n = synthetic_header(1);
+    MWEBTracker tracker;
+    feed_tracker(tracker, kTipHeight, hdr_n);
+
+    // Control: tip is N itself -> the state is used.
+    {
+        auto at_n = mainnet_chain_at(kTipHeight, block_hash_of(hdr_n));
+        auto wd = TemplateBuilder::build_template(*at_n, pool, false, &tracker);
+        ASSERT_TRUE(wd);
+        EXPECT_TRUE(core::coin::tx_hex_is_hogex(
+            wd->m_data["transactions"].back()["data"].get<std::string>()));
+    }
+    // Tip moved to N+1 -> refused.
+    {
+        auto at_n1 = mainnet_chain_at(kTipHeight + 1, block_hash_of(synthetic_header(2)));
+        std::optional<ltc::coin::rpc::WorkData> refused;
+        auto wd = TemplateBuilder::build_template(*at_n1, pool, false, &tracker,
+                                                  TemplateBuilder::MAX_BLOCK_WEIGHT
+                                                      - TemplateBuilder::COINBASE_RESERVE,
+                                                  &refused);
+        EXPECT_FALSE(wd) << "state from N must not build a HogEx on top of N+1";
+        ASSERT_TRUE(refused);
+        EXPECT_TRUE(refused->m_data["mweb"].get<std::string>().empty());
+        EXPECT_TRUE(core::coin::check_template_shape(refused->m_data));
+    }
+    // Same height, different block (a competing N) -> refused.
+    {
+        auto other_n = mainnet_chain_at(kTipHeight, block_hash_of(synthetic_header(3)));
+        EXPECT_FALSE(TemplateBuilder::build_template(*other_n, pool, false, &tracker));
+    }
 }

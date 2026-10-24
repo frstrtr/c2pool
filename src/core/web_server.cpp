@@ -1781,6 +1781,10 @@ void MiningInterface::note_mweb_template_refusal(const std::string& why)
 void MiningInterface::note_mweb_degraded_template(const std::string& why)
 {
     m_mweb_template_refusals.fetch_add(1, std::memory_order_relaxed);
+    // A HOLD whose held template was lost (work invalidated meanwhile) ends
+    // here: nothing is held any more, so stop the HOLD banner, the HOLD
+    // stale marking and the HOLD clock.
+    close_mweb_hold_window("work degraded");
     if (!m_work_degraded) {
         LOG_WARNING << "[MWEB] DEGRADED start: no valid template to hold (" << why << ")."
                     << " Serving this template so shares and merged mining work; block"
@@ -1795,6 +1799,11 @@ void MiningInterface::note_mweb_template_accepted()
 {
     if (m_work_degraded)
         LOG_INFO << "[MWEB] Degraded start ended — template with MWEB state accepted";
+    close_mweb_hold_window("template accepted");
+}
+
+void MiningInterface::close_mweb_hold_window(const char* reason)
+{
     const int64_t since = m_mweb_hold_since_ms.exchange(0);
     if (since == 0)
         return;
@@ -1802,7 +1811,7 @@ void MiningInterface::note_mweb_template_accepted()
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const int64_t held_ms = std::max<int64_t>(0, now_ms - since);
     m_mweb_hold_total_ms.fetch_add(held_ms, std::memory_order_relaxed);
-    LOG_INFO << "[MWEB] HOLD ended after " << held_ms / 1000.0 << "s — template accepted";
+    LOG_INFO << "[MWEB] HOLD ended after " << held_ms / 1000.0 << "s — " << reason;
 }
 
 double MiningInterface::get_mweb_hold_seconds() const
@@ -2046,10 +2055,12 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
 {
     LOG_INFO << "getblocktemplate request received";
 
-    // Return live template if available
+    // Return live template if available. A degraded template (MWEB-active,
+    // no MWEB state yet) is never handed out: an external GBT miner would
+    // build LTC blocks from it that no daemon accepts.
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (m_work_valid && !m_cached_template.empty())
+        if (m_work_valid && !m_work_degraded && !m_cached_template.empty())
             return m_cached_template;
     }
 
