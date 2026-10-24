@@ -212,22 +212,26 @@ bool ordered_done(const core::coin::BlockBootstrapState<BlockT>& bs)
 
 /// Result of walking the UTXO set back to the best chain.
 struct RewindResult {
-    bool     ok{true};          // false: undo data missing or deeper than max_depth
+    bool     ok{true};          // false: undo data missing, deeper than max_depth,
+                                // or a height the header chain cannot judge
     uint32_t disconnected{0};
     uint32_t height{0};         // the UTXO set's best after the walk
     uint256  hash;              // ... and its block hash (flush to this)
 };
 
 /// Walk the UTXO set's best back, one height at a time, until its block is
-/// the best chain's block at that height (`chain_hash_at(h)`; a null answer
-/// means the header chain cannot judge that height and the walk stops).
+/// the best chain's block at that height (`chain_hash_at(h)`). Above
+/// `chain_height` (the header chain's tip) no block is on the best chain, so
+/// those are disconnected without asking (a reorg onto a shorter, heavier
+/// chain). At or below it a null answer means the header chain cannot judge
+/// that height: the walk fails instead of calling the UTXO set good.
 /// `prev_of(hash)` gives a block's parent (std::optional; nullopt = unknown),
 /// `disconnect(h)` undoes the UTXO set's block at height h (false = no undo
 /// data). At most `max_depth` blocks are disconnected. The caller flushes to
 /// (height, hash) when anything was disconnected, then re-arms the fill.
 /// An empty UTXO set (null best block) is left alone.
 template <typename ChainHashAtFn, typename PrevOfFn, typename DisconnectFn>
-RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t utxo_best,
+RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uint32_t utxo_best,
                                   const uint256& utxo_best_block,
                                   ChainHashAtFn&& chain_hash_at, PrevOfFn&& prev_of,
                                   DisconnectFn&& disconnect)
@@ -238,9 +242,15 @@ RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t utxo_best,
     if (utxo_best_block.IsNull())
         return r;
     while (r.height > 0) {
-        const uint256 at = chain_hash_at(r.height);
-        if (at.IsNull() || at == r.hash)
-            break;
+        if (r.height <= chain_height) {
+            const uint256 at = chain_hash_at(r.height);
+            if (at == r.hash)
+                break;
+            if (at.IsNull()) {
+                r.ok = false;
+                return r;
+            }
+        }
         if (r.disconnected >= max_depth) {
             r.ok = false;
             return r;

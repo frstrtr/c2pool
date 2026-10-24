@@ -2477,20 +2477,30 @@ int main(int argc, char* argv[]) {
                 // set's real best to target_height). Used by the reorg handler, by
                 // both connect points on a parent mismatch (e.g. a crash between a
                 // reorg's persisted tip and its UTXO disconnect: no tip change on
-                // restart), and once at startup. rearm_always re-arms even when
-                // nothing had to be disconnected. Returns false when the UTXO set
-                // cannot be brought back (no undo data / deeper than LTC_KEEP).
-                using UtxoHealFn = std::function<bool(const char*, uint32_t, bool)>;
+                // restart), and once at startup. Startup re-arms only when something
+                // was disconnected; Reorg always (the pipeline may hold old-branch
+                // blocks); ParentMismatch fails when nothing was disconnected, since
+                // refilling the same range would hit the same mismatch. Returns
+                // false when the UTXO set cannot be brought back (no undo data /
+                // deeper than LTC_KEEP / a height the header chain cannot judge).
+                enum class UtxoHeal { Startup, Reorg, ParentMismatch };
+                using UtxoHealFn = std::function<bool(UtxoHeal, uint32_t)>;
                 auto utxo_heal = std::make_shared<UtxoHealFn>(
                     [chain = embedded_chain.get(), utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(), bcaster = embedded_broadcaster.get(),
                      ltc_bs, fill_rr, utxo_jump_from, &ioc](
-                        const char* reason, uint32_t target_height, bool rearm_always) -> bool {
+                        UtxoHeal kind, uint32_t target_height) -> bool {
                         if (!chain || !utxo || !utxo_db)
                             return false;
+                        const char* reason = kind == UtxoHeal::Startup ? "startup"
+                            : kind == UtxoHeal::Reorg ? "reorg" : "parent mismatch";
                         const uint32_t before = utxo->get_best_height();
+                        // Undo records go only after the flush: a crash mid-walk
+                        // leaves the DB at its old best with its undo intact.
+                        std::vector<uint32_t> undone;
                         const auto rw = ltc::coin::rewind_to_best_chain(
-                            core::coin::LTC_MIN_BLOCKS_TO_KEEP, before, utxo->get_best_block(),
+                            core::coin::LTC_MIN_BLOCKS_TO_KEEP, chain->height(), before,
+                            utxo->get_best_block(),
                             [&](uint32_t h) {
                                 auto e = chain->get_header_by_height(h);
                                 return e ? e->block_hash : uint256();
@@ -2506,11 +2516,13 @@ int main(int argc, char* argv[]) {
                                 if (!utxo_db->get_block_undo(h, undo))
                                     return false;
                                 utxo->disconnect_from_undo(undo);
-                                utxo_db->remove_block_undo(h);
+                                undone.push_back(h);
                                 return true;
                             });
                         if (rw.disconnected > 0) {
                             utxo->flush(rw.hash, rw.height);
+                            for (uint32_t h : undone)
+                                utxo_db->remove_block_undo(h);
                             LOG_WARNING << "[EMB-LTC] UTXO rewound to the best chain (" << reason
                                         << "): disconnected " << rw.disconnected << " blocks (h="
                                         << before << "→" << rw.height << ") best="
@@ -2524,7 +2536,12 @@ int main(int argc, char* argv[]) {
                                       << core::coin::LTC_MIN_BLOCKS_TO_KEEP << " blocks)";
                             return false;
                         }
-                        if (rw.disconnected == 0 && !rearm_always)
+                        if (rw.disconnected == 0 && kind == UtxoHeal::ParentMismatch) {
+                            LOG_WARNING << "[EMB-LTC] Parent mismatch at h=" << before + 1
+                                        << " but the UTXO set's best is on the best chain; not refilling";
+                            return false;
+                        }
+                        if (rw.disconnected == 0 && kind == UtxoHeal::Startup)
                             return true;
                         // Connect the best chain in order from the UTXO set's REAL
                         // best, whatever the pipeline was doing (it may have drained
@@ -2566,7 +2583,7 @@ int main(int argc, char* argv[]) {
                 boost::asio::post(ioc, [utxo_heal, chain = embedded_chain.get()]() {
                     try {
                         if (chain && chain->tip())
-                            (*utxo_heal)("startup", chain->height(), false);
+                            (*utxo_heal)(UtxoHeal::Startup, chain->height());
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[EMB-LTC] UTXO startup check error: " << e.what();
                     }
@@ -3014,7 +3031,7 @@ int main(int argc, char* argv[]) {
                                         if (drained.refused == ltc::coin::ConnectCheck::ParentMismatch) {
                                             // The UTXO set itself is on another branch: walk
                                             // it back to the best chain and refill from there.
-                                            if (!(*utxo_heal)("parent mismatch", chain->height(), true)) {
+                                            if (!(*utxo_heal)(UtxoHeal::ParentMismatch, chain->height())) {
                                                 ltc_bs->active = false;
                                                 ltc_bs->buffer.clear();
                                                 ltc_bs->stop_stall_timer();
@@ -3157,9 +3174,10 @@ int main(int argc, char* argv[]) {
                                                 << "), UTXO at h=" << utxo_best << " "
                                                 << utxo->get_best_block().GetHex().substr(0, 16) << "...";
                                     if (check == ltc::coin::ConnectCheck::ParentMismatch
-                                        && (*utxo_heal)("parent mismatch", chain->height(), true)
+                                        && (*utxo_heal)(UtxoHeal::ParentMismatch, chain->height())
                                         && ltc_bs->active) {
-                                        // Keep this block for the refill instead of fetching it again.
+                                        // Keep this block for the refill: the drain uses it
+                                        // without waiting for the heal's own request.
                                         ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
                                     }
                                 }
@@ -3419,7 +3437,7 @@ int main(int argc, char* argv[]) {
                             // doing. Blocks of the new branch already delivered
                             // (dropped as copies, or checked against the old branch)
                             // are fetched again.
-                            (*utxo_heal)("reorg", new_height, true);
+                            (*utxo_heal)(UtxoHeal::Reorg, new_height);
                         }
 
                         // Drop MWEB state that is not the new tip's (its HogEx is
