@@ -48,15 +48,17 @@
 //                  load failure; a scan LevelDB cannot read is a Scan fault
 //                  (the store moved aside, an empty store in its place).
 //                  Disk: one row per side carrier at a position at or above
-//                  floors.sides (the view horizon base_pos - J_0 = L - P-01 -
-//                  J_0, lower with P-51's body floor, --pathb-side-keep or an
-//                  open join hold), plus those placed since the last prune
-//                  step; each row at most 256 + 17 x 17 + FRAME_CAP =
-//                  16,074 bytes at hf 16 (the fixed fields, 1 + R_MAX = 17
-//                  placements of 17 bytes, the body at most FRAME_CAP =
-//                  15,529). With k side carriers per position kept over n
-//                  positions: at most k x n x 16,074 bytes (n = P-01 + J_0 =
-//                  2,304 at the defaults: k x 37.0 MB).)
+//                  floors.sides (the lowest of P-51's body floor, the view
+//                  horizon base_pos - J_0, --pathb-side-keep and an open join
+//                  hold), plus those placed since the last prune step; each
+//                  row at most 256 + 17 x 17 + FRAME_CAP = 16,074 bytes at hf
+//                  16 (the fixed fields, 1 + R_MAX = 17 placements of 17
+//                  bytes, the body at most FRAME_CAP = 15,529). With k side
+//                  carriers per position over n = L + 1 - floors.sides
+//                  positions: at most k x n x 16,074 bytes. At the defaults
+//                  P-51's body floor binds: n >= 4,489 on a mature chain
+//                  (k x 72.2 MB), up to about 5,640 on a young chain
+//                  (k x 90.7 MB).)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
