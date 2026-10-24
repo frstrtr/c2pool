@@ -1,0 +1,76 @@
+name: Master red alarm
+# A red build.yml push run on master used to raise no alarm: master's Windows
+# x86_64 leg stayed red for 3 days after #1988 and nobody saw it (#2026).
+# This workflow keeps ONE open issue titled "master red: CI push run" while
+# master's latest CI push run is failing, comments each further red run on it,
+# and closes it on the next green push run. The bridge pull-alarm and anyone
+# watching the repo see the issue; no polling of run lists needed.
+#
+# workflow_run only fires from the copy of this file on the default branch, so
+# it is inert until merged.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+
+permissions:
+  actions: read
+  issues: write
+
+concurrency:
+  group: master-red-alarm
+  cancel-in-progress: false
+
+jobs:
+  alarm:
+    # Push runs only: a fork PR from a branch named master would also match the
+    # branches filter. Cancelled/skipped runs say nothing about master's health.
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      contains(fromJSON('["success","failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Raise, update or clear the master-red issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="master red: CI push run"
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" \
+                       --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          short=${HEAD_SHA:0:8}
+
+          if [ "$CONCLUSION" = "success" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$REPO" \
+                --comment "Master is green again: CI push run $RUN_ID ($short) succeeded. $RUN_URL"
+              echo "cleared #$existing"
+            else
+              echo "master green, no open alarm"
+            fi
+            exit 0
+          fi
+
+          failed=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+                     --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "- " + .name' || true)
+          [ -n "$failed" ] || failed="- (no failed job listed; conclusion=$CONCLUSION)"
+          body=$(printf 'CI push run on master is **%s** at %s.\n\nRun: %s\n\nFailed jobs:\n%s\n\nThis issue closes itself on the next green CI push run on master.\n' \
+                   "$CONCLUSION" "$short" "$RUN_URL" "$failed")
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            echo "updated #$existing"
+          else
+            gh issue create --repo "$REPO" --title "$title" --label ci --body "$body" || \
+              gh issue create --repo "$REPO" --title "$title" --body "$body"
+            echo "raised new alarm"
+          fi
+          echo "::warning title=master is red::CI push run $RUN_ID ($short) concluded $CONCLUSION"
