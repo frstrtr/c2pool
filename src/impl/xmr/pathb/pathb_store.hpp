@@ -35,6 +35,30 @@
 //                  (a store that started empty, not launched here, and has
 //                  not caught up yet: written in its first batch, deleted
 //                  when it catches up; an adoption's empty store holds none)
+//   21 K_PSIDE     v37s:pside:<chain>:<id hex>      K_PCARRIER's fields, kind 21
+//                  (a placed carrier off the best chain, its body and
+//                  placements: written when it is placed as a side carrier
+//                  and by an adoption for the adopted tree's side carriers;
+//                  a switch moves the abandoned branch's carriers here and
+//                  deletes the rows of the new branch; the prune step deletes
+//                  the rows below floors.sides and those of the side branches
+//                  its re-root drops (forking below floors.sides); reloaded
+//                  under their parents at a restart (step 9). A torn row is moved aside to
+//                  v37s:psideaside:<chain>:<id hex>, never deleted, never a
+//                  load failure; a scan LevelDB cannot read is a Scan fault
+//                  (the store moved aside, an empty store in its place).
+//                  Disk: one row per side carrier at a position at or above
+//                  floors.sides (the lowest of P-51's body floor, the view
+//                  horizon base_pos - J_0, --pathb-side-keep and an open join
+//                  hold), plus those placed since the last prune step; each
+//                  row at most 256 + 17 x 17 + FRAME_CAP = 16,074 bytes at hf
+//                  16 (the fixed fields, 1 + R_MAX = 17 placements of 17
+//                  bytes, the body at most FRAME_CAP = 15,529). With k side
+//                  carriers per position over n = L + 1 - floors.sides
+//                  positions: at most k x n x 16,074 bytes. At the defaults
+//                  P-51's body floor binds: n >= 4,489 on a mature chain
+//                  (k x 72.2 MB), up to about 5,640 on a young chain
+//                  (k x 90.7 MB).)
 //   The poison mark v37s:poison:<chain> (one byte): a store write failed.
 //   The directory of a store is named by its pool_id and G (store_dir_name).
 //
@@ -74,7 +98,13 @@
 //     7. K_BWORK: each key names its own height (the bound work below the
 //        floor; absent: none); K_BLO at least 1 and at most tip + 1, present
 //        in a joined store; K_BCLAIM: each key names its own bin;
-//     8. K_NCU: present (not caught up) or absent.
+//     8. K_NCU: present (not caught up) or absent;
+//     9. K_PSIDE (a failed scan: Scan; no row is a load failure): each row
+//        decodes under its key (else moved aside); ascending by position, a
+//        row whose parent the tree holds is placed as a side carrier (the
+//        tree, the BinStore while its fork is at or above the journal base,
+//        the body), its stored d, H, cum_work and S compared; a row that does
+//        not place is skipped.
 //
 // Header-only. Not included by any running component; included by its KATs only.
 // ---------------------------------------------------------------------------
@@ -86,6 +116,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -111,6 +142,8 @@ inline constexpr std::uint8_t K_BLO = 18;
 inline constexpr std::uint8_t K_BCLAIM = 19;
 inline constexpr std::uint8_t K_NCU = 20;  // a node-local store layout kind, the next after K_BCLAIM; no chain byte,
                                            // digest, frame or verdict reads it
+inline constexpr std::uint8_t K_PSIDE = 21;  // a node-local store layout kind, the next after K_NCU; no chain byte,
+                                             // digest, frame or verdict reads it
 
 namespace store_keys {
 inline std::string phead(std::uint32_t c) { return "v37s:phead:" + lane_keys::chain_fmt(c); }
@@ -124,6 +157,10 @@ inline std::string blo(std::uint32_t c) { return "v37s:blo:" + lane_keys::chain_
 inline std::string bclaim_prefix(std::uint32_t c) { return "v37s:bclaim:" + lane_keys::chain_fmt(c) + ":"; }
 inline std::string bclaim(std::uint32_t c, std::uint64_t bin) { return bclaim_prefix(c) + lane_keys::index_fmt(bin); }
 inline std::string ncu(std::uint32_t c) { return "v37s:ncu:" + lane_keys::chain_fmt(c); }
+inline std::string pside_prefix(std::uint32_t c) { return "v37s:pside:" + lane_keys::chain_fmt(c) + ":"; }
+inline std::string pside(std::uint32_t c, const Hash32& id) { return pside_prefix(c) + pid_detail::hex(id); }
+// a torn K_PSIDE row moved aside (kept, never read)
+inline std::string pside_aside_prefix(std::uint32_t c) { return "v37s:psideaside:" + lane_keys::chain_fmt(c) + ":"; }
 // The poison mark: a store write failed; the next load is a load failure.
 inline std::string poison(std::uint32_t c) { return "v37s:poison:" + lane_keys::chain_fmt(c); }
 }  // namespace store_keys
@@ -264,9 +301,9 @@ struct CarrierRecord {
     friend bool operator==(const CarrierRecord&, const CarrierRecord&) = default;
 };
 
-inline std::string encode_pcarrier(const CarrierRecord& c) {
+inline std::string encode_carrier_record(const CarrierRecord& c, std::uint8_t record_kind) {
     lane_rec::Writer w;
-    w.hdr(K_PCARRIER);
+    w.hdr(record_kind);
     w.bytes(c.id);
     w.bytes(c.parent);
     w.u64(c.pos);
@@ -290,11 +327,14 @@ inline std::string encode_pcarrier(const CarrierRecord& c) {
     return w.s;
 }
 
+inline std::string encode_pcarrier(const CarrierRecord& c) { return encode_carrier_record(c, K_PCARRIER); }
+inline std::string encode_pside(const CarrierRecord& c) { return encode_carrier_record(c, K_PSIDE); }
+
 inline constexpr std::size_t kStoredPlacementBytes = kU64Bytes + kU64Bytes + kU8Bytes;
 
-inline std::optional<CarrierRecord> decode_pcarrier(const std::string& v) {
+inline std::optional<CarrierRecord> decode_carrier_record(const std::string& v, std::uint8_t record_kind) {
     lane_rec::Reader r(v);
-    if (!lane_rec::read_hdr(r, K_PCARRIER)) return std::nullopt;
+    if (!lane_rec::read_hdr(r, record_kind)) return std::nullopt;
     CarrierRecord c;
     c.id = r.bytes<kHashBytes>();
     c.parent = r.bytes<kHashBytes>();
@@ -330,6 +370,8 @@ inline std::optional<CarrierRecord> decode_pcarrier(const std::string& v) {
     if (!r.done()) return std::nullopt;
     return c;
 }
+inline std::optional<CarrierRecord> decode_pcarrier(const std::string& v) { return decode_carrier_record(v, K_PCARRIER); }
+inline std::optional<CarrierRecord> decode_pside(const std::string& v) { return decode_carrier_record(v, K_PSIDE); }
 
 // The carrier body of a record (kind Carrier), its own body's header (kind
 // Header); nullopt: none or it does not decode.
@@ -477,6 +519,35 @@ inline CarrierRecord record_of(const CarrierNode& n, const CarrierBodyV3* body, 
     if (delta != nullptr)
         for (const Placement& x : delta->placed) c.placements.push_back(StoredPlacement{x.bin, x.p_own, x.live});
     return c;
+}
+
+// K_PSIDE of a placed side carrier: its tree node, body and placements (false: the tree or the bodies do not hold it).
+inline bool put_side(LaneBatch& b, std::uint32_t chain, const CarrierTree& tree, const BinStore& store,
+                     const CarrierBodies& bodies, const Hash32& id) {
+    const CarrierNode* n = tree.find(id);
+    const CarrierBodyV3* body = bodies.get(id);
+    if (n == nullptr || body == nullptr) return false;
+    b.put(store_keys::pside(chain, id), encode_pside(record_of(*n, body, store.delta(id))));
+    return true;
+}
+
+// A switch: the abandoned branch's carriers (`undone`, now side carriers) moved to K_PSIDE; the new branch's carriers
+// (`added`, best now) leave K_PSIDE. In the switch's own batch.
+inline void side_moves(LaneBatch& b, std::uint32_t chain, const CarrierTree& tree, const BinStore& store,
+                       const CarrierBodies& bodies, const std::vector<Hash32>& undone, const std::vector<Hash32>& added) {
+    for (const Hash32& id : undone) (void)put_side(b, chain, tree, store, bodies, id);
+    for (const Hash32& id : added) b.del(store_keys::pside(chain, id));
+}
+
+// K_PSIDE of every carrier the tree holds off its best chain with its body (an adoption's batch).
+inline void put_sides(LaneBatch& b, std::uint32_t chain, const CarrierTree& tree, const BinStore& store,
+                      const CarrierBodies& bodies) {
+    std::set<Hash32> on_best;
+    for (const CarrierNode* n = &tree.best(); n != nullptr && on_best.insert(n->id).second; n = tree.find(n->parent)) {
+    }
+    bodies.for_each_id([&](const Hash32& id) {
+        if (on_best.count(id) == 0 && tree.find(id) != nullptr) (void)put_side(b, chain, tree, store, bodies, id);
+    });
 }
 
 // The head of a store at its best tip (the identity fields kept).
@@ -668,7 +739,19 @@ inline std::vector<std::string> store_prefixes(std::uint32_t chain) {
     return {store_keys::phead(chain),        store_keys::pcarrier_prefix(chain), store_keys::ar_prefix(chain),
             lane_keys::bmmr(chain),          lane_keys::blhash_prefix(chain),    lane_keys::bleaf_prefix(chain),
             store_keys::bwork_prefix(chain), store_keys::blo(chain),            store_keys::bclaim_prefix(chain),
-            store_keys::ncu(chain),          store_keys::poison(chain)};
+            store_keys::ncu(chain),          store_keys::poison(chain),          store_keys::pside_prefix(chain)};
+}
+
+// The prune's K_PSIDE part at floors.sides: the rows at positions below `sides_floor`, and the rows of the carriers the
+// step's re-root dropped (`gone`: side branches forking below the floor), deleted; false: the scan failed.
+inline bool side_prune_batch(PathbKv& kv, std::uint32_t chain, std::uint64_t sides_floor, const std::set<Hash32>& gone,
+                             LaneBatch& b) {
+    const std::string prefix = store_keys::pside_prefix(chain);
+    return kv.for_each_prefix(prefix, [&](const std::string& k, const std::string& v) {
+        const std::optional<CarrierRecord> c = decode_pside(v);
+        if (c && k == store_keys::pside(chain, c->id) && (c->pos < sides_floor || gone.count(c->id) != 0)) b.del(k);
+        return true;
+    });
 }
 
 // An adoption (the first completed join, or a replacement by rule (4)) and the
@@ -735,6 +818,9 @@ struct LoadedState {
     std::uint64_t bound_lo = 0;  // K_BLO: a joined store's x1 + 1 (0: count from the tree's root)
     std::map<std::uint64_t, BclaimRecord> claimed;  // K_BCLAIM: a joined store's adopted (claimed) leaves, by bin
     bool not_caught_up = false;                     // K_NCU: the store started empty and has not caught up yet
+    std::size_t side_loaded = 0;   // K_PSIDE: side carriers placed again
+    std::size_t side_skipped = 0;  // K_PSIDE: rows that did not place (parent not held, a check failed)
+    std::size_t side_aside = 0;    // K_PSIDE: torn rows moved aside
 };
 
 struct LoadResult {
@@ -762,6 +848,120 @@ inline Placement placement_from(const ReceiptBodyV3& r, const StoredPlacement& s
 }
 
 }  // namespace store_detail
+
+// Step 9: the K_PSIDE rows; false: the scan failed. A row that does not decode under its key is moved aside (kept
+// under the aside prefix); the others, ascending by position, are placed as side carriers under parents the tree
+// holds, their stored d, H, cum_work and S compared, the marks set and the body kept:
+//   - a row with its placements: placed as place_admitted places one (the tree; the BinStore add / ingest / seal
+//     while its fork is at or above the journal base); the tree only otherwise, or when the BinStore cannot place it
+//     again, as a running node holds a side carrier once BinStore::prune dropped its delta;
+//   - a row without them (written once its delta had left the BinStore): restored in the tree from its values.
+// A row that does not place, or would become the best tip, is skipped (its partial placement undone).
+inline bool load_side_carriers(PathbKv& kv, std::uint32_t chain, const LaneParams& p, LoadedState& st) {
+    std::vector<std::pair<std::string, std::string>> rows;
+    if (!kv.for_each_prefix(store_keys::pside_prefix(chain), [&rows](const std::string& k, const std::string& v) {
+            rows.emplace_back(k, v);
+            return true;
+        }))
+        return false;
+    LaneBatch aside;
+    std::vector<CarrierRecord> recs;
+    const std::string prefix = store_keys::pside_prefix(chain);
+    for (const auto& [k, v] : rows) {
+        std::optional<CarrierRecord> c = decode_pside(v);
+        if (!c || k != store_keys::pside(chain, c->id) || !c->state) {
+            aside.put(store_keys::pside_aside_prefix(chain) + k.substr(prefix.size()), v);
+            aside.del(k);
+            ++st.side_aside;
+            continue;
+        }
+        recs.push_back(std::move(*c));
+    }
+    if (!aside.ops.empty()) (void)commit_lane_batch(kv, aside);
+    std::stable_sort(recs.begin(), recs.end(), [](const CarrierRecord& a, const CarrierRecord& b) { return a.pos < b.pos; });
+    CarrierTree& tree = st.tree;
+    BinStore& store = st.store;
+    for (const CarrierRecord& c : recs) {
+        const std::optional<CarrierBodyV3> b = record_body(c, p);
+        const bool placed_list = b && c.placements.size() == b->carried.size() + 1;
+        if (tree.find(c.id) != nullptr || tree.find(c.parent) == nullptr || !b || receipt_id(b->own) != c.id ||
+            b->own.side.tip != c.parent || !(placed_list || c.placements.empty())) {
+            ++st.side_skipped;
+            continue;
+        }
+        bool in_store = false;
+        bool ok = true;
+        if (placed_list) {
+            std::vector<CarriedPlacement> cp;
+            std::vector<Placement> sp;
+            for (std::size_t k = 0; k < b->carried.size(); ++k) {
+                const ReceiptBodyV3& r = b->carried[k];
+                cp.push_back(CarriedPlacement{receipt_id(r), r.side.t_origin, r.side.ballot, c.placements[k].live});
+                sp.push_back(admit_detail::placement_of(r, receipt_id(r), c.placements[k].bin, c.placements[k].p_own));
+            }
+            sp.push_back(admit_detail::placement_of(b->own, c.id, c.placements.back().bin, c.placements.back().p_own));
+            ok = tree.place(CarrierAnnounce{c.id, c.parent, c.h, b->own.side.receipts_root, b->own.side.ballot}, cp)
+                         .verdict == PlaceVerdict::Placed;
+            // the BinStore only for a fork at or above its journal base (a switch by the journal can reach it; the
+            // restored store holds every entry its seals read)
+            const LaneView pv = store.view_at(c.parent);
+            const bool in_journal = pv.ok() && pv.fork_pos() >= store.base_pos();
+            const AddVerdict av = ok && in_journal ? store.add_carrier(c.id, c.parent, c.h) : AddVerdict::Deep;
+            in_store = av == AddVerdict::Added;
+            for (std::size_t i = 0; in_store && i < sp.size(); ++i) {
+                const std::optional<Ingest> ig = store.ingest(c.id, sp[i]);
+                in_store = ig.has_value() && *ig == Ingest::Accepted;
+            }
+            if (in_store) {
+                const LaneDelta* d = store.delta(c.id);
+                in_store = d != nullptr && d->placed.size() == c.placements.size();
+                for (std::size_t k = 0; in_store && k < d->placed.size(); ++k)
+                    in_store = d->placed[k].live == c.placements[k].live;
+                in_store = in_store && store.seal(c.id).has_value();
+            }
+            if (av == AddVerdict::Added && !in_store) (void)store.drop_side(c.id);  // the tree only
+        } else {
+            CarrierTree::RestoredNode rn;
+            rn.id = c.id;
+            rn.parent = c.parent;
+            rn.pos = c.pos;
+            rn.h = c.h;
+            rn.H = c.H;
+            rn.d = c.d;
+            rn.cum_work = c.cum_work;
+            rn.receipts_root = b->own.side.receipts_root;
+            rn.ballot = b->own.side.ballot;
+            rn.rs = decode_ratchet_state(*c.state);
+            ok = tree.restore_side(rn);
+        }
+        const CarrierNode* n = ok ? tree.find(c.id) : nullptr;
+        ok = ok && n != nullptr && n->d == c.d && n->H == c.H && n->cum_work == c.cum_work &&
+             encode_ratchet_state(n->rs) == *c.state;
+        if (ok) {
+            tree.mark_verified(c.id);
+            tree.mark_bodies(c.id);
+            ok = tree.best().id == store.best_tip();
+        }
+        if (!ok) {
+            if (in_store) (void)store.drop_side(c.id);
+            if (tree.find(c.id) != nullptr) {
+                tree.unmark(c.id);
+                tree.drop(c.id);
+            }
+            ++st.side_skipped;
+            continue;
+        }
+        st.bodies.put(c.id, *b);
+        for (const ReceiptBodyV3& r : b->carried) {
+            st.refs[r.side.payee] = r.payee;
+            if (r.owner) st.refs[r.side.owner] = *r.owner;
+        }
+        st.refs[b->own.side.payee] = b->own.payee;
+        if (b->own.owner) st.refs[b->own.side.owner] = *b->own.owner;
+        ++st.side_loaded;
+    }
+    return true;
+}
 
 // The phase-1 start: the first position x >= lo with H(x) > floor_h.
 inline std::uint64_t first_above(const std::vector<std::uint64_t>& records, std::uint64_t first_pos, std::uint64_t lo,
@@ -1117,6 +1317,8 @@ inline LoadResult pathb_load(PathbKv& kv, const Hash32& dir_pool_id, const Hash3
             st.not_caught_up = true;
         }
     }
+    // 9. K_PSIDE (a scan LevelDB cannot read: Scan; no row is a load failure)
+    if (!load_side_carriers(kv, in.chain, p, st)) return fail(StoreFault::Scan);
     out.state.emplace(std::move(st));
     out.fault = StoreFault::None;
     return out;
