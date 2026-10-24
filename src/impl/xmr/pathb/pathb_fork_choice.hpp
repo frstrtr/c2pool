@@ -332,6 +332,7 @@ public:
     const EpochTable& epoch_table() const noexcept { return table_; }
     std::size_t size() const noexcept { return index_.size(); }
     std::size_t waiting() const noexcept { return waiting_keys_.size(); }
+    bool is_waiting(const Hash32& id) const { return waiting_on_any(id); }  // a frame of id waits on its parent
     const CarrierNode& genesis() const noexcept { return nodes_[0]; }
     const CarrierNode& best() const noexcept { return nodes_[best_]; }
 
