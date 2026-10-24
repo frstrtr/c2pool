@@ -2567,6 +2567,13 @@
             }
         }
 
+        // Each Active Miners render waits on three fetches before it draws, and
+        // a refresh, the "Show historical" toggle or a manual reload can start
+        // another while one is in flight. Only the newest render may draw:
+        // two overlapping renders both appended the table, so the same address
+        // showed up twice (one copy's toggle then hid the other's workers).
+        var _minersRenderGen = 0;
+
         function populateActiveMiners(local_stats, global_stats) {
             d3.select('#active_miners_loading').style('display', 'none');
             
@@ -2770,6 +2777,7 @@
                 var STANDBY_TITLE = 'Standby: authorized and receiving work, but no share submitted on this connection. Usually a failover connection of a rig that mines on another node; a rig that never submits anywhere looks the same here.';
                 
                 function renderMinersTable(showHistorical) {
+                    var renderGen = ++_minersRenderGen;
                     var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
                 
                     // Update count badge: active count (/ total if showing historical)
@@ -2794,6 +2802,10 @@
                 d3.json('../current_payouts', function(payouts_data) {
                 d3.json('../current_merged_payouts', function(merged_payouts_data) {
                 d3.json('../web/graph_data/miner_hash_rates/last_day', function(hr_day) {
+                // A newer render started while these fetches were in flight; it
+                // owns the table, so this one draws nothing.
+                if (renderGen !== _minersRenderGen) return;
+                d3.select('#active_miners tbody').selectAll('tr').remove();
                 // #1142 item 6: per-worker 24h average, same derivation as the
                 // miners.html card aggregate. A worker is averaged only over the
                 // samples it appears in; no samples means no average (shown '-').
@@ -3111,8 +3123,10 @@
                 });
                 } // end renderMinersTable
                 
-                // Initial render — show only currently connected (active) miners
-                renderMinersTable(false);
+                // Initial render follows the "Show historical" box, so a refresh
+                // does not drop historical rows while the box stays ticked.
+                var historicalBox = document.getElementById('show_historical_miners');
+                renderMinersTable(!!(historicalBox && historicalBox.checked));
                 
                 // Wire checkbox to toggle historical miners visibility
                 d3.select('#show_historical_miners').on('change', function() {
@@ -7174,7 +7188,15 @@
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
-                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
+                // A young sharechain is shorter than the PPLNS window: nothing has
+                // left the window yet, so no tail share dissolves. Say so instead
+                // of leaving an eviction-free tail unexplained.
+                var totalEl = document.getElementById('defrag-total');
+                var filling = data.window_size > 0 && shares.length < data.window_size;
+                totalEl.textContent = shares.length + ' / ' + (data.window_size || '-') + (filling ? ' (filling)' : '');
+                totalEl.title = filling
+                    ? 'The window is still filling: no share leaves it until ' + data.window_size + ' shares are in it.'
+                    : '';
                 document.getElementById('defrag-mine').textContent = mine;
                 document.getElementById('defrag-stale').textContent = stale;
                 document.getElementById('defrag-dead').textContent = dead;
