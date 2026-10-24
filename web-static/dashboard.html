@@ -5249,6 +5249,28 @@
             }
         }
         
+        // #1142 item 9: page long peer lists (p2pool-dash parity). The shown
+        // count lives outside the loaders so an expanded list stays expanded
+        // across the periodic refresh.
+        var PEERS_PAGE = 10;
+        window.peerPageCounts = {};
+        function pagePeers(key, btnId, rows, reload) {
+            var shown = window.peerPageCounts[key] || PEERS_PAGE;
+            var remaining = rows.length - shown;
+            var btn = d3.select('#' + btnId);
+            if (remaining > 0) {
+                btn.style('display', 'block')
+                    .text('Show ' + Math.min(PEERS_PAGE, remaining) + ' more... (' + remaining + ' remaining)')
+                    .on('click', function() {
+                        window.peerPageCounts[key] = shown + PEERS_PAGE;
+                        reload();
+                    });
+            } else {
+                btn.style('display', 'none');
+            }
+            return rows.slice(0, shown);
+        }
+
         function loadPeers() {
             d3.json('../peer_list', function(peers) {
                 d3.select('#peers_loading').style('display', 'none');
@@ -5261,10 +5283,13 @@
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('No peers connected');
+                    d3.select('#p2pool_peers_show_more').style('display', 'none');
                     return;
                 }
 
-                var tr = d3.select('#peers_tbody').selectAll('tr').data(peers).enter().append('tr');
+                var tr = d3.select('#peers_tbody').selectAll('tr')
+                    .data(pagePeers('p2pool', 'p2pool_peers_show_more', peers, loadPeers))
+                    .enter().append('tr');
                 tr.append('td')
                     .style('font-family', 'monospace')
                     .style('font-size', '12px')
@@ -5305,6 +5330,7 @@
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('Embedded node not enabled');
+                    d3.select('#broadcaster_peers_show_more').style('display', 'none');
                     return;
                 }
 
@@ -5334,7 +5360,7 @@
                 }
 
                 var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
-                    .data(connectedPeers)
+                    .data(pagePeers('broadcaster', 'broadcaster_peers_show_more', connectedPeers, loadBroadcasterStats))
                     .enter().append('tr');
 
                 tr.append('td')
@@ -5344,8 +5370,6 @@
                 tr.append('td').text(function(p) { return p.subver || '-'; });
                 tr.append('td').text(function(p) { return p.startingheight || '-'; });
                 tr.append('td').text(function(p) { return format_duration(p.conntime || 0); });
-
-                d3.select('#broadcaster_peers_show_more').style('display', 'none');
             });
         }
         
