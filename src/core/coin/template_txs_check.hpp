@@ -24,6 +24,7 @@
 //                               order, are exactly HogEx inputs 1.. (as
 //                               mweb_node.cpp ContextualCheckBlock checks them)
 //   8 fee-exceeds-coinbasevalue the listed fees sum above coinbasevalue
+//     fee-negative              a listed fee below zero
 // plus a warning-only fee outlier (one tx's fee above 1 coin).
 //
 // Choke points: template ingress (MiningInterface::refresh_work), block
@@ -315,7 +316,7 @@ inline std::optional<TemplateTxRefusal> check_template_txs(const nlohmann::json&
         if (e.contains("fee") && e["fee"].is_number_integer()) {
             const int64_t fee = e["fee"].get<int64_t>();
             if (fee < 0)
-                return TemplateTxRefusal{"fee-exceeds-coinbasevalue", i, txid, "negative fee"};
+                return TemplateTxRefusal{"fee-negative", i, txid, "negative fee"};
             if (fee > kTemplateFeeOutlierSat && fee_outliers)
                 ++*fee_outliers;
             fee_sum = (fee > std::numeric_limits<int64_t>::max() - fee_sum)

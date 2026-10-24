@@ -315,6 +315,7 @@ FrozenJob freeze_cached_job(MiningInterface& mi, const std::string& prev)
     j.snap.tx_data = cbr.snapshot.tx_data;
     j.snap.mweb = cbr.snapshot.mweb;
     j.snap.mweb_active = cbr.snapshot.mweb_active;
+    j.snap.degraded = cbr.snapshot.degraded;
     j.snap.segwit_active = cbr.snapshot.segwit_active;
     const uint256 root = MiningInterface::reconstruct_merkle_root(
         j.snap.coinb1 + kEn1 + kEn2 + j.snap.coinb2, j.snap.merkle_branches);
@@ -685,6 +686,31 @@ TEST(LtcMwebHogex, DegradedStartServesWorkButNeverSubmitsLtcBlocks)
     f.mi.refresh_work();
     EXPECT_FALSE(f.mi.is_work_degraded());
     EXPECT_EQ(f.mi.get_cached_mweb(), kMweb);
+}
+
+// A cold start whose first template has its HogEx and mweb but that ingress
+// refuses for another reason (here a wrong txid): with nothing valid to hold
+// it is served degraded, and the job carries that. Block assembly's shape
+// check passes, so only the degraded flag keeps the block from the daemon.
+TEST(LtcMwebHogex, DegradedStartOnANonShapeRefusalNeverSubmitsLtcBlocks)
+{
+    Fixture f;
+    const std::string th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, rep("0", 64)}, {kHogex, th}}, kMweb);
+    stub_ref_hash(f.mi);
+    f.mi.refresh_work();
+
+    ASSERT_FALSE(f.mi.get_current_work_template().is_null()) << "degraded start serves work";
+    EXPECT_TRUE(f.mi.is_work_degraded());
+    EXPECT_EQ(f.mi.get_template_tx_refusals_json()["by_code"]["txid-mismatch"], 1);
+
+    FrozenJob j = freeze_cached_job(f.mi, kPrev);
+    EXPECT_TRUE(j.snap.degraded);
+    EXPECT_FALSE(j.snap.mweb.empty()) << "the shape check alone would pass this job";
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
+    EXPECT_EQ(f.node.submit_calls, 0) << "no LTC block from a degraded job";
+    EXPECT_EQ(f.mi.get_mweb_refusals_by_code_json()["degraded-job"], 1);
+    EXPECT_EQ(f.mi.get_aux_checks(), 1u) << "the merged-mining check still sees the share";
 }
 
 // A template failure that is not an MWEB shape refusal still invalidates the

@@ -746,6 +746,20 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
                   << " mweb_active=" << mweb_active << ") — block not submitted";
         return {};
     }
+    // A degraded job was built on a template that ingress refused (a fresh
+    // start with no valid template yet): shares and merged blocks only. The
+    // shape check above catches a template without MWEB state; this catches
+    // every other refusal code.
+    if (job ? job->degraded : m_work_degraded.load(std::memory_order_relaxed)) {
+        m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+            ++m_mweb_refusals_by_code["degraded-job"];
+        }
+        LOG_ERROR << "[MWEB] Block assembly REFUSED: the job was built on a degraded template"
+                  << " (refused at ingress) — block not submitted";
+        return {};
+    }
     // Litecoin: every tx of the frozen job decodes as exactly one tx with
     // inputs and outputs and no MWEB data, and only the last one carries the
     // HogEx flag (template-tx check rules 1-5). In warn mode the block is
@@ -1114,6 +1128,7 @@ MiningInterface::build_connection_coinbase(
         bool segwit_active{false};
         std::string mweb;
         bool mweb_active{false};
+        bool degraded{false};
         std::string coinbase_text;
         std::vector<unsigned char> donation_script;
         std::vector<std::string> merkle_branches;
@@ -1140,6 +1155,7 @@ MiningInterface::build_connection_coinbase(
         ws.segwit_active = m_segwit_active;
         ws.mweb = m_cached_mweb;
         ws.mweb_active = m_cached_mweb_active;
+        ws.degraded = m_work_degraded;
         ws.coinbase_text = m_coinbase_text;
         ws.donation_script = m_donation_script;
         ws.share_version = m_cached_share_version;
@@ -1478,6 +1494,7 @@ MiningInterface::build_connection_coinbase(
     snap.segwit_active = ws.segwit_active;
     snap.mweb = ws.mweb;
     snap.mweb_active = ws.mweb_active;
+    snap.degraded = ws.degraded;
     snap.subsidy = subsidy;
     snap.witness_commitment_hex = ws.witness_commitment;
     snap.witness_root = effective_witness_root;
@@ -2008,6 +2025,7 @@ MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
     s.segwit_active = m_segwit_active;
     s.mweb = m_cached_mweb;
     s.mweb_active = m_cached_mweb_active;
+    s.degraded = m_work_degraded;
     s.subsidy = m_cached_template.is_null() ? 0
                 : m_cached_template.value("coinbasevalue", uint64_t(0));
     s.witness_commitment_hex = m_cached_witness_commitment;

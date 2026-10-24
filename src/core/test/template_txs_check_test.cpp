@@ -225,6 +225,13 @@ TEST(TemplateTxsCheck, EachRuleRefuses)
         size_t outliers = 0;
         EXPECT_FALSE(check_template_txs(u, &outliers));
         EXPECT_EQ(outliers, 1u);
+
+        auto n = gbt();
+        n["transactions"][2]["fee"] = -1;
+        r = check_template_txs(n);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, "fee-negative");
+        EXPECT_EQ(r->index, 2u);
     }
 }
 
