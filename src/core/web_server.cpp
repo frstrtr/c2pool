@@ -15,6 +15,7 @@
 #include <impl/ltc/coin/rpc.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
 #include <core/coin/node_iface.hpp>
+#include <core/coin/mweb_shape.hpp>
 // Phase 4: embedded coin node interface
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -409,18 +410,20 @@ std::string MiningInterface::get_node_fee_hash160() const
     return h160;
 }
 
-bool MiningInterface::check_merged_mining(const std::string& block_hex,
+bool MiningInterface::check_merged_mining(const std::string& header_hex,
                                           const std::string& extranonce1,
                                           const std::string& extranonce2,
                                           const JobSnapshot* job,
                                           const std::string& miner,
                                           const uint256& share_hash)
 {
+    // Counted before the manager check so the call path itself is observable.
+    m_aux_checks.fetch_add(1, std::memory_order_relaxed);
     if (!m_mm_manager) return false;
 
     // Extract 80-byte parent header (first 160 hex chars)
-    if (block_hex.size() < 160) return false;
-    std::string parent_header_hex = block_hex.substr(0, 160);
+    if (header_hex.size() < 160) return false;
+    std::string parent_header_hex = header_hex.substr(0, 160);
 
     // Compute parent block hash (scrypt for LTC)
     auto hdr_bytes = ParseHex(parent_header_hex);
@@ -561,18 +564,52 @@ MiningInterface::reconstruct_merkle_root(const std::string& coinbase_hex,
     return hash;
 }
 
-// ─── Build full block from Stratum parameters ────────────────────────────────
-// Assembles the block header + full transaction list from the cached template
-// and the miner's Stratum submit data.
-std::string
-MiningInterface::build_block_from_stratum(const std::string& extranonce1,
-                                          const std::string& extranonce2,
-                                          const std::string& ntime,
-                                          const std::string& nonce,
-                                          const JobSnapshot* job) const
+// ─── 80-byte block header ────────────────────────────────────────────────────
+// version LE | prev_hash (internal order) | merkle_root | ntime LE | nbits LE |
+// nonce LE. Stratum/GBT send ntime, nbits and nonce as big-endian hex, so each
+// is reversed into the header.
+/*static*/ std::vector<unsigned char>
+MiningInterface::build_header_bytes(uint32_t version,
+                                    const std::string& prevhash_hex,
+                                    const uint256& merkle_root,
+                                    const std::string& ntime,
+                                    const std::string& nbits,
+                                    const std::string& nonce)
 {
-    std::lock_guard<std::mutex> lock(m_work_mutex);
+    // GBT prevhash is BE display hex; SetHex converts to internal byte order,
+    // which is what the header carries.
+    uint256 prev_hash;
+    prev_hash.SetHex(prevhash_hex);
 
+    std::vector<unsigned char> header;
+    header.reserve(80);
+
+    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
+    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
+
+    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
+    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
+
+    for (const std::string* be_hex : {&ntime, &nbits, &nonce}) {
+        auto bytes = ParseHex(*be_hex);
+        if (bytes.size() != 4)
+            return {};
+        std::reverse(bytes.begin(), bytes.end());
+        header.insert(header.end(), bytes.begin(), bytes.end());
+    }
+    return header;
+}
+
+// Caller holds m_work_mutex.
+std::string
+MiningInterface::block_header_hex_locked(const std::string& extranonce1,
+                                         const std::string& extranonce2,
+                                         const std::string& ntime,
+                                         const std::string& nonce,
+                                         const JobSnapshot* job) const
+{
     // When a JobSnapshot is provided, use its frozen template data.
     // Otherwise fall back to the live m_cached_template (legacy/solo path).
     const std::string& coinb1 = job ? job->coinb1 : m_cached_coinb1;
@@ -590,50 +627,96 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
 
     // Block header fields — from the job snapshot or the live template
     uint32_t version;
-    uint256 prev_hash;
+    std::string prev_hex;
     std::string bits_hex;
-    bool segwit;
     if (job) {
         version = job->version ? job->version : 536870912U;
-        prev_hash.SetHex(job->gbt_prevhash.empty() ? std::string(64, '0') : job->gbt_prevhash);
+        prev_hex = job->gbt_prevhash.empty() ? std::string(64, '0') : job->gbt_prevhash;
         bits_hex = job->nbits.empty() ? "1d00ffff" : job->nbits;
-        segwit = job->segwit_active;
     } else {
         if (!m_work_valid || m_cached_template.is_null())
             return {};
         version = m_cached_template.value("version", 536870912U);
-        prev_hash.SetHex(m_cached_template.value("previousblockhash", std::string(64, '0')));
+        prev_hex = m_cached_template.value("previousblockhash", std::string(64, '0'));
         bits_hex = m_cached_template.value("bits", std::string("1d00ffff"));
-        segwit = m_segwit_active;
     }
 
-    // ntime and nonce from miner (hex strings, 4 bytes each, BE from Stratum)
-    auto ntime_bytes = ParseHex(ntime);
-    auto nonce_bytes = ParseHex(nonce);
-    auto bits_bytes  = ParseHex(bits_hex);
+    auto header = build_header_bytes(version, prev_hex, merkle_root, ntime, bits_hex, nonce);
+    if (header.empty())
+        return {};
+    return HexStr(std::span<const unsigned char>(header.data(), header.size()));
+}
 
-    // Stratum/GBT sends these as big-endian hex; block header needs little-endian
-    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
-    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
-    std::reverse(bits_bytes.begin(),  bits_bytes.end());
+std::string
+MiningInterface::derive_block_header_hex(const std::string& extranonce1,
+                                         const std::string& extranonce2,
+                                         const std::string& ntime,
+                                         const std::string& nonce,
+                                         const JobSnapshot* job) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return block_header_hex_locked(extranonce1, extranonce2, ntime, nonce, job);
+}
 
-    std::ostringstream block;
-    // version LE
-    block << std::hex << std::setfill('0')
-          << std::setw(2) << ((version      ) & 0xff)
-          << std::setw(2) << ((version >>  8) & 0xff)
-          << std::setw(2) << ((version >> 16) & 0xff)
-          << std::setw(2) << ((version >> 24) & 0xff);
-    // prev_hash (already internal byte order in uint256)
-    block << HexStr(std::span<const unsigned char>(prev_hash.data(), 32));
-    // merkle_root
-    block << HexStr(std::span<const unsigned char>(merkle_root.data(), 32));
-    // ntime LE
-    block << HexStr(std::span<const unsigned char>(ntime_bytes.data(), ntime_bytes.size()));
-    // nbits LE
-    block << HexStr(std::span<const unsigned char>(bits_bytes.data(), bits_bytes.size()));
-    // nonce LE
-    block << HexStr(std::span<const unsigned char>(nonce_bytes.data(), nonce_bytes.size()));
+std::string
+MiningInterface::assemble_block_for_header(const std::string& header_hex,
+                                           const std::string& extranonce1,
+                                           const std::string& extranonce2,
+                                           const std::string& ntime,
+                                           const std::string& nonce,
+                                           const JobSnapshot* job) const
+{
+    std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
+    if (block_hex.empty() || block_hex.compare(0, header_hex.size(), header_hex) == 0)
+        return block_hex;
+
+    // A job snapshot is frozen, so its header cannot change. A job-less share
+    // reads the live cache, which refresh_work() may have replaced since the
+    // PoW check, so the block was assembled under a different header. Judge
+    // that block by its own header, as the submit path did before the header
+    // and the body were split.
+    auto hdr = ParseHex(block_hex.substr(0, 160));
+    char pow_hash_bytes[32];
+    scrypt_1024_1_1_256(reinterpret_cast<const char*>(hdr.data()), pow_hash_bytes);
+    uint256 pow_hash;
+    memcpy(pow_hash.begin(), pow_hash_bytes, 32);
+    const uint32_t bits = hdr[72] | (hdr[73] << 8) | (hdr[74] << 16) | (hdr[75] << 24);
+    const uint256 target = chain::bits_to_target(bits);
+    if (target.IsNull() || pow_hash > target) {
+        LOG_WARNING << "[BLOCK] Template changed between the PoW check and body assembly"
+                    << " (job-less share); the rebuilt block misses its target — not submitted";
+        return {};
+    }
+    return block_hex;
+}
+
+// ─── Build full block from Stratum parameters ────────────────────────────────
+// Assembles the block header + full transaction list from the cached template
+// and the miner's Stratum submit data.
+std::string
+MiningInterface::build_block_from_stratum(const std::string& extranonce1,
+                                          const std::string& extranonce2,
+                                          const std::string& ntime,
+                                          const std::string& nonce,
+                                          const JobSnapshot* job) const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+
+    // Header: the same derivation the submit path checks PoW against.
+    const std::string header_hex =
+        block_header_hex_locked(extranonce1, extranonce2, ntime, nonce, job);
+    if (header_hex.empty())
+        return {};
+
+    // When a JobSnapshot is provided, use its frozen template data.
+    // Otherwise fall back to the live m_cached_template (legacy/solo path).
+    const std::string& coinb1 = job ? job->coinb1 : m_cached_coinb1;
+    const std::string& coinb2 = job ? job->coinb2 : m_cached_coinb2;
+
+    // Reconstruct coinbase: coinb1 + extranonce1 + extranonce2 + coinb2
+    std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
+
+    const bool segwit = job ? job->segwit_active : m_segwit_active;
 
     // Transaction count (varint) + coinbase + rest of transactions
     const std::vector<std::string> tx_list = (job && job->tx_data) ? *job->tx_data : std::vector<std::string>{};
@@ -645,6 +728,23 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
                 live_tx_data.push_back(tx["data"].get<std::string>());
     }
     const auto& txs_hex = job ? tx_list : live_tx_data;
+
+    // MWEB shape (Litecoin): mweb data and a trailing HogEx come together, and
+    // an MWEB-active template needs both. Anything else is a block litecoind
+    // rejects with "mweb-missing" — refuse it here instead of submitting it.
+    const std::string& mweb_data = job ? job->mweb : m_cached_mweb;
+    const bool mweb_active = job ? job->mweb_active : m_cached_mweb_active;
+    if (auto why = core::coin::check_block_shape(txs_hex, mweb_data, mweb_active)) {
+        m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+        LOG_ERROR << "[MWEB] Block assembly REFUSED: " << *why
+                  << " (txs=" << txs_hex.size() << " mweb=" << mweb_data.size() / 2 << "B"
+                  << " mweb_active=" << mweb_active << ") — block not submitted";
+        return {};
+    }
+
+    std::ostringstream block;
+    block << header_hex;
+
     uint64_t tx_count = 1 + txs_hex.size(); // coinbase + template txs
     // Simple varint encoding
     if (tx_count < 0xfd)
@@ -680,17 +780,10 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
         block << tx_hex;
     }
 
-    // MWEB extension block (Litecoin): append HogEx flag + MWEB data
-    const std::string& mweb_data = job ? job->mweb : m_cached_mweb;
-    if (!mweb_data.empty()) {
+    // MWEB extension block (Litecoin): append the OptionalPtr presence byte +
+    // MWEB data. The shape check above guarantees the HogEx is the last tx.
+    if (!mweb_data.empty())
         block << "01" << mweb_data;
-    } else if (segwit) {
-        // MWEB not yet bootstrapped — litecoind will reject with "mweb-missing".
-        // Return empty string to signal invalid block — caller should skip submission.
-        LOG_WARNING << "[EMB-LTC] Block built WITHOUT MWEB — skipping submission"
-                    << " (MWEB state not yet bootstrapped from P2P full block)";
-        return {};
-    }
 
     return block.str();
 }
@@ -992,6 +1085,7 @@ MiningInterface::build_connection_coinbase(
         std::vector<CachedMergedHeaderInfo> merged_header_infos;
         bool segwit_active{false};
         std::string mweb;
+        bool mweb_active{false};
         std::string coinbase_text;
         std::vector<unsigned char> donation_script;
         std::vector<std::string> merkle_branches;
@@ -1017,6 +1111,7 @@ MiningInterface::build_connection_coinbase(
         ws.merged_header_infos = m_last_merged_header_infos;
         ws.segwit_active = m_segwit_active;
         ws.mweb = m_cached_mweb;
+        ws.mweb_active = m_cached_mweb_active;
         ws.coinbase_text = m_coinbase_text;
         ws.donation_script = m_donation_script;
         ws.share_version = m_cached_share_version;
@@ -1354,6 +1449,7 @@ MiningInterface::build_connection_coinbase(
     WorkSnapshot snap;
     snap.segwit_active = ws.segwit_active;
     snap.mweb = ws.mweb;
+    snap.mweb_active = ws.mweb_active;
     snap.subsidy = subsidy;
     snap.witness_commitment_hex = ws.witness_commitment;
     snap.witness_root = effective_witness_root;
@@ -1389,6 +1485,32 @@ void MiningInterface::refresh_work()
         // decision internally, retains the full per-coin WorkData coin-side
         // (work.set), and returns only the agnostic slice (m_data/m_hashes/m_latency).
         auto wd = m_coin_node->get_work_view();
+
+        // MWEB ingress guard (Litecoin): a template whose MWEB half is missing
+        // or orphaned can only yield blocks litecoind rejects ("mweb-missing").
+        // With a valid template cached: HOLD — return and keep it. Never throw
+        // from here: the catch below would clear m_work_valid, which zeroes
+        // share difficulty for every submit until the next good template.
+        // With none (cold/warm start before the first MWEB state, or a cached
+        // template that is itself degraded): serve this one DEGRADED, so
+        // shares and merged mining work. Block assembly runs the same check
+        // on the frozen job and refuses every LTC block from it.
+        bool degraded = false;
+        if (auto why = core::coin::check_template_shape(wd.m_data)) {
+            if (m_work_valid && !m_work_degraded) {
+                note_mweb_template_refusal(*why);
+                // Keep the DOGE blocks' PPLNS current while holding: new jobs
+                // on the held template read the merged commitment fresh.
+                if (m_mm_manager && m_mm_manager->is_pplns_dirty())
+                    m_mm_manager->rebuild_cached_blocks();
+                return;
+            }
+            note_mweb_degraded_template(*why);
+            degraded = true;
+        } else {
+            note_mweb_template_accepted();
+        }
+        const bool mweb_active = core::coin::template_rules_have_mweb(wd.m_data);
 
         // Collect tx hashes from WorkData
         std::vector<std::string> tx_hashes_hex;
@@ -1592,6 +1714,8 @@ void MiningInterface::refresh_work()
         m_cached_miner_count       = static_cast<uint16_t>(m_cached_pplns_outputs.size());
         m_cached_mweb             = wd.m_data.contains("mweb")
                                   ? wd.m_data["mweb"].get<std::string>() : "";
+        m_cached_mweb_active      = mweb_active;
+        m_work_degraded           = degraded;
         m_work_valid              = true;
         ++m_work_generation;
         m_last_work_update_time   = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1635,6 +1759,73 @@ void MiningInterface::refresh_work()
     }
 }
 
+void MiningInterface::note_mweb_template_refusal(const std::string& why)
+{
+    const uint64_t n = m_mweb_template_refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t now_ms = std::max<int64_t>(1,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    int64_t expected = 0;
+    if (m_mweb_hold_since_ms.compare_exchange_strong(expected, now_ms)) {
+        // First refusal of this window: the one ERROR line.
+        LOG_ERROR << "[MWEB] Template REFUSED at ingress: " << why
+                  << " — HOLD: miners keep working on the previous template until a"
+                  << " template with a trailing HogEx and mweb data arrives. Shares,"
+                  << " PPLNS and merged mining continue; an LTC block found meanwhile"
+                  << " builds on the previous tip.";
+    } else {
+        LOG_DEBUG_COIND << "[MWEB] Template refused at ingress (HOLD, refusal #" << n << "): " << why;
+    }
+}
+
+void MiningInterface::note_mweb_degraded_template(const std::string& why)
+{
+    m_mweb_template_refusals.fetch_add(1, std::memory_order_relaxed);
+    // A HOLD whose held template was lost (work invalidated meanwhile) ends
+    // here: nothing is held any more, so stop the HOLD banner, the HOLD
+    // stale marking and the HOLD clock.
+    close_mweb_hold_window("work degraded");
+    if (!m_work_degraded) {
+        LOG_WARNING << "[MWEB] DEGRADED start: no valid template to hold (" << why << ")."
+                    << " Serving this template so shares and merged mining work; block"
+                    << " assembly refuses every LTC block from it until MWEB state for"
+                    << " the tip arrives.";
+    } else {
+        LOG_DEBUG_COIND << "[MWEB] Degraded template replaced by a newer degraded one: " << why;
+    }
+}
+
+void MiningInterface::note_mweb_template_accepted()
+{
+    if (m_work_degraded)
+        LOG_INFO << "[MWEB] Degraded start ended — template with MWEB state accepted";
+    close_mweb_hold_window("template accepted");
+}
+
+void MiningInterface::close_mweb_hold_window(const char* reason)
+{
+    const int64_t since = m_mweb_hold_since_ms.exchange(0);
+    if (since == 0)
+        return;
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t held_ms = std::max<int64_t>(0, now_ms - since);
+    m_mweb_hold_total_ms.fetch_add(held_ms, std::memory_order_relaxed);
+    LOG_INFO << "[MWEB] HOLD ended after " << held_ms / 1000.0 << "s — " << reason;
+}
+
+double MiningInterface::get_mweb_hold_seconds() const
+{
+    int64_t total_ms = m_mweb_hold_total_ms.load(std::memory_order_relaxed);
+    const int64_t since = m_mweb_hold_since_ms.load(std::memory_order_relaxed);
+    if (since != 0) {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        total_ms += std::max<int64_t>(0, now_ms - since);
+    }
+    return total_ms / 1000.0;
+}
+
 nlohmann::json MiningInterface::get_current_work_template() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
@@ -1665,6 +1856,12 @@ std::string MiningInterface::get_cached_mweb() const
     return m_cached_mweb;
 }
 
+bool MiningInterface::get_cached_mweb_active() const
+{
+    std::lock_guard<std::mutex> lock(m_work_mutex);
+    return m_cached_mweb_active;
+}
+
 std::string MiningInterface::get_cached_witness_commitment() const
 {
     std::lock_guard<std::mutex> lock(m_work_mutex);
@@ -1691,6 +1888,7 @@ MiningInterface::WorkSnapshot MiningInterface::get_work_snapshot() const
     WorkSnapshot s;
     s.segwit_active = m_segwit_active;
     s.mweb = m_cached_mweb;
+    s.mweb_active = m_cached_mweb_active;
     s.subsidy = m_cached_template.is_null() ? 0
                 : m_cached_template.value("coinbasevalue", uint64_t(0));
     s.witness_commitment_hex = m_cached_witness_commitment;
@@ -1857,10 +2055,12 @@ nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, c
 {
     LOG_INFO << "getblocktemplate request received";
 
-    // Return live template if available
+    // Return live template if available. A degraded template (MWEB-active,
+    // no MWEB state yet) is never handed out: an external GBT miner would
+    // build LTC blocks from it that no daemon accepts.
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (m_work_valid && !m_cached_template.empty())
+        if (m_work_valid && !m_work_degraded && !m_cached_template.empty())
             return m_cached_template;
     }
 
@@ -1972,6 +2172,15 @@ nlohmann::json MiningInterface::submitblock(const std::string& hex_data, const s
                                 << " — forwarding to daemon anyway (daemon is authority)";
                     is_stale = true;
                 }
+            }
+
+            // MWEB HOLD: the cached template is the held one, built on the
+            // previous tip, so the prev check above matches it. A block found
+            // now is a race on the previous tip: telemetry only, still forwarded.
+            if (!is_stale && m_mweb_hold_since_ms.load(std::memory_order_relaxed) != 0) {
+                LOG_WARNING << "[LTC] submitblock: block built on the template held during"
+                            << " an MWEB HOLD (previous tip) — forwarding to daemon anyway";
+                is_stale = true;
             }
 
             // Reconstruct expected merkle_root from coinbase + merkle branches
@@ -2876,19 +3085,34 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
     uint64_t total_accepted = 0, total_rejected = 0, total_stale = 0;
     std::set<std::string> unique_addrs;
     std::map<std::string, int> ip_connections;   // IP → connection count
-    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique workers
+    std::map<std::string, std::set<std::string>> ip_workers_set; // IP → unique worker keys ("ADDRESS.worker")
     const auto liveness = observe_worker_liveness(workers, now_steady);
     int connections_silent = 0;
+    int connections_hashing = 0, connections_standby = 0, connections_stalled = 0;
+    // A worker with several connections takes its most active one's state:
+    // hashing > stalled > standby.
+    auto state_rank = [](const std::string& s) {
+        return s == "hashing" ? 2 : s == "stalled" ? 1 : 0;
+    };
 
     nlohmann::json workers_json = nlohmann::json::object();
     for (const auto& [sid, w] : workers) {
         const WorkerLiveness& lv = liveness.at(sid);
         if (lv.silent) ++connections_silent;
+        const std::string state = session_state(lv);
+        if (state == "hashing") ++connections_hashing;
+        else if (state == "standby") ++connections_standby;
+        else ++connections_stalled;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
         total_rejected += w.rejected;
         total_stale += w.stale;
         unique_addrs.insert(w.username);
+
+        // Key by worker name: "ADDRESS.worker" (like p2pool)
+        std::string worker_key = w.worker_name.empty()
+            ? w.username
+            : w.username + "." + w.worker_name;
 
         // Track connections per IP
         // #965 Phase-2: IPv6-aware split (endpoint is bracketed for v6 at the
@@ -2898,17 +3122,15 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
             if (!reveal_ips)
                 ip = core::mask_ip_endpoint(ip);
             ip_connections[ip]++;
-            ip_workers_set[ip].insert(w.username);
+            // A farm behind one NAT often pays every rig to one address and
+            // tells them apart by the worker suffix; count those as separate
+            // workers, or stratum.html flags ~1 conn/rig as "High".
+            ip_workers_set[ip].insert(worker_key);
         }
 
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             now_steady - w.connected_at).count();
         auto first_seen_ts = static_cast<uint64_t>(now) - static_cast<uint64_t>(elapsed);
-
-        // Key by worker name: "ADDRESS.worker" (like p2pool)
-        std::string worker_key = w.worker_name.empty()
-            ? w.username
-            : w.username + "." + w.worker_name;
 
         // Aggregate multiple connections for the same worker (p2pool behavior)
         if (workers_json.contains(worker_key)) {
@@ -2933,6 +3155,14 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 wj["silent_seconds"] = lv.silent_seconds;
                 wj["silent_threshold_seconds"] = lv.threshold_seconds;
             }
+            if (state_rank(state) > state_rank(wj["state"].get<std::string>()))
+                wj["state"] = state;
+            if (lv.has_shared) {
+                wj["ever_submitted"] = true;
+                if (wj["last_share_age_s"].is_null()
+                    || lv.silent_seconds < wj["last_share_age_s"].get<int64_t>())
+                    wj["last_share_age_s"] = lv.silent_seconds;
+            }
         } else {
             workers_json[worker_key] = {
                 {"hash_rate", w.hashrate},
@@ -2953,7 +3183,14 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 {"rtt_ms", w.rtt_ms},
                 {"silent", lv.silent},
                 {"silent_seconds", lv.silent_seconds},
-                {"silent_threshold_seconds", lv.threshold_seconds}
+                {"silent_threshold_seconds", lv.threshold_seconds},
+                {"state", state},
+                {"ever_submitted", lv.has_shared},
+                // Seconds since this worker's last accepted share on this node
+                // (poll resolution); null when it never shared here.
+                {"last_share_age_s", lv.has_shared
+                                         ? nlohmann::json(lv.silent_seconds)
+                                         : nlohmann::json(nullptr)}
             };
         }
     }
@@ -2972,6 +3209,9 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         {"connections", static_cast<int>(workers.size())},
         {"connections_active", static_cast<int>(workers.size()) - connections_silent},
         {"connections_silent", connections_silent},
+        {"connections_hashing", connections_hashing},
+        {"connections_standby", connections_standby},
+        {"connections_stalled", connections_stalled},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
         {"total_accepted", total_accepted},
@@ -4691,14 +4931,22 @@ nlohmann::json MiningInterface::rest_local_stats()
         const auto workers = effective_stratum_workers();
         const auto liveness = observe_worker_liveness(
             workers, std::chrono::steady_clock::now());
-        int silent = 0;
-        for (const auto& [sid, lv] : liveness)
+        int silent = 0, hashing = 0, standby = 0, stalled = 0;
+        for (const auto& [sid, lv] : liveness) {
             if (lv.silent) ++silent;
+            const std::string st = session_state(lv);
+            if (st == "hashing") ++hashing;
+            else if (st == "standby") ++standby;
+            else ++stalled;
+        }
         const int total = static_cast<int>(workers.size());
         result["stratum_sessions"] = {
             {"total", total},
             {"active", total - silent},
             {"silent", silent},
+            {"hashing", hashing},
+            {"standby", standby},
+            {"stalled", stalled},
             {"silent_floor_seconds", kSilentFloorSeconds}
         };
         // #959 slice B: name the silent workers and how long each has been
@@ -4979,7 +5227,14 @@ nlohmann::json MiningInterface::rest_local_stats()
             const bool tip_stalled =
                 m_last_work_update_time > 0 &&
                 now_s - m_last_work_update_time > threshold;
-            if (tip_stalled && have_coin_peers) {
+            // An MWEB HOLD keeps the previous template, so the work timestamp
+            // stops while blocks still arrive: say so instead of LOST CONTACT.
+            const int64_t hold_since_ms = m_mweb_hold_since_ms.load(std::memory_order_relaxed);
+            if (hold_since_ms != 0) {
+                warnings.push_back("MWEB HOLD for "
+                    + std::to_string(std::max<int64_t>(0, now_s - hold_since_ms / 1000))
+                    + "s: waiting for MWEB state of the new tip");
+            } else if (tip_stalled && have_coin_peers) {
                 std::string src = (m_coin_node && m_coin_node->is_embedded()) ? "EMBEDDED LTC NODE" : "LTC DAEMON";
                 warnings.push_back("LOST CONTACT WITH " + src + " for "
                     + std::to_string(now_s - m_last_work_update_time) + "s! "
@@ -5204,6 +5459,14 @@ nlohmann::json MiningInterface::rest_local_stats()
     // p2pool-compat: version and protocol_version
     result["version"] = m_pool_version;
     result["protocol_version"] = m_protocol_version.load(std::memory_order_relaxed);
+
+    // Submit-path health: shares offered to the merged-mining check, blocks
+    // and templates refused on the MWEB shape check, time spent in HOLD.
+    result["aux_checks"] = get_aux_checks();
+    result["mweb_refusals"] = get_mweb_refusals();
+    result["mweb_template_refusals"] = get_mweb_template_refusals();
+    result["mweb_hold_seconds"] = get_mweb_hold_seconds();
+    result["mweb_degraded"] = is_work_degraded();
 
     return result;
 }
@@ -7399,13 +7662,17 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
         }
     }
 
-    // Filter out entries with 0 LTC and no merged payouts
+    // Filter out entries with a zero primary amount and no merged payouts.
+    // Only zero: the donation output is emitted even at --give-author 0 as a
+    // 1-satoshi/duff dust marker (1e-8), which a "< 1e-6" cut dropped from
+    // the "Current Payouts" card while /current_payouts still listed it.
+    // p2pool web.py lists every payout regardless of amount.
     nlohmann::json filtered = nlohmann::json::object();
     for (auto& [key, entry] : result.items()) {
         double ltc_amount = entry.value("amount", 0.0);
         auto& merged = entry["merged"];
         bool has_merged = merged.is_array() && !merged.empty();
-        if (ltc_amount < 0.000001 && !has_merged) continue;
+        if (ltc_amount <= 0.0 && !has_merged) continue;
         // Filter out overflow merged entries (< 0.01 DOGE or > 1B — clearly wrong).
         // Exempt source="donation": p2pool web.py forces donation_reward to >=1
         // satoshi when the V36-signaling shares all set m_donation=0, so the
@@ -7421,7 +7688,7 @@ nlohmann::json MiningInterface::compute_current_merged_payouts()
                     good.push_back(m);
             }
             entry["merged"] = good;
-            if (ltc_amount < 0.000001 && good.empty()) continue;
+            if (ltc_amount <= 0.0 && good.empty()) continue;
         }
         filtered[key] = entry;
     }
@@ -8103,6 +8370,8 @@ void MiningInterface::update_stratum_worker(const std::string& session_id,
     std::lock_guard<std::mutex> lock(m_stratum_workers_mutex);
     auto it = m_stratum_workers.find(session_id);
     if (it != m_stratum_workers.end()) {
+        if (accepted > it->second.accepted)
+            it->second.last_accepted_at = std::chrono::steady_clock::now();
         it->second.hashrate = hashrate;
         it->second.dead_hashrate = dead_hashrate;
         it->second.difficulty = difficulty;
@@ -8171,6 +8440,12 @@ MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
     return out;
 }
 
+const char* MiningInterface::session_state(const WorkerLiveness& lv)
+{
+    if (!lv.has_shared) return "standby";
+    return lv.silent ? "stalled" : "hashing";
+}
+
 std::map<std::string, MiningInterface::WorkerLiveness>
 MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>& workers,
                                          std::chrono::steady_clock::time_point now) const
@@ -8191,6 +8466,11 @@ MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>
                 seen.last_share_at.reset();
             seen.accepted = w.accepted;
         }
+        // A registry that stamps the share time gives the exact age; the
+        // poll stamp above is the fallback for one that does not.
+        if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
+            && w.last_accepted_at <= now)
+            seen.last_share_at = w.last_accepted_at;
         out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
     }
     return out;
@@ -8238,6 +8518,7 @@ nlohmann::json MiningInterface::silent_workers_list(
             {"silent_seconds", a.silent_seconds},
             {"threshold_seconds", a.threshold_seconds},
             {"has_shared", a.has_shared},
+            {"state", a.has_shared ? "stalled" : "standby"},
             {"connections", a.connections}
         });
     }
@@ -9653,14 +9934,17 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Check if share meets network difficulty and attempt block submission
         if (m_coin_node && !extranonce1.empty()) {
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
-            if (!block_hex.empty()) {
+            // Header first: the merged-mining check needs only the header, the
+            // coinbase parts and the branches, so every share reaches it even
+            // when the block body is refused (MWEB shape check).
+            std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
+            if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool solo_merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                bool solo_merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
                                                              payout_address);
 
                 // Check PoW hash against the blockchain target before submitting
-                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
                     char pow_hash_bytes[32];
                     scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
@@ -9675,7 +9959,15 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                            (block_bytes[74] << 16) | (block_bytes[75] << 24);
                     uint256 block_target = chain::bits_to_target(header_bits);
 
-                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                    // Assemble the body only for a block-target hit ("" = refused, logged).
+                    std::string block_hex;
+                    if (!block_target.IsNull() && pow_hash <= block_target)
+                        block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
+                                                              ntime, nonce, job);
+                    if (!block_hex.empty()) {
+                        // The job-less fallback may have rebuilt the block under
+                        // a newer header: dedup and log the block as assembled.
+                        block_bytes = ParseHex(block_hex.substr(0, 160));
                         // Validate merkle root before submitting
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
@@ -10057,13 +10349,16 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
         
         // Attempt block construction + submission only when PoW meets blockchain target.
         if (m_coin_node && !extranonce1.empty()) {
-            std::string block_hex = build_block_from_stratum(extranonce1, extranonce2, ntime, nonce, job);
-            if (!block_hex.empty()) {
+            // Header first: the merged-mining check needs only the header, the
+            // coinbase parts and the branches, so every share reaches it even
+            // when the block body is refused (MWEB shape check).
+            std::string header_hex = derive_block_header_hex(extranonce1, extranonce2, ntime, nonce, job);
+            if (!header_hex.empty()) {
                 // Check merged mining targets for every share (aux targets are lower)
-                bool merged_found = check_merged_mining(block_hex, extranonce1, extranonce2, job,
+                bool merged_found = check_merged_mining(header_hex, extranonce1, extranonce2, job,
                                                         primary_addr, created_share);
 
-                auto block_bytes = ParseHex(block_hex.substr(0, 160));
+                auto block_bytes = ParseHex(header_hex);
                 if (block_bytes.size() == 80) {
                     char pow_hash_bytes[32];
                     scrypt_1024_1_1_256(reinterpret_cast<const char*>(block_bytes.data()), pow_hash_bytes);
@@ -10076,7 +10371,15 @@ nlohmann::json MiningInterface::mining_submit(const std::string& username, const
                                            (block_bytes[74] << 16) | (block_bytes[75] << 24);
                     uint256 block_target = chain::bits_to_target(header_bits);
 
-                    if (!block_target.IsNull() && pow_hash <= block_target) {
+                    // Assemble the body only for a block-target hit ("" = refused, logged).
+                    std::string block_hex;
+                    if (!block_target.IsNull() && pow_hash <= block_target)
+                        block_hex = assemble_block_for_header(header_hex, extranonce1, extranonce2,
+                                                              ntime, nonce, job);
+                    if (!block_hex.empty()) {
+                        // The job-less fallback may have rebuilt the block under
+                        // a newer header: dedup and log the block as assembled.
+                        block_bytes = ParseHex(block_hex.substr(0, 160));
                         uint256 header_merkle;
                         std::memcpy(header_merkle.data(), block_bytes.data() + 36, 32);
 
@@ -10964,41 +11267,10 @@ double MiningInterface::calculate_share_difficulty(
     std::string coinbase_hex = coinb1 + extranonce1 + extranonce2 + coinb2;
     uint256 merkle_root = reconstruct_merkle_root(coinbase_hex, merkle_branches);
 
-    // Prevhash: must match build_block_from_stratum exactly.
-    // GBT prevhash is BE display hex. SetHex converts to internal LE.
-    // .data() returns LE bytes — same as block header format.
-    uint256 prev_hash;
-    prev_hash.SetHex(prevhash_hex);
-
-    std::vector<unsigned char> header;
-    header.reserve(80);
-
-    header.push_back(static_cast<unsigned char>((version      ) & 0xff));
-    header.push_back(static_cast<unsigned char>((version >>  8) & 0xff));
-    header.push_back(static_cast<unsigned char>((version >> 16) & 0xff));
-    header.push_back(static_cast<unsigned char>((version >> 24) & 0xff));
-
-    header.insert(header.end(), prev_hash.data(), prev_hash.data() + 32);
-
-    // Merkle root: internal byte order from reconstruct_merkle_root
-    header.insert(header.end(), merkle_root.data(), merkle_root.data() + 32);
-
-    // ntime: Stratum sends as BE hex (swap4'd from LE). Miner parses as
-    // BE uint32 and writes as LE in header. We must reverse to get LE.
-    auto ntime_bytes = ParseHex(ntime);
-    std::reverse(ntime_bytes.begin(), ntime_bytes.end());
-    header.insert(header.end(), ntime_bytes.begin(), ntime_bytes.end());
-
-    // nbits: same — Stratum sends BE hex, header needs LE
-    auto bits_bytes = ParseHex(nbits_hex);
-    std::reverse(bits_bytes.begin(), bits_bytes.end());
-    header.insert(header.end(), bits_bytes.begin(), bits_bytes.end());
-
-    // nonce: same — miner sends BE hex, header needs LE
-    auto nonce_bytes = ParseHex(nonce);
-    std::reverse(nonce_bytes.begin(), nonce_bytes.end());
-    header.insert(header.end(), nonce_bytes.begin(), nonce_bytes.end());
-
+    // Header: the same serializer block assembly uses, so the difficulty is
+    // computed over exactly the bytes a found block would carry.
+    std::vector<unsigned char> header =
+        build_header_bytes(version, prevhash_hex, merkle_root, ntime, nbits_hex, nonce);
     if (header.size() != 80)
         return 0.0;
 

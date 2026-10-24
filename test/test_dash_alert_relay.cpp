@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <variant>
 #include <vector>
@@ -821,11 +822,11 @@ TEST(DashAlertDetector, BackOnlineOnlyAfterEmittedOfflineAndDwell)
     auto c = det_cfg();
     c.startup_grace = 0;
     AlertDetector d(c, T0);
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     // short blip: back before offline fired -> no events at all
     d.tick({}, T0 + 10);
-    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 0), T0 + 100).empty());
-    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 0), T0 + 400).empty()) << "no back_online without an offline";
+    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 1), T0 + 100).empty());
+    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 1), T0 + 400).empty()) << "no back_online without an offline";
     // real outage
     d.tick({}, T0 + 410);
     ASSERT_EQ(d.tick({}, T0 + 710).size(), 1u);
@@ -840,7 +841,7 @@ TEST(DashAlertDetector, StartupGraceAndRestoredWorkers)
 {
     auto c = det_cfg();
     AlertDetector d(c, T0);   // grace 600
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     d.tick({}, T0 + 10);
     EXPECT_TRUE(d.tick({}, T0 + 400).empty()) << "inside the startup grace";
     auto ev = d.tick({}, T0 + 600);
@@ -857,8 +858,8 @@ TEST(DashAlertDetector, StartupGraceAndRestoredWorkers)
     ASSERT_EQ(ev2.size(), 1u);
     EXPECT_EQ(ev2[0].worker, "B.rig2") << "A.rig1 was already alerted before the restart";
     // A.rig1 reconnects after the restart -> its outstanding offline pairs with a back_online
-    d2.tick(one("A.rig1", "x", 0), T0 + 1700);
-    auto ev3 = d2.tick(one("A.rig1", "x", 0), T0 + 1760);
+    d2.tick(one("A.rig1", "x", 1), T0 + 1700);
+    auto ev3 = d2.tick(one("A.rig1", "x", 1), T0 + 1760);
     ASSERT_EQ(ev3.size(), 1u);
     EXPECT_EQ(ev3[0].kind, Kind::BackOnline);
 }
@@ -890,7 +891,7 @@ TEST(DashAlertDetector, MinIntervalThrottlesFlaps)
     // flap: 70 s down / 30 s up, for 20 minutes
     for (int64_t t = T0; t < T0 + 1200; t += 10) {
         const bool up = ((t - T0) % 100) >= 70;
-        auto ev = d.tick(up ? one("A.rig1", "s" + std::to_string(sid), 0) : std::vector<WorkerSample>{}, t);
+        auto ev = d.tick(up ? one("A.rig1", "s" + std::to_string(sid), 1) : std::vector<WorkerSample>{}, t);
         if (!up) ++sid;
         for (auto& e : ev) (e.kind == Kind::Offline ? offlines : backs)++;
     }
@@ -932,7 +933,7 @@ TEST(DashAlertDetector, HourlyCapProducesOneDigestAndHoldsTheRest)
     c.max_per_hour = 30;
     AlertDetector d(c, T0);
     std::vector<WorkerSample> all;
-    for (int i = 0; i < 40; ++i) all.push_back({"A.rig" + std::to_string(i), "s" + std::to_string(i), 0});
+    for (int i = 0; i < 40; ++i) all.push_back({"A.rig" + std::to_string(i), "s" + std::to_string(i), 1});
     d.tick(all, T0);
     d.tick({}, T0 + 10);
     auto ev = d.tick({}, T0 + 310);
@@ -944,6 +945,260 @@ TEST(DashAlertDetector, HourlyCapProducesOneDigestAndHoldsTheRest)
     EXPECT_TRUE(d.tick({}, T0 + 600).empty()) << "no digest storm while saturated";
     auto later = d.tick({}, T0 + 310 + 3600);
     EXPECT_EQ(later.size(), 10u) << "held events fire when the window frees";
+}
+
+// ── (10b) standby / failover connections (all nodes are peers) ──────────────
+// A rig keeps a failover connection to a node it does not mine on. Such a
+// STANDBY connection never shares; it must never page, on connect, flap,
+// disconnect or after a restart.
+TEST(DashAlertDetector, FailoverSessionNeverPages)
+{
+    for (int64_t stall : {int64_t{900}, int64_t{120}}) {
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        c.stall_after = stall;
+        AlertDetector d(c, T0);
+        int sid = 0;
+        for (int64_t t = T0; t < T0 + 4 * 3600; t += 30) {
+            // connected for 50 min, then flapping (the D9 no-notify watchdog)
+            const bool connected = t < T0 + 3000 || ((t - T0) % 120) < 60;
+            if (!connected) ++sid;
+            EXPECT_TRUE(d.tick(connected ? one("A.rig1", "s" + std::to_string(sid), 0)
+                                         : std::vector<WorkerSample>{}, t).empty())
+                << "stall_after=" << stall << " t=" << t - T0;
+        }
+        EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+        EXPECT_FALSE(d.persist().contains("A.rig1"))
+            << "a standby-only worker would be paged as 'not reconnected' after a restart";
+    }
+}
+
+// stall_after 0 turns every share check off: presence only, so a connection
+// is up and its disconnect pages (the documented meaning of 0, unchanged).
+TEST(DashAlertDetector, StallOffIsPresenceOnly)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    c.stall_after = 0;
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 0), T0);
+    EXPECT_TRUE(d.workers().at("A.rig1").up);
+    d.tick({}, T0 + 10);
+    auto ev = d.tick({}, T0 + 310);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+}
+
+TEST(DashAlertDetector, FirstShareMakesUpAndAHashedWorkerPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 0), T0);                  // standby
+    EXPECT_FALSE(d.workers().at("A.rig1").up);
+    d.tick(one("A.rig1", "s1", 1), T0 + 600);            // pool #1 died: first share here
+    EXPECT_TRUE(d.workers().at("A.rig1").up);
+    EXPECT_TRUE(d.persist().contains("A.rig1"));
+    d.tick({}, T0 + 700);                                // the rig dies
+    auto ev = d.tick({}, T0 + 1000);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+    EXPECT_NE(ev[0].detail.find("disconnected"), std::string::npos);
+}
+
+namespace {
+// A hashing rig on this node that stops sharing at T0+100 and keeps its TCP
+// connection open (the failback shape and the hung-rig shape look the same
+// locally). Ticks every 30 s over [from, until]; returns every event.
+std::vector<DetectorEvent> stall_after_hashing(AlertDetector& d, int64_t from, int64_t until,
+                                               const std::string& key = "A.rig1")
+{
+    std::vector<DetectorEvent> all;
+    for (int64_t t = from; t <= until; t += 30) {
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one(key, "s1", acc), t)) all.push_back(e);
+    }
+    return all;
+}
+} // namespace
+
+TEST(DashAlertDetector, FailbackWithSharechainActivityDoesNotPage)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    // The address keeps getting sharechain shares (minted on the other node).
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        EXPECT_EQ(addr, "A");
+        return now_seen - 20;
+    });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 4 * 3600; t += 30) {
+        now_seen = t;
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one("A.rig1", "s1", acc), t)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+    EXPECT_FALSE(d.persist().contains("A.rig1"));
+    // The standby connection then drops: still no page from this node.
+    for (int64_t t = T0 + 4 * 3600 + 30; t <= T0 + 5 * 3600; t += 30) {
+        now_seen = t;
+        EXPECT_TRUE(d.tick({}, t).empty());
+    }
+}
+
+// A small miner's other-node shares are sparse: one share well inside the
+// stall window still proves the rig mines elsewhere (the margin is measured
+// from the rig's last share HERE, not from the stall detection).
+TEST(DashAlertDetector, SparseOtherNodeShareStillCountsAsReturned)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> {
+        return now_seen >= T0 + 500 ? T0 + 500 : 0;   // one share on the other node
+    });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 1380; t += 30) {
+        now_seen = t;
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one("A.rig1", "s1", acc), t)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+}
+
+// After RETURNED, a standby reconnect is not "up" on the strength of the old
+// evidence (no false BACK_ONLINE, no re-arm without a share).
+TEST(DashAlertDetector, ReturnedWorkerReconnectingAsStandbyStaysStandby)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen - 20; });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 3000; t += 30) {
+        now_seen = t;
+        std::vector<WorkerSample> smp;
+        if (t <= T0 + 90) smp = one("A.rig1", "s1", static_cast<uint64_t>(1 + (t - T0) / 30));
+        else if (t >= T0 + 450) smp = one("A.rig1", "s2", 0);   // standby reconnect
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+        if (t == T0 + 420) {
+            ASSERT_FALSE(d.workers().at("A.rig1").ever_up) << "returned at the first eligible tick";
+        }
+        if (t == T0 + 480) {
+            ASSERT_FALSE(d.workers().at("A.rig1").up) << "a standby reconnect is not up on old evidence";
+        }
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_FALSE(d.workers().at("A.rig1").up);
+    EXPECT_FALSE(d.persist().contains("A.rig1"));
+}
+
+TEST(DashAlertDetector, HungRigWhoseAddressWentDarkPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    // The newest share for the address is the rig's own last one, here.
+    d.set_address_activity([](const std::string&) -> std::optional<int64_t> { return T0 + 100; });
+    auto ev = stall_after_hashing(d, T0, T0 + 100 + c.stall_after + c.offline_after + 60);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+    EXPECT_NE(ev[0].detail.find("no accepted shares"), std::string::npos);
+}
+
+TEST(DashAlertDetector, SiblingHashingHereStillPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    // Fresh shares for the address -- but a sibling rig of the same address
+    // hashes on THIS node, so they prove nothing about rig1.
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen; });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 1500; t += 30) {
+        now_seen = t;
+        const uint64_t acc1 = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        std::vector<WorkerSample> smp{{"A.rig1", "s1", acc1},
+                                      {"A.rig2", "s2", static_cast<uint64_t>(1 + (t - T0) / 30)}};
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+    }
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].worker, "A.rig1");
+}
+
+TEST(DashAlertDetector, UnreadableChainDefersThenPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    d.set_address_activity([](const std::string&) -> std::optional<int64_t> { return std::nullopt; });
+    const int64_t due = T0 + 100 + c.stall_after + c.offline_after;   // first OFFLINE-eligible tick
+    auto early = stall_after_hashing(d, T0, due + 60);
+    EXPECT_TRUE(early.empty()) << "waits for the chain";
+    auto late = stall_after_hashing(d, due + 90, due + c.returned_defer_max + 60);
+    ASSERT_EQ(late.size(), 1u) << "never waits forever";
+    EXPECT_EQ(late[0].kind, Kind::Offline);
+}
+
+TEST(DashAlertDetector, RestoredWorkerMiningElsewhereIsNotPaged)
+{
+    auto c = det_cfg();
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
+    auto snap = d.persist();
+    ASSERT_TRUE(snap.contains("A.rig1"));
+    // Restart; the rig keeps only a standby connection here and mines elsewhere.
+    AlertDetector d2(c, T0 + 1000);
+    d2.restore(snap);
+    int64_t now_seen = 0;
+    d2.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen - 15; });
+    for (int64_t t = T0 + 1000; t <= T0 + 1000 + 3600; t += 30) {
+        now_seen = t;
+        EXPECT_TRUE(d2.tick(one("A.rig1", "x", 0), t).empty());
+    }
+    // Without that activity, the same restored worker pages, naming the cause.
+    AlertDetector d3(c, T0 + 1000);
+    d3.restore(snap);
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0 + 1000; t <= T0 + 1000 + 1200 && ev.empty(); t += 30)
+        ev = d3.tick(one("A.rig1", "x", 0), t);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_NE(ev[0].detail.find("connected, no accepted share since node restart"), std::string::npos)
+        << ev[0].detail;
+}
+
+// main_dash.cpp feeds the RETURNED rule from the sharechain (the tracker's
+// try-lock read, cached), only on an origin.
+TEST(DashAlertDetector, MainDashWiresAddressActivityFromTheSharechain)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string code;
+    std::istringstream lines(buf.str());
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    const auto seam = code.find("alert_relay->set_address_activity(");
+    ASSERT_NE(seam, std::string::npos)
+        << "without the seam a failback (rig returned to another node) pages from this node";
+    const auto origin_gate = code.rfind("if (alert_relay->config().origin)", seam);
+    ASSERT_NE(origin_gate, std::string::npos);
+    EXPECT_LT(seam - origin_gate, 600u);
+    const auto walk = code.find("dash::dashboard::newest_share_time_by_address(", seam);
+    ASSERT_NE(walk, std::string::npos);
+    EXPECT_LT(walk - seam, 900u);
+    const auto lock = code.find("node->read_tracker()", seam);
+    ASSERT_NE(lock, std::string::npos);
+    EXPECT_LT(lock, walk) << "the walk runs under the tracker read guard";
 }
 
 // ── (11) bounded memory ─────────────────────────────────────────────────────
@@ -1415,10 +1670,10 @@ TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
     auto c = det_cfg();
     c.startup_grace = 0;
     AlertDetector d(c, T0);
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     d.tick({}, T0 + 100);                                  // A drops at T0+100
     ASSERT_EQ(d.tick({}, T0 + 400).size(), 1u);            // OFFLINE
-    d.tick(one("B.rig2", "s2", 0), T0 + 500);              // B up when the node stops
+    d.tick(one("B.rig2", "s2", 1), T0 + 500);              // B up when the node stops
     auto snap = d.persist();
     EXPECT_EQ(snap["A.rig1"]["outage_since"], T0 + 100);
     EXPECT_EQ(snap["B.rig2"]["outage_since"], 0);
@@ -1426,7 +1681,7 @@ TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
     AlertDetector d2(c, T0 + 10000);                       // node restarts much later
     d2.restore(snap);
     const uint64_t g0 = d2.generation();
-    d2.tick(one("A.rig1", "x", 0), T0 + 10100);
+    d2.tick(one("A.rig1", "x", 1), T0 + 10100);
     auto ev = d2.tick(one("A.rig1", "x", 1), T0 + 10160);
     ASSERT_EQ(ev.size(), 1u);
     EXPECT_EQ(ev[0].kind, Kind::BackOnline);
@@ -1616,7 +1871,7 @@ TEST(DashAlertRelay, MalformedUtf8FromMinersNeverBreaksADump)
     org.set_transport(capture_transport(acks, &sent));
     const std::string bad = "A.\xff\xfe" "rig";
     for (int64_t t = T0; t <= T0 + 400; t += 5)
-        org.run_tick([&] { return t < T0 + 50 ? one(bad, "s1", 0) : std::vector<WorkerSample>{}; }, t);
+        org.run_tick([&] { return t < T0 + 50 ? one(bad, "s1", 1) : std::vector<WorkerSample>{}; }, t);
     EXPECT_EQ(org.counters().tick_errors, 0u) << "no dump threw";
     auto s = org.status_json();
     EXPECT_TRUE(s["detector"]["workers"].contains("A.??rig"));

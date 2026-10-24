@@ -320,12 +320,22 @@ void DASHWorkSource::update_stratum_worker(const std::string& session_id,
     std::lock_guard<std::mutex> lk(workers_mutex_);
     auto it = workers_.find(session_id);
     if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    if (accepted > it->second.accepted)
+        it->second.last_accepted_at = std::chrono::steady_clock::now();
     it->second.hashrate      = hashrate;
     it->second.dead_hashrate = dead_hashrate;
     it->second.difficulty    = difficulty;
     it->second.accepted      = accepted;
     it->second.rejected      = rejected;
     it->second.stale         = stale;
+}
+
+void DASHWorkSource::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    auto it = workers_.find(session_id);
+    if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    it->second.rtt_ms = rtt_ms;
 }
 
 std::map<std::string, core::stratum::WorkerInfo>
@@ -2580,15 +2590,11 @@ nlohmann::json DASHWorkSource::mining_submit(
     const uint256 share_target = dash::coin::target_from_nbits(
         job->share_bits != 0 ? job->share_bits : 0x1d00ffffu);
 
-    auto bump = [&](bool accepted) {
-        std::lock_guard<std::mutex> lk(workers_mutex_);
-        for (auto& kv : workers_) {
-            if (kv.second.username == username) {
-                accepted ? kv.second.accepted++ : kv.second.rejected++;
-                break;
-            }
-        }
-    };
+    // The per-session accepted/rejected counters are owned by the stratum
+    // session, which reports them through update_stratum_worker(session_id,
+    // ...). Bumping here by username credited the FIRST registered session of
+    // that address, so a failover connection of a rig that hashes through a
+    // sibling session read as hashing. No registry write on this path.
 
     // NOTE: the dashboard "Best Share" feed is NOT recorded here — mining_submit
     // only runs for pool-quality shares / block solutions (the stratum session
@@ -2894,8 +2900,6 @@ nlohmann::json DASHWorkSource::mining_submit(
         // never consulted the payee guard either. Withholding here would be a
         // second, self-inflicted loss on top of the forfeited block.
         mint_solved_share(/*won_block=*/true);
-
-        bump(true);
         return nlohmann::json(true);
     }
 
@@ -2905,12 +2909,9 @@ nlohmann::json DASHWorkSource::mining_submit(
         // creation seam is unbound, accept for vardiff + LOUD log (documented
         // 4d follow-up) -- never a silent drop, never a false reject.
         mint_solved_share(/*won_block=*/false);
-
-        bump(true);
         return nlohmann::json(true);
     }
 
-    bump(false);
     return reject(23, "Low difficulty share");
 }
 

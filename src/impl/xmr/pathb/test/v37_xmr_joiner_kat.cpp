@@ -17,6 +17,7 @@
 // ratchet (rs_step_at in the joined tree), jc1-jc5 (ruling 53: the claimed
 // prefix from x_pre, d below the root a claim, the claimed view at a prefix
 // fork, side bins from served buckets, no below-root best; V1-V16, V2b).
+// Shards and their gather: pathb_kat_shard.hpp.
 // ---------------------------------------------------------------------------
 #include <chrono>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <string>
 #include <vector>
 #include "pathb_kat_join.hpp"
+#include "pathb_kat_shard.hpp"
 using namespace pathb_kat;
 namespace pb = ::c2pool::xmr::pathb;
 namespace {
@@ -3349,32 +3351,26 @@ void jc6() {
 
 }  // namespace
 int main(int argc, char** argv) {
-    const std::string only = argc > 1 ? argv[1] : "";
-    const auto run = [&](const char* name, void (*f)()) {
-        if (!only.empty() && only != name) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        const int f0 = g_fail;
-        run_part(name, f);
-        std::printf("[%s] %.1f s%s\n", name, secs(t0), g_fail != f0 ? " FAIL" : "");
-        std::fflush(stdout);
-    };
-    run("span", span);
-    run("young", young);
-    run("buckets", buckets);
-    run("afterl", afterl);
-    run("claims", claims);
-    run("attempts", attempts);
-    run("candidates", candidates);
-    run("scope", scope);
-    run("header", header);
-    run("d1", d1);
-    run("fastpool", fastpool);
-    run("ratchet", ratchet);
-    run("jc1", jc1);  // ruling 53: V1, V5, V16
-    run("jc2", jc2);  // ruling 53: V2, V2b, V3, V15
-    run("jc3", jc3);  // ruling 53: V4, V6, V14
-    run("jc4", jc4);  // ruling 53: V7, V8, V9, V10, V11, V12
-    run("jc5", jc5);  // ruling 53: V13
-    run("jc6", jc6);  // N-1 (E-86): the FC_HEADERS v0x02 frame head; N-3 (E-102): the header floor
-    return finish("v37_xmr_joiner_kat");
+    return run_sections("v37_xmr_joiner_kat",
+                        {
+                                {"span", span, 173},
+                                {"young", young, 194},
+                                {"buckets", buckets, 39},
+                                {"afterl", afterl, 23},
+                                {"claims", claims, 307},
+                                {"attempts", attempts, 82},
+                                {"candidates", candidates, 102},
+                                {"scope", scope, 101},
+                                {"header", header, 47},
+                                {"d1", d1, 41},
+                                {"fastpool", fastpool, 22},
+                                {"ratchet", ratchet, 24},
+                                {"jc1", jc1, 156},  // ruling 53: V1, V5, V16
+                                {"jc2", jc2, 281},  // ruling 53: V2, V2b, V3, V15
+                                {"jc3", jc3, 183},  // ruling 53: V4, V6, V14
+                                {"jc4", jc4, 253},  // ruling 53: V7, V8, V9, V10, V11, V12
+                                {"jc5", jc5, 94},   // ruling 53: V13
+                                {"jc6", jc6, 31},   // N-1 (E-86): the FC_HEADERS v0x02 frame head; N-3 (E-102): the header floor
+                        },
+                        argc, argv);
 }

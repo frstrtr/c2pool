@@ -44,7 +44,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 #include <memory>
 #include <mutex>
@@ -278,6 +280,38 @@ TEST(DashStratumWorkSource, WorkerRegistryRoundTrip)
     ws->unregister_stratum_worker("sess-1");
     ws->unregister_stratum_worker("sess-unknown");
     SUCCEED();
+}
+
+// The dashboard's per-connection Latency column reads WorkerInfo::rtt_ms from
+// this registry. The stratum session samples the kernel RTT at authorize
+// (into the registered WorkerInfo) and again on every accepted submit through
+// update_stratum_worker_rtt. The registry must take the fresh sample; a
+// connect-time reading (taken while many rigs connect at once) must not stick.
+TEST(DashStratumWorkSource, WorkerRttRefreshesAfterRegistration)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    core::stratum::WorkerInfo info;
+    info.username    = "Xaddr.D14";
+    info.worker_name = "D14";
+    info.rtt_ms      = 90.4;   // sampled at authorize
+    ws->register_stratum_worker("sess-1", info);
+    ASSERT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 90.4);
+
+    ws->update_stratum_worker_rtt("sess-1", 23.1);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1)
+        << "a submit-time RTT sample replaces the connect-time one";
+
+    // The share-stats update leaves the fresh RTT alone.
+    ws->update_stratum_worker("sess-1", 1.0e9, 0.0, 16.0, 4, 0, 0);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1);
+
+    // An unknown session is dropped, never inserted.
+    ws->update_stratum_worker_rtt("sess-unknown", 5.0);
+    EXPECT_EQ(ws->get_stratum_workers().count("sess-unknown"), 0u);
+
+    ws->unregister_stratum_worker("sess-1");
+    EXPECT_TRUE(ws->get_stratum_workers().empty());
 }
 
 // The fused adapter: with an UNPOPULATED coin-state, get_work() routes to the
@@ -564,6 +598,50 @@ TEST(DashStratumWorkSource, MiningSubmitRejectsLowDifficulty)
     EXPECT_FALSE(result[0].get<bool>());
     EXPECT_EQ(result[1][0].get<int>(), 23);   // Low difficulty share
     EXPECT_FALSE(rig.fx.submit_called);
+}
+
+// The DASH registry stamps when a session's accepted counter last moved, so the
+// dashboard's share age and stalled state are exact.
+TEST(DashStratumWorkSource, UpdateStratumWorkerStampsLastAccepted)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo w;
+    w.username = "XfixtureMinerAddress";
+    rig.ws->register_stratum_worker("s", w);
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 0, 1, 0);
+    EXPECT_EQ(rig.ws->get_stratum_workers().at("s").last_accepted_at,
+              std::chrono::steady_clock::time_point{});
+    const auto before = std::chrono::steady_clock::now();
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 3, 1, 0);
+    EXPECT_GE(rig.ws->get_stratum_workers().at("s").last_accepted_at, before);
+}
+
+// The per-session counters belong to the stratum session (update_stratum_worker
+// by session id). mining_submit must not credit another session of the same
+// address: a rig's idle failover connection would then read as hashing.
+TEST(DashStratumWorkSource, MiningSubmitLeavesSessionCountersToTheSession)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo idle;
+    idle.username = "XfixtureMinerAddress";
+    idle.worker_name = "rig1";
+    rig.ws->register_stratum_worker("a-failover", idle);   // sorts first
+    core::stratum::WorkerInfo live = idle;
+    rig.ws->register_stratum_worker("b-hashing", live);
+
+    // A low-difficulty reject, then a share accept, from the same address.
+    rig.job.share_bits  = 0x1c00ffffu;
+    rig.job.block_nbits = "1c00ffff";
+    const uint256 hard_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    auto r1 = rig.submit(rig.find_nonce([&](const uint256& pow) { return pow > hard_target; }));
+    ASSERT_TRUE(r1.is_array());
+
+    const auto w = rig.ws->get_stratum_workers();
+    EXPECT_EQ(w.at("a-failover").accepted, 0u);
+    EXPECT_EQ(w.at("a-failover").rejected, 0u)
+        << "the failover session was credited a sibling's submit";
+    EXPECT_EQ(w.at("b-hashing").rejected, 0u)
+        << "mining_submit writes no registry counters";
 }
 
 TEST(DashStratumWorkSource, MiningSubmitWonBlockAssemblesAndBroadcasts)
@@ -4262,4 +4340,40 @@ TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
     ws_none.set_dashd_templates_only(none.dashd_templates_only);
     EXPECT_TRUE(ws_none.get_current_work_template().empty())
         << "dashd-templates-only with no dashd arm serves no template";
+}
+
+// main_dash.cpp binds its own core::StratumServer (the dashboard WebServer's
+// acceptor is disabled), so it must wire every stratum seam WebServer::
+// start_stratum wires for LTC. Without set_local_rates_fn the local-hashrate
+// history graph falls back to the per-session estimate, which freezes for
+// sessions that stay connected but stop submitting (a backup pool) instead of
+// decaying with the RateMonitor window.
+TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    // Drop /* */ and // comments so a quoted expression in a doc block cannot
+    // satisfy it.
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    const auto hashrate_seam = code.find("mi->set_stratum_hashrate_fn(");
+    ASSERT_NE(hashrate_seam, std::string::npos);
+    const auto local_seam = code.find("mi->set_local_rates_fn(", hashrate_seam);
+    ASSERT_NE(local_seam, std::string::npos)
+        << "main_dash.cpp must feed the local-hashrate graph from its StratumServer";
+    const auto getter = code.find("ss->get_local_rates()", local_seam);
+    ASSERT_NE(getter, std::string::npos);
+    EXPECT_LT(getter - local_seam, 200u) << "the seam is fed by this StratumServer";
+    EXPECT_LT(local_seam - hashrate_seam, 2000u)
+        << "wired in the same block as the other stratum dashboard seams";
 }

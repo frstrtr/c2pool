@@ -204,8 +204,10 @@ struct MWEBState {
     // The raw serialized MWEB block from the previous block (for reference)
     std::vector<unsigned char> prev_mweb_raw;
 
-    // Height at which this state was captured
+    // Block this state was captured from (height + SHA256d header hash). A
+    // template may only use it when building on exactly that block.
     uint32_t captured_at_height{0};
+    uint256  captured_block_hash;
     bool     valid{false};
 };
 
@@ -249,6 +251,10 @@ public:
         state.prev_hogex_vout = 0;
         state.hogaddr_value = hogaddr_out.value;
         state.captured_at_height = block_height;
+        {
+            auto packed_hdr = pack(static_cast<const BlockHeaderType&>(block));
+            state.captured_block_hash = Hash(packed_hdr.get_span());
+        }
         state.valid = true;
 
         LOG_INFO << "[MWEB] Extracted state from height " << block_height
@@ -443,7 +449,18 @@ public:
             return false;
         }
         m_state = std::move(new_state);
+        if (height > m_seen_height)
+            m_seen_height = height;
         return true;
+    }
+
+    /// Highest height of a block whose MWEB state was accepted (0 = never).
+    /// Monotonic: invalidate() does not clear it, so once an MWEB block has
+    /// been seen the chain is known to be MWEB-active even while the state
+    /// itself is being re-fetched.
+    uint32_t mweb_seen_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_seen_height;
     }
 
     /// Get current MWEB state (thread-safe copy).
@@ -460,7 +477,8 @@ public:
     }
 
     /// Invalidate current MWEB state (e.g., after a chain reorg).
-    /// Blocks will not include MWEB data until a fresh full block is received.
+    /// Templates are refused (HOLD) until a fresh full block is received;
+    /// mweb_seen_height() is kept.
     void invalidate() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_state.valid) {
@@ -473,6 +491,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     MWEBState m_state;
+    uint32_t  m_seen_height{0};
 };
 
 } // namespace coin

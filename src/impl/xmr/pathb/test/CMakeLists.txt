@@ -96,6 +96,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 if (BUILD_TESTING)
+    # Registered as shards and a gather below.
+    set(_pathb_sharded v37_xmr_joiner_kat v37_xmr_pathb_node_join_kat)
     foreach(_pathb_kat
             v37_xmr_side_data_v3_kat
             v37_xmr_pathb_body_v3_kat
@@ -152,7 +154,9 @@ if (BUILD_TESTING)
         add_executable(${_pathb_kat} ${_pathb_kat}.cpp)
         target_include_directories(${_pathb_kat} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(${_pathb_kat} PRIVATE xmr_pathb)
-        add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
+        if (NOT _pathb_kat IN_LIST _pathb_sharded)
+            add_test(NAME ${_pathb_kat} COMMAND ${_pathb_kat})
+        endif()
     endforeach()
     # v37_xmr_pathb_miner_tx_kat: a test-only TU compares the author key references
     # with the K16 references of pathb_lane_rules.hpp and pathb's keys with the
@@ -167,10 +171,35 @@ if (BUILD_TESTING)
             PATHB_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
     # v37_xmr_pathb_store_kat also runs its store through the LevelDB archive.
     target_link_libraries(v37_xmr_pathb_store_kat PRIVATE xmr_pathb_store)
-    # v37_xmr_joiner_kat replays several chains of 4,700+ carriers (ASan ~12 min).
-    set_tests_properties(v37_xmr_joiner_kat PROPERTIES TIMEOUT 3000)
-    # v37_xmr_pathb_node_join_kat joins chains of 4,700+ carriers through PathbNode.
-    set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES TIMEOUT 3000)
+    # v37_xmr_joiner_kat runs as the shards v37_xmr_joiner_kat_s0 .. _s7 (--shard=i/8); the test
+    # v37_xmr_joiner_kat gathers their results (--gather=8) and requires them as a fixture.
+    set(_joiner_shards 0 1 2 3 4 5 6 7)
+    list(LENGTH _joiner_shards _joiner_n)
+    set(_joiner_out ${CMAKE_CURRENT_BINARY_DIR}/v37_xmr_joiner_kat.result)
+    foreach(_joiner_shard IN LISTS _joiner_shards)
+        add_test(NAME v37_xmr_joiner_kat_s${_joiner_shard}
+                COMMAND v37_xmr_joiner_kat --shard=${_joiner_shard}/${_joiner_n} --out=${_joiner_out})
+        set_tests_properties(v37_xmr_joiner_kat_s${_joiner_shard} PROPERTIES
+                LABELS slow COST 307 FIXTURES_SETUP v37_xmr_joiner_kat_shards)
+    endforeach()
+    add_test(NAME v37_xmr_joiner_kat COMMAND v37_xmr_joiner_kat --gather=${_joiner_n} --out=${_joiner_out})
+    set_tests_properties(v37_xmr_joiner_kat PROPERTIES
+            LABELS slow FIXTURES_REQUIRED v37_xmr_joiner_kat_shards)
+    # v37_xmr_pathb_node_join_kat runs as the shards v37_xmr_pathb_node_join_kat_s0 .. _s4 (--shard=i/5); the
+    # test v37_xmr_pathb_node_join_kat gathers their results (--gather=5) and requires them as a fixture.
+    set(_node_join_shards 0 1 2 3 4)
+    list(LENGTH _node_join_shards _node_join_n)
+    set(_node_join_out ${CMAKE_CURRENT_BINARY_DIR}/v37_xmr_pathb_node_join_kat.result)
+    foreach(_node_join_shard IN LISTS _node_join_shards)
+        add_test(NAME v37_xmr_pathb_node_join_kat_s${_node_join_shard}
+                COMMAND v37_xmr_pathb_node_join_kat --shard=${_node_join_shard}/${_node_join_n} --out=${_node_join_out})
+        set_tests_properties(v37_xmr_pathb_node_join_kat_s${_node_join_shard} PROPERTIES
+                LABELS slow COST 216 FIXTURES_SETUP v37_xmr_pathb_node_join_kat_shards)
+    endforeach()
+    add_test(NAME v37_xmr_pathb_node_join_kat
+            COMMAND v37_xmr_pathb_node_join_kat --gather=${_node_join_n} --out=${_node_join_out})
+    set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES
+            LABELS slow FIXTURES_REQUIRED v37_xmr_pathb_node_join_kat_shards)
     # v37_xmr_pathb_node_kat runs the relay node and its threads; deferfound submits a found block through the monerod
     # arm (xmr_node: the RPC bodies).
     find_package(Threads REQUIRED)
