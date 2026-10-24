@@ -15,7 +15,8 @@
 //     flipped MWEB header byte fails the commitment, a replayed (older) MWEB
 //     header fails the height check, a block not ending in a HogEx is refused;
 //   - BIP 152 SipHash keys (single SHA256 over header || nonce), the 65535
-//     count limit, and the sendcmpct announcement order (v3 first).
+//     count limit, and the sendcmpct announcement order (v3 first);
+//   - the header screen (PoW, parent) the compact-block hook runs first.
 // Folded into the allowlisted share_test target (no new executable: #769).
 // ---------------------------------------------------------------------------
 
@@ -39,6 +40,7 @@
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/compact_blocks.hpp>
 #include <impl/ltc/coin/p2p_messages.hpp>
+#include <impl/ltc/coin/header_chain.hpp>
 #include <impl/ltc/coin/mweb_builder.hpp>
 
 #include "ltc_mweb_cmpct_fixtures.hpp"
@@ -515,4 +517,32 @@ TEST(LtcCmpctV3MwebState, SendcmpctAnnounceOrder)
               (std::vector<std::string>{"000300000000000000", "000200000000000000"}));
     EXPECT_EQ(payloads(2, true), (std::vector<std::string>{"000200000000000000"}))
         << "rollback: v2 low-bandwidth only";
+}
+
+// The compact-block hook screens the header before any reconstruction work:
+// a header that names a known parent but fails PoW (a random nonce) or names
+// an unknown parent is dropped; nothing is stored either way.
+TEST(LtcCmpctV3MwebState, HeaderScreenBeforeReconstruction)
+{
+    const BlockType b = vector_block();
+    auto params = make_ltc_chain_params_mainnet();
+    LTCChainParams::Checkpoint cp;
+    cp.height = fx::kHeight - 1;
+    cp.hash.SetHex(fx::kPrevBlockHash);
+    params.fast_start_checkpoint = cp;
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+
+    const BlockHeaderType hdr = static_cast<const BlockHeaderType&>(b);
+    EXPECT_TRUE(chain.check_header(hdr)) << "the real header: parent known, PoW ok";
+    EXPECT_EQ(chain.height(), fx::kHeight - 1) << "nothing stored";
+    EXPECT_FALSE(chain.has_header(hash_of(hdr)));
+
+    BlockHeaderType bad_nonce = hdr;
+    bad_nonce.m_nonce ^= 0x01;
+    EXPECT_FALSE(chain.check_header(bad_nonce)) << "PoW fails";
+
+    BlockHeaderType orphan = hdr;
+    orphan.m_previous_block.SetHex("1111111111111111111111111111111111111111111111111111111111111111");
+    EXPECT_FALSE(chain.check_header(orphan)) << "unknown parent";
 }

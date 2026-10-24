@@ -2518,6 +2518,15 @@ int main(int argc, char* argv[]) {
                             }
                             return CmpctAction::Drop;
                         }
+                        // PoW and difficulty before any work: a header that merely
+                        // names our tip as its parent must not cost a mempool
+                        // gather and a getblocktxn round trip.
+                        if (!chain->check_header(cb.header)) {
+                            mweb_stats->note_cmpct_rejected("bad-header");
+                            LOG_WARNING << "[EMB-LTC] Compact block " << hash.GetHex().substr(0, 16)
+                                        << "... from " << peer << " fails PoW/difficulty — dropped";
+                            return CmpctAction::Drop;
+                        }
                         const bool mweb_active = tracker
                             && tracker->mweb_active_at(prev->height + 1, ltc_mweb_activation);
                         const auto verdict = ltc::coin::cmpct_mweb_verdict(cb, mweb_active);
