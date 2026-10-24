@@ -179,6 +179,19 @@ export function buildAnimatedPaintProgram(
         lineWidth: cell.stroke.lineWidth,
       });
     }
+    // Block centre pip (dashboard.html drawBlockMark): a square of 30% of
+    // the cell, at least 1px, in the ring colour.
+    if (cell.blockMark !== undefined) {
+      const pip = Math.max(1, Math.round(cell.size * 0.3));
+      cmds.push({
+        op: 'fillCell',
+        x: cell.x + (cell.size - pip) / 2,
+        y: cell.y + (cell.size - pip) / 2,
+        w: pip,
+        h: pip,
+        color: cell.blockMark,
+      });
+    }
     // Tip-marker triangle (dashboard.html:4778-4787) — top-left
     // corner, 4×4 right-triangle, white fill.
     if (cell.tipMark === true) {
