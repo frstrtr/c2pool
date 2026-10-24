@@ -154,6 +154,55 @@ public:
     void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
     void set_on_full_block(FullBlockCallback cb) { m_on_full_block = std::move(cb); }
 
+    /// Full block plus how it arrived (block message, reconstructed compact
+    /// block, compact block completed via blocktxn). Takes precedence over
+    /// set_on_full_block when both are set.
+    using FullBlockSourceCallback = std::function<void(const std::string& peer,
+                                                       const ltc::coin::BlockType&,
+                                                       ltc::coin::BlockSource)>;
+    void set_on_full_block_with_source(FullBlockSourceCallback cb) { m_on_full_block_src = std::move(cb); }
+
+    /// Coin-side decision for every received compact block (applied to every
+    /// peer connection): duplicate / unknown parent -> Drop, cannot carry the
+    /// MWEB state -> FetchFull, else Reconstruct.
+    using CmpctBlockCallback = std::function<ltc::coin::CmpctAction(const std::string& peer,
+                                                                    const ltc::coin::CompactBlock&)>;
+    void set_on_cmpct_block(CmpctBlockCallback cb) { m_on_cmpct_block = std::move(cb); }
+    using CmpctOutcomeCallback = std::function<void(const std::string& peer, const uint256&,
+                                                    ltc::coin::CmpctOutcome)>;
+    void set_on_cmpct_outcome(CmpctOutcomeCallback cb) { m_on_cmpct_outcome = std::move(cb); }
+
+    /// Mempool for compact block reconstruction, applied to every current and
+    /// future peer connection (BIP 152 short ids are matched against it).
+    void set_mempool(ltc::coin::Mempool* mp)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_mempool = mp;
+        for (auto& [key, peer] : m_peers)
+            if (peer) peer->node_p2p.set_mempool(mp);
+    }
+
+    /// sendcmpct announcement for future connections: version 3 asks MWEB
+    /// peers for v3 compact blocks; hb_peers bounds how many connections ask
+    /// for high-bandwidth (unsolicited) pushes, 0 = all of them.
+    void set_cmpct_announce(uint64_t version, uint32_t hb_peers)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cmpct_announce_version = version;
+        m_cmpct_hb_peers = hb_peers;
+    }
+
+    /// BIP 130 body getdata on small headers announcements, for future
+    /// connections (default on). Off when the node fetches the tip's block
+    /// itself (one fetch per block instead of one per announcing peer).
+    void set_fetch_announced_blocks(bool on)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_fetch_announced_blocks = on;
+        for (auto& [key, peer] : m_peers)
+            if (peer) peer->node_p2p.set_fetch_announced_blocks(on);
+    }
+
     using PeerHeightCallback = std::function<void(uint32_t)>;
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
 
@@ -373,16 +422,20 @@ public:
     }
 
     /// Request a full block from ONE specific peer (for bootstrap pipeline).
-    /// Uses round-robin index: peer_idx % peer_count selects the target.
-    /// Returns true if the request was sent, false if no peers available.
+    /// Uses round-robin index: peer_idx % (peers with a completed handshake)
+    /// selects the target, so a slot that is still dialing never eats the
+    /// request. Returns true if the request was sent, false if no peers available.
     bool request_full_block_targeted(const uint256& block_hash, size_t peer_idx)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_peers.empty()) return false;
-        auto it = m_peers.begin();
-        std::advance(it, peer_idx % m_peers.size());
+        std::vector<BroadcastPeer*> ready;
+        ready.reserve(m_peers.size());
+        for (auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete())
+                ready.push_back(peer.get());
+        if (ready.empty()) return false;
         try {
-            it->second->node_p2p.request_full_block(block_hash);
+            ready[peer_idx % ready.size()]->node_p2p.request_full_block(block_hash);
             return true;
         } catch (...) {
             return false;
@@ -508,10 +561,37 @@ private:
                     if (m_on_new_headers)
                         m_on_new_headers(peer_key, hdrs);
                 });
+            // The subscription lives in peer->coin_node, a member of *peer, so
+            // the raw pointer is valid whenever the event fires.
             peer->coin_node.full_block.subscribe(
-                [this, peer_key](const ltc::coin::BlockType& block) {
-                    if (m_on_full_block)
+                [this, peer_key, p = peer.get()](const ltc::coin::BlockType& block) {
+                    if (m_on_full_block_src)
+                        m_on_full_block_src(peer_key, block, p->node_p2p.last_block_source());
+                    else if (m_on_full_block)
                         m_on_full_block(peer_key, block);
+                });
+
+            // BIP 152: mempool for reconstruction, sendcmpct announcement,
+            // the coin-side compact block hooks, headers-announcement fetch.
+            peer->node_p2p.set_mempool(m_mempool);
+            {
+                size_t hb_now = 0;
+                for (auto& [k, other] : m_peers)
+                    if (other && other->node_p2p.cmpct_announce_hb()) ++hb_now;
+                const bool hb = m_cmpct_hb_peers == 0 || hb_now < m_cmpct_hb_peers;
+                peer->node_p2p.set_cmpct_announce(m_cmpct_announce_version, hb);
+            }
+            peer->node_p2p.set_fetch_announced_blocks(m_fetch_announced_blocks);
+            // Read at call time, so hooks installed after start() still apply.
+            peer->node_p2p.set_on_cmpct_block(
+                [this, peer_key](const ltc::coin::CompactBlock& cb) {
+                    return m_on_cmpct_block ? m_on_cmpct_block(peer_key, cb)
+                                            : ltc::coin::CmpctAction::Reconstruct;
+                });
+            peer->node_p2p.set_on_cmpct_outcome(
+                [this, peer_key](const uint256& hash, ltc::coin::CmpctOutcome outcome) {
+                    if (m_on_cmpct_outcome)
+                        m_on_cmpct_outcome(peer_key, hash, outcome);
                 });
 
             // Wire peer height callback (for fast-sync scrypt skip)
@@ -635,6 +715,13 @@ private:
     TxCallback           m_on_new_tx;
     HeadersCallback      m_on_new_headers;
     FullBlockCallback    m_on_full_block;
+    FullBlockSourceCallback m_on_full_block_src;
+    CmpctBlockCallback   m_on_cmpct_block;
+    CmpctOutcomeCallback m_on_cmpct_outcome;
+    ltc::coin::Mempool*  m_mempool{nullptr};       // compact block reconstruction
+    uint64_t             m_cmpct_announce_version{2};
+    uint32_t             m_cmpct_hb_peers{0};      // 0 = every connection asks for HB
+    bool                 m_fetch_announced_blocks{true};
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
     RawHeadersSink       m_raw_headers_sink;        // NMC AuxPoW header-feed (optional)

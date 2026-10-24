@@ -89,6 +89,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # goes out as a full block: a v2 cmpctblock cannot carry mweb) and the
     # sendcmpct highest-version fold. Same folding rule.
     #
+    # cmpct_v3_mweb_state_test.cpp: v3 (MWEB) compact blocks over the REAL
+    # mainnet block 3200424 (ltc_mweb_cmpct_fixtures.hpp): wire format, HogEx
+    # extraction, reconstruction and blocktxn completion carrying the mw::Block
+    # into the same MWEB state as the full block, the full-block fallbacks,
+    # forged/flipped/replayed commitments never becoming state, BIP 152 SipHash
+    # keys, the 65535 limit and the sendcmpct announce order. Same folding rule.
+    #
     # mweb_state_hash_binding_test.cpp: MWEB state is bound to the hash of its
     # block; the template builder HOLDs on a sibling's state and builds the
     # HogEx template on the tip's (real block 3200424). Same folding rule.
@@ -102,6 +109,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         build_stops_test.cpp
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
+        cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
