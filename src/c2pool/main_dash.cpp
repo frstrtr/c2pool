@@ -7693,9 +7693,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         if (embedded_utxo && utxo_lane.live()) {
             utxo_lane.set_request_block_fn(
                 [cp = coin_p2p.get(), hc = header_chain.get()](uint32_t h) {
+                    // Report the truth of the wire (#138 contract): on a fresh
+                    // node the bootstrap fires on the first bridge block,
+                    // before the pre-anchor header backfill installs, so the
+                    // header lookup misses. A false return keeps h on the
+                    // lane's dead-send list, and it is re-asked once the
+                    // header exists instead of being dropped silently.
                     auto e = hc->get_header_by_height(h);
-                    if (e) cp->request_block(e->hash);
+                    if (!e) return false;
+                    return cp->request_block(e->hash);
                 });
+            // The bootstrap watchdog the DASH arm never armed (LTC/DOGE:
+            // main_ltc.cpp start_stall_timer). It ticks only while a bootstrap
+            // is active, so dead sends and lost bodies recover without waiting
+            // for the next live block.
+            utxo_lane.arm_stall_timer(ioc);
         }
 
         // Peer's reported chain height -> header-chain sync-progress gauge.
