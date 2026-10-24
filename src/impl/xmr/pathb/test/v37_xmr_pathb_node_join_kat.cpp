@@ -2560,7 +2560,7 @@ int main(int argc, char** argv) {
                                 {"prunedj", prunedj, 43},
                                 {"reaskrelay", reaskrelay, 28},
                                 {"joinrx", joinrx, 27},
-                                {"joinnohash", joinnohash, 54},
+                                {"joinnohash", joinnohash, 45},
                                 {"keycache", keycache, 17},
                                 {"sidekeep", sidekeep, 1},
                                 {"sidedeep", sidedeep, 40},
