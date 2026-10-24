@@ -66,6 +66,12 @@
 //   joinrx     a RandomX failure in a join attempt: NodeInternal, an alarm,
 //              no token, the pair kept; the next attempt joins;
 //   keycache   --pathb-key-cache-mb reaches a joined state's key cache;
+//   sidekeep   a server's side branch across a restart (K_PSIDE): moved at
+//              the switch, reloaded under its parents, walked by a joiner
+//              that completes; the joined node's side branch kept by its
+//              adoption batch; a server without it: Unplaceable, excluded;
+//   sidedeep   a side branch whose bins the BinStore no longer holds at the
+//              restart: reloaded in the tree only, served, the join completes;
 //   x1r        a joined node (P-01 4,000: its journal base below x1)
 //              restarted: the journal base the session's; a heavier branch
 //              forking in (base, x1] takes the joiner path by its headers,
@@ -2118,6 +2124,181 @@ void keycache() {
                   std::to_string(js ? js->keys().budget() : 0) + " B, configured " + std::to_string(want) + ")");
 }
 
+
+// ---------------------------------------------------------------------------
+// sidekeep: a server's side branch across a restart (K_PSIDE). A (a written store) mines s1, s2 while cut from B;
+// B's heavier branch reaches A: A switches, s1 and s2 move to K_PSIDE; A's next carrier carries s2's own receipt (its
+// tip s1, a side carrier). A restarted from its store holds s1 and s2; a node joining from it walks the side branch
+// and completes; that joined node, restarted, holds the walked side branch and serves a second join. A server
+// restarted without its K_PSIDE rows answers the side headers empty: the attempt ends Unplaceable and the server is
+// excluded (its pair is not queued again).
+void sidekeep() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    Harness h(net);
+    const std::size_t a = h.add(kat_table(net), true, kJ, true);
+    MemoryKv& akv = *h.kvs.back();
+    const std::size_t b = h.add(kat_table(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + i);
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.tick_monero();
+    h.mine(a, 2, 900);
+    const pb::Hash32 s1 = h[a].tree().best().id;
+    h.tick_monero();
+    h.mine(a, 2, 901);
+    const pb::Hash32 s2 = h[a].tree().best().id;
+    std::vector<pb::Hash32> bb;
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(b, 3, 950 + i);
+        bb.push_back(h[b].tree().best().id);
+    }
+    h.cut.clear();
+    h.q.clear();
+    for (const pb::Hash32& id : bb)
+        (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(id), pb::kRuledLaneParams.r_max));
+    h.pump();
+    check(h[a].tree().best().id == bb.back() && h[a].tree().find(s1) != nullptr && h[a].tree().find(s2) != nullptr,
+          "sidekeep: A switched to B's heavier branch; s1, s2 held as side carriers");
+    check(akv.data.count(pb::store_keys::pside(0, s1)) == 1 && akv.data.count(pb::store_keys::pside(0, s2)) == 1
+                  && akv.data.count(pb::store_keys::pside(0, bb[0])) == 0 && akv.data.count(pb::store_keys::pside(0, bb[1])) == 0,
+          "sidekeep: the switch moved s1, s2 to K_PSIDE; the new branch holds no K_PSIDE row");
+    h.tick_monero();
+    h.mine(a, 4, 77);
+    const pb::Hash32 c = h[a].tree().best().id;
+    const pb::CarrierBodyV3* cb = h[a].bodies().get(c);
+    bool carries = false;
+    for (const pb::ReceiptBodyV3& r : cb ? cb->carried : std::vector<pb::ReceiptBodyV3>{})
+        carries = carries || (pb::receipt_id(r) == s2 && r.side.tip == s1);
+    check(h[a].tree().find(c) != nullptr && h[a].tree().best().pos == 10 && carries,
+          "sidekeep: A's next carrier (position 10) carries s2's own receipt, its tip s1 a side carrier");
+    // A restarted from its store
+    pb::LoadResult rl = pb::pathb_load(akv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    check(rl.fault == pb::StoreFault::None && rl.state && rl.state->side_loaded == 2 && rl.state->tree.find(s1) != nullptr
+                  && rl.state->bodies.get(s2) != nullptr,
+          "sidekeep: A's store reloads s1 and s2 under their parents (" +
+                  std::to_string(rl.state ? rl.state->side_loaded : 0) + " placed, " +
+                  std::to_string(rl.state ? rl.state->side_skipped : 0) + " skipped)");
+    if (!rl.state) return;
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(r), std::move(*rl.state), nullptr));
+    Joining k = joining_node(h, net, kJ);
+    MemoryKv& jkv = *h.kvs.back();
+    h.hello(k.j, r);
+    const pb::JoinStep st = h[k.j].run_join();
+    h.q.clear();
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[k.j].tree().best().id == c
+                  && h[k.j].tree().find(s1) != nullptr,
+          "sidekeep: a node joining from A restarted walks the side branch to s1 and completes" +
+                  (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    // the joined node restarted: the walked side branch from its adoption batch
+    pb::LoadResult rj = pb::pathb_load(jkv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    check(rj.fault == pb::StoreFault::None && rj.state && rj.state->tree.find(s1) != nullptr,
+          "sidekeep: the joined node's store holds the walked side branch (" +
+                  std::to_string(rj.state ? rj.state->side_loaded : 0) + " placed)");
+    if (rj.state) {
+        const std::size_t r2 = h.nodes.size();
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), h.io(r2), std::move(*rj.state), nullptr));
+        Joining k2 = joining_node(h, net, kJ);
+        h.hello(k2.j, r2);
+        const pb::JoinStep st2 = h[k2.j].run_join();
+        h.q.clear();
+        check(st2.report && st2.report->end == pb::AttemptEnd::Completed && st2.switched && h[k2.j].tree().best().id == c,
+              "sidekeep: a second node joins from the joined node restarted" +
+                      (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string(": no attempt")));
+    }
+    // a server restarted without its K_PSIDE rows: the side headers answered empty, the server excluded
+    MemoryKv bare = akv;
+    for (auto it = bare.data.begin(); it != bare.data.end();)
+        it = it->first.rfind(pb::store_keys::pside_prefix(0), 0) == 0 ? bare.data.erase(it) : std::next(it);
+    pb::LoadResult r3l = pb::pathb_load(bare, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    if (!r3l.state) {
+        check(false, "sidekeep: the store without K_PSIDE loads");
+        return;
+    }
+    const std::size_t r3 = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(r3), std::move(*r3l.state), nullptr));
+    Joining k3 = joining_node(h, net, kJ);
+    h.hello(k3.j, r3);
+    const pb::JoinStep st3 = h[k3.j].run_join();
+    const pb::JoinStep st4 = h[k3.j].run_join();
+    h.q.clear();
+    check(st3.report && st3.report->end == pb::AttemptEnd::Unplaceable && h[k3.j].joiner().queue().excluded(r3)
+                  && h[k3.j].joiner().queue().size() == 0 && !st4.report,
+          "sidekeep: a server without the side branch answers its side headers empty: Unplaceable, the server excluded, "
+          "no further attempt" + (st3.report ? std::string(": ") + rep_desc(*st3.report) : std::string(": no attempt")));
+    std::printf("  sidekeep: %.1f s\n", secs_since(t0));
+}
+
+// ---------------------------------------------------------------------------
+// sidedeep: a side branch whose bins the BinStore no longer holds at the restart. As sidekeep after 150 positions (one
+// Monero height each: s1 and s2 seal bins), then A mines 1,300 positions more (past P-01 = 1,152), one Monero height
+// per four. Restarted from its store, A holds s1 and s2 in the tree only (the BinStore cannot seal them again:
+// no delta), with their bodies; a node joining from it walks the side branch and completes.
+void sidedeep() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    Harness h(net);
+    const std::size_t a = h.add(kat_table(net), true, kJ, true);
+    MemoryKv& akv = *h.kvs.back();
+    const std::size_t b = h.add(kat_table(net), true);
+    for (int i = 0; i < 150; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.tick_monero();
+    h.mine(a, 2, 900);
+    const pb::Hash32 s1 = h[a].tree().best().id;
+    h.tick_monero();
+    h.mine(a, 2, 901);
+    const pb::Hash32 s2 = h[a].tree().best().id;
+    std::vector<pb::Hash32> bb;
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(b, 3, 950 + i);
+        bb.push_back(h[b].tree().best().id);
+    }
+    h.cut.clear();
+    h.q.clear();
+    for (const pb::Hash32& id : bb)
+        (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(id), pb::kRuledLaneParams.r_max));
+    h.pump();
+    h.cut = {{a, b}, {b, a}};
+    for (int i = 0; i < 1300; ++i) {
+        if (i % 4 == 0) h.tick_monero();
+        h.mine(a, 4 + static_cast<std::size_t>(i % 3), 2000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::Hash32 tip = h[a].tree().best().id;
+    check(h[a].tree().best().pos == 1453 && h[a].tree().find(s1) != nullptr && akv.data.count(pb::store_keys::pside(0, s1)) == 1,
+          "sidedeep: A at position 1,453 (past P-01), s1 and s2 side carriers in K_PSIDE (A at " +
+                  std::to_string(h[a].tree().best().pos) + ")");
+    pb::LoadResult rl = pb::pathb_load(akv, net.pool_id, net.rules_g, load_inputs(net, kJ));
+    check(rl.fault == pb::StoreFault::None && rl.state && rl.state->side_loaded == 2 && rl.state->tree.find(s1) != nullptr
+                  && rl.state->tree.find(s2) != nullptr && rl.state->bodies.get(s2) != nullptr
+                  && rl.state->store.delta(s1) == nullptr && rl.state->store.delta(s2) == nullptr,
+          "sidedeep: A's store reloads s1 and s2 in the tree only, with their bodies (" +
+                  std::to_string(rl.state ? rl.state->side_loaded : 0) + " placed, " +
+                  std::to_string(rl.state ? rl.state->side_skipped : 0) + " skipped)");
+    if (!rl.state) return;
+    const std::size_t r = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), true, kJ), h.io(r), std::move(*rl.state), nullptr));
+    Joining k = joining_node(h, net, kJ);
+    h.hello(k.j, r);
+    const pb::JoinStep st = h[k.j].run_join();
+    h.q.clear();
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && st.switched && h[k.j].tree().best().id == tip
+                  && h[k.j].tree().find(s1) != nullptr,
+          "sidedeep: a node joining from A restarted walks the side branch to s1 and completes" +
+                  (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    std::printf("  sidedeep: %.1f s\n", secs_since(t0));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2161,5 +2342,7 @@ int main(int argc, char** argv) {
     run("reaskrelay", reaskrelay);
     run("joinrx", joinrx);
     run("keycache", keycache);
+    run("sidekeep", sidekeep);
+    run("sidedeep", sidedeep);
     return finish("v37_xmr_pathb_node_join_kat");
 }

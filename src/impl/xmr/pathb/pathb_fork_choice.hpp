@@ -679,6 +679,39 @@ public:
         return plan;
     }
 
+    // A side carrier restored from its stored values (a K_PSIDE row written once its delta had left the BinStore, so
+    // without its placements) under a held parent, unmarked (the caller marks it): its position, record height and
+    // cumulative work follow from the parent and are checked; d, S as stored. false: not restored.
+    bool restore_side(const RestoredNode& r) {
+        if (index_.count(r.id) != 0) return false;
+        const auto pit = index_.find(r.parent);
+        if (pit == index_.end()) return false;
+        const std::size_t pi = pit->second;
+        const CarrierNode& p = nodes_[pi];
+        if (r.pos != p.pos + 1 || !carrier_height_admissible(p.H, r.h) || r.H != record_height(p.H, r.h) ||
+            !(r.cum_work == ::c2pool::xmr::native::u128_add(p.cum_work, ::c2pool::xmr::native::U128{r.d, 0})))
+            return false;
+        CarrierNode n;
+        n.id = r.id;
+        n.parent = r.parent;
+        n.pos = r.pos;
+        n.h = r.h;
+        n.H = r.H;
+        n.d = r.d;
+        n.cum_work = r.cum_work;
+        n.receipts_root = r.receipts_root;
+        n.ballot = r.ballot;
+        n.rs = r.rs;
+        n.below_root = p.below_root;
+        n.pre_fork_H = p.pre_fork_H;
+        n.parent_index = pi;
+        const std::size_t idx = nodes_.size();
+        nodes_.push_back(std::move(n));
+        nodes_[pi].children.push_back(idx);
+        index_.emplace(r.id, idx);
+        return true;
+    }
+
 private:
     // S1.3 #10: receipts_root of c against carried_root(ids of `carried`) and S at its parent.
     static FoldVerdict fold_verdict(const RatchetState& parent_rs, const CarrierAnnounce& c,
