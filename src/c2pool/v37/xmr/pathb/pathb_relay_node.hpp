@@ -2198,14 +2198,21 @@ private:
         q.want_bodies = true;
         if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, p_)) node_send(peer, *f);
     }
-    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN).
+    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN). A STRIKE, REFUSE or BAN logs its row and
+    // the id of the body it names.
     bool apply_result(std::uint64_t peer, const NodeEventResult& r, bool token_taken) {
         for (const auto& [q, n] : r.admit.peer_tokens) strike(q, n, false);
+        const auto named = [&]() {
+            return "admission row R" + std::to_string(static_cast<int>(r.admit.row)) + " of " +
+                   hex_short(r.admit.id != Hash32{} ? r.admit.id : r.object);
+        };
         switch (r.admit.verdict) {
-            case AdmitVerdict::Strike: strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken); return true;
-            case AdmitVerdict::Ban:
-                ban(peer, "admission row R" + std::to_string(static_cast<int>(r.admit.row)) + " of " + hex_short(r.admit.id));
+            case AdmitVerdict::Strike:
+                log("relay: peer " + std::to_string(peer) + " STRIKE: " + named());
+                strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken);
                 return true;
+            case AdmitVerdict::Ban: ban(peer, named()); return true;
+            case AdmitVerdict::Refuse: log("relay: peer " + std::to_string(peer) + " REFUSE: " + named()); return false;
             case AdmitVerdict::Drop: st_.drops++; return false;
             default: return false;
         }
