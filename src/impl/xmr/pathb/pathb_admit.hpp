@@ -1725,6 +1725,24 @@ public:
         for (const auto& [d, f] : frames_) out.push_back(d);
         return out;
     }
+    // The carrier ids of every stored frame.
+    std::set<Hash32> ids() const {
+        std::set<Hash32> out;
+        for (const auto& [d, f] : frames_) out.insert(f.id);
+        return out;
+    }
+    // Every waiting key's claimed parent with the peer of its oldest stored frame.
+    std::vector<std::pair<Hash32, std::uint64_t>> waiting_parents() const {
+        std::vector<std::pair<Hash32, std::uint64_t>> out;
+        for (const auto& [k, ds] : keys_) {
+            const ParkedFrame* first = nullptr;
+            for (const Hash32& d : ds)
+                if (const auto it = frames_.find(d); it != frames_.end() && (first == nullptr || it->second.seq < first->seq))
+                    first = &it->second;
+            if (first != nullptr) out.emplace_back(k.second, first->peer);
+        }
+        return out;
+    }
 
     // Parks a DEFERred frame (by its digest). ParentUnknown: the waiting entry
     // (id, claimed parent) is registered in the tree. Returns false when the

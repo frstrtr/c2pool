@@ -7841,6 +7841,119 @@ void catchlocator() {
 // for a frame parked now (a copy held already asks nothing), whose parent is neither held nor parked, and which was not
 // asked within P-53.
 //
+// pwalk_run: A, B and C hold one chain of n positions; J, empty, links to all three and catches up headers first while
+// A mines k new tips, one every 2 s, each reaching J from A, B and C. The wire carries at most `per_s` frames per second
+// of the clock; the servers' FC_HEADERS replies to J arrive `hold_s` seconds after they are sent (within P-53). The run
+// ends with J at A's tip after the k tips, at 1,800 s, or once J's R4 DEFERs pass `stop_r4`.
+struct PwalkRun {
+    bool chain = false, mined = true, at_tip = false;
+    std::uint64_t tips = 0, r4 = 0, parent_asks = 0, catchup = 0, strikes = 0, bans = 0, a_pos = 0, j_pos = 0;
+    std::size_t deferred = 0;
+    int secs = 0;
+};
+PwalkRun pwalk_run(std::uint64_t n, std::uint64_t k, std::uint64_t per_s, std::uint64_t hold_s, std::uint64_t stop_r4,
+                   std::uint32_t seed) {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;  // P-14: one FC_HEADERS frame holds a full page of P-01 headers
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    PwalkRun out;
+    out.chain = catch_chain(h, w, a, b, c, n, seed);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    const auto r4 = [&j] {
+        return j.relay->verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    std::deque<std::pair<std::uint64_t, FakeWire::Msg>> held;  // the servers' FC_HEADERS to J, by arrival time
+    std::size_t pass = 0;                                      // released frames at the front of the wire
+    w.edit = [&](FakeWire::Msg& m) {
+        if (pass > 0) {
+            --pass;
+            return;
+        }
+        if (m.to != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcHeaders) return;
+        held.emplace_back(h.now + hold_s, m);
+        m.f.clear();
+    };
+    w.connect(j.node, a.node);
+    w.connect(j.node, b.node);
+    w.connect(j.node, c.node);
+    for (; out.secs < 1800 && r4() <= stop_r4; ++out.secs) {
+        if (out.tips < k && out.secs % 2 == 1) {  // A's new tip, flooded; the wire carries it with the rest
+            if (out.tips % 12 == 0) h.tick_monero();
+            const std::uint32_t nonce = seed + 1000000 + static_cast<std::uint32_t>(out.tips);
+            const std::optional<pb::PathbJob> jb = h.job(a.node, static_cast<std::size_t>(out.tips % 5), nonce);
+            out.mined = out.mined && jb && h[a.node].on_own_share(*jb, nonce, pb::Hash32{}).action == pb::NodeAction::Placed;
+            ++out.tips;
+        }
+        if (out.tips == k && h[j.node].tree().best().id == h[a.node].tree().best().id) break;
+        h.now += 1;
+        std::vector<FakeWire::Msg> due;
+        while (!held.empty() && held.front().first <= h.now) {
+            due.push_back(std::move(held.front().second));
+            held.pop_front();
+        }
+        for (auto it = due.rbegin(); it != due.rend(); ++it) w.q.push_front(std::move(*it));
+        pass += due.size();
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        for (std::uint64_t m = 0; m < per_s && w.step(); ++m) {
+        }
+    }
+    w.edit = nullptr;
+    out.at_tip = h[j.node].tree().best().id == h[a.node].tree().best().id;
+    out.r4 = r4();
+    out.parent_asks = h[j.node].parent_asks();
+    out.catchup = j.relay->stats().catchup_requests.load();
+    out.a_pos = h[a.node].tree().best().pos;
+    out.j_pos = h[j.node].tree().best().pos;
+    out.deferred = h[j.node].deferred().size();
+    for (const KatRelay* x : {&a, &b, &c, &j}) {
+        out.strikes += x->relay->stats().strikes.load();
+        out.bans += x->relay->stats().bans.load();
+    }
+    return out;
+}
+void pwalk_print(const char* tag, const PwalkRun& r, std::uint64_t bound) {
+    std::printf("  %s: chain %d (A at %llu); tips %llu; J at %llu after %d s; R4 DEFERs %llu (bound %llu); parent asks %llu; "
+                "deferred %zu; catch-up asks %llu; strikes %llu, bans %llu\n",
+                tag, r.chain ? 1 : 0, (unsigned long long)r.a_pos, (unsigned long long)r.tips, (unsigned long long)r.j_pos,
+                r.secs, (unsigned long long)r.r4, (unsigned long long)bound, (unsigned long long)r.parent_asks, r.deferred,
+                (unsigned long long)r.catchup, (unsigned long long)r.strikes, (unsigned long long)r.bans);
+}
+
+// pwalk: N = 3,000 positions (more than P-47 = J_0 = 1,152), K = 30 tips; the wire carries at most 1,000 frames per
+// second, the FC_HEADERS replies arrive 8 s after they are sent. J's R4 DEFERs stay within N + 3K + J_0 (a copy of a
+// tip does not walk the gap again); J reaches A's tip at N + K; 0 strikes, 0 bans.
+void pwalk() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 1000, 8, 4 * bound, 44000);
+    pwalk_print("pwalk", r, bound);
+    check(r.chain && r.mined && r.tips == k, "pwalk: A, B and C at 3,000 positions; A mines 30 tips during J's catch-up");
+    check(r.at_tip && r.j_pos == n + k, "pwalk: J reaches A's tip at N + K (" + std::to_string(r.j_pos) + ")");
+    check(r.r4 <= bound, "pwalk: J's R4 DEFERs within N + 3K + J_0 (" + std::to_string(r.r4) + " of " + std::to_string(bound) + ")");
+    check(r.strikes == 0 && r.bans == 0, "pwalk: 0 strikes, 0 bans");
+}
+
+// pwalkstall: the pwalk chain; the wire carries at most 5,000 frames per second, the FC_HEADERS replies arrive 8 s after
+// they are sent. J's first walk places 1,152 positions before the catch-up's pages arrive (every header of them held:
+// the catch-up ends); the deferred store evicted the walk's other carriers. Once J's best has not moved within P-53, the
+// relay's tick asks the lowest parked frame's parent again (reask_parents): J reaches A's tip at N + K; R4 DEFERs within
+// 2N + 3K; 0 strikes, 0 bans.
+void pwalkstall() {
+    const std::uint64_t n = 3000, k = 30, bound = 2 * n + 3 * k;
+    const PwalkRun r = pwalk_run(n, k, 5000, 8, 4 * bound, 44000);
+    pwalk_print("pwalkstall", r, bound);
+    check(r.chain && r.mined && r.tips == k, "pwalkstall: A, B and C at 3,000 positions; A mines 30 tips during J's catch-up");
+    check(r.at_tip && r.j_pos == n + k, "pwalkstall: J reaches A's tip at N + K (" + std::to_string(r.j_pos) + ")");
+    check(r.r4 <= bound, "pwalkstall: J's R4 DEFERs within 2N + 3K (" + std::to_string(r.r4) + " of " + std::to_string(bound) + ")");
+    check(r.strikes == 0 && r.bans == 0, "pwalkstall: 0 strikes, 0 bans");
+}
+
 // pwalkdup: J, empty, receives carriers on S's tip P (position 6), whose parent it does not hold. T1 asks P once; T1 from
 // another peer and T2 (another carrier on P, within P-53) ask nothing; past P-53, T1 again (held already) asks nothing
 // and T3 (parked now) asks P again; P's own frame (parked on its parent Q) asks Q; past P-53 again, T4 on P asks nothing
@@ -9536,6 +9649,8 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("pwalk", pwalk);
+    run("pwalkstall", pwalkstall);
     run("pwalkdup", pwalkdup);
     run("sealall", sealall);
     run("placedcopy", placedcopy);

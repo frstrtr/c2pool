@@ -3517,6 +3517,7 @@ private:
                 for (const std::uint64_t p : arrived) node_->headers_arrived(p);
             }
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
+            node_->reask_parents();                       // the lowest frame of a parked chain: its parent once per P-53
             {  // the wants re-made for an id a join pair waits on (it gave up before): the pairs are tried again
                 std::vector<Hash32> again;
                 {
