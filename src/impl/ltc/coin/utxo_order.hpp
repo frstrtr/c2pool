@@ -220,8 +220,11 @@ struct RewindResult {
         NoUndo,         // no undo record at a height the walk has to disconnect
         Legacy,         // a legacy (pre-#2059) record: its spent coins cannot be put back
         TooDeep,        // more than max_depth blocks to disconnect
-        CannotJudge,    // the header chain has no block at a height, or no parent for one
+        CannotJudge,    // the header chain has no block at a height (a hole in
+                        // its index), or above its tip no parent for the set's block
         BlockMismatch,  // the record at a height belongs to another block
+        BlockUnknown,   // the header chain has another block at a height and no
+                        // longer knows the set's block there (no parent to step to)
     };
     bool     ok{true};          // false: see why
     Why      why{Why::None};
@@ -246,6 +249,7 @@ inline const char* rewind_why_name(RewindResult::Why w)
     case Why::TooDeep:       return "deeper than the undo window";
     case Why::CannotJudge:   return "a height the header chain cannot judge";
     case Why::BlockMismatch: return "undo record of another block";
+    case Why::BlockUnknown:  return "the header chain no longer knows the UTXO set's block";
     }
     return "unknown";
 }
@@ -256,7 +260,10 @@ inline const char* rewind_why_name(RewindResult::Why w)
 /// those are disconnected without asking (a reorg onto a shorter, heavier
 /// chain). At or below it a null answer means the header chain cannot judge
 /// that height: the walk fails instead of calling the UTXO set good.
-/// `prev_of(hash)` gives a block's parent (std::optional; nullopt = unknown),
+/// `prev_of(hash)` gives a block's parent (std::optional; nullopt = unknown):
+/// unknown at a height the chain judged (it has another block there) means
+/// the header DB has lost the set's block, which no wait brings back
+/// (BlockUnknown); above the tip it stays CannotJudge.
 /// `disconnect(h, hash)` undoes the UTXO set's block `hash` at height h and
 /// returns Why::None, or why the record at h cannot bring the set back
 /// (disconnect_with_undo below). At most `max_depth` blocks are disconnected.
@@ -280,7 +287,8 @@ RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uin
         return r;
     };
     while (r.height > 0) {
-        if (r.height <= chain_height) {
+        const bool judged = r.height <= chain_height;
+        if (judged) {
             const uint256 at = chain_hash_at(r.height);
             if (at == r.hash)
                 break;
@@ -291,7 +299,7 @@ RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uin
             return fail(Why::TooDeep);
         const auto prev = prev_of(r.hash);
         if (!prev)
-            return fail(Why::CannotJudge);
+            return fail(judged ? Why::BlockUnknown : Why::CannotJudge);
         const Why w = disconnect(r.height, r.hash);
         if (w != Why::None)
             return fail(w);

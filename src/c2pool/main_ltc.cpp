@@ -2546,10 +2546,11 @@ int main(int argc, char* argv[]) {
                 // refilling the same range would hit the same mismatch. When the
                 // walk cannot bring the set back for good (undo record missing,
                 // legacy pre-#2059 record, record of another block, deeper than
-                // LTC_KEEP) the set is wiped and the last LTC_KEEP blocks of the
-                // best chain are connected into the empty set, as a cold start
-                // does; returns true. Returns false when it cannot be brought back
-                // now (a height the header chain cannot judge).
+                // LTC_KEEP, the set's block lost from the header chain) the set
+                // is wiped and the last LTC_KEEP blocks of the best chain are
+                // connected into the empty set, as a cold start does; returns
+                // true. Returns false when it cannot be brought back now (a
+                // height the header chain cannot judge).
                 enum class UtxoHeal { Startup, Reorg, ParentMismatch };
                 using UtxoHealFn = std::function<bool(UtxoHeal, uint32_t)>;
                 auto utxo_heal = std::make_shared<UtxoHealFn>(

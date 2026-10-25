@@ -772,6 +772,50 @@ TEST(LtcUtxoOrder, HealFailsOnAHeightTheChainCannotJudge)
     EXPECT_TRUE(f.requested.empty());
 }
 
+// The header chain has another block at the UTXO set's best height and no
+// longer knows the set's own block (its header DB lost it): the walk cannot
+// step to a parent, and no wait brings one back, so the set is rebuilt. Above
+// the header chain's tip the same unknown parent is a wait (nothing wiped).
+TEST(LtcUtxoOrder, HealRebuildsWhenTheHeaderChainLostTheUtxoBlock)
+{
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000c6");
+    const auto a = make_chain(g, 1, 4, 0x48);              // a1..a4
+    const auto b = make_chain(hash_of(a[0]), 2, 2, 0x58);  // b2, b3
+    {
+        TempDb t;
+        Feed f{*t.cache, *t.db};
+        f.set_chain({a[0], a[1], a[2]}, 1);
+        for (uint32_t h = 1; h <= 3; ++h)
+            f.deliver(a[h - 1], h);
+        f.set_chain({a[0], b[0], b[1]}, 1);
+        f.headers.erase(hash_of(a[2]));                    // a3's header gone
+        f.requested.clear();
+        EXPECT_TRUE(f.heal(3, Feed::Heal::Reorg));
+        EXPECT_EQ(f.last_why, RewindResult::Why::BlockUnknown);
+        EXPECT_EQ(f.reanchored, 1u);
+        EXPECT_EQ(f.requested, (std::vector<uint32_t>{1, 2, 3}));
+        f.deliver(a[0], 1);
+        f.deliver(b[0], 2);
+        f.deliver(b[1], 3);
+        EXPECT_EQ(t.cache->get_best_block(), hash_of(b[1]));
+        EXPECT_FALSE(has(*t.cache, a[2].m_txs[0]));
+    }
+    {
+        TempDb t;
+        Feed f{*t.cache, *t.db};
+        f.set_chain(a, 1);
+        for (uint32_t h = 1; h <= 4; ++h)
+            f.deliver(a[h - 1], h);
+        f.set_chain({a[0], b[0], b[1]}, 1);                // tip 3, the set at 4
+        f.headers.erase(hash_of(a[3]));
+        EXPECT_FALSE(f.heal(3, Feed::Heal::Reorg));
+        EXPECT_EQ(f.last_why, RewindResult::Why::CannotJudge);
+        EXPECT_EQ(f.reanchored, 0u);
+        EXPECT_EQ(t.cache->get_best_block(), hash_of(a[3])) << "nothing undone, nothing wiped";
+    }
+}
+
 // The best chain's block at best + 1 does not build on the UTXO set's best,
 // yet the index agrees with the UTXO set at best (an index caught between two
 // rebuilds). Nothing can be disconnected, so the heal fails: re-arming the
