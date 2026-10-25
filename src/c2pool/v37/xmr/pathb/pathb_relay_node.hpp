@@ -2429,20 +2429,16 @@ private:
             it = it->second.empty() ? parked_ctx_.erase(it) : std::next(it);
         }
     }
-    // SPEC DEFER for parked carrier frames: a frame indexed for a re-run is dropped without strike when the origin bin
-    // of its OWN receipt (its body's own P_r, held with or without its weights: h = height + 1) seals on the best chain;
-    // a frame whose own P_r is not held stays (the deferred store's cap bounds it). Once per move of H(L) (the tick).
+    // SPEC DEFER for parked carrier frames: every frame of the deferred store, whatever its cause (indexed for a re-run
+    // or not), is dropped without strike when the origin bin of its OWN receipt (its body's own P_r, held with or
+    // without its weights: h = height + 1) seals on the best chain; a frame whose own P_r is not held stays (the
+    // deferred store's cap bounds it). Once per move of H(L) (the tick).
     void sweep_sealed_frames() {
         const NodeGuard g(*this);
         const std::optional<std::uint64_t> H = node_->best_record();
         if (!H || *H == swept_frames_record_) return;
         swept_frames_record_ = *H;
-        std::set<std::pair<Hash32, Hash32>> ds;  // (digest, the DEFER's id: zero for a cause with no Monero input)
-        for (const auto& [key, s] : parked_ctx_)
-            for (const Hash32& d : s) ds.emplace(d, key.second);
-        for (const auto& [cause, s] : parked_by_cause_)
-            for (const Hash32& d : s) ds.emplace(d, Hash32{});
-        for (const auto& [d, id] : ds) {
+        for (const Hash32& d : node_->parked_digests()) {
             // the object's OWN P_r keys its bin; the DEFER's id (a carried receipt's or a walked body's P_r) does not
             const std::optional<Hash32> own = node_->parked_own_pr(d);
             if (!own) continue;

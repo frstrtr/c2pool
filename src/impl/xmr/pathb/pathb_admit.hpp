@@ -1712,6 +1712,13 @@ public:
         return it == frames_.end() ? nullptr : &it->second;
     }
     bool holds(const Hash32& digest) const { return frames_.count(digest) != 0; }
+    // The digests of every stored frame.
+    std::vector<Hash32> digests() const {
+        std::vector<Hash32> out;
+        out.reserve(frames_.size());
+        for (const auto& [d, f] : frames_) out.push_back(d);
+        return out;
+    }
 
     // Parks a DEFERred frame (by its digest). ParentUnknown: the waiting entry
     // (id, claimed parent) is registered in the tree. Returns false when the

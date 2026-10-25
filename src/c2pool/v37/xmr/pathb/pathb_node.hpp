@@ -844,6 +844,8 @@ public:
     // The deferred store holds a frame of this digest; its cap (J_0).
     bool parked_held(const Hash32& digest) const { return deferred_.holds(digest); }
     std::uint64_t deferred_cap() const noexcept { return deferred_.cap(); }
+    // The digests of every frame the deferred store holds (the seal sweep of parked frames).
+    std::vector<Hash32> parked_digests() const { return deferred_.digests(); }
     // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
     std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
         const ParkedFrame* f = deferred_.get(digest);

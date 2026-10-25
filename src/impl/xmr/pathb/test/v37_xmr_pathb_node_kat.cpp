@@ -341,6 +341,14 @@ struct PathbNodeTestAccess {
     }
     static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
     static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
+    // A frame parked through the node's own park as a DEFER of `cause` at `row`.
+    static void park(PathbNode& n, std::uint64_t peer, const std::vector<std::uint8_t>& frame, Missing cause, RowId row) {
+        AdmitResult r;
+        r.verdict = AdmitVerdict::Defer;
+        r.row = row;
+        r.missing = cause;
+        n.park(peer, frame, r);
+    }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -7828,6 +7836,85 @@ void catchlocator() {
           "(steps " + std::to_string(b.relay->stats().catchup_steps.load()) + ")");
 }
 
+// sealall: the seal sweep covers every parked carrier frame (E-139 (i); ruling 40 for the boundary), not only those
+// indexed for a re-run. B (journal depth 16) follows A. E, a node of its own, holds A's positions 1..6 and mines
+// E7, E8 and E9 on position 6. B receives E7 once position 6 lies below its journal base: DEFER R4 (OwnChainDeep); then
+// E8: DEFER R4 (ParentUnknown); E9 is parked as a Boundary DEFER at R17 through the node's own park (its admission needs
+// a branch forked more than J_0 below: the admit KAT's section 4). None is in the relay's re-run index. A mines on: once
+// B's record passes the three frames' own bins + F, the tick drops all three without strike.
+void sealall() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.journal_depth = 16; });
+    const std::size_t e = h.add(table0(net), true);
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 47000 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::CarrierBodyV3> eb;  // E7, E8, E9 (on position 6's Monero tip)
+    for (std::uint32_t i = 0; i < 3 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 47100 + i);
+        ok = jb && h[e].on_own_share(*jb, 47100 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(*h[e].bodies().get(h[e].tree().best().id));
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 20 && ok; ++i) {  // position 6 below B's journal base
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 47200 + static_cast<std::uint32_t>(i));
+    }
+    ok = ok && eb.size() == 3 && h[b.node].tree().best().id == h[a.node].tree().best().id && h[b.node].store().base_pos() > 6;
+    if (!ok) {
+        check(false, "sealall: setup (B on A's chain past depth 16, E's branch of three on position 6)");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = w.id(b.node, a.node);
+    const auto r4 = [&rb] {
+        return rb.verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    const std::uint64_t r4_0 = r4();
+    for (std::size_t i = 0; i < 2; ++i) {  // E7 (OwnChainDeep), E8 (ParentUnknown)
+        h.now += 1;
+        rb.receive(pa, *pb::encode_fc_carrier(0, eb[i], 16));
+        w.run();
+    }
+    pb::PathbNodeTestAccess::park(h[b.node], pa, *pb::encode_fc_carrier(0, eb[2], 16), pb::Missing::Boundary, pb::RowId::R17);
+    const std::size_t parked = h[b.node].deferred().size(), indexed = rb.parked_index_size();
+    std::uint64_t lo = UINT64_MAX;
+    for (const pb::CarrierBodyV3& x : eb) lo = std::min(lo, h[b.node].held_origin(x.own.blob.prev_id).value_or(0));
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins, sealed0 = rb.stats().parked_frames_sealed.load();
+    bool kept_open = true;
+    std::uint64_t H = 0;
+    for (std::uint32_t i = 0; i < 200 && h[b.node].deferred().size() != 0; ++i) {
+        h.tick_monero();
+        (void)mine_on(h, w, a.node, i % 5, 47300 + i);
+        h.now += 1;
+        rb.tick();
+        w.run();
+        H = h[b.node].best_record().value_or(0);
+        if (H < lo + F) kept_open = kept_open && h[b.node].deferred().size() == parked;
+    }
+    const std::uint64_t sealed = rb.stats().parked_frames_sealed.load() - sealed0;
+    std::printf("  sealall: R4 DEFERs %llu; parked %zu (indexed %zu); lowest own bin %llu; H %llu; left %zu; sealed %llu\n",
+                (unsigned long long)(r4() - r4_0), parked, indexed, (unsigned long long)lo, (unsigned long long)H,
+                h[b.node].deferred().size(), (unsigned long long)sealed);
+    check(r4() == r4_0 + 2 && parked == 3 && indexed == 0 && lo != 0,
+          "sealall: E7 (OwnChainDeep) and E8 (ParentUnknown) DEFER at R4, E9 parked as a Boundary DEFER; none indexed");
+    check(kept_open && h[b.node].deferred().size() == 0 && sealed == 3 && rb.stats().strikes.load() == 0,
+          "sealall: kept while their bins are open, all three dropped without strike once they seal (sealed " +
+                  std::to_string(sealed) + ")");
+}
+
 // placedcopy: a copy of a carrier B placed, whose parent lies below B's journal base (depth 16), arrives: DEFER R4
 // (OwnChainDeep), counted, no token; it is not parked (the deferred store unchanged).
 void placedcopy() {
@@ -9375,6 +9462,7 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("sealall", sealall);
     run("placedcopy", placedcopy);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
