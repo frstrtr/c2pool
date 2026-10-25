@@ -4750,18 +4750,21 @@ void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify
     m_chain_verify_fns[chain] = std::move(fn);
 }
 
-void MiningInterface::verify_found_block(size_t index)
+void MiningInterface::verify_found_block(const std::string& block_hash)
 {
-    std::string hash;
+    // The row is found by hash under the lock each time it is touched: the
+    // verdict below runs unlocked, and record_found_block re-sorts the list
+    // on every insert, so no index survives from one lock to the next.
+    const std::string hash = block_hash;
     std::string chain;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index >= m_found_blocks.size()) return;
-        auto& blk = m_found_blocks[index];
-        if (blk.status != BlockStatus::pending) return;
-        blk.check_count++;
-        hash = blk.hash;
-        chain = blk.chain;
+        auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+            [&](const FoundBlock& b) { return b.hash == hash; });
+        if (it == m_found_blocks.end()) return;
+        if (it->status != BlockStatus::pending) return;
+        it->check_count++;
+        chain = it->chain;
     }
 
     // Select chain-specific verifier, fall back to default
@@ -4779,20 +4782,10 @@ void MiningInterface::verify_found_block(size_t index)
     try { result = verify_fn(hash); } catch (...) {}
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    // The verdict ran unlocked, and record_found_block re-sorts the list on
-    // every insert: `index` may now name another block. Apply the verdict to
-    // the row it was asked about, found again by its hash.
-    if (index >= m_found_blocks.size() || m_found_blocks[index].hash != hash) {
-        index = m_found_blocks.size();
-        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
-            if (m_found_blocks[i].hash == hash && m_found_blocks[i].chain == chain) {
-                index = i;
-                break;
-            }
-        }
-        if (index >= m_found_blocks.size()) return;
-    }
-    auto& blk = m_found_blocks[index];
+    auto row = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (row == m_found_blocks.end()) return;
+    auto& blk = *row;
     if (blk.status != BlockStatus::pending) return;
 
     const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
@@ -4904,20 +4897,11 @@ void MiningInterface::verify_found_block(size_t index)
 
 int MiningInterface::run_block_verification_now(const std::string& block_hash)
 {
-    size_t idx = SIZE_MAX;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
-            if (m_found_blocks[i].hash == block_hash) { idx = i; break; }
-        }
-    }
-    if (idx == SIZE_MAX) return std::numeric_limits<int>::min();
-
     // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
-    verify_found_block(idx);
+    // It finds the row by hash (an unknown hash is a no-op), and the outcome
+    // is read back by hash too.
+    verify_found_block(block_hash);
 
-    // Read the outcome back by hash: an insert during the verdict re-sorts
-    // the list, so idx may name another row by now.
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
     for (const auto& blk : m_found_blocks) {
         if (blk.hash != block_hash) continue;

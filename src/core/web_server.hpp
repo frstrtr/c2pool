@@ -1780,7 +1780,10 @@ private:
     void augment_with_coin_sync_status(nlohmann::json& result);
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
-    void verify_found_block(size_t index);
+    // One verification pass for the row with this hash. The row is looked up
+    // under m_blocks_mutex each time it is touched, never by a remembered
+    // index: record_found_block re-sorts the list on every insert.
+    void verify_found_block(const std::string& block_hash);
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};
