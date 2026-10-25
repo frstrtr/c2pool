@@ -1325,6 +1325,38 @@ TEST(LtcUtxoOrder, V2RecordGoldenBytes)
     EXPECT_FALSE(t.db->get_block_undo(9, got)) << "and 'U'";
 }
 
+// Upgrade, downgrade, upgrade again: the older binary wrote a legacy record
+// at a height and left the format-2 one there, which then describes an
+// earlier connect and would be read first. The startup sweep drops it.
+TEST(LtcUtxoOrder, StaleFormat2RecordShadowingALegacyOneIsDropped)
+{
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000c7");
+    const BlockType a1 = make_block(g, 1, {});
+    const Outpoint X(compute_txid(a1.m_txs[0]), 0);
+    const BlockType a2 = make_block(hash_of(a1), 2, {spend(X.txid, 0, 4000000000LL, 0x22)});
+    const BlockType a2x = make_block(hash_of(a1), 2, {spend(X.txid, 0, 3000000000LL, 0x23)});
+
+    TempDb t;
+    t.cache->connect_block(a1, 1, txid_fn, hash_of(a1));
+    ASSERT_TRUE(t.db->put_block_undo(2, t.cache->connect_block(a2, 2, txid_fn, hash_of(a2))));
+    // The older binary, after a reorg to a2x: its legacy record, a2's left behind.
+    TempDb other;
+    other.cache->connect_block(a1, 1, txid_fn);
+    ASSERT_TRUE(t.db->put_block_undo_legacy(2, other.cache->connect_block(a2x, 2, txid_fn), false));
+    ASSERT_TRUE(t.db->put_block_undo(5, t.cache->connect_block(make_chain(g, 5, 1, 0x35)[0], 5, txid_fn)));
+
+    core::coin::BlockUndo u;
+    ASSERT_TRUE(t.db->get_block_undo(2, u));
+    EXPECT_EQ(u.format, 2) << "the stale record is read first";
+    EXPECT_EQ(t.db->drop_shadowed_undo(0, 10), 1u);
+    ASSERT_TRUE(t.db->get_block_undo(2, u));
+    EXPECT_EQ(u.format, 1) << "the newer legacy record";
+    EXPECT_TRUE(t.db->get_block_undo(5, u)) << "a format-2 record alone is kept";
+    EXPECT_EQ(u.format, 2);
+    EXPECT_EQ(t.db->drop_shadowed_undo(0, 10), 0u);
+}
+
 // Mainnet 3199539 -> 3199540 (ltc_utxo_undo_fixtures.hpp), against litecoind's
 // own coins: 3199540's HogEx spends 3199539's HogAddr and its tx[4] spends
 // tx[3]:1 of the same block. Connect both over a view seeded with every coin

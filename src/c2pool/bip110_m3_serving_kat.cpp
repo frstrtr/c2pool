@@ -449,7 +449,7 @@ int main() {
             MutableTransaction cbO = mk_tx(h_of(0x00), 0xffffffff, 5000000000);
             MutableTransaction tO  = mk_tx(h_of(0x44), 0, 70000);
             BlockType blkO; blkO.m_txs = { cbO, tO };
-            auto undoO = cache2.connect_block(blkO, 11, txidfn);
+            auto undoO = cache2.connect_block(blkO, 11, txidfn, hashO11);
             db2.put_block_undo(11, undoO);
             cache2.flush(hashO11, 11);
             core::coin::Outpoint CO(compute_txid(tO), 0);
@@ -479,6 +479,20 @@ int main() {
             expect("reorg over a legacy record == UNDO_LEGACY", resL == bip110::coin::ReorgResult::UNDO_LEGACY);
             expect("UNDO_LEGACY: CO still removed", !cache3.get_coin(CO, co));
             expect("UNDO_LEGACY: 0x44:0 not restored", !cache3.get_coin(SO, co));
+
+            // A record bound to another block than the one being rolled back
+            // (O11): never applied, the walk reports UNDO_MISMATCH.
+            std::string p4 = "/tmp/bip110_kat_mismatch_" + std::to_string(::getpid());
+            core::coin::UTXOViewDB db4(p4); db4.open();
+            core::coin::UTXOViewCache cache4(&db4);
+            cache4.add_coin(SO, core::coin::Coin(80000, OPScript{}, 9, false));
+            db4.put_block_undo(11, cache4.connect_block(blkO, 11, txidfn, h_of(0x64)));
+            cache4.flush(hashO11, 11);
+            auto resM = bip110::coin::reorg_disconnect_to_fork(cache4, db4, mock, hashN12, 288);
+            expect("reorg over another block's record == UNDO_MISMATCH",
+                   resM == bip110::coin::ReorgResult::UNDO_MISMATCH);
+            expect("UNDO_MISMATCH: CO untouched", cache4.get_coin(CO, co));
+            expect("UNDO_MISMATCH: 0x44:0 not restored", !cache4.get_coin(SO, co));
         }
     }
 

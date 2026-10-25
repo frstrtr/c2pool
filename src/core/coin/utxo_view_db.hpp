@@ -175,13 +175,36 @@ public:
         return n;
     }
 
-    /// TEST ONLY: write `undo` as a legacy (format 1) record under 'U' and drop
-    /// the format-2 record at the same height, as a node that connected the
-    /// block before format 2 existed would have left it.
-    bool put_block_undo_legacy(uint32_t height, const BlockUndo& undo) {
+    /// Drop every format-2 record in [lo, hi] that sits next to a legacy one
+    /// at the same height. put_block_undo removes the legacy record, so both
+    /// exist only when an older binary ran in between (downgrade, then
+    /// upgrade again): it wrote the legacy record and left the format-2 one,
+    /// which then describes an earlier connect at that height and would be
+    /// read first. Returns how many were dropped (startup).
+    uint32_t drop_shadowed_undo(uint32_t lo, uint32_t hi) {
+        auto batch = m_store.create_batch();
+        uint32_t n = 0;
+        for (uint64_t h = lo; h <= hi; ++h) {
+            const auto height = static_cast<uint32_t>(h);
+            if (m_store.exists(make_legacy_undo_key(height)) && m_store.exists(make_undo_key(height))) {
+                batch.remove(make_undo_key(height));
+                ++n;
+            }
+        }
+        if (n > 0 && !batch.commit())
+            return 0;
+        return n;
+    }
+
+    /// TEST ONLY: write `undo` as a legacy (format 1) record under 'U', as an
+    /// older binary writes it. drop_v2: also drop the format-2 record at the
+    /// same height (a node that connected the block before format 2 existed);
+    /// false leaves it (an older binary run after an upgrade).
+    bool put_block_undo_legacy(uint32_t height, const BlockUndo& undo, bool drop_v2 = true) {
         auto batch = m_store.create_batch();
         batch.put(make_legacy_undo_key(height), serialize_block_undo(undo));
-        batch.remove(make_undo_key(height));
+        if (drop_v2)
+            batch.remove(make_undo_key(height));
         return batch.commit();
     }
 

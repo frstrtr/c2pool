@@ -2024,11 +2024,18 @@ int main(int argc, char* argv[]) {
                                      << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
                             // Undo records written before #2059 cannot restore
                             // spent coins; a reorg reaching one rebuilds the set.
+                            // A format-2 record next to a legacy one is older
+                            // than it (an older binary ran in between): dropped.
                             constexpr uint32_t KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
                             const uint32_t best = ltc_utxo_db->get_best_height();
                             if (best > 0) {
-                                const uint32_t n = ltc_utxo_db->count_legacy_undo(
-                                    best > KEEP ? best - KEEP : 0, best);
+                                const uint32_t lo = best > KEEP ? best - KEEP : 0;
+                                const uint32_t dropped = ltc_utxo_db->drop_shadowed_undo(lo, best);
+                                if (dropped > 0)
+                                    LOG_WARNING << "[EMB-LTC] UTXO: dropped " << dropped << " undo records"
+                                                << " older than the legacy record at their height"
+                                                << " (an older c2pool ran on this data dir)";
+                                const uint32_t n = ltc_utxo_db->count_legacy_undo(lo, best);
                                 if (n > 0)
                                     LOG_INFO << "[EMB-LTC] UTXO: " << n << " legacy undo records (pre-#2059)"
                                              << " within the " << KEEP << "-block window; a reorg reaching"
@@ -6983,7 +6990,7 @@ int main(int argc, char* argv[]) {
                                                     auto& [b, bh] = node.mapped();
                                                     uint32_t h = doge_bs->next_height;
 
-                                                    auto undo = utxo->connect_block(b, h, txid_fn);
+                                                    auto undo = utxo->connect_block(b, h, txid_fn, bh);
                                                     utxo_db->put_block_undo(h, undo);
                                                     utxo->flush(bh, h);
                                                     utxo->prune_undo(h, DOGE_KEEP);
@@ -7064,7 +7071,7 @@ int main(int argc, char* argv[]) {
                                             // 3. Normal processing
                                             if (height > utxo->get_best_height()) {
                                                 auto undo = utxo->connect_block(
-                                                    block, height, txid_fn);
+                                                    block, height, txid_fn, block_hash);
                                                 utxo_db->put_block_undo(height, undo);
                                                 utxo->flush(block_hash, height);
                                                 utxo->prune_undo(height, DOGE_KEEP);
