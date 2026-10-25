@@ -48,11 +48,14 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
+#include <core/param_catalog.hpp>
 #include <core/uint256.hpp>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -100,8 +103,8 @@ std::array<uint8_t, 96> some_sig(uint8_t seed) {
 }
 
 /// A NodeCoinState in which EVERY axis other than bestCL is viable, tipped at
-/// TIP. Any refusal a test sees is therefore attributable to the bestCL gate.
-void make_state(NodeCoinState& st) {
+/// `tip`. Any refusal a test sees is therefore attributable to the bestCL gate.
+void make_state(NodeCoinState& st, uint32_t tip = TIP) {
     MNState s;
     s.isValid = true;
     s.nRegisteredHeight = 2'300'000;
@@ -114,7 +117,7 @@ void make_state(NodeCoinState& st) {
     st.sml().sort();
     st.set_have_sml(true);
     st.set_sml_current_hash(raw256(0xAB));
-    st.set_tip(TIP, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+    st.set_tip(tip, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
                DASH_PUBKEY_VER, DASH_P2SH_VER);
 }
 
@@ -331,9 +334,10 @@ TEST(DashBestClGate, PrevCommittedNullImposesNoConstraint) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// 8. REGRESSION FENCE: the legacy setter and the default posture are
-//    byte-unchanged. set_require_fresh_bestcl(true) must still mean the
-//    freshness proxy — nobody gets consensus-exact by upgrading.
+// 8. REGRESSION FENCE: the legacy setter is byte-unchanged.
+//    set_require_fresh_bestcl(true) must still mean the freshness proxy, and a
+//    bare NodeCoinState runs no gate. (The NODE default is ConsensusExact —
+//    case 10 — installed through resolve_bestcl_policy(), not this setter.)
 // ════════════════════════════════════════════════════════════════════════
 TEST(DashBestClGate, LegacySetterStillSelectsFreshnessAndOffIsOff) {
     NodeCoinState st;
@@ -392,4 +396,118 @@ TEST(DashBestClGate, TipCbtxChainLockIsMonotonic) {
     st.set_best_cl(2'515'885, some_sig(0x88), ClProvenance::ChainCommitted);
     EXPECT_TRUE(st.make_embedded_work_inputs().viable())
         << "decline was: " << cause_of(st);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 10. THE NODE DEFAULT IS CONSENSUS-EXACT, and freshness stays selectable as
+//     the rollback. Pinned on every surface that names a default: the policy
+//     constant, the CLI parser, the resolver main_dash installs, the param
+//     catalog row, and main_dash's own initializers.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashBestClGate, DefaultPolicyIsConsensusExact) {
+    using dash::coin::kDefaultBestClPolicy;
+    using dash::coin::bestcl_policy_name;
+    using dash::coin::parse_bestcl_policy;
+    using dash::coin::resolve_bestcl_policy;
+
+    EXPECT_EQ(BestClPolicy::ConsensusExact, kDefaultBestClPolicy);
+    const std::string def = bestcl_policy_name(kDefaultBestClPolicy);
+    EXPECT_EQ("consensus-exact", def);
+
+    // What main_dash installs for a node launched without --bestcl-policy.
+    EXPECT_EQ(BestClPolicy::ConsensusExact, resolve_bestcl_policy(true, def));
+    // No embedded arm => no gate, whatever the flag says.
+    EXPECT_EQ(BestClPolicy::Off, resolve_bestcl_policy(false, def));
+    EXPECT_EQ(BestClPolicy::Off, resolve_bestcl_policy(false, "freshness"));
+
+    // The rollback is one flag away and means exactly the old proxy.
+    ASSERT_TRUE(parse_bestcl_policy("freshness").has_value());
+    EXPECT_EQ(BestClPolicy::Freshness, *parse_bestcl_policy("freshness"));
+    EXPECT_EQ(BestClPolicy::Freshness, resolve_bestcl_policy(true, "freshness"));
+    ASSERT_TRUE(parse_bestcl_policy("consensus-exact").has_value());
+    EXPECT_EQ(BestClPolicy::ConsensusExact,
+              *parse_bestcl_policy("consensus-exact"));
+
+    // Nothing else parses: the CLI refuses these instead of guessing a gate.
+    for (const char* bad : {"", "off", "Freshness", "consensus_exact", "exact",
+                            "freshness ", "none"})
+        EXPECT_FALSE(parse_bestcl_policy(bad).has_value()) << "'" << bad << "'";
+
+    // The param catalog states the same default (the settings / config
+    // surfaces publish this literal).
+    const auto* row = c2pool::catalog::find_by_canon("embedded.bestcl_policy");
+    ASSERT_NE(nullptr, row);
+    EXPECT_EQ(def, row->default_literal);
+    EXPECT_EQ(row, c2pool::catalog::find_by_alias(c2pool::catalog::Bin::BIN_DASH,
+                                                  "--bestcl-policy"));
+
+    // main_dash.cpp initialises both of its defaults (the CLI local and
+    // run_node's parameter) from the constant, never from a literal that could
+    // drift from it.
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf;
+    buf << in.rdbuf();
+    std::string code;
+    std::istringstream lines(buf.str());
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    std::size_t sites = 0;
+    for (const char* decl : {"std::string& bestcl_policy =",
+                             "std::string bestcl_policy ="}) {
+        for (std::size_t at = code.find(decl); at != std::string::npos;
+             at = code.find(decl, at + 1)) {
+            const std::string init = code.substr(at, 160);
+            EXPECT_NE(std::string::npos,
+                      init.find("bestcl_policy_name(dash::coin::kDefaultBestClPolicy)"))
+                << "default initializer does not use kDefaultBestClPolicy: " << init;
+            ++sites;
+        }
+    }
+    EXPECT_EQ(2u, sites) << "the CLI local and run_node's parameter";
+    EXPECT_EQ(std::string::npos, code.find("bestcl_policy = \"freshness\""));
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 11. THE 2026-10-25 INCIDENT, replayed against the default policy.
+//
+//     Blocks 2561315..2561318 carried no ChainLock. The last ChainLock was at
+//     2561314, and every block after it re-committed that signature in its
+//     coinbase (dashd's miner: "Our best CL isn't newer: inserting CL from
+//     previous block"). Building on 2561316 the node held best CL 2561314,
+//     prev_h - best_cl = 2: the freshness proxy declined, the daemonless node
+//     had no fallback, no template went out for 376 s, and the block the
+//     miners found on the old job (2561316) was orphaned.
+//
+//     Under the default, with block H-1's committed ChainLock in hand, every
+//     one of those templates is viable — and is exactly what dashd built.
+// ════════════════════════════════════════════════════════════════════════
+TEST(DashBestClGate, IncidentStaleChainLockIsViableUnderTheDefault) {
+    constexpr int32_t LAST_CL = 2'561'314;
+
+    for (uint32_t prev : {2'561'316u, 2'561'317u, 2'561'318u}) {
+        NodeCoinState st;
+        make_state(st, prev);
+        // Block `prev` committed the ChainLock at LAST_CL, and that very
+        // signature is what we hold (read out of its coinbase).
+        st.set_tip_cbtx_chainlock(static_cast<int32_t>(prev), /*has_sig=*/true,
+                                  LAST_CL);
+        st.set_best_cl(LAST_CL, some_sig(0x99), ClProvenance::ChainCommitted);
+        ASSERT_GE(static_cast<int32_t>(prev) - LAST_CL, 2) << "a stale best CL";
+
+        // The node's default, installed the way main_dash installs it.
+        st.set_bestcl_policy(dash::coin::resolve_bestcl_policy(
+            true, dash::coin::bestcl_policy_name(dash::coin::kDefaultBestClPolicy)));
+        EXPECT_EQ(BestClPolicy::ConsensusExact, st.bestcl_policy());
+        EXPECT_TRUE(st.make_embedded_work_inputs().viable())
+            << "prev=" << prev << " decline was: " << cause_of(st);
+        EXPECT_FALSE(st.bestcl_decline().has_value()) << "prev=" << prev;
+
+        // The rollback still declines it, exactly as on the incident day.
+        st.set_bestcl_policy(dash::coin::resolve_bestcl_policy(true, "freshness"));
+        EXPECT_FALSE(st.make_embedded_work_inputs().viable()) << "prev=" << prev;
+        EXPECT_EQ("bestcl-stale", cause_of(st)) << "prev=" << prev;
+    }
 }

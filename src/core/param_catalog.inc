@@ -679,7 +679,7 @@ C2P_PARAM("embedded.oracle_graduation_blocks", Embedded, INT64, LIVE, C_DASH, LI
 C2P_PARAM("embedded.oracle_class_coverage", Embedded, INT64, LIVE, C_DASH, LIT, "20", NONE, "oracle class coverage")
   C2P_ALIAS("embedded.oracle_class_coverage", BIN_DASH, "--oracle-class-coverage", VALUE)
 
-C2P_PARAM("embedded.bestcl_policy", Embedded, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "freshness", ENUM_MEMBER, "bestCL policy freshness|consensus-exact")
+C2P_PARAM("embedded.bestcl_policy", Embedded, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "consensus-exact", ENUM_MEMBER, "bestCL policy consensus-exact|freshness")
   C2P_ALIAS("embedded.bestcl_policy", BIN_DASH, "--bestcl-policy", VALUE)
 
 C2P_PARAM("embedded.serve_gate_state_file", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "cross-restart serve-gate accounting file")

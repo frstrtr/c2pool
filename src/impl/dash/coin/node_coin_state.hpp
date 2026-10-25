@@ -76,10 +76,62 @@ enum class ClProvenance { Unknown, ChainCommitted, BlsVerified };
 ///
 ///  - Off             : no bestCL gate (pre-#780 behaviour).
 ///  - Freshness       : the ORIGINAL proxy — require the best observed ChainLock
-///                      to be within one block of the tip. Conservative,
-///                      over-restrictive, and the DEFAULT when the gate is on.
-///  - ConsensusExact  : require exactly what dashcore requires, no more.
+///                      to be within one block of the tip. Over-restrictive;
+///                      kept selectable (--bestcl-policy freshness) as the
+///                      rollback.
+///  - ConsensusExact  : require exactly what dashcore requires, no more. The
+///                      node DEFAULT (kDefaultBestClPolicy).
 enum class BestClPolicy { Off, Freshness, ConsensusExact };
+
+/// The policy a node runs when its embedded arm is armed and --bestcl-policy
+/// is not given.
+///
+/// ConsensusExact, under the operator's C4 rule (2026-08-08): a consensus-exact
+/// check may change served bytes unflagged. It refuses only what dashcore's
+/// CheckCbTxBestChainlock would refuse; Freshness is a stricter proxy that
+/// dashd itself never applies.
+///
+/// THE INCIDENT THAT MOVED THE DEFAULT (DASH mainnet, 2026-10-25). Blocks
+/// 2561315..2561318 carried no ChainLock. Under Freshness the gate declined
+/// every template for 376 s; the node is daemonless, so nothing else served,
+/// and the miners kept hashing the last job. They found 2561316 on a parent
+/// the network had already left, and it was orphaned. Under ConsensusExact the
+/// node re-commits block H-1's ChainLock, as dashd's own miner does, and keeps
+/// serving.
+inline constexpr BestClPolicy kDefaultBestClPolicy = BestClPolicy::ConsensusExact;
+
+/// The --bestcl-policy spelling of a policy. "off" is printed for Off but is
+/// not a selectable value: Off is what a node without an embedded arm runs.
+constexpr const char* bestcl_policy_name(BestClPolicy p)
+{
+    switch (p) {
+    case BestClPolicy::Freshness:      return "freshness";
+    case BestClPolicy::ConsensusExact: return "consensus-exact";
+    default:                           return "off";
+    }
+}
+
+/// Parse a --bestcl-policy value. nullopt for anything that is not a
+/// selectable policy; the node refuses to start on it rather than guess.
+inline std::optional<BestClPolicy> parse_bestcl_policy(const std::string& s)
+{
+    if (s == bestcl_policy_name(BestClPolicy::ConsensusExact))
+        return BestClPolicy::ConsensusExact;
+    if (s == bestcl_policy_name(BestClPolicy::Freshness))
+        return BestClPolicy::Freshness;
+    return std::nullopt;
+}
+
+/// The policy a node installs on its NodeCoinState. Off without an embedded
+/// arm (work_source never consults viability then); otherwise the
+/// --bestcl-policy value, and the default for a value that does not parse
+/// (unreachable from the CLI, which refuses one).
+inline BestClPolicy resolve_bestcl_policy(bool embedded_arm_enabled,
+                                          const std::string& flag)
+{
+    if (!embedded_arm_enabled) return BestClPolicy::Off;
+    return parse_bestcl_policy(flag).value_or(kDefaultBestClPolicy);
+}
 
 /// What the embedded arm does while the UTXO/fee lane is below its maturity
 /// depth (UtxoLane::mining_utxo_ready == false, i.e. blocks_connected < 106).
@@ -1074,16 +1126,18 @@ public:
     /// ⚠ THE FRESHNESS PREDICATE IS A PROXY, AND IT IS EXPENSIVE. See
     /// set_bestcl_policy() for the consensus-exact replacement and the measured
     /// cost of keeping this one. This setter is retained verbatim: it selects
-    /// BestClPolicy::Freshness, which stays the default, so every existing
-    /// caller and KAT keeps byte-identical behaviour.
+    /// BestClPolicy::Freshness, so every existing caller and KAT keeps
+    /// byte-identical behaviour. The node no longer calls it; it installs
+    /// resolve_bestcl_policy(), whose default is ConsensusExact.
     void set_require_fresh_bestcl(bool v) {
         m_require_fresh_bestcl = v;
         m_bestcl_policy = v ? BestClPolicy::Freshness : BestClPolicy::Off;
     }
 
-    /// Select the bestCL gate policy. `Freshness` (the default whenever the
-    /// gate is enabled) is the original #780 BLOCKER-2 proxy. `ConsensusExact`
-    /// enforces dashcore's ACTUAL rule and nothing more.
+    /// Select the bestCL gate policy. `Freshness` is the original #780
+    /// BLOCKER-2 proxy, kept as the rollback. `ConsensusExact` enforces
+    /// dashcore's ACTUAL rule and nothing more, and is the node default
+    /// (kDefaultBestClPolicy, with the incident that made it so).
     ///
     /// WHY THE PROXY IS WRONG (and it is a proxy — its own docs above call it
     /// "a sufficient condition"). dashcore constrains the committed ChainLock
@@ -2232,7 +2286,7 @@ private:
     // unset => capability absent => every non-null commitment refused.
     std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
-    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // Freshness stays the default when enabled
+    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // the node installs resolve_bestcl_policy() (default ConsensusExact)
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
     // #996: fail-CLOSED default -- reads only mnstates (always present), needs

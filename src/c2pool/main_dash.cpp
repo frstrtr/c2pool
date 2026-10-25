@@ -548,7 +548,7 @@ void print_banner(const char* argv0)
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
-        << "           [--bestcl-policy freshness|consensus-exact]\n"
+        << "           [--bestcl-policy consensus-exact|freshness]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
         << "           [--serve-staleness-sentinel=off]\n"
@@ -601,16 +601,17 @@ void print_banner(const char* argv0)
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
-        << "        --bestcl-policy selects HOW the bestCL gate decides. `freshness`\n"
-        << "        (DEFAULT) keeps the conservative proxy: refuse unless the best\n"
-        << "        observed ChainLock is within one block of the tip. `consensus-exact`\n"
-        << "        enforces dashcore CheckCbTxBestChainlock itself -- the committed\n"
-        << "        ChainLock must merely be non-null and NOT OLDER than the one the\n"
-        << "        previous block committed -- which is what dashd's own miner does\n"
-        << "        (it re-commits the previous block's signature when it holds nothing\n"
-        << "        fresher). Still fails closed: it refuses unless the previous block's\n"
+        << "        --bestcl-policy selects HOW the bestCL gate decides.\n"
+        << "        `consensus-exact` (DEFAULT) enforces dashcore CheckCbTxBestChainlock\n"
+        << "        itself -- the committed ChainLock must merely be non-null and NOT\n"
+        << "        OLDER than the one the previous block committed -- which is what\n"
+        << "        dashd's own miner does (it re-commits the previous block's signature\n"
+        << "        when it holds nothing fresher), so a ChainLock stall does not stop\n"
+        << "        serving. Still fails closed: it refuses unless the previous block's\n"
         << "        own committed ChainLock is held, and a value ADVANCED past it must\n"
-        << "        have passed local BLS verification.\n"
+        << "        have passed local BLS verification. `freshness` is the rollback:\n"
+        << "        the stricter proxy that refuses unless the best observed ChainLock\n"
+        << "        is within one block of the tip (dashd applies no such rule).\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -959,7 +960,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // geometrically in this number (see p2p_client.hpp).
              std::size_t coin_p2p_peers =
                  dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS,
-             const std::string& bestcl_policy = "freshness",
+             const std::string& bestcl_policy =
+                 dash::coin::bestcl_policy_name(dash::coin::kDefaultBestClPolicy),
              // --embedded-utxo-immature-serve-empty: pure-daemonless OPT-IN --
              // during the blocks_connected<106 window serve a coinbase-only
              // (empty mempool tx set) template: consensus-valid, fees exactly 0,
@@ -6940,26 +6942,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // --embedded-mainnet); harmless otherwise (the arm is off, work_source
         // never consults viability).
         //
-        // POLICY SELECTION (--bestcl-policy, DEFAULT freshness = unchanged).
+        // POLICY SELECTION (--bestcl-policy, DEFAULT consensus-exact).
         // The freshness predicate is a PROXY: dashcore constrains the committed
         // ChainLock only relative to what the PREVIOUS BLOCK committed, never
         // against the tip or wall-clock recency (dash v23.1.7
         // src/evo/specialtxman.cpp:129-141). `consensus-exact` enforces that
-        // real rule instead — see NodeCoinState::set_bestcl_policy. Kept as a
-        // runtime flag, not a rebuild, so the conservative posture is one
-        // restart away if a soak ever disagrees.
-        if (!run_arm.embedded_arm_enabled) {
-            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Off);
-        } else if (bestcl_policy == "consensus-exact") {
-            node_coin_state.set_bestcl_policy(
-                dash::coin::BestClPolicy::ConsensusExact);
-            LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
-                        " (dashcore CheckCbTxBestChainlock rule; requires the"
-                        " tip block's own committed ChainLock)";
-        } else {
-            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Freshness);
-            LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
-                        " (conservative proxy: best CL within one block of tip)";
+        // real rule instead — see NodeCoinState::set_bestcl_policy — and is the
+        // default (dash::coin::kDefaultBestClPolicy records the 2026-10-25
+        // orphan that made it so). Kept as a runtime flag, not a rebuild, so
+        // the freshness rollback is one restart away.
+        {
+            const auto bcl = dash::coin::resolve_bestcl_policy(
+                run_arm.embedded_arm_enabled, bestcl_policy);
+            node_coin_state.set_bestcl_policy(bcl);
+            if (bcl == dash::coin::BestClPolicy::ConsensusExact)
+                LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
+                            " (dashcore CheckCbTxBestChainlock rule; requires the"
+                            " tip block's own committed ChainLock)";
+            else if (bcl == dash::coin::BestClPolicy::Freshness)
+                LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
+                            " (rollback proxy: best CL within one block of tip)";
         }
 
         // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
@@ -11734,7 +11736,10 @@ int main(int argc, char** argv)
     // rotation. DEFAULT OFF — the coin client keeps its stall-only rotation,
     // byte-identical to master.
     bool embedded_proactive_rotate = false;
-    std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
+    // --bestcl-policy: consensus-exact (default, dashcore's actual
+    // CheckCbTxBestChainlock rule) | freshness (rollback, the stricter proxy).
+    std::string bestcl_policy =
+        dash::coin::bestcl_policy_name(dash::coin::kDefaultBestClPolicy);
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
     // Serve-staleness sentinel (2026-08-07 dead-height incident): DEFAULT ON.
@@ -12031,8 +12036,16 @@ int main(int argc, char** argv)
             replay_utxo_hash = true;
         else if (std::strcmp(argv[i], "--replay-utxo-expect") == 0 && i + 1 < argc)
             replay_utxo_expect = argv[++i];
-        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc) {
             bestcl_policy = argv[++i];
+            // Refuse a value we do not know rather than guess a policy: a
+            // typo must not silently select either gate.
+            if (!dash::coin::parse_bestcl_policy(bestcl_policy)) {
+                std::cerr << "error: --bestcl-policy expects consensus-exact or"
+                             " freshness, got '" << bestcl_policy << "'\n";
+                return 1;
+            }
+        }
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
         // Cross-restart cumulative serve-gate accounting (#127 follow-up):
