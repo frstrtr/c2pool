@@ -1157,8 +1157,9 @@ int main(int argc, char** argv) {
         const auto acc = dash::address_acceptance(/*testnet=*/cfg.network != BtcNetwork::Mainnet, /*regtest=*/false);
         ws->set_payout_acceptance(acc.p2pkh_versions, acc.p2sh_versions, acc.bech32_hrps);
     }
-    ws->set_on_found_block_fn([](uint32_t h, const uint256& bh, const std::string& miner, bool reached) {
-        LOG_INFO << "[v37-dash] v36-found " << bh.GetHex() << " template-h~=" << h << " by " << miner
+    ws->set_on_found_block_fn([](uint32_t h, const uint256& bh, const std::string& miner, bool reached,
+                                 uint64_t /*subsidy*/) {
+        LOG_INFO << "[v37-dash] v36-found " << bh.GetHex() << " h=" << h << " by " << miner
                  << (reached ? " (reached network)" : " (NOT delivered)");   // telemetry only; registration is in submit_fn
     });
     // ── A2 SEND-SIDE: every own stratum win (share arm AND block arm) -> carrier ──

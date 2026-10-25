@@ -4268,24 +4268,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Display only; the callback runs after dispatch, never gates it.
             work_source->set_on_found_block_fn(
                 [ws](uint32_t height, const uint256& block_hash,
-                     const std::string& miner, bool reached_network) {
+                     const std::string& miner, bool reached_network,
+                     uint64_t subsidy) {
                     auto* mi = ws->get_mining_interface();
-                    // Subsidy: the WebServer-held template is empty on the
-                    // embedded arm (row 2516914 recorded subsidy=0 from it on
-                    // 2026-08-05); record_found_block now falls back to the
-                    // live coin template itself, so 0 here means "let the
-                    // core ask the template". Same for pool hashrate: this
-                    // site passed get_local_hashrate() into a field named
-                    // pool_hashrate_at_find — correct only while every rig
-                    // in the pool happens to sit on this node. 0 routes the
-                    // core to m_pool_hashrate_fn (the real pool estimator),
-                    // which is the rate expected_time/luck are defined over.
-                    uint64_t subsidy = 0;
-                    {
-                        auto tmpl = mi->get_current_work_template();
-                        if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
-                            subsidy = tmpl["coinbasevalue"].get<uint64_t>();
-                    }
+                    // Height and subsidy are the JOB's (the block's own BIP34
+                    // height and the coinbasevalue frozen with the job), not
+                    // the current template's: block 2561316 was solved on a
+                    // stale job on 2026-10-25 and recorded at h=0 with the
+                    // then-current template's subsidy. A 0 subsidy still lets
+                    // record_found_block fall back to the live coin template.
+                    // Pool hashrate: this site passed get_local_hashrate()
+                    // into a field named pool_hashrate_at_find — correct only
+                    // while every rig in the pool happens to sit on this node.
+                    // 0 routes the core to m_pool_hashrate_fn (the real pool
+                    // estimator), which is the rate expected_time/luck are
+                    // defined over.
                     mi->record_found_block(
                         height, block_hash,
                         static_cast<uint64_t>(std::time(nullptr)),

@@ -18,6 +18,8 @@
 #include <impl/dash/stratum/work_source.hpp>
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
+#include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (stale-job block height)
+#include <impl/dash/coin/block_confirm.hpp>         // resolve_status (confirm/orphan verdict)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, be_hex_u32
 #include <impl/dash/coin/block_producer.hpp>  // coinbase_txid, compute_merkle_root, serialize_header80, target_from_nbits
 #include <impl/dash/coin/zmq_tip_notify.hpp>  // dash::coin::TipHashDedup, zmq_hashblock_frame_to_hex (ZMQ hashblock instant tip-notify)
@@ -48,8 +50,10 @@
 #include <functional>
 #include <sstream>
 #include <stdexcept>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -1708,6 +1712,205 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsSubmittedAsHeightRace)
     EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
     EXPECT_TRUE(rig.fx.submit_called);        // ...and the race block IS dispatched
     EXPECT_TRUE(rig.fx.submit_height_race);   // ...flagged HeightRace -> RPC-first dispatch
+}
+
+// ── A block solved on a STALE job is recorded at the JOB's height ───────────
+//
+// 2026-10-25 18:52:21Z, private DASH v36 primary: the --bestcl-policy freshness
+// gate declined new templates for 376 s, the rigs kept the last job (prev =
+// 2561315) and solved it while the network was at 2561318. The won-block arm
+// took the height from cached_work() -- empty at that moment -- so the node
+// logged height~=0, stored the /recent_blocks row at height 0, the confirm lane
+// asked which block won height 0 and left the row pending forever, and the
+// hashrate chart drew it as a green "Block Found!" with Height "?". The reserve
+// read the height from the block's own coinbase (BIP34) and got 2561316 /
+// orphaned. These KATs pin the finder's stratum arm to the same answer.
+
+namespace {
+
+// Won-block rig: trivial block target, nonce mined in-test (as above).
+uint32_t won_nonce(SubmitRig& rig)
+{
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    return rig.find_nonce([&](const uint256& pow) { return pow <= block_target; });
+}
+
+struct FoundCapture {
+    bool     called = false;
+    uint32_t height = 0;
+    uint64_t subsidy = 0;
+    uint256  hash;
+};
+
+void capture_found(SubmitRig& rig, FoundCapture& out)
+{
+    rig.ws->set_on_found_block_fn(
+        [&out](uint32_t height, const uint256& block_hash, const std::string&,
+               bool, uint64_t subsidy) {
+            out.called  = true;
+            out.height  = height;
+            out.subsidy = subsidy;
+            out.hash    = block_hash;
+        });
+}
+
+}  // namespace
+
+// The job's height and subsidy, not the cache's, when the cached template has
+// moved on to the next height between job issue and the solve.
+TEST(DashStratumWorkSource, WonBlockOnMovedTemplateRecordsTheJobsHeight)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+    FoundCapture found;
+    capture_found(rig, found);
+
+    rig.fx.fallback_work = rotated_work();      // cache moves to h=424243
+    rig.fx.fallback_work.m_coinbase_value = kCoinbaseValue + 5555;
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u)
+        << "the broadcaster must be told the block's own height, not the cache's";
+    ASSERT_TRUE(found.called);
+    EXPECT_EQ(found.height, 424242u)
+        << "the dashboard record must carry the job's height (cache is at 424243)";
+    EXPECT_EQ(found.subsidy, kCoinbaseValue)
+        << "the record must carry the job's frozen subsidy, not the cache's";
+    EXPECT_EQ(found.hash, rig.pow_for(nonce));
+}
+
+// The incident shape: nothing cached at all when the solve arrives (the serve
+// gate declining, a set-gap). Before the fix the height was 0.
+TEST(DashStratumWorkSource, WonBlockOnEmptyCacheRecordsTheJobsHeight)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+    FoundCapture found;
+    capture_found(rig, found);
+
+    rig.fx.fallback_work = dash::coin::DashWorkData{};   // set-gap: no template
+    rig.ws->invalidate_template_cache("kat: serve gate declining");
+    ASSERT_TRUE(rig.ws->get_current_work_template().empty())
+        << "precondition: the cache must be empty when the solve arrives";
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+    ASSERT_TRUE(found.called);
+    EXPECT_EQ(found.height, 424242u) << "an empty cache must not record height 0";
+    EXPECT_EQ(found.subsidy, kCoinbaseValue);
+}
+
+// End to end, the way main_dash wires it: the stale-job block lands in
+// /recent_blocks at its real height, the confirm/orphan lane (the daemonless
+// resolve_status verdict main_dash arms) sees a different block on the best
+// chain at that height and flips the row to orphaned, and the row the
+// dashboard's hashrate chart reads carries that height and status.
+TEST(DashStratumWorkSource, StaleJobBlockResolvesOrphanedOnTheDashboard)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+
+    core::MiningInterface mi(/*testnet=*/false, nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+    // An earlier block of ours, so the stale one is not the pool's first.
+    uint256 earlier;
+    earlier.SetHex("00000000000000aa000000000000000000000000000000000000000000000001");
+    mi.record_found_block(424100, earlier, 1751000000u, "DASH", "XfixtureMinerAddress",
+                          earlier.GetHex(), 1.0, 0.0, 0.0, kCoinbaseValue,
+                          core::MiningInterface::BlockAuthorship::this_node);
+
+    rig.ws->set_on_found_block_fn(
+        [&mi](uint32_t height, const uint256& block_hash, const std::string& miner,
+              bool, uint64_t subsidy) {
+            mi.record_found_block(height, block_hash, 1751000600u, "DASH", miner,
+                                  block_hash.GetHex(), 1.0, 0.0, 0.0, subsidy,
+                                  core::MiningInterface::BlockAuthorship::this_node);
+        });
+
+    rig.fx.fallback_work = dash::coin::DashWorkData{};   // the incident: no template
+    rig.ws->invalidate_template_cache("kat: serve gate declining");
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    ASSERT_TRUE(result.get<bool>());
+    const uint256 ours = rig.pow_for(nonce);
+
+    // The network moved on: a competitor holds 424242 and the tip is 424245.
+    uint256 competitor;
+    competitor.SetHex("00000000000000bb000000000000000000000000000000000000000000000002");
+    std::map<uint32_t, uint256> best = {{424242u, competitor}};
+    const uint32_t tip = 424245u;
+    mi.set_block_verify_fn([&mi, &best, tip](const std::string& hash_hex) -> int {
+        uint256 h; h.SetHex(hash_hex);
+        uint32_t found_height = 0;
+        for (const auto& b : mi.get_found_blocks())
+            if (b.hash == hash_hex) { found_height = static_cast<uint32_t>(b.height); break; }
+        return dash::coin::block_confirm::resolve_status(
+            [&best](uint32_t hh) -> std::optional<uint256> {
+                auto it = best.find(hh);
+                if (it == best.end()) return std::nullopt;
+                return it->second;
+            },
+            tip, h, found_height);
+    });
+    EXPECT_LT(mi.run_block_verification_now(ours.GetHex()), 0)
+        << "a block replaced at its height must resolve orphaned, not stay pending";
+
+    nlohmann::json row;
+    for (const auto& b : mi.rest_recent_blocks())
+        if (b.value("hash", "") == ours.GetHex()) row = b;
+    ASSERT_TRUE(row.is_object()) << "the stale-job block must be in /recent_blocks";
+    EXPECT_EQ(row["height"].get<uint64_t>(), 424242u);
+    EXPECT_EQ(row["number"].get<uint64_t>(), 424242u);
+    EXPECT_EQ(row["status"].get<std::string>(), "orphaned");
+    EXPECT_EQ(row["subsidy"].get<uint64_t>(), kCoinbaseValue);
+    EXPECT_NE(row["luck_method"].get<std::string>(), "first_block");
+    // Newest first by height: the stale block heads the list the table shows.
+    EXPECT_EQ(mi.rest_recent_blocks()[0].value("hash", ""), ours.GetHex());
+}
+
+// The pure derivation behind the three KATs above.
+TEST(DashWonBlockRecord, HeightComesFromTheCoinbaseBip34Push)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const auto coinbase = reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2);
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(coinbase), 424242u);
+
+    // A mainnet-scale height round-trips through the real coinbase builder.
+    Fixture fx(true);
+    fx.fallback_work.m_height = 2561316u;
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(
+                  reassemble(cbr.coinb1, "00000000", "00000000", cbr.coinb2)),
+              2561316u);
+
+    // The cache is consulted only when it IS the job's template.
+    const auto moved = rotated_work();
+    const auto same  = rich_work();
+    EXPECT_EQ(dash::stratum::won_block_height(coinbase, kPrevHashHex, &moved), 424242u);
+    EXPECT_EQ(dash::stratum::won_block_height(coinbase, kPrevHashHex, nullptr), 424242u);
+    const std::vector<unsigned char> garbage = {0x01, 0x02, 0x03};
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(garbage), 0u);
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, &same), 424242u);
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, &moved), 0u)
+        << "another height's template must never stand in for the job's";
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, nullptr), 0u);
+    EXPECT_TRUE(dash::stratum::template_is_jobs(&same, kPrevHashHex));
+    EXPECT_FALSE(dash::stratum::template_is_jobs(&moved, kPrevHashHex));
+    EXPECT_FALSE(dash::stratum::template_is_jobs(nullptr, kPrevHashHex));
 }
 
 // ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
