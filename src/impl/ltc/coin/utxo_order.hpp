@@ -19,7 +19,6 @@
 
 #include <core/coin/block_bootstrapper.hpp>
 #include <core/coin/utxo.hpp>
-#include <core/log.hpp>
 #include <core/uint256.hpp>
 
 #include <algorithm>
@@ -315,7 +314,8 @@ RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uin
 /// binds a record to its block with a checksum over pprev's hash,
 /// validation.cpp:1676-1678, 1872 — a record without a hash is unbound) and be
 /// able to put its spent coins back; then the block is disconnected. A record
-/// that cannot bring the set back touches nothing.
+/// that cannot bring the set back touches nothing (the caller logs the reason
+/// with the height, once).
 template <typename UndoDbT, typename UtxoT>
 RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, const uint256& hash)
 {
@@ -325,11 +325,8 @@ RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, con
         return Why::NoUndo;
     if (!undo.block_hash.IsNull() && undo.block_hash != hash)
         return Why::BlockMismatch;
-    if (!undo.restorable()) {
-        LOG_ERROR << "[UTXO] legacy undo record (pre-#2059) at h=" << h << ": "
-                  << undo.unrestorable_coins() << " spent coin(s) cannot be restored";
+    if (!undo.restorable())
         return Why::Legacy;
-    }
     if (!utxo.disconnect_from_undo(undo))
         return Why::Legacy;
     return Why::None;

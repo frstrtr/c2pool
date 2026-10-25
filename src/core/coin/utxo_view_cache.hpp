@@ -388,9 +388,15 @@ private:
     // block created ends absent even when a later tx of the same block spent
     // it (restored in pass 1, removed in pass 2; remove-then-restore would
     // resurrect it). As in Core, restoring over an existing coin and removing
-    // an output that is not there make the disconnect unclean: logged, not
-    // fatal. A coin recorded as unknown (not in the view at connect, e.g. a
-    // partial view after a jump start) has nothing to restore.
+    // an output that is not there make the disconnect unclean: an ERROR (it
+    // means the set and the record disagree), but the disconnect completes.
+    // Core's DisconnectTip refuses an unclean result, discarding its scratch
+    // view; this cache has no scratch view, and Core's own replay rollback
+    // (ReplayBlocks, validation.cpp:4568-4576) keeps going on an unclean
+    // result because writing and deleting a coin are idempotent: the result is
+    // still the set with the block's effects undone. A coin recorded as
+    // unknown (not in the view at connect, e.g. a partial view after a jump
+    // start) has nothing to restore.
     void disconnect_locked(const BlockUndo& undo) {
         size_t unknown = 0, overwrite = 0, missing = 0;
         // Pass 1 — restore spent inputs: txs in reverse, inputs in reverse
@@ -417,7 +423,7 @@ private:
             m_cache[op] = std::nullopt;
         }
         if (overwrite || missing) {
-            LOG_WARNING << "[UTXO] unclean disconnect: " << overwrite
+            LOG_ERROR << "[UTXO] unclean disconnect: " << overwrite
                         << " restored coin(s) overwrote an existing coin, " << missing
                         << " added output(s) were already gone";
         }
