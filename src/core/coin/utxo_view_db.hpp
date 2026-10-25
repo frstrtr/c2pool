@@ -8,7 +8,11 @@
 /// Key schema:
 ///   'C' + txid(32B) + index(4B LE)  →  serialized Coin
 ///   'B'                              →  best_block_hash(32B) + height(4B LE)
-///   'U' + height(4B BE)             →  serialized BlockUndo
+///   'U' + height(4B BE)             →  BlockUndo format 1 (legacy, read-only:
+///                                       no outpoints, cannot restore spent
+///                                       coins; removed by a put at the same
+///                                       height, aged out by prune_undo)
+///   'R' + height(4B BE)             →  BlockUndo format 2 (serialize_block_undo_v2)
 ///   'F' + height(4B BE)             →  raw serialized full block (explorer)
 ///
 /// Reference: Litecoin Core txdb.h CCoinsViewDB
@@ -121,26 +125,64 @@ public:
 
     // ── Block undo data ─────────────────────────────────────────────────
 
-    /// Store undo data for a block at given height.
+    /// Store undo data for a block at given height ('R', format 2). The legacy
+    /// 'U' record at the same height goes in the same batch, so a reconnect at
+    /// h never leaves a stale legacy record behind. False (nothing written) for
+    /// a record without outpoints.
     bool put_block_undo(uint32_t height, const BlockUndo& undo) {
-        auto key = make_undo_key(height);
-        auto data = serialize_block_undo(undo);
-        return m_store.put(key, data);
+        auto data = serialize_block_undo_v2(undo);
+        if (data.empty()) {
+            LOG_ERROR << "[UTXO-DB] undo record at h=" << height
+                      << " has no outpoints; not written";
+            return false;
+        }
+        auto batch = m_store.create_batch();
+        batch.put(make_undo_key(height), data);
+        batch.remove(make_legacy_undo_key(height));
+        return batch.commit();
     }
 
-    /// Retrieve undo data for a block at given height.
+    /// Retrieve undo data for a block at given height: the format-2 record, else
+    /// a legacy one (format = 1, no outpoints: BlockUndo::restorable() tells
+    /// whether it can put the spent coins back). False if neither exists or the
+    /// record does not parse.
     bool get_block_undo(uint32_t height, BlockUndo& undo) {
-        auto key = make_undo_key(height);
         std::vector<uint8_t> data;
-        if (!m_store.get(key, data))
+        if (m_store.get(make_undo_key(height), data))
+            return deserialize_block_undo_v2(data, undo);
+        if (!m_store.get(make_legacy_undo_key(height), data))
             return false;
+        undo = BlockUndo{};
         return deserialize_block_undo(data, undo);
     }
 
-    /// Remove undo data for a block (after successful disconnect or pruning).
+    /// Remove undo data for a block (after successful disconnect or pruning):
+    /// both the format-2 and any legacy record.
     bool remove_block_undo(uint32_t height) {
-        auto key = make_undo_key(height);
-        return m_store.remove(key);
+        auto batch = m_store.create_batch();
+        batch.remove(make_undo_key(height));
+        batch.remove(make_legacy_undo_key(height));
+        return batch.commit();
+    }
+
+    /// Legacy undo records in [lo, hi] (startup diagnostic).
+    uint32_t count_legacy_undo(uint32_t lo, uint32_t hi) {
+        uint32_t n = 0;
+        for (uint64_t h = lo; h <= hi; ++h) {
+            if (m_store.exists(make_legacy_undo_key(static_cast<uint32_t>(h))))
+                ++n;
+        }
+        return n;
+    }
+
+    /// TEST ONLY: write `undo` as a legacy (format 1) record under 'U' and drop
+    /// the format-2 record at the same height, as a node that connected the
+    /// block before format 2 existed would have left it.
+    bool put_block_undo_legacy(uint32_t height, const BlockUndo& undo) {
+        auto batch = m_store.create_batch();
+        batch.put(make_legacy_undo_key(height), serialize_block_undo(undo));
+        batch.remove(make_undo_key(height));
+        return batch.commit();
     }
 
     // ── Raw block storage (explorer) ────────────────────────────────────
@@ -190,7 +232,7 @@ public:
     // ── Re-anchor (wipe) ────────────────────────────────────────────────
 
     /// Wipe the entire persisted accrual view — every coin ('C'), undo record
-    /// ('U') and retained raw block ('F') — and reset best-block state to zero,
+    /// ('U', 'R') and retained raw block ('F') — and reset best-block state to zero,
     /// so accrual restarts fresh from the next connected block. Used when the
     /// confirmed header tip has advanced past the persisted view by more than
     /// one block (e.g. after a restart): the stale view cannot legally extend
@@ -200,7 +242,7 @@ public:
     /// best_* fields are left UNCHANGED and false is returned; the caller must
     /// then NOT connect the current block (hold the old view).
     bool reset() {
-        // Snapshot every key under the three data prefixes first (not removing
+        // Snapshot every key under the data prefixes first (not removing
         // mid-iteration) so the scan reads a stable view, then batch-remove
         // them + zero the best-state marker in one atomic commit.
         std::vector<std::string> keys;
@@ -209,7 +251,7 @@ public:
             keys.push_back(key);
             return true;
         };
-        for (char prefix : {'C', 'U', 'F'}) {
+        for (char prefix : {'C', 'U', 'R', 'F'}) {
             if (!m_store.for_each_prefix(std::string(1, prefix), collect))
                 return false;  // scan failure -> fail-closed, view untouched.
         }
@@ -249,10 +291,10 @@ private:
         return std::string(1, 'B');
     }
 
-    static std::string make_undo_key(uint32_t height) {
+    static std::string make_height_key(char prefix, uint32_t height) {
         std::string key;
-        key.reserve(5);  // 'U' + 4 bytes (big-endian for sorted iteration)
-        key.push_back('U');
+        key.reserve(5);  // prefix + 4 bytes (big-endian for sorted iteration)
+        key.push_back(prefix);
         key.push_back(static_cast<char>((height >> 24) & 0xFF));
         key.push_back(static_cast<char>((height >> 16) & 0xFF));
         key.push_back(static_cast<char>((height >> 8) & 0xFF));
@@ -260,16 +302,9 @@ private:
         return key;
     }
 
-    static std::string make_block_key(uint32_t height) {
-        std::string key;
-        key.reserve(5);  // 'F' + 4 bytes (big-endian for sorted iteration)
-        key.push_back('F');
-        key.push_back(static_cast<char>((height >> 24) & 0xFF));
-        key.push_back(static_cast<char>((height >> 16) & 0xFF));
-        key.push_back(static_cast<char>((height >> 8) & 0xFF));
-        key.push_back(static_cast<char>(height & 0xFF));
-        return key;
-    }
+    static std::string make_undo_key(uint32_t height) { return make_height_key('R', height); }
+    static std::string make_legacy_undo_key(uint32_t height) { return make_height_key('U', height); }
+    static std::string make_block_key(uint32_t height) { return make_height_key('F', height); }
 
     void load_best_block() {
         std::vector<uint8_t> data;

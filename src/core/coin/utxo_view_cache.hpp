@@ -130,14 +130,19 @@ public:
 
     /// Connect a block: spend inputs, add outputs, build undo data.
     /// Returns the BlockUndo for this block (for future disconnection).
-    /// Undo includes both spent coins AND added outpoints (for disconnect
-    /// without full block data — needed during reorgs).
+    /// Undo includes the spent coins with their outpoints AND the added
+    /// outpoints (for disconnect without full block data — needed during
+    /// reorgs).
     ///
     /// txid_fn: function to compute txid (chain-specific: witness vs non-witness)
+    /// block_hash: stored in the record so a disconnect can check that the
+    ///   record belongs to the block it undoes (null = unbound)
     template <typename BlockType, typename TxidFn>
-    BlockUndo connect_block(const BlockType& block, uint32_t height, TxidFn txid_fn) {
+    BlockUndo connect_block(const BlockType& block, uint32_t height, TxidFn txid_fn,
+                            const uint256& block_hash = uint256()) {
         std::unique_lock<std::shared_mutex> lock(m_mu);
         BlockUndo undo;
+        undo.block_hash = block_hash;
         bool first_tx = true;
 
         for (const auto& tx : block.m_txs) {
@@ -153,7 +158,8 @@ public:
             }
 
             if (!is_coinbase) {
-                // Spend inputs — save spent coins for undo
+                // Spend inputs — save spent coins and their outpoints for undo,
+                // index-aligned with tx.vin
                 TxUndo tx_undo;
                 for (const auto& vin : tx.vin) {
                     Outpoint op(vin.prevout.hash, vin.prevout.index);
@@ -165,6 +171,7 @@ public:
                         // Input not in UTXO — UTXO incomplete (bootstrap) or invalid tx
                         tx_undo.spent_coins.emplace_back();
                     }
+                    tx_undo.spent_outpoints.push_back(op);
                 }
                 undo.tx_undos.push_back(std::move(tx_undo));
             }
@@ -188,64 +195,67 @@ public:
         return undo;
     }
 
-    /// Disconnect a block using only undo data (no full block needed).
-    /// 1. Remove all outputs that were added by the block (from added_outpoints)
-    /// 2. Restore all inputs that were spent (from tx_undos)
-    /// This enables reorg handling without requesting full blocks for the old fork.
+    /// Disconnect a block using only its undo record (no full block needed):
+    /// put back every coin the block spent, then remove every output it added.
+    /// Reference: LTC validation.cpp DisconnectBlock() lines 1777-1841,
+    ///            ApplyTxInUndo() lines 1747-1773
+    ///
+    /// A legacy record (no outpoints, BlockUndo::restorable() false) cannot put
+    /// the spent coins back: only the block's outputs are removed (a rolled-back
+    /// coin must never price) and false is returned; the caller decides.
     bool disconnect_from_undo(const BlockUndo& undo) {
         std::unique_lock<std::shared_mutex> lock(m_mu);
-        // Step 1: Remove all outputs added by this block
-        for (const auto& op : undo.added_outpoints)
-            m_cache[op] = std::nullopt;
-
-        // Step 2: Restore all spent inputs
-        for (const auto& tu : undo.tx_undos) {
-            for (const auto& coin : tu.spent_coins) {
-                if (!coin.is_spent()) {
-                    // We don't have the outpoint here — but we stored the full Coin
-                    // The outpoint is NOT in the undo data structure (LTC Core uses
-                    // the block's tx.vin to reconstruct it). Since we're disconnecting
-                    // without the block, we need a different approach.
-                    // This is handled by the full disconnect_block() below.
-                }
-            }
+        if (!undo.restorable()) {
+            for (const auto& op : undo.added_outpoints)
+                m_cache[op] = std::nullopt;
+            LOG_ERROR << "[UTXO] legacy undo record (pre-#2059): " << undo.unrestorable_coins()
+                      << " spent coin(s) cannot be restored; only the block's outputs were removed";
+            return false;
         }
-        // NOTE: disconnect_from_undo() only handles output removal.
-        // Input restoration requires the block data (for vin outpoints).
-        // For SPV reorgs, output removal is sufficient — the new fork's
-        // connect_block() will re-add the correct coins.
+        disconnect_locked(undo);
         return true;
     }
 
-    /// Full disconnect with block data: restore spent inputs + remove added outputs.
+    /// Full disconnect with block data, in Core's checked form: the record must
+    /// match the block — one TxUndo per non-coinbase tx (Core L1787-1790), one
+    /// coin per input (L1814-1817), each outpoint the input's prevout — before
+    /// anything is touched; false otherwise. A legacy record takes its
+    /// outpoints from the block. Then the same passes as disconnect_from_undo.
     /// Reference: LTC validation.cpp DisconnectBlock() lines 1777-1841
     template <typename BlockType, typename TxidFn>
-    bool disconnect_block(const BlockType& block, const BlockUndo& undo, TxidFn txid_fn) {
-        std::unique_lock<std::shared_mutex> lock(m_mu);
-        // Step 1: Remove all added outputs
-        for (const auto& op : undo.added_outpoints)
-            m_cache[op] = std::nullopt;
-
-        // Step 2: Restore spent inputs (reverse tx order, matching LTC Core)
-        size_t undo_idx = undo.tx_undos.size();
-        for (int i = static_cast<int>(block.m_txs.size()) - 1; i >= 0; --i) {
+    bool disconnect_block(const BlockType& block, const BlockUndo& undo, TxidFn /*txid_fn*/) {
+        if (block.m_txs.empty() || undo.tx_undos.size() + 1 != block.m_txs.size())
+            return false;
+        bool legacy = false;
+        for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            bool is_coinbase = (i == 0);
-
-            if (!is_coinbase) {
-                if (undo_idx == 0) return false;
-                --undo_idx;
-                const auto& tx_undo = undo.tx_undos[undo_idx];
-                if (tx_undo.spent_coins.size() != tx.vin.size()) return false;
-
-                for (size_t j = 0; j < tx.vin.size(); ++j) {
-                    Outpoint op(tx.vin[j].prevout.hash, tx.vin[j].prevout.index);
-                    const auto& restored = tx_undo.spent_coins[j];
-                    if (!restored.is_spent())
-                        m_cache[op] = restored;
-                }
+            const auto& tu = undo.tx_undos[i - 1];
+            if (tu.spent_coins.size() != tx.vin.size())
+                return false;
+            if (!tu.has_outpoints()) {
+                legacy = true;
+                continue;
+            }
+            for (size_t j = 0; j < tx.vin.size(); ++j) {
+                if (tu.spent_outpoints[j] != Outpoint(tx.vin[j].prevout.hash, tx.vin[j].prevout.index))
+                    return false;
             }
         }
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        if (!legacy) {
+            disconnect_locked(undo);
+            return true;
+        }
+        BlockUndo completed = undo;
+        for (size_t i = 1; i < block.m_txs.size(); ++i) {
+            auto& tu = completed.tx_undos[i - 1];
+            if (tu.has_outpoints())
+                continue;
+            tu.spent_outpoints.clear();
+            for (const auto& vin : block.m_txs[i].vin)
+                tu.spent_outpoints.emplace_back(vin.prevout.hash, vin.prevout.index);
+        }
+        disconnect_locked(completed);
         return true;
     }
 
@@ -367,6 +377,54 @@ private:
             return true;
         }
         return false;
+    }
+
+    // The disconnect proper; the caller holds m_mu (unique) and every spent
+    // coin that is not unknown has its outpoint (restorable() or completed).
+    //
+    // Core interleaves per tx (txs in reverse: remove the tx's outputs, then
+    // restore its inputs in reverse). Two passes reach the same final state:
+    // a pre-block coin the block spent is restored once, and an output the
+    // block created ends absent even when a later tx of the same block spent
+    // it (restored in pass 1, removed in pass 2; remove-then-restore would
+    // resurrect it). As in Core, restoring over an existing coin and removing
+    // an output that is not there make the disconnect unclean: logged, not
+    // fatal. A coin recorded as unknown (not in the view at connect, e.g. a
+    // partial view after a jump start) has nothing to restore.
+    void disconnect_locked(const BlockUndo& undo) {
+        size_t unknown = 0, overwrite = 0, missing = 0;
+        // Pass 1 — restore spent inputs: txs in reverse, inputs in reverse
+        // (Core DisconnectBlock L1792, L1818-1823; ApplyTxInUndo L1751).
+        for (auto tu = undo.tx_undos.rbegin(); tu != undo.tx_undos.rend(); ++tu) {
+            for (size_t j = tu->spent_coins.size(); j-- > 0;) {
+                const Coin& c = tu->spent_coins[j];
+                if (c.is_spent()) {
+                    ++unknown;
+                    continue;
+                }
+                const Outpoint& op = tu->spent_outpoints[j];
+                Coin cur;
+                if (get_coin_locked(op, cur))
+                    ++overwrite;  // Core: overwriting transaction output
+                m_cache[op] = c;  // value, script, height, coinbase, pegout
+            }
+        }
+        // Pass 2 — remove the outputs the block added (Core L1797-1808).
+        for (const auto& op : undo.added_outpoints) {
+            Coin cur;
+            if (!get_coin_locked(op, cur))
+                ++missing;        // Core: transaction output mismatch
+            m_cache[op] = std::nullopt;
+        }
+        if (overwrite || missing) {
+            LOG_WARNING << "[UTXO] unclean disconnect: " << overwrite
+                        << " restored coin(s) overwrote an existing coin, " << missing
+                        << " added output(s) were already gone";
+        }
+        if (unknown) {
+            LOG_DEBUG_COIND << "[UTXO] disconnect: " << unknown
+                            << " spent coin(s) were not in the view at connect (nothing to restore)";
+        }
     }
 
     template <typename TxType>
