@@ -183,6 +183,10 @@ tools/dash/*
 # as its reproduction path, and a trust root nobody can regenerate is a trust
 # root nobody can review.
 !tools/xmr-anchor-gen/
+# BIP 152 short-id vector tools -- tracked source: the btc/dgb regtest
+# cmpctblock fixture headers name them as their reproduction path, and the
+# vector JSONs are the record of what bitcoind/digibyted sent (#2055).
+!tools/bip152/
 # Design canon drift checker -- tracked source: the canon-check CI job and
 # the daily drift cron run it against docs/canon/CANON.yaml.
 !tools/canon/

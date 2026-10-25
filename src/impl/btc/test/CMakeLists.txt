@@ -10,6 +10,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         block_broadcast_guard_test.cpp
         broadcast_gate_test.cpp
         broadcast_lock_discipline_test.cpp
+        cmpct_bitcoind_vector_test.cpp
         coin_peer_manager_test.cpp
         dashboard_pplns_current_test.cpp
         f10b_version_punish_removal_test.cpp

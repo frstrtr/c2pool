@@ -1319,8 +1319,9 @@ if (BUILD_TESTING AND GTest_FOUND)
     # bytes and the {0,2,6,10,11}->{0,1,3,3,0} diff sequence are hand-derived
     # from the BIP 152 spec, asserted against the on-the-wire serialiser output.
     # No call site rewired. MUST also be in BOTH build.yml --target allowlists
-    # (#143 NOT_BUILT trap).
-    add_executable(dgb_compact_blocks_bip152_parity_test compact_blocks_bip152_parity_test.cpp compact_block_merkle_test.cpp)
+    # (#143 NOT_BUILT trap). cmpct_digibyted_vector_test.cpp pins our SipHash
+    # keys and short ids to a cmpctblock digibyted produced (#2055).
+    add_executable(dgb_compact_blocks_bip152_parity_test compact_blocks_bip152_parity_test.cpp compact_block_merkle_test.cpp cmpct_digibyted_vector_test.cpp)
     target_link_libraries(dgb_compact_blocks_bip152_parity_test PRIVATE
         GTest::gtest_main GTest::gtest
         core dgb
