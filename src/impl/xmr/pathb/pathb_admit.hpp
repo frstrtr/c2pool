@@ -1712,6 +1712,12 @@ public:
         return it == frames_.end() ? nullptr : &it->second;
     }
     bool holds(const Hash32& digest) const { return frames_.count(digest) != 0; }
+    // A frame of carrier `id` is stored (any cause).
+    bool holds_id(const Hash32& id) const {
+        for (const auto& [d, f] : frames_)
+            if (f.id == id) return true;
+        return false;
+    }
     // The digests of every stored frame.
     std::vector<Hash32> digests() const {
         std::vector<Hash32> out;

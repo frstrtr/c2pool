@@ -7836,6 +7836,80 @@ void catchlocator() {
           "(steps " + std::to_string(b.relay->stats().catchup_steps.load()) + ")");
 }
 
+// ---------------------------------------------------------------------------
+// The parent ask of a ParentUnknown DEFER (S1.3 #3, "DEFER + FC_GETCARRIER(tip)"): FC_GETCARRIER(parent) goes out only
+// for a frame parked now (a copy held already asks nothing), whose parent is neither held nor parked, and which was not
+// asked within P-53.
+//
+// pwalkdup: J, empty, receives carriers on S's tip P (position 6), whose parent it does not hold. T1 asks P once; T1 from
+// another peer and T2 (another carrier on P, within P-53) ask nothing; past P-53, T1 again (held already) asks nothing
+// and T3 (parked now) asks P again; P's own frame (parked on its parent Q) asks Q; past P-53 again, T4 on P asks nothing
+// (P is parked, waiting on Q).
+void pwalkdup() {
+    const KatNet net;
+    using K = pb::Missing;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 46000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::Hash32 P = h[s].tree().best().id, Q = *h[s].store().best_at(5);
+    std::vector<SiblingFrame> t;
+    for (std::uint32_t i = 0; i < 4; ++i) t.push_back(sibling_frame(h, s, i % 5, 46100 + i));
+    h.q.clear();
+    const std::vector<std::uint8_t> pf = *pb::encode_fc_carrier(0, *h[s].bodies().get(P), 16);
+    const auto asks = [&h, j](const pb::Hash32& id) {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == id ? 1 : 0;
+        }
+        return n;
+    };
+    bool setup = h[s].tree().best().pos == 6 && h[j].tree().best().pos == 0;
+    for (const SiblingFrame& f : t) setup = setup && !f.frame.empty() && f.id != P;
+    if (!setup) {
+        check(false, "pwalkdup: setup (S at 6, four carriers on its tip)");
+        return;
+    }
+    (void)h[j].tick(h.now);
+    const pb::NodeEventResult r1 = h[j].on_carrier(s, t[0].frame);
+    const std::size_t a1 = asks(P);
+    (void)h[j].on_carrier(7, t[0].frame);  // the same frame from another peer
+    (void)h[j].on_carrier(s, t[1].frame);
+    const std::size_t a2 = asks(P), held2 = h[j].deferred().size();
+    h.now += pb::kAbandonTimeoutDefault + 1;
+    (void)h[j].tick(h.now);
+    (void)h[j].on_carrier(s, t[0].frame);  // held already
+    const std::size_t a3 = asks(P);
+    (void)h[j].on_carrier(s, t[2].frame);
+    const std::size_t a4 = asks(P);
+    const pb::NodeEventResult rp = h[j].on_carrier(s, pf);
+    const std::size_t q1 = asks(Q);
+    h.now += pb::kAbandonTimeoutDefault + 1;
+    (void)h[j].tick(h.now);
+    (void)h[j].on_carrier(s, t[3].frame);
+    const std::size_t a5 = asks(P);
+    std::printf("  pwalkdup: asks of P %zu, %zu, %zu, %zu, %zu; of Q %zu; parked %zu then %zu; parent asks %llu\n", a1, a2, a3,
+                a4, a5, q1, held2, h[j].deferred().size(), (unsigned long long)h[j].parent_asks());
+    check(r1.action == pb::NodeAction::Parked && r1.admit.missing == K::ParentUnknown && r1.admit.row == pb::RowId::R4 && a1 == 1,
+          "pwalkdup: T1 on P, P not held: DEFER R4 (ParentUnknown), P asked once");
+    check(a2 == 1 && held2 == 2, "pwalkdup: T1 again (another peer) and T2 within P-53: parked, P not asked again");
+    check(a3 == 1, "pwalkdup: past P-53, T1 again (held already): P not asked");
+    check(a4 == 2, "pwalkdup: past P-53, T3 (parked now): P asked again");
+    check(rp.action == pb::NodeAction::Parked && rp.admit.missing == K::ParentUnknown && q1 == 1,
+          "pwalkdup: P's own frame (Q not held): parked, Q asked once");
+    check(a5 == 2 && h[j].deferred().size() == 5,
+          "pwalkdup: past P-53 again, T4 on P (parked, waiting on Q): P not asked; five frames parked");
+}
+
 // sealall: the seal sweep covers every parked carrier frame (E-139 (i); ruling 40 for the boundary), not only those
 // indexed for a re-run. B (journal depth 16) follows A. E, a node of its own, holds A's positions 1..6 and mines
 // E7, E8 and E9 on position 6. B receives E7 once position 6 lies below its journal base: DEFER R4 (OwnChainDeep); then
@@ -9462,6 +9536,7 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("pwalkdup", pwalkdup);
     run("sealall", sealall);
     run("placedcopy", placedcopy);
     run("floorpr", floorpr);

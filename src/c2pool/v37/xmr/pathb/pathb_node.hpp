@@ -846,6 +846,8 @@ public:
     std::uint64_t deferred_cap() const noexcept { return deferred_.cap(); }
     // The digests of every frame the deferred store holds (the seal sweep of parked frames).
     std::vector<Hash32> parked_digests() const { return deferred_.digests(); }
+    // The FC_GETCARRIER(parent) asks of ParentUnknown DEFERs sent since the start.
+    std::uint64_t parent_asks() const noexcept { return parent_asks_; }
     // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
     std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
         const ParkedFrame* f = deferred_.get(digest);
@@ -1606,6 +1608,7 @@ public:
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
         HeadersOutcome out;
+        clock_s_ = std::max(clock_s_, now_s);
         if (poisoned_) {
             out.kind = HeadersOutcome::Kind::NodeInternal;
             return out;
@@ -1977,6 +1980,10 @@ public:
     // the link drops; the peer gets no new header request meanwhile).
     std::size_t tick(std::uint64_t now_s) {
         std::size_t n = 0;
+        clock_s_ = std::max(clock_s_, now_s);
+        for (auto a = parent_asked_.begin(); a != parent_asked_.end();)  // placed, or asked P-53 ago
+            a = tree_->find(a->first) != nullptr || clock_s_ >= a->second + cfg_.abandon_timeout_s ? parent_asked_.erase(a)
+                                                                                               : std::next(a);
         for (const Req& r : timers_.expired(now_s)) {
             ++n;
             if (r.kind == ReqKind::Headers) {
@@ -2705,6 +2712,7 @@ private:
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
         repend_watch_.clear();  // the re-pended receipts left with the pending set
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
+        parent_asked_.clear();
         for (auto& [p, r] : header_req_) {  // still in flight: retired (their replies DROP; no new request before them)
             r.retired = true;
             r.got.clear();
@@ -3010,6 +3018,7 @@ private:
         }
         headers_->placed(r.id);
         deferred_.purge(r.id);
+        parent_asked_.erase(r.id);
         if ((relayed || peer == kOwnPeer) && !rests_on_claims())
             flood(frame, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
         // the carriers that waited on this one (placed by the outermost event, drain_released)
@@ -3040,14 +3049,29 @@ private:
                 f.parent = c.own.side.tip;
             }
         }
-        (void)deferred_.park(*tree_, std::move(f));
-        if (*r.missing == Missing::ParentUnknown && peer != kOwnPeer) {
+        const bool stored = deferred_.park(*tree_, std::move(f));
+        // FC_GETCARRIER(parent) for a frame parked now (a copy held already asks nothing), whose parent is neither held,
+        // nor parked, nor asked within P-53
+        if (*r.missing == Missing::ParentUnknown && peer != kOwnPeer && stored && parent_ask_due(r.fetch)) {
             GetCarrier q;
             q.chain_id = cfg_.identity.chain_id;
             q.ids = {r.fetch};
             q.want_bodies = true;
+            ++parent_asks_;
             send(peer, *encode_fc_getcarrier(q, cfg_.p));
         }
+    }
+
+    // The parent ask of a ParentUnknown DEFER is due: `id` is not held, not parked (a frame of it waiting on its own
+    // parent or DEFERred on another cause), and not asked as a parent within P-53; the ask is recorded.
+    bool parent_ask_due(const Hash32& id) {
+        if (tree_->find(id) != nullptr || tree_->is_waiting(id) || deferred_.holds_id(id)) return false;
+        const auto [a, fresh] = parent_asked_.try_emplace(id, clock_s_);
+        if (!fresh) {
+            if (clock_s_ < a->second + cfg_.abandon_timeout_s) return false;
+            a->second = clock_s_;
+        }
+        return true;
     }
 
     // After every change of the store's best tip: variants below H(base_pos -
@@ -3335,6 +3359,9 @@ private:
     std::map<std::uint64_t, HelloTail> peers_;
     std::map<std::uint64_t, HeaderRequest> header_req_;
     std::map<Hash32, std::uint64_t> bodies_asked_;  // FetchBodies ids not placed yet: their last ask time (s)
+    std::map<Hash32, std::uint64_t> parent_asked_;  // parent asks of ParentUnknown DEFERs: their last ask time (s)
+    std::uint64_t parent_asks_ = 0;                 // parent asks sent
+    std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
     std::set<std::pair<std::uint64_t, Hash32>> closed_;
