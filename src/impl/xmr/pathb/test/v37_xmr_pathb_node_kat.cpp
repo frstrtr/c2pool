@@ -198,6 +198,8 @@
 //                DoS token, one placed on its re-run (a duplicate: none);
 //   relayverdictlog a receipt struck (R16) or refused (R21, its bin sealed):
 //                one STRIKE / REFUSE line naming the row and its id;
+//   relayparkstrike a parked carrier released by its parent's placement and
+//                struck (R28): its STRIKE line as a received frame's;
 //   repevict     a re-pended receipt evicted by P-09 while watched: counted
 //                evicted, the watch empty;
 //   openstate    the open state at the best tip: its placements and
@@ -5519,6 +5521,55 @@ void relayverdictlog() {
 }
 
 // ---------------------------------------------------------------------------
+// relayparkstrike: a carrier parked on an unknown parent and released by the parent's placement (the node's drain)
+// logs its STRIKE line as a received frame does: A mines c1 and c2 (c2 carries two receipts) while B gets neither; B
+// receives c2 with its carried list out of order, parks it (parent unknown), fetches c1 and places it; the released
+// c2 STRIKEs at R28 and B logs one line naming R28 and c2's id.
+void relayparkstrike() {
+    const KatNet net;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const std::optional<pb::PathbJob> j1 = h.job(a.node, 2, 801), j2 = h.job(a.node, 3, 802);
+    w.edit = [](FakeWire::Msg& m) {  // A's frames do not reach B
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j1 && j2 && mine_on(h, w, a.node, 1, 810);  // c1
+    const pb::Hash32 c1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].on_own_share(*j1, 801, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[a.node].on_own_share(*j2, 802, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && mine_on(h, w, a.node, 1, 820);  // c2 carries both
+    const pb::Hash32 c2 = h[a.node].tree().best().id;
+    pb::CarrierBodyV3 bad = *h[a.node].bodies().get(c2);
+    ok = ok && bad.carried.size() == 2 && h[b.node].tree().find(c1) == nullptr;
+    if (bad.carried.size() == 2) std::swap(bad.carried[0], bad.carried[1]);
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, bad, 16)});
+    w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().find(c1) == nullptr; ++i) {
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
+    g_relay_lines = nullptr;
+    const std::string want = "relay: peer 1 STRIKE: admission row R28 of " + hex(pb::receipt_id(bad.own).data(), 6);
+    std::size_t got = 0;
+    for (const std::string& l : lines[b.node]) got += l == want ? 1 : 0;
+    std::printf("  relayparkstrike: setup %d, c1 at B %d, c2 at B %d, lines %zu\n", ok ? 1 : 0,
+                h[b.node].tree().find(c1) != nullptr ? 1 : 0, h[b.node].tree().find(c2) != nullptr ? 1 : 0, got);
+    check(ok && h[b.node].tree().find(c1) != nullptr && h[b.node].tree().find(c2) == nullptr,
+          "relayparkstrike: B fetched and placed c1; the misordered c2 is not placed");
+    check(got == 1, "relayparkstrike: the released c2 logs one line '" + want + "'");
+}
+
+// ---------------------------------------------------------------------------
 // repevict: a re-pended receipt the pending set evicts (P-09, 1 here) while watched is counted evicted and leaves the
 // watch. A and B race at one position (the links cut); the loser switches and re-pends its own receipt (watched); its
 // share on its old tip at a newer Monero height is a receipt in a newer bin: the pending set keeps it and evicts the
@@ -9518,6 +9569,7 @@ int main(int argc, char** argv) {
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
     run("relayverdictlog", relayverdictlog);
+    run("relayparkstrike", relayparkstrike);
     run("repevict", repevict);
     run("openstate", openstate);
     run("opendead", opendead);

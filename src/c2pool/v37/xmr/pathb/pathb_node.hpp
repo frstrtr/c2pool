@@ -910,6 +910,7 @@ public:
         std::uint64_t omitted = 0;
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        Hash32 object{};  // a STRIKE or REFUSE: the id of the body it names (logs only)
     };
     std::vector<DrainedResult> take_drained() { return std::exchange(drained_, {}); }
     // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
@@ -2980,7 +2981,7 @@ private:
                     const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
                     const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
                     drained_.push_back(DrainedResult{f.peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended,
-                                                     r.lost});
+                                                     r.lost, r.object});
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
