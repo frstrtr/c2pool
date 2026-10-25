@@ -30,11 +30,14 @@
 #include <impl/dash/share_check.hpp>
 
 #include <core/address_utils.hpp>
+#include <core/hashing_elsewhere.hpp>
 #include <core/netaddress.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>   // MiningInterface session states (failback)
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <map>
 #include <string>
 #include <vector>
@@ -418,4 +421,62 @@ TEST(DashDashboardViews, NewestShareTimeCanCountPeerReceivedSharesOnly)
     EXPECT_EQ(peers.begin()->second, static_cast<int64_t>(V_BASE_TIME + 8))
         << "newest PEER-received share, not the newest share of that address (n=18)";
     EXPECT_EQ(all.at(peers.begin()->first), static_cast<int64_t>(V_BASE_TIME + 18));
+}
+
+// Failback evidence end to end: the peer-received walk (what main_dash feeds
+// the dashboard and the alert relay) into the session state. A rig whose
+// address has only shares minted HERE is stalled when it goes silent; one
+// whose address keeps getting shares from a pool peer is standby (hashing
+// elsewhere). FAIL WITHOUT THE FIX: both read "stalled".
+TEST(DashDashboardViews, SharesMintedHereOnlyLeaveASilentRigStalled)
+{
+    dash::NodeImpl node;
+    uint256 prev = uint256::ZERO;
+    for (unsigned int i = 0; i < 40; ++i) {
+        // pkh 0xa0: every share from a pool peer; pkh 0xa1: every share minted here.
+        auto* sh = make_view_share(i, prev, static_cast<unsigned char>(0xa0 + (i % 2)));
+        if (i % 2 == 0) sh->peer_addr = NetService("10.0.0.2", 8996);
+        node.tracker().chain.add(sh);
+        prev = sh->m_hash;
+    }
+    auto& tracker = node.tracker();
+    const auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    ASSERT_EQ(all.size(), 2u);
+    const auto peers = dash::dashboard::newest_share_time_by_address(
+        tracker, false, 0, 4320, /*peer_received_only=*/true);
+    ASSERT_EQ(peers.size(), 1u);
+    const std::string elsewhere_addr = peers.begin()->first;
+    std::string local_addr;
+    for (const auto& [a, t] : all)
+        if (a != elsewhere_addr) local_addr = a;
+    ASSERT_FALSE(local_addr.empty());
+
+    // Both rigs shared here an hour before the newest share and went silent.
+    const int64_t now = static_cast<int64_t>(V_BASE_TIME) + 60;
+    core::stratum::AddressActivity act;
+    act.valid = true;
+    act.built_at = now;
+    act.newest_elsewhere = peers;
+
+    using MI = core::MiningInterface;
+    const auto steady = std::chrono::steady_clock::now();
+    std::map<std::string, MI::WorkerInfo> workers;
+    std::map<std::string, MI::WorkerLiveness> lv;
+    for (const auto& [sid, addr] : {std::pair<std::string, std::string>{"s-local", local_addr},
+                                    std::pair<std::string, std::string>{"s-peer", elsewhere_addr}}) {
+        MI::WorkerInfo w;
+        w.username = addr;
+        w.worker_name = "rig";
+        w.accepted = 3;
+        w.difficulty = 1.0;
+        w.connected_at = steady - std::chrono::seconds(7200);
+        workers[sid] = w;
+        lv[sid] = MI::classify_worker_liveness(w, steady - std::chrono::seconds(3600), steady);
+    }
+    MI::mark_hashing_elsewhere(workers, lv, act, now);
+    EXPECT_STREQ(MI::session_state(lv.at("s-local")), "stalled")
+        << "shares minted on this node are no evidence of hashing elsewhere";
+    EXPECT_FALSE(lv.at("s-local").hashing_elsewhere);
+    EXPECT_STREQ(MI::session_state(lv.at("s-peer")), "standby");
+    EXPECT_TRUE(lv.at("s-peer").hashing_elsewhere);
 }

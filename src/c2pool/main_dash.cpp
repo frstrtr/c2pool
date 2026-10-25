@@ -1516,6 +1516,43 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // local_mint_ledger.hpp.
     auto mint_ledger = std::make_shared<dash::mint::LocalMintLedger>();
 
+    // ── Hashing on another node (failback): ONE sharechain read ───────────
+    // Per payout address, the newest share minted on ANOTHER node (received
+    // from a pool peer; a share minted here, or loaded from the local store,
+    // has no peer port). Both consumers apply the same rule to the same
+    // snapshot (core/hashing_elsewhere.hpp), so they cannot disagree: the
+    // dashboard's session state (a rig that failed over here and back reads
+    // standby, "hashing elsewhere", not stalled) and the alert relay's
+    // RETURNED rule (such a rig is not paged). Read on the IO thread through
+    // the tracker's try-lock, at most every 30 s, over the last 400 shares
+    // (over 2 h at the 20 s share period) and the last hour; a busy tracker
+    // keeps the previous read, and a read older than 120 s is no evidence.
+    struct AddressActivityCache {
+        std::mutex mtx;
+        core::stratum::AddressActivity snap;
+    };
+    auto addr_activity_cache = std::make_shared<AddressActivityCache>();
+    auto read_addr_activity = [cache = addr_activity_cache,
+                               wnode = std::weak_ptr<dash::Node>(p2p_node_holder)]()
+        -> core::stratum::AddressActivity {
+        const int64_t now = static_cast<int64_t>(core::timestamp());
+        std::lock_guard<std::mutex> lk(cache->mtx);
+        auto& a = cache->snap;
+        if (!a.valid || now - a.built_at >= 30) {
+            if (auto node = wnode.lock()) {
+                auto guard = node->read_tracker();
+                if (guard) {
+                    a.newest_elsewhere = dash::dashboard::newest_share_time_by_address(
+                        *guard, dash::SharechainConfig::is_testnet, now - 3600, 400,
+                        /*peer_received_only=*/true);
+                    a.built_at = now;
+                    a.valid = true;
+                }
+            }
+        }
+        return a;
+    };
+
     // ── DASH web dashboard standup (the EXISTING c2pool dashboard) ────────
     // This is main_ltc.cpp's WebServer wiring, reused verbatim where the DASH
     // side has a real source for the datum. No stub metrics are invented: a
@@ -2688,6 +2725,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             auto data_dir = core::filesystem::config_path();
             mi->load_transition_blobs((data_dir / "transition_messages").string());
         }
+
+        // Failback evidence for the session states (the read above, shared
+        // with the alert relay). Display only; only a mining node has
+        // sessions to classify. Installed before start(): the HTTP thread
+        // reads the cached snapshot, the read runs on the IO thread.
+        if (stratum_port != 0)
+            mi->set_address_activity_fn(read_addr_activity);
 
         // D-MINER.7: read-only alert-relay status (no secrets: pubkeys, counters,
         // detector state). Installed BEFORE web_server->start() so the web
@@ -5042,33 +5086,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                            " ever be observed on this node";
         alert_relay->publish_status(core::timestamp());
         // RETURNED rule: newest sharechain share per payout address minted on
-        // ANOTHER node (received from a peer), so a rig that moved there
-        // (failback) is not paged here. Read on the alert tick (IO thread)
-        // through the tracker's try-lock, cached 30 s; a cache older than 120 s
-        // reads as "unknown" and the detector waits (bounded) instead of
+        // ANOTHER node, so a rig that moved there (failback) is not paged
+        // here. The SAME read the dashboard's session states use
+        // (read_addr_activity above); one that is unknown (never read, or
+        // older than 120 s) makes the detector wait (bounded) instead of
         // guessing.
         if (alert_relay->config().origin) {
-            struct AddrActivity { int64_t built_at{0}; bool valid{false}; std::map<std::string, int64_t> newest; };
-            auto act = std::make_shared<AddrActivity>();
-            std::weak_ptr<dash::Node> wnode = p2p_node_holder;
             alert_relay->set_address_activity(
-                [act, wnode](const std::string& addr) -> std::optional<int64_t> {
-                    const int64_t now = static_cast<int64_t>(core::timestamp());
-                    if (!act->valid || now - act->built_at >= 30) {
-                        if (auto node = wnode.lock()) {
-                            auto guard = node->read_tracker();
-                            if (guard) {
-                                act->newest = dash::dashboard::newest_share_time_by_address(
-                                    *guard, dash::SharechainConfig::is_testnet, now - 3600, 400,
-                                    /*peer_received_only=*/true);
-                                act->built_at = now;
-                                act->valid = true;
-                            }
-                        }
-                    }
-                    if (!act->valid || now - act->built_at > 120) return std::nullopt;
-                    auto it = act->newest.find(addr);
-                    return it == act->newest.end() ? int64_t{0} : it->second;
+                [read_addr_activity](const std::string& addr) -> std::optional<int64_t> {
+                    return read_addr_activity().newest(addr, static_cast<int64_t>(core::timestamp()));
                 });
         }
         alert_relay_timer = std::make_unique<core::Timer>(&ioc, true);

@@ -77,16 +77,23 @@ keeps a dead rig "alive" for ~17 minutes.
   (disconnected, or connected but stalled) is not paged when its payout address
   has a share minted on another node (received from a pool peer) more than
   60 s after the worker's last share here and within the last 900 s, while no
-  worker of that address is up here. It becomes standby here; the node it now
-  mines on is the one that pages if it dies. The sharechain is read through
-  the tracker's try-lock (newest peer-received share per address over the last
-  400 shares) and cached for 30 s; a cache older than 120 s counts as
-  unreadable, and the decision then waits up to 120 s more before it pages.
-  Share times come from the minting node's clock (NTP-synced peers assumed).
+  worker of that address is up here. This is checked from the moment the
+  worker goes down, and it becomes standby here at once: it is neither paged
+  nor counted as hashing on this node; the node it now mines on is the one
+  that pages if it dies. The sharechain is read through the tracker's try-lock
+  (newest peer-received share per address over the last 400 shares) and cached
+  for 30 s; a cache older than 120 s counts as unreadable, and the OFFLINE
+  decision then waits up to 120 s more before it pages. Share times come from
+  the minting node's clock (NTP-synced peers assumed).
+- The dashboard applies the same rule to the same read
+  (`src/core/hashing_elsewhere.hpp`): a session that shared here, went silent
+  and whose address is mining on another node reads **standby** ("hashing
+  elsewhere"), not stalled. The pager and the dashboard therefore agree on a
+  failback rig.
 - Shares carry the payout address, not the worker name. With rigs of one
   address on two nodes, a hung rig here is masked while none of its siblings
   hashes here, and a rig that returned to its first pool is paged while a
-  sibling still hashes here. The dashboard shows each rig's own state.
+  sibling still hashes here.
 - Upgrade: an older build persisted standby workers too. Restored entries are
   treated as rigs that hashed here; one that reconnects and never shares is
   paged once at the end of the startup grace unless it is mining on another

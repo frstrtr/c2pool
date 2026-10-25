@@ -13,11 +13,14 @@
 #include <impl/dash/messages.hpp>
 
 #include <core/timer.hpp>
+#include <core/hashing_elsewhere.hpp>
+#include <core/web_server.hpp>   // MiningInterface session states (failback agreement KAT)
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <deque>
 #include <filesystem>
@@ -1174,8 +1177,156 @@ TEST(DashAlertDetector, RestoredWorkerMiningElsewhereIsNotPaged)
         << ev[0].detail;
 }
 
+// ── (10c) failback: the pager and the dashboard agree ──────────────────────
+// The 2026-10-25 reserve incident, replayed at the alert tick's 5 s cadence.
+// The node restarts (T0); 25 rigs hold failover connections; their primary
+// restarts and they hash here for two minutes inside the startup grace, then
+// fail back. The primary keeps minting shares for their address (except
+// during its restart). Nothing pages, and every rig is standby from the tick
+// it goes down -- the moment its dashboard session goes silent -- not 300 s
+// later at the OFFLINE timer, so a node-level check that counts hashing
+// sessions never counts a rig that hashes elsewhere.
+//
+// FAIL WITHOUT THE FIX: RETURNED was checked only when the OFFLINE fell due,
+// so at the stall the rigs still counted as having hashed here (ever_up).
+TEST(DashAlertDetector, FailbackIsStandbyFromTheStallAndNeverPages)
+{
+    auto c = det_cfg();   // grace 600, stall 900, offline 300
+    AlertDetector d(c, T0);
+    const int64_t hash_from = T0 + 270, hash_until = T0 + 390;
+    const int64_t primary_down_from = T0 + 240, primary_down_until = T0 + 400;
+    int64_t now_seen = T0;
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        EXPECT_EQ(addr, "XoZc");
+        if (now_seen >= primary_down_from && now_seen < primary_down_until)
+            return primary_down_from - 20;   // the primary is restarting
+        return now_seen - 20;
+    });
+    // Rig i stops 0, 5 or 10 s before the last one.
+    auto last_share = [&](int i) { return hash_until - 5 * (i % 3); };
+    const int64_t last_down = hash_until + c.stall_after;   // the last rig stalls
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 4 * 3600; t += 5) {
+        now_seen = t;
+        std::vector<WorkerSample> smp;
+        if (t >= T0 + 60) {
+            for (int i = 1; i <= 25; ++i) {
+                const int64_t until = last_share(i);
+                const uint64_t acc = t < hash_from ? 0
+                    : static_cast<uint64_t>(1 + ((t < until ? t : until) - hash_from) / 5);
+                smp.push_back({"XoZc.D" + std::to_string(i), "s" + std::to_string(i), acc});
+            }
+        }
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+        if (t == last_down - 5) {
+            ASSERT_TRUE(d.workers().at("XoZc.D3").up) << "the last rig is still inside its stall window";
+        }
+        if (t == last_down) {
+            for (int i = 1; i <= 25; ++i) {
+                const auto& st = d.workers().at("XoZc.D" + std::to_string(i));
+                ASSERT_FALSE(st.up);
+                ASSERT_FALSE(st.ever_up) << "D" << i << " still counts as hashing here at the stall";
+                ASSERT_TRUE(d.status_json(t)["workers"]["XoZc.D" + std::to_string(i)]["standby"].get<bool>());
+            }
+        }
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.persist().empty()) << "state.json workers stays {} (as observed live)";
+}
+
+// One rule, two consumers. For the same sharechain evidence, the pager
+// (RETURNED: the worker becomes standby, ever_up false) and the dashboard
+// (MiningInterface session state: failback reads standby) decide alike, at
+// the same moment, on every boundary of core/hashing_elsewhere.hpp.
+TEST(DashAlertDetector, PagerAndDashboardApplyTheSameElsewhereRule)
+{
+    EXPECT_EQ(DetectorConfig{}.returned_margin, core::stratum::kElsewhereMarginSeconds);
+    EXPECT_EQ(DetectorConfig{}.returned_horizon, core::stratum::kElsewhereHorizonSeconds);
+    EXPECT_EQ(DetectorConfig{}.stall_after, core::MiningInterface::kSilentFloorSeconds)
+        << "the pager's stall and the dashboard's silence floor start the rule together";
+
+    struct Case {
+        const char* name;
+        int64_t at;        // evaluated at L + at (L = the rig's last share here)
+        int64_t newest;    // newest other-node share, relative to L; INT64_MIN = none
+        bool sibling;      // another rig of the address hashes here
+        bool expect_elsewhere;
+    };
+    constexpr int64_t kNone = INT64_MIN;
+    const Case cases[] = {
+        {"failback (incident)",        900,  880,  false, true},
+        {"shares minted here only",    900,  kNone, false, false},
+        {"margin edge: +60",           900,  60,   false, false},
+        {"margin edge: +61",           900,  61,   false, true},
+        {"sibling hashing here",       900,  880,  true,  false},
+        {"horizon edge: now - 900",    2000, 1100, false, true},
+        {"horizon edge: now - 901",    2000, 1099, false, false},
+    };
+    for (const auto& k : cases) {
+        const int64_t L = T0;
+        const int64_t now = L + k.at;
+        const int64_t newest = k.newest == kNone ? 0 : L + k.newest;
+
+        // Pager. The chain becomes readable at `now` (a late read decides the
+        // horizon cases); a long offline_after keeps the OFFLINE path out of it.
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        c.offline_after = 10'000;
+        AlertDetector d(c, L - 60);
+        int64_t t_seen = 0;
+        d.set_address_activity([&](const std::string&) -> std::optional<int64_t> {
+            if (t_seen < now) return std::nullopt;
+            return newest;
+        });
+        auto smp = [&](uint64_t acc1, uint64_t acc2) {
+            std::vector<WorkerSample> v{{"A.rig1", "s1", acc1}};
+            if (k.sibling) v.push_back({"A.rig2", "s2", acc2});
+            return v;
+        };
+        t_seen = L;
+        d.tick(smp(1, 1), L);                       // the rig's last share here
+        t_seen = now;
+        EXPECT_TRUE(d.tick(smp(1, 2), now).empty()) << k.name;
+        ASSERT_FALSE(d.workers().at("A.rig1").up) << k.name;
+        const bool pager_elsewhere = !d.workers().at("A.rig1").ever_up;
+
+        // Dashboard: the same session, silent since L, the same evidence.
+        using MI = core::MiningInterface;
+        const auto steady = std::chrono::steady_clock::now();
+        std::map<std::string, MI::WorkerInfo> workers;
+        MI::WorkerInfo w1;
+        w1.username = "A";
+        w1.worker_name = "rig1";
+        w1.accepted = 1;
+        w1.difficulty = 1.0;
+        w1.connected_at = steady - std::chrono::seconds(k.at + 600);
+        workers["s1"] = w1;
+        std::map<std::string, MI::WorkerLiveness> lv{
+            {"s1", MI::classify_worker_liveness(w1, steady - std::chrono::seconds(k.at), steady)}};
+        if (k.sibling) {
+            MI::WorkerInfo w2 = w1;
+            w2.worker_name = "rig2";
+            w2.accepted = 2;
+            workers["s2"] = w2;
+            lv["s2"] = MI::classify_worker_liveness(w2, steady, steady);
+        }
+        core::stratum::AddressActivity act;
+        act.valid = true;
+        act.built_at = now;
+        if (k.newest != kNone) act.newest_elsewhere["A"] = newest;
+        MI::mark_hashing_elsewhere(workers, lv, act, now);
+        const std::string state = MI::session_state(lv.at("s1"));
+        ASSERT_NE(state, "hashing") << k.name;
+        const bool dashboard_elsewhere = state == "standby";
+
+        EXPECT_EQ(pager_elsewhere, dashboard_elsewhere) << k.name << ": the pager and the dashboard disagree";
+        EXPECT_EQ(dashboard_elsewhere, k.expect_elsewhere) << k.name;
+    }
+}
+
 // main_dash.cpp feeds the RETURNED rule from the sharechain (the tracker's
-// try-lock read, cached), only on an origin.
+// try-lock read, cached), only on an origin -- and the dashboard's session
+// states from the SAME read, so the two cannot disagree.
 TEST(DashAlertDetector, MainDashWiresAddressActivityFromTheSharechain)
 {
     std::ifstream in(DASH_MAIN_SRC);
@@ -1187,18 +1338,38 @@ TEST(DashAlertDetector, MainDashWiresAddressActivityFromTheSharechain)
         const auto c = line.find("//");
         code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
     }
+    // One read: the cached sharechain walk, under the tracker read guard.
+    const auto reader = code.find("auto read_addr_activity = ");
+    ASSERT_NE(reader, std::string::npos) << "no shared address-activity read";
+    const auto walk = code.find("dash::dashboard::newest_share_time_by_address(", reader);
+    ASSERT_NE(walk, std::string::npos);
+    EXPECT_LT(walk - reader, 900u);
+    const auto lock = code.find("node->read_tracker()", reader);
+    ASSERT_NE(lock, std::string::npos);
+    EXPECT_LT(lock, walk) << "the walk runs under the tracker read guard";
+    EXPECT_NE(code.find("/*peer_received_only=*/true", walk), std::string::npos);
+    EXPECT_EQ(code.find("dash::dashboard::newest_share_time_by_address(", walk + 1), std::string::npos)
+        << "a second walk: the pager and the dashboard could read different evidence";
+
+    // The relay reads it (origin only).
     const auto seam = code.find("alert_relay->set_address_activity(");
     ASSERT_NE(seam, std::string::npos)
         << "without the seam a failback (rig returned to another node) pages from this node";
     const auto origin_gate = code.rfind("if (alert_relay->config().origin)", seam);
     ASSERT_NE(origin_gate, std::string::npos);
     EXPECT_LT(seam - origin_gate, 600u);
-    const auto walk = code.find("dash::dashboard::newest_share_time_by_address(", seam);
-    ASSERT_NE(walk, std::string::npos);
-    EXPECT_LT(walk - seam, 900u);
-    const auto lock = code.find("node->read_tracker()", seam);
-    ASSERT_NE(lock, std::string::npos);
-    EXPECT_LT(lock, walk) << "the walk runs under the tracker read guard";
+    const auto relay_read = code.find("read_addr_activity()", seam);
+    ASSERT_NE(relay_read, std::string::npos);
+    EXPECT_LT(relay_read - seam, 300u);
+
+    // The dashboard reads it, installed before the web server starts.
+    const auto web_seam = code.find("mi->set_address_activity_fn(read_addr_activity)");
+    ASSERT_NE(web_seam, std::string::npos)
+        << "without it a failback session reads stalled on the dashboard while the pager stays quiet";
+    const auto web_start = code.find("web_server->start()");
+    ASSERT_NE(web_start, std::string::npos);
+    EXPECT_LT(web_seam, web_start);
+    EXPECT_LT(reader, web_seam);
 }
 
 // ── (11) bounded memory ─────────────────────────────────────────────────────
