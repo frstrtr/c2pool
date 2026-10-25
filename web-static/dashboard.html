@@ -2705,6 +2705,9 @@
                         connections: workerData.connections || 0,
                         last_seen: workerData.last_seen || 0,
                         state: state,
+                        // Standby whose payout address hashes through another node
+                        // (failback included); sharechain evidence, per address.
+                        elsewhere: workerData.hashing_elsewhere === true,
                         last_share_age_s: lastShareAge
                     });
                     if (state && minerGroups[baseAddress].stateCounts[state] !== undefined) {
@@ -2768,6 +2771,7 @@
                     return Math.floor(sec / 86400) + 'd ago';
                 }
                 var STANDBY_TITLE = 'Standby: authorized and receiving work, but no share submitted on this connection. Usually a failover connection of a rig that mines on another node; a rig that never submits anywhere looks the same here.';
+                var ELSEWHERE_TITLE = 'Hashing on another node: no share on this connection now, but this payout address keeps getting sharechain shares minted by another node (within 15 min). Usually a rig that failed over here and back. The evidence is per address, not per rig.';
                 
                 function renderMinersTable(showHistorical) {
                     var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
@@ -3014,6 +3018,7 @@
                             .attr('class', rowClass)
                             .attr(attrName, attrVal);
                         var isStandby = worker.state === 'standby';
+                        var standbyTitle = worker.elsewhere ? ELSEWHERE_TITLE : STANDBY_TITLE;
 
                         var shortName = worker.name.indexOf('.') >= 0 ? worker.name.substring(worker.name.lastIndexOf('.') + 1) : worker.name;
                         var nameCell = workerRow.append('td').attr('title', worker.name);
@@ -3021,7 +3026,7 @@
                         if (worker.state) {
                             nameCell.append('span')
                                 .attr('class', 'state-dot ' + worker.state)
-                                .attr('title', isStandby ? STANDBY_TITLE
+                                .attr('title', isStandby ? standbyTitle
                                     : worker.state === 'stalled' ? 'Stalled: shared on this connection, then stopped. Check the rig.'
                                     : 'Hashing on this node');
                         }
@@ -3030,7 +3035,7 @@
                         // Worker hashrate with estimated indicator
                         var workerHashrateCell = workerRow.append('td');
                         if (isStandby) {
-                            workerHashrateCell.attr('title', STANDBY_TITLE).text('\u2014');
+                            workerHashrateCell.attr('title', standbyTitle).text('\u2014');
                         } else if (worker.hashrate > 0) {
                             var workerHashrateText = format_hashrate(worker.hashrate);
                             if (worker.isEstimated) {
@@ -3085,10 +3090,11 @@
 
                     if (standbyWorkers.length > 0) {
                         var standbyId = minerId + '_standby';
+                        var nElsewhere = standbyWorkers.filter(function(w) { return w.elsewhere; }).length;
                         var summary = tbody.append('tr')
                             .attr('class', 'worker-row standby-summary' + (startExpanded ? '' : ' hidden'))
                             .attr('data-parent', minerId)
-                            .attr('title', STANDBY_TITLE)
+                            .attr('title', nElsewhere === standbyWorkers.length ? ELSEWHERE_TITLE : STANDBY_TITLE)
                             .on('click', function() {
                                 var rows = d3.selectAll('tr[data-standby-of="' + standbyId + '"]');
                                 var open = !rows.empty() && !rows.classed('hidden');
@@ -3098,8 +3104,10 @@
                         var sumCell = summary.append('td').attr('colspan', '10');
                         sumCell.append('span').attr('class', 'state-dot standby');
                         sumCell.append('span').text(standbyWorkers.length + ' standby connection' +
-                            (standbyWorkers.length === 1 ? '' : 's') +
-                            ' \u2014 no share submitted here (usually a failover pool) ');
+                            (standbyWorkers.length === 1 ? '' : 's') + ' \u2014 ' +
+                            (nElsewhere === standbyWorkers.length ? 'hashing on another node '
+                                : nElsewhere > 0 ? nElsewhere + ' hashing on another node, the rest never submitted here '
+                                : 'no share submitted here (usually a failover pool) '));
                         sumCell.append('span').attr('class', 'standby-toggle').text('\u25b8');
                         standbyWorkers.forEach(function(worker) {
                             renderWorkerRow(worker, 'worker-row row-standby hidden', 'data-standby-of', standbyId);
@@ -3659,10 +3667,16 @@
                     _chips.append('span').attr('class', 'state-chip')
                         .attr('title', 'Sessions with an accepted share on this node within the silence threshold')
                         .html('<span class="state-dot hashing"></span><b>' + _ss.hashing + '</b> hashing');
+                    // Of the standby sessions, those whose payout address hashes
+                    // through another node (a rig that failed over here and back).
+                    var _elsewhere = typeof _ss.standby_elsewhere === 'number' ? _ss.standby_elsewhere : 0;
                     if (_ss.standby > 0)
                         _chips.append('span').attr('class', 'state-chip')
-                            .attr('title', 'Failover connections: authorized, receiving work, never submitted here. The rigs mine on another node; normal.')
-                            .html('<span class="state-dot standby"></span><b>' + _ss.standby + '</b> standby');
+                            .attr('title', 'Failover connections: authorized, receiving work, no share here now. The rigs mine on another node; normal.' +
+                                (_elsewhere > 0 ? ' "Hashing elsewhere": the payout address has sharechain shares minted by another node within 15 min (per address, not per rig).' : ''))
+                            .html('<span class="state-dot standby"></span><b>' + _ss.standby + '</b> standby' +
+                                (_elsewhere === 0 ? '' : _elsewhere === _ss.standby ? ' (hashing elsewhere)'
+                                    : ' (' + _elsewhere + ' hashing elsewhere)'));
                     if (_ss.stalled > 0)
                         _chips.append('span').attr('class', 'state-chip stalled-hot')
                             .attr('title', 'Shared on this node, then stopped past the threshold. Check these rigs.')
@@ -3671,7 +3685,9 @@
                     var _stateNote = d3.select('#stratum_state_note');
                     if (_ss.hashing === 0 && _ss.stalled === 0 && _ss.standby > 0) {
                         _stateNote.text('All ' + _ss.standby + ' Stratum session' + (_ss.standby === 1 ? ' is' : 's are') +
-                            ' standby (no share submitted here): this node is usually a failover pool for these rigs.');
+                            (_elsewhere === _ss.standby
+                                ? ' standby: their payout address is hashing on another node, and this node is their failover pool.'
+                                : ' standby (no share submitted here): this node is usually a failover pool for these rigs.'));
                         _stateNote.style('display', null);
                     } else {
                         _stateNote.style('display', 'none');

@@ -1969,3 +1969,29 @@ TEST(DashboardSessionStates, StandbyIsMutedAndOnlyStalledWarns) {
         << "'Last Seen' was the stats poll time, which is always 'now' for a "
            "connected session; it hid a stalled rig";
 }
+
+// ===========================================================================
+// Failback: a rig that failed over to this node and back keeps its session
+// here, receives work and submits nothing. The API reads it standby with
+// hashing_elsewhere (its payout address keeps getting shares minted by another
+// node). The table and the chips must show it muted as standby ("hashing
+// elsewhere"), never amber stalled, and never in the stalled warning line.
+// ===========================================================================
+TEST(DashboardSessionStates, FailbackReadsStandbyHashingElsewhere) {
+    const auto html = read_dashboard();
+    // Per worker: the API's mark is carried into the row.
+    EXPECT_NE(html.find("elsewhere: workerData.hashing_elsewhere === true,"), std::string::npos)
+        << "the miners table ignores /stratum_stats workers[].hashing_elsewhere";
+    EXPECT_NE(html.find("var standbyTitle = worker.elsewhere ? ELSEWHERE_TITLE : STANDBY_TITLE;"),
+              std::string::npos);
+    EXPECT_NE(html.find("var ELSEWHERE_TITLE = 'Hashing on another node:"), std::string::npos);
+    // The standby summary row names them.
+    EXPECT_NE(html.find("(nElsewhere === standbyWorkers.length ? 'hashing on another node '"),
+              std::string::npos);
+    // Chips from /local_stats stratum_sessions.standby_elsewhere.
+    EXPECT_NE(html.find("_ss.standby_elsewhere"), std::string::npos);
+    EXPECT_NE(html.find("' (hashing elsewhere)'"), std::string::npos)
+        << "the standby chip does not say the rigs hash on another node";
+    // The stalled warning still lists stalled only (failback rows are standby).
+    EXPECT_NE(html.find("return sw.state === 'stalled';"), std::string::npos);
+}
