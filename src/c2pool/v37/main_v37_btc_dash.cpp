@@ -31,15 +31,18 @@
 //                                                                    [btc_node.hpp:149-154]
 //
 // THE VERIFY-ROUND FIXES FOLDED HERE (★) --------------------------------------------
-//   ★1 D8  H_b FROM THE BLOCK. The v36 SubmitBlockFn's `height` is cached_work()'s
-//          template height (src/impl/dash/stratum/work_source.cpp:2698, passed at
-//          :2845) — NOT the block's. submit_fn below derives the parent from the
-//          80-byte header it is handed (header[4..36) = hashPrevBlock), asks the
-//          backend height_of(parent), registers at parent+1; if the parent is
-//          unknown at win time it submits first and registers from height_of(bid)
-//          after an ACCEPTED submit. Never at the template height, never at 0.
-//          Every `height race` line the log prints must agree with
-//          `getblockheader <bid> .height` (runbook A7 checks it).
+//   ★1 D8  H_b FROM THE BLOCK. The v36 SubmitBlockFn's `height` is the block's
+//          own BIP34 height, read from the job's coinbase
+//          (src/impl/dash/stratum/won_block_record.hpp); the cached template's
+//          height stands in only when that template is the job's own (same
+//          parent), and it is 0 when neither is known. submit_fn below still
+//          derives H_b independently: the parent from the 80-byte header it is
+//          handed (header[4..36) = hashPrevBlock), the backend's
+//          height_of(parent), registration at parent+1; if the parent is
+//          unknown at win time it submits first and registers from
+//          height_of(bid) after an ACCEPTED submit. Never at 0. Every `height
+//          race` line the log prints (the two derivations disagree) must agree
+//          with `getblockheader <bid> .height` (runbook A7 checks it).
 //   ★3 D10 BLOCK-EVENT DRIVER. on_block_found (sidecar write-ahead → FOUND event →
 //          announce), on_block_finalized (D_conf burial, off the tip watch),
 //          on_block_orphaned (D11 re-check off the tip watch, or at maturity
@@ -1023,9 +1026,11 @@ int main(int argc, char** argv) {
     // ★ D8 + D10: real bytes → H_b FROM THE BLOCK → register (sidecar + FOUND
     // write-ahead, W6 §5.2) → submit the real hex. XbtcNode's own placeholder
     // submit is refused by the backend (armed=false) so exactly one real
-    // submitblock fires per won block.
+    // submitblock fires per won block. `ws_height` is the work source's answer
+    // (the coinbase BIP34 height, the template's height only as a fallback,
+    // 0 when unknown); H_b from the parent header cross-checks it.
     dash::stratum::DASHWorkSource::SubmitBlockFn submit_fn =
-        [&](const std::vector<unsigned char>& b, uint32_t wd_height /*template height — NOT the block's*/,
+        [&](const std::vector<unsigned char>& b, uint32_t ws_height /*coinbase BIP34; template height only as fallback; 0 = unknown*/,
             bool v36_height_race) -> bool {
             if (b.size() < 80) { LOG_ERROR << "[v37-dash] submit_fn: short block (" << b.size() << " bytes)"; return false; }
             const std::string bidh   = dash::crypto::hash_x11(b.data(), 80).GetHex();   // header-only X11 == DASH block hash (hash_x11.hpp:44)
@@ -1034,9 +1039,9 @@ int main(int argc, char** argv) {
 
             std::optional<std::uint64_t> hb;
             if (const auto ph = backend->height_of(parent)) hb = *ph + 1;             // H_b = height(parent) + 1
-            if (hb && *hb != wd_height)
+            if (hb && *hb != ws_height)
                 LOG_WARNING << "[v37-dash] height race: block " << bidh << " is at " << *hb
-                            << " (parent " << parent << " @" << (*hb - 1) << "), template said " << wd_height
+                            << " (parent " << parent << " @" << (*hb - 1) << "), work source said " << ws_height
                             << (v36_height_race ? " [v36 HeightRace]" : "");
             if (!hb)
                 LOG_WARNING << "[v37-dash] parent " << parent << " of " << bidh
@@ -1083,7 +1088,7 @@ int main(int argc, char** argv) {
             }
             if (!reg.registered)
                 LOG_ERROR << "[v37-dash] UNREGISTERED block " << bidh << " accepted=" << r.accepted
-                          << " — never registered at the template height (" << wd_height
+                          << " — never registered at the work source's height (" << ws_height
                           << ") and never at 0; operator: re-register by hand once H_b is known";
             else {
                 // ★ S-1: the cut this win folded E_b at, and where the OWED
