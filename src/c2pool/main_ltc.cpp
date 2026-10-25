@@ -2555,6 +2555,7 @@ int main(int argc, char* argv[]) {
                 auto utxo_heal = std::make_shared<UtxoHealFn>(
                     [chain = embedded_chain.get(), utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(), bcaster = embedded_broadcaster.get(),
+                     pool = embedded_pool.get(),
                      ltc_bs, fill_rr, utxo_jump_from, &ioc](
                         UtxoHeal kind, uint32_t target_height) -> bool {
                         if (!chain || !utxo || !utxo_db)
@@ -2615,6 +2616,15 @@ int main(int argc, char* argv[]) {
                                 LOG_ERROR << "[EMB-LTC] UTXO re-anchor failed (DB wipe); set left at h="
                                           << utxo->get_best_height();
                                 return false;
+                            }
+                            // The mempool's priced txs: their inputs come back as
+                            // the set refills; each drain's revalidate_inputs would
+                            // evict them meanwhile (and nothing refetches them).
+                            // Quarantined, they are re-priced by recompute_unknown_fees.
+                            if (pool) {
+                                const int requarantined = pool->requarantine_all();
+                                LOG_INFO << "[EMB-LTC] UTXO rebuild: " << requarantined
+                                         << " priced mempool txs quarantined until their inputs reconnect";
                             }
                             ltc::coin::ordered_arm(*ltc_bs, from, to);
                             ltc_bs->phase = "UTXO rebuild";

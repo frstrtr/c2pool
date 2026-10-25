@@ -156,6 +156,7 @@ struct Feed {
     std::map<uint32_t, uint256> best_chain;
     std::map<uint256, uint256> headers;  // every header seen: hash -> parent
     ConnectCheck last_refusal{ConnectCheck::Ok};
+    Mempool* pool{nullptr};              // optional: the fee passes main_ltc runs after connects
 
     void set_chain(const std::vector<BlockType>& blocks, uint32_t first_height)
     {
@@ -187,6 +188,15 @@ struct Feed {
     void refill()
     {
         ordered_refill(bs, [&](uint32_t rh) { requested.push_back(rh); });
+    }
+
+    // Once per drain / normal connect, as main_ltc does.
+    void fee_passes()
+    {
+        if (!pool)
+            return;
+        pool->recompute_unknown_fees(&utxo);
+        pool->revalidate_inputs(&utxo);
     }
 
     // main_ltc's utxo_heal: walk the UTXO set back to the best chain (undo
@@ -234,6 +244,8 @@ struct Feed {
             if (!utxo.reanchor())
                 return false;
             ++reanchored;
+            if (pool)
+                pool->requarantine_all();
             const uint32_t tip = tip_height();
             ordered_arm(bs, utxo_rebuild_from(tip, 288), std::max(target, tip));
             refill();
@@ -256,6 +268,8 @@ struct Feed {
         const auto r = ordered_drain(
             bs, [&](const BlockType& b, const uint256& h, uint32_t hh) { return check(b, h, hh); },
             [&](const BlockType& b, const uint256& h, uint32_t hh) { connect(b, h, hh); });
+        if (r.connected > 0)
+            fee_passes();
         if (r.refused != ConnectCheck::Ok) {
             last_refusal = r.refused;
             if (r.refused == ConnectCheck::ParentMismatch) {
@@ -296,6 +310,7 @@ struct Feed {
             const auto c = check(b, h, height);
             if (c == ConnectCheck::Ok) {
                 connect(b, h, height);
+                fee_passes();
             } else {
                 last_refusal = c;
                 if (c == ConnectCheck::ParentMismatch && heal(tip_height(), Heal::ParentMismatch) && bs.active)
@@ -1059,6 +1074,62 @@ TEST(LtcUtxoOrder, LegacyUndoRecordRefusesAndRebuilds)
     ASSERT_TRUE(t.cache->get_coin(X, c)) << "rebuilt from the best chain";
     EXPECT_TRUE(coin_eq(c, 5000000000LL, p2pkh(0xc1), 1, true, false));
     EXPECT_FALSE(has(*t.cache, y_tx));
+}
+
+// A rebuild must not empty the mempool: while the wiped set refills, a priced
+// tx's input is missing because its block has not reconnected yet, not
+// because it was spent. The heal quarantines the pool; each drain re-prices
+// what its inputs allow, and nothing priced is evicted on the way.
+TEST(LtcUtxoOrder, RebuildKeepsTheMempoolAndRepricesIt)
+{
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000c5");
+    const BlockType a1 = make_block(g, 1, {});
+    const Outpoint X(compute_txid(a1.m_txs[0]), 0);
+    const BlockType a2 = make_block(hash_of(a1), 2, {spend(X.txid, 0, 4000000000LL, 0x22)});
+    const uint256 y = compute_txid(a2.m_txs[1]);          // Y: 4e9, created by a2
+    const BlockType a3 = make_chain(hash_of(a2), 3, 1, 0x30)[0];
+    const BlockType b3 = make_chain(hash_of(a2), 3, 1, 0x31)[0];
+    const auto m = spend(y, 0, 3900000000LL, 0x44);       // mempool tx, fee 1e8
+    const uint256 mid = compute_txid(m);
+
+    TempDb t;
+    Mempool pool;
+    Feed f{*t.cache, *t.db};
+    f.pool = &pool;
+    f.set_chain({a1, a2, a3}, 1);
+    for (uint32_t h = 1; h <= 3; ++h)
+        f.deliver(h == 1 ? a1 : h == 2 ? a2 : a3, h);
+    ASSERT_TRUE(pool.add_tx_unchecked(m, t.cache.get()));
+    auto e = pool.get_entry(mid);
+    ASSERT_TRUE(e && e->fee_known && e->fee == 100000000u);
+
+    f.set_chain({a1, a2, b3}, 1);
+    t.db->remove_block_undo(3);                            // the walk cannot undo a3: rebuild
+    f.requested.clear();
+    f.reorg(3);
+    ASSERT_EQ(f.reanchored, 1u);
+    EXPECT_EQ(f.requested, (std::vector<uint32_t>{1, 2, 3}));
+    e = pool.get_entry(mid);
+    ASSERT_TRUE(e.has_value()) << "kept";
+    EXPECT_FALSE(e->fee_known) << "quarantined until Y reconnects";
+
+    f.deliver(a1, 1);                                      // Y not back yet
+    e = pool.get_entry(mid);
+    ASSERT_TRUE(e.has_value()) << "not evicted while the set refills";
+    EXPECT_FALSE(e->fee_known);
+    f.deliver(a2, 2);                                      // Y back: re-priced
+    e = pool.get_entry(mid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known);
+    EXPECT_EQ(e->fee, 100000000u);
+    f.deliver(b3, 3);
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b3));
+    e = pool.get_entry(mid);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_known);
+    EXPECT_EQ(pool.total_fees(), 100000000u);
 }
 
 // A record is bound to the block it undoes (Core binds it with a checksum over
