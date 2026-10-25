@@ -17,6 +17,7 @@
 //                receipt; the next carriers carry it (no uncles; credited at
 //                its origin bin), 1 bin after the switch (carry-bins);
 //   racelate     the same, carried 3 bins after the switch (the 3+ bucket);
+//   raceskip     the loser's P_r not held at its switch: repend-skipped 1;
 //   carriage     17 carriable pending receipts: the first 16 in the canonical
 //                order; a carriable receipt is carried by default (R2); the 16
 //                carried receipts of other payees counted foreign-carried;
@@ -504,6 +505,38 @@ void racelate() {
           "racelate: carried 3 bins after the switch: the 3+ bucket (carry-bins " + std::to_string(sc.carry_bins[0]) + "/" +
                   std::to_string(sc.carry_bins[1]) + "/" + std::to_string(sc.carry_bins[2]) + "/" +
                   std::to_string(sc.carry_bins[3]) + ", max " + std::to_string(sc.carry_bins_max) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// raceskip: a sibling race on two Monero heights (each sibling on its own P_r); the losing sibling's P_r is no longer
+// held when the loser switches (BadServed): the re-pend step skips its receipt: repend-skipped 1, re-pended 0, lost 0.
+void raceskip() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + i);
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.mine(a, 2, 900);
+    h.tick_monero();
+    h.mine(b, 3, 901);
+    const pb::Hash32 ca = h[a].tree().best().id, cb = h[b].tree().best().id;
+    h.cut.clear();
+    const std::size_t lnode = ca < cb ? b : a, wnode = ca < cb ? a : b;
+    const pb::Hash32 loser = ca < cb ? cb : ca, winner = ca < cb ? ca : cb;
+    const pb::Hash32 pr_loser = h[lnode].bodies().get(loser)->own.blob.prev_id;
+    const pb::Hash32 pr_winner = h[wnode].bodies().get(winner)->own.blob.prev_id;
+    h.bad_served.insert(pr_loser);
+    const pb::NodeEventResult sw = h[lnode].on_carrier(wnode, *pb::encode_fc_carrier(0, *h[wnode].bodies().get(winner), 16));
+    const pb::PathbNode::SwitchCounts& sc = h[lnode].switch_counts();
+    check(pr_loser != pr_winner && sw.action == pb::NodeAction::Switched && h[lnode].tree().best().id == winner,
+          "raceskip: the siblings on two P_r; the loser switches to the winner");
+    check(sc.repend_skipped == 1 && sc.repended == 0 && sc.lost == 0 && !h[lnode].pending().holds(loser),
+          "raceskip: the losing receipt whose P_r is not held is skipped (repend-skipped " +
+                  std::to_string(sc.repend_skipped) + ", re-pended " + std::to_string(sc.repended) + ", lost " +
+                  std::to_string(sc.lost) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -9497,6 +9530,7 @@ int main(int argc, char** argv) {
     run("relay", relay);
     run("race", race);
     run("racelate", racelate);
+    run("raceskip", raceskip);
     run("carriage", carriage);
     run("feediverse", feediverse);
     run("repend", repend);
