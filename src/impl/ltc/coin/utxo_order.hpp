@@ -18,6 +18,8 @@
 /// calls these helpers; the KAT drives the same helpers in the same order.
 
 #include <core/coin/block_bootstrapper.hpp>
+#include <core/coin/utxo.hpp>
+#include <core/log.hpp>
 #include <core/uint256.hpp>
 
 #include <algorithm>
@@ -212,12 +214,41 @@ bool ordered_done(const core::coin::BlockBootstrapState<BlockT>& bs)
 
 /// Result of walking the UTXO set back to the best chain.
 struct RewindResult {
-    bool     ok{true};          // false: undo data missing, deeper than max_depth,
-                                // or a height the header chain cannot judge
+    /// Why the walk stopped short of the best chain.
+    enum class Why {
+        None,           // it did not: the set's best is on the best chain
+        NoUndo,         // no undo record at a height the walk has to disconnect
+        Legacy,         // a legacy (pre-#2059) record: its spent coins cannot be put back
+        TooDeep,        // more than max_depth blocks to disconnect
+        CannotJudge,    // the header chain has no block at a height, or no parent for one
+        BlockMismatch,  // the record at a height belongs to another block
+    };
+    bool     ok{true};          // false: see why
+    Why      why{Why::None};
     uint32_t disconnected{0};
     uint32_t height{0};         // the UTXO set's best after the walk
     uint256  hash;              // ... and its block hash (flush to this)
+
+    /// No amount of waiting brings the set back (the record is gone, cannot
+    /// restore, belongs to another block, or the fork is too deep): only a
+    /// rebuild does. CannotJudge is transient: the header index is being
+    /// rebuilt.
+    bool permanent() const { return !ok && why != Why::CannotJudge; }
 };
+
+inline const char* rewind_why_name(RewindResult::Why w)
+{
+    using Why = RewindResult::Why;
+    switch (w) {
+    case Why::None:          return "none";
+    case Why::NoUndo:        return "undo record missing";
+    case Why::Legacy:        return "legacy undo record";
+    case Why::TooDeep:       return "deeper than the undo window";
+    case Why::CannotJudge:   return "a height the header chain cannot judge";
+    case Why::BlockMismatch: return "undo record of another block";
+    }
+    return "unknown";
+}
 
 /// Walk the UTXO set's best back, one height at a time, until its block is
 /// the best chain's block at that height (`chain_hash_at(h)`). Above
@@ -226,45 +257,81 @@ struct RewindResult {
 /// chain). At or below it a null answer means the header chain cannot judge
 /// that height: the walk fails instead of calling the UTXO set good.
 /// `prev_of(hash)` gives a block's parent (std::optional; nullopt = unknown),
-/// `disconnect(h)` undoes the UTXO set's block at height h (false = no undo
-/// data). At most `max_depth` blocks are disconnected. The caller flushes to
-/// (height, hash) when anything was disconnected, then re-arms the fill.
-/// An empty UTXO set (null best block) is left alone.
+/// `disconnect(h, hash)` undoes the UTXO set's block `hash` at height h and
+/// returns Why::None, or why the record at h cannot bring the set back
+/// (disconnect_with_undo below). At most `max_depth` blocks are disconnected.
+/// The caller flushes to (height, hash) when anything was disconnected, then
+/// re-arms the fill. An empty UTXO set (null best block) is left alone.
 template <typename ChainHashAtFn, typename PrevOfFn, typename DisconnectFn>
 RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uint32_t utxo_best,
                                   const uint256& utxo_best_block,
                                   ChainHashAtFn&& chain_hash_at, PrevOfFn&& prev_of,
                                   DisconnectFn&& disconnect)
 {
+    using Why = RewindResult::Why;
     RewindResult r;
     r.height = utxo_best;
     r.hash = utxo_best_block;
     if (utxo_best_block.IsNull())
         return r;
+    auto fail = [&r](Why why) {
+        r.ok = false;
+        r.why = why;
+        return r;
+    };
     while (r.height > 0) {
         if (r.height <= chain_height) {
             const uint256 at = chain_hash_at(r.height);
             if (at == r.hash)
                 break;
-            if (at.IsNull()) {
-                r.ok = false;
-                return r;
-            }
+            if (at.IsNull())
+                return fail(Why::CannotJudge);
         }
-        if (r.disconnected >= max_depth) {
-            r.ok = false;
-            return r;
-        }
+        if (r.disconnected >= max_depth)
+            return fail(Why::TooDeep);
         const auto prev = prev_of(r.hash);
-        if (!prev || !disconnect(r.height)) {
-            r.ok = false;
-            return r;
-        }
+        if (!prev)
+            return fail(Why::CannotJudge);
+        const Why w = disconnect(r.height, r.hash);
+        if (w != Why::None)
+            return fail(w);
         r.hash = *prev;
         --r.height;
         ++r.disconnected;
     }
     return r;
+}
+
+/// The walk's disconnect step over a UTXO DB's undo records (main_ltc's heal):
+/// the record at h must exist, belong to the block being undone (`hash`; Core
+/// binds a record to its block with a checksum over pprev's hash,
+/// validation.cpp:1676-1678, 1872 — a record without a hash is unbound) and be
+/// able to put its spent coins back; then the block is disconnected. A record
+/// that cannot bring the set back touches nothing.
+template <typename UndoDbT, typename UtxoT>
+RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, const uint256& hash)
+{
+    using Why = RewindResult::Why;
+    core::coin::BlockUndo undo;
+    if (!db.get_block_undo(h, undo))
+        return Why::NoUndo;
+    if (!undo.block_hash.IsNull() && undo.block_hash != hash)
+        return Why::BlockMismatch;
+    if (!undo.restorable()) {
+        LOG_ERROR << "[UTXO] legacy undo record (pre-#2059) at h=" << h << ": "
+                  << undo.unrestorable_coins() << " spent coin(s) cannot be restored";
+        return Why::Legacy;
+    }
+    if (!utxo.disconnect_from_undo(undo))
+        return Why::Legacy;
+    return Why::None;
+}
+
+/// First height of a rebuild from an empty UTXO set: the last `keep` blocks
+/// below the tip, as the cold-start bootstrap takes them.
+inline uint32_t utxo_rebuild_from(uint32_t tip, uint32_t keep)
+{
+    return tip > keep ? tip - keep : 1;
 }
 
 /// A tip change is a reorg when the new tip does not descend from the old

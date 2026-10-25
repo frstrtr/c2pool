@@ -178,7 +178,7 @@ struct Feed {
     {
         const auto undo = utxo.connect_block(b, height, [](const MutableTransaction& tx) {
             return compute_txid(tx);
-        });
+        }, h);
         db.put_block_undo(height, undo);
         utxo.flush(h, height);
         connected.push_back(height);
@@ -191,11 +191,14 @@ struct Feed {
 
     // main_ltc's utxo_heal: walk the UTXO set back to the best chain (undo
     // data, at most LTC_KEEP), flush, drop the undo records, re-arm from its
-    // real best. crash_after > 0 stops the walk dead after that many
-    // disconnects (a crash before the flush).
+    // real best; when the walk can never get there, wipe the set and rebuild
+    // the best chain's last LTC_KEEP blocks. crash_after > 0 stops the walk
+    // dead after that many disconnects (a crash before the flush).
     enum class Heal { Startup, Reorg, ParentMismatch };
     uint32_t crash_after{0};
     struct Crash {};
+    uint32_t reanchored{0};
+    RewindResult::Why last_why{RewindResult::Why::None};
 
     bool heal(uint32_t target, Heal kind)
     {
@@ -212,20 +215,29 @@ struct Feed {
                     return std::nullopt;
                 return it->second;
             },
-            [&](uint32_t h) {
-                core::coin::BlockUndo undo;
-                if (!db.get_block_undo(h, undo))
-                    return false;
-                utxo.disconnect_from_undo(undo);
+            [&](uint32_t h, const uint256& hh) {
+                const auto w = disconnect_with_undo(db, utxo, h, hh);
+                if (w != RewindResult::Why::None)
+                    return w;
                 undone.push_back(h);
                 if (crash_after != 0 && undone.size() == crash_after)
                     throw Crash{};
-                return true;
+                return w;
             });
+        last_why = rw.why;
         if (rw.disconnected > 0) {
             utxo.flush(rw.hash, rw.height);
             for (uint32_t h : undone)
                 db.remove_block_undo(h);
+        }
+        if (rw.permanent()) {
+            if (!utxo.reanchor())
+                return false;
+            ++reanchored;
+            const uint32_t tip = tip_height();
+            ordered_arm(bs, utxo_rebuild_from(tip, 288), std::max(target, tip));
+            refill();
+            return true;
         }
         if (!rw.ok)
             return false;
@@ -613,7 +625,7 @@ TEST(LtcUtxoOrder, ParentMismatchRewindsAndHeals)
 // A crash after a reorg's tip was persisted but before its UTXO disconnect
 // ran: on restart there is no tip change. The startup check walks the UTXO
 // set back and refills the new branch; on a UTXO set already on the best
-// chain it does nothing. Past the undo data it gives up (ERROR stop).
+// chain it does nothing.
 TEST(LtcUtxoOrder, StartupHealsACrashBetweenTipAndDisconnect)
 {
     TempDb t;
@@ -650,7 +662,11 @@ TEST(LtcUtxoOrder, StartupHealsACrashBetweenTipAndDisconnect)
     EXPECT_TRUE(has(*t.cache, b[2].m_txs[0]));
 }
 
-TEST(LtcUtxoOrder, HealGivesUpWithoutUndoData)
+// Undo data pruned at a height the walk has to disconnect: the set can never
+// be brought back by the walk, so it is wiped and the best chain's last
+// LTC_KEEP blocks are connected into the empty set (it is never left parked
+// off the best chain, where every later block would be a parent mismatch).
+TEST(LtcUtxoOrder, HealWithoutUndoDataRebuildsFromTheBestChain)
 {
     TempDb t;
     Feed f{*t.cache, *t.db};
@@ -663,9 +679,22 @@ TEST(LtcUtxoOrder, HealGivesUpWithoutUndoData)
         f.deliver(a[h - 1], h);
     f.set_chain({a[0], b[0], b[1]}, 1);
     t.db->remove_block_undo(2);                            // pruned
-    EXPECT_FALSE(f.heal(3, Feed::Heal::Reorg)) << "cannot reach the best chain";
-    EXPECT_EQ(t.cache->get_best_height(), 2u) << "a3 undone, a2 has no undo data";
-    EXPECT_FALSE(f.bs.active) << "no fill armed on a UTXO set off the best chain";
+    f.requested.clear();
+    EXPECT_TRUE(f.heal(3, Feed::Heal::Reorg));
+    EXPECT_EQ(f.last_why, RewindResult::Why::NoUndo) << "a3 undone, a2 has no undo data";
+    EXPECT_EQ(f.reanchored, 1u);
+    EXPECT_TRUE(t.cache->get_best_block().IsNull()) << "wiped";
+    EXPECT_TRUE(f.bs.active);
+    EXPECT_EQ(f.requested, (std::vector<uint32_t>{1, 2, 3}));
+    f.deliver(a[0], 1);
+    f.deliver(b[0], 2);
+    f.deliver(b[1], 3);
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b[1]));
+    EXPECT_TRUE(has(*t.cache, a[0].m_txs[0]));
+    EXPECT_TRUE(has(*t.cache, b[1].m_txs[0]));
+    EXPECT_FALSE(has(*t.cache, a[1].m_txs[0]));
+    EXPECT_FALSE(has(*t.cache, a[2].m_txs[0]));
 }
 
 // A reorg onto a shorter but heavier chain: the UTXO set's best (a4) is above
@@ -705,7 +734,8 @@ TEST(LtcUtxoOrder, ReorgOntoAShorterChainDisconnectsAboveTheTip)
 // A height index with a hole at the UTXO set's best (a fast-start checkpoint
 // above it, a rebuild in progress): the walk cannot tell whether that block
 // is on the best chain, so it fails instead of calling the set good, and a
-// parent mismatch at the next height does not re-request the same range.
+// parent mismatch at the next height does not re-request the same range. The
+// hole is transient: nothing is wiped.
 TEST(LtcUtxoOrder, HealFailsOnAHeightTheChainCannotJudge)
 {
     TempDb t;
@@ -720,6 +750,8 @@ TEST(LtcUtxoOrder, HealFailsOnAHeightTheChainCannotJudge)
     f.requested.clear();
     EXPECT_FALSE(f.heal(4, Feed::Heal::ParentMismatch));
     EXPECT_FALSE(f.heal(4, Feed::Heal::Reorg));
+    EXPECT_EQ(f.last_why, RewindResult::Why::CannotJudge);
+    EXPECT_EQ(f.reanchored, 0u);
     EXPECT_EQ(t.cache->get_best_height(), 3u) << "nothing undone";
     EXPECT_FALSE(f.bs.active);
     EXPECT_TRUE(f.requested.empty());
@@ -975,6 +1007,101 @@ TEST(LtcUtxoOrder, DisconnectBlockChecksTheRecordAgainstTheBody)
     EXPECT_TRUE(coin_eq(c, 5000000000LL, p2pkh(0xc1), 1, true, false));
     EXPECT_FALSE(has(*t.cache, y_tx));
     EXPECT_FALSE(has(*t.cache, a2.m_txs[0]));
+}
+
+// A legacy (pre-#2059) record cannot put its spent coins back. A disconnect
+// with it removes only the block's outputs and says so (false); the heal
+// touches nothing, wipes the set and rebuilds it from the best chain instead
+// of carrying on with coins missing.
+TEST(LtcUtxoOrder, LegacyUndoRecordRefusesAndRebuilds)
+{
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000c3");
+    const BlockType a1 = make_block(g, 1, {});
+    const Outpoint X(compute_txid(a1.m_txs[0]), 0);
+    const BlockType a2 = make_block(hash_of(a1), 2, {spend(X.txid, 0, 4000000000LL, 0x22)});
+    const auto y_tx = a2.m_txs[1];
+    const BlockType b2 = make_chain(hash_of(a1), 2, 1, 0x60)[0];
+
+    TempDb t;
+    Feed f{*t.cache, *t.db};
+    f.set_chain({a1, a2}, 1);
+    f.deliver(a1, 1);
+    f.deliver(a2, 2);
+    // a2's record as a node that connected a2 before the upgrade left it.
+    core::coin::BlockUndo v2;
+    ASSERT_TRUE(t.db->get_block_undo(2, v2));
+    ASSERT_TRUE(t.db->put_block_undo_legacy(2, v2));
+    core::coin::BlockUndo u;
+    ASSERT_TRUE(t.db->get_block_undo(2, u));
+    EXPECT_EQ(u.format, 1);
+    EXPECT_FALSE(u.restorable());
+    EXPECT_FALSE(t.cache->disconnect_from_undo(u)) << "cannot restore: says so";
+    EXPECT_FALSE(has(*t.cache, a2.m_txs[0])) << "the block's outputs are removed";
+    EXPECT_FALSE(has(*t.cache, y_tx));
+    EXPECT_FALSE(t.cache->have_coin(X)) << "the record has no outpoint to put X back at";
+
+    f.set_chain({a1, b2}, 1);
+    f.requested.clear();
+    f.reorg(2);
+    EXPECT_EQ(f.last_why, RewindResult::Why::Legacy);
+    EXPECT_EQ(f.reanchored, 1u);
+    EXPECT_TRUE(t.cache->get_best_block().IsNull()) << "wiped";
+    EXPECT_TRUE(f.bs.active);
+    EXPECT_EQ(f.requested, (std::vector<uint32_t>{1, 2}));
+    core::coin::BlockUndo gone;
+    EXPECT_FALSE(t.db->get_block_undo(2, gone)) << "the legacy record went with the wipe";
+    f.deliver(a1, 1);
+    f.deliver(b2, 2);
+    EXPECT_FALSE(f.bs.active);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b2));
+    core::coin::Coin c;
+    ASSERT_TRUE(t.cache->get_coin(X, c)) << "rebuilt from the best chain";
+    EXPECT_TRUE(coin_eq(c, 5000000000LL, p2pkh(0xc1), 1, true, false));
+    EXPECT_FALSE(has(*t.cache, y_tx));
+}
+
+// A record is bound to the block it undoes (Core binds it with a checksum over
+// pprev's hash). A record of another block at the same height — a2x's under
+// height 2 while the set holds a2 — is never applied (it would put X back
+// under a2's output Y); the heal rebuilds instead.
+TEST(LtcUtxoOrder, UndoRecordOfAnotherBlockIsNeverApplied)
+{
+    uint256 g;
+    g.SetHex("00000000000000000000000000000000000000000000000000000000000000c4");
+    const BlockType a1 = make_block(g, 1, {});
+    const Outpoint X(compute_txid(a1.m_txs[0]), 0);
+    const BlockType a2 = make_block(hash_of(a1), 2, {spend(X.txid, 0, 4000000000LL, 0x22)});
+    const auto y_tx = a2.m_txs[1];
+    BlockType a2x = make_chain(hash_of(a1), 2, 1, 0x70)[0];
+    a2x.m_txs.push_back(spend(X.txid, 0, 3500000000LL, 0x25));
+    const BlockType b2 = make_chain(hash_of(a1), 2, 1, 0x60)[0];
+
+    TempDb t;
+    Feed f{*t.cache, *t.db};
+    f.set_chain({a1, a2}, 1);
+    f.deliver(a1, 1);
+    f.deliver(a2, 2);
+    {
+        TempDb scratch;
+        scratch.cache->connect_block(a1, 1, txid_fn, hash_of(a1));
+        ASSERT_TRUE(t.db->put_block_undo(2, scratch.cache->connect_block(a2x, 2, txid_fn, hash_of(a2x))));
+    }
+    EXPECT_EQ(disconnect_with_undo(*t.db, *t.cache, 2, hash_of(a2)), RewindResult::Why::BlockMismatch);
+    EXPECT_FALSE(t.cache->have_coin(X)) << "a2x's record not applied";
+    EXPECT_TRUE(has(*t.cache, y_tx));
+
+    f.set_chain({a1, b2}, 1);
+    f.requested.clear();
+    f.reorg(2);
+    EXPECT_EQ(f.last_why, RewindResult::Why::BlockMismatch);
+    EXPECT_EQ(f.reanchored, 1u);
+    EXPECT_EQ(f.requested, (std::vector<uint32_t>{1, 2}));
+    f.deliver(a1, 1);
+    f.deliver(b2, 2);
+    EXPECT_EQ(t.cache->get_best_block(), hash_of(b2));
+    EXPECT_TRUE(t.cache->have_coin(X));
+    EXPECT_FALSE(has(*t.cache, y_tx));
 }
 
 // The format-2 record, byte by byte (utxo.hpp serialize_block_undo_v2), its
