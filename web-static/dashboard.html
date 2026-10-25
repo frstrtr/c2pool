@@ -2485,6 +2485,30 @@
             return s;
         }
 
+        // Chart marker + tooltip lines for a /recent_blocks row by its on-chain
+        // status. An orphaned block (another block won its height) must not be
+        // drawn as a green "Block Found!" diamond: it gets its own marker and
+        // headline, and its status is shown in red rather than the pending
+        // amber. Display only.
+        function block_is_orphaned(b) {
+            return !!b && b.status === 'orphaned';
+        }
+        function block_marker_style(b, luckColor) {
+            if (block_is_orphaned(b))
+                return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
+            return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
+        }
+        function block_headline_html(b) {
+            if (block_is_orphaned(b))
+                return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
+            return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+        }
+        function block_status_html(b) {
+            var st = (b && b.status) || 'unknown';
+            var color = st === 'confirmed' ? '#00ff88' : (st === 'orphaned' ? '#ff6b6b' : '#ffc107');
+            return 'Status: <b style="color:' + color + '">' + st + '</b>';
+        }
+
         // Format percentage with big integer + small decimal parts
         // Format percentage with big bold integer + smaller decimal
         function format_pct_fancy(pct) {
@@ -8311,7 +8335,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -8647,7 +8671,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8685,7 +8709,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -8778,8 +8802,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -8790,7 +8815,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8827,7 +8852,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -9072,7 +9097,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -9359,7 +9384,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9398,7 +9423,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -9503,8 +9528,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -9515,7 +9541,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9552,7 +9578,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
