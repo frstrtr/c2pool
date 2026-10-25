@@ -2800,8 +2800,8 @@ private:
         c.step = 0;
         catchup_ask_locked(p, c);
     }
-    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended by their done test (every HELLO
-    // tip held) is caught up (its record leaves the store).
+    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
+    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store).
     void caught_up_locked() {
         if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
         node_->note_caught_up();
@@ -2892,16 +2892,25 @@ private:
                             }
                             // the reply to a request from position 0 carried no header: the peer serves nothing after
                             // position 0 (a store that never caught up: the joiner path)
-                            if (o.ids.empty() && it->second.from_pos0 && node_->offer_empty_store_tip(p)) {
-                                st_.empty_store_offers++;
-                                join = true;
+                            if (o.ids.empty() && it->second.from_pos0) {
+                                if (node_->offer_empty_store_tip(p)) {
+                                    st_.empty_store_offers++;
+                                    join = true;
+                                }
+                                catchup_.erase(it);
+                                break;
                             }
+                            // the node's own header work kept its chain: this catch-up ended by its reply
                             catchup_.erase(it);
+                            caught_up_locked();
                             break;
-                        case K::JoinerPath:
+                        case K::JoinerPath: catchup_.erase(it); break;
                         case K::Ban:
                         case K::Strike:
-                        case K::Undecodable: catchup_.erase(it); break;
+                        case K::Undecodable:  // the catch-up ended by its reply
+                            catchup_.erase(it);
+                            caught_up_locked();
+                            break;
                         case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
                                               // the page lapses
                             if (o.fetch_last != Hash32{}) {
