@@ -89,6 +89,32 @@ if (BUILD_TESTING AND GTest_FOUND)
     # goes out as a full block: a v2 cmpctblock cannot carry mweb) and the
     # sendcmpct highest-version fold. Same folding rule.
     #
+    # cmpct_v3_mweb_state_test.cpp: v3 (MWEB) compact blocks over the REAL
+    # mainnet block 3200424 (ltc_mweb_cmpct_fixtures.hpp): wire format, HogEx
+    # extraction, reconstruction and blocktxn completion carrying the mw::Block
+    # into the same MWEB state as the full block, the full-block fallbacks,
+    # forged/flipped/replayed commitments never becoming state, BIP 152 SipHash
+    # keys, the 65535 limit and the sendcmpct announce order. Same folding rule.
+    #
+    # cmpct_litecoind_vector_test.cpp: BIP 152 short ids, parse and re-encoding
+    # pinned to compact blocks litecoind 0.21.5.6 produced for a regtest block
+    # (ltc_regtest_cmpct_fixtures.hpp documents how). Same folding rule.
+    #
+    # mweb_fetch_retry_test.cpp: the tip full-block fetch retry state machine
+    # (schedule, one peer then all, cancel, re-arm, give-up cadence), the MWEB
+    # window metrics and the seen-blocks LRU. Same folding rule.
+    #
+    # mweb_state_hash_binding_test.cpp: MWEB state is bound to the hash of its
+    # block; the template builder HOLDs on a sibling's state and builds the
+    # HogEx template on the tip's (real block 3200424). Same folding rule.
+    #
+    # utxo_order_test.cpp: embedded LTC blocks reach the UTXO set strictly in
+    # height order (a REAL UTXOViewCache/UTXOViewDB through the utxo_order.hpp
+    # helpers the full-block handler uses): out-of-order arrival, a wide gap,
+    # a sibling reorg, a reorg while a fill is running, the connect-point check
+    # (stale buffered blocks, a pipeline above the UTXO set, a UTXO set on
+    # another branch). Same folding rule.
+    #
     # mweb_next_header_test.cpp: the MWEB header of the next empty-body block
     # is built as libmw builds it (cumulative roots, txo count and kernel offset
     # carried; kernel root, kernel count and stealth offset zero), byte-equal to
@@ -117,6 +143,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         build_stops_test.cpp
         chain_topology_endpoints_kat_test.cpp
         chain_walk_window_test.cpp
+        cmpct_litecoind_vector_test.cpp
+        cmpct_v3_mweb_state_test.cpp
         compact_block_merkle_test.cpp
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
@@ -133,7 +161,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mempool_mweb_admission_test.cpp
+        mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
+        mweb_state_hash_binding_test.cpp
         mweb_tx_wire_test.cpp
         peer_block_pow_carry_test.cpp
         per_peer_ingest_test.cpp
@@ -146,6 +176,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_topology_spend_test.cpp
+        utxo_order_test.cpp
         version_switch_floor_test.cpp
         wirecompat_runtime_test.cpp
     )

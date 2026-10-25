@@ -837,6 +837,49 @@ TEST(LtcMwebHogex, DegradedAfterHoldClosesTheHoldWindow)
     EXPECT_FALSE(has_warning_prefix(f.mi.rest_local_stats(), "MWEB HOLD for "));
 }
 
+// HOLD ends on the MWEB update even when the update lands right after the
+// tip-change refresh. The tip change refreshes through the debounced path
+// (leading edge: HOLD starts); a second debounced call inside its 300 ms
+// window is coalesced into a trailing refresh gated on a SHARECHAIN change,
+// so an MWEB update that used it would leave the HOLD in place. The update
+// path calls the immediate refresh, which ends the HOLD at once.
+TEST(LtcMwebHogex, HoldEndsOnUpdateRightAfterTipChangeRefresh)
+{
+    boost::asio::io_context ioc;
+    core::WebServer ws(ioc, "127.0.0.1", 0, /*testnet=*/true);
+    MockCoinNode node;
+    MiningInterface* mi = ws.get_mining_interface();
+    ASSERT_NE(mi, nullptr);
+    mi->set_coin_node(&node);
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    const std::string new_prev = rep("0", 62) + "cd";
+
+    node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    ws.trigger_work_refresh();
+    ASSERT_EQ(mi->get_current_gbt_prevhash(), kPrev);
+
+    // Tip change (debounced refresh, leading edge): no MWEB state yet -> HOLD.
+    node.work_data = mweb_template({{kTx1, t1}}, "", new_prev);
+    ws.trigger_work_refresh_debounced();
+    ASSERT_TRUE(mi->is_mweb_holding());
+    EXPECT_EQ(mi->get_current_gbt_prevhash(), kPrev);
+
+    // The MWEB state lands a few ms later. Through the debounced path the
+    // call is only scheduled: nothing changes now.
+    node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb, new_prev);
+    ws.trigger_work_refresh_debounced();
+    EXPECT_TRUE(mi->is_mweb_holding()) << "a debounced call inside the window is deferred";
+    EXPECT_EQ(mi->get_current_gbt_prevhash(), kPrev);
+
+    // The immediate refresh the update path uses: the HOLD ends now.
+    ws.trigger_work_refresh();
+    EXPECT_FALSE(mi->is_mweb_holding());
+    EXPECT_EQ(mi->get_current_gbt_prevhash(), new_prev);
+    const double total = mi->get_mweb_hold_seconds();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(mi->get_mweb_hold_seconds(), total) << "HOLD seconds stop rising";
+}
+
 // Coin-side metrics (LTC embedded: "ltc_mweb") are merged into /local_stats
 // next to the MWEB counters; a non-object result or a throwing provider
 // leaves the payload intact.
