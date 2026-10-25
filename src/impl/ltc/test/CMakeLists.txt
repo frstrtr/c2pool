@@ -107,6 +107,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # drop_tails_asan_kat_test.cpp ([L-KR1Z1S]): drives the clean_tracker Step 3
+    # tail-drop loop (ltc::drop_tails, drop_tails.hpp) over a REAL ~18k-share
+    # ShareTracker for 300+ drop iterations while a concurrent build_stops
+    # walker runs under the production lock discipline. Meant to be run under
+    # ASan to catch a prune-vs-walk use-after-free. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -122,6 +128,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_template_underfill_test.cpp
+        drop_tails_asan_kat_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
