@@ -2546,3 +2546,83 @@ TEST(DashAlertDetector, MainDashFeedsTheServeSampleToTheAlertTick)
     EXPECT_NE(code.find("ac.det.serve_stall_after = g_alert_relay.serve_stall_after;"), std::string::npos);
     EXPECT_NE(code.find("\"--alert-relay-serve-stall-after\""), std::string::npos);
 }
+
+// The node-level events have their own hourly budget. On the shared worker cap,
+// a 26-rig flap (26 OFFLINE + 26 BACK_ONLINE against 30/h) held a real
+// WORK_STALLED back for up to an hour.
+TEST(DashAlertDetector, WorkStalledHasItsOwnBudgetOutsideTheWorkerCap)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    ASSERT_EQ(c.max_per_hour, 30u);
+    ASSERT_EQ(c.serve_max_per_hour, 4u);
+
+    // (a) A saturated worker cap does not hold WORK_STALLED back.
+    {
+        AlertDetector d(c, T0);
+        auto rigs = [](int gen, uint64_t acc) {
+            std::vector<WorkerSample> v;
+            for (int i = 0; i < 26; ++i)
+                v.push_back({"XaddrA.rig" + std::to_string(i),
+                             "g" + std::to_string(gen) + "s" + std::to_string(i), acc});
+            return v;
+        };
+        std::size_t off = 0, back = 0, dig = 0, stalled = 0;
+        int64_t stalled_at = 0, served_at = T0, stamp = 1;
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 1600; t += 10) {
+            std::vector<WorkerSample> smp;
+            bool serve = false;
+            if (t < T0 + 10) { smp = rigs(0, acc++); serve = true; }      // hashing, served
+            else if (t < T0 + 320) {}                                     // the flap: all gone
+            else if (t < T0 + 1200) { smp = rigs(1, acc++); serve = true; } // back, served
+            else smp = rigs(1, acc++);                                     // attached, no work
+            if (serve) { served_at = t; ++stamp; }
+            auto s = served(stamp, t - served_at);
+            for (const auto& e : d.tick(smp, t, &s)) {
+                if (e.kind == Kind::Offline) ++off;
+                else if (e.kind == Kind::BackOnline) ++back;
+                else if (e.kind == Kind::Digest) ++dig;
+                else if (e.kind == Kind::WorkStalled) { ++stalled; stalled_at = t; }
+            }
+        }
+        EXPECT_EQ(off, 26u);
+        EXPECT_EQ(back, 4u) << "the worker cap is full: 26 + 4 = 30 in the hour";
+        EXPECT_EQ(dig, 1u);
+        EXPECT_EQ(d.suppressed_by_cap(), 22u) << "22 BACK_ONLINEs still held";
+        EXPECT_EQ(stalled, 1u) << "the stall pages although the worker cap is saturated";
+        EXPECT_EQ(stalled_at, T0 + 1190 + 300) << "last hand-out at +1190";
+        EXPECT_EQ(d.serve_held_by_budget(), 0u);
+    }
+
+    // (b) The node-level budget is itself bounded: a serve path that stalls
+    // for 120 s out of every 120 s pages at most 4 node-level events in any
+    // rolling hour; what it holds back stays due and goes out as the window
+    // frees.
+    {
+        auto cb = c;
+        cb.serve_stall_after = 60;
+        cb.min_interval = 0;
+        AlertDetector d(cb, T0);
+        std::vector<int64_t> node_events;
+        int64_t served_at = T0, stamp = 1;
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 2 * 3600; t += 5) {
+            if ((t - T0) % 120 == 0) { served_at = t; ++stamp; }
+            auto s = served(stamp, t - served_at);
+            for (const auto& e : d.tick(one("XaddrA.rig1", "s1", acc++), t, &s))
+                if (is_work_kind(static_cast<uint8_t>(e.kind))) node_events.push_back(e.ts);
+        }
+        ASSERT_GE(node_events.size(), 4u) << "the budget was actually reached";
+        for (std::size_t i = 0; i < node_events.size(); ++i) {
+            std::size_t in_hour = 0;
+            for (int64_t ts : node_events)
+                if (ts > node_events[i] - 3600 && ts <= node_events[i]) ++in_hour;
+            EXPECT_LE(in_hour, 4u) << "rolling hour ending at t=" << node_events[i] - T0;
+        }
+        EXPECT_LE(node_events.size(), 8u) << "two hours, 4 per rolling hour";
+        EXPECT_GT(node_events.back(), T0 + 3600) << "held events go out once the window frees";
+        EXPECT_GE(d.serve_held_by_budget(), 1u);
+        EXPECT_EQ(d.status_json(T0 + 7200)["serve"]["held_by_budget"], d.serve_held_by_budget());
+    }
+}

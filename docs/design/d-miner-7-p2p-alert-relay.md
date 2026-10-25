@@ -101,8 +101,9 @@ keeps a dead rig "alive" for ~17 minutes.
 - A worker never seen up never alerts. Known workers that hashed here (and
   whether an OFFLINE is outstanding) persist in `state.json`, so a restart
   neither forgets a rig that never reconnects nor re-pages one already reported.
-- Global cap: 30 events per rolling hour; the first refused event produces one
-  digest message and refused events stay pending (they fire when the window frees).
+- Global cap: 30 worker events per rolling hour; the first refused event produces
+  one digest message and refused events stay pending (they fire when the window
+  frees). The node-level events below have their own budget.
 
 ## Node level: no work served (origin)
 
@@ -130,11 +131,14 @@ last handed to a miner (the datum the serve-silence check reads):
   its first accepted share and stays so across restarts (persisted). Missed by
   design: a rig failing over here from a dead pool while this node is already
   stalled never gets a job, so it stays standby.
-- Same hourly cap as the worker events (charged first in a tick), and an
-  outstanding WORK_STALLED is persisted (`serve` in `state.json`), so a restart
-  neither pages the episode twice nor loses its WORK_RESUMED.
+- Own budget: at most 4 node-level events per rolling hour, outside the
+  30/h worker cap, so a rig flap (26 OFFLINE + 26 BACK_ONLINE) cannot hold a
+  real WORK_STALLED back. An event the budget refuses stays pending and goes
+  out when the window frees, if still due.
+- An outstanding WORK_STALLED is persisted (`serve` in `state.json`), so a
+  restart neither pages the episode twice nor loses its WORK_RESUMED.
 - Status: `detector.serve` on `/api/alert-relay/status` (quiet, sessions,
-  standby_sessions, alerted, since, cause).
+  standby_sessions, alerted, since, cause, held_by_budget).
 
 ## Wire format
 
@@ -407,7 +411,9 @@ counters. The origin's outbox block also carries `stale_refusal`.
   episode, WORK_RESUMED on recovery, no page with zero or standby-only
   sessions, the startup grace and the reconnect span, kinds 5/6 on the wire and
   an older relay's refusal, delivery through a forwarder and an origin restart
-  mid-episode, and the main_dash wiring of the serve sample.
+  mid-episode, the main_dash wiring of the serve sample, and the node-level
+  budget (a saturated worker cap does not hold WORK_STALLED back; the budget
+  itself is bounded).
 - `scripts/alert_relay_telegram.py --selftest`: fake in-process Bot API (200,
   429 retry_after, 500, ok:false, connection refused, restart, token redaction,
   `--max-age` for new rows and for rows that age out while being retried, the

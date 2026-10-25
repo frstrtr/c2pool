@@ -73,10 +73,13 @@
 //   accepted share and stays so across restarts. The one case this misses is
 //   a rig that fails over here, from a dead pool, while this node is already
 //   stalled: it never gets a job, so it never leaves standby.
-//   Same clock-injected rules, same hourly cap (charged before the worker
-//   events of the tick, so a burst of OFFLINEs cannot hold it back), and an
-//   outstanding WORK_STALLED persists across a restart so the episode still
-//   ends with one WORK_RESUMED and is not paged twice.
+//   Budget: the node-level events have their OWN rolling hour, at most
+//   serve_max_per_hour (default 4), outside the worker cap. Sharing the worker
+//   cap would let a rig flap (26 OFFLINE + 26 BACK_ONLINE fills 30/h) hold a
+//   real WORK_STALLED back for up to an hour. An event the budget refuses
+//   stays pending and fires when the window frees, if it is still due.
+//   An outstanding WORK_STALLED persists across a restart so the episode
+//   still ends with one WORK_RESUMED and is not paged twice.
 //
 // Persistence (restore()/persist()): known workers with their last-seen time,
 // whether an OFFLINE is outstanding and, for a worker that was down, when its
@@ -119,7 +122,8 @@ struct DetectorConfig {
     int64_t returned_margin{60};       // other-node share must be this much newer than the last share here
     int64_t returned_horizon{900};     // ... and no older than this (address still mining)
     int64_t returned_defer_max{120};   // chain unreadable this long -> page anyway
-    std::size_t max_per_hour{30};
+    std::size_t max_per_hour{30};            // worker events (OFFLINE / BACK_ONLINE)
+    std::size_t serve_max_per_hour{4};       // node-level events, own budget outside max_per_hour
     int64_t known_expiry{7 * 86400};   // forget workers absent this long
     std::size_t max_workers{4096};     // memory bound on tracked keys
 };
@@ -205,6 +209,8 @@ public:
     int64_t grace_until() const { return m_grace_until; }
     const std::map<std::string, State>& workers() const { return m_workers; }
     uint64_t suppressed_by_cap() const { return m_suppressed; }
+    // Node-level events the serve budget held back (once per held event).
+    uint64_t serve_held_by_budget() const { return m_serve_held; }
     const ServeState& serve_state() const { return m_serve; }
     // Bumped whenever persisted state changes (new worker, up/down, alert
     // emitted, worker forgotten) -- NOT on the per-tick last_seen refresh.
@@ -438,17 +444,14 @@ public:
                            {"standby_sessions", m_serve.standby},
                            {"alerted", m_serve.alerted},
                            {"since", m_serve.stall_since},
-                           {"cause", m_serve.cause}}},
+                           {"cause", m_serve.cause},
+                           {"held_by_budget", m_serve_held}}},
                 {"grace_until", m_grace_until},
                 {"in_grace", now < m_grace_until},
                 {"suppressed_by_cap", m_suppressed}};
     }
 
 private:
-    // Rate-cap key of the node-level events (only ever counted once per
-    // saturation episode, like a worker key).
-    static constexpr const char* kServeRateKey = "(node: work serving)";
-
     // Never hashed here (or returned to another node) and no OFFLINE
     // outstanding: a failover connection, never paged.
     static bool is_standby(const State& s) { return !s.ever_up && !s.offline_alerted; }
@@ -465,6 +468,8 @@ private:
     // tick, so the session counts reflect this tick's registry.
     void serve_check(const ServeSample& s, int64_t now, std::vector<DetectorEvent>& out)
     {
+        m_serve_was_holding = m_serve_holding;   // a held stretch is counted once
+        m_serve_holding = false;
         ServeState& v = m_serve;
         std::size_t hashing = 0, standby = 0;
         for (const auto& [key, st] : m_workers) {
@@ -496,7 +501,7 @@ private:
             // episode ends. Stalled again before this could be sent: still open.
             if (s.served_stamp == 0 || s.served_stamp == v.alert_stamp || quiet >= m_cfg.serve_stall_after)
                 return;
-            if (!admit_rate(kServeRateKey, now, out)) return;
+            if (!admit_serve_rate(now)) return;
             const int64_t ended = s.served_age >= 0 ? now - s.served_age : now;
             DetectorEvent ev;
             ev.kind = Kind::WorkResumed;
@@ -510,11 +515,11 @@ private:
         }
         if (hashing == 0 || quiet < m_cfg.serve_stall_after || now < m_grace_until) return;
         if (v.last_alert != 0 && now - v.last_alert < m_cfg.min_interval) return;
-        // The cause is read before the cap is charged: a throwing probe costs
-        // the tick (run_tick logs it), never a cap slot.
+        // The cause is read before the budget is charged: a throwing probe
+        // costs the tick (run_tick logs it), never a budget slot.
         std::string cause = clip_utf8(sanitize_utf8(s.cause ? s.cause() : std::string()), 48);
         if (cause.empty()) cause = "none reported";
-        if (!admit_rate(kServeRateKey, now, out)) return;
+        if (!admit_serve_rate(now)) return;
         DetectorEvent ev;
         ev.kind = Kind::WorkStalled;
         ev.ts = now;
@@ -547,6 +552,21 @@ private:
         if (m_rate.size() < m_cfg.max_per_hour) { m_digest_sent = false; m_held.clear(); }
     }
 
+    // Node-level budget (NODE LEVEL above): its own rolling hour, never the
+    // worker cap. A refused event stays pending (the caller re-evaluates it
+    // every tick); it is counted once, not once per tick.
+    bool admit_serve_rate(int64_t now)
+    {
+        while (!m_serve_rate.empty() && m_serve_rate.front() + 3600 <= now) m_serve_rate.pop_front();
+        if (m_serve_rate.size() >= m_cfg.serve_max_per_hour) {
+            if (!m_serve_was_holding) ++m_serve_held;
+            m_serve_holding = true;
+            return false;
+        }
+        m_serve_rate.push_back(now);
+        return true;
+    }
+
     // Charge one event against the hourly cap. When refused, emit the single
     // digest for this saturation episode and report false (event stays pending).
     bool admit_rate(const std::string& key, int64_t now, std::vector<DetectorEvent>& out)
@@ -563,7 +583,8 @@ private:
             d.kind = Kind::Digest;
             d.ts = now;
             d.detail = "alert cap of " + std::to_string(m_cfg.max_per_hour) +
-                       "/h reached; further worker changes are held until the hourly window frees";
+                       "/h reached; further worker changes are held until the hourly window frees"
+                       " (node work alerts unaffected)";
             out.push_back(std::move(d));
         }
         return false;
@@ -578,6 +599,10 @@ private:
     std::set<std::string> m_held;   // workers held by the cap in this episode
     uint64_t m_suppressed{0};
     ServeState m_serve;
+    std::deque<int64_t> m_serve_rate;   // node-level events in the rolling hour
+    bool m_serve_holding{false};        // the budget held a due node-level event this tick
+    bool m_serve_was_holding{false};    // ... and on the previous tick
+    uint64_t m_serve_held{0};
     uint64_t m_gen{0};
     AddressActivityFn m_activity;
 };
