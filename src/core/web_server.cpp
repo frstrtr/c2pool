@@ -4307,6 +4307,25 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             if (luck_input_changed)
                 recompute_found_block_luck_locked();
 
+            // HEIGHT OUT OF 0. A row stored at height 0 is a block whose height
+            // was unknown when it was recorded (the stale-job block 2561316 of
+            // 2026-10-25). The first later record that knows the height -- the
+            // sharechain hook re-records a block from its share's BIP34 height
+            // -- gives it that height, so the confirm/orphan lane can resolve
+            // it and it sorts into its place. A known height is never changed.
+            if (existing.height == 0 && height != 0) {
+                // Re-sorts the list: `existing` is not used past this point.
+                auto learned = learn_found_block_height_locked(hash_hex, chain, height);
+                if (learned && m_persist_block_fn) {
+                    try { m_persist_block_fn(*learned); }
+                    catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] Failed to persist found block"
+                                       " height: " << e.what();
+                    }
+                }
+                return;
+            }
+
             if (row_dirty && m_persist_block_fn) {
                 try { m_persist_block_fn(existing); }
                 catch (const std::exception& e) {
@@ -4544,6 +4563,68 @@ void MiningInterface::recompute_found_block_luck_locked()
     }
 }
 
+std::optional<MiningInterface::FoundBlock>
+MiningInterface::learn_found_block_height_locked(const std::string& hash,
+                                                 const std::string& chain,
+                                                 uint64_t height)
+{
+    // CALLER HOLDS m_blocks_mutex.
+    if (height == 0) return std::nullopt;
+    auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (it == m_found_blocks.end() || it->height != 0) return std::nullopt;
+    it->height = height;
+    LOG_INFO << "[Pool] found-block height learned: hash=" << hash.substr(0, 16)
+             << " chain=" << chain << " h=0 -> " << height;
+    // Same order record_found_block keeps: newest first by height, ts breaks
+    // ties. The row's interval was derived from its old place (none, at the
+    // bottom); the recompute re-derives every interval still unknown.
+    std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+        [](const FoundBlock& a, const FoundBlock& b) {
+            if (a.height != b.height) return a.height > b.height;
+            return a.ts > b.ts;
+        });
+    recompute_found_block_luck_locked();
+    for (const auto& b : m_found_blocks)
+        if (b.hash == hash && b.chain == chain) return b;
+    return std::nullopt;
+}
+
+void MiningInterface::backfill_found_block_heights(const block_height_lookup_fn& height_fn)
+{
+    if (!height_fn) return;
+    // Snapshot the rows still at height 0, then ask the lookup with the lock
+    // released: it may read a header chain or tracker with locks of its own.
+    std::vector<std::pair<std::string, std::string>> unknown;   // (hash, chain)
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.height == 0 && !b.hash.empty())
+                unknown.emplace_back(b.hash, b.chain);
+    }
+    std::vector<FoundBlock> learned;
+    for (const auto& [hash, chain] : unknown) {
+        uint64_t h = 0;
+        try { h = height_fn(hash); } catch (...) { h = 0; }
+        if (h == 0) continue;
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (auto row = learn_found_block_height_locked(hash, chain, h))
+            learned.push_back(std::move(*row));
+    }
+    // Persist outside m_blocks_mutex (the LevelDB writer), as backfill does.
+    if (m_persist_block_fn) {
+        for (const auto& b : learned) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found block height: " << e.what();
+            }
+        }
+    }
+    if (!unknown.empty())
+        LOG_INFO << "[Pool] found blocks at unknown height: " << unknown.size()
+                 << ", height learned for " << learned.size();
+}
+
 void MiningInterface::load_persisted_found_blocks()
 {
     if (!m_load_blocks_fn) return;
@@ -4557,11 +4638,20 @@ void MiningInterface::load_persisted_found_blocks()
         for (auto& blk : blocks)
         {
             bool exists = false;
-            for (const auto& existing : m_found_blocks)
+            for (auto& existing : m_found_blocks)
             {
                 if (existing.hash == blk.hash && existing.chain == blk.chain)
                 {
                     exists = true;
+                    // The persisted key carries the height, so a block whose
+                    // height was learned after it was first stored can be on
+                    // disk twice, the height-0 key listing first. A row only
+                    // ever climbs out of height 0, so the record at a real
+                    // height is the newer one: it wins whatever the order.
+                    if (existing.height == 0 && blk.height != 0) {
+                        existing = std::move(blk);
+                        existing.from_history = true;
+                    }
                     break;
                 }
             }

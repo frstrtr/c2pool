@@ -10730,12 +10730,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 h.SetHex(hash_hex);
 
                 // Recorded mint height for this hash (authoritative for orphans).
+                // Height 0 is "unknown" -- a stale-job row recorded before the
+                // work source read the job's own height -- never a block we
+                // could have mined; asking which block won height 0 left such
+                // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
-                        have_height = true;
+                        have_height = found_height != 0;
                         break;
                     }
                 }
@@ -10811,6 +10815,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
             // One-shot backfill of rows restored from persistence.
             cache_mi->backfill_block_fields(diff_lookup, ts_lookup);
+            // A row restored at height 0 (a stale-job block recorded before
+            // the work source read the job's own height) takes its height from
+            // the header chain when the chain holds that header; the re-verify
+            // pass below then resolves it at that height.
+            cache_mi->backfill_found_block_heights(
+                [hc](const std::string& block_hash_hex) -> uint64_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto e = hc->get_header(h);
+                    return e ? static_cast<uint64_t>(e->height) : 0;
+                });
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose
