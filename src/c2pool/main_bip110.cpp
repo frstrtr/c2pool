@@ -1005,8 +1005,9 @@ int run_embedded(bool coin_p2p_discover,
     // best is already on the new chain this is a plain extension (no-op — the
     // connect handler applies the new blocks). Otherwise the view is on an
     // abandoned branch: flag it inconsistent (serve coinbase-only), roll the view
-    // back to the common ancestor via undo data (removing rolled-back coins;
-    // fail-closed on missing/too-deep undo), requarantine + re-price the mempool
+    // back to the common ancestor via undo data (removing rolled-back coins,
+    // restoring the coins they spent; fail-closed on missing/legacy/too-deep
+    // undo), requarantine + re-price the mempool
     // against the reconciled view, then clear the flag. A rolled-back coin can
     // NEVER be priced/included afterwards (GAP2's inclusion rule is the 2nd wall).
     header_chain.set_on_tip_changed(
