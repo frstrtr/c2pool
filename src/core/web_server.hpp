@@ -1191,9 +1191,10 @@ public:
     // verdict — >0 confirmations (confirmed), <0 orphaned, 0 pending,
     // INT_MIN if the hash is not a recorded found block. This drives the exact
     // production status-transition code (verify_found_block); the async
-    // schedule_block_verification() above is the live driver. Added for the
-    // DASH orphan-lane tests so the pending→confirmed / pending→orphaned flips
-    // can be asserted deterministically without waiting on real timers.
+    // schedule_block_verification() above is the live driver, and its timers
+    // call this so each check finds the row by hash when it fires. Added for
+    // the DASH orphan-lane tests so the pending→confirmed / pending→orphaned
+    // flips can be asserted deterministically without waiting on real timers.
     int run_block_verification_now(const std::string& block_hash);
 
     /// Read-only access to found blocks (for sharechain window grid).

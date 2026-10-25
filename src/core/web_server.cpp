@@ -3007,10 +3007,24 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // that knows. The wire key `found_locally` keeps its existing meaning
     // and its existing consumers; read `found_by` for authorship.
     const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    // "first_block" is a claim about the HISTORY: no same-chain block was
+    // found before this one. A missing interval alone does not make it so. A
+    // row recorded at height 0 (unknown) sorts after every real row, so the
+    // restore-time recompute finds no predecessor for it; the stale-job block
+    // of 2026-10-25 (23 earlier rows) was drawn on the chart as "1st block"
+    // that way. Such a row reads "interval_unavailable".
+    bool has_earlier_row = false;
+    for (const auto& other : m_found_blocks) {
+        if (other.chain == b.chain && other.ts < b.ts) {
+            has_earlier_row = true;
+            break;
+        }
+    }
     std::string method;
     if (!have_local_record)                    method = "relayed";
     else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
     else if (b.time_to_find > 0)               method = "netdiff_unavailable";
+    else if (has_earlier_row)                  method = "interval_unavailable";
     else                                       method = "first_block";
     // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
     // two distinct rows. A genuine first block has no earlier same-chain row,
@@ -4739,6 +4753,7 @@ void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify
 void MiningInterface::verify_found_block(size_t index)
 {
     std::string hash;
+    std::string chain;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
         if (index >= m_found_blocks.size()) return;
@@ -4746,15 +4761,10 @@ void MiningInterface::verify_found_block(size_t index)
         if (blk.status != BlockStatus::pending) return;
         blk.check_count++;
         hash = blk.hash;
+        chain = blk.chain;
     }
 
     // Select chain-specific verifier, fall back to default
-    std::string chain;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index < m_found_blocks.size())
-            chain = m_found_blocks[index].chain;
-    }
     block_verify_fn_t verify_fn;
     auto it = m_chain_verify_fns.find(chain);
     if (it != m_chain_verify_fns.end())
@@ -4769,7 +4779,19 @@ void MiningInterface::verify_found_block(size_t index)
     try { result = verify_fn(hash); } catch (...) {}
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (index >= m_found_blocks.size()) return;
+    // The verdict ran unlocked, and record_found_block re-sorts the list on
+    // every insert: `index` may now name another block. Apply the verdict to
+    // the row it was asked about, found again by its hash.
+    if (index >= m_found_blocks.size() || m_found_blocks[index].hash != hash) {
+        index = m_found_blocks.size();
+        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
+            if (m_found_blocks[i].hash == hash && m_found_blocks[i].chain == chain) {
+                index = i;
+                break;
+            }
+        }
+        if (index >= m_found_blocks.size()) return;
+    }
     auto& blk = m_found_blocks[index];
     if (blk.status != BlockStatus::pending) return;
 
@@ -4894,16 +4916,21 @@ int MiningInterface::run_block_verification_now(const std::string& block_hash)
     // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
     verify_found_block(idx);
 
+    // Read the outcome back by hash: an insert during the verdict re-sorts
+    // the list, so idx may name another row by now.
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (idx >= m_found_blocks.size()) return std::numeric_limits<int>::min();
-    switch (m_found_blocks[idx].status) {
-        case BlockStatus::confirmed:
-            return static_cast<int>(m_found_blocks[idx].confirmations);
-        case BlockStatus::orphaned:
-            return -1;
-        default:
-            return 0;
+    for (const auto& blk : m_found_blocks) {
+        if (blk.hash != block_hash) continue;
+        switch (blk.status) {
+            case BlockStatus::confirmed:
+                return static_cast<int>(blk.confirmations);
+            case BlockStatus::orphaned:
+                return -1;
+            default:
+                return 0;
+        }
     }
+    return std::numeric_limits<int>::min();
 }
 
 void MiningInterface::schedule_block_verification(const std::string& block_hash)
@@ -4975,11 +5002,16 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
         block_time_sec * 10,        // ~10 confs (final)
     };
 
+    // Each check finds the row by its HASH when it fires. The list is kept
+    // newest-first by height and re-sorted on every insert, so an index taken
+    // now names a different block as soon as another one is recorded inside
+    // this window -- its checks then land on the newcomer and this block can
+    // be left pending.
     for (int delay : delays) {
         auto timer = std::make_shared<boost::asio::steady_timer>(
             ioc, std::chrono::seconds(delay));
-        timer->async_wait([this, idx, timer](boost::system::error_code ec) {
-            if (!ec) verify_found_block(idx);
+        timer->async_wait([this, block_hash, timer](boost::system::error_code ec) {
+            if (!ec) (void)run_block_verification_now(block_hash);
         });
     }
 }
