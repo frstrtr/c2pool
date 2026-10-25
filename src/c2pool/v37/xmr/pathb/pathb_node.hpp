@@ -3174,6 +3174,7 @@ private:
                 q = e->q;
                 break;
             }
+        if (q < store_->first_record_pos()) q = v.pos();  // a record the store holds (the view throws below it)
         const std::uint64_t Hq = v.record(q);
         const std::uint64_t bins = Hq > H_s ? Hq - H_s : 0;
         const std::size_t last = switches_.carry_bins.size() - 1;
