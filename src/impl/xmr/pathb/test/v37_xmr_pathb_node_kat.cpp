@@ -7828,6 +7828,45 @@ void catchlocator() {
           "(steps " + std::to_string(b.relay->stats().catchup_steps.load()) + ")");
 }
 
+// placedcopy: a copy of a carrier B placed, whose parent lies below B's journal base (depth 16), arrives: DEFER R4
+// (OwnChainDeep), counted, no token; it is not parked (the deferred store unchanged).
+void placedcopy() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.journal_depth = 16; });
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 26 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 48000 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c3 = h[a.node].store().best_at(3);
+    ok = ok && c3 && h[b.node].tree().best().id == h[a.node].tree().best().id && h[b.node].store().base_pos() > 3
+         && h[b.node].tree().find(*c3) != nullptr;
+    if (!ok) {
+        check(false, "placedcopy: setup (B on A's chain past depth 16)");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const auto r4 = [&rb] {
+        return rb.verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    const std::uint64_t r4_0 = r4();
+    const std::size_t held0 = h[b.node].deferred().size();
+    h.now += 1;
+    rb.receive(w.id(b.node, a.node), *pb::encode_fc_carrier(0, *h[a.node].bodies().get(*c3), 16));
+    w.run();
+    std::printf("  placedcopy: R4 DEFERs %llu; parked %zu then %zu; strikes %llu, bans %llu\n", (unsigned long long)(r4() - r4_0),
+                held0, h[b.node].deferred().size(), (unsigned long long)rb.stats().strikes.load(),
+                (unsigned long long)rb.stats().bans.load());
+    check(r4() == r4_0 + 1 && held0 == 0 && h[b.node].deferred().size() == 0 && rb.stats().strikes.load() == 0
+                  && rb.stats().bans.load() == 0,
+          "placedcopy: a copy of a placed carrier below the journal base: DEFER R4 counted, not parked, no token");
+}
+
 // ---------------------------------------------------------------------------
 // floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
 //   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
@@ -9336,6 +9375,7 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("placedcopy", placedcopy);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
