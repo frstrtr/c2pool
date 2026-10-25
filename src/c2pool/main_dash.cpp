@@ -367,6 +367,7 @@ struct AlertRelayCli {
     std::vector<std::string> to, accept;
     int64_t offline_after = 300, online_after = 60, min_interval = 600;
     int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
+    int64_t serve_stall_after = 300;   // node-level WORK_STALLED threshold (0 = off)
     bool any() const { return origin || telegram || forward; }
 };
 AlertRelayCli g_alert_relay;
@@ -539,6 +540,8 @@ void print_banner(const char* argv0)
         << "           [--alert-relay-offline-after S] [--alert-relay-online-after S] [--alert-relay-min-interval S]\n"
         << "           [--alert-relay-startup-grace S] [--alert-relay-stall-after S]\n"
         << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
+        << "           [--alert-relay-serve-stall-after S]  (origin: no work handed to hashing miners\n"
+        << "              this long => WORK_STALLED, then WORK_RESUMED; default 300, 0 = off)\n"
         << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
         << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
@@ -1578,6 +1581,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         ac.det.min_interval = g_alert_relay.min_interval;
         ac.det.startup_grace = g_alert_relay.startup_grace;
         ac.det.stall_after = g_alert_relay.stall_after;
+        ac.det.serve_stall_after = g_alert_relay.serve_stall_after;
         for (const auto& h : g_alert_relay.to) {
             da::Bytes pub;
             if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
@@ -1647,6 +1651,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << ac.det.offline_after << "s online-after=" << ac.det.online_after
                       << "s min-interval=" << ac.det.min_interval << "s grace="
                       << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
+                      << "s serve-stall-after=" << ac.det.serve_stall_after
                       << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
         }
         if (ac.telegram) {
@@ -5090,7 +5095,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                 }
                 return samples;
-            }, static_cast<int64_t>(core::timestamp()));
+            }, static_cast<int64_t>(core::timestamp()),
+            // Node level (WORK_STALLED / WORK_RESUMED): when work was last
+            // handed to a miner -- the relaxed atomic the [STALE-SERVE]
+            // serve-silence check reads -- and, only when a WORK_STALLED is
+            // built, the serve gate's decline cause. embedded_arm_status_json()
+            // try-locks the serve gate, so this tick never waits on the serve
+            // path ("status-serve-gate-busy" is then the cause it names).
+            [&wsrc]() -> std::optional<dash::alert::ServeSample> {
+                if (!wsrc) return std::nullopt;
+                dash::alert::ServeSample s;
+                const int64_t at = wsrc->last_served_at_ms();
+                s.served_stamp = at;
+                s.served_age = at > 0 ? (dash::coin::diag::steady_now_ms() - at) / 1000 : -1;
+                s.cause = [w = wsrc]() {
+                    const auto j = w->embedded_arm_status_json();
+                    const auto it = j.find("no_work_reason");
+                    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+                };
+                return s;
+            });
         });
     }
 
@@ -11085,6 +11109,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // costs a page; a blocking detector's false positive would cost 26 rigs an
     // outage, which is strictly worse than the failure it guards.
     //
+    // The serve-silence condition (D3) also PAGES when an alert-relay origin
+    // is armed: the alert tick reads the same last_served_at_ms() datum and
+    // sends WORK_STALLED / WORK_RESUMED (impl/dash/alert_detector.hpp, NODE
+    // LEVEL). It does not depend on this sentinel or its kill switch.
+    //
     // HEIGHT SOURCE — a deliberate deviation from the approved plan, stated
     // plainly. The plan called for `dashd getblockcount` on the sentinel's own
     // dedicated NodeRPC connection. That is NOT wired here, because:
@@ -12014,6 +12043,10 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--alert-relay-retry-every") == 0 && i + 1 < argc) {
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_every)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-serve-stall-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.serve_stall_after)) return 1;
             ++i;
         }
         else if (std::strcmp(argv[i], "--alert-relay-retry-max") == 0 && i + 1 < argc) {

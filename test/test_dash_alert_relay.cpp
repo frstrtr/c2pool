@@ -2212,3 +2212,337 @@ TEST(DashAlertRelay, SidecarExpiredRowIsAckedExpiredPromptly)
     EXPECT_EQ(ack_shape_error(acks[0]), nullptr) << "status 5 is a valid wire status";
     EXPECT_EQ(wire_ack(acks[0]), acks[0]);
 }
+
+// ── (13) node level: no work served while hashing miners are attached ──────
+// The 2026-10-25 shape: the bestCL gate declined every template for 376 s on a
+// daemonless node, 26 rigs stayed attached and kept hashing the last job, and
+// the [STALE-SERVE] serve-silence ERROR at 300 s reached nobody.
+namespace {
+// Three hashing sessions (their accepted counters advance: the rigs keep
+// submitting on the last job they were given) and one failover connection
+// that never shares here.
+std::vector<WorkerSample> hashing_and_standby(uint64_t acc)
+{
+    return {{"XaddrA.rig1", "s1", acc}, {"XaddrA.rig2", "s2", acc}, {"XaddrB.rig1", "s3", acc},
+            {"XaddrC.backup", "s9", 0}};
+}
+
+// The serve path as the node samples it: a stamp that changes per hand-out,
+// its age, and the decline cause (counted, to show it is read only for a page).
+ServeSample served(int64_t stamp, int64_t age, int* cause_calls = nullptr)
+{
+    ServeSample s;
+    s.served_stamp = stamp;
+    s.served_age = age;
+    s.cause = [cause_calls]() {
+        if (cause_calls) ++*cause_calls;
+        return std::string("bestcl-stale");
+    };
+    return s;
+}
+
+std::string main_dash_code()
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    EXPECT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string code;
+    std::istringstream lines(buf.str());
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    return code;
+}
+} // namespace
+
+TEST(DashAlertDetector, WorkStalledFiresOnceAtTheThresholdThenResumes)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    ASSERT_EQ(c.serve_stall_after, 300) << "the [STALE-SERVE] serve-silence threshold";
+    AlertDetector d(c, T0);
+    int causes = 0;
+    uint64_t acc = 1;
+    auto step = [&](int64_t t, int64_t stamp, int64_t served_at) {
+        auto s = served(stamp, t - served_at, &causes);
+        return d.tick(hashing_and_standby(acc++), t, &s);
+    };
+
+    // Work handed out at T0, then none: the gate declines every template.
+    for (int64_t t = T0; t < T0 + 300; t += 5)
+        EXPECT_TRUE(step(t, 1000, T0).empty()) << "t=" << t - T0;
+    EXPECT_EQ(causes, 0) << "no page, no cause lookup";
+    auto ev = step(T0 + 300, 1000, T0);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+    EXPECT_EQ(ev[0].worker, "") << "node-level: no worker";
+    EXPECT_EQ(ev[0].ts, T0 + 300);
+    EXPECT_EQ(ev[0].detail,
+              "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_EQ(causes, 1);
+
+    // Still stalled for the next hour: once per episode, no repeat.
+    for (int64_t t = T0 + 305; t <= T0 + 3900; t += 5)
+        EXPECT_TRUE(step(t, 1000, T0).empty()) << "t=" << t - T0;
+    EXPECT_EQ(causes, 1) << "the cause is read only to build the page";
+    EXPECT_TRUE(d.serve_state().alerted);
+    EXPECT_EQ(d.serve_state().quiet, 3900);
+    EXPECT_EQ(d.serve_state().sessions, 3u);
+    EXPECT_EQ(d.serve_state().standby, 1u);
+
+    // Templates flow again (handed out 2 s before this tick).
+    ev = step(T0 + 3905, 2000, T0 + 3903);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkResumed);
+    EXPECT_EQ(ev[0].worker, "");
+    EXPECT_EQ(ev[0].detail,
+              "new work for miners again after 65m (cause was bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_FALSE(d.serve_state().alerted);
+    for (int64_t t = T0 + 3910; t <= T0 + 5000; t += 5)
+        EXPECT_TRUE(step(t, 2000 + t, t).empty()) << "healthy serving is silent, t=" << t - T0;
+    EXPECT_EQ(causes, 1);
+
+    // A second episode pages again (min_interval long past).
+    for (int64_t t = T0 + 5005; t < T0 + 5300; t += 5) EXPECT_TRUE(step(t, 9000, T0 + 5000).empty());
+    ev = step(T0 + 5300, 9000, T0 + 5000);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+}
+
+TEST(DashAlertDetector, WorkStalledNeverPagesWithoutHashingSessions)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    int causes = 0;
+
+    // (a) No session attached: nothing is handed out because nobody asks.
+    {
+        AlertDetector d(c, T0);
+        for (int64_t t = T0; t <= T0 + 7200; t += 5) {
+            auto s = served(1000, t - T0 + 600, &causes);
+            EXPECT_TRUE(d.tick({}, t, &s).empty()) << "t=" << t - T0;
+        }
+        EXPECT_EQ(d.serve_state().sessions, 0u);
+        EXPECT_EQ(d.serve_state().quiet, 0);
+        EXPECT_FALSE(d.serve_state().alerted);
+    }
+
+    // (b) Only a standby (failover) connection, never served: no hashrate is
+    // lost here, so no page however long it lasts.
+    {
+        AlertDetector d(c, T0);
+        for (int64_t t = T0; t <= T0 + 7200; t += 5) {
+            auto s = served(0, -1, &causes);
+            EXPECT_TRUE(d.tick(one("XaddrC.backup", "s9", 0), t, &s).empty()) << "t=" << t - T0;
+        }
+        EXPECT_EQ(d.serve_state().sessions, 0u);
+        EXPECT_EQ(d.serve_state().standby, 1u);
+        EXPECT_FALSE(d.serve_state().alerted);
+
+        // Its pool dies: it takes a job here and its first share is accepted,
+        // so it hashes here now. The quiet clock starts with it, not at T0.
+        const int64_t first = T0 + 7205;
+        uint64_t acc = 1;
+        for (int64_t t = first; t < first + 300; t += 5) {
+            auto s = served(1000, t - (first - 1), &causes);
+            EXPECT_TRUE(d.tick(one("XaddrC.backup", "s9", acc++), t, &s).empty()) << "t=" << t - first;
+        }
+        auto s = served(1000, 301, &causes);
+        auto ev = d.tick(one("XaddrC.backup", "s9", acc++), first + 300, &s);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+        EXPECT_EQ(ev[0].detail, "no new work for miners for 5m (cause bestcl-stale); 1 miner session attached");
+    }
+    EXPECT_EQ(causes, 1);
+
+    // (c) serve_stall_after 0 turns the node-level rules off.
+    {
+        auto c0 = c;
+        c0.serve_stall_after = 0;
+        AlertDetector d(c0, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 3600; t += 5) {
+            auto s = served(1000, t - T0);
+            EXPECT_TRUE(d.tick(hashing_and_standby(acc++), t, &s).empty());
+        }
+    }
+}
+
+TEST(DashAlertDetector, WorkStalledHonoursTheGraceAndSurvivesAReconnect)
+{
+    // Inside the startup grace the node may still be syncing: no page; at its
+    // end the full quiet time is reported.
+    {
+        auto c = det_cfg();   // grace 600
+        AlertDetector d(c, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t < T0 + 600; t += 5) {
+            auto s = served(0, -1);
+            EXPECT_TRUE(d.tick(hashing_and_standby(acc++), t, &s).empty()) << "t=" << t - T0;
+        }
+        auto s = served(0, -1);
+        auto ev = d.tick(hashing_and_standby(acc++), T0 + 600, &s);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+        EXPECT_NE(ev[0].detail.find("for 10m"), std::string::npos) << ev[0].detail;
+    }
+    // A rig that drops and reconnects inside kServeDetachGrace does not
+    // restart the quiet clock; a longer absence does.
+    auto run = [](int64_t gap) {
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        AlertDetector d(c, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 1200; t += 5) {
+            const bool away = t >= T0 + 100 && t < T0 + 100 + gap;
+            auto s = served(1000, t - T0);
+            auto ev = d.tick(away ? std::vector<WorkerSample>{}
+                                  : one("XaddrA.rig1", t < T0 + 100 ? "s1" : "s2", acc++), t, &s);
+            if (!ev.empty()) return ev[0].kind == Kind::WorkStalled ? t - T0 : int64_t{-1};
+        }
+        return int64_t{0};
+    };
+    EXPECT_LT(30, AlertDetector::kServeDetachGrace);
+    EXPECT_EQ(run(30), 300) << "a reconnect blip keeps the span";
+    EXPECT_EQ(run(90), 100 + 90 + 300) << "a real absence restarts it";
+}
+
+TEST(DashAlertRelay, WorkKindsOnTheWireAndAnOlderRelaysRefusal)
+{
+    // Kinds 5 and 6 round-trip; anything past kMaxKind is still refused.
+    for (Kind k : {Kind::WorkStalled, Kind::WorkResumed}) {
+        AlertBody b = sample_body(k);
+        b.worker.clear();
+        auto dec = decode_body(encode_body(b));
+        ASSERT_TRUE(dec);
+        EXPECT_EQ(*dec, b);
+        EXPECT_TRUE(is_work_kind(static_cast<uint8_t>(k)));
+    }
+    EXPECT_STREQ(kind_name(5), "work_stalled");
+    EXPECT_STREQ(kind_name(6), "work_resumed");
+    EXPECT_FALSE(is_work_kind(static_cast<uint8_t>(Kind::Digest)));
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
+
+    // The frame around a work kind is the frame of every other kind: version 1,
+    // same shape, the kind sealed inside the body (an older forwarder carries it).
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o");
+    AlertRelayService org(origin_cfg(od, rkey.pubkey), okey, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AlertFrame> sent;
+    Transport t;
+    t.broadcast_alert = [&](uint64_t, const AlertFrame& f) { sent.push_back(f); return std::size_t{1}; };
+    org.set_transport(t);
+    DetectorEvent ev;
+    ev.kind = Kind::WorkStalled;
+    ev.ts = T0;
+    ev.detail = "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached";
+    org.enqueue_event(ev, T0);
+    ASSERT_EQ(sent.size(), 1u);
+    const AlertFrame f = wire_alert(sent[0]);
+    EXPECT_EQ(alert_shape_error(f), nullptr);
+    EXPECT_EQ(f.version, kWireVersion);
+    auto body = open_alert(rkey, f);
+    ASSERT_TRUE(body);
+    EXPECT_EQ(body->kind, static_cast<uint8_t>(Kind::WorkStalled));
+    EXPECT_EQ(body->label, "farm-1");
+
+    // An older relay decodes kinds 1..4 only and answers a signed
+    // refused_invalid: the origin ends the event with a ledger row. No crash,
+    // no retransmit storm, no disconnect.
+    PeerAlertGuard g;
+    auto ack = build_ack(rkey, okey.pubkey, f.nonce, AckStatus::RefusedInvalid);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(org.on_ack(wire_ack(*ack), 7, g, T0 + 1), Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    EXPECT_EQ(org.counters().refused, 1u);
+    auto ledger = read_lines(od / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 1u);
+    EXPECT_NE(ledger[0].find("\"work_stalled\""), std::string::npos);
+    EXPECT_NE(ledger[0].find("refused_invalid"), std::string::npos);
+    for (int64_t now = T0 + 5; now <= T0 + 600; now += 5) org.on_tick({}, now);
+    EXPECT_EQ(sent.size(), 1u) << "a final refusal ends the event";
+}
+
+TEST(DashAlertRelay, WorkStalledReachesTheRelayOnceAndResumesAfterARestart)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    auto oc = origin_cfg(od, rkey.pubkey);
+    oc.det.startup_grace = 0;
+    Mesh m;
+    m.add(1, oc, okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    uint64_t acc = 1;
+    auto tick = [&](int64_t t, int64_t stamp, int64_t age) {
+        auto s = served(stamp, age);
+        m.nodes[1].svc->on_tick(hashing_and_standby(acc++), t, &s);
+        m.pump(t);
+    };
+
+    for (int64_t t = T0; t <= T0 + 900; t += 5) tick(t, 1000, t - T0);
+    auto rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 1u) << "one page for the episode, carried across the forwarder";
+    auto row = nlohmann::json::parse(rows[0]);
+    EXPECT_EQ(row["kind"], "work_stalled");
+    EXPECT_EQ(row["worker"], "");
+    EXPECT_EQ(row["label"], "farm-1");
+    EXPECT_EQ(row["detail"],
+              "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_EQ(row["event_ts"], T0 + 300);
+    EXPECT_TRUE(m.nodes[1].svc->pending().begin()->second.queued_at_relay);
+    auto st = m.nodes[1].svc->status_json();
+    EXPECT_TRUE(st["detector"]["serve"]["alerted"].get<bool>());
+    EXPECT_EQ(st["detector"]["serve"]["cause"], "bestcl-stale");
+    EXPECT_EQ(st["detector"]["serve"]["sessions"], 3u);
+    {
+        std::ifstream f(od / "state.json");
+        auto j = nlohmann::json::parse(f);
+        EXPECT_TRUE(j["serve"]["alerted"].get<bool>()) << "the open episode is persisted";
+        EXPECT_EQ(j["serve"]["stall_since"], T0);
+    }
+
+    // The origin restarts mid-episode (same state dir): its new process has
+    // served nothing yet. No second page for the same outage...
+    m.add(1, oc, okey, T0 + 1000);
+    for (int64_t t = T0 + 1000; t <= T0 + 2000; t += 5) tick(t, 0, -1);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "not paged twice across a restart";
+
+    // ...and the first template it hands out ends it with WORK_RESUMED.
+    tick(T0 + 2005, 5000, 0);
+    rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 2u);
+    row = nlohmann::json::parse(rows[1]);
+    EXPECT_EQ(row["kind"], "work_resumed");
+    EXPECT_EQ(row["worker"], "");
+    EXPECT_EQ(row["detail"],
+              "new work for miners again after 33m (cause was bestcl-stale); 3 miner sessions attached (+1 standby)");
+    for (int64_t t = T0 + 2010; t <= T0 + 2600; t += 5) tick(t, 5000 + t, 0);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 2u);
+}
+
+// main_dash.cpp feeds the alert tick the served-at datum and, for the page,
+// the serve gate's decline cause; the flag reaches the detector.
+TEST(DashAlertDetector, MainDashFeedsTheServeSampleToTheAlertTick)
+{
+    const std::string code = main_dash_code();
+    const auto tick = code.find("alert_relay_timer->start(");
+    ASSERT_NE(tick, std::string::npos);
+    const auto served_at = code.find("wsrc->last_served_at_ms()", tick);
+    ASSERT_NE(served_at, std::string::npos);
+    EXPECT_LT(served_at - tick, 2500u) << "inside the alert tick";
+    const auto cause = code.find("\"no_work_reason\"", served_at);
+    ASSERT_NE(cause, std::string::npos);
+    EXPECT_LT(cause - served_at, 800u);
+    EXPECT_NE(code.find("w->embedded_arm_status_json()", served_at), std::string::npos)
+        << "the try-locking status read, never a lock the serve path holds";
+    EXPECT_NE(code.find("ac.det.serve_stall_after = g_alert_relay.serve_stall_after;"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-serve-stall-after\""), std::string::npos);
+}

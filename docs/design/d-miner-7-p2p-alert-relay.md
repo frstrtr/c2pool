@@ -58,6 +58,7 @@ wiring it to this transport is a follow-up.
 | `--alert-relay-stall-after S` | connected but no accepted share this long ⇒ down (0 = presence only: a connection is up) | 900 |
 | `--alert-relay-retry-every S` | retransmit an unacked alert | 60 |
 | `--alert-relay-retry-max N` | total transmissions before "undelivered" | 60 |
+| `--alert-relay-serve-stall-after S` | origin: no work handed to hashing miners this long ⇒ WORK_STALLED, later WORK_RESUMED (0 = off) | 300 |
 
 ## Presence detection (origin)
 
@@ -103,6 +104,38 @@ keeps a dead rig "alive" for ~17 minutes.
 - Global cap: 30 events per rolling hour; the first refused event produces one
   digest message and refused events stay pending (they fire when the window frees).
 
+## Node level: no work served (origin)
+
+The worker rules see rigs, not the node. On 2026-10-25 the bestCL gate of a
+daemonless node declined every template for 376 s while 26 rigs stayed attached
+and hashed the last job; the block they found (2561316) sat on a dead parent and
+was orphaned. `[STALE-SERVE] check=serve-silence` logged it at 300 s, and nothing
+reached the operator. The same 5 s tick therefore also reads when a template was
+last handed to a miner (the datum the serve-silence check reads):
+
+- **WORK_STALLED** fires once per episode when no template has been handed out for
+  `serve-stall-after` seconds while hashing sessions are attached, not inside the
+  startup grace and not within `min-interval` of the previous one. The quiet time
+  counts from the later of the last hand-out and the start of the attached span
+  (a span survives a gap under 60 s, so a reconnecting rig does not restart it).
+  Text: `WORK STALLED: no new work for miners for 6m (cause bestcl-stale);
+  26 miner sessions attached (+2 standby)`. The cause is the serve gate's decline
+  cause (`no_work_reason` on `/api/node_topology`), read only to build the page.
+- **WORK_RESUMED** fires once a template is handed out again: `WORK RESUMED: new
+  work for miners again after 6m (cause was bestcl-stale); 26 miner sessions
+  attached`.
+- **Standby sessions do not count.** With no session, or only standby sessions,
+  nothing pages: a standby connection is a failover link that never submits here,
+  so no hashrate is lost on this node. A rig that hashes here leaves standby with
+  its first accepted share and stays so across restarts (persisted). Missed by
+  design: a rig failing over here from a dead pool while this node is already
+  stalled never gets a job, so it stays standby.
+- Same hourly cap as the worker events (charged first in a tick), and an
+  outstanding WORK_STALLED is persisted (`serve` in `state.json`), so a restart
+  neither pages the episode twice nor loses its WORK_RESUMED.
+- Status: `detector.serve` on `/api/alert-relay/status` (quiet, sessions,
+  standby_sessions, alerted, since, cause).
+
 ## Wire format
 
 `alert`: `u32 version(=1) | u8 hops_left | u32 timestamp | u64 nonce |
@@ -115,9 +148,13 @@ var relay_pubkey(33) | var signature` — status 1 delivered (Telegram ok:true),
 malformed body), 4 queued at the relay (sidecar has not delivered yet), 5 expired
 at the relay (the sidecar will not page it: too old).
 
-Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test) |
-event_ts u32 | label | worker | detail` (length-prefixed, clipped to 32/64/128
-bytes). The strings are UTF-8: the origin replaces malformed bytes with `?` and
+Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test,
+5: work_stalled, 6: work_resumed) | event_ts u32 | label | worker | detail`
+(length-prefixed, clipped to 32/64/128 bytes; the node-level kinds 3-6 carry an
+empty worker). Kinds 5 and 6 changed nothing outside the sealed body, so an
+older forwarder carries them unchanged; an older relay (kinds 1-4) refuses them
+with a signed status 3, which the origin records in its ledger and warns about —
+upgrade the relay together with the origin. The strings are UTF-8: the origin replaces malformed bytes with `?` and
 clips on a code-point boundary (Cyrillic worker names and labels are common),
 and the relay refuses a body whose strings are not well-formed UTF-8
 (status 3; such a frame is never cached in the seen set). Every JSON dump on
@@ -365,13 +402,19 @@ counters. The origin's outbox block also carries `stale_refusal`.
   which stops re-arming on an unguarded throw); a stale re-probe crossing a
   restarted forwarder to recover a lost delivered ack; the writer queue cap and
   trailing-Replace coalescing, and the relay deferring alerts when the queue is
-  full; the sidecar's `expired.jsonl` acked "expired" at once.
+  full; the sidecar's `expired.jsonl` acked "expired" at once. Node level:
+  WORK_STALLED once at the threshold with its fields and no repeat in the
+  episode, WORK_RESUMED on recovery, no page with zero or standby-only
+  sessions, the startup grace and the reconnect span, kinds 5/6 on the wire and
+  an older relay's refusal, delivery through a forwarder and an origin restart
+  mid-episode, and the main_dash wiring of the serve sample.
 - `scripts/alert_relay_telegram.py --selftest`: fake in-process Bot API (200,
   429 retry_after, 500, ok:false, connection refused, restart, token redaction,
   `--max-age` for new rows and for rows that age out while being retried, the
   `expired.jsonl` contract the node reads, and the destination group: a negative
   `-100...` id is carried unchanged as a JSON integer, and the CLI refuses to
-  start with no id or with a private-chat id).
+  start with no id or with a private-chat id; the node-level kinds render
+  without a worker).
 - `scripts/alert_relay_e2e.sh`: two nodes + fake Telegram + stratum simulator on
   loopback with a private network id, plus a master-built peer and a flag-off
   parity phase.
