@@ -54,7 +54,7 @@ namespace coin {
 /// Where the currently-held best ChainLock came from. The bestCL* fields are
 /// COMMITTED into the coinbase of every template we serve, and dashcore
 /// re-verifies a non-null committed signature with BLS
-/// (specialtxman.cpp:164-167 VerifyChainLock => bad-cbtx-invalid-clsig), so
+/// (specialtxman.cpp:74-88 VerifyChainLock => bad-cbtx-invalid-clsig), so
 /// "how do we justify this signature" is a consensus question, not bookkeeping.
 ///
 ///  - Unknown        : no provenance recorded. FAIL-CLOSED — the consensus-exact
@@ -304,14 +304,14 @@ public:
     /// block's coinbase CCbTx.
     ///
     /// THIS IS THE DATUM THE CONSENSUS RULE IS STATED IN. dashcore's
-    /// CheckCbTxBestChainlock (dash v23.1.7 src/evo/specialtxman.cpp:102-177)
-    /// constrains our block at height H only RELATIVE to what block H-1
-    /// committed:
+    /// CheckCbTxBestChainlock (src/evo/specialtxman.cpp:32-98, the same in dash
+    /// v23.1.7 and v23.1.8) constrains our block at height H only RELATIVE to
+    /// what block H-1 committed:
     ///
-    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :129-131
-    ///     if (prevCL) {
-    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :134-137
-    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :138-140
+    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :54-60
+    ///     if (prevCL) {                                         // :62-71
+    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :64-67
+    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :68-70
     ///     }
     ///
     /// i.e. "committed CL height must not go BACKWARDS from the previous
@@ -1216,7 +1216,7 @@ public:
             if (m_tip_cbtx_cl_null) {
                 // Block H-1 committed a NULL ChainLock =>
                 // GetNonNullCoinbaseChainlock returns nullopt and dashcore
-                // imposes NO constraint (specialtxman.cpp:130-141 is skipped
+                // imposes NO constraint (specialtxman.cpp:62-71 is skipped
                 // entirely). We may commit null, or any signature we can
                 // justify. Committing null is what dashd does here when it
                 // holds nothing (miner.cpp:167-171).
@@ -1224,13 +1224,13 @@ public:
                 break;   // non-null: fall through to the justification check
             }
 
-            // (2) NON-NULL. dashcore :134-137 bad-cbtx-null-clsig — once block
+            // (2) NON-NULL. dashcore :64-67 bad-cbtx-null-clsig — once block
             // H-1 committed a real ChainLock, ours may not be null.
             if (m_best_cl_height <= 0)
                 return no("bestcl-absent", "n/a",
                           "non-null (prev committed CL @"
                               + std::to_string(m_tip_cbtx_cl_height) + ")");
-            // (3) NOT OLDER. dashcore :138-140 bad-cbtx-older-clsig, restated on
+            // (3) NOT OLDER. dashcore :68-70 bad-cbtx-older-clsig, restated on
             // the absolute-height axis: bestCLHeightDiff > prevDiff + 1 is
             // exactly "our committed CL height < the previous block's".
             if (m_best_cl_height < m_tip_cbtx_cl_height)
@@ -1242,8 +1242,9 @@ public:
 
         // (4) JUSTIFICATION. Reached only under ConsensusExact with a non-null
         // value about to be committed. dashcore BLS-verifies what we commit
-        // (specialtxman.cpp:164-167 => bad-cbtx-invalid-clsig), so we must be
-        // able to say why this signature is good:
+        // (specialtxman.cpp:74-88 => bad-cbtx-invalid-clsig; a validator skips
+        // the check only for a value equal to its own best ChainLock), so we
+        // must be able to say why this signature is good:
         //   - ChainCommitted: the network already accepted it inside block H-1.
         //     Re-committing it is dashd's own fallback and needs no local BLS.
         //   - BlsVerified: we verified it ourselves against its signing quorum.
@@ -1612,7 +1613,7 @@ public:
                           expected_quorum_root.GetHex().substr(0, 12));
         // A null committed clsig is a defect ONLY when dashcore forbids it —
         // i.e. when block H-1 itself committed a non-null ChainLock
-        // (specialtxman.cpp:134-137). Under ConsensusExact, when block H-1
+        // (specialtxman.cpp:64-67). Under ConsensusExact, when block H-1
         // committed null, a null commit is legal and is what dashd emits
         // (miner.cpp:167-171); refusing it there would be pure loss.
         const bool null_commit_forbidden =

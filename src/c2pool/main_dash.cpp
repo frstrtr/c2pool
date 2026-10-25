@@ -6969,8 +6969,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // POLICY SELECTION (--bestcl-policy, DEFAULT consensus-exact).
         // The freshness predicate is a PROXY: dashcore constrains the committed
         // ChainLock only relative to what the PREVIOUS BLOCK committed, never
-        // against the tip or wall-clock recency (dash v23.1.7
-        // src/evo/specialtxman.cpp:129-141). `consensus-exact` enforces that
+        // against the tip or wall-clock recency (dash v23.1.7 / v23.1.8
+        // src/evo/specialtxman.cpp:62-71). `consensus-exact` enforces that
         // real rule instead — see NodeCoinState::set_bestcl_policy — and is the
         // default (dash::coin::kDefaultBestClPolicy records the 2026-10-25
         // orphan that made it so). Kept as a runtime flag, not a rebuild, so

@@ -4,19 +4,23 @@
 /// WHAT THIS SUITE PINS. The #780 BLOCKER-2 gate refuses to serve the embedded
 /// arm unless our best observed ChainLock is within one block of the tip. Its
 /// own rationale calls that "a sufficient condition" — and it is only that.
-/// dashcore's actual rule, CheckCbTxBestChainlock (dash v23.1.7
-/// src/evo/specialtxman.cpp:102-177), never mentions the tip or freshness:
+/// dashcore's actual rule, CheckCbTxBestChainlock (src/evo/specialtxman.cpp
+/// :32-98, the same function in dash v23.1.7 and v23.1.8), never mentions the
+/// tip or freshness:
 ///
-///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)              // :129
-///     if (prevCL) {
-///         if (!cbTx.bestCLSignature.IsValid())   -> bad-cbtx-null-clsig    // :134
+///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)              // :54-60
+///     if (prevCL) {                                                    // :62-71
+///         if (!cbTx.bestCLSignature.IsValid())   -> bad-cbtx-null-clsig    // :64-67
 ///         if (cbTx.bestCLHeightDiff > prevCL.diff + 1)
-///                                                -> bad-cbtx-older-clsig   // :138
+///                                                -> bad-cbtx-older-clsig   // :68-70
 ///     }
-///     if (cbTx.bestCLSignature.IsValid()) {
-///         if (bestCLHeightDiff >= pindex->nHeight) -> bad-cbtx-cldiff       // :146
-///         VerifyChainLock(...)                     -> bad-cbtx-invalid-clsig// :164
-///     } else if (bestCLHeightDiff != 0)            -> bad-cbtx-cldiff       // :172
+///     if (cbTx.bestCLSignature.IsValid()) {                            // :74-91
+///         unless it equals the validator's own best ChainLock:
+///         VerifyChainLock(...)                     -> bad-cbtx-invalid-clsig// :83-88
+///     } else if (bestCLHeightDiff != 0)            -> bad-cbtx-cldiff       // :92-94
+///
+/// (:45-52 accepts at once a block that commits the validator's own best
+/// ChainLock for H-1 with diff 0.)
 ///
 /// Restated on the absolute-height axis (committed CL height of a block at H is
 /// H - bestCLHeightDiff - 1), `bestCLHeightDiff > prevDiff + 1` is EXACTLY
@@ -157,7 +161,7 @@ TEST(DashBestClGate, StaleButMonotonicChainLockServesUnderConsensusExact) {
 
     // (b) Consensus-exact, given the previous block's OWN committed ChainLock,
     //     serves: equal to prev's committed CL => bestCLHeightDiff == prevDiff+1
-    //     exactly, which dashcore's `> prevDiff + 1` test admits (:138).
+    //     exactly, which dashcore's `> prevDiff + 1` test admits (:68).
     st.set_bestcl_policy(BestClPolicy::ConsensusExact);
     st.set_tip_cbtx_chainlock(static_cast<int32_t>(TIP), /*has_sig=*/true,
                               prev_committed_cl);
@@ -170,7 +174,7 @@ TEST(DashBestClGate, StaleButMonotonicChainLockServesUnderConsensusExact) {
 
 // ════════════════════════════════════════════════════════════════════════
 // 2. An ADVANCE past the previous block's committed ChainLock is the one case
-//    dashcore makes us prove with BLS (specialtxman.cpp:164 VerifyChainLock =>
+//    dashcore makes us prove with BLS (specialtxman.cpp:83-88 VerifyChainLock =>
 //    bad-cbtx-invalid-clsig). Unverified provenance must NOT be committed.
 // ════════════════════════════════════════════════════════════════════════
 TEST(DashBestClGate, UnverifiedAdvanceRefused) {
@@ -205,7 +209,7 @@ TEST(DashBestClGate, UnverifiedAdvanceRefused) {
 
 // ════════════════════════════════════════════════════════════════════════
 // 3. Null / absent ChainLock where the previous block committed a real one =>
-//    bad-cbtx-null-clsig (specialtxman.cpp:134-137). Refuse.
+//    bad-cbtx-null-clsig (specialtxman.cpp:64-67). Refuse.
 // ════════════════════════════════════════════════════════════════════════
 TEST(DashBestClGate, AbsentChainLockRefusedWhenPrevCommittedOne) {
     NodeCoinState st;
@@ -304,7 +308,7 @@ TEST(DashBestClGate, BlsDarkBuildNeverServesAnUnprovenChainLock) {
 
 // ════════════════════════════════════════════════════════════════════════
 // 7. The previous block committed a NULL ChainLock =>
-//    GetNonNullCoinbaseChainlock returns nullopt and specialtxman.cpp:130-141
+//    GetNonNullCoinbaseChainlock returns nullopt and specialtxman.cpp:62-71
 //    is skipped entirely: dashcore imposes NO constraint. dashd commits null in
 //    that state when it holds nothing (miner.cpp:167-171). Refusing there would
 //    be pure loss.
@@ -327,7 +331,7 @@ TEST(DashBestClGate, PrevCommittedNullImposesNoConstraint) {
         << "decline was: " << cause_of(st);
 
     // Holding an UNJUSTIFIED one is still refused: we would commit a signature
-    // we cannot defend, and dashcore verifies it (:164).
+    // we cannot defend, and dashcore verifies it (:83-88).
     st.set_best_cl(2'515'800, some_sig(0x66), ClProvenance::Unknown);
     EXPECT_FALSE(st.make_embedded_work_inputs().viable());
     EXPECT_EQ("bestcl-unjustified", cause_of(st));
