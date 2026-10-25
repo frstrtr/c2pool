@@ -36,9 +36,10 @@
 //                reach its ticket (FC_HEADERS in request order, FC_CARRIER by
 //                the asked ids, FC_BUCKETS by (peer, at)); a ticket of a
 //                disconnected peer gets no frame
-//   after HELLO  headers first from the best tip when the peer's
-//                best_cum_work wins fork choice, again while the peer's tip is
-//                not held and still wins; the pending set re-offered (FB_RECEIPTS,
+//   after HELLO  headers first from the best tip when the peer's HELLO tip is
+//                not held (the node's own header work at the reply fetches or
+//                keeps; best_cum_work is not read), again while it is not held
+//                and no reply ended it; the pending set re-offered (FB_RECEIPTS,
 //                at most 1 + R_MAX bodies a frame); a node at position 0 whose
 //                catch-up from position 0 got a reply with no header offers
 //                the peer's HELLO tip to the joiner
@@ -1138,7 +1139,6 @@ private:
     };
     struct Catchup {
         Hash32 tip{};
-        U128 work{};
         bool from_pos0 = false;          // the last request asked from position 0
         bool from_root = false;          // ... from the lowest position the node holds (no step below it)
         std::uint32_t step = 0;          // the locator step of `from`: the best tip, then pos - 1, pos - 2, pos - 4, ...
@@ -2622,7 +2622,7 @@ private:
         on_self_hello(p, link);
         if (o_.discovery) disc_refused(c.text, true, theirs.listen_port, link);
     }
-    // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
+    // After an accepted HELLO: headers first when the peer's HELLO tip is not held, then the pending re-offer (the ids
     // taken under the node lock; the frames paged by reoffer_pump).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
         std::vector<Hash32> ids;
@@ -2787,23 +2787,21 @@ private:
     }
 
     // ---- headers first (the caller's catch-up loop) ----
-    // Under the node lock.
+    // Under the node lock. A catch-up starts when the peer's HELLO tip is not held; the node's own header work at the
+    // reply decides fetch or keep (the tail's best_cum_work is not read).
     void catchup_start(std::uint64_t p, const HelloTail& tail) {
-        const CarrierNode& b = node_->tree().best();
         std::lock_guard<std::mutex> lk(cumtx_);
-        if (node_->tree().find(tail.best_tip) != nullptr
-            || !fork_choice_prefers(ChainTip{tail.best_cum_work, tail.best_tip}, ChainTip{b.cum_work, b.id})) {
+        if (node_->holds_tip(tail.best_tip)) {
             caught_up_locked();  // nothing to catch up from this peer (the done test at the start)
             return;
         }
         Catchup& c = catchup_[p];
         c.tip = tail.best_tip;
-        c.work = tail.best_cum_work;
         c.step = 0;
         catchup_ask_locked(p, c);
     }
     // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended by their done test (every HELLO
-    // tip held, or its claim no longer winning) is caught up (its record leaves the store).
+    // tip held) is caught up (its record leaves the store).
     void caught_up_locked() {
         if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
         node_->note_caught_up();
@@ -3534,9 +3532,7 @@ private:
             bool done_any = false;
             for (auto it = catchup_.begin(); it != catchup_.end();) {
                 const CarrierNode& b = node_->tree().best();
-                const bool done = node_->tree().find(it->second.tip) != nullptr
-                                  || !fork_choice_prefers(ChainTip{it->second.work, it->second.tip}, ChainTip{b.cum_work, b.id})
-                                  || node_->rests_on_claims();
+                const bool done = node_->holds_tip(it->second.tip) || node_->rests_on_claims();
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
                     it = catchup_.erase(it);

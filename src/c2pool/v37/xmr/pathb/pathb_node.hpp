@@ -716,7 +716,7 @@ public:
     }
 
     // The caller (the relay node, S4w-bc) runs what follows an accepted HELLO:
-    // headers first when the peer's best_cum_work wins, the pending re-offer.
+    // headers first when the peer's HELLO tip is not held here, the pending re-offer.
     HelloCheck on_hello(std::uint64_t peer, std::span<const std::uint8_t> frame, const PathbHello& ours) {
         PathbHello theirs;
         const HelloCheck c = pathb_hello_receive(
@@ -738,10 +738,9 @@ public:
             const bool fresh = peers_.count(peer) == 0;
             peers_[peer] = theirs.tail;
             if (fresh) joiner_->release_waits(std::nullopt);  // a new Path B peer: the pairs waiting on a P_r are tried
-            // the first catch-up round after the start opens at the first tail whose claim wins (the template gate)
-            if (gate_applies() && first_round_ && !first_round_open_ && tree_->find(theirs.tail.best_tip) == nullptr
-                && fork_choice_prefers(ChainTip{theirs.tail.best_cum_work, theirs.tail.best_tip},
-                                       ChainTip{tree_->best().cum_work, tree_->best().id}))
+            // the first catch-up round after the start opens at the first tail whose tip is not held here (the template
+            // gate); the tail's best_cum_work is not read
+            if (gate_applies() && first_round_ && !first_round_open_ && !holds_tip(theirs.tail.best_tip))
                 first_round_open_ = true;
             if (transport_ != nullptr && links_.count(peer) == 0)
                 links_[peer] = std::make_shared<PathbJoinLink>(peer, *transport_, cfg_.identity.chain_id, cfg_.p,
@@ -762,31 +761,33 @@ public:
         return c;
     }
     bool has_pathb_peer() const noexcept { return !peers_.empty(); }
+    // A HELLO tip this node holds: position 0 (the pool identity) or a carrier placed in its tree. The catch-up
+    // trigger, its done test and the template gate read this, never a tail's best_cum_work.
+    bool holds_tip(const Hash32& tip) const { return tip == cfg_.identity.pool_id || tree_->find(tip) != nullptr; }
 
     // ---- the relay node's glue (pathb_relay_node.hpp) ----
     // A store that never caught up (at position 0, or not caught up by its record K_NCU): the caller's headers-first
     // catch-up to `peer` got a reply with no header from position 0 (the peer serves nothing after it), or a catch-up
     // step stayed deferred on a P_r past its context's time. The peer's HELLO tip becomes a join candidate with that
-    // peer as its server (no load failure, no adopted state, not poisoned) when the tip is not position 0, not held here
-    // and its claimed work wins fork choice against the best tip. True: the pair was queued.
+    // peer as its server (no load failure, no adopted state, not poisoned) when the tip is not position 0 and not held
+    // here; rule (4) of the attempt decides whether it replaces the node's own chain. True: the pair was queued.
     bool offer_empty_store_tip(std::uint64_t peer) {
         if (poisoned_ || load_failed_ || joined_ != nullptr || (tree_->best().pos != 0 && !not_caught_up_)) return false;
         const auto it = peers_.find(peer);
         if (it == peers_.end()) return false;
         const HelloTail& t = it->second;
-        const CarrierNode& b = tree_->best();
-        if (t.best_tip == cfg_.identity.pool_id || tree_->find(t.best_tip) != nullptr) return false;
-        if (!fork_choice_prefers(ChainTip{t.best_cum_work, t.best_tip}, ChainTip{b.cum_work, b.id})) return false;
+        if (holds_tip(t.best_tip)) return false;
         const std::size_t before = joiner_->queue().size();
         offer(t.best_tip, peer, t.best_cum_work);
         return joiner_->queue().size() > before;
     }
     // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
-    // the caller's catch-up ends by its done test (every HELLO tip held, or no claim winning) or a join adopts.
+    // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision) or a join
+    // adopts.
     bool caught_up() const noexcept { return !not_caught_up_; }
     // The first catch-up round after the start is in flight (the template gate's first clause).
     bool first_round_open() const noexcept { return first_round_open_; }
-    // The caller's catch-up ended by its done test: the record leaves the store (one batch).
+    // The caller's catch-ups ended: the record leaves the store (one batch).
     void note_caught_up() {
         if (!not_caught_up_) return;
         not_caught_up_ = false;
@@ -797,14 +798,12 @@ public:
         b.del(store_keys::ncu(cfg_.record_chain));
         if (!commit_lane_batch(*kv_, b)) poison(tree_->best().id);
     }
-    // Not caught up, templates built: a HELLO tail's claim wins with no verified header winning (the caller logs it).
+    // Not caught up, templates built: a HELLO tail's tip is not held here with no verified header winning (the caller
+    // logs it).
     bool unverified_claims() const {
         if (!gate_applies() || first_round_open_ || verified_win_open()) return false;
-        const CarrierNode& b = tree_->best();
         for (const auto& [peer, t] : peers_)
-            if (tree_->find(t.best_tip) == nullptr && fork_choice_prefers(ChainTip{t.best_cum_work, t.best_tip},
-                                                                          ChainTip{b.cum_work, b.id}))
-                return true;
+            if (!holds_tip(t.best_tip)) return true;
         return false;
     }
     // The P_r ids queued join pairs wait on (a NotServed on an unresolved P_r), and their release: the id resolved,
@@ -3319,7 +3318,7 @@ private:
     bool started_empty_ = false;
     bool not_caught_up_ = false;          // K_NCU
     bool first_round_ = false;            // the first catch-up round after the start not run yet
-    bool first_round_open_ = false;       // ... and in flight (opened by a HELLO tail whose claim wins)
+    bool first_round_open_ = false;       // ... and in flight (opened by a HELLO tail whose tip is not held)
     std::uint64_t first_round_s_ = 0;     // since when it is open with no request in flight
     std::optional<ChainTip> verified_win_;  // headers this node verified that win (their tip and work)
     std::uint64_t verified_win_peer_ = 0;
