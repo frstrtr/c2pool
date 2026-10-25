@@ -6,7 +6,9 @@
 // the per-aftertail checks are byte-for-byte the loop that was inline in
 // NodeImpl::clean_tracker(); only the member names became parameters
 // (m_tracker.chain -> chain, m_tracker.verified -> verified,
-// m_supersede_hint -> hint).
+// m_supersede_hint -> hint). One deliberate change since the move: the
+// supersede exemption now compares tail_hash with hint.target_segment_last
+// directly (see the comment in the loop).
 //
 // LOCKING: takes NO lock. The caller must hold the tracker mutex EXCLUSIVELY
 // for the whole call — clean_tracker() calls it inside the same
@@ -47,14 +49,12 @@ int drop_tails(ChainT& chain, VerifiedT& verified, int32_t CL, const HintT& hint
             // verification silently restarts convergence (looks like the
             // original stickiness). The exemption lifts once it verifies to
             // CHAIN_LENGTH and the hint deactivates, when normal drop-tails
-            // resumes. Matched by segment id (the shared missing-parent).
-            if (hint.active) {
-                try {
-                    if (chain.contains(tail_hash) &&
-                        chain.get_last(tail_hash) == hint.target_segment_last)
-                        continue;
-                } catch (...) {}
-            }
+            // resumes. Matched by segment id (the shared missing-parent):
+            // get_tails() is keyed by that missing parent, so tail_hash IS the
+            // segment id. (The old chain.contains(tail_hash) guard was always
+            // false for exactly that reason, so the exemption never fired.)
+            if (hint.active && tail_hash == hint.target_segment_last)
+                continue;
 
             int32_t min_height = 0;  // default 0 → skip if no valid heads
             for (auto& hh : head_hashes) {

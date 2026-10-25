@@ -179,13 +179,13 @@ TEST(LtcDropTailsAsanKat, ThresholdPerSegment)
     EXPECT_EQ(t.chain.size(), 38u);
 }
 
-// Pins the moved code as it is TODAY: get_tails() is keyed by the MISSING
-// parent hash, which by definition is not in the chain, so the supersede
-// exemption's `chain.contains(tail_hash)` guard is false and the challenger
-// segment is trimmed like any other. This is a pre-existing behaviour, kept by
-// the pure move; a follow-up that matches tail_hash against
-// hint.target_segment_last directly should flip this expectation.
-TEST(LtcDropTailsAsanKat, SupersedeExemptionCurrentlyInert)
+// get_tails() is keyed by the MISSING parent hash, i.e. the segment id that
+// SupersedeHint carries as target_segment_last. An active hint must exempt the
+// whole challenger segment from the trim; once the hint deactivates, normal
+// drop-tails resumes and the segment is trimmed to 2*CL+9.
+// (Was SupersedeExemptionCurrentlyInert, which pinned the old dead guard
+// `chain.contains(tail_hash)` that never matched and trimmed 30 -> 19.)
+TEST(LtcDropTailsAsanKat, SupersedeExemptionKeepsChallengerSegment)
 {
     ltc::ShareTracker t;
     constexpr int32_t cl = 5;
@@ -197,5 +197,32 @@ TEST(LtcDropTailsAsanKat, SupersedeExemptionCurrentlyInert)
     hint.active = true;
     hint.target_head = tip;
     hint.target_segment_last = t.chain.get_last(tip);
+    EXPECT_EQ(ltc::drop_tails(t.chain, t.verified, cl, hint), 0);
+    EXPECT_EQ(t.chain.size(), 30u);
+    EXPECT_EQ(t.chain.get_height(tip), 30);
+
+    hint.active = false;  // challenger verified to CHAIN_LENGTH -> hint off
     EXPECT_EQ(ltc::drop_tails(t.chain, t.verified, cl, hint), 30 - 19);
+    EXPECT_EQ(t.chain.get_height(tip), 19);
+}
+
+// Two segments, both above the threshold. The hint names the challenger: it
+// survives the trim at full depth while the other segment is trimmed as usual.
+TEST(LtcDropTailsAsanKat, ChallengerSurvivesTrimSiblingTrimmed)
+{
+    ltc::ShareTracker t;
+    constexpr int32_t cl = 5;  // threshold 20, keep 19
+    const uint256 seg_ch = hx("dead00d");
+    const uint256 tip_ch = append(t, seg_ch, 5, 0, 32, nullptr);
+    const uint256 tip_other = append(t, hx("dead00e"), 6, 0, 35, nullptr);
+
+    ltc::SupersedeHint hint;
+    hint.active = true;
+    hint.target_head = tip_ch;
+    hint.target_segment_last = seg_ch;
+    EXPECT_EQ(ltc::drop_tails(t.chain, t.verified, cl, hint), 35 - 19);
+    EXPECT_EQ(t.chain.get_height(tip_ch), 32);
+    EXPECT_EQ(t.chain.get_last(tip_ch), seg_ch);
+    EXPECT_EQ(t.chain.get_height(tip_other), 19);
+    EXPECT_EQ(t.chain.size(), 32u + 19u);
 }
