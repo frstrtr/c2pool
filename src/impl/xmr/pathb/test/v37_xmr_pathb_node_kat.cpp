@@ -283,6 +283,13 @@
 //                flight; a node caught up keeps its templates;
 //   catchrestart the record across a restart; a launch node writes none;
 //   catchlocator the catch-up's locator steps after a partition;
+//   catchkeep    a store not caught up whose one HELLO peer holds an unheld
+//                lighter tip: the catch-up ends at its reply (its chain kept)
+//                and the store is caught up (the record gone, templates);
+//   catchlight   an unheld lighter tip: at most one locator round per HELLO,
+//                none after its reply; the chain never switches;
+//   catchoffer   a store not caught up, partly walked, offered an unheld
+//                lighter tip: one pair, one attempt, rule (4) keeps its chain;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
@@ -7829,6 +7836,245 @@ void catchlocator() {
 }
 
 // ---------------------------------------------------------------------------
+// A relay node in manual mode on the harness's clock over a node loaded from a copy of `from` (the copy in h.kvs).
+KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const pb::PathbNodeConfig& cfg) {
+    KatRelay k;
+    k.links = std::make_unique<FakeLinks>();
+    k.links->wire = &w;
+    k.links->self = w.links.size();
+    w.links.push_back(k.links.get());
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock);
+    k.node = h.nodes.size();
+    h.kvs.push_back(std::make_unique<MemoryKv>(from));
+    MemoryKv& kv = *h.kvs.back();
+    pb::LoadInputs in;
+    in.T = cfg.T;
+    in.journal_depth = cfg.journal_depth;
+    pb::LoadResult lr = pb::pathb_load(kv, h.net.pool_id, h.net.rules_g, in);
+    if (!lr.state) throw std::runtime_error("kat_relay_loaded: the store does not load");
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, k.relay->bind_io(h.io(k.node)), std::move(*lr.state), &kv));
+    k.relay->attach(*h.nodes.back());
+    k.relay->set_drive([&w] { return w.step(); });
+    std::string why;
+    if (!k.relay->start(why)) throw std::runtime_error(why);
+    w.relays.push_back(k.relay.get());
+    return k;
+}
+
+// A frame filter of the wire: FC_HEADERS from wire node `from` to wire node `to` dropped (that catch-up gets no reply).
+std::function<void(FakeWire::Msg&)> drop_headers(std::size_t from, std::size_t to) {
+    return [from, to](FakeWire::Msg& m) {
+        if (m.from == from && m.to == to && !m.f.empty() && m.f[0] == pb::kOpFcHeaders) m.f.clear();
+    };
+}
+
+// Two relay nodes (both launched; wire 0 = A, wire 1 = B): they mine `shared` carriers on one chain; apart, B mines
+// `own` on its branch and A `more` on its chain (A's heavier).
+struct Branches {
+    KatRelay a, b;
+    bool ok = true;
+};
+Branches branches(Harness& h, FakeWire& w, const KatNet& net, int shared, int own, int more, std::uint32_t nonce) {
+    Branches o;
+    o.a = kat_relay(h, w, table0(net), true);
+    o.b = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.run();
+    for (int i = 0; i < shared; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        o.ok = o.ok && mine_on(h, w, o.a.node, static_cast<std::size_t>(i % 5), nonce + static_cast<std::uint32_t>(i));
+    }
+    o.ok = o.ok && h[o.b.node].tree().best().id == h[o.a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    h.tick_monero();
+    for (int i = 0; i < own; ++i)
+        o.ok = o.ok && mine_on(h, w, o.b.node, static_cast<std::size_t>(i % 5), nonce + 1000 + static_cast<std::uint32_t>(i));
+    for (int i = 0; i < more; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        o.ok = o.ok && mine_on(h, w, o.a.node, static_cast<std::size_t>(i % 5), nonce + 2000 + static_cast<std::uint32_t>(i));
+    }
+    o.ok = o.ok && h[o.a.node].tree().best().pos == static_cast<std::uint64_t>(shared + more)
+           && h[o.b.node].tree().best().pos == static_cast<std::uint64_t>(shared + own)
+           && ::c2pool::xmr::native::u128_greater(h[o.a.node].tree().best().cum_work, h[o.b.node].tree().best().cum_work);
+    return o;
+}
+
+// catchkeep: a store not caught up (its record K_NCU) holding A's chain (6 positions, placed by a walk with no HELLO,
+// then restarted) whose one HELLO peer B holds a lighter branch (positions 1..4 and its own 5): the catch-up toward B's
+// unheld tip steps down to the fork, its reply is kept by the node's own header work, and the catch-up ending by that
+// reply leaves the store caught up: the record leaves, the chain is A's, and with no peer it builds templates.
+void catchkeep() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    Branches br = branches(h, w, net, 4, 1, 2, 3100);
+    const std::size_t a = br.a.node, b = br.b.node;
+    const pb::Hash32 tip_a = h[a].tree().best().id;
+    const std::size_t jw = h.add(table0(net), false, 1152, true);  // started empty, not launched: K_NCU
+    MemoryKv& kvw = *h.kvs.back();
+    for (std::uint64_t x = 1; x <= 6; ++x)
+        if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+            (void)h[jw].on_carrier(77, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+    h.q.clear();
+    const std::string ncu = pb::store_keys::ncu(0);
+    const bool walked = h[jw].tree().best().id == tip_a && !h[jw].caught_up() && kvw.data.count(ncu) != 0;
+    KatRelay j = kat_relay_loaded(h, w, kvw, h.config(table0(net)));
+    MemoryKv& kvj = *h.kvs.back();
+    const pb::TemplateStatus s0 = tstatus(h, j.node);
+    const bool claim_loses = !pb::fork_choice_prefers(pb::ChainTip{h[b].tree().best().cum_work, h[b].tree().best().id},
+                                                      pb::ChainTip{h[j.node].tree().best().cum_work, tip_a});
+    w.edit = drop_headers(2, 1);  // B's own catch-up toward J gets no reply: B stays on its branch
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t asks = j.relay->stats().catchup_requests.load();
+    const bool caught = h[j.node].caught_up() && kvj.data.count(ncu) == 0 && !h[j.node].first_round_open();
+    const bool kept = h[j.node].tree().best().id == tip_a && !h[j.node].holds_tip(h[b].tree().best().id);
+    w.links[2]->disconnect(w.id(2, 1));
+    w.run();
+    w.edit = nullptr;
+    const pb::TemplateStatus s1 = tstatus(h, j.node);
+    std::printf("  catchkeep: J at %llu (B at %llu); catch-up asks %llu; caught up %d; templates %d -> %d\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[b].tree().best().pos,
+                (unsigned long long)asks, caught ? 1 : 0, static_cast<int>(s0), static_cast<int>(s1));
+    check(br.ok && walked && claim_loses && s0 == pb::TemplateStatus::NoPathbPeer,
+          "catchkeep: setup (J not caught up at A's tip 6, its record kept; B's tip 5 lighter and not held at J)");
+    check(asks >= 2 && kept && caught && s1 != pb::TemplateStatus::NoPathbPeer && s1 != pb::TemplateStatus::CatchingUp,
+          "catchkeep: the catch-up toward B's unheld lighter tip ends at its reply (A's chain kept) and leaves the store "
+          "caught up: the record gone, templates with no peer (asks " + std::to_string(asks) + ")");
+}
+
+// catchlight: a lighter unheld tip costs at most one locator round per HELLO and never switches the chain. A holds
+// 40 positions; B forks at 30 with two of its own. J, a full node at A's tip, meets only B: one locator round (from
+// 40, 39, 38, 36, 32, 24; at most floor(log2 40) + 2 = 7 requests) ended by its reply, kept by J's own header work;
+// no request in 3 x P-53 after it; a new link to B (a second HELLO) costs one round again; J's best never moves.
+void catchlight() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    Branches br = branches(h, w, net, 30, 2, 10, 3400);
+    const std::size_t a = br.a.node, b = br.b.node;
+    const pb::Hash32 tip_a = h[a].tree().best().id;
+    KatRelay j = kat_relay(h, w, table0(net), true);
+    w.connect(0, 2);
+    w.run();
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        j.relay->tick();
+        w.run();
+    }
+    const bool followed = h[j.node].tree().best().id == tip_a;
+    w.links[2]->disconnect(w.id(2, 0));
+    w.run();
+    const pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t gen0 = h[j.node].best_changes();
+    const std::uint64_t asks0 = rj.stats().catchup_requests.load();
+    const std::uint64_t bound = 7;  // floor(log2 40) + 2
+    w.edit = drop_headers(2, 1);    // B's own catch-up toward J gets no reply: B stays on its branch
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t round1 = rj.stats().catchup_requests.load() - asks0;
+    const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+    for (std::uint64_t k = 0; k < 3 * p53 + 2; ++k) {
+        h.now += 1;
+        j.relay->tick();
+        w.run();
+    }
+    const std::uint64_t after = rj.stats().catchup_requests.load() - asks0 - round1;
+    w.links[2]->disconnect(w.id(2, 1));
+    w.run();
+    w.reconnect(1, 2);
+    w.run();
+    const std::uint64_t round2 = rj.stats().catchup_requests.load() - asks0 - round1 - after;
+    for (std::uint64_t k = 0; k < p53 + 2; ++k) {
+        h.now += 1;
+        j.relay->tick();
+        w.run();
+    }
+    const std::uint64_t after2 = rj.stats().catchup_requests.load() - asks0 - round1 - after - round2;
+    w.edit = nullptr;
+    const bool never = h[j.node].tree().best().id == tip_a && h[j.node].best_changes() == gen0
+                       && !h[j.node].holds_tip(h[b].tree().best().id) && rj.stats().strikes.load() == 0
+                       && rj.stats().bans.load() == 0;
+    std::printf("  catchlight: J at %llu, B at %llu; requests: round 1 %llu, after it %llu, round 2 %llu, after it %llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[b].tree().best().pos,
+                (unsigned long long)round1, (unsigned long long)after, (unsigned long long)round2,
+                (unsigned long long)after2);
+    check(br.ok && followed, "catchlight: setup (J at A's tip 40; B's tip 32 on its own branch, lighter)");
+    check(round1 >= 2 && round1 <= bound && after == 0 && round2 >= 2 && round2 <= bound && after2 == 0 && never,
+          "catchlight: B's unheld lighter tip costs one locator round per HELLO (" + std::to_string(round1) + ", " +
+                  std::to_string(round2) + " requests, at most " + std::to_string(bound) +
+                  "), none after its reply; J's chain never switches");
+}
+
+// catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
+// tip (B's branch: A's 1, 2 and its own 3; the fork below the node's journal base 4): offer_empty_store_tip queues one
+// pair; its one attempt completes and rule (4) keeps the node's chain (its own chain is A); the same pair is not queued
+// again (P-52).
+void catchoffer() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true);
+    const std::size_t b = h.add(table0(net), true);
+    for (int i = 0; i < 2; ++i) {
+        h.tick_monero();
+        h.mine(a, static_cast<std::size_t>(i), 3600 + static_cast<std::uint32_t>(i));
+    }
+    const bool shared = h[b].tree().best().id == h[a].tree().best().id;
+    h.cut.insert({a, b});
+    h.cut.insert({b, a});
+    h.tick_monero();
+    h.mine(b, 2, 3700);  // B's own carrier at 3
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, static_cast<std::size_t>(i % 5), 3800 + static_cast<std::uint32_t>(i));
+    }
+    const std::uint64_t J = 4;
+    const std::size_t jn = h.add(table0(net), false, J, true);  // started empty, not launched: K_NCU
+    MemoryKv& kvj = *h.kvs.back();
+    for (std::uint64_t x = 1; x <= 8; ++x)
+        if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+            (void)h[jn].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+    h.q.clear();
+    const pb::Hash32 own_tip = h[jn].tree().best().id;
+    const pb::Hash32 tip_b = h[b].tree().best().id;
+    const bool walked = h[jn].tree().best().pos == 8 && own_tip == h[a].store().best_tip() && !h[jn].caught_up()
+                        && kvj.data.count(pb::store_keys::ncu(0)) != 0 && h[b].tree().best().pos == 3
+                        && h[jn].store().base_pos() > 2;
+    const bool lighter = ::c2pool::xmr::native::u128_greater(h[jn].tree().best().cum_work, h[b].tree().best().cum_work);
+    KatTransport tr(h, jn);
+    h[jn].set_join_transport(&tr);
+    const pb::HelloCheck hc = h.hello(jn, b);
+    const bool unheld = !h[jn].holds_tip(tip_b);
+    const bool offered = h[jn].offer_empty_store_tip(b);
+    const std::size_t queued = h[jn].joiner().queue().size();
+    const pb::JoinStep st = h[jn].run_join();
+    const bool again = h[jn].offer_empty_store_tip(b);
+    std::printf("  catchoffer: J at %llu (base %llu), B at %llu; offered %d; the attempt %s; J's best kept %d; offered "
+                "again %d\n",
+                (unsigned long long)h[jn].tree().best().pos, (unsigned long long)h[jn].store().base_pos(),
+                (unsigned long long)h[b].tree().best().pos, offered ? 1 : 0,
+                st.report ? pb::attempt_end_name(st.report->end) : "none", h[jn].tree().best().id == own_tip ? 1 : 0,
+                again ? 1 : 0);
+    check(shared && walked && lighter && hc.verdict == pb::HelloVerdict::Accept && unheld,
+          "catchoffer: setup (J walked A's 1..8, not caught up, its base above the fork; B's tip 3 lighter and not held "
+          "at J)");
+    check(offered && queued == 1,
+          "catchoffer: B's unheld lighter tip offered to the joiner: one pair queued (" + std::to_string(queued) + ")");
+    check(st.report && st.report->end == pb::AttemptEnd::Completed && !st.sw.replaced && !st.sw.adopted && !st.switched
+                  && h[jn].tree().best().id == own_tip && h[jn].joined() == nullptr && !again
+                  && h[jn].joiner().queue().size() == 0,
+          "catchoffer: the one attempt completes and rule (4) keeps J's chain; the pair is not queued again" +
+                  (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+}
+
+// ---------------------------------------------------------------------------
 // floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
 //   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
 //           the floor and admits A's carriers on it (B follows A's branch);
@@ -9336,6 +9582,9 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("catchkeep", catchkeep);
+    run("catchlight", catchlight);
+    run("catchoffer", catchoffer);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
