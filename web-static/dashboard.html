@@ -1318,6 +1318,12 @@
         
         @media (max-width: 900px) {
             .two-col { grid-template-columns: 1fr; }
+            /* Stacked panels have no neighbour column to align with, so the
+               fixed 660px height only leaves empty space under short tables.
+               Fit each panel to its rows and cap the scroll area so a long
+               table still scrolls in place (p2pool-dash adjustTableHeight). */
+            .table-panel { height: auto; }
+            .table-panel .table-scroll { flex: 0 1 auto; max-height: 400px; }
         }
         
         /* New Main Layout: 4 columns with graph spanning 2x3 */
