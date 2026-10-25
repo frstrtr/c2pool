@@ -36,8 +36,13 @@ SUB="dash_testnet_${NETID}_v36"   # custom network-id state dir (v36 profile suf
 # rig stays entirely on 127.0.0.1.
 COMMON=(--run --testnet --network-id "$NETID" --prefix "$PREFIX" --web-host 127.0.0.1
         --coin-p2p-connect 127.0.0.1:1)
+# --alert-relay-serve-stall-after 0: this rig's node never serves a template
+# (no coin peer), so with the default 300 s the node-level WORK_STALLED would
+# page during a long run and break the "exactly ONE" counts below. The
+# node-level events are pinned by the KATs (test_dash_alert_relay).
 FAST=(--alert-relay-offline-after 20 --alert-relay-online-after 5 --alert-relay-startup-grace 5
-      --alert-relay-retry-every 5 --alert-relay-min-interval 30 --alert-relay-stall-after 0)
+      --alert-relay-retry-every 5 --alert-relay-min-interval 30 --alert-relay-stall-after 0
+      --alert-relay-serve-stall-after 0)
 
 PIDS=()
 fail() { echo "E2E FAIL: $*"; cleanup; exit 1; }
