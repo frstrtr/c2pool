@@ -430,6 +430,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # seeded jobs the operator's expected PPLNS weight equals the jobs the fee
     # drew (was ~0.64 of them; field 0.08% of the block for --fee 1). Same
     # folding rule.
+    # drop_tails_asan_kat_test.cpp ([L-KR1Z1S]): drives the clean_tracker Step 3
+    # tail-drop loop (ltc::drop_tails, drop_tails.hpp) over a REAL ~18k-share
+    # ShareTracker for 300+ drop iterations while a concurrent build_stops
+    # walker runs under the production lock discipline. Meant to be run under
+    # ASan to catch a prune-vs-walk use-after-free. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -464,6 +469,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_utxo_full_test.cpp
         doge_utxo_full_wiring_test.cpp
         doge_utxo_lane_test.cpp
+        drop_tails_asan_kat_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
