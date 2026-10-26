@@ -850,18 +850,12 @@ public:
     std::uint64_t parent_asks() const noexcept { return parent_asks_; }
     // ... of them sent by reask_parents.
     std::uint64_t parent_reasks() const noexcept { return parent_reasks_; }
-    // The relay's maintenance tick, after tick(now_s): while the best tip has not moved within P-53, the lowest frame of
-    // a parked chain (its parent neither held nor parked) has FC_GETCARRIER(parent) sent to its sender once that parent
-    // was not asked within P-53 (an ask lost or not served, an ancestor the deferred store evicted); at most one ask per
-    // parent id per P-53.
+    // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
+    // parked) has FC_GETCARRIER(parent) sent to its sender while that parent is missing, once it was not asked within
+    // P-53 (an ask lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at
+    // most one ask per parent id per P-53.
     void reask_parents() {
         if (poisoned_ || deferred_.waiting_keys() == 0) return;
-        if (const Hash32 b = tree_->best().id; b != reask_best_) {
-            reask_best_ = b;
-            reask_best_s_ = clock_s_;
-            return;
-        }
-        if (clock_s_ < reask_best_s_ + cfg_.abandon_timeout_s) return;
         const std::set<Hash32> parked = deferred_.ids();
         for (const auto& [parent, peer] : deferred_.waiting_parents()) {
             if (peer == kOwnPeer || tree_->find(parent) != nullptr || tree_->is_waiting(parent) || parked.count(parent) != 0)
@@ -3405,8 +3399,6 @@ private:
     std::map<Hash32, std::uint64_t> parent_asked_;  // parent asks of ParentUnknown DEFERs: their last ask time (s)
     std::uint64_t parent_asks_ = 0;                 // parent asks sent
     std::uint64_t parent_reasks_ = 0;               // ... of them by reask_parents
-    Hash32 reask_best_{};                           // reask_parents: the best tip it saw last, and since when (s)
-    std::uint64_t reask_best_s_ = 0;
     std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
