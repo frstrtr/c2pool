@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
+#include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
 #include <impl/dash/coin/asset_unlock_admission.hpp>  // #143 Variant B: verified type-9 set (light bridge struct)
@@ -541,7 +542,19 @@ inline DashWorkData build_embedded_workdata(
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
     // types 5/6/7/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
-    bool include_mn_special_txs = false)
+    bool include_mn_special_txs = false,
+    // ── PoSe PASS seams (sml_pose_fold.hpp, incident h=2561514) ──────────
+    // The member proTxHash source and the penalty oracle for dashd's
+    // HandleQuorumCommitment/PoSePunish pass over the REAL commitments in
+    // qc_commitments (specialtxman.cpp:159-174, :427-451). When the pass
+    // proves a ban, the committed merkleRootMNList carries it (isValid=false
+    // on that leaf); when it cannot be decided exactly, the unfolded root is
+    // committed exactly as before and the NodeCoinState viability + pre-emit
+    // gates refuse the template (emit-qc-real-pose-unfolded). Default
+    // nullptr => every existing positional caller is byte-unchanged: no
+    // member source means no ban can be proven, so no root changes.
+    const QcMembersFn* qc_pose_members = nullptr,
+    const PoSeOracle* qc_pose_oracle = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -710,10 +723,49 @@ inline DashWorkData build_embedded_workdata(
     // Never mutates any follower state: the fold runs on a projected COPY. When
     // the mask did not admit types 1-4 (default), this whole block is skipped
     // and the template is byte-identical to before.
+    //
+    // ── PoSe PASS over the body's REAL type-6 commitments (sml_pose_fold.hpp)
+    // dashd's list rebuild runs confirmedHash pass -> DecreaseScores -> vtx in
+    // block order (specialtxman.cpp:206-229, :232-453), and every type-6 tx of
+    // this body sits directly after the coinbase, ahead of every provider tx.
+    // So the PoSe pass is decided ONCE here and applied to each projected
+    // copy BEFORE the types 1-4 fold and before the CbTx root: a ProUpServTx
+    // later in the same body must see (and revive) a ban this pass applies.
+    // Decided on the TIP list — the pass reads only presence, isValid and the
+    // entry count, which the confirmation projection never changes. A pass
+    // that cannot be decided exactly bans nothing here (the unfolded root is
+    // committed, exactly as before this pass existed) and the NodeCoinState
+    // viability + pre-emit gates refuse the template — never a guessed ban.
+    std::vector<uint256> qc_pose_bans;
+    if (sml != nullptr && qc_commitments != nullptr && !qc_commitments->empty()) {
+        static const QcMembersFn kNoMemberSource;
+        const QcPoseDecision pose = decide_qc_pose(
+            *sml, *qc_commitments,
+            qc_pose_members != nullptr ? *qc_pose_members : kNoMemberSource,
+            qc_pose_oracle, prev_height, prev_hash);
+        if (!pose.ok()) {
+            LOG_WARNING << "[GBT-EMB] PoSe pass UNDECIDABLE at h="
+                        << (prev_height + 1) << ": qc[" << pose.qc_index
+                        << "] type=" << static_cast<int>(pose.llmq_type)
+                        << " qi=" << pose.quorum_index
+                        << " stage=" << qc_pose_stage_name(pose.stage)
+                        << " — committed merkleRootMNList carries no PoSe ban"
+                        << " (emit gate refuses this template)";
+        } else {
+            qc_pose_bans = pose.bans;
+            if (!qc_pose_bans.empty())
+                LOG_INFO << "[GBT-EMB] PoSe pass h=" << (prev_height + 1)
+                         << " punished=" << pose.punished
+                         << " banned=" << qc_pose_bans.size()
+                         << " — committing the post-ban merkleRootMNList";
+        }
+    }
     std::optional<vendor::CSimplifiedMNList> mn_folded_sml;
     if (special_mask.allow_mn_types && sml != nullptr) {
         auto proj_for_fold = project_sml_confirmations(
             *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
+        // dashd order: the type-6 PoSe pass precedes the provider txs.
+        apply_qc_pose_bans(proj_for_fold.sml, qc_pose_bans);
         if (proj_for_fold.ok) {
             std::vector<MutableTransaction> body_for_fold;
             body_for_fold.reserve(selected.size());
@@ -859,19 +911,17 @@ inline DashWorkData build_embedded_workdata(
     // that for byte parity. Zero fee, zero in/out; consensus-checked via
     // the NodeCoinState emit gate against the same deterministic plan.
     //
-    // ██ PHASE-L LANDMINE — PoSe punishment on REAL commitments ██
-    // dashd's verifier PoSe-punishes every !validMembers[i] quorum member
-    // when a NON-NULL commitment is in the block (specialtxman.cpp:159-174
+    // PoSe punishment on REAL commitments (the #1083 landmine): dashd's
+    // verifier PoSe-punishes every !validMembers[i] quorum member when a
+    // NON-NULL commitment is in the block (specialtxman.cpp:159-174
     // HandleQuorumCommitment -> PoSePunish(CalcPenalty(66))), and a penalty
     // that crosses the ban threshold flips that MN's isValid IN THE SAME
     // BLOCK's MN list — changing the merkleRootMNList THIS coinbase commits.
-    // Null commitments are exempt (specialtxman.cpp:432 IsNull() guard), so
-    // today's all-null qc plans cannot trip it and the projected root above
-    // stays correct. THE DAY Phase L serves REAL (non-null) commitments,
-    // this inclusion site MUST fold the PoSe pass into the committed MN root
-    // (mirror of the confirmedHash rollover projection above) or every block
-    // carrying a commitment with a failed member is bad-cbtx-mnmerkleroot —
-    // a silently lost block. Do not ship real commitments without it.
+    // That pass is folded above (qc_pose_bans, sml_pose_fold.hpp) in dashd's
+    // order; whatever it cannot decide exactly is refused by the
+    // NodeCoinState gates. Null commitments are exempt (specialtxman.cpp:432
+    // IsNull() guard). Moving these txs after any provider tx would break
+    // the fold order — keep them directly after the coinbase.
     if (qc_commitments != nullptr) {
         for (const auto& c : *qc_commitments) {
             MutableTransaction qtx = build_qc_tx(w.m_height, c);
@@ -1203,11 +1253,17 @@ inline DashWorkData build_embedded_workdata(
                      << (prev_height + 1)
                      << " — committing projected merkleRootMNList";
         }
+        // The type-6 PoSe pass (decided above, before the types 1-4 fold):
+        // a proven ban flips that leaf's isValid in the list this block
+        // commits (PoSePunish -> BanIfNotBanned, deterministicmns.cpp:319-321).
+        // Empty (no real commitment / no punishment crosses max / undecidable)
+        // => the projection is untouched.
+        apply_qc_pose_bans(proj.sml, qc_pose_bans);
         // merkleRootMNList source: the types-1-4 fold above (when armed and the
-        // projection was available) has already applied the body's provider
-        // special txs to a projected COPY — commit THAT list's root so the
-        // CbTx matches the list the block's own txs produce (dashd
-        // BuildNewListFromBlock). Otherwise commit the plain projected root.
+        // projection was available) has already applied the PoSe bans and the
+        // body's provider special txs to a projected COPY — commit THAT list's
+        // root so the CbTx matches the list the block's own txs produce (dashd
+        // BuildNewListFromBlock). Otherwise commit the projected root.
         const vendor::CSimplifiedMNList& cbtx_sml =
             mn_folded_sml.has_value() ? *mn_folded_sml : proj.sml;
         vendor::CCbTx cb = build_embedded_cbtx(

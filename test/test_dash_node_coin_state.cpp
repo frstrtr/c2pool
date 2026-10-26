@@ -43,6 +43,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using dash::coin::NodeCoinState;
@@ -1945,20 +1946,24 @@ TEST(DashServeGateNamesRefusal, NoTipOnlyWhenTheMaintainerNeverReported) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// The #1083 PoSe landmine, ENFORCED (emit-qc-real-pose-unfolded).
+// The #1083 PoSe landmine, as dashd's own pass (qc-real-pose-unfolded /
+// emit-qc-real-pose-unfolded; sml_pose_fold.hpp, incident h=2561514).
 //
 // dashd's verifier PoSe-punishes every quorum member a NON-NULL in-block
 // commitment marks invalid (specialtxman.cpp:159-174 HandleQuorumCommitment
 // -> PoSePunish(CalcPenalty(66))), and a punishment crossing the ban
 // threshold flips that MN's validity IN THE SAME BLOCK's MN list — changing
 // the merkleRootMNList the same coinbase commits. Null commitments are
-// exempt (specialtxman.cpp:427-432, IsNull() guard). c2pool folds no PoSe
-// pass into its committed root; since #1077 wired rotated member sourcing
-// the real-commitment lane is LIVE, so a verified real commitment carrying
-// !validMembers[i] for a listed member is a servable bad-cbtx-mnmerkleroot —
-// a silently losable block. The pre-emit gate must refuse it; the ONLY thing
-// standing there before this gate was a comment (embedded_gbt.hpp), and a
-// comment refuses nothing.
+// exempt (specialtxman.cpp:427-432, IsNull() guard).
+//
+// The pre-fix gate refused EVERY real commitment with a clear bit for a listed
+// member. The pass now serves whenever the ban decision is PROVABLE (penalty
+// oracle bounds, or the free exact no-ops: punished member absent / already
+// banned) and folds a proven ban into the committed root; everything else
+// still refuses, naming the commitment and the stage. The viability probe and
+// the pre-emit gate take the SAME decision, so the refusal now surfaces at
+// viability (qc-real-pose-unfolded) and the emit gate re-asserts it on any
+// template that bypassed viability (emit-qc-real-pose-unfolded).
 //
 // Shared fixture: the QcPlanServesDkgWindowHeightAndEmitGateEnforcesIt
 // posture (tip 1518417 => next 1518418), with the plan fn returning ONE
@@ -1988,6 +1993,46 @@ dash::coin::vendor::CFinalCommitment make_real_qc(bool punish_listed_member)
     return c;
 }
 
+// The 50 member identities of make_real_qc's quorum, index-aligned with its
+// validMembers bitset. Member 7 — the one a punishing commitment marks
+// invalid — is raw256(0x40), a VALID entry of seed_sml(): dashd punishes it,
+// so its ban decision needs a penalty.
+std::vector<uint256> qc_member_protx()
+{
+    std::vector<uint256> v;
+    for (uint8_t i = 0; i < 50; ++i) {
+        uint256 h;
+        std::array<uint8_t, 32> b{};
+        b[0] = 0xC0; b[1] = i; b[31] = 0x5E;
+        std::memcpy(h.data(), b.data(), 32);
+        v.push_back(h);
+    }
+    v[7] = raw256(0x40);
+    return v;
+}
+
+dash::coin::QcMembersFn qc_members_fn()
+{
+    return [](uint8_t, const uint256&)
+               -> std::optional<std::vector<uint256>> { return qc_member_protx(); };
+}
+
+// A penalty oracle at the fixture tip (1518417, raw256(0xAB)) answering
+// {lo, hi} for every MN.
+void wire_oracle(NodeCoinState& st, int32_t lo, int32_t hi,
+                 uint32_t at_height = 1518417)
+{
+    st.set_qc_pose_fold_inputs(
+        qc_members_fn(),
+        [lo, hi](const uint256&) {
+            return std::optional<dash::coin::PoSePenaltyView>{{lo, hi, false}};
+        },
+        [at_height] {
+            return std::optional<std::pair<uint32_t, uint256>>{
+                {at_height, raw256(0xAB)}};
+        });
+}
+
 // Seed the same healthy DKG-window serving posture the E1 qc-plan test uses,
 // with a plan fn returning exactly `qc` + a fixed with-block root override.
 void seed_real_qc_serving(NodeCoinState& st,
@@ -2007,55 +2052,64 @@ void seed_real_qc_serving(NodeCoinState& st,
                DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u);
 }
 
+// Build the template as if viability had been BYPASSED (a cached template,
+// or a viability regression) — the case the pre-emit gate exists for.
+DashWorkData build_bypassing_viability(const NodeCoinState& st)
+{
+    auto e = st.make_embedded_work_inputs();
+    e.has_state = true;
+    return dash::coin::select_dash_work(e, [] { return DashWorkData{}; }).work;
+}
+
+uint256 committed_mn_root(const DashWorkData& w)
+{
+    CCbTx cb;
+    EXPECT_TRUE(dash::coin::vendor::parse_cbtx(w.m_coinbase_payload, cb));
+    return cb.merkleRootMNList;
+}
+
 } // namespace
 
-// THE MASTER DEFECT, pinned. On pre-gate master this test FAILS at the
-// EXPECT_FALSE: the punishing real commitment sails through the pre-emit
-// gate (count/payload/root all self-consistent) and the template SERVES —
-// the silently losable block. No PoSe-noop capability is wired here, which
-// is exactly the state production shipped in: the gate must fail CLOSED on
-// capability absence, not only on a proven punishment.
+// THE MASTER DEFECT, pinned (pre-gate master served this). No PoSe inputs
+// are wired here — the state production first shipped in: the pass must fail
+// CLOSED on capability absence, at viability AND at emit.
 TEST(DashQcPoseGate, RealCommitmentPunishingListedMemberIsRefusedAtEmit) {
     NodeCoinState st;
     seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
 
-    // The template BUILDS and carries the real qc tx — viability alone does
-    // not (and cannot cheaply) prove the PoSe no-op; the emit gate is the
-    // enforcement point, exactly like the other emit re-derivations.
-    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
-    ASSERT_EQ(sel.source, WorkSource::Embedded);
-    ASSERT_EQ(sel.work.m_txs.size(), 1u);
-    ASSERT_EQ(sel.work.m_txs[0].type, 6);
+    const DeclineReport d = st.describe_decline();
+    EXPECT_FALSE(d.viable);
+    EXPECT_EQ(d.cause, "qc-real-pose-unfolded");
+    EXPECT_NE(d.value.find("stage=members-missing"), std::string::npos) << d.value;
 
+    // The template still BUILDS (bypass) and carries the real qc tx; the
+    // emit gate refuses it independently.
+    DashWorkData w = build_bypassing_viability(st);
+    ASSERT_EQ(w.m_txs.size(), 1u);
+    ASSERT_EQ(w.m_txs[0].type, 6);
     DeclineReport why;
-    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why))
+    EXPECT_FALSE(st.embedded_template_emit_ok(w, &why))
         << "a REAL commitment that PoSe-punishes a listed member reached the "
-           "miner: dashd's verifier flips that MN in THIS block's list and "
-           "the committed merkleRootMNList is wrong (bad-cbtx-mnmerkleroot = "
-           "a silently lost block)";
+           "miner with no way to decide the ban: the committed "
+           "merkleRootMNList may be wrong (bad-cbtx-mnmerkleroot = a silently "
+           "lost block)";
     EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
-    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
-    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
-        << "capability ABSENT must print n/a, not a fabricated verdict: "
+    EXPECT_EQ(why.threshold, NodeCoinState::kQcPoseThreshold);
+    EXPECT_NE(why.value.find("stage=members-missing"), std::string::npos)
+        << "capability ABSENT must name the missing stage, not a verdict: "
         << why.value;
 }
 
-// Negative twin: with the PoSe-noop capability wired and every listed member
-// valid (the common case), the SAME posture serves exactly as before — the
-// gate is punishment-specific, not a blanket real-commitment refuse.
+// Negative twin: with the member source wired and every listed member valid
+// (the common case), the SAME posture serves exactly as before — no oracle
+// is needed when nothing is punished.
 TEST(DashQcPoseGate, AllListedMembersValidServesExactlyAsBefore) {
     NodeCoinState st;
     seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
-    st.set_qc_pose_noop_fn(
-        [](const dash::coin::vendor::CFinalCommitment& c)
-            -> std::optional<bool> {
-            // The production shape: judge against the deterministic member
-            // list's size (full 50-member quorum here).
-            return dash::coin::qc_pose_pass_provably_noop(c, 50);
-        });
+    st.set_qc_pose_fold_inputs(qc_members_fn());
 
     WorkSelection sel = st.select_work([] { return DashWorkData{}; });
-    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
     DeclineReport why;
     EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
         << "cause=" << why.cause << " value=" << why.value;
@@ -2067,43 +2121,40 @@ TEST(DashQcPoseGate, AllListedMembersValidServesExactlyAsBefore) {
     EXPECT_FALSE(st.embedded_template_emit_ok(tampered));
 }
 
-// With the capability WIRED, a proven punishment refuses with the measured
-// value naming the offending commitment — cause/value/threshold discipline.
+// With the member source wired but NO oracle, a punishment of a listed, valid
+// MN refuses — cause/value/threshold discipline, naming type, qi and stage.
 TEST(DashQcPoseGate, PunishingCommitmentRefusedEvenWithCapabilityWired) {
     NodeCoinState st;
     seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
-    st.set_qc_pose_noop_fn(
-        [](const dash::coin::vendor::CFinalCommitment& c)
-            -> std::optional<bool> {
-            return dash::coin::qc_pose_pass_provably_noop(c, 50);
-        });
+    st.set_qc_pose_fold_inputs(qc_members_fn());
 
-    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
-    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    DashWorkData w = build_bypassing_viability(st);
     DeclineReport why;
-    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_FALSE(st.embedded_template_emit_ok(w, &why));
     EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
-    EXPECT_NE(why.value.find("pose_noop=unproven"), std::string::npos)
-        << "a MEASURED failed proof must say 'unproven', not 'n/a': "
-        << why.value;
+    EXPECT_NE(why.value.find("stage=penalty-unknown"), std::string::npos)
+        << "a punishment with no penalty source must say so: " << why.value;
     EXPECT_NE(why.value.find("type=1"), std::string::npos) << why.value;
+    EXPECT_NE(why.value.find("qi=0"), std::string::npos) << why.value;
 }
 
-// A wired capability that CANNOT answer (member set no longer cached) must
+// A wired source that CANNOT answer (member set no longer cached) must
 // refuse — nullopt is "cannot prove", and unprovable serves nothing.
 TEST(DashQcPoseGate, UnprovableMemberSetFailsClosed) {
     NodeCoinState st;
     seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/false));
-    st.set_qc_pose_noop_fn(
-        [](const dash::coin::vendor::CFinalCommitment&)
-            -> std::optional<bool> { return std::nullopt; });
+    st.set_qc_pose_fold_inputs(
+        [](uint8_t, const uint256&) -> std::optional<std::vector<uint256>> {
+            return std::nullopt;
+        });
 
     WorkSelection sel = st.select_work([] { return DashWorkData{}; });
-    ASSERT_EQ(sel.source, WorkSource::Embedded);
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_EQ(sel.decline.cause, "qc-real-pose-unfolded");
     DeclineReport why;
-    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_FALSE(st.embedded_template_emit_ok(build_bypassing_viability(st), &why));
     EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
-    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos) << why.value;
+    EXPECT_NE(why.value.find("stage=members-missing"), std::string::npos) << why.value;
 }
 
 // Null commitments are exempt by dashd's own IsNull() guard — an all-null
@@ -2115,12 +2166,110 @@ TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
     const auto null_qc = dash::coin::build_null_commitment(
         dash::coin::kLlmq50_60, raw256(0x50), 0);
     seed_real_qc_serving(st, null_qc);
-    // No set_qc_pose_noop_fn on purpose.
+    // No set_qc_pose_fold_inputs on purpose.
     WorkSelection sel = st.select_work([] { return DashWorkData{}; });
     ASSERT_EQ(sel.source, WorkSource::Embedded);
     DeclineReport why;
     EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
         << "cause=" << why.cause << " value=" << why.value;
+}
+
+// KAT 8 — THE INCIDENT FIX. A punishment whose ban decision is PROVABLY "no
+// ban" (oracle penalty 0: 0 -> decay 0 -> +66 = 66 < max 100) serves, and the
+// committed root is the unpunished one. Pre-fix master refused this height.
+TEST(DashQcPoseGate, PunishingCommitmentWithProvableNoBanServes) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    wire_oracle(st, 0, 0);
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why))
+        << "a punishment that provably bans nobody was refused: "
+        << why.one_line();
+    EXPECT_EQ(committed_mn_root(sel.work), std::as_const(st).sml().CalcMerkleRoot())
+        << "no ban => the committed root is the (projected) tip root";
+}
+
+// KAT 9 — a PROVEN ban (penalty 50: 49 + 66 = 115 -> clamp 100 >= 100) is
+// folded into the committed root: CalcMerkleRoot of the list with that entry
+// isValid=false (independent hand copy), and the gate accepts it.
+TEST(DashQcPoseGate, PunishingCommitmentWithProvableBanServesFoldedRoot) {
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    wire_oracle(st, 50, 50);
+
+    CSimplifiedMNList ref = std::as_const(st).sml();
+    for (auto& e : ref.mnList)
+        if (e.proRegTxHash == raw256(0x40)) e.isValid = false;
+    const uint256 folded = ref.CalcMerkleRoot();
+    ASSERT_NE(folded, std::as_const(st).sml().CalcMerkleRoot());
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    EXPECT_EQ(committed_mn_root(sel.work), folded)
+        << "the ban must reach the committed merkleRootMNList";
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+}
+
+// KAT 10 — fail closed with no oracle (the PR-A production posture): the
+// refusal names stage=penalty-unknown, and an oracle that is not at THIS tip
+// names oracle-not-at-tip — both at viability and at emit.
+TEST(DashQcPoseGate, OracleAbsentStillRefusesFailClosed) {
+    {
+        NodeCoinState st;
+        seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+        st.set_qc_pose_fold_inputs(qc_members_fn());   // no oracle
+        const DeclineReport d = st.describe_decline();
+        EXPECT_EQ(d.cause, "qc-real-pose-unfolded");
+        EXPECT_NE(d.value.find("stage=penalty-unknown"), std::string::npos) << d.value;
+        DeclineReport why;
+        EXPECT_FALSE(st.embedded_template_emit_ok(build_bypassing_viability(st), &why));
+        EXPECT_EQ(why.cause, "emit-qc-real-pose-unfolded");
+        EXPECT_NE(why.value.find("stage=penalty-unknown"), std::string::npos) << why.value;
+    }
+    {
+        NodeCoinState st;
+        seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+        wire_oracle(st, 0, 0, /*at_height=*/1518416);   // one block behind
+        const DeclineReport d = st.describe_decline();
+        EXPECT_EQ(d.cause, "qc-real-pose-unfolded");
+        EXPECT_NE(d.value.find("stage=oracle-not-at-tip"), std::string::npos) << d.value;
+        DeclineReport why;
+        EXPECT_FALSE(st.embedded_template_emit_ok(build_bypassing_viability(st), &why));
+        EXPECT_NE(why.value.find("stage=oracle-not-at-tip"), std::string::npos) << why.value;
+    }
+}
+
+// KAT 11 — the viability probe NAMES the refusal: cause, the commitment by
+// type + quorumIndex + DISCRIMINATING quorum-hash tail (the head of a mainnet
+// block hash is twelve zeros — the pre-fix value printed exactly that), the
+// stage, and the threshold.
+TEST(DashQcPoseGate, ViabilityProbeNamesPoseUnfolded) {
+    NodeCoinState st;
+    auto qc = make_real_qc(/*punish_listed_member=*/true);
+    // A mainnet-shaped quorum hash: 14 leading zero nibbles.
+    qc.quorumHash.SetHex(
+        "00000000000000114b422bd9bc3a417552d941959ec09b13ff943b4dc77fb198");
+    qc.quorumIndex = 3;
+    seed_real_qc_serving(st, qc);
+    st.set_qc_pose_fold_inputs(qc_members_fn());
+
+    const DeclineReport d = st.describe_decline();
+    ASSERT_FALSE(d.viable);
+    EXPECT_EQ(d.cause, "qc-real-pose-unfolded");
+    EXPECT_EQ(d.threshold, NodeCoinState::kQcPoseThreshold);
+    EXPECT_NE(d.value.find("qc[0]:type=1,qi=3,"), std::string::npos) << d.value;
+    EXPECT_NE(d.value.find("quorum=...3b4dc77fb198"), std::string::npos) << d.value;
+    EXPECT_EQ(d.value.find("quorum=000000000000"), std::string::npos)
+        << "the non-discriminating hash head is back: " << d.value;
+    EXPECT_NE(d.value.find("stage=penalty-unknown"), std::string::npos) << d.value;
+    // The decision the probe took is the one the gate takes.
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    EXPECT_EQ(sel.source, WorkSource::DashdFallback);
+    EXPECT_EQ(sel.decline.cause, "qc-real-pose-unfolded");
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2130,8 +2279,8 @@ TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
 // cache entry (dkg_commitments.hpp:750-761). Once a slot is latched it no
 // longer calls the BLS verifier — and the verifier is what SOURCES THE MEMBER
 // KEY SET (bls_verify.hpp make_commitment_bls_verifier: provider nullopt =>
-// fail closed). Production feeds that same member source to the PoSe-noop
-// prover as well (main_dash.cpp:4160-4169
+// fail closed). Production feeds that same member source to the PoSe pass
+// as well (main_dash.cpp set_qc_pose_fold_inputs:
 // qc_member_source->lookup(...) -> nullopt => cannot prove).
 //
 // So if the member set is EVICTED after a successful verify, the refusal MOVES
@@ -2141,7 +2290,7 @@ TEST(DashQcPoseGate, NullCommitmentPlanIsExemptWithoutCapability) {
 //           (dkg_commitments.hpp:869-878) -> cause=emit-qc-plan-underivable
 //           (node_coin_state.hpp:892)
 //   after:  verified_for -> LATCHED commitment -> plan derives -> the PoSe
-//           gate cannot source the member set -> pose_noop=n/a
+//           gate cannot source the member set -> stage=members-missing
 //           -> cause=emit-qc-real-pose-unfolded (node_coin_state.hpp:930)
 //
 // SAME OUTCOME — fail closed, nothing served, template bytes unchanged. But a
@@ -2194,11 +2343,11 @@ TEST(DashQcVerifyMemoDeclineCause, EvictedMemberSetDeclinesAsPoseUnfolded) {
     NodeCoinState st;
     seed_real_qc_serving(st, qc);        // healthy DKG-window serving posture
     st.set_qc_plan_fn(cache_backed_qc_plan_fn(cache, qc.llmqType, qc.quorumHash));
-    st.set_qc_pose_noop_fn(
-        [&member_set_cached](const dash::coin::vendor::CFinalCommitment& c)
-            -> std::optional<bool> {
+    st.set_qc_pose_fold_inputs(
+        [&member_set_cached](uint8_t, const uint256&)
+            -> std::optional<std::vector<uint256>> {
             if (!member_set_cached) return std::nullopt;   // cannot prove
-            return dash::coin::qc_pose_pass_provably_noop(c, 50);
+            return qc_member_protx();
         });
 
     // 1) Member set present: the slot verifies (and LATCHES), and the height
@@ -2224,10 +2373,10 @@ TEST(DashQcVerifyMemoDeclineCause, EvictedMemberSetDeclinesAsPoseUnfolded) {
            "latched, the member-set eviction is no longer caught at "
            "verified_for (cause=emit-qc-plan-underivable) but at the PoSe "
            "gate. Got cause=" << why.cause << " value=" << why.value;
-    EXPECT_NE(why.value.find("pose_noop=n/a"), std::string::npos)
+    EXPECT_NE(why.value.find("stage=members-missing"), std::string::npos)
         << "the refusal must say the capability could not answer, not "
            "fabricate a verdict: " << why.value;
-    EXPECT_EQ(why.threshold, "pose-pass-provably-noop(all-listed-members-valid)");
+    EXPECT_EQ(why.threshold, NodeCoinState::kQcPoseThreshold);
 }
 
 // The CONTROL, and the reason the test above is a change and not a bug: with
@@ -2239,11 +2388,7 @@ TEST(DashQcVerifyMemoDeclineCause, UnlatchedSlotStillDeclinesAsPlanUnderivable) 
 
     NodeCoinState st;
     seed_real_qc_serving(st, qc);   // fixed plan fn => builds the template
-    st.set_qc_pose_noop_fn(
-        [](const dash::coin::vendor::CFinalCommitment& c)
-            -> std::optional<bool> {
-            return dash::coin::qc_pose_pass_provably_noop(c, 50);
-        });
+    st.set_qc_pose_fold_inputs(qc_members_fn());
     WorkSelection sel = st.select_work([] { return DashWorkData{}; });
     ASSERT_EQ(sel.source, WorkSource::Embedded);
     ASSERT_EQ(sel.work.m_txs.size(), 1u);

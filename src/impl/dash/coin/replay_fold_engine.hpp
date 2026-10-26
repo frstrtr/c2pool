@@ -129,6 +129,7 @@
 /// (genesis replay, W2/W4/W5) retires the anchor entirely.
 
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/pose_penalty.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
@@ -534,15 +535,16 @@ public:
 
     /// dashd CalcMaxPoSePenalty (deterministicmns.cpp:292-298): dynamic,
     /// max(100, number of registered MNs in the list — banned included).
+    /// Shared transcription: pose_penalty.hpp (also used by sml_pose_fold.hpp).
     int32_t calc_max_pose_penalty() const
     {
-        return std::max<int32_t>(100, static_cast<int32_t>(m_entries.size()));
+        return pose::calc_max_pose_penalty(m_entries.size());
     }
 
     /// dashd CalcPenalty (deterministicmns.cpp:300-304), integer math.
     int32_t calc_penalty(int32_t percent) const
     {
-        return (calc_max_pose_penalty() * percent) / 100;
+        return pose::calc_penalty(calc_max_pose_penalty(), percent);
     }
 
     /// DIP-4 merkleRootMNList of the CURRENT state — the value the
@@ -799,7 +801,8 @@ public:
         for (auto& [protx, st] : m_entries) {
             if (st.IsBanned()) continue;
             if (st.nPoSePenalty > 0) {
-                --st.nPoSePenalty;
+                st.nPoSePenalty =
+                    static_cast<int32_t>(pose::decayed(st.nPoSePenalty));
                 ++r.decayed;
             }
         }
@@ -1501,9 +1504,10 @@ private:
                      int32_t penalty, int32_t H, FoldResult& r)
     {
         const int32_t max_penalty = calc_max_pose_penalty();
-        st.nPoSePenalty = std::min(max_penalty, st.nPoSePenalty + penalty);
+        st.nPoSePenalty = static_cast<int32_t>(
+            pose::punished(st.nPoSePenalty, penalty, max_penalty));
         ++r.punished;
-        if (!st.IsBanned() && st.nPoSePenalty >= max_penalty) {
+        if (pose::punish_bans(st.IsBanned(), st.nPoSePenalty, max_penalty)) {
             st.BanIfNotBanned(H);
             // The ban flips isValid — the only SML-relevant effect of a punish
             // (nPoSePenalty itself is EXCLUDED from to_sml_entry).

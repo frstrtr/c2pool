@@ -229,6 +229,32 @@ TEST(DashRotatedQuorumMembers, KatKeysAreDistinctSoKeyOrderIsMemberOrder)
     EXPECT_EQ(protx.size(), want.size());
 }
 
+// PoSe identity (sml_pose_fold.hpp): every published member carries its
+// proRegTxHash, index-aligned with its key — i.e. dashd's own ORDERED
+// proTxHash list for the quorum (`quorum info`). The PoSe pass punishes
+// members[i]->proTxHash for !validMembers[i] (specialtxman.cpp:159-174), so a
+// misaligned identity would punish the wrong MN.
+TEST(DashRotatedQuorumMembers, ProTxHashesAreIndexAlignedWithDashdOrder)
+{
+    RealInputs in;
+    ASSERT_TRUE(in.load());
+    RotatedQuorumParams p{kType, kQuorumSz, kNQuorums};
+    auto sets = compute_quorum_members_by_quarter_rotation(p, in.cycles, in.snaps);
+    ASSERT_TRUE(sets.has_value());
+    const auto& got  = (*sets)[dash::coin::testdata::kRot6075_QuorumIndex];
+    const auto& want = dash::coin::testdata::rotated_6075_members();
+    ASSERT_EQ(got.size(), want.size());
+    for (size_t i = 0; i < want.size(); ++i) {
+        EXPECT_EQ(got[i].proTxHash.GetHex(), std::string(want[i].pro_tx_hash))
+            << "member INDEX " << i << " identity diverges from dashd";
+        EXPECT_EQ(hex48(got[i].pubKeyOperator), std::string(want[i].pub_key_operator))
+            << "member INDEX " << i << " key/identity pair split";
+    }
+    // Every slot of the cycle carries identities, never the null default.
+    for (const auto& q : *sets)
+        for (const auto& m : q) EXPECT_FALSE(m.proTxHash.IsNull());
+}
+
 // One qrinfo yields the WHOLE cycle: 32 slots, each exactly quorum size.
 TEST(DashRotatedQuorumMembers, AllThirtyTwoRotatedSlotsAreFullWidth)
 {

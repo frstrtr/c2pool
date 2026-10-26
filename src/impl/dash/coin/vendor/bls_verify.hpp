@@ -76,6 +76,12 @@ namespace vendor {
 struct MemberOperatorKey {
     std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> pubKeyOperator{};
     bool legacy_scheme{false};
+    /// The member's proRegTxHash — the identity dashd's PoSe pass punishes
+    /// (specialtxman.cpp:159-174: PoSePunish(members[i]->proTxHash, ...)),
+    /// index-aligned with the commitment's validMembers bitset exactly like
+    /// the key. The BLS verify ignores it; sml_pose_fold.hpp consumes it.
+    /// Null => not sourced (the PoSe pass then refuses, never guesses).
+    uint256 proTxHash;
 };
 
 /// dashcore llmq/commitment.cpp BuildCommitmentHash (@ v23.1.x, verbatim

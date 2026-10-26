@@ -246,6 +246,7 @@ inline std::optional<std::vector<MemberOperatorKey>> compute_quorum_members(
         MemberOperatorKey k;
         k.pubKeyOperator = mn.pubKeyOperator;
         k.legacy_scheme  = (mn.nVersion == CSimplifiedMNListEntry::VER_LEGACY_BLS);
+        k.proTxHash      = mn.proRegTxHash;   // PoSe identity (sml_pose_fold.hpp)
         out.push_back(k);
     }
     return out;

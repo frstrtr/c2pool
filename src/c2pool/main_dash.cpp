@@ -6520,31 +6520,43 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return qc_member_source->lookup(t, qh).has_value();
                 });
 
-            // PoSe-fold gate (the #1083 landmine ENFORCED — see
-            // NodeCoinState::set_qc_pose_noop_fn and dkg_commitments.hpp
-            // qc_pose_pass_provably_noop). A REAL in-block commitment makes
-            // dashd's verifier PoSe-punish every member it marks invalid
-            // (specialtxman.cpp:159-174), which can flip that MN's validity
-            // in the SAME block's list — the template's committed
-            // merkleRootMNList is then wrong (bad-cbtx-mnmerkleroot, a
-            // silently lost block). No PoSe fold exists here, so the pre-emit
-            // gate refuses any real commitment whose PoSe pass is not
-            // PROVABLY a no-op: every listed member valid, judged against the
-            // SAME deterministic member list the BLS verifier already sourced
-            // (its size is the members.size() dashd's punish loop runs over).
-            // Member set gone from cache => nullopt => refuse (fail-closed).
-            // Null commitments are exempt (IsNull() guard, specialtxman.cpp
-            // :432) — today's all-null plans are byte-unchanged.
-            node_coin_state.set_qc_pose_noop_fn(
-                [qc_member_source](
-                    const dash::coin::vendor::CFinalCommitment& c)
-                    -> std::optional<bool> {
+            // PoSe pass (the #1083 landmine — see
+            // NodeCoinState::set_qc_pose_fold_inputs and sml_pose_fold.hpp).
+            // A REAL in-block commitment makes dashd's verifier PoSe-punish
+            // every member it marks invalid (specialtxman.cpp:159-174); a
+            // punishment that crosses the ban threshold flips that MN's
+            // validity in the SAME block's list, so the committed
+            // merkleRootMNList must carry the ban or the block is
+            // bad-cbtx-mnmerkleroot (a silently lost block). The pass runs in
+            // dashd order on the SAME deterministic member list the BLS
+            // verifier sourced — its proTxHashes, index-aligned with
+            // validMembers — and serves only when every ban decision is
+            // PROVABLE. Member set gone from cache => nullopt => refuse.
+            //
+            // PENALTY ORACLE: not wired yet (PR-B makes the DML fold engine
+            // the oracle). Without one, any punishment of a listed, valid MN
+            // refuses (stage=penalty-unknown) exactly as before; only the two
+            // free exact no-ops serve — the punished member is absent from
+            // the list, or already banned. Null commitments are exempt
+            // (IsNull() guard, specialtxman.cpp:432) — all-null plans are
+            // byte-unchanged.
+            node_coin_state.set_qc_pose_fold_inputs(
+                [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)
+                    -> std::optional<std::vector<uint256>> {
                     auto members =
-                        qc_member_source->lookup(c.llmqType, c.quorumHash);
+                        qc_member_source->lookup(llmq_type, quorum_hash);
                     if (!members) return std::nullopt;   // cannot prove
-                    return dash::coin::qc_pose_pass_provably_noop(
-                        c, members->size());
-                });
+                    std::vector<uint256> pro;
+                    pro.reserve(members->size());
+                    for (const auto& m : *members) pro.push_back(m.proTxHash);
+                    return pro;
+                },
+                /*oracle_fn=*/{});
+            LOG_INFO << "[QC-POSE] PoSe pass installed: real commitments serve"
+                        " when no listed member is punished, or every punished"
+                        " member is absent/already banned; penalty oracle NOT"
+                        " wired -> any other punishment refuses the height"
+                        " (cause=*qc-real-pose-unfolded stage=penalty-unknown)";
 
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
@@ -6624,6 +6636,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                      << c.quorumHash.GetHex().substr(0, 16)
                                      << "... admitted -> work bumped, template"
                                         " re-issued (was null-served)";
+                            // The upgrade swaps a SERVING null template for
+                            // the real commitment; when that commitment's
+                            // PoSe pass cannot be proven the height is then
+                            // REFUSED until the slot is mined (incident
+                            // h=2561514). Say so at the trigger, not only in
+                            // the later [EMBED-GATE] line. Judged on this one
+                            // commitment (observability only — the gates
+                            // judge the whole plan).
+                            const auto pose =
+                                std::as_const(node_coin_state)
+                                    .qc_pose_decision({c});
+                            if (!pose.ok())
+                                LOG_WARNING
+                                    << "[QC-NULL-ARM] instant upgrade WILL BE"
+                                       " REFUSED by the PoSe pass: type="
+                                    << static_cast<int>(c.llmqType)
+                                    << " qi=" << c.quorumIndex
+                                    << " quorum=..."
+                                    << dash::coin::discriminating_hash_tail(
+                                           c.quorumHash)
+                                    << " stage="
+                                    << dash::coin::qc_pose_stage_name(pose.stage)
+                                    << (pose.pro_tx_hash.IsNull()
+                                            ? std::string()
+                                            : " protx="
+                                                  + pose.pro_tx_hash.GetHex()
+                                                        .substr(0, 12))
+                                    << " punished=" << pose.punished
+                                    << " -> the null-served height now"
+                                       " declines (cause=qc-real-pose-unfolded)"
+                                       " until the slot is mined";
                         }
                     }));
             // ── qc-plan-underivable CLOSURE: the request/response tee ──────

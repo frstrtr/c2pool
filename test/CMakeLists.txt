@@ -1121,6 +1121,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
         test_dash_collateral_spend_filter.cpp
+        # test_dash_sml_pose_fold.cpp (sml_pose_fold.hpp): the serve-time PoSe
+        # pass over a template's real quorum commitments (incident h=2561514)
+        # — dashd's DecreaseScores -> HandleQuorumCommitment -> PoSePunish on
+        # penalty-oracle bounds, the 2561514 shape from the block's real
+        # payloads, the fail-closed equivalence to the pre-fix predicate, and
+        # builder x gate root parity. Folded here per the same #769 rule.
+        test_dash_sml_pose_fold.cpp
         # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 production freeze —
         # NodeCoinState-level memo of the projected-SML root + quorum root
         # (epoch-invalidated). Pins: warm emit_ok does no hashing (T1),

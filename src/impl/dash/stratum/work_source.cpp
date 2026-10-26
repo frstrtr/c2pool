@@ -1008,6 +1008,13 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
             coin_state_.select_work([]() { return coin::DashWorkData{}; });
         if (sel.source != coin::WorkSource::Embedded) {
             arm.decline = std::move(sel.decline);
+            // Keep the height a VIABILITY refusal was refusing at too, exactly
+            // like the emit refusal below: on a daemonless node the fallback
+            // template is empty (m_height == 0), and every [EMBED-GATE-SEG]
+            // line closed by a cause change into a viability cause printed
+            // h=0 (2026-10-26 incident logs). 0 = no tip yet => stays 0.
+            if (coin_state_.prev_height() != 0)
+                arm.declined_height = coin_state_.prev_height() + 1;
             return arm;
         }
 
