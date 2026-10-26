@@ -290,6 +290,10 @@
 //                none after its reply; the chain never switches;
 //   catchoffer   a store not caught up, partly walked, offered an unheld
 //                lighter tip: one pair, one attempt, rule (4) keeps its chain;
+//   revcatchundec  the catch-up of a store not caught up ended by an
+//                undecodable reply (STRIKE): caught up, its chain kept;
+//   catchtok     the same ended by a reply that strikes (a link broken inside
+//                it) or bans (a header failing its PoW at d);
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
@@ -8075,6 +8079,123 @@ void catchoffer() {
 }
 
 // ---------------------------------------------------------------------------
+// revcatchundec: catchkeep's setup, but B's FC_HEADERS replies to J arrive truncated (undecodable). The catch-up toward
+// B's unheld tip ends by that reply (K::Undecodable, a STRIKE token): the store not caught up becomes caught up (the
+// record leaves), its chain is kept, and with no peer it builds templates.
+void revcatchundec() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    Branches br = branches(h, w, net, 4, 1, 2, 3150);
+    const std::size_t b = br.b.node;
+    const std::size_t a = br.a.node;
+    const pb::Hash32 tip_a = h[a].tree().best().id;
+    const std::size_t jw = h.add(table0(net), false, 1152, true);  // started empty, not launched: K_NCU
+    MemoryKv& kvw = *h.kvs.back();
+    for (std::uint64_t x = 1; x <= 6; ++x)
+        if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+            (void)h[jw].on_carrier(77, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+    h.q.clear();
+    const std::string ncu = pb::store_keys::ncu(0);
+    const bool walked = h[jw].tree().best().id == tip_a && !h[jw].caught_up() && kvw.data.count(ncu) != 0;
+    KatRelay j = kat_relay_loaded(h, w, kvw, h.config(table0(net)));
+    MemoryKv& kvj = *h.kvs.back();
+    const pb::TemplateStatus s0 = tstatus(h, j.node);
+    std::uint64_t truncated = 0;
+    w.edit = [&truncated](FakeWire::Msg& m) {
+        if (m.from == 2 && m.to == 1 && !m.f.empty() && m.f[0] == pb::kOpFcHeaders) m.f.clear();  // B gets no reply
+        if (m.from == 1 && m.to == 2 && m.f.size() > 8 && m.f[0] == pb::kOpFcHeaders) {           // J gets a broken one
+            m.f.resize(m.f.size() - 3);
+            ++truncated;
+        }
+    };
+    w.connect(1, 2);
+    w.run();
+    const std::uint64_t asks = j.relay->stats().catchup_requests.load();
+    const std::uint64_t strikes = j.relay->stats().strikes.load();
+    const bool caught = h[j.node].caught_up() && kvj.data.count(ncu) == 0 && !h[j.node].first_round_open();
+    const bool kept = h[j.node].tree().best().id == tip_a;
+    w.links[2]->disconnect(w.id(2, 1));
+    w.run();
+    w.edit = nullptr;
+    const pb::TemplateStatus s1 = tstatus(h, j.node);
+    std::printf("  revcatchundec: J at %llu (B at %llu); truncated %llu; catch-up asks %llu; strikes %llu; caught up %d; "
+                "templates %d -> %d\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[b].tree().best().pos,
+                (unsigned long long)truncated, (unsigned long long)asks, (unsigned long long)strikes, caught ? 1 : 0,
+                static_cast<int>(s0), static_cast<int>(s1));
+    check(br.ok && walked && s0 == pb::TemplateStatus::NoPathbPeer && truncated >= 1,
+          "revcatchundec: setup (J not caught up at A's tip 6; B's reply truncated)");
+    check(kept && caught && strikes >= 1 && s1 != pb::TemplateStatus::NoPathbPeer && s1 != pb::TemplateStatus::CatchingUp,
+          "revcatchundec: the catch-up ended by an undecodable reply (STRIKE) leaves the store caught up, chain kept");
+}
+
+
+// ---------------------------------------------------------------------------
+// catchtok: catchkeep's setup, the catch-up toward B's unheld lighter tip ended by a reply that strikes or bans:
+//   strike  B holds 4 shared and its own 5, 6; J at A's tip 7; B's reply 4, 5, 6 reaches J as 4, 6 (a link broken
+//           inside the reply): STRIKE;
+//   ban     B holds 4 shared and its own 5, which fails its PoW at d at J: BAN.
+// Either way the store not caught up becomes caught up (the record leaves), its chain is kept, and with no peer it
+// builds templates.
+void catchtok() {
+    const KatNet net;
+    for (const bool ban : {false, true}) {
+        const std::string tag = ban ? "catchtok (ban): " : "catchtok (strike): ";
+        Harness h(net);
+        FakeWire w;
+        Branches br = ban ? branches(h, w, net, 4, 1, 2, 3260) : branches(h, w, net, 4, 2, 3, 3270);
+        const std::size_t a = br.a.node, b = br.b.node;
+        const pb::Hash32 tip_a = h[a].tree().best().id;
+        const std::uint64_t top = h[a].tree().best().pos;
+        const std::size_t jw = h.add(table0(net), false, 1152, true);  // started empty, not launched: K_NCU
+        MemoryKv& kvw = *h.kvs.back();
+        for (std::uint64_t x = 1; x <= top; ++x)
+            if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+                (void)h[jw].on_carrier(77, *pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+        h.q.clear();
+        const std::string ncu = pb::store_keys::ncu(0);
+        const bool walked = h[jw].tree().best().id == tip_a && !h[jw].caught_up() && kvw.data.count(ncu) != 0;
+        KatRelay j = kat_relay_loaded(h, w, kvw, h.config(table0(net)));
+        MemoryKv& kvj = *h.kvs.back();
+        const pb::TemplateStatus s0 = tstatus(h, j.node);
+        if (ban) h.bad_pow.insert(h[b].tree().best().id);
+        std::uint64_t edited = 0;
+        w.edit = [ban, &edited](FakeWire::Msg& m) {
+            if (m.f.empty() || m.f[0] != pb::kOpFcHeaders) return;
+            if (m.from == 2 && m.to == 1) m.f.clear();  // B's own catch-up toward J gets no reply
+            if (ban || m.from != 1 || m.to != 2) return;
+            pb::HeadersReply rep;
+            if (!pb::decode_fc_headers(m.f, 0, 1u << 22, pb::kRuledLaneParams, rep).ok() || rep.headers.size() < 3) return;
+            rep.headers.erase(rep.headers.begin() + 1);
+            m.f = *pb::encode_fc_headers(rep, 1u << 22);
+            ++edited;
+        };
+        w.connect(1, 2);
+        w.run();
+        const pb::PathbRelayStats& st = j.relay->stats();
+        const std::uint64_t asks = st.catchup_requests.load(), strikes = st.strikes.load(), bans = st.bans.load();
+        const bool caught = h[j.node].caught_up() && kvj.data.count(ncu) == 0 && !h[j.node].first_round_open();
+        const bool kept = h[j.node].tree().best().id == tip_a;
+        if (w.links[2]->live.count(w.id(2, 1)) != 0) w.links[2]->disconnect(w.id(2, 1));
+        w.run();
+        w.edit = nullptr;
+        const pb::TemplateStatus s1 = tstatus(h, j.node);
+        std::printf("  %sJ at %llu (B at %llu); edited %llu; catch-up asks %llu; strikes %llu; bans %llu; caught up %d; "
+                    "templates %d -> %d\n",
+                    tag.c_str(), (unsigned long long)h[j.node].tree().best().pos,
+                    (unsigned long long)h[b].tree().best().pos, (unsigned long long)edited, (unsigned long long)asks,
+                    (unsigned long long)strikes, (unsigned long long)bans, caught ? 1 : 0, static_cast<int>(s0),
+                    static_cast<int>(s1));
+        check(br.ok && walked && s0 == pb::TemplateStatus::NoPathbPeer && (ban || edited >= 1),
+              tag + "setup (J not caught up at A's tip; B's tip lighter and not held at J)");
+        check(kept && caught && (ban ? bans >= 1 : strikes >= 1) && s1 != pb::TemplateStatus::NoPathbPeer
+                      && s1 != pb::TemplateStatus::CatchingUp,
+              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
 //   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
 //           the floor and admits A's carriers on it (B follows A's branch);
@@ -9585,6 +9706,8 @@ int main(int argc, char** argv) {
     run("catchkeep", catchkeep);
     run("catchlight", catchlight);
     run("catchoffer", catchoffer);
+    run("revcatchundec", revcatchundec);
+    run("catchtok", catchtok);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
