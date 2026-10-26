@@ -8,7 +8,8 @@
  *   2. 09-23 rule: /0, negatives, inf, nan (and hex) set NO target
  *   3. "+inf" / "+nan" fixed pseudoshare difficulty rejected (std::isfinite)
  *   4. Preservation: LTC/DOGE "ADDR/CHAIN_ID:ADDR" merged tokens unchanged
- *   5. Worker dot-strip skipped when the last "/" token is a valid diff
+ *   5. Worker dot-strip skipped when the last "/" token is a valid diff;
+ *      a ".worker" before the "/<diff>" is still stripped (no B1 lockout)
  */
 
 #include <gtest/gtest.h>
@@ -242,6 +243,32 @@ TEST(StratumUsername, WorkerStripUnchangedWithoutDiffTail)
     auto c = parse_login(DASH_ADDR + "/1024.rig3");
     EXPECT_EQ(c.primary, DASH_ADDR);
     EXPECT_EQ(c.worker, "rig3");
+    ASSERT_TRUE(c.slash.share_diff.has_value());
+    EXPECT_DOUBLE_EQ(*c.slash.share_diff, 1024.0);
+}
+
+// ltc-doge HOLD on 966846c9: "ADDR.rig/1024" kept "ADDR.rig" as the primary,
+// so the #961 B1 door check rejected the login. The dot is before the "/",
+// so it is a worker; the "/1024" tail must survive the strip.
+TEST(StratumUsername, WorkerBeforeSlashDiffIsStripped)
+{
+    auto a = parse_login(LTC_ADDR + ".rig/1024");
+    EXPECT_EQ(a.primary, LTC_ADDR);
+    EXPECT_EQ(a.worker, "rig");
+    ASSERT_TRUE(a.slash.share_diff.has_value());
+    EXPECT_DOUBLE_EQ(*a.slash.share_diff, 1024.0);
+
+    auto b = parse_login(DASH_ADDR + ".rig/0.5");
+    EXPECT_EQ(b.primary, DASH_ADDR);
+    EXPECT_EQ(b.worker, "rig");
+    ASSERT_TRUE(b.slash.share_diff.has_value());
+    EXPECT_DOUBLE_EQ(*b.slash.share_diff, 0.5);
+
+    auto c = parse_login(LTC_ADDR + ".rig/98:" + DOGE_ADDR + "/1024");
+    EXPECT_EQ(c.primary, LTC_ADDR);
+    EXPECT_EQ(c.worker, "rig");
+    ASSERT_EQ(c.slash.merged_addresses.size(), 1u);
+    EXPECT_EQ(c.slash.merged_addresses.at(98), DOGE_ADDR);
     ASSERT_TRUE(c.slash.share_diff.has_value());
     EXPECT_DOUBLE_EQ(*c.slash.share_diff, 1024.0);
 }

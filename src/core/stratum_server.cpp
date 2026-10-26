@@ -669,8 +669,8 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
         // Worker name is always AFTER the last address, so strip from the end.
-        // The dot-strip is skipped when the last "/" token is a valid share
-        // difficulty, so "ADDR/1.5" keeps its fractional diff.
+        // A dot inside a valid "/<diff>" tail is not a worker, and only the
+        // ".worker" segment is cut, so "ADDR/1.5" and "ADDR.rig/1024" keep their diff.
         if (auto worker = stratum_username::strip_worker_suffix(username_); !worker.empty())
             worker_name_ = std::move(worker);
 

@@ -69,21 +69,28 @@ inline bool ends_with_slash_diff(const std::string& username)
     return parse_positive_finite_diff(username.substr(slash_pos + 1)).has_value();
 }
 
-// Strip a trailing worker name ("ADDR.rig" / "ADDR_rig", Python compat) and
-// return it ("" if none). The worker is always after the last address, so
-// strip from the end; a separator at index <= 20 is part of an address.
-// A fractional "/<diff>" tail ("ADDR/1.5", "ADDR/98:DOGE/0.5") is not a
-// worker: the dot-strip is skipped when the last "/" token is a valid diff.
+// Strip a worker name ("ADDR.rig" / "ADDR_rig", Python compat) and return
+// it ("" if none). The worker is always after the last address, so search
+// from the end; a separator at index <= 20 is part of an address.
+// A dot inside a fractional "/<diff>" tail ("ADDR/1.5", "ADDR/98:DOGE/0.5")
+// is not a worker: when the last "/" token is a valid diff, only dots before
+// that "/" are candidates. The dot-strip removes just the ".worker" segment
+// (up to the next "/"), so "ADDR.rig/1024" gives ADDR/1024 + worker "rig".
 // "ADDR/1.5.rig" still strips ".rig" (the tail "1.5.rig" is not a diff).
 inline std::string strip_worker_suffix(std::string& username)
 {
     std::string worker;
-    if (!ends_with_slash_diff(username)) {
-        auto dot_pos = username.rfind('.');
-        if (dot_pos != std::string::npos && dot_pos > 20) {
-            worker = username.substr(dot_pos + 1);
-            username = username.substr(0, dot_pos);
-        }
+    auto dot_pos = username.rfind('.');
+    if (ends_with_slash_diff(username)) {
+        auto slash_pos = username.rfind('/');
+        dot_pos = slash_pos == 0 ? std::string::npos : username.rfind('.', slash_pos - 1);
+    }
+    if (dot_pos != std::string::npos && dot_pos > 20) {
+        auto seg_end = username.find('/', dot_pos);
+        if (seg_end == std::string::npos)
+            seg_end = username.size();
+        worker = username.substr(dot_pos + 1, seg_end - dot_pos - 1);
+        username.erase(dot_pos, seg_end - dot_pos);
     }
     auto underscore_pos = username.rfind('_');
     if (underscore_pos != std::string::npos && underscore_pos > 20) {
