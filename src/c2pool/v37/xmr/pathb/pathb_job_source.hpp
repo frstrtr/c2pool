@@ -83,6 +83,11 @@ struct IssuedJob {
     std::size_t n_outputs = 0;
     std::uint8_t hf = 0;
     JobNetwork net;
+    // the template's window values (logs only): N(B), f_spend, B(A_t), Z(A_t)
+    std::uint64_t n_rule = 0;
+    std::uint64_t f_spend = 0;
+    std::uint64_t base = 0;
+    std::uint64_t zone = 0;
 };
 
 // The lane target of difficulty d (the u64 target of the stratum dialect).
@@ -218,6 +223,11 @@ public:
         ij.n_outputs = job->miner_tx.outs.size();
         ij.hf = t.hf;
         ij.net = net;
+        const WindowParams wp = window_params(t.window.inputs, t.window.v, Hash32{});  // N, f_spend, B: no author read
+        ij.n_rule = wp.N;
+        ij.f_spend = wp.f_spend;
+        ij.base = wp.B;
+        ij.zone = t.window.inputs.weights.zone;
         std::lock_guard<std::mutex> lk(mu_);
         fill(ij, out);
         if (std::find(kept_.begin(), kept_.end(), tid) != kept_.end()) jobs_[{tid, extra_nonce}] = std::move(ij);

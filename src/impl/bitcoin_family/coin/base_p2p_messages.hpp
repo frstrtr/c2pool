@@ -139,6 +139,9 @@ struct inventory_type
                                         // DIP-0022 deterministic InstantSend lock)
         witness_tx      = 0x40000001,   // MSG_WITNESS_TX (BIP 144)
         witness_block   = 0x40000002,   // MSG_WITNESS_BLOCK (BIP 144)
+        mweb_block      = 0x60000002,   // MSG_MWEB_BLOCK (Litecoin: witness
+                                        // + MWEB flags; the only block getdata
+                                        // litecoind answers with the mweb tail)
     };
 
     static constexpr uint32_t MSG_WITNESS_FLAG = 0x40000000;

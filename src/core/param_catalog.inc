@@ -495,6 +495,20 @@ C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "
 C2P_PARAM("embedded.doge_header_checkpoint", Embedded, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "DOGE header checkpoint H:HASH")
   C2P_ALIAS("embedded.doge_header_checkpoint", BIN_LTC, "--doge-header-checkpoint", VALUE)
 
+C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
+  C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
+  C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_cmpct_hb_peers", Embedded, INT64, RESTART, C_LTC, LIT, "0", NONE, "LTC peers asked for high-bandwidth compact block pushes (0 = all)")
+  C2P_ALIAS("embedded.ltc_cmpct_hb_peers", BIN_LTC, "--ltc-cmpct-hb-peers", VALUE)
+
+C2P_PARAM("embedded.ltc_mweb_fetch_retry", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "fetch the LTC tip's full block once until its MWEB state is in (default on)")
+  C2P_ALIAS("embedded.ltc_mweb_fetch_retry", BIN_LTC, "--ltc-mweb-fetch-retry", FLAG)
+  C2P_ALIAS("embedded.ltc_mweb_fetch_retry", BIN_LTC, "--no-ltc-mweb-fetch-retry", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_mweb_cmpct_provisional", Embedded, BOOL, RESTART, C_LTC, LIT, "false", NONE, "reserved: MWEB state from an unverified compact block (not implemented)")
+  C2P_ALIAS("embedded.ltc_mweb_cmpct_provisional", BIN_LTC, "--ltc-mweb-cmpct-provisional", FLAG)
+
 C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
   C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
 
