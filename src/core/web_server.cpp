@@ -3240,6 +3240,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
     const auto liveness = observe_worker_liveness(workers, now_steady);
     int connections_silent = 0;
     int connections_hashing = 0, connections_standby = 0, connections_stalled = 0;
+    int connections_standby_elsewhere = 0;
     // A worker with several connections takes its most active one's state:
     // hashing > stalled > standby.
     auto state_rank = [](const std::string& s) {
@@ -3252,7 +3253,10 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         if (lv.silent) ++connections_silent;
         const std::string state = session_state(lv);
         if (state == "hashing") ++connections_hashing;
-        else if (state == "standby") ++connections_standby;
+        else if (state == "standby") {
+            ++connections_standby;
+            if (lv.hashing_elsewhere) ++connections_standby_elsewhere;
+        }
         else ++connections_stalled;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
@@ -3308,6 +3312,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
             }
             if (state_rank(state) > state_rank(wj["state"].get<std::string>()))
                 wj["state"] = state;
+            wj["hashing_elsewhere"] = wj["hashing_elsewhere"].get<bool>() && lv.hashing_elsewhere;
             if (lv.has_shared) {
                 wj["ever_submitted"] = true;
                 if (wj["last_share_age_s"].is_null()
@@ -3336,6 +3341,10 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 {"silent_seconds", lv.silent_seconds},
                 {"silent_threshold_seconds", lv.threshold_seconds},
                 {"state", state},
+                // Not hashing here, and its payout address hashes through
+                // another node (sharechain evidence; a failback session reads
+                // standby with ever_submitted true).
+                {"hashing_elsewhere", lv.hashing_elsewhere},
                 {"ever_submitted", lv.has_shared},
                 // Seconds since this worker's last accepted share on this node
                 // (poll resolution); null when it never shared here.
@@ -3362,6 +3371,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         {"connections_silent", connections_silent},
         {"connections_hashing", connections_hashing},
         {"connections_standby", connections_standby},
+        {"connections_standby_elsewhere", connections_standby_elsewhere},
         {"connections_stalled", connections_stalled},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
@@ -5174,12 +5184,12 @@ nlohmann::json MiningInterface::rest_local_stats()
         const auto workers = effective_stratum_workers();
         const auto liveness = observe_worker_liveness(
             workers, std::chrono::steady_clock::now());
-        int silent = 0, hashing = 0, standby = 0, stalled = 0;
+        int silent = 0, hashing = 0, standby = 0, stalled = 0, standby_elsewhere = 0;
         for (const auto& [sid, lv] : liveness) {
             if (lv.silent) ++silent;
             const std::string st = session_state(lv);
             if (st == "hashing") ++hashing;
-            else if (st == "standby") ++standby;
+            else if (st == "standby") { ++standby; if (lv.hashing_elsewhere) ++standby_elsewhere; }
             else ++stalled;
         }
         const int total = static_cast<int>(workers.size());
@@ -5189,6 +5199,9 @@ nlohmann::json MiningInterface::rest_local_stats()
             {"silent", silent},
             {"hashing", hashing},
             {"standby", standby},
+            // Of the standby sessions, those whose payout address is hashing
+            // through another node (failback included; core/hashing_elsewhere.hpp).
+            {"standby_elsewhere", standby_elsewhere},
             {"stalled", stalled},
             {"silent_floor_seconds", kSilentFloorSeconds}
         };
@@ -8708,7 +8721,37 @@ MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
 const char* MiningInterface::session_state(const WorkerLiveness& lv)
 {
     if (!lv.has_shared) return "standby";
-    return lv.silent ? "stalled" : "hashing";
+    if (!lv.silent) return "hashing";
+    // Failback: silent here, but its address hashes through another node.
+    return lv.hashing_elsewhere ? "standby" : "stalled";
+}
+
+void MiningInterface::mark_hashing_elsewhere(const std::map<std::string, WorkerInfo>& workers,
+                                             std::map<std::string, WorkerLiveness>& liveness,
+                                             const core::stratum::AddressActivity& activity,
+                                             int64_t now_unix)
+{
+    // The relay's "no worker of that address is up here": an address with a
+    // hashing session here is not hashing elsewhere, for any of its sessions.
+    std::set<std::string> hashing_here;
+    for (const auto& [sid, w] : workers) {
+        const auto it = liveness.find(sid);
+        if (it != liveness.end() && it->second.has_shared && !it->second.silent)
+            hashing_here.insert(core::stratum::payout_address_of(w.username));
+    }
+    for (const auto& [sid, w] : workers) {
+        const auto it = liveness.find(sid);
+        if (it == liveness.end()) continue;
+        WorkerLiveness& lv = it->second;
+        lv.hashing_elsewhere = false;
+        if (lv.has_shared && !lv.silent) continue;   // hashing here
+        const std::string addr = core::stratum::payout_address_of(w.username);
+        const auto newest = activity.newest(addr, now_unix);
+        if (!newest) continue;                        // no evidence
+        const int64_t last_here = lv.has_shared ? now_unix - lv.silent_seconds : 0;
+        lv.hashing_elsewhere = core::stratum::hashing_elsewhere(
+            *newest, last_here, now_unix, hashing_here.count(addr) > 0);
+    }
 }
 
 std::map<std::string, MiningInterface::WorkerLiveness>
@@ -8716,28 +8759,35 @@ MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>
                                          std::chrono::steady_clock::time_point now) const
 {
     std::map<std::string, WorkerLiveness> out;
-    std::lock_guard<std::mutex> lock(m_share_seen_mutex);
-    for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
-        if (workers.count(it->first)) ++it;
-        else it = m_share_seen.erase(it);   // session gone
-    }
-    for (const auto& [sid, w] : workers) {
-        auto [it, fresh] = m_share_seen.try_emplace(sid);
-        ShareSeen& seen = it->second;
-        if (fresh || w.accepted != seen.accepted) {
-            if (w.accepted > 0)
-                seen.last_share_at = now;
-            else
-                seen.last_share_at.reset();
-            seen.accepted = w.accepted;
+    {
+        std::lock_guard<std::mutex> lock(m_share_seen_mutex);
+        for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
+            if (workers.count(it->first)) ++it;
+            else it = m_share_seen.erase(it);   // session gone
         }
-        // A registry that stamps the share time gives the exact age; the
-        // poll stamp above is the fallback for one that does not.
-        if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
-            && w.last_accepted_at <= now)
-            seen.last_share_at = w.last_accepted_at;
-        out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+        for (const auto& [sid, w] : workers) {
+            auto [it, fresh] = m_share_seen.try_emplace(sid);
+            ShareSeen& seen = it->second;
+            if (fresh || w.accepted != seen.accepted) {
+                if (w.accepted > 0)
+                    seen.last_share_at = now;
+                else
+                    seen.last_share_at.reset();
+                seen.accepted = w.accepted;
+            }
+            // A registry that stamps the share time gives the exact age; the
+            // poll stamp above is the fallback for one that does not.
+            if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
+                && w.last_accepted_at <= now)
+                seen.last_share_at = w.last_accepted_at;
+            out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+        }
     }
+    // Failback evidence: one cached sharechain snapshot (no tracker access on
+    // this thread), applied outside the share-seen lock.
+    if (m_address_activity_fn && !out.empty())
+        mark_hashing_elsewhere(workers, out, m_address_activity_fn(),
+                               static_cast<int64_t>(std::time(nullptr)));
     return out;
 }
 
@@ -8748,6 +8798,7 @@ nlohmann::json MiningInterface::silent_workers_list(
     struct Agg {
         bool silent{true};
         bool has_shared{false};
+        bool hashing_elsewhere{true};   // every connection hashing elsewhere
         int64_t silent_seconds{std::numeric_limits<int64_t>::max()};
         int64_t threshold_seconds{0};
         int connections{0};
@@ -8762,6 +8813,7 @@ nlohmann::json MiningInterface::silent_workers_list(
         Agg& a = by_worker[key];
         a.silent = a.silent && lv.silent;
         a.has_shared = a.has_shared || lv.has_shared;
+        a.hashing_elsewhere = a.hashing_elsewhere && lv.hashing_elsewhere;
         ++a.connections;
         if (lv.silent_seconds < a.silent_seconds) {
             a.silent_seconds = lv.silent_seconds;
@@ -8783,7 +8835,8 @@ nlohmann::json MiningInterface::silent_workers_list(
             {"silent_seconds", a.silent_seconds},
             {"threshold_seconds", a.threshold_seconds},
             {"has_shared", a.has_shared},
-            {"state", a.has_shared ? "stalled" : "standby"},
+            {"state", a.has_shared && !a.hashing_elsewhere ? "stalled" : "standby"},
+            {"hashing_elsewhere", a.hashing_elsewhere},
             {"connections", a.connections}
         });
     }

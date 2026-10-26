@@ -2,6 +2,9 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <ctime>
+#include <map>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -279,4 +282,182 @@ TEST(WorkerLiveness, UpdateStampsLastAcceptedOnlyOnAdvance) {
     EXPECT_GE(stamped, before);
     mi.update_stratum_worker("s", 1e9, 0.0, 2.0, 1, 2, 0);   // no new accept
     EXPECT_EQ(mi.get_stratum_workers().at("s").last_accepted_at, stamped);
+}
+
+// ---------------------------------------------------------------------------
+// Failback: a rig that failed over to this node, shared here, and failed back
+// to its pool 1 keeps its connection here open and submits nothing. Locally
+// that looks like a hung rig ("stalled"); the sharechain tells them apart: its
+// payout address keeps getting shares minted by ANOTHER node. Such a session
+// reads standby with hashing_elsewhere, the rule the DASH alert relay pages on
+// (core/hashing_elsewhere.hpp), so the dashboard and the pager agree.
+//
+// FAIL WITHOUT THE FIX: the sessions below read "stalled" (the 2026-10-26
+// reserve: "0 hashing, 25 stalled", no share for 1h11m, while the rigs hashed
+// on the primary).
+// ---------------------------------------------------------------------------
+namespace {
+core::stratum::AddressActivity activity(int64_t built_at, std::map<std::string, int64_t> newest)
+{
+    core::stratum::AddressActivity a;
+    a.valid = true;
+    a.built_at = built_at;
+    a.newest_elsewhere = std::move(newest);
+    return a;
+}
+int64_t unix_now() { return static_cast<int64_t>(std::time(nullptr)); }
+}  // namespace
+
+// The incident: 25 rigs shared here for two minutes an hour ago and failed
+// back; the primary keeps minting shares for their address.
+TEST(WorkerLiveness, FailbackSessionsWithPeerSharesReadStandbyElsewhere) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    for (int i = 1; i <= 25; ++i) {
+        auto w = worker(now - seconds(5100), 0.0, 1.0, 3);
+        w.worker_name = "D" + std::to_string(i);
+        w.last_accepted_at = now - seconds(4260);   // 1h11m
+        mi.register_stratum_worker("s" + std::to_string(i), w);
+    }
+    mi.set_address_activity_fn([] { return activity(unix_now(), {{"XaddrD9", unix_now() - 20}}); });
+
+    auto s = mi.rest_stratum_stats();
+    EXPECT_EQ(s["pool"]["connections_hashing"], 0);
+    EXPECT_EQ(s["pool"]["connections_stalled"], 0) << "failback sessions paged as stalled";
+    EXPECT_EQ(s["pool"]["connections_standby"], 25);
+    EXPECT_EQ(s["pool"]["connections_standby_elsewhere"], 25);
+    const auto& d7 = s["workers"]["XaddrD9.D7"];
+    EXPECT_EQ(d7["state"], "standby");
+    EXPECT_TRUE(d7["hashing_elsewhere"].get<bool>());
+    EXPECT_TRUE(d7["ever_submitted"].get<bool>()) << "failback = standby that shared here earlier";
+    EXPECT_GE(d7["last_share_age_s"].get<int64_t>(), 4260);
+
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["stratum_sessions"]["hashing"], 0);
+    EXPECT_EQ(r["stratum_sessions"]["stalled"], 0);
+    EXPECT_EQ(r["stratum_sessions"]["standby"], 25);
+    EXPECT_EQ(r["stratum_sessions"]["standby_elsewhere"], 25);
+    ASSERT_EQ(r["workers_silent"].size(), 25u);
+    for (const auto& sw : r["workers_silent"]) {
+        EXPECT_EQ(sw["state"], "standby") << sw["worker"];
+        EXPECT_TRUE(sw["hashing_elsewhere"].get<bool>());
+    }
+}
+
+// No share of that address minted anywhere but here: a real stall.
+TEST(WorkerLiveness, SilentSessionWithoutPeerSharesStaysStalled) {
+    for (auto newest : {std::map<std::string, int64_t>{},
+                        std::map<std::string, int64_t>{{"XaddrD9", 0}},
+                        std::map<std::string, int64_t>{{"OtherAddr", unix_now() - 5}}}) {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        const auto now = Clock::now();
+        auto w = worker(now - seconds(7200), 0.0, 1.0, 5);
+        w.last_accepted_at = now - seconds(3600);
+        mi.register_stratum_worker("s", w);
+        mi.set_address_activity_fn([newest] { return activity(unix_now(), newest); });
+        auto s = mi.rest_stratum_stats();
+        EXPECT_EQ(s["workers"]["XaddrD9.D2"]["state"], "stalled");
+        EXPECT_FALSE(s["workers"]["XaddrD9.D2"]["hashing_elsewhere"].get<bool>());
+        EXPECT_EQ(s["pool"]["connections_stalled"], 1);
+        auto r = mi.rest_local_stats();
+        EXPECT_EQ(r["stratum_sessions"]["stalled"], 1);
+        EXPECT_EQ(r["stratum_sessions"]["standby_elsewhere"], 0);
+        EXPECT_EQ(r["workers_silent"][0]["state"], "stalled");
+    }
+}
+
+// No readable evidence (never read, or a read older than the max age) is no
+// evidence: stalled stays stalled.
+TEST(WorkerLiveness, UnknownOrStaleActivityKeepsStalled) {
+    const auto now = Clock::now();
+    auto w = worker(now - seconds(7200), 0.0, 1.0, 5);
+    w.last_accepted_at = now - seconds(3600);
+    auto state_with = [&](core::stratum::AddressActivity a) {
+        MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                           c2pool::address::Blockchain::LITECOIN);
+        mi.register_stratum_worker("s", w);
+        mi.set_address_activity_fn([a] { return a; });
+        return mi.rest_stratum_stats()["workers"]["XaddrD9.D2"]["state"].get<std::string>();
+    };
+    core::stratum::AddressActivity never;   // valid = false
+    never.newest_elsewhere = {{"XaddrD9", unix_now() - 20}};
+    EXPECT_EQ(state_with(never), "stalled");
+    const int64_t t = unix_now();
+    EXPECT_EQ(state_with(activity(t - core::stratum::kElsewhereSnapshotMaxAgeSeconds - 5,
+                                  {{"XaddrD9", t - 20}})),
+              "stalled") << "a read older than the max age";
+    EXPECT_EQ(state_with(activity(t - core::stratum::kElsewhereSnapshotMaxAgeSeconds + 5,
+                                  {{"XaddrD9", t - 20}})),
+              "standby");
+}
+
+// A sibling of the same address hashing HERE voids the evidence (failover
+// moves a whole farm): the silent rig is stalled, as the relay pages it.
+TEST(WorkerLiveness, SiblingHashingHereKeepsTheSilentRigStalled) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const auto now = Clock::now();
+    auto hung = worker(now - seconds(7200), 0.0, 1.0, 5);
+    hung.last_accepted_at = now - seconds(3600);
+    mi.register_stratum_worker("a-hung", hung);
+    auto live = worker(now - seconds(7200), 0.0, 1.0, 9);
+    live.worker_name = "D4";
+    live.last_accepted_at = now - seconds(5);
+    mi.register_stratum_worker("b-live", live);
+    mi.set_address_activity_fn([] { return activity(unix_now(), {{"XaddrD9", unix_now() - 20}}); });
+    auto s = mi.rest_stratum_stats();
+    EXPECT_EQ(s["workers"]["XaddrD9.D2"]["state"], "stalled");
+    EXPECT_EQ(s["workers"]["XaddrD9.D4"]["state"], "hashing");
+    EXPECT_EQ(s["pool"]["connections_standby_elsewhere"], 0);
+}
+
+// A standby connection that never shared here carries the mark too, so the
+// chip can say "standby (hashing elsewhere)" for pure failover links.
+TEST(WorkerLiveness, NeverSharedStandbyCarriesTheElsewhereMark) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    mi.register_stratum_worker("s", worker(Clock::now() - seconds(3600)));
+    mi.set_address_activity_fn([] { return activity(unix_now(), {{"XaddrD9", unix_now() - 20}}); });
+    auto r = mi.rest_local_stats();
+    EXPECT_EQ(r["stratum_sessions"]["standby"], 1);
+    EXPECT_EQ(r["stratum_sessions"]["standby_elsewhere"], 1);
+    EXPECT_EQ(r["workers_silent"][0]["state"], "standby");
+    EXPECT_TRUE(r["workers_silent"][0]["hashing_elsewhere"].get<bool>());
+}
+
+// Window boundaries of the shared rule and of the session's silence.
+TEST(WorkerLiveness, ElsewhereWindowBoundaries) {
+    using core::stratum::hashing_elsewhere;
+    using core::stratum::kElsewhereHorizonSeconds;
+    using core::stratum::kElsewhereMarginSeconds;
+    const int64_t now = 2'000'000'000;
+    const int64_t last = now - 3600;
+    // horizon: a share exactly at now - 900 counts, one second older does not
+    EXPECT_TRUE(hashing_elsewhere(now - kElsewhereHorizonSeconds, last, now, false));
+    EXPECT_FALSE(hashing_elsewhere(now - kElsewhereHorizonSeconds - 1, last, now, false));
+    // margin: the other-node share must be MORE than 60 s after the last share here
+    const int64_t recent_last = now - 100;
+    EXPECT_FALSE(hashing_elsewhere(recent_last + kElsewhereMarginSeconds, recent_last, now, false));
+    EXPECT_TRUE(hashing_elsewhere(recent_last + kElsewhereMarginSeconds + 1, recent_last, now, false));
+    // none seen / a sibling hashing here
+    EXPECT_FALSE(hashing_elsewhere(0, last, now, false));
+    EXPECT_FALSE(hashing_elsewhere(now - 5, last, now, true));
+    EXPECT_EQ(kElsewhereHorizonSeconds, MiningInterface::kSilentFloorSeconds)
+        << "the horizon is the silence floor: a silent session's last share is never inside it";
+
+    // A session is only standby-elsewhere once it is silent: at 899 s it is
+    // still hashing, at the 900 s floor it is standby.
+    const auto steady = Clock::now();
+    for (int64_t age : {int64_t{899}, int64_t{900}}) {
+        auto w = worker(steady - seconds(7200), 0.0, 1.0, 5);
+        std::map<std::string, MiningInterface::WorkerInfo> workers{{"s", w}};
+        std::map<std::string, MiningInterface::WorkerLiveness> lv{
+            {"s", MiningInterface::classify_worker_liveness(w, steady - seconds(age), steady)}};
+        MiningInterface::mark_hashing_elsewhere(workers, lv, activity(now, {{"XaddrD9", now - 20}}), now);
+        EXPECT_STREQ(MiningInterface::session_state(lv.at("s")), age < 900 ? "hashing" : "standby")
+            << "age " << age;
+        EXPECT_EQ(lv.at("s").hashing_elsewhere, age >= 900);
+    }
 }

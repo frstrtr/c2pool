@@ -32,6 +32,7 @@
 #include <core/hashrate_ring.hpp>
 #include <core/featured_node.hpp>
 #include <core/stratum_types.hpp>
+#include <core/hashing_elsewhere.hpp>
 #include <core/stratum_work_source.hpp>
 #include <c2pool/payout/payout_manager.hpp>
 #include <c2pool/hashrate/tracker.hpp>
@@ -766,6 +767,18 @@ public:
     // falls back to this provider, so LTC behavior is byte-unchanged.
     void set_stratum_workers_fn(std::function<std::map<std::string, core::stratum::WorkerInfo>()> fn) {
         m_stratum_workers_fn = thread_safe_wrap(std::move(fn));
+    }
+
+    // Per-address sharechain evidence for the failback state (display only):
+    // newest share per payout address minted on ANOTHER node, the same
+    // snapshot the coin's alert relay reads (core/hashing_elsewhere.hpp). A
+    // session that shared here, went silent, and whose address keeps hashing
+    // through another node reads standby ("hashing elsewhere"), not stalled.
+    // Unset: no evidence, states as before. Install before start(); the HTTP
+    // thread reads the cached snapshot (the read runs on the main thread).
+    using address_activity_fn_t = std::function<core::stratum::AddressActivity()>;
+    void set_address_activity_fn(address_activity_fn_t fn) {
+        m_address_activity_fn = thread_safe_wrap(std::move(fn));
     }
 
     // Live coin-template summary provider (display only; NEVER drives coinbase
@@ -2318,15 +2331,31 @@ public:
         bool has_shared{false};          // an accepted share was seen this session
         int64_t silent_seconds{0};       // since last share, else since connect
         int64_t threshold_seconds{0};
+        // Not hashing here, and its payout address hashes through another
+        // node (core/hashing_elsewhere.hpp); set by mark_hashing_elsewhere().
+        bool hashing_elsewhere{false};
     };
     // Session state for display and alerting, derived from WorkerLiveness.
     // All nodes are peers: a rig may hold a failover connection to this node
     // while it hashes on another one, so "never shared on this connection" is
     // a normal state of its own, not a fault.
     //   hashing  -- has shared on this connection and is not silent
-    //   standby  -- authorized and connected, never shared on this connection
-    //   stalled  -- shared on this connection, then went silent
+    //   standby  -- authorized and connected, never shared on this connection;
+    //               or (failback) shared here, went silent, and is hashing on
+    //               another node (hashing_elsewhere)
+    //   stalled  -- shared on this connection, then went silent, and no
+    //               evidence that it hashes elsewhere
     static const char* session_state(const WorkerLiveness& lv);
+    // Failback: set hashing_elsewhere on every session that is not hashing
+    // here when the shared rule (core/hashing_elsewhere.hpp) holds for its
+    // payout address: a share minted on another node newer than the session's
+    // last share here (by the margin) and within the horizon, while no session
+    // of that address is hashing here. An invalid or stale snapshot marks
+    // nothing (no evidence: a stalled session stays stalled).
+    static void mark_hashing_elsewhere(const std::map<std::string, WorkerInfo>& workers,
+                                       std::map<std::string, WorkerLiveness>& liveness,
+                                       const core::stratum::AddressActivity& activity,
+                                       int64_t now_unix);
     static constexpr int64_t kSilentFloorSeconds = 900;
     static constexpr int64_t kSilentCapSeconds = 7 * 24 * 3600;
     static constexpr double kSilentExpectedIntervals = 6.0;
@@ -2340,7 +2369,8 @@ public:
     // first sighting of a session that already has shares is stamped `now`
     // (silence is never overstated); resolution is the gap between polls.
     // A registry that stamps WorkerInfo::last_accepted_at (core, DASH) gives
-    // the exact age instead.
+    // the exact age instead. With an address-activity provider installed, the
+    // result also carries the failback mark (mark_hashing_elsewhere).
     std::map<std::string, WorkerLiveness> observe_worker_liveness(
         const std::map<std::string, WorkerInfo>& workers,
         std::chrono::steady_clock::time_point now) const;
@@ -2348,7 +2378,8 @@ public:
     // /stratum_stats groups them) whose every connection is SILENT, longest
     // silence first. A worker with one live connection is not listed. Its
     // silent_seconds is the freshest connection's, so silence is never
-    // overstated.
+    // overstated. Its state is "stalled" when it shared here, unless every
+    // connection is hashing elsewhere (failback), then "standby".
     static nlohmann::json silent_workers_list(
         const std::map<std::string, WorkerInfo>& workers,
         const std::map<std::string, WorkerLiveness>& liveness);
@@ -2369,6 +2400,7 @@ private:
     std::map<std::string, WorkerInfo> m_stratum_workers;
     mutable std::mutex m_stratum_workers_mutex;
     std::function<std::map<std::string, WorkerInfo>()> m_stratum_workers_fn;  // external provider (coin targets)
+    address_activity_fn_t m_address_activity_fn;                              // failback evidence (coin targets)
     std::function<CoinWorkInfo()> m_coin_work_fn;                             // live template summary (coin targets)
     std::atomic<bool> m_coin_rpc_available{false};                           // external daemon RPC present
     std::optional<bool> m_embedded_display_override;                          // display-only embedded flag (NULL-node lanes)

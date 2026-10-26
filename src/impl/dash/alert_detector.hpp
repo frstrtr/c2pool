@@ -32,10 +32,17 @@
 //   stalled) is not paged if it is mining on another node -- its payout
 //   address has a share MINTED ON ANOTHER NODE (received from a peer) newer
 //   than the worker's last share here (by returned_margin) and within
-//   returned_horizon, while no worker of that address is UP here. The worker
-//   becomes standby here (as if it never hashed here); the node it mines on
-//   now is the one that pages if it dies. When the chain cannot be read (busy
-//   tracker), the decision waits up to returned_defer_max, then pages.
+//   returned_horizon, while no worker of that address is UP here. This is the
+//   rule the dashboard applies to the worker's session (failback: standby,
+//   "hashing elsewhere", not stalled), one predicate fed from one sharechain
+//   read (core/hashing_elsewhere.hpp; the defaults are its constants), so the
+//   two cannot disagree. It is checked from the moment the worker goes down,
+//   i.e. when the dashboard's session goes silent: the worker becomes standby
+//   here (as if it never hashed here) at once, so it is neither paged nor
+//   counted as hashing on this node; the node it mines on now is the one that
+//   pages if it dies. When the chain cannot be read (busy tracker), nothing
+//   changes until the OFFLINE is due; that decision then waits up to
+//   returned_defer_max, then pages.
 //   Shares carry the payout address, not the worker name: with rigs of one
 //   address on two nodes, a hung rig here is masked while no sibling hashes
 //   here, and a rig that returned to its first pool is paged while a sibling
@@ -92,6 +99,8 @@
 
 #include "alert_relay.hpp"   // Kind, kind_name
 
+#include <core/hashing_elsewhere.hpp>   // the RETURNED rule, shared with the dashboard
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -119,8 +128,10 @@ struct DetectorConfig {
     int64_t min_interval{600};
     int64_t startup_grace{600};
     int64_t stall_after{900};          // 0 = presence only: connected = up, shares not checked
-    int64_t returned_margin{60};       // other-node share must be this much newer than the last share here
-    int64_t returned_horizon{900};     // ... and no older than this (address still mining)
+    // other-node share must be this much newer than the last share here ...
+    int64_t returned_margin{core::stratum::kElsewhereMarginSeconds};
+    // ... and no older than this (address still mining)
+    int64_t returned_horizon{core::stratum::kElsewhereHorizonSeconds};
     int64_t returned_defer_max{120};   // chain unreadable this long -> page anyway
     std::size_t max_per_hour{30};            // worker events (OFFLINE / BACK_ONLINE)
     std::size_t serve_max_per_hour{4};       // node-level events, own budget outside max_per_hour
@@ -351,40 +362,54 @@ public:
             if (st.up) up_addresses.insert(address_of(key));
         }
 
+        // 3a) RETURNED, from the moment a worker that hashed here is down: it
+        // is standby here at once if its address is mining on another node
+        // (the dashboard's failback state, same rule and read), so it neither
+        // pages nor counts as hashing on this node. One lookup per address
+        // per tick. An unreadable chain changes nothing here; the OFFLINE
+        // decision below waits for it (bounded).
+        std::map<std::string, std::optional<int64_t>> activity;
+        auto newest_elsewhere = [&](const std::string& addr) -> const std::optional<int64_t>& {
+            auto [ait, fresh] = activity.try_emplace(addr);
+            if (fresh) ait->second = m_activity(addr);
+            return ait->second;
+        };
+        if (m_activity) {
+            for (auto& [key, st] : m_workers) {
+                if (!st.ever_up || st.up || st.offline_alerted) continue;
+                const std::string addr = address_of(key);
+                const auto& newest = newest_elsewhere(addr);
+                if (!newest) continue;
+                if (core::stratum::hashing_elsewhere(
+                        *newest, st.last_evidence > 0 ? st.last_evidence : outage_start(st), now,
+                        up_addresses.count(addr) > 0, m_cfg.returned_margin, m_cfg.returned_horizon)) {
+                    // Mining on another node: standby here, no page. Forget
+                    // the old evidence too, so a standby reconnect does not
+                    // count as up.
+                    st.ever_up = false;
+                    st.last_evidence = 0;
+                    st.defer_since = 0;
+                    st.down_cause = "mining on another node";
+                    ++m_gen;
+                }
+            }
+        }
+
         // 3b) node level: no work handed out while hashing miners are attached.
         // Ahead of the worker events, so the hourly cap admits it first.
         if (serve && m_cfg.serve_stall_after > 0) serve_check(*serve, now, out);
 
         // 4) events
-        std::map<std::string, std::optional<int64_t>> activity;   // one lookup per address per tick
         for (auto& [key, st] : m_workers) {
             if (st.ever_up && !st.up && !st.offline_alerted && now >= m_grace_until &&
                 now - st.down_since >= m_cfg.offline_after &&
                 (st.last_offline_alert == 0 || now - st.last_offline_alert >= m_cfg.min_interval)) {
-                if (m_activity) {
-                    const std::string addr = address_of(key);
-                    if (!up_addresses.count(addr)) {
-                        auto [ait, fresh] = activity.try_emplace(addr);
-                        if (fresh) ait->second = m_activity(addr);
-                        const auto& newest = ait->second;
-                        if (!newest) {
-                            // Chain unreadable: wait, but never forever.
-                            if (st.defer_since == 0) st.defer_since = now;
-                            if (now - st.defer_since < m_cfg.returned_defer_max) continue;
-                        } else if (*newest > (st.last_evidence > 0 ? st.last_evidence : outage_start(st))
-                                                 + m_cfg.returned_margin &&
-                                   *newest >= now - m_cfg.returned_horizon) {
-                            // Mining on another node: standby here, no page.
-                            // Forget the old evidence too, so a standby
-                            // reconnect does not count as up.
-                            st.ever_up = false;
-                            st.last_evidence = 0;
-                            st.defer_since = 0;
-                            st.down_cause = "mining on another node";
-                            ++m_gen;
-                            continue;
-                        }
-                    }
+                // A readable chain was applied in 3a (this worker is not
+                // mining elsewhere); an unreadable one: wait, but never forever.
+                if (m_activity && !up_addresses.count(address_of(key)) &&
+                    !newest_elsewhere(address_of(key))) {
+                    if (st.defer_since == 0) st.defer_since = now;
+                    if (now - st.defer_since < m_cfg.returned_defer_max) continue;
                 }
                 st.defer_since = 0;
                 if (!admit_rate(key, now, out)) continue;
@@ -537,8 +562,7 @@ private:
     // Payout address of a worker key ("ADDRESS.worker" or the bare address).
     static std::string address_of(const std::string& key)
     {
-        const auto dot = key.find('.');
-        return dot == std::string::npos ? key : key.substr(0, dot);
+        return core::stratum::payout_address_of(key);
     }
 
     static int64_t outage_start(const State& st)
