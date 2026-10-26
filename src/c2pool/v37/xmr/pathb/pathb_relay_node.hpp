@@ -1655,6 +1655,7 @@ private:
             PathbNode::CarrierTicket t;
             std::uint64_t fresh = 0;
             bool rx_fail = false;
+            std::string rx_why;
             {
                 const NodeGuard g(*this);
                 if (!running_) {
@@ -1664,12 +1665,13 @@ private:
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
                     t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
-                } catch (const RandomxFailure&) {
+                } catch (const RandomxFailure& e) {
                     rx_fail = true;
+                    rx_why = e.what();
                 }
             }
             if (rx_fail) {
-                rx_failed(std::move(j), "carrier");
+                rx_failed(std::move(j), "carrier", rx_why);
                 return;
             }
             // the token stays spent for a STRIKE or a BAN (begin_carrier's verdict is final for both); a solicited
@@ -1684,6 +1686,7 @@ private:
         std::vector<NodeEventResult> rs;
         Effects fx;
         bool rx_fail = false;
+        std::string rx_why;
         std::uint64_t fresh = 0;
         {
             const NodeGuard g(*this);
@@ -1693,8 +1696,9 @@ private:
             }
             try {
                 rs = node_->on_receipts(j.peer, j.frame);
-            } catch (const RandomxFailure&) {
+            } catch (const RandomxFailure& e) {
                 rx_fail = true;
+                rx_why = e.what();
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
@@ -1712,7 +1716,7 @@ private:
                 }
         }
         if (rx_fail) {
-            rx_failed(std::move(j), "receipt");
+            rx_failed(std::move(j), "receipt", rx_why);
             return;
         }
         if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);  // its first placement, a re-run or not
@@ -1731,18 +1735,20 @@ private:
         NodeEventResult r;
         Effects fx;
         bool rx_fail = false;
+        std::string rx_why;
         {
             const NodeGuard g(*this);
             try {
                 r = node_->complete_carrier(std::move(t));
-            } catch (const RandomxFailure&) {
+            } catch (const RandomxFailure& e) {
                 rx_fail = true;
+                rx_why = e.what();
             }
             if (!rx_fail) after_result_locked(peer, r, digest, fx, !solicited);
             take_rx_failed_locked(fx);
         }
         if (rx_fail) {
-            rx_alarm("carrier placement");
+            rx_alarm("carrier placement", rx_why);
             park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
             run_effects(fx);
             return;
@@ -1769,18 +1775,19 @@ private:
         log("relay: peer " + std::to_string(p) + ": claim-leaf alarm budget empty (P-50) -> link dropped, no ban");
         defer_drop(p, src_of(p), false);
     }
-    void rx_failed(Job j, const char* where) {
-        rx_alarm(where);
+    void rx_failed(Job j, const char* where, const std::string& why) {
+        rx_alarm(where, why);
         refund(j);
         j.rerun = true;  // run again (not gated again; counted at its first placement)
         park_job(std::move(j), now_ms() + kParkRetryMs);
     }
-    // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
-    // (rx_tick).
-    void rx_alarm(const std::string& where) {
+    // The alarm: every failure counted; a log line when RandomX starts failing (where, and the failure's reason) and
+    // one when a hash is computed again (rx_tick).
+    void rx_alarm(const std::string& where, const std::string& why = {}) {
         st_.rx_failures++;
         rx_mark_ = rx_ok_.load();
-        if (!rx_failing_.exchange(true)) log("relay: RandomX failing (" + where + "): frames parked and run again");
+        if (!rx_failing_.exchange(true))
+            log("relay: RandomX failing (" + where + (why.empty() ? "" : ": " + why) + "): frames parked and run again");
     }
     void rx_tick() {
         if (rx_failing_.load() && rx_ok_.load() > rx_mark_.load() && rx_failing_.exchange(false))
@@ -2853,8 +2860,9 @@ private:
             }
             try {
                 o = node_->on_headers(p, f, now_s());
-            } catch (const RandomxFailure&) {  // node-internal, a local alarm; no token; the catch-up asks again
-                rx_alarm("headers");
+            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
+                rx_alarm("headers of peer " + std::to_string(p), e.what());
+                log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
             }
             {
@@ -3172,7 +3180,7 @@ private:
             }
             // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
             // after a non-service
-            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt");
+            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt", s->report->what);
             if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
                 join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
         }
@@ -4102,8 +4110,8 @@ private:
                                 return it->second;
                             },
                             w.bound, ctx_.rx, o_.ctx_block_cap);
-                } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
-                    rx_alarm("context " + hex_short(id));
+                } catch (const RandomxFailure& e) {  // node-internal, a local alarm; the context is judged again later
+                    rx_alarm("context " + hex_short(id), e.what());
                     return false;
                 }
             } else {

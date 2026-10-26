@@ -174,6 +174,12 @@
 //   revrx_drain  RandomX throws on a released child's first hash inside its
 //                parent's completion: caught, the child parked and placed;
 //   relayrxhdr   RandomX throws on a catch-up header: no token, asked again;
+//   hdrnohash    the binary's verify computes no hash on a header:
+//                RandomxFailure, no BAN, not memoised; asked again: placed;
+//                a hash computed not meeting d: BAN (S1.3 #11);
+//   relayrxnohash the same through the relay, on a catch-up header and on a
+//                relayed carrier: no token, no ban, the reason logged, asked
+//                again or run again; a hash not meeting d: BAN;
 //   relayrxtype  a std::logic_error inside an admission leaves the call (not
 //                a RandomX failure);
 //   relaystalem  manual mode: a queued event of a gone peer skipped;
@@ -3676,6 +3682,185 @@ void relayrxhdr() {
                   && rb.stats().bans == 0 && rb.stats().catchup_requests >= 2,
           "relayrxhdr: RandomX failed on a catch-up header (" + std::to_string(f1) + " failure): no token; asked again ("
                   + std::to_string(rb.stats().catchup_requests.load()) + " requests), A's tip reached");
+}
+
+// ---------------------------------------------------------------------------
+// hdrnohash: the header path through the binary's verify (verify_rx_at_d). RandomX computes no hash on a header (the
+// seed's cache not built): RandomxFailure with its reason, no outcome (no BAN), nothing indexed, the failure not
+// memoised; asked again: FetchBodies, J at S's tip. A hash computed that does not meet d on the same header: BAN,
+// its reason S1.3 #11.
+void hdrnohash() {
+    const KatNet net;
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    const std::size_t k = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}, {s, k}, {k, s}, {j, k}, {k, j}};
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 760 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{s, k}, {k, s}, {j, k}, {k, j}};
+    h.q.clear();
+    const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id, armed = *h[s].store().best_at(3);
+    h.nohash_pow.insert(armed);
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrnohash: R1");
+    std::optional<pb::PathbNode::HeadersOutcome> o1;
+    std::string what;
+    bool typed = false;
+    try {
+        o1 = h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    } catch (const pb::RandomxFailure& e) {
+        typed = true;
+        what = e.what();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    h.q.clear();
+    std::printf("  hdrnohash: outcome %s (kind %d), failure '%s', hashes not computed %llu, indexed %zu\n",
+                o1 ? "returned" : "none", o1 ? static_cast<int>(o1->kind) : -1, what.c_str(),
+                (unsigned long long)h.nohash_calls, pb::PathbNodeTestAccess::headers(h[j]).size());
+    check(!o1 && typed && h.nohash_calls == 1 && h.nohash_pow.empty()
+                  && what.find("RandomX computed no hash: kat: the seed cache could not be built") != std::string::npos
+                  && pb::PathbNodeTestAccess::headers(h[j]).size() == 0,
+          "hdrnohash: RandomX computed no hash on a header: RandomxFailure with its reason, no outcome (no BAN), "
+          "nothing indexed");
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrnohash: asked again (the request slot free)");
+    const pb::PathbNode::HeadersOutcome o2 =
+            h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    check(o2.kind == K::FetchBodies,
+          "hdrnohash: then FetchBodies (the failure not memoised; kind " + std::to_string(static_cast<int>(o2.kind)) + ")");
+    h.pump();
+    check(h[j].tree().best().id == tip, "hdrnohash: J at S's tip");
+    // the same header, a hash computed that does not meet d: BAN, the reason S1.3 #11
+    h.low_pow.insert(armed);
+    check(h[k].request_headers(s, g, tip, 64, h.now), "hdrnohash: K's R1");
+    std::optional<pb::PathbNode::HeadersOutcome> o3;
+    std::string what3;
+    try {
+        o3 = h[k].on_headers(s, h[s].serve_getheaders(k, h.q.back().frame, h.now).frames.at(0), h.now);
+    } catch (const std::exception& e) {
+        what3 = e.what();
+    }
+    h.q.clear();
+    check(o3 && o3->kind == K::Ban && o3->why.find("S1.3 #11 PoW below d") != std::string::npos
+                  && pb::PathbNodeTestAccess::headers(h[k]).size() == 0,
+          "hdrnohash: a hash computed not meeting d on that header: BAN, its reason S1.3 #11 ("
+                  + (o3 ? o3->why : "no outcome: " + what3) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// relayrxnohash: the same through the relay node and the binary's verify (verify_rx_at_d). (a) RandomX computes no
+// hash on a catch-up header: one RandomX failure, no token, no ban; the line names the peer and the reason; the
+// catch-up asks again and B reaches A's tip. (b) A hash computed that does not meet d on that header: one BAN, its
+// BANNED line names S1.3 #11. (c) RandomX computes no hash on a relayed carrier's admission: no token, no ban; the
+// alarm names the reason; parked and run again: placed. (d) A hash computed that does not meet d on a relayed
+// carrier: one BAN, its BANNED line names the admission row.
+void relayrxnohash() {
+    const KatNet net;
+    const auto has = [](const std::vector<std::string>& ls, const std::string& a, const std::string& b) {
+        for (const std::string& l : ls)
+            if (l.find(a) != std::string::npos && l.find(b) != std::string::npos) return true;
+        return false;
+    };
+    const std::string reason = "RandomX computed no hash: kat: the seed cache could not be built";
+    for (const bool low : {false, true}) {
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        bool mined = true;
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i % 5), 780 + i);
+            mined = mined && j && h[a.node].on_own_share(*j, 780 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        }
+        const pb::Hash32 tip_a = h[a.node].tree().best().id, armed = *h[a.node].store().best_at(3);
+        (low ? h.low_pow : h.nohash_pow).insert(armed);
+        pb::PathbRelayNode& rb = *b.relay;
+        w.connect(0, 1);
+        w.run();
+        const std::uint64_t f1 = rb.stats().rx_failures.load(), bans1 = rb.stats().bans.load();
+        for (int i = 0; i < 4 && h[b.node].tree().best().id != tip_a && !low; ++i) {
+            h.now += h[b.node].config().abandon_timeout_s + 1;
+            rb.tick();
+            w.run();
+        }
+        g_relay_lines = nullptr;
+        const std::vector<std::string>& lb = lines[b.node];
+        std::printf("  relayrxnohash (%s): hashes not computed %llu, RandomX failures %llu, bans %llu, strikes %llu, "
+                    "catch-up requests %llu, B at %llu of %llu\n",
+                    low ? "low" : "no hash", (unsigned long long)h.nohash_calls, (unsigned long long)f1,
+                    (unsigned long long)bans1, (unsigned long long)rb.strikes_of(1),
+                    (unsigned long long)rb.stats().catchup_requests.load(), (unsigned long long)h[b.node].tree().best().pos,
+                    (unsigned long long)h[a.node].tree().best().pos);
+        if (!low) {
+            check(mined && h.nohash_calls == 1 && f1 == 1 && bans1 == 0 && rb.strikes_of(1) == 0
+                          && has(lb, " FC_HEADERS not judged: " + reason, "(no token, no ban)")
+                          && has(lb, "RandomX failing (headers of peer ", reason),
+                  "relayrxnohash (a): RandomX computed no hash on a catch-up header: 1 failure, no token, no ban; the "
+                  "line names the peer and the reason");
+            check(h[b.node].tree().best().id == tip_a && rb.stats().bans.load() == 0 && rb.stats().catchup_requests >= 2,
+                  "relayrxnohash (a): asked again (" + std::to_string(rb.stats().catchup_requests.load())
+                          + " requests), A's tip reached, no ban");
+        } else {
+            check(mined && h.nohash_calls == 0 && f1 == 0 && bans1 == 1 && has(lb, " BANNED: ", "S1.3 #11 PoW below d"),
+                  "relayrxnohash (b): a hash computed not meeting d on that header: 1 BAN, the BANNED line names S1.3 #11");
+        }
+    }
+    for (const bool low : {false, true}) {
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        w.connect(0, 1);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 790 + static_cast<std::uint32_t>(i));
+        }
+        const bool synced = h[b.node].tree().best().id == h[a.node].tree().best().id;
+        const std::optional<pb::PathbJob> j = h.job(a.node, 3, 795);
+        ok = ok && j && h[a.node].on_own_share(*j, 795, pb::Hash32{}).action == pb::NodeAction::Placed;
+        const pb::Hash32 c = h[a.node].tree().best().id;
+        (low ? h.low_pow : h.nohash_pow).insert(c);
+        pb::PathbRelayNode& rb = *b.relay;
+        w.run();
+        const std::uint64_t f1 = rb.stats().rx_failures.load(), bans1 = rb.stats().bans.load();
+        const bool at_once = h[b.node].tree().find(c) != nullptr;
+        for (int i = 0; i < 8 && !low && h[b.node].tree().find(c) == nullptr; ++i) {
+            h.now += 1;
+            rb.tick();
+            w.run();
+        }
+        g_relay_lines = nullptr;
+        const std::vector<std::string>& lb = lines[b.node];
+        std::printf("  relayrxnohash (%s carrier): hashes not computed %llu, RandomX failures %llu, bans %llu, strikes "
+                    "%llu, placed at once %d, placed %d\n",
+                    low ? "low" : "no hash", (unsigned long long)h.nohash_calls, (unsigned long long)f1,
+                    (unsigned long long)bans1, (unsigned long long)rb.strikes_of(1), at_once ? 1 : 0,
+                    h[b.node].tree().find(c) != nullptr ? 1 : 0);
+        if (!low) {
+            check(ok && synced && h.nohash_calls == 1 && f1 == 1 && bans1 == 0 && !at_once
+                          && has(lb, "RandomX failing (carrier: ", reason),
+                  "relayrxnohash (c): RandomX computed no hash on a relayed carrier: 1 failure, no ban, not placed; the "
+                  "alarm names the reason");
+            check(h[b.node].tree().find(c) != nullptr && h[b.node].tree().best().id == c && rb.stats().bans.load() == 0
+                          && rb.strikes_of(1) == 0,
+                  "relayrxnohash (c): parked and run again: placed, no token, no ban");
+        } else {
+            check(ok && synced && h.nohash_calls == 0 && f1 == 0 && bans1 == 1 && !at_once
+                          && has(lb, " BANNED: ", "admission row R"),
+                  "relayrxnohash (d): a hash computed not meeting d on a relayed carrier: 1 BAN, the BANNED line names "
+                  "the admission row");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9275,6 +9460,8 @@ int main(int argc, char** argv) {
     run("relaysq", relaysq);
     run("revrx_drain", revrx_drain);
     run("relayrxhdr", relayrxhdr);
+    run("hdrnohash", hdrnohash);
+    run("relayrxnohash", relayrxnohash);
     run("relayrxtype", relayrxtype);
     run("relaystalem", relaystalem);
     run("relayrxbind", relayrxbind);
