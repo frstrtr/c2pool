@@ -45,6 +45,12 @@
 //      check on mweb_active; if the copy were lost, an empty-mweb block on an
 //      MWEB chain would pass assembly.
 //
+//   7. DOA WINDOW — after a node restart rigs flush results for job ids the
+//      previous process issued. Those submits are still answered "Stale
+//      share" and still counted in the cumulative stale counter, but the
+//      windowed DOA rate the miner page shows leaves them out; a genuinely
+//      expired job of this connection still counts. The window rolls off.
+//
 // WIRE SAFETY / BYTE-PARITY: everything here is admission/eviction/memory
 // only — no notify param, coinbase (coinb1‖en1‖en2‖coinb2), or share byte
 // changes. The notify/coinbase/share BYTE-PARITY KAT is NOT this file: for
@@ -66,6 +72,7 @@
 #include <core/stratum_types.hpp>
 #include <core/stratum_work_source.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>   // MiningInterface: worker registry + /miner_stats
 
 #include <atomic>
 #include <chrono>
@@ -97,6 +104,9 @@ public:
     bool        snap_mweb_active{false};
     // The JobSnapshot the last mining_submit received (io thread only).
     std::optional<core::stratum::JobSnapshot> last_job;
+    // Optional worker registry the session bookkeeping is forwarded to, so a
+    // test can read /miner_stats exactly as the web API serves it.
+    core::MiningInterface* registry{nullptr};
 
     FakeWorkSource()
     {
@@ -118,11 +128,20 @@ public:
     uint64_t get_work_generation() const override { return generation.load(); }
     bool has_merged_chain(uint32_t) const override { return false; }
 
-    void register_stratum_worker(const std::string&,
-                                 const core::stratum::WorkerInfo&) override {}
-    void unregister_stratum_worker(const std::string&) override {}
-    void update_stratum_worker(const std::string&, double, double, double,
-                               uint64_t, uint64_t, uint64_t) override {}
+    void register_stratum_worker(const std::string& sid,
+                                 const core::stratum::WorkerInfo& wi) override
+    {
+        if (registry) registry->register_stratum_worker(sid, wi);
+    }
+    void unregister_stratum_worker(const std::string& sid) override
+    {
+        if (registry) registry->unregister_stratum_worker(sid);
+    }
+    void update_stratum_worker(const std::string& sid, double hr, double dead, double diff,
+                               uint64_t acc, uint64_t rej, uint64_t stale) override
+    {
+        if (registry) registry->update_stratum_worker(sid, hr, dead, diff, acc, rej, stale);
+    }
 
     nlohmann::json get_current_work_template() const override { return tmpl_; }
     std::vector<std::string> get_stratum_merkle_branches() const override { return {}; }
@@ -724,4 +743,135 @@ TEST(StratumInterimHardening, JobSnapshotCarriesMwebFields)
         EXPECT_EQ(seen->mweb_active, cs.active) << "mweb_active lost in the job freeze";
         EXPECT_EQ(seen->mweb, cs.mweb);
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// KAT 7 — DOA window. Production 2026-10-26: after a hard reboot rigs flushed
+// ~2600 results for job ids the previous process had issued; every one was
+// counted stale and the miner page showed "Error 10.90%" (cumulative since
+// connect) long after the burst ended, while the sharechain had 0 dead.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+bool is_stale_reply(const std::optional<json>& resp)
+{
+    return resp && (*resp)["result"].is_boolean() && !(*resp)["result"].get<bool>()
+        && (*resp)["error"].is_array() && (*resp)["error"][0] == 21
+        && (*resp)["error"][1] == "Stale share";
+}
+bool is_accepted_reply(const std::optional<json>& resp)
+{
+    return resp && (*resp)["result"].is_boolean() && (*resp)["result"].get<bool>();
+}
+}  // namespace
+
+// Unknown-job submits after a restart stay out of the windowed DOA; a job this
+// connection issued and then expired still counts. Reply to the miner and the
+// cumulative fields are unchanged.
+TEST(StratumDoaWindow, RestartBurstUnknownJobsStayOutOfWindowedDoa)
+{
+    const std::string user = "doawindowworker";
+    core::MiningInterface registry(/*testnet=*/true, /*node=*/nullptr);
+    ServerHarness h;
+    h.ws->registry = &registry;
+    ASSERT_TRUE(h.start());
+
+    Client c;
+    ASSERT_TRUE(c.connect(h.port));
+    ASSERT_TRUE(c.subscribe());
+    ASSERT_TRUE(c.authorize(user));
+    ASSERT_TRUE(c.collect_notifies(1, 5000ms));
+    const std::string first_job = c.jobs.front();
+
+    // Phase 1: the rig flushes 40 results for jobs of the previous process
+    // (ids this connection never issued), then 10 good shares.
+    int id = 100;
+    for (int i = 0; i < 40; ++i) {
+        auto resp = c.submit(user, "job_" + std::to_string(7000000 + i), id++);
+        ASSERT_TRUE(is_stale_reply(resp)) << "wire reply changed: "
+                                          << (resp ? resp->dump() : "none");
+    }
+    for (int i = 0; i < 10; ++i)
+        ASSERT_TRUE(is_accepted_reply(c.submit(user, c.jobs.back(), id++)));
+
+    json r = registry.rest_miner_stats(user);
+    // Cumulative fields keep their meaning: every submit whose job was not
+    // active is stale.
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 40u);
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 40u);
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 50u);
+    EXPECT_EQ(r["unstale_shares"].get<uint64_t>(), 10u);
+    EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 0u);
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 40.0 / 50.0);
+    // The windowed rate leaves the unknown jobs out and lists them apart.
+    ASSERT_TRUE(r.contains("doa_rate_window")) << r.dump();
+    EXPECT_DOUBLE_EQ(r["doa_rate_window"].get<double>(), 0.0)
+        << "restart leftovers must not read as DOA";
+    EXPECT_EQ(r["window_seconds"].get<int64_t>(), 600);
+    EXPECT_EQ(r["window_accepted_shares"].get<uint64_t>(), 10u);
+    EXPECT_EQ(r["window_dead_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["window_unknown_job_shares"].get<uint64_t>(), 40u);
+    EXPECT_EQ(r["unknown_job_shares"].get<uint64_t>(), 40u);
+
+    // Phase 2: push the first job of this connection out of the active set
+    // (FIFO cap 256), then the rig returns a late result for it: genuine stale.
+    const size_t base = c.jobs.size();
+    h.notify_storm(300);
+    ASSERT_TRUE(c.collect_notifies(base + 300)) << "storm notifies not received";
+    ASSERT_TRUE(is_stale_reply(c.submit(user, first_job, id++)));
+
+    r = registry.rest_miner_stats(user);
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 41u);
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 41.0 / 51.0);
+    ASSERT_TRUE(r.contains("doa_rate_window")) << r.dump();
+    EXPECT_EQ(r["window_dead_shares"].get<uint64_t>(), 1u)
+        << "a job this connection issued and then expired is genuine stale";
+    EXPECT_EQ(r["window_unknown_job_shares"].get<uint64_t>(), 40u);
+    EXPECT_EQ(r["unknown_job_shares"].get<uint64_t>(), 40u);
+    EXPECT_DOUBLE_EQ(r["doa_rate_window"].get<double>(), 1.0 / 11.0);
+}
+
+// The window drops outcomes older than kWindowSeconds; the cumulative
+// unknown-job count does not roll off.
+TEST(StratumDoaWindow, WindowRollsOffAfterTenMinutes)
+{
+    using W = core::stratum::SubmitOutcomeWindow;
+    using std::chrono::minutes;
+    using std::chrono::seconds;
+    ASSERT_EQ(W::kWindowSeconds, 600);
+
+    // A minute-aligned origin so bucket edges are exact.
+    const auto t0 = std::chrono::steady_clock::time_point{} + minutes(100000);
+    W w;
+    for (int i = 0; i < 5; ++i) w.record(W::Outcome::UnknownJob, t0 + seconds(10));
+    for (int i = 0; i < 3; ++i) w.record(W::Outcome::Stale, t0 + seconds(20));
+    for (int i = 0; i < 7; ++i) w.record(W::Outcome::Accepted, t0 + seconds(30));
+    w.record(W::Outcome::Accepted, t0 + minutes(5));
+
+    auto c = w.window(t0 + seconds(40));
+    EXPECT_EQ(c.unknown_job, 5u);
+    EXPECT_EQ(c.stale, 3u);
+    EXPECT_EQ(c.accepted, 7u);
+
+    // 9 minutes later the first minute is still inside the window.
+    c = w.window(t0 + minutes(9) + seconds(59));
+    EXPECT_EQ(c.unknown_job, 5u);
+    EXPECT_EQ(c.stale, 3u);
+    EXPECT_EQ(c.accepted, 8u);
+
+    // 10 minutes later it has rolled off; the minute-5 share has not.
+    c = w.window(t0 + minutes(10));
+    EXPECT_EQ(c.unknown_job, 0u);
+    EXPECT_EQ(c.stale, 0u);
+    EXPECT_EQ(c.accepted, 1u);
+
+    // Everything gone after another 5 minutes; a new outcome reuses a bucket.
+    c = w.window(t0 + minutes(15));
+    EXPECT_EQ(c.accepted, 0u);
+    w.record(W::Outcome::Stale, t0 + minutes(20));
+    c = w.window(t0 + minutes(20));
+    EXPECT_EQ(c.stale, 1u);
+    EXPECT_EQ(c.accepted, 0u);
+    EXPECT_EQ(c.unknown_job, 0u);
+
+    EXPECT_EQ(w.unknown_job_total(), 5u) << "cumulative count does not roll off";
 }

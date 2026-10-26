@@ -190,6 +190,13 @@ private:
     // (FIFO), and a 300 s TTL sweep on insert mirrors p2pool's ExpiringDict.
     // The most recently issued job (back of the deque) is never evicted.
     std::deque<std::string> job_order_;
+    // Ids of jobs this session issued and has since evicted (newest at the
+    // back, at most RECENT_EXPIRED_JOBS). A submit whose job id is neither
+    // active nor listed here was never issued on this connection, e.g. a
+    // result the rig buffered before a node restart: it is still answered
+    // "Stale share" but counted as an unknown job, not as genuine stale.
+    std::deque<std::string> expired_job_ids_;
+    static constexpr size_t RECENT_EXPIRED_JOBS = 256;
     // Per-generation payload cache: reuse the previous job's SharedJobPayload
     // when the freshly built bytes are identical (same work generation, same
     // coinbase, same branches). Byte-compare gate ⇒ wire-identical by design.
@@ -203,8 +210,14 @@ private:
     // Per-worker statistics
     uint64_t accepted_shares_ = 0;
     uint64_t rejected_shares_ = 0;
-    uint64_t stale_shares_    = 0;
+    uint64_t stale_shares_    = 0;  // job id not active: genuine stale + unknown job
     uint64_t doa_shares_      = 0;  // block-template changed at submit (live-vs-frozen prevhash mismatch); accounting only, share still broadcasts
+    // Rolling accepted / stale / unknown-job outcomes for the miner page;
+    // shared with the worker registry through WorkerInfo::submit_window.
+    // Unknown-job submits (job id never issued on this connection) are a
+    // subset of stale_shares_.
+    std::shared_ptr<core::stratum::SubmitOutcomeWindow> submit_window_ =
+        std::make_shared<core::stratum::SubmitOutcomeWindow>();
     std::chrono::steady_clock::time_point connected_at_;
     // Last inbound-line timestamp (zombie-session reaper, StratumConfig::
     // session_idle_timeout_sec). Updated on every received stratum line; a
