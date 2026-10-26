@@ -669,17 +669,10 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
         // Worker name is always AFTER the last address, so strip from the end.
-        auto dot_pos = username_.rfind('.');
-        if (dot_pos != std::string::npos && dot_pos > 20) {
-            worker_name_ = username_.substr(dot_pos + 1);
-            username_ = username_.substr(0, dot_pos);
-        }
-        auto underscore_pos = username_.rfind('_');
-        if (underscore_pos != std::string::npos && underscore_pos > 20) {
-            if (worker_name_.empty())
-                worker_name_ = username_.substr(underscore_pos + 1);
-            username_ = username_.substr(0, underscore_pos);
-        }
+        // The dot-strip is skipped when the last "/" token is a valid share
+        // difficulty, so "ADDR/1.5" keeps its fractional diff.
+        if (auto worker = stratum_username::strip_worker_suffix(username_); !worker.empty())
+            worker_name_ = std::move(worker);
 
         // ─── Step 3: Parse multi-chain addresses ───
         // Supported separator formats for merged mining addresses:

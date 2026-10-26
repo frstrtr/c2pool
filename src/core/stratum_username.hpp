@@ -5,11 +5,12 @@
 // Kept free of StratumSession state so the exact production code is what the
 // unit tests exercise (test/test_stratum_username.cpp).
 //
-// Login grammar handled here (worker-suffix stripping stays in the session):
+// Login grammar handled here:
 //   ADDR+<pseudo_diff>                 fixed pseudoshare difficulty
 //   ADDR/<share_diff>                  per-miner share difficulty (p2pool
 //                                      "ADDR/diff", work.py get_user_details)
 //   ADDR/CHAIN_ID:ADDR[/CHAIN_ID:ADDR] explicit merged-chain addresses
+//   ADDR.worker / ADDR_worker          worker name (stripped before "/")
 // "/<share_diff>" and "/CHAIN_ID:ADDR" tokens may be mixed in any order.
 
 #include <cctype>
@@ -57,6 +58,40 @@ inline std::optional<double> strip_fixed_diff_suffix(std::string& username)
     std::string diff_str = username.substr(plus_pos + 1);
     username = username.substr(0, plus_pos);
     return parse_positive_finite_diff(diff_str);
+}
+
+// True when the text after the last '/' is a valid "/<share_diff>" token.
+inline bool ends_with_slash_diff(const std::string& username)
+{
+    auto slash_pos = username.rfind('/');
+    if (slash_pos == std::string::npos)
+        return false;
+    return parse_positive_finite_diff(username.substr(slash_pos + 1)).has_value();
+}
+
+// Strip a trailing worker name ("ADDR.rig" / "ADDR_rig", Python compat) and
+// return it ("" if none). The worker is always after the last address, so
+// strip from the end; a separator at index <= 20 is part of an address.
+// A fractional "/<diff>" tail ("ADDR/1.5", "ADDR/98:DOGE/0.5") is not a
+// worker: the dot-strip is skipped when the last "/" token is a valid diff.
+// "ADDR/1.5.rig" still strips ".rig" (the tail "1.5.rig" is not a diff).
+inline std::string strip_worker_suffix(std::string& username)
+{
+    std::string worker;
+    if (!ends_with_slash_diff(username)) {
+        auto dot_pos = username.rfind('.');
+        if (dot_pos != std::string::npos && dot_pos > 20) {
+            worker = username.substr(dot_pos + 1);
+            username = username.substr(0, dot_pos);
+        }
+    }
+    auto underscore_pos = username.rfind('_');
+    if (underscore_pos != std::string::npos && underscore_pos > 20) {
+        if (worker.empty())
+            worker = username.substr(underscore_pos + 1);
+        username = username.substr(0, underscore_pos);
+    }
+    return worker;
 }
 
 struct SlashParse {
