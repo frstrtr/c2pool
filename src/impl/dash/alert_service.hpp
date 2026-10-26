@@ -9,7 +9,9 @@
 // ROLES (any combination; all OFF = this object is never constructed):
 //   origin    -- samples the stratum worker registry, emits OFFLINE /
 //                BACK_ONLINE / digest / test alerts sealed for each configured
-//                relay, retransmits until a signed ack arrives.
+//                relay, retransmits until a signed ack arrives. Given a serve
+//                sample it also emits the node-level WORK_STALLED /
+//                WORK_RESUMED (alert_detector.hpp, NODE LEVEL).
 //   telegram  -- accepts alerts addressed to its own key from allowlisted
 //                origins, appends them to <state>/outbox.jsonl (0600) for the
 //                Telegram sidecar, acks status 4 (queued) and, once the sidecar
@@ -226,6 +228,7 @@ public:
                         m_accepted[it.key()] = Accepted{it.value().value("status", uint8_t{0}),
                                                         it.value().value("received", int64_t{0})};
                 if (m_cfg.origin && j.contains("workers")) m_detector.restore(j["workers"]);
+                if (m_cfg.origin && j.contains("serve")) m_detector.restore_serve(j["serve"]);
                 if (m_cfg.origin && m_keys && j.contains("pending") && j["pending"].is_array())
                     for (const auto& pj : j["pending"]) restore_pending(pj);
             } else {
@@ -430,10 +433,15 @@ public:
     // the tick itself is caught, logged and counted (status "tick.errors"),
     // so the repeating timer is always re-armed (core::Timer does not restart
     // after a throwing handler) and the next tick runs normally.
-    void run_tick(const std::function<std::vector<WorkerSample>()>& sampler, int64_t now) noexcept
+    // `serve_sampler` (origin only, optional) feeds the node-level rules;
+    // nullopt from it means "no serve path to judge" this tick.
+    void run_tick(const std::function<std::vector<WorkerSample>()>& sampler, int64_t now,
+                  const std::function<std::optional<ServeSample>()>& serve_sampler = {}) noexcept
     {
         try {
-            on_tick(sampler ? sampler() : std::vector<WorkerSample>{}, now);
+            std::optional<ServeSample> serve;
+            if (m_cfg.origin && serve_sampler) serve = serve_sampler();
+            on_tick(sampler ? sampler() : std::vector<WorkerSample>{}, now, serve ? &*serve : nullptr);
         } catch (const std::exception& e) {
             record_tick_error(e.what(), now);
         } catch (...) {
@@ -455,7 +463,8 @@ public:
         }
     }
 
-    void on_tick(const std::vector<WorkerSample>& raw_samples, int64_t now)
+    void on_tick(const std::vector<WorkerSample>& raw_samples, int64_t now,
+                 const ServeSample* serve = nullptr)
     {
         drain_io();
         if (m_cfg.origin) {
@@ -464,7 +473,7 @@ public:
             // the ledger or the web status (a JSON dump throws otherwise).
             std::vector<WorkerSample> samples = raw_samples;
             for (auto& smp : samples) smp.key = sanitize_utf8(smp.key);
-            for (auto& ev : m_detector.tick(samples, now)) enqueue_event(ev, now);
+            for (auto& ev : m_detector.tick(samples, now, serve)) enqueue_event(ev, now);
             if (m_detector.generation() != m_detector_gen) {
                 m_detector_gen = m_detector.generation();
                 m_state_dirty = true;
@@ -610,6 +619,7 @@ private:
         j["accepted"] = acc;
         if (m_cfg.origin) {
             j["workers"] = m_detector.persist();
+            j["serve"] = m_detector.persist_serve();
             nlohmann::json pend = nlohmann::json::array();
             for (const auto& [id, p] : m_pending) pend.push_back(pending_json(p));
             j["pending"] = pend;
@@ -918,6 +928,11 @@ private:
                 break;
             }
             ++m_c.refused;
+            if (is_work_kind(p.kind) && a.status == static_cast<uint8_t>(AckStatus::RefusedInvalid))
+                LOG_WARNING << "[alert-relay] event " << p.event_id << " (" << kind_name(p.kind)
+                            << ") refused by relay " << short_hex(p.relay_pub) << " as invalid: a relay"
+                               " older than this event kind refuses it -- upgrade the relay (or check"
+                               " the origin clock)";
             finalize(pit, ack_status_name(a.status), now);
             break;
         }
