@@ -24,6 +24,8 @@
 #include <gtest/gtest.h>
 
 #include <c2pool/storage/found_block_store.hpp>
+#include <core/uint256.hpp>
+#include <core/web_server.hpp>   // MiningInterface: the found-block rows this store persists
 
 #include <algorithm>
 #include <atomic>
@@ -513,4 +515,206 @@ TEST(MergedBlockStoreKat, FindByHashNeedsTheFullHash)
     EXPECT_EQ(b->share_hash, hash_n(0x5a));
     EXPECT_FALSE(store.find_by_hash(hash_n(2)).has_value());
     EXPECT_FALSE(store.find_by_hash(kHashA.substr(0, 16)).has_value());
+}
+
+// ── A row stored at height 0 learns its height and keeps it ─────────────────
+// The stale-job block 2561316 of 2026-10-25 was stored at height 0 and
+// pending. The key carries the height (fblk:<chain>:<height12>:<hash16>), so
+// a later record that knows the real height must (a) give the in-memory row
+// that height, (b) leave no height-0 key behind -- it lists first and would
+// win the (hash, chain) dedup on the next load -- and (c) let the
+// confirm/orphan verdict resolve at the real height. Wired the way
+// main_dash.cpp wires the store.
+
+namespace {
+
+using MI = core::MiningInterface;
+
+void wire_store(MI& mi, FoundBlockStore& store)
+{
+    mi.set_found_block_persistence(
+        [&store](const MI::FoundBlock& b) -> bool {
+            FoundBlockRecord rec;
+            rec.chain = b.chain; rec.height = b.height; rec.block_hash = b.hash;
+            rec.timestamp = b.ts; rec.status = static_cast<uint8_t>(b.status);
+            rec.check_count = b.check_count; rec.confirmations = b.confirmations;
+            rec.finder_address = b.miner; rec.reward_satoshis = b.subsidy;
+            rec.network_difficulty = b.network_difficulty;
+            rec.share_difficulty = b.share_difficulty;
+            rec.pool_hashrate = b.pool_hashrate; rec.share_hash = b.share_hash;
+            rec.authorship = static_cast<uint8_t>(b.authorship);
+            return store.store(rec);
+        },
+        [&store]() {
+            std::vector<MI::FoundBlock> out;
+            for (const auto& rec : store.load_all()) {
+                MI::FoundBlock b{};
+                b.height = rec.height; b.hash = rec.block_hash; b.ts = rec.timestamp;
+                b.status = static_cast<MI::BlockStatus>(rec.status);
+                b.check_count = rec.check_count; b.chain = rec.chain;
+                b.confirmations = rec.confirmations; b.miner = rec.finder_address;
+                b.subsidy = rec.reward_satoshis;
+                b.network_difficulty = rec.network_difficulty;
+                b.share_difficulty = rec.share_difficulty;
+                b.pool_hashrate = rec.pool_hashrate; b.share_hash = rec.share_hash;
+                b.authorship = static_cast<MI::BlockAuthorship>(rec.authorship);
+                out.push_back(std::move(b));
+            }
+            return out;
+        });
+}
+
+const std::string kStaleHash =
+    "000000000000001c9e20a446e73e4a734fd79adba4b7c4d736e34551bc37f10f";
+const std::string kPrevHash =
+    "000000000000001b1181483e7c1ff9d25880ce5688c84696bf5f3913f58a1197";
+constexpr uint64_t kStaleHeight = 2561316;
+
+FoundBlockRecord dash_row(uint64_t height, const std::string& hash, uint64_t ts,
+                          uint8_t status)
+{
+    FoundBlockRecord rec;
+    rec.chain = "DASH"; rec.height = height; rec.block_hash = hash;
+    rec.timestamp = ts; rec.status = status;
+    rec.finder_address = "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu";
+    rec.share_hash = hash; rec.reward_satoshis = 164425700;
+    rec.network_difficulty = 93611841.8; rec.pool_hashrate = 4.6e13;
+    rec.authorship = 2;
+    return rec;
+}
+
+// The DASH confirm lane's answer: nothing is known at height 0 (pending), and
+// a competitor holds 2561316 (orphaned).
+void arm_competitor_verdict(MI& mi)
+{
+    mi.set_block_verify_fn([&mi](const std::string& hash) -> int {
+        for (const auto& b : mi.get_found_blocks())
+            if (b.hash == hash) return b.height == kStaleHeight ? -1 : 0;
+        return 0;
+    });
+}
+
+const MI::FoundBlock* row_of(const std::vector<MI::FoundBlock>& rows,
+                             const std::string& hash)
+{
+    for (const auto& b : rows)
+        if (b.hash == hash) return &b;
+    return nullptr;
+}
+
+bool has_key(core::LevelDBStore& db, const std::string& key)
+{
+    std::vector<uint8_t> v;
+    return db.get(key, v);
+}
+
+} // namespace
+
+TEST(FoundBlockStoreKat, HeightZeroRowLearnsItsHeightAndKeepsItAcrossReloads)
+{
+    TempDb t("fblk_height_learn");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    // What the primary has on disk: the stale-job block at height 0, pending.
+    ASSERT_TRUE(store.store(dash_row(2561265, kPrevHash, 1792945704, /*confirmed*/1)));
+    ASSERT_TRUE(store.store(dash_row(0, kStaleHash, 1792954341, /*pending*/0)));
+
+    {
+        MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::DASH);
+        wire_store(mi, store);
+        mi.load_persisted_found_blocks();
+        arm_competitor_verdict(mi);
+        const auto loaded = mi.get_found_blocks();
+        ASSERT_NE(row_of(loaded, kStaleHash), nullptr);
+        EXPECT_EQ(row_of(loaded, kStaleHash)->height, 0u);
+        // At height 0 the lane cannot answer: the row stays pending.
+        EXPECT_EQ(mi.run_block_verification_now(kStaleHash), 0);
+
+        // The sharechain hook re-records the block from its share (BIP34).
+        uint256 h; h.SetHex(kStaleHash);
+        mi.record_found_block(kStaleHeight, h, 1792954024, "DASH",
+                              "XoZcEFbqwnty5secW7HYjdQEZYfubMkURu", kStaleHash,
+                              93611841.8, 240584.8, 0.0, 164425700,
+                              MI::BlockAuthorship::sharechain_peer);
+        const auto rows = mi.get_found_blocks();
+        ASSERT_NE(row_of(rows, kStaleHash), nullptr);
+        EXPECT_EQ(row_of(rows, kStaleHash)->height, kStaleHeight)
+            << "a later record that knows the height must lift the row out of 0";
+        EXPECT_EQ(rows.front().hash, kStaleHash) << "newest first by height";
+        EXPECT_FALSE(has_key(t.db, fblk_key("DASH", 0, kStaleHash)))
+            << "the height-0 key must not survive the update";
+        EXPECT_TRUE(has_key(t.db, fblk_key("DASH", kStaleHeight, kStaleHash)));
+
+        EXPECT_EQ(mi.run_block_verification_now(kStaleHash), -1)
+            << "at its real height the verdict resolves orphaned";
+    }
+
+    // Two restarts: the row comes back at its height, orphaned, and stays so.
+    for (int restart = 0; restart < 2; ++restart) {
+        MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::DASH);
+        wire_store(mi, store);
+        mi.load_persisted_found_blocks();
+        const auto rows = mi.get_found_blocks();
+        ASSERT_EQ(rows.size(), 2u) << "restart " << restart;
+        const auto* r = row_of(rows, kStaleHash);
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->height, kStaleHeight) << "restart " << restart << " re-zeroed the row";
+        EXPECT_EQ(r->status, MI::BlockStatus::orphaned) << "restart " << restart;
+        EXPECT_FALSE(has_key(t.db, fblk_key("DASH", 0, kStaleHash)));
+    }
+}
+
+// Both keys on disk (a crash between the write and the removal, or an older
+// binary): the record at the real height is the newer one and must win the
+// load whatever order the store lists them in -- the height-0 key lists first.
+TEST(FoundBlockStoreKat, LoadPrefersTheRealHeightOverAHeightZeroKey)
+{
+    TempDb t("fblk_height_prefer");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    ASSERT_TRUE(t.db.put(fblk_key("DASH", 0, kStaleHash),
+                         dash_row(0, kStaleHash, 1792954341, /*pending*/0).serialize()));
+    ASSERT_TRUE(t.db.put(fblk_key("DASH", kStaleHeight, kStaleHash),
+                         dash_row(kStaleHeight, kStaleHash, 1792954341, /*orphaned*/2).serialize()));
+
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::DASH);
+    wire_store(mi, store);
+    mi.load_persisted_found_blocks();
+    const auto rows = mi.get_found_blocks();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].height, kStaleHeight);
+    EXPECT_EQ(rows[0].status, MI::BlockStatus::orphaned);
+}
+
+// The startup repair: a row restored at height 0 takes the height a lookup
+// (main_dash: the header chain) knows for its hash, through the same path, and
+// the lookup is asked about unknown heights only.
+TEST(FoundBlockStoreKat, StartupBackfillGivesAHeightZeroRowItsHeight)
+{
+    TempDb t("fblk_height_backfill");
+    ASSERT_TRUE(t.db.open());
+    FoundBlockStore store(t.db);
+    ASSERT_TRUE(store.store(dash_row(2561265, kPrevHash, 1792945704, /*confirmed*/1)));
+    ASSERT_TRUE(store.store(dash_row(0, kStaleHash, 1792954341, /*pending*/0)));
+
+    MI mi(/*testnet=*/false, nullptr, c2pool::address::Blockchain::DASH);
+    wire_store(mi, store);
+    mi.load_persisted_found_blocks();
+    std::vector<std::string> asked;
+    mi.backfill_found_block_heights([&asked](const std::string& hash) -> uint64_t {
+        asked.push_back(hash);
+        return hash == kStaleHash ? kStaleHeight : 0;
+    });
+    ASSERT_EQ(asked.size(), 1u);
+    EXPECT_EQ(asked[0], kStaleHash);
+
+    const auto rows = mi.get_found_blocks();
+    const auto* r = row_of(rows, kStaleHash);
+    ASSERT_NE(r, nullptr);
+    EXPECT_EQ(r->height, kStaleHeight);
+    EXPECT_FALSE(has_key(t.db, fblk_key("DASH", 0, kStaleHash)));
+    EXPECT_TRUE(has_key(t.db, fblk_key("DASH", kStaleHeight, kStaleHash)));
+
+    arm_competitor_verdict(mi);
+    EXPECT_EQ(mi.run_block_verification_now(kStaleHash), -1);
 }

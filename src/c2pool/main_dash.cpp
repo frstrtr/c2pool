@@ -4275,24 +4275,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Display only; the callback runs after dispatch, never gates it.
             work_source->set_on_found_block_fn(
                 [ws](uint32_t height, const uint256& block_hash,
-                     const std::string& miner, bool reached_network) {
+                     const std::string& miner, bool reached_network,
+                     uint64_t subsidy) {
                     auto* mi = ws->get_mining_interface();
-                    // Subsidy: the WebServer-held template is empty on the
-                    // embedded arm (row 2516914 recorded subsidy=0 from it on
-                    // 2026-08-05); record_found_block now falls back to the
-                    // live coin template itself, so 0 here means "let the
-                    // core ask the template". Same for pool hashrate: this
-                    // site passed get_local_hashrate() into a field named
-                    // pool_hashrate_at_find — correct only while every rig
-                    // in the pool happens to sit on this node. 0 routes the
-                    // core to m_pool_hashrate_fn (the real pool estimator),
-                    // which is the rate expected_time/luck are defined over.
-                    uint64_t subsidy = 0;
-                    {
-                        auto tmpl = mi->get_current_work_template();
-                        if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
-                            subsidy = tmpl["coinbasevalue"].get<uint64_t>();
-                    }
+                    // Height and subsidy are the JOB's (the block's own BIP34
+                    // height and the coinbasevalue frozen with the job), not
+                    // the current template's: block 2561316 was solved on a
+                    // stale job on 2026-10-25 and recorded at h=0 with the
+                    // then-current template's subsidy. A 0 subsidy still lets
+                    // record_found_block fall back to the live coin template.
+                    // Pool hashrate: this site passed get_local_hashrate()
+                    // into a field named pool_hashrate_at_find — correct only
+                    // while every rig in the pool happens to sit on this node.
+                    // 0 routes the core to m_pool_hashrate_fn (the real pool
+                    // estimator), which is the rate expected_time/luck are
+                    // defined over.
                     mi->record_found_block(
                         height, block_hash,
                         static_cast<uint64_t>(std::time(nullptr)),
@@ -10759,12 +10756,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 h.SetHex(hash_hex);
 
                 // Recorded mint height for this hash (authoritative for orphans).
+                // Height 0 is "unknown" -- a stale-job row recorded before the
+                // work source read the job's own height -- never a block we
+                // could have mined; asking which block won height 0 left such
+                // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
-                        have_height = true;
+                        have_height = found_height != 0;
                         break;
                     }
                 }
@@ -10840,6 +10841,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
             // One-shot backfill of rows restored from persistence.
             cache_mi->backfill_block_fields(diff_lookup, ts_lookup);
+            // A row restored at height 0 (a stale-job block recorded before
+            // the work source read the job's own height) takes its height from
+            // the header chain when the chain holds that header; the re-verify
+            // pass below then resolves it at that height.
+            cache_mi->backfill_found_block_heights(
+                [hc](const std::string& block_hash_hex) -> uint64_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto e = hc->get_header(h);
+                    return e ? static_cast<uint64_t>(e->height) : 0;
+                });
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose

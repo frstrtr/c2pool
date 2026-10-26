@@ -1651,3 +1651,129 @@ TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)
     EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000013u);
     EXPECT_TRUE(mi.rest_found_block(std::string(64, 'f')).is_null());
 }
+
+// ── Stale-job block of 2026-10-25 (DASH v36 primary, block 2561316) ──────────
+// The block was recorded at height 0, so newest-first-by-height put it after
+// every real row; after a restart the derived interval was recomputed from
+// that order, found no predecessor, and /recent_blocks labelled it
+// "first_block" -- the chart then said "1st block" for a block with 23 earlier
+// rows. A row with an earlier same-chain row is not the first block.
+TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+
+    const std::string h_first =
+        "6666666666666666666666666666666666666666666666666666666666660001";
+    const std::string h_second =
+        "6666666666666666666666666666666666666666666666666666666666660002";
+    const std::string h_stale =
+        "000000000000001c9e20a446e73e4a734fd79adba4b7c4d736e34551bc37f10f";
+    auto make_row = [](uint64_t height, const std::string& hash, uint64_t ts) {
+        MiningInterface::FoundBlock b{};
+        b.height = height; b.hash = hash; b.ts = ts;
+        b.status = MiningInterface::BlockStatus::confirmed;
+        b.chain = "DASH"; b.confirmations = 50;
+        b.miner = "Xminer"; b.share_hash = hash;
+        b.network_difficulty = 1.0;
+        b.pool_hashrate = 4294967296.0;
+        return b;
+    };
+    std::vector<MiningInterface::FoundBlock> restored = {
+        make_row(2561244, h_first,  1792942805),
+        make_row(2561265, h_second, 1792945704),
+        make_row(0,       h_stale,  1792954341),   // the persisted stale-job row
+    };
+    restored[2].status = MiningInterface::BlockStatus::pending;
+    mi.set_found_block_persistence(
+        [](const MiningInterface::FoundBlock&) { return true; },
+        [&restored]() { return restored; });
+    mi.load_persisted_found_blocks();
+
+    auto arr = mi.rest_recent_blocks();
+    auto first = find_block(arr, h_first);
+    auto second = find_block(arr, h_second);
+    auto stale = find_block(arr, h_stale);
+    ASSERT_TRUE(first.is_object() && second.is_object() && stale.is_object());
+    EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block")
+        << "the genuinely first block keeps its label";
+    EXPECT_EQ(second["luck_method"].get<std::string>(), "simple_avg");
+    EXPECT_TRUE(stale["luck"].is_null());
+    EXPECT_NE(stale["luck_method"].get<std::string>(), "first_block")
+        << "a block with earlier same-chain rows is not the pool's first";
+    EXPECT_EQ(stale["luck_method"].get<std::string>(), "interval_unavailable");
+}
+
+// The confirm/orphan verdict runs with the blocks lock released, and every
+// record_found_block re-sorts the list newest-first by height. A block
+// recorded in that window moved the row being verified, and the verdict was
+// written to whatever row then sat at the old index: the newcomer was flipped
+// to orphaned and the block actually checked stayed pending.
+TEST(DashboardData, VerdictLandsOnTheVerifiedRowWhenTheListReSorts)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    const std::string h_old =
+        "7777777777777777777777777777777777777777777777777777777777770001";
+    const std::string h_new =
+        "7777777777777777777777777777777777777777777777777777777777770002";
+    mi.record_found_block(2561316, uint256S(h_old), 1792954341, "DASH",
+                          "Xminer", h_old, 1.0, 0.0, 4294967296.0, 1);
+
+    mi.set_block_verify_fn([&mi, &h_old, &h_new](const std::string& hash) -> int {
+        if (hash != h_old) return 0;
+        // Another block of ours lands while the verdict is out.
+        mi.record_found_block(2561320, uint256S(h_new), 1792955000, "DASH",
+                              "Xminer", h_new, 1.0, 0.0, 4294967296.0, 1);
+        return -1;   // a competitor holds 2561316
+    });
+    EXPECT_EQ(mi.run_block_verification_now(h_old), -1);
+
+    MiningInterface::BlockStatus st_old{}, st_new{};
+    for (const auto& b : mi.get_found_blocks()) {
+        if (b.hash == h_old) st_old = b.status;
+        if (b.hash == h_new) st_new = b.status;
+    }
+    EXPECT_EQ(st_old, MiningInterface::BlockStatus::orphaned)
+        << "the verdict belongs to the block it was asked about";
+    EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending)
+        << "a block recorded during the verdict must not inherit it";
+}
+
+// The scheduled checks must follow the block, not the index it had when they
+// were armed: a block recorded after the schedule takes index 0, and the
+// first check then verified the newcomer and never the scheduled block. DGB
+// has the shortest first check (3 s), which keeps this test short.
+TEST(DashboardData, ScheduledChecksFollowTheBlockAcrossAnInsert)
+{
+    boost::asio::io_context ioc;
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_io_context(&ioc);
+    const std::string h_old =
+        "8888888888888888888888888888888888888888888888888888888888880001";
+    const std::string h_new =
+        "8888888888888888888888888888888888888888888888888888888888880002";
+    mi.set_block_verify_fn([&h_old](const std::string& hash) -> int {
+        return hash == h_old ? -1 : 0;
+    });
+    mi.record_found_block(100, uint256S(h_old), 1792954341, "DGB",
+                          "Xminer", h_old, 1.0, 0.0, 4294967296.0, 1);
+    mi.schedule_block_verification(h_old);
+    mi.record_found_block(101, uint256S(h_new), 1792954350, "DGB",
+                          "Xminer", h_new, 1.0, 0.0, 4294967296.0, 1);
+
+    ioc.run_for(std::chrono::milliseconds(3500));   // first check fires at +3 s
+
+    MiningInterface::BlockStatus st_old{}, st_new{};
+    uint8_t checks_new = 0;
+    for (const auto& b : mi.get_found_blocks()) {
+        if (b.hash == h_old) st_old = b.status;
+        if (b.hash == h_new) { st_new = b.status; checks_new = b.check_count; }
+    }
+    EXPECT_EQ(st_old, MiningInterface::BlockStatus::orphaned)
+        << "the first scheduled check must verify the scheduled block";
+    EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending);
+    EXPECT_EQ(checks_new, 0u) << "the newcomer was never scheduled";
+}
