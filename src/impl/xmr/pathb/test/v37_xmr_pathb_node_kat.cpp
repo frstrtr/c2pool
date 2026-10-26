@@ -289,7 +289,9 @@
 //   catchlight   an unheld lighter tip: at most one locator round per HELLO,
 //                none after its reply; the chain never switches;
 //   catchoffer   a store not caught up, partly walked, offered an unheld
-//                lighter tip: one pair, one attempt, rule (4) keeps its chain;
+//                lighter tip: one pair, one attempt, rule (4) keeps its chain
+//                and the store is caught up (no record; after a restart no
+//                NoPathbPeer and no first round);
 //   revcatchundec  the catch-up of a store not caught up ended by an
 //                undecodable reply (STRIKE): caught up, its chain kept;
 //   catchtok     the same ended by a reply that strikes (a link broken inside
@@ -8019,8 +8021,8 @@ void catchlight() {
 
 // catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
 // tip (B's branch: A's 1, 2 and its own 3; the fork below the node's journal base 4): offer_empty_store_tip queues one
-// pair; its one attempt completes and rule (4) keeps the node's chain (its own chain is A); the same pair is not queued
-// again (P-52).
+// pair; its one attempt completes and rule (4) keeps the node's chain (its own chain is A), which ends K_NCU; no pair
+// is queued again. Restarted from its store with no peer, it builds templates; a HELLO opens no first round.
 void catchoffer() {
     const KatNet net;
     Harness h(net);
@@ -8076,6 +8078,22 @@ void catchoffer() {
                   && h[jn].joiner().queue().size() == 0,
           "catchoffer: the one attempt completes and rule (4) keeps J's chain; the pair is not queued again" +
                   (st.report ? std::string(": ") + rep_desc(*st.report) : std::string(": no attempt")));
+    // the completed attempt that rule (4) did not take ends K_NCU: no record; with no peer, and after a restart, no
+    // NoPathbPeer and no first round
+    const bool ended = st.caught_up && h[jn].caught_up() && kvj.data.count(pb::store_keys::ncu(0)) == 0;
+    const std::size_t jr = load_node(h, kvj, h.config(table0(net), false, J));
+    const pb::TemplateStatus s_restart = tstatus(h, jr);
+    const pb::HelloCheck hr = h.hello(jr, b);
+    const pb::TemplateStatus s_hello = tstatus(h, jr);
+    std::printf("  catchoffer: K_NCU ended %d; restarted: caught up %d, templates %d with no peer, %d after B's HELLO; "
+                "first round %d\n",
+                ended ? 1 : 0, h[jr].caught_up() ? 1 : 0, static_cast<int>(s_restart), static_cast<int>(s_hello),
+                h[jr].first_round_open() ? 1 : 0);
+    check(ended && h[jr].caught_up() && s_restart != pb::TemplateStatus::NoPathbPeer
+                  && s_restart != pb::TemplateStatus::CatchingUp && hr.verdict == pb::HelloVerdict::Accept
+                  && !h[jr].first_round_open() && s_hello != pb::TemplateStatus::CatchingUp,
+          "catchoffer: the completed attempt that rule (4) did not take ends K_NCU: the record gone; restarted with no "
+          "peer, templates; a HELLO opens no first round");
 }
 
 // ---------------------------------------------------------------------------

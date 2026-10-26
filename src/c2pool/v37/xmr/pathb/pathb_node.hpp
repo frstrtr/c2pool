@@ -229,6 +229,7 @@ struct JoinStep {
     bool batch_written = false;  // the adoption batch committed into an empty store
     std::uint64_t reasked = 0;   // E-72: claimed leaves asked again at a carrier of the heavier chain
     bool reask_joiner = false;   // E-72: a re-asked leaf differed: the joiner path
+    bool caught_up = false;      // a completed attempt that rule (4) did not take ended the store's K_NCU
 };
 
 // The join worker's half of a step (PathbNode::attempt_join): the E-72
@@ -691,6 +692,13 @@ public:
             }
             watch_own_carriers();
         }
+        // a completed attempt whose candidate rule (4) did not take: the node keeps its own chain, and a store not
+        // caught up (K_NCU) is caught up (the record leaves the store)
+        if (out.report && out.report->end == AttemptEnd::Completed && !out.sw.adopted && !out.sw.replaced
+            && not_caught_up_) {
+            note_caught_up();
+            out.caught_up = true;
+        }
         return out;
     }
     // Both halves in one call (the KATs' single-threaded form).
@@ -782,8 +790,8 @@ public:
         return joiner_->queue().size() > before;
     }
     // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
-    // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision) or a join
-    // adopts.
+    // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision), a join adopts,
+    // or a join attempt completes and rule (4) keeps the node's chain.
     bool caught_up() const noexcept { return !not_caught_up_; }
     // The first catch-up round after the start is in flight (the template gate's first clause).
     bool first_round_open() const noexcept { return first_round_open_; }

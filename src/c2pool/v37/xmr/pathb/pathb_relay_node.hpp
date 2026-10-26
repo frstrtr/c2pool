@@ -3168,6 +3168,10 @@ private:
                 (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
                 (rep.what.empty() ? "" : ": " + rep.what) + ")" +
                 (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
+            if (s->caught_up) {
+                st_.caught_up_at_ms = now_ms();
+                log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)");
+            }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
                 if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;
