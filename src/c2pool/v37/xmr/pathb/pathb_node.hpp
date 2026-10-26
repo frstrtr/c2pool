@@ -896,7 +896,8 @@ public:
     std::uint64_t parent_reasks() const noexcept { return parent_reasks_; }
     // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
     // parked) has FC_GETCARRIER(parent) sent while that parent is missing, once it was not asked within P-53 (an ask
-    // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at most one ask
+    // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves (the relay pauses
+    // it while a headers-first catch-up got its own reply within P-53 and the best moved within P-53); at most one ask
     // per parent id per P-53, none for a parent the header path asked within P-53. The first ask goes to the sender of
     // the chain's oldest frame while it is connected, else to another connected Path B peer (one that sent frames of that
     // chain first); each repeat goes to the next connected peer in turn. `room(peer)`: the asks that peer may take now

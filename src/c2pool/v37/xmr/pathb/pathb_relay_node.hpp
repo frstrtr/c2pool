@@ -242,6 +242,7 @@ struct PathbRelayStats {
     // stayed deferred on a P_r past kCtxTtlMs; join pairs released (their P_r resolved, a new peer, a want re-made);
     // when it caught up (ms; 0: not since start)
     std::atomic<std::uint64_t> catchup_steps{0}, catchup_join_offers{0}, join_releases{0}, caught_up_at_ms{0};
+    std::atomic<std::uint64_t> reask_paused{0};  // ticks whose parked-chain re-ask waited on a live catch-up
     std::atomic<std::uint64_t> receipts_parked{0}, parked_receipt_drops{0};  // DEFERred receipts parked; dropped over P-09
     // links dropped for a full send queue at a relay send: while the peer's re-offer pages; otherwise (live traffic)
     std::atomic<std::uint64_t> reoffer_queue_full{0}, live_queue_full{0};
@@ -1153,6 +1154,7 @@ private:
         Hash32 fetch_tip{};              // the last FetchBodies page's tip, while its bodies are in flight
         Hash32 fetch_best{};             // the best tip at the page's last progress
         std::uint64_t fetch_ms = 0;      // ... and its time
+        std::uint64_t reply_ms = 0;      // its own last reply
     };
     // A header request waiting for its peer's slot (one in flight per peer), served oldest first when the slot frees.
     // The parked objects (frame digests, receipt keys) waiting on a tip-header entry, in the order they came.
@@ -2505,6 +2507,23 @@ private:
         }
         (void)send_link(peer, f);
     }
+    // Under the node lock: reask_parents waits while a headers-first catch-up got its own reply within P-53 and the best
+    // tip moved within P-53.
+    bool reask_paused() {
+        const std::uint64_t now = now_ms(), window = abandon_s_ * 1000;
+        if (const Hash32 b = node_->tree().best().id; b != reask_best_) {
+            reask_best_ = b;
+            reask_best_ms_ = now;
+        }
+        if (now >= reask_best_ms_ + window) return false;
+        std::lock_guard<std::mutex> lk(cumtx_);
+        for (const auto& [p, c] : catchup_)
+            if (c.reply_ms != 0 && now < c.reply_ms + window) {
+                st_.reask_paused++;
+                return true;
+            }
+        return false;
+    }
     // The carrier ids this node may still ask of `peer` before its asked-carrier record (kAskedMax) is full.
     std::size_t ask_room(std::uint64_t peer) const {
         std::lock_guard<std::mutex> lk(kmtx_);
@@ -2916,6 +2935,7 @@ private:
                 // only the catch-up's own outcomes act on the catch-up (a tip request's outcome leaves it as it is)
                 const auto it = o.owner == PathbNode::HeaderOwner::CatchUp ? catchup_.find(p) : catchup_.end();
                 if (it != catchup_.end()) {
+                    it->second.reply_ms = now_ms();
                     switch (o.kind) {
                         case K::Keep:
                             // an empty reply to a request from above the lowest position held: the server's chain does
@@ -3554,8 +3574,9 @@ private:
                 for (const std::uint64_t p : arrived) node_->headers_arrived(p);
             }
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
-            // the lowest frame of a parked chain: its parent, once per P-53, within each peer's asked-carrier record
-            node_->reask_parents([this](std::uint64_t p) { return ask_room(p); });
+            // the lowest frame of a parked chain: its parent, once per P-53, within each peer's asked-carrier record;
+            // paused while a headers-first catch-up got its own reply within P-53 and the best moved within P-53
+            if (!reask_paused()) node_->reask_parents([this](std::uint64_t p) { return ask_room(p); });
             {  // the wants re-made for an id a join pair waits on (it gave up before): the pairs are tried again
                 std::vector<Hash32> again;
                 {
@@ -4431,6 +4452,8 @@ private:
 
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
+    Hash32 reask_best_{};            // reask_paused: the best tip it saw last, and since when (ms)
+    std::uint64_t reask_best_ms_ = 0;
     std::map<std::uint64_t, std::deque<HdrWant>> header_wants_;  // peer -> its waiting header requests, oldest first
     std::map<std::uint64_t, std::vector<HdrOnCtx>> headers_on_ctx_;  // deferred on a P_r: peer -> per (owner, from, stop)
     std::map<std::uint64_t, HdrSent> hdr_sent_;  // the tip request in flight per peer and its objects (cumtx_)
