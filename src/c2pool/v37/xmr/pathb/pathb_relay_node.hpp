@@ -1870,14 +1870,20 @@ private:
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
+        std::vector<std::string> lines;                     // the STRIKE / REFUSE lines of the drained carriers
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
     // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
-        for (const PathbNode::DrainedResult& d : node_->take_drained())
+        for (const PathbNode::DrainedResult& d : node_->take_drained()) {
             account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
+            if (d.verdict == AdmitVerdict::Strike || d.verdict == AdmitVerdict::Refuse)
+                fx.lines.push_back("relay: peer " + std::to_string(d.peer) +
+                                   (d.verdict == AdmitVerdict::Strike ? " STRIKE: " : " REFUSE: ") +
+                                   admission_text(d.row, d.object));
+        }
     }
     // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
     // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
@@ -2205,19 +2211,29 @@ private:
         q.want_bodies = true;
         if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, p_)) node_send(peer, *f);
     }
-    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN).
+    // The text of an admission line: its row and the id of the body it names.
+    static std::string admission_text(RowId row, const Hash32& id) {
+        return "admission row R" + std::to_string(static_cast<int>(row)) + " of " + hex_short(id);
+    }
+    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN). A STRIKE, REFUSE or BAN logs its row and
+    // the id of the body it names.
     bool apply_result(std::uint64_t peer, const NodeEventResult& r, bool token_taken) {
         for (const auto& [q, n] : r.admit.peer_tokens) strike(q, n, false);
+        const auto named = [&]() { return admission_text(r.admit.row, r.admit.id != Hash32{} ? r.admit.id : r.object); };
         switch (r.admit.verdict) {
-            case AdmitVerdict::Strike: strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken); return true;
-            case AdmitVerdict::Ban:
-                ban(peer, "admission row R" + std::to_string(static_cast<int>(r.admit.row)) + " of " + hex_short(r.admit.id));
+            case AdmitVerdict::Strike:
+                log("relay: peer " + std::to_string(peer) + " STRIKE: " + named());
+                strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken);
                 return true;
+            case AdmitVerdict::Ban: ban(peer, named()); return true;
+            case AdmitVerdict::Refuse: log("relay: peer " + std::to_string(peer) + " REFUSE: " + named()); return false;
             case AdmitVerdict::Drop: st_.drops++; return false;
             default: return false;
         }
     }
     void run_effects(Effects& fx) {
+        for (const std::string& l : fx.lines) log(l);  // after the node lock
+        fx.lines.clear();
         for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
             rx_alarm("released carrier");
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},

@@ -1291,15 +1291,21 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         f.web.time = unix_now_s();
         f.web.landed = sub::to_string(e.landed);
         f.web.reward_pico = e.reward;
+        std::uint64_t n_rule = 0, f_spend = 0, base = 0, zone = 0;
         if (const std::optional<pb::IssuedJob> j = jobs.network_job(e.template_id, e.extra_nonce)) {
             f.web.tip_hex = hex_of(j->tip);
             f.web.window_root_hex = hex_of(j->window_root);
             f.web.n_outputs = j->n_outputs;
             f.web.reward_pico = j->reward;
+            n_rule = j->n_rule;
+            f_spend = j->f_spend;
+            base = j->base;
+            zone = j->zone;
         }
         f.line = "found h=" + std::to_string(f.web.height) + " id=" + f.web.id_hex + " tip=" + f.web.tip_hex +
                  " window_root=" + f.web.window_root_hex + " n_outputs=" + std::to_string(f.web.n_outputs) +
-                 " R=" + std::to_string(f.web.reward_pico) + " landed=" + f.web.landed;
+                 " R=" + std::to_string(f.web.reward_pico) + " landed=" + f.web.landed + " N=" + std::to_string(n_rule) +
+                 " f_spend=" + std::to_string(f_spend) + " B=" + std::to_string(base) + " Z=" + std::to_string(zone);
         std::lock_guard<std::mutex> lk(found_mtx);
         found_new.push_back(std::move(f));
     };
@@ -1533,6 +1539,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     bool template_kept = false, fork_fuse = false;
     std::uint64_t templates = 0, tip_extends = 0, tip_reorgs = 0, tip_orphans = 0, prunes = 0;
     pb::PathbNode::PruneReport last_prune{};
+    std::optional<pb::PathbNode::PruneFloors> floors_now;  // the floors of the last prune step that computed them
     std::uint64_t last_rows_recorded = rows.recorded();
     const auto mono_s = []() { return pb::RelayClock::system().mono_ms() / 1000; };
     const std::uint64_t t0 = mono_s();
@@ -1553,6 +1560,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         pb::PathbNode::SwitchCounts sw{};
         std::uint64_t own_carriers = 0, own_orphaned = 0;
         std::size_t repend_watched = 0;
+        pb::PathbNode::AmountCounts amounts{};
         pb::PathbNode::OpenState open{};
         std::uint64_t open_evaluated = 0;
         pb::PathbNode::Liveness liveness{};
@@ -1583,6 +1591,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             v.own_carriers = n.own_carriers();
             v.own_orphaned = n.own_orphaned();
             v.repend_watched = n.repend_watch_size();
+            v.amounts = n.amount_counts();
             // computed once per status period (the status line's); the kept values on the other passes
             const pb::PathbNode::StatusSample& ss = n.status_sample(now_s, cfg.status_every_s);
             v.open = ss.open;
@@ -1627,6 +1636,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             last_prune_s = now;
             last_prune = relay->with_node([&](pb::PathbNode& n) { return n.prune(now); });
             if (last_prune.written) ++prunes;
+            if (last_prune.floors_set) floors_now = last_prune.floors;
         }
 
         // 2. the best tip and hold()
@@ -1843,14 +1853,21 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                             nv.coinbase_internal ? (" coinbase-internal=" + std::to_string(nv.coinbase_internal)).c_str() : "",
                             nv.hold.hold ? " hold" : "");
             std::printf("  switches: re-pended=%llu carried=%llu sealed-pending=%llu evicted=%llu watched=%zu lost=%llu "
-                        "joiner-switches=%llu joiner-lost=%llu joiner-adopted=%llu own-carriers=%llu own-orphaned=%llu\n",
+                        "joiner-switches=%llu joiner-lost=%llu joiner-adopted=%llu own-carriers=%llu own-orphaned=%llu "
+                        "carry-bins=%llu/%llu/%llu/%llu carry-bins-max=%llu repend-skipped=%llu\n",
                         static_cast<unsigned long long>(nv.sw.repended), static_cast<unsigned long long>(nv.sw.carried),
                         static_cast<unsigned long long>(nv.sw.sealed_pending), static_cast<unsigned long long>(nv.sw.evicted),
                         nv.repend_watched, static_cast<unsigned long long>(nv.sw.lost),
                         static_cast<unsigned long long>(nv.sw.joiner_switches),
                         static_cast<unsigned long long>(nv.sw.joiner_lost),
                         static_cast<unsigned long long>(nv.sw.joiner_adopted), static_cast<unsigned long long>(nv.own_carriers),
-                        static_cast<unsigned long long>(nv.own_orphaned));
+                        static_cast<unsigned long long>(nv.own_orphaned),
+                        static_cast<unsigned long long>(nv.sw.carry_bins[0]),
+                        static_cast<unsigned long long>(nv.sw.carry_bins[1]),
+                        static_cast<unsigned long long>(nv.sw.carry_bins[2]),
+                        static_cast<unsigned long long>(nv.sw.carry_bins[3]),
+                        static_cast<unsigned long long>(nv.sw.carry_bins_max),
+                        static_cast<unsigned long long>(nv.sw.repend_skipped));
             std::printf("  open-state: placements=%llu bytes=%llu evaluated=%llu\n",
                         static_cast<unsigned long long>(nv.open.placements), static_cast<unsigned long long>(nv.open.bytes),
                         static_cast<unsigned long long>(nv.open_evaluated));
@@ -1987,11 +2004,19 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                                   "=" + std::to_string(vc[row][v]);
                 std::printf("  verdicts:%s\n", vs.empty() ? " none" : vs.c_str());
             }
-            std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu\n",
+            std::printf("  amounts: keys=%llu multi-fee=%llu r-min=%llu r-max=%llu foreign-carried=%llu\n",
+                        static_cast<unsigned long long>(nv.amounts.keys),
+                        static_cast<unsigned long long>(nv.amounts.multi_fee),
+                        static_cast<unsigned long long>(nv.amounts.r_min), static_cast<unsigned long long>(nv.amounts.r_max),
+                        static_cast<unsigned long long>(nv.amounts.foreign_carried));
+            std::printf("  follower: rows=%zu recorded=%llu events extend=%llu reorg=%llu orphan=%llu catching_up=%d prunes=%llu "
+                        "floors-sides=%s floors-bodies=%s\n",
                         rows.size(), static_cast<unsigned long long>(rows.recorded()),
                         static_cast<unsigned long long>(tip_extends), static_cast<unsigned long long>(tip_reorgs),
                         static_cast<unsigned long long>(tip_orphans), chain.catchup_held && chain.catchup_held() ? 1 : 0,
-                        static_cast<unsigned long long>(prunes));
+                        static_cast<unsigned long long>(prunes),
+                        floors_now ? std::to_string(floors_now->sides).c_str() : "-",
+                        floors_now ? std::to_string(floors_now->bodies).c_str() : "-");
             std::printf("  %s\n", nn->native_sync_line().c_str());
             for (const std::string& l : pb::kept_status_lines(kept_status_values(cfg, *backend, transport.get())))
                 std::printf("%s\n", l.c_str());

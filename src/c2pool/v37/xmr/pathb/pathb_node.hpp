@@ -219,6 +219,7 @@ struct NodeEventResult {
     std::uint64_t lost = 0;      // abandoned placements whose bin is sealed on the new branch
     std::uint64_t omitted = 0;   // a peer's placed carrier with room: the receipts this node holds pending in bins open
                                  // at its parent that it did not carry (relay policy, never a verdict)
+    Hash32 object{};             // a STRIKE, REFUSE or BAN: the id of the body it names (zero: not decoded; logs only)
 };
 
 // A family C frame's token class for the relay node (it applies the token):
@@ -538,7 +539,10 @@ public:
     // The switches by the journal: their count, the re-pend and lost counts of the last one, and the totals; of the
     // re-pended receipts, those later carried on the best chain, those whose bin sealed while they were pending and
     // those the pending set evicted (P-09) while watched; the joiner-path switches (rule (4) replaced the running
-    // state) and the placements they lost; the adoptions with no state before (a fresh start, a load failure).
+    // state) and the placements they lost; the adoptions with no state before (a fresh start, a load failure). Of the
+    // carried ones: H(q) - H_s by bucket 0 / 1 / 2 / 3 and above, and its maximum (q the placing position, H_s the
+    // record at the new tip at the switch); the abandoned placements the re-pend step did not re-pend (P_r not held,
+    // or evicted at once by the pending set) (logs only).
     struct SwitchCounts {
         std::uint64_t switches = 0;
         std::uint64_t last_repended = 0;
@@ -551,6 +555,9 @@ public:
         std::uint64_t joiner_switches = 0;
         std::uint64_t joiner_lost = 0;
         std::uint64_t joiner_adopted = 0;
+        std::array<std::uint64_t, 4> carry_bins{};
+        std::uint64_t carry_bins_max = 0;
+        std::uint64_t repend_skipped = 0;
     };
     const SwitchCounts& switch_counts() const noexcept { return switches_; }
     // The windows evaluated since start (each once, the cache) and how many had the N rule drop bins, cut the newest bin
@@ -565,6 +572,21 @@ public:
     // The re-pended receipts still pending (at most the pending cap): each leaves at its placement, its seal, its
     // eviction or an adoption (the joiner path).
     std::size_t repend_watch_size() const noexcept { return repend_watch_.size(); }
+    // The admitted receipt bodies by (tip, P_r) while their origin bin is open at the best tip: the keys held, the keys
+    // that saw two distinct R, the least and greatest R seen; the carried bodies whose payee is not their carrier's
+    // payee, counted at the carrier's first placement (logs only; none noted while the state rests on claims).
+    struct AmountCounts {
+        std::uint64_t keys = 0;
+        std::uint64_t multi_fee = 0;
+        std::uint64_t r_min = 0;
+        std::uint64_t r_max = 0;
+        std::uint64_t foreign_carried = 0;
+    };
+    AmountCounts amount_counts() const noexcept {
+        AmountCounts c = amount_counts_;
+        c.keys = amounts_.size();
+        return c;
+    }
     // Own carriers placed on the best chain since start, and those orphaned (no longer best at their position). Each
     // is watched until it is below the journal base (confirmed) or orphaned, a joiner switch included: at most J
     // positions; the watch starts empty at every start.
@@ -910,6 +932,7 @@ public:
         std::uint64_t omitted = 0;
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        Hash32 object{};  // a STRIKE or REFUSE: the id of the body it names (logs only)
     };
     std::vector<DrainedResult> take_drained() { return std::exchange(drained_, {}); }
     // The receipts the switches by the journal put back into the pending set (E11), in re-pend order, since the last
@@ -1108,7 +1131,23 @@ public:
         if (poisoned_) return node_internal();
         if (t.generation != generation_ && admitted(t.admit))
             t.admit = admit_frame_from(env(), t.peer, t.frame, CarrierRole::Frame);
-        return settle_carrier(t.peer, t.frame, t.admit, t.relayed, t.solicited);
+        NodeEventResult out = settle_carrier(t.peer, t.frame, t.admit, t.relayed, t.solicited);
+        if (names_object(out.admit.verdict)) {  // the body the verdict names (logs only)
+            CarrierBodyV3 c;
+            if (out.admit.id != Hash32{})
+                out.object = out.admit.id;
+            else if (t.frame.size() > kFrameHeaderBytes
+                     && decode_carrier_body_v3(t.frame.data() + kFrameHeaderBytes, t.frame.size() - kFrameHeaderBytes,
+                                               CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c)
+                                == WireError::None)
+                out.object = out.admit.body == 0 ? receipt_id(c.own)
+                             : out.admit.body <= c.carried.size() ? receipt_id(c.carried[out.admit.body - 1])
+                                                                  : Hash32{};
+        }
+        return out;
+    }
+    static bool names_object(AdmitVerdict v) noexcept {
+        return v == AdmitVerdict::Strike || v == AdmitVerdict::Refuse || v == AdmitVerdict::Ban;
     }
 
     NodeEventResult on_carrier(std::uint64_t peer, std::span<const std::uint8_t> frame) {
@@ -1468,6 +1507,7 @@ public:
     // join attempt runs (it reads A).
     struct PruneReport {
         PruneFloors floors;
+        bool floors_set = false;   // the floors computed (none while poisoned, after a load failure, during an attempt)
         std::uint64_t root = 0;    // the tree's lowest position after the step
         std::uint64_t first = 0;   // the store's first record after the step
         bool written = false;      // the prune batch committed
@@ -1496,6 +1536,7 @@ public:
         out.first = store_->first_record_pos();
         if (poisoned_ || load_failed_ || attempting_) return out;
         out.floors = prune_floors(now_s);
+        out.floors_set = true;
         const std::uint64_t held_first = std::max(out.first, head_.first_pos);
         const std::uint64_t root = std::max(out.floors.bodies, out.root);
         const std::uint64_t first = std::min(std::max(out.floors.records, held_first), root);
@@ -2724,6 +2765,7 @@ private:
         own_prefix_.clear();
         pending_ = PendingSet(cfg_.pending_cap ? cfg_.pending_cap : relay_horizons(cfg_.p).pending_cap);
         repend_watch_.clear();  // the re-pended receipts left with the pending set
+        amounts_.clear();
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
         for (auto& [p, r] : header_req_) {  // still in flight: retired (their replies DROP; no new request before them)
             r.retired = true;
@@ -2892,6 +2934,7 @@ private:
             const CarrierNode* t = tree_->find(r.side.tip);
             PendingReceipt pr{out.admit.id, r, out.admit.store_placements.empty() ? 0 : out.admit.store_placements[0].bin,
                               t ? t->pos : 0, 0};
+            note_amount(r, pr.h);
             if (!pending_.add(std::move(pr))) {  // evicted at once (P-09): not held, not relayed
                 out.action = NodeAction::None;
                 return out;
@@ -2904,7 +2947,28 @@ private:
             return out;
         }
         out.action = out.admit.verdict == AdmitVerdict::Defer ? NodeAction::Parked : NodeAction::Verdict;
+        if (names_object(out.admit.verdict)) {  // the body the verdict names (logs only)
+            ReceiptBodyV3 r;
+            if (out.admit.id != Hash32{})
+                out.object = out.admit.id;
+            else if (decode_receipt_body_v3(body.data(), body.size(), ReceiptLimits{cfg_.buffers.receipt}, r) == WireError::None)
+                out.object = receipt_id(r);
+        }
         return out;
+    }
+
+    // An admitted receipt body's R under its (tip, P_r) while its origin bin h is open (logs only).
+    void note_amount(const ReceiptBodyV3& r, std::uint64_t h) {
+        if (rests_on_claims()) return;
+        const std::uint64_t R = r.reward_total;
+        const auto [it, fresh] = amounts_.try_emplace(std::make_pair(r.side.tip, r.blob.prev_id), AmountKey{h, R, false});
+        if (!fresh && !it->second.multi && it->second.first != R) {
+            it->second.multi = true;
+            ++amount_counts_.multi_fee;
+        }
+        amount_counts_.r_min = amount_seen_ ? std::min(amount_counts_.r_min, R) : R;
+        amount_counts_.r_max = amount_seen_ ? std::max(amount_counts_.r_max, R) : R;
+        amount_seen_ = true;
     }
 
     // ---- E7: the placement and what follows it ----
@@ -2939,7 +3003,7 @@ private:
                     const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
                     const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
                     drained_.push_back(DrainedResult{f.peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended,
-                                                     r.lost});
+                                                     r.lost, r.object});
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)
@@ -2971,6 +3035,11 @@ private:
         }
         for (const ReceiptBodyV3& b : r.carrier->carried) learn_refs(b);
         learn_refs(r.carrier->own);
+        if (r.store_placements.size() == r.carrier->carried.size() + 1) {  // the carried list, then the own body
+            for (std::size_t k = 0; k < r.carrier->carried.size(); ++k)
+                note_amount(r.carrier->carried[k], r.store_placements[k].bin);
+            note_amount(r.carrier->own, r.store_placements.back().bin);
+        }
         // a peer's carrier's omissions at its parent, counted at its first placement (a copy of a placed carrier: none)
         const std::uint64_t omitted = peer != kOwnPeer && tree_->find(r.id) == nullptr ? omissions_of(r) : 0;
         NodeStore ns{*store_, faults_};
@@ -3019,6 +3088,7 @@ private:
                     switches_.last_lost = sr.lost;
                     switches_.repended += sr.repended;
                     switches_.lost += sr.lost;
+                    switches_.repend_skipped += sr.skipped;
                 }
                 out.action = sr.joiner ? NodeAction::JoinerPath
                                        : (sr.internal ? NodeAction::NodeInternal : NodeAction::Switched);
@@ -3028,6 +3098,9 @@ private:
                 break;
             }
         }
+        if (!rests_on_claims())  // the carried bodies of other payees, at the carrier's first placement (logs only)
+            for (const ReceiptBodyV3& b : r.carrier->carried)
+                if (b.side.payee != r.carrier->own.side.payee) ++amount_counts_.foreign_carried;
         headers_->placed(r.id);
         deferred_.purge(r.id);
         if ((relayed || peer == kOwnPeer) && !rests_on_claims())
@@ -3094,18 +3167,41 @@ private:
         pending_.erase_if([&](const PendingReceipt& r) {
             const bool placed = v.placed_open(r.id);
             const bool gone = placed || !open_at(H, r.h, cfg_.p.open_bins);
-            if (gone && repend_watch_.erase(r.id) != 0) ++(placed ? switches_.carried : switches_.sealed_pending);
+            if (const auto wt = gone ? repend_watch_.find(r.id) : repend_watch_.end(); wt != repend_watch_.end()) {
+                ++(placed ? switches_.carried : switches_.sealed_pending);
+                if (placed) count_carry_bins(v, r, wt->second);
+                repend_watch_.erase(wt);
+            }
             return gone;
         });
         for (auto it = repend_watch_.begin(); it != repend_watch_.end();) {  // evicted from the pending set meanwhile
-            if (pending_.holds(*it)) {
+            if (pending_.holds(it->first)) {
                 ++it;
                 continue;
             }
             ++switches_.evicted;
             it = repend_watch_.erase(it);
         }
+        for (auto it = amounts_.begin(); it != amounts_.end();)  // the keys whose origin bin sealed at the best tip
+            it = open_at(H, it->second.bin, cfg_.p.open_bins) ? std::next(it) : amounts_.erase(it);
         watch_own_carriers();
+    }
+
+    // A watched re-pended receipt carried on the best chain: H(q) - H_s, q its placing position (the tip's position if
+    // its placement is not found: an upper bound), H_s the record at the new tip at its switch (logs only).
+    void count_carry_bins(const LaneView& v, const PendingReceipt& r, std::uint64_t H_s) {
+        std::uint64_t q = v.pos();
+        for (const Placement* e : v.entries(r.h, v.pos()))
+            if (e->id == r.id) {
+                q = e->q;
+                break;
+            }
+        if (q < store_->first_record_pos()) q = v.pos();  // a record the store holds (the view throws below it)
+        const std::uint64_t Hq = v.record(q);
+        const std::uint64_t bins = Hq > H_s ? Hq - H_s : 0;
+        const std::size_t last = switches_.carry_bins.size() - 1;
+        ++switches_.carry_bins[bins < last ? static_cast<std::size_t>(bins) : last];
+        switches_.carry_bins_max = std::max(switches_.carry_bins_max, bins);
     }
 
     // Each watched own carrier: orphaned when the best chain no longer holds it at its position; confirmed (no longer
@@ -3171,6 +3267,7 @@ private:
         bool internal = false;  // a store write failed: poisoned
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        std::uint64_t skipped = 0;  // not re-pended: P_r not held, or evicted at once (logs only)
     };
 
     SwitchResult switch_to_best(std::uint64_t peer) {
@@ -3243,7 +3340,10 @@ private:
                 const Hash32 rid = receipt_id(r);
                 if (nv.placed_open(rid) || pending_.holds(rid)) continue;
                 const PrInfo pr = io_.resolve_pr ? io_.resolve_pr(r.blob.prev_id) : PrInfo{};
-                if (pr.status != PrInfo::Status::Held) continue;
+                if (pr.status != PrInfo::Status::Held) {
+                    ++out.skipped;
+                    continue;
+                }
                 const std::uint64_t h_r = pr.height + 1;
                 if (!open_at(H_new, h_r, cfg_.p.open_bins)) {
                     ++out.lost;  // its origin bin is sealed on the new branch: lost
@@ -3254,7 +3354,9 @@ private:
                 if (pending_.add(PendingReceipt{rid, r, h_r, t ? t->pos : 0, 0})) {
                     ++out.repended;
                     repended_out_.push_back(rid);  // relayed as FB_RECEIPTS v3 (take_repended)
-                    repend_watch_.insert(rid);
+                    repend_watch_[rid] = H_new;
+                } else {
+                    ++out.skipped;
                 }
             }
         }
@@ -3365,7 +3467,16 @@ private:
     std::vector<PlacedRelease> placed_released_;  // unsolicited released carriers placed by a drain (P-15)
     std::vector<DrainedResult> drained_;          // the outcomes of the drained and walk-bound carriers (take_drained)
     std::vector<Hash32> repended_out_;  // re-pended by a switch, not yet taken for the relay (take_repended)
-    std::set<Hash32> repend_watch_;     // re-pended by a switch and still pending (at most the pending cap)
+    std::map<Hash32, std::uint64_t> repend_watch_;  // re-pended by a switch and still pending (at most the pending cap)
+                                                    // -> the record at the new tip at that switch
+    struct AmountKey {
+        std::uint64_t bin = 0;  // the origin bin
+        std::uint64_t first = 0;
+        bool multi = false;     // a second distinct R seen
+    };
+    std::map<std::pair<Hash32, Hash32>, AmountKey> amounts_;  // (tip, P_r) -> its admitted R (logs only)
+    AmountCounts amount_counts_;
+    bool amount_seen_ = false;
     std::map<Hash32, std::uint64_t> own_watch_;  // own carriers on the best chain at or above the journal base -> pos
     std::uint64_t own_carriers_ = 0;
     std::uint64_t own_orphaned_ = 0;
