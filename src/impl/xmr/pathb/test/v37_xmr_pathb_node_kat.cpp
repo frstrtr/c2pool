@@ -8102,8 +8102,8 @@ void sealall() {
                   std::to_string(sealed) + ")");
 }
 
-// placedcopy: a copy of a carrier B placed, whose parent lies below B's journal base (depth 16), arrives: DEFER R4
-// (OwnChainDeep), counted, no token; it is not parked (the deferred store unchanged).
+// placedcopy: a byte-identical copy of a carrier B placed, whose parent lies below B's journal base (depth 16), arrives:
+// DEFER R4 (OwnChainDeep), counted, no token; it is not parked (the deferred store unchanged).
 void placedcopy() {
     const KatNet net;
     Harness h(net);
@@ -8139,6 +8139,81 @@ void placedcopy() {
     check(r4() == r4_0 + 1 && held0 == 0 && h[b.node].deferred().size() == 0 && rb.stats().strikes.load() == 0
                   && rb.stats().bans.load() == 0,
           "placedcopy: a copy of a placed carrier below the journal base: DEFER R4 counted, not parked, no token");
+}
+
+// placedvariant: B follows A. c, A's carrier on T with P_r S0, carries nothing; r is A's receipt on T with P_r S1. With S0
+// held at B without its weights, a byte-identical copy of c DEFERs at R5 and is not parked. With S1 held without its
+// weights, a copy of c with c's own body and the carried list {r} (other bytes, the same id) DEFERs at R19
+// (MoneroBlock) and is parked; once S1's weights are held it runs again and is judged: STRIKE at R11 (the fold), one
+// token, nothing left parked.
+void placedvariant() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights, noseed;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 49000 + static_cast<std::uint32_t>(i));
+    }
+    h.tick_monero();
+    const std::optional<pb::PathbJob> jc = h.job(a.node, 1, 49100);  // c: on T, P_r S0
+    h.tick_monero();
+    const std::optional<pb::PathbJob> jr = h.job(a.node, 2, 49101);  // r: on T, P_r S1
+    ok = ok && jc && jr && jc->body.side.tip == jr->body.side.tip && jc->body.blob.prev_id != jr->body.blob.prev_id;
+    ok = ok && h[a.node].on_own_share(*jc, 49100, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    const pb::Hash32 c = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().id == c && h[b.node].bodies().get(c) != nullptr;
+    if (!ok) {
+        check(false, "placedvariant: setup (B on A's chain at c; r on c's parent with a later P_r)");
+        return;
+    }
+    const pb::Hash32 S0 = jc->body.blob.prev_id, S1 = jr->body.blob.prev_id;
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = w.id(b.node, a.node);
+    const auto vc = [&rb](pb::RowId row, pb::AdmitVerdict x) {
+        return rb.verdict_counts()[static_cast<std::size_t>(row)][static_cast<std::size_t>(x)];
+    };
+    // the byte-identical copy
+    noweights.insert(S0);
+    const std::uint64_t d5 = vc(pb::RowId::R5, pb::AdmitVerdict::Defer);
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(c), 16));
+    w.run();
+    const bool deferred5 = vc(pb::RowId::R5, pb::AdmitVerdict::Defer) == d5 + 1;
+    const std::size_t parked_same = h[b.node].deferred().size();
+    noweights.erase(S0);
+    // the copy with another carried list
+    pb::CarrierBodyV3 v = *h[a.node].bodies().get(c);
+    pb::ReceiptBodyV3 r = jr->body;
+    r.blob.nonce = 49101;
+    v.carried = {r};
+    noweights.insert(S1);
+    const std::uint64_t d19 = vc(pb::RowId::R19, pb::AdmitVerdict::Defer), s11 = vc(pb::RowId::R11, pb::AdmitVerdict::Strike);
+    const std::uint64_t st0 = rb.strikes_of(pa);
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fc_carrier(0, v, 16));
+    w.run();
+    const bool deferred19 = vc(pb::RowId::R19, pb::AdmitVerdict::Defer) == d19 + 1;
+    const std::size_t parked = h[b.node].deferred().size();
+    noweights.erase(S1);
+    rb.on_monero_tip();
+    w.run();
+    const bool struck = vc(pb::RowId::R11, pb::AdmitVerdict::Strike) == s11 + 1 && rb.strikes_of(pa) == st0 + 1;
+    const std::size_t left = h[b.node].deferred().size();
+    std::printf("  placedvariant: the byte-identical copy: R5 DEFER %d, parked %zu; the variant: R19 DEFER %d, parked %zu, "
+                "then STRIKE at R11 %d, parked %zu; bans %llu\n",
+                deferred5 ? 1 : 0, parked_same, deferred19 ? 1 : 0, parked, struck ? 1 : 0, left,
+                (unsigned long long)rb.stats().bans.load());
+    check(deferred5 && parked_same == 0, "placedvariant: a byte-identical copy of c that DEFERs (R5) is not parked");
+    check(deferred19 && parked == 1, "placedvariant: a copy of c with another carried list DEFERs at R19 and is parked");
+    check(struck && left == 0 && rb.stats().bans.load() == 0,
+          "placedvariant: once S1's weights are held it runs again: STRIKE at R11, nothing parked; no ban");
 }
 
 // ---------------------------------------------------------------------------
@@ -9654,6 +9729,7 @@ int main(int argc, char** argv) {
     run("pwalkdup", pwalkdup);
     run("sealall", sealall);
     run("placedcopy", placedcopy);
+    run("placedvariant", placedvariant);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }

@@ -3080,6 +3080,7 @@ private:
                 f.parent = c.own.side.tip;
             }
         }
+        if (placed_copy(f.id, frame)) return;  // a byte-identical copy of a placed carrier: not parked
         const bool stored = deferred_.park(*tree_, std::move(f));
         // FC_GETCARRIER(parent) for a frame parked now (a copy held already asks nothing), whose parent is neither held,
         // nor parked, nor asked within P-53
@@ -3091,6 +3092,17 @@ private:
             ++parent_asks_;
             send(peer, *encode_fc_getcarrier(q, cfg_.p));
         }
+    }
+
+    // A copy of a carrier the tree holds whose body bytes are those of its stored body (a copy with other bytes, such as
+    // another carried list, is parked and judged as any frame).
+    bool placed_copy(const Hash32& id, const std::vector<std::uint8_t>& frame) const {
+        if (frame.size() <= kFrameHeaderBytes || tree_->find(id) == nullptr) return false;
+        const CarrierBodyV3* c = bodies_->get(id);
+        if (c == nullptr) return false;
+        const std::optional<std::vector<std::uint8_t>> held = carrier_frame(*c, cfg_.p.r_max);
+        return held && held->size() == frame.size()
+               && std::equal(frame.begin() + kFrameHeaderBytes, frame.end(), held->begin() + kFrameHeaderBytes);
     }
 
     // The parent ask of a ParentUnknown DEFER is due: `id` is not held, not parked (a frame of it waiting on its own

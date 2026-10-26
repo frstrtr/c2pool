@@ -1669,8 +1669,7 @@ inline WriteResult place_admitted(CarrierTree& tree, Store& store, ActivationRec
 //   DEFERred on an unknown parent is a waiting entry (id, claimed parent) of
 //   the tree as well; a key holds the digests of every frame stored under it.
 //   Frames parked by a non-retrying DEFER (the boundary, the closure, EP-4
-//   (iii), node-internal, OwnChainDeep) are in the same store and cap. A
-//   copy of a carrier the tree holds is not stored, whatever its cause.
+//   (iii), node-internal, OwnChainDeep) are in the same store and cap.
 //   Over the cap: the oldest frame of the peer holding the most frames is
 //   dropped (DROP, no verdict, no token); the tree's entry is removed
 //   (unwait) only when the last frame under its key leaves.
@@ -1746,13 +1745,12 @@ public:
 
     // Parks a DEFERred frame (by its digest). ParentUnknown: the waiting entry
     // (id, claimed parent) is registered in the tree. Returns false when the
-    // digest is held already or the carrier is placed already (any cause: a
-    // copy of a placed carrier is not stored).
+    // digest is held already.
     bool park(CarrierTree& tree, ParkedFrame f) {
         if (frames_.count(f.digest) != 0) return false;
-        if (tree.find(f.id) != nullptr) return false;  // placed already
         f.seq = ++seq_;
         if (f.cause == Missing::ParentUnknown) {
+            if (tree.find(f.id) != nullptr) return false;  // placed already
             const PlaceVerdict v = tree.place(CarrierAnnounce{f.id, f.parent, 0, Hash32{}, 0}, {}).verdict;
             if (v != PlaceVerdict::Deferred && v != PlaceVerdict::Duplicate) return false;
             keys_[WaitKey{f.id, f.parent}].insert(f.digest);
