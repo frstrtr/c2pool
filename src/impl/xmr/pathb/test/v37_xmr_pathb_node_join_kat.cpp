@@ -73,6 +73,8 @@
 //              the joiner, the attempt is adopted: caught up, templates;
 //   joinrx     a RandomX failure in a join attempt: NodeInternal, an alarm,
 //              no token, the pair kept; the next attempt joins;
+//   joinnohash the same through the binary's verify (no hash computed);
+//              a hash computed not meeting d: Header, the server excluded;
 //   keycache   --pathb-key-cache-mb reaches a joined state's key cache;
 //   sidekeep   a server's side branch across a restart (K_PSIDE): moved at
 //              the switch, reloaded under its parents, walked by a joiner
@@ -2502,6 +2504,60 @@ void joinrx() {
                   (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string(": no attempt")));
 }
 
+// ---------------------------------------------------------------------------
+// joinnohash: joinrx through the binary's verify (verify_rx_at_d). RandomX computes no hash on a header of the
+// server's chain inside a join attempt: NodeInternal with its reason, no token, the pair kept; the next attempt joins.
+// A hash computed that does not meet d on that header: the attempt ends Header, the server excluded, no token.
+void joinnohash() {
+    for (const bool low : {false, true}) {
+        JoinNet net(900);
+        const std::uint64_t L = 4704;
+        KatNode a(net, kJ);
+        grow(a, L);
+        Harness h(net);
+        const std::size_t s = h.nodes.size();
+        h.nodes.push_back(server_from(h, a, kJ, s));
+        Joining jn = joining_node(h, net, kJ);
+        h.hello(jn.j, s);
+        const std::size_t queued = h[jn.j].joiner().queue().size();
+        const pb::Hash32 cL = at_pos(a, L);
+        (low ? h.low_pow : h.nohash_pow).insert(cL);
+        std::string esc;
+        pb::JoinStep st1;
+        try {
+            st1 = h[jn.j].run_join();
+        } catch (const std::exception& e) {
+            esc = e.what();
+        }
+        h.q.clear();
+        const std::size_t after = h[jn.j].joiner().queue().size();
+        const std::string desc = (st1.report ? std::string(": ") + rep_desc(*st1.report) : std::string(": no attempt")) +
+                                 (esc.empty() ? "" : "; escaped: " + esc);
+        if (!low) {
+            const bool ended =
+                    st1.report && st1.report->end == pb::AttemptEnd::NodeInternal && st1.report->strike == 0
+                    && st1.report->server == s && st1.report->alarms >= 1
+                    && st1.report->what.find("RandomX computed no hash: kat: the seed cache could not be built")
+                               != std::string::npos;
+            check(esc.empty() && h.nohash_calls == 1 && ended && !st1.switched && after == queued && queued > 0
+                          && !h[jn.j].attempting() && h[jn.j].joined() == nullptr,
+                  "joinnohash: RandomX computed no hash in the attempt: NodeInternal with its reason, 0 tokens; the "
+                  "pair still queued (" + std::to_string(after) + " of " + std::to_string(queued) + ")" + desc);
+            const pb::JoinStep st2 = h[jn.j].run_join();
+            h.q.clear();
+            check(st2.report && st2.report->end == pb::AttemptEnd::Completed && st2.switched
+                          && h[jn.j].tree().best().id == cL,
+                  "joinnohash: the next attempt of the same pair joins at L" +
+                          (st2.report ? std::string(": ") + rep_desc(*st2.report) : std::string(": no attempt")));
+        } else {
+            check(esc.empty() && h.nohash_calls == 0 && st1.report && st1.report->end == pb::AttemptEnd::Header
+                          && st1.report->strike == 0 && !st1.switched && after == 0 && h[jn.j].joined() == nullptr,
+                  "joinnohash: a hash computed not meeting d on that header: the attempt ends Header, the server "
+                  "excluded (" + std::to_string(after) + " pairs left), 0 tokens" + desc);
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // keycache: --pathb-key-cache-mb reaches the joined state's key cache (the cache a joined node builds templates and
@@ -2825,6 +2881,7 @@ int main(int argc, char** argv) {
                                 {"joinedstall", joinedstall, 60},
                                 {"joinedfresh", joinedfresh, 60},
                                 {"joinrx", joinrx, 27},
+                                {"joinnohash", joinnohash, 45},
                                 {"keycache", keycache, 17},
                                 {"sidekeep", sidekeep, 1},
                                 {"sidedeep", sidedeep, 40},

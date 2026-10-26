@@ -15,9 +15,14 @@
 //                tip; Sum(vout) == B(P_r) + F (C48, no penalty);
 //   race         a sibling race: the losing node switches and re-pends its own
 //                receipt; the next carriers carry it (no uncles; credited at
-//                its origin bin);
+//                its origin bin), 1 bin after the switch (carry-bins);
+//   racelate     the same, carried 3 bins after the switch (the 3+ bucket);
+//   raceskip     the loser's P_r not held at its switch: repend-skipped 1;
 //   carriage     17 carriable pending receipts: the first 16 in the canonical
-//                order; a carriable receipt is carried by default (R2);
+//                order; a carriable receipt is carried by default (R2); the 16
+//                carried receipts of other payees counted foreign-carried;
+//   feediverse   receipts on one (tip, P_r) with one R: no multi-fee key; with
+//                two template fees: one, r-min < r-max; pruned at the seal;
 //   repend       a switch by the journal re-pends the abandoned placements
 //                whose bin is open on the new branch, without a second hash;
 //                one whose bin sealed on the new branch is lost (C49);
@@ -164,7 +169,8 @@
 //   blockblob    the block blob of a Path B job (PathbJobSource, a window of
 //                three payees) pinned byte for byte: no transactions, 12
 //                transactions, a set filled to within one candidate of the
-//                weight cap, and a job carrying 16 receipts;
+//                weight cap, and a job carrying 16 receipts; each issued job
+//                holds its window's N(B), f_spend, B and Z;
 //   relaystale   a gone peer's events (in flight, posted by its blocked
 //                reader) skipped: no join hold for the gone peer;
 //   relaytip     on_monero_tip from the follower's thread and under the node
@@ -174,6 +180,12 @@
 //   revrx_drain  RandomX throws on a released child's first hash inside its
 //                parent's completion: caught, the child parked and placed;
 //   relayrxhdr   RandomX throws on a catch-up header: no token, asked again;
+//   hdrnohash    the binary's verify computes no hash on a header:
+//                RandomxFailure, no BAN, not memoised; asked again: placed;
+//                a hash computed not meeting d: BAN (S1.3 #11);
+//   relayrxnohash the same through the relay, on a catch-up header and on a
+//                relayed carrier: no token, no ban, the reason logged, asked
+//                again or run again; a hash not meeting d: BAN;
 //   relayrxtype  a std::logic_error inside an admission leaves the call (not
 //                a RandomX failure);
 //   relaystalem  manual mode: a queued event of a gone peer skipped;
@@ -191,6 +203,10 @@
 //   relayp15once P-15 counts a frame once, at its first placement: a
 //                carrier placed in its parent's drain, one that waited for its
 //                DoS token, one placed on its re-run (a duplicate: none);
+//   relayverdictlog a receipt struck (R16) or refused (R21, its bin sealed):
+//                one STRIKE / REFUSE line naming the row and its id;
+//   relayparkstrike a parked carrier released by its parent's placement and
+//                struck (R28): its STRIKE line as a received frame's;
 //   repevict     a re-pended receipt evicted by P-09 while watched: counted
 //                evicted, the watch empty;
 //   openstate    the open state at the best tip: its placements and
@@ -354,6 +370,9 @@ struct PathbNodeTestAccess {
     }
     static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
     static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
+    static bool amount_held(const PathbNode& n, const Hash32& tip, const Hash32& p_r) {
+        return n.amounts_.count(std::make_pair(tip, p_r)) != 0;
+    }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -455,6 +474,88 @@ void race() {
           "race: the losing node counts its re-pended receipt carried (" +
                   std::to_string(h[lnode].switch_counts().carried) + ") and watches none (" +
                   std::to_string(h[lnode].repend_watch_size()) + ")");
+    // one Monero height between the switch and the carry: H(q) - H_s = 1
+    const pb::PathbNode::SwitchCounts& sc = h[lnode].switch_counts();
+    check(sc.carry_bins[0] == 0 && sc.carry_bins[1] == sc.carried && sc.carry_bins[2] == 0 && sc.carry_bins[3] == 0
+                  && sc.carry_bins_max == 1 && sc.repend_skipped == 0,
+          "race: the carried receipt counted 1 bin after the switch (carry-bins " + std::to_string(sc.carry_bins[0]) + "/" +
+                  std::to_string(sc.carry_bins[1]) + "/" + std::to_string(sc.carry_bins[2]) + "/" +
+                  std::to_string(sc.carry_bins[3]) + ", max " + std::to_string(sc.carry_bins_max) + ", skipped " +
+                  std::to_string(sc.repend_skipped) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// racelate: the race of `race`, then the winner's next carrier at 2 Monero heights after the switch (it does not
+// hold the losing receipt) and the losing node's carrier one height later carries it: H(q) - H_s = 3, the 3+ bucket.
+void racelate() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + i);
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.mine(a, 2, 900);
+    h.mine(b, 3, 901);
+    const pb::Hash32 ca = h[a].tree().best().id, cb = h[b].tree().best().id;
+    h.cut.clear();
+    (void)h[a].on_carrier(b, *pb::encode_fc_carrier(0, *h[b].bodies().get(cb), 16));
+    (void)h[b].on_carrier(a, *pb::encode_fc_carrier(0, *h[a].bodies().get(ca), 16));
+    h.pump();
+    const pb::Hash32 loser = ca < cb ? cb : ca;
+    const std::size_t lnode = ca < cb ? b : a, wnode = ca < cb ? a : b;
+    const std::optional<std::uint64_t> H_s = h[lnode].best_record();
+    const bool watched = h[lnode].pending().holds(loser) && h[lnode].repend_watch_size() == 1;
+    h.tick_monero(2);
+    const pb::NodeEventResult rw = h.mine(wnode, 4, 902);
+    const bool not_carried = h[lnode].pending().holds(loser) && h[lnode].switch_counts().carried == 0;
+    h.tick_monero();
+    const pb::NodeEventResult rl = h.mine(lnode, 4, 903);
+    const pb::LaneView v = h[wnode].store().view_at(h[wnode].tree().best().id);
+    const std::optional<std::uint64_t> H_q = h[lnode].best_record();
+    const pb::PathbNode::SwitchCounts& sc = h[lnode].switch_counts();
+    check(watched && rw.action == pb::NodeAction::Placed && not_carried && rl.action == pb::NodeAction::Placed && v.ok()
+                  && v.placed_open(loser) && H_s && H_q && *H_q == *H_s + 3,
+          "racelate: the winner's carrier 2 heights after the switch leaves the losing receipt pending; the loser's next "
+          "carries it (H_s " + std::to_string(H_s.value_or(0)) + ", H(q) " + std::to_string(H_q.value_or(0)) + ")");
+    check(sc.carried == 1 && sc.carry_bins[0] == 0 && sc.carry_bins[1] == 0 && sc.carry_bins[2] == 0 && sc.carry_bins[3] == 1
+                  && sc.carry_bins_max == 3,
+          "racelate: carried 3 bins after the switch: the 3+ bucket (carry-bins " + std::to_string(sc.carry_bins[0]) + "/" +
+                  std::to_string(sc.carry_bins[1]) + "/" + std::to_string(sc.carry_bins[2]) + "/" +
+                  std::to_string(sc.carry_bins[3]) + ", max " + std::to_string(sc.carry_bins_max) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// raceskip: a sibling race on two Monero heights (each sibling on its own P_r); the losing sibling's P_r is no longer
+// held when the loser switches (BadServed): the re-pend step skips its receipt: repend-skipped 1, re-pended 0, lost 0.
+void raceskip() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 10 + i);
+    }
+    h.cut = {{a, b}, {b, a}};
+    h.mine(a, 2, 900);
+    h.tick_monero();
+    h.mine(b, 3, 901);
+    const pb::Hash32 ca = h[a].tree().best().id, cb = h[b].tree().best().id;
+    h.cut.clear();
+    const std::size_t lnode = ca < cb ? b : a, wnode = ca < cb ? a : b;
+    const pb::Hash32 loser = ca < cb ? cb : ca, winner = ca < cb ? ca : cb;
+    const pb::Hash32 pr_loser = h[lnode].bodies().get(loser)->own.blob.prev_id;
+    const pb::Hash32 pr_winner = h[wnode].bodies().get(winner)->own.blob.prev_id;
+    h.bad_served.insert(pr_loser);
+    const pb::NodeEventResult sw = h[lnode].on_carrier(wnode, *pb::encode_fc_carrier(0, *h[wnode].bodies().get(winner), 16));
+    const pb::PathbNode::SwitchCounts& sc = h[lnode].switch_counts();
+    check(pr_loser != pr_winner && sw.action == pb::NodeAction::Switched && h[lnode].tree().best().id == winner,
+          "raceskip: the siblings on two P_r; the loser switches to the winner");
+    check(sc.repend_skipped == 1 && sc.repended == 0 && sc.lost == 0 && !h[lnode].pending().holds(loser),
+          "raceskip: the losing receipt whose P_r is not held is skipped (repend-skipped " +
+                  std::to_string(sc.repend_skipped) + ", re-pended " + std::to_string(sc.repended) + ", lost " +
+                  std::to_string(sc.lost) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -486,10 +587,85 @@ void carriage() {
     bool first16 = order;
     for (std::size_t k = 0; first16 && k < 16; ++k) first16 = pb::receipt_id(j->carried[k]) == all[k].second;
     check(order && first16, "carriage: 17 carriable -> the first 16 in the canonical order");
+    const std::uint64_t foreign0 = h[a].amount_counts().foreign_carried;
     h[a].on_own_share(*j, 31, pb::Hash32{});
+    check(foreign0 == 0 && h[a].amount_counts().foreign_carried == 16,
+          "carriage: the 16 carried receipts of other payees counted foreign-carried (" +
+                  std::to_string(h[a].amount_counts().foreign_carried) + ")");
     const std::optional<pb::PathbJob> j2 = h.job(a, 1, 32);
     check(j2 && j2->carried.size() == 1 && pb::receipt_id(j2->carried[0]) == all[16].second,
           "carriage: the remaining carriable receipt is carried by the next job (no omission)");
+}
+
+// ---------------------------------------------------------------------------
+// feediverse: receipts on one (tip, P_r) admitted with their own R. Two shares of one R on one tip: no multi-fee key;
+// two shares with different template fees on one tip: B admits both, one multi-fee key, r-min < r-max; once their
+// origin bin seals at B's best tip the key is pruned.
+pb::Hash32 share_id(const pb::PathbJob& j, std::uint32_t nonce) {
+    pb::ReceiptBodyV3 r = j.body;
+    r.blob.nonce = nonce;
+    return pb::receipt_id(r);
+}
+void feediverse() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net));
+    for (int i = 0; i < 3; ++i) {
+        h.tick_monero();
+        h.mine(a, 1, 20 + i);
+    }
+    // one R twice on one tip (the carrier that moves the tip on it too)
+    h.txs.clear();
+    const pb::Hash32 t1 = h[a].tree().best().id;
+    const std::optional<pb::PathbJob> s1 = h.job(a, 2, 700), s2 = h.job(a, 3, 701);
+    h.mine(a, 1, 702);
+    const bool p1 = s1 && h[a].on_own_share(*s1, 700, pb::Hash32{}).action == pb::NodeAction::Pending;
+    const bool p2 = s2 && h[a].on_own_share(*s2, 701, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.pump();
+    const pb::PathbNode::AmountCounts c1 = h[b].amount_counts();
+    check(p1 && p2 && h[b].pending().holds(share_id(*s1, 700)) && h[b].pending().holds(share_id(*s2, 701))
+                  && s1->body.reward_total == s2->body.reward_total && c1.multi_fee == 0 && c1.keys >= 1
+                  && pb::PathbNodeTestAccess::amount_held(h[b], t1, s1->body.blob.prev_id),
+          "feediverse: two receipts of one R on one tip admitted by B: no multi-fee key (multi-fee " +
+                  std::to_string(c1.multi_fee) + ", keys " + std::to_string(c1.keys) + ")");
+    // two template fees on one tip
+    const pb::Hash32 t2 = h[a].tree().best().id;
+    h.txs = {{seq32(0xE1), 2000, 3000000}};
+    const std::optional<pb::PathbJob> f1 = h.job(a, 4, 710);
+    h.txs = {{seq32(0xE2), 1500, 7000000}};
+    const std::optional<pb::PathbJob> f2 = h.job(a, 5, 711);
+    h.txs.clear();
+    h.mine(a, 1, 712);
+    const bool q1 = f1 && h[a].on_own_share(*f1, 710, pb::Hash32{}).action == pb::NodeAction::Pending;
+    const bool q2 = f2 && h[a].on_own_share(*f2, 711, pb::Hash32{}).action == pb::NodeAction::Pending;
+    h.pump();
+    const pb::PathbNode::AmountCounts c2 = h[b].amount_counts();
+    const std::uint64_t R1 = f1 ? f1->body.reward_total : 0, R2 = f2 ? f2->body.reward_total : 0;
+    check(q1 && q2 && f1->tip == t2 && f2->tip == t2 && f1->body.blob.prev_id == f2->body.blob.prev_id
+                  && R2 == R1 + 4000000 && h[b].pending().holds(share_id(*f1, 710)) && h[b].pending().holds(share_id(*f2, 711))
+                  && c2.multi_fee == 1 && c2.r_min < c2.r_max && c2.r_min == s1->body.reward_total && c2.r_max == R2,
+          "feediverse: two template fees on one tip (R " + std::to_string(R1) + ", " + std::to_string(R2) +
+                  ") admitted by B with their own R: one multi-fee key (" + std::to_string(c2.multi_fee) + "), r-min " +
+                  std::to_string(c2.r_min) + " < r-max " + std::to_string(c2.r_max));
+    // the chain moves past their origin bin: the key is pruned at B
+    const std::optional<std::uint64_t> origin = f1 ? h[b].receipt_origin(f1->body) : std::nullopt;
+    const std::uint64_t F = h[b].config().p.open_bins;
+    bool held_open = true;
+    for (int i = 0; origin && i < 80; ++i) {
+        const std::optional<std::uint64_t> H = h[b].best_record();
+        if (H && *H >= *origin + F) break;
+        held_open = held_open && pb::PathbNodeTestAccess::amount_held(h[b], t2, f1->body.blob.prev_id);
+        h.tick_monero(h[b].config().p.fresh_max);
+        h.mine(a, 1, 720 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<std::uint64_t> H = h[b].best_record();
+    const pb::PathbNode::AmountCounts c3 = h[b].amount_counts();
+    check(origin && H && *H >= *origin + F && held_open && !pb::PathbNodeTestAccess::amount_held(h[b], t2, f1->body.blob.prev_id)
+                  && !pb::PathbNodeTestAccess::amount_held(h[b], t1, s1->body.blob.prev_id) && c3.multi_fee == 1
+                  && c3.keys >= 1,
+          "feediverse: the key held while its origin bin " + std::to_string(origin.value_or(0)) +
+                  " is open, pruned once it seals at B (H(L) " + std::to_string(H.value_or(0)) + ", keys " +
+                  std::to_string(c3.keys) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,6 +2860,13 @@ void prune_young() {
                   && h[a].tree().genesis().pos == 0 && h[a].bodies().get(one) != nullptr && h[a].store().first_record_pos() == 0
                   && h.kvs.back()->data == before && h.kvs.back()->commits == commits && full_record(record_at(*h.kvs.back(), 1)),
           "prune young: everything kept from position 1 (" + floors_text(r.floors) + "; root " + std::to_string(r.root) + ")");
+    check(r.floors_set && r.floors.sides == 0, "prune young: the report carries the floors it computed (floors.sides 0)");
+    // a node after a load failure prunes nothing and computes no floors (the daemon prints its last computed ones)
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(c.net), false, kPruneJ), h.io(h.nodes.size()),
+                                                      h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    const pb::PathbNode::PruneReport rf = h.nodes.back()->prune(h.now);
+    check(!rf.floors_set && !rf.written, "prune young: after a load failure no floors are computed (floors_set 0)");
 }
 
 // ---------------------------------------------------------------------------
@@ -2715,6 +2898,9 @@ void prune_default() {
     const pb::PathbNode::PruneReport r = h[a].prune(h.now);
     check(r.written && kv.commits == commits + 1 && r.root == w.bodies && r.first == w.records,
           "prune default: one store batch; root " + std::to_string(r.root) + ", first record " + std::to_string(r.first));
+    check(r.floors_set && r.floors.sides == w.sides && r.floors.bodies == w.bodies && w.sides > 0,
+          "prune default: the report carries the floors it applied (floors.sides " + std::to_string(r.floors.sides) +
+                  ", floors.bodies " + std::to_string(r.floors.bodies) + ")");
     check(h[a].tree().genesis().pos == w.bodies && h[a].tree().genesis().id == at_fb && h[a].tree().find(below_fb) == nullptr
                   && h[a].bodies().get(at_fb) != nullptr && h[a].bodies().get(below_fb) == nullptr,
           "prune default: tree nodes and bodies from the body floor, none below");
@@ -3384,6 +3570,8 @@ void blockblob() {
         std::size_t cw = 0;
         std::size_t carried = 0;
         std::size_t outs = 0;
+        bool window_values = false;  // the issued job's N, f_spend, B, Z are the template window's
+        std::uint64_t n_rule = 0, f_spend = 0, min_out = 0;
     };
     auto blob_of = [&](std::size_t payee, std::uint32_t en) {
         Got g;
@@ -3402,6 +3590,14 @@ void blockblob() {
         g.cw = ij->job.miner_tx.prefix.size() + 1;
         g.carried = ij->job.carried.size();
         g.outs = ij->job.miner_tx.outs.size();
+        const pb::WindowParams wp = pb::window_params(t.window.inputs, t.window.v, pb::Hash32{});
+        g.window_values = ij->n_rule == wp.N && ij->f_spend == wp.f_spend && ij->base == wp.B
+                          && ij->zone == t.window.inputs.weights.zone && ij->n_rule >= 1 && ij->f_spend > 0 && ij->base > 0
+                          && ij->zone > 0;
+        g.n_rule = ij->n_rule;
+        g.f_spend = ij->f_spend;
+        g.min_out = UINT64_MAX;
+        for (const pb::MinerOut& o : ij->job.miner_tx.outs) g.min_out = std::min(g.min_out, o.amount);
         return g;
     };
     std::vector<std::pair<std::string, Got>> got;
@@ -3441,6 +3637,11 @@ void blockblob() {
                   std::to_string(nc.w_tx + nc.cw) + " B)");
     check(got[3].second.carried == 16 && got[3].second.outs >= 3,
           "blockblob: the carried job carries 16 receipts on a window of " + std::to_string(got[3].second.outs) + " outputs");
+    for (const auto& [name, g] : got)
+        check(g.window_values && g.outs <= g.n_rule && g.min_out >= g.f_spend,
+              "blockblob: " + name + ": the issued job holds its window's N(B) " + std::to_string(g.n_rule) +
+                      ", f_spend " + std::to_string(g.f_spend) + ", B and Z; outputs " + std::to_string(g.outs) +
+                      " <= N, the least " + std::to_string(g.min_out) + " >= f_spend");
 }
 
 // ---------------------------------------------------------------------------
@@ -3689,6 +3890,185 @@ void relayrxhdr() {
                   && rb.stats().bans == 0 && rb.stats().catchup_requests >= 2,
           "relayrxhdr: RandomX failed on a catch-up header (" + std::to_string(f1) + " failure): no token; asked again ("
                   + std::to_string(rb.stats().catchup_requests.load()) + " requests), A's tip reached");
+}
+
+// ---------------------------------------------------------------------------
+// hdrnohash: the header path through the binary's verify (verify_rx_at_d). RandomX computes no hash on a header (the
+// seed's cache not built): RandomxFailure with its reason, no outcome (no BAN), nothing indexed, the failure not
+// memoised; asked again: FetchBodies, J at S's tip. A hash computed that does not meet d on the same header: BAN,
+// its reason S1.3 #11.
+void hdrnohash() {
+    const KatNet net;
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    const std::size_t k = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}, {s, k}, {k, s}, {j, k}, {k, j}};
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 760 + static_cast<std::uint32_t>(i));
+    }
+    h.cut = {{s, k}, {k, s}, {j, k}, {k, j}};
+    h.q.clear();
+    const pb::Hash32 g = h[j].tree().genesis().id, tip = h[s].tree().best().id, armed = *h[s].store().best_at(3);
+    h.nohash_pow.insert(armed);
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrnohash: R1");
+    std::optional<pb::PathbNode::HeadersOutcome> o1;
+    std::string what;
+    bool typed = false;
+    try {
+        o1 = h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    } catch (const pb::RandomxFailure& e) {
+        typed = true;
+        what = e.what();
+    } catch (const std::exception& e) {
+        what = e.what();
+    }
+    h.q.clear();
+    std::printf("  hdrnohash: outcome %s (kind %d), failure '%s', hashes not computed %llu, indexed %zu\n",
+                o1 ? "returned" : "none", o1 ? static_cast<int>(o1->kind) : -1, what.c_str(),
+                (unsigned long long)h.nohash_calls, pb::PathbNodeTestAccess::headers(h[j]).size());
+    check(!o1 && typed && h.nohash_calls == 1 && h.nohash_pow.empty()
+                  && what.find("RandomX computed no hash: kat: the seed cache could not be built") != std::string::npos
+                  && pb::PathbNodeTestAccess::headers(h[j]).size() == 0,
+          "hdrnohash: RandomX computed no hash on a header: RandomxFailure with its reason, no outcome (no BAN), "
+          "nothing indexed");
+    check(h[j].request_headers(s, g, tip, 64, h.now), "hdrnohash: asked again (the request slot free)");
+    const pb::PathbNode::HeadersOutcome o2 =
+            h[j].on_headers(s, h[s].serve_getheaders(j, h.q.back().frame, h.now).frames.at(0), h.now);
+    check(o2.kind == K::FetchBodies,
+          "hdrnohash: then FetchBodies (the failure not memoised; kind " + std::to_string(static_cast<int>(o2.kind)) + ")");
+    h.pump();
+    check(h[j].tree().best().id == tip, "hdrnohash: J at S's tip");
+    // the same header, a hash computed that does not meet d: BAN, the reason S1.3 #11
+    h.low_pow.insert(armed);
+    check(h[k].request_headers(s, g, tip, 64, h.now), "hdrnohash: K's R1");
+    std::optional<pb::PathbNode::HeadersOutcome> o3;
+    std::string what3;
+    try {
+        o3 = h[k].on_headers(s, h[s].serve_getheaders(k, h.q.back().frame, h.now).frames.at(0), h.now);
+    } catch (const std::exception& e) {
+        what3 = e.what();
+    }
+    h.q.clear();
+    check(o3 && o3->kind == K::Ban && o3->why.find("S1.3 #11 PoW below d") != std::string::npos
+                  && pb::PathbNodeTestAccess::headers(h[k]).size() == 0,
+          "hdrnohash: a hash computed not meeting d on that header: BAN, its reason S1.3 #11 ("
+                  + (o3 ? o3->why : "no outcome: " + what3) + ")");
+}
+
+// ---------------------------------------------------------------------------
+// relayrxnohash: the same through the relay node and the binary's verify (verify_rx_at_d). (a) RandomX computes no
+// hash on a catch-up header: one RandomX failure, no token, no ban; the line names the peer and the reason; the
+// catch-up asks again and B reaches A's tip. (b) A hash computed that does not meet d on that header: one BAN, its
+// BANNED line names S1.3 #11. (c) RandomX computes no hash on a relayed carrier's admission: no token, no ban; the
+// alarm names the reason; parked and run again: placed. (d) A hash computed that does not meet d on a relayed
+// carrier: one BAN, its BANNED line names the admission row.
+void relayrxnohash() {
+    const KatNet net;
+    const auto has = [](const std::vector<std::string>& ls, const std::string& a, const std::string& b) {
+        for (const std::string& l : ls)
+            if (l.find(a) != std::string::npos && l.find(b) != std::string::npos) return true;
+        return false;
+    };
+    const std::string reason = "RandomX computed no hash: kat: the seed cache could not be built";
+    for (const bool low : {false, true}) {
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        bool mined = true;
+        for (int i = 0; i < 6; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            const std::optional<pb::PathbJob> j = h.job(a.node, static_cast<std::size_t>(i % 5), 780 + i);
+            mined = mined && j && h[a.node].on_own_share(*j, 780 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        }
+        const pb::Hash32 tip_a = h[a.node].tree().best().id, armed = *h[a.node].store().best_at(3);
+        (low ? h.low_pow : h.nohash_pow).insert(armed);
+        pb::PathbRelayNode& rb = *b.relay;
+        w.connect(0, 1);
+        w.run();
+        const std::uint64_t f1 = rb.stats().rx_failures.load(), bans1 = rb.stats().bans.load();
+        for (int i = 0; i < 4 && h[b.node].tree().best().id != tip_a && !low; ++i) {
+            h.now += h[b.node].config().abandon_timeout_s + 1;
+            rb.tick();
+            w.run();
+        }
+        g_relay_lines = nullptr;
+        const std::vector<std::string>& lb = lines[b.node];
+        std::printf("  relayrxnohash (%s): hashes not computed %llu, RandomX failures %llu, bans %llu, strikes %llu, "
+                    "catch-up requests %llu, B at %llu of %llu\n",
+                    low ? "low" : "no hash", (unsigned long long)h.nohash_calls, (unsigned long long)f1,
+                    (unsigned long long)bans1, (unsigned long long)rb.strikes_of(1),
+                    (unsigned long long)rb.stats().catchup_requests.load(), (unsigned long long)h[b.node].tree().best().pos,
+                    (unsigned long long)h[a.node].tree().best().pos);
+        if (!low) {
+            check(mined && h.nohash_calls == 1 && f1 == 1 && bans1 == 0 && rb.strikes_of(1) == 0
+                          && has(lb, " FC_HEADERS not judged: " + reason, "(no token, no ban)")
+                          && has(lb, "RandomX failing (headers of peer ", reason),
+                  "relayrxnohash (a): RandomX computed no hash on a catch-up header: 1 failure, no token, no ban; the "
+                  "line names the peer and the reason");
+            check(h[b.node].tree().best().id == tip_a && rb.stats().bans.load() == 0 && rb.stats().catchup_requests >= 2,
+                  "relayrxnohash (a): asked again (" + std::to_string(rb.stats().catchup_requests.load())
+                          + " requests), A's tip reached, no ban");
+        } else {
+            check(mined && h.nohash_calls == 0 && f1 == 0 && bans1 == 1 && has(lb, " BANNED: ", "S1.3 #11 PoW below d"),
+                  "relayrxnohash (b): a hash computed not meeting d on that header: 1 BAN, the BANNED line names S1.3 #11");
+        }
+    }
+    for (const bool low : {false, true}) {
+        std::map<std::size_t, std::vector<std::string>> lines;
+        g_relay_lines = &lines;
+        Harness h(net);
+        FakeWire w;
+        KatRelay a = kat_relay(h, w, table0(net), true);
+        KatRelay b = kat_relay(h, w, table0(net), false);
+        w.connect(0, 1);
+        w.run();
+        bool ok = true;
+        for (int i = 0; i < 3; ++i) {
+            if (i % 2 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, 1, 790 + static_cast<std::uint32_t>(i));
+        }
+        const bool synced = h[b.node].tree().best().id == h[a.node].tree().best().id;
+        const std::optional<pb::PathbJob> j = h.job(a.node, 3, 795);
+        ok = ok && j && h[a.node].on_own_share(*j, 795, pb::Hash32{}).action == pb::NodeAction::Placed;
+        const pb::Hash32 c = h[a.node].tree().best().id;
+        (low ? h.low_pow : h.nohash_pow).insert(c);
+        pb::PathbRelayNode& rb = *b.relay;
+        w.run();
+        const std::uint64_t f1 = rb.stats().rx_failures.load(), bans1 = rb.stats().bans.load();
+        const bool at_once = h[b.node].tree().find(c) != nullptr;
+        for (int i = 0; i < 8 && !low && h[b.node].tree().find(c) == nullptr; ++i) {
+            h.now += 1;
+            rb.tick();
+            w.run();
+        }
+        g_relay_lines = nullptr;
+        const std::vector<std::string>& lb = lines[b.node];
+        std::printf("  relayrxnohash (%s carrier): hashes not computed %llu, RandomX failures %llu, bans %llu, strikes "
+                    "%llu, placed at once %d, placed %d\n",
+                    low ? "low" : "no hash", (unsigned long long)h.nohash_calls, (unsigned long long)f1,
+                    (unsigned long long)bans1, (unsigned long long)rb.strikes_of(1), at_once ? 1 : 0,
+                    h[b.node].tree().find(c) != nullptr ? 1 : 0);
+        if (!low) {
+            check(ok && synced && h.nohash_calls == 1 && f1 == 1 && bans1 == 0 && !at_once
+                          && has(lb, "RandomX failing (carrier: ", reason),
+                  "relayrxnohash (c): RandomX computed no hash on a relayed carrier: 1 failure, no ban, not placed; the "
+                  "alarm names the reason");
+            check(h[b.node].tree().find(c) != nullptr && h[b.node].tree().best().id == c && rb.stats().bans.load() == 0
+                          && rb.strikes_of(1) == 0,
+                  "relayrxnohash (c): parked and run again: placed, no token, no ban");
+        } else {
+            check(ok && synced && h.nohash_calls == 0 && f1 == 0 && bans1 == 1 && !at_once
+                          && has(lb, " BANNED: ", "admission row R"),
+                  "relayrxnohash (d): a hash computed not meeting d on a relayed carrier: 1 BAN, the BANNED line names "
+                  "the admission row");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5298,6 +5678,126 @@ void relayrparkseal() {
                   && st.parked_receipts_sealed.load() == 1 && rb.strikes_of(pa) == 0 && st.bans.load() == 0,
           "relayrparkseal: once its origin bin seals on the best chain it is dropped with its asks and index entries; no "
           "strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// relayverdictlog: a receipt the relay strikes or refuses logs one line in the BANNED line's form, naming the row and
+// the receipt's id: a receipt of another pool identity STRIKEs at R16 (one strike); a share whose origin bin sealed on
+// B's best chain before it arrived REFUSEs at R21 (no token). No BANNED line.
+void relayverdictlog() {
+    const KatNet net;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const bool ok0 = ok;
+    const std::optional<pb::PathbJob> j0 = h.job(a.node, 2, 810);  // a share on A's tip, sent only below
+    ok = ok && j0 && mine_on(h, w, a.node, 1, 820);
+    const bool ok1 = ok;
+    int steps = 0;
+    pb::ReceiptBodyV3 late = j0 ? j0->body : pb::ReceiptBodyV3{};
+    late.blob.nonce = 810;
+    const std::string id12 = hex(pb::receipt_id(late).data(), 6);
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = 1;  // A at B
+    // A's chain moves past the share's origin bin
+    const std::optional<std::uint64_t> origin = h[b.node].receipt_origin(late);
+    const std::uint64_t F = h[b.node].config().p.open_bins;
+    for (int i = 0; ok && origin && i < 80; ++i) {
+        const std::optional<std::uint64_t> H = h[b.node].best_record();
+        if (H && *H >= *origin + F) break;
+        h.tick_monero(h[b.node].config().p.fresh_max);
+        ok = mine_on(h, w, a.node, 1, 1830 + static_cast<std::uint32_t>(i));
+        ++steps;
+        h.now += 1;
+        a.relay->tick();
+        rb.tick();
+        w.run();
+    }
+    const std::optional<std::uint64_t> H = h[b.node].best_record();
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{late}, pb::kRuledLaneParams));
+    w.run();
+    const std::uint64_t strikes0 = rb.strikes_of(pa);
+    pb::ReceiptBodyV3 foreign = late;  // then the same body under another pool identity
+    foreign.side.pool_id.fill(0x77);
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fb_receipts(0, std::vector<pb::ReceiptBodyV3>{foreign}, pb::kRuledLaneParams));
+    w.run();
+    const std::uint64_t strikes1 = rb.strikes_of(pa);
+    g_relay_lines = nullptr;
+    const std::string strike_line = "relay: peer 1 STRIKE: admission row R16 of " + id12;
+    const std::string refuse_line = "relay: peer 1 REFUSE: admission row R21 of " + id12;
+    std::size_t strikes = 0, refuses = 0, others = 0;
+    for (const std::string& l : lines[b.node]) {
+        if (l.find(" STRIKE: ") != std::string::npos || l.find(" REFUSE: ") != std::string::npos
+            || l.find(" BANNED") != std::string::npos)
+            ++(l == strike_line ? strikes : l == refuse_line ? refuses : others);
+    }
+    std::printf("  relayverdictlog: mined %d %d, %d steps, A at %llu; origin %llu, F %llu, H(L) %llu; strike lines %zu, "
+                "refuse lines %zu, others %zu; strikes %llu then %llu, bans %llu\n", ok0 ? 1 : 0, ok1 ? 1 : 0, steps,
+                (unsigned long long)h[a.node].best_record().value_or(0), (unsigned long long)origin.value_or(0), (unsigned long long)F, (unsigned long long)H.value_or(0), strikes,
+                refuses, others, (unsigned long long)strikes1, (unsigned long long)rb.strikes_of(pa),
+                (unsigned long long)rb.stats().bans.load());
+    check(ok && origin && H && *H >= *origin + F, "relayverdictlog: setup (the share's bin sealed at B)");
+    check(refuses == 1 && strikes0 == 0,
+          "relayverdictlog: a share whose origin bin sealed: one line '" + refuse_line + "', no token");
+    check(strikes == 1 && strikes1 == strikes0 + 1 && others == 0 && rb.stats().bans.load() == 0,
+          "relayverdictlog: the body under another pool identity: one line '" + strike_line + "', 1 strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// relayparkstrike: a carrier parked on an unknown parent and released by the parent's placement (the node's drain)
+// logs its STRIKE line as a received frame does: A mines c1 and c2 (c2 carries two receipts) while B gets neither; B
+// receives c2 with its carried list out of order, parks it (parent unknown), fetches c1 and places it; the released
+// c2 STRIKEs at R28 and B logs one line naming R28 and c2's id.
+void relayparkstrike() {
+    const KatNet net;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 800);
+    const std::optional<pb::PathbJob> j1 = h.job(a.node, 2, 801), j2 = h.job(a.node, 3, 802);
+    w.edit = [](FakeWire::Msg& m) {  // A's frames do not reach B
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j1 && j2 && mine_on(h, w, a.node, 1, 810);  // c1
+    const pb::Hash32 c1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].on_own_share(*j1, 801, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[a.node].on_own_share(*j2, 802, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && mine_on(h, w, a.node, 1, 820);  // c2 carries both
+    const pb::Hash32 c2 = h[a.node].tree().best().id;
+    pb::CarrierBodyV3 bad = *h[a.node].bodies().get(c2);
+    ok = ok && bad.carried.size() == 2 && h[b.node].tree().find(c1) == nullptr;
+    if (bad.carried.size() == 2) std::swap(bad.carried[0], bad.carried[1]);
+    w.run();
+    w.edit = nullptr;
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, bad, 16)});
+    w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().find(c1) == nullptr; ++i) {
+        h.now += 1;
+        b.relay->tick();
+        w.run();
+    }
+    g_relay_lines = nullptr;
+    const std::string want = "relay: peer 1 STRIKE: admission row R28 of " + hex(pb::receipt_id(bad.own).data(), 6);
+    std::size_t got = 0;
+    for (const std::string& l : lines[b.node]) got += l == want ? 1 : 0;
+    std::printf("  relayparkstrike: setup %d, c1 at B %d, c2 at B %d, lines %zu\n", ok ? 1 : 0,
+                h[b.node].tree().find(c1) != nullptr ? 1 : 0, h[b.node].tree().find(c2) != nullptr ? 1 : 0, got);
+    check(ok && h[b.node].tree().find(c1) != nullptr && h[b.node].tree().find(c2) == nullptr,
+          "relayparkstrike: B fetched and placed c1; the misordered c2 is not placed");
+    check(got == 1, "relayparkstrike: the released c2 logs one line '" + want + "'");
 }
 
 // ---------------------------------------------------------------------------
@@ -9599,7 +10099,10 @@ int main(int argc, char** argv) {
     run("genesis", genesis);
     run("relay", relay);
     run("race", race);
+    run("racelate", racelate);
+    run("raceskip", raceskip);
     run("carriage", carriage);
+    run("feediverse", feediverse);
     run("repend", repend);
     run("n3", n3);
     run("own", own_share);
@@ -9660,6 +10163,8 @@ int main(int argc, char** argv) {
     run("relaysq", relaysq);
     run("revrx_drain", revrx_drain);
     run("relayrxhdr", relayrxhdr);
+    run("hdrnohash", hdrnohash);
+    run("relayrxnohash", relayrxnohash);
     run("relayrxtype", relayrxtype);
     run("relaystalem", relaystalem);
     run("relayrxbind", relayrxbind);
@@ -9669,6 +10174,8 @@ int main(int argc, char** argv) {
     run("relayrxbindr", relayrxbindr);
     run("relayrxbindk", relayrxbindk);
     run("relayp15once", relayp15once);
+    run("relayverdictlog", relayverdictlog);
+    run("relayparkstrike", relayparkstrike);
     run("repevict", repevict);
     run("openstate", openstate);
     run("opendead", opendead);
