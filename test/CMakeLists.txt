@@ -1877,6 +1877,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_stratum_extensions PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_stratum_extensions "" AUTO)
 
+    # Stratum login-field parser KATs (#865 slice 2): exercises the header-only
+    # core/stratum_username.hpp that StratumSession calls, not a copy.
+    add_executable(test_stratum_username test_stratum_username.cpp)
+    target_link_libraries(test_stratum_username PRIVATE GTest::gtest_main GTest::gtest)
+    gtest_add_tests(test_stratum_username "" AUTO)
+
     # Interim hardening fix KATs: strict per-node miner cap (refused
     # connections + counter), FIFO+TTL job eviction under a 600-notify stale
     # storm, the flat-RSS shared-payload pointer-identity scaffold, and the
