@@ -304,24 +304,64 @@ inline bool deserialize_outpoint(const uint8_t* data, size_t len, size_t& pos, O
     return true;
 }
 
+/// Bounds-checked varint read: false on truncation or on more than 64 bits.
+/// (read_varint above returns a partial value on truncation; record readers
+/// that must fail closed use this one.)
+inline bool read_varint_checked(const uint8_t* data, size_t len, size_t& pos, uint64_t& v) {
+    v = 0;
+    for (unsigned shift = 0; shift <= 63; shift += 7) {
+        if (pos >= len) return false;
+        const uint8_t b = data[pos++];
+        v |= uint64_t(b & 0x7F) << shift;
+        if (!(b & 0x80)) return true;
+    }
+    return false;
+}
+
 // ─── BlockUndo ───────────────────────────────────────────────────────────────
 
-/// Undo data for a single transaction: the coins that were spent by its inputs.
+/// Undo data for a single transaction: the coins that were spent by its inputs,
+/// in vin order (Core validation.cpp UpdateCoins), each with its outpoint
+/// (tx.vin[j].prevout). Core takes the outpoints from the block body at
+/// disconnect time; c2pool stores them so a block can be disconnected from its
+/// record alone.
 /// Reference: Litecoin Core CTxUndo
 struct TxUndo {
-    std::vector<Coin> spent_coins;
+    std::vector<Coin>     spent_coins;      // Coin::is_spent() = not in the view at connect
+    std::vector<Outpoint> spent_outpoints;  // same length as spent_coins; empty in a legacy record
+    bool has_outpoints() const { return spent_outpoints.size() == spent_coins.size(); }
 };
 
 /// Undo data for an entire block.
-/// Contains both spent coins (for restoring inputs) and added outpoints
-/// (for removing outputs), enabling disconnect without full block data.
-/// Reference: Litecoin Core CBlockUndo (extended with added_outpoints)
+/// Contains both spent coins with their outpoints (for restoring inputs) and
+/// added outpoints (for removing outputs), enabling disconnect without full
+/// block data.
+/// Reference: Litecoin Core CBlockUndo (extended with outpoints, added_outpoints)
 struct BlockUndo {
-    std::vector<TxUndo> tx_undos;           // one per non-coinbase tx
+    std::vector<TxUndo> tx_undos;           // one per non-coinbase tx, block order
     std::vector<Outpoint> added_outpoints;  // all outputs created by this block
+    uint256 block_hash;                     // the block this record undoes (null = unbound)
+    uint8_t format{2};                      // 1 = legacy record (no outpoints), 2 = current
+
+    /// Spent coins that cannot be put back: coins of a TxUndo without outpoints
+    /// (a legacy record). A coin that was not in the view at connect
+    /// (is_spent) has nothing to restore and does not count.
+    size_t unrestorable_coins() const {
+        size_t n = 0;
+        for (const auto& tu : tx_undos) {
+            if (tu.has_outpoints()) continue;
+            for (const auto& c : tu.spent_coins)
+                if (!c.is_spent()) ++n;
+        }
+        return n;
+    }
+    /// Every spent coin can be put back.
+    bool restorable() const { return unrestorable_coins() == 0; }
 };
 
-/// Serialize BlockUndo to bytes.
+/// Serialize BlockUndo to bytes (legacy format 1: no outpoints, no block hash).
+/// Kept byte-identical for the DASH replay fold's own store; UTXOViewDB writes
+/// format 2 (serialize_block_undo_v2).
 inline std::vector<uint8_t> serialize_block_undo(const BlockUndo& undo) {
     std::vector<uint8_t> buf;
     buf.reserve(2048);
@@ -344,14 +384,18 @@ inline std::vector<uint8_t> serialize_block_undo(const BlockUndo& undo) {
     return buf;
 }
 
-/// Deserialize BlockUndo from bytes.
+/// Deserialize BlockUndo from bytes (legacy format 1). The record carries no
+/// outpoints and no block hash: format = 1, spent_outpoints empty.
 inline bool deserialize_block_undo(const uint8_t* data, size_t len, BlockUndo& undo) {
     size_t pos = 0;
+    undo.format = 1;
+    undo.block_hash.SetNull();
 
     uint64_t n_txs = read_varint(data, len, pos);
     undo.tx_undos.resize(static_cast<size_t>(n_txs));
 
     for (auto& tu : undo.tx_undos) {
+        tu.spent_outpoints.clear();
         uint64_t n_coins = read_varint(data, len, pos);
         tu.spent_coins.resize(static_cast<size_t>(n_coins));
         for (auto& c : tu.spent_coins) {
@@ -377,6 +421,111 @@ inline bool deserialize_block_undo(const uint8_t* data, size_t len, BlockUndo& u
 
 inline bool deserialize_block_undo(const std::vector<uint8_t>& data, BlockUndo& undo) {
     return deserialize_block_undo(data.data(), data.size(), undo);
+}
+
+/// BlockUndo format 2 (UTXOViewDB 'R' records). Varints are write_varint's
+/// LEB128, not Bitcoin CompactSize:
+///   u8      version = 0x02
+///   32      block_hash (all zero = unbound)
+///   varint  n_tx                      one per non-coinbase tx, block order
+///   n_tx x  varint n_in               vin order
+///           n_in x  32 txid | varint index | coin (serialize_coin; an input
+///                   that was not in the view at connect is 00 00 00)
+///   varint  n_added
+///   n_added x 32 txid | varint index
+/// Returns an empty vector for a record without outpoints (never writes a
+/// format-2 record that cannot restore its coins).
+inline constexpr uint8_t BLOCK_UNDO_V2 = 0x02;
+
+inline std::vector<uint8_t> serialize_block_undo_v2(const BlockUndo& undo) {
+    std::vector<uint8_t> buf;
+    buf.reserve(2048);
+    buf.push_back(BLOCK_UNDO_V2);
+    buf.insert(buf.end(), undo.block_hash.data(), undo.block_hash.data() + 32);
+    write_varint(buf, undo.tx_undos.size());
+    for (const auto& tu : undo.tx_undos) {
+        if (!tu.has_outpoints())
+            return {};
+        write_varint(buf, tu.spent_coins.size());
+        for (size_t j = 0; j < tu.spent_coins.size(); ++j) {
+            serialize_outpoint(buf, tu.spent_outpoints[j]);
+            auto cb = serialize_coin(tu.spent_coins[j]);
+            buf.insert(buf.end(), cb.begin(), cb.end());
+        }
+    }
+    write_varint(buf, undo.added_outpoints.size());
+    for (const auto& op : undo.added_outpoints)
+        serialize_outpoint(buf, op);
+    return buf;
+}
+
+/// Deserialize a format-2 record. Fails closed: wrong version, any truncation,
+/// a count larger than the bytes left could hold, or trailing bytes.
+inline bool deserialize_block_undo_v2(const uint8_t* data, size_t len, BlockUndo& undo) {
+    undo = BlockUndo{};
+    if (len < 33 || data[0] != BLOCK_UNDO_V2)
+        return false;
+    std::memcpy(undo.block_hash.data(), data + 1, 32);
+    size_t pos = 33;
+
+    auto read_outpoint = [&](Outpoint& op) {
+        if (len - pos < 32) return false;
+        std::memcpy(op.txid.data(), data + pos, 32);
+        pos += 32;
+        uint64_t idx;
+        if (!read_varint_checked(data, len, pos, idx) || idx > 0xffffffffULL) return false;
+        op.index = static_cast<uint32_t>(idx);
+        return true;
+    };
+    auto read_coin = [&](Coin& c) {
+        uint64_t code, value, slen;
+        if (!read_varint_checked(data, len, pos, code)
+            || !read_varint_checked(data, len, pos, value)
+            || !read_varint_checked(data, len, pos, slen)
+            || slen > len - pos)
+            return false;
+        c.pegout   = (code >> 31) & 1;
+        code &= ~(uint64_t(1) << 31);
+        c.coinbase = (code & 1) != 0;
+        c.height   = static_cast<uint32_t>(code >> 1);
+        c.value    = static_cast<int64_t>(value);
+        c.scriptPubKey.m_data.assign(data + pos, data + pos + slen);
+        pos += static_cast<size_t>(slen);
+        return true;
+    };
+
+    uint64_t n_tx;
+    if (!read_varint_checked(data, len, pos, n_tx) || n_tx > len - pos)
+        return false;
+    undo.tx_undos.resize(static_cast<size_t>(n_tx));
+    for (auto& tu : undo.tx_undos) {
+        uint64_t n_in;
+        // An input takes at least 36 bytes (txid, index, empty coin).
+        if (!read_varint_checked(data, len, pos, n_in) || n_in > (len - pos) / 36)
+            return false;
+        tu.spent_coins.resize(static_cast<size_t>(n_in));
+        tu.spent_outpoints.resize(static_cast<size_t>(n_in));
+        for (size_t j = 0; j < n_in; ++j) {
+            if (!read_outpoint(tu.spent_outpoints[j]) || !read_coin(tu.spent_coins[j]))
+                return false;
+        }
+    }
+    uint64_t n_added;
+    if (!read_varint_checked(data, len, pos, n_added) || n_added > (len - pos) / 33)
+        return false;
+    undo.added_outpoints.resize(static_cast<size_t>(n_added));
+    for (auto& op : undo.added_outpoints) {
+        if (!read_outpoint(op))
+            return false;
+    }
+    if (pos != len)
+        return false;
+    undo.format = 2;
+    return true;
+}
+
+inline bool deserialize_block_undo_v2(const std::vector<uint8_t>& data, BlockUndo& undo) {
+    return deserialize_block_undo_v2(data.data(), data.size(), undo);
 }
 
 } // namespace coin

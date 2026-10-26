@@ -113,7 +113,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # helpers the full-block handler uses): out-of-order arrival, a wide gap,
     # a sibling reorg, a reorg while a fill is running, the connect-point check
     # (stale buffered blocks, a pipeline above the UTXO set, a UTXO set on
-    # another branch). Same folding rule.
+    # another branch), and the undo records a disconnect uses (#2059): spent
+    # coins put back (intra-block spends included), the format-2 record bytes,
+    # REAL mainnet blocks 3199539/3199540 disconnected byte-exact against
+    # litecoind's coins (ltc_utxo_undo_fixtures.hpp). Same folding rule.
     #
     # mweb_next_header_test.cpp: the MWEB header of the next empty-body block
     # is built as libmw builds it (cumulative roots, txo count and kernel offset

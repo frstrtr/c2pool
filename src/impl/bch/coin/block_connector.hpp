@@ -282,10 +282,21 @@ private:
         m_connected_tip = hash;
     }
 
-    void disconnect_one() {
-        ConnectedEntry e = std::move(m_undo_stack.back());
+    /// False when disconnect_block refuses the entry (its undo does not match
+    /// its block: it checks before touching anything). The view then still
+    /// holds the block, so the entry stays on the stack and the tip does not
+    /// step back: stepping would let the next connect build on a view that
+    /// still has this block applied.
+    bool disconnect_one() {
+        ConnectedEntry& top = m_undo_stack.back();
+        if (!m_utxo->disconnect_block(top.block, top.undo, &BlockConnector::txid_of)) {
+            LOG_ERROR << "[EMB-BCH] reorg: undo data of " << top.hash.GetHex().substr(0, 16)
+                      << "... height=" << top.height << " does not match the block;"
+                      << " UTXO view left at it, reorg stopped";
+            return false;
+        }
+        ConnectedEntry e = std::move(top);
         m_undo_stack.pop_back();
-        m_utxo->disconnect_block(e.block, e.undo, &BlockConnector::txid_of);
         // Return the disconnected block's non-coinbase txs to the mempool: they
         // are no longer confirmed on our best chain. add_tx de-dupes and
         // re-derives fee against the now-rolled-back view.
@@ -296,6 +307,7 @@ private:
                         << "... height=" << e.height
                         << " (restored " << (e.block.m_txs.empty() ? 0 : e.block.m_txs.size() - 1)
                         << " tx to mempool)";
+        return true;
     }
 
     /// Bring the UTXO view from m_connected_tip to `tip`: forward extend, an
@@ -327,8 +339,10 @@ private:
         const uint256 fork = cursor;
 
         // Disconnect everything above the fork point (deepest-first via pop).
-        while (!m_undo_stack.empty() && m_undo_stack.back().hash != fork)
-            disconnect_one();
+        while (!m_undo_stack.empty() && m_undo_stack.back().hash != fork) {
+            if (!disconnect_one())
+                return;
+        }
 
         // Reconnect the new branch fork -> new tip from the remembered ring.
         for (auto it = connect_path.rbegin(); it != connect_path.rend(); ++it) {
