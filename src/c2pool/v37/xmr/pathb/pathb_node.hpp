@@ -3075,6 +3075,13 @@ private:
             }
         }
         if (placed_copy(f.id, frame)) return;  // a byte-identical copy of a placed carrier: not parked
+        if (*r.missing == Missing::ParentUnknown) {
+            // its parent was placed after this frame's admission: admitted again (drain_released), never dropped
+            if (const CarrierNode* pn = tree_->find(f.parent); pn != nullptr && pn->verified) {
+                release_q_.push_back(std::move(f));
+                return;
+            }
+        }
         const bool stored = deferred_.park(*tree_, std::move(f));
         // FC_GETCARRIER(parent) for a frame parked now (a copy held already asks nothing), whose parent is neither held,
         // nor parked, nor asked within P-53

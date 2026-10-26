@@ -1745,12 +1745,14 @@ public:
 
     // Parks a DEFERred frame (by its digest). ParentUnknown: the waiting entry
     // (id, claimed parent) is registered in the tree. Returns false when the
-    // digest is held already.
+    // digest is held already, or for ParentUnknown when the carrier or its
+    // parent is held (the caller runs such a frame again).
     bool park(CarrierTree& tree, ParkedFrame f) {
         if (frames_.count(f.digest) != 0) return false;
         f.seq = ++seq_;
         if (f.cause == Missing::ParentUnknown) {
-            if (tree.find(f.id) != nullptr) return false;  // placed already
+            if (tree.find(f.id) != nullptr) return false;      // placed already
+            if (tree.find(f.parent) != nullptr) return false;  // its parent is held: no waiting entry (none discarded)
             const PlaceVerdict v = tree.place(CarrierAnnounce{f.id, f.parent, 0, Hash32{}, 0}, {}).verdict;
             if (v != PlaceVerdict::Deferred && v != PlaceVerdict::Duplicate) return false;
             keys_[WaitKey{f.id, f.parent}].insert(f.digest);

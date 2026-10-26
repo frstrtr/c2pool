@@ -8322,6 +8322,89 @@ void placedvariant() {
 }
 
 // ---------------------------------------------------------------------------
+// revnotcarrier: a ParentUnknown DEFER whose parent is placed between its admission (begin_carrier) and its placement
+// (complete_carrier). J holds the server chain 1..3; d (6) and e (7) are parked (e on d, d on c); p (4) and c (5) arrive
+// back to back: c is admitted before p is placed (ParentUnknown), then p is placed, then c's DEFER completes: c is
+// admitted again and placed, d and e are released (J at 7); no tree waiting entry is discarded.
+void revnotcarrier() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 7; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 51000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const auto id_at = [&](std::uint64_t x) { return *h[s].store().best_at(x); };
+    const auto frame_at = [&](std::uint64_t x) { return *pb::encode_fc_carrier(0, *h[s].bodies().get(id_at(x)), 16); };
+    const auto asks = [&h, j](const pb::Hash32& id) {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == id ? 1 : 0;
+        }
+        return n;
+    };
+    (void)h[j].tick(h.now);
+    for (std::uint64_t x = 1; x <= 3; ++x) (void)h[j].on_carrier(s, frame_at(x));
+    h.q.clear();
+    const bool setup = h[s].tree().best().pos == 7 && h[j].tree().best().pos == 3;
+    const pb::NodeEventResult re = h[j].on_carrier(s, frame_at(7));
+    const pb::NodeEventResult rd = h[j].on_carrier(s, frame_at(6));
+    const bool parked = re.action == pb::NodeAction::Parked && rd.action == pb::NodeAction::Parked
+                        && h[j].tree().is_waiting(id_at(6)) && h[j].tree().is_waiting(id_at(7)) && h[j].deferred().size() == 2;
+    const std::size_t ask_c0 = asks(id_at(5));
+    h.q.clear();
+    pb::PathbNode::CarrierTicket tp = h[j].begin_carrier(s, frame_at(4));
+    pb::PathbNode::CarrierTicket tc = h[j].begin_carrier(s, frame_at(5));
+    const bool c_defer = tc.admit.verdict == pb::AdmitVerdict::Defer && tc.admit.missing == pb::Missing::ParentUnknown;
+    const pb::NodeEventResult rp = h[j].complete_carrier(std::move(tp));
+    const pb::NodeEventResult rc = h[j].complete_carrier(std::move(tc));
+    const bool c_lost = h[j].tree().find(id_at(5)) == nullptr && !h[j].tree().is_waiting(id_at(5));
+    const bool d_wait = h[j].tree().is_waiting(id_at(6)) || h[j].tree().find(id_at(6)) != nullptr;
+    const bool e_wait = h[j].tree().is_waiting(id_at(7)) || h[j].tree().find(id_at(7)) != nullptr;
+    const std::size_t parked_after = h[j].deferred().size();
+    const std::size_t ask_c1 = asks(id_at(5)), ask_p1 = asks(id_at(4));
+    h.q.clear();
+    // three P-53 windows: reask_parents
+    for (int k = 0; k < 3; ++k) {
+        h.now += pb::kAbandonTimeoutDefault + 1;
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+    }
+    const std::size_t reask_c = asks(id_at(5));
+    h.q.clear();
+    // c arrives again (as the reply to such an ask would bring it): placed; are d and e released?
+    const pb::NodeEventResult rc2 = h[j].on_carrier(s, frame_at(5));
+    const std::uint64_t pos_after = h[j].tree().best().pos;
+    const std::size_t parked_end = h[j].deferred().size();
+    h.q.clear();
+    for (int k = 0; k < 3; ++k) {
+        h.now += pb::kAbandonTimeoutDefault + 1;
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+    }
+    std::size_t asks_after = 0;
+    for (const Msg& m : h.q) asks_after += (m.from == j && !m.frame.empty() && m.frame[0] == pb::kOpFcGetCarrier) ? 1 : 0;
+    std::printf("  revnotcarrier: setup %d parked %d (c asked %zu); c begin DEFER ParentUnknown %d; p action %d, c action %d; "
+                "c lost %d; d waiting %d, e waiting %d; parked %zu; asks c %zu, p %zu; reask c %zu; c again action %d; "
+                "J at %llu (S at 7); parked %zu; asks after %zu\n",
+                setup ? 1 : 0, parked ? 1 : 0, ask_c0, c_defer ? 1 : 0, static_cast<int>(rp.action),
+                static_cast<int>(rc.action), c_lost ? 1 : 0, d_wait ? 1 : 0, e_wait ? 1 : 0, parked_after, ask_c1, ask_p1,
+                reask_c, static_cast<int>(rc2.action), (unsigned long long)pos_after, parked_end, asks_after);
+    check(setup && parked && c_defer, "revnotcarrier: setup (d, e parked on c; c admitted before p placed: ParentUnknown)");
+    check(!c_lost, "revnotcarrier: c is not lost when its parent was placed before its DEFER parked");
+    check(d_wait && e_wait, "revnotcarrier: d and e waiting or placed (no waiting entry discarded by c's park)");
+    check(pos_after == 7 && parked_end == 0, "revnotcarrier: c placed, d and e released (J at " + std::to_string(pos_after) + ")");
+}
+
+
+// ---------------------------------------------------------------------------
 // floorpr: the floor reading of #9 (operator ruling), through the node's P_r resolution (resolve_pr_on_branch):
 //   fa      A builds on S with S's weights; B holds S verified without them (a bodiless alternative): B resolves S on
 //           the floor and admits A's carriers on it (B follows A's branch);
@@ -9836,6 +9919,7 @@ int main(int argc, char** argv) {
     run("sealall", sealall);
     run("placedcopy", placedcopy);
     run("placedvariant", placedvariant);
+    run("revnotcarrier", revnotcarrier);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
