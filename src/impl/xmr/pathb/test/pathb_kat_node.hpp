@@ -46,6 +46,11 @@ struct Harness {
     std::uint64_t verify_cost_s = 0;  // seconds a RandomX call takes (the clock moves)
     std::uint64_t verify_per_s = 0;   // or: this many RandomX calls take one second
     std::set<pb::Hash32> throw_pow;   // a RandomX call on one of these throws (once)
+    // through verify_rx_at_d (the binary's verify): the hash function computes no hash on one of these (once)
+    std::set<pb::Hash32> nohash_pow;
+    // through verify_rx_at_d: a hash computed that does not meet d (0xff..ff)
+    std::set<pb::Hash32> low_pow;
+    std::uint64_t nohash_calls = 0;   // hashes not computed (nohash_pow)
     std::vector<pb::TemplateTx> txs;
     std::vector<std::unique_ptr<pb::FollowerBranchView>> views;
     std::vector<std::unique_ptr<pb::PathbNode>> nodes;
@@ -105,11 +110,24 @@ struct Harness {
         o.monero = mon;
         o.resolve_pr = [this, mon](const pb::Hash32& p_r) { return resolve(*mon, p_r); };
         o.seed_of = [](const pb::Hash32&) -> std::optional<pb::Hash32> { return seq32(0x99); };
-        o.verify = [this](const pb::HashingBlob& b, std::uint64_t, const pb::Hash32&) {
+        o.verify = [this](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& seed) {
             ++rx_calls;
             now += verify_cost_s;
             if (verify_per_s != 0 && rx_calls % verify_per_s == 0) ++now;
             if (throw_pow.erase(pb::receipt_id(b)) != 0) throw std::runtime_error("kat: RandomX worker failed");
+            const bool nohash = nohash_pow.erase(pb::receipt_id(b)) != 0;
+            if (nohash || low_pow.count(pb::receipt_id(b)) != 0)
+                return pb::verify_rx_at_d(
+                        [this, nohash](const std::vector<std::uint8_t>&, const pb::Hash32&, pb::Hash32& pow, std::string& why) {
+                            if (nohash) {
+                                ++nohash_calls;
+                                why = "kat: the seed cache could not be built";
+                                return false;
+                            }
+                            pow.fill(0xff);
+                            return true;
+                        },
+                        b, d, seed);
             return bad_pow.count(pb::receipt_id(b)) == 0;
         };
         o.monero_tip = [this]() -> std::optional<std::uint64_t> { return mon_tip; };
