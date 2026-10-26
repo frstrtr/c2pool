@@ -1730,15 +1730,19 @@ public:
         for (const auto& [d, f] : frames_) out.insert(f.id);
         return out;
     }
-    // Every waiting key's claimed parent with the peer of its oldest stored frame.
-    std::vector<std::pair<Hash32, std::uint64_t>> waiting_parents() const {
-        std::vector<std::pair<Hash32, std::uint64_t>> out;
+    // Every waiting key's claimed parent with the peers of its stored frames, the oldest frame's first (no repeats).
+    std::vector<std::pair<Hash32, std::vector<std::uint64_t>>> waiting_parents() const {
+        std::vector<std::pair<Hash32, std::vector<std::uint64_t>>> out;
         for (const auto& [k, ds] : keys_) {
-            const ParkedFrame* first = nullptr;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> by_seq;  // (seq, peer)
             for (const Hash32& d : ds)
-                if (const auto it = frames_.find(d); it != frames_.end() && (first == nullptr || it->second.seq < first->seq))
-                    first = &it->second;
-            if (first != nullptr) out.emplace_back(k.second, first->peer);
+                if (const auto it = frames_.find(d); it != frames_.end()) by_seq.emplace_back(it->second.seq, it->second.peer);
+            if (by_seq.empty()) continue;
+            std::sort(by_seq.begin(), by_seq.end());
+            std::vector<std::uint64_t> peers;
+            for (const auto& [q, p] : by_seq)
+                if (std::find(peers.begin(), peers.end(), p) == peers.end()) peers.push_back(p);
+            out.emplace_back(k.second, std::move(peers));
         }
         return out;
     }

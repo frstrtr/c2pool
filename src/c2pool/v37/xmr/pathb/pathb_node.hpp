@@ -851,18 +851,22 @@ public:
     // ... of them sent by reask_parents.
     std::uint64_t parent_reasks() const noexcept { return parent_reasks_; }
     // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
-    // parked) has FC_GETCARRIER(parent) sent to its sender while that parent is missing, once it was not asked within
-    // P-53 (an ask lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at
-    // most one ask per parent id per P-53.
+    // parked) has FC_GETCARRIER(parent) sent while that parent is missing, once it was not asked within P-53 (an ask
+    // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at most one ask
+    // per parent id per P-53. The ask goes to the sender of the chain's oldest frame while it is connected, else to
+    // another connected Path B peer (one that sent frames of that chain first), the next one at each repeat.
     void reask_parents() {
         if (poisoned_ || deferred_.waiting_keys() == 0) return;
         const std::set<Hash32> parked = deferred_.ids();
-        for (const auto& [parent, peer] : deferred_.waiting_parents()) {
-            if (peer == kOwnPeer || tree_->find(parent) != nullptr || tree_->is_waiting(parent) || parked.count(parent) != 0)
-                continue;
+        std::set<Hash32> missing;
+        for (const auto& [parent, senders] : deferred_.waiting_parents()) {
+            if (tree_->find(parent) != nullptr || tree_->is_waiting(parent) || parked.count(parent) != 0) continue;
+            missing.insert(parent);
             if (const auto a = parent_asked_.find(parent);
                 a != parent_asked_.end() && clock_s_ < a->second + cfg_.abandon_timeout_s)
                 continue;
+            const std::optional<std::uint64_t> to = reask_target(parent, senders);
+            if (!to) continue;
             parent_asked_[parent] = clock_s_;
             GetCarrier q;
             q.chain_id = cfg_.identity.chain_id;
@@ -870,8 +874,10 @@ public:
             q.want_bodies = true;
             ++parent_asks_;
             ++parent_reasks_;
-            send(peer, *encode_fc_getcarrier(q, cfg_.p));
+            send(*to, *encode_fc_getcarrier(q, cfg_.p));
         }
+        for (auto it = reask_round_.begin(); it != reask_round_.end();)  // the rounds of parents no longer missing go
+            it = missing.count(it->first) == 0 ? reask_round_.erase(it) : std::next(it);
     }
     // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
     std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
@@ -2738,6 +2744,7 @@ private:
         repend_watch_.clear();  // the re-pended receipts left with the pending set
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
         parent_asked_.clear();
+        reask_round_.clear();
         for (auto& [p, r] : header_req_) {  // still in flight: retired (their replies DROP; no new request before them)
             r.retired = true;
             r.got.clear();
@@ -3095,6 +3102,19 @@ private:
         }
     }
 
+    // reask_parents' target: the sender of the chain's oldest frame while it is connected (a Path B peer past HELLO);
+    // else the other connected senders of the chain's frames, then every other connected Path B peer, in turn.
+    std::optional<std::uint64_t> reask_target(const Hash32& parent, const std::vector<std::uint64_t>& senders) {
+        if (!senders.empty() && peers_.count(senders.front()) != 0) return senders.front();
+        std::vector<std::uint64_t> c;
+        for (const std::uint64_t p : senders)
+            if (peers_.count(p) != 0) c.push_back(p);
+        for (const auto& [p, t] : peers_)
+            if (std::find(c.begin(), c.end(), p) == c.end()) c.push_back(p);
+        if (c.empty()) return std::nullopt;
+        return c[reask_round_[parent]++ % c.size()];
+    }
+
     // A copy of a carrier the tree holds whose body bytes are those of its stored body (a copy with other bytes, such as
     // another carried list, is parked and judged as any frame).
     bool placed_copy(const Hash32& id, const std::vector<std::uint8_t>& frame) const {
@@ -3406,6 +3426,7 @@ private:
     std::map<Hash32, std::uint64_t> parent_asked_;  // parent asks of ParentUnknown DEFERs: their last ask time (s)
     std::uint64_t parent_asks_ = 0;                 // parent asks sent
     std::uint64_t parent_reasks_ = 0;               // ... of them by reask_parents
+    std::map<Hash32, std::uint64_t> reask_round_;   // reask_parents: asks of a missing parent sent past its sender
     std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
