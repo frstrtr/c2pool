@@ -341,12 +341,14 @@ struct PathbNodeTestAccess {
     }
     static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
     static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
-    // A frame parked through the node's own park as a DEFER of `cause` at `row`.
-    static void park(PathbNode& n, std::uint64_t peer, const std::vector<std::uint8_t>& frame, Missing cause, RowId row) {
+    // A frame parked through the node's own park as a DEFER of `cause` at `row` (`fetch`: the id it waits on).
+    static void park(PathbNode& n, std::uint64_t peer, const std::vector<std::uint8_t>& frame, Missing cause, RowId row,
+                     const Hash32& fetch = Hash32{}) {
         AdmitResult r;
         r.verdict = AdmitVerdict::Defer;
         r.row = row;
         r.missing = cause;
+        r.fetch = fetch;
         n.park(peer, frame, r);
     }
 };
@@ -8167,6 +8169,75 @@ void pwalkgone() {
           "pwalkgone: A gone, e1 asked of B: J holds e1 and e2 within P-53 + 2 s (" + std::to_string(secs) + " s)");
 }
 
+// pwalkjunk: J (deferred store cap 16) gets 100 frames from S, each a carrier on its own unknown parent, parked as
+// ParentUnknown DEFERs (through the node's park). Over 4 windows of P-53, reask_parents runs every second: at most
+// min(100, 16) asks per window, each parent id at most once per window, every ask to S.
+void pwalkjunk() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    pb::PathbNodeConfig cf = h.config(table0(net), false);
+    cf.waiting_cap = 16;
+    const std::size_t j = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cf, h.io(j)));
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 3; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 53000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::HelloCheck hc = h.hello(j, s);
+    (void)h[j].tick(h.now);
+    const std::size_t n = 100;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        const std::optional<pb::PathbJob> jb = h.job(s, k % 5, 53100 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 53100 + k;
+        c.own.side.tip = seq32(static_cast<std::uint8_t>(0x10 + k % 200));
+        c.own.side.tip[1] = static_cast<std::uint8_t>(k);  // its own unknown parent
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      c.own.side.tip);
+    }
+    const std::size_t held = h[j].deferred().size();
+    h.q.clear();
+    const std::uint64_t windows = 4, cap = 16;
+    std::map<pb::Hash32, std::uint64_t> per_id;
+    std::uint64_t worst = 0, total = 0, to_other = 0;
+    for (std::uint64_t win = 0; win < windows; ++win) {
+        std::uint64_t asks = 0;
+        for (std::uint64_t t = 0; t < pb::kAbandonTimeoutDefault; ++t) {
+            h.now += 1;
+            (void)h[j].tick(h.now);
+            h[j].reask_parents();
+            for (const Msg& m : h.q) {
+                if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+                pb::GetCarrier q;
+                if (!pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok()) continue;
+                for (const pb::Hash32& id : q.ids) ++per_id[id];
+                asks += q.ids.size();
+                to_other += m.to != s ? 1 : 0;
+            }
+            h.q.clear();
+        }
+        worst = std::max(worst, asks);
+        total += asks;
+    }
+    std::uint64_t max_id = 0;
+    for (const auto& [id, k] : per_id) max_id = std::max(max_id, k);
+    std::printf("  pwalkjunk: HELLO %d; parked %zu of %zu (cap %llu); asks per window at most %llu, in all %llu; one id at "
+                "most %llu times over %llu windows; asks to another peer %llu\n",
+                hc.verdict == pb::HelloVerdict::Accept ? 1 : 0, held, n, (unsigned long long)cap, (unsigned long long)worst,
+                (unsigned long long)total, (unsigned long long)max_id, (unsigned long long)windows,
+                (unsigned long long)to_other);
+    check(hc.verdict == pb::HelloVerdict::Accept && held == cap, "pwalkjunk: 100 junk frames parked, the store at its cap (16)");
+    check(worst <= std::min<std::uint64_t>(n, cap) && worst > 0 && max_id <= windows && to_other == 0,
+          "pwalkjunk: at most min(N, P-47) asks per P-53, each parent id at most once per window, all to the sender (" +
+                  std::to_string(worst) + " per window, " + std::to_string(max_id) + " per id)");
+}
+
 // pwalkdup: J, empty, receives carriers on S's tip P (position 6), whose parent it does not hold. T1 asks P once; T1 from
 // another peer and T2 (another carrier on P, within P-53) ask nothing; past P-53, T1 again (held already) asks nothing
 // and T3 (parked now) asks P again; P's own frame (parked on its parent Q) asks Q; past P-53 again, T4 on P asks nothing
@@ -10024,6 +10095,7 @@ int main(int argc, char** argv) {
     run("pwalkstall", pwalkstall);
     run("pwalklost", pwalklost);
     run("pwalkgone", pwalkgone);
+    run("pwalkjunk", pwalkjunk);
     run("pwalkdup", pwalkdup);
     run("sealall", sealall);
     run("placedcopy", placedcopy);

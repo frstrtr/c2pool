@@ -853,8 +853,10 @@ public:
     // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
     // parked) has FC_GETCARRIER(parent) sent while that parent is missing, once it was not asked within P-53 (an ask
     // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at most one ask
-    // per parent id per P-53. The ask goes to the sender of the chain's oldest frame while it is connected, else to
-    // another connected Path B peer (one that sent frames of that chain first), the next one at each repeat.
+    // per parent id per P-53, none for a parent the header path asked within P-53. The ask goes to the sender of the
+    // chain's oldest frame while it is connected, else to another connected Path B peer (one that sent frames of that
+    // chain first), the next one at each repeat. Bound: at most P-47 asks per P-53 per node (the waiting keys; about 105
+    // per second at the defaults), each a one-id FC_GETCARRIER to one peer.
     void reask_parents() {
         if (poisoned_ || deferred_.waiting_keys() == 0) return;
         const std::set<Hash32> parked = deferred_.ids();
@@ -865,6 +867,9 @@ public:
             if (const auto a = parent_asked_.find(parent);
                 a != parent_asked_.end() && clock_s_ < a->second + cfg_.abandon_timeout_s)
                 continue;
+            if (const auto b = bodies_asked_.find(parent);
+                b != bodies_asked_.end() && clock_s_ < b->second + cfg_.abandon_timeout_s)
+                continue;  // asked by a header page within P-53
             const std::optional<std::uint64_t> to = reask_target(parent, senders);
             if (!to) continue;
             parent_asked_[parent] = clock_s_;
