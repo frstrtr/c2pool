@@ -757,6 +757,12 @@ public:
         if (it == ctx_want_.end()) return std::nullopt;
         return it->second.bound;
     }
+    // The carrier ids of this node's own FC_GETCARRIER kept for `peer` (its replies count as solicited).
+    std::size_t asked_carriers_of(std::uint64_t peer) const {
+        std::lock_guard<std::mutex> lk(kmtx_);
+        const auto a = asked_carriers_.find(peer);
+        return a == asked_carriers_.end() ? 0 : a->second.size();
+    }
     std::uint64_t node_nonce() const noexcept { return nonce_; }
     const std::set<std::string>& self_keys() const noexcept { return self_keys_; }
     RelayLinks& links() noexcept { return links_; }
@@ -2499,6 +2505,13 @@ private:
         }
         (void)send_link(peer, f);
     }
+    // The carrier ids this node may still ask of `peer` before its asked-carrier record (kAskedMax) is full.
+    std::size_t ask_room(std::uint64_t peer) const {
+        std::lock_guard<std::mutex> lk(kmtx_);
+        const auto a = asked_carriers_.find(peer);
+        const std::size_t n = a == asked_carriers_.end() ? 0 : a->second.size();
+        return n < kAskedMax ? kAskedMax - n : 0;
+    }
     // An FC_CARRIER of `peer` that answers this node's own request: a body set it asked for, or a carrier.
     enum class CarrierReply : std::uint8_t { None, Solicited, BodySet };
     CarrierReply carrier_reply(std::uint64_t peer, const std::vector<std::uint8_t>& f) {
@@ -3541,7 +3554,8 @@ private:
                 for (const std::uint64_t p : arrived) node_->headers_arrived(p);
             }
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
-            node_->reask_parents();                       // the lowest frame of a parked chain: its parent, once per P-53
+            // the lowest frame of a parked chain: its parent, once per P-53, within each peer's asked-carrier record
+            node_->reask_parents([this](std::uint64_t p) { return ask_room(p); });
             {  // the wants re-made for an id a join pair waits on (it gave up before): the pairs are tried again
                 std::vector<Hash32> again;
                 {

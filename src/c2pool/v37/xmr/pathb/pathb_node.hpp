@@ -897,11 +897,13 @@ public:
     // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
     // parked) has FC_GETCARRIER(parent) sent while that parent is missing, once it was not asked within P-53 (an ask
     // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves; at most one ask
-    // per parent id per P-53, none for a parent the header path asked within P-53. The ask goes to the sender of the
-    // chain's oldest frame while it is connected, else to another connected Path B peer (one that sent frames of that
-    // chain first), the next one at each repeat. Bound: at most P-47 asks per P-53 per node (the waiting keys; about 105
-    // per second at the defaults), each a one-id FC_GETCARRIER to one peer.
-    void reask_parents() {
+    // per parent id per P-53, none for a parent the header path asked within P-53. The first ask goes to the sender of
+    // the chain's oldest frame while it is connected, else to another connected Path B peer (one that sent frames of that
+    // chain first); each repeat goes to the next connected peer in turn. `room(peer)`: the asks that peer may take now
+    // (the relay's asked-carrier record per peer); a peer without room is passed over, and with none left the ask waits
+    // for a later pass. Bound: at most P-47 asks per P-53 per node (the waiting keys; about 105 per second at the
+    // defaults), each a one-id FC_GETCARRIER to one peer.
+    void reask_parents(const std::function<std::size_t(std::uint64_t peer)>& room = nullptr) {
         if (poisoned_ || deferred_.waiting_keys() == 0) return;
         const std::set<Hash32> parked = deferred_.ids();
         std::set<Hash32> missing;
@@ -914,7 +916,7 @@ public:
             if (const auto b = bodies_asked_.find(parent);
                 b != bodies_asked_.end() && clock_s_ < b->second + cfg_.abandon_timeout_s)
                 continue;  // asked by a header page within P-53
-            const std::optional<std::uint64_t> to = reask_target(parent, senders);
+            const std::optional<std::uint64_t> to = reask_target(parent, senders, room);
             if (!to) continue;
             parent_asked_[parent] = clock_s_;
             GetCarrier q;
@@ -3202,17 +3204,25 @@ private:
         }
     }
 
-    // reask_parents' target: the sender of the chain's oldest frame while it is connected (a Path B peer past HELLO);
-    // else the other connected senders of the chain's frames, then every other connected Path B peer, in turn.
-    std::optional<std::uint64_t> reask_target(const Hash32& parent, const std::vector<std::uint64_t>& senders) {
-        if (!senders.empty() && peers_.count(senders.front()) != 0) return senders.front();
+    // reask_parents' target, in turn over the asks of one parent: the connected senders of the chain's frames (the
+    // oldest frame's first; connected: a Path B peer past HELLO), then every other connected Path B peer; a peer
+    // without room is passed over (none with room: no ask now).
+    std::optional<std::uint64_t> reask_target(const Hash32& parent, const std::vector<std::uint64_t>& senders,
+                                              const std::function<std::size_t(std::uint64_t)>& room) {
         std::vector<std::uint64_t> c;
         for (const std::uint64_t p : senders)
             if (peers_.count(p) != 0) c.push_back(p);
         for (const auto& [p, t] : peers_)
             if (std::find(c.begin(), c.end(), p) == c.end()) c.push_back(p);
         if (c.empty()) return std::nullopt;
-        return c[reask_round_[parent]++ % c.size()];
+        std::uint64_t& round = reask_round_[parent];
+        for (std::size_t i = 0; i < c.size(); ++i) {
+            const std::uint64_t p = c[(round + i) % c.size()];
+            if (room && room(p) == 0) continue;
+            round += i + 1;
+            return p;
+        }
+        return std::nullopt;
     }
 
     // A copy of a carrier the tree holds whose body bytes are those of its stored body (a copy with other bytes, such as

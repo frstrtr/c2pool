@@ -370,6 +370,8 @@ struct PathbNodeTestAccess {
     static bool amount_held(const PathbNode& n, const Hash32& tip, const Hash32& p_r) {
         return n.amounts_.count(std::make_pair(tip, p_r)) != 0;
     }
+    // A body asked by a header page (FetchBodies) at time t.
+    static void body_asked(PathbNode& n, const Hash32& id, std::uint64_t t) { n.bodies_asked_[id] = t; }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -8456,19 +8458,24 @@ void pwalkstall() {
     check(r.strikes == 0 && r.bans == 0, "pwalkstall: 0 strikes, 0 bans");
 }
 
-// pwalklost: J follows A while A mines one carrier per second. E, a node of its own, holds A's positions 1..6 and mines
-// e1, e2 on position 6; A places them on a side branch and floods them; the wire loses e1's flood to J, so J parks e2,
-// and every FC_GETCARRIER(e1) of J to A is lost for 60 s. The relay's tick asks e1 again once per P-53 although J's best
-// moves every second: from 2 to 1 + 60 / 11 asks of e1 in those 60 s; then the asks pass: J holds e1 and e2 within
-// P-53 + 2 s, nothing parked.
+// pwalklost: A and B hold one chain; J follows both while A mines one carrier per second. E, a node of its own, holds
+// A's positions 1..6 and mines e1, e2 on position 6; A places them on a side branch and floods them, and so does B. The
+// wire loses e1's floods to J and B's e2, so J parks A's e2, and every FC_GETCARRIER(e1) of J is lost for 60 s. The
+// relay's tick asks e1 again once per P-53 although J's best moves every second: first of A (the sender), then of B and
+// A in turn (no two asks in a row to one peer); at 30 s a header page's ask of e1 is recorded, and no ask of e1 goes out
+// within P-53 of it; from 2 to 1 + 60 / 11 asks in those 60 s. Then the asks pass: J holds e1 and e2 within P-53 + 2 s,
+// nothing parked.
 void pwalklost() {
     const KatNet net;
     Harness h(net);
     FakeWire w;
     KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
     KatRelay j = kat_relay(h, w, table0(net), false);
     const std::size_t e = h.add(table0(net), true);
+    w.connect(a.node, b.node);
     w.connect(a.node, j.node);
+    w.connect(b.node, j.node);
     w.run();
     bool ok = true;
     for (int i = 0; i < 6 && ok; ++i) {
@@ -8490,56 +8497,67 @@ void pwalklost() {
     for (int i = 0; i < 4 && ok; ++i) ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 50200 + static_cast<std::uint32_t>(i));
     for (int k = 0; k < 4 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
         h.now += 1;
-        j.relay->tick();
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
         w.run();
     }
-    ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 10;
+    ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 10
+         && h[b.node].tree().best().id == h[a.node].tree().best().id;
     if (!ok) {
-        check(false, "pwalklost: setup (A at 10 and J on it; E's branch e1, e2 on position 6)");
+        check(false, "pwalklost: setup (A and B at 10, J on them; E's branch e1, e2 on position 6)");
         return;
     }
-    bool lose = true, flood_lost = false;
-    std::uint64_t asks = 0;
+    const auto own_id = [&h, &j](const std::vector<std::uint8_t>& f) -> std::optional<pb::Hash32> {
+        pb::CarrierBodyV3 c;
+        if (f.size() <= pb::kFrameHeaderBytes
+            || pb::decode_carrier_body_v3(f.data() + pb::kFrameHeaderBytes, f.size() - pb::kFrameHeaderBytes,
+                                          pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
+                       != pb::WireError::None)
+            return std::nullopt;
+        return pb::receipt_id(c.own);
+    };
+    bool lose = true;
+    std::vector<std::pair<std::uint64_t, std::size_t>> asks;  // (time, the peer: 0 A, 1 B) of every ask of e1
     w.edit = [&](FakeWire::Msg& m) {
         if (m.f.empty()) return;
-        if (!flood_lost && m.from == a.links->self && m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {
-            pb::CarrierBodyV3 c;
-            if (pb::decode_carrier_body_v3(m.f.data() + pb::kFrameHeaderBytes, m.f.size() - pb::kFrameHeaderBytes,
-                                           pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
-                        == pb::WireError::None
-                && pb::receipt_id(c.own) == eb[0]) {
-                flood_lost = true;
-                m.f.clear();
-            }
+        if (m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {  // the floods of e1 to J, and B's e2
+            const std::optional<pb::Hash32> id = own_id(m.f);
+            if (id && lose && (*id == eb[0] || (*id == eb[1] && m.from == b.links->self))) m.f.clear();
             return;
         }
-        if (m.from != j.links->self || m.to != a.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
+        if (m.from != j.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
         pb::GetCarrier q;
         if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
         if (std::find(q.ids.begin(), q.ids.end(), eb[0]) == q.ids.end()) return;
-        ++asks;
+        asks.emplace_back(h.now, m.to == a.links->self ? 0 : 1);
         if (lose) m.f.clear();
     };
     h.now += 1;
-    for (pb::PathbRelayNode* r : {a.relay.get(), j.relay.get()}) r->tick();
-    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it
+    for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it; B places it and floods it
         (void)h[a.node].on_carrier(999, *pb::encode_fc_carrier(0, *h[e].bodies().get(id), 16));
     w.run();
-    const bool sides = h[a.node].tree().find(eb[0]) != nullptr && h[a.node].tree().find(eb[1]) != nullptr;
-    const bool parked = flood_lost && h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr;
-    const std::uint64_t pos0 = h[j.node].tree().best().pos;
+    const bool parked = h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr && asks.size() == 1
+                        && asks[0].second == 0;
+    const std::uint64_t t0 = h.now, pos0 = h[j.node].tree().best().pos;
     const auto second = [&](std::uint32_t nonce) {
         h.now += 1;
         if (nonce % 12 == 0) h.tick_monero();
         (void)mine_on(h, w, a.node, nonce % 5, nonce);
-        for (pb::PathbRelayNode* r : {a.relay.get(), j.relay.get()}) {
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) {
             r->tick();
             r->pump();
         }
         w.run();
     };
-    for (std::uint32_t t = 0; t < 60; ++t) second(50300 + t);
-    const std::uint64_t asks_lost = asks;
+    std::uint64_t t_page = 0;
+    for (std::uint32_t t = 0; t < 60; ++t) {
+        if (t == 30) {  // a header page asks e1 (FetchBodies): no reask of e1 within P-53 of it
+            t_page = h.now;
+            pb::PathbNodeTestAccess::body_asked(h[j.node], eb[0], t_page);
+        }
+        second(50300 + t);
+    }
+    const std::vector<std::pair<std::uint64_t, std::size_t>> lost = asks;
     const bool moved = h[j.node].tree().best().pos >= pos0 + 55 && h[j.node].tree().best().id == h[a.node].tree().best().id;
     lose = false;
     int secs = 0;
@@ -8547,15 +8565,24 @@ void pwalklost() {
     w.edit = nullptr;
     pb::PathbRelayNode& rj = *j.relay;
     const bool done = h[j.node].tree().find(eb[0]) != nullptr && h[j.node].tree().find(eb[1]) != nullptr;
-    std::printf("  pwalklost: A holds e1, e2 %d; e2 parked at J %d; J's best %llu -> %llu; asks of e1 while lost %llu (60 s); "
-                "then e1 and e2 held %d after %d s; parked %zu; re-asks %llu; strikes %llu, bans %llu\n",
-                sides ? 1 : 0, parked ? 1 : 0, (unsigned long long)pos0, (unsigned long long)h[j.node].tree().best().pos,
-                (unsigned long long)asks_lost, done ? 1 : 0, secs, h[j.node].deferred().size(),
-                (unsigned long long)h[j.node].parent_reasks(), (unsigned long long)rj.stats().strikes.load(),
-                (unsigned long long)rj.stats().bans.load());
-    check(sides && parked && moved, "pwalklost: A floods E's branch; e1's flood lost, e2 parked at J; J's best moves every second");
-    check(asks_lost >= 2 && asks_lost <= 1 + 60 / pb::kAbandonTimeoutDefault,
-          "pwalklost: e1 asked again while lost, at most once per P-53 (" + std::to_string(asks_lost) + " asks in 60 s)");
+    bool turns = lost.size() >= 3, both = false, page_quiet = true;
+    std::string seq;
+    for (std::size_t i = 0; i < lost.size(); ++i) {
+        seq += (i ? " " : "") + std::to_string(lost[i].first - t0) + (lost[i].second == 0 ? "A" : "B");
+        if (i >= 2 && lost[i].second == lost[i - 1].second) turns = false;  // the re-asks: never twice in a row to one peer
+        both = both || lost[i].second == 1;
+        if (lost[i].first >= t_page && lost[i].first < t_page + pb::kAbandonTimeoutDefault) page_quiet = false;
+    }
+    std::printf("  pwalklost: e2 parked at J %d; J's best %llu -> %llu; asks of e1 while lost (s from the park, peer): %s; "
+                "header page's ask at %llu; then e1 and e2 held %d after %d s; parked %zu; strikes %llu, bans %llu\n",
+                parked ? 1 : 0, (unsigned long long)pos0, (unsigned long long)h[j.node].tree().best().pos, seq.c_str(),
+                (unsigned long long)(t_page - t0), done ? 1 : 0, secs, h[j.node].deferred().size(),
+                (unsigned long long)rj.stats().strikes.load(), (unsigned long long)rj.stats().bans.load());
+    check(parked && moved, "pwalklost: e1's floods lost, e2 parked at J (its ask of e1 to A); J's best moves every second");
+    check(lost.size() >= 2 && lost.size() <= 1 + 60 / pb::kAbandonTimeoutDefault,
+          "pwalklost: e1 asked again while lost, at most once per P-53 (" + std::to_string(lost.size()) + " asks in 60 s)");
+    check(turns && both, "pwalklost: the re-asks of e1 go to A and B in turn (" + seq + ")");
+    check(page_quiet, "pwalklost: no ask of e1 within P-53 of a header page's ask of it");
     check(done && secs <= static_cast<int>(pb::kAbandonTimeoutDefault) + 2 && h[j.node].deferred().size() == 0
                   && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
           "pwalklost: once the asks pass, J holds e1 and e2 within P-53 + 2 s (" + std::to_string(secs) + " s); nothing parked");
@@ -8736,6 +8763,96 @@ void pwalkjunk() {
     check(worst <= std::min<std::uint64_t>(n, cap) && worst > 0 && max_id <= windows && to_other == 0,
           "pwalkjunk: at most min(N, P-47) asks per P-53, each parent id at most once per window, all to the sender (" +
                   std::to_string(worst) + " per window, " + std::to_string(max_id) + " per id)");
+}
+
+// pwalkasked: J (deferred store cap 1,000) follows S at T. S holds 600 carriers t_k on T, none of them flooded to J;
+// J holds 600 parked chains, each a frame on t_k (parked through the node's park, no sender connected). The relay's
+// tick asks each t_k of S, its only peer: S's asked-carrier record stays within kAskedMax (256) at every pass (the rest
+// waits for room), every reply is solicited, each t_k asked once, and J holds all 600.
+void pwalkasked() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay s = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.waiting_cap = 1000; });
+    w.connect(s.node, j.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, s.node, static_cast<std::size_t>(i % 5), 54000 + static_cast<std::uint32_t>(i));
+    }
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[s.node].tree().best().id; ++k) {
+        h.now += 1;
+        j.relay->tick();
+        w.run();
+    }
+    const std::size_t n = 600;
+    std::vector<SiblingFrame> t;
+    for (std::uint32_t k = 0; k < n && ok; ++k) {
+        t.push_back(sibling_frame(h, s.node, k % 5, 54100 + k));
+        ok = !t.back().frame.empty();
+    }
+    bool quiet = true;  // S's floods of the t_k do not reach J
+    std::uint64_t to_s = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (quiet && m.from == s.links->self && m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) m.f.clear();
+        if (m.from == j.links->self && m.to == s.links->self && m.f[0] == pb::kOpFcGetCarrier) {
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) to_s += q.ids.size();
+        }
+    };
+    for (const SiblingFrame& f : t) (void)h[s.node].on_carrier(999, f.frame);
+    w.run();
+    quiet = false;
+    std::size_t at_s = 0;
+    for (const SiblingFrame& f : t) at_s += h[s.node].tree().find(f.id) != nullptr ? 1 : 0;
+    ok = ok && at_s == n && h[j.node].tree().find(t[0].id) == nullptr;
+    if (!ok) {
+        check(false, "pwalkasked: setup (S holds 600 carriers on T, J none)");
+        return;
+    }
+    for (std::uint32_t k = 0; k < n; ++k) {  // a frame on t_k whose own P_r J does not hold (it parks again once released)
+        const std::optional<pb::PathbJob> jb = h.job(s.node, k % 5, 55000 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 55000 + k;
+        c.own.side.tip = t[k].id;
+        c.own.blob.prev_id = seq32(0xd0);
+        c.own.blob.prev_id[1] = static_cast<std::uint8_t>(k);
+        c.own.blob.prev_id[2] = static_cast<std::uint8_t>(k >> 8);
+        pb::PathbNodeTestAccess::park(h[j.node], pb::PathbNode::kOwnPeer, *pb::encode_fc_carrier(0, c, 16),
+                                      pb::Missing::ParentUnknown, pb::RowId::R4, t[k].id);
+    }
+    const std::size_t parked = h[j.node].deferred().size();
+    pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t ps = w.id(j.node, s.node);
+    const std::uint64_t sol0 = rj.stats().solicited_jobs.load(), p15 = rj.stats().p15_drops.load();
+    std::size_t held = 0, peak = 0, worst_pass = 0;
+    int secs = 0;
+    for (; secs < 60 && held < n; ++secs) {
+        h.now += 1;
+        const std::uint64_t before = to_s;
+        rj.tick();
+        peak = std::max(peak, rj.asked_carriers_of(ps));
+        w.run();
+        worst_pass = std::max<std::size_t>(worst_pass, to_s - before);
+        held = 0;
+        for (const SiblingFrame& f : t) held += h[j.node].tree().find(f.id) != nullptr ? 1 : 0;
+    }
+    w.edit = nullptr;
+    const std::uint64_t solicited = rj.stats().solicited_jobs.load() - sol0;
+    std::printf("  pwalkasked: parked %zu; J holds %zu of %zu after %d s; asks of S %llu (at most %zu in one pass); S's "
+                "asked-carrier record at most %zu; solicited replies %llu; P-15 drops %llu; re-asks %llu\n",
+                parked, held, n, secs, (unsigned long long)to_s, worst_pass, peak, (unsigned long long)solicited,
+                (unsigned long long)(rj.stats().p15_drops.load() - p15), (unsigned long long)h[j.node].parent_reasks());
+    check(parked == n && held == n, "pwalkasked: 600 parked chains towards S, J holds all 600 t_k");
+    check(peak <= 256 && worst_pass <= 256 && to_s == n,
+          "pwalkasked: S's asked-carrier record within kAskedMax at every pass, each t_k asked once (record at most " +
+                  std::to_string(peak) + ", " + std::to_string(worst_pass) + " in one pass)");
+    check(solicited >= n && rj.stats().p15_drops.load() == p15, "pwalkasked: every reply solicited, no P-15 drop");
 }
 
 // pwalkdup: J, empty, receives carriers on S's tip P (position 6), whose parent it does not hold. T1 asks P once; T1 from
@@ -10603,6 +10720,7 @@ int main(int argc, char** argv) {
     run("pwalklost", pwalklost);
     run("pwalkgone", pwalkgone);
     run("pwalkjunk", pwalkjunk);
+    run("pwalkasked", pwalkasked);
     run("pwalkdup", pwalkdup);
     run("sealall", sealall);
     run("placedcopy", placedcopy);
