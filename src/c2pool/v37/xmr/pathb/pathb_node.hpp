@@ -923,7 +923,7 @@ public:
     // (drain_released; at most the release queue's length per drain) and the walked carriers a bind placed
     // (bind_walked_branch; at most the walked ids). The sender, the action, the row and verdict, the omissions and the
     // switch counts, for the relay's accounting of a received frame (the verdict by row, the omission log, the switch
-    // line).
+    // line), and the strike tokens and the frame's id, for the relay's tokens and bans of a received frame.
     struct DrainedResult {
         std::uint64_t peer = 0;
         NodeAction action = NodeAction::None;
@@ -932,6 +932,8 @@ public:
         std::uint64_t omitted = 0;
         std::uint64_t repended = 0;
         std::uint64_t lost = 0;
+        std::uint32_t strike = 0;  // a STRIKE: its tokens
+        Hash32 id{};               // the frame's id (a STRIKE or BAN line names it)
         Hash32 object{};  // a STRIKE or REFUSE: the id of the body it names (logs only)
     };
     std::vector<DrainedResult> take_drained() { return std::exchange(drained_, {}); }
@@ -1038,7 +1040,7 @@ public:
                     if (r.verdict == AdmitVerdict::AdmitCarrier) {
                         const NodeEventResult sr = settle_carrier(servers[k], *frame, r, false);
                         drained_.push_back(DrainedResult{servers[k], sr.action, sr.admit.row, sr.admit.verdict, sr.omitted,
-                                                         sr.repended, sr.lost});
+                                                         sr.repended, sr.lost, sr.admit.strike, id});
                         if (tree_->find(id) != nullptr) {
                             out.placed.push_back(id);
                             progress = true;
@@ -3003,7 +3005,7 @@ private:
                     const std::uint64_t fresh = f.solicited ? 0 : carried_not_pending(f.frame);
                     const NodeEventResult r = complete_carrier(begin_carrier(f.peer, f.frame, true, f.solicited));
                     drained_.push_back(DrainedResult{f.peer, r.action, r.admit.row, r.admit.verdict, r.omitted, r.repended,
-                                                     r.lost, r.object});
+                                                     r.lost, r.admit.strike, f.id, r.object});
                     if (!f.solicited && (r.action == NodeAction::Placed || r.action == NodeAction::SideBranch ||
                                          r.action == NodeAction::Switched || r.action == NodeAction::JoinerPath))
                         placed_released_.push_back(PlacedRelease{f.peer, 1 + fresh});  // its first placement (P-15)

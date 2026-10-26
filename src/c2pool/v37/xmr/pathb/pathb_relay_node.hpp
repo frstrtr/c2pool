@@ -1871,9 +1871,11 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
         std::vector<std::string> lines;                     // the STRIKE / REFUSE lines of the drained carriers
+        std::vector<PathbNode::DrainedResult> penalties;    // the STRIKE and BAN verdicts of the drained carriers
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
-    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are,
+    // and their STRIKE and BAN verdicts charged to their senders as a received frame's are (run_effects).
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
@@ -1883,7 +1885,26 @@ private:
                 fx.lines.push_back("relay: peer " + std::to_string(d.peer) +
                                    (d.verdict == AdmitVerdict::Strike ? " STRIKE: " : " REFUSE: ") +
                                    admission_text(d.row, d.object));
+            if (d.peer != 0 && d.peer != PathbNode::kOwnPeer &&
+                (d.verdict == AdmitVerdict::Strike || d.verdict == AdmitVerdict::Ban))
+                fx.penalties.push_back(d);
         }
+    }
+    // After the node lock: a drained carrier's STRIKE costs its sender the verdict's tokens and its BAN bans the sender
+    // with its reason, as for a received frame (apply_result). A sender whose link is gone by then: one line, nothing
+    // applied.
+    void apply_drained(const PathbNode::DrainedResult& d) {
+        const bool ban_v = d.verdict == AdmitVerdict::Ban;
+        const std::string why = "admission row R" + std::to_string(static_cast<int>(d.row)) + " of " + hex_short(d.object != Hash32{} ? d.object : d.id);
+        if (!peer_known(d.peer)) {
+            log("relay: peer " + std::to_string(d.peer) + " gone: drained " + (ban_v ? "BAN" : "STRIKE") +
+                " not applied: " + why);
+            return;
+        }
+        if (ban_v)
+            ban(d.peer, why);
+        else
+            strike(d.peer, std::max<std::uint32_t>(d.strike, 1), false);
     }
     // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
     // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
@@ -2246,6 +2267,8 @@ private:
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
         fx.p15.clear();
+        for (const PathbNode::DrainedResult& d : fx.penalties) apply_drained(d);
+        fx.penalties.clear();
         for (std::size_t i = 0; i < fx.bans.size(); ++i) ban(fx.bans[i], i < fx.bans_why.size() ? fx.bans_why[i] : std::string());
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
