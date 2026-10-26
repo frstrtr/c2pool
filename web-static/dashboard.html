@@ -1556,6 +1556,31 @@
             height: 12px;
             border-radius: 3px;
         }
+
+        /* Key-only legend entry (not a series toggle): explains a marker. */
+        .legend-item.legend-key {
+            cursor: default;
+        }
+
+        .legend-item.legend-key:hover {
+            opacity: 1;
+        }
+
+        /* The orphaned-block marker: grey triangle-down, red outline. */
+        .legend-color.legend-orphan {
+            background: #ef4444;
+            border-radius: 0;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
+            position: relative;
+        }
+
+        .legend-color.legend-orphan::after {
+            content: "";
+            position: absolute;
+            inset: 2px 3px 4px 3px;
+            background: #6b7280;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
+        }
         
         .graph-line-doa {
             fill: none;
@@ -1953,6 +1978,7 @@
                         <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate"><span class="legend-color" style="background: #008de4;"></span><span>Good</span></div>
                         <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate"><span class="legend-color" style="background: #ff6b6b;"></span><span>DOA</span></div>
                         <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers"><span class="legend-color" style="background: #00ff88;"></span><span>Blocks</span></div>
+                        <div class="legend-item legend-key" title="Orphaned block: another block won its height"><span class="legend-color legend-orphan"></span><span>Orphaned</span></div>
                         <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections"><span class="legend-color" style="background: #9c27b0;"></span><span>Workers</span></div>
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
@@ -1989,6 +2015,7 @@
                     <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #008de4; width: 14px; height: 14px;"></span><span>Good</span></div>
                     <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff6b6b; width: 14px; height: 14px;"></span><span>DOA</span></div>
                     <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00ff88; width: 14px; height: 14px;"></span><span>Blocks</span></div>
+                    <div class="legend-item legend-key" title="Orphaned block: another block won its height" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color legend-orphan" style="width: 14px; height: 14px;"></span><span>Orphaned</span></div>
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
@@ -2483,6 +2510,42 @@
                    + shortAddr + '</b><br/>';
             }
             return s;
+        }
+
+        // Chart marker + tooltip lines for a /recent_blocks row by its on-chain
+        // status. An orphaned block (another block won its height) must not be
+        // drawn as a green "Block Found!" diamond: it gets its own marker and
+        // headline, and its status is shown in red rather than the pending
+        // amber. A stale block (submitted on a stale parent) gets a neutral
+        // grey one. The chart legend's "Orphaned" swatch names the orphan
+        // marker. Display only.
+        function block_is_orphaned(b) {
+            return !!b && b.status === 'orphaned';
+        }
+        function block_is_stale(b) {
+            return !!b && b.status === 'stale';
+        }
+        function block_marker_style(b, luckColor) {
+            if (block_is_orphaned(b))
+                return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
+            if (block_is_stale(b))
+                return { fillColor: '#4b5563', lineColor: '#9ca3af', symbol: 'square' };
+            return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
+        }
+        function block_headline_html(b) {
+            if (block_is_orphaned(b))
+                return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
+            if (block_is_stale(b))
+                return '<span style="color:#9ca3af">■</span> <b>Stale Block</b><br/>';
+            return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+        }
+        function block_status_html(b) {
+            var st = (b && b.status) || 'unknown';
+            var color = st === 'confirmed' ? '#00ff88'
+                      : st === 'orphaned'  ? '#ff6b6b'
+                      : st === 'stale'     ? '#9ca3af'
+                      : '#ffc107';
+            return 'Status: <b style="color:' + color + '">' + st + '</b>';
         }
 
         // Format percentage with big integer + small decimal parts
@@ -8311,7 +8374,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -8647,7 +8710,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8685,7 +8748,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -8778,8 +8841,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -8790,7 +8854,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8827,7 +8891,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -9072,7 +9136,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -9359,7 +9423,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9398,7 +9462,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -9503,8 +9567,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -9515,7 +9580,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9552,7 +9617,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }

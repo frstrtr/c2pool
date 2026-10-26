@@ -179,6 +179,14 @@
 //                them) refused at start;
 //   revrx_drain  RandomX throws on a released child's first hash inside its
 //                parent's completion: caught, the child parked and placed;
+//   drainban     a carrier parked on its unknown parent, released by the
+//                parent's placement, its own PoW failing (R12): its sender
+//                banned (one BANNED line naming R12 and its id), no strike;
+//   drainstrike  the same with its carried list out of order (R28): one
+//                token of its sender's budget, no ban;
+//   drainhonest  the same as mined: placed by the drain, no strike, no ban;
+//   draingone    the same as drainban, its sender's link down before the
+//                parent arrives from another peer: one line, nothing applied;
 //   relayrxhdr   RandomX throws on a catch-up header: no token, asked again;
 //   hdrnohash    the binary's verify computes no hash on a header:
 //                RandomxFailure, no BAN, not memoised; asked again: placed;
@@ -3856,6 +3864,177 @@ void revrx_drain() {
           "revrx_drain: RandomX reached inside complete_carrier (a released child's first hash) and caught");
     check(c2later && c1b && st.strikes.load() == 0 && st.bans.load() == 0,
           "revrx_drain: the released child placed after the failure (parked and run again), no strike, no ban");
+}
+
+// ---------------------------------------------------------------------------
+// The drain's tokens and bans: A mines c1 and c2 (c2 carries two receipts) while B gets neither; c2 reaches B first and
+// is parked on its unknown parent; B fetches c1 from A and places it; the drain runs c2. kind 0: c2 as mined; 1: c2's
+// own PoW fails at B; 2: c2's carried list out of order.
+struct DrainRun {
+    bool setup = false;           // c2 parked at B before c1 (c1 and c2 not placed there)
+    bool c1 = false, c2 = false;  // placed at B at the end
+    bool a_up = false;            // A's link at B up at the end
+    std::uint64_t strikes = 0, strikes_a = 0, bans = 0;  // rises at B: strikes, A's strikes, bans
+    std::size_t want_lines = 0, banned_lines = 0;        // B's lines equal to `want`, B's BANNED lines
+    std::string want;
+};
+DrainRun drain_run(int kind) {
+    const KatNet net;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.run();
+    DrainRun out;
+    bool ok = mine_on(h, w, a.node, 1, 830);
+    const std::optional<pb::PathbJob> j1 = h.job(a.node, 2, 831), j2 = h.job(a.node, 3, 832);
+    w.edit = [](FakeWire::Msg& m) {  // A's frames do not reach B
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && j1 && j2 && mine_on(h, w, a.node, 1, 840);  // c1
+    const pb::Hash32 c1 = h[a.node].tree().best().id;
+    ok = ok && h[a.node].on_own_share(*j1, 831, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && h[a.node].on_own_share(*j2, 832, pb::Hash32{}).action == pb::NodeAction::Pending;
+    ok = ok && mine_on(h, w, a.node, 1, 850);  // c2 carries both
+    const pb::Hash32 c2 = h[a.node].tree().best().id;
+    pb::CarrierBodyV3 body = *h[a.node].bodies().get(c2);
+    ok = ok && body.carried.size() == 2 && h[b.node].tree().find(c1) == nullptr && pb::receipt_id(body.own) == c2;
+    if (kind == 2 && body.carried.size() == 2) std::swap(body.carried[0], body.carried[1]);
+    if (kind == 1) h.bad_pow.insert(c2);
+    w.run();
+    w.edit = nullptr;
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t s0 = st.strikes.load(), sa0 = rb.strikes_of(1), b0 = st.bans.load();
+    w.q.push_back(FakeWire::Msg{0, 1, *pb::encode_fc_carrier(0, body, 16)});
+    w.step();  // c2 at B: parked; B's FC_GETCARRIER of c1 queued to A
+    out.setup = ok && h[b.node].deferred().size() == 1 && h[b.node].tree().find(c1) == nullptr
+                && h[b.node].tree().find(c2) == nullptr;
+    w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().find(c1) == nullptr; ++i) {
+        h.now += 1;
+        rb.tick();
+        w.run();
+    }
+    g_relay_lines = nullptr;
+    out.c1 = h[b.node].tree().find(c1) != nullptr;
+    out.c2 = h[b.node].tree().find(c2) != nullptr;
+    out.a_up = rb.hello_ok(1);
+    out.strikes = st.strikes.load() - s0;
+    out.strikes_a = out.a_up ? rb.strikes_of(1) - sa0 : 0;
+    out.bans = st.bans.load() - b0;
+    out.want = kind == 1 ? "relay: peer 1 BANNED: admission row R12 of " + hex(c2.data(), 6) : std::string();
+    for (const std::string& l : lines[b.node]) {
+        out.want_lines += !out.want.empty() && l == out.want ? 1 : 0;
+        out.banned_lines += l.find(" BANNED") != std::string::npos ? 1 : 0;
+    }
+    std::printf("  drain kind %d: setup %d, c1 at B %d, c2 at B %d, A up %d, strikes %llu (A %llu), bans %llu, lines %zu, "
+                "BANNED lines %zu\n",
+                kind, out.setup ? 1 : 0, out.c1 ? 1 : 0, out.c2 ? 1 : 0, out.a_up ? 1 : 0,
+                (unsigned long long)out.strikes, (unsigned long long)out.strikes_a, (unsigned long long)out.bans,
+                out.want_lines, out.banned_lines);
+    return out;
+}
+
+// drainban: c2's own PoW fails at B (R12, BAN): B bans A with its reason (one BANNED line naming R12 and c2's id) and
+// drops A's link; no strike.
+void drainban() {
+    const DrainRun r = drain_run(1);
+    check(r.setup && r.c1 && !r.c2,
+          "drainban: c2 parked on its unknown parent at B, c1 fetched from A and placed, c2 not placed");
+    check(r.bans == 1 && r.want_lines == 1 && r.banned_lines == 1 && !r.a_up && r.strikes == 0,
+          "drainban: the drained c2's BAN bans its sender: one line '" + r.want + "', A's link dropped, no strike (bans " +
+                  std::to_string(r.bans) + ", lines " + std::to_string(r.want_lines) + ")");
+}
+
+// drainstrike: c2's carried list out of order (R28, STRIKE): one token of A's budget at B; no ban, A's link kept.
+void drainstrike() {
+    const DrainRun r = drain_run(2);
+    check(r.setup && r.c1 && !r.c2,
+          "drainstrike: c2 parked on its unknown parent at B, c1 fetched from A and placed, c2 not placed");
+    check(r.strikes == 1 && r.strikes_a == 1 && r.bans == 0 && r.banned_lines == 0 && r.a_up,
+          "drainstrike: the drained c2's STRIKE costs its sender one token: A struck once, no ban, A's link kept (strikes " +
+                  std::to_string(r.strikes) + ", bans " + std::to_string(r.bans) + ")");
+}
+
+// drainhonest: c2 as mined: placed by the drain; no strike, no ban, A's link kept.
+void drainhonest() {
+    const DrainRun r = drain_run(0);
+    check(r.setup && r.c1 && r.c2 && r.a_up && r.strikes == 0 && r.bans == 0 && r.banned_lines == 0,
+          "drainhonest: c2 parked, released by c1's placement and placed: no strike, no ban, A's link kept (strikes " +
+                  std::to_string(r.strikes) + ", bans " + std::to_string(r.bans) + ")");
+}
+
+// draingone: c2 (its own PoW failing at B) from A is parked at B; A's link at B goes down; B connects to C, which holds
+// c1 and not c2, catches up and places c1; the drained c2's BAN names a gone link: one line, no ban applied, C's link
+// kept.
+void draingone() {
+    const KatNet net;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false);
+    KatRelay c = kat_relay(h, w, table0(net), false);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.run();
+    bool ok = mine_on(h, w, a.node, 1, 860);
+    w.edit = [](FakeWire::Msg& m) {  // A's frames do not reach B
+        if (m.from == 0 && m.to == 1) m.f.clear();
+    };
+    ok = ok && mine_on(h, w, a.node, 1, 861);  // c1: at C, not at B
+    const pb::Hash32 c1 = h[a.node].tree().best().id;
+    w.edit = [](FakeWire::Msg& m) {  // nor C
+        if (m.from == 0) m.f.clear();
+    };
+    ok = ok && mine_on(h, w, a.node, 1, 862);  // c2: at A only
+    const pb::Hash32 c2 = h[a.node].tree().best().id;
+    const std::vector<std::uint8_t> f2 = *pb::encode_fc_carrier(0, *h[a.node].bodies().get(c2), 16);
+    h.bad_pow.insert(c2);
+    w.run();
+    ok = ok && h[c.node].tree().find(c1) != nullptr && h[c.node].tree().find(c2) == nullptr
+         && h[b.node].tree().find(c1) == nullptr;
+    w.edit = [&f2](FakeWire::Msg& m) {  // of A's frames only c2's reaches B (B's ask of c1 gets no reply)
+        if (m.from == 0 && m.f != f2) m.f.clear();
+    };
+    pb::PathbRelayNode& rb = *b.relay;
+    const pb::PathbRelayStats& st = rb.stats();
+    const std::uint64_t s0 = st.strikes.load(), b0 = st.bans.load();
+    w.q.push_back(FakeWire::Msg{0, 1, f2});
+    w.run();
+    const bool parked = h[b.node].deferred().size() == 1 && h[b.node].tree().find(c1) == nullptr
+                        && h[b.node].tree().find(c2) == nullptr;
+    b.links->disconnect(1);  // A's link at B down
+    w.run();
+    const bool gone = !rb.hello_ok(1) && h[b.node].deferred().size() == 1;
+    w.connect(1, 2);  // B and C
+    w.run();
+    for (int i = 0; i < 4 && h[b.node].tree().find(c1) == nullptr; ++i) {
+        h.now += 1;
+        rb.tick();
+        w.run();
+    }
+    g_relay_lines = nullptr;
+    const std::string want = "relay: peer 1 gone: drained BAN not applied: admission row R12 of " + hex(c2.data(), 6);
+    std::size_t got = 0, banned = 0;
+    for (const std::string& l : lines[b.node]) {
+        got += l == want ? 1 : 0;
+        banned += l.find(" BANNED") != std::string::npos ? 1 : 0;
+    }
+    const bool c1b = h[b.node].tree().find(c1) != nullptr, c2b = h[b.node].tree().find(c2) != nullptr;
+    std::printf("  draingone: setup %d, parked %d, gone %d, c1 at B %d, c2 at B %d, C up %d, strikes %llu, bans %llu, "
+                "lines %zu, BANNED lines %zu\n",
+                ok ? 1 : 0, parked ? 1 : 0, gone ? 1 : 0, c1b ? 1 : 0, c2b ? 1 : 0, rb.hello_ok(3) ? 1 : 0,
+                (unsigned long long)(st.strikes.load() - s0), (unsigned long long)(st.bans.load() - b0), got, banned);
+    check(ok && parked && gone && c1b && !c2b && rb.hello_ok(3),
+          "draingone: c2 parked at B from A, A's link down, c1 from C placed, c2 not placed, C's link kept");
+    check(got == 1 && banned == 0 && st.bans.load() == b0 && st.strikes.load() == s0,
+          "draingone: the drained c2's BAN of a gone link: one line '" + want + "', no ban applied, no strike");
 }
 
 // ---------------------------------------------------------------------------
@@ -10162,6 +10341,10 @@ int main(int argc, char** argv) {
     run("relaytip", relaytip);
     run("relaysq", relaysq);
     run("revrx_drain", revrx_drain);
+    run("drainban", drainban);
+    run("drainstrike", drainstrike);
+    run("drainhonest", drainhonest);
+    run("draingone", draingone);
     run("relayrxhdr", relayrxhdr);
     run("hdrnohash", hdrnohash);
     run("relayrxnohash", relayrxnohash);

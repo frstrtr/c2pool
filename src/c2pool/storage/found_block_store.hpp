@@ -232,12 +232,30 @@ class FoundBlockStore {
 public:
     explicit FoundBlockStore(core::LevelDBStore& store) : m_store(store) {}
 
-    /// Store a found block record
+    /// Store a found block record.
+    ///
+    /// The key carries the height, and a block's height can be learned after
+    /// the row was first stored: a stale-job block recorded at height 0 is
+    /// given its real height later (MiningInterface learns it from the
+    /// sharechain or the header chain). Height only ever moves out of 0, so
+    /// storing a row at a real height drops the height-0 record of the same
+    /// block -- otherwise the old key, which lists first, would be loaded
+    /// again on the next start. Written first, removed second: a crash in
+    /// between leaves both, which the load path resolves to the real height.
     bool store(const FoundBlockRecord& rec)
     {
         auto key = make_key(rec.chain, rec.height, rec.block_hash);
         auto data = rec.serialize();
-        return m_store.put(key, data);
+        if (!m_store.put(key, data))
+            return false;
+        if (rec.height != 0) {
+            const auto zero_key = make_key(rec.chain, 0, rec.block_hash);
+            std::vector<uint8_t> old;
+            if (m_store.get(zero_key, old)
+                && FoundBlockRecord::deserialize(old).block_hash == rec.block_hash)
+                m_store.remove(zero_key);
+        }
+        return true;
     }
 
     /// Update status of an existing record

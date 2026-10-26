@@ -36,6 +36,7 @@
 #include <impl/dash/stratum/work_source.hpp>
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
+#include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (the JOB's height, not the cache's)
 #include <impl/dash/coin/serve_gate_rollup_json.hpp>  // serve_gate_rollup_json — #119 follow-up web leg (per-cause TIME)
 #include <impl/dash/coin/serve_gate_ledger_json.hpp>  // serve_gate_ledger_{to_json,save,load} — cumulative cross-restart accounting
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
@@ -2712,7 +2713,15 @@ nlohmann::json DASHWorkSource::mining_submit(
     if (pow_hash <= block_target) {
         // A full network block. NEVER drop it.
         auto wd = cached_work();
-        const uint32_t height = wd ? wd->m_height : 0;
+        // The block's height comes from the JOB the miner hashed (its own
+        // BIP34 coinbase push), never from the CURRENT template: a solve on a
+        // stale job (the serve gate declining, the cache empty, the tip moved)
+        // was recorded at the cache's height -- h=0 for block 2561316 on
+        // 2026-10-25 -- and the confirm/orphan lane then asked about the wrong
+        // height forever. Facts read off `wd` below describe the job only when
+        // `wd` is the job's own template.
+        const bool wd_is_jobs = template_is_jobs(wd.get(), job->gbt_prevhash);
+        const uint32_t height = won_block_height(coinbase, job->gbt_prevhash, wd.get());
         LOG_WARNING << "[DASH-STRATUM-BLOCK] *** BLOCK FOUND *** user=" << username
                     << " height~=" << height
                     << " pow_hash=" << pow_hash.GetHex().substr(0, 16)
@@ -2737,7 +2746,7 @@ nlohmann::json DASHWorkSource::mining_submit(
                 arm_seen     = arm_ever_observed_;
                 arm_embedded = last_arm_embedded_;
             }
-            if (wd) {
+            if (wd_is_jobs) {
                 for (const auto& pp : wd->m_packed_payments) {
                     // dashd surfaces the platform credit-pool burn as a
                     // masternode[] entry with an EMPTY payee; counting it as a
@@ -2746,19 +2755,29 @@ nlohmann::json DASHWorkSource::mining_submit(
                     else ++mn_outs;
                 }
             }
+            // The payout split and the arm describe the CURRENT template. When
+            // that is not the job's template (moved on, or none cached) they
+            // say nothing about this block: print "?" rather than another
+            // block's facts, and name why in template=.
+            const char* arm_label = arm_seen ? (arm_embedded ? "EMBEDDED"
+                                                             : "dashd-fallback")
+                                             : "unobserved";
+            const std::string unknown = "?";
             LOG_WARNING
                 << "[BLOCK-LEDGER] event=found h=" << height
                 << " hash=" << pow_hash.GetHex().substr(0, 16)
                 << " miner=" << username
-                << " arm=" << (arm_seen ? (arm_embedded ? "EMBEDDED"
-                                                        : "dashd-fallback")
-                                        : "unobserved")
+                << " arm=" << (wd_is_jobs ? std::string(arm_label) : unknown)
                 << " coinbase_bytes=" << coinbase.size()
-                << " mn_payout_outputs=" << mn_outs
-                << " split=" << (mn_outs >= 2 ? "operator" : "none")
-                << " burn_outputs=" << burn_outs
+                << " mn_payout_outputs="
+                << (wd_is_jobs ? std::to_string(mn_outs) : unknown)
+                << " split=" << (wd_is_jobs ? (mn_outs >= 2 ? "operator" : "none")
+                                            : unknown)
+                << " burn_outputs="
+                << (wd_is_jobs ? std::to_string(burn_outs) : unknown)
                 << " txs=" << (job->tx_data ? job->tx_data->size() : 0)
-                << " subsidy=" << (wd ? wd->m_coinbase_value : 0)
+                << " subsidy=" << job->subsidy
+                << " template=" << (wd_is_jobs ? "job" : (wd ? "moved" : "none"))
                 << " job=" << job_id;
         }
 
@@ -2875,15 +2894,15 @@ nlohmann::json DASHWorkSource::mining_submit(
 
         // Recent-blocks dashboard record: a genuine block solution we
         // dispatched to the network. A local payee-guard reject was never sent
-        // (not a won block) so it is skipped. Display only; fired after the
-        // dispatch decision, never gates it.
+        // (not a won block) so it is skipped. Height and subsidy are the job's.
+        // Display only; fired after the dispatch decision, never gates it.
         if (!payee_guard_reject) {
             FoundBlockFn fb_fn;
             {
                 std::lock_guard<std::mutex> lk(found_block_mutex_);
                 fb_fn = on_found_block_fn_;
             }
-            if (fb_fn) fb_fn(height, pow_hash, username, reached_network);
+            if (fb_fn) fb_fn(height, pow_hash, username, reached_network, job->subsidy);
         }
 
         // #887: the won block is a SHARE too. Everything above (guard verdict,
