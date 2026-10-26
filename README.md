@@ -903,7 +903,7 @@ dashd-attached default OFF)
 | `--embedded-mn-bridge-no-cursor` | Replay the whole window from the anchor on every start instead of resuming the saved cursor. |
 | `--embedded-fold-live PATH` + `--embedded-fold-live-expect HASH`, `--embedded-fold-checkscripts` | Wire a full-history UTXO fold store as the live input-pricing view (store hash must match); consensus-exact input-script check. |
 | `--embedded-utxo-fold-fees DBPATH` + `--embedded-utxo-fold-expect HEX` | Graduated fold fee pricing; both required together. |
-| `--bestcl-policy freshness\|consensus-exact` | How the bestCL gate decides (default `freshness`). |
+| `--bestcl-policy consensus-exact\|freshness` | How the bestCL gate decides: `consensus-exact` (default) is dashcore's CheckCbTxBestChainlock rule; `freshness` is the stricter rollback proxy. |
 | `--serve-staleness-sentinel[=off]` | Report-only served-height staleness detector, ON by default; `=off`/`=0`/`=false` disables. |
 | `--serve-gate-state-file PATH` | Cross-restart serve-gate accounting (soak convenience). |
 | `--regtest-force-won-block` | Regtest-only: drive one won block through the dual-path dispatch. |

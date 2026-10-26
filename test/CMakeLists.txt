@@ -1290,7 +1290,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
     # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
-    # exact) vs the original freshness proxy, plus the fail-closed fences
+    # exact, the node default) vs the freshness rollback, plus the fail-closed fences
     # (missing prev-block committed CL, unverified advance, unjustified
     # provenance). DELIBERATELY NOT BLS-gated: the gate is a pure state
     # decision over heights + provenance and must be exercised on EVERY build,
@@ -1305,6 +1305,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_bestcl_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # Source-scan KAT: main_dash.cpp initialises --bestcl-policy from the default.
+    target_compile_definitions(test_dash_bestcl_gate PRIVATE
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_bestcl_gate "" AUTO)
 
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for

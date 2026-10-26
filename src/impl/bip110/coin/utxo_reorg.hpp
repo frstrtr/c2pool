@@ -11,17 +11,19 @@
 // reorg_disconnect_to_fork() walks the view's best_block back along the OLD
 // branch (header-index prev pointers) to the common ancestor of new_tip,
 // calling UTXOViewCache::disconnect_from_undo() at each rolled-back height. That
-// removes every output the rolled-back block ADDED (added_outpoints) — the
-// DANGEROUS half: a rolled-back coin must never price/include. It intentionally
-// does NOT restore spent inputs (their outpoints are not in TxUndo) — that
-// direction is fail-closed: the coin stays absent, the respend stays
-// fee-unknown, excluded. The new branch's bodies re-connect via the normal
-// inv->getdata flow, re-adding the correct coins.
+// removes every output the rolled-back block ADDED (added_outpoints) — a
+// rolled-back coin must never price/include — and puts back every coin the
+// block SPENT (TxUndo stores each spent coin with its outpoint, #2059): such a
+// coin is unspent again on the new chain, so GAP2's inclusion rule rightly
+// admits its spender after the re-price. The new branch's bodies re-connect via
+// the normal inv->getdata flow.
 //
-// Fail closed on ANY doubt: missing undo data, a walk that runs off the index,
-// or a rollback deeper than the kept-undo horizon ⇒ a non-OK result; the caller
-// leaves the view flagged inconsistent (serves coinbase-only) until it can be
-// rebuilt. NEVER a wrong ledger. ZERO DASH code.
+// Fail closed on ANY doubt: missing undo data, a legacy (pre-#2059) undo record
+// that cannot put its spent coins back (its outputs are still removed), a
+// record bound to another block than the one being rolled back (untouched), a
+// walk that runs off the index, or a rollback deeper than the kept-undo
+// horizon ⇒ a non-OK result; the caller leaves the view flagged inconsistent (serves
+// coinbase-only) until it can be rebuilt. NEVER a wrong ledger. ZERO DASH code.
 // ---------------------------------------------------------------------------
 
 #include <core/coin/utxo.hpp>
@@ -34,7 +36,7 @@
 namespace bip110 {
 namespace coin {
 
-enum class ReorgResult { OK, UNDO_MISSING, TOO_DEEP, WALK_BROKEN };
+enum class ReorgResult { OK, UNDO_MISSING, TOO_DEEP, WALK_BROKEN, UNDO_LEGACY, UNDO_MISMATCH };
 
 inline const char* reorg_result_name(ReorgResult r) {
     switch (r) {
@@ -42,6 +44,8 @@ inline const char* reorg_result_name(ReorgResult r) {
         case ReorgResult::UNDO_MISSING:return "undo-missing";
         case ReorgResult::TOO_DEEP:    return "too-deep";
         case ReorgResult::WALK_BROKEN: return "walk-broken";
+        case ReorgResult::UNDO_LEGACY: return "undo-legacy";
+        case ReorgResult::UNDO_MISMATCH: return "undo-of-another-block";
     }
     return "?";
 }
@@ -68,10 +72,12 @@ inline ReorgResult reorg_disconnect_to_fork(core::coin::UTXOViewCache& cache,
         auto active = chain.get_header_by_height(h);
         if (active && active->block_hash == cur) break;
 
-        // Roll back the old-branch block at height h.
+        // Roll back the old-branch block at height h. A legacy record removes
+        // the block's outputs but cannot put its spent coins back.
         core::coin::BlockUndo undo;
         if (!db.get_block_undo(h, undo)) return ReorgResult::UNDO_MISSING;
-        cache.disconnect_from_undo(undo);
+        if (!undo.block_hash.IsNull() && undo.block_hash != cur) return ReorgResult::UNDO_MISMATCH;
+        if (!cache.disconnect_from_undo(undo)) return ReorgResult::UNDO_LEGACY;
 
         // Step to the old-branch parent via the header index.
         auto oldent = chain.get_header(cur);

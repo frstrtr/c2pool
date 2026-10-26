@@ -3007,10 +3007,24 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // that knows. The wire key `found_locally` keeps its existing meaning
     // and its existing consumers; read `found_by` for authorship.
     const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    // "first_block" is a claim about the HISTORY: no same-chain block was
+    // found before this one. A missing interval alone does not make it so. A
+    // row recorded at height 0 (unknown) sorts after every real row, so the
+    // restore-time recompute finds no predecessor for it; the stale-job block
+    // of 2026-10-25 (23 earlier rows) was drawn on the chart as "1st block"
+    // that way. Such a row reads "interval_unavailable".
+    bool has_earlier_row = false;
+    for (const auto& other : m_found_blocks) {
+        if (other.chain == b.chain && other.ts < b.ts) {
+            has_earlier_row = true;
+            break;
+        }
+    }
     std::string method;
     if (!have_local_record)                    method = "relayed";
     else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
     else if (b.time_to_find > 0)               method = "netdiff_unavailable";
+    else if (has_earlier_row)                  method = "interval_unavailable";
     else                                       method = "first_block";
     // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
     // two distinct rows. A genuine first block has no earlier same-chain row,
@@ -4303,6 +4317,25 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             if (luck_input_changed)
                 recompute_found_block_luck_locked();
 
+            // HEIGHT OUT OF 0. A row stored at height 0 is a block whose height
+            // was unknown when it was recorded (the stale-job block 2561316 of
+            // 2026-10-25). The first later record that knows the height -- the
+            // sharechain hook re-records a block from its share's BIP34 height
+            // -- gives it that height, so the confirm/orphan lane can resolve
+            // it and it sorts into its place. A known height is never changed.
+            if (existing.height == 0 && height != 0) {
+                // Re-sorts the list: `existing` is not used past this point.
+                auto learned = learn_found_block_height_locked(hash_hex, chain, height);
+                if (learned && m_persist_block_fn) {
+                    try { m_persist_block_fn(*learned); }
+                    catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] Failed to persist found block"
+                                       " height: " << e.what();
+                    }
+                }
+                return;
+            }
+
             if (row_dirty && m_persist_block_fn) {
                 try { m_persist_block_fn(existing); }
                 catch (const std::exception& e) {
@@ -4540,6 +4573,68 @@ void MiningInterface::recompute_found_block_luck_locked()
     }
 }
 
+std::optional<MiningInterface::FoundBlock>
+MiningInterface::learn_found_block_height_locked(const std::string& hash,
+                                                 const std::string& chain,
+                                                 uint64_t height)
+{
+    // CALLER HOLDS m_blocks_mutex.
+    if (height == 0) return std::nullopt;
+    auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (it == m_found_blocks.end() || it->height != 0) return std::nullopt;
+    it->height = height;
+    LOG_INFO << "[Pool] found-block height learned: hash=" << hash.substr(0, 16)
+             << " chain=" << chain << " h=0 -> " << height;
+    // Same order record_found_block keeps: newest first by height, ts breaks
+    // ties. The row's interval was derived from its old place (none, at the
+    // bottom); the recompute re-derives every interval still unknown.
+    std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+        [](const FoundBlock& a, const FoundBlock& b) {
+            if (a.height != b.height) return a.height > b.height;
+            return a.ts > b.ts;
+        });
+    recompute_found_block_luck_locked();
+    for (const auto& b : m_found_blocks)
+        if (b.hash == hash && b.chain == chain) return b;
+    return std::nullopt;
+}
+
+void MiningInterface::backfill_found_block_heights(const block_height_lookup_fn& height_fn)
+{
+    if (!height_fn) return;
+    // Snapshot the rows still at height 0, then ask the lookup with the lock
+    // released: it may read a header chain or tracker with locks of its own.
+    std::vector<std::pair<std::string, std::string>> unknown;   // (hash, chain)
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.height == 0 && !b.hash.empty())
+                unknown.emplace_back(b.hash, b.chain);
+    }
+    std::vector<FoundBlock> learned;
+    for (const auto& [hash, chain] : unknown) {
+        uint64_t h = 0;
+        try { h = height_fn(hash); } catch (...) { h = 0; }
+        if (h == 0) continue;
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (auto row = learn_found_block_height_locked(hash, chain, h))
+            learned.push_back(std::move(*row));
+    }
+    // Persist outside m_blocks_mutex (the LevelDB writer), as backfill does.
+    if (m_persist_block_fn) {
+        for (const auto& b : learned) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found block height: " << e.what();
+            }
+        }
+    }
+    if (!unknown.empty())
+        LOG_INFO << "[Pool] found blocks at unknown height: " << unknown.size()
+                 << ", height learned for " << learned.size();
+}
+
 void MiningInterface::load_persisted_found_blocks()
 {
     if (!m_load_blocks_fn) return;
@@ -4553,11 +4648,20 @@ void MiningInterface::load_persisted_found_blocks()
         for (auto& blk : blocks)
         {
             bool exists = false;
-            for (const auto& existing : m_found_blocks)
+            for (auto& existing : m_found_blocks)
             {
                 if (existing.hash == blk.hash && existing.chain == blk.chain)
                 {
                     exists = true;
+                    // The persisted key carries the height, so a block whose
+                    // height was learned after it was first stored can be on
+                    // disk twice, the height-0 key listing first. A row only
+                    // ever climbs out of height 0, so the record at a real
+                    // height is the newer one: it wins whatever the order.
+                    if (existing.height == 0 && blk.height != 0) {
+                        existing = std::move(blk);
+                        existing.from_history = true;
+                    }
                     break;
                 }
             }
@@ -4746,25 +4850,24 @@ void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify
     m_chain_verify_fns[chain] = std::move(fn);
 }
 
-void MiningInterface::verify_found_block(size_t index)
+void MiningInterface::verify_found_block(const std::string& block_hash)
 {
-    std::string hash;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index >= m_found_blocks.size()) return;
-        auto& blk = m_found_blocks[index];
-        if (blk.status != BlockStatus::pending) return;
-        blk.check_count++;
-        hash = blk.hash;
-    }
-
-    // Select chain-specific verifier, fall back to default
+    // The row is found by hash under the lock each time it is touched: the
+    // verdict below runs unlocked, and record_found_block re-sorts the list
+    // on every insert, so no index survives from one lock to the next.
+    const std::string hash = block_hash;
     std::string chain;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index < m_found_blocks.size())
-            chain = m_found_blocks[index].chain;
+        auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+            [&](const FoundBlock& b) { return b.hash == hash; });
+        if (it == m_found_blocks.end()) return;
+        if (it->status != BlockStatus::pending) return;
+        it->check_count++;
+        chain = it->chain;
     }
+
+    // Select chain-specific verifier, fall back to default
     block_verify_fn_t verify_fn;
     auto it = m_chain_verify_fns.find(chain);
     if (it != m_chain_verify_fns.end())
@@ -4779,8 +4882,10 @@ void MiningInterface::verify_found_block(size_t index)
     try { result = verify_fn(hash); } catch (...) {}
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (index >= m_found_blocks.size()) return;
-    auto& blk = m_found_blocks[index];
+    auto row = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (row == m_found_blocks.end()) return;
+    auto& blk = *row;
     if (blk.status != BlockStatus::pending) return;
 
     const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
@@ -4892,28 +4997,24 @@ void MiningInterface::verify_found_block(size_t index)
 
 int MiningInterface::run_block_verification_now(const std::string& block_hash)
 {
-    size_t idx = SIZE_MAX;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
-            if (m_found_blocks[i].hash == block_hash) { idx = i; break; }
-        }
-    }
-    if (idx == SIZE_MAX) return std::numeric_limits<int>::min();
-
     // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
-    verify_found_block(idx);
+    // It finds the row by hash (an unknown hash is a no-op), and the outcome
+    // is read back by hash too.
+    verify_found_block(block_hash);
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (idx >= m_found_blocks.size()) return std::numeric_limits<int>::min();
-    switch (m_found_blocks[idx].status) {
-        case BlockStatus::confirmed:
-            return static_cast<int>(m_found_blocks[idx].confirmations);
-        case BlockStatus::orphaned:
-            return -1;
-        default:
-            return 0;
+    for (const auto& blk : m_found_blocks) {
+        if (blk.hash != block_hash) continue;
+        switch (blk.status) {
+            case BlockStatus::confirmed:
+                return static_cast<int>(blk.confirmations);
+            case BlockStatus::orphaned:
+                return -1;
+            default:
+                return 0;
+        }
     }
+    return std::numeric_limits<int>::min();
 }
 
 void MiningInterface::schedule_block_verification(const std::string& block_hash)
@@ -4985,11 +5086,16 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
         block_time_sec * 10,        // ~10 confs (final)
     };
 
+    // Each check finds the row by its HASH when it fires. The list is kept
+    // newest-first by height and re-sorted on every insert, so an index taken
+    // now names a different block as soon as another one is recorded inside
+    // this window -- its checks then land on the newcomer and this block can
+    // be left pending.
     for (int delay : delays) {
         auto timer = std::make_shared<boost::asio::steady_timer>(
             ioc, std::chrono::seconds(delay));
-        timer->async_wait([this, idx, timer](boost::system::error_code ec) {
-            if (!ec) verify_found_block(idx);
+        timer->async_wait([this, block_hash, timer](boost::system::error_code ec) {
+            if (!ec) (void)run_block_verification_now(block_hash);
         });
     }
 }

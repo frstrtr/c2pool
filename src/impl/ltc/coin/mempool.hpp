@@ -732,6 +732,25 @@ public:
         return resolved;
     }
 
+    /// Mark every transaction fee-unknown (quarantined): revalidate_inputs
+    /// skips it and recompute_unknown_fees prices it again from the UTXO set.
+    /// For a UTXO set that was wiped and is being rebuilt: an input missing
+    /// from the refilling set is not yet reconnected, not spent, so a priced
+    /// transaction must not be evicted for it. Same as BIP110's
+    /// Mempool::requarantine_all after a reorg. Returns how many were priced.
+    int requarantine_all() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int n = 0;
+        for (auto& [txid, entry] : m_pool) {
+            if (entry.fee_known)
+                ++n;
+            entry.fee_known = false;
+            entry.fee = 0;
+        }
+        m_feerate_index.clear();
+        return n;
+    }
+
     /// Re-validate all fee-known mempool transactions against the UTXO set.
     /// Evicts any transaction whose inputs are no longer in the UTXO set
     /// (i.e., were spent by a confirmed block but not caught by remove_for_block's

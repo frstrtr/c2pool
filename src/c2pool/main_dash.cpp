@@ -367,6 +367,7 @@ struct AlertRelayCli {
     std::vector<std::string> to, accept;
     int64_t offline_after = 300, online_after = 60, min_interval = 600;
     int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
+    int64_t serve_stall_after = 300;   // node-level WORK_STALLED threshold (0 = off)
     bool any() const { return origin || telegram || forward; }
 };
 AlertRelayCli g_alert_relay;
@@ -539,6 +540,8 @@ void print_banner(const char* argv0)
         << "           [--alert-relay-offline-after S] [--alert-relay-online-after S] [--alert-relay-min-interval S]\n"
         << "           [--alert-relay-startup-grace S] [--alert-relay-stall-after S]\n"
         << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
+        << "           [--alert-relay-serve-stall-after S]  (origin: no work handed to hashing miners\n"
+        << "              this long => WORK_STALLED, then WORK_RESUMED; default 300, 0 = off)\n"
         << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
         << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
@@ -548,7 +551,7 @@ void print_banner(const char* argv0)
         << "           [--pin-local-tx-hex FILE]  (zero-fee self-mined tx, e.g. donation consolidation)\n"
         << "           [--pin-splice-xcheck-arm]  (let pins ride an xcheck-SWAPPED dashd template; default OFF)\n"
         << "           [--pin-splice-block-budget] (EXCLUDE a pin that pushes the template past the block size cap; default OFF)\n"
-        << "           [--bestcl-policy freshness|consensus-exact]\n"
+        << "           [--bestcl-policy consensus-exact|freshness]\n"
         << "           [--embedded-oracle-shadow]\n"
         << "           [--embedded-shadow-compare]\n"
         << "           [--serve-staleness-sentinel=off]\n"
@@ -601,16 +604,17 @@ void print_banner(const char* argv0)
         << "        are transport only and NEVER move the arm. Even when armed, every\n"
         << "        per-template gate (SML fresh at tip, non-superblock, credit-pool seed\n"
         << "        height, bestCL, MN-payee cursor, DKG plan) fails closed to dashd.\n"
-        << "        --bestcl-policy selects HOW the bestCL gate decides. `freshness`\n"
-        << "        (DEFAULT) keeps the conservative proxy: refuse unless the best\n"
-        << "        observed ChainLock is within one block of the tip. `consensus-exact`\n"
-        << "        enforces dashcore CheckCbTxBestChainlock itself -- the committed\n"
-        << "        ChainLock must merely be non-null and NOT OLDER than the one the\n"
-        << "        previous block committed -- which is what dashd's own miner does\n"
-        << "        (it re-commits the previous block's signature when it holds nothing\n"
-        << "        fresher). Still fails closed: it refuses unless the previous block's\n"
+        << "        --bestcl-policy selects HOW the bestCL gate decides.\n"
+        << "        `consensus-exact` (DEFAULT) enforces dashcore CheckCbTxBestChainlock\n"
+        << "        itself -- the committed ChainLock must merely be non-null and NOT\n"
+        << "        OLDER than the one the previous block committed -- which is what\n"
+        << "        dashd's own miner does (it re-commits the previous block's signature\n"
+        << "        when it holds nothing fresher), so a ChainLock stall does not stop\n"
+        << "        serving. Still fails closed: it refuses unless the previous block's\n"
         << "        own committed ChainLock is held, and a value ADVANCED past it must\n"
-        << "        have passed local BLS verification.\n"
+        << "        have passed local BLS verification. `freshness` is the rollback:\n"
+        << "        the stricter proxy that refuses unless the best observed ChainLock\n"
+        << "        is within one block of the tip (dashd applies no such rule).\n"
         << "        --coin-p2p-magic HEX overrides the embedded coin-P2P wire magic\n"
         << "        (default mainnet bf0c6bbd / testnet cee2caff; regtest fcc1b7dc).\n"
         << "        --regtest-force-won-block (regtest E5 harness, fail-closed) drives\n"
@@ -959,7 +963,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // geometrically in this number (see p2p_client.hpp).
              std::size_t coin_p2p_peers =
                  dash::coin::p2p::CoinClient<dash::Config>::DEFAULT_POOL_PEERS,
-             const std::string& bestcl_policy = "freshness",
+             const std::string& bestcl_policy =
+                 dash::coin::bestcl_policy_name(dash::coin::kDefaultBestClPolicy),
              // --embedded-utxo-immature-serve-empty: pure-daemonless OPT-IN --
              // during the blocks_connected<106 window serve a coinbase-only
              // (empty mempool tx set) template: consensus-valid, fees exactly 0,
@@ -1613,6 +1618,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         ac.det.min_interval = g_alert_relay.min_interval;
         ac.det.startup_grace = g_alert_relay.startup_grace;
         ac.det.stall_after = g_alert_relay.stall_after;
+        ac.det.serve_stall_after = g_alert_relay.serve_stall_after;
         for (const auto& h : g_alert_relay.to) {
             da::Bytes pub;
             if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
@@ -1682,6 +1688,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << ac.det.offline_after << "s online-after=" << ac.det.online_after
                       << "s min-interval=" << ac.det.min_interval << "s grace="
                       << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
+                      << "s serve-stall-after=" << ac.det.serve_stall_after
                       << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
         }
         if (ac.telegram) {
@@ -4312,24 +4319,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // Display only; the callback runs after dispatch, never gates it.
             work_source->set_on_found_block_fn(
                 [ws](uint32_t height, const uint256& block_hash,
-                     const std::string& miner, bool reached_network) {
+                     const std::string& miner, bool reached_network,
+                     uint64_t subsidy) {
                     auto* mi = ws->get_mining_interface();
-                    // Subsidy: the WebServer-held template is empty on the
-                    // embedded arm (row 2516914 recorded subsidy=0 from it on
-                    // 2026-08-05); record_found_block now falls back to the
-                    // live coin template itself, so 0 here means "let the
-                    // core ask the template". Same for pool hashrate: this
-                    // site passed get_local_hashrate() into a field named
-                    // pool_hashrate_at_find — correct only while every rig
-                    // in the pool happens to sit on this node. 0 routes the
-                    // core to m_pool_hashrate_fn (the real pool estimator),
-                    // which is the rate expected_time/luck are defined over.
-                    uint64_t subsidy = 0;
-                    {
-                        auto tmpl = mi->get_current_work_template();
-                        if (!tmpl.is_null() && tmpl.contains("coinbasevalue"))
-                            subsidy = tmpl["coinbasevalue"].get<uint64_t>();
-                    }
+                    // Height and subsidy are the JOB's (the block's own BIP34
+                    // height and the coinbasevalue frozen with the job), not
+                    // the current template's: block 2561316 was solved on a
+                    // stale job on 2026-10-25 and recorded at h=0 with the
+                    // then-current template's subsidy. A 0 subsidy still lets
+                    // record_found_block fall back to the live coin template.
+                    // Pool hashrate: this site passed get_local_hashrate()
+                    // into a field named pool_hashrate_at_find — correct only
+                    // while every rig in the pool happens to sit on this node.
+                    // 0 routes the core to m_pool_hashrate_fn (the real pool
+                    // estimator), which is the rate expected_time/luck are
+                    // defined over.
                     mi->record_found_block(
                         height, block_hash,
                         static_cast<uint64_t>(std::time(nullptr)),
@@ -5114,7 +5118,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                 }
                 return samples;
-            }, static_cast<int64_t>(core::timestamp()));
+            }, static_cast<int64_t>(core::timestamp()),
+            // Node level (WORK_STALLED / WORK_RESUMED): when work was last
+            // handed to a miner -- the relaxed atomic the [STALE-SERVE]
+            // serve-silence check reads -- and, only when a WORK_STALLED is
+            // built, the serve gate's decline cause. embedded_arm_status_json()
+            // try-locks the serve gate, so this tick never waits on the serve
+            // path ("status-serve-gate-busy" is then the cause it names).
+            [&wsrc]() -> std::optional<dash::alert::ServeSample> {
+                if (!wsrc) return std::nullopt;
+                dash::alert::ServeSample s;
+                const int64_t at = wsrc->last_served_at_ms();
+                s.served_stamp = at;
+                s.served_age = at > 0 ? (dash::coin::diag::steady_now_ms() - at) / 1000 : -1;
+                s.cause = [w = wsrc]() {
+                    const auto j = w->embedded_arm_status_json();
+                    const auto it = j.find("no_work_reason");
+                    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+                };
+                return s;
+            });
         });
     }
 
@@ -6966,26 +6989,26 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // --embedded-mainnet); harmless otherwise (the arm is off, work_source
         // never consults viability).
         //
-        // POLICY SELECTION (--bestcl-policy, DEFAULT freshness = unchanged).
+        // POLICY SELECTION (--bestcl-policy, DEFAULT consensus-exact).
         // The freshness predicate is a PROXY: dashcore constrains the committed
         // ChainLock only relative to what the PREVIOUS BLOCK committed, never
-        // against the tip or wall-clock recency (dash v23.1.7
-        // src/evo/specialtxman.cpp:129-141). `consensus-exact` enforces that
-        // real rule instead — see NodeCoinState::set_bestcl_policy. Kept as a
-        // runtime flag, not a rebuild, so the conservative posture is one
-        // restart away if a soak ever disagrees.
-        if (!run_arm.embedded_arm_enabled) {
-            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Off);
-        } else if (bestcl_policy == "consensus-exact") {
-            node_coin_state.set_bestcl_policy(
-                dash::coin::BestClPolicy::ConsensusExact);
-            LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
-                        " (dashcore CheckCbTxBestChainlock rule; requires the"
-                        " tip block's own committed ChainLock)";
-        } else {
-            node_coin_state.set_bestcl_policy(dash::coin::BestClPolicy::Freshness);
-            LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
-                        " (conservative proxy: best CL within one block of tip)";
+        // against the tip or wall-clock recency (dash v23.1.7 / v23.1.8
+        // src/evo/specialtxman.cpp:62-71). `consensus-exact` enforces that
+        // real rule instead — see NodeCoinState::set_bestcl_policy — and is the
+        // default (dash::coin::kDefaultBestClPolicy records the 2026-10-25
+        // orphan that made it so). Kept as a runtime flag, not a rebuild, so
+        // the freshness rollback is one restart away.
+        {
+            const auto bcl = dash::coin::resolve_bestcl_policy(
+                run_arm.embedded_arm_enabled, bestcl_policy);
+            node_coin_state.set_bestcl_policy(bcl);
+            if (bcl == dash::coin::BestClPolicy::ConsensusExact)
+                LOG_INFO << "[EMB-DASH] bestCL gate policy = CONSENSUS-EXACT"
+                            " (dashcore CheckCbTxBestChainlock rule; requires the"
+                            " tip block's own committed ChainLock)";
+            else if (bcl == dash::coin::BestClPolicy::Freshness)
+                LOG_INFO << "[EMB-DASH] bestCL gate policy = FRESHNESS"
+                            " (rollback proxy: best CL within one block of tip)";
         }
 
         // SOAK FIX (bad-cbtx-assetlocked-amount): the DIP-0027 credit-pool seed
@@ -10759,12 +10782,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 h.SetHex(hash_hex);
 
                 // Recorded mint height for this hash (authoritative for orphans).
+                // Height 0 is "unknown" -- a stale-job row recorded before the
+                // work source read the job's own height -- never a block we
+                // could have mined; asking which block won height 0 left such
+                // a row pending forever. Fall through to the header chain.
                 uint32_t found_height = 0;
                 bool have_height = false;
                 for (const auto& b : mi->get_found_blocks()) {
                     if (b.hash == hash_hex) {
                         found_height = static_cast<uint32_t>(b.height);
-                        have_height = true;
+                        have_height = found_height != 0;
                         break;
                     }
                 }
@@ -10840,6 +10867,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             };
             // One-shot backfill of rows restored from persistence.
             cache_mi->backfill_block_fields(diff_lookup, ts_lookup);
+            // A row restored at height 0 (a stale-job block recorded before
+            // the work source read the job's own height) takes its height from
+            // the header chain when the chain holds that header; the re-verify
+            // pass below then resolves it at that height.
+            cache_mi->backfill_found_block_heights(
+                [hc](const std::string& block_hash_hex) -> uint64_t {
+                    uint256 h;
+                    h.SetHex(block_hash_hex);
+                    auto e = hc->get_header(h);
+                    return e ? static_cast<uint64_t>(e->height) : 0;
+                });
             // Retain the same lookups so the record + confirm paths can fill a
             // missing network_difficulty for blocks won AFTER this backfill runs
             // (sharechain-replay / relay wins recorded seconds into boot), whose
@@ -11108,6 +11146,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // to a serve decision, an arm flip, or a template byte. A false positive
     // costs a page; a blocking detector's false positive would cost 26 rigs an
     // outage, which is strictly worse than the failure it guards.
+    //
+    // The serve-silence condition (D3) also PAGES when an alert-relay origin
+    // is armed: the alert tick reads the same last_served_at_ms() datum and
+    // sends WORK_STALLED / WORK_RESUMED (impl/dash/alert_detector.hpp, NODE
+    // LEVEL). It does not depend on this sentinel or its kill switch.
     //
     // HEIGHT SOURCE — a deliberate deviation from the approved plan, stated
     // plainly. The plan called for `dashd getblockcount` on the sentinel's own
@@ -11760,7 +11803,10 @@ int main(int argc, char** argv)
     // rotation. DEFAULT OFF — the coin client keeps its stall-only rotation,
     // byte-identical to master.
     bool embedded_proactive_rotate = false;
-    std::string bestcl_policy = "freshness";   // --bestcl-policy: freshness (default, conservative proxy) | consensus-exact (dashcore's actual CheckCbTxBestChainlock rule)
+    // --bestcl-policy: consensus-exact (default, dashcore's actual
+    // CheckCbTxBestChainlock rule) | freshness (rollback, the stricter proxy).
+    std::string bestcl_policy =
+        dash::coin::bestcl_policy_name(dash::coin::kDefaultBestClPolicy);
     bool embedded_oracle_shadow = false;       // --embedded-oracle-shadow: per-block dashd cross-check (OBSERVE-only)
     bool embedded_shadow_compare = false;      // --embedded-shadow-compare: serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
     // Serve-staleness sentinel (2026-08-07 dead-height incident): DEFAULT ON.
@@ -12037,6 +12083,10 @@ int main(int argc, char** argv)
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_every)) return 1;
             ++i;
         }
+        else if (std::strcmp(argv[i], "--alert-relay-serve-stall-after") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.serve_stall_after)) return 1;
+            ++i;
+        }
         else if (std::strcmp(argv[i], "--alert-relay-retry-max") == 0 && i + 1 < argc) {
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
             ++i;
@@ -12057,8 +12107,16 @@ int main(int argc, char** argv)
             replay_utxo_hash = true;
         else if (std::strcmp(argv[i], "--replay-utxo-expect") == 0 && i + 1 < argc)
             replay_utxo_expect = argv[++i];
-        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--bestcl-policy") == 0 && i + 1 < argc) {
             bestcl_policy = argv[++i];
+            // Refuse a value we do not know rather than guess a policy: a
+            // typo must not silently select either gate.
+            if (!dash::coin::parse_bestcl_policy(bestcl_policy)) {
+                std::cerr << "error: --bestcl-policy expects consensus-exact or"
+                             " freshness, got '" << bestcl_policy << "'\n";
+                return 1;
+            }
+        }
         else if (std::strcmp(argv[i], "--coinbase-text") == 0 && i + 1 < argc)
             coinbase_text = argv[++i];
         // Cross-restart cumulative serve-gate accounting (#127 follow-up):

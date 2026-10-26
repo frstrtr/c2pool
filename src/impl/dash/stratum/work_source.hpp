@@ -519,13 +519,19 @@ public:
     /// mining_submit the moment a submission meets the full network block
     /// target AND is dispatched to the network (NOT on a local payee-guard
     /// reject). Carries the block height, the X11 block hash (== pow_hash for
-    /// DASH), the submitting miner, and whether at least one network sink was
-    /// reached. main_dash.cpp binds this to MiningInterface::record_found_block
-    /// so DASH block wins appear in the found-block history. Display only —
-    /// never gates the won-block dispatch. While unbound this is a no-op.
+    /// DASH), the submitting miner, whether at least one network sink was
+    /// reached, and the block's subsidy. Height and subsidy are the JOB's (the
+    /// coinbase's BIP34 height and the coinbasevalue frozen with the job), not
+    /// the current template's: a solve on a stale job must be recorded at the
+    /// height it was built at, or the confirm/orphan lane checks the wrong
+    /// height (won_block_record.hpp). Height 0 means unknown. main_dash.cpp
+    /// binds this to MiningInterface::record_found_block so DASH block wins
+    /// appear in the found-block history. Display only — never gates the
+    /// won-block dispatch. While unbound this is a no-op.
     using FoundBlockFn =
         std::function<void(uint32_t height, const uint256& block_hash,
-                           const std::string& miner, bool reached_network)>;
+                           const std::string& miner, bool reached_network,
+                           uint64_t subsidy)>;
     void set_on_found_block_fn(FoundBlockFn fn);
 
     /// Wire the CUMULATIVE cross-restart serve-gate ledger to its persisted

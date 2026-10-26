@@ -1204,9 +1204,10 @@ public:
     // verdict — >0 confirmations (confirmed), <0 orphaned, 0 pending,
     // INT_MIN if the hash is not a recorded found block. This drives the exact
     // production status-transition code (verify_found_block); the async
-    // schedule_block_verification() above is the live driver. Added for the
-    // DASH orphan-lane tests so the pending→confirmed / pending→orphaned flips
-    // can be asserted deterministically without waiting on real timers.
+    // schedule_block_verification() above is the live driver, and its timers
+    // call this so each check finds the row by hash when it fires. Added for
+    // the DASH orphan-lane tests so the pending→confirmed / pending→orphaned
+    // flips can be asserted deterministically without waiting on real timers.
     int run_block_verification_now(const std::string& block_hash);
 
     /// Read-only access to found blocks (for sharechain window grid).
@@ -1244,6 +1245,15 @@ public:
     using block_diff_lookup_fn = std::function<double(const std::string& block_hash)>;
     using block_ts_lookup_fn = std::function<uint32_t(const std::string& block_hash)>;
     void backfill_block_fields(block_diff_lookup_fn diff_fn, block_ts_lookup_fn ts_fn);
+
+    /// Give every found block still at height 0 (unknown) the height the
+    /// lookup knows for its hash (0 = still unknown), through the same path a
+    /// later record carrying a real height takes: re-sort, re-derive luck,
+    /// persist. One-shot at startup, beside backfill_block_fields. A height-0
+    /// row is a stale-job block recorded before the work source read the
+    /// job's own height; the confirm/orphan lane cannot resolve it at 0.
+    using block_height_lookup_fn = std::function<uint64_t(const std::string& block_hash)>;
+    void backfill_found_block_heights(const block_height_lookup_fn& height_fn);
 
     /// #946: fill the explorer body fields (coinbase_txid, tx_count) on the
     /// already-recorded row(s) for this block hash. Fill-only: a known value
@@ -1316,6 +1326,13 @@ private:
     /// CALLER MUST HOLD m_blocks_mutex. Coin-generic; run at load and again
     /// after backfill_block_fields fills a previously-missing network_difficulty.
     void recompute_found_block_luck_locked();
+    /// Give the row (hash, chain) `height` if it is still at 0 (unknown).
+    /// Height only ever climbs out of 0; a known height is never changed.
+    /// Re-sorts the list (references into it are invalid afterwards) and
+    /// re-derives the luck series. Returns the updated row, to persist.
+    /// CALLER MUST HOLD m_blocks_mutex.
+    std::optional<FoundBlock> learn_found_block_height_locked(
+        const std::string& hash, const std::string& chain, uint64_t height);
     /// One /recent_blocks row. Shared by rest_recent_blocks and
     /// rest_found_block so the two can never drift apart.
     /// CALLER MUST HOLD m_blocks_mutex.
@@ -1792,7 +1809,10 @@ private:
     void augment_with_coin_sync_status(nlohmann::json& result);
     block_verify_fn_t m_block_verify_fn;  // default (parent chain)
     std::map<std::string, block_verify_fn_t> m_chain_verify_fns; // per-chain
-    void verify_found_block(size_t index);
+    // One verification pass for the row with this hash. The row is looked up
+    // under m_blocks_mutex each time it is touched, never by a remembered
+    // index: record_found_block re-sorts the list on every insert.
+    void verify_found_block(const std::string& block_hash);
 
     // Pool start time for /uptime
     std::chrono::steady_clock::time_point m_start_time{std::chrono::steady_clock::now()};

@@ -1655,6 +1655,7 @@ private:
             PathbNode::CarrierTicket t;
             std::uint64_t fresh = 0;
             bool rx_fail = false;
+            std::string rx_why;
             {
                 const NodeGuard g(*this);
                 if (!running_) {
@@ -1664,12 +1665,13 @@ private:
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
                     t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
-                } catch (const RandomxFailure&) {
+                } catch (const RandomxFailure& e) {
                     rx_fail = true;
+                    rx_why = e.what();
                 }
             }
             if (rx_fail) {
-                rx_failed(std::move(j), "carrier");
+                rx_failed(std::move(j), "carrier", rx_why);
                 return;
             }
             // the token stays spent for a STRIKE or a BAN (begin_carrier's verdict is final for both); a solicited
@@ -1684,6 +1686,7 @@ private:
         std::vector<NodeEventResult> rs;
         Effects fx;
         bool rx_fail = false;
+        std::string rx_why;
         std::uint64_t fresh = 0;
         {
             const NodeGuard g(*this);
@@ -1693,8 +1696,9 @@ private:
             }
             try {
                 rs = node_->on_receipts(j.peer, j.frame);
-            } catch (const RandomxFailure&) {
+            } catch (const RandomxFailure& e) {
                 rx_fail = true;
+                rx_why = e.what();
             }
             if (!rx_fail)
                 for (const NodeEventResult& r : rs) {
@@ -1712,7 +1716,7 @@ private:
                 }
         }
         if (rx_fail) {
-            rx_failed(std::move(j), "receipt");
+            rx_failed(std::move(j), "receipt", rx_why);
             return;
         }
         if (!j.solicited && fresh > 0) valid_count(j.peer, fresh);  // its first placement, a re-run or not
@@ -1731,18 +1735,20 @@ private:
         NodeEventResult r;
         Effects fx;
         bool rx_fail = false;
+        std::string rx_why;
         {
             const NodeGuard g(*this);
             try {
                 r = node_->complete_carrier(std::move(t));
-            } catch (const RandomxFailure&) {
+            } catch (const RandomxFailure& e) {
                 rx_fail = true;
+                rx_why = e.what();
             }
             if (!rx_fail) after_result_locked(peer, r, digest, fx, !solicited);
             take_rx_failed_locked(fx);
         }
         if (rx_fail) {
-            rx_alarm("carrier placement");
+            rx_alarm("carrier placement", rx_why);
             park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
             run_effects(fx);
             return;
@@ -1769,18 +1775,19 @@ private:
         log("relay: peer " + std::to_string(p) + ": claim-leaf alarm budget empty (P-50) -> link dropped, no ban");
         defer_drop(p, src_of(p), false);
     }
-    void rx_failed(Job j, const char* where) {
-        rx_alarm(where);
+    void rx_failed(Job j, const char* where, const std::string& why) {
+        rx_alarm(where, why);
         refund(j);
         j.rerun = true;  // run again (not gated again; counted at its first placement)
         park_job(std::move(j), now_ms() + kParkRetryMs);
     }
-    // The alarm: every failure counted; a log line when RandomX starts failing and one when a hash is computed again
-    // (rx_tick).
-    void rx_alarm(const std::string& where) {
+    // The alarm: every failure counted; a log line when RandomX starts failing (where, and the failure's reason) and
+    // one when a hash is computed again (rx_tick).
+    void rx_alarm(const std::string& where, const std::string& why = {}) {
         st_.rx_failures++;
         rx_mark_ = rx_ok_.load();
-        if (!rx_failing_.exchange(true)) log("relay: RandomX failing (" + where + "): frames parked and run again");
+        if (!rx_failing_.exchange(true))
+            log("relay: RandomX failing (" + where + (why.empty() ? "" : ": " + why) + "): frames parked and run again");
     }
     void rx_tick() {
         if (rx_failing_.load() && rx_ok_.load() > rx_mark_.load() && rx_failing_.exchange(false))
@@ -1863,14 +1870,41 @@ private:
         std::vector<ParkedFrame> rx_retry;                  // frames whose admission failed with a RandomX failure
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
+        std::vector<std::string> lines;                     // the STRIKE / REFUSE lines of the drained carriers
+        std::vector<PathbNode::DrainedResult> penalties;    // the STRIKE and BAN verdicts of the drained carriers
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
-    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are,
+    // and their STRIKE and BAN verdicts charged to their senders as a received frame's are (run_effects).
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
-        for (const PathbNode::DrainedResult& d : node_->take_drained())
+        for (const PathbNode::DrainedResult& d : node_->take_drained()) {
             account_locked(d.peer, d.action, d.row, d.verdict, d.omitted, d.repended, d.lost);
+            if (d.verdict == AdmitVerdict::Strike || d.verdict == AdmitVerdict::Refuse)
+                fx.lines.push_back("relay: peer " + std::to_string(d.peer) +
+                                   (d.verdict == AdmitVerdict::Strike ? " STRIKE: " : " REFUSE: ") +
+                                   admission_text(d.row, d.object));
+            if (d.peer != 0 && d.peer != PathbNode::kOwnPeer &&
+                (d.verdict == AdmitVerdict::Strike || d.verdict == AdmitVerdict::Ban))
+                fx.penalties.push_back(d);
+        }
+    }
+    // After the node lock: a drained carrier's STRIKE costs its sender the verdict's tokens and its BAN bans the sender
+    // with its reason, as for a received frame (apply_result). A sender whose link is gone by then: one line, nothing
+    // applied.
+    void apply_drained(const PathbNode::DrainedResult& d) {
+        const bool ban_v = d.verdict == AdmitVerdict::Ban;
+        const std::string why = "admission row R" + std::to_string(static_cast<int>(d.row)) + " of " + hex_short(d.object != Hash32{} ? d.object : d.id);
+        if (!peer_known(d.peer)) {
+            log("relay: peer " + std::to_string(d.peer) + " gone: drained " + (ban_v ? "BAN" : "STRIKE") +
+                " not applied: " + why);
+            return;
+        }
+        if (ban_v)
+            ban(d.peer, why);
+        else
+            strike(d.peer, std::max<std::uint32_t>(d.strike, 1), false);
     }
     // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
     // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
@@ -2198,19 +2232,29 @@ private:
         q.want_bodies = true;
         if (const std::optional<std::vector<std::uint8_t>> f = encode_fc_getcarrier(q, p_)) node_send(peer, *f);
     }
-    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN).
+    // The text of an admission line: its row and the id of the body it names.
+    static std::string admission_text(RowId row, const Hash32& id) {
+        return "admission row R" + std::to_string(static_cast<int>(row)) + " of " + hex_short(id);
+    }
+    // The tokens of an outcome; true: the job's token is kept (STRIKE or BAN). A STRIKE, REFUSE or BAN logs its row and
+    // the id of the body it names.
     bool apply_result(std::uint64_t peer, const NodeEventResult& r, bool token_taken) {
         for (const auto& [q, n] : r.admit.peer_tokens) strike(q, n, false);
+        const auto named = [&]() { return admission_text(r.admit.row, r.admit.id != Hash32{} ? r.admit.id : r.object); };
         switch (r.admit.verdict) {
-            case AdmitVerdict::Strike: strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken); return true;
-            case AdmitVerdict::Ban:
-                ban(peer, "admission row R" + std::to_string(static_cast<int>(r.admit.row)) + " of " + hex_short(r.admit.id));
+            case AdmitVerdict::Strike:
+                log("relay: peer " + std::to_string(peer) + " STRIKE: " + named());
+                strike(peer, std::max<std::uint32_t>(r.admit.strike, 1), token_taken);
                 return true;
+            case AdmitVerdict::Ban: ban(peer, named()); return true;
+            case AdmitVerdict::Refuse: log("relay: peer " + std::to_string(peer) + " REFUSE: " + named()); return false;
             case AdmitVerdict::Drop: st_.drops++; return false;
             default: return false;
         }
     }
     void run_effects(Effects& fx) {
+        for (const std::string& l : fx.lines) log(l);  // after the node lock
+        fx.lines.clear();
         for (ParkedFrame& f : fx.rx_retry) {  // parked and run again (no token)
             rx_alarm("released carrier");
             park_job(Job{Job::Kind::Carrier, f.peer, src_of(f.peer), std::move(f.frame), 0, f.solicited, true},
@@ -2223,6 +2267,8 @@ private:
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
         fx.p15.clear();
+        for (const PathbNode::DrainedResult& d : fx.penalties) apply_drained(d);
+        fx.penalties.clear();
         for (std::size_t i = 0; i < fx.bans.size(); ++i) ban(fx.bans[i], i < fx.bans_why.size() ? fx.bans_why[i] : std::string());
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
@@ -2853,8 +2899,9 @@ private:
             }
             try {
                 o = node_->on_headers(p, f, now_s());
-            } catch (const RandomxFailure&) {  // node-internal, a local alarm; no token; the catch-up asks again
-                rx_alarm("headers");
+            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
+                rx_alarm("headers of peer " + std::to_string(p), e.what());
+                log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
             }
             {
@@ -3172,7 +3219,7 @@ private:
             }
             // a RandomX failure in the attempt: node-internal, the alarm; no token; the pair re-queued, tried again as
             // after a non-service
-            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt");
+            if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt", s->report->what);
             if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
                 join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
         }
@@ -4102,8 +4149,8 @@ private:
                                 return it->second;
                             },
                             w.bound, ctx_.rx, o_.ctx_block_cap);
-                } catch (const RandomxFailure&) {  // node-internal, a local alarm; the context is judged again later
-                    rx_alarm("context " + hex_short(id));
+                } catch (const RandomxFailure& e) {  // node-internal, a local alarm; the context is judged again later
+                    rx_alarm("context " + hex_short(id), e.what());
                     return false;
                 }
             } else {

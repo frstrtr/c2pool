@@ -53,6 +53,41 @@
 //   refused events stay pending (they fire when the window frees up if the
 //   condition still holds) -- nothing is silently lost.
 //
+// NODE LEVEL: NO WORK SERVED (tick() with a ServeSample). The worker rules
+// above see rigs; they cannot see the node itself stop handing out work while
+// every rig stays connected. That is what lost block 2561316 on 2026-10-25:
+// the bestCL gate declined templates for 376 s on a daemonless node, the 26
+// attached rigs kept hashing the last job, and the block they found sat on a
+// dead parent. The [STALE-SERVE] serve-silence check logged it at 300 s, and
+// nothing reached the operator.
+//   WORK_STALLED  fires once per episode when no template has been handed to
+//               a miner for serve_stall_after seconds while HASHING sessions
+//               are attached, not inside the startup grace, and not within
+//               min_interval of the previous WORK_STALLED. The quiet time
+//               counts from the later of the last hand-out and the start of
+//               the attached span (a span survives a gap shorter than
+//               kServeDetachGrace, so a reconnecting rig does not restart it).
+//               The detail names the duration, the serve gate's decline cause
+//               and the attached sessions.
+//   WORK_RESUMED fires once a template has been handed out again after a
+//               WORK_STALLED (an episode that stalls again before it could be
+//               sent simply stays open).
+//   Hashing session = a session of a worker that is not standby (it hashed
+//   here, in this process or persisted, or has an OFFLINE outstanding).
+//   Standby-only (or no) sessions never page: a standby connection is a
+//   failover link that never submits here, so no hashrate is lost on this
+//   node; a rig that does hash here stops being standby with its first
+//   accepted share and stays so across restarts. The one case this misses is
+//   a rig that fails over here, from a dead pool, while this node is already
+//   stalled: it never gets a job, so it never leaves standby.
+//   Budget: the node-level events have their OWN rolling hour, at most
+//   serve_max_per_hour (default 4), outside the worker cap. Sharing the worker
+//   cap would let a rig flap (26 OFFLINE + 26 BACK_ONLINE fills 30/h) hold a
+//   real WORK_STALLED back for up to an hour. An event the budget refuses
+//   stays pending and fires when the window frees, if it is still due.
+//   An outstanding WORK_STALLED persists across a restart so the episode
+//   still ends with one WORK_RESUMED and is not paged twice.
+//
 // Persistence (restore()/persist()): known workers with their last-seen time,
 // whether an OFFLINE is outstanding and, for a worker that was down, when its
 // outage began, so a restart neither forgets a rig that never reconnects nor
@@ -87,6 +122,7 @@ struct WorkerSample {
 };
 
 struct DetectorConfig {
+    int64_t serve_stall_after{300};    // node: no work handed out this long, hashing miners attached (0 = off)
     int64_t offline_after{300};
     int64_t online_after{60};
     int64_t min_interval{600};
@@ -97,7 +133,8 @@ struct DetectorConfig {
     // ... and no older than this (address still mining)
     int64_t returned_horizon{core::stratum::kElsewhereHorizonSeconds};
     int64_t returned_defer_max{120};   // chain unreadable this long -> page anyway
-    std::size_t max_per_hour{30};
+    std::size_t max_per_hour{30};            // worker events (OFFLINE / BACK_ONLINE)
+    std::size_t serve_max_per_hour{4};       // node-level events, own budget outside max_per_hour
     int64_t known_expiry{7 * 86400};   // forget workers absent this long
     std::size_t max_workers{4096};     // memory bound on tracked keys
 };
@@ -116,6 +153,20 @@ inline std::string fmt_duration(int64_t s)
     if (s < 7200) return std::to_string(s / 60) + "m";
     return std::to_string(s / 3600) + "h" + std::to_string((s % 3600) / 60) + "m";
 }
+
+// One tick's view of the node's serve path, for the node-level events (see
+// NODE LEVEL above). The [STALE-SERVE] serve-silence check reads the same
+// datum: when a template was last handed to a miner.
+struct ServeSample {
+    // Changes whenever a template is handed to a miner; 0 = none yet in this
+    // process. Opaque: only "differs from the stamp at the WORK_STALLED" is used.
+    int64_t served_stamp{0};
+    // Seconds since that hand-out, on the caller's monotonic clock; < 0 = never.
+    int64_t served_age{-1};
+    // Why no work is produced (the serve gate's EMBED-GATE decline cause, e.g.
+    // "bestcl-stale"). Called only when a WORK_STALLED event is built.
+    std::function<std::string()> cause;
+};
 
 // Newest sharechain share time (unix seconds) carrying this payout address and
 // minted on another node; 0 = none in the walked window; nullopt = the chain
@@ -145,6 +196,23 @@ public:
         int64_t outage_since{0};
     };
 
+    // Node-level serve state (NODE LEVEL above).
+    struct ServeState {
+        int64_t attached_since{0};    // start of the span with hashing sessions attached; 0 = none
+        int64_t detached_at{0};       // when the last hashing session left; 0 = attached
+        bool    alerted{false};       // a WORK_STALLED is outstanding (persisted)
+        int64_t stall_since{0};       // when that outage began (persisted)
+        int64_t last_alert{0};        // time of the last WORK_STALLED (persisted)
+        int64_t alert_stamp{0};       // served_stamp at that WORK_STALLED (0 after a restart)
+        std::string cause;            // the cause it named (persisted)
+        int64_t quiet{0};             // last tick: seconds without work, hashing miners attached
+        std::size_t sessions{0};      // last tick: hashing sessions attached
+        std::size_t standby{0};       // last tick: standby sessions attached
+    };
+
+    // A span of attached hashing sessions survives a gap this short.
+    static constexpr int64_t kServeDetachGrace = 60;
+
     AlertDetector(DetectorConfig cfg, int64_t start_ts)
         : m_cfg(cfg), m_start(start_ts), m_grace_until(start_ts + cfg.startup_grace) {}
 
@@ -152,6 +220,9 @@ public:
     int64_t grace_until() const { return m_grace_until; }
     const std::map<std::string, State>& workers() const { return m_workers; }
     uint64_t suppressed_by_cap() const { return m_suppressed; }
+    // Node-level events the serve budget held back (once per held event).
+    uint64_t serve_held_by_budget() const { return m_serve_held; }
+    const ServeState& serve_state() const { return m_serve; }
     // Bumped whenever persisted state changes (new worker, up/down, alert
     // emitted, worker forgotten) -- NOT on the per-tick last_seen refresh.
     uint64_t generation() const { return m_gen; }
@@ -185,6 +256,29 @@ public:
         ++m_gen;
     }
 
+    // An outstanding WORK_STALLED, so a restart neither re-pages the episode
+    // nor loses its WORK_RESUMED. Empty object when none is outstanding.
+    nlohmann::json persist_serve() const
+    {
+        if (!m_serve.alerted) return nlohmann::json::object();
+        return {{"alerted", true}, {"stall_since", m_serve.stall_since},
+                {"last_alert", m_serve.last_alert}, {"cause", m_serve.cause}};
+    }
+
+    void restore_serve(const nlohmann::json& j)
+    {
+        if (!j.is_object() || !j.value("alerted", false)) return;
+        const int64_t since = j.value("stall_since", int64_t{0});
+        if (since <= 0 || m_start - since > m_cfg.known_expiry) return;
+        m_serve.alerted = true;
+        m_serve.stall_since = since;
+        m_serve.last_alert = j.value("last_alert", int64_t{0});
+        m_serve.cause = j.contains("cause") && j["cause"].is_string() ? j["cause"].get<std::string>() : std::string();
+        // Stamps are per process: the first hand-out after the restart ends it.
+        m_serve.alert_stamp = 0;
+        ++m_gen;
+    }
+
     nlohmann::json persist() const
     {
         nlohmann::json j = nlohmann::json::object();
@@ -200,7 +294,10 @@ public:
         return j;
     }
 
-    std::vector<DetectorEvent> tick(const std::vector<WorkerSample>& samples, int64_t now)
+    // `serve` (optional) adds the node-level rules; without it only the
+    // worker rules run.
+    std::vector<DetectorEvent> tick(const std::vector<WorkerSample>& samples, int64_t now,
+                                    const ServeSample* serve = nullptr)
     {
         std::vector<DetectorEvent> out;
 
@@ -298,6 +395,10 @@ public:
             }
         }
 
+        // 3b) node level: no work handed out while hashing miners are attached.
+        // Ahead of the worker events, so the hourly cap admits it first.
+        if (serve && m_cfg.serve_stall_after > 0) serve_check(*serve, now, out);
+
         // 4) events
         for (auto& [key, st] : m_workers) {
             if (st.ever_up && !st.up && !st.offline_alerted && now >= m_grace_until &&
@@ -360,14 +461,104 @@ public:
                     {"sessions", s.sessions.size()},
                     // Never hashed here (or returned to another node): a
                     // failover connection, not paged.
-                    {"standby", !s.ever_up && !s.offline_alerted}};
+                    {"standby", is_standby(s)}};
         return {{"workers", w},
+                {"serve", {{"stall_after", m_cfg.serve_stall_after},
+                           {"quiet", m_serve.quiet},
+                           {"sessions", m_serve.sessions},
+                           {"standby_sessions", m_serve.standby},
+                           {"alerted", m_serve.alerted},
+                           {"since", m_serve.stall_since},
+                           {"cause", m_serve.cause},
+                           {"held_by_budget", m_serve_held}}},
                 {"grace_until", m_grace_until},
                 {"in_grace", now < m_grace_until},
                 {"suppressed_by_cap", m_suppressed}};
     }
 
 private:
+    // Never hashed here (or returned to another node) and no OFFLINE
+    // outstanding: a failover connection, never paged.
+    static bool is_standby(const State& s) { return !s.ever_up && !s.offline_alerted; }
+
+    static std::string sessions_text(std::size_t hashing, std::size_t standby)
+    {
+        std::string t = std::to_string(hashing) + (hashing == 1 ? " miner session" : " miner sessions") +
+                        " attached";
+        if (standby) t += " (+" + std::to_string(standby) + " standby)";
+        return t;
+    }
+
+    // NODE LEVEL (header comment). Runs after the worker transitions of the
+    // tick, so the session counts reflect this tick's registry.
+    void serve_check(const ServeSample& s, int64_t now, std::vector<DetectorEvent>& out)
+    {
+        m_serve_was_holding = m_serve_holding;   // a held stretch is counted once
+        m_serve_holding = false;
+        ServeState& v = m_serve;
+        std::size_t hashing = 0, standby = 0;
+        for (const auto& [key, st] : m_workers) {
+            if (!st.present) continue;
+            (is_standby(st) ? standby : hashing) += st.sessions.size();
+        }
+        v.sessions = hashing;
+        v.standby = standby;
+
+        if (hashing > 0) {
+            if (v.attached_since == 0) v.attached_since = now;
+            v.detached_at = 0;
+        } else if (v.attached_since != 0) {
+            if (v.detached_at == 0) v.detached_at = now;
+            if (now - v.detached_at >= kServeDetachGrace) v.attached_since = v.detached_at = 0;
+        }
+
+        // Seconds without work while hashing miners were attached: from the
+        // later of the last hand-out and the start of the attached span.
+        int64_t quiet = 0;
+        if (v.attached_since != 0) {
+            const int64_t last_served = s.served_age >= 0 ? now - s.served_age : int64_t{0};
+            quiet = std::max<int64_t>(0, now - std::max(last_served, v.attached_since));
+        }
+        v.quiet = quiet;
+
+        if (v.alerted) {
+            // A template went out since the page, and work is flowing: the
+            // episode ends. Stalled again before this could be sent: still open.
+            if (s.served_stamp == 0 || s.served_stamp == v.alert_stamp || quiet >= m_cfg.serve_stall_after)
+                return;
+            if (!admit_serve_rate(now)) return;
+            const int64_t ended = s.served_age >= 0 ? now - s.served_age : now;
+            DetectorEvent ev;
+            ev.kind = Kind::WorkResumed;
+            ev.ts = now;
+            ev.detail = "new work for miners again after " + fmt_duration(ended - v.stall_since) +
+                        " (cause was " + v.cause + "); " + sessions_text(hashing, standby);
+            out.push_back(std::move(ev));
+            v.alerted = false;
+            ++m_gen;
+            return;
+        }
+        if (hashing == 0 || quiet < m_cfg.serve_stall_after || now < m_grace_until) return;
+        if (v.last_alert != 0 && now - v.last_alert < m_cfg.min_interval) return;
+        // The cause is read before the budget is charged: a throwing probe
+        // costs the tick (run_tick logs it), never a budget slot.
+        std::string cause = clip_utf8(sanitize_utf8(s.cause ? s.cause() : std::string()), 48);
+        if (cause.empty()) cause = "none reported";
+        if (!admit_serve_rate(now)) return;
+        DetectorEvent ev;
+        ev.kind = Kind::WorkStalled;
+        ev.ts = now;
+        ev.detail = "no new work for miners for " + fmt_duration(quiet) + " (cause " + cause + "); " +
+                    sessions_text(hashing, standby);
+        out.push_back(std::move(ev));
+        v.alerted = true;
+        v.stall_since = now - quiet;
+        v.last_alert = now;
+        v.alert_stamp = s.served_stamp;
+        v.cause = cause;
+        ++m_gen;
+    }
+
     // Payout address of a worker key ("ADDRESS.worker" or the bare address).
     static std::string address_of(const std::string& key)
     {
@@ -383,6 +574,21 @@ private:
     {
         while (!m_rate.empty() && m_rate.front() + 3600 <= now) m_rate.pop_front();
         if (m_rate.size() < m_cfg.max_per_hour) { m_digest_sent = false; m_held.clear(); }
+    }
+
+    // Node-level budget (NODE LEVEL above): its own rolling hour, never the
+    // worker cap. A refused event stays pending (the caller re-evaluates it
+    // every tick); it is counted once, not once per tick.
+    bool admit_serve_rate(int64_t now)
+    {
+        while (!m_serve_rate.empty() && m_serve_rate.front() + 3600 <= now) m_serve_rate.pop_front();
+        if (m_serve_rate.size() >= m_cfg.serve_max_per_hour) {
+            if (!m_serve_was_holding) ++m_serve_held;
+            m_serve_holding = true;
+            return false;
+        }
+        m_serve_rate.push_back(now);
+        return true;
     }
 
     // Charge one event against the hourly cap. When refused, emit the single
@@ -401,7 +607,8 @@ private:
             d.kind = Kind::Digest;
             d.ts = now;
             d.detail = "alert cap of " + std::to_string(m_cfg.max_per_hour) +
-                       "/h reached; further worker changes are held until the hourly window frees";
+                       "/h reached; further worker changes are held until the hourly window frees"
+                       " (node work alerts unaffected)";
             out.push_back(std::move(d));
         }
         return false;
@@ -415,6 +622,11 @@ private:
     bool m_digest_sent{false};
     std::set<std::string> m_held;   // workers held by the cap in this episode
     uint64_t m_suppressed{0};
+    ServeState m_serve;
+    std::deque<int64_t> m_serve_rate;   // node-level events in the rolling hour
+    bool m_serve_holding{false};        // the budget held a due node-level event this tick
+    bool m_serve_was_holding{false};    // ... and on the previous tick
+    uint64_t m_serve_held{0};
     uint64_t m_gen{0};
     AddressActivityFn m_activity;
 };

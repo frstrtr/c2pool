@@ -963,7 +963,7 @@ public:
         }
         // BlsVerified is the ONLY provenance that lets the consensus-exact gate
         // commit a ChainLock NEWER than the one block H-1 committed — that is
-        // the case dashcore makes us prove with BLS (specialtxman.cpp:164-167).
+        // the case dashcore makes us prove with BLS (specialtxman.cpp:74-88).
         m_state.set_best_cl(height, sig, ClProvenance::BlsVerified);
         LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
                  << " block=" << block_hash.GetHex().substr(0, 16) << "...";
