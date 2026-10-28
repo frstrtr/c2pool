@@ -36,12 +36,14 @@
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
+#include <impl/dash/coin/vendor/quorum_members.hpp>
 #include <impl/dash/coin/block.hpp>
 
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +64,7 @@
 #include "data/dash_replay_quorum_2513090_idx2.inc"
 #include "data/dash_replay_seam_qsnap_2513088.inc"
 #include "data/dash_replay_seam_workblocks_2513088.inc"
+#include "data/dash_quorum_members_kat.hpp"   // dashd golden: non-rotated member sets
 
 namespace rp = dash::coin::replay;
 using dash::coin::BlockType;
@@ -872,4 +875,166 @@ TEST(DashPoseOracleFeeder, OracleDrivesThePoSePassProvenNoBanProvenBanAndOffTipR
     d = dash::coin::decide_qc_pose(fresh.anchor_sml(), {commitment_marking(fresh.b)},
                                    members, &o2, 100, fresh.chain[100]);
     EXPECT_EQ(d.stage, dash::coin::QcPoseStage::PenaltyInexact);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. NON-ROTATED MEMBER ATTRIBUTION vs dashd (PR-B verify, must-fix 1)
+//
+// The fold engine derives non-rotated member sets with ITS OWN CalculateQuorum
+// port (replay_quorum_engine.hpp mn_score / calculate_quorum_all /
+// compute_nonrotated_members), not the vendored compute_quorum_members the
+// serve path uses. A wrong order there mis-attributes PoSe punishes: lo moves
+// on the wrong MN and hi stays too low on the right one, the per-block root
+// check stays green (no ban moved), and ~1000 blocks later the pass would
+// serve a "provable" decision dashd disagrees with. Pin it to dashd's own
+// `quorum info` (test/data/dash_quorum_members_kat.hpp, testnet base 1519920,
+// work block 1519912): llmq_50_60 (regular + Evo) and llmq_25_67 (the testnet
+// platform type => Evo-only, the same code path as mainnet type 4, the type of
+// the 2561514 incident). Driven THROUGH the engine (derive_at over a seeded
+// work list + work-block hash + cbTx CL, members_for by quorum hash), and
+// cross-checked index by index against the vendored port on the same input.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace golden_nonrot {
+
+std::vector<uint8_t> unhex(const std::string& s)
+{
+    std::vector<uint8_t> o;
+    o.reserve(s.size() / 2);
+    for (size_t i = 0; i + 1 < s.size(); i += 2)
+        o.push_back(static_cast<uint8_t>(std::stoul(s.substr(i, 2), nullptr, 16)));
+    return o;
+}
+uint256 u256_disp(const std::string& disp)
+{
+    auto b = unhex(disp);
+    std::reverse(b.begin(), b.end());
+    return uint256(b);
+}
+template <size_t N>
+std::array<uint8_t, N> arr(const std::vector<uint8_t>& v)
+{
+    std::array<uint8_t, N> a{};
+    for (size_t i = 0; i < N && i < v.size(); ++i) a[i] = v[i];
+    return a;
+}
+
+CSimplifiedMNList golden_sml()
+{
+    std::vector<CSimplifiedMNListEntry> es;
+    for (const auto& g : dash_qmk::kSml) {
+        CSimplifiedMNListEntry m;
+        m.nVersion       = g.nVersion;
+        m.proRegTxHash   = u256_disp(g.proReg);
+        m.confirmedHash  = u256_disp(g.confirmed);
+        m.netAddress     = arr<16>(unhex(g.ip));
+        m.netPort        = g.port;
+        m.pubKeyOperator = arr<48>(unhex(g.pubkeyOp));
+        m.keyIDVoting    = uint160(unhex(g.votingKeyId));
+        m.isValid        = g.isValid;
+        m.nType          = g.nType;
+        m.platformHTTPPort = g.platformHTTPPort;
+        if (g.platformNodeId[0] != '\0')
+            m.platformNodeID = uint160(unhex(g.platformNodeId));
+        es.push_back(m);
+    }
+    return CSimplifiedMNList(std::move(es));
+}
+
+// The engine's work-list entry form, exactly as the feeder builds it from an
+// authenticated historical SML (no collateral on an SML: a tie fails closed).
+std::vector<rp::QuorumMnEntry> engine_list(const CSimplifiedMNList& sml)
+{
+    std::vector<rp::QuorumMnEntry> v;
+    for (const auto& e : sml.mnList) {
+        rp::QuorumMnEntry q;
+        q.proTxHash      = e.proRegTxHash;
+        q.confirmedHash  = e.confirmedHash;
+        q.is_valid       = e.isValid;
+        q.n_type         = e.nType;
+        q.has_collateral = false;
+        v.push_back(q);
+    }
+    return v;
+}
+
+std::vector<uint256> expected(const std::vector<dash_qmk::ExpMember>& want)
+{
+    std::vector<uint256> v;
+    for (const auto& m : want) v.push_back(u256_disp(m.proReg));
+    return v;
+}
+
+} // namespace golden_nonrot
+
+TEST(DashPoseOracleNonRotated, EngineDerivationReproducesDashdMemberSets)
+{
+    using namespace golden_nonrot;
+    const CSimplifiedMNList sml = golden_sml();
+    const auto list = engine_list(sml);
+    const uint256 work_hash  = u256_disp(dash_qmk::kWorkBlockHashDisp);
+    const uint256 quorum     = u256_disp(dash_qmk::kQuorumHashDisp);
+    const auto    cl         = arr<96>(unhex(dash_qmk::kWorkClSig));
+
+    rp::QuorumReplayConfig qc;
+    qc.enabled   = true;
+    qc.network   = LlmqNetwork::Testnet;
+    qc.v20_floor = 905'100u;                       // testnet V20 (main_dash)
+    rp::QuorumReplayEngine q(qc);
+    q.set_mn_list_at_fn([&](uint32_t h) -> std::optional<std::vector<rp::QuorumMnEntry>> {
+        if (h == dash_qmk::kWorkHeight) return list;
+        return std::nullopt;
+    });
+    q.seed_block_hash(dash_qmk::kWorkHeight, work_hash);
+    q.seed_work_block_cl(dash_qmk::kWorkHeight, cl);
+    q.seed_block_hash(dash_qmk::kBaseHeight, quorum);
+
+    auto dr = q.derive_at(dash_qmk::kBaseHeight);
+    ASSERT_TRUE(q.has_members_at(dash_qmk::kLlmqType, dash_qmk::kBaseHeight))
+        << (dr.reasons.empty() ? std::string("no reason") : dr.reasons.back());
+    ASSERT_TRUE(q.has_members_at(dash_qmk::kLlmqTypePlatform, dash_qmk::kBaseHeight))
+        << (dr.reasons.empty() ? std::string("no reason") : dr.reasons.back());
+
+    struct Case {
+        uint8_t type;
+        uint16_t size;
+        bool evo_only;
+        const std::vector<dash_qmk::ExpMember>* want;
+    };
+    const Case cases[] = {
+        {dash_qmk::kLlmqType, dash_qmk::kQuorumSize, false, &dash_qmk::kExpectedMembers},
+        {dash_qmk::kLlmqTypePlatform, dash_qmk::kQuorumSize25, true,
+         &dash_qmk::kExpectedMembers25},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE("llmqType=" + std::to_string(int(c.type)));
+        const auto want = expected(*c.want);
+        auto got = q.members_for(c.type, quorum);
+        ASSERT_TRUE(got.has_value());
+        ASSERT_EQ(got->size(), want.size());
+        for (size_t i = 0; i < want.size(); ++i)
+            EXPECT_EQ((*got)[i], want[i]) << "engine member #" << i
+                << " differs from dashd `quorum info " << int(c.type) << "`";
+
+        // The two ports agree index by index on the same input.
+        const uint256 mod = dash::coin::vendor::compute_quorum_modifier(
+            c.type, dash_qmk::kWorkHeight,
+            std::optional<std::array<uint8_t, 96>>(cl), work_hash);
+        auto vendor = dash::coin::vendor::compute_quorum_members(
+            dash::coin::vendor::QuorumMemberParams{c.type, c.size, false, c.evo_only},
+            mod, sml);
+        ASSERT_TRUE(vendor.has_value());
+        ASSERT_EQ(vendor->size(), got->size());
+        for (size_t i = 0; i < got->size(); ++i)
+            EXPECT_EQ((*vendor)[i].proTxHash, (*got)[i]) << "port drift at #" << i;
+    }
+
+    // The Evo-only filter is load-bearing: without it the platform set differs.
+    auto unfiltered = rp::compute_nonrotated_members(
+        dash::coin::kLlmq25_67, /*evo_only=*/false, list,
+        dash::coin::vendor::compute_quorum_modifier(
+            dash_qmk::kLlmqTypePlatform, dash_qmk::kWorkHeight,
+            std::optional<std::array<uint8_t, 96>>(cl), work_hash));
+    ASSERT_TRUE(unfiltered.has_value());
+    EXPECT_NE(*unfiltered, expected(dash_qmk::kExpectedMembers25));
 }
