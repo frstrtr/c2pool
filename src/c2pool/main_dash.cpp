@@ -178,6 +178,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>          // PoSe oracle consultation log (one line per tip x MN)
 #include <memory>
 #include <string>
 #include <thread>       // the serve-staleness sentinel's DEDICATED poller
@@ -6567,13 +6568,31 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return pro;
                 },
                 /*oracle_fn=*/
-                [&pose_oracle](const uint256& pro_tx)
+                [&pose_oracle,
+                 seen = std::make_shared<std::pair<uint32_t, std::set<uint256>>>()](
+                    const uint256& pro_tx)
                     -> std::optional<dash::coin::PoSePenaltyView> {
                     if (!pose_oracle) return std::nullopt;
                     const auto cur = pose_oracle->cursor();
                     if (!cur) return std::nullopt;
                     const auto b =
                         pose_oracle->oracle_bounds(cur->first, cur->second, pro_tx);
+                    // One line per (tip, MN): the pass consults the oracle on
+                    // every template evaluation of a punishing height, so a
+                    // per-call line would flood; the answer itself is what an
+                    // operator needs to audit a served ban / no-ban.
+                    if (seen->first != cur->first) {
+                        seen->first = cur->first;
+                        seen->second.clear();
+                    }
+                    if (seen->second.insert(pro_tx).second) {
+                        LOG_INFO << "[POSE-ORACLE] consulted at tip h=" << cur->first
+                                 << " protx=" << pro_tx.GetHex().substr(0, 16)
+                                 << (b ? " lo=" + std::to_string(b->lo)
+                                         + " hi=" + std::to_string(b->hi)
+                                         + " banned=" + std::to_string(b->banned)
+                                       : std::string(" not-in-list"));
+                    }
                     if (!b) return std::nullopt;
                     return dash::coin::PoSePenaltyView{b->lo, b->hi, b->banned};
                 },
