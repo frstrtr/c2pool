@@ -923,6 +923,18 @@ public:
     //   mweb_hold_seconds      — total time spent holding the previous template
     uint64_t get_aux_checks() const { return m_aux_checks.load(std::memory_order_relaxed); }
     uint64_t get_mweb_refusals() const { return m_mweb_block_refusals.load(std::memory_order_relaxed); }
+
+    // Template budget (LTC): the weight a template must leave free for the
+    // coinbase. The last coinbase's weight (the largest built for the
+    // current template) plus kCoinbaseWeightMargin, which also covers the
+    // header, the tx count, the HogEx appended after selection, extranonces
+    // and a few new payees; before the first coinbase, the largest one
+    // max_coinbase_outputs allows. The embedded template builder selects
+    // transactions within MAX_BLOCK_WEIGHT minus this.
+    static constexpr uint32_t kCoinbaseWeightMargin = 4000;
+    static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
+    uint32_t coinbase_weight_reserve() const;
+    static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -1469,6 +1481,10 @@ private:
     void note_mweb_template_refusal(const std::string& why);
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
+    // A coinbase was built (refresh_work: fresh_template; per connection:
+    // raises the mark): records its weight for coinbase_weight_reserve().
+    void note_coinbase_built(const std::string& coinb1, const std::string& coinb2, bool segwit,
+                             size_t branch_len, bool fresh_template) const;
     void close_mweb_hold_window(const char* reason);
     // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
     // (height, code).
@@ -1717,6 +1733,10 @@ private:
     mutable std::mutex m_template_tx_mutex;
     TemplateTxRefusalLog m_template_tx_refusals;                     // ingress
     mutable std::map<std::string, uint64_t> m_mweb_refusals_by_code; // assembly (const path)
+    // Weight of the largest coinbase built for the current template (its own
+    // and the per-connection ones built on it): the next template leaves room
+    // for it (coinbase_weight_reserve). 0 = none built yet.
+    mutable std::atomic<uint32_t> m_coinbase_weight{0};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;

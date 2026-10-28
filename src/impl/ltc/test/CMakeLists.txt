@@ -136,6 +136,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # doge_template_budget_test.cpp: embedded DOGE templates dogecoind can
+    # accept: a REAL DOGE TemplateBuilder template over a mempool above 1 MB,
+    # within the merged-mining size budget, assembles (REAL AuxPoW and PPLNS
+    # coinbase producers, 4,000 payees on both chains) to at most 1,000,000
+    # bytes (bad-blk-length); curtime and mintime above the median time past
+    # (time-too-old). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -152,6 +159,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
+        doge_template_budget_test.cpp
         doge_template_underfill_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp

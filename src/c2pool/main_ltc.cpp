@@ -2051,6 +2051,11 @@ int main(int argc, char* argv[]) {
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
                 embedded_node->set_template_tx_check_strict(template_tx_check_strict);
+                // Leave room for the PPLNS coinbase the web server builds on
+                // each template (up to max_coinbase_outputs outputs): the
+                // last one's weight plus a margin, not a fixed 2,000.
+                embedded_node->set_coinbase_reserve_fn(
+                    [mi = web_server.get_mining_interface()]() { return mi->coinbase_weight_reserve(); });
                 // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100

@@ -22,6 +22,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <ctime>
 #include <optional>
 #include <stdexcept>
@@ -51,6 +53,36 @@ public:
     // DOGE uses (chain_id << 16) | base_version, e.g. 0x00620004 for BIP65.
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;
+    // dogecoind CheckBlock: the serialized block, AuxPoW in the header
+    // included, at most MAX_BLOCK_BASE_SIZE bytes (validation.cpp:2972,
+    // consensus/consensus.h:17; primitives/block.h serializes the auxpow with
+    // the header). DOGE has no witness: a tx's weight is 4 x its size.
+    static constexpr uint32_t MAX_BLOCK_BASE_SIZE = 1'000'000u;
+
+    /// The weight the mempool selection may use when `reserve_bytes` of the
+    /// block go to the header, the AuxPoW and the coinbase.
+    static uint32_t tx_weight_budget(uint32_t reserve_bytes)
+    {
+        const uint64_t reserve_wu = std::max<uint64_t>(uint64_t{reserve_bytes} * 4, COINBASE_RESERVE);
+        return reserve_wu >= MAX_BLOCK_WEIGHT ? 0 : static_cast<uint32_t>(MAX_BLOCK_WEIGHT - reserve_wu);
+    }
+
+    /// dogecoind's CBlockIndex::GetMedianTimePast (chain.h:286-298): the median
+    /// of the timestamps of `tip` and up to 10 of its ancestors.
+    static int64_t median_time_past(const HeaderChain& chain, const IndexEntry& tip)
+    {
+        std::vector<int64_t> times;
+        times.reserve(11);
+        std::optional<IndexEntry> cur = tip;
+        for (int i = 0; i < 11 && cur; ++i) {
+            times.push_back(static_cast<int64_t>(cur->header.m_timestamp));
+            if (cur->prev_hash.IsNull())
+                break;
+            cur = chain.get_header(cur->prev_hash);
+        }
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
+    }
 
     // ── Underfill guard (v36 cutover deploy path) ──────────────────────
     // Mirror of the LTC parent guard. DOGE runs its OWN embedded GBT path and
@@ -63,17 +95,26 @@ public:
     static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
     static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
 
+    /// max_weight bounds the mempool selection: tx_weight_budget(reserve)
+    /// with the bytes the header, AuxPoW and coinbase take (MergedMiningManager
+    /// passes them through AuxChainEmbedded).
     static std::optional<ltc::coin::rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
-        const DOGEChainParams& params)
+        const DOGEChainParams& params,
+        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE)
     {
         auto tip_opt = chain.tip();
         if (!tip_opt) return std::nullopt;
 
         const auto& tip    = *tip_opt;
         uint32_t    next_h = tip.height + 1;
-        uint32_t    now_ts = static_cast<uint32_t>(std::time(nullptr));
+        // dogecoind refuses a block at or below the median time past
+        // (time-too-old, validation.cpp:3103); its own template time is
+        // max(MTP + 1, now) (miner.cpp:65 UpdateTime).
+        const int64_t mtp = median_time_past(chain, tip);
+        uint32_t    now_ts = static_cast<uint32_t>(
+            std::max<int64_t>(static_cast<int64_t>(std::time(nullptr)), mtp + 1));
 
         // ── Next difficulty (DigiShield v3) ───────────────────────────────
         uint32_t next_bits;
@@ -100,8 +141,7 @@ public:
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ──
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
-                                          /*fill_unknown_fee=*/true);
+            pool.get_sorted_txs_with_fees(max_weight, /*fill_unknown_fee=*/true);
 
         // coinbasevalue = block reward + included transaction fees
         uint64_t coinbasevalue = subsidy + total_fees;
@@ -170,7 +210,7 @@ public:
         data["sigoplimit"]        = 80000;
         data["sizelimit"]         = 1'000'000;
         data["weightlimit"]       = 4'000'000;
-        data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+        data["mintime"]           = static_cast<int64_t>(mtp + 1);
 
         LOG_INFO << "[EMB-DOGE] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
@@ -180,7 +220,9 @@ public:
                  << " fees=" << total_fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << selected_txs.size()
+                 << " max_weight=" << max_weight
                  << " tip_ts=" << tip.header.m_timestamp
+                 << " mtp=" << mtp
                  << " now=" << now_ts
                  << " synced=" << (chain.is_synced() ? "true" : "false");
 
@@ -199,7 +241,9 @@ public:
         if (!m_chain.is_synced())
             throw std::runtime_error("DOGE EmbeddedCoinNode: header chain not synced (height="
                 + std::to_string(m_chain.height()) + ")");
-        auto result = TemplateBuilder::build_template(m_chain, m_pool, m_params);
+        auto result = TemplateBuilder::build_template(
+            m_chain, m_pool, m_params,
+            TemplateBuilder::tx_weight_budget(m_reserve_bytes.load(std::memory_order_relaxed)));
         if (!result)
             throw std::runtime_error("DOGE EmbeddedCoinNode: chain has no tip");
         return *result;
@@ -227,6 +271,10 @@ public:
     /// enough depth for coinbase maturity validation (240 blocks for DOGE).
     void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
 
+    /// Bytes of the block the next templates leave to the header, the AuxPoW
+    /// and the coinbase (0: COINBASE_RESERVE weight only).
+    void set_block_size_reserve(uint32_t bytes) { m_reserve_bytes.store(bytes, std::memory_order_relaxed); }
+
     bool is_synced() const override {
         if (!m_chain.is_synced()) return false;
         if (m_utxo_ready && !m_utxo_ready()) return false;
@@ -245,6 +293,7 @@ private:
     Mempool&             m_pool;
     const DOGEChainParams& m_params;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
+    std::atomic<uint32_t> m_reserve_bytes{0};
 };
 
 } // namespace coin

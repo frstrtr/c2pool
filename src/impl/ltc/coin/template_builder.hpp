@@ -31,6 +31,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -488,8 +489,7 @@ public:
         }
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
-            m_chain, m_pool, m_testnet, m_mweb_tracker,
-            TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused,
+            m_chain, m_pool, m_testnet, m_mweb_tracker, tx_weight_budget(), &refused,
             m_template_tx_check_strict.load(std::memory_order_relaxed));
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet,
@@ -541,6 +541,20 @@ public:
     /// enough depth for coinbase maturity validation (100 blocks for LTC).
     void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
 
+    /// The weight a template leaves free for the coinbase (and the header,
+    /// tx count and HogEx): MiningInterface::coinbase_weight_reserve, so a
+    /// full mempool and a PPLNS coinbase of many outputs stay within
+    /// litecoind's 4,000,000 (bad-blk-weight). Unset: COINBASE_RESERVE.
+    void set_coinbase_reserve_fn(std::function<uint32_t()> fn) { m_coinbase_reserve = std::move(fn); }
+
+    /// The weight the mempool selection may use (never more than
+    /// MAX_BLOCK_WEIGHT - COINBASE_RESERVE).
+    uint32_t tx_weight_budget() const {
+        uint32_t reserve = m_coinbase_reserve ? m_coinbase_reserve() : 0;
+        reserve = std::max(reserve, TemplateBuilder::COINBASE_RESERVE);
+        return reserve < TemplateBuilder::MAX_BLOCK_WEIGHT ? TemplateBuilder::MAX_BLOCK_WEIGHT - reserve : 0;
+    }
+
     /// Template-tx check mode for the built templates (see build_template):
     /// strict refuses, warn logs only (config template_tx_check).
     void set_template_tx_check_strict(bool strict) {
@@ -557,6 +571,7 @@ private:
     HeaderChain& m_chain;
     Mempool&     m_pool;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
+    std::function<uint32_t()> m_coinbase_reserve;  // template budget (see set_coinbase_reserve_fn)
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
     std::atomic<bool> m_template_tx_check_strict{true};

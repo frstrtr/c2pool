@@ -766,7 +766,8 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // still submitted: refusing a block on a false positive would lose it.
     if (m_blockchain == Blockchain::LITECOIN) {
         std::vector<std::string_view> views(txs_hex.begin(), txs_hex.end());
-        if (auto r = core::coin::check_tx_list(views, mweb_active)) {
+        std::vector<core::coin::TxShape> shapes;
+        if (auto r = core::coin::check_tx_list(views, mweb_active, &shapes)) {
             const bool strict = m_template_tx_check_strict.load(std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(m_template_tx_mutex);
@@ -781,6 +782,24 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
             }
             LOG_WARNING << "[MWEB] Block assembly: template-tx check " << r->code << " at tx "
                         << r->index << " (" << r->detail << ") — submitted anyway (warn mode)";
+        } else {
+            // litecoind refuses a block above 4,000,000 weight (bad-blk-weight,
+            // validation.cpp:3756): a full template plus a large PPLNS coinbase
+            // can get there. Such a block can never be accepted, so it is
+            // refused here and counted instead of submitted.
+            const size_t cb_bytes = coinbase_hex.size() / 2;
+            const uint64_t weight = core::coin::ltc_block_weight(cb_bytes, segwit, shapes);
+            if (weight > core::coin::kLtcMaxBlockWeight) {
+                m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+                    ++m_mweb_refusals_by_code["oversize"];
+                }
+                LOG_ERROR << "[BLOCK] Block assembly REFUSED: weight " << weight << " > "
+                          << core::coin::kLtcMaxBlockWeight << " (coinbase " << cb_bytes << " B, "
+                          << txs_hex.size() << " txs) — block not submitted";
+                return {};
+            }
         }
     }
 
@@ -828,6 +847,50 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
         block << "01" << mweb_data;
 
     return block.str();
+}
+
+// ─── Coinbase weight for the template budget ──────────────────────────────────
+// The weight of a coinbase coinb1 | extranonce1 | extranonce2 | coinb2 (the
+// extranonces at most kCoinbaseExtranonceBytes); segwit adds the one-item
+// 32-byte witness reserved value (marker, flag, count, length, 32 bytes).
+uint32_t MiningInterface::coinbase_weight(const std::string& coinb1, const std::string& coinb2,
+                                          bool segwit)
+{
+    const uint64_t stripped = (coinb1.size() + coinb2.size()) / 2 + kCoinbaseExtranonceBytes;
+    const uint64_t w = stripped * 4 + (segwit ? 2 + 1 + 1 + 32 : 0);
+    return static_cast<uint32_t>(std::min<uint64_t>(w, UINT32_MAX));
+}
+
+void MiningInterface::note_coinbase_built(const std::string& coinb1, const std::string& coinb2,
+                                          bool segwit, size_t branch_len, bool fresh_template) const
+{
+    const uint32_t w = coinbase_weight(coinb1, coinb2, segwit);
+    if (fresh_template) {
+        // A new template: start from its own coinbase; the per-connection
+        // coinbases built on it raise the mark.
+        m_coinbase_weight.store(w, std::memory_order_relaxed);
+    } else {
+        uint32_t cur = m_coinbase_weight.load(std::memory_order_relaxed);
+        while (w > cur && !m_coinbase_weight.compare_exchange_weak(cur, w, std::memory_order_relaxed)) {
+        }
+    }
+    // The merged blocks carry this coinbase (without witness) in their AuxPoW.
+    if (m_mm_manager) {
+        const uint32_t mark = m_coinbase_weight.load(std::memory_order_relaxed);
+        m_mm_manager->set_parent_coinbase_shape((mark + 3) / 4, static_cast<uint32_t>(branch_len));
+    }
+}
+
+uint32_t MiningInterface::coinbase_weight_reserve() const
+{
+    const uint32_t last = m_coinbase_weight.load(std::memory_order_relaxed);
+    if (last != 0)
+        return last + kCoinbaseWeightMargin;
+    // No coinbase built yet (the first template): the largest one the output
+    // cap allows, each output at most 8 + 1 + 34 bytes, plus the fixed parts.
+    const uint64_t outputs = m_stratum_config.max_coinbase_outputs + 4;
+    const uint64_t bound = (outputs * 43 + 1000) * 4 + kCoinbaseWeightMargin;
+    return static_cast<uint32_t>(std::min<uint64_t>(bound, core::coin::kLtcMaxBlockWeight));
 }
 
 // ─── Coinbase parts construction ─────────────────────────────────────────────
@@ -1478,6 +1541,7 @@ MiningInterface::build_connection_coinbase(
         the_root,
         ws.coinbase_text);
     LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
+    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false);
 
     // ── Phase 4: Write back updated PPLNS cache ──
     {
@@ -1764,6 +1828,9 @@ void MiningInterface::refresh_work()
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
         }
+
+        note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
+                            /*fresh_template=*/true);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
@@ -5724,6 +5791,9 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
     result["mweb_refusals_by_code"] = get_mweb_refusals_by_code_json();
+    // Merged (aux) blocks refused at assembly, e.g. DOGE above 1,000,000 bytes.
+    result["merged_block_refusals_by_code"] = m_mm_manager ? m_mm_manager->get_block_refusals_json()
+                                                           : nlohmann::json::object();
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";

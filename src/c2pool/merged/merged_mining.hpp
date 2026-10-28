@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -82,6 +83,35 @@ std::vector<uint8_t> build_auxpow_commitment(const uint256& mm_root,
                                               uint32_t tree_size,
                                               uint32_t nonce = 0);
 
+// ─── Aux block size budget ───────────────────────────────────────────────────
+// dogecoind refuses a block whose serialization, AuxPoW in the header
+// included, exceeds MAX_BLOCK_BASE_SIZE = 1,000,000 bytes (CheckBlock
+// bad-blk-length, validation.cpp:2972; primitives/block.h serializes the
+// auxpow with the header). The AuxPoW carries the whole parent (LTC) coinbase,
+// so with PPLNS coinbases of many outputs on both chains a template filled to
+// 1 MB of transactions cannot be a valid block.
+inline constexpr uint32_t kAuxMaxBlockBytes = 1'000'000;
+inline constexpr uint32_t kAuxBlockSizeMargin = 1'000;
+// Before the first parent coinbase is known: room for one of ~4,000 outputs.
+inline constexpr uint32_t kUnknownParentCoinbaseBytes = 200'000;
+
+/// Bytes of an aux block that are not its transactions: header (80), the
+/// AuxPoW as build_auxpow_proof writes it (parent coinbase, parent hash 32,
+/// coinbase branch, its index 4, chain branch, its index 4, parent header 80),
+/// the tx count (at most 9) and the aux coinbase, plus kAuxBlockSizeMargin.
+/// A zero parent coinbase size means unknown (kUnknownParentCoinbaseBytes);
+/// a zero aux coinbase size means unknown (taken as large as the parent's).
+inline uint32_t aux_block_reserve_bytes(uint32_t parent_coinbase_bytes, uint32_t parent_branch_len,
+                                        uint32_t aux_branch_len, uint32_t aux_coinbase_bytes)
+{
+    const uint64_t parent_cb = parent_coinbase_bytes ? parent_coinbase_bytes : kUnknownParentCoinbaseBytes;
+    const uint64_t aux_cb = aux_coinbase_bytes ? aux_coinbase_bytes : parent_cb;
+    const uint64_t auxpow = parent_cb + 32 + 9 + 32ull * parent_branch_len + 4
+                          + 9 + 32ull * aux_branch_len + 4 + 80;
+    const uint64_t total = 80 + auxpow + 9 + aux_cb + kAuxBlockSizeMargin;
+    return static_cast<uint32_t>(std::min<uint64_t>(total, kAuxMaxBlockBytes));
+}
+
 // ─── AuxPoW proof serialization ──────────────────────────────────────────────
 // Builds the auxpow structure that gets prepended to merged block txs:
 //   parent_coinbase_tx + parent_block_hash + parent_coinbase_merkle_link
@@ -110,6 +140,10 @@ public:
     virtual std::string get_best_block_hash() = 0;
     virtual std::vector<NetService> getpeerinfo() = 0;
     virtual const AuxChainConfig& config() const = 0;
+    // Bytes of the next aux block that go to the header, AuxPoW and coinbase
+    // (aux_block_reserve_bytes): a backend that builds its own template keeps
+    // its transactions within the rest. A daemon's template cannot be told.
+    virtual void set_block_size_reserve(uint32_t /*bytes*/) {}
 };
 
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
@@ -202,6 +236,21 @@ public:
 
     // Current aux work per chain_id
     std::map<uint32_t, AuxWork> get_current_work() const;
+
+    // The parent (LTC) coinbase the next shares carry: its size without
+    // witness (bytes) and its merkle branch length. Set by the web server on
+    // every coinbase it builds; sizes the aux blocks' AuxPoW for the template
+    // budget (aux_block_reserve_bytes).
+    void set_parent_coinbase_shape(uint32_t coinbase_bytes, uint32_t branch_len)
+    {
+        m_parent_coinbase_bytes.store(coinbase_bytes, std::memory_order_relaxed);
+        m_parent_branch_len.store(branch_len, std::memory_order_relaxed);
+    }
+    // The reserve the chain's next template leaves (see aux_block_reserve_bytes).
+    uint32_t block_size_reserve(uint32_t chain_id) const;
+
+    // Aux blocks refused at assembly, by "<symbol>:<code>" (oversize).
+    nlohmann::json get_block_refusals_json() const;
 
     // V36: Build merged block header info for share_info.merged_coinbase_info.
     // Returns (80-byte header, coinbase_merkle_link_branches) per chain.
@@ -430,6 +479,13 @@ private:
     BlockRelayFn m_block_relay_fn;
     MergedBlockFoundFn m_on_merged_block_found;
     WorkChangedFn m_on_work_changed;
+
+    // Parent coinbase shape for the aux size budget (set_parent_coinbase_shape).
+    std::atomic<uint32_t> m_parent_coinbase_bytes{0};
+    std::atomic<uint32_t> m_parent_branch_len{0};
+    // Aux blocks refused at assembly (guarded by m_mutex).
+    std::map<std::string, uint64_t> m_block_refusals_by_code;
+    uint32_t block_size_reserve_locked(const ChainState& chain) const;
 
     // Discovered merged blocks history
     std::vector<DiscoveredMergedBlock> m_discovered_blocks;
