@@ -133,7 +133,14 @@ struct PoseOracleConfig
     uint32_t persist_every_catchup{500}; // ... while catching up
     uint32_t near_tip{12};               // "at tip" = within this many blocks
     size_t   ring_size{6};               // reorg rollback snapshots kept
-    uint32_t request_retry_ms{60000};    // qrinfo / getmnlistd / getheaders
+    uint32_t request_retry_ms{60000};    // getmnlistd / getheaders
+    /// getqrinfo re-ask interval. Much longer than the others on purpose: an
+    /// empty-base getqrinfo makes the serving dashd build five FULL lists
+    /// from genesis, it answers a peer's messages strictly in order, and
+    /// under load a reply takes minutes — measured live (2026-10-28): a
+    /// one-minute re-ask buried everything else we sent that peer (the
+    /// backfill getheaders included) behind our own growing backlog.
+    uint32_t qrinfo_retry_ms{600000};
     uint32_t bootstrap_give_up_ms{900000};// stop gating folds on an input that
                                          // never arrives (fallback covers)
     uint32_t anchor_grace_ms{120000};    // wait for the lane's anchor SML first
@@ -157,9 +164,13 @@ struct PoseOracleIo
     std::function<void(const uint256& base, const uint256& target)> send_getmnlistd;
     /// getqrinfo with EMPTY base hashes and extraShare=true for a cycle base.
     std::function<void(const uint256& cycle_base_hash)> send_getqrinfo;
-    /// One-shot backward getheaders, locator -> stop=anchor.
-    std::function<bool(const uint256& locator)> send_backfill_getheaders;
-    /// Install a pre-anchor header batch downward from the anchor.
+    /// One-shot backward getheaders, locator -> stop=anchor. `attempt`
+    /// lets the caller rotate peers (preferring one that is not busy
+    /// answering our getqrinfo).
+    std::function<bool(const uint256& locator, uint32_t attempt)>
+        send_backfill_getheaders;
+    /// Install a pre-anchor header batch downward from the anchor; returns
+    /// how many headers it linked (newly installed OR re-indexed by height).
     std::function<size_t(const std::vector<BlockHeaderType>&)> install_preanchor_span;
     /// Run `fn` on a LATER io turn (long catch-up yields between batches).
     std::function<void(std::function<void()>)> post;
@@ -344,8 +355,8 @@ public:
         const size_t n = m_io.install_preanchor_span(batch);
         if (n == 0) return;
         m_backfill_pending = false;
-        LOG_INFO << "[POSE-ORACLE] pre-anchor header backfill installed " << n
-                 << " headers below the anchor";
+        LOG_INFO << "[POSE-ORACLE] pre-anchor header backfill linked " << n
+                 << " headers below the anchor (installed or re-indexed)";
         // The work-block headers the qrinfo legs need may now be held:
         // re-ask immediately instead of after the retry interval.
         m_boot.qr_ms = 0;
@@ -455,6 +466,7 @@ private:
     uint32_t m_last_persist_h{0};
     std::deque<RingEntry> m_ring;
     bool     m_backfill_pending{false};
+    uint32_t m_backfill_attempts{0};
     uint64_t m_backfill_ms{0};
     uint32_t m_last_hold_logged{0};
     bool     m_in_pump{false};
@@ -775,16 +787,18 @@ private:
         // (2) rotated: getqrinfo(cyc0), or cyc1 first when cyc0's header is not held.
         if (m_boot.rot_type != 0 && !m_boot.rot_landed && tip >= m_boot.cyc0) {
             if (auto hb0 = m_io.hash_at(m_boot.cyc0)) {
-                if (m_boot.qr_ms == 0 || t - m_boot.qr_ms >= m_cfg.request_retry_ms) {
+                if (m_boot.qr_ms == 0 || t - m_boot.qr_ms >= m_cfg.qrinfo_retry_ms) {
                     m_boot.qr_ms = t;
                     m_io.send_getqrinfo(*hb0);
                     LOG_INFO << "[POSE-ORACLE] getqrinfo(cycle base h="
                              << m_boot.cyc0 << ", extraShare) for the straddle cycle";
                 }
-            } else if (tip >= m_boot.cyc1) {
+            } else if (tip >= m_boot.cyc1 && !m_backfill_pending) {
+                // (A pending backfill already holds the locator this would
+                // fetch: wait for it rather than queue another qrinfo.)
                 if (auto hb1 = m_io.hash_at(m_boot.cyc1)) {
                     if (m_boot.qr1_ms == 0
-                        || t - m_boot.qr1_ms >= m_cfg.request_retry_ms) {
+                        || t - m_boot.qr1_ms >= m_cfg.qrinfo_retry_ms) {
                         m_boot.qr1_ms = t;
                         m_io.send_getqrinfo(*hb1);
                         LOG_INFO << "[POSE-ORACLE] straddle cycle h=" << m_boot.cyc0
@@ -968,12 +982,14 @@ private:
         const uint64_t t = now();
         if (m_backfill_pending && t - m_backfill_ms < m_cfg.request_retry_ms) return;
         if (!m_io.send_backfill_getheaders) return;
-        if (m_io.send_backfill_getheaders(locator)) {
+        if (m_io.send_backfill_getheaders(locator, m_backfill_attempts)) {
             m_backfill_pending = true;
             m_backfill_ms = t;
-            LOG_INFO << "[POSE-ORACLE] pre-anchor header BACKFILL issued: locator "
-                     << locator.GetHex().substr(0, 16) << " -> anchor h="
+            LOG_INFO << "[POSE-ORACLE] pre-anchor header BACKFILL issued (attempt "
+                     << m_backfill_attempts << "): locator "
+                     << locator.GetHex() << " -> anchor h="
                      << m_cfg.anchor_height;
+            ++m_backfill_attempts;
         }
     }
 
@@ -1000,7 +1016,9 @@ private:
                              << miss.size() << " punishing commitment(s) without a"
                                 " resolvable member set (first: type="
                              << int(miss.front().first) << " quorum=..."
-                             << miss.front().second.GetHex().substr(0, 12)
+                             // the DISCRIMINATING tail: a mainnet block hash
+                             // starts with ~14 zero nibbles
+                             << miss.front().second.GetHex().substr(52)
                              << ") — waiting for the straddle bootstrap /"
                                 " member source";
                 }

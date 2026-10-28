@@ -590,10 +590,20 @@ public:
     /// consults. A lying peer that returns garbage produces no linkage → zero
     /// installs → leg (b) still fails closed.
     ///
-    /// Returns the number of headers newly installed.
+    /// Returns the number of headers newly installed. A header the walk
+    /// links that is ALREADY held (loaded from the header DB after a restart,
+    /// or dropped from the height index by a reorg's rebuild, which stops at
+    /// the synthetic anchor) is re-entered into the height index — the same
+    /// downward proof that installs a header also dates it — and counted in
+    /// `*reindexed` when given. Without that, after a restart every
+    /// pre-anchor HEIGHT lookup stayed empty for good while the hashes were
+    /// held (measured live, 2026-10-28: an 896-header backfill reply landed
+    /// and installed 0).
     size_t install_preanchor_span(const uint256& anchor_hash,
-                                  const std::vector<BlockHeaderType>& batch)
+                                  const std::vector<BlockHeaderType>& batch,
+                                  size_t* reindexed = nullptr)
     {
+        if (reindexed) *reindexed = 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         // The anchor is the trust root of the downward walk; it must be held.
         auto anchor_it = m_headers.find(anchor_hash);
@@ -655,6 +665,12 @@ public:
                 m_height_index[parent_height] = parent_hash;
                 persist_header(e);
                 ++installed;
+            } else {
+                auto hi = m_height_index.find(parent_height);
+                if (hi == m_height_index.end() || hi->second != parent_hash) {
+                    m_height_index[parent_height] = parent_hash;
+                    if (reindexed) ++*reindexed;
+                }
             }
             child_height = parent_height;
             parent_hash  = ph.m_previous_block;

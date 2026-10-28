@@ -8782,20 +8782,33 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             cp->send_getqrinfo({}, cycle_hash, /*extra=*/true);
                         };
                         pio.send_backfill_getheaders =
-                            [cp, anchor_hash](const uint256& locator) {
+                            [cp, anchor_hash](const uint256& locator, uint32_t attempt) {
                                 // getheaders replies START at locator+1; the span
                                 // is installed DOWNWARD from the trusted anchor
                                 // (prev-link + PoW), the locator itself is never
-                                // trusted.
-                                const std::string peer = cp->primary_peer_key();
-                                return !peer.empty()
-                                    && cp->send_getheaders_to(peer, 70230,
+                                // trusted. Any peer serves headers, so rotate
+                                // over the handshaked pool and prefer one that
+                                // is NOT the primary: the primary answers our
+                                // getqrinfo, and a peer processes our messages
+                                // strictly in order.
+                                std::vector<std::string> peers = cp->handshaked_peer_keys();
+                                const std::string primary = cp->primary_peer_key();
+                                std::vector<std::string> others;
+                                for (const auto& k : peers)
+                                    if (k != primary) others.push_back(k);
+                                const auto& pool = others.empty() ? peers : others;
+                                if (pool.empty()) return false;
+                                const std::string& peer = pool[attempt % pool.size()];
+                                return cp->send_getheaders_to(peer, 70230,
                                                               {locator}, anchor_hash);
                             };
                         pio.install_preanchor_span =
                             [hc, anchor_hash](
                                 const std::vector<dash::coin::BlockHeaderType>& b) {
-                                return hc->install_preanchor_span(anchor_hash, b);
+                                size_t reindexed = 0;
+                                const size_t n =
+                                    hc->install_preanchor_span(anchor_hash, b, &reindexed);
+                                return n + reindexed;
                             };
                         pio.post = [&ioc](std::function<void()> fn) {
                             boost::asio::post(ioc, std::move(fn));
