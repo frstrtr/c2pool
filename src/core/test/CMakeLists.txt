@@ -126,6 +126,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # vin/vout, HogEx not last / missing, txid, pegin outputs vs HogEx inputs,
     # fees vs coinbasevalue) refuses the template that breaks it. Same
     # fold-into-core_test reasoning as every TU here.
+    # web_server_aux_template_test.cpp: getblocktemplate [{"chain":"DOGE"}]
+    # answers with the merged DOGE template (prev, height, bits, curtime,
+    # coinbase value, txs, degraded mark), over JSON-RPC to a direct local
+    # client only; the call without "chain" is unchanged. Same
+    # fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -159,6 +164,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         version_gate_test.cpp
+        web_server_aux_template_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp

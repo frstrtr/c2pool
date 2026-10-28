@@ -1135,6 +1135,58 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
     }
 }
 
+nlohmann::json MergedMiningManager::aux_template_json(const std::string& symbol) const
+{
+    auto upper = [](std::string v) {
+        for (auto& ch : v)
+            if (ch >= 'a' && ch <= 'z')
+                ch = static_cast<char>(ch - 32);
+        return v;
+    };
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains) {
+        if (upper(chain.config.symbol) != upper(symbol))
+            continue;
+        const auto& w = chain.current_work;
+        const auto& t = w.block_template;
+        nlohmann::json j = nlohmann::json::object();
+        j["chain"] = chain.config.symbol;
+        j["chain_id"] = chain.config.chain_id;
+        j["height"] = w.height;
+        j["previousblockhash"] = t.is_object() ? t.value("previousblockhash", w.prev_block_hash)
+                                               : w.prev_block_hash;
+        j["bits"] = t.is_object() ? t.value("bits", std::string()) : std::string();
+        j["version"] = t.is_object() ? t.value("version", 0) : 0;
+        j["curtime"] = t.is_object() ? t.value("curtime", int64_t{0}) : int64_t{0};
+        j["mintime"] = t.is_object() ? t.value("mintime", int64_t{0}) : int64_t{0};
+        j["coinbasevalue"] = w.coinbase_value;
+        j["target"] = w.target.GetHex();
+        j["block_hash"] = w.block_hash.GetHex();
+        j["coinbase_hex"] = chain.frozen_coinbase_hex;
+        j["using_fallback"] = chain.using_fallback;
+        const auto why = core::coin::template_degraded_code(t);
+        j["degraded"] = why ? nlohmann::json(*why) : nlohmann::json(nullptr);
+        nlohmann::json txs = nlohmann::json::array();
+        uint64_t tx_bytes = 0;
+        if (t.is_object() && t.contains("transactions") && t["transactions"].is_array()) {
+            for (const auto& e : t["transactions"]) {
+                if (!e.is_object())
+                    continue;
+                const std::string data = e.value("data", std::string());
+                tx_bytes += data.size() / 2;
+                txs.push_back({{"txid", e.value("txid", std::string())},
+                               {"data", data},
+                               {"fee", e.contains("fee") ? e["fee"] : nlohmann::json(nullptr)}});
+            }
+        }
+        j["tx_count"] = txs.size();
+        j["tx_bytes"] = tx_bytes;
+        j["transactions"] = std::move(txs);
+        return j;
+    }
+    return nullptr;
+}
+
 nlohmann::json MergedMiningManager::get_template_gate_json() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

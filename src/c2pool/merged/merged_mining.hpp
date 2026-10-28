@@ -326,6 +326,13 @@ public:
     /// one came back degraded (core::coin::kTemplateDegradedKey).
     void refresh_aux_work();
 
+    /// Read-only view of an aux chain's current block template (symbol,
+    /// case-insensitive), for local cross-checks: prev, height, bits,
+    /// curtime, coinbase value, the tx list (txid, raw, fee), tx bytes, the
+    /// degraded mark, the block hash the parent commits to and the frozen
+    /// coinbase. null when there is no such chain.
+    nlohmann::json aux_template_json(const std::string& symbol) const;
+
     /// Per chain symbol: {"degraded": templates fetched degraded,
     /// "refetched_clean": clean templates fetched after a degraded one}.
     nlohmann::json get_template_gate_json() const;
