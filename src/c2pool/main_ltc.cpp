@@ -6915,6 +6915,16 @@ int main(int argc, char* argv[]) {
                                             return std::nullopt;
                                         return e->prev_hash;
                                     };
+                                    // A body about to move the tip (its header taken from it): the
+                                    // txs it confirmed leave the pool first, so no template built on
+                                    // the new tip can carry them.
+                                    host.clean_before_header =
+                                        [pool = doge_pool.get()](const ltc::coin::BlockType& b, uint32_t h) {
+                                            if (!pool)
+                                                return;
+                                            pool->set_tip_height(h);
+                                            pool->remove_for_block(b);
+                                        };
                                     host.add_header = [dc](const ltc::coin::BlockType& b) {
                                         const auto& hdr = static_cast<const ltc::coin::BlockHeaderType&>(b);
                                         if (!dc->has_header(b.m_previous_block))
@@ -7138,11 +7148,12 @@ int main(int argc, char* argv[]) {
                                     [bcaster_ptr, &web_server, &ioc,
                                      chain = doge_chain.get(),
                                      utxo = doge_utxo_cache.get(),
+                                     mm_ptr = mm_manager.get(),
                                      doge_lane](
                                         const uint256& old_tip, uint32_t old_height,
                                         const uint256& new_tip, uint32_t new_height) {
                                         boost::asio::post(ioc,
-                                            [bcaster_ptr, &web_server, chain, utxo, doge_lane,
+                                            [bcaster_ptr, &web_server, chain, utxo, mm_ptr, doge_lane,
                                              old_tip, old_height, new_tip, new_height]() {
                                       try {
                                         // Reorg and the UTXO side: doge::coin::UtxoLane.
@@ -7169,6 +7180,10 @@ int main(int argc, char* argv[]) {
                                             && utxo
                                             && utxo->blocks_connected() >= core::coin::DOGE_MINING_GATE_DEPTH;
                                         if (doge_ready) {
+                                            // The DOGE template on the new tip now, not at the
+                                            // merged-mining poll's next tick.
+                                            if (mm_ptr)
+                                                mm_ptr->request_refresh();
                                             web_server.trigger_work_refresh_debounced();
                                         } else {
                                             LOG_DEBUG_COIND << "[EMB-DOGE] Skipping work refresh at h="

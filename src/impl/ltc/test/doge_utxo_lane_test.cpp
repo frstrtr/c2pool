@@ -186,6 +186,8 @@ struct Net {
     uint32_t wiped{0};
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
+    std::vector<std::string> events;     // clean / header, in order
+    bool cleaned_when_header_taken{false};
     Mempool* pool{nullptr};
 
     void set_chain(const std::vector<BlockType>& blocks, uint32_t first_height)
@@ -215,10 +217,20 @@ struct Net {
         };
         // The header chain taking a body's header (main_ltc: HeaderChain::
         // add_header): a header that extends the tip extends the best chain.
+        // main_ltc: the body's txs leave the mempool before its header.
+        h.clean_before_header = [this](const BlockType& b, uint32_t height) {
+            events.push_back("clean " + std::to_string(height));
+            if (pool) {
+                pool->set_tip_height(height);
+                pool->remove_for_block(b);
+            }
+        };
         h.add_header = [this](const BlockType& b) {
             const uint256 hh = hash_of(b);
             if (parent.count(hh) || !parent.count(b.m_previous_block))
                 return false;
+            events.push_back("header");
+            cleaned_when_header_taken = pool && pool->cleaned_for(hh);
             parent[hh] = b.m_previous_block;
             if (!best.empty() && best.rbegin()->second == b.m_previous_block)
                 best[best.rbegin()->first + 1] = hh;
@@ -570,6 +582,34 @@ TEST(DogeUtxoOrder, BodyBeforeHeaderConnectsOnFirstDelivery)
     EXPECT_EQ(l.net.headers_taken, 1u);
     EXPECT_EQ(l.net.headers_requests, 1u);
     EXPECT_EQ(l.lane.stats().headers_requested.load(), 1u);
+}
+
+// The header taken from a body moves the tip at once, and the merged-mining
+// poll (another thread) may build the DOGE template on it right then. The
+// txs the block confirmed must already be out of the mempool: the pool is
+// cleaned for the block BEFORE its header goes in.
+TEST(DogeUtxoOrder, BodyBeforeHeaderCleansThePoolFirst)
+{
+    Lane l;
+    Mempool pool(core::coin::DOGE_LIMITS);
+    pool.set_utxo(l.t.cache.get());
+    l.net.pool = &pool;
+    const auto a = make_chain(genesis(0xd5), 1, 3, 0xd5);
+    l.grow(a);
+    const auto q_tx = spend(txid_of(a[0].m_txs[0]), 0, DOGE_SUBSIDY - 100000000, 0xdb);
+    ASSERT_TRUE(pool.add_tx(q_tx, l.t.cache.get()));
+    const BlockType a4 = make_block(hash_of(a[2]), 4, 0xd9, {q_tx});   // confirms Q
+    l.net.events.clear();
+
+    EXPECT_EQ(l.deliver(a4, 4).fed, UtxoLane::Fed::Connected);
+    EXPECT_EQ(l.net.events, (std::vector<std::string>{"clean 4", "header"}));
+    EXPECT_TRUE(l.net.cleaned_when_header_taken) << "Q was in the pool when the tip moved";
+    EXPECT_FALSE(pool.contains(txid_of(q_tx)));
+
+    // A body whose header the chain already has: nothing extra.
+    l.net.events.clear();
+    l.deliver(a4, 4);
+    EXPECT_TRUE(l.net.events.empty());
 }
 
 // A block buffered by a fill that is no longer the best chain's at its

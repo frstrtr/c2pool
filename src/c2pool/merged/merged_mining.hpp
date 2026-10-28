@@ -320,6 +320,11 @@ public:
     using WorkChangedFn = std::function<void()>;
     void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
 
+    /// Run one poll of the aux chains now, on the RPC thread, instead of
+    /// waiting for the next 1 s tick (e.g. the DOGE tip just moved). Skipped
+    /// when a poll is already running.
+    void request_refresh();
+
 private:
     void poll_loop();
     void refresh_aux_work();

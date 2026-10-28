@@ -145,6 +145,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # connected, a legacy undo record rebuilds, and a child of a tx confirmed
     # only on the old branch never reaches the template without its parent.
     # Same folding rule.
+    #
+    # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
+    # runs one merged-work poll at once (the DOGE tip handler's poke), without
+    # the poll timer. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -174,6 +178,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp

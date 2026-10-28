@@ -83,6 +83,12 @@ struct UtxoLaneHost {
     /// parent it knows: hand the header to the header chain (the same checks
     /// as a headers message; a new tip fires its tip change). true = taken.
     std::function<bool(const BlockType&)> add_header;
+    /// Called just before add_header with a body whose header the chain does
+    /// not know but whose parent it does, at the height it will take: the
+    /// txs it confirmed leave the mempool BEFORE its header can move the tip,
+    /// so no template is ever built on the new tip from a pool still holding
+    /// them.
+    std::function<void(const BlockType&, uint32_t)> clean_before_header;
     /// A body whose header and parent the header chain both do not know: the
     /// header chain is behind; ask peers for headers now (rate-limited by the
     /// host) instead of waiting for the periodic getheaders.
@@ -166,6 +172,9 @@ public:
         // on this delivery instead of being dropped and fetched again once
         // the header lands.
         if (at != hash) {
+            if (height && m_host.clean_before_header && !m_host.prev_of(hash)
+                && m_host.prev_of(block.m_previous_block))
+                m_host.clean_before_header(block, height);
             if (height && m_host.add_header && m_host.add_header(block)) {
                 m_stats.headers_from_bodies.fetch_add(1, std::memory_order_relaxed);
                 at = m_host.chain_hash_at(height);

@@ -640,6 +640,20 @@ void MergedMiningManager::stop()
     m_rpc_pool.join();
 }
 
+void MergedMiningManager::request_refresh()
+{
+    if (m_refresh_in_progress.exchange(true))
+        return;
+    boost::asio::post(m_rpc_pool, [this]() {
+        try {
+            refresh_aux_work();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[MM] refresh_aux_work exception: " << e.what();
+        }
+        m_refresh_in_progress.store(false);
+    });
+}
+
 void MergedMiningManager::poll_loop()
 {
     if (!m_running) return;
