@@ -96,6 +96,8 @@ void MiningInterface::setup_methods()
     
     Add("getblocktemplate", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         nlohmann::json template_params = params.empty() ? nlohmann::json::array() : params;
+        if (aux_template_chain(template_params) && !t_direct_local_request)
+            throw jsonrpccxx::JsonRpcException(-1, "getblocktemplate for a merged chain is local-only");
         return getblocktemplate(template_params);
     }));
     
@@ -2188,9 +2190,45 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
     }
 }
 
+thread_local bool MiningInterface::t_direct_local_request = false;
+
+std::optional<std::string> MiningInterface::aux_template_chain(const nlohmann::json& params) const
+{
+    const nlohmann::json* req = nullptr;
+    if (params.is_array() && !params.empty() && params[0].is_object())
+        req = &params[0];
+    else if (params.is_object())
+        req = &params;
+    if (!req || !req->contains("chain") || !(*req)["chain"].is_string())
+        return std::nullopt;
+    std::string chain = (*req)["chain"].get<std::string>();
+    std::string own = node_symbol();
+    auto upper = [](std::string v) {
+        for (auto& ch : v)
+            if (ch >= 'a' && ch <= 'z')
+                ch = static_cast<char>(ch - 32);
+        return v;
+    };
+    // The node's own chain, also in its testnet spelling (tLTC).
+    const bool own_chain = upper(chain) == upper(own)
+        || (chain.size() > 1 && (chain[0] == 't' || chain[0] == 'T')
+            && upper(chain.substr(1)) == upper(own));
+    if (chain.empty() || own_chain)
+        return std::nullopt;
+    return chain;
+}
+
 nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, const std::string& request_id)
 {
     LOG_INFO << "getblocktemplate request received";
+
+    // A merged chain's template (read-only, local cross-checks).
+    if (auto chain = aux_template_chain(params)) {
+        nlohmann::json j = m_mm_manager ? m_mm_manager->aux_template_json(*chain) : nlohmann::json();
+        if (j.is_null())
+            throw jsonrpccxx::JsonRpcException(-1, "no merged chain " + *chain + " on this node");
+        return j;
+    }
 
     // Return live template if available. A degraded template (MWEB-active,
     // no MWEB state yet) is never handed out: an external GBT miner would
@@ -5727,6 +5765,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
+    // Merged (aux) templates fetched degraded (built before the tip's body
+    // cleaned the mempool: coinbase only) and fetched again clean, per chain.
+    if (m_mm_manager)
+        result["merged_template_gate"] = m_mm_manager->get_template_gate_json();
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

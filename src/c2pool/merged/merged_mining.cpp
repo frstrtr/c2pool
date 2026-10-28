@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
+#include <core/coin/mweb_shape.hpp>
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -677,9 +678,12 @@ void MergedMiningManager::refresh_aux_work()
 
     for (auto& chain : m_chains) {
         try {
-            // Check if tip changed
+            // Check if tip changed. A degraded template (built before the
+            // tip's body cleaned the mempool: coinbase only) is fetched again
+            // on every poll until a clean one comes back.
             auto tip = chain.rpc->get_best_block_hash();
-            if (tip == chain.last_tip && !chain.current_work.block_hash.IsNull()) {
+            const bool same_tip = tip == chain.last_tip && !chain.current_work.block_hash.IsNull();
+            if (same_tip && !chain.template_degraded) {
                 continue;  // no change
             }
             chain.last_tip = tip;
@@ -725,13 +729,36 @@ void MergedMiningManager::refresh_aux_work()
                 }
             }
 
-            chain.current_work = std::move(new_work);
             if (chain.config.multiaddress) {
                 auto tmpl_work = chain.rpc->get_work_template();
                 // Keep the template data but preserve the createauxblock hash
-                chain.current_work.block_template = std::move(tmpl_work.block_template);
-                chain.current_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
-                chain.current_work.coinbase_value = tmpl_work.coinbase_value;
+                new_work.block_template = std::move(tmpl_work.block_template);
+                new_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
+                new_work.coinbase_value = tmpl_work.coinbase_value;
+            }
+            // Still degraded on the same tip: keep the block already being
+            // mined. A new one would differ only in its time, and each rebuild
+            // would push new work to every miner and fill frozen_history.
+            if (same_tip && chain.template_degraded
+                && core::coin::template_degraded_code(new_work.block_template)) {
+                ++chain.templates_still_degraded;
+                continue;
+            }
+            chain.current_work = std::move(new_work);
+            {
+                const bool was_degraded = chain.template_degraded;
+                const auto why = core::coin::template_degraded_code(chain.current_work.block_template);
+                chain.template_degraded = why.has_value();
+                if (chain.template_degraded) {
+                    ++chain.templates_degraded;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " degraded (" << *why
+                             << "): coinbase only, fetching again next poll";
+                } else if (was_degraded) {
+                    ++chain.templates_refetched_clean;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " fetched again, clean";
+                }
             }
 
             // Like p2pool: get authoritative target from the daemon via
@@ -1116,6 +1143,79 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
     }
 }
 
+nlohmann::json MergedMiningManager::aux_template_json(const std::string& symbol) const
+{
+    auto upper = [](std::string v) {
+        for (auto& ch : v)
+            if (ch >= 'a' && ch <= 'z')
+                ch = static_cast<char>(ch - 32);
+        return v;
+    };
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains) {
+        if (upper(chain.config.symbol) != upper(symbol))
+            continue;
+        const auto& w = chain.current_work;
+        const auto& t = w.block_template;
+        nlohmann::json j = nlohmann::json::object();
+        j["chain"] = chain.config.symbol;
+        j["chain_id"] = chain.config.chain_id;
+        j["height"] = w.height;
+        j["previousblockhash"] = t.is_object() ? t.value("previousblockhash", w.prev_block_hash)
+                                               : w.prev_block_hash;
+        j["bits"] = t.is_object() ? t.value("bits", std::string()) : std::string();
+        j["version"] = t.is_object() ? t.value("version", 0) : 0;
+        j["curtime"] = t.is_object() ? t.value("curtime", int64_t{0}) : int64_t{0};
+        j["mintime"] = t.is_object() ? t.value("mintime", int64_t{0}) : int64_t{0};
+        j["coinbasevalue"] = w.coinbase_value;
+        j["target"] = w.target.GetHex();
+        j["block_hash"] = w.block_hash.GetHex();
+        j["coinbase_hex"] = chain.frozen_coinbase_hex;
+        j["using_fallback"] = chain.using_fallback;
+        const auto why = core::coin::template_degraded_code(t);
+        j["degraded"] = why ? nlohmann::json(*why) : nlohmann::json(nullptr);
+        nlohmann::json txs = nlohmann::json::array();
+        uint64_t tx_bytes = 0;
+        if (t.is_object() && t.contains("transactions") && t["transactions"].is_array()) {
+            for (const auto& e : t["transactions"]) {
+                if (!e.is_object())
+                    continue;
+                const std::string data = e.value("data", std::string());
+                tx_bytes += data.size() / 2;
+                txs.push_back({{"txid", e.value("txid", std::string())},
+                               {"data", data},
+                               {"fee", e.contains("fee") ? e["fee"] : nlohmann::json(nullptr)}});
+            }
+        }
+        j["tx_count"] = txs.size();
+        j["tx_bytes"] = tx_bytes;
+        j["transactions"] = std::move(txs);
+        return j;
+    }
+    return nullptr;
+}
+
+nlohmann::json MergedMiningManager::get_template_gate_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& chain : m_chains)
+        j[chain.config.symbol] = {{"degraded", chain.templates_degraded},
+                                  {"refetched_clean", chain.templates_refetched_clean},
+                                  {"still_degraded", chain.templates_still_degraded},
+                                  {"degraded_now", chain.template_degraded}};
+    return j;
+}
+
+bool MergedMiningManager::has_frozen_snapshot(uint32_t chain_id, const uint256& block_hash) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains)
+        if (chain.config.chain_id == chain_id)
+            return chain.frozen_history.count(block_hash) > 0;
+    return false;
+}
+
 std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -1258,16 +1358,25 @@ void MergedMiningManager::rebuild_cached_blocks()
                 chain.frozen_history[chain.frozen_block_hash] = {
                     chain.frozen_template,
                     chain.frozen_coinbase_hex,
-                    now_sec
+                    now_sec,
+                    ++m_frozen_seq
                 };
-                // Expire old snapshots
+                // Expire old snapshots, then keep at most MAX_FROZEN_HISTORY,
+                // dropping the oldest first. (The map is keyed by block hash:
+                // trimming in key order could drop the snapshot just frozen,
+                // and a find committing to it would be skipped at submit.)
                 for (auto it = chain.frozen_history.begin(); it != chain.frozen_history.end(); ) {
-                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC
-                        || chain.frozen_history.size() > ChainState::MAX_FROZEN_HISTORY) {
+                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC)
                         it = chain.frozen_history.erase(it);
-                    } else {
+                    else
                         ++it;
-                    }
+                }
+                while (chain.frozen_history.size() > ChainState::MAX_FROZEN_HISTORY) {
+                    auto oldest = chain.frozen_history.begin();
+                    for (auto it = chain.frozen_history.begin(); it != chain.frozen_history.end(); ++it)
+                        if (it->second.seq < oldest->second.seq)
+                            oldest = it;
+                    chain.frozen_history.erase(oldest);
                 }
                 LOG_INFO << "[MM-cache] chain " << hi.chain_id
                          << " frozen hash=" << chain.frozen_block_hash.GetHex().substr(0, 16)

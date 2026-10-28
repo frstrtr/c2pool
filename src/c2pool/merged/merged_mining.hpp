@@ -320,9 +320,29 @@ public:
     using WorkChangedFn = std::function<void()>;
     void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
 
+    /// One poll of the aux chains (called every second by poll_loop on the
+    /// RPC thread; public so a test can drive one). A chain's template is
+    /// fetched when its tip changed, and again on every poll while the last
+    /// one came back degraded (core::coin::kTemplateDegradedKey).
+    void refresh_aux_work();
+
+    /// Read-only view of an aux chain's current block template (symbol,
+    /// case-insensitive), for local cross-checks: prev, height, bits,
+    /// curtime, coinbase value, the tx list (txid, raw, fee), tx bytes, the
+    /// degraded mark, the block hash the parent commits to and the frozen
+    /// coinbase. null when there is no such chain.
+    nlohmann::json aux_template_json(const std::string& symbol) const;
+
+    /// Per chain symbol: {"degraded": templates fetched degraded,
+    /// "refetched_clean": clean templates fetched after a degraded one}.
+    nlohmann::json get_template_gate_json() const;
+
+    /// The chain keeps a frozen snapshot for this committed block hash (a
+    /// share committing to it can still be turned into a block).
+    bool has_frozen_snapshot(uint32_t chain_id, const uint256& block_hash) const;
+
 private:
     void poll_loop();
-    void refresh_aux_work();
 
 public:
     // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
@@ -374,6 +394,12 @@ private:
         std::string                          last_tip;
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
+        // The last template came back degraded (the mempool was not cleaned
+        // for the tip yet): the tip is not latched, the next poll fetches again.
+        bool                                 template_degraded{false};
+        uint64_t                             templates_degraded{0};
+        uint64_t                             templates_refetched_clean{0};
+        uint64_t                             templates_still_degraded{0};  // re-fetches kept back
         // Frozen DOGE block data from rebuild_cached_blocks().
         // Contains the pre-built DOGE coinbase hex and template snapshot that
         // match the block hash committed in the LTC parent's mm_data.
@@ -391,6 +417,7 @@ private:
             nlohmann::json tmpl;
             std::string    coinbase_hex;
             int64_t        timestamp;   // monotonic seconds for expiration
+            uint64_t       seq{0};      // insertion order: the cap drops the oldest
         };
         std::map<uint256, FrozenSnapshot> frozen_history;  // block_hash → snapshot
         // Keep enough frozen snapshots to cover FROZEN_EXPIRY_SEC (300s).
@@ -401,6 +428,7 @@ private:
         static constexpr int64_t FROZEN_EXPIRY_SEC = 300;  // 5 minutes
     };
     std::vector<ChainState> m_chains;
+    uint64_t m_frozen_seq{0};  // FrozenSnapshot::seq source (under m_mutex)
 
     // Submit via submitauxblock and relay the accepted block via P2P
     void submit_aux_and_relay(ChainState& chain, const std::string& auxpow,

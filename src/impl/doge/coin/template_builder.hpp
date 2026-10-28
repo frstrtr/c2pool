@@ -12,6 +12,7 @@
 #include "chain_params.hpp"    // get_doge_block_subsidy(), calculate_doge_next_work()
 
 #include <core/log.hpp>
+#include <core/coin/mweb_shape.hpp>
 
 // Reuse LTC's generic components (Mempool, block format, RPC data, merkle)
 #include <impl/ltc/coin/mempool.hpp>
@@ -98,10 +99,22 @@ public:
         // Use prevHash-based random subsidy (exact match with Dogecoin Core)
         uint64_t subsidy = get_doge_block_subsidy(next_h, params, tip.block_hash);
 
+        // ── Mempool cleaned for this tip ──────────────────────────────────
+        // The txs the tip confirmed leave the pool only when the tip's body
+        // runs through remove_for_block; until then any selection can carry
+        // them (bad-txns-inputs-missingorspent). The DOGE list is fetched once
+        // per tip change, usually before the body, and kept for the whole
+        // interval. A coinbase-only block on the new tip is valid and pays the
+        // subsidy (DOGE fees are a few hundredths of a percent of it); a held
+        // template would be on the old tip. So: no txs, marked degraded, and
+        // the merged-mining poll fetches again until the pool is cleaned.
+        const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
+
         // ── Transactions from mempool (fee-sorted when UTXO available) ──
-        auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
-                                          /*fill_unknown_fee=*/true);
+        auto [selected_txs, total_fees] = pool_cleaned
+            ? pool.get_sorted_txs_with_fees(MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
+                                            /*fill_unknown_fee=*/true)
+            : std::pair<std::vector<ltc::coin::Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
         uint64_t coinbasevalue = subsidy + total_fees;
@@ -171,6 +184,8 @@ public:
         data["sizelimit"]         = 1'000'000;
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+        if (!pool_cleaned)
+            data[core::coin::kTemplateDegradedKey] = "mempool-not-cleaned-for-tip";
 
         LOG_INFO << "[EMB-DOGE] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
@@ -180,6 +195,7 @@ public:
                  << " fees=" << total_fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << selected_txs.size()
+                 << (pool_cleaned ? "" : " degraded=mempool-not-cleaned-for-tip")
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
                  << " synced=" << (chain.is_synced() ? "true" : "false");

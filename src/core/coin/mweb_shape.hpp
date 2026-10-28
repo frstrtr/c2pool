@@ -99,6 +99,23 @@ inline std::optional<std::string> template_refusal_code(const nlohmann::json& tm
     return tmpl[kTemplateRefusalKey].get<std::string>();
 }
 
+/// Key under which a coin node marks a template it built DEGRADED but valid:
+/// the embedded DOGE builder's coinbase-only template while the mempool has
+/// not been cleaned for the tip ("mempool-not-cleaned-for-tip"). Unlike
+/// kTemplateRefusalKey it is served (a coinbase-only block on the new tip is
+/// valid; a held template would be on the old tip); the merged-mining poll
+/// fetches again until it is gone.
+inline constexpr const char* kTemplateDegradedKey = "degraded";
+
+/// The degraded code a coin node put on the template, if any.
+inline std::optional<std::string> template_degraded_code(const nlohmann::json& tmpl)
+{
+    if (!tmpl.is_object() || !tmpl.contains(kTemplateDegradedKey)
+        || !tmpl[kTemplateDegradedKey].is_string())
+        return std::nullopt;
+    return tmpl[kTemplateDegradedKey].get<std::string>();
+}
+
 /// True when a getblocktemplate-shaped "rules" array names the MWEB
 /// deployment ("mweb", or "!mweb" for the forced-rule spelling).
 inline bool template_rules_have_mweb(const nlohmann::json& tmpl)

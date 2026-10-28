@@ -145,7 +145,16 @@ public:
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
     nlohmann::json submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id = "");
+    // params [{"chain": "<aux symbol>"}] (e.g. "DOGE"): the merged chain's
+    // current block template instead (MergedMiningManager::aux_template_json),
+    // read-only, for local cross-checks; over JSON-RPC only to a direct local
+    // request (t_direct_local_request). Any other chain: the node's own.
     nlohmann::json getblocktemplate(const nlohmann::json& params = nlohmann::json::array(), const std::string& request_id = "");
+    // Set by the HTTP session around a JSON-RPC call from a direct local
+    // client (loopback, no proxy headers).
+    static thread_local bool t_direct_local_request;
+    // The aux chain a getblocktemplate params names, if not the node's own.
+    std::optional<std::string> aux_template_chain(const nlohmann::json& params) const;
     nlohmann::json submitblock(const std::string& hex_data, const std::string& request_id = "");
 
     // Recent-won-block dedup (#886). Keyed on the BLOCK HASH (SHA256d of the
