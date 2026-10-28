@@ -3559,6 +3559,18 @@ std::string MiningInterface::found_block_miner_display(const std::string& stored
     return decoded;
 }
 
+namespace {
+// A block carries a luck MEASUREMENT only when we hold a local record of it
+// (a relayed row has no local timing) and both its interval and its luck
+// were computed. One predicate for every consumer, so /recent_blocks'
+// pool_avg_luck and /luck_stats' avg_luck can never average different rows.
+bool luck_measured(const MiningInterface::FoundBlock& b)
+{
+    const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    return have_local_record && b.luck > 0.0 && b.time_to_find > 0.0;
+}
+} // namespace
+
 nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) const
 {
     static const char* status_str[] = {"pending", "confirmed", "orphaned", "stale"};
@@ -3663,8 +3675,7 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // A luck value exists only on a row we hold locally that actually
     // computed one (time_to_find>0 && luck>0). Those rows feed both the
     // per-row luck_approximate flag and rest_recent_blocks' pool aggregate.
-    const bool luck_present = have_local_record && b.luck > 0.0
-                              && b.time_to_find > 0.0;
+    const bool luck_present = luck_measured(b);
     // block_reward: the raw-duff subsidy expressed in whole coins, kept
     // ALONGSIDE the existing integer `subsidy` field. 1e8 base units per
     // coin holds for every lane this build serves (DASH/LTC/DOGE/BTC/DGB).
@@ -7920,6 +7931,29 @@ nlohmann::json MiningInterface::rest_luck_stats()
     }
     result["luck_available"] = any_primary;
     result["blocks"] = blocks;
+
+    // Pool luck aggregates (#1142 item 8, p2pool-dash parity). Same row set
+    // as /recent_blocks pool_avg_luck: only rows that measured a luck. With
+    // no measured row every value is null, never a fabricated 0%.
+    double luck_sum = 0.0, luck_min = 0.0, luck_max = 0.0;
+    uint64_t luck_count = 0, primary_count = 0;
+    for (const auto& b : m_found_blocks) {
+        if (!is_primary_found_block(b)) continue;   // aux rows: see above
+        ++primary_count;
+        if (!luck_measured(b)) continue;
+        if (luck_count == 0 || b.luck < luck_min) luck_min = b.luck;
+        if (luck_count == 0 || b.luck > luck_max) luck_max = b.luck;
+        luck_sum += b.luck;
+        ++luck_count;
+    }
+    const bool have_luck = luck_count > 0;
+    result["blocks_found"]     = primary_count;
+    result["blocks_with_luck"] = luck_count;
+    result["avg_luck"] = have_luck
+        ? nlohmann::json(luck_sum / static_cast<double>(luck_count))
+        : nlohmann::json(nullptr);
+    result["min_luck"] = have_luck ? nlohmann::json(luck_min) : nlohmann::json(nullptr);
+    result["max_luck"] = have_luck ? nlohmann::json(luck_max) : nlohmann::json(nullptr);
 
     // Current round luck: expected_time / time_since_last_block * 100
     // Matches p2pool: shows how the ongoing round compares to expectation
