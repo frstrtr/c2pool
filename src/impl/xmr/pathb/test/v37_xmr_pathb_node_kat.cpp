@@ -372,6 +372,7 @@ struct PathbNodeTestAccess {
     }
     // A body asked by a header page (FetchBodies) at time t.
     static void body_asked(PathbNode& n, const Hash32& id, std::uint64_t t) { n.bodies_asked_[id] = t; }
+    static bool hf_live(const PathbNode& n) { return n.headers_first_live(); }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -8929,6 +8930,105 @@ void rclate() {
         silent_checks("rclate " + std::to_string(late) + " s", silent_run(0, late), true);
 }
 
+// rcrehello: only a catch-up round's first request (the first after a HELLO) makes headers first live, for at most P-53.
+// J follows S; S HELLOs J. Round 1: J's first request R1 is live until its reply; a later request R2 of the round is
+// not live, nor after S HELLOs again while R2 is in flight. Round 2: its first request R3 gets no reply (S silent) while
+// S HELLOs every 5 s: R3 is live through P-53 and retired after it, and nothing is live after it; a frame J parks
+// meanwhile asks its parent once headers first is not live.
+void rcrehello() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 59000 + static_cast<std::uint32_t>(i));
+    }
+    h.q.clear();
+    (void)h[j].tick(h.now);
+    const pb::Hash32 tip = h[s].tree().best().id;
+    const auto live = [&h, j] { return pb::PathbNodeTestAccess::hf_live(h[j]); };
+    const auto hello = [&h, j, s] { return h.hello(j, s).verdict == pb::HelloVerdict::Accept; };
+    const auto ask = [&h, j, s, &tip] {  // a catch-up request of J to S (from J's tip: an empty page)
+        h.q.clear();
+        return h[j].request_headers(s, tip, tip, 64, h.now);
+    };
+    const auto serve = [&h, j, s] {  // S answers J's open request
+        for (const Msg& m : std::deque<Msg>(h.q))
+            if (m.from == j && m.to == s && !m.frame.empty() && m.frame[0] == pb::kOpFcGetHeaders)
+                for (const auto& f : h[s].serve_getheaders(j, m.frame, h.now).frames) (void)h[j].on_headers(s, f, h.now);
+        h.q.clear();
+    };
+    const bool setup = h[j].tree().best().id == tip && hello();
+    const bool r1 = ask();
+    const bool live1 = live();
+    serve();
+    const bool live1_after = live();
+    const bool r2 = ask();
+    const bool live2 = live();
+    const bool rehello2 = hello();
+    const bool live2_rehello = live();
+    serve();
+    const bool round2 = hello();
+    const bool r3 = ask();
+    const bool live3 = live();
+    // a frame on a parent no node holds, parked at J from S while R3 is in flight
+    pb::Hash32 parent = seq32(0xe1);
+    std::optional<pb::PathbJob> jb = h.job(s, 1, 59100);
+    bool parked = false;
+    if (jb) {
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 59100;
+        c.own.side.tip = parent;
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      parent);
+        parked = h[j].deferred().size() == 1;
+    }
+    const auto asks = [&h, j, &parent] {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == parent ? 1 : 0;
+        }
+        return n;
+    };
+    std::size_t asked_live = 0;
+    bool live_in = true;
+    for (std::uint64_t t = 1; t <= pb::kAbandonTimeoutDefault; ++t) {  // within P-53 of R3: S HELLOs every 5 s
+        h.now += 1;
+        if (t % 5 == 0) (void)hello();
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+        live_in = live_in && live();
+        asked_live += asks();
+    }
+    bool live_out = false;
+    std::size_t asked_after = 0;
+    for (std::uint64_t t = 0; t < 2 * pb::kAbandonTimeoutDefault; ++t) {  // past P-53: R3 retired; S HELLOs every 5 s
+        h.now += 1;
+        if (t % 5 == 0) (void)hello();
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+        live_out = live_out || live();
+        asked_after += asks();
+        h.q.clear();
+    }
+    const bool r4 = h[j].request_headers(s, tip, tip, 64, h.now);  // R3 retired, no reply: the slot stays taken
+    std::printf("  rcrehello: R1 live %d, after its reply %d; R2 live %d, after a re-HELLO %d; R3 (round 2) live %d, within "
+                "P-53 of it %d, past it %d; parked %d; asks of its parent within P-53 %zu, past it %zu; a new request %d\n",
+                live1 ? 1 : 0, live1_after ? 1 : 0, live2 ? 1 : 0, live2_rehello ? 1 : 0, live3 ? 1 : 0, live_in ? 1 : 0,
+                live_out ? 1 : 0, parked ? 1 : 0, asked_live, asked_after, r4 ? 1 : 0);
+    check(setup && r1 && r2 && rehello2 && round2 && r3 && parked, "rcrehello: setup (J on S's chain, S's HELLOs, requests)");
+    check(live1 && !live1_after, "rcrehello: a round's first request is live until its reply");
+    check(!live2 && !live2_rehello, "rcrehello: a later request of the round is not live, nor after a re-HELLO");
+    check(live3 && live_in && asked_live == 0, "rcrehello: round 2's first request, unanswered, live within P-53; no ask");
+    check(!live_out && asked_after >= 1 && !r4,
+          "rcrehello: retired at P-53, nothing live after it although S HELLOs every 5 s; the parked frame's parent asked");
+}
+
 // pwalkgone: A and B hold one chain; J follows both. E, a node of its own, holds A's positions 1..6 and mines e1, e2 on
 // position 6; A places them on a side branch and floods them, and so does B. The wire loses e1's floods to J and B's e2,
 // so J parks A's e2, and J's FC_GETCARRIER(e1) to A is lost; then A's link to J drops. The relay's tick asks e1 of B (the
@@ -11064,6 +11164,7 @@ int main(int argc, char** argv) {
     run("pwalksilent", pwalksilent);
     run("rcsilent", rcsilent);
     run("rclate", rclate);
+    run("rcrehello", rcrehello);
     run("pwalkgone", pwalkgone);
     run("pwalkjunk", pwalkjunk);
     run("pwalkasked", pwalkasked);

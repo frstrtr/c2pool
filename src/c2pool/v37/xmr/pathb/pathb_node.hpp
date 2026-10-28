@@ -781,7 +781,7 @@ public:
         if (c.verdict == HelloVerdict::Accept) {
             const bool fresh = peers_.count(peer) == 0;
             peers_[peer] = theirs.tail;
-            hf_answered_.erase(peer);
+            hf_round_.insert(peer);  // the peer's next catch-up request is a round's first
             if (fresh) joiner_->release_waits(std::nullopt);  // a new Path B peer: the pairs waiting on a P_r are tried
             // the first catch-up round after the start opens at the first tail whose claim wins (the template gate)
             if (gate_applies() && first_round_ && !first_round_open_ && tree_->find(theirs.tail.best_tip) == nullptr
@@ -1108,7 +1108,7 @@ public:
 
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
-        hf_answered_.erase(peer);
+        hf_round_.erase(peer);
         if (verified_win_ && verified_win_peer_ == peer) verified_win_.reset();
         headers_->release_peer(peer);
         deferred_.forget_peer(peer);
@@ -1653,6 +1653,7 @@ public:
         r.stop = stop;
         r.max = max;
         r.owner = owner;
+        r.first = owner == HeaderOwner::CatchUp && hf_round_.erase(peer) != 0;
         r.sent_s = now_s;
         header_req_[peer] = std::move(r);
         timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
@@ -1719,7 +1720,6 @@ public:
         }
         const auto it = header_req_.find(peer);
         if (it == header_req_.end()) return out;
-        if (it->second.owner == HeaderOwner::CatchUp) hf_answered_.insert(peer);
         // the next FC_HEADERS of a peer answers the request in flight to it (one frame, one request)
         if (it->second.retired) {  // its reply, whatever it holds: DROP, nothing judged; the slot frees
             out.kind = HeadersOutcome::Kind::Retired;
@@ -1972,6 +1972,7 @@ public:
             req.from = out.ids.back();
             req.sent_s = now_s;
             req.arrived = false;
+            req.first = false;
             const GetHeaders q{cfg_.identity.chain_id, req.from, req.stop, req.max};
             header_req_[peer] = std::move(req);
             timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
@@ -2097,10 +2098,7 @@ public:
                 it->second.retired = true;
                 it->second.got.clear();
                 it->second.heights.clear();
-                if (it->second.owner == HeaderOwner::CatchUp) {
-                    hf_answered_.insert(r.peer);
-                    end_first_round();  // its P-53 ends the first round
-                }
+                if (it->second.owner == HeaderOwner::CatchUp) end_first_round();  // its P-53 ends the first round
                 continue;
             }
             const auto key = std::make_pair(r.peer, r.at);
@@ -2159,6 +2157,7 @@ private:
         std::uint64_t sent_s = 0;  // this page's send
         bool arrived = false;      // a frame of its reply arrived: its P-53 clock stopped
         bool retired = false;      // no frame within P-53: its reply DROPs when it arrives
+        bool first = false;        // a catch-up round's first request (the first after a HELLO)
         std::vector<CarrierHeader> got;      // the branch's headers so far, oldest first
         std::vector<std::uint64_t> heights;  // h(y) of each
     };
@@ -3246,12 +3245,12 @@ private:
                && std::equal(frame.begin() + kFrameHeaderBytes, frame.end(), held->begin() + kFrameHeaderBytes);
     }
 
-    // Headers first is live (no parent ask, first or repeated, goes out): (a) a catch-up's first request is in flight
-    // (sent, not answered, not retired); or (b) while the deferred store is not full, a body a header page asked is in
-    // flight within P-53, or one was placed within P-53.
+    // Headers first is live (no parent ask, first or repeated, goes out): (a) a catch-up round's first request is in
+    // flight (sent, no frame of its reply arrived, not retired); or (b) while the deferred store is not full, a body a
+    // header page asked is in flight within P-53, or one was placed within P-53.
     bool headers_first_live() const {
         for (const auto& [p, r] : header_req_)
-            if (r.owner == HeaderOwner::CatchUp && !r.retired && hf_answered_.count(p) == 0) return true;
+            if (r.owner == HeaderOwner::CatchUp && r.first && !r.arrived && !r.retired) return true;
         if (deferred_.size() >= deferred_.cap()) return false;
         if (hf_placed_s_ != 0 && clock_s_ < hf_placed_s_ + cfg_.abandon_timeout_s) return true;
         for (const auto& [id, t] : bodies_asked_)
@@ -3590,7 +3589,7 @@ private:
     std::uint64_t parent_reasks_ = 0;               // ... of them by reask_parents
     std::map<Hash32, std::uint64_t> reask_round_;   // reask_parents: asks of a missing parent sent past its sender
     std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
-    std::set<std::uint64_t> hf_answered_;           // peers whose catch-up's first request got a reply or was retired
+    std::set<std::uint64_t> hf_round_;              // peers whose next catch-up request opens a round (after a HELLO)
     std::uint64_t hf_placed_s_ = 0;                 // the last placement of a body a header page asked (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
