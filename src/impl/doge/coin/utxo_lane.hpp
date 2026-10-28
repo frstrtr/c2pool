@@ -79,6 +79,14 @@ struct UtxoLaneHost {
     std::function<uint256(uint32_t)> chain_hash_at;
     /// A known header's parent (nullopt: the header is unknown).
     std::function<std::optional<uint256>(const uint256&)> prev_of;
+    /// A body whose header the header chain does not know yet but whose
+    /// parent it knows: hand the header to the header chain (the same checks
+    /// as a headers message; a new tip fires its tip change). true = taken.
+    std::function<bool(const BlockType&)> add_header;
+    /// A body whose header and parent the header chain both do not know: the
+    /// header chain is behind; ask peers for headers now (rate-limited by the
+    /// host) instead of waiting for the periodic getheaders.
+    std::function<void()> headers_needed;
     /// Fetch the best chain's block at height h.
     std::function<void(uint32_t, UtxoAsk)> request;
     /// A block was connected to the set. drained: by the ordered pipeline
@@ -101,6 +109,8 @@ struct UtxoLaneStats {
     std::atomic<uint64_t> disconnected{0};   // blocks those walks disconnected
     std::atomic<uint64_t> rebuilds{0};       // wipes + rebuilds
     std::atomic<uint64_t> heal_failures{0};  // the set could not be brought back (yet)
+    std::atomic<uint64_t> headers_from_bodies{0};  // headers the header chain took from a body
+    std::atomic<uint64_t> headers_requested{0};    // bodies whose parent was unknown too
 
     nlohmann::json to_json() const
     {
@@ -110,6 +120,7 @@ struct UtxoLaneStats {
             {"reorgs", v(reorgs)},             {"refused", v(refused)},
             {"heals", v(heals)},               {"disconnected", v(disconnected)},
             {"rebuilds", v(rebuilds)},         {"heal_failures", v(heal_failures)},
+            {"headers_from_bodies", v(headers_from_bodies)}, {"headers_requested", v(headers_requested)},
         };
     }
 };
@@ -147,7 +158,23 @@ public:
     {
         using namespace ltc::coin;
         FeedResult r;
-        const uint256 at = height ? m_host.chain_hash_at(height) : uint256();
+        uint256 at = height ? m_host.chain_hash_at(height) : uint256();
+        // A body often arrives before the header chain knows its block: a
+        // peer's inv is answered with the body at once, while headers come
+        // with the periodic getheaders. The body carries its header; the
+        // header chain takes it here, so the block is judged (and connected)
+        // on this delivery instead of being dropped and fetched again once
+        // the header lands.
+        if (at != hash) {
+            if (height && m_host.add_header && m_host.add_header(block)) {
+                m_stats.headers_from_bodies.fetch_add(1, std::memory_order_relaxed);
+                at = m_host.chain_hash_at(height);
+            } else if (m_host.headers_needed && !m_host.prev_of(hash)
+                       && !m_host.prev_of(block.m_previous_block)) {
+                m_stats.headers_requested.fetch_add(1, std::memory_order_relaxed);
+                m_host.headers_needed();
+            }
+        }
         r.on_best_chain = !at.IsNull() && at == hash;
 
         // 1. Cold start: the first block above `keep` with the set empty or

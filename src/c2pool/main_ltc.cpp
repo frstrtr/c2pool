@@ -6872,6 +6872,29 @@ int main(int argc, char* argv[]) {
                                 // order, reorgs by ancestry, heal / rebuild (#2070).
                                 // The tip-change handler below shares it.
                                 auto doge_mempool_requested = std::make_shared<bool>(false);
+                                // Headers now, not at the next periodic getheaders (60 s once
+                                // synced): a peer announced a block the header chain does not
+                                // know, or a body arrived whose parent it does not know either.
+                                // At most once a second.
+                                auto doge_last_hdr_req = std::make_shared<std::chrono::steady_clock::time_point>();
+                                auto request_doge_headers =
+                                    [dc = doge_chain.get(), bcaster_ptr, doge_last_hdr_req]() {
+                                        const auto now = std::chrono::steady_clock::now();
+                                        if (now - *doge_last_hdr_req < std::chrono::seconds(1))
+                                            return;
+                                        *doge_last_hdr_req = now;
+                                        try {
+                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Header request error: " << e.what();
+                                        }
+                                    };
+                                broadcaster->set_on_new_block(
+                                    [dc = doge_chain.get(), request_doge_headers](
+                                        const std::string& /*peer*/, const uint256& hash) {
+                                        if (!dc->has_header(hash))
+                                            request_doge_headers();
+                                    });
                                 // Round-robin counter for one-peer fill requests, and
                                 // the peer whose block is being handled (a gap fill
                                 // asks it first: it has the block's parents).
@@ -6892,6 +6915,15 @@ int main(int argc, char* argv[]) {
                                             return std::nullopt;
                                         return e->prev_hash;
                                     };
+                                    host.add_header = [dc](const ltc::coin::BlockType& b) {
+                                        const auto& hdr = static_cast<const ltc::coin::BlockHeaderType&>(b);
+                                        if (!dc->has_header(b.m_previous_block))
+                                            return false;
+                                        if (dc->has_header(Hash(pack(hdr).get_span())))
+                                            return false;
+                                        return dc->add_header(hdr);
+                                    };
+                                    host.headers_needed = request_doge_headers;
                                     host.request = [dc, bcaster_ptr, doge_fill_rr, doge_cur_peer](
                                                        uint32_t h, doge::coin::UtxoAsk how) {
                                         auto e = dc->get_header_by_height(h);
@@ -7123,9 +7155,10 @@ int main(int argc, char* argv[]) {
                                                         << (new_height <= old_height ? " [REORG]" : "");
                                         }
 
-                                        // Request the new tip's full block for UTXO build + mempool cleanup.
-                                        // Always fires during sync — the block body drives UTXO construction.
-                                        if (bcaster_ptr)
+                                        // Request the new tip's full block for UTXO build + mempool cleanup,
+                                        // unless the UTXO set already has it: its body moved the tip (the
+                                        // header came from the body), was connected and cleaned the pool.
+                                        if (bcaster_ptr && !(utxo && utxo->get_best_block() == new_tip))
                                             bcaster_ptr->request_full_block(new_tip);
 
                                         // Merged-mining readiness gate.  aux_chain_embedded's

@@ -184,6 +184,8 @@ struct Net {
     std::vector<UtxoAsk> asked_how;
     std::vector<uint32_t> connected;  // heights, in connect order
     uint32_t wiped{0};
+    uint32_t headers_taken{0};  // headers the chain took from bodies
+    uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     Mempool* pool{nullptr};
 
     void set_chain(const std::vector<BlockType>& blocks, uint32_t first_height)
@@ -211,6 +213,19 @@ struct Net {
                 return std::nullopt;
             return it->second;
         };
+        // The header chain taking a body's header (main_ltc: HeaderChain::
+        // add_header): a header that extends the tip extends the best chain.
+        h.add_header = [this](const BlockType& b) {
+            const uint256 hh = hash_of(b);
+            if (parent.count(hh) || !parent.count(b.m_previous_block))
+                return false;
+            parent[hh] = b.m_previous_block;
+            if (!best.empty() && best.rbegin()->second == b.m_previous_block)
+                best[best.rbegin()->first + 1] = hh;
+            ++headers_taken;
+            return true;
+        };
+        h.headers_needed = [this]() { ++headers_requests; };
         h.request = [this](uint32_t height, UtxoAsk how) {
             requested.push_back(height);
             asked_how.push_back(how);
@@ -514,6 +529,74 @@ TEST(DogeUtxoOrder, OrphanedTxChildIsNotSelectedAfterReorg)
 
 // ── Beyond the five: request kinds, startup, a mismatch the tip change did
 //    not report, the cold start, counters ────────────────────────────────
+
+// On the canary 62 % of DOGE bodies arrive before the header chain knows the
+// block (a peer's inv is answered with the body; headers come with the 60 s
+// getheaders): p50 10 s, up to 61 s early. The body carries its header: the
+// header chain takes it and the block is connected on this delivery. Before,
+// the body was dropped (not on the best chain yet), fetched again after the
+// header landed, and meanwhile the mempool pass evicted the children of its
+// txs.
+TEST(DogeUtxoOrder, BodyBeforeHeaderConnectsOnFirstDelivery)
+{
+    Lane l;
+    const auto a = make_chain(genesis(0xe0), 1, 3, 0xe0);
+    l.grow(a);
+    const auto x_tx = spend(txid_of(a[0].m_txs[0]), 0, DOGE_SUBSIDY - 100000000, 0xea);
+    const BlockType a4 = make_block(hash_of(a[2]), 4, 0xe4, {x_tx});
+    l.net.requested.clear();
+
+    const auto r = l.deliver(a4, 4);   // the header chain has never seen a4
+    EXPECT_EQ(r.fed, UtxoLane::Fed::Connected) << "connected on the first delivery";
+    EXPECT_EQ(l.net.headers_taken, 1u) << "the header came from the body";
+    EXPECT_EQ(l.net.best[4], hash_of(a4));
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(a4));
+    EXPECT_TRUE(l.has(x_tx));
+    EXPECT_FALSE(l.has(a[0].m_txs[0])) << "the coin a4 spent is spent";
+    EXPECT_TRUE(l.net.requested.empty()) << "nothing fetched again";
+    // The tip change the header chain fired: an extension, nothing to do.
+    EXPECT_FALSE(l.lane.on_tip_changed(hash_of(a[2]), 3, hash_of(a4), 4));
+    EXPECT_TRUE(l.net.requested.empty());
+    // The late copy (another peer, or the old re-request): already connected.
+    EXPECT_EQ(l.deliver(a4, 4).fed, UtxoLane::Fed::Skipped);
+    EXPECT_EQ(l.lane.stats().headers_from_bodies.load(), 1u);
+
+    EXPECT_EQ(l.net.headers_requests, 0u);
+    // A body whose parent the chain does not know either: the header chain
+    // is behind. Nothing taken or connected; headers are asked for now
+    // instead of at the next periodic getheaders.
+    const BlockType stray = make_block(genesis(0xef), 6, 0xe6);
+    EXPECT_EQ(l.deliver(stray, 0).fed, UtxoLane::Fed::Skipped);
+    EXPECT_EQ(l.net.headers_taken, 1u);
+    EXPECT_EQ(l.net.headers_requests, 1u);
+    EXPECT_EQ(l.lane.stats().headers_requested.load(), 1u);
+}
+
+// A block buffered by a fill that is no longer the best chain's at its
+// height when the drain reaches it (the header chain switched, its tip
+// change not handled yet): it is not connected; the fill restarts at the
+// set's real next height and fetches the best chain's block.
+TEST(DogeUtxoOrder, StaleBufferedBlockIsRefetched)
+{
+    Lane l;
+    const auto a = make_chain(genesis(0xf0), 1, 4, 0xf0);   // a1..a4
+    const BlockType a4x = make_block(hash_of(a[2]), 4, 0xf9); // sibling of a4
+    l.grow({a[0], a[1]});
+    l.switch_to(a, 1);
+    l.deliver(a[3], 4);                        // gap: a4 buffered, 3 requested
+    ASSERT_TRUE(l.lane.fill().active);
+    l.net.set_chain({a[0], a[1], a[2], a4x}, 1);  // switched, not yet handled
+    l.net.requested.clear();
+    l.deliver(a[2], 3);                        // 3 drains; a4 is refused
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(a[2]));
+    EXPECT_TRUE(l.lane.fill().active);
+    EXPECT_EQ(l.net.requested, (std::vector<uint32_t>{4}));
+    l.deliver(a4x, 4);
+    EXPECT_FALSE(l.lane.fill().active);
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(a4x));
+    EXPECT_FALSE(l.has(a[3].m_txs[0]));
+    EXPECT_TRUE(l.has(a4x.m_txs[0]));
+}
 
 // Each fill asks the way main_ltc's EMB-LTC lane does: a gap asks the peer
 // that delivered the block (it has its parents), a reorg fill one peer at a
