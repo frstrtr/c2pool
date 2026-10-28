@@ -5727,6 +5727,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
+    // Merged (aux) templates fetched degraded (built before the tip's body
+    // cleaned the mempool: coinbase only) and fetched again clean, per chain.
+    if (m_mm_manager)
+        result["merged_template_gate"] = m_mm_manager->get_template_gate_json();
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

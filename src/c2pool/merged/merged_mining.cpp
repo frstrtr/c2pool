@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
+#include <core/coin/mweb_shape.hpp>
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -677,9 +678,12 @@ void MergedMiningManager::refresh_aux_work()
 
     for (auto& chain : m_chains) {
         try {
-            // Check if tip changed
+            // Check if tip changed. A degraded template (built before the
+            // tip's body cleaned the mempool: coinbase only) is fetched again
+            // on every poll until a clean one comes back.
             auto tip = chain.rpc->get_best_block_hash();
-            if (tip == chain.last_tip && !chain.current_work.block_hash.IsNull()) {
+            if (tip == chain.last_tip && !chain.current_work.block_hash.IsNull()
+                && !chain.template_degraded) {
                 continue;  // no change
             }
             chain.last_tip = tip;
@@ -732,6 +736,21 @@ void MergedMiningManager::refresh_aux_work()
                 chain.current_work.block_template = std::move(tmpl_work.block_template);
                 chain.current_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
                 chain.current_work.coinbase_value = tmpl_work.coinbase_value;
+            }
+            {
+                const bool was_degraded = chain.template_degraded;
+                const auto why = core::coin::template_degraded_code(chain.current_work.block_template);
+                chain.template_degraded = why.has_value();
+                if (chain.template_degraded) {
+                    ++chain.templates_degraded;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " degraded (" << *why
+                             << "): coinbase only, fetching again next poll";
+                } else if (was_degraded) {
+                    ++chain.templates_refetched_clean;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " fetched again, clean";
+                }
             }
 
             // Like p2pool: get authoritative target from the daemon via
@@ -1114,6 +1133,17 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
             }
         }
     }
+}
+
+nlohmann::json MergedMiningManager::get_template_gate_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& chain : m_chains)
+        j[chain.config.symbol] = {{"degraded", chain.templates_degraded},
+                                  {"refetched_clean", chain.templates_refetched_clean},
+                                  {"degraded_now", chain.template_degraded}};
+    return j;
 }
 
 std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const

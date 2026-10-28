@@ -320,9 +320,18 @@ public:
     using WorkChangedFn = std::function<void()>;
     void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
 
+    /// One poll of the aux chains (called every second by poll_loop on the
+    /// RPC thread; public so a test can drive one). A chain's template is
+    /// fetched when its tip changed, and again on every poll while the last
+    /// one came back degraded (core::coin::kTemplateDegradedKey).
+    void refresh_aux_work();
+
+    /// Per chain symbol: {"degraded": templates fetched degraded,
+    /// "refetched_clean": clean templates fetched after a degraded one}.
+    nlohmann::json get_template_gate_json() const;
+
 private:
     void poll_loop();
-    void refresh_aux_work();
 
 public:
     // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
@@ -374,6 +383,11 @@ private:
         std::string                          last_tip;
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
+        // The last template came back degraded (the mempool was not cleaned
+        // for the tip yet): the tip is not latched, the next poll fetches again.
+        bool                                 template_degraded{false};
+        uint64_t                             templates_degraded{0};
+        uint64_t                             templates_refetched_clean{0};
         // Frozen DOGE block data from rebuild_cached_blocks().
         // Contains the pre-built DOGE coinbase hex and template snapshot that
         // match the block hash committed in the LTC parent's mm_data.
