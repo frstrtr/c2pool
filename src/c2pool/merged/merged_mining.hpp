@@ -527,6 +527,12 @@ private:
     // Helper: record a discovered block (caller must hold m_mutex)
     void record_discovered_block(const ChainState& chain, bool accepted,
                                  const std::string& parent_hash = "");
+    // The block a share actually committed to: its hash, height and coinbase
+    // value from the frozen snapshot the block was built from (a stale job's
+    // is not the current work).
+    void record_discovered_block(const ChainState& chain, bool accepted,
+                                 const std::string& parent_hash, const uint256& block_hash,
+                                 int height, uint64_t coinbase_value);
 
     // recursive_mutex: rebuild_cached_blocks() acquires/releases m_mutex
     // in phases (snapshot → payout_fn → re-acquire to store).  poll_loop

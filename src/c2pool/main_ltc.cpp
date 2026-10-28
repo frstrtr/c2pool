@@ -272,6 +272,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/found_block_verify.hpp>
 // Phase 5: Embedded DOGE node for daemonless merged mining
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
@@ -338,6 +339,18 @@ static nlohmann::json doge_block_detail_json(const c2pool::merged::DiscoveredMer
     o["is_local"]      = db.is_local;
     o["accepted"]      = db.accepted;
     return o;
+}
+
+// The height our found-block record holds for `hash_hex` (the height it was
+// mined at, known even when peers never relayed its header back); nullopt
+// when there is no record or its height is unknown.
+static std::optional<uint32_t> found_block_height(const core::MiningInterface& mi,
+                                                  const std::string& hash_hex)
+{
+    for (const auto& b : mi.get_found_blocks())
+        if (b.hash == hash_hex && b.height > 0)
+            return static_cast<uint32_t>(b.height);
+    return std::nullopt;
 }
 
 // Global signal handling
@@ -2424,19 +2437,30 @@ int main(int argc, char* argv[]) {
                     /*embedded*/embedded_node.get(), /*rpc*/node_rpc.get());
                 web_server.set_coin_node(coin_iface.get());
 
-                // Wire block verification for embedded mode
+                // Wire block verification for embedded mode: the verdict
+                // (ltc::coin::found_block::parent_verdict) over the embedded
+                // header chain, at the height our found-block record holds.
                 auto* mi = web_server.get_mining_interface();
                 mi->set_block_verify_fn(
-                    [chain = embedded_chain.get()](const std::string& hash_hex) -> int {
+                    [chain = embedded_chain.get(), mi](const std::string& hash_hex) -> int {
                         uint256 h;
                         h.SetHex(hash_hex);
-                        auto entry = chain->get_header(h);
-                        if (!entry.has_value())
-                            return 0;  // not in our chain — still pending
-                        // Return actual confirmation count (tip_height - block_height + 1)
-                        int32_t tip_h = static_cast<int32_t>(chain->height());
-                        int32_t blk_h = static_cast<int32_t>(entry->height);
-                        return std::max(1, tip_h - blk_h + 1);
+                        ltc::coin::found_block::ChainView view;
+                        view.height_of = [chain](const uint256& hh) -> std::optional<uint32_t> {
+                            auto e = chain->get_header(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->height;
+                        };
+                        view.hash_at = [chain](uint32_t hh) -> std::optional<uint256> {
+                            auto e = chain->get_header_by_height(hh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->block_hash;
+                        };
+                        view.tip_height = [chain]() { return chain->height(); };
+                        view.has_tip = [chain]() { return chain->tip().has_value(); };
+                        return ltc::coin::found_block::parent_verdict(view, h, found_block_height(*mi, hash_hex));
                     });
 
                 // Header validation thread pool (1 thread) — keeps scrypt off io_context.
@@ -4092,9 +4116,10 @@ int main(int argc, char* argv[]) {
                 mi->record_found_block(
                     height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
                     miner_addr, share_h, net_diff, 0, pool_hr, block_subsidy);
-                // Schedule async verification at +10s, +30s, +120s
-                if (stale_info == 0)
-                    web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
+                // Verify every found block against the best chain, a stale
+                // or refused one too: it is orphaned once the chain is 6 deep
+                // from its height, never left pending.
+                web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
 
                 const char* stale_str = (stale_info == 253) ? " [ORPHAN — stale prev]"
                                       : (stale_info == 254) ? " [DOA — daemon rejected]"
@@ -7578,7 +7603,14 @@ int main(int argc, char* argv[]) {
                             if (it == merged_broadcasters.end()) return;
                             try {
                                 auto block_bytes = ParseHex(block_hex);
-                                it->second->submit_block_raw(block_bytes);
+                                const size_t peers = it->second->submit_block_raw(block_bytes);
+                                if (peers == 0)
+                                    LOG_WARNING << "[MM:" << it->second->symbol()
+                                                << "] found block relayed to NO peers ("
+                                                << block_bytes.size() << " bytes)";
+                                else
+                                    LOG_INFO << "[MM:" << it->second->symbol() << "] found block relayed to "
+                                             << peers << " peers (" << block_bytes.size() << " bytes)";
                             } catch (const std::exception& e) {
                                 LOG_WARNING << "[" << it->second->symbol()
                                             << "] Merged P2P relay failed: " << e.what();
@@ -7618,16 +7650,43 @@ int main(int argc, char* argv[]) {
                             auto* rpc_backend = mm_manager->get_chain_rpc(cid);
                             if (rpc_backend) {
                                 mi_ptr->add_chain_verify_fn(sym,
-                                    [rpc_backend](const std::string& /*hash_hex*/) -> int {
-                                        // For merged blocks, submitauxblock returning success
-                                        // means the daemon accepted it. The block IS in the chain.
-                                        // We verify by checking the daemon is still responsive.
-                                        try {
-                                            auto tip = rpc_backend->get_best_block_hash();
-                                            return tip.empty() ? 0 : 1; // daemon alive = confirmed
-                                        } catch (...) {
-                                            return 0; // daemon unreachable — can't verify
+                                    [rpc_backend, mi_ptr, dc = (cid == 98 ? doge_chain.get() : nullptr)](
+                                        const std::string& hash_hex) -> int {
+                                        ltc::coin::found_block::ChainView view;
+                                        view.height_of = [dc](const uint256& hh) -> std::optional<uint32_t> {
+                                            if (!dc)
+                                                return std::nullopt;
+                                            auto e = dc->get_header(hh);
+                                            if (!e)
+                                                return std::nullopt;
+                                            return e->height;
+                                        };
+                                        view.hash_at = [dc](uint32_t hh) -> std::optional<uint256> {
+                                            if (!dc)
+                                                return std::nullopt;
+                                            auto e = dc->get_header_by_height(hh);
+                                            if (!e)
+                                                return std::nullopt;
+                                            return e->block_hash;
+                                        };
+                                        view.tip_height = [dc]() { return dc ? dc->height() : 0u; };
+                                        view.has_tip = [dc]() { return dc && dc->tip().has_value(); };
+                                        if (!dc) {
+                                            // No embedded header chain for this aux chain
+                                            // (not DOGE): the backend being alive is all
+                                            // there is to go on, as before.
+                                            try {
+                                                return rpc_backend->get_best_block_hash().empty() ? 0 : 1;
+                                            } catch (...) {
+                                                return 0; // unreachable — can't verify
+                                            }
                                         }
+                                        // DOGE: our block against the DOGE best chain at
+                                        // the height it was mined at.
+                                        uint256 h;
+                                        h.SetHex(hash_hex);
+                                        return ltc::coin::found_block::aux_verdict(
+                                            view, h, found_block_height(*mi_ptr, hash_hex));
                                     });
                             }
                         }

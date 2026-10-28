@@ -166,6 +166,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ltc_template_time_test.cpp: the embedded LTC template's curtime and
     # mintime are above the parent's median time past (time-too-old). Same
     # folding rule.
+    #
+    # found_block_verify_test.cpp: the dashboard verdict on a found LTC block
+    # and a found DOGE block (ltc::coin::found_block, the verifiers main_ltc
+    # wires): a side-branch block is never confirmed, a block the chain never
+    # saw is orphaned once the chain is 6 deep from its height, a live DOGE
+    # tip is not a confirmation, a best-chain block confirms once 6 deep.
+    # Same folding rule.
+    #
+    # merged_found_record_test.cpp: a merged find on a stale job is recorded
+    # as the block the share committed to (its hash and height from the
+    # frozen snapshot), not the current work. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -189,6 +200,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
+        found_block_verify_test.cpp
         head_retention_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp
@@ -198,6 +210,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_found_record_test.cpp
         merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
