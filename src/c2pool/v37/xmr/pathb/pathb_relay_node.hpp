@@ -40,9 +40,10 @@
 //                not held (the node's own header work at the reply fetches or
 //                keeps; best_cum_work is not read), again while it is not held
 //                and no reply ended it; the pending set re-offered (FB_RECEIPTS,
-//                at most 1 + R_MAX bodies a frame); a node at position 0 whose
-//                catch-up from position 0 got a reply with no header offers
-//                the peer's HELLO tip to the joiner
+//                at most 1 + R_MAX bodies a frame); a store (not joined, not
+//                load-failed) whose catch-up got a reply with no header to a
+//                request from position 0 offers the peer's HELLO tip to the
+//                joiner
 //   buckets      a DEFER naming a missing bucket: FC_GETBUCKETS at the named
 //                carrier, one peer at a time (one assembly per (peer, at)); the
 //                parked frames run again when a bin arrives, when a request
@@ -2937,8 +2938,8 @@ private:
                                 catchup_ask_locked(p, it->second);
                                 break;
                             }
-                            // the reply to a request from position 0 carried no header: the peer serves nothing after
-                            // position 0 (a store that never caught up: the joiner path)
+                            // the reply to a request from position 0 carried no header: the peer serves none of this
+                            // node's chain (the joiner path: its tip a join candidate)
                             if (o.ids.empty() && it->second.from_pos0) {
                                 if (node_->offer_empty_store_tip(p)) {
                                     st_.empty_store_offers++;

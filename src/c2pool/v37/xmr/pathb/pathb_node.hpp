@@ -62,9 +62,9 @@
 //                     untouched until an adoption replaces it; a joined node
 //                     serves its claimed prefix headers; a full node that
 //                     pruned also offers a HELLO tip it does not hold
-//   relay glue        offer_empty_store_tip (an empty store whose catch-up
-//                     from position 0 got no header: the peer's HELLO tip a
-//                     join candidate), take_parked (a parked frame run again),
+//   relay glue        offer_empty_store_tip (a store whose catch-up from
+//                     position 0 got no header: the peer's HELLO tip a join
+//                     candidate), take_parked (a parked frame run again),
 //                     take_repended (the receipts a switch re-pended, to
 //                     relay), set_join_step (the join worker's step callback),
 //                     may_ask / take_rewalk_frames (the re-walk of parked
@@ -818,13 +818,14 @@ public:
     bool holds_tip(const Hash32& tip) const { return tip == cfg_.identity.pool_id || tree_->find(tip) != nullptr; }
 
     // ---- the relay node's glue (pathb_relay_node.hpp) ----
-    // A store that never caught up (at position 0, or not caught up by its record K_NCU): the caller's headers-first
-    // catch-up to `peer` got a reply with no header from position 0 (the peer serves nothing after it), or a catch-up
-    // step stayed deferred on a P_r past its context's time. The peer's HELLO tip becomes a join candidate with that
-    // peer as its server (no load failure, no adopted state, not poisoned) when the tip is not position 0 and not held
-    // here; rule (4) of the attempt decides whether it replaces the node's own chain. True: the pair was queued.
+    // The caller's headers-first catch-up to `peer` got a reply with no header to a request from position 0 (the peer
+    // serves none of this node's chain), or (a store not caught up, the caller's test) a catch-up step stayed deferred
+    // on a P_r past its context's time. The peer's HELLO tip becomes a join candidate with that peer as its server (no
+    // load failure, no adopted state, not poisoned; K_NCU not read) when the tip is not position 0 and not held here;
+    // one pair per (tip, server) (P-52); rule (4) of the attempt decides whether it replaces the node's own chain.
+    // True: the pair was queued.
     bool offer_empty_store_tip(std::uint64_t peer) {
-        if (poisoned_ || load_failed_ || joined_ != nullptr || (tree_->best().pos != 0 && !not_caught_up_)) return false;
+        if (poisoned_ || load_failed_ || joined_ != nullptr) return false;
         const auto it = peers_.find(peer);
         if (it == peers_.end()) return false;
         const HelloTail& t = it->second;
