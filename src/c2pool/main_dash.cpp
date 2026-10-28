@@ -6541,13 +6541,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // validMembers — and serves only when every ban decision is
             // PROVABLE. Member set gone from cache => nullopt => refuse.
             //
-            // PENALTY ORACLE: not wired yet (PR-B makes the DML fold engine
-            // the oracle). Without one, any punishment of a listed, valid MN
-            // refuses (stage=penalty-unknown) exactly as before; only the two
-            // free exact no-ops serve — the punished member is absent from
-            // the list, or already banned. Null commitments are exempt
-            // (IsNull() guard, specialtxman.cpp:432) — all-null plans are
-            // byte-unchanged.
+            // PENALTY ORACLE (PR-B): the bridge DML fold engine, kept at the
+            // live tip by pose_oracle_feeder.hpp (constructed further down
+            // with the MN-CKPT bridge; reached here by reference, null until
+            // then and on any arm without it). It answers certainty bounds
+            // {lo, hi} on nPoSePenalty in the POST-state of its cursor block —
+            // i.e. as of the end of H-1, before H's decay, which the pass
+            // applies itself — and only while seeded and unpoisoned. The
+            // CURSOR fn names that block, so the pass refuses with
+            // stage=oracle-not-at-tip unless it is exactly the tip the
+            // template builds on (an oracle read can never interleave a fold:
+            // both run on this io thread). No oracle / not at tip / an MN it
+            // does not hold => the punishment refuses exactly as before; only
+            // a ban decision provable from the bounds serves. Null
+            // commitments are exempt (IsNull() guard, specialtxman.cpp:432).
             node_coin_state.set_qc_pose_fold_inputs(
                 [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)
                     -> std::optional<std::vector<uint256>> {
@@ -6559,12 +6566,30 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     for (const auto& m : *members) pro.push_back(m.proTxHash);
                     return pro;
                 },
-                /*oracle_fn=*/{});
+                /*oracle_fn=*/
+                [&pose_oracle](const uint256& pro_tx)
+                    -> std::optional<dash::coin::PoSePenaltyView> {
+                    if (!pose_oracle) return std::nullopt;
+                    const auto cur = pose_oracle->cursor();
+                    if (!cur) return std::nullopt;
+                    const auto b =
+                        pose_oracle->oracle_bounds(cur->first, cur->second, pro_tx);
+                    if (!b) return std::nullopt;
+                    return dash::coin::PoSePenaltyView{b->lo, b->hi, b->banned};
+                },
+                /*oracle_cursor=*/
+                [&pose_oracle]()
+                    -> std::optional<std::pair<uint32_t, uint256>> {
+                    if (!pose_oracle) return std::nullopt;
+                    return pose_oracle->cursor();
+                });
             LOG_INFO << "[QC-POSE] PoSe pass installed: real commitments serve"
-                        " when no listed member is punished, or every punished"
-                        " member is absent/already banned; penalty oracle NOT"
-                        " wired -> any other punishment refuses the height"
-                        " (cause=*qc-real-pose-unfolded stage=penalty-unknown)";
+                        " when every ban decision is PROVABLE — punished member"
+                        " absent/already banned, or the penalty oracle (bridge"
+                        " DML fold engine at the template's tip) bounds it"
+                        " either side of the threshold; otherwise the height"
+                        " refuses (cause=*qc-real-pose-unfolded,"
+                        " stage=oracle-not-at-tip|penalty-unknown|penalty-inexact)";
 
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
