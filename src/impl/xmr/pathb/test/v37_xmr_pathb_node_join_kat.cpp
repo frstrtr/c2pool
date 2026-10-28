@@ -63,6 +63,14 @@
 //              with its P-01; with P-01 4,000 a load failure, never a BAN of
 //              an honest heavier branch;
 //   reaskrelay reask after a restart through the relay node;
+//   joinedpeer a full node behind a joined node by less than the joined node's
+//              root work: its catch-up starts toward the unheld HELLO tip and
+//              reaches it (the HELLO best_cum_work is not read);
+//   joinedstall only a joined node holds the heavier chain, forked more than
+//              J_0 below its tip: the full node still catches up;
+//   joinedfresh a fresh store whose only servers are joined nodes: its
+//              catch-up from position 0 gets no header, the tip is offered to
+//              the joiner, the attempt is adopted: caught up, templates;
 //   joinrx     a RandomX failure in a join attempt: NodeInternal, an alarm,
 //              no token, the pair kept; the next attempt joins;
 //   joinnohash the same through the binary's verify (no hash computed);
@@ -98,6 +106,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -2147,6 +2156,315 @@ void reaskrelay() {
 }
 
 // ---------------------------------------------------------------------------
+// The catch-up trigger toward a joined peer: a joined node counts cum_work from its joined root, so its HELLO
+// best_cum_work lies below the chain's work from position 0; a full node's trigger reads whether that HELLO tip is held.
+// F: a full node over n's chain (launched) behind the relay node in manual mode, its one peer (peer 1) the harness node
+// `server` over ServerLinks.
+struct RelayedFull {
+    ServerLinks links;
+    std::unique_ptr<pb::PathbRelayNode> relay;
+    std::size_t node = 0;
+    bool started = false;
+};
+std::unique_ptr<RelayedFull> relayed_full(Harness& h, const KatNode& n, std::size_t server) {
+    auto r = std::make_unique<RelayedFull>();
+    r->links.h = &h;
+    r->links.server = server;
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    r->relay = std::make_unique<pb::PathbRelayNode>(o, r->links, clock);
+    r->links.relay = r->relay.get();
+    r->node = h.nodes.size();
+    r->links.self = r->node;
+    pb::LoadedState st{kat_head(*n.net), n.tree, n.store, n.ar, n.bodies, 0, 0, {}};
+    for (const auto& [id, ref] : n.net->book.refs) st.refs[id] = ref;
+    st.refs[n.net->author_id] = n.net->author;
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(n.T, true, kJ), r->relay->bind_io(h.io(r->node)),
+                                                      std::move(st), nullptr));
+    r->relay->attach(*h.nodes.back());
+    ServerLinks* lp = &r->links;
+    r->relay->set_drive([lp] { return lp->step(); });
+    std::string why;
+    r->started = r->relay->start(why);
+    return r;
+}
+
+// The relay's ticks, one second each, until F holds `tip` or `secs` pass; the seconds taken.
+int tick_to(Harness& h, RelayedFull& f, const pb::Hash32& tip, int secs) {
+    int k = 0;
+    for (; k < secs && h[f.node].tree().best().id != tip; ++k) {
+        h.now += 1;
+        f.relay->tick();
+        f.links.run();
+    }
+    return k;
+}
+
+// A chain grown to `L`, a node J joined at L from a server over it, then J following `k` more carriers of that chain.
+struct JoinedAhead {
+    Joined jd;
+    pb::Hash32 tip{};
+};
+JoinedAhead joined_ahead(Harness& h, const JoinNet& net, KatNode& a, std::uint64_t L, std::uint64_t k) {
+    JoinedAhead o;
+    o.jd = join_at(h, net, a, kJ);
+    if (!o.jd.ok) return o;
+    const std::size_t j = o.jd.jn.j;
+    const std::vector<pb::Hash32> next = grow(a, k);
+    h.mon_tip = h_pos(L + k) + 1;
+    for (const pb::Hash32& id : next)
+        (void)h[j].on_carrier(o.jd.s, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
+    h.q.clear();
+    o.tip = a.store.best_tip();
+    return o;
+}
+
+// joinedpeer: a full node F behind a joined node J by less than J's root work (F at L = 4,704, J at L + 6): J's HELLO
+// best_cum_work (counted from its root) is below F's own, and J's tip is not held at F: F starts headers first toward J
+// and reaches its tip; no token.
+void joinedpeer() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, k = 6;
+    KatNode a(net, kJ);
+    grow(a, L);
+    const KatNode fc(a);  // F's chain: A's to L
+    Harness h(net);
+    const JoinedAhead ja = joined_ahead(h, net, a, L, k);
+    check(ja.jd.ok, "joinedpeer: J joined at L");
+    if (!ja.jd.ok) return;
+    const std::size_t j = ja.jd.jn.j;
+    const auto claim = h[j].tree().best().cum_work;  // J's HELLO best_cum_work
+    const auto own = fc.tree.best().cum_work;         // F's at L
+    const auto chain = a.tree.best().cum_work;        // the chain's work at L + 6 from position 0
+    const bool pre = h[j].tree().best().id == ja.tip && h[j].joined() != nullptr
+                     && ::c2pool::xmr::native::u128_greater(own, claim) && ::c2pool::xmr::native::u128_greater(chain, own);
+    std::unique_ptr<RelayedFull> f = relayed_full(h, fc, j);
+    f->links.connect();
+    f->links.run();
+    const bool hello = f->relay->hello_ok(1);
+    const int secs = tick_to(h, *f, ja.tip, 60);
+    const std::uint64_t asks = f->relay->stats().catchup_requests.load();
+    std::printf("  joinedpeer: J at %llu (cum_work %llu from its root), F at %llu after %d s (cum_work %llu); catch-up "
+                "asks %llu\n",
+                (unsigned long long)h[j].tree().best().pos, (unsigned long long)claim.lo,
+                (unsigned long long)h[f->node].tree().best().pos, secs, (unsigned long long)own.lo,
+                (unsigned long long)asks);
+    check(pre, "joinedpeer: setup (J at L + 6; J's best_cum_work below F's own at L; the chain's work above it)");
+    check(f->started && hello && h[f->node].tree().best().id == ja.tip && asks >= 1
+                  && f->relay->stats().bans.load() == 0 && f->relay->stats().strikes.load() == 0,
+          "joinedpeer: F starts headers first toward the joined node's unheld tip and reaches it (asks " +
+                  std::to_string(asks) + ")");
+    f->relay->stop();
+    std::printf("  joinedpeer: %.1f s\n", secs_since(t0));
+}
+
+// joinedstall: only a joined node holds the heavier chain. F holds A's chain to f = L - 1,180 and three carriers of its
+// own (lighter); J, joined at L = 4,704, is at L + 6: its tip 1,186 positions past the fork (more than J_0 = 1,152),
+// its HELLO best_cum_work below F's own. F's one peer is J and no carrier is relayed to F: the catch-up toward J's unheld
+// tip steps down F's chain to the fork, fetches J's chain page by page, switches and reaches J's tip; no token.
+void joinedstall() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, k = 6, f_pos = L - 1180;
+    KatNode a(net, kJ);
+    grow(a, f_pos);
+    KatNode fc(a);  // F's chain: A's to f, then its own branch
+    grow(a, L - f_pos);
+    ChainShape sb;
+    sb.nonce0 = 7480000;
+    const std::vector<pb::Hash32> own_branch = grow(fc, 3, sb);
+    Harness h(net);
+    const JoinedAhead ja = joined_ahead(h, net, a, L, k);
+    check(ja.jd.ok, "joinedstall: J joined at L");
+    if (!ja.jd.ok) return;
+    const std::size_t j = ja.jd.jn.j;
+    const auto claim = h[j].tree().best().cum_work;
+    const auto own = fc.tree.best().cum_work;
+    const auto chain = a.tree.best().cum_work;
+    const bool pre = own_branch.size() == 3 && h[j].tree().best().id == ja.tip && h[j].joined() != nullptr
+                     && h[j].tree().best().pos - f_pos > kJ && !h[j].holds_tip(own_branch.back())
+                     && ::c2pool::xmr::native::u128_greater(own, claim) && ::c2pool::xmr::native::u128_greater(chain, own);
+    std::unique_ptr<RelayedFull> f = relayed_full(h, fc, j);
+    f->links.connect();
+    f->links.run();
+    const bool hello = f->relay->hello_ok(1);
+    const int secs = tick_to(h, *f, ja.tip, 600);
+    const auto& st = f->relay->stats();
+    std::printf("  joinedstall: fork at %llu; J at %llu (cum_work %llu from its root); F from %llu (cum_work %llu) at "
+                "%llu after %d s; catch-up asks %llu, steps %llu\n",
+                (unsigned long long)f_pos, (unsigned long long)h[j].tree().best().pos, (unsigned long long)claim.lo,
+                (unsigned long long)(f_pos + 3), (unsigned long long)own.lo,
+                (unsigned long long)h[f->node].tree().best().pos, secs, (unsigned long long)st.catchup_requests.load(),
+                (unsigned long long)st.catchup_steps.load());
+    check(pre, "joinedstall: setup (the fork more than J_0 below J's tip; J's best_cum_work below F's own; the chain's "
+               "work above it)");
+    check(f->started && hello && h[f->node].tree().best().id == ja.tip && st.catchup_steps.load() >= 1
+                  && st.bans.load() == 0 && st.strikes.load() == 0,
+          "joinedstall: F, whose only peer holding the heavier chain is a joined node, catches up to its tip (steps " +
+                  std::to_string(st.catchup_steps.load()) + ")");
+    f->relay->stop();
+    std::printf("  joinedstall: %.1f s\n", secs_since(t0));
+}
+
+// ---------------------------------------------------------------------------
+// Relay links to several harness nodes: peer i + 1 is the harness node servers[i]; each request is answered in this
+// thread by that node's serve_* and its HELLO answers the relay's; the replies wait for step(), in arrival order.
+struct MultiServerLinks final : pb::RelayLinks {
+    Harness* h = nullptr;
+    std::vector<std::size_t> servers;  // the harness node behind peer i + 1
+    std::size_t self = 0;              // the relayed node (its peer id at every server)
+    pb::PathbRelayNode* relay = nullptr;
+    FrameFn frame;
+    FrameFn control;
+    EventFn event;
+    std::set<std::uint64_t> up;
+    std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>> inbox;
+    void bind(FrameFn f, FrameFn c, EventFn e) override {
+        frame = std::move(f);
+        control = std::move(c);
+        event = std::move(e);
+    }
+    void configure(const pb::PathbRelayOptions&) override {}
+    bool listen(const std::string&, std::uint16_t) override { return true; }
+    std::uint16_t listen_port() const override { return 0; }
+    std::uint64_t dial(const std::string&, std::uint16_t) override { return 0; }
+    bool send_to(std::uint64_t p, const std::vector<std::uint8_t>& f) override {
+        if (up.count(p) == 0) return false;
+        if (f.empty()) return true;
+        const std::size_t server = servers[p - 1];
+        pb::PathbNode& sv = *h->nodes[server];
+        std::vector<std::vector<std::uint8_t>> out;
+        if (f[0] == pb::kOpFbHello) out.push_back(*pb::encode_pathb_hello(sv.our_hello(5000 + server, 0)));
+        if (f[0] == pb::kOpFcGetHeaders) out = sv.serve_getheaders(self, f, h->now).frames;
+        if (f[0] == pb::kOpFcGetCarrier) out = sv.serve_getcarrier(self, f, h->now).frames;
+        if (f[0] == pb::kOpFcGetBuckets) out = sv.serve_getbuckets(self, f, h->now).frames;
+        for (std::vector<std::uint8_t>& x : out) inbox.emplace_back(p, std::move(x));
+        return true;
+    }
+    void disconnect(std::uint64_t p) override {
+        if (up.erase(p) == 0) return;
+        event(p, false);
+    }
+    void ban_key(std::uint64_t, std::uint32_t) override {}
+    bool is_banned_key(std::uint64_t) override { return false; }
+    std::uint64_t addr_key(std::uint64_t) const override { return 0; }
+    bool is_inbound(std::uint64_t) const override { return false; }
+    bool has_peer(std::uint64_t p) const override { return up.count(p) != 0; }
+    std::vector<std::uint64_t> peer_ids() const override { return {up.begin(), up.end()}; }
+    std::size_t conns_from(std::uint64_t) const override { return 0; }
+    std::string remote_ip(std::uint64_t) const override { return {}; }
+    std::size_t n_peers() const override { return up.size(); }
+    void stop() override {}
+    void connect_all() {
+        for (std::size_t i = 0; i < servers.size(); ++i) {
+            up.insert(i + 1);
+            event(i + 1, true);
+        }
+    }
+    bool step() {
+        if (inbox.empty()) return false;
+        const auto [p, f] = std::move(inbox.front());
+        inbox.pop_front();
+        if (up.count(p) != 0) frame(p, f);
+        relay->pump();
+        return true;
+    }
+    void run() {
+        relay->pump();
+        while (step()) {
+        }
+    }
+};
+
+// joinedfresh: a fresh store (started empty, not launched: its record K_NCU) whose only servers are two nodes joined at
+// L = 4,704 and at L + 120: the catch-up from position 0 gets no header (a joined server holds nothing at position 0),
+// the HELLO tip is offered to the joiner, the attempt completes and is adopted: the store at the servers' tip, caught
+// up (no record), building templates.
+void joinedfresh() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, k = 120;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined j1 = join_at(h, net, a, kJ);
+    Joining j2 = joining_node(h, net, kJ);
+    h.hello(j2.j, j1.s);
+    const pb::JoinStep st2 = h[j2.j].run_join();
+    const bool joined = j1.ok && st2.switched && h[j2.j].joined() != nullptr;
+    check(joined, "joinedfresh: two nodes joined at L");
+    if (!joined) return;
+    const std::vector<pb::Hash32> next = grow(a, k);
+    h.mon_tip = h_pos(L + k) + 1;
+    for (const std::size_t j : {j1.jn.j, j2.j})
+        for (const pb::Hash32& id : next)
+            (void)h[j].on_carrier(j1.s, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
+    h.q.clear();
+    const pb::Hash32 tip = a.store.best_tip();
+    const bool ahead = h[j1.jn.j].tree().best().id == tip && h[j2.j].tree().best().id == tip
+                       && h[j1.jn.j].tree().genesis().pos > 0 && h[j2.j].tree().genesis().pos > 0;
+    MultiServerLinks links;
+    links.h = &h;
+    links.servers = {j1.jn.j, j2.j};
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode relay(o, links, clock);
+    links.relay = &relay;
+    const std::size_t r = h.nodes.size();
+    links.self = r;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    MemoryKv& kv = *h.kvs.back();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), relay.bind_io(h.io(r)), &kv));
+    relay.attach(*h.nodes[r]);
+    relay.set_drive([&links] { return links.step(); });
+    std::string why;
+    const bool started = relay.start(why);
+    const std::string ncu = pb::store_keys::ncu(0);
+    const bool fresh = h[r].tree().best().pos == 0 && !h[r].caught_up() && kv.data.count(ncu) != 0;
+    const pb::TemplateStatus s0 = h[r].make_template(h.now).status;
+    links.connect_all();
+    links.run();
+    const bool hellos = relay.hello_ok(1) && relay.hello_ok(2);
+    const std::uint64_t offers = relay.stats().empty_store_offers.load();
+    int k_steps = 0;
+    std::string last;
+    for (; k_steps < 20 && h[r].tree().best().id != tip; ++k_steps) {
+        if (const std::optional<pb::JoinStep> st = relay.join_step(); st && st->report) last = rep_desc(*st->report);
+        links.run();
+        h.now += 1;
+        relay.tick();
+        links.run();
+    }
+    const pb::TemplateStatus s1 = h[r].make_template(h.now).status;
+    std::printf("  joinedfresh: servers at %llu (joined); the fresh store at %llu after %d steps; empty-store offers "
+                "%llu; join attempts %llu; caught up %d; templates %d -> %d\n",
+                (unsigned long long)h[j1.jn.j].tree().best().pos, (unsigned long long)h[r].tree().best().pos, k_steps,
+                (unsigned long long)offers, (unsigned long long)relay.stats().join_attempts.load(),
+                h[r].caught_up() ? 1 : 0, static_cast<int>(s0), static_cast<int>(s1));
+    std::printf("  joinedfresh: the last attempt: %s\n", last.c_str());
+    check(ahead && started && fresh && s0 == pb::TemplateStatus::NoPathbPeer && hellos,
+          "joinedfresh: setup (two joined servers at L + 120; a fresh store at position 0, its record K_NCU)" +
+                  (why.empty() ? "" : "; " + why));
+    check(offers >= 1 && h[r].tree().best().id == tip && h[r].caught_up() && kv.data.count(ncu) == 0
+                  && h[r].joined() != nullptr && relay.stats().bans.load() == 0 && relay.stats().strikes.load() == 0
+                  && s1 != pb::TemplateStatus::NoPathbPeer && s1 != pb::TemplateStatus::CatchingUp
+                  && s1 != pb::TemplateStatus::RestsOnClaims,
+          "joinedfresh: the fresh store whose only servers are joined nodes joins at their tip and is caught up "
+          "(offers " + std::to_string(offers) + ")");
+    relay.stop();
+    std::printf("  joinedfresh: %.1f s\n", secs_since(t0));
+}
+
+// ---------------------------------------------------------------------------
 // joinrx: a RandomX failure inside a join attempt (a header's PoW of the server's chain): the attempt ends
 // NodeInternal with a local alarm, no token; the pair stays queued, the node not attempting; the next attempt joins.
 void joinrx() {
@@ -2559,6 +2877,9 @@ int main(int argc, char** argv) {
                                 {"x8claim", x8claim, 31},
                                 {"prunedj", prunedj, 43},
                                 {"reaskrelay", reaskrelay, 28},
+                                {"joinedpeer", joinedpeer, 45},
+                                {"joinedstall", joinedstall, 60},
+                                {"joinedfresh", joinedfresh, 60},
                                 {"joinrx", joinrx, 27},
                                 {"joinnohash", joinnohash, 45},
                                 {"keycache", keycache, 17},
