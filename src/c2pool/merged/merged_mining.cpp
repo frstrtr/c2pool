@@ -1084,7 +1084,11 @@ void MergedMiningManager::try_submit_merged_blocks(
                 // the trustless merged-payout invariant. So the canonical aux path
                 // is deliberately NOT wired as a fallback.
                 bool ok = chain.rpc->submit_block(block_hex);
-                record_discovered_block(chain, ok, parent_hash.GetHex());
+                // The block found is the snapshot's (a share on a stale job
+                // commits to an older block than the current work).
+                record_discovered_block(chain, ok, parent_hash.GetHex(), committed_block_hash,
+                                        tmpl.value("height", chain.current_work.height),
+                                        tmpl.value("coinbasevalue", chain.current_work.coinbase_value));
                 if (m_block_relay_fn) {
                     try { m_block_relay_fn(chain.config.chain_id, block_hex); }
                     catch (...) {}
@@ -1671,18 +1675,26 @@ std::string MergedMiningManager::build_multiaddress_block(
 void MergedMiningManager::record_discovered_block(
     const ChainState& chain, bool accepted, const std::string& parent_hash)
 {
+    record_discovered_block(chain, accepted, parent_hash, chain.current_work.block_hash,
+                            chain.current_work.height, chain.current_work.coinbase_value);
+}
+
+void MergedMiningManager::record_discovered_block(
+    const ChainState& chain, bool accepted, const std::string& parent_hash,
+    const uint256& block_hash, int height, uint64_t coinbase_value)
+{
     // Caller must hold m_mutex
     LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block: building record...";
     DiscoveredMergedBlock blk;
     blk.chain_id    = chain.config.chain_id;
     blk.symbol      = chain.config.symbol;
-    blk.height      = chain.current_work.height;
-    blk.block_hash  = chain.current_work.block_hash.GetHex();
+    blk.height      = height;
+    blk.block_hash  = block_hash.GetHex();
     blk.parent_hash = parent_hash;
     blk.timestamp      = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
     blk.accepted       = accepted;
-    blk.coinbase_value = chain.current_work.coinbase_value;
+    blk.coinbase_value = coinbase_value;
     blk.is_local       = true;  // our own submission
 
     m_discovered_blocks.push_back(std::move(blk));
@@ -1694,10 +1706,8 @@ void MergedMiningManager::record_discovered_block(
     if (m_on_merged_block_found) {
         try {
             LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
-            m_on_merged_block_found(chain.config.symbol,
-                chain.current_work.height,
-                chain.current_work.block_hash.GetHex(), accepted,
-                chain.current_work.coinbase_value);
+            m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), accepted,
+                                    coinbase_value);
             LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << chain.config.symbol

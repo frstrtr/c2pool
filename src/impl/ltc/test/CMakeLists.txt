@@ -143,6 +143,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # saw is orphaned once the chain is 6 deep from its height, a live DOGE
     # tip is not a confirmation, a best-chain block confirms once 6 deep.
     # Same folding rule.
+    #
+    # merged_found_record_test.cpp: a merged find on a stale job is recorded
+    # as the block the share committed to (its hash and height from the
+    # frozen snapshot), not the current work. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -172,6 +176,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_found_record_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp

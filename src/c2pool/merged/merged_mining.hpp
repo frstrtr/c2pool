@@ -320,9 +320,12 @@ public:
     using WorkChangedFn = std::function<void()>;
     void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
 
+    /// One poll of the aux chains (called every second by poll_loop on the
+    /// RPC thread; public so a test can drive one).
+    void refresh_aux_work();
+
 private:
     void poll_loop();
-    void refresh_aux_work();
 
 public:
     // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
@@ -438,6 +441,12 @@ private:
     // Helper: record a discovered block (caller must hold m_mutex)
     void record_discovered_block(const ChainState& chain, bool accepted,
                                  const std::string& parent_hash = "");
+    // The block a share actually committed to: its hash, height and coinbase
+    // value from the frozen snapshot the block was built from (a stale job's
+    // is not the current work).
+    void record_discovered_block(const ChainState& chain, bool accepted,
+                                 const std::string& parent_hash, const uint256& block_hash,
+                                 int height, uint64_t coinbase_value);
 
     // recursive_mutex: rebuild_cached_blocks() acquires/releases m_mutex
     // in phases (snapshot → payout_fn → re-acquire to store).  poll_loop
