@@ -6799,7 +6799,13 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     double total_hr = 0, dead_hr = 0, diff = 0;
     uint64_t accepted = 0, rejected = 0, stale = 0;
     bool found = false;
+    // Rolling submit outcomes (core::stratum::SubmitOutcomeWindow), summed over
+    // the sessions that carry one.
+    core::stratum::SubmitOutcomeWindow::Counts win;
+    uint64_t unknown_job = 0;
+    bool has_window = false;
     {
+        const auto now = std::chrono::steady_clock::now();
         auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Match base address (strip worker suffix)
@@ -6814,6 +6820,14 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
                 rejected += w.rejected;
                 stale += w.stale;
                 found = true;
+                if (w.submit_window) {
+                    const auto c = w.submit_window->window(now);
+                    win.accepted    += c.accepted;
+                    win.stale       += c.stale;
+                    win.unknown_job += c.unknown_job;
+                    unknown_job     += w.submit_window->unknown_job_total();
+                    has_window = true;
+                }
             }
         }
     }
@@ -6897,6 +6911,23 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     result["orphan_shares"] = stale;          // stale-template shares are orphans
     result["doa_shares"] = 0;                 // no per-worker DOA share counter (see dead_hashrate)
     result["rejected_shares"] = rejected;     // invalid/low-diff submissions, never counted as shares
+
+    // doa_rate and the share counts above are cumulative since connect and
+    // count every submit whose job was not active, including the burst of
+    // results rigs flush after a node restart for jobs the previous process
+    // issued. The fields below cover only the last window_seconds and keep
+    // those unknown-job submits out of the rate; the miner page headline
+    // reads doa_rate_window. Only emitted when the sessions carry a window
+    // (otherwise absent, and the page falls back to doa_rate).
+    if (has_window) {
+        result["window_seconds"] = core::stratum::SubmitOutcomeWindow::kWindowSeconds;
+        result["window_accepted_shares"] = win.accepted;
+        result["window_dead_shares"] = win.stale;             // job issued on this connection, since expired
+        result["window_unknown_job_shares"] = win.unknown_job; // job id never issued on this connection
+        result["doa_rate_window"] = (win.accepted + win.stale > 0)
+            ? static_cast<double>(win.stale) / (win.accepted + win.stale) : 0.0;
+        result["unknown_job_shares"] = unknown_job;           // since connect; included in dead_shares
+    }
 
     return result;
 }
