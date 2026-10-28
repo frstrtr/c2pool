@@ -341,6 +341,11 @@ public:
     /// share committing to it can still be turned into a block).
     bool has_frozen_snapshot(uint32_t chain_id, const uint256& block_hash) const;
 
+    /// Run one poll of the aux chains now, on the RPC thread, instead of
+    /// waiting for the next 1 s tick (e.g. the DOGE tip just moved). Skipped
+    /// when a poll is already running.
+    void request_refresh();
+
 private:
     void poll_loop();
 

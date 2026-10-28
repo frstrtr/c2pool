@@ -142,6 +142,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     # coinbase-only template marked degraded (a sibling's body does not
     # count), and the merged-mining poll fetches again until it is clean.
     # Same folding rule.
+    #
+    # doge_utxo_lane_test.cpp: the embedded DOGE UTXO set follows the best
+    # chain in height order and through reorgs (#2070): doge::coin::UtxoLane,
+    # the object main_ltc.cpp's DOGE full-block and tip handlers call, over a
+    # REAL UTXOViewCache/UTXOViewDB -- a taller heavier branch is a reorg,
+    # out-of-order bodies connect in order, every block of a new branch is
+    # connected, a legacy undo record rebuilds, and a child of a tx confirmed
+    # only on the old branch never reaches the template without its parent.
+    # Same folding rule.
+    #
+    # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
+    # runs one merged-work poll at once (the DOGE tip handler's poke), without
+    # the poll timer. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -160,6 +173,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_version_tally_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
+        doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
@@ -171,6 +185,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
