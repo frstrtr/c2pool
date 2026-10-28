@@ -9228,6 +9228,91 @@ void pwalkjunk() {
                   std::to_string(worst) + " per window, " + std::to_string(max_id) + " per id)");
 }
 
+// pwalkskipfull: J gets 16 frames from S, each a carrier on its own unknown parent, parked as ParentUnknown DEFERs
+// (through the node's park, T0); 5 s later a header page asks the parent x0 of one of them (its body in flight). Store
+// cap 32 (not full): headers first is live, no parent ask within P-53 of the header page's ask. Store cap 16 (full): not
+// live; the other parents are asked again at T0 + P-53, x0 not within P-53 of the header page's ask, then once (in
+// the next P-53).
+struct SkipFullRun {
+    bool hello = false;
+    std::size_t parked = 0;
+    bool live = false;
+    std::uint64_t x0_in = 0, x0_after = 0, others = 0, first_x0 = 0;
+};
+SkipFullRun pwalkskipfull_run(std::uint64_t cap) {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    pb::PathbNodeConfig cf = h.config(table0(net), false);
+    cf.waiting_cap = cap;
+    const std::size_t j = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cf, h.io(j)));
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 3; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 54000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    SkipFullRun out;
+    out.hello = h.hello(j, s).verdict == pb::HelloVerdict::Accept;
+    (void)h[j].tick(h.now);
+    std::vector<pb::Hash32> parents;
+    for (std::uint32_t k = 0; k < 16; ++k) {
+        const std::optional<pb::PathbJob> jb = h.job(s, k % 5, 54100 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 54100 + k;
+        c.own.side.tip = seq32(static_cast<std::uint8_t>(0x40 + k));
+        c.own.side.tip[1] = 0x5f;  // its own unknown parent
+        parents.push_back(c.own.side.tip);
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      c.own.side.tip);
+    }
+    out.parked = h[j].deferred().size();
+    h.q.clear();
+    const std::uint64_t t0 = h.now, p53 = pb::kAbandonTimeoutDefault;
+    const pb::Hash32 x0 = parents.empty() ? pb::Hash32{} : parents.front();
+    for (std::uint64_t t = 1; t < 5 + 2 * p53; ++t) {
+        h.now = t0 + t;
+        if (t == 5) pb::PathbNodeTestAccess::body_asked(h[j], x0, h.now);  // a header page's ask of x0
+        (void)h[j].tick(h.now);
+        if (t == 6) out.live = pb::PathbNodeTestAccess::hf_live(h[j]);
+        h[j].reask_parents();
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (!pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok()) continue;
+            for (const pb::Hash32& id : q.ids) {
+                if (id != x0) {
+                    out.others += t >= 5 && t < 5 + p53 ? 1 : 0;
+                    continue;
+                }
+                if (out.first_x0 == 0) out.first_x0 = t;
+                if (t < 5 + p53) ++out.x0_in;
+                else ++out.x0_after;
+            }
+        }
+        h.q.clear();
+    }
+    return out;
+}
+void pwalkskipfull() {
+    const SkipFullRun a = pwalkskipfull_run(32), b = pwalkskipfull_run(16);
+    for (const auto& [tag, r] : {std::make_pair("cap 32", a), std::make_pair("cap 16", b)})
+        std::printf("  pwalkskipfull %s: HELLO %d; parked %zu; live after the header page's ask %d; asks of x0 within P-53 of "
+                    "it %llu, after %llu (first at %llu s); asks of the other parents within that P-53 %llu\n",
+                    tag, r.hello ? 1 : 0, r.parked, r.live ? 1 : 0, (unsigned long long)r.x0_in,
+                    (unsigned long long)r.x0_after, (unsigned long long)r.first_x0, (unsigned long long)r.others);
+    check(a.hello && a.parked == 16 && b.hello && b.parked == 16, "pwalkskipfull: 16 frames parked at cap 32 and at cap 16");
+    check(a.live && a.x0_in == 0 && a.others == 0,
+          "pwalkskipfull: store not full: headers first live, no parent ask within P-53 of the header page's ask");
+    check(!b.live && b.x0_in == 0 && b.x0_after == 1 && b.others == 15,
+          "pwalkskipfull: store full: not live; the other 15 parents asked again, x0 not within P-53 of the header page's "
+          "ask, then once (" + std::to_string(b.x0_in) + " within, " + std::to_string(b.x0_after) + " after)");
+}
+
 // pwalkasked: J (deferred store cap 1,000) follows S at T. S holds 600 carriers t_k on T, none of them flooded to J;
 // J holds 600 parked chains, each a frame on t_k (parked through the node's park, no sender connected). The relay's
 // tick asks each t_k of S, its only peer: S's asked-carrier record stays within kAskedMax (256) at every pass (the rest
@@ -11190,6 +11275,7 @@ int main(int argc, char** argv) {
     run("rcrehello", rcrehello);
     run("pwalkgone", pwalkgone);
     run("pwalkjunk", pwalkjunk);
+    run("pwalkskipfull", pwalkskipfull);
     run("pwalkasked", pwalkasked);
     run("pwalkdup", pwalkdup);
     run("sealall", sealall);
