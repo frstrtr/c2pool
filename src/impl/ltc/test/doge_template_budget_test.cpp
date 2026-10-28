@@ -34,6 +34,7 @@
 #include <core/coin/utxo.hpp>
 #include <btclibs/util/strencodings.h>
 
+#include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/doge/coin/chain_params.hpp>
@@ -50,6 +51,7 @@ using ltc::coin::MutableTransaction;
 struct DogeChain {
     doge::coin::DOGEChainParams params = doge::coin::DOGEChainParams::mainnet();
     doge::coin::HeaderChain chain{params};
+    std::vector<ltc::coin::BlockHeaderType> headers;
 
     DogeChain(uint32_t root_height, const std::vector<uint32_t>& timestamps)
     {
@@ -66,6 +68,7 @@ struct DogeChain {
             h.m_bits = 0x1a01d2c3;
             h.m_nonce = static_cast<uint32_t>(i);
             EXPECT_TRUE(chain.add_header(h)) << "header " << i;
+            headers.push_back(h);
             prev = Hash(pack(h).get_span());
         }
     }
@@ -135,6 +138,13 @@ TEST(DogeTemplateBudget, FullTemplateWithAuxPowStaysUnder1MB)
         auto tx = big_tx(static_cast<uint8_t>(i), i, 290);
         ASSERT_TRUE(pool.add_tx_unchecked(tx));
         pool.set_tx_fee(ltc::coin::compute_txid(tx), 1000000 + i);
+    }
+    {
+        // The tip's body has run through the pool (none of these txs in it),
+        // as the full-block handler does before a full template is built.
+        ltc::coin::BlockType body;
+        static_cast<ltc::coin::BlockHeaderType&>(body) = c.headers.back();
+        pool.remove_for_block(body);
     }
 
     // Both coinbases carry 4,000 payees; the parent's is about as large plus
