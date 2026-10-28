@@ -1616,9 +1616,13 @@ public:
         // txs, specialtxman.cpp:206-229 then vtx order — the type-6 txs lead
         // the body). A proven ban changes the expected root; the memo above
         // is deliberately NOT keyed on the plan or the oracle: it stays the
-        // pre-PoSe projected root, and a banning pass re-derives on a fresh
-        // projected copy every time (bans are rare; a memo that missed an
-        // oracle move would serve a stale root — a silently lost block).
+        // pre-PoSe projected root. The post-ban root has its OWN memo, keyed
+        // on (epoch, the exact ban list): the projection it is derived from
+        // is the one the epoch already covers, and the bans are the only
+        // other input, so a different ban list (an oracle or plan move) can
+        // never land on it. Without it a banning height re-ran the full
+        // projection + root hash on EVERY evaluation — the D2 freeze shape
+        // above, at exactly the height a proven ban is being served.
         uint256 expected_mn_root = m_sml_root_memo;
         if (m_include_mn_special_txs) {
             auto proj = project_sml_confirmations(m_sml, m_prev_height,
@@ -1640,15 +1644,23 @@ public:
                               "0-refused");
             expected_mn_root = fold.sml.CalcMerkleRoot();
         } else if (!pose_bans.empty()) {
-            auto proj = project_sml_confirmations(m_sml, m_prev_height,
-                                                  m_prev_hash, m_mnstates,
-                                                  m_mn_min_confirmations);
-            if (!proj.ok)   // unreachable: the memo path above passed
-                return reject("emit-mn-confirm-rollover-pending",
-                              "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
-                              "known-registration-height");
-            apply_qc_pose_bans(proj.sml, pose_bans);
-            expected_mn_root = proj.sml.CalcMerkleRoot();
+            if (!(m_ban_root_memo_valid
+                  && m_ban_root_memo_epoch == m_root_memo_epoch
+                  && m_ban_root_memo_bans == pose_bans)) {
+                auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                      m_prev_hash, m_mnstates,
+                                                      m_mn_min_confirmations);
+                if (!proj.ok)   // unreachable: the memo path above passed
+                    return reject("emit-mn-confirm-rollover-pending",
+                                  "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                                  "known-registration-height");
+                apply_qc_pose_bans(proj.sml, pose_bans);
+                m_ban_root_memo       = proj.sml.CalcMerkleRoot();
+                m_ban_root_memo_epoch = m_root_memo_epoch;
+                m_ban_root_memo_bans  = pose_bans;
+                m_ban_root_memo_valid = true;
+            }
+            expected_mn_root = m_ban_root_memo;
         }
         if (cb.merkleRootMNList != expected_mn_root)
             return reject("emit-mnlist-root-drift",
@@ -2279,6 +2291,13 @@ private:
     mutable bool     m_sml_root_memo_valid{false};
     mutable uint64_t m_sml_root_memo_epoch{0};
     mutable uint256  m_sml_root_memo;         // projected-SML merkle root
+    // Post-PoSe-ban projected root, keyed on (epoch, ban list) — see the
+    // emit gate. Distinct slot: the no-ban memo above must stay the pre-ban
+    // root that every non-banning evaluation reads.
+    mutable bool                 m_ban_root_memo_valid{false};
+    mutable uint64_t             m_ban_root_memo_epoch{0};
+    mutable std::vector<uint256> m_ban_root_memo_bans;
+    mutable uint256              m_ban_root_memo;
     mutable bool     m_quorum_root_memo_valid{false};
     mutable uint64_t m_quorum_root_memo_epoch{0};
     mutable uint256  m_quorum_root_memo;      // plain active-set quorum root

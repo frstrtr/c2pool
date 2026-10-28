@@ -2214,6 +2214,58 @@ TEST(DashQcPoseGate, PunishingCommitmentWithProvableBanServesFoldedRoot) {
     EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
 }
 
+// A PROVEN ban's folded root is computed ONCE per (epoch, ban list), not on
+// every emit evaluation: the gate runs ~3 times per session per notify, and a
+// fresh projection + full-list root on each one is the D2 production-freeze
+// shape (2026-08-07/08) — at exactly the height a ban is being served. RED
+// without the post-ban memo: N warm calls == N full SML roots. The memo must
+// still move with its inputs: a different ban list (the oracle stops proving
+// the ban) and an epoch bump (the tip SML moves) both re-derive.
+TEST(DashQcPoseGate, ProvenBanRootIsMemoizedAcrossEmitEvaluations) {
+    using dash::coin::vendor::sml_calc_merkle_root_count;
+    NodeCoinState st;
+    seed_real_qc_serving(st, make_real_qc(/*punish_listed_member=*/true));
+    wire_oracle(st, 50, 50);
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    DeclineReport why;
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+
+    const uint64_t before = sml_calc_merkle_root_count();
+    constexpr int N = 100;
+    for (int i = 0; i < N; ++i)
+        ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(sml_calc_merkle_root_count() - before, 0u)
+        << N << " warm emit_ok evaluations of a banning height re-derived the"
+                " folded root (pre-memo: " << N << ")";
+
+    // The oracle stops proving the ban: the SAME template (banned root) is
+    // now stale and must be refused, never served off the memo.
+    wire_oracle(st, 0, 0);
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-mnlist-root-drift") << why.one_line();
+
+    // The ban is proven again (same list, same epoch): the memo is still the
+    // value of exactly these inputs, so it answers with no recomputation.
+    wire_oracle(st, 50, 50);
+    const uint64_t again = sml_calc_merkle_root_count();
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+    ASSERT_TRUE(st.embedded_template_emit_ok(sel.work, nullptr));
+    EXPECT_EQ(sml_calc_merkle_root_count() - again, 0u);
+
+    // The tip SML moves (an SML-hashed field of the OTHER, unpunished entry):
+    // the epoch bumps, the memoized banned root is stale, the old template is
+    // refused, and the template for the new state passes.
+    for (auto& e : st.sml().mnList)
+        if (e.proRegTxHash == raw256(0x60)) e.netPort = 12345;
+    EXPECT_FALSE(st.embedded_template_emit_ok(sel.work, &why));
+    EXPECT_EQ(why.cause, "emit-mnlist-root-drift") << why.one_line();
+    WorkSelection sel2 = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel2.source, WorkSource::Embedded) << sel2.decline.one_line();
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel2.work, &why)) << why.one_line();
+}
+
 // KAT 10 — fail closed with no oracle (the PR-A production posture): the
 // refusal names stage=penalty-unknown, and an oracle that is not at THIS tip
 // names oracle-not-at-tip — both at viability and at emit.
