@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <ctime>
 #include <deque>
+#include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -264,4 +266,76 @@ TEST(MergedMining, CleanDogeTemplateLatchesTheTip)
     stub->tip = std::string(63, '0') + "b";   // a new tip: fetched
     mm.refresh_aux_work();
     EXPECT_EQ(stub->template_fetches, 2);
+}
+
+// A re-fetch that is still degraded on the same tip keeps the block already
+// being mined: no rebuild, no new work pushed to the miners. Before, every
+// such poll (1 s) rebuilt the DOGE block and pushed a new LTC job to every
+// miner, for as long as the tip's body was missing.
+TEST(MergedMining, StillDegradedRefetchKeepsTheBlock)
+{
+    boost::asio::io_context ioc;
+    c2pool::merged::MergedMiningManager mm(ioc);
+    int work_changed = 0;
+    mm.set_on_work_changed([&work_changed]() { ++work_changed; });
+    auto backend = std::make_unique<StubBackend>();
+    auto* stub = backend.get();
+    stub->degraded = {true, true, true, false};
+    mm.add_chain(stub->cfg, std::move(backend));
+
+    mm.refresh_aux_work();   // new tip, degraded: the new work goes out
+    ioc.restart();
+    ioc.poll();
+    EXPECT_EQ(work_changed, 1);
+    mm.refresh_aux_work();   // same tip, still degraded: kept
+    mm.refresh_aux_work();
+    ioc.restart();
+    ioc.poll();
+    EXPECT_EQ(stub->template_fetches, 3) << "it keeps asking";
+    EXPECT_EQ(work_changed, 1) << "but pushes nothing new while still degraded";
+    EXPECT_TRUE(mm.get_current_work().at(98).block_template.contains("degraded"));
+    mm.refresh_aux_work();   // clean: the full template goes out
+    ioc.restart();
+    ioc.poll();
+    EXPECT_EQ(work_changed, 2);
+    EXPECT_FALSE(mm.get_current_work().at(98).block_template.contains("degraded"));
+    const auto j = mm.get_template_gate_json();
+    EXPECT_EQ(j["DOGE"]["degraded"], 1u);
+    EXPECT_EQ(j["DOGE"]["still_degraded"], 2u);
+    EXPECT_EQ(j["DOGE"]["refetched_clean"], 1u);
+}
+
+// frozen_history holds the snapshots a share's committed DOGE block is
+// rebuilt from at submit. Past its cap (100) it must drop the OLDEST: it is
+// keyed by block hash, and trimming in key order dropped arbitrary ones, the
+// one just frozen included, so a DOGE find on the current job was skipped
+// ("No matching snapshot") and lost.
+TEST(MergedMining, FrozenHistoryKeepsTheNewestSnapshots)
+{
+    boost::asio::io_context ioc;
+    c2pool::merged::MergedMiningManager mm(ioc);
+    auto backend = std::make_unique<StubBackend>();
+    auto* stub = backend.get();
+    mm.add_chain(stub->cfg, std::move(backend));
+    uint64_t round = 0;
+    mm.set_payout_provider([&round](uint32_t, uint64_t value) {
+        std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+        s.insert(s.end(), 20, 0x5a);
+        s.push_back(0x88);
+        s.push_back(0xac);
+        return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value - round}};
+    });
+    mm.refresh_aux_work();
+    std::vector<uint256> hashes;
+    for (round = 1; round <= 150; ++round) {   // a new PPLNS split each round
+        mm.mark_pplns_dirty();
+        mm.rebuild_cached_blocks();
+        hashes.push_back(mm.get_current_work().at(98).block_hash);
+    }
+    for (size_t i = 0; i < hashes.size(); ++i) {
+        if (i + 100 >= hashes.size())
+            EXPECT_TRUE(mm.has_frozen_snapshot(98, hashes[i])) << "snapshot " << i << " of the last 100";
+        else
+            EXPECT_FALSE(mm.has_frozen_snapshot(98, hashes[i])) << "snapshot " << i << " is older";
+    }
 }
