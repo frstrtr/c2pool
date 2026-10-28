@@ -55,6 +55,8 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <set>
+#include <span>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -329,8 +331,10 @@ static DmlFoldEngine seed_from_fixture(const PrestateFixture& fx)
     auto entries = fx.entries;
     uint256 anchor_hash;
     anchor_hash.SetHex(fx.blockhash_display);
+    // The fixtures are dashd `protx list` captures: their poSePenalty IS
+    // dashd's value, so the certainty bounds start exact.
     eng.seed(std::move(entries), fx.entries.size(), fx.height, anchor_hash,
-             fx.network);
+             fx.network, dash::coin::replay::SeedPenalties::Exact);
     EXPECT_EQ(eng.compute_sml_root().GetHex(), fx.mnroot_display)
         << "prestate does not reproduce the committed root at h=" << fx.height;
     return eng;
@@ -612,6 +616,10 @@ TEST(DashReplayFoldReal, PoSePunishAndCaseDBan2516412)
     ASSERT_NE(still_valid, nullptr);
     EXPECT_FALSE(still_valid->IsBanned());
     EXPECT_EQ(still_valid->nPoSePenalty, 1961);
+    // Exact seed => exact bounds through decay + punish + ban.
+    EXPECT_EQ(still_valid->nPoSePenaltyHi, 1961);
+    EXPECT_EQ(banned->nPoSePenaltyHi, 2972);
+    EXPECT_EQ(r.root_resolved_bans, 0u);
 
     expect_coinbase_pays(blk, eng, r);
 }
@@ -1952,4 +1960,456 @@ TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeePaidIsNotFlaggedSkipped)
     // Below enforcement the check is skipped regardless of whether the coinbase
     // happens to pay the projection; the flag reflects the GATE, not the match.
     EXPECT_TRUE(r.payee_check_preenforcement_skipped);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PoSe PENALTY CERTAINTY BOUNDS (design PR-B §4.2, KAT 13) — the penalty
+// oracle. nPoSePenalty is the LOWER bound (the model the ban is decided on),
+// nPoSePenaltyHi the UPPER bound; dashd's value sits between them.
+// ════════════════════════════════════════════════════════════════════════
+namespace pose_bounds_kat {
+
+using dash::coin::replay::PoSeBounds;
+using dash::coin::replay::PoSeExactness;
+using dash::coin::replay::SeedPenalties;
+
+// A confirmed, valid, regular MN as an anchor seed would carry it.
+static ReplayMNState synth_state(uint8_t tag, int32_t lo = 0)
+{
+    ReplayMNState st;
+    st.nVersion       = ProTxVersion::BASIC_BLS;
+    st.nType          = MnType::REGULAR;
+    st.internalId     = tag;
+    st.collateralOutpoint.hash  = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.netInfo.ip      = seq_array<16>(static_cast<uint8_t>(0x10 + tag));
+    st.netInfo.port_be = 9999;
+    st.keyIDOwner      = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.pubKeyOperator  = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.keyIDVoting     = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.scriptPayout.m_data = script_bytes(static_cast<uint8_t>(0x60 + tag));
+    st.nRegisteredHeight = 1;
+    st.confirmedHash   = raw256(static_cast<uint8_t>(0x70 + tag));
+    st.nPoSePenalty    = lo;
+    return st;
+}
+
+// Independent hand-build of the DIP-4 entry (never the engine's own output).
+static CSimplifiedMNListEntry synth_entry(const uint256& protx,
+                                          const ReplayMNState& st, bool valid)
+{
+    CSimplifiedMNListEntry e;
+    e.nVersion       = st.nVersion;
+    e.proRegTxHash   = protx;
+    e.confirmedHash  = st.confirmedHash;
+    e.netAddress     = st.netInfo.ip;
+    e.netPort        = st.netInfo.port_be;
+    e.pubKeyOperator = st.pubKeyOperator;
+    e.keyIDVoting    = st.keyIDVoting;
+    e.isValid        = valid;
+    e.nType          = st.nType;
+    return e;
+}
+
+static MutableTransaction punish_qc(const uint256& quorum_hash,
+                                    std::vector<bool> valid, uint8_t vin_tag)
+{
+    CFinalCommitmentTxPayload qc;
+    qc.nVersion = 1;
+    qc.nHeight  = 0;
+    qc.commitment.nVersion   = CFinalCommitment::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
+    qc.commitment.llmqType   = CFinalCommitment::LLMQ_100_67;
+    qc.commitment.quorumHash = quorum_hash;
+    qc.commitment.signers      = valid;
+    qc.commitment.validMembers = valid;
+    qc.commitment.quorumPublicKey = seq_array<48>(0xD0);
+    qc.commitment.quorumVvecHash  = raw256(0xD1);
+    qc.commitment.quorumSig  = seq_array<96>(0xD2);
+    qc.commitment.membersSig = seq_array<96>(0xD3);
+    return make_special_tx(6, qc, vin_tag);
+}
+
+// Three seeded MNs a, b, c (count 3 => CalcMaxPoSePenalty 100, P = 66, seed
+// ceiling 200) with a quorum whose members are (a, b, c) in bitset order.
+struct BoundsChain
+{
+    DmlFoldEngine eng{synth_cfg()};
+    uint256 a{raw256(0xE1)}, b{raw256(0xE2)}, c{raw256(0xE3)};
+    std::map<uint256, ReplayMNState> st;
+    uint256  quorum{raw256(0xC0)};
+    uint32_t h{100};
+    uint256  prev{raw256(9)};
+    uint8_t  tag{10};
+
+    explicit BoundsChain(SeedPenalties mode, int32_t lo_a = 0)
+    {
+        st[a] = synth_state(1, lo_a);
+        st[b] = synth_state(2);
+        st[c] = synth_state(3);
+        eng.seed({{a, st[a]}, {b, st[b]}, {c, st[c]}}, 3, h, prev, "mainnet",
+                 mode);
+        eng.set_members_fn([this](uint8_t, const uint256& qh)
+                               -> std::optional<std::vector<uint256>> {
+            if (qh == quorum) return std::vector<uint256>{a, b, c};
+            return std::nullopt;
+        });
+    }
+
+    uint256 root(const std::set<uint256>& banned) const
+    {
+        std::vector<CSimplifiedMNListEntry> v;
+        for (const auto& [p, s] : st) v.push_back(synth_entry(p, s, !banned.count(p)));
+        return root_of(std::move(v));
+    }
+
+    MutableTransaction qc_marking(const uint256& who)
+    {
+        return punish_qc(quorum, {who != a, who != b, who != c}, ++tag);
+    }
+
+    MutableTransaction proupserv(const uint256& who)
+    {
+        CProUpServTx up;
+        up.nVersion  = ProTxVersion::BASIC_BLS;
+        up.proTxHash = who;
+        up.netInfo   = st.at(who).netInfo;   // root-neutral service update
+        return make_special_tx(2, up, ++tag);
+    }
+
+    // Fold the next block; `banned_after` is the set dashd's committed root
+    // carries (the answer key the test chooses).
+    FoldResult next(std::vector<MutableTransaction> txs,
+                    const std::set<uint256>& banned_after = {})
+    {
+        ++h;
+        auto blk = make_block(h, prev, root(banned_after), std::move(txs), &eng);
+        auto r = eng.fold_block(blk, h);
+        if (r.ok) prev = DmlFoldEngine::block_header_hash(blk);
+        return r;
+    }
+
+    PoSeBounds bounds(const uint256& p) const { return *eng.pose_bounds(p); }
+};
+
+} // namespace pose_bounds_kat
+
+using namespace pose_bounds_kat;
+
+// Seed without penalties: lo = 0 (the placeholder), hi = the ceiling
+// 2 x CalcMaxPoSePenalty. Seed WITH dashd's penalties: hi = lo. The caller's
+// own nPoSePenaltyHi is ignored either way. Mutation "seed hi=0" reds here.
+TEST(DashPoSeBounds, UnknownSeedWidensHiExactSeedKeepsItTight)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown, /*lo_a=*/7);
+        EXPECT_EQ(ch.eng.calc_max_pose_penalty(), 100);
+        EXPECT_EQ(ch.eng.seed_penalty_ceiling(), 200);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 7);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 200);
+        EXPECT_EQ(ch.bounds(ch.b).lo, 0);
+        EXPECT_EQ(ch.bounds(ch.b).hi, 200);
+        const PoSeExactness x = ch.eng.pose_exactness();
+        EXPECT_EQ(x.valid_exact, 0u);
+        EXPECT_EQ(x.valid_inexact, 3u);
+        EXPECT_EQ(x.max_gap, 200);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Exact, /*lo_a=*/7);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 7);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 7);
+        EXPECT_EQ(ch.bounds(ch.b).hi, 0);
+        EXPECT_EQ(ch.eng.pose_exactness().valid_exact, 3u);
+    }
+    {
+        // Default is Unknown, and a stray caller-side hi never survives.
+        DmlFoldEngine eng(synth_cfg());
+        auto s = synth_state(1, 0);
+        s.nPoSePenaltyHi = 3;
+        eng.seed({{raw256(0xE1), s}}, 1, 100, raw256(9));
+        EXPECT_EQ(eng.find(raw256(0xE1))->nPoSePenaltyHi, 200);
+    }
+}
+
+// Convergence: with no punish after the seed, hi decays one per block and the
+// bound is exact (0) after exactly `ceiling` blocks.
+TEST(DashPoSeBounds, BoundsConvergeOverACleanRun)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    for (int k = 1; k <= 200; ++k) {
+        auto r = ch.next({});
+        ASSERT_TRUE(r.ok) << "k=" << k << " " << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).hi, 200 - k);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 0);
+        if (k == 199) EXPECT_EQ(ch.eng.pose_exactness().valid_inexact, 3u);
+    }
+    const PoSeExactness x = ch.eng.pose_exactness();
+    EXPECT_EQ(x.valid_exact, 3u);
+    EXPECT_EQ(x.valid_inexact, 0u);
+    EXPECT_EQ(x.max_gap, 0);
+}
+
+// A punish moves BOTH bounds (decay first, then +P, clamp at max); the ban is
+// decided on lo only. dashd's hidden value 0 => no ban at the first punish,
+// the root is unchanged and nothing needs resolving; the second punish takes
+// lo to max and the model bans.
+TEST(DashPoSeBounds, PunishMovesBothBoundsAndTheBanStaysOnLo)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    auto r = ch.next({ch.qc_marking(ch.a)});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.punished, 1u);
+    EXPECT_EQ(r.banned, 0u);
+    EXPECT_EQ(r.root_resolved_bans + r.root_resolved_nobans, 0u);
+    EXPECT_EQ(ch.bounds(ch.a).lo, 66);          // 0 -> decay 0 -> +66
+    EXPECT_EQ(ch.bounds(ch.a).hi, 100);         // 200 -> 199 -> +66 -> clamp 100
+    EXPECT_FALSE(ch.bounds(ch.a).banned);
+    EXPECT_EQ(ch.bounds(ch.b).hi, 199);         // decay only
+
+    r = ch.next({ch.qc_marking(ch.a)}, {ch.a});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.banned, 1u);
+    EXPECT_EQ(ch.bounds(ch.a).lo, 100);         // 65 + 66 -> clamp 100 = max
+    EXPECT_EQ(ch.bounds(ch.a).hi, 100);         // 99 + 66 -> clamp 100
+    EXPECT_TRUE(ch.bounds(ch.a).banned);
+    EXPECT_EQ(ch.eng.find(ch.a)->nPoSeBanHeight, 102);
+}
+
+// The ambiguous band (lo < max <= hi): dashd MAY have banned. The committed
+// root decides — exactly one candidate subset reproduces it, and it is
+// adopted (banned, penalty = max exactly). With the resolver removed this
+// block poisons (the pre-bounds behaviour on an unknown-penalty seed).
+TEST(DashPoSeBounds, AmbiguousPunishIsResolvedFromTheCommittedRoot)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a)}, /*dashd banned=*/{ch.a});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.root_resolved_bans, 1u);
+        EXPECT_EQ(r.banned, 1u);
+        EXPECT_EQ(r.computed_root, r.committed_root);
+        EXPECT_TRUE(ch.bounds(ch.a).banned);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 100);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+        EXPECT_EQ(ch.eng.find(ch.a)->nPoSeBanHeight, 101);
+        // and the fold keeps going on the adopted state
+        auto r2 = ch.next({}, {ch.a});
+        ASSERT_TRUE(r2.ok) << r2.error;
+    }
+    {
+        // A divergence the PoSe ambiguity cannot explain (b banned, b was
+        // never punished) still poisons, exactly as before.
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a)}, {ch.b});
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("ROOT MISMATCH"), std::string::npos) << r.error;
+        EXPECT_TRUE(ch.eng.poisoned());
+    }
+    {
+        // An EXACT seed never enters the band: lo = hi = 66 < 100, so a root
+        // showing `a` banned is a genuine divergence and poisons.
+        BoundsChain ch(SeedPenalties::Exact);
+        auto r = ch.next({ch.qc_marking(ch.a)}, {ch.a});
+        ASSERT_FALSE(r.ok);
+        EXPECT_TRUE(ch.eng.poisoned());
+    }
+}
+
+// Same block: ambiguous punish of `a`, then a ProUpServTx for `a`. dashd may
+// have banned and then revived it (penalty 0) — indistinguishable by the root
+// — so the lower bound must drop to 0. Before the punish, or after an exact
+// (non-ambiguous) punish, the ProUpServTx leaves the bounds alone.
+TEST(DashPoSeBounds, ProUpServAfterAmbiguousPunishWidensTheLowerBound)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a), ch.proupserv(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 0);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+        EXPECT_FALSE(ch.bounds(ch.a).banned);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.proupserv(ch.a), ch.qc_marking(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 66);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Exact);
+        auto r = ch.next({ch.qc_marking(ch.a), ch.proupserv(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 66);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 66);
+    }
+}
+
+// The oracle accessor answers ONLY for the post-state of the exact block the
+// engine stands on, never when poisoned, never for an MN it does not hold.
+TEST(DashPoSeBounds, OracleAccessorAnswersOnlyAtItsOwnTip)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    ASSERT_TRUE(ch.eng.pose_bounds_at(100, raw256(9), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(101, raw256(9), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(8), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(9), raw256(0xEE)).has_value());
+
+    ASSERT_TRUE(ch.next({ch.qc_marking(ch.a)}).ok);
+    auto v = ch.eng.pose_bounds_at(101, ch.prev, ch.a);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->lo, 66);
+    EXPECT_EQ(v->hi, 100);
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(9), ch.a).has_value());
+
+    const uint256 tip = ch.prev;
+    ASSERT_FALSE(ch.next({}, {ch.c}).ok);        // poisons at 102
+    EXPECT_FALSE(ch.eng.pose_bounds_at(101, tip, ch.a).has_value());
+}
+
+// v4 round trip carries both bounds and is byte-stable.
+TEST(DashPoSeBounds, SnapshotV4RoundTripCarriesTheBounds)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    ASSERT_TRUE(ch.next({ch.qc_marking(ch.a)}).ok);
+    const auto bytes = ch.eng.save_snapshot();
+    ASSERT_EQ(std::memcmp(bytes.data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+
+    DmlFoldEngine e2(synth_cfg());
+    std::string err;
+    ASSERT_TRUE(e2.load_snapshot(bytes, err)) << err;
+    EXPECT_EQ(e2.loaded_snapshot_version(), 4u);
+    for (const auto& p : {ch.a, ch.b, ch.c}) {
+        EXPECT_EQ(e2.find(p)->nPoSePenalty, ch.eng.find(p)->nPoSePenalty);
+        EXPECT_EQ(e2.find(p)->nPoSePenaltyHi, ch.eng.find(p)->nPoSePenaltyHi);
+    }
+    EXPECT_EQ(e2.find(ch.a)->nPoSePenaltyHi, 100);
+    EXPECT_EQ(e2.find(ch.b)->nPoSePenaltyHi, 199);
+    EXPECT_EQ(e2.save_snapshot(), bytes);
+    EXPECT_TRUE(e2.at_block(101, ch.prev));
+}
+
+// A v3 file (no bound on disk) still loads, with hi widened to the ceiling —
+// the same reading as an Unknown-penalty seed. Magic/version must agree.
+TEST(DashPoSeBounds, SnapshotV3LoadsWithTheUpperBoundAtTheCeiling)
+{
+    auto v3_bytes = [](const char* magic, uint32_t version,
+                       const std::vector<std::pair<uint256, ReplayMNState>>& es) {
+        ::PackStream s;
+        s.write(std::as_bytes(std::span<const char>(magic, 24)));
+        s << version;
+        s << std::string("mainnet");
+        s << uint32_t{100};
+        s << raw256(9);
+        s << uint64_t{es.size()};
+        s << uint64_t{es.size()};
+        for (const auto& [p, st] : es) { s << p; s << st; }
+        auto sp = s.get_span();
+        uint256 d;
+        CHash256()
+            .Write(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
+            .Finalize(std::span<unsigned char>(d.data(), 32));
+        s << d;
+        auto full = s.get_span();
+        return std::vector<uint8_t>(
+            reinterpret_cast<const uint8_t*>(full.data()),
+            reinterpret_cast<const uint8_t*>(full.data()) + full.size());
+    };
+    const std::vector<std::pair<uint256, ReplayMNState>> es = {
+        {raw256(0xE1), synth_state(1, 0)},
+        {raw256(0xE2), synth_state(2, 150)},
+        {raw256(0xE3), synth_state(3, 0)}};
+
+    DmlFoldEngine e(synth_cfg());
+    std::string err;
+    ASSERT_TRUE(e.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v03", 3, es), err))
+        << err;
+    EXPECT_EQ(e.loaded_snapshot_version(), 3u);
+    EXPECT_EQ(e.find(raw256(0xE1))->nPoSePenalty, 0);
+    EXPECT_EQ(e.find(raw256(0xE1))->nPoSePenaltyHi, 200);
+    EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenalty, 150);
+    EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenaltyHi, 200);
+    // Re-saved as v4.
+    EXPECT_EQ(std::memcmp(e.save_snapshot().data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+
+    DmlFoldEngine e2(synth_cfg());
+    EXPECT_FALSE(e2.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v03", 4, es), err));
+    EXPECT_FALSE(e2.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v04", 3, es), err));
+    EXPECT_EQ(e2.size(), 0u);
+}
+
+// REAL CHAIN BYTES, h=2516412 (the case-D event): what an anchor seeded from
+// an SML (no penalties) sees. Every MN starts at [0, 2 x 2972]; dashd's own
+// pre-state value is inside the interval for all 2972. The block punishes
+// two MNs into the ambiguous band; the committed root proves one ban
+// (1e5112a9…, dashd 1937 -> clamp 2972) and one non-ban (104b336e…, dashd
+// 0 -> 1961), and after the fold every MN's dashd value (the exact-seeded
+// engine) is still bracketed. The exact seed stays exact throughout.
+TEST(DashPoSeBoundsReal, UnknownSeedBracketsDashdAndTheRootResolvesCaseD2516412)
+{
+    auto fx = parse_prestate(kDashReplayPrestate2516411);
+    auto qf = parse_quorum(kDashReplayQuorum2516412);
+    const uint256 quorum_hash = from_display(qf.quorum_hash_display.c_str());
+    auto members = [&](uint8_t t, const uint256& qh)
+        -> std::optional<std::vector<uint256>> {
+        if (t == qf.llmq_type && qh == quorum_hash) return qf.members;
+        return std::nullopt;
+    };
+    uint256 anchor_hash;
+    anchor_hash.SetHex(fx.blockhash_display);
+
+    FoldConfig cfg;
+    cfg.enabled = true;
+    DmlFoldEngine truth(cfg);   // dashd's penalties (protx list): EXACT
+    {
+        auto es = fx.entries;
+        truth.seed(std::move(es), fx.entries.size(), fx.height, anchor_hash,
+                   fx.network, SeedPenalties::Exact);
+    }
+    DmlFoldEngine blind(cfg);   // an SML anchor: penalties unknown
+    {
+        auto es = fx.entries;
+        for (auto& [p, st] : es) st.nPoSePenalty = 0;
+        blind.seed(std::move(es), fx.entries.size(), fx.height, anchor_hash,
+                   fx.network, SeedPenalties::Unknown);
+    }
+    EXPECT_EQ(blind.compute_sml_root().GetHex(), kRoot2516411);
+    EXPECT_EQ(blind.seed_penalty_ceiling(), 2 * 2972);
+    for (const auto& [p, st] : truth.entries()) {
+        const auto* bs = blind.find(p);
+        ASSERT_NE(bs, nullptr);
+        EXPECT_LE(bs->nPoSePenalty, st.nPoSePenalty);
+        EXPECT_GE(bs->nPoSePenaltyHi, st.nPoSePenalty);
+    }
+    EXPECT_EQ(truth.pose_exactness().valid_inexact, 0u);
+
+    truth.set_members_fn(members);
+    blind.set_members_fn(members);
+    const auto blk = parse_block(kDashReplayBlock2516412);
+    auto rt = truth.fold_block(blk, 2516412);
+    ASSERT_TRUE(rt.ok) << rt.error;
+    EXPECT_EQ(rt.root_resolved_bans, 0u);         // exact: the model banned it
+    auto rb = blind.fold_block(blk, 2516412);
+    ASSERT_TRUE(rb.ok) << rb.error;
+    EXPECT_EQ(rb.computed_root.GetHex(), kRoot2516412);
+    EXPECT_EQ(rb.root_resolved_bans, 1u);
+    EXPECT_EQ(rb.root_resolved_nobans, 1u);
+
+    const uint256 to_ban   = from_display(kBannedMN);
+    const uint256 punished = from_display(kPunishedMN);
+    EXPECT_TRUE(blind.find(to_ban)->IsBanned());
+    EXPECT_EQ(blind.find(to_ban)->nPoSeBanHeight, 2516412);
+    EXPECT_EQ(blind.find(to_ban)->nPoSePenalty, 2972);
+    EXPECT_EQ(blind.find(to_ban)->nPoSePenaltyHi, 2972);
+    EXPECT_EQ(blind.find(punished)->nPoSePenalty, 1961);
+    EXPECT_EQ(blind.find(punished)->nPoSePenaltyHi, 2971);   // proven < max
+
+    for (const auto& [p, st] : truth.entries()) {
+        const auto* bs = blind.find(p);
+        ASSERT_NE(bs, nullptr);
+        EXPECT_EQ(bs->IsBanned(), st.IsBanned());
+        EXPECT_LE(bs->nPoSePenalty, st.nPoSePenalty) << p.GetHex();
+        EXPECT_GE(bs->nPoSePenaltyHi, st.nPoSePenalty) << p.GetHex();
+        EXPECT_EQ(st.nPoSePenalty, st.nPoSePenaltyHi) << "exact seed drifted";
+    }
 }
