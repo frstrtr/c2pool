@@ -4690,6 +4690,21 @@ void MiningInterface::load_persisted_found_blocks()
     catch (const std::exception& e) {
         LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
     }
+
+    // Rows still pending from before the restart were never given a verdict
+    // (their checks died with the process): check them again.
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.status == BlockStatus::pending)
+                pending.push_back(b.hash);
+    }
+    if (!pending.empty() && m_context) {
+        LOG_INFO << "[Pool] Re-checking " << pending.size() << " found blocks still pending";
+        for (const auto& h : pending)
+            schedule_block_verification(h);
+    }
 }
 
 void MiningInterface::seed_netdiff_history_from_found_blocks()
@@ -5048,7 +5063,9 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     //   DOGE: 1 min/block  → check at +10s, +60s, +120s, +180s, +360s, +600s
     //
     // After 6 confirmations the block is considered permanently accepted.
-    // If still pending after all checks, mark as orphaned.
+    // The coin's verifier gives the orphan verdict (another block at the
+    // height, the chain 6 deep); a row pending after the last check is one
+    // the chain could not judge, and stays pending rather than be called lost.
     std::string chain_name;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
@@ -5074,8 +5091,11 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     else if (cn == "DGB")  block_time_sec = 15;    // ~15 s
     else                   block_time_sec = 60;    // safe fallback
 
-    // Check at: first_check, then every block_time for 6 blocks,
-    // then one final check at 10 blocks
+    // Check at: first_check, then every block_time for 6 blocks, at 10
+    // blocks, then while still pending (a verdict needs the chain 6 deep
+    // from the block's height, which can take longer than 10 block times)
+    // at 15, 20, 30, 45, 60, 90 and 120 block times. A check of a row that
+    // already has its verdict is a no-op.
     auto& ioc = *m_context;
     std::vector<int> delays = {
         block_time_sec / 5,         // quick first check
@@ -5083,7 +5103,14 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
         block_time_sec * 2,         // ~2 confs
         block_time_sec * 3,         // ~3 confs
         block_time_sec * 5,         // ~5 confs
-        block_time_sec * 10,        // ~10 confs (final)
+        block_time_sec * 10,        // ~10 confs
+        block_time_sec * 15,
+        block_time_sec * 20,
+        block_time_sec * 30,
+        block_time_sec * 45,
+        block_time_sec * 60,
+        block_time_sec * 90,
+        block_time_sec * 120,
     };
 
     // Each check finds the row by its HASH when it fires. The list is kept

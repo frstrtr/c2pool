@@ -8,6 +8,18 @@
 /// < 0 orphaned, 0 pending (keep checking). TELEMETRY ONLY: a verdict never
 /// gates a submit, a relay or a payout.
 ///
+/// The verdict is taken at the height the found-block record holds (known
+/// even when peers never relayed the block back), against the best chain
+/// (BTC's block_confirm contract, impl/btc/coin/block_confirm.hpp, with the
+/// orphan verdict held back to the same depth):
+///   - our block is the best chain's block there: confirmed once kDepth deep
+///     (tip - height + 1 >= kDepth), pending before: it can still be reorged
+///     out, and MiningInterface never checks a confirmed row again;
+///   - another block is there, or none while the tip is past the height:
+///     orphaned once the best chain is kDepth deep from the height, pending
+///     before (a sibling race can still go our way);
+///   - the chain has not reached the height, or no height is known: pending.
+///
 /// main_ltc.cpp wires a ChainView over the embedded header chains; the KAT
 /// (src/impl/ltc/test/found_block_verify_test.cpp) over maps.
 
@@ -34,24 +46,44 @@ struct ChainView {
     std::function<bool()> has_tip;
 };
 
-/// A parent (LTC) block: a header the chain knows is confirmed, with
-/// tip - height + 1 confirmations.
-inline int parent_verdict(const ChainView& chain, const uint256& hash,
-                          std::optional<uint32_t> /*found_height*/)
+/// Depth at which a verdict is final: the conventional 6 confirmations.
+inline constexpr uint32_t kDepth = 6;
+
+/// The rule above, for a block mined at `found_height` (the record's; when
+/// unknown, the height of its header if the chain knows it).
+inline int verdict_at_height(const ChainView& chain, const uint256& hash,
+                             std::optional<uint32_t> found_height)
 {
-    const auto h = chain.height_of(hash);
-    if (!h)
-        return 0;  // not in our chain — still pending
-    const int32_t tip_h = static_cast<int32_t>(chain.tip_height());
-    const int32_t blk_h = static_cast<int32_t>(*h);
-    return std::max(1, tip_h - blk_h + 1);
+    if (!found_height)
+        found_height = chain.height_of(hash);
+    if (!found_height || !chain.has_tip())
+        return 0;
+    const uint32_t h = *found_height;
+    const uint32_t tip = chain.tip_height();
+    if (tip < h)
+        return 0;  // the chain has not reached it
+    const uint32_t depth = tip - h + 1;
+    const auto winner = chain.hash_at(h);
+    if (winner && *winner == hash)
+        return depth >= kDepth ? static_cast<int>(depth) : 0;
+    if (!winner)
+        return 0;  // a hole in the height index: cannot judge
+    return depth >= kDepth ? -1 : 0;
 }
 
-/// A merged (aux) block: confirmed while the chain has a tip.
-inline int aux_verdict(const ChainView& chain, const uint256& /*hash*/,
-                       std::optional<uint32_t> /*found_height*/)
+/// A parent (LTC) block.
+inline int parent_verdict(const ChainView& chain, const uint256& hash,
+                          std::optional<uint32_t> found_height)
 {
-    return chain.has_tip() ? 1 : 0;
+    return verdict_at_height(chain, hash, found_height);
+}
+
+/// A merged (aux) block, against the aux chain's own header chain: a live
+/// tip says nothing about whether our block is on it.
+inline int aux_verdict(const ChainView& chain, const uint256& hash,
+                       std::optional<uint32_t> found_height)
+{
+    return verdict_at_height(chain, hash, found_height);
 }
 
 } // namespace found_block

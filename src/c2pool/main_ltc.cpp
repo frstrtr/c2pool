@@ -4110,9 +4110,10 @@ int main(int argc, char* argv[]) {
                 mi->record_found_block(
                     height, block_hash, 0, is_testnet ? "tLTC" : "LTC",
                     miner_addr, share_h, net_diff, 0, pool_hr, block_subsidy);
-                // Schedule async verification at +10s, +30s, +120s
-                if (stale_info == 0)
-                    web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
+                // Verify every found block against the best chain, a stale
+                // or refused one too: it is orphaned once the chain is 6 deep
+                // from its height, never left pending.
+                web_server.get_mining_interface()->schedule_block_verification(block_hash.GetHex());
 
                 const char* stale_str = (stale_info == 253) ? " [ORPHAN — stale prev]"
                                       : (stale_info == 254) ? " [DOA — daemon rejected]"
@@ -7600,7 +7601,14 @@ int main(int argc, char* argv[]) {
                             if (it == merged_broadcasters.end()) return;
                             try {
                                 auto block_bytes = ParseHex(block_hex);
-                                it->second->submit_block_raw(block_bytes);
+                                const size_t peers = it->second->submit_block_raw(block_bytes);
+                                if (peers == 0)
+                                    LOG_WARNING << "[MM:" << it->second->symbol()
+                                                << "] found block relayed to NO peers ("
+                                                << block_bytes.size() << " bytes)";
+                                else
+                                    LOG_INFO << "[MM:" << it->second->symbol() << "] found block relayed to "
+                                             << peers << " peers (" << block_bytes.size() << " bytes)";
                             } catch (const std::exception& e) {
                                 LOG_WARNING << "[" << it->second->symbol()
                                             << "] Merged P2P relay failed: " << e.what();
@@ -7660,14 +7668,19 @@ int main(int argc, char* argv[]) {
                                             return e->block_hash;
                                         };
                                         view.tip_height = [dc]() { return dc ? dc->height() : 0u; };
-                                        // The backend's tip: the daemon, or the embedded chain.
-                                        view.has_tip = [rpc_backend]() {
+                                        view.has_tip = [dc]() { return dc && dc->tip().has_value(); };
+                                        if (!dc) {
+                                            // No embedded header chain for this aux chain
+                                            // (not DOGE): the backend being alive is all
+                                            // there is to go on, as before.
                                             try {
-                                                return !rpc_backend->get_best_block_hash().empty();
+                                                return rpc_backend->get_best_block_hash().empty() ? 0 : 1;
                                             } catch (...) {
-                                                return false; // unreachable — can't verify
+                                                return 0; // unreachable — can't verify
                                             }
-                                        };
+                                        }
+                                        // DOGE: our block against the DOGE best chain at
+                                        // the height it was mined at.
                                         uint256 h;
                                         h.SetHex(hash_hex);
                                         return ltc::coin::found_block::aux_verdict(

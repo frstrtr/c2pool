@@ -136,6 +136,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # found_block_verify_test.cpp: the dashboard verdict on a found LTC block
+    # and a found DOGE block (ltc::coin::found_block, the verifiers main_ltc
+    # wires): a side-branch block is never confirmed, a block the chain never
+    # saw is orphaned once the chain is 6 deep from its height, a live DOGE
+    # tip is not a confirmation, a best-chain block confirms once 6 deep.
+    # Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -156,6 +163,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
+        found_block_verify_test.cpp
         head_retention_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp
