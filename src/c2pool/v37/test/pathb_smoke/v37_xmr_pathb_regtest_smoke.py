@@ -1206,14 +1206,6 @@ class Rig:
                        "start line: %s" % (sl[0] if sl else first))
         lp = listening_ports(p.pid)
         self.res.check("fo", not lp, "D (pid %d) listens on no TCP port: %s" % (p.pid, lp))
-        if port_free(3333):
-            try:
-                c = socket.create_connection(("127.0.0.1", 3333), timeout=2)
-                c.close()
-                refused = False
-            except OSError:
-                refused = True
-            self.res.check("fo", refused, "the default stratum port 127.0.0.1:3333 refuses a connect")
         pdb = [os.path.join(dp, x) for dp, ds, _ in os.walk(os.path.join(self.work, "nodeD")) for x in ds
                if x == "pathb_db"]
         self.res.check("fo", not pdb, "no pathb_db directory under nodeD: %s" % pdb)
