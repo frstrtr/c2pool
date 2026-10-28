@@ -8349,16 +8349,17 @@ void catchlocator() {
 // pwalk_run: A, B and C hold one chain of n positions; J, empty, links to all three and catches up headers first while
 // A mines k new tips, one every 2 s, each reaching J from A, B and C. The wire carries at most `per_s` frames per second
 // of the clock; the servers' FC_HEADERS replies to J arrive `hold_s` seconds after they are sent (within P-53). The run
-// ends with J at A's tip after the k tips, at 1,800 s, or once J's R4 DEFERs pass `stop_r4`.
+// ends with J at A's tip after the k tips, at 1,800 s, or once J's R4 DEFERs pass `stop_r4`. `prefill`: before the links,
+// A's top `prefill` carriers reach J from A, newest first (each a ParentUnknown DEFER parked at J, not counted in R4).
 struct PwalkRun {
     bool chain = false, mined = true, at_tip = false;
     std::uint64_t tips = 0, r4 = 0, r17 = 0, parent_asks = 0, reasks = 0, catchup = 0, strikes = 0, bans = 0, a_pos = 0, j_pos = 0;
     std::uint64_t cu_end_pos = 0;  // J's best when the catch-ups toward A, B and C had all ended (0: not seen)
-    std::size_t deferred = 0, peak = 0, cap = 0;
+    std::size_t deferred = 0, peak = 0, cap = 0, prefilled = 0;
     int secs = 0;
 };
 PwalkRun pwalk_run(std::uint64_t n, std::uint64_t k, std::uint64_t per_s, std::uint64_t hold_s, std::uint64_t stop_r4,
-                   std::uint32_t seed) {
+                   std::uint32_t seed, std::size_t prefill = 0) {
     const KatNet net;
     Harness h(net);
     h.headers_frame = 700000;  // P-14: one FC_HEADERS frame holds a full page of P-01 headers
@@ -8383,6 +8384,15 @@ PwalkRun pwalk_run(std::uint64_t n, std::uint64_t k, std::uint64_t per_s, std::u
         held.emplace_back(h.now + hold_s, m);
         m.f.clear();
     };
+    if (prefill > 0) {
+        const std::uint64_t pa = w.id(j.node, a.node);
+        std::vector<pb::Hash32> top;
+        for (const pb::CarrierNode* x = &h[a.node].tree().best(); x != nullptr && x->pos > 0 && top.size() < prefill;
+             x = h[a.node].tree().find(x->parent))
+            top.push_back(x->id);
+        for (const pb::Hash32& id : top) (void)h[j.node].on_carrier(pa, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(id), 16));
+        out.prefilled = h[j.node].deferred().size();
+    }
     w.connect(j.node, a.node);
     w.connect(j.node, b.node);
     w.connect(j.node, c.node);
@@ -8485,6 +8495,18 @@ void pwalkfull() {
     check(r.peak == r.cap,
           "pwalkfull: J's deferred store at its cap during the catch-up (at most " + std::to_string(r.peak) + ")");
     pwalk_checks("pwalkfull", r, n, k, bound);
+}
+
+// pwalkcrawl: the pwalk chain at 500 frames per second, the FC_HEADERS replies 8 s after they are sent, J's deferred
+// store full (P-47) of A's top carriers before the links: the header path gets one body per page while the store is
+// full; J reaches A's tip within 1,800 s; as pwalk.
+void pwalkcrawl() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 500, 8, 4 * bound, 44000, pb::admit_j0(pb::kRuledLaneParams));
+    pwalk_print("pwalkcrawl", r, bound);
+    std::printf("  pwalkcrawl: parked at J before the links %zu (cap %zu)\n", r.prefilled, r.cap);
+    check(r.prefilled == r.cap, "pwalkcrawl: J's deferred store full before the links (" + std::to_string(r.prefilled) + ")");
+    pwalk_checks("pwalkcrawl", r, n, k, bound);
 }
 
 // pwalkstall: the pwalk chain at 5,000 frames per second, the FC_HEADERS replies 8 s after they are sent; as pwalk.
@@ -11159,6 +11181,7 @@ int main(int argc, char** argv) {
     run("pwalk", pwalk);
     run("pwalkshapes", pwalkshapes);
     run("pwalkfull", pwalkfull);
+    run("pwalkcrawl", pwalkcrawl);
     run("pwalkstall", pwalkstall);
     run("pwalklost", pwalklost);
     run("pwalksilent", pwalksilent);
