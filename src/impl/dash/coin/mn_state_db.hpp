@@ -141,6 +141,28 @@ struct MNState
         return (mn_payment * static_cast<int64_t>(nOperatorReward)) / 10000;
     }
 
+    /// The script dashd's coinbase is GUARANTEED to pay this masternode at,
+    /// i.e. the one output every block that pays it must carry. dashd
+    /// masternode/payments.cpp:65-79 (GetBlockTxOuts): with
+    /// nOperatorReward == 10000 and an operator script set, the operator
+    /// takes the whole share, the owner remainder is exactly 0 and
+    /// `if (masternodeReward > 0)` emits NO owner output — the only MN
+    /// output goes to scriptOperatorPayout. For every other state the owner
+    /// output (scriptPayout) is always present: floor(x*bps/10000) < x for
+    /// bps < 10000, and no operator script means no split at all.
+    ///
+    /// Every payee cross-check ("does this coinbase pay the masternode we
+    /// projected?") must test THIS script, never scriptPayout alone and never
+    /// "any script of this masternode". Mainnet, 2026-10-28: four anchor rows
+    /// carry bps=10000 with the operator script equal to the owner script.
+    const std::vector<unsigned char>& first_payout_script() const
+    {
+        return (nOperatorReward == 10000
+                && !scriptOperatorPayout.m_data.empty())
+            ? scriptOperatorPayout.m_data
+            : scriptPayout.m_data;
+    }
+
     C2POOL_SERIALIZE_METHODS(MNState)
     {
         READWRITE(obj.nVersion,

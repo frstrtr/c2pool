@@ -36,8 +36,10 @@
 ///     pindexPrev == find_expected_payee() before pass 1) and — if still
 ///     present after passes 1/2 (newList.HasMN) — marked
 ///     nLastPaidHeight = height. The coinbase is only used as a
-///     CROSS-CHECK: if it does not pay the projected MN's scriptPayout,
-///     this state has desynced from the network's payment schedule and
+///     CROSS-CHECK: if it does not pay the projected MN's
+///     first_payout_script() (scriptPayout, or scriptOperatorPayout for a
+///     full nOperatorReward == 10000 split, which dashd pays as ONE operator
+///     output), this state has desynced from the network's payment schedule and
 ///     the apply reports payee_desync (caller fails closed + re-seeds)
 ///     instead of guessing an attribution.
 ///
@@ -1074,7 +1076,7 @@ public:
         if (!m_pending.ranked.empty()) {
             auto hit = m_entries.find(m_pending.ranked.front());
             if (hit != m_entries.end()
-                && paid_in_cb(hit->second.scriptPayout.m_data)) {
+                && paid_in_cb(hit->second.first_payout_script())) {
                 const std::optional<bool> ha = attest(m_pending.ranked.front());
                 if (!ha.has_value() || *ha) {
                     mark_paid_entry(hit, height);
@@ -1303,8 +1305,12 @@ public:
         std::vector<unsigned char> projected_script_pre;
         if (projected) {
             auto ppit = m_entries.find(*projected);
+            // The script dashd's coinbase must carry for this payee — the
+            // operator's for a full (bps == 10000) operator split, the
+            // owner's otherwise (masternode/payments.cpp:65-79; see
+            // MNState::first_payout_script).
             if (ppit != m_entries.end())
-                projected_script_pre = ppit->second.scriptPayout.m_data;
+                projected_script_pre = ppit->second.first_payout_script();
         }
 
         // Past the guards, so this block WILL be applied: any pending
@@ -1661,16 +1667,32 @@ private:
     // coinbase (incident h=2516595 bad-cb-payee)
     // ─────────────────────────────────────────────────────────────────────
     //
-    // Precondition: pass 3 verified the coinbase pays `it`'s scriptPayout —
-    // the projection matched, so the coinbase's MN payment outputs describe
-    // THIS MN's current payout set as dashd computed it
-    // (masternode/payments.cpp GetBlockTxOuts: owner output, then — iff
-    // nOperatorReward != 0 and scriptOperatorPayout is set — an operator
-    // output of floor(mnShare * bps / 10000)).
+    // Precondition: pass 3 verified the coinbase pays `it`'s
+    // first_payout_script() — the projection matched, so the coinbase's MN
+    // payment outputs describe THIS MN's current payout set as dashd computed
+    // it. dashd masternode/payments.cpp:65-79 (GetBlockTxOuts), verbatim:
+    //
+    //     operatorReward = 0;
+    //     if (nOperatorReward != 0 && scriptOperatorPayout != CScript()) {
+    //         operatorReward    = (masternodeReward * nOperatorReward) / 10000;
+    //         masternodeReward -= operatorReward;
+    //     }
+    //     if (masternodeReward > 0) emplace_back(masternodeReward, scriptPayout);
+    //     if (operatorReward  > 0) emplace_back(operatorReward,  scriptOperatorPayout);
+    //
+    // so the MN payment is an output SET whose shape depends on bps:
+    //   no operator script / bps 0 : {owner: share}
+    //   0 < bps < 10000           : {owner: share - op, operator: op} with
+    //                               op = floor(share * bps / 10000), and
+    //                               {owner: share} alone when op floors to 0
+    //   bps == 10000              : {operator: share} — owner remainder is 0,
+    //                               so there is NO owner output at all
+    // (mainnet 2549648/49/50, 2550029, 2562669/70/71: four anchor rows with
+    // bps=10000, each paid as one output to the operator script).
     //
     // Superblock safety WITHOUT knowing the superblock cycle: the demotion
     // checks are pure presence/consistency scans over ALL coinbase outputs
-    // (extra treasury outputs cannot un-match a pair that is present), and
+    // (extra treasury outputs cannot un-match a set that is present), and
     // the adoption paths require an UNAMBIGUOUS output shape — exactly one
     // (single-owner proof) or exactly two (split derivation, floor-verified:
     // an unrelated output passes floor-consistency for a ceil-derived bps
@@ -1692,7 +1714,11 @@ private:
             if (sc == st.scriptPayout.m_data) owner_idx.push_back(i);
             else                              other_idx.push_back(i);
         }
-        if (owner_idx.empty()) return;   // unreachable: paid_in_cb passed
+        // owner_idx MAY be empty here: a bps == 10000 masternode whose
+        // operator script differs from its owner script is paid at the
+        // operator script only (no owner output — dashd :74 skips a zero
+        // remainder). The checks below scan for the expected output SET
+        // rather than assuming an owner output exists.
 
         const auto floor_split = [](int64_t total, uint16_t bps) -> int64_t {
             return (total * static_cast<int64_t>(bps)) / 10000;
@@ -1710,24 +1736,72 @@ private:
 
         if (st.payoutSplitProvenance == MNState::SPLIT_KNOWN) {
             if (expect_operator_out) {
-                // The exact (owner, operator) pair must be present and
-                // floor-consistent with OUR bps. Presence-scan is valid at
-                // any height class.
-                // NOTE the operator script MAY equal the owner script (an
-                // operator paid to the owner's address): scan ALL non-burn
-                // outputs as operator candidates, excluding only the output
-                // standing as owner in the current pairing.
+                // The output SET dashd's GetBlockTxOuts derives from OUR
+                // fields must be present. Presence/consistency scan only, so
+                // it is valid at any height class (superblock included).
                 bool consistent = false;
-                for (size_t oi : owner_idx) {
-                    for (size_t pj = 0; pj < outs.size() && !consistent; ++pj) {
-                        if (pj == oi) continue;
-                        if (outs[pj].scriptPubKey.m_data
-                            != st.scriptOperatorPayout.m_data) continue;
-                        const int64_t total = outs[oi].value + outs[pj].value;
-                        if (floor_split(total, st.nOperatorReward)
-                            == outs[pj].value) consistent = true;
+                if (st.nOperatorReward == 10000) {
+                    // Full operator share: operatorReward == masternodeReward,
+                    // the owner remainder is 0 and dashd (:74) emits NO owner
+                    // output — the ONE MN output is the operator's, for the
+                    // whole share. Every value v satisfies
+                    // floor(v * 10000 / 10000) == v, so presence of a
+                    // non-zero output at the operator script IS the whole
+                    // check. When the operator script equals the owner
+                    // script this is the same single output pass 3 matched;
+                    // demanding a second one is the 2026-10-28 false desync.
+                    for (const auto& o : outs) {
+                        if (o.value > 0
+                            && o.scriptPubKey.m_data
+                                   == st.scriptOperatorPayout.m_data) {
+                            consistent = true;
+                            break;
+                        }
                     }
-                    if (consistent) break;
+                } else {
+                    // 0 < bps < 10000: the exact (owner, operator) pair must
+                    // be present and floor-consistent with OUR bps.
+                    // NOTE the operator script MAY equal the owner script (an
+                    // operator paid to the owner's address): scan ALL non-burn
+                    // outputs as operator candidates, excluding only the
+                    // output standing as owner in the current pairing.
+                    for (size_t oi : owner_idx) {
+                        for (size_t pj = 0; pj < outs.size() && !consistent; ++pj) {
+                            if (pj == oi) continue;
+                            if (outs[pj].scriptPubKey.m_data
+                                != st.scriptOperatorPayout.m_data) continue;
+                            const int64_t total = outs[oi].value + outs[pj].value;
+                            if (floor_split(total, st.nOperatorReward)
+                                == outs[pj].value) consistent = true;
+                        }
+                        if (consistent) break;
+                    }
+                    // The floor-zero edge (dashd :68-70 comment, :77): when
+                    // floor(share * bps / 10000) == 0 dashd emits NO operator
+                    // output and the owner output carries the whole share.
+                    // Consistent iff an owner output v > 0 floors to a zero
+                    // operator amount at OUR bps AND no other output pays the
+                    // operator script (one that did would be an operator
+                    // payment this branch says cannot exist). Unreachable at
+                    // today's reward (share ~7.7e7 duffs, bps >= 1 → op >=
+                    // 7705); pinned so a falling subsidy cannot turn it into
+                    // a false desync.
+                    for (size_t oi : owner_idx) {
+                        if (consistent) break;
+                        const int64_t v = outs[oi].value;
+                        if (v <= 0 || floor_split(v, st.nOperatorReward) != 0)
+                            continue;
+                        bool op_out_elsewhere = false;
+                        for (size_t pj = 0; pj < outs.size(); ++pj) {
+                            if (pj == oi) continue;
+                            if (outs[pj].scriptPubKey.m_data
+                                == st.scriptOperatorPayout.m_data) {
+                                op_out_elsewhere = true;
+                                break;
+                            }
+                        }
+                        if (!op_out_elsewhere) consistent = true;
+                    }
                 }
                 if (!consistent) {
                     ++r.split_desync;
@@ -1766,6 +1840,17 @@ private:
         }
 
         // SPLIT_UNKNOWN → adoption from the chain's own attestation.
+        //
+        // NOT A RECOVERY PATH ON MAINNET. Both branches need the coinbase's
+        // non-burn outputs to be exactly the MN payment (one owner output, or
+        // owner + one other), but every mainnet coinbase also pays the miner:
+        // the single-owner branch never matches, and the two-output branch
+        // floor-tests (MN output, miner output) as if the miner output were an
+        // operator payment, which fails with probability ~1 - 1e-4 → stay
+        // UNKNOWN. A SPLIT_UNKNOWN entry therefore stays UNKNOWN until a
+        // fresh anchor/seed reloads it. Do NOT widen this to "make it work": an
+        // adoption off a miner output is a wrong split, i.e. bad-cb-payee on
+        // a won block.
         if (ambiguous_height) return;   // never adopt off a superblock coinbase
         if (owner_idx.size() == 1 && other_idx.empty()) {
             // Exactly one non-burn output and it is the owner: the operator
@@ -1908,7 +1993,7 @@ private:
                             " its script cannot be cross-checked";
                 break;
             }
-            if (paid_in_cb(nit->second.scriptPayout.m_data)) {
+            if (paid_in_cb(nit->second.first_payout_script())) {
                 w.accepted = ranked[i + 1];
                 w.refusal  = nullptr;
                 break;

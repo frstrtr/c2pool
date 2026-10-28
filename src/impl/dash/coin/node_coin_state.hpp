@@ -1474,6 +1474,15 @@ public:
                         // Occurrence-counted so a 50/50 split (owner amount
                         // == operator amount) needs TWO outputs, not one
                         // double-matched.
+                        //
+                        // dashd masternode/payments.cpp:74-79 emits each
+                        // output only when its amount is > 0. The operator
+                        // amount is > 0 here by construction, so it is always
+                        // required; the owner amount is 0 exactly when
+                        // bps == 10000 (the whole share goes to the operator)
+                        // and then dashd emits NO owner output — requiring one
+                        // rejected every correct full-operator template
+                        // (owner=0-MISSING, 2026-10-28).
                         const uint64_t own_amt =
                             static_cast<uint64_t>(mn_payment - op_due);
                         const uint64_t op_amt = static_cast<uint64_t>(op_due);
@@ -1484,7 +1493,9 @@ public:
                             if (p.amount == op_amt)  ++op_n;
                         }
                         const bool owner_ok =
-                            own_amt == op_amt ? own_n >= 2 : own_n >= 1;
+                            own_amt == 0
+                                ? true
+                                : (own_amt == op_amt ? own_n >= 2 : own_n >= 1);
                         const bool op_ok =
                             own_amt == op_amt ? op_n >= 2 : op_n >= 1;
                         if (!owner_ok || !op_ok)
