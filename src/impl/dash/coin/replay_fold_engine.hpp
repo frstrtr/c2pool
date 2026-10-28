@@ -217,6 +217,20 @@ struct ReplayMNState
 
     bool IsBanned() const { return nPoSeBanHeight != NEVER; }
 
+    /// The script a block paying this masternode is guaranteed to carry —
+    /// same rule as MNState::first_payout_script(). dashd
+    /// masternode/payments.cpp:65-79: nOperatorReward == 10000 with an
+    /// operator script set leaves the owner remainder at 0, so the ONLY MN
+    /// output goes to scriptOperatorPayout; otherwise the owner output
+    /// (scriptPayout) is always present.
+    const std::vector<unsigned char>& first_payout_script() const
+    {
+        return (nOperatorReward == 10000
+                && !scriptOperatorPayout.m_data.empty())
+            ? scriptOperatorPayout.m_data
+            : scriptPayout.m_data;
+    }
+
     void BanIfNotBanned(int32_t height)
     {
         if (!IsBanned()) nPoSeBanHeight = height;
@@ -757,7 +771,10 @@ public:
                 LOG_ERROR << "[DML-FOLD] " << r.error;
                 return r;
             }
-            payee_script_pre = pst->scriptPayout.m_data;
+            // The script dashd's coinbase must carry for this payee: the
+            // operator's for a full (bps == 10000) operator split, else the
+            // owner's (dashd masternode/payments.cpp:65-79).
+            payee_script_pre = pst->first_payout_script();
         }
 
         // task #154 delta driver: this block's SML mutations start empty.

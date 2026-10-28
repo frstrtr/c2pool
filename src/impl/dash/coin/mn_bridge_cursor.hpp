@@ -175,7 +175,19 @@ public:
     /// Bump on ANY change to the payload encoding or to MNState's pack
     /// methods. A stale-format record is discarded whole; it is never
     /// partially interpreted (the MnStateDb v1->v2 lesson).
-    static constexpr uint32_t kFormatVersion = 1;
+    ///
+    /// Also bump when the record's CONTENT was written by a detector this
+    /// build no longer trusts. v1 -> v2 (2026-10-28, mn-payout-split-
+    /// unprovable): every v1 writer ran the payout-split check that demanded
+    /// an (owner, operator) output PAIR from masternodes with
+    /// nOperatorReward == 10000, which dashd pays as ONE operator output
+    /// (masternode/payments.cpp:65-79). Those masternodes were persisted
+    /// with payoutSplitProvenance = SPLIT_UNKNOWN, and a resume carried the
+    /// false demotion forward forever (adoption cannot re-prove them on a
+    /// coinbase that also pays a miner). The encoding is unchanged; v1 is
+    /// refused so the bridge starts COLD from the compiled anchor and
+    /// re-folds with the corrected detector.
+    static constexpr uint32_t kFormatVersion = 2;
 
     explicit MnBridgeCursorStore(std::string path) : m_path(std::move(path)) {}
 
