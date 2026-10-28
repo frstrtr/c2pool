@@ -143,6 +143,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # coinbase producers, 4,000 payees on both chains) to at most 1,000,000
     # bytes (bad-blk-length); curtime and mintime above the median time past
     # (time-too-old). Same folding rule.
+    #
+    # ltc_template_time_test.cpp: the embedded LTC template's curtime and
+    # mintime are above the parent's median time past (time-too-old). Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -171,6 +175,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        ltc_template_time_test.cpp
         mempool_mweb_admission_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp

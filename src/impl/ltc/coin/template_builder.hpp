@@ -173,6 +173,23 @@ public:
     static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
     static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
 
+    /// litecoind's CBlockIndex::GetMedianTimePast (chain.h): the median of the
+    /// timestamps of `tip` and up to 10 of its ancestors.
+    static int64_t median_time_past(const HeaderChain& chain, const IndexEntry& tip)
+    {
+        std::vector<int64_t> times;
+        times.reserve(11);
+        std::optional<IndexEntry> cur = tip;
+        for (int i = 0; i < 11 && cur; ++i) {
+            times.push_back(static_cast<int64_t>(cur->header.m_timestamp));
+            if (cur->prev_hash.IsNull())
+                break;
+            cur = chain.get_header(cur->prev_hash);
+        }
+        std::sort(times.begin(), times.end());
+        return times[times.size() / 2];
+    }
+
     /// Build a WorkData template from the current chain tip + mempool.
     /// When mweb_tracker is provided and has state, the template includes
     /// a HogEx transaction (last tx) and MWEB block data.
@@ -210,7 +227,13 @@ public:
 
         const IndexEntry& tip       = *tip_opt;
         uint32_t          next_h    = tip.height + 1;
-        uint32_t          now_ts    = static_cast<uint32_t>(std::time(nullptr));
+        // litecoind refuses a block at or below its parent's median time past
+        // (time-too-old, validation.cpp:3653) and dates its own templates
+        // max(MTP + 1, now) (miner.cpp:31 UpdateTime): a local clock behind
+        // the network's MTP must not date ours too early.
+        const int64_t     mtp       = median_time_past(chain, tip);
+        uint32_t          now_ts    = static_cast<uint32_t>(
+            std::max<int64_t>(static_cast<int64_t>(std::time(nullptr)), mtp + 1));
 
         // ── Next difficulty ────────────────────────────────────────────────
         auto get_ancestor = [&](uint32_t h) -> std::optional<IndexEntry> {
@@ -381,7 +404,7 @@ public:
         data["sigoplimit"]        = 80000;
         data["sizelimit"]         = 4'000'000;
         data["weightlimit"]       = 4'000'000;
-        data["mintime"]           = static_cast<int64_t>(tip.header.m_timestamp + 1);
+        data["mintime"]           = static_cast<int64_t>(mtp + 1);
 
         // Post-build MWEB shape check: an MWEB-active template without a
         // trailing HogEx + mweb can only yield "mweb-missing" blocks.
