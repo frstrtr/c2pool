@@ -47,16 +47,22 @@
 
 #include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
+#include <impl/dash/coin/mn_checkpoint.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/embedded_oracle_shadow.hpp>
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
 using dash::coin::MNState;
@@ -531,6 +537,479 @@ TEST(DashOperatorSplit, Pass3DemotesContradictedSplit) {
               MNState::SPLIT_UNKNOWN)
         << "a contradicted split must fail closed (refused when scheduled) "
            "until re-proven";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// nOperatorReward == 10000 — the 2026-10-28 mn-payout-split-unprovable
+// incident. dashd masternode/payments.cpp:65-79 (v23.1.7):
+//
+//     operatorReward = 0;
+//     if (nOperatorReward != 0 && scriptOperatorPayout != CScript()) {
+//         operatorReward    = (masternodeReward * nOperatorReward) / 10000;
+//         masternodeReward -= operatorReward;
+//     }
+//     if (masternodeReward > 0) emplace_back(masternodeReward, scriptPayout);
+//     if (operatorReward  > 0) emplace_back(operatorReward,  scriptOperatorPayout);
+//
+// With bps == 10000 the owner remainder is exactly 0, so dashd pays ONE MN
+// output — to scriptOperatorPayout, for the whole share — and NO owner
+// output. The mainnet anchor (h=2549400) carries four such rows, all with the
+// operator script equal to the owner script; pass 3 demanded a second
+// (operator) output beside the owner one, demoted each of them to
+// SPLIT_UNKNOWN on its first payment after the anchor, and the serve gate
+// then refused every height one of them was scheduled for
+// (cause=mn-payout-split-unprovable, ~3 consecutive heights per pass).
+// ════════════════════════════════════════════════════════════════════════
+
+// Ground truth: mainnet block 2549648
+// (000000000000000f15fc1efb1f7b27980177c4d6eeaa324ca5429158b8429c93), coinbase
+// txid 7006d78d9d4467bb1b716f3e89ee490305c37908937616592eca36c785da2259,
+// outputs [miner, OP_RETURN credit-pool burn, MN] — the MN output pays
+// proTx 47676550eca46ed6… (bps=10000, operator script == owner script).
+static constexpr int64_t K_2549648_MINER = 41'095'669;
+static constexpr int64_t K_2549648_BURN  = 46'231'323;
+static constexpr int64_t K_2549648_MN    = 77'055'682;
+static const char* const K_2549648_COINBASE_HEX =
+    "03000500010000000000000000000000000000000000000000000000000000000000000000"
+    "ffffffff300390e7261a2f5669614254432f4d696e65642062792077753030303531372f10"
+    "a56265006f5fb17bb0f94066ce130000ffffffff03f5117302000000001976a914bc89d607"
+    "1dabc5b4494d303af761a052a5c70d5788ac1b6fc10200000000016ac2c697040000000019"
+    "76a914d16529b809097990baa10d3a0daa60efaede895f88ac00000000af030090e726007e"
+    "31bbcfafb05e582f121424b6677a9b89299c1d1d9522d772de816cd11e84844b9c21bf9b2c"
+    "56a5f367b3587259c91bb43018c5231312ad0d4b2ac397dcc67201874b48ffc429aab3bd53"
+    "05e9b218465359a5b0543a43797fe07b260815b6092ca282e5c6e7e3e0d1cc0fd5f0195220"
+    "7d02412f0f624f47c3fd5308a5388f0cec2eb93687197bded1c91385888660a2bc5217261d"
+    "b23e3cc46c7721a37bf54b10996a017295030000";
+static const char* const K_2549648_COINBASE_TXID =
+    "7006d78d9d4467bb1b716f3e89ee490305c37908937616592eca36c785da2259";
+static const char* const K_FULLOP_PROTX =
+    "47676550eca46ed65b0565da7239c3439b1d6900a0c4562effd551a094bbbe5f";
+static const char* const K_FULLOP_ADDR = "Xun2FGjJHPYBrcrG582D4yQq4ZW4Z42WVZ";
+
+static std::vector<unsigned char> hex_bytes(const std::string& h) {
+    std::vector<unsigned char> v;
+    v.reserve(h.size() / 2);
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        v.push_back(static_cast<unsigned char>(
+            std::stoul(h.substr(i, 2), nullptr, 16)));
+    return v;
+}
+
+// 76a914 d16529b8…895f 88ac — the single script of the full-operator MN paid
+// at 2549648 (owner and operator alike).
+static const std::vector<unsigned char> K_FULLOP_SCRIPT =
+    hex_bytes("76a914d16529b809097990baa10d3a0daa60efaede895f88ac");
+// 76a914 bc89d607…0d57 88ac — the 2549648 miner output.
+static const std::vector<unsigned char> K_MINER_SCRIPT =
+    hex_bytes("76a914bc89d6071dabc5b4494d303af761a052a5c70d5788ac");
+
+// A mainnet-shaped coinbase: the MN outputs PLUS the platform credit-pool
+// burn (OP_RETURN) and a miner output, rotated by `rot` so no check can lean
+// on output order (2549648 = [miner, OP_RETURN, MN];
+// 2562669 = [OP_RETURN, MN, miner]). coinbase_only_block() has no miner
+// output, which is what let the adoption KAT above pass while adoption is
+// dead on every real coinbase.
+static dash::coin::BlockType mainnet_shaped_block(
+    const std::vector<unsigned char>& miner_script, int64_t miner_value,
+    std::vector<std::pair<std::vector<unsigned char>, int64_t>> mn_outs,
+    size_t rot = 0) {
+    std::vector<std::pair<std::vector<unsigned char>, int64_t>> outs;
+    outs.emplace_back(miner_script, miner_value);
+    outs.emplace_back(std::vector<unsigned char>{0x6a}, K_2549648_BURN);
+    for (auto& o : mn_outs) outs.push_back(std::move(o));
+    std::rotate(outs.begin(),
+                outs.begin() + static_cast<std::ptrdiff_t>(rot % outs.size()),
+                outs.end());
+    return coinbase_only_block(std::move(outs));
+}
+
+// (a) THE INCIDENT: bps=10000, operator script == owner script. The block
+// pays that script ONCE, for the whole share. That is dashd's exact output
+// set — consistent, no demotion.
+TEST(DashOperatorSplit, Pass3FullOperatorSplitSameScriptSingleOutputIsConsistent) {
+    for (size_t rot = 0; rot < 3; ++rot) {
+        MnStateMachine m;
+        m.load(std::vector<std::pair<uint256, MNState>>{
+                   {raw256(0x01),
+                    split_mn(10000, K_FULLOP_SCRIPT, K_FULLOP_SCRIPT)}},
+               /*as_of_height=*/999);
+        auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                        {{K_FULLOP_SCRIPT, K_2549648_MN}}, rot);
+        auto r = m.apply_block(blk, 1000);
+        EXPECT_EQ(r.paid, 1u) << "rot=" << rot;
+        EXPECT_FALSE(r.payee_desync) << "rot=" << rot;
+        EXPECT_EQ(r.split_desync, 0u)
+            << "rot=" << rot << ": dashd pays a bps=10000 masternode ONE output"
+               " (payments.cpp:74 skips the zero owner remainder); demanding a"
+               " second one is the 2026-10-28 false demotion";
+        const auto& st = m.entries().at(raw256(0x01));
+        EXPECT_EQ(st.payoutSplitProvenance, MNState::SPLIT_KNOWN) << "rot=" << rot;
+        EXPECT_EQ(st.nLastPaidHeight, 1000u) << "rot=" << rot;
+        EXPECT_EQ(st.nOperatorReward, 10000);
+        EXPECT_EQ(st.scriptOperatorPayout.m_data, K_FULLOP_SCRIPT);
+    }
+}
+
+// (b) bps=10000 with a DISTINCT operator script: the coinbase pays ONLY the
+// operator script. That must be read as "the projected masternode was paid"
+// (not a payee desync), with a consistent split. And the converse — a block
+// paying only the OWNER script — is NOT what dashd pays for this state: the
+// cross-check is exact script equality, never "any script of this MN".
+TEST(DashOperatorSplit, Pass3FullOperatorSplitDistinctScriptPaysOperatorOnly) {
+    for (size_t rot = 0; rot < 3; ++rot) {
+        MnStateMachine m;
+        m.load(std::vector<std::pair<uint256, MNState>>{
+                   {raw256(0x01),
+                    split_mn(10000, K_OWNER_SCRIPT, K_OPER_SCRIPT)}},
+               /*as_of_height=*/999);
+        auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                        {{K_OPER_SCRIPT, K_2549648_MN}}, rot);
+        auto r = m.apply_block(blk, 1000);
+        EXPECT_FALSE(r.payee_desync)
+            << "rot=" << rot << ": the coinbase pays exactly the output dashd"
+               " derives for this masternode (operator script, whole share)";
+        EXPECT_EQ(r.paid, 1u) << "rot=" << rot;
+        EXPECT_EQ(r.split_desync, 0u) << "rot=" << rot;
+        const auto& st = m.entries().at(raw256(0x01));
+        EXPECT_EQ(st.payoutSplitProvenance, MNState::SPLIT_KNOWN) << "rot=" << rot;
+        EXPECT_EQ(st.nLastPaidHeight, 1000u) << "rot=" << rot;
+    }
+    // Converse: owner-only payment of a full-operator state is not dashd's
+    // output set → payee desync, nothing attributed.
+    MnStateMachine m;
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {raw256(0x01), split_mn(10000, K_OWNER_SCRIPT, K_OPER_SCRIPT)}},
+           /*as_of_height=*/999);
+    auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                    {{K_OWNER_SCRIPT, K_2549648_MN}});
+    auto r = m.apply_block(blk, 1000);
+    EXPECT_TRUE(r.payee_desync)
+        << "an owner-only coinbase cannot have been built by dashd from a"
+           " bps=10000 state with an operator script";
+    EXPECT_EQ(r.paid, 0u);
+}
+
+// (b') the SML ban-recovery walk accepts a runner-up by the SAME rule: a
+// full-operator runner-up is "paid" when the coinbase carries its operator
+// script (walk_to_paid_candidate).
+TEST(DashOperatorSplit, SmlBanRecoveryAcceptsFullOperatorRunnerUp) {
+    const std::vector<unsigned char> head_script =
+        hex_bytes("76a914000102030405060708090a0b0c0d0e0f1011121388ac");
+    MNState a = split_mn(0, head_script, {});
+    a.nLastPaidHeight = 2'300'001;                 // head of the queue
+    MNState b = split_mn(10000, K_OWNER_SCRIPT, K_OPER_SCRIPT);
+    b.nLastPaidHeight = 2'300'002;                 // runner-up
+    MnStateMachine m;
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {raw256(0x01), a}, {raw256(0x02), b}},
+           /*as_of_height=*/2'300'010);
+    const uint256 ha = raw256(0x01), hb = raw256(0x02);
+    m.set_sml_validity_fn([ha, hb](const uint256& h) -> std::optional<bool> {
+        if (h == ha) return false;     // head attested PoSe-banned
+        if (h == hb) return true;
+        return std::nullopt;
+    });
+    m.set_sml_recovery_cap(4);
+
+    auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                    {{K_OPER_SCRIPT, K_2549648_MN}});
+    auto r = m.apply_block(blk, 2'300'011);
+    ASSERT_TRUE(r.projected_payee.has_value());
+    EXPECT_EQ(*r.projected_payee, ha);
+    EXPECT_FALSE(r.payee_desync)
+        << "the runner-up's operator script IS the output dashd pays it";
+    EXPECT_EQ(r.paid, 1u);
+    EXPECT_EQ(r.sml_recovered, 1u);
+    EXPECT_EQ(m.entries().at(hb).nLastPaidHeight, 2'300'011u);
+    EXPECT_FALSE(m.entries().at(ha).isValid);
+}
+
+// (c) builder pin, same-script sibling of
+// BuilderFullOperatorSplitOmitsZeroOwnerOutput: exactly ONE MN packed
+// payment, to the shared script, for the whole share.
+TEST(DashOperatorSplit, BuilderFullOperatorSplitSameScriptSingleOutput) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+
+    auto mnstates =
+        machine_with(split_mn(10000, K_FULLOP_SCRIPT, K_FULLOP_SCRIPT));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+    const auto mn_outs = mn_payments(w);
+    ASSERT_EQ(mn_outs.size(), 1u)
+        << "dashd emits no zero-value owner output (payments.cpp:74)";
+    EXPECT_EQ(mn_outs[0].payee, K_FULLOP_ADDR);
+    EXPECT_EQ(mn_outs[0].amount, w.m_payment_amount);
+    ASSERT_GT(w.m_payment_amount, 0u);
+}
+
+// (c) the pre-emit structural re-derivation must ACCEPT the correct
+// full-operator template. Before the fix it demanded an owner output of
+// amount 0 (owner=0-MISSING) — the next starvation once (a) was fixed.
+TEST(DashOperatorSplit, EmitGateAcceptsFullOperatorSplitTemplate) {
+    struct Case { const char* name; std::vector<unsigned char> owner, oper; };
+    const std::vector<Case> cases = {
+        {"same-script", K_FULLOP_SCRIPT, K_FULLOP_SCRIPT},
+        {"distinct-script", K_OWNER_SCRIPT, K_OPER_SCRIPT},
+    };
+    for (const auto& c : cases) {
+        NodeCoinState st;
+        st.mnstates().load(std::vector<std::pair<uint256, MNState>>{
+                               {raw256(0x01), split_mn(10000, c.owner, c.oper)}},
+                           H - 1);
+        arm_emit_gate(st, raw256(0xAB));
+        st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+                   DASH_PUBKEY_VER, DASH_P2SH_VER);
+
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        auto w = build_embedded_workdata(
+            H - 1, raw256(0xAB), st.mnstates(), mp,
+            0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+        ASSERT_EQ(mn_payments(w).size(), 1u) << c.name;
+        // Commit the armed SML/quorum roots so the split re-derivation is the
+        // only thing this template could fail on.
+        w.m_coinbase_payload = dash::coin::encode_cbtx(
+            dash::coin::build_embedded_cbtx(H - 1, st.sml(), st.qmgr(), 0,
+                                            dash::coin::k_zero_cl_sig, 0,
+                                            nullptr));
+
+        dash::coin::DeclineReport why;
+        const bool ok = st.embedded_template_emit_ok(w, &why);
+        EXPECT_NE(why.cause, std::string("emit-mn-payout-split-drift"))
+            << c.name << ": value=" << why.value
+            << " — dashd emits no owner output when the owner remainder is 0";
+        EXPECT_NE(why.cause, std::string("emit-mn-payout-split-unprovable"))
+            << c.name;
+        EXPECT_TRUE(ok) << c.name << ": cause=" << why.cause
+                        << " value=" << why.value;
+    }
+
+    // The gate still bites on a full-operator template that LOST its
+    // operator output (the operator amount stays mandatory).
+    NodeCoinState st;
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{
+                           {raw256(0x01),
+                            split_mn(10000, K_OWNER_SCRIPT, K_OPER_SCRIPT)}},
+                       H - 1);
+    arm_emit_gate(st, raw256(0xAB));
+    st.set_tip(H - 1, raw256(0xAB), 0x1b104be3u, 1'700'000'000u,
+               DASH_PUBKEY_VER, DASH_P2SH_VER);
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), st.mnstates(), mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    std::vector<PackedPayment> burn_only;
+    for (const auto& p : w.m_packed_payments)
+        if (p.payee == "!6a") burn_only.push_back(p);
+    DashWorkData lost = w;
+    lost.m_packed_payments = burn_only;
+    dash::coin::DeclineReport why;
+    EXPECT_FALSE(st.embedded_template_emit_ok(lost, &why));
+    EXPECT_EQ(why.cause, std::string("emit-mn-payout-split-drift"));
+    EXPECT_NE(why.value.find("operator=" + std::to_string(w.m_payment_amount)
+                             + "-MISSING"),
+              std::string::npos)
+        << why.value;
+}
+
+// (d) the floor-zero edge: floor(share * bps / 10000) == 0 → dashd emits NO
+// operator output (payments.cpp:77) and the owner output carries the whole
+// share. Unreachable at today's reward; pinned so a falling subsidy cannot
+// turn it into a false demotion — and the pair check must not loosen.
+TEST(DashOperatorSplit, OperatorFloorZeroEdge) {
+    // Builder: a far-future height where the MN share itself is < 10000
+    // duffs, so bps=1 floors the operator amount to 0.
+    {
+        constexpr uint32_t kFarH = 28'000'000;
+        const int64_t reward   = compute_dash_block_reward_post_v20(kFarH);
+        const int64_t platform = compute_dash_platform_reward_post_v20_mn_rr(kFarH);
+        const int64_t share    = compute_dash_mn_payment_post_v20(reward) - platform;
+        ASSERT_GT(share, 0);
+        ASSERT_LT(share, 10'000) << "kFarH no longer reaches the floor-zero edge";
+        MNState s = split_mn(1, K_OWNER_SCRIPT, K_OPER_SCRIPT);
+        ASSERT_EQ(s.operator_payment_of(share), 0);
+
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        auto mnstates = machine_with(s);
+        auto w = build_embedded_workdata(
+            kFarH - 1, raw256(0xAB), mnstates, mp,
+            0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+        ASSERT_EQ(w.m_payment_amount, static_cast<uint64_t>(share));
+        const auto mn_outs = mn_payments(w);
+        ASSERT_EQ(mn_outs.size(), 1u)
+            << "an operator amount that floors to 0 emits no operator output";
+        EXPECT_EQ(mn_outs[0].payee, "XoDo3w4ZUqn93uL3FeRNb9fgfXvgg7BvDC");
+        EXPECT_EQ(mn_outs[0].amount, static_cast<uint64_t>(share));
+    }
+    // Detector: KNOWN bps=1, coinbase pays the owner 9'999 duffs only —
+    // dashd's exact set for that share. Distinct and shared scripts alike.
+    struct Case { const char* name; std::vector<unsigned char> owner, oper; };
+    const std::vector<Case> cases = {
+        {"distinct-script", K_OWNER_SCRIPT, K_OPER_SCRIPT},
+        {"same-script", K_OWNER_SCRIPT, K_OWNER_SCRIPT},
+    };
+    for (const auto& c : cases) {
+        MnStateMachine m;
+        m.load(std::vector<std::pair<uint256, MNState>>{
+                   {raw256(0x01), split_mn(1, c.owner, c.oper)}},
+               /*as_of_height=*/999);
+        auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                        {{c.owner, 9'999}}, 1);
+        auto r = m.apply_block(blk, 1000);
+        EXPECT_EQ(r.paid, 1u) << c.name;
+        EXPECT_EQ(r.split_desync, 0u)
+            << c.name << ": floor(9999 * 1 / 10000) == 0 — dashd pays no"
+               " operator output, so its absence is not a desync";
+        EXPECT_EQ(m.entries().at(raw256(0x01)).payoutSplitProvenance,
+                  MNState::SPLIT_KNOWN) << c.name;
+    }
+    // ...and NOT loosened: one duff more (10'000 → operator amount 1 due) with
+    // no operator output is still a contradicted split.
+    MnStateMachine m;
+    m.load(std::vector<std::pair<uint256, MNState>>{
+               {raw256(0x01), split_mn(1, K_OWNER_SCRIPT, K_OPER_SCRIPT)}},
+           /*as_of_height=*/999);
+    auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                    {{K_OWNER_SCRIPT, 10'000}}, 1);
+    auto r = m.apply_block(blk, 1000);
+    EXPECT_EQ(r.paid, 1u);
+    EXPECT_EQ(r.split_desync, 1u)
+        << "floor(10000 * 1 / 10000) == 1: an operator output was due";
+    EXPECT_EQ(m.entries().at(raw256(0x01)).payoutSplitProvenance,
+              MNState::SPLIT_UNKNOWN);
+}
+
+// (e) REAL BYTES: the dashd-accepted coinbase of mainnet block 2549648,
+// against the SHIPPED anchor's own row for the masternode it paid.
+namespace {
+const char* const kShippedMainnetAnchorForSplit =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc>
+    ;
+}  // namespace
+
+TEST(DashOperatorSplit, RealBytesH2549648Coinbase) {
+    // The coinbase, byte-exact, round-trips to its on-chain txid.
+    MutableTransaction cb;
+    {
+        auto raw = hex_bytes(K_2549648_COINBASE_HEX);
+        ::PackStream ps(raw);
+        ps >> cb;
+    }
+    ASSERT_EQ(dash::coin::dash_txid(cb), uint256S(K_2549648_COINBASE_TXID));
+    ASSERT_EQ(cb.type, 5);
+    ASSERT_EQ(cb.vout.size(), 3u);
+    EXPECT_EQ(cb.vout[0].value, K_2549648_MINER);
+    EXPECT_EQ(cb.vout[1].value, K_2549648_BURN);
+    EXPECT_EQ(cb.vout[2].value, K_2549648_MN);
+    EXPECT_EQ(cb.vout[2].scriptPubKey.m_data, K_FULLOP_SCRIPT);
+
+    // The shipped anchor's row for the masternode this block paid.
+    auto cp = dash::coin::parse_mn_checkpoint(kShippedMainnetAnchorForSplit,
+                                              "mainnet");
+    ASSERT_TRUE(cp.ok) << cp.error;
+    const uint256 protx = uint256S(K_FULLOP_PROTX);
+    std::optional<MNState> row;
+    size_t full_operator_rows = 0;
+    for (const auto& [h, st] : cp.entries) {
+        if (h == protx) row = st;
+        if (st.nOperatorReward == 10000) ++full_operator_rows;
+    }
+    ASSERT_TRUE(row.has_value()) << "anchor h=" << cp.height
+                                 << " no longer carries " << K_FULLOP_PROTX;
+    ASSERT_EQ(row->nOperatorReward, 10000);
+    ASSERT_EQ(row->scriptPayout.m_data, K_FULLOP_SCRIPT);
+    ASSERT_EQ(row->scriptOperatorPayout.m_data, K_FULLOP_SCRIPT);
+    ASSERT_EQ(row->payoutSplitProvenance, MNState::SPLIT_KNOWN);
+    ASSERT_TRUE(row->isValid);
+    EXPECT_GE(full_operator_rows, 1u);
+
+    // dashd's arithmetic on the real share: the operator takes all of it.
+    EXPECT_EQ(row->operator_payment_of(K_2549648_MN), K_2549648_MN);
+    EXPECT_EQ(K_2549648_MN - row->operator_payment_of(K_2549648_MN), 0);
+
+    // Pass 3 on the real coinbase: paid, consistent, still KNOWN.
+    dash::coin::BlockType blk;
+    blk.m_txs.push_back(cb);
+    MnStateMachine m;
+    m.load(std::vector<std::pair<uint256, MNState>>{{protx, *row}},
+           /*as_of_height=*/2'549'647);
+    auto r = m.apply_block(blk, 2'549'648);
+    ASSERT_TRUE(r.projected_payee.has_value());
+    EXPECT_EQ(*r.projected_payee, protx);
+    EXPECT_FALSE(r.payee_desync);
+    EXPECT_EQ(r.paid, 1u);
+    EXPECT_EQ(r.split_desync, 0u)
+        << "the real 2549648 coinbase is dashd's exact output set for this"
+           " masternode; demoting it is the 2026-10-28 incident";
+    EXPECT_EQ(m.entries().at(protx).payoutSplitProvenance, MNState::SPLIT_KNOWN);
+    EXPECT_EQ(m.entries().at(protx).nLastPaidHeight, 2'549'648u);
+
+    // The builder, from the same row, emits the same single output.
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    MnStateMachine bm;
+    bm.load(std::vector<std::pair<uint256, MNState>>{{protx, *row}},
+            2'549'647);
+    auto w = build_embedded_workdata(
+        2'549'647, raw256(0xAB), bm, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const auto mn_outs = mn_payments(w);
+    ASSERT_EQ(mn_outs.size(), 1u);
+    EXPECT_EQ(mn_outs[0].payee, K_FULLOP_ADDR);
+    EXPECT_EQ(mn_outs[0].amount, w.m_payment_amount);
+}
+
+// (g) pins. Adoption is NOT a recovery path on mainnet: every real coinbase
+// pays a miner too, so an UNKNOWN entry is never re-proven by it.
+TEST(DashOperatorSplit, Pass3MainnetShapedCoinbaseNeverAdopts) {
+    for (size_t rot = 0; rot < 3; ++rot) {
+        MnStateMachine m;
+        m.load(std::vector<std::pair<uint256, MNState>>{
+                   {raw256(0x01),
+                    split_mn(10000, K_FULLOP_SCRIPT, K_FULLOP_SCRIPT,
+                             MNState::SPLIT_UNKNOWN)}},
+               /*as_of_height=*/999);
+        auto blk = mainnet_shaped_block(K_MINER_SCRIPT, K_2549648_MINER,
+                                        {{K_FULLOP_SCRIPT, K_2549648_MN}}, rot);
+        auto r = m.apply_block(blk, 1000);
+        EXPECT_EQ(r.paid, 1u) << "rot=" << rot;
+        EXPECT_EQ(r.split_adopted, 0u) << "rot=" << rot;
+        const auto& st = m.entries().at(raw256(0x01));
+        EXPECT_EQ(st.payoutSplitProvenance, MNState::SPLIT_UNKNOWN) << "rot=" << rot;
+        EXPECT_EQ(st.nOperatorReward, 10000) << "rot=" << rot;
+        EXPECT_EQ(st.scriptOperatorPayout.m_data, K_FULLOP_SCRIPT) << "rot=" << rot;
+    }
+}
+
+// (g) dashd emits TWO outputs with the same script for a partial split whose
+// operator script equals the owner script — nothing downstream may coalesce
+// them.
+TEST(DashOperatorSplit, BuilderSameScriptPartialSplitEmitsTwoOutputs) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto mnstates = machine_with(split_mn(K_BPS, K_FULLOP_SCRIPT, K_FULLOP_SCRIPT));
+    auto w = build_embedded_workdata(
+        H - 1, raw256(0xAB), mnstates, mp,
+        0x1b104be3u, 1'700'000'000u, DASH_PUBKEY_VER, DASH_P2SH_VER);
+    const int64_t mn_payment = static_cast<int64_t>(w.m_payment_amount);
+    const int64_t op_due = (mn_payment * K_BPS) / 10000;
+    const auto mn_outs = mn_payments(w);
+    ASSERT_EQ(mn_outs.size(), 2u);
+    EXPECT_EQ(mn_outs[0].payee, K_FULLOP_ADDR);
+    EXPECT_EQ(mn_outs[1].payee, K_FULLOP_ADDR);
+    EXPECT_EQ(mn_outs[0].amount, static_cast<uint64_t>(mn_payment - op_due));
+    EXPECT_EQ(mn_outs[1].amount, static_cast<uint64_t>(op_due));
 }
 
 // ════════════════════════════════════════════════════════════════════════

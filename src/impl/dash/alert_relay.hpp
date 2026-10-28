@@ -81,7 +81,21 @@ constexpr std::size_t kMaxWorker       = 64;
 constexpr std::size_t kMaxDetail       = 128;
 constexpr unsigned char kSealVersion   = 0x01;
 
-enum class Kind : uint8_t { Offline = 1, BackOnline = 2, Digest = 3, Test = 4 };
+// Worker-level kinds (1, 2) name a worker; the others are node-level and carry
+// an empty worker. WorkStalled / WorkResumed (5, 6): the node handed no work to
+// its hashing miners for the threshold, and later did again (AlertDetector).
+//
+// COMPATIBILITY of kinds 5 and 6. The kind travels inside the SEALED body, so
+// an older forwarder carries the frame unchanged (it never opens a body), and
+// nothing outside the body changed: the frame shape, the version and the
+// signature are those of kinds 1-4. An older RELAY (decode accepting 1..4)
+// refuses the body with a signed refused_invalid ack: a final status the
+// origin records in its ledger and warns about, never a disconnect or a ban.
+// The page is then lost, so upgrade the relay with the origin.
+enum class Kind : uint8_t {
+    Offline = 1, BackOnline = 2, Digest = 3, Test = 4, WorkStalled = 5, WorkResumed = 6,
+};
+constexpr uint8_t kMaxKind = 6;   // highest kind this build decodes
 
 inline const char* kind_name(uint8_t k)
 {
@@ -90,8 +104,16 @@ inline const char* kind_name(uint8_t k)
     case 2: return "back_online";
     case 3: return "digest";
     case 4: return "test";
+    case 5: return "work_stalled";
+    case 6: return "work_resumed";
     }
     return "unknown";
+}
+
+// A node-level "no work served" kind (5 or 6).
+inline bool is_work_kind(uint8_t k)
+{
+    return k == static_cast<uint8_t>(Kind::WorkStalled) || k == static_cast<uint8_t>(Kind::WorkResumed);
 }
 
 enum class AckStatus : uint8_t {
@@ -478,7 +500,7 @@ inline std::optional<AlertBody> decode_body(const Bytes& in)
     AlertBody b;
     std::size_t p = 0;
     b.kind = in[p++];
-    if (b.kind < 1 || b.kind > 4) return std::nullopt;
+    if (b.kind < 1 || b.kind > kMaxKind) return std::nullopt;
     b.event_ts = 0;
     for (int i = 0; i < 4; ++i) b.event_ts |= static_cast<uint32_t>(in[p++]) << (8 * i);
     auto get = [&](std::string& s, std::size_t cap) -> bool {

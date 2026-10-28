@@ -23,9 +23,11 @@
 #include <core/uint256.hpp>
 #include <memory>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -246,6 +248,93 @@ struct CoinbaseResult {
     WorkSnapshot snapshot;
 };
 
+/// Rolling record of one stratum connection's submit outcomes, for the
+/// per-miner DOA display. WorkerInfo::stale is cumulative since connect, so a
+/// burst of results a rig flushes right after a node restart (jobs the
+/// previous process issued) kept the miner page reading a high DOA long after
+/// the burst was over. This keeps the last kWindowSeconds in one-minute
+/// buckets, and counts submits for a job id the connection never issued
+/// (unknown job) apart from genuine stale ones (a job it issued that has
+/// since expired).
+///
+/// The stratum session records into it on its io thread; the worker registry
+/// holds the same object through WorkerInfo::submit_window and the web API
+/// reads it, so every work source carries it without coin-specific code.
+/// Accounting only: nothing here decides whether a submit is accepted.
+class SubmitOutcomeWindow {
+public:
+    enum class Outcome { Accepted, Stale, UnknownJob };
+
+    static constexpr int64_t kBucketSeconds = 60;
+    static constexpr int64_t kBuckets       = 10;
+    static constexpr int64_t kWindowSeconds = kBucketSeconds * kBuckets;
+
+    struct Counts {
+        uint64_t accepted{0};
+        uint64_t stale{0};        // a job this connection issued, since expired
+        uint64_t unknown_job{0};  // a job id this connection never issued
+    };
+
+    void record(Outcome o,
+                std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now())
+    {
+        const int64_t slot = slot_of(now);
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (o == Outcome::UnknownJob)
+            ++unknown_job_total_;
+        Bucket& b = buckets_[static_cast<size_t>(((slot % kBuckets) + kBuckets) % kBuckets)];
+        if (b.used && b.slot > slot)
+            return;  // older than what this bucket now holds: already out of the window
+        if (!b.used || b.slot != slot)
+            b = Bucket{slot, true, {}};
+        switch (o) {
+        case Outcome::Accepted:   ++b.counts.accepted;    break;
+        case Outcome::Stale:      ++b.counts.stale;       break;
+        case Outcome::UnknownJob: ++b.counts.unknown_job; break;
+        }
+    }
+
+    /// Outcomes in the current minute and the kBuckets-1 minutes before it.
+    Counts window(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const
+    {
+        const int64_t slot = slot_of(now);
+        std::lock_guard<std::mutex> lk(mutex_);
+        Counts c;
+        for (const auto& b : buckets_) {
+            if (!b.used || b.slot > slot || slot - b.slot >= kBuckets)
+                continue;
+            c.accepted    += b.counts.accepted;
+            c.stale       += b.counts.stale;
+            c.unknown_job += b.counts.unknown_job;
+        }
+        return c;
+    }
+
+    /// Unknown-job submits since connect (a subset of WorkerInfo::stale).
+    uint64_t unknown_job_total() const
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return unknown_job_total_;
+    }
+
+private:
+    static int64_t slot_of(std::chrono::steady_clock::time_point t)
+    {
+        const int64_t s = std::chrono::duration_cast<std::chrono::seconds>(
+            t.time_since_epoch()).count();
+        return s >= 0 ? s / kBucketSeconds : -((kBucketSeconds - 1 - s) / kBucketSeconds);
+    }
+
+    struct Bucket {
+        int64_t slot{0};
+        bool    used{false};
+        Counts  counts;
+    };
+    mutable std::mutex mutex_;
+    std::array<Bucket, kBuckets> buckets_{};
+    uint64_t unknown_job_total_{0};
+};
+
 /// Per-connection metadata maintained by the work source for dashboard
 /// + stats display. Updated by the stratum session as shares accumulate.
 struct WorkerInfo {
@@ -263,6 +352,10 @@ struct WorkerInfo {
     // When `accepted` last moved; default = no accepted share on this
     // connection (or a registry that does not stamp it).
     std::chrono::steady_clock::time_point last_accepted_at;
+    // Rolling accepted / stale / unknown-job outcomes, shared with the stratum
+    // session that records them (set at authorize). Null when the entry did
+    // not come from a core stratum session.
+    std::shared_ptr<SubmitOutcomeWindow> submit_window;
 };
 
 }  // namespace core::stratum

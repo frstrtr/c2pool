@@ -1318,6 +1318,12 @@
         
         @media (max-width: 900px) {
             .two-col { grid-template-columns: 1fr; }
+            /* Stacked panels have no neighbour column to align with, so the
+               fixed 660px height only leaves empty space under short tables.
+               Fit each panel to its rows and cap the scroll area so a long
+               table still scrolls in place (p2pool-dash adjustTableHeight). */
+            .table-panel { height: auto; }
+            .table-panel .table-scroll { flex: 0 1 auto; max-height: 400px; }
         }
         
         /* New Main Layout: 4 columns with graph spanning 2x3 */
@@ -1555,6 +1561,31 @@
             width: 12px;
             height: 12px;
             border-radius: 3px;
+        }
+
+        /* Key-only legend entry (not a series toggle): explains a marker. */
+        .legend-item.legend-key {
+            cursor: default;
+        }
+
+        .legend-item.legend-key:hover {
+            opacity: 1;
+        }
+
+        /* The orphaned-block marker: grey triangle-down, red outline. */
+        .legend-color.legend-orphan {
+            background: #ef4444;
+            border-radius: 0;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
+            position: relative;
+        }
+
+        .legend-color.legend-orphan::after {
+            content: "";
+            position: absolute;
+            inset: 2px 3px 4px 3px;
+            background: #6b7280;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
         }
         
         .graph-line-doa {
@@ -1953,6 +1984,7 @@
                         <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate"><span class="legend-color" style="background: #008de4;"></span><span>Good</span></div>
                         <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate"><span class="legend-color" style="background: #ff6b6b;"></span><span>DOA</span></div>
                         <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers"><span class="legend-color" style="background: #00ff88;"></span><span>Blocks</span></div>
+                        <div class="legend-item legend-key" title="Orphaned block: another block won its height"><span class="legend-color legend-orphan"></span><span>Orphaned</span></div>
                         <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections"><span class="legend-color" style="background: #9c27b0;"></span><span>Workers</span></div>
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
@@ -1989,6 +2021,7 @@
                     <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #008de4; width: 14px; height: 14px;"></span><span>Good</span></div>
                     <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff6b6b; width: 14px; height: 14px;"></span><span>DOA</span></div>
                     <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00ff88; width: 14px; height: 14px;"></span><span>Blocks</span></div>
+                    <div class="legend-item legend-key" title="Orphaned block: another block won its height" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color legend-orphan" style="width: 14px; height: 14px;"></span><span>Orphaned</span></div>
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
@@ -2338,7 +2371,7 @@
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Blocks Found</span>
+                            <span class="label" id="defrag-blocks-label" title="Shares in this window that solved a block">Blocks in Window</span>
                             <span class="value" id="defrag-blocks" style="color:#ffd700">-</span>
                         </div>
                     </div>
@@ -2378,15 +2411,15 @@
                             <span>Node fee share</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1a1400;border:2px solid #ffd700;box-shadow:0 0 5px rgba(255,215,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffd700"></div></div>
                             <span style="color:#0070dd;font-weight:600"><span class="symbol-small">COIN</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
+                            <div class="legend-swatch" style="background:#001a1d;border:2px solid #00e5ff;box-shadow:0 0 5px rgba(0,229,255,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#00e5ff"></div></div>
                             <span style="color:#a335ee;font-weight:600"><span class="merged-child-symbol-hint">DOGE</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1d0e00;border:2px solid #ffaa00;box-shadow:0 0 5px rgba(255,170,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffaa00"></div></div>
                             <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
                         <div class="legend-item">
@@ -2485,6 +2518,42 @@
             return s;
         }
 
+        // Chart marker + tooltip lines for a /recent_blocks row by its on-chain
+        // status. An orphaned block (another block won its height) must not be
+        // drawn as a green "Block Found!" diamond: it gets its own marker and
+        // headline, and its status is shown in red rather than the pending
+        // amber. A stale block (submitted on a stale parent) gets a neutral
+        // grey one. The chart legend's "Orphaned" swatch names the orphan
+        // marker. Display only.
+        function block_is_orphaned(b) {
+            return !!b && b.status === 'orphaned';
+        }
+        function block_is_stale(b) {
+            return !!b && b.status === 'stale';
+        }
+        function block_marker_style(b, luckColor) {
+            if (block_is_orphaned(b))
+                return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
+            if (block_is_stale(b))
+                return { fillColor: '#4b5563', lineColor: '#9ca3af', symbol: 'square' };
+            return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
+        }
+        function block_headline_html(b) {
+            if (block_is_orphaned(b))
+                return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
+            if (block_is_stale(b))
+                return '<span style="color:#9ca3af">■</span> <b>Stale Block</b><br/>';
+            return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+        }
+        function block_status_html(b) {
+            var st = (b && b.status) || 'unknown';
+            var color = st === 'confirmed' ? '#00ff88'
+                      : st === 'orphaned'  ? '#ff6b6b'
+                      : st === 'stale'     ? '#9ca3af'
+                      : '#ffc107';
+            return 'Status: <b style="color:' + color + '">' + st + '</b>';
+        }
+
         // Format percentage with big integer + small decimal parts
         // Format percentage with big bold integer + smaller decimal
         function format_pct_fancy(pct) {
@@ -2566,6 +2635,13 @@
                 label.style.left = leftInTrack + 'px';
             }
         }
+
+        // Each Active Miners render waits on three fetches before it draws, and
+        // a refresh, the "Show historical" toggle or a manual reload can start
+        // another while one is in flight. Only the newest render may draw:
+        // two overlapping renders both appended the table, so the same address
+        // showed up twice (one copy's toggle then hid the other's workers).
+        var _minersRenderGen = 0;
 
         function populateActiveMiners(local_stats, global_stats) {
             d3.select('#active_miners_loading').style('display', 'none');
@@ -2705,6 +2781,9 @@
                         connections: workerData.connections || 0,
                         last_seen: workerData.last_seen || 0,
                         state: state,
+                        // Standby whose payout address hashes through another node
+                        // (failback included); sharechain evidence, per address.
+                        elsewhere: workerData.hashing_elsewhere === true,
                         last_share_age_s: lastShareAge
                     });
                     if (state && minerGroups[baseAddress].stateCounts[state] !== undefined) {
@@ -2768,8 +2847,10 @@
                     return Math.floor(sec / 86400) + 'd ago';
                 }
                 var STANDBY_TITLE = 'Standby: authorized and receiving work, but no share submitted on this connection. Usually a failover connection of a rig that mines on another node; a rig that never submits anywhere looks the same here.';
+                var ELSEWHERE_TITLE = 'Hashing on another node: no share on this connection now, but this payout address keeps getting sharechain shares minted by another node (within 15 min). Usually a rig that failed over here and back. The evidence is per address, not per rig.';
                 
                 function renderMinersTable(showHistorical) {
+                    var renderGen = ++_minersRenderGen;
                     var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
                 
                     // Update count badge: active count (/ total if showing historical)
@@ -2794,6 +2875,10 @@
                 d3.json('../current_payouts', function(payouts_data) {
                 d3.json('../current_merged_payouts', function(merged_payouts_data) {
                 d3.json('../web/graph_data/miner_hash_rates/last_day', function(hr_day) {
+                // A newer render started while these fetches were in flight; it
+                // owns the table, so this one draws nothing.
+                if (renderGen !== _minersRenderGen) return;
+                d3.select('#active_miners tbody').selectAll('tr').remove();
                 // #1142 item 6: per-worker 24h average, same derivation as the
                 // miners.html card aggregate. A worker is averaged only over the
                 // samples it appears in; no samples means no average (shown '-').
@@ -3014,6 +3099,7 @@
                             .attr('class', rowClass)
                             .attr(attrName, attrVal);
                         var isStandby = worker.state === 'standby';
+                        var standbyTitle = worker.elsewhere ? ELSEWHERE_TITLE : STANDBY_TITLE;
 
                         var shortName = worker.name.indexOf('.') >= 0 ? worker.name.substring(worker.name.lastIndexOf('.') + 1) : worker.name;
                         var nameCell = workerRow.append('td').attr('title', worker.name);
@@ -3021,7 +3107,7 @@
                         if (worker.state) {
                             nameCell.append('span')
                                 .attr('class', 'state-dot ' + worker.state)
-                                .attr('title', isStandby ? STANDBY_TITLE
+                                .attr('title', isStandby ? standbyTitle
                                     : worker.state === 'stalled' ? 'Stalled: shared on this connection, then stopped. Check the rig.'
                                     : 'Hashing on this node');
                         }
@@ -3030,7 +3116,7 @@
                         // Worker hashrate with estimated indicator
                         var workerHashrateCell = workerRow.append('td');
                         if (isStandby) {
-                            workerHashrateCell.attr('title', STANDBY_TITLE).text('\u2014');
+                            workerHashrateCell.attr('title', standbyTitle).text('\u2014');
                         } else if (worker.hashrate > 0) {
                             var workerHashrateText = format_hashrate(worker.hashrate);
                             if (worker.isEstimated) {
@@ -3085,10 +3171,11 @@
 
                     if (standbyWorkers.length > 0) {
                         var standbyId = minerId + '_standby';
+                        var nElsewhere = standbyWorkers.filter(function(w) { return w.elsewhere; }).length;
                         var summary = tbody.append('tr')
                             .attr('class', 'worker-row standby-summary' + (startExpanded ? '' : ' hidden'))
                             .attr('data-parent', minerId)
-                            .attr('title', STANDBY_TITLE)
+                            .attr('title', nElsewhere === standbyWorkers.length ? ELSEWHERE_TITLE : STANDBY_TITLE)
                             .on('click', function() {
                                 var rows = d3.selectAll('tr[data-standby-of="' + standbyId + '"]');
                                 var open = !rows.empty() && !rows.classed('hidden');
@@ -3098,8 +3185,10 @@
                         var sumCell = summary.append('td').attr('colspan', '10');
                         sumCell.append('span').attr('class', 'state-dot standby');
                         sumCell.append('span').text(standbyWorkers.length + ' standby connection' +
-                            (standbyWorkers.length === 1 ? '' : 's') +
-                            ' \u2014 no share submitted here (usually a failover pool) ');
+                            (standbyWorkers.length === 1 ? '' : 's') + ' \u2014 ' +
+                            (nElsewhere === standbyWorkers.length ? 'hashing on another node '
+                                : nElsewhere > 0 ? nElsewhere + ' hashing on another node, the rest never submitted here '
+                                : 'no share submitted here (usually a failover pool) '));
                         sumCell.append('span').attr('class', 'standby-toggle').text('\u25b8');
                         standbyWorkers.forEach(function(worker) {
                             renderWorkerRow(worker, 'worker-row row-standby hidden', 'data-standby-of', standbyId);
@@ -3111,8 +3200,10 @@
                 });
                 } // end renderMinersTable
                 
-                // Initial render — show only currently connected (active) miners
-                renderMinersTable(false);
+                // Initial render follows the "Show historical" box, so a refresh
+                // does not drop historical rows while the box stays ticked.
+                var historicalBox = document.getElementById('show_historical_miners');
+                renderMinersTable(!!(historicalBox && historicalBox.checked));
                 
                 // Wire checkbox to toggle historical miners visibility
                 d3.select('#show_historical_miners').on('change', function() {
@@ -3659,10 +3750,16 @@
                     _chips.append('span').attr('class', 'state-chip')
                         .attr('title', 'Sessions with an accepted share on this node within the silence threshold')
                         .html('<span class="state-dot hashing"></span><b>' + _ss.hashing + '</b> hashing');
+                    // Of the standby sessions, those whose payout address hashes
+                    // through another node (a rig that failed over here and back).
+                    var _elsewhere = typeof _ss.standby_elsewhere === 'number' ? _ss.standby_elsewhere : 0;
                     if (_ss.standby > 0)
                         _chips.append('span').attr('class', 'state-chip')
-                            .attr('title', 'Failover connections: authorized, receiving work, never submitted here. The rigs mine on another node; normal.')
-                            .html('<span class="state-dot standby"></span><b>' + _ss.standby + '</b> standby');
+                            .attr('title', 'Failover connections: authorized, receiving work, no share here now. The rigs mine on another node; normal.' +
+                                (_elsewhere > 0 ? ' "Hashing elsewhere": the payout address has sharechain shares minted by another node within 15 min (per address, not per rig).' : ''))
+                            .html('<span class="state-dot standby"></span><b>' + _ss.standby + '</b> standby' +
+                                (_elsewhere === 0 ? '' : _elsewhere === _ss.standby ? ' (hashing elsewhere)'
+                                    : ' (' + _elsewhere + ' hashing elsewhere)'));
                     if (_ss.stalled > 0)
                         _chips.append('span').attr('class', 'state-chip stalled-hot')
                             .attr('title', 'Shared on this node, then stopped past the threshold. Check these rigs.')
@@ -3671,7 +3768,9 @@
                     var _stateNote = d3.select('#stratum_state_note');
                     if (_ss.hashing === 0 && _ss.stalled === 0 && _ss.standby > 0) {
                         _stateNote.text('All ' + _ss.standby + ' Stratum session' + (_ss.standby === 1 ? ' is' : 's are') +
-                            ' standby (no share submitted here): this node is usually a failover pool for these rigs.');
+                            (_elsewhere === _ss.standby
+                                ? ' standby: their payout address is hashing on another node, and this node is their failover pool.'
+                                : ' standby (no share submitted here): this node is usually a failover pool for these rigs.'));
                         _stateNote.style('display', null);
                     } else {
                         _stateNote.style('display', 'none');
@@ -5592,6 +5691,41 @@
         // =============================================
         // Sharechain Defragmenter Viewer
         // =============================================
+
+        // A share that solved a block is drawn as a DARK cell with a bright
+        // glowing ring and a centre pip, so it differs from every share colour
+        // in fill and shape, not by hue alone. The old thin gold outline on a
+        // bright green cell was nearly invisible, and a plain gold fill would
+        // read as an orphan (amber). kind: 'primary' | 'child' | 'twin'.
+        var BLOCK_MARK = {
+            primary: { ring: '#ffd700', core: '#1a1400' },
+            child:   { ring: '#00e5ff', core: '#001a1d' },
+            twin:    { ring: '#ffaa00', core: '#1d0e00' }
+        };
+        function blockMarkKind(isPrimary, isChild) {
+            if (isPrimary && isChild) return 'twin';
+            if (isPrimary) return 'primary';
+            if (isChild) return 'child';
+            return null;
+        }
+        function drawBlockMark(ctx, x, y, size, kind) {
+            var m = BLOCK_MARK[kind];
+            var lw = size < 8 ? 1 : Math.max(2, Math.round(size * 0.18));
+            var pip = Math.max(1, Math.round(size * 0.3));
+            ctx.save();
+            ctx.fillStyle = m.core;
+            ctx.fillRect(x, y, size, size);
+            ctx.shadowColor = m.ring;
+            ctx.shadowBlur = Math.max(3, size * 0.5);
+            ctx.strokeStyle = m.ring;
+            ctx.lineWidth = lw;
+            ctx.strokeRect(x + lw / 2, y + lw / 2, size - lw, size - lw);
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = m.ring;
+            ctx.fillRect(x + (size - pip) / 2, y + (size - pip) / 2, pip, pip);
+            ctx.restore();
+        }
+
         var defrag = {
             canvas: null,
             ctx: null,
@@ -5930,25 +6064,8 @@
                     var isDogeBlock = !!this.dogeSet[share.h];
                     var isHead = !!this.headSet[share.h];
 
-                    // LTC block solution: gold border + inner fill
-                    if (isLtcBlock && isDogeBlock) {
-                        // Twin block — Legendary: orange glow
-                        ctx.fillStyle = '#ff8000';
-                        ctx.fillRect(x, y, cs, cs);
-                        ctx.strokeStyle = '#ffaa00';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isLtcBlock) {
-                        // LTC block only: gold border
-                        ctx.strokeStyle = '#ffd700';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isDogeBlock) {
-                        // DOGE block only: cyan border
-                        ctx.strokeStyle = '#00e5ff';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    }
+                    var markKind = blockMarkKind(isLtcBlock, isDogeBlock);
+                    if (markKind) drawBlockMark(ctx, x, y, cs, markKind);
 
                     // Chain head: only mark position 0 (actual tip)
                     if (i === 0 && !isLtcBlock && !isDogeBlock) {
@@ -6466,17 +6583,8 @@
 
                         var isLtc = !!animBlockSet[share.h];
                         var isDoge = !!animDogeSet[share.h];
-                        if (isLtc && isDoge) {
-                            ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
-                            ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isLtc) {
-                            ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isDoge) {
-                            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        }
+                        var animMarkKind = blockMarkKind(isLtc, isDoge);
+                        if (animMarkKind) drawBlockMark(ctx, sx, sy, sw, animMarkKind);
 
                         // Head marker: only on tip share (position 0) after it has landed
                         if (i === 0 && !isNew && !isLtc && !isDoge && ctx.globalAlpha >= 1) {
@@ -6877,16 +6985,12 @@
                 // Block solution / head borders on the overlay
                 var isLtc = this.blockSet[share.h];
                 var isDoge = this.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    hc.style.background = 'linear-gradient(135deg, #ff8000, #cc6600)';
-                    hc.style.border = '2px solid #ffaa00';
-                    hc.style.boxShadow = '0 0 12px rgba(255,128,0,0.7)';
-                } else if (isLtc) {
-                    hc.style.border = '2px solid #ffd700';
-                    hc.style.boxShadow = '0 0 8px rgba(255,215,0,0.5)';
-                } else if (isDoge) {
-                    hc.style.border = '2px solid #00e5ff';
-                    hc.style.boxShadow = '0 0 8px rgba(0,229,255,0.5)';
+                var hcMark = blockMarkKind(isLtc, isDoge);
+                if (hcMark) {
+                    var hm = BLOCK_MARK[hcMark];
+                    hc.style.background = 'radial-gradient(' + hm.ring + ' 0 18%, ' + hm.core + ' 19%)';
+                    hc.style.border = '3px solid ' + hm.ring;
+                    hc.style.boxShadow = '0 0 12px ' + hm.ring;
                 }
 
                 // Trigger enlarge: remove shrinking, force reflow, add active
@@ -7198,7 +7302,15 @@
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
-                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
+                // A young sharechain is shorter than the PPLNS window: nothing has
+                // left the window yet, so no tail share dissolves. Say so instead
+                // of leaving an eviction-free tail unexplained.
+                var totalEl = document.getElementById('defrag-total');
+                var filling = data.window_size > 0 && shares.length < data.window_size;
+                totalEl.textContent = shares.length + ' / ' + (data.window_size || '-') + (filling ? ' (filling)' : '');
+                totalEl.title = filling
+                    ? 'The window is still filling: no share leaves it until ' + data.window_size + ' shares are in it.'
+                    : '';
                 document.getElementById('defrag-mine').textContent = mine;
                 document.getElementById('defrag-stale').textContent = stale;
                 document.getElementById('defrag-dead').textContent = dead;
@@ -7215,11 +7327,33 @@
                     blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
                 }
                 document.getElementById('defrag-blocks').textContent = blocksText;
+                setBlocksScopeTitle(shares);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
+
+        // "Blocks in Window" counts the shares IN THE SHOWN WINDOW that solved
+        // a block — the same scope as Shares / Verified / Orphan above it, not
+        // the node's whole found-block history. The window covers the last
+        // window_size shares, so its time span depends on the share rate;
+        // the tooltip states the actual span.
+        function setBlocksScopeTitle(shares) {
+            var n = shares ? shares.length : 0;
+            var span = '';
+            if (n > 1 && shares[0].t && shares[n - 1].t) {
+                var hrs = Math.abs(shares[0].t - shares[n - 1].t) / 3600;
+                span = ' (spanning ' + (hrs >= 1 ? hrs.toFixed(1) + ' h' : Math.round(hrs * 60) + ' min') + ')';
+            }
+            var title = 'Shares that solved a block, counted over the ' + n
+                + ' shares in this window' + span + '. Blocks found before the'
+                + ' oldest share in the window are not counted.';
+            var l = document.getElementById('defrag-blocks-label');
+            var v = document.getElementById('defrag-blocks');
+            if (l) l.title = title;
+            if (v) v.title = title;
+        }
 
         // ── Phase B #9 feature flag ───────────────────────────────
         // Set ?new-explorer=1 in the URL (or localStorage.c2p_new_explorer=1)
@@ -7646,13 +7780,12 @@
             if (share) {
                 var isLtc = defrag.blockSet[share.h];
                 var isDoge = defrag.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    cell.classList.add('cell-legendary');
-                } else if (isLtc) {
-                    cell.style.border = '2px solid #ffd700';
-                    cell.style.boxShadow = '0 0 4px rgba(255,215,0,0.4)';
-                } else if (isDoge) {
-                    cell.style.border = '2px solid #00e5ff';
+                var cellMark = blockMarkKind(isLtc, isDoge);
+                if (cellMark) {
+                    var cm = BLOCK_MARK[cellMark];
+                    cell.style.background = cm.core;
+                    cell.style.border = '2px solid ' + cm.ring;
+                    cell.style.boxShadow = '0 0 4px ' + cm.ring;
                 }
             }
 
@@ -8311,7 +8444,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -8647,7 +8780,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8685,7 +8818,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -8778,8 +8911,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -8790,7 +8924,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8827,7 +8961,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -9072,7 +9206,7 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
@@ -9359,7 +9493,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9398,7 +9532,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -9503,8 +9637,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -9515,7 +9650,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9552,7 +9687,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -10116,6 +10251,7 @@
                                 bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
                             }
                             statEls.blocks.textContent = bt;
+                            setBlocksScopeTitle(state.window.shares);
                         }
                     }
                     window.addEventListener('beforeunload', function() {

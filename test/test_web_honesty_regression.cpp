@@ -21,7 +21,9 @@
 #include <impl/dash/config_pool.hpp>   // dash::SharechainConfig SHARE_PERIOD / TARGET_LOOKBEHIND
 #include <impl/ltc/config_pool.hpp>    // ltc::PoolConfig  SHARE_PERIOD / TARGET_LOOKBEHIND
 
+#include <chrono>
 #include <cmath>
+#include <memory>
 #include <fstream>   // folded merged-gating KAT (#912)
 #include <sstream>
 #include <vector>
@@ -226,6 +228,100 @@ TEST(WebHonestyRegression, MinerStatsUnknownAddressIsHonestlyInactive) {
     EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 0u);
     EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u);
     EXPECT_EQ(r["rejected_shares"].get<uint64_t>(), 0u);
+}
+
+// --- rest_miner_stats: windowed DOA, unknown-job submits kept apart ---------
+// Production 2026-10-26: after a hard reboot rigs flushed ~2600 results for job
+// ids the previous process had issued. Every one was counted stale, and the
+// miner page's cumulative doa_rate read "Error 10.90%, 2600 dead" long after
+// the burst while the sharechain had 0 dead. The window fields cover the last
+// 10 minutes and leave unknown-job submits out of the rate; the cumulative
+// fields keep their meaning.
+TEST(WebHonestyRegression, MinerStatsWindowedDoaLeavesOutUnknownJobs) {
+    using W = core::stratum::SubmitOutcomeWindow;
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    core::stratum::WorkerInfo w;
+    w.username = "addr1.rig";
+    w.accepted = 21251;
+    w.stale = 2600 + 3;   // 2600 restart leftovers + 3 genuinely expired jobs
+    w.submit_window = std::make_shared<W>();
+    for (int i = 0; i < 2600; ++i) w.submit_window->record(W::Outcome::UnknownJob);
+    for (int i = 0; i < 3; ++i)    w.submit_window->record(W::Outcome::Stale);
+    for (int i = 0; i < 197; ++i)  w.submit_window->record(W::Outcome::Accepted);
+    mi.register_stratum_worker("sess-1", w);
+
+    core::stratum::WorkerInfo w2;  // second rig on the same address
+    w2.username = "addr1.rig2";
+    w2.accepted = 100;
+    w2.submit_window = std::make_shared<W>();
+    for (int i = 0; i < 100; ++i) w2.submit_window->record(W::Outcome::Accepted);
+    mi.register_stratum_worker("sess-2", w2);
+
+    json r = mi.rest_miner_stats("addr1");
+
+    // Cumulative fields: unchanged meaning (every submit whose job was not active).
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 2603u);
+    EXPECT_EQ(r["orphan_shares"].get<uint64_t>(), 2603u);
+    EXPECT_EQ(r["total_shares"].get<uint64_t>(), 21351u + 2603u);
+    EXPECT_EQ(r["unstale_shares"].get<uint64_t>(), 21351u);
+    EXPECT_EQ(r["doa_shares"].get<uint64_t>(), 0u);
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 2603.0 / (21351.0 + 2603.0));
+
+    // Window fields, summed over the address's sessions.
+    ASSERT_TRUE(r.contains("doa_rate_window")) << r.dump();
+    EXPECT_EQ(r["window_seconds"].get<int64_t>(), 600);
+    EXPECT_EQ(r["window_accepted_shares"].get<uint64_t>(), 297u);
+    EXPECT_EQ(r["window_dead_shares"].get<uint64_t>(), 3u);
+    EXPECT_EQ(r["window_unknown_job_shares"].get<uint64_t>(), 2600u);
+    EXPECT_EQ(r["unknown_job_shares"].get<uint64_t>(), 2600u);
+    EXPECT_DOUBLE_EQ(r["doa_rate_window"].get<double>(), 3.0 / 300.0)
+        << "unknown-job submits must not count as DOA";
+}
+
+// Outcomes older than the window roll off; the cumulative fields and the
+// since-connect unknown-job count do not.
+TEST(WebHonestyRegression, MinerStatsWindowRollsOffCumulativeStays) {
+    using W = core::stratum::SubmitOutcomeWindow;
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+
+    const auto old = std::chrono::steady_clock::now() - std::chrono::minutes(11);
+    core::stratum::WorkerInfo w;
+    w.username = "addr1";
+    w.accepted = 45;
+    w.stale = 55;
+    w.submit_window = std::make_shared<W>();
+    for (int i = 0; i < 50; ++i) w.submit_window->record(W::Outcome::UnknownJob, old);
+    for (int i = 0; i < 5; ++i)  w.submit_window->record(W::Outcome::Stale, old);
+    for (int i = 0; i < 45; ++i) w.submit_window->record(W::Outcome::Accepted, old);
+    mi.register_stratum_worker("sess-1", w);
+
+    json r = mi.rest_miner_stats("addr1");
+    ASSERT_TRUE(r.contains("doa_rate_window")) << r.dump();
+    EXPECT_EQ(r["window_accepted_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["window_dead_shares"].get<uint64_t>(), 0u);
+    EXPECT_EQ(r["window_unknown_job_shares"].get<uint64_t>(), 0u);
+    EXPECT_DOUBLE_EQ(r["doa_rate_window"].get<double>(), 0.0);
+    EXPECT_EQ(r["unknown_job_shares"].get<uint64_t>(), 50u);
+    EXPECT_EQ(r["dead_shares"].get<uint64_t>(), 55u);
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 55.0 / 100.0);
+}
+
+// A registry entry without a window (not from a core stratum session) gets no
+// window fields rather than a made-up 0% -- the page then uses doa_rate.
+TEST(WebHonestyRegression, MinerStatsWithoutWindowOmitsWindowFields) {
+    MiningInterface mi(/*testnet=*/true, /*node=*/nullptr);
+    core::stratum::WorkerInfo w;
+    w.username = "addr1";
+    w.accepted = 90;
+    w.stale = 10;
+    mi.register_stratum_worker("sess-1", w);
+
+    json r = mi.rest_miner_stats("addr1");
+    EXPECT_DOUBLE_EQ(r["doa_rate"].get<double>(), 0.1);
+    EXPECT_FALSE(r.contains("doa_rate_window"));
+    EXPECT_FALSE(r.contains("window_seconds"));
+    EXPECT_FALSE(r.contains("unknown_job_shares"));
 }
 
 // --- rest_stratum_security: signal not-instrumented, never a fake all-clear ---
@@ -1845,6 +1941,24 @@ TEST(WebStaticMergedGating, MinerPageMergedBlocksSectionIsTopologyGated) {
            "merged blocks section on the miner page.";
 }
 
+// miner.html: the headline Error / Efficiency / DOA read the windowed rate
+// (doa_rate_window), falling back to the cumulative doa_rate only for a node
+// without it, and unknown-job submits (restart leftovers) are shown apart
+// instead of as dead shares. Production 2026-10-26: the cumulative rate showed
+// "Error 10.90%" for a burst that had ended.
+TEST(WebStaticMinerPage, HeadlineDoaUsesWindowedRateAndShowsUnknownJobsApart) {
+    const auto html = read_web_static("miner.html");
+    EXPECT_NE(html.find("stats.doa_rate_window"), std::string::npos)
+        << "the miner page does not read the windowed DOA rate";
+    EXPECT_EQ(html.find("stats.doa_rate * 100"), std::string::npos)
+        << "a headline still renders the cumulative doa_rate directly";
+    EXPECT_NE(html.find("stats.unknown_job_shares"), std::string::npos)
+        << "unknown-job submits are not taken out of the dead count";
+    EXPECT_NE(html.find("id=\"unknown_job_shares\""), std::string::npos)
+        << "no separate unknown-job count on the miner page";
+    EXPECT_NE(html.find("unknown job (previous session)"), std::string::npos);
+}
+
 // loading.html: the startup page must not hardcode LTC/DOGE SPV rows. The
 // parent row's label is currency_info-driven and both rows appear only when
 // the node reports SPV progress; the child row additionally requires a merged
@@ -1968,4 +2082,30 @@ TEST(DashboardSessionStates, StandbyIsMutedAndOnlyStalledWarns) {
     EXPECT_EQ(html.find(">Last Seen</th>"), std::string::npos)
         << "'Last Seen' was the stats poll time, which is always 'now' for a "
            "connected session; it hid a stalled rig";
+}
+
+// ===========================================================================
+// Failback: a rig that failed over to this node and back keeps its session
+// here, receives work and submits nothing. The API reads it standby with
+// hashing_elsewhere (its payout address keeps getting shares minted by another
+// node). The table and the chips must show it muted as standby ("hashing
+// elsewhere"), never amber stalled, and never in the stalled warning line.
+// ===========================================================================
+TEST(DashboardSessionStates, FailbackReadsStandbyHashingElsewhere) {
+    const auto html = read_dashboard();
+    // Per worker: the API's mark is carried into the row.
+    EXPECT_NE(html.find("elsewhere: workerData.hashing_elsewhere === true,"), std::string::npos)
+        << "the miners table ignores /stratum_stats workers[].hashing_elsewhere";
+    EXPECT_NE(html.find("var standbyTitle = worker.elsewhere ? ELSEWHERE_TITLE : STANDBY_TITLE;"),
+              std::string::npos);
+    EXPECT_NE(html.find("var ELSEWHERE_TITLE = 'Hashing on another node:"), std::string::npos);
+    // The standby summary row names them.
+    EXPECT_NE(html.find("(nElsewhere === standbyWorkers.length ? 'hashing on another node '"),
+              std::string::npos);
+    // Chips from /local_stats stratum_sessions.standby_elsewhere.
+    EXPECT_NE(html.find("_ss.standby_elsewhere"), std::string::npos);
+    EXPECT_NE(html.find("' (hashing elsewhere)'"), std::string::npos)
+        << "the standby chip does not say the rigs hash on another node";
+    // The stalled warning still lists stalled only (failback rows are standby).
+    EXPECT_NE(html.find("return sw.state === 'stalled';"), std::string::npos);
 }

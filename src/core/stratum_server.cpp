@@ -8,6 +8,7 @@
 #include <btclibs/util/strencodings.h>
 #include <crypto/scrypt.h>
 
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -904,6 +905,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                     + ":" + std::to_string(rep.port());
             } catch (...) {}
             wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
+            wi.submit_window = submit_window_;
             mining_interface_->register_stratum_worker(session_id_, wi);
         }
         
@@ -1176,8 +1178,28 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     bool is_stale = (job_it == active_jobs_.end());
     if (is_stale) {
         ++stale_shares_;
-        LOG_INFO << "[Stratum] Stale share from " << username_ << " for expired job " << job_id
+        // A job id that is neither active nor among this session's recently
+        // expired ids was never issued on this connection: typically results
+        // a rig buffered before a node restart (job ids from the previous
+        // process) or from its previous connection. Same reply to the miner
+        // and still in stale_shares_; counted apart so the miner page does
+        // not show the burst as DOA.
+        const bool unknown_job =
+            std::find(expired_job_ids_.begin(), expired_job_ids_.end(), job_id)
+            == expired_job_ids_.end();
+        submit_window_->record(unknown_job
+            ? core::stratum::SubmitOutcomeWindow::Outcome::UnknownJob
+            : core::stratum::SubmitOutcomeWindow::Outcome::Stale);
+        LOG_INFO << "[Stratum] Stale share from " << username_ << " for "
+                 << (unknown_job ? "unknown job " : "expired job ") << job_id
                  << " (active_jobs=" << active_jobs_.size() << ")";
+        if (mining_interface_) {
+            mining_interface_->update_stratum_worker(session_id_,
+                hashrate_tracker_.get_current_hashrate(),
+                0.0,
+                hashrate_tracker_.get_current_difficulty(),
+                accepted_shares_, rejected_shares_, stale_shares_);
+        }
         // Job data evicted — can't reconstruct block or share.
         // Return stale response to the miner.
         nlohmann::json response;
@@ -1376,6 +1398,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // p2pool: work = target_to_average_attempts(effective_target)
     // For us: work = credited_difficulty × 2^32 (equivalent unit conversion)
     ++accepted_shares_;
+    submit_window_->record(core::stratum::SubmitOutcomeWindow::Outcome::Accepted);
     static constexpr double TWO_32 = 4294967296.0;
     // #766/#762: credit the hashrate estimate at the difficulty THIS job was
     // actually issued/mined at, not the live vardiff. A vardiff retarget
@@ -1926,6 +1949,14 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // ExpiringDict semantics. The most recently issued job (deque back) is
     // never evicted — it is the job the miner is currently on.
     const auto now_steady = std::chrono::steady_clock::now();
+    // Evicted ids are remembered (bounded) so a late submit for one is told
+    // apart from a submit for a job id this connection never issued.
+    auto evict_oldest = [this] {
+        expired_job_ids_.push_back(std::move(job_order_.front()));
+        job_order_.pop_front();
+        if (expired_job_ids_.size() > RECENT_EXPIRED_JOBS)
+            expired_job_ids_.pop_front();
+    };
     // TTL sweep (oldest-first; stop at the first young entry).
     while (job_order_.size() > 1) {
         auto oldest = active_jobs_.find(job_order_.front());
@@ -1936,12 +1967,12 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         if (now_steady - oldest->second.created_at < JOB_TTL)
             break;
         active_jobs_.erase(oldest);
-        job_order_.pop_front();
+        evict_oldest();
     }
     // FIFO capacity eviction (keep MAX_ACTIVE_JOBS for late shares).
     while (active_jobs_.size() >= MAX_ACTIVE_JOBS && job_order_.size() > 1) {
         active_jobs_.erase(job_order_.front());
-        job_order_.pop_front();
+        evict_oldest();
     }
     {
         JobEntry je;

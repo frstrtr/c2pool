@@ -1700,11 +1700,11 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             }
         }
 
-        {  // a store not caught up building templates while a peer claims more work no verified header shows
+        {  // a store not caught up building templates while a peer's HELLO tip is not held and no verified header wins
             const bool uc = relay->with_node([](pb::PathbNode& n) { return n.unverified_claims(); });
             if (uc != last_unverified_claims) {
                 last_unverified_claims = uc;
-                if (uc) std::printf("catch-up: peers claim more work; no verified header wins: templates continue\n");
+                if (uc) std::printf("catch-up: a peer's tip is not held; no verified header wins: templates continue\n");
             }
         }
         if (tstatus != last_tstatus || tstatus_why != last_tstatus_why) {

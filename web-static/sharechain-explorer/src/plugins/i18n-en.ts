@@ -31,7 +31,7 @@ export const EN_CATALOG: I18nCatalog = Object.freeze({
     'explorer.stat.orphan':      'Orphan / stale',
     'explorer.stat.dead':        'Dead',
     'explorer.stat.nodeFee':     'Node fee',
-    'explorer.stat.blocksFound': 'Blocks found',
+    'explorer.stat.blocksFound': 'Blocks in window',
     'explorer.toggle.realtime':  'Real-time',
     'explorer.toggle.fastmode':  'Fast animation',
     'explorer.share.born':       'Share {hash} born from {miner}, PPLNS {pct}%',

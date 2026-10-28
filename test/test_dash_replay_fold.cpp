@@ -1044,6 +1044,83 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     EXPECT_EQ(st->nOperatorReward, 800);
 }
 
+// nOperatorReward == 10000 (the 2026-10-28 mn-payout-split-unprovable
+// incident class). dashd masternode/payments.cpp:65-79: with the operator
+// script set, operatorReward == masternodeReward, the owner remainder is 0 and
+// `if (masternodeReward > 0)` emits NO owner output — the coinbase pays the
+// projected masternode at its OPERATOR script only. The fold's pass-6 payee
+// cross-check must therefore look for that script; checking scriptPayout here
+// false-poisons a byte-correct fold (and this engine also runs on the cold
+// MN-CKPT path that feeds the diff store).
+TEST(DashReplayFoldSynthetic, ReplayFoldPayeeCheckAcceptsFullOperatorSplit)
+{
+    // Build the same two-block history twice: one engine sees the operator-
+    // only payment dashd makes, the other an owner-only payment dashd could
+    // not have made for this state.
+    auto history = [](DmlFoldEngine& eng, uint256& mn, CProRegTx& p) {
+        eng.seed({}, 0, 100, raw256(9));
+        p  = make_proreg(1, /*operator_reward_bps=*/10000);
+        auto tx = make_special_tx(1, p, 1);
+        mn = tx_hash_of(tx);
+        auto r1 = eng.fold_block(
+            make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}),
+                       {tx}, &eng), 101);
+        ASSERT_TRUE(r1.ok) << r1.error;
+        // The operator sets its payout script (ProUpServTx). Block 102 is
+        // still built from the PRE-block list, where no operator script is
+        // set yet, so dashd pays the owner the whole share there.
+        CProUpServTx up;
+        up.nVersion  = ProTxVersion::BASIC_BLS;
+        up.proTxHash = mn;
+        up.netInfo   = p.netInfo;
+        up.scriptOperatorPayout.m_data = script_bytes(0x99);
+        auto uptx = make_special_tx(2, up, 2);
+        auto r2 = eng.fold_block(
+            make_block(102, raw256(10), root_of({expected_entry_of(p, mn)}),
+                       {uptx}, &eng), 102);
+        ASSERT_TRUE(r2.ok) << r2.error;
+        ASSERT_EQ(eng.find(mn)->nOperatorReward, 10000);
+        ASSERT_EQ(eng.find(mn)->scriptOperatorPayout.m_data, script_bytes(0x99));
+    };
+    auto paying = [](const CProRegTx& p, const uint256& mn,
+                     const std::vector<unsigned char>& script) {
+        auto b = make_block(103, raw256(11), root_of({expected_entry_of(p, mn)}));
+        TxOut out;
+        out.value = 77'055'682;
+        out.scriptPubKey.m_data = script;
+        b.m_txs[0].vout.push_back(std::move(out));
+        return b;
+    };
+
+    {
+        DmlFoldEngine eng(synth_cfg());
+        uint256 mn; CProRegTx p;
+        history(eng, mn, p);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(eng.project_payee(103).has_value());
+        ASSERT_EQ(*eng.project_payee(103), mn);
+        auto r = eng.fold_block(paying(p, mn, script_bytes(0x99)), 103);
+        ASSERT_TRUE(r.ok)
+            << "a coinbase paying ONLY the operator script is dashd's exact"
+               " output set for a bps=10000 masternode: " << r.error;
+        EXPECT_TRUE(r.payee_paid_verified);
+        EXPECT_FALSE(eng.poisoned());
+        EXPECT_EQ(eng.find(mn)->nLastPaidHeight, 103);
+    }
+    {
+        DmlFoldEngine eng(synth_cfg());
+        uint256 mn; CProRegTx p;
+        history(eng, mn, p);
+        if (HasFatalFailure()) return;
+        auto r = eng.fold_block(paying(p, mn, p.scriptPayout.m_data), 103);
+        ASSERT_FALSE(r.ok)
+            << "an owner-only coinbase cannot have been built by dashd from a"
+               " bps=10000 state with an operator script — exact script"
+               " equality, never 'any script of this masternode'";
+        EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
+    }
+}
+
 TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
 {
     DmlFoldEngine eng(synth_cfg());

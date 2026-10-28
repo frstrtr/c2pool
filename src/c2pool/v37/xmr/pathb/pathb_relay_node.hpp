@@ -36,12 +36,14 @@
 //                reach its ticket (FC_HEADERS in request order, FC_CARRIER by
 //                the asked ids, FC_BUCKETS by (peer, at)); a ticket of a
 //                disconnected peer gets no frame
-//   after HELLO  headers first from the best tip when the peer's
-//                best_cum_work wins fork choice, again while the peer's tip is
-//                not held and still wins; the pending set re-offered (FB_RECEIPTS,
-//                at most 1 + R_MAX bodies a frame); a node at position 0 whose
-//                catch-up from position 0 got a reply with no header offers
-//                the peer's HELLO tip to the joiner
+//   after HELLO  headers first from the best tip when the peer's HELLO tip is
+//                not held (the node's own header work at the reply fetches or
+//                keeps; best_cum_work is not read), again while it is not held
+//                and no reply ended it; the pending set re-offered (FB_RECEIPTS,
+//                at most 1 + R_MAX bodies a frame); a store (not joined, not
+//                load-failed) whose catch-up got a reply with no header to a
+//                request from position 0 offers the peer's HELLO tip to the
+//                joiner
 //   buckets      a DEFER naming a missing bucket: FC_GETBUCKETS at the named
 //                carrier, one peer at a time (one assembly per (peer, at)); the
 //                parked frames run again when a bin arrives, when a request
@@ -1144,7 +1146,6 @@ private:
     };
     struct Catchup {
         Hash32 tip{};
-        U128 work{};
         bool from_pos0 = false;          // the last request asked from position 0
         bool from_root = false;          // ... from the lowest position the node holds (no step below it)
         std::uint32_t step = 0;          // the locator step of `from`: the best tip, then pos - 1, pos - 2, pos - 4, ...
@@ -1877,9 +1878,11 @@ private:
         std::vector<ParkedFrame> rx_rerun;                  // frames to run again after a counted RandomX failure
         std::vector<std::pair<std::uint64_t, std::uint64_t>> p15;  // released carriers placed: (peer, objects)
         std::vector<std::string> lines;                     // the STRIKE / REFUSE lines of the drained carriers
+        std::vector<PathbNode::DrainedResult> penalties;    // the STRIKE and BAN verdicts of the drained carriers
     };
     // Under the node lock: the released carriers whose admission failed with a RandomX failure, to park; the carriers
-    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are.
+    // the node placed on its own (a drain's released carriers, a bind's walked carriers), counted as received frames are,
+    // and their STRIKE and BAN verdicts charged to their senders as a received frame's are (run_effects).
     void take_rx_failed_locked(Effects& fx) {
         for (ParkedFrame& f : node_->take_rx_failed()) fx.rx_retry.push_back(std::move(f));
         for (const PathbNode::PlacedRelease& c : node_->take_placed_released()) fx.p15.emplace_back(c.peer, c.objects);
@@ -1889,7 +1892,26 @@ private:
                 fx.lines.push_back("relay: peer " + std::to_string(d.peer) +
                                    (d.verdict == AdmitVerdict::Strike ? " STRIKE: " : " REFUSE: ") +
                                    admission_text(d.row, d.object));
+            if (d.peer != 0 && d.peer != PathbNode::kOwnPeer &&
+                (d.verdict == AdmitVerdict::Strike || d.verdict == AdmitVerdict::Ban))
+                fx.penalties.push_back(d);
         }
+    }
+    // After the node lock: a drained carrier's STRIKE costs its sender the verdict's tokens and its BAN bans the sender
+    // with its reason, as for a received frame (apply_result). A sender whose link is gone by then: one line, nothing
+    // applied.
+    void apply_drained(const PathbNode::DrainedResult& d) {
+        const bool ban_v = d.verdict == AdmitVerdict::Ban;
+        const std::string why = "admission row R" + std::to_string(static_cast<int>(d.row)) + " of " + hex_short(d.object != Hash32{} ? d.object : d.id);
+        if (!peer_known(d.peer)) {
+            log("relay: peer " + std::to_string(d.peer) + " gone: drained " + (ban_v ? "BAN" : "STRIKE") +
+                " not applied: " + why);
+            return;
+        }
+        if (ban_v)
+            ban(d.peer, why);
+        else
+            strike(d.peer, std::max<std::uint32_t>(d.strike, 1), false);
     }
     // Under the node lock: the counts of one admission outcome of a peer's object, a received frame's or a carrier's the
     // node placed on its own (drained or walk-bound): the verdict by row, the per-peer omission log, the line of a switch
@@ -2252,6 +2274,8 @@ private:
         fx.rx_retry.clear();
         fx.rx_rerun.clear();
         fx.p15.clear();
+        for (const PathbNode::DrainedResult& d : fx.penalties) apply_drained(d);
+        fx.penalties.clear();
         for (std::size_t i = 0; i < fx.bans.size(); ++i) ban(fx.bans[i], i < fx.bans_why.size() ? fx.bans_why[i] : std::string());
         for (std::uint64_t q : fx.strikes) strike(q, 1, false);
         for (const auto& [id, from, cls] : fx.ctx) want_ctx(id, from, 0, cls);
@@ -2654,7 +2678,7 @@ private:
         on_self_hello(p, link);
         if (o_.discovery) disc_refused(c.text, true, theirs.listen_port, link);
     }
-    // After an accepted HELLO: headers first when the peer's claimed work wins, then the pending re-offer (the ids
+    // After an accepted HELLO: headers first when the peer's HELLO tip is not held, then the pending re-offer (the ids
     // taken under the node lock; the frames paged by reoffer_pump).
     void after_hello(std::uint64_t p, const HelloTail& tail) {
         std::vector<Hash32> ids;
@@ -2819,23 +2843,21 @@ private:
     }
 
     // ---- headers first (the caller's catch-up loop) ----
-    // Under the node lock.
+    // Under the node lock. A catch-up starts when the peer's HELLO tip is not held; the node's own header work at the
+    // reply decides fetch or keep (the tail's best_cum_work is not read).
     void catchup_start(std::uint64_t p, const HelloTail& tail) {
-        const CarrierNode& b = node_->tree().best();
         std::lock_guard<std::mutex> lk(cumtx_);
-        if (node_->tree().find(tail.best_tip) != nullptr
-            || !fork_choice_prefers(ChainTip{tail.best_cum_work, tail.best_tip}, ChainTip{b.cum_work, b.id})) {
+        if (node_->holds_tip(tail.best_tip)) {
             caught_up_locked();  // nothing to catch up from this peer (the done test at the start)
             return;
         }
         Catchup& c = catchup_[p];
         c.tip = tail.best_tip;
-        c.work = tail.best_cum_work;
         c.step = 0;
         catchup_ask_locked(p, c);
     }
-    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended by their done test (every HELLO
-    // tip held, or its claim no longer winning) is caught up (its record leaves the store).
+    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
+    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store).
     void caught_up_locked() {
         if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
         node_->note_caught_up();
@@ -2925,18 +2947,27 @@ private:
                                 catchup_ask_locked(p, it->second);
                                 break;
                             }
-                            // the reply to a request from position 0 carried no header: the peer serves nothing after
-                            // position 0 (a store that never caught up: the joiner path)
-                            if (o.ids.empty() && it->second.from_pos0 && node_->offer_empty_store_tip(p)) {
-                                st_.empty_store_offers++;
-                                join = true;
+                            // the reply to a request from position 0 carried no header: the peer serves none of this
+                            // node's chain (the joiner path: its tip a join candidate)
+                            if (o.ids.empty() && it->second.from_pos0) {
+                                if (node_->offer_empty_store_tip(p)) {
+                                    st_.empty_store_offers++;
+                                    join = true;
+                                }
+                                catchup_.erase(it);
+                                break;
                             }
+                            // the node's own header work kept its chain: this catch-up ended by its reply
                             catchup_.erase(it);
+                            caught_up_locked();
                             break;
-                        case K::JoinerPath:
+                        case K::JoinerPath: catchup_.erase(it); break;
                         case K::Ban:
                         case K::Strike:
-                        case K::Undecodable: catchup_.erase(it); break;
+                        case K::Undecodable:  // the catch-up ended by its reply
+                            catchup_.erase(it);
+                            caught_up_locked();
+                            break;
                         case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
                                               // the page lapses
                             if (o.fetch_last != Hash32{}) {
@@ -3194,6 +3225,10 @@ private:
                 (rep.side_needs > 0 ? ", side branches " + std::to_string(rep.side_needs) : std::string()) +
                 (rep.what.empty() ? "" : ": " + rep.what) + ")" +
                 (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
+            if (s->caught_up) {
+                st_.caught_up_at_ms = now_ms();
+                log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)");
+            }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
                 if (rep.end == AttemptEnd::Completed) st_.join_side_completed++;
@@ -3569,9 +3604,7 @@ private:
             bool done_any = false;
             for (auto it = catchup_.begin(); it != catchup_.end();) {
                 const CarrierNode& b = node_->tree().best();
-                const bool done = node_->tree().find(it->second.tip) != nullptr
-                                  || !fork_choice_prefers(ChainTip{it->second.work, it->second.tip}, ChainTip{b.cum_work, b.id})
-                                  || node_->rests_on_claims();
+                const bool done = node_->holds_tip(it->second.tip) || node_->rests_on_claims();
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
                     it = catchup_.erase(it);

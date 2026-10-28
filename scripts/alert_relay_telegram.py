@@ -65,6 +65,9 @@ KIND_TEXT = {
     "back_online": "back ONLINE",
     "digest": "DIGEST",
     "test": "TEST",
+    # Node-level (no worker): the node handed no work to its miners, then did again.
+    "work_stalled": "WORK STALLED:",
+    "work_resumed": "WORK RESUMED:",
 }
 
 
@@ -561,6 +564,19 @@ def selftest():
                 os.environ.pop("TELEGRAM_BOT_TOKEN", None)
             else:
                 os.environ["TELEGRAM_BOT_TOKEN"] = old_env
+
+    # Node-level kinds carry no worker and read as one plain sentence.
+    node_row = {"kind": "work_stalled", "label": "dash-1", "worker": "", "event_ts": 1790000000,
+                "detail": "no new work for miners for 6m (cause bestcl-stale); 26 miner sessions attached"}
+    text = format_text(node_row)
+    check(text.startswith("[c2pool] dash-1: WORK STALLED: no new work for miners for 6m")
+          and "bestcl-stale" in text and "26 miner sessions" in text and "worker" not in text,
+          "work_stalled renders label, duration, cause and sessions, no worker")
+    text = format_text(dict(node_row, kind="work_resumed",
+                            detail="new work for miners again after 6m (cause was bestcl-stale); "
+                                   "26 miner sessions attached"))
+    check(text.startswith("[c2pool] dash-1: WORK RESUMED: new work for miners again after 6m"),
+          "work_resumed renders as one sentence")
 
     srv.shutdown()
     logs = log_buf.getvalue()

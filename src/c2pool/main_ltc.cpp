@@ -2022,6 +2022,26 @@ int main(int argc, char* argv[]) {
                             embedded_pool->set_utxo(ltc_utxo_cache.get());
                             LOG_INFO << "[EMB-LTC] UTXO set opened: best_height=" << ltc_utxo_db->get_best_height()
                                      << " best_block=" << ltc_utxo_db->get_best_block().GetHex().substr(0, 16);
+                            // Undo records written before #2059 cannot restore
+                            // spent coins; a reorg reaching one rebuilds the set.
+                            // A format-2 record next to a legacy one is older
+                            // than it (an older binary ran in between): dropped.
+                            constexpr uint32_t KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+                            const uint32_t best = ltc_utxo_db->get_best_height();
+                            if (best > 0) {
+                                const uint32_t lo = best > KEEP ? best - KEEP : 0;
+                                const uint32_t dropped = ltc_utxo_db->drop_shadowed_undo(lo, best);
+                                if (dropped > 0)
+                                    LOG_WARNING << "[EMB-LTC] UTXO: dropped " << dropped << " undo records"
+                                                << " older than the legacy record at their height"
+                                                << " (an older c2pool ran on this data dir)";
+                                const uint32_t n = ltc_utxo_db->count_legacy_undo(lo, best);
+                                if (n > 0)
+                                    LOG_INFO << "[EMB-LTC] UTXO: " << n << " legacy undo records (pre-#2059)"
+                                             << " within the " << KEEP << "-block window; a reorg reaching"
+                                             << " them triggers a one-time UTXO rebuild; they age out within "
+                                             << KEEP + 1 << " blocks";
+                            }
                         } else {
                             LOG_WARNING << "[EMB-LTC] UTXO DB failed to open after 5 attempts — fees will be unknown";
                         }
@@ -2530,14 +2550,20 @@ int main(int argc, char* argv[]) {
                 // restart), and once at startup. Startup re-arms only when something
                 // was disconnected; Reorg always (the pipeline may hold old-branch
                 // blocks); ParentMismatch fails when nothing was disconnected, since
-                // refilling the same range would hit the same mismatch. Returns
-                // false when the UTXO set cannot be brought back (no undo data /
-                // deeper than LTC_KEEP / a height the header chain cannot judge).
+                // refilling the same range would hit the same mismatch. When the
+                // walk cannot bring the set back for good (undo record missing,
+                // legacy pre-#2059 record, record of another block, deeper than
+                // LTC_KEEP, the set's block lost from the header chain) the set
+                // is wiped and the last LTC_KEEP blocks of the best chain are
+                // connected into the empty set, as a cold start does; returns
+                // true. Returns false when it cannot be brought back now (a
+                // height the header chain cannot judge).
                 enum class UtxoHeal { Startup, Reorg, ParentMismatch };
                 using UtxoHealFn = std::function<bool(UtxoHeal, uint32_t)>;
                 auto utxo_heal = std::make_shared<UtxoHealFn>(
                     [chain = embedded_chain.get(), utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(), bcaster = embedded_broadcaster.get(),
+                     pool = embedded_pool.get(),
                      ltc_bs, fill_rr, utxo_jump_from, &ioc](
                         UtxoHeal kind, uint32_t target_height) -> bool {
                         if (!chain || !utxo || !utxo_db)
@@ -2561,13 +2587,11 @@ int main(int argc, char* argv[]) {
                                     return std::nullopt;
                                 return e->prev_hash;
                             },
-                            [&](uint32_t h) {
-                                core::coin::BlockUndo undo;
-                                if (!utxo_db->get_block_undo(h, undo))
-                                    return false;
-                                utxo->disconnect_from_undo(undo);
-                                undone.push_back(h);
-                                return true;
+                            [&](uint32_t h, const uint256& hh) {
+                                const auto w = ltc::coin::disconnect_with_undo(*utxo_db, *utxo, h, hh);
+                                if (w == ltc::coin::RewindResult::Why::None)
+                                    undone.push_back(h);
+                                return w;
                             });
                         if (rw.disconnected > 0) {
                             if (!utxo->flush(rw.hash, rw.height)) {
@@ -2583,13 +2607,58 @@ int main(int argc, char* argv[]) {
                                         << before << "→" << rw.height << ") best="
                                         << rw.hash.GetHex().substr(0, 16);
                         }
+                        if (rw.permanent()) {
+                            // The walk can never get further: wipe the set and
+                            // connect the best chain's last LTC_KEEP blocks into
+                            // the empty set, as a cold start does (the mining gate
+                            // closes until LTC_MINING_GATE_DEPTH have reconnected).
+                            const uint32_t tip = chain->height();
+                            const uint32_t from = ltc::coin::utxo_rebuild_from(
+                                tip, core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                            const uint32_t to = std::max(target_height, tip);
+                            LOG_ERROR << "[EMB-LTC] UTXO set cannot be brought back to the best chain ("
+                                      << reason << ": " << ltc::coin::rewind_why_name(rw.why)
+                                      << " at h=" << rw.height << "); re-anchoring: wiping the UTXO set"
+                                      << " and rebuilding " << from << ".." << to << " from the best chain";
+                            if (!utxo->reanchor()) {
+                                LOG_ERROR << "[EMB-LTC] UTXO re-anchor failed (DB wipe); set left at h="
+                                          << utxo->get_best_height();
+                                return false;
+                            }
+                            // The mempool's priced txs: their inputs come back as
+                            // the set refills; each drain's revalidate_inputs would
+                            // evict them meanwhile (and nothing refetches them).
+                            // Quarantined, they are re-priced by recompute_unknown_fees.
+                            if (pool) {
+                                const int requarantined = pool->requarantine_all();
+                                LOG_INFO << "[EMB-LTC] UTXO rebuild: " << requarantined
+                                         << " priced mempool txs quarantined until their inputs reconnect";
+                            }
+                            ltc::coin::ordered_arm(*ltc_bs, from, to);
+                            ltc_bs->phase = "UTXO rebuild";
+                            *utxo_jump_from = from;
+                            if (bcaster) {
+                                ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
+                                    auto e = chain->get_header_by_height(rh);
+                                    if (!e)
+                                        return;
+                                    if (!bcaster->request_full_block_targeted(e->block_hash, (*fill_rr)++))
+                                        bcaster->request_full_block(e->block_hash);
+                                });
+                                ltc_bs->start_stall_timer(ioc,
+                                    [chain, bcaster](uint32_t h) {
+                                        auto e = chain->get_header_by_height(h);
+                                        if (e && bcaster)
+                                            bcaster->request_full_block(e->block_hash);
+                                    }, "EMB-LTC");
+                            }
+                            return true;
+                        }
                         if (!rw.ok) {
                             LOG_ERROR << "[EMB-LTC] UTXO set cannot be brought back to the best chain ("
-                                      << reason << "): stuck at h=" << rw.height << " "
-                                      << rw.hash.GetHex().substr(0, 16)
-                                      << "... (undo data missing, deeper than "
-                                      << core::coin::LTC_MIN_BLOCKS_TO_KEEP
-                                      << " blocks, or a height the header chain cannot judge)";
+                                      << reason << ": " << ltc::coin::rewind_why_name(rw.why)
+                                      << "): stuck at h=" << rw.height << " "
+                                      << rw.hash.GetHex().substr(0, 16) << "...";
                             return false;
                         }
                         if (rw.disconnected == 0 && kind == UtxoHeal::ParentMismatch) {
@@ -3042,7 +3111,7 @@ int main(int argc, char* argv[]) {
                                             uint32_t h) {
                                         if (h == *utxo_jump_from)
                                             *utxo_jump_from = 0;
-                                        auto undo = utxo->connect_block(b, h, txid_fn);
+                                        auto undo = utxo->connect_block(b, h, txid_fn, bh);
                                         utxo_db->put_block_undo(h, undo);
                                         utxo->flush(bh, h);
                                         utxo->prune_undo(h, LTC_KEEP);
@@ -3256,7 +3325,7 @@ int main(int argc, char* argv[]) {
                                 if (act == ltc::coin::UtxoConnect::Connect
                                     && check == ltc::coin::ConnectCheck::Ok) {
                                     auto undo = utxo->connect_block(
-                                        block, height, txid_fn);
+                                        block, height, txid_fn, block_hash);
                                     utxo_db->put_block_undo(height, undo);
                                     utxo->flush(block_hash, height);
                                     utxo->prune_undo(height, LTC_KEEP);
@@ -3499,8 +3568,9 @@ int main(int argc, char* argv[]) {
                                     << (is_reorg ? " [REORG]" : "");
 
                         // Disconnect old fork blocks from UTXO during reorg.
-                        // Uses undo data (added_outpoints + spent_coins) so full blocks
-                        // are NOT needed for the old fork.
+                        // Uses undo data (spent coins with their outpoints +
+                        // added_outpoints) so full blocks are NOT needed for the
+                        // old fork.
                         if (is_reorg && utxo && utxo_db && chain) {
                             // Walk the UTXO set back to the (new) best chain — what it
                             // actually connected above the fork, never moving its best
@@ -6920,7 +6990,7 @@ int main(int argc, char* argv[]) {
                                                     auto& [b, bh] = node.mapped();
                                                     uint32_t h = doge_bs->next_height;
 
-                                                    auto undo = utxo->connect_block(b, h, txid_fn);
+                                                    auto undo = utxo->connect_block(b, h, txid_fn, bh);
                                                     utxo_db->put_block_undo(h, undo);
                                                     utxo->flush(bh, h);
                                                     utxo->prune_undo(h, DOGE_KEEP);
@@ -7001,7 +7071,7 @@ int main(int argc, char* argv[]) {
                                             // 3. Normal processing
                                             if (height > utxo->get_best_height()) {
                                                 auto undo = utxo->connect_block(
-                                                    block, height, txid_fn);
+                                                    block, height, txid_fn, block_hash);
                                                 utxo_db->put_block_undo(height, undo);
                                                 utxo->flush(block_hash, height);
                                                 utxo->prune_undo(height, DOGE_KEEP);
@@ -7101,7 +7171,15 @@ int main(int argc, char* argv[]) {
                                                 int disc = 0;
                                                 for (uint32_t h = old_height; h > fork_ht; --h) {
                                                     core::coin::BlockUndo undo;
-                                                    if (utxo_db->get_block_undo(h, undo)) { utxo->disconnect_from_undo(undo); utxo_db->remove_block_undo(h); ++disc; }
+                                                    if (utxo_db->get_block_undo(h, undo)) {
+                                                        // false: a legacy (pre-#2059) record; only the
+                                                        // block's outputs went, its spent coins stay
+                                                        // missing (no rebuild path on this lane, #2070).
+                                                        if (!utxo->disconnect_from_undo(undo))
+                                                            LOG_ERROR << "[EMB-DOGE] UTXO reorg: legacy undo record (pre-#2059) at h="
+                                                                      << h << ": spent coins not restored";
+                                                        utxo_db->remove_block_undo(h); ++disc;
+                                                    }
                                                 }
                                                 utxo->flush(fork_h, fork_ht);
                                                 LOG_WARNING << "[EMB-DOGE] UTXO reorg: disconnected " << disc << " blocks";

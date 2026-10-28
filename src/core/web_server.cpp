@@ -3007,10 +3007,24 @@ nlohmann::json MiningInterface::found_block_row_locked(const FoundBlock& b) cons
     // that knows. The wire key `found_locally` keeps its existing meaning
     // and its existing consumers; read `found_by` for authorship.
     const bool have_local_record = !(b.share_hash.empty() && b.miner.empty());
+    // "first_block" is a claim about the HISTORY: no same-chain block was
+    // found before this one. A missing interval alone does not make it so. A
+    // row recorded at height 0 (unknown) sorts after every real row, so the
+    // restore-time recompute finds no predecessor for it; the stale-job block
+    // of 2026-10-25 (23 earlier rows) was drawn on the chart as "1st block"
+    // that way. Such a row reads "interval_unavailable".
+    bool has_earlier_row = false;
+    for (const auto& other : m_found_blocks) {
+        if (other.chain == b.chain && other.ts < b.ts) {
+            has_earlier_row = true;
+            break;
+        }
+    }
     std::string method;
     if (!have_local_record)                    method = "relayed";
     else if (b.time_to_find > 0 && b.luck > 0) method = "simple_avg";
     else if (b.time_to_find > 0)               method = "netdiff_unavailable";
+    else if (has_earlier_row)                  method = "interval_unavailable";
     else                                       method = "first_block";
     // "netdiff_unavailable" vs "first_block": the old else-branch collapsed
     // two distinct rows. A genuine first block has no earlier same-chain row,
@@ -3226,6 +3240,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
     const auto liveness = observe_worker_liveness(workers, now_steady);
     int connections_silent = 0;
     int connections_hashing = 0, connections_standby = 0, connections_stalled = 0;
+    int connections_standby_elsewhere = 0;
     // A worker with several connections takes its most active one's state:
     // hashing > stalled > standby.
     auto state_rank = [](const std::string& s) {
@@ -3238,7 +3253,10 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         if (lv.silent) ++connections_silent;
         const std::string state = session_state(lv);
         if (state == "hashing") ++connections_hashing;
-        else if (state == "standby") ++connections_standby;
+        else if (state == "standby") {
+            ++connections_standby;
+            if (lv.hashing_elsewhere) ++connections_standby_elsewhere;
+        }
         else ++connections_stalled;
         total_hashrate += w.hashrate;
         total_accepted += w.accepted;
@@ -3294,6 +3312,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
             }
             if (state_rank(state) > state_rank(wj["state"].get<std::string>()))
                 wj["state"] = state;
+            wj["hashing_elsewhere"] = wj["hashing_elsewhere"].get<bool>() && lv.hashing_elsewhere;
             if (lv.has_shared) {
                 wj["ever_submitted"] = true;
                 if (wj["last_share_age_s"].is_null()
@@ -3322,6 +3341,10 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
                 {"silent_seconds", lv.silent_seconds},
                 {"silent_threshold_seconds", lv.threshold_seconds},
                 {"state", state},
+                // Not hashing here, and its payout address hashes through
+                // another node (sharechain evidence; a failback session reads
+                // standby with ever_submitted true).
+                {"hashing_elsewhere", lv.hashing_elsewhere},
                 {"ever_submitted", lv.has_shared},
                 // Seconds since this worker's last accepted share on this node
                 // (poll resolution); null when it never shared here.
@@ -3348,6 +3371,7 @@ nlohmann::json MiningInterface::rest_stratum_stats(bool reveal_ips)
         {"connections_silent", connections_silent},
         {"connections_hashing", connections_hashing},
         {"connections_standby", connections_standby},
+        {"connections_standby_elsewhere", connections_standby_elsewhere},
         {"connections_stalled", connections_stalled},
         {"workers", static_cast<int>(unique_addrs.size())},
         {"unique_addresses", static_cast<int>(unique_addrs.size())},
@@ -4293,6 +4317,25 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             if (luck_input_changed)
                 recompute_found_block_luck_locked();
 
+            // HEIGHT OUT OF 0. A row stored at height 0 is a block whose height
+            // was unknown when it was recorded (the stale-job block 2561316 of
+            // 2026-10-25). The first later record that knows the height -- the
+            // sharechain hook re-records a block from its share's BIP34 height
+            // -- gives it that height, so the confirm/orphan lane can resolve
+            // it and it sorts into its place. A known height is never changed.
+            if (existing.height == 0 && height != 0) {
+                // Re-sorts the list: `existing` is not used past this point.
+                auto learned = learn_found_block_height_locked(hash_hex, chain, height);
+                if (learned && m_persist_block_fn) {
+                    try { m_persist_block_fn(*learned); }
+                    catch (const std::exception& e) {
+                        LOG_WARNING << "[Pool] Failed to persist found block"
+                                       " height: " << e.what();
+                    }
+                }
+                return;
+            }
+
             if (row_dirty && m_persist_block_fn) {
                 try { m_persist_block_fn(existing); }
                 catch (const std::exception& e) {
@@ -4530,6 +4573,68 @@ void MiningInterface::recompute_found_block_luck_locked()
     }
 }
 
+std::optional<MiningInterface::FoundBlock>
+MiningInterface::learn_found_block_height_locked(const std::string& hash,
+                                                 const std::string& chain,
+                                                 uint64_t height)
+{
+    // CALLER HOLDS m_blocks_mutex.
+    if (height == 0) return std::nullopt;
+    auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (it == m_found_blocks.end() || it->height != 0) return std::nullopt;
+    it->height = height;
+    LOG_INFO << "[Pool] found-block height learned: hash=" << hash.substr(0, 16)
+             << " chain=" << chain << " h=0 -> " << height;
+    // Same order record_found_block keeps: newest first by height, ts breaks
+    // ties. The row's interval was derived from its old place (none, at the
+    // bottom); the recompute re-derives every interval still unknown.
+    std::sort(m_found_blocks.begin(), m_found_blocks.end(),
+        [](const FoundBlock& a, const FoundBlock& b) {
+            if (a.height != b.height) return a.height > b.height;
+            return a.ts > b.ts;
+        });
+    recompute_found_block_luck_locked();
+    for (const auto& b : m_found_blocks)
+        if (b.hash == hash && b.chain == chain) return b;
+    return std::nullopt;
+}
+
+void MiningInterface::backfill_found_block_heights(const block_height_lookup_fn& height_fn)
+{
+    if (!height_fn) return;
+    // Snapshot the rows still at height 0, then ask the lookup with the lock
+    // released: it may read a header chain or tracker with locks of its own.
+    std::vector<std::pair<std::string, std::string>> unknown;   // (hash, chain)
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.height == 0 && !b.hash.empty())
+                unknown.emplace_back(b.hash, b.chain);
+    }
+    std::vector<FoundBlock> learned;
+    for (const auto& [hash, chain] : unknown) {
+        uint64_t h = 0;
+        try { h = height_fn(hash); } catch (...) { h = 0; }
+        if (h == 0) continue;
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        if (auto row = learn_found_block_height_locked(hash, chain, h))
+            learned.push_back(std::move(*row));
+    }
+    // Persist outside m_blocks_mutex (the LevelDB writer), as backfill does.
+    if (m_persist_block_fn) {
+        for (const auto& b : learned) {
+            try { m_persist_block_fn(b); }
+            catch (const std::exception& e) {
+                LOG_WARNING << "[Pool] Failed to persist found block height: " << e.what();
+            }
+        }
+    }
+    if (!unknown.empty())
+        LOG_INFO << "[Pool] found blocks at unknown height: " << unknown.size()
+                 << ", height learned for " << learned.size();
+}
+
 void MiningInterface::load_persisted_found_blocks()
 {
     if (!m_load_blocks_fn) return;
@@ -4543,11 +4648,20 @@ void MiningInterface::load_persisted_found_blocks()
         for (auto& blk : blocks)
         {
             bool exists = false;
-            for (const auto& existing : m_found_blocks)
+            for (auto& existing : m_found_blocks)
             {
                 if (existing.hash == blk.hash && existing.chain == blk.chain)
                 {
                     exists = true;
+                    // The persisted key carries the height, so a block whose
+                    // height was learned after it was first stored can be on
+                    // disk twice, the height-0 key listing first. A row only
+                    // ever climbs out of height 0, so the record at a real
+                    // height is the newer one: it wins whatever the order.
+                    if (existing.height == 0 && blk.height != 0) {
+                        existing = std::move(blk);
+                        existing.from_history = true;
+                    }
                     break;
                 }
             }
@@ -4736,25 +4850,24 @@ void MiningInterface::add_chain_verify_fn(const std::string& chain, block_verify
     m_chain_verify_fns[chain] = std::move(fn);
 }
 
-void MiningInterface::verify_found_block(size_t index)
+void MiningInterface::verify_found_block(const std::string& block_hash)
 {
-    std::string hash;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index >= m_found_blocks.size()) return;
-        auto& blk = m_found_blocks[index];
-        if (blk.status != BlockStatus::pending) return;
-        blk.check_count++;
-        hash = blk.hash;
-    }
-
-    // Select chain-specific verifier, fall back to default
+    // The row is found by hash under the lock each time it is touched: the
+    // verdict below runs unlocked, and record_found_block re-sorts the list
+    // on every insert, so no index survives from one lock to the next.
+    const std::string hash = block_hash;
     std::string chain;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        if (index < m_found_blocks.size())
-            chain = m_found_blocks[index].chain;
+        auto it = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+            [&](const FoundBlock& b) { return b.hash == hash; });
+        if (it == m_found_blocks.end()) return;
+        if (it->status != BlockStatus::pending) return;
+        it->check_count++;
+        chain = it->chain;
     }
+
+    // Select chain-specific verifier, fall back to default
     block_verify_fn_t verify_fn;
     auto it = m_chain_verify_fns.find(chain);
     if (it != m_chain_verify_fns.end())
@@ -4769,8 +4882,10 @@ void MiningInterface::verify_found_block(size_t index)
     try { result = verify_fn(hash); } catch (...) {}
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (index >= m_found_blocks.size()) return;
-    auto& blk = m_found_blocks[index];
+    auto row = std::find_if(m_found_blocks.begin(), m_found_blocks.end(),
+        [&](const FoundBlock& b) { return b.hash == hash && b.chain == chain; });
+    if (row == m_found_blocks.end()) return;
+    auto& blk = *row;
     if (blk.status != BlockStatus::pending) return;
 
     const auto& cn = blk.chain.empty() ? std::string("unknown") : blk.chain;
@@ -4882,28 +4997,24 @@ void MiningInterface::verify_found_block(size_t index)
 
 int MiningInterface::run_block_verification_now(const std::string& block_hash)
 {
-    size_t idx = SIZE_MAX;
-    {
-        std::lock_guard<std::mutex> lock(m_blocks_mutex);
-        for (size_t i = 0; i < m_found_blocks.size(); ++i) {
-            if (m_found_blocks[i].hash == block_hash) { idx = i; break; }
-        }
-    }
-    if (idx == SIZE_MAX) return std::numeric_limits<int>::min();
-
     // verify_found_block() takes m_blocks_mutex itself — must not hold it here.
-    verify_found_block(idx);
+    // It finds the row by hash (an unknown hash is a no-op), and the outcome
+    // is read back by hash too.
+    verify_found_block(block_hash);
 
     std::lock_guard<std::mutex> lock(m_blocks_mutex);
-    if (idx >= m_found_blocks.size()) return std::numeric_limits<int>::min();
-    switch (m_found_blocks[idx].status) {
-        case BlockStatus::confirmed:
-            return static_cast<int>(m_found_blocks[idx].confirmations);
-        case BlockStatus::orphaned:
-            return -1;
-        default:
-            return 0;
+    for (const auto& blk : m_found_blocks) {
+        if (blk.hash != block_hash) continue;
+        switch (blk.status) {
+            case BlockStatus::confirmed:
+                return static_cast<int>(blk.confirmations);
+            case BlockStatus::orphaned:
+                return -1;
+            default:
+                return 0;
+        }
     }
+    return std::numeric_limits<int>::min();
 }
 
 void MiningInterface::schedule_block_verification(const std::string& block_hash)
@@ -4975,11 +5086,16 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
         block_time_sec * 10,        // ~10 confs (final)
     };
 
+    // Each check finds the row by its HASH when it fires. The list is kept
+    // newest-first by height and re-sorted on every insert, so an index taken
+    // now names a different block as soon as another one is recorded inside
+    // this window -- its checks then land on the newcomer and this block can
+    // be left pending.
     for (int delay : delays) {
         auto timer = std::make_shared<boost::asio::steady_timer>(
             ioc, std::chrono::seconds(delay));
-        timer->async_wait([this, idx, timer](boost::system::error_code ec) {
-            if (!ec) verify_found_block(idx);
+        timer->async_wait([this, block_hash, timer](boost::system::error_code ec) {
+            if (!ec) (void)run_block_verification_now(block_hash);
         });
     }
 }
@@ -5068,12 +5184,12 @@ nlohmann::json MiningInterface::rest_local_stats()
         const auto workers = effective_stratum_workers();
         const auto liveness = observe_worker_liveness(
             workers, std::chrono::steady_clock::now());
-        int silent = 0, hashing = 0, standby = 0, stalled = 0;
+        int silent = 0, hashing = 0, standby = 0, stalled = 0, standby_elsewhere = 0;
         for (const auto& [sid, lv] : liveness) {
             if (lv.silent) ++silent;
             const std::string st = session_state(lv);
             if (st == "hashing") ++hashing;
-            else if (st == "standby") ++standby;
+            else if (st == "standby") { ++standby; if (lv.hashing_elsewhere) ++standby_elsewhere; }
             else ++stalled;
         }
         const int total = static_cast<int>(workers.size());
@@ -5083,6 +5199,9 @@ nlohmann::json MiningInterface::rest_local_stats()
             {"silent", silent},
             {"hashing", hashing},
             {"standby", standby},
+            // Of the standby sessions, those whose payout address is hashing
+            // through another node (failback included; core/hashing_elsewhere.hpp).
+            {"standby_elsewhere", standby_elsewhere},
             {"stalled", stalled},
             {"silent_floor_seconds", kSilentFloorSeconds}
         };
@@ -6680,7 +6799,13 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     double total_hr = 0, dead_hr = 0, diff = 0;
     uint64_t accepted = 0, rejected = 0, stale = 0;
     bool found = false;
+    // Rolling submit outcomes (core::stratum::SubmitOutcomeWindow), summed over
+    // the sessions that carry one.
+    core::stratum::SubmitOutcomeWindow::Counts win;
+    uint64_t unknown_job = 0;
+    bool has_window = false;
     {
+        const auto now = std::chrono::steady_clock::now();
         auto workers = effective_stratum_workers();
         for (const auto& [sid, w] : workers) {
             // Match base address (strip worker suffix)
@@ -6695,6 +6820,14 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
                 rejected += w.rejected;
                 stale += w.stale;
                 found = true;
+                if (w.submit_window) {
+                    const auto c = w.submit_window->window(now);
+                    win.accepted    += c.accepted;
+                    win.stale       += c.stale;
+                    win.unknown_job += c.unknown_job;
+                    unknown_job     += w.submit_window->unknown_job_total();
+                    has_window = true;
+                }
             }
         }
     }
@@ -6778,6 +6911,23 @@ nlohmann::json MiningInterface::rest_miner_stats(const std::string& address)
     result["orphan_shares"] = stale;          // stale-template shares are orphans
     result["doa_shares"] = 0;                 // no per-worker DOA share counter (see dead_hashrate)
     result["rejected_shares"] = rejected;     // invalid/low-diff submissions, never counted as shares
+
+    // doa_rate and the share counts above are cumulative since connect and
+    // count every submit whose job was not active, including the burst of
+    // results rigs flush after a node restart for jobs the previous process
+    // issued. The fields below cover only the last window_seconds and keep
+    // those unknown-job submits out of the rate; the miner page headline
+    // reads doa_rate_window. Only emitted when the sessions carry a window
+    // (otherwise absent, and the page falls back to doa_rate).
+    if (has_window) {
+        result["window_seconds"] = core::stratum::SubmitOutcomeWindow::kWindowSeconds;
+        result["window_accepted_shares"] = win.accepted;
+        result["window_dead_shares"] = win.stale;             // job issued on this connection, since expired
+        result["window_unknown_job_shares"] = win.unknown_job; // job id never issued on this connection
+        result["doa_rate_window"] = (win.accepted + win.stale > 0)
+            ? static_cast<double>(win.stale) / (win.accepted + win.stale) : 0.0;
+        result["unknown_job_shares"] = unknown_job;           // since connect; included in dead_shares
+    }
 
     return result;
 }
@@ -8602,7 +8752,37 @@ MiningInterface::WorkerLiveness MiningInterface::classify_worker_liveness(
 const char* MiningInterface::session_state(const WorkerLiveness& lv)
 {
     if (!lv.has_shared) return "standby";
-    return lv.silent ? "stalled" : "hashing";
+    if (!lv.silent) return "hashing";
+    // Failback: silent here, but its address hashes through another node.
+    return lv.hashing_elsewhere ? "standby" : "stalled";
+}
+
+void MiningInterface::mark_hashing_elsewhere(const std::map<std::string, WorkerInfo>& workers,
+                                             std::map<std::string, WorkerLiveness>& liveness,
+                                             const core::stratum::AddressActivity& activity,
+                                             int64_t now_unix)
+{
+    // The relay's "no worker of that address is up here": an address with a
+    // hashing session here is not hashing elsewhere, for any of its sessions.
+    std::set<std::string> hashing_here;
+    for (const auto& [sid, w] : workers) {
+        const auto it = liveness.find(sid);
+        if (it != liveness.end() && it->second.has_shared && !it->second.silent)
+            hashing_here.insert(core::stratum::payout_address_of(w.username));
+    }
+    for (const auto& [sid, w] : workers) {
+        const auto it = liveness.find(sid);
+        if (it == liveness.end()) continue;
+        WorkerLiveness& lv = it->second;
+        lv.hashing_elsewhere = false;
+        if (lv.has_shared && !lv.silent) continue;   // hashing here
+        const std::string addr = core::stratum::payout_address_of(w.username);
+        const auto newest = activity.newest(addr, now_unix);
+        if (!newest) continue;                        // no evidence
+        const int64_t last_here = lv.has_shared ? now_unix - lv.silent_seconds : 0;
+        lv.hashing_elsewhere = core::stratum::hashing_elsewhere(
+            *newest, last_here, now_unix, hashing_here.count(addr) > 0);
+    }
 }
 
 std::map<std::string, MiningInterface::WorkerLiveness>
@@ -8610,28 +8790,35 @@ MiningInterface::observe_worker_liveness(const std::map<std::string, WorkerInfo>
                                          std::chrono::steady_clock::time_point now) const
 {
     std::map<std::string, WorkerLiveness> out;
-    std::lock_guard<std::mutex> lock(m_share_seen_mutex);
-    for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
-        if (workers.count(it->first)) ++it;
-        else it = m_share_seen.erase(it);   // session gone
-    }
-    for (const auto& [sid, w] : workers) {
-        auto [it, fresh] = m_share_seen.try_emplace(sid);
-        ShareSeen& seen = it->second;
-        if (fresh || w.accepted != seen.accepted) {
-            if (w.accepted > 0)
-                seen.last_share_at = now;
-            else
-                seen.last_share_at.reset();
-            seen.accepted = w.accepted;
+    {
+        std::lock_guard<std::mutex> lock(m_share_seen_mutex);
+        for (auto it = m_share_seen.begin(); it != m_share_seen.end();) {
+            if (workers.count(it->first)) ++it;
+            else it = m_share_seen.erase(it);   // session gone
         }
-        // A registry that stamps the share time gives the exact age; the
-        // poll stamp above is the fallback for one that does not.
-        if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
-            && w.last_accepted_at <= now)
-            seen.last_share_at = w.last_accepted_at;
-        out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+        for (const auto& [sid, w] : workers) {
+            auto [it, fresh] = m_share_seen.try_emplace(sid);
+            ShareSeen& seen = it->second;
+            if (fresh || w.accepted != seen.accepted) {
+                if (w.accepted > 0)
+                    seen.last_share_at = now;
+                else
+                    seen.last_share_at.reset();
+                seen.accepted = w.accepted;
+            }
+            // A registry that stamps the share time gives the exact age; the
+            // poll stamp above is the fallback for one that does not.
+            if (w.accepted > 0 && w.last_accepted_at != std::chrono::steady_clock::time_point{}
+                && w.last_accepted_at <= now)
+                seen.last_share_at = w.last_accepted_at;
+            out[sid] = classify_worker_liveness(w, seen.last_share_at, now);
+        }
     }
+    // Failback evidence: one cached sharechain snapshot (no tracker access on
+    // this thread), applied outside the share-seen lock.
+    if (m_address_activity_fn && !out.empty())
+        mark_hashing_elsewhere(workers, out, m_address_activity_fn(),
+                               static_cast<int64_t>(std::time(nullptr)));
     return out;
 }
 
@@ -8642,6 +8829,7 @@ nlohmann::json MiningInterface::silent_workers_list(
     struct Agg {
         bool silent{true};
         bool has_shared{false};
+        bool hashing_elsewhere{true};   // every connection hashing elsewhere
         int64_t silent_seconds{std::numeric_limits<int64_t>::max()};
         int64_t threshold_seconds{0};
         int connections{0};
@@ -8656,6 +8844,7 @@ nlohmann::json MiningInterface::silent_workers_list(
         Agg& a = by_worker[key];
         a.silent = a.silent && lv.silent;
         a.has_shared = a.has_shared || lv.has_shared;
+        a.hashing_elsewhere = a.hashing_elsewhere && lv.hashing_elsewhere;
         ++a.connections;
         if (lv.silent_seconds < a.silent_seconds) {
             a.silent_seconds = lv.silent_seconds;
@@ -8677,7 +8866,8 @@ nlohmann::json MiningInterface::silent_workers_list(
             {"silent_seconds", a.silent_seconds},
             {"threshold_seconds", a.threshold_seconds},
             {"has_shared", a.has_shared},
-            {"state", a.has_shared ? "stalled" : "standby"},
+            {"state", a.has_shared && !a.hashing_elsewhere ? "stalled" : "standby"},
+            {"hashing_elsewhere", a.hashing_elsewhere},
             {"connections", a.connections}
         });
     }
