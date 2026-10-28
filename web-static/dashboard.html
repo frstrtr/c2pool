@@ -2365,7 +2365,7 @@
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Blocks Found</span>
+                            <span class="label" id="defrag-blocks-label" title="Shares in this window that solved a block">Blocks in Window</span>
                             <span class="value" id="defrag-blocks" style="color:#ffd700">-</span>
                         </div>
                     </div>
@@ -2405,15 +2405,15 @@
                             <span>Node fee share</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1a1400;border:2px solid #ffd700;box-shadow:0 0 5px rgba(255,215,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffd700"></div></div>
                             <span style="color:#0070dd;font-weight:600"><span class="symbol-small">COIN</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
+                            <div class="legend-swatch" style="background:#001a1d;border:2px solid #00e5ff;box-shadow:0 0 5px rgba(0,229,255,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#00e5ff"></div></div>
                             <span style="color:#a335ee;font-weight:600"><span class="merged-child-symbol-hint">DOGE</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1d0e00;border:2px solid #ffaa00;box-shadow:0 0 5px rgba(255,170,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffaa00"></div></div>
                             <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
                         <div class="legend-item">
@@ -2630,6 +2630,13 @@
             }
         }
 
+        // Each Active Miners render waits on three fetches before it draws, and
+        // a refresh, the "Show historical" toggle or a manual reload can start
+        // another while one is in flight. Only the newest render may draw:
+        // two overlapping renders both appended the table, so the same address
+        // showed up twice (one copy's toggle then hid the other's workers).
+        var _minersRenderGen = 0;
+
         function populateActiveMiners(local_stats, global_stats) {
             d3.select('#active_miners_loading').style('display', 'none');
             
@@ -2837,6 +2844,7 @@
                 var ELSEWHERE_TITLE = 'Hashing on another node: no share on this connection now, but this payout address keeps getting sharechain shares minted by another node (within 15 min). Usually a rig that failed over here and back. The evidence is per address, not per rig.';
                 
                 function renderMinersTable(showHistorical) {
+                    var renderGen = ++_minersRenderGen;
                     var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
                 
                     // Update count badge: active count (/ total if showing historical)
@@ -2861,6 +2869,10 @@
                 d3.json('../current_payouts', function(payouts_data) {
                 d3.json('../current_merged_payouts', function(merged_payouts_data) {
                 d3.json('../web/graph_data/miner_hash_rates/last_day', function(hr_day) {
+                // A newer render started while these fetches were in flight; it
+                // owns the table, so this one draws nothing.
+                if (renderGen !== _minersRenderGen) return;
+                d3.select('#active_miners tbody').selectAll('tr').remove();
                 // #1142 item 6: per-worker 24h average, same derivation as the
                 // miners.html card aggregate. A worker is averaged only over the
                 // samples it appears in; no samples means no average (shown '-').
@@ -3182,8 +3194,10 @@
                 });
                 } // end renderMinersTable
                 
-                // Initial render — show only currently connected (active) miners
-                renderMinersTable(false);
+                // Initial render follows the "Show historical" box, so a refresh
+                // does not drop historical rows while the box stays ticked.
+                var historicalBox = document.getElementById('show_historical_miners');
+                renderMinersTable(!!(historicalBox && historicalBox.checked));
                 
                 // Wire checkbox to toggle historical miners visibility
                 d3.select('#show_historical_miners').on('change', function() {
@@ -5671,6 +5685,41 @@
         // =============================================
         // Sharechain Defragmenter Viewer
         // =============================================
+
+        // A share that solved a block is drawn as a DARK cell with a bright
+        // glowing ring and a centre pip, so it differs from every share colour
+        // in fill and shape, not by hue alone. The old thin gold outline on a
+        // bright green cell was nearly invisible, and a plain gold fill would
+        // read as an orphan (amber). kind: 'primary' | 'child' | 'twin'.
+        var BLOCK_MARK = {
+            primary: { ring: '#ffd700', core: '#1a1400' },
+            child:   { ring: '#00e5ff', core: '#001a1d' },
+            twin:    { ring: '#ffaa00', core: '#1d0e00' }
+        };
+        function blockMarkKind(isPrimary, isChild) {
+            if (isPrimary && isChild) return 'twin';
+            if (isPrimary) return 'primary';
+            if (isChild) return 'child';
+            return null;
+        }
+        function drawBlockMark(ctx, x, y, size, kind) {
+            var m = BLOCK_MARK[kind];
+            var lw = size < 8 ? 1 : Math.max(2, Math.round(size * 0.18));
+            var pip = Math.max(1, Math.round(size * 0.3));
+            ctx.save();
+            ctx.fillStyle = m.core;
+            ctx.fillRect(x, y, size, size);
+            ctx.shadowColor = m.ring;
+            ctx.shadowBlur = Math.max(3, size * 0.5);
+            ctx.strokeStyle = m.ring;
+            ctx.lineWidth = lw;
+            ctx.strokeRect(x + lw / 2, y + lw / 2, size - lw, size - lw);
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = m.ring;
+            ctx.fillRect(x + (size - pip) / 2, y + (size - pip) / 2, pip, pip);
+            ctx.restore();
+        }
+
         var defrag = {
             canvas: null,
             ctx: null,
@@ -6009,25 +6058,8 @@
                     var isDogeBlock = !!this.dogeSet[share.h];
                     var isHead = !!this.headSet[share.h];
 
-                    // LTC block solution: gold border + inner fill
-                    if (isLtcBlock && isDogeBlock) {
-                        // Twin block — Legendary: orange glow
-                        ctx.fillStyle = '#ff8000';
-                        ctx.fillRect(x, y, cs, cs);
-                        ctx.strokeStyle = '#ffaa00';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isLtcBlock) {
-                        // LTC block only: gold border
-                        ctx.strokeStyle = '#ffd700';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isDogeBlock) {
-                        // DOGE block only: cyan border
-                        ctx.strokeStyle = '#00e5ff';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    }
+                    var markKind = blockMarkKind(isLtcBlock, isDogeBlock);
+                    if (markKind) drawBlockMark(ctx, x, y, cs, markKind);
 
                     // Chain head: only mark position 0 (actual tip)
                     if (i === 0 && !isLtcBlock && !isDogeBlock) {
@@ -6545,17 +6577,8 @@
 
                         var isLtc = !!animBlockSet[share.h];
                         var isDoge = !!animDogeSet[share.h];
-                        if (isLtc && isDoge) {
-                            ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
-                            ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isLtc) {
-                            ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isDoge) {
-                            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        }
+                        var animMarkKind = blockMarkKind(isLtc, isDoge);
+                        if (animMarkKind) drawBlockMark(ctx, sx, sy, sw, animMarkKind);
 
                         // Head marker: only on tip share (position 0) after it has landed
                         if (i === 0 && !isNew && !isLtc && !isDoge && ctx.globalAlpha >= 1) {
@@ -6956,16 +6979,12 @@
                 // Block solution / head borders on the overlay
                 var isLtc = this.blockSet[share.h];
                 var isDoge = this.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    hc.style.background = 'linear-gradient(135deg, #ff8000, #cc6600)';
-                    hc.style.border = '2px solid #ffaa00';
-                    hc.style.boxShadow = '0 0 12px rgba(255,128,0,0.7)';
-                } else if (isLtc) {
-                    hc.style.border = '2px solid #ffd700';
-                    hc.style.boxShadow = '0 0 8px rgba(255,215,0,0.5)';
-                } else if (isDoge) {
-                    hc.style.border = '2px solid #00e5ff';
-                    hc.style.boxShadow = '0 0 8px rgba(0,229,255,0.5)';
+                var hcMark = blockMarkKind(isLtc, isDoge);
+                if (hcMark) {
+                    var hm = BLOCK_MARK[hcMark];
+                    hc.style.background = 'radial-gradient(' + hm.ring + ' 0 18%, ' + hm.core + ' 19%)';
+                    hc.style.border = '3px solid ' + hm.ring;
+                    hc.style.boxShadow = '0 0 12px ' + hm.ring;
                 }
 
                 // Trigger enlarge: remove shrinking, force reflow, add active
@@ -7277,7 +7296,15 @@
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
-                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
+                // A young sharechain is shorter than the PPLNS window: nothing has
+                // left the window yet, so no tail share dissolves. Say so instead
+                // of leaving an eviction-free tail unexplained.
+                var totalEl = document.getElementById('defrag-total');
+                var filling = data.window_size > 0 && shares.length < data.window_size;
+                totalEl.textContent = shares.length + ' / ' + (data.window_size || '-') + (filling ? ' (filling)' : '');
+                totalEl.title = filling
+                    ? 'The window is still filling: no share leaves it until ' + data.window_size + ' shares are in it.'
+                    : '';
                 document.getElementById('defrag-mine').textContent = mine;
                 document.getElementById('defrag-stale').textContent = stale;
                 document.getElementById('defrag-dead').textContent = dead;
@@ -7294,11 +7321,33 @@
                     blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
                 }
                 document.getElementById('defrag-blocks').textContent = blocksText;
+                setBlocksScopeTitle(shares);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
+
+        // "Blocks in Window" counts the shares IN THE SHOWN WINDOW that solved
+        // a block — the same scope as Shares / Verified / Orphan above it, not
+        // the node's whole found-block history. The window covers the last
+        // window_size shares, so its time span depends on the share rate;
+        // the tooltip states the actual span.
+        function setBlocksScopeTitle(shares) {
+            var n = shares ? shares.length : 0;
+            var span = '';
+            if (n > 1 && shares[0].t && shares[n - 1].t) {
+                var hrs = Math.abs(shares[0].t - shares[n - 1].t) / 3600;
+                span = ' (spanning ' + (hrs >= 1 ? hrs.toFixed(1) + ' h' : Math.round(hrs * 60) + ' min') + ')';
+            }
+            var title = 'Shares that solved a block, counted over the ' + n
+                + ' shares in this window' + span + '. Blocks found before the'
+                + ' oldest share in the window are not counted.';
+            var l = document.getElementById('defrag-blocks-label');
+            var v = document.getElementById('defrag-blocks');
+            if (l) l.title = title;
+            if (v) v.title = title;
+        }
 
         // ── Phase B #9 feature flag ───────────────────────────────
         // Set ?new-explorer=1 in the URL (or localStorage.c2p_new_explorer=1)
@@ -7725,13 +7774,12 @@
             if (share) {
                 var isLtc = defrag.blockSet[share.h];
                 var isDoge = defrag.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    cell.classList.add('cell-legendary');
-                } else if (isLtc) {
-                    cell.style.border = '2px solid #ffd700';
-                    cell.style.boxShadow = '0 0 4px rgba(255,215,0,0.4)';
-                } else if (isDoge) {
-                    cell.style.border = '2px solid #00e5ff';
+                var cellMark = blockMarkKind(isLtc, isDoge);
+                if (cellMark) {
+                    var cm = BLOCK_MARK[cellMark];
+                    cell.style.background = cm.core;
+                    cell.style.border = '2px solid ' + cm.ring;
+                    cell.style.boxShadow = '0 0 4px ' + cm.ring;
                 }
             }
 
@@ -10197,6 +10245,7 @@
                                 bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
                             }
                             statEls.blocks.textContent = bt;
+                            setBlocksScopeTitle(state.window.shares);
                         }
                     }
                     window.addEventListener('beforeunload', function() {

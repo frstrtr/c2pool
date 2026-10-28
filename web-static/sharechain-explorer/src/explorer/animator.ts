@@ -28,7 +28,7 @@ import type {
   ShareForClassify,
   UserContext,
 } from './colors.js';
-import { getColor } from './colors.js';
+import { blockCellStyle, getColor } from './colors.js';
 import { lerpColor, applyAlpha, parseHexColor } from './color-utils.js';
 
 // ── Input / output types ────────────────────────────────────────────
@@ -96,6 +96,9 @@ export interface CellFrame {
   /** Coloured border stroke painted on top of the cell fill.
    *  Used for block markers (LTC gold, DOGE cyan, twin orange). */
   stroke?: { color: string; lineWidth: number };
+  /** Colour of the centre pip painted on a block-solution cell, so a block
+   *  differs by shape as well as colour. */
+  blockMark?: string;
   /** Paint a tiny white tip-triangle in the top-left corner of the
    *  cell — set only on the tip share when no block marker applies. */
   tipMark?: boolean;
@@ -487,15 +490,8 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
       const isLtc = input.primaryBlockHashes?.has(waveShort) ?? false;
       const isDoge = input.dogeBlockHashes?.has(waveShort) ?? false;
       const isTip = input.tipHash !== undefined && input.tipHash === waveShort;
-      let stroke: { color: string; lineWidth: number } | undefined;
-      if (isLtc && isDoge) {
-        color = '#ff8000';              // twin orange fill
-        stroke = { color: '#ffaa00', lineWidth: 2 };
-      } else if (isLtc) {
-        stroke = { color: '#ffd700', lineWidth: 2 };
-      } else if (isDoge) {
-        stroke = { color: '#00e5ff', lineWidth: 2 };
-      }
+      const mark = blockCellStyle(isLtc, isDoge);
+      if (mark) color = mark.color;
       const cell: CellFrame = {
         shareHash: entry.hash,
         track: 'wave',
@@ -505,7 +501,7 @@ export function buildAnimationPlan(input: AnimationInput): AnimationPlan {
         color,
         alpha: 1,
       };
-      if (stroke) cell.stroke = stroke;
+      if (mark) { cell.stroke = mark.stroke; cell.blockMark = mark.blockMark; }
       if (isTip && !isLtc && !isDoge) cell.tipMark = true;
       cells.push(cell);
     }
