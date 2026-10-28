@@ -789,7 +789,7 @@ public:
         if (c.verdict == HelloVerdict::Accept) {
             const bool fresh = peers_.count(peer) == 0;
             peers_[peer] = theirs.tail;
-            hf_round_.insert(peer);  // the peer's next catch-up request is a round's first
+            if (fresh) hf_round_.insert(peer);  // a new link: its next catch-up request is a round's first
             if (fresh) joiner_->release_waits(std::nullopt);  // a new Path B peer: the pairs waiting on a P_r are tried
             // the first catch-up round after the start opens at the first tail whose tip is not held here (the template
             // gate); the tail's best_cum_work is not read
@@ -2167,7 +2167,7 @@ private:
         std::uint64_t sent_s = 0;  // this page's send
         bool arrived = false;      // a frame of its reply arrived: its P-53 clock stopped
         bool retired = false;      // no frame within P-53: its reply DROPs when it arrives
-        bool first = false;        // a catch-up round's first request (the first after a HELLO)
+        bool first = false;        // a catch-up round's first request (the first after a link's first HELLO)
         std::vector<CarrierHeader> got;      // the branch's headers so far, oldest first
         std::vector<std::uint64_t> heights;  // h(y) of each
     };
@@ -3599,7 +3599,7 @@ private:
     std::uint64_t parent_reasks_ = 0;               // ... of them by reask_parents
     std::map<Hash32, std::uint64_t> reask_round_;   // reask_parents: asks of a missing parent sent past its sender
     std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
-    std::set<std::uint64_t> hf_round_;              // peers whose next catch-up request opens a round (after a HELLO)
+    std::set<std::uint64_t> hf_round_;              // links whose next catch-up request opens a round (first HELLO)
     std::uint64_t hf_placed_s_ = 0;                 // the last placement of a body a header page asked (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;

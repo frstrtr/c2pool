@@ -9149,11 +9149,12 @@ void rclate() {
         silent_checks("rclate " + std::to_string(late) + " s", silent_run(0, late), true);
 }
 
-// rcrehello: only a catch-up round's first request (the first after a HELLO) makes headers first live, for at most P-53.
-// J follows S; S HELLOs J. Round 1: J's first request R1 is live until its reply; a later request R2 of the round is
-// not live, nor after S HELLOs again while R2 is in flight. Round 2: its first request R3 gets no reply (S silent) while
-// S HELLOs every 5 s: R3 is live through P-53 and retired after it, and nothing is live after it; a frame J parks
-// meanwhile asks its parent once headers first is not live.
+// rcrehello: only a catch-up round's first request (the first after a link's first HELLO) makes headers first live, for
+// at most P-53. J follows S; S HELLOs J. Round 1: J's first request R1 is live until its reply; a later request R2 of the
+// round is not live, nor after S HELLOs again on the same link while R2 is in flight, nor the request R2' after that
+// HELLO. Round 2, on a new link (S's link drops, S HELLOs again): its first request R3 gets no reply (S silent) while S
+// HELLOs every 5 s on that link: R3 is live through P-53 and retired after it, and nothing is live after it; a frame J
+// parks meanwhile asks its parent once headers first is not live.
 void rcrehello() {
     const KatNet net;
     Harness h(net);
@@ -9188,6 +9189,10 @@ void rcrehello() {
     const bool rehello2 = hello();
     const bool live2_rehello = live();
     serve();
+    const bool r2b = ask();  // R2': the request after the HELLO on the same link
+    const bool live2b = live();
+    serve();
+    h[j].disconnect(s);  // S's link drops; S links again
     const bool round2 = hello();
     const bool r3 = ask();
     const bool live3 = live();
@@ -9236,13 +9241,16 @@ void rcrehello() {
         h.q.clear();
     }
     const bool r4 = h[j].request_headers(s, tip, tip, 64, h.now);  // R3 retired, no reply: the slot stays taken
-    std::printf("  rcrehello: R1 live %d, after its reply %d; R2 live %d, after a re-HELLO %d; R3 (round 2) live %d, within "
-                "P-53 of it %d, past it %d; parked %d; asks of its parent within P-53 %zu, past it %zu; a new request %d\n",
-                live1 ? 1 : 0, live1_after ? 1 : 0, live2 ? 1 : 0, live2_rehello ? 1 : 0, live3 ? 1 : 0, live_in ? 1 : 0,
-                live_out ? 1 : 0, parked ? 1 : 0, asked_live, asked_after, r4 ? 1 : 0);
-    check(setup && r1 && r2 && rehello2 && round2 && r3 && parked, "rcrehello: setup (J on S's chain, S's HELLOs, requests)");
+    std::printf("  rcrehello: R1 live %d, after its reply %d; R2 live %d, after a HELLO on the same link %d; R2' live %d; "
+                "R3 (round 2, a new link) live %d, within P-53 of it %d, past it %d; parked %d; asks of its parent within "
+                "P-53 %zu, past it %zu; a new request %d\n",
+                live1 ? 1 : 0, live1_after ? 1 : 0, live2 ? 1 : 0, live2_rehello ? 1 : 0, live2b ? 1 : 0, live3 ? 1 : 0,
+                live_in ? 1 : 0, live_out ? 1 : 0, parked ? 1 : 0, asked_live, asked_after, r4 ? 1 : 0);
+    check(setup && r1 && r2 && rehello2 && r2b && round2 && r3 && parked,
+          "rcrehello: setup (J on S's chain, S's HELLOs, requests)");
     check(live1 && !live1_after, "rcrehello: a round's first request is live until its reply");
-    check(!live2 && !live2_rehello, "rcrehello: a later request of the round is not live, nor after a re-HELLO");
+    check(!live2 && !live2_rehello, "rcrehello: a later request of the round is not live, nor after a HELLO on the same link");
+    check(!live2b, "rcrehello: a HELLO on the same link never makes a request first (R2' not live)");
     check(live3 && live_in && asked_live == 0, "rcrehello: round 2's first request, unanswered, live within P-53; no ask");
     check(!live_out && asked_after >= 1 && !r4,
           "rcrehello: retired at P-53, nothing live after it although S HELLOs every 5 s; the parked frame's parent asked");
