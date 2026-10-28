@@ -1007,6 +1007,20 @@ private:
             auto want = m_io.hash_at(h);
             if (!want || *want != bh) { m_buf.erase(it); return; }   // reorged away
             if (!boot_gate_open(h)) return;
+            // The body must extend the engine's own cursor block (the engine
+            // refuses it otherwise); checked BEFORE the quorum lane observes
+            // it, so the two cursors never split. A mismatch here means the
+            // chain moved under the cursor: drop the body, check_reorg
+            // re-anchors on the next pump.
+            if (blk.m_previous_block != m_eng.block_hash()) {
+                LOG_WARNING << "[POSE-ORACLE] body h=" << h << " does not extend"
+                               " the cursor block "
+                            << m_eng.block_hash().GetHex().substr(0, 16)
+                            << " — dropped; re-anchoring on the best chain";
+                m_buf.erase(it);
+                m_repump = true;
+                return;
+            }
             auto miss = m_br.unresolved_member_sets(blk, /*kick=*/true);
             if (!miss.empty()) {
                 if (m_last_hold_logged != h) {
@@ -1037,7 +1051,12 @@ private:
             const FoldResult r = m_eng.fold_block(blk, h);
             m_br.after_fold(h);
             if (!r.ok) {
-                on_poisoned();
+                if (m_eng.poisoned()) { on_poisoned(); return; }
+                // A refusal without poison leaves the engine untouched (e.g.
+                // a prev-link the pre-check above already excludes).
+                LOG_WARNING << "[POSE-ORACLE] fold of h=" << h << " refused: "
+                            << r.error;
+                m_buf.erase(it);
                 return;
             }
             ++m_stats.folded;

@@ -935,7 +935,7 @@ TEST(DashReplayFoldSynthetic, EmptyNetInfoRegistersBannedThenProUpServRevives)
     e2.netAddress = up.netInfo.ip;
     e2.netPort    = up.netInfo.port_be;
     auto r2 = eng.fold_block(
-        make_block(102, raw256(10), root_of({e2}), {uptx}), 102);
+        make_block(102, eng.block_hash(), root_of({e2}), {uptx}), 102);
     ASSERT_TRUE(r2.ok) << r2.error;
     EXPECT_EQ(r2.revived, 1u);
     EXPECT_FALSE(eng.find(mn)->IsBanned());
@@ -1009,7 +1009,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
         up.scriptOperatorPayout.m_data = script_bytes(0x99);
         auto uptx = make_special_tx(2, up, 2);
         auto r = eng.fold_block(
-            make_block(102, raw256(10), root_of({expected_entry_of(p, mn)}),
+            make_block(102, eng.block_hash(), root_of({expected_entry_of(p, mn)}),
                        {uptx}, &eng), 102);
         ASSERT_TRUE(r.ok) << r.error;
         EXPECT_FALSE(eng.find(mn)->scriptOperatorPayout.m_data.empty());
@@ -1035,7 +1035,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     e.keyIDVoting    = upr.keyIDVoting;
     e.isValid        = false; // banned until a ProUpServTx revives
     e.nType          = MnType::REGULAR;
-    auto r = eng.fold_block(make_block(103, raw256(11), root_of({e}), {uprtx}, &eng),
+    auto r = eng.fold_block(make_block(103, eng.block_hash(), root_of({e}), {uprtx}, &eng),
                             103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.banned, 1u);
@@ -1084,15 +1084,15 @@ TEST(DashReplayFoldSynthetic, ReplayFoldPayeeCheckAcceptsFullOperatorSplit)
         up.scriptOperatorPayout.m_data = script_bytes(0x99);
         auto uptx = make_special_tx(2, up, 2);
         auto r2 = eng.fold_block(
-            make_block(102, raw256(10), root_of({expected_entry_of(p, mn)}),
+            make_block(102, eng.block_hash(), root_of({expected_entry_of(p, mn)}),
                        {uptx}, &eng), 102);
         ASSERT_TRUE(r2.ok) << r2.error;
         ASSERT_EQ(eng.find(mn)->nOperatorReward, 10000);
         ASSERT_EQ(eng.find(mn)->scriptOperatorPayout.m_data, script_bytes(0x99));
     };
-    auto paying = [](const CProRegTx& p, const uint256& mn,
+    auto paying = [](const DmlFoldEngine& eng, const CProRegTx& p, const uint256& mn,
                      const std::vector<unsigned char>& script) {
-        auto b = make_block(103, raw256(11), root_of({expected_entry_of(p, mn)}));
+        auto b = make_block(103, eng.block_hash(), root_of({expected_entry_of(p, mn)}));
         TxOut out;
         out.value = 77'055'682;
         out.scriptPubKey.m_data = script;
@@ -1107,7 +1107,7 @@ TEST(DashReplayFoldSynthetic, ReplayFoldPayeeCheckAcceptsFullOperatorSplit)
         if (HasFatalFailure()) return;
         ASSERT_TRUE(eng.project_payee(103).has_value());
         ASSERT_EQ(*eng.project_payee(103), mn);
-        auto r = eng.fold_block(paying(p, mn, script_bytes(0x99)), 103);
+        auto r = eng.fold_block(paying(eng, p, mn, script_bytes(0x99)), 103);
         ASSERT_TRUE(r.ok)
             << "a coinbase paying ONLY the operator script is dashd's exact"
                " output set for a bps=10000 masternode: " << r.error;
@@ -1120,7 +1120,7 @@ TEST(DashReplayFoldSynthetic, ReplayFoldPayeeCheckAcceptsFullOperatorSplit)
         uint256 mn; CProRegTx p;
         history(eng, mn, p);
         if (HasFatalFailure()) return;
-        auto r = eng.fold_block(paying(p, mn, p.scriptPayout.m_data), 103);
+        auto r = eng.fold_block(paying(eng, p, mn, p.scriptPayout.m_data), 103);
         ASSERT_FALSE(r.ok)
             << "an owner-only coinbase cannot have been built by dashd from a"
                " bps=10000 state with an operator script — exact script"
@@ -1152,7 +1152,7 @@ TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
     e.proRegTxHash = mn;
     e.keyIDVoting  = p.keyIDVoting;
     e.isValid      = false;
-    auto r = eng.fold_block(make_block(102, raw256(10), root_of({e}), {revtx}, &eng),
+    auto r = eng.fold_block(make_block(102, eng.block_hash(), root_of({e}), {revtx}, &eng),
                             102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revoked, 1u);
@@ -1182,7 +1182,7 @@ TEST(DashReplayFoldSynthetic, CollateralReplacementRemovesOldMN)
     auto tx2 = make_special_tx(1, p2, 2);
     const uint256 mn2 = tx_hash_of(tx2);
     auto r = eng.fold_block(
-        make_block(102, raw256(10), root_of({expected_entry_of(p2, mn2)}),
+        make_block(102, eng.block_hash(), root_of({expected_entry_of(p2, mn2)}),
                    {tx2}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.collateral_replaced, 1u);
@@ -1265,7 +1265,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
 
     // Block 102: punish #1 → penalty 66, no ban (66 < 100), root unchanged.
     auto r = eng.fold_block(
-        make_block(102, raw256(10), root_of({ea, eb, ec}), {make_qc(4)}, &eng), 102);
+        make_block(102, eng.block_hash(), root_of({ea, eb, ec}), {make_qc(4)}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 1u);
     EXPECT_EQ(r.banned, 0u);
@@ -1278,7 +1278,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     auto ea_banned = ea;
     ea_banned.isValid = false;
     r = eng.fold_block(
-        make_block(103, raw256(11), root_of({ea_banned, eb, ec}),
+        make_block(103, eng.block_hash(), root_of({ea_banned, eb, ec}),
                    {make_qc(5)}, &eng), 103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.decayed, 1u);
@@ -1298,7 +1298,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     null_qc.commitment.signers      = {false, false, false};
     null_qc.commitment.validMembers = {false, false, false};
     r = eng.fold_block(
-        make_block(104, raw256(12), root_of({ea_banned, eb, ec}),
+        make_block(104, eng.block_hash(), root_of({ea_banned, eb, ec}),
                    {make_special_tx(6, null_qc, 6)}, &eng), 104);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 0u);
@@ -1311,7 +1311,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     up.proTxHash = a;
     up.netInfo   = pa.netInfo;
     r = eng.fold_block(
-        make_block(105, raw256(13), root_of({ea, eb, ec}),
+        make_block(105, eng.block_hash(), root_of({ea, eb, ec}),
                    {make_special_tx(2, up, 7)}, &eng), 105);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revived, 1u);
@@ -1337,12 +1337,14 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
     // confirmedHash = hash(116) = that block's own hashPrevBlock.
     for (uint32_t h = 102; h <= 116; ++h) {
         auto r = eng.fold_block(
-            make_block(h, raw256(static_cast<uint8_t>(h)), root_of({e}), {}, &eng), h);
+            make_block(h, eng.block_hash(), root_of({e}), {}, &eng), h);
         ASSERT_TRUE(r.ok) << "h=" << h << ": " << r.error;
         EXPECT_EQ(r.confirmed, 0u) << "h=" << h;
         EXPECT_TRUE(eng.find(mn)->confirmedHash.IsNull()) << "h=" << h;
     }
-    const uint256 hash116 = raw256(117); // prev-hash we hand block 117
+    // The prev-link block 117 must carry = the cursor block (116) — and
+    // that hash is what becomes the confirmedHash.
+    const uint256 hash116 = eng.block_hash();
     auto e_conf = e;
     e_conf.confirmedHash = hash116;
     auto r = eng.fold_block(make_block(117, hash116, root_of({e_conf}), {}, &eng), 117);
@@ -1362,6 +1364,38 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
         std::memcpy(expect_pair.data(), out, 32);
     }
     EXPECT_EQ(eng.find(mn)->confirmedHashWithProRegTxHash, expect_pair);
+}
+
+// The engine's state is the post-state of (m_height, m_block_hash) and the
+// penalty oracle answers for exactly that pair (PR-B verify, must-fix
+// 2): a block whose prev-link names a different block is REFUSED — no
+// mutation, no poison (the held state is still right for its own block) —
+// and the correct child still folds afterwards.
+TEST(DashReplayFoldSynthetic, FoldRefusesABlockThatDoesNotExtendTheCursor)
+{
+    DmlFoldEngine eng(synth_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    auto p  = make_proreg(1);
+    auto tx = make_special_tx(1, p, 1);
+    const uint256 mn = tx_hash_of(tx);
+    const auto e = expected_entry_of(p, mn);
+    ASSERT_TRUE(eng.fold_block(
+        make_block(101, raw256(9), root_of({e}), {tx}, &eng), 101).ok);
+    const uint256 cursor = eng.block_hash();
+    const ReplayMNState before = *eng.find(mn);
+
+    auto r = eng.fold_block(make_block(102, raw256(0x55), root_of({e}), {}, &eng), 102);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("prev-link"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned()) << "a foreign block is a refusal, not a poison";
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_EQ(eng.block_hash(), cursor);
+    EXPECT_TRUE(*eng.find(mn) == before) << "a refused fold must not mutate";
+    EXPECT_EQ(eng.find(mn)->nLastPaidHeight, before.nLastPaidHeight);
+
+    auto ok = eng.fold_block(make_block(102, cursor, root_of({e}), {}, &eng), 102);
+    ASSERT_TRUE(ok.ok) << ok.error;
+    EXPECT_EQ(eng.height(), 102u);
 }
 
 TEST(DashReplayFoldSynthetic, RootMismatchIsAHardStopWithNamedHeight)
@@ -1917,7 +1951,7 @@ TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeeMismatchFoldsThrough)
     PayeeGateFixture fx(/*enforcement_height=*/103);  // 102 < 103 ⇒ pre-enforcement
     ASSERT_TRUE(fx.eng.project_payee(102).has_value())
         << "a payee must be projected (else the test proves nothing)";
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_TRUE(r.ok) << "pre-enforcement payee mismatch must NOT poison (dashd "
@@ -1939,7 +1973,7 @@ TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
 {
     PayeeGateFixture fx(/*enforcement_height=*/102);  // 102 >= 102 ⇒ enforced
     ASSERT_TRUE(fx.eng.project_payee(102).has_value());
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_FALSE(r.ok) << "at/after enforcement a payee mismatch MUST poison";
@@ -1953,7 +1987,7 @@ TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
 TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeePaidIsNotFlaggedSkipped)
 {
     PayeeGateFixture fx(/*enforcement_height=*/103);
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/&fx.eng);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_TRUE(r.ok) << r.error;

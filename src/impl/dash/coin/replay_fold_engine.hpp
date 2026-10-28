@@ -903,6 +903,22 @@ public:
                     + std::to_string(m_height + 1) + " is foldable)";
             return r;
         }
+        // The held list is the post-state of block (m_height, m_block_hash)
+        // and nothing else — that pair IS what the penalty oracle answers
+        // for. A block whose prev-link names any other block extends a
+        // different chain: refuse it, without mutation (the held state is
+        // still exactly right for its own block, so this is not a poison;
+        // the caller re-anchors on the best chain).
+        if (block.m_previous_block != m_block_hash) {
+            r.error = "fold refused at h=" + std::to_string(height)
+                    + ": block's prev-link "
+                    + block.m_previous_block.GetHex().substr(0, 16)
+                    + " is not the cursor block "
+                    + m_block_hash.GetHex().substr(0, 16)
+                    + " (a different chain; the held state is the post-state"
+                      " of the cursor block only)";
+            return r;
+        }
         if (block.m_txs.empty()) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block has no transactions (no coinbase, no cbTx "
