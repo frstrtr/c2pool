@@ -5884,6 +5884,60 @@ TEST(DashMnBridgeCursor, CorruptTruncatedAndForeignRecordsAllRefuse)
     }
 }
 
+// ── 6b. A v1 record is REFUSED: its content was written by the payout-split
+//     detector that falsely demoted every nOperatorReward == 10000 masternode
+//     (2026-10-28, cause=mn-payout-split-unprovable). dashd pays such a
+//     masternode ONE operator output (masternode/payments.cpp:65-79); v1 pass 3
+//     demanded an (owner, operator) pair, persisted those entries as
+//     SPLIT_UNKNOWN, and every resume carried the demotion forward. The fix
+//     bumps the format so a v1 record starts the bridge COLD from the anchor,
+//     where the corrected detector re-folds — refused cleanly, never crashed.
+TEST(DashMnBridgeCursor, AFormatV1RecordFromTheFalseSplitDetectorIsRefusedAndReplayedCold)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 2u)
+        << "a v1 cursor carries the false SPLIT_UNKNOWN demotions";
+
+    TempCursorStore cs("fmtv1");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    ASSERT_TRUE(cs.exists());
+
+    // Re-stamp the header as v1. The digest covers the payload only, so this
+    // is byte-for-byte what a v1 build wrote — a VALID record of the old
+    // format, not a corrupt one.
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 1; b[25] = 0; b[26] = 0; b[27] = 0;
+    cs.write_raw(b);
+
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value())
+        << "a v1 record must never be resumed into: " << why;
+    EXPECT_NE(why.find("format v1"), std::string::npos) << why;
+
+    // The lane starts COLD, says why, and still does its job.
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("COLD"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    EXPECT_NE(r.h.lane.restore_verdict().find("format v1"), std::string::npos)
+        << r.h.lane.restore_verdict();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u)
+        << "a refused v1 record must produce a FULL cold replay from the anchor";
+
+    // ...and the record it leaves behind is the CURRENT format, so the next
+    // start resumes instead of paying the cold replay again.
+    std::string why2;
+    auto rec = cs.store.load(why2);
+    ASSERT_TRUE(rec.has_value()) << why2;
+    EXPECT_EQ(rec->cursor_height, 1519546u);
+    const auto after = cs.raw();
+    ASSERT_GT(after.size(), 28u);
+    EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
+}
+
 // ── 7. A fail-closed bridge must not be resumable ──────────────────────────
 TEST(DashMnBridgeCursor, FailClosedErasesTheRecordSoARestartCannotResumeIntoIt)
 {
