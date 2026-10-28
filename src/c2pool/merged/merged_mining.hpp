@@ -52,8 +52,8 @@ struct AuxWork
 };
 
 // ─── AuxPoW tree ─────────────────────────────────────────────────────────────
-// Assigns chain_ids to slots in a binary merkle tree.
-// p2pool convention: slot = lcg(chain_id) % size
+// Assigns chain_ids to slots in a binary merkle tree: the slot the aux
+// daemons expect, CAuxPow::getExpectedIndex(nonce 0, chain_id, log2(size)).
 // Size is smallest power of 2 >= number of chains.
 
 struct AuxPowTree

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
+#include <impl/nmc/coin/header_chain.hpp>  // aux_expected_index (CAuxPow::getExpectedIndex)
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
@@ -93,23 +94,26 @@ AuxPowTree AuxPowTree::build(const std::vector<uint32_t>& chain_ids)
     tree.size = 1;
     while (tree.size < n) tree.size <<= 1;
 
-    // Assign slots using p2pool LCG convention:
-    //   slot = ((1103515245 * chain_id + 1103515245 * 12345 + 12345) & 0xFFFFFFFF) % size
-    // Simplified: slot = ((1103515245 * (chain_id + 12345) + 12345) & 0xFFFFFFFF) % size
-    // Actually the exact formula from p2pool Python:
-    //   pos = (1103515245 * chain_id * 1103515245 + 12345) — but let's use the real one.
-    // From mm_adapter code: slot = hash_to_int(chain_id_bytes) % size, but the simpler
-    // p2pool approach for make_auxpow_tree is:
-    //   nonce = 0; for each chain_id: slot[chain_id] = (chain_id * 1103515245 + 12345) % size
-    //   Retry with size *= 2 if collision occurs.
-    
+    // Slots as the aux daemons check them: CAuxPow::getExpectedIndex(nonce,
+    // chain_id, h) with h = log2(size) (dogecoin/namecoin auxpow.cpp;
+    // "Aux POW wrong index" otherwise), ported in
+    // nmc::coin::aux_expected_index. The commitment carries nonce 0
+    // (build_auxpow_commitment's default).
+    //
+    // A collision is resolved by doubling the tree, never by another nonce:
+    // for a fixed nonce the slot is an odd-multiplier affine map of
+    // chain_id mod 2^h, so two chains share a slot exactly when their ids
+    // agree mod 2^h, whatever the nonce.
     for (;;) {
+        unsigned height = 0;
+        while ((1u << height) < tree.size)
+            ++height;
         tree.slot_map.clear();
         bool collision = false;
         std::vector<bool> used(tree.size, false);
         for (uint32_t cid : chain_ids) {
-            uint32_t slot = static_cast<uint32_t>(
-                (static_cast<uint64_t>(cid) * 1103515245ULL + 12345ULL) % tree.size);
+            const uint32_t slot =
+                nmc::coin::aux_expected_index(0, static_cast<int32_t>(cid), height);
             if (used[slot]) {
                 collision = true;
                 break;

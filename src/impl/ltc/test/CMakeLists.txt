@@ -136,11 +136,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # auxpow_tree_slot_test.cpp: merged-mining chain merkle tree slots are the
+    # aux daemons' CAuxPow::getExpectedIndex (#2060): two chains {98, 1} at
+    # {0, 1}, colliding ids grow the tree, every proof carries the index and
+    # size the daemon checks. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
         auto_ratchet_sim_test.cpp
         auto_ratchet_tail_guard_test.cpp
+        auxpow_tree_slot_test.cpp
         broadcast_lock_discipline_test.cpp
         broadcast_tx_completeness_test.cpp
         build_stops_test.cpp
