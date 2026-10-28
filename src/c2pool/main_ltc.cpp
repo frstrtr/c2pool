@@ -6868,9 +6868,15 @@ int main(int argc, char* argv[]) {
 
                                 // Wire full-block handler: UTXO feed + mempool cleanup.
                                 // The UTXO feed is doge::coin::UtxoLane
-                                // (impl/doge/coin/utxo_lane.hpp); the tip-change
-                                // handler below shares it.
+                                // (impl/doge/coin/utxo_lane.hpp): strictly in height
+                                // order, reorgs by ancestry, heal / rebuild (#2070).
+                                // The tip-change handler below shares it.
                                 auto doge_mempool_requested = std::make_shared<bool>(false);
+                                // Round-robin counter for one-peer fill requests, and
+                                // the peer whose block is being handled (a gap fill
+                                // asks it first: it has the block's parents).
+                                auto doge_fill_rr = std::make_shared<size_t>(0);
+                                auto doge_cur_peer = std::make_shared<std::string>();
                                 std::shared_ptr<doge::coin::UtxoLane> doge_lane;
                                 if (doge_utxo_cache && doge_utxo_db) {
                                     doge::coin::UtxoLaneHost host;
@@ -6886,10 +6892,25 @@ int main(int argc, char* argv[]) {
                                             return std::nullopt;
                                         return e->prev_hash;
                                     };
-                                    host.request = [dc, bcaster_ptr](uint32_t h, doge::coin::UtxoAsk) {
+                                    host.request = [dc, bcaster_ptr, doge_fill_rr, doge_cur_peer](
+                                                       uint32_t h, doge::coin::UtxoAsk how) {
                                         auto e = dc->get_header_by_height(h);
-                                        if (e)
+                                        if (!e)
+                                            return;
+                                        switch (how) {
+                                        case doge::coin::UtxoAsk::FromPeer:
+                                            if (!doge_cur_peer->empty()
+                                                && bcaster_ptr->request_full_block_from(*doge_cur_peer, e->block_hash))
+                                                return;
+                                            [[fallthrough]];
+                                        case doge::coin::UtxoAsk::Targeted:
+                                            if (bcaster_ptr->request_full_block_targeted(e->block_hash, (*doge_fill_rr)++))
+                                                return;
+                                            [[fallthrough]];
+                                        case doge::coin::UtxoAsk::Broadcast:
                                             bcaster_ptr->request_full_block(e->block_hash);
+                                            break;
+                                        }
                                     };
                                     host.connected =
                                         [pool = doge_pool.get(), utxo_db = doge_utxo_db.get(),
@@ -6928,6 +6949,17 @@ int main(int argc, char* argv[]) {
                                             LOG_INFO << "[EMB-DOGE] Mempool relay active";
                                         }
                                     };
+                                    // A rebuild wipes the set: the mempool's priced txs
+                                    // keep their place, quarantined until their inputs
+                                    // reconnect (each drain re-prices them), instead of
+                                    // being evicted as spent while the set refills.
+                                    host.wiped = [pool = doge_pool.get()]() {
+                                        if (!pool)
+                                            return;
+                                        const int n = pool->requarantine_all();
+                                        LOG_INFO << "[EMB-DOGE] UTXO rebuild: " << n
+                                                 << " priced mempool txs quarantined until their inputs reconnect";
+                                    };
                                     host.fill_started =
                                         [dc, bcaster_ptr, &ioc](doge::coin::UtxoLaneHost::Fill& f) {
                                         f.start_stall_timer(ioc,
@@ -6942,6 +6974,32 @@ int main(int argc, char* argv[]) {
                                     };
                                     doge_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_utxo_cache, *doge_utxo_db, std::move(host));
+
+                                    // /local_stats "doge_utxo": the set's best against the
+                                    // header chain, and the lane's counters (gaps, reorgs,
+                                    // heals, rebuilds). Added next to the coin metrics
+                                    // already wired (LTC's).
+                                    auto* mi = web_server.get_mining_interface();
+                                    auto prev_metrics = mi->coin_metrics_fn();
+                                    mi->set_coin_metrics_fn(
+                                        [prev_metrics, lane = std::weak_ptr<doge::coin::UtxoLane>(doge_lane),
+                                         utxo = doge_utxo_cache.get(), dc]() {
+                                            nlohmann::json j = prev_metrics ? prev_metrics() : nlohmann::json::object();
+                                            if (!j.is_object())
+                                                j = nlohmann::json::object();
+                                            auto l = lane.lock();
+                                            if (!l)
+                                                return j;
+                                            nlohmann::json d = l->stats().to_json();
+                                            const uint32_t best = utxo->get_best_height();
+                                            const uint32_t tip = dc->height();
+                                            d["utxo_best_height"] = best;
+                                            d["chain_height"] = tip;
+                                            d["behind"] = tip > best ? tip - best : 0;
+                                            d["blocks_connected"] = utxo->blocks_connected();
+                                            j["doge_utxo"] = std::move(d);
+                                            return j;
+                                        });
                                 }
                                 broadcaster->set_on_full_block(
                                     [pool = doge_pool.get(),
@@ -6950,8 +7008,8 @@ int main(int argc, char* argv[]) {
                                      utxo_db = doge_utxo_db.get(),
                                      explorer_enabled, explorer_depth_doge,
                                      mm_ptr = mm_manager.get(),
-                                     doge_lane, &web_server](
-                                        const std::string& /*peer*/,
+                                     doge_lane, doge_cur_peer, &web_server](
+                                        const std::string& peer,
                                         const ltc::coin::BlockType& block) {
                                         auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
                                         auto block_hash = Hash(packed_hdr.get_span());
@@ -6962,14 +7020,53 @@ int main(int argc, char* argv[]) {
                                             else { auto prev = chain->get_header(block.m_previous_block); if (prev) height = prev->height + 1; }
                                         }
 
-                                        // UTXO feed (bootstrap pipeline, then in order)
-                                        if (doge_lane) {
-                                            const auto fed = doge_lane->on_block(block, block_hash, height);
-                                            if (fed.fed == doge::coin::UtxoLane::Fed::Pipeline)
+                                        // The block's coinbase value for a found block's
+                                        // record (merged-mining manager + block store).
+                                        auto record_coinbase = [&]() {
+                                            if (!mm_ptr || block.m_txs.empty())
                                                 return;
+                                            uint64_t cb_total = 0;
+                                            for (const auto& out : block.m_txs[0].vout)
+                                                cb_total += out.value;
+                                            if (cb_total == 0)
+                                                return;
+                                            mm_ptr->update_block_coinbase(block_hash.GetHex(), cb_total);
+                                            auto sp = web_server.get_mining_interface()->get_merged_block_store();
+                                            if (sp) {
+                                                auto* ms = static_cast<c2pool::storage::MergedBlockStore*>(sp.get());
+                                                ms->update_coinbase(block_hash.GetHex(), 98, cb_total);
+                                            }
+                                        };
+
+                                        // UTXO feed: strictly in height order (doge::coin::UtxoLane)
+                                        if (doge_lane) {
+                                            *doge_cur_peer = peer;
+                                            const auto fed = doge_lane->on_block(block, block_hash, height);
+                                            doge_cur_peer->clear();
+                                            if (fed.fed == doge::coin::UtxoLane::Fed::Pipeline) {
+                                                // The ordered pipeline holds the block (drained blocks
+                                                // had their passes in connected()). Mempool cleanup does
+                                                // not depend on the UTXO set: a best-chain block's txs
+                                                // leave the pool now, so no template carries an already
+                                                // confirmed tx while the fill catches up.
+                                                if (pool && fed.on_best_chain) {
+                                                    if (chain && chain->height() == height)
+                                                        pool->set_tip_height(height);
+                                                    pool->remove_for_block(block);
+                                                }
+                                                // Fees and inputs once per drain, as the normal path does.
+                                                if (pool && utxo && fed.connected > 0) {
+                                                    int resolved = pool->recompute_unknown_fees(utxo);
+                                                    int evicted = pool->revalidate_inputs(utxo);
+                                                    if (resolved > 0 || evicted > 0)
+                                                        web_server.trigger_work_refresh_debounced();
+                                                }
+                                                record_coinbase();
+                                                return;
+                                            }
                                         }
 
-                                        // Normal mode processing (after bootstrap)
+                                        // Normal mode: explorer, mempool, coinbase value.
                                         if (explorer_enabled && utxo_db && height > 0) {
                                             PackStream ps;
                                             ps << block;
@@ -6991,24 +7088,7 @@ int main(int argc, char* argv[]) {
                                                     web_server.trigger_work_refresh_debounced();
                                             }
                                         }
-                                        if (mm_ptr && !block.m_txs.empty()) {
-                                            uint64_t cb_total = 0;
-                                            for (const auto& out : block.m_txs[0].vout)
-                                                cb_total += out.value;
-                                            if (cb_total > 0) {
-                                                mm_ptr->update_block_coinbase(
-                                                    block_hash.GetHex(), cb_total);
-                                                auto sp = web_server.get_mining_interface()
-                                                    ->get_merged_block_store();
-                                                if (sp) {
-                                                    auto* ms = static_cast<
-                                                        c2pool::storage::MergedBlockStore*>(
-                                                        sp.get());
-                                                    ms->update_coinbase(
-                                                        block_hash.GetHex(), 98, cb_total);
-                                                }
-                                            }
-                                        }
+                                        record_coinbase();
                                     });
 
                                 // Tip-changed handler: trigger work refresh so stratum miners
@@ -7073,6 +7153,18 @@ int main(int argc, char* argv[]) {
                                             }); // end post(ioc)
                                     });
                                 LOG_INFO << "[EMB-DOGE] Chain reorg handler registered";
+                                // Once at startup: a reorg whose tip was persisted but
+                                // whose UTXO side never ran (crash in between) fires no
+                                // tip change.
+                                if (doge_lane) {
+                                    boost::asio::post(ioc, [doge_lane]() {
+                                        try {
+                                            doge_lane->startup();
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] UTXO startup check error: " << e.what();
+                                        }
+                                    });
+                                }
 
                                 // Periodic mempool cleanup: evict expired txs every 5 minutes.
                                 auto doge_mempool_fn = std::make_shared<std::function<void(boost::system::error_code)>>();

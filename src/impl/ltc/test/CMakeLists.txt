@@ -136,6 +136,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # doge_utxo_lane_test.cpp: the embedded DOGE UTXO set follows the best
+    # chain in height order and through reorgs (#2070): doge::coin::UtxoLane,
+    # the object main_ltc.cpp's DOGE full-block and tip handlers call, over a
+    # REAL UTXOViewCache/UTXOViewDB -- a taller heavier branch is a reorg,
+    # out-of-order bodies connect in order, every block of a new branch is
+    # connected, a legacy undo record rebuilds, and a child of a tx confirmed
+    # only on the old branch never reaches the template without its parent.
+    # Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -153,6 +162,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_template_underfill_test.cpp
+        doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp

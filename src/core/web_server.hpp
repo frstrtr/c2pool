@@ -959,6 +959,12 @@ public:
         std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
         m_coin_metrics_fn = std::move(fn);
     }
+    // The hook set so far, so a later coin (embedded DOGE) can add its keys
+    // next to it.
+    coin_metrics_fn_t coin_metrics_fn() const {
+        std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
+        return m_coin_metrics_fn;
+    }
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
     // Return the raw wtxid merkle root (computed in refresh_work)
