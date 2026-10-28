@@ -320,6 +320,11 @@
 //                undecodable reply (STRIKE): caught up, its chain kept;
 //   catchtok     the same ended by a reply that strikes (a link broken inside
 //                it) or bans (a header failing its PoW at d);
+//   catchheavy   a store that walked part of a chain, whose lighter
+//                candidate's attempt completed (K_NCU ended), offers a heavier
+//                tip whose server answers its catch-up from position 0 with no
+//                header: J at that tip (C connects later; C's reply held);
+//                a server that never answers: no pair, K_NCU ended;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
@@ -8522,7 +8527,8 @@ void catchlocator() {
 
 // ---------------------------------------------------------------------------
 // A relay node in manual mode on the harness's clock over a node loaded from a copy of `from` (the copy in h.kvs).
-KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const pb::PathbNodeConfig& cfg) {
+KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const pb::PathbNodeConfig& cfg,
+                          const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr) {
     KatRelay k;
     k.links = std::make_unique<FakeLinks>();
     k.links->wire = &w;
@@ -8531,6 +8537,7 @@ KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const p
     pb::PathbRelayOptions o;
     o.threads = false;
     o.keepalive_ms = 0;
+    if (tweak) tweak(o);
     pb::RelayClock clock;
     clock.mono_ms = [&h] { return h.now * 1000; };
     clock.wall_s = [&h] { return h.now; };
@@ -8889,6 +8896,176 @@ void catchtok() {
         check(kept && caught && (ban ? bans >= 1 : strikes >= 1) && s1 != pb::TemplateStatus::NoPathbPeer
                       && s1 != pb::TemplateStatus::CatchingUp,
               tag + "the catch-up ended by its reply leaves the store caught up, its chain kept");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// catchheavy: a store not caught up (its record K_NCU; journal depth 4) that walked D's chain 1..8 meets B (A's 1, 2
+// and its own 3: lighter) and C (A's 1, 2 and its own 3..14: heavier); both forks at 2, below J's journal base. B and C
+// answer J's catch-up requests (from a held id) with no header, as servers that hold none of J's positions; their
+// joiner pages are served. B's tip is offered from the empty reply at position 0 and its attempt completes, rule (4)
+// keeping J's chain; then C's catch-up reaches position 0 with no header:
+//   later   C connects after B's attempt;
+//   open    C is connected from the start, its catch-up replies held until B's attempt is applied;
+//   silent  C never answers a catch-up request (its catch-up stays open).
+// later / open: C's tip is offered and its attempt replaces J's chain (J at C's tip 14). silent: no offer, J keeps its
+// chain, K_NCU ended (a restart and C's HELLO open no first round).
+struct HeavyResult {
+    bool setup = false;
+    bool b_completed = false;
+    bool ncu_after_b = false;    // K_NCU still set after B's attempt
+    std::uint64_t c_offers = 0;  // empty-store offers counted after B's attempt
+    std::uint64_t j_pos = 0;
+    bool at_c = false;
+    bool ncu_end = false;        // K_NCU set at the end
+    std::uint64_t c_asks = 0;    // catch-up requests after B's attempt
+    int restart_round = -1;      // silent: after a restart and C's HELLO, the first round open (1) or not (0)
+};
+HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    HeavyResult out;
+    KatRelay a = kat_relay(h, w, table0(net), true);  // C
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay d = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.connect(0, 2);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 4100 + static_cast<std::uint32_t>(i));
+    }
+    ok = ok && h[b.node].tree().best().id == h[a.node].tree().best().id && h[d.node].tree().best().id == h[a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.links[2]->disconnect(w.id(2, 0));
+    w.run();
+    h.tick_monero();
+    ok = ok && mine_on(h, w, b.node, 2, 4200);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, d.node, static_cast<std::size_t>(i % 5), 4300 + static_cast<std::uint32_t>(i));
+    }
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 4400 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip_c = h[a.node].tree().best().id;
+    const std::uint64_t J = 4;
+    const std::size_t jw = h.add(table0(net), false, J, true);
+    MemoryKv& kvw = *h.kvs.back();
+    for (std::uint64_t x = 1; x <= 8; ++x)
+        if (const std::optional<pb::Hash32> id = h[d.node].store().best_at(x))
+            (void)h[jw].on_carrier(77, *pb::encode_fc_carrier(0, *h[d.node].bodies().get(*id), 16));
+    h.q.clear();
+    const std::string ncu = pb::store_keys::ncu(0);
+    out.setup = ok && h[jw].tree().best().pos == 8 && !h[jw].caught_up() && kvw.data.count(ncu) != 0
+                && h[a.node].tree().best().pos == 14 && h[b.node].tree().best().pos == 3;
+    KatRelay j = kat_relay_loaded(h, w, kvw, h.config(table0(net), false, J),
+                                  [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; });
+    MemoryKv& kvj = *h.kvs.back();
+    const std::size_t jwire = 3;
+    // J's FC_GETHEADERS from a held id to B or C: its reply carries no header (held back while `hold_c`); joiner pages
+    // (from the zero id) are served; B's and C's own catch-ups toward J get no reply
+    std::map<std::size_t, std::deque<bool>> asked;
+    std::vector<FakeWire::Msg> held;
+    bool hold_c = mode == 1;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (m.from == jwire && (m.to == 0 || m.to == 1) && m.f[0] == pb::kOpFcGetHeaders) {
+            pb::GetHeaders q;
+            if (pb::decode_fc_getheaders(m.f, 0, q).ok()) asked[m.to].push_back(q.from != pb::Hash32{});
+            return;
+        }
+        if (m.f[0] != pb::kOpFcHeaders) return;
+        if (m.to != jwire && m.from == jwire) {
+            m.f.clear();
+            return;
+        }
+        if (m.to != jwire || (m.from != 0 && m.from != 1) || asked[m.from].empty()) return;
+        const bool catchup = asked[m.from].front();
+        asked[m.from].pop_front();
+        if (!catchup) return;
+        if (m.from == 0 && mode == 2) {  // silent: no reply
+            m.f.clear();
+            return;
+        }
+        m.f = *pb::encode_fc_headers(pb::HeadersReply{0, 0, {}}, 1u << 22);
+        if (m.from == 0 && hold_c) {  // open: the reply held until B's attempt is applied
+            held.push_back(m);
+            m.f.clear();
+        }
+    };
+    pb::PathbRelayNode& rj = *j.relay;
+    const auto ticks = [&](int n) {
+        for (int k = 0; k < n; ++k) {
+            (void)rj.join_step();
+            w.run();
+            h.now += 1;
+            rj.tick();
+            w.run();
+        }
+    };
+    w.connect(1, jwire);
+    if (mode != 0) w.connect(0, jwire);
+    w.run();
+    std::optional<pb::JoinStep> sb;
+    for (int k = 0; k < 40 && !(sb && sb->report); ++k) {
+        sb = rj.join_step();
+        w.run();
+        if (!(sb && sb->report)) {
+            h.now += 1;
+            rj.tick();
+            w.run();
+        }
+    }
+    out.b_completed = sb && sb->report && sb->report->end == pb::AttemptEnd::Completed && !sb->sw.adopted && !sb->sw.replaced
+                      && sb->report->server == static_cast<std::uint64_t>(1 + 1);
+    out.ncu_after_b = !h[j.node].caught_up();
+    const std::uint64_t offers0 = rj.stats().empty_store_offers.load();
+    const std::uint64_t asks0 = rj.stats().catchup_requests.load();
+    hold_c = false;
+    for (FakeWire::Msg& m : held) w.q.push_back(std::move(m));
+    held.clear();
+    w.run();
+    if (mode == 0) {
+        w.connect(0, jwire);
+        w.run();
+    }
+    const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
+    ticks(static_cast<int>(mode == 2 ? 5 * p53 : 3 * p53));
+    out.c_offers = rj.stats().empty_store_offers.load() - offers0;
+    out.c_asks = rj.stats().catchup_requests.load() - asks0;
+    out.j_pos = h[j.node].tree().best().pos;
+    out.at_c = h[j.node].tree().best().id == tip_c;
+    out.ncu_end = !h[j.node].caught_up() || kvj.data.count(ncu) != 0;
+    if (mode == 2) {
+        const std::size_t jr = load_node(h, kvj, h.config(table0(net), false, J));
+        (void)h.hello(jr, a.node);
+        out.restart_round = h[jr].first_round_open() ? 1 : 0;
+    }
+    w.edit = nullptr;
+    return out;
+}
+void catchheavy() {
+    const char* names[] = {"later", "open", "silent"};
+    for (int mode = 0; mode < 3; ++mode) {
+        const HeavyResult r = catch_heavy(mode);
+        const std::string tag = std::string("catchheavy (") + names[mode] + "): ";
+        std::printf("  %sB's attempt completed %d; K_NCU after it %d; C: empty-store offers %llu, catch-up requests %llu; "
+                    "J at %llu (at C's tip %d); K_NCU at the end %d; restarted first round %d\n",
+                    tag.c_str(), r.b_completed ? 1 : 0, r.ncu_after_b ? 1 : 0, (unsigned long long)r.c_offers,
+                    (unsigned long long)r.c_asks, (unsigned long long)r.j_pos, r.at_c ? 1 : 0, r.ncu_end ? 1 : 0,
+                    r.restart_round);
+        check(r.setup && r.b_completed, tag + "setup (J at D's 8, K_NCU; B's attempt completes, rule (4) keeps J's chain)");
+        if (mode != 2)
+            check(r.c_offers >= 1 && r.at_c && !r.ncu_end,
+                  tag + "C's heavier unheld tip gets a join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+                          ", J at " + std::to_string(r.j_pos) + ")");
+        else
+            check(r.c_offers == 0 && r.j_pos == 8 && !r.ncu_end && r.restart_round == 0,
+                  tag + "no reply, no pair: J keeps its chain; K_NCU ended; a restart opens no first round");
     }
 }
 
@@ -10416,6 +10593,7 @@ int main(int argc, char** argv) {
     run("catchoffer", catchoffer);
     run("revcatchundec", revcatchundec);
     run("catchtok", catchtok);
+    run("catchheavy", catchheavy);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
