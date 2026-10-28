@@ -691,6 +691,14 @@ void MergedMiningManager::refresh_aux_work()
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     for (auto& chain : m_chains) {
+        // Size budget for the template about to be built: the backends that
+        // build their own (embedded) keep header + AuxPoW + coinbase room.
+        {
+            const uint32_t reserve = block_size_reserve_locked(chain);
+            chain.rpc->set_block_size_reserve(reserve);
+            if (chain.fallback)
+                chain.fallback->set_block_size_reserve(reserve);
+        }
         try {
             // Check if tip changed. A degraded template (built before the
             // tip's body cleaned the mempool: coinbase only) is fetched again
@@ -1094,6 +1102,18 @@ void MergedMiningManager::try_submit_merged_blocks(
             }
 
             auto block_hex = blk.str();
+            // DOGE (chain id 98): dogecoind's CheckBlock refuses a block above 1,000,000 bytes
+            // (bad-blk-length, AuxPoW included): such a block can never be
+            // accepted, so it is refused here and counted, not relayed.
+            if (chain.config.chain_id == 98 && block_hex.size() / 2 > kAuxMaxBlockBytes) {
+                ++m_block_refusals_by_code[chain.config.symbol + ":oversize"];
+                LOG_ERROR << "[MM:" << chain.config.symbol << "] Merged block REFUSED: "
+                          << block_hex.size() / 2 << " bytes > " << kAuxMaxBlockBytes
+                          << " (auxpow " << auxpow.size() / 2 << " B, coinbase "
+                          << use_coinbase->size() / 2 << " B, " << n_tx - 1
+                          << " txs) — not submitted";
+                continue;
+            }
             if (!block_hex.empty()) {
                 LOG_INFO << "[MM:" << chain.config.symbol
                          << "] Merged block submitted (" << block_hex.size()/2 << " bytes"
@@ -1228,6 +1248,35 @@ bool MergedMiningManager::has_frozen_snapshot(uint32_t chain_id, const uint256& 
         if (chain.config.chain_id == chain_id)
             return chain.frozen_history.count(block_hash) > 0;
     return false;
+}
+
+uint32_t MergedMiningManager::block_size_reserve_locked(const ChainState& chain) const
+{
+    uint32_t aux_branch_len = 0;
+    for (uint32_t n = 1; n < m_tree.size; n <<= 1)
+        ++aux_branch_len;
+    return aux_block_reserve_bytes(m_parent_coinbase_bytes.load(std::memory_order_relaxed),
+                                   m_parent_branch_len.load(std::memory_order_relaxed),
+                                   aux_branch_len,
+                                   static_cast<uint32_t>(chain.frozen_coinbase_hex.size() / 2));
+}
+
+uint32_t MergedMiningManager::block_size_reserve(uint32_t chain_id) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains)
+        if (chain.config.chain_id == chain_id)
+            return block_size_reserve_locked(chain);
+    return 0;
+}
+
+nlohmann::json MergedMiningManager::get_block_refusals_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& [code, n] : m_block_refusals_by_code)
+        j[code] = n;
+    return j;
 }
 
 std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const

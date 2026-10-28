@@ -155,6 +155,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
     # runs one merged-work poll at once (the DOGE tip handler's poke), without
     # the poll timer. Same folding rule.
+    #
+    # doge_template_budget_test.cpp: embedded DOGE templates dogecoind can
+    # accept: a REAL DOGE TemplateBuilder template over a mempool above 1 MB,
+    # within the merged-mining size budget, assembles (REAL AuxPoW and PPLNS
+    # coinbase producers, 4,000 payees on both chains) to at most 1,000,000
+    # bytes (bad-blk-length); curtime and mintime above the median time past
+    # (time-too-old). Same folding rule.
+    #
+    # ltc_template_time_test.cpp: the embedded LTC template's curtime and
+    # mintime are above the parent's median time past (time-too-old). Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -171,6 +182,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
+        doge_template_budget_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
         doge_utxo_lane_test.cpp
@@ -184,6 +196,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        ltc_template_time_test.cpp
         mempool_mweb_admission_test.cpp
         merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
