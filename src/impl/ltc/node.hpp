@@ -362,19 +362,35 @@ protected:
             }
         }
 
-        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
-        // Carry the last-good pool hashrate forward when this cycle produced none
-        // (empty/short chain), so a transient gap does not blank the graph; the
-        // web fn applies the 600 s staleness bound on pool_hashrate_ts to break
-        // the line if think() itself has stalled.
-        if (s.pool_hashrate <= 0.0 && m_snapshot.pool_hashrate > 0.0) {
-            s.pool_hashrate = m_snapshot.pool_hashrate;
-            s.pool_hashrate_ts = m_snapshot.pool_hashrate_ts;
+        {
+            std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+            // Carry the last-good pool hashrate forward when this cycle produced none
+            // (empty/short chain), so a transient gap does not blank the graph; the
+            // web fn applies the 600 s staleness bound on pool_hashrate_ts to break
+            // the line if think() itself has stalled.
+            if (s.pool_hashrate <= 0.0 && m_snapshot.pool_hashrate > 0.0) {
+                s.pool_hashrate = m_snapshot.pool_hashrate;
+                s.pool_hashrate_ts = m_snapshot.pool_hashrate_ts;
+            }
+            m_snapshot = s;
         }
-        m_snapshot = s;
+
+        // Still under the exclusive tracker lock, after the best-share
+        // decision: consumers copy what they need from the tracker now
+        // (set_locked_best_hook) instead of trying for the lock later.
+        std::lock_guard<std::mutex> hook_lock(m_locked_best_hook_mutex);
+        if (m_locked_best_hook) {
+            try {
+                m_locked_best_hook(m_tracker, m_best_share_hash);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[locked-best-hook] " << e.what();
+            }
+        }
     }
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
+    std::mutex m_locked_best_hook_mutex;
+    std::function<void(ShareTracker&, const uint256&)> m_locked_best_hook;
 
     // ── Lock-free peer-info snapshot (display-only) ──────────────────────
     // m_peers / m_outbound_addrs are IO-thread-owned with NO lock; the
@@ -937,6 +953,19 @@ public:
     ///   <  0 : block is NOT in main chain (orphaned/stale)
     using block_rel_height_fn_t = std::function<int32_t(uint256)>;
     void set_block_rel_height_fn(block_rel_height_fn_t fn) { m_block_rel_height_fn = std::move(fn); }
+
+    /// Called on the compute thread while it holds the tracker lock
+    /// exclusively, each time it publishes the lock-free snapshot (after
+    /// every best-share decision), with the tracker and the best share: a
+    /// consumer copies what it needs from the tracker then instead of trying
+    /// for the lock later (the merged payouts' PPLNS weights). It must not
+    /// call back into the node.
+    using locked_best_hook_t = std::function<void(ShareTracker&, const uint256& best)>;
+    void set_locked_best_hook(locked_best_hook_t fn)
+    {
+        std::lock_guard<std::mutex> lock(m_locked_best_hook_mutex);
+        m_locked_best_hook = std::move(fn);
+    }
 
     /// Lock-free stats snapshot — published by think(), never fails, never needs tracker lock.
     /// Inline definition must precede callers in the same header.

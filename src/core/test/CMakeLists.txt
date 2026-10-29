@@ -137,6 +137,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # yields a found block of at most 4,000,000 weight with a 4,000-output
     # PPLNS coinbase; a job above the limit is refused at assembly and
     # counted. Same fold-into-core_test reasoning as every TU here.
+    # web_server_merged_drop_test.cpp: the share side follows the merged
+    # commitment. With no buildable DOGE block the job carries neither mm_data
+    # nor the share's merged_coinbase_info (a V36 peer rejects info without
+    # mm_data). Real MiningInterface + MergedMiningManager; same
+    # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -181,6 +186,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp
