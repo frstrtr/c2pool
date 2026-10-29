@@ -281,6 +281,7 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/aux_chain_embedded.hpp>
 #include <impl/doge/coin/auxpow_header.hpp>
 #include <impl/doge/coin/utxo_lane.hpp>
+#include <core/coin/utxo_digest.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
 // #980: embedded NMC P2P AuxPoW header-feed (seeds + wire parser)
@@ -502,6 +503,8 @@ void print_help() {
     std::cout << "  --doge-p2p-port PORT      Direct DOGE P2P peer port (overrides auto-detect)\n";
     std::cout << "  --header-checkpoint H:HASH  LTC header chain starting point\n";
     std::cout << "  --doge-header-checkpoint H:HASH  DOGE header chain starting point\n";
+    std::cout << "  --utxo-digest DIR         Print the digest of the UTXO LevelDB at DIR (SHA256 over\n";
+    std::cout << "                            its coins, sync state and best block) and exit\n";
     std::cout << "  --no-ltc-cmpct-v3         Do not ask LTC peers for v3 (MWEB) compact blocks\n";
     std::cout << "  --ltc-cmpct-hb-peers N    LTC peers asked to push compact blocks (default: 0 = all)\n";
     std::cout << "  --no-ltc-mweb-fetch-retry Fetch each announced LTC block from every announcing peer\n";
@@ -1044,6 +1047,36 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-p2p-port" && i + 1 < argc) {
             doge_p2p_port = std::stoi(argv[++i]);
             cli_explicit.insert("doge_p2p_port");
+        }
+        else if (arg == "--utxo-digest" && i + 1 < argc) {
+            // Digest a UTXO LevelDB (no node is started). The DB must not be
+            // open in a running node (LevelDB's lock).
+            const std::string dir = argv[++i];
+            if (!std::filesystem::exists(std::filesystem::path(dir) / "CURRENT")) {
+                std::cerr << "utxo-digest: no LevelDB at " << dir << "\n";
+                return 1;
+            }
+            core::coin::UTXOViewDB db(dir);
+            if (!db.open()) {
+                std::cerr << "utxo-digest: cannot open " << dir << " (in use by a running node?)\n";
+                return 1;
+            }
+            const auto d = core::coin::utxo_digest(db);
+            if (!d.ok) {
+                std::cerr << "utxo-digest: scan error in " << dir << "\n";
+                return 1;
+            }
+            std::cout << "utxo-digest " << dir << "\n"
+                      << "  sha256        " << d.sha256_hex << "\n"
+                      << "  coins         " << d.coins << "\n"
+                      << "  coin_bytes    " << d.record_bytes << " (keys + values)\n"
+                      << "  best          h=" << d.best_height << " " << d.best_block.GetHex() << "\n";
+            if (d.sync.tracked())
+                std::cout << "  sync          anchor=" << d.sync.anchor_height << " strict=" << int(d.sync.strict)
+                          << " synced=" << int(d.sync.synced) << " coins=" << d.sync.coins << "\n";
+            else
+                std::cout << "  sync          none (an accrual view: anchor unknown)\n";
+            return 0;
         }
         else if (arg == "--config" && i + 1 < argc) {
             config_file = argv[++i];

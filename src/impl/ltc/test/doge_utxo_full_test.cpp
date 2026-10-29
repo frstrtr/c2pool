@@ -20,11 +20,13 @@
 //      the refusal bound the set is left as is (heal_failures).
 // Plus: zero-value outputs are coins (as in Core), a body that is not what
 // its header commits to is refetched, the sync state is written with the best
-// block.
+// block, and the digest (--utxo-digest) pins the set.
 // Drives doge::coin::UtxoLane (Mode::Full) through the harness main_ltc's
 // handlers mirror (doge_utxo_lane_harness.hpp).
 // ---------------------------------------------------------------------------
 #include "doge_utxo_lane_harness.hpp"
+
+#include <core/coin/utxo_digest.hpp>
 
 #include <numeric>
 
@@ -429,4 +431,33 @@ TEST(DogeUtxoFull, SyncStateTravelsWithTheBestBlock)
     EXPECT_EQ(ss.coins, coins);
     ASSERT_TRUE(l.t.db->reset());
     EXPECT_FALSE(l.t.db->get_sync_state().tracked());
+}
+
+// The digest (c2pool --utxo-digest): equal for the same set built twice,
+// different once one more block is connected; counts the coins.
+TEST(DogeUtxoFull, DigestPinsTheSet)
+{
+    const uint256 g = genesis(0x60);
+    const auto chain = chain_with(g, 8);
+    auto build = [&](Lane& l, uint32_t n) {
+        l.net.set_chain(std::vector<BlockType>(chain.begin(), chain.begin() + n), 1);
+        l.net.best[0] = g;
+        l.lane.on_block(chain[n - 1], hash_of(chain[n - 1]), n);
+        serve(l.lane, l.net, chain);
+        ASSERT_EQ(l.t.cache->get_best_height(), n);
+    };
+    Lane a(20, Mode::Full, 16), b(20, Mode::Full, 4), c(20, Mode::Full, 16);
+    build(a, 7);
+    build(b, 7);
+    build(c, 8);
+    const auto da = core::coin::utxo_digest(*a.t.db);
+    const auto db = core::coin::utxo_digest(*b.t.db);
+    const auto dc = core::coin::utxo_digest(*c.t.db);
+    ASSERT_TRUE(da.ok && db.ok && dc.ok);
+    EXPECT_EQ(da.sha256_hex.size(), 64u);
+    EXPECT_EQ(da.sha256_hex, db.sha256_hex) << "the same set, built with another window";
+    EXPECT_NE(da.sha256_hex, dc.sha256_hex);
+    EXPECT_EQ(da.coins, 7u);
+    EXPECT_EQ(da.best_height, 7u);
+    EXPECT_EQ(da.sync.anchor_height, 0u);
 }
