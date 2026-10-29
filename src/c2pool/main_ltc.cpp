@@ -7703,11 +7703,12 @@ int main(int argc, char* argv[]) {
                                         // no request) runs no pass; only the tip's body moves
                                         // the pool's tip height (a late copy of an older block
                                         // must not lower it).
-                                        // An old body (a late copy, a block the full lane asked
-                                        // for near the tip) that connected nothing runs no pass:
-                                        // it would only push the tip out of the pool's
-                                        // cleaned-for list.
-                                        const bool current = connected_now || (chain && height + 1 >= chain->height());
+                                        // With the UTXO lane, an old body (a late copy, a block
+                                        // the full lane asked for near the tip) that connected
+                                        // nothing runs no pass: it would only push the tip out of
+                                        // the pool's cleaned-for list.
+                                        const bool current = !doge_lane || connected_now
+                                                             || (chain && height + 1 >= chain->height());
                                         if (pool && height > 0 && current) {
                                             if (chain && height == chain->height())
                                                 pool->set_tip_height(height);
