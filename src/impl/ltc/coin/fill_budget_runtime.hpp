@@ -51,6 +51,14 @@ inline constexpr double  LTC_FILL_RATE        = 6666;
 inline constexpr int64_t LTC_FILL_BURST       = 250000;
 inline constexpr int64_t LTC_FILL_RAMP_SHARES = 4;
 
+// Default OFF. p2pool-merged-v36 #32 gates the G2 new_tx_budget break on
+// IMMUTABLE_BLOCKS, so LTC p2pool never cuts the template tx list. A
+// c2pool-only cut would break that parity. EmbeddedCoinNode uses the GBT
+// tx set uncut unless set_fill_budget_enabled(true) opts in. When off,
+// nothing is granted, recorded or settled, so the template is byte-identical
+// to pre-G2.
+inline constexpr bool LTC_FILL_BUDGET_DEFAULT_ON = false;
+
 // Coinbase (index 0) merkle branch over the template's tx hashes. Mirrors
 // core::MiningInterface::compute_merkle_branches() step for step, minus its
 // GetHex/SetHex/HexStr round-trip (an identity on the bytes), so the result

@@ -57,6 +57,13 @@ std::vector<uint256> core_branch(const std::vector<uint256>& txs)
 
 } // namespace
 
+// p2pool-merged-v36 #32 parity: LTC p2pool never applies the G2 cut, so
+// c2pool ships it off. Flipping this default needs a matching p2pool change.
+TEST(G2FillBudgetRuntime, LtcCutDefaultOffForP2poolParity)
+{
+    EXPECT_FALSE(ltc::coin::LTC_FILL_BUDGET_DEFAULT_ON);
+}
+
 // The settle key must equal what the job hands back at share-found time.
 TEST(G2FillBudgetRuntime, BranchKeyEqualsCoreShareParams)
 {
