@@ -5727,6 +5727,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
+    // Merged-work rebuilds that got no payouts, by reason, and what they did
+    // with the chain's commitment (kept the last block / dropped it).
+    if (m_mm_manager)
+        result["merged_rebuild"] = m_mm_manager->get_rebuild_stats_json();
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

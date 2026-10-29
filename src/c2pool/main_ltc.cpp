@@ -269,6 +269,7 @@ static void segfault_handler(int sig) {
 
 // Integrated merged mining
 #include <c2pool/merged/merged_mining.hpp>
+#include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
@@ -7508,49 +7509,70 @@ int main(int argc, char* argv[]) {
                     LOG_INFO << "Merged operator address override: " << node_owner_merged_address
                              << " (script " << operator_merged_script.size() << " bytes)";
                 }
+                // The tracker lock is often busy (the compute thread holds it
+                // while it processes shares): wait for it a little on the
+                // merged-mining RPC thread, and reuse the payouts already
+                // computed for the same (best share, chain, value) when it stays
+                // busy, instead of handing the rebuild no payouts
+                // (c2pool/merged/payout_source.hpp).
+                auto merged_payout_source = std::make_shared<c2pool::merged::MergedPayoutSource>();
                 mm_manager->set_payout_provider(
-                    [&p2p_node, mi, operator_ltc_script, operator_merged_script](
+                    [&p2p_node, mi, operator_ltc_script, operator_merged_script, merged_payout_source](
                         uint32_t chain_id, uint64_t coinbase_value)
                     -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
                 {
+                    using Payouts = c2pool::merged::MergedPayoutSource::Payouts;
                     auto best = p2p_node->best_share_hash();
-                    if (best.IsNull())
+                    if (best.IsNull()) {
+                        c2pool::merged::MergedMiningManager::note_payout_miss("no_best_share");
                         return {};
-
-                    auto guard = p2p_node->read_tracker();
-                    if (!guard) return {};
-
-                    // Use block target (from min_header.bits), not share target.
-                    // Matches p2pool: block_target = self.header['bits'].target
-                    uint256 block_target;
-                    guard->chain.get(best).share.invoke([&](auto* s) {
-                        block_target = chain::bits_to_target(s->m_min_header.m_bits);
-                    });
-
-                    // Merged chains always use COMBINED_DONATION_SCRIPT (P2SH)
-                    // regardless of share version — p2pool data.py line 303.
-                    // The parent chain uses version-dependent donation (P2PK for V35).
-                    auto combined_donation = std::vector<unsigned char>(
-                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                        ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
-                    auto payouts_map = guard->get_merged_expected_payouts(
-                        best, block_target, coinbase_value, chain_id, combined_donation,
-                        operator_ltc_script, operator_merged_script);
-
-                    LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
-                             << " coinbase_value=" << coinbase_value
-                             << " payouts_map_size=" << payouts_map.size()
-                             << " chain_height=" << guard->chain.get_height(best)
-                             << " block_target=" << block_target.GetHex().substr(0,16);
-
-                    // Convert map → sorted vector for coinbase construction
-                    std::vector<std::pair<std::vector<unsigned char>, uint64_t>> result;
-                    result.reserve(payouts_map.size());
-                    for (auto& [script, amount] : payouts_map) {
-                        if (amount >= 1)
-                            result.emplace_back(script, amount);
                     }
-                    std::sort(result.begin(), result.end());
+
+                    std::string miss;
+                    Payouts result = merged_payout_source->get(
+                        best, chain_id, coinbase_value,
+                        c2pool::merged::MergedMiningManager::on_rpc_thread(),
+                        [&]() -> std::optional<Payouts> {
+                            auto guard = p2p_node->read_tracker();
+                            if (!guard)
+                                return std::nullopt;
+
+                            // Use block target (from min_header.bits), not share target.
+                            // Matches p2pool: block_target = self.header['bits'].target
+                            uint256 block_target;
+                            guard->chain.get(best).share.invoke([&](auto* s) {
+                                block_target = chain::bits_to_target(s->m_min_header.m_bits);
+                            });
+
+                            // Merged chains always use COMBINED_DONATION_SCRIPT (P2SH)
+                            // regardless of share version — p2pool data.py line 303.
+                            // The parent chain uses version-dependent donation (P2PK for V35).
+                            auto combined_donation = std::vector<unsigned char>(
+                                ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                                ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                            auto payouts_map = guard->get_merged_expected_payouts(
+                                best, block_target, coinbase_value, chain_id, combined_donation,
+                                operator_ltc_script, operator_merged_script);
+
+                            LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
+                                     << " coinbase_value=" << coinbase_value
+                                     << " payouts_map_size=" << payouts_map.size()
+                                     << " chain_height=" << guard->chain.get_height(best)
+                                     << " block_target=" << block_target.GetHex().substr(0,16);
+
+                            // Convert map → sorted vector for coinbase construction
+                            Payouts out;
+                            out.reserve(payouts_map.size());
+                            for (auto& [script, amount] : payouts_map) {
+                                if (amount >= 1)
+                                    out.emplace_back(script, amount);
+                            }
+                            std::sort(out.begin(), out.end());
+                            return out;
+                        },
+                        miss);
+                    if (result.empty())
+                        c2pool::merged::MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
                     return result;
                 });
               } // end MM payout provider

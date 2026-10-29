@@ -136,6 +136,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
+    # rebuild without payouts never commits to the parent's hash (keeps the
+    # last block on the same parent, else no commitment), a stale rebuild is
+    # not frozen under a newer template, and MergedPayoutSource produces the
+    # payouts while the tracker lock is busy. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -164,6 +170,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_rebuild_payouts_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
