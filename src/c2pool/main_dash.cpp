@@ -98,6 +98,7 @@
 #include <impl/dash/coin/sml_quorum_db.hpp>      // dash::coin::SMLDb / QuorumDb — SML+quorum persistence (incremental restart)
 #include <impl/dash/coin/credit_pool_db.hpp>     // dash::coin::CreditPoolDb — credit-pool tip persistence (E2 restart resume)
 #include <impl/dash/coin/live_feed.hpp>          // E2a live-feed bridge (raw wire events -> derived ingest events)
+#include <impl/dash/coin/payee_fold_feeder.hpp>  // ordered connect for the payee + UTXO lanes
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
@@ -3064,6 +3065,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::function<bool(const ::core::coin::Outpoint&, ::core::coin::Coin&)>
         rpc_pin_lookup;
     dash::coin::UtxoLane utxo_lane;
+    // Ordered connect (payee_fold_feeder.hpp): the UTXO lane and the
+    // maintainer's payee fold consume Node::block_connected THROUGH this
+    // feeder, strictly in height order, and it fetches by header-chain hash
+    // the bodies no inv announced. Same outlive rule as utxo_lane. Its cursor
+    // and fetch seams are wired below once the maintainer / coin-P2P exist;
+    // until then (and on every non-embedded posture) it is a passthrough.
+    dash::coin::PayeeFoldFeeder payee_feeder;
     // W5-A fold fee source: SAME outlive-the-mempool rule as utxo_lane above
     // (the mempool's m_fee_coin_lookup lambda points into fold_fee_source,
     // which reads fold_fee_fold). Declared before node_coin_state, destroyed
@@ -3521,6 +3529,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // the lane sits armed-but-dormant and get_work still routes to the
     // retained dashd fallback (populated()==false).
     std::shared_ptr<EventDisposable> utxo_block_sub;
+    // The feeder takes the UTXO lane's old slot as the FIRST block_connected
+    // subscriber, so its sinks (UTXO lane, then the maintainer) keep the
+    // relative order the two raw subscriptions had.
+    auto payee_feeder_sub = coin_state.block_connected.subscribe(
+        [&payee_feeder](const dash::interfaces::BlockConnected& bc) {
+            payee_feeder.on_block_connected(bc);
+        });
     if (embedded_utxo) {
         const auto utxo_path = (core::filesystem::config_path()
             / net_subdir / "utxo_leveldb").string();
@@ -3566,7 +3581,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 embedded_utxo_immature_serve_empty
                     ? dash::coin::UtxoImmaturePolicy::ServeEmptyTxSet
                     : dash::coin::UtxoImmaturePolicy::Refuse);
-            utxo_block_sub = coin_state.block_connected.subscribe(
+            utxo_block_sub = payee_feeder.ordered.subscribe(
                 [&utxo_lane, explorer_enabled, DASH_EXPLORER_DEPTH]
                 (const dash::interfaces::BlockConnected& bc) {
                     utxo_lane.on_block_connected(bc.block, bc.height);
@@ -5826,7 +5841,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // bridge (full_block -> height lookup). The E2b UTXO lane is ALSO
         // subscribed to the same event (its connect_block + fee recompute).
         coin_feed_subs.push_back(
-            c2pool::dash::wire_block_connect_ingest(coin_state, *maintainer));
+            payee_feeder.ordered.subscribe(
+                [m = maintainer.get()](const dash::interfaces::BlockConnected& bc) {
+                    m->on_block_connected(bc.block, bc.height);
+                }));
+        // The feeder orders against the payee apply cursor (0 = passthrough:
+        // unseeded / wiped awaiting its re-seed).
+        payee_feeder.set_cursor_fn(
+            [m = maintainer.get()]() { return m->payee_fold_cursor(); });
         // Leg 4 (MN-set RESYNC): Node::mn_list_update -> maintainer
         // .on_mn_list_update. Dash's P2P Simplified MN List omits scriptPayout,
         // so the payout-bearing feed for this leg is the E2c RPC seed below
@@ -7434,6 +7456,23 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     cp->request_block_tracked(hash);
                 }));
 
+        // The payee feeder's fetch seams: request by HEADER-CHAIN POSITION
+        // (dashd FindNextBlocksToDownload), TRACKED so the lost-body watchdog
+        // rotates an unanswered ask to another peer. This is the tip-follow
+        // request the inv path above cannot make for a block whose inv was
+        // lost (the 2026-10-26 reserve blackout).
+        payee_feeder.set_tip_height_fn(
+            [hc = header_chain.get()]() { return hc->height(); });
+        payee_feeder.set_hash_at_fn(
+            [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                if (auto e = hc->get_header_by_height(h)) return e->hash;
+                return std::nullopt;
+            });
+        payee_feeder.set_request_fn(
+            [cp = coin_p2p.get()](const uint256& hash, uint32_t) {
+                return cp->request_block_tracked(hash);
+            });
+
         // new_chainlock -> record into the best-chainlock tracker (finalization
         // signal the block-find submit path can consult).
         coin_feed_subs.push_back(
@@ -7612,7 +7651,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // class as mined_commitment_index) -- on a reorg the fold's cursor
              // must roll back to the fork point before the new branch is folded
              // forward, or a stale coin would read UNSPENT.
-             &fold_live_ctl]
+             &fold_live_ctl,
+             // Ordered connect: a header tip past the payee cursor is a height
+             // to fetch even if no inv ever announces it.
+             &payee_feeder]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -7624,6 +7666,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // relies on exactly that property and is proven live.
                 // No-op unless the lane was armed on the daemonless path.
                 if (mnl) mnl->pump();
+                payee_feeder.on_tip_changed();
                 // #108 QC-PREFETCH: ask for the member sets this DKG cycle
                 // will need while the tip is still ~10 blocks short of the
                 // mining window, instead of at the first qfcommit that needs
@@ -11105,10 +11148,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     auto mn_service_tick =
         std::make_shared<std::function<void(const boost::system::error_code&)>>();
     *mn_service_tick =
-        [&mn_service_timer, mn_service_tick, &mn_ckpt_lane](
+        [&mn_service_timer, mn_service_tick, &mn_ckpt_lane, &payee_feeder](
             const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
             if (mn_ckpt_lane) mn_ckpt_lane->service_tick();
+            // Ordered connect: first asks after the inv grace, re-asks every
+            // 10 s, until the payee cursor reaches the header tip.
+            payee_feeder.tick();
             mn_service_timer.expires_after(std::chrono::seconds(3));
             mn_service_timer.async_wait(*mn_service_tick);
         };

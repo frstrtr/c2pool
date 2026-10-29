@@ -1358,7 +1358,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # re-seed ask) unchanged; and the consumer half of the G7 split (below-tip
     # seed catch-up / refusal-to-arm). Links leveldb via core.
     add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp
-                   test_dash_mn_gap_repair.cpp)
+                   test_dash_mn_gap_repair.cpp
+                   test_dash_payee_fold_feeder.cpp)   # ordered connect (payee + UTXO lanes)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

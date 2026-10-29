@@ -209,6 +209,9 @@ public:
     // mnstates() bumps too: the confirmation-pass projection reads MN
     // registration heights from it (sml_projection.hpp).
     MnStateMachine& mnstates() { bump_root_memo_epoch(); return m_mnstates; }
+    // Read-only view (no epoch bump): the payee ordered-connect cursor and the
+    // gap-seed capture read the queue per block and per tick.
+    const MnStateMachine& mnstates() const { return m_mnstates; }
     // Mempool contents feed the template TX SET, not either committed root —
     // no epoch bump (a per-tx bump would chill the memo for nothing).
     Mempool&        mempool()  { return m_mempool; }

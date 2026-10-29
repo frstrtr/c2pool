@@ -1806,6 +1806,19 @@ public:
         m_on_mn_reseed = std::move(fn);
     }
 
+    /// The ordered-connect cursor PayeeFoldFeeder delivers against: the
+    /// payee machine's apply cursor WHILE an authoritative, height-stamped,
+    /// non-empty snapshot is in force; 0 otherwise (unseeded, unheighted,
+    /// wiped awaiting its re-seed), which puts the feeder in passthrough.
+    /// Read through the const accessor: this runs per block and per tick and
+    /// must not bump the root-memo epoch.
+    uint32_t payee_fold_cursor() const {
+        if (m_mn_needs_reseed || m_mn_snapshot_height == 0) return 0;
+        const MnStateMachine& sm = std::as_const(m_state).mnstates();
+        if (sm.entries().empty()) return 0;
+        return sm.last_applied_height();
+    }
+
     /// Wire the MN diff-store gap-repair seam (mn_gap_repair.hpp; main_dash
     /// points this at MnDiffStore::reconstruct over the PoW-validated header
     /// chain — the c2pool port of dashd's snapshot+diff walk,
