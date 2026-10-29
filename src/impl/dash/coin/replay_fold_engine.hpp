@@ -1011,9 +1011,10 @@ public:
         // ── Pass 3: special txs, in tx order (specialtxman.cpp:228-460) ─
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            // dashd: IsSpecialTxVersion() == (nVersion == 3); only then is
-            // nType meaningful.
-            if (tx.version != 3 || tx.type == 0) continue;
+            // dashd: IsSpecialTxVersion() is nVersion >= 3 on the int16
+            // nVersion (primitives/transaction.h); only then is nType
+            // meaningful and the extra payload present.
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
 
             std::string err;
             switch (tx.type) {

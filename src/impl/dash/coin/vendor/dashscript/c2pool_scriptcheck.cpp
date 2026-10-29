@@ -69,6 +69,7 @@ public:
     }
 
     int GetVersion() const { return m_version; }
+    size_t remaining() const { return m_remaining; }
 
 private:
     const int m_version;
@@ -125,6 +126,29 @@ int c2pool_dash_legacy_sighash(const unsigned char* tx_to, unsigned int tx_to_le
             CScript(script_code, script_code + script_code_len),
             tx, nIn, hash_type, am, SigVersion::BASE, nullptr);
         memcpy(out32, h.begin(), 32);
+        return 1;
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// KAT helper: dashcore's own transaction decoder as a differential reference.
+// Test-only; never on the serve path.
+extern "C" C2POOL_DASH_SCRIPT_EXPORT
+int c2pool_dash_tx_decode_probe(const unsigned char* buf, unsigned int len,
+                                c2pool_dash_tx_probe* out)
+{
+    if (out == nullptr) return 0;
+    try {
+        TxInputStream stream(PROTOCOL_VERSION, buf, len);
+        CMutableTransaction tx(deserialize, stream);
+        out->n_version   = tx.nVersion;
+        out->n_type      = tx.nType;
+        out->n_vin       = static_cast<unsigned int>(tx.vin.size());
+        out->n_vout      = static_cast<unsigned int>(tx.vout.size());
+        out->lock_time   = tx.nLockTime;
+        out->payload_len = static_cast<unsigned int>(tx.vExtraPayload.size());
+        out->consumed    = static_cast<unsigned int>(len - stream.remaining());
         return 1;
     } catch (const std::exception&) {
         return 0;

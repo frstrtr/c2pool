@@ -757,7 +757,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_mempool_validity_gate.cpp
         test_dash_checkinputscripts.cpp   # PR-C4: consensus-exact CheckInputScripts KAT
         test_dash_tx_inject.cpp           # #157: miner/user tx-injection (priority + validity + DoS)
-        test_dash_fold_fee_source.cpp)    # W5-A: fold-backed fee pricing source
+        test_dash_fold_fee_source.cpp     # W5-A: fold-backed fee pricing source
+        test_dash_tx_version_rules.cpp)   # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core

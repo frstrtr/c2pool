@@ -5547,8 +5547,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             {"vout", vout_arr},
                             {"chain", "dash"}};
                         // DIP2/DIP3/DIP4 special-tx payload (explorer.py decodes
-                        // client-side). Present iff version==3 && type!=0.
-                        if (e.tx.version == 3 && e.tx.type != 0 && !e.tx.extra_payload.empty()) {
+                        // client-side). Present iff int16 version >= 3 && type!=0.
+                        if (dash::coin::tx_has_extra_payload(e.tx.version, e.tx.type)
+                            && !e.tx.extra_payload.empty()) {
                             static const char H[] = "0123456789abcdef";
                             std::string ep;
                             ep.reserve(e.tx.extra_payload.size() * 2);
