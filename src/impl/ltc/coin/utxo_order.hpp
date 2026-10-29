@@ -187,14 +187,14 @@ bool ordered_rearm_after_reorg(core::coin::BlockBootstrapState<BlockT>& bs, uint
     return true;
 }
 
-/// Keep up to WINDOW_SIZE requests in flight: request(height) for every
+/// Keep up to bs.window requests in flight: request(height) for every
 /// height not yet requested and not buffered. Returns how many were asked.
 template <typename BlockT, typename RequestFn>
 uint32_t ordered_refill(core::coin::BlockBootstrapState<BlockT>& bs, RequestFn&& request)
 {
     uint32_t n = 0;
     while (bs.next_request <= bs.end_height
-           && (bs.next_request - bs.next_height) < bs.WINDOW_SIZE) {
+           && (bs.next_request - bs.next_height) < bs.window) {
         if (!bs.buffer.count(bs.next_request)) {
             request(bs.next_request);
             ++n;
