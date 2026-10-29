@@ -68,7 +68,14 @@ KIND_TEXT = {
     # Node-level (no worker): the node handed no work to its miners, then did again.
     "work_stalled": "WORK STALLED:",
     "work_resumed": "WORK RESUMED:",
+    # Per worker: hashing below the operator's threshold, then back above it.
+    # The detail carries the measured rate, the threshold and the window.
+    "hashrate_low": "HASHRATE LOW",
+    "hashrate_ok": "hashrate OK again",
 }
+
+WORKER_KINDS = ("offline", "back_online")
+WORKER_RATE_KINDS = ("hashrate_low", "hashrate_ok")
 
 
 class Redactor(logging.Filter):
@@ -140,8 +147,10 @@ def format_text(row):
     detail = row.get("detail", "")
     ts = row.get("event_ts") or row.get("sent_ts") or 0
     when = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if kind in ("offline", "back_online"):
+    if kind in WORKER_KINDS:
         text = "[c2pool] %s: worker %s %s (%s) at %s" % (label, worker, KIND_TEXT[kind], detail, when)
+    elif kind in WORKER_RATE_KINDS:
+        text = "[c2pool] %s: worker %s %s %s at %s" % (label, worker, KIND_TEXT[kind], detail, when)
     else:
         text = "[c2pool] %s: %s %s at %s" % (label, KIND_TEXT.get(kind, kind.upper()), detail, when)
     return text[:4000]
@@ -577,6 +586,18 @@ def selftest():
                                    "26 miner sessions attached"))
     check(text.startswith("[c2pool] dash-1: WORK RESUMED: new work for miners again after 6m"),
           "work_resumed renders as one sentence")
+
+    # Per-worker hashrate kinds: worker, measured rate, threshold, window, time.
+    rate_row = {"kind": "hashrate_low", "label": "primary", "worker": "XaddrABC.D7", "event_ts": 1790000000,
+                "detail": "1.05 TH/s < 1.20 TH/s (15 min)"}
+    text = format_text(rate_row)
+    check(text == "[c2pool] primary: worker XaddrABC.D7 HASHRATE LOW 1.05 TH/s < 1.20 TH/s (15 min) "
+                  "at 2026-09-21 14:13:20 UTC", "hashrate_low renders worker, rate, threshold and window")
+    text = format_text(dict(rate_row, kind="hashrate_ok",
+                            detail="1.78 TH/s (threshold 1.20 TH/s, 15 min); low for 47m"))
+    check(text == "[c2pool] primary: worker XaddrABC.D7 hashrate OK again 1.78 TH/s (threshold 1.20 TH/s, "
+                  "15 min); low for 47m at 2026-09-21 14:13:20 UTC", "hashrate_ok renders the recovered rate")
+    check(all(k in KIND_TEXT for k in ("hashrate_low", "hashrate_ok")), "both hashrate kinds have a text")
 
     srv.shutdown()
     logs = log_buf.getvalue()

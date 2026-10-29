@@ -11,7 +11,9 @@
 //                BACK_ONLINE / digest / test alerts sealed for each configured
 //                relay, retransmits until a signed ack arrives. Given a serve
 //                sample it also emits the node-level WORK_STALLED /
-//                WORK_RESUMED (alert_detector.hpp, NODE LEVEL).
+//                WORK_RESUMED (alert_detector.hpp, NODE LEVEL), and with a
+//                hashrate threshold the per-worker HASHRATE_LOW /
+//                HASHRATE_OK (alert_detector.hpp, HASHRATE).
 //   telegram  -- accepts alerts addressed to its own key from allowlisted
 //                origins, appends them to <state>/outbox.jsonl (0600) for the
 //                Telegram sidecar, acks status 4 (queued) and, once the sidecar
@@ -928,7 +930,8 @@ private:
                 break;
             }
             ++m_c.refused;
-            if (is_work_kind(p.kind) && a.status == static_cast<uint8_t>(AckStatus::RefusedInvalid))
+            if ((is_work_kind(p.kind) || is_hashrate_kind(p.kind)) &&
+                a.status == static_cast<uint8_t>(AckStatus::RefusedInvalid))
                 LOG_WARNING << "[alert-relay] event " << p.event_id << " (" << kind_name(p.kind)
                             << ") refused by relay " << short_hex(p.relay_pub) << " as invalid: a relay"
                                " older than this event kind refuses it -- upgrade the relay (or check"

@@ -59,6 +59,8 @@ wiring it to this transport is a follow-up.
 | `--alert-relay-retry-every S` | retransmit an unacked alert | 60 |
 | `--alert-relay-retry-max N` | total transmissions before "undelivered" | 60 |
 | `--alert-relay-serve-stall-after S` | origin: no work handed to hashing miners this long ⇒ WORK_STALLED, later WORK_RESUMED (0 = off) | 300 |
+| `--alert-relay-hashrate-min RATE` | origin: a worker hashing below RATE (`1200G`, `1.2T`, `1.2TH/s`; a plain number is H/s) ⇒ HASHRATE_LOW, later HASHRATE_OK (0 = off) | off |
+| `--alert-relay-hashrate-window S` | origin: seconds of shares per hashrate evaluation (120-86400) | 900 |
 
 ## Presence detection (origin)
 
@@ -147,6 +149,60 @@ last handed to a miner (the datum the serve-silence check reads):
 - Status: `detector.serve` on `/api/alert-relay/status` (quiet, sessions,
   standby_sessions, alerted, since, cause, held_by_budget).
 
+## Worker level: low hashrate (origin, opt-in)
+
+A rig that keeps submitting at reduced speed (a dead hashboard) stays up, so
+OFFLINE never pages it. With `--alert-relay-hashrate-min RATE` the same 5 s tick
+also measures each hashing worker's rate from the work it delivered here:
+
+- **Measurement.** Per session, the advance of the accepted-share counter and of
+  the accepted work (the sum of the difficulty each accepted share is credited
+  at, recorded by the stratum session next to its hashrate tracker), and the
+  exposure `dt / (vardiff × 2^32)`. Over a window (`hashrate-window`, 900 s)
+  that ends at the worker's last share: `rate = work × 2^32 / T`, the share
+  count N, and the count expected at the threshold, Λ = RATE × exposure.
+- **Test.** Every window/3 (with new shares since the previous evaluation):
+  low evidence = rate < RATE and P(Poisson(Λ) ≤ N) < 0.05; ok evidence = rate >
+  1.1 × RATE and P(Poisson(1.1 Λ) ≥ N) < 0.05. HASHRATE_LOW fires after two
+  consecutive evaluations with low evidence, HASHRATE_OK after two with ok
+  evidence while a LOW is outstanding. [RATE, 1.1 RATE] is the hysteresis band:
+  a rig inside it keeps its state, so a rig at the threshold pages once.
+  Text: `worker X.D7 HASHRATE LOW 1.05 TH/s < 1.20 TH/s (15 min)` and
+  `worker X.D7 hashrate OK again 1.78 TH/s (threshold 1.20 TH/s, 15 min); low for 47m`.
+- **What a window can tell.** At the DASH vardiff (a share per ~10 s) a 900 s
+  window holds ~90-180 shares, so a rate is known to about ±10 %, and the test
+  level trades detection delay against pages for rigs just above the
+  threshold. Measured on simulated shares (1.2 TH/s threshold, 900 s window,
+  two evaluations):
+
+  | level | 1.8 → 1.0 TH/s: median delay | within 3 windows | pages per 210 rig-days at 1.32 / 1.44 TH/s |
+  |---|---|---|---|
+  | 0.001 | 8.9 windows | 12 % | 0 / 0 |
+  | 0.02 | 2.6 windows | 62 % | 4 / 0 |
+  | **0.05** (default) | 1.6 windows | 81 % | 15 / 2 |
+
+  Healthy rigs at 1.5× the threshold never page at any of these levels (the
+  KATs measure a week of 30 rigs). A rig that loses one of three boards
+  (1.77 → 1.18 TH/s) sits right at a 1.2 TH/s threshold and cannot be told
+  from it in any useful time: set RATE between the healthy rate and the
+  one-board rate (e.g. 1.5T for 1.8 TH/s rigs).
+- **Not judged** (no page either way): standby workers and connections (they
+  submit nothing here); a worker that is down (OFFLINE's business; a window
+  ending at the last share never sees the silence of a rig that stopped or
+  moved to another node); a worker without a full window of settled data: the
+  data restart when its session set changes, when it comes back up, after a
+  gap of 20 share intervals at the threshold rate (a paused rig is not a slow
+  one), and while a WORK_STALLED is outstanding (the node is at fault, not the
+  rigs), and they count from 180 s later (vardiff ramp-up).
+- **Budget.** The worker events' 30/h cap (digest, held events stay pending);
+  a LOW not within `min-interval` of the worker's previous LOW; nothing inside
+  the startup grace. An outstanding LOW is persisted (`hashrate_low` under
+  `workers` in `state.json`) and outlives an OFFLINE episode: no second LOW
+  when the rig comes back still slow, one HASHRATE_OK when it hashes at speed
+  again. A worker that moved to another node drops it silently.
+- Status: `detector.hashrate` (min, window, evaluations, low_evidence) and,
+  per worker, `hashrate` (last measured H/s) and `hashrate_low`.
+
 ## Wire format
 
 `alert`: `u32 version(=1) | u8 hops_left | u32 timestamp | u64 nonce |
@@ -160,12 +216,13 @@ malformed body), 4 queued at the relay (sidecar has not delivered yet), 5 expire
 at the relay (the sidecar will not page it: too old).
 
 Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test,
-5: work_stalled, 6: work_resumed) | event_ts u32 | label | worker | detail`
-(length-prefixed, clipped to 32/64/128 bytes; the node-level kinds 3-6 carry an
-empty worker). Kinds 5 and 6 changed nothing outside the sealed body, so an
-older forwarder carries them unchanged; an older relay (kinds 1-4) refuses them
-with a signed status 3, which the origin records in its ledger and warns about —
-upgrade the relay together with the origin. The strings are UTF-8: the origin replaces malformed bytes with `?` and
+5: work_stalled, 6: work_resumed, 7: hashrate_low, 8: hashrate_ok) | event_ts u32 |
+label | worker | detail` (length-prefixed, clipped to 32/64/128 bytes; the
+node-level kinds 3-6 carry an empty worker). Kinds 5-8 changed nothing outside
+the sealed body, so an older forwarder carries them unchanged; an older relay
+(kinds 1-4, or 1-6 for 7 and 8) refuses them with a signed status 3, which the
+origin records in its ledger and warns about. The page is then lost: ship the
+relay (and its sidecar) together with, or before, its origins. The strings are UTF-8: the origin replaces malformed bytes with `?` and
 clips on a code-point boundary (Cyrillic worker names and labels are common),
 and the relay refuses a body whose strings are not well-formed UTF-8
 (status 3; such a frame is never cached in the seen set). Every JSON dump on
@@ -420,14 +477,24 @@ counters. The origin's outbox block also carries `stale_refusal`.
   an older relay's refusal, delivery through a forwarder and an origin restart
   mid-episode, the main_dash wiring of the serve sample, and the node-level
   budget (a saturated worker cap does not hold WORK_STALLED back; the budget
-  itself is bounded).
+  itself is bounded). Hashrate (simulated Poisson shares at the DASH vardiff,
+  fixed seeds): 30 healthy 1.8 TH/s rigs for a week never page (the measured
+  false-alarm rate is printed), rigs 10 % / 20 % above the threshold, a drop
+  to 1.0 TH/s paging exactly once (delay distribution over 200 trials), the
+  recovery paging HASHRATE_OK once, standby / failback / hung / just-connected
+  / reconnecting / vardiff ramp-up / paused rigs never paging LOW, no second
+  page around an OFFLINE episode or a node restart, no LOW during WORK_STALLED,
+  the worker cap and min-interval, the exact Poisson tails, the rate parser,
+  kinds 7/8 on the wire with an older relay's refusal, and the stratum and
+  main_dash wiring.
 - `scripts/alert_relay_telegram.py --selftest`: fake in-process Bot API (200,
   429 retry_after, 500, ok:false, connection refused, restart, token redaction,
   `--max-age` for new rows and for rows that age out while being retried, the
   `expired.jsonl` contract the node reads, and the destination group: a negative
   `-100...` id is carried unchanged as a JSON integer, and the CLI refuses to
   start with no id or with a private-chat id; the node-level kinds render
-  without a worker).
+  without a worker; the hashrate kinds render worker, rate, threshold and
+  window).
 - `scripts/alert_relay_e2e.sh`: two nodes + fake Telegram + stratum simulator on
   loopback with a private network id, plus a master-built peer and a flag-off
   parity phase.
