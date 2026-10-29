@@ -276,6 +276,9 @@
 //   relayjoint   the threaded join over TCP (the attempt on the join worker,
 //                applied on the owner); a RandomX failure in an attempt ends
 //                it alarmed, no token; the next attempt joins;
+//   relaypace    the join worker after a NotServed end (a short FC_HEADERS
+//                reply; threads, TCP, the relay's ticks): the next attempt no
+//                sooner than P-53;
 //   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
 //                its own with a rig set, a kind-2 file for epoch 1 accepted
 //                at fixed = start + GRACE, refused off regtest;
@@ -7955,6 +7958,82 @@ void relayjoint() {
 }
 
 // ---------------------------------------------------------------------------
+// relaypace: the join worker's pacing after a NotServed end (threads, loopback TCP, the relay's own ticks; no
+// join_step call): a load-failed J (abandon_timeout_s 2) whose one server A answers each join page with one header
+// (A's FC_HEADERS frame holds one; J's request could take three) ends every attempt NotServed (a short FC_HEADERS
+// reply); the next attempt is never sooner than 2 s after the last one ended.
+void relaypace() {
+    const KatNet net;
+    std::uint64_t one = 0;  // an FC_HEADERS frame of one header
+    {
+        Harness h0(net);
+        const std::size_t n0 = h0.add(table0(net), true);
+        h0.tick_monero();
+        h0.mine(n0, 0, 900);
+        if (const pb::CarrierBodyV3* b = h0[n0].bodies().get(h0[n0].tree().best().id))
+            if (const auto f = pb::encode_fc_headers(pb::HeadersReply{0, 1, {pb::header_of(*b)}}, 1u << 22)) one = f->size();
+    }
+    Harness h(net);
+    h.tick_monero();
+    std::string why;
+    pb::CarrierLinks la, lj;
+    pb::PathbRelayOptions oa;
+    oa.listen = true;
+    oa.listen_host = "127.0.0.1";
+    pb::PathbRelayNode ra(oa, la);
+    pb::PathbNodeConfig ca = h.config(table0(net), true);
+    ca.headers_frame_bytes = one + (one - pb::kHeadersFrameHeadBytes) / 2;  // room for one header, not two
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(ca, ra.bind_io(h.io(0))));
+    ra.attach(*h.nodes[0]);
+    bool mined = one > pb::kHeadersFrameHeadBytes;
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(0, static_cast<std::size_t>(i), 900 + i);
+        mined = mined && jb && h[0].on_own_share(*jb, 900 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const bool sa = ra.start(why);
+    using Clk = std::chrono::steady_clock;
+    std::mutex lm;
+    std::vector<std::pair<Clk::time_point, std::string>> ends;
+    pb::PathbRelayOptions oj;
+    oj.peers = {{"127.0.0.1", la.listen_port()}};
+    oj.join_min_peers = 1;
+    pb::PathbRelayNode rj(oj, lj, pb::RelayClock::system(), [&](const std::string& line) {
+        if (line.rfind("relay: join attempt", 0) != 0) return;
+        std::lock_guard<std::mutex> lk(lm);
+        ends.emplace_back(Clk::now(), line);
+    });
+    pb::PathbNodeConfig cj = h.config(table0(net));
+    cj.abandon_timeout_s = 2;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cj, rj.bind_io(h.io(1)), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    rj.attach(*h.nodes[1]);
+    const bool sj = rj.start(why);
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    rj.stop();
+    ra.stop();
+    std::vector<std::pair<Clk::time_point, std::string>> e;
+    {
+        std::lock_guard<std::mutex> lk(lm);
+        e = ends;
+    }
+    std::size_t not_served = 0;
+    for (const auto& [t, line] : e)
+        if (line.find(": NotServed (") != std::string::npos && line.find("a short FC_HEADERS reply") != std::string::npos)
+            ++not_served;
+    double min_gap = 1e9;
+    for (std::size_t i = 1; i < e.size(); ++i)
+        min_gap = std::min(min_gap, std::chrono::duration<double>(e[i].first - e[i - 1].first).count());
+    std::printf("  relaypace: attempts %zu (NotServed, short reply %zu) in 9 s; the shortest gap %.2f s\n", e.size(),
+                not_served, e.size() > 1 ? min_gap : 0.0);
+    check(mined && sa && sj && e.size() >= 2 && not_served == e.size(),
+          "relaypace: setup (every attempt NotServed on a short FC_HEADERS reply; " + std::to_string(e.size()) +
+                  " attempts)" + (why.empty() ? "" : "; " + why));
+    check(e.size() <= 5 && min_gap >= 1.9,
+          "relaypace: after a NotServed end the next attempt comes no sooner than P-53 (2 s): " + std::to_string(e.size()) +
+                  " attempts in 9 s, the shortest gap " + std::to_string(min_gap) + " s");
+}
+
+// ---------------------------------------------------------------------------
 // ctxgate: a frame parked on a Monero input runs again only when that input is held, per (cause, id):
 //   storm   ten sibling carriers whose own P_r S the follower holds without its weights (a bodiless alternative):
 //           50 follower events run none of them again (one context asked for S); a DEFER waiting for the weights of
@@ -12071,6 +12150,7 @@ int main(int argc, char** argv) {
     run("relayp40", relayp40);
     run("relayp50", relayp50);
     run("relayjoint", relayjoint);
+    run("relaypace", relaypace);
     run("regtestk30", regtestk30);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
