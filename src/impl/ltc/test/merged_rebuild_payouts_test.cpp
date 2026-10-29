@@ -554,6 +554,38 @@ TEST(MergedPayoutSource, ValueChangeIsDerivedExactlyWithoutTheLock)
     EXPECT_EQ(src.stats().busy, 0u);
 }
 
+// Two weight keys resolving to the same DOGE script (a miner's P2PKH and
+// P2WPKH shares of one pubkey hash) are one output, split once on their
+// summed weight, as p2pool's build_canonical_merged_coinbase does
+// (script_weights). Summing two per-key floors gives a satoshi less to that
+// output (and one more to the donation) whenever the split is not exact; a
+// V36 peer re-derives the coinbase and would reject the share.
+TEST(MergedPayoutSource, SameScriptFromTwoKeysIsSplitOnceLikeP2pool)
+{
+    ltc::ShareTracker t;
+    const uint256 best = add_shares(t, uint256(), 4, {{1, 0}, {1, 1}, {2, 0}});   // h (P2PKH), h (P2WPKH), g
+    const auto w = t.get_merged_payout_weights(best, 98);
+    // The miners' reward m = v - floor(v*50/65535); pick v with m = 2 (mod 3).
+    uint64_t value = 1000000000000ULL;
+    while ((value - static_cast<uint64_t>((static_cast<unsigned __int128>(value) * kDonation) / 65535)) % 3 != 2)
+        ++value;
+    const uint64_t donation = static_cast<uint64_t>((static_cast<unsigned __int128>(value) * kDonation) / 65535);
+    const uint64_t miners = value - donation;
+    const auto script_of = [](unsigned char b) {
+        uint160 h;
+        h.SetHex(std::string(40, "0123456789abcdef"[b & 0xf]));
+        return ltc::pubkey_hash_to_script(h, 0);
+    };
+    const uint64_t h_amount = miners * 2 / 3;   // p2pool: one floor on the summed weight
+    const uint64_t g_amount = miners / 3;
+    Payouts want{{script_of(1), h_amount}, {script_of(2), g_amount},
+                 {combined_donation(), donation + (miners - h_amount - g_amount)}};
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(ltc::ShareTracker::merged_payout_outputs(w, value, combined_donation()), want);
+    EXPECT_EQ(with_the_lock(t, best, value), want);
+    EXPECT_NE(h_amount, 2 * (miners / 3)) << "the case where per-key floors differ";
+}
+
 // The tracker lock stays busy for 30 s (one rebuild a second, the fees
 // changing every time): every rebuild on the best share whose weights the
 // compute thread published gets payouts, re-derived exactly. The best share

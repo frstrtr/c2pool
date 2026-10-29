@@ -186,7 +186,7 @@ struct MergedPayoutWeights
     int32_t chain_len{0};      // min(height(best), real_chain_length)
     uint288 total_weight;
     uint288 donation_weight;
-    // (merged script, weight) for each convertible key, in the weights map's order.
+    // (merged script, summed weight of the keys resolving to it), by script.
     std::vector<std::pair<std::vector<unsigned char>, uint288>> resolved;
     uint288 accepted_total;    // sum of the resolved weights
 };
@@ -2952,7 +2952,14 @@ public:
         // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
         // convertible weights (after filtering unconvertible P2WSH/P2TR).
         // NOT total_weight - donation_weight (which includes unconvertible).
-        // First pass: resolve scripts and compute accepted_total
+        // First pass: resolve scripts and compute accepted_total.
+        // Keys resolving to the same merged script (a miner's P2PKH and P2WPKH
+        // shares, an explicit merged address equal to an autoconverted one)
+        // are summed BEFORE the split, as p2pool's
+        // build_canonical_merged_coinbase does (script_weights): one
+        // floor(miners_reward * sum / accepted) per script, not a sum of
+        // per-key floors. V36 peers re-derive this coinbase and compare.
+        std::map<std::vector<unsigned char>, uint288> script_weights;
         for (const auto& [key, weight] : weights) {
             std::vector<unsigned char> script;
             if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
@@ -2961,9 +2968,11 @@ public:
                 script = resolve_merged_payout_script(key);
             }
             if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
-            out.resolved.emplace_back(std::move(script), weight);
+            script_weights[script] = script_weights[script] + weight;
             out.accepted_total = out.accepted_total + weight;
         }
+        for (auto& [script, weight] : script_weights)
+            out.resolved.emplace_back(script, weight);
         return out;
     }
 
