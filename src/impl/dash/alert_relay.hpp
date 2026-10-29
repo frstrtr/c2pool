@@ -36,9 +36,14 @@
 //   * Acks are signed by the relay key; an origin only accepts an ack from the
 //     relay it addressed, so an intermediate cannot silence retransmits.
 //
-// Randomness: getrandom(2) (fallback /dev/urandom). NEVER a seeded PRNG.
+// Randomness: the OS CSPRNG via core::os_random_bytes (getrandom(2) on Linux,
+// getentropy(2) on macOS, BCryptGenRandom on Windows; /dev/urandom fallback on
+// POSIX). NEVER a seeded PRNG.
 
 #include "share_messages.hpp"   // hmac_sha256, generate_stream, ecdsa_sign/verify, hash160, secp ctx
+
+#include <core/durable_file.hpp>
+#include <core/os_random.hpp>
 
 #include <btclibs/crypto/sha256.h>
 #include <secp256k1.h>
@@ -55,11 +60,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/random.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace dash::alert {
 
@@ -210,30 +210,7 @@ inline std::optional<Bytes> from_hex(const std::string& in)
 // ── Randomness (OS CSPRNG only) ─────────────────────────────────────────────
 inline bool fill_random(unsigned char* out, std::size_t n)
 {
-    std::size_t got = 0;
-    while (got < n) {
-        ssize_t r = ::getrandom(out + got, n - got, 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        got += static_cast<std::size_t>(r);
-    }
-    if (got == n) return true;
-    // Fallback: /dev/urandom (getrandom unavailable, e.g. very old kernel).
-    int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    while (got < n) {
-        ssize_t r = ::read(fd, out + got, n - got);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
-            ::close(fd);
-            return false;
-        }
-        got += static_cast<std::size_t>(r);
-    }
-    ::close(fd);
-    return true;
+    return core::os_random_bytes(out, n);
 }
 
 // ── Keys ────────────────────────────────────────────────────────────────────
@@ -288,16 +265,17 @@ inline Bytes key_id(const Bytes& pubkey)
 
 // Load a 32-byte hex secret from PATH, or create one (0600, O_EXCL) when the
 // file does not exist. `created` reports which. `warning` is set (non-fatal)
-// when an existing file is group/other accessible. The secret is never logged.
+// when an existing file is group/other accessible (POSIX mode bits; Windows
+// files carry the directory's ACL instead). The secret is never logged.
 inline std::optional<KeyPair> load_or_create_key_file(const std::string& path,
                                                       bool& created,
                                                       std::string& err,
                                                       std::string& warning)
 {
     created = false;
-    struct stat st{};
-    if (::stat(path.c_str(), &st) == 0) {
-        if ((st.st_mode & 077) != 0)
+    bool group_other_access = false;
+    if (core::durable_file::stat_exists(path, &group_other_access)) {
+        if (group_other_access)
             warning = "alert key file " + path + " is group/other accessible (chmod 600 it)";
         std::ifstream f(path);
         if (!f) { err = "cannot read alert key file " + path; return std::nullopt; }
@@ -312,14 +290,11 @@ inline std::optional<KeyPair> load_or_create_key_file(const std::string& path,
     }
     auto kp = KeyPair::generate();
     if (!kp) { err = "OS randomness unavailable; cannot generate an alert key"; return std::nullopt; }
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) { err = "cannot create alert key file " + path + ": " + std::strerror(errno); return std::nullopt; }
     std::string hex = to_hex(kp->seckey.data(), 32) + "\n";
-    bool ok = ::write(fd, hex.data(), hex.size()) == static_cast<ssize_t>(hex.size());
-    ok = (::fsync(fd) == 0) && ok;
-    ::close(fd);
+    const int rc = core::durable_file::create_new(path, hex);
     std::fill(hex.begin(), hex.end(), '0');
-    if (!ok) { err = "short write creating alert key file " + path; return std::nullopt; }
+    if (rc > 0) { err = "cannot create alert key file " + path + ": " + std::strerror(rc); return std::nullopt; }
+    if (rc != 0) { err = "short write creating alert key file " + path; return std::nullopt; }
     created = true;
     return kp;
 }
