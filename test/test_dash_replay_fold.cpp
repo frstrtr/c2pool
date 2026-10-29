@@ -1544,6 +1544,114 @@ TEST(DashReplayFoldSynthetic, SnapshotV3FailLoudPaths)
     EXPECT_EQ(eng.height(), 100u);
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Dash Core v23.1.9 port — chain-side rules (items A and B)
+// ════════════════════════════════════════════════════════════════════════
+
+// A seeded, already-confirmed masternode (pass 1 leaves it alone).
+static ReplayMNState v2319_mn(uint8_t tag, uint8_t type = MnType::REGULAR)
+{
+    ReplayMNState st;
+    st.nVersion = ProTxVersion::BASIC_BLS;
+    st.nType = type;
+    st.keyIDOwner = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.keyIDVoting = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.pubKeyOperator = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.collateralOutpoint.hash = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.netInfo.ip = seq_array<16>(static_cast<uint8_t>(0x10 + tag));
+    st.netInfo.port_be = 9999;
+    st.scriptPayout.m_data = script_bytes(static_cast<uint8_t>(0x60 + tag));
+    st.nRegisteredHeight = 50;
+    st.confirmedHash = raw256(0x77);
+    if (type == MnType::EVO) {
+        st.platformNodeID = raw160(static_cast<uint8_t>(0x90 + tag));
+        st.platformP2PPort = 26656;
+        st.platformHTTPPort = 443;
+    }
+    return st;
+}
+
+static MutableTransaction v2319_plain_tx(int32_t version, uint16_t type = 0)
+{
+    MutableTransaction tx;
+    tx.version = version;
+    tx.type = type;
+    TxIn in;
+    in.prevout.hash = raw256(0xA9);
+    in.prevout.index = 3;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    TxOut out;
+    out.value = 5;
+    out.scriptPubKey.m_data = script_bytes(0xAA);
+    tx.vout.push_back(out);
+    if (type != 0) tx.extra_payload = {0x01, 0x02};
+    return tx;
+}
+
+// A5 (07494dd62): after DIP3 a negative-nVersion tx makes the block invalid
+// (bad-txns-version). The fold refuses it BEFORE any pass mutates the list —
+// no poison, cursor unmoved — and the valid block at that height still folds.
+TEST(DashReplayFoldSynthetic, NegativeVersionTxRefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;   // DIP3 active for blocks at h > 100
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    ASSERT_NE(eng.find(mn), nullptr);
+    const ReplayMNState before = *eng.find(mn);
+
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    ASSERT_FALSE(r.ok) << "dashd: bad-txns-version";
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned()) << "a block dashd rejects is another chain, not a desync";
+    EXPECT_EQ(eng.height(), 100u);
+    ASSERT_NE(eng.find(mn), nullptr);
+    EXPECT_TRUE(*eng.find(mn) == before) << "the held list is unchanged";
+
+    auto ok = eng.fold_block(make_block(101, raw256(9), root, {}, &eng), 101);
+    EXPECT_TRUE(ok.ok) << ok.error;
+}
+
+// Control for A5: the rule is post-DIP3 only (DeploymentActiveAfter).
+TEST(DashReplayFoldSynthetic, NegativeVersionTxIsOutsideTheRuleAtTheDip3Block)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 101;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    EXPECT_TRUE(r.ok) << r.error;
+}
+
+// A6: an unknown special type post-DIP3 is bad-txns-type.
+TEST(DashReplayFoldSynthetic, UnknownSpecialTypePostDip3RefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(3, /*type=*/42)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-type"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned());
+    EXPECT_EQ(eng.height(), 100u);
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 // task #154 — INCREMENTAL merkleRootMNList cache KATs.
 //

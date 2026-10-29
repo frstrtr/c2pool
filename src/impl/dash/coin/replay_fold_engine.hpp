@@ -941,6 +941,27 @@ public:
         const int32_t H = static_cast<int32_t>(height);
         const uint256 prev_hash = block.m_previous_block;
 
+        // ── Pre-scan: ContextualCheckTransaction (validation.cpp:317-349 @
+        // v23.1.9), every tx incl. the coinbase, once DIP3 is active for this
+        // block (DeploymentActiveAfter(pindexPrev): H > dip0003_height). A
+        // block dashd rejects (bad-txns-type / bad-txns-cb-type / the v23.1.9
+        // bad-txns-version for a negative nVersion) is refused BEFORE any pass
+        // mutates the held list — like the prev-link refusal above it is not
+        // a poison: the held state is still exactly right for the cursor
+        // block, and the caller re-anchors on the best chain.
+        if (H > m_cfg.gates.dip0003_height) {
+            for (size_t i = 0; i < block.m_txs.size(); ++i) {
+                if (auto why = contextual_tx_check(block.m_txs[i], i == 0)) {
+                    r.error = "fold refused at h=" + std::to_string(height)
+                            + " tx[" + std::to_string(i) + "]: "
+                            + std::string(*why)
+                            + " (ContextualCheckTransaction — dashd rejects"
+                              " this block; the held list is unchanged)";
+                    return r;
+                }
+            }
+        }
+
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);
 

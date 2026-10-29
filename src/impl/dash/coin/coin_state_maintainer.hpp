@@ -1515,6 +1515,19 @@ private:
             return r;
         }
         auto r    = m_state.mnstates().apply_block(block, height);
+        // CONSENSUS REFUSAL (v23.1.9 port): dashd rejects this block. The apply
+        // mutated nothing and the cursor stayed put, so the set is still right
+        // for the previous block — no wipe, no re-seed. Stop serving on this
+        // block; the valid block at this height (the chain the network
+        // ChainLocks) folds normally, and a child of the refused block trips
+        // the gap guard.
+        if (!r.refused.empty()) {
+            LOG_WARNING << "[EMB-DASH] MN payee fold REFUSED block h=" << height
+                        << ": " << r.refused
+                        << " — dashd rejects it; not serving on it (demote)";
+            demote();
+            return r;
+        }
         // ── DIFF-STORE GAP REPAIR (dashd GetListForBlockInternal analogue,
         // evo/deterministicmns.cpp:778-870, as a cold repair path). An APPLY
         // GAP means blocks between the cursor and this one were never folded

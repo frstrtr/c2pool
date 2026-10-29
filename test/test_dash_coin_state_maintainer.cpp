@@ -1295,6 +1295,7 @@ static BlockType make_cbtx_block(uint32_t height, int64_t credit_pool,
     cb.creditPoolBalance = credit_pool;
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, height));
+    blk.m_txs[0].version = 3;   // special version: a typed v1 coinbase is bad-txns-type
     blk.m_txs[0].type = 5;                                    // CbTx
     blk.m_txs[0].extra_payload = dash::coin::encode_cbtx(cb);
     blk.m_txs[0].vout[0].scriptPubKey.m_data = payee_script;  // pays projected MN
