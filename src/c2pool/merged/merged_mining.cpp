@@ -653,6 +653,17 @@ void MergedMiningManager::note_payout_miss(const std::string& reason) { t_payout
 
 bool MergedMiningManager::on_rpc_thread() { return t_mm_rpc_thread; }
 
+namespace {
+nlohmann::json payout_source_json(const MergedPayoutSource::Stats& st)
+{
+    return {{"published", st.published},
+            {"from_weights", st.from_weights},
+            {"computed", st.computed},
+            {"reused_across_best", st.reused_across_best},
+            {"busy", st.busy}};
+}
+} // namespace
+
 nlohmann::json MergedMiningManager::get_rebuild_stats_json() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -679,7 +690,8 @@ nlohmann::json MergedMiningManager::get_rebuild_stats_json() const
             {"work_unchanged", m_rebuild_work_unchanged},
             {"snapshot_target_refusals", m_snapshot_target_refusals},
             {"no_payout_seconds", no_payout_seconds},
-            {"no_payout_now", std::move(no_payout_now)}};
+            {"no_payout_now", std::move(no_payout_now)},
+            {"payout_source", payout_source_json(m_payout_source->stats())}};
 }
 
 void MergedMiningManager::set_clock_for_test(ClockFn fn) { m_clock = std::move(fn); }

@@ -7510,14 +7510,69 @@ int main(int argc, char* argv[]) {
                              << " (script " << operator_merged_script.size() << " bytes)";
                 }
                 // The tracker lock is often busy (the compute thread holds it
-                // while it processes shares): wait for it a little on the
-                // merged-mining RPC thread, and reuse the payouts already
-                // computed for the same (best share, chain, value) when it stays
-                // busy, instead of handing the rebuild no payouts
+                // exclusively while it processes shares, for tens of seconds
+                // at a stretch): the compute thread publishes the PPLNS
+                // weights of every best share it chooses while it holds the
+                // lock, and a rebuild derives the amounts for its coinbase
+                // value from them without the lock
                 // (c2pool/merged/payout_source.hpp).
-                auto merged_payout_source = std::make_shared<c2pool::merged::MergedPayoutSource>();
+                auto merged_payout_source = mm_manager->payout_source();
+                auto combined_donation = std::vector<unsigned char>(
+                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
+                    ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
+                // The weights of `best` for a merged chain, as a payout
+                // source entry. Merged chains always use
+                // COMBINED_DONATION_SCRIPT (P2SH) regardless of share version
+                // (p2pool data.py line 303); the parent chain uses the
+                // version-dependent donation.
+                auto merged_weights = [operator_ltc_script, operator_merged_script, combined_donation](
+                    ltc::ShareTracker& tracker, const uint256& best, uint32_t chain_id)
+                    -> c2pool::merged::MergedPayoutSource::Weights
+                {
+                    c2pool::merged::MergedPayoutSource::Weights out;
+                    out.best = best;
+                    out.chain_id = chain_id;
+                    if (best.IsNull() || !tracker.chain.contains(best))
+                        return out;   // no derive: no payouts
+                    auto w = std::make_shared<const ltc::MergedPayoutWeights>(
+                        tracker.get_merged_payout_weights(best, chain_id, operator_ltc_script,
+                                                          operator_merged_script));
+                    out.chain_len = w->chain_len;
+                    out.derive = [w, combined_donation](uint64_t coinbase_value) {
+                        return ltc::ShareTracker::merged_payout_outputs(*w, coinbase_value,
+                                                                         combined_donation);
+                    };
+                    return out;
+                };
+
+                // Published on the compute thread, under the exclusive tracker
+                // lock, after each best-share decision (and when the window
+                // under the same best share deepens).
+                {
+                    std::vector<uint32_t> merged_chain_ids;
+                    for (const auto& ci : mm_manager->get_chain_infos())
+                        merged_chain_ids.push_back(ci.chain_id);
+                    auto published = std::make_shared<std::map<uint32_t, std::pair<uint256, int32_t>>>();
+                    p2p_node->set_locked_best_hook(
+                        [merged_payout_source, merged_weights, merged_chain_ids, published](
+                            ltc::ShareTracker& tracker, const uint256& best) {
+                            if (best.IsNull() || !tracker.chain.contains(best))
+                                return;
+                            const int32_t chain_len = std::min(
+                                tracker.chain.get_height(best),
+                                static_cast<int32_t>(ltc::PoolConfig::real_chain_length()));
+                            for (uint32_t chain_id : merged_chain_ids) {
+                                auto& last = (*published)[chain_id];
+                                if (last.first == best && last.second == chain_len)
+                                    continue;
+                                merged_payout_source->publish(merged_weights(tracker, best, chain_id));
+                                last = {best, chain_len};
+                            }
+                        });
+                }
+
                 mm_manager->set_payout_provider(
-                    [&p2p_node, mi, operator_ltc_script, operator_merged_script, merged_payout_source](
+                    [&p2p_node, merged_payout_source, merged_weights](
                         uint32_t chain_id, uint64_t coinbase_value)
                     -> std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
                 {
@@ -7532,45 +7587,17 @@ int main(int argc, char* argv[]) {
                     Payouts result = merged_payout_source->get(
                         best, chain_id, coinbase_value,
                         c2pool::merged::MergedMiningManager::on_rpc_thread(),
-                        [&]() -> std::optional<Payouts> {
+                        [&]() -> std::optional<c2pool::merged::MergedPayoutSource::Weights> {
                             auto guard = p2p_node->read_tracker();
                             if (!guard)
                                 return std::nullopt;
-
-                            // Use block target (from min_header.bits), not share target.
-                            // Matches p2pool: block_target = self.header['bits'].target
-                            uint256 block_target;
-                            guard->chain.get(best).share.invoke([&](auto* s) {
-                                block_target = chain::bits_to_target(s->m_min_header.m_bits);
-                            });
-
-                            // Merged chains always use COMBINED_DONATION_SCRIPT (P2SH)
-                            // regardless of share version — p2pool data.py line 303.
-                            // The parent chain uses version-dependent donation (P2PK for V35).
-                            auto combined_donation = std::vector<unsigned char>(
-                                ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
-                                ltc::PoolConfig::COMBINED_DONATION_SCRIPT.end());
-                            auto payouts_map = guard->get_merged_expected_payouts(
-                                best, block_target, coinbase_value, chain_id, combined_donation,
-                                operator_ltc_script, operator_merged_script);
-
-                            LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
-                                     << " coinbase_value=" << coinbase_value
-                                     << " payouts_map_size=" << payouts_map.size()
-                                     << " chain_height=" << guard->chain.get_height(best)
-                                     << " block_target=" << block_target.GetHex().substr(0,16);
-
-                            // Convert map → sorted vector for coinbase construction
-                            Payouts out;
-                            out.reserve(payouts_map.size());
-                            for (auto& [script, amount] : payouts_map) {
-                                if (amount >= 1)
-                                    out.emplace_back(script, amount);
-                            }
-                            std::sort(out.begin(), out.end());
-                            return out;
+                            return merged_weights(*guard, best, chain_id);
                         },
                         miss);
+                    LOG_DEBUG_DIAG << "[MM-payout] chain_id=" << chain_id
+                             << " coinbase_value=" << coinbase_value
+                             << " payouts=" << result.size()
+                             << (miss.empty() ? "" : " miss=" + miss);
                     if (result.empty())
                         c2pool::merged::MergedMiningManager::note_payout_miss(miss.empty() ? "empty" : miss);
                     return result;

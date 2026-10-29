@@ -12,6 +12,7 @@
 
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
+#include <c2pool/merged/payout_source.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -292,6 +293,11 @@ public:
             uint32_t chain_id, uint64_t coinbase_value)>;
 
     void set_payout_provider(PayoutProvider provider);
+
+    /// Where a payout provider gets the payouts while the sharechain
+    /// tracker's lock is busy (payout_source.hpp); its counters are in
+    /// get_rebuild_stats_json()["payout_source"].
+    std::shared_ptr<MergedPayoutSource> payout_source() const { return m_payout_source; }
     /// Get merged payouts for a chain (delegates to payout_provider)
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
     get_payouts(uint32_t chain_id, uint64_t coinbase_value) const
@@ -338,7 +344,8 @@ public:
     /// {"no_payouts": {reason: rebuilds}, "kept_last_block": n,
     ///  "dropped_commitment": n, "stale_results": n, "work_changed": n,
     ///  "work_unchanged": n, "snapshot_target_refusals": n,
-    ///  "no_payout_seconds": s, "no_payout_now": [symbols]}.
+    ///  "no_payout_seconds": s, "no_payout_now": [symbols],
+    ///  "payout_source": {published, from_weights, computed, reused_across_best, busy}}.
     nlohmann::json get_rebuild_stats_json() const;
 
     /// Steady-clock seconds the manager stamps snapshots and episodes with
@@ -452,6 +459,7 @@ private:
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
+    std::shared_ptr<MergedPayoutSource> m_payout_source = std::make_shared<MergedPayoutSource>();
 
     // Rebuilds without payouts (guarded by m_mutex).
     std::map<std::string, uint64_t> m_rebuild_no_payouts;

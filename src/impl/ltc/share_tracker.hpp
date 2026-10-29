@@ -174,6 +174,23 @@ struct CumulativeWeights
     uint288 total_donation_weight;
 };
 
+/// The PPLNS weights a merged (aux) chain's payouts are split by, with each
+/// key resolved to its merged script. Taken under the tracker lock
+/// (ShareTracker::get_merged_payout_weights); the amounts for ANY coinbase
+/// value then follow from them alone (ShareTracker::merged_payouts_from_weights),
+/// exactly as get_merged_expected_payouts computes them.
+struct MergedPayoutWeights
+{
+    uint256 best;
+    uint32_t chain_id{0};
+    int32_t chain_len{0};      // min(height(best), real_chain_length)
+    uint288 total_weight;
+    uint288 donation_weight;
+    // (merged script, weight) for each convertible key, in the weights map's order.
+    std::vector<std::pair<std::vector<unsigned char>, uint288>> resolved;
+    uint288 accepted_total;    // sum of the resolved weights
+};
+
 // ── Dense PPLNS Ring Buffer ──────────────────────────────────────────────
 // Stores PPLNS-relevant data for each share in the sliding window as a
 // contiguous array. Eliminates hash map pointer-chasing during PPLNS walks:
@@ -2903,14 +2920,63 @@ public:
                                 const std::vector<unsigned char>& operator_ltc_script = {},
                                 const std::vector<unsigned char>& operator_merged_script = {})
     {
-        auto chain_len = std::min(chain.get_height(best_share_hash),
-                                  static_cast<int32_t>(PoolConfig::real_chain_length()));
+        (void)block_target;
+        return merged_payouts_from_weights(
+            get_merged_payout_weights(best_share_hash, chain_id, operator_ltc_script, operator_merged_script),
+            subsidy, donation_script);
+    }
+
+    // The tracker half of get_merged_expected_payouts: the PPLNS weights from
+    // best_share_hash, keys resolved to merged scripts (the operator override
+    // applied). Needs the tracker; the amounts do not (merged_payouts_from_weights).
+    MergedPayoutWeights
+    get_merged_payout_weights(const uint256& best_share_hash,
+                              uint32_t chain_id,
+                              const std::vector<unsigned char>& operator_ltc_script = {},
+                              const std::vector<unsigned char>& operator_merged_script = {})
+    {
+        MergedPayoutWeights out;
+        out.best = best_share_hash;
+        out.chain_id = chain_id;
+        out.chain_len = std::min(chain.get_height(best_share_hash),
+                                 static_cast<int32_t>(PoolConfig::real_chain_length()));
         // Unlimited desired_weight — exponential decay handles windowing.
         uint288 unlimited_weight;
         unlimited_weight.SetHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
         auto [weights, total_weight, donation_weight] =
-            get_merged_cumulative_weights(best_share_hash, chain_len, unlimited_weight, chain_id);
+            get_merged_cumulative_weights(best_share_hash, out.chain_len, unlimited_weight, chain_id);
+        out.total_weight = total_weight;
+        out.donation_weight = donation_weight;
+
+        // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
+        // convertible weights (after filtering unconvertible P2WSH/P2TR).
+        // NOT total_weight - donation_weight (which includes unconvertible).
+        // First pass: resolve scripts and compute accepted_total
+        for (const auto& [key, weight] : weights) {
+            std::vector<unsigned char> script;
+            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
+                script = operator_merged_script;
+            } else {
+                script = resolve_merged_payout_script(key);
+            }
+            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
+            out.resolved.emplace_back(std::move(script), weight);
+            out.accepted_total = out.accepted_total + weight;
+        }
+        return out;
+    }
+
+    // The amounts half of get_merged_expected_payouts: a pure function of the
+    // weights and the coinbase value (no tracker access).
+    static std::map<std::vector<unsigned char>, uint64_t>
+    merged_payouts_from_weights(const MergedPayoutWeights& w,
+                                uint64_t subsidy,
+                                const std::vector<unsigned char>& donation_script)
+    {
+        const uint288& total_weight = w.total_weight;
+        const uint288& donation_weight = w.donation_weight;
+        const uint288& accepted_total = w.accepted_total;
 
         std::map<std::vector<unsigned char>, uint64_t> result;
 
@@ -2929,37 +2995,15 @@ public:
         // finder_fee = 0 (CANONICAL_MERGED_FINDER_FEE_PER_MILLE = 0 in p2pool)
         uint64_t miners_reward = subsidy - donation_amount;
 
-        // p2pool data.py:220-269: accepted_total_weight is the sum of ONLY
-        // convertible weights (after filtering unconvertible P2WSH/P2TR).
-        // NOT total_weight - donation_weight (which includes unconvertible).
-        // First pass: resolve scripts and compute accepted_total
-        struct ResolvedEntry {
-            std::vector<unsigned char> script;
-            uint288 weight;
-        };
-        std::vector<ResolvedEntry> resolved;
-        uint288 accepted_total;
-        for (const auto& [key, weight] : weights) {
-            std::vector<unsigned char> script;
-            if (!operator_ltc_script.empty() && !operator_merged_script.empty() && key == operator_ltc_script) {
-                script = operator_merged_script;
-            } else {
-                script = resolve_merged_payout_script(key);
-            }
-            if (script.empty()) continue;  // Unconvertible (P2WSH, P2TR) — skip
-            resolved.push_back({std::move(script), weight});
-            accepted_total = accepted_total + weight;
-        }
-
         // Second pass: distribute miners_reward proportionally (uint288 arithmetic)
         uint64_t total_distributed = 0;
         uint288 miners_reward288(miners_reward);
-        for (const auto& entry : resolved) {
+        for (const auto& [script, weight] : w.resolved) {
             uint64_t amount = !accepted_total.IsNull()
-                ? (miners_reward288 * entry.weight / accepted_total).GetLow64()
+                ? (miners_reward288 * weight / accepted_total).GetLow64()
                 : 0;
             if (amount > 0) {
-                result[entry.script] += amount;
+                result[script] += amount;
                 total_distributed += amount;
             }
         }
@@ -2988,6 +3032,21 @@ public:
                                   + static_cast<uint64_t>(final_donation);
 
         return result;
+    }
+
+    // merged_payouts_from_weights as the merged coinbase takes them: the
+    // outputs of at least 1 satoshi, sorted by (script, amount).
+    static std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
+    merged_payout_outputs(const MergedPayoutWeights& w,
+                          uint64_t subsidy,
+                          const std::vector<unsigned char>& donation_script)
+    {
+        std::vector<std::pair<std::vector<unsigned char>, uint64_t>> out;
+        for (auto& [script, amount] : merged_payouts_from_weights(w, subsidy, donation_script))
+            if (amount >= 1)
+                out.emplace_back(script, amount);
+        std::sort(out.begin(), out.end());
+        return out;
     }
 
     // F10/(b): should_punish_version (the 95%-obsolescence punish) was removed.
