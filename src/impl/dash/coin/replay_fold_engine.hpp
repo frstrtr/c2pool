@@ -1469,6 +1469,39 @@ private:
         m_sml_structural = true;
     }
 
+    // ── dashd mnUniquePropertyMap, on demand (deterministicmns.h @ v23.1.9).
+    // ProTxs are a handful per block, so a scan of the held list per ProTx
+    // replaces an index that every mutation path would have to maintain.
+    // CKeyID (keyIDOwner) and uint160 (Evo platformNodeID) serialize — and so
+    // hash — identically: ONE namespace (#7846). Null values are never in the
+    // map (AddUniqueProperty skips them).
+
+    /// The MN other than `self` holding `id` as keyIDOwner or Evo
+    /// platformNodeID, or nullptr.
+    const uint256* id_holder(const uint160& id, const uint256& self) const
+    {
+        if (id.IsNull()) return nullptr;
+        for (const auto& [protx, st] : m_entries) {
+            if (protx == self) continue;
+            if (st.keyIDOwner == id) return &protx;
+            if (st.nType == vendor::MnType::EVO && st.platformNodeID == id) return &protx;
+        }
+        return nullptr;
+    }
+
+    /// The MN other than `self` holding operator key `basic` (canonical BASIC,
+    /// the store's form), or nullptr. The null key is never held.
+    const uint256* opkey_holder(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& basic,
+                                const uint256& self) const
+    {
+        bool null_key = true;
+        for (uint8_t b : basic) if (b != 0) { null_key = false; break; }
+        if (null_key) return nullptr;
+        for (const auto& [protx, st] : m_entries)
+            if (protx != self && st.pubKeyOperator == basic) return &protx;
+        return nullptr;
+    }
+
     /// dashd CompareByLastPaid_GetHeight (deterministicmns.cpp:157-166),
     /// int semantics with the -1 sentinels VERBATIM.
     static int32_t compare_by_last_paid_height(const ReplayMNState& st)
@@ -1548,11 +1581,29 @@ private:
             remove_mn(rep->second);
             ++r.collateral_replaced;
         }
+        // RebuildListFromBlock: `newList.HasUniqueProperty(keyIDOwner) ||
+        // HasUniqueProperty(pubKeyOperator)` => bad-protx-dup-key, then AddMN
+        // adds the Evo platformNodeID (throws on a holder). Checked on the
+        // list AFTER the replacement above, like dashd's newList.
+        const auto op_basic = vendor::opkey_to_basic(
+            p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        if (const uint256* h = id_holder(p.keyIDOwner, proTxHash))
+            return "ProRegTx keyIDOwner is already an owner key or platformNodeID of MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        if (const uint256* h = opkey_holder(op_basic, proTxHash))
+            return "ProRegTx pubKeyOperator is already held by MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        if (p.nType == vendor::MnType::EVO) {
+            if (const uint256* h = id_holder(p.platformNodeID, proTxHash))
+                return "ProRegTx platformNodeID is already an owner key or platformNodeID"
+                       " of MN " + h->GetHex().substr(0, 16)
+                     + " (bad-protx-dup-platformnodeid)";
+        }
         // State built entirely from the payload
         // (CDeterministicMNState(CProRegTx), dmnstate.h:68-79).
         st.nVersion          = p.nVersion;
         st.keyIDOwner        = p.keyIDOwner;
-        st.pubKeyOperator    = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        st.pubKeyOperator    = op_basic;
         st.keyIDVoting       = p.keyIDVoting;
         st.netInfo           = p.netInfo;
         st.scriptPayout      = p.scriptPayout;
@@ -1591,6 +1642,11 @@ private:
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProUpServTx nVersion=" + std::to_string(p.nVersion)
                  + " (ExtAddr) — branch not implemented, failing closed";
+        // RebuildListFromBlock (#7488 moved it ahead of the lookup):
+        // IsValidMnType(nType) else bad-protx-type.
+        if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO)
+            return "ProUpServTx nType=" + std::to_string(p.nType)
+                 + " is not a valid MnType (bad-protx-type)";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1602,6 +1658,14 @@ private:
         if (p.nType != st.nType)
             return "ProUpServTx nType mismatch for "
                  + p.proTxHash.GetHex().substr(0, 16);
+        // UpdateMN -> UpdateUniqueProperty(platformNodeID): another MN's owner
+        // key or platformNodeID (#7846) makes the update throw.
+        if (p.nType == vendor::MnType::EVO) {
+            if (const uint256* h = id_holder(p.platformNodeID, p.proTxHash))
+                return "ProUpServTx platformNodeID is already an owner key or"
+                       " platformNodeID of MN " + h->GetHex().substr(0, 16)
+                     + " (bad-protx-dup-platformnodeid)";
+        }
 
         // v24-only: nVersion update from the payload — DEAD on mainnet
         // (fold refuses when v24_active; branch kept for the record).
@@ -1669,6 +1733,14 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        // UpdateMN -> UpdateUniqueProperty(pubKeyOperator): a key another MN
+        // holds makes the update throw (bad-protx-dup-key).
+        if (const uint256* h = opkey_holder(
+                vendor::opkey_to_basic(p.pubKeyOperator,
+                                       p.nVersion < vendor::ProTxVersion::BASIC_BLS),
+                p.proTxHash))
+            return "ProUpRegTx pubKeyOperator is already held by MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
 
         // Operator-key change ⇒ reset all operator fields + ban until a
         // ProUpServTx revives (specialtxman.cpp:395-405).

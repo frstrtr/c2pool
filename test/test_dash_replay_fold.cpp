@@ -1651,6 +1651,115 @@ TEST(DashReplayFoldSynthetic, UnknownSpecialTypePostDip3RefusesTheBlock)
     EXPECT_EQ(eng.height(), 100u);
 }
 
+// B9 (#7488): IsValidMnType is checked by name, ahead of the lookup.
+TEST(DashReplayFoldSynthetic, ProUpServInvalidNTypeRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    eng.seed({{mn, v2319_mn(11)}}, 1, 100, raw256(9));
+    CProUpServTx up;
+    up.nVersion  = ProTxVersion::BASIC_BLS;
+    up.nType     = 2;
+    up.proTxHash = mn;
+    up.netInfo.ip = seq_array<16>(0x19);
+    up.netInfo.port_be = 9999;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), uint256{}, {make_special_tx(2, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("(bad-protx-type)"), std::string::npos) << r.error;
+}
+
+// B9: a ProRegTx whose keyIDOwner an existing MN holds (bad-protx-dup-key).
+// The block commits the root a fold WITHOUT the check would compute, so the
+// only thing refusing it is the uniqueness rule.
+TEST(DashReplayFoldSynthetic, DupOwnerKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto p = make_proreg(1);
+    p.keyIDOwner = st.keyIDOwner;
+    auto tx = make_special_tx(1, p, 1);
+    auto r = eng.fold_block(
+        make_block(101, raw256(9),
+                   root_of({st.to_sml_entry(mn), expected_entry_of(p, tx_hash_of(tx))}),
+                   {tx}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
+// B9 (#7846): keyIDOwner and platformNodeID are ONE namespace — both ways.
+TEST(DashReplayFoldSynthetic, OwnerPlatformNamespaceRefusesFold)
+{
+    {   // a ProRegTx owner key equal to an Evo MN's platformNodeID
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 evo = raw256(0xE2);
+        const auto se = v2319_mn(12, MnType::EVO);
+        eng.seed({{evo, se}}, 1, 100, raw256(9));
+        auto p = make_proreg(1);
+        p.keyIDOwner = se.platformNodeID;
+        auto tx = make_special_tx(1, p, 1);
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({se.to_sml_entry(evo), expected_entry_of(p, tx_hash_of(tx))}),
+                       {tx}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+    }
+    {   // an Evo ProUpServTx platformNodeID equal to another MN's owner key
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 x = raw256(0xE1), evo = raw256(0xE3);
+        const auto sx = v2319_mn(11);
+        const auto se = v2319_mn(13, MnType::EVO);
+        eng.seed({{x, sx}, {evo, se}}, 2, 100, raw256(9));
+        CProUpServTx up;
+        up.nVersion = ProTxVersion::BASIC_BLS;
+        up.nType = MnType::EVO;
+        up.proTxHash = evo;
+        up.netInfo = se.netInfo;
+        up.platformNodeID = sx.keyIDOwner;
+        up.platformP2PPort = se.platformP2PPort;
+        up.platformHTTPPort = se.platformHTTPPort;
+        auto upd = se;
+        upd.platformNodeID = up.platformNodeID;
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({sx.to_sml_entry(x), upd.to_sml_entry(evo)}),
+                       {make_special_tx(2, up, 1)}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-platformnodeid"), std::string::npos) << r.error;
+    }
+}
+
+// B9: a ProUpRegTx moving to an operator key another MN holds
+// (UpdateUniqueProperty throws => bad-protx-dup-key).
+TEST(DashReplayFoldSynthetic, DupOperatorKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 x = raw256(0xE1), y = raw256(0xE4);
+    const auto sx = v2319_mn(11);
+    const auto sy = v2319_mn(14);
+    eng.seed({{x, sx}, {y, sy}}, 2, 100, raw256(9));
+    CProUpRegTx up;
+    up.nVersion = ProTxVersion::BASIC_BLS;
+    up.proTxHash = y;
+    up.pubKeyOperator = sx.pubKeyOperator;
+    up.keyIDVoting = sy.keyIDVoting;
+    up.scriptPayout = sy.scriptPayout;
+    // What a fold without the rule produces: Y reset + banned on the new key.
+    auto ey = sy;
+    ey.ResetOperatorFields();
+    ey.BanIfNotBanned(101);
+    ey.nVersion = ProTxVersion::BASIC_BLS;
+    ey.pubKeyOperator = sx.pubKeyOperator;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({sx.to_sml_entry(x), ey.to_sml_entry(y)}),
+                   {make_special_tx(3, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // task #154 — INCREMENTAL merkleRootMNList cache KATs.
