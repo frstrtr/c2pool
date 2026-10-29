@@ -15,11 +15,13 @@
 
 #include <gtest/gtest.h>
 
+#include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>
 #include <impl/dash/coin/utxo_adapter.hpp>
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
+#include <core/coin/utxo_view_cache.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -30,6 +32,7 @@
 
 namespace {
 
+using dash::coin::Mempool;
 using dash::coin::MutableTransaction;
 using dash::coin::dash_txid;
 
@@ -69,6 +72,27 @@ MutableTransaction decode(const std::vector<uint8_t>& bytes, size_t& consumed)
     MutableTransaction tx;
     s >> tx;
     consumed = bytes.size() - s.cursor_size();
+    return tx;
+}
+
+/// A fee-paying tx spending a coin minted into `utxo`.
+MutableTransaction priced_spend(::core::coin::UTXOViewCache& utxo, uint8_t tag,
+                                int32_t version, uint16_t type = 0)
+{
+    const uint256 prev = h256(tag);
+    utxo.add_coin(::core::coin::Outpoint(prev, 0),
+                  ::core::coin::Coin(100'000, {}, 1, false));
+    MutableTransaction tx;
+    tx.version = version;
+    tx.type    = type;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash = prev; in.prevout.index = 0; in.sequence = 0xFFFFFFFFu;
+    tx.vin.push_back(in);
+    bitcoin_family::coin::TxOut out;
+    out.value = 90'000;
+    out.scriptPubKey.m_data = {0x76, 0xa9, 0x14, tag, 0x88, 0xac};
+    tx.vout.push_back(out);
+    tx.locktime = tag;
     return tx;
 }
 
@@ -123,6 +147,61 @@ TEST(DashTxVersion, NegativeVersionRoundTripsByteExact)
                   .Finalize(std::span<unsigned char>(want.data(), 32));
         EXPECT_EQ(dash_txid(tx), want) << std::hex << field;
     }
+}
+
+// A2: the mempool refuses a negative-nVersion tx at admission (the choke point
+// for relay, DSTX and inject); the same tx at version 1 is admitted.
+TEST(DashTxVersion, MempoolRejectsNegativeVersion)
+{
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto neg = priced_spend(utxo, 0x31, /*version=*/0xFFFF);
+    EXPECT_FALSE(mp.add_tx(neg)) << "bad-txns-version must never enter the pool";
+    EXPECT_EQ(mp.size(), 0u);
+    EXPECT_FALSE(mp.add_dstx(priced_spend(utxo, 0x32, 0x8000)));
+    EXPECT_EQ(mp.size(), 0u);
+
+    auto ok = priced_spend(utxo, 0x33, /*version=*/1);
+    EXPECT_TRUE(mp.add_tx(ok));
+    EXPECT_EQ(mp.size(), 1u);
+}
+
+// A2b: the rest of ContextualCheckTransaction at admission — an unknown
+// special type and a typed non-special-version tx are bad-txns-type.
+TEST(DashTxVersion, MempoolRejectsUnknownOrMisplacedType)
+{
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    EXPECT_FALSE(mp.add_tx(priced_spend(utxo, 0x41, 3, /*type=*/42)));
+    EXPECT_FALSE(mp.add_tx(priced_spend(utxo, 0x42, 1, /*type=*/1)));
+    EXPECT_EQ(mp.size(), 0u);
+    EXPECT_TRUE(mp.add_tx(priced_spend(utxo, 0x43, 3, /*type=*/8)));
+}
+
+// A3: the selector belt — an entry that predates the admission gate (modelled
+// by the test seam) is never served; the control rides.
+TEST(DashTxVersion, SelectorNeverServesNegativeVersion)
+{
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool mp;
+    mp.set_utxo(&utxo);
+    auto neg = priced_spend(utxo, 0x51, /*version=*/0xFFFF);
+    auto ok  = priced_spend(utxo, 0x52, /*version=*/2);
+    ASSERT_TRUE(mp.add_tx_skipping_contextual_check_for_test(neg));
+    ASSERT_TRUE(mp.add_tx(ok));
+    ASSERT_EQ(mp.size(), 2u);
+
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(1'000'000);
+    bool neg_served = false, ok_served = false;
+    for (const auto& s : sel) {
+        if (dash_txid(s.tx) == dash_txid(neg)) neg_served = true;
+        if (dash_txid(s.tx) == dash_txid(ok))  ok_served  = true;
+    }
+    EXPECT_FALSE(neg_served) << "a negative-nVersion tx makes the block bad-txns-version";
+    EXPECT_TRUE(ok_served);
+    EXPECT_EQ(fees, 10'000u) << "only the control's fee is counted";
 }
 
 // A4: differential sweep against dashcore's own decoder. Each case is a tx

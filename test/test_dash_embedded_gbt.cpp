@@ -264,6 +264,7 @@ TEST(DashEmbeddedGbt, EmbeddedBlockExcludesAllDipSpecialTxs) {
         uint256 pv = mint_hash(seed++);
         utxo.add_coin(Outpoint(pv, 0), Coin(100'000, {}, 1, false));
         auto sp = make_spend(pv, 0, 90'000, /*salt=*/100u + t);
+        sp.version = 3;                  // special version (else bad-txns-type)
         sp.type = t;                     // DIP special type
         ASSERT_TRUE(mp.add_tx(sp));
         special_ids.push_back(dash::coin::dash_txid(sp));

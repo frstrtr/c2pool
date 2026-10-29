@@ -54,6 +54,7 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "tx_version_rules.hpp"    // ContextualCheckTransaction (v23.1.9 bad-txns-version)
 #include "utxo_adapter.hpp"
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
@@ -482,6 +483,17 @@ public:
         return add_tx_locked(tx, utxo, /*is_dstx=*/false);
     }
 
+    /// TEST SEAM ONLY: admit WITHOUT the ContextualCheckTransaction gate, to
+    /// model an entry that entered the pool before that gate existed (a node
+    /// upgraded mid-flight) so the selector's belt can be pinned. Never called
+    /// on a live path.
+    bool add_tx_skipping_contextual_check_for_test(const MutableTransaction& tx)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return add_tx_locked(tx, m_utxo.load(), /*is_dstx=*/false,
+                             /*contextual_check=*/false);
+    }
+
     /// W5-B: dashd's DSTX prioritisation delta — PrioritiseTransaction(hash,
     /// COIN/10) fired by ValidateDSTX on every BLS-verified CoinJoin
     /// broadcast tx BEFORE mempool acceptance (net_processing.cpp:3609).
@@ -590,6 +602,9 @@ public:
                              // (INT64_MIN → huge) → inflated total_fees → the
                              // coinbase value moves → an invalid, reward-unsafe
                              // block (CheckTransaction bad-txns-vout-* / -txouttotal).
+        BadVersionOrType,    // ContextualCheckTransaction (v23.1.9): unknown
+                             // special type, or a negative nVersion
+                             // (bad-txns-type / bad-txns-version).
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -601,6 +616,7 @@ public:
             case InjectGate::Unpriceable:        return "inject-unpriceable";
             case InjectGate::Bip68Unsupported:   return "inject-bip68-unsupported";
             case InjectGate::BadVoutRange:       return "inject-bad-txns-vout-range";
+            case InjectGate::BadVersionOrType:   return "inject-bad-txns-version-or-type";
         }
         return "inject-unknown";
     }
@@ -630,6 +646,10 @@ public:
         // (1) size — cheapest, chain-state-independent.
         if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
             return InjectGate::TooLarge;
+        // (1a) ContextualCheckTransaction — add_tx_locked refuses it too, but
+        //     that refusal would surface here as AlreadyConfirmed; name it.
+        if (contextual_tx_check(tx, /*is_coinbase=*/false))
+            return InjectGate::BadVersionOrType;
         // (2) new-seam script-verify requirement (fail-closed).
         if (!m_script_check)
             return InjectGate::ScriptCheckUnarmed;
@@ -699,8 +719,26 @@ public:
 private:
     bool add_tx_locked(const MutableTransaction& tx,
                        ::core::coin::UTXOViewCache* utxo,
-                       bool is_dstx)
+                       bool is_dstx,
+                       bool contextual_check = true)
     {
+        // ContextualCheckTransaction (dashd validation.cpp:317-349 @ v23.1.9),
+        // post-DIP3 — the pool only ever serves the live tip. The single choke
+        // point for relay (add_tx), DSTX (add_dstx) and inject (add_inject):
+        // an unknown special type, a typed non-special-version tx, or (v23.1.9,
+        // 07494dd62) a negative nVersion is a consensus-invalid tx that would
+        // make any block we serve with it bad-txns-*. No dashd of any version
+        // relays one (IsStandardTx rejects nVersion < 1), so only a dialled
+        // non-dashd peer can push it.
+        if (contextual_check) {
+            if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false)) {
+                LOG_INFO << "[MEMPOOL] reject " << *why << " txid="
+                         << dash_txid(tx).GetHex().substr(0, 16)
+                         << " version16=" << wire_version_i16(tx.version)
+                         << " type=" << tx.type;
+                return false;
+            }
+        }
         uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
 
@@ -1642,6 +1680,11 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // Belt for the admission gate (add_tx_locked): a pool entry
+                // that predates it (or any future seam that bypasses it) must
+                // never ride — dashd rejects the block (bad-txns-version /
+                // bad-txns-type, ContextualCheckTransaction post-DIP3).
+                if (contextual_tx_check(e->tx, /*is_coinbase=*/false)) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
                 // member-level; either failure drops the WHOLE package and —
