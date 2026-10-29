@@ -56,6 +56,7 @@
 #include "transaction.hpp"
 #include "tx_version_rules.hpp"    // ContextualCheckTransaction (v23.1.9 bad-txns-version)
 #include "utxo_adapter.hpp"
+#include "vendor/providertx.hpp"  // B.8: ProTx payloads for block-connect eviction
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 
@@ -66,6 +67,7 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <algorithm>             // get_summary(): feerate percentile sort (display-only)
+#include <array>
 #include <atomic>
 #include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
@@ -76,6 +78,7 @@
 #include <set>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1016,6 +1019,215 @@ public:
                      << " conflicts=" << conflicts
                      << " remaining=" << m_pool.size();
         }
+    }
+
+    // ── B.8: block-connect ProTx eviction (dashd removeProTxConflicts) ──
+    /// Owner of a TRACKED masternode collateral in the PRE-block list, or
+    /// nullopt (MnStateMachine::find_by_collateral, read before apply_block).
+    using CollateralOwnerFn = std::function<std::optional<uint256>(
+        const bitcoin_family::coin::TxPrevOut&)>;
+
+    /// Phase 3 of block-connect eviction: drop the pending provider txs a
+    /// connected block invalidates — dashd CTxMemPool::removeForBlock →
+    /// removeProTxConflicts (txmempool.cpp:1034-1110 @ v23.1.9, with
+    /// removeProTxSpentCollateralConflicts / removeProTxKeyChangedConflicts /
+    /// removeProTxReferences / removeProTx*Conflicts). Without it a pending
+    /// ProUpServTx signed with an operator key a mined ProUpRegTx/ProUpRevTx
+    /// just replaced stays here (no dashd will ever mine it) and every block
+    /// we serve with it is bad-protx-sig. Phases 1-2 (confirmed txids,
+    /// outpoint double-spends) stay in remove_for_block, which the UTXO lane
+    /// calls; this phase needs the PRE-block masternode list, so the
+    /// CoinStateMaintainer calls it before apply_block.
+    ///
+    /// Rules, per mined tx (pool entries are matched by parsed payload; a
+    /// pool tx whose payload does not parse is left alone — the template fold
+    /// refuses it):
+    ///   1. every vin: an outpoint that is a tracked MN collateral evicts the
+    ///      pool types 2-4 naming that MN; an outpoint that is the collateral
+    ///      of a pool ProRegTx evicts that ProRegTx (and updates naming it).
+    ///   2. ProRegTx P: evicts pool ProRegTx with the same keyIDOwner,
+    ///      pubKeyOperator, collateral or service, and (Evo) pool ProRegTx /
+    ///      ProUpServTx with the same platformNodeID; keyIDOwner and
+    ///      platformNodeID are ONE namespace (#7846). If P's external
+    ///      collateral backed MN X, evicts the pool types 2-4 naming X (#7489).
+    ///   3. ProUpServTx(X): evicts pool ProRegTx/ProUpServTx with the same
+    ///      service, and (Evo) the same platformNodeID / an owner key equal to
+    ///      it.
+    ///   4. ProUpRegTx(X): evicts EVERY pool type 2-4 naming X, and pool
+    ///      ProRegTx/ProUpRegTx with the same pubKeyOperator. dashd keeps a
+    ///      pending type-3/4 admitted against the NEW key (validForProTxKey);
+    ///      we do not track that, so the drop is conservative.
+    ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
+    /// Drop-only: a false eviction costs that tx's fee, never a block.
+    /// Returns the number of pool txs evicted.
+    size_t remove_protx_conflicts_for_block(
+        const dash::coin::BlockType& block,
+        const CollateralOwnerFn& pre_block_collateral_owner)
+    {
+        using bitcoin_family::coin::TxPrevOut;
+        using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
+        auto service_of = [](const vendor::LegacyNetService& n) -> std::optional<Service> {
+            if (n.port_be == 0) {
+                bool zero = true;
+                for (uint8_t b : n.ip) if (b != 0) { zero = false; break; }
+                if (zero) return std::nullopt;     // empty netInfo carries no entry
+            }
+            return Service{n.ip, n.port_be};
+        };
+        auto same_out = [](const TxPrevOut& a, const TxPrevOut& b) {
+            return a.hash == b.hash && a.index == b.index;
+        };
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Index the pool's provider txs once (special txs are rare).
+        struct PoolProTx {
+            uint256  txid;
+            uint16_t type{0};
+            uint256  names_mn;                  // types 2-4: the proTxHash
+            TxPrevOut collateral;               // type 1: resolved collateral
+            uint160  owner;                     // type 1
+            std::array<uint8_t, vendor::BLS_PUBKEY_SIZE> opkey{};   // types 1,3
+            bool     has_opkey{false};
+            uint160  platform;                  // types 1,2 (Evo only)
+            std::optional<Service> service;     // types 1,2
+        };
+        std::vector<PoolProTx> pro;
+        for (const auto& [txid, e] : m_pool) {
+            const auto& tx = e.tx;
+            if (tx.type < 1 || tx.type > 4) continue;
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
+            PoolProTx p;
+            p.txid = txid;
+            p.type = tx.type;
+            bool ok = false;
+            if (tx.type == vendor::CProRegTx::SPECIALTX_TYPE) {
+                vendor::CProRegTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.collateral = pl.collateralOutpoint;
+                    if (pl.collateralOutpoint.hash.IsNull()) p.collateral.hash = txid;
+                    p.owner = pl.keyIDOwner;
+                    p.opkey = pl.pubKeyOperator; p.has_opkey = true;
+                    if (pl.nType == vendor::MnType::EVO) p.platform = pl.platformNodeID;
+                    p.service = service_of(pl.netInfo);
+                }
+            } else if (tx.type == vendor::CProUpServTx::SPECIALTX_TYPE) {
+                vendor::CProUpServTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    if (pl.nType == vendor::MnType::EVO) p.platform = pl.platformNodeID;
+                    p.service = service_of(pl.netInfo);
+                }
+            } else if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+                vendor::CProUpRegTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    p.opkey = pl.pubKeyOperator; p.has_opkey = true;
+                }
+            } else {
+                vendor::CProUpRevTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl)))
+                    p.names_mn = pl.proTxHash;
+            }
+            if (ok) pro.push_back(std::move(p));
+        }
+        if (pro.empty()) return 0;
+
+        std::map<uint256, std::string> evict;   // txid -> reason (first wins)
+        auto mark = [&](const PoolProTx& p, const uint256& mined, const char* why) {
+            if (p.txid == mined) return;        // dashd: conflictHash != tx_hash
+            evict.emplace(p.txid, why);
+        };
+        auto evict_updates_of = [&](const uint256& mn, const uint256& mined,
+                                    const char* why) {
+            for (const auto& p : pro)
+                if (p.type >= 2 && p.type <= 4 && p.names_mn == mn) mark(p, mined, why);
+        };
+        auto evict_id_conflicts = [&](const uint160& id, const uint256& mined) {
+            if (id.IsNull()) return;
+            for (const auto& p : pro) {
+                if (p.type == 1 && p.owner == id)
+                    mark(p, mined, "dup-owner-or-platform-id");
+                if ((p.type == 1 || p.type == 2) && !p.platform.IsNull() && p.platform == id)
+                    mark(p, mined, "dup-owner-or-platform-id");
+            }
+        };
+        auto evict_service_conflicts = [&](const std::optional<Service>& s,
+                                           const uint256& mined) {
+            if (!s) return;
+            for (const auto& p : pro)
+                if ((p.type == 1 || p.type == 2) && p.service && *p.service == *s)
+                    mark(p, mined, "dup-service");
+        };
+        auto evict_opkey_conflicts = [&](const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& k,
+                                         const uint256& mined) {
+            for (const auto& p : pro)
+                if ((p.type == 1 || p.type == 3) && p.has_opkey && p.opkey == k)
+                    mark(p, mined, "dup-operator-key");
+        };
+
+        for (const auto& tx : block.m_txs) {
+            const uint256 mined = dash_txid(tx);
+            // Rule 1 — removeProTxSpentCollateralConflicts.
+            for (const auto& in : tx.vin) {
+                if (pre_block_collateral_owner) {
+                    if (auto mn = pre_block_collateral_owner(in.prevout))
+                        evict_updates_of(*mn, mined, "mn-collateral-spent");
+                }
+                for (const auto& p : pro) {
+                    if (p.type == 1 && same_out(p.collateral, in.prevout)) {
+                        mark(p, mined, "registration-collateral-spent");
+                        evict_updates_of(p.txid, mined, "registration-collateral-spent");
+                    }
+                }
+            }
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
+            if (tx.type == vendor::CProRegTx::SPECIALTX_TYPE) {
+                // Rule 2.
+                vendor::CProRegTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                TxPrevOut coll = pl.collateralOutpoint;
+                if (coll.hash.IsNull()) coll.hash = mined;
+                evict_service_conflicts(service_of(pl.netInfo), mined);
+                evict_id_conflicts(pl.keyIDOwner, mined);
+                evict_opkey_conflicts(pl.pubKeyOperator, mined);
+                if (pl.nType == vendor::MnType::EVO)
+                    evict_id_conflicts(pl.platformNodeID, mined);
+                for (const auto& p : pro)
+                    if (p.type == 1 && same_out(p.collateral, coll))
+                        mark(p, mined, "dup-collateral");
+                if (!pl.collateralOutpoint.hash.IsNull() && pre_block_collateral_owner) {
+                    if (auto mn = pre_block_collateral_owner(pl.collateralOutpoint))
+                        evict_updates_of(*mn, mined, "mn-replaced-by-collateral-reuse");
+                }
+            } else if (tx.type == vendor::CProUpServTx::SPECIALTX_TYPE) {
+                // Rule 3.
+                vendor::CProUpServTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_service_conflicts(service_of(pl.netInfo), mined);
+                if (pl.nType == vendor::MnType::EVO)
+                    evict_id_conflicts(pl.platformNodeID, mined);
+            } else if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+                // Rule 4 — removeProTxPubKeyConflicts + removeProTxKeyChangedConflicts.
+                vendor::CProUpRegTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_opkey_conflicts(pl.pubKeyOperator, mined);
+                evict_updates_of(pl.proTxHash, mined, "operator-key-changed");
+            } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
+                // Rule 5 — removeProTxKeyChangedConflicts(null key).
+                vendor::CProUpRevTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_updates_of(pl.proTxHash, mined, "operator-revoked");
+            }
+        }
+
+        for (const auto& [txid, why] : evict) {
+            LOG_INFO << "[MEMPOOL] evicting provider tx "
+                     << txid.GetHex().substr(0, 16)
+                     << " (" << why << ", invalidated by the connected block)";
+            remove_tx_locked(txid);
+        }
+        return evict.size();
     }
 
     // ── G4 (audit): InstantSend-lock conflict tracking ──────────────────

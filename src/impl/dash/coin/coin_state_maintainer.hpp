@@ -1416,6 +1416,19 @@ private:
             return r;
         }
 
+        // B.8 (dashd removeForBlock -> removeProTxConflicts): evict the pending
+        // provider txs this block invalidates — operator key changed/revoked,
+        // collateral spent or re-registered, duplicate keys / collateral /
+        // service / platform id. Runs HERE, before apply_block, because the
+        // collateral rules read the PRE-block masternode list. Drop-only.
+        {
+            const MnStateMachine& pre = std::as_const(m_state).mnstates();
+            m_state.mempool().remove_protx_conflicts_for_block(
+                block, [&pre](const bitcoin_family::coin::TxPrevOut& op) {
+                    return pre.find_by_collateral(op);
+                });
+        }
+
         // E2 (independent credit-pool advance): fold THIS block's own credit-pool
         // accrual so the DIP-0027 balance tracks the tip on every ingested block,
         // NOT only when the periodic mnlistdiff re-seeds it. This is what lets the
