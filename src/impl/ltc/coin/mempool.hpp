@@ -140,7 +140,14 @@ public:
 
     /// Update the current chain tip height (for coinbase maturity checks).
     /// Call after each block connection.
-    void set_tip_height(uint32_t h) { m_tip_height = h; }
+    /// A height of 0 is ignored: it never means the tip, and a tip of 0
+    /// turns the maturity checks off (a body the caller could not place must
+    /// not make every coinbase spendable).
+    void set_tip_height(uint32_t h) {
+        if (h != 0)
+            m_tip_height = h;
+    }
+    uint32_t tip_height() const { return m_tip_height; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
     // Disable copy
@@ -761,6 +768,9 @@ public:
                     core::coin::Coin coin;
                     if (!utxo->get_coin(uop, coin))
                         return false;  // absent from UTXO and mempool — stale
+                    // Not spendable in the block being built (height tip + 1).
+                    if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                        return false;
                 }
             }
             return true;
@@ -851,8 +861,14 @@ public:
                 ++dropped;
             }
         }
-        if (resolved > 0 || still_unknown > 0 || promoted > 0 || parked > 0 || dropped > 0
-            || !m_orphans.empty()) {
+        // Every block runs this (and every copy of a body did): log when
+        // something moved or the counts changed, not the same line again.
+        const bool moved = resolved > 0 || promoted > 0 || parked > 0 || dropped > 0;
+        const bool changed = still_unknown != m_last_logged_unknown
+                          || m_orphans.size() != m_last_logged_orphans;
+        m_last_logged_unknown = still_unknown;
+        m_last_logged_orphans = m_orphans.size();
+        if (moved || changed) {
             LOG_INFO << "[EMB] Mempool fee revalidation: resolved=" << resolved
                      << " still_unknown=" << still_unknown
                      << " resolved_fees=" << resolved_total_fee << " sat"
@@ -895,6 +911,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<uint256> to_remove;
+        std::vector<uint256> to_unprice;
         for (const auto& [txid, entry] : m_pool) {
             if (!entry.fee_known) continue;  // already quarantined
             for (const auto& vin : entry.tx.vin) {
@@ -908,11 +925,23 @@ public:
                     to_remove.push_back(txid);
                     break;
                 }
+                // Priced while the tip height was wrong: a coinbase (pegout)
+                // spend not mature at the tip loses its price until it is.
+                if (m_tip_height > 0 && !coin.is_mature(m_tip_height, m_limits)) {
+                    to_unprice.push_back(txid);
+                    break;
+                }
             }
         }
 
         for (const auto& txid : to_remove)
             remove_tx_locked(txid);
+        for (const auto& txid : to_unprice)
+            unprice_locked(txid);
+        if (!to_unprice.empty()) {
+            LOG_WARNING << "[EMB] Mempool revalidate: " << to_unprice.size()
+                        << " priced tx(s) spend a coinbase not mature at h=" << m_tip_height.load() << ": unpriced";
+        }
 
         if (!to_remove.empty()) {
             LOG_INFO << "[EMB] Mempool revalidate: evicted " << to_remove.size()
@@ -1352,6 +1381,23 @@ private:
         m_pool.erase(it);
     }
 
+    /// Fee unknown again (out of the feerate index): never selected until
+    /// recompute_unknown_fees prices it.
+    void unprice_locked(const uint256& txid) {
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end() || !it->second.fee_known)
+            return;
+        auto fr_range = m_feerate_index.equal_range(it->second.feerate());
+        for (auto fi = fr_range.first; fi != fr_range.second; ++fi) {
+            if (fi->second == txid) {
+                m_feerate_index.erase(fi);
+                break;
+            }
+        }
+        it->second.fee_known = false;
+        it->second.fee = 0;
+    }
+
     void evict_one_locked(const uint256& txid) {
         remove_tx_locked(txid);
     }
@@ -1387,11 +1433,15 @@ private:
     std::map<uint256, Orphan>        m_orphans;
     std::multimap<uint256, uint256>  m_orphans_by_parent;
 
+    // The last "[EMB] Mempool fee revalidation" counts logged.
+    int    m_last_logged_unknown{-1};
+    size_t m_last_logged_orphans{0};
+
     size_t m_total_bytes{0};    // sum of base_size across all entries
     size_t m_max_bytes;
     time_t m_expiry_sec;
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
-    uint32_t m_tip_height{0};           // current chain tip (for maturity checks)
+    std::atomic<uint32_t> m_tip_height{0};  // current chain tip (maturity); set from the io_context and the DOGE full set's thread
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
 
     // Blocks remove_for_block() ran for (most recent last), for cleaned_for().

@@ -255,7 +255,8 @@ struct Net {
         h.connected = [this](const BlockType& b, const uint256&, uint32_t height, bool drained) {
             connected.push_back(height);
             if (drained && pool) {
-                pool->set_tip_height(height);
+                if (height == tip_height())
+                    pool->set_tip_height(height);
                 pool->remove_for_block(b);
             }
         };
@@ -310,7 +311,10 @@ struct Lane {
             }
             return r;
         }
-        pool->set_tip_height(height);
+        if (height == 0)
+            return r;  // cannot be placed: no pass (main_ltc)
+        if (net.tip_height() == height)
+            pool->set_tip_height(height);
         pool->remove_for_block(b);
         pool->recompute_unknown_fees(t.cache.get());
         pool->revalidate_inputs(t.cache.get());

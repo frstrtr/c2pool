@@ -158,6 +158,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # mining gate closed until the set is built from genesis, a body spending
     # a coin the set does not hold refused. Same folding rule.
     #
+    # doge_utxo_full_wiring_test.cpp: the rules main_ltc's DOGE handlers apply
+    # through doge::coin::UtxoFullState (every copy of a deep body placed, the
+    # pool's tip never 0, start live only near the tip, the swap on every
+    # completion). Same folding rule.
+    #
     # doge_mempool_validity_test.cpp: a tx reaches a DOGE template only when
     # priced against the set: a premature coinbase spend is refused at
     # admission, nothing is selected without a view, an orphan waits outside
@@ -226,6 +231,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
         doge_utxo_full_test.cpp
+        doge_utxo_full_wiring_test.cpp
         doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
