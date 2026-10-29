@@ -8891,7 +8891,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             return std::nullopt;
                         };
                         pio.request_block = [cp](const uint256& h) {
-                            return cp->request_block_tracked(h);
+                            // Once per hash (as the payee feeder): a body
+                            // the watchdog already tracks is left to its
+                            // stall schedule, and neither feeder duplicates
+                            // the other's (or the inv path's) getdata.
+                            return cp->request_block_if_untracked(h);
                         };
                         pio.send_getmnlistd = [cp](const uint256& base,
                                                    const uint256& target) {

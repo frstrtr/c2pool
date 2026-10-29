@@ -462,6 +462,47 @@ TEST(DashPayeeFoldFeeder, PayeeLane_ParkedBodyReorgedBeforeDrainIsDropped)
     EXPECT_EQ(r.gaps, 0);
 }
 
+// S5: the chain's block for a parked height arrives while the reorged-out
+// loser is still held there — the winner replaces it, and folds the moment the
+// hole fills, with no drop-and-refetch round trip.
+TEST(DashPayeeFoldFeeder, PayeeLane_OnChainWinnerReplacesAParkedLoser)
+{
+    FeedRig r(H, H + 2);
+    r.seed(H);
+    r.tip = H + 2;
+    r.deliver(H + 2);                       // the loser, on the chain at arrival
+    ASSERT_TRUE(r.f.is_parked(H + 2));
+    r.chain[H + 2] = make_block(H + 2, r.balance[H + 2], /*salt=*/77);
+    r.deliver(H + 2);                       // the winner arrives, still ahead
+    EXPECT_EQ(r.f.parked(), 1u);
+    r.deliver(H + 1);
+    EXPECT_EQ(r.cursor(), H + 2) << "the winner folds when the hole fills";
+    EXPECT_EQ(r.folded, (std::vector<uint32_t>{H + 1, H + 2}));
+    EXPECT_EQ(r.f.fork_drops(), 0u) << "nothing to drop: the loser was replaced";
+    EXPECT_EQ(r.gaps, 0);
+}
+
+// S4: park overflow releases the lowest held body to the payee lane — unless
+// that body lost its height to a reorg, which is dropped instead (still one
+// out, one in) and never reaches the lane.
+TEST(DashPayeeFoldFeeder, PayeeLane_OverflowDropsAReorgedLowestBody)
+{
+    const uint32_t cap = static_cast<uint32_t>(PayeeFoldFeeder::kParkCap);
+    FeedRig r(H, H + cap + 2);
+    r.seed(H);
+    r.tip = H + cap + 2;
+    for (uint32_t h = H + 2; h < H + 2 + cap; ++h) r.deliver(h);
+    ASSERT_EQ(r.f.parked(), PayeeFoldFeeder::kParkCap);
+    r.chain[H + 2] = make_block(H + 2, r.balance[H + 2], /*salt=*/77);   // reorg
+    r.deliver(H + 2 + cap);
+    EXPECT_EQ(r.f.overflows(), 1u);
+    EXPECT_EQ(r.f.parked(), PayeeFoldFeeder::kParkCap) << "bounded";
+    EXPECT_FALSE(r.f.is_parked(H + 2));
+    EXPECT_TRUE(r.folded.empty()) << "the reorged-out body never reaches the lane";
+    EXPECT_EQ(r.reseeds, 0);
+    EXPECT_EQ(r.f.stale_parked_drops(), 1u);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // KAT 6 — PayeeLane_ParkOverflowFallsBackToWipe
 // cursor+1 never arrives while kParkCap later bodies do: memory stays bounded

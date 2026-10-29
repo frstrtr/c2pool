@@ -327,7 +327,20 @@ private:
         // A later body proves cursor+1 .. h-1 are missing: hold it and fetch
         // them now (dashd keeps the body in m_blocks_unlinked and downloads by
         // header position, validation.cpp:3944-3954 / net_processing.cpp:1417).
-        const bool fresh = m_park.emplace(h, bc).second;
+        auto [pit, fresh] = m_park.emplace(h, bc);
+        if (!fresh && on_chain.value_or(false)
+            && body_hash(pit->second) != body_hash(bc)) {
+            // The held body lost its height to a reorg and the chain's block
+            // there just arrived: keep the winner, not the loser (the
+            // drain-time re-check would only drop the loser and re-fetch).
+            ++m_stale_parked_drops;
+            LOG_WARNING << "[PAYEE-FEED] parked body h=" << h << " "
+                        << body_hash(pit->second).GetHex().substr(0, 16)
+                        << " replaced by the header chain's block there "
+                        << body_hash(bc).GetHex().substr(0, 16)
+                        << " (reorged while parked)";
+            pit->second = bc;
+        }
         m_asks.erase(h);
         if (fresh) {
             ++m_parked_total;
@@ -354,6 +367,12 @@ private:
     {
         ++m_overflows;
         auto it = m_park.begin();
+        if (parked_body_stale(it->first, it->second)) {
+            // The lowest held body is not on the chain any more: dropping it is
+            // the bound (one out, one in), and it must not reach the payee lane.
+            m_park.erase(it);
+            return;
+        }
         LOG_WARNING << "[PAYEE-FEED] PARK OVERFLOW: " << m_park.size()
                     << " bodies held but h=" << (c + 1)
                     << " never arrived — releasing h=" << it->first
