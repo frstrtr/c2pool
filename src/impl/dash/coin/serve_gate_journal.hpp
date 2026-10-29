@@ -56,7 +56,8 @@ public:
         Transition,  ///< EMBEDDED -> fallback: always emitted
         CauseChange, ///< still declining, but a DIFFERENT first-unmet condition
         Heartbeat,   ///< still declining, same cause, heartbeat interval elapsed
-        Resumed      ///< fallback -> EMBEDDED: the arm is serving again
+        Resumed,     ///< fallback -> EMBEDDED: the arm is serving again
+        ReadyIdle    ///< the arm WOULD serve, but no miner has asked (F4)
     };
 
     /// The THREE serve dispositions, so the journal stops collapsing the third
@@ -152,6 +153,8 @@ public:
         if (m_first_observed_sec < 0) m_first_observed_sec = now_sec;
 
         if (served == Served::Embedded) {
+            // From READY-IDLE the episode is already closed: silent, like a
+            // serve that follows a serve.
             const bool was_declining = (m_arm == Arm::Declining);
             m_arm = Arm::Embedded;
             m_disposition = Disposition::Serving;
@@ -193,7 +196,7 @@ public:
         // very first observation) and survives cause changes.
         if (m_episode_start_sec < 0) m_episode_start_sec = now_sec;
 
-        if (prev_arm == Arm::Embedded)
+        if (prev_arm == Arm::Embedded || prev_arm == Arm::ReadyIdle)
             d.trigger = Trigger::Transition;
         else if (prev_arm == Arm::Unknown)
             d.trigger = Trigger::First;
@@ -249,6 +252,7 @@ public:
             case Trigger::CauseChange: return "cause-change";
             case Trigger::Heartbeat:   return "heartbeat";
             case Trigger::Resumed:     return "resumed";
+            case Trigger::ReadyIdle:   return "ready-idle";
             case Trigger::None:        break;
         }
         return "none";
@@ -270,10 +274,51 @@ public:
         switch (t) {
             case Trigger::Resumed:     return "resumed";
             case Trigger::CauseChange: return "cause-change";
+            case Trigger::ReadyIdle:   return "ready-idle";
             default:                   break;
         }
         return nullptr;
     }
+
+    /// F4 — the embedded arm is READY again (NodeCoinState would serve) but
+    /// no template has been sourced because no miner is connected. Close the
+    /// open decline segment HERE with terminal=ready-idle, so its cause is
+    /// charged exactly the time it held. Without this the segment stays open
+    /// until the next miner happens to ask: on the 2026-10-26 reserve the
+    /// mn-needs-reseed latch cleared at 22:45 (EMBED-STATUS would-serve) but
+    /// the segment closed at 02:17:43 when GodMiner reconnected — 15058 s
+    /// charged to a cause that held ~2580 s, and 3.55 h of miner absence
+    /// booked as node downtime.
+    ///
+    /// No-op (Trigger::None) unless the arm is declining. The arm then rests
+    /// in a READY-IDLE state: a later embedded serve is silent (its segment is
+    /// already closed), a later decline is a Transition, as from serving.
+    Decision observe_ready_idle(int64_t now_sec) {
+        Decision d;
+        if (m_arm != Arm::Declining) return d;
+        if (m_first_observed_sec < 0) m_first_observed_sec = now_sec;
+        d.trigger        = Trigger::ReadyIdle;
+        d.previous_cause = m_last_cause;
+        d.suppressed     = m_suppressed;
+        d.episode_sec    = (m_episode_start_sec >= 0)
+                               ? now_sec - m_episode_start_sec : -1;
+        d.prev_cause_sec = (m_cause_start_sec >= 0)
+                               ? now_sec - m_cause_start_sec : -1;
+        if (d.prev_cause_sec >= 0 && !d.previous_cause.empty())
+            m_cause_totals[d.previous_cause] += d.prev_cause_sec;
+        m_arm               = Arm::ReadyIdle;
+        m_disposition       = Disposition::Serving;
+        m_last_cause.clear();
+        m_cause_start_sec   = -1;
+        m_episode_start_sec = -1;
+        m_suppressed        = 0;
+        m_last_emit_sec     = now_sec;
+        m_have_emitted      = true;
+        return d;
+    }
+
+    /// True while the arm rests ready-idle (would serve; nobody asked).
+    bool ready_idle() const { return m_arm == Arm::ReadyIdle; }
 
     /// A cumulative, denominator-carrying view of where wall clock went, so a
     /// soak can be read WITHOUT reconstructing episodes from raw lines.
@@ -341,12 +386,13 @@ public:
     const char* arm_name() const {
         if (m_arm == Arm::Unknown)  return "unknown";
         if (m_arm == Arm::Embedded) return "embedded";
+        if (m_arm == Arm::ReadyIdle) return "ready-idle";
         return m_disposition == Disposition::NoWork ? "none(set-gap/no-work)"
                                                     : "dashd-fallback";
     }
 
 private:
-    enum class Arm { Unknown, Embedded, Declining };
+    enum class Arm { Unknown, Embedded, Declining, ReadyIdle };
     /// Which off-embedded disposition the current decline is (Serving while the
     /// embedded arm is up). This is the state that makes arm_name() three-valued.
     enum class Disposition { Serving, Fallback, NoWork };

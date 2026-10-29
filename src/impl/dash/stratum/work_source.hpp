@@ -820,6 +820,14 @@ public:
     /// contended.
     nlohmann::json serve_staleness_json() const;
 
+    /// F4 — the embedded arm WOULD serve (NodeCoinState::describe_decline()
+    /// viable) and no miner is connected, so no template will be sourced to
+    /// close the open decline segment. Close it now with terminal=ready-idle
+    /// (journal + cumulative ledger, same lock as note_arm_decision). main_dash
+    /// calls this from the 30 s diagnostics tick only while sessions == 0.
+    /// Returns true when a segment was closed.
+    bool note_ready_idle(uint32_t height) const;
+
 private:
     /// Record ONE arm-selection outcome and, if the rate policy says so, emit
     /// the single named line. `why` MUST be the report the selecting branch

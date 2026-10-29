@@ -6868,3 +6868,257 @@ TEST(DashMnCheckpointBudgets, AClampedBudgetIsAnnouncedOncePerBridgeNotOncePerPu
     h.lane.arm(good_checkpoint());
     EXPECT_EQ(h.lane.budget_ceiling_warnings(), 0u);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F2 / F3 — A GAP IS NOT DIVERGENCE; THE CURSOR FOLLOWS THE TIP
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// THE INCIDENT (hotel reserve, 2026-10-26 22:06 and 10-27 02:18 MSK). Two
+// payee APPLY GAPs in one process — a block the payee lane was never offered,
+// not a disagreement with the chain. The first re-arm resumed a 198-block-old
+// cursor (persisted every 250 blocks, never after publish) and recorded the
+// gap as "evidence of divergence"; the second then had its sound cursor
+// refused by R8 [divergence-lineage] and replayed 12 571 blocks cold, and each
+// re-arm spent one of kMaxRearms = 3 — a third gap would have blocked the lane
+// until restart. These pin the three fixes: a gap records no divergence and
+// burns no rung (F2), it resumes from the live payee cursor (F2), and the
+// cursor is persisted at every fold at the tip (F3).
+
+namespace {
+
+using RearmReason = MnCheckpointLane::RearmReason;
+using LiveSeed    = MnCheckpointLane::LiveSeed;
+
+/// The maintainer's live payee queue: the lane's published set folded forward
+/// by the same MnStateMachine::apply_block, one contiguous block at a time.
+std::vector<std::pair<uint256, MNState>> fold_forward(
+    const std::vector<std::pair<uint256, MNState>>& set, uint32_t as_of,
+    const std::map<uint32_t, dash::coin::BlockType>& blocks, uint32_t to)
+{
+    dash::coin::MnStateMachine sm;
+    sm.load(set, as_of);
+    for (uint32_t h = as_of + 1; h <= to; ++h) {
+        auto r = sm.apply_block(blocks.at(h), h);
+        EXPECT_FALSE(r.gap_detected || r.payee_desync) << "fixture fold at h=" << h;
+    }
+    return {sm.entries().begin(), sm.entries().end()};
+}
+
+} // namespace
+
+// ── KAT 8. A gap ask records no divergence and burns no rung; the NEXT gap
+// re-arm still resumes the persisted cursor (the 02:18 episode refused it
+// under R8 and replayed cold).
+TEST(DashMnCheckpointGapReseed, Rearm_GapAskDoesNotRecordDivergence)
+{
+    TempCursorStore cs("gap-divergence");
+    CursorRun r(&cs.store, 1519544);
+    r.run();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    auto& lane = r.h.lane;
+
+    // Gap #1 (22:06:45): the chain moved on to 1519545.
+    r.h.tip = 1519545;
+    r.h.published = false;
+    ASSERT_EQ(lane.rearm(good_checkpoint(), "gap 1", RearmReason::Gap),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << lane.last_rearm_reason();
+    EXPECT_EQ(lane.first_divergence_height(), 0u)
+        << "a block the payee lane was never offered is not evidence that the"
+           " queue diverged from the chain";
+    EXPECT_EQ(lane.rearms(), 0u) << "a gap must not burn a re-arm rung";
+    lane.pump();
+    ASSERT_TRUE(r.h.published) << lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519545u);
+
+    // Gap #2 (02:18:06): the record now sits ABOVE the first gap's tip — the
+    // exact shape R8 refused.
+    r.h.tip = 1519546;
+    r.h.published = false;
+    r.h.requested.clear();
+    ASSERT_EQ(lane.rearm(good_checkpoint(), "gap 2", RearmReason::Gap),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << lane.last_rearm_reason();
+    lane.pump();
+    EXPECT_TRUE(lane.cursor_restored())
+        << "R8 must not refuse a sound cursor over a transport gap: "
+        << lane.restore_verdict();
+    EXPECT_EQ(lane.restored_at(), 1519545u);
+    ASSERT_TRUE(r.h.published) << lane.status();
+    for (uint32_t asked : r.h.requested)
+        EXPECT_GT(asked, 1519545u) << "h=" << asked << " — a cold replay";
+    EXPECT_EQ(lane.rearms(), 0u);
+    EXPECT_EQ(lane.gap_rearms(), 2u);
+    EXPECT_EQ(lane.first_divergence_height(), 0u);
+}
+
+// ── KAT 9. A gap re-seed resumes from the LIVE payee cursor C and replays
+// C+1..tip only — no persisted record needed — and publishes exactly what a
+// continuous bridge publishes.
+TEST(DashMnCheckpointGapReseed, Rearm_GapResumesFromLiveCursor)
+{
+    CursorRun r(nullptr, 1519544);   // no store: only the live seed can help
+    r.run();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    auto& lane = r.h.lane;
+
+    LiveSeed live;
+    live.entries    = fold_forward(r.h.published_set, 1519544, r.h.blocks, 1519545);
+    live.as_of      = 1519545;
+    live.as_of_hash = synth_block_hash(1519545);
+
+    r.h.tip = 1519546;
+    r.h.published = false;
+    r.h.requested.clear();
+    ASSERT_EQ(lane.rearm(good_checkpoint(), "gap", RearmReason::Gap, &live),
+              MnCheckpointLane::RearmOutcome::Armed)
+        << lane.last_rearm_reason();
+    lane.pump();
+    EXPECT_TRUE(lane.resumed_from_live()) << lane.restore_verdict();
+    EXPECT_EQ(lane.restored_at(), 1519545u);
+    EXPECT_EQ(r.h.requested, (std::vector<uint32_t>{1519546}))
+        << "a gap at live cursor C replays C+1..tip, nothing below";
+    ASSERT_TRUE(r.h.published) << lane.status();
+    EXPECT_EQ(r.h.published_as_of, 1519546u);
+
+    CursorRun cont(nullptr, 1519546);
+    cont.run();
+    ASSERT_TRUE(cont.h.published);
+    EXPECT_EQ(as_map(r.h.published_set), as_map(cont.h.published_set))
+        << "the resumed set must be the set a continuous bridge publishes";
+}
+
+// ── KAT 9b. The live seed is adjudicated like any record: a seed whose block
+// is no longer the header chain's block at its height (a reorg) is REFUSED
+// and the re-arm falls back to the anchor — never a wrong queue.
+TEST(DashMnCheckpointGapReseed, Rearm_GapLiveCursorOnAReorgedBlockIsRefused)
+{
+    CursorRun r(nullptr, 1519544);
+    r.run();
+    ASSERT_TRUE(r.h.published);
+    auto& lane = r.h.lane;
+
+    LiveSeed live;
+    live.entries    = fold_forward(r.h.published_set, 1519544, r.h.blocks, 1519545);
+    live.as_of      = 1519545;
+    live.as_of_hash = synth_block_hash(999);   // not the chain's block there
+
+    r.h.tip = 1519546;
+    r.h.published = false;
+    r.h.requested.clear();
+    ASSERT_EQ(lane.rearm(good_checkpoint(), "gap", RearmReason::Gap, &live),
+              MnCheckpointLane::RearmOutcome::Armed);
+    lane.pump();
+    EXPECT_FALSE(lane.resumed_from_live());
+    EXPECT_FALSE(lane.cursor_restored());
+    ASSERT_FALSE(r.h.requested.empty());
+    EXPECT_EQ(r.h.requested.front(), 1519544u) << "fell back to the anchor";
+    ASSERT_TRUE(r.h.published) << lane.status();
+}
+
+// ── KAT 10. Three gap asks in one process: every one re-arms, none counts
+// against kMaxRearms, the lane is never terminally blocked.
+TEST(DashMnCheckpointGapReseed, Rearm_ThirdGapDoesNotTerminallyBlock)
+{
+    TempCursorStore cs("gap-three");
+    CursorRun r(&cs.store, 1519544);
+    r.run();
+    ASSERT_TRUE(r.h.published);
+    auto& lane = r.h.lane;
+    for (uint32_t i = 1; i <= 3; ++i) {
+        r.h.tip = std::min<uint32_t>(1519544 + i, 1519546);
+        r.h.published = false;
+        EXPECT_EQ(lane.rearm(good_checkpoint(), "gap " + std::to_string(i),
+                             RearmReason::Gap),
+                  MnCheckpointLane::RearmOutcome::Armed)
+            << "gap #" << i << ": " << lane.last_rearm_reason();
+        lane.pump();
+    }
+    EXPECT_EQ(lane.gap_rearms(), 3u);
+    EXPECT_EQ(lane.rearms(), 0u) << "kMaxRearms bounds DESYNCS, not transport holes";
+    EXPECT_FALSE(lane.rearm_blocked());
+    EXPECT_EQ(lane.first_divergence_height(), 0u);
+}
+
+// ── GUARD (F3 x desync). Live-follow records describe the queue that just
+// DESYNCED, so a desync re-arm still resumes from the last BRIDGE publish —
+// today's semantics — and puts that record back on disk.
+TEST(DashMnCheckpointGapReseed, Rearm_DesyncAfterLiveFollowResumesFromTheBridgePublish)
+{
+    TempCursorStore cs("desync-live");
+    CursorRun r(&cs.store, 1519544);
+    r.run();
+    ASSERT_TRUE(r.h.published);
+    auto& lane = r.h.lane;
+    const auto at45 = fold_forward(r.h.published_set, 1519544, r.h.blocks, 1519545);
+    lane.note_live_fold(std::map<uint256, MNState>(at45.begin(), at45.end()),
+                        1519545, synth_block_hash(1519545));
+    std::string why;
+    auto rec = cs.store.load(why);
+    ASSERT_TRUE(rec) << why;
+    ASSERT_EQ(rec->cursor_height, 1519545u) << "live fold persisted";
+
+    r.h.tip = 1519546;
+    r.h.published = false;
+    r.h.requested.clear();
+    ASSERT_EQ(lane.rearm(good_checkpoint(), "desync", RearmReason::Desync),
+              MnCheckpointLane::RearmOutcome::Armed);
+    rec = cs.store.load(why);
+    ASSERT_TRUE(rec) << why;
+    EXPECT_EQ(rec->cursor_height, 1519544u)
+        << "the implicated live record is replaced by the bridge publish";
+    lane.pump();
+    EXPECT_TRUE(lane.cursor_restored()) << lane.restore_verdict();
+    EXPECT_EQ(lane.restored_at(), 1519544u)
+        << "a desync must not resume the queue that desynced";
+    EXPECT_FALSE(lane.resumed_from_live());
+    EXPECT_EQ(lane.rearms(), 1u);
+}
+
+// ── KAT 11. The cursor is persisted on every fold at the tip: during the
+// bridge's chase (within kPersistAtTipSlack of the tip, even with the shipped
+// 250-block interval) and on every LIVE fold after publish, so a restart
+// resumes from the last fold.
+TEST(DashMnCheckpointGapReseed, Persist_EveryFoldAtTip)
+{
+    TempCursorStore cs("persist-tip");
+    {
+        CursorRun r(&cs.store, 1519544);
+        r.h.lane.set_persist_every(MnCheckpointLane::kDefaultPersistEvery);
+        r.run();
+        ASSERT_TRUE(r.h.published);
+        auto& lane = r.h.lane;
+        // Live folds after publish (the maintainer's queue at the tip).
+        const auto at45 = fold_forward(r.h.published_set, 1519544, r.h.blocks, 1519545);
+        lane.note_live_fold(std::map<uint256, MNState>(at45.begin(), at45.end()),
+                            1519545, synth_block_hash(1519545));
+        std::string why;
+        auto rec = cs.store.load(why);
+        ASSERT_TRUE(rec) << why;
+        EXPECT_EQ(rec->cursor_height, 1519545u);
+        EXPECT_TRUE(rec->contiguous());
+        const auto at46 = fold_forward(at45, 1519545, r.h.blocks, 1519546);
+        lane.note_live_fold(std::map<uint256, MNState>(at46.begin(), at46.end()),
+                            1519546, synth_block_hash(1519546));
+        rec = cs.store.load(why);
+        ASSERT_TRUE(rec) << why;
+        EXPECT_EQ(rec->cursor_height, 1519546u) << "every live fold at the tip";
+        EXPECT_EQ(lane.live_persist_writes(), 2u);
+    }
+    // A restart resumes from the last LIVE fold: nothing to replay.
+    CursorRun r2(&cs.store, 1519546);
+    r2.run();
+    EXPECT_TRUE(r2.h.lane.cursor_restored()) << r2.h.lane.restore_verdict();
+    EXPECT_EQ(r2.h.lane.restored_at(), 1519546u);
+    EXPECT_TRUE(r2.h.requested.empty());
+
+    // Bridge chase at the tip with the shipped interval: every fold persisted.
+    TempCursorStore cs3("persist-chase");
+    CursorRun r3(&cs3.store, 1519546);
+    r3.h.lane.set_persist_every(MnCheckpointLane::kDefaultPersistEvery);
+    r3.run();
+    ASSERT_TRUE(r3.h.published);
+    EXPECT_GE(r3.h.lane.persist_writes(), 3u)
+        << "three folds within kPersistAtTipSlack of the tip: three records,"
+           " not one per 250";
+}

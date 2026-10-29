@@ -495,3 +495,139 @@ TEST(DashReceptionWire, DisposeStopsMnListIngest) {
     EXPECT_EQ(st.mnstates().size(), 0u)
         << "after dispose, an mnlistdiff snapshot must not seed the set";
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// KAT 13 — the 2026-10-26 reserve incident, end to end on the reception
+// wire: HeaderChain + wire_full_block_ingest + PayeeFoldFeeder +
+// CoinStateMaintainer, the same chain of events the live node ran.
+//
+//   21:52  payee cursor H (2561876) current at the tip
+//   21:54  coin-P2P blackout: the invs for H+1 and H+2 are LOST
+//   22:00  their HEADERS arrive anyway (getheaders self-propel)
+//   22:05  inv + header H+3; 22:06:45 its body lands FIRST
+//
+// Master: block_connected(H+3) reaches apply_block in arrival order ->
+// PAYEE APPLY GAP -> wipe + authoritative re-seed (43 min without work).
+// With the feeder: the header batch makes H+1/H+2 heights to fetch by hash,
+// H+3 parks, the fetched bodies fold in order, the cursor ends at H+3, and
+// nothing is wiped.
+// ════════════════════════════════════════════════════════════════════════
+#include <impl/dash/coin/live_feed.hpp>
+#include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/coin/payee_fold_feeder.hpp>
+#include <impl/dash/crypto/hash_x11.hpp>
+#include <core/pack.hpp>
+#include <algorithm>
+#include <deque>
+#include <map>
+#include <optional>
+
+namespace {
+
+dash::coin::BlockType incident_block(uint32_t h, const std::vector<unsigned char>& payout)
+{
+    dash::coin::BlockType b;
+    b.m_version   = 0x20000000u;
+    b.m_timestamp = 1'761'500'000u + h;
+    b.m_bits      = 0x1e0ffff0u;
+    b.m_nonce     = h;
+    b.m_txs.push_back(make_spend(raw256(0x90), 0, 500'000'000, h));   // coinbase slot
+    b.m_txs[0].vout[0].scriptPubKey.m_data = payout;                  // pays the MN
+    bind_block(b);
+    return b;
+}
+
+uint256 incident_hash(const dash::coin::BlockType& b)
+{
+    auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(b));
+    return ::dash::crypto::hash_x11(packed.get_span());
+}
+
+} // namespace
+
+TEST(DashReceptionWire, LostInvGapIsFetchedByHeightAndFoldedInOrder)
+{
+    constexpr uint32_t kH = 2'561'876;
+    const auto payout = p2pkh_script(0x30);
+    std::map<uint32_t, dash::coin::BlockType> blocks;
+    std::map<uint256, uint32_t> height_of;
+    for (uint32_t h = kH; h <= kH + 3; ++h) {
+        blocks[h] = incident_block(h, payout);
+        height_of[incident_hash(blocks[h])] = h;
+    }
+
+    dash::coin::HeaderChain chain(dash::coin::make_dash_chain_params_testnet());
+    chain.init();
+    chain.set_dynamic_checkpoint(kH, incident_hash(blocks[kH]));
+
+    dash::interfaces::Node node;
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.set_require_seeded_mn_set(true);
+    int reseeds = 0;
+    m.set_on_mn_reseed([&] { ++reseeds; });
+    m.on_mn_list_update(single_mn(payout), kH, "mn-ckpt");
+    ASSERT_EQ(m.payee_fold_cursor(), kH);
+
+    // The coin-P2P "peer": getdata answers arrive on a later io turn.
+    std::deque<uint256> getdata;
+    dash::coin::PayeeFoldFeeder feeder;
+    int64_t now_ms = 0;
+    feeder.set_clock_fn([&] { return now_ms; });
+    feeder.set_cursor_fn([&] { return m.payee_fold_cursor(); });
+    feeder.set_tip_height_fn([&] { return chain.height(); });
+    feeder.set_hash_at_fn([&](uint32_t h) -> std::optional<uint256> {
+        if (auto e = chain.get_header_by_height(h)) return e->hash;
+        return std::nullopt;
+    });
+    feeder.set_request_fn([&](const uint256& hash, uint32_t) {
+        getdata.push_back(hash);
+        return true;
+    });
+
+    // main_dash's wiring: full_block -> block_connected -> feeder -> maintainer.
+    auto s1 = dash::coin::wire_full_block_ingest(node, chain);
+    auto s2 = node.block_connected.subscribe(
+        [&](const dash::interfaces::BlockConnected& bc) { feeder.on_block_connected(bc); });
+    std::vector<uint32_t> folded;
+    auto s3 = feeder.ordered.subscribe(
+        [&](const dash::interfaces::BlockConnected& bc) {
+            folded.push_back(bc.height);
+            m.on_block_connected(bc.block, bc.height);
+        });
+
+    // 22:00:39 — the header batch H+1, H+2 lands; no inv for either.
+    chain.set_dynamic_checkpoint(kH + 1, incident_hash(blocks[kH + 1]));
+    chain.set_dynamic_checkpoint(kH + 2, incident_hash(blocks[kH + 2]));
+    feeder.on_tip_changed();          // HeaderChain::set_on_tip_changed
+    // 22:05:57 — inv + header H+3; 22:06:45 its body arrives FIRST.
+    chain.set_dynamic_checkpoint(kH + 3, incident_hash(blocks[kH + 3]));
+    feeder.on_tip_changed();
+    node.full_block.happened(blocks[kH + 3]);
+
+    EXPECT_EQ(reseeds, 0) << "H+3 on cursor H must not wipe the payee queue";
+    EXPECT_EQ(st.mnstates().size(), 1u);
+    EXPECT_TRUE(feeder.is_parked(kH + 3));
+
+    // The peer answers every getdata the feeder issued (by header-chain hash).
+    std::vector<uint32_t> fetched;
+    while (!getdata.empty()) {
+        const uint256 hsh = getdata.front();
+        getdata.pop_front();
+        auto it = height_of.find(hsh);
+        ASSERT_NE(it, height_of.end()) << "asked for a hash the chain does not hold";
+        fetched.push_back(it->second);
+        node.full_block.happened(blocks[it->second]);
+    }
+    EXPECT_NE(std::find(fetched.begin(), fetched.end(), kH + 1), fetched.end())
+        << "H+1 (inv lost) must be fetched by header-chain position";
+    EXPECT_NE(std::find(fetched.begin(), fetched.end(), kH + 2), fetched.end())
+        << "H+2 (inv lost) must be fetched by header-chain position";
+
+    EXPECT_EQ(std::as_const(st).mnstates().last_applied_height(), kH + 3)
+        << "the payee cursor ends at H+3 with H+1 and H+2 folded";
+    EXPECT_EQ(folded, (std::vector<uint32_t>{kH + 1, kH + 2, kH + 3}));
+    EXPECT_EQ(reseeds, 0);
+    EXPECT_FALSE(m.mn_needs_reseed_latched());
+    EXPECT_EQ(st.mnstates().size(), 1u);
+}

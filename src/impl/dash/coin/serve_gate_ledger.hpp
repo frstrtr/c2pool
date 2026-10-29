@@ -291,6 +291,23 @@ public:
         }
     }
 
+    /// F4 — bank a READY-IDLE close (ServeGateJournal::observe_ready_idle):
+    /// the open segment closes with the SAME prev_cause_sec the journal just
+    /// banked, observed_sec advances by the delta, and no serve is counted
+    /// (nothing was served — the arm is ready and nobody asked).
+    void bank_ready_idle(const ServeGateJournal::Decision& d, int64_t now_sec) {
+        if (m_have_last_seen && now_sec >= m_last_seen_sec)
+            m_t.observed_sec += (now_sec - m_last_seen_sec);
+        m_last_seen_sec  = now_sec;
+        m_have_last_seen = true;
+        if (d.prev_cause_sec >= 0 && !d.previous_cause.empty()) {
+            m_t.off_embedded_sec += d.prev_cause_sec;
+            m_t.per_cause_sec[d.previous_cause] += d.prev_cause_sec;
+        }
+        m_open_cause.clear();
+        m_open_start_sec = -1;
+    }
+
     /// HOOK h3 — snapshot the open segment into the REPLACED carry field, ready
     /// to be persisted. Idempotent; call immediately before every flush. Does
     /// NOT touch the cumulative totals (carry is folded only on load). The
