@@ -56,6 +56,7 @@
 #include <array>
 #include <cstdint>
 #include <ctime>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -382,6 +383,35 @@ inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
     return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
 }
 
+/// The ONE MnFoldContext both the template builder and the NodeCoinState emit
+/// gate fold with (sml_special_fold.hpp): the pre-block list from the live
+/// MnStateMachine, external-collateral proofs from the same chain views the
+/// selector priced from (Mempool::prove_chain_coin), and the BLS operator-
+/// signature verifier (nullptr/empty ⇒ ProUpServTx / ProUpRevTx refused).
+inline MnFoldContext make_template_fold_context(
+    const MnStateMachine& mnstates, const Mempool& mempool,
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier)
+{
+    MnFoldContext::CollateralCoinFn coin =
+        [&mempool](const MnFoldContext::Outpoint& op, int64_t& value) {
+            ::core::coin::Coin c;
+            switch (mempool.prove_chain_coin(::core::coin::Outpoint(op.hash, op.index), c)) {
+            case Mempool::CoinProof::Unspent:
+                value = c.value;
+                return MnFoldContext::CollateralProof::Unspent;
+            case Mempool::CoinProof::Absent:
+                return MnFoldContext::CollateralProof::Absent;
+            case Mempool::CoinProof::Unknown:
+                break;
+            }
+            return MnFoldContext::CollateralProof::Unknown;
+        };
+    return MnFoldContext::from(
+        mnstates, std::move(coin),
+        protx_sig_verifier != nullptr ? *protx_sig_verifier
+                                      : MnFoldContext::OperatorSigFn{});
+}
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -554,7 +584,13 @@ inline DashWorkData build_embedded_workdata(
     // nullptr => every existing positional caller is byte-unchanged: no
     // member source means no ban can be proven, so no root changes.
     const QcMembersFn* qc_pose_members = nullptr,
-    const PoSeOracle* qc_pose_oracle = nullptr)
+    const PoSeOracle* qc_pose_oracle = nullptr,
+    // ── B.9 seam: the BLS operator-signature verifier for ProUpServTx /
+    // ProUpRevTx in the types 1-4 fold (vendor::verify_protx_operator_sig in
+    // c2pool-dash). nullptr => those two types are REFUSED (fail closed): a
+    // stale-key ProUpServTx is bad-protx-sig on every block that carries it.
+    // Only consulted when include_mn_special_txs admitted types 1-4.
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -767,39 +803,76 @@ inline DashWorkData build_embedded_workdata(
         // dashd order: the type-6 PoSe pass precedes the provider txs.
         apply_qc_pose_bans(proj_for_fold.sml, qc_pose_bans);
         if (proj_for_fold.ok) {
-            std::vector<MutableTransaction> body_for_fold;
-            body_for_fold.reserve(selected.size());
-            for (const auto& s : selected) body_for_fold.push_back(s.tx);
-            auto fold = fold_mn_special_txs(
-                proj_for_fold.sml, body_for_fold,
-                [](const MutableTransaction& t) {
-                    return dash::coin::dash_txid(t);
-                });
-            if (!fold.refused_ids.empty()) {
-                std::set<uint256> drop(fold.refused_ids.begin(),
-                                       fold.refused_ids.end());
-                size_t kept = 0;
-                for (size_t i = 0; i < selected.size(); ++i) {
-                    if (drop.count(dash::coin::dash_txid(selected[i].tx))) {
-                        total_fees -= selected[i].fee;
-                        LOG_WARNING << "[GBT-EMB] excluding provider special tx "
-                                    << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
-                                    << " from template h=" << (prev_height + 1)
-                                    << ": MN-list fold refused it (unknown proTxHash"
-                                    << " / dup key / parse failure)";
-                        continue;
+            // The SAME context the emit gate folds with (B10 parity).
+            const MnFoldContext fold_ctx =
+                make_template_fold_context(mnstates, mempool, protx_sig_verifier);
+            // Fold, drop what it refused (fee follows the tx out), and repeat
+            // while a drop also takes an in-body DESCENDANT with it: a child of
+            // a dropped tx would spend an output the block no longer creates
+            // (bad-txns-inputs-missingorspent), and a dropped child that the
+            // fold had applied changes the list, so the body is re-folded.
+            // Every pass removes at least one tx, so this terminates.
+            for (;;) {
+                std::vector<MutableTransaction> body_for_fold;
+                body_for_fold.reserve(selected.size());
+                for (const auto& s : selected) body_for_fold.push_back(s.tx);
+                auto fold = fold_mn_special_txs(
+                    proj_for_fold.sml, body_for_fold,
+                    [](const MutableTransaction& t) {
+                        return dash::coin::dash_txid(t);
+                    },
+                    fold_ctx);
+                bool dropped_descendant = false;
+                if (!fold.refused_ids.empty()) {
+                    std::map<uint256, std::string> why;
+                    for (size_t k = 0; k < fold.refused_ids.size(); ++k)
+                        why.emplace(fold.refused_ids[k], fold.refused_reasons[k]);
+                    std::set<uint256> drop(fold.refused_ids.begin(),
+                                           fold.refused_ids.end());
+                    size_t kept = 0;
+                    for (size_t i = 0; i < selected.size(); ++i) {
+                        const uint256 id = dash::coin::dash_txid(selected[i].tx);
+                        bool child_of_dropped = false;
+                        for (const auto& in : selected[i].tx.vin)
+                            if (drop.count(in.prevout.hash)) { child_of_dropped = true; break; }
+                        if (drop.count(id) || child_of_dropped) {
+                            total_fees -= selected[i].fee;
+                            if (!drop.count(id)) {
+                                drop.insert(id);
+                                dropped_descendant = true;
+                                LOG_WARNING << "[GBT-EMB] excluding tx "
+                                            << id.GetHex().substr(0, 16)
+                                            << " from template h=" << (prev_height + 1)
+                                            << ": it spends an output of an excluded"
+                                               " provider special tx";
+                            } else {
+                                LOG_WARNING << "[GBT-EMB] excluding provider special tx "
+                                            << id.GetHex().substr(0, 16)
+                                            << " from template h=" << (prev_height + 1)
+                                            << ": MN-list fold refused it ("
+                                            << why[id] << ")";
+                            }
+                            continue;
+                        }
+                        if (kept != i) selected[kept] = std::move(selected[i]);
+                        ++kept;
                     }
-                    if (kept != i) selected[kept] = std::move(selected[i]);
-                    ++kept;
+                    selected.resize(kept);
                 }
-                selected.resize(kept);
+                if (dropped_descendant) continue;   // re-fold the reduced body
+                // A refused tx never mutated the list and its inputs were not
+                // counted as spends, so this fold IS the fold of the body that
+                // remains.
+                mn_folded_sml = std::move(fold.sml);
+                if (fold.applied > 0 || fold.collateral_removed > 0)
+                    LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
+                             << (prev_height + 1) << " applied=" << fold.applied
+                             << " refused=" << fold.refused
+                             << " replaced=" << fold.replaced
+                             << " collateral_removed=" << fold.collateral_removed
+                             << " — committing folded merkleRootMNList";
+                break;
             }
-            mn_folded_sml = std::move(fold.sml);
-            if (fold.applied > 0)
-                LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
-                         << (prev_height + 1) << " applied=" << fold.applied
-                         << " refused=" << fold.refused
-                         << " — committing folded merkleRootMNList";
         } else {
             // Projection unavailable ⇒ degrade leg (b): mask types 1-4 out by
             // dropping them from the body (the credit-pool / type-8 leg is

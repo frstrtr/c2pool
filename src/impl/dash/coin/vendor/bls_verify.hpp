@@ -169,6 +169,35 @@ bool verify_govvote_operator_sig(
     const uint256& digest,
     const std::vector<uint8_t>& vch_sig);
 
+// ── B.9: ProUpServTx / ProUpRevTx operator-signature verify ─────────────────
+//
+// dashd CheckProUpServTx / CheckProUpRevTx (evo/specialtxman.cpp @ v23.1.9):
+//     CheckHashSig(*opt_ptx, dmn->pdmnState->pubKeyOperator.Get(), state)
+//       => proTx.sig.VerifyInsecure(pubKey, ::SerializeHash(proTx))
+// against the operator key of the masternode in the PRE-block list. Fail
+// => bad-protx-sig, the whole block is invalid. The two axes, as dashd reads
+// them:
+//   * the 96-byte `sig` is DESERIALIZED per the payload version
+//     (CBLSSignatureVersionWrapper, legacy iff nVersion == LegacyBLS) — the
+//     stream path resets a sig that is only canonical under the OTHER scheme,
+//     so there is no fallback: `sig_legacy` decodes, nothing else does;
+//   * the verify runs under the network's scheme (bls_legacy_scheme, BASIC
+//     since V19) — BasicSchemeMPL, like verify_govvote_operator_sig.
+// The operator key is the stored key; its wire encoding follows the entry
+// version (legacy iff nVersion < BasicBLS) with the other encoding as a
+// fallback, exactly the govvote pubkey axis (dashd hands VerifyInsecure an
+// already-decoded point; a forged sig verifies under no encoding).
+// `sign_hash` is vendor::protx_operator_sign_hash(payload).
+//
+// FAIL-CLOSED: false when the BLS backend is absent, the key is null or fails
+// to decode, the sig fails to decode, or the verify fails. Never throws.
+bool verify_protx_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme,
+    const uint256& sign_hash,
+    const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig,
+    bool sig_legacy_scheme);
+
 // ── ChainLock recovered-threshold-signature verify ──────────────────────────
 //
 // dashcore llmq::VerifyRecoveredSig's final step (src/llmq/quorumsman.cpp:749-751):

@@ -989,7 +989,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # never phantom-registered into the default-OFF build_ci leg -- the #818
     # drift that reddened Linux x86_64 (cases registered at configure time by
     # source-scan while the binary is never built, so ctest cannot find it).
-    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp)
+    # test_dash_protx_sig_bls.cpp (Dash Core v23.1.8 B.9): the template fold's
+    # ProUpServTx / ProUpRevTx operator-signature check against real dashbls
+    # keys — rides this BLS-backend target because it signs.
+    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp
+        test_dash_protx_sig_bls.cpp)
     target_link_libraries(test_dash_govvote_bls PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify
@@ -1167,7 +1171,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
         # suite above, and is folded into this target for the same #769
         # reason (the push bot cannot add a build.yml --target).
-        test_dash_mined_commitment_index.cpp)
+        test_dash_mined_commitment_index.cpp
+        # test_dash_protx_fold_ctx.cpp: Dash Core v23.1.9 B (+ v23.1.8 B.9
+        # plumbing) — the MnFoldContext template fold (#7488 nType, #7489
+        # collateral reuse, #7846 owner/platform namespace, dup service,
+        # collateral spends, external-collateral proof, ExtAddr refusal) and
+        # the A7 builder belt. Folded here per the same #769 rule.
+        test_dash_protx_fold_ctx.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE

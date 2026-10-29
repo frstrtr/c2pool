@@ -241,6 +241,30 @@ public:
 
     void set_utxo(::core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    /// What the chain's UTXO set can PROVE about one outpoint, for checks that
+    /// may only DROP a tx on proof (sml_special_fold.hpp external-collateral
+    /// check). The forward-built view is complete only for coins created since
+    /// it started, so a miss there proves nothing; the at-tip full-history fold
+    /// (fold_active: wired AND at the tip) is authoritative both ways.
+    ///   Unspent — the coin exists unspent; `out` holds it.
+    ///   Absent  — the at-tip fold proves no such unspent coin exists.
+    ///   Unknown — neither source can decide (forward-view miss, no live fold).
+    enum class CoinProof : uint8_t { Unknown, Unspent, Absent };
+    CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
+                               ::core::coin::Coin& out) const
+    {
+        if (auto* utxo = m_utxo.load()) {
+            ::core::coin::Coin c;
+            if (utxo->get_coin(op, c) && !c.is_spent()) { out = c; return CoinProof::Unspent; }
+        }
+        if (fold_active()) {
+            ::core::coin::Coin c;
+            if (fold_resolve(op, c)) { out = c; return CoinProof::Unspent; }
+            return CoinProof::Absent;
+        }
+        return CoinProof::Unknown;
+    }
+
     /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
     /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
     /// feerate in duffs/kB used by the blockMinFeeRate early-return in

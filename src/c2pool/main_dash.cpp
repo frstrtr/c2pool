@@ -3344,6 +3344,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // builder drops any special tx the SML fold cannot apply exactly and the
     // emit gate re-folds and rejects on root drift.
     node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    // B.9 (Dash Core v23.1.8 delta): the types 1-4 fold verifies the BLS
+    // operator signature of every ProUpServTx / ProUpRevTx against the
+    // pre-block operator key (dashd CheckProUpServTx / CheckProUpRevTx ->
+    // bad-protx-sig). Unwired, the fold refuses both types (fail closed); a
+    // BLS-dark build's verifier is a fail-closed stub with the same effect.
+    // Memoized: the builder and the emit gate re-fold the same body per tip.
+    node_coin_state.set_protx_operator_sig_verifier(
+        dash::coin::memoize_operator_sig_fn(
+            &dash::coin::vendor::verify_protx_operator_sig));
     std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
