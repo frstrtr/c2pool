@@ -1303,9 +1303,14 @@ MiningInterface::build_connection_coinbase(
     }
 
     // Write merged header infos so ref_hash_fn (which captures MiningInterface*)
-    // reads the FRESH infos from this MM build, not stale ones from last refresh_work.
+    // reads the infos of THIS cache read, not stale ones from an earlier build.
     // m_last_merged_header_infos is mutable and only consumed by ref_hash_fn (single caller).
-    if (!ws.merged_header_infos.empty()) {
+    // The share's merged_coinbase_info and the coinbase's mm_data come from the
+    // same read: an empty read (no buildable merged block: the commitment was
+    // dropped) clears the infos too. A V36 share with merged_coinbase_info but
+    // no mm_data in its coinbase is invalid to peers (share_check
+    // verify_merged_coinbase_commitment, p2pool data.py).
+    if (m_mm_manager) {
         auto& self = const_cast<MiningInterface&>(*this);
         self.m_last_merged_header_infos = ws.merged_header_infos;
     }
@@ -1326,8 +1331,10 @@ MiningInterface::build_connection_coinbase(
         tag_hex += HEX[b & 0x0f];
     }
 
-    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
-        ? ws.mm_commitment : atomic_mm_commitment;
+    // With a merged-mining manager wired, its cache read is the only source:
+    // the commitment refresh_work cached may be one the manager has since
+    // dropped (and the infos read above would not match it).
+    const auto& mm_for_scriptsig = m_mm_manager ? atomic_mm_commitment : ws.mm_commitment;
 
     std::string mm_hex;
     for (uint8_t b : mm_for_scriptsig) {
