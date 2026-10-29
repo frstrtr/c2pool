@@ -67,6 +67,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -83,12 +84,22 @@ enum class UtxoLaneMode {
 };
 
 /// SHA256d Merkle root of `hashes` (Core ComputeMerkleRoot: the last of an
-/// odd row is paired with itself).
-inline uint256 merkle_root_of(std::vector<uint256> hashes)
+/// odd row is paired with itself). `mutated` (optional): set when a row has
+/// two equal hashes at a pair position, the CVE-2012-2459 shape (a body with
+/// a duplicated tx run has the same root as the real one: Core's CheckBlock
+/// refuses it as bad-txns-duplicate).
+inline uint256 merkle_root_of(std::vector<uint256> hashes, bool* mutated = nullptr)
 {
+    if (mutated)
+        *mutated = false;
     if (hashes.empty())
         return uint256();
     while (hashes.size() > 1) {
+        if (mutated) {
+            for (size_t i = 0; i + 1 < hashes.size(); i += 2)
+                if (hashes[i] == hashes[i + 1])
+                    *mutated = true;
+        }
         if (hashes.size() & 1u)
             hashes.push_back(hashes.back());
         std::vector<uint256> next;
@@ -148,7 +159,27 @@ struct UtxoLaneHost {
     /// The ordered pipeline started (arm its stall timer) / stopped.
     std::function<void(Fill&)> fill_started;
     std::function<void(Fill&)> fill_stopped;
+
+    /// Full mode, block download as Core does it (several blocks in flight
+    /// per peer within a moving window, a stalling peer replaced). The peers
+    /// a body may be asked from: handshaken and advertising NODE_NETWORK (a
+    /// pruned node is not asked; full_block_peer()). Unset: the lane asks
+    /// through `request` (one window, in order).
+    std::function<std::vector<std::string>()> download_peers;
+    /// Ask `peer` for the best chain's block at height h (false: not sent).
+    std::function<bool(const std::string&, uint32_t)> request_from;
+    /// The clock (tests drive it). Unset: std::chrono::steady_clock.
+    std::function<std::chrono::steady_clock::time_point()> now;
 };
+
+/// A peer that serves every historical block: it advertises NODE_NETWORK
+/// (bit 0). A pruned node clears it (Dogecoin 1.14) or advertises only
+/// NODE_NETWORK_LIMITED (bit 10, later Core): neither is asked for the IBD.
+inline bool full_block_peer(uint64_t services)
+{
+    constexpr uint64_t NODE_NETWORK = 1;
+    return (services & NODE_NETWORK) != 0;
+}
 
 /// Counters for /local_stats ("doge_utxo"). Atomic: read from the HTTP thread.
 struct UtxoLaneStats {
@@ -166,7 +197,15 @@ struct UtxoLaneStats {
     std::atomic<uint64_t> bad_bodies{0};       // full mode: bodies whose Merkle root is not the header's
     std::atomic<uint64_t> complete{0};         // full mode: 1 once the set reached the header tip
     std::atomic<uint64_t> ibd_next_height{0};  // full mode: next height the fill connects
-    std::atomic<uint64_t> ibd_rate_bps{0};     // full mode: blocks per second over the last progress step
+    std::atomic<uint64_t> ibd_rate_bps{0};     // full mode: blocks per second (last ~10 s)
+    std::atomic<uint64_t> inflight{0};         // full mode: block requests outstanding
+    std::atomic<uint64_t> peers_used{0};       // full mode: peers with requests outstanding
+    std::atomic<uint64_t> peers_cooling{0};    // full mode: peers rotated out (stalling, bad bodies)
+    std::atomic<uint64_t> stalls{0};           // full mode: peers that held the window's first block
+    std::atomic<uint64_t> request_timeouts{0}; // full mode: requests unanswered for REQUEST_TIMEOUT
+    std::atomic<uint64_t> buffer_bytes{0};     // full mode: bodies received, waiting to connect
+    std::atomic<uint64_t> stall_timeout_ms{0}; // full mode: the current stall timeout
+    std::atomic<uint64_t> stuck_retries{0};    // full mode: retries of a stuck height
 
     nlohmann::json to_json() const
     {
@@ -179,6 +218,10 @@ struct UtxoLaneStats {
             {"headers_from_bodies", v(headers_from_bodies)}, {"headers_requested", v(headers_requested)},
             {"strict_refusals", v(strict_refusals)}, {"bad_bodies", v(bad_bodies)},
             {"ibd_next_height", v(ibd_next_height)}, {"ibd_rate_bps", v(ibd_rate_bps)},
+            {"inflight", v(inflight)},         {"peers_used", v(peers_used)},
+            {"peers_cooling", v(peers_cooling)}, {"stalls", v(stalls)},
+            {"request_timeouts", v(request_timeouts)}, {"buffer_bytes", v(buffer_bytes)},
+            {"stall_timeout_ms", v(stall_timeout_ms)}, {"stuck_retries", v(stuck_retries)},
         };
     }
 };
@@ -189,9 +232,28 @@ public:
     using Fill = UtxoLaneHost::Fill;
     using Mode = UtxoLaneMode;
 
-    /// Full mode: the fill's request window (<= 64 MB of bodies in flight at
-    /// DOGE's 1 MB block size limit).
-    static constexpr size_t FULL_WINDOW = 64;
+    /// Full mode, block download (Core net_processing.h): the window of
+    /// heights ahead of the next to connect that may be requested
+    /// (BLOCK_DOWNLOAD_WINDOW), requests outstanding per peer
+    /// (MAX_BLOCKS_IN_TRANSIT_PER_PEER), the stall timeout for the window's
+    /// first block (BLOCK_STALLING_TIMEOUT, doubled after each stall up to
+    /// 64 s, halved again after 1,000 blocks without one).
+    static constexpr size_t   FULL_WINDOW = 1024;
+    static constexpr uint32_t PER_PEER_IN_FLIGHT = 16;
+    static constexpr std::chrono::milliseconds STALL_TIMEOUT_MIN{2000};
+    static constexpr std::chrono::milliseconds STALL_TIMEOUT_MAX{64000};
+    /// A request unanswered this long goes to another peer.
+    static constexpr std::chrono::seconds REQUEST_TIMEOUT{60};
+    /// A stalling peer, or one that sent a bad body, is not asked this long.
+    static constexpr std::chrono::seconds PEER_COOLDOWN{600};
+    /// Memory bound of the bodies received but not yet connected (the
+    /// reorder buffer): no new request while it holds this much. Worst case
+    /// held: this + the requests in flight (<= PER_PEER_IN_FLIGHT per peer)
+    /// x DOGE's 1 MB block size limit.
+    static constexpr size_t   BUFFER_BYTES_MAX = 256u * 1024 * 1024;
+    /// A height refused REFUSALS_MAX times is left alone this long, then
+    /// fetched again (not only at a restart).
+    static constexpr std::chrono::seconds STUCK_RETRY{600};
     /// Full mode: a progress line every this many connected blocks.
     static constexpr uint32_t PROGRESS_EVERY = 10'000;
     /// Full mode: refusals of one height before its body is asked from every
@@ -227,8 +289,9 @@ public:
     UtxoLane& operator=(const UtxoLane&) = delete;
 
     /// The full-block handler: block `hash` at `height` (the header chain's
-    /// height for it; 0 = unknown).
-    FeedResult on_block(const BlockType& block, const uint256& hash, uint32_t height)
+    /// height for it; 0 = unknown), received from `peer` ("" = unknown).
+    FeedResult on_block(const BlockType& block, const uint256& hash, uint32_t height,
+                        const std::string& peer = std::string())
     {
         using namespace ltc::coin;
         FeedResult r;
@@ -255,7 +318,8 @@ public:
         r.on_best_chain = !at.IsNull() && at == hash;
 
         if (m_mode == Mode::Full) {
-            if (m_stuck) {
+            delivered(height, peer);
+            if (m_stuck && !retry_stuck(now())) {
                 r.fed = Fed::Skipped;
                 return r;
             }
@@ -371,10 +435,15 @@ public:
             if (fc != FullConnect::Connected) {
                 // A bad body or a strict refusal: fetch the height again
                 // through the fill (another peer), or leave the set as is.
-                if (fc == FullConnect::Refused)
+                if (fc == FullConnect::Refused) {
                     on_strict_refusal(height);
-                else if (fc == FullConnect::BadBody)
+                } else if (fc == FullConnect::BadBody) {
+                    if (downloading())
+                        cool_down(m_last_peer, now());
                     refetch_from_set();
+                } else if (fc == FullConnect::WriteFailed) {
+                    stop_stuck();
+                }
                 r.fed = Fed::Refused;
                 return r;
             }
@@ -435,11 +504,17 @@ public:
     const UtxoLaneStats& stats() const { return m_stats; }
 
     /// Full mode: the set was left as is after repeated refusals or a write
-    /// failure (heal_failures); nothing is connected until a restart.
+    /// failure (heal_failures); the height is fetched again after STUCK_RETRY.
     bool stuck() const { return m_stuck; }
 
 private:
     enum class Heal { Startup, Reorg, ParentMismatch };
+
+    /// Full mode block download: a block request outstanding.
+    struct InFlight {
+        std::string peer;
+        std::chrono::steady_clock::time_point sent;
+    };
 
     /// What a full-mode connect did with a block.
     enum class FullConnect {
@@ -461,7 +536,30 @@ private:
             }
             return;
         }
+        const bool fresh = height >= m_fill.next_height && !m_fill.buffer.count(height);
         ltc::coin::ordered_buffer(m_fill, height, block, hash);
+        if (m_mode == Mode::Full && fresh && m_fill.buffer.count(height)) {
+            const size_t bytes = body_bytes(block);
+            m_sizes[height] = bytes;
+            m_buffer_bytes += bytes;
+            m_from[height] = m_last_peer;
+            m_stats.buffer_bytes.store(m_buffer_bytes, std::memory_order_relaxed);
+        }
+    }
+
+    /// The serialized size of a body, estimated from its parts (the reorder
+    /// buffer's memory bound).
+    static size_t body_bytes(const BlockType& b)
+    {
+        size_t n = 80 + 9;
+        for (const auto& tx : b.m_txs) {
+            n += 4 + 4 + 9 + 9;
+            for (const auto& in : tx.vin)
+                n += 32 + 4 + 4 + 9 + in.scriptSig.m_data.size();
+            for (const auto& out : tx.vout)
+                n += 8 + 9 + out.scriptPubKey.m_data.size();
+        }
+        return n;
     }
 
     /// Full mode, the first block: arm the fill. A set that is empty or not
@@ -590,7 +688,244 @@ private:
 
     uint32_t refill(UtxoAsk how)
     {
+        if (downloading())
+            return download_refill();
         return ltc::coin::ordered_refill(m_fill, [&](uint32_t h) { m_host.request(h, how); });
+    }
+
+    // ── Full mode block download ────────────────────────────────────────
+
+    bool downloading() const
+    {
+        return m_mode == Mode::Full && m_host.download_peers && m_host.request_from;
+    }
+
+    std::chrono::steady_clock::time_point now() const
+    {
+        return m_host.now ? m_host.now() : std::chrono::steady_clock::now();
+    }
+
+    /// A body arrived from `peer`: its request is answered.
+    void delivered(uint32_t height, const std::string& peer)
+    {
+        m_last_peer = peer;
+        auto it = m_inflight.find(height);
+        if (it == m_inflight.end())
+            return;
+        drop_request(it);
+    }
+
+    void drop_request(std::map<uint32_t, InFlight>::iterator it)
+    {
+        auto load = m_load.find(it->second.peer);
+        if (load != m_load.end() && load->second > 0 && --load->second == 0)
+            m_load.erase(load);
+        m_inflight.erase(it);
+    }
+
+    /// Forget requests and buffered sizes the fill no longer covers (a
+    /// re-arm cleared its buffer, the range moved).
+    void sync_download_state()
+    {
+        for (auto it = m_sizes.begin(); it != m_sizes.end();) {
+            if (it->first < m_fill.next_height || !m_fill.buffer.count(it->first)) {
+                m_buffer_bytes -= std::min(m_buffer_bytes, it->second);
+                m_from.erase(it->first);
+                it = m_sizes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = m_inflight.begin(); it != m_inflight.end();) {
+            if (!m_fill.active || it->first < m_fill.next_height || it->first > m_fill.end_height
+                || m_fill.buffer.count(it->first)) {
+                auto next = std::next(it);
+                drop_request(it);
+                it = next;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    /// The peers to ask: the host's (NODE_NETWORK, handshaken) minus the ones
+    /// cooling down; all of them if every one is cooling.
+    std::vector<std::string> eligible_peers(std::chrono::steady_clock::time_point t)
+    {
+        if (m_peers.empty() || t - m_peers_at > std::chrono::seconds(1)) {
+            m_peers = m_host.download_peers();
+            m_peers_at = t;
+        }
+        for (auto it = m_cooldown.begin(); it != m_cooldown.end();)
+            it = it->second <= t ? m_cooldown.erase(it) : std::next(it);
+        m_stats.peers_cooling.store(m_cooldown.size(), std::memory_order_relaxed);
+        std::vector<std::string> out;
+        for (const auto& p : m_peers)
+            if (!m_cooldown.count(p))
+                out.push_back(p);
+        return out.empty() ? m_peers : out;
+    }
+
+    /// Rotate `peer` out for PEER_COOLDOWN; its outstanding requests go to
+    /// other peers at the next refill.
+    void cool_down(const std::string& peer, std::chrono::steady_clock::time_point t)
+    {
+        if (peer.empty())
+            return;
+        m_cooldown[peer] = t + PEER_COOLDOWN;
+        for (auto it = m_inflight.begin(); it != m_inflight.end();) {
+            if (it->second.peer == peer) {
+                auto next = std::next(it);
+                drop_request(it);
+                it = next;
+            } else {
+                ++it;
+            }
+        }
+        m_peers_at = {};
+    }
+
+    /// Keep the window full: every height from the next to connect up to
+    /// window ahead that is neither buffered nor in flight is asked from the
+    /// least loaded eligible peer with fewer than PER_PEER_IN_FLIGHT
+    /// outstanding, while the reorder buffer is under its memory bound.
+    uint32_t download_refill()
+    {
+        if (!m_fill.active)
+            return 0;
+        const auto t = now();
+        sync_download_state();
+        auto peers = eligible_peers(t);
+        uint32_t asked = 0;
+        const uint64_t last = std::min<uint64_t>(m_fill.end_height, uint64_t(m_fill.next_height) + m_fill.window - 1);
+        for (uint64_t hh = m_fill.next_height; hh <= last && !peers.empty(); ++hh) {
+            if (m_buffer_bytes >= m_buffer_limit)
+                break;
+            const uint32_t h = static_cast<uint32_t>(hh);
+            if (m_fill.buffer.count(h) || m_inflight.count(h))
+                continue;
+            // The least loaded peer with room; ties go round robin.
+            std::string pick;
+            uint32_t pick_load = PER_PEER_IN_FLIGHT;
+            for (size_t i = 0; i < peers.size(); ++i) {
+                const auto& p = peers[(m_peer_rr + i) % peers.size()];
+                auto ld = m_load.find(p);
+                const uint32_t l = ld == m_load.end() ? 0 : ld->second;
+                if (l < pick_load) {
+                    pick = p;
+                    pick_load = l;
+                }
+            }
+            if (pick.empty())
+                break;  // every peer has PER_PEER_IN_FLIGHT outstanding
+            ++m_peer_rr;
+            if (!m_host.request_from(pick, h)) {
+                peers.erase(std::remove(peers.begin(), peers.end(), pick), peers.end());
+                m_peers_at = {};
+                --hh;  // this height again, another peer
+                continue;
+            }
+            m_inflight[h] = InFlight{pick, t};
+            ++m_load[pick];
+            ++asked;
+        }
+        m_stats.inflight.store(m_inflight.size(), std::memory_order_relaxed);
+        m_stats.peers_used.store(m_load.size(), std::memory_order_relaxed);
+        m_stats.buffer_bytes.store(m_buffer_bytes, std::memory_order_relaxed);
+        return asked;
+    }
+
+public:
+    /// Full mode: the periodic check (main_ltc: every second, on the lane's
+    /// thread). Requests unanswered for REQUEST_TIMEOUT go to other peers; a
+    /// peer holding the window's first block past the stall timeout while
+    /// later blocks wait (the window cannot move) is rotated out and its
+    /// requests reassigned (Core's stalling-peer rule); a stuck height is
+    /// retried after STUCK_RETRY; the window is refilled; the rate updated.
+    void tick()
+    {
+        if (m_mode != Mode::Full)
+            return;
+        const auto t = now();
+        if (m_stuck)
+            retry_stuck(t);
+        update_rate(t);
+        if (!downloading() || !m_fill.active)
+            return;
+        sync_download_state();
+        for (auto it = m_inflight.begin(); it != m_inflight.end();) {
+            if (t - it->second.sent > REQUEST_TIMEOUT) {
+                m_stats.request_timeouts.fetch_add(1, std::memory_order_relaxed);
+                m_cooldown[it->second.peer] = t + PEER_COOLDOWN;
+                auto next = std::next(it);
+                drop_request(it);
+                it = next;
+            } else {
+                ++it;
+            }
+        }
+        auto first = m_inflight.find(m_fill.next_height);
+        if (first != m_inflight.end() && t - first->second.sent > m_stall_timeout) {
+            // Core (FindNextBlocksToDownload): a staller only when nothing
+            // more can be asked: the window is full, or the buffer at its
+            // memory bound. A slow peer with room left in the window is left
+            // to REQUEST_TIMEOUT.
+            const uint32_t window_end = static_cast<uint32_t>(std::min<uint64_t>(
+                m_fill.end_height, uint64_t(m_fill.next_height) + m_fill.window - 1));
+            const size_t span = window_end - m_fill.next_height + 1;
+            const bool window_waits = m_buffer_bytes >= m_buffer_limit
+                || m_inflight.size() + m_fill.buffer.size() >= span;
+            if (window_waits) {
+                const std::string staller = first->second.peer;
+                m_stats.stalls.fetch_add(1, std::memory_order_relaxed);
+                LOG_INFO << m_tag << " IBD: peer " << staller << " stalls h=" << m_fill.next_height << " ("
+                         << std::chrono::duration_cast<std::chrono::milliseconds>(t - first->second.sent).count()
+                         << " ms, timeout " << m_stall_timeout.count() << " ms): rotated out, its requests reassigned";
+                cool_down(staller, t);
+                m_stall_timeout = std::min(m_stall_timeout * 2, std::chrono::milliseconds(STALL_TIMEOUT_MAX));
+                m_drained_since_stall = 0;
+            }
+        }
+        m_stats.stall_timeout_ms.store(static_cast<uint64_t>(m_stall_timeout.count()), std::memory_order_relaxed);
+        download_refill();
+    }
+
+    /// Tests: the reorder buffer's memory bound.
+    void set_buffer_limit(size_t bytes) { m_buffer_limit = bytes; }
+
+private:
+    /// A stuck height (REFUSALS_MAX refusals) is fetched again once
+    /// STUCK_RETRY has passed. Returns true when the lane runs again.
+    bool retry_stuck(std::chrono::steady_clock::time_point t)
+    {
+        if (!m_stuck)
+            return true;
+        if (t - m_stuck_since < STUCK_RETRY)
+            return false;
+        m_stuck = false;
+        m_refusal_count = 0;
+        m_stats.stuck_retries.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARNING << m_tag << " UTXO set stuck at h=" << m_utxo.get_best_height() << " for "
+                    << std::chrono::duration_cast<std::chrono::seconds>(t - m_stuck_since).count()
+                    << "s: fetching h=" << m_utxo.get_best_height() + 1 << " again";
+        refetch_from_set();
+        return true;
+    }
+
+    void update_rate(std::chrono::steady_clock::time_point t)
+    {
+        const uint64_t c = m_stats.connected.load(std::memory_order_relaxed);
+        if (m_rate_at == std::chrono::steady_clock::time_point{}) {
+            m_rate_at = t;
+            m_rate_connected = c;
+            return;
+        }
+        const double secs = std::chrono::duration<double>(t - m_rate_at).count();
+        if (secs < 10)
+            return;
+        m_stats.ibd_rate_bps.store(static_cast<uint64_t>((c - m_rate_connected) / secs), std::memory_order_relaxed);
+        m_rate_at = t;
+        m_rate_connected = c;
     }
 
     /// The check at every connect point; the cold start's deliberate jump
@@ -643,17 +978,31 @@ private:
         txids.reserve(b.m_txs.size());
         for (const auto& tx : b.m_txs)
             txids.push_back(txid_of(tx));
-        if (txids.empty() || merkle_root_of(txids) != b.m_merkle_root) {
+        bool mutated = false;
+        if (txids.empty() || merkle_root_of(txids, &mutated) != b.m_merkle_root || mutated) {
             m_stats.refused.fetch_add(1, std::memory_order_relaxed);
             m_stats.bad_bodies.fetch_add(1, std::memory_order_relaxed);
-            LOG_WARNING << m_tag << " Block h=" << h << " " << bh.GetHex().substr(0, 16)
-                        << "...: its transactions are not the ones its header commits to (Merkle root); refetching";
+            LOG_WARNING << m_tag << " Block h=" << h << " " << bh.GetHex().substr(0, 16) << "...: "
+                        << (mutated ? "duplicated transactions under the header's Merkle root (CVE-2012-2459)"
+                                    : "its transactions are not the ones its header commits to (Merkle root)")
+                        << "; fetching it from another peer";
             return FullConnect::BadBody;
         }
         core::coin::UTXOViewCache::StrictRefusal why;
         size_t next = 0;
         auto undo = m_utxo.connect_block(
             b, h, [&](const ltc::coin::MutableTransaction&) { return txids[next++]; }, bh, true, &why);
+        if (!undo && why.spent_in_block) {
+            // An output spent twice inside the body: no valid block does
+            // that, so this body is not the best chain's block (a mutated or
+            // forged body). The peer's fault, not the set's.
+            m_stats.refused.fetch_add(1, std::memory_order_relaxed);
+            m_stats.bad_bodies.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARNING << m_tag << " Block h=" << h << " " << bh.GetHex().substr(0, 16) << "...: tx "
+                        << why.txid.GetHex() << " spends " << why.missing.txid.GetHex() << ":"
+                        << why.missing.index << " already spent in the same body; fetching it from another peer";
+            return FullConnect::BadBody;
+        }
         if (!undo) {
             m_stats.refused.fetch_add(1, std::memory_order_relaxed);
             m_stats.strict_refusals.fetch_add(1, std::memory_order_relaxed);
@@ -668,6 +1017,7 @@ private:
         if (near_tip)
             m_db.put_block_undo(h, *undo);
         if (!m_utxo.flush(bh, h)) {
+            m_utxo.discard_pending();  // the set is the DB's, at its best block
             m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR << m_tag << " UTXO write failed at h=" << h << " (disk?); the lane stops, set at h="
                       << m_utxo.get_best_height();
@@ -684,6 +1034,24 @@ private:
         if (m_host.connected)
             m_host.connected(b, bh, h, drained);
         return FullConnect::Connected;
+    }
+
+    /// A buffered body leaves the reorder buffer (to connect): its bytes are
+    /// released; returns the peer that sent it.
+    std::string release_buffered(uint32_t h)
+    {
+        std::string peer;
+        auto sz = m_sizes.find(h);
+        if (sz != m_sizes.end()) {
+            m_buffer_bytes -= std::min(m_buffer_bytes, sz->second);
+            m_sizes.erase(sz);
+        }
+        auto f = m_from.find(h);
+        if (f != m_from.end()) {
+            peer = f->second;
+            m_from.erase(f);
+        }
+        return peer;
     }
 
     /// Full mode: restart the fill at the set's next height (another peer
@@ -717,18 +1085,31 @@ private:
             m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR << m_tag << " UTXO set refused h=" << h << " " << m_refusal_count
                       << " times: left as is at h=" << m_utxo.get_best_height()
-                      << " (templates stay coinbase-only; a restart retries)";
+                      << " (templates stay coinbase-only; fetched again in "
+                      << STUCK_RETRY.count() << "s)";
             stop_stuck();
             return;
         }
-        refetch_from_set();
+        refetch_height();
         if (m_refusal_count >= REFUSALS_BROADCAST)
             m_host.request(h, UtxoAsk::Broadcast);
+    }
+
+    /// The next height again: with the block download, a height neither
+    /// buffered nor in flight is asked at the next refill (from an eligible
+    /// peer); otherwise the fill restarts at the set's next height.
+    void refetch_height()
+    {
+        if (downloading() && m_fill.active)
+            download_refill();
+        else
+            refetch_from_set();
     }
 
     void stop_stuck()
     {
         m_stuck = true;
+        m_stuck_since = now();
         m_fill.buffer.clear();
         if (m_fill.active) {
             m_fill.active = false;
@@ -743,10 +1124,12 @@ private:
         using ltc::coin::ConnectCheck;
         ltc::coin::DrainResult r;
         FullConnect failed = FullConnect::Connected;
+        std::string from;
         while (m_fill.buffer.count(m_fill.next_height)) {
             auto node = m_fill.buffer.extract(m_fill.next_height);
             auto& [b, bh] = node.mapped();
             const uint32_t h = m_fill.next_height;
+            from = release_buffered(h);
             const ConnectCheck c = check(b, bh, h);
             if (c != ConnectCheck::Ok) {
                 r.refused = c;
@@ -762,12 +1145,23 @@ private:
             ++m_fill.processed;
             m_fill.last_drain_time = std::chrono::steady_clock::now();
             ++r.connected;
+            if (++m_drained_since_stall >= 1000 && m_stall_timeout > STALL_TIMEOUT_MIN) {
+                m_stall_timeout = std::max(m_stall_timeout / 2, std::chrono::milliseconds(STALL_TIMEOUT_MIN));
+                m_drained_since_stall = 0;
+            }
         }
+        m_stats.buffer_bytes.store(m_buffer_bytes, std::memory_order_relaxed);
         switch (failed) {
         case FullConnect::Connected:
             break;
         case FullConnect::BadBody:
-            refetch_from_set();
+            // The peer that sent it is rotated out; the height goes to another.
+            if (downloading()) {
+                cool_down(from, now());
+                download_refill();
+            } else {
+                refetch_from_set();
+            }
             return r.connected;
         case FullConnect::Refused:
             on_strict_refusal(r.refused_height);
@@ -981,11 +1375,28 @@ private:
     UtxoLaneStats              m_stats;
     // Full mode
     bool                       m_completed{false};   // completed() fired this run
-    bool                       m_stuck{false};       // left as is (heal_failures)
+    bool                       m_stuck{false};       // left as is (heal_failures) until STUCK_RETRY
+    std::chrono::steady_clock::time_point m_stuck_since{};
     uint32_t                   m_refusal_height{0};  // the height strict connect refused last
     uint32_t                   m_refusal_count{0};   // ... and how many times in a row
     std::chrono::steady_clock::time_point m_progress_time{std::chrono::steady_clock::now()};
     uint32_t                   m_progress_height{0};
+    std::chrono::steady_clock::time_point m_rate_at{};
+    uint64_t                   m_rate_connected{0};
+    // Full mode block download (downloading())
+    std::map<uint32_t, InFlight>        m_inflight;   // height -> its request
+    std::map<std::string, uint32_t>     m_load;       // peer -> requests outstanding
+    std::map<std::string, std::chrono::steady_clock::time_point> m_cooldown;  // peer -> not asked until
+    std::vector<std::string>            m_peers;      // the host's download peers (refreshed each second)
+    std::chrono::steady_clock::time_point m_peers_at{};
+    size_t                              m_peer_rr{0};
+    std::map<uint32_t, size_t>          m_sizes;      // buffered height -> body bytes
+    std::map<uint32_t, std::string>     m_from;       // buffered height -> the peer that sent it
+    std::string                         m_last_peer;  // the peer of the body being handled
+    size_t                              m_buffer_bytes{0};
+    size_t                              m_buffer_limit{BUFFER_BYTES_MAX};
+    std::chrono::milliseconds           m_stall_timeout{STALL_TIMEOUT_MIN};
+    uint32_t                            m_drained_since_stall{0};
 };
 
 } // namespace coin

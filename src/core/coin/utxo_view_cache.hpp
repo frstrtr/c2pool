@@ -200,6 +200,8 @@ public:
         Outpoint missing;      // the input's prevout
         uint256  txid;         // the transaction spending it
         uint32_t tx_index{0};  // its position in the block
+        bool     spent_in_block{false};  // an earlier tx of the same block spent it (no valid
+                                         // block does: a mutated or forged body)
     };
 
     /// connect_block with the mode explicit. strict = false is the call above
@@ -221,11 +223,14 @@ public:
         std::unique_lock<std::shared_mutex> lock(m_mu);
         // The block's changes, applied to the view only once every input resolved.
         std::unordered_map<Outpoint, std::optional<Coin>, OutpointHasher> overlay;
+        bool spent_in_block = false;
         auto lookup = [&](const Outpoint& op, Coin& coin) {
             auto it = overlay.find(op);
             if (it != overlay.end()) {
-                if (!it->second.has_value())
-                    return false;  // spent earlier in this block
+                if (!it->second.has_value()) {
+                    spent_in_block = true;  // spent earlier in this block
+                    return false;
+                }
                 coin = *it->second;
                 return true;
             }
@@ -252,6 +257,7 @@ public:
                             why->missing = op;
                             why->txid = txid;
                             why->tx_index = static_cast<uint32_t>(t);
+                            why->spent_in_block = spent_in_block;
                         }
                         return std::nullopt;
                     }
@@ -365,6 +371,14 @@ public:
         m_cache.clear();
         m_coin_delta = 0;
         return true;
+    }
+
+    /// Drop the changes not flushed yet (after a flush that failed): the
+    /// view is the backing DB's again, at its best block.
+    void discard_pending() {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        m_cache.clear();
+        m_coin_delta = 0;
     }
 
     // ── Sync state ('S', UTXOViewDB) ────────────────────────────────────

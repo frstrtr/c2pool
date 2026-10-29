@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
@@ -192,6 +193,12 @@ struct Net {
     std::vector<uint32_t> connected;  // heights, in connect order
     uint32_t wiped{0};
     uint32_t completed{0};      // full mode: the set reached the tip
+    // Full mode block download (Lane(..., download = true)): the peers
+    // offered, what each was asked, the clock.
+    bool download{false};
+    std::vector<std::string> peers;
+    std::vector<std::pair<std::string, uint32_t>> peer_requests;
+    std::chrono::steady_clock::time_point clock{std::chrono::steady_clock::time_point{} + std::chrono::hours(1)};
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     std::vector<std::string> events;     // clean / header, in order
@@ -267,6 +274,14 @@ struct Net {
                 pool->requarantine_all();
         };
         h.completed = [this]() { ++completed; };
+        if (download) {
+            h.download_peers = [this]() { return peers; };
+            h.request_from = [this](const std::string& peer, uint32_t height) {
+                peer_requests.emplace_back(peer, height);
+                return true;
+            };
+            h.now = [this]() { return clock; };
+        }
         return h;
     }
 };
@@ -276,8 +291,8 @@ struct Lane {
     Net net;
     UtxoLane lane;
     explicit Lane(uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP,
-                  UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0)
-        : lane(*t.cache, *t.db, net.host(), keep, mode, window)
+                  UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0, bool download = false)
+        : lane(*t.cache, *t.db, (net.download = download, net.host()), keep, mode, window)
     {
     }
 

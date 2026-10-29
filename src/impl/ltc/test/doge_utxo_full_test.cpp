@@ -495,3 +495,224 @@ TEST(DogeUtxoFull, SiblingAtTheTipHeightDoesNotPrice)
     d = tip.build(pool);
     EXPECT_EQ(d["transactions"].size(), 1u);
 }
+
+// ── VERIFY S2: block download as Core does it ─────────────────────────────
+
+namespace {
+
+/// Answer every outstanding request in the order made, from the peer asked
+/// (skipping `silent`'s), until none is left. Returns the most requests any
+/// one peer had outstanding at once.
+uint32_t serve_peers(Lane& l, const std::vector<BlockType>& chain, const std::string& silent = std::string())
+{
+    uint32_t peak = 0;
+    size_t i = 0;
+    std::map<std::string, uint32_t> outstanding;
+    for (; i < l.net.peer_requests.size(); ++i) {
+        // Outstanding per peer = asked - answered so far.
+        outstanding.clear();
+        for (size_t k = i; k < l.net.peer_requests.size(); ++k)
+            ++outstanding[l.net.peer_requests[k].first];
+        for (const auto& [p, n] : outstanding)
+            peak = std::max(peak, n);
+        const auto [peer, h] = l.net.peer_requests[i];
+        if (peer == silent)
+            continue;
+        l.lane.on_block(chain[h - 1], hash_of(chain[h - 1]), h, peer);
+    }
+    return peak;
+}
+
+} // namespace
+
+// Several blocks in flight per peer (16), within the window, from every
+// peer; every height asked once; the set reaches the tip.
+TEST(DogeUtxoDownload, ManyBlocksInFlightPerPeerWithinTheWindow)
+{
+    const uint256 g = genesis(0x62);
+    const auto chain = chain_with(g, 200);
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[199], hash_of(chain[199]), 200, "a");
+    ASSERT_EQ(l.net.peer_requests.size(), 48u) << "3 peers x 16 in flight";
+    std::map<std::string, int> per_peer;
+    for (const auto& [p, h] : l.net.peer_requests)
+        ++per_peer[p];
+    EXPECT_EQ(per_peer["a"], 16);
+    EXPECT_EQ(per_peer["b"], 16);
+    EXPECT_EQ(per_peer["c"], 16);
+    EXPECT_EQ(l.lane.stats().inflight.load(), 48u);
+    EXPECT_EQ(l.lane.stats().peers_used.load(), 3u);
+    const uint32_t peak = serve_peers(l, chain);
+    EXPECT_LE(peak, UtxoLane::PER_PEER_IN_FLIGHT);
+    EXPECT_EQ(l.t.cache->get_best_height(), 200u);
+    std::map<uint32_t, int> asked;
+    for (const auto& [p, h] : l.net.peer_requests)
+        ++asked[h];
+    for (uint32_t h = 1; h < 200; ++h)
+        EXPECT_EQ(asked[h], 1) << "h=" << h;
+    EXPECT_EQ(l.net.completed, 1u);
+}
+
+// The peer holding the window's first block answers nothing; the others
+// deliver. Past the stall timeout (2 s) it is rotated out, its requests go
+// to the other peers, the set moves on (Core's stalling-peer rule). Before,
+// one silent peer held the in-order drain for 30 s per height.
+TEST(DogeUtxoDownload, StallingPeerIsRotatedOutAndItsRequestsReassigned)
+{
+    const uint256 g = genesis(0x63);
+    const auto chain = chain_with(g, 120);
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[119], hash_of(chain[119]), 120, "b");
+    ASSERT_FALSE(l.net.peer_requests.empty());
+    const std::string staller = l.net.peer_requests.front().first;   // asked for h=1
+    ASSERT_EQ(l.net.peer_requests.front().second, 1u);
+    serve_peers(l, chain, staller);
+    EXPECT_EQ(l.t.cache->get_best_height(), 0u) << "h=1 never came";
+    l.net.clock += std::chrono::seconds(3);
+    const size_t before = l.net.peer_requests.size();
+    l.lane.tick();
+    EXPECT_EQ(l.lane.stats().stalls.load(), 1u);
+    EXPECT_EQ(l.lane.stats().peers_cooling.load(), 1u);
+    ASSERT_GT(l.net.peer_requests.size(), before) << "its requests reassigned";
+    for (size_t i = before; i < l.net.peer_requests.size(); ++i)
+        EXPECT_NE(l.net.peer_requests[i].first, staller);
+    // Serve the reassigned requests and whatever follows.
+    std::vector<std::pair<std::string, uint32_t>> rest(l.net.peer_requests.begin() + static_cast<long>(before),
+                                                        l.net.peer_requests.end());
+    l.net.peer_requests = rest;
+    serve_peers(l, chain, staller);
+    EXPECT_EQ(l.t.cache->get_best_height(), 120u);
+}
+
+// A request unanswered for REQUEST_TIMEOUT goes to another peer.
+TEST(DogeUtxoDownload, RequestTimeoutGoesToAnotherPeer)
+{
+    const uint256 g = genesis(0x64);
+    const auto chain = chain_with(g, 40);
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[39], hash_of(chain[39]), 40, "a");
+    const size_t asked = l.net.peer_requests.size();
+    ASSERT_GT(asked, 0u);
+    l.net.clock += UtxoLane::REQUEST_TIMEOUT + std::chrono::seconds(1);
+    l.lane.tick();
+    EXPECT_EQ(l.lane.stats().request_timeouts.load(), asked);
+    EXPECT_GT(l.net.peer_requests.size(), asked) << "asked again";
+    std::vector<std::pair<std::string, uint32_t>> rest(l.net.peer_requests.begin() + static_cast<long>(asked),
+                                                        l.net.peer_requests.end());
+    l.net.peer_requests = rest;
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 40u);
+}
+
+// The reorder buffer's memory bound: while the received-but-unconnected
+// bodies hold the bound, nothing new is asked; once the gap fills and they
+// connect, requests resume.
+TEST(DogeUtxoDownload, ReorderBufferMemoryBoundStopsRequests)
+{
+    const uint256 g = genesis(0x65);
+    const auto chain = chain_with(g, 60);
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.lane.set_buffer_limit(3 * 200);   // about three of these bodies
+    l.net.peers = {"a"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[59], hash_of(chain[59]), 60, "a");
+    ASSERT_EQ(l.net.peer_requests.size(), 16u);
+    for (uint32_t h = 2; h <= 16; ++h)
+        l.lane.on_block(chain[h - 1], hash_of(chain[h - 1]), h, "a");
+    // 15 slots freed, at most one or two used before the buffer held the bound.
+    const size_t held = l.net.peer_requests.size();
+    EXPECT_LE(held, 16u + 2u) << "asked past the memory bound";
+    EXPECT_GE(l.lane.stats().buffer_bytes.load(), 3u * 200u);
+    l.lane.on_block(chain[0], hash_of(chain[0]), 1, "a");
+    EXPECT_GE(l.t.cache->get_best_height(), 16u);
+    EXPECT_GT(l.net.peer_requests.size(), held) << "requests resume once the buffer drains";
+}
+
+// Only a peer advertising NODE_NETWORK serves the IBD (a pruned node does
+// not keep old blocks).
+TEST(DogeUtxoDownload, FullBlockPeerNeedsNodeNetwork)
+{
+    EXPECT_TRUE(doge::coin::full_block_peer(1));
+    EXPECT_TRUE(doge::coin::full_block_peer(1 | 4 | 8));
+    EXPECT_FALSE(doge::coin::full_block_peer(1u << 10)) << "NODE_NETWORK_LIMITED only";
+    EXPECT_FALSE(doge::coin::full_block_peer(0));
+}
+
+// ── VERIFY S6: a mutated body is the peer's fault, a stuck height is retried
+
+// [cb, t1, t2, t2] has the Merkle root of [cb, t1, t2] (CVE-2012-2459): it is
+// a bad body from that peer (bad_bodies), fetched again, never counted as a
+// strict refusal of the set.
+TEST(DogeUtxoFull, MutatedBodyIsABadBodyNotARefusal)
+{
+    const uint256 g = genesis(0x66);
+    auto chain = chain_with(g, 5);
+    const auto t1 = spend(txid_of(chain[0].m_txs[0]), 0, DOGE_SUBSIDY - 1000, 0x67);
+    const auto t2 = spend(txid_of(chain[1].m_txs[0]), 0, DOGE_SUBSIDY - 1000, 0x68);
+    Lane l(20, Mode::Full, 16);
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[4], hash_of(chain[4]), 5);
+    serve(l.lane, l.net, chain);
+    ASSERT_EQ(l.t.cache->get_best_height(), 5u);
+    chain.push_back(make_block(hash_of(chain[4]), 6, 0x66, {t1, t2}));
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    BlockType mutated = chain[5];
+    mutated.m_txs.push_back(t2);
+    ASSERT_EQ(hash_of(mutated), hash_of(chain[5])) << "same header";
+    l.net.requested.clear();
+    l.lane.on_block(mutated, hash_of(mutated), 6);
+    EXPECT_EQ(l.lane.stats().bad_bodies.load(), 1u);
+    EXPECT_EQ(l.lane.stats().strict_refusals.load(), 0u) << "a mutated body counted against the set";
+    EXPECT_EQ(l.t.cache->get_best_height(), 5u);
+    EXPECT_TRUE(contains_height(l.net.requested, 6)) << "fetched again";
+    l.lane.on_block(chain[5], hash_of(chain[5]), 6);
+    EXPECT_EQ(l.t.cache->get_best_height(), 6u);
+}
+
+// A height refused REFUSALS_MAX times is left alone for STUCK_RETRY, then
+// fetched again (not only at a restart).
+TEST(DogeUtxoFull, StuckHeightIsRetried)
+{
+    const uint256 g = genesis(0x69);
+    auto chain = chain_with(g, 5);
+    uint256 nowhere;
+    nowhere.SetHex("ee000000000000000000000000000000000000000000000000000000000069ee");
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.net.peers = {"a", "b"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[4], hash_of(chain[4]), 5, "a");
+    serve_peers(l, chain);
+    ASSERT_EQ(l.t.cache->get_best_height(), 5u);
+    chain.push_back(make_block(hash_of(chain[4]), 6, 0x69, {spend(nowhere, 0, 1000, 0x69)}));
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    for (uint32_t i = 0; i < UtxoLane::REFUSALS_MAX; ++i)
+        l.lane.on_block(chain[5], hash_of(chain[5]), 6, i % 2 ? "a" : "b");
+    ASSERT_TRUE(l.lane.stuck());
+    EXPECT_EQ(l.lane.on_block(chain[5], hash_of(chain[5]), 6, "a").fed, UtxoLane::Fed::Skipped);
+    l.net.clock += std::chrono::seconds(60);
+    l.lane.tick();
+    EXPECT_TRUE(l.lane.stuck()) << "not before STUCK_RETRY";
+    l.net.peer_requests.clear();
+    l.net.clock += UtxoLane::STUCK_RETRY;
+    l.lane.tick();
+    EXPECT_FALSE(l.lane.stuck());
+    EXPECT_EQ(l.lane.stats().stuck_retries.load(), 1u);
+    bool asked6 = false;
+    for (const auto& [p, h] : l.net.peer_requests)
+        asked6 = asked6 || h == 6;
+    EXPECT_TRUE(asked6) << "h=6 fetched again";
+}
