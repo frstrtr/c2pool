@@ -88,6 +88,13 @@ public:
         m_sent.erase(peer);
     }
 
+    /// `peer` has a getheaders of the header chain unanswered.
+    bool outstanding(const std::string& peer, Clock::time_point now)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return outstanding_locked(peer, now);
+    }
+
 private:
     static constexpr size_t MAX_PEERS = 512;
 

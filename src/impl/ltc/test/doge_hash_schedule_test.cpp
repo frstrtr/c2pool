@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -816,4 +817,171 @@ TEST(DogeHashScheduleSync, TwentyFruitlessPeersWithinThirtyMinutesDoNotCut)
     }
     EXPECT_EQ(sched.frontier_height(), 200u);
     EXPECT_EQ(sync.truncations(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// VERIFY4 and the live cut of 825f4fd8c: the sequential sync (now the
+// anchored ranges' fallback) cuts a long run only on evidence; N-a and
+// ASK_TTL pinned.
+// ---------------------------------------------------------------------------
+
+// The live cut (825f4fd8c, 18:59Z: 5,080,000 cut back to 4,110,000): one
+// fast peer carried a long honest run, then the network went slow, and 20
+// answers from the locator that did not continue the frontier plus 30
+// minutes without progress cut the whole run. Slowness is not evidence: a
+// run longer than MAX_UNPROVEN_CUT is never cut unless peers show another
+// chain inside it.
+TEST(DogeHashScheduleSync, ALongHonestRunIsNeverCutOnSlowAnswers)
+{
+    constexpr uint32_t CP = 50000;
+    const Headers chain(genesis_hash(), CP);
+    std::map<uint256, uint32_t> height_of;
+    for (uint32_t h = 0; h <= CP; ++h)
+        height_of[chain.hashes[h]] = h;
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("a", chain.slice(1, 10000), t, next), Feed::Extended);
+    t += Sync::STALL + std::chrono::seconds(1);
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("fast", t);
+    for (uint32_t h = 10000; h < 40000; h += 2000) {
+        ASSERT_EQ(sync.on_headers("fast", chain.slice(h + 1, h + 2000), t, next), Feed::Extended);
+        sync.asked("fast", t);
+    }
+    ASSERT_EQ(sched.frontier_height(), 40000u);
+    for (int i = 0; i < 80; ++i) {  // 41 simulated minutes of slow honest answers
+        t += Sync::STALL + std::chrono::seconds(1);
+        ASSERT_TRUE(sync.due(t).has_value());
+        const std::string p = "slow-" + std::to_string(i);
+        sync.asked(p, t);
+        // An honest answer from a locator entry inside the run (the same
+        // chain), not continuing the frontier.
+        uint32_t at = 0;
+        for (const auto& x : sched.locator()) {
+            auto it = height_of.find(x);
+            if (it != height_of.end() && it->second > 10000 && it->second < 39000) {
+                at = it->second;
+                break;
+            }
+        }
+        if (at == 0)
+            break;  // the run is gone: the frontier was cut below it
+        sync.on_headers(p, chain.slice(at + 1, at + 100), t, next);
+    }
+    EXPECT_EQ(sched.frontier_height(), 40000u)
+        << "a long honest run was cut on slow answers (" << sync.truncations() << " truncations)";
+    EXPECT_EQ(sync.truncations(), 0u);
+    t += Sync::STALL + std::chrono::seconds(1);
+    sync.due(t);
+    sync.asked("fast-2", t);
+    EXPECT_EQ(sync.on_headers("fast-2", chain.slice(40001, 42000), t, next), Feed::Extended);
+}
+
+// Positive evidence cuts at once: a liar extends an honest 20,000 with
+// 25,000 fakes (too long to cut on silence). Three asked peers answer the
+// locator with the real chain, which differs from the stored run at its
+// first height: cut back to 20,000 now, not after 30 minutes; the honest
+// chain continues from there.
+TEST(DogeHashScheduleSync, ThreePeersOnAnotherChainCutALiarAtOnce)
+{
+    constexpr uint32_t CP = 50000;
+    const Headers chain(genesis_hash(), CP);
+    std::map<uint256, uint32_t> height_of;
+    for (uint32_t h = 0; h <= CP; ++h)
+        height_of[chain.hashes[h]] = h;
+    std::vector<BlockHeaderType> fake;
+    uint256 prev = chain.hashes[20000];
+    for (uint32_t h = 20001; h <= 45000; ++h) {
+        BlockHeaderType b = chain.headers[h - 1];
+        b.m_previous_block = prev;
+        b.m_nonce += 1000;
+        fake.push_back(b);
+        prev = Hash(pack(b).get_span());
+    }
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("a", chain.slice(1, 20000), t, next), Feed::Extended);
+    t += Sync::STALL + std::chrono::seconds(1);
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("liar", t);
+    ASSERT_EQ(sync.on_headers("liar", fake, t, next), Feed::Extended);
+    ASSERT_EQ(sched.frontier_height(), 45000u);
+    const auto start = t;
+    for (int i = 0; i < 3; ++i) {
+        t += Sync::STALL + std::chrono::seconds(1);
+        const auto a = sync.due(t);
+        ASSERT_TRUE(a.has_value());
+        const std::string p = "honest-" + std::to_string(i);
+        sync.asked(p, t);
+        // An honest peer answers from the first locator entry it knows.
+        uint32_t at = 0;
+        for (const auto& x : a->locator) {
+            auto it = height_of.find(x);
+            if (it != height_of.end()) {
+                at = it->second;
+                break;
+            }
+        }
+        sync.on_headers(p, chain.slice(at + 1, at + 2000), t, next);
+    }
+    EXPECT_EQ(sched.frontier_height(), 20000u) << "three peers showed another chain; the liar's run stands";
+    EXPECT_LT(t - start, Sync::TRUNCATE_AFTER);
+    EXPECT_EQ(sync.truncations(), 1u);
+    t += Sync::STALL + std::chrono::seconds(1);
+    sync.due(t);
+    sync.asked("honest-x", t);
+    EXPECT_EQ(sync.on_headers("honest-x", chain.slice(20001, 22000), t, next), Feed::Extended);
+}
+
+// N-a: a cut whose state cannot be written reports it; the cut holds in
+// memory, the DB keeps the old state.
+TEST(DogeHashScheduleSync, ACutThatCannotBeWrittenReportsIt)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    {
+        HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+        sched.load();
+        ASSERT_EQ(sched.feed(chain.slice(1, 100)), Feed::Extended);
+        s.db->close();
+        EXPECT_FALSE(sched.truncate(0)) << "a failed write was not reported";
+        EXPECT_EQ(sched.frontier_height(), 0u) << "the cut holds in memory";
+        ASSERT_TRUE(s.db->open());
+    }
+    HashSchedule again(*s.db, CP, chain.hashes[CP], genesis_hash());
+    again.load();
+    EXPECT_EQ(again.frontier_height(), 100u) << "the DB keeps the state it had";
+}
+
+// V4-N7: an ask older than ASK_TTL is not fed.
+TEST(DogeHashScheduleSync, AnExpiredAskIsNotFed)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    t += Sync::ASK_TTL + std::chrono::seconds(1);
+    EXPECT_EQ(sync.on_headers("a", chain.slice(1, 100), t, next), Feed::NotNext) << "an expired ask was fed";
+    EXPECT_EQ(sched.frontier_height(), 0u);
+    sync.asked("a", t);
+    EXPECT_EQ(sync.on_headers("a", chain.slice(1, 100), t, next), Feed::Extended);
 }

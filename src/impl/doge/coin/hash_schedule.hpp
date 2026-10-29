@@ -41,6 +41,7 @@
 ///
 /// Thread safety: every public method takes the internal mutex.
 
+#include <impl/doge/coin/schedule_anchors.hpp>
 #include <impl/ltc/coin/block.hpp>
 
 #include <core/hash.hpp>
@@ -187,21 +188,39 @@ public:
     /// answer is not taken (feed: NotNext).
     std::vector<uint256> locator() const
     {
-        std::lock_guard<std::mutex> lock(m_mu);
         std::vector<uint256> out;
+        for (const auto& e : locator_entries())
+            out.push_back(e.second);
+        return out;
+    }
+
+    /// The locator with each entry's height (genesis last, at 0).
+    std::vector<std::pair<uint32_t, uint256>> locator_entries() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        std::vector<std::pair<uint32_t, uint256>> out;
         uint32_t step = 1;
         int64_t h = m_frontier_height;
         while (h > 0) {
             const uint32_t hh = static_cast<uint32_t>(h);
             const uint256 x = hh == m_frontier_height ? m_frontier_hash : stored_locked(hh).first;
             if (!x.IsNull())
-                out.push_back(x);
+                out.emplace_back(hh, x);
             if (out.size() > 10)
                 step *= 2;
             h -= step;
         }
-        out.push_back(m_genesis);
+        out.emplace_back(0u, m_genesis);
         return out;
+    }
+
+    /// The height of `h` in the current locator (nullopt: not in it).
+    std::optional<uint32_t> locator_height(const uint256& h) const
+    {
+        for (const auto& e : locator_entries())
+            if (e.second == h)
+                return e.first;
+        return std::nullopt;
     }
 
     /// Append a `headers` batch. Its first header's parent must be the
@@ -328,6 +347,229 @@ public:
         return out;
     }
 
+    // ── Anchored ranges (RangeSync, DESIGN-ANCHORS) ─────────────────────
+    // Range i = heights (STEP * i, STEP * (i + 1)]. A range is stored only
+    // whole: its STEP headers link from anchor i to anchor i + 1. The range
+    // bitmap is written in the same batch as the range's records, and the
+    // frontier is the end of the contiguous delivered prefix.
+
+    enum class RangeMode {
+        None,      // no usable anchors (absent, another chain, above the
+                   // checkpoint, or refused at run time): the sequential sync
+        Anchored,  // the anchors end at the configured checkpoint
+        Tail,      // they end below it: the ranges, then the sequential sync
+    };
+
+    enum class RangeFeed {
+        Stored,    // the range is stored
+        Complete,  // ... and it was the last: the schedule is proven
+        Done,      // already stored (or the schedule is complete): ignored
+        NotOurs,   // does not start at the range's anchor
+        Short,     // links from the anchor but has fewer than STEP headers
+        Long,      // more than STEP headers
+        Broken,    // a header does not link to the one before it
+        WrongEnd,  // STEP linked headers that end at another hash than the next anchor
+        Failed,    // the write failed: nothing stored
+        Rejected,  // the last range, but the stored prefix does not link: reset
+    };
+
+    /// Use `a` (after load()): they must start at genesis and end at or below
+    /// the configured checkpoint (at it: with its hash). Loads the range
+    /// bitmap kept for these anchors, else imports what a sequential sync
+    /// stored (a range whose STEP records link from its anchor to the next).
+    RangeMode use_anchors(const ScheduleAnchors& a)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_range_mode = RangeMode::None;
+        m_anchors.reset();
+        if (m_complete || a.empty())
+            return RangeMode::None;
+        const uint32_t acp = a.checkpoint_height();
+        if (a.hashes.front() != m_genesis) {
+            LOG_WARNING << "[EMB-DOGE] Hash schedule: the anchors start at another genesis: not used";
+            return RangeMode::None;
+        }
+        if (acp > m_cp_height || (acp == m_cp_height && a.checkpoint_hash() != m_cp_hash)) {
+            LOG_WARNING << "[EMB-DOGE] Hash schedule: the anchors end at " << acp << " "
+                        << a.checkpoint_hash().GetHex().substr(0, 16) << ", the checkpoint is " << m_cp_height
+                        << " " << m_cp_hash.GetHex().substr(0, 16) << ": not used";
+            return RangeMode::None;
+        }
+        m_anchors = a;
+        m_anchors_digest = a.digest();
+        m_range_bits.assign((a.ranges() + 7) / 8, 0);
+        bool refused = false;
+        if (!load_ranges_locked(refused)) {
+            import_ranges_locked();
+            refused = false;
+        }
+        if (refused) {
+            LOG_WARNING << "[EMB-DOGE] Hash schedule: these anchors were refused by an earlier run: sequential sync";
+            m_anchors.reset();
+            return RangeMode::None;
+        }
+        recount_locked();
+        m_range_mode = acp == m_cp_height ? RangeMode::Anchored : RangeMode::Tail;
+        // The frontier: the contiguous delivered prefix (a tail already
+        // synced past the anchors' end keeps its place).
+        const uint32_t prefix = ScheduleAnchors::STEP * m_first_undone;
+        if (!(m_range_mode == RangeMode::Tail && m_first_undone == a.ranges() && m_frontier_height > prefix)) {
+            m_frontier_height = prefix;
+            m_frontier_hash = a.hashes[m_first_undone];
+            m_cache.clear();
+        }
+        auto batch = m_db.create_batch();
+        batch.put(ranges_key(), ranges_record_locked(m_range_bits, false));
+        batch.put(state_key(), state_locked());
+        if (!batch.commit())
+            LOG_WARNING << "[EMB-DOGE] Hash schedule: the range bitmap could not be written";
+        LOG_INFO << "[EMB-DOGE] Hash schedule: " << a.ranges() << " anchored ranges to h=" << acp << ", "
+                 << m_ranges_done << " delivered, the prefix at h=" << m_frontier_height
+                 << (m_range_mode == RangeMode::Tail ? " (then the sequential sync to the checkpoint)" : "");
+        if (m_ranges_done == a.ranges() && m_range_mode == RangeMode::Anchored)
+            finish_ranges_locked();
+        return m_range_mode;
+    }
+
+    RangeMode range_mode() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_range_mode;
+    }
+    uint32_t ranges_total() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_anchors ? m_anchors->ranges() : 0;
+    }
+    uint32_t ranges_done() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_ranges_done;
+    }
+    uint32_t first_undone_range() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_first_undone;
+    }
+    bool range_done(uint32_t i) const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return range_bit_locked(i);
+    }
+
+    /// Store range i from `headers` if they are exactly it. `end`: the hash
+    /// the STEP linked headers end at (set for WrongEnd and Stored).
+    RangeFeed store_range(uint32_t i, const std::vector<ltc::coin::BlockHeaderType>& headers,
+                          uint256* end = nullptr)
+    {
+        constexpr uint32_t STEP = ScheduleAnchors::STEP;
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_complete)
+            return RangeFeed::Done;
+        if (!m_anchors || i >= m_anchors->ranges() || headers.empty()
+            || headers.front().m_previous_block != m_anchors->hashes[i])
+            return RangeFeed::NotOurs;
+        if (range_bit_locked(i))
+            return RangeFeed::Done;
+        if (headers.size() > STEP)
+            return RangeFeed::Long;
+        std::vector<uint256> hs;
+        hs.reserve(headers.size());
+        uint256 prev = m_anchors->hashes[i];
+        for (const auto& hdr : headers) {
+            if (hdr.m_previous_block != prev)
+                return RangeFeed::Broken;
+            prev = Hash(pack(hdr).get_span());
+            hs.push_back(prev);
+        }
+        if (headers.size() < STEP)
+            return RangeFeed::Short;
+        if (end)
+            *end = prev;
+        if (prev != m_anchors->hashes[i + 1])
+            return RangeFeed::WrongEnd;
+        auto batch = m_db.create_batch();
+        uint256 parent = m_anchors->hashes[i];
+        for (uint32_t k = 0; k < STEP; ++k) {
+            const uint32_t h = STEP * i + k + 1;
+            if (h < m_cp_height) {
+                std::vector<uint8_t> v(RECORD_SIZE);
+                std::memcpy(v.data(), hs[k].data(), 32);
+                std::memcpy(v.data() + 32, parent.data(), 32);
+                batch.put(height_key(h), v);
+            }
+            parent = hs[k];
+        }
+        auto bits = m_range_bits;
+        bits[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+        batch.put(ranges_key(), ranges_record_locked(bits, false));
+        // The frontier moves when the prefix grows.
+        const uint32_t old_h = m_frontier_height;
+        const uint256 old_hash = m_frontier_hash;
+        uint32_t first = m_first_undone;
+        while (first < m_anchors->ranges() && (bits[first / 8] >> (first % 8) & 1))
+            ++first;
+        if (STEP * first > m_frontier_height) {
+            m_frontier_height = STEP * first;
+            m_frontier_hash = m_anchors->hashes[first];
+        }
+        batch.put(state_key(), state_locked());
+        if (!batch.commit()) {
+            m_frontier_height = old_h;
+            m_frontier_hash = old_hash;
+            return RangeFeed::Failed;
+        }
+        m_range_bits.swap(bits);
+        m_first_undone = first;
+        ++m_ranges_done;
+        if (m_ranges_done == m_anchors->ranges() && m_range_mode == RangeMode::Anchored)
+            return finish_ranges_locked();
+        return RangeFeed::Stored;
+    }
+
+    /// The anchors are refused for the rest of this schedule (a wrong
+    /// anchor, an undeliverable range): kept in the range record, so a
+    /// restart runs the sequential sync from its frontier at once.
+    void refuse_anchors()
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (!m_anchors)
+            return;
+        m_db.put(ranges_key(), ranges_record_locked(m_range_bits, true));
+        m_range_mode = RangeMode::None;
+    }
+
+    /// The record's hash at `h` (0 < h < checkpoint), complete or not; null
+    /// when absent.
+    uint256 stored_hash(uint32_t h) const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return stored_locked(h).first;
+    }
+
+    /// The 'H' state of a schedule DB, read without a configured checkpoint
+    /// (the anchor dump).
+    struct StoredState {
+        uint32_t cp_height{0};
+        uint256  cp_hash;
+        uint256  genesis;
+        uint32_t frontier{0};
+        bool     complete{false};
+    };
+    static std::optional<StoredState> read_state(core::LevelDBStore& db)
+    {
+        std::vector<uint8_t> v;
+        if (!db.get(state_key(), v) || v.size() != STATE_SIZE || v[0] != STATE_VERSION)
+            return std::nullopt;
+        StoredState st;
+        std::memcpy(st.cp_hash.data(), v.data() + 1, 32);
+        st.cp_height = read_u32(v.data() + 33);
+        std::memcpy(st.genesis.data(), v.data() + 37, 32);
+        st.frontier = read_u32(v.data() + 69);
+        st.complete = v[105] != 0;
+        return st;
+    }
+
 private:
     static constexpr uint8_t  STATE_VERSION = 2;               // 2: height records carry the parent hash
     static constexpr size_t   STATE_SIZE = 1 + 32 + 4 + 32 + 4 + 32 + 1;
@@ -341,6 +583,134 @@ private:
     // "h" + hash, "H" + height, "tip", "height".
     static std::string runs_key() { return "schedule_runs"; }
     static constexpr uint8_t RUNS_VERSION = 1;
+    // The range bitmap: version | flags (1 = anchors refused) | anchors digest
+    // | checkpoint height | checkpoint hash | bits. Not under 'H' either.
+    static std::string ranges_key() { return "schedule_ranges"; }
+    static constexpr uint8_t RANGES_VERSION = 1;
+
+    std::vector<uint8_t> ranges_record_locked(const std::vector<uint8_t>& bits, bool refused) const
+    {
+        std::vector<uint8_t> v(1 + 1 + 32 + 4 + 32);
+        v[0] = RANGES_VERSION;
+        v[1] = refused ? 1 : 0;
+        std::memcpy(v.data() + 2, m_anchors_digest.data(), 32);
+        write_u32(v.data() + 34, m_cp_height);
+        std::memcpy(v.data() + 38, m_cp_hash.data(), 32);
+        v.insert(v.end(), bits.begin(), bits.end());
+        return v;
+    }
+
+    /// The bitmap kept for these anchors and this checkpoint; false when
+    /// absent or for others (then the import runs).
+    bool load_ranges_locked(bool& refused)
+    {
+        std::vector<uint8_t> v;
+        if (!m_db.get(ranges_key(), v) || v.size() != 70 + m_range_bits.size() || v[0] != RANGES_VERSION)
+            return false;
+        uint256 d, cp;
+        std::memcpy(d.data(), v.data() + 2, 32);
+        std::memcpy(cp.data(), v.data() + 38, 32);
+        if (d != m_anchors_digest || read_u32(v.data() + 34) != m_cp_height || cp != m_cp_hash)
+            return false;
+        refused = v[1] & 1;
+        std::copy(v.begin() + 70, v.end(), m_range_bits.begin());
+        return true;
+    }
+
+    /// One ordered scan of the height records: a range whose STEP records
+    /// are all present, link from its anchor and end at the next anchor is
+    /// delivered. The last range of an anchored schedule ends at the
+    /// checkpoint, which has no record: it is always fetched.
+    void import_ranges_locked()
+    {
+        constexpr uint32_t STEP = ScheduleAnchors::STEP;
+        std::fill(m_range_bits.begin(), m_range_bits.end(), 0);
+        const uint32_t n = m_anchors->ranges();
+        uint32_t cur = UINT32_MAX, expect = 0, imported = 0;
+        uint256 below;
+        bool ok = false;
+        m_db.for_each_prefix(state_key(), [&](const std::string& k, const std::vector<uint8_t>& v) {
+            if (k.size() != 5)
+                return true;
+            const uint32_t h = key_height(k);
+            if (h >= m_cp_height || h == 0)
+                return h < m_cp_height;
+            const uint32_t r = (h - 1) / STEP;
+            if (r >= n)
+                return false;
+            if (r != cur) {
+                cur = r;
+                expect = STEP * r + 1;
+                below = m_anchors->hashes[r];
+                ok = true;
+            }
+            if (!ok)
+                return true;
+            if (h != expect || v.size() != RECORD_SIZE || std::memcmp(v.data() + 32, below.data(), 32) != 0) {
+                ok = false;
+                return true;
+            }
+            std::memcpy(below.data(), v.data(), 32);
+            ++expect;
+            if (h == STEP * (r + 1)) {
+                if (below == m_anchors->hashes[r + 1]) {
+                    m_range_bits[r / 8] |= static_cast<uint8_t>(1u << (r % 8));
+                    ++imported;
+                }
+                ok = false;
+            }
+            return true;
+        });
+        LOG_INFO << "[EMB-DOGE] Hash schedule: imported " << imported << " of " << n
+                 << " ranges from the stored heights";
+    }
+
+    bool range_bit_locked(uint32_t i) const
+    {
+        return i / 8 < m_range_bits.size() && (m_range_bits[i / 8] >> (i % 8) & 1);
+    }
+
+    void recount_locked()
+    {
+        const uint32_t n = m_anchors ? m_anchors->ranges() : 0;
+        m_ranges_done = 0;
+        m_first_undone = n;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (range_bit_locked(i))
+                ++m_ranges_done;
+            else if (m_first_undone == n)
+                m_first_undone = i;
+        }
+    }
+
+    /// Every range of an anchored schedule is stored: prove the prefix
+    /// (heights 1 .. checkpoint - 1 link from genesis; the last range linked
+    /// the checkpoint to its parent when it was stored), then complete.
+    RangeFeed finish_ranges_locked()
+    {
+        const uint256 cp_parent = stored_locked(m_cp_height - 1).first;
+        if (cp_parent.IsNull() || !verify_prefix_locked(cp_parent)) {
+            LOG_ERROR << "[EMB-DOGE] Hash schedule: every range is stored but heights 1.." << m_cp_height - 1
+                      << " do not link: the ranges are fetched again";
+            std::fill(m_range_bits.begin(), m_range_bits.end(), 0);
+            m_db.put(ranges_key(), ranges_record_locked(m_range_bits, false));
+            recount_locked();
+            reset_locked();
+            return RangeFeed::Rejected;
+        }
+        m_complete = true;
+        m_frontier_height = m_cp_height;
+        m_frontier_hash = m_cp_hash;
+        if (!m_db.put(state_key(), state_locked())) {
+            m_complete = false;
+            m_frontier_height = ScheduleAnchors::STEP * m_first_undone;
+            return RangeFeed::Failed;
+        }
+        m_cache.clear();
+        LOG_INFO << "[EMB-DOGE] Hash schedule complete (anchored ranges): heights 0.." << m_cp_height
+                 << " link into the checkpoint " << m_cp_hash.GetHex().substr(0, 16);
+        return RangeFeed::Complete;
+    }
 
     static std::string height_key(uint32_t h)
     {
@@ -474,6 +844,14 @@ private:
     uint256  m_frontier_hash;
     bool     m_complete{false};
     mutable std::map<uint32_t, std::vector<uint256>> m_cache;  // chunk -> 65,536 hashes
+
+    // Anchored ranges (use_anchors).
+    std::optional<ScheduleAnchors> m_anchors;
+    uint256              m_anchors_digest;
+    std::vector<uint8_t> m_range_bits;
+    uint32_t             m_ranges_done{0};
+    uint32_t             m_first_undone{0};
+    RangeMode            m_range_mode{RangeMode::None};
 };
 
 /// The hash schedule's P2P sync (main_ltc's DOGE wiring drives it):
@@ -497,6 +875,14 @@ private:
 ///     traffic never count) loses its top run (truncate): a lying peer costs
 ///     its own batches, not the prefix. Again and again, back to genesis.
 ///     The run bases are persisted (a restart cuts back the same way);
+///   - a cut needs evidence of a lie for a run longer than MAX_UNPROVEN_CUT:
+///     a broken or rejected batch from the run's peer, or VOTES_TO_CUT
+///     asked peers whose answers to the locator carry, at a height inside
+///     the run, a header other than the stored one (another chain). Slow or
+///     silent peers never cut such a run (live, 825f4fd8c: 970,000 honest
+///     heights were cut on 20 slow answers and 30 minutes);
+///   - a floor (the anchored prefix, when this sync is the fallback of the
+///     anchored ranges) is never cut below;
 ///   - a peer whose run was cut, or that sent a broken or rejected batch, is
 ///     never fed nor asked again by this process.
 /// Thread safety: every public method takes the internal mutex.
@@ -508,6 +894,8 @@ public:
     static constexpr std::chrono::minutes TRUNCATE_AFTER{30};
     static constexpr std::chrono::minutes ASK_TTL{10};  // far longer than any queued answer
     static constexpr size_t HEDGE = 2;                  // new peers asked after a stall
+    static constexpr uint32_t MAX_UNPROVEN_CUT = 20000; // longest run cut on silence alone
+    static constexpr size_t VOTES_TO_CUT = 3;           // peers that show another chain inside the run
 
     explicit HashScheduleSync(HashSchedule& schedule)
         : m_s(schedule)
@@ -551,7 +939,16 @@ public:
                      << m_s.checkpoint_height() << ": no progress from " << m_peer << " in "
                      << std::chrono::duration_cast<std::chrono::seconds>(now - since).count()
                      << "s; asking other peers";
-            if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER) {
+            const uint32_t run_len = m_s.frontier_height() - (m_runs.empty() ? 0 : m_runs.back().first);
+            if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER
+                && run_len > MAX_UNPROVEN_CUT) {
+                if (!m_unproven_logged) {
+                    m_unproven_logged = true;
+                    LOG_INFO << "[EMB-DOGE] Hash schedule: no progress at h=" << m_s.frontier_height()
+                             << ", but the top run is " << run_len
+                             << " headers: not cut without a peer showing another chain";
+                }
+            } else if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER) {
                 LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_fruitless
                             << " turns answered without continuing the frontier at h="
                             << m_s.frontier_height() << ", "
@@ -563,7 +960,15 @@ public:
             m_rr += HEDGE;
             peers = HEDGE;
         }
-        return Ask{m_s.locator(), m_rr, std::string(), peers};
+        return Ask{ask_locator_locked(), m_rr, std::string(), peers};
+    }
+
+    /// The sequential sync never cuts below `h` (the anchored prefix it
+    /// continues, as the anchored ranges' fallback).
+    void set_floor(uint32_t h)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_floor = h;
     }
 
     /// The peers to ask for `a` among `ready` (the connected peers): `a.peers`
@@ -622,12 +1027,14 @@ public:
                 if (m_runs.size() >= MAX_RUNS)
                     m_runs.erase(m_runs.begin());  // the deepest base is forgotten: genesis then
                 m_runs.emplace_back(before_h, peer);
+                m_votes.clear();
+                m_unproven_logged = false;
                 save_runs_locked();
             }
             if (peer != m_peer)
                 start_turn_locked(peer, now);
             note_progress_locked(now);
-            ask_next = Ask{m_s.locator(), m_rr, m_peer, 1};
+            ask_next = Ask{ask_locator_locked(), m_rr, m_peer, 1};
             break;
         case HashSchedule::Feed::Complete:
             m_asks.clear();
@@ -646,7 +1053,7 @@ public:
                 m_rr += HEDGE;
             }
             if (cut || m_peer.empty())
-                ask_next = Ask{m_s.locator(), m_rr, std::string(), 1};
+                ask_next = Ask{ask_locator_locked(), m_rr, std::string(), 1};
             break;
         }
         case HashSchedule::Feed::NotNext:
@@ -654,10 +1061,19 @@ public:
             // entry: it is this turn's answer, and it did not continue the
             // frontier. The header chain's traffic (above the checkpoint)
             // is no answer; the ask stays outstanding.
-            if (!headers.empty() && in_locator_locked(headers.front().m_previous_block)) {
-                if (ask->second.at >= m_asked_at && !m_peer.empty())
-                    m_turn_answered = true;
-                answered_locked(ask);
+            if (!headers.empty()) {
+                if (const auto at = answer_start_locked(headers.front().m_previous_block)) {
+                    if (ask->second.at >= m_asked_at && !m_peer.empty())
+                        m_turn_answered = true;
+                    answered_locked(ask);
+                    if (shows_another_chain_locked(*at, headers) && m_votes.insert(peer).second
+                        && m_votes.size() >= VOTES_TO_CUT) {
+                        LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_votes.size()
+                                    << " peers answered with another chain above h="
+                                    << (m_runs.empty() ? 0 : m_runs.back().first);
+                        cut_top_run_locked(now);
+                    }
+                }
             }
             break;
         default:
@@ -729,10 +1145,56 @@ private:
         m_asks.erase(peer);
     }
 
-    bool in_locator_locked(const uint256& h) const
+    /// The locator asked: the schedule's, with the top run's base inserted
+    /// (by height): a peer without the run answers from its base, so its
+    /// answer covers the run's first height and shows whether it is on the
+    /// same chain; a peer with the run continues it.
+    std::vector<uint256> ask_locator_locked() const
     {
-        const auto loc = m_s.locator();
-        return std::find(loc.begin(), loc.end(), h) != loc.end();
+        auto entries = m_s.locator_entries();
+        if (!m_runs.empty() && m_runs.back().first > 0) {
+            const uint32_t base = m_runs.back().first;
+            const uint256 bh = m_s.stored_hash(base);
+            if (!bh.IsNull()) {
+                auto it = entries.begin();
+                while (it != entries.end() && it->first > base)
+                    ++it;
+                if (it == entries.end() || it->first != base)
+                    entries.insert(it, {base, bh});
+            }
+        }
+        std::vector<uint256> out;
+        out.reserve(entries.size());
+        for (const auto& e : entries)
+            out.push_back(e.second);
+        return out;
+    }
+
+    /// The height of the locator entry an answer starts at (the base of the
+    /// top run included).
+    std::optional<uint32_t> answer_start_locked(const uint256& prev) const
+    {
+        if (!m_runs.empty() && m_runs.back().first > 0 && prev == m_s.stored_hash(m_runs.back().first))
+            return m_runs.back().first;
+        return m_s.locator_height(prev);
+    }
+
+    /// An answer from the locator entry at height `at` that carries, at a
+    /// height inside the top run, another header than the stored one.
+    bool shows_another_chain_locked(uint32_t at, const std::vector<ltc::coin::BlockHeaderType>& headers) const
+    {
+        if (m_runs.empty())
+            return false;
+        const uint32_t base = m_runs.back().first, f = m_s.frontier_height();
+        for (size_t k = 0; k < headers.size(); ++k) {
+            const uint32_t h = at + 1 + static_cast<uint32_t>(k);
+            if (h <= base)
+                continue;
+            if (h > f)
+                return false;
+            return Hash(pack(headers[k]).get_span()) != m_s.stored_hash(h);
+        }
+        return false;
     }
 
     void start_turn_locked(const std::string& peer, Clock::time_point now)
@@ -755,6 +1217,15 @@ private:
             to = m_runs.back().first;
             mark_cut_locked(m_runs.back().second);
             m_runs.pop_back();
+        }
+        m_votes.clear();
+        m_unproven_logged = false;
+        if (to < m_floor)
+            to = m_floor;
+        if (to >= f) {
+            m_fruitless = 0;
+            m_progress_at = now;
+            return;  // nothing above the floor to cut
         }
         LOG_WARNING << "[EMB-DOGE] Hash schedule: the frontier at h=" << f << " is cut back to h=" << to
                     << (to == 0 ? " (genesis: no earlier run known)" : " (the top run's base)");
@@ -806,6 +1277,9 @@ private:
     uint64_t          m_truncations{0};
     AskMap            m_asks;             // peers with an outstanding getheaders
     std::set<std::string> m_cut;          // never fed nor asked again
+    std::set<std::string> m_votes;        // peers that showed another chain inside the top run
+    bool              m_unproven_logged{false};
+    uint32_t          m_floor{0};         // never cut below (the anchored prefix)
     std::vector<std::pair<uint32_t, std::string>> m_runs;  // (base height, peer), deepest first
 };
 
