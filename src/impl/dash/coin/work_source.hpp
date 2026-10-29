@@ -180,6 +180,14 @@ struct EmbeddedWorkInputs {
     // NodeCoinState::make_embedded_work_inputs from set_include_mn_special_txs.
     bool                             include_mn_special_txs{false};
 
+    // PoSe pass seams (sml_pose_fold.hpp): the member proTxHash source and
+    // the penalty oracle for the builder's own HandleQuorumCommitment pass
+    // over qc_commitments. Point into NodeCoinState (same lifetime discipline
+    // as mnstates/mempool); nullptr (default) => no ban is ever proven and
+    // the committed root is byte-unchanged.
+    const QcMembersFn*               qc_pose_members{nullptr};
+    const PoSeOracle*                qc_pose_oracle{nullptr};
+
     bool viable() const {
         return has_state && mnstates != nullptr && mempool != nullptr;
     }
@@ -319,7 +327,10 @@ inline WorkSelection select_dash_work(
                 /*admitted_asset_unlocks=*/nullptr,
                 // SUPERSET: include provider special txs (types 1-4) + fold
                 // them into merkleRootMNList (default false => byte-unchanged).
-                emb.include_mn_special_txs);
+                emb.include_mn_special_txs,
+                // PoSe pass over the real type-6 commitments (null => no ban
+                // provable => root byte-unchanged).
+                emb.qc_pose_members, emb.qc_pose_oracle);
         },
         dashd_fallback);
 }

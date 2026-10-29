@@ -81,6 +81,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -468,6 +469,8 @@ public:
         uint64_t member_cycles_skipped{0};
         uint64_t members_answered{0};     // resolver hits the fold consumed
         uint64_t members_missing{0};      // resolver misses (fold fails closed)
+        uint64_t members_from_fallback{0};// answered by the fallback source
+        uint64_t members_kicked{0};       // request-on-miss kicks issued
         uint64_t lists_retained{0};
         uint64_t quorum_roots_matched{0}; // informational: folded == committed
         uint64_t quorum_roots_differed{0};
@@ -720,6 +723,77 @@ public:
         return it->second;
     }
 
+    // ── members_for FALLBACK (design PR-B §4.2 item 1) ──────────────────
+    //
+    // The quorum engine derives member sets from the replayed list itself,
+    // which covers every quorum whose work block the replay observed and every
+    // rotated cycle whose three predecessors it produced or was seeded with.
+    // What it cannot cover is a STRADDLE: a quorum whose base or work block
+    // predates the fold cursor (the anchor, or a resumed snapshot), mined
+    // after it. The serve path already sources exactly those sets — the
+    // DIP-4-authenticated historical getmnlistd / getqrinfo member source the
+    // BLS verifier uses (quorum_member_source.hpp) — so a miss here asks it,
+    // and on ITS miss kicks its request path (request-on-miss), so the next
+    // attempt can be answered. The fold itself never waits on I/O: the caller
+    // (pose_oracle_feeder.hpp) holds a block whose sets are unresolved
+    // (unresolved_member_sets) instead of folding it into a fail-closed
+    // poison.
+    //
+    // Reward-safety is unchanged: a wrong set punishes the wrong MN, which
+    // the per-block merkleRootMNList self-check catches at the first ban it
+    // moves — exactly the posture of a wrong derived set.
+    using MembersLookupFn = std::function<std::optional<std::vector<uint256>>(
+        uint8_t llmq_type, const uint256& quorum_hash)>;
+    using MembersKickFn = std::function<void(uint8_t llmq_type,
+                                             const uint256& quorum_hash)>;
+    void set_members_fallback(MembersLookupFn lookup, MembersKickFn kick = {})
+    {
+        m_fallback = std::move(lookup);
+        m_kick     = std::move(kick);
+    }
+    bool has_members_fallback() const { return static_cast<bool>(m_fallback); }
+
+    /// Resolve WITHOUT counting or kicking — the pre-fold probe.
+    std::optional<std::vector<uint256>> peek_members(uint8_t llmq_type,
+                                                     const uint256& quorum_hash) const
+    {
+        if (auto m = m_quorum.members_for(llmq_type, quorum_hash)) return m;
+        if (m_fallback) {
+            auto f = m_fallback(llmq_type, quorum_hash);
+            if (f && !f->empty()) return f;
+        }
+        return std::nullopt;
+    }
+
+    /// The (llmqType, quorumHash) of every commitment in `block` whose PoSe
+    /// pass needs a member set this bridge cannot answer yet: non-null, at
+    /// least one member marked invalid (the only case fold_qfcommit consults
+    /// the resolver), and unresolvable. When `kick`, each miss also kicks the
+    /// fallback's request path. Empty => fold_block will not fail closed for
+    /// want of members. An unparseable payload is NOT reported here: the
+    /// fold refuses it on its own terms.
+    std::vector<std::pair<uint8_t, uint256>> unresolved_member_sets(
+        const BlockType& block, bool kick = true)
+    {
+        std::vector<std::pair<uint8_t, uint256>> out;
+        for (size_t i = 1; i < block.m_txs.size(); ++i) {
+            const auto& tx = block.m_txs[i];
+            if (tx.version != 3 || tx.type != 6) continue;
+            vendor::CFinalCommitmentTxPayload qc;
+            if (!vendor::parse_qfcommit_payload(tx.extra_payload, qc)) continue;
+            const auto& c = qc.commitment;
+            if (dash::coin::qc_commitment_is_null(c)) continue;
+            if (c.CountValidMembers() == c.validMembers.size()) continue;
+            if (peek_members(c.llmqType, c.quorumHash)) continue;
+            out.emplace_back(c.llmqType, c.quorumHash);
+            if (kick && m_kick) {
+                m_kick(c.llmqType, c.quorumHash);
+                ++m_stats.members_kicked;
+            }
+        }
+        return out;
+    }
+
     std::optional<std::vector<uint256>> members_for(uint8_t llmq_type,
                                                     const uint256& quorum_hash)
     {
@@ -727,6 +801,18 @@ public:
         if (m) {
             ++m_stats.members_answered;
             return m;
+        }
+        if (m_fallback) {
+            auto f = m_fallback(llmq_type, quorum_hash);
+            if (f && !f->empty()) {
+                ++m_stats.members_answered;
+                ++m_stats.members_from_fallback;
+                return f;
+            }
+        }
+        if (m_kick) {
+            m_kick(llmq_type, quorum_hash);
+            ++m_stats.members_kicked;
         }
         ++m_stats.members_missing;
         if (m_stats.first_member_miss.empty())
@@ -758,6 +844,91 @@ public:
     }
 
     size_t retained_lists() const { return m_lists.size(); }
+
+    // ── PRE-CURSOR STRADDLE SEEDING (design PR-B §4.2 items 1-2) ─────────
+    //
+    // A fold cursor S (the anchor, or a resumed snapshot) leaves the quorum
+    // lane blind below S: no block hash (so a commitment mined after S that
+    // names a base at or before S would fail the quorum engine's ingest), no
+    // work-block list, no snapshot. These seams take PRE-S inputs that the
+    // caller has authenticated (PoW header chain, DIP-4 historical SML) and
+    // install them; derive_at() then runs the engine's own derivation for a
+    // base at or before S. Heights after S are refused: the replay observes
+    // those itself, and a seed winning there would mask a broken fold.
+
+    /// Register block hashes for heights [from, to] that the PoW-verified
+    /// header chain holds (design: seeded AFTER the header chain loads).
+    /// Returns how many were registered.
+    size_t seed_block_hashes(uint32_t from, uint32_t to,
+                             const std::function<std::optional<uint256>(uint32_t)>& hash_at)
+    {
+        size_t n = 0;
+        for (uint64_t h = from; h <= to; ++h) {
+            auto hh = hash_at(static_cast<uint32_t>(h));
+            if (!hh || hh->IsNull()) continue;
+            m_quorum.seed_block_hash(static_cast<uint32_t>(h), *hh);
+            ++n;
+        }
+        return n;
+    }
+
+    /// Seed ONE pre-cursor work-block list (a non-rotated quorum's work block
+    /// or a rotated cycle's own H leg), plus the two chain fields the
+    /// modifier reads (hash, cbTx bestCLSignature). Pinned for the run like
+    /// seed_work_lists(). Refuses work_h > cursor.
+    bool seed_pre_cursor_work_list(
+        uint32_t work_h, const uint256& work_hash,
+        const std::optional<std::array<uint8_t, vendor::CCbTx::BLS_SIG_SIZE>>& cl,
+        std::vector<QuorumMnEntry> entries, uint32_t cursor, std::string& err)
+    {
+        if (work_h > cursor) {
+            err = "work list h=" + std::to_string(work_h)
+                + " is after the fold cursor h=" + std::to_string(cursor)
+                + " — the replay observes that height itself";
+            return false;
+        }
+        if (entries.empty()) {
+            err = "work list h=" + std::to_string(work_h) + " is empty";
+            return false;
+        }
+        // A list the replay itself retained (the cursor's own, which carries
+        // collateral outpoints and so decides score ties) is kept; the seed
+        // then only supplies the chain fields below.
+        if (!m_lists.count(work_h)) m_lists[work_h] = std::move(entries);
+        if (std::find(m_seeded_work_heights.begin(), m_seeded_work_heights.end(),
+                      work_h) == m_seeded_work_heights.end())
+            m_seeded_work_heights.push_back(work_h);
+        m_quorum.seed_block_hash(work_h, work_hash);
+        m_quorum.seed_work_block_cl(work_h, cl);
+        ++m_seeded_work_lists;
+        return true;
+    }
+
+    /// Run the quorum engine's own per-cycle derivation at a base at or
+    /// before the cursor (see QuorumReplayEngine::derive_at).
+    QuorumReplayEngine::DeriveAtResult derive_at(uint32_t base)
+    {
+        auto r = m_quorum.derive_at(base);
+        m_stats.member_cycles_derived += r.derived;
+        m_stats.member_cycles_skipped += r.skipped;
+        if (!r.reasons.empty()) m_stats.last_skip_reason = r.reasons.back();
+        return r;
+    }
+
+    bool has_work_list(uint32_t h) const { return m_lists.count(h) != 0; }
+
+    /// After a rollback/resume: forget retained (non-seeded) lists above `h`
+    /// so a dead branch's work lists can never feed a derivation; they are
+    /// re-retained as the replay re-folds those heights.
+    void forget_lists_above(uint32_t h)
+    {
+        for (auto it = m_lists.upper_bound(h); it != m_lists.end();) {
+            if (std::find(m_seeded_work_heights.begin(),
+                          m_seeded_work_heights.end(), it->first)
+                    != m_seeded_work_heights.end()) { ++it; continue; }
+            it = m_lists.erase(it);
+        }
+    }
 
     /// dashd CDeterministicMN → the member-computation view. Carries the
     /// collateral outpoint, so the upstream score TIEBREAK
@@ -807,6 +978,8 @@ private:
     DmlFoldEngine&      m_dml;
     QuorumReplayEngine& m_quorum;
     QuorumBridgeConfig  m_cfg;
+    MembersLookupFn     m_fallback;
+    MembersKickFn       m_kick;
     std::map<uint32_t, std::vector<QuorumMnEntry>> m_lists;
     std::vector<uint32_t> m_seeded_work_heights;
     Stats  m_stats;

@@ -1130,6 +1130,43 @@ public:
         return out;
     }
 
+    /// Out-of-band derivation at ONE base height at or before the cursor —
+    /// the straddle bootstrap's generalisation of derive_members_for_cycle()
+    /// to every enabled type (rotated AND non-rotated) whose dkgInterval
+    /// divides `base`. Same derive_cycles_at() the forward observe runs, no
+    /// new consensus code; it simply runs once the PRE-cursor inputs (work
+    /// lists, block hashes, CLs, snapshots) have been seeded. Idempotent.
+    struct DeriveAtResult {
+        uint32_t                 base{0};
+        size_t                   derived{0};   // per-type cycle derivations
+        size_t                   skipped{0};
+        std::vector<std::string> reasons;      // the engine's named misses
+    };
+    DeriveAtResult derive_at(uint32_t base)
+    {
+        QuorumObserveResult r;
+        r.height = base;
+        derive_cycles_at(base, r);
+        DeriveAtResult out;
+        out.base    = base;
+        out.derived = r.member_cycles_derived;
+        out.skipped = r.member_cycles_skipped;
+        out.reasons = std::move(r.member_skip_reasons);
+        return out;
+    }
+
+    /// Whether a member list is registered for (type, quorum base height).
+    bool has_members_at(uint8_t llmq_type, uint32_t base_height) const
+    {
+        return m_members.count({llmq_type, base_height}) != 0;
+    }
+
+    /// Whether `hash` is a registered (observed or seeded) block.
+    bool knows_block(const uint256& hash) const
+    {
+        return m_height_by_hash.count(hash) != 0;
+    }
+
     /// The produced (or seeded) per-cycle snapshot — the qrinfo replacement.
     std::optional<vendor::CQuorumSnapshot> snapshot_for(uint8_t type,
                                                         uint32_t cycle_base) const

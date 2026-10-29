@@ -119,6 +119,7 @@
 #include <impl/dash/coin/mn_checkpoint_dump.hpp> // self-derived MN-set checkpoint dump (--dump-mn-checkpoint)
 #include <impl/dash/coin/replay_fold_consumer.hpp> // W5: bulk lane -> W1 DML fold + per-block root check
 #include <impl/dash/coin/replay_quorum_bridge.hpp> // SEAM: W4 quorum lane <-> W1 MembersFn
+#include <impl/dash/coin/pose_oracle_feeder.hpp>   // PoSe penalty oracle: bridge fold engine kept at tip
 #include <impl/dash/coin/historical_sml.hpp> // authenticate_historical_snapshot (DIP-4 R3, straddle-seed)
 #include <impl/dash/coin/replay_payee_publish.hpp> // SEAM: W1 fold -> the PAYEE queue that gates serving
 #include <impl/dash/coin/mn_diff_store.hpp>      // dashd evodb dmn_D4/dmn_S3 port: per-block MN list diffs + snapshots
@@ -177,6 +178,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>          // PoSe oracle consultation log (one line per tip x MN)
 #include <memory>
 #include <string>
 #include <thread>       // the serve-staleness sentinel's DEDICATED poller
@@ -5224,6 +5226,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // set_members_fn onto mn_bridge_fold_engine, seeded at the SAME anchor.
     std::unique_ptr<dash::coin::replay::QuorumReplayEngine>    mn_bridge_quorum_engine;
     std::unique_ptr<dash::coin::replay::ReplayQuorumBridge>    mn_bridge_quorum_bridge;
+    // THE PoSe PENALTY ORACLE (design PR-B): drives mn_bridge_fold_engine to
+    // the live tip and keeps it there (pose_oracle_feeder.hpp). Declared AFTER
+    // the engines it references so it unwinds FIRST; its timer after it. The
+    // serve-time PoSe pass reaches it by reference (it appears after the
+    // serve path is wired; null => no oracle => fail closed).
+    std::unique_ptr<dash::coin::replay::PoseOracleFeeder>      pose_oracle;
+    std::unique_ptr<core::Timer>                               pose_oracle_timer;
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -6520,31 +6529,86 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return qc_member_source->lookup(t, qh).has_value();
                 });
 
-            // PoSe-fold gate (the #1083 landmine ENFORCED — see
-            // NodeCoinState::set_qc_pose_noop_fn and dkg_commitments.hpp
-            // qc_pose_pass_provably_noop). A REAL in-block commitment makes
-            // dashd's verifier PoSe-punish every member it marks invalid
-            // (specialtxman.cpp:159-174), which can flip that MN's validity
-            // in the SAME block's list — the template's committed
-            // merkleRootMNList is then wrong (bad-cbtx-mnmerkleroot, a
-            // silently lost block). No PoSe fold exists here, so the pre-emit
-            // gate refuses any real commitment whose PoSe pass is not
-            // PROVABLY a no-op: every listed member valid, judged against the
-            // SAME deterministic member list the BLS verifier already sourced
-            // (its size is the members.size() dashd's punish loop runs over).
-            // Member set gone from cache => nullopt => refuse (fail-closed).
-            // Null commitments are exempt (IsNull() guard, specialtxman.cpp
-            // :432) — today's all-null plans are byte-unchanged.
-            node_coin_state.set_qc_pose_noop_fn(
-                [qc_member_source](
-                    const dash::coin::vendor::CFinalCommitment& c)
-                    -> std::optional<bool> {
+            // PoSe pass (the #1083 landmine — see
+            // NodeCoinState::set_qc_pose_fold_inputs and sml_pose_fold.hpp).
+            // A REAL in-block commitment makes dashd's verifier PoSe-punish
+            // every member it marks invalid (specialtxman.cpp:159-174); a
+            // punishment that crosses the ban threshold flips that MN's
+            // validity in the SAME block's list, so the committed
+            // merkleRootMNList must carry the ban or the block is
+            // bad-cbtx-mnmerkleroot (a silently lost block). The pass runs in
+            // dashd order on the SAME deterministic member list the BLS
+            // verifier sourced — its proTxHashes, index-aligned with
+            // validMembers — and serves only when every ban decision is
+            // PROVABLE. Member set gone from cache => nullopt => refuse.
+            //
+            // PENALTY ORACLE (PR-B): the bridge DML fold engine, kept at the
+            // live tip by pose_oracle_feeder.hpp (constructed further down
+            // with the MN-CKPT bridge; reached here by reference, null until
+            // then and on any arm without it). It answers certainty bounds
+            // {lo, hi} on nPoSePenalty in the POST-state of its cursor block —
+            // i.e. as of the end of H-1, before H's decay, which the pass
+            // applies itself — and only while seeded and unpoisoned. The
+            // CURSOR fn names that block, so the pass refuses with
+            // stage=oracle-not-at-tip unless it is exactly the tip the
+            // template builds on (an oracle read can never interleave a fold:
+            // both run on this io thread). No oracle / not at tip / an MN it
+            // does not hold => the punishment refuses exactly as before; only
+            // a ban decision provable from the bounds serves. Null
+            // commitments are exempt (IsNull() guard, specialtxman.cpp:432).
+            node_coin_state.set_qc_pose_fold_inputs(
+                [qc_member_source](uint8_t llmq_type, const uint256& quorum_hash)
+                    -> std::optional<std::vector<uint256>> {
                     auto members =
-                        qc_member_source->lookup(c.llmqType, c.quorumHash);
+                        qc_member_source->lookup(llmq_type, quorum_hash);
                     if (!members) return std::nullopt;   // cannot prove
-                    return dash::coin::qc_pose_pass_provably_noop(
-                        c, members->size());
+                    std::vector<uint256> pro;
+                    pro.reserve(members->size());
+                    for (const auto& m : *members) pro.push_back(m.proTxHash);
+                    return pro;
+                },
+                /*oracle_fn=*/
+                [&pose_oracle,
+                 seen = std::make_shared<std::pair<uint32_t, std::set<uint256>>>()](
+                    const uint256& pro_tx)
+                    -> std::optional<dash::coin::PoSePenaltyView> {
+                    if (!pose_oracle) return std::nullopt;
+                    const auto cur = pose_oracle->cursor();
+                    if (!cur) return std::nullopt;
+                    const auto b =
+                        pose_oracle->oracle_bounds(cur->first, cur->second, pro_tx);
+                    // One line per (tip, MN): the pass consults the oracle on
+                    // every template evaluation of a punishing height, so a
+                    // per-call line would flood; the answer itself is what an
+                    // operator needs to audit a served ban / no-ban.
+                    if (seen->first != cur->first) {
+                        seen->first = cur->first;
+                        seen->second.clear();
+                    }
+                    if (seen->second.insert(pro_tx).second) {
+                        LOG_INFO << "[POSE-ORACLE] consulted at tip h=" << cur->first
+                                 << " protx=" << pro_tx.GetHex().substr(0, 16)
+                                 << (b ? " lo=" + std::to_string(b->lo)
+                                         + " hi=" + std::to_string(b->hi)
+                                         + " banned=" + std::to_string(b->banned)
+                                       : std::string(" not-in-list"));
+                    }
+                    if (!b) return std::nullopt;
+                    return dash::coin::PoSePenaltyView{b->lo, b->hi, b->banned};
+                },
+                /*oracle_cursor=*/
+                [&pose_oracle]()
+                    -> std::optional<std::pair<uint32_t, uint256>> {
+                    if (!pose_oracle) return std::nullopt;
+                    return pose_oracle->cursor();
                 });
+            LOG_INFO << "[QC-POSE] PoSe pass installed: real commitments serve"
+                        " when every ban decision is PROVABLE — punished member"
+                        " absent/already banned, or the penalty oracle (bridge"
+                        " DML fold engine at the template's tip) bounds it"
+                        " either side of the threshold; otherwise the height"
+                        " refuses (cause=*qc-real-pose-unfolded,"
+                        " stage=oracle-not-at-tip|penalty-unknown|penalty-inexact)";
 
             // DEMUX: route the source's HISTORICAL getmnlistd replies away from
             // the tip-SML maintainer (a base=ZERO snapshot would overwrite it).
@@ -6624,6 +6688,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                      << c.quorumHash.GetHex().substr(0, 16)
                                      << "... admitted -> work bumped, template"
                                         " re-issued (was null-served)";
+                            // The upgrade swaps a SERVING null template for
+                            // the real commitment; when that commitment's
+                            // PoSe pass cannot be proven the height is then
+                            // REFUSED until the slot is mined (incident
+                            // h=2561514). Say so at the trigger, not only in
+                            // the later [EMBED-GATE] line. Judged on this one
+                            // commitment (observability only — the gates
+                            // judge the whole plan).
+                            const auto pose =
+                                std::as_const(node_coin_state)
+                                    .qc_pose_decision({c});
+                            if (!pose.ok())
+                                LOG_WARNING
+                                    << "[QC-NULL-ARM] instant upgrade WILL BE"
+                                       " REFUSED by the PoSe pass: type="
+                                    << static_cast<int>(c.llmqType)
+                                    << " qi=" << c.quorumIndex
+                                    << " quorum=..."
+                                    << dash::coin::discriminating_hash_tail(
+                                           c.quorumHash)
+                                    << " stage="
+                                    << dash::coin::qc_pose_stage_name(pose.stage)
+                                    << (pose.pro_tx_hash.IsNull()
+                                            ? std::string()
+                                            : " protx="
+                                                  + pose.pro_tx_hash.GetHex()
+                                                        .substr(0, 12))
+                                    << " punished=" << pose.punished
+                                    << " -> the null-served height now"
+                                       " declines (cause=qc-real-pose-unfolded)"
+                                       " until the slot is mined";
                         }
                     }));
             // ── qc-plan-underivable CLOSURE: the request/response tee ──────
@@ -7612,7 +7707,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              // class as mined_commitment_index) -- on a reorg the fold's cursor
              // must roll back to the fork point before the new branch is folded
              // forward, or a stale coin would read UNSPENT.
-             &fold_live_ctl]
+             &fold_live_ctl,
+             // PoSe oracle (PR-B): constructed later in this function; a tip
+             // change drives its reorg check + fetch window immediately.
+             &pose_oracle]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -7624,6 +7722,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // relies on exactly that property and is proven live.
                 // No-op unless the lane was armed on the daemonless path.
                 if (mnl) mnl->pump();
+                if (pose_oracle) pose_oracle->on_tick();
                 // #108 QC-PREFETCH: ask for the member sets this DKG cycle
                 // will need while the tip is still ~10 blocks short of the
                 // mining window, instead of at the first qfcommit that needs
@@ -8620,32 +8719,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     mn_diff_writer = std::make_unique<rp::MnDiffWriter>(
                         *mn_diff_store, *mn_bridge_fold_engine);
 
-                    // ── RESOLVER WIRING (the fix) ────────────────────────
-                    // The parallel store engine, like the main replay-fold
-                    // path, needs the W4 quorum-member resolver or its fold
-                    // fails closed at the first punishing qfcommit (llmqType=5
-                    // @ h=2513130, only ~130 past the anchor): "no quorum-
-                    // member resolver is installed -- PoSe punishes cannot be
-                    // folded, failing closed". That cap is why the store
-                    // covered only ~130 heights and the bridge fell back to the
-                    // capped network getmnlistd probe (payee-desync).
-                    //
-                    // Mirror the main-path --replay-fold-quorums seam: a SECOND
-                    // QuorumReplayEngine seeded at the SAME full-state anchor and
-                    // a SECOND ReplayQuorumBridge whose ctor installs
-                    // set_members_fn onto mn_bridge_fold_engine. The engine
-                    // self-DERIVES rotated + non-rotated member sets from the
-                    // SAME replayed blocks the store folds (dashd
-                    // CalcQuorumMembers / GetAllQuorumMembers analog),
-                    // self-checked vs each block's committed merkleRootQuorums --
-                    // no qrinfo/P2P dependency. The fold then applies dashd
-                    // HandleQuorumCommitment PoSe-punishes (already ported in
-                    // replay_fold_engine.hpp) so the folded list re-hashes to the
-                    // committed merkleRootMNList PAST the qfcommit and the store
-                    // COVERS heights to tip. A WRONG member set -> root mismatch
-                    // -> the writer's own root self-check REFUSES the row -> store
-                    // stays empty -> callers fall through to the network path
-                    // (reward-safe by construction).
+                    // ── RESOLVER WIRING ──────────────────────────────────
+                    // A second QuorumReplayEngine + ReplayQuorumBridge whose
+                    // ctor installs set_members_fn onto mn_bridge_fold_engine.
+                    // The engine self-DERIVES rotated + non-rotated member sets
+                    // from the SAME replayed blocks the store folds (dashd
+                    // CalcQuorumMembers / GetAllQuorumMembers analog), so the
+                    // fold applies dashd HandleQuorumCommitment PoSe-punishes
+                    // and re-hashes to the committed merkleRootMNList past
+                    // every punishing qfcommit. The quorums that STRADDLE the
+                    // fold cursor (base/work block before it, mined after it)
+                    // are bootstrapped by the oracle feeder below.
                     {
                         namespace rq = dash::coin::replay;
                         rq::QuorumReplayConfig qcfg;
@@ -8664,633 +8748,269 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             std::make_unique<rq::ReplayQuorumBridge>(
                                 *mn_bridge_fold_engine,
                                 *mn_bridge_quorum_engine, bcfg);
-                        // Pre-anchor height->hash from the PoW-verified header
-                        // chain: a commitment mined just after the anchor whose
-                        // quorum BASE predates it still resolves instead of
-                        // failing the lane on an unknown base (mirrors the main
-                        // path's back = 3*576 + 64 window).
-                        size_t qseeded = 0;
-                        const uint32_t qback = 3u * 576u + 64u;
-                        for (uint32_t hh = (ckpt.height > qback
-                                                ? ckpt.height - qback : 1);
-                             hh < ckpt.height; ++hh) {
-                            auto he = header_chain->get_header_by_height(hh);
-                            if (!he) continue;
-                            mn_bridge_quorum_bridge->seed_block_hash(hh, he->hash);
-                            ++qseeded;
-                        }
-                        LOG_INFO << "[MN-DIFF-DB] store-engine quorum resolver"
-                                    " WIRED: second QuorumReplayEngine seeded at"
-                                    " anchor h=" << ckpt.height
-                                 << " (" << qseeded << " pre-anchor header"
-                                    " hashes); set_members_fn installed on the"
-                                    " parallel DML engine -- prime_at_anchor"
-                                    " deferred to the anchor snapshot seed.";
                     }
-                    mn_ckpt_lane->set_on_anchor_snapshot(
-                        [eng = mn_bridge_fold_engine.get(),
-                         w   = mn_diff_writer.get(),
-                         qbr = mn_bridge_quorum_bridge.get(),
-                         anchor = ckpt, net = net_name](
-                            const dash::coin::vendor::CSimplifiedMNList& asml,
-                            uint32_t /*anchor_h*/) {
-                            if (eng->size() != 0) return;   // already seeded
-                            // The DIP-4-authenticated anchor SML is the AUTHORITATIVE
-                            // source for EVERY field the committed merkleRootMNList
-                            // commits to (nVersion, confirmedHash, netInfo,
-                            // pubKeyOperator, keyIDVoting, isValid, nType, platform
-                            // HTTP port + node id). The payee-only checkpoint diverges
-                            // from the committed list in MORE than confirmedHash+
-                            // netInfo (proven live: a confirmedHash+netInfo-only merge
-                            // still missed the anchor root), so iterate the SML and
-                            // take those root fields from it -- the seeded set then IS
-                            // the anchor set and the root reproduces BY CONSTRUCTION.
-                            // The FORWARD-FOLD facets the SML does not carry
-                            // (collateralOutpoint, nRegisteredHeight, nLastPaidHeight,
-                            // nConsecutivePayments, nPoSeRevivedHeight, nOperatorReward,
-                            // keyIDOwner, scriptPayout/scriptOperatorPayout,
-                            // platformP2PPort, the ban HEIGHT magnitude) come from the
-                            // compiled checkpoint when it holds the MN.
-                            std::map<uint256, const dash::coin::MNState*> cp;
-                            for (const auto& [protx, mn] : anchor.entries)
-                                cp[protx] = &mn;
-                            std::vector<std::pair<uint256, rp::ReplayMNState>> seed;
-                            seed.reserve(asml.mnList.size());
-                            uint64_t trc = 0;
-                            size_t with_facets = 0, without_facets = 0;
-                            for (const auto& e : asml.mnList) {
-                                rp::ReplayMNState st;
-                                // ROOT-COMMITTING fields -- SML authoritative.
-                                st.nVersion         = e.nVersion;
-                                st.nType            = e.nType;
-                                // STORE CONTRACT: the DML engine stores the operator
-                                // key in CANONICAL BASIC encoding and re-encodes each
-                                // SML leaf per its own nVersion (to_sml_entry ->
-                                // opkey_for_leaf: legacy iff nVersion < BASIC_BLS).
-                                // The anchor SML carries the key in the scheme the
-                                // entry's nVersion dictates (legacy for the pre-v19
-                                // nVersion=1 entries), so canonicalize on ingest here
-                                // exactly as the fold_proupreg store sites do
-                                // (replay_fold_engine.hpp opkey_to_basic). Storing the
-                                // raw wire bytes lets a legacy-era leaf re-encode from
-                                // the wrong point -> merkleRootMNList diverges and the
-                                // seed self-check below UNSEEDS the engine (the
-                                // observed ff99366e != committed 2315e6df at h=2513000).
-                                st.pubKeyOperator   = dash::coin::vendor::opkey_to_basic(
-                                    e.pubKeyOperator,
-                                    e.nVersion < dash::coin::vendor::ProTxVersion::BASIC_BLS);
-                                st.keyIDVoting      = e.keyIDVoting;
-                                st.netInfo.ip       = e.netAddress;
-                                st.netInfo.port_be  = e.netPort;
-                                st.platformHTTPPort = e.platformHTTPPort;
-                                st.platformNodeID   = e.platformNodeID;
-                                if (!e.confirmedHash.IsNull())
-                                    st.UpdateConfirmedHash(e.proRegTxHash,
-                                                           e.confirmedHash);
-                                st.internalId       = trc++;   // ordering only; not root
-                                // FORWARD-FOLD facets -- checkpoint when present.
-                                auto cit = cp.find(e.proRegTxHash);
-                                if (cit != cp.end()) {
-                                    const auto& mn = *cit->second;
-                                    st.collateralOutpoint   = mn.collateralOutpoint;
-                                    st.nOperatorReward      = mn.nOperatorReward;
-                                    st.nRegisteredHeight    = static_cast<int32_t>(mn.nRegisteredHeight);
-                                    st.nLastPaidHeight      = static_cast<int32_t>(mn.nLastPaidHeight);
-                                    st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
-                                    st.nPoSeRevivedHeight   = mn.nPoSeRevivedHeight == 0
-                                        ? rp::ReplayMNState::NEVER
-                                        : static_cast<int32_t>(mn.nPoSeRevivedHeight);
-                                    st.nRevocationReason    = mn.nRevocationReason;
-                                    st.keyIDOwner           = mn.keyIDOwner;
-                                    st.scriptPayout         = mn.scriptPayout;
-                                    st.scriptOperatorPayout = mn.scriptOperatorPayout;
-                                    st.platformP2PPort      = mn.platformP2PPort;
-                                    ++with_facets;
-                                } else {
-                                    ++without_facets;
-                                }
-                                // BAN STATE: the SML isValid boolean is the root truth
-                                // (isValid == !IsBanned()); reconcile the ban HEIGHT so
-                                // IsBanned() matches it -- the checkpoint height when it
-                                // agrees, else a sentinel at the anchor.
-                                if (e.isValid) {
-                                    st.nPoSeBanHeight = rp::ReplayMNState::NEVER;
-                                } else {
-                                    int32_t cpban = rp::ReplayMNState::NEVER;
-                                    if (cit != cp.end() && cit->second->nPoSeBanHeight != 0)
-                                        cpban = static_cast<int32_t>(cit->second->nPoSeBanHeight);
-                                    st.nPoSeBanHeight = (cpban != rp::ReplayMNState::NEVER)
-                                        ? cpban
-                                        : static_cast<int32_t>(anchor.height);
-                                }
-                                seed.emplace_back(e.proRegTxHash, std::move(st));
-                            }
-                            eng->seed(std::move(seed), trc, anchor.height,
-                                      anchor.blockhash, net);
-                            // SEED SELF-CHECK: the merged state MUST reproduce the
-                            // anchor's own committed merkleRootMNList (== the DIP-4
-                            // authenticated SML's root). If not, UNSEED so the store
-                            // never populates and every caller falls through.
-                            const uint256 got  = eng->compute_sml_root();
-                            const uint256 want = asml.CalcMerkleRoot();
-                            if (got != want) {
-                                LOG_ERROR
-                                    << "[MN-DIFF-DB] FULL-STATE anchor seed SELF-CHECK"
-                                       " FAILED at h=" << anchor.height
-                                    << " (with_facets=" << with_facets
-                                    << " without_facets=" << without_facets
-                                    << "): computed root "
-                                    << got.GetHex().substr(0, 16) << " != committed "
-                                    << want.GetHex().substr(0, 16)
-                                    << " -- engine left UNSEEDED, store stays empty,"
-                                       " callers fall through to the network path"
-                                       " unchanged (reward-safe).";
-                                eng->seed({}, 0, 0, uint256::ZERO, net);   // UNSEED
-                                return;
-                            }
-                            if (!w->arm()) {
-                                LOG_WARNING
-                                    << "[MN-DIFF-DB] writer arm FAILED after a"
-                                       " root-matched full-state seed -- store"
-                                       " inert, callers unchanged.";
-                                return;
-                            }
-                            // Resolver lane: retain the anchor MN list in the
-                            // quorum bridge's window now that the fold engine is
-                            // seeded (m_dml.height()==anchor), so rotated member
-                            // derivation has its base list. Mirrors the main path.
-                            if (qbr) qbr->prime_at_anchor();
-                            LOG_INFO
-                                << "[MN-DIFF-DB] FULL-STATE anchor seed OK: "
-                                << with_facets << " MNs seeded root-fields from the"
-                                   " DIP-4 anchor SML (" << without_facets
-                                << " without a checkpoint facet); reproduces the"
-                                   " anchor's committed"
-                                   " merkleRootMNList "
-                                << want.GetHex().substr(0, 16)
-                                << " -- the parallel DML engine now folds forward"
-                                   " WITHOUT poisoning at anchor+1; the store will"
-                                   " COVER heights and the ban-state probe /"
-                                   " on-demand fold source 0-RTT/uncapped from it.";
-                        });
 
-                    // ── DIP-24 ROTATED-QUORUM STRADDLE BOOTSTRAP (getqrinfo) ─────
-                    // The store engine is seeded at the anchor with ZERO
-                    // pre-anchor quarter snapshots (only pre-anchor header
-                    // hashes, above). The FIRST rotated (DIP-24, llmqType=5)
-                    // cycle mined AFTER the anchor has a base B0 whose three
-                    // quarter predecessors (B0-C/2C/3C) all sit BELOW the
-                    // anchor, so the engine's self_contained_from is beyond it
-                    // and it cannot self-derive that cycle's member set from
-                    // the replayed post-anchor stream alone. Its first punishing
-                    // qfcommit then hits fold_qfcommit with "resolver has no
-                    // member set", the parallel fold fails closed only ~a
-                    // window past the anchor, the store caps, and the payee lane
-                    // falls to the capped network probe (the #149-class payee
-                    // desync). FIX (dashd DIP-24 CGetQuorumRotationInfo /
-                    // BuildQuorumSnapshot, the companion to the #1261 full-SML
-                    // seed): fetch getqrinfo(B0) once at cold arm, DIP-4/merkle
-                    // authenticate the returned quarter snapshots + work lists
-                    // against the committed roots, and seed them so cycle B0 is
-                    // derivable. A WRONG snapshot -> wrong members -> folded root
-                    // mismatch -> the writer's own root self-check REFUSES the
-                    // row -> store empty -> callers fall through (reward-safe by
-                    // construction; never a bad mint).
-                    struct StoreStraddleSeed {
-                        bool     armed{false};
-                        bool     sent{false};
-                        bool     landed{false};
-                        bool     exhausted{false};
-                        uint8_t  llmq_type{5};
-                        uint32_t C{0};
-                        uint32_t cycle_base{0};     // B0 = first rotated cycle base > anchor
-                        uint32_t first_need_h{0};   // hold straddle blocks at/after this height
-                        uint32_t last_send_h{0};
-                        uint256  cycle_base_hash;
-                        std::vector<std::pair<uint32_t, dash::coin::BlockType>> hold;
-                        // Pre-anchor header backfill (cold fast-start): leg (b)
-                        // of the getqrinfo snapshot auth needs the FULL headers
-                        // of the three rotated work blocks, all BELOW the anchor
-                        // and absent from the lone-anchor cold chain. One-shot
-                        // backward getheaders installs the span DOWN from the
-                        // trusted anchor before the seed can authenticate.
-                        bool     backfill_sent{false};
-                        uint256  anchor_hash;      // trusted downward-link root
-                        uint32_t anchor_height{0};
-                    };
-                    auto sseed = std::make_shared<StoreStraddleSeed>();
+                    // ── THE PoSe PENALTY ORACLE (design PR-B §4.2) ───────────
+                    // pose_oracle_feeder.hpp drives this engine to the LIVE tip
+                    // and keeps it there: every connected block (bridge bodies
+                    // AND the live tip — the lane stops feeding once it
+                    // publishes), straddle bootstrap at the seed cursor,
+                    // hold-instead-of-poison on an unresolved member set, v4
+                    // snapshot persist + resume under the data dir, reorg
+                    // rollback. Its certainty bounds are what the serve-time
+                    // PoSe pass consults (oracle_bounds; answers only AT the
+                    // template's tip). The MN diff store rides the same folds.
                     {
-                        const uint32_t anchor_h = ckpt.height;
-                        for (const auto& pv : dash::coin::enabled_llmqs(
-                                 testnet ? dash::coin::LlmqNetwork::Testnet
-                                         : dash::coin::LlmqNetwork::Mainnet)) {
-                            if (!pv.use_rotation || pv.dkg_interval == 0) continue;
-                            sseed->llmq_type   = pv.type;
-                            sseed->C           = pv.dkg_interval;
-                            sseed->cycle_base  = ((anchor_h / pv.dkg_interval) + 1u)
-                                                 * pv.dkg_interval;
-                            // Hold from the cycle base itself (conservative): the
-                            // engine derives cycle B0's members no later than the
-                            // block that carries B0's first punishing qfcommit, and
-                            // no earlier than observing B0; gating at the base is
-                            // correct for both and costs at most a few dozen buffered
-                            // blocks in the rare case the reply is slow.
-                            sseed->first_need_h = sseed->cycle_base;
-                            sseed->anchor_hash  = ckpt.blockhash;
-                            sseed->anchor_height= anchor_h;
-                            sseed->armed        = true;
-                            break;   // one rotated type on mainnet (type 5)
+                        rp::PoseOracleConfig pcfg;
+                        pcfg.network = testnet ? dash::coin::LlmqNetwork::Testnet
+                                               : dash::coin::LlmqNetwork::Mainnet;
+                        pcfg.net_name      = net_name;
+                        pcfg.anchor_height = ckpt.height;
+                        pcfg.anchor_hash   = ckpt.blockhash;
+                        pcfg.snapshot_path =
+                            (core::filesystem::config_path() / net_subdir
+                             / "dash_pose_oracle.snap").string();
+                        rp::PoseOracleIo pio;
+                        auto* hc = header_chain.get();
+                        auto* cp = coin_p2p.get();
+                        auto* mnl = mn_ckpt_lane.get();
+                        auto* w   = mn_diff_writer.get();
+                        const uint256 anchor_hash = ckpt.blockhash;
+                        pio.hash_at = [hc](uint32_t h) -> std::optional<uint256> {
+                            if (auto e = hc->get_header_by_height(h)) return e->hash;
+                            return std::nullopt;
+                        };
+                        pio.tip_height = [hc]() { return hc->height(); };
+                        pio.merkle_root_of = [hc](const uint256& b)
+                            -> std::optional<uint256> {
+                            if (auto e = hc->get_header(b))
+                                return e->header.m_merkle_root;
+                            return std::nullopt;
+                        };
+                        pio.request_block = [cp](const uint256& h) {
+                            return cp->request_block_tracked(h);
+                        };
+                        pio.send_getmnlistd = [cp](const uint256& base,
+                                                   const uint256& target) {
+                            cp->send_getmnlistd(base, target);
+                        };
+                        pio.send_getqrinfo = [cp](const uint256& cycle_hash) {
+                            // EMPTY base hashes => FULL (self-authenticating)
+                            // lists; extraShare => the H-4C leg, whose block
+                            // hash is the deepest backfill locator available.
+                            cp->send_getqrinfo({}, cycle_hash, /*extra=*/true);
+                        };
+                        pio.send_backfill_getheaders =
+                            [cp, anchor_hash](const uint256& locator, uint32_t attempt) {
+                                // getheaders replies START at locator+1; the span
+                                // is installed DOWNWARD from the trusted anchor
+                                // (prev-link + PoW), the locator itself is never
+                                // trusted. Any peer serves headers, so rotate
+                                // over the handshaked pool and prefer one that
+                                // is NOT the primary: the primary answers our
+                                // getqrinfo, and a peer processes our messages
+                                // strictly in order.
+                                std::vector<std::string> peers = cp->handshaked_peer_keys();
+                                const std::string primary = cp->primary_peer_key();
+                                std::vector<std::string> others;
+                                for (const auto& k : peers)
+                                    if (k != primary) others.push_back(k);
+                                const auto& pool = others.empty() ? peers : others;
+                                if (pool.empty()) return false;
+                                const std::string& peer = pool[attempt % pool.size()];
+                                return cp->send_getheaders_to(peer, 70230,
+                                                              {locator}, anchor_hash);
+                            };
+                        pio.install_preanchor_span =
+                            [hc, anchor_hash](
+                                const std::vector<dash::coin::BlockHeaderType>& b) {
+                                size_t reindexed = 0;
+                                const size_t n =
+                                    hc->install_preanchor_span(anchor_hash, b, &reindexed);
+                                return n + reindexed;
+                            };
+                        pio.post = [&ioc](std::function<void()> fn) {
+                            boost::asio::post(ioc, std::move(fn));
+                        };
+                        pio.now_ms = []() -> uint64_t {
+                            return static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now()
+                                        .time_since_epoch()).count());
+                        };
+                        pio.other_lane_fetching = [mnl]() {
+                            return std::strcmp(mnl->state_name(), "bridging") == 0;
+                        };
+                        // FULL-STATE ANCHOR SEED (dashd-parity): the DIP-4-
+                        // authenticated anchor SML is AUTHORITATIVE for every
+                        // field the committed merkleRootMNList commits to
+                        // (nVersion, confirmedHash, netInfo, pubKeyOperator,
+                        // keyIDVoting, isValid, nType, platform HTTP port + node
+                        // id). The payee-only checkpoint diverges from it in
+                        // MORE than confirmedHash+netInfo (proven live), so the
+                        // SML is iterated and those fields taken from it -- the
+                        // seeded set IS the anchor set and the root reproduces
+                        // BY CONSTRUCTION. The FORWARD-FOLD facets the SML does
+                        // not carry (collateralOutpoint, nRegisteredHeight,
+                        // nLastPaidHeight, nConsecutivePayments,
+                        // nPoSeRevivedHeight, nOperatorReward, keyIDOwner,
+                        // scriptPayout/scriptOperatorPayout, platformP2PPort, the
+                        // ban HEIGHT magnitude) come from the compiled checkpoint
+                        // when it holds the MN. nPoSePenalty is on neither: the
+                        // feeder seeds it UNKNOWN (certainty bounds [0, ceiling]).
+                        pio.anchor_entries =
+                            [anchor = ckpt](const dash::coin::vendor::CSimplifiedMNList& asml,
+                                            size_t& with_facets, size_t& without_facets) {
+                                std::map<uint256, const dash::coin::MNState*> cpm;
+                                for (const auto& [protx, mn] : anchor.entries)
+                                    cpm[protx] = &mn;
+                                std::vector<std::pair<uint256, rp::ReplayMNState>> seed;
+                                seed.reserve(asml.mnList.size());
+                                uint64_t trc = 0;
+                                with_facets = without_facets = 0;
+                                for (const auto& e : asml.mnList) {
+                                    rp::ReplayMNState st;
+                                    // ROOT-COMMITTING fields -- SML authoritative.
+                                    st.nVersion = e.nVersion;
+                                    st.nType    = e.nType;
+                                    // STORE CONTRACT: the DML engine stores the
+                                    // operator key in CANONICAL BASIC encoding and
+                                    // re-encodes each SML leaf per its own nVersion
+                                    // (to_sml_entry -> opkey_for_leaf); canonicalize
+                                    // on ingest exactly as the fold_proupreg store
+                                    // sites do (the observed ff99366e != committed
+                                    // 2315e6df at h=2513000 was the raw-bytes form).
+                                    st.pubKeyOperator = dash::coin::vendor::opkey_to_basic(
+                                        e.pubKeyOperator,
+                                        e.nVersion < dash::coin::vendor::ProTxVersion::BASIC_BLS);
+                                    st.keyIDVoting      = e.keyIDVoting;
+                                    st.netInfo.ip       = e.netAddress;
+                                    st.netInfo.port_be  = e.netPort;
+                                    st.platformHTTPPort = e.platformHTTPPort;
+                                    st.platformNodeID   = e.platformNodeID;
+                                    if (!e.confirmedHash.IsNull())
+                                        st.UpdateConfirmedHash(e.proRegTxHash,
+                                                               e.confirmedHash);
+                                    st.internalId = trc++;   // ordering only; not root
+                                    // FORWARD-FOLD facets -- checkpoint when present.
+                                    auto cit = cpm.find(e.proRegTxHash);
+                                    if (cit != cpm.end()) {
+                                        const auto& mn = *cit->second;
+                                        st.collateralOutpoint   = mn.collateralOutpoint;
+                                        st.nOperatorReward      = mn.nOperatorReward;
+                                        st.nRegisteredHeight    = static_cast<int32_t>(mn.nRegisteredHeight);
+                                        st.nLastPaidHeight      = static_cast<int32_t>(mn.nLastPaidHeight);
+                                        st.nConsecutivePayments = static_cast<int32_t>(mn.nConsecutivePayments);
+                                        st.nPoSeRevivedHeight   = mn.nPoSeRevivedHeight == 0
+                                            ? rp::ReplayMNState::NEVER
+                                            : static_cast<int32_t>(mn.nPoSeRevivedHeight);
+                                        st.nRevocationReason    = mn.nRevocationReason;
+                                        st.keyIDOwner           = mn.keyIDOwner;
+                                        st.scriptPayout         = mn.scriptPayout;
+                                        st.scriptOperatorPayout = mn.scriptOperatorPayout;
+                                        st.platformP2PPort      = mn.platformP2PPort;
+                                        ++with_facets;
+                                    } else {
+                                        ++without_facets;
+                                    }
+                                    // BAN STATE: the SML isValid boolean is the root
+                                    // truth (isValid == !IsBanned()); reconcile the
+                                    // ban HEIGHT so IsBanned() matches it -- the
+                                    // checkpoint height when it agrees, else a
+                                    // sentinel at the anchor.
+                                    if (e.isValid) {
+                                        st.nPoSeBanHeight = rp::ReplayMNState::NEVER;
+                                    } else {
+                                        int32_t cpban = rp::ReplayMNState::NEVER;
+                                        if (cit != cpm.end() && cit->second->nPoSeBanHeight != 0)
+                                            cpban = static_cast<int32_t>(cit->second->nPoSeBanHeight);
+                                        st.nPoSeBanHeight = (cpban != rp::ReplayMNState::NEVER)
+                                            ? cpban
+                                            : static_cast<int32_t>(anchor.height);
+                                    }
+                                    seed.emplace_back(e.proRegTxHash, std::move(st));
+                                }
+                                return seed;
+                            };
+                        // Engine state replaced wholesale (anchor seed, snapshot
+                        // resume, reorg rollback): the diff store's writer
+                        // re-grounds on it (a seed snapshot at the new cursor),
+                        // so it never writes a diff off a wrong parent.
+                        pio.on_reseeded = [w]() {
+                            if (!w->arm())
+                                LOG_WARNING << "[MN-DIFF-DB] writer arm FAILED after"
+                                               " an oracle (re)seed -- store inert,"
+                                               " callers unchanged.";
+                        };
+                        pio.on_folded = [w](uint32_t h, const uint256& bh,
+                                            const dash::coin::BlockType& blk,
+                                            const rp::FoldResult& fr) {
+                            w->on_folded(h, bh, blk, fr);
+                        };
+                        // members_for FALLBACK (design §4.2 item 1): a set the
+                        // quorum lane cannot derive (a straddle quorum, or any
+                        // cycle after a resume before the recurrence re-closes)
+                        // is answered by the serve path's DIP-4-authenticated
+                        // member source — the very set the BLS verifier and the
+                        // PoSe pass use — and a miss kicks its request path.
+                        if (qc_ms_prefetch_handle) {
+                            mn_bridge_quorum_bridge->set_members_fallback(
+                                [qcms = qc_ms_prefetch_handle](
+                                    uint8_t t, const uint256& qh)
+                                    -> std::optional<std::vector<uint256>> {
+                                    auto ms = qcms->lookup(t, qh);
+                                    if (!ms || ms->empty()) return std::nullopt;
+                                    std::vector<uint256> pro;
+                                    pro.reserve(ms->size());
+                                    for (const auto& m : *ms) {
+                                        // An unidentified member cannot be
+                                        // attributed a punishment: unsourced.
+                                        if (m.proTxHash.IsNull()) return std::nullopt;
+                                        pro.push_back(m.proTxHash);
+                                    }
+                                    return pro;
+                                },
+                                [qcms = qc_ms_prefetch_handle](
+                                    uint8_t t, const uint256& qh) {
+                                    qcms->request(t, qh);
+                                });
                         }
-                        if (sseed->armed)
-                            LOG_INFO << "[MN-DIFF-DB] store-engine rotated-quorum"
-                                        " bootstrap ARMED: getqrinfo(cycle_base h="
-                                     << sseed->cycle_base << ", type="
-                                     << int(sseed->llmq_type) << ", C=" << sseed->C
-                                     << ") will seed the pre-anchor quarter"
-                                        " snapshots+work-lists for the cycle that"
-                                        " STRADDLES anchor h=" << anchor_h
-                                     << " (its H-C/2C/3C predecessors are all below"
-                                        " the anchor; the store engine cannot"
-                                        " self-derive them).";
-                    }
-
-                    // ── PRE-ANCHOR HEADER BACKFILL INSTALLER ─────────────────
-                    // The one-shot backward getheaders issued by the qrinfo
-                    // consumer below (when the work-block headers leg (b) needs
-                    // are absent at cold fast-start) returns a `headers` batch
-                    // spanning [h-4C .. anchor]. It arrives on the new_headers
-                    // event, where the forward add_headers path orphan-rejects
-                    // every pre-anchor header (parent not held). This installer
-                    // instead links them DOWN from the trusted anchor via
-                    // HeaderChain::install_preanchor_span (X11 prev-hash chain +
-                    // PoW, reward-safe), then re-drives getqrinfo so leg (b)
-                    // authenticates promptly. Self-guarding: it no-ops unless the
-                    // backfill was issued and not yet landed, and a batch that
-                    // does not reach the anchor installs nothing.
-                    if (sseed->armed) {
+                        pose_oracle = std::make_unique<rp::PoseOracleFeeder>(
+                            *mn_bridge_fold_engine, *mn_bridge_quorum_engine,
+                            *mn_bridge_quorum_bridge, pcfg, std::move(pio));
+                        auto* po = pose_oracle.get();
+                        mn_ckpt_lane->set_on_anchor_snapshot(
+                            [po](const dash::coin::vendor::CSimplifiedMNList& asml,
+                                 uint32_t /*anchor_h*/) { po->on_anchor_sml(asml); });
+                        coin_feed_subs.push_back(
+                            coin_state.block_connected.subscribe(
+                                [po](const dash::interfaces::BlockConnected& bc) {
+                                    po->on_block(bc.block, bc.height);
+                                }));
                         coin_feed_subs.push_back(
                             coin_state.new_headers.subscribe(
-                                [sseed, hc = header_chain.get(),
-                                 cp = coin_p2p.get()](
-                                    const std::vector<dash::coin::BlockHeaderType>&
-                                        batch) {
-                                    if (!sseed->armed || sseed->landed) return;
-                                    if (!sseed->backfill_sent) return;
-                                    if (batch.empty()) return;
-                                    const size_t n = hc->install_preanchor_span(
-                                        sseed->anchor_hash, batch);
-                                    if (n == 0) return;
-                                    // Re-drive getqrinfo now that the pre-anchor
-                                    // work-block headers are held → leg (b)
-                                    // authenticates on the next reply.
-                                    if (cp && !sseed->cycle_base_hash.IsNull())
-                                        cp->send_getqrinfo(
-                                            {}, sseed->cycle_base_hash,
-                                            /*extra=*/true);
+                                [po](const std::vector<dash::coin::BlockHeaderType>& b) {
+                                    po->on_headers(b);
                                 }));
-                    }
-
-                    // The shared per-block fold drive. Both the live feed and the
-                    // held-block drain call THIS, so a block folded from the hold
-                    // buffer takes the exact same observe/fold/after_fold/writer
-                    // path as a live one.
-                    auto feed = std::make_shared<
-                        std::function<void(const dash::coin::BlockType&, uint32_t)>>();
-                    *feed = [eng = mn_bridge_fold_engine.get(),
-                             w   = mn_diff_writer.get(),
-                             qbr = mn_bridge_quorum_bridge.get(),
-                             logged = std::make_shared<bool>(false)](
-                                const dash::coin::BlockType& blk, uint32_t h) {
-                        if (eng->poisoned()) return;
-                        if (eng->size() == 0) return;   // seed deferred to the anchor fold
-                        const uint256 bh = rp::DmlFoldEngine::block_header_hash(blk);
-                        if (qbr) qbr->observe(h, bh, blk);
-                        const auto fr = eng->fold_block(blk, h);
-                        if (qbr) qbr->after_fold(h);
-                        if (fr.ok) { w->on_folded(h, bh, blk, fr); return; }
-                        if (!*logged) {
-                            *logged = true;
-                            LOG_WARNING
-                                << "[MN-DIFF-DB] cold-bridge parallel fold could"
-                                   " not extend the store at h=" << h << " ("
-                                << fr.error << "). The store keeps only heights up"
-                                   " to here; every height above REPAIR-REFUSES and"
-                                   " the probe/on-demand paths fall through to the"
-                                   " network unchanged (reward-safe).";
+                        if (coin_p2p) {
+                            coin_p2p->add_qrinfo_consumer(
+                                [po](const dash::coin::vendor::CQuorumRotationInfo& info) {
+                                    po->on_qrinfo(info);
+                                });
+                            coin_p2p->add_historical_mnlistdiff_filter(
+                                [po](const dash::coin::vendor::CSimplifiedMNListDiff& d) {
+                                    return po->on_historical_mnlistdiff(d);
+                                });
                         }
-                    };
-
-                    // The qrinfo reply consumer: authenticate the straddle-cycle
-                    // snapshots + work lists and seed them into the store engine.
-                    // Additive (coexists with the serve-path consumer at
-                    // main_dash.cpp:4446); it filters by the reply's H so only OUR
-                    // getqrinfo(B0) reply is consumed.
-                    if (coin_p2p && sseed->armed) {
-                        coin_p2p->add_qrinfo_consumer(
-                            [sseed, feed,
-                             qbr = mn_bridge_quorum_bridge.get(),
-                             hc  = header_chain.get(),
-                             cp  = coin_p2p.get(),
-                             anchor_h = ckpt.height, net = net_name](
-                                const dash::coin::vendor::CQuorumRotationInfo& info) {
-                                if (!sseed->armed || sseed->landed) return;
-                                namespace v  = dash::coin::vendor;
-                                namespace rq = dash::coin::replay;
-                                // Bind: OUR reply's mnListDiffH sits at B0-8.
-                                v::CCbTx hcb;
-                                if (info.mnListDiffH.cbTx.type != 5
-                                    || !v::parse_cbtx(
-                                           info.mnListDiffH.cbTx.extra_payload, hcb)
-                                    || hcb.nHeight < 0) return;
-                                if (static_cast<uint32_t>(hcb.nHeight)
-                                    != sseed->cycle_base - 8u) return;   // not ours
-
-                                // ── PRE-ANCHOR HEADER BACKFILL GATE ──────────
-                                // leg (b) below needs the FULL headers of the
-                                // three rotated work blocks (h-C/2C/3C), all
-                                // BELOW the fast-start anchor. At cold start the
-                                // header chain holds only the anchor, so the auth
-                                // fails closed 'block header not held'. Fetch the
-                                // pre-anchor span (once) and install it DOWN from
-                                // the trusted anchor BEFORE authenticating.
-                                {
-                                    const uint256 wh_c  =
-                                        info.mnListDiffAtHMinusC.blockHash;
-                                    const uint256 wh_2c =
-                                        info.mnListDiffAtHMinus2C.blockHash;
-                                    const uint256 wh_3c =
-                                        info.mnListDiffAtHMinus3C.blockHash;
-                                    if (!hc->has_header(wh_c)
-                                        || !hc->has_header(wh_2c)
-                                        || !hc->has_header(wh_3c)) {
-                                        // getheaders replies START at locator+1,
-                                        // so to INCLUDE the deepest work block
-                                        // (h-3C) the locator is seeded one rotated
-                                        // cycle DEEPER — the h-4C block from the
-                                        // extraShare leg. That hash is used ONLY
-                                        // as a locator; it is never trusted (a bad
-                                        // one yields no downward linkage from the
-                                        // anchor → zero installs → fail closed).
-                                        if (!sseed->backfill_sent && cp
-                                            && info.extraShare
-                                            && info.mnListDiffAtHMinus4C) {
-                                            const uint256 loc =
-                                                info.mnListDiffAtHMinus4C->blockHash;
-                                            const std::string peer =
-                                                cp->primary_peer_key();
-                                            if (!peer.empty()
-                                                && cp->send_getheaders_to(
-                                                       peer, 70230, {loc},
-                                                       sseed->anchor_hash)) {
-                                                sseed->backfill_sent = true;
-                                                LOG_INFO << "[MN-DIFF-DB] pre-anchor"
-                                                    " header BACKFILL issued:"
-                                                    " getheaders locator=h-4C "
-                                                    << loc.GetHex().substr(0, 16)
-                                                    << " stop=anchor "
-                                                    << sseed->anchor_hash.GetHex()
-                                                           .substr(0, 16)
-                                                    << " — installs the h-C/2C/3C"
-                                                       " work-block headers leg (b)"
-                                                       " needs; getqrinfo retries"
-                                                       " once the span lands.";
-                                            }
-                                        } else if (!info.extraShare
-                                                   || !info.mnListDiffAtHMinus4C) {
-                                            LOG_WARNING << "[MN-DIFF-DB] getqrinfo"
-                                                " reply lacks the h-4C extraShare"
-                                                " leg — cannot seed a locator below"
-                                                " the deepest work block; rotated"
-                                                " bootstrap fails closed"
-                                                " (reward-safe), retry.";
-                                        }
-                                        return;   // headers absent → fail closed
-                                    }
-                                }
-                                dash::coin::MerkleRootOfHashFn mroot =
-                                    [hc](const uint256& b)
-                                        -> std::optional<uint256> {
-                                        if (auto e = hc->get_header(b))
-                                            return e->header.m_merkle_root;
-                                        return std::nullopt;
-                                    };
-                                const v::CSimplifiedMNListDiff* diffs[3] = {
-                                    &info.mnListDiffAtHMinusC,
-                                    &info.mnListDiffAtHMinus2C,
-                                    &info.mnListDiffAtHMinus3C };
-                                const v::CQuorumSnapshot* snaps[3] = {
-                                    &info.quorumSnapshotAtHMinusC,
-                                    &info.quorumSnapshotAtHMinus2C,
-                                    &info.quorumSnapshotAtHMinus3C };
-                                rq::QSnapshotSeed qs;  qs.network = net;
-                                rq::WorkListSeed  wl;  wl.network = net;
-                                wl.llmq_type  = sseed->llmq_type;
-                                wl.cycle_base = sseed->cycle_base;
-                                wl.interval   = sseed->C;
-                                for (size_t i = 0; i < 3; ++i) {
-                                    const uint32_t cyc = sseed->cycle_base
-                                        - static_cast<uint32_t>(i + 1) * sseed->C;
-                                    const uint32_t work_h = cyc - 8u;
-                                    // A qrinfo cycle diff is a FULL list (applied
-                                    // onto empty); a delete means it is not.
-                                    if (!diffs[i]->deletedMNs.empty()) {
-                                        LOG_WARNING << "[MN-DIFF-DB] getqrinfo cycle"
-                                                       " diff " << i << " is not a"
-                                                       " full list (deletes) — rotated"
-                                                       " bootstrap fails closed, retry.";
-                                        return;
-                                    }
-                                    v::CCbTx cbtx;
-                                    auto sml = dash::coin::authenticate_historical_snapshot(
-                                        *diffs[i], work_h, mroot, cbtx, "MN-DIFF-DB-QR");
-                                    if (!sml) {
-                                        LOG_WARNING << "[MN-DIFF-DB] getqrinfo cycle"
-                                                       " diff " << i << " DIP-4 auth"
-                                                       " FAILED at work h=" << work_h
-                                                    << " — rotated bootstrap fails"
-                                                       " closed, retry.";
-                                        return;
-                                    }
-                                    rq::QSnapshotSeedEntry se;
-                                    se.llmq_type  = sseed->llmq_type;
-                                    se.cycle_base = cyc;
-                                    se.snapshot   = *snaps[i];
-                                    qs.entries.push_back(std::move(se));
-                                    rq::WorkListSeedEntry we;
-                                    we.work_height = work_h;
-                                    we.cycle_base  = cyc;
-                                    we.block_hash  = diffs[i]->blockHash;
-                                    if (cbtx.nVersion >= v::CCbTx::VERSION_CLSIG_AND_BALANCE
-                                        && cbtx.has_best_cl_signature()) {
-                                        we.has_cl = true;
-                                        std::memcpy(we.cl_sig.data(),
-                                                    cbtx.bestCLSignature.data(),
-                                                    we.cl_sig.size());
-                                    }
-                                    we.entries.reserve(sml->mnList.size());
-                                    for (const auto& e : sml->mnList) {
-                                        rq::QuorumMnEntry qe;
-                                        qe.proTxHash      = e.proRegTxHash;
-                                        qe.confirmedHash  = e.confirmedHash;
-                                        qe.is_valid       = e.isValid;
-                                        qe.n_type         = e.nType;
-                                        qe.has_collateral = false;
-                                        we.entries.push_back(std::move(qe));
-                                    }
-                                    wl.works.push_back(std::move(we));
-                                }
-                                qs.ok = true;  wl.ok = true;
-                                std::string e1, e2;
-                                const bool ok1 = qbr->seed_snapshots(qs, anchor_h, e1);
-                                const bool ok2 = qbr->seed_work_lists(wl, anchor_h, e2);
-                                if (!ok1 || !ok2) {
-                                    LOG_ERROR << "[MN-DIFF-DB] getqrinfo rotated"
-                                                 " bootstrap seed REJECTED (snapshots: "
-                                              << (ok1 ? "ok" : e1) << "; work-lists: "
-                                              << (ok2 ? "ok" : e2) << ") — store engine"
-                                                 " stays without the straddle snapshots;"
-                                                 " callers fall through (reward-safe).";
-                                    return;
-                                }
-                                sseed->landed = true;
-                                LOG_INFO << "[MN-DIFF-DB] getqrinfo rotated bootstrap"
-                                            " SEEDED: " << qs.entries.size()
-                                         << " pre-anchor quarter snapshots + "
-                                         << wl.works.size() << " work-lists for cycle"
-                                            " base h=" << sseed->cycle_base << " (type "
-                                         << int(sseed->llmq_type) << "); cycle "
-                                         << sseed->cycle_base << " is now derivable —"
-                                            " fold_qfcommit past the anchor resolves its"
-                                            " member set and the store extends toward"
-                                            " tip.";
-                                // ── ASSEMBLE + KEY the straddle cycle NOW ────
-                                // The seed made the cycle DERIVABLE (snapshots +
-                                // work-lists present); this drives dashd's
-                                // ComputeQuorumMembersByQuarterRotation over them
-                                // (the engine's compute_rotation_cycle, verbatim)
-                                // and registers the ordered member set keyed by
-                                // (llmqType, cycle_base+quorumIndex) — the exact
-                                // key fold_qfcommit's m_members_fn(type,quorumHash)
-                                // resolves a commitment quorumHash to. Done BEFORE
-                                // draining the held blocks so the qfcommit at
-                                // cycle_base+mining_window_start (the height the
-                                // store used to cap at) resolves its member set
-                                // and the fold folds THROUGH toward tip.
-                                {
-                                    auto dr = qbr->derive_members_for_cycle(
-                                        sseed->llmq_type, sseed->cycle_base);
-                                    if (dr.ok)
-                                        LOG_INFO << "[MN-DIFF-DB] straddle cycle"
-                                                    " base h=" << sseed->cycle_base
-                                                 << " (type "
-                                                 << int(sseed->llmq_type)
-                                                 << ") rotated member sets"
-                                                    " ASSEMBLED + KEYED: "
-                                                 << dr.member_sets << "/"
-                                                 << dr.expected_sets
-                                                 << " quorumIndex lists (quorum"
-                                                    " size " << dr.quorum_size
-                                                 << ") — fold_qfcommit resolves"
-                                                    " past the anchor.";
-                                    else
-                                        LOG_WARNING << "[MN-DIFF-DB] straddle cycle"
-                                                       " base h="
-                                                    << sseed->cycle_base
-                                                    << " (type "
-                                                    << int(sseed->llmq_type)
-                                                    << ") member assembly"
-                                                       " INCOMPLETE ("
-                                                    << dr.member_sets << "/"
-                                                    << dr.expected_sets << "): "
-                                                    << dr.skip_reason
-                                                    << " — store will cap at the"
-                                                       " cycle's first punishing"
-                                                       " qfcommit; callers fall"
-                                                       " through (reward-safe).";
-                                }
-                                if (!sseed->hold.empty()) {
-                                    for (auto& pr : sseed->hold)
-                                        (*feed)(pr.second, pr.first);
-                                    sseed->hold.clear();
-                                }
-                            });
+                        // Retries (qrinfo / getmnlistd / getheaders / refetch)
+                        // need a clock between tip changes.
+                        pose_oracle_timer =
+                            std::make_unique<core::Timer>(&ioc, /*repeat=*/true);
+                        pose_oracle_timer->start(5, [po]() { po->on_tick(); });
+                        LOG_INFO << "[POSE-ORACLE] armed: anchor h=" << ckpt.height
+                                 << ", snapshot " << pcfg.snapshot_path
+                                 << " (resumed when on our header chain)";
                     }
-
-                    // THE WRITE FEED: the SAME shared drive as the hold-buffer
-                    // drain (feed), wrapped by the rotated-quorum ORDERING GATE.
-                    // getqrinfo(B0) is a P2P round-trip that races the parallel
-                    // fold advancing from the anchor; a straddle block folded
-                    // BEFORE its snapshots are seeded fails closed and POISONS
-                    // the engine. So: issue the fetch once a body-serving peer is
-                    // certainly up, HOLD straddle blocks until the seed lands
-                    // (then drain them in order), and — reward-safe fallback — if
-                    // the reply never arrives within a bounded hold, cap the store
-                    // below the straddle and let callers fall through unchanged
-                    // rather than poison.
-                    mn_ckpt_lane->set_on_block_applied(
-                        [sseed, feed, cp = coin_p2p.get(),
-                         hc = header_chain.get()](
-                            const dash::coin::BlockType& blk, uint32_t h) {
-                            // Lazy one-shot getqrinfo(B0): fire on the first folded
-                            // block, when headers are synced and a body-serving
-                            // peer exists.
-                            if (sseed->armed && !sseed->sent) {
-                                if (auto he = hc->get_header_by_height(
-                                        sseed->cycle_base)) {
-                                    sseed->cycle_base_hash = he->hash;
-                                    // extra=true: the reply must carry the h-4C
-                                    // leg, whose blockHash seeds a getheaders
-                                    // locator BELOW the deepest work block so the
-                                    // pre-anchor backfill span includes h-3C.
-                                    if (cp) cp->send_getqrinfo(
-                                        {}, he->hash, /*extra=*/true);
-                                    sseed->sent        = true;
-                                    sseed->last_send_h = h;
-                                    LOG_INFO << "[MN-DIFF-DB] getqrinfo issued for"
-                                                " straddling cycle base h="
-                                             << sseed->cycle_base
-                                             << " — bootstrap the store engine's"
-                                                " rotated member derivation across"
-                                                " the anchor.";
-                                }
-                            }
-                            // Seed landed while blocks were held -> drain first.
-                            if (sseed->landed && !sseed->hold.empty()) {
-                                for (auto& pr : sseed->hold)
-                                    (*feed)(pr.second, pr.first);
-                                sseed->hold.clear();
-                            }
-                            // Hold blocks that would ask the resolver for the
-                            // straddling cycle before its snapshots are seeded.
-                            if (sseed->armed && !sseed->landed
-                                && h >= sseed->first_need_h) {
-                                if (sseed->exhausted) return;   // gave up: never fold unseeded
-                                constexpr size_t kHoldCap = 2000;
-                                if (sseed->hold.size() < kHoldCap) {
-                                    sseed->hold.emplace_back(h, blk);
-                                    if (sseed->sent
-                                        && h >= sseed->last_send_h + 24u) {
-                                        if (auto he = hc->get_header_by_height(
-                                                sseed->cycle_base)) {
-                                            if (cp) cp->send_getqrinfo(
-                                                {}, he->hash, /*extra=*/true);
-                                            sseed->last_send_h = h;
-                                        }
-                                    }
-                                } else {
-                                    sseed->exhausted = true;
-                                    sseed->hold.clear();
-                                    LOG_WARNING
-                                        << "[MN-DIFF-DB] getqrinfo straddle seed did"
-                                           " not arrive before the hold cap at h="
-                                        << h << "; store caps below the straddling"
-                                           " cycle and callers fall through to the"
-                                           " network path (reward-safe, no bad mint).";
-                                }
-                                return;   // do not fold a straddle block unseeded
-                            }
-                            (*feed)(blk, h);
-                        });
 
                     // ── DASHD-CUT: self-derived MN-set checkpoint DUMP off the
                     // MN-CKPT BRIDGE (task #154, the #1 dashd-cut pacing item).
@@ -11364,6 +11084,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
     if (replay_timer) replay_timer->stop();
     if (replay_lane) replay_lane->flush();
+
+    // PoSe oracle: write the folded state so the next start RESUMES here
+    // instead of re-folding from the last periodic snapshot.
+    if (pose_oracle_timer) pose_oracle_timer->stop();
+    if (pose_oracle && pose_oracle->persist_now())
+        LOG_INFO << "[POSE-ORACLE] snapshot written at shutdown: "
+                 << pose_oracle->status_line();
 
     // Save stats on shutdown (main_ltc.cpp:7457 parity): flush the final
     // stat_log so the last window survives the restart. mi still valid here —
