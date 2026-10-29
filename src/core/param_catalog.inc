@@ -646,6 +646,12 @@ C2P_PARAM("alert_relay.retry_max", Global, INT64, RESTART, C_DASH, LIT, "60", NO
 C2P_PARAM("alert_relay.serve_stall_after", Global, INT64, RESTART, C_DASH, LIT, "300", NONE, "origin: no work handed to hashing miners this long => WORK_STALLED, then WORK_RESUMED (0=off)")
   C2P_ALIAS("alert_relay.serve_stall_after", BIN_DASH, "--alert-relay-serve-stall-after", VALUE)
 
+C2P_PARAM("alert_relay.hashrate_min", Global, STRING, RESTART, C_DASH, LIT, "0", NONE, "origin: page HASHRATE LOW when a worker's credited rate stays below RATE (e.g. 1.35T, 1350G; 0=off), HASHRATE OK on recovery")
+  C2P_ALIAS("alert_relay.hashrate_min", BIN_DASH, "--alert-relay-hashrate-min", VALUE)
+
+C2P_PARAM("alert_relay.hashrate_window", Global, INT64, RESTART, C_DASH, LIT, "900", NONE, "origin: seconds of credited work per HASHRATE LOW/OK evaluation (120-86400)")
+  C2P_ALIAS("alert_relay.hashrate_window", BIN_DASH, "--alert-relay-hashrate-window", VALUE)
+
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
   C2P_ALIAS("embedded.tx_inject_hex", BIN_DASH, "--embedded-tx-inject-hex", VALUE)
 
