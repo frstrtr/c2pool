@@ -317,6 +317,23 @@ public:
         return unknown_job_total_;
     }
 
+    /// Work of the accepted shares since connect: the sum of the difficulty
+    /// each one is credited at (its job's issued difficulty, the value the
+    /// session's hashrate tracker records); x 2^32 = hashes. The DASH alert
+    /// relay measures a worker's hashrate from it.
+    void add_accepted_work(double difficulty)
+    {
+        if (!(difficulty > 0.0)) return;
+        std::lock_guard<std::mutex> lk(mutex_);
+        accepted_work_total_ += difficulty;
+    }
+
+    double accepted_work_total() const
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return accepted_work_total_;
+    }
+
 private:
     static int64_t slot_of(std::chrono::steady_clock::time_point t)
     {
@@ -333,6 +350,7 @@ private:
     mutable std::mutex mutex_;
     std::array<Bucket, kBuckets> buckets_{};
     uint64_t unknown_job_total_{0};
+    double accepted_work_total_{0.0};
 };
 
 /// Per-connection metadata maintained by the work source for dashboard
