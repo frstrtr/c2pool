@@ -16,9 +16,11 @@
 //     continues is dropped only by discard().
 //   - CompletionProvesTheStoredPrefix: a stored prefix that does not link
 //     (a corrupted record) is never persisted as complete.
-//   - HashScheduleSync: only the peer asked feeds the schedule; a stall is
-//     no frontier progress (asking the same peer again does not reset it);
-//     peers in a row that do not continue the frontier discard it.
+//   - HashScheduleSync: a batch continuing the frontier extends it from any
+//     peer (a replaced peer's late answer too); a stall is no frontier
+//     progress (asking the same peer again does not reset it); silence never
+//     cuts the frontier; a liar's batches are cut back to the frontier
+//     before it, not to genesis.
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
 
@@ -131,7 +133,7 @@ TEST(DogeHashSchedule, LinksIntoCheckpointOrIsRejected)
         sched.load();
         EXPECT_EQ(sched.feed(broken.slice(1, CP)), Feed::Broken);
         EXPECT_FALSE(sched.complete());
-        EXPECT_EQ(sched.frontier_height(), 0u) << "discarded back to genesis";
+        EXPECT_EQ(sched.frontier_height(), 0u) << "nothing of the broken batch stored";
         for (uint32_t h = 1; h < CP; ++h)
             ASSERT_TRUE(sched.hash_at(h).IsNull());
     }
@@ -145,9 +147,12 @@ TEST(DogeHashSchedule, LinksIntoCheckpointOrIsRejected)
         EXPECT_EQ(sched.feed(other.slice(1, 200)), Feed::Extended);
         EXPECT_EQ(sched.feed(other.slice(201, CP)), Feed::Rejected);
         EXPECT_FALSE(sched.complete());
-        EXPECT_EQ(sched.frontier_height(), 0u);
+        EXPECT_EQ(sched.frontier_height(), 200u) << "the rejected batch dropped, the prefix kept";
         EXPECT_TRUE(sched.hash_at(150).IsNull());
-        // The honest chain afterwards, from genesis.
+        // HashScheduleSync cuts back what the sending peer stored (here: all
+        // of it); the honest chain afterwards, from genesis.
+        sched.truncate(0);
+        EXPECT_EQ(sched.frontier_height(), 0u);
         EXPECT_EQ(sched.feed(chain.slice(1, CP)), Feed::Complete);
         EXPECT_EQ(sched.hash_at(150), chain.hashes[150]);
     }
@@ -279,10 +284,10 @@ Clock::time_point t0() { return Clock::time_point{} + std::chrono::hours(1); }
 
 } // namespace
 
-// Only the peer the schedule asked feeds it; another peer's continuing batch
-// is the header chain's (NotNext), so a peer we did not ask cannot steer the
-// schedule.
-TEST(DogeHashScheduleSync, OnlyTheAskedPeerFeedsTheSchedule)
+// A batch that continues the frontier extends it, whoever sends it (feed()'s
+// rule keeps it safe); the next batch is asked from that peer. A batch that
+// does not continue it is the header chain's.
+TEST(DogeHashScheduleSync, AnyPeerContinuingTheFrontierExtends)
 {
     constexpr uint32_t CP = 300;
     const Headers chain(genesis_hash(), CP);
@@ -295,13 +300,150 @@ TEST(DogeHashScheduleSync, OnlyTheAskedPeerFeedsTheSchedule)
     EXPECT_TRUE(a->peer.empty()) << "a new peer, round robin";
     sync.asked("peer-a", t0());
     std::optional<Sync::Ask> next;
-    EXPECT_EQ(sync.on_headers("peer-b", chain.slice(1, 100), t0(), next), Feed::NotNext);
-    EXPECT_FALSE(next.has_value());
-    EXPECT_EQ(sched.frontier_height(), 0u);
-    EXPECT_EQ(sync.on_headers("peer-a", chain.slice(1, 100), t0(), next), Feed::Extended);
+    EXPECT_EQ(sync.on_headers("peer-b", chain.slice(1, 100), t0(), next), Feed::Extended);
     ASSERT_TRUE(next.has_value());
-    EXPECT_EQ(next->peer, "peer-a") << "the next batch from the same peer";
+    EXPECT_EQ(next->peer, "peer-b") << "the next batch from the peer that delivered";
     EXPECT_EQ(next->locator.front(), chain.hashes[100]);
+    EXPECT_EQ(sync.on_headers("peer-c", chain.slice(50, 150), t0(), next), Feed::NotNext);
+    EXPECT_EQ(sched.frontier_height(), 100u);
+}
+
+// The live stall (VERIFY2 M3): peer A's answer for 2001.. arrives after its
+// 30 s and after A was replaced (the header chain's getheaders traffic queued
+// it). It continues the frontier: taken. Before, it was dropped as "not the
+// asked peer" and A counted as fruitless.
+TEST(DogeHashScheduleSync, LateValidContinuationFromAReplacedPeerIsTaken)
+{
+    constexpr uint32_t CP = 5000;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("peer-a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("peer-a", chain.slice(1, 2000), t, next), Feed::Extended);
+    sync.asked("peer-a", t);   // asked for 2001..
+    t += Sync::STALL + std::chrono::seconds(1);
+    ASSERT_TRUE(sync.due(t).has_value()) << "A replaced";
+    sync.asked("peer-b", t);
+    EXPECT_EQ(sync.on_headers("peer-a", chain.slice(2001, 4000), t, next), Feed::Extended)
+        << "a late answer that continues the frontier was dropped";
+    EXPECT_EQ(sched.frontier_height(), 4000u);
+}
+
+// Silence is not evidence of a fake frontier: peers that never answer, for
+// any number of stalls and any time, never cut the frontier back. Before, 20
+// silent peers in a row discarded it to genesis.
+TEST(DogeHashScheduleSync, SilentPeersNeverDropTheFrontier)
+{
+    constexpr uint32_t CP = 3000;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("peer-a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("peer-a", chain.slice(1, 2000), t, next), Feed::Extended);
+    for (int i = 0; i < 60; ++i) {
+        t += Sync::STALL + std::chrono::seconds(1);
+        ASSERT_TRUE(sync.due(t).has_value());
+        sync.asked("silent-" + std::to_string(i), t);
+    }
+    EXPECT_EQ(sync.stalls(), 60u);
+    EXPECT_EQ(sched.frontier_height(), 2000u) << "silence cut the frontier back";
+    EXPECT_EQ(sync.truncations(), 0u);
+}
+
+// A liar extends an honest 200-prefix with 60 headers of its own; no honest
+// peer continues that (they answer, from deeper). After FRUITLESS_AFTER such
+// answers and TRUNCATE_AFTER without progress the frontier is cut back to
+// where it stood when the liar was asked (200), not to genesis.
+TEST(DogeHashScheduleSync, LiarIsCutBackToTheFrontierBeforeIt)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("honest", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("honest", chain.slice(1, 200), t, next), Feed::Extended);
+    t += Sync::STALL + std::chrono::seconds(1);
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("liar", t);
+    // The liar's 60 headers on the real 200.
+    std::vector<BlockHeaderType> fake;
+    uint256 prev = chain.hashes[200];
+    for (uint32_t h = 201; h <= 260; ++h) {
+        BlockHeaderType b = chain.headers[h - 1];
+        b.m_previous_block = prev;
+        b.m_nonce += 1000;
+        fake.push_back(b);
+        prev = Hash(pack(b).get_span());
+    }
+    ASSERT_EQ(sync.on_headers("liar", fake, t, next), Feed::Extended);
+    ASSERT_EQ(sched.frontier_height(), 260u);
+    // Honest peers answer (not from the fake frontier, which they lack).
+    uint32_t i = 0;
+    while (sched.frontier_height() == 260u && i < 200) {
+        t += Sync::STALL + std::chrono::seconds(1);
+        ASSERT_TRUE(sync.due(t).has_value());
+        const std::string p = "honest-" + std::to_string(i++);
+        sync.asked(p, t);
+        EXPECT_EQ(sync.on_headers(p, chain.slice(1, 100), t, next), Feed::NotNext);
+    }
+    EXPECT_EQ(sched.frontier_height(), 200u) << "cut back to before the liar, not to genesis";
+    EXPECT_GE(i, Sync::FRUITLESS_AFTER);
+    EXPECT_GE(t - t0(), Sync::TRUNCATE_AFTER);
+    EXPECT_EQ(sync.truncations(), 1u);
+    t += Sync::STALL + std::chrono::seconds(1);
+    sync.due(t);
+    sync.asked("honest-x", t);
+    EXPECT_EQ(sync.on_headers("honest-x", chain.slice(201, CP), t, next), Feed::Complete);
+}
+
+// A batch that breaks a link: the batch is dropped and what its sender
+// stored on top is cut back; the prefix before that peer stays. A broken
+// batch from a peer whose run others continued drops only the batch.
+TEST(DogeHashScheduleSync, BrokenBatchCutsBackOnlyItsSender)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("a", chain.slice(1, 100), t, next), Feed::Extended);
+    t += Sync::STALL + std::chrono::seconds(1);
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("b", t);
+    ASSERT_EQ(sync.on_headers("b", chain.slice(101, 150), t, next), Feed::Extended);
+    auto broken = chain.slice(151, 200);
+    broken[10].m_previous_block = chain.hashes[3];
+    EXPECT_EQ(sync.on_headers("b", broken, t, next), Feed::Broken);
+    EXPECT_EQ(sched.frontier_height(), 100u) << "b's batches go, a's stay";
+    ASSERT_TRUE(next.has_value());
+    EXPECT_TRUE(next->peer.empty()) << "another peer, now";
+    sync.asked("c", t);
+    ASSERT_EQ(sync.on_headers("c", chain.slice(101, 150), t, next), Feed::Extended);
+    auto broken_a = chain.slice(151, 200);
+    broken_a[5].m_previous_block = chain.hashes[7];
+    EXPECT_EQ(sync.on_headers("a", broken_a, t, next), Feed::Broken);
+    EXPECT_EQ(sched.frontier_height(), 150u) << "c continued a's run: only a's batch goes";
+    EXPECT_EQ(sync.truncations(), 1u);
 }
 
 // A stall is no frontier progress for STALL; asking the same peer again
@@ -336,33 +478,4 @@ TEST(DogeHashScheduleSync, StallIsMeasuredByFrontierProgress)
     EXPECT_EQ(sched.frontier_height(), 2000u) << "nothing lost";
     sync.asked("peer-b", later);
     EXPECT_EQ(sync.on_headers("peer-b", chain.slice(2001, CP), later, next), Feed::Complete);
-}
-
-// A frontier that DISCARD_AFTER peers in a row do not continue (a chain a
-// peer made up): discarded, the sync starts again from genesis.
-TEST(DogeHashScheduleSync, FruitlessPeersDiscardTheFrontier)
-{
-    constexpr uint32_t CP = 300;
-    const Headers chain(genesis_hash(), CP);
-    const Headers stale(genesis_hash(), 60, /*salt=*/9);
-    TempStore s;
-    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
-    sched.load();
-    Sync sync(sched);
-    auto t = t0();
-    ASSERT_TRUE(sync.due(t).has_value());
-    sync.asked("liar", t);
-    std::optional<Sync::Ask> next;
-    ASSERT_EQ(sync.on_headers("liar", stale.slice(1, 60), t, next), Feed::Extended);
-    for (uint32_t i = 0; i < Sync::DISCARD_AFTER; ++i) {
-        t += Sync::STALL + std::chrono::seconds(1);
-        ASSERT_TRUE(sync.due(t).has_value());
-        sync.asked("honest-" + std::to_string(i), t);
-    }
-    EXPECT_EQ(sched.frontier_height(), 60u) << "not before DISCARD_AFTER fruitless peers";
-    t += Sync::STALL + std::chrono::seconds(1);
-    ASSERT_TRUE(sync.due(t).has_value());
-    EXPECT_EQ(sched.frontier_height(), 0u) << "discarded";
-    sync.asked("honest-x", t);
-    EXPECT_EQ(sync.on_headers("honest-x", chain.slice(1, CP), t, next), Feed::Complete);
 }

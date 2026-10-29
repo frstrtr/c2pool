@@ -30,7 +30,9 @@
 ///     the checkpoint header's parent. A prefix that does not link (a disk
 ///     fault, a bug) is discarded, never persisted as complete.
 /// A batch that breaks a link, or reaches the checkpoint height with another
-/// hash, discards the schedule (re-synced from genesis, from another peer).
+/// hash, is dropped (nothing of it is stored); HashScheduleSync then cuts
+/// the frontier back to where it stood before the sending peer was asked
+/// (truncate), so a peer's bad batches cost those batches, not the prefix.
 /// The body stream proves the links again: a body whose parent is not the
 /// UTXO set's best block is refused at the connect point (ParentMismatch).
 ///
@@ -53,6 +55,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -66,9 +69,9 @@ public:
         Extended,  // appended; the checkpoint height is not reached yet
         Complete,  // the chain linked into the checkpoint: the schedule is proven
         NotNext,   // the batch does not continue the frontier (another request's answer): ignored
-        Broken,    // a header does not link to the one before it: the schedule is discarded
-        Rejected,  // the checkpoint height carries another hash, or the stored prefix
-                   // does not link: the schedule is discarded
+        Broken,    // a header does not link to the one before it: the batch is dropped
+        Rejected,  // the checkpoint height carries another hash: the batch is dropped;
+                   // the stored prefix does not link: the schedule is discarded
         Done,      // the schedule was already complete: ignored
     };
 
@@ -219,8 +222,7 @@ public:
         for (const auto& hdr : headers) {
             if (hdr.m_previous_block != prev) {
                 LOG_WARNING << "[EMB-DOGE] Hash schedule: header at h=" << h + 1
-                            << " does not link to h=" << h << ": discarded";
-                reset_locked();
+                            << " does not link to h=" << h << ": batch dropped";
                 return Feed::Broken;
             }
             const uint256 hh = Hash(pack(hdr).get_span());
@@ -228,8 +230,7 @@ public:
                 if (hh != m_cp_hash) {
                     LOG_WARNING << "[EMB-DOGE] Hash schedule: h=" << h + 1 << " is "
                                 << hh.GetHex().substr(0, 16) << ", the checkpoint is "
-                                << m_cp_hash.GetHex().substr(0, 16) << ": discarded";
-                    reset_locked();
+                                << m_cp_hash.GetHex().substr(0, 16) << ": batch dropped";
                     return Feed::Rejected;
                 }
                 // Store up to the checkpoint's parent, then prove the whole
@@ -274,6 +275,25 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mu);
         reset_locked();
+    }
+
+    /// Cut the frontier back to `height` (below the frontier, not complete):
+    /// what a peer stored above it is dropped. Back to genesis when the
+    /// record at `height` is missing.
+    void truncate(uint32_t height)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_complete || height >= m_frontier_height)
+            return;
+        const uint256 x = stored_locked(height).first;
+        if (x.IsNull()) {
+            reset_locked();
+            return;
+        }
+        m_frontier_height = height;
+        m_frontier_hash = x;
+        m_cache.clear();
+        m_db.put(state_key(), state_locked());
     }
 
 private:
@@ -422,26 +442,35 @@ private:
 
 /// The hash schedule's P2P sync (main_ltc's DOGE wiring drives it):
 ///   - getheaders to ONE peer at a time (a 3-4 GB AuxPoW header sync must
-///     not be asked of every peer);
-///   - only that peer's answers are fed to the schedule; any other batch
-///     (the header chain's own getheaders answers, a peer we did not ask)
-///     is the header chain's;
-///   - a stall is no frontier progress for STALL since the later of the
-///     last progress and the moment this peer was asked; asking the same
-///     peer for the next batch does not restart the clock. A stalled peer
-///     (behind, pruned, silent, or answering from deeper because it lacks
-///     the frontier) is replaced by the next one;
-///   - DISCARD_AFTER peers in a row that make no progress from the frontier
-///     mean no honest peer continues it (a peer fed a chain of its own):
-///     the schedule is discarded and synced again from genesis.
+///     not be asked of every peer); the first peer is picked at random;
+///   - every batch that continues the frontier is taken, whoever sends it (a
+///     replaced peer's late answer included: under the header chain's own
+///     getheaders traffic an answer can take longer than STALL); safety is
+///     feed()'s - a batch extends only at the frontier, and no chain but the
+///     checkpoint's completes. Any other batch is the header chain's;
+///   - a stall is no frontier progress for STALL since the later of the last
+///     progress and the moment this peer was asked; asking the same peer
+///     again does not restart the clock. A stalled peer is replaced;
+///   - the frontier is a stack of runs: consecutive extensions by one peer.
+///     A batch that breaks or reaches the checkpoint with another hash cuts
+///     back its sender's run when that run is the top one (nobody continued
+///     it); a frontier no peer continues for long (FRUITLESS_AFTER peers that
+///     answered but did not continue it, and TRUNCATE_AFTER without progress;
+///     silence never counts) loses its top run (truncate): a lying peer costs
+///     its own batches, not the prefix. Again and again, back to genesis.
 /// Thread safety: every public method takes the internal mutex.
 class HashScheduleSync {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::chrono::seconds STALL{30};
-    static constexpr uint32_t DISCARD_AFTER = 20;
+    static constexpr uint32_t FRUITLESS_AFTER = 20;
+    static constexpr std::chrono::minutes TRUNCATE_AFTER{30};
 
-    explicit HashScheduleSync(HashSchedule& schedule) : m_s(schedule) {}
+    explicit HashScheduleSync(HashSchedule& schedule)
+        : m_s(schedule)
+        , m_rr(static_cast<size_t>(std::random_device{}()))
+    {
+    }
 
     /// A getheaders to send: `peer_idx` picks a peer round robin when
     /// `peer` is empty (a new peer), else `peer` is asked again.
@@ -458,25 +487,30 @@ public:
         std::lock_guard<std::mutex> lock(m_mu);
         if (m_s.complete())
             return std::nullopt;
+        if (m_progress_at == Clock::time_point{})
+            m_progress_at = now;  // the clock starts with the sync
         note_progress_locked(now);
         if (!m_peer.empty()) {
             const auto since = std::max(m_progress_at, m_asked_at);
             if (now - since < STALL)
                 return std::nullopt;
             ++m_stalls;
-            if (m_s.frontier_height() == m_height_when_asked)
-                ++m_fruitless;
+            if (m_turn_answered && m_s.frontier_height() == m_height_when_asked)
+                ++m_fruitless;  // it answered, and not with the frontier's continuation
             LOG_INFO << "[EMB-DOGE] Hash schedule at h=" << m_s.frontier_height() << "/"
                      << m_s.checkpoint_height() << ": no progress from " << m_peer << " in "
                      << std::chrono::duration_cast<std::chrono::seconds>(now - since).count()
                      << "s; asking another peer";
-            if (m_fruitless >= DISCARD_AFTER) {
+            if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER) {
+                const uint32_t to = m_runs.empty() ? 0 : m_runs.back().first;
                 LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_fruitless
-                            << " peers in a row did not continue the frontier at h="
-                            << m_s.frontier_height() << ": discarded, syncing again from genesis";
-                m_s.discard();
-                m_fruitless = 0;
-                m_progress_height = 0;
+                            << " peers answered without continuing the frontier at h="
+                            << m_s.frontier_height() << " for "
+                            << std::chrono::duration_cast<std::chrono::minutes>(now - m_progress_at).count()
+                            << " min: cut back to h=" << to << " (before the peer that extended it)";
+                if (!m_runs.empty())
+                    m_runs.pop_back();
+                truncate_locked(to, now);
             }
             m_peer.clear();
             ++m_rr;
@@ -493,16 +527,14 @@ public:
             m_peer.clear();
             return;
         }
-        if (peer != m_peer) {
-            m_peer = peer;
-            m_asked_at = now;
-            m_height_when_asked = m_s.frontier_height();
-        }
+        if (peer != m_peer)
+            start_turn_locked(peer, now);
     }
 
-    /// A headers batch from `peer`. Fed to the schedule only when `peer` is
-    /// the one asked; otherwise NotNext (the caller hands it to the header
-    /// chain). `ask_next`: ask the same peer for the next batch now.
+    /// A headers batch from `peer`: fed when it continues the frontier,
+    /// whoever sent it; otherwise NotNext (the caller hands it to the header
+    /// chain). `ask_next`: ask that peer for the next batch now (after an
+    /// extension), or a new peer (after a bad batch).
     HashSchedule::Feed on_headers(const std::string& peer,
                                   const std::vector<ltc::coin::BlockHeaderType>& headers,
                                   Clock::time_point now, std::optional<Ask>& ask_next)
@@ -511,22 +543,41 @@ public:
         ask_next.reset();
         if (m_s.complete())
             return HashSchedule::Feed::Done;
-        if (peer.empty() || peer != m_peer)
-            return HashSchedule::Feed::NotNext;
+        if (!peer.empty() && peer == m_peer)
+            m_turn_answered = true;
+        const uint32_t before_h = m_s.frontier_height();
         const auto r = m_s.feed(headers);
         switch (r) {
-        case HashSchedule::Feed::Extended:
+        case HashSchedule::Feed::Extended: {
+            if (m_runs.empty() || m_runs.back().second != peer) {
+                if (m_runs.size() >= MAX_RUNS)
+                    m_runs.erase(m_runs.begin());  // the deepest base is forgotten: genesis then
+                m_runs.emplace_back(before_h, peer);
+            }
+            if (peer != m_peer && !peer.empty())
+                start_turn_locked(peer, now);
             note_progress_locked(now);
             ask_next = Ask{m_s.locator(), m_rr, m_peer};
             break;
+        }
         case HashSchedule::Feed::Broken:
-        case HashSchedule::Feed::Rejected:
-            // This peer's chain is not the checkpoint's: another peer, now.
-            m_peer.clear();
-            ++m_rr;
-            m_progress_height = 0;
-            ask_next = Ask{m_s.locator(), m_rr, std::string()};
+        case HashSchedule::Feed::Rejected: {
+            // This peer's chain is not the checkpoint's: what it stored and
+            // nobody continued goes, another peer is asked now.
+            const bool cut = !m_runs.empty() && m_runs.back().second == peer;
+            if (cut) {
+                const uint32_t to = m_runs.back().first;
+                m_runs.pop_back();
+                truncate_locked(to, now);
+            }
+            if (peer == m_peer) {
+                m_peer.clear();
+                ++m_rr;
+            }
+            if (cut || m_peer.empty())
+                ask_next = Ask{m_s.locator(), m_rr, std::string()};
             break;
+        }
         default:
             break;
         }
@@ -543,8 +594,36 @@ public:
         std::lock_guard<std::mutex> lock(m_mu);
         return m_stalls;
     }
+    uint64_t truncations() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_truncations;
+    }
 
 private:
+    static constexpr size_t MAX_RUNS = 4096;
+
+    void start_turn_locked(const std::string& peer, Clock::time_point now)
+    {
+        m_peer = peer;
+        m_asked_at = now;
+        m_height_when_asked = m_s.frontier_height();
+        m_turn_answered = false;
+    }
+
+    void truncate_locked(uint32_t height, Clock::time_point now)
+    {
+        m_s.truncate(height);
+        ++m_truncations;
+        m_fruitless = 0;
+        const uint32_t h = m_s.frontier_height();
+        while (!m_runs.empty() && m_runs.back().first >= h)
+            m_runs.pop_back();  // runs that started above the cut (genesis: all)
+        m_progress_height = h;
+        m_progress_at = now;
+        m_height_when_asked = std::min(m_height_when_asked, h);
+    }
+
     void note_progress_locked(Clock::time_point now)
     {
         const uint32_t h = m_s.frontier_height();
@@ -553,7 +632,7 @@ private:
             m_progress_at = now;
             m_fruitless = 0;
         } else if (h < m_progress_height) {
-            m_progress_height = h;  // discarded
+            m_progress_height = h;  // cut back
         }
     }
 
@@ -565,8 +644,11 @@ private:
     Clock::time_point m_progress_at{};
     uint32_t          m_progress_height{0};
     uint32_t          m_height_when_asked{0};
-    uint32_t          m_fruitless{0};     // peers in a row with no progress
+    bool              m_turn_answered{false};  // the asked peer sent a batch this turn
+    uint32_t          m_fruitless{0};     // peers in a row that answered without continuing
     uint64_t          m_stalls{0};
+    uint64_t          m_truncations{0};
+    std::vector<std::pair<uint32_t, std::string>> m_runs;  // (base height, peer), deepest first
 };
 
 } // namespace coin
