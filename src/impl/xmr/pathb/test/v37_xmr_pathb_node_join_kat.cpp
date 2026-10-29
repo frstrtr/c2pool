@@ -2561,6 +2561,11 @@ void joinedlag() {
     show("(L + 18, the same links)", p2);
     check(started && !p1.at_tip && p1.ncu, "joinedlag: setup (servers at L + 6: the store not at their tip, K_NCU)" +
                                                    (why.empty() ? "" : "; " + why));
+    check(p1.attempts >= 2 && p1.last.rfind("NotServed", 0) == 0 && p1.last.find("fetch A not served") != std::string::npos,
+          "joinedlag: at L + 6 the attempts end NotServed at fetch A (" + std::to_string(p1.attempts) + " attempts)");
+    check(p2.attempts == p1.attempts + 1 && p2.last.rfind("Completed", 0) == 0 && p2.offers == p1.offers,
+          "joinedlag: past one Monero height one attempt completes; no new pair (offers " + std::to_string(p1.offers) +
+                  " -> " + std::to_string(p2.offers) + ", attempts " + std::to_string(p2.attempts - p1.attempts) + ")");
     check(p2.at_tip && p2.caught && !p2.ncu && h[r].joined() != nullptr && relay.stats().bans.load() == 0,
           "joinedlag: once the servers pass one Monero height the join completes on the same links and K_NCU ends (" +
                   std::to_string(p2.secs) + " s, attempts " + std::to_string(p2.attempts - p1.attempts) + ")");
