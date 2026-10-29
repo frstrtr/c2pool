@@ -283,6 +283,7 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/utxo_lane.hpp>
 #include <impl/doge/coin/hash_schedule.hpp>
 #include <impl/doge/coin/utxo_full_state.hpp>
+#include <impl/doge/coin/header_sync.hpp>
 #include <core/coin/utxo_digest.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
@@ -7062,21 +7063,16 @@ int main(int argc, char* argv[]) {
                                                              << " accepted, chain height="
                                                              << dc->height();
 
-                                                // Pipeline: immediate follow-up getheaders for fast sync
-                                                uint256 last_hash;
-                                                if (!batch->empty()) {
-                                                    auto packed = pack(batch->back());
-                                                    last_hash = Hash(packed.get_span());
-                                                }
-                                                bool full_batch = (batch->size() >= 2000);
-                                                if (accepted > 0 || full_batch) {
-                                                    boost::asio::post(ioc, [accepted, last_hash, dc, bcaster_ptr]() {
+                                                // Follow-up getheaders as Core asks them
+                                                // (doge::coin::headers_follow_up): only to the peer
+                                                // that sent new headers, from the chain's locator;
+                                                // nothing for a batch with nothing new.
+                                                if (doge::coin::headers_follow_up(accepted)
+                                                    == doge::coin::HeadersFollowUp::AskSender) {
+                                                    boost::asio::post(ioc, [dc, bcaster_ptr, key]() {
                                                       try {
-                                                        if (accepted > 0 && !last_hash.IsNull()) {
-                                                            bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
-                                                        } else {
-                                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
-                                                        }
+                                                        bcaster_ptr->request_headers_targeted(
+                                                            dc->get_locator(), uint256::ZERO, 0, key);
                                                       } catch (const std::exception& e) {
                                                         LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
                                                       }
@@ -7090,16 +7086,22 @@ int main(int argc, char* argv[]) {
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, now_ms, hb_doge_sync,
                                                  dc = doge_chain.get(),
-                                                 bcaster_ptr](boost::system::error_code ec) {
+                                                 bcaster_ptr, rr = std::make_shared<size_t>(0)](boost::system::error_code ec) {
                                     if (ec) return;
                                     hb_doge_sync->store(now_ms());
                                     // Fast poll during sync (5s), slow when caught up (60s)
-                                    int interval = dc->is_synced() ? 60 : 5;
+                                    const bool synced = dc->is_synced();
+                                    int interval = synced ? 60 : 5;
                                     doge_sync_timer->expires_after(std::chrono::seconds(interval));
                                     doge_sync_timer->async_wait(*doge_sync_fn);
                                     try {
                                         auto locator = dc->get_locator();
-                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                        // Catching up: one peer per tick (the follow-ups go to
+                                        // the peer that answered); synced: every peer.
+                                        if (doge::coin::headers_poll(synced) == doge::coin::HeadersPoll::OnePeer)
+                                            bcaster_ptr->request_headers_targeted(locator, uint256::ZERO, (*rr)++);
+                                        else
+                                            bcaster_ptr->request_headers(locator, uint256::ZERO);
                                     } catch (const std::exception& e) {
                                         LOG_WARNING << "[EMB-DOGE] Header sync error: " << e.what();
                                     }
@@ -7503,12 +7505,15 @@ int main(int argc, char* argv[]) {
                                                 d["pricing"] = full->live.load() ? "full" : "accrual";
                                                 d["schedule_ready"] = full->schedule_ready.load();
                                                 d["adoptions"] = full->adoptions.load();
+                                                d["queued_bytes"] = full->queued_bytes.load();
+                                                d["queue_dropped"] = full->queue_dropped.load();
                                                 if (sched)
                                                     d["schedule"] = {{"frontier", sched->frontier_height()},
                                                                      {"checkpoint", sched->checkpoint_height()},
                                                                      {"complete", sched->complete()},
                                                                      {"peer", sched_sync ? sched_sync->peer() : std::string()},
-                                                                     {"stalls", sched_sync ? sched_sync->stalls() : 0}};
+                                                                     {"stalls", sched_sync ? sched_sync->stalls() : 0},
+                                                                     {"truncations", sched_sync ? sched_sync->truncations() : 0}};
                                                 if (a && acc_utxo && !full->live.load())
                                                     d["accrual"] = describe(*a, acc_utxo);
                                             } else if (a && acc_utxo) {
@@ -7549,19 +7554,26 @@ int main(int argc, char* argv[]) {
                                         // full lane only (a deep body must not move the pool's tip
                                         // height or run its passes).
                                         bool full_only = false;
+                                        doge::coin::UtxoFullState::Placement placed;
                                         if (doge_full_lane) {
-                                            const auto placed = full->place(block_hash, height, chain ? chain->height() : 0);
+                                            placed = full->place(block_hash, height, chain ? chain->height() : 0);
                                             height = placed.height;
                                             full_only = placed.full_only;
                                         }
 
                                         // The full set's lane, on its own pool. Once live it
                                         // serves the pool as the accrual lane did (the same
-                                        // passes, against the full set).
-                                        if (doge_full_lane && fpool && full->schedule_ready.load()) {
+                                        // passes, against the full set). The queue to it is
+                                        // bounded (UtxoFullState::enqueue): a body that cannot
+                                        // be placed is not queued while the full set is not
+                                        // live, a deep one is dropped while the queue is full.
+                                        const uint64_t body_bytes = doge_full_lane ? doge::coin::estimate_body_bytes(block) : 0;
+                                        if (doge_full_lane && fpool && full->schedule_ready.load()
+                                            && full->enqueue(placed, body_bytes)) {
                                             boost::asio::post(*fpool,
                                                 [doge_full_lane, block, block_hash, height, peer, pool, chain, full, full_db,
-                                                 explorer_enabled, explorer_depth_doge, &web_server, &ioc]() {
+                                                 explorer_enabled, explorer_depth_doge, body_bytes, &web_server, &ioc]() {
+                                              full->dequeued(body_bytes);
                                               try {
                                                 const auto fed = doge_full_lane->on_block(block, block_hash, height, peer);
                                                 if (!full->live.load())
@@ -7590,9 +7602,13 @@ int main(int argc, char* argv[]) {
                                                         full_db->put_raw_block(height, raw);
                                                         full_db->prune_raw_blocks(height, explorer_depth_doge);
                                                     }
-                                                    // A body that cannot be placed runs no pass; only
-                                                    // the tip's moves the pool's tip height.
+                                                    // A body that cannot be placed runs no pass; nor
+                                                    // does an old one (a late copy) that connected
+                                                    // nothing; only the tip's moves the tip height.
                                                     if (height == 0)
+                                                        return;
+                                                    if (fed.fed != doge::coin::UtxoLane::Fed::Connected
+                                                        && (!chain || height + 1 < chain->height()))
                                                         return;
                                                     if (chain && height == chain->height())
                                                         pool->set_tip_height(height);
@@ -7642,10 +7658,12 @@ int main(int argc, char* argv[]) {
                                         auto* utxo = pool ? pool->utxo() : nullptr;
 
                                         // UTXO feed: strictly in height order (doge::coin::UtxoLane)
+                                        bool connected_now = false;
                                         if (doge_lane) {
                                             *doge_cur_peer = peer;
                                             const auto fed = doge_lane->on_block(block, block_hash, height);
                                             doge_cur_peer->clear();
+                                            connected_now = fed.fed == doge::coin::UtxoLane::Fed::Connected;
                                             if (fed.fed == doge::coin::UtxoLane::Fed::Pipeline) {
                                                 // The ordered pipeline holds the block (drained blocks
                                                 // had their passes in connected()). Mempool cleanup does
@@ -7685,7 +7703,12 @@ int main(int argc, char* argv[]) {
                                         // no request) runs no pass; only the tip's body moves
                                         // the pool's tip height (a late copy of an older block
                                         // must not lower it).
-                                        if (pool && height > 0) {
+                                        // An old body (a late copy, a block the full lane asked
+                                        // for near the tip) that connected nothing runs no pass:
+                                        // it would only push the tip out of the pool's
+                                        // cleaned-for list.
+                                        const bool current = connected_now || (chain && height + 1 >= chain->height());
+                                        if (pool && height > 0 && current) {
                                             if (chain && height == chain->height())
                                                 pool->set_tip_height(height);
                                             pool->remove_for_block(block);

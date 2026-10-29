@@ -82,18 +82,53 @@ struct UtxoFullState {
     /// (0 = unknown); `chain_height`: the header chain's tip.
     struct Placement {
         uint32_t height{0};     // 0 = cannot be placed
-        bool     full_only{false};  // asked by the full lane and not the tip's: no accrual pass
+        bool     full_only{false};  // asked by the full lane and deeper than the accrual
+                                    // lane's interest: no accrual pass
     };
-    Placement place(const uint256& hash, uint32_t header_height, uint32_t chain_height) const
+    Placement place(const uint256& hash, uint32_t header_height, uint32_t chain_height,
+                    uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP) const
     {
         Placement p;
         p.height = header_height;
         if (const auto asked = requested_height(hash)) {
             if (p.height == 0)
                 p.height = *asked;
-            p.full_only = p.height != chain_height;
+            // The accrual lane wants the last `keep` blocks too (its
+            // bootstrap, its gap fills): a body both lanes asked for serves
+            // both. Only a deeper one is the full lane's alone.
+            p.full_only = uint64_t(p.height) + keep < chain_height;
         }
         return p;
+    }
+
+    /// The queue to the full set's thread (S-A): a body that cannot be
+    /// placed is not queued while the full set is not live (nothing can
+    /// use it); a body for the full lane alone is dropped while the queue
+    /// holds QUEUE_BYTES_MAX (a requested one is asked again after the
+    /// request timeout). The tip's bodies always pass. true = post it, and
+    /// call dequeued(bytes) when the full set's thread takes it.
+    static constexpr uint64_t QUEUE_BYTES_MAX = 256u * 1024 * 1024;
+    std::atomic<uint64_t> queued_bytes{0};
+    std::atomic<uint64_t> queue_dropped{0};
+
+    bool enqueue(const Placement& p, uint64_t bytes)
+    {
+        if (p.height == 0 && !live.load()) {
+            queue_dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if ((p.full_only || p.height == 0) && queued_bytes.load() + bytes > QUEUE_BYTES_MAX) {
+            queue_dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        queued_bytes.fetch_add(bytes);
+        return true;
+    }
+    void dequeued(uint64_t bytes)
+    {
+        uint64_t cur = queued_bytes.load();
+        while (!queued_bytes.compare_exchange_weak(cur, cur > bytes ? cur - bytes : 0)) {
+        }
     }
 
     /// Start with the full set pricing the templates: built from genesis,

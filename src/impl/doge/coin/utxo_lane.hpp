@@ -172,6 +172,21 @@ struct UtxoLaneHost {
     std::function<std::chrono::steady_clock::time_point()> now;
 };
 
+/// The serialized size of a body, estimated from its parts (memory bounds:
+/// the full lane's reorder buffer, the queue to its thread).
+inline size_t estimate_body_bytes(const ltc::coin::BlockType& b)
+{
+    size_t n = 80 + 9;
+    for (const auto& tx : b.m_txs) {
+        n += 4 + 4 + 9 + 9;
+        for (const auto& in : tx.vin)
+            n += 32 + 4 + 4 + 9 + in.scriptSig.m_data.size();
+        for (const auto& out : tx.vout)
+            n += 8 + 9 + out.scriptPubKey.m_data.size();
+    }
+    return n;
+}
+
 /// A peer that serves every historical block: it advertises NODE_NETWORK
 /// (bit 0). A pruned node clears it (Dogecoin 1.14) or advertises only
 /// NODE_NETWORK_LIMITED (bit 10, later Core): neither is asked for the IBD.
@@ -547,20 +562,7 @@ private:
         }
     }
 
-    /// The serialized size of a body, estimated from its parts (the reorder
-    /// buffer's memory bound).
-    static size_t body_bytes(const BlockType& b)
-    {
-        size_t n = 80 + 9;
-        for (const auto& tx : b.m_txs) {
-            n += 4 + 4 + 9 + 9;
-            for (const auto& in : tx.vin)
-                n += 32 + 4 + 4 + 9 + in.scriptSig.m_data.size();
-            for (const auto& out : tx.vout)
-                n += 8 + 9 + out.scriptPubKey.m_data.size();
-        }
-        return n;
-    }
+    static size_t body_bytes(const BlockType& b) { return estimate_body_bytes(b); }
 
     /// Full mode, the first block: arm the fill. A set that is empty or not
     /// built from genesis (no sync state, or another anchor) is (wiped and)
@@ -755,6 +757,17 @@ private:
         if (m_peers.empty() || t - m_peers_at > std::chrono::seconds(1)) {
             m_peers = m_host.download_peers();
             m_peers_at = t;
+            if (!m_peers.empty()) {
+                m_no_peers_since = {};
+            } else if (m_no_peers_since == std::chrono::steady_clock::time_point{}) {
+                m_no_peers_since = t;
+            } else if (t - m_no_peers_since > std::chrono::seconds(60)
+                       && t - m_no_peers_logged > std::chrono::minutes(10)) {
+                m_no_peers_logged = t;
+                LOG_WARNING << m_tag << " IBD: no peer advertising NODE_NETWORK for "
+                            << std::chrono::duration_cast<std::chrono::seconds>(t - m_no_peers_since).count()
+                            << "s; nothing asked but the 30 s broadcast";
+            }
         }
         for (auto it = m_cooldown.begin(); it != m_cooldown.end();)
             it = it->second <= t ? m_cooldown.erase(it) : std::next(it);
@@ -1390,6 +1403,8 @@ private:
     std::vector<std::string>            m_peers;      // the host's download peers (refreshed each second)
     std::chrono::steady_clock::time_point m_peers_at{};
     size_t                              m_peer_rr{0};
+    std::chrono::steady_clock::time_point m_no_peers_since{};
+    std::chrono::steady_clock::time_point m_no_peers_logged{};
     std::map<uint32_t, size_t>          m_sizes;      // buffered height -> body bytes
     std::map<uint32_t, std::string>     m_from;       // buffered height -> the peer that sent it
     std::string                         m_last_peer;  // the peer of the body being handled

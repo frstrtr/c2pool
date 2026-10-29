@@ -16,9 +16,18 @@
 //     the full set catches up; a set past the checkpoint needs no schedule.
 //   - EveryCompletionRepricesThePool (S5): the swap runs on every completion
 //     (after a rebuild too), not once per process.
+//   - RecentBodiesServeBothLanes (VERIFY2 S-D): a body both lanes asked for
+//     within the accrual lane's last 1,440 blocks reaches both.
+//   - QueueToTheFullSetIsBounded (S-A): unplaceable bodies are not queued
+//     while the full set is not live; deep ones are dropped while the queue
+//     holds its bound; the tip's always pass.
+//   - HeaderSyncAsksAsCoreDoes (S-B): follow-up getheaders only to the peer
+//     that sent new headers, none for a batch with nothing new; the periodic
+//     poll asks one peer while catching up, every peer once synced.
 // ---------------------------------------------------------------------------
 #include "doge_utxo_lane_harness.hpp"
 
+#include <impl/doge/coin/header_sync.hpp>
 #include <impl/doge/coin/utxo_full_state.hpp>
 
 namespace {
@@ -167,4 +176,54 @@ TEST(DogeUtxoFullWiring, EveryCompletionRepricesThePool)
     EXPECT_FALSE(a.first) << "the accrual lane left the feed once";
     EXPECT_TRUE(pool.get_entry(txid)->fee_known) << "not re-priced after the second completion";
     EXPECT_EQ(st.adoptions.load(), 2u);
+}
+
+// The S4 restart (the full set > 1,440 behind, the accrual set bootstrapping
+// the last 1,440 blocks) and the IBD's last blocks: both lanes ask for the
+// same recent bodies. Before, every copy was the full lane's alone and the
+// accrual set never filled (the mining gate stayed closed until adoption).
+TEST(DogeUtxoFullWiring, RecentBodiesServeBothLanes)
+{
+    UtxoFullState st;
+    const uint256 recent = tag(0x06, 1), edge = tag(0x06, 2), deep = tag(0x06, 3);
+    st.note_request(recent, TIP - 100);
+    st.note_request(edge, TIP - 1440);
+    st.note_request(deep, TIP - 1441);
+    EXPECT_FALSE(st.place(recent, TIP - 100, TIP).full_only) << "a body the accrual lane wants too";
+    EXPECT_FALSE(st.place(edge, TIP - 1440, TIP).full_only);
+    EXPECT_TRUE(st.place(deep, 0, TIP).full_only);
+    EXPECT_EQ(st.place(deep, 0, TIP).height, TIP - 1441);
+}
+
+TEST(DogeUtxoFullWiring, QueueToTheFullSetIsBounded)
+{
+    UtxoFullState st;
+    UtxoFullState::Placement unplaced;  // height 0
+    EXPECT_FALSE(st.enqueue(unplaced, 1000)) << "nothing can use it while the full set is not live";
+    st.live.store(true);
+    EXPECT_TRUE(st.enqueue(unplaced, 1000)) << "live: its header may come from it";
+    st.dequeued(1000);
+    UtxoFullState::Placement deep{1000, true}, tip{TIP, false};
+    constexpr uint64_t MB = 1024 * 1024;
+    uint64_t queued = 0;
+    while (st.enqueue(deep, MB))
+        queued += MB;
+    EXPECT_LE(queued, UtxoFullState::QUEUE_BYTES_MAX);
+    EXPECT_GT(queued, UtxoFullState::QUEUE_BYTES_MAX - MB);
+    EXPECT_GE(st.queue_dropped.load(), 2u);
+    EXPECT_TRUE(st.enqueue(tip, MB)) << "the tip's body always passes";
+    st.dequeued(queued + MB);
+    EXPECT_EQ(st.queued_bytes.load(), 0u);
+    EXPECT_TRUE(st.enqueue(deep, MB)) << "room again once the full set's thread took them";
+}
+
+TEST(DogeUtxoFullWiring, HeaderSyncAsksAsCoreDoes)
+{
+    using doge::coin::HeadersFollowUp;
+    using doge::coin::HeadersPoll;
+    EXPECT_EQ(doge::coin::headers_follow_up(0), HeadersFollowUp::None) << "a batch with nothing new asks nothing";
+    EXPECT_EQ(doge::coin::headers_follow_up(1), HeadersFollowUp::AskSender);
+    EXPECT_EQ(doge::coin::headers_follow_up(2000), HeadersFollowUp::AskSender);
+    EXPECT_EQ(doge::coin::headers_poll(false), HeadersPoll::OnePeer) << "catching up: one peer per tick";
+    EXPECT_EQ(doge::coin::headers_poll(true), HeadersPoll::EveryPeer) << "synced: the tip's headers from every peer";
 }
