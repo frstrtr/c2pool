@@ -3049,6 +3049,44 @@ TEST(DashAlertHashrate, RigsAboveTheThresholdBarelyPage)
     }
 }
 
+// The rate is the work the shares were CREDITED at, not their count x the
+// advertised vardiff. After a retarget the registry already shows the new
+// vardiff while shares of jobs issued before it (still in the rig's pipeline:
+// the retarget sends set_difficulty with a non-clean notify) are credited at
+// their job's issued difficulty (stratum_server.cpp, credited_difficulty). A
+// steady 1.76 TH/s rig is retargeted 2048 -> 4096 and keeps submitting old-job
+// shares for 120 s: every window must read 1.76 TH/s. Counting those shares at
+// the advertised 4096 would read ~13 % high in each window that holds them.
+TEST(DashAlertHashrate, RateIsTheCreditedWorkAcrossARetarget)
+{
+    AlertDetector d(rate_cfg(), T0);
+    const double rate = 2048.0 * kTwo32 / 5.0;   // one 2048 share per 5 s tick
+    const int64_t retarget = T0 + 3600, lag = 120;
+    WorkerSample s{"XaddrHotel.D11", "s11", 0};
+    s.work = 0;
+    uint64_t seen = 0;
+    int spanning = 0;   // evaluations whose window holds old-job shares after the retarget
+    double worst = 0;
+    for (int64_t now = T0 + 5; now <= T0 + 3 * 3600; now += 5) {
+        s.difficulty = now <= retarget ? 2048 : 4096;   // what the registry shows
+        const bool old_job = now <= retarget + lag;     // still credited at 2048
+        if (old_job || (now / 5) % 2 == 0) {            // 2048 every tick, 4096 every other tick
+            ++s.accepted;
+            s.work += old_job ? 2048 : 4096;
+        }
+        for (const auto& e : d.tick({s}, now)) ADD_FAILURE() << kind_name(static_cast<uint8_t>(e.kind));
+        if (d.hashrate_evaluations() == seen) continue;
+        seen = d.hashrate_evaluations();
+        const double measured = d.status_json(now)["workers"][s.key]["hashrate"].get<double>();
+        worst = std::max(worst, std::fabs(measured / rate - 1.0));
+        if (now > retarget && now <= retarget + lag + 900) ++spanning;
+    }
+    std::cout << "[hashrate] credited work across a retarget: " << seen << " evaluations (" << spanning
+              << " spanning the old-job shares), worst deviation " << 100 * worst << " %\n";
+    EXPECT_GE(spanning, 2);
+    EXPECT_LT(worst, 0.03) << "every window reads the credited work, old-job shares at their own difficulty";
+}
+
 // KAT 2: a rig that drops from 1.8 to 1.0 TH/s (a dead hashboard) pages
 // HASHRATE_LOW exactly once, in about two windows. 200 seeded trials; the
 // detection delay is measured from the drop.
