@@ -1584,6 +1584,14 @@ private:
     /// F3 x DESYNC: put the last BRIDGE publish back in front of the re-arm
     /// (and on disk, so a restart mid-re-arm does not resume the implicated
     /// live record either). A no-op unless live records were written.
+    ///
+    /// STATED RESIDUAL: "the last bridge publish" is not always a probed set.
+    /// A restart resumes the last LIVE record and its bridge replays
+    /// cursor+1..tip and publishes, so that publish carries live-derived
+    /// state forward; the next desync then falls back to it. That is the same
+    /// escalation a bad publish has always had — the re-armed bridge folds
+    /// every block against its coinbase again, R8 refuses a cursor at or after
+    /// the divergence and the anchor is the floor — not a new trust root.
     void implicate_live_follow_records(std::optional<MnBridgeCursor> pub)
     {
         if (!m_live_persisted_since_publish) return;

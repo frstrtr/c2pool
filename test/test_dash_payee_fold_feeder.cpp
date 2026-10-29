@@ -422,6 +422,47 @@ TEST(DashPayeeFoldFeeder, PayeeLane_ForkBodyAtParkedHeightDropped)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// KAT 5b — PayeeLane_ParkedBodyReorgedBeforeDrainIsDropped (verify M1)
+// H+2 arrives first and is the chain's block there, so it PARKS. Before H+1
+// fills the hole the header chain reorgs at H+2 (a tip race whose loser's
+// body we held). When H+1 lands the parked loser must NOT fold — the
+// maintainer binds a body only to its own header and apply_block has no
+// prev-hash linkage, so it would fold the loser's coinbase mark and ProTx set
+// and then ignore the winner as <= cursor. It is dropped, and the winner is
+// asked for by its hash at once.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashPayeeFoldFeeder, PayeeLane_ParkedBodyReorgedBeforeDrainIsDropped)
+{
+    FeedRig r(H, H + 2);
+    r.seed(H);
+    r.tip = H + 2;
+    const BlockType loser = r.chain[H + 2];
+    r.deliver(H + 2);
+    ASSERT_TRUE(r.f.is_parked(H + 2)) << "on the chain at arrival: parked";
+
+    // Reorg at H+2 while it waits.
+    r.chain[H + 2] = make_block(H + 2, r.balance[H + 2], /*salt=*/77);
+    ASSERT_NE(x11_of(r.chain[H + 2]), x11_of(loser));
+    r.requests.clear();
+
+    r.deliver(H + 1);
+    EXPECT_EQ(r.cursor(), H + 1) << "the reorged-out parked body must not fold";
+    EXPECT_EQ(r.folded, (std::vector<uint32_t>{H + 1}));
+    EXPECT_EQ(r.f.fork_drops(), 1u);
+    EXPECT_EQ(r.f.stale_parked_drops(), 1u);
+    EXPECT_FALSE(r.f.is_parked(H + 2));
+    EXPECT_TRUE(r.asked_for(H + 2))
+        << "the block the chain holds at H+2 NOW is asked for, by its hash";
+    EXPECT_EQ(r.reseeds, 0);
+
+    // The winner lands and folds.
+    r.deliver(H + 2);
+    EXPECT_EQ(r.cursor(), H + 2);
+    EXPECT_EQ(r.folded, (std::vector<uint32_t>{H + 1, H + 2}));
+    EXPECT_EQ(r.gaps, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // KAT 6 — PayeeLane_ParkOverflowFallsBackToWipe
 // cursor+1 never arrives while kParkCap later bodies do: memory stays bounded
 // and the lane takes today's fail-closed wipe + re-seed (the invariant is

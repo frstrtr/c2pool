@@ -221,6 +221,9 @@ public:
     uint64_t delivered_from_park() const { return m_from_park; }
     uint64_t parked_total() const    { return m_parked_total; }
     uint64_t fork_drops() const      { return m_fork_drops; }
+    /// ...of which bodies that were on the chain when parked and lost their
+    /// height to a reorg before they could be released.
+    uint64_t stale_parked_drops() const { return m_stale_parked_drops; }
     uint64_t requests() const        { return m_requests; }
     uint64_t reasks() const          { return m_reasks; }
     uint64_t dead_sends() const      { return m_dead_sends; }
@@ -361,6 +364,33 @@ private:
         emit(bc);
     }
 
+    /// A parked body was the header chain's block at its height when it
+    /// ARRIVED (intake checks that). The chain may have reorged at that height
+    /// while it waited for the hole below it to fill — a tip race at
+    /// h >= cursor+2 whose loser's body parked. Nothing downstream would catch
+    /// it: the maintainer binds a body only to its OWN header, and
+    /// MnStateMachine::apply_block has no prev-hash linkage, so the loser would
+    /// fold (and the winner then be ignored as <= cursor). Re-check at EVERY
+    /// release; a body that lost its height is dropped like a fork body at
+    /// intake. Cannot judge (no index entry) = the intake answer: release.
+    bool parked_body_stale(uint32_t h, const BlockConnected& bc)
+    {
+        if (!m_hash_at) return false;
+        auto at = m_hash_at(h);
+        if (!at) return false;
+        const uint256 have = body_hash(bc);
+        if (*at == have) return false;
+        ++m_fork_drops;
+        ++m_stale_parked_drops;
+        LOG_WARNING << "[PAYEE-FEED] parked body h=" << h << " "
+                    << have.GetHex().substr(0, 16)
+                    << " is no longer the header chain's block there (reorged"
+                       " while parked; the chain now holds "
+                    << at->GetHex().substr(0, 16)
+                    << ") — DROPPED, not folded";
+        return true;
+    }
+
     /// Deliver every parked body the cursor now reaches, in height order.
     void drain()
     {
@@ -375,8 +405,10 @@ private:
                                 " — releasing " << m_park.size()
                              << " parked body(ies) in height order";
                 while (!m_park.empty()) {
+                    const uint32_t h = m_park.begin()->first;
                     BlockConnected bc = std::move(m_park.begin()->second);
                     m_park.erase(m_park.begin());
+                    if (parked_body_stale(h, bc)) continue;
                     ++m_from_park;
                     emit(bc);
                 }
@@ -387,8 +419,10 @@ private:
             // it): release them in order; the payee guard ignores them and the
             // UTXO lane may still need them.
             while (!m_park.empty() && m_park.begin()->first <= c) {
+                const uint32_t h = m_park.begin()->first;
                 BlockConnected bc = std::move(m_park.begin()->second);
                 m_park.erase(m_park.begin());
+                if (parked_body_stale(h, bc)) continue;
                 ++m_from_park;
                 emit(bc);
             }
@@ -396,6 +430,13 @@ private:
             if (it == m_park.end()) break;
             BlockConnected bc = std::move(it->second);
             m_park.erase(it);
+            if (parked_body_stale(c + 1, bc)) {
+                // Ask for the block the header chain holds there NOW, at once
+                // (a fresh first ask, not a 10 s re-ask).
+                m_asks.erase(c + 1);
+                want_window(c + 2, "parked body reorged out");
+                break;
+            }
             ++m_from_park;
             emit(bc);
             const uint32_t after = cursor();
@@ -478,6 +519,7 @@ private:
     uint64_t m_from_park{0};
     uint64_t m_parked_total{0};
     uint64_t m_fork_drops{0};
+    uint64_t m_stale_parked_drops{0};
     uint64_t m_requests{0};
     uint64_t m_reasks{0};
     uint64_t m_dead_sends{0};

@@ -7495,7 +7495,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             });
         payee_feeder.set_request_fn(
             [cp = coin_p2p.get()](const uint256& hash, uint32_t) {
-                return cp->request_block_tracked(hash);
+                // Once per hash: a body the watchdog already tracks is left to
+                // its stall/strike schedule (a re-ask here would refresh
+                // last_req and mute it), and an inv-path ask is not duplicated.
+                return cp->request_block_if_untracked(hash);
             });
 
         // new_chainlock -> record into the best-chainlock tracker (finalization
