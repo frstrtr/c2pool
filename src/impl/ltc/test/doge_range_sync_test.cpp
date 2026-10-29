@@ -200,8 +200,11 @@ TEST(DogeRangeSync, ExactRangesCompleteInAnyOrder)
 }
 
 // Only an exact range is stored: short, long, broken, wrong end and wrong
-// start store nothing; the start-right-but-wrong senders are excluded, a
-// short answer (a trickle, a parser that stopped) and a wrong start are not.
+// start store nothing. A wrong end (2,000 linked headers ending elsewhere)
+// excludes its sender at once; a short, long or broken answer is what the
+// AuxPoW parser can make of an honest answer (live, 19:34Z), so it costs the
+// asked peer a strike and the range is asked again, and from a peer not
+// asked it is ignored; three strikes exclude.
 TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
 {
     constexpr uint32_t CP = 20 * STEP;
@@ -210,33 +213,51 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     auto sched = open_schedule(s, c, CP);
     RangeSync rs(*sched, c.anchors(CP));
     auto t = t0();
-    rs.tick({"a"}, t);
+    ASSERT_EQ(rs.tick({"a"}, t).size(), 8u);
     const uint32_t r = 3, lo = STEP * r + 1, hi = STEP * (r + 1);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi - 1), t), Answer::Ignored) << "short";
-    EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::Excluded) << "long";
+    EXPECT_EQ(rs.inflight_of("a"), 7u) << "the short answer ended the request: asked again";
+    EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::Ignored) << "long, not asked";
     auto broken = c.slice(lo, hi);
     broken[500].m_previous_block = c.hashes[9];
-    EXPECT_EQ(rs.on_headers("c", broken, t), Answer::Excluded) << "broken";
+    EXPECT_EQ(rs.on_headers("c", broken, t), Answer::Ignored) << "broken, not asked";
     EXPECT_EQ(rs.on_headers("d", c.fake_range(r), t), Answer::Excluded) << "wrong end";
     EXPECT_EQ(rs.on_headers("e", c.slice(lo + 1, hi + 1), t), Answer::NotOurs) << "wrong start";
     EXPECT_EQ(sched->ranges_done(), 0u);
     EXPECT_FALSE(sched->range_done(r));
     EXPECT_TRUE(sched->stored_hash(lo).IsNull()) << "a record was written from a non-exact answer";
     EXPECT_FALSE(rs.excluded("a"));
-    EXPECT_TRUE(rs.excluded("b"));
-    EXPECT_TRUE(rs.excluded("c"));
+    EXPECT_FALSE(rs.excluded("b"));
+    EXPECT_FALSE(rs.excluded("c"));
     EXPECT_TRUE(rs.excluded("d"));
     EXPECT_FALSE(rs.excluded("e"));
     EXPECT_EQ(rs.stats(t).short_parses, 1u);
-    EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::Stored);
+    EXPECT_EQ(rs.stats(t).bad_parses, 2u);
+    EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::Stored) << "an exact answer, from anyone";
     EXPECT_TRUE(sched->range_done(r));
     EXPECT_EQ(sched->stored_hash(lo), c.hashes[lo]);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::Ignored) << "a copy of a stored range";
+
+    // Three bad answers to its own requests exclude a peer.
+    TempStore s2;
+    auto sched2 = open_schedule(s2, c, CP);
+    RangeSync rs2(*sched2, c.anchors(CP));
+    ASSERT_EQ(rs2.tick({"x"}, t).size(), 8u);
+    Answer last = Answer::Ignored;
+    for (uint32_t k = 0; k < 3; ++k) {
+        auto b = c.slice(STEP * k + 1, STEP * (k + 1));
+        b[7].m_previous_block = c.hashes[3];
+        last = rs2.on_headers("x", b, t);
+    }
+    EXPECT_EQ(last, Answer::Excluded);
+    EXPECT_TRUE(rs2.excluded("x"));
+    EXPECT_EQ(sched2->ranges_done(), 0u);
 }
 
-// V4-M1 against the ranges: a peer answers its range with one-header
-// messages every 29 s for two hours. Nothing of it is stored; at 60 s its
-// range goes to another peer and it is cooled; three strikes exclude it; the
+// V4-M1 against the ranges: a peer answers its ranges with one-header
+// messages every 29 s, for two hours if it can. Nothing of it is stored;
+// each short answer ends the request (the range goes to another peer) and
+// costs a strike that cools it for 10 minutes; three strikes exclude it; the
 // schedule completes from the honest (slow) peer.
 TEST(DogeRangeSync, ATricklingPeerDeliversNothingAndTheRangeMovesOn)
 {
@@ -282,10 +303,10 @@ TEST(DogeRangeSync, ATricklingPeerDeliversNothingAndTheRangeMovesOn)
     EXPECT_EQ(rs.mode(), Mode::Complete) << "the trickler held the schedule";
     EXPECT_TRUE(sched->complete());
     EXPECT_TRUE(rs.excluded("t")) << "three strikes did not exclude the trickler";
-    EXPECT_GE(rs.stats(t).timeouts, 3u);
-    EXPECT_GT(rs.stats(t).short_parses, 0u);
-    ASSERT_GE(t_asked.size(), 2u);
-    EXPECT_GE(t_asked[1] - t_asked[0], cfg.request_timeout + cfg.peer_cooldown) << "not cooled";
+    EXPECT_GE(rs.stats(t).short_parses, 3u);
+    ASSERT_EQ(t_asked.size(), 3u) << "asked once per strike";
+    EXPECT_GE(t_asked[1] - t_asked[0], cfg.peer_cooldown) << "not cooled";
+    EXPECT_GE(t_asked[2] - t_asked[1], cfg.peer_cooldown) << "not cooled";
     EXPECT_LT(t - start, std::chrono::hours(1));
 }
 

@@ -15,21 +15,26 @@
 ///     traffic, a peer answering from genesis for a range it cannot serve
 ///     lands on range 0): not ours unless it is an anchor's child;
 ///   - exact: stored, whoever sends it (exact = authentic given the anchor);
-///   - short but linking from the anchor (a trickle, or a parser that
-///     stopped early): ignored, counted (short_parses); the range stays in
-///     flight until its peer times out;
-///   - long, broken, or STEP linked headers ending at another hash than the
-///     next anchor: the peer is excluded for the process, its ranges go
-///     back to the window. VOTES distinct peers on the same other end hash:
-///     the anchor is wrong; the schedule falls back to the sequential sync
-///     from the delivered prefix (refused for good in the DB).
+///   - short, long or broken (a trickle, a liar, or the AuxPoW headers
+///     parser losing its place: live, 825f4fd8c at 19:34Z, honest peers'
+///     answers parsed to 1,780 and 1,798 headers with a broken link): from
+///     the peer the range is in flight to, the request is over: the range
+///     goes back to the window (another peer preferred) and the peer takes
+///     a strike; from any other peer, ignored. Counted (short_parses,
+///     bad_parses);
+///   - STEP linked headers ending at another hash than the next anchor (no
+///     parse error yields that): the peer is excluded at once. VOTES
+///     distinct peers on the same other end hash: the anchor is wrong; the
+///     schedule falls back to the sequential sync from the delivered prefix
+///     (refused for good in the DB).
 /// Timeouts: a peer that has delivered no exact range for REQUEST_TIMEOUT
 /// since its oldest request (or its last delivery) loses its in-flight
-/// ranges (one strike) and is cooled for PEER_COOLDOWN; STRIKES strikes
-/// exclude it. A slow peer that keeps delivering is never timed out: its
-/// requests queue behind each other on its connection. A range that every
-/// usable peer (at least VOTES of them) timed out on twice is undeliverable
-/// (an anchor nobody knows): the same fallback.
+/// ranges (one strike). A strike cools the peer for PEER_COOLDOWN; STRIKES
+/// strikes exclude it. A slow peer that keeps delivering is never struck:
+/// its requests queue behind each other on its connection; a range it holds
+/// for 3 x REQUEST_TIMEOUT goes to another peer without a strike. A range
+/// that every usable peer (at least VOTES of them) timed out on twice is
+/// undeliverable (an anchor nobody knows): the same fallback.
 /// Thread safety: every public method takes the internal mutex.
 
 #include <impl/doge/coin/hash_schedule.hpp>
@@ -225,15 +230,25 @@ public:
             return Answer::Stored;
         }
         case Feed::Short:
-            ++m_short_parses;
-            return Answer::Ignored;
+        case Feed::Long:
+        case Feed::Broken: {
+            if (r == Feed::Short)
+                ++m_short_parses;
+            else
+                ++m_bad_parses;
+            auto it = m_inflight.find(i);
+            if (it == m_inflight.end() || it->second.peer != peer)
+                return Answer::Ignored;  // not the answer to our request
+            // Our getheaders is answered, and not with the range: re-ask.
+            ++m_range_timeouts[i][peer];
+            release_locked(it);
+            strike_locked(peer, now, r == Feed::Short ? "a short range answer"
+                                     : r == Feed::Long ? "a range answer with more than 2000 headers"
+                                                       : "a range answer that does not link");
+            return m_excluded.count(peer) ? Answer::Excluded : Answer::Ignored;
+        }
         case Feed::Done:
             return Answer::Ignored;
-        case Feed::Long:
-        case Feed::Broken:
-            exclude_locked(peer, Feed::Long == r ? "a range answer with more than 2000 headers"
-                                                 : "a range answer that does not link");
-            return Answer::Excluded;
         case Feed::WrongEnd: {
             exclude_locked(peer, "a range answer ending at another hash than the anchor");
             auto& voters = m_end_votes[i][end];
@@ -266,6 +281,7 @@ public:
         uint64_t    timeouts{0};
         uint32_t    excluded{0};
         uint64_t    short_parses{0};
+        uint64_t    bad_parses{0};   // long or broken range answers
         double      rate_hps{0};  // headers stored per second, last minute
         std::string mode;
     };
@@ -280,6 +296,7 @@ public:
         st.timeouts = m_timeouts;
         st.excluded = static_cast<uint32_t>(m_excluded.size());
         st.short_parses = m_short_parses;
+        st.bad_parses = m_bad_parses;
         size_t recent = 0;
         for (const auto& t : m_stored_at)
             if (now - t <= std::chrono::seconds(60))
@@ -343,6 +360,17 @@ private:
         LOG_WARNING << "[EMB-DOGE] Hash schedule: " << peer << " excluded (" << why << ")";
     }
 
+    /// A strike: the peer is cooled; STRIKES of them exclude it.
+    void strike_locked(const std::string& peer, Clock::time_point now, const char* why)
+    {
+        auto& ps = m_peers[peer];
+        ++ps.strikes;
+        ps.cool_until = now + m_cfg.peer_cooldown;
+        LOG_INFO << "[EMB-DOGE] Hash schedule: " << peer << ": " << why << " (strike " << ps.strikes << ")";
+        if (ps.strikes >= m_cfg.strikes)
+            exclude_locked(peer, "repeated timeouts or bad range answers");
+    }
+
     void time_out_locked(Clock::time_point now)
     {
         std::set<std::string> struck;
@@ -350,7 +378,6 @@ private:
             if (ps.inflight > 0 && now - ps.since >= m_cfg.request_timeout)
                 struck.insert(p);
         for (const auto& p : struck) {
-            auto& ps = m_peers[p];
             for (auto it = m_inflight.begin(); it != m_inflight.end();)
                 if (it->second.peer == p) {
                     ++m_range_timeouts[it->first][p];
@@ -361,14 +388,20 @@ private:
                 } else {
                     ++it;
                 }
-            ++ps.strikes;
-            ps.cool_until = now + m_cfg.peer_cooldown;
-            LOG_INFO << "[EMB-DOGE] Hash schedule: no range from " << p << " in "
-                     << std::chrono::duration_cast<std::chrono::seconds>(now - ps.since).count()
-                     << "s; its ranges go to other peers (strike " << ps.strikes << ")";
-            if (ps.strikes >= m_cfg.strikes)
-                exclude_locked(p, "timed out repeatedly");
+            strike_locked(p, now, "no range delivered in time; its ranges go to other peers");
         }
+        // A range a delivering peer has held far too long goes elsewhere
+        // (no strike: the peer is working).
+        for (auto it = m_inflight.begin(); it != m_inflight.end();)
+            if (now - it->second.at >= 3 * m_cfg.request_timeout) {
+                ++m_range_timeouts[it->first][it->second.peer];
+                ++m_timeouts;
+                auto next = std::next(it);
+                release_locked(it);
+                it = next;
+            } else {
+                ++it;
+            }
     }
 
     /// A range every usable peer (at least `votes` of them) timed out on
@@ -457,6 +490,7 @@ private:
     std::deque<Clock::time_point>   m_stored_at;
     uint64_t                        m_timeouts{0};
     uint64_t                        m_short_parses{0};
+    uint64_t                        m_bad_parses{0};
     size_t                          m_rr{0};
 };
 
