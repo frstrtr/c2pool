@@ -282,6 +282,7 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/auxpow_header.hpp>
 #include <impl/doge/coin/utxo_lane.hpp>
 #include <impl/doge/coin/hash_schedule.hpp>
+#include <impl/doge/coin/utxo_full_state.hpp>
 #include <core/coin/utxo_digest.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
@@ -358,59 +359,6 @@ static std::optional<uint32_t> found_block_height(const core::MiningInterface& m
 
 // Global signal handling
 static bool g_shutdown_requested = false;
-
-/// The full DOGE UTXO set's state shared by main's DOGE handlers (the io
-/// context, the header pool and the full set's own pool).
-struct DogeFullState {
-    /// The pool prices against the full set (it reached the header tip);
-    /// the accrual lane is off the block feed.
-    std::atomic<bool> live{false};
-    /// The hash schedule below the header checkpoint is proven (or not
-    /// needed): the full lane can place every height.
-    std::atomic<bool> schedule_ready{false};
-    /// The DB the explorer reads DOGE blocks from (the lane writing them).
-    std::atomic<core::coin::UTXOViewDB*> explorer_db{nullptr};
-
-    /// A body the full lane asked for (hash -> height). A body below the
-    /// header checkpoint is placed by this; a deep one goes to the full
-    /// lane only (the accrual lane and the mempool must not see it).
-    void note_request(const uint256& hash, uint32_t height)
-    {
-        std::lock_guard<std::mutex> lock(m_mu);
-        m_requested[hash] = height;
-        if (m_requested.size() > MAX_REQUESTED) {
-            // Never answered (stalls re-ask by height): drop the lowest.
-            std::vector<std::pair<uint32_t, uint256>> by_height;
-            for (const auto& [h, ht] : m_requested)
-                by_height.emplace_back(ht, h);
-            std::sort(by_height.begin(), by_height.end());
-            for (size_t i = 0; i < by_height.size() / 2; ++i)
-                m_requested.erase(by_height[i].second);
-        }
-    }
-    std::optional<uint32_t> take_request(const uint256& hash)
-    {
-        std::lock_guard<std::mutex> lock(m_mu);
-        auto it = m_requested.find(hash);
-        if (it == m_requested.end())
-            return std::nullopt;
-        const uint32_t h = it->second;
-        m_requested.erase(it);
-        return h;
-    }
-
-    /// The hash schedule's sync: one peer asked at a time.
-    std::mutex sched_mu;
-    size_t sched_rr{0};
-    std::string sched_peer;
-    std::chrono::steady_clock::time_point sched_last{};
-    uint32_t sched_height{0};
-
-private:
-    static constexpr size_t MAX_REQUESTED = 16384;
-    std::mutex m_mu;
-    std::map<uint256, uint32_t> m_requested;
-};
 
 void signal_handler(int signal) {
     LOG_INFO << "Received signal " << signal << ", initiating shutdown...";
@@ -6508,11 +6456,13 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<core::coin::UTXOViewDB>    doge_full_db;
             std::unique_ptr<core::coin::UTXOViewCache> doge_full_cache;
             std::unique_ptr<doge::coin::HashSchedule>  doge_hash_schedule;
+            std::unique_ptr<doge::coin::HashScheduleSync> doge_sched_sync;
             std::unique_ptr<boost::asio::thread_pool>  doge_full_pool;
             // Shared with the lanes' callbacks: whether the pool prices against
-            // the full set, which bodies the full lane asked for, the schedule
-            // sync. The DB the explorer reads DOGE blocks from follows the set.
-            auto doge_full = std::make_shared<DogeFullState>();
+            // the full set, which bodies the full lane asked for, whether its
+            // lane can run. The DB the explorer reads DOGE blocks from follows
+            // the set (doge::coin::UtxoFullState).
+            auto doge_full = std::make_shared<doge::coin::UtxoFullState>();
 
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
@@ -6662,10 +6612,13 @@ int main(int argc, char* argv[]) {
                             doge_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
 
                         // The full DOGE UTXO set, built from genesis and strictly
-                        // connected. Once it has reached the header tip (synced) it
-                        // is the set the pool prices against and the accrual set is
-                        // not opened; until then the accrual set keeps pricing as
-                        // before while the full set builds alongside (dual DB).
+                        // connected. Once it has reached the header tip (synced),
+                        // and at a start no more than a day's blocks behind it, it is
+                        // the set the pool prices against and the accrual set is not
+                        // opened; otherwise (building, a long downtime, a rebuild cut
+                        // short by a restart) the accrual set keeps pricing as before
+                        // while the full set catches up (dual DB), and the pool
+                        // switches when it completes.
                         bool doge_full_live = false;
                         if (doge_utxo_full && !doge_full_db) {
                             const std::string full_path = !doge_utxo_full_dir.empty()
@@ -6683,13 +6636,15 @@ int main(int argc, char* argv[]) {
                             if (doge_full_db->open()) {
                                 doge_full_cache = std::make_unique<core::coin::UTXOViewCache>(doge_full_db.get());
                                 const auto ss = doge_full_db->get_sync_state();
-                                doge_full_live = ss.tracked() && ss.anchor_height == 0 && ss.synced;
+                                doge_full_live = doge::coin::UtxoFullState::start_live(
+                                    ss, doge_full_db->get_best_height(), doge_chain->height());
                                 LOG_INFO << "[EMB-DOGE] Full UTXO set at " << full_path << ": best_height="
                                          << doge_full_db->get_best_height() << " anchor="
                                          << (ss.tracked() ? std::to_string(ss.anchor_height) : std::string("none"))
-                                         << " coins=" << ss.coins
-                                         << (doge_full_live ? " — synced: the templates price against it"
-                                                            : " — building; the accrual set prices meanwhile");
+                                         << " synced=" << int(ss.synced) << " coins=" << ss.coins
+                                         << " header_height=" << doge_chain->height()
+                                         << (doge_full_live ? " — the templates price against it"
+                                                            : " — catching up; the accrual set prices meanwhile");
                             } else {
                                 LOG_ERROR << "[EMB-DOGE] Full UTXO set DB failed to open at " << full_path
                                           << " — accrual set only";
@@ -6744,12 +6699,19 @@ int main(int argc, char* argv[]) {
                                 doge_hash_schedule = std::make_unique<doge::coin::HashSchedule>(
                                     *doge_chain->store(), root, root_entry->block_hash, doge_params_ptr->genesis_hash);
                                 doge_hash_schedule->load();
-                                doge_full->schedule_ready.store(doge_hash_schedule->complete());
+                                // A set already past the checkpoint needs no schedule to
+                                // run (a header DB reset under a synced set); the
+                                // schedule still resumes from its frontier, for a rebuild.
+                                doge_full->schedule_ready.store(doge::coin::UtxoFullState::schedule_ready_for(
+                                    doge_hash_schedule->complete(), root, doge_full_db->get_best_height()));
+                                if (!doge_hash_schedule->complete())
+                                    doge_sched_sync = std::make_unique<doge::coin::HashScheduleSync>(*doge_hash_schedule);
                                 LOG_INFO << "[EMB-DOGE] Hash schedule below the header checkpoint " << root << ": "
                                          << (doge_hash_schedule->complete()
                                                  ? std::string("complete")
                                                  : "at h=" + std::to_string(doge_hash_schedule->frontier_height())
-                                                       + ", syncing headers from genesis");
+                                                       + ", syncing headers from genesis")
+                                         << (doge_full->schedule_ready.load() ? "; the full lane runs" : "");
                             } else if (!doge_full_live) {
                                 LOG_ERROR << "[EMB-DOGE] No header DB for the hash schedule below the checkpoint "
                                           << root << ": the full UTXO set cannot be built (accrual set only)";
@@ -7011,49 +6973,32 @@ int main(int argc, char* argv[]) {
 
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 // The hash schedule below the header checkpoint (full UTXO
-                                // set): getheaders from genesis to one peer at a time; the
-                                // next batch is asked for as soon as one is taken, another
-                                // peer after 30 s without progress or a batch that does not
-                                // link (doge::coin::HashSchedule).
+                                // set), synced by doge::coin::HashScheduleSync: getheaders
+                                // from genesis to one peer at a time, only that peer's
+                                // batches fed, the next asked as soon as one is taken; a
+                                // peer that does not move the frontier for 30 s is replaced.
                                 auto* sched = doge_hash_schedule.get();
-                                auto ask_schedule = [sched, bcaster_ptr, full = doge_full](bool next_peer) {
-                                    if (!sched || sched->complete())
-                                        return;
-                                    std::lock_guard<std::mutex> lock(full->sched_mu);
-                                    if (next_peer) {
-                                        ++full->sched_rr;
-                                        full->sched_peer.clear();
-                                    }
-                                    full->sched_peer = bcaster_ptr->request_headers_targeted(
-                                        sched->locator(), uint256::ZERO, full->sched_rr, full->sched_peer);
-                                    full->sched_last = std::chrono::steady_clock::now();
+                                auto* sched_sync = doge_sched_sync.get();
+                                auto send_sched_ask = [sched_sync, bcaster_ptr](
+                                                          const doge::coin::HashScheduleSync::Ask& a) {
+                                    const std::string peer = bcaster_ptr->request_headers_targeted(
+                                        a.locator, uint256::ZERO, a.peer_idx, a.peer);
+                                    sched_sync->asked(peer, std::chrono::steady_clock::now());
                                 };
-                                if (sched && !sched->complete()) {
+                                if (sched_sync && sched && !sched->complete()) {
                                     auto sched_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                     auto sched_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                    *sched_fn = [sched_fn, sched_timer, sched, ask_schedule,
-                                                 full = doge_full](boost::system::error_code ec) {
+                                    *sched_fn = [sched_fn, sched_timer, sched, sched_sync,
+                                                 send_sched_ask](boost::system::error_code ec) {
                                         if (ec || sched->complete())
                                             return;
-                                        sched_timer->expires_after(std::chrono::seconds(10));
+                                        sched_timer->expires_after(std::chrono::seconds(5));
                                         sched_timer->async_wait(*sched_fn);
-                                        bool stalled = false;
-                                        {
-                                            std::lock_guard<std::mutex> lock(full->sched_mu);
-                                            const uint32_t h = sched->frontier_height();
-                                            if (h != full->sched_height) {
-                                                full->sched_height = h;
-                                                full->sched_last = std::chrono::steady_clock::now();
-                                            }
-                                            stalled = full->sched_peer.empty()
-                                                || std::chrono::steady_clock::now() - full->sched_last
-                                                       > std::chrono::seconds(30);
-                                        }
-                                        if (stalled) {
-                                            LOG_INFO << "[EMB-DOGE] Hash schedule at h=" << sched->frontier_height()
-                                                     << "/" << sched->checkpoint_height()
-                                                     << ": asking another peer";
-                                            ask_schedule(true);
+                                        try {
+                                            if (auto a = sched_sync->due(std::chrono::steady_clock::now()))
+                                                send_sched_ask(*a);
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Hash schedule ask error: " << e.what();
                                         }
                                     };
                                     sched_timer->expires_after(std::chrono::seconds(15));
@@ -7061,8 +7006,8 @@ int main(int argc, char* argv[]) {
                                 }
 
                                 broadcaster->set_on_new_headers(
-                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, ask_schedule,
-                                     full = doge_full](
+                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync,
+                                     send_sched_ask, full = doge_full](
                                         const std::string& key,
                                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                                         // The broadcaster's on_new_headers gives us raw BlockHeaderType
@@ -7083,26 +7028,30 @@ int main(int argc, char* argv[]) {
                                                  << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc, sched, ask_schedule, full, key]() {
-                                                // Below the checkpoint: the hash schedule's batch.
-                                                if (sched && !sched->complete()) {
+                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, send_sched_ask, full, key]() {
+                                                // Below the checkpoint: the hash schedule's batch, from
+                                                // the peer it asked only.
+                                                if (sched_sync && sched && !sched->complete()) {
                                                     using Feed = doge::coin::HashSchedule::Feed;
-                                                    const Feed fr = sched->feed(*batch);
+                                                    std::optional<doge::coin::HashScheduleSync::Ask> next;
+                                                    const Feed fr = sched_sync->on_headers(
+                                                        key, *batch, std::chrono::steady_clock::now(), next);
                                                     if (fr != Feed::NotNext && fr != Feed::Done) {
                                                         if (fr == Feed::Complete) {
-                                                            full->schedule_ready.store(true);
-                                                        } else {
-                                                            if (fr != Feed::Extended)
-                                                                LOG_WARNING << "[EMB-DOGE] Hash schedule: batch from "
-                                                                            << key << " " << doge::coin::HashSchedule::feed_name(fr)
-                                                                            << "; asking another peer";
-                                                            else if (sched->frontier_height() % 200000 < batch->size())
-                                                                LOG_INFO << "[EMB-DOGE] Hash schedule h=" << sched->frontier_height()
-                                                                         << "/" << sched->checkpoint_height();
-                                                            boost::asio::post(ioc, [ask_schedule, fr]() {
-                                                                ask_schedule(fr != Feed::Extended);
-                                                            });
+                                                            if (!full->schedule_ready.exchange(true) && full->on_schedule_ready)
+                                                                full->on_schedule_ready();
+                                                        } else if (fr != Feed::Extended) {
+                                                            LOG_WARNING << "[EMB-DOGE] Hash schedule: batch from " << key << " "
+                                                                        << doge::coin::HashSchedule::feed_name(fr)
+                                                                        << "; asking another peer";
+                                                        } else if (sched->frontier_height() % 200000 < batch->size()) {
+                                                            LOG_INFO << "[EMB-DOGE] Hash schedule h=" << sched->frontier_height()
+                                                                     << "/" << sched->checkpoint_height();
                                                         }
+                                                        if (next)
+                                                            boost::asio::post(ioc, [send_sched_ask, a = *next]() {
+                                                                send_sched_ask(a);
+                                                            });
                                                         return;
                                                     }
                                                 }
@@ -7252,7 +7201,7 @@ int main(int argc, char* argv[]) {
                                         [pool = doge_pool.get(), utxo_db = doge_utxo_db.get(),
                                          explorer_enabled, explorer_depth_doge,
                                          mm_ptr = mm_manager.get(), bcaster_ptr,
-                                         doge_mempool_requested](
+                                         doge_mempool_requested, dc](
                                             const ltc::coin::BlockType& b, const uint256& bh,
                                             uint32_t h, bool drained) {
                                         if (drained) {
@@ -7268,7 +7217,8 @@ int main(int argc, char* argv[]) {
                                                 utxo_db->prune_raw_blocks(h, explorer_depth_doge);
                                             }
                                             if (pool) {
-                                                pool->set_tip_height(h);
+                                                if (h == dc->height())
+                                                    pool->set_tip_height(h);
                                                 pool->remove_for_block(b);
                                             }
                                             if (mm_ptr && !b.m_txs.empty()) {
@@ -7363,16 +7313,34 @@ int main(int argc, char* argv[]) {
                                         if (full->live.load())
                                             boost::asio::post(ioc, request_doge_headers);
                                     };
+                                    // Every request is recorded (hash -> height), every copy
+                                    // of the answer placed by it (UtxoFullState::place).
                                     host.request = [hash_at = host.chain_hash_at, bcaster_ptr, full,
                                                     rr = std::make_shared<size_t>(0)](uint32_t h, doge::coin::UtxoAsk how) {
                                         const uint256 hash = hash_at(h);
-                                        if (hash.IsNull())
+                                        if (hash.IsNull()) {
+                                            LOG_ERROR << "[EMB-DOGE] [full] No best-chain hash for h=" << h
+                                                      << ": not requested";
                                             return;
+                                        }
                                         full->note_request(hash, h);
                                         if (how != doge::coin::UtxoAsk::Broadcast
                                             && bcaster_ptr->request_full_block_targeted(hash, (*rr)++))
                                             return;
                                         bcaster_ptr->request_full_block(hash);
+                                    };
+                                    // Block download (Core's): several blocks in flight per
+                                    // peer, from peers that serve every block (NODE_NETWORK).
+                                    host.download_peers = [bcaster_ptr]() {
+                                        return bcaster_ptr->ready_peers(1 /* NODE_NETWORK */);
+                                    };
+                                    host.request_from = [hash_at = host.chain_hash_at, bcaster_ptr, full](
+                                                            const std::string& peer, uint32_t h) {
+                                        const uint256 hash = hash_at(h);
+                                        if (hash.IsNull())
+                                            return false;
+                                        full->note_request(hash, h);
+                                        return bcaster_ptr->request_full_block_from(peer, hash);
                                     };
                                     host.connected =
                                         [pool, full, full_db = doge_full_db.get(), dc, explorer_enabled,
@@ -7390,7 +7358,8 @@ int main(int argc, char* argv[]) {
                                                 full_db->put_raw_block(h, raw);
                                                 full_db->prune_raw_blocks(h, explorer_depth_doge);
                                             }
-                                            pool->set_tip_height(h);
+                                            if (h == dc->height())
+                                                pool->set_tip_height(h);
                                             pool->remove_for_block(b);
                                             if (mm_ptr && !b.m_txs.empty()) {
                                                 uint64_t cb_total = 0;
@@ -7404,28 +7373,24 @@ int main(int argc, char* argv[]) {
                                         if (!full->live.load())
                                             return;
                                         const int n = pool->requarantine_all();
-                                        LOG_INFO << "[EMB-DOGE] UTXO rebuild: " << n
-                                                 << " priced mempool txs quarantined until their inputs reconnect";
+                                        LOG_WARNING << "[EMB-DOGE] UTXO rebuild of the full set: " << n
+                                                    << " priced mempool txs quarantined; DOGE templates are coinbase-only"
+                                                    << " until it completes (a restart lets the accrual set price meanwhile)";
                                     };
                                     // The set reached the header tip, built from genesis: the
                                     // pool prices against it from now on (every tx re-priced;
                                     // one with an input the set does not hold becomes an
                                     // orphan), the explorer reads its blocks, the accrual lane
                                     // leaves the block feed.
+                                    // On every completion (the first, and after a rebuild).
                                     host.completed =
                                         [pool, full, full_cache = doge_full_cache.get(), full_db = doge_full_db.get(),
                                          bcaster_ptr, mm_ptr = mm_manager.get(), &ioc, &web_server]() {
-                                            if (full->live.exchange(true))
-                                                return;
-                                            pool->set_utxo(full_cache);
-                                            const int requarantined = pool->requarantine_all();
-                                            const int priced = pool->recompute_unknown_fees(full_cache);
-                                            const int evicted = pool->revalidate_inputs(full_cache);
-                                            full->explorer_db.store(full_db);
-                                            LOG_INFO << "[EMB-DOGE] The DOGE templates now price against the full UTXO set ("
-                                                     << requarantined << " priced txs re-priced: " << priced << " priced, "
-                                                     << evicted << " evicted, " << pool->orphan_count()
-                                                     << " orphans); the accrual set is off the block feed";
+                                            const auto a = full->adopt(*pool, full_cache, full_db);
+                                            LOG_INFO << "[EMB-DOGE] The DOGE templates price against the full UTXO set ("
+                                                     << a.requarantined << " txs re-priced: " << a.priced << " priced, "
+                                                     << a.evicted << " evicted, " << a.orphans << " orphans)"
+                                                     << (a.first ? "; the accrual set is off the block feed" : "");
                                             boost::asio::post(ioc, [bcaster_ptr, mm_ptr, &web_server]() {
                                                 bcaster_ptr->enable_mempool_request();
                                                 if (mm_ptr)
@@ -7433,14 +7398,12 @@ int main(int argc, char* argv[]) {
                                                 web_server.trigger_work_refresh_debounced();
                                             });
                                         };
-                                    host.fill_started = [fpool, bcaster_ptr, hash_at = host.chain_hash_at](
-                                                            doge::coin::UtxoLaneHost::Fill& f) {
+                                    // The 30 s last resort (every peer asked), through
+                                    // host.request so the answers are placed.
+                                    host.fill_started = [fpool, req = host.request](doge::coin::UtxoLaneHost::Fill& f) {
                                         f.start_stall_timer_on(fpool->get_executor(),
-                                            [bcaster_ptr, hash_at](uint32_t h) {
-                                                const uint256 hash = hash_at(h);
-                                                if (!hash.IsNull())
-                                                    bcaster_ptr->request_full_block(hash);
-                                            }, "EMB-DOGE full");
+                                            [req](uint32_t h) { req(h, doge::coin::UtxoAsk::Broadcast); },
+                                            "EMB-DOGE full");
                                     };
                                     host.fill_stopped = [](doge::coin::UtxoLaneHost::Fill& f) {
                                         f.stop_stall_timer();
@@ -7450,6 +7413,50 @@ int main(int argc, char* argv[]) {
                                         core::coin::DOGE_MIN_BLOCKS_TO_KEEP, doge::coin::UtxoLaneMode::Full);
                                     if (doge_full->live.load())
                                         boost::asio::post(ioc, [bcaster_ptr]() { bcaster_ptr->enable_mempool_request(); });
+
+                                    // The block download's clock: stalls, request timeouts, the
+                                    // window refill and the rate, every second on the lane's
+                                    // own thread.
+                                    auto tick_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                    auto tick_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                                    *tick_fn = [tick_fn, tick_timer, lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane),
+                                                full](boost::system::error_code ec) {
+                                        if (ec)
+                                            return;
+                                        tick_timer->expires_after(std::chrono::seconds(1));
+                                        tick_timer->async_wait(*tick_fn);
+                                        auto l = lane.lock();
+                                        if (!l || !full->schedule_ready.load())
+                                            return;
+                                        try {
+                                            l->tick();
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Full UTXO lane tick error: " << e.what();
+                                        }
+                                    };
+                                    tick_timer->expires_after(std::chrono::seconds(1));
+                                    tick_timer->async_wait(*tick_fn);
+
+                                    // The hash schedule completes during the run: the full
+                                    // lane's startup check, then the next tip body arms it.
+                                    doge_full->on_schedule_ready = [fpool, lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane)]() {
+                                        boost::asio::post(*fpool, [lane]() {
+                                            if (auto l = lane.lock()) {
+                                                try {
+                                                    l->startup();
+                                                } catch (const std::exception& e) {
+                                                    LOG_WARNING << "[EMB-DOGE] Full UTXO set startup check error: " << e.what();
+                                                }
+                                            }
+                                        });
+                                    };
+
+                                    // The IBD's historical bodies are logged at DEBUG (the
+                                    // 10,000-block progress lines stay at INFO).
+                                    bcaster_ptr->set_block_log_quiet([full, dc](const uint256& hash) {
+                                        const auto h = full->requested_height(hash);
+                                        return h && *h + core::coin::DOGE_MIN_BLOCKS_TO_KEEP < dc->height();
+                                    });
                                 }
 
                                 // /local_stats "doge_utxo": the set the full lane builds (mode
@@ -7464,7 +7471,7 @@ int main(int argc, char* argv[]) {
                                         [prev_metrics, accrual = std::weak_ptr<doge::coin::UtxoLane>(doge_lane),
                                          full_lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane),
                                          acc_utxo = doge_utxo_cache.get(), full_utxo = doge_full_cache.get(),
-                                         dc = doge_chain.get(), full = doge_full]() {
+                                         dc = doge_chain.get(), full = doge_full, sched, sched_sync]() {
                                             nlohmann::json j = prev_metrics ? prev_metrics() : nlohmann::json::object();
                                             if (!j.is_object())
                                                 j = nlohmann::json::object();
@@ -7495,6 +7502,13 @@ int main(int argc, char* argv[]) {
                                                 d["stuck"] = f->stuck();
                                                 d["pricing"] = full->live.load() ? "full" : "accrual";
                                                 d["schedule_ready"] = full->schedule_ready.load();
+                                                d["adoptions"] = full->adoptions.load();
+                                                if (sched)
+                                                    d["schedule"] = {{"frontier", sched->frontier_height()},
+                                                                     {"checkpoint", sched->checkpoint_height()},
+                                                                     {"complete", sched->complete()},
+                                                                     {"peer", sched_sync ? sched_sync->peer() : std::string()},
+                                                                     {"stalls", sched_sync ? sched_sync->stalls() : 0}};
                                                 if (a && acc_utxo && !full->live.load())
                                                     d["accrual"] = describe(*a, acc_utxo);
                                             } else if (a && acc_utxo) {
@@ -7530,16 +7544,15 @@ int main(int argc, char* argv[]) {
                                             else { auto prev = chain->get_header(block.m_previous_block); if (prev) height = prev->height + 1; }
                                         }
                                         // A body the full set's lane asked for: below the header
-                                        // checkpoint the request places it; one that is not the
-                                        // tip's goes to the full lane only (a deep body must not
-                                        // move the pool's tip height or run its passes).
+                                        // checkpoint its request places it (every copy: the
+                                        // record is kept); one that is not the tip's goes to the
+                                        // full lane only (a deep body must not move the pool's tip
+                                        // height or run its passes).
                                         bool full_only = false;
                                         if (doge_full_lane) {
-                                            if (auto asked = full->take_request(block_hash)) {
-                                                if (height == 0)
-                                                    height = *asked;
-                                                full_only = !chain || height != chain->height();
-                                            }
+                                            const auto placed = full->place(block_hash, height, chain ? chain->height() : 0);
+                                            height = placed.height;
+                                            full_only = placed.full_only;
                                         }
 
                                         // The full set's lane, on its own pool. Once live it
@@ -7547,10 +7560,10 @@ int main(int argc, char* argv[]) {
                                         // passes, against the full set).
                                         if (doge_full_lane && fpool && full->schedule_ready.load()) {
                                             boost::asio::post(*fpool,
-                                                [doge_full_lane, block, block_hash, height, pool, chain, full, full_db,
+                                                [doge_full_lane, block, block_hash, height, peer, pool, chain, full, full_db,
                                                  explorer_enabled, explorer_depth_doge, &web_server, &ioc]() {
                                               try {
-                                                const auto fed = doge_full_lane->on_block(block, block_hash, height);
+                                                const auto fed = doge_full_lane->on_block(block, block_hash, height, peer);
                                                 if (!full->live.load())
                                                     return;
                                                 auto* utxo = pool->utxo();
@@ -7577,7 +7590,12 @@ int main(int argc, char* argv[]) {
                                                         full_db->put_raw_block(height, raw);
                                                         full_db->prune_raw_blocks(height, explorer_depth_doge);
                                                     }
-                                                    pool->set_tip_height(height);
+                                                    // A body that cannot be placed runs no pass; only
+                                                    // the tip's moves the pool's tip height.
+                                                    if (height == 0)
+                                                        return;
+                                                    if (chain && height == chain->height())
+                                                        pool->set_tip_height(height);
                                                     pool->remove_for_block(block);
                                                     if (utxo) {
                                                         changed = pool->recompute_unknown_fees(utxo) > 0;
@@ -7663,8 +7681,13 @@ int main(int argc, char* argv[]) {
                                             utxo_db->put_raw_block(height, raw);
                                             utxo_db->prune_raw_blocks(height, explorer_depth_doge);
                                         }
-                                        if (pool) {
-                                            pool->set_tip_height(height);
+                                        // A body that cannot be placed (height 0: no header,
+                                        // no request) runs no pass; only the tip's body moves
+                                        // the pool's tip height (a late copy of an older block
+                                        // must not lower it).
+                                        if (pool && height > 0) {
+                                            if (chain && height == chain->height())
+                                                pool->set_tip_height(height);
                                             pool->remove_for_block(block);
                                             if (utxo) {
                                                 int resolved = pool->recompute_unknown_fees(utxo);

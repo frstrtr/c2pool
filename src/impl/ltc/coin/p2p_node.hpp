@@ -126,6 +126,9 @@ private:
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
+    // A block whose arrival is logged at DEBUG instead of INFO (the DOGE full
+    // set's IBD: millions of historical bodies).
+    std::function<bool(const uint256&)> m_block_log_quiet;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
@@ -310,6 +313,7 @@ public:
 
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
+    void set_block_log_quiet(std::function<bool(const uint256&)> f) { m_block_log_quiet = std::move(f); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -730,10 +734,16 @@ private:
         // Catch to ensure full_block event always fires for MWEB extraction.
         try { m_peer->get_block(blockhash, block); } catch (...) {}
         try { m_peer->get_header(blockhash, header); } catch (...) {}
-        LOG_INFO << "[" << m_chain_label << "] Full block received: "
-                 << blockhash.GetHex().substr(0, 16) << "..."
-                 << " txs=" << block.m_txs.size()
-                 << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        if (m_block_log_quiet && m_block_log_quiet(blockhash)) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Full block received: "
+                            << blockhash.GetHex().substr(0, 16) << "..."
+                            << " txs=" << block.m_txs.size();
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] Full block received: "
+                     << blockhash.GetHex().substr(0, 16) << "..."
+                     << " txs=" << block.m_txs.size()
+                     << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        }
         // Fire full block event (carries MWEB data for state extraction)
         deliver_full_block(block, BlockSource::Block);
     }

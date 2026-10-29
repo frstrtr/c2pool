@@ -224,6 +224,30 @@ public:
     using RawBlockParser = std::function<ltc::coin::BlockType(const uint8_t*, size_t)>;
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
 
+    /// Bodies whose arrival is logged at DEBUG (applied to every current and
+    /// future peer connection).
+    using BlockLogQuiet = std::function<bool(const uint256&)>;
+    void set_block_log_quiet(BlockLogQuiet f)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_block_log_quiet = std::move(f);
+        for (auto& [key, peer] : m_peers)
+            if (peer) peer->node_p2p.set_block_log_quiet(m_block_log_quiet);
+    }
+
+    /// The peers with a completed handshake whose version message advertised
+    /// every bit of `services` (e.g. NODE_NETWORK: not pruned).
+    std::vector<std::string> ready_peers(uint64_t services) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> out;
+        for (const auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete()
+                && (peer->node_p2p.peer_services() & services) == services)
+                out.push_back(key);
+        return out;
+    }
+
     /// Enable BIP 35 mempool request for all current and future peer connections.
     /// Call after UTXO is initialized so incoming txs can have fees computed.
     void enable_mempool_request() {
@@ -659,6 +683,9 @@ private:
                     });
             }
             // Wire AuxPoW raw block parser (DOGE)
+            if (m_block_log_quiet) {
+                peer->node_p2p.set_block_log_quiet(m_block_log_quiet);
+            }
             if (m_raw_block_parser) {
                 peer->node_p2p.set_raw_block_parser(m_raw_block_parser);
             }
@@ -772,6 +799,7 @@ private:
     RawHeadersParser     m_raw_headers_parser;
     RawHeadersSink       m_raw_headers_sink;        // NMC AuxPoW header-feed (optional)
     RawBlockParser       m_raw_block_parser;
+    BlockLogQuiet        m_block_log_quiet;
     bool                 m_request_mempool{false};  // BIP 35 mempool sync
 };
 
