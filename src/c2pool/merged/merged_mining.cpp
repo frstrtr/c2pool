@@ -555,6 +555,7 @@ std::vector<NetService> AuxChainRPC::getpeerinfo()
 namespace {
 thread_local bool t_mm_rpc_thread = false;
 thread_local std::string t_payout_miss;
+thread_local uint256 t_payout_basis;
 } // namespace
 
 MergedMiningManager::MergedMiningManager(boost::asio::io_context& ioc)
@@ -651,6 +652,8 @@ void MergedMiningManager::stop()
 
 void MergedMiningManager::note_payout_miss(const std::string& reason) { t_payout_miss = reason; }
 
+void MergedMiningManager::note_payout_basis(const uint256& best) { t_payout_basis = best; }
+
 bool MergedMiningManager::on_rpc_thread() { return t_mm_rpc_thread; }
 
 namespace {
@@ -659,7 +662,6 @@ nlohmann::json payout_source_json(const MergedPayoutSource::Stats& st)
     return {{"published", st.published},
             {"from_weights", st.from_weights},
             {"computed", st.computed},
-            {"reused_across_best", st.reused_across_best},
             {"busy", st.busy}};
 }
 } // namespace
@@ -685,6 +687,7 @@ nlohmann::json MergedMiningManager::get_rebuild_stats_json() const
     return {{"no_payouts", std::move(no_payouts)},
             {"kept_last_block", m_rebuild_kept_last_block},
             {"dropped_commitment", m_rebuild_dropped_commitment},
+            {"dropped_best_moved", m_rebuild_dropped_best_moved},
             {"stale_results", m_rebuild_stale_results},
             {"work_changed", m_rebuild_work_changed},
             {"work_unchanged", m_rebuild_work_unchanged},
@@ -1249,6 +1252,8 @@ bool MergedMiningManager::rebuild_cached_blocks()
     std::vector<nlohmann::json> built_templates;   // the template each header_infos entry was built from
     // Chains whose block could not be built this time (no payouts): chain id -> why.
     std::map<uint32_t, std::string> no_payouts;
+    // The best share each chain's payouts are (or would have been) split at.
+    std::map<uint32_t, uint256> payout_basis;
 
     for (auto& snap : snapshots)
     {
@@ -1259,12 +1264,16 @@ bool MergedMiningManager::rebuild_cached_blocks()
         info.block_height = static_cast<uint32_t>(snap.height);
 
         // Build PPLNS coinbase for this chain (NO lock held — safe)
+        payout_basis[snap.chain_id] = uint256();
         if (!payout_fn) {
             no_payouts[snap.chain_id] = "no_provider";
             continue;
         }
         t_payout_miss.clear();
+        t_payout_basis.SetNull();
         auto payouts = payout_fn(snap.chain_id, snap.coinbase_value);
+        payout_basis[snap.chain_id] = t_payout_basis;
+        info.payout_basis = t_payout_basis;
         if (payouts.empty()) {
             no_payouts[snap.chain_id] = t_payout_miss.empty() ? "empty" : t_payout_miss;
             continue;
@@ -1363,6 +1372,7 @@ bool MergedMiningManager::rebuild_cached_blocks()
             }
             chain.frozen_coinbase_hex = hi.coinbase_hex;
             chain.frozen_template = built_templates[k];
+            chain.frozen_payout_basis = hi.payout_basis;
 
             if (!chain.frozen_block_hash.IsNull()) {
                 chain.frozen_history[chain.frozen_block_hash] = {
@@ -1399,15 +1409,24 @@ bool MergedMiningManager::rebuild_cached_blocks()
     const auto prev_of = [](const nlohmann::json& t) {
         return t.is_object() ? t.value("previousblockhash", std::string()) : std::string();
     };
+    // The last block's payouts must also still be for the current best share:
+    // a job's LTC share carries that best as its prev share, and a V36 peer
+    // re-derives the merged payouts from it (p2pool data.py
+    // verify_merged_coinbase_commitment) and rejects the share otherwise.
     for (auto& chain : m_chains) {
         const auto np = no_payouts.find(chain.config.chain_id);
+        const auto basis = payout_basis.find(chain.config.chain_id);
+        const bool same_best = basis == payout_basis.end()
+            || basis->second == chain.frozen_payout_basis;
         const char* action = "its last block stays committed";
         if (chain.config.multiaddress && !chain.current_work.block_hash.IsNull()
-            && chain.current_work.block_hash != chain.frozen_block_hash) {
+            && (chain.current_work.block_hash != chain.frozen_block_hash || !same_best)) {
             const std::string parent = prev_of(chain.current_work.block_template);
-            const bool keep = !chain.frozen_block_hash.IsNull() && !parent.empty()
+            const bool keep = same_best && !chain.frozen_block_hash.IsNull() && !parent.empty()
                 && prev_of(chain.frozen_template) == parent
                 && chain.frozen_history.count(chain.frozen_block_hash) > 0;
+            if (!same_best)
+                ++m_rebuild_dropped_best_moved;
             if (keep) {
                 chain.current_work.block_hash = chain.frozen_block_hash;
                 // Jobs keep committing to it: it ages from now, not from when
@@ -1418,7 +1437,8 @@ bool MergedMiningManager::rebuild_cached_blocks()
             } else {
                 chain.current_work.block_hash.SetNull();
                 ++m_rebuild_dropped_commitment;
-                action = "no commitment to this chain until a block is built";
+                action = same_best ? "no commitment to this chain until a block is built"
+                                   : "the last block pays another best share: no commitment until a block is built";
             }
         }
         if (np == no_payouts.end())

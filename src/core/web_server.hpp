@@ -561,8 +561,12 @@ public:
         std::vector<uint256> coinbase_merkle_branches;
         std::vector<unsigned char> coinbase_script;
         std::string coinbase_hex;
+        uint256 payout_basis;   // best share the merged payouts were split at (null: not sharechain)
     };
     const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
+    /// Jobs built without the merged block because its payouts were split at
+    /// another best share than the job's prev share.
+    uint64_t get_merged_basis_mismatch_jobs() const { return m_merged_basis_mismatch_jobs.load(); }
     double get_local_hashrate() const { return m_cached_pool_hashrate; }
     void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
     double get_network_difficulty() const { return m_network_difficulty.load(); }
@@ -1686,6 +1690,7 @@ private:
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
     mutable std::vector<CachedMergedHeaderInfo> m_last_merged_header_infos;
+    mutable std::atomic<uint64_t> m_merged_basis_mismatch_jobs{0};
     uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
     bool m_cached_mweb_active{false};  // template rules named MWEB (Litecoin)

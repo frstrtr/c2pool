@@ -18,7 +18,9 @@
 //     busy: from the PPLNS weights the compute thread published for the best
 //     share, re-derived exactly for any coinbase value (a 30 s busy stretch
 //     with the fees changing every second still pays every rebuild), else a
-//     short wait for the lock on the RPC thread;
+//     short wait for the lock on the RPC thread; never from another best
+//     share's weights (V36 peers re-derive them from the share's prev share),
+//     and a kept block is dropped once the best share moves;
 //   - a retry that leaves the work as it was does not push it to the miners
 //     again; a kept block ages from when it was last kept; a find from an
 //     older job is submitted only if it meets the bits of its own block.
@@ -146,6 +148,7 @@ struct Rig {
     EmbeddedLike* b{nullptr};
     bool payouts{true};
     unsigned char payee{0x5c};
+    uint256 best;   // the sharechain best share the payouts are split at
     int64_t clock{1000};
     int work_pushes{0};
     Rig()
@@ -154,6 +157,7 @@ struct Rig {
         b = backend.get();
         mm.add_chain(b->cfg, std::move(backend));
         mm.set_payout_provider([this](uint32_t, uint64_t value) -> Payouts {
+            MergedMiningManager::note_payout_basis(best);
             if (!payouts) {
                 MergedMiningManager::note_payout_miss("tracker_busy");
                 return {};
@@ -304,6 +308,43 @@ TEST(MergedMining, KeptBlockDoesNotExpireUnderItsJobs)
 
     submit_job(r.mm, job_a);
     EXPECT_EQ(r.b->submits, 1) << "the kept block's snapshot expired under its jobs";
+}
+
+// The last block on the parent is kept while the payouts are unavailable,
+// but only while its payouts are for the current best share: once the best
+// moves (a new share), a job's LTC share carries the new best as prev share
+// and a V36 peer would re-derive other payouts. The block is dropped, and
+// the next one is built at the new best.
+TEST(MergedMining, KeptBlockIsDroppedWhenTheBestMoves)
+{
+    Rig r;
+    r.best.SetHex("b1");
+    r.mm.refresh_aux_work();   // block A, payouts at b1
+    const uint256 a = r.mm.get_current_work().at(98).block_hash;
+    ASSERT_EQ(r.mm.get_cached_header_infos_and_commitment().first.at(0).payout_basis, r.best);
+
+    r.payouts = false;
+    r.b->tip_id = std::string(62, '0') + "a2";   // fetched again, same parent, same best
+    r.b->curtime += 7;
+    r.mm.refresh_aux_work();
+    ASSERT_EQ(committed_root(r.mm), a) << "kept while the best is unchanged";
+
+    r.best.SetHex("b2");                         // a new share; the tracker still busy
+    r.mm.mark_pplns_dirty();
+    r.mm.refresh_aux_work();
+    EXPECT_TRUE(r.mm.get_auxpow_commitment().empty()) << "a block paying the previous best stays committed";
+    EXPECT_TRUE(r.mm.get_cached_header_infos_and_commitment().first.empty());
+    const auto j = r.mm.get_rebuild_stats_json();
+    EXPECT_EQ(j["dropped_best_moved"], 1u);
+    EXPECT_EQ(j["kept_last_block"], 1u);
+
+    r.payouts = true;                            // weights for b2 published
+    r.mm.refresh_aux_work();
+    const auto [infos, commitment] = r.mm.get_cached_header_infos_and_commitment();
+    ASSERT_EQ(infos.size(), 1u);
+    EXPECT_EQ(infos[0].payout_basis, r.best);
+    EXPECT_FALSE(commitment.empty());
+    EXPECT_NE(committed_root(r.mm), a);
 }
 
 // A share from an older job whose block is on another parent, with harder
@@ -514,11 +555,13 @@ TEST(MergedPayoutSource, ValueChangeIsDerivedExactlyWithoutTheLock)
 }
 
 // The tracker lock stays busy for 30 s (one rebuild a second, the fees
-// changing every time): every rebuild still gets payouts. The best share
-// moves at 15 s, the compute thread publishes its weights at 20 s: in
-// between the last published weights are used (their best share is the
-// previous tip of the same chain), after that the new ones, exactly.
-TEST(MergedPayoutSource, BusyLockForThirtySecondsStillPays)
+// changing every time): every rebuild on the best share whose weights the
+// compute thread published gets payouts, re-derived exactly. The best share
+// moves at 15 s and its weights are published at 20 s: in between there are
+// NO payouts. The previous best's weights would build a coinbase no V36
+// peer accepts on a share whose prev share is the new best (they re-derive
+// it from previous_share_hash).
+TEST(MergedPayoutSource, BusyLockPaysOnlyForThePublishedBest)
 {
     ltc::ShareTracker t;
     const uint256 b1 = add_shares(t, uint256(), 2, {{1, 0}, {2, 0}, {1, 0}, {3, 0}});
@@ -536,15 +579,18 @@ TEST(MergedPayoutSource, BusyLockForThirtySecondsStillPays)
             src.publish(tracker_weights(t, b2));   // the compute thread got there
         std::string miss;
         const Payouts p = src.get(best, 98, value, /*may_wait=*/true, kBusy, miss);
+        if (sec >= 15 && sec < 20) {
+            EXPECT_TRUE(p.empty()) << sec << " s: payouts for another best share";
+            EXPECT_EQ(miss, "tracker_busy") << sec << " s";
+            continue;
+        }
         ASSERT_FALSE(p.empty()) << "no payouts at " << sec << " s (" << miss << ")";
         EXPECT_EQ(total(p), value) << sec << " s";
-        EXPECT_EQ(p, with_the_lock(t, sec >= 15 && sec < 20 ? b1 : best, value)) << sec << " s";
+        EXPECT_EQ(p, with_the_lock(t, best, value)) << sec << " s";
     }
     const auto st = src.stats();
     EXPECT_EQ(st.from_weights, 25u);
-    EXPECT_EQ(st.reused_across_best, 5u);
-    EXPECT_EQ(st.busy, 0u);
-    EXPECT_EQ(src.reused(), 5u);
+    EXPECT_EQ(st.busy, 5u);
 }
 
 // One entry per best share: what the compute thread publishes for it (a

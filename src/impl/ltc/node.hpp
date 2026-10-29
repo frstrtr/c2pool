@@ -378,6 +378,13 @@ protected:
         // Still under the exclusive tracker lock, after the best-share
         // decision: consumers copy what they need from the tracker now
         // (set_locked_best_hook) instead of trying for the lock later.
+        run_locked_best_hook();
+    }
+    /// Compute thread, exclusive tracker lock held, right after
+    /// m_best_share_hash is set (publish_snapshot, and clean_tracker before
+    /// its prune).
+    void run_locked_best_hook()
+    {
         std::lock_guard<std::mutex> hook_lock(m_locked_best_hook_mutex);
         if (m_locked_best_hook) {
             try {

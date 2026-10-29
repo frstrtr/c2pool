@@ -2959,6 +2959,10 @@ void NodeImpl::clean_tracker()
 
             if (!result.best.IsNull()) {
                 m_best_share_hash = result.best;
+                // Same critical section as the decision: the merged payouts
+                // for this best share are available before the prune below
+                // (which can hold the lock for a long time).
+                run_locked_best_hook();
             }
 
             flush_verified_to_leveldb();

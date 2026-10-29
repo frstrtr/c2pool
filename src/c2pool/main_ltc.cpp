@@ -7515,7 +7515,9 @@ int main(int argc, char* argv[]) {
                 // weights of every best share it chooses while it holds the
                 // lock, and a rebuild derives the amounts for its coinbase
                 // value from them without the lock
-                // (c2pool/merged/payout_source.hpp).
+                // (c2pool/merged/payout_source.hpp). Only ever for the best
+                // share the jobs build on: V36 peers re-derive the payouts
+                // from the share's prev share.
                 auto merged_payout_source = mm_manager->payout_source();
                 auto combined_donation = std::vector<unsigned char>(
                     ltc::PoolConfig::COMBINED_DONATION_SCRIPT.begin(),
@@ -7582,6 +7584,10 @@ int main(int argc, char* argv[]) {
                         c2pool::merged::MergedMiningManager::note_payout_miss("no_best_share");
                         return {};
                     }
+                    // The payouts are split at exactly this best share (never
+                    // another one's weights): the jobs whose LTC share has it
+                    // as prev share are the ones that may carry the block.
+                    c2pool::merged::MergedMiningManager::note_payout_basis(best);
 
                     std::string miss;
                     Payouts result = merged_payout_source->get(
