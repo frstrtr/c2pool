@@ -446,6 +446,9 @@ TEST(DashPayeeFoldFeeder, PayeeLane_ParkOverflowFallsBackToWipe)
     EXPECT_EQ(r.st.mnstates().size(), 0u);
     EXPECT_EQ(r.f.parked(), 0u) << "no cursor any more: everything held is released";
     EXPECT_EQ(r.m.payee_fold_cursor(), 0u);
+    EXPECT_EQ(r.m.last_reseed_reason(), CoinStateMaintainer::ReseedReason::Gap);
+    EXPECT_TRUE(r.m.has_gap_seed())
+        << "the wiped queue is kept as the gap re-seed's resume point";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

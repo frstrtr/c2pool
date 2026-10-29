@@ -1907,6 +1907,38 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                 << " suppressed=" << d.suppressed;
 }
 
+bool DASHWorkSource::note_ready_idle(uint32_t height) const
+{
+    const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    coin::ServeGateJournal::Decision d;
+    {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        d = serve_gate_journal_.observe_ready_idle(now_sec);
+        if (!d.emit()) return false;
+        serve_gate_ledger_.bank_ready_idle(d, now_sec);
+        last_decline_ = coin::DeclineReport{};
+    }
+    if (d.prev_cause_sec >= 0 && !d.previous_cause.empty()) {
+        LOG_WARNING << "[EMBED-GATE-SEG] h=" << height
+                    << " cause=" << d.previous_cause
+                    << " dur=" << d.prev_cause_sec << "s"
+                    << " terminal=ready-idle";
+    }
+    LOG_WARNING << "[EMBED-GATE] h=" << height
+                << " arm=READY-IDLE (the embedded arm would serve; no miner is"
+                   " connected, so no template was sourced) — closed cause="
+                << (d.previous_cause.empty() ? "unknown" : d.previous_cause)
+                << (d.episode_sec >= 0
+                        ? " episode dur=" + std::to_string(d.episode_sec) + "s"
+                        : std::string())
+                << " " << d.suppressed << " decline(s) suppressed. Time from"
+                   " here until a miner asks is miner absence, not node"
+                   " downtime, and is charged to no cause.";
+    return true;
+}
+
 // Operator surface (per-coin /api/node_topology no_work_reason). Publishes the
 // SAME DeclineReport the journal logged, so the page and the log cannot
 // disagree; "unknown" before the first template is sourced, never a fabricated

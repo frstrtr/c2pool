@@ -328,6 +328,31 @@ public:
         return "UNKNOWN";
     }
 
+    /// WHY the maintainer asked (F2). The two asks are opposite evidence:
+    ///   * Desync — the queue disagreed with a block's coinbase at a
+    ///     contiguous height: divergence. Recorded as m_first_divergence,
+    ///     counted against kMaxRearms, backed off — all unchanged.
+    ///   * Gap    — the queue was never offered cursor+1 (a transport hole,
+    ///     the 2026-10-26 reserve incident). The queue is CORRECT as of its
+    ///     cursor. It is not divergence evidence, it burns no rung, it waits on
+    ///     no backoff, and it resumes from the live cursor (LiveSeed) when one
+    ///     is offered — replaying cursor+1..tip, tens of blocks, not thousands.
+    enum class RearmReason { Desync, Gap };
+    static const char* rearm_reason_name(RearmReason r)
+    {
+        return r == RearmReason::Gap ? "gap" : "desync";
+    }
+
+    /// The maintainer's payee queue at the moment a GAP wiped it, offered as
+    /// the resume point of a Gap re-arm. Adjudicated by try_restore() exactly
+    /// like a persisted record (R2..R8), so it is never trusted more than a
+    /// record from disk would be.
+    struct LiveSeed {
+        std::vector<std::pair<uint256, MNState>> entries;
+        uint32_t as_of{0};
+        uint256  as_of_hash;   // block folded at as_of; null = look it up
+    };
+
     /// ~34 days of DASH blocks at 2.5 min spacing. Chosen so a release cut
     /// within the last month bridges in minutes over the coin-P2P feed, and
     /// anything older is refused loudly instead of grinding.
@@ -559,6 +584,18 @@ public:
     /// resumed cursor is never more than one fold interval from a fold point.
     static constexpr uint32_t kDefaultPersistEvery = 250;
     void set_persist_every(uint32_t n) { m_persist_every = n ? n : 1; }
+    /// F3: within this many blocks of the header tip the bridge persists on
+    /// EVERY fold (the chase at the tip is a handful of blocks; losing one of
+    /// them to the 250-block throttle is what made a re-arm replay hundreds).
+    /// The bulk replay below it keeps m_persist_every.
+    static constexpr uint32_t kPersistAtTipSlack = 6;
+    /// F3: after PUBLISH the lane stops folding — the maintainer's payee
+    /// machine folds the live tip. note_live_fold() persists THAT queue, every
+    /// `n` live folds (default 1 = every block at tip, ~2.5 min on mainnet;
+    /// operator-approved disk cadence), so a restart or a gap re-seed replays
+    /// blocks-since-the-last-fold instead of blocks-since-the-last-publish.
+    static constexpr uint32_t kDefaultLivePersistEvery = 1;
+    void set_live_persist_every(uint32_t n) { m_live_persist_every = n ? n : 1; }
 
     // ─────────────────────────────────────────────────────────────────────
     // DIAGNOSTIC SEAMS (telemetry only — no serve/arm/consensus effect)
@@ -642,23 +679,7 @@ public:
             m_snapshot_pending
             && (now - m_snapshot_asked_at) >= kStatefulStallGraceMs;
         if (m_stateful_stall_fn) m_stateful_stall_fn(stateful_stalled);
-        if (stateful_stalled && m_reask_snapshot
-            && now - m_last_wallclock_reask >= kStatefulReaskIntervalMs) {
-            m_last_wallclock_reask = now;
-            ++m_wallclock_reasks;
-            LOG_WARNING << "[MN-CKPT] wall-clock RE-ASK of the "
-                        << (m_ondemand_pending ? "ON-DEMAND " : "")
-                        << "masternode-list request at h=" << m_snapshot_height
-                        << " after " << ((now - m_snapshot_asked_at) / 1000)
-                        << "s of silence — rotating to a fresh peer and"
-                           " striking the silent carrier (dashd wall-clock"
-                           " mnlistdiff re-ask; does NOT wait for a tip"
-                           " change). wall_reasks=" << m_wallclock_reasks;
-            m_reask_snapshot(m_snapshot_hash);
-            // PR-2: a fresh fan-out attempt — reset the race budget for the new
-            // set of carriers this re-ask reaches (flag-gated width; 1==today).
-            m_fresh_race.arm(m_snapshot_hash, fresh_datum_race_width());
-        }
+        wallclock_reask_tick(now);
 
         auto due = m_watchdog.due(now);
         if (!due) return;
@@ -675,6 +696,72 @@ public:
                     << " warn=" << m_watchdog.warnings()
                     << " — the payee queue is NOT advancing; the embedded arm"
                        " cannot arm until it does";
+    }
+
+    /// ── WALL-CLOCK RE-ASK of an outstanding masternode-list request ──────
+    ///
+    /// Driven from BOTH wall-clock timers (watchdog_tick, 30 s; service_tick,
+    /// 3 s) so its cadence is its own, not the slower timer's. Two phases:
+    ///
+    ///   * F3 FAST PHASE, inside kStatefulStallGraceMs of silence: re-send the
+    ///     SAME getmnlistd through the rotating first-ask seam (a different
+    ///     carrier, nobody struck) on dashd's block-stall schedule — 2 s,
+    ///     doubling, capped at 64 s (BLOCK_STALLING_TIMEOUT_DEFAULT /
+    ///     BLOCK_STALLING_TIMEOUT_MAX, net_processing.cpp:141-143, doubled per
+    ///     stall at :6441). On the 2026-10-26 reserve the BAN-STATE probe sat
+    ///     71..311 s and the tip PoSe fold 3 min on the old 45-60 s cadence
+    ///     over a churning pool; a lost request now costs seconds.
+    ///   * STRIKE PHASE, past the grace: the pre-existing re-ask through the
+    ///     rotate+demote seam every kStatefulReaskIntervalMs, unchanged.
+    ///
+    /// REWARD-SAFE: same request, same hash; a reply to any ask is matched by
+    /// the unchanged m_snapshot_hash and DIP-4 self-checked before it folds. A
+    /// duplicate reply after the fold is not claimed here and is refused by the
+    /// maintainer's stale zero-base guard (StaleZeroBaseSnapshotDoesNotCorrupt
+    /// TipSml), exactly like a late strike-phase reply today.
+    static constexpr int64_t kFastReaskFirstMs = 2000;
+    static constexpr int64_t kFastReaskMaxMs   = 64000;
+    void wallclock_reask_tick(int64_t now)
+    {
+        if (!m_snapshot_pending) return;
+        const int64_t silent = now - m_snapshot_asked_at;
+        if (silent >= kStatefulStallGraceMs) {
+            if (m_reask_snapshot
+                && now - m_last_wallclock_reask >= kStatefulReaskIntervalMs) {
+                m_last_wallclock_reask = now;
+                ++m_wallclock_reasks;
+                LOG_WARNING << "[MN-CKPT] wall-clock RE-ASK of the "
+                            << (m_ondemand_pending ? "ON-DEMAND " : "")
+                            << "masternode-list request at h=" << m_snapshot_height
+                            << " after " << (silent / 1000)
+                            << "s of silence — rotating to a fresh peer and"
+                               " striking the silent carrier (dashd wall-clock"
+                               " mnlistdiff re-ask; does NOT wait for a tip"
+                               " change). wall_reasks=" << m_wallclock_reasks;
+                m_reask_snapshot(m_snapshot_hash);
+                // PR-2: a fresh fan-out attempt — reset the race budget for the
+                // new set of carriers this re-ask reaches (flag-gated width;
+                // 1==today).
+                m_fresh_race.arm(m_snapshot_hash, fresh_datum_race_width());
+            }
+            return;
+        }
+        if (!m_request_snapshot) return;
+        const size_t  n   = std::min<size_t>(m_fast_reasks_this_ask, 5);
+        const int64_t gap = std::min<int64_t>(kFastReaskFirstMs << n, kFastReaskMaxMs);
+        const int64_t last = std::max(m_last_fast_reask_at, m_snapshot_asked_at);
+        if (now - last < gap) return;
+        m_last_fast_reask_at = now;
+        ++m_fast_reasks_this_ask;
+        ++m_fast_reasks;
+        LOG_INFO << "[MN-CKPT] fast RE-ASK #" << m_fast_reasks_this_ask
+                 << " of the " << (m_ondemand_pending ? "ON-DEMAND " : "")
+                 << "masternode-list request at h=" << m_snapshot_height
+                 << " after " << (silent / 1000) << "s — rotating carrier, no"
+                    " strike (dashd 2 s-doubling stall schedule; the striking"
+                    " re-ask takes over at " << (kStatefulStallGraceMs / 1000)
+                 << "s)";
+        m_request_snapshot(m_snapshot_hash);
     }
 
     /// ── EVENT-DRIVEN BODY RE-REQUEST. Call from a WALL-CLOCK TIMER, never
@@ -712,7 +799,12 @@ public:
         // and FailedClosed are terminal. Match request_window's own guard so a
         // fold pause (m_snapshot_pending) is left to the fold reply to resume.
         if (m_state != State::Bridging) return;
-        if (m_snapshot_pending) return;
+        if (m_snapshot_pending) {
+            // Paused on a fold / probe reply: the 3 s clock drives the
+            // wall-clock re-ask schedule (F3) instead of a body re-request.
+            wallclock_reask_tick(m_now());
+            return;
+        }
         if (!m_tip_height) return;
         const uint32_t tip = m_tip_height();
         if (tip == 0 || m_next > tip) return;   // nothing left to fetch
@@ -948,9 +1040,13 @@ public:
 
     /// Re-arm the bridge after the maintainer wiped a desynced payee queue.
     /// `why` is the operator-facing trigger text and appears in every line.
-    RearmOutcome rearm(const MnCheckpoint& cp, const std::string& why)
+    RearmOutcome rearm(const MnCheckpoint& cp, const std::string& why,
+                       RearmReason reason = RearmReason::Desync,
+                       const LiveSeed* live = nullptr)
     {
         ++m_rearm_asks;
+        const bool gap = (reason == RearmReason::Gap);
+        if (gap) ++m_gap_rearm_asks;
         // A field never evaluated prints "n/a", never "0" — 0 is a height.
         const bool     have_tip = static_cast<bool>(m_tip_height);
         const uint32_t at       = have_tip ? m_tip_height() : 0;
@@ -968,7 +1064,9 @@ public:
             m_last_rearm_trigger = why;
             std::ostringstream ln;
             ln << "[MN-CKPT] RE-ARM " << rearm_outcome_name(o)
-               << " (ask #" << m_rearm_asks << ", attempt " << attempt_s
+               << " (ask #" << m_rearm_asks
+               << (gap ? std::string(", reason=gap, not counted against the cap")
+                       : ", attempt " + attempt_s)
                << ", " << m_rearms << " already used)"
                << " trigger='" << why << "'"
                << " anchor h=" << (cp.ok ? std::to_string(cp.height)
@@ -995,7 +1093,9 @@ public:
                          " fallback until the operator restarts with a fixed"
                          " anchor or a coin RPC (--coin-rpc-*).");
         }
-        if (m_rearms >= kMaxRearms) {
+        // F2: a gap burns no rung — three transport holes in one process are
+        // three transport holes, not a standing disagreement with the chain.
+        if (!gap && m_rearms >= kMaxRearms) {
             m_rearm_blocked = true;
             m_rearm_block_reason =
                 "the re-arm cap of " + std::to_string(kMaxRearms)
@@ -1025,9 +1125,14 @@ public:
 
         // ── THE ANCHOR-SELECTION GUARD (never newest-first) ───────────────
         // Record the earliest height at which we have evidence of divergence.
-        // Every re-seed ask IS such evidence: the maintainer only calls back
-        // after apply_block reported a payee desync or an apply gap.
-        if (have_tip && (m_first_divergence == 0 || at < m_first_divergence))
+        // A DESYNC ask is such evidence: apply_block saw the chain's coinbase
+        // disagree with our queue at a contiguous height. A GAP ask is NOT
+        // (F2): the queue was never offered the missing block, it did not
+        // disagree with anything, and recording it here is what made the
+        // 2026-10-27 02:18 re-arm refuse a sound cursor under R8 and replay
+        // 12 571 blocks cold.
+        if (!gap && have_tip
+            && (m_first_divergence == 0 || at < m_first_divergence))
             m_first_divergence = at;
 
         if (m_anchor_height != 0 && cp.height > m_anchor_height) {
@@ -1063,6 +1168,60 @@ public:
                        + "). Such an anchor replays cleanly BECAUSE it already"
                          " contains the divergence — it would re-arm a wrong"
                          " queue and mint a rejected coinbase.");
+        }
+
+        // ── GAP: resume, do not re-derive ────────────────────────────────
+        if (gap) {
+            if (m_state == State::Waiting || m_state == State::Bridging) {
+                return say(RearmOutcome::Deferred,
+                           "a bridge is already in flight (" + std::string(
+                               state_name()) + "); a gap ask needs no second"
+                           " one — its publish answers this ask too");
+            }
+            // A live payee gap exists only after a PUBLISH (the maintainer
+            // folds nothing before). Any other state means the BRIDGE itself
+            // is down: its own capped, backed-off self re-arm (poll_rearm)
+            // owns that recovery, and a gap ask must not become a way around
+            // the cap.
+            if (m_state != State::Published) {
+                return say(RearmOutcome::Deferred,
+                           "the lane is " + std::string(state_name())
+                           + ", not published; recovery belongs to the capped"
+                             " self re-arm, not to a gap ask");
+            }
+            // Build the resume record BEFORE reset_for_arm(): its lineage and
+            // spent budgets are the ones this lane published, and the reset
+            // is about to clear them. R2 then compares that lineage against
+            // the anchor `cp` installs, so a different anchor refuses it.
+            std::optional<MnBridgeCursor> live_rec;
+            std::string live_note = "no live cursor offered";
+            if (live) live_rec = make_live_record(*live, live_note);
+            ++m_gap_rearms;
+            reset_for_arm(cp);
+            if (live_rec) {
+                m_pending_restore = std::move(live_rec);
+                m_pending_is_live = true;
+                m_restore_settled = false;
+                m_restore_defers  = 0;
+            }
+            m_status = "RE-ARMED after a payee APPLY GAP (gap re-arm "
+                       + std::to_string(m_gap_rearms) + ", not counted against"
+                         " the cap) at h=" + std::to_string(cp.height) + "; "
+                       + (m_pending_restore
+                              ? std::string(m_pending_is_live
+                                                ? "resuming from the LIVE payee cursor"
+                                                : "resuming from the persisted cursor")
+                              : std::string("replaying from the anchor"));
+            return say(RearmOutcome::Armed,
+                       "GAP re-arm: the payee queue was never offered the"
+                       " missing block(s), which is not evidence of divergence"
+                       " — m_first_divergence untouched, no rung spent, no"
+                       " backoff. " + (m_pending_is_live
+                           ? "Resuming from the live cursor h="
+                             + std::to_string(live->as_of) + " (replays h="
+                             + std::to_string(live->as_of + 1) + "..tip)."
+                           : "Live cursor not usable (" + live_note
+                             + "); the persisted cursor / anchor decides."));
         }
 
         // ── BACKOFF ──────────────────────────────────────────────────────
@@ -1119,7 +1278,19 @@ public:
         // the same reason: the deferral counter is reset with everything else
         // and the record is re-adjudicated from scratch against this arm's
         // evidence, R8 included.
+        // F3 x DESYNC: live-follow records (note_live_fold) describe the very
+        // queue that just disagreed with the chain. Capture the last BRIDGE
+        // publish (m_machine is frozen at it while Published) before the
+        // reset reloads the anchor, so the re-arm resumes where it did before
+        // F3 existed.
+        std::optional<MnBridgeCursor> published_rec;
+        if (m_live_persisted_since_publish && m_state == State::Published
+            && m_published_as_of > m_anchor_height && m_header_hash_at) {
+            if (auto ph = m_header_hash_at(m_published_as_of))
+                published_rec = make_cursor_record(m_published_as_of, *ph, nullptr);
+        }
         reset_for_arm(cp);
+        implicate_live_follow_records(std::move(published_rec));
         m_status = "RE-ARMED " + std::to_string(m_rearms) + "/"
                    + std::to_string(kMaxRearms) + " at h="
                    + std::to_string(cp.height) + " ("
@@ -1308,12 +1479,147 @@ public:
         return out == RearmOutcome::Armed;
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // F3: LIVE-FOLLOW CURSOR PERSISTENCE (after PUBLISH)
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Once the bridge publishes it stops folding: the maintainer's payee
+    // machine folds every later block. The record on disk therefore stayed at
+    // the publish height — on the 2026-10-26 reserve it was 198 blocks old
+    // when the re-seed came, and a restart after days of uptime replays days.
+    // note_live_fold() persists the maintainer's queue at every live fold
+    // (kDefaultLivePersistEvery = 1) under THIS lane's lineage: the queue is
+    // the published set folded forward one contiguous block at a time by the
+    // same MnStateMachine::apply_block (the maintainer refuses gaps and wipes
+    // on them, and a wipe ends the live lineage until the next publish), so
+    // the R5 arithmetic applied == cursor - anchor is the truth, not a claim.
+    //
+    // A DESYNC re-arm does not resume from these records — they describe the
+    // queue that just desynced (see implicate_live_follow_records). A restart
+    // and a GAP re-arm do.
+
+    /// main_dash: CoinStateMaintainer::set_on_payee_folded, called only while
+    /// the maintainer's queue is sourced from THIS lane (kPayeeSourceMnCkpt).
+    void note_live_fold(const MnStateMachine::Entries& entries, uint32_t height,
+                        const uint256& block_hash)
+    {
+        if (m_state != State::Published || m_published_as_of == 0) return;
+        if (height <= m_live_cursor) return;            // duplicate / old
+        if (m_live_broken) { m_live_cursor = height; return; }
+        if (height != m_live_cursor + 1) {
+            // Never write a record that skipped heights; say so once and stop
+            // until the next publish re-roots the live lineage.
+            LOG_WARNING << "[MN-CKPT] live cursor NOT persisted from h=" << height
+                        << ": it does not extend the live lineage at h="
+                        << m_live_cursor << " (published h=" << m_published_as_of
+                        << ") — live-follow persistence stops until the next"
+                           " bridge publish";
+            m_live_broken = true;
+            m_live_cursor = height;
+            return;
+        }
+        m_live_cursor = height;
+        if (!m_cursor_store) return;
+        if (height - m_last_persisted < m_live_persist_every) return;
+        uint256 hash = block_hash;
+        if (hash.IsNull() && m_header_hash_at) {
+            if (auto h = m_header_hash_at(height)) hash = *h;
+        }
+        if (hash.IsNull()) return;   // cannot name the block; do not claim it
+        std::vector<std::pair<uint256, MNState>> set(entries.begin(), entries.end());
+        MnBridgeCursor rec = make_cursor_record(height, hash, &set);
+        rec.applied = height - m_anchor_height;
+        if (!rec.contiguous() || rec.entries.empty()) return;
+        if (!m_cursor_store->store(rec)) {
+            if (!m_persist_io_warned) {
+                m_persist_io_warned = true;
+                LOG_WARNING << "[MN-CKPT] could NOT write the live cursor to "
+                            << m_cursor_store->path();
+            }
+            return;
+        }
+        m_last_persisted = height;
+        ++m_persist_writes;
+        ++m_live_persist_writes;
+        m_live_persisted_since_publish = true;
+        if (m_live_persist_writes == 1 || (m_live_persist_writes % 100) == 0)
+            LOG_INFO << "[MN-CKPT] live cursor PERSISTED h=" << height << " "
+                     << hash.GetHex().substr(0, 16) << " entries=" << rec.entries.size()
+                     << " (live writes=" << m_live_persist_writes
+                     << " since publish h=" << m_published_as_of
+                     << ") — a restart or a gap re-seed resumes here";
+    }
+
+private:
+    /// F2: the LiveSeed as a cursor record under this lane's lineage, or
+    /// nullopt with the reason. Built BEFORE reset_for_arm() (it reads the
+    /// published lane's spent budgets); adjudicated by try_restore() after it.
+    std::optional<MnBridgeCursor> make_live_record(const LiveSeed& live,
+                                                   std::string& why) const
+    {
+        if (m_state != State::Published || m_published_as_of == 0) {
+            why = "the lane has not published the lineage this queue descends from";
+            return std::nullopt;
+        }
+        if (live.entries.empty()) { why = "empty queue"; return std::nullopt; }
+        if (live.as_of < m_published_as_of) {
+            why = "live cursor h=" + std::to_string(live.as_of)
+                  + " is below the publish h=" + std::to_string(m_published_as_of);
+            return std::nullopt;
+        }
+        if (live.as_of <= m_anchor_height) { why = "at/below the anchor"; return std::nullopt; }
+        uint256 hash = live.as_of_hash;
+        if (hash.IsNull() && m_header_hash_at) {
+            if (auto h = m_header_hash_at(live.as_of)) hash = *h;
+        }
+        if (hash.IsNull()) {
+            why = "cannot name the block at h=" + std::to_string(live.as_of);
+            return std::nullopt;
+        }
+        MnBridgeCursor rec = make_cursor_record(live.as_of, hash, &live.entries);
+        rec.applied = live.as_of - m_anchor_height;
+        return rec;
+    }
+
+    /// F3 x DESYNC: put the last BRIDGE publish back in front of the re-arm
+    /// (and on disk, so a restart mid-re-arm does not resume the implicated
+    /// live record either). A no-op unless live records were written.
+    void implicate_live_follow_records(std::optional<MnBridgeCursor> pub)
+    {
+        if (!m_live_persisted_since_publish) return;
+        m_live_persisted_since_publish = false;
+        if (!pub) return;
+        LOG_WARNING << "[MN-CKPT] DESYNC re-arm: the live-follow cursor records"
+                       " (through h=" << m_live_cursor << ") describe the queue"
+                       " that just desynced — resuming from the last BRIDGE"
+                       " publish h=" << pub->cursor_height
+                    << " instead (rewritten to the cursor store)";
+        if (m_cursor_store) m_cursor_store->store(*pub);
+        m_pending_restore = std::move(pub);
+        m_pending_is_live = false;
+        m_restore_settled = false;
+        m_restore_defers  = 0;
+    }
+
+public:
     /// How many re-arms have actually been spent against the cap.
     uint32_t rearms() const           { return m_rearms; }
     /// How many times a re-seed was ASKED for, including deferrals and
     /// refusals. Deliberately distinct from rearms(): "asked 9 times, re-armed
     /// 3" and "asked 3 times, re-armed 3" are different diagnoses.
     uint32_t rearm_asks() const       { return m_rearm_asks; }
+    /// F2: gap asks and the gap re-arms they produced (never against the cap).
+    uint32_t gap_rearm_asks() const   { return m_gap_rearm_asks; }
+    uint32_t gap_rearms() const       { return m_gap_rearms; }
+    /// Did the current bridge resume from a LIVE payee cursor (gap re-seed)?
+    bool     resumed_from_live() const { return m_resumed_from_live; }
+    /// F3 telemetry: live-follow folds seen / persisted since the last publish.
+    uint32_t live_cursor() const        { return m_live_cursor; }
+    uint32_t live_persist_writes() const { return m_live_persist_writes; }
+    uint32_t persist_writes() const     { return m_persist_writes; }
+    uint32_t last_persisted() const     { return m_last_persisted; }
+    uint32_t published_as_of() const    { return m_published_as_of; }
+    size_t   fast_reasks() const        { return m_fast_reasks; }
     uint32_t rearm_cap() const        { return kMaxRearms; }
     bool     rearm_blocked() const    { return m_rearm_blocked; }
     /// The last named outcome, verbatim. Empty until the first ask — which is
@@ -2178,6 +2484,7 @@ private:
     void load_pending_cursor()
     {
         m_pending_restore.reset();
+        m_pending_is_live = false;
         m_restore_settled = m_cursor_store == nullptr;
         m_restore_defers  = 0;
         m_restore_verdict.clear();
@@ -2201,6 +2508,18 @@ private:
     /// cannot vouch for costs a replay, not a refusal to serve.
     void restore_cold(const std::string& rule, const std::string& detail)
     {
+        if (m_pending_is_live) {
+            // F2: the refused candidate was the maintainer's LIVE cursor, not
+            // the record on disk. Do NOT erase the disk record over it: re-park
+            // that record and let try_restore() adjudicate it next, on the
+            // same rules, as a gap re-arm without a live seed would have.
+            LOG_WARNING << "[MN-CKPT] LIVE payee cursor REFUSED [" << rule
+                        << "]: " << detail
+                        << " — falling back to the persisted cursor / anchor";
+            load_pending_cursor();
+            m_restore_fallback = true;
+            return;
+        }
         m_pending_restore.reset();
         m_restore_settled = true;
         m_cursor_restored = false;
@@ -2262,6 +2581,16 @@ private:
     /// another arm's verdict — the anchor, the header chain and
     /// m_first_divergence are all different evidence by then.
     bool try_restore()
+    {
+        const bool proceed = try_restore_once();
+        if (!m_restore_fallback) return proceed;
+        // A refused live seed re-parked the disk record: adjudicate it NOW,
+        // in this same pump, before anything is applied.
+        m_restore_fallback = false;
+        return try_restore_once();
+    }
+
+    bool try_restore_once()
     {
         if (m_restore_settled) return true;
         if (!m_pending_restore) { m_restore_settled = true; return true; }
@@ -2466,12 +2795,21 @@ private:
         m_cursor_restored = true;
         m_restored_at     = rec.cursor_height;
         m_restore_settled = true;
+        m_resumed_from_live = m_pending_is_live;
+        m_pending_is_live   = false;
         m_restore_verdict =
-            "RESTORED at h=" + std::to_string(rec.cursor_height) + " ("
+            std::string(m_resumed_from_live ? "RESUMED-LIVE" : "RESTORED")
+            + " at h=" + std::to_string(rec.cursor_height) + " ("
             + std::to_string(rec.entries.size()) + " masternodes, "
-            + std::to_string(rec.applied) + " blocks already replayed by a"
-              " previous process)";
-        LOG_INFO << "[MN-CKPT] persisted cursor ACCEPTED: h="
+            + std::to_string(rec.applied)
+            + (m_resumed_from_live
+                   ? " blocks of contiguous lineage from the anchor; the live"
+                     " payee queue a gap wiped)"
+                   : " blocks already replayed by a previous process)");
+        LOG_INFO << "[MN-CKPT] "
+                 << (m_resumed_from_live ? "LIVE payee cursor (gap re-seed)"
+                                         : "persisted cursor")
+                 << " ACCEPTED: h="
                  << rec.cursor_height << " " << have->GetHex().substr(0, 16)
                  << " entries=" << rec.entries.size()
                  << " eligible=" << m_machine.eligible_size()
@@ -2583,17 +2921,14 @@ private:
                        " --embedded-mn-bridge-max.";
     }
 
-    void note_persist(bool force)
+    /// The record a write site persists: this lane's lineage and spent
+    /// budgets, the given cursor, and the given set. Shared by the bridge's
+    /// note_persist(), publish() and the live-follow note_live_fold() so the
+    /// three can never drift apart field by field.
+    MnBridgeCursor make_cursor_record(
+        uint32_t cursor, const uint256& cursor_hash,
+        const std::vector<std::pair<uint256, MNState>>* entries) const
     {
-        if (!m_cursor_store) return;
-        if (m_state != State::Bridging && m_state != State::Published) return;
-        const uint32_t cursor = m_next ? m_next - 1 : 0;
-        if (cursor <= m_anchor_height) return;
-        if (!force && (cursor - m_last_persisted) < m_persist_every) return;
-        if (!m_header_hash_at) return;
-        auto hash = m_header_hash_at(cursor);
-        if (!hash) return;   // cannot name the block we folded; do not claim to
-
         MnBridgeCursor rec;
         rec.anchor_height      = m_anchor_height;
         rec.anchor_hash        = m_anchor_hash;
@@ -2602,7 +2937,7 @@ private:
         rec.anchor_eligible    = static_cast<uint32_t>(m_anchor_eligible);
         rec.anchor_ineligible  = static_cast<uint32_t>(m_anchor_ineligible);
         rec.cursor_height      = cursor;
-        rec.cursor_hash        = *hash;
+        rec.cursor_hash        = cursor_hash;
         rec.applied            = m_restored_applied + m_applied;
         rec.folds              = m_restored_folds + m_folds;
         rec.first_fold_height  = m_first_fold_height;
@@ -2622,9 +2957,36 @@ private:
         rec.revive_dropped     = static_cast<uint32_t>(m_revive_dropped);
         rec.registered         = static_cast<uint32_t>(m_registered);
         rec.spent              = static_cast<uint32_t>(m_spent);
-        rec.entries.reserve(m_machine.entries().size());
-        for (const auto& [h, st] : m_machine.entries())
-            rec.entries.emplace_back(h, st);
+        if (entries) {
+            rec.entries = *entries;
+        } else {
+            rec.entries.reserve(m_machine.entries().size());
+            for (const auto& [h, st] : m_machine.entries())
+                rec.entries.emplace_back(h, st);
+        }
+        return rec;
+    }
+
+    void note_persist(bool force)
+    {
+        if (!m_cursor_store) return;
+        if (m_state != State::Bridging && m_state != State::Published) return;
+        const uint32_t cursor = m_next ? m_next - 1 : 0;
+        if (cursor <= m_anchor_height) return;
+        // F3: AT THE TIP every fold is persisted; the bulk replay below it
+        // keeps the coarse interval (a record is one ~700 KB rename, absurd per
+        // block at 375 blk/s, cheap at one block per ~2.5 min).
+        uint32_t every = m_persist_every;
+        if (m_tip_height) {
+            const uint32_t tip = m_tip_height();
+            if (tip >= cursor && tip - cursor <= kPersistAtTipSlack) every = 1;
+        }
+        if (!force && (cursor - m_last_persisted) < every) return;
+        if (!m_header_hash_at) return;
+        auto hash = m_header_hash_at(cursor);
+        if (!hash) return;   // cannot name the block we folded; do not claim to
+
+        MnBridgeCursor rec = make_cursor_record(cursor, *hash, nullptr);
 
         // SELF-CHECK BEFORE PUBLISHING THE RECORD. R5 is the rule a reader
         // enforces; checking it at the WRITER too means a lane that has
@@ -3016,6 +3378,8 @@ public:
         // while the header tip is itself stalled (the ondemand-mnlist freeze).
         m_snapshot_asked_at    = m_now();
         m_last_wallclock_reask = m_snapshot_asked_at;
+        m_last_fast_reask_at   = m_snapshot_asked_at;
+        m_fast_reasks_this_ask = 0;
         // PR-0 instrumentation (record-only): the off-embedded window opens the
         // moment the fold ask goes out. t_data_arrived/t_fold_complete/t_resumed
         // are stamped in on_historical_snapshot(). Pure timestamp; no behaviour.
@@ -3996,6 +4360,11 @@ public:
         // throttle and every restart would still redo up to kDefaultPersistEvery
         // blocks for no reason.
         note_persist(/*force=*/true);
+        // F3: root the live-follow lineage at this publish.
+        m_published_as_of = as_of;
+        m_live_cursor     = as_of;
+        m_live_broken     = false;
+        m_live_persisted_since_publish = false;
         m_publish(std::move(out), as_of);
     }
 
@@ -4298,6 +4667,10 @@ public:
         m_pending_restore.reset();
         m_restore_verdict.clear();
         m_restore_settled = true;    // the declared default: nothing owed…
+        m_restore_fallback  = false;
+        m_resumed_from_live = false;
+        m_fast_reasks_this_ask = 0;
+        m_last_fast_reask_at   = 0;
         load_pending_cursor();       // …re-opened here iff a record exists
         m_progress.start(0, m_now());
         m_watchdog.disarm();         // re-armed at the Waiting->Bridging edge
@@ -4533,6 +4906,23 @@ public:
     uint32_t m_persist_every{kDefaultPersistEvery};
     uint32_t m_last_persisted{0};
     uint32_t m_persist_writes{0};
+    // ── F2/F3 (gap re-seed + live-follow persistence). The live lineage is
+    // rooted at each publish (publish() sets these) and survives
+    // reset_for_arm(): a gap re-arm reads it AFTER the decision to re-arm.
+    uint32_t m_live_persist_every{kDefaultLivePersistEvery};
+    uint32_t m_published_as_of{0};       // height of the last bridge publish
+    uint32_t m_live_cursor{0};           // last live fold seen after it
+    bool     m_live_broken{false};       // a live fold skipped: stop until publish
+    bool     m_live_persisted_since_publish{false};
+    uint32_t m_live_persist_writes{0};
+    bool     m_pending_is_live{false};   // m_pending_restore is a LiveSeed
+    bool     m_restore_fallback{false};  // a refused live seed re-parked the disk record
+    bool     m_resumed_from_live{false}; // this bridge resumed from a live cursor
+    uint32_t m_gap_rearm_asks{0};        // F2: gap asks (never against the cap)
+    uint32_t m_gap_rearms{0};            // F2: gap re-arms armed
+    size_t   m_fast_reasks{0};           // F3: rotate-only fast re-asks issued
+    size_t   m_fast_reasks_this_ask{0};  // ...for the outstanding ask
+    int64_t  m_last_fast_reask_at{0};
     bool     m_persist_io_warned{false};
     bool     m_persist_arith_warned{false};
     uint32_t m_resume_hold_logged{0};

@@ -3695,11 +3695,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // loudly -- never a silent drop. &rpc is lifetime-safe: rpc is declared
     // above work_source in this scope, so work_source (which owns this lambda)
     // is destroyed BEFORE rpc at scope exit.
+    // F4: on a DAEMONLESS node this arm serves NO work. Say so as a WARNING
+    // once per off-embedded stretch (a stretch ends after 120 s without a
+    // fallback call, i.e. the embedded arm served again) instead of one stdout
+    // line every template refresh that reads like a working fallback.
+    // Atomics: the fallback is called from whichever thread sources templates.
+    auto fb_unarmed_last_ms    = std::make_shared<std::atomic<int64_t>>(0);
+    auto fb_unarmed_suppressed = std::make_shared<std::atomic<uint64_t>>(0);
     std::function<dash::coin::DashWorkData()> dashd_fallback =
-        [&rpc]() -> dash::coin::DashWorkData {
+        [&rpc, fb_unarmed_last_ms, fb_unarmed_suppressed]()
+            -> dash::coin::DashWorkData {
             if (!rpc) {
-                std::cout << "[DASH-STRATUM-GBT] fallback arm UNARMED (no dashd "
-                             "RPC creds) -- serving empty set-gap template\n";
+                const int64_t now  = dash::coin::diag::steady_now_ms();
+                const int64_t last = fb_unarmed_last_ms->exchange(now);
+                if (last == 0 || now - last > 120000) {
+                    const uint64_t prev = fb_unarmed_suppressed->exchange(0);
+                    LOG_WARNING
+                        << "[DASH-STRATUM-GBT] fallback arm UNARMED (no dashd RPC"
+                           " creds): this node is DAEMONLESS, so a declined"
+                           " embedded arm serves NO work (empty set-gap"
+                           " template) — miners idle until the embedded arm is"
+                           " ready again. Further calls this stretch are"
+                           " suppressed"
+                        << (prev ? " (previous stretch: " + std::to_string(prev)
+                                       + " suppressed)"
+                                 : std::string());
+                } else {
+                    fb_unarmed_suppressed->fetch_add(1);
+                }
                 return dash::coin::DashWorkData{};
             }
             return rpc->getwork();
@@ -5849,6 +5872,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // unseeded / wiped awaiting its re-seed).
         payee_feeder.set_cursor_fn(
             [m = maintainer.get()]() { return m->payee_fold_cursor(); });
+        // F4: name the posture in the fail-closed lines.
+        maintainer->set_fallback_armed(static_cast<bool>(rpc));
         // Leg 4 (MN-set RESYNC): Node::mn_list_update -> maintainer
         // .on_mn_list_update. Dash's P2P Simplified MN List omits scriptPayout,
         // so the payout-bearing feed for this leg is the E2c RPC seed below
@@ -8540,12 +8565,34 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // captured BY VALUE rather than re-parsed per ask: parsing is not
             // free and a deferred ask must stay cheap.
             mn_reseed_fallback =
-                [mnl = mn_ckpt_lane.get(), anchor = ckpt]() {
+                [mnl = mn_ckpt_lane.get(), anchor = ckpt, m = maintainer.get()]() {
                     using Lane    = dash::coin::MnCheckpointLane;
+                    using Maint   = dash::coin::CoinStateMaintainer;
+                    // F2: a GAP is not divergence. It burns no re-arm rung,
+                    // records no divergence height, and resumes from the
+                    // queue the gap wiped (still correct as of its cursor)
+                    // when that queue descends from this lane.
+                    const bool gap =
+                        m->last_reseed_reason() == Maint::ReseedReason::Gap;
+                    std::optional<Lane::LiveSeed> live;
+                    if (gap) {
+                        if (auto g = m->take_gap_seed();
+                            g && g->source == dash::coin::replay::kPayeeSourceMnCkpt) {
+                            live.emplace();
+                            live->entries    = std::move(g->entries);
+                            live->as_of      = g->as_of;
+                            live->as_of_hash = g->as_of_hash;
+                        }
+                    }
                     const auto out = mnl->rearm(
                         anchor,
-                        "CoinStateMaintainer wiped a desynced/gapped payee"
-                        " queue and asked for an authoritative re-seed");
+                        gap ? "CoinStateMaintainer wiped a GAPPED payee queue"
+                              " (a block it was never offered) and asked for a"
+                              " re-seed"
+                            : "CoinStateMaintainer wiped a desynced payee"
+                              " queue and asked for an authoritative re-seed",
+                        gap ? Lane::RearmReason::Gap : Lane::RearmReason::Desync,
+                        live ? &*live : nullptr);
                     std::cout << "[run] E2d MN-set RE-SEED ask -> bridge re-arm "
                               << Lane::rearm_outcome_name(out)
                               << " (" << mnl->rearms() << "/"
@@ -8565,6 +8612,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     mnl->pump();
                 };
             maintainer->set_on_mn_reseed(mn_reseed_fallback);
+            // F3: persist the LIVE payee queue at every clean fold, under the
+            // lane's lineage, while that queue is the one this lane published.
+            maintainer->set_on_payee_folded(
+                [mnl = mn_ckpt_lane.get(), m = maintainer.get()](
+                    const dash::coin::MnStateMachine::Entries& entries,
+                    uint32_t height, const uint256& block_hash) {
+                    if (m->mn_source() != dash::coin::replay::kPayeeSourceMnCkpt)
+                        return;
+                    mnl->note_live_fold(entries, height, block_hash);
+                });
 
             // ── DASHD-CUT ARM: the MN DIFF/SNAPSHOT STORE on the COLD bridge ──
             // The store block below (dashd evodb dmn_D4/dmn_S3 port) was DORMANT
@@ -10993,13 +11050,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
-                      &header_chain, &mn_ckpt_lane](
+                      &header_chain, &mn_ckpt_lane,
+                      ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
             ++*ticks;
 
             // ── 1. LANE WATCHDOG (every tick) ───────────────────────────
             if (mn_ckpt_lane) mn_ckpt_lane->watchdog_tick();
+
+            // ── 1b. READY-IDLE (F4, every tick): the arm would serve but no
+            // miner is connected, so nothing sources a template to close the
+            // decline segment — close it here, so the rollup charges the cause
+            // its own time and not the miners' absence.
+            if (ws_ri && stratum_server
+                && stratum_server->get_session_count() == 0
+                && node_coin_state.describe_decline().viable)
+                ws_ri->note_ready_idle(
+                    header_chain ? header_chain->height() + 1 : 0);
 
             // ── 2. EMBED-STATUS (every 2nd tick = 60 s) ─────────────────
             if ((*ticks % 2) == 0) {
