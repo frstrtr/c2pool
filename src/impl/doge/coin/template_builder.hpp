@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <ctime>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,46 @@ using ltc::coin::compute_merkle_root;
 using ltc::coin::compute_txid;
 using ltc::coin::bits_to_hex;
 using ltc::coin::TX_WITH_WITNESS;
+
+/// The degraded code of a template built while the set the pool prices
+/// against cannot show every input unspent (core::coin::kTemplateDegradedKey).
+inline constexpr const char* kUtxoIncomplete = "utxo-incomplete";
+
+/// Can the pool's view price a DOGE template on `tip_height`?
+///   - no view: no;
+///   - a set with a sync state (the full set): only when complete(), i.e.
+///     built from genesis and at the tip;
+///   - a legacy accrual view (no sync state): yes, as before (the dual-DB
+///     transition prices against it until the full set completes).
+inline bool utxo_view_prices(const core::coin::UTXOViewCache* view, uint32_t tip_height)
+{
+    if (!view)
+        return false;
+    if (!view->sync_state().tracked())
+        return true;
+    return view->complete(tip_height);
+}
+
+/// The DOGE mining gate (EmbeddedCoinNode::is_synced), on the set the pool
+/// prices against:
+///   - no view: closed;
+///   - the full set (a sync state): built from genesis and its best has
+///     reached the header chain's tip once (synced). Behind the tip later
+///     (a restart, a block in flight, a rebuild) the gate stays open and the
+///     templates are coinbase-only (utxo-incomplete): a closed gate gives the
+///     merged-mining poll empty work, which keeps the old tip's work until
+///     the next tip change (MergedMiningManager::refresh_aux_work);
+///   - a legacy accrual view: blocks_connected() >= DOGE_MINING_GATE_DEPTH,
+///     the predicate before the full set.
+inline bool utxo_mining_gate(const core::coin::UTXOViewCache* view)
+{
+    if (!view)
+        return false;
+    const auto s = view->sync_state();
+    if (s.tracked())
+        return s.anchor_height == 0 && s.synced != 0;
+    return view->blocks_connected() >= core::coin::DOGE_MINING_GATE_DEPTH;
+}
 
 // ─── DOGE TemplateBuilder ────────────────────────────────────────────────────
 
@@ -95,6 +136,16 @@ public:
     // (~50 kB); reviewable by btc-heap-opt.
     static constexpr uint64_t UNDERFILL_MIN_FILL_BYTES = 50'000ull; // < this = near-empty block
     static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
+
+    /// The underfill guard's predicate: a near-empty template while the pool
+    /// holds fee-paying backlog that should have filled it.
+    static bool underfill(uint64_t selected_bytes, uint64_t mempool_bytes, uint64_t mempool_fees)
+    {
+        const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
+        const bool has_backlog = mempool_fees > 0
+                              && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+        return near_empty && has_backlog;
+    }
 
     /// max_weight bounds the mempool selection: tx_weight_budget(reserve)
     /// with the bytes the header, AuxPoW and coinbase take (MergedMiningManager
@@ -151,9 +202,20 @@ public:
         // the merged-mining poll fetches again until the pool is cleaned.
         const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
 
-        // ── Transactions from mempool (fee-sorted when UTXO available) ──
-        auto [selected_txs, total_fees] = pool_cleaned
-            ? pool.get_sorted_txs_with_fees(max_weight, /*fill_unknown_fee=*/true)
+        // ── The set the pool prices against ───────────────────────────────
+        // A tx may enter only when every input is shown unspent: the full
+        // set must be complete at the tip (a rebuild, a restart behind the
+        // tip, the tip's body still in flight), and there must be a view at
+        // all. Otherwise coinbase-only, marked degraded, fetched again by the
+        // merged-mining poll until it prices.
+        const bool view_prices = pool.size() == 0 || utxo_view_prices(pool.utxo(), tip.height);
+        const char* degraded = !pool_cleaned ? "mempool-not-cleaned-for-tip"
+                             : !view_prices ? kUtxoIncomplete
+                             : nullptr;
+
+        // ── Transactions from mempool: priced txs only (fee-sorted) ──────
+        auto [selected_txs, total_fees] = degraded == nullptr
+            ? pool.get_sorted_txs_with_fees(max_weight)
             : std::pair<std::vector<ltc::coin::Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
@@ -191,10 +253,7 @@ public:
         {
             const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
             const uint64_t mempool_fees  = pool.total_fees();
-            const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
-            const bool has_backlog = mempool_fees > 0
-                                  && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
-            if (near_empty && has_backlog) {
+            if (underfill(selected_bytes, mempool_bytes, mempool_fees)) {
                 LOG_WARNING << "[EMB-DOGE] TemplateBuilder UNDERFILL: selected "
                             << selected_txs.size() << " tx / " << selected_bytes
                             << "B into template while mempool holds " << pool.size()
@@ -224,8 +283,8 @@ public:
         data["sizelimit"]         = 1'000'000;
         data["weightlimit"]       = 4'000'000;
         data["mintime"]           = static_cast<int64_t>(mtp + 1);
-        if (!pool_cleaned)
-            data[core::coin::kTemplateDegradedKey] = "mempool-not-cleaned-for-tip";
+        if (degraded)
+            data[core::coin::kTemplateDegradedKey] = degraded;
 
         LOG_INFO << "[EMB-DOGE] TemplateBuilder: height=" << next_h
                  << " version=0x" << std::hex << block_version << std::dec
@@ -235,7 +294,7 @@ public:
                  << " fees=" << total_fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << selected_txs.size()
-                 << (pool_cleaned ? "" : " degraded=mempool-not-cleaned-for-tip")
+                 << (degraded ? std::string(" degraded=") + degraded : std::string())
                  << " max_weight=" << max_weight
                  << " tip_ts=" << tip.header.m_timestamp
                  << " mtp=" << mtp
@@ -286,6 +345,30 @@ public:
     /// Set UTXO readiness callback — blocks getwork() until UTXO has
     /// enough depth for coinbase maturity validation (240 blocks for DOGE).
     void set_utxo_ready_fn(std::function<bool()> fn) { m_utxo_ready = std::move(fn); }
+
+    /// The readiness callback main_ltc installs: utxo_mining_gate on the set
+    /// the pool prices against at the time of the call (it changes when the
+    /// full set completes).
+    void gate_on_pool_view()
+    {
+        auto closed = std::make_shared<std::atomic<uint64_t>>(0);
+        m_utxo_ready = [this, closed]() {
+            const core::coin::UTXOViewCache* view = m_pool.utxo();
+            const bool ready = utxo_mining_gate(view);
+            if (!ready && closed->fetch_add(1, std::memory_order_relaxed) % 20 == 0) {
+                if (!view) {
+                    LOG_INFO << "[EMB-DOGE] UTXO mining gate closed: no UTXO set";
+                } else if (const auto s = view->sync_state(); s.tracked()) {
+                    LOG_INFO << "[EMB-DOGE] UTXO mining gate closed: full set anchor=" << s.anchor_height
+                             << " best=" << view->get_best_height() << " synced=" << int(s.synced);
+                } else {
+                    LOG_INFO << "[EMB-DOGE] UTXO maturity gate: blocks_connected=" << view->blocks_connected()
+                             << " need>=" << core::coin::DOGE_MINING_GATE_DEPTH;
+                }
+            }
+            return ready;
+        };
+    }
 
     /// Bytes of the block the next templates leave to the header, the AuxPoW
     /// and the coinbase (0: COINBASE_RESERVE weight only).

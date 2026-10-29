@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -32,6 +33,8 @@
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/mempool.hpp>
+#include <impl/doge/coin/chain_params.hpp>
+#include <impl/doge/coin/header_chain.hpp>
 #include <impl/doge/coin/template_builder.hpp>
 #include <impl/doge/coin/utxo_lane.hpp>
 
@@ -108,6 +111,17 @@ MutableTransaction spend(const uint256& prev, uint32_t index, int64_t value, uin
     out.scriptPubKey.m_data = p2pkh(tag);
     tx.vout.push_back(out);
     return tx;
+}
+
+/// A coin of `value` at `height`, paying p2pkh(tag).
+core::coin::Coin coin_of(int64_t value, uint32_t height, bool is_coinbase, uint8_t tag = 0x41)
+{
+    core::coin::Coin c;
+    c.value = value;
+    c.scriptPubKey.m_data = p2pkh(tag);
+    c.height = height;
+    c.coinbase = is_coinbase;
+    return c;
 }
 
 uint256 hash_of(const BlockType& b)
@@ -304,12 +318,11 @@ struct Lane {
 };
 
 /// The DOGE template's transactions, as TemplateBuilder::build_template
-/// selects them (same call, same weight budget, unknown-fee fill on).
+/// selects them (same call, same weight budget).
 std::vector<uint256> template_txids(const Mempool& pool)
 {
     const auto sel = pool.get_sorted_txs_with_fees(
-        doge::coin::TemplateBuilder::MAX_BLOCK_WEIGHT - doge::coin::TemplateBuilder::COINBASE_RESERVE,
-        /*fill_unknown_fee=*/true);
+        doge::coin::TemplateBuilder::MAX_BLOCK_WEIGHT - doge::coin::TemplateBuilder::COINBASE_RESERVE);
     std::vector<uint256> out;
     for (const auto& s : sel.first)
         out.push_back(compute_txid(s.tx));
@@ -320,5 +333,53 @@ bool contains(const std::vector<uint256>& v, const uint256& x)
 {
     return std::find(v.begin(), v.end(), x) != v.end();
 }
+
+/// A DOGE header chain whose tip is `tip` at `height`, rooted at a
+/// checkpoint on its parent: what TemplateBuilder::build_template and
+/// EmbeddedCoinNode read. testnet4alpha's parameters: AuxPoW from genesis,
+/// so a test header is taken at any height (no scrypt PoW on it).
+struct DogeTip {
+    doge::coin::DOGEChainParams params = doge::coin::DOGEChainParams::testnet4alpha();
+    doge::coin::HeaderChain chain{params};
+    BlockType body;  // the tip's block (header only unless given one)
+
+    DogeTip(const BlockType& tip, uint32_t height)
+        : body(tip)
+    {
+        chain.set_dynamic_checkpoint(height - 1, tip.m_previous_block);
+        EXPECT_TRUE(chain.add_header(static_cast<const BlockHeaderType&>(tip)));
+        EXPECT_EQ(chain.height(), height);
+    }
+
+    /// A header-only tip at `height`, `age` seconds old.
+    static BlockType header_at(uint32_t height, uint32_t age = 60)
+    {
+        BlockType b;
+        b.m_version = 0x00620104;
+        b.m_previous_block = genesis(static_cast<uint8_t>(height));
+        b.m_timestamp = static_cast<uint32_t>(std::time(nullptr)) - age;
+        b.m_bits = 0x1a01d2c3;
+        b.m_nonce = height;
+        return b;
+    }
+
+    uint256 hash() const { return hash_of(body); }
+    uint32_t height() const { return chain.height(); }
+
+    /// The tip's body ran through the pool's cleanup (the template builds).
+    void clean(Mempool& pool) const { pool.remove_for_block(body); }
+
+    nlohmann::json build(const Mempool& pool) const
+    {
+        auto wd = doge::coin::TemplateBuilder::build_template(chain, pool, params);
+        EXPECT_TRUE(wd.has_value());
+        return wd ? wd->m_data : nlohmann::json();
+    }
+
+    int64_t subsidy() const
+    {
+        return static_cast<int64_t>(doge::coin::get_doge_block_subsidy(height() + 1, params, hash()));
+    }
+};
 
 } // namespace

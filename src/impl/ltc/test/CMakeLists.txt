@@ -152,6 +152,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # only on the old branch never reaches the template without its parent.
     # Same folding rule.
     #
+    # doge_mempool_validity_test.cpp: a tx reaches a DOGE template only when
+    # priced against the set: a premature coinbase spend is refused at
+    # admission, nothing is selected without a view, an orphan waits outside
+    # the pool and is admitted priced when its parent is. Same folding rule.
+    #
     # doge_hash_schedule_test.cpp: the DOGE block hash at every height below
     # the header checkpoint (doge::coin::HashSchedule), served only once the
     # hash chain links from genesis into the checkpoint. Same folding rule.
@@ -210,6 +215,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_hash_schedule_test.cpp
+        doge_mempool_validity_test.cpp
         doge_template_budget_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp

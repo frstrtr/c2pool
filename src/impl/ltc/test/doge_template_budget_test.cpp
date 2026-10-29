@@ -40,6 +40,7 @@
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
 #include <impl/doge/coin/template_builder.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 #include <c2pool/merged/merged_mining.hpp>
 
 namespace {
@@ -139,6 +140,8 @@ TEST(DogeTemplateBudget, FullTemplateWithAuxPowStaysUnder1MB)
         ASSERT_TRUE(pool.add_tx_unchecked(tx));
         pool.set_tx_fee(ltc::coin::compute_txid(tx), 1000000 + i);
     }
+    ltc_test::CoveringView view;
+    view.cover(pool);
     {
         // The tip's body has run through the pool (none of these txs in it),
         // as the full-block handler does before a full template is built.

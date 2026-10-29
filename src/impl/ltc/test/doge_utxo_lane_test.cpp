@@ -279,7 +279,9 @@ TEST(DogeUtxoOrder, BodyBeforeHeaderConnectsOnFirstDelivery)
 TEST(DogeUtxoOrder, BodyBeforeHeaderCleansThePoolFirst)
 {
     Lane l;
-    Mempool pool(core::coin::DOGE_LIMITS);
+    // No coinbase maturity: Q spends a coinbase of this 3-block chain, which
+    // the pool's admission would refuse as premature at DOGE's 240.
+    Mempool pool(core::coin::ChainLimits{core::coin::DOGE_LIMITS.max_money, 0, 0});
     pool.set_utxo(l.t.cache.get());
     l.net.pool = &pool;
     const auto a = make_chain(genesis(0xd5), 1, 3, 0xd5);

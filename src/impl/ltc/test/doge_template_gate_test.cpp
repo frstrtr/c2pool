@@ -41,6 +41,7 @@
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
 #include <impl/doge/coin/template_builder.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 #include <c2pool/merged/merged_mining.hpp>
 
 namespace {
@@ -134,6 +135,8 @@ TEST(DogeTemplateGate, MempoolNotCleanedForTipBuildsCoinbaseOnly)
     DogeChain c;
     ltc::coin::Mempool pool(core::coin::DOGE_LIMITS);
     priced_tx(pool, 0x11);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     const auto t = build(c, pool);
     EXPECT_TRUE(t["transactions"].empty()) << "the tip's body has not cleaned the pool";
     EXPECT_EQ(t["coinbasevalue"].get<int64_t>(), subsidy_of(c)) << "subsidy only";
@@ -147,6 +150,8 @@ TEST(DogeTemplateGate, CleanedForTipFillsTemplate)
     DogeChain c;
     ltc::coin::Mempool pool(core::coin::DOGE_LIMITS);
     const auto tx = priced_tx(pool, 0x22);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     pool.remove_for_block(DogeChain::body(c.tip));   // the tip's body: did not confirm tx
     const auto t = build(c, pool);
     ASSERT_EQ(t["transactions"].size(), 1u);
@@ -168,6 +173,8 @@ TEST(DogeTemplateGate, LateSiblingBodyDoesNotCountAsTheTip)
     DogeChain c;
     ltc::coin::Mempool pool(core::coin::DOGE_LIMITS);
     priced_tx(pool, 0x33);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     pool.remove_for_block(DogeChain::body(c.sibling));   // not the tip's body
     const auto t = build(c, pool);
     EXPECT_TRUE(t["transactions"].empty());
