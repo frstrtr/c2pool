@@ -8,10 +8,11 @@
 /// 6,160,000): it holds no header below it, so no body below it can be
 /// asked for. A UTXO set built from genesis needs every one of them. The
 /// schedule is built once from `headers` messages (getheaders from genesis),
-/// keeping only each height's hash and dropping the header and its AuxPoW;
-/// it is not added to HeaderChain (6.16 M resident index entries would cost
-/// ~1.5 GB of RAM). It lives in a LevelDB (the header chain's) under
-///   'H' + height (4 bytes BE) -> block hash (32 bytes)
+/// keeping only each height's hash and its parent's, dropping the header and
+/// its AuxPoW; it is not added to HeaderChain (6.16 M resident index entries
+/// would cost ~1.5 GB of RAM). It lives in a LevelDB (the header chain's)
+/// under
+///   'H' + height (4 bytes BE) -> block hash (32 bytes) | parent hash (32 bytes)
 ///   'H'                       -> state (below)
 /// with a small read cache.
 ///
@@ -19,10 +20,22 @@
 /// parent hash of every header, from genesis into the configured checkpoint
 /// hash at the checkpoint height. The checkpoint commits to the whole prefix
 /// (a hash chain is the commitment), so scrypt and AuxPoW are not checked
-/// below it. A chain that breaks or reaches the checkpoint height with
-/// another hash is discarded (re-synced from another peer). The body stream
-/// proves the links again: a body whose parent is not the UTXO set's best
-/// block is refused at the connect point (ParentMismatch).
+/// below it. Two rules make the stored prefix a hash chain:
+///   - a batch is taken only when its first header's parent is the frontier
+///     (the last height stored) and each header's parent is the one before
+///     it: the prefix grows only at its end, never rewinds;
+///   - before the schedule is marked complete, every stored height
+///     1 .. checkpoint - 1 is read back in order and each parent hash checked
+///     against the height below it (genesis for height 1), the last against
+///     the checkpoint header's parent. A prefix that does not link (a disk
+///     fault, a bug) is discarded, never persisted as complete.
+/// A batch that breaks a link, or reaches the checkpoint height with another
+/// hash, discards the schedule (re-synced from genesis, from another peer).
+/// The body stream proves the links again: a body whose parent is not the
+/// UTXO set's best block is refused at the connect point (ParentMismatch).
+///
+/// HashScheduleSync drives the sync: getheaders to one peer at a time, only
+/// that peer's answers fed, a stall measured by the frontier's progress.
 ///
 /// Thread safety: every public method takes the internal mutex.
 
@@ -34,10 +47,12 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -50,9 +65,10 @@ public:
     enum class Feed {
         Extended,  // appended; the checkpoint height is not reached yet
         Complete,  // the chain linked into the checkpoint: the schedule is proven
-        NotNext,   // the batch does not continue the schedule (another request's answer): ignored
+        NotNext,   // the batch does not continue the frontier (another request's answer): ignored
         Broken,    // a header does not link to the one before it: the schedule is discarded
-        Rejected,  // the checkpoint height carries another hash: the schedule is discarded
+        Rejected,  // the checkpoint height carries another hash, or the stored prefix
+                   // does not link: the schedule is discarded
         Done,      // the schedule was already complete: ignored
     };
 
@@ -85,8 +101,8 @@ public:
     HashSchedule(const HashSchedule&) = delete;
     HashSchedule& operator=(const HashSchedule&) = delete;
 
-    /// Read the persisted state. A state for another checkpoint or genesis
-    /// starts over at genesis.
+    /// Read the persisted state. A state for another checkpoint, genesis or
+    /// record version starts over at genesis.
     void load()
     {
         std::lock_guard<std::mutex> lock(m_mu);
@@ -161,52 +177,44 @@ public:
 
     /// getheaders locator: the frontier, the ten heights below it, then
     /// back in doubling steps, ending at genesis (Core CChain::GetLocator).
-    /// A peer that does not have the frontier answers from the deepest of
-    /// these it has; feed() then continues from that height.
-    std::vector<uint256> locator()
+    /// An honest peer has the frontier and answers from it; a peer that
+    /// does not (behind, or another chain) answers from deeper, and that
+    /// answer is not taken (feed: NotNext).
+    std::vector<uint256> locator() const
     {
         std::lock_guard<std::mutex> lock(m_mu);
-        m_locator.clear();
         std::vector<uint256> out;
         uint32_t step = 1;
         int64_t h = m_frontier_height;
         while (h > 0) {
             const uint32_t hh = static_cast<uint32_t>(h);
-            const uint256 x = hh == m_frontier_height ? m_frontier_hash : stored_locked(hh);
-            if (!x.IsNull()) {
+            const uint256 x = hh == m_frontier_height ? m_frontier_hash : stored_locked(hh).first;
+            if (!x.IsNull())
                 out.push_back(x);
-                m_locator[x] = hh;
-            }
             if (out.size() > 10)
                 step *= 2;
             h -= step;
         }
         out.push_back(m_genesis);
-        m_locator[m_genesis] = 0;
         return out;
     }
 
-    /// Append a `headers` batch. It must continue the frontier (or a
-    /// height of the last locator()); every header must link to the one
-    /// before it. The header at the checkpoint height must hash to the
-    /// checkpoint: then the schedule is complete. Anything else discards
-    /// the schedule back to genesis.
+    /// Append a `headers` batch. Its first header's parent must be the
+    /// frontier, every header's parent the one before it. The header at the
+    /// checkpoint height must hash to the checkpoint, and the stored prefix
+    /// must link (verify_prefix_locked): then the schedule is complete.
+    /// A batch that does not start at the frontier is NotNext (ignored); one
+    /// that breaks a link, or reaches the checkpoint with another hash,
+    /// discards the schedule back to genesis.
     Feed feed(const std::vector<ltc::coin::BlockHeaderType>& headers)
     {
         std::lock_guard<std::mutex> lock(m_mu);
         if (m_complete)
             return Feed::Done;
-        if (headers.empty())
+        if (headers.empty() || headers.front().m_previous_block != m_frontier_hash)
             return Feed::NotNext;
         uint32_t h = m_frontier_height;
         uint256 prev = m_frontier_hash;
-        if (headers.front().m_previous_block != prev) {
-            auto it = m_locator.find(headers.front().m_previous_block);
-            if (it == m_locator.end())
-                return Feed::NotNext;
-            h = it->second;
-            prev = it->first;
-        }
         auto batch = m_db.create_batch();
         for (const auto& hdr : headers) {
             if (hdr.m_previous_block != prev) {
@@ -215,44 +223,48 @@ public:
                 reset_locked();
                 return Feed::Broken;
             }
-            ++h;
             const uint256 hh = Hash(pack(hdr).get_span());
-            if (h == m_cp_height) {
+            if (h + 1 == m_cp_height) {
                 if (hh != m_cp_hash) {
-                    LOG_WARNING << "[EMB-DOGE] Hash schedule: h=" << h << " is " << hh.GetHex().substr(0, 16)
-                                << ", the checkpoint is " << m_cp_hash.GetHex().substr(0, 16) << ": discarded";
+                    LOG_WARNING << "[EMB-DOGE] Hash schedule: h=" << h + 1 << " is "
+                                << hh.GetHex().substr(0, 16) << ", the checkpoint is "
+                                << m_cp_hash.GetHex().substr(0, 16) << ": discarded";
                     reset_locked();
                     return Feed::Rejected;
                 }
-                m_frontier_height = h;
-                m_frontier_hash = hh;
-                m_complete = true;
-                batch.put(state_key(), state_locked());
-                if (!batch.commit()) {
-                    m_complete = false;
+                // Store up to the checkpoint's parent, then prove the whole
+                // prefix before persisting the schedule as complete.
+                if (!commit_locked(batch, h, prev))
+                    return Feed::NotNext;
+                if (!verify_prefix_locked(prev)) {
+                    LOG_ERROR << "[EMB-DOGE] Hash schedule: the stored heights 1.." << m_cp_height - 1
+                              << " do not link into the checkpoint: discarded";
                     reset_locked();
-                    return Feed::Broken;
+                    return Feed::Rejected;
                 }
-                m_locator.clear();
+                m_complete = true;
+                m_frontier_height = m_cp_height;
+                m_frontier_hash = m_cp_hash;
+                if (!m_db.put(state_key(), state_locked())) {
+                    m_complete = false;
+                    m_frontier_height = h;
+                    m_frontier_hash = prev;
+                    return Feed::NotNext;
+                }
+                m_cache.clear();
                 LOG_INFO << "[EMB-DOGE] Hash schedule complete: heights 0.." << m_cp_height
                          << " link into the checkpoint " << m_cp_hash.GetHex().substr(0, 16);
                 return Feed::Complete;
             }
-            batch.put(height_key(h), std::vector<uint8_t>(hh.data(), hh.data() + 32));
+            ++h;
+            std::vector<uint8_t> v(64);
+            std::memcpy(v.data(), hh.data(), 32);
+            std::memcpy(v.data() + 32, prev.data(), 32);
+            batch.put(height_key(h), v);
             prev = hh;
         }
-        const uint32_t old_height = m_frontier_height;
-        const uint256 old_hash = m_frontier_hash;
-        m_frontier_height = h;
-        m_frontier_hash = prev;
-        batch.put(state_key(), state_locked());
-        if (!batch.commit()) {
-            m_frontier_height = old_height;
-            m_frontier_hash = old_hash;
+        if (!commit_locked(batch, h, prev))
             return Feed::NotNext;
-        }
-        // Heights at or below a rewind point may be cached from before.
-        m_cache.clear();
         return Feed::Extended;
     }
 
@@ -265,11 +277,12 @@ public:
     }
 
 private:
-    static constexpr uint8_t  STATE_VERSION = 1;
+    static constexpr uint8_t  STATE_VERSION = 2;               // 2: height records carry the parent hash
     static constexpr size_t   STATE_SIZE = 1 + 32 + 4 + 32 + 4 + 32 + 1;
-    static constexpr uint32_t CHUNK_BITS = 16;          // 65,536 heights (2 MB) per cache chunk
+    static constexpr uint32_t CHUNK_BITS = 16;                 // 65,536 heights (2 MB) per cache chunk
     static constexpr uint32_t CHUNK_MASK = (1u << CHUNK_BITS) - 1;
     static constexpr size_t   CACHE_CHUNKS = 2;
+    static constexpr size_t   RECORD_SIZE = 64;                // hash | parent hash
 
     static std::string state_key() { return std::string(1, 'H'); }
 
@@ -282,6 +295,12 @@ private:
         k[3] = static_cast<char>((h >> 8) & 0xFF);
         k[4] = static_cast<char>(h & 0xFF);
         return k;
+    }
+
+    static uint32_t key_height(const std::string& k)
+    {
+        return (uint32_t(uint8_t(k[1])) << 24) | (uint32_t(uint8_t(k[2])) << 16)
+             | (uint32_t(uint8_t(k[3])) << 8) | uint32_t(uint8_t(k[4]));
     }
 
     static uint32_t read_u32(const uint8_t* p)
@@ -308,26 +327,69 @@ private:
         return v;
     }
 
+    /// Commit a batch of height records with the new frontier.
+    bool commit_locked(core::LevelDBStore::BatchWriter& batch, uint32_t height, const uint256& hash)
+    {
+        const uint32_t old_height = m_frontier_height;
+        const uint256 old_hash = m_frontier_hash;
+        m_frontier_height = height;
+        m_frontier_hash = hash;
+        batch.put(state_key(), state_locked());
+        if (!batch.commit()) {
+            m_frontier_height = old_height;
+            m_frontier_hash = old_hash;
+            return false;
+        }
+        return true;
+    }
+
+    /// Every height 1 .. checkpoint - 1 stored, in order, each record's
+    /// parent the hash below it (genesis for 1), the last one `cp_parent`.
+    bool verify_prefix_locked(const uint256& cp_parent) const
+    {
+        uint32_t expect = 1;
+        uint256 below = m_genesis;
+        bool ok = true;
+        const bool scanned = m_db.for_each_prefix(state_key(),
+            [&](const std::string& k, const std::vector<uint8_t>& v) {
+                if (k.size() != 5)
+                    return true;  // the state record
+                const uint32_t h = key_height(k);
+                if (h >= m_cp_height)
+                    return false;  // nothing at or above the checkpoint belongs here
+                if (h != expect || v.size() != RECORD_SIZE
+                    || std::memcmp(v.data() + 32, below.data(), 32) != 0) {
+                    ok = false;
+                    return false;
+                }
+                std::memcpy(below.data(), v.data(), 32);
+                ++expect;
+                return true;
+            });
+        return scanned && ok && expect == m_cp_height && below == cp_parent;
+    }
+
     void reset_locked()
     {
         m_frontier_height = 0;
         m_frontier_hash = m_genesis;
         m_complete = false;
         m_cache.clear();
-        m_locator.clear();
         m_db.put(state_key(), state_locked());
     }
 
-    uint256 stored_locked(uint32_t h) const
+    /// The record at `h`: (hash, parent); nulls when absent.
+    std::pair<uint256, uint256> stored_locked(uint32_t h) const
     {
         if (h == 0)
-            return m_genesis;
+            return {m_genesis, uint256()};
         std::vector<uint8_t> v;
-        if (!m_db.get(height_key(h), v) || v.size() != 32)
-            return uint256();
-        uint256 x;
+        if (!m_db.get(height_key(h), v) || v.size() != RECORD_SIZE)
+            return {};
+        uint256 x, p;
         std::memcpy(x.data(), v.data(), 32);
-        return x;
+        std::memcpy(p.data(), v.data() + 32, 32);
+        return {x, p};
     }
 
     std::map<uint32_t, std::vector<uint256>>::iterator load_chunk_locked(uint32_t chunk) const
@@ -335,11 +397,8 @@ private:
         std::vector<uint256> hashes(size_t(1) << CHUNK_BITS);
         const std::string prefix = height_key(chunk << CHUNK_BITS).substr(0, 3);
         const bool ok = m_db.for_each_prefix(prefix, [&](const std::string& k, const std::vector<uint8_t>& v) {
-            if (k.size() == 5 && v.size() == 32) {
-                const uint32_t h = (uint32_t(uint8_t(k[1])) << 24) | (uint32_t(uint8_t(k[2])) << 16)
-                                 | (uint32_t(uint8_t(k[3])) << 8) | uint32_t(uint8_t(k[4]));
-                std::memcpy(hashes[h & CHUNK_MASK].data(), v.data(), 32);
-            }
+            if (k.size() == 5 && v.size() == RECORD_SIZE)
+                std::memcpy(hashes[key_height(k) & CHUNK_MASK].data(), v.data(), 32);
             return true;
         });
         if (!ok)
@@ -358,8 +417,156 @@ private:
     uint32_t m_frontier_height{0};
     uint256  m_frontier_hash;
     bool     m_complete{false};
-    std::map<uint256, uint32_t> m_locator;  // hashes of the last locator() and their heights
     mutable std::map<uint32_t, std::vector<uint256>> m_cache;  // chunk -> 65,536 hashes
+};
+
+/// The hash schedule's P2P sync (main_ltc's DOGE wiring drives it):
+///   - getheaders to ONE peer at a time (a 3-4 GB AuxPoW header sync must
+///     not be asked of every peer);
+///   - only that peer's answers are fed to the schedule; any other batch
+///     (the header chain's own getheaders answers, a peer we did not ask)
+///     is the header chain's;
+///   - a stall is no frontier progress for STALL since the later of the
+///     last progress and the moment this peer was asked; asking the same
+///     peer for the next batch does not restart the clock. A stalled peer
+///     (behind, pruned, silent, or answering from deeper because it lacks
+///     the frontier) is replaced by the next one;
+///   - DISCARD_AFTER peers in a row that make no progress from the frontier
+///     mean no honest peer continues it (a peer fed a chain of its own):
+///     the schedule is discarded and synced again from genesis.
+/// Thread safety: every public method takes the internal mutex.
+class HashScheduleSync {
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::seconds STALL{30};
+    static constexpr uint32_t DISCARD_AFTER = 20;
+
+    explicit HashScheduleSync(HashSchedule& schedule) : m_s(schedule) {}
+
+    /// A getheaders to send: `peer_idx` picks a peer round robin when
+    /// `peer` is empty (a new peer), else `peer` is asked again.
+    struct Ask {
+        std::vector<uint256> locator;
+        size_t               peer_idx{0};
+        std::string          peer;
+    };
+
+    /// Who to ask now: nothing while the asked peer is within its time or
+    /// the schedule is complete; a new peer (after a stall) otherwise.
+    std::optional<Ask> due(Clock::time_point now)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_s.complete())
+            return std::nullopt;
+        note_progress_locked(now);
+        if (!m_peer.empty()) {
+            const auto since = std::max(m_progress_at, m_asked_at);
+            if (now - since < STALL)
+                return std::nullopt;
+            ++m_stalls;
+            if (m_s.frontier_height() == m_height_when_asked)
+                ++m_fruitless;
+            LOG_INFO << "[EMB-DOGE] Hash schedule at h=" << m_s.frontier_height() << "/"
+                     << m_s.checkpoint_height() << ": no progress from " << m_peer << " in "
+                     << std::chrono::duration_cast<std::chrono::seconds>(now - since).count()
+                     << "s; asking another peer";
+            if (m_fruitless >= DISCARD_AFTER) {
+                LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_fruitless
+                            << " peers in a row did not continue the frontier at h="
+                            << m_s.frontier_height() << ": discarded, syncing again from genesis";
+                m_s.discard();
+                m_fruitless = 0;
+                m_progress_height = 0;
+            }
+            m_peer.clear();
+            ++m_rr;
+        }
+        return Ask{m_s.locator(), m_rr, std::string()};
+    }
+
+    /// The peer the getheaders went to ("" = none was ready: asked again at
+    /// the next due()).
+    void asked(const std::string& peer, Clock::time_point now)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (peer.empty()) {
+            m_peer.clear();
+            return;
+        }
+        if (peer != m_peer) {
+            m_peer = peer;
+            m_asked_at = now;
+            m_height_when_asked = m_s.frontier_height();
+        }
+    }
+
+    /// A headers batch from `peer`. Fed to the schedule only when `peer` is
+    /// the one asked; otherwise NotNext (the caller hands it to the header
+    /// chain). `ask_next`: ask the same peer for the next batch now.
+    HashSchedule::Feed on_headers(const std::string& peer,
+                                  const std::vector<ltc::coin::BlockHeaderType>& headers,
+                                  Clock::time_point now, std::optional<Ask>& ask_next)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        ask_next.reset();
+        if (m_s.complete())
+            return HashSchedule::Feed::Done;
+        if (peer.empty() || peer != m_peer)
+            return HashSchedule::Feed::NotNext;
+        const auto r = m_s.feed(headers);
+        switch (r) {
+        case HashSchedule::Feed::Extended:
+            note_progress_locked(now);
+            ask_next = Ask{m_s.locator(), m_rr, m_peer};
+            break;
+        case HashSchedule::Feed::Broken:
+        case HashSchedule::Feed::Rejected:
+            // This peer's chain is not the checkpoint's: another peer, now.
+            m_peer.clear();
+            ++m_rr;
+            m_progress_height = 0;
+            ask_next = Ask{m_s.locator(), m_rr, std::string()};
+            break;
+        default:
+            break;
+        }
+        return r;
+    }
+
+    std::string peer() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_peer;
+    }
+    uint64_t stalls() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_stalls;
+    }
+
+private:
+    void note_progress_locked(Clock::time_point now)
+    {
+        const uint32_t h = m_s.frontier_height();
+        if (h > m_progress_height) {
+            m_progress_height = h;
+            m_progress_at = now;
+            m_fruitless = 0;
+        } else if (h < m_progress_height) {
+            m_progress_height = h;  // discarded
+        }
+    }
+
+    HashSchedule&     m_s;
+    mutable std::mutex m_mu;
+    std::string       m_peer;             // the peer asked ("" = none)
+    size_t            m_rr{0};
+    Clock::time_point m_asked_at{};
+    Clock::time_point m_progress_at{};
+    uint32_t          m_progress_height{0};
+    uint32_t          m_height_when_asked{0};
+    uint32_t          m_fruitless{0};     // peers in a row with no progress
+    uint64_t          m_stalls{0};
 };
 
 } // namespace coin
