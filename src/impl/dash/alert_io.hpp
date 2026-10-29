@@ -47,8 +47,7 @@
 #include <thread>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
+#include <core/durable_file.hpp>   // owner-only write + fsync + rename-over, POSIX and Windows
 
 namespace dash::alert {
 
@@ -162,24 +161,12 @@ public:
 
     static bool atomic_write(const std::string& path, const std::string& data)
     {
-        const std::string tmp = path + ".tmp";
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0) return false;
-        bool ok = ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
-        ok = (::fsync(fd) == 0) && ok;
-        ::close(fd);
-        return ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+        return core::durable_file::replace(path, data);
     }
 
     static bool append_line(const std::string& path, const std::string& line)
     {
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (fd < 0) return false;
-        const std::string l = line + "\n";
-        bool ok = ::write(fd, l.data(), l.size()) == static_cast<ssize_t>(l.size());
-        ok = (::fsync(fd) == 0) && ok;
-        ::close(fd);
-        return ok;
+        return core::durable_file::append(path, line + "\n");
     }
 
 private:
