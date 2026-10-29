@@ -59,7 +59,7 @@ wiring it to this transport is a follow-up.
 | `--alert-relay-retry-every S` | retransmit an unacked alert | 60 |
 | `--alert-relay-retry-max N` | total transmissions before "undelivered" | 60 |
 | `--alert-relay-serve-stall-after S` | origin: no work handed to hashing miners this long ⇒ WORK_STALLED, later WORK_RESUMED (0 = off) | 300 |
-| `--alert-relay-hashrate-min RATE` | origin: a worker hashing below RATE (`1200G`, `1.2T`, `1.2TH/s`; a plain number is H/s) ⇒ HASHRATE_LOW, later HASHRATE_OK (0 = off) | off |
+| `--alert-relay-hashrate-min RATE` | origin: a worker hashing below RATE ⇒ HASHRATE_LOW, later HASHRATE_OK (0 = off). RATE ≈ 0.8 × the slowest healthy rig and ≥ 1.1 × a rig with one failed board, e.g. `1.35T` for 1.64-2.02 TH/s rigs (see "Choosing RATE"); units `1350G`, `1.35T`, `1.35TH/s`, a plain number is H/s | off |
 | `--alert-relay-hashrate-window S` | origin: seconds of shares per hashrate evaluation (120-86400) | 900 |
 
 ## Presence detection (origin)
@@ -167,6 +167,11 @@ also measures each hashing worker's rate from the work it delivered here:
   consecutive evaluations with low evidence, HASHRATE_OK after two with ok
   evidence while a LOW is outstanding. [RATE, 1.1 RATE] is the hysteresis band:
   a rig inside it keeps its state, so a rig at the threshold pages once.
+  Consecutive evaluations overlap (each window shares 2/3 of its shares with
+  the previous one), so two in a row is not α²: for a rig at the threshold the
+  pair probability at α = 0.05 is ≈ 0.018 (≈ 7 α²). The measured rates below
+  are simulated end to end and already include this; do not tighten α
+  expecting a square.
   Text: `worker X.D7 HASHRATE LOW 1.05 TH/s < 1.20 TH/s (15 min)` and
   `worker X.D7 hashrate OK again 1.78 TH/s (threshold 1.20 TH/s, 15 min); low for 47m`.
 - **What a window can tell.** At the DASH vardiff (a share per ~10 s) a 900 s
@@ -182,10 +187,32 @@ also measures each hashing worker's rate from the work it delivered here:
   | **0.05** (default) | 1.6 windows | 81 % | 15 / 2 |
 
   Healthy rigs at 1.5× the threshold never page at any of these levels (the
-  KATs measure a week of 30 rigs). A rig that loses one of three boards
-  (1.77 → 1.18 TH/s) sits right at a 1.2 TH/s threshold and cannot be told
-  from it in any useful time: set RATE between the healthy rate and the
-  one-board rate (e.g. 1.5T for 1.8 TH/s rigs).
+  KATs measure a week of 30 rigs).
+- **Choosing RATE.** Rule: RATE ≈ 0.8 × the slowest healthy rig, and ≥ 1.1 ×
+  the rate of a rig with one failed board. A rig within ~20 % above RATE is in
+  the gray zone: it pages now and then, and its outstanding LOW then masks
+  any later real drop on it until HASHRATE_OK (one LOW per episode). A rig
+  that loses one of three boards (1.77 → 1.18 TH/s) sits right at a 1.2 TH/s
+  threshold and cannot be told from it in useful time. Simulated for a fleet
+  of 30 rigs at 1.64-2.02 TH/s (420 rig-days, window 900 s) and a dead board
+  (1.77 → 1.18 TH/s, 100 trials):
+
+  | RATE | healthy fleet: LOW pages in 420 rig-days | dead board paged: median | p90 | worst |
+  |---|---|---|---|---|
+  | 1.2T | 0 | 4.0 h | 15 h | 21 h |
+  | **1.35T** | 0 | 28 min | 74 min | 2.2 h |
+  | 1.5T | 6 | 18 min | 29 min | 48 min |
+
+  So for that fleet: `--alert-relay-hashrate-min 1.35T`. After the first week
+  read `detector.hashrate.low_evidence / evaluations` on
+  `/api/alert-relay/status`: it should stay around 1e-4 or below. Higher
+  means a rig has drifted into the gray zone (per-worker `hashrate_low` and
+  `hashrate` show which): lower RATE a step, or use
+  `--alert-relay-hashrate-window 1800` (about half the gray-zone evidence, a
+  dead board paged ~15 min later).
+- **One worker name per rig.** Sessions of one worker name are judged as one
+  rig on their combined rate (the same key OFFLINE uses), so with two rigs
+  under one name a dead board on one of them is invisible.
 - **Not judged** (no page either way): standby workers and connections (they
   submit nothing here); a worker that is down (OFFLINE's business; a window
   ending at the last share never sees the silence of a rig that stopped or
@@ -500,6 +527,13 @@ counters. The origin's outbox block also carries `stale_refusal`.
   parity phase.
 
 ## Follow-ups (not in this change)
+
+- Hashrate: a fleet-correlation guard. A node-side cause that thins ACCEPTED
+  shares for every rig at once (a stale-job window, a reject regression,
+  upstream latency) would page each rig HASHRATE_LOW (up to the 30/h cap plus
+  a digest); WORK_STALLED covers only "no template handed out". If more than
+  N % of the hashing workers show low evidence in the same round, emit one
+  node-level event instead of per-worker LOWs.
 
 - On master, a dash node never re-dials a `--connect`/`--addnode` peer whose
   dial was refused: `dash::NodeImpl` has no `connect_failed()` override, so the

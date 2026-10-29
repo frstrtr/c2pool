@@ -547,8 +547,10 @@ void print_banner(const char* argv0)
         << "           [--alert-relay-serve-stall-after S]  (origin: no work handed to hashing miners\n"
         << "              this long => WORK_STALLED, then WORK_RESUMED; default 300, 0 = off)\n"
         << "           [--alert-relay-hashrate-min RATE [--alert-relay-hashrate-window S]]  (origin: a\n"
-        << "              worker hashing below RATE (e.g. 1200G, 1.2T; plain number = H/s) => HASHRATE_LOW,\n"
-        << "              then HASHRATE_OK above 1.1x; window default 900; default off)\n"
+        << "              worker hashing below RATE => HASHRATE_LOW, then HASHRATE_OK above 1.1x RATE.\n"
+        << "              RATE ~ 0.8x the slowest healthy rig and >= 1.1x a rig with one failed board,\n"
+        << "              e.g. 1.35T for 1.64-2.02 TH/s rigs (also 1350G, 1.35TH/s; plain number = H/s);\n"
+        << "              one worker name per rig; window default 900; default off)\n"
         << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
         << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
@@ -11837,8 +11839,8 @@ int main(int argc, char** argv)
         else if (std::strcmp(argv[i], "--alert-relay-hashrate-min") == 0 && i + 1 < argc) {
             const auto rate = dash::alert::parse_hashrate(argv[i + 1]);
             if (!rate) {
-                std::cerr << "error: --alert-relay-hashrate-min expects a hashrate such as 1200G,"
-                             " 1.2T or a plain number of H/s (0 = off), got '" << argv[i + 1] << "'\n";
+                std::cerr << "error: --alert-relay-hashrate-min expects a hashrate such as 1.35T,"
+                             " 1350G or a plain number of H/s (0 = off), got '" << argv[i + 1] << "'\n";
                 return 1;
             }
             g_alert_relay.hashrate_min = *rate;

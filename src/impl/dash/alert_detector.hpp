@@ -108,6 +108,9 @@
 //   evidence; HASHRATE_OK after as many with ok evidence while a LOW is
 //   outstanding. [min, 1.1 min] is the hysteresis band: a rig inside it keeps
 //   its state, so a rig sitting at the threshold pages once and never flaps.
+//   Consecutive evaluations share 2/3 of their shares, so two in a row is not
+//   alpha^2: at the threshold the pair probability is ~7 alpha^2 (0.018 at
+//   0.05). The measured rates below are simulated end to end and include it.
 //   Strength of evidence. The window, not the test, limits it: at the DASH
 //   vardiff (one share per ~10 s) a 900 s window holds ~90-180 shares, so a
 //   rate is known to ~+/-10 %, and the level trades detection delay against
@@ -118,6 +121,10 @@
 //     0.02    2.6 windows                     62 %              4 / 0
 //     0.05    1.6 windows                     81 %              15 / 2   <- default
 //   Healthy rigs at 1.5x the threshold never page at any of these levels.
+//   Hence the guidance: min ~ 0.8x the slowest healthy rig and >= 1.1x a rig
+//   with one failed board (1.35 TH/s for 1.64-2.02 TH/s rigs). A gray-zone rig
+//   pages now and then, and its outstanding LOW masks any later real drop on
+//   it until HASHRATE_OK.
 //   Not judged (no page either way):
 //   - standby workers and sessions (they submit nothing here);
 //   - a worker that is down: OFFLINE's business. A window that ends at the
@@ -137,7 +144,8 @@
 //   rig hashes at speed again (also after it came back online). A worker that
 //   moved to another node (RETURNED) drops it silently: that node judges it.
 //   Several sessions of one worker key are judged as one rig at the highest
-//   vardiff among those that hashed, i.e. on their combined rate.
+//   vardiff among those that hashed, i.e. on their combined rate: one worker
+//   name per rig, or a dead board on one of two same-named rigs is invisible.
 //
 // Persistence (restore()/persist()): known workers with their last-seen time,
 // whether an OFFLINE is outstanding and, for a worker that was down, when its
