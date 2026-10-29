@@ -789,6 +789,7 @@ public:
         if (c.verdict == HelloVerdict::Accept) {
             const bool fresh = peers_.count(peer) == 0;
             peers_[peer] = theirs.tail;
+            if (fresh) hf_round_.insert(peer);  // a new link: its next catch-up request is a round's first
             if (fresh) joiner_->release_waits(std::nullopt);  // a new Path B peer: the pairs waiting on a P_r are tried
             // the first catch-up round after the start opens at the first tail whose tip is not held here (the template
             // gate); the tail's best_cum_work is not read
@@ -896,6 +897,49 @@ public:
     // The deferred store holds a frame of this digest; its cap (J_0).
     bool parked_held(const Hash32& digest) const { return deferred_.holds(digest); }
     std::uint64_t deferred_cap() const noexcept { return deferred_.cap(); }
+    // The digests of every frame the deferred store holds (the seal sweep of parked frames).
+    std::vector<Hash32> parked_digests() const { return deferred_.digests(); }
+    // The FC_GETCARRIER(parent) asks of ParentUnknown DEFERs sent since the start.
+    std::uint64_t parent_asks() const noexcept { return parent_asks_; }
+    // ... of them sent by reask_parents.
+    std::uint64_t parent_reasks() const noexcept { return parent_reasks_; }
+    // The relay's maintenance tick, after tick(now_s): the lowest frame of a parked chain (its parent neither held nor
+    // parked) has FC_GETCARRIER(parent) sent while that parent is missing, once it was not asked within P-53 (an ask
+    // lost or not served, an ancestor the deferred store evicted), whether or not the best tip moves, while headers first
+    // is not live (headers_first_live); at most one ask
+    // per parent id per P-53, none for a parent the header path asked within P-53. The first ask goes to the sender of
+    // the chain's oldest frame while it is connected, else to another connected Path B peer (one that sent frames of that
+    // chain first); each repeat goes to the next connected peer in turn. `room(peer)`: the asks that peer may take now
+    // (the relay's asked-carrier record per peer); a peer without room is passed over, and with none left the ask waits
+    // for a later pass. Bound: at most P-47 asks per P-53 per node (the waiting keys; about 105 per second at the
+    // defaults), each a one-id FC_GETCARRIER to one peer.
+    void reask_parents(const std::function<std::size_t(std::uint64_t peer)>& room = nullptr) {
+        if (poisoned_ || deferred_.waiting_keys() == 0 || headers_first_live()) return;
+        const std::set<Hash32> parked = deferred_.ids();
+        std::set<Hash32> missing;
+        for (const auto& [parent, senders] : deferred_.waiting_parents()) {
+            if (tree_->find(parent) != nullptr || tree_->is_waiting(parent) || parked.count(parent) != 0) continue;
+            missing.insert(parent);
+            if (const auto a = parent_asked_.find(parent);
+                a != parent_asked_.end() && clock_s_ < a->second + cfg_.abandon_timeout_s)
+                continue;
+            if (const auto b = bodies_asked_.find(parent);
+                b != bodies_asked_.end() && clock_s_ < b->second + cfg_.abandon_timeout_s)
+                continue;  // asked by a header page within P-53
+            const std::optional<std::uint64_t> to = reask_target(parent, senders, room);
+            if (!to) continue;
+            parent_asked_[parent] = clock_s_;
+            GetCarrier q;
+            q.chain_id = cfg_.identity.chain_id;
+            q.ids = {parent};
+            q.want_bodies = true;
+            ++parent_asks_;
+            ++parent_reasks_;
+            send(*to, *encode_fc_getcarrier(q, cfg_.p));
+        }
+        for (auto it = reask_round_.begin(); it != reask_round_.end();)  // the rounds of parents no longer missing go
+            it = missing.count(it->first) == 0 ? reask_round_.erase(it) : std::next(it);
+    }
     // A parked carrier frame's own P_r (its own receipt's), by digest; nullopt: no such frame held.
     std::optional<Hash32> parked_own_pr(const Hash32& digest) const {
         const ParkedFrame* f = deferred_.get(digest);
@@ -1074,6 +1118,7 @@ public:
 
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
+        hf_round_.erase(peer);
         if (verified_win_ && verified_win_peer_ == peer) verified_win_.reset();
         headers_->release_peer(peer);
         deferred_.forget_peer(peer);
@@ -1618,6 +1663,7 @@ public:
         r.stop = stop;
         r.max = max;
         r.owner = owner;
+        r.first = owner == HeaderOwner::CatchUp && hf_round_.erase(peer) != 0;
         r.sent_s = now_s;
         header_req_[peer] = std::move(r);
         timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
@@ -1677,6 +1723,7 @@ public:
 
     HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
         HeadersOutcome out;
+        clock_s_ = std::max(clock_s_, now_s);
         if (poisoned_) {
             out.kind = HeadersOutcome::Kind::NodeInternal;
             return out;
@@ -1935,6 +1982,7 @@ public:
             req.from = out.ids.back();
             req.sent_s = now_s;
             req.arrived = false;
+            req.first = false;
             const GetHeaders q{cfg_.identity.chain_id, req.from, req.stop, req.max};
             header_req_[peer] = std::move(req);
             timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
@@ -2048,6 +2096,10 @@ public:
     // the link drops; the peer gets no new header request meanwhile).
     std::size_t tick(std::uint64_t now_s) {
         std::size_t n = 0;
+        clock_s_ = std::max(clock_s_, now_s);
+        for (auto a = parent_asked_.begin(); a != parent_asked_.end();)  // placed, or asked P-53 ago
+            a = tree_->find(a->first) != nullptr || clock_s_ >= a->second + cfg_.abandon_timeout_s ? parent_asked_.erase(a)
+                                                                                               : std::next(a);
         for (const Req& r : timers_.expired(now_s)) {
             ++n;
             if (r.kind == ReqKind::Headers) {
@@ -2115,6 +2167,7 @@ private:
         std::uint64_t sent_s = 0;  // this page's send
         bool arrived = false;      // a frame of its reply arrived: its P-53 clock stopped
         bool retired = false;      // no frame within P-53: its reply DROPs when it arrives
+        bool first = false;        // a catch-up round's first request (the first after a link's first HELLO)
         std::vector<CarrierHeader> got;      // the branch's headers so far, oldest first
         std::vector<std::uint64_t> heights;  // h(y) of each
     };
@@ -2777,6 +2830,9 @@ private:
         repend_watch_.clear();  // the re-pended receipts left with the pending set
         amounts_.clear();
         deferred_ = DeferredCarriers(cfg_.waiting_cap ? cfg_.waiting_cap : waiting_cap_default());
+        parent_asked_.clear();
+        reask_round_.clear();
+        hf_placed_s_ = 0;
         for (auto& [p, r] : header_req_) {  // still in flight: retired (their replies DROP; no new request before them)
             r.retired = true;
             r.got.clear();
@@ -3113,6 +3169,8 @@ private:
                 if (b.side.payee != r.carrier->own.side.payee) ++amount_counts_.foreign_carried;
         headers_->placed(r.id);
         deferred_.purge(r.id);
+        parent_asked_.erase(r.id);
+        if (bodies_asked_.count(r.id) != 0) hf_placed_s_ = clock_s_;
         if ((relayed || peer == kOwnPeer) && !rests_on_claims())
             flood(frame, peer == kOwnPeer ? std::nullopt : std::optional<std::uint64_t>(peer));
         // the carriers that waited on this one (placed by the outermost event, drain_released)
@@ -3143,14 +3201,83 @@ private:
                 f.parent = c.own.side.tip;
             }
         }
-        (void)deferred_.park(*tree_, std::move(f));
-        if (*r.missing == Missing::ParentUnknown && peer != kOwnPeer) {
+        if (placed_copy(f.id, frame)) return;  // a byte-identical copy of a placed carrier: not parked
+        if (*r.missing == Missing::ParentUnknown) {
+            // its parent was placed after this frame's admission: admitted again (drain_released), never dropped
+            if (const CarrierNode* pn = tree_->find(f.parent); pn != nullptr && pn->verified) {
+                release_q_.push_back(std::move(f));
+                return;
+            }
+        }
+        const bool stored = deferred_.park(*tree_, std::move(f));
+        // FC_GETCARRIER(parent) for a frame parked now (a copy held already asks nothing), whose parent is neither held,
+        // nor parked, nor asked within P-53, while headers first is not live
+        if (*r.missing == Missing::ParentUnknown && peer != kOwnPeer && stored && !headers_first_live()
+            && parent_ask_due(r.fetch)) {
             GetCarrier q;
             q.chain_id = cfg_.identity.chain_id;
             q.ids = {r.fetch};
             q.want_bodies = true;
+            ++parent_asks_;
             send(peer, *encode_fc_getcarrier(q, cfg_.p));
         }
+    }
+
+    // reask_parents' target, in turn over the asks of one parent: the connected senders of the chain's frames (the
+    // oldest frame's first; connected: a Path B peer past HELLO), then every other connected Path B peer; a peer
+    // without room is passed over (none with room: no ask now).
+    std::optional<std::uint64_t> reask_target(const Hash32& parent, const std::vector<std::uint64_t>& senders,
+                                              const std::function<std::size_t(std::uint64_t)>& room) {
+        std::vector<std::uint64_t> c;
+        for (const std::uint64_t p : senders)
+            if (peers_.count(p) != 0) c.push_back(p);
+        for (const auto& [p, t] : peers_)
+            if (std::find(c.begin(), c.end(), p) == c.end()) c.push_back(p);
+        if (c.empty()) return std::nullopt;
+        std::uint64_t& round = reask_round_[parent];
+        for (std::size_t i = 0; i < c.size(); ++i) {
+            const std::uint64_t p = c[(round + i) % c.size()];
+            if (room && room(p) == 0) continue;
+            round += i + 1;
+            return p;
+        }
+        return std::nullopt;
+    }
+
+    // A copy of a carrier the tree holds whose body bytes are those of its stored body (a copy with other bytes, such as
+    // another carried list, is parked and judged as any frame).
+    bool placed_copy(const Hash32& id, const std::vector<std::uint8_t>& frame) const {
+        if (frame.size() <= kFrameHeaderBytes || tree_->find(id) == nullptr) return false;
+        const CarrierBodyV3* c = bodies_->get(id);
+        if (c == nullptr) return false;
+        const std::optional<std::vector<std::uint8_t>> held = carrier_frame(*c, cfg_.p.r_max);
+        return held && held->size() == frame.size()
+               && std::equal(frame.begin() + kFrameHeaderBytes, frame.end(), held->begin() + kFrameHeaderBytes);
+    }
+
+    // Headers first is live (no parent ask, first or repeated, goes out): (a) a catch-up round's first request is in
+    // flight (sent, no frame of its reply arrived, not retired); or (b) while the deferred store is not full, a body a
+    // header page asked is in flight within P-53, or one was placed within P-53.
+    bool headers_first_live() const {
+        for (const auto& [p, r] : header_req_)
+            if (r.owner == HeaderOwner::CatchUp && r.first && !r.arrived && !r.retired) return true;
+        if (deferred_.size() >= deferred_.cap()) return false;
+        if (hf_placed_s_ != 0 && clock_s_ < hf_placed_s_ + cfg_.abandon_timeout_s) return true;
+        for (const auto& [id, t] : bodies_asked_)
+            if (clock_s_ < t + cfg_.abandon_timeout_s && tree_->find(id) == nullptr) return true;
+        return false;
+    }
+
+    // The parent ask of a ParentUnknown DEFER is due: `id` is not held, not parked (a frame of it waiting on its own
+    // parent or DEFERred on another cause), and not asked as a parent within P-53; the ask is recorded.
+    bool parent_ask_due(const Hash32& id) {
+        if (tree_->find(id) != nullptr || tree_->is_waiting(id) || deferred_.holds_id(id)) return false;
+        const auto [a, fresh] = parent_asked_.try_emplace(id, clock_s_);
+        if (!fresh) {
+            if (clock_s_ < a->second + cfg_.abandon_timeout_s) return false;
+            a->second = clock_s_;
+        }
+        return true;
     }
 
     // After every change of the store's best tip: variants below H(base_pos -
@@ -3467,6 +3594,13 @@ private:
     std::map<std::uint64_t, HelloTail> peers_;
     std::map<std::uint64_t, HeaderRequest> header_req_;
     std::map<Hash32, std::uint64_t> bodies_asked_;  // FetchBodies ids not placed yet: their last ask time (s)
+    std::map<Hash32, std::uint64_t> parent_asked_;  // parent asks of ParentUnknown DEFERs: their last ask time (s)
+    std::uint64_t parent_asks_ = 0;                 // parent asks sent
+    std::uint64_t parent_reasks_ = 0;               // ... of them by reask_parents
+    std::map<Hash32, std::uint64_t> reask_round_;   // reask_parents: asks of a missing parent sent past its sender
+    std::uint64_t clock_s_ = 0;                     // the latest time given to tick or on_headers (s)
+    std::set<std::uint64_t> hf_round_;              // links whose next catch-up request opens a round (first HELLO)
+    std::uint64_t hf_placed_s_ = 0;                 // the last placement of a body a header page asked (s)
     std::map<std::pair<std::uint64_t, Hash32>, BucketsAssembly> assemblies_;
     std::set<std::pair<std::uint64_t, Hash32>> abandoned_;
     std::set<std::pair<std::uint64_t, Hash32>> closed_;

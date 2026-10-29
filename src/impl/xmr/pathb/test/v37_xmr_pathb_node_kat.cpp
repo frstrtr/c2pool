@@ -383,9 +383,22 @@ struct PathbNodeTestAccess {
     }
     static bool own_pow_set(const PathbNode& n) { return n.own_pow_.has_value(); }
     static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
+    // A frame parked through the node's own park as a DEFER of `cause` at `row` (`fetch`: the id it waits on).
+    static void park(PathbNode& n, std::uint64_t peer, const std::vector<std::uint8_t>& frame, Missing cause, RowId row,
+                     const Hash32& fetch = Hash32{}) {
+        AdmitResult r;
+        r.verdict = AdmitVerdict::Defer;
+        r.row = row;
+        r.missing = cause;
+        r.fetch = fetch;
+        n.park(peer, frame, r);
+    }
     static bool amount_held(const PathbNode& n, const Hash32& tip, const Hash32& p_r) {
         return n.amounts_.count(std::make_pair(tip, p_r)) != 0;
     }
+    // A body asked by a header page (FetchBodies) at time t.
+    static void body_asked(PathbNode& n, const Hash32& id, std::uint64_t t) { n.bodies_asked_[id] = t; }
+    static bool hf_live(const PathbNode& n) { return n.headers_first_live(); }
 };
 }  // namespace c2pool::xmr::pathb
 
@@ -8526,6 +8539,1420 @@ void catchlocator() {
 }
 
 // ---------------------------------------------------------------------------
+// The parent ask of a ParentUnknown DEFER (S1.3 #3, "DEFER + FC_GETCARRIER(tip)"): FC_GETCARRIER(parent) goes out only
+// for a frame parked now (a copy held already asks nothing), whose parent is neither held nor parked, and which was not
+// asked within P-53.
+//
+// pwalk_run: A, B and C hold one chain of n positions; J, empty, links to all three and catches up headers first while
+// A mines k new tips, one every 2 s, each reaching J from A, B and C. The wire carries at most `per_s` frames per second
+// of the clock; the servers' FC_HEADERS replies to J arrive `hold_s` seconds after they are sent (within P-53). The run
+// ends with J at A's tip after the k tips, at 1,800 s, or once J's R4 DEFERs pass `stop_r4`. `prefill`: before the links,
+// A's top `prefill` carriers reach J from A, newest first (each a ParentUnknown DEFER parked at J, not counted in R4).
+struct PwalkRun {
+    bool chain = false, mined = true, at_tip = false;
+    std::uint64_t tips = 0, r4 = 0, r17 = 0, parent_asks = 0, reasks = 0, catchup = 0, strikes = 0, bans = 0, a_pos = 0, j_pos = 0;
+    std::uint64_t cu_end_pos = 0;  // J's best when the catch-ups toward A, B and C had all ended (0: not seen)
+    std::size_t deferred = 0, peak = 0, cap = 0, prefilled = 0;
+    int secs = 0;
+};
+PwalkRun pwalk_run(std::uint64_t n, std::uint64_t k, std::uint64_t per_s, std::uint64_t hold_s, std::uint64_t stop_r4,
+                   std::uint32_t seed, std::size_t prefill = 0) {
+    const KatNet net;
+    Harness h(net);
+    h.headers_frame = 700000;  // P-14: one FC_HEADERS frame holds a full page of P-01 headers
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    PwalkRun out;
+    out.chain = catch_chain(h, w, a, b, c, n, seed);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    const auto r4 = [&j] {
+        return j.relay->verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    std::deque<std::pair<std::uint64_t, FakeWire::Msg>> held;  // the servers' FC_HEADERS to J, by arrival time
+    std::size_t pass = 0;                                      // released frames at the front of the wire
+    w.edit = [&](FakeWire::Msg& m) {
+        if (pass > 0) {
+            --pass;
+            return;
+        }
+        if (m.to != j.links->self || m.f.empty() || m.f[0] != pb::kOpFcHeaders) return;
+        held.emplace_back(h.now + hold_s, m);
+        m.f.clear();
+    };
+    if (prefill > 0) {
+        const std::uint64_t pa = w.id(j.node, a.node);
+        std::vector<pb::Hash32> top;
+        for (const pb::CarrierNode* x = &h[a.node].tree().best(); x != nullptr && x->pos > 0 && top.size() < prefill;
+             x = h[a.node].tree().find(x->parent))
+            top.push_back(x->id);
+        for (const pb::Hash32& id : top) (void)h[j.node].on_carrier(pa, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(id), 16));
+        out.prefilled = h[j.node].deferred().size();
+    }
+    w.connect(j.node, a.node);
+    w.connect(j.node, b.node);
+    w.connect(j.node, c.node);
+    bool cu_seen = false;
+    for (; out.secs < 1800 && r4() <= stop_r4; ++out.secs) {
+        if (out.tips < k && out.secs % 2 == 1) {  // A's new tip, flooded; the wire carries it with the rest
+            if (out.tips % 12 == 0) h.tick_monero();
+            const std::uint32_t nonce = seed + 1000000 + static_cast<std::uint32_t>(out.tips);
+            const std::optional<pb::PathbJob> jb = h.job(a.node, static_cast<std::size_t>(out.tips % 5), nonce);
+            out.mined = out.mined && jb && h[a.node].on_own_share(*jb, nonce, pb::Hash32{}).action == pb::NodeAction::Placed;
+            ++out.tips;
+        }
+        if (out.tips == k && h[j.node].tree().best().id == h[a.node].tree().best().id) break;
+        h.now += 1;
+        std::vector<FakeWire::Msg> due;
+        while (!held.empty() && held.front().first <= h.now) {
+            due.push_back(std::move(held.front().second));
+            held.pop_front();
+        }
+        for (auto it = due.rbegin(); it != due.rend(); ++it) w.q.push_front(std::move(*it));
+        pass += due.size();
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), c.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        for (std::uint64_t m = 0; m < per_s && w.step(); ++m) {
+        }
+        out.peak = std::max(out.peak, h[j.node].deferred().size());
+        if (out.cu_end_pos == 0) {
+            bool open = false;
+            for (const KatRelay* x : {&a, &b, &c}) open = open || j.relay->catchup_view(w.id(j.node, x->node)).has_value();
+            if (open) cu_seen = true;
+            else if (cu_seen) out.cu_end_pos = h[j.node].tree().best().pos;
+        }
+    }
+    w.edit = nullptr;
+    out.at_tip = h[j.node].tree().best().id == h[a.node].tree().best().id;
+    out.r4 = r4();
+    out.r17 = j.relay->verdict_counts()[static_cast<std::size_t>(pb::RowId::R17)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    out.parent_asks = h[j.node].parent_asks();
+    out.reasks = h[j.node].parent_reasks();
+    out.catchup = j.relay->stats().catchup_requests.load();
+    out.a_pos = h[a.node].tree().best().pos;
+    out.j_pos = h[j.node].tree().best().pos;
+    out.deferred = h[j.node].deferred().size();
+    out.cap = h[j.node].deferred_cap();
+    for (const KatRelay* x : {&a, &b, &c, &j}) {
+        out.strikes += x->relay->stats().strikes.load();
+        out.bans += x->relay->stats().bans.load();
+    }
+    return out;
+}
+void pwalk_print(const char* tag, const PwalkRun& r, std::uint64_t bound) {
+    std::printf("  %s: chain %d (A at %llu); tips %llu; J at %llu after %d s; R4 DEFERs %llu (bound %llu); R17 %llu; parent "
+                "asks %llu (re-asks %llu); the catch-ups all ended at %llu; deferred %zu (at most %zu); catch-up asks %llu; "
+                "strikes %llu, bans %llu\n",
+                tag, r.chain ? 1 : 0, (unsigned long long)r.a_pos, (unsigned long long)r.tips, (unsigned long long)r.j_pos,
+                r.secs, (unsigned long long)r.r4, (unsigned long long)bound, (unsigned long long)r.r17,
+                (unsigned long long)r.parent_asks, (unsigned long long)r.reasks, (unsigned long long)r.cu_end_pos, r.deferred,
+                r.peak, (unsigned long long)r.catchup, (unsigned long long)r.strikes, (unsigned long long)r.bans);
+}
+
+// pwalk: N = 3,000 positions (more than P-47 = J_0 = 1,152), K = 30 tips; the wire carries at most 1,000 frames per
+// second, the FC_HEADERS replies arrive 8 s after they are sent. J reaches A's tip at N + K; its R4 DEFERs within
+// N + 3K + J_0; the catch-ups toward A, B and C all end at or after their HELLO tip (N); 0 strikes, 0 bans.
+void pwalk_checks(const char* tag, const PwalkRun& r, std::uint64_t n, std::uint64_t k, std::uint64_t bound) {
+    const std::string t = tag;
+    check(r.chain && r.mined && r.tips == k, t + ": A, B and C at 3,000 positions; A mines 30 tips during J's catch-up");
+    check(r.at_tip && r.j_pos == n + k, t + ": J reaches A's tip at N + K (" + std::to_string(r.j_pos) + ")");
+    check(r.r4 <= bound, t + ": J's R4 DEFERs within N + 3K + J_0 (" + std::to_string(r.r4) + " of " + std::to_string(bound) + ")");
+    check(r.cu_end_pos >= n, t + ": the catch-ups all end at or after the HELLO tip (at " + std::to_string(r.cu_end_pos) + ")");
+    check(r.strikes == 0 && r.bans == 0, t + ": 0 strikes, 0 bans");
+}
+void pwalk() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 1000, 8, 4 * bound, 44000);
+    pwalk_print("pwalk", r, bound);
+    pwalk_checks("pwalk", r, n, k, bound);
+}
+
+// pwalkshapes: the pwalk chain over wire / FC_HEADERS reply shapes (frames per second / seconds after the send): 1,000 / 8,
+// 500 / 8, 1,000 / 10, 1,500 / 8, 2,000 / 5; each as pwalk.
+void pwalkshapes() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const std::pair<std::uint64_t, std::uint64_t> shapes[] = {{1000, 8}, {500, 8}, {1000, 10}, {1500, 8}, {2000, 5}};
+    for (const auto& [per_s, hold] : shapes) {
+        const PwalkRun r = pwalk_run(n, k, per_s, hold, 4 * bound, 44000);
+        const std::string tag = "pwalkshapes " + std::to_string(per_s) + " / " + std::to_string(hold);
+        pwalk_print(tag.c_str(), r, bound);
+        pwalk_checks(tag.c_str(), r, n, k, bound);
+    }
+}
+
+// pwalkfull: the pwalk chain at 500 frames per second, the FC_HEADERS replies 8 s after they are sent: J's deferred
+// store reaches its cap (P-47) during the catch-up; as pwalk.
+void pwalkfull() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 500, 8, 4 * bound, 44000);
+    pwalk_print("pwalkfull", r, bound);
+    check(r.peak == r.cap,
+          "pwalkfull: J's deferred store at its cap during the catch-up (at most " + std::to_string(r.peak) + ")");
+    pwalk_checks("pwalkfull", r, n, k, bound);
+}
+
+// pwalkcrawl: the pwalk chain at 500 frames per second, the FC_HEADERS replies 8 s after they are sent, J's deferred
+// store full (P-47) of A's top carriers before the links: the header path gets one body per page while the store is
+// full; J reaches A's tip within 1,800 s; as pwalk.
+void pwalkcrawl() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 500, 8, 4 * bound, 44000, pb::admit_j0(pb::kRuledLaneParams));
+    pwalk_print("pwalkcrawl", r, bound);
+    std::printf("  pwalkcrawl: parked at J before the links %zu (cap %zu)\n", r.prefilled, r.cap);
+    check(r.prefilled == r.cap, "pwalkcrawl: J's deferred store full before the links (" + std::to_string(r.prefilled) + ")");
+    pwalk_checks("pwalkcrawl", r, n, k, bound);
+}
+
+// pwalkstall: the pwalk chain at 5,000 frames per second, the FC_HEADERS replies 8 s after they are sent; as pwalk.
+void pwalkstall() {
+    const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
+    const PwalkRun r = pwalk_run(n, k, 5000, 8, 4 * bound, 44000);
+    pwalk_print("pwalkstall", r, bound);
+    pwalk_checks("pwalkstall", r, n, k, bound);
+}
+
+// pwalklost: A and B hold one chain; J follows both while A mines one carrier per second. E, a node of its own, holds
+// A's positions 1..6 and mines e1, e2 on position 6; A places them on a side branch and floods them, and so does B. The
+// wire loses e1's floods to J and B's e2, so J parks A's e2, and every FC_GETCARRIER(e1) of J is lost for 60 s. The
+// relay's tick asks e1 again once per P-53 although J's best moves every second: first of A (the sender), then of B and
+// A in turn (no two asks in a row to one peer); at 30 s a header page's ask of e1 is recorded, and no ask of e1 goes out
+// within P-53 of it; from 2 to 1 + 60 / 11 asks in those 60 s. Then the asks pass: J holds e1 and e2 within P-53 + 2 s,
+// nothing parked.
+void pwalklost() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    const std::size_t e = h.add(table0(net), true);
+    w.connect(a.node, b.node);
+    w.connect(a.node, j.node);
+    w.connect(b.node, j.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 50000 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::Hash32> eb;  // e1, e2
+    for (std::uint32_t i = 0; i < 2 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 50100 + i);
+        ok = jb && h[e].on_own_share(*jb, 50100 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(h[e].tree().best().id);
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 4 && ok; ++i) ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 50200 + static_cast<std::uint32_t>(i));
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+        w.run();
+    }
+    ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 10
+         && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "pwalklost: setup (A and B at 10, J on them; E's branch e1, e2 on position 6)");
+        return;
+    }
+    const auto own_id = [&h, &j](const std::vector<std::uint8_t>& f) -> std::optional<pb::Hash32> {
+        pb::CarrierBodyV3 c;
+        if (f.size() <= pb::kFrameHeaderBytes
+            || pb::decode_carrier_body_v3(f.data() + pb::kFrameHeaderBytes, f.size() - pb::kFrameHeaderBytes,
+                                          pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
+                       != pb::WireError::None)
+            return std::nullopt;
+        return pb::receipt_id(c.own);
+    };
+    bool lose = true;
+    std::vector<std::pair<std::uint64_t, std::size_t>> asks;  // (time, the peer: 0 A, 1 B) of every ask of e1
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {  // the floods of e1 to J, and B's e2
+            const std::optional<pb::Hash32> id = own_id(m.f);
+            if (id && lose && (*id == eb[0] || (*id == eb[1] && m.from == b.links->self))) m.f.clear();
+            return;
+        }
+        if (m.from != j.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
+        if (std::find(q.ids.begin(), q.ids.end(), eb[0]) == q.ids.end()) return;
+        asks.emplace_back(h.now, m.to == a.links->self ? 0 : 1);
+        if (lose) m.f.clear();
+    };
+    h.now += 1;
+    for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it; B places it and floods it
+        (void)h[a.node].on_carrier(999, *pb::encode_fc_carrier(0, *h[e].bodies().get(id), 16));
+    w.run();
+    const bool parked = h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr && asks.size() == 1
+                        && asks[0].second == 0;
+    const std::uint64_t t0 = h.now, pos0 = h[j.node].tree().best().pos;
+    const auto second = [&](std::uint32_t nonce) {
+        h.now += 1;
+        if (nonce % 12 == 0) h.tick_monero();
+        (void)mine_on(h, w, a.node, nonce % 5, nonce);
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        w.run();
+    };
+    std::uint64_t t_page = 0;
+    for (std::uint32_t t = 0; t < 60; ++t) {
+        if (t == 30) {  // a header page asks e1 (FetchBodies): no reask of e1 within P-53 of it
+            t_page = h.now;
+            pb::PathbNodeTestAccess::body_asked(h[j.node], eb[0], t_page);
+        }
+        second(50300 + t);
+    }
+    const std::vector<std::pair<std::uint64_t, std::size_t>> lost = asks;
+    const bool moved = h[j.node].tree().best().pos >= pos0 + 55 && h[j.node].tree().best().id == h[a.node].tree().best().id;
+    lose = false;
+    int secs = 0;
+    for (; secs < 30 && h[j.node].tree().find(eb[0]) == nullptr; ++secs) second(50400 + static_cast<std::uint32_t>(secs));
+    w.edit = nullptr;
+    pb::PathbRelayNode& rj = *j.relay;
+    const bool done = h[j.node].tree().find(eb[0]) != nullptr && h[j.node].tree().find(eb[1]) != nullptr;
+    bool turns = lost.size() >= 3, both = false, page_quiet = true;
+    std::string seq;
+    for (std::size_t i = 0; i < lost.size(); ++i) {
+        seq += (i ? " " : "") + std::to_string(lost[i].first - t0) + (lost[i].second == 0 ? "A" : "B");
+        if (i >= 2 && lost[i].second == lost[i - 1].second) turns = false;  // the re-asks: never twice in a row to one peer
+        both = both || lost[i].second == 1;
+        if (lost[i].first >= t_page && lost[i].first < t_page + pb::kAbandonTimeoutDefault) page_quiet = false;
+    }
+    std::printf("  pwalklost: e2 parked at J %d; J's best %llu -> %llu; asks of e1 while lost (s from the park, peer): %s; "
+                "header page's ask at %llu; then e1 and e2 held %d after %d s; parked %zu; strikes %llu, bans %llu\n",
+                parked ? 1 : 0, (unsigned long long)pos0, (unsigned long long)h[j.node].tree().best().pos, seq.c_str(),
+                (unsigned long long)(t_page - t0), done ? 1 : 0, secs, h[j.node].deferred().size(),
+                (unsigned long long)rj.stats().strikes.load(), (unsigned long long)rj.stats().bans.load());
+    check(parked && moved, "pwalklost: e1's floods lost, e2 parked at J (its ask of e1 to A); J's best moves every second");
+    check(lost.size() >= 2 && lost.size() <= 1 + 60 / pb::kAbandonTimeoutDefault,
+          "pwalklost: e1 asked again while lost, at most once per P-53 (" + std::to_string(lost.size()) + " asks in 60 s)");
+    check(turns && both, "pwalklost: the re-asks of e1 go to A and B in turn (" + seq + ")");
+    check(page_quiet, "pwalklost: no ask of e1 within P-53 of a header page's ask of it");
+    check(done && secs <= static_cast<int>(pb::kAbandonTimeoutDefault) + 2 && h[j.node].deferred().size() == 0
+                  && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
+          "pwalklost: once the asks pass, J holds e1 and e2 within P-53 + 2 s (" + std::to_string(secs) + " s); nothing parked");
+}
+
+// pwalksilent: as pwalklost with a fourth peer Z, linked to J only, whose own chain of 200 positions claims more work
+// than J's best throughout; every FC_HEADERS of Z to J is lost, so J's catch-up toward Z stays open with no reply of its
+// own. While A mines one carrier per second and every FC_GETCARRIER(e1) of J is lost for 60 s, e1 is asked at least
+// twice, the first time within P-53 + 2 s of the park; the catch-up toward Z is still open at the end. Then the asks
+// pass: J holds e1 and e2 within 2 x P-53 + 2 s (the turn may first fall on Z, which does not hold e1).
+void pwalksilent() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    KatRelay z = kat_relay(h, w, table0(net), true);
+    const std::size_t e = h.add(table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 200 && ok; ++i)  // Z's own chain (Z linked to nobody), on one Monero height
+        ok = mine_on(h, w, z.node, static_cast<std::size_t>(i % 5), 56000 + static_cast<std::uint32_t>(i));
+    w.connect(a.node, b.node);
+    w.connect(a.node, j.node);
+    w.connect(b.node, j.node);
+    w.run();
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 56300 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::Hash32> eb;  // e1, e2
+    for (std::uint32_t i = 0; i < 2 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 56400 + i);
+        ok = jb && h[e].on_own_share(*jb, 56400 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(h[e].tree().best().id);
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 4 && ok; ++i) ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 56500 + static_cast<std::uint32_t>(i));
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+        w.run();
+    }
+    ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 10
+         && h[z.node].tree().best().pos == 200;
+    if (!ok) {
+        check(false, "pwalksilent: setup (A and B at 10, J on them; Z at 200 of its own; E's branch e1, e2 on position 6)");
+        return;
+    }
+    const auto own_id = [&h, &j](const std::vector<std::uint8_t>& f) -> std::optional<pb::Hash32> {
+        pb::CarrierBodyV3 c;
+        if (f.size() <= pb::kFrameHeaderBytes
+            || pb::decode_carrier_body_v3(f.data() + pb::kFrameHeaderBytes, f.size() - pb::kFrameHeaderBytes,
+                                          pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
+                       != pb::WireError::None)
+            return std::nullopt;
+        return pb::receipt_id(c.own);
+    };
+    bool lose = true;
+    std::uint64_t z_headers = 0;
+    std::vector<std::uint64_t> ask_t;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (m.from == z.links->self && m.to == j.links->self && m.f[0] == pb::kOpFcHeaders) {  // Z is silent
+            ++z_headers;
+            m.f.clear();
+            return;
+        }
+        if (m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {  // the floods of e1 to J, and B's e2
+            const std::optional<pb::Hash32> id = own_id(m.f);
+            if (id && lose && (*id == eb[0] || (*id == eb[1] && m.from == b.links->self))) m.f.clear();
+            return;
+        }
+        if (m.from != j.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
+        if (std::find(q.ids.begin(), q.ids.end(), eb[0]) == q.ids.end()) return;
+        ask_t.push_back(h.now);
+        if (lose) m.f.clear();
+    };
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(z.node, j.node);
+    w.run();
+    const std::uint64_t pz = w.id(j.node, z.node);
+    const bool opened = rj.catchup_view(pz).has_value();
+    h.now += 1;
+    for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get(), z.relay.get()}) r->tick();
+    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it; B places it and floods it
+        (void)h[a.node].on_carrier(999, *pb::encode_fc_carrier(0, *h[e].bodies().get(id), 16));
+    w.run();
+    const std::uint64_t t_park = h.now;
+    const bool parked = h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr;
+    const std::uint64_t pos0 = h[j.node].tree().best().pos;
+    const auto second = [&](std::uint32_t nonce) {
+        h.now += 1;
+        if (nonce % 12 == 0) h.tick_monero();
+        (void)mine_on(h, w, a.node, nonce % 5, nonce);
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get(), z.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        w.run();
+    };
+    for (std::uint32_t t = 0; t < 60; ++t) second(56600 + t);
+    const std::vector<std::uint64_t> lost = ask_t;
+    const bool open_end = rj.catchup_view(pz).has_value();
+    const bool moved = h[j.node].tree().best().pos >= pos0 + 55 && h[j.node].tree().best().id == h[a.node].tree().best().id;
+    lose = false;
+    int secs = 0;
+    for (; secs < 40 && h[j.node].tree().find(eb[0]) == nullptr; ++secs) second(56700 + static_cast<std::uint32_t>(secs));
+    w.edit = nullptr;
+    const bool done = h[j.node].tree().find(eb[0]) != nullptr && h[j.node].tree().find(eb[1]) != nullptr;
+    std::string seq;
+    for (std::size_t i = 0; i < lost.size(); ++i) seq += (i ? " " : "") + std::to_string(lost[i] - t_park);
+    const std::uint64_t first = lost.empty() ? 999 : lost[0] - t_park;
+    std::printf("  pwalksilent: catch-up toward Z opened %d, Z's FC_HEADERS lost %llu, still open after 60 s %d; e2 parked "
+                "at J %d; J's best %llu -> %llu; asks of e1 while lost (s from the park): %s; then e1 and e2 held %d after "
+                "%d s; parked %zu; strikes %llu, bans %llu\n",
+                opened ? 1 : 0, (unsigned long long)z_headers, open_end ? 1 : 0, parked ? 1 : 0, (unsigned long long)pos0,
+                (unsigned long long)h[j.node].tree().best().pos, seq.c_str(), done ? 1 : 0, secs,
+                h[j.node].deferred().size(), (unsigned long long)rj.stats().strikes.load(),
+                (unsigned long long)rj.stats().bans.load());
+    check(opened && open_end && z_headers >= 1 && parked && moved,
+          "pwalksilent: a catch-up toward the silent Z open throughout; e2 parked at J; J's best moves every second");
+    check(lost.size() >= 2 && first <= pb::kAbandonTimeoutDefault + 2,
+          "pwalksilent: e1 asked at least twice while the catch-up toward Z stays open, the first within P-53 + 2 s of the "
+          "park (" + seq + ")");
+    check(done && secs <= 2 * static_cast<int>(pb::kAbandonTimeoutDefault) + 2 && h[j.node].deferred().size() == 0
+                  && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
+          "pwalksilent: once the asks pass, J holds e1 and e2 within 2 x P-53 + 2 s (" + std::to_string(secs) + " s)");
+}
+
+// silent_run: the pwalksilent shape. Z, linked to J only `lead` seconds before E's branch reaches J, holds its own chain
+// of 200 positions (more work than J's best throughout); Z's FC_HEADERS to J are lost (late_s < 0) or arrive late_s
+// seconds after they are sent. The times of J's asks of e1 are taken from the park.
+struct SilentRun {
+    bool ok = false, opened = false, open_end = false, parked = false, moved = false, done = false;
+    std::uint64_t z_headers = 0, pos0 = 0, pos_end = 0, strikes = 0, bans = 0;
+    std::vector<std::uint64_t> asks;
+    int secs = 0;
+    std::size_t deferred = 0;
+};
+SilentRun silent_run(int lead, int late_s) {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    KatRelay z = kat_relay(h, w, table0(net), true);
+    const std::size_t e = h.add(table0(net), true);
+    SilentRun out;
+    bool ok = true;
+    for (int i = 0; i < 200 && ok; ++i)  // Z's own chain (Z linked to nobody), on one Monero height
+        ok = mine_on(h, w, z.node, static_cast<std::size_t>(i % 5), 58000 + static_cast<std::uint32_t>(i));
+    w.connect(a.node, b.node);
+    w.connect(a.node, j.node);
+    w.connect(b.node, j.node);
+    w.run();
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 58300 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::Hash32> eb;  // e1, e2
+    for (std::uint32_t i = 0; i < 2 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 58400 + i);
+        ok = jb && h[e].on_own_share(*jb, 58400 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(h[e].tree().best().id);
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 4 && ok; ++i) ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 58500 + static_cast<std::uint32_t>(i));
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+        w.run();
+    }
+    out.ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id
+             && h[j.node].tree().best().pos == 10 && h[z.node].tree().best().pos == 200;
+    if (!out.ok) return out;
+    const auto own_id = [&h, &j](const std::vector<std::uint8_t>& f) -> std::optional<pb::Hash32> {
+        pb::CarrierBodyV3 c;
+        if (f.size() <= pb::kFrameHeaderBytes
+            || pb::decode_carrier_body_v3(f.data() + pb::kFrameHeaderBytes, f.size() - pb::kFrameHeaderBytes,
+                                          pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
+                       != pb::WireError::None)
+            return std::nullopt;
+        return pb::receipt_id(c.own);
+    };
+    bool lose = true;
+    std::deque<std::pair<std::uint64_t, FakeWire::Msg>> zheld;  // Z's FC_HEADERS to J, by arrival time
+    std::size_t zpass = 0;                                      // released frames at the front of the wire
+    std::vector<std::uint64_t> ask_t;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (zpass > 0) {
+            --zpass;
+            return;
+        }
+        if (m.from == z.links->self && m.to == j.links->self && m.f[0] == pb::kOpFcHeaders) {
+            ++out.z_headers;
+            if (late_s >= 0) zheld.emplace_back(h.now + static_cast<std::uint64_t>(late_s), m);
+            m.f.clear();
+            return;
+        }
+        if (m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {  // the floods of e1 to J, and B's e2
+            const std::optional<pb::Hash32> id = own_id(m.f);
+            if (id && lose && (*id == eb[0] || (*id == eb[1] && m.from == b.links->self))) m.f.clear();
+            return;
+        }
+        if (m.from != j.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
+        if (std::find(q.ids.begin(), q.ids.end(), eb[0]) == q.ids.end()) return;
+        ask_t.push_back(h.now);
+        if (lose) m.f.clear();
+    };
+    pb::PathbRelayNode& rj = *j.relay;
+    const auto second = [&](std::uint32_t nonce) {
+        h.now += 1;
+        if (nonce % 12 == 0) h.tick_monero();
+        (void)mine_on(h, w, a.node, nonce % 5, nonce);
+        std::vector<FakeWire::Msg> due;
+        while (!zheld.empty() && zheld.front().first <= h.now) {
+            due.push_back(std::move(zheld.front().second));
+            zheld.pop_front();
+        }
+        for (auto it = due.rbegin(); it != due.rend(); ++it) w.q.push_front(std::move(*it));
+        zpass += due.size();
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get(), z.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        w.run();
+    };
+    w.connect(z.node, j.node);
+    w.run();
+    const std::uint64_t pz = w.id(j.node, z.node);
+    out.opened = rj.catchup_view(pz).has_value();
+    for (int t = 0; t < lead; ++t) second(58800 + static_cast<std::uint32_t>(t));
+    h.now += 1;
+    for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get(), z.relay.get()}) r->tick();
+    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it; B places it and floods it
+        (void)h[a.node].on_carrier(999, *pb::encode_fc_carrier(0, *h[e].bodies().get(id), 16));
+    w.run();
+    const std::uint64_t t_park = h.now;
+    out.parked = h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr;
+    out.pos0 = h[j.node].tree().best().pos;
+    for (std::uint32_t t = 0; t < 60; ++t) second(58600 + t);
+    for (const std::uint64_t at : ask_t) out.asks.push_back(at - t_park);
+    out.open_end = rj.catchup_view(pz).has_value();
+    out.moved = h[j.node].tree().best().pos >= out.pos0 + 55 && h[j.node].tree().best().id == h[a.node].tree().best().id;
+    lose = false;
+    for (; out.secs < 40 && h[j.node].tree().find(eb[0]) == nullptr; ++out.secs) second(58700 + static_cast<std::uint32_t>(out.secs));
+    w.edit = nullptr;
+    out.done = h[j.node].tree().find(eb[0]) != nullptr && h[j.node].tree().find(eb[1]) != nullptr;
+    out.pos_end = h[j.node].tree().best().pos;
+    out.deferred = h[j.node].deferred().size();
+    out.strikes = rj.stats().strikes.load();
+    out.bans = rj.stats().bans.load();
+    return out;
+}
+// The checks of rcsilent and rclate; `cadence`: no two asks of e1 more than P-53 + 1 s apart.
+void silent_checks(const std::string& tag, const SilentRun& r, bool cadence) {
+    if (!r.ok) {
+        check(false, tag + ": setup (A and B at 10, J on them; Z at 200 of its own; E's branch e1, e2 on position 6)");
+        return;
+    }
+    std::string seq;
+    bool steady = true;
+    for (std::size_t i = 0; i < r.asks.size(); ++i) {
+        seq += (i ? " " : "") + std::to_string(r.asks[i]);
+        if (i > 0 && r.asks[i] - r.asks[i - 1] > pb::kAbandonTimeoutDefault + 1) steady = false;
+    }
+    const std::uint64_t first = r.asks.empty() ? 999 : r.asks[0];
+    std::printf("  %s: catch-up toward Z opened %d, Z's FC_HEADERS %llu, still open after 60 s %d; e2 parked %d; J's best "
+                "%llu -> %llu; asks of e1 while lost (s from the park): %s; then e1 and e2 held %d after %d s; parked %zu; "
+                "strikes %llu, bans %llu\n",
+                tag.c_str(), r.opened ? 1 : 0, (unsigned long long)r.z_headers, r.open_end ? 1 : 0, r.parked ? 1 : 0,
+                (unsigned long long)r.pos0, (unsigned long long)r.pos_end, seq.c_str(), r.done ? 1 : 0, r.secs, r.deferred,
+                (unsigned long long)r.strikes, (unsigned long long)r.bans);
+    check(r.opened && r.open_end && r.z_headers >= 1 && r.parked && r.moved,
+          tag + ": the catch-up toward Z open throughout; e2 parked at J; J's best moves every second");
+    check(r.asks.size() >= 2 && first <= pb::kAbandonTimeoutDefault + 2,
+          tag + ": e1 asked at least twice while lost, the first within P-53 + 2 s of the park (" + seq + ")");
+    if (cadence) check(steady, tag + ": no two asks of e1 more than P-53 + 1 s apart (" + seq + ")");
+    check(r.done && r.secs <= 2 * static_cast<int>(pb::kAbandonTimeoutDefault) + 2 && r.deferred == 0 && r.strikes == 0
+                  && r.bans == 0,
+          tag + ": then J holds e1 and e2 within 2 x P-53 + 2 s (" + std::to_string(r.secs) + " s); nothing parked");
+}
+// rcsilent: Z silent (its FC_HEADERS to J all lost), linked at the park (lead 0) and 20 s before it.
+void rcsilent() {
+    for (const int lead : {0, 20}) silent_checks("rcsilent lead " + std::to_string(lead), silent_run(lead, -1), false);
+}
+// rclate: Z linked at the park; its FC_HEADERS reach J P-53 + 2 s after they are sent (past P-53: each a reply to a
+// retired request), or 3 s after (in time; no header of them wins).
+void rclate() {
+    for (const int late : {static_cast<int>(pb::kAbandonTimeoutDefault) + 2, 3})
+        silent_checks("rclate " + std::to_string(late) + " s", silent_run(0, late), true);
+}
+
+// rcrehello: only a catch-up round's first request (the first after a link's first HELLO) makes headers first live, for
+// at most P-53. J follows S; S HELLOs J. Round 1: J's first request R1 is live until its reply; a later request R2 of the
+// round is not live, nor after S HELLOs again on the same link while R2 is in flight, nor the request R2' after that
+// HELLO. Round 2, on a new link (S's link drops, S HELLOs again): its first request R3 gets no reply (S silent) while S
+// HELLOs every 5 s on that link: R3 is live through P-53 and retired after it, and nothing is live after it; a frame J
+// parks meanwhile asks its parent once headers first is not live.
+void rcrehello() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 59000 + static_cast<std::uint32_t>(i));
+    }
+    h.q.clear();
+    (void)h[j].tick(h.now);
+    const pb::Hash32 tip = h[s].tree().best().id;
+    const auto live = [&h, j] { return pb::PathbNodeTestAccess::hf_live(h[j]); };
+    const auto hello = [&h, j, s] { return h.hello(j, s).verdict == pb::HelloVerdict::Accept; };
+    const auto ask = [&h, j, s, &tip] {  // a catch-up request of J to S (from J's tip: an empty page)
+        h.q.clear();
+        return h[j].request_headers(s, tip, tip, 64, h.now);
+    };
+    const auto serve = [&h, j, s] {  // S answers J's open request
+        for (const Msg& m : std::deque<Msg>(h.q))
+            if (m.from == j && m.to == s && !m.frame.empty() && m.frame[0] == pb::kOpFcGetHeaders)
+                for (const auto& f : h[s].serve_getheaders(j, m.frame, h.now).frames) (void)h[j].on_headers(s, f, h.now);
+        h.q.clear();
+    };
+    const bool setup = h[j].tree().best().id == tip && hello();
+    const bool r1 = ask();
+    const bool live1 = live();
+    serve();
+    const bool live1_after = live();
+    const bool r2 = ask();
+    const bool live2 = live();
+    const bool rehello2 = hello();
+    const bool live2_rehello = live();
+    serve();
+    const bool r2b = ask();  // R2': the request after the HELLO on the same link
+    const bool live2b = live();
+    serve();
+    h[j].disconnect(s);  // S's link drops; S links again
+    const bool round2 = hello();
+    const bool r3 = ask();
+    const bool live3 = live();
+    // a frame on a parent no node holds, parked at J from S while R3 is in flight
+    pb::Hash32 parent = seq32(0xe1);
+    std::optional<pb::PathbJob> jb = h.job(s, 1, 59100);
+    bool parked = false;
+    if (jb) {
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 59100;
+        c.own.side.tip = parent;
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      parent);
+        parked = h[j].deferred().size() == 1;
+    }
+    const auto asks = [&h, j, &parent] {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == parent ? 1 : 0;
+        }
+        return n;
+    };
+    std::size_t asked_live = 0;
+    bool live_in = true;
+    for (std::uint64_t t = 1; t <= pb::kAbandonTimeoutDefault; ++t) {  // within P-53 of R3: S HELLOs every 5 s
+        h.now += 1;
+        if (t % 5 == 0) (void)hello();
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+        live_in = live_in && live();
+        asked_live += asks();
+    }
+    bool live_out = false;
+    std::size_t asked_after = 0;
+    for (std::uint64_t t = 0; t < 2 * pb::kAbandonTimeoutDefault; ++t) {  // past P-53: R3 retired; S HELLOs every 5 s
+        h.now += 1;
+        if (t % 5 == 0) (void)hello();
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+        live_out = live_out || live();
+        asked_after += asks();
+        h.q.clear();
+    }
+    const bool r4 = h[j].request_headers(s, tip, tip, 64, h.now);  // R3 retired, no reply: the slot stays taken
+    std::printf("  rcrehello: R1 live %d, after its reply %d; R2 live %d, after a HELLO on the same link %d; R2' live %d; "
+                "R3 (round 2, a new link) live %d, within P-53 of it %d, past it %d; parked %d; asks of its parent within "
+                "P-53 %zu, past it %zu; a new request %d\n",
+                live1 ? 1 : 0, live1_after ? 1 : 0, live2 ? 1 : 0, live2_rehello ? 1 : 0, live2b ? 1 : 0, live3 ? 1 : 0,
+                live_in ? 1 : 0, live_out ? 1 : 0, parked ? 1 : 0, asked_live, asked_after, r4 ? 1 : 0);
+    check(setup && r1 && r2 && rehello2 && r2b && round2 && r3 && parked,
+          "rcrehello: setup (J on S's chain, S's HELLOs, requests)");
+    check(live1 && !live1_after, "rcrehello: a round's first request is live until its reply");
+    check(!live2 && !live2_rehello, "rcrehello: a later request of the round is not live, nor after a HELLO on the same link");
+    check(!live2b, "rcrehello: a HELLO on the same link never makes a request first (R2' not live)");
+    check(live3 && live_in && asked_live == 0, "rcrehello: round 2's first request, unanswered, live within P-53; no ask");
+    check(!live_out && asked_after >= 1 && !r4,
+          "rcrehello: retired at P-53, nothing live after it although S HELLOs every 5 s; the parked frame's parent asked");
+}
+
+// pwalkgone: A and B hold one chain; J follows both. E, a node of its own, holds A's positions 1..6 and mines e1, e2 on
+// position 6; A places them on a side branch and floods them, and so does B. The wire loses e1's floods to J and B's e2,
+// so J parks A's e2, and J's FC_GETCARRIER(e1) to A is lost; then A's link to J drops. The relay's tick asks e1 of B (the
+// sender is gone): J holds e1 and e2 within P-53 + 2 s of the drop; no ask goes to A after it.
+void pwalkgone() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false);
+    const std::size_t e = h.add(table0(net), true);
+    w.connect(a.node, b.node);
+    w.connect(a.node, j.node);
+    w.connect(b.node, j.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 52000 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::Hash32> eb;  // e1, e2
+    for (std::uint32_t i = 0; i < 2 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 52100 + i);
+        ok = jb && h[e].on_own_share(*jb, 52100 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(h[e].tree().best().id);
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 4 && ok; ++i) ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 52200 + static_cast<std::uint32_t>(i));
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[a.node].tree().best().id; ++k) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+        w.run();
+    }
+    ok = ok && eb.size() == 2 && h[j.node].tree().best().id == h[a.node].tree().best().id
+         && h[b.node].tree().best().id == h[a.node].tree().best().id;
+    if (!ok) {
+        check(false, "pwalkgone: setup (A and B at 10, J on them; E's branch e1, e2 on position 6)");
+        return;
+    }
+    const auto own_id = [&h, &j](const std::vector<std::uint8_t>& f) -> std::optional<pb::Hash32> {
+        pb::CarrierBodyV3 c;
+        if (f.size() <= pb::kFrameHeaderBytes
+            || pb::decode_carrier_body_v3(f.data() + pb::kFrameHeaderBytes, f.size() - pb::kFrameHeaderBytes,
+                                          pb::CarrierLimits{h[j.node].config().buffers.receipt, pb::kRuledLaneParams.r_max}, c)
+                       != pb::WireError::None)
+            return std::nullopt;
+        return pb::receipt_id(c.own);
+    };
+    bool gone = false;
+    std::uint64_t asks_a = 0, asks_a_after = 0, asks_b = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) {  // the floods of e1 to J, and B's e2
+            const std::optional<pb::Hash32> id = own_id(m.f);
+            if (id && !gone && (*id == eb[0] || (*id == eb[1] && m.from == b.links->self))) m.f.clear();
+            return;
+        }
+        if (m.from != j.links->self || m.f[0] != pb::kOpFcGetCarrier) return;
+        pb::GetCarrier q;
+        if (!pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) return;
+        if (std::find(q.ids.begin(), q.ids.end(), eb[0]) == q.ids.end()) return;
+        if (m.to == a.links->self) {
+            ++asks_a;
+            asks_a_after += gone ? 1 : 0;
+            m.f.clear();  // A's answer is lost
+        } else if (m.to == b.links->self) {
+            ++asks_b;
+        }
+    };
+    h.now += 1;
+    for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) r->tick();
+    for (const pb::Hash32& id : eb)  // A places E's branch (a side branch) and floods it; B places it and floods it
+        (void)h[a.node].on_carrier(999, *pb::encode_fc_carrier(0, *h[e].bodies().get(id), 16));
+    w.run();
+    const bool parked = h[j.node].deferred().size() == 1 && h[j.node].tree().find(eb[1]) == nullptr && asks_a == 1
+                        && h[b.node].tree().find(eb[0]) != nullptr && h[b.node].tree().find(eb[1]) != nullptr;
+    h.now += 1;
+    j.links->disconnect(w.id(j.node, a.node));
+    w.run();
+    gone = true;
+    int secs = 0;
+    for (; secs < 30 && h[j.node].tree().find(eb[0]) == nullptr; ++secs) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        w.run();
+    }
+    w.edit = nullptr;
+    const bool done = h[j.node].tree().find(eb[0]) != nullptr && h[j.node].tree().find(eb[1]) != nullptr;
+    std::printf("  pwalkgone: e2 parked at J %d (asks of e1 to A %llu); A's link dropped; asks of e1 to B %llu, to A after %llu; "
+                "e1 and e2 held %d after %d s; parked %zu; strikes %llu, bans %llu\n",
+                parked ? 1 : 0, (unsigned long long)asks_a, (unsigned long long)asks_b, (unsigned long long)asks_a_after,
+                done ? 1 : 0, secs, h[j.node].deferred().size(), (unsigned long long)j.relay->stats().strikes.load(),
+                (unsigned long long)j.relay->stats().bans.load());
+    check(parked, "pwalkgone: e2 parked at J from A, its ask of e1 to A lost");
+    check(done && asks_b >= 1 && asks_a_after == 0 && secs <= static_cast<int>(pb::kAbandonTimeoutDefault) + 2
+                  && h[j.node].deferred().size() == 0,
+          "pwalkgone: A gone, e1 asked of B: J holds e1 and e2 within P-53 + 2 s (" + std::to_string(secs) + " s)");
+}
+
+// pwalkjunk: J (deferred store cap 16) gets 100 frames from S, each a carrier on its own unknown parent, parked as
+// ParentUnknown DEFERs (through the node's park). Over 4 windows of P-53, reask_parents runs every second: at most
+// min(100, 16) asks per window, each parent id at most once per window, every ask to S.
+void pwalkjunk() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    pb::PathbNodeConfig cf = h.config(table0(net), false);
+    cf.waiting_cap = 16;
+    const std::size_t j = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cf, h.io(j)));
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 3; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 53000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::HelloCheck hc = h.hello(j, s);
+    (void)h[j].tick(h.now);
+    const std::size_t n = 100;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        const std::optional<pb::PathbJob> jb = h.job(s, k % 5, 53100 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 53100 + k;
+        c.own.side.tip = seq32(static_cast<std::uint8_t>(0x10 + k % 200));
+        c.own.side.tip[1] = static_cast<std::uint8_t>(k);  // its own unknown parent
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      c.own.side.tip);
+    }
+    const std::size_t held = h[j].deferred().size();
+    h.q.clear();
+    const std::uint64_t windows = 4, cap = 16;
+    std::map<pb::Hash32, std::uint64_t> per_id;
+    std::uint64_t worst = 0, total = 0, to_other = 0;
+    for (std::uint64_t win = 0; win < windows; ++win) {
+        std::uint64_t asks = 0;
+        for (std::uint64_t t = 0; t < pb::kAbandonTimeoutDefault; ++t) {
+            h.now += 1;
+            (void)h[j].tick(h.now);
+            h[j].reask_parents();
+            for (const Msg& m : h.q) {
+                if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+                pb::GetCarrier q;
+                if (!pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok()) continue;
+                for (const pb::Hash32& id : q.ids) ++per_id[id];
+                asks += q.ids.size();
+                to_other += m.to != s ? 1 : 0;
+            }
+            h.q.clear();
+        }
+        worst = std::max(worst, asks);
+        total += asks;
+    }
+    std::uint64_t max_id = 0;
+    for (const auto& [id, k] : per_id) max_id = std::max(max_id, k);
+    std::printf("  pwalkjunk: HELLO %d; parked %zu of %zu (cap %llu); asks per window at most %llu, in all %llu; one id at "
+                "most %llu times over %llu windows; asks to another peer %llu\n",
+                hc.verdict == pb::HelloVerdict::Accept ? 1 : 0, held, n, (unsigned long long)cap, (unsigned long long)worst,
+                (unsigned long long)total, (unsigned long long)max_id, (unsigned long long)windows,
+                (unsigned long long)to_other);
+    check(hc.verdict == pb::HelloVerdict::Accept && held == cap, "pwalkjunk: 100 junk frames parked, the store at its cap (16)");
+    check(worst <= std::min<std::uint64_t>(n, cap) && worst > 0 && max_id <= windows && to_other == 0,
+          "pwalkjunk: at most min(N, P-47) asks per P-53, each parent id at most once per window, all to the sender (" +
+                  std::to_string(worst) + " per window, " + std::to_string(max_id) + " per id)");
+}
+
+// pwalkskipfull: J gets 16 frames from S, each a carrier on its own unknown parent, parked as ParentUnknown DEFERs
+// (through the node's park, T0); 5 s later a header page asks the parent x0 of one of them (its body in flight). Store
+// cap 32 (not full): headers first is live, no parent ask within P-53 of the header page's ask. Store cap 16 (full): not
+// live; the other parents are asked again at T0 + P-53, x0 not within P-53 of the header page's ask, then once (in
+// the next P-53).
+struct SkipFullRun {
+    bool hello = false;
+    std::size_t parked = 0;
+    bool live = false;
+    std::uint64_t x0_in = 0, x0_after = 0, others = 0, first_x0 = 0;
+};
+SkipFullRun pwalkskipfull_run(std::uint64_t cap) {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    pb::PathbNodeConfig cf = h.config(table0(net), false);
+    cf.waiting_cap = cap;
+    const std::size_t j = h.nodes.size();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cf, h.io(j)));
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 3; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 54000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    SkipFullRun out;
+    out.hello = h.hello(j, s).verdict == pb::HelloVerdict::Accept;
+    (void)h[j].tick(h.now);
+    std::vector<pb::Hash32> parents;
+    for (std::uint32_t k = 0; k < 16; ++k) {
+        const std::optional<pb::PathbJob> jb = h.job(s, k % 5, 54100 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 54100 + k;
+        c.own.side.tip = seq32(static_cast<std::uint8_t>(0x40 + k));
+        c.own.side.tip[1] = 0x5f;  // its own unknown parent
+        parents.push_back(c.own.side.tip);
+        pb::PathbNodeTestAccess::park(h[j], s, *pb::encode_fc_carrier(0, c, 16), pb::Missing::ParentUnknown, pb::RowId::R4,
+                                      c.own.side.tip);
+    }
+    out.parked = h[j].deferred().size();
+    h.q.clear();
+    const std::uint64_t t0 = h.now, p53 = pb::kAbandonTimeoutDefault;
+    const pb::Hash32 x0 = parents.empty() ? pb::Hash32{} : parents.front();
+    for (std::uint64_t t = 1; t < 5 + 2 * p53; ++t) {
+        h.now = t0 + t;
+        if (t == 5) pb::PathbNodeTestAccess::body_asked(h[j], x0, h.now);  // a header page's ask of x0
+        (void)h[j].tick(h.now);
+        if (t == 6) out.live = pb::PathbNodeTestAccess::hf_live(h[j]);
+        h[j].reask_parents();
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (!pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok()) continue;
+            for (const pb::Hash32& id : q.ids) {
+                if (id != x0) {
+                    out.others += t >= 5 && t < 5 + p53 ? 1 : 0;
+                    continue;
+                }
+                if (out.first_x0 == 0) out.first_x0 = t;
+                if (t < 5 + p53) ++out.x0_in;
+                else ++out.x0_after;
+            }
+        }
+        h.q.clear();
+    }
+    return out;
+}
+void pwalkskipfull() {
+    const SkipFullRun a = pwalkskipfull_run(32), b = pwalkskipfull_run(16);
+    for (const auto& [tag, r] : {std::make_pair("cap 32", a), std::make_pair("cap 16", b)})
+        std::printf("  pwalkskipfull %s: HELLO %d; parked %zu; live after the header page's ask %d; asks of x0 within P-53 of "
+                    "it %llu, after %llu (first at %llu s); asks of the other parents within that P-53 %llu\n",
+                    tag, r.hello ? 1 : 0, r.parked, r.live ? 1 : 0, (unsigned long long)r.x0_in,
+                    (unsigned long long)r.x0_after, (unsigned long long)r.first_x0, (unsigned long long)r.others);
+    check(a.hello && a.parked == 16 && b.hello && b.parked == 16, "pwalkskipfull: 16 frames parked at cap 32 and at cap 16");
+    check(a.live && a.x0_in == 0 && a.others == 0,
+          "pwalkskipfull: store not full: headers first live, no parent ask within P-53 of the header page's ask");
+    check(!b.live && b.x0_in == 0 && b.x0_after == 1 && b.others == 15,
+          "pwalkskipfull: store full: not live; the other 15 parents asked again, x0 not within P-53 of the header page's "
+          "ask, then once (" + std::to_string(b.x0_in) + " within, " + std::to_string(b.x0_after) + " after)");
+}
+
+// pwalkasked: J (deferred store cap 1,000) follows S at T. S holds 600 carriers t_k on T, none of them flooded to J;
+// J holds 600 parked chains, each a frame on t_k (parked through the node's park, no sender connected). The relay's
+// tick asks each t_k of S, its only peer: S's asked-carrier record stays within kAskedMax (256) at every pass (the rest
+// waits for room), every reply is solicited, each t_k asked once, and J holds all 600.
+void pwalkasked() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay s = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.waiting_cap = 1000; });
+    w.connect(s.node, j.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, s.node, static_cast<std::size_t>(i % 5), 54000 + static_cast<std::uint32_t>(i));
+    }
+    for (int k = 0; k < 4 && h[j.node].tree().best().id != h[s.node].tree().best().id; ++k) {
+        h.now += 1;
+        j.relay->tick();
+        w.run();
+    }
+    const std::size_t n = 600;
+    std::vector<SiblingFrame> t;
+    for (std::uint32_t k = 0; k < n && ok; ++k) {
+        t.push_back(sibling_frame(h, s.node, k % 5, 54100 + k));
+        ok = !t.back().frame.empty();
+    }
+    bool quiet = true;  // S's floods of the t_k do not reach J
+    std::uint64_t to_s = 0;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        if (quiet && m.from == s.links->self && m.to == j.links->self && m.f[0] == pb::kOpFcCarrier) m.f.clear();
+        if (m.from == j.links->self && m.to == s.links->self && m.f[0] == pb::kOpFcGetCarrier) {
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) to_s += q.ids.size();
+        }
+    };
+    for (const SiblingFrame& f : t) (void)h[s.node].on_carrier(999, f.frame);
+    w.run();
+    quiet = false;
+    std::size_t at_s = 0;
+    for (const SiblingFrame& f : t) at_s += h[s.node].tree().find(f.id) != nullptr ? 1 : 0;
+    ok = ok && at_s == n && h[j.node].tree().find(t[0].id) == nullptr;
+    if (!ok) {
+        check(false, "pwalkasked: setup (S holds 600 carriers on T, J none)");
+        return;
+    }
+    for (std::uint32_t k = 0; k < n; ++k) {  // a frame on t_k whose own P_r J does not hold (it parks again once released)
+        const std::optional<pb::PathbJob> jb = h.job(s.node, k % 5, 55000 + k);
+        if (!jb) break;
+        pb::CarrierBodyV3 c;
+        c.own = jb->body;
+        c.own.blob.nonce = 55000 + k;
+        c.own.side.tip = t[k].id;
+        c.own.blob.prev_id = seq32(0xd0);
+        c.own.blob.prev_id[1] = static_cast<std::uint8_t>(k);
+        c.own.blob.prev_id[2] = static_cast<std::uint8_t>(k >> 8);
+        pb::PathbNodeTestAccess::park(h[j.node], pb::PathbNode::kOwnPeer, *pb::encode_fc_carrier(0, c, 16),
+                                      pb::Missing::ParentUnknown, pb::RowId::R4, t[k].id);
+    }
+    const std::size_t parked = h[j.node].deferred().size();
+    pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t ps = w.id(j.node, s.node);
+    const std::uint64_t sol0 = rj.stats().solicited_jobs.load(), p15 = rj.stats().p15_drops.load();
+    std::size_t held = 0, peak = 0, worst_pass = 0;
+    int secs = 0;
+    for (; secs < 60 && held < n; ++secs) {
+        h.now += 1;
+        const std::uint64_t before = to_s;
+        rj.tick();
+        peak = std::max(peak, rj.asked_carriers_of(ps));
+        w.run();
+        worst_pass = std::max<std::size_t>(worst_pass, to_s - before);
+        held = 0;
+        for (const SiblingFrame& f : t) held += h[j.node].tree().find(f.id) != nullptr ? 1 : 0;
+    }
+    w.edit = nullptr;
+    const std::uint64_t solicited = rj.stats().solicited_jobs.load() - sol0;
+    std::printf("  pwalkasked: parked %zu; J holds %zu of %zu after %d s; asks of S %llu (at most %zu in one pass); S's "
+                "asked-carrier record at most %zu; solicited replies %llu; P-15 drops %llu; re-asks %llu\n",
+                parked, held, n, secs, (unsigned long long)to_s, worst_pass, peak, (unsigned long long)solicited,
+                (unsigned long long)(rj.stats().p15_drops.load() - p15), (unsigned long long)h[j.node].parent_reasks());
+    check(parked == n && held == n, "pwalkasked: 600 parked chains towards S, J holds all 600 t_k");
+    check(peak <= 256 && worst_pass <= 256 && to_s == n,
+          "pwalkasked: S's asked-carrier record within kAskedMax at every pass, each t_k asked once (record at most " +
+                  std::to_string(peak) + ", " + std::to_string(worst_pass) + " in one pass)");
+    check(solicited >= n && rj.stats().p15_drops.load() == p15, "pwalkasked: every reply solicited, no P-15 drop");
+}
+
+// pwalkdup: J, empty, receives carriers on S's tip P (position 6), whose parent it does not hold. T1 asks P once; T1 from
+// another peer and T2 (another carrier on P, within P-53) ask nothing; past P-53, T1 again (held already) asks nothing
+// and T3 (parked now) asks P again; P's own frame (parked on its parent Q) asks Q; past P-53 again, T4 on P asks nothing
+// (P is parked, waiting on Q).
+void pwalkdup() {
+    const KatNet net;
+    using K = pb::Missing;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 6; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 46000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const pb::Hash32 P = h[s].tree().best().id, Q = *h[s].store().best_at(5);
+    std::vector<SiblingFrame> t;
+    for (std::uint32_t i = 0; i < 4; ++i) t.push_back(sibling_frame(h, s, i % 5, 46100 + i));
+    h.q.clear();
+    const std::vector<std::uint8_t> pf = *pb::encode_fc_carrier(0, *h[s].bodies().get(P), 16);
+    const auto asks = [&h, j](const pb::Hash32& id) {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == id ? 1 : 0;
+        }
+        return n;
+    };
+    bool setup = h[s].tree().best().pos == 6 && h[j].tree().best().pos == 0;
+    for (const SiblingFrame& f : t) setup = setup && !f.frame.empty() && f.id != P;
+    if (!setup) {
+        check(false, "pwalkdup: setup (S at 6, four carriers on its tip)");
+        return;
+    }
+    (void)h[j].tick(h.now);
+    const pb::NodeEventResult r1 = h[j].on_carrier(s, t[0].frame);
+    const std::size_t a1 = asks(P);
+    (void)h[j].on_carrier(7, t[0].frame);  // the same frame from another peer
+    (void)h[j].on_carrier(s, t[1].frame);
+    const std::size_t a2 = asks(P), held2 = h[j].deferred().size();
+    h.now += pb::kAbandonTimeoutDefault + 1;
+    (void)h[j].tick(h.now);
+    (void)h[j].on_carrier(s, t[0].frame);  // held already
+    const std::size_t a3 = asks(P);
+    (void)h[j].on_carrier(s, t[2].frame);
+    const std::size_t a4 = asks(P);
+    const pb::NodeEventResult rp = h[j].on_carrier(s, pf);
+    const std::size_t q1 = asks(Q);
+    h.now += pb::kAbandonTimeoutDefault + 1;
+    (void)h[j].tick(h.now);
+    (void)h[j].on_carrier(s, t[3].frame);
+    const std::size_t a5 = asks(P);
+    std::printf("  pwalkdup: asks of P %zu, %zu, %zu, %zu, %zu; of Q %zu; parked %zu then %zu; parent asks %llu\n", a1, a2, a3,
+                a4, a5, q1, held2, h[j].deferred().size(), (unsigned long long)h[j].parent_asks());
+    check(r1.action == pb::NodeAction::Parked && r1.admit.missing == K::ParentUnknown && r1.admit.row == pb::RowId::R4 && a1 == 1,
+          "pwalkdup: T1 on P, P not held: DEFER R4 (ParentUnknown), P asked once");
+    check(a2 == 1 && held2 == 2, "pwalkdup: T1 again (another peer) and T2 within P-53: parked, P not asked again");
+    check(a3 == 1, "pwalkdup: past P-53, T1 again (held already): P not asked");
+    check(a4 == 2, "pwalkdup: past P-53, T3 (parked now): P asked again");
+    check(rp.action == pb::NodeAction::Parked && rp.admit.missing == K::ParentUnknown && q1 == 1,
+          "pwalkdup: P's own frame (Q not held): parked, Q asked once");
+    check(a5 == 2 && h[j].deferred().size() == 5,
+          "pwalkdup: past P-53 again, T4 on P (parked, waiting on Q): P not asked; five frames parked");
+}
+
+// sealall: the seal sweep covers every parked carrier frame (E-139 (i); ruling 40 for the boundary), not only those
+// indexed for a re-run. B (journal depth 16) follows A. E, a node of its own, holds A's positions 1..6 and mines
+// E7, E8 and E9 on position 6. B receives E7 once position 6 lies below its journal base: DEFER R4 (OwnChainDeep); then
+// E8: DEFER R4 (ParentUnknown); E9 is parked as a Boundary DEFER at R17 through the node's own park (its admission needs
+// a branch forked more than J_0 below: the admit KAT's section 4). None is in the relay's re-run index. A mines on: once
+// B's record passes the three frames' own bins + F, the tick drops all three without strike.
+void sealall() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.journal_depth = 16; });
+    const std::size_t e = h.add(table0(net), true);
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 47000 + static_cast<std::uint32_t>(i));
+    }
+    for (std::uint64_t x = 1; x <= 6 && ok; ++x) {  // E: A's positions 1..6
+        const std::optional<pb::Hash32> id = h[a.node].store().best_at(x);
+        const pb::CarrierBodyV3* body = id ? h[a.node].bodies().get(*id) : nullptr;
+        ok = body != nullptr && h[e].on_carrier(0, *pb::encode_fc_carrier(0, *body, 16)).action == pb::NodeAction::Placed;
+    }
+    std::vector<pb::CarrierBodyV3> eb;  // E7, E8, E9 (on position 6's Monero tip)
+    for (std::uint32_t i = 0; i < 3 && ok; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(e, i % 5, 47100 + i);
+        ok = jb && h[e].on_own_share(*jb, 47100 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+        if (ok) eb.push_back(*h[e].bodies().get(h[e].tree().best().id));
+    }
+    h.q.clear();  // E's floods go nowhere
+    for (int i = 0; i < 20 && ok; ++i) {  // position 6 below B's journal base
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 47200 + static_cast<std::uint32_t>(i));
+    }
+    ok = ok && eb.size() == 3 && h[b.node].tree().best().id == h[a.node].tree().best().id && h[b.node].store().base_pos() > 6;
+    if (!ok) {
+        check(false, "sealall: setup (B on A's chain past depth 16, E's branch of three on position 6)");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = w.id(b.node, a.node);
+    const auto r4 = [&rb] {
+        return rb.verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    const std::uint64_t r4_0 = r4();
+    for (std::size_t i = 0; i < 2; ++i) {  // E7 (OwnChainDeep), E8 (ParentUnknown)
+        h.now += 1;
+        rb.receive(pa, *pb::encode_fc_carrier(0, eb[i], 16));
+        w.run();
+    }
+    pb::PathbNodeTestAccess::park(h[b.node], pa, *pb::encode_fc_carrier(0, eb[2], 16), pb::Missing::Boundary, pb::RowId::R17);
+    const std::size_t parked = h[b.node].deferred().size(), indexed = rb.parked_index_size();
+    std::uint64_t lo = UINT64_MAX;
+    for (const pb::CarrierBodyV3& x : eb) lo = std::min(lo, h[b.node].held_origin(x.own.blob.prev_id).value_or(0));
+    const std::uint64_t F = pb::kRuledLaneParams.open_bins, sealed0 = rb.stats().parked_frames_sealed.load();
+    bool kept_open = true;
+    std::uint64_t H = 0;
+    for (std::uint32_t i = 0; i < 200 && h[b.node].deferred().size() != 0; ++i) {
+        h.tick_monero();
+        (void)mine_on(h, w, a.node, i % 5, 47300 + i);
+        h.now += 1;
+        rb.tick();
+        w.run();
+        H = h[b.node].best_record().value_or(0);
+        if (H < lo + F) kept_open = kept_open && h[b.node].deferred().size() == parked;
+    }
+    const std::uint64_t sealed = rb.stats().parked_frames_sealed.load() - sealed0;
+    std::printf("  sealall: R4 DEFERs %llu; parked %zu (indexed %zu); lowest own bin %llu; H %llu; left %zu; sealed %llu\n",
+                (unsigned long long)(r4() - r4_0), parked, indexed, (unsigned long long)lo, (unsigned long long)H,
+                h[b.node].deferred().size(), (unsigned long long)sealed);
+    check(r4() == r4_0 + 2 && parked == 3 && indexed == 0 && lo != 0,
+          "sealall: E7 (OwnChainDeep) and E8 (ParentUnknown) DEFER at R4, E9 parked as a Boundary DEFER; none indexed");
+    check(kept_open && h[b.node].deferred().size() == 0 && sealed == 3 && rb.stats().strikes.load() == 0,
+          "sealall: kept while their bins are open, all three dropped without strike once they seal (sealed " +
+                  std::to_string(sealed) + ")");
+}
+
+// placedcopy: a byte-identical copy of a carrier B placed, whose parent lies below B's journal base (depth 16), arrives:
+// DEFER R4 (OwnChainDeep), counted, no token; it is not parked (the deferred store unchanged).
+void placedcopy() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, [](pb::PathbNodeConfig& c) { c.journal_depth = 16; });
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 26 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 48000 + static_cast<std::uint32_t>(i));
+    }
+    const std::optional<pb::Hash32> c3 = h[a.node].store().best_at(3);
+    ok = ok && c3 && h[b.node].tree().best().id == h[a.node].tree().best().id && h[b.node].store().base_pos() > 3
+         && h[b.node].tree().find(*c3) != nullptr;
+    if (!ok) {
+        check(false, "placedcopy: setup (B on A's chain past depth 16)");
+        return;
+    }
+    pb::PathbRelayNode& rb = *b.relay;
+    const auto r4 = [&rb] {
+        return rb.verdict_counts()[static_cast<std::size_t>(pb::RowId::R4)][static_cast<std::size_t>(pb::AdmitVerdict::Defer)];
+    };
+    const std::uint64_t r4_0 = r4();
+    const std::size_t held0 = h[b.node].deferred().size();
+    h.now += 1;
+    rb.receive(w.id(b.node, a.node), *pb::encode_fc_carrier(0, *h[a.node].bodies().get(*c3), 16));
+    w.run();
+    std::printf("  placedcopy: R4 DEFERs %llu; parked %zu then %zu; strikes %llu, bans %llu\n", (unsigned long long)(r4() - r4_0),
+                held0, h[b.node].deferred().size(), (unsigned long long)rb.stats().strikes.load(),
+                (unsigned long long)rb.stats().bans.load());
+    check(r4() == r4_0 + 1 && held0 == 0 && h[b.node].deferred().size() == 0 && rb.stats().strikes.load() == 0
+                  && rb.stats().bans.load() == 0,
+          "placedcopy: a copy of a placed carrier below the journal base: DEFER R4 counted, not parked, no token");
+}
+
+// placedvariant: B follows A. c, A's carrier on T with P_r S0, carries nothing; r is A's receipt on T with P_r S1. With S0
+// held at B without its weights, a byte-identical copy of c DEFERs at R5 and is not parked. With S1 held without its
+// weights, a copy of c with c's own body and the carried list {r} (other bytes, the same id) DEFERs at R19
+// (MoneroBlock) and is parked; once S1's weights are held it runs again and is judged: STRIKE at R11 (the fold), one
+// token, nothing left parked.
+void placedvariant() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> noweights, noseed;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay b = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, hide_inputs(noweights, noseed));
+    w.connect(a.node, b.node);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 6 && ok; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 49000 + static_cast<std::uint32_t>(i));
+    }
+    h.tick_monero();
+    const std::optional<pb::PathbJob> jc = h.job(a.node, 1, 49100);  // c: on T, P_r S0
+    h.tick_monero();
+    const std::optional<pb::PathbJob> jr = h.job(a.node, 2, 49101);  // r: on T, P_r S1
+    ok = ok && jc && jr && jc->body.side.tip == jr->body.side.tip && jc->body.blob.prev_id != jr->body.blob.prev_id;
+    ok = ok && h[a.node].on_own_share(*jc, 49100, pb::Hash32{}).action == pb::NodeAction::Placed;
+    w.run();
+    const pb::Hash32 c = h[a.node].tree().best().id;
+    ok = ok && h[b.node].tree().best().id == c && h[b.node].bodies().get(c) != nullptr;
+    if (!ok) {
+        check(false, "placedvariant: setup (B on A's chain at c; r on c's parent with a later P_r)");
+        return;
+    }
+    const pb::Hash32 S0 = jc->body.blob.prev_id, S1 = jr->body.blob.prev_id;
+    pb::PathbRelayNode& rb = *b.relay;
+    const std::uint64_t pa = w.id(b.node, a.node);
+    const auto vc = [&rb](pb::RowId row, pb::AdmitVerdict x) {
+        return rb.verdict_counts()[static_cast<std::size_t>(row)][static_cast<std::size_t>(x)];
+    };
+    // the byte-identical copy
+    noweights.insert(S0);
+    const std::uint64_t d5 = vc(pb::RowId::R5, pb::AdmitVerdict::Defer);
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fc_carrier(0, *h[a.node].bodies().get(c), 16));
+    w.run();
+    const bool deferred5 = vc(pb::RowId::R5, pb::AdmitVerdict::Defer) == d5 + 1;
+    const std::size_t parked_same = h[b.node].deferred().size();
+    noweights.erase(S0);
+    // the copy with another carried list
+    pb::CarrierBodyV3 v = *h[a.node].bodies().get(c);
+    pb::ReceiptBodyV3 r = jr->body;
+    r.blob.nonce = 49101;
+    v.carried = {r};
+    noweights.insert(S1);
+    const std::uint64_t d19 = vc(pb::RowId::R19, pb::AdmitVerdict::Defer), s11 = vc(pb::RowId::R11, pb::AdmitVerdict::Strike);
+    const std::uint64_t st0 = rb.strikes_of(pa);
+    h.now += 1;
+    rb.receive(pa, *pb::encode_fc_carrier(0, v, 16));
+    w.run();
+    const bool deferred19 = vc(pb::RowId::R19, pb::AdmitVerdict::Defer) == d19 + 1;
+    const std::size_t parked = h[b.node].deferred().size();
+    noweights.erase(S1);
+    rb.on_monero_tip();
+    w.run();
+    const bool struck = vc(pb::RowId::R11, pb::AdmitVerdict::Strike) == s11 + 1 && rb.strikes_of(pa) == st0 + 1;
+    const std::size_t left = h[b.node].deferred().size();
+    std::printf("  placedvariant: the byte-identical copy: R5 DEFER %d, parked %zu; the variant: R19 DEFER %d, parked %zu, "
+                "then STRIKE at R11 %d, parked %zu; bans %llu\n",
+                deferred5 ? 1 : 0, parked_same, deferred19 ? 1 : 0, parked, struck ? 1 : 0, left,
+                (unsigned long long)rb.stats().bans.load());
+    check(deferred5 && parked_same == 0, "placedvariant: a byte-identical copy of c that DEFERs (R5) is not parked");
+    check(deferred19 && parked == 1, "placedvariant: a copy of c with another carried list DEFERs at R19 and is parked");
+    check(struck && left == 0 && rb.stats().bans.load() == 0,
+          "placedvariant: once S1's weights are held it runs again: STRIKE at R11, nothing parked; no ban");
+}
+
+// ---------------------------------------------------------------------------
+// revnotcarrier: a ParentUnknown DEFER whose parent is placed between its admission (begin_carrier) and its placement
+// (complete_carrier). J holds the server chain 1..3; d (6) and e (7) are parked (e on d, d on c); p (4) and c (5) arrive
+// back to back: c is admitted before p is placed (ParentUnknown), then p is placed, then c's DEFER completes: c is
+// admitted again and placed, d and e are released (J at 7); no tree waiting entry is discarded.
+void revnotcarrier() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t s = h.add(table0(net), true);
+    const std::size_t j = h.add(table0(net), false);
+    h.cut = {{s, j}, {j, s}};
+    for (int i = 0; i < 7; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        h.mine(s, static_cast<std::size_t>(i % 5), 51000 + static_cast<std::uint32_t>(i));
+    }
+    h.cut.clear();
+    h.q.clear();
+    const auto id_at = [&](std::uint64_t x) { return *h[s].store().best_at(x); };
+    const auto frame_at = [&](std::uint64_t x) { return *pb::encode_fc_carrier(0, *h[s].bodies().get(id_at(x)), 16); };
+    const auto asks = [&h, j](const pb::Hash32& id) {
+        std::size_t n = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != j || m.frame.empty() || m.frame[0] != pb::kOpFcGetCarrier) continue;
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                for (const pb::Hash32& x : q.ids) n += x == id ? 1 : 0;
+        }
+        return n;
+    };
+    (void)h[j].tick(h.now);
+    for (std::uint64_t x = 1; x <= 3; ++x) (void)h[j].on_carrier(s, frame_at(x));
+    h.q.clear();
+    const bool setup = h[s].tree().best().pos == 7 && h[j].tree().best().pos == 3;
+    const pb::NodeEventResult re = h[j].on_carrier(s, frame_at(7));
+    const pb::NodeEventResult rd = h[j].on_carrier(s, frame_at(6));
+    const bool parked = re.action == pb::NodeAction::Parked && rd.action == pb::NodeAction::Parked
+                        && h[j].tree().is_waiting(id_at(6)) && h[j].tree().is_waiting(id_at(7)) && h[j].deferred().size() == 2;
+    const std::size_t ask_c0 = asks(id_at(5));
+    h.q.clear();
+    pb::PathbNode::CarrierTicket tp = h[j].begin_carrier(s, frame_at(4));
+    pb::PathbNode::CarrierTicket tc = h[j].begin_carrier(s, frame_at(5));
+    const bool c_defer = tc.admit.verdict == pb::AdmitVerdict::Defer && tc.admit.missing == pb::Missing::ParentUnknown;
+    const pb::NodeEventResult rp = h[j].complete_carrier(std::move(tp));
+    const pb::NodeEventResult rc = h[j].complete_carrier(std::move(tc));
+    const bool c_lost = h[j].tree().find(id_at(5)) == nullptr && !h[j].tree().is_waiting(id_at(5));
+    const bool d_wait = h[j].tree().is_waiting(id_at(6)) || h[j].tree().find(id_at(6)) != nullptr;
+    const bool e_wait = h[j].tree().is_waiting(id_at(7)) || h[j].tree().find(id_at(7)) != nullptr;
+    const std::size_t parked_after = h[j].deferred().size();
+    const std::size_t ask_c1 = asks(id_at(5)), ask_p1 = asks(id_at(4));
+    h.q.clear();
+    // three P-53 windows: reask_parents
+    for (int k = 0; k < 3; ++k) {
+        h.now += pb::kAbandonTimeoutDefault + 1;
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+    }
+    const std::size_t reask_c = asks(id_at(5));
+    h.q.clear();
+    // c arrives again (as the reply to such an ask would bring it): placed; are d and e released?
+    const pb::NodeEventResult rc2 = h[j].on_carrier(s, frame_at(5));
+    const std::uint64_t pos_after = h[j].tree().best().pos;
+    const std::size_t parked_end = h[j].deferred().size();
+    h.q.clear();
+    for (int k = 0; k < 3; ++k) {
+        h.now += pb::kAbandonTimeoutDefault + 1;
+        (void)h[j].tick(h.now);
+        h[j].reask_parents();
+    }
+    std::size_t asks_after = 0;
+    for (const Msg& m : h.q) asks_after += (m.from == j && !m.frame.empty() && m.frame[0] == pb::kOpFcGetCarrier) ? 1 : 0;
+    std::printf("  revnotcarrier: setup %d parked %d (c asked %zu); c begin DEFER ParentUnknown %d; p action %d, c action %d; "
+                "c lost %d; d waiting %d, e waiting %d; parked %zu; asks c %zu, p %zu; reask c %zu; c again action %d; "
+                "J at %llu (S at 7); parked %zu; asks after %zu\n",
+                setup ? 1 : 0, parked ? 1 : 0, ask_c0, c_defer ? 1 : 0, static_cast<int>(rp.action),
+                static_cast<int>(rc.action), c_lost ? 1 : 0, d_wait ? 1 : 0, e_wait ? 1 : 0, parked_after, ask_c1, ask_p1,
+                reask_c, static_cast<int>(rc2.action), (unsigned long long)pos_after, parked_end, asks_after);
+    check(setup && parked && c_defer, "revnotcarrier: setup (d, e parked on c; c admitted before p placed: ParentUnknown)");
+    check(!c_lost, "revnotcarrier: c is not lost when its parent was placed before its DEFER parked");
+    check(d_wait && e_wait, "revnotcarrier: d and e waiting or placed (no waiting entry discarded by c's park)");
+    check(pos_after == 7 && parked_end == 0, "revnotcarrier: c placed, d and e released (J at " + std::to_string(pos_after) + ")");
+}
+
+
 // A relay node in manual mode on the harness's clock over a node loaded from a copy of `from` (the copy in h.kvs).
 KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const pb::PathbNodeConfig& cfg,
                           const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr) {
@@ -10588,6 +12015,25 @@ int main(int argc, char** argv) {
     run("catchgate", catchgate);
     run("catchrestart", catchrestart);
     run("catchlocator", catchlocator);
+    run("pwalk", pwalk);
+    run("pwalkshapes", pwalkshapes);
+    run("pwalkfull", pwalkfull);
+    run("pwalkcrawl", pwalkcrawl);
+    run("pwalkstall", pwalkstall);
+    run("pwalklost", pwalklost);
+    run("pwalksilent", pwalksilent);
+    run("rcsilent", rcsilent);
+    run("rclate", rclate);
+    run("rcrehello", rcrehello);
+    run("pwalkgone", pwalkgone);
+    run("pwalkjunk", pwalkjunk);
+    run("pwalkskipfull", pwalkskipfull);
+    run("pwalkasked", pwalkasked);
+    run("pwalkdup", pwalkdup);
+    run("sealall", sealall);
+    run("placedcopy", placedcopy);
+    run("placedvariant", placedvariant);
+    run("revnotcarrier", revnotcarrier);
     run("catchkeep", catchkeep);
     run("catchlight", catchlight);
     run("catchoffer", catchoffer);

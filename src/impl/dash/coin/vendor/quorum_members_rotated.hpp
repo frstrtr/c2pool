@@ -451,6 +451,7 @@ compute_quorum_members_by_quarter_rotation(
             // unambiguous legacy/basic scheme signal, and each quarter's
             // members carry THEIR cycle's entry (see the header note).
             k.legacy_scheme = (mn->nVersion == CSimplifiedMNListEntry::VER_LEGACY_BLS);
+            k.proTxHash     = mn->proRegTxHash;   // PoSe identity (sml_pose_fold.hpp)
             out[i].push_back(k);
         }
     }
