@@ -18,9 +18,12 @@
 //     (after a rebuild too), not once per process.
 //   - RecentBodiesServeBothLanes (VERIFY2 S-D): a body both lanes asked for
 //     within the accrual lane's last 1,440 blocks reaches both.
-//   - QueueToTheFullSetIsBounded (S-A): unplaceable bodies are not queued
-//     while the full set is not live; deep ones are dropped while the queue
-//     holds its bound; the tip's always pass.
+//   - QueueToTheFullSetIsBounded (S-A, VERIFY3 S4): unplaceable bodies are
+//     not queued while the full set is not live; a queued hash is not queued
+//     again; while the queue holds its bound only the header chain's tip
+//     itself passes. UnsolicitedPlaceableBodiesAreBounded: the verifier's
+//     probe (4,096 copies of a recent body).
+//   - InvAsksTheAnnouncingPeerOnly (VERIFY3 S3): the inv path's getheaders.
 //   - HeaderSyncAsksAsCoreDoes (S-B): follow-up getheaders only to the peer
 //     that sent new headers, none for a batch with nothing new; the periodic
 //     poll asks one peer while catching up, every peer once synced.
@@ -199,22 +202,43 @@ TEST(DogeUtxoFullWiring, QueueToTheFullSetIsBounded)
 {
     UtxoFullState st;
     UtxoFullState::Placement unplaced;  // height 0
+    unplaced.hash = tag(0x08, 1);
     EXPECT_FALSE(st.enqueue(unplaced, 1000)) << "nothing can use it while the full set is not live";
     st.live.store(true);
     EXPECT_TRUE(st.enqueue(unplaced, 1000)) << "live: its header may come from it";
-    st.dequeued(1000);
-    UtxoFullState::Placement deep{1000, true}, tip{TIP, false};
+    EXPECT_FALSE(st.enqueue(unplaced, 1000)) << "a copy of a queued body: one slot";
+    st.dequeued(unplaced.hash, 1000);
+    EXPECT_EQ(st.queued_bytes.load(), 0u);
     constexpr uint64_t MB = 1024 * 1024;
     uint64_t queued = 0;
-    while (st.enqueue(deep, MB))
+    std::vector<uint256> hashes;
+    for (uint32_t n = 0; n < 400; ++n) {
+        UtxoFullState::Placement deep;
+        deep.height = 1000 + n;
+        deep.full_only = true;
+        deep.hash = tag(0x09, static_cast<uint8_t>(n & 0xFF));
+        deep.hash.data()[2] = static_cast<uint8_t>(n >> 8);
+        if (!st.enqueue(deep, MB))
+            break;
+        hashes.push_back(deep.hash);
         queued += MB;
+    }
     EXPECT_LE(queued, UtxoFullState::QUEUE_BYTES_MAX);
     EXPECT_GT(queued, UtxoFullState::QUEUE_BYTES_MAX - MB);
-    EXPECT_GE(st.queue_dropped.load(), 2u);
+    // The queue is full: a recent body (both lanes') is dropped too; only
+    // the header chain's tip itself passes, once.
+    const auto recent = st.place(tag(0x0a, 1), TIP - 1, TIP, tag(0x0a, 2));
+    EXPECT_FALSE(recent.tip);
+    EXPECT_FALSE(st.enqueue(recent, MB)) << "a full queue takes no body but the tip";
+    const auto tip = st.place(tag(0x0a, 2), TIP, TIP, tag(0x0a, 2));
+    EXPECT_TRUE(tip.tip);
     EXPECT_TRUE(st.enqueue(tip, MB)) << "the tip's body always passes";
-    st.dequeued(queued + MB);
+    EXPECT_FALSE(st.enqueue(tip, MB)) << "but a copy of it does not";
+    for (const auto& h : hashes)
+        st.dequeued(h, MB);
+    st.dequeued(tip.hash, MB);
     EXPECT_EQ(st.queued_bytes.load(), 0u);
-    EXPECT_TRUE(st.enqueue(deep, MB)) << "room again once the full set's thread took them";
+    EXPECT_TRUE(st.enqueue(recent, MB)) << "room again once the full set's thread took them";
 }
 
 TEST(DogeUtxoFullWiring, HeaderSyncAsksAsCoreDoes)
@@ -226,4 +250,54 @@ TEST(DogeUtxoFullWiring, HeaderSyncAsksAsCoreDoes)
     EXPECT_EQ(doge::coin::headers_follow_up(2000), HeadersFollowUp::AskSender);
     EXPECT_EQ(doge::coin::headers_poll(false), HeadersPoll::OnePeer) << "catching up: one peer per tick";
     EXPECT_EQ(doge::coin::headers_poll(true), HeadersPoll::EveryPeer) << "synced: the tip's headers from every peer";
+}
+
+// VERIFY3 S3: a block announcement asks the announcing peer only, at once;
+// not while it has a getheaders unanswered (Core's 2 min); while the chain
+// catches up one announcer per new block, once synced every announcer.
+TEST(DogeUtxoFullWiring, InvAsksTheAnnouncingPeerOnly)
+{
+    using Asks = doge::coin::HeaderAsks;
+    Asks asks;
+    const auto t = Asks::Clock::time_point{} + std::chrono::hours(1);
+    const uint256 x = tag(0x0b, 1), y = tag(0x0b, 2), z = tag(0x0b, 3);
+    // Catching up.
+    EXPECT_TRUE(asks.on_inv("a", x, false, t)) << "the first announcer, at once";
+    EXPECT_FALSE(asks.on_inv("b", x, false, t)) << "one announcer per block while catching up";
+    EXPECT_FALSE(asks.on_inv("a", y, false, t)) << "a has a getheaders unanswered";
+    EXPECT_TRUE(asks.on_inv("b", y, false, t)) << "a new block brings one more peer";
+    asks.answered("a");
+    EXPECT_TRUE(asks.on_inv("a", z, false, t)) << "answered: asked again";
+    EXPECT_TRUE(asks.on_inv("b", tag(0x0b, 4), false, t + Asks::RESPONSE_TIME))
+        << "an answer that never came frees the peer after RESPONSE_TIME";
+    asks.sent("c", t);
+    EXPECT_FALSE(asks.on_inv("c", tag(0x0b, 5), false, t)) << "a poll or follow-up getheaders counts";
+    // Synced: every announcer of a block the chain lacks, at once.
+    Asks synced;
+    const uint256 w = tag(0x0b, 6);
+    EXPECT_TRUE(synced.on_inv("a", w, true, t));
+    EXPECT_TRUE(synced.on_inv("b", w, true, t)) << "synced: the tip's headers from every announcer";
+    EXPECT_FALSE(synced.on_inv("b", w, true, t)) << "not twice while unanswered";
+    EXPECT_FALSE(synced.on_inv("", w, true, t)) << "no peer: nothing";
+}
+
+// V3-S4: a peer streaming copies of a recent block the full lane never asked
+// for (placeable, not full_only) is bounded: one queue slot per hash.
+TEST(DogeUtxoFullWiring, UnsolicitedPlaceableBodiesAreBounded)
+{
+    UtxoFullState st;
+    st.live.store(true);
+    const UtxoFullState::Placement recent = st.place(tag(0x07, 1), TIP - 100, TIP);
+    ASSERT_EQ(recent.height, TIP - 100);
+    ASSERT_FALSE(recent.full_only);
+    constexpr uint64_t MB = 1024 * 1024;
+    uint64_t queued = 0;
+    int n = 0;
+    while (n < 4096 && st.enqueue(recent, MB)) {
+        queued += MB;
+        ++n;
+    }
+    EXPECT_LE(queued, UtxoFullState::QUEUE_BYTES_MAX + MB)
+        << "a peer streaming copies of a recent block is never dropped: " << queued / MB
+        << " MB queued, " << st.queue_dropped.load() << " dropped";
 }

@@ -29,6 +29,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -84,11 +85,17 @@ struct UtxoFullState {
         uint32_t height{0};     // 0 = cannot be placed
         bool     full_only{false};  // asked by the full lane and deeper than the accrual
                                     // lane's interest: no accrual pass
+        uint256  hash;          // the body's
+        bool     tip{false};    // the header chain's tip itself
     };
+    /// `tip_hash`: the header chain's tip (null = unknown).
     Placement place(const uint256& hash, uint32_t header_height, uint32_t chain_height,
+                    const uint256& tip_hash = uint256(),
                     uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP) const
     {
         Placement p;
+        p.hash = hash;
+        p.tip = !tip_hash.IsNull() && hash == tip_hash;
         p.height = header_height;
         if (const auto asked = requested_height(hash)) {
             if (p.height == 0)
@@ -101,34 +108,41 @@ struct UtxoFullState {
         return p;
     }
 
-    /// The queue to the full set's thread (S-A): a body that cannot be
-    /// placed is not queued while the full set is not live (nothing can
-    /// use it); a body for the full lane alone is dropped while the queue
-    /// holds QUEUE_BYTES_MAX (a requested one is asked again after the
-    /// request timeout). The tip's bodies always pass. true = post it, and
-    /// call dequeued(bytes) when the full set's thread takes it.
+    /// The queue to the full set's thread (S-A, VERIFY3 S4), bounded for
+    /// every body a peer can send:
+    ///   - a body that cannot be placed is not queued while the full set is
+    ///     not live (nothing can use it);
+    ///   - a body whose hash is already queued is not queued again (a peer
+    ///     streaming copies costs one slot);
+    ///   - while QUEUE_BYTES_MAX is queued, only the header chain's tip
+    ///     itself passes (a requested body that is dropped is asked again
+    ///     after the request timeout).
+    /// true = post it, and call dequeued(hash, bytes) when the full set's
+    /// thread takes it.
     static constexpr uint64_t QUEUE_BYTES_MAX = 256u * 1024 * 1024;
     std::atomic<uint64_t> queued_bytes{0};
     std::atomic<uint64_t> queue_dropped{0};
 
     bool enqueue(const Placement& p, uint64_t bytes)
     {
-        if (p.height == 0 && !live.load()) {
+        std::lock_guard<std::mutex> lock(m_queue_mu);
+        const bool drop = (p.height == 0 && !live.load()) || m_queued.count(p.hash)
+                       || (!p.tip && m_queue_bytes + bytes > QUEUE_BYTES_MAX);
+        if (drop) {
             queue_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if ((p.full_only || p.height == 0) && queued_bytes.load() + bytes > QUEUE_BYTES_MAX) {
-            queue_dropped.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        queued_bytes.fetch_add(bytes);
+        m_queued.insert(p.hash);
+        m_queue_bytes += bytes;
+        queued_bytes.store(m_queue_bytes);
         return true;
     }
-    void dequeued(uint64_t bytes)
+    void dequeued(const uint256& hash, uint64_t bytes)
     {
-        uint64_t cur = queued_bytes.load();
-        while (!queued_bytes.compare_exchange_weak(cur, cur > bytes ? cur - bytes : 0)) {
-        }
+        std::lock_guard<std::mutex> lock(m_queue_mu);
+        m_queued.erase(hash);
+        m_queue_bytes = m_queue_bytes > bytes ? m_queue_bytes - bytes : 0;
+        queued_bytes.store(m_queue_bytes);
     }
 
     /// Start with the full set pricing the templates: built from genesis,
@@ -177,6 +191,9 @@ struct UtxoFullState {
 private:
     static constexpr size_t MAX_REQUESTED = 65536;
     mutable std::mutex m_mu;
+    std::mutex         m_queue_mu;
+    std::set<uint256>  m_queued;       // hashes posted to the full set's thread, not yet taken
+    uint64_t           m_queue_bytes{0};
     std::map<uint256, uint32_t> m_requested;
 };
 

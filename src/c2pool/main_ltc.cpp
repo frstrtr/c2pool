@@ -6972,19 +6972,41 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "DOGE mempool wired via P2P broadcaster";
                                 }
 
+                                // The header chain's getheaders per peer (inv: the announcing
+                                // peer only, one unanswered request per peer).
+                                auto doge_hdr_asks = std::make_shared<doge::coin::HeaderAsks>();
+
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 // The hash schedule below the header checkpoint (full UTXO
                                 // set), synced by doge::coin::HashScheduleSync: getheaders
-                                // from genesis to one peer at a time, only that peer's
-                                // batches fed, the next asked as soon as one is taken; a
-                                // peer that does not move the frontier for 30 s is replaced.
+                                // from genesis to one peer at a time (two after a stall),
+                                // only answers to its own getheaders fed, the next asked as
+                                // soon as one is taken; a turn that does not move the
+                                // frontier for 30 s goes to other peers.
                                 auto* sched = doge_hash_schedule.get();
                                 auto* sched_sync = doge_sched_sync.get();
                                 auto send_sched_ask = [sched_sync, bcaster_ptr](
                                                           const doge::coin::HashScheduleSync::Ask& a) {
-                                    const std::string peer = bcaster_ptr->request_headers_targeted(
-                                        a.locator, uint256::ZERO, a.peer_idx, a.peer);
-                                    sched_sync->asked(peer, std::chrono::steady_clock::now());
+                                    const auto now = std::chrono::steady_clock::now();
+                                    if (!a.peer.empty()) {
+                                        const std::string peer = bcaster_ptr->request_headers_targeted(
+                                            a.locator, uint256::ZERO, a.peer_idx, a.peer);
+                                        sched_sync->asked(peer, now);
+                                        return;
+                                    }
+                                    // New peers: round robin, never one whose run was cut.
+                                    const auto picked = sched_sync->pick(bcaster_ptr->ready_peers(0), a);
+                                    bool first = true;
+                                    for (const auto& p : picked) {
+                                        const std::string peer = bcaster_ptr->request_headers_targeted(
+                                            a.locator, uint256::ZERO, 0, p);
+                                        if (peer != p)
+                                            continue;  // gone meanwhile
+                                        sched_sync->asked(peer, now, /*hedge=*/!first);
+                                        first = false;
+                                    }
+                                    if (first)
+                                        sched_sync->asked(std::string(), now);
                                 };
                                 if (sched_sync && sched && !sched->complete()) {
                                     auto sched_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
@@ -7008,7 +7030,7 @@ int main(int argc, char* argv[]) {
 
                                 broadcaster->set_on_new_headers(
                                     [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync,
-                                     send_sched_ask, full = doge_full](
+                                     send_sched_ask, full = doge_full, doge_hdr_asks](
                                         const std::string& key,
                                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                                         // The broadcaster's on_new_headers gives us raw BlockHeaderType
@@ -7029,7 +7051,8 @@ int main(int argc, char* argv[]) {
                                                  << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, send_sched_ask, full, key]() {
+                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, send_sched_ask, full, key,
+                                             doge_hdr_asks]() {
                                                 // Below the checkpoint: the hash schedule's batch, from
                                                 // the peer it asked only.
                                                 if (sched_sync && sched && !sched->complete()) {
@@ -7056,6 +7079,7 @@ int main(int argc, char* argv[]) {
                                                         return;
                                                     }
                                                 }
+                                                doge_hdr_asks->answered(key);
                                                 int accepted = dc->add_headers(*batch);
                                                 if (accepted > 0)
                                                     LOG_INFO << "[EMB-DOGE] add_headers: "
@@ -7069,10 +7093,11 @@ int main(int argc, char* argv[]) {
                                                 // nothing for a batch with nothing new.
                                                 if (doge::coin::headers_follow_up(accepted)
                                                     == doge::coin::HeadersFollowUp::AskSender) {
-                                                    boost::asio::post(ioc, [dc, bcaster_ptr, key]() {
+                                                    boost::asio::post(ioc, [dc, bcaster_ptr, key, doge_hdr_asks]() {
                                                       try {
-                                                        bcaster_ptr->request_headers_targeted(
-                                                            dc->get_locator(), uint256::ZERO, 0, key);
+                                                        doge_hdr_asks->sent(bcaster_ptr->request_headers_targeted(
+                                                            dc->get_locator(), uint256::ZERO, 0, key),
+                                                            std::chrono::steady_clock::now());
                                                       } catch (const std::exception& e) {
                                                         LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
                                                       }
@@ -7086,7 +7111,7 @@ int main(int argc, char* argv[]) {
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, now_ms, hb_doge_sync,
                                                  dc = doge_chain.get(),
-                                                 bcaster_ptr, rr = std::make_shared<size_t>(0)](boost::system::error_code ec) {
+                                                 bcaster_ptr, doge_hdr_asks, rr = std::make_shared<size_t>(0)](boost::system::error_code ec) {
                                     if (ec) return;
                                     hb_doge_sync->store(now_ms());
                                     // Fast poll during sync (5s), slow when caught up (60s)
@@ -7099,7 +7124,9 @@ int main(int argc, char* argv[]) {
                                         // Catching up: one peer per tick (the follow-ups go to
                                         // the peer that answered); synced: every peer.
                                         if (doge::coin::headers_poll(synced) == doge::coin::HeadersPoll::OnePeer)
-                                            bcaster_ptr->request_headers_targeted(locator, uint256::ZERO, (*rr)++);
+                                            doge_hdr_asks->sent(bcaster_ptr->request_headers_targeted(
+                                                                    locator, uint256::ZERO, (*rr)++),
+                                                                std::chrono::steady_clock::now());
                                         else
                                             bcaster_ptr->request_headers(locator, uint256::ZERO);
                                     } catch (const std::exception& e) {
@@ -7118,27 +7145,48 @@ int main(int argc, char* argv[]) {
                                 // The tip-change handler below shares it.
                                 auto doge_mempool_requested = std::make_shared<bool>(false);
                                 // Headers now, not at the next periodic getheaders (60 s once
-                                // synced): a peer announced a block the header chain does not
-                                // know, or a body arrived whose parent it does not know either.
-                                // At most once a second.
-                                auto doge_last_hdr_req = std::make_shared<std::chrono::steady_clock::time_point>();
+                                // synced): a body arrived whose parent the header chain does
+                                // not know. From `peer` (it has the parents), else one peer
+                                // round robin; at most once a second.
+                                auto doge_last_hdr_req = std::make_shared<std::atomic<int64_t>>(0);
+                                auto doge_hdr_rr = std::make_shared<std::atomic<size_t>>(0);
                                 auto request_doge_headers =
-                                    [dc = doge_chain.get(), bcaster_ptr, doge_last_hdr_req]() {
+                                    [dc = doge_chain.get(), bcaster_ptr, doge_last_hdr_req, doge_hdr_rr,
+                                     doge_hdr_asks](const std::string& peer) {
                                         const auto now = std::chrono::steady_clock::now();
-                                        if (now - *doge_last_hdr_req < std::chrono::seconds(1))
+                                        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                               now.time_since_epoch()).count();
+                                        int64_t last = doge_last_hdr_req->load();
+                                        if (ms - last < 1000 || !doge_last_hdr_req->compare_exchange_strong(last, ms))
                                             return;
-                                        *doge_last_hdr_req = now;
                                         try {
-                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
+                                            doge_hdr_asks->sent(bcaster_ptr->request_headers_targeted(
+                                                                    dc->get_locator(), uint256::ZERO,
+                                                                    doge_hdr_rr->fetch_add(1), peer),
+                                                                now);
                                         } catch (const std::exception& e) {
                                             LOG_WARNING << "[EMB-DOGE] Header request error: " << e.what();
                                         }
                                     };
+                                // A block announcement: the announcing peer is asked at once
+                                // (doge::coin::HeaderAsks: not while it has a getheaders
+                                // unanswered; while catching up, one announcer per block).
                                 broadcaster->set_on_new_block(
-                                    [dc = doge_chain.get(), request_doge_headers](
-                                        const std::string& /*peer*/, const uint256& hash) {
-                                        if (!dc->has_header(hash))
-                                            request_doge_headers();
+                                    [dc = doge_chain.get(), bcaster_ptr, doge_hdr_asks](
+                                        const std::string& peer, const uint256& hash) {
+                                        if (dc->has_header(hash))
+                                            return;
+                                        const auto now = std::chrono::steady_clock::now();
+                                        if (!doge_hdr_asks->on_inv(peer, hash, dc->is_synced(), now))
+                                            return;
+                                        try {
+                                            const std::string sent = bcaster_ptr->request_headers_targeted(
+                                                dc->get_locator(), uint256::ZERO, 0, peer);
+                                            if (sent != peer)
+                                                doge_hdr_asks->sent(sent, now);  // the announcer is gone
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Header request error: " << e.what();
+                                        }
                                     });
                                 // Round-robin counter for one-peer fill requests, and
                                 // the peer whose block is being handled (a gap fill
@@ -7178,7 +7226,9 @@ int main(int argc, char* argv[]) {
                                             return false;
                                         return dc->add_header(hdr);
                                     };
-                                    host.headers_needed = request_doge_headers;
+                                    host.headers_needed = [request_doge_headers, doge_cur_peer]() {
+                                        request_doge_headers(*doge_cur_peer);
+                                    };
                                     host.request = [dc, bcaster_ptr, doge_fill_rr, doge_cur_peer](
                                                        uint32_t h, doge::coin::UtxoAsk how) {
                                         auto e = dc->get_header_by_height(h);
@@ -7313,7 +7363,9 @@ int main(int argc, char* argv[]) {
                                     };
                                     host.headers_needed = [full, &ioc, request_doge_headers]() {
                                         if (full->live.load())
-                                            boost::asio::post(ioc, request_doge_headers);
+                                            boost::asio::post(ioc, [request_doge_headers]() {
+                                                request_doge_headers(std::string());
+                                            });
                                     };
                                     // Every request is recorded (hash -> height), every copy
                                     // of the answer placed by it (UtxoFullState::place).
@@ -7556,7 +7608,11 @@ int main(int argc, char* argv[]) {
                                         bool full_only = false;
                                         doge::coin::UtxoFullState::Placement placed;
                                         if (doge_full_lane) {
-                                            placed = full->place(block_hash, height, chain ? chain->height() : 0);
+                                            uint256 tip_hash;
+                                            if (chain)
+                                                if (const auto t = chain->tip())
+                                                    tip_hash = t->block_hash;
+                                            placed = full->place(block_hash, height, chain ? chain->height() : 0, tip_hash);
                                             height = placed.height;
                                             full_only = placed.full_only;
                                         }
@@ -7573,7 +7629,7 @@ int main(int argc, char* argv[]) {
                                             boost::asio::post(*fpool,
                                                 [doge_full_lane, block, block_hash, height, peer, pool, chain, full, full_db,
                                                  explorer_enabled, explorer_depth_doge, body_bytes, &web_server, &ioc]() {
-                                              full->dequeued(body_bytes);
+                                              full->dequeued(block_hash, body_bytes);
                                               try {
                                                 const auto fed = doge_full_lane->on_block(block, block_hash, height, peer);
                                                 if (!full->live.load())
