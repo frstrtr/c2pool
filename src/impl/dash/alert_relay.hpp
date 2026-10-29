@@ -81,8 +81,8 @@ constexpr std::size_t kMaxWorker       = 64;
 constexpr std::size_t kMaxDetail       = 128;
 constexpr unsigned char kSealVersion   = 0x01;
 
-// Worker-level kinds (1, 2) name a worker; the others are node-level and carry
-// an empty worker. WorkStalled / WorkResumed (5, 6): the node handed no work to
+// Worker-level kinds (1, 2, 7, 8) name a worker; the others are node-level and
+// carry an empty worker. WorkStalled / WorkResumed (5, 6): the node handed no work to
 // its hashing miners for the threshold, and later did again (AlertDetector).
 //
 // COMPATIBILITY of kinds 5 and 6. The kind travels inside the SEALED body, so
@@ -92,10 +92,17 @@ constexpr unsigned char kSealVersion   = 0x01;
 // refuses the body with a signed refused_invalid ack: a final status the
 // origin records in its ledger and warns about, never a disconnect or a ban.
 // The page is then lost, so upgrade the relay with the origin.
+//
+// HashrateLow / HashrateOk (7, 8) are worker-level: a worker that kept hashing
+// here measured below the operator's --alert-relay-hashrate-min, and later
+// back above it (AlertDetector, HASHRATE). Same compatibility as 5 and 6, so
+// the same rule: a relay built before them (kMaxKind 6) refuses them as
+// invalid and the page is lost. Ship the relay together with its origins.
 enum class Kind : uint8_t {
     Offline = 1, BackOnline = 2, Digest = 3, Test = 4, WorkStalled = 5, WorkResumed = 6,
+    HashrateLow = 7, HashrateOk = 8,
 };
-constexpr uint8_t kMaxKind = 6;   // highest kind this build decodes
+constexpr uint8_t kMaxKind = 8;   // highest kind this build decodes
 
 inline const char* kind_name(uint8_t k)
 {
@@ -106,6 +113,8 @@ inline const char* kind_name(uint8_t k)
     case 4: return "test";
     case 5: return "work_stalled";
     case 6: return "work_resumed";
+    case 7: return "hashrate_low";
+    case 8: return "hashrate_ok";
     }
     return "unknown";
 }
@@ -114,6 +123,12 @@ inline const char* kind_name(uint8_t k)
 inline bool is_work_kind(uint8_t k)
 {
     return k == static_cast<uint8_t>(Kind::WorkStalled) || k == static_cast<uint8_t>(Kind::WorkResumed);
+}
+
+// A per-worker hashrate kind (7 or 8).
+inline bool is_hashrate_kind(uint8_t k)
+{
+    return k == static_cast<uint8_t>(Kind::HashrateLow) || k == static_cast<uint8_t>(Kind::HashrateOk);
 }
 
 enum class AckStatus : uint8_t {
@@ -469,13 +484,16 @@ inline Bytes encode_body(const AlertBody& b)
     return out;
 }
 
-inline std::optional<AlertBody> decode_body(const Bytes& in)
+// `max_kind` is the highest kind the decoder knows: kMaxKind for this build.
+// A KAT passes an older build's value to show what such a relay does with a
+// newer kind (it refuses the body).
+inline std::optional<AlertBody> decode_body(const Bytes& in, uint8_t max_kind = kMaxKind)
 {
     if (in.size() < 8) return std::nullopt;
     AlertBody b;
     std::size_t p = 0;
     b.kind = in[p++];
-    if (b.kind < 1 || b.kind > kMaxKind) return std::nullopt;
+    if (b.kind < 1 || b.kind > max_kind) return std::nullopt;
     b.event_ts = 0;
     for (int i = 0; i < 4; ++i) b.event_ts |= static_cast<uint32_t>(in[p++]) << (8 * i);
     auto get = [&](std::string& s, std::size_t cap) -> bool {

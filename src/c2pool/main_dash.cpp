@@ -371,6 +371,8 @@ struct AlertRelayCli {
     int64_t offline_after = 300, online_after = 60, min_interval = 600;
     int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
     int64_t serve_stall_after = 300;   // node-level WORK_STALLED threshold (0 = off)
+    double  hashrate_min = 0;          // per-worker HASHRATE_LOW threshold, H/s (0 = off)
+    int64_t hashrate_window = 900;     // seconds of shares per hashrate evaluation
     bool any() const { return origin || telegram || forward; }
 };
 AlertRelayCli g_alert_relay;
@@ -545,6 +547,11 @@ void print_banner(const char* argv0)
         << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
         << "           [--alert-relay-serve-stall-after S]  (origin: no work handed to hashing miners\n"
         << "              this long => WORK_STALLED, then WORK_RESUMED; default 300, 0 = off)\n"
+        << "           [--alert-relay-hashrate-min RATE [--alert-relay-hashrate-window S]]  (origin: a\n"
+        << "              worker hashing below RATE => HASHRATE_LOW, then HASHRATE_OK above 1.1x RATE.\n"
+        << "              RATE ~ 0.8x the slowest healthy rig and >= 1.1x a rig with one failed board,\n"
+        << "              e.g. 1.35T for 1.64-2.02 TH/s rigs (also 1350G, 1.35TH/s; plain number = H/s);\n"
+        << "              one worker name per rig; window default 900; default off)\n"
         << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
         << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
@@ -1622,6 +1629,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         ac.det.startup_grace = g_alert_relay.startup_grace;
         ac.det.stall_after = g_alert_relay.stall_after;
         ac.det.serve_stall_after = g_alert_relay.serve_stall_after;
+        ac.det.hashrate_min = g_alert_relay.hashrate_min;
+        ac.det.hashrate_window = g_alert_relay.hashrate_window;
         for (const auto& h : g_alert_relay.to) {
             da::Bytes pub;
             if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
@@ -1692,7 +1701,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << "s min-interval=" << ac.det.min_interval << "s grace="
                       << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
                       << "s serve-stall-after=" << ac.det.serve_stall_after
-                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
+                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max
+                      << " hashrate-min="
+                      << (ac.det.hashrate_min > 0 ? da::fmt_hashrate(ac.det.hashrate_min) + " window=" +
+                                                        std::to_string(ac.det.hashrate_window) + "s"
+                                                  : std::string("off"))
+                      << "\n";
         }
         if (ac.telegram) {
             std::cout << "[alert-relay] relay: " << ac.accept.size()
@@ -5154,6 +5168,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
                         smp.session = sid;
                         smp.accepted = w.accepted;
+                        // HASHRATE: the session's vardiff and the work of its
+                        // accepted shares (recorded by the stratum session).
+                        smp.difficulty = w.difficulty;
+                        smp.work = w.submit_window ? w.submit_window->accepted_work_total() : -1.0;
                         samples.push_back(std::move(smp));
                     }
                 }
@@ -11951,6 +11969,25 @@ int main(int argc, char** argv)
         }
         else if (std::strcmp(argv[i], "--alert-relay-retry-max") == 0 && i + 1 < argc) {
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-hashrate-min") == 0 && i + 1 < argc) {
+            const auto rate = dash::alert::parse_hashrate(argv[i + 1]);
+            if (!rate) {
+                std::cerr << "error: --alert-relay-hashrate-min expects a hashrate such as 1.35T,"
+                             " 1350G or a plain number of H/s (0 = off), got '" << argv[i + 1] << "'\n";
+                return 1;
+            }
+            g_alert_relay.hashrate_min = *rate;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-hashrate-window") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.hashrate_window)) return 1;
+            if (g_alert_relay.hashrate_window < 120 || g_alert_relay.hashrate_window > 86400) {
+                std::cerr << "error: --alert-relay-hashrate-window expects seconds in [120, 86400], got '"
+                          << argv[i + 1] << "'\n";
+                return 1;
+            }
             ++i;
         }
         else

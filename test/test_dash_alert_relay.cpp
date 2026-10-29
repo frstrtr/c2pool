@@ -36,6 +36,10 @@
 #include <vector>
 
 #include <thread>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <random>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -2834,4 +2838,699 @@ TEST(DashAlertDetector, FailbackRigIsNotAHashingSessionForWorkStalled)
             EXPECT_EQ(ev[0].ts, T0 + 1250);
         }
     }
+}
+
+// ── HASHRATE: per-worker low-hashrate alerts (kinds 7 / 8) ──────────────────
+namespace {
+constexpr double kTwo32 = 4294967296.0;
+constexpr double kTH = 1e12;
+
+// The DASH vardiff (DASHWorkSource target_time 10 s): one share per ~10 s,
+// advertised on a power-of-two grid, rounded down. 1.8 TH/s -> 4096,
+// 1.0 TH/s -> 2048.
+double dash_vardiff(double rate)
+{
+    return std::exp2(std::floor(std::log2(rate * 10.0 / kTwo32)));
+}
+
+// One rig on one stratum session. Shares arrive as a Poisson process of rate
+// rate / (difficulty * 2^32); after a rate change its vardiff follows
+// `lag` seconds later (the tracker's EWMA has tau 90 s).
+struct Rig {
+    std::string key, session;
+    double rate{0}, difficulty{1}, next_difficulty{1};
+    int64_t retarget_at{0};
+    uint64_t accepted{0};
+    double work{0};
+
+    Rig(std::string k, std::string s, double r)
+        : key(std::move(k)), session(std::move(s)), rate(r), difficulty(dash_vardiff(r)), next_difficulty(difficulty) {}
+
+    void set_rate(double r, int64_t now, int64_t lag = 120)
+    {
+        rate = r;
+        if (r > 0) {
+            next_difficulty = dash_vardiff(r);
+            retarget_at = now + lag;
+        }
+    }
+    void step(std::mt19937_64& rng, int64_t now, double dt)
+    {
+        if (retarget_at && now >= retarget_at) { difficulty = next_difficulty; retarget_at = 0; }
+        if (rate <= 0) return;
+        std::poisson_distribution<uint64_t> p(rate * dt / (difficulty * kTwo32));
+        const uint64_t k = p(rng);
+        accepted += k;
+        work += static_cast<double>(k) * difficulty;   // credited at the job's difficulty
+    }
+    WorkerSample sample() const
+    {
+        WorkerSample s{key, session, accepted};
+        s.difficulty = difficulty;
+        s.work = work;
+        return s;
+    }
+};
+
+DetectorConfig rate_cfg()
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    c.hashrate_min = 1.2 * kTH;
+    c.hashrate_window = 900;
+    return c;
+}
+
+struct Timed {
+    int64_t t;
+    DetectorEvent ev;
+};
+
+// Run one rig through (seconds, rate) phases on 5 s ticks, like the node.
+std::vector<Timed> run_rig(AlertDetector& d, Rig& rig, std::mt19937_64& rng,
+                           const std::vector<std::pair<int64_t, double>>& phases, int64_t& now)
+{
+    std::vector<Timed> out;
+    for (const auto& [dur, r] : phases) {
+        if (r != rig.rate) rig.set_rate(r, now);
+        for (const int64_t end = now + dur; now < end;) {
+            now += 5;
+            rig.step(rng, now, 5);
+            for (auto& e : d.tick({rig.sample()}, now)) out.push_back({now, e});
+        }
+    }
+    return out;
+}
+
+double quantile(std::vector<double> v, double q)
+{
+    std::sort(v.begin(), v.end());
+    return v[static_cast<std::size_t>(q * static_cast<double>(v.size() - 1))];
+}
+
+bool ends_with(const std::string& s, const std::string& tail)
+{
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+} // namespace
+
+TEST(DashAlertHashrate, ParseFormatAndPoissonTails)
+{
+    EXPECT_EQ(parse_hashrate("1200G"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2T"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2TH/s"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1200 GH/s"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1200gh"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("500M"), 5e8);
+    EXPECT_EQ(parse_hashrate("1200000000000"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2e12"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("0"), 0.0);
+    for (const char* bad : {"", " ", "-1T", "1.2X", "1.2TB", "abc", "nan", "inf", "1.2T/s/s", "T"})
+        EXPECT_FALSE(parse_hashrate(bad)) << bad;
+
+    EXPECT_EQ(fmt_hashrate(1.2e12), "1.20 TH/s");
+    EXPECT_EQ(fmt_hashrate(1.05e12), "1.05 TH/s");
+    EXPECT_EQ(fmt_hashrate(1.78e12), "1.78 TH/s");
+    EXPECT_EQ(fmt_hashrate(950e9), "950 GH/s");
+    EXPECT_EQ(fmt_hashrate(12.5e9), "12.5 GH/s");
+    EXPECT_EQ(fmt_hashrate(0), "0.00 H/s");
+    EXPECT_EQ(fmt_window(900), "15 min");
+    EXPECT_EQ(fmt_window(90), "90 s");
+
+    // Exact tails against direct summation, both sides of the mean.
+    for (double lam : {0.5, 7.0, 61.4, 122.7, 1000.0}) {
+        double cdf = 0;
+        for (uint64_t n = 0; n < static_cast<uint64_t>(lam * 2 + 10); ++n) {
+            const double dn = static_cast<double>(n);
+            cdf += std::exp(dn * std::log(lam) - lam - std::lgamma(dn + 1.0));
+            EXPECT_NEAR(poisson_cdf(n, lam), cdf, 1e-9) << "lam " << lam << " n " << n;
+            EXPECT_NEAR(poisson_sf(n + 1, lam), 1.0 - cdf, 1e-9) << "lam " << lam << " n " << n;
+        }
+    }
+    // Deep tails stay accurate (relative), not 0 by cancellation.
+    EXPECT_NEAR(poisson_cdf(0, 50.0), std::exp(-50.0), 1e-30);
+    EXPECT_GT(poisson_cdf(40, 92.1), 0.0);
+    EXPECT_LT(poisson_cdf(40, 92.1), 1e-7);
+    EXPECT_GT(poisson_sf(200, 92.1), 0.0);
+    EXPECT_LT(poisson_sf(200, 92.1), 1e-15);
+    EXPECT_EQ(poisson_sf(0, 3.0), 1.0);
+    EXPECT_EQ(poisson_cdf(5, 0.0), 1.0);
+}
+
+// KAT 1: healthy rigs at the hotel's rate never page. 30 rigs at 1.75-1.85
+// TH/s (vardiff 2048 or 4096), threshold 1.2 TH/s, one week on 5 s ticks:
+// ~60 000 evaluations, and the measured false-alarm rate is printed.
+TEST(DashAlertHashrate, SteadyRigsNeverPage)
+{
+    AlertDetector d(rate_cfg(), T0);
+    std::mt19937_64 rng(20261029);
+    std::vector<Rig> rigs;
+    for (int i = 0; i < 30; ++i)
+        rigs.emplace_back("XaddrHotel.D" + std::to_string(i + 1), "s" + std::to_string(i + 1),
+                          (1.75 + 0.10 * i / 29.0) * kTH);
+    std::vector<WorkerSample> samples(rigs.size());
+    std::size_t events = 0;
+    const int64_t end = T0 + 7 * 86400;
+    for (int64_t now = T0 + 5; now <= end; now += 5) {
+        for (std::size_t i = 0; i < rigs.size(); ++i) {
+            rigs[i].step(rng, now, 5);
+            samples[i] = rigs[i].sample();
+        }
+        for (const auto& e : d.tick(samples, now)) {
+            ++events;
+            ADD_FAILURE() << kind_name(static_cast<uint8_t>(e.kind)) << " " << e.worker << " " << e.detail;
+        }
+    }
+    const uint64_t evals = d.hashrate_evaluations();
+    std::cout << "[hashrate KAT1] 30 rigs x 7 days at 1.75-1.85 TH/s, threshold 1.20 TH/s: " << evals
+              << " evaluations, " << d.hashrate_low_evidence() << " with low evidence, " << events
+              << " pages (false-alarm rate " << static_cast<double>(events) / (30 * 7) << " per rig-day)\n";
+    EXPECT_EQ(events, 0u);
+    EXPECT_EQ(d.hashrate_low_evidence(), 0u) << "not even one evaluation leaned low";
+    EXPECT_GT(evals, uint64_t{30} * 7 * 86400 / 300 * 9 / 10) << "every rig judged every ~300 s";
+    const auto st = d.status_json(end)["workers"];
+    for (const auto& r : rigs) {
+        const double measured = st[r.key]["hashrate"].get<double>();
+        EXPECT_NEAR(measured / r.rate, 1.0, 0.3) << r.key;
+        EXPECT_FALSE(st[r.key]["hashrate_low"].get<bool>());
+    }
+}
+
+// KAT 1b: the measured gray zone. Rigs 10 % and 20 % above the threshold
+// (1.32 TH/s, the top of the hysteresis band, and 1.44 TH/s), 30 rigs x 7 days
+// each. A window of ~130 shares cannot tell 1.32 from 1.2 TH/s for certain, so
+// such a rig pages now and then; 20 % above, almost never.
+TEST(DashAlertHashrate, RigsAboveTheThresholdBarelyPage)
+{
+    for (double rate : {1.32 * kTH, 1.44 * kTH}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(7 + static_cast<uint64_t>(rate / 1e9));
+        std::vector<Rig> rigs;
+        for (int i = 0; i < 30; ++i)
+            rigs.emplace_back("XaddrHotel.D" + std::to_string(i + 1), "s" + std::to_string(i + 1), rate);
+        std::vector<WorkerSample> samples(rigs.size());
+        std::size_t pages = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 7 * 86400; now += 5) {
+            for (std::size_t i = 0; i < rigs.size(); ++i) {
+                rigs[i].step(rng, now, 5);
+                samples[i] = rigs[i].sample();
+            }
+            for (const auto& e : d.tick(samples, now))
+                if (e.kind == Kind::HashrateLow) ++pages;
+        }
+        std::cout << "[hashrate KAT1b] 30 rigs x 7 days at " << fmt_hashrate(rate) << ": " << pages
+                  << " HASHRATE_LOW (" << static_cast<double>(pages) / (30 * 7) << " per rig-day), "
+                  << d.hashrate_low_evidence() << " of " << d.hashrate_evaluations()
+                  << " evaluations with low evidence\n";
+        if (rate > 1.4 * kTH)
+            EXPECT_LE(pages, 3u) << "20 % above the threshold: at most a stray page in 210 rig-days";
+        else
+            EXPECT_LE(pages, 30u) << "10 % above the threshold: well under one page per rig-week";
+    }
+}
+
+// The rate is the work the shares were CREDITED at, not their count x the
+// advertised vardiff. After a retarget the registry already shows the new
+// vardiff while shares of jobs issued before it (still in the rig's pipeline:
+// the retarget sends set_difficulty with a non-clean notify) are credited at
+// their job's issued difficulty (stratum_server.cpp, credited_difficulty). A
+// steady 1.76 TH/s rig is retargeted 2048 -> 4096 and keeps submitting old-job
+// shares for 120 s: every window must read 1.76 TH/s. Counting those shares at
+// the advertised 4096 would read ~13 % high in each window that holds them.
+TEST(DashAlertHashrate, RateIsTheCreditedWorkAcrossARetarget)
+{
+    AlertDetector d(rate_cfg(), T0);
+    const double rate = 2048.0 * kTwo32 / 5.0;   // one 2048 share per 5 s tick
+    const int64_t retarget = T0 + 3600, lag = 120;
+    WorkerSample s{"XaddrHotel.D11", "s11", 0};
+    s.work = 0;
+    uint64_t seen = 0;
+    int spanning = 0;   // evaluations whose window holds old-job shares after the retarget
+    double worst = 0;
+    for (int64_t now = T0 + 5; now <= T0 + 3 * 3600; now += 5) {
+        s.difficulty = now <= retarget ? 2048 : 4096;   // what the registry shows
+        const bool old_job = now <= retarget + lag;     // still credited at 2048
+        if (old_job || (now / 5) % 2 == 0) {            // 2048 every tick, 4096 every other tick
+            ++s.accepted;
+            s.work += old_job ? 2048 : 4096;
+        }
+        for (const auto& e : d.tick({s}, now)) ADD_FAILURE() << kind_name(static_cast<uint8_t>(e.kind));
+        if (d.hashrate_evaluations() == seen) continue;
+        seen = d.hashrate_evaluations();
+        const double measured = d.status_json(now)["workers"][s.key]["hashrate"].get<double>();
+        worst = std::max(worst, std::fabs(measured / rate - 1.0));
+        if (now > retarget && now <= retarget + lag + 900) ++spanning;
+    }
+    std::cout << "[hashrate] credited work across a retarget: " << seen << " evaluations (" << spanning
+              << " spanning the old-job shares), worst deviation " << 100 * worst << " %\n";
+    EXPECT_GE(spanning, 2);
+    EXPECT_LT(worst, 0.03) << "every window reads the credited work, old-job shares at their own difficulty";
+}
+
+// KAT 2: a rig that drops from 1.8 to 1.0 TH/s (a dead hashboard) pages
+// HASHRATE_LOW exactly once, in about two windows. 200 seeded trials; the
+// detection delay is measured from the drop.
+TEST(DashAlertHashrate, DropToOneTerahashPagesOnceInAboutTwoWindows)
+{
+    std::vector<double> delay;
+    for (int trial = 0; trial < 200; ++trial) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(1000 + trial);
+        Rig rig("XaddrHotel.D7", "s7", 1.8 * kTH);
+        int64_t now = T0;
+        const auto before = run_rig(d, rig, rng, {{3600, 1.8 * kTH}}, now);
+        EXPECT_TRUE(before.empty()) << "trial " << trial;
+        const int64_t drop = now;
+        const auto after = run_rig(d, rig, rng, {{16 * 900, 1.0 * kTH}}, now);
+        ASSERT_EQ(after.size(), 1u) << "trial " << trial << ": exactly one page";
+        EXPECT_EQ(after[0].ev.kind, Kind::HashrateLow);
+        EXPECT_EQ(after[0].ev.worker, "XaddrHotel.D7");
+        EXPECT_EQ(after[0].ev.ts, after[0].t);
+        EXPECT_TRUE(ends_with(after[0].ev.detail, " < 1.20 TH/s (15 min)")) << after[0].ev.detail;
+        delay.push_back(static_cast<double>(after[0].t - drop) / 900.0);
+    }
+    const double med = quantile(delay, 0.5), p90 = quantile(delay, 0.9), mx = quantile(delay, 1.0);
+    std::size_t within2 = 0, within3 = 0;
+    for (double x : delay) { within2 += x <= 2.0; within3 += x <= 3.0; }
+    std::cout << "[hashrate KAT2] 1.8 -> 1.0 TH/s, 200 trials: delay in windows median " << med << ", p90 " << p90
+              << ", max " << mx << "; within 2 windows " << within2 / 2.0 << " %, within 3 " << within3 / 2.0
+              << " %\n";
+    EXPECT_LE(med, 2.0) << "about two windows";
+    EXPECT_LE(p90, 4.5);
+    EXPECT_GE(within3, 150u) << "three in four within three windows";
+    EXPECT_GE(quantile(delay, 0.0), 0.5) << "never before the window holds the new rate";
+}
+
+// KAT 3: recovery to 1.78 TH/s pages HASHRATE_OK exactly once, then nothing.
+TEST(DashAlertHashrate, RecoveryPagesOkOnce)
+{
+    std::vector<double> delay;
+    for (int trial = 0; trial < 100; ++trial) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(5000 + trial);
+        Rig rig("XaddrHotel.D7", "s7", 1.8 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3600, 1.8 * kTH}, {16 * 900, 1.0 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        ASSERT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        const int64_t fixed = now;
+        ev = run_rig(d, rig, rng, {{16 * 900, 1.78 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u) << "trial " << trial << ": exactly one HASHRATE_OK, nothing after";
+        EXPECT_EQ(ev[0].ev.kind, Kind::HashrateOk);
+        EXPECT_EQ(ev[0].ev.worker, "XaddrHotel.D7");
+        EXPECT_NE(ev[0].ev.detail.find(" TH/s (threshold 1.20 TH/s, 15 min); low for "), std::string::npos)
+            << ev[0].ev.detail;
+        delay.push_back(static_cast<double>(ev[0].t - fixed) / 900.0);
+        EXPECT_FALSE(d.status_json(now)["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>());
+    }
+    std::cout << "[hashrate KAT3] recovery to 1.78 TH/s, 100 trials: delay in windows median "
+              << quantile(delay, 0.5) << ", p90 " << quantile(delay, 0.9) << ", max " << quantile(delay, 1.0)
+              << "\n";
+    EXPECT_LE(quantile(delay, 0.5), 2.0);
+    EXPECT_LE(quantile(delay, 0.9), 3.0);
+}
+
+// KAT 4a: standby connections, failback ("hashing elsewhere") and a rig that
+// stops never page HASHRATE_LOW; a stopped rig pages OFFLINE only.
+TEST(DashAlertHashrate, StandbyElsewhereAndStoppedRigsNeverPageLow)
+{
+    auto c = rate_cfg();
+    c.offline_after = 300;
+    AlertDetector d(c, T0);
+    int64_t now = T0;
+    bool elsewhere = false;
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        return elsewhere && addr == "XaddrHotel" ? now - 20 : int64_t{0};
+    });
+    std::mt19937_64 rng(42);
+    Rig standby("XaddrHotel.D1", "s1", 0);          // failover connection: never submits here
+    standby.difficulty = 1;
+    Rig failback("XaddrHotel.D2", "s2", 0.7 * kTH);  // hashes here (LOW), then fails back
+    Rig stopper("XaddrOther.D3", "s3", 1.8 * kTH);   // hashes, then hangs with the connection open
+    std::vector<Timed> ev;
+    auto tick = [&](int64_t until) {
+        while (now < until) {
+            now += 5;
+            failback.step(rng, now, 5);
+            stopper.step(rng, now, 5);
+            for (auto& e : d.tick({standby.sample(), failback.sample(), stopper.sample()}, now))
+                ev.push_back({now, e});
+        }
+    };
+    tick(T0 + 3 * 3600);
+    ASSERT_EQ(ev.size(), 1u) << "the slow rig pages; the standby connection and the healthy rig do not";
+    EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(ev[0].ev.worker, "XaddrHotel.D2");
+    EXPECT_TRUE(d.workers().at("XaddrHotel.D2").rate.low_alerted);
+
+    // D2 fails back to the primary (its session here stays open, silent; its
+    // address hashes there) and D3 hangs. No HASHRATE event for either.
+    failback.rate = 0;
+    stopper.rate = 0;
+    elsewhere = true;
+    ev.clear();
+    tick(now + 2 * 3600);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].ev.kind, Kind::Offline) << "the hung rig: OFFLINE, never HASHRATE_LOW";
+    EXPECT_EQ(ev[0].ev.worker, "XaddrOther.D3");
+    const auto& w = d.workers();
+    EXPECT_FALSE(w.at("XaddrHotel.D2").rate.low_alerted) << "moved to another node: that node judges it";
+    EXPECT_TRUE(d.status_json(now)["workers"]["XaddrHotel.D1"]["standby"].get<bool>());
+    EXPECT_TRUE(d.status_json(now)["workers"]["XaddrHotel.D2"]["standby"].get<bool>());
+}
+
+// KAT 4b: a just-connected rig is not judged before warm-up + one window, a
+// reconnecting rig never gathers a window, and the vardiff ramp of a fresh
+// session (difficulty 1 -> 4096) never reads as a slow rig.
+TEST(DashAlertHashrate, JustConnectedAndReconnectingRigsNeverPage)
+{
+    {
+        // A genuinely slow rig (0.6 TH/s) is judged only after 180 s + 900 s.
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(7);
+        Rig rig("XaddrHotel.D9", "s9", 0.6 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3 * 3600, 0.6 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        EXPECT_GE(ev[0].t, T0 + 180 + 900 + 300)
+            << "no page before warm-up + a window of settled shares + the confirming evaluation";
+        EXPECT_LE(ev[0].t, T0 + 180 + 900 + 2 * 300 + 30) << "far below: the first two evaluations";
+    }
+    {
+        // 0.6 TH/s, but the session is replaced every 10 minutes (reconnects):
+        // no window ever fills, so nothing pages (no OFFLINE either: it is up).
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(8);
+        Rig rig("XaddrHotel.D9", "s0", 0.6 * kTH);
+        std::size_t events = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 6 * 3600; now += 5) {
+            if ((now - T0) % 600 == 0) rig.session = "s" + std::to_string((now - T0) / 600);
+            rig.step(rng, now, 5);
+            events += d.tick({rig.sample()}, now).size();
+        }
+        EXPECT_EQ(events, 0u);
+        EXPECT_EQ(d.hashrate_evaluations(), 0u);
+    }
+    {
+        // A healthy 1.8 TH/s rig on a fresh session: vardiff starts at 1 and
+        // steps to 256 after 20 s and to 4096 after 90 s. Never a page.
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(9);
+        Rig rig("XaddrHotel.D4", "s4", 1.8 * kTH);
+        rig.difficulty = 1;
+        std::size_t events = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 4 * 3600; now += 5) {
+            if (now == T0 + 20) rig.difficulty = 256;
+            if (now == T0 + 90) rig.difficulty = 4096;
+            rig.step(rng, now, 5);
+            events += d.tick({rig.sample()}, now).size();
+        }
+        EXPECT_EQ(events, 0u);
+        EXPECT_GT(d.hashrate_evaluations(), 30u);
+        EXPECT_EQ(d.hashrate_low_evidence(), 0u);
+    }
+}
+
+// KAT 4c: no double page around an OFFLINE episode. A LOW rig that goes
+// offline pages OFFLINE (not another LOW); back still slow: BACK_ONLINE, no
+// second LOW; back at speed after a repair: BACK_ONLINE, then HASHRATE_OK.
+// A pause of a healthy rig (10 min with the connection open: shorter than the
+// 15 min stall, so no OFFLINE either) is not a slow rig.
+TEST(DashAlertHashrate, OfflineEpisodeIsNeverDoublePaged)
+{
+    for (bool repaired : {false, true}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(repaired ? 11 : 12);
+        Rig rig("XaddrHotel.D5", "s5", 0.7 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3 * 3600, 0.7 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        ASSERT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        // Disconnected for 20 minutes.
+        std::vector<Timed> got;
+        for (const int64_t end = now + 1200; now < end;) {
+            now += 5;
+            for (auto& e : d.tick({}, now)) got.push_back({now, e});
+        }
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].ev.kind, Kind::Offline);
+        EXPECT_TRUE(d.workers().at("XaddrHotel.D5").rate.low_alerted) << "outlives the outage";
+        rig.session = "s5b";
+        const double back = repaired ? 1.78 * kTH : 0.7 * kTH;
+        got = run_rig(d, rig, rng, {{3 * 3600, back}}, now);
+        ASSERT_EQ(got.size(), repaired ? 2u : 1u);
+        EXPECT_EQ(got[0].ev.kind, Kind::BackOnline);
+        if (repaired) EXPECT_EQ(got[1].ev.kind, Kind::HashrateOk);
+    }
+    {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(13);
+        Rig rig("XaddrHotel.D6", "s6", 1.8 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{2 * 3600, 1.8 * kTH}, {600, 0.0}, {2 * 3600, 1.8 * kTH}}, now);
+        EXPECT_TRUE(ev.empty()) << ev.front().ev.detail;
+        EXPECT_GT(d.hashrate_evaluations(), 30u);
+    }
+}
+
+// KAT 4d: while the node itself serves no work (WORK_STALLED outstanding),
+// slow shares are the node's fault, not the rigs': no HASHRATE_LOW.
+TEST(DashAlertHashrate, NoLowWhileTheNodeServesNoWork)
+{
+    auto c = rate_cfg();
+    AlertDetector d(c, T0);
+    std::mt19937_64 rng(14);
+    Rig rig("XaddrHotel.D8", "s8", 1.8 * kTH);
+    std::vector<DetectorEvent> ev;
+    int64_t now = T0;
+    for (; now < T0 + 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        auto s = served(1000 + now, 0);
+        for (auto& e : d.tick({rig.sample()}, now, &s)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty());
+    rig.set_rate(0.5 * kTH, now);   // shares thin out while no new work is served
+    const int64_t stalled = now;
+    for (; now < stalled + 2 * 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        auto s = served(1000 + stalled, now - stalled);
+        for (auto& e : d.tick({rig.sample()}, now, &s)) ev.push_back(e);
+    }
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled) << "the node pages; the rig is not blamed";
+}
+
+// The hashrate events share the worker budget: the cap holds a LOW (pending,
+// one digest), and a second LOW waits out min_interval after the first.
+TEST(DashAlertHashrate, WorkerBudgetAndMinIntervalApply)
+{
+    auto c = rate_cfg();
+    c.max_per_hour = 1;
+    AlertDetector d(c, T0);
+    std::mt19937_64 rng(15);
+    Rig a("XaddrHotel.D1", "s1", 0.5 * kTH), b("XaddrHotel.D2", "s2", 0.5 * kTH);
+    std::vector<Timed> ev;
+    for (int64_t now = T0 + 5; now <= T0 + 3 * 3600; now += 5) {
+        a.step(rng, now, 5);
+        b.step(rng, now, 5);
+        for (auto& e : d.tick({a.sample(), b.sample()}, now)) ev.push_back({now, e});
+    }
+    ASSERT_EQ(ev.size(), 3u);
+    EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(ev[1].ev.kind, Kind::Digest) << "the second LOW is held by the 1/h cap";
+    EXPECT_EQ(ev[2].ev.kind, Kind::HashrateLow);
+    EXPECT_NE(ev[0].ev.worker, ev[2].ev.worker);
+    EXPECT_GE(ev[2].t - ev[0].t, 3600) << "held until the hourly window freed";
+
+    // LOW -> OK -> LOW within min_interval: the second LOW waits.
+    auto c2 = rate_cfg();
+    c2.min_interval = 4 * 3600;
+    AlertDetector d2(c2, T0);
+    Rig r("XaddrHotel.D3", "s3", 0.5 * kTH);
+    int64_t now = T0;
+    auto e2 = run_rig(d2, r, rng, {{3600, 0.5 * kTH}, {3600, 1.8 * kTH}, {3 * 3600, 0.5 * kTH}}, now);
+    ASSERT_EQ(e2.size(), 3u);
+    EXPECT_EQ(e2[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(e2[1].ev.kind, Kind::HashrateOk);
+    EXPECT_EQ(e2[2].ev.kind, Kind::HashrateLow);
+    EXPECT_GE(e2[2].t - e2[0].t, 4 * 3600);
+}
+
+// An outstanding LOW survives a node restart (persisted): still slow, no
+// second page; at speed again, one HASHRATE_OK.
+TEST(DashAlertHashrate, OutstandingLowIsPersistedAcrossARestart)
+{
+    for (bool repaired : {false, true}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(repaired ? 21 : 22);
+        Rig rig("XaddrHotel.D1", "s1", 0.6 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{2 * 3600, 0.6 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        const auto saved = d.persist();
+        ASSERT_TRUE(saved["XaddrHotel.D1"]["hashrate_low"].get<bool>());
+
+        AlertDetector d2(rate_cfg(), now + 60);
+        d2.restore(saved);
+        EXPECT_TRUE(d2.workers().at("XaddrHotel.D1").rate.low_alerted);
+        rig.session = "s1b";
+        now += 60;
+        ev = run_rig(d2, rig, rng, {{3 * 3600, repaired ? 1.8 * kTH : 0.6 * kTH}}, now);
+        if (!repaired) {
+            EXPECT_TRUE(ev.empty()) << "not paged twice across a restart";
+        } else {
+            ASSERT_EQ(ev.size(), 1u);
+            EXPECT_EQ(ev[0].ev.kind, Kind::HashrateOk);
+        }
+    }
+    // Off (the default): nothing is evaluated or persisted.
+    AlertDetector off(det_cfg(), T0);
+    std::mt19937_64 rng(23);
+    Rig rig("XaddrHotel.D1", "s1", 0.3 * kTH);
+    int64_t now = T0;
+    EXPECT_TRUE(run_rig(off, rig, rng, {{3 * 3600, 0.3 * kTH}}, now).empty());
+    EXPECT_EQ(off.hashrate_evaluations(), 0u);
+    EXPECT_FALSE(off.status_json(now)["workers"]["XaddrHotel.D1"].contains("hashrate"));
+}
+
+// KAT 5: kinds 7 and 8 on the wire. This build decodes them; a relay built
+// before them (kMaxKind 6) refuses the body -- the page is lost, so the relay
+// must ship together with (or before) its origins.
+TEST(DashAlertRelay, HashrateKindsOnTheWireAndAnOlderRelaysRefusal)
+{
+    ASSERT_EQ(kMaxKind, 8);
+    EXPECT_STREQ(kind_name(7), "hashrate_low");
+    EXPECT_STREQ(kind_name(8), "hashrate_ok");
+    for (Kind k : {Kind::HashrateLow, Kind::HashrateOk}) {
+        AlertBody b = sample_body(k);
+        b.worker = "XdashAddress123.D17";
+        b.detail = "1.05 TH/s < 1.20 TH/s (15 min)";
+        const Bytes enc = encode_body(b);
+        auto dec = decode_body(enc);
+        ASSERT_TRUE(dec);
+        EXPECT_EQ(*dec, b);
+        EXPECT_TRUE(is_hashrate_kind(static_cast<uint8_t>(k)));
+        EXPECT_FALSE(is_work_kind(static_cast<uint8_t>(k)));
+        EXPECT_FALSE(decode_body(enc, /*an older relay's kMaxKind=*/6)) << "an older relay refuses it";
+    }
+    EXPECT_TRUE(decode_body(encode_body(sample_body(Kind::WorkResumed)), 6)) << "kinds 1-6 unchanged";
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
+
+    // End to end: origin -> forwarder -> relay outbox (the row the sidecar reads).
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    auto oc = origin_cfg(od, rkey.pubkey);
+    oc.det = rate_cfg();
+    Mesh m;
+    m.add(1, oc, okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    std::mt19937_64 rng(31);
+    Rig rig("XaddrHotel.D7", "s7", 0.7 * kTH);
+    int64_t now = T0;
+    for (; now < T0 + 2 * 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        m.nodes[1].svc->on_tick({rig.sample()}, now);
+        m.pump(now);
+    }
+    auto rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 1u);
+    auto row = nlohmann::json::parse(rows[0]);
+    EXPECT_EQ(row["kind"], "hashrate_low");
+    EXPECT_EQ(row["worker"], "XaddrHotel.D7");
+    EXPECT_EQ(row["label"], "farm-1");
+    EXPECT_TRUE(ends_with(row["detail"].get<std::string>(), " < 1.20 TH/s (15 min)")) << row["detail"];
+    auto st = m.nodes[1].svc->status_json();
+    EXPECT_TRUE(st["detector"]["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>());
+    EXPECT_EQ(st["detector"]["hashrate"]["min"].get<double>(), 1.2e12);
+    {
+        std::ifstream f(od / "state.json");
+        auto j = nlohmann::json::parse(f);
+        EXPECT_TRUE(j["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>()) << "persisted";
+    }
+
+    // An older relay answers refused_invalid: the origin ends the event with a
+    // ledger row (and a warning to upgrade the relay), no retransmit storm.
+    auto okey2 = key_from_byte(0x33);
+    auto od2 = fresh_dir("o2");
+    AlertRelayService org(origin_cfg(od2, rkey.pubkey), okey2, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AlertFrame> sent;
+    Transport t;
+    t.broadcast_alert = [&](uint64_t, const AlertFrame& f) { sent.push_back(f); return std::size_t{1}; };
+    org.set_transport(t);
+    DetectorEvent ev;
+    ev.kind = Kind::HashrateLow;
+    ev.worker = "XaddrHotel.D7";
+    ev.ts = T0;
+    ev.detail = "1.05 TH/s < 1.20 TH/s (15 min)";
+    org.enqueue_event(ev, T0);
+    ASSERT_EQ(sent.size(), 1u);
+    const AlertFrame f = wire_alert(sent[0]);
+    auto shared = ecdh_shared(rkey.seckey.data(), f.origin_pubkey);
+    ASSERT_TRUE(shared);
+    auto pt = open_body(*shared, f.body);
+    ASSERT_TRUE(pt);
+    EXPECT_FALSE(decode_body(*pt, 6)) << "what an older relay sees: a body it cannot decode";
+    PeerAlertGuard g;
+    auto ack = build_ack(rkey, okey2.pubkey, f.nonce, AckStatus::RefusedInvalid);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(org.on_ack(wire_ack(*ack), 7, g, T0 + 1), Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    auto ledger = read_lines(od2 / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 1u);
+    EXPECT_NE(ledger[0].find("\"hashrate_low\""), std::string::npos);
+    EXPECT_NE(ledger[0].find("refused_invalid"), std::string::npos);
+}
+
+// The stratum session records the work of each accepted share (the credited
+// difficulty its hashrate tracker gets), and main_dash hands it, the vardiff
+// and the two flags to the detector.
+TEST(DashAlertHashrate, StratumRecordsAcceptedWorkAndMainDashWiresIt)
+{
+    core::stratum::SubmitOutcomeWindow w;
+    EXPECT_EQ(w.accepted_work_total(), 0.0);
+    w.add_accepted_work(4096);
+    w.add_accepted_work(2048);
+    w.add_accepted_work(0);
+    w.add_accepted_work(-5);
+    EXPECT_EQ(w.accepted_work_total(), 6144.0);
+
+    std::string root = DASH_MAIN_SRC;
+    root.resize(root.rfind("c2pool/main_dash.cpp"));
+    std::ifstream in(root + "core/stratum_server.cpp");
+    ASSERT_TRUE(in.good());
+    std::stringstream buf;
+    buf << in.rdbuf();
+    const std::string ss = buf.str();
+    const auto credited = ss.find("double credited_difficulty =");
+    ASSERT_NE(credited, std::string::npos);
+    const auto add = ss.find("submit_window_->add_accepted_work(credited_difficulty);", credited);
+    ASSERT_NE(add, std::string::npos);
+    EXPECT_LT(add - credited, 200u) << "recorded with the credited difficulty of the accepted share";
+    EXPECT_LT(add, ss.find("hashrate_tracker_.record_mining_share_submission(credited_difficulty, true);", credited));
+
+    const std::string code = main_dash_code();
+    const auto tick = code.find("alert_relay_timer->start(");
+    ASSERT_NE(tick, std::string::npos);
+    const auto diff = code.find("smp.difficulty = w.difficulty;", tick);
+    const auto work = code.find("smp.work = w.submit_window ? w.submit_window->accepted_work_total() : -1.0;", tick);
+    ASSERT_NE(diff, std::string::npos);
+    ASSERT_NE(work, std::string::npos);
+    EXPECT_LT(work - tick, 1500u) << "inside the alert tick's sampler";
+    EXPECT_NE(code.find("ac.det.hashrate_min = g_alert_relay.hashrate_min;"), std::string::npos);
+    EXPECT_NE(code.find("ac.det.hashrate_window = g_alert_relay.hashrate_window;"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-hashrate-min\""), std::string::npos);
+    EXPECT_NE(code.find("dash::alert::parse_hashrate(argv[i + 1])"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-hashrate-window\""), std::string::npos);
+    EXPECT_NE(code.find("double  hashrate_min = 0;"), std::string::npos) << "off by default";
 }
