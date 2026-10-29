@@ -226,6 +226,23 @@ struct StubBackend : c2pool::merged::IAuxChainBackend {
 
 } // namespace
 
+namespace {
+
+/// The merged payouts the node computes for a rebuild (one payee): a DOGE
+/// block is built and frozen for every template, as on a node with shares.
+void one_payee_provider(c2pool::merged::MergedMiningManager& mm)
+{
+    mm.set_payout_provider([](uint32_t, uint64_t value) {
+        std::vector<unsigned char> s{0x76, 0xa9, 0x14};
+        s.insert(s.end(), 20, 0x5d);
+        s.push_back(0x88);
+        s.push_back(0xac);
+        return std::vector<std::pair<std::vector<unsigned char>, uint64_t>>{{s, value}};
+    });
+}
+
+} // namespace
+
 TEST(MergedMining, DegradedDogeTemplateIsRefetchedUntilCleaned)
 {
     boost::asio::io_context ioc;
@@ -234,6 +251,7 @@ TEST(MergedMining, DegradedDogeTemplateIsRefetchedUntilCleaned)
     auto* stub = backend.get();
     stub->degraded = {true, false};
     mm.add_chain(stub->cfg, std::move(backend));
+    one_payee_provider(mm);
 
     mm.refresh_aux_work();   // new tip: degraded template
     EXPECT_EQ(stub->template_fetches, 1);
@@ -260,6 +278,7 @@ TEST(MergedMining, CleanDogeTemplateLatchesTheTip)
     auto backend = std::make_unique<StubBackend>();
     auto* stub = backend.get();
     mm.add_chain(stub->cfg, std::move(backend));
+    one_payee_provider(mm);
     mm.refresh_aux_work();
     mm.refresh_aux_work();
     EXPECT_EQ(stub->template_fetches, 1);
@@ -282,6 +301,7 @@ TEST(MergedMining, StillDegradedRefetchKeepsTheBlock)
     auto* stub = backend.get();
     stub->degraded = {true, true, true, false};
     mm.add_chain(stub->cfg, std::move(backend));
+    one_payee_provider(mm);
 
     mm.refresh_aux_work();   // new tip, degraded: the new work goes out
     ioc.restart();
