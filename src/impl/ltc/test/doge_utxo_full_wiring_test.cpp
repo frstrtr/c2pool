@@ -24,6 +24,9 @@
 //     itself passes. UnsolicitedPlaceableBodiesAreBounded: the verifier's
 //     probe (4,096 copies of a recent body).
 //   - InvAsksTheAnnouncingPeerOnly (VERIFY3 S3): the inv path's getheaders.
+//   - RequestedBodyPassesAQueueFullOfJunkOnce, OutstandingRequestsBoundTheBypass:
+//     the first copy of a body with an outstanding full-lane request passes a
+//     full queue; the bypass is bounded by the requests kept.
 //   - HeaderSyncAsksAsCoreDoes (S-B): follow-up getheaders only to the peer
 //     that sent new headers, none for a batch with nothing new; the periodic
 //     poll asks one peer while catching up, every peer once synced.
@@ -300,4 +303,62 @@ TEST(DogeUtxoFullWiring, UnsolicitedPlaceableBodiesAreBounded)
     EXPECT_LE(queued, UtxoFullState::QUEUE_BYTES_MAX + MB)
         << "a peer streaming copies of a recent block is never dropped: " << queued / MB
         << " MB queued, " << st.queue_dropped.load() << " dropped";
+}
+
+// The queue is full of junk (placeable bodies nobody asked for): a body with
+// an outstanding full-lane request still passes, once; a copy of it is
+// dropped, and once answered its later copies face the cap again. The bound
+// stays the cap plus the outstanding requests.
+TEST(DogeUtxoFullWiring, RequestedBodyPassesAQueueFullOfJunkOnce)
+{
+    UtxoFullState st;
+    st.live.store(true);
+    constexpr uint64_t MB = 1024 * 1024;
+    uint32_t n = 0;
+    for (; n < 1000; ++n) {
+        uint256 h = tag(0x0c, static_cast<uint8_t>(n & 0xFF));
+        h.data()[2] = static_cast<uint8_t>(n >> 8);
+        if (!st.enqueue(st.place(h, TIP - 10, TIP), MB))
+            break;
+    }
+    ASSERT_LT(n, 1000u) << "the cap never held";
+    const uint256 asked = tag(0x0d, 1);
+    st.note_request(asked, TIP - 5000);
+    const auto p = st.place(asked, 0, TIP);
+    ASSERT_EQ(p.height, TIP - 5000);
+    EXPECT_TRUE(st.enqueue(p, MB)) << "a requested body was dropped by a queue full of junk";
+    EXPECT_FALSE(st.enqueue(p, MB)) << "a second copy while the first is queued";
+    st.dequeued(asked, MB);
+    EXPECT_FALSE(st.enqueue(p, MB)) << "answered: a later copy faces the cap";
+    st.note_request(asked, TIP - 5000);  // asked again (the lane's request timeout)
+    EXPECT_TRUE(st.enqueue(p, MB)) << "a new request: its first copy passes";
+}
+
+// The bypass is bounded: only the most recent MAX_AWAITING outstanding
+// requests pass a full queue; older ones face the cap like any body.
+TEST(DogeUtxoFullWiring, OutstandingRequestsBoundTheBypass)
+{
+    UtxoFullState st;
+    st.live.store(true);
+    constexpr uint64_t MB = 1024 * 1024;
+    for (uint32_t n = 0; n < 1000; ++n) {
+        uint256 h = tag(0x0e, static_cast<uint8_t>(n & 0xFF));
+        h.data()[2] = static_cast<uint8_t>(n >> 8);
+        if (!st.enqueue(st.place(h, TIP - 10, TIP), MB))
+            break;
+    }
+    const uint32_t N = UtxoFullState::MAX_AWAITING + 100;
+    auto asked = [](uint32_t i) {
+        uint256 h = tag(0x0f, static_cast<uint8_t>(i & 0xFF));
+        h.data()[2] = static_cast<uint8_t>(i >> 8);
+        return h;
+    };
+    for (uint32_t i = 0; i < N; ++i)
+        st.note_request(asked(i), 1000 + i);
+    EXPECT_EQ(st.awaiting(), UtxoFullState::MAX_AWAITING);
+    uint32_t passed = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        passed += st.enqueue(st.place(asked(i), 0, TIP), 1024) ? 1 : 0;
+    EXPECT_EQ(passed, UtxoFullState::MAX_AWAITING) << "the bypass is bounded by the outstanding requests kept";
+    EXPECT_EQ(st.awaiting(), 0u);
 }

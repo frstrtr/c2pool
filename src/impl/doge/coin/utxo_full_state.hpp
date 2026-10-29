@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -55,6 +56,10 @@ struct UtxoFullState {
     /// A request of the full lane: the best chain's block `hash` at `height`.
     void note_request(const uint256& hash, uint32_t height)
     {
+        {
+            std::lock_guard<std::mutex> q(m_queue_mu);
+            await_locked(hash);
+        }
         std::lock_guard<std::mutex> lock(m_mu);
         m_requested[hash] = height;
         if (m_requested.size() > MAX_REQUESTED) {
@@ -115,23 +120,30 @@ struct UtxoFullState {
     ///   - a body whose hash is already queued is not queued again (a peer
     ///     streaming copies costs one slot);
     ///   - while QUEUE_BYTES_MAX is queued, only the header chain's tip
-    ///     itself passes (a requested body that is dropped is asked again
-    ///     after the request timeout).
+    ///     itself and the first copy of a body with an outstanding full-lane
+    ///     request pass. A junk flood cannot starve the lane, and the bound
+    ///     stays the cap plus the outstanding requests (the lane keeps at most
+    ///     16 per peer and its window in flight; MAX_AWAITING backstops it).
     /// true = post it, and call dequeued(hash, bytes) when the full set's
     /// thread takes it.
     static constexpr uint64_t QUEUE_BYTES_MAX = 256u * 1024 * 1024;
+    static constexpr size_t   MAX_AWAITING = 1024;  // the full lane's window (UtxoLane::FULL_WINDOW)
     std::atomic<uint64_t> queued_bytes{0};
     std::atomic<uint64_t> queue_dropped{0};
 
     bool enqueue(const Placement& p, uint64_t bytes)
     {
         std::lock_guard<std::mutex> lock(m_queue_mu);
+        const auto awaited = m_awaiting.find(p.hash);
+        const bool requested = awaited != m_awaiting.end();
         const bool drop = (p.height == 0 && !live.load()) || m_queued.count(p.hash)
-                       || (!p.tip && m_queue_bytes + bytes > QUEUE_BYTES_MAX);
+                       || (!p.tip && !requested && m_queue_bytes + bytes > QUEUE_BYTES_MAX);
         if (drop) {
             queue_dropped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        if (requested)
+            m_awaiting.erase(awaited);  // answered: a later copy is just a copy
         m_queued.insert(p.hash);
         m_queue_bytes += bytes;
         queued_bytes.store(m_queue_bytes);
@@ -140,9 +152,17 @@ struct UtxoFullState {
     void dequeued(const uint256& hash, uint64_t bytes)
     {
         std::lock_guard<std::mutex> lock(m_queue_mu);
-        m_queued.erase(hash);
+        if (!m_queued.erase(hash))
+            return;  // never queued: nothing to release
         m_queue_bytes = m_queue_bytes > bytes ? m_queue_bytes - bytes : 0;
         queued_bytes.store(m_queue_bytes);
+    }
+
+    /// Outstanding full-lane requests (no copy queued since the request).
+    size_t awaiting() const
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mu);
+        return m_awaiting.size();
     }
 
     /// Start with the full set pricing the templates: built from genesis,
@@ -190,10 +210,35 @@ struct UtxoFullState {
 
 private:
     static constexpr size_t MAX_REQUESTED = 65536;
+
+    /// A request is outstanding until its first copy is queued; the oldest
+    /// go beyond MAX_AWAITING (they are then bounded by the cap like any
+    /// body). The order queue holds stale entries of answered or renewed
+    /// requests, skipped and bounded at 4 x MAX_AWAITING.
+    void await_locked(const uint256& hash)
+    {
+        const uint64_t seq = ++m_await_seq;
+        m_awaiting[hash] = seq;
+        m_await_order.emplace_back(seq, hash);
+        while (!m_await_order.empty()) {
+            const auto [s, h] = m_await_order.front();
+            auto it = m_awaiting.find(h);
+            const bool stale = it == m_awaiting.end() || it->second != s;
+            if (!stale && m_awaiting.size() <= MAX_AWAITING && m_await_order.size() <= 4 * MAX_AWAITING)
+                break;
+            if (!stale)
+                m_awaiting.erase(it);
+            m_await_order.pop_front();
+        }
+    }
+
     mutable std::mutex m_mu;
-    std::mutex         m_queue_mu;
+    mutable std::mutex m_queue_mu;
     std::set<uint256>  m_queued;       // hashes posted to the full set's thread, not yet taken
     uint64_t           m_queue_bytes{0};
+    std::map<uint256, uint64_t> m_awaiting;  // outstanding full-lane requests -> their sequence
+    std::deque<std::pair<uint64_t, uint256>> m_await_order;
+    uint64_t           m_await_seq{0};
     std::map<uint256, uint32_t> m_requested;
 };
 
