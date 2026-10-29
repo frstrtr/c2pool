@@ -11581,6 +11581,14 @@ int main(int argc, char** argv)
     std::string embedded_utxo_fold_fees_db;   // --embedded-utxo-fold-fees PATH
     std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
+        // The flags are matched by three consecutive else-if chains, because a
+        // single chain over all of them nests deeper than MSVC allows (C1061,
+        // "blocks nested too deeply"). The first two chains end in
+        // `else flag_matched = false;` and the loop moves on to the next
+        // argument as soon as a chain matched, so every flag is still tried in
+        // the original order and only the last chain's final else rejects an
+        // unknown argument.
+        bool flag_matched = true;
         if (std::strcmp(argv[i], "--version") == 0) {
             // Name the BLS backend on the version line (issue #1671): a stub
             // (BLS-dark) binary is otherwise indistinguishable here, and this is
@@ -11702,6 +11710,12 @@ int main(int argc, char** argv)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
             embedded_null_arm_off = true;  // #127: good-citizen opt-out (daemonless default ON)
+        else
+            flag_matched = false;
+        if (flag_matched) continue;
+
+        // Second chain (see the note at the top of the loop).
+        flag_matched = true;
         // PR-2 FRESH-DATUM RACE (dashd-cut coin-P2P). Race the SINGLE freshest
         // object (the fold snapshot's getmnlistd today) to K distinct-netgroup
         // CanServeBlocks carriers and fold the first valid self-checked reply,
@@ -11709,7 +11723,7 @@ int main(int argc, char** argv)
         // safe: only WHO/HOW-MANY is asked changes; every reply still flows
         // through the identical DIP-4/merkle/payee self-check before it is
         // believed, and exactly one fold is licensed.
-        else if (std::strcmp(argv[i], "--embedded-fresh-datum-race") == 0)
+        if (std::strcmp(argv[i], "--embedded-fresh-datum-race") == 0)
             dash::coin::set_fresh_datum_race_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-fresh-datum-race=false") == 0)
             dash::coin::set_fresh_datum_race_enabled(false);
@@ -11818,7 +11832,13 @@ int main(int argc, char** argv)
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
             ++i;
         }
-        else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
+        else
+            flag_matched = false;
+        if (flag_matched) continue;
+
+        // Third chain (see the note at the top of the loop); its final else
+        // rejects an argument no chain matched.
+        if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
             pin_splice_xcheck_arm = true;
