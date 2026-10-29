@@ -325,6 +325,9 @@
 //                tip whose server answers its catch-up from position 0 with no
 //                header: J at that tip (C connects later; C's reply held);
 //                a server that never answers: no pair, K_NCU ended;
+//   catchctx     a caught-up store above position 0 whose catch-up step
+//                stays deferred on a P_r no node serves past kCtxTtlMs: no
+//                join pair;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
@@ -10320,9 +10323,10 @@ void catchtok() {
                     static_cast<int>(s1));
         check(br.ok && walked && s0 == pb::TemplateStatus::NoPathbPeer && (ban || edited >= 1),
               tag + "setup (J not caught up at A's tip; B's tip lighter and not held at J)");
-        check(kept && caught && (ban ? bans >= 1 : strikes >= 1) && s1 != pb::TemplateStatus::NoPathbPeer
+        check(kept && caught && (ban ? bans >= 1 : strikes >= 1 && bans == 0) && s1 != pb::TemplateStatus::NoPathbPeer
                       && s1 != pb::TemplateStatus::CatchingUp,
-              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept");
+              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept (strikes " +
+                      std::to_string(strikes) + ", bans " + std::to_string(bans) + ")");
     }
 }
 
@@ -10346,6 +10350,8 @@ struct HeavyResult {
     bool at_c = false;
     bool ncu_end = false;        // K_NCU set at the end
     std::uint64_t c_asks = 0;    // catch-up requests after B's attempt
+    std::size_t c_pairs = 0;     // the joiner's queue after C's empty reply from position 0 (before any attempt)
+    bool c_again = false;        // C's tip offered again by the same server: a second pair queued
     int restart_round = -1;      // silent: after a restart and C's HELLO, the first round open (1) or not (0)
 };
 HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
@@ -10460,6 +10466,10 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
         w.connect(0, jwire);
         w.run();
     }
+    if (mode != 2) {  // one pair per (tip, server): the same server's tip offered again queues none
+        out.c_pairs = h[j.node].joiner().queue().size();
+        out.c_again = h[j.node].offer_empty_store_tip(w.id(jwire, 0));
+    }
     const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
     ticks(static_cast<int>(mode == 2 ? 5 * p53 : 3 * p53));
     out.c_offers = rj.stats().empty_store_offers.load() - offers0;
@@ -10487,13 +10497,77 @@ void catchheavy() {
                     r.restart_round);
         check(r.setup && r.b_completed, tag + "setup (J at D's 8, K_NCU; B's attempt completes, rule (4) keeps J's chain)");
         if (mode != 2)
-            check(r.c_offers >= 1 && r.at_c && !r.ncu_end,
-                  tag + "C's heavier unheld tip gets a join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+            check(r.c_offers == 1 && r.c_pairs == 1 && !r.c_again && r.at_c && !r.ncu_end,
+                  tag + "C's heavier unheld tip gets one join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+                          ", pairs " + std::to_string(r.c_pairs) + ", again " + std::to_string(r.c_again ? 1 : 0) +
                           ", J at " + std::to_string(r.j_pos) + ")");
         else
             check(r.c_offers == 0 && r.j_pos == 8 && !r.ncu_end && r.restart_round == 0,
                   tag + "no reply, no pair: J keeps its chain; K_NCU ended; a restart opens no first round");
     }
+}
+
+// ---------------------------------------------------------------------------
+// catchctx: a caught-up store above position 0 (launched; J at A's 4) whose catch-up step stays deferred on a P_r no
+// node serves (X, the P_r of A's carriers 5..7) past kCtxTtlMs: no join pair, J at 4 (the kCtxTtlMs offer reads K_NCU).
+void catchctx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), true, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview));
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 4600 + static_cast<std::uint32_t>(i));
+    }
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    ok = ok && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 4;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    h.tick_monero();
+    for (int i = 0; i < 3; ++i)
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 4700 + static_cast<std::uint32_t>(i));
+    const std::optional<pb::Hash32> c5 = h[a.node].store().best_at(5);
+    const pb::CarrierBodyV3* b5 = c5 ? h[a.node].bodies().get(*c5) : nullptr;
+    if (!ok || b5 == nullptr) {
+        check(false, "catchctx: setup (J at A's 4; A at 7)");
+        return;
+    }
+    hidden.insert(b5->own.blob.prev_id);
+    const std::uint64_t def0 = rj.stats().headers_ctx_deferred.load();
+    w.reconnect(0, 1);
+    w.run();
+    const bool deferred = rj.stats().headers_ctx_deferred.load() > def0;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+        (void)rj.join_step();
+        w.run();
+    }
+    const std::uint64_t offers = rj.stats().catchup_join_offers.load();
+    std::printf("  catchctx: J at %llu (A at %llu); deferred %d; caught up %d; kCtxTtlMs offers %llu; pairs %zu; attempts "
+                "%llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos,
+                deferred ? 1 : 0, h[j.node].caught_up() ? 1 : 0, (unsigned long long)offers,
+                h[j.node].joiner().queue().size(), (unsigned long long)rj.stats().join_attempts.load());
+    check(deferred && h[j.node].caught_up(), "catchctx: setup (J caught up; its catch-up step DEFERs on X)");
+    check(offers == 0 && h[j.node].joiner().queue().size() == 0 && rj.stats().join_attempts.load() == 0
+                  && h[j.node].tree().best().pos == 4,
+          "catchctx: a caught-up store's catch-up deferred past kCtxTtlMs queues no join pair (offers " +
+                  std::to_string(offers) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -12040,6 +12114,7 @@ int main(int argc, char** argv) {
     run("revcatchundec", revcatchundec);
     run("catchtok", catchtok);
     run("catchheavy", catchheavy);
+    run("catchctx", catchctx);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
