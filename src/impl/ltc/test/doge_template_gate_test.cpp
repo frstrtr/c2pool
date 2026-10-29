@@ -202,6 +202,9 @@ struct StubBackend : c2pool::merged::IAuxChainBackend {
                             {"transactions", nlohmann::json::array()}};
         if (is_degraded)
             w.block_template["degraded"] = "mempool-not-cleaned-for-tip";
+        else   // a clean template has the mempool's txs back (the degraded one: coinbase only)
+            w.block_template["transactions"].push_back(
+                {{"txid", std::string(62, '0') + "7e"}, {"data", "00"}});
         return w;
     }
     bool connect() override { return true; }
