@@ -1711,15 +1711,52 @@ public:
         return it == frames_.end() ? nullptr : &it->second;
     }
     bool holds(const Hash32& digest) const { return frames_.count(digest) != 0; }
+    // A frame of carrier `id` is stored (any cause).
+    bool holds_id(const Hash32& id) const {
+        for (const auto& [d, f] : frames_)
+            if (f.id == id) return true;
+        return false;
+    }
+    // The digests of every stored frame.
+    std::vector<Hash32> digests() const {
+        std::vector<Hash32> out;
+        out.reserve(frames_.size());
+        for (const auto& [d, f] : frames_) out.push_back(d);
+        return out;
+    }
+    // The carrier ids of every stored frame.
+    std::set<Hash32> ids() const {
+        std::set<Hash32> out;
+        for (const auto& [d, f] : frames_) out.insert(f.id);
+        return out;
+    }
+    // Every waiting key's claimed parent with the peers of its stored frames, the oldest frame's first (no repeats).
+    std::vector<std::pair<Hash32, std::vector<std::uint64_t>>> waiting_parents() const {
+        std::vector<std::pair<Hash32, std::vector<std::uint64_t>>> out;
+        for (const auto& [k, ds] : keys_) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> by_seq;  // (seq, peer)
+            for (const Hash32& d : ds)
+                if (const auto it = frames_.find(d); it != frames_.end()) by_seq.emplace_back(it->second.seq, it->second.peer);
+            if (by_seq.empty()) continue;
+            std::sort(by_seq.begin(), by_seq.end());
+            std::vector<std::uint64_t> peers;
+            for (const auto& [q, p] : by_seq)
+                if (std::find(peers.begin(), peers.end(), p) == peers.end()) peers.push_back(p);
+            out.emplace_back(k.second, std::move(peers));
+        }
+        return out;
+    }
 
     // Parks a DEFERred frame (by its digest). ParentUnknown: the waiting entry
     // (id, claimed parent) is registered in the tree. Returns false when the
-    // digest is held already.
+    // digest is held already, or for ParentUnknown when the carrier or its
+    // parent is held (the caller runs such a frame again).
     bool park(CarrierTree& tree, ParkedFrame f) {
         if (frames_.count(f.digest) != 0) return false;
         f.seq = ++seq_;
         if (f.cause == Missing::ParentUnknown) {
-            if (tree.find(f.id) != nullptr) return false;  // placed already
+            if (tree.find(f.id) != nullptr) return false;      // placed already
+            if (tree.find(f.parent) != nullptr) return false;  // its parent is held: no waiting entry (none discarded)
             const PlaceVerdict v = tree.place(CarrierAnnounce{f.id, f.parent, 0, Hash32{}, 0}, {}).verdict;
             if (v != PlaceVerdict::Deferred && v != PlaceVerdict::Duplicate) return false;
             keys_[WaitKey{f.id, f.parent}].insert(f.digest);
