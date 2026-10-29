@@ -276,6 +276,9 @@
 //   relayjoint   the threaded join over TCP (the attempt on the join worker,
 //                applied on the owner); a RandomX failure in an attempt ends
 //                it alarmed, no token; the next attempt joins;
+//   relaypace    the join worker after a NotServed end (a short FC_HEADERS
+//                reply; threads, TCP, the relay's ticks): the next attempt no
+//                sooner than P-53;
 //   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
 //                its own with a rig set, a kind-2 file for epoch 1 accepted
 //                at fixed = start + GRACE, refused off regtest;
@@ -325,6 +328,9 @@
 //                tip whose server answers its catch-up from position 0 with no
 //                header: J at that tip (C connects later; C's reply held);
 //                a server that never answers: no pair, K_NCU ended;
+//   catchctx     a caught-up store above position 0 whose catch-up step
+//                stays deferred on a P_r no node serves past kCtxTtlMs: no
+//                join pair;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
@@ -7953,6 +7959,82 @@ void relayjoint() {
 }
 
 // ---------------------------------------------------------------------------
+// relaypace: the join worker's pacing after a NotServed end (threads, loopback TCP, the relay's own ticks; no
+// join_step call): a load-failed J (abandon_timeout_s 2) whose one server A answers each join page with one header
+// (A's FC_HEADERS frame holds one; J's request could take three) ends every attempt NotServed (a short FC_HEADERS
+// reply); the next attempt is never sooner than 2 s after the last one ended.
+void relaypace() {
+    const KatNet net;
+    std::uint64_t one = 0;  // an FC_HEADERS frame of one header
+    {
+        Harness h0(net);
+        const std::size_t n0 = h0.add(table0(net), true);
+        h0.tick_monero();
+        h0.mine(n0, 0, 900);
+        if (const pb::CarrierBodyV3* b = h0[n0].bodies().get(h0[n0].tree().best().id))
+            if (const auto f = pb::encode_fc_headers(pb::HeadersReply{0, 1, {pb::header_of(*b)}}, 1u << 22)) one = f->size();
+    }
+    Harness h(net);
+    h.tick_monero();
+    std::string why;
+    pb::CarrierLinks la, lj;
+    pb::PathbRelayOptions oa;
+    oa.listen = true;
+    oa.listen_host = "127.0.0.1";
+    pb::PathbRelayNode ra(oa, la);
+    pb::PathbNodeConfig ca = h.config(table0(net), true);
+    ca.headers_frame_bytes = one + (one - pb::kHeadersFrameHeadBytes) / 2;  // room for one header, not two
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(ca, ra.bind_io(h.io(0))));
+    ra.attach(*h.nodes[0]);
+    bool mined = one > pb::kHeadersFrameHeadBytes;
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(0, static_cast<std::size_t>(i), 900 + i);
+        mined = mined && jb && h[0].on_own_share(*jb, 900 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const bool sa = ra.start(why);
+    using Clk = std::chrono::steady_clock;
+    std::mutex lm;
+    std::vector<std::pair<Clk::time_point, std::string>> ends;
+    pb::PathbRelayOptions oj;
+    oj.peers = {{"127.0.0.1", la.listen_port()}};
+    oj.join_min_peers = 1;
+    pb::PathbRelayNode rj(oj, lj, pb::RelayClock::system(), [&](const std::string& line) {
+        if (line.rfind("relay: join attempt", 0) != 0) return;
+        std::lock_guard<std::mutex> lk(lm);
+        ends.emplace_back(Clk::now(), line);
+    });
+    pb::PathbNodeConfig cj = h.config(table0(net));
+    cj.abandon_timeout_s = 2;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cj, rj.bind_io(h.io(1)), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    rj.attach(*h.nodes[1]);
+    const bool sj = rj.start(why);
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    rj.stop();
+    ra.stop();
+    std::vector<std::pair<Clk::time_point, std::string>> e;
+    {
+        std::lock_guard<std::mutex> lk(lm);
+        e = ends;
+    }
+    std::size_t not_served = 0;
+    for (const auto& [t, line] : e)
+        if (line.find(": NotServed (") != std::string::npos && line.find("a short FC_HEADERS reply") != std::string::npos)
+            ++not_served;
+    double min_gap = 1e9;
+    for (std::size_t i = 1; i < e.size(); ++i)
+        min_gap = std::min(min_gap, std::chrono::duration<double>(e[i].first - e[i - 1].first).count());
+    std::printf("  relaypace: attempts %zu (NotServed, short reply %zu) in 9 s; the shortest gap %.2f s\n", e.size(),
+                not_served, e.size() > 1 ? min_gap : 0.0);
+    check(mined && sa && sj && e.size() >= 2 && not_served == e.size(),
+          "relaypace: setup (every attempt NotServed on a short FC_HEADERS reply; " + std::to_string(e.size()) +
+                  " attempts)" + (why.empty() ? "" : "; " + why));
+    check(e.size() <= 5 && min_gap >= 1.9,
+          "relaypace: after a NotServed end the next attempt comes no sooner than P-53 (2 s): " + std::to_string(e.size()) +
+                  " attempts in 9 s, the shortest gap " + std::to_string(min_gap) + " s");
+}
+
+// ---------------------------------------------------------------------------
 // ctxgate: a frame parked on a Monero input runs again only when that input is held, per (cause, id):
 //   storm   ten sibling carriers whose own P_r S the follower holds without its weights (a bodiless alternative):
 //           50 follower events run none of them again (one context asked for S); a DEFER waiting for the weights of
@@ -10405,9 +10487,10 @@ void catchtok() {
                     static_cast<int>(s1));
         check(br.ok && walked && s0 == pb::TemplateStatus::NoPathbPeer && (ban || edited >= 1),
               tag + "setup (J not caught up at A's tip; B's tip lighter and not held at J)");
-        check(kept && caught && (ban ? bans >= 1 : strikes >= 1) && s1 != pb::TemplateStatus::NoPathbPeer
+        check(kept && caught && (ban ? bans >= 1 : strikes >= 1 && bans == 0) && s1 != pb::TemplateStatus::NoPathbPeer
                       && s1 != pb::TemplateStatus::CatchingUp,
-              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept");
+              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept (strikes " +
+                      std::to_string(strikes) + ", bans " + std::to_string(bans) + ")");
     }
 }
 
@@ -10431,6 +10514,8 @@ struct HeavyResult {
     bool at_c = false;
     bool ncu_end = false;        // K_NCU set at the end
     std::uint64_t c_asks = 0;    // catch-up requests after B's attempt
+    std::size_t c_pairs = 0;     // the joiner's queue after C's empty reply from position 0 (before any attempt)
+    bool c_again = false;        // C's tip offered again by the same server: a second pair queued
     int restart_round = -1;      // silent: after a restart and C's HELLO, the first round open (1) or not (0)
     std::vector<std::string> caught;  // J's `relay: caught up (` lines over the run
     std::uint64_t b_pos = 0, b_t = 0;  // J's best position and the relay clock's unix ms at B's attempt
@@ -10551,6 +10636,10 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
         w.connect(0, jwire);
         w.run();
     }
+    if (mode != 2) {  // one pair per (tip, server): the same server's tip offered again queues none
+        out.c_pairs = h[j.node].joiner().queue().size();
+        out.c_again = h[j.node].offer_empty_store_tip(w.id(jwire, 0));
+    }
     const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
     ticks(static_cast<int>(mode == 2 ? 5 * p53 : 3 * p53));
     out.c_offers = rj.stats().empty_store_offers.load() - offers0;
@@ -10587,13 +10676,77 @@ void catchheavy() {
                       std::to_string(r.caught.size()) + ")");
         check(r.setup && r.b_completed, tag + "setup (J at D's 8, K_NCU; B's attempt completes, rule (4) keeps J's chain)");
         if (mode != 2)
-            check(r.c_offers >= 1 && r.at_c && !r.ncu_end,
-                  tag + "C's heavier unheld tip gets a join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+            check(r.c_offers == 1 && r.c_pairs == 1 && !r.c_again && r.at_c && !r.ncu_end,
+                  tag + "C's heavier unheld tip gets one join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+                          ", pairs " + std::to_string(r.c_pairs) + ", again " + std::to_string(r.c_again ? 1 : 0) +
                           ", J at " + std::to_string(r.j_pos) + ")");
         else
             check(r.c_offers == 0 && r.j_pos == 8 && !r.ncu_end && r.restart_round == 0,
                   tag + "no reply, no pair: J keeps its chain; K_NCU ended; a restart opens no first round");
     }
+}
+
+// ---------------------------------------------------------------------------
+// catchctx: a caught-up store above position 0 (launched; J at A's 4) whose catch-up step stays deferred on a P_r no
+// node serves (X, the P_r of A's carriers 5..7) past kCtxTtlMs: no join pair, J at 4 (the kCtxTtlMs offer reads K_NCU).
+void catchctx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), true, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview));
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 4600 + static_cast<std::uint32_t>(i));
+    }
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    ok = ok && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 4;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    h.tick_monero();
+    for (int i = 0; i < 3; ++i)
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 4700 + static_cast<std::uint32_t>(i));
+    const std::optional<pb::Hash32> c5 = h[a.node].store().best_at(5);
+    const pb::CarrierBodyV3* b5 = c5 ? h[a.node].bodies().get(*c5) : nullptr;
+    if (!ok || b5 == nullptr) {
+        check(false, "catchctx: setup (J at A's 4; A at 7)");
+        return;
+    }
+    hidden.insert(b5->own.blob.prev_id);
+    const std::uint64_t def0 = rj.stats().headers_ctx_deferred.load();
+    w.reconnect(0, 1);
+    w.run();
+    const bool deferred = rj.stats().headers_ctx_deferred.load() > def0;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+        (void)rj.join_step();
+        w.run();
+    }
+    const std::uint64_t offers = rj.stats().catchup_join_offers.load();
+    std::printf("  catchctx: J at %llu (A at %llu); deferred %d; caught up %d; kCtxTtlMs offers %llu; pairs %zu; attempts "
+                "%llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos,
+                deferred ? 1 : 0, h[j.node].caught_up() ? 1 : 0, (unsigned long long)offers,
+                h[j.node].joiner().queue().size(), (unsigned long long)rj.stats().join_attempts.load());
+    check(deferred && h[j.node].caught_up(), "catchctx: setup (J caught up; its catch-up step DEFERs on X)");
+    check(offers == 0 && h[j.node].joiner().queue().size() == 0 && rj.stats().join_attempts.load() == 0
+                  && h[j.node].tree().best().pos == 4,
+          "catchctx: a caught-up store's catch-up deferred past kCtxTtlMs queues no join pair (offers " +
+                  std::to_string(offers) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -12097,6 +12250,7 @@ int main(int argc, char** argv) {
     run("relayp40", relayp40);
     run("relayp50", relayp50);
     run("relayjoint", relayjoint);
+    run("relaypace", relaypace);
     run("regtestk30", regtestk30);
     run("prune_young", prune_young);
     run("prune_default", prune_default);
@@ -12141,6 +12295,7 @@ int main(int argc, char** argv) {
     run("revcatchundec", revcatchundec);
     run("catchtok", catchtok);
     run("catchheavy", catchheavy);
+    run("catchctx", catchctx);
     run("floorpr", floorpr);
     return finish("v37_xmr_pathb_node_kat");
 }
