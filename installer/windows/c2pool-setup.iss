@@ -66,12 +66,13 @@
 ; Every coin binary has its own argv parser (src/c2pool/main_<coin>.cpp).
 ; btc, dgb, bch and dash exit with "unknown argument" on a flag they do not
 ; know and bip110 silently ignores it, so one shared command line cannot
-; work. The shortcuts start the binary directly with WorkingDir={app}:
-; btc, dgb, bch and bip110 serve the dashboard from "web-static" relative to
-; the working directory (they have no --dashboard-dir flag). The shipped
-; start.bat is not used: it passes --config config\c2pool_mainnet.yaml, which
-; the package does not contain (only the .example) and which only the LTC
-; binary understands.
+; work. The main shortcuts start the binary directly with WorkingDir={app}
+; (no Python needed): btc, dgb, bch and bip110 serve the dashboard from
+; "web-static" relative to the working directory (they have no
+; --dashboard-dir flag). The "(start.bat)" shortcut runs the shipped launcher,
+; which uses the same command lines and also starts the block explorer where
+; the coin serves the explorer API. Keep these in sync with start.bat and
+; start.sh.
 ;
 ; Ports: sharechain P2P, Stratum, dashboard (8080 everywhere) and the coin
 ; P2P port, from src/impl/<coin>/config_pool.hpp and params.hpp. Stratum and
@@ -201,13 +202,9 @@ Source: "{#PACKAGE_DIR}\transition_messages\*"; DestDir: "{app}\transition_messa
 Source: "{#VCREDIST_PATH}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flags: deleteafterinstall
 #endif
 
-[InstallDelete]
-; Older installers added a start.bat shortcut; start.bat does not start any
-; coin from the shipped package, so remove it on upgrade.
-Type: files; Name: "{group}\{#MyAppName} (start.bat).lnk"
-
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#LaunchParams}"; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName} (start.bat)"; Filename: "{app}\start.bat"; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "{#LaunchParams}"; WorkingDir: "{app}"
 
