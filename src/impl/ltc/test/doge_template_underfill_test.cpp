@@ -69,7 +69,7 @@ struct Fixture {
         s.strict = 1;
         s.synced = 1;
         EXPECT_TRUE(t.cache->set_sync_state(s));
-        EXPECT_TRUE(t.cache->complete(TIP));
+        EXPECT_TRUE(t.cache->complete(TIP, tip.hash()));
 
         pool.set_utxo(t.cache.get());
         pool.set_tip_height(TIP);

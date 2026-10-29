@@ -43,7 +43,7 @@ void complete_set(TempDb& t, const DogeTip& tip, const core::coin::UTXOViewDB::C
     s.strict = 1;
     s.synced = 1;
     ASSERT_TRUE(t.cache->set_sync_state(s));
-    ASSERT_TRUE(t.cache->complete(tip.height()));
+    ASSERT_TRUE(t.cache->complete(tip.height(), tip.hash()));
 }
 
 } // namespace

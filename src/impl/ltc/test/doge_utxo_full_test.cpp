@@ -133,7 +133,7 @@ TEST(DogeUtxoFull, DeepInputConsolidationIsPricedAndSelected)
     EXPECT_EQ(ss.anchor_height, 0u);
     EXPECT_EQ(ss.strict, 1);
     EXPECT_EQ(ss.synced, 1);
-    EXPECT_TRUE(l.t.cache->complete(N));
+    EXPECT_TRUE(l.t.cache->complete(N, hash_of(chain[N - 1])));
     for (uint32_t c = 0; c < COINS; ++c)
         ASSERT_TRUE(l.t.cache->have_coin(coins[c])) << "coin " << c << " (created at height "
                                                     << FIRST + c % (LAST - FIRST + 1) << ") not in the set";
@@ -205,7 +205,7 @@ TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
         lane.on_block(chain[BEST - 1], hash_of(chain[BEST - 1]), BEST);
         serve(lane, net, chain);
         ASSERT_EQ(t.cache->get_best_height(), BEST);
-        ASSERT_TRUE(t.cache->complete(BEST));
+        ASSERT_TRUE(t.cache->complete(BEST, hash_of(chain[BEST - 1])));
         ASSERT_TRUE(t.cache->have_coin(Outpoint(txid_of(a_tx), 0)));
     }
 
@@ -224,7 +224,7 @@ TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
     EXPECT_FALSE(t.cache->have_coin(Outpoint(txid_of(a_tx), 0))) << "A was spent at 13";
     EXPECT_TRUE(t.cache->have_coin(Outpoint(txid_of(b_tx), 0))) << "B was created at 12";
     EXPECT_EQ(t.cache->anchor_height(), 0u);
-    EXPECT_TRUE(t.cache->complete(TIP_H));
+    EXPECT_TRUE(t.cache->complete(TIP_H, hash_of(chain[TIP_H - 1])));
 }
 
 // KAT 3. A DB at best 1,000 holding coins from 900 only. The old gate read
@@ -296,7 +296,7 @@ TEST(DogeUtxoFull, StrictConnectRefusesUnknownInput)
     l.net.best[0] = g;
     l.lane.on_block(chain[4], hash_of(chain[4]), 5);
     serve(l.lane, l.net, chain);
-    ASSERT_TRUE(l.t.cache->complete(5));
+    ASSERT_TRUE(l.t.cache->complete(5, hash_of(chain[4])));
 
     uint256 nowhere;
     nowhere.SetHex("ee000000000000000000000000000000000000000000000000000000000000ee");
@@ -460,4 +460,38 @@ TEST(DogeUtxoFull, DigestPinsTheSet)
     EXPECT_EQ(da.coins, 7u);
     EXPECT_EQ(da.best_height, 7u);
     EXPECT_EQ(da.sync.anchor_height, 0u);
+}
+
+// ── VERIFY S1: complete() is the tip's block, not only its height ─────────
+
+// The set at the tip's height but on a sibling (the tip changed to B, the
+// set still holds A): the template prices against A's coins, and a child of
+// a tx only A confirmed is invalid on B. It must be coinbase-only.
+TEST(DogeUtxoFull, SiblingAtTheTipHeightDoesNotPrice)
+{
+    constexpr uint32_t TIP = 5'000'001;
+    TempDb t;
+    const DogeTip tip(DogeTip::header_at(TIP), TIP);   // the tip: B
+    const Outpoint x(genesis(0x61), 0);
+    uint256 sibling_a;
+    sibling_a.SetHex("00000000000000000000000000000000000000000000000000000000000a5151");
+    ASSERT_TRUE(t.db->write_batch({{x, coin_of(600000000, TIP - 100, false)}}, sibling_a, TIP));
+    core::coin::SyncState s;
+    s.anchor_height = 0;
+    s.strict = 1;
+    s.synced = 1;
+    ASSERT_TRUE(t.cache->set_sync_state(s));
+    Mempool pool(core::coin::DOGE_LIMITS);
+    pool.set_utxo(t.cache.get());
+    pool.set_tip_height(TIP);
+    EXPECT_FALSE(pool.admit(spend(x.txid, 0, 500000000, 0x61), t.cache.get()).has_value());
+    tip.clean(pool);
+    EXPECT_FALSE(t.cache->complete(TIP, tip.hash())) << "a sibling at the tip's height";
+    auto d = tip.build(pool);
+    EXPECT_TRUE(d["transactions"].empty()) << "priced against the sibling's set";
+    EXPECT_EQ(d.value("degraded", std::string()), doge::coin::kUtxoIncomplete);
+    // The set on the tip itself: priced.
+    ASSERT_TRUE(t.db->write_batch({}, tip.hash(), TIP));
+    d = tip.build(pool);
+    EXPECT_EQ(d["transactions"].size(), 1u);
 }

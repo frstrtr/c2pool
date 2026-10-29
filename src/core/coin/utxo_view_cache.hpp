@@ -386,13 +386,16 @@ public:
     /// legacy accrual view that never recorded one).
     uint32_t anchor_height() const { return sync_state().anchor_height; }
 
-    /// The set holds every coin of the best chain up to `chain_height`: it was
-    /// built from genesis and its best block is at that height.
-    bool complete(uint32_t chain_height) const {
+    /// The set holds every coin of the best chain up to its tip: it was
+    /// built from genesis and its best block IS the tip (`chain_hash` at
+    /// `chain_height`), not only at the tip's height (a sibling of the tip
+    /// is not the tip's set).
+    bool complete(uint32_t chain_height, const uint256& chain_hash) const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
-        if (!m_base)
+        if (!m_base || chain_hash.IsNull())
             return false;
-        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height;
+        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height
+            && m_base->get_best_block() == chain_hash;
     }
 
     /// Re-anchor the view: drop all in-memory pending changes AND wipe the

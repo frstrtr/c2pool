@@ -51,19 +51,21 @@ using ltc::coin::TX_WITH_WITNESS;
 /// against cannot show every input unspent (core::coin::kTemplateDegradedKey).
 inline constexpr const char* kUtxoIncomplete = "utxo-incomplete";
 
-/// Can the pool's view price a DOGE template on `tip_height`?
+/// Can the pool's view price a DOGE template on the tip `tip_hash` at
+/// `tip_height`?
 ///   - no view: no;
 ///   - a set with a sync state (the full set): only when complete(), i.e.
-///     built from genesis and at the tip;
+///     built from genesis and its best block is the tip (a sibling at the
+///     tip's height is not);
 ///   - a legacy accrual view (no sync state): yes, as before (the dual-DB
 ///     transition prices against it until the full set completes).
-inline bool utxo_view_prices(const core::coin::UTXOViewCache* view, uint32_t tip_height)
+inline bool utxo_view_prices(const core::coin::UTXOViewCache* view, uint32_t tip_height, const uint256& tip_hash)
 {
     if (!view)
         return false;
     if (!view->sync_state().tracked())
         return true;
-    return view->complete(tip_height);
+    return view->complete(tip_height, tip_hash);
 }
 
 /// The DOGE mining gate (EmbeddedCoinNode::is_synced), on the set the pool
@@ -208,7 +210,7 @@ public:
         // tip, the tip's body still in flight), and there must be a view at
         // all. Otherwise coinbase-only, marked degraded, fetched again by the
         // merged-mining poll until it prices.
-        const bool view_prices = pool.size() == 0 || utxo_view_prices(pool.utxo(), tip.height);
+        const bool view_prices = pool.size() == 0 || utxo_view_prices(pool.utxo(), tip.height, tip.block_hash);
         const char* degraded = !pool_cleaned ? "mempool-not-cleaned-for-tip"
                              : !view_prices ? kUtxoIncomplete
                              : nullptr;

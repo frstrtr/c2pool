@@ -7488,7 +7488,8 @@ int main(int argc, char* argv[]) {
                                                 d["mode"] = "full";
                                                 d["anchor_height"] = ss.tracked() ? nlohmann::json(ss.anchor_height)
                                                                                   : nlohmann::json(nullptr);
-                                                d["complete"] = full_utxo->complete(tip);
+                                                const auto tip_entry = dc->tip();
+                                                d["complete"] = full_utxo->complete(tip, tip_entry ? tip_entry->block_hash : uint256());
                                                 d["synced"] = ss.synced != 0;
                                                 d["coins"] = ss.coins;
                                                 d["stuck"] = f->stuck();

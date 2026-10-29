@@ -530,7 +530,10 @@ private:
     /// and tell the host (once per run).
     void maybe_complete()
     {
-        if (m_mode != Mode::Full || m_completed || !m_utxo.complete(m_host.chain_height()))
+        if (m_mode != Mode::Full || m_completed)
+            return;
+        const uint32_t tip = m_host.chain_height();
+        if (!m_utxo.complete(tip, m_host.chain_hash_at(tip)))
             return;
         m_completed = true;
         m_stats.complete.store(1, std::memory_order_relaxed);
