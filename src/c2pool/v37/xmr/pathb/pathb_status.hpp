@@ -14,6 +14,8 @@
 //                            template path's daemon pumps, the failures
 //   rpc_on_find_path=        template pumps + pool transport; off-path parity
 // An absent pool transport reports 0 for its counters.
+// serve_pathb's status block also prints
+//   time: t=                 the wall time at the block's print, unix ms
 //
 // Header-only.
 // ---------------------------------------------------------------------------
@@ -123,6 +125,11 @@ inline std::string find_path_line(const KeptStatusValues& v) {
                               "(template %llu + pool-transport %llu) | off-path parity=%llu",
                               v.arm_order.c_str(), u(v.template_daemon_pumps + v.pool_transport_rpc),
                               u(v.template_daemon_pumps), u(v.pool_transport_rpc), u(v.node_rpc));
+}
+
+// serve_pathb's status block: the line after `status: up=`.
+inline std::string status_time_line(std::uint64_t unix_ms) {
+    return status_detail::fmt("  time: t=%llu", status_detail::u(unix_ms));
 }
 
 // The four lines in the order master prints them.
