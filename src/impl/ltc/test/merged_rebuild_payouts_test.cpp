@@ -16,7 +16,10 @@
 //     does not freeze its block under the new template;
 //   - MergedPayoutSource: the payouts are produced while the tracker lock is
 //     busy (a short wait on the RPC thread, or the result already computed
-//     for the same best share, chain and value).
+//     for the same best share, chain and value);
+//   - a retry that leaves the work as it was does not push it to the miners
+//     again; a kept block ages from when it was last kept; a find from an
+//     older job is submitted only if it meets the bits of its own block.
 // Folded into the allowlisted share_test target (no new executable: #769).
 // ---------------------------------------------------------------------------
 
@@ -50,6 +53,8 @@ struct EmbeddedLike : c2pool::merged::IAuxChainBackend {
     std::string tip_id = std::string(62, '0') + "a1";   // what get_best_block_hash reports
     std::string parent = std::string(62, '0') + "a1";   // the template's previousblockhash
     int curtime = 1793210000;
+    std::string bits = "1a01d2c3";
+    std::string target_hex = std::string(8, '0') + std::string(56, 'f');
     int submits = 0;
     std::function<void()> on_fetch;
     EmbeddedLike()
@@ -67,10 +72,10 @@ struct EmbeddedLike : c2pool::merged::IAuxChainBackend {
         w.height = 5'000'001;
         w.coinbase_value = 1000000000000ULL;
         w.block_hash.SetHex(parent);   // embedded: tip->block_hash
-        w.target.SetHex(std::string(8, '0') + std::string(56, 'f'));
+        w.target.SetHex(target_hex);
         w.prev_block_hash = parent;
         w.block_template = {
-            {"previousblockhash", parent}, {"height", 5'000'001}, {"bits", "1a01d2c3"},
+            {"previousblockhash", parent}, {"height", 5'000'001}, {"bits", bits},
             {"curtime", curtime}, {"version", 0x620004}, {"coinbasevalue", 1000000000000LL},
             {"transactions", nlohmann::json::array()},
         };
@@ -90,10 +95,10 @@ struct EmbeddedLike : c2pool::merged::IAuxChainBackend {
     const c2pool::merged::AuxChainConfig& config() const override { return cfg; }
 };
 
-Payouts one_payee(uint64_t value)
+Payouts one_payee(uint64_t value, unsigned char who = 0x5c)
 {
     std::vector<unsigned char> s{0x76, 0xa9, 0x14};
-    s.insert(s.end(), 20, 0x5c);
+    s.insert(s.end(), 20, who);
     s.push_back(0x88);
     s.push_back(0xac);
     return {{s, value}};
@@ -111,16 +116,21 @@ uint256 committed_root(MergedMiningManager& mm)
     return r;
 }
 
-/// A share whose LTC coinbase carries the current commitment meets the DOGE
-/// target: try_submit_merged_blocks.
-void submit_current_job(MergedMiningManager& mm)
+/// A share whose LTC coinbase carries commitment `c` and whose parent PoW is
+/// `pow`: try_submit_merged_blocks.
+void submit_job(MergedMiningManager& mm, const std::vector<uint8_t>& c, const std::string& pow = "01")
 {
-    const auto c = mm.get_auxpow_commitment();
     const std::string cb = std::string(20, 'a') + HexStr(std::span<const unsigned char>(c.data(), c.size()))
                          + std::string(20, 'b');
     uint256 parent_hash;
-    parent_hash.SetHex("01");
+    parent_hash.SetHex(pow);
     mm.try_submit_merged_blocks(std::string(160, 'd'), cb, {}, 0, parent_hash);
+}
+
+/// A share on the current job (its coinbase carries the current commitment).
+void submit_current_job(MergedMiningManager& mm)
+{
+    submit_job(mm, mm.get_auxpow_commitment());
 }
 
 struct Rig {
@@ -128,6 +138,9 @@ struct Rig {
     MergedMiningManager mm{ioc};
     EmbeddedLike* b{nullptr};
     bool payouts{true};
+    unsigned char payee{0x5c};
+    int64_t clock{1000};
+    int work_pushes{0};
     Rig()
     {
         auto backend = std::make_unique<EmbeddedLike>();
@@ -138,8 +151,17 @@ struct Rig {
                 MergedMiningManager::note_payout_miss("tracker_busy");
                 return {};
             }
-            return one_payee(value);
+            return one_payee(value, payee);
         });
+        mm.set_clock_for_test([this] { return clock; });
+        mm.set_on_work_changed([this] { ++work_pushes; });
+    }
+    /// Work pushes to the miners so far (the manager posts them to the io_context).
+    int pushes()
+    {
+        ioc.restart();
+        ioc.poll();
+        return work_pushes;
     }
 };
 
@@ -218,6 +240,91 @@ TEST(MergedMining, StaleRebuildResultIsNotFrozenUnderANewTemplate)
     submit_current_job(r.mm);
     EXPECT_EQ(r.b->submits, 1) << "the committed block rebuilds from its snapshot";
     EXPECT_GE(r.mm.get_rebuild_stats_json()["stale_results"].get<uint64_t>(), 1u);
+}
+
+// A chain without payouts is fetched again on every poll (block hash null)
+// and dropped again: the miners' work does not change, so it is not pushed
+// again (the canary pushed the same work every second of an episode).
+TEST(MergedMining, RetriesWithoutPayoutsDoNotPushTheSameWork)
+{
+    Rig r;
+    r.mm.refresh_aux_work();
+    EXPECT_EQ(r.pushes(), 1) << "a block built: pushed";
+
+    r.payouts = false;
+    r.b->tip_id = std::string(62, '0') + "a3";
+    r.b->parent = r.b->tip_id;
+    r.mm.refresh_aux_work();
+    EXPECT_EQ(r.pushes(), 2) << "the commitment dropped: pushed";
+    for (int i = 0; i < 30; ++i)
+        r.mm.refresh_aux_work();
+    EXPECT_EQ(r.pushes(), 2) << "retries without payouts pushed the same work again";
+    const auto j = r.mm.get_rebuild_stats_json();
+    EXPECT_EQ(j["work_unchanged"], 30u);
+    EXPECT_EQ(j["no_payouts"]["tracker_busy"], 31u) << "every poll still retried the rebuild";
+
+    r.payouts = true;
+    r.mm.refresh_aux_work();
+    EXPECT_EQ(r.pushes(), 3) << "payouts back: the new block is pushed";
+    EXPECT_FALSE(r.mm.get_auxpow_commitment().empty());
+}
+
+// The last block on the parent is kept while the payouts are unavailable and
+// the miners keep committing to it. When a newer block on the same parent is
+// frozen later, snapshots older than FROZEN_EXPIRY_SEC are pruned: the kept
+// one must count its age from when it was last kept, or a find on a job still
+// carrying it is skipped ("No matching snapshot").
+TEST(MergedMining, KeptBlockDoesNotExpireUnderItsJobs)
+{
+    Rig r;
+    r.mm.refresh_aux_work();   // block A, frozen at t=1000
+    const uint256 a = r.mm.get_current_work().at(98).block_hash;
+
+    r.payouts = false;
+    r.clock = 1290;
+    r.b->tip_id = std::string(62, '0') + "a2";   // fetched again, same parent
+    r.b->curtime += 7;
+    r.mm.refresh_aux_work();
+    ASSERT_EQ(committed_root(r.mm), a) << "kept";
+    const auto job_a = r.mm.get_auxpow_commitment();   // a job issued now
+
+    r.clock = 1490;                                     // 490 s after A was frozen
+    r.payouts = true;
+    r.payee = 0x5d;                                     // new PPLNS split
+    r.mm.mark_pplns_dirty();
+    r.mm.refresh_aux_work();                            // block B frozen, prune runs
+    ASSERT_NE(committed_root(r.mm), a);
+
+    submit_job(r.mm, job_a);
+    EXPECT_EQ(r.b->submits, 1) << "the kept block's snapshot expired under its jobs";
+}
+
+// A share from an older job whose block is on another parent, with harder
+// bits than the current work: its PoW meets the current target but not the
+// bits the block is built with. It must not be submitted (nor relayed).
+TEST(MergedMining, OldJobMustMeetItsSnapshotsBits)
+{
+    Rig r;
+    r.b->bits = "1a01d2c3";                                    // target ~2^201
+    r.b->target_hex = std::string(12, '0') + "01d2c3" + std::string(46, '0');
+    r.mm.refresh_aux_work();                                   // block A on parent a1
+    const auto job_a = r.mm.get_auxpow_commitment();
+
+    r.b->tip_id = std::string(62, '0') + "b2";                 // DOGE moves on, easier bits
+    r.b->parent = r.b->tip_id;
+    r.b->bits = "1d00ffff";                                    // target ~2^224
+    r.b->target_hex = std::string(8, '0') + "ffff" + std::string(52, '0');
+    r.mm.refresh_aux_work();                                   // block B on parent b2
+    const auto job_b = r.mm.get_auxpow_commitment();
+    ASSERT_NE(job_a, job_b);
+
+    const std::string pow = std::string(11, '0') + "4" + std::string(52, '0');   // 2^210
+    submit_job(r.mm, job_a, pow);
+    EXPECT_EQ(r.b->submits, 0) << "a PoW-invalid block was submitted";
+    EXPECT_EQ(r.mm.get_rebuild_stats_json()["snapshot_target_refusals"], 1u);
+
+    submit_job(r.mm, job_b, pow);                              // control: B's bits are met
+    EXPECT_EQ(r.b->submits, 1);
 }
 
 // ── MergedPayoutSource ──────────────────────────────────────────────────────

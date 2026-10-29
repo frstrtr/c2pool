@@ -234,7 +234,9 @@ public:
     // merkle + header + freeze + commitment).  Called from refresh_work()
     // when PPLNS changed so the commitment is fresh before notify_all().
     // Runs the expensive payout_fn outside m_mutex to avoid deadlock.
-    void rebuild_cached_blocks();
+    // Returns true when the commitment or the header infos changed (what
+    // the miners' work carries), false when the rebuild left them as they were.
+    bool rebuild_cached_blocks();
 
     // Check if any aux chains are configured
     bool has_chains() const { return !m_chains.empty(); }
@@ -334,8 +336,15 @@ public:
     static bool on_rpc_thread();
 
     /// {"no_payouts": {reason: rebuilds}, "kept_last_block": n,
-    ///  "dropped_commitment": n, "stale_results": n}.
+    ///  "dropped_commitment": n, "stale_results": n, "work_changed": n,
+    ///  "work_unchanged": n, "snapshot_target_refusals": n,
+    ///  "no_payout_seconds": s, "no_payout_now": [symbols]}.
     nlohmann::json get_rebuild_stats_json() const;
+
+    /// Steady-clock seconds the manager stamps snapshots and episodes with
+    /// (a test drives its own clock).
+    using ClockFn = std::function<int64_t()>;
+    void set_clock_for_test(ClockFn fn);
 
 private:
     void poll_loop();
@@ -387,6 +396,7 @@ private:
         bool                                 no_payout_episode{false};
         int64_t                              no_payout_since{0};      // steady seconds
         uint64_t                             no_payout_rebuilds{0};
+        int64_t                              no_payout_seconds{0};    // closed episodes
         AuxChainConfig                       config;
         std::unique_ptr<IAuxChainBackend>    rpc;       // primary backend (RPC or embedded)
         std::unique_ptr<IAuxChainBackend>    fallback;  // fallback backend (embedded if primary is RPC)
@@ -448,6 +458,16 @@ private:
     uint64_t m_rebuild_kept_last_block{0};
     uint64_t m_rebuild_dropped_commitment{0};
     uint64_t m_rebuild_stale_results{0};
+    // Rebuilds whose result reached the miners (work pushed) or did not
+    // change what they commit to (no push).
+    uint64_t m_rebuild_work_changed{0};
+    uint64_t m_rebuild_work_unchanged{0};
+    // Finds refused at submit: the parent PoW meets the current target but
+    // not the bits of the snapshot the block is built from.
+    uint64_t m_snapshot_target_refusals{0};
+
+    ClockFn m_clock;
+    int64_t now_sec() const;
 
     // THE state root provider for sharechain anchoring
     StateRootProvider m_state_root_provider;
