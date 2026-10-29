@@ -105,23 +105,68 @@
 ///        penalties (design doc §4.5).
 ///   v2 — MnStateDb store schema (mn_state_db.hpp kFormatVersion = 2):
 ///        projection persistence, same field gaps.
-///   v3 — THIS: the full `CDeterministicMNList`-equivalent state. Binary,
+///   v3 — the full `CDeterministicMNList`-equivalent state. Binary,
 ///        magic + version header (an old binary fails LOUD on either),
 ///        SHA256d digest trailer over the payload (truncation / corruption
 ///        fails loud), resume cursor (height + block hash +
 ///        totalRegisteredCount) included.
+///   v4 — THIS: v3 plus the PoSe-penalty UPPER bound per entry
+///        (ReplayMNState::nPoSePenaltyHi — see "PoSe PENALTY CERTAINTY
+///        BOUNDS" below). Written by every save; a v3 snapshot still LOADS,
+///        with the upper bound widened to the seed ceiling (a v3 file carries
+///        no bound, so "unknown, at most the ceiling" is the only honest
+///        reading).
 ///
 /// Layout (PackStream, all integers LE):
-///   bytes[24]  magic  "C2POOL-DASH-DML-SNAP/v03"
-///   u32        version                  == 3
+///   bytes[24]  magic  "C2POOL-DASH-DML-SNAP/v04"   (v3: ".../v03")
+///   u32        version                  == 4       (v3: 3)
 ///   string     network                  ("mainnet" / "testnet" / ...)
 ///   u32        height                   fold cursor: state is AT this height
 ///   uint256    block_hash               chain block hash at `height`
 ///   u64        total_registered_count   internalId source for the next AddMN
 ///   u64        count
-///   count ×    { uint256 proTxHash, ReplayMNState }
+///   count ×    { uint256 proTxHash, ReplayMNState, i32 nPoSePenaltyHi }
+///                                       (v3: no trailing i32)
 ///   uint256    sha256d over every preceding byte
 ///
+/// ─────────────────────────────────────────────────────────────────────────
+/// PoSe PENALTY CERTAINTY BOUNDS (the penalty oracle, design PR-B §4.2)
+/// ─────────────────────────────────────────────────────────────────────────
+/// nPoSePenalty is on NO wire c2pool speaks: SML / mnlistdiff / qrinfo carry
+/// isValid only. A list seeded from an anchor SML therefore does not know the
+/// penalties it starts with, and every later punish/decay inherits that
+/// ignorance. The engine carries the penalty as an interval:
+///
+///   nPoSePenalty    (lo) — the MODEL. The ban decision is taken on lo
+///                          exactly as before: lo is a lower bound of dashd's
+///                          value, so lo >= max  =>  dashd banned too (a false
+///                          ban is impossible); a ban dashd applies while
+///                          lo < max is a MISSED ban, which flips isValid in
+///                          the committed root and poisons the fold at that
+///                          block — the per-block self-check, unchanged.
+///   nPoSePenaltyHi  (hi) — an UPPER bound of dashd's value. Moves with lo
+///                          under every rule (decay, punish + clamp, revive,
+///                          registration) so lo <= dashd <= hi is invariant.
+///                          lo == hi  =>  exact.
+///
+/// Seeds that carry dashd's penalties (a `protx list` prestate, a v4
+/// snapshot) start exact. Seeds that do not (the DIP-4 anchor SML) start at
+/// lo = 0, hi = kSeedPenaltyCeilingFactor * CalcMaxPoSePenalty() at the seed:
+/// PoSePunish clamps the penalty to CalcMaxPoSePenalty() of the list at
+/// punish time (deterministicmns.cpp:315-317), decay only lowers it
+/// (:353-359), so dashd's value never exceeds the masternode count at the
+/// last punish; a positive residue at the seed means that punish was at most
+/// ~count blocks (~5 days) earlier, a span over which the count moves by well
+/// under 1% per day. Twice the count at the seed therefore bounds it with a
+/// wide margin (operator decision Q3, design §5). The bound converges: hi
+/// decays every block, and once lo reaches 0 the gap closes one unit per
+/// block, so an MN never punished after the seed is exact within one ceiling
+/// span of blocks.
+///
+/// NOT in operator== (that compares dashd state; hi is c2pool model metadata)
+/// and NOT in ReplayMNState's serializer (the MN diff store's row format
+/// stays byte-unchanged; its snapshots carry hi via this container, and its
+/// diff-replayed lists widen hi back to the ceiling — mn_diff_store.hpp).
 /// Trust posture: a v3 snapshot is the SAME trust class as the v1 checkpoint
 /// (assumevalid-for-MN-state) but far better checked — the per-block root
 /// self-check validates its SML-committed fields against consensus at
@@ -129,6 +174,7 @@
 /// (genesis replay, W2/W4/W5) retires the anchor entirely.
 
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/pose_penalty.hpp>
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/crypto/hash_x11.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
@@ -139,6 +185,7 @@
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
+#include <core/durable_file.hpp>   // rename_over: replaces the target on Windows too
 #include <core/hash.hpp>
 #include <core/log.hpp>
 #include <core/opscript.hpp>
@@ -150,12 +197,14 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -200,6 +249,11 @@ struct ReplayMNState
     int32_t                                      nLastPaidHeight{0};
     int32_t                                      nConsecutivePayments{0};
     int32_t                                      nPoSePenalty{0};
+    // c2pool model metadata, NOT a dashd field: the UPPER certainty bound on
+    // dashd's nPoSePenalty (nPoSePenalty is the lower bound). See "PoSe
+    // PENALTY CERTAINTY BOUNDS" in the file header. Default 0 is exact for a
+    // freshly registered MN (dmnstate.h: a new state starts at 0).
+    int32_t                                      nPoSePenaltyHi{0};
     int32_t                                      nPoSeRevivedHeight{NEVER};
     int32_t                                      nPoSeBanHeight{NEVER};
     uint16_t                                     nRevocationReason{vendor::CProUpRevTx::REASON_NOT_SPECIFIED};
@@ -236,13 +290,18 @@ struct ReplayMNState
         if (!IsBanned()) nPoSeBanHeight = height;
     }
 
-    /// dashd dmnstate.h:135-140 — the h=2516756 transition.
+    /// dashd dmnstate.h:135-140 — the h=2516756 transition. The penalty is
+    /// SET to 0, so both certainty bounds become exact.
     void Revive(int32_t height)
     {
         nPoSePenalty       = 0;
+        nPoSePenaltyHi     = 0;
         nPoSeBanHeight     = NEVER;
         nPoSeRevivedHeight = height;
     }
+
+    /// Both penalty bounds agree — dashd's nPoSePenalty is known exactly.
+    bool pose_penalty_exact() const { return nPoSePenalty == nPoSePenaltyHi; }
 
     /// dashd dmnstate.h:112-120. Note nVersion drops to LegacyBLS and
     /// netInfo empties — the caller (ProUpRegTx key-change branch) then
@@ -311,6 +370,9 @@ struct ReplayMNState
     // but versioned + digest-pinned at the container level so a field change
     // here MUST bump kSnapshotVersion (an old binary then fails loud instead
     // of skipping entries one by one — the MnStateDb v1→v2 lesson).
+    // nPoSePenaltyHi is deliberately NOT here: this codec is also the MN diff
+    // store's row format (mn_diff_store.hpp `added` entries), which must not
+    // change; the v4 snapshot container writes hi beside each entry instead.
     C2POOL_SERIALIZE_METHODS(ReplayMNState)
     {
         READWRITE(obj.nType,
@@ -338,6 +400,10 @@ struct ReplayMNState
                   obj.platformHTTPPort);
     }
 
+    /// dashd-state equality. nPoSePenaltyHi is excluded on purpose (model
+    /// metadata, not CDeterministicMNState) — the MN diff store's newest-pair
+    /// verify compares a snapshot against a diff-replayed list whose rows do
+    /// not carry it.
     bool operator==(const ReplayMNState& r) const
     {
         return nType == r.nType
@@ -431,6 +497,10 @@ struct FoldResult
     size_t      confirmed{0};           // confirmedHash set this block
     size_t      collateral_replaced{0}; // ProRegTx re-using a tracked collateral
     size_t      collateral_spent{0};    // MNs removed by the vin scan
+    // PoSe certainty (only non-zero after an Unknown-penalty seed):
+    size_t      root_resolved_bans{0};  // ambiguous punishes the committed
+                                        // root PROVED were bans
+    size_t      root_resolved_nobans{0};// ambiguous punishes it proved were not
     // The pass-0 projected payee (present whenever the pre-block list was
     // non-empty) and whether it was still present to be marked paid.
     std::optional<uint256> payee;
@@ -450,6 +520,35 @@ struct FoldResult
     bool        payee_check_preenforcement_skipped{false};
 };
 
+/// How a seed's nPoSePenalty values are to be read (see "PoSe PENALTY
+/// CERTAINTY BOUNDS" in the file header).
+///   Exact   — the source carries dashd's own penalties (a `protx list`
+///             prestate): hi = lo.
+///   Unknown — the source does not (a DIP-4 SML anchor, a getmnlistdiff
+///             seed): hi = max(lo, seed ceiling). The safe default.
+enum class SeedPenalties : uint8_t { Unknown, Exact };
+
+/// One MN's PoSe penalty as the engine can prove it: lo <= dashd <= hi.
+/// lo == hi => exact. `banned` is the engine's IsBanned(), which the per-block
+/// merkleRootMNList self-check holds equal to dashd's isValid at every folded
+/// block.
+struct PoSeBounds
+{
+    int32_t lo{0};
+    int32_t hi{0};
+    bool    banned{false};
+};
+
+/// Whole-list certainty census (diagnostics + the live-proof log line).
+struct PoSeExactness
+{
+    size_t  valid_exact{0};     // not banned, lo == hi
+    size_t  valid_inexact{0};   // not banned, lo <  hi
+    size_t  valid_nonzero{0};   // not banned, lo > 0 (a live penalty)
+    size_t  banned{0};
+    int32_t max_gap{0};         // max(hi - lo) over non-banned entries
+};
+
 class DmlFoldEngine
 {
 public:
@@ -464,9 +563,18 @@ public:
     using MembersFn = std::function<std::optional<std::vector<uint256>>(
         uint8_t llmqType, const uint256& quorumHash)>;
 
-    static constexpr uint32_t    kSnapshotVersion = 3;
-    static constexpr const char* kSnapshotMagic   = "C2POOL-DASH-DML-SNAP/v03";
+    static constexpr uint32_t    kSnapshotVersion = 4;
+    static constexpr const char* kSnapshotMagic   = "C2POOL-DASH-DML-SNAP/v04";
     static constexpr size_t      kSnapshotMagicLen = 24;
+    // The previous format, still LOADED (never written): no upper bound per
+    // entry, so it loads with hi widened to the seed ceiling.
+    static constexpr uint32_t    kSnapshotVersionV3 = 3;
+    static constexpr const char* kSnapshotMagicV3   = "C2POOL-DASH-DML-SNAP/v03";
+
+    /// The seed ceiling for an UNKNOWN penalty: this factor times
+    /// CalcMaxPoSePenalty() of the seeded list. Argument in the file header
+    /// ("PoSe PENALTY CERTAINTY BOUNDS"); operator decision Q3.
+    static constexpr int32_t kSeedPenaltyCeilingFactor = 2;
 
     explicit DmlFoldEngine(FoldConfig cfg) : m_cfg(std::move(cfg)) {}
 
@@ -475,17 +583,31 @@ public:
     /// Seed the engine from an anchor (Phase-1 trusted-anchor replay). The
     /// state is declared to be the DML AT `height` (i.e. AFTER folding block
     /// `height`); the only block fold_block accepts next is height+1.
+    ///
+    /// `penalties` says whether the entries' nPoSePenalty values are dashd's
+    /// own (Exact: the upper bound is set equal) or placeholders (Unknown, the
+    /// default: the upper bound is widened to the seed ceiling). The caller's
+    /// nPoSePenaltyHi values are ignored either way.
     void seed(std::vector<std::pair<uint256, ReplayMNState>> entries,
               uint64_t total_registered_count,
               uint32_t height,
               const uint256& block_hash,
-              std::string network = "mainnet")
+              std::string network = "mainnet",
+              SeedPenalties penalties = SeedPenalties::Unknown)
     {
         m_entries.clear();
         m_collateral_index.clear();
         for (auto& [protx, st] : entries) {
             m_collateral_index[st.collateralOutpoint] = protx;
             m_entries.emplace(protx, std::move(st));
+        }
+        // CalcMaxPoSePenalty reads the list size, so the ceiling is taken
+        // over the seeded list, after it is installed.
+        const int32_t ceiling = seed_penalty_ceiling();
+        for (auto& [protx, st] : m_entries) {
+            st.nPoSePenaltyHi = penalties == SeedPenalties::Exact
+                ? st.nPoSePenalty
+                : std::max(st.nPoSePenalty, ceiling);
         }
         m_total_registered_count = total_registered_count;
         m_height                 = height;
@@ -496,6 +618,12 @@ public:
         // The held list was replaced wholesale — the incremental merkle cache's
         // diff base is gone, so drop it. The next fold rebuilds it in full.
         m_sml_cache.reset();
+    }
+
+    /// kSeedPenaltyCeilingFactor x CalcMaxPoSePenalty() of the CURRENT list.
+    int32_t seed_penalty_ceiling() const
+    {
+        return kSeedPenaltyCeilingFactor * calc_max_pose_penalty();
     }
 
     // ── Accessors ────────────────────────────────────────────────────────
@@ -532,17 +660,66 @@ public:
         return it == m_entries.end() ? nullptr : &it->second;
     }
 
+    /// True iff the held list is the POST-state of block (height, hash): a
+    /// seeded, unpoisoned engine whose cursor is exactly there. Every fold
+    /// that advanced the cursor passed the merkleRootMNList self-check, so
+    /// this is "the list dashd holds after that block" on every committed
+    /// field — and lo <= dashd <= hi on nPoSePenalty.
+    bool at_block(uint32_t height, const uint256& hash) const
+    {
+        return !m_poisoned && !m_entries.empty()
+            && m_height == height && m_block_hash == hash;
+    }
+
+    /// Penalty bounds of one MN in the CURRENT state (no cursor check —
+    /// pose_bounds_at() is the oracle accessor). nullopt: not in the list.
+    std::optional<PoSeBounds> pose_bounds(const uint256& proTxHash) const
+    {
+        const ReplayMNState* st = find(proTxHash);
+        if (st == nullptr) return std::nullopt;
+        return PoSeBounds{st->nPoSePenalty, st->nPoSePenaltyHi, st->IsBanned()};
+    }
+
+    /// THE PENALTY ORACLE (design PR-B §4.2): bounds of `proTxHash`'s
+    /// nPoSePenalty in the post-state of block (prev_height, prev_hash) — the
+    /// tip a template builds on. nullopt ("oracle-not-at-tip") unless the
+    /// engine is seeded, not poisoned and exactly at that block; nullopt also
+    /// when the MN is not in the list.
+    std::optional<PoSeBounds> pose_bounds_at(uint32_t prev_height,
+                                             const uint256& prev_hash,
+                                             const uint256& proTxHash) const
+    {
+        if (!at_block(prev_height, prev_hash)) return std::nullopt;
+        return pose_bounds(proTxHash);
+    }
+
+    /// Certainty census over the whole list.
+    PoSeExactness pose_exactness() const
+    {
+        PoSeExactness x;
+        for (const auto& [protx, st] : m_entries) {
+            if (st.IsBanned()) { ++x.banned; continue; }
+            if (st.pose_penalty_exact()) ++x.valid_exact;
+            else                         ++x.valid_inexact;
+            if (st.nPoSePenalty > 0)     ++x.valid_nonzero;
+            x.max_gap = std::max(x.max_gap,
+                                 st.nPoSePenaltyHi - st.nPoSePenalty);
+        }
+        return x;
+    }
+
     /// dashd CalcMaxPoSePenalty (deterministicmns.cpp:292-298): dynamic,
     /// max(100, number of registered MNs in the list — banned included).
+    /// Shared transcription: pose_penalty.hpp (also used by sml_pose_fold.hpp).
     int32_t calc_max_pose_penalty() const
     {
-        return std::max<int32_t>(100, static_cast<int32_t>(m_entries.size()));
+        return pose::calc_max_pose_penalty(m_entries.size());
     }
 
     /// dashd CalcPenalty (deterministicmns.cpp:300-304), integer math.
     int32_t calc_penalty(int32_t percent) const
     {
-        return (calc_max_pose_penalty() * percent) / 100;
+        return pose::calc_penalty(calc_max_pose_penalty(), percent);
     }
 
     /// DIP-4 merkleRootMNList of the CURRENT state — the value the
@@ -727,6 +904,22 @@ public:
                     + std::to_string(m_height + 1) + " is foldable)";
             return r;
         }
+        // The held list is the post-state of block (m_height, m_block_hash)
+        // and nothing else — that pair IS what the penalty oracle answers
+        // for. A block whose prev-link names any other block extends a
+        // different chain: refuse it, without mutation (the held state is
+        // still exactly right for its own block, so this is not a poison;
+        // the caller re-anchors on the best chain).
+        if (block.m_previous_block != m_block_hash) {
+            r.error = "fold refused at h=" + std::to_string(height)
+                    + ": block's prev-link "
+                    + block.m_previous_block.GetHex().substr(0, 16)
+                    + " is not the cursor block "
+                    + m_block_hash.GetHex().substr(0, 16)
+                    + " (a different chain; the held state is the post-state"
+                      " of the cursor block only)";
+            return r;
+        }
         if (block.m_txs.empty()) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block has no transactions (no coinbase, no cbTx "
@@ -780,6 +973,9 @@ public:
         // task #154 delta driver: this block's SML mutations start empty.
         m_sml_touched.clear();
         m_sml_structural = false;
+        // PoSe certainty: this block's punish ledger starts empty.
+        m_block_punished.clear();
+        m_block_revive_widened.clear();
 
         // ── Pass 1: confirmedHash (specialtxman.cpp:205-218) ────────────
         // Walks every MN, BANNED INCLUDED. Confirmation compares against
@@ -796,12 +992,20 @@ public:
         }
 
         // ── Pass 2: DecreaseScores (deterministicmns.cpp:334-359) ───────
+        // dashd decrements every NON-banned MN whose penalty is positive
+        // (ForEachMNShared(onlyValid=true) -> PoSeDecrease :353-359). Both
+        // certainty bounds take the same step, each floored at 0, which keeps
+        // lo <= dashd <= hi: the ban state is dashd's (root-checked every
+        // block), and x -> max(0, x-1) is monotone.
         for (auto& [protx, st] : m_entries) {
             if (st.IsBanned()) continue;
             if (st.nPoSePenalty > 0) {
-                --st.nPoSePenalty;
+                st.nPoSePenalty =
+                    static_cast<int32_t>(pose::decayed(st.nPoSePenalty));
                 ++r.decayed;
             }
+            st.nPoSePenaltyHi =
+                static_cast<int32_t>(pose::decayed(st.nPoSePenaltyHi));
         }
 
         // ── Pass 3: special txs, in tx order (specialtxman.cpp:228-460) ─
@@ -891,6 +1095,11 @@ public:
         // replay: a wrong fold rule, wrong body or wrong seed HARD-STOPS at
         // the named height instead of serving wrong bytes.
         r.computed_root = compute_sml_root_incremental();
+        if (r.computed_root != r.committed_root
+            && resolve_ambiguous_bans_from_root(r, H)) {
+            // Proven equal: the resolver re-hashed the adopted list.
+            r.computed_root = r.committed_root;
+        }
         if (r.computed_root != r.committed_root) {
             r.error = "DML FOLD ROOT MISMATCH at h=" + std::to_string(height)
                     + ": folded merkleRootMNList " + r.computed_root.GetHex()
@@ -989,7 +1198,7 @@ public:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // Snapshot v3 — save / load / resume
+    // Snapshot v4 (v3 still loads) — save / load / resume
     // ─────────────────────────────────────────────────────────────────────
     std::vector<uint8_t> save_snapshot() const
     {
@@ -1005,6 +1214,7 @@ public:
         for (const auto& [protx, st] : m_entries) {
             s << protx;
             s << st;
+            s << st.nPoSePenaltyHi;   // v4: the upper certainty bound
         }
         auto sp = s.get_span();
         uint256 digest;
@@ -1019,11 +1229,18 @@ public:
             reinterpret_cast<const uint8_t*>(full.data()) + full.size());
     }
 
-    /// Load a v3 snapshot and RESUME from its cursor: the next foldable
-    /// block is height+1. Fail-closed on wrong magic, wrong VERSION (an old
-    /// or newer binary must fail LOUD, not skip-and-limp — the versioned-
-    /// format standing trap), truncated payload or digest mismatch. On any
-    /// failure the engine state is left UNTOUCHED.
+    /// Load a v4 (or v3) snapshot and RESUME from its cursor: the next
+    /// foldable block is height+1. Fail-closed on wrong magic, wrong VERSION
+    /// (an old or newer binary must fail LOUD, not skip-and-limp — the
+    /// versioned-format standing trap), a magic/version pair that disagrees,
+    /// truncated payload or digest mismatch. On any failure the engine state
+    /// is left UNTOUCHED.
+    ///
+    /// v3 is the one older format accepted, and only because it is a strict
+    /// prefix of v4's information: it lacks the per-entry penalty upper
+    /// bound, so every entry loads with hi = max(lo, seed ceiling) — exactly
+    /// an Unknown-penalty seed. Never silently: `loaded_snapshot_version()`
+    /// names what was read.
     bool load_snapshot(const std::vector<uint8_t>& bytes, std::string& error)
     {
         error.clear();
@@ -1032,7 +1249,13 @@ public:
                   + " bytes) — truncated or not a DML snapshot";
             return false;
         }
-        if (std::memcmp(bytes.data(), kSnapshotMagic, kSnapshotMagicLen) != 0) {
+        uint32_t magic_version = 0;
+        if (std::memcmp(bytes.data(), kSnapshotMagic, kSnapshotMagicLen) == 0)
+            magic_version = kSnapshotVersion;
+        else if (std::memcmp(bytes.data(), kSnapshotMagicV3,
+                             kSnapshotMagicLen) == 0)
+            magic_version = kSnapshotVersionV3;
+        if (magic_version == 0) {
             error = "snapshot magic mismatch — not a C2POOL-DASH-DML "
                     "snapshot";
             return false;
@@ -1055,11 +1278,12 @@ public:
             ::PackStream s(payload);
             uint32_t version = 0;
             s >> version;
-            if (version != kSnapshotVersion) {
+            if (version != magic_version) {
                 error = "snapshot format v" + std::to_string(version)
                       + " != supported v" + std::to_string(kSnapshotVersion)
-                      + " — refusing to load (versioned fail-loud, no "
-                        "silent migration)";
+                      + " (or v" + std::to_string(kSnapshotVersionV3)
+                      + " under its own magic) — refusing to load"
+                        " (versioned fail-loud, no silent migration)";
                 return false;
             }
             std::string network;
@@ -1074,8 +1298,28 @@ public:
                 uint256 protx;
                 ReplayMNState st;
                 s >> protx >> st;
+                if (version >= 4) {
+                    s >> st.nPoSePenaltyHi;
+                    if (st.nPoSePenaltyHi < st.nPoSePenalty) {
+                        error = "snapshot entry "
+                              + protx.GetHex().substr(0, 16)
+                              + " carries penalty bounds lo="
+                              + std::to_string(st.nPoSePenalty) + " > hi="
+                              + std::to_string(st.nPoSePenaltyHi)
+                              + " — not a state this engine writes, refusing";
+                        return false;
+                    }
+                }
                 collateral[st.collateralOutpoint] = protx;
                 entries.emplace(protx, std::move(st));
+            }
+            if (version == kSnapshotVersionV3) {
+                // No bound on disk: widen to the ceiling over THIS list
+                // (CalcMaxPoSePenalty counts every entry, banned included).
+                const int32_t ceiling = kSeedPenaltyCeilingFactor
+                    * pose::calc_max_pose_penalty(entries.size());
+                for (auto& [protx, st] : entries)
+                    st.nPoSePenaltyHi = std::max(st.nPoSePenalty, ceiling);
             }
             if (!s.empty()) {
                 error = "snapshot carries " + std::to_string(s.cursor_size())
@@ -1097,6 +1341,7 @@ public:
             m_total_registered_count = total_registered;
             m_poisoned               = false;
             m_poison_reason.clear();
+            m_loaded_snapshot_version = version;
             // Resumed from a snapshot: the held list is a fresh wholesale load,
             // so the incremental merkle cache's diff base does not apply. Drop
             // it; the first post-resume fold rebuilds it in full.
@@ -1108,17 +1353,32 @@ public:
         }
     }
 
+    /// Write the snapshot to `path` via a sibling temp file + rename(2), so a
+    /// crash mid-write leaves the previous file intact (and a torn temp file
+    /// is never mistaken for it — the digest trailer would refuse it anyway).
     bool save_snapshot_file(const std::string& path, std::string& error) const
     {
         error.clear();
         auto bytes = save_snapshot();
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (!f) { error = "cannot open '" + path + "' for write"; return false; }
-        f.write(reinterpret_cast<const char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
-        if (!f) { error = "short write to '" + path + "'"; return false; }
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            if (!f) { error = "cannot open '" + tmp + "' for write"; return false; }
+            f.write(reinterpret_cast<const char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()));
+            f.flush();
+            if (!f) { error = "short write to '" + tmp + "'"; return false; }
+        }
+        if (!core::durable_file::rename_over(tmp, path)) {
+            error = "rename '" + tmp + "' -> '" + path + "' failed";
+            std::remove(tmp.c_str());
+            return false;
+        }
         return true;
     }
+
+    /// Format version of the last successful load_snapshot() (0 = none).
+    uint32_t loaded_snapshot_version() const { return m_loaded_snapshot_version; }
 
     bool load_snapshot_file(const std::string& path, std::string& error)
     {
@@ -1153,6 +1413,12 @@ private:
     // (and the debug assert) catches — fail-closed, never a wrong served root.
     std::vector<uint256> m_sml_touched;
     bool                 m_sml_structural{false};
+    // PoSe certainty, per block: MNs punished while NOT banned this block ->
+    // CalcMaxPoSePenalty at their last punish; and the ones whose lower bound
+    // a same-block ProUpServTx widened (see fold_proupserv). Cleared at the
+    // top of every fold_block.
+    std::map<uint256, int32_t> m_block_punished;
+    std::set<uint256>          m_block_revive_widened;
     void sml_touch(const uint256& protx) { m_sml_touched.push_back(protx); }
     std::map<bitcoin_family::coin::TxPrevOut, uint256, ReplayOutpointLess>
         m_collateral_index;
@@ -1162,6 +1428,7 @@ private:
     std::string m_network{"mainnet"};
     bool        m_poisoned{false};
     std::string m_poison_reason;
+    uint32_t    m_loaded_snapshot_version{0};
 
     void poison(const std::string& why)
     {
@@ -1322,6 +1589,30 @@ private:
             st.platformNodeID   = p.platformNodeID;
             st.platformP2PPort  = p.platformP2PPort;
             st.platformHTTPPort = p.platformHTTPPort;
+        }
+        // PoSe certainty (ban + revive in ONE block). If this MN was punished
+        // earlier in THIS block into the ambiguous band (lo < max <= hi), dashd
+        // may have BANNED it there (PoSePunish, deterministicmns.cpp:319-321)
+        // and this very tx then REVIVES it (specialtxman.cpp:359-368):
+        // penalty 0, isValid true — the same isValid the model ends with, so
+        // the root cannot tell the two histories apart. dashd's penalty is
+        // then either its punished value (>= lo) or 0, so the only sound
+        // lower bound is 0. Widen lo; hi already covers the other branch.
+        // (nPoSeRevivedHeight is equally undecidable here; it orders the
+        // payee queue, which the per-block coinbase cross-check falsifies.)
+        if (!st.IsBanned()) {
+            auto bp = m_block_punished.find(p.proTxHash);
+            if (bp != m_block_punished.end()
+                && st.nPoSePenaltyHi >= bp->second && st.nPoSePenalty > 0) {
+                st.nPoSePenalty = 0;
+                m_block_revive_widened.insert(p.proTxHash);
+                LOG_INFO << "[DML-FOLD] h=" << H << " MN "
+                         << p.proTxHash.GetHex().substr(0, 16)
+                         << " ProUpServTx after an ambiguous PoSe punish in the"
+                            " same block: dashd may have banned+revived it —"
+                            " penalty lower bound widened to 0 (upper "
+                         << st.nPoSePenaltyHi << ")";
+            }
         }
         // The h=2516756 transition (specialtxman.cpp:368-377): revive only
         // when banned AND all keys set.
@@ -1497,13 +1788,22 @@ private:
     /// penalty += p, saturate at CalcMaxPoSePenalty; crossing max on a
     /// not-yet-banned MN ⇒ ban — the isValid flip that changes the SML root
     /// (the 2516412/2516435 case-D events).
+    ///
+    /// Certainty bounds: x -> min(max, x + p) is monotone, so applying it to
+    /// both bounds keeps lo <= dashd <= hi. The BAN is decided on lo alone
+    /// (lo >= max proves dashd's value reached max too); a ban dashd applies
+    /// with lo < max is a missed ban, caught by this block's root self-check.
     void pose_punish(ReplayMNState& st, const uint256& protx,
                      int32_t penalty, int32_t H, FoldResult& r)
     {
         const int32_t max_penalty = calc_max_pose_penalty();
-        st.nPoSePenalty = std::min(max_penalty, st.nPoSePenalty + penalty);
+        st.nPoSePenalty = static_cast<int32_t>(
+            pose::punished(st.nPoSePenalty, penalty, max_penalty));
+        st.nPoSePenaltyHi = static_cast<int32_t>(
+            pose::punished(st.nPoSePenaltyHi, penalty, max_penalty));
+        if (!st.IsBanned()) m_block_punished[protx] = max_penalty;
         ++r.punished;
-        if (!st.IsBanned() && st.nPoSePenalty >= max_penalty) {
+        if (pose::punish_bans(st.IsBanned(), st.nPoSePenalty, max_penalty)) {
             st.BanIfNotBanned(H);
             // The ban flips isValid — the only SML-relevant effect of a punish
             // (nPoSePenalty itself is EXCLUDED from to_sml_entry).
@@ -1516,6 +1816,99 @@ private:
                          << " max=" << max_penalty << ")";
             }
         }
+    }
+
+    // At most this many ambiguous punishes in ONE block are resolved from
+    // the committed root (2^n - 1 candidate roots, each a full SML hash).
+    // Mainnet carries at most a handful of invalid members per window block;
+    // beyond this the fold refuses exactly as before.
+    static constexpr size_t kMaxRootResolveCandidates = 8;
+
+    /// ROOT-RESOLVED PoSe BANS — the one place the committed root is used as
+    /// an ORACLE rather than only as a check.
+    ///
+    /// When the seed did not carry dashd's penalties, a punish can land in
+    /// the ambiguous band: lo < CalcMaxPoSePenalty <= hi, i.e. dashd MAY have
+    /// banned the MN (PoSePunish, deterministicmns.cpp:319-321) and the
+    /// lower-bound model did not. The block's committed merkleRootMNList
+    /// decides it: to_sml_entry hashes isValid = !IsBanned()
+    /// (deterministicmns.cpp:45-52), so dashd's list after this block is
+    /// OUR list with isValid cleared on exactly the subset S of ambiguous MNs
+    /// dashd banned — every other leaf is already root-equal or the fold is
+    /// wrong elsewhere. Try every subset; if exactly ONE reproduces the
+    /// committed root (a second would be a SHA256d collision), adopt it:
+    ///   S       banned at H, penalty = max exactly (min(max, p + P) with
+    ///           p + P >= max), lo = hi;
+    ///   the rest proven NOT banned, so dashd's value < max: hi = max - 1.
+    /// No subset matching means the divergence is not a PoSe ambiguity, and
+    /// the caller poisons exactly as before. A false ban stays impossible:
+    /// nothing is banned that the committed root does not show banned.
+    bool resolve_ambiguous_bans_from_root(FoldResult& r, int32_t H)
+    {
+        std::vector<std::pair<uint256, int32_t>> amb;   // (protx, max at punish)
+        for (const auto& [protx, mx] : m_block_punished) {
+            if (m_block_revive_widened.count(protx)) continue;
+            auto it = m_entries.find(protx);
+            if (it == m_entries.end()) continue;   // removed later in the block
+            if (it->second.IsBanned()) continue;   // the model banned it (lo)
+            if (it->second.nPoSePenaltyHi < mx) continue;   // provably no ban
+            amb.emplace_back(protx, mx);
+        }
+        if (amb.empty() || amb.size() > kMaxRootResolveCandidates) return false;
+
+        vendor::CSimplifiedMNList sml(materialize_sml_entries());
+        std::vector<size_t> idx;
+        for (const auto& [protx, mx] : amb) {
+            size_t k = sml.mnList.size();
+            for (size_t i = 0; i < sml.mnList.size(); ++i)
+                if (sml.mnList[i].proRegTxHash == protx) { k = i; break; }
+            if (k == sml.mnList.size()) return false;
+            idx.push_back(k);
+        }
+        const uint32_t n = static_cast<uint32_t>(amb.size());
+        uint32_t found = 0;
+        for (uint32_t mask = 1; mask < (1u << n); ++mask) {
+            for (uint32_t b = 0; b < n; ++b)
+                sml.mnList[idx[b]].isValid = !(mask & (1u << b));
+            if (sml.CalcMerkleRoot() == r.committed_root) {
+                if (found != 0) return false;   // not unique: refuse
+                found = mask;
+            }
+        }
+        if (found == 0) return false;
+
+        m_sml_touched.clear();
+        m_sml_structural = false;
+        for (uint32_t b = 0; b < n; ++b) {
+            auto& st = m_entries.find(amb[b].first)->second;
+            const int32_t mx = amb[b].second;
+            if (found & (1u << b)) {
+                st.BanIfNotBanned(H);
+                st.nPoSePenalty   = mx;
+                st.nPoSePenaltyHi = mx;
+                sml_touch(amb[b].first);
+                ++r.banned;
+                ++r.root_resolved_bans;
+                LOG_INFO << "[DML-FOLD] h=" << H << " MN "
+                         << amb[b].first.GetHex().substr(0, 16)
+                         << " PoSe-BANNED, resolved from the committed"
+                            " merkleRootMNList (penalty bounds were ambiguous"
+                            " at the threshold " << mx << ")";
+            } else {
+                st.nPoSePenaltyHi = std::min(st.nPoSePenaltyHi, mx - 1);
+                ++r.root_resolved_nobans;
+            }
+        }
+        // Re-sync the incremental tree with the adopted leaves; it must now
+        // reproduce the committed root on its own or nothing is adopted.
+        const uint256 again = compute_sml_root_incremental();
+        if (again != r.committed_root) {
+            poison("root-resolved PoSe ban did not re-hash to the committed"
+                   " root at h=" + std::to_string(H)
+                   + " (incremental merkle disagreement)");
+            return false;
+        }
+        return true;
     }
 
     /// dashd CFinalCommitment::IsNull(): no set bits and null key/vvec/sigs.

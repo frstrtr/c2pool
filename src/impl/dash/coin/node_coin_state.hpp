@@ -209,6 +209,9 @@ public:
     // mnstates() bumps too: the confirmation-pass projection reads MN
     // registration heights from it (sml_projection.hpp).
     MnStateMachine& mnstates() { bump_root_memo_epoch(); return m_mnstates; }
+    // Read-only view (no epoch bump): the payee ordered-connect cursor and the
+    // gap-seed capture read the queue per block and per tick.
+    const MnStateMachine& mnstates() const { return m_mnstates; }
     // Mempool contents feed the template TX SET, not either committed root —
     // no epoch bump (a per-tx bump would chill the memo for nothing).
     Mempool&        mempool()  { return m_mempool; }
@@ -1088,29 +1091,72 @@ public:
         m_qc_pull_fn = std::move(fn);
     }
 
-    /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
-    /// enforcement of the #1083 landmine comment at the inclusion site
-    /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
-    /// non-null in-block commitment marks invalid (specialtxman.cpp:159-174),
-    /// which can flip that MN's validity in the SAME block's list and change
-    /// the merkleRootMNList this coinbase commits — bad-cbtx-mnmerkleroot, a
-    /// silently lost block. c2pool does not fold that pass, so the pre-emit
-    /// gate refuses any real commitment whose PoSe pass is not PROVABLY a
-    /// no-op (qc_pose_pass_provably_noop: every listed member valid).
+    /// PoSe-pass inputs for REAL (non-null) type-6 commitments — the
+    /// enforcement of the #1083 landmine, now as dashd's own pass instead of
+    /// the old "every listed member valid" predicate (incident h=2561514:
+    /// that predicate refused correct templates at most DKG windows).
     ///
-    /// The fn answers exactly that question for one commitment:
-    ///   true    => the PoSe pass provably touches nothing — servable;
-    ///   false   => at least one listed member would be punished — refuse;
-    ///   nullopt => cannot be established (member set not sourced) — refuse.
-    /// UNSET (default) => the capability is absent and every non-null
-    /// commitment is refused (fail-closed insurance until a real PoSe fold
-    /// into the committed MN root is built). Null commitments are exempt by
-    /// dashd's own IsNull() guard (specialtxman.cpp:427-432) and are never
-    /// consulted, so the all-null production plans are byte-unchanged.
-    void set_qc_pose_noop_fn(
-        std::function<std::optional<bool>(const vendor::CFinalCommitment&)> fn) {
-        m_qc_pose_noop_fn = std::move(fn);
+    /// dashd's verifier PoSe-punishes every member a non-null in-block
+    /// commitment marks invalid (specialtxman.cpp:159-174), and a punishment
+    /// that crosses the ban threshold flips that MN's validity in the SAME
+    /// block's list — the committed merkleRootMNList must carry it or the
+    /// block is bad-cbtx-mnmerkleroot. sml_pose_fold.hpp runs that pass in
+    /// dashd order (DecreaseScores -> punish -> ban) on certainty bounds:
+    ///   `members` — the index-aligned member proTxHashes of a quorum (the
+    ///               set the BLS verifier used); nullopt => not sourced;
+    ///   `oracle`  — nPoSePenalty bounds at the tip (no wire carries them).
+    /// A ban provable either way is SERVED (folded into the committed root);
+    /// anything else refuses with a stage-named cause
+    /// (emit-qc-real-pose-unfolded / qc-real-pose-unfolded).
+    ///
+    /// UNSET members (default) => every non-null commitment refuses
+    /// (members-missing) — fail closed. UNSET oracle => every punishment of a
+    /// listed, valid MN refuses (penalty-unknown), i.e. exactly the old
+    /// refusal set minus the two free exact no-op proofs: the punished member
+    /// is absent from the list, or already banned. Null commitments are
+    /// exempt by dashd's own IsNull() guard (specialtxman.cpp:432).
+    ///
+    /// `oracle_cursor` (optional) names the block the oracle's penalties
+    /// describe; when supplied, an oracle not at this state's tip refuses
+    /// with stage=oracle-not-at-tip instead of being consulted.
+    void set_qc_pose_fold_inputs(QcMembersFn members_fn,
+                                 PoSeOracleFn oracle_fn = {},
+                                 PoSeOracleCursorFn oracle_cursor = {}) {
+        m_qc_pose_members_fn    = std::move(members_fn);
+        m_qc_pose_oracle.penalty = std::move(oracle_fn);
+        m_qc_pose_oracle.cursor  = std::move(oracle_cursor);
     }
+
+    /// The PoSe pass over `commitments` against the tip this state serves —
+    /// the SAME decision the viability probe, the builder and the pre-emit
+    /// gate take. Pure; exposed for diagnostics ([QC-NULL-ARM] logs whether
+    /// an instant upgrade will be refused) and tests.
+    QcPoseDecision qc_pose_decision(
+        const std::vector<vendor::CFinalCommitment>& commitments) const {
+        return decide_qc_pose(m_sml, commitments, m_qc_pose_members_fn,
+                              &m_qc_pose_oracle, m_prev_height, m_prev_hash);
+    }
+
+    /// The refusal VALUE for a PoSe-pass decision: names the commitment by
+    /// llmqType, quorumIndex and the DISCRIMINATING quorum-hash tail (the
+    /// head of a mainnet block hash is difficulty padding), and the stage.
+    static std::string qc_pose_value(const QcPoseDecision& d) {
+        std::string stage = qc_pose_stage_name(d.stage);
+        if (d.stage == QcPoseStage::PenaltyInexact)
+            stage += "(protx=" + d.pro_tx_hash.GetHex().substr(0, 12) + ")";
+        else if (!d.pro_tx_hash.IsNull())
+            stage += ",protx=" + d.pro_tx_hash.GetHex().substr(0, 12);
+        return "qc[" + std::to_string(d.qc_index) + "]:type="
+             + std::to_string(static_cast<int>(d.llmq_type))
+             + ",qi=" + std::to_string(d.quorum_index)
+             + ",quorum=..." + discriminating_hash_tail(d.quorum_hash)
+             + ",stage=" + stage;
+    }
+    static constexpr const char* kQcPoseThreshold =
+        "pose-pass-exact(ban-decision-provable)";
+
+    /// The tip this state builds on (prev_height + 1 is the template height).
+    uint32_t prev_height() const { return m_prev_height; }
 
     /// bestCL freshness guard (review PR #780 BLOCKER-2, HIGH). dashcore
     /// CheckCbTxBestChainlock rejects a block whose committed bestCLSignature is
@@ -1360,6 +1406,10 @@ public:
         // order). Any drift => discard for the reward-safe fallback. Without
         // a plan fn the PHASE-1 refusal stays.
         std::optional<QcBlockPlan> qc_plan;
+        // MNs the PoSe pass PROVES banned in this block (empty: no real
+        // commitment / no punishment crosses max). Folded into the expected
+        // merkleRootMNList below.
+        std::vector<uint256> pose_bans;
         if (m_qc_plan_fn) {
             QcPlanGap qc_gap;
             qc_plan = m_qc_plan_fn(next_h, &qc_gap);
@@ -1384,36 +1434,23 @@ public:
                     return reject("emit-qc-payload-drift", "qc[" + std::to_string(i) + "]-bytes",
                                   "planned-qc[" + std::to_string(i) + "]-bytes");
             }
-            // ── PoSe-fold gate on REAL commitments (the #1083 landmine, now
-            // ENFORCED — a comment refuses nothing). A verified real
-            // commitment carrying !validMembers[i] for a listed member makes
-            // dashd's verifier PoSePunish that MN (specialtxman.cpp:159-174),
-            // and a punishment crossing the ban threshold flips the MN's
-            // validity in THIS block's list — the committed merkleRootMNList
-            // above is then wrong: bad-cbtx-mnmerkleroot, a silently lost
-            // block. c2pool folds no PoSe pass, so serve a real commitment
-            // ONLY when its PoSe pass is PROVABLY a no-op (every listed
-            // member valid — the common case, so real-commitment serving
-            // stays unblocked). Absent capability / unprovable => refuse:
-            // fail-closed insurance until a real PoSe fold (mirror of the
-            // confirmedHash rollover projection) is built. Null commitments
-            // are exempt by dashd's own IsNull() guard (specialtxman.cpp:432)
-            // — all-null plans are byte-unchanged through here.
-            for (size_t i = 0; i < qc_plan->commitments.size(); ++i) {
-                const auto& c = qc_plan->commitments[i];
-                if (qc_commitment_is_null(c)) continue;   // IsNull() exempt
-                const std::optional<bool> noop =
-                    m_qc_pose_noop_fn ? m_qc_pose_noop_fn(c) : std::nullopt;
-                if (!noop.has_value() || !*noop)
-                    return reject(
-                        "emit-qc-real-pose-unfolded",
-                        "qc[" + std::to_string(i) + "]:type="
-                            + std::to_string(static_cast<int>(c.llmqType))
-                            + ",quorum=" + c.quorumHash.GetHex().substr(0, 12)
-                            + ",pose_noop="
-                            + (noop.has_value() ? "unproven" : "n/a"),
-                        "pose-pass-provably-noop(all-listed-members-valid)");
-            }
+            // ── PoSe pass on REAL commitments (the #1083 landmine) ──────
+            // A verified real commitment carrying !validMembers[i] for a
+            // listed member makes dashd's verifier PoSePunish that MN
+            // (specialtxman.cpp:159-174), and a punishment crossing the ban
+            // threshold flips the MN's validity in THIS block's list. The
+            // pass (sml_pose_fold.hpp: DecreaseScores -> punish -> ban, on
+            // oracle certainty bounds) either PROVES the ban decision — and
+            // the expected root below then carries every proven ban — or
+            // refuses, naming the commitment and the stage. Same decision
+            // the viability probe and the builder take. Null commitments are
+            // exempt by dashd's own IsNull() guard (specialtxman.cpp:432) —
+            // all-null plans are byte-unchanged through here.
+            const QcPoseDecision pose = qc_pose_decision(qc_plan->commitments);
+            if (!pose.ok())
+                return reject("emit-qc-real-pose-unfolded", qc_pose_value(pose),
+                              kQcPoseThreshold);
+            pose_bans = pose.bans;
         } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
             return reject("emit-dkg-commitment-window",
                           "in-window@h=" + std::to_string(next_h), "off-window");
@@ -1577,6 +1614,18 @@ public:
         // BuildNewListFromBlock parity, sml_special_fold.hpp) and refuse the
         // template if the fold cannot apply the body exactly (fail-closed:
         // an unfoldable body must never be served with a guessed root).
+        //
+        // PoSe pass (fold order = dashd's: confirmations -> PoSe -> special
+        // txs, specialtxman.cpp:206-229 then vtx order — the type-6 txs lead
+        // the body). A proven ban changes the expected root; the memo above
+        // is deliberately NOT keyed on the plan or the oracle: it stays the
+        // pre-PoSe projected root. The post-ban root has its OWN memo, keyed
+        // on (epoch, the exact ban list): the projection it is derived from
+        // is the one the epoch already covers, and the bans are the only
+        // other input, so a different ban list (an oracle or plan move) can
+        // never land on it. Without it a banning height re-ran the full
+        // projection + root hash on EVERY evaluation — the D2 freeze shape
+        // above, at exactly the height a proven ban is being served.
         uint256 expected_mn_root = m_sml_root_memo;
         if (m_include_mn_special_txs) {
             auto proj = project_sml_confirmations(m_sml, m_prev_height,
@@ -1586,6 +1635,7 @@ public:
                 return reject("emit-mn-confirm-rollover-pending",
                               "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
                               "known-registration-height");
+            apply_qc_pose_bans(proj.sml, pose_bans);
             auto fold = fold_mn_special_txs(
                 proj.sml, w.m_txs,
                 [](const Transaction& t) {
@@ -1596,6 +1646,24 @@ public:
                               std::to_string(fold.refused),
                               "0-refused");
             expected_mn_root = fold.sml.CalcMerkleRoot();
+        } else if (!pose_bans.empty()) {
+            if (!(m_ban_root_memo_valid
+                  && m_ban_root_memo_epoch == m_root_memo_epoch
+                  && m_ban_root_memo_bans == pose_bans)) {
+                auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                      m_prev_hash, m_mnstates,
+                                                      m_mn_min_confirmations);
+                if (!proj.ok)   // unreachable: the memo path above passed
+                    return reject("emit-mn-confirm-rollover-pending",
+                                  "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                                  "known-registration-height");
+                apply_qc_pose_bans(proj.sml, pose_bans);
+                m_ban_root_memo       = proj.sml.CalcMerkleRoot();
+                m_ban_root_memo_epoch = m_root_memo_epoch;
+                m_ban_root_memo_bans  = pose_bans;
+                m_ban_root_memo_valid = true;
+            }
+            expected_mn_root = m_ban_root_memo;
         }
         if (cb.merkleRootMNList != expected_mn_root)
             return reject("emit-mnlist-root-drift",
@@ -1729,8 +1797,15 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
+        // The PoSe pass over the plan's REAL commitments, decided ONCE here
+        // (no SML copy, no hashing — presence/isValid lookups only) and
+        // threaded into the viability clause; the builder and the pre-emit
+        // gate take the same decision over the same plan.
+        std::optional<QcPoseDecision> qc_pose;
+        if (qc_plan) qc_pose = qc_pose_decision(qc_plan->commitments);
         e.decline   = evaluate_viability(qc_ok, qc_gap, sb.ok, payee_resolvable,
-                                         utxo_immature);
+                                         utxo_immature,
+                                         qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
@@ -1824,6 +1899,10 @@ public:
             e.has_quorum_root_override = true;
             e.quorum_root_override = qc_plan->merkle_root_quorums;
         }
+        // PoSe pass inputs for the builder's own fold over qc_commitments
+        // (pointers into this state, like mnstates/mempool).
+        e.qc_pose_members = m_qc_pose_members_fn ? &m_qc_pose_members_fn : nullptr;
+        e.qc_pose_oracle  = &m_qc_pose_oracle;
         return e;
     }
 
@@ -1885,10 +1964,13 @@ private:
     /// are passed in: it was measured at the one place that CAN measure it —
     /// the plan call — and re-deriving it here would mean a second plan build
     /// that could answer differently. It is meaningful only when !qc_ok.
+    /// `qc_pose` is the PoSe-pass decision over the same plan (null when no
+    /// plan was derived), passed in for the same reason as qc_gap.
     DeclineReport evaluate_viability(bool qc_ok, const QcPlanGap& qc_gap,
                                      bool sb_ok,
                                      bool payee_resolvable,
-                                     bool utxo_immature) const {
+                                     bool utxo_immature,
+                                     const QcPoseDecision* qc_pose = nullptr) const {
         const uint32_t next_h = m_prev_height + 1;
         const std::string tip = std::to_string(m_prev_height);
         auto refuse = [](const char* c, std::string v, std::string t) {
@@ -1999,6 +2081,17 @@ private:
                        "protx=" + find_unprojectable_confirmation(m_sml, m_mnstates)
                                       ->GetHex().substr(0, 12),
                        "known-registration-height");
+        else if (m_require_sml && qc_pose != nullptr && !qc_pose->ok())
+            // The PoSe sibling of the clause above: a REAL commitment in the
+            // plan punishes a listed MN whose ban decision cannot be PROVEN
+            // (sml_pose_fold.hpp — member set unsourced, no oracle / oracle
+            // not at the tip, or bounds straddling the threshold), so the
+            // merkleRootMNList block next_h must commit cannot be derived.
+            // Same decision the pre-emit gate takes
+            // (emit-qc-real-pose-unfolded); refusing HERE names it before a
+            // template is built only to be discarded.
+            d = refuse("qc-real-pose-unfolded", qc_pose_value(*qc_pose),
+                       kQcPoseThreshold);
         else if (!payee_resolvable)
             d = refuse("payee-unresolvable",
                        std::to_string(m_mnstates.entries().size())
@@ -2201,6 +2294,13 @@ private:
     mutable bool     m_sml_root_memo_valid{false};
     mutable uint64_t m_sml_root_memo_epoch{0};
     mutable uint256  m_sml_root_memo;         // projected-SML merkle root
+    // Post-PoSe-ban projected root, keyed on (epoch, ban list) — see the
+    // emit gate. Distinct slot: the no-ban memo above must stay the pre-ban
+    // root that every non-banning evaluation reads.
+    mutable bool                 m_ban_root_memo_valid{false};
+    mutable uint64_t             m_ban_root_memo_epoch{0};
+    mutable std::vector<uint256> m_ban_root_memo_bans;
+    mutable uint256              m_ban_root_memo;
     mutable bool     m_quorum_root_memo_valid{false};
     mutable uint64_t m_quorum_root_memo_epoch{0};
     mutable uint256  m_quorum_root_memo;      // plain active-set quorum root
@@ -2294,9 +2394,11 @@ private:
     // Fired only when the gap names a single quorum (slot_known); UNSET
     // (default) => the refusal simply waits for the next relay, byte-identical.
     std::function<void(const QcPlanGap&)> m_qc_pull_fn;
-    // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
-    // unset => capability absent => every non-null commitment refused.
-    std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
+    // PoSe-pass inputs for REAL commitments (sml_pose_fold.hpp): member
+    // proTxHash source + penalty oracle. Unset => fail closed (see
+    // set_qc_pose_fold_inputs).
+    QcMembersFn m_qc_pose_members_fn;
+    PoSeOracle  m_qc_pose_oracle;
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
     BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // the node installs resolve_bestcl_policy() (default ConsensusExact)
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed

@@ -1008,6 +1008,13 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
             coin_state_.select_work([]() { return coin::DashWorkData{}; });
         if (sel.source != coin::WorkSource::Embedded) {
             arm.decline = std::move(sel.decline);
+            // Keep the height a VIABILITY refusal was refusing at too, exactly
+            // like the emit refusal below: on a daemonless node the fallback
+            // template is empty (m_height == 0), and every [EMBED-GATE-SEG]
+            // line closed by a cause change into a viability cause printed
+            // h=0 (2026-10-26 incident logs). 0 = no tip yet => stays 0.
+            if (coin_state_.prev_height() != 0)
+                arm.declined_height = coin_state_.prev_height() + 1;
             return arm;
         }
 
@@ -1905,6 +1912,38 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                 << dur
                 << cause_dur
                 << " suppressed=" << d.suppressed;
+}
+
+bool DASHWorkSource::note_ready_idle(uint32_t height) const
+{
+    const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    coin::ServeGateJournal::Decision d;
+    {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        d = serve_gate_journal_.observe_ready_idle(now_sec);
+        if (!d.emit()) return false;
+        serve_gate_ledger_.bank_ready_idle(d, now_sec);
+        last_decline_ = coin::DeclineReport{};
+    }
+    if (d.prev_cause_sec >= 0 && !d.previous_cause.empty()) {
+        LOG_WARNING << "[EMBED-GATE-SEG] h=" << height
+                    << " cause=" << d.previous_cause
+                    << " dur=" << d.prev_cause_sec << "s"
+                    << " terminal=ready-idle";
+    }
+    LOG_WARNING << "[EMBED-GATE] h=" << height
+                << " arm=READY-IDLE (the embedded arm would serve; no miner is"
+                   " connected, so no template was sourced) — closed cause="
+                << (d.previous_cause.empty() ? "unknown" : d.previous_cause)
+                << (d.episode_sec >= 0
+                        ? " episode dur=" + std::to_string(d.episode_sec) + "s"
+                        : std::string())
+                << " " << d.suppressed << " decline(s) suppressed. Time from"
+                   " here until a miner asks is miner absence, not node"
+                   " downtime, and is charged to no cause.";
+    return true;
 }
 
 // Operator surface (per-coin /api/node_topology no_work_reason). Publishes the

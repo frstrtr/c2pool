@@ -359,4 +359,52 @@ TEST(DashPreanchorHeaderBackfill, UnheldAnchorInstallsNothing)
         << "install must refuse when the anchor (trust root) is not held";
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 6. HELD BUT NOT DATED. A height-index rebuild (a tip reorg here; a restart
+//    reloads the header DB the same way) walks down from the tip and stops at
+//    the synthetic anchor, so pre-anchor headers stay held by HASH but lose
+//    their HEIGHT. A second install over the same trusted span must date them
+//    again (and say so via `reindexed`); before the fix it installed 0 and the
+//    heights stayed empty for good — the PoSe oracle's straddle bootstrap then
+//    could never resolve its pre-cursor block hashes (live, 2026-10-28).
+// ─────────────────────────────────────────────────────────────────────────
+TEST(DashPreanchorHeaderBackfill, ReinstallReindexesHeldHeadersAfterARebuild)
+{
+    SynthChain c = build_chain(2513000, 3);
+    HeaderChain hc(c.params);
+    ASSERT_TRUE(hc.init());
+    hc.set_dynamic_checkpoint(c.anchor_height, c.anchor_hash);
+    ASSERT_EQ(hc.install_preanchor_span(c.anchor_hash, c.batch), c.below.size());
+    for (const auto& [h, id] : c.below) {
+        auto e = hc.get_header_by_height(h);
+        ASSERT_TRUE(e.has_value()) << h;
+        EXPECT_EQ(e->hash, id);
+    }
+
+    // Two competing children of the anchor with equal work: the second takes
+    // the tip by the equal-work rule and forces a height-index REBUILD.
+    BlockHeaderType a = mine_hdr(c.anchor_hash, c.params.pow_limit, c.anchor_height + 1);
+    BlockHeaderType b = mine_hdr(c.anchor_hash, c.params.pow_limit, c.anchor_height + 101);
+    ASSERT_TRUE(hc.add_header(a));
+    ASSERT_TRUE(hc.add_header(b));
+    ASSERT_EQ(hc.tip()->hash, x11_hash(b)) << "fixture: the rebuild did not happen";
+    for (const auto& [h, id] : c.below) {
+        EXPECT_TRUE(hc.has_header(id)) << "still held by hash at h=" << h;
+        EXPECT_FALSE(hc.get_header_by_height(h).has_value())
+            << "fixture: the rebuild should have dropped h=" << h;
+    }
+
+    size_t reindexed = 0;
+    EXPECT_EQ(hc.install_preanchor_span(c.anchor_hash, c.batch, &reindexed), 0u)
+        << "nothing is NEW";
+    EXPECT_EQ(reindexed, c.below.size());
+    for (const auto& [h, id] : c.below) {
+        auto e = hc.get_header_by_height(h);
+        ASSERT_TRUE(e.has_value()) << "h=" << h << " must be dated again";
+        EXPECT_EQ(e->hash, id);
+    }
+    // Forward heights are untouched.
+    EXPECT_EQ(hc.get_header_by_height(c.anchor_height + 1)->hash, x11_hash(b));
+}
+
 #endif // C2POOL_PREANCHOR_SPAN_BACKFILL

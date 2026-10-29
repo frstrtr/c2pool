@@ -368,6 +368,7 @@
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_status.hpp"
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
 #include "pathb_ratchet_sim.hpp"
@@ -10050,7 +10051,9 @@ KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const p
     pb::RelayClock clock;
     clock.mono_ms = [&h] { return h.now * 1000; };
     clock.wall_s = [&h] { return h.now; };
-    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock);
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock, [n = h.nodes.size()](const std::string& line) {
+        if (g_relay_lines != nullptr) (*g_relay_lines)[n].push_back(line);
+    });
     k.node = h.nodes.size();
     h.kvs.push_back(std::make_unique<MemoryKv>(from));
     MemoryKv& kv = *h.kvs.back();
@@ -10077,6 +10080,77 @@ std::function<void(FakeWire::Msg&)> drop_headers(std::size_t from, std::size_t t
 
 // Two relay nodes (both launched; wire 0 = A, wire 1 = B): they mine `shared` carriers on one chain; apart, B mines
 // `own` on its branch and A `more` on its chain (A's heavier).
+// A decimal number, the whole string (at most 19 digits).
+bool whole_u64(const std::string& s, std::uint64_t& v) {
+    if (s.empty() || s.size() > 19) return false;
+    v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    return true;
+}
+
+// A `relay: caught up (<form>) at pos <n> t=<unix ms>` line, parsed whole.
+struct CaughtLine {
+    std::string form;
+    std::uint64_t pos = 0, t = 0;
+};
+constexpr const char* kCaughtDone = "the catch-up from every HELLO peer ended by its done test";
+constexpr const char* kCaughtJoin = "a join attempt completed; rule (4) kept the node's chain";
+std::optional<CaughtLine> parse_caught(const std::string& l) {
+    static const std::string pre = "relay: caught up (", mid = ") at pos ", tk = " t=";
+    if (l.rfind(pre, 0) != 0) return std::nullopt;
+    const std::size_t m = l.rfind(mid), k = l.rfind(tk);
+    if (m == std::string::npos || m < pre.size() || k == std::string::npos || k < m + mid.size()) return std::nullopt;
+    CaughtLine c;
+    c.form = l.substr(pre.size(), m - pre.size());
+    if (!whole_u64(l.substr(m + mid.size(), k - m - mid.size()), c.pos) || !whole_u64(l.substr(k + tk.size()), c.t))
+        return std::nullopt;
+    return c;
+}
+// The `relay: caught up (` lines of one node.
+std::vector<std::string> caught_of(const std::map<std::size_t, std::vector<std::string>>& lines, std::size_t node) {
+    std::vector<std::string> out;
+    if (const auto it = lines.find(node); it != lines.end())
+        for (const std::string& l : it->second)
+            if (l.rfind("relay: caught up (", 0) == 0) out.push_back(l);
+    return out;
+}
+
+// statustime: the status block's time line (serve_pathb prints it after `status: up=`) on the system relay clock:
+// "  time: t=<unix ms>", parsed whole; three prints 3 ms apart rise, each inside the system clock's bracket.
+void statustime() {
+    const auto sys_ms = [] {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::system_clock::now().time_since_epoch())
+                                                  .count());
+    };
+    const std::string pre = "  time: t=";
+    const bool fixed = pb::status_time_line(1761700000123ULL) == "  time: t=1761700000123";
+    const pb::RelayClock c = pb::RelayClock::system();
+    std::vector<std::uint64_t> ts;
+    bool parsed = true, inside = true;
+    std::string last;
+    for (int i = 0; i < 3; ++i) {
+        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        const std::uint64_t lo = sys_ms();
+        last = pb::status_time_line(c.wall_ms());
+        const std::uint64_t hi = sys_ms();
+        std::uint64_t t = 0;
+        parsed = parsed && last.rfind(pre, 0) == 0 && whole_u64(last.substr(pre.size()), t);
+        inside = inside && t >= lo && t <= hi;
+        ts.push_back(t);
+    }
+    const bool rising = ts.size() == 3 && ts[0] < ts[1] && ts[1] < ts[2];
+    std::printf("  statustime: %s; rises %llu -> %llu -> %llu\n", last.c_str(), (unsigned long long)ts[0],
+                (unsigned long long)ts[1], (unsigned long long)ts[2]);
+    check(fixed, "statustime: status_time_line(1761700000123) == \"  time: t=1761700000123\"");
+    check(parsed && inside && rising,
+          "statustime: three time lines on the system relay clock parse whole, each inside the system clock's unix-ms "
+          "bracket, and rise");
+}
+
 struct Branches {
     KatRelay a, b;
     bool ok = true;
@@ -10132,14 +10206,20 @@ void catchkeep() {
     const bool claim_loses = !pb::fork_choice_prefers(pb::ChainTip{h[b].tree().best().cum_work, h[b].tree().best().id},
                                                       pb::ChainTip{h[j.node].tree().best().cum_work, tip_a});
     w.edit = drop_headers(2, 1);  // B's own catch-up toward J gets no reply: B stays on its branch
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
     w.connect(1, 2);
     w.run();
+    const std::uint64_t t_line = h.now * 1000;  // the relay clock's wall_s() * 1000 (the KAT clock sets no wall_ms)
     const std::uint64_t asks = j.relay->stats().catchup_requests.load();
     const bool caught = h[j.node].caught_up() && kvj.data.count(ncu) == 0 && !h[j.node].first_round_open();
     const bool kept = h[j.node].tree().best().id == tip_a && !h[j.node].holds_tip(h[b].tree().best().id);
     w.links[2]->disconnect(w.id(2, 1));
     w.run();
     w.edit = nullptr;
+    g_relay_lines = nullptr;
+    const std::vector<std::string> cl = caught_of(lines, j.node);
+    const std::optional<CaughtLine> c = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
     const pb::TemplateStatus s1 = tstatus(h, j.node);
     std::printf("  catchkeep: J at %llu (B at %llu); catch-up asks %llu; caught up %d; templates %d -> %d\n",
                 (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[b].tree().best().pos,
@@ -10149,6 +10229,11 @@ void catchkeep() {
     check(asks >= 2 && kept && caught && s1 != pb::TemplateStatus::NoPathbPeer && s1 != pb::TemplateStatus::CatchingUp,
           "catchkeep: the catch-up toward B's unheld lighter tip ends at its reply (A's chain kept) and leaves the store "
           "caught up: the record gone, templates with no peer (asks " + std::to_string(asks) + ")");
+    std::printf("  catchkeep: %s\n", cl.empty() ? "no caught-up line" : cl[0].c_str());
+    check(c && c->form == kCaughtDone && c->pos == 6 && c->pos == h[j.node].tree().best().pos && c->t == t_line,
+          "catchkeep: one caught-up line, the done-test form ending \" at pos 6 t=" + std::to_string(t_line) +
+                  "\" (J's best position, the relay clock's unix ms at the line; lines " + std::to_string(cl.size()) +
+                  ")");
 }
 
 // catchlight: a lighter unheld tip costs at most one locator round per HELLO and never switches the chain. A holds
@@ -10432,6 +10517,8 @@ struct HeavyResult {
     std::size_t c_pairs = 0;     // the joiner's queue after C's empty reply from position 0 (before any attempt)
     bool c_again = false;        // C's tip offered again by the same server: a second pair queued
     int restart_round = -1;      // silent: after a restart and C's HELLO, the first round open (1) or not (0)
+    std::vector<std::string> caught;  // J's `relay: caught up (` lines over the run
+    std::uint64_t b_pos = 0, b_t = 0;  // J's best position and the relay clock's unix ms at B's attempt
 };
 HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
     const KatNet net;
@@ -10519,6 +10606,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
             w.run();
         }
     };
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
     w.connect(1, jwire);
     if (mode != 0) w.connect(0, jwire);
     w.run();
@@ -10534,6 +10623,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
     }
     out.b_completed = sb && sb->report && sb->report->end == pb::AttemptEnd::Completed && !sb->sw.adopted && !sb->sw.replaced
                       && sb->report->server == static_cast<std::uint64_t>(1 + 1);
+    out.b_pos = h[j.node].tree().best().pos;
+    out.b_t = h.now * 1000;
     out.ncu_after_b = !h[j.node].caught_up();
     const std::uint64_t offers0 = rj.stats().empty_store_offers.load();
     const std::uint64_t asks0 = rj.stats().catchup_requests.load();
@@ -10562,6 +10653,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
         out.restart_round = h[jr].first_round_open() ? 1 : 0;
     }
     w.edit = nullptr;
+    g_relay_lines = nullptr;
+    out.caught = caught_of(lines, j.node);
     return out;
 }
 void catchheavy() {
@@ -10574,6 +10667,13 @@ void catchheavy() {
                     tag.c_str(), r.b_completed ? 1 : 0, r.ncu_after_b ? 1 : 0, (unsigned long long)r.c_offers,
                     (unsigned long long)r.c_asks, (unsigned long long)r.j_pos, r.at_c ? 1 : 0, r.ncu_end ? 1 : 0,
                     r.restart_round);
+        for (const std::string& l : r.caught) std::printf("  %s%s (B's attempt at pos %llu t=%llu)\n", tag.c_str(), l.c_str(),
+                                                          (unsigned long long)r.b_pos, (unsigned long long)r.b_t);
+        const std::optional<CaughtLine> c = r.caught.size() == 1 ? parse_caught(r.caught[0]) : std::nullopt;
+        check(c && c->form == kCaughtJoin && c->pos == 8 && c->pos == r.b_pos && c->t == r.b_t,
+              tag + "B's completed attempt: one caught-up line, the join-attempt form ending \" at pos 8 t=" +
+                      std::to_string(r.b_t) + "\" (J's best position, the relay clock's unix ms at the line; lines " +
+                      std::to_string(r.caught.size()) + ")");
         check(r.setup && r.b_completed, tag + "setup (J at D's 8, K_NCU; B's attempt completes, rule (4) keeps J's chain)");
         if (mode != 2)
             check(r.c_offers == 1 && r.c_pairs == 1 && !r.c_again && r.at_c && !r.ncu_end,
@@ -12188,6 +12288,7 @@ int main(int argc, char** argv) {
     run("placedcopy", placedcopy);
     run("placedvariant", placedvariant);
     run("revnotcarrier", revnotcarrier);
+    run("statustime", statustime);
     run("catchkeep", catchkeep);
     run("catchlight", catchlight);
     run("catchoffer", catchoffer);

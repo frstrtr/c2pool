@@ -1408,6 +1408,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // acceptance gate above is unchanged.
     double credited_difficulty =
         (job.issued_difficulty > 0.0) ? job.issued_difficulty : vardiff_difficulty;
+    submit_window_->add_accepted_work(credited_difficulty);
     double work = credited_difficulty * TWO_32;
     bool is_dead = (job.stale_info != 0);
 
