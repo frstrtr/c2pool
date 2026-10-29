@@ -71,6 +71,9 @@
 //   joinedfresh a fresh store whose only servers are joined nodes: its
 //              catch-up from position 0 gets no header, the tip is offered to
 //              the joiner, the attempt is adopted: caught up, templates;
+//   joinedlag  the same with the servers 6 past their own join: attempts
+//              NotServed; once the servers pass one Monero height (12 more,
+//              the same links) an attempt completes; K_NCU ends;
 //   joinrx     a RandomX failure in a join attempt: NodeInternal, an alarm,
 //              no token, the pair kept; the next attempt joins;
 //   joinnohash the same through the binary's verify (no hash computed);
@@ -2464,6 +2467,107 @@ void joinedfresh() {
     std::printf("  joinedfresh: %.1f s\n", secs_since(t0));
 }
 
+// joinedlag: joinedfresh with the two joined servers only 6 positions past their own join (L + 6): the fresh store's
+// attempts end NotServed (fetch A). The servers then follow 12 more carriers (past L + 12, one Monero height), relayed
+// to the store as floods on the same links: an attempt completes at the servers' tip and K_NCU ends.
+struct LagPhase {
+    std::uint64_t offers = 0, attempts = 0, pos = 0;
+    int secs = 0;
+    bool caught = false, ncu = false, at_tip = false;
+    std::string last;
+};
+void joinedlag() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, k = 6, more = 12;
+    KatNode a(net, kJ);
+    grow(a, L);
+    Harness h(net);
+    Joined j1 = join_at(h, net, a, kJ);
+    Joining j2 = joining_node(h, net, kJ);
+    h.hello(j2.j, j1.s);
+    const pb::JoinStep st2 = h[j2.j].run_join();
+    const bool joined = j1.ok && st2.switched && h[j2.j].joined() != nullptr;
+    check(joined, "joinedlag: two nodes joined at L");
+    if (!joined) return;
+    const auto follow_k = [&](std::uint64_t n) {
+        const std::vector<pb::Hash32> next = grow(a, n);
+        h.mon_tip = h_pos(a.store.tip_pos()) + 1;
+        for (const std::size_t j : {j1.jn.j, j2.j})
+            for (const pb::Hash32& id : next)
+                (void)h[j].on_carrier(j1.s, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
+        h.q.clear();
+        return next;
+    };
+    (void)follow_k(k);
+    MultiServerLinks links;
+    links.h = &h;
+    links.servers = {j1.jn.j, j2.j};
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    pb::PathbRelayNode relay(o, links, clock);
+    links.relay = &relay;
+    const std::size_t r = h.nodes.size();
+    links.self = r;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    MemoryKv& kv = *h.kvs.back();
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(h.config(kat_table(net), false, kJ), relay.bind_io(h.io(r)), &kv));
+    relay.attach(*h.nodes[r]);
+    relay.set_drive([&links] { return links.step(); });
+    std::string why;
+    const bool started = relay.start(why);
+    const std::string ncu = pb::store_keys::ncu(0);
+    const std::uint64_t p53 = h[r].config().abandon_timeout_s;
+    const auto phase = [&](int secs) {
+        LagPhase ph;
+        for (; ph.secs < secs && h[r].tree().best().id != a.store.best_tip(); ++ph.secs) {
+            if (const std::optional<pb::JoinStep> st = relay.join_step(); st && st->report) ph.last = rep_desc(*st->report);
+            links.run();
+            h.now += 1;
+            relay.tick();
+            links.run();
+        }
+        ph.offers = relay.stats().empty_store_offers.load();
+        ph.attempts = relay.stats().join_attempts.load();
+        ph.pos = h[r].tree().best().pos;
+        ph.caught = h[r].caught_up();
+        ph.ncu = kv.data.count(ncu) != 0;
+        ph.at_tip = h[r].tree().best().id == a.store.best_tip();
+        return ph;
+    };
+    const auto show = [&](const char* name, const LagPhase& ph) {
+        std::printf("  joinedlag %s: servers at %llu; after %d s the store at %llu (at the tip %d); empty-store offers %llu; "
+                    "join attempts %llu; caught up %d; K_NCU %d; last attempt: %s\n",
+                    name, (unsigned long long)h[j1.jn.j].tree().best().pos, ph.secs, (unsigned long long)ph.pos,
+                    ph.at_tip ? 1 : 0,
+                    (unsigned long long)ph.offers, (unsigned long long)ph.attempts, ph.caught ? 1 : 0, ph.ncu ? 1 : 0,
+                    ph.last.c_str());
+    };
+    links.connect_all();
+    links.run();
+    const LagPhase p1 = phase(static_cast<int>(2 * p53));
+    show("(L + 6)", p1);
+    // the servers pass one Monero height: 12 more carriers, relayed to the store as floods on the same links
+    const std::vector<pb::Hash32> next = follow_k(more);
+    for (const pb::Hash32& id : next)
+        for (std::uint64_t p : {std::uint64_t{1}, std::uint64_t{2}})
+            links.inbox.emplace_back(p, *pb::encode_fc_carrier(0, *a.bodies.get(id), pb::kRuledLaneParams.r_max));
+    links.run();
+    const LagPhase p2 = phase(static_cast<int>(6 * p53));
+    show("(L + 18, the same links)", p2);
+    check(started && !p1.at_tip && p1.ncu, "joinedlag: setup (servers at L + 6: the store not at their tip, K_NCU)" +
+                                                   (why.empty() ? "" : "; " + why));
+    check(p2.at_tip && p2.caught && !p2.ncu && h[r].joined() != nullptr && relay.stats().bans.load() == 0,
+          "joinedlag: once the servers pass one Monero height the join completes on the same links and K_NCU ends (" +
+                  std::to_string(p2.secs) + " s, attempts " + std::to_string(p2.attempts - p1.attempts) + ")");
+    relay.stop();
+    std::printf("  joinedlag: %.1f s\n", secs_since(t0));
+}
+
 // ---------------------------------------------------------------------------
 // joinrx: a RandomX failure inside a join attempt (a header's PoW of the server's chain): the attempt ends
 // NodeInternal with a local alarm, no token; the pair stays queued, the node not attempting; the next attempt joins.
@@ -2880,6 +2984,7 @@ int main(int argc, char** argv) {
                                 {"joinedpeer", joinedpeer, 45},
                                 {"joinedstall", joinedstall, 60},
                                 {"joinedfresh", joinedfresh, 60},
+                                {"joinedlag", joinedlag, 90},
                                 {"joinrx", joinrx, 27},
                                 {"joinnohash", joinnohash, 45},
                                 {"keycache", keycache, 17},
