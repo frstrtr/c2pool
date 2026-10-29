@@ -1354,6 +1354,20 @@ MiningInterface::build_connection_coinbase(
         atomic_mm_commitment = std::move(fresh_commit);
         ws.merged_header_infos.clear();
         ws.merged_header_infos.reserve(header_infos.size());
+        // The merged payouts must be the PPLNS split at THIS job's prev share:
+        // a V36 peer re-derives the merged coinbase from the share's
+        // previous_share_hash and rejects the share when it differs (p2pool
+        // data.py verify_merged_coinbase_commitment). A block split at
+        // another best share (the best moved after the rebuild) stays out of
+        // this job: no mm_data, no merged info.
+        bool other_best = false;
+        for (const auto& hi : header_infos)
+            other_best = other_best || (!hi.payout_basis.IsNull() && hi.payout_basis != prev_share_hash);
+        if (other_best) {
+            atomic_mm_commitment.clear();
+            header_infos.clear();
+            m_merged_basis_mismatch_jobs.fetch_add(1, std::memory_order_relaxed);
+        }
         for (auto& hi : header_infos) {
             CachedMergedHeaderInfo c;
             c.chain_id = hi.chain_id;
@@ -1363,6 +1377,7 @@ MiningInterface::build_connection_coinbase(
             c.coinbase_merkle_branches = std::move(hi.coinbase_merkle_branches);
             c.coinbase_script = std::move(hi.coinbase_script);
             c.coinbase_hex = std::move(hi.coinbase_hex);
+            c.payout_basis = hi.payout_basis;
             ws.merged_header_infos.push_back(std::move(c));
         }
     }
@@ -5875,8 +5890,10 @@ nlohmann::json MiningInterface::rest_local_stats()
         result["merged_template_gate"] = m_mm_manager->get_template_gate_json();
     // Merged-work rebuilds that got no payouts, by reason, and what they did
     // with the chain's commitment (kept the last block / dropped it).
-    if (m_mm_manager)
+    if (m_mm_manager) {
         result["merged_rebuild"] = m_mm_manager->get_rebuild_stats_json();
+        result["merged_rebuild"]["jobs_merged_other_best"] = m_merged_basis_mismatch_jobs.load();
+    }
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

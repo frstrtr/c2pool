@@ -22,13 +22,15 @@
 ///   - no weights for the current best share yet: compute them under the
 ///     lock if it is free, waiting for it up to max_wait where waiting is
 ///     allowed (the merged-mining RPC thread, not the network thread);
-///   - still busy: the weights the compute thread published last. Their best
-///     share is the tip of the best chain as the compute thread last decided
-///     it (the current one differs only in the moment between that decision
-///     and its publication, or when best_share_hash() falls back to another
-///     verified head). A payout set seconds stale is a valid merged coinbase
-///     (it sums to the value) and peers do not reconstruct it;
 ///   - else no payouts, with the reason ("tracker_busy").
+///
+/// Never the weights of another best share: a V36 peer re-derives the
+/// merged coinbase from the PPLNS weights at the LTC share's
+/// previous_share_hash (p2pool data.py verify_merged_coinbase_commitment,
+/// called from Share.check) and rejects the share when it differs. The
+/// payouts are for exactly `best`, and the merged manager records that best
+/// with the block (MergedMiningManager::note_payout_basis) so a job on
+/// another prev share does not carry it.
 
 #include <core/uint256.hpp>
 
@@ -64,8 +66,7 @@ public:
         uint64_t published{0};           // weights published by the compute thread
         uint64_t from_weights{0};        // payouts derived from weights already there (no lock)
         uint64_t computed{0};            // weights computed on request (lock taken)
-        uint64_t reused_across_best{0};  // the last published weights, current best had none
-        uint64_t busy{0};                // no weights at all: no payouts
+        uint64_t busy{0};                // no weights for the best share: no payouts
     };
 
     explicit MergedPayoutSource(std::chrono::milliseconds max_wait = std::chrono::milliseconds(250),
@@ -112,10 +113,6 @@ public:
                 break;
             std::this_thread::sleep_for(m_step);
         }
-        if (auto w = latest(chain_id)) {
-            bump(&Stats::reused_across_best);
-            return derive(*w, value, miss);
-        }
         bump(&Stats::busy);
         miss = "tracker_busy";
         return {};
@@ -126,9 +123,6 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_stats;
     }
-
-    /// Payouts produced from weights of another best share than the current one.
-    uint64_t reused() const { return stats().reused_across_best; }
 
 private:
     static Payouts derive(const Weights& w, uint64_t value, std::string& miss)
@@ -173,21 +167,12 @@ private:
         return std::nullopt;
     }
 
-    std::optional<Weights> latest(uint32_t chain_id) const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        const auto it = m_latest.find(chain_id);
-        if (it == m_latest.end())
-            return std::nullopt;
-        return it->second;
-    }
-
     std::chrono::milliseconds m_max_wait;
     std::chrono::milliseconds m_step;
     size_t m_keep;
     mutable std::mutex m_mutex;
     std::deque<Weights> m_entries;
-    std::map<uint32_t, Weights> m_latest;   // the last published weights per chain
+    std::map<uint32_t, Weights> m_latest;   // the last published weights per chain (never evicted)
     Stats m_stats;
 };
 

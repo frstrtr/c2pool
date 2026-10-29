@@ -264,6 +264,12 @@ public:
         std::vector<uint256> coinbase_merkle_branches;
         std::vector<unsigned char> coinbase_script;  // scriptSig from the merged coinbase
         std::string coinbase_hex;  // full coinbase TX hex (for freezing at submission time)
+        // The sharechain best share the coinbase's PPLNS payouts were split
+        // at (note_payout_basis); null when they do not come from the
+        // sharechain. Only a job whose LTC share has this prev share may
+        // carry the block: a V36 peer re-derives the payouts from the share's
+        // previous_share_hash.
+        uint256 payout_basis;
     };
 
     // ─── Cached DOGE block data (p2pool: merged_work variable) ──────────
@@ -407,16 +413,20 @@ public:
     /// ("no_best_share", "tracker_busy", ...); the rebuild that asked counts
     /// it (get_rebuild_stats_json).
     static void note_payout_miss(const std::string& reason);
+    /// The payout provider calls this with the sharechain best share its
+    /// payouts are (or would be) split at; the rebuild records it with the
+    /// block (MergedHeaderInfo::payout_basis).
+    static void note_payout_basis(const uint256& best);
     /// True on the merged-mining RPC thread (polls / refreshes), where a
     /// payout provider may wait a little for a busy lock; false on the
     /// network thread, which must not.
     static bool on_rpc_thread();
 
     /// {"no_payouts": {reason: rebuilds}, "kept_last_block": n,
-    ///  "dropped_commitment": n, "stale_results": n, "work_changed": n,
+    ///  "dropped_commitment": n, "dropped_best_moved": n, "stale_results": n, "work_changed": n,
     ///  "work_unchanged": n, "snapshot_target_refusals": n,
     ///  "no_payout_seconds": s, "no_payout_now": [symbols],
-    ///  "payout_source": {published, from_weights, computed, reused_across_best, busy}}.
+    ///  "payout_source": {published, from_weights, computed, busy}}.
     nlohmann::json get_rebuild_stats_json() const;
 
     /// Steady-clock seconds the manager stamps snapshots and episodes with
@@ -495,6 +505,7 @@ private:
         std::string frozen_coinbase_hex;   // pre-built PPLNS coinbase from ref_hash_fn time
         nlohmann::json frozen_template;    // template snapshot from ref_hash_fn time
         uint256 frozen_block_hash;         // block hash at commit time (for AuxPoW proof)
+        uint256 frozen_payout_basis;       // best share its payouts were split at
 
         // History of frozen snapshots keyed by block hash.
         // Solves the stale-commitment race: the LTC coinbase contains an MM root
@@ -544,6 +555,8 @@ private:
     std::map<std::string, uint64_t> m_rebuild_no_payouts;
     uint64_t m_rebuild_kept_last_block{0};
     uint64_t m_rebuild_dropped_commitment{0};
+    // ...of which because the last block's payouts are for another best share.
+    uint64_t m_rebuild_dropped_best_moved{0};
     uint64_t m_rebuild_stale_results{0};
     // Rebuilds whose result reached the miners (work pushed) or did not
     // change what they commit to (no push).

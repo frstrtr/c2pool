@@ -96,6 +96,7 @@ struct Rig {
     LtcNode ltc;
     MiningInterface mi{/*testnet=*/true};
     bool payouts{true};
+    uint256 best;   // the sharechain best share the merged payouts are split at
     // What ref_hash_fn saw (it copies these into the share's merged_coinbase_info).
     std::vector<MiningInterface::CachedMergedHeaderInfo> share_infos;
 
@@ -105,6 +106,7 @@ struct Rig {
         doge = backend.get();
         mm.add_chain(doge->cfg, std::move(backend));
         mm.set_payout_provider([this](uint32_t, uint64_t value) -> Payouts {
+            MergedMiningManager::note_payout_basis(best);
             if (!payouts) {
                 MergedMiningManager::note_payout_miss("tracker_busy");
                 return {};
@@ -136,13 +138,14 @@ struct Rig {
         });
     }
 
-    /// A stratum job: the coinbase hex, with share_infos set as the share gets them.
-    std::string job()
+    /// A stratum job on prev share `prev`: the coinbase hex, with share_infos
+    /// set as the share gets them.
+    std::string job(const uint256& prev = uint256())
     {
         const std::vector<unsigned char> payout{0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                                                 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x88, 0xac};
         share_infos.clear();
-        auto cbr = mi.build_connection_coinbase(uint256(), "aabbccdd", payout, {});
+        auto cbr = mi.build_connection_coinbase(prev, "aabbccdd", payout, {});
         EXPECT_FALSE(cbr.coinb1.empty());
         return cbr.coinb1 + cbr.coinb2;
     }
@@ -220,4 +223,36 @@ TEST(MergedShareSide, DroppedCommitmentLeavesNeitherMmDataNorMergedInfo)
     cb = r.job();
     EXPECT_EQ(mm_root(cb), b);
     expect_share_matches_coinbase(cb, r.share_infos, "built again");
+}
+
+// The merged block's payouts are the PPLNS split at the best share of its
+// rebuild. A job whose share has another prev share (the best moved since
+// the rebuild) must not carry it: a V36 peer re-derives the merged coinbase
+// from the share's previous_share_hash (p2pool data.py
+// verify_merged_coinbase_commitment) and rejects the share.
+TEST(MergedShareSide, JobOnAnotherPrevShareCarriesNoMergedBlock)
+{
+    Rig r;
+    r.best.SetHex("b1");
+    r.mm.refresh_aux_work();
+    const uint256 a = r.mm.get_current_work().at(98).block_hash;
+    r.mi.refresh_work();
+
+    std::string cb = r.job(r.best);
+    EXPECT_EQ(mm_root(cb), a) << "a job on the payouts' best share carries the block";
+    expect_share_matches_coinbase(cb, r.share_infos, "same prev share");
+
+    uint256 b2;
+    b2.SetHex("b2");                           // the best moved, no rebuild yet
+    cb = r.job(b2);
+    EXPECT_TRUE(mm_root(cb).IsNull()) << "mm_data for payouts at another prev share";
+    EXPECT_TRUE(r.share_infos.empty()) << "merged info for payouts at another prev share";
+    EXPECT_EQ(r.mi.get_merged_basis_mismatch_jobs(), 1u);
+
+    r.best = b2;                               // the rebuild at the new best
+    r.mm.mark_pplns_dirty();
+    r.mm.refresh_aux_work();
+    cb = r.job(b2);
+    EXPECT_FALSE(mm_root(cb).IsNull()) << "the block rebuilt at the job's prev share is carried";
+    expect_share_matches_coinbase(cb, r.share_infos, "rebuilt at the new best");
 }
