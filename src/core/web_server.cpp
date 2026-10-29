@@ -5866,6 +5866,10 @@ nlohmann::json MiningInterface::rest_local_stats()
     // cleaned the mempool: coinbase only) and fetched again clean, per chain.
     if (m_mm_manager)
         result["merged_template_gate"] = m_mm_manager->get_template_gate_json();
+    // Merged-work rebuilds that got no payouts, by reason, and what they did
+    // with the chain's commitment (kept the last block / dropped it).
+    if (m_mm_manager)
+        result["merged_rebuild"] = m_mm_manager->get_rebuild_stats_json();
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).

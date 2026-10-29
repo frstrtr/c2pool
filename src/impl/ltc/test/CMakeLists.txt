@@ -182,6 +182,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # aux daemons' CAuxPow::getExpectedIndex (#2060): two chains {98, 1} at
     # {0, 1}, colliding ids grow the tree, every proof carries the index and
     # size the daemon checks. Same folding rule.
+    #
+    # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
+    # rebuild without payouts never commits to the parent's hash (keeps the
+    # last block on the same parent, else no commitment), a stale rebuild is
+    # not frozen under a newer template, and MergedPayoutSource produces the
+    # payouts while the tracker lock is busy. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -217,6 +223,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ltc_template_time_test.cpp
         mempool_mweb_admission_test.cpp
         merged_found_record_test.cpp
+        merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp

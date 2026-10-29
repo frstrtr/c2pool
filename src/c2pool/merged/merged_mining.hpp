@@ -395,6 +395,19 @@ public:
     /// when a poll is already running.
     void request_refresh();
 
+    /// The payout provider calls this before returning no payouts, with why
+    /// ("no_best_share", "tracker_busy", ...); the rebuild that asked counts
+    /// it (get_rebuild_stats_json).
+    static void note_payout_miss(const std::string& reason);
+    /// True on the merged-mining RPC thread (polls / refreshes), where a
+    /// payout provider may wait a little for a busy lock; false on the
+    /// network thread, which must not.
+    static bool on_rpc_thread();
+
+    /// {"no_payouts": {reason: rebuilds}, "kept_last_block": n,
+    ///  "dropped_commitment": n, "stale_results": n}.
+    nlohmann::json get_rebuild_stats_json() const;
+
 private:
     void poll_loop();
 
@@ -441,6 +454,10 @@ private:
 
     // Registered aux chains
     struct ChainState {
+        // A run of rebuilds that got no payouts for this chain (logged once).
+        bool                                 no_payout_episode{false};
+        int64_t                              no_payout_since{0};      // steady seconds
+        uint64_t                             no_payout_rebuilds{0};
         AuxChainConfig                       config;
         std::unique_ptr<IAuxChainBackend>    rpc;       // primary backend (RPC or embedded)
         std::unique_ptr<IAuxChainBackend>    fallback;  // fallback backend (embedded if primary is RPC)
@@ -504,6 +521,12 @@ private:
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
+
+    // Rebuilds without payouts (guarded by m_mutex).
+    std::map<std::string, uint64_t> m_rebuild_no_payouts;
+    uint64_t m_rebuild_kept_last_block{0};
+    uint64_t m_rebuild_dropped_commitment{0};
+    uint64_t m_rebuild_stale_results{0};
 
     // THE state root provider for sharechain anchoring
     StateRootProvider m_state_root_provider;

@@ -1053,8 +1053,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # FAILS CLOSED. Folded into this SAME allowlisted target for the #143/#769
     # NOT_BUILT reason (a standalone add_executable is not in build.yml's
     # --target list and would silently report "Not Run").
+    # Eighth TU (PoSe penalty oracle, design PR-B): test_dash_pose_oracle_feeder.cpp
+    # — the feeder that keeps the bridge DML fold engine at the live tip
+    # (coin/pose_oracle_feeder.hpp): members_for fallback + request-on-miss,
+    # the deferred straddle bootstrap on real mainnet bytes (cycle 2513088 at
+    # cursor 2513129, block 2513130), hold-not-poison, v4 persist/resume,
+    # reorg rollback. Same allowlisted target, same #143 NOT_BUILT reason.
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
                    test_dash_mn_diff_store.cpp
+                   test_dash_pose_oracle_feeder.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
@@ -1121,6 +1128,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
         test_dash_collateral_spend_filter.cpp
+        # test_dash_sml_pose_fold.cpp (sml_pose_fold.hpp): the serve-time PoSe
+        # pass over a template's real quorum commitments (incident h=2561514)
+        # — dashd's DecreaseScores -> HandleQuorumCommitment -> PoSePunish on
+        # penalty-oracle bounds, the 2561514 shape from the block's real
+        # payloads, the fail-closed equivalence to the pre-fix predicate, and
+        # builder x gate root parity. Folded here per the same #769 rule.
+        test_dash_sml_pose_fold.cpp
         # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 production freeze —
         # NodeCoinState-level memo of the projected-SML root + quorum root
         # (epoch-invalidated). Pins: warm emit_ok does no hashing (T1),
@@ -1358,7 +1372,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # re-seed ask) unchanged; and the consumer half of the G7 split (below-tip
     # seed catch-up / refusal-to-arm). Links leveldb via core.
     add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp
-                   test_dash_mn_gap_repair.cpp)
+                   test_dash_mn_gap_repair.cpp
+                   test_dash_payee_fold_feeder.cpp)   # ordered connect (payee + UTXO lanes)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
