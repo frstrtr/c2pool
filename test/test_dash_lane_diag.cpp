@@ -417,6 +417,48 @@ TEST(DashLaneDiag, FrozenOndemandMnlistReasksAnotherPeerAndExpandsOnWallClock)
     EXPECT_TRUE(rig.last_stall);
 }
 
+// ── F3: the masternode-list re-ask follows dashd's block-stall schedule ────
+// The 2026-10-26 reserve re-seed spent 6 min on a BAN-STATE probe (re-asks at
+// 71..311 s) and 3 min on the tip PoSe fold, on the 45 s grace + 30 s tick
+// cadence, over a churning pool. Inside the grace the SAME request is now
+// re-sent through the rotating first-ask seam (no carrier struck) at 2 s,
+// doubling — dashd BLOCK_STALLING_TIMEOUT_DEFAULT 2 s .. _MAX 64 s
+// (net_processing.cpp:141-143, 6441) — driven by the 3 s service tick; the
+// striking re-ask still takes over at the grace.
+TEST(DashLaneDiag, MnlistReaskFollowsTheTwoSecondDoublingSchedule)
+{
+    OndemandReaskRig rig;
+    auto cp = diag_checkpoint();
+    rig.headers[kDiagAnchorHeight] = cp.blockhash;
+    rig.tip = kDiagAnchorHeight + 50;
+    rig.lane.arm(cp);
+    rig.lane.pump();
+    ASSERT_TRUE(rig.lane.snapshot_pending());
+    ASSERT_EQ(rig.first_asks, 1);
+
+    rig.now = 1999;  rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 1) << "not before 2 s";
+    rig.now = 2000;  rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 2) << "first re-ask at 2 s, rotating, no strike";
+    EXPECT_EQ(rig.reasks, 0);
+    rig.now = 5999;  rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 2) << "then 4 s later";
+    rig.now = 6000;  rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 3);
+    rig.now = 14000; rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 4) << "then 8 s later";
+    rig.now = 30000; rig.lane.service_tick();
+    EXPECT_EQ(rig.first_asks, 5) << "then 16 s later";
+    EXPECT_EQ(rig.lane.fast_reasks(), 4u);
+    EXPECT_EQ(rig.reasks, 0) << "nobody is struck inside the grace";
+
+    // The grace: the pre-existing striking re-ask, now on the 3 s clock.
+    rig.now = MnCheckpointLane::kStatefulStallGraceMs;
+    rig.lane.service_tick();
+    EXPECT_EQ(rig.reasks, 1);
+    EXPECT_EQ(rig.first_asks, 5);
+}
+
 TEST(DashLaneDiag, ColdStartIsTheDefaultAndIsStated)
 {
     WatchdogRig rig;

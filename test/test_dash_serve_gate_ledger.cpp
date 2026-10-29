@@ -241,3 +241,67 @@ TEST(DashServeGateLedger, ObservedSecIsDeltaAccumulatedAcrossRestart) {
 }
 
 }  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KAT 12 — Gate_SegmentClosesOnWouldServeWhenIdle (F4)
+//
+// THE MEASUREMENT (hotel reserve, 2026-10-26/27). The arm declined from
+// 22:01:36 (mn-needs-reseed), every miner left by 22:11:07, the re-seed
+// published and EMBED-STATUS read `arm=would-serve` from 22:45:02 — but no
+// template was sourced again until GodMiner reconnected at 02:17:43, which is
+// when the segment closed: `[EMBED-GATE-SEG] cause=mn-needs-reseed dur=15058s
+// terminal=resumed`. 3.55 h of miner absence charged to the latch. With the
+// arm ready and sessions == 0 the segment must close at the flip, with
+// terminal=ready-idle, in the journal AND the cumulative ledger.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST(DashServeGateLedger, Gate_SegmentClosesOnWouldServeWhenIdle) {
+    using Served = ServeGateJournal::Served;
+    ServeGateJournal j(/*heartbeat_sec=*/300);
+    ServeGateLedger  ledger;
+
+    const int64_t t0       = 1'000;          // 22:01:36 decline begins
+    const int64_t t_idle   = t0 + 571;       // 22:11:07 last template sourced
+    const int64_t t_ready  = t0 + 2'606;     // 22:45:02 would-serve, nobody connected
+    const int64_t t_miner  = t0 + 15'058;    // 02:17:43 a miner returns
+
+    auto d = j.observe(Served::NoWork, "mn-needs-reseed", t0);
+    ledger.bank_serve(Arm::NoWork, "mn-needs-reseed", d, t0);
+    d = j.observe(Served::NoWork, "mn-needs-reseed", t_idle);
+    ledger.bank_serve(Arm::NoWork, "mn-needs-reseed", d, t_idle);
+
+    // The flip: closes the segment at its true length.
+    d = j.observe_ready_idle(t_ready);
+    ASSERT_EQ(d.trigger, ServeGateJournal::Trigger::ReadyIdle);
+    EXPECT_EQ(d.previous_cause, "mn-needs-reseed");
+    EXPECT_EQ(d.prev_cause_sec, 2'606);
+    ASSERT_NE(ServeGateJournal::seg_terminal_name(d.trigger), nullptr);
+    EXPECT_STREQ(ServeGateJournal::seg_terminal_name(d.trigger), "ready-idle");
+    EXPECT_TRUE(j.ready_idle());
+    EXPECT_STREQ(j.arm_name(), "ready-idle");
+    ledger.bank_ready_idle(d, t_ready);
+
+    // Idempotent while idle.
+    EXPECT_FALSE(j.observe_ready_idle(t_ready + 30).emit());
+
+    // The miner returns: the first embedded serve charges NOTHING more.
+    d = j.observe(Served::Embedded, "", t_miner);
+    EXPECT_FALSE(d.emit()) << "the segment already closed at the flip";
+    ledger.bank_serve(Arm::EmbeddedReal, "", d, t_miner);
+
+    const auto roll = j.rollup(t_miner);
+    ASSERT_EQ(roll.per_cause.size(), 1u);
+    EXPECT_EQ(roll.per_cause[0].first, "mn-needs-reseed");
+    EXPECT_EQ(roll.per_cause[0].second, 2'606)
+        << "the latch held 2606 s; the other 12452 s were miner absence";
+    EXPECT_EQ(roll.off_embedded_sec, 2'606);
+    EXPECT_EQ(ledger.totals().per_cause_sec.at("mn-needs-reseed"), 2'606)
+        << "ledger and journal must bank the same closed segment";
+    EXPECT_EQ(ledger.totals().off_embedded_sec, 2'606);
+
+    // A decline after ready-idle is a fresh TRANSITION, as from serving.
+    ServeGateJournal j2(300);
+    j2.observe(Served::NoWork, "tip-body-pending", 0);
+    j2.observe_ready_idle(10);
+    EXPECT_EQ(j2.observe(Served::NoWork, "dmn-stale", 20).trigger,
+              ServeGateJournal::Trigger::Transition);
+}
