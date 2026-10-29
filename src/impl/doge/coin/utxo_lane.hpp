@@ -30,8 +30,23 @@
 /// it, then connect every block of the new branch in order; MIN_BLOCKS_TO_KEEP
 /// = 1440 (src/validation.h:212).
 ///
-/// Thread: one thread (the io_context the handlers run on), except stats(),
-/// which is atomic and read from the HTTP thread.
+/// Two modes:
+///   - Accrual (the rules above): a partial view born from the last `keep`
+///     blocks, which cannot tell a coin it never saw from a spent one;
+///   - Full: the set is built from genesis and connected strictly, as
+///     dogecoind's chainstate is. It arms from height 1 (an empty set, or one
+///     not built from genesis) or from best + 1 whatever the distance (no
+///     jump, so no restart hole); a body spending a coin the set does not
+///     hold is refused (UTXOViewCache::connect_block strict), refetched, and
+///     after repeated refusals the set is left as is (heal_failures); a
+///     rebuild starts again from height 1. The body's Merkle root is checked
+///     against its header before anything is connected. The set's sync state
+///     ('S') records anchor 0 and, once its best reaches the header chain's
+///     tip, `synced`; host.completed() fires then.
+///
+/// Thread: one thread (the io_context the handlers run on, or the full
+/// set's own pool), except stats(), which is atomic and read from the HTTP
+/// thread.
 
 #include <impl/ltc/coin/block.hpp>
 #include <impl/ltc/coin/transaction.hpp>
@@ -41,6 +56,7 @@
 #include <core/coin/utxo.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/coin/utxo_view_db.hpp>
+#include <core/hash.hpp>
 #include <core/log.hpp>
 #include <core/uint256.hpp>
 
@@ -52,12 +68,38 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace doge {
 namespace coin {
+
+/// How the lane builds its set (see the file comment).
+enum class UtxoLaneMode {
+    Accrual,  // the last `keep` blocks, then forward (partial)
+    Full,     // every block from genesis, strictly connected
+};
+
+/// SHA256d Merkle root of `hashes` (Core ComputeMerkleRoot: the last of an
+/// odd row is paired with itself).
+inline uint256 merkle_root_of(std::vector<uint256> hashes)
+{
+    if (hashes.empty())
+        return uint256();
+    while (hashes.size() > 1) {
+        if (hashes.size() & 1u)
+            hashes.push_back(hashes.back());
+        std::vector<uint256> next;
+        next.reserve(hashes.size() / 2);
+        for (size_t i = 0; i < hashes.size(); i += 2)
+            next.push_back(Hash(std::span<const uint8_t>(hashes[i].data(), 32),
+                                std::span<const uint8_t>(hashes[i + 1].data(), 32)));
+        hashes = std::move(next);
+    }
+    return hashes[0];
+}
 
 /// How a block is asked for.
 enum class UtxoAsk {
@@ -100,6 +142,9 @@ struct UtxoLaneHost {
     std::function<void(const BlockType&, const uint256&, uint32_t, bool drained)> connected;
     /// The set was wiped for a rebuild.
     std::function<void()> wiped;
+    /// Full mode: the set reached the header chain's tip (built from
+    /// genesis, strictly connected): the pool may price against it.
+    std::function<void()> completed;
     /// The ordered pipeline started (arm its stall timer) / stopped.
     std::function<void(Fill&)> fill_started;
     std::function<void(Fill&)> fill_stopped;
@@ -117,6 +162,11 @@ struct UtxoLaneStats {
     std::atomic<uint64_t> heal_failures{0};  // the set could not be brought back (yet)
     std::atomic<uint64_t> headers_from_bodies{0};  // headers the header chain took from a body
     std::atomic<uint64_t> headers_requested{0};    // bodies whose parent was unknown too
+    std::atomic<uint64_t> strict_refusals{0};  // full mode: bodies spending a coin the set does not hold
+    std::atomic<uint64_t> bad_bodies{0};       // full mode: bodies whose Merkle root is not the header's
+    std::atomic<uint64_t> complete{0};         // full mode: 1 once the set reached the header tip
+    std::atomic<uint64_t> ibd_next_height{0};  // full mode: next height the fill connects
+    std::atomic<uint64_t> ibd_rate_bps{0};     // full mode: blocks per second over the last progress step
 
     nlohmann::json to_json() const
     {
@@ -127,6 +177,8 @@ struct UtxoLaneStats {
             {"heals", v(heals)},               {"disconnected", v(disconnected)},
             {"rebuilds", v(rebuilds)},         {"heal_failures", v(heal_failures)},
             {"headers_from_bodies", v(headers_from_bodies)}, {"headers_requested", v(headers_requested)},
+            {"strict_refusals", v(strict_refusals)}, {"bad_bodies", v(bad_bodies)},
+            {"ibd_next_height", v(ibd_next_height)}, {"ibd_rate_bps", v(ibd_rate_bps)},
         };
     }
 };
@@ -135,6 +187,17 @@ class UtxoLane {
 public:
     using BlockType = ltc::coin::BlockType;
     using Fill = UtxoLaneHost::Fill;
+    using Mode = UtxoLaneMode;
+
+    /// Full mode: the fill's request window (<= 64 MB of bodies in flight at
+    /// DOGE's 1 MB block size limit).
+    static constexpr size_t FULL_WINDOW = 64;
+    /// Full mode: a progress line every this many connected blocks.
+    static constexpr uint32_t PROGRESS_EVERY = 10'000;
+    /// Full mode: refusals of one height before its body is asked from every
+    /// peer, and before the set is left as is (heal_failures).
+    static constexpr uint32_t REFUSALS_BROADCAST = 3;
+    static constexpr uint32_t REFUSALS_MAX = 6;
 
     /// What on_block did with the block.
     enum class Fed {
@@ -150,10 +213,15 @@ public:
     };
 
     UtxoLane(core::coin::UTXOViewCache& utxo, core::coin::UTXOViewDB& db, UtxoLaneHost host,
-             uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP)
-        : m_utxo(utxo), m_db(db), m_host(std::move(host)), m_keep(keep)
+             uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP, Mode mode = Mode::Accrual,
+             size_t window = 0)
+        : m_utxo(utxo), m_db(db), m_host(std::move(host)), m_keep(keep), m_mode(mode)
+        , m_tag(mode == Mode::Full ? "[EMB-DOGE] [full]" : "[EMB-DOGE]")
     {
+        m_fill.window = window ? window : (mode == Mode::Full ? FULL_WINDOW : Fill::WINDOW_SIZE);
     }
+
+    Mode mode() const { return m_mode; }
 
     UtxoLane(const UtxoLane&) = delete;
     UtxoLane& operator=(const UtxoLane&) = delete;
@@ -186,12 +254,29 @@ public:
         }
         r.on_best_chain = !at.IsNull() && at == hash;
 
+        if (m_mode == Mode::Full) {
+            if (m_stuck) {
+                r.fed = Fed::Skipped;
+                return r;
+            }
+            // 1. Full mode: the first block arms the fill from height 1 (or
+            //    from best + 1 for a set built from genesis), whatever the
+            //    distance.
+            if (!m_bootstrap_done && !m_fill.active && height > 0) {
+                m_bootstrap_done = true;
+                if (arm_full(block, hash, height, r.on_best_chain)) {
+                    r.fed = Fed::Pipeline;
+                    return r;
+                }
+            }
+        }
+
         // 1. Cold start: the first block above `keep` with the set empty or
         //    too far behind fetches the last `keep` blocks in order (a set too
         //    far behind starts its partial view at height - keep, the one
         //    deliberate jump: that first block passes the next-height and
         //    parent checks).
-        if (!m_bootstrap_done && !m_fill.active && height > m_keep) {
+        if (m_mode == Mode::Accrual && !m_bootstrap_done && !m_fill.active && height > m_keep) {
             m_bootstrap_done = true;
             const uint32_t best = m_utxo.get_best_height();
             const uint32_t start = (best > 0 && best >= height - m_keep) ? best + 1 : height - m_keep;
@@ -203,7 +288,7 @@ public:
                     ordered_buffer(m_fill, height, block, hash);
                 const uint32_t asked = refill(UtxoAsk::Broadcast);
                 LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: " << m_fill.total << " blocks [" << start
-                         << ".." << height << "] window=" << m_fill.WINDOW_SIZE
+                         << ".." << height << "] window=" << m_fill.window
                          << " requests=" << asked;
                 started();
                 r.fed = Fed::Pipeline;
@@ -217,12 +302,12 @@ public:
         //    refusal, keep the window full.
         if (m_fill.active) {
             if (r.on_best_chain)
-                ordered_buffer(m_fill, height, block, hash);
+                buffer(height, block, hash);
             const auto now = std::chrono::steady_clock::now();
             const auto stall =
                 std::chrono::duration_cast<std::chrono::seconds>(now - m_fill.last_drain_time).count();
             if (stall >= m_fill.STALL_TIMEOUT_SEC) {
-                LOG_WARNING << "[EMB-DOGE] " << m_fill.phase << " stall h=" << m_fill.next_height
+                LOG_WARNING << m_tag << " " << m_fill.phase << " stall h=" << m_fill.next_height
                             << " (" << stall << "s) — broadcast fallback";
                 m_host.request(m_fill.next_height, UtxoAsk::Broadcast);
                 m_fill.last_drain_time = now;
@@ -233,9 +318,10 @@ public:
             if (m_fill.active && ordered_done(m_fill)) {
                 m_fill.active = false;
                 stopped();
-                LOG_INFO << "[EMB-DOGE] " << m_fill.phase << " complete: " << m_fill.processed
+                LOG_INFO << m_tag << " " << m_fill.phase << " complete: " << m_fill.processed
                          << " blocks, UTXO at h=" << m_utxo.get_best_height();
             }
+            maybe_complete();
             r.fed = Fed::Pipeline;
             return r;
         }
@@ -247,13 +333,13 @@ public:
         const auto act = r.on_best_chain ? utxo_connect_action(best, height) : UtxoConnect::Skip;
         if (act == UtxoConnect::Gap) {
             m_stats.gaps.fetch_add(1, std::memory_order_relaxed);
-            LOG_WARNING << "[EMB-DOGE] UTXO gap: block h=" << height << " arrived with the UTXO set at h="
+            LOG_WARNING << m_tag << " UTXO gap: block h=" << height << " arrived with the UTXO set at h="
                         << best << " — buffering it and fetching " << best + 1 << ".." << height - 1
                         << " in order";
             ordered_arm(m_fill, best + 1, height);
             m_fill.phase = "UTXO gap fill";
             m_jump_from = 0;
-            ordered_buffer(m_fill, height, block, hash);
+            buffer(height, block, hash);
             refill(UtxoAsk::FromPeer);
             started();
             r.fed = Fed::Pipeline;
@@ -268,7 +354,7 @@ public:
             // NotBestChain here is the benign race between the best-chain
             // look-up and the check (the index moved).
             m_stats.refused.fetch_add(1, std::memory_order_relaxed);
-            LOG_WARNING << "[EMB-DOGE] Block h=" << height << " " << hash.GetHex().substr(0, 16)
+            LOG_WARNING << m_tag << " Block h=" << height << " " << hash.GetHex().substr(0, 16)
                         << "... not connected to the UTXO set (" << connect_check_name(c)
                         << "), UTXO at h=" << best << " "
                         << m_utxo.get_best_block().GetHex().substr(0, 16) << "...";
@@ -276,8 +362,25 @@ public:
             // waiting for the heal's own request.
             if (c == ConnectCheck::ParentMismatch && heal(Heal::ParentMismatch, m_host.chain_height())
                 && m_fill.active)
-                ordered_buffer(m_fill, height, block, hash);
+                buffer(height, block, hash);
             r.fed = Fed::Refused;
+            return r;
+        }
+        if (m_mode == Mode::Full) {
+            const FullConnect fc = connect_full(block, hash, height, false);
+            if (fc != FullConnect::Connected) {
+                // A bad body or a strict refusal: fetch the height again
+                // through the fill (another peer), or leave the set as is.
+                if (fc == FullConnect::Refused)
+                    on_strict_refusal(height);
+                else if (fc == FullConnect::BadBody)
+                    refetch_from_set();
+                r.fed = Fed::Refused;
+                return r;
+            }
+            r.connected = 1;
+            r.fed = Fed::Connected;
+            maybe_complete();
             return r;
         }
         connect(block, hash, height, false);
@@ -309,7 +412,7 @@ public:
                 }
                 return cur;
             });
-        LOG_WARNING << "[EMB-DOGE] Chain tip changed: " << old_tip.GetHex().substr(0, 16) << " (h="
+        LOG_WARNING << m_tag << " Chain tip changed: " << old_tip.GetHex().substr(0, 16) << " (h="
                     << old_height << ") → " << new_tip.GetHex().substr(0, 16) << " (h=" << new_height
                     << ")" << (is_reorg ? " [REORG]" : "");
         if (is_reorg) {
@@ -331,8 +434,143 @@ public:
     const Fill& fill() const { return m_fill; }
     const UtxoLaneStats& stats() const { return m_stats; }
 
+    /// Full mode: the set was left as is after repeated refusals or a write
+    /// failure (heal_failures); nothing is connected until a restart.
+    bool stuck() const { return m_stuck; }
+
 private:
     enum class Heal { Startup, Reorg, ParentMismatch };
+
+    /// What a full-mode connect did with a block.
+    enum class FullConnect {
+        Connected,
+        BadBody,      // its transactions are not the ones its header commits to
+        Refused,      // strict connect: an input the set does not hold
+        WriteFailed,  // the set could not be written (the lane stops)
+    };
+
+    /// Buffer a best-chain block for the running fill. Full mode keeps the
+    /// buffer within the request window: a block further ahead only extends
+    /// the fill's range (it is asked for in order when the window gets there).
+    void buffer(uint32_t height, const BlockType& block, const uint256& hash)
+    {
+        if (m_mode == Mode::Full && height >= m_fill.next_height + m_fill.window) {
+            if (height > m_fill.end_height) {
+                m_fill.end_height = height;
+                m_fill.total = m_fill.processed + (m_fill.end_height - m_fill.next_height + 1);
+            }
+            return;
+        }
+        ltc::coin::ordered_buffer(m_fill, height, block, hash);
+    }
+
+    /// Full mode, the first block: arm the fill. A set that is empty or not
+    /// built from genesis (no sync state, or another anchor) is (wiped and)
+    /// started at height 1; a set built from genesis continues at best + 1,
+    /// however far behind. Returns true when a fill was armed.
+    bool arm_full(const BlockType& block, const uint256& hash, uint32_t height, bool on_best_chain)
+    {
+        const uint32_t tip = std::max(height, m_host.chain_height());
+        const auto ss = m_utxo.sync_state();
+        uint32_t from = 0;
+        if (m_utxo.get_best_block().IsNull() || !ss.tracked() || ss.anchor_height != 0) {
+            if (!start_from_genesis(ss.synced != 0))
+                return false;
+            from = 1;
+        } else {
+            from = m_utxo.get_best_height() + 1;
+        }
+        if (from > tip) {
+            LOG_INFO << m_tag << " UTXO warm restart: best=" << from - 1 << " — no fill needed";
+            return false;
+        }
+        ordered_arm(m_fill, from, tip);
+        m_fill.phase = (from == 1 || tip - from > m_keep) ? "IBD" : "UTXO catch-up";
+        m_jump_from = 0;
+        if (on_best_chain)
+            buffer(height, block, hash);
+        mark_progress();
+        const uint32_t asked = refill(UtxoAsk::Targeted);
+        LOG_INFO << m_tag << " UTXO " << m_fill.phase << ": " << m_fill.total << " blocks [" << from << ".."
+                 << tip << "] window=" << m_fill.window << " requests=" << asked;
+        started();
+        return true;
+    }
+
+    /// Full mode: an empty set with anchor 0 (wiping whatever the DB held).
+    bool start_from_genesis(bool keep_synced)
+    {
+        if (!m_utxo.get_best_block().IsNull() || m_utxo.sync_state().tracked()) {
+            LOG_WARNING << m_tag << " UTXO set at h=" << m_utxo.get_best_height()
+                        << " was not built from genesis: wiping it, connecting from height 1";
+            if (!m_utxo.reanchor()) {
+                m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR << m_tag << " UTXO wipe failed; set left at h=" << m_utxo.get_best_height();
+                return false;
+            }
+            if (m_host.wiped)
+                m_host.wiped();
+        }
+        core::coin::SyncState s;
+        s.anchor_height = 0;
+        s.strict = 1;
+        s.synced = keep_synced ? 1 : 0;
+        s.coins = 0;
+        if (!m_utxo.set_sync_state(s)) {
+            m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR << m_tag << " UTXO sync state could not be written";
+            return false;
+        }
+        m_completed = false;
+        m_stats.complete.store(0, std::memory_order_relaxed);
+        return true;
+    }
+
+    /// Full mode: the set reached the header chain's tip. Record `synced`
+    /// and tell the host (once per run).
+    void maybe_complete()
+    {
+        if (m_mode != Mode::Full || m_completed || !m_utxo.complete(m_host.chain_height()))
+            return;
+        m_completed = true;
+        m_stats.complete.store(1, std::memory_order_relaxed);
+        auto s = m_utxo.sync_state();
+        if (!s.synced) {
+            s.synced = 1;
+            if (!m_utxo.set_sync_state(s))
+                LOG_ERROR << m_tag << " UTXO sync state (synced) could not be written";
+        }
+        LOG_INFO << m_tag << " UTXO set complete: h=" << m_utxo.get_best_height() << " coins=" << s.coins
+                 << " (built from genesis, strictly connected)";
+        if (m_host.completed)
+            m_host.completed();
+    }
+
+    void mark_progress()
+    {
+        m_progress_time = std::chrono::steady_clock::now();
+        m_progress_height = m_utxo.get_best_height();
+        m_stats.ibd_next_height.store(m_progress_height + 1, std::memory_order_relaxed);
+    }
+
+    /// Full mode: a progress line every PROGRESS_EVERY connected blocks.
+    void progress(uint32_t h)
+    {
+        m_stats.ibd_next_height.store(h + 1, std::memory_order_relaxed);
+        if (h < m_progress_height + PROGRESS_EVERY)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(now - m_progress_time).count();
+        const double rate = secs > 0 ? (h - m_progress_height) / secs : 0;
+        const uint32_t tip = std::max(m_host.chain_height(), m_fill.end_height);
+        const uint64_t eta = rate > 0 && tip > h ? static_cast<uint64_t>((tip - h) / rate) : 0;
+        m_stats.ibd_rate_bps.store(static_cast<uint64_t>(rate), std::memory_order_relaxed);
+        LOG_INFO << m_tag << " IBD h=" << h << " /" << tip << " coins=" << m_utxo.sync_state().coins
+                 << " rate=" << static_cast<uint64_t>(rate) << "/s eta=" << eta / 3600 << "h"
+                 << (eta % 3600) / 60 << "m";
+        m_progress_time = now;
+        m_progress_height = h;
+    }
 
     static uint256 txid_of(const ltc::coin::MutableTransaction& tx) { return ltc::coin::compute_txid(tx); }
 
@@ -353,10 +591,22 @@ private:
     }
 
     /// The check at every connect point; the cold start's deliberate jump
-    /// passes the next-height and parent checks once.
+    /// passes the next-height and parent checks once. Full mode has no jump:
+    /// an empty set takes only height 1, on genesis.
     ltc::coin::ConnectCheck check(const BlockType& b, const uint256& bh, uint32_t h)
     {
         using ltc::coin::ConnectCheck;
+        if (m_mode == Mode::Full && m_utxo.get_best_block().IsNull()) {
+            const uint256 at = m_host.chain_hash_at(h);
+            if (at.IsNull() || at != bh)
+                return ConnectCheck::NotBestChain;
+            if (h != 1)
+                return ConnectCheck::NotNext;
+            const uint256 genesis = m_host.chain_hash_at(0);
+            if (!genesis.IsNull() && b.m_previous_block != genesis)
+                return ConnectCheck::ParentMismatch;
+            return ConnectCheck::Ok;
+        }
         auto c = ltc::coin::utxo_connect_check(m_utxo.get_best_height(), m_utxo.get_best_block(), h, bh,
                                                b.m_previous_block, m_host.chain_hash_at(h));
         if (m_jump_from != 0 && h == m_jump_from
@@ -381,18 +631,176 @@ private:
             m_host.connected(b, bh, h, drained);
     }
 
+    /// Full mode: the body's Merkle root, then a strict connect. Undo records
+    /// are kept (and pruned) only for the last `keep` blocks below the header
+    /// tip: a deeper block is never disconnected (a deeper reorg rebuilds).
+    FullConnect connect_full(const BlockType& b, const uint256& bh, uint32_t h, bool drained)
+    {
+        std::vector<uint256> txids;
+        txids.reserve(b.m_txs.size());
+        for (const auto& tx : b.m_txs)
+            txids.push_back(txid_of(tx));
+        if (txids.empty() || merkle_root_of(txids) != b.m_merkle_root) {
+            m_stats.refused.fetch_add(1, std::memory_order_relaxed);
+            m_stats.bad_bodies.fetch_add(1, std::memory_order_relaxed);
+            LOG_WARNING << m_tag << " Block h=" << h << " " << bh.GetHex().substr(0, 16)
+                        << "...: its transactions are not the ones its header commits to (Merkle root); refetching";
+            return FullConnect::BadBody;
+        }
+        core::coin::UTXOViewCache::StrictRefusal why;
+        size_t next = 0;
+        auto undo = m_utxo.connect_block(
+            b, h, [&](const ltc::coin::MutableTransaction&) { return txids[next++]; }, bh, true, &why);
+        if (!undo) {
+            m_stats.refused.fetch_add(1, std::memory_order_relaxed);
+            m_stats.strict_refusals.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR << m_tag << " Block h=" << h << " " << bh.GetHex().substr(0, 16) << "... refused: tx "
+                      << why.txid.GetHex() << " (#" << why.tx_index << ") spends "
+                      << why.missing.txid.GetHex() << ":" << why.missing.index
+                      << ", which the UTXO set does not hold";
+            return FullConnect::Refused;
+        }
+        const uint32_t tip = m_host.chain_height();
+        const bool near_tip = h + m_keep >= tip;
+        if (near_tip)
+            m_db.put_block_undo(h, *undo);
+        if (!m_utxo.flush(bh, h)) {
+            m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR << m_tag << " UTXO write failed at h=" << h << " (disk?); the lane stops, set at h="
+                      << m_utxo.get_best_height();
+            return FullConnect::WriteFailed;
+        }
+        if (near_tip)
+            m_utxo.prune_undo(h, m_keep);
+        m_stats.connected.fetch_add(1, std::memory_order_relaxed);
+        progress(h);
+        if (near_tip)
+            LOG_INFO << "[EMB-DOGE] UTXO: block " << h << " hash=" << bh.GetHex().substr(0, 16)
+                     << " txs=" << b.m_txs.size() << " set=full"
+                     << (drained ? " (" + m_fill.phase + ")" : std::string());
+        if (m_host.connected)
+            m_host.connected(b, bh, h, drained);
+        return FullConnect::Connected;
+    }
+
+    /// Full mode: restart the fill at the set's next height (another peer
+    /// is asked: the requests go round robin).
+    void refetch_from_set()
+    {
+        const uint32_t best = m_utxo.get_best_height();
+        const uint32_t to = std::max(m_host.chain_height(), m_fill.active ? m_fill.end_height : 0u);
+        const std::string phase = m_fill.active ? m_fill.phase : std::string("UTXO refetch");
+        if (to <= best)
+            return;
+        const bool was_active = m_fill.active;
+        ordered_arm(m_fill, best + 1, to);
+        m_fill.phase = phase;
+        refill(UtxoAsk::Targeted);
+        if (!was_active)
+            started();
+    }
+
+    /// Full mode: a body spending a coin the set does not hold. The body
+    /// is asked for again (another peer; from every peer from the third
+    /// refusal of that height); past REFUSALS_MAX the set is left as is.
+    void on_strict_refusal(uint32_t h)
+    {
+        if (m_refusal_height != h) {
+            m_refusal_height = h;
+            m_refusal_count = 0;
+        }
+        ++m_refusal_count;
+        if (m_refusal_count >= REFUSALS_MAX) {
+            m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
+            LOG_ERROR << m_tag << " UTXO set refused h=" << h << " " << m_refusal_count
+                      << " times: left as is at h=" << m_utxo.get_best_height()
+                      << " (templates stay coinbase-only; a restart retries)";
+            stop_stuck();
+            return;
+        }
+        refetch_from_set();
+        if (m_refusal_count >= REFUSALS_BROADCAST)
+            m_host.request(h, UtxoAsk::Broadcast);
+    }
+
+    void stop_stuck()
+    {
+        m_stuck = true;
+        m_fill.buffer.clear();
+        if (m_fill.active) {
+            m_fill.active = false;
+            stopped();
+        }
+    }
+
+    /// Full mode's drain: ordered_drain's loop with the body checks and the
+    /// strict connect between the connect-point check and the next height.
+    uint32_t drain_full()
+    {
+        using ltc::coin::ConnectCheck;
+        ltc::coin::DrainResult r;
+        FullConnect failed = FullConnect::Connected;
+        while (m_fill.buffer.count(m_fill.next_height)) {
+            auto node = m_fill.buffer.extract(m_fill.next_height);
+            auto& [b, bh] = node.mapped();
+            const uint32_t h = m_fill.next_height;
+            const ConnectCheck c = check(b, bh, h);
+            if (c != ConnectCheck::Ok) {
+                r.refused = c;
+                r.refused_height = h;
+                break;
+            }
+            failed = connect_full(b, bh, h, true);
+            if (failed != FullConnect::Connected) {
+                r.refused_height = h;
+                break;
+            }
+            ++m_fill.next_height;
+            ++m_fill.processed;
+            m_fill.last_drain_time = std::chrono::steady_clock::now();
+            ++r.connected;
+        }
+        switch (failed) {
+        case FullConnect::Connected:
+            break;
+        case FullConnect::BadBody:
+            refetch_from_set();
+            return r.connected;
+        case FullConnect::Refused:
+            on_strict_refusal(r.refused_height);
+            return r.connected;
+        case FullConnect::WriteFailed:
+            stop_stuck();
+            return r.connected;
+        }
+        if (r.refused == ConnectCheck::Ok)
+            return r.connected;
+        on_refused(r);
+        return r.connected;
+    }
+
     /// Drain the buffer in order; on a refused block restart the fill at the
     /// set's real next height, or heal a set that is on another branch.
     uint32_t drain()
     {
         using ltc::coin::ConnectCheck;
+        if (m_mode == Mode::Full)
+            return drain_full();
         const auto drained = ltc::coin::ordered_drain(
             m_fill, [&](const BlockType& b, const uint256& bh, uint32_t h) { return check(b, bh, h); },
             [&](const BlockType& b, const uint256& bh, uint32_t h) { connect(b, bh, h, true); });
         if (drained.refused == ConnectCheck::Ok)
             return drained.connected;
+        on_refused(drained);
+        return drained.connected;
+    }
+
+    /// A block the connect-point check refused during a drain.
+    void on_refused(const ltc::coin::DrainResult& drained)
+    {
+        using ltc::coin::ConnectCheck;
         m_stats.refused.fetch_add(1, std::memory_order_relaxed);
-        LOG_WARNING << "[EMB-DOGE] " << m_fill.phase << ": block h=" << drained.refused_height
+        LOG_WARNING << m_tag << " " << m_fill.phase << ": block h=" << drained.refused_height
                     << " not connected (" << ltc::coin::connect_check_name(drained.refused)
                     << "), UTXO at h=" << m_utxo.get_best_height();
         // Restart at the set's next height, or at the pipeline's own start
@@ -414,10 +822,9 @@ private:
         } else {
             stopped();
             m_jump_from = 0;
-            LOG_ERROR << "[EMB-DOGE] " << m_fill.phase << " stopped at h=" << m_utxo.get_best_height()
+            LOG_ERROR << m_tag << " " << m_fill.phase << " stopped at h=" << m_utxo.get_best_height()
                       << " (" << ltc::coin::connect_check_name(drained.refused) << ")";
         }
-        return drained.connected;
     }
 
     /// Bring the set back onto the best chain (main_ltc's EMB-LTC utxo_heal,
@@ -448,7 +855,7 @@ private:
         if (rw.disconnected > 0) {
             if (!m_utxo.flush(rw.hash, rw.height)) {
                 m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
-                LOG_ERROR << "[EMB-DOGE] UTXO flush failed after disconnecting " << rw.disconnected
+                LOG_ERROR << m_tag << " UTXO flush failed after disconnecting " << rw.disconnected
                           << " blocks (" << reason << "); undo data kept, UTXO DB still at h=" << before;
                 return false;
             }
@@ -456,9 +863,36 @@ private:
                 m_db.remove_block_undo(h);
             m_stats.heals.fetch_add(1, std::memory_order_relaxed);
             m_stats.disconnected.fetch_add(rw.disconnected, std::memory_order_relaxed);
-            LOG_WARNING << "[EMB-DOGE] UTXO rewound to the best chain (" << reason << "): disconnected "
+            LOG_WARNING << m_tag << " UTXO rewound to the best chain (" << reason << "): disconnected "
                         << rw.disconnected << " blocks (h=" << before << "→" << rw.height
                         << ") best=" << rw.hash.GetHex().substr(0, 16);
+        }
+        if (rw.permanent() && m_mode == Mode::Full) {
+            // The set cannot be walked back: rebuild it from genesis (the
+            // same IBD; templates stay coinbase-only meanwhile).
+            const uint32_t to = std::max(target_height, m_host.chain_height());
+            LOG_ERROR << m_tag << " UTXO set cannot be brought back to the best chain (" << reason << ": "
+                      << rewind_why_name(rw.why) << " at h=" << rw.height
+                      << "); rebuilding it from genesis: 1.." << to;
+            const bool was_synced = m_utxo.sync_state().synced != 0;
+            if (!m_utxo.reanchor()) {
+                m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR << m_tag << " UTXO re-anchor failed (DB wipe); set left at h="
+                          << m_utxo.get_best_height();
+                return false;
+            }
+            m_stats.rebuilds.fetch_add(1, std::memory_order_relaxed);
+            if (m_host.wiped)
+                m_host.wiped();
+            if (!start_from_genesis(was_synced))
+                return false;
+            ordered_arm(m_fill, 1, to);
+            m_fill.phase = "IBD";
+            m_jump_from = 0;
+            mark_progress();
+            refill(UtxoAsk::Targeted);
+            started();
+            return true;
         }
         if (rw.permanent()) {
             // The walk can never get further: wipe the set and connect the
@@ -473,7 +907,7 @@ private:
                       << " from the best chain";
             if (!m_utxo.reanchor()) {
                 m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
-                LOG_ERROR << "[EMB-DOGE] UTXO re-anchor failed (DB wipe); set left at h="
+                LOG_ERROR << m_tag << " UTXO re-anchor failed (DB wipe); set left at h="
                           << m_utxo.get_best_height();
                 return false;
             }
@@ -489,24 +923,33 @@ private:
         }
         if (!rw.ok) {
             m_stats.heal_failures.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR << "[EMB-DOGE] UTXO set cannot be brought back to the best chain (" << reason << ": "
+            LOG_ERROR << m_tag << " UTXO set cannot be brought back to the best chain (" << reason << ": "
                       << rewind_why_name(rw.why) << "): stuck at h=" << rw.height << " "
                       << rw.hash.GetHex().substr(0, 16) << "...";
             return false;
         }
         if (rw.disconnected == 0 && kind == Heal::ParentMismatch) {
-            LOG_WARNING << "[EMB-DOGE] Parent mismatch at h=" << before + 1
+            LOG_WARNING << m_tag << " Parent mismatch at h=" << before + 1
                         << " but the UTXO set's best is on the best chain; not refilling";
             return false;
         }
         if (rw.disconnected == 0 && kind == Heal::Startup)
             return true;
+        // Full mode, a reorg near the tip while the fill is still far below
+        // it: nothing the fill asked for or holds is affected; its range
+        // follows the new tip.
+        if (m_mode == Mode::Full && rw.disconnected == 0 && m_fill.active
+            && m_fill.next_request + m_keep < target_height) {
+            m_fill.end_height = target_height;
+            m_fill.total = m_fill.processed + (m_fill.end_height - m_fill.next_height + 1);
+            return true;
+        }
         // Connect the best chain in order from the set's REAL best, whatever
         // the pipeline was doing (it may have drained past the fork and may
         // hold old-branch blocks). An empty set (cold start, nothing drained
         // yet) restarts at the pipeline's own start instead.
         const bool empty = m_utxo.get_best_block().IsNull() || (m_fill.active && m_jump_from != 0);
-        const bool was_cold_start = m_fill.active && m_fill.phase == "Bootstrap";
+        const bool was_cold_start = m_fill.active && (m_fill.phase == "Bootstrap" || m_fill.phase == "IBD");
         const uint32_t best_now =
             empty ? (m_fill.active && m_fill.next_height > 0 ? m_fill.next_height - 1 : 0)
                   : m_utxo.get_best_height();
@@ -515,7 +958,7 @@ private:
                 m_fill.phase = "UTXO reorg fill";
                 m_jump_from = 0;
             }
-            LOG_WARNING << "[EMB-DOGE] UTXO reorg fill (" << reason << "): connecting " << best_now + 1
+            LOG_WARNING << m_tag << " UTXO reorg fill (" << reason << "): connecting " << best_now + 1
                         << ".." << target_height << " in order";
             refill(UtxoAsk::Targeted);
             started();
@@ -527,10 +970,19 @@ private:
     core::coin::UTXOViewDB&    m_db;
     UtxoLaneHost               m_host;
     const uint32_t             m_keep;
+    const Mode                 m_mode;
+    const char*                m_tag;           // log prefix
     Fill                       m_fill;
     bool                       m_bootstrap_done{false};
     uint32_t                   m_jump_from{0};  // the cold start's deliberate jump (0 = none)
     UtxoLaneStats              m_stats;
+    // Full mode
+    bool                       m_completed{false};   // completed() fired this run
+    bool                       m_stuck{false};       // left as is (heal_failures)
+    uint32_t                   m_refusal_height{0};  // the height strict connect refused last
+    uint32_t                   m_refusal_count{0};   // ... and how many times in a row
+    std::chrono::steady_clock::time_point m_progress_time{std::chrono::steady_clock::now()};
+    uint32_t                   m_progress_height{0};
 };
 
 } // namespace coin

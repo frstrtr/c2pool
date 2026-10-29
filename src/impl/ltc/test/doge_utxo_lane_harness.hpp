@@ -67,6 +67,15 @@ struct TempDb {
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
+    /// A restart: close the DB and open it again from disk.
+    void reopen()
+    {
+        cache.reset();
+        db.reset();
+        db = std::make_unique<core::coin::UTXOViewDB>(dir.string());
+        EXPECT_TRUE(db->open());
+        cache = std::make_unique<core::coin::UTXOViewCache>(db.get());
+    }
 };
 
 std::vector<unsigned char> p2pkh(uint8_t tag)
@@ -145,6 +154,10 @@ BlockType make_block(const uint256& prev, uint32_t height, uint8_t tag,
     b.m_txs.push_back(coinbase(height, tag));
     for (auto& t : extra)
         b.m_txs.push_back(std::move(t));
+    std::vector<uint256> txids;
+    for (const auto& t : b.m_txs)
+        txids.push_back(compute_txid(t));
+    b.m_merkle_root = doge::coin::merkle_root_of(txids);  // the header commits to its txs
     return b;
 }
 
@@ -178,6 +191,7 @@ struct Net {
     std::vector<UtxoAsk> asked_how;
     std::vector<uint32_t> connected;  // heights, in connect order
     uint32_t wiped{0};
+    uint32_t completed{0};      // full mode: the set reached the tip
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     std::vector<std::string> events;     // clean / header, in order
@@ -251,6 +265,7 @@ struct Net {
             if (pool)
                 pool->requarantine_all();
         };
+        h.completed = [this]() { ++completed; };
         return h;
     }
 };
@@ -259,8 +274,9 @@ struct Lane {
     TempDb t;
     Net net;
     UtxoLane lane;
-    explicit Lane(uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP)
-        : lane(*t.cache, *t.db, net.host(), keep)
+    explicit Lane(uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP,
+                  UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0)
+        : lane(*t.cache, *t.db, net.host(), keep, mode, window)
     {
     }
 
