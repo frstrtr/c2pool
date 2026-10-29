@@ -152,6 +152,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # only on the old branch never reaches the template without its parent.
     # Same folding rule.
     #
+    # doge_hash_schedule_test.cpp: the DOGE block hash at every height below
+    # the header checkpoint (doge::coin::HashSchedule), served only once the
+    # hash chain links from genesis into the checkpoint. Same folding rule.
+    #
     # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
     # runs one merged-work poll at once (the DOGE tip handler's poke), without
     # the poll timer. Same folding rule.
@@ -205,6 +209,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
+        doge_hash_schedule_test.cpp
         doge_template_budget_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp

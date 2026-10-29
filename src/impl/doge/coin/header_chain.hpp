@@ -241,6 +241,17 @@ public:
         return m_best_work;
     }
 
+    /// The lowest height the chain holds a header for: 0 from genesis, else
+    /// the fast-start checkpoint it is rooted at (nothing below it).
+    uint32_t lowest_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_height_index.empty() ? 0 : m_height_index.begin()->first;
+    }
+
+    /// The LevelDB the chain persists to (null: in memory only). Other
+    /// per-chain records (doge::coin::HashSchedule, 'H') share it.
+    core::LevelDBStore* store() { return m_db.get(); }
+
     /// Number of headers stored.
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
