@@ -284,6 +284,9 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/hash_schedule.hpp>
 #include <impl/doge/coin/utxo_full_state.hpp>
 #include <impl/doge/coin/header_sync.hpp>
+#include <impl/doge/coin/range_sync.hpp>
+#include <impl/doge/coin/schedule_anchors.hpp>
+#include <impl/doge/coin/schedule_dispatch.hpp>
 #include <core/coin/utxo_digest.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
@@ -510,6 +513,11 @@ void print_help() {
     std::cout << "                            genesis; YAML doge_utxo_full: false)\n";
     std::cout << "  --doge-utxo-full-dir PATH The full DOGE UTXO set's LevelDB\n";
     std::cout << "                            (default: <data>/dogecoin/utxo_full_leveldb)\n";
+    std::cout << "  --dump-doge-schedule-anchors DIR [OUT]  Write the DOGE hash schedule's anchors (the .inc\n";
+    std::cout << "                            for src/impl/doge/coin/doge_schedule_anchors.inc) from the DOGE\n";
+    std::cout << "                            header LevelDB at DIR (<data>/dogecoin/embedded_headers; not\n";
+    std::cout << "                            open in a running node: use a copy) and exit; the schedule must\n";
+    std::cout << "                            be complete into the configured --doge-header-checkpoint\n";
     std::cout << "  --utxo-digest DIR         Print the digest of the UTXO LevelDB at DIR (SHA256 over\n";
     std::cout << "                            its coins, sync state and best block) and exit\n";
     std::cout << "  --no-ltc-cmpct-v3         Do not ask LTC peers for v3 (MWEB) compact blocks\n";
@@ -600,6 +608,80 @@ void print_help() {
     
     std::cout << "For detailed documentation, visit: https://github.com/frstrtr/c2pool\n";
     std::cout << "Report issues at: https://github.com/frstrtr/c2pool/issues\n";
+}
+
+/// `--dump-doge-schedule-anchors DIR [OUT]`: the .inc of the DOGE hash
+/// schedule's anchors (doge::coin::ScheduleAnchors) from the header LevelDB
+/// at DIR, whose schedule completed into `checkpoint` ("height:hash").
+static int dump_doge_schedule_anchors(const std::string& dir, const std::string& out_path,
+                                      const std::string& checkpoint)
+{
+    if (!std::filesystem::exists(std::filesystem::path(dir) / "CURRENT")) {
+        std::cerr << "dump-doge-schedule-anchors: no LevelDB at " << dir << "\n";
+        return 1;
+    }
+    const auto colon = checkpoint.find(':');
+    if (colon == std::string::npos) {
+        std::cerr << "dump-doge-schedule-anchors: bad checkpoint " << checkpoint << "\n";
+        return 1;
+    }
+    const uint32_t cp_height = static_cast<uint32_t>(std::stoul(checkpoint.substr(0, colon)));
+    uint256 cp_hash;
+    cp_hash.SetHex(checkpoint.substr(colon + 1));
+    core::LevelDBStore db(dir, core::LevelDBOptions{});
+    if (!db.open()) {
+        std::cerr << "dump-doge-schedule-anchors: cannot open " << dir
+                  << " (in use by a running node? dump from a copy)\n";
+        return 1;
+    }
+    const auto st = doge::coin::HashSchedule::read_state(db);
+    if (!st) {
+        std::cerr << "dump-doge-schedule-anchors: no hash schedule in " << dir << "\n";
+        return 1;
+    }
+    if (st->cp_height != cp_height || st->cp_hash != cp_hash) {
+        std::cerr << "dump-doge-schedule-anchors: the schedule is for checkpoint " << st->cp_height << ":"
+                  << st->cp_hash.GetHex() << ", the configured one is " << checkpoint << "\n";
+        return 1;
+    }
+    doge::coin::HashSchedule sched(db, st->cp_height, st->cp_hash, st->genesis);
+    sched.load();
+    std::string err;
+    const auto anchors = doge::coin::anchors_from_schedule(sched, &err);
+    if (!anchors) {
+        std::cerr << "dump-doge-schedule-anchors: not dumped: " << err << "\n";
+        return 1;
+    }
+    const auto now = std::time(nullptr);
+    char date[32];
+    std::strftime(date, sizeof(date), "%Y-%m-%d %H:%MZ", std::gmtime(&now));
+    const std::vector<std::string> header = {
+        "c2pool DOGE hash-schedule anchors -- generated, do not hand-edit.",
+        "tool        c2pool --dump-doge-schedule-anchors (read from a copy of the header DB)",
+        "source      " + dir,
+        "checkpoint  " + std::to_string(st->cp_height) + " " + st->cp_hash.GetHex(),
+        "genesis     " + st->genesis.GetHex(),
+        "anchors     " + std::to_string(anchors->hashes.size()) + " (every "
+            + std::to_string(doge::coin::ScheduleAnchors::STEP) + "th height, genesis first, the checkpoint last)",
+        "digest      sha256 " + anchors->digest_hex() + " (over the 32-byte hashes, in order)",
+        "generated   " + std::string(date),
+        "check       tools/doge-anchor-check.py against two independent sources before shipping",
+    };
+    const std::string inc = anchors->to_inc(header);
+    if (out_path.empty()) {
+        std::cout << inc;
+    } else {
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        f << inc;
+        if (!f) {
+            std::cerr << "dump-doge-schedule-anchors: cannot write " << out_path << "\n";
+            return 1;
+        }
+    }
+    std::cerr << "dump-doge-schedule-anchors: " << anchors->hashes.size() << " anchors to h=" << st->cp_height
+              << ", digest " << anchors->digest_hex() << (out_path.empty() ? "" : ", written to " + out_path)
+              << "\n";
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -1073,6 +1155,16 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-utxo-full-dir" && i + 1 < argc) {
             doge_utxo_full_dir = argv[++i];
             cli_explicit.insert("doge_utxo_full_dir");
+        }
+        else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
+            // The anchors of a complete hash schedule (no node is started);
+            // the checkpoint is the configured one (a --doge-header-checkpoint
+            // given before this option, else the built-in).
+            const std::string dir = argv[++i];
+            std::string out_path;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                out_path = argv[++i];
+            return dump_doge_schedule_anchors(dir, out_path, doge_header_checkpoint_str);
         }
         else if (arg == "--utxo-digest" && i + 1 < argc) {
             // Digest a UTXO LevelDB (no node is started). The DB must not be
@@ -6458,6 +6550,7 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<core::coin::UTXOViewCache> doge_full_cache;
             std::unique_ptr<doge::coin::HashSchedule>  doge_hash_schedule;
             std::unique_ptr<doge::coin::HashScheduleSync> doge_sched_sync;
+            std::unique_ptr<doge::coin::RangeSync>        doge_range_sync;
             std::unique_ptr<boost::asio::thread_pool>  doge_full_pool;
             // Shared with the lanes' callbacks: whether the pool prices against
             // the full set, which bodies the full lane asked for, whether its
@@ -6700,18 +6793,29 @@ int main(int argc, char* argv[]) {
                                 doge_hash_schedule = std::make_unique<doge::coin::HashSchedule>(
                                     *doge_chain->store(), root, root_entry->block_hash, doge_params_ptr->genesis_hash);
                                 doge_hash_schedule->load();
+                                // The anchored ranges (doge::coin::RangeSync): parallel and
+                                // exact below the checkpoint; the sequential sync is their
+                                // fallback (no anchors in this build, refused anchors) and
+                                // fetches the tail past anchors for an older checkpoint.
+                                if (!doge_hash_schedule->complete())
+                                    doge_range_sync = std::make_unique<doge::coin::RangeSync>(
+                                        *doge_hash_schedule, doge::coin::ScheduleAnchors::builtin());
                                 // A set already past the checkpoint needs no schedule to
                                 // run (a header DB reset under a synced set); the
                                 // schedule still resumes from its frontier, for a rebuild.
                                 doge_full->schedule_ready.store(doge::coin::UtxoFullState::schedule_ready_for(
                                     doge_hash_schedule->complete(), root, doge_full_db->get_best_height()));
-                                if (!doge_hash_schedule->complete())
+                                if (!doge_hash_schedule->complete()) {
                                     doge_sched_sync = std::make_unique<doge::coin::HashScheduleSync>(*doge_hash_schedule);
+                                    doge_sched_sync->set_floor(doge_range_sync ? doge_range_sync->floor() : 0);
+                                }
                                 LOG_INFO << "[EMB-DOGE] Hash schedule below the header checkpoint " << root << ": "
                                          << (doge_hash_schedule->complete()
                                                  ? std::string("complete")
                                                  : "at h=" + std::to_string(doge_hash_schedule->frontier_height())
-                                                       + ", syncing headers from genesis")
+                                                       + ", " + (doge_range_sync
+                                                                     ? doge::coin::RangeSync::mode_name(doge_range_sync->mode())
+                                                                     : "sequential"))
                                          << (doge_full->schedule_ready.load() ? "; the full lane runs" : "");
                             } else if (!doge_full_live) {
                                 LOG_ERROR << "[EMB-DOGE] No header DB for the hash schedule below the checkpoint "
@@ -6985,6 +7089,7 @@ int main(int argc, char* argv[]) {
                                 // frontier for 30 s goes to other peers.
                                 auto* sched = doge_hash_schedule.get();
                                 auto* sched_sync = doge_sched_sync.get();
+                                auto* range_sync = doge_range_sync.get();
                                 auto send_sched_ask = [sched_sync, bcaster_ptr](
                                                           const doge::coin::HashScheduleSync::Ask& a) {
                                     const auto now = std::chrono::steady_clock::now();
@@ -7011,12 +7116,19 @@ int main(int argc, char* argv[]) {
                                 if (sched_sync && sched && !sched->complete()) {
                                     auto sched_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                     auto sched_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                    *sched_fn = [sched_fn, sched_timer, sched, sched_sync,
+                                    *sched_fn = [sched_fn, sched_timer, sched, sched_sync, range_sync,
                                                  send_sched_ask](boost::system::error_code ec) {
                                         if (ec || sched->complete())
                                             return;
                                         sched_timer->expires_after(std::chrono::seconds(5));
                                         sched_timer->async_wait(*sched_fn);
+                                        // While the anchored ranges run, the sequential sync waits;
+                                        // as their fallback or tail it never cuts below them.
+                                        if (range_sync) {
+                                            if (!range_sync->sequential())
+                                                return;
+                                            sched_sync->set_floor(range_sync->floor());
+                                        }
                                         try {
                                             if (auto a = sched_sync->due(std::chrono::steady_clock::now()))
                                                 send_sched_ask(*a);
@@ -7027,9 +7139,31 @@ int main(int argc, char* argv[]) {
                                     sched_timer->expires_after(std::chrono::seconds(15));
                                     sched_timer->async_wait(*sched_fn);
                                 }
+                                // The anchored ranges: a 1-s tick (time out, fill the window).
+                                if (range_sync && range_sync->mode() == doge::coin::RangeSync::Mode::Anchored) {
+                                    auto range_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                    auto range_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                                    *range_fn = [range_fn, range_timer, range_sync, bcaster_ptr](boost::system::error_code ec) {
+                                        if (ec || range_sync->mode() != doge::coin::RangeSync::Mode::Anchored)
+                                            return;
+                                        range_timer->expires_after(std::chrono::seconds(1));
+                                        range_timer->async_wait(*range_fn);
+                                        try {
+                                            const auto reqs = range_sync->tick(bcaster_ptr->ready_peers(0),
+                                                                               std::chrono::steady_clock::now());
+                                            for (const auto& r : reqs)
+                                                if (bcaster_ptr->request_headers_targeted(r.locator, r.stop, 0, r.peer) != r.peer)
+                                                    range_sync->unsent(r.range, r.peer);
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Hash schedule range error: " << e.what();
+                                        }
+                                    };
+                                    range_timer->expires_after(std::chrono::seconds(10));
+                                    range_timer->async_wait(*range_fn);
+                                }
 
                                 broadcaster->set_on_new_headers(
-                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync,
+                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync, range_sync,
                                      send_sched_ask, full = doge_full, doge_hdr_asks](
                                         const std::string& key,
                                         const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
@@ -7051,35 +7185,42 @@ int main(int argc, char* argv[]) {
                                                  << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, send_sched_ask, full, key,
-                                             doge_hdr_asks]() {
-                                                // Below the checkpoint: the hash schedule's batch, from
-                                                // the peer it asked only.
-                                                if (sched_sync && sched && !sched->complete()) {
-                                                    using Feed = doge::coin::HashSchedule::Feed;
-                                                    std::optional<doge::coin::HashScheduleSync::Ask> next;
-                                                    const Feed fr = sched_sync->on_headers(
-                                                        key, *batch, std::chrono::steady_clock::now(), next);
-                                                    if (fr != Feed::NotNext && fr != Feed::Done) {
-                                                        if (fr == Feed::Complete) {
-                                                            if (!full->schedule_ready.exchange(true) && full->on_schedule_ready)
-                                                                full->on_schedule_ready();
-                                                        } else if (fr != Feed::Extended) {
-                                                            LOG_WARNING << "[EMB-DOGE] Hash schedule: batch from " << key << " "
-                                                                        << doge::coin::HashSchedule::feed_name(fr)
-                                                                        << "; asking another peer";
-                                                        } else if (sched->frontier_height() % 200000 < batch->size()) {
-                                                            LOG_INFO << "[EMB-DOGE] Hash schedule h=" << sched->frontier_height()
-                                                                     << "/" << sched->checkpoint_height();
-                                                        }
-                                                        if (next)
-                                                            boost::asio::post(ioc, [send_sched_ask, a = *next]() {
-                                                                send_sched_ask(a);
-                                                            });
-                                                        return;
-                                                    }
+                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
+                                             full, key, doge_hdr_asks]() {
+                                                // Below the checkpoint: an anchored range, or the
+                                                // sequential schedule's batch (doge::coin::route_headers);
+                                                // only the rest answers the header chain's getheaders.
+                                                using Taken = doge::coin::HeadersRoute::Taken;
+                                                using Feed = doge::coin::HashSchedule::Feed;
+                                                using Answer = doge::coin::RangeSync::Answer;
+                                                auto route = doge::coin::route_headers(range_sync, sched_sync, sched, *doge_hdr_asks,
+                                                                                       key, *batch, std::chrono::steady_clock::now());
+                                                const bool completed = (route.taken == Taken::Range && route.range == Answer::Complete)
+                                                                    || (route.taken == Taken::Schedule && route.feed == Feed::Complete);
+                                                if (completed && !full->schedule_ready.exchange(true) && full->on_schedule_ready)
+                                                    full->on_schedule_ready();
+                                                if (route.taken == Taken::Range) {
+                                                    if (route.range == Answer::Stored && sched->ranges_done() % 100 == 0)
+                                                        LOG_INFO << "[EMB-DOGE] Hash schedule: " << sched->ranges_done() << "/"
+                                                                 << sched->ranges_total() << " ranges, prefix h=" << sched->frontier_height();
+                                                    return;
                                                 }
-                                                doge_hdr_asks->answered(key);
+                                                if (route.taken == Taken::Schedule) {
+                                                    const Feed fr = route.feed;
+                                                    if (fr != Feed::Complete && fr != Feed::Extended) {
+                                                        LOG_WARNING << "[EMB-DOGE] Hash schedule: batch from " << key << " "
+                                                                    << doge::coin::HashSchedule::feed_name(fr)
+                                                                    << "; asking another peer";
+                                                    } else if (fr == Feed::Extended && sched->frontier_height() % 200000 < batch->size()) {
+                                                        LOG_INFO << "[EMB-DOGE] Hash schedule h=" << sched->frontier_height()
+                                                                 << "/" << sched->checkpoint_height();
+                                                    }
+                                                    if (route.next)
+                                                        boost::asio::post(ioc, [send_sched_ask, a = *route.next]() {
+                                                            send_sched_ask(a);
+                                                        });
+                                                    return;
+                                                }
                                                 int accepted = dc->add_headers(*batch);
                                                 if (accepted > 0)
                                                     LOG_INFO << "[EMB-DOGE] add_headers: "
@@ -7525,7 +7666,7 @@ int main(int argc, char* argv[]) {
                                         [prev_metrics, accrual = std::weak_ptr<doge::coin::UtxoLane>(doge_lane),
                                          full_lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane),
                                          acc_utxo = doge_utxo_cache.get(), full_utxo = doge_full_cache.get(),
-                                         dc = doge_chain.get(), full = doge_full, sched, sched_sync]() {
+                                         dc = doge_chain.get(), full = doge_full, sched, sched_sync, range_sync]() {
                                             nlohmann::json j = prev_metrics ? prev_metrics() : nlohmann::json::object();
                                             if (!j.is_object())
                                                 j = nlohmann::json::object();
@@ -7559,13 +7700,29 @@ int main(int argc, char* argv[]) {
                                                 d["adoptions"] = full->adoptions.load();
                                                 d["queued_bytes"] = full->queued_bytes.load();
                                                 d["queue_dropped"] = full->queue_dropped.load();
-                                                if (sched)
+                                                if (sched) {
                                                     d["schedule"] = {{"frontier", sched->frontier_height()},
                                                                      {"checkpoint", sched->checkpoint_height()},
                                                                      {"complete", sched->complete()},
                                                                      {"peer", sched_sync ? sched_sync->peer() : std::string()},
                                                                      {"stalls", sched_sync ? sched_sync->stalls() : 0},
-                                                                     {"truncations", sched_sync ? sched_sync->truncations() : 0}};
+                                                                     {"truncations", sched_sync ? sched_sync->truncations() : 0},
+                                                                     {"mode", range_sync ? std::string(doge::coin::RangeSync::mode_name(
+                                                                                               range_sync->mode()))
+                                                                                         : std::string(sched->complete() ? "complete"
+                                                                                                                         : "sequential-fallback")}};
+                                                    if (range_sync) {
+                                                        const auto rs = range_sync->stats(std::chrono::steady_clock::now());
+                                                        d["schedule"]["ranges_done"] = rs.ranges_done;
+                                                        d["schedule"]["ranges_total"] = rs.ranges_total;
+                                                        d["schedule"]["inflight"] = rs.inflight;
+                                                        d["schedule"]["peers_used"] = rs.peers_used;
+                                                        d["schedule"]["timeouts"] = rs.timeouts;
+                                                        d["schedule"]["excluded"] = rs.excluded;
+                                                        d["schedule"]["short_parses"] = rs.short_parses;
+                                                        d["schedule"]["rate_hps"] = rs.rate_hps;
+                                                    }
+                                                }
                                                 if (a && acc_utxo && !full->live.load())
                                                     d["accrual"] = describe(*a, acc_utxo);
                                             } else if (a && acc_utxo) {
