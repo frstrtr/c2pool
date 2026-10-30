@@ -693,16 +693,18 @@ private:
     {
         // When a raw block parser is set (DOGE AuxPoW), re-parse the block from
         // raw P2P bytes.  The standard BlockType deserialization misinterprets
-        // AuxPoW data as transactions, producing garbage.
+        // AuxPoW data as transactions, producing garbage, so a body the raw
+        // parser cannot read is dropped, never handed on from that parse.
         BlockType block;
         if (m_raw_block_parser && !msg->m_raw_payload.empty()) {
             try {
                 block = m_raw_block_parser(msg->m_raw_payload.data(),
                                            msg->m_raw_payload.size());
             } catch (const std::exception& e) {
-                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed: " << e.what()
-                            << " — falling back to standard parse";
-                block = msg->m_block;
+                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed on a "
+                            << msg->m_raw_payload.size() << "-byte block from "
+                            << m_target_addr.to_string() << ": " << e.what() << " — dropped";
+                return;
             }
         } else {
             block = msg->m_block;
@@ -754,11 +756,13 @@ private:
 
         std::vector<BlockHeaderType> vheaders;
 
-        // When a raw parser is set (DOGE AuxPoW), always prefer it over the
-        // standard parser.  The standard parser misinterprets AuxPoW data as
-        // block transactions, producing a small number of garbage entries
-        // instead of the full 2000-header batch.
-        if (m_raw_headers_parser && !msg->m_raw_payload.empty()) {
+        // When a raw parser is set (DOGE AuxPoW), its result is the batch: the
+        // standard parser misinterprets AuxPoW data as block transactions,
+        // producing a small number of garbage entries instead of the full
+        // 2000-header batch, so it is never a fallback for an AuxPoW chain
+        // (the raw parser returns the entries that parsed; none is none).
+        const bool raw_parsed = m_raw_headers_parser && !msg->m_raw_payload.empty();
+        if (raw_parsed) {
             try {
                 vheaders = m_raw_headers_parser(
                     msg->m_raw_payload.data(), msg->m_raw_payload.size());
@@ -770,7 +774,7 @@ private:
             }
         }
 
-        if (vheaders.empty() && !msg->m_headers.empty()) {
+        if (!raw_parsed && !msg->m_headers.empty()) {
             // Standard path: headers parsed as 80-byte BlockType (LTC, BTC)
             for (auto block : msg->m_headers)
             {
