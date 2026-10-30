@@ -26,7 +26,9 @@
 #include <core/pow.hpp>                 // core::SubsidyFunc
 
 #include <core/stratum_work_source.hpp>
+#include <c2pool/merged/merged_mining.hpp>  // MergedMiningManager (DC has_merged_chain)
 
+#include <boost/asio/io_context.hpp>
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -105,9 +107,33 @@ TEST(DgbWorkSource, NoMergedChainInDefaultBuild)
 {
     Fixture fx;
     auto ws = fx.make();
-    // DGB V36 default build is a standalone Scrypt parent (no merged mining;
-    // -DAUX_DOGE dual-parent is a parked STRETCH).
+    // DGB V36 default build is a standalone Scrypt parent: no --merged spec =>
+    // main_dgb never sets a manager => no merged chain.
     EXPECT_FALSE(ws->has_merged_chain(0x0001));
+    EXPECT_FALSE(ws->has_merged_chain(98));
+}
+
+TEST(DgbWorkSource, HasMergedChainConsultsManager)
+{
+    // DC: with a --merged DOGE manager set, has_merged_chain must report the
+    // registered chain_id (stratum keeps the DOGE login address / accepts a
+    // DOGE-primary username) and stay false for any unregistered id.
+    Fixture fx;
+    auto ws = fx.make();
+    boost::asio::io_context ioc;
+    c2pool::merged::MergedMiningManager mm(ioc);
+    ws->set_merged_mining_manager(&mm);
+    EXPECT_FALSE(ws->has_merged_chain(98));  // manager set, no chain yet
+
+    c2pool::merged::AuxChainConfig cfg;
+    cfg.symbol = "DOGE";
+    cfg.chain_id = 98;
+    mm.add_chain(cfg);  // RPC backend, never started: no I/O
+    EXPECT_TRUE(ws->has_merged_chain(98));
+    EXPECT_FALSE(ws->has_merged_chain(0x0001));
+
+    ws->set_merged_mining_manager(nullptr);
+    EXPECT_FALSE(ws->has_merged_chain(98));
 }
 
 TEST(DgbWorkSource, BestShareHashFnEmptyUntilWired)
