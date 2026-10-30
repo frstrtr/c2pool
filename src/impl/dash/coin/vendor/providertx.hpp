@@ -64,6 +64,7 @@
 #include <impl/dash/coin/vendor/shim.hpp>
 
 #include <core/uint256.hpp>
+#include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
 #include <core/opscript.hpp>
@@ -72,6 +73,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -361,6 +363,26 @@ struct CProUpRevTx
 // Parse a ProTx payload. Returns true on success (payload fully consumed),
 // false on any deserialization error or trailing garbage. Caller checks
 // tx.type to know which variant to attempt.
+
+// ── Operator-signature preimage (B.9) ─────────────────────────────────────
+// dashd CheckProUpServTx / CheckProUpRevTx verify `sig` against
+// ::SerializeHash(proTx) (specialtxman.cpp CheckHashSig). Both payloads skip
+// the trailing BLS `sig` under SER_GETHASH (providertx.h SERIALIZE_METHODS:
+// `if (!(s.GetType() & SER_GETHASH)) READWRITE(sig)`), and `sig` is their last
+// field, so for a payload that parse_protx_payload consumed completely the
+// signed preimage is the payload minus its last BLS_SIG_SIZE bytes, hashed
+// SHA256d. Returns nullopt when the payload is too short to carry a signature.
+inline std::optional<uint256>
+protx_operator_sign_hash(const std::vector<uint8_t>& payload)
+{
+    if (payload.size() < BLS_SIG_SIZE) return std::nullopt;
+    uint256 h;
+    CHash256()
+        .Write(std::span<const unsigned char>(payload.data(),
+                                              payload.size() - BLS_SIG_SIZE))
+        .Finalize(std::span<unsigned char>(h.data(), 32));
+    return h;
+}
 
 template <typename T>
 inline bool parse_protx_payload(const std::vector<uint8_t>& payload, T& out)

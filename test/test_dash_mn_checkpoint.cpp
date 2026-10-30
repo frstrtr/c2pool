@@ -1308,6 +1308,7 @@ MutableTransaction pro_up_serv_tx(const char* protx)
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;
+    tx.version       = 3;   // special version (a typed v1 tx is bad-txns-type)
     tx.type          = CProUpServTx::SPECIALTX_TYPE;
     tx.extra_payload = protx_payload_bytes(p);
     bitcoin_family::coin::TxIn in;
@@ -1345,6 +1346,7 @@ MutableTransaction pro_reg_tx(const std::vector<unsigned char>& payout,
     p.scriptPayout.m_data      = payout;
 
     MutableTransaction tx;
+    tx.version = 3;   // special version (a typed v1 tx is bad-txns-type)
     tx.type = dash::coin::vendor::CProRegTx::SPECIALTX_TYPE;
     {
         auto ps = ::pack(p);
@@ -4745,6 +4747,7 @@ MutableTransaction pro_up_serv_tx_for(const uint256& protx)
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;
+    tx.version       = 3;   // special version (a typed v1 tx is bad-txns-type)
     tx.type          = CProUpServTx::SPECIALTX_TYPE;
     tx.extra_payload = protx_payload_bytes(p);
     bitcoin_family::coin::TxIn in;

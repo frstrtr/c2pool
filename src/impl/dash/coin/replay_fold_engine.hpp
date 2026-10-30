@@ -481,6 +481,12 @@ struct FoldResult
     // On !ok: a sentence naming the height and the blocking condition.
     std::string error;
     uint32_t    height{0};
+    // On !ok: the block was refused BEFORE any state changed and the engine is
+    // not poisoned — it extends another chain (prev-link) or dashd rejects it
+    // (ContextualCheckTransaction). The held list is still exactly the cursor
+    // block's post-state, so a consumer must NOT treat this as a divergence:
+    // the valid block at this height still folds.
+    bool        refused_unchanged{false};
 
     // THE self-check (both always filled on a completed fold).
     uint256     computed_root;
@@ -859,19 +865,37 @@ public:
         return *best;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // fold_block — the per-block DML fold + THE self-check
-    // ─────────────────────────────────────────────────────────────────────
-    FoldResult fold_block(const dash::coin::BlockType& block, uint32_t height)
+    /// The reason fold_block would refuse this block with the held list
+    /// unchanged (FoldResult::refused_unchanged: a prev-link to another chain,
+    /// or a tx ContextualCheckTransaction rejects), or nullopt when it would
+    /// fold the block or refuse it for a reason that latches. Const and
+    /// side-effect free: a caller asks BEFORE it lets companion lanes observe
+    /// the block, so a block the fold will refuse never advances their
+    /// forward-contiguous cursors (the valid sibling at the same height must
+    /// still be observable).
+    std::optional<std::string> refused_unchanged_reason(
+        const dash::coin::BlockType& block, uint32_t height) const
     {
         FoldResult r;
         r.height = height;
+        if (check_before_fold(block, height, r) || !r.refused_unchanged)
+            return std::nullopt;
+        return r.error;
+    }
 
+    /// Every check fold_block makes BEFORE it touches the held list, in
+    /// fold_block's own order. Returns true when the block may be folded;
+    /// otherwise r.error is set, and r.refused_unchanged where the refusal
+    /// does not latch (another chain, or a block dashd rejects). Sets
+    /// r.committed_root from the block's CCbTx. Changes nothing.
+    bool check_before_fold(const dash::coin::BlockType& block, uint32_t height,
+                           FoldResult& r) const
+    {
         // Feature flag: default-constructed config folds nothing.
         if (!m_cfg.enabled) {
             r.error = "DML fold engine is not enabled (FoldConfig.enabled "
                       "is the W1 feature flag; W5 wires it)";
-            return r;
+            return false;
         }
         // HARD STOP is sticky: after a root mismatch nothing folds again
         // until the operator re-seeds — serving from a state that has
@@ -879,20 +903,20 @@ public:
         if (m_poisoned) {
             r.error = "DML fold engine is POISONED (" + m_poison_reason
                     + ") — re-seed required";
-            return r;
+            return false;
         }
         if (m_cfg.gates.v24_active) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": DEPLOYMENT_V24/ExtAddr is active but the ExtAddr "
                       "fold branch is not implemented (fail closed, never "
                       "drift — design doc §3)";
-            return r;
+            return false;
         }
         if (static_cast<int32_t>(height) < m_cfg.gates.dip0003_height) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": below DIP0003 activation h="
                     + std::to_string(m_cfg.gates.dip0003_height);
-            return r;
+            return false;
         }
         // Forward-contiguous cursor: exactly height == cursor + 1. A gap
         // means skipped folds (stale payment cursor); out-of-order means a
@@ -902,7 +926,7 @@ public:
                     + ": cursor is at h=" + std::to_string(m_height)
                     + " and the fold is forward-contiguous (only h="
                     + std::to_string(m_height + 1) + " is foldable)";
-            return r;
+            return false;
         }
         // The held list is the post-state of block (m_height, m_block_hash)
         // and nothing else — that pair IS what the penalty oracle answers
@@ -911,6 +935,7 @@ public:
         // still exactly right for its own block, so this is not a poison;
         // the caller re-anchors on the best chain).
         if (block.m_previous_block != m_block_hash) {
+            r.refused_unchanged = true;
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block's prev-link "
                     + block.m_previous_block.GetHex().substr(0, 16)
@@ -918,13 +943,13 @@ public:
                     + m_block_hash.GetHex().substr(0, 16)
                     + " (a different chain; the held state is the post-state"
                       " of the cursor block only)";
-            return r;
+            return false;
         }
         if (block.m_txs.empty()) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block has no transactions (no coinbase, no cbTx "
                       "root to self-check against)";
-            return r;
+            return false;
         }
         // The committed answer key, read FIRST: a block whose cbTx cannot
         // be parsed cannot be self-checked, so it cannot be folded.
@@ -934,9 +959,45 @@ public:
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": coinbase carries no parseable CCbTx "
                       "(merkleRootMNList unavailable for the self-check)";
-            return r;
+            return false;
         }
         r.committed_root = cbtx.merkleRootMNList;
+
+        const int32_t H = static_cast<int32_t>(height);
+
+        // ── Pre-scan: ContextualCheckTransaction (validation.cpp:317-349 @
+        // v23.1.9), every tx incl. the coinbase, once DIP3 is active for this
+        // block (DeploymentActiveAfter(pindexPrev, DIP0003): H >=
+        // dip0003_height, the height the DML itself starts at). A
+        // block dashd rejects (bad-txns-type / bad-txns-cb-type / the v23.1.9
+        // bad-txns-version for a negative nVersion) is refused BEFORE any pass
+        // mutates the held list — like the prev-link refusal above it is not
+        // a poison: the held state is still exactly right for the cursor
+        // block, and the caller re-anchors on the best chain.
+        if (H >= m_cfg.gates.dip0003_height) {
+            for (size_t i = 0; i < block.m_txs.size(); ++i) {
+                if (auto why = contextual_tx_check(block.m_txs[i], i == 0)) {
+                    r.refused_unchanged = true;
+                    r.error = "fold refused at h=" + std::to_string(height)
+                            + " tx[" + std::to_string(i) + "]: "
+                            + std::string(*why)
+                            + " (ContextualCheckTransaction — dashd rejects"
+                              " this block; the held list is unchanged)";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // fold_block — the per-block DML fold + THE self-check
+    // ─────────────────────────────────────────────────────────────────────
+    FoldResult fold_block(const dash::coin::BlockType& block, uint32_t height)
+    {
+        FoldResult r;
+        r.height = height;
+        if (!check_before_fold(block, height, r)) return r;
 
         const int32_t H = static_cast<int32_t>(height);
         const uint256 prev_hash = block.m_previous_block;
@@ -1011,9 +1072,10 @@ public:
         // ── Pass 3: special txs, in tx order (specialtxman.cpp:228-460) ─
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            // dashd: IsSpecialTxVersion() == (nVersion == 3); only then is
-            // nType meaningful.
-            if (tx.version != 3 || tx.type == 0) continue;
+            // dashd: IsSpecialTxVersion() is nVersion >= 3 on the int16
+            // nVersion (primitives/transaction.h); only then is nType
+            // meaningful and the extra payload present.
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
 
             std::string err;
             switch (tx.type) {
@@ -1447,6 +1509,51 @@ private:
         m_sml_structural = true;
     }
 
+    // ── dashd mnUniquePropertyMap, on demand (deterministicmns.h @ v23.1.9).
+    // ProTxs are a handful per block, so a scan of the held list per ProTx
+    // replaces an index that every mutation path would have to maintain.
+    // CKeyID (keyIDOwner) and uint160 (Evo platformNodeID) serialize — and so
+    // hash — identically: ONE namespace (#7846). Null values are never in the
+    // map (AddUniqueProperty skips them).
+
+    /// The MN other than `self` holding `id` as keyIDOwner or Evo
+    /// platformNodeID, or nullptr.
+    const uint256* id_holder(const uint160& id, const uint256& self) const
+    {
+        if (id.IsNull()) return nullptr;
+        for (const auto& [protx, st] : m_entries) {
+            if (protx == self) continue;
+            if (st.keyIDOwner == id) return &protx;
+            if (st.nType == vendor::MnType::EVO && st.platformNodeID == id) return &protx;
+        }
+        return nullptr;
+    }
+
+    /// The MN other than `self` whose operator key, as BYTES under that
+    /// holder's own scheme (legacy iff its nVersion < BasicBLS), equals the
+    /// payload's wire bytes — dashd's unique-property semantics
+    /// (CBLSLazyWrapper serialization, not a point compare): a legacy L(P) and
+    /// a basic B(P) of one point are two properties; equal bytes of two
+    /// different points are one. The store is canonical basic, so legacy
+    /// holders compare against opkey_legacy_wire_to_basic(wire). The null key
+    /// is never held.
+    const uint256* opkey_holder(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& wire,
+                                const uint256& self) const
+    {
+        bool null_key = true;
+        for (uint8_t b : wire) if (b != 0) { null_key = false; break; }
+        if (null_key) return nullptr;
+        const auto as_legacy = vendor::opkey_legacy_wire_to_basic(wire);
+        for (const auto& [protx, st] : m_entries) {
+            if (protx == self || st.operator_pubkey_null()) continue;
+            const bool holder_legacy = st.nVersion < vendor::ProTxVersion::BASIC_BLS;
+            if (holder_legacy ? (as_legacy && st.pubKeyOperator == *as_legacy)
+                              : st.pubKeyOperator == wire)
+                return &protx;
+        }
+        return nullptr;
+    }
+
     /// dashd CompareByLastPaid_GetHeight (deterministicmns.cpp:157-166),
     /// int semantics with the -1 sentinels VERBATIM.
     static int32_t compare_by_last_paid_height(const ReplayMNState& st)
@@ -1526,11 +1633,29 @@ private:
             remove_mn(rep->second);
             ++r.collateral_replaced;
         }
+        // RebuildListFromBlock: `newList.HasUniqueProperty(keyIDOwner) ||
+        // HasUniqueProperty(pubKeyOperator)` => bad-protx-dup-key, then AddMN
+        // adds the Evo platformNodeID (throws on a holder). Checked on the
+        // list AFTER the replacement above, like dashd's newList.
+        const auto op_basic = vendor::opkey_to_basic(
+            p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        if (const uint256* h = id_holder(p.keyIDOwner, proTxHash))
+            return "ProRegTx keyIDOwner is already an owner key or platformNodeID of MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        if (const uint256* h = opkey_holder(p.pubKeyOperator, proTxHash))
+            return "ProRegTx pubKeyOperator is already held by MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
+        if (p.nType == vendor::MnType::EVO) {
+            if (const uint256* h = id_holder(p.platformNodeID, proTxHash))
+                return "ProRegTx platformNodeID is already an owner key or platformNodeID"
+                       " of MN " + h->GetHex().substr(0, 16)
+                     + " (bad-protx-dup-platformnodeid)";
+        }
         // State built entirely from the payload
         // (CDeterministicMNState(CProRegTx), dmnstate.h:68-79).
         st.nVersion          = p.nVersion;
         st.keyIDOwner        = p.keyIDOwner;
-        st.pubKeyOperator    = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
+        st.pubKeyOperator    = op_basic;
         st.keyIDVoting       = p.keyIDVoting;
         st.netInfo           = p.netInfo;
         st.scriptPayout      = p.scriptPayout;
@@ -1569,6 +1694,11 @@ private:
         if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
             return "ProUpServTx nVersion=" + std::to_string(p.nVersion)
                  + " (ExtAddr) — branch not implemented, failing closed";
+        // RebuildListFromBlock (#7488 moved it ahead of the lookup):
+        // IsValidMnType(nType) else bad-protx-type.
+        if (p.nType != vendor::MnType::REGULAR && p.nType != vendor::MnType::EVO)
+            return "ProUpServTx nType=" + std::to_string(p.nType)
+                 + " is not a valid MnType (bad-protx-type)";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1580,6 +1710,14 @@ private:
         if (p.nType != st.nType)
             return "ProUpServTx nType mismatch for "
                  + p.proTxHash.GetHex().substr(0, 16);
+        // UpdateMN -> UpdateUniqueProperty(platformNodeID): another MN's owner
+        // key or platformNodeID (#7846) makes the update throw.
+        if (p.nType == vendor::MnType::EVO) {
+            if (const uint256* h = id_holder(p.platformNodeID, p.proTxHash))
+                return "ProUpServTx platformNodeID is already an owner key or"
+                       " platformNodeID of MN " + h->GetHex().substr(0, 16)
+                     + " (bad-protx-dup-platformnodeid)";
+        }
 
         // v24-only: nVersion update from the payload — DEAD on mainnet
         // (fold refuses when v24_active; branch kept for the record).
@@ -1647,6 +1785,11 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        // UpdateMN -> UpdateUniqueProperty(pubKeyOperator): a key another MN
+        // holds makes the update throw (bad-protx-dup-key).
+        if (const uint256* h = opkey_holder(p.pubKeyOperator, p.proTxHash))
+            return "ProUpRegTx pubKeyOperator is already held by MN "
+                 + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
 
         // Operator-key change ⇒ reset all operator fields + ban until a
         // ProUpServTx revives (specialtxman.cpp:395-405).
