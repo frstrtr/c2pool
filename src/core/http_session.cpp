@@ -657,8 +657,13 @@ void HttpSession::process_request()
                 rest_result = mining_interface_->rest_broadcaster_status();
             else if (target == "/merged_broadcaster_status")
                 rest_result = mining_interface_->rest_merged_broadcaster_status();
-            else if (target == "/network_difficulty")
-                rest_result = mining_interface_->rest_network_difficulty();
+            else if (target == "/network_difficulty") {
+                // #1142 item 11: honour ?period=; no period keeps the full history.
+                const std::string period = getQueryParam("period");
+                rest_result = period.empty()
+                    ? mining_interface_->rest_network_difficulty()
+                    : mining_interface_->rest_network_difficulty(period);
+            }
 
             // /web/ sub-endpoints (share chain inspection)
             else if (target == "/web/heads")
