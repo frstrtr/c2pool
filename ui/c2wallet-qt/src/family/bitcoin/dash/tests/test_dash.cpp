@@ -48,6 +48,7 @@
 #include <exception>
 #include <initializer_list>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -941,9 +942,8 @@ static void test_utxo_intake()
 static const char* kFixtureName = "xdgf-getaddressutxos-tip2563986.json";
 static const int64_t kFixtureTip = 2563986;
 
-static std::string read_fixture(const char* name)
+static std::string read_file(const std::string& path)
 {
-    const std::string path = std::string(C2W_DASH_FIXTURE_DIR) + "/" + name;
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return {};
     std::string out;
@@ -953,6 +953,8 @@ static std::string read_fixture(const char* name)
     std::fclose(f);
     return out;
 }
+
+static std::string read_fixture(const char* name) { return read_file(std::string(C2W_DASH_FIXTURE_DIR) + "/" + name); }
 
 // Run `fn`, reporting a DashAbort as a failed check instead of ending the suite.
 template <typename F>
@@ -1836,6 +1838,21 @@ int main(int argc, char** argv)
             std::printf("%s\n", gov_hash_display(internal).c_str());
         }
         return 0;
+    }
+
+    // ctest export_utxos_roundtrip hook: import a UTXO file through the model,
+    // screen it at the default target and print the two public cards.
+    if (argc >= 3 && std::strcmp(argv[1], "--import-file") == 0) {
+        try {
+            DashInjectModel m;
+            m.import_utxos(read_file(argv[2]), argc >= 4 ? std::atoll(argv[3]) : 0);
+            m.rescreen({});
+            std::printf("%s%s", m.import_card().c_str(), m.screen_card().c_str());
+            return 0;
+        } catch (const std::exception& e) {
+            std::printf("REFUSED: %s\n", e.what());
+            return 1;
+        }
     }
 
     // Oracle hook: the slice-2 end-to-end txs on the fixture (test key), as

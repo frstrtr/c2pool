@@ -71,7 +71,10 @@ add_library(c2wallet-dash-common STATIC
     DashMessage.cpp
     UtxoIntake.cpp
     SweepTx.cpp
-    # slice 2: PageDashInject's std-only model (all but sign()) + the manifest
+    # slice 2: PageDashInject's std-only model (all but sign()) + the manifest.
+    # DashInjectModel.cpp plans a collateral through plan_collateral
+    # (CollateralTx.cpp, c2wallet-dash-tx): a consumer of the model links BOTH
+    # libs, c2wallet-dash-tx first, as the signer app and c2wallet-dash-test do.
     InjectManifest.cpp
     DashInjectModel.cpp
 )
@@ -120,5 +123,14 @@ if(C2WALLET_QT_BUILD_TESTS OR _dash_standalone)
                  COMMAND ${PYTHON3_EXECUTABLE}
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/proto_hash_oracle.py
                          --cpp-bin $<TARGET_FILE:c2wallet-dash-test>)
+        # Slice 2: the online exporter (ui/c2wallet-qt/tools/export_utxos.py) run
+        # against a mock dash-cli serving the public fixture, its output then
+        # imported through DashInjectModel.
+        add_test(NAME export_utxos_roundtrip
+                 COMMAND ${PYTHON3_EXECUTABLE} -I
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_roundtrip.py
+                         --cpp-bin $<TARGET_FILE:c2wallet-dash-test>
+                         --exporter ${CMAKE_CURRENT_SOURCE_DIR}/../../../../tools/export_utxos.py
+                         --fixture ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/xdgf-getaddressutxos-tip2563986.json)
     endif()
 endif()
