@@ -196,3 +196,28 @@ TEST(BlockDownload, TheBufferIsBoundedInBytes)
     EXPECT_EQ(dl.in_flight(), 1u);
     EXPECT_FALSE(dl.asked_peer(10).empty());
 }
+
+// A peer with 16 requests queued that delivers one block every 10 s is
+// working through its queue: no timeout (a per-request 60-s clock timed out
+// its last ten). A peer that delivers nothing for 60 s times out.
+TEST(BlockDownload, ASteadyPeerIsNotTimedOut)
+{
+    FakePeers net(1);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    arm(f, 1, 100);
+    ASSERT_EQ(dl.refill(f), 16u);
+    for (uint32_t h = 1; h <= 16; ++h) {
+        net.t += std::chrono::seconds(10);
+        dl.tick(f);
+        EXPECT_EQ(dl.stats().request_timeouts.load(), 0u) << "after " << h * 10 << " s";
+        deliver(f, dl, h, "peer0");
+    }
+    EXPECT_EQ(dl.stats().request_timeouts.load(), 0u);
+
+    // Now silent for 61 s with 16 more queued.
+    dl.refill(f);
+    net.t += std::chrono::seconds(61);
+    dl.tick(f);
+    EXPECT_EQ(dl.stats().request_timeouts.load(), 1u);
+}

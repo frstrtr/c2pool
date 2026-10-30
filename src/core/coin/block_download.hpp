@@ -11,8 +11,12 @@
 ///     fewer than PER_PEER_IN_FLIGHT outstanding (round robin on ties);
 ///     eligible = the host's peers (handshaken, NODE_NETWORK) minus those
 ///     cooling down, or all of them when every one is;
-///   - a request unanswered for REQUEST_TIMEOUT goes to another peer, and
-///     its peer cools down for PEER_COOLDOWN;
+///   - a peer that delivered nothing for REQUEST_TIMEOUT since its oldest
+///     outstanding request (or its last delivery, whichever is later) times
+///     out: its requests go to other peers and it cools down for
+///     PEER_COOLDOWN. A peer working through its queue, however slowly, is
+///     not timed out request by request (a per-request clock timed out most
+///     of 20 peers on a saturated link, each queue 13 blocks deep);
 ///   - a peer holding the window's first height past the stall timeout
 ///     while the window cannot move (every height in it asked or buffered,
 ///     or the buffer at its byte bound) is rotated out and its requests
@@ -55,7 +59,8 @@ public:
     /// Core BLOCK_STALLING_TIMEOUT, doubled after each stall up to the max.
     static constexpr std::chrono::milliseconds STALL_TIMEOUT_MIN{2000};
     static constexpr std::chrono::milliseconds STALL_TIMEOUT_MAX{64000};
-    /// A request unanswered this long goes to another peer.
+    /// A peer that delivered nothing this long since its oldest request (or
+    /// its last delivery) times out.
     static constexpr std::chrono::seconds REQUEST_TIMEOUT{60};
     /// A stalling or timed-out peer is not asked this long.
     static constexpr std::chrono::seconds PEER_COOLDOWN{600};
@@ -120,6 +125,7 @@ public:
     {
         m_inflight.clear();
         m_load.clear();
+        m_last_delivery.clear();
         m_sizes.clear();
         m_buffer_bytes = 0;
         m_stall_height = 0;
@@ -129,8 +135,10 @@ public:
 
     /// A body for height h arrived from `peer` (any block the fill's thread
     /// sees; a height not in flight is ignored).
-    void delivered(uint32_t h, const std::string& /*peer*/)
+    void delivered(uint32_t h, const std::string& peer)
     {
+        if (!peer.empty() && m_load.count(peer))
+            m_last_delivery[peer] = now();
         auto it = m_inflight.find(h);
         if (it == m_inflight.end())
             return;
@@ -230,10 +238,10 @@ public:
         return asked;
     }
 
-    /// The periodic check (every second): requests unanswered for
-    /// REQUEST_TIMEOUT go to other peers; a peer holding the window's first
-    /// height past the stall timeout while the window cannot move is rotated
-    /// out; then the window is refilled.
+    /// The periodic check (every second): a peer that delivered nothing for
+    /// REQUEST_TIMEOUT times out (its requests go to other peers); a peer
+    /// holding the window's first height past the stall timeout while the
+    /// window cannot move is rotated out; then the window is refilled.
     template <typename Fill>
     void tick(const Fill& fill)
     {
@@ -241,16 +249,26 @@ public:
             return;
         const auto t = now();
         sync(fill);
-        for (auto it = m_inflight.begin(); it != m_inflight.end();) {
-            if (t - it->second.sent > REQUEST_TIMEOUT) {
-                m_stats.request_timeouts.fetch_add(1, std::memory_order_relaxed);
-                m_cooldown[it->second.peer] = t + PEER_COOLDOWN;
-                m_peers_at = {};
-                auto next = std::next(it);
-                drop_request(it);
-                it = next;
-            } else {
-                ++it;
+        {
+            // Per peer: the later of its oldest outstanding request and its
+            // last delivery.
+            std::map<std::string, Clock::time_point> since;
+            for (const auto& [h, req] : m_inflight) {
+                auto [it, fresh] = since.try_emplace(req.peer, req.sent);
+                if (!fresh && req.sent < it->second)
+                    it->second = req.sent;
+            }
+            for (auto& [peer, at] : since) {
+                auto d = m_last_delivery.find(peer);
+                if (d != m_last_delivery.end() && d->second > at)
+                    at = d->second;
+                if (t - at > REQUEST_TIMEOUT) {
+                    m_stats.request_timeouts.fetch_add(1, std::memory_order_relaxed);
+                    LOG_INFO << m_tag << " peer " << peer << " delivered nothing for "
+                             << std::chrono::duration_cast<std::chrono::seconds>(t - at).count()
+                             << "s: its requests go to other peers";
+                    cool_down(peer, t);
+                }
             }
         }
         auto first = m_inflight.find(fill.next_height);
@@ -331,8 +349,10 @@ private:
     void drop_request(std::map<uint32_t, InFlight>::iterator it)
     {
         auto load = m_load.find(it->second.peer);
-        if (load != m_load.end() && load->second > 0 && --load->second == 0)
+        if (load != m_load.end() && load->second > 0 && --load->second == 0) {
+            m_last_delivery.erase(load->first);
             m_load.erase(load);
+        }
         m_inflight.erase(it);
     }
 
@@ -425,6 +445,7 @@ private:
 
     std::map<uint32_t, InFlight>                  m_inflight;  // height -> its request
     std::map<std::string, uint32_t>               m_load;      // peer -> requests outstanding
+    std::map<std::string, Clock::time_point>      m_last_delivery;  // peer (with requests) -> its last delivery
     std::map<std::string, Clock::time_point>      m_cooldown;  // peer -> not asked until
     std::map<uint32_t, size_t>                    m_sizes;     // buffered height -> bytes
     size_t                                        m_buffer_bytes{0};
