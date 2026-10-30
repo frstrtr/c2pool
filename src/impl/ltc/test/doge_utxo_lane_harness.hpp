@@ -199,6 +199,7 @@ struct Net {
     std::vector<std::string> peers;
     std::vector<std::pair<std::string, uint32_t>> peer_requests;
     std::chrono::steady_clock::time_point clock{std::chrono::steady_clock::time_point{} + std::chrono::hours(1)};
+    bool bodies_wait{false};  // the host's bodies_wait (headers first)
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     std::vector<std::string> events;     // clean / header, in order
@@ -281,6 +282,7 @@ struct Net {
                 return true;
             };
             h.now = [this]() { return clock; };
+            h.bodies_wait = [this]() { return bodies_wait; };
         }
         return h;
     }

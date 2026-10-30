@@ -7143,14 +7143,21 @@ int main(int argc, char* argv[]) {
                                 if (range_sync && range_sync->mode() == doge::coin::RangeSync::Mode::Anchored) {
                                     auto range_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                     auto range_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                    *range_fn = [range_fn, range_timer, range_sync, bcaster_ptr](boost::system::error_code ec) {
+                                    *range_fn = [range_fn, range_timer, range_sync, bcaster_ptr, doge_hdr_asks,
+                                                 full = doge_full](boost::system::error_code ec) {
                                         if (ec || range_sync->mode() != doge::coin::RangeSync::Mode::Anchored)
                                             return;
                                         range_timer->expires_after(std::chrono::seconds(1));
                                         range_timer->async_wait(*range_fn);
                                         try {
-                                            const auto reqs = range_sync->tick(bcaster_ptr->ready_peers(0),
-                                                                               std::chrono::steady_clock::now());
+                                            // Not the header chain's sync peers nor the block
+                                            // downloads' peers, while others are connected: a peer
+                                            // serves its requests in order (FRESH-NODE §4.2).
+                                            const auto now = std::chrono::steady_clock::now();
+                                            auto avoid = doge_hdr_asks->busy(now);
+                                            for (const auto& p : full->body_peers())
+                                                avoid.insert(p);
+                                            const auto reqs = range_sync->tick(bcaster_ptr->ready_peers(0), now, avoid);
                                             for (const auto& r : reqs)
                                                 if (bcaster_ptr->request_headers_targeted(r.locator, r.stop, 0, r.peer) != r.peer)
                                                     range_sync->unsent(r.range, r.peer);
@@ -7402,8 +7409,16 @@ int main(int argc, char* argv[]) {
                                     // behind) through the lane's block download: one peer that
                                     // serves every block (NODE_NETWORK) per block, per-request
                                     // timeouts and reassignment, not every peer for every block.
-                                    host.download_peers = [bcaster_ptr]() {
-                                        return bcaster_ptr->ready_peers(1 /* NODE_NETWORK */);
+                                    // While the anchored ranges run, at most BODY_PEERS of them (the
+                                    // ranges ask the others first: a peer serves its requests in
+                                    // order, FRESH-NODE §6.4).
+                                    host.download_peers = [bcaster_ptr, range_sync]() {
+                                        constexpr size_t BODY_PEERS = 4;
+                                        auto peers = bcaster_ptr->ready_peers(1 /* NODE_NETWORK */);
+                                        if (range_sync && range_sync->mode() == doge::coin::RangeSync::Mode::Anchored
+                                            && peers.size() > BODY_PEERS)
+                                            peers.resize(BODY_PEERS);
+                                        return peers;
                                     };
                                     host.request_from = [dc, bcaster_ptr](const std::string& peer, uint32_t h) {
                                         auto e = dc->get_header_by_height(h);
@@ -7470,8 +7485,19 @@ int main(int argc, char* argv[]) {
                                     host.fill_stopped = [](doge::coin::UtxoLaneHost::Fill& f) {
                                         f.stop_stall_timer();
                                     };
+                                    // Bodies wait for headers (Core's ordering, FRESH-NODE §6.4):
+                                    // the Bootstrap asks nothing while the anchored ranges run
+                                    // and the header chain is not synced.
+                                    host.bodies_wait = [dc, range_sync]() {
+                                        return range_sync && range_sync->mode() == doge::coin::RangeSync::Mode::Anchored
+                                            && !dc->is_synced();
+                                    };
                                     doge_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_utxo_cache, *doge_utxo_db, std::move(host));
+                                    doge_full->add_body_peers([lane = std::weak_ptr<doge::coin::UtxoLane>(doge_lane)]() {
+                                        auto l = lane.lock();
+                                        return l ? l->peers_in_use() : std::set<std::string>();
+                                    });
                                     // Its download's clock (the Bootstrap): timeouts, the
                                     // stalling-peer rule and the refill, every second on the
                                     // io_context, where the lane runs.
@@ -7648,6 +7674,11 @@ int main(int argc, char* argv[]) {
                                     doge_full_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_full_cache, *doge_full_db, std::move(host),
                                         core::coin::DOGE_MIN_BLOCKS_TO_KEEP, doge::coin::UtxoLaneMode::Full);
+                                    doge_full->add_body_peers(
+                                        [lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane)]() {
+                                            auto l = lane.lock();
+                                            return l ? l->peers_in_use() : std::set<std::string>();
+                                        });
                                     if (doge_full->live.load())
                                         boost::asio::post(ioc, [bcaster_ptr]() { bcaster_ptr->enable_mempool_request(); });
 

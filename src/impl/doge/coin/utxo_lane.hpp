@@ -68,7 +68,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -170,6 +172,12 @@ struct UtxoLaneHost {
     std::function<bool(const std::string&, uint32_t)> request_from;
     /// The clock (tests drive it). Unset: std::chrono::steady_clock.
     std::function<std::chrono::steady_clock::time_point()> now;
+    /// Bodies wait for headers (Core's ordering, FRESH-NODE §6.4): while it
+    /// returns true the block download asks nothing (no request, no
+    /// broadcast); it resumes at the next tick() once it returns false.
+    /// main_ltc: the accrual Bootstrap while the anchored hash schedule runs
+    /// and the header chain is not synced. Unset: never waits.
+    std::function<bool()> bodies_wait;
 };
 
 /// The serialized size of a body, estimated from its parts (memory bounds:
@@ -385,7 +393,9 @@ public:
             const auto now = std::chrono::steady_clock::now();
             const auto stall =
                 std::chrono::duration_cast<std::chrono::seconds>(now - m_fill.last_drain_time).count();
-            if (stall >= m_fill.STALL_TIMEOUT_SEC) {
+            if (bodies_wait()) {
+                m_fill.last_drain_time = now;  // waiting is not a stall
+            } else if (stall >= m_fill.STALL_TIMEOUT_SEC) {
                 LOG_WARNING << m_tag << " " << m_fill.phase << " stall h=" << m_fill.next_height
                             << " (" << stall << "s) — broadcast fallback";
                 m_host.request(m_fill.next_height, UtxoAsk::Broadcast);
@@ -521,6 +531,14 @@ public:
     /// Full mode: the set was left as is after repeated refusals or a write
     /// failure (heal_failures); the height is fetched again after STUCK_RETRY.
     bool stuck() const { return m_stuck; }
+
+    /// The peers the block download has requests outstanding with, from any
+    /// thread (the hash schedule asks other peers first).
+    std::set<std::string> peers_in_use() const
+    {
+        std::lock_guard<std::mutex> lock(m_in_use_mu);
+        return m_in_use;
+    }
 
 private:
     enum class Heal { Startup, Reorg, ParentMismatch };
@@ -688,6 +706,9 @@ private:
             m_host.fill_stopped(m_fill);
     }
 
+    /// The download waits for headers (UtxoLaneHost::bodies_wait).
+    bool bodies_wait() const { return downloading() && m_host.bodies_wait && m_host.bodies_wait(); }
+
     uint32_t refill(UtxoAsk how)
     {
         if (downloading())
@@ -813,7 +834,7 @@ private:
     /// outstanding, while the reorder buffer is under its memory bound.
     uint32_t download_refill()
     {
-        if (!m_fill.active)
+        if (!m_fill.active || bodies_wait())
             return 0;
         const auto t = now();
         sync_download_state();
@@ -854,7 +875,18 @@ private:
         m_stats.inflight.store(m_inflight.size(), std::memory_order_relaxed);
         m_stats.peers_used.store(m_load.size(), std::memory_order_relaxed);
         m_stats.buffer_bytes.store(m_buffer_bytes, std::memory_order_relaxed);
+        publish_in_use();
         return asked;
+    }
+
+    void publish_in_use()
+    {
+        std::set<std::string> in_use;
+        for (const auto& [p, n] : m_load)
+            if (n > 0)
+                in_use.insert(p);
+        std::lock_guard<std::mutex> lock(m_in_use_mu);
+        m_in_use.swap(in_use);
     }
 
 public:
@@ -873,8 +905,20 @@ public:
                 retry_stuck(t);
             update_rate(t);
         }
-        if (!downloading() || !m_fill.active)
+        if (!downloading() || !m_fill.active) {
+            // No download runs: what is left of the last one is answered or
+            // moot (the accrual lane drops a request only at its next refill).
+            m_inflight.clear();
+            m_load.clear();
+            publish_in_use();
             return;
+        }
+        if (bodies_wait()) {
+            // Nothing asked; the fill's stall timer sees no stall.
+            m_fill.last_drain_time = std::chrono::steady_clock::now();
+            publish_in_use();
+            return;
+        }
         sync_download_state();
         for (auto it = m_inflight.begin(); it != m_inflight.end();) {
             if (t - it->second.sent > REQUEST_TIMEOUT) {
@@ -1422,6 +1466,8 @@ private:
     size_t                              m_buffer_limit{BUFFER_BYTES_MAX};
     std::chrono::milliseconds           m_stall_timeout{STALL_TIMEOUT_MIN};
     uint32_t                            m_drained_since_stall{0};
+    mutable std::mutex                  m_in_use_mu;
+    std::set<std::string>               m_in_use;     // peers_in_use(): m_load's peers, for other threads
 };
 
 } // namespace coin

@@ -31,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -208,6 +209,28 @@ struct UtxoFullState {
         return a;
     }
 
+    /// The block downloads' peers (each lane's peers_in_use, registered at
+    /// wiring): the hash schedule's ranges go to other peers first.
+    void add_body_peers(std::function<std::set<std::string>()> fn)
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mu);
+        m_body_peers.push_back(std::move(fn));
+    }
+    std::set<std::string> body_peers() const
+    {
+        std::vector<std::function<std::set<std::string>()>> fns;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mu);
+            fns = m_body_peers;
+        }
+        std::set<std::string> out;
+        for (const auto& f : fns) {
+            auto s = f();
+            out.insert(s.begin(), s.end());
+        }
+        return out;
+    }
+
 private:
     static constexpr size_t MAX_REQUESTED = 65536;
 
@@ -240,6 +263,8 @@ private:
     std::deque<std::pair<uint64_t, uint256>> m_await_order;
     uint64_t           m_await_seq{0};
     std::map<uint256, uint32_t> m_requested;
+    mutable std::mutex m_peers_mu;
+    std::vector<std::function<std::set<std::string>()>> m_body_peers;
 };
 
 } // namespace coin

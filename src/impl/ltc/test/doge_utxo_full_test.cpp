@@ -754,6 +754,45 @@ TEST(DogeUtxoBootstrap, TheBootstrapAsksOnePeerPerBlockNotEveryPeer)
     EXPECT_EQ(l.t.cache->get_best_height(), 30u);
 }
 
+// FRESH-NODE §6.4 / §7: bodies wait for headers (Core's ordering). While the
+// host says so (main_ltc: the anchored ranges run and the header chain is not
+// synced) the armed Bootstrap asks nothing, neither a peer nor a broadcast;
+// within one tick of the host's word it asks, and the peers it asks are the
+// ones peers_in_use() names (the ranges go elsewhere). On 91e5f87d9 the
+// Bootstrap asked at once.
+TEST(DogeUtxoBootstrap, BodiesWaitForHeaders)
+{
+    const uint256 g = genesis(0x73);
+    const auto chain = chain_with(g, 30);
+    Lane l(20, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.net.bodies_wait = true;
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "b");
+    ASSERT_TRUE(l.lane.fill().active) << "the Bootstrap is armed";
+    for (int i = 0; i < 5; ++i) {
+        l.net.clock += std::chrono::seconds(1);
+        l.lane.tick();
+    }
+    EXPECT_TRUE(l.net.peer_requests.empty()) << "a body asked while headers come first";
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast while headers come first";
+    EXPECT_TRUE(l.lane.peers_in_use().empty());
+    l.net.bodies_wait = false;
+    l.net.clock += std::chrono::seconds(1);
+    l.lane.tick();
+    ASSERT_FALSE(l.net.peer_requests.empty()) << "not resumed within one tick";
+    std::set<std::string> asked;
+    for (const auto& [p, h] : l.net.peer_requests)
+        asked.insert(p);
+    EXPECT_EQ(l.lane.peers_in_use(), asked);
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 30u);
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast";
+    l.lane.tick();
+    EXPECT_TRUE(l.lane.peers_in_use().empty()) << "nothing outstanding";
+}
+
 // A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.
 TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
 {

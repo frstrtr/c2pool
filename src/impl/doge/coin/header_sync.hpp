@@ -24,6 +24,7 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace doge {
@@ -93,6 +94,18 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mu);
         return outstanding_locked(peer, now);
+    }
+
+    /// The peers with a getheaders of the header chain unanswered: its sync
+    /// peers (the hash schedule's ranges go to other peers first).
+    std::set<std::string> busy(Clock::time_point now)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        std::set<std::string> out;
+        for (const auto& [p, at] : m_sent)
+            if (now - at < RESPONSE_TIME)
+                out.insert(p);
+        return out;
     }
 
 private:
