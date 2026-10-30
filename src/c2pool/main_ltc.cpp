@@ -6969,6 +6969,17 @@ int main(int argc, char* argv[]) {
                                     };
                                     doge_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs), "[EMB-DOGE]");
                                 }
+                                // A block announcement (DOGE peers get no sendheaders and
+                                // announce by inv): ask the announcer for headers at once
+                                // (HeaderSync::on_block_announced: Core's getheaders to the
+                                // announcing peer, none while one to it is unanswered).
+                                // Before, the DOGE tip moved only on the poll, 0-60 s after
+                                // the block; the batch's peer is then the announcer the tip
+                                // body is asked of first (adding_from).
+                                broadcaster->set_on_new_block(
+                                    [doge_hdr_sync](const std::string& peer, const uint256& hash) {
+                                        doge_hdr_sync->on_block_announced(peer, hash);
+                                    });
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
                                     [doge_hdr_sync](const std::string& key,
