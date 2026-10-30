@@ -223,7 +223,16 @@ std::string build_inject_manifest(const ManifestData& d)
     J node = J::obj();
     if (relay) {
         node.put("lane", J::str("relay"));
-        node.put("submit", J::str("dash-cli sendrawtransaction <each line of the .hex file>"));
+        // Legacy sighash commits no input amounts: the export's amounts are the
+        // trust root, and on this lane an understated one is paid as extra fee.
+        node.put("submit", J::str("ONLY after the preflight below passes on the online host: "
+                                  "dash-cli sendrawtransaction <each line of the .hex file>"));
+        node.put("preflight",
+                 J::str("for every input of every tx: dash-cli gettxout <txid> <vout> true must be "
+                        "non-null, its scriptPubKey.hex must equal script_hex and round(value * 1e8) "
+                        "must equal the input's value in duffs; and for every tx the inputs' values "
+                        "must sum to value_out + fee. Legacy sighash commits no input amounts: an "
+                        "understated amount would be paid as extra fee"));
         node.put("min_relay_fee_duffs_per_byte", J::integer(kMinRelayFeePerByte));
     } else {
         node.put("lane", J::str("pin|inject (zero fee: Dash Core peers will not relay it)"));

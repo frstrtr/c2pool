@@ -1597,6 +1597,11 @@ static void test_s2_k6_end_to_end()
                   contains(r.manifest_json(), "\"total_fee\": 19116") &&
                   contains(r.manifest_json(), "sendrawtransaction"),
               "relay manifest: fee mode, total fee, submit hint");
+        mj::ParseResult rm = mj::parse(r.manifest_json());
+        CHECK(rm.ok && jstr(jpath(rm.root, {"node_requirements", "submit"})).find("ONLY after the preflight") == 0 &&
+                  contains(jstr(jpath(rm.root, {"node_requirements", "preflight"})), "gettxout") &&
+                  contains(jstr(jpath(rm.root, {"node_requirements", "preflight"})), "value_out + fee"),
+              "relay manifest (VERIFY-S2 F4): submit requires the gettxout amount preflight first");
     }
 }
 
