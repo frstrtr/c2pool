@@ -7,24 +7,61 @@
 #include <core/leveldb_pread_env.hpp>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <sstream>
 
 namespace core {
 
 namespace {
 
-/// LevelDB could not take the DB's LOCK (env_posix / env_windows: "lock
-/// <dir>/LOCK: Resource temporarily unavailable", "... already held by
-/// process").
-bool lock_held(const leveldb::Status& status)
+/// LevelDB could not take the DB's LOCK. The status names the file,
+/// leveldb::LockFileName(dbname) = dbname + "/LOCK", on every platform:
+/// env_posix "lock <dir>/LOCK: Resource temporarily unavailable" or "...
+/// already held by process"; env_windows "<dir>/LOCK: <sharing violation>"
+/// (CreateFileA fails before LockFileEx, without the "lock " prefix).
+bool status_lock_held(const leveldb::Status& status, const std::string& db_path)
 {
-    if (!status.IsIOError())
-        return false;
-    const std::string msg = status.ToString();
-    return msg.find("lock ") != std::string::npos && msg.find("LOCK") != std::string::npos;
+    return status.IsIOError() && status.ToString().find(db_path + "/LOCK") != std::string::npos;
+}
+
+/// The DBs this process has open (canonical paths): a second open of one is
+/// refused before LevelDB sees it.
+std::mutex& registry_mutex()
+{
+    static std::mutex mu;
+    return mu;
+}
+
+std::set<std::string>& registry()
+{
+    static std::set<std::string> open_paths;
+    return open_paths;
+}
+
+std::string registry_key(const std::string& db_path)
+{
+    std::error_code ec;
+    auto p = std::filesystem::weakly_canonical(std::filesystem::path(db_path), ec);
+    return ec ? std::filesystem::absolute(db_path, ec).lexically_normal().string() : p.string();
+}
+
+void unregister(std::string& key)
+{
+    if (key.empty())
+        return;
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    registry().erase(key);
+    key.clear();
 }
 
 } // namespace
+
+bool leveldb_status_lock_held(const leveldb::Status& status, const std::string& db_path)
+{
+    return status_lock_held(status, db_path);
+}
 
 LevelDBStore::LevelDBStore(const std::string& db_path, const LevelDBOptions& options)
     : m_db_path(db_path), m_options(options), m_db(nullptr)
@@ -43,9 +80,23 @@ bool LevelDBStore::open()
         return true;
     }
 
+    m_lock_held = false;
     try {
         // Create directory if it doesn't exist
         std::filesystem::create_directories(m_db_path);
+
+        // Another LevelDBStore of this process has it open.
+        {
+            const std::string key = registry_key(m_db_path);
+            std::lock_guard<std::mutex> lock(registry_mutex());
+            if (!registry().insert(key).second) {
+                m_lock_held = true;
+                LOG_ERROR << "LevelDB at " << m_db_path << " is already open in this process; not opened "
+                          << "again, and nothing in it touched. " << held_advice();
+                return false;
+            }
+            m_registered = key;
+        }
 
         // Configure LevelDB options
         leveldb::Options db_options;
@@ -82,10 +133,12 @@ bool LevelDBStore::open()
         // (--utxo-digest) open a live IBD's full UTXO set beside it: 68 table
         // files went missing and a 4.75 M-height set was lost. A LOCK file
         // nobody holds (left by a crash) does not stop the open.
-        if (!status.ok() && lock_held(status)) {
+        if (!status.ok() && status_lock_held(status, m_db_path)) {
+            m_lock_held = true;
+            unregister(m_registered);
             LOG_ERROR << "LevelDB at " << m_db_path << " is in use (" << status.ToString()
-                      << "): another process, or another open of it in this one, holds its lock; "
-                      << "not opened, and nothing in it touched";
+                      << "): another process holds its lock; not opened, and nothing in it touched. "
+                      << held_advice();
             return false;
         }
 
@@ -104,6 +157,7 @@ bool LevelDBStore::open()
         }
 
         if (!status.ok()) {
+            unregister(m_registered);
             LOG_ERROR << "Failed to open LevelDB at " << m_db_path << ": " << status.ToString();
             return false;
         }
@@ -113,8 +167,23 @@ bool LevelDBStore::open()
         return true;
 
     } catch (const std::exception& e) {
+        unregister(m_registered);
         LOG_ERROR << "Exception opening LevelDB: " << e.what();
         return false;
+    }
+}
+
+bool LevelDBStore::open_waiting(int attempts, std::chrono::milliseconds wait)
+{
+    for (int attempt = 1;; ++attempt) {
+        if (open())
+            return true;
+        if (!m_lock_held || attempt >= attempts)
+            return false;
+        LOG_WARNING << "LevelDB at " << m_db_path << " is held by another open (attempt " << attempt << "/"
+                    << attempts << "): the process it replaces may still be exiting; again in "
+                    << wait.count() << " ms (if not, " << held_advice() << ")";
+        std::this_thread::sleep_for(wait);
     }
 }
 
@@ -124,6 +193,7 @@ void LevelDBStore::close()
         LOG_INFO << "Closing LevelDB store at: " << m_db_path;
         m_db.reset();
     }
+    unregister(m_registered);
 }
 
 bool LevelDBStore::put(const std::string& key, const std::vector<uint8_t>& value)
@@ -481,6 +551,20 @@ bool SharechainLevelDBStore::open()
         LOG_INFO << "  Recovery: height index rebuilt from share metadata";
 
     return true;
+}
+
+bool SharechainLevelDBStore::open_waiting(int attempts, std::chrono::milliseconds wait)
+{
+    for (int attempt = 1;; ++attempt) {
+        if (open())
+            return true;
+        if (!lock_held() || attempt >= attempts)
+            return false;
+        LOG_WARNING << "SharechainLevelDB at " << m_db_path << " is held by another open (attempt " << attempt
+                    << "/" << attempts << "): the process it replaces may still be exiting; again in "
+                    << wait.count() << " ms (if not, " << LevelDBStore::held_advice() << ")";
+        std::this_thread::sleep_for(wait);
+    }
 }
 
 void SharechainLevelDBStore::close()

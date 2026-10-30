@@ -1,17 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "sharechain_storage.hpp"
+#include <cstdlib>
 #include <functional>
+#include <iostream>
 
 namespace c2pool {
 namespace storage {
 
-SharechainStorage::SharechainStorage(const std::string& network_name) 
+SharechainStorage::SharechainStorage(const std::string& network_name, int lock_attempts,
+                                     std::chrono::milliseconds lock_wait)
     : m_network_name(network_name)
 {
     std::string base_path = core::filesystem::config_path().string();
     m_leveldb_store = std::make_unique<core::SharechainLevelDBStore>(base_path, network_name);
     
-    if (!m_leveldb_store->open()) {
+    if (!m_leveldb_store->open_waiting(lock_attempts, lock_wait)) {
+        if (m_leveldb_store->lock_held()) {
+            const std::string msg = "the sharechain store " + m_leveldb_store->db_path()
+                + " is held by another c2pool; " + core::LevelDBStore::held_advice()
+                + ". Exiting: without it every share of this run would be lost";
+            LOG_ERROR << msg;
+            std::cerr << "c2pool: " << msg << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
         LOG_ERROR << "Failed to open LevelDB sharechain storage for network: " << network_name;
         m_leveldb_store.reset();
     } else {
