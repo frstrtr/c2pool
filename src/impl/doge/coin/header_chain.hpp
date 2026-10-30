@@ -192,6 +192,10 @@ public:
             // then a height per block; through mmap every page read stayed
             // in RSS (282 MB on a fresh node once the schedule was proven).
             opts.mmap_reads = false;
+            // One fd per open table with pread (no mmap to close it after):
+            // 256 tables of 2 MB cover the ~330 MB store within an fd budget
+            // the full set's DB and the sockets share (VERIFY7 B3).
+            opts.max_open_files = 256;
             m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
             if (!m_db->open())
                 return false;
