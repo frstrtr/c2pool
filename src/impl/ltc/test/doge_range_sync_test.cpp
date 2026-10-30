@@ -21,11 +21,13 @@
 //     (a shared link), ADeliveryForgivesAStrike
 //   - APerFlowCapIsNotTheLink (each connection capped, the link to spare),
 //     NoStrikeWhenNobodyDelivers, RangePeersAreNotTheSyncPeerNorBodyPeers
-//     (FRESH-NODE §6.4, §7)
+//     (FRESH-NODE §6.4, §7); AStarvedLinkStrikesNoSlowPeer,
+//     APeersWindowIsBytesNotRanges (fresh-anchored3 run 1)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -225,10 +227,12 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     const Chain c(CP);
     TempStore s;
     auto sched = open_schedule(s, c, CP);
-    RangeSync rs(*sched, c.anchors(CP));
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 0;  // every range an AuxPoW one (a window counts them)
+    RangeSync rs(*sched, c.anchors(CP), cfg);
     auto t = t0();
-    // A peer's window starts at 1; a range delivered at once makes it 2:
-    // ranges 1 and 2 in flight to a.
+    // A peer's window starts at one range; a range delivered at once adds
+    // one: ranges 1 and 2 in flight to a.
     const auto first = rs.tick({"a"}, t);
     ASSERT_EQ(first.size(), 1u) << "a peer's window starts at 1";
     ASSERT_EQ(rs.on_headers("a", c.answer(first[0].locator, first[0].stop), t), Answer::Stored);
@@ -1090,7 +1094,9 @@ TEST(DogeRangeSync, ASharedLinkDoesNotStrikeHonestPeers)
     for (const double mbps : {0.5, 0.2, 0.1}) {
         TempStore s;
         auto sched = open_schedule(s, c, CP);
-        RangeSync rs(*sched, c.anchors(CP));
+        RangeSync::Config cfg;
+        cfg.auxpow_height = 0;  // the link carries 1.6 MB AuxPoW ranges
+        RangeSync rs(*sched, c.anchors(CP), cfg);
         const auto peers = v6_peers(18);
         SharedLink link{mbps * 1e6, 1.6e6, {}};
         auto t = t0();
@@ -1143,20 +1149,39 @@ struct CappedLink {
     double flow_bytes_per_s;
     double range_bytes;
     std::map<std::string, std::deque<std::pair<RangeSync::Request, double>>> queues;
-    void add(const RangeSync::Request& r) { queues[r.peer].emplace_back(r, range_bytes); }
+    std::map<std::string, double> caps;  // a peer's own limit, when below flow_bytes_per_s
+    uint32_t plain_ranges{0};            // ranges below it carry 162 KB (pre-AuxPoW headers)
+    double bytes_of(uint32_t range) const { return range < plain_ranges ? 162e3 : range_bytes; }
+    void add(const RangeSync::Request& r) { queues[r.peer].emplace_back(r, bytes_of(r.range)); }
+    double cap_of(const std::string& p) const
+    {
+        auto it = caps.find(p);
+        return it == caps.end() ? flow_bytes_per_s : std::min(it->second, flow_bytes_per_s);
+    }
     std::vector<RangeSync::Request> step()  // one second passes
     {
         std::vector<RangeSync::Request> done;
-        size_t active = 0;
+        // Max-min fair: flows below the equal share keep their limit, the
+        // others share what is left.
+        std::vector<std::string> active;
         for (const auto& [p, q] : queues)
-            active += q.empty() ? 0 : 1;
-        if (active == 0)
+            if (!q.empty())
+                active.push_back(p);
+        if (active.empty())
             return done;
-        const double rate = std::min(flow_bytes_per_s, link_bytes_per_s / active);
+        std::sort(active.begin(), active.end(),
+                  [&](const std::string& a, const std::string& b) { return cap_of(a) < cap_of(b); });
+        std::map<std::string, double> rate;
+        double left = link_bytes_per_s;
+        for (size_t i = 0; i < active.size(); ++i) {
+            const double share = left / double(active.size() - i);
+            rate[active[i]] = std::min(cap_of(active[i]), share);
+            left -= rate[active[i]];
+        }
         for (auto& [p, q] : queues) {
             if (q.empty())
                 continue;
-            q.front().second -= rate;
+            q.front().second -= rate[p];
             if (q.front().second <= 0) {
                 done.push_back(q.front().first);
                 q.pop_front();
@@ -1171,24 +1196,27 @@ struct CappedLink {
 // FRESH-NODE §4.4 / §7: the ranges' limit is per connection (a peer's upload,
 // the RTT), not the link. Eighteen peers, each connection capped at 100 KB/s
 // (the §7 figure) or 50 KB/s (the live rate of a range, 4 a minute at budget
-// 2), sharing a 1 MB/s link, AuxPoW ranges of 1.6 MB: after the first minute
-// at least 10 ranges are in flight in every second, the schedule takes at
-// least 0.8 MB/s, nobody is struck. On 91e5f87d9 the rate budget measures its
-// own output: at 50 KB/s a range takes 32 s > 20 s and it stays at 2 (0.1
-// MB/s); at 100 KB/s it climbs from 2 and is still at 4-8 in the second minute.
+// 2), sharing a 1 MB/s link, DOGE mainnet's mix: 186 ranges of 162 KB below
+// the AuxPoW height, then 1.6 MB ranges. After the first minute at least 10
+// ranges are in flight in every second, the AuxPoW ranges come at 0.8 MB/s or
+// more, nobody is struck. On 91e5f87d9 the rate budget measures its own
+// output: 48 in flight on the quick 162-KB ranges, then 77 MB of 1.6 MB ones
+// queued, timeouts, and a budget of 2 at 32 s a range.
 TEST(DogeRangeSync, APerFlowCapIsNotTheLink)
 {
-    constexpr uint32_t CP = 300 * STEP;
+    constexpr uint32_t CP = 420 * STEP;
+    constexpr uint32_t PLAIN = 186;  // ranges below h=371,337 (RangeSyncConfig::auxpow_height)
     const Chain c(CP);
     for (const double flow : {100e3, 50e3}) {
         TempStore s;
         auto sched = open_schedule(s, c, CP);
         RangeSync rs(*sched, c.anchors(CP));
         const auto peers = v6_peers(18);
-        CappedLink link{1e6, flow, 1.6e6, {}};
-        constexpr int RUN = 420, WARM = 60;
+        CappedLink link{1e6, flow, 1.6e6, {}, {}, PLAIN};
+        constexpr int RUN = 360, WARM = 60, STEADY = 120;  // the AuxPoW ranges from ~60-70 s
         uint32_t min_inflight = UINT32_MAX;
-        uint64_t stored = 0;
+        double auxpow_bytes = 0;  // AuxPoW ranges stored from STEADY on
+        int auxpow_from = -1;
         auto t = t0();
         int sec = 0;
         for (; sec < RUN && rs.mode() == Mode::Anchored; ++sec) {
@@ -1199,22 +1227,91 @@ TEST(DogeRangeSync, APerFlowCapIsNotTheLink)
                 min_inflight = std::min(min_inflight, rs.stats(t).inflight);
             for (const auto& r : link.step()) {
                 const auto a = rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
-                if (sec >= WARM && (a == Answer::Stored || a == Answer::Complete))
-                    ++stored;
+                if (r.range >= PLAIN && (a == Answer::Stored || a == Answer::Complete)) {
+                    if (auxpow_from < 0)
+                        auxpow_from = sec;
+                    if (sec >= STEADY)
+                        auxpow_bytes += 1.6e6;
+                }
             }
         }
         const auto st = rs.stats(t);
-        const double mbps = stored * 1.6 / (sec - WARM);
-        std::cout << "  " << flow / 1e3 << " KB/s a connection, 1 MB/s link: " << mbps << " MB/s after minute 1, "
-                  << "min in flight " << min_inflight << ", budget " << st.budget << ", strikes " << st.strikes
-                  << ", range timeouts " << st.timeouts << ", ranges " << st.ranges_done << "/" << st.ranges_total
-                  << " in " << sec << " s\n";
+        const double mbps = auxpow_bytes / 1e6 / std::max(1, sec - STEADY);
+        std::cout << "  " << flow / 1e3 << " KB/s a connection, 1 MB/s link: the first AuxPoW range at "
+                  << auxpow_from << " s, then " << mbps << " MB/s, min in flight after minute 1 " << min_inflight
+                  << ", budget " << st.budget << ", strikes " << st.strikes << ", range timeouts " << st.timeouts
+                  << ", ranges " << st.ranges_done << "/" << st.ranges_total << " in " << sec << " s\n";
         EXPECT_EQ(sec, RUN) << "the run ended early: the KAT needs more ranges";
         EXPECT_GE(min_inflight, 10u) << flow / 1e3 << " KB/s: the ranges in flight fell to " << min_inflight;
         EXPECT_GE(mbps, 0.8) << flow / 1e3 << " KB/s: the link was there";
         EXPECT_EQ(st.strikes, 0u) << flow / 1e3 << " KB/s";
         EXPECT_EQ(st.excluded, 0u) << flow / 1e3 << " KB/s";
     }
+}
+
+// Live, fresh-anchored3 run 1 (f7658afee): the LTC header storm left the
+// ranges a starved link, every transfer took 50-70 s, and the slower peers
+// were struck because faster ones (still slow) overtook them: 13 strikes in
+// 5 minutes. A witness has to be a healthy peer: one whose range came within
+// REQUEST_TIMEOUT / 2. Here 18 peers share 0.5 MB/s (a range ~58 s), six of
+// them limited to 20 KB/s (80 s): nobody is struck, the schedule moves.
+TEST(DogeRangeSync, AStarvedLinkStrikesNoSlowPeer)
+{
+    constexpr uint32_t CP = 60 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 0;
+    RangeSync rs(*sched, c.anchors(CP), cfg);
+    const auto peers = v6_peers(18);
+    CappedLink link{0.5e6, 100e3, 1.6e6, {}, {}, 0};
+    for (int i = 0; i < 6; ++i)
+        link.caps[peers[i]] = 20e3;
+    auto t = t0();
+    int sec = 0;
+    for (; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t))
+            link.add(r);
+        for (const auto& r : link.step())
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+    }
+    const auto st = rs.stats(t);
+    std::cout << "  0.5 MB/s for 18 peers, 6 of them at 20 KB/s: strikes " << st.strikes << ", excluded "
+              << st.excluded << ", range timeouts " << st.timeouts << ", " << RangeSync::mode_name(rs.mode())
+              << " after " << sec << " s (link-bound 192 s)\n";
+    EXPECT_EQ(st.strikes, 0u) << "slow honest peers struck on a starved link";
+    EXPECT_EQ(st.excluded, 0u);
+    EXPECT_EQ(rs.mode(), Mode::Complete);
+}
+
+// The live first AuxPoW minutes (fresh-anchored3 run 1): 162-KB ranges
+// answered within seconds grew every peer's window to 8 ranges, and the
+// first 1.6 MB ranges then queued 8 deep on each peer (12.8 MB, minutes at
+// its rate). A window in bytes grows by what was delivered: ten 162-KB
+// ranges add one AuxPoW range, so a peer goes into the AuxPoW ranges with 2.
+TEST(DogeRangeSync, APeersWindowIsBytesNotRanges)
+{
+    constexpr uint32_t CP = 30 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 10 * STEP;  // ranges 0..9 plain (162 KB), 10.. AuxPoW (1.6 MB)
+    RangeSync rs(*sched, c.anchors(CP), cfg);
+    auto t = t0();
+    // The 162-KB ranges answered at once; the 1.6 MB ones not at all.
+    for (int sec = 0; sec < 10; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick({"a"}, t))
+            if (r.range < 10)
+                rs.on_headers("a", c.answer(r.locator, r.stop), t);
+    }
+    ASSERT_EQ(sched->first_undone_range(), 10u);
+    std::cout << "  after ten 162-KB ranges answered at once: " << rs.inflight_of("a") << " 1.6 MB ranges in flight\n";
+    EXPECT_GE(rs.inflight_of("a"), 1u);
+    EXPECT_LE(rs.inflight_of("a"), 2u) << "1.6 MB ranges queued on one peer after its 162-KB ones";
 }
 
 // FRESH-NODE §6.4 / §7: a strike needs a witness. Every peer silent for five
@@ -1226,7 +1323,7 @@ TEST(DogeRangeSync, APerFlowCapIsNotTheLink)
 // minute (10 strikes by 5 minutes) and asked each range again and again.
 TEST(DogeRangeSync, NoStrikeWhenNobodyDelivers)
 {
-    constexpr uint32_t CP = 40 * STEP;
+    constexpr uint32_t CP = 150 * STEP;
     const Chain c(CP);
     {
         TempStore s;
