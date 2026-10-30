@@ -33,6 +33,7 @@
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
 #include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
 #include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
 #include <impl/dash/coin/asset_unlock_admission.hpp>  // #143 Variant B: verified type-9 set (light bridge struct)
 #include <impl/dash/coin/subsidy.hpp>
@@ -749,6 +750,9 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
+    // S2: is each admitted inject in this body? One RIDES / HELD line per
+    // inject per height (telemetry only; the body is untouched).
+    log_inject_rides(mempool, selected, prev_height + 1, suppress_mempool_txs);
     // ── TYPES 1-4 MN-LIST FOLD (merkleRootMNList parity) ──────────────────
     // When the mask admitted provider special txs (types 1-4), fold their
     // effect over a COPY of the projected SML now, BEFORE body assembly, so

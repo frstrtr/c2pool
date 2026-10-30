@@ -75,6 +75,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/fold_live_controller.hpp>  // dash::coin::FoldLiveController (PR-C1 live tip-tracking fold)
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>  // PR-C4 consensus-exact CheckInputScripts C API
+#include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: the script check defaults ON with a view
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/good_citizen_defaults.hpp>   // dash::coin::resolve_good_citizen_tx_serve — daemonless FULL-MEMPOOL default
 #include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
@@ -390,6 +391,11 @@ struct AlertRelayCli {
 };
 AlertRelayCli g_alert_relay;
 
+// --embedded-fold-checkscripts=false (S3a): opt out of the consensus-exact
+// script check that is now armed by default whenever a view exists. Same
+// file-scope posture as g_mn_bridge_max_blocks.
+bool g_embedded_fold_checkscripts_off = false;
+
 // Strict non-negative integer parse for the --alert-relay-* numeric knobs.
 static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
 {
@@ -555,7 +561,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
-        << "           [--embedded-fold-checkscripts]\n"
+        << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--control-plane-token-file FILE]\n"
         << "           [--alert-relay-origin --alert-relay-to PUBHEX... [--alert-relay-label STR]]\n"
@@ -3229,8 +3235,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     if (embedded_tx_inject) {
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
                      "ON -- submitted txs ride the block with priority through the "
-                     "SAME validity gate; reward path byte-unchanged. Requires "
-                     "--embedded-fold-checkscripts + the served-body posture. M2 "
+                     "SAME validity gate; reward path byte-unchanged. Needs the "
+                     "script check (armed by default with --embedded-utxo, S3a) + "
+                     "the served-body posture. M2 "
                      "peer tx_inject transport is live (first-see fan-out, "
                      "per-peer DoS guard).\n";
     }
@@ -3296,6 +3303,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     flags = req["flags"].get<uint32_t>();
                 if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
                     expiry = req["expiry_height"].get<int32_t>();
+                // S2: the fee the operator allows (duffs). Default 0: the
+                // zero-fee sweep; a fee-paying tx the operator did not ask for
+                // refuses inject-fee-above-max.
+                uint64_t max_fee = 0;
+                if (req.contains("max_fee")) {
+                    if (!req["max_fee"].is_number_unsigned())
+                        return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
+                                              {"http_status", 400}};
+                    max_fee = req["max_fee"].get<uint64_t>();
+                }
                 dash::coin::MutableTransaction tx;
                 try {
                     auto raw = ParseHex(hex);
@@ -3311,7 +3328,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // rate, never the aggregate-peer budget a flood can exhaust.
                 auto r = node_coin_state.submit_inject(
                     tx, flags, expiry,
-                    dash::coin::NodeCoinState::InjectOrigin::Local);
+                    dash::coin::NodeCoinState::InjectOrigin::Local, max_fee);
                 // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
                 const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
                 return nlohmann::json{
@@ -7601,27 +7618,6 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return ctl->at_tip(hc->height(), hash_at);
                 });
 
-            // PR-C4 (embedded-fold-checkscripts): wire dashcore's consensus-exact
-            // VerifyScript as the per-input serve-path script gate. Armed ONLY
-            // when --embedded-fold-checkscripts is set (and the fold is live --
-            // this block only runs when fold_live_ctl exists). The mempool
-            // resolves each input's coin scriptPubKey from the at-tip fold and
-            // calls this to confirm the scriptSig satisfies it; any failure drops
-            // the tx from the template (fail-closed). Unset => the selector runs
-            // no check (byte-identical to master). Reward-safe: can only DROP.
-            if (embedded_fold_checkscripts) {
-                node_coin_state.set_script_check(
-                    [](const std::vector<uint8_t>& tx_bytes, uint32_t nIn,
-                       const std::vector<uint8_t>& spk, uint32_t flags) -> bool {
-                        return c2pool_dash_verify_input(
-                                   spk.data(), (unsigned)spk.size(),
-                                   tx_bytes.data(), (unsigned)tx_bytes.size(),
-                                   nIn, flags) == 1;
-                    });
-                std::cout << "[run] embedded-fold-checkscripts ARMED: consensus-exact "
-                             "CheckInputScripts (dashcore VerifyScript) over every served "
-                             "mempool-tx input against the at-tip fold; fail-closed exclude\n";
-            }
             node_coin_state.set_pin_external_coin_lookup(
                 [ctl, hc, hash_at, rpc_pin_lookup](
                     const ::core::coin::Outpoint& op,
@@ -7637,6 +7633,38 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "advance-on-connect + reorg-undo + at-tip serving guard "
                          "(fold consulted only while fold_height >= serve_tip and "
                          "chain-identical; behind tip => fee-unknown = master)\n";
+        }
+
+        // S3a: arm dashcore's consensus-exact VerifyScript as the per-input
+        // gate whenever an at-tip scriptPubKey source exists: the --embedded-utxo
+        // view (accrual or the full set) or the C1 fold. resolve_input_spk_locked
+        // reads the view first, then an in-pool parent, then the fold, so every
+        // fee_fold_proven tx's prevouts resolve here too. Armed, the selector
+        // checks every served mempool-tx input and add_inject checks every
+        // inject at admission (inject-script-invalid). Reward-safe: it only
+        // excludes / refuses. --embedded-fold-checkscripts=false opts out.
+        {
+            const auto cs = dash::coin::resolve_checkscripts_arm(
+                embedded_fold_checkscripts, g_embedded_fold_checkscripts_off,
+                utxo_lane.cache() != nullptr, static_cast<bool>(fold_live_ctl));
+            if (cs.on) {
+                node_coin_state.set_script_check(
+                    [](const std::vector<uint8_t>& tx_bytes, uint32_t nIn,
+                       const std::vector<uint8_t>& spk, uint32_t flags) -> bool {
+                        return c2pool_dash_verify_input(
+                                   spk.data(), (unsigned)spk.size(),
+                                   tx_bytes.data(), (unsigned)tx_bytes.size(),
+                                   nIn, flags) == 1;
+                    });
+                std::cout << "[run] embedded-fold-checkscripts ARMED (" << cs.reason
+                          << "): consensus-exact CheckInputScripts (dashcore VerifyScript) over "
+                             "every served mempool-tx input and every inject at admission; "
+                             "fail-closed exclude\n";
+            } else {
+                LOG_WARNING << "[run] embedded-fold-checkscripts OFF: " << cs.reason
+                            << " -- served mempool txs are NOT script-verified; the inject lane "
+                               "refuses inject-script-check-unarmed";
+            }
         }
 
         // #157 (--embedded-tx-inject-hex): local submit path (M1). Parse the
@@ -7682,7 +7710,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             if (inj_load_ok && !inj_txs.empty()) {
                 for (auto& tx : inj_txs) {
-                    auto r = node_coin_state.submit_inject(tx);
+                    // S2: the file loader is a local operator submit: max_fee 0.
+                    auto r = node_coin_state.submit_inject(
+                        tx, 0, 0, dash::coin::NodeCoinState::InjectOrigin::Local, /*max_fee=*/0);
                     std::cout << "[run] tx-inject submit txid="
                               << r.txid.GetHex().substr(0, 16)
                               << " => " << r.cause
@@ -12064,6 +12094,8 @@ int main(int argc, char** argv)
             embedded_fold_live_expect = argv[++i];  // PR-C1: store hash_serialized_2 verify (D)
         else if (std::strcmp(argv[i], "--embedded-fold-checkscripts") == 0)
             embedded_fold_checkscripts = true;  // PR-C4: consensus-exact input-script check on the served template
+        else if (std::strcmp(argv[i], "--embedded-fold-checkscripts=false") == 0)
+            g_embedded_fold_checkscripts_off = true;  // S3a opt-out (the check defaults ON with a view)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock=false") == 0)

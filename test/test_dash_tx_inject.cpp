@@ -44,6 +44,7 @@
 #include <impl/dash/coin/inject_sandbox.hpp>    // #157 M3: bounded-work script-verify sandbox
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: node-wide count+byte rate limiter
 #include <impl/dash/coin/good_citizen_defaults.hpp>
+#include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: resolve_checkscripts_arm
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
 // std-only: the c2wallet-qt mirror of the node caps, pinned below.
@@ -53,6 +54,8 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <secp256k1.h>
+
+#include "dash_utxo_full_fixture.hpp"   // S2: a full set built as the node builds it
 
 #include <cstdint>
 #include <cstring>
@@ -148,12 +151,14 @@ struct Key {
     }
 };
 
-// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee.
+// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee. The
+// version and the input's sequence are set before signing (both are signed).
 MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
-                                     int64_t out_value) {
+                                     int64_t out_value, int32_t version = 1,
+                                     uint32_t sequence = 0xffffffffu) {
     MutableTransaction tx;
-    tx.version = 1; tx.type = 0; tx.locktime = 0;
-    TxIn in; in.prevout.hash = prev; in.prevout.index = 0; in.sequence = 0xffffffffu;
+    tx.version = version; tx.type = 0; tx.locktime = 0;
+    TxIn in; in.prevout.hash = prev; in.prevout.index = 0; in.sequence = sequence;
     in.scriptSig = to_script(k.spk);
     tx.vin.push_back(in);
     TxOut out; out.value = out_value; tx.vout.push_back(out);
@@ -281,10 +286,11 @@ TEST(DashTxInject, InjectDoubleSpendStillDropsTheConflict)
     EXPECT_EQ(fees, 0u) << "the 0-fee inject won; the fee tx it conflicts with is dropped";
 }
 
-// (3c) VALIDITY: a bad-script inject is admitted to the pool (priceable from the
-//      UTXO value) but DROPPED at template build by the ARMED script check —
-//      never served. Priority is not a guard bypass.
-TEST(DashTxInject, BadScriptInjectDroppedAtTemplateBuild)
+// (3c) VALIDITY (S3a, A4): a bad-script inject is priceable from the UTXO value
+//      but REFUSED AT ADMISSION by the armed script check, by name, and rolled
+//      back — it never occupies the pool. (Before S3a it was admitted and only
+//      dropped at template build; the selector still re-checks as the belt.)
+TEST(DashTxInject, BadScriptInjectRefusedAtAdmissionByName)
 {
     Key k(0x55);
     uint256 prev = prevhash(0xe1);
@@ -297,12 +303,36 @@ TEST(DashTxInject, BadScriptInjectDroppedAtTemplateBuild)
     utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
     Mempool mp; mp.set_utxo(&utxo);
     arm_script_check(mp);
-    // Priceable ⇒ admitted with priority.
-    ASSERT_EQ(mp.add_inject(bad), Mempool::InjectGate::Ok);
-    // ...but the armed selector script-check DROPS it: never served.
+    EXPECT_EQ(mp.add_inject(bad), Mempool::InjectGate::ScriptInvalid);
+    EXPECT_STREQ(Mempool::inject_gate_name(Mempool::InjectGate::ScriptInvalid), "inject-script-invalid");
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value()) << "rolled back";
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty());
     auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
-    EXPECT_EQ(selected.size(), 0u) << "an invalid-script inject must be dropped at template build";
+    EXPECT_EQ(selected.size(), 0u);
     EXPECT_EQ(fees, 0u);
+    // The correctly signed spend of the same coin is admitted.
+    EXPECT_EQ(mp.add_inject(good), Mempool::InjectGate::Ok);
+}
+
+// (S2, A3) A fee above the submitter's max_fee is refused by name and rolled
+// back; the same tx with a ceiling that covers it is admitted.
+TEST(DashTxInject, InjectFeeAboveMaxRefusedAndRolledBack)
+{
+    Key k(0x57);
+    uint256 prev = prevhash(0xe3);
+    auto tx = make_signed_spend(k, prev, 90'000);   // fee 10'000
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/0), Mempool::InjectGate::FeeAboveMax);
+    EXPECT_STREQ(Mempool::inject_gate_name(Mempool::InjectGate::FeeAboveMax), "inject-fee-above-max");
+    EXPECT_FALSE(mp.get_entry(dash_txid(tx)).has_value());
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty()) << "the priority delta is gone too";
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/9'999), Mempool::InjectGate::FeeAboveMax);
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/10'000), Mempool::InjectGate::Ok);
+    ASSERT_EQ(mp.inject_txids_in_pool().size(), 1u);
+    EXPECT_EQ(mp.get_entry(dash_txid(tx))->fee, 10'000u);
 }
 
 // (3d) VALIDITY: an inject whose input is not in the view is REFUSED at submit,
@@ -413,16 +443,16 @@ TEST(DashTxInject, Bip68RelativeLockInjectRefusedFailClosed)
     arm_script_check(mp);
 
     // NEGATIVE: nVersion==2 with a BIP68 relative-lock input (bit 31 clear).
-    auto rel = make_signed_spend(k, prev, 90'000);
-    rel.version = 2;
-    rel.vin[0].sequence = 0x0000000au;   // disable-flag clear ⇒ relative lock ON
+    // (Each tx is signed after its version and sequence are set: since S3a an
+    // inject's scripts are verified at admission.)
+    auto rel = make_signed_spend(k, prev, 90'000, /*version=*/2,
+                                 /*sequence=*/0x0000000au);   // disable-flag clear ⇒ relative lock ON
     EXPECT_EQ(mp.add_inject(rel), Mempool::InjectGate::Bip68Unsupported)
         << "a v2 inject that opts into a BIP68 relative lock must be fail-closed refused";
 
     // POSITIVE TWIN 1: nVersion==2 but every input disables the relative lock
     // (SEQUENCE_FINAL has bit 31 set) ⇒ no BIP68 opt-in ⇒ admitted.
-    auto v2_final = make_signed_spend(k, prev, 90'000);
-    v2_final.version = 2;                 // vin sequence stays 0xffffffff
+    auto v2_final = make_signed_spend(k, prev, 90'000, /*version=*/2);   // sequence 0xffffffff
     EXPECT_EQ(mp.add_inject(v2_final), Mempool::InjectGate::Ok)
         << "a v2 inject with no relative-lock input rides the normal path";
 
@@ -430,9 +460,7 @@ TEST(DashTxInject, Bip68RelativeLockInjectRefusedFailClosed)
     // relative-lock sequence bits — version-gated, exactly as consensus does it.
     uint256 prev2 = prevhash(0xbb);
     utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
-    auto v1_rel = make_signed_spend(k, prev2, 90'000);
-    v1_rel.version = 1;
-    v1_rel.vin[0].sequence = 0x0000000au;
+    auto v1_rel = make_signed_spend(k, prev2, 90'000, /*version=*/1, /*sequence=*/0x0000000au);
     EXPECT_EQ(mp.add_inject(v1_rel), Mempool::InjectGate::Ok)
         << "BIP68 is nVersion>=2 only; a v1 inject is unaffected";
 }
@@ -1267,4 +1295,78 @@ TEST(DashTxInject, StatusCountersLeaveAcceptVerdictUnchanged)
     EXPECT_EQ(obs.sb_max_inputs.load(), InjectSandbox::kMaxInputs);
     EXPECT_GE(obs.rl_local_in_window.load(), 1u)
         << "the accepted local inject must show in the mirrored window occupancy";
+}
+
+// (S2, A11) An inject whose expiry_height the tip passes leaves the inject
+// pool and the mempool on the tip advance itself, without a second submit.
+TEST(DashTxInject, ExpiredInjectReapedOnTipAdvance)
+{
+    Key k(0xa7);
+    uint256 prev = prevhash(0x77);
+    auto tx = make_signed_spend(k, prev, 100'000);   // fee 0
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    auto r = st.submit_inject(tx, 0, /*expiry_height=*/101, NodeCoinState::InjectOrigin::Local, /*max_fee=*/0);
+    ASSERT_TRUE(r.ok) << r.cause;
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    st.set_tip(101, prevhash(0x11), 0x1d00ffff, 0, 76, 16);   // next block 102 > expiry 101
+    EXPECT_EQ(st.inject_pool_size(), 0u) << "reaped on the tip advance";
+    EXPECT_FALSE(st.mempool().get_entry(dash_txid(tx)).has_value()) << "and evicted from the mempool";
+}
+
+// (S2) The full UTXO set prices an inject whose input is older than any
+// forward view (the 71-of-170 case): the same tx is inject-unpriceable on an
+// accrual view and admitted against the full set; a fee-paying one is refused
+// by the operator's max_fee 0 with the fee computed from the full set.
+TEST(DashMempool, InjectPricedFromFullView)
+{
+    using namespace dash_utxo_full;
+    Key k(0xb7);
+    const uint256 prevA = prevhash(0x81), prevB = prevhash(0x82);
+    auto zero_fee = make_signed_spend(k, prevA, 100'000);
+    auto paying = make_signed_spend(k, prevB, 90'000);
+
+    // Accrual view that never saw the coin's block.
+    {
+        UTXOViewCache accrual(nullptr);
+        NodeCoinState st; arm_ncs(st, accrual);
+        auto r = st.submit_inject(zero_fee, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-unpriceable");
+    }
+    // The full set holds both coins (created at h=500, long before the base).
+    TempDir tmp("inject");
+    dash::coin::UtxoLane lane;
+    SnapCoin a, b;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    b.op = Outpoint(prevB, 0);
+    b.coin = Coin(100'000, to_script(k.spk), 500, false);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, 2000, prevhash(0x99)));
+    NodeCoinState st; arm_ncs(st, *lane.cache());
+    auto r = st.submit_inject(zero_fee, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_TRUE(r.ok) << r.cause;
+    auto e = st.mempool().get_entry(dash_txid(zero_fee));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_fold_proven);
+    EXPECT_EQ(e->fee, 0u);
+    auto r2 = st.submit_inject(paying, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_FALSE(r2.ok);
+    EXPECT_EQ(r2.cause, "inject-fee-above-max");
+}
+
+// (S3a, A1) The script check is armed by default whenever an at-tip
+// scriptPubKey source exists; the operator can opt out.
+TEST(DashTxInject, CheckscriptsArmResolverDefaultOnWithView)
+{
+    using dash::coin::resolve_checkscripts_arm;
+    EXPECT_TRUE(resolve_checkscripts_arm(false, false, /*view=*/true, false).on);
+    EXPECT_STREQ(resolve_checkscripts_arm(false, false, true, false).reason, "default-on (view-backed)");
+    EXPECT_TRUE(resolve_checkscripts_arm(false, false, false, /*fold=*/true).on);
+    EXPECT_STREQ(resolve_checkscripts_arm(true, false, true, false).reason, "explicit");
+    EXPECT_FALSE(resolve_checkscripts_arm(true, /*off=*/true, true, true).on);
+    EXPECT_FALSE(resolve_checkscripts_arm(false, false, false, false).on);
+    EXPECT_FALSE(resolve_checkscripts_arm(true, false, false, false).on) << "explicit with no source stays off";
 }

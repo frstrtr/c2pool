@@ -71,6 +71,7 @@
 #include <atomic>
 #include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
+#include <limits>               // add_inject: the default max_fee (no cap)
 #include <cstdint>
 #include <ctime>
 #include <deque>
@@ -710,6 +711,11 @@ public:
         BadVersionOrType,    // ContextualCheckTransaction (v23.1.9): unknown
                              // special type, or a negative nVersion
                              // (bad-txns-type / bad-txns-version).
+        FeeAboveMax,         // S2: the priced fee exceeds the submitter's max_fee
+                             // (a local operator submit defaults to 0: a fee-paying
+                             // tx the operator did not ask for is refused).
+        ScriptInvalid,       // S3a: an input's scriptSig fails dashcore VerifyScript
+                             // at admission, or its scriptPubKey cannot be resolved.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -722,6 +728,8 @@ public:
             case InjectGate::Bip68Unsupported:   return "inject-bip68-unsupported";
             case InjectGate::BadVoutRange:       return "inject-bad-txns-vout-range";
             case InjectGate::BadVersionOrType:   return "inject-bad-txns-version-or-type";
+            case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
+            case InjectGate::ScriptInvalid:      return "inject-script-invalid";
         }
         return "inject-unknown";
     }
@@ -745,8 +753,18 @@ public:
     /// whose inputs cannot be fold-priced is REFUSED here BY NAME (never left
     /// in the pool to be silently template-excluded).
     ///
+    /// S2: `max_fee` caps the priced fee (inject-fee-above-max); the library
+    /// default is no cap, the operator entry points (main_dash: the hex file
+    /// loader, the loopback HTTP submit) pass 0 unless told otherwise. S3a:
+    /// after pricing, every input is script-verified once at admission with
+    /// the full buried flag set (script_flags_for_height(0)); a failure, or an
+    /// input whose scriptPubKey no at-tip source resolves, refuses by name
+    /// (inject-script-invalid). The selector keeps re-checking at each build
+    /// with the serving height's flags (the belt).
+    ///
     /// Caller holds no lock. Returns a named InjectGate verdict.
-    InjectGate add_inject(const MutableTransaction& tx) {
+    InjectGate add_inject(const MutableTransaction& tx,
+                          uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         std::lock_guard<std::mutex> lock(m_mutex);
         // (1) size — cheapest, chain-state-independent.
         if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
@@ -815,10 +833,55 @@ public:
             m_fee_deltas.erase(txid);
             return InjectGate::Unpriceable;
         }
+        // (7) S2 fee ceiling: the coinbase moves by exactly this fee.
+        if (it->second.fee > max_fee) {
+            LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                        << " fee=" << it->second.fee << " > max_fee=" << max_fee
+                        << " (inject-fee-above-max)";
+            remove_tx_locked(txid);
+            m_fee_deltas.erase(txid);
+            return InjectGate::FeeAboveMax;
+        }
+        // (8) S3a admission-time script verify (consensus-exact, every input).
+        {
+            std::vector<uint8_t> tx_bytes;
+            {
+                auto ps = ::pack(tx);
+                auto sp = ps.get_span();
+                const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+                tx_bytes.assign(b, b + sp.size());
+            }
+            const uint32_t sflags = script_flags_for_height(0);
+            for (uint32_t vi = 0; vi < tx.vin.size(); ++vi) {
+                ::core::coin::Outpoint op(tx.vin[vi].prevout.hash, tx.vin[vi].prevout.index);
+                std::vector<uint8_t> spk;
+                const bool resolved = resolve_input_spk_locked(op, spk);
+                if (!resolved || !m_script_check(tx_bytes, vi, spk, sflags)) {
+                    LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                                << " input " << vi << (resolved ? " fails VerifyScript"
+                                                                : " has no resolvable scriptPubKey")
+                                << " (inject-script-invalid)";
+                    remove_tx_locked(txid);
+                    m_fee_deltas.erase(txid);
+                    return InjectGate::ScriptInvalid;
+                }
+            }
+        }
         LOG_INFO << "[MEMPOOL] inject admitted txid=" << txid.GetHex().substr(0, 16)
-                 << " base_fee=" << it->second.fee
-                 << " prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
+                 << " base_fee=" << it->second.fee << " max_fee=" << max_fee
+                 << " scripts=ok prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
         return InjectGate::Ok;
+    }
+
+    /// The injects in the pool (the txids carrying INJECT_FEE_DELTA), for the
+    /// per-build RIDES / HELD lines.
+    std::vector<uint256> inject_txids_in_pool() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        for (const auto& [txid, delta] : m_fee_deltas)
+            if (delta == static_cast<decltype(delta)>(INJECT_FEE_DELTA) && m_pool.count(txid))
+                out.push_back(txid);
+        return out;
     }
 
 private:
