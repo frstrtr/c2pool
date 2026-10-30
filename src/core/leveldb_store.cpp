@@ -4,6 +4,7 @@
 #include <leveldb/write_batch.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/cache.h>
+#include <core/leveldb_pread_env.hpp>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -38,6 +39,10 @@ bool LevelDBStore::open()
         db_options.paranoid_checks = m_options.paranoid_checks;
         db_options.write_buffer_size = m_options.write_buffer_size;
         db_options.max_open_files = m_options.max_open_files;
+        db_options.max_file_size = m_options.max_file_size;
+        if (!m_options.mmap_reads)
+            if (leveldb::Env* env = leveldb_pread_env())
+                db_options.env = env;
         db_options.block_size = m_options.block_size;
         db_options.compression = m_options.use_compression ? leveldb::kSnappyCompression : leveldb::kNoCompression;
 

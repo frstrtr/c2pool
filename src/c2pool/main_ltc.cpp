@@ -6721,11 +6721,18 @@ int main(int argc, char* argv[]) {
                                    / (settings->m_testnet ? "dogecoin_testnet" : "dogecoin")
                                    / "utxo_full_leveldb").string();
                             // IBD tuning: the set is written once per block for millions
-                            // of blocks (defaults 4 MB / 8 MB / 1000).
+                            // of blocks (defaults 4 MB / 8 MB / 1000). Its tables are read
+                            // with pread in 32 MB files (Core's chainstate size): through
+                            // mmap every page read stayed in RSS (809 MB of 2.5 GB at 14.6 M
+                            // coins, doge::coin::ProcessMemory); one fd per open table.
                             core::LevelDBOptions full_opts;
                             full_opts.write_buffer_size = 64 * 1024 * 1024;
                             full_opts.block_cache_size = 128 * 1024 * 1024;
-                            full_opts.max_open_files = 2000;
+                            full_opts.max_open_files = 512;
+                            full_opts.max_file_size = 32 * 1024 * 1024;
+                            full_opts.mmap_reads = false;
+                            // malloc's thread arenas (813 MB of anonymous mappings there).
+                            doge::coin::ProcessMemory::limit_arenas();
                             doge_full_db = std::make_unique<core::coin::UTXOViewDB>(full_path, full_opts);
                             if (doge_full_db->open()) {
                                 doge_full_cache = std::make_unique<core::coin::UTXOViewCache>(doge_full_db.get());
@@ -7705,6 +7712,21 @@ int main(int argc, char* argv[]) {
                                     tick_timer->expires_after(std::chrono::seconds(1));
                                     tick_timer->async_wait(*tick_fn);
 
+                                    // Free malloc pages back to the kernel (doge::coin::ProcessMemory),
+                                    // on the lane's thread.
+                                    auto trim_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                    auto trim_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                                    *trim_fn = [trim_fn, trim_timer, full](boost::system::error_code ec) {
+                                        if (ec)
+                                            return;
+                                        trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                                        trim_timer->async_wait(*trim_fn);
+                                        if (doge::coin::ProcessMemory::trim())
+                                            full->malloc_trims.fetch_add(1, std::memory_order_relaxed);
+                                    };
+                                    trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                                    trim_timer->async_wait(*trim_fn);
+
                                     // The hash schedule completes during the run: the full
                                     // lane's startup check, then the next tip body arms it.
                                     doge_full->on_schedule_ready = [fpool, lane = std::weak_ptr<doge::coin::UtxoLane>(doge_full_lane)]() {
@@ -7773,6 +7795,11 @@ int main(int argc, char* argv[]) {
                                                 d["adoptions"] = full->adoptions.load();
                                                 d["queued_bytes"] = full->queued_bytes.load();
                                                 d["queue_dropped"] = full->queue_dropped.load();
+                                                const auto mem = doge::coin::ProcessMemory::read();
+                                                d["memory"] = {{"rss_mb", mem.rss_kb / 1024},
+                                                               {"rss_anon_mb", mem.anon_kb / 1024},
+                                                               {"rss_file_mb", mem.file_kb / 1024},
+                                                               {"malloc_trims", full->malloc_trims.load()}};
                                                 if (sched) {
                                                     d["schedule"] = {{"frontier", sched->frontier_height()},
                                                                      {"checkpoint", sched->checkpoint_height()},

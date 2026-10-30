@@ -20,13 +20,19 @@
 //      the refusal bound the set is left as is (heal_failures).
 // Plus: zero-value outputs are coins (as in Core), a body that is not what
 // its header commits to is refetched, the sync state is written with the best
-// block, and the digest (--utxo-digest) pins the set.
+// block, and the digest (--utxo-digest) pins the set. The Bootstrap's block
+// download (DogeUtxoBootstrap: one peer per block, bodies wait for headers)
+// and the full set's DB reading its tables without mmap (the memory bound).
 // Drives doge::coin::UtxoLane (Mode::Full) through the harness main_ltc's
 // handlers mirror (doge_utxo_lane_harness.hpp).
 // ---------------------------------------------------------------------------
 #include "doge_utxo_lane_harness.hpp"
 
 #include <core/coin/utxo_digest.hpp>
+#include <core/leveldb_store.hpp>
+#include <impl/doge/coin/process_memory.hpp>
+
+#include <cstdio>
 
 #include <map>
 #include <numeric>
@@ -847,4 +853,75 @@ TEST(DogeUtxoBootstrap, ASlowPeerDoesNotStallTheBootstrap)
     serve_peers(l, chain, staller);
     EXPECT_EQ(l.t.cache->get_best_height(), 60u);
     EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast";
+}
+
+// The full set's memory bound (doge::coin::ProcessMemory, FRESH-NODE §6.5).
+// The IBD node's RSS was 2.5 GB: 1.24 GB of it mapped files, 809 MB the full
+// set's LevelDB tables read through mmap (a page read stays in the process's
+// RSS while its table is open). The full set's DB reads with pread now: a
+// 48 MB DB read at random adds tens of MB of RssFile through mmap and next to
+// nothing through pread; both read back every key, also after a reopen with
+// 32 MB table files over 2 MB ones.
+TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
+{
+    constexpr int KEYS = 400000;
+    auto key = [](int i) {
+        char k[16];
+        std::snprintf(k, sizeof(k), "k%09d", i);
+        return std::string(k);
+    };
+    auto value = [](int i) {
+        std::vector<uint8_t> v(120);
+        uint64_t x = 0x9e3779b97f4a7c15ull * static_cast<uint64_t>(i + 1);
+        for (auto& b : v) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b = static_cast<uint8_t>(x);
+        }
+        return v;
+    };
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = std::filesystem::temp_directory_path() / ("doge_full_db_" + std::to_string(rng()));
+    {
+        core::LevelDBOptions w;
+        w.write_buffer_size = 4 << 20;
+        core::LevelDBStore db(dir.string(), w);
+        ASSERT_TRUE(db.open());
+        for (int i = 0; i < KEYS; i += 1000) {
+            core::LevelDBStore::BatchWriter b(&db);
+            for (int k = i; k < i + 1000; ++k)
+                b.put(key(k), value(k));
+            ASSERT_TRUE(b.commit());
+        }
+    }
+    auto read_all = [&](bool mmap_reads, size_t file_size, long& file_kb_delta) {
+        core::LevelDBOptions o;
+        o.mmap_reads = mmap_reads;
+        o.max_file_size = file_size;
+        o.block_cache_size = 1 << 20;
+        core::LevelDBStore db(dir.string(), o);
+        if (!db.open())
+            return false;
+        const long before = doge::coin::ProcessMemory::read().file_kb;
+        std::mt19937 pick(7);
+        std::vector<uint8_t> v;
+        bool ok = true;
+        for (int n = 0; n < 2 * KEYS && ok; ++n) {
+            const int i = static_cast<int>(pick() % KEYS);
+            ok = db.get(key(i), v) && v == value(i);
+        }
+        file_kb_delta = doge::coin::ProcessMemory::read().file_kb - before;
+        return ok;
+    };
+    long via_mmap = 0, via_pread = 0, reopened = 0;
+    EXPECT_TRUE(read_all(true, 2 << 20, via_mmap)) << "mmap reads";
+    EXPECT_TRUE(read_all(false, 32 << 20, via_pread)) << "pread reads";
+    EXPECT_TRUE(read_all(false, 2 << 20, reopened)) << "pread reads after a reopen";
+    std::cout << "  RssFile grown by a random read of a 48 MB DB: mmap " << via_mmap / 1024 << " MB, pread "
+              << via_pread / 1024 << " MB\n";
+    EXPECT_GT(via_mmap, 16 * 1024) << "the mmap baseline did not show (no /proc/self/status?)";
+    EXPECT_LT(via_pread, 4 * 1024);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

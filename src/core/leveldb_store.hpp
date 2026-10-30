@@ -25,6 +25,16 @@ struct LevelDBOptions {
     bool sync_writes = false;
     bool verify_checksums = true;
     bool paranoid_checks = false;
+    /// LevelDB's table file size (its default, 2 MB). Bitcoin Core's chainstate
+    /// uses 32 MB: fewer files for the same data, so a table cache of a few
+    /// hundred covers a set of several GB.
+    size_t max_file_size = 2 * 1024 * 1024;
+    /// Read table files through mmap (LevelDB's default on 64-bit, up to 1000
+    /// files). Every page read stays in the process's RSS (RssFile) while its
+    /// table is open: the DOGE full UTXO set's DB was 809 MB of a 2.5 GB RSS.
+    /// false: pread into LevelDB's buffers (the block cache bounds what stays
+    /// resident; the OS page cache keeps the rest, outside the process).
+    bool mmap_reads = true;
 };
 
 /**

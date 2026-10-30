@@ -20,6 +20,7 @@
 #include <core/coin/utxo_view_cache.hpp>
 #include <core/coin/utxo_view_db.hpp>
 #include <core/uint256.hpp>
+#include <impl/doge/coin/process_memory.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 
 #include <algorithm>
@@ -50,6 +51,8 @@ struct UtxoFullState {
     std::atomic<core::coin::UTXOViewDB*> explorer_db{nullptr};
     /// How many times the pool was swapped to the full set (adopt()).
     std::atomic<uint64_t> adoptions{0};
+    /// Periodic malloc trims that gave pages back (doge::coin::ProcessMemory).
+    std::atomic<uint64_t> malloc_trims{0};
     /// Called once when the hash schedule becomes ready during the run (set
     /// at wiring, before any callback fires): the full lane starts then.
     std::function<void()> on_schedule_ready;
