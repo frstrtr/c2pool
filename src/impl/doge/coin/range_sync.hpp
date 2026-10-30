@@ -234,6 +234,7 @@ public:
             bytes += range_bytes(i);
             out.push_back(Request{i, p, {m_anchors.hashes[i]}, m_anchors.hashes[i + 1]});
         }
+        end_game_locked(peers, now, avoid, out);
         return out;
     }
 
@@ -470,6 +471,55 @@ private:
         LOG_INFO << "[EMB-DOGE] Hash schedule: " << peer << ": " << why << " (strike " << ps.strikes << ")";
         if (ps.strikes >= m_cfg.strikes)
             exclude_locked(peer, "repeated timeouts or bad range answers");
+    }
+
+    /// The end game: every undelivered range in the window is in flight
+    /// (the last ranges of the schedule). A range whose peer has been silent
+    /// for REQUEST_TIMEOUT goes to a peer with nothing in flight, without a
+    /// strike: the slow peer may still answer, and the first exact answer is
+    /// stored. Live, fresh-anchored3 run 5: the last 13 ranges took more than
+    /// 8 minutes on slow peers while the others had nothing to do.
+    void end_game_locked(const std::vector<std::string>& peers, Clock::time_point now,
+                         const std::set<std::string>& avoid, std::vector<Request>& out)
+    {
+        uint32_t seen = 0;
+        for (uint32_t i = m_s.first_undone_range(); i < m_anchors.ranges() && seen < m_cfg.window; ++i) {
+            if (m_s.range_done(i))
+                continue;
+            ++seen;
+            if (!m_inflight.count(i))
+                return;  // something is still to ask: not the end game
+        }
+        std::vector<std::pair<Clock::time_point, uint32_t>> held;
+        for (const auto& [r, f] : m_inflight)
+            if (now - f.at >= m_cfg.request_timeout && now - m_peers[f.peer].since >= m_cfg.request_timeout)
+                held.emplace_back(f.at, r);
+        std::sort(held.begin(), held.end());
+        for (const auto& [at, r] : held) {
+            std::string idle;
+            for (int pass = 0; pass < 2 && idle.empty(); ++pass)
+                for (const auto& p : peers) {
+                    if (!usable_locked(p, now) || (pass == 0 && avoid.count(p)))
+                        continue;
+                    auto ps = m_peers.find(p);
+                    if (ps == m_peers.end() || ps->second.inflight == 0) {
+                        idle = p;
+                        break;
+                    }
+                }
+            if (idle.empty())
+                return;
+            auto it = m_inflight.find(r);
+            ++m_timeouts;
+            release_locked(it);
+            auto& ps = m_peers[idle];
+            ps.since = now;
+            ps.late = false;
+            ++ps.inflight;
+            ps.bytes += range_bytes(r);
+            m_inflight[r] = InFlight{idle, now};
+            out.push_back(Request{r, idle, {m_anchors.hashes[r]}, m_anchors.hashes[r + 1]});
+        }
     }
 
     /// A peer that is no longer connected releases its ranges (no strike).

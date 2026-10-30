@@ -23,7 +23,8 @@
 //     NoStrikeWhenNobodyDelivers, RangePeersAreNotTheSyncPeerNorBodyPeers
 //     (FRESH-NODE §6.4, §7); AStarvedLinkStrikesNoSlowPeer,
 //     APeersWindowIsBytesNotRanges (fresh-anchored3 run 1),
-//     AQueuedAnswerIsNoWitness (run 2), ASlowPeerIsNotAStaller (run 3)
+//     AQueuedAnswerIsNoWitness (run 2), ASlowPeerIsNotAStaller (run 3),
+//     TheSyncPeersAreTheLastTwoAsked (run 4), TheLastRangesGoToIdlePeers (run 5)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -1347,7 +1348,7 @@ TEST(DogeRangeSync, AQueuedAnswerIsNoWitness)
 // struck once, p0 never.
 TEST(DogeRangeSync, ASlowPeerIsNotAStaller)
 {
-    constexpr uint32_t CP = 150 * STEP;
+    constexpr uint32_t CP = 300 * STEP;  // the end game (the last ranges) comes after p1's stall
     const Chain c(CP);
     TempStore s;
     auto sched = open_schedule(s, c, CP);
@@ -1508,4 +1509,38 @@ TEST(DogeRangeSync, RangePeersAreNotTheSyncPeerNorBodyPeers)
         const auto reqs = rs.tick(peers, t0(), {"p0", "p1"});
         EXPECT_FALSE(reqs.empty()) << "only named peers connected: nothing asked";
     }
+}
+
+// The end game (live, fresh-anchored3 run 5: the last 13 ranges took more
+// than 8 minutes on slow peers while the others idled). 10 ranges, 4 peers;
+// p0 carries a range at 5 KB/s (320 s), the others at 200 KB/s. Once
+// nothing is left to ask, p0's range goes to an idle peer after 60 s of
+// silence: the schedule completes within 2 minutes, nobody struck.
+TEST(DogeRangeSync, TheLastRangesGoToIdlePeers)
+{
+    constexpr uint32_t CP = 10 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 0;
+    RangeSync rs(*sched, c.anchors(CP), cfg);
+    const std::vector<std::string> peers{"p0", "p1", "p2", "p3"};
+    CappedLink link{10e6, 200e3, 1.6e6, {}, {}, 0};
+    link.caps["p0"] = 5e3;
+    auto t = t0();
+    int sec = 0;
+    for (; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t))
+            link.add(r);
+        for (const auto& r : link.step())
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+    }
+    const auto st = rs.stats(t);
+    std::cout << "  p0 at 5 KB/s, three peers at 200 KB/s: " << RangeSync::mode_name(rs.mode()) << " after " << sec
+              << " s, strikes " << st.strikes << "\n";
+    EXPECT_EQ(rs.mode(), Mode::Complete);
+    EXPECT_LE(sec, 120) << "the last range waited on the slow peer";
+    EXPECT_EQ(st.strikes, 0u);
 }
