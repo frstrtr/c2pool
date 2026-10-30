@@ -65,7 +65,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_hardening PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_utxo test_utxo.cpp test_block_download.cpp)
+    add_executable(test_utxo test_utxo.cpp test_block_download.cpp test_utxo_cold_start.cpp)
     target_link_libraries(test_utxo PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

@@ -211,6 +211,86 @@ bool ordered_done(const core::coin::BlockBootstrapState<BlockT>& bs)
     return bs.next_height > bs.end_height;
 }
 
+/// Extend the running pipeline's range to `height` without buffering a block
+/// (a new tip, or a block ahead of the window: asked in order later).
+template <typename BlockT>
+void ordered_extend(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t height)
+{
+    if (height > bs.end_height) {
+        bs.end_height = height;
+        bs.total = bs.processed + (bs.end_height - bs.next_height + 1);
+    }
+}
+
+/// How a fill's heights are asked for.
+enum class FillAsk {
+    Download,  // the cold start ("Bootstrap"): one peer per height, core::coin::BlockDownload
+    Targeted,  // gap / reorg / rebuild fills: one peer round robin
+};
+
+inline FillAsk fill_ask(const std::string& phase)
+{
+    return phase == "Bootstrap" ? FillAsk::Download : FillAsk::Targeted;
+}
+
+/// The cold-start Bootstrap of a partial UTXO view (the embedded LTC set,
+/// the DOGE accrual set): when it starts and over which heights.
+///   - only once the header chain is synced (tip age < 24 h). Before, the
+///     first block above `keep` armed it at whatever tip the header chain
+///     had then, on a fresh node the checkpoint-era one, and every
+///     best-chain block extended it to the real tip (FRESH-NODE 2.2: LTC
+///     289 -> 114,549 blocks; 2.3: DOGE 1,441 -> 276,000) while templates
+///     waited for it to reach the tip;
+///   - over the synced tip's last `blocks` heights, or from the set's best
+///     + 1 when that is within them (a warm restart catches up); a set at
+///     most one block behind needs none (the normal path takes the tip);
+///   - a fill that falls more than `blocks` + its window behind the tip is
+///     armed again at the tip (cold_start_rearm).
+struct ColdStart {
+    enum class Action {
+        Wait,  // not yet (header chain not synced): no fill, the set takes no block
+        Warm,  // the set is at most one block behind the tip: no fill
+        Arm,   // fetch [from, to] in order
+    };
+    Action   action{Action::Wait};
+    uint32_t from{0};
+    uint32_t to{0};
+    uint32_t jump_from{0};  // the deliberate jump over a non-empty set too far behind (0 = none)
+};
+
+inline ColdStart cold_start_plan(uint32_t blocks, bool synced, uint32_t tip, uint32_t utxo_best)
+{
+    ColdStart p;
+    if (!synced || blocks == 0 || tip == 0)
+        return p;
+    if (utxo_best + 1 >= tip) {
+        p.action = ColdStart::Action::Warm;
+        return p;
+    }
+    const uint32_t lo = tip >= blocks ? tip - blocks + 1 : 1;
+    p.action = ColdStart::Action::Arm;
+    p.from = (utxo_best > 0 && utxo_best + 1 >= lo) ? utxo_best + 1 : lo;
+    p.to = tip;
+    p.jump_from = (utxo_best > 0 && p.from > utxo_best + 1) ? p.from : 0;
+    return p;
+}
+
+/// A running Bootstrap whose next height is more than `blocks` + its window
+/// below the tip (it downloads slower than blocks are found, or the node
+/// was away): the range to arm it again, the tip's last `blocks` heights.
+/// The caller wipes the partial set first (the new range does not continue
+/// it). nullopt: keep going.
+template <typename BlockT>
+std::optional<std::pair<uint32_t, uint32_t>> cold_start_rearm(
+    const core::coin::BlockBootstrapState<BlockT>& bs, uint32_t tip, uint32_t blocks)
+{
+    if (!bs.active || blocks == 0 || tip < bs.next_height)
+        return std::nullopt;
+    if (uint64_t(tip) - bs.next_height <= uint64_t(blocks) + bs.window)
+        return std::nullopt;
+    return std::make_pair(tip >= blocks ? tip - blocks + 1 : 1u, tip);
+}
+
 /// Result of walking the UTXO set back to the best chain.
 struct RewindResult {
     /// Why the walk stopped short of the best chain.
