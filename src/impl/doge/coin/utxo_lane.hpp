@@ -995,6 +995,15 @@ private:
             m_chase_height = 0;
             return;
         }
+        // An accrual set more than `keep` behind (a restart after a while)
+        // is the Bootstrap's: its first body above keep jumps to tip - keep.
+        // A chased best + 1 landing first would take that body's place and
+        // the tip's body would then arm a gap fill over the whole distance
+        // (VERIFY8 C3). The chase is for a set near the tip.
+        if (m_mode == Mode::Accrual && tip - best > m_keep) {
+            m_chase_height = 0;
+            return;
+        }
         const uint32_t h = best + 1;
         if (m_chase_height != h) {
             m_chase_height = h;

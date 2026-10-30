@@ -526,3 +526,62 @@ TEST(DogeUtxoOrder, TheSetChasesATipItsAnnouncerNeverServes)
     EXPECT_GE(l.lane.stats().tip_chases.load(), 4u);
 }
 
+// VERIFY8 C4 (the verifier's probe Verify8_NoChaseWhileAFillRuns): a fill
+// asks its own blocks; the chase stays out of it. The set at h=3, h=5's body
+// arrives ahead (a gap fill [4..5] is armed), chase_tip says yes: in 8 s no
+// request from the chase, tip_chases 0.
+TEST(DogeUtxoOrder, TheSetDoesNotChaseWhileAFillRuns)
+{
+    Lane l(core::coin::DOGE_MIN_BLOCKS_TO_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
+    const uint256 g = genesis(0x70);
+    const auto c = make_chain(g, 1, 5, 0x70);
+    l.grow({c[0], c[1], c[2]});
+    ASSERT_EQ(l.t.cache->get_best_height(), 3u);
+    l.switch_to(c, 1);
+    l.deliver(c[4], 5);  // ahead of the set: the gap fill [4..5]
+    ASSERT_TRUE(l.lane.fill().active);
+    ASSERT_EQ(l.t.cache->get_best_height(), 3u);
+    l.net.requested.clear();
+    l.net.asked_how.clear();
+    l.net.chase = true;
+    for (int i = 0; i < 8; ++i) {
+        l.net.clock += std::chrono::seconds(1);
+        l.lane.tick();
+    }
+    EXPECT_TRUE(l.net.requested.empty()) << "the chase asked h=" << l.net.requested.front()
+                                         << " while the gap fill runs";
+    EXPECT_EQ(l.lane.stats().tip_chases.load(), 0u);
+}
+
+// VERIFY8 C3: an accrual set more than `keep` behind (a restart after a
+// while) whose tip announcer never serves bodies. The chase used to ask
+// best + 1 first; that body took the place of the Bootstrap's first body,
+// and the tip's body later armed a gap fill over the whole distance instead
+// of the last `keep` blocks. Now the chase leaves such a set alone, and the
+// tip's body arms the Bootstrap at tip - keep. keep = 20, the set at h=3,
+// the header chain at h=33.
+TEST(DogeUtxoOrder, TheChaseLeavesASetFarBehindToTheBootstrap)
+{
+    Lane l(20, UtxoLane::Mode::Accrual, 0, /*download=*/true);
+    const uint256 g = genesis(0x71);
+    const auto c = make_chain(g, 1, 33, 0x71);
+    l.grow({c[0], c[1], c[2]});
+    ASSERT_EQ(l.t.cache->get_best_height(), 3u);
+    l.switch_to(c, 1);
+    l.net.requested.clear();
+    l.net.peer_requests.clear();
+    l.net.chase = true;
+    for (int i = 0; i < 10; ++i) {
+        l.net.clock += std::chrono::seconds(1);
+        l.lane.tick();
+    }
+    EXPECT_TRUE(l.net.requested.empty()) << "the chase asked h=" << l.net.requested.front()
+                                         << " of a set 30 behind with keep 20";
+    EXPECT_EQ(l.lane.stats().tip_chases.load(), 0u);
+    // The tip's body from another peer: the Bootstrap, from tip - keep.
+    l.lane.on_block(c[32], hash_of(c[32]), 33, "other");
+    ASSERT_TRUE(l.lane.fill().active);
+    EXPECT_EQ(l.lane.fill().phase, "Bootstrap");
+    EXPECT_EQ(l.lane.fill().next_height, 13u) << "not the Bootstrap's jump to tip - keep";
+}
+
