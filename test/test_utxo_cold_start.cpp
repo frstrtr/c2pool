@@ -62,8 +62,7 @@ bool arm_from_plan(Fill& f, uint32_t blocks, bool synced, uint32_t tip, uint32_t
     const ColdStart p = ltc::coin::cold_start_plan(blocks, synced, tip, best);
     if (p.action != ColdStart::Action::Arm)
         return false;
-    ltc::coin::ordered_arm(f, p.from, p.to);
-    f.phase = "Bootstrap";
+    ltc::coin::cold_start_arm(f, p.from, p.to);
     return true;
 }
 
@@ -139,7 +138,7 @@ TEST(LtcColdStart, TheColdStartBootstrapNeverRunsFarBehindTheTip)
     uint64_t widest = 0;
     for (uint32_t tip = LTC_TIP + 1; tip <= LTC_TIP + 116000; ++tip) {
         if (auto r = ltc::coin::cold_start_rearm(f, tip, LTC_COLD_BLOCKS)) {
-            ltc::coin::ordered_arm(f, r->first, r->second);
+            ltc::coin::cold_start_arm(f, r->first, r->second);
             ++rearms;
         } else {
             ltc::coin::ordered_extend(f, tip);
@@ -253,7 +252,7 @@ TEST(DogeAccrualColdStart, TheAccrualBootstrapNeverGrowsPastKeep)
     for (uint32_t tip = DOGE_TIP + 1; tip <= DOGE_TIP + 276000; ++tip) {
         // The tick: arm again when too far behind, else the tip joins the range.
         if (auto r = ltc::coin::cold_start_rearm(f, tip, DOGE_COLD_BLOCKS)) {
-            ltc::coin::ordered_arm(f, r->first, r->second);
+            ltc::coin::cold_start_arm(f, r->first, r->second);
             dl.reset();
             ++rearms;
         }

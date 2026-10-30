@@ -2699,6 +2699,7 @@ int main(int argc, char* argv[]) {
                             }
                             ltc::coin::ordered_arm(*ltc_bs, from, to);
                             ltc_bs->phase = "UTXO rebuild";
+                            ltc_bs->window = ltc_bs->WINDOW_SIZE;
                             *utxo_jump_from = from;
                             ltc_dl->reset();
                             if (bcaster) {
@@ -2743,6 +2744,7 @@ int main(int argc, char* argv[]) {
                             && ltc::coin::ordered_rearm_after_reorg(*ltc_bs, best_now, target_height)) {
                             if (!was_cold_start) {
                                 ltc_bs->phase = "UTXO reorg fill";
+                                ltc_bs->window = ltc_bs->WINDOW_SIZE;
                                 *utxo_jump_from = 0;
                             }
                             LOG_WARNING << "[EMB-LTC] UTXO reorg fill (" << reason << "): connecting "
@@ -3249,6 +3251,7 @@ int main(int argc, char* argv[]) {
                                     if (ltc_bs->active && ltc::coin::ordered_done(*ltc_bs)) {
                                         ltc_bs->active = false;
                                         ltc_bs->stop_stall_timer();
+                                        ltc_bs->window = ltc_bs->WINDOW_SIZE;
                                         ltc_dl->reset();
                                         LOG_INFO << "[EMB-LTC] " << ltc_bs->phase << " complete: "
                                                  << ltc_bs->processed << " blocks";
@@ -3315,6 +3318,7 @@ int main(int argc, char* argv[]) {
                                     }
                                     ltc::coin::ordered_arm(*ltc_bs, utxo_best + 1, height);
                                     ltc_bs->phase = "UTXO gap fill";
+                                    ltc_bs->window = ltc_bs->WINDOW_SIZE;
                                     *utxo_jump_from = 0;
                                     ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
                                     ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
@@ -3692,8 +3696,7 @@ int main(int argc, char* argv[]) {
                             if (!chain || !bcaster || !utxo || !utxo_db)
                                 return;
                             auto arm = [&](uint32_t from, uint32_t to, uint32_t jump_from) {
-                                ltc::coin::ordered_arm(*ltc_bs, from, to);
-                                ltc_bs->phase = "Bootstrap";
+                                ltc::coin::cold_start_arm(*ltc_bs, from, to);
                                 *utxo_jump_from = jump_from;
                                 ltc_dl->reset();
                                 const uint32_t asked = ltc_dl->refill(*ltc_bs);
@@ -7138,6 +7141,7 @@ int main(int argc, char* argv[]) {
                                                 if (doge_bs->next_height > doge_bs->end_height) {
                                                     doge_bs->active = false;
                                                     doge_bs->stop_stall_timer();
+                                                    doge_bs->window = doge_bs->WINDOW_SIZE;
                                                     doge_dl->reset();
                                                     LOG_INFO << "[EMB-DOGE] Bootstrap complete: "
                                                              << doge_bs->processed << " blocks";
@@ -7242,8 +7246,7 @@ int main(int argc, char* argv[]) {
                                             // [tip - keep, tip]: 1,441 heights.
                                             constexpr uint32_t DOGE_COLD_BLOCKS = core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1;
                                             auto arm = [&](uint32_t from, uint32_t to) {
-                                                ltc::coin::ordered_arm(*doge_bs, from, to);
-                                                doge_bs->phase = "Bootstrap";
+                                                ltc::coin::cold_start_arm(*doge_bs, from, to);
                                                 doge_dl->reset();
                                                 const uint32_t asked = doge_dl->refill(*doge_bs);
                                                 LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: " << doge_bs->total

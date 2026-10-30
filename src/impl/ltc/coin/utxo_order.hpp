@@ -279,6 +279,24 @@ struct ColdStart {
     uint32_t jump_from{0};  // the deliberate jump over a non-empty set too far behind (0 = none)
 };
 
+/// The cold start's download window: heights asked ahead of the next to
+/// drain, one peer each (core::coin::BlockDownload). Wide enough that a slow
+/// block is left to the request timeout rather than its peer called a
+/// staller, and that 20 peers work in parallel (Core's
+/// BLOCK_DOWNLOAD_WINDOW is 1,024); the bodies kept stay under the
+/// download's byte bound. A 16-height window rotated out every peer whose
+/// block took more than 2 s on a busy link.
+constexpr size_t COLD_START_WINDOW = 256;
+
+/// Arm the cold start over [from, to] ("Bootstrap", COLD_START_WINDOW).
+template <typename BlockT>
+void cold_start_arm(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t from, uint32_t to)
+{
+    ordered_arm(bs, from, to);
+    bs.phase = "Bootstrap";
+    bs.window = COLD_START_WINDOW;
+}
+
 inline ColdStart cold_start_plan(uint32_t blocks, bool synced, uint32_t tip, uint32_t utxo_best)
 {
     ColdStart p;
