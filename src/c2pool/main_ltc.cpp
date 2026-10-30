@@ -272,6 +272,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/header_sync.hpp>
 // Phase 5: Embedded DOGE node for daemonless merged mining
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
@@ -2437,65 +2438,61 @@ int main(int argc, char* argv[]) {
                 // Shared_ptr so it stays alive for the lifetime of the callbacks.
                 auto hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
 
-                // Header sync: self-propelling chain catch-up.
-                // add_headers() runs scrypt for each header (~20ms each), so we offload
-                // it to a background thread and post the follow-up back to ioc.
+                // Header sync (ltc/coin/header_sync.hpp): the batches go to the
+                // header thread (add_headers runs scrypt near the tip), the
+                // follow-up getheaders and the poll go out on ioc.
+                std::shared_ptr<ltc::coin::HeaderSync> ltc_hdr_sync;
+                {
+                    ltc::coin::HeaderSyncHost hs;
+                    auto* chain = embedded_chain.get();
+                    auto* bcaster = embedded_broadcaster.get();
+                    hs.has_header = [chain](const uint256& h) { return chain->has_header(h); };
+                    hs.add_headers = [chain](const std::vector<ltc::coin::BlockHeaderType>& batch) {
+                        auto t0 = std::chrono::steady_clock::now();
+                        int accepted = chain->add_headers(batch);
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+                        if (accepted > 0)
+                            LOG_INFO << "[EMB-LTC] Processed batch: " << batch.size() << " headers"
+                                     << " accepted=" << accepted
+                                     << " chain_height=" << chain->height()
+                                     << " elapsed=" << elapsed << "ms";
+                        else
+                            LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch.size();
+                        return accepted;
+                    };
+                    hs.post_worker = [hdr_pool](std::function<void()> fn) {
+                        boost::asio::post(*hdr_pool, std::move(fn));
+                    };
+                    hs.post_io = [&ioc](std::function<void()> fn) {
+                        boost::asio::post(ioc, [fn = std::move(fn)]() {
+                            try {
+                                fn();
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[EMB-LTC] Header post-process error: " << e.what();
+                            }
+                        });
+                    };
+                    hs.locator = [chain]() { return chain->get_locator(); };
+                    hs.synced = [chain]() { return chain->is_synced(); };
+                    hs.ask_one = [bcaster](const std::vector<uint256>& locator, size_t rr, const std::string& peer) {
+                        return bcaster->request_headers_targeted(locator, uint256::ZERO, rr, peer);
+                    };
+                    hs.ask_all = [bcaster](const std::vector<uint256>& locator) {
+                        bcaster->request_headers(locator, uint256::ZERO);
+                    };
+                    hs.accepted = [&web_server](int) {
+                        LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
+                        web_server.trigger_work_refresh_debounced();
+                    };
+                    ltc_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs));
+                }
                 LOG_INFO << "[EMB-LTC] Wiring on_new_headers callback (background thread pool)";
                 embedded_broadcaster->set_on_new_headers(
-                    [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
-                     &web_server, &ioc, hdr_pool](
-                        const std::string& peer_key,
-                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                    [ltc_hdr_sync](const std::string& peer_key,
+                                   const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                         LOG_INFO << "[EMB-LTC] Received " << hdrs.size() << " headers from " << peer_key;
-                        // Copy batch — caller's vector may be freed after return
-                        auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
-                        boost::asio::post(*hdr_pool,
-                            [batch, chain, bcaster, &web_server, &ioc]() {
-                                auto t0 = std::chrono::steady_clock::now();
-                                int accepted = chain->add_headers(*batch);
-                                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - t0).count();
-                                if (accepted > 0)
-                                    LOG_INFO << "[EMB-LTC] Processed batch: " << batch->size() << " headers"
-                                             << " accepted=" << accepted
-                                             << " chain_height=" << chain->height()
-                                             << " elapsed=" << elapsed << "ms";
-                                // Always use the LAST header in the batch as locator for the
-                                // next getheaders — this advances past known-but-duplicate
-                                // headers loaded from LevelDB.  The peer recognises the hash
-                                // (it sent it) and continues from there.
-                                uint256 last_hash;
-                                if (!batch->empty()) {
-                                    auto& last_hdr = batch->back();
-                                    auto packed = pack(last_hdr);
-                                    last_hash = Hash(packed.get_span());
-                                }
-                                bool full_batch = (batch->size() >= 2000);
-                                if (accepted > 0 || full_batch) {
-                                    boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
-                                      try {
-                                        if (accepted > 0) {
-                                            LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
-                                            web_server.trigger_work_refresh_debounced();
-                                            // New headers accepted — use last_hash to continue
-                                            if (!last_hash.IsNull()) {
-                                                bcaster->request_headers({last_hash}, uint256::ZERO);
-                                            } else {
-                                                bcaster->request_headers(chain->get_locator(), uint256::ZERO);
-                                            }
-                                        } else {
-                                            // Full batch but all duplicates — use chain tip locator
-                                            // to skip past known headers and find new ones
-                                            bcaster->request_headers(chain->get_locator(), uint256::ZERO);
-                                        }
-                                      } catch (const std::exception& e) {
-                                        LOG_WARNING << "[EMB-LTC] Header post-process error: " << e.what();
-                                      }
-                                    });
-                                } else {
-                                    LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch->size();
-                                }
-                            });
+                        ltc_hdr_sync->on_headers(peer_key, hdrs);
                     });
                 LOG_INFO << "[EMB-LTC] Embedded coin node wired to web server";
 
@@ -2734,7 +2731,7 @@ int main(int argc, char* argv[]) {
                 // Compact blocks: coin-side decision before reconstruction.
                 embedded_broadcaster->set_on_cmpct_block(
                     [chain = embedded_chain.get(), tracker = mweb_tracker.get(),
-                     bcaster = embedded_broadcaster.get(),
+                     ltc_hdr_sync,
                      mweb_stats, seen_blocks, cmpct_inflight, cmpct_headers_req,
                      ltc_mweb_activation](const std::string& peer,
                                           const ltc::coin::CompactBlock& cb) {
@@ -2765,7 +2762,7 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "[EMB-LTC] Compact block " << hash.GetHex().substr(0, 16)
                                          << "... from " << peer
                                          << " does not connect (parent unknown) — requesting headers";
-                                bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                                ltc_hdr_sync->on_unconnected(peer);
                             }
                             return CmpctAction::Drop;
                         }
@@ -2825,7 +2822,7 @@ int main(int argc, char* argv[]) {
                 // seen, kernel fees given up, template drops, the last block the
                 // pool was cleaned for).
                 mi->set_coin_metrics_fn(
-                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry,
+                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync,
                      pool = embedded_pool.get(), tracker = mweb_tracker.get()]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
@@ -2842,7 +2839,8 @@ int main(int argc, char* argv[]) {
                         mp["last_cleaned_ago_s"] = cleaned
                             ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
                             : nlohmann::json(nullptr);
-                        return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)}};
+                        return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
+                                              {"ltc_headers", ltc_hdr_sync->to_json()}};
                     });
 
                 // Full block handler: MWEB state extraction + mempool cleanup.
@@ -3616,22 +3614,22 @@ int main(int argc, char* argv[]) {
                     });
                 LOG_INFO << "[EMB-LTC] Chain reorg handler registered";
 
-                // Periodic fallback: re-request headers every 60s even if no batch arrived.
+                // Periodic getheaders (HeaderSync::poll), also when no batch arrived.
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
                 auto sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                 auto sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                *sync_fn = [sync_fn, sync_timer, now_ms, hb_ltc_sync,
+                *sync_fn = [sync_fn, sync_timer, now_ms, hb_ltc_sync, ltc_hdr_sync,
                             chain   = embedded_chain.get(),
                             bcaster = embedded_broadcaster.get()](boost::system::error_code ec) {
                     if (ec) return; // cancelled (ioc stopped)
                     hb_ltc_sync->store(now_ms());
-                    sync_timer->expires_after(std::chrono::seconds(60));
+                    sync_timer->expires_after(ltc_hdr_sync->poll_interval());
                     sync_timer->async_wait(*sync_fn);
                     try {
                         LOG_DEBUG_COIND << "[EMB-LTC] Periodic header sync: height=" << chain->height()
                                   << " synced=" << chain->is_synced()
                                   << " peers=" << bcaster->connected_count();
-                        bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                        ltc_hdr_sync->poll();
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[EMB-LTC] Header sync error: " << e.what();
                     }
