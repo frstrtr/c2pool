@@ -21,12 +21,16 @@
 
 #include <core/uint256.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace doge {
 namespace coin {
@@ -128,15 +132,24 @@ public:
         return outstanding_locked(peer, now);
     }
 
-    /// The peers with a getheaders of the header chain unanswered: its sync
-    /// peers (the hash schedule's ranges go to other peers first).
+    /// The header chain's sync peers: the SYNC_PEERS most recently asked
+    /// with their getheaders unanswered (the hash schedule's ranges go to
+    /// other peers first). Not every peer with one unanswered: while
+    /// catching up the periodic poll asks a new peer every 5 s, and an answer
+    /// queued behind ranges takes minutes, so that set grew to most peers
+    /// and left the ranges 5 of them (fresh-anchored3 run 4).
+    static constexpr size_t SYNC_PEERS = 2;
     std::set<std::string> busy(Clock::time_point now)
     {
         std::lock_guard<std::mutex> lock(m_mu);
-        std::set<std::string> out;
+        std::vector<std::pair<Clock::time_point, std::string>> recent;
         for (const auto& [p, at] : m_sent)
             if (now - at < RESPONSE_TIME)
-                out.insert(p);
+                recent.emplace_back(at, p);
+        std::sort(recent.begin(), recent.end(), std::greater<>());
+        std::set<std::string> out;
+        for (size_t i = 0; i < recent.size() && i < SYNC_PEERS; ++i)
+            out.insert(recent[i].second);
         return out;
     }
 

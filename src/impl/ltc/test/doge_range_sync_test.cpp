@@ -823,6 +823,24 @@ TEST(DogeRangeSync, RangeAnswersNeverTouchHeaderAsks)
     }
 }
 
+// The header chain's sync peers, for the ranges to avoid: the two most
+// recently asked with their getheaders unanswered. Live, fresh-anchored3 run
+// 4: every peer the 5-s catch-up poll had asked stayed "busy" for 2 minutes
+// (its answer queued behind ranges), the ranges were left 5 peers of 19.
+TEST(DogeRangeSync, TheSyncPeersAreTheLastTwoAsked)
+{
+    doge::coin::HeaderAsks asks;
+    const auto t = t0();
+    for (int i = 0; i < 18; ++i)
+        asks.sent("p" + std::to_string(i), t + std::chrono::seconds(5 * i));
+    const auto now = t + std::chrono::seconds(90);
+    const auto busy = asks.busy(now);
+    EXPECT_EQ(busy, (std::set<std::string>{"p16", "p17"}));
+    asks.answered("p17");
+    EXPECT_EQ(asks.busy(now), (std::set<std::string>{"p15", "p16"}));
+    EXPECT_TRUE(asks.busy(t + std::chrono::minutes(10)).empty()) << "unanswered for longer than RESPONSE_TIME";
+}
+
 // The anchors compiled in (when the build carries the generated .inc): they
 // parse (digest, heights, checkpoint line) and run from DOGE mainnet's genesis
 // to the built-in header checkpoint 6,160,000.
