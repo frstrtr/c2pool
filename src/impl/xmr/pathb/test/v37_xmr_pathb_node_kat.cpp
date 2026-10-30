@@ -10665,88 +10665,134 @@ void caughtdrain() {
           "10 s (lines " + std::to_string(line_at.size()) + ")");
 }
 
-// drainwindow (E-194 (vi)): the template gate holds in the drain window. A holds 600 positions; J, an empty store not
-// caught up, catches up from A (the wire at most 100 frames per second). Right after J places the HELLO tip, before its
-// next tick, a pass of J's own (its node lock held 30 s) while A mines three carriers that arrive at J's link. At J's
-// next two ticks every HELLO tip is held and those frames are in hand: no caught-up line and the gate holds
-// (CatchingUp); once they are judged the line comes at A's position and the gate opens.
-void drainwindow() {
+// The drain window (E-194 (vi)). A holds 600 positions; J, an empty store not caught up, catches up from A (the wire at
+// most 100 frames per second). With J at 300 or more, frames of A (copies of its carriers) are parked at J's relay,
+// received and not judged; then J places the HELLO tip. `drop` false: three frames, run again 20 s later. `drop` true
+// (J's parked list holds at most 2): two frames that never run again; five seconds after the HELLO tip two more, run
+// again 3 s later, whose parking evicts the first two. Read once per second after J's tick: its template status and
+// its caught-up line.
+struct DrainWindow {
+    bool setup = false;
+    std::uint64_t hello_pos = 0, a_pos = 0, dropped = 0;
+    int held = 0, open = 0;  // reads before the line
+    bool line = false, line_at_a = false, open_at_end = false, caught_up = false;
+    std::uint64_t strikes = 0, bans = 0;
+};
+DrainWindow drain_window(bool drop) {
     const KatNet net;
     Harness h(net);
     h.headers_frame = 700000;
     FakeWire w;
+    DrainWindow o;
     KatRelay a = kat_relay(h, w, table0(net), true);
-    std::uint64_t mcount = 0;
     bool mined = true;
-    for (; mcount < 600 && mined; ++mcount) {
-        if (mcount % 12 == 0) h.tick_monero();
-        mined = mine_on(h, w, a.node, static_cast<std::size_t>(mcount % 5), 50000 + static_cast<std::uint32_t>(mcount));
+    for (std::uint64_t i = 0; i < 600 && mined; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        mined = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 50000 + static_cast<std::uint32_t>(i));
     }
     const pb::Hash32 hello_tip = h[a.node].tree().best().id;
+    std::vector<std::vector<std::uint8_t>> copies;
+    for (const std::uint64_t x : {100, 200, 300, 400})
+        if (const std::optional<pb::Hash32> id = h[a.node].store().best_at(x))
+            copies.push_back(*pb::encode_fc_carrier(0, *h[a.node].bodies().get(*id), 16));
     std::map<std::size_t, std::vector<std::string>> lines;
     g_relay_lines = &lines;
-    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [drop](pb::PathbRelayOptions& r) {
+        if (drop) r.parked_max = 2;
+    }, nullptr, nullptr, true);
+    pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t pa = w.id(1, 0);  // A at J
+    const std::uint64_t dropped0 = rj.stats().queue_dropped.load();
     w.connect(1, 0);
-    bool reached = false;
+    bool parked = false, reached = false;
     for (int secs = 0; secs < 120 && !reached; ++secs) {  // until J places the HELLO tip (read after every step)
         h.now += 1;
         a.relay->tick();
         a.relay->pump();
-        j.relay->tick();
-        j.relay->pump();
-        reached = h[j.node].holds_tip(hello_tip);
-        for (int m = 0; m < 100 && !reached && w.step(); ++m) reached = h[j.node].holds_tip(hello_tip);
-    }
-    const std::uint64_t j_reach = h[j.node].tree().best().pos;
-    j.relay->test_hold_node([&] {  // J's own pass right after the placement: A mines three carriers meanwhile
-        for (int k = 0; k < 30; ++k) {
-            h.now += 1;
-            if (k % 10 == 9) {
-                if (mcount % 12 == 0) h.tick_monero();
-                mined = mine_only(h, a.node, static_cast<std::size_t>(mcount % 5), 50000 + static_cast<std::uint32_t>(mcount))
-                        && mined;
-                ++mcount;
+        rj.tick();
+        rj.pump();
+        for (int m = 0; m < 100 && !reached; ++m) {
+            if (!parked && h[j.node].tree().best().pos >= 300 && copies.size() == 4) {
+                if (drop) {
+                    rj.test_park(pa, copies[0]);  // never run again
+                    rj.test_park(pa, copies[1]);
+                } else {
+                    for (std::size_t k = 0; k < 3; ++k) rj.test_park(pa, copies[k], (h.now + 20) * 1000);
+                }
+                parked = true;
             }
-            a.relay->tick();
-            a.relay->pump();
-            for (int m = 0; m < 100 && step_only(w, {a.relay.get()}); ++m) {
-            }
+            reached = h[j.node].holds_tip(hello_tip);
+            if (reached || !w.step()) break;
         }
-    });
-    const std::uint64_t a_pass = h[a.node].tree().best().pos;
-    j.relay->tick();  // the done test: every HELLO tip held, A's three carriers in hand
-    const pb::TemplateStatus s1 = tstatus(h, j.node);
-    h.now += 1;
-    j.relay->tick();
-    const pb::TemplateStatus s2 = tstatus(h, j.node);
-    const std::size_t lines_window = caught_of(lines, j.node).size();
-    const bool due = !h[j.node].caught_up();
-    j.relay->pump();  // the three judged
-    const pb::TemplateStatus s3 = tstatus(h, j.node);
+        reached = reached || h[j.node].holds_tip(hello_tip);
+    }
+    o.setup = mined && parked && reached;
+    o.hello_pos = h[j.node].tree().best().pos;
+    for (int k = 0; k < 40; ++k) {
+        h.now += 1;
+        if (drop && k == 5)  // two later frames evict the two that never run
+            for (std::size_t c = 2; c < 4; ++c) rj.test_park(pa, copies[c], (h.now + 3) * 1000);
+        rj.tick();
+        if (caught_of(lines, j.node).empty()) ++(gate_open(h, j.node) ? o.open : o.held);
+        rj.pump();
+        a.relay->tick();
+        a.relay->pump();
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
     const std::vector<std::string> cl = caught_of(lines, j.node);
     g_relay_lines = nullptr;
     const std::optional<CaughtLine> c = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
-    std::printf("  drainwindow: J at %llu at the HELLO tip's placement, A at %llu after J's pass; in the drain window "
-                "statuses %d, %d, lines %zu, caught up %d; after the drain status %d, J at %llu, line %s\n",
-                (unsigned long long)j_reach, (unsigned long long)a_pass, static_cast<int>(s1), static_cast<int>(s2),
-                lines_window, due ? 0 : 1, static_cast<int>(s3), (unsigned long long)h[j.node].tree().best().pos,
-                cl.empty() ? "none" : cl[0].c_str());
-    check(mined && reached && j_reach == 600 && a_pass == 603,
-          "drainwindow: setup (J at the HELLO tip 600; A at 603 after J's own pass, its three carriers in hand at J)");
-    check(due && lines_window == 0 && s1 == pb::TemplateStatus::CatchingUp && s2 == pb::TemplateStatus::CatchingUp,
-          "drainwindow: every HELLO tip held, frames in hand: no caught-up line, the gate holds (" +
-                  std::to_string(static_cast<int>(s1)) + ", " + std::to_string(static_cast<int>(s2)) + ")");
-    check(c && c->form == kCaughtDone && c->pos == a_pass && h[j.node].tree().best().pos == a_pass && h[j.node].caught_up()
-                  && s3 != pb::TemplateStatus::CatchingUp && s3 != pb::TemplateStatus::NoPathbPeer,
-          "drainwindow: the frames judged: the caught-up line at A's position, the gate open (" +
-                  std::to_string(static_cast<int>(s3)) + ")");
+    o.a_pos = h[a.node].tree().best().pos;
+    o.line = c && c->form == kCaughtDone;
+    o.line_at_a = o.line && c->pos == o.a_pos;
+    o.caught_up = h[j.node].caught_up();
+    o.open_at_end = gate_open(h, j.node);
+    o.dropped = rj.stats().queue_dropped.load() - dropped0;
+    o.strikes = rj.stats().strikes.load();
+    o.bans = rj.stats().bans.load();
+    return o;
+}
+void print_drain(const char* name, const DrainWindow& o) {
+    std::printf("  %s: J at the HELLO tip %llu; reads before the line: held %d, open %d; dropped from J's parked list "
+                "%llu; line %d at A's position %d; caught up %d; gate open at the end %d; strikes %llu, bans %llu\n",
+                name, (unsigned long long)o.hello_pos, o.held, o.open, (unsigned long long)o.dropped, o.line ? 1 : 0,
+                o.line_at_a ? 1 : 0, o.caught_up ? 1 : 0, o.open_at_end ? 1 : 0, (unsigned long long)o.strikes,
+                (unsigned long long)o.bans);
+}
+
+// drainwindow (E-194 (vi)): every HELLO tip held and frames in hand: the gate holds until they are judged; then the
+// caught-up line comes at A's position and the gate opens.
+void drainwindow() {
+    const DrainWindow o = drain_window(false);
+    print_drain("drainwindow", o);
+    check(o.setup && o.hello_pos == 600, "drainwindow: setup (three frames of A parked at J, then J at the HELLO tip 600)");
+    check(o.held >= 10 && o.open == 0,
+          "drainwindow: while the frames are in hand the gate holds (held " + std::to_string(o.held) + ", open " +
+                  std::to_string(o.open) + ")");
+    check(o.line && o.line_at_a && o.caught_up && o.open_at_end && o.strikes == 0 && o.bans == 0,
+          "drainwindow: the frames judged: the caught-up line at A's position, the gate open, no token");
+}
+
+// draindrop (E-193, E-194 (vi)): frames dropped while in hand leave the drain: two frames that never run again are
+// evicted from J's parked list (at most 2) by two later ones; once those are judged the line comes and the gate opens.
+void draindrop() {
+    const DrainWindow o = drain_window(true);
+    print_drain("draindrop", o);
+    check(o.setup && o.hello_pos == 600, "draindrop: setup (two frames of A parked at J for good, then J at the HELLO tip 600)");
+    check(o.held >= 5 && o.open == 0 && o.dropped == 2,
+          "draindrop: the gate holds while frames are in hand; the two evicted (dropped " + std::to_string(o.dropped) +
+                  ", held " + std::to_string(o.held) + ")");
+    check(o.line && o.line_at_a && o.caught_up && o.open_at_end && o.strikes == 0 && o.bans == 0,
+          "draindrop: the evicted frames leave the drain: the caught-up line at A's position, the gate open, no token");
 }
 
 // adoptdrain (E-193): an adoption at a store not caught up waits for the drain. J, an empty store not caught up, meets A
 // (8 positions) while a P_r of A's chain is hidden from J: the catch-up DEFERs and A's tip is offered to the joiner
 // after kCtxTtlMs. The P_r shown again (no Monero tip event: the catch-up's deferred request waits), a frame of A is
-// parked at J's relay (received and not judged; run again 30 s later) and J's attempt completes and adopts: K_NCU stays (its record in the adopted store) and no template is built
-// while that frame is in hand; once it is judged, K_NCU ends and the record leaves the store.
+// parked at J's relay (received and not judged; run again 30 s later) and J's attempt completes and adopts: K_NCU
+// stays (its record in the adopted store), no template is built and no caught-up line is printed while that frame is
+// in hand; once it is judged, K_NCU ends, the record leaves the store and the caught-up line is printed.
 void adoptdrain() {
     const KatNet net;
     Harness h(net);
@@ -10775,6 +10821,8 @@ void adoptdrain() {
     MemoryKv& kvj = *h.kvs.back();
     const std::string ncu = pb::store_keys::ncu(0);
     pb::PathbRelayNode& rj = *j.relay;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
     w.connect(0, 1);
     w.run();
     for (int k = 0; k < 130 && h[j.node].joiner().queue().size() == 0; ++k) {  // kCtxTtlMs: A's tip offered
@@ -10792,7 +10840,8 @@ void adoptdrain() {
         w.run();
     }
     const bool adopted = st && st->switched && st->sw.adopted && h[j.node].joined() != nullptr;
-    const bool kept = !h[j.node].caught_up() && kvj.data.count(ncu) != 0 && rj.parked_size() == 1;
+    const bool kept = !h[j.node].caught_up() && kvj.data.count(ncu) != 0 && rj.parked_size() == 1
+                      && caught_of(lines, j.node).empty();
     h.now += 1;
     rj.tick();
     w.run();
@@ -10804,11 +10853,15 @@ void adoptdrain() {
         rj.tick();
         w.run();
     }
+    const std::vector<std::string> cl = caught_of(lines, j.node);
+    g_relay_lines = nullptr;
+    const std::optional<CaughtLine> c = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
     std::printf("  adoptdrain: offered %d; adopted %d (J at %llu); K_NCU kept with the frame in hand %d, after a tick %d "
                 "(status %d); caught up after %d s, the record %s; parked %zu\n",
                 offered ? 1 : 0, adopted ? 1 : 0, (unsigned long long)h[j.node].tree().best().pos, kept ? 1 : 0,
                 still ? 1 : 0, static_cast<int>(s_due), secs, kvj.data.count(ncu) == 0 ? "gone" : "kept",
                 rj.parked_size());
+    std::printf("  adoptdrain: %s\n", cl.empty() ? "no caught-up line" : cl[0].c_str());
     check(offered && adopted, "adoptdrain: setup (J's catch-up DEFERs, A's tip offered; the attempt adopts)");
     check(kept && still && (s_due == pb::TemplateStatus::CatchingUp || s_due == pb::TemplateStatus::RestsOnClaims),
           "adoptdrain: the adoption with a frame received and not judged: K_NCU stays (its record in the adopted store), "
@@ -10816,6 +10869,9 @@ void adoptdrain() {
     check(h[j.node].caught_up() && kvj.data.count(ncu) == 0 && h.now >= until_s && rj.parked_size() == 0
                   && h[j.node].tree().best().id == tip && rj.stats().strikes.load() == 0 && rj.stats().bans.load() == 0,
           "adoptdrain: the frame judged: K_NCU ends, its record leaves the store; J at A's tip; no token");
+    check(c && c->form == kCaughtDone && c->pos == h[j.node].tree().best().pos,
+          "adoptdrain: one caught-up line when K_NCU ends, with its \" at pos <n> t=<ms>\" suffix (lines " +
+                  std::to_string(cl.size()) + ")");
 }
 
 // catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
@@ -12789,6 +12845,7 @@ int main(int argc, char** argv) {
                                 {"gatenowin", gatenowin, 3},
                                 {"caughtdrain", caughtdrain, 8},
                                 {"drainwindow", drainwindow, 5},
+                                {"draindrop", draindrop, 5},
                                 {"adoptdrain", adoptdrain, 1},
                                 {"catchrestart", catchrestart, 0},
                                 {"catchlocator", catchlocator, 0},

@@ -253,6 +253,7 @@ struct JoinStep {
     std::uint64_t reasked = 0;   // E-72: claimed leaves asked again at a carrier of the heavier chain
     bool reask_joiner = false;   // E-72: a re-asked leaf differed: the joiner path
     bool caught_up = false;      // a completed attempt that rule (4) did not take ended the store's K_NCU
+    bool adopt_caught_up = false;  // the adoption ended the store's K_NCU (its drain done)
 };
 
 // The join worker's half of a step (PathbNode::attempt_join): the E-72
@@ -734,7 +735,9 @@ public:
         }
         for (const std::uint64_t peer : left_) joiner_->disconnect(peer);  // re-queued pairs of a gone server
         left_.clear();
+        const bool ncu_before = not_caught_up_;
         if (out.report && (out.sw.adopted || out.sw.replaced)) out.switched = adopt(out.batch_written);
+        out.adopt_caught_up = out.switched && ncu_before && !not_caught_up_;
         if (out.switched) {
             if (out.sw.replaced) {
                 ++switches_.joiner_switches;
@@ -1155,6 +1158,7 @@ public:
         peers_.erase(peer);
         hf_round_.erase(peer);
         if (hp_win_ && hp_win_peer_ == peer) hp_win_.reset();  // its verified headers released below
+        hp_body_.erase(peer);
         headers_->release_peer(peer);
         deferred_.forget_peer(peer);
         header_req_.erase(peer);
@@ -3611,7 +3615,13 @@ private:
         if (!gate_applies()) return false;
         const bool win = win_open();
         if (hp_page_.live && win) return true;
-        return hp_body_.live && (win || hello_unheld());
+        for (const auto& [peer, d] : hp_body_)  // a body delivery: toward its server's HELLO tip, or the verified win
+            if (d.live && (win || peer_tip_unheld(peer))) return true;
+        return false;
+    }
+    bool peer_tip_unheld(std::uint64_t peer) const {
+        const auto it = peers_.find(peer);
+        return it != peers_.end() && !holds_tip(it->second.best_tip);
     }
     // E-194 (vi): every HELLO tip held and the end of K_NCU waiting for the drain (frames in hand only).
     bool drain_hold() const { return gate_applies() && !peers_.empty() && !hello_unheld() && !drain_done(); }
@@ -3648,7 +3658,7 @@ private:
                 return;
             id = receipt_id(c.own);
         }
-        if (bodies_asked_.count(id) != 0 && tree_->find(id) == nullptr) note_delivery(hp_body_, t.arrival);
+        if (bodies_asked_.count(id) != 0 && tree_->find(id) == nullptr) note_delivery(hp_body_[t.peer], t.arrival);
     }
     // P-53 on the server's time: the time since the arrival less the node lock's busy time since then.
     void expire(Delivery& d) const {
@@ -3659,7 +3669,7 @@ private:
     }
     void reset_delivery() {
         hp_page_ = Delivery{};
-        hp_body_ = Delivery{};
+        hp_body_.clear();
         hp_win_.reset();
     }
     // An open catch-up request (not retired) to any peer.
@@ -3679,7 +3689,10 @@ private:
         }
         gate_now_ms_ = std::max(gate_now_ms_, now_s * 1000);
         expire(hp_page_);
-        expire(hp_body_);
+        for (auto it = hp_body_.begin(); it != hp_body_.end();) {
+            expire(it->second);
+            it = it->second.live ? std::next(it) : hp_body_.erase(it);
+        }
         if (hp_win_ && !win_open()) hp_win_.reset();
     }
 
@@ -3694,7 +3707,7 @@ private:
     std::optional<ChainTip> hp_win_;      // headers this node verified that win (their tip and work)
     std::uint64_t hp_win_peer_ = 0;
     Delivery hp_page_;                    // the last page or side-header delivery (E-194 (v))
-    Delivery hp_body_;                    // the last delivery of a body asked by FetchBodies
+    std::map<std::uint64_t, Delivery> hp_body_;  // the last delivery of a body asked by FetchBodies, per server
     std::uint64_t gate_now_ms_ = 0;       // the gate clock: the caller's time (ms)
     std::uint64_t gate_busy_ms_ = 0;      // ... and the node lock's busy total then (ms)
     bool poisoned_ = false;

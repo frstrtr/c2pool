@@ -2950,7 +2950,7 @@ private:
         log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
     }
     // Under the node lock and cumtx_: a completed join attempt that rule (4) did not take (E-178), or an adoption, at
-    // a store not caught up: K_NCU ends once the drain is done (E-193).
+    // a store not caught up: K_NCU ends once the drain is done (E-193), and the caught-up line is printed.
     void kept_locked() {
         if (node_->kept_due()) {
             if (!node_->finish_kept()) return;
@@ -2963,6 +2963,7 @@ private:
             if (!node_->finish_adopted()) return;
             kept_due_ = false;
             st_.caught_up_at_ms = now_ms();
+            log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
             return;
         }
         kept_due_ = false;
@@ -3360,6 +3361,14 @@ private:
                     at = at_pos_t_locked();
                 }
                 log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at);
+            } else if (s->adopt_caught_up) {  // the adoption ended K_NCU (E-193): the line
+                st_.caught_up_at_ms = now_ms();
+                std::string at;
+                {
+                    const NodeGuard g(*this);
+                    at = at_pos_t_locked();
+                }
+                log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at);
             } else {
                 const NodeGuard g(*this);
                 if (node_->kept_due() || node_->adopt_due()) kept_due_ = true;  // its drain first (E-193)
