@@ -136,6 +136,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # fill_budget_kat_test.cpp: G2 fill-budget token bucket (underfill ramp, port
+    # of p2pool-merged-v36 fillbudget.py) -- grant() is a pure read, settle() the
+    # one debit, floor = legacy 50 kB in every state. Same folding rule.
+    #
+    # fill_budget_runtime_kat_test.cpp: G2 runtime owner (EmbeddedCoinNode) --
+    # grant per work event, settle on share FOUND, reset on parent change, ramp
+    # back above the floor; settle key == core ShareCreationParams branch.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -155,6 +163,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_template_underfill_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
+        fill_budget_kat_test.cpp
+        fill_budget_runtime_kat_test.cpp
         found_block_peer_txid_test.cpp
         head_retention_test.cpp
         ingest_bounds_test.cpp

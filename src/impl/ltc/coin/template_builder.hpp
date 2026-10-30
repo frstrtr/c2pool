@@ -16,6 +16,8 @@
 #include <functional>
 #include "header_chain.hpp"
 #include "mempool.hpp"
+#include "fill_budget.hpp"
+#include "fill_budget_runtime.hpp"
 #include "mweb_builder.hpp"
 #include "rpc_data.hpp"
 #include "transaction.hpp"
@@ -191,6 +193,11 @@ public:
     /// coinbasevalue == subsidy + listed fees (fee-reconcile); with
     /// template_tx_check_strict a failure refuses it like the shape check,
     /// otherwise it is logged only.
+    /// new_tx_budget: G2 fill-budget grant (FillBudget::grant(), frozen per
+    /// work event by the caller). nullopt = unlimited, byte-identical to the
+    /// pre-G2 template. When set, selection stops at the first tx that would
+    /// push committed bytes past the grant (NewTxBudgetGate) and
+    /// coinbasevalue drops the fees of the cut tail.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
@@ -198,7 +205,8 @@ public:
         const MWEBTracker* mweb_tracker = nullptr,
         uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
         std::optional<rpc::WorkData>* refused = nullptr,
-        bool               template_tx_check_strict = true)
+        bool               template_tx_check_strict = true,
+        std::optional<int64_t> new_tx_budget = std::nullopt)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -254,19 +262,21 @@ public:
         auto [selected_txs, total_fees] =
             pool.get_sorted_txs_with_fees(max_weight);
 
-        // coinbasevalue = block reward + included transaction fees
-        // Matches litecoind's getblocktemplate coinbasevalue field.
-        uint64_t coinbasevalue = subsidy + total_fees;
-
         nlohmann::json         tx_array = nlohmann::json::array();
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
 
+        NewTxBudgetGate budget_gate(new_tx_budget);
+        uint64_t included_fees  = 0;  // known fees of the admitted prefix
         uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
-            uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
+            if (!budget_gate.admit(packed.get_span().size()))
+                break;
+            uint256     txid     = compute_txid(stx.tx);
             selected_bytes += packed.get_span().size();
+            if (stx.fee_known)
+                included_fees += stx.fee;
             std::string hex_data = HexStr(packed.get_span());
             // wtxid for the witness merkle tree (litecoind GetWitnessHash)
             uint256     wtxid    = compute_wtxid(stx.tx);
@@ -288,6 +298,13 @@ public:
             tx_hashes.push_back(txid);
         }
 
+        // coinbasevalue = block reward + included transaction fees
+        // Matches litecoind's getblocktemplate coinbasevalue field. Without a
+        // budget cut the admitted set is the whole selection and total_fees
+        // is used unchanged (byte-identical pre-G2 path).
+        const uint64_t fees = budget_gate.truncated() ? included_fees : total_fees;
+        uint64_t coinbasevalue = subsidy + fees;
+
         // ── Underfill guard ────────────────────────────────────────────────
         // Do not silently treat a near-empty template as healthy when the
         // mempool held fee-paying backlog that should have filled it. We cannot
@@ -302,11 +319,12 @@ public:
                                   && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
             if (near_empty && has_backlog) {
                 LOG_WARNING << "[EMB-LTC] TemplateBuilder UNDERFILL: selected "
-                            << selected_txs.size() << " tx / " << selected_bytes
+                            << tx_hashes.size() << " tx / " << selected_bytes
                             << "B into template while mempool holds " << pool.size()
                             << " tx / " << mempool_bytes << "B (" << mempool_fees
                             << " sat fees) — near-empty block on a non-empty "
-                            << "mempool; template-fill regression, gates cutover.";
+                            << "mempool; template-fill regression, gates cutover."
+                            << (budget_gate.truncated() ? " (G2 fill-budget cut)" : "");
             }
         }
 
@@ -440,9 +458,11 @@ public:
                  << " version=0x" << std::hex << block_version << std::dec
                  << " prev=" << tip.block_hash.GetHex().substr(0, 16) << "..."
                  << " bits=" << bits_to_hex(next_bits)
-                 << " subsidy=" << subsidy << " fees=" << total_fees
+                 << " subsidy=" << subsidy << " fees=" << fees
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << data["transactions"].size()
+                 << " newtx_bytes=" << budget_gate.spent()
+                 << (budget_gate.truncated() ? " (G2 budget cut)" : "")
                  << " mweb=" << (has_mweb ? "yes" : "no")
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
@@ -450,6 +470,7 @@ public:
         auto t1 = std::chrono::steady_clock::now();
         auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         rpc::WorkData wd{std::move(data), std::move(tx_objects), std::move(tx_hashes), latency_ms};
+        wd.m_newtx_bytes = budget_gate.spent();
         if (refusal) {
             if (refused)
                 *refused = std::move(wd);
@@ -486,11 +507,18 @@ public:
                      << m_chain.height() << ")";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain not synced — waiting for header sync");
         }
+        // G2: one grant per work event (one getwork() == one refresh_work()),
+        // after the lazy block reset when the parent tip moved. Off by
+        // default (LTC_FILL_BUDGET_DEFAULT_ON): no grant, the build is uncut.
+        const bool g2 = m_fill_budget_enabled.load(std::memory_order_relaxed);
+        std::optional<int64_t> grant;
+        if (auto tip = m_chain.tip(); g2 && tip)
+            grant = m_fill_budget.begin_work(tip->block_hash);
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker,
             TemplateBuilder::MAX_BLOCK_WEIGHT - TemplateBuilder::COINBASE_RESERVE, &refused,
-            m_template_tx_check_strict.load(std::memory_order_relaxed));
+            m_template_tx_check_strict.load(std::memory_order_relaxed), grant);
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet,
             // the mempool is not cleaned for the tip yet, or the template fails
@@ -499,14 +527,46 @@ public:
             // which keeps the previous valid template (HOLD) or, with none,
             // serves this one degraded. Without MWEB state its rules name
             // "mweb" and it has no mweb data, so block assembly refuses every
-            // LTC block from it.
+            // LTC block from it. Recorded like a served template so a share
+            // found on it settles its grant.
+            if (g2)
+                m_fill_budget.record(refused->m_hashes, refused->m_newtx_bytes);
             return std::move(*refused);
         }
         if (!result) {
             LOG_WARNING << "[EMB-LTC] EmbeddedCoinNode::getwork() FAILED: no tip (chain empty)";
             throw std::runtime_error("EmbeddedCoinNode::getwork: chain has no tip (not yet synced to genesis)");
         }
+        if (g2)
+            m_fill_budget.record(result->m_hashes, result->m_newtx_bytes);
         return *result;
+    }
+
+    /// G2 settle: a local share was FOUND on the job whose coinbase merkle
+    /// branch is `branch` (ShareCreationParams::merkle_branches). The one
+    /// debit; also advances the ramp. Call for DOA/orphan shares too.
+    /// No-op (0 bytes, bucket untouched) while the budget is off.
+    ParentFillBudget::Settled settle_found_share(const std::vector<uint256>& branch) {
+        if (!m_fill_budget_enabled.load(std::memory_order_relaxed))
+            return {0, false};
+        auto s = m_fill_budget.settle_found(branch);
+        LOG_INFO << "[EMB-LTC] G2 settle: " << s.bytes << "B"
+                 << (s.matched ? "" : " (template not recent, held grant)")
+                 << " cap=" << m_fill_budget.current_cap()
+                 << " ramp=" << m_fill_budget.shares_since_reset()
+                 << " tokens=" << static_cast<int64_t>(m_fill_budget.tokens());
+        return s;
+    }
+
+    const ParentFillBudget& fill_budget() const { return m_fill_budget; }
+
+    /// G2 opt-in. Default LTC_FILL_BUDGET_DEFAULT_ON (off) keeps parity with
+    /// p2pool-merged-v36 #32 (no LTC new-tx cut).
+    void set_fill_budget_enabled(bool on) {
+        m_fill_budget_enabled.store(on, std::memory_order_relaxed);
+    }
+    bool fill_budget_enabled() const {
+        return m_fill_budget_enabled.load(std::memory_order_relaxed);
     }
 
     /// Block relay in embedded mode is handled by CoinBroadcaster via
@@ -560,6 +620,8 @@ private:
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
     std::atomic<bool> m_template_tx_check_strict{true};
+    ParentFillBudget m_fill_budget = ParentFillBudget::ltc();  // G2 LTC bucket
+    std::atomic<bool> m_fill_budget_enabled{LTC_FILL_BUDGET_DEFAULT_ON};
 };
 
 } // namespace coin
