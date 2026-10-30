@@ -300,6 +300,42 @@ TEST(DashMempool, UnrelatedProTxSurvivesBlock)
     EXPECT_EQ(mp.size(), 2u);
 }
 
+// S3 — rule 4 is dashd's removeProTxKeyChangedConflicts(X, hash(newKey)):
+// a pending ProUpServTx carries the NULL validForProTxKey (txmempool.cpp sets
+// it only for ProUpRegTx / ProUpRevTx, :686/:694; txmempool.h:178) and is
+// evicted by any mined ProUpRegTx(X); a pending ProUpRegTx / ProUpRevTx(X)
+// survives a mined ProUpRegTx that leaves the key's bytes unchanged, and is
+// evicted when they change.
+TEST(DashMempool, BlockProUpRegTxKeepsUpdatesValidForAnUnchangedOperatorKey)
+{
+    const std::array<uint8_t, 48> key = seq<48>(0xE5);
+    auto run = [&](const std::array<uint8_t, 48>& held_bytes) {
+        Mempool mp;
+        auto serv = special(2, proupserv(kX, 7), 0x41);
+        auto reg  = special(3, proupreg(kX, 0xE6), 0x42);   // payout/voting change pending
+        auto rev  = special(4, prouprev(kX), 0x43);
+        EXPECT_TRUE(mp.add_tx(serv));
+        EXPECT_TRUE(mp.add_tx(reg));
+        EXPECT_TRUE(mp.add_tx(rev));
+        auto mined_pl = proupreg(kX, 0xE5);                 // carries `key`
+        mp.remove_protx_conflicts_for_block(
+            block_of({special(3, mined_pl, 0x44)}), owners({}),
+            [held_bytes](const uint256& pro) -> std::optional<std::array<uint8_t, 48>> {
+                if (pro == kX) return held_bytes;
+                return std::nullopt;
+            });
+        return std::array<bool, 3>{pooled(mp, serv), pooled(mp, reg), pooled(mp, rev)};
+    };
+    const auto same = run(key);
+    EXPECT_FALSE(same[0]) << "a pending ProUpServTx is evicted by any mined ProUpRegTx (dashd)";
+    EXPECT_TRUE(same[1]) << "the operator key did not change: the pending ProUpRegTx stays";
+    EXPECT_TRUE(same[2]) << "the operator key did not change: the pending ProUpRevTx stays";
+    const auto changed = run(seq<48>(0x70));
+    EXPECT_FALSE(changed[0]);
+    EXPECT_FALSE(changed[1]) << "the key changed: validForProTxKey no longer matches";
+    EXPECT_FALSE(changed[2]);
+}
+
 // S2 — the connected blocks' spent outpoints prove a coin spent: an external
 // collateral spent by one of the last kRecentSpentBlocks blocks is Absent
 // (the template fold then refuses a ProRegTx naming it, bad-protx-collateral),

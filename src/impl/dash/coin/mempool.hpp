@@ -1039,6 +1039,12 @@ public:
     /// nullopt (MnStateMachine::find_by_collateral, read before apply_block).
     using CollateralOwnerFn = std::function<std::optional<uint256>(
         const bitcoin_family::coin::TxPrevOut&)>;
+    /// The operator key a masternode holds in the PRE-block list, as BYTES
+    /// under that masternode's own scheme (legacy iff its nVersion <
+    /// BasicBLS) — what dashd's validForProTxKey hashes. nullopt = unknown MN.
+    using PreBlockOperatorKeyFn =
+        std::function<std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>>(
+            const uint256& protx)>;
 
     /// Phase 3 of block-connect eviction: drop the pending provider txs a
     /// connected block invalidates — dashd CTxMemPool::removeForBlock →
@@ -1066,17 +1072,25 @@ public:
     ///   3. ProUpServTx(X): evicts pool ProRegTx/ProUpServTx with the same
     ///      service, and (Evo) the same platformNodeID / an owner key equal to
     ///      it.
-    ///   4. ProUpRegTx(X): evicts EVERY pool type 2-4 naming X, and pool
-    ///      ProRegTx/ProUpRegTx with the same pubKeyOperator. dashd keeps a
-    ///      pending type-3/4 admitted against the NEW key (validForProTxKey);
-    ///      we do not track that, so the drop is conservative.
+    ///   4. ProUpRegTx(X): removeProTxKeyChangedConflicts(X, hash(newKey))
+    ///      evicts every pool entry naming X whose validForProTxKey differs.
+    ///      dashd sets validForProTxKey only for ProUpRegTx / ProUpRevTx (the
+    ///      MN's key at admission, txmempool.cpp:686,694); a ProUpServTx keeps
+    ///      the null default (txmempool.h:178), so it is evicted by EVERY mined
+    ///      ProUpRegTx(X). A pending ProUpRegTx / ProUpRevTx(X) stays when the
+    ///      key does not change: the pre-block key's bytes under its holder's
+    ///      scheme equal the new key's wire bytes (SerializeHash compares bytes,
+    ///      so a legacy key re-sent in the basic encoding IS a change here).
+    ///      Unknown MN or no `pre_block_operator_key` ⇒ evicted. Also evicts
+    ///      pool ProRegTx/ProUpRegTx with the same pubKeyOperator.
     ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
     /// It also records the block's spent outpoints for prove_chain_coin (S2).
     /// Drop-only: a false eviction costs that tx's fee, never a block.
     /// Returns the number of pool txs evicted.
     size_t remove_protx_conflicts_for_block(
         const dash::coin::BlockType& block,
-        const CollateralOwnerFn& pre_block_collateral_owner)
+        const CollateralOwnerFn& pre_block_collateral_owner,
+        const PreBlockOperatorKeyFn& pre_block_operator_key = {})
     {
         using bitcoin_family::coin::TxPrevOut;
         using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
@@ -1227,7 +1241,18 @@ public:
                 vendor::CProUpRegTx pl;
                 if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
                 evict_opkey_conflicts(pl.pubKeyOperator, mined);
-                evict_updates_of(pl.proTxHash, mined, "operator-key-changed");
+                std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> held;
+                if (pre_block_operator_key) held = pre_block_operator_key(pl.proTxHash);
+                const bool key_changes = !held || *held != pl.pubKeyOperator;
+                for (const auto& p : pro) {
+                    if (p.names_mn != pl.proTxHash) continue;
+                    if (p.type == vendor::CProUpServTx::SPECIALTX_TYPE)
+                        mark(p, mined, "operator-key-update");   // validForProTxKey null
+                    else if ((p.type == vendor::CProUpRegTx::SPECIALTX_TYPE
+                              || p.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
+                             && key_changes)
+                        mark(p, mined, "operator-key-changed");
+                }
             } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
                 // Rule 5 — removeProTxKeyChangedConflicts(null key).
                 vendor::CProUpRevTx pl;

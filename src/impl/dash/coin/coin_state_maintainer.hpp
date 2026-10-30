@@ -1419,13 +1419,26 @@ private:
         // B.8 (dashd removeForBlock -> removeProTxConflicts): evict the pending
         // provider txs this block invalidates — operator key changed/revoked,
         // collateral spent or re-registered, duplicate keys / collateral /
-        // service / platform id. Runs HERE, before apply_block, because the
-        // collateral rules read the PRE-block masternode list. Drop-only.
+        // service / platform id — and record the block's spent outpoints for
+        // the external-collateral proof. Runs HERE, before apply_block,
+        // because the collateral and operator-key rules read the PRE-block
+        // masternode list. Drop-only.
         {
             const MnStateMachine& pre = std::as_const(m_state).mnstates();
             m_state.mempool().remove_protx_conflicts_for_block(
-                block, [&pre](const bitcoin_family::coin::TxPrevOut& op) {
+                block,
+                [&pre](const bitcoin_family::coin::TxPrevOut& op) {
                     return pre.find_by_collateral(op);
+                },
+                // dashd validForProTxKey: the key's bytes under the holder's
+                // own scheme (the store is canonical basic; re-encode).
+                [&pre](const uint256& protx)
+                    -> std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> {
+                    auto it = pre.entries().find(protx);
+                    if (it == pre.entries().end()) return std::nullopt;
+                    return vendor::opkey_for_leaf(
+                        it->second.pubKeyOperator,
+                        it->second.nVersion < vendor::ProTxVersion::BASIC_BLS);
                 });
         }
 
