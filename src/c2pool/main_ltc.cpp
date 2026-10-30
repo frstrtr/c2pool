@@ -7398,6 +7398,17 @@ int main(int argc, char* argv[]) {
                                             break;
                                         }
                                     };
+                                    // The Bootstrap window (the last `keep` blocks of a set far
+                                    // behind) through the lane's block download: one peer that
+                                    // serves every block (NODE_NETWORK) per block, per-request
+                                    // timeouts and reassignment, not every peer for every block.
+                                    host.download_peers = [bcaster_ptr]() {
+                                        return bcaster_ptr->ready_peers(1 /* NODE_NETWORK */);
+                                    };
+                                    host.request_from = [dc, bcaster_ptr](const std::string& peer, uint32_t h) {
+                                        auto e = dc->get_header_by_height(h);
+                                        return e && bcaster_ptr->request_full_block_from(peer, e->block_hash);
+                                    };
                                     host.connected =
                                         [pool = doge_pool.get(), utxo_db = doge_utxo_db.get(),
                                          explorer_enabled, explorer_depth_doge,
@@ -7461,6 +7472,29 @@ int main(int argc, char* argv[]) {
                                     };
                                     doge_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_utxo_cache, *doge_utxo_db, std::move(host));
+                                    // Its download's clock (the Bootstrap): timeouts, the
+                                    // stalling-peer rule and the refill, every second on the
+                                    // io_context, where the lane runs.
+                                    auto acc_tick_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                    auto acc_tick_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                                    *acc_tick_fn = [acc_tick_fn, acc_tick_timer,
+                                                    lane = std::weak_ptr<doge::coin::UtxoLane>(doge_lane)](
+                                                       boost::system::error_code ec) {
+                                        if (ec)
+                                            return;
+                                        acc_tick_timer->expires_after(std::chrono::seconds(1));
+                                        acc_tick_timer->async_wait(*acc_tick_fn);
+                                        auto l = lane.lock();
+                                        if (!l)
+                                            return;
+                                        try {
+                                            l->tick();
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] UTXO lane tick error: " << e.what();
+                                        }
+                                    };
+                                    acc_tick_timer->expires_after(std::chrono::seconds(1));
+                                    acc_tick_timer->async_wait(*acc_tick_fn);
                                 }
 
                                 // The full set's lane (doge::coin::UtxoLane, Mode::Full) on

@@ -695,11 +695,20 @@ private:
         return ltc::coin::ordered_refill(m_fill, [&](uint32_t h) { m_host.request(h, how); });
     }
 
-    // ── Full mode block download ────────────────────────────────────────
+    // ── Block download (full mode; the accrual set's Bootstrap) ──────────
 
+    /// One peer per block, with per-request timeouts, the stalling-peer rule
+    /// and cooldowns: the full set's download, and the accrual set's
+    /// Bootstrap window (the last `keep` blocks of a set far behind). The
+    /// Bootstrap asked every peer for every block before (VERIFY3 N-d): on a
+    /// fresh node 6,700-11,000 bodies a minute, the link full for the hash
+    /// schedule and the IBD beside it. The accrual set's other fills (a gap,
+    /// a reorg) ask one peer already.
     bool downloading() const
     {
-        return m_mode == Mode::Full && m_host.download_peers && m_host.request_from;
+        if (!m_host.download_peers || !m_host.request_from)
+            return false;
+        return m_mode == Mode::Full || (m_fill.active && m_fill.phase == "Bootstrap");
     }
 
     std::chrono::steady_clock::time_point now() const
@@ -849,20 +858,21 @@ private:
     }
 
 public:
-    /// Full mode: the periodic check (main_ltc: every second, on the lane's
-    /// thread). Requests unanswered for REQUEST_TIMEOUT go to other peers; a
-    /// peer holding the window's first block past the stall timeout while
-    /// later blocks wait (the window cannot move) is rotated out and its
-    /// requests reassigned (Core's stalling-peer rule); a stuck height is
-    /// retried after STUCK_RETRY; the window is refilled; the rate updated.
+    /// The periodic check (main_ltc: every second, on the lane's thread).
+    /// While a download runs (full mode; the accrual Bootstrap): requests
+    /// unanswered for REQUEST_TIMEOUT go to other peers; a peer holding the
+    /// window's first block past the stall timeout while later blocks wait
+    /// (the window cannot move) is rotated out and its requests reassigned
+    /// (Core's stalling-peer rule); the window is refilled. Full mode also
+    /// retries a stuck height after STUCK_RETRY and updates the rate.
     void tick()
     {
-        if (m_mode != Mode::Full)
-            return;
         const auto t = now();
-        if (m_stuck)
-            retry_stuck(t);
-        update_rate(t);
+        if (m_mode == Mode::Full) {
+            if (m_stuck)
+                retry_stuck(t);
+            update_rate(t);
+        }
         if (!downloading() || !m_fill.active)
             return;
         sync_download_state();

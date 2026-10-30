@@ -28,7 +28,9 @@
 
 #include <core/coin/utxo_digest.hpp>
 
+#include <map>
 #include <numeric>
+#include <set>
 
 namespace {
 
@@ -715,4 +717,95 @@ TEST(DogeUtxoFull, StuckHeightIsRetried)
     for (const auto& [p, h] : l.net.peer_requests)
         asked6 = asked6 || h == 6;
     EXPECT_TRUE(asked6) << "h=6 fetched again";
+}
+
+// ---------------------------------------------------------------------------
+// The accrual set's Bootstrap through the lane's block download (VERIFY3 N-d):
+// one peer per block, per-request timeouts and reassignment, the ordered fill
+// unchanged. Before, every peer was asked for every block of the window: on a
+// fresh node 6,700-11,000 bodies a minute.
+// ---------------------------------------------------------------------------
+
+// Every height of the Bootstrap window is asked of one peer, once; nothing is
+// broadcast; the set reaches the tip in order.
+TEST(DogeUtxoBootstrap, TheBootstrapAsksOnePeerPerBlockNotEveryPeer)
+{
+    const uint256 g = genesis(0x70);
+    const auto chain = chain_with(g, 30);
+    Lane l(20, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "b");  // cold start: the last 20 below the tip
+    ASSERT_FALSE(l.net.peer_requests.empty()) << "the Bootstrap asked no single peer";
+    EXPECT_TRUE(l.net.asked_how.empty()) << "the Bootstrap broadcast";
+    serve_peers(l, chain);
+    std::map<uint32_t, int> asked;
+    std::set<std::string> peers;
+    for (const auto& [p, h] : l.net.peer_requests) {
+        ++asked[h];
+        peers.insert(p);
+    }
+    for (const auto& [h, n] : asked)
+        EXPECT_EQ(n, 1) << "h=" << h << " asked more than once";
+    EXPECT_EQ(asked.size(), 20u) << "heights 10..29";
+    EXPECT_EQ(peers.size(), 3u) << "spread over the peers";
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast while the Bootstrap ran";
+    EXPECT_EQ(l.t.cache->get_best_height(), 30u);
+}
+
+// A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.
+TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
+{
+    const uint256 g = genesis(0x71);
+    const auto chain = chain_with(g, 30);
+    Lane l(20, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "a");
+    const size_t asked = l.net.peer_requests.size();
+    ASSERT_GT(asked, 0u);
+    l.net.clock += UtxoLane::REQUEST_TIMEOUT + std::chrono::seconds(1);
+    l.lane.tick();
+    EXPECT_EQ(l.lane.stats().request_timeouts.load(), asked);
+    EXPECT_GT(l.net.peer_requests.size(), asked) << "asked again";
+    std::vector<std::pair<std::string, uint32_t>> rest(l.net.peer_requests.begin() + static_cast<long>(asked),
+                                                        l.net.peer_requests.end());
+    l.net.peer_requests = rest;
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 30u);
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast";
+}
+
+// A peer holding the window's first height while the others deliver is
+// rotated out past the stall timeout; its heights go to the other peers and
+// the Bootstrap completes (before: 30 s per height, then a broadcast).
+TEST(DogeUtxoBootstrap, ASlowPeerDoesNotStallTheBootstrap)
+{
+    const uint256 g = genesis(0x72);
+    const auto chain = chain_with(g, 60);
+    Lane l(40, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[59], hash_of(chain[59]), 60, "b");
+    ASSERT_FALSE(l.net.peer_requests.empty());
+    const std::string staller = l.net.peer_requests.front().first;  // asked for the first height
+    ASSERT_EQ(l.net.peer_requests.front().second, 20u);
+    serve_peers(l, chain, staller);
+    EXPECT_EQ(l.t.cache->get_best_height(), 0u) << "h=20 never came";
+    l.net.clock += std::chrono::seconds(3);
+    const size_t before = l.net.peer_requests.size();
+    l.lane.tick();
+    EXPECT_EQ(l.lane.stats().stalls.load(), 1u);
+    ASSERT_GT(l.net.peer_requests.size(), before) << "its requests reassigned";
+    for (size_t i = before; i < l.net.peer_requests.size(); ++i)
+        EXPECT_NE(l.net.peer_requests[i].first, staller);
+    std::vector<std::pair<std::string, uint32_t>> rest(l.net.peer_requests.begin() + static_cast<long>(before),
+                                                        l.net.peer_requests.end());
+    l.net.peer_requests = rest;
+    serve_peers(l, chain, staller);
+    EXPECT_EQ(l.t.cache->get_best_height(), 60u);
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast";
 }
