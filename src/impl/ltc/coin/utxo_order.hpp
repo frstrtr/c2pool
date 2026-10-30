@@ -314,6 +314,23 @@ inline ColdStart cold_start_plan(uint32_t blocks, bool synced, uint32_t tip, uin
     return p;
 }
 
+/// When the cold start may be decided: the header chain is synced (tip age
+/// < 24 h, Core's IsInitialBlockDownload) and caught up: its tip is less
+/// than COLD_START_CAUGHT_UP_AGE_S old, or it has stayed synced for
+/// COLD_START_CAUGHT_UP_WAIT_S (a quiet network). "Synced" alone comes up to
+/// a day of blocks before the header sync ends (live: LTC synced at a tip
+/// 46,016 s old, 314 blocks short); armed there, the next header batch
+/// re-armed the Bootstrap a second later and every request of its first
+/// window was wasted, the peers serving them first.
+constexpr int64_t COLD_START_CAUGHT_UP_AGE_S = 2 * 60 * 60;
+constexpr int64_t COLD_START_CAUGHT_UP_WAIT_S = 60;
+
+inline bool cold_start_ready(bool synced, int64_t tip_age_s, int64_t synced_for_s)
+{
+    return synced
+        && (tip_age_s < COLD_START_CAUGHT_UP_AGE_S || synced_for_s >= COLD_START_CAUGHT_UP_WAIT_S);
+}
+
 /// A running Bootstrap whose next height is more than `blocks` + its window
 /// below the tip (it downloads slower than blocks are found, or the node
 /// was away): the range to arm it again, the tip's last `blocks` heights.

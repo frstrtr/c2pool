@@ -331,3 +331,28 @@ TEST(DogeAccrualColdStart, TheAccrualBufferIsBounded)
     EXPECT_LT(g.buffer.size(), g.window);
     EXPECT_LE(dl2.buffer_bytes(), g.window * MB);
 }
+
+// The cold start is decided on a synced AND caught-up header chain: the
+// first synced tip of the fresh run was 46,016 s old (314 blocks short), and
+// arming there re-armed the Bootstrap a second later. Caught up = tip under
+// 2 h old, or synced for 60 s already (a network without a block for 2 h).
+TEST(LtcColdStart, TheColdStartWaitsForTheCaughtUpChain)
+{
+    EXPECT_FALSE(ltc::coin::cold_start_ready(true, 46016, 0));
+    EXPECT_FALSE(ltc::coin::cold_start_ready(true, 46016, 59));
+    EXPECT_TRUE(ltc::coin::cold_start_ready(true, 46016, 60));
+    EXPECT_TRUE(ltc::coin::cold_start_ready(true, 300, 0));
+    EXPECT_FALSE(ltc::coin::cold_start_ready(false, 300, 600));
+
+    // In the fresh run's sequence: synced at 3,204,000 (46,016 s old), then
+    // the last batch to 3,204,314 (minutes old): one arm, at the real tip.
+    Fill f;
+    const bool ready0 = ltc::coin::cold_start_ready(true, 46016, 0);
+    if (ready0)
+        ASSERT_TRUE(arm_from_plan(f, LTC_COLD_BLOCKS, true, 3204000, 0));
+    ASSERT_TRUE(ltc::coin::cold_start_ready(true, 120, 1));
+    if (!f.active)
+        ASSERT_TRUE(arm_from_plan(f, LTC_COLD_BLOCKS, true, 3204314, 0));
+    EXPECT_FALSE(ltc::coin::cold_start_rearm(f, 3204314, LTC_COLD_BLOCKS).has_value());
+    EXPECT_EQ(f.end_height, 3204314u);
+}

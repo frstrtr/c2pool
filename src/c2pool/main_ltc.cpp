@@ -2565,6 +2565,7 @@ int main(int argc, char* argv[]) {
                 const uint32_t ltc_cold_blocks = 5 * ltc::PoolConfig::share_period()
                     * ltc::PoolConfig::chain_length() / 150;
                 auto ltc_cold_decided = std::make_shared<bool>(false);
+                auto ltc_synced_since = std::make_shared<std::chrono::steady_clock::time_point>();
                 // The Bootstrap's block download: one peer per height
                 // (core/coin/block_download.hpp), NODE_NETWORK peers first.
                 std::shared_ptr<core::coin::BlockDownload> ltc_dl;
@@ -3685,7 +3686,7 @@ int main(int argc, char* argv[]) {
                     auto cold_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                     auto cold_timer = std::make_shared<boost::asio::steady_timer>(ioc);
                     *cold_fn = [cold_fn, cold_timer, ltc_bs, ltc_dl, ltc_cold_decided, ltc_cold_blocks,
-                                ltc_stall_request, utxo_jump_from,
+                                ltc_synced_since, ltc_stall_request, utxo_jump_from,
                                 chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
                                 utxo = ltc_utxo_cache.get(), utxo_db = ltc_utxo_db.get(),
                                 pool = embedded_pool.get(), &ioc](boost::system::error_code ec) {
@@ -3708,7 +3709,20 @@ int main(int argc, char* argv[]) {
                                     [ltc_stall_request](uint32_t h) { (*ltc_stall_request)(h); }, "EMB-LTC");
                             };
                             if (!*ltc_cold_decided) {
-                                if (!chain->is_synced())
+                                // Synced and caught up (cold_start_ready).
+                                const auto now = std::chrono::steady_clock::now();
+                                if (!chain->is_synced()) {
+                                    *ltc_synced_since = {};
+                                    return;
+                                }
+                                if (*ltc_synced_since == std::chrono::steady_clock::time_point{})
+                                    *ltc_synced_since = now;
+                                const auto tip_e = chain->tip();
+                                const int64_t tip_age = tip_e
+                                    ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
+                                const int64_t synced_for = std::chrono::duration_cast<std::chrono::seconds>(
+                                    now - *ltc_synced_since).count();
+                                if (!ltc::coin::cold_start_ready(true, tip_age, synced_for))
                                     return;
                                 *ltc_cold_decided = true;
                                 if (ltc_bs->active) {
@@ -7000,6 +7014,7 @@ int main(int argc, char* argv[]) {
                                 auto doge_bs = std::make_shared<
                                     core::coin::BlockBootstrapState<ltc::coin::BlockType>>();
                                 auto doge_cold_decided = std::make_shared<bool>(false);
+                                auto doge_synced_since = std::make_shared<std::chrono::steady_clock::time_point>();
                                 std::shared_ptr<core::coin::BlockDownload> doge_dl;
                                 {
                                     core::coin::BlockDownload::Host dh;
@@ -7233,7 +7248,7 @@ int main(int argc, char* argv[]) {
                                 {
                                     auto cold_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                     auto cold_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                    *cold_fn = [cold_fn, cold_timer, doge_bs, doge_dl, doge_cold_decided,
+                                    *cold_fn = [cold_fn, cold_timer, doge_bs, doge_dl, doge_cold_decided, doge_synced_since,
                                                 chain = doge_chain.get(), bc = broadcaster.get(),
                                                 utxo = doge_utxo_cache.get(), utxo_db = doge_utxo_db.get(),
                                                 pool = doge_pool.get(), &ioc](boost::system::error_code ec) {
@@ -7258,7 +7273,20 @@ int main(int argc, char* argv[]) {
                                                     "EMB-DOGE");
                                             };
                                             if (!*doge_cold_decided) {
-                                                if (!chain->is_synced())
+                                                // Synced and caught up (cold_start_ready).
+                                                const auto now = std::chrono::steady_clock::now();
+                                                if (!chain->is_synced()) {
+                                                    *doge_synced_since = {};
+                                                    return;
+                                                }
+                                                if (*doge_synced_since == std::chrono::steady_clock::time_point{})
+                                                    *doge_synced_since = now;
+                                                const auto tip_e = chain->tip();
+                                                const int64_t tip_age = tip_e
+                                                    ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
+                                                const int64_t synced_for = std::chrono::duration_cast<std::chrono::seconds>(
+                                                    now - *doge_synced_since).count();
+                                                if (!ltc::coin::cold_start_ready(true, tip_age, synced_for))
                                                     return;
                                                 *doge_cold_decided = true;
                                                 if (doge_bs->active)
