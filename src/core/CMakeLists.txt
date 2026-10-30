@@ -82,7 +82,8 @@ target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
 add_library(core_utxo OBJECT
     crypto/chacha20.hpp crypto/chacha20.cpp
     crypto/muhash.hpp crypto/muhash.cpp
+    coin/coin_compressor.hpp coin/coin_compressor.cpp
 )
-target_link_libraries(core_utxo core)
+target_link_libraries(core_utxo core ${SECP256K1_LIBRARIES})
 
 add_subdirectory(test)

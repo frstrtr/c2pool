@@ -136,6 +136,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         broadcast_convergence_matrix_test.cpp
         chain_test.cpp
         coin_addrman_test.cpp
+        coin_compressor_test.cpp
         coin_registry_symbol_test.cpp
         core_merkle_branches_test.cpp
         dual_family_dial_test.cpp
