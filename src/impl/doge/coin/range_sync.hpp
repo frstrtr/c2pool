@@ -7,8 +7,13 @@
 /// getheaders(locator = {a_i}, stop = a_{i+1}) and stored only when the
 /// answer is exactly it (HashSchedule::store_range): nothing partial is ever
 /// stored, so nothing is ever cut. The window is the lowest WINDOW
-/// undelivered ranges; at most PER_PEER in flight per peer and GLOBAL in
-/// all, a range to one peer at a time; tick() every second.
+/// undelivered ranges; at most PER_PEER in flight per peer, a range to one
+/// peer at a time; tick() every second. In all, at most what the last
+/// minute's delivery rate brings in BUDGET (half the request timeout),
+/// between MIN_INFLIGHT and GLOBAL: an AuxPoW range is ~1.6 MB, and 48 of
+/// them on a link that gives the schedule 0.5 MB/s are minutes of queue, so
+/// every peer would miss its 60 s and take strikes (live, a fresh node
+/// beside a block IBD: 17 strikes in 5 minutes, no peer at fault).
 ///
 /// Answers (on_headers, before the sequential sync and the header chain):
 ///   - the first header's parent is not an anchor (the header chain's
@@ -47,6 +52,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -166,6 +172,7 @@ public:
             return out;
         // The window: the lowest `window` undelivered ranges.
         const uint32_t n = m_anchors.ranges();
+        const size_t budget = inflight_budget_locked(now);
         uint32_t seen = 0;
         for (uint32_t i = m_s.first_undone_range(); i < n && seen < m_cfg.window; ++i) {
             if (m_s.range_done(i))
@@ -173,7 +180,7 @@ public:
             ++seen;
             if (m_inflight.count(i))
                 continue;
-            if (m_inflight.size() >= m_cfg.global)
+            if (m_inflight.size() >= budget)
                 break;
             const std::string p = pick_locked(i, peers, now);
             if (p.empty())
@@ -296,6 +303,7 @@ public:
         uint64_t    short_parses{0};
         uint64_t    bad_parses{0};   // long, broken or wrong-end range answers
         uint64_t    strikes{0};      // timeouts and bad answers held against peers
+        uint32_t    budget{0};       // ranges allowed in flight now
         double      rate_hps{0};  // headers stored per second, last minute
         std::string mode;
     };
@@ -312,6 +320,7 @@ public:
         st.short_parses = m_short_parses;
         st.bad_parses = m_bad_parses;
         st.strikes = m_strikes;
+        st.budget = static_cast<uint32_t>(m_budget);
         size_t recent = 0;
         for (const auto& t : m_stored_at)
             if (now - t <= std::chrono::seconds(60))
@@ -336,6 +345,7 @@ public:
 
 private:
     static constexpr size_t MAX_EXCLUDED = 4096;
+    static constexpr size_t MIN_INFLIGHT = 8;
     static constexpr std::chrono::minutes ALL_EXCLUDED_PATIENCE{5};
 
     struct InFlight {
@@ -452,6 +462,24 @@ private:
         }
     }
 
+    /// How many ranges may be in flight: what the last minute's deliveries
+    /// bring in BUDGET, at least MIN_INFLIGHT (the start, a stalled minute),
+    /// at most GLOBAL.
+    size_t inflight_budget_locked(Clock::time_point now)
+    {
+        while (!m_stored_at.empty() && now - m_stored_at.front() > std::chrono::seconds(60))
+            m_stored_at.pop_front();
+        size_t budget = MIN_INFLIGHT;
+        if (!m_stored_at.empty()) {
+            const double span = std::max(10.0, std::chrono::duration<double>(now - m_stored_at.front()).count());
+            const double per_second = m_stored_at.size() / span;
+            budget = static_cast<size_t>(std::ceil(per_second * std::chrono::duration<double>(budget_time()).count()));
+        }
+        m_budget = std::clamp<size_t>(budget, std::min<size_t>(MIN_INFLIGHT, m_cfg.global), m_cfg.global);
+        return m_budget;
+    }
+    std::chrono::seconds budget_time() const { return m_cfg.request_timeout / 2; }
+
     /// Every connected peer excluded, for ALL_EXCLUDED_PATIENCE (new peers
     /// connect meanwhile): nothing can deliver the ranges.
     void check_all_excluded_locked(const std::vector<std::string>& peers, Clock::time_point now)
@@ -525,6 +553,7 @@ private:
     std::deque<Clock::time_point>   m_stored_at;
     uint64_t                        m_timeouts{0};
     uint64_t                        m_strikes{0};
+    size_t                          m_budget{0};
     Clock::time_point               m_all_excluded_since{};
     uint64_t                        m_short_parses{0};
     uint64_t                        m_bad_parses{0};

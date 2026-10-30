@@ -17,16 +17,19 @@
 //   - UnsolicitedWrongEndAnswersCannotRefuseTheAnchors,
 //     AWrongAnchorWithTwoPeersStillFallsBack, InFlightNeverExceedsGlobalUnderManyPeers
 //     (VERIFY5)
+//   - ALimitedLinkStrikesNoPeer (the in-flight budget follows the delivery rate)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -539,12 +542,15 @@ TEST(DogeRangeSync, ResumesFromTheBitmap)
     std::vector<std::string> peers;
     for (int i = 0; i < 4; ++i)
         peers.push_back("p" + std::to_string(i));
-    const auto reqs = rs.tick(peers, t0());
-    EXPECT_EQ(reqs.size(), 10u);
-    for (const auto& r : reqs)
-        EXPECT_EQ(r.range % 2, 1u) << "a stored range asked again";
-    for (const auto& r : reqs)
-        rs.on_headers(r.peer, c.answer(r.locator, r.stop), t0());
+    std::set<uint32_t> asked;
+    for (int round = 0; round < 10 && rs.mode() == Mode::Anchored; ++round) {
+        for (const auto& r : rs.tick(peers, t0() + std::chrono::seconds(round))) {
+            EXPECT_EQ(r.range % 2, 1u) << "a stored range asked again";
+            asked.insert(r.range);
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t0());
+        }
+    }
+    EXPECT_EQ(asked.size(), 10u) << "the ten missing ranges, each once";
     EXPECT_TRUE(sched->complete());
 }
 
@@ -888,4 +894,40 @@ TEST(DogeRangeSync, InFlightNeverExceedsGlobalUnderManyPeers)
     EXPECT_LE(rs.stats(t).inflight, 48u);
     for (const auto& p : peers)
         EXPECT_LE(rs.inflight_of(p), 8u);
+}
+
+// The live fresh-node run beside a block IBD: the schedule's share of the
+// link was ~0.5 MB/s, an AuxPoW range ~1.6 MB, and 48 ranges in flight were
+// minutes of queue: every honest peer missed its 60 s and took strikes (17
+// in 5 minutes). Eighteen honest peers behind one link that delivers a range
+// every 4 s, in order: the in-flight budget follows the delivery rate, no
+// peer is struck or excluded, and the schedule completes.
+TEST(DogeRangeSync, ALimitedLinkStrikesNoPeer)
+{
+    constexpr uint32_t CP = 100 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync rs(*sched, c.anchors(CP));
+    std::vector<std::string> peers;
+    for (int i = 0; i < 18; ++i)
+        peers.push_back("p" + std::to_string(i));
+    std::deque<RangeSync::Request> link;  // answered in the order asked, one every 4 s
+    auto t = t0();
+    int sec = 0;
+    for (; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t))
+            link.push_back(r);
+        if (sec % 4 == 3 && !link.empty()) {
+            const auto r = link.front();
+            link.pop_front();
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        }
+    }
+    const auto st = rs.stats(t);
+    EXPECT_EQ(st.strikes, 0u) << "honest peers struck because our own link was full (" << st.timeouts
+                              << " range timeouts)";
+    EXPECT_EQ(st.excluded, 0u);
+    EXPECT_EQ(rs.mode(), Mode::Complete) << "ranges_done=" << st.ranges_done << " after " << sec << " s";
 }

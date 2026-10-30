@@ -7730,6 +7730,7 @@ int main(int argc, char* argv[]) {
                                                         d["schedule"]["short_parses"] = rs.short_parses;
                                                         d["schedule"]["bad_parses"] = rs.bad_parses;
                                                         d["schedule"]["strikes"] = rs.strikes;
+                                                        d["schedule"]["budget"] = rs.budget;
                                                         d["schedule"]["rate_hps"] = rs.rate_hps;
                                                     }
                                                 }
