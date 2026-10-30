@@ -149,6 +149,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
         listener_family_test.cpp
+        muhash_chacha20_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
         pack_test.cpp
@@ -175,6 +176,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     )
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
+    target_link_libraries(core_test PRIVATE core_utxo)  # UTXO snapshot KATs (coin_compressor, muhash_chacha20, utxo_*)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
 
     include(GoogleTest)

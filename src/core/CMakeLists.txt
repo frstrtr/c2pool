@@ -74,4 +74,15 @@ target_link_libraries(core PUBLIC Boost::headers Boost::exception Boost::log Boo
 # Add LevelDB include directories
 target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
 
+# UTXO snapshots (DASH full UTXO set, PR S1): MuHash3072 + ChaCha20 and the
+# compressor / Coin codec ported from Dash Core v23.1.7 (crypto/VENDOR.md),
+# the dumptxoutset reader / writer / pin / import / dump, and the set hashes
+# over a UTXOViewDB. Its own OBJECT library: only the targets that name it
+# link it (core_test, c2pool-utxo), so no node binary changes in this PR.
+add_library(core_utxo OBJECT
+    crypto/chacha20.hpp crypto/chacha20.cpp
+    crypto/muhash.hpp crypto/muhash.cpp
+)
+target_link_libraries(core_utxo core)
+
 add_subdirectory(test)
