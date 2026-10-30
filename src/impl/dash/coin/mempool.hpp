@@ -250,12 +250,25 @@ public:
     /// it started, so a miss there proves nothing; the at-tip full-history fold
     /// (fold_active: wired AND at the tip) is authoritative both ways.
     ///   Unspent — the coin exists unspent; `out` holds it.
-    ///   Absent  — the at-tip fold proves no such unspent coin exists.
+    ///   Absent  — a block among the last kRecentSpentBlocks connected spent
+    ///             it, or the at-tip fold proves no such unspent coin exists.
     ///   Unknown — neither source can decide (forward-view miss, no live fold).
     enum class CoinProof : uint8_t { Unknown, Unspent, Absent };
+    /// How many connected blocks' spent outpoints prove_chain_coin remembers
+    /// (recorded by remove_protx_conflicts_for_block), and the hard cap on
+    /// outpoints held — the oldest blocks leave first. ~100 blocks is ~4 hours
+    /// of mainnet: a ProRegTx relayed later than that by a lagging peer is
+    /// not covered (see IMPL-NOTES S2).
+    static constexpr size_t kRecentSpentBlocks       = 100;
+    static constexpr size_t kRecentSpentMaxOutpoints = 200'000;
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
     {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_recent_chain_spends.count({op.txid, op.index}))
+                return CoinProof::Absent;
+        }
         if (auto* utxo = m_utxo.load()) {
             ::core::coin::Coin c;
             if (utxo->get_coin(op, c) && !c.is_spent()) { out = c; return CoinProof::Unspent; }
@@ -1058,6 +1071,7 @@ public:
     ///      pending type-3/4 admitted against the NEW key (validForProTxKey);
     ///      we do not track that, so the drop is conservative.
     ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
+    /// It also records the block's spent outpoints for prove_chain_coin (S2).
     /// Drop-only: a false eviction costs that tx's fee, never a block.
     /// Returns the number of pool txs evicted.
     size_t remove_protx_conflicts_for_block(
@@ -1079,6 +1093,7 @@ public:
         };
 
         std::lock_guard<std::mutex> lock(m_mutex);
+        record_chain_spends_locked(block);
 
         // Index the pool's provider txs once (special txs are rare).
         struct PoolProTx {
@@ -2545,6 +2560,34 @@ private:
     void evict_one_locked(const uint256& txid)
     {
         remove_tx_locked(txid);
+    }
+
+    // S2: outpoints spent by the last kRecentSpentBlocks connected blocks
+    // (count per outpoint so a reorg re-spend never drops protection early).
+    std::map<std::pair<uint256, uint32_t>, uint32_t>        m_recent_chain_spends;
+    std::deque<std::vector<std::pair<uint256, uint32_t>>>  m_recent_chain_spend_blocks;
+    size_t                                                 m_recent_chain_spend_count{0};
+
+    void record_chain_spends_locked(const dash::coin::BlockType& block)
+    {
+        std::vector<std::pair<uint256, uint32_t>> spent;
+        for (size_t i = 1; i < block.m_txs.size(); ++i)   // the coinbase spends nothing
+            for (const auto& in : block.m_txs[i].vin)
+                spent.emplace_back(in.prevout.hash, in.prevout.index);
+        for (const auto& op : spent) ++m_recent_chain_spends[op];
+        m_recent_chain_spend_count += spent.size();
+        m_recent_chain_spend_blocks.push_back(std::move(spent));
+        while (!m_recent_chain_spend_blocks.empty()
+               && (m_recent_chain_spend_blocks.size() > kRecentSpentBlocks
+                   || m_recent_chain_spend_count > kRecentSpentMaxOutpoints)) {
+            for (const auto& op : m_recent_chain_spend_blocks.front()) {
+                auto it = m_recent_chain_spends.find(op);
+                if (it != m_recent_chain_spends.end() && --it->second == 0)
+                    m_recent_chain_spends.erase(it);
+            }
+            m_recent_chain_spend_count -= m_recent_chain_spend_blocks.front().size();
+            m_recent_chain_spend_blocks.pop_front();
+        }
     }
 
     void remove_tx_locked(const uint256& txid)

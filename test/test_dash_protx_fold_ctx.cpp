@@ -397,6 +397,45 @@ TEST(DashSupersetSpecialTx, ExternalCollateralNotInUtxoViewIsRefused)
     EXPECT_EQ(with(P::Unknown, 0).applied, 1u) << "no proof, no refusal";
 }
 
+// S2: through the production context (make_template_fold_context): a
+// ProRegTx whose external collateral a recently connected block spent is
+// refused — the mempool's recent-spent proof answers Absent even though the
+// forward UTXO view cannot (it never held the old coin).
+TEST(DashSupersetSpecialTx, ExternalCollateralSpentByARecentBlockIsRefused)
+{
+    World w({make_mn(1)});
+    Mempool mp;
+    auto reg = proreg(1);
+    auto regtx = special(1, reg, 0x01);
+    const auto verifier = accept_all();
+    auto fold_now = [&] {
+        return fold(w, {regtx}, dash::coin::make_template_fold_context(w.sm, mp, &verifier));
+    };
+    EXPECT_EQ(fold_now().applied, 1u) << "nothing proves the collateral spent yet";
+
+    MutableTransaction spend;
+    spend.version = 2;
+    bitcoin_family::coin::TxIn in;
+    in.prevout = reg.collateralOutpoint; in.sequence = 0xFFFFFFFFu;
+    spend.vin.push_back(in);
+    bitcoin_family::coin::TxOut o; o.value = 5; o.scriptPubKey.m_data = {0x51};
+    spend.vout.push_back(o);
+    dash::coin::BlockType blk;
+    MutableTransaction cb; cb.version = 3; cb.type = 5;
+    bitcoin_family::coin::TxIn cin;
+    cin.prevout.hash.SetNull(); cin.prevout.index = 0xFFFFFFFFu; cin.sequence = 0xFFFFFFFFu;
+    cb.vin.push_back(cin);
+    blk.m_txs = {cb, spend};
+    mp.remove_protx_conflicts_for_block(
+        blk, [](const TxPrevOut&) { return std::optional<uint256>{}; });
+
+    const auto f = fold_now();
+    EXPECT_TRUE(refused(f, regtx)) << "dashd: bad-protx-collateral";
+    ASSERT_FALSE(f.refused_reasons.empty());
+    EXPECT_NE(f.refused_reasons.front().find("bad-protx-collateral"), std::string::npos)
+        << f.refused_reasons.front();
+}
+
 // B8: an ExtAddr (nVersion 3, DEPLOYMENT_V24) payload is refused by name even
 // when the fixed-layout parse happens to succeed.
 TEST(DashSupersetSpecialTx, ExtAddrPayloadIsRefusedByName)

@@ -299,3 +299,33 @@ TEST(DashMempool, UnrelatedProTxSurvivesBlock)
     EXPECT_TRUE(pooled(mp, reg_other));
     EXPECT_EQ(mp.size(), 2u);
 }
+
+// S2 — the connected blocks' spent outpoints prove a coin spent: an external
+// collateral spent by one of the last kRecentSpentBlocks blocks is Absent
+// (the template fold then refuses a ProRegTx naming it, bad-protx-collateral),
+// an untouched outpoint stays Unknown, and the proof ages out.
+TEST(DashMempool, RecentlySpentOutpointsAreProvenAbsent)
+{
+    Mempool mp;
+    const TxPrevOut c = outpoint(0xD7);
+    MutableTransaction spend;
+    spend.version = 2;
+    bitcoin_family::coin::TxIn in;
+    in.prevout = c; in.sequence = 0xFFFFFFFFu;
+    spend.vin.push_back(in);
+    bitcoin_family::coin::TxOut out; out.value = 5; out.scriptPubKey.m_data = {0x51};
+    spend.vout.push_back(out);
+    mp.remove_protx_conflicts_for_block(block_of({spend}), owners({}));
+
+    ::core::coin::Coin coin;
+    EXPECT_EQ(mp.prove_chain_coin(::core::coin::Outpoint(c.hash, c.index), coin),
+              Mempool::CoinProof::Absent);
+    const TxPrevOut other = outpoint(0xD8);
+    EXPECT_EQ(mp.prove_chain_coin(::core::coin::Outpoint(other.hash, other.index), coin),
+              Mempool::CoinProof::Unknown);
+
+    for (size_t i = 0; i < Mempool::kRecentSpentBlocks; ++i)
+        mp.remove_protx_conflicts_for_block(block_of({}), owners({}));
+    EXPECT_EQ(mp.prove_chain_coin(::core::coin::Outpoint(c.hash, c.index), coin),
+              Mempool::CoinProof::Unknown) << "the proof covers the last kRecentSpentBlocks blocks";
+}
