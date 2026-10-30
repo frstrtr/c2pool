@@ -99,7 +99,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_phase0_live PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_header_chain test_header_chain.cpp)
+    add_executable(test_header_chain test_header_chain.cpp test_ltc_header_sync.cpp)
     target_link_libraries(test_header_chain PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc

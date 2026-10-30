@@ -2475,6 +2475,7 @@ int main(int argc, char* argv[]) {
                     };
                     hs.locator = [chain]() { return chain->get_locator(); };
                     hs.synced = [chain]() { return chain->is_synced(); };
+                    hs.height = [chain]() { return chain->height(); };
                     hs.ask_one = [bcaster](const std::vector<uint256>& locator, size_t rr, const std::string& peer) {
                         return bcaster->request_headers_targeted(locator, uint256::ZERO, rr, peer);
                     };
