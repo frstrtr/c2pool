@@ -611,9 +611,12 @@ TEST(DashPoseOracleFeeder, RefusedBodyNeverReachesTheQuorumLane)
     EXPECT_EQ(ch.eng.height(), 100u);
     EXPECT_FALSE(ch.eng.poisoned());
     EXPECT_EQ(ch.feeder->stats().refused_unchanged, 1u);
+    EXPECT_EQ(ch.feeder->refused_unchanged_count(), 1u);
     EXPECT_EQ(ch.br.stats().blocks_observed, observed0)
         << "the refused body reached the quorum lane";
     EXPECT_EQ(ch.qeng.height(), qh0);
+    EXPECT_NE(ch.feeder->status_line().find("refused_unchanged=1"), std::string::npos)
+        << ch.feeder->status_line();
 
     // The best chain moves to the valid sibling: it folds, and the quorum
     // lane observes exactly that block.

@@ -1699,6 +1699,7 @@ TEST(DashReplayFoldSynthetic, RefusedBlockNeverReachesThePreFoldCompanions)
     EXPECT_FALSE(consumer.on_replay_block(
         101, raw256(0xB3), make_block(101, raw256(0x77), root, {}, &eng)));
     EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 2u);
+    EXPECT_EQ(consumer.refused_unchanged_count(), 2u);
     EXPECT_TRUE(observed.empty()) << "a refused block reached a companion";
     EXPECT_EQ(companion, 100u);
 
@@ -1709,6 +1710,8 @@ TEST(DashReplayFoldSynthetic, RefusedBlockNeverReachesThePreFoldCompanions)
     EXPECT_EQ(consumer.stats().quorum_lane_refusals, 0u)
         << consumer.stats().first_quorum_refusal;
     EXPECT_EQ(eng.height(), 101u);
+    EXPECT_NE(consumer.summary().find("refused_unchanged=2"), std::string::npos)
+        << consumer.summary();
 }
 
 // A6: an unknown special type post-DIP3 is bad-txns-type.

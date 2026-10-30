@@ -48,6 +48,7 @@
 
 #include <core/log.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -315,6 +316,7 @@ public:
                      << " ban=" << m_stats.banned
                      << " punish=" << m_stats.punished
                      << " spent=" << m_stats.collateral_spent
+                     << " refused-unchanged=" << m_stats.blocks_refused_unchanged
                      << " (" << secs << "s, "
                      << (secs > 0
                             ? static_cast<double>(m_stats.blocks_folded) / secs
@@ -325,6 +327,12 @@ public:
     }
 
     const FoldConsumerStats& stats() const { return m_stats; }
+    /// blocks_refused_unchanged, readable from any thread (the status
+    /// endpoints run off the lane's thread).
+    uint64_t refused_unchanged_count() const
+    {
+        return m_refused_unchanged_count.value.load(std::memory_order_relaxed);
+    }
     const DmlFoldEngine&     engine() const { return m_engine; }
 
     uint64_t elapsed_seconds() const
@@ -357,6 +365,8 @@ public:
             s += " quorum_lane_refusals="
                + std::to_string(m_stats.quorum_lane_refusals)
                + " first_at=" + std::to_string(m_stats.first_quorum_refusal_height);
+        s += " refused_unchanged="
+           + std::to_string(m_stats.blocks_refused_unchanged);
         if (m_stats.diverged)
             s += " DIVERGED_AT=" + std::to_string(m_stats.divergence_height)
                + " computed=" + m_stats.computed_root
@@ -377,6 +387,8 @@ private:
     {
         ++m_stats.blocks_refused_unchanged;
         m_stats.last_refused_unchanged = why;
+        m_refused_unchanged_count.value.store(m_stats.blocks_refused_unchanged,
+                                              std::memory_order_relaxed);
         LOG_WARNING << "[REPLAY-FOLD] h=" << height << " block "
                     << hash.GetHex().substr(0, 16)
                     << " refused, state unchanged (refused_unchanged="
@@ -394,6 +406,15 @@ private:
     uint32_t          m_progress_every;
     FoldConsumerStats m_stats;
     std::chrono::steady_clock::time_point m_started;
+    // Read by the status endpoints off the lane's thread. Movable (owners move
+    // the consumer into place), which a bare std::atomic member is not.
+    struct CrossThreadCount {
+        std::atomic<uint64_t> value{0};
+        CrossThreadCount() = default;
+        CrossThreadCount(CrossThreadCount&& o) noexcept
+            : value(o.value.load(std::memory_order_relaxed)) {}
+    };
+    CrossThreadCount m_refused_unchanged_count;
 };
 
 /// ── THE LAST MILE: live tip blocks finish what the bulk lane started ──────

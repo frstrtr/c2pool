@@ -97,6 +97,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -272,6 +273,12 @@ public:
         return p;
     }
     const Stats& stats() const { return m_stats; }
+    /// stats().refused_unchanged, readable from any thread (the status
+    /// endpoints run off the oracle's io thread).
+    uint64_t refused_unchanged_count() const
+    {
+        return m_refused_unchanged_count.load(std::memory_order_relaxed);
+    }
     bool bootstrap_complete() const { return m_boot.active && m_boot.complete; }
     bool hashes_ready() const { return m_boot.hashes_ready; }
     size_t buffered() const { return m_buf.size(); }
@@ -397,6 +404,7 @@ public:
         s += " h=" + std::to_string(seeded() ? m_eng.height() : 0);
         s += " tip=" + std::to_string(tip);
         s += " poisoned=" + std::to_string(m_eng.poisoned() ? 1 : 0);
+        s += " refused_unchanged=" + std::to_string(m_stats.refused_unchanged);
         s += " folded=" + std::to_string(m_stats.folded);
         s += " root_mismatch=" + std::to_string(m_stats.root_mismatches);
         s += " root_resolved=" + std::to_string(m_stats.root_resolved_bans)
@@ -478,6 +486,7 @@ private:
     bool     m_post_scheduled{false};
     Boot     m_boot;
     Stats    m_stats;
+    std::atomic<uint64_t> m_refused_unchanged_count{0};
 
     uint64_t now() const { return m_io.now_ms ? m_io.now_ms() : 0; }
 
@@ -637,6 +646,8 @@ private:
     {
         ++m_stats.refused_unchanged;
         m_stats.last_refused_unchanged = why;
+        m_refused_unchanged_count.store(m_stats.refused_unchanged,
+                                        std::memory_order_relaxed);
         LOG_WARNING << "[POSE-ORACLE] body h=" << h
                     << " refused, state unchanged (refused_unchanged="
                     << m_stats.refused_unchanged << ") — " << why;

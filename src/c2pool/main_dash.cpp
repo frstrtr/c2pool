@@ -5298,6 +5298,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // serve path is wired; null => no oracle => fail closed).
     std::unique_ptr<dash::coin::replay::PoseOracleFeeder>      pose_oracle;
     std::unique_ptr<core::Timer>                               pose_oracle_timer;
+    // The DML fold lanes' refused-unchanged counters (a block the fold refuses
+    // with its state unchanged: another chain, or one dashd rejects) for
+    // [EMBED-STATUS] and /local_stats. Both lanes are created after the web
+    // server's HTTP thread starts, so they are published to it through these
+    // atomics; web_server is reset before either lane unwinds.
+    struct DmlFoldLanes {
+        std::atomic<const dash::coin::replay::PoseOracleFeeder*>   oracle{nullptr};
+        std::atomic<const dash::coin::replay::FoldReplayConsumer*> replay{nullptr};
+        uint64_t oracle_refused_unchanged() const {
+            const auto* o = oracle.load(std::memory_order_acquire);
+            return o ? o->refused_unchanged_count() : 0;
+        }
+        uint64_t replay_refused_unchanged() const {
+            const auto* r = replay.load(std::memory_order_acquire);
+            return r ? r->refused_unchanged_count() : 0;
+        }
+    };
+    const auto dml_lanes = std::make_shared<DmlFoldLanes>();
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -5681,7 +5699,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // as the topology hook directly above: web_server is reset() after
             // ioc.run() returns, BEFORE header_chain / coin_p2p unwind.
             web_server->get_mining_interface()->set_coin_sync_status_fn(
-                [hc = header_chain.get(), cp = coin_p2p.get()]() -> nlohmann::json {
+                [hc = header_chain.get(), cp = coin_p2p.get(),
+                 lanes = dml_lanes]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -5733,6 +5752,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // connected_peers check (it already looks for this key).
                         s["connected_peers"] = connected;
                     }
+                    // DML fold lanes: blocks refused with the fold state
+                    // unchanged (core passes s["dml_fold"] through).
+                    s["dml_fold"] = {
+                        {"oracle_refused_unchanged", lanes->oracle_refused_unchanged()},
+                        {"replay_refused_unchanged", lanes->replay_refused_unchanged()},
+                    };
                     return s;
                 });
         }
@@ -9113,6 +9138,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         pose_oracle = std::make_unique<rp::PoseOracleFeeder>(
                             *mn_bridge_fold_engine, *mn_bridge_quorum_engine,
                             *mn_bridge_quorum_bridge, pcfg, std::move(pio));
+                        dml_lanes->oracle.store(pose_oracle.get(),
+                                                std::memory_order_release);
                         auto* po = pose_oracle.get();
                         mn_ckpt_lane->set_on_anchor_snapshot(
                             [po](const dash::coin::vendor::CSimplifiedMNList& asml,
@@ -9355,6 +9382,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 replay_fold_consumer =
                     std::make_unique<rp::FoldReplayConsumer>(
                         *replay_fold_engine);
+                dml_lanes->replay.store(replay_fold_consumer.get(),
+                                        std::memory_order_release);
                 replay_consumer = replay_fold_consumer.get();
                 std::cout << "[run] W5 REPLAY FOLD ARMED: anchor h="
                           << ps.height << " mns=" << replay_fold_engine->size()
@@ -10805,6 +10834,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
+                      dml_lanes,
                       &header_chain, &mn_ckpt_lane,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
@@ -10904,6 +10934,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << " bridge_wait="
                         << (mn_ckpt_lane ? mn_ckpt_lane->waiting_for()
                                          : std::string("n/a"))
+                        // DML fold lanes: blocks refused with the fold state
+                        // unchanged (PoSe oracle / W5 replay consumer). Not a
+                        // divergence, but a count that keeps climbing means a
+                        // lane is stuck behind a block it will never fold.
+                        << " dml_refused_unchanged="
+                        << dml_lanes->oracle_refused_unchanged() << "/"
+                        << dml_lanes->replay_refused_unchanged()
                         << " hdr_tip=" << (header_chain ? header_chain->height() : 0)
                         // E-SUPERBLOCK govsync store status (grep-provable on the
                         // observe-only soak): triggers held / weighted funding
