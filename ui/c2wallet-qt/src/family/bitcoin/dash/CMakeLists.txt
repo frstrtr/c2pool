@@ -101,6 +101,9 @@ if(C2WALLET_QT_BUILD_TESTS OR _dash_standalone)
     # signer first on the link line (matches the proven link order).
     target_link_libraries(c2wallet-dash-test PRIVATE c2wallet-dash-tx c2wallet-dash-common
                           c2wallet-artifact)
+    # Slice-2 KATs read the real (public) getaddressutxos fixture from disk.
+    target_compile_definitions(c2wallet-dash-test PRIVATE
+        C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME dash_kats COMMAND c2wallet-dash-test)
 
     # The "drive the proven Python as the oracle" leg: proto_hash_oracle.py (the

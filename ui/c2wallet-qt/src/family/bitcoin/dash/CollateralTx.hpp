@@ -64,6 +64,9 @@ struct Utxo {
     // true or nullopt (unknown, treated as coinbase) => max(min_confirmations,
     // kCoinbaseMaturity) confirmations; false => one confirmation is enough.
     std::optional<bool> coinbase = std::nullopt;
+    // Block height that created the output; 0 = unknown. The target-height
+    // re-screen (rescreen_at_height) projects confirmations from it.
+    int64_t height = 0;
 };
 
 struct CollateralPlan {

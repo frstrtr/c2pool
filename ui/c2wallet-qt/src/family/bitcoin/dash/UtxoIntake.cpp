@@ -209,3 +209,34 @@ std::string describe_skipped(const UtxoScreen& screen, int64_t min_confirmations
 }
 
 } // namespace c2w::dash
+
+// ── Slice 2 intake (RED stubs: slice-1 behaviour, insight only) ─────────────
+namespace c2w::dash {
+
+const char* utxo_source_name(UtxoSource s)
+{
+    return s == UtxoSource::ExportV1 ? "export v1" : s == UtxoSource::GetAddressUtxos ? "getaddressutxos" : "insight";
+}
+
+UtxoImport parse_utxo_json(const std::string& json, int64_t tip_height, bool testnet)
+{
+    (void)tip_height;
+    std::string err;
+    UtxoImport out;
+    out.testnet = testnet;
+    out.utxos = parse_insight_utxos(json, err);
+    if (!err.empty()) throw DashAbort(err);
+    return out;
+}
+
+UtxoImport parse_getaddressutxos(const std::string& json, int64_t tip_height, bool testnet)
+{
+    return parse_utxo_json(json, tip_height, testnet);
+}
+
+UtxoImport parse_utxo_export_v1(const std::string& json, bool testnet)
+{
+    return parse_utxo_json(json, 0, testnet);
+}
+
+} // namespace c2w::dash

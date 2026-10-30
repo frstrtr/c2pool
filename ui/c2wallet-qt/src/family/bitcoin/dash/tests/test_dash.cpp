@@ -33,7 +33,9 @@
 #include "inject_vectors.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -913,6 +915,127 @@ static void test_utxo_intake()
     CHECK(parse_insight_utxos("[1,", err).empty() && !err.empty(), "broken JSON aborts");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Slice 2 — PageDashInject's std-only model (DashInjectModel), the intake
+// formats an operator actually produces, the target-height re-screen, the
+// relay fee mode and the manifest. KATs S2-K1..K12 of the slice-2 design.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef C2W_DASH_FIXTURE_DIR
+#error "C2W_DASH_FIXTURE_DIR must point at tests/fixtures"
+#endif
+
+// The real XdgF UTXO set (dashd getaddressutxos on the tertiary at tip 2563986;
+// public data): 170 rows, 60963705 duffs, 42 of them 1-duff spam.
+static const char* kFixtureName = "xdgf-getaddressutxos-tip2563986.json";
+static const int64_t kFixtureTip = 2563986;
+
+static std::string read_fixture(const char* name)
+{
+    const std::string path = std::string(C2W_DASH_FIXTURE_DIR) + "/" + name;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+// Run `fn`, reporting a DashAbort as a failed check instead of ending the suite.
+template <typename F>
+static bool runs(F&& fn, const char* what)
+{
+    try { fn(); return true; }
+    catch (const DashAbort& e) { std::printf("    (%s aborted: %s)\n", what, e.what()); return false; }
+    catch (const std::exception& e) { std::printf("    (%s threw: %s)\n", what, e.what()); return false; }
+}
+
+static void test_s2_k2_getaddressutxos_fixture()
+{
+    std::printf("[S2-K2 dashd getaddressutxos intake on the real 170-row fixture]\n");
+    const std::string json = read_fixture(kFixtureName);
+    CHECK(json.size() > 40000, "fixture readable");
+
+    UtxoImport imp;
+    const bool parsed = runs([&] { imp = parse_utxo_json(json, kFixtureTip, false); }, "parse_utxo_json");
+    CHECK(parsed, "the dashd getaddressutxos shape parses");
+    CHECK(imp.source == UtxoSource::GetAddressUtxos, "auto-detected as getaddressutxos");
+    CHECK(imp.utxos.size() == 170, "170 rows");
+    CHECK(imp.total == 60963705, "sum 60963705 duffs");
+    CHECK(imp.address == testvec::kDonationAddress, "funding address derived from the scripts: XdgF...");
+    CHECK(imp.tip_height == kFixtureTip && !imp.coinbase_flags, "tip 2563986, no coinbase flags");
+    bool unknown_cb = true, conf_ok = true, spk_ok = true;
+    int64_t hmin = INT64_MAX, hmax = 0;
+    for (const Utxo& u : imp.utxos) {
+        unknown_cb = unknown_cb && !u.coinbase.has_value();
+        conf_ok = conf_ok && u.confirmations == kFixtureTip - u.height + 1;
+        spk_ok = spk_ok && u.script_pubkey_hex == testvec::kDonationSpk;
+        hmin = std::min(hmin, u.height);
+        hmax = std::max(hmax, u.height);
+    }
+    CHECK(unknown_cb, "every row: coinbase unknown (held to the coinbase rule)");
+    CHECK(conf_ok, "every row: confirmations = tip - height + 1");
+    CHECK(spk_ok, "every row: script = the XdgF P2PKH");
+    CHECK(hmin == 2527503 && hmax == 2563881, "heights 2527503 .. 2563881");
+    CHECK(!imp.utxos.empty() && imp.utxos[0].txid == "665710f4833e0d3b4c2ce93b971e5fe04315fe244d3c53c926db511a8dde1b9b" &&
+              imp.utxos[0].vout == 7 && imp.utxos[0].satoshis == 36490 && imp.utxos[0].confirmations == 36484,
+          "row 0: 665710f4...:7, 36490 duffs, 36484 conf (outputIndex -> vout)");
+
+    UtxoImport direct;
+    CHECK(runs([&] { direct = parse_getaddressutxos(json, kFixtureTip, false); }, "parse_getaddressutxos") &&
+              direct.utxos.size() == 170 && direct.total == imp.total,
+          "parse_getaddressutxos == the auto-detected import");
+
+    // The slice-1 insight parser alone cannot read this shape (why slice 2 adds it).
+    std::string err;
+    CHECK(parse_insight_utxos(json, err).empty() && contains(err, "vout"),
+          "parse_insight_utxos still refuses the dashd shape (no vout field)");
+
+    if (imp.utxos.size() == 170) {
+        UtxoScreen scr = screen_utxos(imp.utxos, addr_to_h160(testvec::kDonationAddress, false), kDefaultMinConf, 2, true);
+        CHECK(scr.spendable.size() == 128 && scr.immature.empty() && scr.dust.size() == 42,
+              "screen at the tip, dust_floor 2: 128 spendable / 0 immature / 42 dust");
+        SweepRequest sw;
+        sw.funding_address = testvec::kDonationAddress;
+        sw.utxos = imp.utxos;
+        sw.dust_floor = 2;
+        sw.key_encoding = PubkeyEncoding::Compressed;
+        SweepBatchPlan sp;
+        CHECK(runs([&] { sp = plan_sweep(sw); }, "plan_sweep") && sp.txs.size() == 1 &&
+                  sp.txs[0].inputs.size() == 128 && sp.txs[0].est_signed_bytes <= 19116 &&
+                  sp.total_in == 60963663,
+              "plan: one tx, 128 inputs, 60963663 duffs, est signed <= 19116 B");
+    }
+
+    // Refusals.
+    CHECK(aborts([&] { parse_getaddressutxos(json, 0, false); }), "bare array without a tip aborts");
+    CHECK(aborts_with([&] { parse_getaddressutxos(json, 2563880, false); }, "above the tip"),
+          "a tip below the youngest row (2563881) aborts");
+    CHECK(aborts([&] { parse_getaddressutxos(json, kFixtureTip, true); }), "testnet page, mainnet address aborts");
+    std::string foreign = json;
+    const size_t at = foreign.find(testvec::kDonationSpk, foreign.find(testvec::kDonationSpk) + 1);
+    foreign.replace(at, std::strlen(testvec::kDonationSpk), spk_hex_of(DUMMY_ADDR0));
+    CHECK(aborts_with([&] { parse_getaddressutxos(foreign, kFixtureTip, false); }, "pays"),
+          "a row paying another script aborts");
+    std::string dup = json;
+    const size_t open = dup.find('{'), close = dup.find('}');
+    dup.insert(dup.find('[') + 1, dup.substr(open, close - open + 1) + ",");
+    CHECK(aborts_with([&] { parse_getaddressutxos(dup, kFixtureTip, false); }, "listed twice"),
+          "a duplicated row aborts");
+
+    // The chainInfo object form carries its own tip.
+    const std::string chain_info = "{\"utxos\":" + json + ",\"hash\":\"" + std::string(64, 'c') +
+                                   "\",\"height\":2563986}";
+    UtxoImport ci;
+    CHECK(runs([&] { ci = parse_utxo_json(chain_info, 0, false); }, "chainInfo") && ci.utxos.size() == 170 &&
+              ci.tip_height == kFixtureTip && ci.source == UtxoSource::GetAddressUtxos,
+          "chainInfo form {utxos, hash, height}: tip taken from the object");
+    CHECK(aborts([&] { parse_utxo_json(chain_info, kFixtureTip + 1, false); }),
+          "chainInfo form with a different typed tip aborts");
+}
+
 int main(int argc, char** argv)
 {
     // Oracle hook: emit the gobject display hashes for the fixed mainnet vectors
@@ -947,6 +1070,9 @@ int main(int argc, char** argv)
     test_k12_refusals();
     test_k13_display_roundtrip();
     test_utxo_intake();
+
+    std::printf("\n=== slice 2: DashInjectModel / PageDashInject ===\n");
+    test_s2_k2_getaddressutxos_fixture();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
