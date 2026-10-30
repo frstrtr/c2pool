@@ -10,6 +10,10 @@
 ///   3. the header chain: only then is the peer's header-chain getheaders
 ///      answered (HeaderAsks) — a range or schedule answer never counts as
 ///      one, so a peer with both in flight keeps its header-chain ask.
+/// `truncated_at`: the AuxPoW parser stopped at that entry and `headers` are
+/// the ones before it. The sequential schedule takes such an answer as a
+/// strike (Feed::Truncated), never as a batch from another chain; a range
+/// takes its prefix as any short answer (a strike).
 
 #include <impl/doge/coin/hash_schedule.hpp>
 #include <impl/doge/coin/header_sync.hpp>
@@ -33,7 +37,8 @@ struct HeadersRoute {
 inline HeadersRoute route_headers(RangeSync* ranges, HashScheduleSync* sequential, HashSchedule* schedule,
                                   HeaderAsks& asks, const std::string& peer,
                                   const std::vector<ltc::coin::BlockHeaderType>& headers,
-                                  std::chrono::steady_clock::time_point now)
+                                  std::chrono::steady_clock::time_point now,
+                                  std::optional<size_t> truncated_at = std::nullopt)
 {
     HeadersRoute r;
     if (ranges) {
@@ -44,7 +49,7 @@ inline HeadersRoute route_headers(RangeSync* ranges, HashScheduleSync* sequentia
         }
     }
     if (sequential && schedule && !schedule->complete() && (!ranges || ranges->sequential())) {
-        r.feed = sequential->on_headers(peer, headers, now, r.next);
+        r.feed = sequential->on_headers(peer, headers, now, r.next, truncated_at);
         if (r.feed != HashSchedule::Feed::NotNext && r.feed != HashSchedule::Feed::Done) {
             r.taken = HeadersRoute::Taken::Schedule;
             return r;

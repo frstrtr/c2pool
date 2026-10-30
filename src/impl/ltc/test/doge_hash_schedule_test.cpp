@@ -22,7 +22,8 @@
 //     progress (asking the same peer again does not reset it) and asks two
 //     peers; silence and the header chain's traffic never count; a liar's
 //     batches are cut back to the frontier before it, not to genesis, after
-//     a restart too.
+//     a restart too; a batch the AuxPoW parser did not read to its end
+//     (truncated_at) is a strike, never a cut, and its clean prefix is kept.
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
 
@@ -30,6 +31,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -39,6 +41,7 @@
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 #include <impl/doge/coin/hash_schedule.hpp>
+#include <impl/doge/coin/schedule_dispatch.hpp>
 #include <impl/ltc/coin/block.hpp>
 
 namespace {
@@ -984,4 +987,94 @@ TEST(DogeHashScheduleSync, AnExpiredAskIsNotFed)
     EXPECT_EQ(sched.frontier_height(), 0u);
     sync.asked("a", t);
     EXPECT_EQ(sync.on_headers("a", chain.slice(1, 100), t, next), Feed::Extended);
+}
+
+// A batch the AuxPoW parser did not read to its end (truncated_at): a strike,
+// never a cut. The same bytes read as garbage were "broken" and cut the
+// sender's run 19 times in the live log.
+TEST(DogeHashScheduleSync, ATruncatedBatchIsAStrikeNeverACut)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    ASSERT_EQ(sync.on_headers("a", chain.slice(1, 100), t, next), Feed::Extended);
+    sync.asked("a", t);  // the follow-up
+    // What came before the entry that did not parse does not link (the parser
+    // is meant to cut that off; even so it is no evidence of another chain).
+    auto prefix = chain.slice(101, 150);
+    prefix[10].m_previous_block = chain.hashes[3];
+    EXPECT_EQ(sync.on_headers("a", prefix, t, next, /*truncated_at=*/50), Feed::Truncated);
+    EXPECT_EQ(sched.frontier_height(), 100u) << "a's run stays";
+    EXPECT_EQ(sync.truncations(), 0u);
+    EXPECT_EQ(sync.cut_peers(), 0u);
+    EXPECT_EQ(sync.bad_parses(), 1u);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_TRUE(next->peer.empty()) << "another peer now: the same one sends the same bytes";
+    EXPECT_TRUE(sync.peer().empty());
+    EXPECT_EQ(next->locator.front(), chain.hashes[100]);
+    // a is still asked and fed.
+    sync.asked("a", t);
+    EXPECT_EQ(sync.on_headers("a", chain.slice(101, 150), t, next), Feed::Extended);
+    EXPECT_EQ(sched.frontier_height(), 150u);
+}
+
+// The clean prefix of a truncated answer that continues the frontier is
+// stored; the turn still goes to another peer.
+TEST(DogeHashScheduleSync, ATruncatedBatchKeepsItsCleanPrefix)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    std::optional<Sync::Ask> next;
+    EXPECT_EQ(sync.on_headers("a", chain.slice(1, 40), t, next, /*truncated_at=*/40), Feed::Truncated);
+    EXPECT_EQ(sched.frontier_height(), 40u);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_TRUE(next->peer.empty());
+    EXPECT_EQ(next->locator.front(), chain.hashes[40]);
+    EXPECT_EQ(sync.cut_peers(), 0u);
+    // Nothing parsed at all (the first entry did not): still a strike, not a cut.
+    sync.asked("b", t);
+    EXPECT_EQ(sync.on_headers("b", {}, t, next, /*truncated_at=*/0), Feed::Truncated);
+    EXPECT_EQ(sched.frontier_height(), 40u);
+    EXPECT_EQ(sync.bad_parses(), 2u);
+    EXPECT_EQ(sync.cut_peers(), 0u);
+    // One answer per ask, and only from an asked peer.
+    EXPECT_EQ(sync.on_headers("b", chain.slice(41, 60), t, next, 20), Feed::NotNext);
+    EXPECT_EQ(sync.on_headers("z", chain.slice(41, 60), t, next, 20), Feed::NotNext);
+    sync.asked("b", t);
+    EXPECT_EQ(sync.on_headers("b", chain.slice(41, 300), t, next), Feed::Complete);
+}
+
+// route_headers hands truncated_at to the sequential schedule: Taken::Schedule
+// with Feed::Truncated and the next ask, never the header chain.
+TEST(DogeHashScheduleSync, RouteHandsATruncatedBatchToTheSchedule)
+{
+    constexpr uint32_t CP = 300;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    doge::coin::HeaderAsks asks;
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    sync.asked("a", t);
+    const auto route = doge::coin::route_headers(nullptr, &sync, &sched, asks, "a", chain.slice(1, 30), t, 30);
+    EXPECT_EQ(route.taken, doge::coin::HeadersRoute::Taken::Schedule);
+    EXPECT_EQ(route.feed, Feed::Truncated);
+    ASSERT_TRUE(route.next.has_value());
+    EXPECT_EQ(sched.frontier_height(), 30u);
 }

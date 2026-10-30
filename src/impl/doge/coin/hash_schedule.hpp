@@ -76,6 +76,8 @@ public:
         Rejected,  // the checkpoint height carries another hash: the batch is dropped;
                    // the stored prefix does not link: the schedule is discarded
         Done,      // the schedule was already complete: ignored
+        Truncated, // (HashScheduleSync) the batch did not parse to its end: a strike
+                   // for its peer, never a cut; what linked onto the frontier is stored
     };
 
     static const char* feed_name(Feed f)
@@ -87,6 +89,7 @@ public:
         case Feed::Broken:   return "broken";
         case Feed::Rejected: return "rejected";
         case Feed::Done:     return "done";
+        case Feed::Truncated: return "truncated";
         }
         return "unknown";
     }
@@ -884,7 +887,12 @@ private:
 ///   - a floor (the anchored prefix, when this sync is the fallback of the
 ///     anchored ranges) is never cut below;
 ///   - a peer whose run was cut, or that sent a broken or rejected batch, is
-///     never fed nor asked again by this process.
+///     never fed nor asked again by this process;
+///   - a batch that did not parse to its end (truncated_at: the AuxPoW parser
+///     stopped at an entry it could not read) is a strike, never a cut: what
+///     links onto the frontier is stored, the ask is answered and the turn
+///     goes to another peer, the peer stays askable. A bad parse is no
+///     evidence of another chain (the 19 cuts of the live log were this).
 /// Thread safety: every public method takes the internal mutex.
 class HashScheduleSync {
 public:
@@ -1007,9 +1015,12 @@ public:
     /// and it continues the frontier; otherwise NotNext (the caller hands it
     /// to the header chain). `ask_next`: ask that peer for the next batch
     /// now (after an extension), or new peers (after a bad batch).
+    /// `truncated_at`: the message did not parse past that entry, `headers`
+    /// are the ones before it (they link): Truncated, a strike, never a cut.
     HashSchedule::Feed on_headers(const std::string& peer,
                                   const std::vector<ltc::coin::BlockHeaderType>& headers,
-                                  Clock::time_point now, std::optional<Ask>& ask_next)
+                                  Clock::time_point now, std::optional<Ask>& ask_next,
+                                  std::optional<size_t> truncated_at = std::nullopt)
     {
         std::lock_guard<std::mutex> lock(m_mu);
         ask_next.reset();
@@ -1018,19 +1029,14 @@ public:
         auto ask = m_asks.find(peer);
         if (peer.empty() || ask == m_asks.end() || now - ask->second.at > ASK_TTL || m_cut.count(peer))
             return HashSchedule::Feed::NotNext;  // not an answer to us
+        if (truncated_at)
+            return truncated_locked(peer, ask, headers, *truncated_at, now, ask_next);
         const uint32_t before_h = m_s.frontier_height();
         const auto r = m_s.feed(headers);
         switch (r) {
         case HashSchedule::Feed::Extended:
             answered_locked(ask);
-            if (m_runs.empty() || m_runs.back().second != peer) {
-                if (m_runs.size() >= MAX_RUNS)
-                    m_runs.erase(m_runs.begin());  // the deepest base is forgotten: genesis then
-                m_runs.emplace_back(before_h, peer);
-                m_votes.clear();
-                m_unproven_logged = false;
-                save_runs_locked();
-            }
+            run_extended_locked(before_h, peer);
             if (peer != m_peer)
                 start_turn_locked(peer, now);
             note_progress_locked(now);
@@ -1102,6 +1108,11 @@ public:
         std::lock_guard<std::mutex> lock(m_mu);
         return m_cut.size();
     }
+    uint64_t bad_parses() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_bad_parses;
+    }
 
 private:
     static constexpr size_t MAX_RUNS = 4096;
@@ -1120,6 +1131,53 @@ private:
             --it->second.outstanding;
         else
             m_asks.erase(it);
+    }
+
+    /// The frontier moved from `before_h` on `peer`'s batch: a new top run
+    /// unless it is that peer's already.
+    void run_extended_locked(uint32_t before_h, const std::string& peer)
+    {
+        if (!m_runs.empty() && m_runs.back().second == peer)
+            return;
+        if (m_runs.size() >= MAX_RUNS)
+            m_runs.erase(m_runs.begin());  // the deepest base is forgotten: genesis then
+        m_runs.emplace_back(before_h, peer);
+        m_votes.clear();
+        m_unproven_logged = false;
+        save_runs_locked();
+    }
+
+    /// `peer`'s answer did not parse past entry `at`; `headers` are the ones
+    /// before it. What continues the frontier is stored (a run of that peer,
+    /// as any extension); the ask is answered and the turn goes to another
+    /// peer, since the same peer sends the same bytes again. Nothing is cut
+    /// and the peer is not marked: this side could not read its answer,
+    /// which says nothing about the chain it is on.
+    HashSchedule::Feed truncated_locked(const std::string& peer, AskMap::iterator ask,
+                                        const std::vector<ltc::coin::BlockHeaderType>& headers, size_t at,
+                                        Clock::time_point now, std::optional<Ask>& ask_next)
+    {
+        const uint32_t before_h = m_s.frontier_height();
+        const auto r = headers.empty() ? HashSchedule::Feed::NotNext : m_s.feed(headers);
+        answered_locked(ask);
+        if (r == HashSchedule::Feed::Complete) {
+            m_asks.clear();
+            return r;
+        }
+        if (r == HashSchedule::Feed::Extended) {
+            run_extended_locked(before_h, peer);
+            note_progress_locked(now);
+        }
+        ++m_bad_parses;
+        LOG_WARNING << "[EMB-DOGE] Hash schedule: the batch from " << peer << " does not parse past entry " << at
+                    << " (the " << headers.size() << " before it: " << HashSchedule::feed_name(r)
+                    << "): a strike, not another chain; asking another peer";
+        if (peer == m_peer) {
+            m_peer.clear();
+            m_rr += HEDGE;
+        }
+        ask_next = Ask{ask_locator_locked(), m_rr, std::string(), 1};
+        return HashSchedule::Feed::Truncated;
     }
 
     void expire_asks_locked(Clock::time_point now)
@@ -1275,6 +1333,7 @@ private:
     uint32_t          m_fruitless{0};     // such turns in a row without progress
     uint64_t          m_stalls{0};
     uint64_t          m_truncations{0};
+    uint64_t          m_bad_parses{0};    // answers that did not parse to their end (strikes)
     AskMap            m_asks;             // peers with an outstanding getheaders
     std::set<std::string> m_cut;          // never fed nor asked again
     std::set<std::string> m_votes;        // peers that showed another chain inside the top run
