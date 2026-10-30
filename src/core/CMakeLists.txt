@@ -85,7 +85,12 @@ add_library(core_utxo OBJECT
     coin/coin_compressor.hpp coin/coin_compressor.cpp
     coin/utxo_set_hash.hpp coin/utxo_set_hash.cpp
     coin/utxo_snapshot.hpp coin/utxo_snapshot.cpp
+    utxo_tools.hpp utxo_tools.cpp
 )
 target_link_libraries(core_utxo core ${SECP256K1_LIBRARIES})
+
+# c2pool-utxo: the coin-neutral snapshot tool (utxo_tools.hpp).
+add_executable(c2pool-utxo utxo_tools_main.cpp)
+target_link_libraries(c2pool-utxo PRIVATE core_utxo core c2pool_merged_mining c2pool_payout c2pool_hashrate ltc_coin)
 
 add_subdirectory(test)

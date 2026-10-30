@@ -162,6 +162,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         tx_advertiser_test.cpp
         utxo_set_hash_test.cpp
         utxo_snapshot_test.cpp
+        utxo_tools_test.cpp
         version_gate_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
