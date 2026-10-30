@@ -291,9 +291,15 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
     if (extended) {
         s << "est signed " << plan.est_signed_bytes << "/" << caps::kMaxInjectTxBytes << " B\n";
         s << describe_skipped(screen, req.min_confirmations, req.dust_floor);
-        s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
-             "      understated the difference becomes block fee; if it is overstated the\n"
-             "      node refuses the tx.\n";
+        if (inject)
+            s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
+                 "      understated, the inject lane takes the difference as block fee and the\n"
+                 "      pin lane EXCLUDES the tx (fee-not-zero); if it is overstated the node\n"
+                 "      refuses the tx.\n";
+        else
+            s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
+                 "      understated the difference is paid as extra fee; if it is overstated\n"
+                 "      dashd refuses the tx.\n";
     }
     s << "----------------------------------------------------------------------\n";
     s << "WARNING: this transaction SPENDS REAL FUNDS and irreversibly BURNS 1 DASH.\n";

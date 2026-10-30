@@ -118,6 +118,10 @@ std::vector<SignedTx> sign_sweep(const SweepBatchPlan& plan, const FoundKey& key
     const std::array<uint8_t, 25> dest_script = p2pkh_script(addr_to_h160(dest, plan.testnet));
     const Bytes dest_spk(dest_script.begin(), dest_script.end());
 
+    const bool relay = plan.fee_mode == FeeMode::Relay;
+    const PubkeyEncoding key_enc =
+        key.compressed ? PubkeyEncoding::Compressed : PubkeyEncoding::Uncompressed;
+
     // Check every planned tx before signing any of them.
     for (size_t t = 0; t < plan.txs.size(); ++t) {
         const SweepTxPlan& tx = plan.txs[t];
@@ -129,12 +133,29 @@ std::vector<SignedTx> sign_sweep(const SweepBatchPlan& plan, const FoundKey& key
             throw DashAbort(label + " does not pay the destination " + dest);
         int64_t sum = 0;
         for (const Utxo& u : tx.inputs)
-            if (u.satoshis < 0 || __builtin_add_overflow(sum, u.satoshis, &sum))
+            if (u.satoshis < 0 || __builtin_add_overflow(sum, u.satoshis, &sum) || sum > kMaxMoney)
                 throw DashAbort(label + " input amounts are malformed");
-        if (sum != tx.value_out)
-            throw DashAbort(label + " is not zero-fee (inputs " + std::to_string(sum) +
-                            " != output " + std::to_string(tx.value_out) +
-                            " duffs) — refusing to sign");
+        if (!relay) {
+            if (tx.fee != 0 || sum != tx.value_out)
+                throw DashAbort(label + " is not zero-fee (inputs " + std::to_string(sum) +
+                                " != output " + std::to_string(tx.value_out) +
+                                " duffs) — refusing to sign");
+        } else {
+            // Money range first, then the balance identity, then the fee ceiling
+            // for THIS key's worst-case size (never the plan's own estimate).
+            int64_t out_plus_fee = 0;
+            if (tx.fee <= 0 || tx.fee > kMaxMoney || tx.value_out < kP2pkhDustDuffs ||
+                tx.value_out > kMaxMoney ||
+                __builtin_add_overflow(tx.value_out, tx.fee, &out_plus_fee) || out_plus_fee != sum)
+                throw DashAbort(label + " does not balance as a relay tx (inputs " +
+                                std::to_string(sum) + ", output " + std::to_string(tx.value_out) +
+                                ", fee " + std::to_string(tx.fee) + " duffs) — refusing to sign");
+            const size_t worst = est_signed_size(tx.unsigned_tx.size(), tx.inputs.size(), key_enc);
+            if (tx.fee > kMaxRelayFeePerByte * static_cast<int64_t>(worst))
+                throw DashAbort(label + " fee " + std::to_string(tx.fee) + " duffs is above " +
+                                std::to_string(kMaxRelayFeePerByte) + " duffs/B x " +
+                                std::to_string(worst) + " B — refusing to sign");
+        }
     }
 
     std::vector<SignedTx> out;
@@ -152,7 +173,12 @@ std::vector<SignedTx> sign_sweep(const SweepBatchPlan& plan, const FoundKey& key
         if (s.serialize(false) != tx.unsigned_tx)
             throw DashAbort(label + ": the tx about to be signed is not the planned one — "
                             "refusing to sign");
-        out.push_back(sign_all_inputs(s, funding_spk, key, label));
+        SignedTx signed_tx = sign_all_inputs(s, funding_spk, key, label);
+        if (relay && tx.fee < kMinRelayFeePerByte * static_cast<int64_t>(signed_tx.size))
+            throw DashAbort(label + ": fee " + std::to_string(tx.fee) + " duffs is below dashd's " +
+                            std::to_string(kMinRelayFeePerByte) + " duff/B minimum relay fee for " +
+                            std::to_string(signed_tx.size) + " signed bytes");
+        out.push_back(std::move(signed_tx));
     }
     return out;
 }
