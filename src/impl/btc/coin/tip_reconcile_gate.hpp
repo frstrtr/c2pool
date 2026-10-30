@@ -23,6 +23,9 @@
 // and the tip_reconcile KAT (src/impl/btc/test/tip_reconcile_test.cpp) — the
 // decision, and the 10s cadence, live in exactly one place so the test can
 // never silently drift from production. Header-only, no I/O, no timers.
+//
+// It also owns the unknown-block resync decision (on_block_announce), the
+// second HeaderChain stall shape: inv-only tip announcements after a reorg.
 // ---------------------------------------------------------------------------
 #ifndef C2POOL_IMPL_BTC_COIN_TIP_RECONCILE_GATE_HPP
 #define C2POOL_IMPL_BTC_COIN_TIP_RECONCILE_GATE_HPP
@@ -65,6 +68,39 @@ public:
                         const Hash& genesis_hash) noexcept
     {
         return have_tip ? tip_hash : genesis_hash;
+    }
+
+    // ── Unknown-block resync (header-stall fix) ──────────────────────────────
+    // Second stall shape (observed on the .234 G3b testnet3 rig 2026-10-25,
+    // HeaderChain pinned ~50k behind bitcoind for 5 days): once a < 2000
+    // headers batch marks sync "caught up", the external-bitcoind arm relies on
+    // bitcoind pushing new tips as headers (sendheaders). Core falls back to a
+    // plain block INV whenever the announced block does not connect to the
+    // best header it believes the peer has (reorg / min-diff storm / > 8 new
+    // blocks). We then getdata the block, full_block finds its header unknown
+    // and drops it -- and nothing ever re-issues getheaders, so every later
+    // tip arrives as yet another unconnectable INV. Core's own PeerManager
+    // answers an INV for an unknown block with getheaders(locator); do the
+    // same. Throttled to one resync per kUnknownBlockResyncMinGap so a burst of
+    // sibling INVs (the 288-wide regtest storm) costs one getheaders, not 288.
+    static constexpr std::chrono::seconds kUnknownBlockResyncMinGap{2};
+
+    // Decide whether an announced block should trigger a resync getheaders.
+    //   header_known       : HeaderChain already has this block's header
+    //   handshake_complete : P2P leg is up and handshaked
+    //   resync_ever_sent   : a previous unknown-block resync was issued
+    //   since_last_resync  : time since that previous resync (ignored if none)
+    static constexpr Action on_block_announce(
+        bool header_known,
+        bool handshake_complete,
+        bool resync_ever_sent,
+        std::chrono::steady_clock::duration since_last_resync) noexcept
+    {
+        if (header_known || !handshake_complete)
+            return Action::Skip;
+        if (resync_ever_sent && since_last_resync < kUnknownBlockResyncMinGap)
+            return Action::Skip;
+        return Action::Poll;
     }
 };
 
