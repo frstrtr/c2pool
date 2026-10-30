@@ -22,7 +22,8 @@
 //   - APerFlowCapIsNotTheLink (each connection capped, the link to spare),
 //     NoStrikeWhenNobodyDelivers, RangePeersAreNotTheSyncPeerNorBodyPeers
 //     (FRESH-NODE §6.4, §7); AStarvedLinkStrikesNoSlowPeer,
-//     APeersWindowIsBytesNotRanges (fresh-anchored3 run 1)
+//     APeersWindowIsBytesNotRanges (fresh-anchored3 run 1),
+//     AQueuedAnswerIsNoWitness (run 2)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -1284,6 +1285,39 @@ TEST(DogeRangeSync, AStarvedLinkStrikesNoSlowPeer)
     EXPECT_EQ(st.strikes, 0u) << "slow honest peers struck on a starved link";
     EXPECT_EQ(st.excluded, 0u);
     EXPECT_EQ(rs.mode(), Mode::Complete);
+}
+
+// Live, fresh-anchored3 run 2 (bd7178b7d): a peer serves its queued ranges
+// back to back, so the second answer arrives right after the first. Timed
+// from the peer's previous answer it looked instant, a "healthy" witness on a
+// starved link, and the slower peers were struck (10 in 3.5 minutes). Timed
+// from its own request it is as slow as the first. Here every peer answers
+// its queue in one burst 40 s after asking; p0 answers after 90 s. Nobody
+// is struck.
+TEST(DogeRangeSync, AQueuedAnswerIsNoWitness)
+{
+    constexpr uint32_t CP = 150 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync rs(*sched, c.anchors(CP));
+    const auto peers = v6_peers(18);
+    std::multimap<int, RangeSync::Request> due;
+    auto t = t0();
+    for (int sec = 0; sec < 240 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t))
+            due.emplace(sec + (r.peer == "p0" ? 90 : 40), r);
+        for (auto it = due.begin(); it != due.end() && it->first <= sec;) {
+            rs.on_headers(it->second.peer, c.answer(it->second.locator, it->second.stop), t);
+            it = due.erase(it);
+        }
+    }
+    const auto st = rs.stats(t);
+    std::cout << "  queues answered in bursts after 40 s, p0 after 90 s: strikes " << st.strikes << ", ranges "
+              << st.ranges_done << "/" << st.ranges_total << "\n";
+    EXPECT_EQ(st.strikes, 0u) << "a burst of queued answers counted as a quick witness";
+    EXPECT_FALSE(rs.excluded("p0"));
 }
 
 // The live first AuxPoW minutes (fresh-anchored3 run 1): 162-KB ranges
