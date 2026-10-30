@@ -225,6 +225,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # its end yields the clean prefix (entries that link) and truncated_at,
     # never garbage that reads like another chain; the parent coinbase params
     # (wire: witness, no MWEB; txid: stripped). Same folding rule.
+    #
+    # doge_schedule_witness_test.cpp: the hash schedule fed the parse of the
+    # captured witness-coinbase batches (h4715979, h5080796, h5641398,
+    # h6101857) extends by the whole batch; an asked peer's answer cuts
+    # nothing. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -247,6 +252,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_headers_parse_test.cpp
         doge_range_sync_test.cpp
         doge_mempool_validity_test.cpp
+        doge_schedule_witness_test.cpp
         doge_template_budget_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
