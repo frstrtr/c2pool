@@ -334,6 +334,42 @@ opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& sto
 #endif
 }
 
+// dashd keys its masternode unique-property map (and the mempool's
+// mapProTxBlsPubKeyHashes) by the operator key's BYTES under the scheme its
+// holder read it with — legacy iff the holder's nVersion < BasicBLS
+// (CBLSLazyWrapper::Serialize / GetHash, bls/bls.h) — never by point. For a
+// LEGACY holder whose key we store as canonical basic B(P), "the holder's
+// bytes equal `wire`" is L(P) == wire, i.e. `wire` is the CANONICAL legacy
+// encoding of P. This returns B(P) for that P — the basic bytes of the point
+// `wire` canonically encodes under the LEGACY scheme — so a store compare
+// replaces one opkey_for_leaf per holder with one decode per ProTx. nullopt
+// when `wire` is not a canonical legacy encoding (no legacy holder can then
+// match). Without the BLS backend the store holds the raw bytes, so this is
+// the identity.
+inline std::optional<std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>>
+opkey_legacy_wire_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire)
+{
+#ifndef C2POOL_DASH_BLS
+    return wire;
+#else
+    try {
+        bls::G1Element e = bls::G1Element::FromBytes(
+            bls::Bytes(wire.data(), wire.size()), /*fLegacy=*/true);
+        if (!e.IsValid()) return std::nullopt;
+        const std::vector<uint8_t> legacy = e.Serialize(/*fLegacy=*/true);
+        if (legacy.size() != wire.size()
+            || !std::equal(legacy.begin(), legacy.end(), wire.begin()))
+            return std::nullopt;   // decodes, but not the canonical legacy bytes
+        const std::vector<uint8_t> basic = e.Serialize(/*fLegacy=*/false);
+        std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+        std::copy_n(basic.begin(), std::min(basic.size(), out.size()), out.begin());
+        return out;
+    } catch (...) {
+        return std::nullopt;
+    }
+#endif
+}
+
 } // namespace vendor
 } // namespace coin
 } // namespace dash

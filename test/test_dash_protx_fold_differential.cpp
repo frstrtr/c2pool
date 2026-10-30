@@ -105,6 +105,26 @@ OpKey op_key_with_distinct_encodings(uint8_t start)
     return {};
 }
 
+/// A key P whose BASIC bytes are also the canonical LEGACY encoding of a
+/// DIFFERENT point Q (the h=1874081 class) — the M2 direction-2 case.
+OpKey op_key_whose_basic_bytes_are_another_legacy_point(uint8_t start)
+{
+    for (int s = start; s < start + 128; ++s) {
+        const OpKey k = op_key(static_cast<uint8_t>(s));
+        try {
+            const bls::G1Element q = bls::G1Element::FromBytes(
+                bls::Bytes(k.basic.data(), k.basic.size()), /*fLegacy=*/true);
+            if (!q.IsValid()) continue;
+            if (q.SerializeToArray(true) != k.basic) continue;          // canonical
+            if (q.SerializeToArray(false) == k.basic) continue;         // a different point
+            return k;
+        } catch (...) {
+        }
+    }
+    ADD_FAILURE() << "no such key";
+    return {};
+}
+
 struct Mn {
     uint256 pro;
     ReplayMNState st;
@@ -374,4 +394,45 @@ TEST(DashProTxFoldDifferential, EvoMnKeyChangeClearsThePlatformNodeId)
     expect_same_root({e, b}, special(3, update_registrar(e.pro, v::ProTxVersion::BASIC_BLS, fresh.basic)));
 }
 
+// ── M2: operator-key uniqueness is bytes under the holder's scheme ────────
+
+// Direction 1: a legacy holder's point, re-sent basic-encoded by a new
+// registration, is a DIFFERENT unique property in dashd — accepted, mined.
+// Refusing it would latch the DML lane on a valid block.
+TEST(DashProTxFoldDifferential, ProRegTxWithTheBasicBytesOfALegacyHoldersPointIsAccepted)
+{
+    const OpKey kl = op_key_with_distinct_encodings(0x10);
+    const auto l = mn(4, kl, v::ProTxVersion::LEGACY_BLS);
+    const auto b = mn(2, op_key(0x02), v::ProTxVersion::BASIC_BLS);
+    expect_same_root({l, b}, special(1, register_mn(v::ProTxVersion::BASIC_BLS, kl.basic)));
+}
+
+// Direction 2: wire bytes equal to a basic holder's key are the SAME
+// property even though, read under the legacy scheme, they are another point
+// — dashd refuses (bad-protx-dup-key), so both folds must.
+TEST(DashProTxFoldDifferential, ProRegTxWhoseBytesEqualABasicHoldersKeyIsRefused)
+{
+    const OpKey ka = op_key_whose_basic_bytes_are_another_legacy_point(0x40);
+    const auto a = mn(1, ka, v::ProTxVersion::BASIC_BLS);
+    const auto b = mn(2, op_key(0x02), v::ProTxVersion::BASIC_BLS);
+    const auto tx = special(1, register_mn(v::ProTxVersion::LEGACY_BLS, ka.basic));
+    const Outcome chain = dml({a, b}, tx);
+    const Outcome serve = tmpl({a, b}, tx);
+    EXPECT_TRUE(chain.refused) << "the chain fold must refuse bad-protx-dup-key";
+    EXPECT_NE(chain.why.find("bad-protx-dup-key"), std::string::npos) << chain.why;
+    EXPECT_TRUE(serve.refused) << "the template fold must drop it";
+}
+
+// The legacy-wire helper both engines rely on.
+TEST(DashProTxFoldDifferential, LegacyWireToBasicFindsOnlyCanonicalLegacyEncodings)
+{
+    const OpKey k = op_key_with_distinct_encodings(0x10);
+    const auto from_legacy = v::opkey_legacy_wire_to_basic(k.legacy);
+    ASSERT_TRUE(from_legacy.has_value());
+    EXPECT_EQ(*from_legacy, k.basic) << "L(P) must map to B(P)";
+    const OpKey odd = op_key_whose_basic_bytes_are_another_legacy_point(0x40);
+    const auto other = v::opkey_legacy_wire_to_basic(odd.basic);
+    ASSERT_TRUE(other.has_value());
+    EXPECT_NE(*other, odd.basic) << "B(P) read as legacy is another point";
+}
 #endif // C2POOL_DASH_BLS

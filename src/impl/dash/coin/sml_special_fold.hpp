@@ -338,7 +338,6 @@ struct MnFoldContext
         /// and uint160 identically, so the two are ONE namespace (#7846). Null
         /// ids are never entered (AddUniqueProperty skips the null value).
         std::map<uint160, uint256> owner_or_platform_ids;
-        std::map<OpKey, uint256>   operator_keys;   ///< canonical BASIC, non-null
         std::map<Service, uint256> services;        ///< non-empty netInfo
     };
 
@@ -383,9 +382,6 @@ struct MnFoldContext
                         u.owner_or_platform_ids.emplace(st.keyIDOwner, pro);
                     if (st.nType == vendor::MnType::EVO && !st.platformNodeID.IsNull())
                         u.owner_or_platform_ids.emplace(st.platformNodeID, pro);
-                    bool null_key = true;
-                    for (uint8_t b : st.pubKeyOperator) if (b != 0) { null_key = false; break; }
-                    if (!null_key) u.operator_keys.emplace(st.pubKeyOperator, pro);   // stored BASIC
                     if (!detail::net_service_empty(st.netInfo.ip, st.netInfo.port_be))
                         u.services.emplace(Service{st.netInfo.ip, st.netInfo.port_be}, pro);
                 }
@@ -454,6 +450,29 @@ struct MnFoldOverlay
     std::map<uint160, uint256>                   added_ids;
     /// Operator keys added by this body, as the payload's wire bytes.
     std::map<MnFoldContext::OpKey, uint256>      added_opkeys;
+    /// The pre-block list's operator keys, keyed by the LEAF bytes — the key
+    /// under its holder's own scheme (legacy iff the leaf nVersion <
+    /// BasicBLS). That is what dashd's unique-property map hashes
+    /// (CBLSLazyWrapper::Serialize under the scheme the key was read with,
+    /// deterministicmns.h GetUniquePropertyHash): a legacy L(P) and a basic
+    /// B(P) of ONE point are two properties, and equal bytes of two different
+    /// points are one. Built on first use.
+    std::optional<std::map<MnFoldContext::OpKey, uint256>> base_opkeys_idx;
+
+    const std::map<MnFoldContext::OpKey, uint256>&
+    base_opkeys(const vendor::CSimplifiedMNList& base)
+    {
+        if (!base_opkeys_idx) {
+            std::map<MnFoldContext::OpKey, uint256> m;
+            for (const auto& e : base.mnList) {
+                bool null_key = true;
+                for (uint8_t b : e.pubKeyOperator) if (b != 0) { null_key = false; break; }
+                if (!null_key) m.emplace(e.pubKeyOperator, e.proRegTxHash);
+            }
+            base_opkeys_idx = std::move(m);
+        }
+        return *base_opkeys_idx;
+    }
     std::map<MnFoldContext::Service, uint256>    added_services;
 
     /// GetMNByCollateral on the evolving list.
@@ -630,10 +649,11 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         if (!pl.keyIDOwner.IsNull()
             && held_by_other(pl.keyIDOwner, uq.owner_or_platform_ids, ov.added_ids, none))
             return refuse("bad-protx-dup-key (keyIDOwner is an owner key or platformNodeID)");
-        const auto op_basic = vendor::opkey_to_basic(
-            pl.pubKeyOperator, pl.nVersion < vendor::ProTxVersion::BASIC_BLS);
-        if (!opkey_is_null(op_basic)
-            && held_by_other(op_basic, uq.operator_keys, ov.added_opkeys, none))
+        // Operator key: the payload's wire bytes against each holder's bytes
+        // under the holder's scheme (MnFoldOverlay::base_opkeys).
+        const auto& op_wire = pl.pubKeyOperator;
+        if (!opkey_is_null(op_wire)
+            && held_by_other(op_wire, ov.base_opkeys(base), ov.added_opkeys, none))
             return refuse("bad-protx-dup-key (pubKeyOperator)");
         const bool evo = pl.nType == vendor::MnType::EVO;
         if (evo && !pl.platformNodeID.IsNull()
@@ -665,7 +685,7 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         ov.added_collateral[coll] = pro;
         if (!pl.keyIDOwner.IsNull()) ov.added_ids.emplace(pl.keyIDOwner, pro);
         if (evo && !pl.platformNodeID.IsNull()) ov.added_ids.emplace(pl.platformNodeID, pro);
-        if (!opkey_is_null(op_basic)) ov.added_opkeys.emplace(op_basic, pro);
+        if (!opkey_is_null(op_wire)) ov.added_opkeys.emplace(op_wire, pro);
         if (svc) ov.added_services.emplace(*svc, pro);
         return {MnFoldOutcome::Applied, {}};
     }
@@ -713,10 +733,11 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         const vendor::CSimplifiedMNListEntry* be = nullptr;
         if (auto why = update_target_refusal(base, list, ov, pl.proTxHash, be))
             return refuse(*why);
-        const auto op_basic = vendor::opkey_to_basic(
-            pl.pubKeyOperator, pl.nVersion < vendor::ProTxVersion::BASIC_BLS);
-        if (!opkey_is_null(op_basic)
-            && held_by_other(op_basic, ctx.unique().operator_keys, ov.added_opkeys, pl.proTxHash))
+        // CheckProUpRegTx / UpdateMN: the new key's wire bytes must not be a
+        // key another masternode holds (bytes under the holder's scheme).
+        const auto& op_wire = pl.pubKeyOperator;
+        if (!opkey_is_null(op_wire)
+            && held_by_other(op_wire, ov.base_opkeys(base), ov.added_opkeys, pl.proTxHash))
             return refuse("bad-protx-dup-key (pubKeyOperator held by another MN)");
         // Only a key that CHANGES enters the unique-property map (UpdateMN);
         // decide it on the evolving leaf, as the leaf apply below does.
@@ -730,7 +751,7 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
                     pl.nVersion < vendor::ProTxVersion::BASIC_BLS);
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
-        if (!opkey_is_null(op_basic)) ov.added_opkeys[op_basic] = pl.proTxHash;
+        if (key_changes && !opkey_is_null(op_wire)) ov.added_opkeys[op_wire] = pl.proTxHash;
         return {MnFoldOutcome::Applied, {}};
     }
 

@@ -1489,16 +1489,28 @@ private:
         return nullptr;
     }
 
-    /// The MN other than `self` holding operator key `basic` (canonical BASIC,
-    /// the store's form), or nullptr. The null key is never held.
-    const uint256* opkey_holder(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& basic,
+    /// The MN other than `self` whose operator key, as BYTES under that
+    /// holder's own scheme (legacy iff its nVersion < BasicBLS), equals the
+    /// payload's wire bytes — dashd's unique-property semantics
+    /// (CBLSLazyWrapper serialization, not a point compare): a legacy L(P) and
+    /// a basic B(P) of one point are two properties; equal bytes of two
+    /// different points are one. The store is canonical basic, so legacy
+    /// holders compare against opkey_legacy_wire_to_basic(wire). The null key
+    /// is never held.
+    const uint256* opkey_holder(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& wire,
                                 const uint256& self) const
     {
         bool null_key = true;
-        for (uint8_t b : basic) if (b != 0) { null_key = false; break; }
+        for (uint8_t b : wire) if (b != 0) { null_key = false; break; }
         if (null_key) return nullptr;
-        for (const auto& [protx, st] : m_entries)
-            if (protx != self && st.pubKeyOperator == basic) return &protx;
+        const auto as_legacy = vendor::opkey_legacy_wire_to_basic(wire);
+        for (const auto& [protx, st] : m_entries) {
+            if (protx == self || st.operator_pubkey_null()) continue;
+            const bool holder_legacy = st.nVersion < vendor::ProTxVersion::BASIC_BLS;
+            if (holder_legacy ? (as_legacy && st.pubKeyOperator == *as_legacy)
+                              : st.pubKeyOperator == wire)
+                return &protx;
+        }
         return nullptr;
     }
 
@@ -1590,7 +1602,7 @@ private:
         if (const uint256* h = id_holder(p.keyIDOwner, proTxHash))
             return "ProRegTx keyIDOwner is already an owner key or platformNodeID of MN "
                  + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
-        if (const uint256* h = opkey_holder(op_basic, proTxHash))
+        if (const uint256* h = opkey_holder(p.pubKeyOperator, proTxHash))
             return "ProRegTx pubKeyOperator is already held by MN "
                  + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
         if (p.nType == vendor::MnType::EVO) {
@@ -1735,10 +1747,7 @@ private:
         auto& st = it->second;
         // UpdateMN -> UpdateUniqueProperty(pubKeyOperator): a key another MN
         // holds makes the update throw (bad-protx-dup-key).
-        if (const uint256* h = opkey_holder(
-                vendor::opkey_to_basic(p.pubKeyOperator,
-                                       p.nVersion < vendor::ProTxVersion::BASIC_BLS),
-                p.proTxHash))
+        if (const uint256* h = opkey_holder(p.pubKeyOperator, p.proTxHash))
             return "ProUpRegTx pubKeyOperator is already held by MN "
                  + h->GetHex().substr(0, 16) + " (bad-protx-dup-key)";
 
