@@ -1667,6 +1667,50 @@ TEST(DashReplayFoldSynthetic, RefusedBlockDoesNotLatchTheConsumerAndTheValidSibl
     EXPECT_EQ(consumer.stats().blocks_folded, 1u);
 }
 
+// The pre-fold companions (the W4 quorum bridge, the mined-commitment index)
+// are forward-contiguous cursors. A block the fold refuses with its state
+// unchanged must not reach them, or they sit one block ahead and refuse the
+// valid sibling at the same height.
+TEST(DashReplayFoldSynthetic, RefusedBlockNeverReachesThePreFoldCompanions)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    uint32_t companion = 100;    // a forward-contiguous companion cursor
+    std::vector<uint32_t> observed;
+    consumer.set_pre_fold([&](uint32_t h, const uint256&,
+                              const dash::coin::BlockType&) -> std::string {
+        observed.push_back(h);
+        if (h != companion + 1)
+            return "cursor is at h=" + std::to_string(companion);
+        companion = h;
+        return {};
+    });
+
+    // A block dashd rejects (negative nVersion), then one on another chain.
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB1), make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng)));
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB3), make_block(101, raw256(0x77), root, {}, &eng)));
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 2u);
+    EXPECT_TRUE(observed.empty()) << "a refused block reached a companion";
+    EXPECT_EQ(companion, 100u);
+
+    // The valid sibling: every companion accepts it.
+    EXPECT_TRUE(consumer.on_replay_block(
+        101, raw256(0xB2), make_block(101, raw256(9), root, {}, &eng)));
+    EXPECT_EQ(companion, 101u);
+    EXPECT_EQ(consumer.stats().quorum_lane_refusals, 0u)
+        << consumer.stats().first_quorum_refusal;
+    EXPECT_EQ(eng.height(), 101u);
+}
+
 // A6: an unknown special type post-DIP3 is bad-txns-type.
 TEST(DashReplayFoldSynthetic, UnknownSpecialTypePostDip3RefusesTheBlock)
 {

@@ -199,6 +199,16 @@ public:
         }
         if (m_stats.diverged) return false;   // sticky, never fold past it
 
+        // Ask the engine FIRST whether it will refuse this block with its
+        // state unchanged. The pre-fold companions (the W4 quorum bridge, the
+        // mined-commitment index) are forward-contiguous cursors: letting
+        // them observe a block the fold then refuses leaves them one block
+        // ahead, and they refuse the valid sibling at the same height.
+        if (auto why = m_engine.refused_unchanged_reason(block, height)) {
+            note_refused_unchanged(height, hash, *why);
+            return false;
+        }
+
         if (m_pre_fold) {
             const std::string qerr = m_pre_fold(height, hash, block);
             if (!qerr.empty()) {
@@ -217,15 +227,10 @@ public:
 
         const auto r = m_engine.fold_block(block, height);
         if (!r.ok && r.refused_unchanged) {
-            // Refused before any state changed (FoldResult::refused_unchanged):
-            // this block is not ours to fold, the held list is still right for
-            // the cursor block, and the valid block at this height folds when
-            // it arrives. Not a divergence — never latch the lane on it.
-            ++m_stats.blocks_refused_unchanged;
-            m_stats.last_refused_unchanged = r.error;
-            LOG_WARNING << "[REPLAY-FOLD] h=" << height << " block "
-                        << hash.GetHex().substr(0, 16)
-                        << " refused, state unchanged — " << r.error;
+            // Unreachable while refused_unchanged_reason() mirrors
+            // fold_block's own checks; kept so the lane can never latch on
+            // such a refusal.
+            note_refused_unchanged(height, hash, r.error);
             return false;
         }
         if (!r.ok) {
@@ -363,6 +368,21 @@ public:
     }
 
 private:
+    /// A block the engine refuses before any state changed
+    /// (FoldResult::refused_unchanged): it is not ours to fold, the held list
+    /// is still right for the cursor block, and the valid block at this height
+    /// folds when it arrives. Not a divergence — never latch the lane on it.
+    void note_refused_unchanged(uint32_t height, const uint256& hash,
+                                const std::string& why)
+    {
+        ++m_stats.blocks_refused_unchanged;
+        m_stats.last_refused_unchanged = why;
+        LOG_WARNING << "[REPLAY-FOLD] h=" << height << " block "
+                    << hash.GetHex().substr(0, 16)
+                    << " refused, state unchanged (refused_unchanged="
+                    << m_stats.blocks_refused_unchanged << ") — " << why;
+    }
+
     DmlFoldEngine&    m_engine;
     UtxoSink          m_utxo_sink;
     BlockHook         m_pre_fold;

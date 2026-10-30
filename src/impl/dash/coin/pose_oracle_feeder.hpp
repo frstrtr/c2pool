@@ -196,6 +196,10 @@ public:
     struct Stats {
         uint64_t folded{0};             // folds that passed the root self-check
         uint64_t root_mismatches{0};    // folds that poisoned
+        // Bodies the engine refused with its state unchanged (a tx dashd's
+        // ContextualCheckTransaction rejects) — not a poison; dropped.
+        uint64_t refused_unchanged{0};
+        std::string last_refused_unchanged;
         uint64_t root_resolved_bans{0};
         uint64_t root_resolved_nobans{0};
         uint64_t holds{0};              // distinct (height) holds for members
@@ -629,6 +633,15 @@ private:
         if (m_io.on_reseeded) m_io.on_reseeded();
     }
 
+    void note_refused_unchanged(uint32_t h, const std::string& why)
+    {
+        ++m_stats.refused_unchanged;
+        m_stats.last_refused_unchanged = why;
+        LOG_WARNING << "[POSE-ORACLE] body h=" << h
+                    << " refused, state unchanged (refused_unchanged="
+                    << m_stats.refused_unchanged << ") — " << why;
+    }
+
     void on_poisoned()
     {
         if (!m_poison_logged) {
@@ -1021,6 +1034,16 @@ private:
                 m_repump = true;
                 return;
             }
+            // The engine's other pre-mutation refusal (a tx dashd's
+            // ContextualCheckTransaction rejects), asked BEFORE the quorum
+            // lane observes the block for the same reason: its cursor is
+            // forward-contiguous, and a block the fold refuses must not move
+            // it past the height the valid sibling still has to fill.
+            if (auto why = m_eng.refused_unchanged_reason(blk, h)) {
+                note_refused_unchanged(h, *why);
+                m_buf.erase(it);
+                return;
+            }
             auto miss = m_br.unresolved_member_sets(blk, /*kick=*/true);
             if (!miss.empty()) {
                 if (m_last_hold_logged != h) {
@@ -1052,6 +1075,11 @@ private:
             m_br.after_fold(h);
             if (!r.ok) {
                 if (m_eng.poisoned()) { on_poisoned(); return; }
+                if (r.refused_unchanged) {
+                    note_refused_unchanged(h, r.error);
+                    m_buf.erase(it);
+                    return;
+                }
                 // A refusal without poison leaves the engine untouched (e.g.
                 // a prev-link the pre-check above already excludes).
                 LOG_WARNING << "[POSE-ORACLE] fold of h=" << h << " refused: "

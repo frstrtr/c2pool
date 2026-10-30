@@ -865,19 +865,37 @@ public:
         return *best;
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // fold_block — the per-block DML fold + THE self-check
-    // ─────────────────────────────────────────────────────────────────────
-    FoldResult fold_block(const dash::coin::BlockType& block, uint32_t height)
+    /// The reason fold_block would refuse this block with the held list
+    /// unchanged (FoldResult::refused_unchanged: a prev-link to another chain,
+    /// or a tx ContextualCheckTransaction rejects), or nullopt when it would
+    /// fold the block or refuse it for a reason that latches. Const and
+    /// side-effect free: a caller asks BEFORE it lets companion lanes observe
+    /// the block, so a block the fold will refuse never advances their
+    /// forward-contiguous cursors (the valid sibling at the same height must
+    /// still be observable).
+    std::optional<std::string> refused_unchanged_reason(
+        const dash::coin::BlockType& block, uint32_t height) const
     {
         FoldResult r;
         r.height = height;
+        if (check_before_fold(block, height, r) || !r.refused_unchanged)
+            return std::nullopt;
+        return r.error;
+    }
 
+    /// Every check fold_block makes BEFORE it touches the held list, in
+    /// fold_block's own order. Returns true when the block may be folded;
+    /// otherwise r.error is set, and r.refused_unchanged where the refusal
+    /// does not latch (another chain, or a block dashd rejects). Sets
+    /// r.committed_root from the block's CCbTx. Changes nothing.
+    bool check_before_fold(const dash::coin::BlockType& block, uint32_t height,
+                           FoldResult& r) const
+    {
         // Feature flag: default-constructed config folds nothing.
         if (!m_cfg.enabled) {
             r.error = "DML fold engine is not enabled (FoldConfig.enabled "
                       "is the W1 feature flag; W5 wires it)";
-            return r;
+            return false;
         }
         // HARD STOP is sticky: after a root mismatch nothing folds again
         // until the operator re-seeds — serving from a state that has
@@ -885,20 +903,20 @@ public:
         if (m_poisoned) {
             r.error = "DML fold engine is POISONED (" + m_poison_reason
                     + ") — re-seed required";
-            return r;
+            return false;
         }
         if (m_cfg.gates.v24_active) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": DEPLOYMENT_V24/ExtAddr is active but the ExtAddr "
                       "fold branch is not implemented (fail closed, never "
                       "drift — design doc §3)";
-            return r;
+            return false;
         }
         if (static_cast<int32_t>(height) < m_cfg.gates.dip0003_height) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": below DIP0003 activation h="
                     + std::to_string(m_cfg.gates.dip0003_height);
-            return r;
+            return false;
         }
         // Forward-contiguous cursor: exactly height == cursor + 1. A gap
         // means skipped folds (stale payment cursor); out-of-order means a
@@ -908,7 +926,7 @@ public:
                     + ": cursor is at h=" + std::to_string(m_height)
                     + " and the fold is forward-contiguous (only h="
                     + std::to_string(m_height + 1) + " is foldable)";
-            return r;
+            return false;
         }
         // The held list is the post-state of block (m_height, m_block_hash)
         // and nothing else — that pair IS what the penalty oracle answers
@@ -925,13 +943,13 @@ public:
                     + m_block_hash.GetHex().substr(0, 16)
                     + " (a different chain; the held state is the post-state"
                       " of the cursor block only)";
-            return r;
+            return false;
         }
         if (block.m_txs.empty()) {
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block has no transactions (no coinbase, no cbTx "
                       "root to self-check against)";
-            return r;
+            return false;
         }
         // The committed answer key, read FIRST: a block whose cbTx cannot
         // be parsed cannot be self-checked, so it cannot be folded.
@@ -941,12 +959,11 @@ public:
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": coinbase carries no parseable CCbTx "
                       "(merkleRootMNList unavailable for the self-check)";
-            return r;
+            return false;
         }
         r.committed_root = cbtx.merkleRootMNList;
 
         const int32_t H = static_cast<int32_t>(height);
-        const uint256 prev_hash = block.m_previous_block;
 
         // ── Pre-scan: ContextualCheckTransaction (validation.cpp:317-349 @
         // v23.1.9), every tx incl. the coinbase, once DIP3 is active for this
@@ -966,10 +983,24 @@ public:
                             + std::string(*why)
                             + " (ContextualCheckTransaction — dashd rejects"
                               " this block; the held list is unchanged)";
-                    return r;
+                    return false;
                 }
             }
         }
+        return true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // fold_block — the per-block DML fold + THE self-check
+    // ─────────────────────────────────────────────────────────────────────
+    FoldResult fold_block(const dash::coin::BlockType& block, uint32_t height)
+    {
+        FoldResult r;
+        r.height = height;
+        if (!check_before_fold(block, height, r)) return r;
+
+        const int32_t H = static_cast<int32_t>(height);
+        const uint256 prev_hash = block.m_previous_block;
 
         // ── Pass 0: payee, from the PRE-block list ──────────────────────
         r.payee = project_payee(H);
