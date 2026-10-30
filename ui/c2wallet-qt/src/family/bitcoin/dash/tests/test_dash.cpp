@@ -1351,10 +1351,85 @@ static void test_s2_k4_state_machine()
     CHECK(aborts_with([&] { m.import_utxos(k7_json(), 1000, DUMMY_ADDR0); }, "not the expected"),
           "expected_address mismatch aborts");
 
-    // A sign that fails AFTER the key was used still wipes it: a relay
-    // collateral at 1 duff/B signed with an uncompressed key pays below the
-    // minimum relay fee (the classic fee estimate is 148 B/input).
+    // A sign that fails AFTER the key was taken still wipes it. Every
+    // legitimate post-key refusal is unreachable from the page (the plan is
+    // re-made for the bound key), so the plan is altered behind the model's
+    // back here: the case sign_sweep's "not the planned one" check exists for.
+    DashInjectModel t;
+    CHECK(drive_planned(t, k7_json(), 1000, {}, {}), "planned");
+    t.load_key(wif);
+    t.set_gate(true, false, kSpendWord);
+    const_cast<SweepBatchPlan*>(t.sweep_plan())->txs.at(0).unsigned_tx.back() ^= 0x01;
+    CHECK(aborts_with([&] { t.sign(); }, "not the planned one"), "a plan altered after review is refused at sign");
+    CHECK(!t.has_key() && t.keys_wiped() == 1 && t.stage() == InjectStage::Planned && t.inject_file().empty(),
+          "the failed sign wiped the key, emitted nothing, left the plan");
+
+    // The burn box gates a collateral (and only a collateral).
     DashInjectModel u;
+    std::vector<Row> rows;
+    for (int i = 0; i < 10; ++i) rows.push_back({txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 100, std::nullopt});
+    PlanParams coll;
+    coll.mode = OutputMode::Collateral;
+    coll.gov_hash_display = testvec::kOnchainGovHash;
+    CHECK(drive_planned(u, gau_json(testvec::kUncompressedAddr001, rows), 1000, {}, coll), "collateral planned");
+    u.load_key(key_of(KeySource::Wif, testvec::kUncompWif));
+    u.set_gate(true, false, kSpendWord);
+    CHECK(!u.armed(), "collateral: not armed without the burn box");
+    u.set_gate(true, true, kSpendWord);
+    CHECK(u.armed(), "collateral: reviewed + burn box + SPEND arms");
+}
+
+// ── S2-F1 relay collateral fee follows the key encoding (VERIFY-S2 F1) ──────
+
+static void test_s2_f1_relay_collateral_fee()
+{
+    std::printf("[S2-F1 relay collateral: the fee follows the key encoding; min relay fee floors]\n");
+    const std::string uspk = spk_hex_of(testvec::kUncompressedAddr001);
+    CollateralRequest r;
+    r.funding_address = testvec::kUncompressedAddr001;
+    r.fee_mode = FeeMode::Relay;
+    r.fee_rate = 1000; // 1 duff/B
+    r.sweep_all = true;
+    r.gov_hash_display = testvec::kOnchainGovHash;
+    for (int i = 0; i < 10; ++i)
+        r.utxos.push_back(mk_utxo(txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 200, uspk));
+    const FoundKey uk = load_funding_key(key_of(KeySource::Wif, testvec::kUncompWif), testvec::kUncompressedAddr001, false);
+    CHECK(!uk.compressed && uk.pub.size() == 65, "the test key is uncompressed");
+
+    // Planned for an unknown key: the classic 148 B/input (compressed) estimate.
+    const int64_t est148 = 4 + 1 + 10 * 148 + 1 + 43 + 34 + 4; // 1567
+    const int64_t est180 = 4 + 1 + 10 * 180 + 1 + 43 + 34 + 4; // 1887
+    CollateralPlan p148 = plan_collateral(r);
+    CHECK(p148.fee == est148, "unknown encoding: fee 1567 = 1 duff/B x 148 B/input estimate");
+    CHECK(aborts_with([&] { sign_collateral(p148, uk, true); }, "re-plan"),
+          "an uncompressed key on that plan: refused BEFORE signing (1567 < 1887 worst case)");
+
+    // Planned for the uncompressed key: 180 B/input, and it signs above the floor.
+    r.key_encoding = PubkeyEncoding::Uncompressed;
+    CollateralPlan p180 = plan_collateral(r);
+    CHECK(p180.fee == est180 && p180.change == 2 * 100000000 - kCoin - est180,
+          "uncompressed: fee 1887 = 1 duff/B x 180 B/input estimate");
+    CHECK(contains(p180.summary, "est 1887 B at 180 B/input, uncompressed key"), "the summary names the fee basis");
+    SignedTx st;
+    CHECK(runs([&] { st = sign_collateral(p180, uk, true); }, "sign_collateral"), "signs");
+    CHECK(st.size > 0 && st.size <= static_cast<size_t>(est180) && p180.fee >= static_cast<int64_t>(st.size),
+          "signed size <= 1887 and fee >= 1 duff/B x actual size");
+    CHECK(!aborts([&] { verify_signed_funding_tx(st.hex, testvec::kUncompressedAddr001, false); }), "re-verifies");
+
+    // A rate that cannot meet the minimum relay fee is refused at plan time.
+    CollateralRequest low = r;
+    low.fee_rate = 100;
+    CHECK(aborts_with([&] { plan_collateral(low); }, "minimum relay fee"),
+          "100 duffs/kB on a 1887 B tx: refused at plan time");
+    CollateralRequest small = make_request(DUMMY_ADDR0);
+    small.fee_rate = 100;
+    CHECK(!aborts([&] { plan_collateral(small); }), "a 383 B tx at 100 duffs/kB still passes (the 1000-duff minimum covers it)");
+    // The compressed classic path is unchanged.
+    CHECK(plan_collateral(make_request(DUMMY_ADDR0)).fee == 1000, "classic compressed relay: fee 1000 (the 1000-duff minimum)");
+
+    // Through the model: an uncompressed key at 1 duff/B now builds a tx that
+    // meets the minimum relay fee (re-planned at bind for its encoding).
+    DashInjectModel m;
     std::vector<Row> rows;
     for (int i = 0; i < 10; ++i) rows.push_back({txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 100, std::nullopt});
     PlanParams coll;
@@ -1362,15 +1437,15 @@ static void test_s2_k4_state_machine()
     coll.fee_mode = FeeMode::Relay;
     coll.fee_rate_per_byte = 1;
     coll.gov_hash_display = testvec::kOnchainGovHash;
-    CHECK(drive_planned(u, gau_json(testvec::kUncompressedAddr001, rows), 1000, {}, coll), "uncompressed relay collateral planned");
-    u.load_key(key_of(KeySource::Wif, testvec::kUncompWif));
-    u.set_gate(true, false, kSpendWord);
-    CHECK(!u.armed(), "collateral: not armed without the burn box");
-    u.set_gate(true, true, kSpendWord);
-    CHECK(u.armed(), "collateral: reviewed + burn box + SPEND arms");
-    CHECK(aborts_with([&] { u.sign(); }, "minimum relay fee"), "below-min-relay-fee signature is refused");
-    CHECK(!u.has_key() && u.keys_wiped() == 1 && u.stage() == InjectStage::Planned && u.inject_file().empty(),
-          "the failed sign wiped the key, emitted nothing, left the plan");
+    CHECK(drive_planned(m, gau_json(testvec::kUncompressedAddr001, rows), 1000, {}, coll), "model: relay collateral planned");
+    CHECK(m.planned_fee() == est148, "model before the key: fee on the 148 B/input estimate");
+    CHECK(sign_with(m, key_of(KeySource::Wif, testvec::kUncompWif), /*burn=*/true) && m.signed_txs().size() == 1,
+          "model: uncompressed key, relay collateral at 1 duff/B signs");
+    if (m.signed_txs().size() == 1) {
+        CHECK(m.planned_fee() == est180 && m.planned_fee() >= static_cast<int64_t>(m.signed_txs()[0].size),
+              "model: re-planned fee 1887 >= 1 duff/B x actual size");
+        CHECK(!m.has_key() && m.keys_wiped() == 1, "model: the key was wiped after signing");
+    }
 }
 
 // ── S2-K5 key paths ─────────────────────────────────────────────────────────
@@ -1906,6 +1981,7 @@ int main(int argc, char** argv)
     test_s2_k2_getaddressutxos_fixture();
     test_s2_k3_rescreen();
     test_s2_k4_state_machine();
+    test_s2_f1_relay_collateral_fee();
     test_s2_k5_key_paths();
     test_s2_k6_end_to_end();
     test_s2_k7_manifest();
