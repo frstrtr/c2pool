@@ -878,12 +878,15 @@ private:
 ///     traffic never count) loses its top run (truncate): a lying peer costs
 ///     its own batches, not the prefix. Again and again, back to genesis.
 ///     The run bases are persisted (a restart cuts back the same way);
-///   - a cut needs evidence of a lie for a run longer than MAX_UNPROVEN_CUT:
-///     a broken or rejected batch from the run's peer, or VOTES_TO_CUT
-///     asked peers whose answers to the locator carry, at a height inside
-///     the run, a header other than the stored one (another chain). Slow or
-///     silent peers never cut such a run (live, 825f4fd8c: 970,000 honest
-///     heights were cut on 20 slow answers and 30 minutes);
+///   - every cut but a broken or rejected batch's needs the stall: 20
+///     fruitless turns and 30 minutes without progress. A run longer than
+///     MAX_UNPROVEN_CUT needs evidence on top: VOTES_TO_CUT asked peers whose
+///     answers to the locator carry, at a height inside the run, a header
+///     other than the stored one (another chain), gathered since the run
+///     last moved. Votes alone cut nothing: they cost a sybil one 80-byte
+///     header each, so a run that is still progressing is never cut (VERIFY5
+///     M1), and slow or silent peers never cut a long run (live, 825f4fd8c:
+///     970,000 honest heights were cut on 20 slow answers and 30 minutes);
 ///   - a floor (the anchored prefix, when this sync is the fallback of the
 ///     anchored ranges) is never cut below;
 ///   - a peer whose run was cut, or that sent a broken or rejected batch, is
@@ -948,15 +951,16 @@ public:
                      << std::chrono::duration_cast<std::chrono::seconds>(now - since).count()
                      << "s; asking other peers";
             const uint32_t run_len = m_s.frontier_height() - (m_runs.empty() ? 0 : m_runs.back().first);
-            if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER
-                && run_len > MAX_UNPROVEN_CUT) {
+            const bool stalled = m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER;
+            const bool proven = run_len <= MAX_UNPROVEN_CUT || m_votes.size() >= VOTES_TO_CUT;
+            if (stalled && !proven) {
                 if (!m_unproven_logged) {
                     m_unproven_logged = true;
                     LOG_INFO << "[EMB-DOGE] Hash schedule: no progress at h=" << m_s.frontier_height()
-                             << ", but the top run is " << run_len
-                             << " headers: not cut without a peer showing another chain";
+                             << ", but the top run is " << run_len << " headers and " << m_votes.size()
+                             << " peer(s) showed another chain: not cut";
                 }
-            } else if (m_fruitless >= FRUITLESS_AFTER && now - m_progress_at >= TRUNCATE_AFTER) {
+            } else if (stalled) {
                 LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_fruitless
                             << " turns answered without continuing the frontier at h="
                             << m_s.frontier_height() << ", "
@@ -1072,13 +1076,16 @@ public:
                     if (ask->second.at >= m_asked_at && !m_peer.empty())
                         m_turn_answered = true;
                     answered_locked(ask);
+                    // Evidence for a cut, never a cut by itself: one is
+                    // made only after the stall (due()).
                     if (shows_another_chain_locked(*at, headers) && m_votes.insert(peer).second
-                        && m_votes.size() >= VOTES_TO_CUT) {
+                        && m_votes.size() == VOTES_TO_CUT)
                         LOG_WARNING << "[EMB-DOGE] Hash schedule: " << m_votes.size()
                                     << " peers answered with another chain above h="
-                                    << (m_runs.empty() ? 0 : m_runs.back().first);
-                        cut_top_run_locked(now);
-                    }
+                                    << (m_runs.empty() ? 0 : m_runs.back().first)
+                                    << "; the run is cut if it does not move for "
+                                    << std::chrono::duration_cast<std::chrono::minutes>(TRUNCATE_AFTER).count()
+                                    << " min";
                 }
             }
             break;
@@ -1316,6 +1323,7 @@ private:
             m_progress_height = h;
             m_progress_at = now;
             m_fruitless = 0;
+            m_votes.clear();  // evidence counts only from the stall it explains
         } else if (h < m_progress_height) {
             m_progress_height = h;  // cut back
         }

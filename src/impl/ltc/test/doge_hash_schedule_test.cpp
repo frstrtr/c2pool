@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -886,12 +887,14 @@ TEST(DogeHashScheduleSync, ALongHonestRunIsNeverCutOnSlowAnswers)
     EXPECT_EQ(sync.on_headers("fast-2", chain.slice(40001, 42000), t, next), Feed::Extended);
 }
 
-// Positive evidence cuts at once: a liar extends an honest 20,000 with
-// 25,000 fakes (too long to cut on silence). Three asked peers answer the
-// locator with the real chain, which differs from the stored run at its
-// first height: cut back to 20,000 now, not after 30 minutes; the honest
-// chain continues from there.
-TEST(DogeHashScheduleSync, ThreePeersOnAnotherChainCutALiarAtOnce)
+// Evidence lifts the long-run bar, after the stall: a liar extends an honest
+// 20,000 with 25,000 fakes and goes silent (a run too long to cut on silence
+// alone). Asked peers answer the locator from the run's base with the real
+// chain, which differs from the stored run at its first height: three such
+// votes do not cut by themselves (VERIFY5 M1), but once the run has not
+// moved for 30 minutes and 20 turns were fruitless it is cut back to 20,000;
+// the honest chain continues from there.
+TEST(DogeHashScheduleSync, ThreePeersOnAnotherChainCutALiarAfterTheStall)
 {
     constexpr uint32_t CP = 50000;
     const Headers chain(genesis_hash(), CP);
@@ -922,11 +925,14 @@ TEST(DogeHashScheduleSync, ThreePeersOnAnotherChainCutALiarAtOnce)
     ASSERT_EQ(sync.on_headers("liar", fake, t, next), Feed::Extended);
     ASSERT_EQ(sched.frontier_height(), 45000u);
     const auto start = t;
-    for (int i = 0; i < 3; ++i) {
+    int i = 0;
+    while (i < 200) {
         t += Sync::STALL + std::chrono::seconds(1);
         const auto a = sync.due(t);
         ASSERT_TRUE(a.has_value());
-        const std::string p = "honest-" + std::to_string(i);
+        if (sched.frontier_height() != 45000u)
+            break;  // cut by this stall
+        const std::string p = "honest-" + std::to_string(i++);
         sync.asked(p, t);
         // An honest peer answers from the first locator entry it knows.
         uint32_t at = 0;
@@ -937,10 +943,14 @@ TEST(DogeHashScheduleSync, ThreePeersOnAnotherChainCutALiarAtOnce)
                 break;
             }
         }
+        EXPECT_EQ(at, 20000u) << "the run's base is in the locator";
         sync.on_headers(p, chain.slice(at + 1, at + 2000), t, next);
+        if (i == 3)
+            EXPECT_EQ(sched.frontier_height(), 45000u) << "three votes cut the run by themselves";
     }
     EXPECT_EQ(sched.frontier_height(), 20000u) << "three peers showed another chain; the liar's run stands";
-    EXPECT_LT(t - start, Sync::TRUNCATE_AFTER);
+    EXPECT_GE(t - start, Sync::TRUNCATE_AFTER) << "cut before the stall";
+    EXPECT_GE(i, int(Sync::FRUITLESS_AFTER));
     EXPECT_EQ(sync.truncations(), 1u);
     t += Sync::STALL + std::chrono::seconds(1);
     sync.due(t);
@@ -1077,4 +1087,80 @@ TEST(DogeHashScheduleSync, RouteHandsATruncatedBatchToTheSchedule)
     EXPECT_EQ(route.feed, Feed::Truncated);
     ASSERT_TRUE(route.next.has_value());
     EXPECT_EQ(sched.frontier_height(), 30u);
+}
+
+namespace {
+// VERIFY5 probe helper.
+
+/// `n` fake headers at heights from_h.. on `prev` (no PoW is checked below
+/// the checkpoint, so any content links).
+std::vector<ltc::coin::BlockHeaderType> v5_fakes(const uint256& prev, uint32_t from_h, uint32_t n, uint32_t salt)
+{
+    std::vector<ltc::coin::BlockHeaderType> out;
+    uint256 p = prev;
+    for (uint32_t i = 0; i < n; ++i) {
+        ltc::coin::BlockHeaderType b;
+        b.m_version = 0x00620104;
+        b.m_previous_block = p;
+        b.m_merkle_root.SetHex(std::to_string(777000 + from_h + i));
+        b.m_timestamp = 1500000000 + (from_h + i) * 60;
+        b.m_bits = 0x1e0ffff0;
+        b.m_nonce = salt + i;
+        out.push_back(b);
+        p = Hash(pack(b).get_span());
+    }
+    return out;
+}
+
+} // namespace
+
+// VERIFY5 M1 (the verifier's probe V5-P1, kept as the KAT): a vote is one
+// header on the run's base hash (which the sybil reads from our own
+// getheaders locator), no PoW. Three such answers cannot cut a run whose
+// honest carrier is still delivering (progress within TRUNCATE_AFTER). On
+// ee4c882f0 the run was cut at once and the carrier marked cut.
+TEST(DogeHashScheduleSync, ThreeSybilVotesCannotCutAProgressingHonestRun)
+{
+    constexpr uint32_t CP = 60000;
+    const Headers chain(genesis_hash(), CP);
+    TempStore s;
+    HashSchedule sched(*s.db, CP, chain.hashes[CP], genesis_hash());
+    sched.load();
+    Sync sync(sched);
+    auto t = t0();
+    ASSERT_TRUE(sync.due(t).has_value());
+    // The honest carrier h builds a run of 30,000 headers (> MAX_UNPROVEN_CUT).
+    sync.asked("h", t);
+    std::optional<Sync::Ask> next;
+    uint32_t f = 0;
+    while (f < 30000) {
+        ASSERT_EQ(sync.on_headers("h", chain.slice(f + 1, f + 2000), t, next), Feed::Extended);
+        f += 2000;
+        t += std::chrono::seconds(2);
+        sync.asked("h", t);
+    }
+    ASSERT_EQ(sched.frontier_height(), 30000u);
+    const uint256 base_hash = chain.hashes[0];  // the run's base is genesis here
+    (void)base_hash;
+    // Three sybils, each asked once by the hedge, each answers the locator
+    // from the run's base (height 0: the genesis entry) with ONE fake header.
+    const uint32_t base = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::string sybil = "sybil" + std::to_string(i);
+        sync.asked(sybil, t);
+        const auto r = sync.on_headers(sybil, v5_fakes(chain.hashes[base], base + 1, 1, 9000 + i), t, next);
+        std::cout << "  sybil " << i << " answer: " << HashSchedule::feed_name(r)
+                  << " frontier=" << sched.frontier_height() << " truncations=" << sync.truncations() << "\n";
+        // the carrier keeps delivering between the sybil answers
+        t += std::chrono::seconds(2);
+        sync.asked("h", t);
+        if (sched.frontier_height() == f)
+            ASSERT_EQ(sync.on_headers("h", chain.slice(f + 1, f + 2000), t, next), Feed::Extended);
+        f = sched.frontier_height();
+    }
+    EXPECT_EQ(sync.truncations(), 0u)
+        << "three zero-cost votes cut a run whose carrier delivered 2 s ago (frontier now "
+        << sched.frontier_height() << ")";
+    EXPECT_GE(sched.frontier_height(), 30000u) << "the honest run was cut";
+    EXPECT_EQ(sync.cut_peers(), 0u) << "the honest carrier was marked cut";
 }
