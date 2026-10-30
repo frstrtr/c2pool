@@ -6984,6 +6984,12 @@ int main(int argc, char* argv[]) {
                                     [doge_hdr_sync](const std::string& peer, const uint256& hash) {
                                         doge_hdr_sync->on_block_announced(peer, hash);
                                     });
+                                // No BIP 130 body getdata on each small headers answer (as
+                                // LTC with its fetch retry): the tip body is asked of its
+                                // announcer by the tip handler and chased by the cold-start
+                                // tick until it is in; with every announcer asked for headers,
+                                // this path fetched each DOGE tip body ~15 more times.
+                                broadcaster->set_fetch_announced_blocks(false);
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
                                     [doge_hdr_sync](const std::string& key,

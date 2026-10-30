@@ -14,6 +14,7 @@
 #include <impl/ltc/coin/p2p_node.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
 
+#include <chrono>
 #include <map>
 #include <set>
 #include <memory>
@@ -454,6 +455,18 @@ public:
             LOG_INFO << "[" << m_symbol << "] Full block requested from "
                      << sent << " peer(s)" << (services ? " (NODE_NETWORK)" : "") << ": "
                      << block_hash.GetHex().substr(0, 16) << "...";
+        } else if (services != 0) {
+            // Nobody advertises the services: nothing was sent (the one-peer
+            // paths fall back to any peer; this one must not). Once a minute.
+            const auto now = std::chrono::steady_clock::now();
+            if (m_no_service_peer_logged == std::chrono::steady_clock::time_point{}
+                || now - m_no_service_peer_logged >= std::chrono::minutes(1)) {
+                m_no_service_peer_logged = now;
+                LOG_WARNING << "[" << m_symbol << "] No peer advertising services 0x" << std::hex
+                            << services << std::dec << " to ask for block "
+                            << block_hash.GetHex().substr(0, 16) << "... (" << m_peers.size()
+                            << " peers): not requested";
+            }
         }
     }
 
@@ -804,6 +817,7 @@ private:
     uint64_t             m_cmpct_announce_version{2};
     uint32_t             m_cmpct_hb_peers{0};      // 0 = every connection asks for HB
     bool                 m_fetch_announced_blocks{true};
+    std::chrono::steady_clock::time_point m_no_service_peer_logged{};  // request_full_block_peers, under m_mutex
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
     RawHeadersSink       m_raw_headers_sink;        // NMC AuxPoW header-feed (optional)
