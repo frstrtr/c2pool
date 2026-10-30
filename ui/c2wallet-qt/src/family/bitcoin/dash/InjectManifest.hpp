@@ -50,6 +50,7 @@ struct ManifestData {
     std::vector<ManifestTx> txs;
     // maturity screen
     std::string intake_source;
+    bool coinbase_flags_known = false;  // the intake carried a coinbase flag for every row
     int64_t screen_tip_height = 0;
     std::string screen_tip_hash;
     int64_t target_height = 0;
@@ -67,6 +68,14 @@ struct ManifestData {
     std::string key_encoding;           // "compressed" | "uncompressed"
 };
 
+// Every input (txs[].inputs[], skipped.immature[]) is written in the shape of a
+// runtime-submit prevout claim, {txid, vout, value, script_hex, height,
+// coinbase}: value in duffs, script_hex the scriptPubKey it pays, coinbase a
+// boolean. When the intake carried no coinbase flag (maturity.
+// coinbase_flags_known false) the claim is `true`, the rule the builder held the
+// input to; a node whose oracle says otherwise refuses the claim, it never
+// mis-prices it.
+//
 // sha256 of the bytes, lowercase hex in natural order (what `sha256sum` prints).
 std::string sha256_hex(const std::string& bytes);
 // sha256d of the bytes, display order (byte-reversed, like a txid).

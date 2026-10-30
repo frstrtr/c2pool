@@ -637,6 +637,7 @@ void DashInjectModel::Impl::finish_signed(std::vector<SignedTx> txs)
     std::string file = emit_inject_file(txs);
     md.hex_file = file;
     md.intake_source = utxo_source_name(imp.source);
+    md.coinbase_flags_known = imp.coinbase_flags;
     md.screen_tip_height = imp.tip_height;
     md.screen_tip_hash = imp.tip_hash;
     md.target_height = screen.target_height;
