@@ -332,7 +332,10 @@ public:
         }
         if (auto* utxo = m_utxo.load()) {
             ::core::coin::Coin c;
-            if (utxo->get_coin(op, c) && !c.is_spent()) { out = c; return CoinProof::Unspent; }
+            // get_coin is true exactly for a coin the view holds (absence is an
+            // erased or missing entry). Coin::is_spent() would also read a real
+            // (value 0, empty script) coin as absent (VERIFY-S1 S2-3).
+            if (utxo->get_coin(op, c)) { out = c; return CoinProof::Unspent; }
         }
         if (fold_active()) {
             ::core::coin::Coin c;
@@ -550,7 +553,8 @@ public:
         for (const auto& vin : tx.vin) {
             ::core::coin::Coin coin;
             ::core::coin::Outpoint op{vin.prevout.hash, vin.prevout.index};
-            bool found = utxo != nullptr && utxo->get_coin(op, coin) && !coin.is_spent();
+            // View: present == unspent (no is_spent() filter, VERIFY-S1 S2-3).
+            bool found = utxo != nullptr && utxo->get_coin(op, coin);
             if (!found && m_external_coin_lookup) {
                 coin = ::core::coin::Coin{};
                 found = m_external_coin_lookup(op, coin) && !coin.is_spent();
@@ -2422,7 +2426,7 @@ private:
                                   std::vector<uint8_t>& spk_out) const {
         auto* utxo = m_utxo.load();
         ::core::coin::Coin coin;
-        if (utxo && utxo->get_coin(op, coin) && !coin.is_spent()) {
+        if (utxo && utxo->get_coin(op, coin)) {   // present == unspent (S2-3)
             spk_out = coin.scriptPubKey.m_data; return true;
         }
         auto pit = m_pool.find(op.txid);
