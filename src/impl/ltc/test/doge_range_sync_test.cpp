@@ -17,8 +17,8 @@
 //   - UnsolicitedWrongEndAnswersCannotRefuseTheAnchors,
 //     AWrongAnchorWithTwoPeersStillFallsBack, InFlightNeverExceedsGlobalUnderManyPeers
 //     (VERIFY5)
-//   - ALimitedLinkStrikesNoPeer (the in-flight budget follows the delivery
-//     rate), ADeliveryForgivesAStrike
+//   - ALimitedLinkStrikesNoPeer (a FIFO link), ASharedLinkDoesNotStrikeHonestPeers
+//     (a shared link: the budget reads the rate, not a burst), ADeliveryForgivesAStrike
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -29,6 +29,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <set>
 #include <string>
@@ -636,6 +637,9 @@ TEST(DogeRangeSync, WrongAnchorFallsBackToSequential)
     for (int i = 0; i < 6; ++i)
         peers.push_back("p" + std::to_string(i));
     auto t = t0();
+    // A range above the wrong anchor, delivered (exact, unasked) before the
+    // anchors are refused.
+    ASSERT_EQ(rs.on_headers("p0", c.slice(STEP * 10 + 1, STEP * 11), t), Answer::Stored);
     for (int sec = 0; sec < 600 && rs.mode() == Mode::Anchored; ++sec) {
         t = t0() + std::chrono::seconds(sec);
         for (const auto& r : rs.tick(peers, t))
@@ -643,7 +647,7 @@ TEST(DogeRangeSync, WrongAnchorFallsBackToSequential)
     }
     ASSERT_EQ(rs.mode(), Mode::SequentialFallback);
     EXPECT_EQ(rs.floor(), 4 * STEP) << "the contiguous prefix: ranges 0..3";
-    EXPECT_TRUE(sched->range_done(10)) << "a delivered range above the wrong anchor";
+    EXPECT_TRUE(sched->range_done(10)) << "a delivered range above the wrong anchor was dropped";
     {
         RangeSync again(*sched, anchors);
         EXPECT_EQ(again.mode(), Mode::Anchored) << "the refusal is per process: the next start tries the anchors";
@@ -919,9 +923,11 @@ TEST(DogeRangeSync, InFlightNeverExceedsGlobalUnderManyPeers)
 // The live fresh-node run beside a block IBD: the schedule's share of the
 // link was ~0.5 MB/s, an AuxPoW range ~1.6 MB, and 48 ranges in flight were
 // minutes of queue: every honest peer missed its 60 s and took strikes (17
-// in 5 minutes). Eighteen honest peers behind one link that delivers a range
-// every 4 s, in order: the in-flight budget follows the delivery rate, no
-// peer is struck or excluded, and the schedule completes.
+// in 5 minutes). Eighteen honest peers behind a FIFO link (one request
+// answered at a time, in order: deliveries evenly spaced) that delivers a
+// range every 4 s: the in-flight budget follows the delivery rate, no peer is
+// struck or excluded, and the schedule completes. The shared link (every
+// transfer at once, completing together) is ASharedLinkDoesNotStrikeHonestPeers.
 TEST(DogeRangeSync, ALimitedLinkStrikesNoPeer)
 {
     constexpr uint32_t CP = 100 * STEP;
@@ -994,4 +1000,106 @@ TEST(DogeRangeSync, ADeliveryForgivesAStrike)
     t += cfg.request_timeout + std::chrono::seconds(1);
     rs.tick({"a"}, t);  // the last silent ask times out
     EXPECT_FALSE(rs.excluded("a")) << "three strikes, one forgiven by a delivery: excluded anyway";
+}
+
+namespace {
+// VERIFY6 probe helpers.
+
+/// A processor-sharing link: every transfer in progress gets an equal share
+/// of `bytes_per_s` each second (how TCP flows share one downlink). A request
+/// keeps transferring after RangeSync released it (the peer still sends), as
+/// live; a copy of a range another peer already delivered arrives as
+/// Feed::Done (Answer::NotOurs).
+struct SharedLink {
+    struct Xfer {
+        RangeSync::Request req;
+        double left;
+    };
+    double bytes_per_s;
+    double range_bytes;
+    std::vector<Xfer> xfers;
+    void add(const RangeSync::Request& r) { xfers.push_back({r, range_bytes}); }
+    std::vector<RangeSync::Request> step()  // one second passes
+    {
+        std::vector<RangeSync::Request> done;
+        if (xfers.empty())
+            return done;
+        const double share = bytes_per_s / xfers.size();
+        for (auto& x : xfers)
+            x.left -= share;
+        for (auto it = xfers.begin(); it != xfers.end();) {
+            if (it->left <= 0) {
+                done.push_back(it->req);
+                it = xfers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return done;
+    }
+};
+
+std::vector<std::string> v6_peers(int n, const std::string& prefix = "p")
+{
+    std::vector<std::string> out;
+    for (int i = 0; i < n; ++i)
+        out.push_back(prefix + std::to_string(i));
+    return out;
+}
+
+} // namespace
+
+// VERIFY6 S1 (the verifier's probe V6-P1, kept as the KAT). 797de0e79 capped
+// the ranges in flight at what the last minute's deliveries bring in 30 s. Live (fresh-anchored run 3, 4ff71383a,
+// 08:05-08:13Z): rate 1,300 -> 33 hps, 19 strikes on 19 honest peers in 7
+// minutes, 0 in flight at 08:12Z. Ranges in flight share the link, so they
+// complete together; the budget divides the deliveries in the window by the
+// span since the OLDEST one (floor 10 s), so right after a burst it reads the
+// burst, not the link. Property probed: on a shared link of R MB/s with 18
+// honest peers, nobody is struck and the schedule completes near the link's
+// own time. On 4ff71383a: 72 / 175 / 212 strikes at 0.5 / 0.2 / 0.1 MB/s.
+TEST(DogeRangeSync, ASharedLinkDoesNotStrikeHonestPeers)
+{
+    constexpr uint32_t CP = 300 * STEP;
+    const Chain c(CP);
+    for (const double mbps : {0.5, 0.2, 0.1}) {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const auto peers = v6_peers(18);
+        SharedLink link{mbps * 1e6, 1.6e6, {}};
+        auto t = t0();
+        int sec = 0, idle = 0, max_idle = 0;
+        size_t max_budget = 0;
+        uint64_t dup = 0, delivered = 0;
+        const int ideal = static_cast<int>(300 * 1.6e6 / (mbps * 1e6));
+        for (; sec < 6 * ideal + 1200 && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                link.add(r);
+            const auto st = rs.stats(t);
+            max_budget = std::max<size_t>(max_budget, st.budget);
+            if (st.inflight == 0 && link.xfers.empty())
+                max_idle = std::max(max_idle, ++idle);
+            else
+                idle = 0;
+            for (const auto& r : link.step()) {
+                const auto a = rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+                if (a == Answer::NotOurs)
+                    ++dup;
+                else
+                    ++delivered;
+            }
+        }
+        const auto st = rs.stats(t);
+        std::cout << "  link " << mbps << " MB/s: " << RangeSync::mode_name(rs.mode()) << " after " << sec
+                  << " s (link-bound " << ideal << " s): strikes " << st.strikes << ", range timeouts "
+                  << st.timeouts << ", excluded " << st.excluded << ", exact deliveries " << delivered
+                  << ", duplicate copies " << dup << ", max budget " << max_budget << ", longest dead window "
+                  << max_idle << " s\n";
+        EXPECT_EQ(rs.mode(), Mode::Complete) << mbps << " MB/s";
+        EXPECT_EQ(st.excluded, 0u) << mbps << " MB/s";
+        EXPECT_LE(st.strikes, 2u) << "honest peers struck on a " << mbps << " MB/s link";
+        EXPECT_LE(sec, 2 * ideal + 600) << mbps << " MB/s: far from link-bound";
+    }
 }

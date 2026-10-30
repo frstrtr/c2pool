@@ -8,9 +8,14 @@
 /// answer is exactly it (HashSchedule::store_range): nothing partial is ever
 /// stored, so nothing is ever cut. The window is the lowest WINDOW
 /// undelivered ranges; at most PER_PEER in flight per peer, a range to one
-/// peer at a time; tick() every second. In all, at most what the last
-/// minute's delivery rate brings in BUDGET (half the request timeout),
-/// between MIN_INFLIGHT and GLOBAL: an AuxPoW range is ~1.6 MB, ranges in
+/// peer at a time; tick() every second. In all, at most what the delivery
+/// rate brings in BUDGET (a third of the request timeout), between
+/// MIN_INFLIGHT and GLOBAL. The rate is the last minute's deliveries over
+/// the minute (over the time since the sync began, at least 10 s, in its
+/// first minute), never over the span of the deliveries themselves: ranges
+/// in flight share the link and complete together, and a burst read as a
+/// rate overcommits threefold (VERIFY6 S1: 53 strikes, two honest peers
+/// excluded on a shared link). An AuxPoW range is ~1.6 MB, ranges in
 /// flight share the link, and 48 of them on a link that gives the schedule
 /// 0.2-0.5 MB/s are minutes of queue, so every peer would miss its 60 s and
 /// take strikes (live, a fresh node beside a block IBD and its own accrual
@@ -470,23 +475,28 @@ private:
         }
     }
 
-    /// How many ranges may be in flight: what the last minute's deliveries
-    /// bring in BUDGET, at least MIN_INFLIGHT (the start, a stalled minute),
-    /// at most GLOBAL.
+    /// How many ranges may be in flight: what the delivery rate brings in
+    /// budget_time(), at least MIN_INFLIGHT (the start, a stalled minute), at
+    /// most GLOBAL. The rate: the deliveries of the last minute over the
+    /// minute, or over the time since the sync began (at least 10 s) while it
+    /// is younger than a minute.
     size_t inflight_budget_locked(Clock::time_point now)
     {
+        if (m_started_at == Clock::time_point{})
+            m_started_at = now;
         while (!m_stored_at.empty() && now - m_stored_at.front() > std::chrono::seconds(60))
             m_stored_at.pop_front();
         size_t budget = MIN_INFLIGHT;
         if (!m_stored_at.empty()) {
-            const double span = std::max(10.0, std::chrono::duration<double>(now - m_stored_at.front()).count());
+            const double age = std::chrono::duration<double>(now - m_started_at).count();
+            const double span = std::clamp(age, 10.0, 60.0);
             const double per_second = m_stored_at.size() / span;
             budget = static_cast<size_t>(std::ceil(per_second * std::chrono::duration<double>(budget_time()).count()));
         }
         m_budget = std::clamp<size_t>(budget, std::min<size_t>(MIN_INFLIGHT, m_cfg.global), m_cfg.global);
         return m_budget;
     }
-    std::chrono::seconds budget_time() const { return m_cfg.request_timeout / 2; }
+    std::chrono::seconds budget_time() const { return m_cfg.request_timeout / 3; }
 
     /// Every connected peer excluded, for ALL_EXCLUDED_PATIENCE (new peers
     /// connect meanwhile): nothing can deliver the ranges.
@@ -562,6 +572,7 @@ private:
     uint64_t                        m_timeouts{0};
     uint64_t                        m_strikes{0};
     size_t                          m_budget{0};
+    Clock::time_point               m_started_at{};  // the first tick of this process
     Clock::time_point               m_all_excluded_since{};
     uint64_t                        m_short_parses{0};
     uint64_t                        m_bad_parses{0};
