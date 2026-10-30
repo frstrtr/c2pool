@@ -15,6 +15,7 @@
 //                            section ran in exactly one shard and no check
 //                            failed; the result files are removed once read;
 //   --plan=n                 prints the sections and cost of each of n shards.
+// The sections of one group run in one shard.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -34,26 +36,38 @@
 
 namespace pathb_kat {
 
-// A section in run order, with its cost (seconds under ASan+UBSan).
+// A section in run order, with its cost (seconds under ASan+UBSan) and its group (none: nullptr).
 struct KatSection {
     const char* name;
     void (*run)();
     std::uint64_t cost;
+    const char* group = nullptr;
 };
 
-// The shard of each section for n shards: the sections by cost, highest first (run order on equal cost), each to the
-// least loaded shard (the lowest index on equal load).
+// The shard of each section for n shards. A unit is a section without a group, or the sections of one group (at its
+// first section, with their summed cost). The units by cost, highest first (run order on equal cost), each to the
+// least loaded shard (the lowest index on equal load); a section runs in the shard of its unit.
 inline std::vector<std::size_t> shard_plan(const std::vector<KatSection>& sections, std::size_t n) {
-    std::vector<std::size_t> order(sections.size()), shard(sections.size());
-    std::iota(order.begin(), order.end(), std::size_t{0});
-    std::stable_sort(order.begin(), order.end(),
-                     [&](std::size_t a, std::size_t b) { return sections[a].cost > sections[b].cost; });
-    std::vector<std::uint64_t> load(n, 0);
-    for (const std::size_t k : order) {
-        const auto s = static_cast<std::size_t>(std::min_element(load.begin(), load.end()) - load.begin());
-        shard[k] = s;
-        load[s] += sections[k].cost;
+    std::vector<std::size_t> unit(sections.size()), order, shard(sections.size());
+    std::vector<std::uint64_t> cost(sections.size(), 0);
+    std::iota(unit.begin(), unit.end(), std::size_t{0});
+    for (std::size_t k = 0; k < sections.size(); ++k) {
+        for (std::size_t j = 0; j < k && sections[k].group != nullptr; ++j)
+            if (sections[j].group != nullptr && std::string_view(sections[j].group) == sections[k].group) {
+                unit[k] = unit[j];
+                break;
+            }
+        if (unit[k] == k) order.push_back(k);
+        cost[unit[k]] += sections[k].cost;
     }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return cost[a] > cost[b]; });
+    std::vector<std::uint64_t> load(n, 0);
+    for (const std::size_t u : order) {
+        const auto s = static_cast<std::size_t>(std::min_element(load.begin(), load.end()) - load.begin());
+        shard[u] = s;
+        load[s] += cost[u];
+    }
+    for (std::size_t k = 0; k < sections.size(); ++k) shard[k] = shard[unit[k]];
     return shard;
 }
 

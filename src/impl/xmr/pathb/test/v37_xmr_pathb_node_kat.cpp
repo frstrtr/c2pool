@@ -276,6 +276,9 @@
 //   relayjoint   the threaded join over TCP (the attempt on the join worker,
 //                applied on the owner); a RandomX failure in an attempt ends
 //                it alarmed, no token; the next attempt joins;
+//   relaypace    the join worker after a NotServed end (a short FC_HEADERS
+//                reply; threads, TCP, the relay's ticks): the next attempt no
+//                sooner than P-53;
 //   regtestk30   the regtest rig's K30 set: the golden G by default, a G of
 //                its own with a rig set, a kind-2 file for epoch 1 accepted
 //                at fixed = start + GRACE, refused off regtest;
@@ -325,11 +328,15 @@
 //                tip whose server answers its catch-up from position 0 with no
 //                header: J at that tip (C connects later; C's reply held);
 //                a server that never answers: no pair, K_NCU ended;
+//   catchctx     a caught-up store above position 0 whose catch-up step
+//                stays deferred on a P_r no node serves past kCtxTtlMs: no
+//                join pair;
 //   floorpr      the floor reading of #9: a carrier on a P_r held without
 //                its weights admitted; one above the floor DEFERs with no
 //                context and passes on the exact weights; #12 stays exact;
 //                a join replay on a band DEFER ends NotServed (no fetch, no
 //                loop) and waits on the weights.
+// Shards and their gather: pathb_kat_shard.hpp.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -362,8 +369,10 @@
 #include "c2pool/v37/xmr/pathb/pathb_relay_links.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_relay_node.hpp"
 #include "c2pool/v37/xmr/pathb/pathb_startup.hpp"
+#include "c2pool/v37/xmr/pathb/pathb_status.hpp"
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
+#include "pathb_kat_shard.hpp"
 #include "pathb_ratchet_sim.hpp"
 
 
@@ -7952,6 +7961,82 @@ void relayjoint() {
 }
 
 // ---------------------------------------------------------------------------
+// relaypace: the join worker's pacing after a NotServed end (threads, loopback TCP, the relay's own ticks; no
+// join_step call): a load-failed J (abandon_timeout_s 2) whose one server A answers each join page with one header
+// (A's FC_HEADERS frame holds one; J's request could take three) ends every attempt NotServed (a short FC_HEADERS
+// reply); the next attempt is never sooner than 2 s after the last one ended.
+void relaypace() {
+    const KatNet net;
+    std::uint64_t one = 0;  // an FC_HEADERS frame of one header
+    {
+        Harness h0(net);
+        const std::size_t n0 = h0.add(table0(net), true);
+        h0.tick_monero();
+        h0.mine(n0, 0, 900);
+        if (const pb::CarrierBodyV3* b = h0[n0].bodies().get(h0[n0].tree().best().id))
+            if (const auto f = pb::encode_fc_headers(pb::HeadersReply{0, 1, {pb::header_of(*b)}}, 1u << 22)) one = f->size();
+    }
+    Harness h(net);
+    h.tick_monero();
+    std::string why;
+    pb::CarrierLinks la, lj;
+    pb::PathbRelayOptions oa;
+    oa.listen = true;
+    oa.listen_host = "127.0.0.1";
+    pb::PathbRelayNode ra(oa, la);
+    pb::PathbNodeConfig ca = h.config(table0(net), true);
+    ca.headers_frame_bytes = one + (one - pb::kHeadersFrameHeadBytes) / 2;  // room for one header, not two
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(ca, ra.bind_io(h.io(0))));
+    ra.attach(*h.nodes[0]);
+    bool mined = one > pb::kHeadersFrameHeadBytes;
+    for (int i = 0; i < 3; ++i) {
+        const std::optional<pb::PathbJob> jb = h.job(0, static_cast<std::size_t>(i), 900 + i);
+        mined = mined && jb && h[0].on_own_share(*jb, 900 + i, pb::Hash32{}).action == pb::NodeAction::Placed;
+    }
+    const bool sa = ra.start(why);
+    using Clk = std::chrono::steady_clock;
+    std::mutex lm;
+    std::vector<std::pair<Clk::time_point, std::string>> ends;
+    pb::PathbRelayOptions oj;
+    oj.peers = {{"127.0.0.1", la.listen_port()}};
+    oj.join_min_peers = 1;
+    pb::PathbRelayNode rj(oj, lj, pb::RelayClock::system(), [&](const std::string& line) {
+        if (line.rfind("relay: join attempt", 0) != 0) return;
+        std::lock_guard<std::mutex> lk(lm);
+        ends.emplace_back(Clk::now(), line);
+    });
+    pb::PathbNodeConfig cj = h.config(table0(net));
+    cj.abandon_timeout_s = 2;
+    h.kvs.push_back(std::make_unique<MemoryKv>());
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cj, rj.bind_io(h.io(1)), h.kvs.back().get(), pb::PathbNode::LoadFailed{}));
+    rj.attach(*h.nodes[1]);
+    const bool sj = rj.start(why);
+    std::this_thread::sleep_for(std::chrono::seconds(9));
+    rj.stop();
+    ra.stop();
+    std::vector<std::pair<Clk::time_point, std::string>> e;
+    {
+        std::lock_guard<std::mutex> lk(lm);
+        e = ends;
+    }
+    std::size_t not_served = 0;
+    for (const auto& [t, line] : e)
+        if (line.find(": NotServed (") != std::string::npos && line.find("a short FC_HEADERS reply") != std::string::npos)
+            ++not_served;
+    double min_gap = 1e9;
+    for (std::size_t i = 1; i < e.size(); ++i)
+        min_gap = std::min(min_gap, std::chrono::duration<double>(e[i].first - e[i - 1].first).count());
+    std::printf("  relaypace: attempts %zu (NotServed, short reply %zu) in 9 s; the shortest gap %.2f s\n", e.size(),
+                not_served, e.size() > 1 ? min_gap : 0.0);
+    check(mined && sa && sj && e.size() >= 2 && not_served == e.size(),
+          "relaypace: setup (every attempt NotServed on a short FC_HEADERS reply; " + std::to_string(e.size()) +
+                  " attempts)" + (why.empty() ? "" : "; " + why));
+    check(e.size() <= 5 && min_gap >= 1.9,
+          "relaypace: after a NotServed end the next attempt comes no sooner than P-53 (2 s): " + std::to_string(e.size()) +
+                  " attempts in 9 s, the shortest gap " + std::to_string(min_gap) + " s");
+}
+
+// ---------------------------------------------------------------------------
 // ctxgate: a frame parked on a Monero input runs again only when that input is held, per (cause, id):
 //   storm   ten sibling carriers whose own P_r S the follower holds without its weights (a bodiless alternative):
 //           50 follower events run none of them again (one context asked for S); a DEFER waiting for the weights of
@@ -8671,16 +8756,14 @@ void pwalk() {
 }
 
 // pwalkshapes: the pwalk chain over wire / FC_HEADERS reply shapes (frames per second / seconds after the send): 1,000 / 8,
-// 500 / 8, 1,000 / 10, 1,500 / 8, 2,000 / 5; each as pwalk.
+// 500 / 8, 1,000 / 10, 1,500 / 8, 2,000 / 5; each as pwalk. One section per shape (pwalkshapes_<per_s>_<hold>).
+template <std::uint64_t per_s, std::uint64_t hold>
 void pwalkshapes() {
     const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
-    const std::pair<std::uint64_t, std::uint64_t> shapes[] = {{1000, 8}, {500, 8}, {1000, 10}, {1500, 8}, {2000, 5}};
-    for (const auto& [per_s, hold] : shapes) {
-        const PwalkRun r = pwalk_run(n, k, per_s, hold, 4 * bound, 44000);
-        const std::string tag = "pwalkshapes " + std::to_string(per_s) + " / " + std::to_string(hold);
-        pwalk_print(tag.c_str(), r, bound);
-        pwalk_checks(tag.c_str(), r, n, k, bound);
-    }
+    const PwalkRun r = pwalk_run(n, k, per_s, hold, 4 * bound, 44000);
+    const std::string tag = "pwalkshapes " + std::to_string(per_s) + " / " + std::to_string(hold);
+    pwalk_print(tag.c_str(), r, bound);
+    pwalk_checks(tag.c_str(), r, n, k, bound);
 }
 
 // pwalkfull: the pwalk chain at 500 frames per second, the FC_HEADERS replies 8 s after they are sent: J's deferred
@@ -9968,7 +10051,9 @@ KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const p
     pb::RelayClock clock;
     clock.mono_ms = [&h] { return h.now * 1000; };
     clock.wall_s = [&h] { return h.now; };
-    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock);
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock, [n = h.nodes.size()](const std::string& line) {
+        if (g_relay_lines != nullptr) (*g_relay_lines)[n].push_back(line);
+    });
     k.node = h.nodes.size();
     h.kvs.push_back(std::make_unique<MemoryKv>(from));
     MemoryKv& kv = *h.kvs.back();
@@ -9995,6 +10080,77 @@ std::function<void(FakeWire::Msg&)> drop_headers(std::size_t from, std::size_t t
 
 // Two relay nodes (both launched; wire 0 = A, wire 1 = B): they mine `shared` carriers on one chain; apart, B mines
 // `own` on its branch and A `more` on its chain (A's heavier).
+// A decimal number, the whole string (at most 19 digits).
+bool whole_u64(const std::string& s, std::uint64_t& v) {
+    if (s.empty() || s.size() > 19) return false;
+    v = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    return true;
+}
+
+// A `relay: caught up (<form>) at pos <n> t=<unix ms>` line, parsed whole.
+struct CaughtLine {
+    std::string form;
+    std::uint64_t pos = 0, t = 0;
+};
+constexpr const char* kCaughtDone = "the catch-up from every HELLO peer ended by its done test";
+constexpr const char* kCaughtJoin = "a join attempt completed; rule (4) kept the node's chain";
+std::optional<CaughtLine> parse_caught(const std::string& l) {
+    static const std::string pre = "relay: caught up (", mid = ") at pos ", tk = " t=";
+    if (l.rfind(pre, 0) != 0) return std::nullopt;
+    const std::size_t m = l.rfind(mid), k = l.rfind(tk);
+    if (m == std::string::npos || m < pre.size() || k == std::string::npos || k < m + mid.size()) return std::nullopt;
+    CaughtLine c;
+    c.form = l.substr(pre.size(), m - pre.size());
+    if (!whole_u64(l.substr(m + mid.size(), k - m - mid.size()), c.pos) || !whole_u64(l.substr(k + tk.size()), c.t))
+        return std::nullopt;
+    return c;
+}
+// The `relay: caught up (` lines of one node.
+std::vector<std::string> caught_of(const std::map<std::size_t, std::vector<std::string>>& lines, std::size_t node) {
+    std::vector<std::string> out;
+    if (const auto it = lines.find(node); it != lines.end())
+        for (const std::string& l : it->second)
+            if (l.rfind("relay: caught up (", 0) == 0) out.push_back(l);
+    return out;
+}
+
+// statustime: the status block's time line (serve_pathb prints it after `status: up=`) on the system relay clock:
+// "  time: t=<unix ms>", parsed whole; three prints 3 ms apart rise, each inside the system clock's bracket.
+void statustime() {
+    const auto sys_ms = [] {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::system_clock::now().time_since_epoch())
+                                                  .count());
+    };
+    const std::string pre = "  time: t=";
+    const bool fixed = pb::status_time_line(1761700000123ULL) == "  time: t=1761700000123";
+    const pb::RelayClock c = pb::RelayClock::system();
+    std::vector<std::uint64_t> ts;
+    bool parsed = true, inside = true;
+    std::string last;
+    for (int i = 0; i < 3; ++i) {
+        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        const std::uint64_t lo = sys_ms();
+        last = pb::status_time_line(c.wall_ms());
+        const std::uint64_t hi = sys_ms();
+        std::uint64_t t = 0;
+        parsed = parsed && last.rfind(pre, 0) == 0 && whole_u64(last.substr(pre.size()), t);
+        inside = inside && t >= lo && t <= hi;
+        ts.push_back(t);
+    }
+    const bool rising = ts.size() == 3 && ts[0] < ts[1] && ts[1] < ts[2];
+    std::printf("  statustime: %s; rises %llu -> %llu -> %llu\n", last.c_str(), (unsigned long long)ts[0],
+                (unsigned long long)ts[1], (unsigned long long)ts[2]);
+    check(fixed, "statustime: status_time_line(1761700000123) == \"  time: t=1761700000123\"");
+    check(parsed && inside && rising,
+          "statustime: three time lines on the system relay clock parse whole, each inside the system clock's unix-ms "
+          "bracket, and rise");
+}
+
 struct Branches {
     KatRelay a, b;
     bool ok = true;
@@ -10050,14 +10206,20 @@ void catchkeep() {
     const bool claim_loses = !pb::fork_choice_prefers(pb::ChainTip{h[b].tree().best().cum_work, h[b].tree().best().id},
                                                       pb::ChainTip{h[j.node].tree().best().cum_work, tip_a});
     w.edit = drop_headers(2, 1);  // B's own catch-up toward J gets no reply: B stays on its branch
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
     w.connect(1, 2);
     w.run();
+    const std::uint64_t t_line = h.now * 1000;  // the relay clock's wall_s() * 1000 (the KAT clock sets no wall_ms)
     const std::uint64_t asks = j.relay->stats().catchup_requests.load();
     const bool caught = h[j.node].caught_up() && kvj.data.count(ncu) == 0 && !h[j.node].first_round_open();
     const bool kept = h[j.node].tree().best().id == tip_a && !h[j.node].holds_tip(h[b].tree().best().id);
     w.links[2]->disconnect(w.id(2, 1));
     w.run();
     w.edit = nullptr;
+    g_relay_lines = nullptr;
+    const std::vector<std::string> cl = caught_of(lines, j.node);
+    const std::optional<CaughtLine> c = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
     const pb::TemplateStatus s1 = tstatus(h, j.node);
     std::printf("  catchkeep: J at %llu (B at %llu); catch-up asks %llu; caught up %d; templates %d -> %d\n",
                 (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[b].tree().best().pos,
@@ -10067,6 +10229,11 @@ void catchkeep() {
     check(asks >= 2 && kept && caught && s1 != pb::TemplateStatus::NoPathbPeer && s1 != pb::TemplateStatus::CatchingUp,
           "catchkeep: the catch-up toward B's unheld lighter tip ends at its reply (A's chain kept) and leaves the store "
           "caught up: the record gone, templates with no peer (asks " + std::to_string(asks) + ")");
+    std::printf("  catchkeep: %s\n", cl.empty() ? "no caught-up line" : cl[0].c_str());
+    check(c && c->form == kCaughtDone && c->pos == 6 && c->pos == h[j.node].tree().best().pos && c->t == t_line,
+          "catchkeep: one caught-up line, the done-test form ending \" at pos 6 t=" + std::to_string(t_line) +
+                  "\" (J's best position, the relay clock's unix ms at the line; lines " + std::to_string(cl.size()) +
+                  ")");
 }
 
 // catchlight: a lighter unheld tip costs at most one locator round per HELLO and never switches the chain. A holds
@@ -10320,9 +10487,10 @@ void catchtok() {
                     static_cast<int>(s1));
         check(br.ok && walked && s0 == pb::TemplateStatus::NoPathbPeer && (ban || edited >= 1),
               tag + "setup (J not caught up at A's tip; B's tip lighter and not held at J)");
-        check(kept && caught && (ban ? bans >= 1 : strikes >= 1) && s1 != pb::TemplateStatus::NoPathbPeer
+        check(kept && caught && (ban ? bans >= 1 : strikes >= 1 && bans == 0) && s1 != pb::TemplateStatus::NoPathbPeer
                       && s1 != pb::TemplateStatus::CatchingUp,
-              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept");
+              tag + "the catch-up ended by its reply leaves the store caught up, its chain kept (strikes " +
+                      std::to_string(strikes) + ", bans " + std::to_string(bans) + ")");
     }
 }
 
@@ -10346,7 +10514,11 @@ struct HeavyResult {
     bool at_c = false;
     bool ncu_end = false;        // K_NCU set at the end
     std::uint64_t c_asks = 0;    // catch-up requests after B's attempt
+    std::size_t c_pairs = 0;     // the joiner's queue after C's empty reply from position 0 (before any attempt)
+    bool c_again = false;        // C's tip offered again by the same server: a second pair queued
     int restart_round = -1;      // silent: after a restart and C's HELLO, the first round open (1) or not (0)
+    std::vector<std::string> caught;  // J's `relay: caught up (` lines over the run
+    std::uint64_t b_pos = 0, b_t = 0;  // J's best position and the relay clock's unix ms at B's attempt
 };
 HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
     const KatNet net;
@@ -10434,6 +10606,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
             w.run();
         }
     };
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
     w.connect(1, jwire);
     if (mode != 0) w.connect(0, jwire);
     w.run();
@@ -10449,6 +10623,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
     }
     out.b_completed = sb && sb->report && sb->report->end == pb::AttemptEnd::Completed && !sb->sw.adopted && !sb->sw.replaced
                       && sb->report->server == static_cast<std::uint64_t>(1 + 1);
+    out.b_pos = h[j.node].tree().best().pos;
+    out.b_t = h.now * 1000;
     out.ncu_after_b = !h[j.node].caught_up();
     const std::uint64_t offers0 = rj.stats().empty_store_offers.load();
     const std::uint64_t asks0 = rj.stats().catchup_requests.load();
@@ -10459,6 +10635,10 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
     if (mode == 0) {
         w.connect(0, jwire);
         w.run();
+    }
+    if (mode != 2) {  // one pair per (tip, server): the same server's tip offered again queues none
+        out.c_pairs = h[j.node].joiner().queue().size();
+        out.c_again = h[j.node].offer_empty_store_tip(w.id(jwire, 0));
     }
     const std::uint64_t p53 = h[j.node].config().abandon_timeout_s;
     ticks(static_cast<int>(mode == 2 ? 5 * p53 : 3 * p53));
@@ -10473,6 +10653,8 @@ HeavyResult catch_heavy(int mode) {  // 0 later, 1 open, 2 silent
         out.restart_round = h[jr].first_round_open() ? 1 : 0;
     }
     w.edit = nullptr;
+    g_relay_lines = nullptr;
+    out.caught = caught_of(lines, j.node);
     return out;
 }
 void catchheavy() {
@@ -10485,15 +10667,86 @@ void catchheavy() {
                     tag.c_str(), r.b_completed ? 1 : 0, r.ncu_after_b ? 1 : 0, (unsigned long long)r.c_offers,
                     (unsigned long long)r.c_asks, (unsigned long long)r.j_pos, r.at_c ? 1 : 0, r.ncu_end ? 1 : 0,
                     r.restart_round);
+        for (const std::string& l : r.caught) std::printf("  %s%s (B's attempt at pos %llu t=%llu)\n", tag.c_str(), l.c_str(),
+                                                          (unsigned long long)r.b_pos, (unsigned long long)r.b_t);
+        const std::optional<CaughtLine> c = r.caught.size() == 1 ? parse_caught(r.caught[0]) : std::nullopt;
+        check(c && c->form == kCaughtJoin && c->pos == 8 && c->pos == r.b_pos && c->t == r.b_t,
+              tag + "B's completed attempt: one caught-up line, the join-attempt form ending \" at pos 8 t=" +
+                      std::to_string(r.b_t) + "\" (J's best position, the relay clock's unix ms at the line; lines " +
+                      std::to_string(r.caught.size()) + ")");
         check(r.setup && r.b_completed, tag + "setup (J at D's 8, K_NCU; B's attempt completes, rule (4) keeps J's chain)");
         if (mode != 2)
-            check(r.c_offers >= 1 && r.at_c && !r.ncu_end,
-                  tag + "C's heavier unheld tip gets a join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+            check(r.c_offers == 1 && r.c_pairs == 1 && !r.c_again && r.at_c && !r.ncu_end,
+                  tag + "C's heavier unheld tip gets one join pair and J reaches it (offers " + std::to_string(r.c_offers) +
+                          ", pairs " + std::to_string(r.c_pairs) + ", again " + std::to_string(r.c_again ? 1 : 0) +
                           ", J at " + std::to_string(r.j_pos) + ")");
         else
             check(r.c_offers == 0 && r.j_pos == 8 && !r.ncu_end && r.restart_round == 0,
                   tag + "no reply, no pair: J keeps its chain; K_NCU ended; a restart opens no first round");
     }
+}
+
+// ---------------------------------------------------------------------------
+// catchctx: a caught-up store above position 0 (launched; J at A's 4) whose catch-up step stays deferred on a P_r no
+// node serves (X, the P_r of A's carriers 5..7) past kCtxTtlMs: no join pair, J at 4 (the kCtxTtlMs offer reads K_NCU).
+void catchctx() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay j = kat_relay(h, w, table0(net), true, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview));
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 4600 + static_cast<std::uint32_t>(i));
+    }
+    for (int k = 0; k < 3; ++k) {
+        h.now += 1;
+        rj.tick();
+        w.run();
+    }
+    ok = ok && h[j.node].tree().best().id == h[a.node].tree().best().id && h[j.node].tree().best().pos == 4;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    h.tick_monero();
+    for (int i = 0; i < 3; ++i)
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), 4700 + static_cast<std::uint32_t>(i));
+    const std::optional<pb::Hash32> c5 = h[a.node].store().best_at(5);
+    const pb::CarrierBodyV3* b5 = c5 ? h[a.node].bodies().get(*c5) : nullptr;
+    if (!ok || b5 == nullptr) {
+        check(false, "catchctx: setup (J at A's 4; A at 7)");
+        return;
+    }
+    hidden.insert(b5->own.blob.prev_id);
+    const std::uint64_t def0 = rj.stats().headers_ctx_deferred.load();
+    w.reconnect(0, 1);
+    w.run();
+    const bool deferred = rj.stats().headers_ctx_deferred.load() > def0;
+    for (int k = 0; k < 125; ++k) {  // 625 s
+        h.now += 5;
+        rj.tick();
+        w.run();
+        (void)rj.join_step();
+        w.run();
+    }
+    const std::uint64_t offers = rj.stats().catchup_join_offers.load();
+    std::printf("  catchctx: J at %llu (A at %llu); deferred %d; caught up %d; kCtxTtlMs offers %llu; pairs %zu; attempts "
+                "%llu\n",
+                (unsigned long long)h[j.node].tree().best().pos, (unsigned long long)h[a.node].tree().best().pos,
+                deferred ? 1 : 0, h[j.node].caught_up() ? 1 : 0, (unsigned long long)offers,
+                h[j.node].joiner().queue().size(), (unsigned long long)rj.stats().join_attempts.load());
+    check(deferred && h[j.node].caught_up(), "catchctx: setup (J caught up; its catch-up step DEFERs on X)");
+    check(offers == 0 && h[j.node].joiner().queue().size() == 0 && rj.stats().join_attempts.load() == 0
+                  && h[j.node].tree().best().pos == 4,
+          "catchctx: a caught-up store's catch-up deferred past kCtxTtlMs queues no join pair (offers " +
+                  std::to_string(offers) + ")");
 }
 
 // ---------------------------------------------------------------------------
@@ -11875,171 +12128,177 @@ void hp_qbound() {
 
 int main(int argc, char** argv) {
     std::printf("v37_xmr_pathb_node_kat\n");
-    const std::string only = argc > 1 ? argv[1] : "";
-    const auto run = [&](const char* name, void (*fn)()) {
-        if (only.empty() || only == name) run_part(name, fn);
-    };
-    run("genesis", genesis);
-    run("relay", relay);
-    run("race", race);
-    run("racelate", racelate);
-    run("raceskip", raceskip);
-    run("carriage", carriage);
-    run("feediverse", feediverse);
-    run("repend", repend);
-    run("n3", n3);
-    run("own", own_share);
-    run("m23", m23);
-    run("restart", restart);
-    run("n5", n5);
-    run("hold", hold_kind2);
-    run("c48", c48);
-    run("rrfix3", rrfix3);
-    run("deep", deep);
-    run("joinserve", joinserve);
-    run("n7b2", n7b2);
-    run("startup", startup);
-    run("poison", poison);
-    run("joinpages", joinpages);
-    run("tokens", tokens);
-    run("receive", receive);
-    run("hellobound", hellobound);
-    run("base", base);
-    run("boundary", boundary);
-    run("timers", timers);
-    run("j1stale", j1stale);
-    run("relayj1stale", relayj1stale);
-    run("hdrstrike", hdrstrike);
-    run("hdrseed", hdrseed);
-    run("catchpage", catchpage);
-    run("catchhold", catchhold);
-    run("catchslow", catchslow);
-    run("catchgone", catchgone);
-    run("catchlost", catchlost);
-    run("catchfull", catchfull);
-    run("hp_stale", hp_stale);
-    run("hp_tipkeep", hp_tipkeep);
-    run("hp_tip_in_page", hp_tip_in_page);
-    run("hp_stale_after_tip", hp_stale_after_tip);
-    run("hp_side_in_page", hp_side_in_page);
-    run("hp_ctxslot", hp_ctxslot);
-    run("hp_firstround", hp_firstround);
-    run("hp_guard", hp_guard);
-    run("hp_crawl", hp_crawl);
-    run("hp_qbound", hp_qbound);
-    run("buckets", buckets);
-    run("relaytok", relaytok);
-    run("relaym4", relaym4);
-    run("relaybudget", relaybudget);
-    run("relayfetch", relayfetch);
-    run("relaysmoke", relaysmoke);
-    run("relayq", relayq);
-    run("relayindex", relayindex);
-    run("relayp15", relayp15);
-    run("relayp15rx", relayp15rx);
-    run("ownbound", ownbound);
-    run("deferfound", deferfound);
-    run("blockblob", blockblob);
-    run("alarmbound", alarmbound);
-    run("relaystale", relaystale);
-    run("relaytip", relaytip);
-    run("relaysq", relaysq);
-    run("revrx_drain", revrx_drain);
-    run("drainban", drainban);
-    run("drainstrike", drainstrike);
-    run("drainhonest", drainhonest);
-    run("draingone", draingone);
-    run("relayrxhdr", relayrxhdr);
-    run("hdrnohash", hdrnohash);
-    run("relayrxnohash", relayrxnohash);
-    run("relayrxtype", relayrxtype);
-    run("relaystalem", relaystalem);
-    run("relayrxbind", relayrxbind);
-    run("relaymaxpage", relaymaxpage);
-    run("rev99_complete", rev99_complete);
-    run("ownrx", ownrx);
-    run("relayrxbindr", relayrxbindr);
-    run("relayrxbindk", relayrxbindk);
-    run("relayp15once", relayp15once);
-    run("relayverdictlog", relayverdictlog);
-    run("relayparkstrike", relayparkstrike);
-    run("repevict", repevict);
-    run("openstate", openstate);
-    run("opendead", opendead);
-    run("statusperiod", statusperiod);
-    run("ownorphan", ownorphan);
-    run("liveness", liveness);
-    run("wingolden", wingolden);
-    run("wingoldenmb", wingoldenmb);
-    run("relayomit", relayomit);
-    run("relayomitgone", relayomitgone);
-    run("omitrules", omitrules);
-    run("omitfresh", omitfresh);
-    run("omitopen", omitopen);
-    run("omitcompete", omitcompete);
-    run("omitwalk", omitwalk);
-    run("omithonest", omithonest);
-    run("relayswitchlog", relayswitchlog);
-    run("relaybindswitch", relaybindswitch);
-    run("relayrepend", relayrepend);
-    run("revrepend2", revrepend2);
-    run("relayrpark", relayrpark);
-    run("relayhdrctx", relayhdrctx);
-    run("relayrbindr", relayrbindr);
-    run("relayrparkseal", relayrparkseal);
-    run("relayrparkgone", relayrparkgone);
-    run("revjunkbig", revjunkbig);
-    run("revdueorder", revdueorder);
-    run("relayqfull", relayqfull);
-    run("relayreoffercap", relayreoffercap);
-    run("relayrxbind2", relayrxbind2);
-    run("ownrxrun", ownrxrun);
-    run("relayp40", relayp40);
-    run("relayp50", relayp50);
-    run("relayjoint", relayjoint);
-    run("regtestk30", regtestk30);
-    run("prune_young", prune_young);
-    run("prune_default", prune_default);
-    run("prune_flags", prune_flags);
-    run("prune_side", prune_side);
-    run("sideprune", sideprune);
-    run("prune_hold", prune_hold);
-    run("below", below);
-    run("jobslot", jobslot);
-    run("minerwithdraw", minerwithdraw);
-    run("minerflush", minerflush);
-    run("ctxgate", ctxgate);
-    run("parkidx", parkidx);
-    run("catchjoin", catchjoin);
-    run("catchwalk", catchwalk);
-    run("catchgate", catchgate);
-    run("catchrestart", catchrestart);
-    run("catchlocator", catchlocator);
-    run("pwalk", pwalk);
-    run("pwalkshapes", pwalkshapes);
-    run("pwalkfull", pwalkfull);
-    run("pwalkcrawl", pwalkcrawl);
-    run("pwalkstall", pwalkstall);
-    run("pwalklost", pwalklost);
-    run("pwalksilent", pwalksilent);
-    run("rcsilent", rcsilent);
-    run("rclate", rclate);
-    run("rcrehello", rcrehello);
-    run("pwalkgone", pwalkgone);
-    run("pwalkjunk", pwalkjunk);
-    run("pwalkskipfull", pwalkskipfull);
-    run("pwalkasked", pwalkasked);
-    run("pwalkdup", pwalkdup);
-    run("sealall", sealall);
-    run("placedcopy", placedcopy);
-    run("placedvariant", placedvariant);
-    run("revnotcarrier", revnotcarrier);
-    run("catchkeep", catchkeep);
-    run("catchlight", catchlight);
-    run("catchoffer", catchoffer);
-    run("revcatchundec", revcatchundec);
-    run("catchtok", catchtok);
-    run("catchheavy", catchheavy);
-    run("floorpr", floorpr);
-    return finish("v37_xmr_pathb_node_kat");
+    return run_sections("v37_xmr_pathb_node_kat",
+                        {
+                                {"genesis", genesis, 0},
+                                {"relay", relay, 1},
+                                {"race", race, 0},
+                                {"racelate", racelate, 0},
+                                {"raceskip", raceskip, 0},
+                                {"carriage", carriage, 0},
+                                {"feediverse", feediverse, 1},
+                                {"repend", repend, 0},
+                                {"n3", n3, 0},
+                                {"own", own_share, 0},
+                                {"m23", m23, 0},
+                                {"restart", restart, 1},
+                                {"n5", n5, 0},
+                                {"hold", hold_kind2, 0},
+                                {"c48", c48, 0},
+                                {"rrfix3", rrfix3, 3},
+                                {"deep", deep, 0},
+                                {"joinserve", joinserve, 11},
+                                {"n7b2", n7b2, 1},
+                                {"startup", startup, 0},
+                                {"poison", poison, 0},
+                                {"joinpages", joinpages, 1},
+                                {"tokens", tokens, 0},
+                                {"receive", receive, 3},
+                                {"hellobound", hellobound, 0},
+                                {"base", base, 0},
+                                {"boundary", boundary, 1},
+                                {"timers", timers, 0},
+                                {"j1stale", j1stale, 0},
+                                {"relayj1stale", relayj1stale, 0},
+                                {"hdrstrike", hdrstrike, 0},
+                                {"hdrseed", hdrseed, 0},
+                                {"catchpage", catchpage, 46},
+                                {"catchhold", catchhold, 7},
+                                {"catchslow", catchslow, 8},
+                                {"catchgone", catchgone, 3},
+                                {"catchlost", catchlost, 1},
+                                {"catchfull", catchfull, 0},
+                                {"hp_stale", hp_stale, 0},
+                                {"hp_tipkeep", hp_tipkeep, 2},
+                                {"hp_tip_in_page", hp_tip_in_page, 0},
+                                {"hp_stale_after_tip", hp_stale_after_tip, 0},
+                                {"hp_side_in_page", hp_side_in_page, 0},
+                                {"hp_ctxslot", hp_ctxslot, 0},
+                                {"hp_firstround", hp_firstround, 0},
+                                {"hp_guard", hp_guard, 0},
+                                {"hp_crawl", hp_crawl, 7},
+                                {"hp_qbound", hp_qbound, 53},
+                                {"buckets", buckets, 1},
+                                {"relaytok", relaytok, 0},
+                                {"relaym4", relaym4, 0},
+                                {"relaybudget", relaybudget, 0},
+                                {"relayfetch", relayfetch, 0},
+                                {"relaysmoke", relaysmoke, 0},
+                                {"relayq", relayq, 0},
+                                {"relayindex", relayindex, 0},
+                                {"relayp15", relayp15, 0},
+                                {"relayp15rx", relayp15rx, 0},
+                                {"ownbound", ownbound, 0},
+                                {"deferfound", deferfound, 0},
+                                {"blockblob", blockblob, 0},
+                                {"alarmbound", alarmbound, 0},
+                                {"relaystale", relaystale, 4},
+                                {"relaytip", relaytip, 0},
+                                {"relaysq", relaysq, 0},
+                                {"revrx_drain", revrx_drain, 0},
+                                {"drainban", drainban, 0},
+                                {"drainstrike", drainstrike, 0},
+                                {"drainhonest", drainhonest, 0},
+                                {"draingone", draingone, 0},
+                                {"relayrxhdr", relayrxhdr, 0},
+                                {"hdrnohash", hdrnohash, 0},
+                                {"relayrxnohash", relayrxnohash, 0},
+                                {"relayrxtype", relayrxtype, 0},
+                                {"relaystalem", relaystalem, 0},
+                                {"relayrxbind", relayrxbind, 0},
+                                {"relaymaxpage", relaymaxpage, 0},
+                                {"rev99_complete", rev99_complete, 0},
+                                {"ownrx", ownrx, 0},
+                                {"relayrxbindr", relayrxbindr, 0},
+                                {"relayrxbindk", relayrxbindk, 0},
+                                {"relayp15once", relayp15once, 0},
+                                {"relayverdictlog", relayverdictlog, 0},
+                                {"relayparkstrike", relayparkstrike, 0},
+                                {"repevict", repevict, 0},
+                                {"openstate", openstate, 0},
+                                {"opendead", opendead, 0},
+                                {"statusperiod", statusperiod, 0},
+                                {"ownorphan", ownorphan, 0},
+                                {"liveness", liveness, 0},
+                                {"wingolden", wingolden, 0},
+                                {"wingoldenmb", wingoldenmb, 0},
+                                {"relayomit", relayomit, 0},
+                                {"relayomitgone", relayomitgone, 0},
+                                {"omitrules", omitrules, 0},
+                                {"omitfresh", omitfresh, 0},
+                                {"omitopen", omitopen, 1},
+                                {"omitcompete", omitcompete, 0},
+                                {"omitwalk", omitwalk, 0},
+                                {"omithonest", omithonest, 0},
+                                {"relayswitchlog", relayswitchlog, 0},
+                                {"relaybindswitch", relaybindswitch, 0},
+                                {"relayrepend", relayrepend, 0},
+                                {"revrepend2", revrepend2, 0},
+                                {"relayrpark", relayrpark, 0},
+                                {"relayhdrctx", relayhdrctx, 0},
+                                {"relayrbindr", relayrbindr, 0},
+                                {"relayrparkseal", relayrparkseal, 0},
+                                {"relayrparkgone", relayrparkgone, 0},
+                                {"revjunkbig", revjunkbig, 13},
+                                {"revdueorder", revdueorder, 0},
+                                {"relayqfull", relayqfull, 0},
+                                {"relayreoffercap", relayreoffercap, 0},
+                                {"relayrxbind2", relayrxbind2, 0},
+                                {"ownrxrun", ownrxrun, 0},
+                                {"relayp40", relayp40, 0},
+                                {"relayp50", relayp50, 0},
+                                {"relayjoint", relayjoint, 2},
+                                {"relaypace", relaypace, 9},
+                                {"regtestk30", regtestk30, 0},
+                                {"prune_young", prune_young, 12, "prune_chain"},
+                                {"prune_default", prune_default, 5, "prune_chain"},
+                                {"prune_flags", prune_flags, 4, "prune_chain"},
+                                {"prune_side", prune_side, 0, "prune_chain"},
+                                {"sideprune", sideprune, 5, "prune_chain"},
+                                {"prune_hold", prune_hold, 4, "prune_chain"},
+                                {"below", below, 111},
+                                {"jobslot", jobslot, 1},
+                                {"minerwithdraw", minerwithdraw, 0},
+                                {"minerflush", minerflush, 0},
+                                {"ctxgate", ctxgate, 1},
+                                {"parkidx", parkidx, 0},
+                                {"catchjoin", catchjoin, 0},
+                                {"catchwalk", catchwalk, 0},
+                                {"catchgate", catchgate, 0},
+                                {"catchrestart", catchrestart, 0},
+                                {"catchlocator", catchlocator, 0},
+                                {"pwalk", pwalk, 99},
+                                {"pwalkshapes_1000_8", pwalkshapes<1000, 8>, 116},
+                                {"pwalkshapes_500_8", pwalkshapes<500, 8>, 117},
+                                {"pwalkshapes_1000_10", pwalkshapes<1000, 10>, 108},
+                                {"pwalkshapes_1500_8", pwalkshapes<1500, 8>, 84},
+                                {"pwalkshapes_2000_5", pwalkshapes<2000, 5>, 75},
+                                {"pwalkfull", pwalkfull, 102},
+                                {"pwalkcrawl", pwalkcrawl, 111},
+                                {"pwalkstall", pwalkstall, 94},
+                                {"pwalklost", pwalklost, 1},
+                                {"pwalksilent", pwalksilent, 3},
+                                {"rcsilent", rcsilent, 6},
+                                {"rclate", rclate, 5},
+                                {"rcrehello", rcrehello, 0},
+                                {"pwalkgone", pwalkgone, 0},
+                                {"pwalkjunk", pwalkjunk, 0},
+                                {"pwalkskipfull", pwalkskipfull, 0},
+                                {"pwalkasked", pwalkasked, 1},
+                                {"pwalkdup", pwalkdup, 0},
+                                {"sealall", sealall, 1},
+                                {"placedcopy", placedcopy, 0},
+                                {"placedvariant", placedvariant, 0},
+                                {"revnotcarrier", revnotcarrier, 0},
+                                {"statustime", statustime, 0},
+                                {"catchkeep", catchkeep, 0},
+                                {"catchlight", catchlight, 0},
+                                {"catchoffer", catchoffer, 0},
+                                {"revcatchundec", revcatchundec, 0},
+                                {"catchtok", catchtok, 0},
+                                {"catchheavy", catchheavy, 0},
+                                {"catchctx", catchctx, 0},
+                                {"floorpr", floorpr, 0},
+                        },
+                        argc, argv);
 }
