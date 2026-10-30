@@ -56,6 +56,32 @@ if [ -n "$_cfg_dir" ]; then
     esac
   fi
 fi
+
+# --- host-RAM clamp (opt-in per lock via the mem-gb-per-slot input) ---
+# Never run more concurrent holders than the host RAM can hold at
+# MEM_GB_PER_SLOT GB each (the RAM lock uses 20, one ASan/CodeQL leg's budget).
+# On the 62 GB VM905 build host 62/20 = 3, so slots=2 is kept; on a 31 GB runner
+# (e.g. .198, 0 swap) it clamps to 1 so two heavy legs cannot co-OOM the box.
+# Applied AFTER the host override, so an override can lower SLOTS but never raise
+# it past what the RAM holds. 0 (the default) disables it, as for the disk lock.
+# HEAVY_LEG_MEMTOTAL_KB exists ONLY for the honesty-gate test.
+MEM_GB_PER_SLOT="${HEAVY_LEG_MEM_GB_PER_SLOT:-0}"
+case "$MEM_GB_PER_SLOT" in
+  ''|*[!0-9]*|0?*)
+    echo "::warning::heavy-leg lock: ignoring mem-gb-per-slot '${MEM_GB_PER_SLOT}' (not a non-negative integer) -- RAM clamp disabled"
+    MEM_GB_PER_SLOT=0 ;;
+esac
+if [ "$MEM_GB_PER_SLOT" -gt 0 ]; then
+  _mem_kb="${HEAVY_LEG_MEMTOTAL_KB:-$(awk '/^MemTotal:/{print $2}' /proc/meminfo)}"
+  _mem_gb=$(( _mem_kb / 1024 / 1024 ))
+  _mem_cap=$(( _mem_gb / MEM_GB_PER_SLOT ))
+  [ "$_mem_cap" -lt 1 ] && _mem_cap=1
+  if [ "$SLOTS" -gt "$_mem_cap" ]; then
+    SLOTS="$_mem_cap"
+    SLOTS_SRC="$SLOTS_SRC, clamped by host RAM"
+  fi
+  echo "heavy-leg: host RAM ${_mem_gb}G / ${MEM_GB_PER_SLOT}G per slot -> memory cap ${_mem_cap} slot(s)"
+fi
 echo "heavy-leg lock ${LOCK}: slots=$SLOTS (source: $SLOTS_SRC)"
 
 # Slot files are ${LOCK}.1 .. ${LOCK}.SLOTS; each slot's live holder records a
