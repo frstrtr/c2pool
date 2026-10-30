@@ -481,6 +481,12 @@ struct FoldResult
     // On !ok: a sentence naming the height and the blocking condition.
     std::string error;
     uint32_t    height{0};
+    // On !ok: the block was refused BEFORE any state changed and the engine is
+    // not poisoned — it extends another chain (prev-link) or dashd rejects it
+    // (ContextualCheckTransaction). The held list is still exactly the cursor
+    // block's post-state, so a consumer must NOT treat this as a divergence:
+    // the valid block at this height still folds.
+    bool        refused_unchanged{false};
 
     // THE self-check (both always filled on a completed fold).
     uint256     computed_root;
@@ -911,6 +917,7 @@ public:
         // still exactly right for its own block, so this is not a poison;
         // the caller re-anchors on the best chain).
         if (block.m_previous_block != m_block_hash) {
+            r.refused_unchanged = true;
             r.error = "fold refused at h=" + std::to_string(height)
                     + ": block's prev-link "
                     + block.m_previous_block.GetHex().substr(0, 16)
@@ -943,15 +950,17 @@ public:
 
         // ── Pre-scan: ContextualCheckTransaction (validation.cpp:317-349 @
         // v23.1.9), every tx incl. the coinbase, once DIP3 is active for this
-        // block (DeploymentActiveAfter(pindexPrev): H > dip0003_height). A
+        // block (DeploymentActiveAfter(pindexPrev, DIP0003): H >=
+        // dip0003_height, the height the DML itself starts at). A
         // block dashd rejects (bad-txns-type / bad-txns-cb-type / the v23.1.9
         // bad-txns-version for a negative nVersion) is refused BEFORE any pass
         // mutates the held list — like the prev-link refusal above it is not
         // a poison: the held state is still exactly right for the cursor
         // block, and the caller re-anchors on the best chain.
-        if (H > m_cfg.gates.dip0003_height) {
+        if (H >= m_cfg.gates.dip0003_height) {
             for (size_t i = 0; i < block.m_txs.size(); ++i) {
                 if (auto why = contextual_tx_check(block.m_txs[i], i == 0)) {
+                    r.refused_unchanged = true;
                     r.error = "fold refused at h=" + std::to_string(height)
                             + " tx[" + std::to_string(i) + "]: "
                             + std::string(*why)

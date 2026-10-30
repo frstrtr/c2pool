@@ -704,7 +704,7 @@ TEST(DashMnState, ProUpServTxInvalidOrMismatchedTypeRefusesTheBlock) {
 TEST(DashMnState, NegativeVersionBeforeDip3IsOutsideTheRule) {
     uint256 h;
     MnStateMachine m = v2319_one_regular_mn(h, 2400050);
-    m.set_dip0003_height(2400051);         // DIP3 active only above 2400051
+    m.set_dip0003_height(2400052);         // DIP3 active from 2400052 on
     MutableTransaction neg;
     neg.version = 0xFFFF;
     BlockType b;

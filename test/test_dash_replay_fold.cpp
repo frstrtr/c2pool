@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/replay_fold_consumer.hpp>   // S1: a refused block does not latch the lane
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -1618,8 +1619,10 @@ TEST(DashReplayFoldSynthetic, NegativeVersionTxRefusesTheBlock)
     EXPECT_TRUE(ok.ok) << ok.error;
 }
 
-// Control for A5: the rule is post-DIP3 only (DeploymentActiveAfter).
-TEST(DashReplayFoldSynthetic, NegativeVersionTxIsOutsideTheRuleAtTheDip3Block)
+// A5 boundary: DeploymentActiveAfter(pindexPrev, DIP0003) is active for the
+// DIP3 block itself (height >= dip0003_height) — the first block the DML folds
+// is already under the rule. (Blocks below it are never folded at all.)
+TEST(DashReplayFoldSynthetic, NegativeVersionTxIsRefusedFromTheDip3BlockOn)
 {
     auto cfg = synth_cfg();
     cfg.gates.dip0003_height = 101;
@@ -1630,7 +1633,38 @@ TEST(DashReplayFoldSynthetic, NegativeVersionTxIsOutsideTheRuleAtTheDip3Block)
     auto r = eng.fold_block(
         make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
                    {v2319_plain_tx(0xFFFF)}, &eng), 101);
-    EXPECT_TRUE(r.ok) << r.error;
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_TRUE(r.refused_unchanged);
+}
+
+// S1: a block the engine refuses with its state unchanged (here one dashd
+// rejects, bad-txns-version) must not latch the consumer's sticky
+// divergence — the valid block at that height still folds through the same
+// consumer, and so does the next one.
+TEST(DashReplayFoldSynthetic, RefusedBlockDoesNotLatchTheConsumerAndTheValidSiblingFolds)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    const auto bad = make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng);
+    EXPECT_FALSE(consumer.on_replay_block(101, raw256(0xB1), bad));
+    EXPECT_FALSE(consumer.stats().diverged)
+        << "a refusal with the state unchanged is not a divergence";
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 1u);
+    EXPECT_EQ(eng.height(), 100u);
+
+    const auto good = make_block(101, raw256(9), root, {}, &eng);
+    EXPECT_TRUE(consumer.on_replay_block(101, raw256(0xB2), good));
+    EXPECT_FALSE(consumer.stats().diverged);
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_EQ(consumer.stats().blocks_folded, 1u);
 }
 
 // A6: an unknown special type post-DIP3 is bad-txns-type.

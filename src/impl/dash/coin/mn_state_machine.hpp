@@ -475,7 +475,7 @@ public:
     uint32_t last_applied_height() const { return m_last_applied_height; }
 
     /// DIP3 activation height for the ContextualCheckTransaction pre-scan in
-    /// apply_block: the rules apply to a block at height > this value
+    /// apply_block: the rules apply to a block at height >= this value
     /// (dashd DeploymentActiveAfter(pindexPrev, DIP0003)). Defaults to the
     /// MAINNET value (1028160); a smaller real value on another network only
     /// leaves blocks in between unchecked, never refuses a valid one.
@@ -2182,7 +2182,7 @@ private:
     {
         for (size_t i = 0; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            if (height > m_dip0003_height) {
+            if (height >= m_dip0003_height) {
                 if (auto why = contextual_tx_check(tx, i == 0))
                     return "tx[" + std::to_string(i) + "]: " + std::string(*why);
             }

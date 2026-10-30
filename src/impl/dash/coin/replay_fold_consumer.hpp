@@ -73,6 +73,10 @@ struct FoldConsumerStats
     // two proofs, and the difference between them is legible.
     uint64_t payees_verified{0};
     uint64_t blocks_skipped{0};     // below the anchor, already folded
+    // Blocks the engine refused with its state unchanged (another chain, or a
+    // block dashd rejects) — NOT a divergence; the lane keeps folding.
+    uint64_t blocks_refused_unchanged{0};
+    std::string last_refused_unchanged;
     uint32_t first_height{0};       // first height actually folded
     uint32_t last_height{0};        // highest height folded
 
@@ -212,6 +216,18 @@ public:
         }
 
         const auto r = m_engine.fold_block(block, height);
+        if (!r.ok && r.refused_unchanged) {
+            // Refused before any state changed (FoldResult::refused_unchanged):
+            // this block is not ours to fold, the held list is still right for
+            // the cursor block, and the valid block at this height folds when
+            // it arrives. Not a divergence — never latch the lane on it.
+            ++m_stats.blocks_refused_unchanged;
+            m_stats.last_refused_unchanged = r.error;
+            LOG_WARNING << "[REPLAY-FOLD] h=" << height << " block "
+                        << hash.GetHex().substr(0, 16)
+                        << " refused, state unchanged — " << r.error;
+            return false;
+        }
         if (!r.ok) {
             // The fold names its own blocking condition; keep it VERBATIM.
             m_stats.diverged          = true;
@@ -450,6 +466,15 @@ public:
             m_held.erase(it);
             ++m_folded_live;
             if (!ok) {
+                if (!m_consumer.stats().diverged) {
+                    // Refused with the state unchanged (another chain, or a
+                    // block dashd rejects): drop it and wait for the valid
+                    // block at this height.
+                    LOG_WARNING << "[REPLAY-TAIL] live block h=" << want
+                                << " refused with the fold state unchanged —"
+                                   " waiting for the valid block at this height";
+                    return;
+                }
                 // A live block that fails the fold is exactly as fatal as a
                 // replayed one — the consumer has already recorded the
                 // divergence and the engine is poisoned. Stop; do not try the
