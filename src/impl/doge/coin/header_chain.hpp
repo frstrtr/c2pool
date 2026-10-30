@@ -187,6 +187,11 @@ public:
             core::LevelDBOptions opts;
             opts.write_buffer_size = 2 * 1024 * 1024;  // 2MB
             opts.block_cache_size = 4 * 1024 * 1024;    // 4MB
+            // pread, not mmap: the store also holds the full UTXO set's hash
+            // schedule (6.16 M heights, ~300 MB), read once to prove it and
+            // then a height per block; through mmap every page read stayed
+            // in RSS (282 MB on a fresh node once the schedule was proven).
+            opts.mmap_reads = false;
             m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
             if (!m_db->open())
                 return false;
