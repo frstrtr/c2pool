@@ -10,10 +10,13 @@
 /// undelivered ranges; at most PER_PEER in flight per peer, a range to one
 /// peer at a time; tick() every second. In all, at most what the last
 /// minute's delivery rate brings in BUDGET (half the request timeout),
-/// between MIN_INFLIGHT and GLOBAL: an AuxPoW range is ~1.6 MB, and 48 of
-/// them on a link that gives the schedule 0.5 MB/s are minutes of queue, so
-/// every peer would miss its 60 s and take strikes (live, a fresh node
-/// beside a block IBD: 17 strikes in 5 minutes, no peer at fault).
+/// between MIN_INFLIGHT and GLOBAL: an AuxPoW range is ~1.6 MB, ranges in
+/// flight share the link, and 48 of them on a link that gives the schedule
+/// 0.2-0.5 MB/s are minutes of queue, so every peer would miss its 60 s and
+/// take strikes (live, a fresh node beside a block IBD and its own accrual
+/// bootstrap: 17 strikes in 5 minutes, then nothing in flight, no peer at
+/// fault). MIN_INFLIGHT is 2: even 8 at once outlast 60 s below 8 ranges a
+/// minute, which the same run saw.
 ///
 /// Answers (on_headers, before the sequential sync and the header chain):
 ///   - the first header's parent is not an anchor (the header chain's
@@ -40,9 +43,12 @@
 /// Timeouts: a peer that has delivered no exact range for REQUEST_TIMEOUT
 /// since its oldest request (or its last delivery) loses its in-flight
 /// ranges (one strike). A strike cools the peer for PEER_COOLDOWN; STRIKES
-/// strikes exclude it. A slow peer that keeps delivering is never struck:
-/// its requests queue behind each other on its connection; a range it holds
-/// for 3 x REQUEST_TIMEOUT goes to another peer without a strike. A range
+/// strikes exclude it; an exact range it delivers forgives one (a peer
+/// struck while the link was full is not excluded for it; a silent peer, a
+/// trickler or a liar never delivers one). A slow peer that keeps
+/// delivering is never struck: its requests queue behind each other on its
+/// connection; a range it holds for 3 x REQUEST_TIMEOUT goes to another
+/// peer without a strike. A range
 /// that every usable peer (at least VOTES of them) timed out on twice is
 /// undeliverable (an anchor nobody knows): the same fallback.
 /// Thread safety: every public method takes the internal mutex.
@@ -229,6 +235,8 @@ public:
             auto& ps = m_peers[peer];
             ps.since = now;  // a delivery: its queue moves
             ++ps.delivered;
+            if (ps.strikes > 0)
+                --ps.strikes;  // a delivery forgives one strike
             m_used.insert(peer);
             m_range_timeouts.erase(i);
             m_end_votes.erase(i);
@@ -345,7 +353,7 @@ public:
 
 private:
     static constexpr size_t MAX_EXCLUDED = 4096;
-    static constexpr size_t MIN_INFLIGHT = 8;
+    static constexpr size_t MIN_INFLIGHT = 2;
     static constexpr std::chrono::minutes ALL_EXCLUDED_PATIENCE{5};
 
     struct InFlight {

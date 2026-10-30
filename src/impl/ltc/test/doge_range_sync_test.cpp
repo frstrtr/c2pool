@@ -17,7 +17,8 @@
 //   - UnsolicitedWrongEndAnswersCannotRefuseTheAnchors,
 //     AWrongAnchorWithTwoPeersStillFallsBack, InFlightNeverExceedsGlobalUnderManyPeers
 //     (VERIFY5)
-//   - ALimitedLinkStrikesNoPeer (the in-flight budget follows the delivery rate)
+//   - ALimitedLinkStrikesNoPeer (the in-flight budget follows the delivery
+//     rate), ADeliveryForgivesAStrike
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -222,10 +223,10 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     auto sched = open_schedule(s, c, CP);
     RangeSync rs(*sched, c.anchors(CP));
     auto t = t0();
-    ASSERT_EQ(rs.tick({"a"}, t).size(), 8u);
-    const uint32_t r = 3, lo = STEP * r + 1, hi = STEP * (r + 1);
+    ASSERT_EQ(rs.tick({"a"}, t).size(), 2u) << "ranges 0 and 1, the starting budget";
+    const uint32_t r = 1, lo = STEP * r + 1, hi = STEP * (r + 1);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi - 1), t), Answer::Ignored) << "short";
-    EXPECT_EQ(rs.inflight_of("a"), 7u) << "the short answer ended the request: asked again";
+    EXPECT_EQ(rs.inflight_of("a"), 1u) << "the short answer ended the request: asked again";
     EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::NotOurs) << "long, not asked";
     auto broken = c.slice(lo, hi);
     broken[500].m_previous_block = c.hashes[9];
@@ -246,22 +247,27 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     EXPECT_TRUE(sched->range_done(r));
     EXPECT_EQ(sched->stored_hash(lo), c.hashes[lo]);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::NotOurs) << "a copy of a stored range";
-    const uint32_t w = 5;  // in flight to a
+    const uint32_t w = 0;  // in flight to a
     EXPECT_EQ(rs.on_headers("a", c.fake_range(w), t), Answer::Excluded) << "wrong end, asked";
     EXPECT_TRUE(rs.excluded("a"));
     EXPECT_EQ(rs.stats(t).bad_parses, 1u);
     EXPECT_EQ(rs.inflight_of("a"), 0u) << "an excluded peer's ranges go back to the window";
 
-    // Three bad answers to its own requests exclude a peer.
+    // Three bad answers to its own requests exclude a peer (no cooldown
+    // here, so it is asked again at once).
     TempStore s2;
     auto sched2 = open_schedule(s2, c, CP);
-    RangeSync rs2(*sched2, c.anchors(CP));
-    ASSERT_EQ(rs2.tick({"x"}, t).size(), 8u);
+    RangeSync::Config cfg2;
+    cfg2.peer_cooldown = std::chrono::seconds(0);
+    RangeSync rs2(*sched2, c.anchors(CP), cfg2);
     Answer last = Answer::Ignored;
-    for (uint32_t k = 0; k < 3; ++k) {
-        auto b = c.slice(STEP * k + 1, STEP * (k + 1));
+    for (int k = 0; k < 3; ++k) {
+        const auto reqs = rs2.tick({"x"}, t + std::chrono::seconds(k));
+        ASSERT_FALSE(reqs.empty());
+        const uint32_t q = reqs.front().range;
+        auto b = c.slice(STEP * q + 1, STEP * (q + 1));
         b[7].m_previous_block = c.hashes[3];
-        last = rs2.on_headers("x", b, t);
+        last = rs2.on_headers("x", b, t + std::chrono::seconds(k));
     }
     EXPECT_EQ(last, Answer::Excluded);
     EXPECT_TRUE(rs2.excluded("x"));
@@ -469,7 +475,7 @@ TEST(DogeRangeSync, InFlightIsBounded)
     EXPECT_EQ(d.global, 48u);
     EXPECT_EQ(d.request_timeout, std::chrono::seconds(60));
     EXPECT_EQ(d.peer_cooldown, std::chrono::seconds(600));
-    constexpr uint32_t CP = 20 * STEP;
+    constexpr uint32_t CP = 40 * STEP;
     const Chain c(CP);
     {
         TempStore s;
@@ -482,17 +488,31 @@ TEST(DogeRangeSync, InFlightIsBounded)
         std::vector<std::string> peers;
         for (int i = 0; i < 10; ++i)
             peers.push_back("p" + std::to_string(i));
-        const auto reqs = rs.tick(peers, t0());
+        // A fast start (answers at once) grows the budget to the global bound.
+        auto t = t0();
+        for (int sec = 0; sec < 4; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            const auto reqs = rs.tick(peers, t);
+            if (sec == 0)
+                EXPECT_EQ(reqs.size(), 2u) << "the starting budget";
+            for (const auto& r : reqs)
+                rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        }
+        t += std::chrono::seconds(1);
+        // Now nobody answers: in flight fills up to the bounds.
+        const uint32_t first = sched->first_undone_range();
+        const auto reqs = rs.tick(peers, t);
+        EXPECT_EQ(rs.stats(t).budget, 6u) << "the budget did not grow to GLOBAL on a fast link";
         EXPECT_EQ(reqs.size(), 6u);
         std::map<std::string, int> per;
         for (const auto& r : reqs) {
-            EXPECT_LT(r.range, 8u) << "outside the window";
+            EXPECT_LT(r.range, first + 8u) << "outside the window";
             ++per[r.peer];
         }
         for (const auto& [p, n] : per)
             EXPECT_LE(n, 2) << p;
-        EXPECT_TRUE(rs.tick(peers, t0() + std::chrono::seconds(1)).empty()) << "global bound";
-        EXPECT_EQ(rs.stats(t0()).inflight, 6u);
+        EXPECT_TRUE(rs.tick(peers, t + std::chrono::seconds(1)).empty()) << "global bound";
+        EXPECT_EQ(rs.stats(t).inflight, 6u);
     }
     {
         TempStore s;
@@ -906,28 +926,72 @@ TEST(DogeRangeSync, ALimitedLinkStrikesNoPeer)
 {
     constexpr uint32_t CP = 100 * STEP;
     const Chain c(CP);
+    // One range every 4 s (the first live minutes), then a starved link: one
+    // every 20 s (the live run during its own accrual bootstrap, ~3 a minute).
+    for (const int every : {4, 20}) {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        std::vector<std::string> peers;
+        for (int i = 0; i < 18; ++i)
+            peers.push_back("p" + std::to_string(i));
+        std::deque<RangeSync::Request> link;  // answered in the order asked, one every `every` s
+        auto t = t0();
+        int sec = 0;
+        for (; sec < 120 * every + 600 && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                link.push_back(r);
+            if (sec % every == every - 1 && !link.empty()) {
+                const auto r = link.front();
+                link.pop_front();
+                rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+            }
+        }
+        const auto st = rs.stats(t);
+        EXPECT_EQ(st.strikes, 0u) << "a range every " << every << " s: honest peers struck because our own "
+                                  << "link was full (" << st.timeouts << " range timeouts)";
+        EXPECT_EQ(st.excluded, 0u);
+        EXPECT_EQ(rs.mode(), Mode::Complete)
+            << "a range every " << every << " s: ranges_done=" << st.ranges_done << " after " << sec << " s";
+    }
+}
+
+// A peer struck while the link was full delivers afterwards: the delivery
+// forgives the strike, so two more timeouts do not exclude it. A peer that
+// never delivers is excluded on its third strike (ThreeTimeoutsExclude).
+TEST(DogeRangeSync, ADeliveryForgivesAStrike)
+{
+    constexpr uint32_t CP = 20 * STEP;
+    const Chain c(CP);
     TempStore s;
     auto sched = open_schedule(s, c, CP);
-    RangeSync rs(*sched, c.anchors(CP));
-    std::vector<std::string> peers;
-    for (int i = 0; i < 18; ++i)
-        peers.push_back("p" + std::to_string(i));
-    std::deque<RangeSync::Request> link;  // answered in the order asked, one every 4 s
+    RangeSync::Config cfg;
+    cfg.window = 1;
+    cfg.per_peer = 1;
+    cfg.global = 1;
+    cfg.peer_cooldown = std::chrono::seconds(60);
+    RangeSync rs(*sched, c.anchors(CP), cfg);
     auto t = t0();
-    int sec = 0;
-    for (; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+    int asked = 0, struck_silent = 0;
+    bool delivered = false;
+    for (int sec = 0; sec < 900; ++sec) {
         t = t0() + std::chrono::seconds(sec);
-        for (const auto& r : rs.tick(peers, t))
-            link.push_back(r);
-        if (sec % 4 == 3 && !link.empty()) {
-            const auto r = link.front();
-            link.pop_front();
-            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        for (const auto& r : rs.tick({"a"}, t)) {
+            ++asked;
+            if (asked == 2) {  // the second ask is answered: the link is back
+                EXPECT_EQ(rs.on_headers("a", c.answer(r.locator, r.stop), t), Answer::Stored);
+                delivered = true;
+            } else {
+                ++struck_silent;  // the others time out
+            }
         }
+        if (struck_silent >= 3 && delivered)
+            break;
     }
-    const auto st = rs.stats(t);
-    EXPECT_EQ(st.strikes, 0u) << "honest peers struck because our own link was full (" << st.timeouts
-                              << " range timeouts)";
-    EXPECT_EQ(st.excluded, 0u);
-    EXPECT_EQ(rs.mode(), Mode::Complete) << "ranges_done=" << st.ranges_done << " after " << sec << " s";
+    ASSERT_TRUE(delivered);
+    ASSERT_GE(struck_silent, 3);
+    t += cfg.request_timeout + std::chrono::seconds(1);
+    rs.tick({"a"}, t);  // the last silent ask times out
+    EXPECT_FALSE(rs.excluded("a")) << "three strikes, one forgiven by a delivery: excluded anyway";
 }
