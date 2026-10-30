@@ -269,6 +269,14 @@ struct JoinAttempted {
     std::optional<Joiner::Attempted> attempt;
 };
 
+// A frame's arrival at the caller's link, in link order: the caller's clock (ms) and its node lock's busy total then
+// (ms). Unstamped: a frame run again, or one given to the node directly; it is no arrival (the template gate, E-194).
+struct PathbArrival {
+    std::uint64_t ms = 0;
+    std::uint64_t busy_ms = 0;
+    bool stamped = false;
+};
+
 enum class TemplateStatus : std::uint8_t {
     Ok,
     NoPathbPeer,  // an empty store with no Path B peer and no --pathb-launch; a store not caught up with no Path B peer
@@ -737,11 +745,12 @@ public:
             watch_own_carriers();
         }
         // a completed attempt whose candidate rule (4) did not take: the node keeps its own chain, and a store not
-        // caught up (K_NCU) is caught up (the record leaves the store)
+        // caught up (K_NCU) is caught up (the record leaves the store) once its drain is done (E-193; else the
+        // caller's finish_kept)
         if (out.report && out.report->end == AttemptEnd::Completed && !out.sw.adopted && !out.sw.replaced
             && not_caught_up_) {
-            note_caught_up();
-            out.caught_up = true;
+            kept_due_ = true;
+            out.caught_up = finish_kept();
         }
         return out;
     }
@@ -837,7 +846,9 @@ public:
     }
     // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
     // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision), a join adopts,
-    // or a join attempt completes and rule (4) keeps the node's chain.
+    // or a join attempt completes and rule (4) keeps the node's chain; the first and the last also wait until the
+    // node holds no frame it received and has not judged, and no parked frame whose parent it holds (E-193:
+    // drain_done).
     bool caught_up() const noexcept { return !not_caught_up_; }
     // The first catch-up round after the start is in flight (the template gate's first clause).
     bool first_round_open() const noexcept { return first_round_open_; }
@@ -846,16 +857,35 @@ public:
         if (!not_caught_up_) return;
         not_caught_up_ = false;
         first_round_ = first_round_open_ = false;
-        verified_win_.reset();
+        kept_due_ = false;
+        reset_delivery();
         if (kv_ == nullptr || poisoned_) return;
         LaneBatch b;
         b.del(store_keys::ncu(cfg_.record_chain));
         if (!commit_lane_batch(*kv_, b)) poison(tree_->best().id);
     }
-    // Not caught up, templates built: a HELLO tail's tip is not held here with no verified header winning (the caller
-    // logs it).
+    // E-193's second half: the node holds no frame it received and has not judged (the caller's inbound frames, the
+    // released carriers not run yet, a RandomX failure's re-run) and no parked frame whose parent it holds.
+    bool drain_done() const {
+        if (!release_q_.empty() || !rx_failed_.empty()) return false;
+        for (const auto& [parent, peers] : deferred_.waiting_parents())
+            if (const CarrierNode* pn = tree_->find(parent); pn != nullptr && pn->verified) return false;
+        return !inbound_idle_ || inbound_idle_();
+    }
+    // The caller's inbound frames: true when it holds none it received and has not given to the node (unset: none).
+    void set_inbound_idle(std::function<bool()> f) { inbound_idle_ = std::move(f); }
+    // A completed join attempt that rule (4) did not take ended the catch-up's first half; K_NCU ends when the drain
+    // is done (finish_kept).
+    bool kept_due() const noexcept { return kept_due_ && not_caught_up_; }
+    bool finish_kept() {
+        if (!kept_due() || !drain_done()) return false;
+        note_caught_up();
+        return true;
+    }
+    // Not caught up, templates built: a HELLO tail's tip is not held here and the header path delivers nothing toward
+    // a tip it does not hold (the caller logs it).
     bool unverified_claims() const {
-        if (!gate_applies() || first_round_open_ || verified_win_open()) return false;
+        if (!gate_applies() || first_round_open_ || delivery_hold()) return false;
         for (const auto& [peer, t] : peers_)
             if (!holds_tip(t.best_tip)) return true;
         return false;
@@ -1119,7 +1149,7 @@ public:
     void disconnect(std::uint64_t peer) {
         peers_.erase(peer);
         hf_round_.erase(peer);
-        if (verified_win_ && verified_win_peer_ == peer) verified_win_.reset();
+        if (hp_win_ && hp_win_peer_ == peer) hp_win_.reset();  // its verified headers released below
         headers_->release_peer(peer);
         deferred_.forget_peer(peer);
         header_req_.erase(peer);
@@ -1151,6 +1181,7 @@ public:
     }
 
     // ---- FC_CARRIER (E7) ----
+    using Arrival = PathbArrival;
     // The cheap rows and RandomX (on the verify workers), then the placement.
     struct CarrierTicket {
         std::uint64_t peer = 0;
@@ -1159,14 +1190,16 @@ public:
         std::uint64_t generation = 0;
         bool relayed = true;
         bool solicited = false;  // a reply to this node's own request (kept if it parks)
+        Arrival arrival;         // its arrival (the template gate's delivery clock)
     };
 
     CarrierTicket begin_carrier(std::uint64_t peer, std::span<const std::uint8_t> frame, bool relayed = true,
-                                bool solicited = false) {
+                                bool solicited = false, Arrival arrival = {}) {
         CarrierTicket t;
         t.peer = peer;
         t.solicited = solicited;
         t.relayed = relayed;
+        t.arrival = arrival;
         t.generation = generation_;
         if (poisoned_) return t;  // the latch: nothing judged after the poison
         t.frame.assign(frame.begin(), frame.end());
@@ -1184,6 +1217,7 @@ public:
     // the ticket's admission, its cheap rows run again (RandomX from the memo).
     NodeEventResult complete_carrier(CarrierTicket t) {
         if (poisoned_) return node_internal();
+        note_body_arrival(t);
         if (t.generation != generation_ && admitted(t.admit))
             t.admit = admit_frame_from(env(), t.peer, t.frame, CarrierRole::Frame);
         NodeEventResult out = settle_carrier(t.peer, t.frame, t.admit, t.relayed, t.solicited);
@@ -1255,9 +1289,9 @@ public:
         if (!cfg_.launch && peers_.empty() && ((started_empty_ && tree_->best().pos == 0) || not_caught_up_))
             return status(t, TemplateStatus::NoPathbPeer);
         // not caught up (K_NCU): no template while the first catch-up round after the start is in flight, or while
-        // headers this node verified (PoW at d on its header path) win against its best tip and their fetch is in
-        // flight; a HELLO claim alone holds no template past that round
-        if (gate_applies() && (first_round_open_ || verified_win_open())) return status(t, TemplateStatus::CatchingUp);
+        // the header path delivers toward a tip this node does not hold (E-194); a HELLO claim alone holds no
+        // template past that round
+        if (gate_applies() && (first_round_open_ || delivery_hold())) return status(t, TemplateStatus::CatchingUp);
         const CarrierNode& tip = tree_->best();
         t.tip = tip.id;
         t.x = tip.pos + 1;
@@ -1721,7 +1755,9 @@ public:
         std::string why;  // the deciding check, for the relay's log line
     };
 
-    HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s) {
+    // `arrival`: the frame's arrival at the caller's link (the template gate's delivery clock; unstamped: none).
+    HeadersOutcome on_headers(std::uint64_t peer, std::span<const std::uint8_t> frame, std::uint64_t now_s,
+                              Arrival arrival = {}) {
         HeadersOutcome out;
         clock_s_ = std::max(clock_s_, now_s);
         if (poisoned_) {
@@ -1922,8 +1958,10 @@ public:
         }
         // N-7: a variant enters the index only after the cheap rows and the PoW at d of the whole reply passed on this
         // path (path_ok passed explicitly)
+        std::size_t fresh = 0;  // variants this frame brought (a re-asked page's known ones are no delivery)
         for (std::size_t i = before; i < side->size(); ++i) {
-            headers_->add(peer, req.got[i], req.heights[i], /*path_ok=*/true);
+            const IndexAdd a = headers_->add(peer, req.got[i], req.heights[i], /*path_ok=*/true);
+            if (a == IndexAdd::Added || a == IndexAdd::Replaced) ++fresh;
             ++out.indexed;
         }
         deferred_.touch(out.ids);
@@ -1931,14 +1969,12 @@ public:
         const SideBranchDecision dec =
                 decide_side_branch(b.cum_work, b.id, fork->cum_work, *side, 0, std::numeric_limits<std::uint64_t>::max());
         out.fork_pos = fork->pos;
-        if (dec.action == SideBranchAction::FetchBodies && gate_applies() && !out.ids.empty()
-            && out.ids.back() != verified_lapsed_) {
-            // headers this node verified win: the template gate holds while their fetch is in flight (a tip whose
-            // fetch lapsed once does not hold it again)
-            verified_win_ = ChainTip{dec.claimed_work, out.ids.back()};
-            verified_win_peer_ = peer;
-            verified_win_s_ = now_s;
-            verified_best_ = b.id;
+        if (dec.action == SideBranchAction::FetchBodies && gate_applies() && !out.ids.empty()) {
+            // headers this node verified win against its best tip: a page or side-header delivery holds the template
+            // gate toward their tip (E-194 (v)); a frame that brought no new header is no delivery
+            hp_win_ = ChainTip{dec.claimed_work, out.ids.back()};
+            hp_win_peer_ = peer;
+            if (fresh > 0) note_delivery(hp_page_, arrival);
         }
         if (dec.action == SideBranchAction::FetchBodies) {
             // one depth measure: the journal base (never fork_depth against J); a joined node at or below its x1
@@ -2118,6 +2154,14 @@ public:
         catchup_gate_tick(now_s);
         return n;
     }
+
+    // The template gate's clock (E-194): the caller's time (ms) and its node lock's busy total (ms), given before tick.
+    void gate_clock(std::uint64_t now_ms, std::uint64_t busy_ms) {
+        gate_now_ms_ = std::max(gate_now_ms_, now_ms);
+        gate_busy_ms_ = std::max(gate_busy_ms_, busy_ms);
+    }
+    // The template gate's hold after the first round: the header path delivers (E-194).
+    bool delivering() const { return delivery_hold(); }
 
     bool abandoned(std::uint64_t peer, const Hash32& at) const { return abandoned_.count(std::make_pair(peer, at)) != 0; }
 
@@ -2856,7 +2900,8 @@ private:
         reask_pending_ = false;
         not_caught_up_ = false;  // an adoption catches up (its empty store holds no K_NCU)
         first_round_ = first_round_open_ = false;
-        verified_win_.reset();
+        kept_due_ = false;
+        reset_delivery();
         ++generation_;
         if (kv_ == nullptr) return true;
         LaneBatch b;
@@ -3541,11 +3586,69 @@ private:
         first_round_open_ = false;
         first_round_ = false;
     }
-    // Verified heavier headers whose fetch is in flight: not held yet, still winning.
-    bool verified_win_open() const {
-        if (!verified_win_) return false;
+    // The template gate after the first round (E-194): the header path delivers toward a tip this node does not
+    // hold. A delivery is a frame answering one of the node's own requests that arrived within P-53: a body it asked
+    // by FetchBodies (toward any unheld tip: its headers were verified and won when it was asked), or a page or a
+    // side header whose verified headers win against the best tip and that brought a header the index did not hold
+    // (toward that tip only). The hold belongs to the catch-up, not to one page. P-53 is non-service as E-150 reads
+    // it: time counts from the frame's arrival in link order and leaves out the node's own processing (the node lock
+    // held, the caller's busy total); a re-ask is no delivery.
+    struct Delivery {
+        Arrival at;
+        bool live = false;  // within P-53 of `at`, by the last gate clock
+    };
+    bool delivery_hold() const {
+        if (!gate_applies()) return false;
+        const bool win = win_open();
+        if (hp_page_.live && win) return true;
+        return hp_body_.live && (win || hello_unheld());
+    }
+    // The verified winning headers' tip: not held, still winning against the best tip.
+    bool win_open() const {
+        if (!hp_win_) return false;
         const CarrierNode& b = tree_->best();
-        return tree_->find(verified_win_->id) == nullptr && fork_choice_prefers(*verified_win_, ChainTip{b.cum_work, b.id});
+        return tree_->find(hp_win_->id) == nullptr && fork_choice_prefers(*hp_win_, ChainTip{b.cum_work, b.id});
+    }
+    bool hello_unheld() const {
+        for (const auto& [peer, t] : peers_)
+            if (!holds_tip(t.best_tip)) return true;
+        return false;
+    }
+    void note_delivery(Delivery& d, const Arrival& a) {
+        if (!a.stamped || !gate_applies()) return;
+        if (!d.live || a.ms >= d.at.ms) d.at = a;
+        d.live = true;
+        expire(d);
+    }
+    // A body this node asked by FetchBodies arrived in reply (solicited, not held, not refuted at its cheap rows).
+    void note_body_arrival(const CarrierTicket& t) {
+        if (!t.solicited || !t.arrival.stamped || !gate_applies() || bodies_asked_.empty()) return;
+        if (t.admit.verdict == AdmitVerdict::Strike || t.admit.verdict == AdmitVerdict::Ban
+            || t.admit.verdict == AdmitVerdict::Drop)
+            return;
+        Hash32 id = t.admit.id;
+        if (id == Hash32{}) {
+            CarrierBodyV3 c;
+            if (t.frame.size() <= kFrameHeaderBytes
+                || decode_carrier_body_v3(t.frame.data() + kFrameHeaderBytes, t.frame.size() - kFrameHeaderBytes,
+                                          CarrierLimits{cfg_.buffers.receipt, cfg_.p.r_max}, c)
+                           != WireError::None)
+                return;
+            id = receipt_id(c.own);
+        }
+        if (bodies_asked_.count(id) != 0 && tree_->find(id) == nullptr) note_delivery(hp_body_, t.arrival);
+    }
+    // P-53 on the server's time: the time since the arrival less the node lock's busy time since then.
+    void expire(Delivery& d) const {
+        if (!d.live) return;
+        const std::uint64_t elapsed = gate_now_ms_ > d.at.ms ? gate_now_ms_ - d.at.ms : 0;
+        const std::uint64_t busy = gate_busy_ms_ > d.at.busy_ms ? gate_busy_ms_ - d.at.busy_ms : 0;
+        if (elapsed > busy && elapsed - busy >= cfg_.abandon_timeout_s * 1000) d.live = false;
+    }
+    void reset_delivery() {
+        hp_page_ = Delivery{};
+        hp_body_ = Delivery{};
+        hp_win_.reset();
     }
     // An open catch-up request (not retired) to any peer.
     bool catchup_request_open() const {
@@ -3553,8 +3656,8 @@ private:
             if (r.owner == HeaderOwner::CatchUp && !r.retired) return true;
         return false;
     }
-    // The template gate's timers (P-53): an open first round with no catch-up request in flight, and verified headers
-    // whose fetch placed nothing within P-53, end.
+    // The template gate's timers (P-53): an open first round with no catch-up request in flight ends; a delivery's
+    // hold ends at P-53 on the server's time.
     void catchup_gate_tick(std::uint64_t now_s) {
         if (first_round_open_ && !catchup_request_open()) {
             if (first_round_s_ == 0) first_round_s_ = now_s;
@@ -3562,19 +3665,10 @@ private:
         } else {
             first_round_s_ = 0;
         }
-        if (!verified_win_) return;
-        if (!verified_win_open()) {
-            verified_win_.reset();
-            return;
-        }
-        const Hash32 best = tree_->best().id;
-        if (best != verified_best_) {
-            verified_best_ = best;
-            verified_win_s_ = now_s;
-        } else if (now_s >= verified_win_s_ + cfg_.abandon_timeout_s) {
-            verified_lapsed_ = verified_win_->id;
-            verified_win_.reset();
-        }
+        gate_now_ms_ = std::max(gate_now_ms_, now_s * 1000);
+        expire(hp_page_);
+        expire(hp_body_);
+        if (hp_win_ && !win_open()) hp_win_.reset();
     }
 
     bool started_empty_ = false;
@@ -3582,11 +3676,14 @@ private:
     bool first_round_ = false;            // the first catch-up round after the start not run yet
     bool first_round_open_ = false;       // ... and in flight (opened by a HELLO tail whose tip is not held)
     std::uint64_t first_round_s_ = 0;     // since when it is open with no request in flight
-    std::optional<ChainTip> verified_win_;  // headers this node verified that win (their tip and work)
-    std::uint64_t verified_win_peer_ = 0;
-    std::uint64_t verified_win_s_ = 0;    // the last progress of their fetch
-    Hash32 verified_best_{};
-    Hash32 verified_lapsed_{};            // the last tip whose fetch lapsed (it does not hold the gate again)
+    bool kept_due_ = false;               // a completed attempt kept the chain; K_NCU ends at its drain (E-193)
+    std::function<bool()> inbound_idle_;  // the caller's inbound frames all judged (E-193)
+    std::optional<ChainTip> hp_win_;      // headers this node verified that win (their tip and work)
+    std::uint64_t hp_win_peer_ = 0;
+    Delivery hp_page_;                    // the last page or side-header delivery (E-194 (v))
+    Delivery hp_body_;                    // the last delivery of a body asked by FetchBodies
+    std::uint64_t gate_now_ms_ = 0;       // the gate clock: the caller's time (ms)
+    std::uint64_t gate_busy_ms_ = 0;      // ... and the node lock's busy total then (ms)
     bool poisoned_ = false;
     StoreFaults faults_;
     std::uint64_t generation_ = 0;

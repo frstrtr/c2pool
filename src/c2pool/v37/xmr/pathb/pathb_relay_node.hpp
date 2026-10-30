@@ -322,17 +322,34 @@ struct PathbCtxSource {
 // ---------------------------------------------------------------------------
 class RelayNodeLock {
 public:
+    // The clock (ms) of the busy total (unset: none kept).
+    void set_clock(std::function<std::uint64_t()> c) { clock_ = std::move(c); }
     void lock() {
         std::unique_lock<std::mutex> l(m_);
         const std::uint64_t t = next_++;
         cv_.wait(l, [&] { return serving_ == t; });
+        held_ = true;
+        if (clock_) since_ = clock_();
     }
     void unlock() {
         {
             std::lock_guard<std::mutex> l(m_);
+            if (held_ && clock_) {
+                const std::uint64_t n = clock_();
+                busy_ += n > since_ ? n - since_ : 0;
+            }
+            held_ = false;
             ++serving_;
         }
         cv_.notify_all();
+    }
+    // The node's own processing: the time the lock was held (ms), the hold in progress included (the template gate's
+    // delivery clock leaves it out, E-194).
+    std::uint64_t busy_ms() {
+        std::lock_guard<std::mutex> l(m_);
+        if (!held_ || !clock_) return busy_;
+        const std::uint64_t n = clock_();
+        return busy_ + (n > since_ ? n - since_ : 0);
     }
 
 private:
@@ -340,6 +357,10 @@ private:
     std::condition_variable cv_;
     std::uint64_t next_ = 0;
     std::uint64_t serving_ = 0;
+    std::function<std::uint64_t()> clock_;
+    bool held_ = false;
+    std::uint64_t since_ = 0;
+    std::uint64_t busy_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -353,6 +374,7 @@ public:
     PathbRelayNode(PathbRelayOptions o, RelayLinks& links, RelayClock clock = RelayClock::system(), LogFn log = {})
         : o_(std::move(o)), links_(links), clock_(std::move(clock)), log_(std::move(log)), budget_(budget_of(o_)),
           dos_(budget_.dos), port_(*this) {
+        lock_.set_clock([this] { return now_ms(); });
         solicited_ = static_cast<double>(o_.solicited_credits);
         std::random_device rd;
         do {
@@ -386,6 +408,7 @@ public:
         node_ = &n;
         n.set_join_transport(&port_);
         n.set_join_step([this] { const JoinRelease r(*this); });
+        n.set_inbound_idle([this] { return inbound_idle(); });
         const PathbNodeConfig& c = n.config();
         chain_id_ = c.identity.chain_id;
         p_ = c.p;
@@ -571,6 +594,18 @@ public:
             else
                 post_from(p, std::move(fn));
         };
+        // a frame the node judges: received and not judged until its event runs (E-193)
+        const auto judge = [&](std::function<void()> fn) {
+            if (owner) {
+                fn();
+                return;
+            }
+            ++rx_events_;
+            post_from(p, [this, fn = std::move(fn)] {
+                --rx_events_;
+                fn();
+            }, [this] { --rx_events_; });
+        };
         const std::uint8_t op = f[0];
         switch (op) {
             case kOpFbPing:
@@ -587,7 +622,7 @@ public:
                 on_addr(p, f);
                 return;
             case kOpFbGetCtx: run([this, p, f] { serve_getctx(p, f); }); return;
-            case kOpFbCtx: run([this, p, f] { on_ctx(p, f); }); return;
+            case kOpFbCtx: judge([this, p, f] { on_ctx(p, f); }); return;
             case kOpFbReceipts:
                 if (f.size() > 1 && f[1] != kFrameVersion2) break;  // the old receipts v2 frame: unknown
                 on_receipts_frame(p, f);
@@ -600,21 +635,23 @@ public:
                 }
                 const CarrierReply k = carrier_reply(p, f);
                 if (k == CarrierReply::BodySet) {
-                    run([this, p, f] { handle_body_set(p, f); });
+                    judge([this, p, f] { handle_body_set(p, f); });
                     return;
                 }
-                enqueue_job(Job{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited});
+                Job j{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited};
+                if (j.solicited) j.arrival = arrival_now();  // a reply to the node's own request: its arrival (E-194)
+                enqueue_job(std::move(j));
                 return;
             }
             case kOpFcHeaders: {
                 bool node_reply = false;  // the frame answers this node's own request in link order
                 if (route_reply(p, f, &node_reply)) return;
-                run([this, p, f, node_reply] { handle_headers(p, f, node_reply); });
+                judge([this, p, f, node_reply] { handle_headers(p, f, node_reply); });
                 return;
             }
             case kOpFcBuckets:
                 if (route_reply(p, f)) return;
-                run([this, p, f] { handle_buckets(p, f); });
+                judge([this, p, f] { handle_buckets(p, f); });
                 return;
             case kOpFcGetCarrier:
             case kOpFcGetHeaders:
@@ -668,14 +705,17 @@ public:
                 std::lock_guard<std::mutex> lk(vmtx_);
                 due_parked_locked();
                 jobs.swap(vq_);
+                vbusy_ += jobs.size();
             }
             for (Job& j : jobs) {
                 run_job(std::move(j));
+                --vbusy_;
                 ++n;
                 any = true;
             }
             if (!any) break;
         }
+        recheck_caught_up();
         return n;
     }
     // One join step: the next pair's attempt (the node lock held, released at its waits), then its outcome applied.
@@ -721,6 +761,13 @@ public:
         o_.book_save(book_.records());
         st_.disc_saves++;
     }
+    // The node lock held while `during` runs (the KATs: a pass of the node's own, its frames arriving meanwhile).
+    void test_hold_node(const std::function<void()>& during) {
+        const NodeGuard g(*this);
+        during();
+    }
+    // The node lock's busy total (ms).
+    std::uint64_t node_busy_ms() { return lock_.busy_ms(); }
     // Parks a carrier frame of `peer` in the verify parked list with no retry time (the parked-cap KAT).
     std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame) {
         Job j{Job::Kind::Carrier, peer, peer, frame, 0};
@@ -1132,6 +1179,7 @@ private:
         // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
         std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
         std::uint64_t origin_h = 0;  // a parked receipt's origin height h(r) (0: its P_r not held yet)
+        PathbNode::Arrival arrival{};  // a reply to the node's own FC_GETCARRIER: its arrival (E-194)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
@@ -1370,6 +1418,8 @@ private:
                 events_.pop_front();
             }
             fn();
+            fn = nullptr;
+            recheck_caught_up();
         }
     }
     void maint_loop() {
@@ -1640,8 +1690,11 @@ private:
                 if (vq_.empty()) continue;
                 j = std::move(vq_.front());
                 vq_.pop_front();
+                ++vbusy_;
             }
             run_job(std::move(j));
+            --vbusy_;
+            recheck_caught_up();
         }
     }
     // One job: the sender's token, then the admission under the node lock; the token goes back unless the outcome
@@ -1683,7 +1736,7 @@ private:
                 }
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
-                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
+                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited, j.arrival);
                 } catch (const RandomxFailure& e) {
                     rx_fail = true;
                     rx_why = e.what();
@@ -1699,7 +1752,11 @@ private:
             if (!kept) refund(j);
             const bool taken = kept && !j.solicited;
             const bool solicited = j.solicited;
-            post([this, t = std::move(t), taken, solicited, fresh]() mutable { complete_job(std::move(t), taken, solicited, fresh); });
+            ++rx_events_;  // not judged until its placement runs (E-193)
+            post([this, t = std::move(t), taken, solicited, fresh]() mutable {
+                --rx_events_;
+                complete_job(std::move(t), taken, solicited, fresh);
+            });
             return;
         }
         std::vector<NodeEventResult> rs;
@@ -1751,6 +1808,7 @@ private:
         const std::uint64_t peer = t.peer;
         const Hash32 digest = ::v37::sha256d(t.frame);
         std::vector<std::uint8_t> frame = t.frame;
+        const PathbNode::Arrival arrival = t.arrival;
         NodeEventResult r;
         Effects fx;
         bool rx_fail = false;
@@ -1768,7 +1826,9 @@ private:
         }
         if (rx_fail) {
             rx_alarm("carrier placement", rx_why);
-            park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
+            Job j{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true};
+            j.arrival = arrival;
+            park_job(std::move(j), now_ms() + kParkRetryMs);
             run_effects(fx);
             return;
         }
@@ -2866,16 +2926,56 @@ private:
         Catchup& c = catchup_[p];
         c.tip = tail.best_tip;
         c.step = 0;
+        caught_due_ = false;  // a catch-up open again
         catchup_ask_locked(p, c);
     }
     // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
-    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store).
+    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store) once the node
+    // holds no frame it received and has not judged, and no parked frame whose parent it holds (E-193); until then
+    // the end is due and is tried again after each judged frame and at each tick.
     void caught_up_locked() {
-        if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
+        if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) {
+            caught_due_ = false;
+            return;
+        }
+        if (!node_->drain_done()) {
+            caught_due_ = true;
+            return;
+        }
+        caught_due_ = false;
         node_->note_caught_up();
         st_.caught_up_at_ms = now_ms();
         log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
     }
+    // Under the node lock and cumtx_: a completed join attempt that rule (4) did not take, its drain done (E-178,
+    // E-193).
+    void kept_locked() {
+        if (!node_->kept_due()) {
+            kept_due_ = false;
+            return;
+        }
+        if (!node_->finish_kept()) return;
+        kept_due_ = false;
+        st_.caught_up_at_ms = now_ms();
+        log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at_pos_t_locked());
+    }
+    // A due end of K_NCU tried again (not under the node lock: after a judged frame, a job, a pump).
+    void recheck_caught_up() {
+        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this) return;
+        const NodeGuard g(*this);
+        std::lock_guard<std::mutex> lk(cumtx_);
+        if (caught_due_.load()) caught_up_locked();
+        if (kept_due_.load()) kept_locked();
+    }
+    // E-193: the node holds no frame this relay received and has not given it to judge (an owner event of a frame,
+    // a verify job queued, parked for a token or running).
+    bool inbound_idle() const {
+        if (rx_events_.load() != 0) return false;
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return vq_.empty() && parked_.empty() && vbusy_.load() == 0;
+    }
+    // A reply frame's arrival at its link (E-194): the relay clock and the node lock's busy total now.
+    PathbNode::Arrival arrival_now() { return PathbNode::Arrival{now_ms(), lock_.busy_ms(), true}; }
     // Under the node lock and cumtx_: FC_GETHEADERS to the peer's tip (one in flight per peer), from the best tip,
     // then, after empty replies, a locator step down the best chain: pos - 1, pos - 2, pos - 4, ..., then the lowest
     // position held (position 0 on an unpruned store): at most floor(log2 pos) + 2 requests per round.
@@ -2912,13 +3012,20 @@ private:
         bool join = false;
         {
             const NodeGuard g(*this);
+            PathbNode::Arrival arrival;  // a reply to the node's own request: its arrival in link order (E-194)
             if (node_reply) {  // handled now: no longer waiting for the owner
                 std::lock_guard<std::mutex> lk(kmtx_);
                 const auto a = hdr_arrived_.find(p);
                 if (a != hdr_arrived_.end() && --a->second == 0) hdr_arrived_.erase(a);
+                const auto at = hdr_at_.find(p);
+                if (at != hdr_at_.end() && !at->second.empty()) {
+                    arrival = at->second.front();
+                    at->second.pop_front();
+                    if (at->second.empty()) hdr_at_.erase(at);
+                }
             }
             try {
-                o = node_->on_headers(p, f, now_s());
+                o = node_->on_headers(p, f, now_s(), arrival);
             } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
                 rx_alarm("headers of peer " + std::to_string(p), e.what());
                 log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
@@ -3245,6 +3352,9 @@ private:
                     at = at_pos_t_locked();
                 }
                 log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at);
+            } else {
+                const NodeGuard g(*this);
+                if (node_->kept_due()) kept_due_ = true;  // its drain first (E-193): the line when it is done
             }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
@@ -3354,6 +3464,7 @@ private:
                 if (t.peer == p) t.closed = true;
             hdr_fifo_.erase(p);
             hdr_arrived_.erase(p);
+            hdr_at_.erase(p);
             asked_carriers_.erase(p);
             bodyset_asked_.erase(p);
         }
@@ -3391,6 +3502,7 @@ private:
             q->second.pop_front();
             if (h.node) {
                 ++hdr_arrived_[peer];  // node_tick stops the request's P-53 clock while the frame waits for the owner
+                hdr_at_[peer].push_back(arrival_now());
                 if (node_reply != nullptr) *node_reply = true;
                 return false;
             }
@@ -3605,6 +3717,7 @@ private:
                 }
                 for (const std::uint64_t p : arrived) node_->headers_arrived(p);
             }
+            node_->gate_clock(now_ms(), lock_.busy_ms());  // the template gate's delivery clock (E-194)
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
             // the lowest frame of a parked chain: its parent, once per P-53, within each peer's asked-carrier record
             node_->reask_parents([this](std::uint64_t p) { return ask_room(p); });
@@ -3663,7 +3776,8 @@ private:
                 }
                 ++it;
             }
-            if (done_any) caught_up_locked();
+            if (done_any || caught_due_.load()) caught_up_locked();
+            if (kept_due_.load()) kept_locked();
             join = (node_->joiner().queue().ready() > 0 || reask_due_) && now_ms() >= join_not_before_ms_;
         }
         {
@@ -4450,6 +4564,10 @@ private:
     std::condition_variable vcv_;
     std::deque<Job> vq_;
     std::deque<Job> parked_;
+    std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
+    std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
+    std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)
+    std::atomic<bool> kept_due_{false};        // a kept join attempt; K_NCU's end waits for the drain (E-193)
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
     std::map<std::uint64_t, ValidBucket> valid_;  // P-15 (vmtx_)
@@ -4474,6 +4592,7 @@ private:
     std::map<std::uint64_t, Ticket> tickets_;
     std::map<std::uint64_t, std::deque<HdrWait>> hdr_fifo_;
     std::map<std::uint64_t, std::uint64_t> hdr_arrived_;  // replies to node requests arrived, not handled yet (kmtx_)
+    std::map<std::uint64_t, std::deque<PathbNode::Arrival>> hdr_at_;  // ... their arrivals in link order (kmtx_)
     std::map<std::uint64_t, std::set<Hash32>> asked_carriers_;  // ids of the node's own FC_GETCARRIER, per peer
     std::map<std::uint64_t, std::set<Hash32>> bodyset_asked_;   // walked carriers whose body set is asked, per peer
     std::uint64_t next_ticket_ = 0;
