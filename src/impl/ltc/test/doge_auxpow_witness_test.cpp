@@ -342,9 +342,14 @@ TEST(DogeAuxPowWitness, AuxPow_ParentCoinbaseFlag8_Rejected)
         << "got: \"" << parse_error(entry) << "\"";
 }
 
-// K7: flag 0x01 with every witness stack empty is refused
-// ("Superfluous witness record", Core parity).
-TEST(DogeAuxPowWitness, AuxPow_ParentCoinbaseEmptyWitness_Rejected)
+// K7: flag 0x01 with every witness stack empty is refused ("Superfluous
+// witness record", the LTC transaction reader's check). Stricter than
+// Dogecoin Core 1.14.9, which has no such check (primitives/transaction.h:
+// 231-236) and accepts that form. Harmless: Core re-serializes a proof from
+// the parsed transaction and writes flag 1 only when a stack is non-empty
+// (transaction.h:252-256), so a Core peer never sends it; only a non-Core
+// peer could, to its own loss.
+TEST(DogeAuxPowWitness, AuxPow_ParentCoinbaseEmptyWitness_RefusedStricterThanCore)
 {
     Bytes entry = slice(fixture_bytes(FIXTURES[0]), E_BEGIN, E_END);
     entry = erase(entry, WIT_BEGIN - E_BEGIN, WIT_END - E_BEGIN);

@@ -221,6 +221,10 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the txid stays witness-stripped, flag 8 and empty witnesses are refused.
     # Same folding rule.
     #
+    # doge_p2p_raw_parser_test.cpp: NodeP2P with a raw (AuxPoW) parser: what
+    # it cannot read is delivered by no standard-parse fallback. Same
+    # folding rule.
+    #
     # doge_headers_parse_test.cpp: a 'headers' message that does not parse to
     # its end yields the clean prefix (entries that link) and truncated_at,
     # never garbage that reads like another chain; the parent coinbase params
@@ -250,8 +254,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_auxpow_witness_test.cpp
         doge_hash_schedule_test.cpp
         doge_headers_parse_test.cpp
-        doge_range_sync_test.cpp
         doge_mempool_validity_test.cpp
+        doge_p2p_raw_parser_test.cpp
+        doge_range_sync_test.cpp
         doge_schedule_witness_test.cpp
         doge_template_budget_test.cpp
         doge_template_gate_test.cpp

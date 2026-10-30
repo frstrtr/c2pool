@@ -105,8 +105,12 @@ struct parent_coinbase_no_witness
 /// optional data", transaction.h:238). A stripped coinbase (vin non-empty)
 /// parses the same way, so both legal encodings are accepted; a witness-
 /// carrying one round-trips byte-identical, and one without a witness
-/// serializes exactly as before. Same per-parent rule as above: a parent
-/// with its own TxParams type specializes this in its own tree.
+/// serializes exactly as before. One refusal is stricter than Dogecoin Core
+/// 1.14.9: flag 1 with every witness stack empty ("Superfluous witness
+/// record", the LTC transaction reader) - Core accepts it, but never emits
+/// it (it writes flag 1 only for a non-empty stack, transaction.h:252-256).
+/// Same per-parent rule as above: a parent with its own TxParams type
+/// specializes this in its own tree.
 template <typename ParentCoinbaseTx>
 struct parent_coinbase_wire_params
 {
