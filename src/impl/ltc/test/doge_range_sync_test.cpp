@@ -14,12 +14,16 @@
 //     AnchorsForAnOlderCheckpointCoverThePrefixThenTheTailIsSequential,
 //     AbsentAnchorsUseTheSequentialSync, AnchorDumpRoundTrips
 //   - RangeAnswersNeverTouchHeaderAsks (the headers routing)
+//   - UnsolicitedWrongEndAnswersCannotRefuseTheAnchors,
+//     AWrongAnchorWithTwoPeersStillFallsBack, InFlightNeverExceedsGlobalUnderManyPeers
+//     (VERIFY5)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <random>
@@ -200,11 +204,13 @@ TEST(DogeRangeSync, ExactRangesCompleteInAnyOrder)
 }
 
 // Only an exact range is stored: short, long, broken, wrong end and wrong
-// start store nothing. A wrong end (2,000 linked headers ending elsewhere)
-// excludes its sender at once; a short, long or broken answer is what the
-// AuxPoW parser can make of an honest answer (live, 19:34Z), so it costs the
-// asked peer a strike and the range is asked again, and from a peer not
-// asked it is ignored; three strikes exclude.
+// start store nothing. Only the peer a range is in flight to is judged: a
+// short, long or broken answer is what the AuxPoW parser can make of an
+// honest answer (live, 19:34Z), so it costs that peer a strike and the range
+// is asked again; a wrong end (2,000 linked headers ending elsewhere)
+// excludes it at once. From a peer not asked, any of them is not ours (it
+// falls through to the header chain) and costs, excludes or votes nothing
+// (VERIFY5 S1); three strikes exclude.
 TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
 {
     constexpr uint32_t CP = 20 * STEP;
@@ -217,11 +223,11 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     const uint32_t r = 3, lo = STEP * r + 1, hi = STEP * (r + 1);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi - 1), t), Answer::Ignored) << "short";
     EXPECT_EQ(rs.inflight_of("a"), 7u) << "the short answer ended the request: asked again";
-    EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::Ignored) << "long, not asked";
+    EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::NotOurs) << "long, not asked";
     auto broken = c.slice(lo, hi);
     broken[500].m_previous_block = c.hashes[9];
-    EXPECT_EQ(rs.on_headers("c", broken, t), Answer::Ignored) << "broken, not asked";
-    EXPECT_EQ(rs.on_headers("d", c.fake_range(r), t), Answer::Excluded) << "wrong end";
+    EXPECT_EQ(rs.on_headers("c", broken, t), Answer::NotOurs) << "broken, not asked";
+    EXPECT_EQ(rs.on_headers("d", c.fake_range(r), t), Answer::NotOurs) << "wrong end, not asked";
     EXPECT_EQ(rs.on_headers("e", c.slice(lo + 1, hi + 1), t), Answer::NotOurs) << "wrong start";
     EXPECT_EQ(sched->ranges_done(), 0u);
     EXPECT_FALSE(sched->range_done(r));
@@ -229,14 +235,19 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     EXPECT_FALSE(rs.excluded("a"));
     EXPECT_FALSE(rs.excluded("b"));
     EXPECT_FALSE(rs.excluded("c"));
-    EXPECT_TRUE(rs.excluded("d"));
+    EXPECT_FALSE(rs.excluded("d")) << "an unasked wrong end excluded its sender";
     EXPECT_FALSE(rs.excluded("e"));
     EXPECT_EQ(rs.stats(t).short_parses, 1u);
-    EXPECT_EQ(rs.stats(t).bad_parses, 2u);
-    EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::Stored) << "an exact answer, from anyone";
+    EXPECT_EQ(rs.stats(t).bad_parses, 0u);
+    EXPECT_EQ(rs.on_headers("d", c.slice(lo, hi), t), Answer::Stored) << "an exact answer, from anyone";
     EXPECT_TRUE(sched->range_done(r));
     EXPECT_EQ(sched->stored_hash(lo), c.hashes[lo]);
-    EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::Ignored) << "a copy of a stored range";
+    EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::NotOurs) << "a copy of a stored range";
+    const uint32_t w = 5;  // in flight to a
+    EXPECT_EQ(rs.on_headers("a", c.fake_range(w), t), Answer::Excluded) << "wrong end, asked";
+    EXPECT_TRUE(rs.excluded("a"));
+    EXPECT_EQ(rs.stats(t).bad_parses, 1u);
+    EXPECT_EQ(rs.inflight_of("a"), 0u) << "an excluded peer's ranges go back to the window";
 
     // Three bad answers to its own requests exclude a peer.
     TempStore s2;
@@ -440,7 +451,8 @@ TEST(DogeRangeSync, ThreeTimeoutsExclude)
     const uint32_t undone = sched->first_undone_range();
     if (undone < 40) {
         RangeSync::Request any{undone, "a", {c.hashes[STEP * undone]}, c.hashes[STEP * (undone + 1)]};
-        EXPECT_EQ(rs.on_headers("a", c.answer(any.locator, any.stop), start), Answer::Ignored);
+        EXPECT_EQ(rs.on_headers("a", c.answer(any.locator, any.stop), start), Answer::NotOurs)
+            << "an excluded peer's answer is nobody's request";
     }
 }
 
@@ -580,10 +592,11 @@ TEST(DogeRangeSync, ImportsASequentialPrefix)
     EXPECT_EQ(sched->hash_at(2500), c.hashes[2500]);
 }
 
-// A wrong anchor (a_5): three peers agree the range ending there ends
+// A wrong anchor (a_5): three asked peers agree the range ending there ends
 // elsewhere: the anchors are refused, the sequential sync completes from the
-// delivered prefix into the checkpoint; the delivered ranges are kept, and a
-// restart does not try the anchors again.
+// delivered prefix into the checkpoint; the delivered ranges are kept. The
+// refusal holds for the process only: the next start tries the anchors
+// again (VERIFY5 S1).
 TEST(DogeRangeSync, WrongAnchorFallsBackToSequential)
 {
     constexpr uint32_t CP = 20 * STEP;
@@ -607,7 +620,7 @@ TEST(DogeRangeSync, WrongAnchorFallsBackToSequential)
     EXPECT_TRUE(sched->range_done(10)) << "a delivered range above the wrong anchor";
     {
         RangeSync again(*sched, anchors);
-        EXPECT_EQ(again.mode(), Mode::SequentialFallback) << "refused anchors tried again";
+        EXPECT_EQ(again.mode(), Mode::Anchored) << "the refusal is per process: the next start tries the anchors";
     }
     HashScheduleSync seq(*sched);
     seq.set_floor(rs.floor());
@@ -784,4 +797,95 @@ TEST(DogeRangeSync, BuiltinAnchorsAreDogeMainnet)
     cp.SetHex("51efd04daebddba43ae403662098524d99abf3edad3bddc3ea7b2938c6799939");
     EXPECT_EQ(a.checkpoint_hash(), cp);
     EXPECT_EQ(a.hashes.size(), 3081u);
+}
+
+// ---------------------------------------------------------------------------
+// VERIFY5 (ee4c882f0): unasked WrongEnd answers refused the anchors for good
+// (S1); a wrong anchor with two peers stalled (S2). The verifier's probes.
+// ---------------------------------------------------------------------------
+
+// VERIFY5 S1 (the verifier's probe V5-P3, kept as the KAT): a WrongEnd
+// answer is 2,000 linked headers from an anchor's child ending elsewhere: no
+// PoW, no ask needed. Answers from peers never asked for the range cannot
+// refuse the anchors, and nothing is persisted that a restart would obey. On
+// ee4c882f0 three unsolicited fakes from three peers switched the schedule
+// to the sequential fallback for good.
+TEST(DogeRangeSync, UnsolicitedWrongEndAnswersCannotRefuseTheAnchors)
+{
+    constexpr uint32_t CP = 20 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    const auto anchors = c.anchors(CP);
+    RangeSync rs(*sched, anchors);
+    ASSERT_EQ(rs.mode(), Mode::Anchored);
+    auto t = t0();
+    // Only "h" is ever asked.
+    const auto reqs = rs.tick({"h"}, t);
+    ASSERT_FALSE(reqs.empty());
+    const uint32_t r = 15;  // not in flight to anyone (h holds 0..7)
+    for (const auto& q : reqs)
+        ASSERT_NE(q.range, r);
+    for (int i = 0; i < 3; ++i) {
+        const std::string sybil = "sybil" + std::to_string(i);
+        const auto a = rs.on_headers(sybil, c.fake_range(r), t);
+        std::cout << "  " << sybil << " unsolicited wrong-end answer: "
+                  << (a == Answer::Excluded ? "Excluded" : a == Answer::Ignored ? "Ignored" : "other")
+                  << " mode=" << RangeSync::mode_name(rs.mode()) << "\n";
+    }
+    EXPECT_EQ(rs.mode(), Mode::Anchored) << "three unsolicited fakes refused the anchors";
+    EXPECT_FALSE(rs.sequential());
+    // And across a restart:
+    RangeSync again(*sched, anchors);
+    EXPECT_EQ(again.mode(), Mode::Anchored) << "the refusal was persisted: the anchors are never tried again";
+}
+
+// VERIFY5 S2 (the verifier's probe V5-P5, kept as the KAT): a wrong anchor
+// with fewer than VOTES peers connected: every peer is excluded on its honest
+// answer to the range, the votes never reach three. The schedule still
+// reaches the fallback (every connected peer excluded for 5 minutes). On
+// ee4c882f0 both peers were excluded and no request went out again.
+TEST(DogeRangeSync, AWrongAnchorWithTwoPeersStillFallsBack)
+{
+    constexpr uint32_t CP = 20 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    auto anchors = c.anchors(CP);
+    anchors.hashes[5].SetHex("00000000000000000000000000000000000000000000000000000000000000ff");
+    RangeSync rs(*sched, anchors);
+    const std::vector<std::string> peers{"p0", "p1"};
+    auto t = t0();
+    size_t last_reqs = 0;
+    for (int sec = 0; sec < 1200 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        const auto reqs = rs.tick(peers, t);
+        last_reqs = reqs.size();
+        for (const auto& r : reqs)
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+    }
+    std::cout << "  mode=" << RangeSync::mode_name(rs.mode()) << " excluded(p0)=" << rs.excluded("p0")
+              << " excluded(p1)=" << rs.excluded("p1") << " ranges_done=" << sched->ranges_done()
+              << " last tick requests=" << last_reqs << "\n";
+    EXPECT_NE(rs.mode(), Mode::Anchored) << "two honest peers, one wrong anchor: stuck in anchored mode with every peer excluded";
+}
+
+// The verifier's probe V5-P6, kept as a pin: the in-flight map never exceeds
+// GLOBAL, nor a peer PER_PEER, with many peers connected.
+TEST(DogeRangeSync, InFlightNeverExceedsGlobalUnderManyPeers)
+{
+    constexpr uint32_t CP = 20 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync rs(*sched, c.anchors(CP));
+    std::vector<std::string> peers;
+    for (int i = 0; i < 64; ++i)
+        peers.push_back("p" + std::to_string(i));
+    auto t = t0();
+    const auto reqs = rs.tick(peers, t);
+    EXPECT_LE(reqs.size(), 48u);
+    EXPECT_LE(rs.stats(t).inflight, 48u);
+    for (const auto& p : peers)
+        EXPECT_LE(rs.inflight_of(p), 8u);
 }

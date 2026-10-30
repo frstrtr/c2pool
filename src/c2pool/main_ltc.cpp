@@ -7729,6 +7729,7 @@ int main(int argc, char* argv[]) {
                                                         d["schedule"]["excluded"] = rs.excluded;
                                                         d["schedule"]["short_parses"] = rs.short_parses;
                                                         d["schedule"]["bad_parses"] = rs.bad_parses;
+                                                        d["schedule"]["strikes"] = rs.strikes;
                                                         d["schedule"]["rate_hps"] = rs.rate_hps;
                                                     }
                                                 }

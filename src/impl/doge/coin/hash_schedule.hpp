@@ -401,16 +401,9 @@ public:
         m_anchors = a;
         m_anchors_digest = a.digest();
         m_range_bits.assign((a.ranges() + 7) / 8, 0);
-        bool refused = false;
-        if (!load_ranges_locked(refused)) {
+        bool refused = false;  // a flag older builds wrote: ignored, the anchors are tried again
+        if (!load_ranges_locked(refused))
             import_ranges_locked();
-            refused = false;
-        }
-        if (refused) {
-            LOG_WARNING << "[EMB-DOGE] Hash schedule: these anchors were refused by an earlier run: sequential sync";
-            m_anchors.reset();
-            return RangeMode::None;
-        }
         recount_locked();
         m_range_mode = acp == m_cp_height ? RangeMode::Anchored : RangeMode::Tail;
         // The frontier: the contiguous delivered prefix (a tail already
@@ -530,15 +523,16 @@ public:
         return RangeFeed::Stored;
     }
 
-    /// The anchors are refused for the rest of this schedule (a wrong
-    /// anchor, an undeliverable range): kept in the range record, so a
-    /// restart runs the sequential sync from its frontier at once.
+    /// The anchors are refused for the rest of this process (a wrong anchor,
+    /// an undeliverable range, every peer excluded). Not persisted: a refusal
+    /// at run time is likelier forced by peers than a wrong shipped anchor
+    /// (tools/doge-anchor-check.py checks those before they ship), so the
+    /// next start tries the anchors again (VERIFY5 S1).
     void refuse_anchors()
     {
         std::lock_guard<std::mutex> lock(m_mu);
         if (!m_anchors)
             return;
-        m_db.put(ranges_key(), ranges_record_locked(m_range_bits, true));
         m_range_mode = RangeMode::None;
     }
 
@@ -586,7 +580,7 @@ private:
     // "h" + hash, "H" + height, "tip", "height".
     static std::string runs_key() { return "schedule_runs"; }
     static constexpr uint8_t RUNS_VERSION = 1;
-    // The range bitmap: version | flags (1 = anchors refused) | anchors digest
+    // The range bitmap: version | flags (1 = refused, written by older builds; ignored) | anchors digest
     // | checkpoint height | checkpoint hash | bits. Not under 'H' either.
     static std::string ranges_key() { return "schedule_ranges"; }
     static constexpr uint8_t RANGES_VERSION = 1;
