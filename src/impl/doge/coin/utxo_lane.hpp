@@ -178,6 +178,12 @@ struct UtxoLaneHost {
     /// main_ltc: the accrual Bootstrap while the anchored hash schedule runs
     /// and the header chain is not synced. Unset: never waits.
     std::function<bool()> bodies_wait;
+    /// The set chases the header chain's tip (VERIFY7 B2; LTC's
+    /// utxo_catchup): while it returns true and no fill runs, a set behind
+    /// the tip asks its next block itself (see UtxoLane::chase_tip). main_ltc:
+    /// the header chain is synced (and, for the accrual set, the full set is
+    /// not live). Unset: never chases.
+    std::function<bool()> chase_tip;
 };
 
 /// The serialized size of a body, estimated from its parts (memory bounds:
@@ -229,6 +235,7 @@ struct UtxoLaneStats {
     std::atomic<uint64_t> buffer_bytes{0};     // full mode: bodies received, waiting to connect
     std::atomic<uint64_t> stall_timeout_ms{0}; // full mode: the current stall timeout
     std::atomic<uint64_t> stuck_retries{0};    // full mode: retries of a stuck height
+    std::atomic<uint64_t> tip_chases{0};       // the set behind the tip asked its next block (chase_tip)
 
     nlohmann::json to_json() const
     {
@@ -245,6 +252,7 @@ struct UtxoLaneStats {
             {"peers_cooling", v(peers_cooling)}, {"stalls", v(stalls)},
             {"request_timeouts", v(request_timeouts)}, {"buffer_bytes", v(buffer_bytes)},
             {"stall_timeout_ms", v(stall_timeout_ms)}, {"stuck_retries", v(stuck_retries)},
+            {"tip_chases", v(tip_chases)},
         };
     }
 };
@@ -905,6 +913,7 @@ public:
                 retry_stuck(t);
             update_rate(t);
         }
+        chase_tip(t);
         if (!downloading() || !m_fill.active) {
             // No download runs: what is left of the last one is answered or
             // moot (the accrual lane drops a request only at its next refill).
@@ -959,6 +968,54 @@ public:
 
     /// Tests: the reorder buffer's memory bound.
     void set_buffer_limit(size_t bytes) { m_buffer_limit = bytes; }
+
+    static constexpr std::chrono::seconds CHASE_LAG{1};       // two or more blocks behind
+    static constexpr std::chrono::seconds CHASE_TIP_LAG{5};   // only the tip's body missing
+    static constexpr std::chrono::seconds CHASE_EVERY{2};
+    static constexpr uint32_t CHASE_ONE_PEER_TRIES = 2;
+
+private:
+    /// The tip's body is asked once, from its announcer, and a lost one was
+    /// fetched only when a later body arrived (the gap fill); an announcer
+    /// that serves headers but no bodies left the set behind for good
+    /// (VERIFY7 B2). With no fill running, a set behind the header chain's
+    /// tip asks its next block: after CHASE_LAG (CHASE_TIP_LAG when only the
+    /// tip is missing: its own request may still be answered), every
+    /// CHASE_EVERY, from one peer CHASE_ONE_PEER_TRIES times, then from every
+    /// peer. LTC's utxo_catchup (main_ltc.cpp), with the tip's own case added.
+    void chase_tip(std::chrono::steady_clock::time_point t)
+    {
+        if (!m_host.chase_tip || m_fill.active || m_stuck || !m_host.chase_tip()) {
+            m_chase_height = 0;
+            return;
+        }
+        const uint32_t best = m_utxo.get_best_height();
+        const uint32_t tip = m_host.chain_height();
+        if (best == 0 || best >= tip) {
+            m_chase_height = 0;
+            return;
+        }
+        const uint32_t h = best + 1;
+        if (m_chase_height != h) {
+            m_chase_height = h;
+            m_chase_since = t;
+            m_chase_last = {};
+            m_chase_tries = 0;
+            return;
+        }
+        const auto lag = h < tip ? CHASE_LAG : CHASE_TIP_LAG;
+        if (t - m_chase_since < lag || (m_chase_tries > 0 && t - m_chase_last < CHASE_EVERY))
+            return;
+        const bool all = m_chase_tries >= CHASE_ONE_PEER_TRIES;
+        m_host.request(h, all ? UtxoAsk::Broadcast : UtxoAsk::Targeted);
+        m_stats.tip_chases.fetch_add(1, std::memory_order_relaxed);
+        LOG_INFO << m_tag << " UTXO behind the tip (h=" << best << ", tip h=" << tip << "): requesting h=" << h
+                 << (all ? " from every peer" : " from one peer");
+        ++m_chase_tries;
+        m_chase_last = t;
+    }
+
+public:
 
 private:
     /// A stuck height (REFUSALS_MAX refusals) is fetched again once
@@ -1466,6 +1523,10 @@ private:
     size_t                              m_buffer_limit{BUFFER_BYTES_MAX};
     std::chrono::milliseconds           m_stall_timeout{STALL_TIMEOUT_MIN};
     uint32_t                            m_drained_since_stall{0};
+    uint32_t                            m_chase_height{0};  // chase_tip: the height asked, 0 = none
+    std::chrono::steady_clock::time_point m_chase_since{};
+    std::chrono::steady_clock::time_point m_chase_last{};
+    uint32_t                            m_chase_tries{0};
     mutable std::mutex                  m_in_use_mu;
     std::set<std::string>               m_in_use;     // peers_in_use(): m_load's peers, for other threads
 };

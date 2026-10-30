@@ -7514,6 +7514,11 @@ int main(int argc, char* argv[]) {
                                         return range_sync && range_sync->mode() == doge::coin::RangeSync::Mode::Anchored
                                             && !dc->is_synced();
                                     };
+                                    // A tip body that never came is asked again (VERIFY7 B2),
+                                    // while this set prices the templates.
+                                    host.chase_tip = [dc, full = doge_full]() {
+                                        return dc->is_synced() && !full->live.load();
+                                    };
                                     doge_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_utxo_cache, *doge_utxo_db, std::move(host));
                                     doge_full->add_body_peers([lane = std::weak_ptr<doge::coin::UtxoLane>(doge_lane)]() {
@@ -7693,6 +7698,8 @@ int main(int argc, char* argv[]) {
                                     host.fill_stopped = [](doge::coin::UtxoLaneHost::Fill& f) {
                                         f.stop_stall_timer();
                                     };
+                                    // A tip body that never came is asked again (VERIFY7 B2).
+                                    host.chase_tip = [dc]() { return dc->is_synced(); };
                                     doge_full_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_full_cache, *doge_full_db, std::move(host),
                                         core::coin::DOGE_MIN_BLOCKS_TO_KEEP, doge::coin::UtxoLaneMode::Full);

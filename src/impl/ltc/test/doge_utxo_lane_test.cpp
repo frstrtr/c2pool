@@ -469,3 +469,60 @@ TEST(DogeUtxoOrder, StatsCountGapsReorgsHealsAndRebuilds)
     EXPECT_EQ(j.at("connected").get<uint64_t>(), 6u);
     EXPECT_EQ(j.at("heal_failures").get<uint64_t>(), 0u);
 }
+
+// VERIFY7 B2: the tip's body is asked once, from its announcer. An announcer
+// that serves headers but no bodies left the set behind for good: a lost
+// body was fetched only when a later body arrived. The set at h=3, the header
+// chain at h=5, no body coming: after a second the set asks h=4 itself, from
+// one peer twice, then from every peer; once h=4 is in, the tip's own body
+// (h=5) is asked after CHASE_TIP_LAG. Nothing is asked while chase_tip says
+// no (the header chain not synced, a fill running).
+TEST(DogeUtxoOrder, TheSetChasesATipItsAnnouncerNeverServes)
+{
+    Lane l(core::coin::DOGE_MIN_BLOCKS_TO_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
+    const uint256 g = genesis(0x60);
+    const auto c = make_chain(g, 1, 5, 0x60);
+    l.grow({c[0], c[1], c[2]});
+    ASSERT_EQ(l.t.cache->get_best_height(), 3u);
+    l.switch_to(c, 1);  // headers to h=5; the bodies of h=4 and h=5 never come from their announcer
+    l.net.requested.clear();
+    l.net.asked_how.clear();
+    auto tick_after = [&](std::chrono::milliseconds dt) {
+        l.net.clock += dt;
+        l.lane.tick();
+    };
+    for (int i = 0; i < 5; ++i)
+        tick_after(std::chrono::seconds(1));
+    EXPECT_TRUE(l.net.requested.empty()) << "chased while chase_tip said no";
+
+    l.net.chase = true;
+    tick_after(std::chrono::milliseconds(100));  // notices the lag
+    tick_after(std::chrono::milliseconds(500));
+    EXPECT_TRUE(l.net.requested.empty()) << "asked before CHASE_LAG";
+    tick_after(std::chrono::milliseconds(600));
+    ASSERT_EQ(l.net.requested, (std::vector<uint32_t>{4})) << "the set did not ask its next block";
+    for (int i = 0; i < 6; ++i)
+        tick_after(std::chrono::seconds(1));
+    ASSERT_GE(l.net.asked_how.size(), 3u);
+    EXPECT_EQ(l.net.asked_how[0], UtxoAsk::Targeted);
+    EXPECT_EQ(l.net.asked_how[1], UtxoAsk::Targeted);
+    EXPECT_EQ(l.net.asked_how[2], UtxoAsk::Broadcast) << "every peer from the third ask";
+
+    // Another peer serves h=4: the set moves; only the tip's body is missing now.
+    l.deliver(c[3], 4);
+    ASSERT_EQ(l.t.cache->get_best_height(), 4u);
+    l.net.requested.clear();
+    tick_after(std::chrono::milliseconds(100));
+    tick_after(std::chrono::seconds(2));
+    EXPECT_TRUE(l.net.requested.empty()) << "the tip's body chased before CHASE_TIP_LAG";
+    tick_after(std::chrono::seconds(4));
+    ASSERT_EQ(l.net.requested, (std::vector<uint32_t>{5}));
+    l.deliver(c[4], 5);
+    EXPECT_EQ(l.t.cache->get_best_height(), 5u);
+    l.net.requested.clear();
+    for (int i = 0; i < 10; ++i)
+        tick_after(std::chrono::seconds(1));
+    EXPECT_TRUE(l.net.requested.empty()) << "chased at the tip";
+    EXPECT_GE(l.lane.stats().tip_chases.load(), 4u);
+}
+

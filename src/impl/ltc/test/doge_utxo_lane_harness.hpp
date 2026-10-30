@@ -200,6 +200,7 @@ struct Net {
     std::vector<std::pair<std::string, uint32_t>> peer_requests;
     std::chrono::steady_clock::time_point clock{std::chrono::steady_clock::time_point{} + std::chrono::hours(1)};
     bool bodies_wait{false};  // the host's bodies_wait (headers first)
+    bool chase{false};        // the host's chase_tip
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     std::vector<std::string> events;     // clean / header, in order
@@ -275,6 +276,7 @@ struct Net {
                 pool->requarantine_all();
         };
         h.completed = [this]() { ++completed; };
+        h.chase_tip = [this]() { return chase; };
         if (download) {
             h.download_peers = [this]() { return peers; };
             h.request_from = [this](const std::string& peer, uint32_t height) {
