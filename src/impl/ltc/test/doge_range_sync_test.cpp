@@ -18,7 +18,10 @@
 //     AWrongAnchorWithTwoPeersStillFallsBack, InFlightNeverExceedsGlobalUnderManyPeers
 //     (VERIFY5)
 //   - ALimitedLinkStrikesNoPeer (a FIFO link), ASharedLinkDoesNotStrikeHonestPeers
-//     (a shared link: the budget reads the rate, not a burst), ADeliveryForgivesAStrike
+//     (a shared link), ADeliveryForgivesAStrike
+//   - APerFlowCapIsNotTheLink (each connection capped, the link to spare),
+//     NoStrikeWhenNobodyDelivers, RangePeersAreNotTheSyncPeerNorBodyPeers
+//     (FRESH-NODE §6.4, §7)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -224,8 +227,13 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     auto sched = open_schedule(s, c, CP);
     RangeSync rs(*sched, c.anchors(CP));
     auto t = t0();
-    ASSERT_EQ(rs.tick({"a"}, t).size(), 2u) << "ranges 0 and 1, the starting budget";
-    const uint32_t r = 1, lo = STEP * r + 1, hi = STEP * (r + 1);
+    // A peer's window starts at 1; a range delivered at once makes it 2:
+    // ranges 1 and 2 in flight to a.
+    const auto first = rs.tick({"a"}, t);
+    ASSERT_EQ(first.size(), 1u) << "a peer's window starts at 1";
+    ASSERT_EQ(rs.on_headers("a", c.answer(first[0].locator, first[0].stop), t), Answer::Stored);
+    ASSERT_EQ(rs.tick({"a"}, t).size(), 2u) << "ranges 1 and 2: a fast delivery grows the window";
+    const uint32_t r = 2, lo = STEP * r + 1, hi = STEP * (r + 1);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi - 1), t), Answer::Ignored) << "short";
     EXPECT_EQ(rs.inflight_of("a"), 1u) << "the short answer ended the request: asked again";
     EXPECT_EQ(rs.on_headers("b", c.slice(lo, hi + 1), t), Answer::NotOurs) << "long, not asked";
@@ -234,7 +242,7 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     EXPECT_EQ(rs.on_headers("c", broken, t), Answer::NotOurs) << "broken, not asked";
     EXPECT_EQ(rs.on_headers("d", c.fake_range(r), t), Answer::NotOurs) << "wrong end, not asked";
     EXPECT_EQ(rs.on_headers("e", c.slice(lo + 1, hi + 1), t), Answer::NotOurs) << "wrong start";
-    EXPECT_EQ(sched->ranges_done(), 0u);
+    EXPECT_EQ(sched->ranges_done(), 1u) << "range 0 only";
     EXPECT_FALSE(sched->range_done(r));
     EXPECT_TRUE(sched->stored_hash(lo).IsNull()) << "a record was written from a non-exact answer";
     EXPECT_FALSE(rs.excluded("a"));
@@ -248,7 +256,7 @@ TEST(DogeRangeSync, OnlyAnExactRangeIsStored)
     EXPECT_TRUE(sched->range_done(r));
     EXPECT_EQ(sched->stored_hash(lo), c.hashes[lo]);
     EXPECT_EQ(rs.on_headers("a", c.slice(lo, hi), t), Answer::NotOurs) << "a copy of a stored range";
-    const uint32_t w = 0;  // in flight to a
+    const uint32_t w = 1;  // in flight to a
     EXPECT_EQ(rs.on_headers("a", c.fake_range(w), t), Answer::Excluded) << "wrong end, asked";
     EXPECT_TRUE(rs.excluded("a"));
     EXPECT_EQ(rs.stats(t).bad_parses, 1u);
@@ -489,13 +497,13 @@ TEST(DogeRangeSync, InFlightIsBounded)
         std::vector<std::string> peers;
         for (int i = 0; i < 10; ++i)
             peers.push_back("p" + std::to_string(i));
-        // A fast start (answers at once) grows the budget to the global bound.
+        // One range per peer up to GLOBAL; answered at once, the windows grow.
         auto t = t0();
         for (int sec = 0; sec < 4; ++sec) {
             t = t0() + std::chrono::seconds(sec);
             const auto reqs = rs.tick(peers, t);
             if (sec == 0)
-                EXPECT_EQ(reqs.size(), 2u) << "the starting budget";
+                EXPECT_EQ(reqs.size(), 6u) << "one per peer, GLOBAL in all";
             for (const auto& r : reqs)
                 rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
         }
@@ -963,42 +971,59 @@ TEST(DogeRangeSync, ALimitedLinkStrikesNoPeer)
     }
 }
 
-// A peer struck while the link was full delivers afterwards: the delivery
-// forgives the strike, so two more timeouts do not exclude it. A peer that
-// never delivers is excluded on its third strike (ThreeTimeoutsExclude).
+// A peer struck while another delivered (a strike needs a witness) delivers
+// afterwards: the delivery forgives the strike, so two more timeouts do not
+// exclude it. A peer that never delivers is excluded on its third strike
+// (ThreeTimeoutsExclude).
 TEST(DogeRangeSync, ADeliveryForgivesAStrike)
 {
-    constexpr uint32_t CP = 20 * STEP;
+    constexpr uint32_t CP = 80 * STEP;
     const Chain c(CP);
     TempStore s;
     auto sched = open_schedule(s, c, CP);
     RangeSync::Config cfg;
-    cfg.window = 1;
+    cfg.window = 2;
     cfg.per_peer = 1;
-    cfg.global = 1;
+    cfg.global = 2;
     cfg.peer_cooldown = std::chrono::seconds(60);
     RangeSync rs(*sched, c.anchors(CP), cfg);
+    const std::vector<std::string> peers{"a", "w"};  // w answers 10 s after each ask: the witness
     auto t = t0();
     int asked = 0, struck_silent = 0;
     bool delivered = false;
-    for (int sec = 0; sec < 900; ++sec) {
-        t = t0() + std::chrono::seconds(sec);
-        for (const auto& r : rs.tick({"a"}, t)) {
+    std::multimap<Clock::time_point, RangeSync::Request> w_due;
+    auto run = [&](Clock::time_point at) {
+        for (auto it = w_due.begin(); it != w_due.end() && it->first <= at;) {
+            rs.on_headers("w", c.answer(it->second.locator, it->second.stop), at);
+            it = w_due.erase(it);
+        }
+        for (const auto& r : rs.tick(peers, at)) {
+            if (r.peer == "w") {
+                w_due.emplace(at + std::chrono::seconds(10), r);
+                continue;
+            }
             ++asked;
             if (asked == 2) {  // the second ask is answered: the link is back
-                EXPECT_EQ(rs.on_headers("a", c.answer(r.locator, r.stop), t), Answer::Stored);
+                EXPECT_EQ(rs.on_headers("a", c.answer(r.locator, r.stop), at), Answer::Stored);
                 delivered = true;
             } else {
                 ++struck_silent;  // the others time out
             }
         }
+    };
+    for (int sec = 0; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        run(t);
         if (struck_silent >= 3 && delivered)
             break;
     }
     ASSERT_TRUE(delivered);
     ASSERT_GE(struck_silent, 3);
-    t += cfg.request_timeout + std::chrono::seconds(1);
-    rs.tick({"a"}, t);  // the last silent ask times out
+    for (int k = 0; k <= 61 && rs.mode() == Mode::Anchored; ++k) {
+        t += std::chrono::seconds(1);
+        run(t);  // the last silent ask times out while w delivers
+    }
+    EXPECT_GE(rs.stats(t).strikes, 3u);
     EXPECT_FALSE(rs.excluded("a")) << "three strikes, one forgiven by a delivery: excluded anyway";
 }
 
@@ -1101,5 +1126,200 @@ TEST(DogeRangeSync, ASharedLinkDoesNotStrikeHonestPeers)
         EXPECT_EQ(st.excluded, 0u) << mbps << " MB/s";
         EXPECT_LE(st.strikes, 2u) << "honest peers struck on a " << mbps << " MB/s link";
         EXPECT_LE(sec, 2 * ideal + 600) << mbps << " MB/s: far from link-bound";
+    }
+}
+
+namespace {
+
+/// A link where every peer's connection has its own limit (its upload, the
+/// RTT: `flow_bytes_per_s`) and all of them share `link_bytes_per_s`: the
+/// connections with a range in progress share the link equally, each at most
+/// its limit (FRESH-NODE §4: live, ~50 KB/s a range with the link to spare).
+/// A peer answers its requests in the order asked, one at a time; a request
+/// keeps transferring after RangeSync released it (the peer still sends).
+/// SharedLink is the other model: every range at once, completing together.
+struct CappedLink {
+    double link_bytes_per_s;
+    double flow_bytes_per_s;
+    double range_bytes;
+    std::map<std::string, std::deque<std::pair<RangeSync::Request, double>>> queues;
+    void add(const RangeSync::Request& r) { queues[r.peer].emplace_back(r, range_bytes); }
+    std::vector<RangeSync::Request> step()  // one second passes
+    {
+        std::vector<RangeSync::Request> done;
+        size_t active = 0;
+        for (const auto& [p, q] : queues)
+            active += q.empty() ? 0 : 1;
+        if (active == 0)
+            return done;
+        const double rate = std::min(flow_bytes_per_s, link_bytes_per_s / active);
+        for (auto& [p, q] : queues) {
+            if (q.empty())
+                continue;
+            q.front().second -= rate;
+            if (q.front().second <= 0) {
+                done.push_back(q.front().first);
+                q.pop_front();
+            }
+        }
+        return done;
+    }
+};
+
+} // namespace
+
+// FRESH-NODE §4.4 / §7: the ranges' limit is per connection (a peer's upload,
+// the RTT), not the link. Eighteen peers, each connection capped at 100 KB/s
+// (the §7 figure) or 50 KB/s (the live rate of a range, 4 a minute at budget
+// 2), sharing a 1 MB/s link, AuxPoW ranges of 1.6 MB: after the first minute
+// at least 10 ranges are in flight in every second, the schedule takes at
+// least 0.8 MB/s, nobody is struck. On 91e5f87d9 the rate budget measures its
+// own output: at 50 KB/s a range takes 32 s > 20 s and it stays at 2 (0.1
+// MB/s); at 100 KB/s it climbs from 2 and is still at 4-8 in the second minute.
+TEST(DogeRangeSync, APerFlowCapIsNotTheLink)
+{
+    constexpr uint32_t CP = 300 * STEP;
+    const Chain c(CP);
+    for (const double flow : {100e3, 50e3}) {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const auto peers = v6_peers(18);
+        CappedLink link{1e6, flow, 1.6e6, {}};
+        constexpr int RUN = 420, WARM = 60;
+        uint32_t min_inflight = UINT32_MAX;
+        uint64_t stored = 0;
+        auto t = t0();
+        int sec = 0;
+        for (; sec < RUN && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                link.add(r);
+            if (sec >= WARM)
+                min_inflight = std::min(min_inflight, rs.stats(t).inflight);
+            for (const auto& r : link.step()) {
+                const auto a = rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+                if (sec >= WARM && (a == Answer::Stored || a == Answer::Complete))
+                    ++stored;
+            }
+        }
+        const auto st = rs.stats(t);
+        const double mbps = stored * 1.6 / (sec - WARM);
+        std::cout << "  " << flow / 1e3 << " KB/s a connection, 1 MB/s link: " << mbps << " MB/s after minute 1, "
+                  << "min in flight " << min_inflight << ", budget " << st.budget << ", strikes " << st.strikes
+                  << ", range timeouts " << st.timeouts << ", ranges " << st.ranges_done << "/" << st.ranges_total
+                  << " in " << sec << " s\n";
+        EXPECT_EQ(sec, RUN) << "the run ended early: the KAT needs more ranges";
+        EXPECT_GE(min_inflight, 10u) << flow / 1e3 << " KB/s: the ranges in flight fell to " << min_inflight;
+        EXPECT_GE(mbps, 0.8) << flow / 1e3 << " KB/s: the link was there";
+        EXPECT_EQ(st.strikes, 0u) << flow / 1e3 << " KB/s";
+        EXPECT_EQ(st.excluded, 0u) << flow / 1e3 << " KB/s";
+    }
+}
+
+// FRESH-NODE §6.4 / §7: a strike needs a witness. Every peer silent for five
+// minutes (the link full of something else, nothing arriving from anyone):
+// no strike, nobody excluded, no range asked twice (each peer is still
+// sending what it was asked; asking again doubles the load); then the link
+// comes back and the schedule completes. One silent peer while the others
+// deliver: one strike, for it. On 91e5f87d9 the silent link struck 2 peers a
+// minute (10 strikes by 5 minutes) and asked each range again and again.
+TEST(DogeRangeSync, NoStrikeWhenNobodyDelivers)
+{
+    constexpr uint32_t CP = 40 * STEP;
+    const Chain c(CP);
+    {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const auto peers = v6_peers(18);
+        std::map<uint32_t, int> asked;
+        std::vector<RangeSync::Request> pending;
+        auto t = t0();
+        for (int sec = 0; sec < 300; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t)) {
+                ++asked[r.range];
+                pending.push_back(r);
+            }
+        }
+        auto st = rs.stats(t);
+        std::cout << "  five silent minutes: strikes " << st.strikes << ", excluded " << st.excluded
+                  << ", range timeouts " << st.timeouts << ", asks " << pending.size() << " for " << asked.size()
+                  << " ranges, in flight " << st.inflight << "\n";
+        EXPECT_EQ(st.strikes, 0u) << "honest peers struck while nobody delivered";
+        EXPECT_EQ(st.excluded, 0u);
+        for (const auto& [r, n] : asked)
+            EXPECT_EQ(n, 1) << "range " << r << " asked again while nobody delivered";
+        // The link is back: the answers arrive, then every ask is answered.
+        for (const auto& r : pending)
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        for (int sec = 301; sec < 400 && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        }
+        st = rs.stats(t);
+        EXPECT_EQ(rs.mode(), Mode::Complete);
+        EXPECT_EQ(st.strikes, 0u);
+    }
+    {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const auto peers = v6_peers(18);
+        std::multimap<int, RangeSync::Request> due;
+        auto t = t0();
+        for (int sec = 0; sec < 300; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                if (r.peer != "p0")
+                    due.emplace(sec + 5, r);
+            for (auto it = due.begin(); it != due.end() && it->first <= sec;) {
+                rs.on_headers(it->second.peer, c.answer(it->second.locator, it->second.stop), t);
+                it = due.erase(it);
+            }
+        }
+        const auto st = rs.stats(t);
+        EXPECT_EQ(st.strikes, 1u) << "the silent peer, once (then it cools for 10 minutes)";
+        EXPECT_FALSE(rs.excluded("p0"));
+    }
+}
+
+// FRESH-NODE §4.2 / §6.4: a peer serves its requests in order, so a range
+// asked of the header chain's sync peer or of a peer downloading bodies waits
+// behind them. With 18 peers, the sync peer and 4 body peers named: no range
+// goes to them. With only named peers connected, they are asked (the ranges
+// never wait for want of another peer).
+TEST(DogeRangeSync, RangePeersAreNotTheSyncPeerNorBodyPeers)
+{
+    constexpr uint32_t CP = 40 * STEP;
+    const Chain c(CP);
+    {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const auto peers = v6_peers(18);
+        const std::set<std::string> avoid{"p0", "p1", "p2", "p3", "p4"};  // sync peer p0, body peers p1..p4
+        std::set<std::string> used;
+        auto t = t0();
+        for (int sec = 0; sec < 60 && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t, avoid)) {
+                EXPECT_EQ(avoid.count(r.peer), 0u) << "range " << r.range << " asked of " << r.peer;
+                used.insert(r.peer);
+                rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+            }
+        }
+        EXPECT_EQ(rs.mode(), Mode::Complete);
+        EXPECT_EQ(used.size(), 13u) << "every other peer";
+    }
+    {
+        TempStore s;
+        auto sched = open_schedule(s, c, CP);
+        RangeSync rs(*sched, c.anchors(CP));
+        const std::vector<std::string> peers{"p0", "p1"};
+        const auto reqs = rs.tick(peers, t0(), {"p0", "p1"});
+        EXPECT_FALSE(reqs.empty()) << "only named peers connected: nothing asked";
     }
 }

@@ -8,20 +8,29 @@
 /// answer is exactly it (HashSchedule::store_range): nothing partial is ever
 /// stored, so nothing is ever cut. The window is the lowest WINDOW
 /// undelivered ranges; at most PER_PEER in flight per peer, a range to one
-/// peer at a time; tick() every second. In all, at most what the delivery
-/// rate brings in BUDGET (a third of the request timeout), between
-/// MIN_INFLIGHT and GLOBAL. The rate is the last minute's deliveries over
-/// the minute (over the time since the sync began, at least 10 s, in its
-/// first minute), never over the span of the deliveries themselves: ranges
-/// in flight share the link and complete together, and a burst read as a
-/// rate overcommits threefold (VERIFY6 S1: 53 strikes, two honest peers
-/// excluded on a shared link). An AuxPoW range is ~1.6 MB, ranges in
-/// flight share the link, and 48 of them on a link that gives the schedule
-/// 0.2-0.5 MB/s are minutes of queue, so every peer would miss its 60 s and
-/// take strikes (live, a fresh node beside a block IBD and its own accrual
-/// bootstrap: 17 strikes in 5 minutes, then nothing in flight, no peer at
-/// fault). MIN_INFLIGHT is 2: even 8 at once outlast 60 s below 8 ranges a
-/// minute, which the same run saw.
+/// peer at a time; tick() every second.
+///
+/// How many ranges are in flight (FRESH-NODE §6.4): a window per peer, as
+/// Core's per-peer block window, under a congestion window for the link the
+/// ranges share; no rate feedback.
+///   - Per peer: it starts at 1; a range delivered within REQUEST_TIMEOUT / 3
+///     of its request adds one (up to PER_PEER), one delivered after 2/3 of
+///     it halves it, a timeout sets it back to 1. A peer serves its requests
+///     in order, so a second range to it waits behind the first.
+///   - In all: GLOBAL, the ranges' estimated bytes within INFLIGHT_BYTES, and
+///     the congestion window: it starts at the number of usable peers, grows
+///     by one per range whose transfer (from its request, or from its peer's
+///     previous delivery when later) took at most REQUEST_TIMEOUT / 2, shrinks
+///     by one per range that took more than 3/4 of it, and halves when peers
+///     go quiet with nobody delivering. A per-flow limit (a peer's upload,
+///     the RTT) leaves the transfer time flat however many peers are asked,
+///     so every usable peer gets its range; a link every range shares
+///     stretches it, so fewer are asked and none reaches the timeout.
+/// The rate budget this replaces measured its own output and settled at 2
+/// whenever a range took more than 20 s (live: 4 ranges a minute for 100
+/// minutes with the link to spare). Peers the caller names (the header
+/// chain's sync peers, the block downloads' peers) are asked only when no
+/// other usable peer is connected.
 ///
 /// Answers (on_headers, before the sequential sync and the header chain):
 ///   - the first header's parent is not an anchor (the header chain's
@@ -46,16 +55,21 @@
 ///   - every connected peer excluded for ALL_EXCLUDED_PATIENCE (a wrong
 ///     anchor with fewer than VOTES peers, VERIFY5 S2): the same fallback.
 /// Timeouts: a peer that has delivered no exact range for REQUEST_TIMEOUT
-/// since its oldest request (or its last delivery) loses its in-flight
-/// ranges (one strike). A strike cools the peer for PEER_COOLDOWN; STRIKES
-/// strikes exclude it; an exact range it delivers forgives one (a peer
-/// struck while the link was full is not excluded for it; a silent peer, a
-/// trickler or a liar never delivers one). A slow peer that keeps
-/// delivering is never struck: its requests queue behind each other on its
-/// connection; a range it holds for 3 x REQUEST_TIMEOUT goes to another
-/// peer without a strike. A range
-/// that every usable peer (at least VOTES of them) timed out on twice is
-/// undeliverable (an anchor nobody knows): the same fallback.
+/// since its oldest request (or its last delivery) is struck only with a
+/// witness: another peer delivered a range asked after this peer's oldest
+/// one (it was overtaken). Then its in-flight ranges go to other peers
+/// and the strike cools it for PEER_COOLDOWN; STRIKES strikes exclude it; an
+/// exact range it delivers forgives one. Without a witness the link, not the
+/// peer, is the cause (a full link, nothing arriving from anyone, ranges
+/// served in turn): no strike, no cooldown, its ranges stay with it (it is
+/// still sending them; asking again would double the load), its window goes
+/// back to 1 and the congestion window halves. After NOBODY_PATIENCE with no
+/// range delivered by anyone, timeouts are struck again (a network that
+/// serves no range reaches the fallback). A range held for 3 x
+/// REQUEST_TIMEOUT that a later request overtook goes to another peer without
+/// a strike; a peer that disconnected releases its ranges. A range that every
+/// usable peer (at least VOTES of them) timed out on twice is undeliverable
+/// (an anchor nobody knows): the same fallback.
 /// Thread safety: every public method takes the internal mutex.
 
 #include <impl/doge/coin/hash_schedule.hpp>
@@ -83,6 +97,8 @@ struct RangeSyncConfig {
     std::chrono::seconds peer_cooldown{600};     // a struck peer is not asked for this
     uint32_t strikes{3};                         // strikes that exclude a peer
     uint32_t votes{3};                           // peers that prove an anchor wrong
+    uint64_t inflight_bytes{64ull << 20};        // the ranges' estimated bytes in flight
+    uint32_t auxpow_height{371337};              // ranges above it: AuxPoW headers (~800 B each)
 };
 
 class RangeSync {
@@ -165,13 +181,17 @@ public:
         uint256              stop;     // a_{i+1}
     };
 
-    /// Time out, then fill the window from `peers` (the connected peers).
-    std::vector<Request> tick(const std::vector<std::string>& peers, Clock::time_point now)
+    /// Time out, then fill the window from `peers` (the connected peers);
+    /// `avoid` (the header chain's sync peers, the block downloads' peers)
+    /// is asked only when no other peer has room.
+    std::vector<Request> tick(const std::vector<std::string>& peers, Clock::time_point now,
+                              const std::set<std::string>& avoid = {})
     {
         std::lock_guard<std::mutex> lock(m_mu);
         std::vector<Request> out;
         if (m_mode != Mode::Anchored)
             return out;
+        release_gone_locked(peers);
         time_out_locked(now);
         if (m_mode != Mode::Anchored)
             return out;
@@ -181,9 +201,15 @@ public:
         check_all_excluded_locked(peers, now);
         if (m_mode != Mode::Anchored)
             return out;
+        if (m_last_any == Clock::time_point{})
+            m_last_any = now;
+        if (m_cwnd == 0)
+            m_cwnd = std::clamp<size_t>(usable_count_locked(peers, now), min_cwnd(), m_cfg.global);
         // The window: the lowest `window` undelivered ranges.
         const uint32_t n = m_anchors.ranges();
-        const size_t budget = inflight_budget_locked(now);
+        uint64_t bytes = 0;
+        for (const auto& [r, f] : m_inflight)
+            bytes += range_bytes(r);
         uint32_t seen = 0;
         for (uint32_t i = m_s.first_undone_range(); i < n && seen < m_cfg.window; ++i) {
             if (m_s.range_done(i))
@@ -191,16 +217,21 @@ public:
             ++seen;
             if (m_inflight.count(i))
                 continue;
-            if (m_inflight.size() >= budget)
+            if (m_inflight.size() >= std::min<size_t>(m_cwnd, m_cfg.global))
                 break;
-            const std::string p = pick_locked(i, peers, now);
+            if (!m_inflight.empty() && bytes + range_bytes(i) > m_cfg.inflight_bytes)
+                break;
+            const std::string p = pick_locked(i, peers, now, avoid);
             if (p.empty())
                 break;  // no peer has a free slot
             auto& ps = m_peers[p];
-            if (ps.inflight == 0)
+            if (ps.inflight == 0) {
                 ps.since = now;
+                ps.late = false;
+            }
             ++ps.inflight;
             m_inflight[i] = InFlight{p, now};
+            bytes += range_bytes(i);
             out.push_back(Request{i, p, {m_anchors.hashes[i]}, m_anchors.hashes[i + 1]});
         }
         return out;
@@ -235,10 +266,15 @@ public:
         case Feed::Stored:
         case Feed::Complete: {
             auto it = m_inflight.find(i);
+            if (it != m_inflight.end() && it->second.peer == peer)
+                on_served_locked(peer, it->second.at, now);
             if (it != m_inflight.end())
                 release_locked(it);
             auto& ps = m_peers[peer];
             ps.since = now;  // a delivery: its queue moves
+            ps.last_delivery = now;
+            ps.late = false;
+            m_last_any = now;
             ++ps.delivered;
             if (ps.strikes > 0)
                 --ps.strikes;  // a delivery forgives one strike
@@ -316,7 +352,8 @@ public:
         uint64_t    short_parses{0};
         uint64_t    bad_parses{0};   // long, broken or wrong-end range answers
         uint64_t    strikes{0};      // timeouts and bad answers held against peers
-        uint32_t    budget{0};       // ranges allowed in flight now
+        uint32_t    budget{0};       // ranges allowed in flight now (the congestion window, capped)
+        uint64_t    link_waits{0};   // peers late with nobody delivering: no strike (the link)
         double      rate_hps{0};  // headers stored per second, last minute
         std::string mode;
     };
@@ -333,7 +370,8 @@ public:
         st.short_parses = m_short_parses;
         st.bad_parses = m_bad_parses;
         st.strikes = m_strikes;
-        st.budget = static_cast<uint32_t>(m_budget);
+        st.budget = static_cast<uint32_t>(std::min<size_t>(m_cwnd, m_cfg.global));
+        st.link_waits = m_link_waits;
         size_t recent = 0;
         for (const auto& t : m_stored_at)
             if (now - t <= std::chrono::seconds(60))
@@ -355,10 +393,27 @@ public:
         std::lock_guard<std::mutex> lock(m_mu);
         return m_excluded.count(peer) > 0;
     }
+    /// `peer`'s window: ranges it may hold now (KATs).
+    uint32_t window_of(const std::string& peer) const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        auto it = m_peers.find(peer);
+        return std::min<uint32_t>(it == m_peers.end() ? 1 : it->second.window, m_cfg.per_peer);
+    }
 
 private:
     static constexpr size_t MAX_EXCLUDED = 4096;
     static constexpr size_t MIN_INFLIGHT = 2;
+    static constexpr std::chrono::seconds WITNESS_SPAN{300};
+    static constexpr std::chrono::minutes NOBODY_PATIENCE{10};
+    static constexpr uint64_t PLAIN_RANGE_BYTES = 2000 * 81;      // 80-byte headers + tx count
+    static constexpr uint64_t AUXPOW_RANGE_BYTES = 2000 * 800;    // live: ~1.6 MB a range
+
+    struct Delivered {
+        Clock::time_point at;
+        Clock::time_point sent;
+        std::string       peer;
+    };
     static constexpr std::chrono::minutes ALL_EXCLUDED_PATIENCE{5};
 
     struct InFlight {
@@ -371,6 +426,9 @@ private:
         uint64_t          delivered{0};
         Clock::time_point since{};        // its oldest request, or its last delivery
         Clock::time_point cool_until{};
+        Clock::time_point last_delivery{};
+        uint32_t          window{1};      // ranges it may hold (AIMD)
+        bool              late{false};    // timed out without a witness, not since delivered
     };
 
     void release_locked(std::map<uint32_t, InFlight>::iterator it)
@@ -411,12 +469,44 @@ private:
             exclude_locked(peer, "repeated timeouts or bad range answers");
     }
 
+    /// A peer that is no longer connected releases its ranges (no strike).
+    void release_gone_locked(const std::vector<std::string>& peers)
+    {
+        if (m_inflight.empty())
+            return;
+        const std::set<std::string> here(peers.begin(), peers.end());
+        for (auto it = m_inflight.begin(); it != m_inflight.end();)
+            if (!here.count(it->second.peer)) {
+                auto next = std::next(it);
+                release_locked(it);
+                it = next;
+            } else {
+                ++it;
+            }
+    }
+
     void time_out_locked(Clock::time_point now)
     {
+        while (!m_delivered.empty() && now - m_delivered.front().at > WITNESS_SPAN)
+            m_delivered.pop_front();
+        const bool nobody = now - m_last_any >= NOBODY_PATIENCE;
         std::set<std::string> struck;
-        for (auto& [p, ps] : m_peers)
-            if (ps.inflight > 0 && now - ps.since >= m_cfg.request_timeout)
+        bool link = false;
+        for (auto& [p, ps] : m_peers) {
+            if (ps.inflight == 0 || now - ps.since < m_cfg.request_timeout)
+                continue;
+            if (overtaken_locked(oldest_of_locked(p), p) || (nobody && now - ps.since >= NOBODY_PATIENCE)) {
                 struck.insert(p);
+            } else if (!ps.late) {
+                // Nobody overtook it: the link is the cause. Its ranges stay.
+                ps.late = true;
+                ps.window = 1;
+                ++m_link_waits;
+                link = true;
+            }
+        }
+        if (link && m_cwnd > 0)
+            m_cwnd = std::max(min_cwnd(), m_cwnd / 2);
         for (const auto& p : struck) {
             for (auto it = m_inflight.begin(); it != m_inflight.end();)
                 if (it->second.peer == p) {
@@ -428,12 +518,17 @@ private:
                 } else {
                     ++it;
                 }
-            strike_locked(p, now, "no range delivered in time; its ranges go to other peers");
+            auto& ps = m_peers[p];
+            ps.window = 1;
+            ps.late = false;
+            strike_locked(p, now, "no range delivered in time while other peers delivered; its ranges go to "
+                                  "other peers");
         }
-        // A range a delivering peer has held far too long goes elsewhere
-        // (no strike: the peer is working).
+        // A range held far too long that a later request overtook goes
+        // elsewhere, with no strike (the peer is working).
         for (auto it = m_inflight.begin(); it != m_inflight.end();)
-            if (now - it->second.at >= 3 * m_cfg.request_timeout) {
+            if (now - it->second.at >= 3 * m_cfg.request_timeout
+                && (overtaken_locked(it->second.at, it->second.peer) || nobody)) {
                 ++m_range_timeouts[it->first][it->second.peer];
                 ++m_timeouts;
                 auto next = std::next(it);
@@ -442,6 +537,70 @@ private:
             } else {
                 ++it;
             }
+    }
+
+    Clock::time_point oldest_of_locked(const std::string& peer) const
+    {
+        Clock::time_point oldest = Clock::time_point::max();
+        for (const auto& [r, f] : m_inflight)
+            if (f.peer == peer)
+                oldest = std::min(oldest, f.at);
+        return oldest;
+    }
+
+    /// Another peer delivered a range asked after `since` (ranges asked in
+    /// the same tick are answered in their turn, not ahead of each other).
+    bool overtaken_locked(Clock::time_point since, const std::string& peer) const
+    {
+        for (const auto& d : m_delivered)
+            if (d.peer != peer && d.sent > since)
+                return true;
+        return false;
+    }
+
+    size_t min_cwnd() const { return std::min<size_t>(MIN_INFLIGHT, m_cfg.global); }
+
+    uint64_t range_bytes(uint32_t range) const
+    {
+        return uint64_t(ScheduleAnchors::STEP) * (range + 1) > m_cfg.auxpow_height ? AUXPOW_RANGE_BYTES
+                                                                                    : PLAIN_RANGE_BYTES;
+    }
+
+    /// The range `peer` was asked for at `sent` arrived at `now`: its peer's
+    /// window and the congestion window move.
+    void on_served_locked(const std::string& peer, Clock::time_point sent, Clock::time_point now)
+    {
+        auto& ps = m_peers[peer];
+        const auto timeout = m_cfg.request_timeout;
+        // The peer's window: the range's own time from its request.
+        if (now - sent < timeout / 3)
+            ps.window = std::min(ps.window + 1, m_cfg.per_peer);
+        else if (now - sent > 2 * timeout / 3)
+            ps.window = std::max<uint32_t>(1, ps.window / 2);
+        m_delivered.push_back(Delivered{now, sent, peer});
+        // The congestion window: the range's transfer (from its request, or
+        // from the peer's previous delivery when later: its queue).
+        const auto transfer = now - std::max(sent, ps.last_delivery);
+        if (m_cwnd == 0)
+            return;
+        if (transfer <= timeout / 2)
+            m_cwnd = std::min<size_t>(m_cwnd + 1, m_cfg.global);
+        else if (transfer > 3 * timeout / 4)
+            m_cwnd = std::max(min_cwnd(), m_cwnd - 1);
+    }
+
+    bool usable_locked(const std::string& p, Clock::time_point now) const
+    {
+        if (p.empty() || m_excluded.count(p))
+            return false;
+        auto ps = m_peers.find(p);
+        return ps == m_peers.end() || now >= ps->second.cool_until;
+    }
+
+    size_t usable_count_locked(const std::vector<std::string>& peers, Clock::time_point now) const
+    {
+        return static_cast<size_t>(std::count_if(peers.begin(), peers.end(),
+                                                  [&](const std::string& p) { return usable_locked(p, now); }));
     }
 
     /// A range every usable peer (at least `votes` of them) timed out on
@@ -475,29 +634,6 @@ private:
         }
     }
 
-    /// How many ranges may be in flight: what the delivery rate brings in
-    /// budget_time(), at least MIN_INFLIGHT (the start, a stalled minute), at
-    /// most GLOBAL. The rate: the deliveries of the last minute over the
-    /// minute, or over the time since the sync began (at least 10 s) while it
-    /// is younger than a minute.
-    size_t inflight_budget_locked(Clock::time_point now)
-    {
-        if (m_started_at == Clock::time_point{})
-            m_started_at = now;
-        while (!m_stored_at.empty() && now - m_stored_at.front() > std::chrono::seconds(60))
-            m_stored_at.pop_front();
-        size_t budget = MIN_INFLIGHT;
-        if (!m_stored_at.empty()) {
-            const double age = std::chrono::duration<double>(now - m_started_at).count();
-            const double span = std::clamp(age, 10.0, 60.0);
-            const double per_second = m_stored_at.size() / span;
-            budget = static_cast<size_t>(std::ceil(per_second * std::chrono::duration<double>(budget_time()).count()));
-        }
-        m_budget = std::clamp<size_t>(budget, std::min<size_t>(MIN_INFLIGHT, m_cfg.global), m_cfg.global);
-        return m_budget;
-    }
-    std::chrono::seconds budget_time() const { return m_cfg.request_timeout / 3; }
-
     /// Every connected peer excluded, for ALL_EXCLUDED_PATIENCE (new peers
     /// connect meanwhile): nothing can deliver the ranges.
     void check_all_excluded_locked(const std::vector<std::string>& peers, Clock::time_point now)
@@ -515,21 +651,31 @@ private:
             fall_back_locked("every connected peer (" + std::to_string(peers.size()) + ") is excluded");
     }
 
-    /// A peer with a free slot, not excluded nor cooling, preferring one that
-    /// has not timed out on this range; round robin.
-    std::string pick_locked(uint32_t range, const std::vector<std::string>& peers, Clock::time_point now)
+    /// A peer with room in its window, not excluded nor cooling, preferring
+    /// one that has not timed out on this range; round robin. Peers in
+    /// `avoid` only when no other usable peer is connected.
+    std::string pick_locked(uint32_t range, const std::vector<std::string>& peers, Clock::time_point now,
+                            const std::set<std::string>& avoid)
     {
+        if (!avoid.empty()
+            && std::any_of(peers.begin(), peers.end(),
+                           [&](const std::string& p) { return !avoid.count(p) && usable_locked(p, now); })) {
+            std::vector<std::string> others;
+            for (const auto& p : peers)
+                if (!avoid.count(p))
+                    others.push_back(p);
+            return pick_locked(range, others, now, {});
+        }
         if (peers.empty())
             return {};
         const auto rt = m_range_timeouts.find(range);
         std::string fallback;
         for (size_t k = 0; k < peers.size(); ++k) {
             const std::string& p = peers[(m_rr + k) % peers.size()];
-            if (p.empty() || m_excluded.count(p))
+            if (!usable_locked(p, now))
                 continue;
             auto ps = m_peers.find(p);
-            if (ps != m_peers.end()
-                && (ps->second.inflight >= m_cfg.per_peer || now < ps->second.cool_until))
+            if (ps != m_peers.end() && ps->second.inflight >= std::min(ps->second.window, m_cfg.per_peer))
                 continue;
             const bool timed_out_here = rt != m_range_timeouts.end() && rt->second.count(p);
             if (!timed_out_here) {
@@ -571,8 +717,10 @@ private:
     std::deque<Clock::time_point>   m_stored_at;
     uint64_t                        m_timeouts{0};
     uint64_t                        m_strikes{0};
-    size_t                          m_budget{0};
-    Clock::time_point               m_started_at{};  // the first tick of this process
+    size_t                          m_cwnd{0};        // the congestion window; 0 until the first tick
+    std::deque<Delivered>           m_delivered;      // asked ranges delivered, the last 5 minutes
+    Clock::time_point               m_last_any{};     // the last exact range from anyone
+    uint64_t                        m_link_waits{0};
     Clock::time_point               m_all_excluded_since{};
     uint64_t                        m_short_parses{0};
     uint64_t                        m_bad_parses{0};

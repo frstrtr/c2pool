@@ -7765,6 +7765,7 @@ int main(int argc, char* argv[]) {
                                                         d["schedule"]["bad_parses"] = rs.bad_parses;
                                                         d["schedule"]["strikes"] = rs.strikes;
                                                         d["schedule"]["budget"] = rs.budget;
+                                                        d["schedule"]["link_waits"] = rs.link_waits;
                                                         d["schedule"]["rate_hps"] = rs.rate_hps;
                                                     }
                                                 }
