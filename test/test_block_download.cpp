@@ -221,3 +221,31 @@ TEST(BlockDownload, ASteadyPeerIsNotTimedOut)
     dl.tick(f);
     EXPECT_EQ(dl.stats().request_timeouts.load(), 1u);
 }
+
+// On a saturated link every peer looks slow: requests time out and window
+// heads stall one after another. At most half the peers cool down at once
+// (the rest keep downloading); a cooldown lasts 60 s.
+TEST(BlockDownload, HalfThePeersKeepDownloading)
+{
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    arm(f, 1, 5000);
+    f.window = 256;
+    ASSERT_GT(dl.refill(f), 0u);
+    // Nobody delivers for 61 s: every peer with requests times out.
+    net.t += std::chrono::seconds(61);
+    dl.tick(f);
+    EXPECT_GE(dl.stats().request_timeouts.load(), 10u);
+    EXPECT_LE(dl.stats().peers_cooling.load(), 10u);
+    EXPECT_GE(dl.stats().peers_used.load(), 10u) << "the download went on with fewer than half the peers";
+    EXPECT_GE(dl.stats().cooling_capped.load(), 1u);
+    // Still nobody delivers: 60 s later the first cooled peers are back, the
+    // others time out in turn; half the peers still download.
+    const size_t before = net.asked.size();
+    net.t += std::chrono::seconds(61);
+    dl.tick(f);
+    EXPECT_LE(dl.stats().peers_cooling.load(), 10u);
+    EXPECT_GE(dl.stats().peers_used.load(), 10u);
+    EXPECT_GT(net.asked.size(), before);
+}

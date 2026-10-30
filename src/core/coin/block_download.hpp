@@ -25,6 +25,13 @@
 ///   - the fill's own stall timer (no block drained for 30 s) asks another
 ///     peer for the stalled height (its holder cools down), and every peer
 ///     only on the third stall of the same height;
+///   - a peer cools down for PEER_COOLDOWN (60 s; the lane's 600 s), and at
+///     most half the host's peers cool at once: past that a slow peer is
+///     the link's doing, not the peer's, and its requests are only
+///     reassigned. On a saturated link the lane's rules cooled 18 of 20 LTC
+///     peers for 10 minutes within 4 minutes (requests reassigned from a
+///     cooled peer queue behind other peers' and stall there in turn), and
+///     one peer carried the download;
 ///   - the bodies buffered but not drained are bounded in bytes: past
 ///     buffer_limit nothing is asked but the next height to drain, and a
 ///     body ahead of the window is not kept (it is asked again in order).
@@ -62,8 +69,9 @@ public:
     /// A peer that delivered nothing this long since its oldest request (or
     /// its last delivery) times out.
     static constexpr std::chrono::seconds REQUEST_TIMEOUT{60};
-    /// A stalling or timed-out peer is not asked this long.
-    static constexpr std::chrono::seconds PEER_COOLDOWN{600};
+    /// A stalling or timed-out peer is not asked this long (at most half the
+    /// peers at once).
+    static constexpr std::chrono::seconds PEER_COOLDOWN{60};
     /// The fill's stall timer: the stalled height goes to every peer on this
     /// stall (to one other peer before).
     static constexpr uint32_t STALLS_BEFORE_BROADCAST = 3;
@@ -91,6 +99,7 @@ public:
         std::atomic<uint64_t> fill_stalls{0};       // the fill's 30-s stall timer fired
         std::atomic<uint64_t> window_waits{0};      // refills stopped at the byte bound
         std::atomic<uint64_t> not_kept{0};          // bodies ahead of the window, not buffered
+        std::atomic<uint64_t> cooling_capped{0};    // reassigned without a cooldown (half the peers cooling)
         std::atomic<uint64_t> inflight{0};
         std::atomic<uint64_t> peers_used{0};
         std::atomic<uint64_t> peers_cooling{0};
@@ -104,7 +113,8 @@ public:
                 {"requests", v(requests)}, {"broadcasts", v(broadcasts)}, {"delivered", v(delivered)},
                 {"request_timeouts", v(request_timeouts)}, {"stalls", v(stalls)},
                 {"fill_stalls", v(fill_stalls)}, {"window_waits", v(window_waits)},
-                {"not_kept", v(not_kept)}, {"inflight", v(inflight)}, {"peers_used", v(peers_used)},
+                {"not_kept", v(not_kept)}, {"cooling_capped", v(cooling_capped)},
+                {"inflight", v(inflight)}, {"peers_used", v(peers_used)},
                 {"peers_cooling", v(peers_cooling)}, {"buffer_bytes", v(buffer_bytes)},
                 {"stall_timeout_ms", v(stall_timeout_ms)},
             };
@@ -410,12 +420,21 @@ private:
     }
 
     /// Rotate `peer` out for PEER_COOLDOWN; its requests go to other peers
-    /// at the next refill.
+    /// at the next refill. With half the host's peers cooling already, the
+    /// requests are reassigned but the peer stays eligible.
     void cool_down(const std::string& peer, Clock::time_point t)
     {
         if (peer.empty())
             return;
-        m_cooldown[peer] = t + PEER_COOLDOWN;
+        size_t cooling = 0;
+        for (const auto& [p, until] : m_cooldown)
+            cooling += until > t;
+        auto cur = m_cooldown.find(peer);
+        const bool already = cur != m_cooldown.end() && cur->second > t;
+        if (already || (cooling + 1) * 2 <= m_peers.size())
+            m_cooldown[peer] = t + PEER_COOLDOWN;
+        else
+            m_stats.cooling_capped.fetch_add(1, std::memory_order_relaxed);
         for (auto it = m_inflight.begin(); it != m_inflight.end();) {
             if (it->second.peer == peer) {
                 auto next = std::next(it);
