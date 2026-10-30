@@ -144,6 +144,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # count and link, re-emit byte-identical, the stripped form still parses,
     # the txid stays witness-stripped, flag 8 and empty witnesses are refused.
     # Same folding rule.
+    #
+    # doge_headers_parse_test.cpp: a 'headers' message that does not parse to
+    # its end yields the clean prefix (entries that link) and truncated_at,
+    # never garbage that reads like another chain; the parent coinbase params
+    # (wire: witness, no MWEB; txid: stripped). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -161,6 +166,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
+        doge_headers_parse_test.cpp
         doge_template_underfill_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
