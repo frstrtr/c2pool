@@ -6738,8 +6738,38 @@ int main(int argc, char* argv[]) {
                             full_opts.mmap_reads = false;
                             // malloc's thread arenas (813 MB of anonymous mappings there).
                             doge::coin::ProcessMemory::limit_arenas();
-                            doge_full_db = std::make_unique<core::coin::UTXOViewDB>(full_path, full_opts);
-                            if (doge_full_db->open()) {
+                            // A set another c2pool holds (the same --data-dir) is waited
+                            // for, 5 x 2 s (a restart overlapping the process it replaces);
+                            // still held, this node exits: without it the templates would
+                            // price against the accrual set for the whole run (VERIFY-LOCK
+                            // A3). Any other failure: the accrual set only, as before.
+                            auto open_full = [&]() {
+                                for (int attempt = 1;; ++attempt) {
+                                    doge_full_db = std::make_unique<core::coin::UTXOViewDB>(full_path, full_opts);
+                                    if (doge_full_db->open())
+                                        return true;
+                                    doge_full_db.reset();
+                                    core::LevelDBStore probe(full_path, full_opts);
+                                    const bool held = !probe.open() && probe.lock_held();
+                                    probe.close();
+                                    if (!held)
+                                        return false;
+                                    if (attempt >= 5) {
+                                        const std::string msg = "the DOGE full UTXO set " + full_path
+                                            + " is held by another c2pool; " + core::LevelDBStore::held_advice()
+                                            + ". Exiting";
+                                        LOG_ERROR << "[EMB-DOGE] " << msg;
+                                        std::cerr << "c2pool: " << msg << std::endl;
+                                        std::exit(EXIT_FAILURE);
+                                    }
+                                    LOG_WARNING << "[EMB-DOGE] Full UTXO set at " << full_path
+                                                << " is held by another open (attempt " << attempt
+                                                << "/5): again in 2 s (if not, " << core::LevelDBStore::held_advice()
+                                                << ")";
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                }
+                            };
+                            if (open_full()) {
                                 doge_full_cache = std::make_unique<core::coin::UTXOViewCache>(doge_full_db.get());
                                 const auto ss = doge_full_db->get_sync_state();
                                 doge_full_live = doge::coin::UtxoFullState::start_live(
