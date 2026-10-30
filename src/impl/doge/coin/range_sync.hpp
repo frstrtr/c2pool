@@ -51,24 +51,26 @@
 ///   - every connected peer excluded for ALL_EXCLUDED_PATIENCE (a wrong
 ///     anchor with fewer than VOTES peers, VERIFY5 S2): the same fallback.
 /// Timeouts: a peer that has delivered no exact range for REQUEST_TIMEOUT
-/// since its oldest request (or its last delivery) is struck only with a
+/// since its oldest request (or its last delivery) is late: its window goes
+/// back to one range. It is struck only when it has been silent for its
+/// range's stall timeout (REQUEST_TIMEOUT, or the range's bytes at
+/// STALL_BYTES_PER_S when longer: 160 s for an AuxPoW range) and has a
 /// witness: another peer delivered a range asked after this peer's oldest
 /// one, at a rate (that range's bytes over the time from its own request)
-/// that brings this peer's range within REQUEST_TIMEOUT / 2: a healthy peer
-/// overtook it. Then its in-flight ranges go to other peers and the strike
-/// cools it for PEER_COOLDOWN; STRIKES strikes exclude it; an exact range it
-/// delivers forgives one. Without a witness the link, not the peer, is the
-/// cause (a full link, nothing arriving from anyone, ranges served in turn,
-/// every transfer slow): no strike, no cooldown, its ranges stay with it (it
-/// is still sending them; asking again would double the load), its window
-/// goes back to one range. After NOBODY_PATIENCE with no range delivered by
-/// anyone, timeouts are struck again (a network that serves no range
-/// reaches the fallback). A range held for 3 x REQUEST_TIMEOUT that a later
-/// request overtook at a rate that brings it within 1.5 x REQUEST_TIMEOUT
-/// goes to another peer without a strike; a peer that disconnected releases
-/// its ranges. A range that every usable peer (at least VOTES of them) timed
-/// out on twice is undeliverable (an anchor nobody knows): the same
-/// fallback.
+/// that brings this peer's range within half that timeout. A healthy peer
+/// overtook a stalled one. Then its in-flight ranges go to other peers and
+/// the strike cools it for PEER_COOLDOWN; STRIKES strikes exclude it; an
+/// exact range it delivers forgives one. Without a witness the link, not the
+/// peer, is the cause (a full link, nothing arriving from anyone, ranges
+/// served in turn, every transfer slow): no strike, no cooldown, its ranges
+/// stay with it (it is still sending them; asking again would double the
+/// load). After NOBODY_PATIENCE with no range delivered by anyone, timeouts
+/// are struck again (a network that serves no range reaches the fallback).
+/// A range held for 3 x REQUEST_TIMEOUT that a later request overtook at a
+/// rate that brings it within 1.5 x REQUEST_TIMEOUT goes to another peer
+/// without a strike; a peer that disconnected releases its ranges. A range
+/// that every usable peer (at least VOTES of them) timed out on twice is
+/// undeliverable (an anchor nobody knows): the same fallback.
 /// Thread safety: every public method takes the internal mutex.
 
 #include <impl/doge/coin/hash_schedule.hpp>
@@ -352,7 +354,7 @@ public:
         uint64_t    bad_parses{0};   // long, broken or wrong-end range answers
         uint64_t    strikes{0};      // timeouts and bad answers held against peers
         uint32_t    budget{0};       // the peers' windows, in AuxPoW ranges, within GLOBAL
-        uint64_t    link_waits{0};   // peers late without a witness: no strike (the link)
+        uint64_t    link_waits{0};   // peers late and not struck (no witness, or not yet stalled)
         double      rate_hps{0};  // headers stored per second, last minute
         std::string mode;
     };
@@ -400,6 +402,9 @@ private:
     static constexpr size_t MAX_EXCLUDED = 4096;
     static constexpr std::chrono::seconds WITNESS_SPAN{300};
     static constexpr std::chrono::minutes NOBODY_PATIENCE{10};
+    /// A peer slower than this on a range, with a healthy one beside it,
+    /// stalls (live, a 1.6 MB range over a congested link: 20-50 KB/s).
+    static constexpr uint64_t STALL_BYTES_PER_S = 10000;
     static constexpr uint64_t PLAIN_RANGE_BYTES = 2000 * 81;      // 80-byte headers + tx count
     static constexpr uint64_t AUXPOW_RANGE_BYTES = 2000 * 800;    // live: ~1.6 MB a range
 
@@ -493,7 +498,8 @@ private:
             if (ps.inflight == 0 || now - ps.since < m_cfg.request_timeout)
                 continue;
             const auto [oldest_at, oldest_range] = oldest_of_locked(p);
-            if (overtaken_locked(oldest_at, p, range_bytes(oldest_range), m_cfg.request_timeout / 2)
+            const auto stall = stall_timeout(range_bytes(oldest_range));
+            if ((now - ps.since >= stall && overtaken_locked(oldest_at, p, range_bytes(oldest_range), stall / 2))
                 || (nobody && now - ps.since >= NOBODY_PATIENCE)) {
                 struck.insert(p);
             } else if (!ps.late) {
@@ -535,6 +541,16 @@ private:
             } else {
                 ++it;
             }
+    }
+
+    /// How long a peer may be silent on a range of `bytes` before a strike:
+    /// REQUEST_TIMEOUT, or longer for a range a peer at STALL_BYTES_PER_S
+    /// needs longer for (an AuxPoW range: 160 s).
+    Clock::duration stall_timeout(uint64_t bytes) const
+    {
+        const Clock::duration slow = std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(double(bytes) / double(STALL_BYTES_PER_S)));
+        return std::max<Clock::duration>(m_cfg.request_timeout, slow);
     }
 
     /// `peer`'s oldest request: when, and which range.

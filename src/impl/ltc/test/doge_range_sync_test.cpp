@@ -23,7 +23,7 @@
 //     NoStrikeWhenNobodyDelivers, RangePeersAreNotTheSyncPeerNorBodyPeers
 //     (FRESH-NODE §6.4, §7); AStarvedLinkStrikesNoSlowPeer,
 //     APeersWindowIsBytesNotRanges (fresh-anchored3 run 1),
-//     AQueuedAnswerIsNoWitness (run 2)
+//     AQueuedAnswerIsNoWitness (run 2), ASlowPeerIsNotAStaller (run 3)
 //   - BuiltinAnchorsAreDogeMainnet (the generated .inc, when present)
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
@@ -1318,6 +1318,43 @@ TEST(DogeRangeSync, AQueuedAnswerIsNoWitness)
               << st.ranges_done << "/" << st.ranges_total << "\n";
     EXPECT_EQ(st.strikes, 0u) << "a burst of queued answers counted as a quick witness";
     EXPECT_FALSE(rs.excluded("p0"));
+}
+
+// Live, fresh-anchored3 run 3 (563b420b5): on a congested link some peers
+// carried a 1.6 MB range at 20-25 KB/s while nearby ones did 60 KB/s or more.
+// Silent for 60 s beside a healthy witness, they were struck again and again:
+// 33 strikes and 4 honest peers excluded in 28 minutes. A peer stalls when it
+// is slower than STALL_BYTES_PER_S (an AuxPoW range: 160 s). Here 16 peers
+// run at 100 KB/s, p0 at 20 KB/s (80 s a range) and p1 sends nothing: p1 is
+// struck once, p0 never.
+TEST(DogeRangeSync, ASlowPeerIsNotAStaller)
+{
+    constexpr uint32_t CP = 150 * STEP;
+    const Chain c(CP);
+    TempStore s;
+    auto sched = open_schedule(s, c, CP);
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 0;
+    RangeSync rs(*sched, c.anchors(CP), cfg);
+    const auto peers = v6_peers(18);
+    CappedLink link{10e6, 100e3, 1.6e6, {}, {}, 0};
+    link.caps["p0"] = 20e3;
+    link.caps["p1"] = 1;
+    auto t = t0();
+    int sec = 0;
+    for (; sec < 900 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t))
+            link.add(r);
+        for (const auto& r : link.step())
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+    }
+    const auto st = rs.stats(t);
+    std::cout << "  16 peers at 100 KB/s, p0 at 20 KB/s, p1 silent: strikes " << st.strikes << ", excluded "
+              << st.excluded << ", " << RangeSync::mode_name(rs.mode()) << " after " << sec << " s\n";
+    EXPECT_EQ(st.strikes, 1u) << "p1 once (then it cools); p0 is slow, not stalled";
+    EXPECT_FALSE(rs.excluded("p0"));
+    EXPECT_EQ(rs.mode(), Mode::Complete);
 }
 
 // The live first AuxPoW minutes (fresh-anchored3 run 1): 162-KB ranges
