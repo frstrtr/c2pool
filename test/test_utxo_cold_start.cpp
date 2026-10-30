@@ -10,6 +10,7 @@
 #include <core/coin/block_bootstrapper.hpp>
 #include <core/coin/block_download.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/cold_start_tick.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -101,8 +102,7 @@ TEST(LtcColdStart, TheColdStartBootstrapArmsAtTheSyncedTip)
 
 // Where the synced cold start starts: an empty set at the window's first
 // height; a set within the window catches up from best + 1; a set further
-// behind jumps (the one deliberate jump); a set at most one block behind
-// needs no fill.
+// behind jumps (the one deliberate jump); a set at the tip needs no fill.
 TEST(LtcColdStart, TheColdStartPlanByUtxoBest)
 {
     const uint32_t T = LTC_TIP;
@@ -122,7 +122,13 @@ TEST(LtcColdStart, TheColdStartPlanByUtxoBest)
     EXPECT_EQ(p.from, T - 4319);
     EXPECT_EQ(p.jump_from, T - 4319);
 
-    EXPECT_EQ(ltc::coin::cold_start_plan(LTC_COLD_BLOCKS, true, T, T - 1).action, ColdStart::Action::Warm);
+    // One block behind (a restart between a header and its body): a
+    // one-block fill for the tip, not "warm" (nothing else asks for it).
+    p = ltc::coin::cold_start_plan(LTC_COLD_BLOCKS, true, T, T - 1);
+    ASSERT_EQ(p.action, ColdStart::Action::Arm);
+    EXPECT_EQ(p.from, T);
+    EXPECT_EQ(p.to, T);
+    EXPECT_EQ(p.jump_from, 0u);
     EXPECT_EQ(ltc::coin::cold_start_plan(LTC_COLD_BLOCKS, true, T, T).action, ColdStart::Action::Warm);
     EXPECT_EQ(ltc::coin::cold_start_plan(LTC_COLD_BLOCKS, false, T, T - 100).action, ColdStart::Action::Wait);
 }
@@ -355,4 +361,130 @@ TEST(LtcColdStart, TheColdStartWaitsForTheCaughtUpChain)
         ASSERT_TRUE(arm_from_plan(f, LTC_COLD_BLOCKS, true, 3204314, 0));
     EXPECT_FALSE(ltc::coin::cold_start_rearm(f, 3204314, LTC_COLD_BLOCKS).has_value());
     EXPECT_EQ(f.end_height, 3204314u);
+}
+
+
+// ─── The DOGE accrual tick (cold_start_tick.hpp): a tip body is never lost ───
+// FRESH-VERIFY M1. The DOGE lane on master has no gap fill and nothing else
+// re-asks a body: a block whose body never arrives would stay a hole, its
+// transactions in the DOGE mempool and in every merged template for two
+// weeks (invalid DOGE blocks).
+
+namespace {
+
+struct FakeAccrual {
+    bool synced = true;
+    int64_t tip_age = 60;
+    uint32_t tip = DOGE_TIP;
+    uint32_t best = 0;
+    std::vector<uint32_t> one, all;
+    std::vector<std::pair<uint32_t, uint32_t>> armed;
+    Clock::time_point t = Clock::time_point{} + std::chrono::hours(1);
+
+    ltc::coin::ColdStartTickHost host()
+    {
+        ltc::coin::ColdStartTickHost h;
+        h.synced = [this]() { return synced; };
+        h.tip_age_s = [this]() { return tip_age; };
+        h.tip = [this]() { return tip; };
+        h.utxo_best = [this]() { return best; };
+        h.utxo_empty = [this]() { return best == 0; };
+        h.wipe = [this]() { best = 0; return true; };
+        h.armed = [this](uint32_t from, uint32_t to, uint32_t) { armed.emplace_back(from, to); };
+        h.ask_one = [this](uint32_t x) { one.push_back(x); return true; };
+        h.ask_all = [this](uint32_t x) { all.push_back(x); };
+        h.now = [this]() { return t; };
+        return h;
+    }
+
+    size_t asks_for(uint32_t h) const
+    {
+        return std::count(one.begin(), one.end(), h) + std::count(all.begin(), all.end(), h);
+    }
+};
+
+/// One tick a second for `secs` seconds (both clocks).
+void run_ticks(ltc::coin::AccrualColdStart<int>& cs, FakeAccrual& a, FakePeers& net, int secs)
+{
+    for (int i = 0; i < secs; ++i) {
+        cs.tick();
+        a.t += std::chrono::seconds(1);
+        net.t += std::chrono::seconds(1);
+    }
+}
+
+} // namespace
+
+// (a) A warm restart one block behind (the node stopped between a header and
+// its body): the tip's block is asked for. Before, the plan said "warm", the
+// tip handler fires only on a tip change and the peers' inv for it came
+// before we connected: nothing ever asked (master armed [best+1, height]).
+TEST(DogeAccrualColdStart, AWarmRestartOneBlockBehindFetchesTheTip)
+{
+    FakeAccrual a;
+    a.best = DOGE_TIP - 1;
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    ltc::coin::AccrualColdStart<int> cs(f, dl, DOGE_COLD_BLOCKS, a.host());
+    run_ticks(cs, a, net, 10);
+    EXPECT_TRUE(cs.decided());
+    EXPECT_GE(net.asked[DOGE_TIP].size() + a.asks_for(DOGE_TIP), 1u)
+        << "the tip's block, one above the set, was never asked for";
+}
+
+// (b) A tip body asked of its announcer only, which never answers: after a
+// second of lag one peer is asked, three times two seconds apart, then every
+// peer. Before, the tip request was one-shot (the fallbacks only when the
+// send failed).
+TEST(DogeAccrualColdStart, ALostTipBodyIsAskedAgain)
+{
+    FakeAccrual a;
+    a.best = DOGE_TIP;
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    ltc::coin::AccrualColdStart<int> cs(f, dl, DOGE_COLD_BLOCKS, a.host());
+    run_ticks(cs, a, net, 2);
+    ASSERT_TRUE(cs.decided());
+    ASSERT_FALSE(f.active);
+
+    a.tip = DOGE_TIP + 1;  // its header came; the announcer's body never does
+    run_ticks(cs, a, net, 3);
+    EXPECT_GE(std::count(a.one.begin(), a.one.end(), DOGE_TIP + 1), 1) << "not asked again within 2 s";
+    EXPECT_TRUE(a.all.empty()) << "every peer asked before one peer was tried";
+    run_ticks(cs, a, net, 6);
+    EXPECT_GE(std::count(a.all.begin(), a.all.end(), DOGE_TIP + 1), 1) << "not asked of every peer within 8 s";
+
+    // It arrives: nothing more is asked.
+    a.best = DOGE_TIP + 1;
+    const size_t asked = a.one.size() + a.all.size();
+    run_ticks(cs, a, net, 10);
+    EXPECT_EQ(a.one.size() + a.all.size(), asked);
+}
+
+// (c) The header of T+1 is accepted while the Bootstrap drains its last block
+// T: the tip handler asks nobody (the cold start runs), the fill completes at
+// T before the tick could take T+1 into its range. T+1 must still be fetched.
+TEST(DogeAccrualColdStart, TheLastDrainRacesANewTip)
+{
+    FakeAccrual a;
+    a.best = 0;
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    ltc::coin::AccrualColdStart<int> cs(f, dl, DOGE_COLD_BLOCKS, a.host());
+    run_ticks(cs, a, net, 1);
+    ASSERT_TRUE(f.active);
+    ASSERT_EQ(f.end_height, DOGE_TIP);
+
+    a.tip = DOGE_TIP + 1;            // the header thread, mid-drain
+    f.next_height = DOGE_TIP + 1;    // the drain connected T: the handler ends the fill
+    f.processed = DOGE_COLD_BLOCKS;
+    f.buffer.clear();
+    f.active = false;
+    a.best = DOGE_TIP;
+    run_ticks(cs, a, net, 8);
+    EXPECT_GE(net.asked[DOGE_TIP + 1].size() + a.asks_for(DOGE_TIP + 1), 1u)
+        << "T+1 is in no fill and was never asked for";
 }

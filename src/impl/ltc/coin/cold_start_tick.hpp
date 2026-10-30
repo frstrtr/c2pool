@@ -9,7 +9,15 @@
 ///     (cold_start_plan), or none for a warm set;
 ///   - while the Bootstrap runs: arm it again at the tip when it fell more
 ///     than `blocks` + its window behind (the partial set wiped first),
-///     else take the tip into its range and move its download on.
+///     else take the tip into its range and move its download on;
+///   - otherwise, while the set is behind the header chain's tip, chase its
+///     next block: after a second of lag ask best + 1 of one peer, every 2 s,
+///     of every peer from the fourth ask (the LTC lane's utxo_catchup rule).
+///     The DOGE lane has no gap fill and nothing else re-asks a body: a tip
+///     body its announcer never sent, a restart between a header and its
+///     body, a header that came while the Bootstrap drained its last block
+///     each left a hole for good (FRESH-VERIFY M1), and the block's
+///     transactions in the DOGE mempool and in every merged template.
 
 #include "utxo_order.hpp"
 
@@ -61,6 +69,12 @@ public:
     {
     }
 
+    /// Chasing the set's next block: a second of lag before the first ask,
+    /// then one every CHASE_EVERY; every peer from the CHASE_ONE_PEER+1-th.
+    static constexpr std::chrono::seconds CHASE_LAG{1};
+    static constexpr std::chrono::seconds CHASE_EVERY{2};
+    static constexpr uint32_t CHASE_ONE_PEER = 3;
+
     /// The cold start has been decided (armed, or warm).
     bool decided() const { return m_decided; }
 
@@ -91,8 +105,11 @@ public:
             arm(plan.from, plan.to);
             return;
         }
-        if (!m_fill.active)
+        if (!m_fill.active) {
+            chase(t);
             return;
+        }
+        m_chase = {};
         const uint32_t tip = m_host.tip();
         if (auto r = cold_start_rearm(m_fill, tip, m_blocks)) {
             LOG_WARNING << m_tag << " Bootstrap at h=" << m_fill.next_height << " is " << tip - m_fill.next_height
@@ -110,6 +127,39 @@ public:
 private:
     Clock::time_point now() const { return m_host.now ? m_host.now() : Clock::now(); }
 
+    /// No fill runs: ask for the set's next block while it is behind the tip.
+    void chase(Clock::time_point t)
+    {
+        const uint32_t best = m_host.utxo_best();
+        const uint32_t tip = m_host.tip();
+        if (best == 0 || best >= tip) {
+            m_chase = {};
+            return;
+        }
+        const uint32_t next = best + 1;
+        if (m_chase.height != next) {
+            m_chase = Chase{next, t, {}, 0};
+            return;
+        }
+        if (t - m_chase.since < CHASE_LAG
+            || (m_chase.last != Clock::time_point{} && t - m_chase.last < CHASE_EVERY))
+            return;
+        const bool all = m_chase.tries >= CHASE_ONE_PEER;
+        if (all || !m_host.ask_one(next))
+            m_host.ask_all(next);
+        LOG_INFO << m_tag << " UTXO behind the tip (h=" << best << ", tip h=" << tip << ") — requesting h="
+                 << next << (all ? " from all peers" : "");
+        ++m_chase.tries;
+        m_chase.last = t;
+    }
+
+    struct Chase {
+        uint32_t          height{0};
+        Clock::time_point since{};
+        Clock::time_point last{};
+        uint32_t          tries{0};
+    };
+
     void arm(uint32_t from, uint32_t to)
     {
         cold_start_arm(m_fill, from, to);
@@ -126,6 +176,7 @@ private:
     std::string                m_tag;
     bool                       m_decided{false};
     Clock::time_point          m_synced_since{};
+    Chase                      m_chase{};
 };
 
 } // namespace coin

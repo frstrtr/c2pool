@@ -7064,8 +7064,24 @@ int main(int argc, char* argv[]) {
                                             [doge_bs, doge_dl](uint32_t h) { doge_dl->on_fill_stall(*doge_bs, h); },
                                             "EMB-DOGE");
                                     };
-                                    ch.ask_one = [](uint32_t) { return false; };
-                                    ch.ask_all = [](uint32_t) {};
+                                    // The chase of the set's next block: one peer
+                                    // (NODE_NETWORK first) round robin, else every peer.
+                                    ch.ask_one = [chain, bc, rr = std::make_shared<size_t>(0)](uint32_t h) {
+                                        auto e = chain->get_header_by_height(h);
+                                        if (!e)
+                                            return true;  // no block there (yet): nothing to ask
+                                        constexpr uint64_t NODE_NETWORK = 1;
+                                        auto peers = bc->ready_peers(NODE_NETWORK);
+                                        if (peers.empty())
+                                            peers = bc->ready_peers(0);
+                                        if (peers.empty())
+                                            return false;
+                                        return bc->request_full_block_from(peers[(*rr)++ % peers.size()], e->block_hash);
+                                    };
+                                    ch.ask_all = [chain, bc](uint32_t h) {
+                                        if (auto e = chain->get_header_by_height(h))
+                                            bc->request_full_block(e->block_hash);
+                                    };
                                     doge_cold = std::make_shared<ltc::coin::AccrualColdStart<ltc::coin::BlockType>>(
                                         *doge_bs, *doge_dl, core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1, std::move(ch));
                                 }
@@ -7207,8 +7223,12 @@ int main(int argc, char* argv[]) {
                                                 return;
                                             }
 
-                                            // 3. Normal processing
-                                            if (height > utxo->get_best_height()) {
+                                            // 3. Normal processing: only the set's next block is
+                                            // connected. A block further ahead waits: the cold
+                                            // start's tick chases best + 1 in order, so a missed
+                                            // body is fetched instead of left a hole under it.
+                                            if (ltc::coin::utxo_connect_action(utxo->get_best_height(), height)
+                                                == ltc::coin::UtxoConnect::Connect) {
                                                 auto undo = utxo->connect_block(
                                                     block, height, txid_fn, block_hash);
                                                 utxo_db->put_block_undo(height, undo);

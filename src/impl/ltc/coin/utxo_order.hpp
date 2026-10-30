@@ -263,14 +263,15 @@ inline FillAsk fill_ask(const std::string& phase)
 ///     289 -> 114,549 blocks; 2.3: DOGE 1,441 -> 276,000) while templates
 ///     waited for it to reach the tip;
 ///   - over the synced tip's last `blocks` heights, or from the set's best
-///     + 1 when that is within them (a warm restart catches up); a set at
-///     most one block behind needs none (the normal path takes the tip);
+///     + 1 when that is within them (a warm restart catches up, one block
+///     behind included: nothing else asks for a tip whose announcement came
+///     before we connected); only a set at the tip needs none;
 ///   - a fill that falls more than `blocks` + its window behind the tip is
 ///     armed again at the tip (cold_start_rearm).
 struct ColdStart {
     enum class Action {
         Wait,  // not yet (header chain not synced): no fill, the set takes no block
-        Warm,  // the set is at most one block behind the tip: no fill
+        Warm,  // the set is at the tip: no fill
         Arm,   // fetch [from, to] in order
     };
     Action   action{Action::Wait};
@@ -302,7 +303,7 @@ inline ColdStart cold_start_plan(uint32_t blocks, bool synced, uint32_t tip, uin
     ColdStart p;
     if (!synced || blocks == 0 || tip == 0)
         return p;
-    if (utxo_best + 1 >= tip) {
+    if (utxo_best >= tip) {
         p.action = ColdStart::Action::Warm;
         return p;
     }
