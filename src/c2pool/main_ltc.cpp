@@ -362,6 +362,8 @@ static std::optional<uint32_t> found_block_height(const core::MiningInterface& m
         if (b.hash == hash_hex && b.height > 0)
             return static_cast<uint32_t>(b.height);
     return std::nullopt;
+}
+
 // A block body's serialized size, estimated from its parts (the cold-start
 // downloads' buffer bound; LTC and DOGE bodies alike).
 static size_t estimate_block_bytes(const ltc::coin::BlockType& b)
