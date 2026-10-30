@@ -6922,79 +6922,73 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "DOGE mempool wired via P2P broadcaster";
                                 }
 
+                                // Header sync (ltc/coin/header_sync.hpp, as the LTC one): one
+                                // sync peer, no re-ask on a batch with nothing new, a known or
+                                // queued batch dropped before the header thread, that queue
+                                // bounded. Before, every batch with new headers and every full
+                                // one asked every peer, and the 5-s poll too: 3.1 GB of AuxPoW
+                                // headers in 17 minutes on a fresh node, the link's whole share.
+                                std::shared_ptr<ltc::coin::HeaderSync> doge_hdr_sync;
+                                {
+                                    ltc::coin::HeaderSyncHost hs;
+                                    auto* dc = doge_chain.get();
+                                    hs.has_header = [dc](const uint256& h) { return dc->has_header(h); };
+                                    hs.add_headers = [dc](const std::vector<ltc::coin::BlockHeaderType>& batch) {
+                                        int accepted = dc->add_headers(batch);
+                                        if (accepted > 0)
+                                            LOG_INFO << "[EMB-DOGE] add_headers: " << accepted << "/" << batch.size()
+                                                     << " accepted, chain height=" << dc->height();
+                                        return accepted;
+                                    };
+                                    hs.adding_from = [doge_hdr_from](const std::string& peer) {
+                                        std::lock_guard<std::mutex> lock(doge_hdr_from->mu);
+                                        doge_hdr_from->peer = peer;
+                                    };
+                                    hs.post_worker = [doge_hdr_pool](std::function<void()> fn) {
+                                        boost::asio::post(*doge_hdr_pool, std::move(fn));
+                                    };
+                                    hs.post_io = [&ioc](std::function<void()> fn) {
+                                        boost::asio::post(ioc, [fn = std::move(fn)]() {
+                                            try {
+                                                fn();
+                                            } catch (const std::exception& e) {
+                                                LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
+                                            }
+                                        });
+                                    };
+                                    hs.locator = [dc]() { return dc->get_locator(); };
+                                    hs.synced = [dc]() { return dc->is_synced(); };
+                                    hs.height = [dc]() { return dc->height(); };
+                                    hs.ask_one = [bcaster_ptr](const std::vector<uint256>& locator, size_t rr,
+                                                               const std::string& peer) {
+                                        return bcaster_ptr->request_headers_targeted(locator, uint256::ZERO, rr, peer);
+                                    };
+                                    hs.ask_all = [bcaster_ptr](const std::vector<uint256>& locator) {
+                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                    };
+                                    doge_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs), "[EMB-DOGE]");
+                                }
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
-                                    [dc = doge_chain.get(), doge_hdr_pool, doge_hdr_from, bcaster_ptr, &ioc](
-                                        const std::string& key,
-                                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
-                                        // The broadcaster's on_new_headers gives us raw BlockHeaderType
-                                        // from the standard parser. For DOGE AuxPoW, the P2P message
-                                        // handler in NodeP2P already parses the headers using the
-                                        // standard 80+1 byte format. AuxPoW blocks have the AuxPoW
-                                        // data INSIDE the block, not the header in 'headers' message.
-                                        //
-                                        // NOTE: Dogecoin's P2P 'headers' message DOES include AuxPoW
-                                        // data. However, our NodeP2P handler parses each header as
-                                        // 80 bytes + tx_count. If the DOGE peer sends AuxPoW headers,
-                                        // the parser will fail on the variable-length data.
-                                        //
-                                        // For testnet4alpha (all AuxPoW from genesis), we may need
-                                        // the dedicated AuxPoW parser. For now, pass through directly
-                                        // and handle parse errors gracefully.
+                                    [doge_hdr_sync](const std::string& key,
+                                                    const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                                         LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
                                                  << " headers from P2P";
-                                        auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
-                                        boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, doge_hdr_from, key, &ioc]() {
-                                                {
-                                                    std::lock_guard<std::mutex> lock(doge_hdr_from->mu);
-                                                    doge_hdr_from->peer = key;
-                                                }
-                                                int accepted = dc->add_headers(*batch);
-                                                if (accepted > 0)
-                                                    LOG_INFO << "[EMB-DOGE] add_headers: "
-                                                             << accepted << "/" << batch->size()
-                                                             << " accepted, chain height="
-                                                             << dc->height();
-
-                                                // Pipeline: immediate follow-up getheaders for fast sync
-                                                uint256 last_hash;
-                                                if (!batch->empty()) {
-                                                    auto packed = pack(batch->back());
-                                                    last_hash = Hash(packed.get_span());
-                                                }
-                                                bool full_batch = (batch->size() >= 2000);
-                                                if (accepted > 0 || full_batch) {
-                                                    boost::asio::post(ioc, [accepted, last_hash, dc, bcaster_ptr]() {
-                                                      try {
-                                                        if (accepted > 0 && !last_hash.IsNull()) {
-                                                            bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
-                                                        } else {
-                                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
-                                                        }
-                                                      } catch (const std::exception& e) {
-                                                        LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
-                                                      }
-                                                    });
-                                                }
-                                            });
+                                        doge_hdr_sync->on_headers(key, hdrs);
                                     });
 
-                                // Periodic DOGE header sync (every 60s)
+                                // Periodic DOGE getheaders (HeaderSync::poll: one peer; every
+                                // 10 s while catching up, a minute once synced).
                                 auto doge_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, now_ms, hb_doge_sync,
-                                                 dc = doge_chain.get(),
-                                                 bcaster_ptr](boost::system::error_code ec) {
+                                                 doge_hdr_sync](boost::system::error_code ec) {
                                     if (ec) return;
                                     hb_doge_sync->store(now_ms());
-                                    // Fast poll during sync (5s), slow when caught up (60s)
-                                    int interval = dc->is_synced() ? 60 : 5;
-                                    doge_sync_timer->expires_after(std::chrono::seconds(interval));
+                                    doge_sync_timer->expires_after(doge_hdr_sync->poll_interval());
                                     doge_sync_timer->async_wait(*doge_sync_fn);
                                     try {
-                                        auto locator = dc->get_locator();
-                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                        doge_hdr_sync->poll();
                                     } catch (const std::exception& e) {
                                         LOG_WARNING << "[EMB-DOGE] Header sync error: " << e.what();
                                     }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
-/// Embedded LTC: the header chain's getheaders and the queue of headers
-/// batches to its thread, as Litecoin/Bitcoin Core does it
+/// Embedded LTC (and, on this branch, the embedded DOGE header chain): the
+/// header chain's getheaders and the queue of headers batches to its
+/// thread, as Litecoin/Bitcoin Core does it
 /// (net_processing.cpp ProcessHeadersMessage). main_ltc.cpp wires it to the
 /// HeaderChain, the CoinBroadcaster and the header thread pool; the KATs
 /// drive it with fakes.
@@ -69,6 +70,9 @@ struct HeaderSyncHost {
     std::function<void(const std::vector<uint256>&)> ask_all;
     /// New headers were accepted (optional: the work refresh).
     std::function<void(int)> accepted;
+    /// On the header thread, just before add_headers of a batch from this
+    /// peer (optional: a tip change it fires knows its announcer).
+    std::function<void(const std::string&)> adding_from;
     /// The clock (optional; tests drive it).
     std::function<Clock::time_point()> now;
 };
@@ -118,7 +122,10 @@ public:
     /// (at most once per STALE_TIP; LTC blocks come every 2.5 minutes).
     static constexpr std::chrono::minutes STALE_TIP{30};
 
-    explicit HeaderSync(HeaderSyncHost host) : m_host(std::move(host)) {}
+    explicit HeaderSync(HeaderSyncHost host, std::string tag = "[EMB-LTC]")
+        : m_host(std::move(host)), m_tag(std::move(tag))
+    {
+    }
 
     HeaderSync(const HeaderSync&) = delete;
     HeaderSync& operator=(const HeaderSync&) = delete;
@@ -155,9 +162,11 @@ public:
         m_host.post_worker([self, batch, peer, last]() {
             int accepted = 0;
             try {
+                if (self->m_host.adding_from)
+                    self->m_host.adding_from(peer);
                 accepted = self->m_host.add_headers(*batch);
             } catch (const std::exception& e) {
-                LOG_WARNING << "[EMB-LTC] Header batch from " << peer << " failed: " << e.what();
+                LOG_WARNING << self->m_tag << " Header batch from " << peer << " failed: " << e.what();
             }
             self->done(last);
             self->m_host.post_io([self, peer, accepted]() { self->after_batch(peer, accepted); });
@@ -248,6 +257,7 @@ private:
     }
 
     HeaderSyncHost  m_host;
+    std::string     m_tag;
     HeaderSyncStats m_stats;
 
     std::mutex      m_mu;       // m_pending: IO thread and header thread
