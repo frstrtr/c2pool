@@ -439,8 +439,10 @@ private:
     /// Rotate `peer` out for PEER_COOLDOWN; its requests go to other peers
     /// at the next refill. With half the host's peers cooling already, the
     /// requests are reassigned but the peer stays eligible.
-    void cool_down(const std::string& peer, Clock::time_point t)
+    void cool_down(std::string peer, Clock::time_point t)
     {
+        // By value: on_fill_stall passes an in-flight entry's peer, and the
+        // loop below erases that entry.
         if (peer.empty())
             return;
         size_t cooling = 0;
