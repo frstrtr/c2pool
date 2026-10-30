@@ -222,6 +222,27 @@ void ordered_extend(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t height
     }
 }
 
+/// Buffer a best-chain body for a fill whose download bounds what it keeps
+/// (core::coin::BlockDownload::keep: its window, its byte bound): kept and
+/// counted, or only the range extended (the height is asked in order when
+/// the window gets there). Returns true when kept. Before, the accrual
+/// set's fill buffered every body at or above its next height (FRESH-NODE
+/// 3: the accrual buffer had no bound).
+template <typename BlockT, typename Download>
+bool ordered_buffer_bounded(core::coin::BlockBootstrapState<BlockT>& bs, Download& dl, uint32_t height,
+                            const BlockT& block, const uint256& hash, size_t bytes)
+{
+    if (!dl.keep(bs, height, bytes)) {
+        ordered_extend(bs, height);
+        return false;
+    }
+    const bool fresh = height >= bs.next_height && !bs.buffer.count(height);
+    ordered_buffer(bs, height, block, hash);
+    if (fresh && bs.buffer.count(height))
+        dl.buffered(height, bytes);
+    return true;
+}
+
 /// How a fill's heights are asked for.
 enum class FillAsk {
     Download,  // the cold start ("Bootstrap"): one peer per height, core::coin::BlockDownload
@@ -289,6 +310,34 @@ std::optional<std::pair<uint32_t, uint32_t>> cold_start_rearm(
     if (uint64_t(tip) - bs.next_height <= uint64_t(blocks) + bs.window)
         return std::nullopt;
     return std::make_pair(tip >= blocks ? tip - blocks + 1 : 1u, tip);
+}
+
+/// Who is asked for a new tip's body (the DOGE tip-change handler).
+enum class TipBodyAsk {
+    None,       // the initial header sync, or the cold start runs: nobody
+    Announcer,  // the peer whose headers brought the tip
+    OnePeer,    // the announcer is gone: one peer, round robin
+    EveryPeer,  // no peer could be asked one at a time
+};
+
+/// Nothing during the initial header sync (no body is of use before the
+/// cold start, which waits for the synced chain) nor while the cold start
+/// runs (its download takes the tip in order); else the announcer, else one
+/// peer, else every peer. from(peer) / one() return whether the request was
+/// sent. Before, every peer was asked for every new tip, sync or not
+/// (FRESH-NODE 2.3: 2-5 copies of each tip body).
+template <typename FromFn, typename OneFn, typename AllFn>
+TipBodyAsk ask_tip_body(bool chain_synced, bool cold_start_runs, const std::string& announcer,
+                        FromFn&& from, OneFn&& one, AllFn&& all)
+{
+    if (!chain_synced || cold_start_runs)
+        return TipBodyAsk::None;
+    if (!announcer.empty() && from(announcer))
+        return TipBodyAsk::Announcer;
+    if (one())
+        return TipBodyAsk::OnePeer;
+    all();
+    return TipBodyAsk::EveryPeer;
 }
 
 /// Result of walking the UTXO set back to the best chain.

@@ -209,3 +209,126 @@ TEST(LtcColdStart, TheColdStartBootstrapAsksOnePeerPerBlock)
     EXPECT_EQ(net2.all, std::vector<uint32_t>{h0});
     EXPECT_EQ(net2.asked[h0].size(), 3u);
 }
+
+// ─── The DOGE accrual set's cold start (FRESH-NODE §2.3 / §6.3) ──────────────
+
+namespace {
+
+constexpr uint32_t DOGE_COLD_BLOCKS = 1441;          // [tip - 1440, tip] (keep + 1)
+constexpr uint32_t DOGE_FIRST_BATCH_TIP = 6162000;   // the tip chain's first batch above its checkpoint
+constexpr uint32_t DOGE_TIP = 6436623;               // the real tip then (274 k above it)
+constexpr size_t   MB = 1024 * 1024;
+
+} // namespace
+
+// The first body above keep arrives while the tip chain is 274 k blocks behind
+// (tip age > 24 h): no fill. Synced at T: [T-1440, T], 1,441 blocks. Before, it
+// armed at that first batch's tip ([6,160,560..6,162,000]).
+TEST(DogeAccrualColdStart, TheAccrualBootstrapWaitsForTheSyncedChain)
+{
+    Fill f;
+    EXPECT_FALSE(arm_from_plan(f, DOGE_COLD_BLOCKS, false, DOGE_FIRST_BATCH_TIP, 0))
+        << "armed at [" << f.next_height << ".." << f.end_height << "] with the tip chain unsynced";
+    EXPECT_FALSE(f.active);
+    if (f.active)
+        f = Fill{};
+    ASSERT_TRUE(arm_from_plan(f, DOGE_COLD_BLOCKS, true, DOGE_TIP, 0));
+    EXPECT_EQ(f.next_height, DOGE_TIP - 1440);
+    EXPECT_EQ(f.end_height, DOGE_TIP);
+    EXPECT_EQ(f.total, 1441u);
+}
+
+// 276 k best-chain bodies after arming while nothing drains (the fresh run's
+// 37 blocks a minute against 60 minted, at the extreme): the fill is armed
+// again at tip - keep, never more than keep + its window deep; bodies past the
+// window are not kept. Before, every body extended it: total 276 k.
+TEST(DogeAccrualColdStart, TheAccrualBootstrapNeverGrowsPastKeep)
+{
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    ASSERT_TRUE(arm_from_plan(f, DOGE_COLD_BLOCKS, true, DOGE_TIP, 0));
+    uint32_t rearms = 0;
+    uint32_t widest = f.total;
+    for (uint32_t tip = DOGE_TIP + 1; tip <= DOGE_TIP + 276000; ++tip) {
+        // The tick: arm again when too far behind, else the tip joins the range.
+        if (auto r = ltc::coin::cold_start_rearm(f, tip, DOGE_COLD_BLOCKS)) {
+            ltc::coin::ordered_arm(f, r->first, r->second);
+            dl.reset();
+            ++rearms;
+        }
+        // The tip's body arrives.
+        ltc::coin::ordered_buffer_bounded(f, dl, tip, int(tip), uint256(), 30000);
+        widest = std::max(widest, f.total);
+    }
+    EXPECT_GT(rearms, 0u);
+    EXPECT_LE(widest, DOGE_COLD_BLOCKS + f.window + 1) << "the Bootstrap grew to " << widest << " blocks";
+    EXPECT_LE(f.buffer.size(), f.window);
+}
+
+// A new tip from peer A: one getdata, to A. A gone: one other peer; no peer
+// one at a time: every peer. Nothing during the initial header sync or while
+// the cold start runs. Before, every peer was asked for every new tip.
+TEST(DogeAccrualColdStart, ATipAnnouncementAsksTheAnnouncer)
+{
+    using ltc::coin::TipBodyAsk;
+    std::vector<std::string> from;
+    int one = 0, all = 0;
+    auto ask = [&](bool synced, bool cold_start_runs, const std::string& announcer,
+                   bool from_ok, bool one_ok) {
+        return ltc::coin::ask_tip_body(
+            synced, cold_start_runs, announcer,
+            [&](const std::string& p) { from.push_back(p); return from_ok; },
+            [&]() { ++one; return one_ok; },
+            [&]() { ++all; });
+    };
+    EXPECT_EQ(ask(true, false, "A", true, true), TipBodyAsk::Announcer);
+    EXPECT_EQ(from, std::vector<std::string>{"A"});
+    EXPECT_EQ(one, 0);
+    EXPECT_EQ(all, 0) << "every peer asked for a tip its announcer was asked for";
+
+    from.clear();
+    EXPECT_EQ(ask(true, false, "A", false, true), TipBodyAsk::OnePeer);
+    EXPECT_EQ(one, 1);
+    EXPECT_EQ(all, 0);
+    EXPECT_EQ(ask(true, false, "", false, false), TipBodyAsk::EveryPeer);
+    EXPECT_EQ(all, 1);
+
+    one = all = 0;
+    from.clear();
+    EXPECT_EQ(ask(false, false, "A", true, true), TipBodyAsk::None);
+    EXPECT_EQ(ask(true, true, "A", true, true), TipBodyAsk::None);
+    EXPECT_TRUE(from.empty());
+    EXPECT_EQ(one + all, 0);
+}
+
+// 300 MB of 1-MB bodies arrive ahead of a missing next height: with a wide
+// window (the full lane's 1,024) the buffer stops at the 256 MB bound and the
+// download asks nothing but the next height (window_waits); with the accrual
+// window (16) bodies past it are not kept at all. Before, the accrual buffer
+// took every body at or above its next height.
+TEST(DogeAccrualColdStart, TheAccrualBufferIsBounded)
+{
+    FakePeers net(20);
+    BlockDownload dl(net.host(), "[test]");
+    Fill f;
+    ASSERT_TRUE(arm_from_plan(f, DOGE_COLD_BLOCKS, true, DOGE_TIP, 0));
+    f.window = 1024;
+    for (uint32_t h = f.next_height + 1; h <= f.next_height + 300; ++h)
+        ltc::coin::ordered_buffer_bounded(f, dl, h, int(h), uint256(), 1 * MB);
+    EXPECT_LE(dl.buffer_bytes(), 256 * MB);
+    EXPECT_LE(f.buffer.size(), 256u);
+    dl.refill(f);
+    EXPECT_GE(dl.stats().window_waits.load(), 1u);
+    EXPECT_EQ(dl.in_flight(), 1u) << "only the next height";
+    EXPECT_FALSE(dl.asked_peer(f.next_height).empty());
+
+    FakePeers net2(20);
+    BlockDownload dl2(net2.host(), "[test]");
+    Fill g;
+    ASSERT_TRUE(arm_from_plan(g, DOGE_COLD_BLOCKS, true, DOGE_TIP, 0));
+    for (uint32_t h = g.next_height + 1; h <= g.next_height + 300; ++h)
+        ltc::coin::ordered_buffer_bounded(g, dl2, h, int(h), uint256(), 1 * MB);
+    EXPECT_LT(g.buffer.size(), g.window);
+    EXPECT_LE(dl2.buffer_bytes(), g.window * MB);
+}
