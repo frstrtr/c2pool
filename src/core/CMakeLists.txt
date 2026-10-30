@@ -83,6 +83,7 @@ add_library(core_utxo OBJECT
     crypto/chacha20.hpp crypto/chacha20.cpp
     crypto/muhash.hpp crypto/muhash.cpp
     coin/coin_compressor.hpp coin/coin_compressor.cpp
+    coin/utxo_set_hash.hpp coin/utxo_set_hash.cpp
 )
 target_link_libraries(core_utxo core ${SECP256K1_LIBRARIES})
 
