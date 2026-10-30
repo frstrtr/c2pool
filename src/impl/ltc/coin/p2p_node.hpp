@@ -98,7 +98,10 @@ private:
     BlockSource m_last_block_source{BlockSource::Block};
     // BIP 130: getdata the body of every small headers announcement. The LTC
     // embedded node turns this off and fetches the tip's block once
-    // (mweb_fetch_retry) instead of once per announcing peer.
+    // (mweb_fetch_retry) instead of once per announcing peer. On DOGE it also
+    // gates the inv announcement's body getdata (the embedded DOGE node turns
+    // it off: its tip handler asks the announcer once, its UTXO lane fills a
+    // gap).
     bool m_fetch_announced_blocks{true};
     // Last compact block we SENT — cached to serve getblocktxn requests
     BlockType m_sent_cmpct_block;
@@ -404,7 +407,8 @@ public:
     void set_on_cmpct_outcome(CmpctOutcomeCallback cb) { m_on_cmpct_outcome = std::move(cb); }
     /// How the block of the current/last full_block event arrived.
     BlockSource last_block_source() const { return m_last_block_source; }
-    /// BIP 130 body getdata for small headers announcements (default on).
+    /// BIP 130 body getdata for small headers announcements (default on); on
+    /// DOGE also the inv announcement's body getdata.
     void set_fetch_announced_blocks(bool on) { m_fetch_announced_blocks = on; }
 
     /// getdata type for a block body from this peer: MSG_MWEB_BLOCK for an
@@ -674,6 +678,11 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
+                // DOGE: like the BIP 130 getdata, only while
+                // fetch_announced_blocks (every announcer sent the body:
+                // 18-22 copies of each tip).
+                if (!m_fetch_announced_blocks && (m_chain_label == "DOGE" || m_chain_label == "doge"))
+                    break;
                 // Request the full block for MWEB state extraction. An MWEB
                 // peer answers MSG_BLOCK without the mweb tail, so ask it
                 // for MSG_MWEB_BLOCK.

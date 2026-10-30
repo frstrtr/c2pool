@@ -7055,6 +7055,14 @@ int main(int argc, char* argv[]) {
                             if (cfg.symbol == "DOGE" && doge_chain) {
                                 auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
                                 auto* bcaster_ptr = broadcaster.get();
+                                // A block announced by inv or a small headers message is not
+                                // fetched from its announcer at once (every announcer sent the
+                                // body: 18-22 copies of each tip, FRESH-IMPL-NOTES item 9): the
+                                // tip-change handler asks the announcer, then one peer; the
+                                // UTXO lane's gap fill takes a body that never came.
+                                broadcaster->set_fetch_announced_blocks(false);
+                                // The peer whose headers move the tip (the tip handler asks it).
+                                auto doge_hdr_from = std::make_shared<doge::coin::HeadersFrom>();
 
                                 // Wire peer tip height for fast-sync scrypt skip
                                 broadcaster->set_on_peer_height(
@@ -7184,7 +7192,7 @@ int main(int argc, char* argv[]) {
                                 // a cut.
                                 auto on_doge_headers =
                                     [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync, range_sync,
-                                     send_sched_ask, full = doge_full, doge_hdr_asks](
+                                     send_sched_ask, full = doge_full, doge_hdr_asks, doge_hdr_from](
                                         const std::string& key,
                                         const std::vector<ltc::coin::BlockHeaderType>& hdrs,
                                         std::optional<size_t> truncated_at) {
@@ -7197,7 +7205,7 @@ int main(int argc, char* argv[]) {
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
                                             [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
-                                             full, key, doge_hdr_asks, truncated_at]() {
+                                             full, key, doge_hdr_asks, doge_hdr_from, truncated_at]() {
                                                 // Below the checkpoint: an anchored range, or the
                                                 // sequential schedule's batch (doge::coin::route_headers);
                                                 // only the rest answers the header chain's getheaders.
@@ -7233,7 +7241,9 @@ int main(int argc, char* argv[]) {
                                                         });
                                                     return;
                                                 }
+                                                doge_hdr_from->set(key);
                                                 int accepted = dc->add_headers(*batch);
+                                                doge_hdr_from->clear();
                                                 if (accepted > 0)
                                                     LOG_INFO << "[EMB-DOGE] add_headers: "
                                                              << accepted << "/" << batch->size()
@@ -8056,12 +8066,15 @@ int main(int argc, char* argv[]) {
                                      chain = doge_chain.get(),
                                      pool = doge_pool.get(),
                                      mm_ptr = mm_manager.get(),
-                                     doge_lane, doge_full_lane, fpool = doge_full_pool.get(), full = doge_full](
+                                     doge_lane, doge_full_lane, fpool = doge_full_pool.get(), full = doge_full,
+                                     doge_hdr_from, tip_rr = std::make_shared<size_t>(0)](
                                         const uint256& old_tip, uint32_t old_height,
                                         const uint256& new_tip, uint32_t new_height) {
+                                        // Fired inside add_headers: the batch's sender announced it.
+                                        const std::string announcer = doge_hdr_from->get();
                                         boost::asio::post(ioc,
                                             [bcaster_ptr, &web_server, chain, pool, mm_ptr, doge_lane,
-                                             doge_full_lane, fpool, full,
+                                             doge_full_lane, fpool, full, announcer, tip_rr,
                                              old_tip, old_height, new_tip, new_height]() {
                                       try {
                                         // The full set's lane sees every tip change (on its pool).
@@ -8091,8 +8104,16 @@ int main(int argc, char* argv[]) {
                                         // Request the new tip's full block for UTXO build + mempool cleanup,
                                         // unless the UTXO set already has it: its body moved the tip (the
                                         // header came from the body), was connected and cleaned the pool.
-                                        if (bcaster_ptr && !(utxo && utxo->get_best_block() == new_tip))
-                                            bcaster_ptr->request_full_block(new_tip);
+                                        // Once: from the peer whose headers brought the tip, else one
+                                        // peer, else every peer (a body that never comes is the UTXO
+                                        // lane's gap fill at the next tip); nothing during the initial
+                                        // header sync (no body is of use before the synced tip). Before,
+                                        // every peer for every tip, and every announcer again.
+                                        if (bcaster_ptr && chain->is_synced() && !(utxo && utxo->get_best_block() == new_tip)) {
+                                            if (announcer.empty() || !bcaster_ptr->request_full_block_from(announcer, new_tip))
+                                                if (!bcaster_ptr->request_full_block_targeted(new_tip, (*tip_rr)++))
+                                                    bcaster_ptr->request_full_block(new_tip);
+                                        }
 
                                         // Merged-mining readiness gate.  aux_chain_embedded's
                                         // get_work_template() would return empty AuxWork until

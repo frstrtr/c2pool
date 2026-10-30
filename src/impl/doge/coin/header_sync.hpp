@@ -26,6 +26,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 
 namespace doge {
 namespace coin {
@@ -51,6 +52,37 @@ inline HeadersPoll headers_poll(bool chain_synced)
 {
     return chain_synced ? HeadersPoll::EveryPeer : HeadersPoll::OnePeer;
 }
+
+/// The peer whose headers the header chain is taking now (main_ltc: set
+/// around HeaderChain::add_headers on the header pool's thread, read by the
+/// tip-change handler that add_headers fires on that thread): the new tip's
+/// announcer, asked first for the tip's body. Read on another thread it is
+/// "" (a body that moved the tip came from a peer that had it).
+class HeadersFrom {
+public:
+    void set(const std::string& peer)
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_peer = peer;
+        m_thread = std::this_thread::get_id();
+    }
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_peer.clear();
+        m_thread = std::thread::id();
+    }
+    std::string get() const
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_thread == std::this_thread::get_id() ? m_peer : std::string();
+    }
+
+private:
+    mutable std::mutex m_mu;
+    std::string        m_peer;
+    std::thread::id    m_thread;
+};
 
 /// The header chain's getheaders per peer (net_processing.cpp
 /// MaybeSendGetHeaders, the inv handling of a block not known).
