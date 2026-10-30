@@ -274,6 +274,7 @@ static void segfault_handler(int sig) {
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
 #include <impl/ltc/coin/header_sync.hpp>
+#include <impl/ltc/coin/cold_start_tick.hpp>
 // Phase 5: Embedded DOGE node for daemonless merged mining
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
@@ -7007,8 +7008,6 @@ int main(int argc, char* argv[]) {
                                 // takes no block.
                                 auto doge_bs = std::make_shared<
                                     core::coin::BlockBootstrapState<ltc::coin::BlockType>>();
-                                auto doge_cold_decided = std::make_shared<bool>(false);
-                                auto doge_synced_since = std::make_shared<std::chrono::steady_clock::time_point>();
                                 std::shared_ptr<core::coin::BlockDownload> doge_dl;
                                 {
                                     core::coin::BlockDownload::Host dh;
@@ -7030,6 +7029,46 @@ int main(int argc, char* argv[]) {
                                     doge_dl = std::make_shared<core::coin::BlockDownload>(
                                         std::move(dh), "[EMB-DOGE] Bootstrap:");
                                 }
+                                // The cold start's 1-s tick (ltc/coin/cold_start_tick.hpp).
+                                std::shared_ptr<ltc::coin::AccrualColdStart<ltc::coin::BlockType>> doge_cold;
+                                {
+                                    ltc::coin::ColdStartTickHost ch;
+                                    auto* chain = doge_chain.get();
+                                    auto* bc = broadcaster.get();
+                                    auto* utxo = doge_utxo_cache.get();
+                                    auto* pool = doge_pool.get();
+                                    ch.synced = [chain]() { return chain->is_synced(); };
+                                    ch.tip_age_s = [chain]() -> int64_t {
+                                        const auto tip_e = chain->tip();
+                                        return tip_e ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
+                                    };
+                                    ch.tip = [chain]() { return chain->height(); };
+                                    ch.utxo_best = [utxo]() { return utxo ? utxo->get_best_height() : 0u; };
+                                    ch.utxo_empty = [utxo]() { return !utxo || utxo->get_best_block().IsNull(); };
+                                    ch.wipe = [utxo, pool]() {
+                                        if (!utxo || !utxo->reanchor()) {
+                                            LOG_ERROR << "[EMB-DOGE] UTXO wipe for the Bootstrap failed; set left at h="
+                                                      << (utxo ? utxo->get_best_height() : 0);
+                                            return false;
+                                        }
+                                        if (pool)
+                                            pool->requarantine_all();
+                                        return true;
+                                    };
+                                    ch.armed = [doge_bs, doge_dl, bc, &ioc](uint32_t from, uint32_t to, uint32_t asked) {
+                                        LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: " << doge_bs->total
+                                                 << " blocks [" << from << ".." << to << "] window="
+                                                 << doge_bs->window << " requests=" << asked
+                                                 << " peers=" << bc->peer_count() << " (one peer per block)";
+                                        doge_bs->start_stall_timer(ioc,
+                                            [doge_bs, doge_dl](uint32_t h) { doge_dl->on_fill_stall(*doge_bs, h); },
+                                            "EMB-DOGE");
+                                    };
+                                    ch.ask_one = [](uint32_t) { return false; };
+                                    ch.ask_all = [](uint32_t) {};
+                                    doge_cold = std::make_shared<ltc::coin::AccrualColdStart<ltc::coin::BlockType>>(
+                                        *doge_bs, *doge_dl, core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1, std::move(ch));
+                                }
                                 {
                                 broadcaster->set_on_full_block(
                                     [pool = doge_pool.get(),
@@ -7040,7 +7079,7 @@ int main(int argc, char* argv[]) {
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      explorer_enabled, explorer_depth_doge,
                                      mm_ptr = mm_manager.get(),
-                                     doge_bs, doge_dl, doge_cold_decided, &ioc, &web_server](
+                                     doge_bs, doge_dl, doge_cold, &ioc, &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
                                         auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
@@ -7060,7 +7099,7 @@ int main(int argc, char* argv[]) {
                                         if (height > 0)
                                             doge_dl->delivered(height, peer);
                                         // The cold start waits for the synced header chain.
-                                        const bool utxo_waits = !*doge_cold_decided && !doge_bs->active;
+                                        const bool utxo_waits = !doge_cold->decided() && !doge_bs->active;
 
                                         // ═══ BOOTSTRAP PIPELINE (same as LTC) ═════════
                                         if (utxo && utxo_db && !utxo_waits) {
@@ -7233,91 +7272,24 @@ int main(int argc, char* argv[]) {
                                     });
                                 } // doge_bs scope
 
-                                // DOGE cold start (1 s tick), as the LTC one: decided once
-                                // the header chain is synced (the tip's last 1,441 heights,
-                                // a warm restart's catch-up, or none); while it runs, new
-                                // tips join its range, it is armed again at the tip when it
-                                // falls more than keep + its window behind, and its download
-                                // moves on (request timeouts, the stalling peer).
+                                // DOGE cold start (1 s tick, ltc/coin/cold_start_tick.hpp), as the
+                                // LTC one: decided once the header chain is synced and caught up
+                                // (the tip's last 1,441 heights, a warm restart's catch-up, or
+                                // none); while it runs, new tips join its range, it is armed again
+                                // at the tip when it falls more than keep + its window behind, and
+                                // its download moves on (request timeouts, the stalling peer).
                                 {
                                     auto cold_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                     auto cold_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                                    *cold_fn = [cold_fn, cold_timer, doge_bs, doge_dl, doge_cold_decided, doge_synced_since,
-                                                chain = doge_chain.get(), bc = broadcaster.get(),
-                                                utxo = doge_utxo_cache.get(), utxo_db = doge_utxo_db.get(),
-                                                pool = doge_pool.get(), &ioc](boost::system::error_code ec) {
+                                    *cold_fn = [cold_fn, cold_timer, doge_cold,
+                                                utxo = doge_utxo_cache.get(), utxo_db = doge_utxo_db.get()](
+                                                   boost::system::error_code ec) {
                                         if (ec) return; // cancelled (ioc stopped)
                                         cold_timer->expires_after(std::chrono::seconds(1));
                                         cold_timer->async_wait(*cold_fn);
                                         try {
-                                            if (!chain || !bc || !utxo || !utxo_db)
-                                                return;
-                                            // [tip - keep, tip]: 1,441 heights.
-                                            constexpr uint32_t DOGE_COLD_BLOCKS = core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1;
-                                            auto arm = [&](uint32_t from, uint32_t to) {
-                                                ltc::coin::cold_start_arm(*doge_bs, from, to);
-                                                doge_dl->reset();
-                                                const uint32_t asked = doge_dl->refill(*doge_bs);
-                                                LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: " << doge_bs->total
-                                                         << " blocks [" << from << ".." << to << "] window="
-                                                         << doge_bs->window << " requests=" << asked
-                                                         << " peers=" << bc->peer_count() << " (one peer per block)";
-                                                doge_bs->start_stall_timer(ioc,
-                                                    [doge_bs, doge_dl](uint32_t h) { doge_dl->on_fill_stall(*doge_bs, h); },
-                                                    "EMB-DOGE");
-                                            };
-                                            if (!*doge_cold_decided) {
-                                                // Synced and caught up (cold_start_ready).
-                                                const auto now = std::chrono::steady_clock::now();
-                                                if (!chain->is_synced()) {
-                                                    *doge_synced_since = {};
-                                                    return;
-                                                }
-                                                if (*doge_synced_since == std::chrono::steady_clock::time_point{})
-                                                    *doge_synced_since = now;
-                                                const auto tip_e = chain->tip();
-                                                const int64_t tip_age = tip_e
-                                                    ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
-                                                const int64_t synced_for = std::chrono::duration_cast<std::chrono::seconds>(
-                                                    now - *doge_synced_since).count();
-                                                if (!ltc::coin::cold_start_ready(true, tip_age, synced_for))
-                                                    return;
-                                                *doge_cold_decided = true;
-                                                if (doge_bs->active)
-                                                    return;
-                                                const uint32_t best = utxo->get_best_height();
-                                                const auto plan = ltc::coin::cold_start_plan(
-                                                    DOGE_COLD_BLOCKS, true, chain->height(), best);
-                                                if (plan.action != ltc::coin::ColdStart::Action::Arm) {
-                                                    LOG_INFO << "[EMB-DOGE] UTXO warm restart: best=" << best
-                                                             << " — no bootstrap needed";
-                                                    return;
-                                                }
-                                                arm(plan.from, plan.to);
-                                                return;
-                                            }
-                                            if (!doge_bs->active)
-                                                return;
-                                            const uint32_t tip = chain->height();
-                                            if (auto r = ltc::coin::cold_start_rearm(*doge_bs, tip, DOGE_COLD_BLOCKS)) {
-                                                LOG_WARNING << "[EMB-DOGE] Bootstrap at h=" << doge_bs->next_height
-                                                            << " is " << tip - doge_bs->next_height
-                                                            << " blocks behind the tip h=" << tip << ": arming it again at ["
-                                                            << r->first << ".." << r->second << "]";
-                                                if (!utxo->get_best_block().IsNull()) {
-                                                    if (!utxo->reanchor()) {
-                                                        LOG_ERROR << "[EMB-DOGE] UTXO wipe for the Bootstrap failed; set left at h="
-                                                                  << utxo->get_best_height();
-                                                        return;
-                                                    }
-                                                    if (pool)
-                                                        pool->requarantine_all();
-                                                }
-                                                arm(r->first, r->second);
-                                                return;
-                                            }
-                                            ltc::coin::ordered_extend(*doge_bs, tip);
-                                            doge_dl->tick(*doge_bs);
+                                            if (utxo && utxo_db)
+                                                doge_cold->tick();
                                         } catch (const std::exception& e) {
                                             LOG_WARNING << "[EMB-DOGE] Cold start tick error: " << e.what();
                                         }
