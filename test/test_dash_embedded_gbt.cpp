@@ -2096,10 +2096,13 @@ TEST(DashSupersetSpecialTx, Type4FoldRevokesOperatorAndRecomputesRoot) {
     std::array<uint8_t, 48> zero{};
     EXPECT_EQ(fold.sml.mnList[0].pubKeyOperator, zero) << "operator key cleared";
 
-    // Independent expected root (hand-built, never from the fold).
+    // Independent expected root (hand-built, never from the fold). dashd's
+    // ResetOperatorFields also puts the state back to nVersion LegacyBLS
+    // (evo/dmnstate.h:112-120), and the leaf takes the state's nVersion.
     CSimplifiedMNListEntry exp = base_e;
     exp.isValid = false; exp.pubKeyOperator = {};
     exp.netAddress = {}; exp.netPort = 0;
+    exp.nVersion = CSimplifiedMNListEntry::VER_LEGACY_BLS;
     CSimplifiedMNList expsml(std::vector<CSimplifiedMNListEntry>{exp});
     EXPECT_EQ(fold.sml.CalcMerkleRoot(), expsml.CalcMerkleRoot());
     EXPECT_NE(fold.sml.CalcMerkleRoot(), root_before)

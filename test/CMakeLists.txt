@@ -1073,7 +1073,11 @@ if (BUILD_TESTING AND GTest_FOUND)
                    test_dash_replay_quorum_seam.cpp
                    test_dash_replay_payee_publish.cpp
                    test_dash_replay_mnlist_seed.cpp
-                   test_dash_replay_prestate_empty_dip3.cpp)
+                   test_dash_replay_prestate_empty_dip3.cpp
+                   # Differential KAT (Dash Core v23.1.9 PR-1 verify, M1/M2): the
+                   # template fold must commit the root the root-proven DML fold
+                   # computes and refuse what it refuses (real dashbls keys).
+                   test_dash_protx_fold_differential.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify dash_x11 core

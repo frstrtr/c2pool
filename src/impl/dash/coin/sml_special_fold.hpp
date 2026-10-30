@@ -63,7 +63,7 @@
 
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
-#include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_to_basic (canonical operator key)
+#include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_point_eq (scheme-faithful operator-key compare)
 #include <impl/dash/coin/mn_state_machine.hpp>    // MnFoldContext::from, TxPrevOutLess
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>
@@ -115,6 +115,41 @@ find_entry(std::vector<vendor::CSimplifiedMNListEntry>& list, const uint256& pro
     for (auto& e : list)
         if (e.proRegTxHash == pro) return &e;
     return nullptr;
+}
+
+// dashd CBLSLazyWrapper::operator== (bls/bls.h @ v23.1.9) between the key a
+// masternode holds and a ProUpRegTx's key, each with the scheme it was read
+// under (legacy iff its nVersion < BasicBLS): two null keys are equal; under
+// the same scheme the BYTES decide; across schemes the decoded POINTS decide
+// (opkey_point_eq — the h=1874081 and #154 classes). Returns true when the
+// operator key CHANGES.
+inline bool operator_key_changed(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& held,
+                                 bool held_legacy,
+                                 const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& wire,
+                                 bool wire_legacy)
+{
+    bool held_null = true, wire_null = true;
+    for (uint8_t b : held) if (b != 0) { held_null = false; break; }
+    for (uint8_t b : wire) if (b != 0) { wire_null = false; break; }
+    if (held_null || wire_null) return held_null != wire_null;
+    if (held_legacy == wire_legacy) return held != wire;
+    return !vendor::opkey_point_eq(held, held_legacy, wire, wire_legacy);
+}
+
+// dashd CDeterministicMNState::ResetOperatorFields (evo/dmnstate.h:112-120)
+// as the SML leaf sees it, plus the ban: nVersion back to LegacyBLS, operator
+// key, service and platformNodeID cleared, isValid=false. The leaf hash drops
+// nType and the platform fields while nVersion < BasicBLS
+// (CSimplifiedMNListEntry serialization), so the nVersion reset changes the
+// committed root. platformHTTPPort is not reset by dashd and is kept.
+inline void reset_operator_fields(vendor::CSimplifiedMNListEntry& e)
+{
+    e.nVersion       = vendor::CSimplifiedMNListEntry::VER_LEGACY_BLS;
+    e.pubKeyOperator = {};
+    e.netAddress     = {};
+    e.netPort        = 0;
+    e.isValid        = false;
+    e.platformNodeID = uint160{};
 }
 
 } // namespace detail
@@ -195,14 +230,21 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
         e->keyIDVoting = pl.keyIDVoting;
-        // Operator-key change ⇒ ResetOperatorFields + ban, exactly as dashd's
-        // BuildNewListFromBlock: the masternode must re-announce service with a
-        // ProUpServTx before it is valid again.
-        if (e->pubKeyOperator != pl.pubKeyOperator) {
+        // Operator-key change (dashd compares the keys as CBLSLazyPublicKey —
+        // bytes under one scheme, points across schemes) ⇒ ResetOperatorFields
+        // + ban, then `nVersion = nVersion > BasicBLS ? nVersion :
+        // proTx.nVersion` (specialtxman.cpp RebuildListFromBlock), i.e. the
+        // payload's nVersion after the reset. The payload's key bytes are
+        // already in the scheme that nVersion dictates, which is now the
+        // leaf's. The masternode must re-announce service with a ProUpServTx.
+        if (detail::operator_key_changed(
+                e->pubKeyOperator,
+                e->nVersion < vendor::CSimplifiedMNListEntry::VER_BASIC_BLS,
+                pl.pubKeyOperator,
+                pl.nVersion < vendor::ProTxVersion::BASIC_BLS)) {
+            detail::reset_operator_fields(*e);
+            e->nVersion       = pl.nVersion;
             e->pubKeyOperator = pl.pubKeyOperator;
-            e->netAddress = {};
-            e->netPort    = 0;
-            e->isValid    = false;
         }
         return MnFoldOutcome::Applied;
     }
@@ -214,12 +256,9 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
             return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
-        // ResetOperatorFields + ban: operator key cleared, service cleared,
-        // isValid=false until a fresh ProUpRegTx(new key)+ProUpServTx pair.
-        e->pubKeyOperator = {};
-        e->netAddress = {};
-        e->netPort    = 0;
-        e->isValid    = false;
+        // ResetOperatorFields + ban (nVersion back to LegacyBLS): invalid
+        // until a fresh ProUpRegTx(new key) + ProUpServTx pair.
+        detail::reset_operator_fields(*e);
         return MnFoldOutcome::Applied;
     }
 
@@ -413,6 +452,7 @@ struct MnFoldOverlay
     std::set<uint256> removed;   ///< replaced by a ProRegTx, or collateral spent
     std::map<MnFoldContext::Outpoint, uint256, TxPrevOutLess> added_collateral;
     std::map<uint160, uint256>                   added_ids;
+    /// Operator keys added by this body, as the payload's wire bytes.
     std::map<MnFoldContext::OpKey, uint256>      added_opkeys;
     std::map<MnFoldContext::Service, uint256>    added_services;
 
@@ -678,6 +718,16 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
         if (!opkey_is_null(op_basic)
             && held_by_other(op_basic, ctx.unique().operator_keys, ov.added_opkeys, pl.proTxHash))
             return refuse("bad-protx-dup-key (pubKeyOperator held by another MN)");
+        // Only a key that CHANGES enters the unique-property map (UpdateMN);
+        // decide it on the evolving leaf, as the leaf apply below does.
+        bool key_changes = false;
+        for (const auto& e : list)
+            if (e.proRegTxHash == pl.proTxHash)
+                key_changes = detail::operator_key_changed(
+                    e.pubKeyOperator,
+                    e.nVersion < vendor::CSimplifiedMNListEntry::VER_BASIC_BLS,
+                    pl.pubKeyOperator,
+                    pl.nVersion < vendor::ProTxVersion::BASIC_BLS);
         if (apply_mn_special_tx_to_sml(list, tx) != MnFoldOutcome::Applied)
             return refuse("bad-protx-hash (leaf apply)");   // unreachable: checked above
         if (!opkey_is_null(op_basic)) ov.added_opkeys[op_basic] = pl.proTxHash;
