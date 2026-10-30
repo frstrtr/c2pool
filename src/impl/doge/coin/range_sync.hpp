@@ -477,7 +477,8 @@ private:
     /// (the last ranges of the schedule). A range whose peer has been silent
     /// for REQUEST_TIMEOUT goes to a peer with nothing in flight, without a
     /// strike: the slow peer may still answer, and the first exact answer is
-    /// stored. Live, fresh-anchored3 run 5: the last 13 ranges took more than
+    /// stored. The move counts as the old peer's timeout on the range, so a
+    /// range nobody serves ends in the fallback (VERIFY7 B1). Live, fresh-anchored3 run 5: the last 13 ranges took more than
     /// 8 minutes on slow peers while the others had nothing to do.
     void end_game_locked(const std::vector<std::string>& peers, Clock::time_point now,
                          const std::set<std::string>& avoid, std::vector<Request>& out)
@@ -496,20 +497,32 @@ private:
                 held.emplace_back(f.at, r);
         std::sort(held.begin(), held.end());
         for (const auto& [at, r] : held) {
+            // An idle peer, the one that timed out on this range least (every
+            // peer gets its turn: a range nobody serves is then concluded).
+            const auto rt = m_range_timeouts.find(r);
+            auto timeouts_of = [&](const std::string& p) -> uint32_t {
+                if (rt == m_range_timeouts.end())
+                    return 0;
+                auto it = rt->second.find(p);
+                return it == rt->second.end() ? 0 : it->second;
+            };
             std::string idle;
             for (int pass = 0; pass < 2 && idle.empty(); ++pass)
                 for (const auto& p : peers) {
                     if (!usable_locked(p, now) || (pass == 0 && avoid.count(p)))
                         continue;
                     auto ps = m_peers.find(p);
-                    if (ps == m_peers.end() || ps->second.inflight == 0) {
+                    if (ps != m_peers.end() && ps->second.inflight != 0)
+                        continue;
+                    if (idle.empty() || timeouts_of(p) < timeouts_of(idle))
                         idle = p;
-                        break;
-                    }
                 }
             if (idle.empty())
                 return;
             auto it = m_inflight.find(r);
+            // A move is its holder's timeout on the range: a range nobody
+            // serves (a wrong anchor) still reaches check_undeliverable_locked.
+            ++m_range_timeouts[r][it->second.peer];
             ++m_timeouts;
             release_locked(it);
             auto& ps = m_peers[idle];

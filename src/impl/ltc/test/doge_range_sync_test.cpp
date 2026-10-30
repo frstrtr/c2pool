@@ -1544,3 +1544,43 @@ TEST(DogeRangeSync, TheLastRangesGoToIdlePeers)
     EXPECT_LE(sec, 120) << "the last range waited on the slow peer";
     EXPECT_EQ(st.strikes, 0u);
 }
+
+// VERIFY7 B1 (the verifier's probe, kept as the KAT): a range nobody serves
+// (a wrong anchor) in the end game. Every 60 s the end game moved it to an
+// idle peer and recorded no timeout, so check_undeliverable_locked never
+// concluded and the schedule stayed Anchored: on 1d0b86698 the dead last range
+// and a dead middle range (the end game takes it once the other 99 are done)
+// were both still anchored after 2 hours, 117 moves. A move counts as its
+// holder's timeout on the range: two per usable peer, and the sequential sync
+// takes over.
+TEST(DogeRangeSync, ADeadRangeInTheEndGameFallsBack)
+{
+    for (const uint32_t dead : {99u, 50u}) {
+        constexpr uint32_t RANGES = 100;
+        const Chain c(RANGES * STEP);
+        TempStore s;
+        auto sched = open_schedule(s, c, RANGES * STEP);
+        RangeSync::Config cfg;
+        cfg.auxpow_height = 0;
+        RangeSync rs(*sched, c.anchors(RANGES * STEP), cfg);
+        const auto peers = v6_peers(6);
+        CappedLink link{100e6, 200e3, 1.6e6, {}, {}, 0};
+        auto t = t0();
+        int sec = 0;
+        for (; sec < 7200 && rs.mode() == Mode::Anchored; ++sec) {
+            t = t0() + std::chrono::seconds(sec);
+            for (const auto& r : rs.tick(peers, t))
+                if (r.range != dead)
+                    link.add(r);  // the dead range: silence from every peer
+            for (const auto& r : link.step())
+                rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+        }
+        const auto st = rs.stats(t);
+        std::cout << "  range " << dead << " of 100 unanswered, 6 peers at 200 KB/s: "
+                  << RangeSync::mode_name(rs.mode()) << " after " << sec << " s, timeouts " << st.timeouts
+                  << ", strikes " << st.strikes << "\n";
+        EXPECT_EQ(rs.mode(), Mode::SequentialFallback) << "range " << dead << ": the end game bounced it without end";
+        EXPECT_LE(sec, 1800) << "range " << dead;
+    }
+}
+
