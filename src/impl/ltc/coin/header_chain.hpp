@@ -483,28 +483,44 @@ public:
     /// With fast-sync (scrypt skipped for old headers), structural validation
     /// is microseconds per header, so large batches are fine.  Near the tip
     /// (scrypt active), each header takes ~20ms, so we use smaller batches.
+    /// A batch whose last header is known has nothing new (its headers are
+    /// that header's ancestors) and returns at once; a sub-batch that
+    /// accepted nothing ran no scrypt and is followed by no yield. Before, a
+    /// known 2,000-header batch at the tip slept 39 x 10 ms.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
+        if (headers.empty())
+            return 0;
+        const uint256 last_hash = block_hash(headers.back());
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_headers.count(last_hash))
+                return 0;
+        }
         uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
         // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
         size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
         int accepted = 0;
         PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
+            int sub_accepted = 0;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 size_t end = std::min(offset + BATCH_SIZE, headers.size());
                 for (size_t i = offset; i < end; ++i) {
                     if (add_header_internal(headers[i]))
-                        ++accepted;
+                        ++sub_accepted;
                 }
+                accepted += sub_accepted;
                 // Capture any pending tip change from this batch
                 if (m_pending_tip_change.fired)
                     last_ptc = m_pending_tip_change;
                 m_pending_tip_change.fired = false;
             }
             // Yield between batches so ioc-thread callers (get_height,
-            // is_synced, get_tip) can acquire the mutex.
-            if (offset + BATCH_SIZE < headers.size()) {
+            // is_synced, get_tip) can acquire the mutex. Only after a
+            // sub-batch that accepted headers: a run of known ones held the
+            // lock for look-ups only.
+            if (sub_accepted > 0 && offset + BATCH_SIZE < headers.size()) {
                 // Short yield during fast-sync (structural only), longer near tip (scrypt)
                 auto ms = (BATCH_SIZE >= 500) ? 1 : 10;
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
