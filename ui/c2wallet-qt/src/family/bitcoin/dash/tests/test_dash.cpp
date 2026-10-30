@@ -1832,6 +1832,34 @@ static void test_s2_k9_secret_hygiene()
     CHECK(clean, "no card, summary, manifest, hex file or error message contains a test secret");
 }
 
+// ── S2-F3 JSON nesting cap (VERIFY-S2 F3) ───────────────────────────────────
+
+static void test_s2_f3_json_depth()
+{
+    std::printf("[S2-F3 JSON nesting cap: hostile depth is refused by name, not a crash]\n");
+    const std::string deep_arr(200000, '[');
+    std::string deep_obj;
+    for (int i = 0; i < 100000; ++i) deep_obj += "{\"a\":";
+    mj::ParseResult a = mj::parse(deep_arr);
+    CHECK(!a.ok && contains(a.error, "too deep"), "200000 nested '[' -> \"nesting too deep\"");
+    mj::ParseResult o = mj::parse(deep_obj);
+    CHECK(!o.ok && contains(o.error, "too deep"), "100000 nested {\"a\": -> \"nesting too deep\"");
+    auto nest = [](int n) { return std::string(static_cast<size_t>(n), '[') + std::string(static_cast<size_t>(n), ']'); };
+    CHECK(mj::parse(nest(mj::kMaxNestingDepth)).ok, "64 levels parse");
+    CHECK(!mj::parse(nest(mj::kMaxNestingDepth + 1)).ok, "65 levels are refused");
+    // Through the model's two JSON inputs: the UTXO list and the keystore.
+    DashInjectModel m;
+    CHECK(aborts_with([&] { m.import_utxos(deep_arr, 1000); }, "too deep") && m.stage() == InjectStage::Empty,
+          "import refuses it by name");
+    CHECK(aborts_with([&] { m.import_utxos(deep_obj, 0); }, "too deep"), "import refuses a deep object too");
+    CHECK(aborts_with([&] { load_funding_key(key_of(KeySource::JsonKeystore, deep_obj), DUMMY_ADDR0, false); },
+                      "not valid JSON"),
+          "the keystore parser refuses it too");
+    CHECK(aborts_with([&] { load_funding_key(key_of(KeySource::JsonKeystore, deep_arr), DUMMY_ADDR0, false); },
+                      "not valid JSON"),
+          "the keystore parser refuses a deep array too");
+}
+
 // ── S2-K10 split knob ───────────────────────────────────────────────────────
 
 static void test_s2_k10_split()
@@ -2019,6 +2047,7 @@ int main(int argc, char** argv)
     test_s2_k8_collateral();
     test_s2_k9_secret_hygiene();
     test_s2_k10_split();
+    test_s2_f3_json_depth();
     test_s2_k13_relay_fee_mode();
     CHECK(kDefaultMinConf == kCoinbaseMaturity + 1, "S2-K11: kDefaultMinConf == kCoinbaseMaturity + 1 (also static_assert)");
 
