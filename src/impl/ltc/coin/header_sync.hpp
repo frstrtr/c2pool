@@ -18,7 +18,14 @@
 ///     is dropped on the IO thread (one hash, one look-up): never copied,
 ///     never queued;
 ///   - at most MAX_QUEUED batches wait for the header thread; more are
-///     dropped and counted (the poll asks again).
+///     dropped and counted (the poll asks again);
+///   - a block announcement the chain cannot place (an inv of an unknown
+///     block; a small headers announcement that does not connect, Core's
+///     HandleFewUnconnectingHeaders) asks its announcer at once, from the
+///     chain's locator: not while a getheaders to that peer is unanswered
+///     (2 min), at most every 2 s per peer, and while catching up only the
+///     first announcer of a block. Before, the DOGE tip moved only on the
+///     poll (0-60 s late) and an unconnecting LTC announcement asked nobody.
 /// Before (FRESH-NODE §2.1, §3): every full batch from any of 20 peers asked
 /// all 20 again; 22,500 duplicate 2,000-header batches (3.6 GB) arrived for
 /// a sync that needed 58, each copied into an unbounded queue: RSS 2.5 GB.
@@ -35,6 +42,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -88,6 +96,7 @@ struct HeaderSyncStats {
     std::atomic<uint64_t> pool_queued_max{0};
     std::atomic<uint64_t> getheaders_sent{0};     // getheaders messages (one per peer asked)
     std::atomic<uint64_t> getheaders_all{0};      // of them: rounds that asked every peer
+    std::atomic<uint64_t> announce_asks{0};       // of them: asks of a block's announcer
 
     nlohmann::json to_json() const
     {
@@ -102,6 +111,7 @@ struct HeaderSyncStats {
             {"hdr_pool_queued_max", v(pool_queued_max)},
             {"getheaders_sent", v(getheaders_sent)},
             {"getheaders_all", v(getheaders_all)},
+            {"announce_asks", v(announce_asks)},
         };
     }
 };
@@ -121,6 +131,14 @@ public:
     /// Synced, but no new header for this long: the poll asks every peer
     /// (at most once per STALE_TIP; LTC blocks come every 2.5 minutes).
     static constexpr std::chrono::minutes STALE_TIP{30};
+    /// Core HEADERS_RESPONSE_TIME: no second getheaders to a peer about an
+    /// announcement while one is unanswered.
+    static constexpr std::chrono::minutes RESPONSE_TIME{2};
+    /// A peer is asked about announcements at most this often (one whose
+    /// answers never connect cannot make us ask it in a loop).
+    static constexpr std::chrono::seconds ANNOUNCE_ASK_EVERY{2};
+    /// A headers message this small is an announcement (BIP 130).
+    static constexpr size_t ANNOUNCEMENT_MAX = 3;
 
     explicit HeaderSync(HeaderSyncHost host, std::string tag = "[EMB-LTC]")
         : m_host(std::move(host)), m_tag(std::move(tag))
@@ -134,6 +152,8 @@ public:
     void on_headers(const std::string& peer, const Headers& hdrs)
     {
         m_stats.batches_received.fetch_add(1, std::memory_order_relaxed);
+        if (auto a = m_announce_asks.find(peer); a != m_announce_asks.end())
+            a->second.unanswered = false;
         if (hdrs.empty())
             return;
         const uint256 last = block_hash(hdrs.back());
@@ -169,7 +189,10 @@ public:
                 LOG_WARNING << self->m_tag << " Header batch from " << peer << " failed: " << e.what();
             }
             self->done(last);
-            self->m_host.post_io([self, peer, accepted]() { self->after_batch(peer, accepted); });
+            const size_t size = batch->size();
+            self->m_host.post_io([self, peer, accepted, size, last]() {
+                self->after_batch(peer, accepted, size, last);
+            });
         });
     }
 
@@ -209,6 +232,36 @@ public:
     /// have (IO thread; the caller rate-limits): ask that peer.
     void on_unconnected(const std::string& peer) { ask(peer); }
 
+    /// `peer` announced `block` (IO thread): an inv, or a headers
+    /// announcement that does not connect. Nothing when the chain has it;
+    /// else a getheaders to that peer, from the chain's locator (Core: to
+    /// the announcer), unless one to it is unanswered (RESPONSE_TIME) or was
+    /// sent within ANNOUNCE_ASK_EVERY, and while catching up only for the
+    /// first announcer of a block.
+    void on_block_announced(const std::string& peer, const uint256& block)
+    {
+        if (peer.empty() || (!block.IsNull() && m_host.has_header(block)))
+            return;
+        const auto t = now();
+        auto it = m_announce_asks.find(peer);
+        if (it != m_announce_asks.end()
+            && ((it->second.unanswered && t - it->second.sent < RESPONSE_TIME)
+                || t - it->second.sent < ANNOUNCE_ASK_EVERY))
+            return;
+        if (!m_host.synced()) {
+            if (!block.IsNull() && block == m_last_announced)
+                return;
+            m_last_announced = block;
+        }
+        if (m_announce_asks.size() >= 512) {
+            for (auto a = m_announce_asks.begin(); a != m_announce_asks.end();)
+                a = t - a->second.sent >= RESPONSE_TIME ? m_announce_asks.erase(a) : std::next(a);
+        }
+        m_announce_asks[peer] = AnnounceAsk{t, true};
+        m_stats.announce_asks.fetch_add(1, std::memory_order_relaxed);
+        ask(peer);
+    }
+
     std::chrono::seconds poll_interval() const
     {
         return m_host.synced() ? POLL_SYNCED : POLL_CATCHING_UP;
@@ -221,10 +274,16 @@ private:
     Clock::time_point now() const { return m_host.now ? m_host.now() : Clock::now(); }
 
     /// IO thread, after the header thread took a batch from `peer`.
-    void after_batch(const std::string& peer, int accepted)
+    void after_batch(const std::string& peer, int accepted, size_t size, const uint256& last)
     {
-        if (accepted <= 0)
-            return;  // nothing new: ask nobody (Core: no getheaders on a batch it had)
+        if (accepted <= 0) {
+            // Nothing new: ask nobody (Core: no getheaders on a batch it had),
+            // unless it was an announcement that does not connect (its
+            // parent unknown): ask its announcer.
+            if (size > 0 && size <= ANNOUNCEMENT_MAX && !m_host.has_header(last))
+                on_block_announced(peer, last);
+            return;
+        }
         m_progress = true;
         m_last_new = now();
         if (m_host.accepted)
@@ -264,6 +323,12 @@ private:
     std::set<uint256> m_pending;  // last-header hashes of the queued batches
 
     // IO thread only.
+    struct AnnounceAsk {
+        Clock::time_point sent{};
+        bool              unanswered{false};
+    };
+    std::map<std::string, AnnounceAsk> m_announce_asks;  // peer -> its last announcement ask
+    uint256           m_last_announced;                  // catching up: the block that brought a peer in
     size_t            m_rr{0};
     bool              m_progress{false};   // new headers since the last poll
     Clock::time_point m_last_new{};        // the tip last moved (a new batch, or the height polled)

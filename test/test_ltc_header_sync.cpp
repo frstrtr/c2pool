@@ -43,6 +43,7 @@ std::vector<BlockHeaderType> make_batch(uint32_t first, size_t n)
 struct FakeLtcNet {
     static constexpr size_t PEERS = 20;
     std::set<uint256> known;
+    std::set<uint256> orphans;  // headers whose parent the chain lacks: refused
     std::vector<std::function<void()>> worker_q, io_q;
     bool synced = false;
     std::vector<std::string> one_asks;  // peers asked one at a time
@@ -64,9 +65,11 @@ struct FakeLtcNet {
         h.has_header = [this](const uint256& x) { return known.count(x) > 0; };
         h.add_headers = [this](const std::vector<BlockHeaderType>& b) {
             int n = 0;
-            for (const auto& hd : b)
-                if (known.insert(block_hash(hd)).second)
+            for (const auto& hd : b) {
+                const uint256 h = block_hash(hd);
+                if (!orphans.count(h) && known.insert(h).second)
                     ++n;
+            }
             return n;
         };
         h.post_worker = [this](std::function<void()> fn) { worker_q.push_back(std::move(fn)); };
@@ -226,4 +229,88 @@ TEST(LtcHeaderSync, TheSyncedPollAsksOnePeer)
         net.run();
     }
     EXPECT_EQ(net.all_rounds, 1u) << "a 40-minute stale tip";
+}
+
+
+// A BIP 130 announcement of N+1 while N was missed (every announcement of N
+// came while we reconnected): it does not connect, the chain refuses it.
+// Its announcer is asked for headers at once (Core:
+// HandleFewUnconnectingHeaders), at most every 2 s per peer. Before, nobody
+// was asked until the one-peer poll, up to a minute later.
+TEST(LtcHeaderSync, AnUnconnectingAnnouncementAsksItsAnnouncer)
+{
+    FakeLtcNet net;
+    net.synced = true;
+    auto sync = std::make_shared<HeaderSync>(net.host());
+    const auto ann = make_batch(500, 1);
+    net.orphans.insert(block_hash(ann.back()));
+    sync->on_headers("A", ann);
+    net.run();
+    ASSERT_EQ(net.one_asks.size(), 1u) << "the announcer was not asked";
+    EXPECT_EQ(net.one_asks[0], "A");
+    EXPECT_EQ(net.all_rounds, 0u);
+
+    // Its answer does not connect either (another announcement): not again
+    // within 2 s, again after.
+    net.clear_asks();
+    const auto ann2 = make_batch(600, 1);
+    net.orphans.insert(block_hash(ann2.back()));
+    sync->on_headers("A", ann2);
+    net.run();
+    EXPECT_EQ(net.getheaders(), 0u);
+    net.t += std::chrono::seconds(3);
+    const auto ann3 = make_batch(700, 1);
+    net.orphans.insert(block_hash(ann3.back()));
+    sync->on_headers("A", ann3);
+    net.run();
+    EXPECT_EQ(net.getheaders(), 1u);
+
+    // A full batch of nothing new is not an announcement: nobody.
+    net.clear_asks();
+    net.t += std::chrono::seconds(3);
+    auto full = make_batch(1000, 2000);
+    for (const auto& h : full)
+        net.orphans.insert(block_hash(h));
+    sync->on_headers("B", full);
+    net.run();
+    EXPECT_EQ(net.getheaders(), 0u);
+}
+
+// A block inv for a block the chain lacks (DOGE peers announce by inv): one
+// getheaders, to the announcer; not again while its answer is outstanding;
+// another announcer of it is asked too once synced, but while catching up
+// only the first announcer of a block. A known block asks nobody.
+TEST(LtcHeaderSync, ABlockAnnouncementAsksItsAnnouncer)
+{
+    FakeLtcNet net;
+    net.synced = true;
+    auto sync = std::make_shared<HeaderSync>(net.host());
+    const uint256 x = block_hash(make_batch(800, 1).back());
+    sync->on_block_announced("A", x);
+    ASSERT_EQ(net.one_asks.size(), 1u);
+    EXPECT_EQ(net.one_asks[0], "A");
+    net.t += std::chrono::seconds(5);
+    sync->on_block_announced("A", x);
+    EXPECT_EQ(net.one_asks.size(), 1u) << "asked again with an answer outstanding";
+    sync->on_block_announced("B", x);
+    EXPECT_EQ(net.one_asks.size(), 2u);
+    // A answers (any headers message): A may be asked again.
+    sync->on_headers("A", std::vector<BlockHeaderType>{});
+    sync->on_block_announced("A", x);
+    EXPECT_EQ(net.one_asks.size(), 3u);
+
+    net.know(make_batch(800, 1));
+    sync->on_block_announced("C", x);
+    EXPECT_EQ(net.one_asks.size(), 3u) << "asked about a block the chain has";
+
+    FakeLtcNet net2;  // catching up
+    auto sync2 = std::make_shared<HeaderSync>(net2.host());
+    const uint256 y = block_hash(make_batch(900, 1).back());
+    const uint256 z = block_hash(make_batch(901, 1).back());
+    sync2->on_block_announced("A", y);
+    sync2->on_block_announced("B", y);
+    EXPECT_EQ(net2.one_asks.size(), 1u) << "catching up: one announcer per block";
+    sync2->on_block_announced("B", z);
+    EXPECT_EQ(net2.one_asks.size(), 2u);
+    EXPECT_EQ(net2.all_rounds, 0u);
 }
