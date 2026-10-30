@@ -6758,7 +6758,10 @@ int main(int argc, char* argv[]) {
                                             + ". Exiting";
                                         LOG_ERROR << "[EMB-DOGE] " << msg;
                                         std::cerr << "c2pool: " << msg << std::endl;
-                                        std::exit(EXIT_FAILURE);
+                                        // _Exit, not exit: the PPLNS precompute thread and the
+                                        // header pool run; static destructors under them can
+                                        // turn status 1 into a crash (VERIFY8 C5).
+                                        std::_Exit(EXIT_FAILURE);
                                     }
                                     LOG_WARNING << "[EMB-DOGE] Full UTXO set at " << full_path
                                                 << " is held by another open (attempt " << attempt
