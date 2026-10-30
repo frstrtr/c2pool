@@ -3623,8 +3623,9 @@ private:
         const auto it = peers_.find(peer);
         return it != peers_.end() && !holds_tip(it->second.best_tip);
     }
-    // E-194 (vi): every HELLO tip held and the end of K_NCU waiting for the drain (frames in hand only).
-    bool drain_hold() const { return gate_applies() && !peers_.empty() && !hello_unheld() && !drain_done(); }
+    // E-194 (vi): every HELLO tip held and K_NCU not ended yet: its drain (E-193) not done, or the done test that ends
+    // it not run yet. The gate and the caught-up line read one state.
+    bool drain_hold() const { return gate_applies() && !peers_.empty() && !hello_unheld(); }
     // The verified winning headers' tip: not held, still winning against the best tip.
     bool win_open() const {
         if (!hp_win_) return false;
