@@ -1082,6 +1082,16 @@ public:
     /// and then re-requests a full diff. (Distinct from on_invalidate, which
     /// only drops tip-readiness and deliberately KEEPS the MN payee list.)
     void on_sml_reorg() {
+        // The mempool's recent-spent ring (external-collateral proof) holds
+        // the spends of every connected block; the ones the reorg
+        // disconnected are no longer chain spends. Forget them against the
+        // switched chain's height index; unwired (KAT / RPC posture) the
+        // ring is cleared, which only gives up proof.
+        if (const size_t n = m_state.mempool().forget_chain_spends_off_chain(
+                m_chain_hash_at_height_fn))
+            LOG_INFO << "[EMB-DASH] reorg: forgot the recorded spends of " << n
+                     << " block(s) no longer on the active chain"
+                        " (external-collateral proof)";
         m_state.sml().mnList.clear();
         m_state.qmgr().clear();
         m_have_mn_sml = false;
@@ -1422,7 +1432,10 @@ private:
         // service / platform id — and record the block's spent outpoints for
         // the external-collateral proof. Runs HERE, before apply_block,
         // because the collateral and operator-key rules read the PRE-block
-        // masternode list. Drop-only.
+        // masternode list. Drop-only. The spends are recorded under this
+        // block's height + hash so a reorg (on_sml_reorg) or a refusal below
+        // can forget them again.
+        const uint256 connected_hash = block_identity_hash(block);
         {
             const MnStateMachine& pre = std::as_const(m_state).mnstates();
             m_state.mempool().remove_protx_conflicts_for_block(
@@ -1439,7 +1452,8 @@ private:
                     return vendor::opkey_for_leaf(
                         it->second.pubKeyOperator,
                         it->second.nVersion < vendor::ProTxVersion::BASIC_BLS);
-                });
+                },
+                Mempool::ChainPos{height, connected_hash});
         }
 
         // E2 (independent credit-pool advance): fold THIS block's own credit-pool
@@ -1551,6 +1565,9 @@ private:
             LOG_WARNING << "[EMB-DASH] MN payee fold REFUSED block h=" << height
                         << ": " << r.refused
                         << " — dashd rejects it; not serving on it (demote)";
+            // Its spends are not chain spends: they must not prove an
+            // external collateral absent.
+            m_state.mempool().forget_chain_spends_of_block(connected_hash);
             demote();
             return r;
         }

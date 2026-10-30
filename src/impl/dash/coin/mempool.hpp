@@ -261,6 +261,67 @@ public:
     /// not covered (see IMPL-NOTES S2).
     static constexpr size_t kRecentSpentBlocks       = 100;
     static constexpr size_t kRecentSpentMaxOutpoints = 200'000;
+    /// Where a recorded block sits: its height and identity hash, so a reorg
+    /// can tell the blocks it disconnected from the ones still on the chain.
+    struct ChainPos {
+        uint32_t height{0};
+        uint256  hash;
+    };
+    /// Reorg undo for the spent ring: forget every recorded block that is no
+    /// longer on the active chain (`active_hash_at(height)` differs from the
+    /// recorded hash, or the height is above the new tip), and every block
+    /// recorded without a position. With no lookup the whole ring is cleared:
+    /// that only gives up proof (Unknown), it never refuses a valid ProRegTx.
+    /// Per-outpoint counts keep an outpoint the surviving chain also spent.
+    /// Returns the number of blocks forgotten. The lookup runs outside the
+    /// pool lock (it reads the header chain, which has its own).
+    size_t forget_chain_spends_off_chain(
+        const std::function<std::optional<uint256>(uint32_t)>& active_hash_at)
+    {
+        std::vector<ChainPos> held;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const auto& b : m_recent_chain_spend_blocks)
+                if (b.pos) held.push_back(*b.pos);
+        }
+        std::set<std::pair<uint32_t, uint256>> on_chain;
+        if (active_hash_at)
+            for (const auto& p : held)
+                if (const auto h = active_hash_at(p.height); h && *h == p.hash)
+                    on_chain.emplace(p.height, p.hash);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (auto it = m_recent_chain_spend_blocks.begin();
+             it != m_recent_chain_spend_blocks.end();) {
+            if (it->pos && on_chain.count({it->pos->height, it->pos->hash})) {
+                ++it;
+                continue;
+            }
+            it = drop_spend_block_locked(it);
+            ++n;
+        }
+        return n;
+    }
+    /// Forget one recorded block (the live lane refused it: dashd rejects
+    /// it, so its spends are not chain spends). Returns whether it was held.
+    bool forget_chain_spends_of_block(const uint256& block_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_recent_chain_spend_blocks.end();
+             it != m_recent_chain_spend_blocks.begin();) {
+            --it;
+            if (it->pos && it->pos->hash == block_hash) {
+                drop_spend_block_locked(it);
+                return true;
+            }
+        }
+        return false;
+    }
+    size_t recent_chain_spend_blocks() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_recent_chain_spend_blocks.size();
+    }
     CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
                                ::core::coin::Coin& out) const
     {
@@ -1084,13 +1145,17 @@ public:
     ///      Unknown MN or no `pre_block_operator_key` ⇒ evicted. Also evicts
     ///      pool ProRegTx/ProUpRegTx with the same pubKeyOperator.
     ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
-    /// It also records the block's spent outpoints for prove_chain_coin (S2).
+    /// It also records the block's spent outpoints for prove_chain_coin (S2),
+    /// under `at` (height + hash) so a reorg can forget them again
+    /// (forget_chain_spends_off_chain); a block recorded without a position
+    /// is forgotten on any reorg.
     /// Drop-only: a false eviction costs that tx's fee, never a block.
     /// Returns the number of pool txs evicted.
     size_t remove_protx_conflicts_for_block(
         const dash::coin::BlockType& block,
         const CollateralOwnerFn& pre_block_collateral_owner,
-        const PreBlockOperatorKeyFn& pre_block_operator_key = {})
+        const PreBlockOperatorKeyFn& pre_block_operator_key = {},
+        const std::optional<ChainPos>& at = std::nullopt)
     {
         using bitcoin_family::coin::TxPrevOut;
         using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
@@ -1107,7 +1172,7 @@ public:
         };
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        record_chain_spends_locked(block);
+        record_chain_spends_locked(block, at);
 
         // Index the pool's provider txs once (special txs are rare).
         struct PoolProTx {
@@ -2587,32 +2652,45 @@ private:
         remove_tx_locked(txid);
     }
 
-    // S2: outpoints spent by the last kRecentSpentBlocks connected blocks
-    // (count per outpoint so a reorg re-spend never drops protection early).
-    std::map<std::pair<uint256, uint32_t>, uint32_t>        m_recent_chain_spends;
-    std::deque<std::vector<std::pair<uint256, uint32_t>>>  m_recent_chain_spend_blocks;
-    size_t                                                 m_recent_chain_spend_count{0};
+    // S2: outpoints spent by the last kRecentSpentBlocks connected blocks, in
+    // connect order (count per outpoint so forgetting one block never drops
+    // an outpoint another recorded block also spent).
+    struct RecentSpendBlock {
+        std::optional<ChainPos>                    pos;
+        std::vector<std::pair<uint256, uint32_t>>  spent;
+    };
+    using RecentSpendBlocks = std::deque<RecentSpendBlock>;
+    std::map<std::pair<uint256, uint32_t>, uint32_t>  m_recent_chain_spends;
+    RecentSpendBlocks                                 m_recent_chain_spend_blocks;
+    size_t                                            m_recent_chain_spend_count{0};
 
-    void record_chain_spends_locked(const dash::coin::BlockType& block)
+    void record_chain_spends_locked(const dash::coin::BlockType& block,
+                                    const std::optional<ChainPos>& at)
     {
-        std::vector<std::pair<uint256, uint32_t>> spent;
+        RecentSpendBlock rec;
+        rec.pos = at;
         for (size_t i = 1; i < block.m_txs.size(); ++i)   // the coinbase spends nothing
             for (const auto& in : block.m_txs[i].vin)
-                spent.emplace_back(in.prevout.hash, in.prevout.index);
-        for (const auto& op : spent) ++m_recent_chain_spends[op];
-        m_recent_chain_spend_count += spent.size();
-        m_recent_chain_spend_blocks.push_back(std::move(spent));
+                rec.spent.emplace_back(in.prevout.hash, in.prevout.index);
+        for (const auto& op : rec.spent) ++m_recent_chain_spends[op];
+        m_recent_chain_spend_count += rec.spent.size();
+        m_recent_chain_spend_blocks.push_back(std::move(rec));
         while (!m_recent_chain_spend_blocks.empty()
                && (m_recent_chain_spend_blocks.size() > kRecentSpentBlocks
-                   || m_recent_chain_spend_count > kRecentSpentMaxOutpoints)) {
-            for (const auto& op : m_recent_chain_spend_blocks.front()) {
-                auto it = m_recent_chain_spends.find(op);
-                if (it != m_recent_chain_spends.end() && --it->second == 0)
-                    m_recent_chain_spends.erase(it);
-            }
-            m_recent_chain_spend_count -= m_recent_chain_spend_blocks.front().size();
-            m_recent_chain_spend_blocks.pop_front();
+                   || m_recent_chain_spend_count > kRecentSpentMaxOutpoints))
+            drop_spend_block_locked(m_recent_chain_spend_blocks.begin());
+    }
+
+    RecentSpendBlocks::iterator
+    drop_spend_block_locked(RecentSpendBlocks::iterator blk)
+    {
+        for (const auto& op : blk->spent) {
+            auto it = m_recent_chain_spends.find(op);
+            if (it != m_recent_chain_spends.end() && --it->second == 0)
+                m_recent_chain_spends.erase(it);
         }
+        m_recent_chain_spend_count -= blk->spent.size();
+        return m_recent_chain_spend_blocks.erase(blk);
     }
 
     void remove_tx_locked(const uint256& txid)

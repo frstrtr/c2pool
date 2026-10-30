@@ -365,3 +365,70 @@ TEST(DashMempool, RecentlySpentOutpointsAreProvenAbsent)
     EXPECT_EQ(mp.prove_chain_coin(::core::coin::Outpoint(c.hash, c.index), coin),
               Mempool::CoinProof::Unknown) << "the proof covers the last kRecentSpentBlocks blocks";
 }
+
+// A reorg takes back the spends of the blocks it disconnected: a ProRegTx
+// naming such an outpoint as external collateral is dashd-valid on the new
+// chain and must not be refused on the old chain's word. An outpoint the
+// surviving chain spends as well stays proven.
+TEST(DashMempool, ReorgForgetsTheSpendsOfDisconnectedBlocks)
+{
+    auto spend_of = [](const TxPrevOut& op, uint32_t salt) {
+        MutableTransaction tx;
+        tx.version = 2;
+        tx.locktime = salt;
+        bitcoin_family::coin::TxIn in;
+        in.prevout = op; in.sequence = 0xFFFFFFFFu;
+        tx.vin.push_back(in);
+        bitcoin_family::coin::TxOut out; out.value = 5; out.scriptPubKey.m_data = {0x51};
+        tx.vout.push_back(out);
+        return tx;
+    };
+    auto proof = [](const Mempool& mp, const TxPrevOut& op) {
+        ::core::coin::Coin coin;
+        return mp.prove_chain_coin(::core::coin::Outpoint(op.hash, op.index), coin);
+    };
+    using Proof = Mempool::CoinProof;
+    const TxPrevOut kept = outpoint(0xD1), orphaned = outpoint(0xD2), both = outpoint(0xD3);
+    const uint256 h100 = h256(0x60), a101 = h256(0x61), b101 = h256(0x62);
+
+    Mempool mp;
+    mp.remove_protx_conflicts_for_block(block_of({spend_of(kept, 1)}), owners({}), {},
+                                        Mempool::ChainPos{100, h100});
+    mp.remove_protx_conflicts_for_block(
+        block_of({spend_of(orphaned, 2), spend_of(both, 3)}), owners({}), {},
+        Mempool::ChainPos{101, a101});
+    mp.remove_protx_conflicts_for_block(block_of({spend_of(both, 4)}), owners({}), {},
+                                        Mempool::ChainPos{101, b101});
+    EXPECT_EQ(proof(mp, kept), Proof::Absent);
+    EXPECT_EQ(proof(mp, orphaned), Proof::Absent);
+    EXPECT_EQ(proof(mp, both), Proof::Absent);
+
+    // The active chain after the reorg: 100 -> h100, 101 -> b101, nothing above.
+    auto active = [&](uint32_t h) -> std::optional<uint256> {
+        if (h == 100) return h100;
+        if (h == 101) return b101;
+        return std::nullopt;
+    };
+    EXPECT_EQ(mp.forget_chain_spends_off_chain(active), 1u);
+    EXPECT_EQ(mp.recent_chain_spend_blocks(), 2u);
+    EXPECT_EQ(proof(mp, kept), Proof::Absent);
+    EXPECT_EQ(proof(mp, orphaned), Proof::Unknown) << "spent only by the disconnected block";
+    EXPECT_EQ(proof(mp, both), Proof::Absent) << "the surviving chain spends it too";
+
+    // A block recorded without a position is forgotten on any reorg, and
+    // with no chain lookup the whole ring goes (proof given up, never a
+    // false refusal).
+    mp.remove_protx_conflicts_for_block(block_of({spend_of(orphaned, 5)}), owners({}));
+    EXPECT_EQ(mp.forget_chain_spends_off_chain(active), 1u);
+    EXPECT_EQ(proof(mp, orphaned), Proof::Unknown);
+    EXPECT_EQ(mp.forget_chain_spends_off_chain({}), 2u);
+    EXPECT_EQ(proof(mp, kept), Proof::Unknown);
+    EXPECT_EQ(proof(mp, both), Proof::Unknown);
+
+    // A block the live lane refused is forgotten by hash.
+    mp.remove_protx_conflicts_for_block(block_of({spend_of(kept, 6)}), owners({}), {},
+                                        Mempool::ChainPos{102, h256(0x63)});
+    EXPECT_FALSE(mp.forget_chain_spends_of_block(h256(0x64)));
+    EXPECT_TRUE(mp.forget_chain_spends_of_block(h256(0x63)));
+    EXPECT_EQ(proof(mp, kept), Proof::Unknown);
+}
