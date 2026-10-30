@@ -1584,3 +1584,40 @@ TEST(DogeRangeSync, ADeadRangeInTheEndGameFallsBack)
     }
 }
 
+// VERIFY8 C1 (the verifier's probe Verify8_ADeadRangeWithAStaticAvoidSet,
+// kept as the KAT): the dead range of ADeadRangeInTheEndGameFallsBack with
+// two peers to avoid (the header chain's sync peer, a body peer). The end
+// game always found an idle peer outside the avoid set, so p0 and p1 never
+// took the range, and check_undeliverable_locked (every connected peer twice)
+// never concluded: on d5b5f8f44 anchored after 7,200 s, 116 moves. The avoided
+// peers now compete once the best other peer has timed out on it twice.
+TEST(DogeRangeSync, ADeadRangeReachesTheAvoidedPeersToo)
+{
+    constexpr uint32_t RANGES = 100, dead = 50;
+    const Chain c(RANGES * STEP);
+    TempStore s;
+    auto sched = open_schedule(s, c, RANGES * STEP);
+    RangeSync::Config cfg;
+    cfg.auxpow_height = 0;
+    RangeSync rs(*sched, c.anchors(RANGES * STEP), cfg);
+    const auto peers = v6_peers(6);
+    const std::set<std::string> avoid{peers[0], peers[1]};
+    CappedLink link{100e6, 200e3, 1.6e6, {}, {}, 0};
+    auto t = t0();
+    int sec = 0;
+    for (; sec < 7200 && rs.mode() == Mode::Anchored; ++sec) {
+        t = t0() + std::chrono::seconds(sec);
+        for (const auto& r : rs.tick(peers, t, avoid))
+            if (r.range != dead)
+                link.add(r);  // the dead range: silence from every peer
+        for (const auto& r : link.step())
+            rs.on_headers(r.peer, c.answer(r.locator, r.stop), t);
+    }
+    const auto st = rs.stats(t);
+    std::cout << "  dead range 50, 6 peers, avoid={p0,p1}: " << RangeSync::mode_name(rs.mode()) << " after " << sec
+              << " s, timeouts " << st.timeouts << ", strikes " << st.strikes << "\n";
+    EXPECT_EQ(rs.mode(), Mode::SequentialFallback) << "a static avoid set kept the end game bouncing";
+    EXPECT_LE(sec, 1800);
+    EXPECT_EQ(st.strikes, 0u);
+}
+

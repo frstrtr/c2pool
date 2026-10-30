@@ -506,8 +506,12 @@ private:
                 auto it = rt->second.find(p);
                 return it == rt->second.end() ? 0 : it->second;
             };
+            // Peers to avoid (the header chain's, the block downloads') take
+            // it only when no other is idle, or once the best other one has
+            // timed out on it twice: check_undeliverable_locked needs every
+            // connected peer twice, the avoided ones too (VERIFY8 C1).
             std::string idle;
-            for (int pass = 0; pass < 2 && idle.empty(); ++pass)
+            for (int pass = 0; pass < 2 && (idle.empty() || timeouts_of(idle) >= 2); ++pass)
                 for (const auto& p : peers) {
                     if (!usable_locked(p, now) || (pass == 0 && avoid.count(p)))
                         continue;
