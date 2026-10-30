@@ -2585,7 +2585,8 @@ int main(int argc, char* argv[]) {
                     };
                     dh.request_all = [chain, bcaster](uint32_t h) {
                         if (auto e = chain->get_header_by_height(h))
-                            bcaster->request_full_block(e->block_hash);
+                            bcaster->request_full_block_peers(
+                                e->block_hash, core::coin::block_request_services(chain->height(), h));
                     };
                     ltc_dl = std::make_shared<core::coin::BlockDownload>(
                         std::move(dh), "[EMB-LTC] Bootstrap:", 64u * 1024 * 1024);
@@ -2602,7 +2603,8 @@ int main(int argc, char* argv[]) {
                         }
                         auto e = chain->get_header_by_height(h);
                         if (e && bcaster)
-                            bcaster->request_full_block(e->block_hash);
+                            bcaster->request_full_block_peers(
+                                e->block_hash, core::coin::block_request_services(chain->height(), h));
                     });
 
                 // Bring the UTXO set back onto the best chain: walk its best back by
@@ -3482,7 +3484,9 @@ int main(int argc, char* argv[]) {
                                         const bool all = utxo_catchup->tries >= 3;
                                         if (all || !bcaster->request_full_block_targeted(
                                                        e->block_hash, (*mweb_fetch_rr)++))
-                                            bcaster->request_full_block(e->block_hash);
+                                            bcaster->request_full_block_peers(
+                                                e->block_hash,
+                                                core::coin::block_request_services(tip->height, best + 1));
                                         LOG_INFO << "[EMB-LTC] UTXO behind the tip (h=" << best
                                                  << ", tip h=" << tip->height << ") — requesting h="
                                                  << best + 1 << (all ? " from all peers" : "");
@@ -7035,7 +7039,8 @@ int main(int argc, char* argv[]) {
                                     };
                                     dh.request_all = [chain, bc](uint32_t h) {
                                         if (auto e = chain->get_header_by_height(h))
-                                            bc->request_full_block(e->block_hash);
+                                            bc->request_full_block_peers(
+                                                e->block_hash, core::coin::block_request_services(chain->height(), h));
                                     };
                                     doge_dl = std::make_shared<core::coin::BlockDownload>(
                                         std::move(dh), "[EMB-DOGE] Bootstrap:");
@@ -7091,7 +7096,8 @@ int main(int argc, char* argv[]) {
                                     };
                                     ch.ask_all = [chain, bc](uint32_t h) {
                                         if (auto e = chain->get_header_by_height(h))
-                                            bc->request_full_block(e->block_hash);
+                                            bc->request_full_block_peers(
+                                                e->block_hash, core::coin::block_request_services(chain->height(), h));
                                     };
                                     doge_cold = std::make_shared<ltc::coin::AccrualColdStart<ltc::coin::BlockType>>(
                                         *doge_bs, *doge_dl, core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1, std::move(ch));

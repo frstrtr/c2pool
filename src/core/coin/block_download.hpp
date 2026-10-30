@@ -57,6 +57,23 @@
 namespace core {
 namespace coin {
 
+/// Core NODE_NETWORK_LIMITED_MIN_BLOCKS: a pruned peer (NODE_NETWORK_LIMITED,
+/// no NODE_NETWORK) serves only about the last 288 blocks and disconnects a
+/// peer that asks it for a deeper one (net_processing.cpp
+/// ProcessGetBlockData).
+constexpr uint32_t NODE_NETWORK_LIMITED_BLOCKS = 288;
+constexpr uint64_t SERVICE_NODE_NETWORK = 1;
+
+/// The services a peer must advertise to be asked for the block at height
+/// h with the tip at `tip`: NODE_NETWORK when h is deeper than
+/// NODE_NETWORK_LIMITED_BLOCKS below the tip, none otherwise. For the
+/// requests that go to every peer (a third stall, a catch-up's fourth try):
+/// the one-peer downloads already ask NODE_NETWORK peers first.
+inline uint64_t block_request_services(uint32_t tip, uint32_t h)
+{
+    return (tip > h && tip - h > NODE_NETWORK_LIMITED_BLOCKS) ? SERVICE_NODE_NETWORK : 0;
+}
+
 class BlockDownload {
 public:
     using Clock = std::chrono::steady_clock;

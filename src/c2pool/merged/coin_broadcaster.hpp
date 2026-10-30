@@ -434,6 +434,29 @@ public:
         }
     }
 
+    /// Request a full block from every peer with a completed handshake that
+    /// advertises every bit of `services` (0: every peer), e.g. NODE_NETWORK
+    /// for a block a pruned peer would drop us for asking.
+    void request_full_block_peers(const uint256& block_hash, uint64_t services)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int sent = 0;
+        for (auto& [key, peer] : m_peers) {
+            if (!peer || !peer->node_p2p.is_handshake_complete()
+                || (peer->node_p2p.peer_services() & services) != services)
+                continue;
+            try {
+                peer->node_p2p.request_full_block(block_hash);
+                ++sent;
+            } catch (...) {}
+        }
+        if (sent > 0) {
+            LOG_INFO << "[" << m_symbol << "] Full block requested from "
+                     << sent << " peer(s)" << (services ? " (NODE_NETWORK)" : "") << ": "
+                     << block_hash.GetHex().substr(0, 16) << "...";
+        }
+    }
+
     /// Request a full block from ONE specific peer (for bootstrap pipeline).
     /// Uses round-robin index: peer_idx % (peers with a completed handshake)
     /// selects the target, so a slot that is still dialing never eats the

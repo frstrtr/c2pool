@@ -249,3 +249,18 @@ TEST(BlockDownload, HalfThePeersKeepDownloading)
     EXPECT_GE(dl.stats().peers_used.load(), 10u);
     EXPECT_GT(net.asked.size(), before);
 }
+
+// A request to every peer (a third stall, a catch-up's fourth try) for a
+// block deeper than 288 below the tip goes to NODE_NETWORK peers only: a
+// pruned (NODE_NETWORK_LIMITED) Core peer disconnects a peer that asks it
+// for one (the LTC cold start reaches 4,320 deep).
+TEST(BlockDownload, ADeepHeightIsAskedOfFullNodesOnly)
+{
+    using core::coin::block_request_services;
+    using core::coin::SERVICE_NODE_NETWORK;
+    EXPECT_EQ(block_request_services(1000, 1000), 0u);
+    EXPECT_EQ(block_request_services(1000, 712), 0u) << "288 deep: a pruned peer serves it";
+    EXPECT_EQ(block_request_services(1000, 711), SERVICE_NODE_NETWORK);
+    EXPECT_EQ(block_request_services(3204353, 3200034), SERVICE_NODE_NETWORK);
+    EXPECT_EQ(block_request_services(100, 200), 0u) << "above the tip";
+}
