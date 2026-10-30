@@ -2,6 +2,7 @@
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
 #include "address_utils.hpp"    // address utilities
+#include "stratum_username.hpp"  // pure login-field parsers
 
 #include <core/hash.hpp>
 #include <core/target_utils.hpp>
@@ -658,36 +659,21 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
         // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
-        {
-            auto plus_pos = username_.rfind('+');
-            if (plus_pos != std::string::npos && plus_pos + 1 < username_.size()) {
-                std::string diff_str = username_.substr(plus_pos + 1);
-                try {
-                    double fixed_diff = std::stod(diff_str);
-                    if (fixed_diff > 0.0) {
-                        suggested_difficulty_ = fixed_diff;
-                        hashrate_tracker_.set_difficulty_hint(fixed_diff);
-                        LOG_INFO << "[Stratum] Fixed difficulty from username: " << fixed_diff;
-                    }
-                } catch (...) {}
-                username_ = username_.substr(0, plus_pos);
-            }
+        // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
+        // accepts inf/nan, so a bare "> 0" check let "+inf" through).
+        if (auto fixed_diff = stratum_username::strip_fixed_diff_suffix(username_)) {
+            suggested_difficulty_ = *fixed_diff;
+            hashrate_tracker_.set_difficulty_hint(*fixed_diff);
+            LOG_INFO << "[Stratum] Fixed difficulty from username: " << *fixed_diff;
         }
 
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
         // Worker name is always AFTER the last address, so strip from the end.
-        auto dot_pos = username_.rfind('.');
-        if (dot_pos != std::string::npos && dot_pos > 20) {
-            worker_name_ = username_.substr(dot_pos + 1);
-            username_ = username_.substr(0, dot_pos);
-        }
-        auto underscore_pos = username_.rfind('_');
-        if (underscore_pos != std::string::npos && underscore_pos > 20) {
-            if (worker_name_.empty())
-                worker_name_ = username_.substr(underscore_pos + 1);
-            username_ = username_.substr(0, underscore_pos);
-        }
+        // A dot inside a valid "/<diff>" tail is not a worker, and only the
+        // ".worker" segment is cut, so "ADDR/1.5" and "ADDR.rig/1024" keep their diff.
+        if (auto worker = stratum_username::strip_worker_suffix(username_); !worker.empty())
+            worker_name_ = std::move(worker);
 
         // ─── Step 3: Parse multi-chain addresses ───
         // Supported separator formats for merged mining addresses:
@@ -2220,6 +2206,8 @@ void StratumSession::drop_stale(const char* reason)
 // Parse multi-chain addresses from username string.
 // Tries multiple separator formats for maximum miner compatibility:
 //   1. Slash+colon: "LTC_ADDR/98:DOGE_ADDR"  (explicit chain ID)
+//      A colon-less numeric slash token ("ADDR/1024") is the per-miner share
+//      difficulty -> share_difficulty_override_.
 //   2. Comma:       "LTC_ADDR,DOGE_ADDR"      (standard)
 //   3. Pipe:        "LTC_ADDR|DOGE_ADDR"       (Vnish firmware)
 //   4. Semicolon:   "LTC_ADDR;DOGE_ADDR"       (alternative)
@@ -2229,21 +2217,14 @@ void StratumSession::drop_stale(const char* reason)
 // Simple formats extract merged_addr_raw for chain auto-detection.
 void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw)
 {
-    // Priority 1: Slash format with explicit chain IDs
-    auto slash_pos = username.find('/');
-    if (slash_pos != std::string::npos) {
-        std::string remainder = username.substr(slash_pos + 1);
-        username = username.substr(0, slash_pos);
-        std::istringstream ss(remainder);
-        std::string token;
-        while (std::getline(ss, token, '/')) {
-            auto colon = token.find(':');
-            if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
-                try {
-                    uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
-                    merged_addresses_[chain_id] = token.substr(colon + 1);
-                } catch (...) {}
-            }
+    // Priority 1: Slash format with explicit chain IDs and/or "/<share_diff>"
+    auto slash = stratum_username::parse_slash_tokens(username);
+    if (slash.had_slash) {
+        for (auto& [chain_id, addr] : slash.merged_addresses)
+            merged_addresses_[chain_id] = std::move(addr);
+        if (slash.share_diff) {
+            share_difficulty_override_ = slash.share_diff;
+            LOG_INFO << "[Stratum] Share difficulty from username: " << *slash.share_diff;
         }
         return;
     }

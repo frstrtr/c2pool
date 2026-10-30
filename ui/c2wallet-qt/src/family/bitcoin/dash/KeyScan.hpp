@@ -22,9 +22,22 @@ namespace c2w::dash {
 
 struct FoundKey {
     secure::SecureBytes priv;   // 32-byte scalar, zeroized on destruction
-    std::vector<uint8_t> pub;   // 33-byte compressed pubkey (public)
-    std::string path;           // e.g. "m/44'/5'/0'/0/2"
+    std::vector<uint8_t> pub;   // 33-byte compressed pubkey, or 65 bytes when !compressed (public)
+    std::string path;           // e.g. "m/44'/5'/0'/0/2"; " (uncompressed)" appended when !compressed
     std::string address;        // the matched funding address (== requested)
+    bool compressed = true;     // which pubkey encoding hashes to the address
+};
+
+// The wider scan of the reference c2wallet.py find_key: accounts 0..accounts-1,
+// the external chain (and the internal one when scan_internal), indices
+// 0..indices-1, and at every index the compressed pubkey first, then the
+// uncompressed one when try_uncompressed (old p2pool-era keys were often
+// uncompressed). The defaults are the reference tool's.
+struct KeyScanRange {
+    uint32_t accounts = 2;
+    uint32_t indices = 50;
+    bool scan_internal = true;
+    bool try_uncompressed = true;
 };
 
 // Scan m/44'/{5|1}'/account'/{0[,1]}/i (external chain always; internal chain
@@ -42,5 +55,14 @@ FoundKey find_key_for_address(const std::string& mnemonic,
                               uint32_t account,
                               uint32_t scan_limit,
                               bool scan_internal);
+
+// The same scan over a KeyScanRange (python find_key parity): the order is
+// account, then chain, then index, then compressed before uncompressed. The
+// same double-check and hard-abort rules apply; the abort names the range.
+FoundKey find_key_for_address(const std::string& mnemonic,
+                              const std::string& passphrase,
+                              const std::string& address,
+                              bool testnet,
+                              const KeyScanRange& range);
 
 } // namespace c2w::dash

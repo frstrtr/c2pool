@@ -1542,6 +1542,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
     std::optional<pb::PathbNode::PruneFloors> floors_now;  // the floors of the last prune step that computed them
     std::uint64_t last_rows_recorded = rows.recorded();
     const auto mono_s = []() { return pb::RelayClock::system().mono_ms() / 1000; };
+    const auto wall_ms = []() { return pb::RelayClock::system().wall_ms(); };
     const std::uint64_t t0 = mono_s();
 
     struct NodeView {
@@ -1825,6 +1826,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 while (found_web.size() > 64) found_web.pop_back();
             }
         }
+        std::fflush(stdout);  // the pass's log lines
         if (now >= last_save_s + save_every_s) {
             last_save_s = now;
             std::string w;
@@ -1834,6 +1836,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
         if (cfg.status_every_s != 0 && now >= last_status_s + cfg.status_every_s) {
             last_status_s = now;
             const auto tipm = nn->index().tip();
+            const std::uint64_t status_t_ms = wall_ms();
             std::printf("status: up=%llus monero=%llu best pos=%llu id=%s cum_work=%s epoch=%u H_hold=%llu "
                         "window_root=%s mmr_root=%s leaves=%llu pending=%zu deferred=%zu re-pended(last switch)=%llu "
                         "lost(last switch)=%llu switches=%llu template=%s%s%s templates=%llu\n",
@@ -1847,6 +1850,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(nv.sw.last_repended), static_cast<unsigned long long>(nv.sw.last_lost),
                         static_cast<unsigned long long>(nv.sw.switches), template_status_name(tstatus),
                         tstatus_why.empty() ? "" : " ", tstatus_why.c_str(), static_cast<unsigned long long>(templates));
+            std::printf("%s\n", pb::status_time_line(status_t_ms).c_str());
             if (nv.poisoned || fork_fuse || template_kept || nv.coinbase_internal != 0 || nv.hold.hold)
                 std::printf("  ALARM:%s%s%s%s%s\n", nv.poisoned ? " store-poisoned(no template; the joiner path at the next start)" : "",
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",

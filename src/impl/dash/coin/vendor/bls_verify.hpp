@@ -169,6 +169,35 @@ bool verify_govvote_operator_sig(
     const uint256& digest,
     const std::vector<uint8_t>& vch_sig);
 
+// ── B.9: ProUpServTx / ProUpRevTx operator-signature verify ─────────────────
+//
+// dashd CheckProUpServTx / CheckProUpRevTx (evo/specialtxman.cpp @ v23.1.9):
+//     CheckHashSig(*opt_ptx, dmn->pdmnState->pubKeyOperator.Get(), state)
+//       => proTx.sig.VerifyInsecure(pubKey, ::SerializeHash(proTx))
+// against the operator key of the masternode in the PRE-block list. Fail
+// => bad-protx-sig, the whole block is invalid. The two axes, as dashd reads
+// them:
+//   * the 96-byte `sig` is DESERIALIZED per the payload version
+//     (CBLSSignatureVersionWrapper, legacy iff nVersion == LegacyBLS) — the
+//     stream path resets a sig that is only canonical under the OTHER scheme,
+//     so there is no fallback: `sig_legacy` decodes, nothing else does;
+//   * the verify runs under the network's scheme (bls_legacy_scheme, BASIC
+//     since V19) — BasicSchemeMPL, like verify_govvote_operator_sig.
+// The operator key is the stored key; its wire encoding follows the entry
+// version (legacy iff nVersion < BasicBLS) with the other encoding as a
+// fallback, exactly the govvote pubkey axis (dashd hands VerifyInsecure an
+// already-decoded point; a forged sig verifies under no encoding).
+// `sign_hash` is vendor::protx_operator_sign_hash(payload).
+//
+// FAIL-CLOSED: false when the BLS backend is absent, the key is null or fails
+// to decode, the sig fails to decode, or the verify fails. Never throws.
+bool verify_protx_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme,
+    const uint256& sign_hash,
+    const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig,
+    bool sig_legacy_scheme);
+
 // ── ChainLock recovered-threshold-signature verify ──────────────────────────
 //
 // dashcore llmq::VerifyRecoveredSig's final step (src/llmq/quorumsman.cpp:749-751):
@@ -302,6 +331,42 @@ opkey_for_leaf(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& sto
         } catch (...) { /* try the other scheme */ }
     }
     return stored_basic;
+#endif
+}
+
+// dashd keys its masternode unique-property map (and the mempool's
+// mapProTxBlsPubKeyHashes) by the operator key's BYTES under the scheme its
+// holder read it with — legacy iff the holder's nVersion < BasicBLS
+// (CBLSLazyWrapper::Serialize / GetHash, bls/bls.h) — never by point. For a
+// LEGACY holder whose key we store as canonical basic B(P), "the holder's
+// bytes equal `wire`" is L(P) == wire, i.e. `wire` is the CANONICAL legacy
+// encoding of P. This returns B(P) for that P — the basic bytes of the point
+// `wire` canonically encodes under the LEGACY scheme — so a store compare
+// replaces one opkey_for_leaf per holder with one decode per ProTx. nullopt
+// when `wire` is not a canonical legacy encoding (no legacy holder can then
+// match). Without the BLS backend the store holds the raw bytes, so this is
+// the identity.
+inline std::optional<std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>>
+opkey_legacy_wire_to_basic(const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& wire)
+{
+#ifndef C2POOL_DASH_BLS
+    return wire;
+#else
+    try {
+        bls::G1Element e = bls::G1Element::FromBytes(
+            bls::Bytes(wire.data(), wire.size()), /*fLegacy=*/true);
+        if (!e.IsValid()) return std::nullopt;
+        const std::vector<uint8_t> legacy = e.Serialize(/*fLegacy=*/true);
+        if (legacy.size() != wire.size()
+            || !std::equal(legacy.begin(), legacy.end(), wire.begin()))
+            return std::nullopt;   // decodes, but not the canonical legacy bytes
+        const std::vector<uint8_t> basic = e.Serialize(/*fLegacy=*/false);
+        std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE> out{};
+        std::copy_n(basic.begin(), std::min(basic.size(), out.size()), out.begin());
+        return out;
+    } catch (...) {
+        return std::nullopt;
+    }
 #endif
 }
 

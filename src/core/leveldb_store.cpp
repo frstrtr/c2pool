@@ -11,6 +11,21 @@
 
 namespace core {
 
+namespace {
+
+/// LevelDB could not take the DB's LOCK (env_posix / env_windows: "lock
+/// <dir>/LOCK: Resource temporarily unavailable", "... already held by
+/// process").
+bool lock_held(const leveldb::Status& status)
+{
+    if (!status.IsIOError())
+        return false;
+    const std::string msg = status.ToString();
+    return msg.find("lock ") != std::string::npos && msg.find("LOCK") != std::string::npos;
+}
+
+} // namespace
+
 LevelDBStore::LevelDBStore(const std::string& db_path, const LevelDBOptions& options)
     : m_db_path(db_path), m_options(options), m_db(nullptr)
 {
@@ -59,27 +74,23 @@ bool LevelDBStore::open()
         leveldb::DB* db_ptr;
         leveldb::Status status = leveldb::DB::Open(db_options, m_db_path, &db_ptr);
 
-        // Recovery after unclean shutdown (crash, kill -9, power loss).
-        // LevelDB uses fcntl locks on Linux which are released on process
-        // death, but a stale LOCK file can remain and block reopening if
-        // a zombie child still holds the fd or the OS didn't clean up.
-        // Standard approach (same as Bitcoin Core / litecoind):
-        //   1. Remove stale LOCK file → retry Open
-        //   2. If still fails (corruption) → RepairDB → retry Open
-        if (!status.ok()) {
-            auto lock_path = std::filesystem::path(m_db_path) / "LOCK";
-            if (std::filesystem::exists(lock_path)) {
-                LOG_WARNING << "LevelDB open failed at " << m_db_path
-                            << ": " << status.ToString()
-                            << " — removing stale LOCK file and retrying";
-                std::error_code ec;
-                std::filesystem::remove(lock_path, ec);
-                status = leveldb::DB::Open(db_options, m_db_path, &db_ptr);
-            }
+        // A LOCK that LevelDB cannot take is held by an open DB: another
+        // process (an fcntl lock: the kernel releases a dead holder's, so a
+        // held lock is never stale), or another handle in this process. Fail
+        // as Bitcoin Core does ("Cannot obtain a lock"): never unlink LOCK,
+        // never repair a live DB. Unlinking it let a second process
+        // (--utxo-digest) open a live IBD's full UTXO set beside it: 68 table
+        // files went missing and a 4.75 M-height set was lost. A LOCK file
+        // nobody holds (left by a crash) does not stop the open.
+        if (!status.ok() && lock_held(status)) {
+            LOG_ERROR << "LevelDB at " << m_db_path << " is in use (" << status.ToString()
+                      << "): another process, or another open of it in this one, holds its lock; "
+                      << "not opened, and nothing in it touched";
+            return false;
         }
 
         if (!status.ok()) {
-            LOG_WARNING << "LevelDB open failed after LOCK removal at " << m_db_path
+            LOG_WARNING << "LevelDB open failed at " << m_db_path
                         << ": " << status.ToString()
                         << " — attempting RepairDB (data will be preserved)";
             leveldb::Status repair = leveldb::RepairDB(m_db_path, db_options);

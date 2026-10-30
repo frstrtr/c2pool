@@ -43,6 +43,11 @@ std::array<uint8_t, 32> gov_object_hash(const std::string& parent_hash_hex,
 // the internal bytes).
 std::string gov_hash_display(const std::array<uint8_t, 32>& internal);
 
+// The inverse of gov_hash_display: a display-order hash, as `gobject prepare` /
+// `gobject check` print it, back to the INTERNAL bytes the OP_RETURN commits to.
+// Exactly 64 hex characters (either case); throws DashAbort on anything else.
+std::array<uint8_t, 32> gov_hash_from_display(const std::string& display_hex);
+
 // CScript() << OP_RETURN << ToByteVector(nExpectedHash) — object.cpp:488-489.
 // Exactly 34 bytes: 0x6a 0x20 followed by the 32 internal-order hash bytes.
 std::vector<uint8_t> collateral_op_return_script(const std::array<uint8_t, 32>& internal);

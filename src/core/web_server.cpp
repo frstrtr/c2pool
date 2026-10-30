@@ -5579,6 +5579,11 @@ nlohmann::json MiningInterface::rest_local_stats()
                 coin_dial_failing = !cp2p.value("network_reachable", true)
                                     && coin_dial_failures > 0;
             }
+            // Coin-specific fold-lane counters (DASH: blocks the DML fold
+            // refused with its state unchanged). Passed through as-is;
+            // absent for every other coin.
+            if (css.is_object() && css.contains("dml_fold") && css["dml_fold"].is_object())
+                result["dml_fold"] = css["dml_fold"];
         }
 
         // 1. Coin block-source contact check (issue #1482).
