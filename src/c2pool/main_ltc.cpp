@@ -6725,15 +6725,13 @@ int main(int argc, char* argv[]) {
                             // with pread in 32 MB files (Core's chainstate size): through
                             // mmap every page read stayed in RSS (809 MB of 2.5 GB at 14.6 M
                             // coins, doge::coin::ProcessMemory); one fd per open table.
-                            // With pread every open table holds an fd: at most a quarter
-                            // of the process's soft limit (raised at start; the DOGE
-                            // header store takes 256 more), 64..512 tables (VERIFY7 B3).
+                            // With pread every open table holds an fd: drawn from the
+                            // process's soft limit (raised at start) with the DOGE header
+                            // store's (doge::coin::StoreFds; VERIFY7 B3, VERIFY8 C2).
                             core::LevelDBOptions full_opts;
                             full_opts.write_buffer_size = 64 * 1024 * 1024;
                             full_opts.block_cache_size = 128 * 1024 * 1024;
-                            const uint64_t nofile = core::raise_nofile_limit(65536);
-                            full_opts.max_open_files = static_cast<int>(
-                                std::clamp<uint64_t>(nofile == 0 ? 512 : nofile / 4, 64, 512));
+                            full_opts.max_open_files = doge::coin::StoreFds::full_set(core::raise_nofile_limit(65536));
                             full_opts.max_file_size = 32 * 1024 * 1024;
                             full_opts.mmap_reads = false;
                             // malloc's thread arenas (813 MB of anonymous mappings there).

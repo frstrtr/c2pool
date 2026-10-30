@@ -31,6 +31,7 @@
 #include <core/coin/utxo_digest.hpp>
 #include <core/leveldb_store.hpp>
 #include <impl/doge/coin/process_memory.hpp>
+#include <impl/doge/coin/store_fds.hpp>
 
 #include <cstdio>
 
@@ -925,3 +926,30 @@ TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+
+// VERIFY8 C2: the stores that read with pread keep one fd per open table.
+// The DOGE header store and the full set draw from one budget, at most half
+// of the soft fd limit: at 256 (macOS when the raise fails) 64 + 64 tables
+// (LevelDB keeps max_open_files - 10, at least 64), not the old fixed 256 +
+// 64; at 1,024 (a service whose hard limit is 1,024) 128 + 256; at 65,536
+// 256 + 512; unknown (Windows: HANDLEs, no pread) 256 + 512.
+TEST(DogeUtxoFull, TheStoresTableBudgetFitsTheFdLimit)
+{
+    using doge::coin::StoreFds;
+    auto tables = [](int max_open_files) { return std::max(max_open_files, 74) - 10; };
+    for (const uint64_t nofile : {256ull, 1024ull, 4096ull, 65536ull}) {
+        const int h = StoreFds::header_store(nofile), f = StoreFds::full_set(nofile);
+        EXPECT_LE(uint64_t(tables(h) + tables(f)), nofile / 2) << "soft limit " << nofile;
+        EXPECT_GE(h, 64);
+        EXPECT_GE(f, 64);
+    }
+    EXPECT_EQ(StoreFds::header_store(256), 64);
+    EXPECT_EQ(StoreFds::full_set(256), 64);
+    EXPECT_EQ(StoreFds::header_store(1024), 128);
+    EXPECT_EQ(StoreFds::full_set(1024), 256);
+    EXPECT_EQ(StoreFds::header_store(65536), 256);
+    EXPECT_EQ(StoreFds::full_set(65536), 512);
+    EXPECT_EQ(StoreFds::header_store(0), 256);
+    EXPECT_EQ(StoreFds::full_set(0), 512);
+}
+
