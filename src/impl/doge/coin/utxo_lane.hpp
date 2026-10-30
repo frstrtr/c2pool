@@ -184,6 +184,15 @@ struct UtxoLaneHost {
     /// the header chain is synced (and, for the accrual set, the full set is
     /// not live). Unset: never chases.
     std::function<bool()> chase_tip;
+    /// The accrual cold start waits for a caught-up header chain
+    /// (ltc::coin::cold_start_ready: synced, and the tip under 2 h old or
+    /// synced for 60 s): "synced" alone comes up to 1,440 blocks before the
+    /// header sync ends, and a Bootstrap armed there spends its first window
+    /// below the real tip (FRESH-IMPL-NOTES §7 rule 1, deviation 10). Both
+    /// set: bodies before that are not taken into the set. Unset: the first
+    /// body above keep arms it, as before.
+    std::function<bool()> chain_synced;
+    std::function<int64_t()> tip_age_s;
 };
 
 /// The serialized size of a body, estimated from its parts (memory bounds:
@@ -312,6 +321,7 @@ public:
         , m_tag(mode == Mode::Full ? "[EMB-DOGE] [full]" : "[EMB-DOGE]")
     {
         m_fill.window = window ? window : (mode == Mode::Full ? FULL_WINDOW : Fill::WINDOW_SIZE);
+        m_default_window = m_fill.window;
     }
 
     Mode mode() const { return m_mode; }
@@ -372,12 +382,20 @@ public:
         //    deliberate jump: that first block passes the next-height and
         //    parent checks).
         if (m_mode == Mode::Accrual && !m_bootstrap_done && !m_fill.active && height > m_keep) {
+            if (!cold_start_ready()) {
+                // Not decided yet: no body enters the set (nor arms a gap
+                // fill from best + 1 over the whole distance).
+                r.fed = Fed::Skipped;
+                return r;
+            }
             m_bootstrap_done = true;
             const uint32_t best = m_utxo.get_best_height();
             const uint32_t start = (best > 0 && best >= height - m_keep) ? best + 1 : height - m_keep;
             if (start < height) {
                 ordered_arm(m_fill, start, height);
                 m_fill.phase = "Bootstrap";
+                // The cold start's window (FRESH-IMPL-NOTES §7 rule 5).
+                m_fill.window = ltc::coin::COLD_START_WINDOW;
                 m_jump_from = (best > 0 && start > best + 1) ? start : 0;
                 if (r.on_best_chain)
                     ordered_buffer(m_fill, height, block, hash);
@@ -401,8 +419,11 @@ public:
             const auto now = std::chrono::steady_clock::now();
             const auto stall =
                 std::chrono::duration_cast<std::chrono::seconds>(now - m_fill.last_drain_time).count();
-            if (bodies_wait()) {
-                m_fill.last_drain_time = now;  // waiting is not a stall
+            if (bodies_wait() || (m_mode == Mode::Accrual && downloading())) {
+                // Waiting is not a stall; the Bootstrap's download has its own
+                // request timeouts and stalling-peer rule, so no broadcast
+                // beside it (FRESH-IMPL-NOTES §7 rule 4).
+                m_fill.last_drain_time = now;
             } else if (stall >= m_fill.STALL_TIMEOUT_SEC) {
                 LOG_WARNING << m_tag << " " << m_fill.phase << " stall h=" << m_fill.next_height
                             << " (" << stall << "s) — broadcast fallback";
@@ -414,6 +435,7 @@ public:
                 refill(m_fill.phase == "Bootstrap" ? UtxoAsk::Broadcast : UtxoAsk::Targeted);
             if (m_fill.active && ordered_done(m_fill)) {
                 m_fill.active = false;
+                m_fill.window = m_default_window;
                 stopped();
                 LOG_INFO << m_tag << " " << m_fill.phase << " complete: " << m_fill.processed
                          << " blocks, UTXO at h=" << m_utxo.get_best_height();
@@ -570,7 +592,11 @@ private:
     /// the fill's range (it is asked for in order when the window gets there).
     void buffer(uint32_t height, const BlockType& block, const uint256& hash)
     {
-        if (m_mode == Mode::Full && height >= m_fill.next_height + m_fill.window) {
+        // Full mode, and the accrual Bootstrap's download (its buffer bound,
+        // FRESH-IMPL-NOTES §7 rule 3): a block beyond the window extends the
+        // range instead of waiting in memory.
+        const bool bounded = m_mode == Mode::Full || downloading();
+        if (bounded && height >= m_fill.next_height + m_fill.window) {
             if (height > m_fill.end_height) {
                 m_fill.end_height = height;
                 m_fill.total = m_fill.processed + (m_fill.end_height - m_fill.next_height + 1);
@@ -579,7 +605,7 @@ private:
         }
         const bool fresh = height >= m_fill.next_height && !m_fill.buffer.count(height);
         ltc::coin::ordered_buffer(m_fill, height, block, hash);
-        if (m_mode == Mode::Full && fresh && m_fill.buffer.count(height)) {
+        if (bounded && fresh && m_fill.buffer.count(height)) {
             const size_t bytes = body_bytes(block);
             m_sizes[height] = bytes;
             m_buffer_bytes += bytes;
@@ -712,6 +738,23 @@ private:
     {
         if (m_host.fill_stopped)
             m_host.fill_stopped(m_fill);
+    }
+
+    /// The accrual cold start may be decided (UtxoLaneHost::chain_synced,
+    /// tip_age_s): ltc::coin::cold_start_ready.
+    bool cold_start_ready()
+    {
+        if (!m_host.chain_synced || !m_host.tip_age_s)
+            return true;
+        const auto t = now();
+        if (!m_host.chain_synced()) {
+            m_synced_since = {};
+            return false;
+        }
+        if (m_synced_since == std::chrono::steady_clock::time_point{})
+            m_synced_since = t;
+        const int64_t synced_for = std::chrono::duration_cast<std::chrono::seconds>(t - m_synced_since).count();
+        return ltc::coin::cold_start_ready(true, m_host.tip_age_s(), synced_for);
     }
 
     /// The download waits for headers (UtxoLaneHost::bodies_wait).
@@ -1532,6 +1575,8 @@ private:
     size_t                              m_buffer_limit{BUFFER_BYTES_MAX};
     std::chrono::milliseconds           m_stall_timeout{STALL_TIMEOUT_MIN};
     uint32_t                            m_drained_since_stall{0};
+    std::chrono::steady_clock::time_point m_synced_since{};  // cold_start_ready
+    size_t                              m_default_window{0};  // the fill window outside the cold start
     uint32_t                            m_chase_height{0};  // chase_tip: the height asked, 0 = none
     std::chrono::steady_clock::time_point m_chase_since{};
     std::chrono::steady_clock::time_point m_chase_last{};

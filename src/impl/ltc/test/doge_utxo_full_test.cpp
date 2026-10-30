@@ -512,6 +512,12 @@ namespace {
 /// Answer every outstanding request in the order made, from the peer asked
 /// (skipping `silent`'s), until none is left. Returns the most requests any
 /// one peer had outstanding at once.
+/// A Lane whose host carries the cold start's caught-up gate (the Net is
+/// set up before the lane takes its host).
+struct GatedLane : Lane {
+    explicit GatedLane(uint32_t keep) : Lane(keep, UtxoLane::Mode::Accrual, 0, /*download=*/true, /*cold_gate=*/true) {}
+};
+
 uint32_t serve_peers(Lane& l, const std::vector<BlockType>& chain, const std::string& silent = std::string())
 {
     uint32_t peak = 0;
@@ -798,6 +804,46 @@ TEST(DogeUtxoBootstrap, BodiesWaitForHeaders)
     EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast";
     l.lane.tick();
     EXPECT_TRUE(l.lane.peers_in_use().empty()) << "nothing outstanding";
+}
+
+// FRESH-IMPL-NOTES §7 rules 1 and 5, carried into the lane: the accrual cold
+// start waits for a caught-up header chain (ltc::coin::cold_start_ready:
+// synced, and the tip under 2 h old or synced for 60 s). "Synced" alone (tip
+// age < 24 h) comes up to 1,440 blocks before the header sync ends, and a
+// Bootstrap armed there spent its first window below the real tip (live,
+// run 6: armed at a 20-h-old tip, 2,652 blocks instead of 1,441). Bodies
+// before that are not taken into the set; then the Bootstrap arms with the
+// cold start's window (256).
+TEST(DogeUtxoBootstrap, TheColdStartWaitsForACaughtUpChain)
+{
+    const uint256 g = genesis(0x74);
+    const auto chain = chain_with(g, 30);
+    GatedLane l(20);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.net.synced = false;
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "a");
+    EXPECT_FALSE(l.lane.fill().active) << "armed before the header chain was synced";
+    // Synced, but the tip 20 h old (the header sync still running).
+    l.net.synced = true;
+    l.net.tip_age = 20 * 3600;
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "a");
+    EXPECT_FALSE(l.lane.fill().active) << "armed at a chain that was not caught up";
+    l.net.clock += std::chrono::seconds(30);
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "a");
+    EXPECT_FALSE(l.lane.fill().active) << "armed 30 s after synced";
+    EXPECT_EQ(l.t.cache->get_best_height(), 0u) << "a body entered the set before the cold start";
+    // Synced for a minute (a quiet network), or a tip under 2 h old: armed.
+    l.net.clock += std::chrono::seconds(31);
+    l.lane.on_block(chain[29], hash_of(chain[29]), 30, "a");
+    ASSERT_TRUE(l.lane.fill().active);
+    EXPECT_EQ(l.lane.fill().phase, "Bootstrap");
+    EXPECT_EQ(l.lane.fill().window, ltc::coin::COLD_START_WINDOW);
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 30u);
+    EXPECT_FALSE(l.lane.fill().active);
+    EXPECT_NE(l.lane.fill().window, ltc::coin::COLD_START_WINDOW) << "the cold start's window outlived it";
 }
 
 // A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.

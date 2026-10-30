@@ -201,6 +201,11 @@ struct Net {
     std::chrono::steady_clock::time_point clock{std::chrono::steady_clock::time_point{} + std::chrono::hours(1)};
     bool bodies_wait{false};  // the host's bodies_wait (headers first)
     bool chase{false};        // the host's chase_tip
+    // The host's chain_synced / tip_age_s (the cold start's caught-up gate),
+    // wired when cold_gate is set before the Lane is built.
+    bool cold_gate{false};
+    bool synced{true};
+    int64_t tip_age{0};
     uint32_t headers_taken{0};  // headers the chain took from bodies
     uint32_t headers_requests{0};  // getheaders asked for (body's parent unknown)
     std::vector<std::string> events;     // clean / header, in order
@@ -277,6 +282,10 @@ struct Net {
         };
         h.completed = [this]() { ++completed; };
         h.chase_tip = [this]() { return chase; };
+        if (cold_gate) {
+            h.chain_synced = [this]() { return synced; };
+            h.tip_age_s = [this]() { return tip_age; };
+        }
         if (download) {
             h.download_peers = [this]() { return peers; };
             h.request_from = [this](const std::string& peer, uint32_t height) {
@@ -295,8 +304,9 @@ struct Lane {
     Net net;
     UtxoLane lane;
     explicit Lane(uint32_t keep = core::coin::DOGE_MIN_BLOCKS_TO_KEEP,
-                  UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0, bool download = false)
-        : lane(*t.cache, *t.db, (net.download = download, net.host()), keep, mode, window)
+                  UtxoLane::Mode mode = UtxoLane::Mode::Accrual, size_t window = 0, bool download = false,
+                  bool cold_gate = false)
+        : lane(*t.cache, *t.db, (net.download = download, net.cold_gate = cold_gate, net.host()), keep, mode, window)
     {
     }
 

@@ -7586,7 +7586,9 @@ int main(int argc, char* argv[]) {
                                                 return;
                                             [[fallthrough]];
                                         case doge::coin::UtxoAsk::Broadcast:
-                                            bcaster_ptr->request_full_block(e->block_hash);
+                                            // A deep block only from the peers that serve it.
+                                            bcaster_ptr->request_full_block_peers(
+                                                e->block_hash, core::coin::block_request_services(dc->height(), h));
                                             break;
                                         }
                                     };
@@ -7658,13 +7660,24 @@ int main(int argc, char* argv[]) {
                                         LOG_INFO << "[EMB-DOGE] UTXO rebuild: " << n
                                                  << " priced mempool txs quarantined until their inputs reconnect";
                                     };
+                                    // A stalled fill: one peer, every peer only on the third stall
+                                    // of a height, and for a deep block only the peers that serve it
+                                    // (NODE_NETWORK) (FRESH-IMPL-NOTES §7 rule 4, §8.4 commit 18).
                                     host.fill_started =
-                                        [dc, bcaster_ptr, &ioc](doge::coin::UtxoLaneHost::Fill& f) {
+                                        [dc, bcaster_ptr, &ioc, doge_fill_rr](doge::coin::UtxoLaneHost::Fill& f) {
+                                        auto stalls = std::make_shared<std::pair<uint32_t, uint32_t>>(0, 0);
                                         f.start_stall_timer(ioc,
-                                            [dc, bcaster_ptr](uint32_t h) {
+                                            [dc, bcaster_ptr, doge_fill_rr, stalls](uint32_t h) {
                                                 auto e = dc->get_header_by_height(h);
-                                                if (e && bcaster_ptr)
-                                                    bcaster_ptr->request_full_block(e->block_hash);
+                                                if (!e || !bcaster_ptr)
+                                                    return;
+                                                if (stalls->first != h)
+                                                    *stalls = {h, 0};
+                                                if (++stalls->second < 3
+                                                    && bcaster_ptr->request_full_block_targeted(e->block_hash, (*doge_fill_rr)++))
+                                                    return;
+                                                bcaster_ptr->request_full_block_peers(
+                                                    e->block_hash, core::coin::block_request_services(dc->height(), h));
                                             }, "EMB-DOGE");
                                     };
                                     host.fill_stopped = [](doge::coin::UtxoLaneHost::Fill& f) {
@@ -7681,6 +7694,14 @@ int main(int argc, char* argv[]) {
                                     // while this set prices the templates.
                                     host.chase_tip = [dc, full = doge_full]() {
                                         return dc->is_synced() && !full->live.load();
+                                    };
+                                    // The cold start waits for a caught-up header chain
+                                    // (FRESH-IMPL-NOTES §7 rule 1).
+                                    host.chain_synced = [dc]() { return dc->is_synced(); };
+                                    host.tip_age_s = [dc]() -> int64_t {
+                                        const auto t = dc->tip();
+                                        return t ? int64_t(std::time(nullptr)) - int64_t(t->header.m_timestamp)
+                                                 : std::numeric_limits<int64_t>::max();
                                     };
                                     doge_lane = std::make_shared<doge::coin::UtxoLane>(
                                         *doge_utxo_cache, *doge_utxo_db, std::move(host));
@@ -7768,7 +7789,7 @@ int main(int argc, char* argv[]) {
                                     };
                                     // Every request is recorded (hash -> height), every copy
                                     // of the answer placed by it (UtxoFullState::place).
-                                    host.request = [hash_at = host.chain_hash_at, bcaster_ptr, full,
+                                    host.request = [hash_at = host.chain_hash_at, chain_height = host.chain_height, bcaster_ptr, full,
                                                     rr = std::make_shared<size_t>(0)](uint32_t h, doge::coin::UtxoAsk how) {
                                         const uint256 hash = hash_at(h);
                                         if (hash.IsNull()) {
@@ -7780,7 +7801,9 @@ int main(int argc, char* argv[]) {
                                         if (how != doge::coin::UtxoAsk::Broadcast
                                             && bcaster_ptr->request_full_block_targeted(hash, (*rr)++))
                                             return;
-                                        bcaster_ptr->request_full_block(hash);
+                                        // A deep block only from the peers that serve it.
+                                        bcaster_ptr->request_full_block_peers(
+                                            hash, core::coin::block_request_services(chain_height(), h));
                                     };
                                     // Block download (Core's): several blocks in flight per
                                     // peer, from peers that serve every block (NODE_NETWORK).
