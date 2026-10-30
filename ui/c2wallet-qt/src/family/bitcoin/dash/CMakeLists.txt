@@ -71,6 +71,9 @@ add_library(c2wallet-dash-common STATIC
     DashMessage.cpp
     UtxoIntake.cpp
     SweepTx.cpp
+    # slice 2: PageDashInject's std-only model (all but sign()) + the manifest
+    InjectManifest.cpp
+    DashInjectModel.cpp
 )
 target_include_directories(c2wallet-dash-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # PRIVATE on purpose: this lib's .cpp need the hdkeys (btclibs) include tree,
@@ -82,7 +85,9 @@ target_link_libraries(c2wallet-dash-common PRIVATE c2wallet-hdkeys)
 
 # ── dashscript-closure lib: the tx assembly, via the M3-A signer ────────────
 # (collateral build + sign, and the signing half of the sweep builder)
-add_library(c2wallet-dash-tx STATIC CollateralTx.cpp SweepSign.cpp)
+# DashInjectSign.cpp is DashInjectModel::sign(): it calls the signers above and
+# includes only std-only headers itself.
+add_library(c2wallet-dash-tx STATIC CollateralTx.cpp SweepSign.cpp DashInjectSign.cpp)
 target_include_directories(c2wallet-dash-tx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # c2wallet-signer FIRST so the dashscript <hash.h>/<uint256.h> win for this TU;
 # c2wallet-dash-common provides the std-only address/key/gov declarations it
