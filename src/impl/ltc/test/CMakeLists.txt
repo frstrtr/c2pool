@@ -136,6 +136,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # (REAL peg-in / peg-out), pegin outputs without a kernel, empty vin/vout,
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
+    #
+    # doge_auxpow_witness_test.cpp: the AuxPoW parent (LTC) coinbase read as
+    # Dogecoin Core reads it, witness allowed: REAL mainnet 'headers' entries
+    # whose parent coinbase carries the BIP144 witness (h4715979, h5080796,
+    # h5641398, h6101857; doge_headers_witness_fixtures.hpp) parse to their
+    # count and link, re-emit byte-identical, the stripped form still parses,
+    # the txid stays witness-stripped, flag 8 and empty witnesses are refused.
+    # Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -152,6 +160,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
+        doge_auxpow_witness_test.cpp
         doge_template_underfill_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp

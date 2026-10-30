@@ -124,7 +124,7 @@ inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len)
 
     BlockType block;
     static_cast<BlockHeaderType&>(block) = hdr;
-    ::Unserialize(ps, TX_WITH_WITNESS(block.m_txs));
+    ::Unserialize(ps, ltc::coin::TX_WITH_WITNESS(block.m_txs));
     return block;
 }
 

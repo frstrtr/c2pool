@@ -36,6 +36,7 @@
 #include <impl/dgb/coin/transaction.hpp>      // dgb::coin::MutableTransaction
 #include <impl/dgb/coin/aux_doge_parent_traits.hpp> // DGB-parent witness-strip specialization
 
+#include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 #include <core/opscript.hpp>
@@ -251,3 +252,64 @@ TEST(DGB_AuxDogeBindParsers, BoundParserAuxRoundTripsByteIdentical) {
 }
 
 #endif  // AUX_DOGE
+// ---------------------------------------------------------------------------
+// DGB-as-parent coinbase in witness serialization. Dogecoin Core reads and
+// writes the AuxPoW parent coinbase witness-allowed (auxpow.h READWRITE(tx)
+// with the stream's default params), and a DGB coinbase carries the BIP141
+// witness-reserved value since segwit (2017): a proof received from the
+// network may carry marker 00, flag 01 and that item. The canonical blob
+// above with its coinbase in that form must parse to the same fields, keep
+// the witness, re-emit byte-identical, and keep the stripped txid.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string witness_aux_blob()
+{
+    std::string b = CANONICAL_AUX_BLOB;
+    const size_t cb = 160;                     // the coinbase starts after the 80-byte header
+    const size_t cb_len = 2 * (4 + 1 + 32 + 4 + 14 + 4 + 1 + 8 + 26 + 4);
+    b.insert(cb + cb_len - 8, "0120" + std::string(64, '0'));  // one 32-byte witness item, before the locktime
+    b.insert(cb + 8, "0001");                                  // marker + flag, after the version
+    return b;
+}
+
+// Witness-stripped txid via the trait every DGB-parent txid goes through.
+std::string dgb_coinbase_txid_hex(const dgb::coin::MutableTransaction& tx)
+{
+    return Hash(pack(doge::coin::parent_coinbase_no_witness<dgb::coin::MutableTransaction>::value(tx))
+                    .get_span())
+        .GetHex();
+}
+
+} // namespace
+
+TEST(DGB_AuxDogeWitnessParent, WitnessCoinbaseParsesAndRoundTrips)
+{
+    const auto whole = unhex(witness_aux_blob());
+    ASSERT_EQ(whole.size(), unhex(CANONICAL_AUX_BLOB).size() + 36);
+    PackStream s(whole);
+    doge::coin::CAuxPow<dgb::coin::MutableTransaction> aux;
+    bool has_aux = false;
+    doge::coin::CPureBlockHeader hdr;
+    ASSERT_NO_THROW((hdr = doge::coin::parse_aux_header<PackStream, dgb::coin::MutableTransaction>(s, aux, has_aux)));
+    ASSERT_TRUE(has_aux);
+    EXPECT_EQ(hdr.m_nonce, HDR_NONCE);
+    EXPECT_EQ(s.cursor_size(), 0u);
+
+    const auto& tx = aux.m_merkle_tx.m_tx;
+    ASSERT_EQ(tx.vin.size(), 1u);
+    ASSERT_EQ(tx.vout.size(), 1u);
+    EXPECT_EQ(tx.vout[0].value, CB_VALUE);
+    ASSERT_EQ(tx.vin[0].scriptWitness.stack.size(), 1u);
+    EXPECT_EQ(tx.vin[0].scriptWitness.stack[0], std::vector<unsigned char>(32, 0x00));
+    EXPECT_EQ(aux.m_merkle_tx.m_merkle_link.m_index, 5u);
+    EXPECT_EQ(aux.m_chain_merkle_link.m_index, 5u);
+
+    std::vector<unsigned char> reemit = pack_bytes(hdr);
+    const auto a = pack_bytes(aux);
+    reemit.insert(reemit.end(), a.begin(), a.end());
+    EXPECT_EQ(tohex(reemit), tohex(whole));
+
+    // The txid is the witness-stripped one: that of the canonical coinbase.
+    EXPECT_EQ(dgb_coinbase_txid_hex(tx), dgb_coinbase_txid_hex(build_parent_coinbase()));
+}

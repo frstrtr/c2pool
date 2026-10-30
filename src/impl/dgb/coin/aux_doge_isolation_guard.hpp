@@ -30,9 +30,9 @@
 
 #include <type_traits>
 
-#include <impl/doge/coin/auxpow.hpp>                 // CAuxPow<>, parent_coinbase_no_witness<>
-#include <impl/dgb/coin/transaction.hpp>             // dgb::coin::MutableTransaction, TX_NO_WITNESS
-#include <impl/dgb/coin/aux_doge_parent_traits.hpp>  // doge::coin::parent_coinbase_no_witness<dgb::coin::MutableTransaction>
+#include <impl/doge/coin/auxpow.hpp>                 // CAuxPow<>, parent_coinbase_no_witness<>, parent_coinbase_wire_params<>
+#include <impl/dgb/coin/transaction.hpp>             // dgb::coin::MutableTransaction, TX_NO_WITNESS, TX_WITH_WITNESS
+#include <impl/dgb/coin/aux_doge_parent_traits.hpp>  // both traits specialized for dgb::coin::MutableTransaction
 #include <impl/ltc/coin/transaction.hpp>             // ltc::coin::MutableTransaction (wire-generic, ALLOWED on link)
 
 namespace dgb::coin::aux_doge_guard {
@@ -52,6 +52,17 @@ static_assert(
     "AUX_DOGE isolation: DGB-parent coinbase must serialize through dgb::coin::TxParams "
     "(its OWN consensus params), never bitcoin_family's default (the LTC/DASH path). "
     "A failure here means the dgb specialization in aux_doge_parent_traits.hpp was dropped.");
+
+// (1b) Same for the wire params CMerkleTx reads and writes the parent coinbase
+//      with (witness allowed): dgb::coin::TX_WITH_WITNESS, never bitcoin_family's.
+static_assert(
+    std::is_same_v<
+        std::decay_t<decltype(
+            ::doge::coin::parent_coinbase_wire_params<dgb::coin::MutableTransaction>::value)>,
+        dgb::coin::TxParams>,
+    "AUX_DOGE isolation: the DGB-parent coinbase wire params must be dgb::coin::TxParams "
+    "(its OWN consensus params), never bitcoin_family's default (the LTC/DASH path). "
+    "A failure here means the dgb wire-params specialization in aux_doge_parent_traits.hpp was dropped.");
 
 // (2) The DGB parent coinbase type is DGB-owned, distinct from ltc::coin's. The
 //     shared aux module's DEFAULT parent is ltc::coin::MutableTransaction; the

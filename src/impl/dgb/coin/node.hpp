@@ -45,7 +45,7 @@
 #include <core/pack.hpp>                            // PackStream (the byte stream the parser reads)
 #include <impl/doge/coin/auxpow.hpp>                // shared SSOT: CAuxPow<>, parse_aux_header<>, CPureBlockHeader
 #include <impl/dgb/coin/transaction.hpp>            // dgb::coin::MutableTransaction (the DGB parent coinbase type)
-#include <impl/dgb/coin/aux_doge_parent_traits.hpp> // doge::coin::parent_coinbase_no_witness<dgb::coin::MutableTransaction>
+#include <impl/dgb/coin/aux_doge_parent_traits.hpp> // doge::coin::parent_coinbase_{no_witness,wire_params}<dgb::coin::MutableTransaction>
 #include <impl/dgb/coin/aux_doge_isolation_guard.hpp> // D0.5 per-coin consensus-isolation guard (compile-time half)
 #endif
 
