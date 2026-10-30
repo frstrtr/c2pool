@@ -768,10 +768,12 @@ public:
     }
     // The node lock's busy total (ms).
     std::uint64_t node_busy_ms() { return lock_.busy_ms(); }
-    // Parks a carrier frame of `peer` in the verify parked list with no retry time (the parked-cap KAT).
-    std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame) {
+    // Parks a carrier frame of `peer` in the verify parked list, run again at `not_before_ms` (default: never; the
+    // parked-cap KAT).
+    std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame,
+                          std::uint64_t not_before_ms = UINT64_MAX) {
         Job j{Job::Kind::Carrier, peer, peer, frame, 0};
-        park_job(std::move(j), UINT64_MAX);
+        park_job(std::move(j), not_before_ms);
         return parked_size();
     }
     bool parked_has(const std::vector<std::uint8_t>& frame) const {
@@ -2947,17 +2949,23 @@ private:
         st_.caught_up_at_ms = now_ms();
         log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
     }
-    // Under the node lock and cumtx_: a completed join attempt that rule (4) did not take, its drain done (E-178,
-    // E-193).
+    // Under the node lock and cumtx_: a completed join attempt that rule (4) did not take (E-178), or an adoption, at
+    // a store not caught up: K_NCU ends once the drain is done (E-193).
     void kept_locked() {
-        if (!node_->kept_due()) {
+        if (node_->kept_due()) {
+            if (!node_->finish_kept()) return;
             kept_due_ = false;
+            st_.caught_up_at_ms = now_ms();
+            log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at_pos_t_locked());
             return;
         }
-        if (!node_->finish_kept()) return;
+        if (node_->adopt_due()) {
+            if (!node_->finish_adopted()) return;
+            kept_due_ = false;
+            st_.caught_up_at_ms = now_ms();
+            return;
+        }
         kept_due_ = false;
-        st_.caught_up_at_ms = now_ms();
-        log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at_pos_t_locked());
     }
     // A due end of K_NCU tried again (not under the node lock: after a judged frame, a job, a pump).
     void recheck_caught_up() {
@@ -3354,7 +3362,7 @@ private:
                 log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at);
             } else {
                 const NodeGuard g(*this);
-                if (node_->kept_due()) kept_due_ = true;  // its drain first (E-193): the line when it is done
+                if (node_->kept_due() || node_->adopt_due()) kept_due_ = true;  // its drain first (E-193)
             }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
@@ -4567,7 +4575,7 @@ private:
     std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
     std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
     std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)
-    std::atomic<bool> kept_due_{false};        // a kept join attempt; K_NCU's end waits for the drain (E-193)
+    std::atomic<bool> kept_due_{false};        // a kept join attempt or an adoption; K_NCU's end waits for the drain
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
     std::map<std::uint64_t, ValidBucket> valid_;  // P-15 (vmtx_)

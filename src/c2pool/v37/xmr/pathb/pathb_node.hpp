@@ -749,7 +749,7 @@ public:
         // caller's finish_kept)
         if (out.report && out.report->end == AttemptEnd::Completed && !out.sw.adopted && !out.sw.replaced
             && not_caught_up_) {
-            kept_due_ = true;
+            ncu_due_ = NcuDue::Kept;
             out.caught_up = finish_kept();
         }
         return out;
@@ -846,9 +846,8 @@ public:
     }
     // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
     // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision), a join adopts,
-    // or a join attempt completes and rule (4) keeps the node's chain; the first and the last also wait until the
-    // node holds no frame it received and has not judged, and no parked frame whose parent it holds (E-193:
-    // drain_done).
+    // or a join attempt completes and rule (4) keeps the node's chain; each also waits until the node holds no frame
+    // it received and has not judged, and no parked frame whose parent it holds (E-193: drain_done).
     bool caught_up() const noexcept { return !not_caught_up_; }
     // The first catch-up round after the start is in flight (the template gate's first clause).
     bool first_round_open() const noexcept { return first_round_open_; }
@@ -857,7 +856,7 @@ public:
         if (!not_caught_up_) return;
         not_caught_up_ = false;
         first_round_ = first_round_open_ = false;
-        kept_due_ = false;
+        ncu_due_ = NcuDue::None;
         reset_delivery();
         if (kv_ == nullptr || poisoned_) return;
         LaneBatch b;
@@ -874,11 +873,17 @@ public:
     }
     // The caller's inbound frames: true when it holds none it received and has not given to the node (unset: none).
     void set_inbound_idle(std::function<bool()> f) { inbound_idle_ = std::move(f); }
-    // A completed join attempt that rule (4) did not take ended the catch-up's first half; K_NCU ends when the drain
-    // is done (finish_kept).
-    bool kept_due() const noexcept { return kept_due_ && not_caught_up_; }
+    // A completed join attempt that rule (4) did not take, or an adoption, at a store not caught up: K_NCU ends when
+    // the drain is done (finish_kept, finish_adopted).
+    bool kept_due() const noexcept { return ncu_due_ == NcuDue::Kept && not_caught_up_; }
+    bool adopt_due() const noexcept { return ncu_due_ == NcuDue::Adopted && not_caught_up_; }
     bool finish_kept() {
         if (!kept_due() || !drain_done()) return false;
+        note_caught_up();
+        return true;
+    }
+    bool finish_adopted() {
+        if (!adopt_due() || !drain_done()) return false;
         note_caught_up();
         return true;
     }
@@ -1288,10 +1293,11 @@ public:
         if (rests_on_claims()) return status(t, TemplateStatus::RestsOnClaims);
         if (!cfg_.launch && peers_.empty() && ((started_empty_ && tree_->best().pos == 0) || not_caught_up_))
             return status(t, TemplateStatus::NoPathbPeer);
-        // not caught up (K_NCU): no template while the first catch-up round after the start is in flight, or while
-        // the header path delivers toward a tip this node does not hold (E-194); a HELLO claim alone holds no
-        // template past that round
-        if (gate_applies() && (first_round_open_ || delivery_hold())) return status(t, TemplateStatus::CatchingUp);
+        // not caught up (K_NCU): no template while the first catch-up round after the start is in flight, while the
+        // header path delivers toward a tip this node does not hold, or while every HELLO tip is held and the drain
+        // that ends K_NCU is not done (E-194); a HELLO claim alone holds no template past that round
+        if (gate_applies() && (first_round_open_ || delivery_hold() || drain_hold()))
+            return status(t, TemplateStatus::CatchingUp);
         const CarrierNode& tip = tree_->best();
         t.tip = tip.id;
         t.x = tip.pos + 1;
@@ -2848,6 +2854,7 @@ private:
         written = false;
         JoinedState* js = joiner_->adopted();
         if (js == nullptr || !js->tree || !js->store) return false;
+        const bool ncu = not_caught_up_;
         joined_ = js;
         prefix_ = &js->prefix_headers;
         tree_ = &*js->tree;
@@ -2898,9 +2905,11 @@ private:
         load_failed_ = false;
         poisoned_ = false;
         reask_pending_ = false;
-        not_caught_up_ = false;  // an adoption catches up (its empty store holds no K_NCU)
+        // an adoption catches up once the drain is done (E-193); until then the adopted store keeps K_NCU
+        // (finish_adopted)
+        not_caught_up_ = ncu && !drain_done();
+        ncu_due_ = not_caught_up_ ? NcuDue::Adopted : NcuDue::None;
         first_round_ = first_round_open_ = false;
-        kept_due_ = false;
         reset_delivery();
         ++generation_;
         if (kv_ == nullptr) return true;
@@ -2912,6 +2921,7 @@ private:
         put_sides(b, cfg_.record_chain, *tree_, *store_, *bodies_);  // the adopted tree's side carriers (K_PSIDE)
         // the lower edge of A's bound work (x1 + 1), read at a restart (K_BLO)
         if (!js->young) b.put(store_keys::blo(cfg_.record_chain), encode_blo(js->x1 + 1));
+        if (not_caught_up_) b.put(store_keys::ncu(cfg_.record_chain), encode_ncu());  // K_NCU until the drain
         for (const auto& [bin, at] : js->claimed)  // the leaves adopted as claims (K_BCLAIM)
             b.put(store_keys::bclaim(cfg_.record_chain, bin), encode_bclaim(BclaimRecord{bin, at.id, at.digest}));
         if (!cleared || !ab || !commit_lane_batch(*kv_, b)) {
@@ -3603,6 +3613,8 @@ private:
         if (hp_page_.live && win) return true;
         return hp_body_.live && (win || hello_unheld());
     }
+    // E-194 (vi): every HELLO tip held and the end of K_NCU waiting for the drain (frames in hand only).
+    bool drain_hold() const { return gate_applies() && !peers_.empty() && !hello_unheld() && !drain_done(); }
     // The verified winning headers' tip: not held, still winning against the best tip.
     bool win_open() const {
         if (!hp_win_) return false;
@@ -3676,7 +3688,8 @@ private:
     bool first_round_ = false;            // the first catch-up round after the start not run yet
     bool first_round_open_ = false;       // ... and in flight (opened by a HELLO tail whose tip is not held)
     std::uint64_t first_round_s_ = 0;     // since when it is open with no request in flight
-    bool kept_due_ = false;               // a completed attempt kept the chain; K_NCU ends at its drain (E-193)
+    enum class NcuDue : std::uint8_t { None, Kept, Adopted };
+    NcuDue ncu_due_ = NcuDue::None;       // a kept attempt or an adoption; K_NCU ends at its drain (E-193)
     std::function<bool()> inbound_idle_;  // the caller's inbound frames all judged (E-193)
     std::optional<ChainTip> hp_win_;      // headers this node verified that win (their tip and work)
     std::uint64_t hp_win_peer_ = 0;
