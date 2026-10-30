@@ -180,6 +180,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_link_libraries(core_test PRIVATE c2pool_storage)  # leveldb_store_lock_test: SharechainStorage
 
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
