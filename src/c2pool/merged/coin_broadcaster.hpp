@@ -152,6 +152,15 @@ public:
     void set_on_new_block(BlockCallback cb)     { m_on_new_block = std::move(cb); }
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx = std::move(cb); }
     void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
+
+    /// A 'headers' message the raw headers parser did not read to its end
+    /// (AuxPoW chains): the headers before the entry it stopped at (they
+    /// link) and the message's count. When set (before peers connect), such
+    /// a batch comes here instead of on_new_headers.
+    using TruncatedHeadersCallback = std::function<void(const std::string& peer,
+                                                        const std::vector<ltc::coin::BlockHeaderType>&,
+                                                        uint64_t count)>;
+    void set_on_headers_truncated(TruncatedHeadersCallback cb) { m_on_headers_truncated = std::move(cb); }
     void set_on_full_block(FullBlockCallback cb) { m_on_full_block = std::move(cb); }
 
     /// Full block plus how it arrived (block message, reconstructed compact
@@ -673,6 +682,12 @@ private:
             // Wire AuxPoW raw headers parser (DOGE)
             if (m_raw_headers_parser) {
                 peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
+                if (m_on_headers_truncated) {
+                    peer->node_p2p.set_on_headers_truncated(
+                        [this, peer_key](const std::vector<ltc::coin::BlockHeaderType>& hdrs, uint64_t count) {
+                            m_on_headers_truncated(peer_key, hdrs, count);
+                        });
+                }
             }
             // Wire AuxPoW raw headers SINK (NMC) — carries the raw 'headers' bytes
             // (tagged with the peer key) so the AuxPoW proof survives to the chain.
@@ -787,6 +802,7 @@ private:
     BlockCallback        m_on_new_block;
     TxCallback           m_on_new_tx;
     HeadersCallback      m_on_new_headers;
+    TruncatedHeadersCallback m_on_headers_truncated;
     FullBlockCallback    m_on_full_block;
     FullBlockSourceCallback m_on_full_block_src;
     CmpctBlockCallback   m_on_cmpct_block;

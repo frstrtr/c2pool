@@ -7162,31 +7162,28 @@ int main(int argc, char* argv[]) {
                                     range_timer->async_wait(*range_fn);
                                 }
 
-                                broadcaster->set_on_new_headers(
+                                // Every DOGE headers batch, as the AuxPoW parser
+                                // (doge::coin::parse_doge_headers_message) read it: from
+                                // on_new_headers, or from on_headers_truncated when it stopped
+                                // at an entry it could not read (`truncated_at`: the headers
+                                // are the ones before it) -- a strike for the schedule, never
+                                // a cut.
+                                auto on_doge_headers =
                                     [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc, sched, sched_sync, range_sync,
                                      send_sched_ask, full = doge_full, doge_hdr_asks](
                                         const std::string& key,
-                                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
-                                        // The broadcaster's on_new_headers gives us raw BlockHeaderType
-                                        // from the standard parser. For DOGE AuxPoW, the P2P message
-                                        // handler in NodeP2P already parses the headers using the
-                                        // standard 80+1 byte format. AuxPoW blocks have the AuxPoW
-                                        // data INSIDE the block, not the header in 'headers' message.
-                                        //
-                                        // NOTE: Dogecoin's P2P 'headers' message DOES include AuxPoW
-                                        // data. However, our NodeP2P handler parses each header as
-                                        // 80 bytes + tx_count. If the DOGE peer sends AuxPoW headers,
-                                        // the parser will fail on the variable-length data.
-                                        //
-                                        // For testnet4alpha (all AuxPoW from genesis), we may need
-                                        // the dedicated AuxPoW parser. For now, pass through directly
-                                        // and handle parse errors gracefully.
-                                        LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
-                                                 << " headers from P2P";
+                                        const std::vector<ltc::coin::BlockHeaderType>& hdrs,
+                                        std::optional<size_t> truncated_at) {
+                                        if (truncated_at)
+                                            LOG_INFO << "[EMB-DOGE] Received " << hdrs.size() << " headers from " << key
+                                                     << " (the message does not parse past entry " << *truncated_at << ")";
+                                        else
+                                            LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
+                                                     << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
                                         boost::asio::post(*doge_hdr_pool,
                                             [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
-                                             full, key, doge_hdr_asks]() {
+                                             full, key, doge_hdr_asks, truncated_at]() {
                                                 // Below the checkpoint: an anchored range, or the
                                                 // sequential schedule's batch (doge::coin::route_headers);
                                                 // only the rest answers the header chain's getheaders.
@@ -7194,7 +7191,8 @@ int main(int argc, char* argv[]) {
                                                 using Feed = doge::coin::HashSchedule::Feed;
                                                 using Answer = doge::coin::RangeSync::Answer;
                                                 auto route = doge::coin::route_headers(range_sync, sched_sync, sched, *doge_hdr_asks,
-                                                                                       key, *batch, std::chrono::steady_clock::now());
+                                                                                       key, *batch, std::chrono::steady_clock::now(),
+                                                                                       truncated_at);
                                                 const bool completed = (route.taken == Taken::Range && route.range == Answer::Complete)
                                                                     || (route.taken == Taken::Schedule && route.feed == Feed::Complete);
                                                 if (completed && !full->schedule_ready.exchange(true) && full->on_schedule_ready)
@@ -7245,6 +7243,16 @@ int main(int argc, char* argv[]) {
                                                     });
                                                 }
                                             });
+                                    };
+                                broadcaster->set_on_new_headers(
+                                    [on_doge_headers](const std::string& key,
+                                                      const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                                        on_doge_headers(key, hdrs, std::nullopt);
+                                    });
+                                broadcaster->set_on_headers_truncated(
+                                    [on_doge_headers](const std::string& key,
+                                                      const std::vector<ltc::coin::BlockHeaderType>& hdrs, uint64_t) {
+                                        on_doge_headers(key, hdrs, hdrs.size());
                                     });
 
                                 // Periodic DOGE header sync (every 60s)

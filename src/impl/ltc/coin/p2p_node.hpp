@@ -115,6 +115,11 @@ private:
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
     RawHeadersParser m_raw_headers_parser;
+    // A raw parse that stopped before the message's count (an entry it could
+    // not read): the headers before it and the count go here instead of to
+    // new_headers, when set (the DOGE hash schedule: a strike, not a cut).
+    using HeadersTruncatedFn = std::function<void(const std::vector<BlockHeaderType>&, uint64_t count)>;
+    HeadersTruncatedFn m_on_headers_truncated;
     // Raw headers SINK: if set, receives the raw 'headers' payload bytes and
     // short-circuits the standard handler entirely (both the 80+1 parse and the
     // BIP130 body getdata). Additive and OPTIONAL — only the NMC lane sets it, so
@@ -305,6 +310,10 @@ public:
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+
+    /// A 'headers' message the raw parser did not read to its end: its clean
+    /// prefix and the message's count, instead of new_headers.
+    void set_on_headers_truncated(HeadersTruncatedFn f) { m_on_headers_truncated = std::move(f); }
     /// Set a raw headers SINK (for NMC AuxPoW header-feed). When set, the 'headers'
     /// handler forwards the raw payload bytes and returns immediately — the standard
     /// 80+1 parse and BIP130 body getdata are skipped. Additive; unset for every
@@ -772,6 +781,8 @@ private:
         // 2000-header batch, so it is never a fallback for an AuxPoW chain
         // (the raw parser returns the entries that parsed; none is none).
         const bool raw_parsed = m_raw_headers_parser && !msg->m_raw_payload.empty();
+        bool truncated = false;
+        uint64_t declared = 0;
         if (raw_parsed) {
             try {
                 vheaders = m_raw_headers_parser(
@@ -781,6 +792,19 @@ private:
                          << msg->m_raw_payload.size() << " bytes";
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_chain_label << "] AuxPoW headers parser failed: " << e.what();
+            }
+            // The raw parser returns the entries that parsed, in order: fewer
+            // than the message's count means it stopped at one it could not read.
+            if (m_on_headers_truncated) {
+                try {
+                    PackStream cs(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(msg->m_raw_payload.data()),
+                        std::min<size_t>(msg->m_raw_payload.size(), 9)));
+                    declared = ReadCompactSize(cs);
+                } catch (const std::exception&) {
+                    declared = 0;
+                }
+                truncated = vheaders.size() < declared;
             }
         }
 
@@ -798,8 +822,11 @@ private:
             }
         }
 
+        if (truncated)
+            m_on_headers_truncated(vheaders, declared);
         if (!vheaders.empty()) {
-            m_coin->new_headers.happened(vheaders);
+            if (!truncated)
+                m_coin->new_headers.happened(vheaders);
 
             // BIP 130: when receiving a small headers batch (new block announcement),
             // request the full block via getdata.
