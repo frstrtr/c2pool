@@ -224,6 +224,19 @@ public:
     using RawBlockParser = std::function<ltc::coin::BlockType(const uint8_t*, size_t)>;
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
 
+    /// The peers with a completed handshake whose version message advertised
+    /// every bit of `services` (e.g. NODE_NETWORK: not pruned).
+    std::vector<std::string> ready_peers(uint64_t services) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> out;
+        for (const auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete()
+                && (peer->node_p2p.peer_services() & services) == services)
+                out.push_back(key);
+        return out;
+    }
+
     /// Enable BIP 35 mempool request for all current and future peer connections.
     /// Call after UTXO is initialized so incoming txs can have fees computed.
     void enable_mempool_request() {
@@ -504,6 +517,35 @@ public:
         LOG_INFO << "[" << m_symbol << "] getheaders sent to " << sent << " peer(s)"
                  << " locator_size=" << locator.size()
                  << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16) + "...");
+    }
+
+    /// getheaders to ONE peer: the round-robin pick among peers with a
+    /// completed handshake (peer_idx % count), or `peer_key` when it is one
+    /// of them. Returns the peer asked ("" = none). For a long header sync
+    /// whose answers would otherwise come from every peer.
+    std::string request_headers_targeted(const std::vector<uint256>& locator, const uint256& stop_hash,
+                                         size_t peer_idx, const std::string& peer_key = std::string())
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::pair<std::string, BroadcastPeer*>> ready;
+        for (auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete())
+                ready.emplace_back(key, peer.get());
+        if (ready.empty())
+            return {};
+        size_t pick = peer_idx % ready.size();
+        for (size_t i = 0; i < ready.size(); ++i)
+            if (!peer_key.empty() && ready[i].first == peer_key)
+                pick = i;
+        try {
+            const uint32_t proto = (m_symbol == "DOGE" || m_symbol == "doge") ? 70015 : 70017;
+            ready[pick].second->node_p2p.send_getheaders(proto, locator, stop_hash);
+            return ready[pick].first;
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[" << m_symbol << "] getheaders to " << ready[pick].first
+                        << " failed: " << e.what();
+            return {};
+        }
     }
 
     CoinPeerManager& peer_manager() { return m_peer_manager; }
