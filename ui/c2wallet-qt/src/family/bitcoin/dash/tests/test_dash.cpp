@@ -1634,9 +1634,23 @@ static void test_s2_k7_manifest()
                   jint(t.find("fee")) == 0 && jint(t.find("est_signed_bytes")) == 19116,
               "tx: txid, size, vin 128, vout 1, value_out, fee 0, est");
         const mj::JVal* ins = t.find("inputs");
-        CHECK(ins && ins->arr.size() == 128 && jint(ins->arr[0].find("height")) > 0 &&
-                  ins->arr[0].find("coinbase") && ins->arr[0].find("coinbase")->t == mj::JVal::T::Null,
-              "inputs: 128 with heights, coinbase unknown -> null");
+        // Every input is a runtime-submit prevout claim (VERIFY-S2 F2):
+        // exactly {txid, vout, value, script_hex, height, coinbase}.
+        bool claim_shape = ins && ins->arr.size() == 128;
+        int64_t sum_in = 0;
+        const std::string spk = spk_hex_of(testvec::kPyParityAddress);
+        if (ins)
+            for (const mj::JVal& in : ins->arr) {
+                const char* keys[] = {"txid", "vout", "value", "script_hex", "height", "coinbase"};
+                claim_shape = claim_shape && in.obj.size() == 6;
+                for (size_t k = 0; k < 6 && claim_shape; ++k) claim_shape = in.obj[k].first == keys[k];
+                claim_shape = claim_shape && jstr(in.find("txid")).size() == 64 && jint(in.find("value")) > 0 &&
+                              jstr(in.find("script_hex")) == spk && jint(in.find("height")) > 0 &&
+                              in.find("coinbase")->t == mj::JVal::T::Bool && in.find("coinbase")->b;
+                sum_in += jint(in.find("value"));
+            }
+        CHECK(claim_shape, "inputs: 128 claims {txid, vout, value, script_hex, height, coinbase}; unknown coinbase claimed true");
+        CHECK(sum_in == jint(t.find("value_out")) + jint(t.find("fee")), "claims: sum(value) == value_out + fee");
     }
     CHECK(jint(jpath(r, {"maturity", "safe_from_height"})) == 2563881 + 100 &&
               jint(jpath(r, {"maturity", "youngest_input_height"})) == 2563881 &&
@@ -1644,6 +1658,12 @@ static void test_s2_k7_manifest()
               jint(jpath(r, {"maturity", "target_height"})) == kFixtureTip + 2 &&
               jint(jpath(r, {"maturity", "min_confirmations"})) == kDefaultMinConf,
           "maturity: safe_from = max(h) + 100 = 2563981, youngest, tip, target, min_conf");
+    CHECK(jstr(r.find("funding_script")) == spk_hex_of(testvec::kPyParityAddress) &&
+              jpath(r, {"maturity", "coinbase_flags_known"}) &&
+              jpath(r, {"maturity", "coinbase_flags_known"})->t == mj::JVal::T::Bool &&
+              !jpath(r, {"maturity", "coinbase_flags_known"})->b,
+          "funding_script; coinbase_flags_known false for a getaddressutxos intake");
+    CHECK(!contains(man, "\"satoshis\""), "no legacy satoshis field left");
     CHECK(jint(jpath(r, {"skipped", "dust"})) == 42 && jint(jpath(r, {"skipped", "dust_floor"})) == 2 &&
               jpath(r, {"skipped", "immature"}) && jpath(r, {"skipped", "immature"})->arr.empty(),
           "skipped: 42 dust at floor 2, 0 immature");
@@ -1720,6 +1740,17 @@ static void test_s2_k8_collateral()
                   outs[1].value == 10963663 && hexstr(outs[1].script) == spk_hex_of(testvec::kPyParityAddress),
               "signed: 1 DASH OP_RETURN burn + change to the funding address");
         std::printf("    collateral: %zu inputs, %zu B signed\n", cp->selected.size(), c.signed_txs()[0].size);
+        mj::ParseResult cm = mj::parse(c.manifest_json());
+        size_t n_false = 0, n_true = 0;
+        if (cm.ok && cm.root.find("txs") && !cm.root.find("txs")->arr.empty())
+            if (const mj::JVal* ins = cm.root.find("txs")->arr[0].find("inputs"))
+                for (const mj::JVal& in : ins->arr) {
+                    const mj::JVal* cb = in.find("coinbase");
+                    if (cb && cb->t == mj::JVal::T::Bool) (cb->b ? n_true : n_false)++;
+                    if (cb && !cb->b && jstr(in.find("txid")) != txid_of_byte("5e")) n_false += 100; // wrong row
+                }
+        CHECK(n_false == 1 && n_true == 128 && cm.ok && jpath(cm.root, {"maturity", "coinbase_flags_known"})->b,
+              "export v1 flags carried into the claims: 128 coinbase true, the 1-conf input false");
         CHECK(contains(c.manifest_json(), "\"mode\": \"collateral\"") &&
                   contains(c.manifest_json(), (std::string("\"gov_hash\": \"") + testvec::kOnchainGovHash + "\"").c_str()),
               "manifest: mode collateral + gov hash");

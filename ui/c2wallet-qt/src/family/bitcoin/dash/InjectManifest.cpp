@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "InjectManifest.hpp"
 
+#include "DashAddress.hpp"
 #include "DashError.hpp"
 #include "InjectCaps.hpp"
 #include "SweepTx.hpp"
@@ -98,14 +99,18 @@ void write(std::string& out, const J& j, int depth)
     }
 }
 
+// One input in the runtime-submit prevout-claim shape (RUNTIME-INJECT-DESIGN
+// §5.2): {txid, vout, value, script_hex, height, coinbase}. An unknown coinbase
+// flag is claimed `true`: the builder held the input to the coinbase rule.
 J utxo_json(const Utxo& u)
 {
     J j = J::obj();
     j.put("txid", J::str(u.txid));
     j.put("vout", J::integer(u.vout));
-    j.put("satoshis", J::integer(u.satoshis));
+    j.put("value", J::integer(u.satoshis));
+    j.put("script_hex", J::str(u.script_pubkey_hex));
     j.put("height", int_or_null(u.height));
-    j.put("coinbase", u.coinbase.has_value() ? J::boolean(*u.coinbase) : J::null());
+    j.put("coinbase", J::boolean(u.coinbase.value_or(true)));
     return j;
 }
 
@@ -147,6 +152,10 @@ std::string build_inject_manifest(const ManifestData& d)
     root.put("fee_mode", J::str(relay ? "relay" : "inject-zero-fee"));
     root.put("fee_rate_duffs_per_byte", J::integer(relay ? d.fee_rate_per_byte : 0));
     root.put("funding_address", J::str(d.funding_address));
+    {
+        const std::array<uint8_t, 25> spk = p2pkh_script(addr_to_h160(d.funding_address, d.testnet));
+        root.put("funding_script", J::str(hdkeys::to_hex(std::vector<uint8_t>(spk.begin(), spk.end()))));
+    }
     root.put("destination", J::str(d.destination));
     root.put("gov_hash", str_or_null(d.gov_hash));
     root.put("hex_file_sha256", J::str(sha256_hex(d.hex_file)));
@@ -187,6 +196,7 @@ std::string build_inject_manifest(const ManifestData& d)
 
     J mat = J::obj();
     mat.put("intake", J::str(d.intake_source));
+    mat.put("coinbase_flags_known", J::boolean(d.coinbase_flags_known));
     mat.put("screen_tip_height", int_or_null(d.screen_tip_height));
     mat.put("screen_tip_hash", str_or_null(d.screen_tip_hash));
     mat.put("target_height", J::integer(d.target_height));
