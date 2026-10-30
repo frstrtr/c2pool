@@ -107,3 +107,23 @@ python3 ui/c2wallet-qt/tools/export_utxos.py <ADDRESS> utxos.json
 Carry `utxos.json` to the signer; carry back `<name>.hex` (one raw tx per line,
 the c2pool loader format) and `<name>.manifest.json` (txids, sizes, inputs,
 maturity, node requirements, the file's sha256 / sha256d; no secrets).
+
+**Before `dash-cli sendrawtransaction` (the relay lane), check every input's
+amount on the online host.** Legacy sighash commits no input amounts, so the
+amounts in the export are the trust root: on the relay lane an understated one
+is paid as extra fee (the zero-fee pin / inject lanes refuse such a tx instead).
+Every manifest input must still be unspent with exactly its `value` and
+`script_hex`, and each tx's inputs must sum to its `value_out + fee`:
+
+```sh
+python3 - name.manifest.json <<'PY'
+import json, subprocess, sys
+m = json.load(open(sys.argv[1]))
+for t in m["txs"]:
+    for i in t["inputs"]:
+        o = json.loads(subprocess.check_output(["dash-cli", "gettxout", i["txid"], str(i["vout"]), "true"]) or b"null")
+        assert o and round(o["value"] * 1e8) == i["value"] and o["scriptPubKey"]["hex"] == i["script_hex"], i
+    assert sum(i["value"] for i in t["inputs"]) == t["value_out"] + t["fee"], t["txid"]
+print("preflight OK: every input is unspent with the manifest's amount")
+PY
+```
