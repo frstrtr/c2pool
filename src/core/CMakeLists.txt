@@ -27,6 +27,7 @@ set(source
     netaddress.hpp netaddress.cpp
     opscript.hpp
     random.hpp random.cpp
+    os_random.hpp os_random.cpp
     addr_store.hpp addr_store.cpp
     p2p_message_stats.hpp
     web_server.hpp web_server.cpp

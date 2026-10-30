@@ -979,10 +979,9 @@ loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
 Source: `src/c2pool/main_dgb.cpp` — `print_banner()` and the `main()` parse
 loop. Unknown argument → `unknown argument: …`, exit 1. **Mainnet only**: there
 is no `--testnet` flag and `make_coin_params(/*testnet=*/false)` is hardwired;
-a settings file that sets `network.testnet` is refused. The DGB parser has no
-`--fee` / `--give-author` (the catalog's `money.give_author_pct` and
-`money.node_owner_fee_pct` rows exclude DGB); operator payout goes through
-`--redistribute` + `--node-owner-address`.
+a settings file that sets `network.testnet` is refused. Operator payout goes
+through `-f`/`--fee` or `--redistribute`, with `--node-owner-address` as the
+destination.
 
 ```bash
 # Daemonless public pool (dgb.voidbind.com posture)
@@ -1008,7 +1007,9 @@ a settings file that sets `network.testnet` is refused. The DGB parser has no
 | `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
 | `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
 | `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. |
-| `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm. |
+| `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm and for `-f`/`--fee`. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
 | `--merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]` (repeatable) | — | Embedded DOGE aux backend (`-DAUX_DOGE` build; DOGE chain_id 98, P2P 22556). |
 | `--doge-p2p-address HOST`, `--doge-p2p-port PORT`, `--embedded-doge` | — | DOGE peer overrides; `--embedded-doge` forces the embedded path. |
 | `--embedded-serve-mempool-txs[=true\|=false]` | posture default | Arm / opt out of the embedded UTXO fee-proof lane. CLI wins over the settings file. |
@@ -1035,16 +1036,17 @@ loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
 | `--selftest` | default | ABLA budget self-test, exit. |
 | `--ibd [--near-tip] [--auto-kick]`, `--with-peer-verify`, `--max-seconds N` (600) | | Headers-first IBD / peer-verify harnesses against one BCHN peer. |
 | `--leg-c-capture [--rpc-conf PATH]`, `--leg-c-capture-p2p [--p2p-port N]` (18444) | | Regtest capture harnesses; `--rpc-conf` defaults to `~/bch-regtest/bitcoin.conf` here. **`--p2p-port` is the leg-C BCHN regtest port, not the sharechain port** (the catalog maps it to `sharechain.listen`; the parser does not). |
-| `--peer HOST[:PORT]` | `192.168.86.110:8333` (a developer-host default — always supply your own) | BCHN coin-P2P peer. Port `0` = no explicit peer → SeedTier discovery ladder (`src/impl/bch/coin/embedded_daemon.hpp` `maybe_start_p2p`). |
+| `--peer HOST[:PORT]` | none (port 8333) | BCHN coin-P2P peer. `--pool` refuses to start without `--peer` or `--coin-p2p-discover`. Port `0` = no explicit peer → SeedTier discovery ladder (`src/impl/bch/coin/embedded_daemon.hpp` `maybe_start_p2p`). |
 | `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection; also moves the default peer port (18333 / 28333 / 18444). |
 | `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard. |
 | `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
+| `--coin-p2p-discover` | off | Daemonless coin-peer discovery (CoinAddrMan); no `--peer` needed. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
-
-No money flags on this binary: BCH has no `--fee` / `--give-author` /
-`--node-owner-address` in the parser (the catalog rows exclude `C_BCH`).
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
+| `--node-owner-address ADDR` | — | Node-owner fee destination. |
 
 ### c2pool-bip110 — Bitcoin Knots BLAKE2b fork
 

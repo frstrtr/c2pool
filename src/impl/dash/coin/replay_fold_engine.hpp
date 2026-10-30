@@ -185,6 +185,7 @@
 #include <impl/dash/coin/vendor/incremental_sml_merkle.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
+#include <core/durable_file.hpp>   // rename_over: replaces the target on Windows too
 #include <core/hash.hpp>
 #include <core/log.hpp>
 #include <core/opscript.hpp>
@@ -1368,7 +1369,7 @@ public:
             f.flush();
             if (!f) { error = "short write to '" + tmp + "'"; return false; }
         }
-        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        if (!core::durable_file::rename_over(tmp, path)) {
             error = "rename '" + tmp + "' -> '" + path + "' failed";
             std::remove(tmp.c_str());
             return false;

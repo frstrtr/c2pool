@@ -88,13 +88,72 @@
 //   An outstanding WORK_STALLED persists across a restart so the episode
 //   still ends with one WORK_RESUMED and is not paged twice.
 //
+// WORKER LEVEL: HASHRATE (opt-in, hashrate_min > 0). A rig that keeps
+// submitting at reduced speed (a dead hashboard) stays UP, so the rules above
+// never page it.
+//   Measurement: the work the worker actually delivered here. Per tick and
+//   session, the advance of the accepted-share counter and of the accepted
+//   work (the sum of the difficulty each accepted share is credited at, which
+//   the stratum session records; x 2^32 = hashes), and the share exposure
+//   dt / (vardiff * 2^32). Over a window of hashrate_window seconds that ENDS
+//   AT THE WORKER'S LAST SHARE: rate = work * 2^32 / T, the share count N, and
+//   the count expected at the threshold, Lambda = hashrate_min * exposure
+//   (shares at difficulty D arrive as a Poisson process of rate / (D * 2^32)).
+//   The session's reported hashrate (a sliding average of the same shares)
+//   is not used: it carries no share count, so no test can be made on it.
+//   Evaluation every window/3, and only with new shares since the last one:
+//     low evidence  rate < min        and P(Poisson(Lambda) <= N)       < alpha
+//     ok evidence   rate > min * 1.1  and P(Poisson(1.1 Lambda) >= N)   < alpha
+//   HASHRATE_LOW fires after hashrate_confirm consecutive evaluations with low
+//   evidence; HASHRATE_OK after as many with ok evidence while a LOW is
+//   outstanding. [min, 1.1 min] is the hysteresis band: a rig inside it keeps
+//   its state, so a rig sitting at the threshold pages once and never flaps.
+//   Consecutive evaluations share 2/3 of their shares, so two in a row is not
+//   alpha^2: at the threshold the pair probability is ~7 alpha^2 (0.018 at
+//   0.05). The measured rates below are simulated end to end and include it.
+//   Strength of evidence. The window, not the test, limits it: at the DASH
+//   vardiff (one share per ~10 s) a 900 s window holds ~90-180 shares, so a
+//   rate is known to ~+/-10 %, and the level trades detection delay against
+//   pages for rigs just above the threshold. Measured (simulated shares at
+//   the DASH vardiff, 1.2 TH/s threshold, 900 s window, 2 evaluations):
+//     alpha   1.8 -> 1.0 TH/s: median delay  within 3 windows   1.32 / 1.44 TH/s rigs
+//     0.001   8.9 windows                     12 %              0 / 0 pages per 210 rig-days
+//     0.02    2.6 windows                     62 %              4 / 0
+//     0.05    1.6 windows                     81 %              15 / 2   <- default
+//   Healthy rigs at 1.5x the threshold never page at any of these levels.
+//   Hence the guidance: min ~ 0.8x the slowest healthy rig and >= 1.1x a rig
+//   with one failed board (1.35 TH/s for 1.64-2.02 TH/s rigs). A gray-zone rig
+//   pages now and then, and its outstanding LOW masks any later real drop on
+//   it until HASHRATE_OK.
+//   Not judged (no page either way):
+//   - standby workers and sessions (they submit nothing here);
+//   - a worker that is down: OFFLINE's business. A window that ends at the
+//     last share never sees the trailing silence of a rig that stopped or
+//     moved to another node, and an evaluation needs new shares;
+//   - a worker without a full window of settled data. The data restart when
+//     its session set changes (connect, reconnect, failover), when it comes
+//     back up, after a gap of 20 share intervals at the threshold rate (a
+//     paused rig is not a slow one) and while a WORK_STALLED is outstanding
+//     (the node, not the rigs); they count from hashrate_warmup seconds later
+//     (vardiff ramp-up). A just-connected rig is judged no earlier than
+//     warmup + window after it connected.
+//   Budget: the worker events' cap (max_per_hour, digest, held events stay
+//   pending), a LOW not within min_interval of the worker's previous LOW,
+//   nothing inside the startup grace. An outstanding LOW is persisted and
+//   outlives an OFFLINE episode: one LOW per episode, and HASHRATE_OK once the
+//   rig hashes at speed again (also after it came back online). A worker that
+//   moved to another node (RETURNED) drops it silently: that node judges it.
+//   Several sessions of one worker key are judged as one rig at the highest
+//   vardiff among those that hashed, i.e. on their combined rate: one worker
+//   name per rig, or a dead board on one of two same-named rigs is invisible.
+//
 // Persistence (restore()/persist()): known workers with their last-seen time,
 // whether an OFFLINE is outstanding and, for a worker that was down, when its
 // outage began, so a restart neither forgets a rig that never reconnects nor
 // re-pages one already reported, and a later BACK_ONLINE reports the REAL
 // outage length (not "since the node restarted").
 //
-// No money / consensus state: reads a worker key, a session id, a counter and
+// No money / consensus state: reads a worker key, a session id, counters and
 // (through an optional callback) per-address sharechain share times.
 
 #include "alert_relay.hpp"   // Kind, kind_name
@@ -103,7 +162,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <algorithm>
 #include <deque>
 #include <functional>
@@ -119,6 +182,11 @@ struct WorkerSample {
     std::string key;        // "ADDRESS.worker"
     std::string session;    // stratum session id
     uint64_t    accepted{0};
+    // HASHRATE only. The session's current vardiff (0 = unknown) and the work
+    // of its accepted shares since connect, in difficulty-1 units (< 0 =
+    // unknown: accepted shares are then counted at the current vardiff).
+    double      difficulty{0.0};
+    double      work{-1.0};
 };
 
 struct DetectorConfig {
@@ -137,6 +205,13 @@ struct DetectorConfig {
     std::size_t serve_max_per_hour{4};       // node-level events, own budget outside max_per_hour
     int64_t known_expiry{7 * 86400};   // forget workers absent this long
     std::size_t max_workers{4096};     // memory bound on tracked keys
+    // HASHRATE (opt-in): page a worker hashing below this many H/s (0 = off).
+    double  hashrate_min{0.0};
+    int64_t hashrate_window{900};      // seconds of shares per evaluation
+    double  hashrate_alpha{0.05};      // one-sided Poisson level of one evaluation
+    int     hashrate_confirm{2};       // consecutive evaluations before an event
+    double  hashrate_ok_factor{1.1};   // HASHRATE_OK needs the rate above min x this
+    int64_t hashrate_warmup{180};      // after a (re)connect: vardiff settles first
 };
 
 struct DetectorEvent {
@@ -152,6 +227,100 @@ inline std::string fmt_duration(int64_t s)
     if (s < 120) return std::to_string(s) + "s";
     if (s < 7200) return std::to_string(s / 60) + "m";
     return std::to_string(s / 3600) + "h" + std::to_string((s % 3600) / 60) + "m";
+}
+
+// "1.20 TH/s": three significant digits in the largest unit that keeps the
+// value >= 1.
+inline std::string fmt_hashrate(double hps)
+{
+    static const char* units[] = {"H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"};
+    if (!std::isfinite(hps) || hps < 0) hps = 0;
+    std::size_t u = 0;
+    while (hps >= 1000.0 && u + 1 < sizeof(units) / sizeof(units[0])) { hps /= 1000.0; ++u; }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), hps >= 100.0 ? "%.0f %s" : hps >= 10.0 ? "%.1f %s" : "%.2f %s", hps, units[u]);
+    return buf;
+}
+
+// "15 min" for a whole number of minutes, else "90 s".
+inline std::string fmt_window(int64_t s)
+{
+    return s > 0 && s % 60 == 0 ? std::to_string(s / 60) + " min" : std::to_string(s) + " s";
+}
+
+// --alert-relay-hashrate-min: a non-negative rate in H/s with an optional SI
+// unit, e.g. "1200G", "1.2T", "1.2TH/s", "1200 GH/s", "5e11". k, M, G, T, P
+// (any case) scale by 1e3 .. 1e15; an "H" or "H/s" may follow. nullopt for
+// anything else (negative, NaN, trailing garbage).
+inline std::optional<double> parse_hashrate(const std::string& text)
+{
+    std::size_t b = 0, e = text.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(text[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(text[e - 1]))) --e;
+    if (b == e) return std::nullopt;
+    double v = 0;
+    const char* first = text.data() + b;
+    const char* last = text.data() + e;
+    auto [ptr, ec] = std::from_chars(first, last, v);
+    if (ec != std::errc() || ptr == first || !std::isfinite(v) || v < 0) return std::nullopt;
+    std::string unit(ptr, last);
+    if (!unit.empty() && unit.front() == ' ') unit.erase(0, 1);
+    for (auto& c : unit) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    double mult = 1;
+    if (!unit.empty()) {
+        switch (unit.front()) {
+        case 'k': mult = 1e3; break;
+        case 'm': mult = 1e6; break;
+        case 'g': mult = 1e9; break;
+        case 't': mult = 1e12; break;
+        case 'p': mult = 1e15; break;
+        default: mult = 0; break;
+        }
+        if (mult != 0) unit.erase(0, 1);
+        else mult = 1;
+    }
+    if (!unit.empty() && unit != "h" && unit != "h/s") return std::nullopt;
+    const double out = v * mult;
+    if (!std::isfinite(out)) return std::nullopt;
+    return out;
+}
+
+// Poisson tails, exact (summed in log space from the tail's inner edge).
+inline double poisson_sf(uint64_t n, double lam);
+
+// P(N <= n) for N ~ Poisson(lam).
+inline double poisson_cdf(uint64_t n, double lam)
+{
+    if (!(lam > 0)) return 1.0;
+    const double dn = static_cast<double>(n);
+    if (dn >= lam) return std::max(0.0, 1.0 - poisson_sf(n + 1, lam));
+    // Terms fall going down from n (< lam): t(k-1) = t(k) * k / lam.
+    double t = std::exp(dn * std::log(lam) - lam - std::lgamma(dn + 1.0));
+    double sum = 0;
+    for (uint64_t k = n;; --k) {
+        sum += t;
+        if (k == 0 || t < sum * 1e-17) break;
+        t *= static_cast<double>(k) / lam;
+    }
+    return std::min(1.0, sum);
+}
+
+// P(N >= n) for N ~ Poisson(lam).
+inline double poisson_sf(uint64_t n, double lam)
+{
+    if (n == 0) return 1.0;
+    if (!(lam > 0)) return 0.0;
+    const double dn = static_cast<double>(n);
+    if (dn <= lam) return std::max(0.0, 1.0 - poisson_cdf(n - 1, lam));
+    // Terms fall going up from n (> lam): t(k+1) = t(k) * lam / (k + 1).
+    double t = std::exp(dn * std::log(lam) - lam - std::lgamma(dn + 1.0));
+    double sum = 0;
+    for (uint64_t k = n; k < n + 1000000; ++k) {
+        sum += t;
+        if (t < sum * 1e-17) break;
+        t *= lam / static_cast<double>(k + 1);
+    }
+    return std::min(1.0, sum);
 }
 
 // One tick's view of the node's serve path, for the node-level events (see
@@ -194,6 +363,36 @@ public:
         // alert texts). down_since drives the OFFLINE timer and is reset to
         // the detector start on restore; outage_since survives the restart.
         int64_t outage_since{0};
+
+        // HASHRATE (header comment). Cumulative counters since the data last
+        // restarted, and snapshots of them at ticks that brought shares.
+        struct RateSession {
+            uint64_t accepted{0};
+            double   work{-1.0};        // < 0: unknown
+            double   difficulty{0.0};
+            bool     hashed{false};     // advanced since the data restarted
+        };
+        struct RateSnap {
+            int64_t t{0};
+            double  n{0}, work{0}, expo{0};
+        };
+        struct Rate {
+            bool    active{false};      // collecting (worker up, sessions known)
+            std::map<std::string, RateSession> sessions;
+            std::deque<RateSnap> snaps; // >= stride apart, newest = last share
+            double  n{0}, work{0}, expo{0};
+            int64_t last_tick{0};
+            int64_t last_share{0};
+            int64_t settled_at{0};      // shares before this do not count
+            int64_t last_eval{0};
+            int64_t last_eval_end{0};   // window end of the last evaluation
+            int     low_streak{0};
+            int     ok_streak{0};
+            double  rate{-1.0};         // last measured H/s (status); < 0 = none
+            bool    low_alerted{false}; // a HASHRATE_LOW is outstanding (persisted)
+            int64_t low_since{0};       // when it fired (persisted)
+            int64_t last_low_alert{0};  // (persisted)
+        } rate;
     };
 
     // Node-level serve state (NODE LEVEL above).
@@ -226,6 +425,10 @@ public:
     // Bumped whenever persisted state changes (new worker, up/down, alert
     // emitted, worker forgotten) -- NOT on the per-tick last_seen refresh.
     uint64_t generation() const { return m_gen; }
+    // HASHRATE: evaluations run, and those that showed low evidence (a page
+    // needs hashrate_confirm of them in a row).
+    uint64_t hashrate_evaluations() const { return m_rate_evals; }
+    uint64_t hashrate_low_evidence() const { return m_rate_low_evidence; }
 
     void set_address_activity(AddressActivityFn fn) { m_activity = std::move(fn); }
 
@@ -251,6 +454,11 @@ public:
             s.outage_since = persisted_outage > 0 ? persisted_outage : (s.last_seen > 0 ? s.last_seen : m_start);
             if (s.outage_since > m_start) s.outage_since = m_start;
             s.down_cause = "not reconnected since node restart";
+            if (m_cfg.hashrate_min > 0 && it.value().value("hashrate_low", false)) {
+                s.rate.low_alerted = true;
+                s.rate.low_since = it.value().value("hashrate_low_since", int64_t{0});
+                s.rate.last_low_alert = it.value().value("last_hashrate_alert", int64_t{0});
+            }
             m_workers.emplace(it.key(), std::move(s));
         }
         ++m_gen;
@@ -290,6 +498,11 @@ public:
                     {"offline_alerted", s.offline_alerted},
                     {"last_offline_alert", s.last_offline_alert},
                     {"outage_since", s.up ? int64_t{0} : s.outage_since}};
+            if (s.rate.low_alerted) {
+                j[k]["hashrate_low"] = true;
+                j[k]["hashrate_low_since"] = s.rate.low_since;
+                j[k]["last_hashrate_alert"] = s.rate.last_low_alert;
+            }
         }
         return j;
     }
@@ -302,15 +515,24 @@ public:
         std::vector<DetectorEvent> out;
 
         // 1) aggregate the registry per worker key
-        struct Agg { std::map<std::string, uint64_t> sessions; };
+        struct Agg {
+            std::map<std::string, uint64_t> sessions;
+            std::map<std::string, State::RateSession> rate;   // HASHRATE inputs
+        };
         std::map<std::string, Agg> agg;
         for (const auto& s : samples) {
             if (s.key.empty()) continue;
-            auto& acc = agg[s.key].sessions[s.session];
+            auto& a = agg[s.key];
+            auto& acc = a.sessions[s.session];
             acc = std::max(acc, s.accepted);
+            auto& r = a.rate[s.session];
+            r.accepted = acc;
+            r.work = std::max(r.work, s.work);
+            r.difficulty = std::max(r.difficulty, s.difficulty);
         }
 
         // 2) fold into per-worker state
+        std::map<std::string, std::map<std::string, State::RateSession>> rate_inputs;
         for (auto& [key, a] : agg) {
             auto it = m_workers.find(key);
             if (it == m_workers.end()) {
@@ -328,6 +550,7 @@ public:
             st.last_seen = now;
             st.sessions = std::move(a.sessions);
             if (evidence) st.last_evidence = now;
+            if (m_cfg.hashrate_min > 0) rate_inputs[key] = std::move(a.rate);
         }
         for (auto& [key, st] : m_workers) {
             if (agg.count(key)) continue;
@@ -390,6 +613,7 @@ public:
                     st.last_evidence = 0;
                     st.defer_since = 0;
                     st.down_cause = "mining on another node";
+                    st.rate = State::Rate{};   // its hashrate is judged there
                     ++m_gen;
                 }
             }
@@ -398,6 +622,15 @@ public:
         // 3b) node level: no work handed out while hashing miners are attached.
         // Ahead of the worker events, so the hourly cap admits it first.
         if (serve && m_cfg.serve_stall_after > 0) serve_check(*serve, now, out);
+
+        // 3c) HASHRATE data: what each hashing worker delivered this tick.
+        if (m_cfg.hashrate_min > 0) {
+            static const std::map<std::string, State::RateSession> kNone;
+            for (auto& [key, st] : m_workers) {
+                auto in = rate_inputs.find(key);
+                rate_collect(st, in == rate_inputs.end() ? kNone : in->second, now);
+            }
+        }
 
         // 4) events
         for (auto& [key, st] : m_workers) {
@@ -438,6 +671,8 @@ public:
                 st.offline_alerted = false;
                 ++m_gen;
             }
+            if (m_cfg.hashrate_min > 0 && st.up && st.ever_up && !st.offline_alerted)
+                rate_check(key, st, now, out);
         }
 
         // 5) forget long-absent workers (bounded memory)
@@ -454,7 +689,7 @@ public:
     nlohmann::json status_json(int64_t now) const
     {
         nlohmann::json w = nlohmann::json::object();
-        for (const auto& [k, s] : m_workers)
+        for (const auto& [k, s] : m_workers) {
             w[k] = {{"up", s.up},
                     {"since", s.up ? s.up_since : s.down_since},
                     {"offline_alerted", s.offline_alerted},
@@ -462,7 +697,17 @@ public:
                     // Never hashed here (or returned to another node): a
                     // failover connection, not paged.
                     {"standby", is_standby(s)}};
+            if (m_cfg.hashrate_min > 0) {
+                // Last measured rate over a full window (null until there is one).
+                w[k]["hashrate"] = s.rate.rate >= 0 ? nlohmann::json(s.rate.rate) : nlohmann::json();
+                w[k]["hashrate_low"] = s.rate.low_alerted;
+            }
+        }
         return {{"workers", w},
+                {"hashrate", {{"min", m_cfg.hashrate_min},
+                              {"window", m_cfg.hashrate_window},
+                              {"evaluations", m_rate_evals},
+                              {"low_evidence", m_rate_low_evidence}}},
                 {"serve", {{"stall_after", m_cfg.serve_stall_after},
                            {"quiet", m_serve.quiet},
                            {"sessions", m_serve.sessions},
@@ -559,6 +804,170 @@ private:
         ++m_gen;
     }
 
+    // ── HASHRATE (header comment) ───────────────────────────────────────
+    static constexpr double  kTwo32 = 4294967296.0;
+    static constexpr int64_t kRateMaxTickGap = 60;   // a longer tick gap restarts the data
+    static constexpr int64_t kRateMinGap = 120;      // shortest share gap that counts as a pause
+    static constexpr double  kRateGapIntervals = 20; // ... else this many intervals at the threshold
+
+    int64_t rate_stride() const { return std::max<int64_t>(15, m_cfg.hashrate_window / 60); }
+    int64_t rate_eval_every() const { return std::max<int64_t>(5, m_cfg.hashrate_window / 3); }
+
+    // Start the window data again from the sessions as they are now; shares
+    // count from `settled_at` on. Keeps the alert state (low_alerted, ...).
+    static void rate_restart(State::Rate& r, const std::map<std::string, State::RateSession>& in,
+                             int64_t now, int64_t settled_at)
+    {
+        r.active = true;
+        r.sessions = in;
+        for (auto& [sid, rs] : r.sessions) rs.hashed = false;
+        r.snaps.clear();
+        r.n = r.work = r.expo = 0;
+        r.last_tick = now;
+        r.last_share = 0;
+        r.settled_at = settled_at;
+        r.last_eval_end = 0;
+        r.low_streak = r.ok_streak = 0;
+    }
+
+    static void rate_stop(State::Rate& r)
+    {
+        if (!r.active) return;
+        r.active = false;
+        r.sessions.clear();
+        r.snaps.clear();
+        r.low_streak = r.ok_streak = 0;
+    }
+
+    void rate_collect(State& st, const std::map<std::string, State::RateSession>& in, int64_t now)
+    {
+        State::Rate& r = st.rate;
+        // Judged only while it hashes here, and not across a node-level outage.
+        if (!st.up || !st.present || !st.ever_up || in.empty() || m_serve.alerted) {
+            rate_stop(r);
+            return;
+        }
+        bool same = r.active && r.sessions.size() == in.size() && now > r.last_tick &&
+                    now - r.last_tick <= kRateMaxTickGap;
+        for (auto it = in.begin(); same && it != in.end(); ++it) {
+            auto p = r.sessions.find(it->first);
+            same = p != r.sessions.end() && it->second.accepted >= p->second.accepted;
+        }
+        if (!same) {
+            rate_restart(r, in, now, now + m_cfg.hashrate_warmup);
+            return;
+        }
+        const double dt = static_cast<double>(now - r.last_tick);
+        double dn = 0, dwork = 0, dref = 0, dany = 0;
+        for (const auto& [sid, cur] : in) {
+            State::RateSession& prev = r.sessions[sid];
+            const uint64_t adv = cur.accepted - prev.accepted;
+            if (adv > 0) {
+                dn += static_cast<double>(adv);
+                const bool known = cur.work >= 0 && prev.work >= 0 && cur.work >= prev.work;
+                dwork += known ? cur.work - prev.work : static_cast<double>(adv) * cur.difficulty;
+                prev.hashed = true;
+            }
+            prev.accepted = cur.accepted;
+            prev.work = cur.work;
+            prev.difficulty = cur.difficulty;
+            dany = std::max(dany, cur.difficulty);
+            if (prev.hashed) dref = std::max(dref, cur.difficulty);
+        }
+        if (dref <= 0) dref = dany;
+        if (!(dref > 0) || !std::isfinite(dref)) {   // no vardiff to judge against
+            rate_restart(r, in, now, now + m_cfg.hashrate_warmup);
+            return;
+        }
+        r.last_tick = now;
+        bool paused = false;
+        if (dn > 0) {
+            // A gap no rig at the threshold rate would leave is a pause, not
+            // a slow rig: the window starts again at this share.
+            const double interval = dref * kTwo32 / m_cfg.hashrate_min;
+            const int64_t gap_limit = std::max<int64_t>(
+                kRateMinGap, static_cast<int64_t>(std::min(kRateGapIntervals * interval, 1e9)));
+            paused = r.last_share > 0 && now - r.last_share > gap_limit;
+            r.last_share = now;
+        }
+        r.expo += dt / (dref * kTwo32);
+        r.n += dn;
+        r.work += dwork;
+        if (paused) {
+            r.snaps.clear();
+            r.low_streak = r.ok_streak = 0;
+            r.last_eval_end = 0;
+            r.settled_at = std::max(r.settled_at, now);   // a warm-up still running keeps going
+        }
+        if (dn > 0 && now >= r.settled_at) {
+            const State::RateSnap snap{now, r.n, r.work, r.expo};
+            if (r.snaps.size() >= 2 && r.snaps.back().t - r.snaps[r.snaps.size() - 2].t < rate_stride())
+                r.snaps.back() = snap;
+            else
+                r.snaps.push_back(snap);
+            // Keep one snapshot at or before (newest - window) as the window start.
+            while (r.snaps.size() >= 2 && r.snaps[1].t <= r.snaps.back().t - m_cfg.hashrate_window)
+                r.snaps.pop_front();
+        }
+    }
+
+    void rate_check(const std::string& key, State& st, int64_t now, std::vector<DetectorEvent>& out)
+    {
+        State::Rate& r = st.rate;
+        if (!r.active || r.snaps.size() < 2) return;
+        const State::RateSnap& a = r.snaps.front();
+        const State::RateSnap& b = r.snaps.back();
+        if (b.t - a.t < m_cfg.hashrate_window) return;   // no full window of settled data yet
+        if (b.t <= r.last_eval_end) return;              // nothing new since the last evaluation
+        if (r.last_eval != 0 && now - r.last_eval < rate_eval_every()) return;
+        r.last_eval = now;
+        r.last_eval_end = b.t;
+        const double span = static_cast<double>(b.t - a.t);
+        const double expo = b.expo - a.expo;
+        if (!(expo > 0)) return;
+        const uint64_t n = static_cast<uint64_t>(std::llround(std::max(0.0, b.n - a.n)));
+        const double rate = std::max(0.0, b.work - a.work) * kTwo32 / span;
+        const double lam = m_cfg.hashrate_min * expo;   // shares expected at the threshold
+        r.rate = rate;
+        ++m_rate_evals;
+        const std::string window = fmt_window(m_cfg.hashrate_window);
+        if (!r.low_alerted) {
+            const bool low = rate < m_cfg.hashrate_min && poisson_cdf(n, lam) < m_cfg.hashrate_alpha;
+            if (low) ++m_rate_low_evidence;
+            r.low_streak = low ? r.low_streak + 1 : 0;
+            if (r.low_streak < m_cfg.hashrate_confirm || now < m_grace_until) return;
+            if (r.last_low_alert != 0 && now - r.last_low_alert < m_cfg.min_interval) return;
+            if (!admit_rate(key, now, out)) return;   // held: pending while the evidence holds
+            DetectorEvent ev;
+            ev.kind = Kind::HashrateLow;
+            ev.worker = key;
+            ev.ts = now;
+            ev.detail = fmt_hashrate(rate) + " < " + fmt_hashrate(m_cfg.hashrate_min) + " (" + window + ")";
+            out.push_back(std::move(ev));
+            r.low_alerted = true;
+            r.low_since = now;
+            r.last_low_alert = now;
+            r.low_streak = r.ok_streak = 0;
+            ++m_gen;
+            return;
+        }
+        const double ok_min = m_cfg.hashrate_min * m_cfg.hashrate_ok_factor;
+        const bool ok = rate > ok_min && poisson_sf(n, lam * m_cfg.hashrate_ok_factor) < m_cfg.hashrate_alpha;
+        r.ok_streak = ok ? r.ok_streak + 1 : 0;
+        if (r.ok_streak < m_cfg.hashrate_confirm || now < m_grace_until) return;
+        if (!admit_rate(key, now, out)) return;
+        DetectorEvent ev;
+        ev.kind = Kind::HashrateOk;
+        ev.worker = key;
+        ev.ts = now;
+        ev.detail = fmt_hashrate(rate) + " (threshold " + fmt_hashrate(m_cfg.hashrate_min) + ", " + window +
+                    "); low for " + fmt_duration(now - (r.low_since > 0 ? r.low_since : now));
+        out.push_back(std::move(ev));
+        r.low_alerted = false;
+        r.low_streak = r.ok_streak = 0;
+        ++m_gen;
+    }
+
     // Payout address of a worker key ("ADDRESS.worker" or the bare address).
     static std::string address_of(const std::string& key)
     {
@@ -628,6 +1037,8 @@ private:
     bool m_serve_was_holding{false};    // ... and on the previous tick
     uint64_t m_serve_held{0};
     uint64_t m_gen{0};
+    uint64_t m_rate_evals{0};
+    uint64_t m_rate_low_evidence{0};
     AddressActivityFn m_activity;
 };
 
