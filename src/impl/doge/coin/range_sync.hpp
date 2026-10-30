@@ -443,7 +443,10 @@ private:
         m_inflight.erase(it);
     }
 
-    void exclude_locked(const std::string& peer, const char* why)
+    // By value (as core::coin::BlockDownload::cool_down, 2df2fbbac): both
+    // erase in-flight entries, and a peer string taken from one of them would
+    // be read after it is freed. No caller passes one today.
+    void exclude_locked(std::string peer, const char* why)
     {
         if (peer.empty() || m_excluded.count(peer))
             return;
@@ -462,7 +465,7 @@ private:
     }
 
     /// A strike: the peer is cooled; STRIKES of them exclude it.
-    void strike_locked(const std::string& peer, Clock::time_point now, const char* why)
+    void strike_locked(std::string peer, Clock::time_point now, const char* why)
     {
         auto& ps = m_peers[peer];
         ++ps.strikes;

@@ -862,8 +862,11 @@ private:
 
     /// Rotate `peer` out for PEER_COOLDOWN; its outstanding requests go to
     /// other peers at the next refill.
-    void cool_down(const std::string& peer, std::chrono::steady_clock::time_point t)
+    void cool_down(std::string peer, std::chrono::steady_clock::time_point t)
     {
+        // By value, as core::coin::BlockDownload's (2df2fbbac): the loop below
+        // erases in-flight entries, and a peer string taken from one of them
+        // would be read after it is freed. No caller passes one today.
         if (peer.empty())
             return;
         m_cooldown[peer] = t + PEER_COOLDOWN;
