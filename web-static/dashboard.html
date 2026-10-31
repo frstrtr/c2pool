@@ -2094,6 +2094,7 @@
                         <span class="badge" id="luck_current_round" style="background: var(--primary);" title="Current round luck">Round: -</span>
                         <span class="badge" id="luck_seven_days" style="background: var(--primary);" title="7-day average luck">7d: -</span>
                         <span class="badge" id="luck_thirty_days" style="background: var(--primary);" title="30-day average luck">30d: -</span>
+                        <span class="badge" id="luck_average" style="background: var(--primary);" title="Average luck over every block with a luck measurement">Avg: -</span>
                     </div>
                 </div>
                 <div class="table-scroll">
@@ -4997,6 +4998,18 @@
                         .style('background', thirtyDayLuck >= 100 ? 'var(--success)' : (thirtyDayLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
                 } else {
                     d3.select('#luck_thirty_days').text('30d: -').style('background', 'var(--primary)');
+                }
+
+                // All-time average from the backend (null when no block has a
+                // luck measurement, rendered as '-', never as 0%).
+                if (luckData.avg_luck != null) {
+                    var avgLuck = luckData.avg_luck;
+                    d3.select('#luck_average')
+                        .text('Avg: ' + d3.format('.0f')(avgLuck) + '%')
+                        .attr('title', 'Average luck over ' + luckData.blocks_with_luck + ' of ' + luckData.blocks_found + ' blocks with a luck measurement (min ' + d3.format('.0f')(luckData.min_luck) + '%, max ' + d3.format('.0f')(luckData.max_luck) + '%)')
+                        .style('background', avgLuck >= 100 ? 'var(--success)' : (avgLuck >= 75 ? 'var(--warning)' : 'var(--danger)'));
+                } else {
+                    d3.select('#luck_average').text('Avg: -').style('background', 'var(--primary)');
                 }
             });
         }
