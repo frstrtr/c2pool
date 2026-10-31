@@ -126,6 +126,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # vin/vout, HogEx not last / missing, txid, pegin outputs vs HogEx inputs,
     # fees vs coinbasevalue) refuses the template that breaks it. Same
     # fold-into-core_test reasoning as every TU here.
+    # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
+    # held (another process, another handle) fails and leaves LOCK alone; an
+    # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -148,6 +151,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         inject_status_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
+        leveldb_store_lock_test.cpp
         listener_family_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
@@ -176,6 +180,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_link_libraries(core_test PRIVATE c2pool_storage)  # leveldb_store_lock_test: SharechainStorage
 
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
