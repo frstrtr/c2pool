@@ -142,6 +142,12 @@ public:
     MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
     ~MiningInterface();
 
+    /// Stop and join the background threads (the PPLNS pre-computation, the
+    /// graph-view seed). Their work runs the owner's callbacks: the owner
+    /// calls this before those go away (main_ltc's ordered shutdown). Also
+    /// run by the destructor; idempotent.
+    void stop_background();
+
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
     nlohmann::json submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id = "");
@@ -1685,7 +1691,8 @@ private:
     std::mutex m_pplns_cache_mutex;
     std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
     std::atomic<bool> m_pplns_precompute_done{false};
-    std::atomic<bool> m_pplns_precompute_started{false};  // prevents re-spawn after detach
+    std::atomic<bool> m_pplns_precompute_started{false};  // spawned once
+    std::atomic<bool> m_pplns_precompute_stop{false};     // stop_background(): end the thread
     // Cached full merged payouts (LTC + DOGE) — updated by cache_pplns_at_tip()
     mutable std::mutex m_merged_payouts_mutex;
     nlohmann::json m_cached_merged_payouts;

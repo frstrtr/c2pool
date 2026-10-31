@@ -2171,6 +2171,10 @@ int main(int argc, char* argv[]) {
                 // 1. No new work: the HTTP API and stratum, the coin peers (no
                 //    more blocks, headers or txs), the merged-mining poll.
                 web_server.stop();
+                // The mining interface's background threads run this scope's
+                // callbacks (the PPLNS walk: a detached thread read a freed
+                // MiningInterface at teardown, r16 live harness).
+                web_server.get_mining_interface()->stop_background();
                 if (embedded_broadcaster)
                     embedded_broadcaster->stop();
                 if (shutdown_stop_merged)
