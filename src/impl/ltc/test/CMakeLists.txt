@@ -137,6 +137,82 @@ if (BUILD_TESTING AND GTest_FOUND)
     # a loose HogEx -- counted by code with the kernel fees given up. Same
     # folding rule.
     #
+    # doge_template_gate_test.cpp: the embedded DOGE template never carries
+    # txs its tip confirmed: a pool not cleaned for the tip yields a
+    # coinbase-only template marked degraded (a sibling's body does not
+    # count), and the merged-mining poll fetches again until it is clean.
+    # Same folding rule.
+    #
+    # doge_utxo_lane_test.cpp: the embedded DOGE UTXO set follows the best
+    # chain in height order and through reorgs (#2070): doge::coin::UtxoLane,
+    # the object main_ltc.cpp's DOGE full-block and tip handlers call, over a
+    # REAL UTXOViewCache/UTXOViewDB -- a taller heavier branch is a reorg,
+    # out-of-order bodies connect in order, every block of a new branch is
+    # connected, a legacy undo record rebuilds, and a child of a tx confirmed
+    # only on the old branch never reaches the template without its parent.
+    # Same folding rule.
+    #
+    # doge_utxo_full_test.cpp: the full DOGE UTXO set (doge::coin::UtxoLane,
+    # Mode::Full, over doge_utxo_lane_harness.hpp): armed from height 1 in
+    # order within the window, every block from best + 1 after a restart, the
+    # mining gate closed until the set is built from genesis, a body spending
+    # a coin the set does not hold refused. Same folding rule.
+    #
+    # doge_utxo_full_wiring_test.cpp: the rules main_ltc's DOGE handlers apply
+    # through doge::coin::UtxoFullState (every copy of a deep body placed, the
+    # pool's tip never 0, start live only near the tip, the swap on every
+    # completion). Same folding rule.
+    #
+    # doge_mempool_validity_test.cpp: a tx reaches a DOGE template only when
+    # priced against the set: a premature coinbase spend is refused at
+    # admission, nothing is selected without a view, an orphan waits outside
+    # the pool and is admitted priced when its parent is. Same folding rule.
+    #
+    # doge_hash_schedule_test.cpp: the DOGE block hash at every height below
+    # the header checkpoint (doge::coin::HashSchedule), served only once the
+    # hash chain links from genesis into the checkpoint. Same folding rule.
+    #
+    # doge_range_sync_test.cpp: the anchored, parallel hash schedule
+    # (doge::coin::RangeSync): exact 2,000-header ranges between anchors, the
+    # sequential sync as the fallback, the headers routing. Same folding rule.
+    #
+    # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
+    # runs one merged-work poll at once (the DOGE tip handler's poke), without
+    # the poll timer. Same folding rule.
+    #
+    # doge_template_budget_test.cpp: embedded DOGE templates dogecoind can
+    # accept: a REAL DOGE TemplateBuilder template over a mempool above 1 MB,
+    # within the merged-mining size budget, assembles (REAL AuxPoW and PPLNS
+    # coinbase producers, 4,000 payees on both chains) to at most 1,000,000
+    # bytes (bad-blk-length); curtime and mintime above the median time past
+    # (time-too-old). Same folding rule.
+    #
+    # ltc_template_time_test.cpp: the embedded LTC template's curtime and
+    # mintime are above the parent's median time past (time-too-old). Same
+    # folding rule.
+    #
+    # found_block_verify_test.cpp: the dashboard verdict on a found LTC block
+    # and a found DOGE block (ltc::coin::found_block, the verifiers main_ltc
+    # wires): a side-branch block is never confirmed, a block the chain never
+    # saw is orphaned once the chain is 6 deep from its height, a live DOGE
+    # tip is not a confirmation, a best-chain block confirms once 6 deep.
+    # Same folding rule.
+    #
+    # merged_found_record_test.cpp: a merged find on a stale job is recorded
+    # as the block the share committed to (its hash and height from the
+    # frozen snapshot), not the current work. Same folding rule.
+    #
+    # auxpow_tree_slot_test.cpp: merged-mining chain merkle tree slots are the
+    # aux daemons' CAuxPow::getExpectedIndex (#2060): two chains {98, 1} at
+    # {0, 1}, colliding ids grow the tree, every proof carries the index and
+    # size the daemon checks. Same folding rule.
+    #
+    # merged_rebuild_payouts_test.cpp: the merged work is always buildable: a
+    # rebuild without payouts never commits to the parent's hash (keeps the
+    # last block on the same parent, else no commitment), a stale rebuild is
+    # not frozen under a newer template, and MergedPayoutSource produces the
+    # payouts while the tracker lock is busy. Same folding rule.
+    #
     # doge_auxpow_witness_test.cpp: the AuxPoW parent (LTC) coinbase read as
     # Dogecoin Core reads it, witness allowed: REAL mainnet 'headers' entries
     # whose parent coinbase carries the BIP144 witness (h4715979, h5080796,
@@ -153,11 +229,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # its end yields the clean prefix (entries that link) and truncated_at,
     # never garbage that reads like another chain; the parent coinbase params
     # (wire: witness, no MWEB; txid: stripped). Same folding rule.
+    #
+    # doge_schedule_witness_test.cpp: the hash schedule fed the parse of the
+    # captured witness-coinbase batches (h4715979, h5080796, h5641398,
+    # h6101857) extends by the whole batch; an asked peer's answer cuts
+    # nothing. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
         auto_ratchet_sim_test.cpp
         auto_ratchet_tail_guard_test.cpp
+        auxpow_tree_slot_test.cpp
         broadcast_lock_discipline_test.cpp
         broadcast_tx_completeness_test.cpp
         build_stops_test.cpp
@@ -170,12 +252,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
+        doge_hash_schedule_test.cpp
         doge_headers_parse_test.cpp
+        doge_mempool_validity_test.cpp
         doge_p2p_raw_parser_test.cpp
+        doge_range_sync_test.cpp
+        doge_schedule_witness_test.cpp
+        doge_template_budget_test.cpp
+        doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
+        doge_utxo_full_test.cpp
+        doge_utxo_full_wiring_test.cpp
+        doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp
         found_block_peer_txid_test.cpp
+        found_block_verify_test.cpp
         head_retention_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp
@@ -183,7 +275,11 @@ if (BUILD_TESTING AND GTest_FOUND)
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
+        ltc_template_time_test.cpp
         mempool_mweb_admission_test.cpp
+        merged_found_record_test.cpp
+        merged_rebuild_payouts_test.cpp
+        merged_refresh_request_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp

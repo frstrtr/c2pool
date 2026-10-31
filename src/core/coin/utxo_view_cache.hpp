@@ -195,6 +195,97 @@ public:
         return undo;
     }
 
+    /// The first input a strict connect could not find.
+    struct StrictRefusal {
+        Outpoint missing;      // the input's prevout
+        uint256  txid;         // the transaction spending it
+        uint32_t tx_index{0};  // its position in the block
+        bool     spent_in_block{false};  // an earlier tx of the same block spent it (no valid
+                                         // block does: a mutated or forged body)
+    };
+
+    /// connect_block with the mode explicit. strict = false is the call above
+    /// (an input the view does not hold is recorded as unknown: a partial
+    /// view). strict = true is for a set built from genesis: every input must
+    /// be a coin the view holds, or an output of an earlier transaction of the
+    /// same block, and each is spent once (Dogecoin Core CheckTxInputs,
+    /// bad-txns-inputs-missingorspent). Otherwise the block is refused:
+    /// nullopt, nothing touched, `why` names the input.
+    /// A strict connect keeps zero-value outputs, as Core's chainstate does
+    /// (only an IsUnspendable output is left out: coins.h ClearUnspendable),
+    /// and counts the set's coins for the sync state.
+    template <typename BlockType, typename TxidFn>
+    std::optional<BlockUndo> connect_block(const BlockType& block, uint32_t height, TxidFn txid_fn,
+                                           const uint256& block_hash, bool strict,
+                                           StrictRefusal* why = nullptr) {
+        if (!strict)
+            return connect_block(block, height, txid_fn, block_hash);
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        // The block's changes, applied to the view only once every input resolved.
+        std::unordered_map<Outpoint, std::optional<Coin>, OutpointHasher> overlay;
+        bool spent_in_block = false;
+        auto lookup = [&](const Outpoint& op, Coin& coin) {
+            auto it = overlay.find(op);
+            if (it != overlay.end()) {
+                if (!it->second.has_value()) {
+                    spent_in_block = true;  // spent earlier in this block
+                    return false;
+                }
+                coin = *it->second;
+                return true;
+            }
+            return get_coin_locked(op, coin);
+        };
+        BlockUndo undo;
+        undo.block_hash = block_hash;
+        int64_t delta = 0;
+        for (size_t t = 0; t < block.m_txs.size(); ++t) {
+            const auto& tx = block.m_txs[t];
+            const uint256 txid = txid_fn(tx);
+            const bool is_coinbase = t == 0;
+            bool is_hogex = false;
+            if constexpr (requires { tx.m_hogEx; }) {
+                is_hogex = tx.m_hogEx;
+            }
+            if (!is_coinbase) {
+                TxUndo tx_undo;
+                for (const auto& vin : tx.vin) {
+                    Outpoint op(vin.prevout.hash, vin.prevout.index);
+                    Coin spent;
+                    if (!lookup(op, spent)) {
+                        if (why) {
+                            why->missing = op;
+                            why->txid = txid;
+                            why->tx_index = static_cast<uint32_t>(t);
+                            why->spent_in_block = spent_in_block;
+                        }
+                        return std::nullopt;
+                    }
+                    overlay[op] = std::nullopt;
+                    tx_undo.spent_coins.push_back(std::move(spent));
+                    tx_undo.spent_outpoints.push_back(op);
+                    --delta;
+                }
+                undo.tx_undos.push_back(std::move(tx_undo));
+            }
+            for (uint32_t i = 0; i < static_cast<uint32_t>(tx.vout.size()); ++i) {
+                const auto& vout = tx.vout[i];
+                if (is_unspendable(vout.scriptPubKey))
+                    continue;
+                const bool is_pegout = is_hogex && i > 0;
+                Outpoint op(txid, i);
+                overlay[op] = Coin(vout.value, vout.scriptPubKey, height, is_coinbase, is_pegout);
+                undo.added_outpoints.push_back(op);
+                ++delta;
+            }
+        }
+        for (auto& [op, change] : overlay)
+            m_cache[op] = std::move(change);
+        m_coin_delta += delta;
+        ++m_blocks_connected;
+        return undo;
+    }
+
     /// Disconnect a block using only its undo record (no full block needed):
     /// put back every coin the block spent, then remove every output it added.
     /// Reference: LTC validation.cpp DisconnectBlock() lines 1777-1841,
@@ -203,7 +294,13 @@ public:
     /// A legacy record (no outpoints, BlockUndo::restorable() false) cannot put
     /// the spent coins back: only the block's outputs are removed (a rolled-back
     /// coin must never price) and false is returned; the caller decides.
-    bool disconnect_from_undo(const BlockUndo& undo) {
+    ///
+    /// every_coin_known: the record comes from a strict connect, which refuses
+    /// an input the view does not hold, so every spent coin in it is a real
+    /// coin - including one with value 0 and an empty script, which Core keeps
+    /// (coins.cpp AddCoin skips only IsUnspendable) and Coin::is_spent() would
+    /// otherwise read as "not in the view at connect". All are restored.
+    bool disconnect_from_undo(const BlockUndo& undo, bool every_coin_known = false) {
         std::unique_lock<std::shared_mutex> lock(m_mu);
         if (!undo.restorable()) {
             for (const auto& op : undo.added_outpoints)
@@ -212,7 +309,7 @@ public:
                       << " spent coin(s) cannot be restored; only the block's outputs were removed";
             return false;
         }
-        disconnect_locked(undo);
+        disconnect_locked(undo, every_coin_known);
         return true;
     }
 
@@ -274,11 +371,51 @@ public:
         for (auto& [op, change] : m_cache)
             changes[op] = change;
 
-        if (!m_base->write_batch(changes, best_block, best_height))
+        if (!m_base->write_batch(changes, best_block, best_height, m_coin_delta))
             return false;
 
         m_cache.clear();
+        m_coin_delta = 0;
         return true;
+    }
+
+    /// Drop the changes not flushed yet (after a flush that failed): the
+    /// view is the backing DB's again, at its best block.
+    void discard_pending() {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        m_cache.clear();
+        m_coin_delta = 0;
+    }
+
+    // ── Sync state ('S', UTXOViewDB) ────────────────────────────────────
+
+    /// The backing DB's sync state ({anchor unknown} without a DB or record).
+    SyncState sync_state() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        return m_base ? m_base->get_sync_state() : SyncState{};
+    }
+
+    /// Write the sync state (anchor, strict, synced); best_height and coins
+    /// follow every flush from then on.
+    bool set_sync_state(const SyncState& s) {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        return m_base && m_base->put_sync_state(s);
+    }
+
+    /// First height whose coins the set holds (SyncState::ANCHOR_UNKNOWN: a
+    /// legacy accrual view that never recorded one).
+    uint32_t anchor_height() const { return sync_state().anchor_height; }
+
+    /// The set holds every coin of the best chain up to its tip: it was
+    /// built from genesis and its best block IS the tip (`chain_hash` at
+    /// `chain_height`), not only at the tip's height (a sibling of the tip
+    /// is not the tip's set).
+    bool complete(uint32_t chain_height, const uint256& chain_hash) const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        if (!m_base || chain_hash.IsNull())
+            return false;
+        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height
+            && m_base->get_best_block() == chain_hash;
     }
 
     /// Re-anchor the view: drop all in-memory pending changes AND wipe the
@@ -299,6 +436,7 @@ public:
         m_cache.clear();
         m_blocks_connected = 0;
         m_oldest_undo_height = 0;
+        m_coin_delta = 0;
         return true;
     }
 
@@ -319,8 +457,8 @@ public:
     }
 
     /// Number of blocks connected since startup (or loaded from DB on restart).
-    /// Used for coinbase maturity gate — mining blocked until this reaches
-    /// the chain's COINBASE_MATURITY depth.
+    /// The LTC and accrual DOGE mining gates read it (coinbase maturity
+    /// depth); a set with a sync state is gated by complete() instead.
     uint32_t blocks_connected() const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
         return m_blocks_connected;
@@ -396,15 +534,16 @@ private:
     // result because writing and deleting a coin are idempotent: the result is
     // still the set with the block's effects undone. A coin recorded as
     // unknown (not in the view at connect, e.g. a partial view after a jump
-    // start) has nothing to restore.
-    void disconnect_locked(const BlockUndo& undo) {
+    // start) has nothing to restore; with every_coin_known (a strict record)
+    // no coin is unknown.
+    void disconnect_locked(const BlockUndo& undo, bool every_coin_known = false) {
         size_t unknown = 0, overwrite = 0, missing = 0;
         // Pass 1 — restore spent inputs: txs in reverse, inputs in reverse
         // (Core DisconnectBlock L1792, L1818-1823; ApplyTxInUndo L1751).
         for (auto tu = undo.tx_undos.rbegin(); tu != undo.tx_undos.rend(); ++tu) {
             for (size_t j = tu->spent_coins.size(); j-- > 0;) {
                 const Coin& c = tu->spent_coins[j];
-                if (c.is_spent()) {
+                if (!every_coin_known && c.is_spent()) {
                     ++unknown;
                     continue;
                 }
@@ -412,6 +551,8 @@ private:
                 Coin cur;
                 if (get_coin_locked(op, cur))
                     ++overwrite;  // Core: overwriting transaction output
+                else
+                    ++m_coin_delta;
                 m_cache[op] = c;  // value, script, height, coinbase, pegout
             }
         }
@@ -420,6 +561,8 @@ private:
             Coin cur;
             if (!get_coin_locked(op, cur))
                 ++missing;        // Core: transaction output mismatch
+            else
+                --m_coin_delta;
             m_cache[op] = std::nullopt;
         }
         if (overwrite || missing) {
@@ -450,6 +593,7 @@ private:
     UTXOViewDB* m_base;
     uint32_t m_blocks_connected{0};
     uint32_t m_oldest_undo_height{0};
+    int64_t  m_coin_delta{0};  // coins added minus removed since the last flush (sync state)
     // Cache: outpoint → optional<Coin>
     //   - has_value() && !is_spent(): coin exists
     //   - nullopt: coin was spent (erased)

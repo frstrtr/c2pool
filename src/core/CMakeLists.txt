@@ -39,6 +39,7 @@ set(source
     stratum_work_source.hpp
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
+    leveldb_pread_env.hpp leveldb_pread_env.cpp
     address_validator.hpp address_validator.cpp
     # Control-plane settings foundation (M0): declarative param catalog +
     # monolithic settings-file loader with per-key source, tri-state, money gate.
@@ -65,6 +66,12 @@ add_library(core_util STATIC core_util.cpp)
 # on the default include path; the github-hosted live-bootstrap gate has boost
 # only as conan target-scoped includes, so the leaf must carry the header path.
 target_link_libraries(core_util PUBLIC Boost::headers)
+
+# The pread Env derives from LevelDB's classes; LevelDB is built without RTTI
+# (no typeinfo for them), so that file is too.
+if(NOT MSVC)
+    set_source_files_properties(leveldb_pread_env.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+endif()
 
 add_library(core OBJECT ${source})
 target_link_libraries(core PUBLIC core_util btclibs)
