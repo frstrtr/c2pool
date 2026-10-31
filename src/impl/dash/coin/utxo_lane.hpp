@@ -41,6 +41,44 @@
 ///     the analog of broadcaster->request_full_block by height). Until E2a
 ///     connects them the lane is dormant and byte-inert.
 ///
+/// FULL MODE (DESIGN S2 4.3, the DASH full UTXO set from a pinned snapshot).
+/// open_full() takes <net>/utxo_full_leveldb, opened under the S2-2 rule by
+/// utxo_snapshot_import.hpp. The set holds every coin of the chain up to its
+/// best block, so the lane never jumps (no height-288 restart) and connects
+/// strictly:
+///   - verify_base(): the assumed base must be the header chain's block at its
+///     height before the set connects or prices anything at the tip;
+///   - every block is the header chain's block at its height and links to the
+///     set's best; a fork body is dropped (bad_bodies), never connected;
+///   - best+1 .. the header tip is filled in order (FULL_WINDOW requests in
+///     flight, one per height, stall re-ask as in the bootstrap), from the
+///     first block_connected or from on_header_tip();
+///   - connect = BIP30 (an output whose outpoint is already a coin refuses),
+///     then UTXOViewCache::connect_block(strict): every input a coin of the set or
+///     of an earlier tx of the block, each spent once. Special txs need no
+///     rule of their own: QcTx/MnHfTx have no inputs and no outputs, an
+///     AssetUnlock has no inputs and adds its outputs, an AssetLock's
+///     OP_RETURN is unspendable and skipped, a CbTx is the coinbase. An
+///     output with value 0 and an empty script is a coin, as in dashd
+///     (coins.cpp AddCoin skips only IsUnspendable): stored, spendable, and
+///     restored by a rewind (disconnect_from_undo every_coin_known);
+///   - a refusal asks the body again once; a second refusal at the same
+///     height means the SET is wrong: the lane WITHHOLDS (stops advancing,
+///     utxo_current_at() false so templates carry no mempool tx, an alert, a
+///     named reason in the status), and never heals by jumping or wiping;
+///   - a best block that left the header chain's best is disconnected from
+///     its undo record (rewind), back to the base at most; deeper withholds.
+///     An inject the rewound blocks had confirmed is put back into the inject
+///     set (Mempool::readmit_disconnected_injects, the normal admission gate);
+///   - a flush that fails drops the unflushed changes (discard_pending) and
+///     withholds, so nothing prices from coins the DB does not have.
+///
+/// THREADS. Every lane entry point runs on the node io thread. The HTTP thread
+/// (/local_stats) reads full_status(), the copy the io thread publishes when
+/// an entry point returns (the AlertRelayService status_json pattern); the
+/// mode and the base-verified / withheld latches are atomics, read by the
+/// template path.
+///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in
 /// embedded path in main_dash.cpp; the dashd-RPC fallback (production
 /// prod) never touches this file.
@@ -52,6 +90,7 @@
 #include <impl/dash/crypto/hash_x11.hpp>
 
 #include <core/coin/block_bootstrapper.hpp>
+#include <core/coin/utxo_assumed.hpp>
 #include <core/leveldb_store.hpp>
 #include <core/log.hpp>
 #include <core/pack.hpp>
@@ -60,10 +99,13 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -86,6 +128,37 @@ public:
     using RequestBlockFn = std::function<bool(uint32_t height)>;
     using Clock = std::chrono::steady_clock;
     using BootstrapState = ::core::coin::BlockBootstrapState<BlockType>;
+
+    enum class Mode : uint8_t { Accrual, Full };
+    /// The header chain's block hash at a height (nullopt = not held).
+    using HashAtFn = std::function<std::optional<uint256>(uint32_t height)>;
+    /// A withhold, for the alert relay: (event, detail).
+    using AlertFn = std::function<void(const std::string& event, const std::string& detail)>;
+
+    /// Requests in flight while a full set fills best+1 .. tip (the DOGE
+    /// branch's ordered-fill window, DESIGN 4.3).
+    static constexpr size_t FULL_WINDOW = 64;
+
+    /// What a full set is doing, for /local_stats and [EMBED-STATUS].
+    struct FullStatus {
+        bool        full{false};
+        std::string state;           // verifying-base | catching-up | serving | withheld
+        uint32_t    best_height{0};
+        uint256     best_block;
+        uint64_t    coins{0};
+        uint32_t    base_height{0};
+        uint256     base_hash;
+        uint256     muhash;
+        bool        base_verified{false};
+        bool        validated{false};
+        uint64_t    connected{0};
+        uint64_t    strict_refusals{0};
+        uint64_t    bad_bodies{0};
+        uint64_t    rewinds{0};
+        uint32_t    fill_next{0};
+        uint32_t    fill_end{0};
+        std::string withheld_reason;
+    };
 
     UtxoLane() = default;
     UtxoLane(const UtxoLane&) = delete;
@@ -128,10 +201,107 @@ public:
         return true;
     }
 
+    /// Full mode: take the full set opened by open_dash_full_utxo_set (the
+    /// S2-2 rule already held). Nothing is connected or priced at the tip
+    /// until verify_base() places the assumed base on the header chain.
+    bool open_full(std::unique_ptr<UtxoViewDB> db, const ::core::coin::AssumedBase& assumed,
+                   uint32_t min_base_height)
+    {
+        if (!db) return false;
+        m_db = std::move(db);
+        m_cache = std::make_unique<UtxoViewCache>(m_db.get());
+        m_mode = Mode::Full;
+        m_assumed = assumed;
+        m_min_base_height = min_base_height;
+        m_bs.window = FULL_WINDOW;
+        m_bs.phase = "Catch-up";
+        LOG_INFO << "[EMB-DASH] UTXO set: FULL, best=" << m_db->get_best_height()
+                 << " best_block=" << m_db->get_best_block().GetHex().substr(0, 16)
+                 << " assumed_base=" << assumed.base_height
+                 << " validated=" << int(assumed.validated)
+                 << " coins=" << m_db->get_sync_state().coins;
+        publish_status();
+        return true;
+    }
+
     bool live() const { return static_cast<bool>(m_cache); }
     UtxoViewCache* cache() { return m_cache.get(); }
     UtxoViewDB*    db()    { return m_db.get(); }
 
+    Mode mode() const { return m_mode; }
+    bool full() const { return m_mode == Mode::Full; }
+    bool withheld() const { return m_withheld; }
+    bool base_verified() const { return m_base_verified; }
+    void set_hash_at_fn(HashAtFn fn) { m_hash_at = std::move(fn); }
+    void set_alert_fn(AlertFn fn) { m_alert = std::move(fn); }
+
+    /// Any thread: the status the io thread last published (VERIFY-S2 S-1).
+    FullStatus full_status() const
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        return m_status;
+    }
+
+    /// Full mode: the header tip moved. Places the base, rewinds a best block
+    /// that left the best chain, and asks for best+1 .. tip without waiting
+    /// for a block to be announced. No-op in accrual mode.
+    void on_header_tip(uint32_t tip_height)
+    {
+        if (m_mode != Mode::Full || !m_cache) return;
+        const PublishOnReturn publish{*this};
+        if (m_withheld) return;
+        if (!verify_base() || !rewind_to_best_chain()) return;
+        const uint32_t best_h = m_cache->get_best_height();
+        if (tip_height <= best_h && !m_bs.active) return;
+        start_fill(best_h);
+        if (tip_height > m_bs.end_height) m_bs.end_height = tip_height;
+        fill_step();
+    }
+
+private:
+    /// io thread: the status from the live members.
+    FullStatus compute_status() const
+    {
+        FullStatus st;
+        st.full = m_mode == Mode::Full;
+        if (!st.full || !m_cache) return st;
+        st.best_height = m_cache->get_best_height();
+        st.best_block = m_cache->get_best_block();
+        st.coins = m_cache->sync_state().coins;
+        st.base_height = m_assumed.base_height;
+        st.base_hash = m_assumed.base_hash;
+        st.muhash = m_assumed.muhash;
+        st.base_verified = m_base_verified;
+        st.validated = m_assumed.validated != 0;
+        st.connected = m_full_connected;
+        st.strict_refusals = m_strict_refusals;
+        st.bad_bodies = m_bad_bodies;
+        st.rewinds = m_rewinds;
+        st.fill_next = m_bs.active ? m_bs.next_height : 0;
+        st.fill_end = m_bs.active ? m_bs.end_height : 0;
+        st.withheld_reason = m_withheld_reason;
+        if (m_withheld)            st.state = "withheld";
+        else if (!m_base_verified) st.state = "verifying-base";
+        else if (m_bs.active)      st.state = "catching-up";
+        else                       st.state = "serving";
+        return st;
+    }
+
+    /// io thread: publish compute_status() for full_status().
+    void publish_status()
+    {
+        FullStatus st = compute_status();
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status = std::move(st);
+    }
+
+    /// Publishes the status when an io-thread entry point returns.
+    struct PublishOnReturn {
+        UtxoLane& lane;
+        ~PublishOnReturn() { lane.publish_status(); }
+    };
+
+public:
     /// The set_utxo call the dash arm never made (main_ltc.cpp:1770).
     /// After this, Mempool::add_tx prices via UTXO+CPFP and
     /// recompute_unknown_fees can resolve backlog entries.
@@ -210,6 +380,11 @@ public:
     bool mining_utxo_ready() const
     {
         if (!m_cache) return false;
+        // A full set holds every coin up to its best: the depth gate is moot.
+        // Ready once its base is on the header chain; whether a template may
+        // carry mempool txs is utxo_current_at()'s answer (best == tip, not
+        // withheld).
+        if (m_mode == Mode::Full) return m_base_verified;
         const auto connected = m_cache->blocks_connected();
         const bool ready = connected >= DASH_MINING_GATE_DEPTH;
         if (!ready) {
@@ -245,6 +420,7 @@ public:
     /// (header arrival vs body arrival) that c2pool cannot hold one lock over.
     bool utxo_current_at(const uint256& tip_hash) const
     {
+        if (m_mode == Mode::Full && (!m_base_verified || m_withheld)) return false;
         return m_cache && m_cache->get_best_block() == tip_hash;
     }
 
@@ -263,6 +439,12 @@ public:
             static_cast<const ::dash::coin::BlockHeaderType&>(block));
         const uint256 block_hash =
             ::dash::crypto::hash_x11(packed_hdr.get_span());
+
+        if (m_mode == Mode::Full) {
+            const PublishOnReturn publish{*this};
+            on_block_full(block, height, block_hash);
+            return;
+        }
 
         constexpr uint32_t DASH_KEEP = DASH_MIN_BLOCKS_TO_KEEP;  // 288
 
@@ -385,6 +567,302 @@ public:
     }
 
 private:
+    // ═══ FULL MODE ═══════════════════════════════════════════════════════
+
+    enum class FullConnect : uint8_t { Connected, Dropped, Refused, Rewound };
+
+    void on_block_full(const BlockType& block, uint32_t height, const uint256& block_hash)
+    {
+        if (m_withheld || !verify_base() || !rewind_to_best_chain()) {
+            if (m_pool) m_pool->remove_for_block(block);
+            return;
+        }
+        const uint32_t best_h = m_cache->get_best_height();
+        if (height <= best_h) {
+            if (m_pool) m_pool->remove_for_block(block);
+            return;
+        }
+        if (m_hash_at) {
+            const auto hh = m_hash_at(height);
+            if (hh && *hh != block_hash) {
+                ++m_bad_bodies;
+                LOG_WARNING << "[EMB-DASH] UTXO full: h=" << height << " body "
+                            << block_hash.GetHex().substr(0, 16)
+                            << " is not the header chain's block there; dropped";
+                return;
+            }
+        }
+        start_fill(best_h);
+        if (height > m_bs.end_height) m_bs.end_height = height;
+        m_bs.buffer.try_emplace(height, std::make_pair(block, block_hash));
+        fill_step();
+    }
+
+    /// The assumed base is the header chain's block at its height. Waits
+    /// (false) while the header chain is below it; withholds on a mismatch.
+    bool verify_base()
+    {
+        if (m_base_verified) return true;
+        if (m_withheld) return false;
+        if (m_assumed.base_height < m_min_base_height) {
+            withhold("utxo-full-base-below-checkpoint",
+                     "base " + std::to_string(m_assumed.base_height) + " < checkpoint " +
+                         std::to_string(m_min_base_height));
+            return false;
+        }
+        if (!m_hash_at) return false;
+        const auto hh = m_hash_at(m_assumed.base_height);
+        if (!hh) return false;
+        if (*hh != m_assumed.base_hash) {
+            withhold("utxo-full-base-not-in-header-chain",
+                     "header at " + std::to_string(m_assumed.base_height) + " is " + hh->GetHex() +
+                         ", the set's base is " + m_assumed.base_hash.GetHex());
+            return false;
+        }
+        m_base_verified = true;
+        LOG_INFO << "[EMB-DASH] UTXO full set: base h=" << m_assumed.base_height << " "
+                 << m_assumed.base_hash.GetHex().substr(0, 16)
+                 << " is the header chain's block there; best=" << m_cache->get_best_height();
+        return true;
+    }
+
+    /// Disconnect, from the undo records, every best block that is no longer
+    /// the header chain's block at its height. False = withheld. The injects
+    /// the disconnected blocks had confirmed go back into the inject set once
+    /// the rewind is done (parents before children, VERIFY-S2 S-2).
+    bool rewind_to_best_chain()
+    {
+        if (!m_hash_at) return true;
+        uint32_t lowest = 0;   // the lowest height disconnected (0: none)
+        const bool ok = rewind_steps(lowest);
+        if (lowest != 0) put_back_injects(lowest);
+        return ok;
+    }
+
+    bool rewind_steps(uint32_t& lowest)
+    {
+        while (true) {
+            const uint32_t bh = m_cache->get_best_height();
+            const uint256 best = m_cache->get_best_block();
+            const auto hh = m_hash_at(bh);
+            if (!hh || *hh == best) return true;
+            if (bh <= m_assumed.base_height) {
+                withhold("utxo-reorg-below-snapshot-base",
+                         "best h=" + std::to_string(bh) + " " + best.GetHex() + " left the best chain");
+                return false;
+            }
+            BlockUndo u;
+            if (!m_db || !m_db->get_block_undo(bh, u) || u.block_hash != best || !u.restorable()) {
+                withhold("utxo-reorg-beyond-undo", "no restorable undo record for h=" + std::to_string(bh));
+                return false;
+            }
+            uint256 prev;
+            if (bh - 1 == m_assumed.base_height) {
+                prev = m_assumed.base_hash;
+            } else {
+                BlockUndo pu;
+                if (!m_db->get_block_undo(bh - 1, pu) || pu.block_hash.IsNull()) {
+                    withhold("utxo-reorg-beyond-undo", "no undo record for h=" + std::to_string(bh - 1));
+                    return false;
+                }
+                prev = pu.block_hash;
+            }
+            // A strict record holds no unknown coin: restore every one, a
+            // (value 0, empty script) coin too (VERIFY-S2b section 3).
+            if (!m_cache->disconnect_from_undo(u, /*every_coin_known=*/true) ||
+                !m_cache->flush(prev, bh - 1)) {
+                m_cache->discard_pending();   // the view is the DB's again (S-4)
+                withhold("utxo-rewind-failed", "h=" + std::to_string(bh));
+                return false;
+            }
+            m_db->remove_block_undo(bh);
+            ++m_rewinds;
+            lowest = bh;
+            LOG_WARNING << "[EMB-DASH] UTXO rewind: h=" << bh << " " << best.GetHex().substr(0, 16)
+                        << " left the header chain's best; best is now h=" << (bh - 1) << "; its "
+                        << u.tx_undos.size() << " non-coinbase tx(s) left the chain (relayed txs are"
+                        << " not put back; injects are)";
+            if (m_bs.active) restart_fill();
+        }
+    }
+
+    /// The injects confirmed at `from_height` and above, back into the inject
+    /// set through the normal admission gate; each verdict is logged.
+    void put_back_injects(uint32_t from_height)
+    {
+        if (!m_pool) return;
+        const auto r = m_pool->readmit_disconnected_injects(from_height);
+        if (r.readmitted.empty() && r.refused.empty() && r.not_wanted.empty()) return;
+        LOG_WARNING << "[EMB-DASH] UTXO rewind from h=" << from_height << ": " << r.readmitted.size()
+                    << " inject(s) the rewound block(s) confirmed are back in the inject set, "
+                    << r.refused.size() << " refused, " << r.not_wanted.size()
+                    << " left out (expired in the inject ledger)";
+        for (const auto& [txid, gate] : r.refused)
+            LOG_WARNING << "[EMB-DASH] UTXO rewind: inject " << txid.GetHex().substr(0, 16)
+                        << " not re-admitted (" << Mempool::inject_gate_name(gate)
+                        << "); resubmit it if it is still wanted";
+    }
+
+    void start_fill(uint32_t best_h)
+    {
+        if (m_bs.active) return;
+        m_bs.active = true;
+        m_bs.next_height = best_h + 1;
+        m_bs.next_request = best_h + 1;
+        m_bs.end_height = best_h;
+        m_bs.processed = 0;
+        m_bs.total = 0;
+        m_bs.last_drain_time = now_();
+        schedule_stall_tick();
+    }
+
+    /// The best moved back (rewind): fill again from best+1, keeping only
+    /// bodies above it (each is re-checked against the header chain).
+    void restart_fill()
+    {
+        const uint32_t best_h = m_cache->get_best_height();
+        m_bs.next_height = best_h + 1;
+        m_bs.next_request = best_h + 1;
+        for (auto it = m_bs.buffer.begin(); it != m_bs.buffer.end();)
+            it = (it->first <= best_h) ? m_bs.buffer.erase(it) : std::next(it);
+        m_dead_sends.clear();
+    }
+
+    void fill_step()
+    {
+        if (!m_bs.active) return;
+        service_bootstrap();
+        bool drained_any = false;
+        while (!m_withheld && m_bs.buffer.count(m_bs.next_height)) {
+            auto node = m_bs.buffer.extract(m_bs.next_height);
+            auto& [b, bh] = node.mapped();
+            const FullConnect res = connect_full(b, m_bs.next_height, bh);
+            if (res == FullConnect::Connected) {
+                drained_any = true;
+                ++m_bs.next_height;
+                ++m_bs.processed;
+                m_bs.last_drain_time = now_();
+                continue;
+            }
+            if (res == FullConnect::Dropped) reask(m_bs.next_height);
+            break;
+        }
+        if (m_withheld) {
+            m_bs.active = false;
+            m_bs.buffer.clear();
+            if (m_stall_timer) m_stall_timer->cancel();
+            return;
+        }
+        if (m_bs.next_request < m_bs.next_height) m_bs.next_request = m_bs.next_height;
+        while (m_bs.next_request <= m_bs.end_height
+               && (m_bs.next_request - m_bs.next_height) < m_bs.window) {
+            if (!m_bs.buffer.count(m_bs.next_request))
+                request_block(m_bs.next_request);
+            ++m_bs.next_request;
+        }
+        static int fill_log = 0;
+        if (drained_any && (++fill_log % 50 == 0 || m_bs.next_height > m_bs.end_height)) {
+            LOG_INFO << "[EMB-DASH] UTXO full catch-up: best=" << m_cache->get_best_height()
+                     << " target=" << m_bs.end_height << " buf=" << m_bs.buffer.size()
+                     << " dead=" << m_dead_sends.size();
+        }
+        if (m_bs.next_height > m_bs.end_height) {
+            m_bs.active = false;
+            m_dead_sends.clear();
+            if (m_stall_timer) m_stall_timer->cancel();
+            LOG_INFO << "[EMB-DASH] UTXO full set at the tip: best=" << m_cache->get_best_height()
+                     << " " << m_cache->get_best_block().GetHex().substr(0, 16)
+                     << " (" << m_bs.processed << " blocks connected this fill)";
+        }
+        if (drained_any) recompute_fees();
+    }
+
+    FullConnect connect_full(const BlockType& block, uint32_t height, const uint256& block_hash)
+    {
+        if (m_hash_at) {
+            const auto hh = m_hash_at(height);
+            if (hh && *hh != block_hash) {
+                ++m_bad_bodies;
+                return FullConnect::Dropped;
+            }
+        }
+        if (block.m_previous_block != m_cache->get_best_block()) {
+            if (!rewind_to_best_chain()) return FullConnect::Refused;
+            if (m_cache->get_best_height() + 1 != height) return FullConnect::Rewound;
+            if (block.m_previous_block != m_cache->get_best_block()) {
+                ++m_bad_bodies;
+                return FullConnect::Dropped;
+            }
+        }
+        // BIP30, before anything is touched.
+        for (size_t t = 0; t < block.m_txs.size(); ++t) {
+            const auto& tx = block.m_txs[t];
+            const uint256 txid = dash_txid(tx);
+            for (uint32_t i = 0; i < static_cast<uint32_t>(tx.vout.size()); ++i) {
+                const auto& out = tx.vout[i];
+                if (::core::coin::is_unspendable(out.scriptPubKey)) continue;
+                if (m_cache->have_coin(Outpoint(txid, i)))
+                    return refuse_strict(height, "bad-txns-BIP30",
+                                         "txid=" + txid.GetHex() + " vout=" + std::to_string(i) +
+                                             " is already a coin");
+            }
+        }
+        UtxoViewCache::StrictRefusal why;
+        auto undo = m_cache->connect_block(
+            block, height, [](const MutableTransaction& tx) { return dash_txid(tx); },
+            block_hash, /*strict=*/true, &why);
+        if (!undo)
+            return refuse_strict(height, "bad-txns-inputs-missingorspent",
+                                 "txid=" + why.txid.GetHex() + " tx=" + std::to_string(why.tx_index) +
+                                     " missing=" + why.missing.txid.GetHex() + ":" +
+                                     std::to_string(why.missing.index));
+        if (m_db) m_db->put_block_undo(height, *undo);
+        if (!m_cache->flush(block_hash, height)) {
+            m_cache->discard_pending();   // the view is the DB's again (S-4)
+            withhold("utxo-flush-failed", "h=" + std::to_string(height));
+            return FullConnect::Refused;
+        }
+        m_cache->prune_undo(height, DASH_MIN_BLOCKS_TO_KEEP);
+        if (m_pool) {
+            m_pool->remember_confirmed_injects(block, height);   // for a rewind (S-2)
+            m_pool->remove_for_block(block);
+        }
+        ++m_full_connected;
+        return FullConnect::Connected;
+    }
+
+    /// First refusal at a height: the body is asked again. A second one means
+    /// the set is wrong: withhold.
+    FullConnect refuse_strict(uint32_t height, const std::string& name, const std::string& detail)
+    {
+        ++m_strict_refusals;
+        LOG_ERROR << "[EMB-DASH] STRICT REFUSAL h=" << height << " " << name << " " << detail;
+        if (m_refused_heights.insert(height).second) {
+            reask(height);
+            return FullConnect::Refused;
+        }
+        withhold("utxo-strict-refusal", name + " h=" + std::to_string(height) + " " + detail);
+        return FullConnect::Refused;
+    }
+
+    /// Ask a height of the fill again; it counts as requested, so the refill
+    /// does not ask it a second time.
+    void reask(uint32_t height)
+    {
+        request_block(height);
+        if (m_bs.active && m_bs.next_request <= height) m_bs.next_request = height + 1;
+    }
+
+    void withhold(const std::string& event, const std::string& detail)
+    {
+        if (m_withheld) return;
+        m_withheld = true;
+        m_withheld_reason = event + ": " + detail;
+        LOG_ERROR << "[EMB-DASH] UTXO full set WITHHELD (" << m_withheld_reason
+                  << "): the set stops advancing; templates carry no mempool tx until the operator acts";
+        if (m_alert) m_alert(event, detail);
+    }
+
     /// Single-block connect: UTXO spend/add + undo persist + flush + prune
     /// + mempool confirm-eviction. Mirrors the per-block body of both the
     /// LTC drain loop (~2303-2311) and normal leg (~2387-2391).
@@ -475,6 +953,24 @@ private:
     std::unique_ptr<boost::asio::steady_timer> m_stall_timer;
     std::chrono::milliseconds      m_stall_interval{
         std::chrono::seconds(BootstrapState::STALL_CHECK_SEC)};
+
+    // Full mode.
+    std::atomic<Mode>              m_mode{Mode::Accrual};
+    ::core::coin::AssumedBase      m_assumed;
+    uint32_t                       m_min_base_height{0};
+    HashAtFn                       m_hash_at;
+    AlertFn                        m_alert;
+    std::atomic<bool>              m_base_verified{false};
+    std::atomic<bool>              m_withheld{false};
+    std::string                    m_withheld_reason;
+    std::set<uint32_t>             m_refused_heights;
+    uint64_t                       m_full_connected{0};
+    uint64_t                       m_strict_refusals{0};
+    uint64_t                       m_bad_bodies{0};
+    uint64_t                       m_rewinds{0};
+    // The status full_status() hands to any thread (S-1).
+    mutable std::mutex             m_status_mutex;
+    FullStatus                     m_status;
 };
 
 } // namespace coin
