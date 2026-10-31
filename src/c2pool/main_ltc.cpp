@@ -387,18 +387,28 @@ static size_t estimate_block_bytes(const ltc::coin::BlockType& b)
 
 // Global signal handling
 static std::atomic<bool> g_shutdown_requested{false};
+static std::atomic<int> g_shutdown_signal{0};
 
+// Async-signal-safe only: flags, write(2), _Exit. The main thread logs the
+// signal (log_shutdown_signal) when its loop sees the flag.
 void signal_handler(int signal) {
     if (g_shutdown_requested.exchange(true)) {
         // A second SIGINT/SIGTERM while the shutdown runs: exit now, as
-        // Core does on a repeated interrupt. Only async-signal-safe calls.
+        // Core does on a repeated interrupt.
         static const char msg[] = "c2pool: second signal during shutdown: exiting now\n";
 #ifndef _WIN32
         (void)!::write(STDERR_FILENO, msg, sizeof(msg) - 1);
 #endif
         std::_Exit(128 + signal);
     }
-    LOG_INFO << "Received signal " << signal << ", initiating shutdown...";
+    g_shutdown_signal = signal;
+}
+
+static void log_shutdown_signal()
+{
+    static std::atomic<bool> logged{false};
+    if (g_shutdown_requested && !logged.exchange(true))
+        LOG_INFO << "Received signal " << g_shutdown_signal.load() << ", initiating shutdown...";
 }
 
 // The shutdown's watchdog: started when the main loop ends. If the process
@@ -406,7 +416,7 @@ void signal_handler(int signal) {
 // destructor blocked behind a worker), it exits: status 0 once every store
 // was closed (only the exit-time teardown hung), 1 before.
 static std::atomic<bool> g_shutdown_stores_closed{false};
-static constexpr auto SHUTDOWN_DEADLINE = std::chrono::seconds(10);
+static constexpr auto SHUTDOWN_DEADLINE = std::chrono::seconds(20);
 static void start_shutdown_watchdog()
 {
     std::thread([]() {
@@ -590,9 +600,9 @@ void print_help() {
     std::cout << "                            be complete into the configured --doge-header-checkpoint\n";
     std::cout << "  --utxo-digest DIR         Print the digest of the UTXO LevelDB at DIR (SHA256 over\n";
     std::cout << "                            its coins, sync state and best block) and exit\n";
-    std::cout << "  --ltc-connect HOST[:PORT] Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
+    std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
-    std::cout << "  --doge-connect HOST[:PORT] Dial only this DOGE peer (repeatable), as --ltc-connect\n";
+    std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
     std::cout << "  --no-ltc-cmpct-v3         Do not ask LTC peers for v3 (MWEB) compact blocks\n";
     std::cout << "  --ltc-cmpct-hb-peers N    LTC peers asked to push compact blocks (default: 0 = all)\n";
     std::cout << "  --no-ltc-mweb-fetch-retry Fetch each announced LTC block from every announcing peer\n";
@@ -1767,6 +1777,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // --ltc-connect / --doge-connect take IP literals. A name would need a DNS
+    // query (the LAN-only runs allow none), and one the peer manager could not
+    // read was dropped with a warning, leaving connect-only with no target at
+    // all (VERIFY10 2.3). Refused here, before anything starts.
+    for (auto [flag, list] : {std::pair<const char*, const std::vector<std::string>*>{"--ltc-connect", &ltc_connect},
+                              std::pair<const char*, const std::vector<std::string>*>{"--doge-connect", &doge_connect}}) {
+        for (const auto& spec : *list) {
+            const auto hp = core::parse_host_port(spec);
+            boost::system::error_code ec;
+            boost::asio::ip::make_address(hp.host, ec);
+            if (hp.host.empty() || ec) {
+                const std::string msg = std::string(flag) + " " + spec
+                    + ": not an IP address (an IPv4 or IPv6 literal, [:PORT]; a name is not resolved)";
+                LOG_ERROR << msg;
+                std::cerr << "c2pool: " << msg << std::endl;
+                return 1;
+            }
+        }
+    }
+
     // ---- M0b control-plane wiring ------------------------------------------
     // compiled defaults (L0) -> settings file (L1, TOML) -> CLI (L2). No file =>
     // a structural no-op (AbsentOk) so the locals/settings above are today's
@@ -2111,6 +2141,80 @@ int main(int argc, char* argv[]) {
             // during SPV header sync and share loading.
             core::WebServer web_server(ioc, http_host, static_cast<uint16_t>(http_port),
                                      settings->m_testnet, enhanced_node, blockchain);
+
+            // ── The ordered shutdown, on every way out of this scope ────────
+            // The stores (the DOGE sets, the header chains) close when this
+            // scope ends. Every worker that uses them is stopped and joined
+            // first: the header pools and the DOGE full lane's pool are kept
+            // alive by callbacks past the stores, and the sharechain's compute
+            // thread calls this scope's lambdas. A task running on a closed
+            // store aborted the process or hung it for hours (10-31), and the
+            // early return of the sync wait skipped all of this (VERIFY10
+            // MUST-FIX 1: ASan heap-use-after-free, the LTC header pool in
+            // persist_header on a HeaderChain the scope had freed). It runs
+            // once: at the normal end, before each early return, and from the
+            // guards below when an exception leaves the scope. Objects made
+            // further down register their part through these hooks.
+            constexpr auto POOLS_DEADLINE = std::chrono::seconds(3);
+            constexpr auto COMPUTE_DEADLINE = std::chrono::seconds(10);
+            std::function<void()> shutdown_stop_merged;  // merged peers, the MM poll, the DOGE lanes' stopping
+            std::function<bool(std::chrono::milliseconds)> shutdown_join_lane;     // the DOGE full lane's pool
+            std::function<bool(std::chrono::milliseconds)> shutdown_join_compute;  // the sharechain compute thread
+            std::function<void()> shutdown_flush;        // the full set's height, the sharechain's flush
+            bool shutdown_ran = false;
+            auto ordered_shutdown = [&]() {
+                if (shutdown_ran)
+                    return;
+                shutdown_ran = true;
+                log_shutdown_signal();
+                start_shutdown_watchdog();
+                // 1. No new work: the HTTP API and stratum, the coin peers (no
+                //    more blocks, headers or txs), the merged-mining poll.
+                web_server.stop();
+                if (embedded_broadcaster)
+                    embedded_broadcaster->stop();
+                if (shutdown_stop_merged)
+                    shutdown_stop_merged();
+                // 2. The workers: the header pools and the DOGE full lane's
+                //    pool drop their queued tasks and are joined (the lanes end
+                //    a drain after the block being connected, each flushed when
+                //    connected); then the compute thread, whose think+clean
+                //    cycle takes seconds.
+                std::vector<std::string> still_running = worker_pools.stop_and_join(POOLS_DEADLINE);
+                if (shutdown_join_lane && !shutdown_join_lane(POOLS_DEADLINE))
+                    still_running.push_back("DOGE full set");
+                if (shutdown_join_compute && !shutdown_join_compute(COMPUTE_DEADLINE))
+                    still_running.push_back("sharechain compute");
+                if (!still_running.empty()) {
+                    std::string names;
+                    for (const auto& n : still_running)
+                        names += (names.empty() ? "" : ", ") + n;
+                    // Closing the stores under a running worker is what this
+                    // order prevents: exit with them at their last flush.
+                    LOG_ERROR << "Shutdown: worker(s) still running past their deadline: " << names
+                              << "; exiting without closing the stores";
+                    std::_Exit(1);
+                }
+                // 3. Flush, then the scope closes the stores.
+                web_server.get_mining_interface()->save_stat_log();
+                if (shutdown_flush)
+                    shutdown_flush();
+                enhanced_node->shutdown();
+            };
+            // Runs `fn` when the scope unwinds (an exception): declared after
+            // the objects it protects, so it runs before they are destroyed.
+            struct ShutdownOnUnwind {
+                std::function<void()> fn;
+                ~ShutdownOnUnwind()
+                {
+                    try {
+                        if (fn)
+                            fn();
+                    } catch (...) {
+                    }
+                }
+            };
+            ShutdownOnUnwind shutdown_guard_ltc{ordered_shutdown};
             // #961: publish the running coin's REGISTRY-SOURCED payout-address
             // acceptance (LTC on the active network) so the core stratum server
             // validates each per-job coinbase payout against LTC's own version
@@ -4144,6 +4248,7 @@ int main(int argc, char* argv[]) {
                 p2p_node = std::make_shared<ltc::Node>(&ioc, ltc_p2p_config.get());
                 p2p_node->set_lifetime(p2p_node);
                 assert(p2p_node->lifetime_armed() && "LTC sharechain node dial/accept lifetime failed to arm");
+                shutdown_join_compute = [node = p2p_node](std::chrono::milliseconds d) { return node->stop_compute(d); };
             } // P2P node creation
             if (p2p_node) {
 #ifdef C2POOL_VERSION
@@ -4686,6 +4791,7 @@ int main(int argc, char* argv[]) {
             if (!operator_message_blob_hex.empty()) {
                 if (operator_message_blob_hex.size() % 2 != 0) {
                     LOG_ERROR << "--message-blob-hex must have even length";
+                    ordered_shutdown();
                     return 1;
                 }
                 std::vector<unsigned char> blob;
@@ -4693,11 +4799,13 @@ int main(int argc, char* argv[]) {
                     blob = ParseHex(operator_message_blob_hex);
                 } catch (const std::exception& e) {
                     LOG_ERROR << "Invalid --message-blob-hex: " << e.what();
+                    ordered_shutdown();
                     return 1;
                 }
                 auto err = ltc::validate_message_data(blob);
                 if (!err.empty()) {
                     LOG_ERROR << "Rejected --message-blob-hex: " << err;
+                    ordered_shutdown();
                     return 1;
                 }
                 web_server.get_mining_interface()->set_operator_message_blob(blob);
@@ -4727,6 +4835,7 @@ int main(int argc, char* argv[]) {
                     LOG_ERROR << "--coinbase-text too long: " << coinbase_text.size()
                               << " bytes (max " << max_len << " with"
                               << (has_mm ? "" : "out") << " merged mining)";
+                    ordered_shutdown();
                     return 1;
                 }
                 web_server.get_mining_interface()->set_coinbase_text(coinbase_text);
@@ -6633,12 +6742,14 @@ int main(int argc, char* argv[]) {
 
             if (payout_address.empty()) {
                 LOG_ERROR << "--custodial requires --address (node operator payout address)";
+                ordered_shutdown();
                 return 1;
             }
 
             auto owner_script = core::address_to_script(payout_address);
             if (owner_script.empty()) {
                 LOG_ERROR << "--custodial: invalid --address: " << payout_address;
+                ordered_shutdown();
                 return 1;
             }
 
@@ -6774,6 +6885,25 @@ int main(int argc, char* argv[]) {
             // lane can run. The DB the explorer reads DOGE blocks from follows
             // the set (doge::coin::UtxoFullState).
             auto doge_full = std::make_shared<doge::coin::UtxoFullState>();
+            shutdown_stop_merged = [&merged_broadcasters, &mm_manager, doge_full]() {
+                for (auto& [chain_id, b] : merged_broadcasters)
+                    if (b)
+                        b->stop();
+                if (mm_manager)
+                    mm_manager->stop();
+                doge_full->stopping = true;
+            };
+            shutdown_join_lane = [&doge_full_pool](std::chrono::milliseconds d) {
+                return !doge_full_pool || core::stop_and_join_within(doge_full_pool, d);
+            };
+            shutdown_flush = [&doge_full_db, &p2p_node]() {
+                if (doge_full_db)
+                    LOG_INFO << "[EMB-DOGE] Full UTXO set at h=" << doge_full_db->get_best_height()
+                             << " on shutdown (a restart resumes there)";
+                if (p2p_node)
+                    p2p_node->shutdown();
+            };
+            ShutdownOnUnwind shutdown_guard_merged{ordered_shutdown};
 
             if (!merged_chain_specs.empty()) {
                 mm_manager = std::make_unique<c2pool::merged::MergedMiningManager>(ioc);
@@ -9128,6 +9258,7 @@ int main(int argc, char* argv[]) {
                 }
                 if (g_shutdown_requested) {
                     LOG_INFO << "Shutdown requested during sync — exiting";
+                    ordered_shutdown();
                     return 0;
                 }
                 LOG_INFO << "[EMB-LTC] Synced: headers=" << embedded_chain->height()
@@ -9477,6 +9608,7 @@ int main(int argc, char* argv[]) {
 
             if (!web_server.start()) {
                 LOG_ERROR << "Failed to start integrated mining pool";
+                ordered_shutdown();
                 return 1;
             }
             
@@ -10110,68 +10242,10 @@ int main(int argc, char* argv[]) {
             }
             work_guard.reset();
 
-            // ── Shutdown, in order ──────────────────────────────────────
-            // The stores (the DOGE full and accrual sets, the header chains)
-            // close when this scope ends. Every worker that uses them is
-            // stopped and joined first: the header pools and the DOGE full
-            // lane's pool were kept alive by callbacks past the stores, and
-            // a task running on a closed store aborted the process or blocked
-            // it for good (the live IBD hung 4.3 h after "shutdown complete").
-            start_shutdown_watchdog();
-
             // Stop external watchdog thread (g_shutdown_requested is already true)
             if (ext_watchdog.joinable())
                 ext_watchdog.join();
-
-            // 1. No new work: the HTTP API and stratum, the coin peers (no
-            //    more blocks, headers or txs), the merged-mining poll.
-            web_server.stop();
-            if (embedded_broadcaster)
-                embedded_broadcaster->stop();
-            for (auto& [chain_id, b] : merged_broadcasters)
-                if (b)
-                    b->stop();
-            if (mm_manager)
-                mm_manager->stop();
-
-            // 2. The workers. The DOGE lanes end a drain after the block being
-            //    connected (each block is flushed when connected, so the sets
-            //    stay at their last flush); the header pools and the full
-            //    lane's pool drop their queued tasks and are joined (a task
-            //    of theirs is short). Then the sharechain's compute thread: its
-            //    callbacks (the locked-best hook, block_rel_height, ...) are
-            //    this scope's lambdas, and a cycle running after the scope
-            //    segfaulted (live 10-31); a think+clean cycle takes seconds,
-            //    so it gets the larger share of the 10-s budget.
-            constexpr auto POOLS_DEADLINE = std::chrono::seconds(1);
-            constexpr auto COMPUTE_DEADLINE = std::chrono::seconds(7);
-            std::vector<std::string> still_running;
-            doge_full->stopping = true;
-            for (auto& name : worker_pools.stop_and_join(POOLS_DEADLINE))
-                still_running.push_back(name);
-            if (doge_full_pool && !core::stop_and_join_within(doge_full_pool, POOLS_DEADLINE))
-                still_running.push_back("DOGE full set");
-            if (p2p_node && !p2p_node->stop_compute(COMPUTE_DEADLINE))
-                still_running.push_back("sharechain compute");
-            if (!still_running.empty()) {
-                std::string names;
-                for (const auto& n : still_running)
-                    names += (names.empty() ? "" : ", ") + n;
-                // Closing the stores under a running worker is what this order
-                // prevents: exit with them at their last flush instead.
-                LOG_ERROR << "Shutdown: worker(s) still running past their deadline: " << names
-                          << "; exiting without closing the stores";
-                std::_Exit(1);
-            }
-            if (doge_full_db)
-                LOG_INFO << "[EMB-DOGE] Full UTXO set at h=" << doge_full_db->get_best_height()
-                         << " on shutdown (a restart resumes there)";
-
-            // Save stats on shutdown
-            mi_ptr->save_stat_log();
-
-            if (p2p_node) p2p_node->shutdown();
-            enhanced_node->shutdown();
+            ordered_shutdown();
         }
         else if (sharechain_mode) {
             LOG_INFO << "Starting enhanced C2Pool sharechain node...";
@@ -10209,6 +10283,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             work_guard.reset();
+            log_shutdown_signal();
 
             enhanced_node->shutdown();
         }
@@ -10300,6 +10375,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             work_guard.reset();
+            log_shutdown_signal();
         }
         
         g_shutdown_stores_closed = true;
