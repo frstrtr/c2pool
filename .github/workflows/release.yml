@@ -744,6 +744,30 @@ jobs:
           if-no-files-found: warn
 
   # ════════════════════════════════════════════════════════════════════════════
+  # DASH masternode-set anchor age (#1906). The compiled MN anchor ages about
+  # 20000 blocks every five weeks, and a cold c2pool-dash with no dashd fails
+  # closed once the anchor is past the bridge limit (kDefaultMaxBridgeBlocks).
+  # The guard estimates the anchor's age in blocks from its pinned header
+  # time. Over the default limit but within the --embedded-mn-bridge-max
+  # 40000 workaround: the release goes ahead only if its notes carry the
+  # workaround (enforced in the checksums job). Past 40000: fail, the
+  # workaround no longer covers a cold start and the anchor must be bumped.
+  # ════════════════════════════════════════════════════════════════════════════
+  dash-mn-anchor-age:
+    name: DASH MN anchor age (#1906)
+    runs-on: ubuntu-24.04
+    if: contains(github.event.inputs.coins || '["dash"]', 'dash')
+    outputs:
+      stale: ${{ steps.age.outputs.stale }}
+      age: ${{ steps.age.outputs.age }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check anchor age
+        id: age
+        run: bash scripts/ci/dash_mn_anchor_age_guard.sh
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Aggregate: single SHA256SUMS over every produced package; on tags,
   # attach everything to a DRAFT release (operator publishes manually).
   # if: always() — runs even when some coin cells are red or skipped, so a
@@ -752,7 +776,7 @@ jobs:
   checksums:
     name: SHA256SUMS + draft release
     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
-    needs: [linux, macos-universal, windows]
+    needs: [linux, macos-universal, windows, dash-mn-anchor-age]
     if: always()
     permissions:
       contents: write
@@ -777,6 +801,43 @@ jobs:
           name: SHA256SUMS
           path: dist/SHA256SUMS
 
+      # DASH MN anchor-age gate (#1906). Runs before the draft is touched. A
+      # stale anchor does not block the release while #1906 is open, provided
+      # the release notes carry the --embedded-mn-bridge-max 40000 workaround:
+      # a fresh draft gets the workaround written into its notes; an existing
+      # draft (operator may have edited the notes) must still carry it. An
+      # anchor past what the workaround covers blocks the release outright.
+      - name: DASH MN anchor-age gate (#1906)
+        id: anchor
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANCHOR_RESULT: ${{ needs.dash-mn-anchor-age.result }}
+          ANCHOR_STALE: ${{ needs.dash-mn-anchor-age.outputs.stale }}
+          ANCHOR_AGE: ${{ needs.dash-mn-anchor-age.outputs.age }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${{ github.repository }}"
+          WORKAROUND='--embedded-mn-bridge-max 40000'
+          if [ "$ANCHOR_RESULT" != "success" ]; then
+            echo "::error::MN-ANCHOR FAIL: the DASH MN anchor-age check did not pass (result: $ANCHOR_RESULT). The compiled masternode-set anchor is too old for a cold c2pool-dash even with $WORKAROUND. Bump the anchor before releasing: see https://github.com/$REPO/issues/1906"
+            exit 1
+          fi
+          if [ "$ANCHOR_STALE" != "1" ]; then
+            echo "DASH MN anchor is within the default bridge limit; no release-notes requirement."
+            echo "notes_extra=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            if ! gh release view "$TAG" --repo "$REPO" --json body --jq .body | grep -qF -- "$WORKAROUND"; then
+              echo "::error::MN-ANCHOR FAIL: the DASH MN anchor is about $ANCHOR_AGE blocks old, over the 20000-block default bridge limit, and the notes of draft $TAG do not carry the workaround '$WORKAROUND'. Add it to the release notes, or bump the anchor: see https://github.com/$REPO/issues/1906"
+              exit 1
+            fi
+            echo "Draft $TAG notes carry '$WORKAROUND' (#1906)."
+          fi
+          echo "::warning::DASH MN anchor is about $ANCHOR_AGE blocks old (#1906); the release notes carry the $WORKAROUND workaround."
+          echo "notes_extra= DASH known issue #1906: the compiled masternode-set anchor is about $ANCHOR_AGE blocks old, over the 20000-block default bridge limit, so a fresh c2pool-dash with no dashd will not serve templates. Workaround: start c2pool-dash with $WORKAROUND." >> "$GITHUB_OUTPUT"
+
       # Idempotent draft assembly: a v-tag draft may already exist from a prior
       # re-run of this job. gh release create is NOT idempotent -- it spawns a
       # SECOND draft with the same tag_name, so repeated runs pile up duplicate
@@ -798,7 +859,7 @@ jobs:
               --repo "$REPO" \
               --draft \
               --title "c2pool $TAG" \
-              --notes "Draft assembled by release.yml -- operator reviews and publishes manually." \
+              --notes "Draft assembled by release.yml -- operator reviews and publishes manually.${{ steps.anchor.outputs.notes_extra }}" \
               dist/*
           fi
 
