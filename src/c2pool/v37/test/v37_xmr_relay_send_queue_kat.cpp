@@ -38,10 +38,11 @@
 //       nothing until A's re-offer has paused at the bound (or ended), then
 //       drains: the link kept, every frame sent and read, 0 queue-full drops.
 //   S5  at the bound / 8, such a peer asks FC_GETHEADERS right after its
-//       HELLO, and A mines a carrier once the re-offer has paused at the bound
-//       (paged within the bound less one FC_HEADERS frame), before the peer
-//       reads: the link kept, 0 queue-full drops; the peer reads every
-//       re-offer frame, the carrier and the FC_HEADERS reply.
+//       HELLO; A builds a job before the peer connects and shares it (a
+//       carrier) once the re-offer has paused at the bound (paged within the
+//       bound less one FC_HEADERS frame), before the peer reads: the link
+//       kept, 0 queue-full drops; the peer reads every re-offer frame, the
+//       carrier and the FC_HEADERS reply.
 // ===========================================================================
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -166,6 +167,12 @@ struct ReadGate {
     }
 };
 
+#ifdef POLLRDHUP
+static constexpr short kPollRdHup = POLLRDHUP;
+#else
+static constexpr short kPollRdHup = 0;
+#endif
+
 // A raw peer on A's port, on its own thread: sends `hello` ([u32 LE length][frame]) and then `ask` (when given), then
 // reads nothing until read(), then whatever has arrived, until stop(), which joins it and closes the socket. ops(): the
 // complete frames read, by opcode; closed(): the other side closed the connection.
@@ -211,12 +218,12 @@ private:
         std::vector<u8> buf(16384), acc;
         std::size_t at = 0;
         while (!stop_ && !closed_) {
-            if (!read_) {  // reads nothing: a 5 ms step, then look again
-                pollfd p{fd_, 0, 0};
-                if (::poll(&p, 1, 5) > 0 && (p.revents & (POLLERR | POLLHUP)) != 0) closed_ = true;
+            if (!read_) {  // reads nothing: a 5 ms step, then look again (a FIN or a reset: closed)
+                pollfd p{fd_, kPollRdHup, 0};
+                if (::poll(&p, 1, 5) > 0 && (p.revents & (kPollRdHup | POLLERR | POLLHUP)) != 0) closed_ = true;
                 continue;
             }
-            for (;;) {
+            while (!stop_) {
                 pollfd p{fd_, POLLIN, 0};
                 if (::poll(&p, 1, 5) <= 0) break;
                 const ssize_t r = ::recv(fd_, buf.data(), buf.size(), MSG_DONTWAIT);
@@ -409,10 +416,12 @@ int main() {
             const std::uint64_t ro0 = A->st().reoffer_frames.load(), d0 = A->st().reoffer_done.load();
             RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5151ull, 0));
             const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
+            const auto th = SClock::now();
             // the bound holds the whole re-offer: it is queued while the peer reads nothing
             const bool queued = hello && wait_until([&] { return A->st().reoffer_done.load() > d0; }, 30000ms);
             const std::optional<std::uint64_t> pl = peer_link();
             const std::size_t q = pl ? na.queued_bytes(*pl) : 0;
+            const long long silent_ms = ms_since(th, SClock::now());
             peer.read();
             const bool read_all = queued && wait_until([&] { return peer.ops(pb::kOpFbReceipts) >= want; }, 30000ms);
             const bool kept = !peer.closed() && peer_link().has_value();
@@ -421,9 +430,10 @@ int main() {
             const std::uint64_t full1 = na.peers_dropped_queue_full();
             const std::uint64_t frames = A->st().reoffer_frames.load() - ro0;
             std::printf("    S4 METRIC bound=%zu re-offer=%zu B (%llu frames, %llu pending) queued=%zu B hwm=%zu full_drops=%llu "
-                        "kept=%d read=%llu\n",
+                        "kept=%d read=%llu silent_ms=%lld\n",
                         na.send_queue_limit(), reoffer, (unsigned long long)frames, (unsigned long long)pend, q, hwm,
-                        (unsigned long long)(full1 - full0), kept ? 1 : 0, (unsigned long long)peer.ops(pb::kOpFbReceipts));
+                        (unsigned long long)(full1 - full0), kept ? 1 : 0, (unsigned long long)peer.ops(pb::kOpFbReceipts),
+                        silent_ms);
             C(clean && queued && read_all && kept && full1 == full0 && frames >= want && hwm >= reoffer / 4,
               "S4 a peer that reads nothing at A's send queue bound: the whole re-offer queued (" + std::to_string(q) +
                       " B on the link), the link kept, every frame read");
@@ -441,10 +451,12 @@ int main() {
             const std::uint64_t z0 = A->st().reoffer_paused.load(), d0 = A->st().reoffer_done.load();
             RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ (0x5252ull + k), 0));
             const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
+            const auto th = SClock::now();
             // the peer reads nothing until A's re-offer has paused at the bound (or ended)
             const bool filled = hello && wait_until([&] {
                 return A->st().reoffer_paused.load() > z0 || A->st().reoffer_done.load() > d0;
             }, 30000ms);
+            const long long silent_ms = ms_since(th, SClock::now());
             peer.read();
             const bool read_all = filled && wait_until([&] {
                 return peer.ops(pb::kOpFbReceipts) >= want && A->st().reoffer_done.load() > d0;
@@ -455,10 +467,10 @@ int main() {
             const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
             const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
             std::printf("    S4 METRIC bound=%zu sent=%llu of %llu frames (%llu pending) paused=%llu full_drops=%llu kept=%d "
-                        "read=%llu\n",
+                        "read=%llu silent_ms=%lld\n",
                         bound, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)pend,
                         (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0,
-                        (unsigned long long)peer.ops(pb::kOpFbReceipts));
+                        (unsigned long long)peer.ops(pb::kOpFbReceipts), silent_ms);
             C(clean && filled && read_all && held && f1 == f0 && sent >= want && (k == 1 || paused > 0) && done == 1,
               std::string("S4 a bound below the re-offer's bytes (") +
                       (k == 0 ? "an eighth" : "x 16,777,216 / 17,418,240") +
@@ -475,12 +487,15 @@ int main() {
             const std::uint64_t f0 = na.peers_dropped_queue_full(), r0 = A->st().reoffer_frames.load();
             const std::uint64_t z0 = A->st().reoffer_paused.load(), d0 = A->st().reoffer_done.load();
             const std::vector<u8> ask = pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 64});
+            rig.tick_monero();
+            const std::optional<pb::PathbJob> j5 = rig.job(*A, 5, 0x55000000u);   // built before the peer connects
             RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5353ull, 0), &ask);
             const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
-            // the re-offer paused at the bound, the peer reading nothing: a live carrier now
+            // the re-offer paused at the bound, the peer reading nothing: a live carrier now (its share only)
             const bool filled = hello && wait_until([&] { return A->st().reoffer_paused.load() > z0; }, 30000ms);
-            rig.tick_monero();
-            const pb::NodeEventResult live = rig.mine(*A, 5, 0x55000000u);
+            const auto tf = SClock::now();
+            const pb::NodeEventResult live = j5 ? rig.share(*A, *j5, 0x55000000u) : pb::NodeEventResult{};
+            const long long stall_ms = ms_since(tf, SClock::now());
             peer.read();
             const bool read_all = filled && wait_until([&] {
                 return peer.ops(pb::kOpFbReceipts) >= want && peer.ops(pb::kOpFcCarrier) >= 1 &&
@@ -491,9 +506,9 @@ int main() {
             const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
             const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
             std::printf("    S5 METRIC bound=%zu headers frame=%zu sent=%llu of %llu (%llu pending) paused=%llu full_drops=%llu "
-                        "kept=%d | read: FB_RECEIPTS %llu FC_CARRIER %llu FC_HEADERS %llu\n",
+                        "kept=%d stall_ms=%lld | read: FB_RECEIPTS %llu FC_CARRIER %llu FC_HEADERS %llu\n",
                         eighth, hf, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)pend,
-                        (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0,
+                        (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0, stall_ms,
                         (unsigned long long)peer.ops(pb::kOpFbReceipts), (unsigned long long)peer.ops(pb::kOpFcCarrier),
                         (unsigned long long)peer.ops(pb::kOpFcHeaders));
             C(clean && filled && read_all && live.action == pb::NodeAction::Placed && held && f1 == f0 && sent >= want &&
