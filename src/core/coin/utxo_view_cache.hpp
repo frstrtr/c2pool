@@ -294,7 +294,13 @@ public:
     /// A legacy record (no outpoints, BlockUndo::restorable() false) cannot put
     /// the spent coins back: only the block's outputs are removed (a rolled-back
     /// coin must never price) and false is returned; the caller decides.
-    bool disconnect_from_undo(const BlockUndo& undo) {
+    ///
+    /// every_coin_known: the record comes from a strict connect, which refuses
+    /// an input the view does not hold, so every spent coin in it is a real
+    /// coin - including one with value 0 and an empty script, which Core keeps
+    /// (coins.cpp AddCoin skips only IsUnspendable) and Coin::is_spent() would
+    /// otherwise read as "not in the view at connect". All are restored.
+    bool disconnect_from_undo(const BlockUndo& undo, bool every_coin_known = false) {
         std::unique_lock<std::shared_mutex> lock(m_mu);
         if (!undo.restorable()) {
             for (const auto& op : undo.added_outpoints)
@@ -303,7 +309,7 @@ public:
                       << " spent coin(s) cannot be restored; only the block's outputs were removed";
             return false;
         }
-        disconnect_locked(undo);
+        disconnect_locked(undo, every_coin_known);
         return true;
     }
 
@@ -528,15 +534,16 @@ private:
     // result because writing and deleting a coin are idempotent: the result is
     // still the set with the block's effects undone. A coin recorded as
     // unknown (not in the view at connect, e.g. a partial view after a jump
-    // start) has nothing to restore.
-    void disconnect_locked(const BlockUndo& undo) {
+    // start) has nothing to restore; with every_coin_known (a strict record)
+    // no coin is unknown.
+    void disconnect_locked(const BlockUndo& undo, bool every_coin_known = false) {
         size_t unknown = 0, overwrite = 0, missing = 0;
         // Pass 1 — restore spent inputs: txs in reverse, inputs in reverse
         // (Core DisconnectBlock L1792, L1818-1823; ApplyTxInUndo L1751).
         for (auto tu = undo.tx_undos.rbegin(); tu != undo.tx_undos.rend(); ++tu) {
             for (size_t j = tu->spent_coins.size(); j-- > 0;) {
                 const Coin& c = tu->spent_coins[j];
-                if (c.is_spent()) {
+                if (!every_coin_known && c.is_spent()) {
                     ++unknown;
                     continue;
                 }
