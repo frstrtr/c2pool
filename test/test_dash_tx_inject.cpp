@@ -1563,3 +1563,95 @@ TEST(DashTxInject, CheckscriptsOffWarningNamesTheLostBlock)
     EXPECT_NE(w.find("lost block, not a lost fee"), std::string::npos);
     EXPECT_NE(w.find("inject-script-check-unarmed"), std::string::npos);
 }
+
+// (VERIFY-S2 N-1, M9) The script flags per served height are dashd 23.1.9's
+// GetBlockScriptFlags with the mainnet buried heights: P2SH always, DERSIG
+// from 245817, CLTV from 619382, CSV from 622944, NULLDUMMY from 939456
+// (dashcore bit values: P2SH 1<<0, DERSIG 1<<2, NULLDUMMY 1<<4, CLTV 1<<9,
+// CSV 1<<10). A height-0 caller and inject admission get every flag.
+TEST(DashTxInject, ScriptFlagsPerServedHeightAreDashds)
+{
+    constexpr uint32_t P2SH = 1u << 0, DERSIG = 1u << 2, NULLDUMMY = 1u << 4,
+                       CLTV = 1u << 9, CSV = 1u << 10;
+    constexpr uint32_t ALL = P2SH | DERSIG | NULLDUMMY | CLTV | CSV;
+    Key k(0x5d);
+    const uint256 prev = prevhash(0xe7);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+
+    uint32_t seen = 0;
+    int calls = 0;
+    auto spy = [&](const std::vector<uint8_t>&, uint32_t, const std::vector<uint8_t>&, uint32_t f) {
+        seen = f;
+        ++calls;
+        return true;
+    };
+    Mempool mp; mp.set_utxo(&utxo);
+    mp.set_script_check(spy);
+    ASSERT_TRUE(mp.add_tx(make_signed_spend(k, prev, 90'000)));
+    auto flags_at = [&](uint32_t next_height) {
+        seen = 0xffffffffu;
+        calls = 0;
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, next_height, 0);
+        EXPECT_EQ(selected.size(), 1u) << "h=" << next_height;
+        EXPECT_EQ(calls, 1) << "h=" << next_height;
+        return seen;
+    };
+    EXPECT_EQ(flags_at(1), P2SH);
+    EXPECT_EQ(flags_at(245816), P2SH);
+    EXPECT_EQ(flags_at(245817), P2SH | DERSIG);
+    EXPECT_EQ(flags_at(619381), P2SH | DERSIG);
+    EXPECT_EQ(flags_at(619382), P2SH | DERSIG | CLTV);
+    EXPECT_EQ(flags_at(622943), P2SH | DERSIG | CLTV);
+    EXPECT_EQ(flags_at(622944), P2SH | DERSIG | CLTV | CSV);
+    EXPECT_EQ(flags_at(939455), P2SH | DERSIG | CLTV | CSV);
+    EXPECT_EQ(flags_at(939456), ALL);
+    EXPECT_EQ(flags_at(2564045), ALL);
+    EXPECT_EQ(flags_at(0), ALL) << "a caller that serves no template gets every buried flag";
+
+    // Inject admission checks with every flag.
+    const uint256 prev2 = prevhash(0xe9);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mi; mi.set_utxo(&utxo);
+    mi.set_script_check(spy);
+    seen = 0;
+    calls = 0;
+    ASSERT_EQ(mi.add_inject(make_signed_spend(k, prev2, 100'000)), Mempool::InjectGate::Ok);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(seen, ALL);
+}
+
+// (M9, the consensus side of the table) A signature in lax DER (a needless
+// 0x00 pad on R) is valid before BIP66 and invalid from 245817 on, through
+// the real dashcore VerifyScript: the served height's DERSIG flag decides.
+TEST(DashTxInject, LaxDerSignatureServedOnlyBelowBip66)
+{
+    Key k(0x5e);
+    const uint256 prev = prevhash(0xea);
+    auto tx = make_signed_spend(k, prev, 90'000);
+    {
+        // scriptSig = <push L+1> <DER sig, sighash byte> <push 33> <pubkey>
+        auto ss = tx.vin[0].scriptSig.m_data;
+        ASSERT_EQ(ss[1], 0x30);
+        ASSERT_EQ(ss[3], 0x02);
+        std::vector<uint8_t> lax;
+        lax.push_back(static_cast<uint8_t>(ss[0] + 1));
+        lax.push_back(0x30);
+        lax.push_back(static_cast<uint8_t>(ss[2] + 1));
+        lax.push_back(0x02);
+        lax.push_back(static_cast<uint8_t>(ss[4] + 1));
+        lax.push_back(0x00);                       // the needless pad
+        lax.insert(lax.end(), ss.begin() + 5, ss.end());
+        tx.vin[0].scriptSig = to_script(lax);
+    }
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    ASSERT_TRUE(mp.add_tx(tx));
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 245816, 0).first.size(), 1u)
+        << "lax DER is valid before BIP66";
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 245817, 0).first.size(), 0u)
+        << "and non-DER from BIP66 on";
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 2564045, 0).first.size(), 0u);
+}
