@@ -1430,7 +1430,11 @@ private:
         const auto rw = rewind_to_best_chain(
             m_keep, m_host.chain_height(), before, m_utxo.get_best_block(), m_host.chain_hash_at,
             m_host.prev_of, [&](uint32_t h, const uint256& hh) {
-                const auto w = disconnect_with_undo(m_db, m_utxo, h, hh);
+                // The full set's records come from strict connects: every
+                // spent coin in them is real, a (value 0, empty script) one
+                // too (dogecoind keeps it: coins.cpp AddCoin skips only
+                // IsUnspendable), and is put back.
+                const auto w = disconnect_with_undo(m_db, m_utxo, h, hh, m_mode == Mode::Full);
                 if (w == RewindResult::Why::None)
                     undone.push_back(h);
                 return w;
