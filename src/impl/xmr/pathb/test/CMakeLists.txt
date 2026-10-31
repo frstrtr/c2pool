@@ -97,7 +97,7 @@
 
 if (BUILD_TESTING)
     # Registered as shards and a gather below.
-    set(_pathb_sharded v37_xmr_joiner_kat v37_xmr_pathb_node_join_kat)
+    set(_pathb_sharded v37_xmr_joiner_kat v37_xmr_pathb_node_join_kat v37_xmr_pathb_node_kat)
     foreach(_pathb_kat
             v37_xmr_side_data_v3_kat
             v37_xmr_pathb_body_v3_kat
@@ -200,6 +200,20 @@ if (BUILD_TESTING)
             COMMAND v37_xmr_pathb_node_join_kat --gather=${_node_join_n} --out=${_node_join_out})
     set_tests_properties(v37_xmr_pathb_node_join_kat PROPERTIES
             LABELS slow FIXTURES_REQUIRED v37_xmr_pathb_node_join_kat_shards)
+    # v37_xmr_pathb_node_kat runs as the shards v37_xmr_pathb_node_kat_s0 .. _s3 (--shard=i/4); the test
+    # v37_xmr_pathb_node_kat gathers their results (--gather=4) and requires them as a fixture.
+    set(_node_shards 0 1 2 3)
+    list(LENGTH _node_shards _node_n)
+    set(_node_out ${CMAKE_CURRENT_BINARY_DIR}/v37_xmr_pathb_node_kat.result)
+    foreach(_node_shard IN LISTS _node_shards)
+        add_test(NAME v37_xmr_pathb_node_kat_s${_node_shard}
+                COMMAND v37_xmr_pathb_node_kat --shard=${_node_shard}/${_node_n} --out=${_node_out})
+        set_tests_properties(v37_xmr_pathb_node_kat_s${_node_shard} PROPERTIES
+                LABELS slow COST 312 FIXTURES_SETUP v37_xmr_pathb_node_kat_shards)
+    endforeach()
+    add_test(NAME v37_xmr_pathb_node_kat COMMAND v37_xmr_pathb_node_kat --gather=${_node_n} --out=${_node_out})
+    set_tests_properties(v37_xmr_pathb_node_kat PROPERTIES
+            LABELS slow FIXTURES_REQUIRED v37_xmr_pathb_node_kat_shards)
     # v37_xmr_pathb_node_kat runs the relay node and its threads; deferfound submits a found block through the monerod
     # arm (xmr_node: the RPC bodies).
     find_package(Threads REQUIRED)

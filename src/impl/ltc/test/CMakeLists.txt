@@ -152,6 +152,30 @@ if (BUILD_TESTING AND GTest_FOUND)
     # only on the old branch never reaches the template without its parent.
     # Same folding rule.
     #
+    # doge_utxo_full_test.cpp: the full DOGE UTXO set (doge::coin::UtxoLane,
+    # Mode::Full, over doge_utxo_lane_harness.hpp): armed from height 1 in
+    # order within the window, every block from best + 1 after a restart, the
+    # mining gate closed until the set is built from genesis, a body spending
+    # a coin the set does not hold refused. Same folding rule.
+    #
+    # doge_utxo_full_wiring_test.cpp: the rules main_ltc's DOGE handlers apply
+    # through doge::coin::UtxoFullState (every copy of a deep body placed, the
+    # pool's tip never 0, start live only near the tip, the swap on every
+    # completion). Same folding rule.
+    #
+    # doge_mempool_validity_test.cpp: a tx reaches a DOGE template only when
+    # priced against the set: a premature coinbase spend is refused at
+    # admission, nothing is selected without a view, an orphan waits outside
+    # the pool and is admitted priced when its parent is. Same folding rule.
+    #
+    # doge_hash_schedule_test.cpp: the DOGE block hash at every height below
+    # the header checkpoint (doge::coin::HashSchedule), served only once the
+    # hash chain links from genesis into the checkpoint. Same folding rule.
+    #
+    # doge_range_sync_test.cpp: the anchored, parallel hash schedule
+    # (doge::coin::RangeSync): exact 2,000-header ranges between anchors, the
+    # sequential sync as the fallback, the headers routing. Same folding rule.
+    #
     # merged_refresh_request_test.cpp: MergedMiningManager::request_refresh
     # runs one merged-work poll at once (the DOGE tip handler's poke), without
     # the poll timer. Same folding rule.
@@ -188,6 +212,28 @@ if (BUILD_TESTING AND GTest_FOUND)
     # last block on the same parent, else no commitment), a stale rebuild is
     # not frozen under a newer template, and MergedPayoutSource produces the
     # payouts while the tracker lock is busy. Same folding rule.
+    #
+    # doge_auxpow_witness_test.cpp: the AuxPoW parent (LTC) coinbase read as
+    # Dogecoin Core reads it, witness allowed: REAL mainnet 'headers' entries
+    # whose parent coinbase carries the BIP144 witness (h4715979, h5080796,
+    # h5641398, h6101857; doge_headers_witness_fixtures.hpp) parse to their
+    # count and link, re-emit byte-identical, the stripped form still parses,
+    # the txid stays witness-stripped, flag 8 and empty witnesses are refused.
+    # Same folding rule.
+    #
+    # doge_p2p_raw_parser_test.cpp: NodeP2P with a raw (AuxPoW) parser: what
+    # it cannot read is delivered by no standard-parse fallback. Same
+    # folding rule.
+    #
+    # doge_headers_parse_test.cpp: a 'headers' message that does not parse to
+    # its end yields the clean prefix (entries that link) and truncated_at,
+    # never garbage that reads like another chain; the parent coinbase params
+    # (wire: witness, no MWEB; txid: stripped). Same folding rule.
+    #
+    # doge_schedule_witness_test.cpp: the hash schedule fed the parse of the
+    # captured witness-coinbase batches (h4715979, h5080796, h5641398,
+    # h6101857) extends by the whole batch; an asked peer's answer cuts
+    # nothing. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -205,9 +251,18 @@ if (BUILD_TESTING AND GTest_FOUND)
         compact_block_mweb_relay_test.cpp
         desired_request_pacer_test.cpp
         desired_version_tally_test.cpp
+        doge_auxpow_witness_test.cpp
+        doge_hash_schedule_test.cpp
+        doge_headers_parse_test.cpp
+        doge_mempool_validity_test.cpp
+        doge_p2p_raw_parser_test.cpp
+        doge_range_sync_test.cpp
+        doge_schedule_witness_test.cpp
         doge_template_budget_test.cpp
         doge_template_gate_test.cpp
         doge_template_underfill_test.cpp
+        doge_utxo_full_test.cpp
+        doge_utxo_full_wiring_test.cpp
         doge_utxo_lane_test.cpp
         emergency_decay_overflow_test.cpp
         f11_donation_invariance_test.cpp

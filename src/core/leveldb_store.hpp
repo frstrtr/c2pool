@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,16 @@ struct LevelDBOptions {
     bool sync_writes = false;
     bool verify_checksums = true;
     bool paranoid_checks = false;
+    /// LevelDB's table file size (its default, 2 MB). Bitcoin Core's chainstate
+    /// uses 32 MB: fewer files for the same data, so a table cache of a few
+    /// hundred covers a set of several GB.
+    size_t max_file_size = 2 * 1024 * 1024;
+    /// Read table files through mmap (LevelDB's default on 64-bit, up to 1000
+    /// files). Every page read stays in the process's RSS (RssFile) while its
+    /// table is open: the DOGE full UTXO set's DB was 809 MB of a 2.5 GB RSS.
+    /// false: pread into LevelDB's buffers (the block cache bounds what stays
+    /// resident; the OS page cache keeps the rest, outside the process).
+    bool mmap_reads = true;
 };
 
 /**
@@ -36,6 +47,8 @@ private:
     std::string m_db_path;
     LevelDBOptions m_options;
     std::unique_ptr<leveldb::DB> m_db;
+    std::string m_registered;   // the path this store holds in the process's registry
+    bool m_lock_held{false};
 
 public:
     class BatchWriter {
@@ -59,9 +72,24 @@ public:
     LevelDBStore(const LevelDBStore&) = delete;
     LevelDBStore& operator=(const LevelDBStore&) = delete;
 
+    /// Opens the DB. Fails, touching nothing, when another open holds it:
+    /// another process (its LOCK), or another LevelDBStore in this process
+    /// (a process-wide registry, checked before LevelDB: LevelDB's own refusal
+    /// closes a descriptor of LOCK, which drops this process's fcntl lock on
+    /// it). lock_held() then says so.
     bool open();
+    /// open(), and while another open holds the DB, again until `attempts`
+    /// in all, `wait` apart (a restart that overlaps the process it replaces).
+    bool open_waiting(int attempts, std::chrono::milliseconds wait);
     void close();
     bool is_open() const { return m_db != nullptr; }
+    /// The last open() failed because another open holds the DB.
+    bool lock_held() const { return m_lock_held; }
+    /// What an operator does about a held DB.
+    static const char* held_advice()
+    {
+        return "stop the other c2pool using this --data-dir, or give this one its own --data-dir";
+    }
 
     bool put(const std::string& key, const std::vector<uint8_t>& value);
     bool get(const std::string& key, std::vector<uint8_t>& value);
@@ -118,6 +146,10 @@ struct ChainMetadata {
     uint64_t last_updated_timestamp = 0;
 };
 
+/// The status of a leveldb::DB::Open of `db_path` says another open holds
+/// the DB's LOCK (every platform's wording; see leveldb_store.cpp).
+bool leveldb_status_lock_held(const leveldb::Status& status, const std::string& db_path);
+
 /**
  * Specialized LevelDB store for sharechain data with optimized indexing
  */
@@ -148,6 +180,10 @@ public:
     SharechainLevelDBStore& operator=(const SharechainLevelDBStore&) = delete;
 
     bool open();
+    /// See LevelDBStore::open_waiting / lock_held.
+    bool open_waiting(int attempts, std::chrono::milliseconds wait);
+    bool lock_held() const { return m_store && m_store->lock_held(); }
+    const std::string& db_path() const { return m_db_path; }
     void close();
 
     // Share operations

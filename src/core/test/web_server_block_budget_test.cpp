@@ -44,6 +44,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/coin/transaction.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 #include <btclibs/util/strencodings.h>
 #include <crypto/scrypt.h>
 
@@ -273,6 +274,8 @@ TEST(LtcTemplateBudget, FullTemplateWithLargeCoinbaseStaysUnder4MWU)
         ASSERT_TRUE(pool.add_tx_unchecked(tx));
         pool.set_tx_fee(ltc::coin::compute_txid(tx), 10000 + i);
     }
+    ltc_test::CoveringView view;
+    view.cover(pool);
     {
         ltc::coin::BlockType g;
         static_cast<ltc::coin::BlockHeaderType&>(g) = ltc_testnet_genesis();

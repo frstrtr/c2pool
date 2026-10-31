@@ -38,6 +38,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -1295,11 +1297,64 @@ static BlockType make_cbtx_block(uint32_t height, int64_t credit_pool,
     cb.creditPoolBalance = credit_pool;
     BlockType blk;
     blk.m_txs.push_back(make_spend(raw256(0x90), 0, 500000000, height));
+    blk.m_txs[0].version = 3;   // special version: a typed v1 coinbase is bad-txns-type
     blk.m_txs[0].type = 5;                                    // CbTx
     blk.m_txs[0].extra_payload = dash::coin::encode_cbtx(cb);
     blk.m_txs[0].vout[0].scriptPubKey.m_data = payee_script;  // pays projected MN
     bind_block(blk);
     return blk;
+}
+
+// The external-collateral proof (Mempool::prove_chain_coin) remembers the
+// spends of recent connected blocks. A block the live lane refuses (dashd
+// rejects it) never feeds it, and on_sml_reorg forgets the blocks the switched
+// chain no longer holds — otherwise a ProRegTx naming such an outpoint is
+// dropped for up to kRecentSpentBlocks blocks.
+TEST(DashCoinStateMaintainer, RefusedAndReorgedBlocksLeaveTheRecentSpentRing) {
+    NodeCoinState st;
+    CoinStateMaintainer m(st);
+    m.on_mn_list_update(single_mn_coll(p2pkh_script(0x30), raw256(0x55), 3));
+    m.on_new_tip(H - 1, PREV_HASH, BITS, MTP, DASH_PUBKEY_VER, DASH_P2SH_VER, CURTIME, VERSION);
+    std::map<uint32_t, uint256> active;
+    m.set_chain_hash_at_height_fn([&active](uint32_t h) -> std::optional<uint256> {
+        auto it = active.find(h);
+        if (it == active.end()) return std::nullopt;
+        return it->second;
+    });
+    auto header_hash = [](const BlockType& b) {
+        auto packed = ::pack(static_cast<const bitcoin_family::coin::BlockHeaderType&>(b));
+        return dash::crypto::hash_x11(packed.get_span());
+    };
+    auto proof = [&st](uint8_t tag) {
+        Coin coin;
+        return st.mempool().prove_chain_coin(Outpoint(raw256(tag), 0), coin);
+    };
+
+    BlockType good = make_cbtx_block(H, 123'456'789LL, p2pkh_script(0x30));
+    good.m_txs.push_back(make_spend(raw256(0x61), 0, 1000, 7));
+    bind_block(good);
+    m.on_block_connected(good, H);
+    active[H] = header_hash(good);
+    ASSERT_EQ(st.mnstates().last_applied_height(), H);
+    EXPECT_EQ(proof(0x61), Mempool::CoinProof::Absent);
+
+    BlockType bad = make_cbtx_block(H + 1, 123'456'789LL, p2pkh_script(0x30));
+    MutableTransaction neg = make_spend(raw256(0x62), 0, 1000, 8);
+    neg.version = 0xFFFF;                     // nVersion -1: bad-txns-version
+    bad.m_txs.push_back(neg);
+    bind_block(bad);
+    m.on_block_connected(bad, H + 1);
+    EXPECT_EQ(st.mnstates().last_applied_height(), H) << "the live lane refuses it";
+    EXPECT_EQ(proof(0x62), Mempool::CoinProof::Unknown)
+        << "a refused block's spends are not chain spends";
+
+    m.on_sml_reorg();                         // H is still on the chain
+    EXPECT_EQ(proof(0x61), Mempool::CoinProof::Absent);
+
+    active[H] = raw256(0x99);                 // the reorg disconnected H
+    m.on_sml_reorg();
+    EXPECT_EQ(proof(0x61), Mempool::CoinProof::Unknown);
+    EXPECT_EQ(st.mempool().recent_chain_spend_blocks(), 0u);
 }
 
 TEST(DashCoinStateMaintainer, TipBodyArrivalFiresStateDirtyWithoutTemplateRequest) {

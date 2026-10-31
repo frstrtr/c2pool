@@ -98,7 +98,10 @@ private:
     BlockSource m_last_block_source{BlockSource::Block};
     // BIP 130: getdata the body of every small headers announcement. The LTC
     // embedded node turns this off and fetches the tip's block once
-    // (mweb_fetch_retry) instead of once per announcing peer.
+    // (mweb_fetch_retry) instead of once per announcing peer. On DOGE it also
+    // gates the inv announcement's body getdata (the embedded DOGE node turns
+    // it off: its tip handler asks the announcer once, its UTXO lane fills a
+    // gap).
     bool m_fetch_announced_blocks{true};
     // Last compact block we SENT — cached to serve getblocktxn requests
     BlockType m_sent_cmpct_block;
@@ -115,6 +118,11 @@ private:
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
     RawHeadersParser m_raw_headers_parser;
+    // A raw parse that stopped before the message's count (an entry it could
+    // not read): the headers before it and the count go here instead of to
+    // new_headers, when set (the DOGE hash schedule: a strike, not a cut).
+    using HeadersTruncatedFn = std::function<void(const std::vector<BlockHeaderType>&, uint64_t count)>;
+    HeadersTruncatedFn m_on_headers_truncated;
     // Raw headers SINK: if set, receives the raw 'headers' payload bytes and
     // short-circuits the standard handler entirely (both the 80+1 parse and the
     // BIP130 body getdata). Additive and OPTIONAL — only the NMC lane sets it, so
@@ -126,6 +134,9 @@ private:
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
+    // A block whose arrival is logged at DEBUG instead of INFO (the DOGE full
+    // set's IBD: millions of historical bodies).
+    std::function<bool(const uint256&)> m_block_log_quiet;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
@@ -302,6 +313,10 @@ public:
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+
+    /// A 'headers' message the raw parser did not read to its end: its clean
+    /// prefix and the message's count, instead of new_headers.
+    void set_on_headers_truncated(HeadersTruncatedFn f) { m_on_headers_truncated = std::move(f); }
     /// Set a raw headers SINK (for NMC AuxPoW header-feed). When set, the 'headers'
     /// handler forwards the raw payload bytes and returns immediately — the standard
     /// 80+1 parse and BIP130 body getdata are skipped. Additive; unset for every
@@ -310,6 +325,7 @@ public:
 
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
+    void set_block_log_quiet(std::function<bool(const uint256&)> f) { m_block_log_quiet = std::move(f); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -391,7 +407,8 @@ public:
     void set_on_cmpct_outcome(CmpctOutcomeCallback cb) { m_on_cmpct_outcome = std::move(cb); }
     /// How the block of the current/last full_block event arrived.
     BlockSource last_block_source() const { return m_last_block_source; }
-    /// BIP 130 body getdata for small headers announcements (default on).
+    /// BIP 130 body getdata for small headers announcements (default on); on
+    /// DOGE also the inv announcement's body getdata.
     void set_fetch_announced_blocks(bool on) { m_fetch_announced_blocks = on; }
 
     /// getdata type for a block body from this peer: MSG_MWEB_BLOCK for an
@@ -661,6 +678,11 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
+                // DOGE: like the BIP 130 getdata, only while
+                // fetch_announced_blocks (every announcer sent the body:
+                // 18-22 copies of each tip).
+                if (!m_fetch_announced_blocks && (m_chain_label == "DOGE" || m_chain_label == "doge"))
+                    break;
                 // Request the full block for MWEB state extraction. An MWEB
                 // peer answers MSG_BLOCK without the mweb tail, so ask it
                 // for MSG_MWEB_BLOCK.
@@ -693,16 +715,18 @@ private:
     {
         // When a raw block parser is set (DOGE AuxPoW), re-parse the block from
         // raw P2P bytes.  The standard BlockType deserialization misinterprets
-        // AuxPoW data as transactions, producing garbage.
+        // AuxPoW data as transactions, producing garbage, so a body the raw
+        // parser cannot read is dropped, never handed on from that parse.
         BlockType block;
         if (m_raw_block_parser && !msg->m_raw_payload.empty()) {
             try {
                 block = m_raw_block_parser(msg->m_raw_payload.data(),
                                            msg->m_raw_payload.size());
             } catch (const std::exception& e) {
-                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed: " << e.what()
-                            << " — falling back to standard parse";
-                block = msg->m_block;
+                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed on a "
+                            << msg->m_raw_payload.size() << "-byte block from "
+                            << m_target_addr.to_string() << ": " << e.what() << " — dropped";
+                return;
             }
         } else {
             block = msg->m_block;
@@ -730,10 +754,16 @@ private:
         // Catch to ensure full_block event always fires for MWEB extraction.
         try { m_peer->get_block(blockhash, block); } catch (...) {}
         try { m_peer->get_header(blockhash, header); } catch (...) {}
-        LOG_INFO << "[" << m_chain_label << "] Full block received: "
-                 << blockhash.GetHex().substr(0, 16) << "..."
-                 << " txs=" << block.m_txs.size()
-                 << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        if (m_block_log_quiet && m_block_log_quiet(blockhash)) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Full block received: "
+                            << blockhash.GetHex().substr(0, 16) << "..."
+                            << " txs=" << block.m_txs.size();
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] Full block received: "
+                     << blockhash.GetHex().substr(0, 16) << "..."
+                     << " txs=" << block.m_txs.size()
+                     << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        }
         // Fire full block event (carries MWEB data for state extraction)
         deliver_full_block(block, BlockSource::Block);
     }
@@ -754,11 +784,15 @@ private:
 
         std::vector<BlockHeaderType> vheaders;
 
-        // When a raw parser is set (DOGE AuxPoW), always prefer it over the
-        // standard parser.  The standard parser misinterprets AuxPoW data as
-        // block transactions, producing a small number of garbage entries
-        // instead of the full 2000-header batch.
-        if (m_raw_headers_parser && !msg->m_raw_payload.empty()) {
+        // When a raw parser is set (DOGE AuxPoW), its result is the batch: the
+        // standard parser misinterprets AuxPoW data as block transactions,
+        // producing a small number of garbage entries instead of the full
+        // 2000-header batch, so it is never a fallback for an AuxPoW chain
+        // (the raw parser returns the entries that parsed; none is none).
+        const bool raw_parsed = m_raw_headers_parser && !msg->m_raw_payload.empty();
+        bool truncated = false;
+        uint64_t declared = 0;
+        if (raw_parsed) {
             try {
                 vheaders = m_raw_headers_parser(
                     msg->m_raw_payload.data(), msg->m_raw_payload.size());
@@ -768,9 +802,22 @@ private:
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_chain_label << "] AuxPoW headers parser failed: " << e.what();
             }
+            // The raw parser returns the entries that parsed, in order: fewer
+            // than the message's count means it stopped at one it could not read.
+            if (m_on_headers_truncated) {
+                try {
+                    PackStream cs(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(msg->m_raw_payload.data()),
+                        std::min<size_t>(msg->m_raw_payload.size(), 9)));
+                    declared = ReadCompactSize(cs);
+                } catch (const std::exception&) {
+                    declared = 0;
+                }
+                truncated = vheaders.size() < declared;
+            }
         }
 
-        if (vheaders.empty() && !msg->m_headers.empty()) {
+        if (!raw_parsed && !msg->m_headers.empty()) {
             // Standard path: headers parsed as 80-byte BlockType (LTC, BTC)
             for (auto block : msg->m_headers)
             {
@@ -784,8 +831,11 @@ private:
             }
         }
 
+        if (truncated)
+            m_on_headers_truncated(vheaders, declared);
         if (!vheaders.empty()) {
-            m_coin->new_headers.happened(vheaders);
+            if (!truncated)
+                m_coin->new_headers.happened(vheaders);
 
             // BIP 130: when receiving a small headers batch (new block announcement),
             // request the full block via getdata.

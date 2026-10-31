@@ -779,6 +779,12 @@ void seed_gate(NodeCoinState& st, const CSimplifiedMNList& sml,
                kPubkeyVer, kP2shVer, 1'700'000'123u, 0x20000000u);
 }
 
+dash::coin::MnFoldContext::OperatorSigFn accept_all_operator_sigs()
+{
+    return [](const dash::coin::MnFoldContext::OpKey&, bool, const uint256&,
+              const dash::coin::MnFoldContext::Sig&, bool) { return true; };
+}
+
 uint256 committed_mn_root(const DashWorkData& w)
 {
     CCbTx cb;
@@ -842,6 +848,9 @@ TEST(DashSmlPoseFoldGate, RevivingProUpServAfterQcBanOrdersLikeDashd)
     seed_gate(st, sml, qc);
     st.set_include_mn_special_txs(true);
     st.set_serve_mempool_txs(true);
+    // The fold verifies a ProUpServTx's BLS operator signature (B.9); this KAT
+    // is about ordering, not crypto, so every signature verifies here.
+    st.set_protx_operator_sig_verifier(accept_all_operator_sigs());
     st.set_qc_pose_fold_inputs(
         members_table({{qhash(1), member_run(0, 8)}}),
         [](const uint256&) { return std::optional<PoSePenaltyView>{{50, 50, false}}; },
@@ -894,4 +903,133 @@ TEST(DashSmlPoseFoldGate, RevivingProUpServAfterQcBanOrdersLikeDashd)
         << "ban-then-revive: the MN must end VALID (type-6 precedes type-2)";
     DeclineReport why;
     EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+}
+
+// B10 (#7489, builder x emit gate): a ProRegTx re-registering MN X's
+// external collateral REPLACES X, so a pending ProUpServTx(X) behind it in the
+// body can never be mined (bad-protx-hash). The builder drops the update and
+// commits the post-replacement root; the emit gate re-folds the served body
+// with the SAME context and agrees, and refuses a template that commits the
+// root of a fold that kept X.
+TEST(DashSmlPoseFoldGate, EmitGateRefusesTemplateWhoseFoldWouldReplaceAnMn)
+{
+    namespace v = dash::coin::vendor;
+    const CSimplifiedMNList sml = list_of(10);
+    const auto qc = real_qc(1, qhash(1), 8);      // every member valid: no ban
+    NodeCoinState st;
+    seed_gate(st, sml, qc);
+    // The DMN view knows X = mn(3) and its external collateral.
+    MNState payee;
+    payee.isValid = true;
+    payee.nRegisteredHeight = 2'300'000;
+    payee.scriptPayout.m_data = p2pkh(0x30);
+    payee.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    MNState x = payee;
+    x.nRegisteredHeight = 2'300'001;
+    x.scriptPayout.m_data = p2pkh(0x31);
+    x.collateralOutpoint.hash = hval(0x66, 3);
+    x.collateralOutpoint.index = 1;
+    st.mnstates().load(std::vector<std::pair<uint256, MNState>>{{mn(0), payee}, {mn(3), x}});
+    st.set_include_mn_special_txs(true);
+    st.set_serve_mempool_txs(true);
+    st.set_protx_operator_sig_verifier(accept_all_operator_sigs());
+    st.set_qc_pose_fold_inputs(
+        members_table({{qhash(1), member_run(0, 8)}}),
+        [](const uint256&) { return std::optional<PoSePenaltyView>{{50, 50, false}}; },
+        [] { return std::optional<std::pair<uint32_t, uint256>>{{kPrevH, kPrevHash}}; });
+
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    st.mempool().set_utxo(&utxo);
+    auto funded = [&](uint16_t type, const std::vector<unsigned char>& payload,
+                      uint32_t n, int64_t fee) {
+        const uint256 pv = hval(0x99, n);
+        utxo.add_coin(::core::coin::Outpoint(pv, 0),
+                      ::core::coin::Coin(100'000, {}, 1, false));
+        MutableTransaction tx;
+        tx.version = 3; tx.type = type;
+        ::bitcoin_family::coin::TxIn in; in.prevout.hash = pv; in.prevout.index = 0;
+        in.sequence = 0xffffffffu;
+        tx.vin.push_back(in);
+        ::bitcoin_family::coin::TxOut o; o.value = 100'000 - fee;
+        o.scriptPubKey.m_data = p2pkh(static_cast<uint8_t>(0x40 + n));
+        tx.vout.push_back(o);
+        tx.extra_payload = payload;
+        return tx;
+    };
+    auto bytes_of = [](const auto& pl) {
+        auto ps = ::pack(pl); auto sp = ps.get_span();
+        return std::vector<unsigned char>(reinterpret_cast<const unsigned char*>(sp.data()),
+                                          reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    };
+    v::CProRegTx reg;
+    reg.nVersion = v::ProTxVersion::BASIC_BLS;
+    reg.nType = v::MnType::REGULAR;
+    reg.collateralOutpoint = x.collateralOutpoint;            // X's collateral
+    for (size_t b = 0; b < reg.netInfo.ip.size(); ++b)
+        reg.netInfo.ip[b] = static_cast<uint8_t>(0x60 + b);
+    reg.netInfo.port_be = 0x270f;
+    reg.pubKeyOperator.fill(0x5A);
+    reg.keyIDOwner.data()[0] = 0x71;
+    reg.keyIDVoting.data()[0] = 0x72;
+    reg.scriptPayout.m_data = p2pkh(0x35);
+    reg.inputsHash = hval(0x88, 2);
+    v::CProUpServTx ups;
+    ups.nVersion = v::ProTxVersion::BASIC_BLS;
+    ups.nType = v::MnType::REGULAR;
+    ups.proTxHash = mn(3);
+    for (size_t b = 0; b < ups.netInfo.ip.size(); ++b)
+        ups.netInfo.ip[b] = static_cast<uint8_t>(0x20 + b);
+    ups.netInfo.port_be = 0x1027;
+    ups.inputsHash = hval(0x88, 3);
+    // The registration out-bids the update, so it is selected (and folded) first.
+    const auto regtx = funded(1, bytes_of(reg), 1, 60'000);
+    const auto upstx = funded(2, bytes_of(ups), 2, 5'000);
+    ASSERT_TRUE(st.mempool().add_tx(regtx));
+    ASSERT_TRUE(st.mempool().add_tx(upstx));
+
+    WorkSelection sel = st.select_work([] { return DashWorkData{}; });
+    ASSERT_EQ(sel.source, WorkSource::Embedded) << sel.decline.one_line();
+    bool reg_rides = false, ups_rides = false;
+    for (const auto& h : sel.work.m_tx_hashes) {
+        if (h == dash::coin::dash_txid(regtx)) reg_rides = true;
+        if (h == dash::coin::dash_txid(upstx)) ups_rides = true;
+    }
+    EXPECT_TRUE(reg_rides);
+    EXPECT_FALSE(ups_rides) << "X is replaced in this block: its update is bad-protx-hash";
+
+    // Independent reference: the list without X, plus the new registration.
+    CSimplifiedMNListEntry fresh;
+    fresh.nVersion = CSimplifiedMNListEntry::VER_BASIC_BLS;
+    fresh.proRegTxHash = dash::coin::dash_txid(regtx);
+    fresh.netAddress = reg.netInfo.ip;
+    fresh.netPort = reg.netInfo.port_be;
+    fresh.pubKeyOperator = reg.pubKeyOperator;
+    fresh.keyIDVoting = reg.keyIDVoting;
+    fresh.isValid = true;
+    CSimplifiedMNList replaced;
+    CSimplifiedMNList kept;
+    for (const auto& e : sml.mnList) {
+        if (e.proRegTxHash != mn(3)) replaced.mnList.push_back(e);
+        kept.mnList.push_back(e);
+    }
+    replaced.mnList.push_back(fresh);
+    kept.mnList.push_back(fresh);
+    replaced.sort();
+    kept.sort();
+    EXPECT_EQ(committed_mn_root(sel.work), replaced.CalcMerkleRoot())
+        << "dashd RebuildListFromBlock removes the MN whose collateral is reused";
+    DeclineReport why;
+    EXPECT_TRUE(st.embedded_template_emit_ok(sel.work, &why)) << why.one_line();
+
+    // A template committing the root of a fold that KEPT X is refused.
+    DashWorkData stale = sel.work;
+    {
+        CCbTx cb;
+        ASSERT_TRUE(dash::coin::vendor::parse_cbtx(stale.m_coinbase_payload, cb));
+        cb.merkleRootMNList = kept.CalcMerkleRoot();
+        stale.m_coinbase_payload = dash::coin::encode_cbtx(cb);
+    }
+    DeclineReport why2;
+    EXPECT_FALSE(st.embedded_template_emit_ok(stale, &why2));
+    EXPECT_EQ(why2.cause, "emit-mnlist-root-drift");
 }

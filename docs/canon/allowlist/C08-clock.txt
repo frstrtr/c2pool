@@ -15,7 +15,7 @@ src/c2pool/v37/xmr/xmr_live_submit.hpp 3 submit_block round-trip latency and eve
 src/c2pool/v37/xmr/xmr_live_transport.hpp 2 monerod RPC request deadline (monotonic)
 src/c2pool/v37/xmr/xmr_native_template_backend.hpp 2 deadline while waiting for a template (liveness)
 src/c2pool/v37/xmr/xmr_stratum_listener.hpp 1 the listener clock of the stratum session timers (parked logins, idle re-probe, the submit-rate budget)
-src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp 2 relay transport timers through one clock (RelayClock: monotonic and wall): keepalive, link silence, HELLO timeout, address-ban and dial backoff, the parked retry, the join waits (P-53, the FC_GETBUCKETS window), context asks, peer book last-seen times
+src/c2pool/v37/xmr/pathb/pathb_relay_node.hpp 3 relay transport timers through one clock (RelayClock: monotonic and wall): keepalive, link silence, HELLO timeout, address-ban and dial backoff, the parked retry, the join waits (P-53, the FC_GETBUCKETS window), context asks, peer book last-seen times; RelayClock::wall_ms, unix milliseconds of log lines only (the caught-up lines' t=, the status block's time line)
 src/c2pool/v37/xmr/xmr_p2p_block_publisher.hpp 2 found-block publish retry timing and event timestamps
 src/c2pool/v37/xmr/xmr_web_dashboard.cpp 2 dashboard display clock
 src/impl/xmr/native/node/xmr_native_node.hpp 5 native Monero node: timing logs, receive time of operator-injected txs, monotonic link epoch

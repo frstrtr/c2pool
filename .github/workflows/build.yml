@@ -468,6 +468,7 @@ jobs:
               test_share_messages \
               test_stratum_extensions \
               test_stratum_interim_hardening \
+              test_stratum_username \
               test_template_builder \
               test_threading \
               test_utxo \
@@ -1144,7 +1145,7 @@ jobs:
                     boost_sentinel \
                     test_hardening test_share_messages \
                     test_redistribute_address test_redistribute test_auto_ratchet \
-                    test_stratum_extensions test_stratum_interim_hardening test_btc_underfill_guard test_dgb_underfill_guard \
+                    test_stratum_extensions test_stratum_interim_hardening test_stratum_username test_btc_underfill_guard test_dgb_underfill_guard \
                     core_test sharechain_test share_test btc_share_test \
                     test_threading test_weights \
                     test_header_chain test_mempool test_template_builder \

@@ -1405,6 +1405,29 @@ TEST(CoinP2pDialVisibility, IdleNeverDialedIsDistinctAndSilent) {
     EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
 }
 
+// The DASH fold lanes' refused-unchanged counters ride the coin-sync status
+// object and surface in /local_stats as-is; a provider without them leaves the
+// payload unchanged.
+TEST(CoinP2pDialVisibility, LocalStatsPassesTheDmlFoldCountersThrough) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "connected", /*reachable=*/true,
+                  /*connected=*/3, /*dial_failures=*/0);
+    EXPECT_FALSE(mi.rest_local_stats().contains("dml_fold"));
+
+    mi.set_coin_sync_status_fn([]() {
+        nlohmann::json s = nlohmann::json::object();
+        s["peers"] = nlohmann::json::array();
+        s["dml_fold"] = {{"oracle_refused_unchanged", 2},
+                         {"replay_refused_unchanged", 0}};
+        return s;
+    });
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("dml_fold"));
+    EXPECT_EQ(stats["dml_fold"].value("oracle_refused_unchanged", -1), 2);
+    EXPECT_EQ(stats["dml_fold"].value("replay_refused_unchanged", -1), 0);
+}
+
 TEST(CoinP2pDialVisibility, V36StatusCarriesDialState) {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
                        c2pool::address::Blockchain::DASH);

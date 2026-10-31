@@ -95,11 +95,13 @@ namespace rly = ::c2pool::v37n::xmr::relay;
 
 // ---------------------------------------------------------------------------
 // The relay's clock: the transport timers only (keepalive, silence, HELLO
-// timeout, bans, the parked retry, the join waits, the peer book's times).
+// timeout, bans, the parked retry, the join waits, the peer book's times) and
+// the log lines' wall time.
 // ---------------------------------------------------------------------------
 struct RelayClock {
     std::function<std::uint64_t()> mono_ms;  // monotonic, milliseconds
     std::function<std::uint64_t()> wall_s;   // unix seconds (the peer book)
+    std::function<std::uint64_t()> wall_ms;  // unix milliseconds, log lines only (t=); unset: wall_s() * 1000
     static RelayClock system() {
         RelayClock c;
         c.mono_ms = [] {
@@ -111,6 +113,11 @@ struct RelayClock {
             return static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
                             .count());
+        };
+        c.wall_ms = [] {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      std::chrono::system_clock::now().time_since_epoch())
+                                                      .count());
         };
         return c;
     }
@@ -1272,6 +1279,11 @@ private:
     static unsigned long long ull(const std::atomic<std::uint64_t>& a) { return static_cast<unsigned long long>(a.load()); }
     std::uint64_t now_ms() const { return clock_.mono_ms(); }
     std::int64_t now_ns() const { return static_cast<std::int64_t>(now_ms()) * 1000000; }
+    std::uint64_t wall_ms() const { return clock_.wall_ms ? clock_.wall_ms() : clock_.wall_s() * 1000; }
+    // Under the node lock: the caught-up lines' end, " at pos <best position> t=<unix ms>".
+    std::string at_pos_t_locked() const {
+        return " at pos " + std::to_string(node_->tree().best().pos) + " t=" + std::to_string(wall_ms());
+    }
     void log(const std::string& s) const {
         if (log_) log_(s);
     }
@@ -2862,7 +2874,7 @@ private:
         if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
         node_->note_caught_up();
         st_.caught_up_at_ms = now_ms();
-        log("relay: caught up (the catch-up from every HELLO peer ended by its done test)");
+        log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
     }
     // Under the node lock and cumtx_: FC_GETHEADERS to the peer's tip (one in flight per peer), from the best tip,
     // then, after empty replies, a locator step down the best chain: pos - 1, pos - 2, pos - 4, ..., then the lowest
@@ -3227,7 +3239,12 @@ private:
                 (s->switched ? " -> adopted, lost " + std::to_string(s->sw.lost) : ""));
             if (s->caught_up) {
                 st_.caught_up_at_ms = now_ms();
-                log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)");
+                std::string at;
+                {
+                    const NodeGuard g(*this);
+                    at = at_pos_t_locked();
+                }
+                log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at);
             }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;

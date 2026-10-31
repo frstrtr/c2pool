@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <string>
 #include <array>
+#include <vector>
 
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
@@ -258,6 +259,77 @@ TEST(NmcP1AuxPowWire, MainnetBlock829949RoundTrip)
     ASSERT_LE(80 + auxlen, total);
     EXPECT_EQ(0, std::memcmp(out.data(), base + 80, auxlen));
     EXPECT_LT(80 + auxlen, total);
+}
+
+// ---------------------------------------------------------------------------
+// The parent (BTC) coinbase in witness serialization. The daemon reads and
+// writes the CAuxPow parent coinbase witness-allowed (auxpow.h READWRITE(tx)
+// with the stream's default params), and a BTC coinbase carries the BIP141
+// witness-reserved value since 2017 (block 757000's has the aa21a9ed
+// commitment): a peer that stored the proof witness-kept serves it with
+// marker 00, flag 01 and that item. The real 757000 proof with its coinbase in
+// that form must parse to the same fields, keep the witness, re-emit
+// byte-identical, and keep the witness-stripped txid that the parent block's
+// merkle root commits to.
+// ---------------------------------------------------------------------------
+TEST(NmcP1AuxPowWire, WitnessParentCoinbaseParses)
+{
+    PackStream ps;
+    ps.from_hex(NMC_BLOCK_757000_HEX);
+    const std::vector<unsigned char> blk(reinterpret_cast<const unsigned char*>(ps.data()),
+                                         reinterpret_cast<const unsigned char*>(ps.data()) + ps.size());
+    BlockHeaderType hdr;
+    ps >> hdr;
+    AuxPow stripped;
+    ps >> stripped;
+    ASSERT_TRUE(stripped.parent_coinbase.vin.at(0).scriptWitness.IsNull());
+
+    PackStream re;
+    re << stripped;
+    const size_t auxlen = re.size();
+    PackStream cb;
+    cb << nmc::coin::TX_NO_WITNESS(stripped.parent_coinbase);
+    const size_t L = cb.size();
+    ASSERT_LT(80 + auxlen, blk.size());
+    const std::vector<unsigned char> aux(blk.begin() + 80, blk.begin() + 80 + auxlen);
+
+    // version | 00 01 | vin .. vout | 01 20 <32 x 00> | locktime | the rest
+    std::vector<unsigned char> w(aux.begin(), aux.begin() + 4);
+    w.push_back(0x00);
+    w.push_back(0x01);
+    w.insert(w.end(), aux.begin() + 4, aux.begin() + L - 4);
+    w.push_back(0x01);
+    w.push_back(0x20);
+    w.insert(w.end(), 32, 0x00);
+    w.insert(w.end(), aux.begin() + L - 4, aux.end());
+    ASSERT_EQ(w.size(), auxlen + 36);
+
+    PackStream wps(w);
+    AuxPow wit;
+    ASSERT_NO_THROW(wps >> wit);
+    EXPECT_EQ(wps.cursor_size(), 0u);
+
+    ASSERT_EQ(wit.parent_coinbase.vin.size(), 1u);
+    EXPECT_EQ(wit.parent_coinbase.vout.size(), stripped.parent_coinbase.vout.size());
+    ASSERT_EQ(wit.parent_coinbase.vin[0].scriptWitness.stack.size(), 1u);
+    EXPECT_EQ(wit.parent_coinbase.vin[0].scriptWitness.stack[0], std::vector<unsigned char>(32, 0x00));
+    EXPECT_EQ(wit.parent_block_hash, stripped.parent_block_hash);
+    EXPECT_EQ(wit.parent_coinbase_branch, stripped.parent_coinbase_branch);
+    EXPECT_EQ(wit.parent_coinbase_index, stripped.parent_coinbase_index);
+    EXPECT_EQ(wit.chain_merkle_branch, stripped.chain_merkle_branch);
+    EXPECT_EQ(wit.chain_merkle_index, stripped.chain_merkle_index);
+    EXPECT_EQ(Hash(pack(wit.parent_header).get_span()), Hash(pack(stripped.parent_header).get_span()));
+
+    const uint256 txid = nmc::coin::parent_coinbase_txid(wit.parent_coinbase);
+    EXPECT_EQ(txid, nmc::coin::parent_coinbase_txid(stripped.parent_coinbase));
+    EXPECT_EQ(nmc::coin::aux_merkle_root(txid, wit.parent_coinbase_branch,
+                                         static_cast<uint32_t>(wit.parent_coinbase_index)),
+              wit.parent_header.m_merkle_root);
+
+    PackStream out;
+    out << wit;
+    ASSERT_EQ(out.size(), w.size());
+    EXPECT_EQ(0, std::memcmp(out.data(), w.data(), w.size()));
 }
 
 // ---------------------------------------------------------------------------

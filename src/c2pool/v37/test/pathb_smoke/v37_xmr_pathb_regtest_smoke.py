@@ -57,6 +57,12 @@
 #             (--pathb-regtest-k30 2,4,8: G of its own) and a kind-2
 #             deployment file naming epoch 1, which the build lacks: HOLD at
 #             fixed - 1; the job counter stops; no strike
+# After the parts (checks "lines", every run of the daemon under test):
+#   every status block has one `  time: t=<unix ms>` line before the next
+#   block; t rises within a run and lies within the rig's run; every
+#   `relay: caught up (` line is a known form ending ` at pos <n>
+#   t=<unix ms>`, t within the rig's run and at most the next block's t
+#   (at least one such line when the part pool ran)
 # Inputs: --daemon (the c2pool-v37-xmr under test); XMR_REGTEST_MONEROD,
 # XMR_REGTEST_WALLET_RPC (default: beside monerod), XMR_PATHB_SMOKE_OLD_BINARY
 # (the old binary; the part "old" needs it). A missing monerod, wallet-rpc
@@ -114,6 +120,10 @@ FOLLOW_RE = re.compile(r"^\[follow-only\] follow h=(\d+) id=([0-9a-f]{64}) prev=
                        r"event=(extend|reorg|orphan) depth=(\d+) tip=(\d+)")
 TEMPLATE_RE = re.compile(r"^\[follow-only\] template h=(\d+) (.*)$")
 WIRE_RE = re.compile(r"wire RPC to monerod: TOTAL=(\d+)")
+TIME_RE = re.compile(r"^  time: t=(\d+)$")
+CAUGHT_RE = re.compile(r"^  relay: caught up \((.*)\) at pos (\d+) t=(\d+)$")
+CAUGHT_FORMS = ("the catch-up from every HELLO peer ended by its done test",
+                "a join attempt completed; rule (4) kept the node's chain")
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +456,7 @@ class Rig:
         self.nodes = {}
         self.runs = {}
         self.found = []
+        self.t0_ms = int(time.time() * 1000)
 
     # ---- processes ----
     def start(self, name, argv, cwd=None, nice=True):
@@ -1489,6 +1500,61 @@ class Rig:
         p.stop()
         self.no_booking("hold", ["K"])
 
+    # ---- the lines of every run of the daemon under test (after the parts) ----
+    def part_lines(self):
+        t1 = int(time.time() * 1000) + 1
+        runs = [p for p in self.procs if self.a.daemon_run in p.argv]
+        if not runs:
+            return
+        blocks = timed = cut = 0
+        bad_time, bad_rise, bad_caught, caught = [], [], [], []
+        for p in runs:
+            lines = p.text().splitlines()
+            name = os.path.basename(p.logpath)
+            idx = [i for i, l in enumerate(lines) if l.startswith("status: up=")]
+            ts = []     # (line index, t) of each block's time line
+            for k, i in enumerate(idx):
+                end = idx[k + 1] if k + 1 < len(idx) else len(lines)
+                tl = [m for m in (TIME_RE.match(l) for l in lines[i + 1:end]) if m]
+                blocks += 1
+                if len(tl) == 1:
+                    ts.append((i, int(tl[0].group(1))))
+                elif k + 1 == len(idx) and end == i + 1:
+                    cut += 1    # the run's last line: a block cut by the stop
+                else:
+                    bad_time.append("%s line %d: %d time lines" % (name, i + 1, len(tl)))
+            timed += len(ts)
+            for (i0, t0), (i1, t1_) in zip(ts, ts[1:]):
+                if t1_ <= t0:
+                    bad_rise.append("%s lines %d, %d: t %d -> %d" % (name, i0 + 1, i1 + 1, t0, t1_))
+            bad_rise += ["%s line %d: t %d" % (name, i + 1, t) for i, t in ts if not self.t0_ms <= t <= t1]
+            for i, l in enumerate(lines):
+                if "relay: caught up (" not in l:
+                    continue
+                m = CAUGHT_RE.match(l)
+                if not m or m.group(1) not in CAUGHT_FORMS:
+                    bad_caught.append("%s line %d: %s" % (name, i + 1, l.strip()[:160]))
+                    continue
+                t = int(m.group(3))
+                nxt = next((tb for j, tb in ts if j > i), None)
+                if not self.t0_ms <= t <= t1 or (nxt is not None and t > nxt):
+                    bad_caught.append("%s line %d: t %d, the next block's t %s" % (name, i + 1, t, nxt))
+                caught.append((name, CAUGHT_FORMS.index(m.group(1)), int(m.group(2)), t))
+        for x in caught:
+            self.res.note("lines", "caught up: %s form %d pos %d t %d" % x)
+        self.res.check("lines", blocks > 0 and timed + cut == blocks and not bad_time,
+                       "every status block of the daemon's %d runs has one `  time: t=` line before the next block "
+                       "(blocks %d, timed %d, cut by a stop %d)%s" % (len(runs), blocks, timed, cut,
+                                                                      (": " + "; ".join(bad_time[:4])) if bad_time else ""))
+        self.res.check("lines", timed > 0 and not bad_rise,
+                       "t (unix ms) rises within each run and lies within the rig's run [%d, %d]%s" %
+                       (self.t0_ms, t1, (": " + "; ".join(bad_rise[:4])) if bad_rise else ""))
+        self.res.check("lines", not bad_caught and (caught or "pool" not in self.a.parts),
+                       "caught-up lines %d (done test %d, join attempt %d), each ending ` at pos <n> t=<unix ms>`, t "
+                       "within the rig's run and at most the next block's t%s" %
+                       (len(caught), sum(1 for x in caught if x[1] == 0), sum(1 for x in caught if x[1] == 1),
+                        (": " + "; ".join(bad_caught[:4])) if bad_caught else ""))
+
     # ---- the run ----
     def run(self):
         parts = self.a.parts
@@ -1599,9 +1665,13 @@ def main():
         rig.res.check("rig", False, "%s: %s" % (type(e).__name__, e))
     finally:
         rig.stop_all()
+    try:
+        rig.part_lines()
+    except Exception as e:
+        rig.res.check("lines", False, "%s: %s" % (type(e).__name__, e))
     fails = [x for x in rig.res.items if not x[1]]
     print("=" * 72)
-    for part in PARTS_ALL + ["rig"]:
+    for part in PARTS_ALL + ["lines", "rig"]:
         its = [x for x in rig.res.items if x[0] == part]
         if its:
             print("%-10s %s (%d checks)" % (part, "PASS" if all(x[1] for x in its) else "FAIL", len(its)))

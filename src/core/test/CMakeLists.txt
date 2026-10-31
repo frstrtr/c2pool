@@ -16,6 +16,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # the #769 "Not Run" trap), and one KAT covers every coin because all five
     # node lanes consume this one shared helper.
     #
+    # socket_read_empty_prefix_test.cpp: core::Socket's read path for a node
+    # with an empty prefix (read_prefix handed asio &prefix[0] on an empty
+    # vector, UB). IPv4 loopback only, so it runs where the DualFamilyDial
+    # cases that reached it skip. FOLDED into the EXISTING core_test target.
+    #
     # socket_write_queue_test.cpp: the core::Socket OUTBOUND WRITE QUEUE (#863).
     # Drives a real loopback TCP pair with a small send buffer and submits
     # overlapping composed writes from off-io threads; without the queue those
@@ -142,6 +147,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # nor the share's merged_coinbase_info (a V36 peer rejects info without
     # mm_data). Real MiningInterface + MergedMiningManager; same
     # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
+    # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
+    # held (another process, another handle) fails and leaves LOCK alone; an
+    # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -164,6 +172,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         inject_status_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
+        leveldb_store_lock_test.cpp
         listener_family_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
@@ -172,6 +181,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         payout_manager_rules_test.cpp
         random_choice_guard_test.cpp
         socket_write_queue_test.cpp
+        socket_read_empty_prefix_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         version_gate_test.cpp
@@ -195,6 +205,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
+    target_link_libraries(core_test PRIVATE c2pool_storage)  # leveldb_store_lock_test: SharechainStorage
 
     include(GoogleTest)
     include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})

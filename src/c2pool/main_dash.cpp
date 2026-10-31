@@ -371,6 +371,8 @@ struct AlertRelayCli {
     int64_t offline_after = 300, online_after = 60, min_interval = 600;
     int64_t startup_grace = 600, stall_after = 900, retry_every = 60, retry_max = 60;
     int64_t serve_stall_after = 300;   // node-level WORK_STALLED threshold (0 = off)
+    double  hashrate_min = 0;          // per-worker HASHRATE_LOW threshold, H/s (0 = off)
+    int64_t hashrate_window = 900;     // seconds of shares per hashrate evaluation
     bool any() const { return origin || telegram || forward; }
 };
 AlertRelayCli g_alert_relay;
@@ -545,6 +547,11 @@ void print_banner(const char* argv0)
         << "           [--alert-relay-retry-every S] [--alert-relay-retry-max N]\n"
         << "           [--alert-relay-serve-stall-after S]  (origin: no work handed to hashing miners\n"
         << "              this long => WORK_STALLED, then WORK_RESUMED; default 300, 0 = off)\n"
+        << "           [--alert-relay-hashrate-min RATE [--alert-relay-hashrate-window S]]  (origin: a\n"
+        << "              worker hashing below RATE => HASHRATE_LOW, then HASHRATE_OK above 1.1x RATE.\n"
+        << "              RATE ~ 0.8x the slowest healthy rig and >= 1.1x a rig with one failed board,\n"
+        << "              e.g. 1.35T for 1.64-2.02 TH/s rigs (also 1350G, 1.35TH/s; plain number = H/s);\n"
+        << "              one worker name per rig; window default 900; default off)\n"
         << "             (miner-offline alerts relayed over the sharechain p2p to a Telegram-capable\n"
         << "              node; non-consensus, all OFF by default -- docs/design/d-miner-7-p2p-alert-relay.md)\n"
         << "           [--embedded-accrue-asset-locks] [--embedded-accrue-asset-unlocks]\n"
@@ -1622,6 +1629,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         ac.det.startup_grace = g_alert_relay.startup_grace;
         ac.det.stall_after = g_alert_relay.stall_after;
         ac.det.serve_stall_after = g_alert_relay.serve_stall_after;
+        ac.det.hashrate_min = g_alert_relay.hashrate_min;
+        ac.det.hashrate_window = g_alert_relay.hashrate_window;
         for (const auto& h : g_alert_relay.to) {
             da::Bytes pub;
             if (!parse_pub(h, "--alert-relay-to", pub)) return 1;
@@ -1692,7 +1701,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << "s min-interval=" << ac.det.min_interval << "s grace="
                       << ac.det.startup_grace << "s stall-after=" << ac.det.stall_after
                       << "s serve-stall-after=" << ac.det.serve_stall_after
-                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max << "\n";
+                      << "s retry-every=" << ac.retry_every << "s retry-max=" << ac.retry_max
+                      << " hashrate-min="
+                      << (ac.det.hashrate_min > 0 ? da::fmt_hashrate(ac.det.hashrate_min) + " window=" +
+                                                        std::to_string(ac.det.hashrate_window) + "s"
+                                                  : std::string("off"))
+                      << "\n";
         }
         if (ac.telegram) {
             std::cout << "[alert-relay] relay: " << ac.accept.size()
@@ -3330,6 +3344,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // builder drops any special tx the SML fold cannot apply exactly and the
     // emit gate re-folds and rejects on root drift.
     node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    // B.9 (Dash Core v23.1.8 delta): the types 1-4 fold verifies the BLS
+    // operator signature of every ProUpServTx / ProUpRevTx against the
+    // pre-block operator key (dashd CheckProUpServTx / CheckProUpRevTx ->
+    // bad-protx-sig). Unwired, the fold refuses both types (fail closed); a
+    // BLS-dark build's verifier is a fail-closed stub with the same effect.
+    // Memoized: the builder and the emit gate re-fold the same body per tip.
+    node_coin_state.set_protx_operator_sig_verifier(
+        dash::coin::memoize_operator_sig_fn(
+            &dash::coin::vendor::verify_protx_operator_sig));
     std::cout << "[run] embedded special-tx superset (DIP types 1-4): "
               << (embedded_include_mn_special_txs
                       ? "ON (--embedded-include-mn-special-txs: SML-folded "
@@ -5154,6 +5177,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         smp.key = w.worker_name.empty() ? w.username : w.username + "." + w.worker_name;
                         smp.session = sid;
                         smp.accepted = w.accepted;
+                        // HASHRATE: the session's vardiff and the work of its
+                        // accepted shares (recorded by the stratum session).
+                        smp.difficulty = w.difficulty;
+                        smp.work = w.submit_window ? w.submit_window->accepted_work_total() : -1.0;
                         samples.push_back(std::move(smp));
                     }
                 }
@@ -5271,6 +5298,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // serve path is wired; null => no oracle => fail closed).
     std::unique_ptr<dash::coin::replay::PoseOracleFeeder>      pose_oracle;
     std::unique_ptr<core::Timer>                               pose_oracle_timer;
+    // The DML fold lanes' refused-unchanged counters (a block the fold refuses
+    // with its state unchanged: another chain, or one dashd rejects) for
+    // [EMBED-STATUS] and /local_stats. Both lanes are created after the web
+    // server's HTTP thread starts, so they are published to it through these
+    // atomics; web_server is reset before either lane unwinds.
+    struct DmlFoldLanes {
+        std::atomic<const dash::coin::replay::PoseOracleFeeder*>   oracle{nullptr};
+        std::atomic<const dash::coin::replay::FoldReplayConsumer*> replay{nullptr};
+        uint64_t oracle_refused_unchanged() const {
+            const auto* o = oracle.load(std::memory_order_acquire);
+            return o ? o->refused_unchanged_count() : 0;
+        }
+        uint64_t replay_refused_unchanged() const {
+            const auto* r = replay.load(std::memory_order_acquire);
+            return r ? r->refused_unchanged_count() : 0;
+        }
+    };
+    const auto dml_lanes = std::make_shared<DmlFoldLanes>();
     // PR-2 FORWARD: dashd's mined-commitment store, fed from the same replayed
     // bodies. shared_ptr because the qc-plan lambda (installed far above, on
     // the serve path) captures it by value and must see it appear later — it
@@ -5529,8 +5574,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             {"vout", vout_arr},
                             {"chain", "dash"}};
                         // DIP2/DIP3/DIP4 special-tx payload (explorer.py decodes
-                        // client-side). Present iff version==3 && type!=0.
-                        if (e.tx.version == 3 && e.tx.type != 0 && !e.tx.extra_payload.empty()) {
+                        // client-side). Present iff int16 version >= 3 && type!=0.
+                        if (dash::coin::tx_has_extra_payload(e.tx.version, e.tx.type)
+                            && !e.tx.extra_payload.empty()) {
                             static const char H[] = "0123456789abcdef";
                             std::string ep;
                             ep.reserve(e.tx.extra_payload.size() * 2);
@@ -5653,7 +5699,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // as the topology hook directly above: web_server is reset() after
             // ioc.run() returns, BEFORE header_chain / coin_p2p unwind.
             web_server->get_mining_interface()->set_coin_sync_status_fn(
-                [hc = header_chain.get(), cp = coin_p2p.get()]() -> nlohmann::json {
+                [hc = header_chain.get(), cp = coin_p2p.get(),
+                 lanes = dml_lanes]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -5705,6 +5752,12 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         // connected_peers check (it already looks for this key).
                         s["connected_peers"] = connected;
                     }
+                    // DML fold lanes: blocks refused with the fold state
+                    // unchanged (core passes s["dml_fold"] through).
+                    s["dml_fold"] = {
+                        {"oracle_refused_unchanged", lanes->oracle_refused_unchanged()},
+                        {"replay_refused_unchanged", lanes->replay_refused_unchanged()},
+                    };
                     return s;
                 });
         }
@@ -9085,6 +9138,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         pose_oracle = std::make_unique<rp::PoseOracleFeeder>(
                             *mn_bridge_fold_engine, *mn_bridge_quorum_engine,
                             *mn_bridge_quorum_bridge, pcfg, std::move(pio));
+                        dml_lanes->oracle.store(pose_oracle.get(),
+                                                std::memory_order_release);
                         auto* po = pose_oracle.get();
                         mn_ckpt_lane->set_on_anchor_snapshot(
                             [po](const dash::coin::vendor::CSimplifiedMNList& asml,
@@ -9327,6 +9382,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 replay_fold_consumer =
                     std::make_unique<rp::FoldReplayConsumer>(
                         *replay_fold_engine);
+                dml_lanes->replay.store(replay_fold_consumer.get(),
+                                        std::memory_order_release);
                 replay_consumer = replay_fold_consumer.get();
                 std::cout << "[run] W5 REPLAY FOLD ARMED: anchor h="
                           << ps.height << " mns=" << replay_fold_engine->size()
@@ -10777,6 +10834,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
+                      dml_lanes,
                       &header_chain, &mn_ckpt_lane,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
@@ -10876,6 +10934,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         << " bridge_wait="
                         << (mn_ckpt_lane ? mn_ckpt_lane->waiting_for()
                                          : std::string("n/a"))
+                        // DML fold lanes: blocks refused with the fold state
+                        // unchanged (PoSe oracle / W5 replay consumer). Not a
+                        // divergence, but a count that keeps climbing means a
+                        // lane is stuck behind a block it will never fold.
+                        << " dml_refused_unchanged="
+                        << dml_lanes->oracle_refused_unchanged() << "/"
+                        << dml_lanes->replay_refused_unchanged()
                         << " hdr_tip=" << (header_chain ? header_chain->height() : 0)
                         // E-SUPERBLOCK govsync store status (grep-provable on the
                         // observe-only soak): triggers held / weighted funding
@@ -11702,6 +11767,14 @@ int main(int argc, char** argv)
     std::string embedded_utxo_fold_fees_db;   // --embedded-utxo-fold-fees PATH
     std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
+        // The flags are matched by three consecutive else-if chains, because a
+        // single chain over all of them nests deeper than MSVC allows (C1061,
+        // "blocks nested too deeply"). The first two chains end in
+        // `else flag_matched = false;` and the loop moves on to the next
+        // argument as soon as a chain matched, so every flag is still tried in
+        // the original order and only the last chain's final else rejects an
+        // unknown argument.
+        bool flag_matched = true;
         if (std::strcmp(argv[i], "--version") == 0) {
             // Name the BLS backend on the version line (issue #1671): a stub
             // (BLS-dark) binary is otherwise indistinguishable here, and this is
@@ -11823,6 +11896,12 @@ int main(int argc, char** argv)
             embedded_null_arm = true;   // #127
         else if (std::strcmp(argv[i], "--embedded-null-arm=false") == 0)
             embedded_null_arm_off = true;  // #127: good-citizen opt-out (daemonless default ON)
+        else
+            flag_matched = false;
+        if (flag_matched) continue;
+
+        // Second chain (see the note at the top of the loop).
+        flag_matched = true;
         // PR-2 FRESH-DATUM RACE (dashd-cut coin-P2P). Race the SINGLE freshest
         // object (the fold snapshot's getmnlistd today) to K distinct-netgroup
         // CanServeBlocks carriers and fold the first valid self-checked reply,
@@ -11830,7 +11909,7 @@ int main(int argc, char** argv)
         // safe: only WHO/HOW-MANY is asked changes; every reply still flows
         // through the identical DIP-4/merkle/payee self-check before it is
         // believed, and exactly one fold is licensed.
-        else if (std::strcmp(argv[i], "--embedded-fresh-datum-race") == 0)
+        if (std::strcmp(argv[i], "--embedded-fresh-datum-race") == 0)
             dash::coin::set_fresh_datum_race_enabled(true);
         else if (std::strcmp(argv[i], "--embedded-fresh-datum-race=false") == 0)
             dash::coin::set_fresh_datum_race_enabled(false);
@@ -11939,7 +12018,32 @@ int main(int argc, char** argv)
             if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.retry_max)) return 1;
             ++i;
         }
-        else if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
+        else if (std::strcmp(argv[i], "--alert-relay-hashrate-min") == 0 && i + 1 < argc) {
+            const auto rate = dash::alert::parse_hashrate(argv[i + 1]);
+            if (!rate) {
+                std::cerr << "error: --alert-relay-hashrate-min expects a hashrate such as 1.35T,"
+                             " 1350G or a plain number of H/s (0 = off), got '" << argv[i + 1] << "'\n";
+                return 1;
+            }
+            g_alert_relay.hashrate_min = *rate;
+            ++i;
+        }
+        else if (std::strcmp(argv[i], "--alert-relay-hashrate-window") == 0 && i + 1 < argc) {
+            if (!parse_alert_relay_int(argv[i], argv[i + 1], g_alert_relay.hashrate_window)) return 1;
+            if (g_alert_relay.hashrate_window < 120 || g_alert_relay.hashrate_window > 86400) {
+                std::cerr << "error: --alert-relay-hashrate-window expects seconds in [120, 86400], got '"
+                          << argv[i + 1] << "'\n";
+                return 1;
+            }
+            ++i;
+        }
+        else
+            flag_matched = false;
+        if (flag_matched) continue;
+
+        // Third chain (see the note at the top of the loop); its final else
+        // rejects an argument no chain matched.
+        if (std::strcmp(argv[i], "--pin-local-tx-hex") == 0 && i + 1 < argc)
             pin_local_tx_hex_path = argv[++i];
         else if (std::strcmp(argv[i], "--pin-splice-xcheck-arm") == 0)
             pin_splice_xcheck_arm = true;

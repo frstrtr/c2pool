@@ -14,6 +14,7 @@
 #include <impl/ltc/coin/p2p_node.hpp>
 #include <impl/ltc/coin/node_interface.hpp>
 
+#include <chrono>
 #include <map>
 #include <set>
 #include <memory>
@@ -152,6 +153,15 @@ public:
     void set_on_new_block(BlockCallback cb)     { m_on_new_block = std::move(cb); }
     void set_on_new_tx(TxCallback cb)           { m_on_new_tx = std::move(cb); }
     void set_on_new_headers(HeadersCallback cb)  { m_on_new_headers = std::move(cb); }
+
+    /// A 'headers' message the raw headers parser did not read to its end
+    /// (AuxPoW chains): the headers before the entry it stopped at (they
+    /// link) and the message's count. When set (before peers connect), such
+    /// a batch comes here instead of on_new_headers.
+    using TruncatedHeadersCallback = std::function<void(const std::string& peer,
+                                                        const std::vector<ltc::coin::BlockHeaderType>&,
+                                                        uint64_t count)>;
+    void set_on_headers_truncated(TruncatedHeadersCallback cb) { m_on_headers_truncated = std::move(cb); }
     void set_on_full_block(FullBlockCallback cb) { m_on_full_block = std::move(cb); }
 
     /// Full block plus how it arrived (block message, reconstructed compact
@@ -223,6 +233,30 @@ public:
     // Applied to every new peer connection.
     using RawBlockParser = std::function<ltc::coin::BlockType(const uint8_t*, size_t)>;
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
+
+    /// Bodies whose arrival is logged at DEBUG (applied to every current and
+    /// future peer connection).
+    using BlockLogQuiet = std::function<bool(const uint256&)>;
+    void set_block_log_quiet(BlockLogQuiet f)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_block_log_quiet = std::move(f);
+        for (auto& [key, peer] : m_peers)
+            if (peer) peer->node_p2p.set_block_log_quiet(m_block_log_quiet);
+    }
+
+    /// The peers with a completed handshake whose version message advertised
+    /// every bit of `services` (e.g. NODE_NETWORK: not pruned).
+    std::vector<std::string> ready_peers(uint64_t services) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::string> out;
+        for (const auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete()
+                && (peer->node_p2p.peer_services() & services) == services)
+                out.push_back(key);
+        return out;
+    }
 
     /// Enable BIP 35 mempool request for all current and future peer connections.
     /// Call after UTXO is initialized so incoming txs can have fees computed.
@@ -421,6 +455,41 @@ public:
         }
     }
 
+    /// Request a full block from every peer with a completed handshake that
+    /// advertises every bit of `services` (0: every peer), e.g. NODE_NETWORK
+    /// for a block a pruned peer would drop us for asking.
+    void request_full_block_peers(const uint256& block_hash, uint64_t services)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int sent = 0;
+        for (auto& [key, peer] : m_peers) {
+            if (!peer || !peer->node_p2p.is_handshake_complete()
+                || (peer->node_p2p.peer_services() & services) != services)
+                continue;
+            try {
+                peer->node_p2p.request_full_block(block_hash);
+                ++sent;
+            } catch (...) {}
+        }
+        if (sent > 0) {
+            LOG_INFO << "[" << m_symbol << "] Full block requested from "
+                     << sent << " peer(s)" << (services ? " (NODE_NETWORK)" : "") << ": "
+                     << block_hash.GetHex().substr(0, 16) << "...";
+        } else if (services != 0) {
+            // Nobody advertises the services: nothing was sent (the one-peer
+            // paths fall back to any peer; this one must not). Once a minute.
+            const auto now = std::chrono::steady_clock::now();
+            if (m_no_service_peer_logged == std::chrono::steady_clock::time_point{}
+                || now - m_no_service_peer_logged >= std::chrono::minutes(1)) {
+                m_no_service_peer_logged = now;
+                LOG_WARNING << "[" << m_symbol << "] No peer advertising services 0x" << std::hex
+                            << services << std::dec << " to ask for block "
+                            << block_hash.GetHex().substr(0, 16) << "... (" << m_peers.size()
+                            << " peers): not requested";
+            }
+        }
+    }
+
     /// Request a full block from ONE specific peer (for bootstrap pipeline).
     /// Uses round-robin index: peer_idx % (peers with a completed handshake)
     /// selects the target, so a slot that is still dialing never eats the
@@ -504,6 +573,35 @@ public:
         LOG_INFO << "[" << m_symbol << "] getheaders sent to " << sent << " peer(s)"
                  << " locator_size=" << locator.size()
                  << (locator.empty() ? "" : " tip=" + locator.front().GetHex().substr(0, 16) + "...");
+    }
+
+    /// getheaders to ONE peer: the round-robin pick among peers with a
+    /// completed handshake (peer_idx % count), or `peer_key` when it is one
+    /// of them. Returns the peer asked ("" = none). For a long header sync
+    /// whose answers would otherwise come from every peer.
+    std::string request_headers_targeted(const std::vector<uint256>& locator, const uint256& stop_hash,
+                                         size_t peer_idx, const std::string& peer_key = std::string())
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<std::pair<std::string, BroadcastPeer*>> ready;
+        for (auto& [key, peer] : m_peers)
+            if (peer && peer->node_p2p.is_handshake_complete())
+                ready.emplace_back(key, peer.get());
+        if (ready.empty())
+            return {};
+        size_t pick = peer_idx % ready.size();
+        for (size_t i = 0; i < ready.size(); ++i)
+            if (!peer_key.empty() && ready[i].first == peer_key)
+                pick = i;
+        try {
+            const uint32_t proto = (m_symbol == "DOGE" || m_symbol == "doge") ? 70015 : 70017;
+            ready[pick].second->node_p2p.send_getheaders(proto, locator, stop_hash);
+            return ready[pick].first;
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[" << m_symbol << "] getheaders to " << ready[pick].first
+                        << " failed: " << e.what();
+            return {};
+        }
     }
 
     CoinPeerManager& peer_manager() { return m_peer_manager; }
@@ -620,6 +718,12 @@ private:
             // Wire AuxPoW raw headers parser (DOGE)
             if (m_raw_headers_parser) {
                 peer->node_p2p.set_raw_headers_parser(m_raw_headers_parser);
+                if (m_on_headers_truncated) {
+                    peer->node_p2p.set_on_headers_truncated(
+                        [this, peer_key](const std::vector<ltc::coin::BlockHeaderType>& hdrs, uint64_t count) {
+                            m_on_headers_truncated(peer_key, hdrs, count);
+                        });
+                }
             }
             // Wire AuxPoW raw headers SINK (NMC) — carries the raw 'headers' bytes
             // (tagged with the peer key) so the AuxPoW proof survives to the chain.
@@ -630,6 +734,9 @@ private:
                     });
             }
             // Wire AuxPoW raw block parser (DOGE)
+            if (m_block_log_quiet) {
+                peer->node_p2p.set_block_log_quiet(m_block_log_quiet);
+            }
             if (m_raw_block_parser) {
                 peer->node_p2p.set_raw_block_parser(m_raw_block_parser);
             }
@@ -731,6 +838,7 @@ private:
     BlockCallback        m_on_new_block;
     TxCallback           m_on_new_tx;
     HeadersCallback      m_on_new_headers;
+    TruncatedHeadersCallback m_on_headers_truncated;
     FullBlockCallback    m_on_full_block;
     FullBlockSourceCallback m_on_full_block_src;
     CmpctBlockCallback   m_on_cmpct_block;
@@ -739,10 +847,12 @@ private:
     uint64_t             m_cmpct_announce_version{2};
     uint32_t             m_cmpct_hb_peers{0};      // 0 = every connection asks for HB
     bool                 m_fetch_announced_blocks{true};
+    std::chrono::steady_clock::time_point m_no_service_peer_logged{};  // request_full_block_peers, under m_mutex
     PeerHeightCallback   m_on_peer_height;
     RawHeadersParser     m_raw_headers_parser;
     RawHeadersSink       m_raw_headers_sink;        // NMC AuxPoW header-feed (optional)
     RawBlockParser       m_raw_block_parser;
+    BlockLogQuiet        m_block_log_quiet;
     bool                 m_request_mempool{false};  // BIP 35 mempool sync
 };
 

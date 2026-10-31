@@ -264,6 +264,7 @@ TEST(DashEmbeddedGbt, EmbeddedBlockExcludesAllDipSpecialTxs) {
         uint256 pv = mint_hash(seed++);
         utxo.add_coin(Outpoint(pv, 0), Coin(100'000, {}, 1, false));
         auto sp = make_spend(pv, 0, 90'000, /*salt=*/100u + t);
+        sp.version = 3;                  // special version (else bad-txns-type)
         sp.type = t;                     // DIP special type
         ASSERT_TRUE(mp.add_tx(sp));
         special_ids.push_back(dash::coin::dash_txid(sp));
@@ -2095,10 +2096,13 @@ TEST(DashSupersetSpecialTx, Type4FoldRevokesOperatorAndRecomputesRoot) {
     std::array<uint8_t, 48> zero{};
     EXPECT_EQ(fold.sml.mnList[0].pubKeyOperator, zero) << "operator key cleared";
 
-    // Independent expected root (hand-built, never from the fold).
+    // Independent expected root (hand-built, never from the fold). dashd's
+    // ResetOperatorFields also puts the state back to nVersion LegacyBLS
+    // (evo/dmnstate.h:112-120), and the leaf takes the state's nVersion.
     CSimplifiedMNListEntry exp = base_e;
     exp.isValid = false; exp.pubKeyOperator = {};
     exp.netAddress = {}; exp.netPort = 0;
+    exp.nVersion = CSimplifiedMNListEntry::VER_LEGACY_BLS;
     CSimplifiedMNList expsml(std::vector<CSimplifiedMNListEntry>{exp});
     EXPECT_EQ(fold.sml.CalcMerkleRoot(), expsml.CalcMerkleRoot());
     EXPECT_NE(fold.sml.CalcMerkleRoot(), root_before)

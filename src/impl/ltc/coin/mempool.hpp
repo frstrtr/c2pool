@@ -21,6 +21,19 @@
 ///   - a HogEx (valid only in a block; validation.cpp PreChecks).
 /// Children of a refused tx need no rule: their input is in neither the UTXO
 /// set nor the pool, so their fee stays unknown and they are never selected.
+///
+/// Inputs (Dogecoin/Litecoin Core AcceptToMemoryPool):
+///   - an input the view holds that is a premature coinbase (or pegout)
+///     spend, a value out of money range, or outputs above inputs: refused
+///     (Reject::inputs_invalid, Core CheckTxInputs);
+///   - with a set built from genesis (anchor 0, UTXOViewCache::sync_state),
+///     an input in neither the set nor the pool makes the tx an orphan
+///     (Reject::missing_inputs): it waits in a bounded orphan set (100 txs,
+///     20 minutes: Core DEFAULT_MAX_ORPHAN_TRANSACTIONS, ORPHAN_TX_EXPIRE_TIME)
+///     and is admitted when its parent is admitted or confirmed. A partial
+///     (accrual) view cannot tell an unknown coin from a spent one: there the
+///     tx is admitted fee-unknown as before.
+/// Selection takes only priced txs, and nothing without a view.
 
 #include "block.hpp"
 #include "transaction.hpp"
@@ -127,7 +140,14 @@ public:
 
     /// Update the current chain tip height (for coinbase maturity checks).
     /// Call after each block connection.
-    void set_tip_height(uint32_t h) { m_tip_height = h; }
+    /// A height of 0 is ignored: it never means the tip, and a tip of 0
+    /// turns the maturity checks off (a body the caller could not place must
+    /// not make every coinbase spendable).
+    void set_tip_height(uint32_t h) {
+        if (h != 0)
+            m_tip_height = h;
+    }
+    uint32_t tip_height() const { return m_tip_height; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
     // Disable copy
@@ -149,6 +169,8 @@ public:
             hogex,                   // a HogEx outside a block
             malformed,               // an MWEB part that does not walk
             duplicate,               // already in the pool
+            inputs_invalid,          // premature coinbase/pegout spend, money range, outputs above inputs
+            missing_inputs,          // an input in neither the set nor the pool: parked as an orphan
             count
         };
         Code     code{malformed};
@@ -170,6 +192,8 @@ public:
             case Reject::hogex:                  return "hogex";
             case Reject::malformed:              return "malformed";
             case Reject::duplicate:              return "duplicate";
+            case Reject::inputs_invalid:         return "inputs_invalid";
+            case Reject::missing_inputs:         return "missing_inputs";
             case Reject::count:                  break;
         }
         return "unknown";
@@ -184,18 +208,38 @@ public:
         std::atomic<uint64_t> pegins_seen{0};           // peg-in kernels among them
         std::atomic<uint64_t> pegouts_seen{0};          // peg-out coins among them
         std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
+        std::atomic<uint64_t> orphans_promoted{0};      // orphans admitted once their parent was
+        std::atomic<uint64_t> orphans_dropped{0};       // orphans expired, evicted or too large
     };
+
+    /// Orphan set bounds (Dogecoin Core 1.14 net_processing.cpp / net_processing.h).
+    static constexpr size_t   MAX_ORPHANS = 100;              // DEFAULT_MAX_ORPHAN_TRANSACTIONS
+    static constexpr time_t   ORPHAN_EXPIRE_SECS = 20 * 60;   // ORPHAN_TX_EXPIRE_TIME
+    static constexpr uint32_t MAX_ORPHAN_WEIGHT = 400'000;    // MAX_STANDARD_TX_WEIGHT
 
     /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
     /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
     /// pegin output without one (litecoind PreChecks refuses each of these);
-    /// then the pool's own duplicate check. Fees are computed as add_tx does.
+    /// then the pool's own duplicate check; then, with a view, the inputs
+    /// (inputs_invalid; missing_inputs parks the tx as an orphan when the
+    /// view is built from genesis). Fees are computed as add_tx does. An
+    /// admitted tx admits the orphans waiting for it.
     std::optional<Reject> admit(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+        auto r = admit_one(tx, utxo, /*count=*/true);
+        if (!r && utxo)
+            promote_orphans_of(compute_txid(tx), utxo);
+        return r;
+    }
+
+private:
+    std::optional<Reject> admit_one(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
+                                    bool count) {
         Reject r;
         r.txid = compute_txid(tx);
         auto refuse = [&](Reject::Code c) -> std::optional<Reject> {
             r.code = c;
-            m_stats.by_code[c].fetch_add(1, std::memory_order_relaxed);
+            if (count)
+                m_stats.by_code[c].fetch_add(1, std::memory_order_relaxed);
             return r;
         };
 
@@ -233,16 +277,108 @@ public:
         if (pegin_output)
             return refuse(Reject::pegin_output_no_kernel);
 
+        if (utxo) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_pool.count(r.txid))
+                return refuse(Reject::duplicate);
+            std::vector<uint256> missing;
+            switch (check_inputs_locked(tx, utxo, missing)) {
+            case Inputs::Ok:
+                break;
+            case Inputs::Invalid:
+                erase_orphan_locked(r.txid);
+                return refuse(Reject::inputs_invalid);
+            case Inputs::Missing:
+                // Only a set built from genesis knows the input is not there:
+                // a partial view admits the tx fee-unknown, as before.
+                if (utxo->anchor_height() == 0) {
+                    park_orphan_locked(tx, r.txid, missing);
+                    return refuse(Reject::missing_inputs);
+                }
+                break;
+            }
+        }
+
         if (!add_tx_unchecked(tx, utxo))
             return refuse(Reject::duplicate);
-        m_stats.admitted.fetch_add(1, std::memory_order_relaxed);
+        if (count)
+            m_stats.admitted.fetch_add(1, std::memory_order_relaxed);
+        if (utxo)
+            reprice_children(r.txid, utxo);
         return std::nullopt;
     }
 
+    /// The pool's unpriced children of `parent` (admitted before it) are
+    /// priced now, and theirs in turn, instead of at the next block.
+    void reprice_children(const uint256& parent, core::coin::UTXOViewCache* utxo) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::deque<uint256> work{parent};
+        while (!work.empty()) {
+            const uint256 p = work.front();
+            work.pop_front();
+            auto pit = m_pool.find(p);
+            if (pit == m_pool.end())
+                continue;
+            const auto n_out = static_cast<uint32_t>(pit->second.tx.vout.size());
+            for (uint32_t i = 0; i < n_out; ++i) {
+                auto so = m_spent_outputs.find(std::make_pair(p, i));
+                if (so == m_spent_outputs.end())
+                    continue;
+                auto cit = m_pool.find(so->second);
+                if (cit == m_pool.end() || cit->second.fee_known)
+                    continue;
+                if (compute_fee_locked(cit->second, utxo)) {
+                    m_feerate_index.emplace(cit->second.feerate(), cit->first);
+                    work.push_back(cit->first);
+                }
+            }
+        }
+    }
+
+public:
     const RejectStats& reject_stats() const { return m_stats; }
 
+    /// Orphans waiting for a parent.
+    size_t orphan_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_orphans.size();
+    }
+
+    bool is_orphan(const uint256& txid) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_orphans.count(txid) > 0;
+    }
+
+    /// The view the template prices against (null: none; nothing is selected).
+    core::coin::UTXOViewCache* utxo() const { return m_utxo.load(); }
+
+    /// Admit the orphans whose missing parents are now in the view or the
+    /// pool (a block confirmed them); drop the expired ones. An orphan still
+    /// missing an input keeps its place and its expiry. Returns how many were
+    /// admitted. recompute_unknown_fees runs it after every block.
+    int retry_orphans(core::coin::UTXOViewCache* utxo) {
+        if (!utxo)
+            return 0;
+        std::vector<std::pair<uint256, MutableTransaction>> ready;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            expire_orphans_locked(std::time(nullptr));
+            ready = take_resolved_orphans_locked(all_orphans_locked(), utxo);
+        }
+        int admitted = 0;
+        for (const auto& [txid, tx] : ready) {
+            if (!admit_one(tx, utxo, /*count=*/false)) {
+                ++admitted;
+                m_stats.orphans_promoted.fetch_add(1, std::memory_order_relaxed);
+                admitted += promote_orphans_of(txid, utxo);
+            }
+        }
+        return admitted;
+    }
+
     /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
-    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped"}
+    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped", "orphans",
+    ///  "orphans_promoted", "orphans_dropped"}
     nlohmann::json reject_stats_json() const {
         nlohmann::json rejected = nlohmann::json::object();
         for (int c = 0; c < Reject::count; ++c)
@@ -256,6 +392,9 @@ public:
             {"pegins_seen", m_stats.pegins_seen.load(std::memory_order_relaxed)},
             {"pegouts_seen", m_stats.pegouts_seen.load(std::memory_order_relaxed)},
             {"template_tx_dropped", m_stats.template_tx_dropped.load(std::memory_order_relaxed)},
+            {"orphans", orphan_count()},
+            {"orphans_promoted", m_stats.orphans_promoted.load(std::memory_order_relaxed)},
+            {"orphans_dropped", m_stats.orphans_dropped.load(std::memory_order_relaxed)},
         };
     }
 
@@ -359,6 +498,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         int removed = 0, conflicts = 0;
         note_block_cleaned_locked(block_hash);
+        erase_orphans_for_block_locked(block);
 
         // Phase 1: remove confirmed txs by txid
         for (const auto& mtx : block.m_txs) {
@@ -443,6 +583,8 @@ public:
         m_feerate_index.clear();
         m_spent_outputs.clear();
         m_total_bytes = 0;
+        m_orphans.clear();
+        m_orphans_by_parent.clear();
     }
 
     // ─── Queries ─────────────────────────────────────────────────────────
@@ -460,6 +602,19 @@ public:
     size_t byte_size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_total_bytes;
+    }
+
+    /// Wire bytes of the priced (fee_known) transactions: what a selection
+    /// can take, as TemplateBuilder counts a selected tx (base + witness).
+    /// An unpriced (quarantined) tx enters no template.
+    uint64_t priced_bytes() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        uint64_t sum = 0;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known)
+                sum += uint64_t{entry.base_size} + entry.witness_size;
+        }
+        return sum;
     }
 
     /// Sum of all known fees across mempool transactions.
@@ -545,14 +700,16 @@ public:
     };
 
     /// Return transactions sorted by feerate (highest first), up to max_weight.
-    /// Transactions with known fees are prioritized; unknown-fee txs fill remaining space.
-    /// Returns total_fees across all selected transactions (known fees only).
+    /// Only priced (fee_known) transactions are selected: with a view built
+    /// from genesis an unpriced tx is an orphan, a premature spend or a
+    /// money-range failure, none of which may enter a block. No view, no
+    /// selection: nothing can be shown to spend an unspent coin.
+    /// Returns total_fees across all selected transactions.
     ///
     /// #1437 — template validity: the selected set MUST be a self-consistent
     /// block body or the daemon rejects the whole template
     /// (bad-txns-inputs-missingorspent) and the found block is LOST. Two hazards
-    /// the naive highest-feerate-first pass admits (both Pass 1 AND the Pass 2
-    /// unknown-fee fill, which the DOGE template builder uses):
+    /// the naive highest-feerate-first pass admits:
     ///   (a) child-without-parent — an input funded by another MEMPOOL tx (the
     ///       parent) selected AFTER the child, or not selected at all. A block
     ///       must place every parent before its children; a CPFP child normally
@@ -567,23 +724,22 @@ public:
     ///       a block. Fix: a per-template consumed-outpoint set (shared across
     ///       both passes) refuses the second spender.
     /// Reward-neutral: total_fees sums only INCLUDED txs' known fees, so
-    /// coinbasevalue tracks exactly the txs that ship; Pass 2 packs unknown-fee
-    /// txs with fee=0 (shaped as fee=null) and never touches total_fees.
+    /// coinbasevalue tracks exactly the txs that ship.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_weight,
-                             bool fill_unknown_fee = false) const {
+    get_sorted_txs_with_fees(uint32_t max_weight) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<SelectedTx> result;
         uint64_t total_fees = 0;
         uint32_t total_weight = 0;
         std::set<uint256> selected;
-        // Per-template consumed outpoints — shared across both passes so an
-        // unknown-fee spender can never double-spend a Pass-1 outpoint (or
-        // another Pass-2 tx's). One entry per input of every selected tx.
+        // Per-template consumed outpoints: one entry per input of every
+        // selected tx, so no outpoint is spent twice.
         std::set<std::pair<uint256, uint32_t>> consumed;
 
         auto* utxo = m_utxo.load();
+        if (!utxo)
+            return {std::move(result), total_fees};  // no view, no selection
 
         // Belt under admit(): a tx no block can carry never joins a template,
         // however it reached the pool. Counted per template; expected 0.
@@ -603,11 +759,8 @@ public:
         //     must already be selected (topological: parents before children);
         //     otherwise defer — a later fixed-point pass admits it once the
         //     parent lands.
-        //   - with a UTXO view: an input in neither the UTXO set nor a mempool
-        //     parent is stale/orphan — refuse (unchanged pre-#1437 guard).
-        //   - without a UTXO view: an input with no mempool parent is assumed a
-        //     confirmed coin we cannot see (unchanged legacy behaviour; the fee
-        //     was computable, so the input resolved at add time).
+        //   - an input in neither the UTXO set nor a mempool parent is
+        //     stale/orphan — refuse.
         auto admissible = [&](const MempoolEntry& entry) -> bool {
             if (barred.count(entry.txid))
                 return false;
@@ -623,11 +776,14 @@ public:
                 if (has_mempool_parent) {
                     if (!selected.count(vin.prevout.hash))
                         return false;  // parent not yet in template — defer
-                } else if (utxo) {
+                } else {
                     core::coin::Outpoint uop(vin.prevout.hash, vin.prevout.index);
                     core::coin::Coin coin;
                     if (!utxo->get_coin(uop, coin))
                         return false;  // absent from UTXO and mempool — stale
+                    // Not spendable in the block being built (height tip + 1).
+                    if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                        return false;
                 }
             }
             return true;
@@ -660,74 +816,80 @@ public:
             }
         }
 
-        // ── Pass 2: fill remaining weight with unknown-fee txs (opt-in) ─────
-        // Root cause of the [EMB-DOGE]/[EMB-DGB] TemplateBuilder UNDERFILL:
-        // Pass 1 above skips EVERY fee_known=false tx, so an embedded UTXO set
-        // that cannot resolve a large multi-input tx's fee (input unconfirmed /
-        // spent from an in-mempool parent) drops that tx from the template
-        // entirely — a near-empty block on a non-empty mempool. The GBT shapers
-        // already emit these with fee=null and p2pool excludes null-fee txs from
-        // the coinbasevalue (base_subsidy fallback, data.py:876-884), so
-        // including them here is a template-fill completion that leaves
-        // total_fees — hence coinbasevalue and the gentx — byte-for-byte
-        // unchanged. Consensus-neutral for the share; opt-in so the proven LTC
-        // parent path stays untouched.
-        // #1437: Pass 2 shares the same `admissible` predicate and `consumed`
-        // set as Pass 1, and runs as its own fixed point so an unknown-fee child
-        // of an unknown-fee parent still lands parent-first (topological), and no
-        // unknown-fee spender can double-spend an outpoint a Pass-1 tx already
-        // consumed (or another Pass-2 tx's). total_fees is never touched here.
-        if (fill_unknown_fee) {
-            bool progress2 = true;
-            while (progress2) {
-                progress2 = false;
-                for (const auto& [ts, txid] : m_time_index) {
-                    if (selected.count(txid)) continue;                 // already selected
-                    auto pit = m_pool.find(txid);
-                    if (pit == m_pool.end()) continue;
-                    const auto& entry = pit->second;
-                    if (entry.fee_known) continue;                      // Pass 1 territory
-                    if (total_weight + entry.weight > max_weight) continue;
-                    if (!admissible(entry)) continue;
-
-                    total_weight += entry.weight;
-                    // fee intentionally NOT summed — unknown, shaped as fee=null.
-                    result.push_back({entry.tx, 0, false});
-                    selected.insert(entry.txid);
-                    for (const auto& vin : entry.tx.vin)
-                        consumed.emplace(vin.prevout.hash, vin.prevout.index);
-                    progress2 = true;
-                }
-            }
-        }
-
         return {std::move(result), total_fees};
     }
 
-    /// Re-attempt fee computation for all transactions with fee_known=false.
+    /// Re-attempt fee computation for all transactions with fee_known=false,
+    /// then admit the orphans whose parents a block confirmed.
+    /// With a set built from genesis (anchor 0) an entry that still cannot
+    /// be priced leaves the pool as admit() would treat it now: an input in
+    /// neither the set nor the pool -> the orphan set; an invalid input
+    /// (premature spend, money range) -> dropped. The pool then holds priced
+    /// txs only (the one exception: a coinbase spend mature at the next
+    /// height but not at the tip, priced at the next block).
     /// Call after a new block is connected (new UTXOs may resolve missing inputs).
     /// Returns the number of transactions whose fees were successfully computed.
     int recompute_unknown_fees(core::coin::UTXOViewCache* utxo) {
         if (!utxo) return 0;
+        const int promoted = retry_orphans(utxo);
+        const bool full_view = utxo->anchor_height() == 0;
         std::lock_guard<std::mutex> lock(m_mutex);
         int resolved = 0;
         int still_unknown = 0;
+        int parked = 0;
+        int dropped = 0;
         uint64_t resolved_total_fee = 0;
+        std::vector<std::pair<uint256, Inputs>> unpriced;
+        std::vector<std::vector<uint256>> missing_of;
         for (auto& [txid, entry] : m_pool) {
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
                 m_feerate_index.emplace(entry.feerate(), txid);
                 resolved_total_fee += entry.fee;
                 ++resolved;
+                continue;
+            }
+            if (full_view) {
+                std::vector<uint256> missing;
+                const Inputs in = check_inputs_locked(entry.tx, utxo, missing);
+                if (in != Inputs::Ok) {
+                    unpriced.emplace_back(txid, in);
+                    missing_of.push_back(std::move(missing));
+                    continue;
+                }
+            }
+            ++still_unknown;
+        }
+        for (size_t i = 0; i < unpriced.size(); ++i) {
+            const auto& [txid, in] = unpriced[i];
+            auto it = m_pool.find(txid);
+            if (it == m_pool.end())
+                continue;
+            const MutableTransaction tx = it->second.tx;
+            remove_tx_locked(txid);
+            if (in == Inputs::Missing) {
+                park_orphan_locked(tx, txid, missing_of[i]);
+                ++parked;
             } else {
-                ++still_unknown;
+                ++dropped;
             }
         }
-        if (resolved > 0 || still_unknown > 0) {
+        // Every block runs this (and every copy of a body did): log when
+        // something moved or the counts changed, not the same line again.
+        const bool moved = resolved > 0 || promoted > 0 || parked > 0 || dropped > 0;
+        const bool changed = still_unknown != m_last_logged_unknown
+                          || m_orphans.size() != m_last_logged_orphans;
+        m_last_logged_unknown = still_unknown;
+        m_last_logged_orphans = m_orphans.size();
+        if (moved || changed) {
             LOG_INFO << "[EMB] Mempool fee revalidation: resolved=" << resolved
                      << " still_unknown=" << still_unknown
                      << " resolved_fees=" << resolved_total_fee << " sat"
-                     << " pool_size=" << m_pool.size();
+                     << " pool_size=" << m_pool.size()
+                     << " orphans=" << m_orphans.size()
+                     << " orphans_promoted=" << promoted
+                     << (parked > 0 ? " parked=" + std::to_string(parked) : std::string())
+                     << (dropped > 0 ? " dropped_invalid=" + std::to_string(dropped) : std::string());
         }
         return resolved;
     }
@@ -762,6 +924,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<uint256> to_remove;
+        std::vector<uint256> to_unprice;
         for (const auto& [txid, entry] : m_pool) {
             if (!entry.fee_known) continue;  // already quarantined
             for (const auto& vin : entry.tx.vin) {
@@ -775,11 +938,23 @@ public:
                     to_remove.push_back(txid);
                     break;
                 }
+                // Priced while the tip height was wrong: a coinbase (pegout)
+                // spend not mature at the tip loses its price until it is.
+                if (m_tip_height > 0 && !coin.is_mature(m_tip_height, m_limits)) {
+                    to_unprice.push_back(txid);
+                    break;
+                }
             }
         }
 
         for (const auto& txid : to_remove)
             remove_tx_locked(txid);
+        for (const auto& txid : to_unprice)
+            unprice_locked(txid);
+        if (!to_unprice.empty()) {
+            LOG_WARNING << "[EMB] Mempool revalidate: " << to_unprice.size()
+                        << " priced tx(s) spend a coinbase not mature at h=" << m_tip_height.load() << ": unpriced";
+        }
 
         if (!to_remove.empty()) {
             LOG_INFO << "[EMB] Mempool revalidate: evicted " << to_remove.size()
@@ -906,6 +1081,197 @@ public:
 private:
     // ─── Internal (caller holds mutex) ───────────────────────────────────
 
+    /// What check_inputs_locked found.
+    enum class Inputs { Ok, Missing, Invalid };
+
+    /// Core HaveInputs + CheckTxInputs against the view and the pool: every
+    /// input in the view or an in-pool parent (else Missing, with the missing
+    /// parents' txids); a view coin mature at the next block's height (Core
+    /// GetSpendHeight = tip + 1) and in money range; inputs cover outputs.
+    Inputs check_inputs_locked(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
+                               std::vector<uint256>& missing) const {
+        int64_t value_in = 0;
+        for (const auto& vin : tx.vin) {
+            core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
+            core::coin::Coin coin;
+            int64_t v = 0;
+            if (utxo->get_coin(op, coin)) {
+                if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                    return Inputs::Invalid;  // bad-txns-premature-spend-of-coinbase
+                v = coin.value;
+            } else {
+                auto parent = m_pool.find(vin.prevout.hash);
+                if (parent == m_pool.end() || vin.prevout.index >= parent->second.tx.vout.size()) {
+                    if (std::find(missing.begin(), missing.end(), vin.prevout.hash) == missing.end())
+                        missing.push_back(vin.prevout.hash);
+                    continue;
+                }
+                v = parent->second.tx.vout[vin.prevout.index].value;
+            }
+            if (!core::coin::money_range(v, m_limits))
+                return Inputs::Invalid;  // bad-txns-inputvalues-outofrange
+            value_in += v;
+            if (!core::coin::money_range(value_in, m_limits))
+                return Inputs::Invalid;
+        }
+        if (!missing.empty())
+            return Inputs::Missing;
+        int64_t value_out = 0;
+        for (const auto& vout : tx.vout) {
+            if (!core::coin::money_range(vout.value, m_limits))
+                return Inputs::Invalid;  // bad-txns-vout-toolarge / negative
+            value_out += vout.value;
+            if (!core::coin::money_range(value_out, m_limits))
+                return Inputs::Invalid;
+        }
+        if (value_in < value_out)
+            return Inputs::Invalid;  // bad-txns-in-belowout
+        return Inputs::Ok;
+    }
+
+    struct Orphan {
+        MutableTransaction   tx;
+        time_t               time_added{0};
+        std::vector<uint256> parents;  // the missing parents' txids
+    };
+
+    void park_orphan_locked(const MutableTransaction& tx, const uint256& txid,
+                            const std::vector<uint256>& parents) {
+        if (m_orphans.count(txid))
+            return;
+        uint32_t base_size = 0, witness_size = 0, weight = 0;
+        compute_tx_weight(tx, base_size, witness_size, weight);
+        if (weight >= MAX_ORPHAN_WEIGHT) {
+            m_stats.orphans_dropped.fetch_add(1, std::memory_order_relaxed);
+            return;  // Core AddOrphanTx: ignoring large orphan
+        }
+        const time_t now = std::time(nullptr);
+        expire_orphans_locked(now);
+        while (m_orphans.size() >= MAX_ORPHANS) {
+            // Core evicts a random orphan; the oldest goes here.
+            auto oldest = m_orphans.begin();
+            for (auto it = m_orphans.begin(); it != m_orphans.end(); ++it)
+                if (it->second.time_added < oldest->second.time_added)
+                    oldest = it;
+            erase_orphan_locked(oldest->first);
+            m_stats.orphans_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+        Orphan o;
+        o.tx = tx;
+        o.time_added = now;
+        o.parents = parents;
+        for (const auto& p : parents)
+            m_orphans_by_parent.emplace(p, txid);
+        m_orphans.emplace(txid, std::move(o));
+    }
+
+    void erase_orphan_locked(const uint256& txid) {
+        auto it = m_orphans.find(txid);
+        if (it == m_orphans.end())
+            return;
+        for (const auto& p : it->second.parents) {
+            auto range = m_orphans_by_parent.equal_range(p);
+            for (auto b = range.first; b != range.second;) {
+                if (b->second == txid)
+                    b = m_orphans_by_parent.erase(b);
+                else
+                    ++b;
+            }
+        }
+        m_orphans.erase(it);
+    }
+
+    void expire_orphans_locked(time_t now) {
+        std::vector<uint256> old;
+        for (const auto& [txid, o] : m_orphans)
+            if (o.time_added + ORPHAN_EXPIRE_SECS <= now)
+                old.push_back(txid);
+        for (const auto& txid : old) {
+            erase_orphan_locked(txid);
+            m_stats.orphans_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// A block confirmed or spent what an orphan would: drop it (Core
+    /// erases the orphans a block includes or precludes).
+    void erase_orphans_for_block_locked(const BlockType& block) {
+        if (m_orphans.empty())
+            return;
+        std::set<std::pair<uint256, uint32_t>> spent;
+        std::set<uint256> in_block;
+        for (const auto& mtx : block.m_txs) {
+            in_block.insert(compute_txid(mtx));
+            for (const auto& vin : mtx.vin)
+                spent.emplace(vin.prevout.hash, vin.prevout.index);
+        }
+        std::vector<uint256> gone;
+        for (const auto& [txid, o] : m_orphans) {
+            bool drop = in_block.count(txid) > 0;
+            for (const auto& vin : o.tx.vin)
+                drop = drop || spent.count({vin.prevout.hash, vin.prevout.index}) > 0;
+            if (drop)
+                gone.push_back(txid);
+        }
+        for (const auto& txid : gone)
+            erase_orphan_locked(txid);
+    }
+
+    /// Every orphan's txid (caller holds the mutex).
+    std::vector<uint256> all_orphans_locked() const {
+        std::vector<uint256> all;
+        all.reserve(m_orphans.size());
+        for (const auto& [txid, o] : m_orphans)
+            all.push_back(txid);
+        return all;
+    }
+
+    /// Of `candidates`, take out of the orphan set those whose inputs now
+    /// resolve (view or pool) or are invalid: admit_one decides about them.
+    /// One still missing an input stays, with its expiry.
+    std::vector<std::pair<uint256, MutableTransaction>>
+    take_resolved_orphans_locked(const std::vector<uint256>& candidates, core::coin::UTXOViewCache* utxo) {
+        std::vector<std::pair<uint256, MutableTransaction>> out;
+        for (const auto& txid : candidates) {
+            auto o = m_orphans.find(txid);
+            if (o == m_orphans.end())
+                continue;
+            std::vector<uint256> missing;
+            if (check_inputs_locked(o->second.tx, utxo, missing) == Inputs::Missing)
+                continue;
+            out.emplace_back(txid, o->second.tx);
+            erase_orphan_locked(txid);
+        }
+        return out;
+    }
+
+    /// Admit the orphans waiting for `parent` (and theirs, in turn).
+    /// Returns how many were admitted.
+    int promote_orphans_of(const uint256& parent, core::coin::UTXOViewCache* utxo) {
+        int admitted = 0;
+        std::deque<uint256> work{parent};
+        while (!work.empty()) {
+            const uint256 p = work.front();
+            work.pop_front();
+            std::vector<std::pair<uint256, MutableTransaction>> waiting;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                std::vector<uint256> candidates;
+                auto range = m_orphans_by_parent.equal_range(p);
+                for (auto it = range.first; it != range.second; ++it)
+                    candidates.push_back(it->second);
+                waiting = take_resolved_orphans_locked(candidates, utxo);
+            }
+            for (const auto& [txid, tx] : waiting) {
+                if (!admit_one(tx, utxo, /*count=*/false)) {
+                    ++admitted;
+                    m_stats.orphans_promoted.fetch_add(1, std::memory_order_relaxed);
+                    work.push_back(txid);
+                }
+            }
+        }
+        return admitted;
+    }
+
     /// Compute fee for a mempool entry using UTXO + parent mempool lookups.
     /// Includes MoneyRange overflow checks and coinbase/pegout maturity.
     /// Reference: LTC consensus/tx_verify.cpp CheckTxInputs()
@@ -1028,6 +1394,23 @@ private:
         m_pool.erase(it);
     }
 
+    /// Fee unknown again (out of the feerate index): never selected until
+    /// recompute_unknown_fees prices it.
+    void unprice_locked(const uint256& txid) {
+        auto it = m_pool.find(txid);
+        if (it == m_pool.end() || !it->second.fee_known)
+            return;
+        auto fr_range = m_feerate_index.equal_range(it->second.feerate());
+        for (auto fi = fr_range.first; fi != fr_range.second; ++fi) {
+            if (fi->second == txid) {
+                m_feerate_index.erase(fi);
+                break;
+            }
+        }
+        it->second.fee_known = false;
+        it->second.fee = 0;
+    }
+
     void evict_one_locked(const uint256& txid) {
         remove_tx_locked(txid);
     }
@@ -1059,11 +1442,19 @@ private:
     /// Mirrors Litecoin Core's mapNextTx for O(1) double-spend detection.
     std::map<std::pair<uint256, uint32_t>, uint256> m_spent_outputs;
 
+    /// Orphans (txid -> tx) and the parents they wait for (parent -> orphan).
+    std::map<uint256, Orphan>        m_orphans;
+    std::multimap<uint256, uint256>  m_orphans_by_parent;
+
+    // The last "[EMB] Mempool fee revalidation" counts logged.
+    int    m_last_logged_unknown{-1};
+    size_t m_last_logged_orphans{0};
+
     size_t m_total_bytes{0};    // sum of base_size across all entries
     size_t m_max_bytes;
     time_t m_expiry_sec;
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
-    uint32_t m_tip_height{0};           // current chain tip (for maturity checks)
+    std::atomic<uint32_t> m_tip_height{0};  // current chain tip (maturity); set from the io_context and the DOGE full set's thread
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
 
     // Blocks remove_for_block() ran for (most recent last), for cleaned_for().
