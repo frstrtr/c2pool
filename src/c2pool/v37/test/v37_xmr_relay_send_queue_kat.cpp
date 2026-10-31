@@ -14,28 +14,34 @@
 //       set (P-09 receipts on a tip it has moved past) the other lacks; they
 //       HELLO and both re-offer every pending receipt (FB_RECEIPTS v3). B's
 //       reader is held at A's first re-offer frame (B reads nothing more from
-//       A) while A floods a small frame from another thread (its share of a
-//       job made before the HELLO): the call returns while B is held; once B
-//       reads again, the frame reaches B in the link's order, behind every
-//       re-offer frame A queued before it; every re-offered frame is
-//       delivered, both directions; no send timeout, no hard drop, no redial
-//       (one HELLO per side); no frame of either re-offer dropped by the
-//       receiver's valid-object budget (P-15).
+//       A) until A's whole re-offer is queued behind it (asserted: bytes
+//       queued). A then floods a small frame from another thread (its share
+//       of a job made before the HELLO): the call returns while B is held and
+//       the link is up; once B reads again, the frame reaches B in the link's
+//       order, behind every re-offer frame A queued before it; every
+//       re-offered frame is delivered, both directions; no send timeout, no
+//       hard drop, no redial (one HELLO per side); no frame of either
+//       re-offer dropped by the receiver's valid-object budget (P-15).
+//       A send that blocks for less than the wait bound (30 s) passes the
+//       call check. SO_SNDTIMEO (10 s) bounds how long B may be held. The
+//       order check pins FIFO order on the link.
 //   S3  the per-link send queue stays bounded (high-water mark measured), with
 //       0 queue-full drops and 0 send-timeout drops.
-//   S4  first A runs every job of the S1 exchange (its verify queue empty,
-//       nothing parked, no ticket open; one verify thread). A peer that reads
-//       slowly (a raw socket, 16 KiB per 100 ms) HELLOs A,
-//       which re-offers its full pending set: at A's send queue bound the link
-//       is kept and the queue holds the re-offer. At a bound below the
-//       re-offer's bytes (an eighth of them: paged; and the re-offer x
-//       16,777,216 / 17,418,240, the default bound against P-09 x P-10) a
-//       peer that reads nothing for 3 s, then drains: the link kept, every
-//       frame sent, 0 queue-full drops.
-//   S5  at the bound / 8, such a peer asks FC_GETHEADERS at 1 s and A mines a
-//       carrier while the re-offer is paged (within the bound less one
-//       FC_HEADERS frame): the link kept, 0 queue-full drops; the peer reads
-//       every re-offer frame, the carrier and the FC_HEADERS reply.
+//   S4  first A runs every job of the S1 exchange (every FB_RECEIPTS frame
+//       handled, its verify queue empty, nothing parked, no ticket open, on
+//       two samples in a row; one verify thread). A peer that reads nothing
+//       (a raw socket) HELLOs A, which re-offers its full pending set: at A's
+//       send queue bound the whole re-offer is queued and the link kept; the
+//       peer then reads every frame. At a bound below the re-offer's bytes
+//       (an eighth of them: paged; and the re-offer x 16,777,216 /
+//       17,418,240, the default bound against P-09 x P-10) a peer that reads
+//       nothing until A's re-offer has paused at the bound (or ended), then
+//       drains: the link kept, every frame sent and read, 0 queue-full drops.
+//   S5  at the bound / 8, such a peer asks FC_GETHEADERS right after its
+//       HELLO, and A mines a carrier once the re-offer has paused at the bound
+//       (paged within the bound less one FC_HEADERS frame), before the peer
+//       reads: the link kept, 0 queue-full drops; the peer reads every
+//       re-offer frame, the carrier and the FC_HEADERS reply.
 // ===========================================================================
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -44,6 +50,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -77,6 +84,7 @@ struct SmallArrivals {
     std::mutex m;
     std::map<pb::Hash32, SClock::time_point> at;
     std::map<pb::Hash32, std::uint64_t> behind;
+    std::map<pb::Hash32, std::pair<u8, std::size_t>> shape;   // its opcode and bytes
     std::uint64_t receipts = 0;   // FB_RECEIPTS frames read
     pb::RelayBuffers buf;
     void tap(const std::vector<u8>& f) {
@@ -102,7 +110,10 @@ struct SmallArrivals {
                 id = pb::receipt_id(r);
         }
         std::lock_guard<std::mutex> lk(m);
-        if (id && at.emplace(*id, SClock::now()).second) behind.emplace(*id, receipts);
+        if (id && at.emplace(*id, SClock::now()).second) {
+            behind.emplace(*id, receipts);
+            shape.emplace(*id, std::make_pair(f[0], f.size()));
+        }
         if (rf) ++receipts;
     }
     std::optional<SClock::time_point> of(const pb::Hash32& id) {
@@ -116,6 +127,11 @@ struct SmallArrivals {
         const auto it = behind.find(id);
         if (it == behind.end()) return std::nullopt;
         return it->second;
+    }
+    std::pair<u8, std::size_t> shape_of(const pb::Hash32& id) {
+        std::lock_guard<std::mutex> lk(m);
+        const auto it = shape.find(id);
+        return it == shape.end() ? std::make_pair(u8{0}, std::size_t{0}) : it->second;
     }
 };
 
@@ -150,53 +166,62 @@ struct ReadGate {
     }
 };
 
-// A raw peer that sends `hello` ([u32 LE length][frame]) and then reads at most 16 KiB every 100 ms (nothing when
-// `slow_read` is false) for `slow_ms`, then whatever has arrived every 100 ms, until `ms`; false: the connection was
-// closed by the other side within `ms`.
-// `ask`: a frame sent at 1 s; `ops`: the complete frames read, by opcode.
-static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, int slow_ms = -1, bool slow_read = true,
-                      const std::vector<u8>* ask = nullptr, std::map<u8, std::uint64_t>* ops = nullptr) {
-    if (slow_ms < 0) slow_ms = ms;
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    const int rcv = 4096;
-    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_port = htons(port);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
-        ::close(fd);
-        return false;
-    }
-    std::vector<u8> out(4);
-    const std::uint32_t n = static_cast<std::uint32_t>(hello.size());
-    for (int i = 0; i < 4; ++i) out[i] = static_cast<u8>(n >> (8 * i));
-    out.insert(out.end(), hello.begin(), hello.end());
-    if (::send(fd, out.data(), out.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(out.size())) {
-        ::close(fd);
-        return false;
-    }
-    bool open = true;
-    std::vector<u8> buf(16384), acc;
-    std::size_t at = 0;
-    for (int t = 0; t < ms && open; t += 100) {
-        std::this_thread::sleep_for(100ms);
-        if (ask != nullptr && t == 1000) {
-            std::vector<u8> q(4);
-            for (int i = 0; i < 4; ++i) q[i] = static_cast<u8>(ask->size() >> (8 * i));
-            q.insert(q.end(), ask->begin(), ask->end());
-            if (::send(fd, q.data(), q.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(q.size())) open = false;
+// A raw peer on A's port, on its own thread: sends `hello` ([u32 LE length][frame]) and then `ask` (when given), then
+// reads nothing until read(), then whatever has arrived, until stop(), which joins it and closes the socket. ops(): the
+// complete frames read, by opcode; closed(): the other side closed the connection.
+class RawPeer {
+public:
+    RawPeer(std::uint16_t port, const std::vector<u8>& hello, const std::vector<u8>* ask = nullptr) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) return;
+        const int rcv = 4096;
+        (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd_, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) return;
+        std::vector<u8> out;
+        for (const std::vector<u8>* f : {&hello, ask}) {
+            if (f == nullptr) continue;
+            const std::uint32_t n = static_cast<std::uint32_t>(f->size());
+            for (int i = 0; i < 4; ++i) out.push_back(static_cast<u8>(n >> (8 * i)));
+            out.insert(out.end(), f->begin(), f->end());
         }
-        const bool slow = t < slow_ms;
-        if (slow && !slow_read) continue;
-        for (;;) {
-            pollfd p{fd, POLLIN, 0};
-            if (::poll(&p, 1, slow ? 0 : 5) <= 0) break;
-            const ssize_t r = ::recv(fd, buf.data(), buf.size(), MSG_DONTWAIT);
-            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) open = false;
-            if (r <= 0) break;
-            if (ops != nullptr) {
+        if (::send(fd_, out.data(), out.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(out.size())) return;
+        connected_ = true;
+        t_ = std::thread([this] { loop(); });
+    }
+    RawPeer(const RawPeer&) = delete;
+    RawPeer& operator=(const RawPeer&) = delete;
+    ~RawPeer() { stop(); }
+    bool connected() const { return connected_; }
+    void read() { read_ = true; }
+    void stop() {
+        stop_ = true;
+        if (t_.joinable()) t_.join();
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+    }
+    bool closed() const { return closed_.load(); }
+    std::uint64_t ops(u8 op) const { return ops_[op].load(); }
+
+private:
+    void loop() {
+        std::vector<u8> buf(16384), acc;
+        std::size_t at = 0;
+        while (!stop_ && !closed_) {
+            if (!read_) {  // reads nothing: a 5 ms step, then look again
+                pollfd p{fd_, 0, 0};
+                if (::poll(&p, 1, 5) > 0 && (p.revents & (POLLERR | POLLHUP)) != 0) closed_ = true;
+                continue;
+            }
+            for (;;) {
+                pollfd p{fd_, POLLIN, 0};
+                if (::poll(&p, 1, 5) <= 0) break;
+                const ssize_t r = ::recv(fd_, buf.data(), buf.size(), MSG_DONTWAIT);
+                if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) closed_ = true;
+                if (r <= 0) break;
                 acc.insert(acc.end(), buf.begin(), buf.begin() + r);
                 for (;;) {
                     if (acc.size() - at < 4) break;
@@ -204,7 +229,7 @@ static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, 
                                               (static_cast<std::uint32_t>(acc[at + 2]) << 16) |
                                               (static_cast<std::uint32_t>(acc[at + 3]) << 24);
                     if (acc.size() - at < 4 + static_cast<std::size_t>(len)) break;
-                    if (len > 0) ++(*ops)[acc[at + 4]];
+                    if (len > 0) ++ops_[acc[at + 4]];
                     at += 4 + len;
                 }
                 if (at > (1u << 20)) {
@@ -212,12 +237,14 @@ static bool slow_peer(std::uint16_t port, const std::vector<u8>& hello, int ms, 
                     at = 0;
                 }
             }
-            if (slow) break;
         }
     }
-    ::close(fd);
-    return open;
-}
+    int fd_ = -1;
+    bool connected_ = false;
+    std::thread t_;
+    std::atomic<bool> read_{false}, stop_{false}, closed_{false};
+    std::array<std::atomic<std::uint64_t>, 256> ops_{};
+};
 
 int main() {
     Checker C;
@@ -268,9 +295,11 @@ int main() {
     const bool up = wait_until([&] { return A->r().ready_peers().size() == 1 && B->r().ready_peers().size() == 1; }, 5000ms, 10ms);
     C(up, "S1 HELLO A<->B (both re-offer their pending sets now)");
     const bool parked = gate.wait_held(30000ms);   // B holds A's first re-offer frame: B reads nothing more from A
+    const bool queued_all = parked && wait_until([&] { return A->st().reoffer_done.load() >= 1; }, 30000ms, 1ms);
     const std::vector<std::uint64_t> ra = A->r().ready_peers();
     const std::uint64_t r0 = A->st().reoffer_frames.load();   // A's re-offer frames queued before the small frame
     const std::size_t q0 = ra.empty() ? 0 : A->links.net().queued_bytes(ra.front());
+    C(queued_all && q0 > 0, "S1 A's re-offer is queued behind a peer that reads nothing (" + std::to_string(q0) + " B)");
 
     // A concurrent small sender: A's share of a job made before the HELLO, flooded as one frame (the stratum /
     // verify-flood path in the daemon), while B is held.
@@ -299,12 +328,13 @@ int main() {
     const std::optional<SClock::time_point> at = arrivals.of(small);
     const long long arrive_ms = at ? ms_since(t0, *at) : -1;
     const std::optional<std::uint64_t> behind = arrivals.behind_of(small);
+    const std::pair<u8, std::size_t> sh = arrivals.shape_of(small);
     const auto helloA = A->st().hello_ok.load(), helloB = B->st().hello_ok.load();
-    std::printf("    S1 METRIC small_send_call_ms=%lld small_arrive_ms=%lld | B held=%d, returned held=%d link up=%d, A queued %zu B, "
-                "%llu re-offer frames before the small one, B read it behind %lld | re-offered A->B %llu (B got %llu) B->A "
-                "%llu (A got %llu) frames in %lld ms | hello_ok A=%llu B=%llu\n",
-                call_ms, arrive_ms, parked ? 1 : 0, while_held ? 1 : 0, link_up ? 1 : 0, q0, (unsigned long long)r0,
-                behind ? (long long)*behind : -1LL,
+    std::printf("    S1 METRIC small_send_call_ms=%lld small_arrive_ms=%lld small_frame=0x%02x/%zu B | B held=%d, returned held=%d "
+                "link up=%d, A queued %zu B, %llu re-offer frames before the small one, B read it behind %lld | re-offered "
+                "A->B %llu (B got %llu) B->A %llu (A got %llu) frames in %lld ms | hello_ok A=%llu B=%llu\n",
+                call_ms, arrive_ms, static_cast<unsigned>(sh.first), sh.second, parked ? 1 : 0, while_held ? 1 : 0,
+                link_up ? 1 : 0, q0, (unsigned long long)r0, behind ? (long long)*behind : -1LL,
                 (unsigned long long)A->st().reoffer_frames.load(), (unsigned long long)B->links.frames(pb::kOpFbReceipts),
                 (unsigned long long)B->st().reoffer_frames.load(), (unsigned long long)A->links.frames(pb::kOpFbReceipts),
                 ms_since(t_start, t_done), (unsigned long long)helloA, (unsigned long long)helloB);
@@ -341,92 +371,138 @@ int main() {
         auto& na = A->links.net();
         // A runs every job of the S1 exchange first (B's re-offered receipts); one verify thread
         const auto ti = SClock::now();
-        const std::uint64_t fl0 = A->st().flood_frames.load();
         const std::size_t vq0 = A->r().verify_queue_size();
+        const std::uint64_t ad0 = A->st().p15_counted.load();
+        int calm = 0;
         const bool idle = wait_until([&] {
-            return A->r().verify_queue_size() == 0 && A->r().parked_size() == 0 && A->r().open_tickets() == 0 &&
-                   A->r().parked_receipts() == 0;
+            const bool now = A->links.handled(pb::kOpFbReceipts) == A->links.frames(pb::kOpFbReceipts) &&
+                             A->r().verify_queue_size() == 0 && A->r().parked_size() == 0 && A->r().open_tickets() == 0 &&
+                             A->r().parked_receipts() == 0;
+            calm = now ? calm + 1 : 0;
+            return calm >= 2;
         }, 60000ms, 20ms);
-        std::printf("    S4 METRIC A idle=%d in %lld ms (verify queue %zu at the start; %llu frames flooded meanwhile; verify "
+        std::printf("    S4 METRIC A idle=%d in %lld ms (verify queue %zu at the start; %llu receipts admitted meanwhile; verify "
                     "threads %llu)\n",
-                    idle ? 1 : 0, ms_since(ti, SClock::now()), vq0,
-                    (unsigned long long)(A->st().flood_frames.load() - fl0), (unsigned long long)A->st().verify_threads.load());
+                    idle ? 1 : 0, ms_since(ti, SClock::now()), vq0, (unsigned long long)(A->st().p15_counted.load() - ad0),
+                    (unsigned long long)A->st().verify_threads.load());
         C(idle && A->st().verify_threads.load() == 1,
           "S4 A has run every job of the S1 exchange before a slow peer HELLOs (verify queue empty, nothing parked)");
+        const std::uint64_t b_link = ra.empty() ? 0 : ra.front();
+        // the raw peer's link at A (none: gone)
+        auto peer_link = [&]() -> std::optional<std::uint64_t> {
+            for (const std::uint64_t p : A->r().ready_peers())
+                if (p != b_link) return p;
+            return std::nullopt;
+        };
+        // A holds B's link alone (a raw peer's link gone)
+        auto only_b = [&] { return wait_until([&] { return A->r().ready_peers().size() == 1 && A->links.n_peers() == 1; }, 30000ms); };
         const std::size_t reoffer = body * K;
-        const std::uint64_t full0 = na.peers_dropped_queue_full();
-        const std::uint64_t ro0 = A->st().reoffer_frames.load();
-        const bool kept = slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5151ull, 0), 3000);
-        const std::size_t hwm = na.queued_bytes_hwm();
-        const std::uint64_t full1 = na.peers_dropped_queue_full();
-        std::printf("    S4 METRIC bound=%zu re-offer=%zu B (%llu frames) hwm=%zu full_drops=%llu kept=%d\n",
-                    na.send_queue_limit(), reoffer, (unsigned long long)(A->st().reoffer_frames.load() - ro0), hwm,
-                    (unsigned long long)(full1 - full0), kept ? 1 : 0);
-        const std::uint64_t frames = A->st().reoffer_frames.load() - ro0;
-        C(kept && full1 == full0 && frames > 0 && hwm >= reoffer / 4,
-          "S4 a slow peer at A's send queue bound: the link kept, the queue holds the re-offer (hwm " + std::to_string(hwm) + " B)");
-        (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
+        const std::uint64_t per = pb::fc_ids_max(pb::kRuledLaneParams);
+        auto want_frames = [&] {
+            const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
+            return std::make_pair(pend, (pend + per - 1) / per);
+        };
+        {
+            const bool clean = only_b();
+            const auto [pend, want] = want_frames();
+            const std::uint64_t full0 = na.peers_dropped_queue_full();
+            const std::uint64_t ro0 = A->st().reoffer_frames.load(), d0 = A->st().reoffer_done.load();
+            RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5151ull, 0));
+            const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
+            // the bound holds the whole re-offer: it is queued while the peer reads nothing
+            const bool queued = hello && wait_until([&] { return A->st().reoffer_done.load() > d0; }, 30000ms);
+            const std::optional<std::uint64_t> pl = peer_link();
+            const std::size_t q = pl ? na.queued_bytes(*pl) : 0;
+            peer.read();
+            const bool read_all = queued && wait_until([&] { return peer.ops(pb::kOpFbReceipts) >= want; }, 30000ms);
+            const bool kept = !peer.closed() && peer_link().has_value();
+            peer.stop();
+            const std::size_t hwm = na.queued_bytes_hwm();
+            const std::uint64_t full1 = na.peers_dropped_queue_full();
+            const std::uint64_t frames = A->st().reoffer_frames.load() - ro0;
+            std::printf("    S4 METRIC bound=%zu re-offer=%zu B (%llu frames, %llu pending) queued=%zu B hwm=%zu full_drops=%llu "
+                        "kept=%d read=%llu\n",
+                        na.send_queue_limit(), reoffer, (unsigned long long)frames, (unsigned long long)pend, q, hwm,
+                        (unsigned long long)(full1 - full0), kept ? 1 : 0, (unsigned long long)peer.ops(pb::kOpFbReceipts));
+            C(clean && queued && read_all && kept && full1 == full0 && frames >= want && hwm >= reoffer / 4,
+              "S4 a peer that reads nothing at A's send queue bound: the whole re-offer queued (" + std::to_string(q) +
+                      " B on the link), the link kept, every frame read");
+        }
         // below the re-offer's bytes: a frame queued only within the bound
         const std::size_t worst = static_cast<std::size_t>(static_cast<double>(reoffer) * 16777216.0 / 17418240.0);
-        const std::uint64_t per = pb::fc_ids_max(pb::kRuledLaneParams);
         const std::size_t hf = static_cast<std::size_t>(A->node->frame_bytes_headers());
         const std::size_t eighth = std::max(reoffer / 8, 2 * hf);
         int k = 0;
         for (const std::size_t bound : {eighth, worst}) {
+            const bool clean = only_b();
             na.set_send_queue(bound);
-            const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
-            const std::uint64_t want = (pend + per - 1) / per;
+            const auto [pend, want] = want_frames();
             const std::uint64_t f0 = na.peers_dropped_queue_full(), r0 = A->st().reoffer_frames.load();
             const std::uint64_t z0 = A->st().reoffer_paused.load(), d0 = A->st().reoffer_done.load();
-            const bool held =
-                    slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ (0x5252ull + k), 0), 10000, 3000, 0);
+            RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ (0x5252ull + k), 0));
+            const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
+            // the peer reads nothing until A's re-offer has paused at the bound (or ended)
+            const bool filled = hello && wait_until([&] {
+                return A->st().reoffer_paused.load() > z0 || A->st().reoffer_done.load() > d0;
+            }, 30000ms);
+            peer.read();
+            const bool read_all = filled && wait_until([&] {
+                return peer.ops(pb::kOpFbReceipts) >= want && A->st().reoffer_done.load() > d0;
+            }, 30000ms);
+            const bool held = !peer.closed() && peer_link().has_value();
+            peer.stop();
             const std::uint64_t done = A->st().reoffer_done.load() - d0;
             const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
             const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
-            std::printf("    S4 METRIC bound=%zu sent=%llu of %llu frames (%llu pending) paused=%llu full_drops=%llu kept=%d\n",
+            std::printf("    S4 METRIC bound=%zu sent=%llu of %llu frames (%llu pending) paused=%llu full_drops=%llu kept=%d "
+                        "read=%llu\n",
                         bound, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)pend,
-                        (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0);
-            C(held && f1 == f0 && sent >= want && (k == 1 || paused > 0) && done == 1,
+                        (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0,
+                        (unsigned long long)peer.ops(pb::kOpFbReceipts));
+            C(clean && filled && read_all && held && f1 == f0 && sent >= want && (k == 1 || paused > 0) && done == 1,
               std::string("S4 a bound below the re-offer's bytes (") +
                       (k == 0 ? "an eighth" : "x 16,777,216 / 17,418,240") +
-                      ", " + std::to_string(bound) + " B): the link kept, every frame sent, 0 queue-full drops (paused " +
+                      ", " + std::to_string(bound) + " B): the link kept, every frame sent and read, 0 queue-full drops (paused " +
                       std::to_string(paused) + (k == 0 ? ", paged" : "") + "), the re-offer timed to its end (" +
                       std::to_string(done) + ", " + std::to_string(A->st().reoffer_last_ms.load()) + " ms)");
-            (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
             ++k;
         }
         // S5: paging, live traffic and a serve reply on one slow link: the re-offer leaves one FC_HEADERS frame free
         {
+            const bool clean = only_b();
             na.set_send_queue(eighth);
-            const std::uint64_t pend = A->r().with_node([](pb::PathbNode& n) { return n.pending().size(); });
-            const std::uint64_t want = (pend + per - 1) / per;
+            const auto [pend, want] = want_frames();
             const std::uint64_t f0 = na.peers_dropped_queue_full(), r0 = A->st().reoffer_frames.load();
-            const std::uint64_t z0 = A->st().reoffer_paused.load();
+            const std::uint64_t z0 = A->st().reoffer_paused.load(), d0 = A->st().reoffer_done.load();
             const std::vector<u8> ask = pb::encode_fc_getheaders(pb::GetHeaders{0, pb::Hash32{}, pb::Hash32{}, 64});
-            std::map<u8, std::uint64_t> ops;
-            bool held = false;
-            std::thread peer([&] {
-                held = slow_peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5353ull, 0), 10000, 3000, false, &ask,
-                                 &ops);
-            });
-            std::this_thread::sleep_for(1500ms);  // the re-offer paused at the bound, the serve reply queued
+            RawPeer peer(A->port(), A->hello_bytes(A->r().node_nonce() ^ 0x5353ull, 0), &ask);
+            const bool hello = peer.connected() && wait_until([&] { return A->r().ready_peers().size() == 2; }, 30000ms);
+            // the re-offer paused at the bound, the peer reading nothing: a live carrier now
+            const bool filled = hello && wait_until([&] { return A->st().reoffer_paused.load() > z0; }, 30000ms);
             rig.tick_monero();
             const pb::NodeEventResult live = rig.mine(*A, 5, 0x55000000u);
-            peer.join();
+            peer.read();
+            const bool read_all = filled && wait_until([&] {
+                return peer.ops(pb::kOpFbReceipts) >= want && peer.ops(pb::kOpFcCarrier) >= 1 &&
+                       peer.ops(pb::kOpFcHeaders) >= 1 && A->st().reoffer_done.load() > d0;
+            }, 30000ms);
+            const bool held = !peer.closed() && peer_link().has_value();
+            peer.stop();
             const std::uint64_t f1 = na.peers_dropped_queue_full(), sent = A->st().reoffer_frames.load() - r0;
             const std::uint64_t paused = A->st().reoffer_paused.load() - z0;
-            std::printf("    S5 METRIC bound=%zu headers frame=%zu sent=%llu of %llu paused=%llu full_drops=%llu kept=%d | "
-                        "read: FB_RECEIPTS %llu FC_CARRIER %llu FC_HEADERS %llu\n",
-                        eighth, hf, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)paused,
-                        (unsigned long long)(f1 - f0), held ? 1 : 0, (unsigned long long)ops[pb::kOpFbReceipts],
-                        (unsigned long long)ops[pb::kOpFcCarrier], (unsigned long long)ops[pb::kOpFcHeaders]);
-            C(live.action == pb::NodeAction::Placed && held && f1 == f0 && sent >= want && paused > 0 &&
-                      ops[pb::kOpFbReceipts] >= want && ops[pb::kOpFcCarrier] >= 1 && ops[pb::kOpFcHeaders] >= 1,
-              "S5 a paced slow peer (the re-offer paged within the bound less one FC_HEADERS frame) gets a live carrier and "
-              "a serve reply while paged: the link kept, 0 queue-full drops, every re-offer frame, the carrier and the "
+            std::printf("    S5 METRIC bound=%zu headers frame=%zu sent=%llu of %llu (%llu pending) paused=%llu full_drops=%llu "
+                        "kept=%d | read: FB_RECEIPTS %llu FC_CARRIER %llu FC_HEADERS %llu\n",
+                        eighth, hf, (unsigned long long)sent, (unsigned long long)want, (unsigned long long)pend,
+                        (unsigned long long)paused, (unsigned long long)(f1 - f0), held ? 1 : 0,
+                        (unsigned long long)peer.ops(pb::kOpFbReceipts), (unsigned long long)peer.ops(pb::kOpFcCarrier),
+                        (unsigned long long)peer.ops(pb::kOpFcHeaders));
+            C(clean && filled && read_all && live.action == pb::NodeAction::Placed && held && f1 == f0 && sent >= want &&
+                      paused > 0,
+              "S5 a slow peer (the re-offer paged within the bound less one FC_HEADERS frame) gets a live carrier and a "
+              "serve reply while paged: the link kept, 0 queue-full drops, every re-offer frame, the carrier and the "
               "FC_HEADERS reply read");
-            (void)wait_until([&] { return A->r().ready_peers().size() == 1; }, 3000ms);
         }
+        (void)only_b();
         na.set_send_queue(pb::PathbRelayOptions{}.send_queue_bytes);
     }
     return C.done("v37_xmr_relay_send_queue_kat");
