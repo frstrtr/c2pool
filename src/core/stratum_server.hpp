@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -252,6 +253,11 @@ private:
     // Suggested difficulty from miner (mining.suggest_difficulty)
     double suggested_difficulty_ = 0.0;
 
+    // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
+    // (p2pool desired_share_target). Unset when absent or not a finite
+    // value > 0. Parsed here only; consumers wire it per coin.
+    std::optional<double> share_difficulty_override_;
+
     // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
     // where the transport/protocol object owns its timers.
@@ -296,6 +302,7 @@ public:
     double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
     const std::array<uint8_t, 20>& get_pubkey_hash() const { return pubkey_hash_; }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
+    const std::optional<double>& get_share_difficulty_override() const { return share_difficulty_override_; }
 
 private:
     std::string generate_subscription_id();

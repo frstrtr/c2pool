@@ -1082,6 +1082,16 @@ public:
     /// and then re-requests a full diff. (Distinct from on_invalidate, which
     /// only drops tip-readiness and deliberately KEEPS the MN payee list.)
     void on_sml_reorg() {
+        // The mempool's recent-spent ring (external-collateral proof) holds
+        // the spends of every connected block; the ones the reorg
+        // disconnected are no longer chain spends. Forget them against the
+        // switched chain's height index; unwired (KAT / RPC posture) the
+        // ring is cleared, which only gives up proof.
+        if (const size_t n = m_state.mempool().forget_chain_spends_off_chain(
+                m_chain_hash_at_height_fn))
+            LOG_INFO << "[EMB-DASH] reorg: forgot the recorded spends of " << n
+                     << " block(s) no longer on the active chain"
+                        " (external-collateral proof)";
         m_state.sml().mnList.clear();
         m_state.qmgr().clear();
         m_have_mn_sml = false;
@@ -1416,6 +1426,36 @@ private:
             return r;
         }
 
+        // B.8 (dashd removeForBlock -> removeProTxConflicts): evict the pending
+        // provider txs this block invalidates — operator key changed/revoked,
+        // collateral spent or re-registered, duplicate keys / collateral /
+        // service / platform id — and record the block's spent outpoints for
+        // the external-collateral proof. Runs HERE, before apply_block,
+        // because the collateral and operator-key rules read the PRE-block
+        // masternode list. Drop-only. The spends are recorded under this
+        // block's height + hash so a reorg (on_sml_reorg) or a refusal below
+        // can forget them again.
+        const uint256 connected_hash = block_identity_hash(block);
+        {
+            const MnStateMachine& pre = std::as_const(m_state).mnstates();
+            m_state.mempool().remove_protx_conflicts_for_block(
+                block,
+                [&pre](const bitcoin_family::coin::TxPrevOut& op) {
+                    return pre.find_by_collateral(op);
+                },
+                // dashd validForProTxKey: the key's bytes under the holder's
+                // own scheme (the store is canonical basic; re-encode).
+                [&pre](const uint256& protx)
+                    -> std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> {
+                    auto it = pre.entries().find(protx);
+                    if (it == pre.entries().end()) return std::nullopt;
+                    return vendor::opkey_for_leaf(
+                        it->second.pubKeyOperator,
+                        it->second.nVersion < vendor::ProTxVersion::BASIC_BLS);
+                },
+                Mempool::ChainPos{height, connected_hash});
+        }
+
         // E2 (independent credit-pool advance): fold THIS block's own credit-pool
         // accrual so the DIP-0027 balance tracks the tip on every ingested block,
         // NOT only when the periodic mnlistdiff re-seeds it. This is what lets the
@@ -1515,6 +1555,22 @@ private:
             return r;
         }
         auto r    = m_state.mnstates().apply_block(block, height);
+        // CONSENSUS REFUSAL (v23.1.9 port): dashd rejects this block. The apply
+        // mutated nothing and the cursor stayed put, so the set is still right
+        // for the previous block — no wipe, no re-seed. Stop serving on this
+        // block; the valid block at this height (the chain the network
+        // ChainLocks) folds normally, and a child of the refused block trips
+        // the gap guard.
+        if (!r.refused.empty()) {
+            LOG_WARNING << "[EMB-DASH] MN payee fold REFUSED block h=" << height
+                        << ": " << r.refused
+                        << " — dashd rejects it; not serving on it (demote)";
+            // Its spends are not chain spends: they must not prove an
+            // external collateral absent.
+            m_state.mempool().forget_chain_spends_of_block(connected_hash);
+            demote();
+            return r;
+        }
         // ── DIFF-STORE GAP REPAIR (dashd GetListForBlockInternal analogue,
         // evo/deterministicmns.cpp:778-870, as a cold repair path). An APPLY
         // GAP means blocks between the cursor and this one were never folded

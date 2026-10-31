@@ -1349,7 +1349,7 @@ public:
         }
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            if (tx.version != 3 || tx.type != 6) continue;
+            if (!tx_has_extra_payload(tx.version, tx.type) || tx.type != 6) continue;
             vendor::CFinalCommitmentTxPayload qc;
             if (!vendor::parse_qfcommit_payload(tx.extra_payload, qc)) {
                 if (err) *err = "unparseable qfcommit payload in tx["

@@ -46,6 +46,9 @@
 #include <impl/dash/coin/good_citizen_defaults.hpp>
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
+// std-only: the c2wallet-qt mirror of the node caps, pinned below.
+#include "../ui/c2wallet-qt/src/family/bitcoin/dash/InjectCaps.hpp"
+
 #include <core/uint256.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
@@ -64,6 +67,35 @@ using ::core::coin::Outpoint;
 using ::core::coin::Coin;
 using ::bitcoin_family::coin::TxIn;
 using ::bitcoin_family::coin::TxOut;
+
+// ── c2wallet-qt mirror tripwire ─────────────────────────────────────────────
+// The offline c2wallet-qt DASH inject builders (CollateralTx inject mode,
+// SweepTx) refuse or split against a std-only COPY of the node's admission caps
+// (ui/c2wallet-qt/src/family/bitcoin/dash/InjectCaps.hpp). Pin the copy to the
+// real constants here, so changing either side breaks this build until both
+// agree — a wallet that plans against stale caps would build txs the node
+// refuses (or a template silently drops).
+namespace c2w_caps = ::c2w::dash::caps;
+static_assert(c2w_caps::kMaxInjectTxBytes == Mempool::kMaxInjectTxBytes,
+              "c2wallet inject size cap != Mempool::kMaxInjectTxBytes");
+static_assert(c2w_caps::kMaxInjectTxBytes == TxInjectPool::kMaxInjectTxBytes,
+              "c2wallet inject size cap != TxInjectPool::kMaxInjectTxBytes");
+static_assert(c2w_caps::kMaxInjectTxBytes == Mempool::kMaxPinnedTxBytes,
+              "c2wallet inject size cap != the pin lane's kMaxPinnedTxBytes");
+static_assert(c2w_caps::kMaxInjectInputs == dash::coin::InjectSandbox::kMaxInputs,
+              "c2wallet inject input cap != InjectSandbox::kMaxInputs");
+static_assert(c2w_caps::kMaxInjectOutputs == dash::coin::InjectSandbox::kMaxOutputs,
+              "c2wallet inject output cap != InjectSandbox::kMaxOutputs");
+static_assert(c2w_caps::kMaxInjectTotalBytes == TxInjectPool::kMaxInjectTotalBytes,
+              "c2wallet pool budget != TxInjectPool::kMaxInjectTotalBytes");
+static_assert(c2w_caps::kMaxInjectTotalBytes == Mempool::kMaxPinnedTotalBytes,
+              "c2wallet pool budget != Mempool::kMaxPinnedTotalBytes");
+static_assert(c2w_caps::kMaxInjectPoolEntries == TxInjectPool::INJECT_POOL_MAX_ENTRIES,
+              "c2wallet pool entries != TxInjectPool::INJECT_POOL_MAX_ENTRIES");
+static_assert(c2w_caps::kSequenceLocktimeDisableFlag == Mempool::SEQUENCE_LOCKTIME_DISABLE_FLAG,
+              "c2wallet BIP68 flag != Mempool::SEQUENCE_LOCKTIME_DISABLE_FLAG");
+static_assert((c2w_caps::kSequenceFinal & Mempool::SEQUENCE_LOCKTIME_DISABLE_FLAG) != 0,
+              "c2wallet's built sequence would opt into BIP68 and be refused by add_inject");
 
 namespace {
 

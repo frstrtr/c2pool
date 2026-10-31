@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/replay_fold_consumer.hpp>   // S1: a refused block does not latch the lane
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -1543,6 +1544,303 @@ TEST(DashReplayFoldSynthetic, SnapshotV3FailLoudPaths)
     EXPECT_EQ(eng.size(), 1u);
     EXPECT_EQ(eng.height(), 100u);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Dash Core v23.1.9 port — chain-side rules (items A and B)
+// ════════════════════════════════════════════════════════════════════════
+
+// A seeded, already-confirmed masternode (pass 1 leaves it alone).
+static ReplayMNState v2319_mn(uint8_t tag, uint8_t type = MnType::REGULAR)
+{
+    ReplayMNState st;
+    st.nVersion = ProTxVersion::BASIC_BLS;
+    st.nType = type;
+    st.keyIDOwner = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.keyIDVoting = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.pubKeyOperator = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.collateralOutpoint.hash = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.netInfo.ip = seq_array<16>(static_cast<uint8_t>(0x10 + tag));
+    st.netInfo.port_be = 9999;
+    st.scriptPayout.m_data = script_bytes(static_cast<uint8_t>(0x60 + tag));
+    st.nRegisteredHeight = 50;
+    st.confirmedHash = raw256(0x77);
+    if (type == MnType::EVO) {
+        st.platformNodeID = raw160(static_cast<uint8_t>(0x90 + tag));
+        st.platformP2PPort = 26656;
+        st.platformHTTPPort = 443;
+    }
+    return st;
+}
+
+static MutableTransaction v2319_plain_tx(int32_t version, uint16_t type = 0)
+{
+    MutableTransaction tx;
+    tx.version = version;
+    tx.type = type;
+    TxIn in;
+    in.prevout.hash = raw256(0xA9);
+    in.prevout.index = 3;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    TxOut out;
+    out.value = 5;
+    out.scriptPubKey.m_data = script_bytes(0xAA);
+    tx.vout.push_back(out);
+    if (type != 0) tx.extra_payload = {0x01, 0x02};
+    return tx;
+}
+
+// A5 (07494dd62): after DIP3 a negative-nVersion tx makes the block invalid
+// (bad-txns-version). The fold refuses it BEFORE any pass mutates the list —
+// no poison, cursor unmoved — and the valid block at that height still folds.
+TEST(DashReplayFoldSynthetic, NegativeVersionTxRefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;   // DIP3 active for blocks at h > 100
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    ASSERT_NE(eng.find(mn), nullptr);
+    const ReplayMNState before = *eng.find(mn);
+
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    ASSERT_FALSE(r.ok) << "dashd: bad-txns-version";
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned()) << "a block dashd rejects is another chain, not a desync";
+    EXPECT_EQ(eng.height(), 100u);
+    ASSERT_NE(eng.find(mn), nullptr);
+    EXPECT_TRUE(*eng.find(mn) == before) << "the held list is unchanged";
+
+    auto ok = eng.fold_block(make_block(101, raw256(9), root, {}, &eng), 101);
+    EXPECT_TRUE(ok.ok) << ok.error;
+}
+
+// A5 boundary: DeploymentActiveAfter(pindexPrev, DIP0003) is active for the
+// DIP3 block itself (height >= dip0003_height) — the first block the DML folds
+// is already under the rule. (Blocks below it are never folded at all.)
+TEST(DashReplayFoldSynthetic, NegativeVersionTxIsRefusedFromTheDip3BlockOn)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 101;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_TRUE(r.refused_unchanged);
+}
+
+// S1: a block the engine refuses with its state unchanged (here one dashd
+// rejects, bad-txns-version) must not latch the consumer's sticky
+// divergence — the valid block at that height still folds through the same
+// consumer, and so does the next one.
+TEST(DashReplayFoldSynthetic, RefusedBlockDoesNotLatchTheConsumerAndTheValidSiblingFolds)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    const auto bad = make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng);
+    EXPECT_FALSE(consumer.on_replay_block(101, raw256(0xB1), bad));
+    EXPECT_FALSE(consumer.stats().diverged)
+        << "a refusal with the state unchanged is not a divergence";
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 1u);
+    EXPECT_EQ(eng.height(), 100u);
+
+    const auto good = make_block(101, raw256(9), root, {}, &eng);
+    EXPECT_TRUE(consumer.on_replay_block(101, raw256(0xB2), good));
+    EXPECT_FALSE(consumer.stats().diverged);
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_EQ(consumer.stats().blocks_folded, 1u);
+}
+
+// The pre-fold companions (the W4 quorum bridge, the mined-commitment index)
+// are forward-contiguous cursors. A block the fold refuses with its state
+// unchanged must not reach them, or they sit one block ahead and refuse the
+// valid sibling at the same height.
+TEST(DashReplayFoldSynthetic, RefusedBlockNeverReachesThePreFoldCompanions)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    uint32_t companion = 100;    // a forward-contiguous companion cursor
+    std::vector<uint32_t> observed;
+    consumer.set_pre_fold([&](uint32_t h, const uint256&,
+                              const dash::coin::BlockType&) -> std::string {
+        observed.push_back(h);
+        if (h != companion + 1)
+            return "cursor is at h=" + std::to_string(companion);
+        companion = h;
+        return {};
+    });
+
+    // A block dashd rejects (negative nVersion), then one on another chain.
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB1), make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng)));
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB3), make_block(101, raw256(0x77), root, {}, &eng)));
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 2u);
+    EXPECT_EQ(consumer.refused_unchanged_count(), 2u);
+    EXPECT_TRUE(observed.empty()) << "a refused block reached a companion";
+    EXPECT_EQ(companion, 100u);
+
+    // The valid sibling: every companion accepts it.
+    EXPECT_TRUE(consumer.on_replay_block(
+        101, raw256(0xB2), make_block(101, raw256(9), root, {}, &eng)));
+    EXPECT_EQ(companion, 101u);
+    EXPECT_EQ(consumer.stats().quorum_lane_refusals, 0u)
+        << consumer.stats().first_quorum_refusal;
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_NE(consumer.summary().find("refused_unchanged=2"), std::string::npos)
+        << consumer.summary();
+}
+
+// A6: an unknown special type post-DIP3 is bad-txns-type.
+TEST(DashReplayFoldSynthetic, UnknownSpecialTypePostDip3RefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(3, /*type=*/42)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-type"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned());
+    EXPECT_EQ(eng.height(), 100u);
+}
+
+// B9 (#7488): IsValidMnType is checked by name, ahead of the lookup.
+TEST(DashReplayFoldSynthetic, ProUpServInvalidNTypeRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    eng.seed({{mn, v2319_mn(11)}}, 1, 100, raw256(9));
+    CProUpServTx up;
+    up.nVersion  = ProTxVersion::BASIC_BLS;
+    up.nType     = 2;
+    up.proTxHash = mn;
+    up.netInfo.ip = seq_array<16>(0x19);
+    up.netInfo.port_be = 9999;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), uint256{}, {make_special_tx(2, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("(bad-protx-type)"), std::string::npos) << r.error;
+}
+
+// B9: a ProRegTx whose keyIDOwner an existing MN holds (bad-protx-dup-key).
+// The block commits the root a fold WITHOUT the check would compute, so the
+// only thing refusing it is the uniqueness rule.
+TEST(DashReplayFoldSynthetic, DupOwnerKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto p = make_proreg(1);
+    p.keyIDOwner = st.keyIDOwner;
+    auto tx = make_special_tx(1, p, 1);
+    auto r = eng.fold_block(
+        make_block(101, raw256(9),
+                   root_of({st.to_sml_entry(mn), expected_entry_of(p, tx_hash_of(tx))}),
+                   {tx}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
+// B9 (#7846): keyIDOwner and platformNodeID are ONE namespace — both ways.
+TEST(DashReplayFoldSynthetic, OwnerPlatformNamespaceRefusesFold)
+{
+    {   // a ProRegTx owner key equal to an Evo MN's platformNodeID
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 evo = raw256(0xE2);
+        const auto se = v2319_mn(12, MnType::EVO);
+        eng.seed({{evo, se}}, 1, 100, raw256(9));
+        auto p = make_proreg(1);
+        p.keyIDOwner = se.platformNodeID;
+        auto tx = make_special_tx(1, p, 1);
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({se.to_sml_entry(evo), expected_entry_of(p, tx_hash_of(tx))}),
+                       {tx}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+    }
+    {   // an Evo ProUpServTx platformNodeID equal to another MN's owner key
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 x = raw256(0xE1), evo = raw256(0xE3);
+        const auto sx = v2319_mn(11);
+        const auto se = v2319_mn(13, MnType::EVO);
+        eng.seed({{x, sx}, {evo, se}}, 2, 100, raw256(9));
+        CProUpServTx up;
+        up.nVersion = ProTxVersion::BASIC_BLS;
+        up.nType = MnType::EVO;
+        up.proTxHash = evo;
+        up.netInfo = se.netInfo;
+        up.platformNodeID = sx.keyIDOwner;
+        up.platformP2PPort = se.platformP2PPort;
+        up.platformHTTPPort = se.platformHTTPPort;
+        auto upd = se;
+        upd.platformNodeID = up.platformNodeID;
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({sx.to_sml_entry(x), upd.to_sml_entry(evo)}),
+                       {make_special_tx(2, up, 1)}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-platformnodeid"), std::string::npos) << r.error;
+    }
+}
+
+// B9: a ProUpRegTx moving to an operator key another MN holds
+// (UpdateUniqueProperty throws => bad-protx-dup-key).
+TEST(DashReplayFoldSynthetic, DupOperatorKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 x = raw256(0xE1), y = raw256(0xE4);
+    const auto sx = v2319_mn(11);
+    const auto sy = v2319_mn(14);
+    eng.seed({{x, sx}, {y, sy}}, 2, 100, raw256(9));
+    CProUpRegTx up;
+    up.nVersion = ProTxVersion::BASIC_BLS;
+    up.proTxHash = y;
+    up.pubKeyOperator = sx.pubKeyOperator;
+    up.keyIDVoting = sy.keyIDVoting;
+    up.scriptPayout = sy.scriptPayout;
+    // What a fold without the rule produces: Y reset + banned on the new key.
+    auto ey = sy;
+    ey.ResetOperatorFields();
+    ey.BanIfNotBanned(101);
+    ey.nVersion = ProTxVersion::BASIC_BLS;
+    ey.pubKeyOperator = sx.pubKeyOperator;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({sx.to_sml_entry(x), ey.to_sml_entry(y)}),
+                   {make_special_tx(3, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // task #154 — INCREMENTAL merkleRootMNList cache KATs.

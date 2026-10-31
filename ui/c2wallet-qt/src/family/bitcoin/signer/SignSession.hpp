@@ -40,6 +40,24 @@ const char* spk_type_str(SpkType t);
 // match) so a page can call it directly.
 SpkType classify_spk(const Bytes& spk);
 
+// ── parse_raw_legacy_tx ─────────────────────────────────────────────────────
+// The strict raw (non-witness) tx parser behind parse_unsigned / sign_and_verify,
+// exported for the DASH inject builders (family/bitcoin/dash SweepTx), which sign
+// operator-supplied unsigned hex. Refuses (false + `err`) a zero input count —
+// which is also how a segwit marker byte reads — an implausible count, any
+// truncation, and any byte after locktime. `txid` is in internal (serialization)
+// byte order; `version` is the raw 32-bit field (a Dash special tx carries its
+// type in the upper 16 bits).
+struct RawTxInView  { Bytes txid; uint32_t index = 0; Bytes scriptsig; uint32_t seq = 0; };
+struct RawTxOutView { int64_t value = 0; Bytes spk; };
+struct RawTxView {
+    int32_t                   version = 0;
+    uint32_t                  locktime = 0;
+    std::vector<RawTxInView>  vin;
+    std::vector<RawTxOutView> vout;
+};
+bool parse_raw_legacy_tx(const Bytes& raw, RawTxView& tx, std::string& err);
+
 // ── parse_unsigned (GAP-2) ──────────────────────────────────────────────────
 struct InputView {
     SpkType     type = SpkType::Unknown;

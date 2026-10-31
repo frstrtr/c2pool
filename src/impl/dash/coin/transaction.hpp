@@ -5,6 +5,7 @@
 // No MWEB, no HogEx. Has extra_payload for coinbase special transactions (type=5).
 
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
+#include <impl/dash/coin/tx_version_rules.hpp>
 
 #include <core/pack.hpp>
 #include <core/opscript.hpp>
@@ -66,13 +67,15 @@ struct MutableTransaction
         s << locktime;
         // Extra payload for special transactions — dashd parity
         // (primitives/transaction.h): vExtraPayload exists on the wire ONLY
-        // when nVersion==3 (SPECIAL_VERSION) AND nType!=0. Gating on type
-        // alone mis-serializes pre-DIP2 txs whose raw 32-bit nVersion carries
-        // BIP9-style high bits (e.g. mainnet 842284's coinbase nVersion
-        // 0x20000000 => version16=0, type16=0x2000): those are PLAIN txs and
-        // must round-trip without any payload field. Note dashd writes the
-        // payload compact-size even when the payload is empty.
-        if (version == 3 && type != 0) {
+        // when IsSpecialTxVersion() (int16 nVersion >= 3) AND nType!=0
+        // (tx_version_rules.hpp). Gating on type alone mis-serializes pre-DIP2
+        // txs whose raw 32-bit nVersion carries BIP9-style high bits (e.g.
+        // mainnet 842284's coinbase nVersion 0x20000000 => version16=0,
+        // type16=0x2000): those are PLAIN txs and must round-trip without any
+        // payload field. Gating on nVersion == 3 instead of >= 3 drops the
+        // payload of a low-16 in [4, 0x7FFF] tx that dashd reads. Note dashd
+        // writes the payload compact-size even when the payload is empty.
+        if (tx_has_extra_payload(version, type)) {
             BaseScript ep;
             ep.m_data = extra_payload;
             s << ep;
@@ -90,12 +93,12 @@ struct MutableTransaction
         s >> vout;
         s >> locktime;
         // Read extra payload for special transactions — same dashd gate as
-        // Serialize above: nVersion==3 && nType!=0. Reading on type alone
-        // consumed a phantom payload out of the NEXT tx's bytes whenever a
-        // pre-DIP2 tx carried BIP9-style high version bits, misaligning the
+        // Serialize above: IsSpecialTxVersion() && nType!=0. Reading on type
+        // alone consumed a phantom payload out of the NEXT tx's bytes whenever
+        // a pre-DIP2 tx carried BIP9-style high version bits, misaligning the
         // whole block body (the 842284 merkle-bind livelock).
         extra_payload.clear();
-        if (version == 3 && type != 0) {
+        if (tx_has_extra_payload(version, type)) {
             BaseScript ep;
             s >> ep;
             extra_payload = std::move(ep.m_data);

@@ -257,6 +257,53 @@ bool verify_govvote_operator_sig(
 #endif // C2POOL_DASH_BLS
 }
 
+// ── B.9: ProUpServTx / ProUpRevTx operator-signature verify ─────────────────
+
+bool verify_protx_operator_sig(
+    const std::array<uint8_t, CFinalCommitment::BLS_PUBKEY_SIZE>& pubkey_operator,
+    bool key_legacy_scheme, const uint256& sign_hash,
+    const std::array<uint8_t, CFinalCommitment::BLS_SIG_SIZE>& sig,
+    bool sig_legacy_scheme)
+{
+#ifndef C2POOL_DASH_BLS
+    (void)pubkey_operator;
+    (void)key_legacy_scheme;
+    (void)sign_hash;
+    (void)sig;
+    (void)sig_legacy_scheme;
+    return false;   // no BLS backend -> fail closed (the tx is never served)
+#else
+    // A revoked / reset operator key is the null key: nothing can verify.
+    bool key_null = true;
+    for (uint8_t b : pubkey_operator) if (b != 0) { key_null = false; break; }
+    if (key_null) return false;
+
+    const bls::Bytes msg(sign_hash.data(), 32);   // SerializeHash(proTx) bytes
+    try {
+        bls::G2Element g2;
+        try {
+            g2 = bls::G2Element::FromBytes(bls::Bytes(sig.data(), sig.size()),
+                                           sig_legacy_scheme);
+        } catch (...) {
+            return false;   // not canonical under the payload's scheme
+        }
+        for (bool pk_legacy : {key_legacy_scheme, !key_legacy_scheme}) {
+            bls::G1Element pk;
+            try {
+                pk = bls::G1Element::FromBytes(
+                    bls::Bytes(pubkey_operator.data(), pubkey_operator.size()),
+                    pk_legacy);
+            } catch (...) { continue; }
+            if (!pk.IsValid()) continue;
+            if (bls::BasicSchemeMPL().Verify(pk, msg, g2)) return true;
+        }
+        return false;
+    } catch (...) {
+        return false;   // any relic/dashbls throw -> fail closed
+    }
+#endif // C2POOL_DASH_BLS
+}
+
 // ── ChainLock recovered-threshold-signature verify ──────────────────────────
 
 bool verify_chainlock_sig(

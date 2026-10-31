@@ -336,6 +336,7 @@
 //                context and passes on the exact weights; #12 stays exact;
 //                a join replay on a band DEFER ends NotServed (no fetch, no
 //                loop) and waits on the weights.
+// Shards and their gather: pathb_kat_shard.hpp.
 // ---------------------------------------------------------------------------
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -371,6 +372,7 @@
 #include "c2pool/v37/xmr/pathb/pathb_status.hpp"
 #include "pathb_kat_join.hpp"
 #include "pathb_kat_node.hpp"
+#include "pathb_kat_shard.hpp"
 #include "pathb_ratchet_sim.hpp"
 
 
@@ -8754,16 +8756,14 @@ void pwalk() {
 }
 
 // pwalkshapes: the pwalk chain over wire / FC_HEADERS reply shapes (frames per second / seconds after the send): 1,000 / 8,
-// 500 / 8, 1,000 / 10, 1,500 / 8, 2,000 / 5; each as pwalk.
+// 500 / 8, 1,000 / 10, 1,500 / 8, 2,000 / 5; each as pwalk. One section per shape (pwalkshapes_<per_s>_<hold>).
+template <std::uint64_t per_s, std::uint64_t hold>
 void pwalkshapes() {
     const std::uint64_t n = 3000, k = 30, bound = n + 3 * k + pb::admit_j0(pb::kRuledLaneParams);
-    const std::pair<std::uint64_t, std::uint64_t> shapes[] = {{1000, 8}, {500, 8}, {1000, 10}, {1500, 8}, {2000, 5}};
-    for (const auto& [per_s, hold] : shapes) {
-        const PwalkRun r = pwalk_run(n, k, per_s, hold, 4 * bound, 44000);
-        const std::string tag = "pwalkshapes " + std::to_string(per_s) + " / " + std::to_string(hold);
-        pwalk_print(tag.c_str(), r, bound);
-        pwalk_checks(tag.c_str(), r, n, k, bound);
-    }
+    const PwalkRun r = pwalk_run(n, k, per_s, hold, 4 * bound, 44000);
+    const std::string tag = "pwalkshapes " + std::to_string(per_s) + " / " + std::to_string(hold);
+    pwalk_print(tag.c_str(), r, bound);
+    pwalk_checks(tag.c_str(), r, n, k, bound);
 }
 
 // pwalkfull: the pwalk chain at 500 frames per second, the FC_HEADERS replies 8 s after they are sent: J's deferred
@@ -12128,174 +12128,177 @@ void hp_qbound() {
 
 int main(int argc, char** argv) {
     std::printf("v37_xmr_pathb_node_kat\n");
-    const std::string only = argc > 1 ? argv[1] : "";
-    const auto run = [&](const char* name, void (*fn)()) {
-        if (only.empty() || only == name) run_part(name, fn);
-    };
-    run("genesis", genesis);
-    run("relay", relay);
-    run("race", race);
-    run("racelate", racelate);
-    run("raceskip", raceskip);
-    run("carriage", carriage);
-    run("feediverse", feediverse);
-    run("repend", repend);
-    run("n3", n3);
-    run("own", own_share);
-    run("m23", m23);
-    run("restart", restart);
-    run("n5", n5);
-    run("hold", hold_kind2);
-    run("c48", c48);
-    run("rrfix3", rrfix3);
-    run("deep", deep);
-    run("joinserve", joinserve);
-    run("n7b2", n7b2);
-    run("startup", startup);
-    run("poison", poison);
-    run("joinpages", joinpages);
-    run("tokens", tokens);
-    run("receive", receive);
-    run("hellobound", hellobound);
-    run("base", base);
-    run("boundary", boundary);
-    run("timers", timers);
-    run("j1stale", j1stale);
-    run("relayj1stale", relayj1stale);
-    run("hdrstrike", hdrstrike);
-    run("hdrseed", hdrseed);
-    run("catchpage", catchpage);
-    run("catchhold", catchhold);
-    run("catchslow", catchslow);
-    run("catchgone", catchgone);
-    run("catchlost", catchlost);
-    run("catchfull", catchfull);
-    run("hp_stale", hp_stale);
-    run("hp_tipkeep", hp_tipkeep);
-    run("hp_tip_in_page", hp_tip_in_page);
-    run("hp_stale_after_tip", hp_stale_after_tip);
-    run("hp_side_in_page", hp_side_in_page);
-    run("hp_ctxslot", hp_ctxslot);
-    run("hp_firstround", hp_firstround);
-    run("hp_guard", hp_guard);
-    run("hp_crawl", hp_crawl);
-    run("hp_qbound", hp_qbound);
-    run("buckets", buckets);
-    run("relaytok", relaytok);
-    run("relaym4", relaym4);
-    run("relaybudget", relaybudget);
-    run("relayfetch", relayfetch);
-    run("relaysmoke", relaysmoke);
-    run("relayq", relayq);
-    run("relayindex", relayindex);
-    run("relayp15", relayp15);
-    run("relayp15rx", relayp15rx);
-    run("ownbound", ownbound);
-    run("deferfound", deferfound);
-    run("blockblob", blockblob);
-    run("alarmbound", alarmbound);
-    run("relaystale", relaystale);
-    run("relaytip", relaytip);
-    run("relaysq", relaysq);
-    run("revrx_drain", revrx_drain);
-    run("drainban", drainban);
-    run("drainstrike", drainstrike);
-    run("drainhonest", drainhonest);
-    run("draingone", draingone);
-    run("relayrxhdr", relayrxhdr);
-    run("hdrnohash", hdrnohash);
-    run("relayrxnohash", relayrxnohash);
-    run("relayrxtype", relayrxtype);
-    run("relaystalem", relaystalem);
-    run("relayrxbind", relayrxbind);
-    run("relaymaxpage", relaymaxpage);
-    run("rev99_complete", rev99_complete);
-    run("ownrx", ownrx);
-    run("relayrxbindr", relayrxbindr);
-    run("relayrxbindk", relayrxbindk);
-    run("relayp15once", relayp15once);
-    run("relayverdictlog", relayverdictlog);
-    run("relayparkstrike", relayparkstrike);
-    run("repevict", repevict);
-    run("openstate", openstate);
-    run("opendead", opendead);
-    run("statusperiod", statusperiod);
-    run("ownorphan", ownorphan);
-    run("liveness", liveness);
-    run("wingolden", wingolden);
-    run("wingoldenmb", wingoldenmb);
-    run("relayomit", relayomit);
-    run("relayomitgone", relayomitgone);
-    run("omitrules", omitrules);
-    run("omitfresh", omitfresh);
-    run("omitopen", omitopen);
-    run("omitcompete", omitcompete);
-    run("omitwalk", omitwalk);
-    run("omithonest", omithonest);
-    run("relayswitchlog", relayswitchlog);
-    run("relaybindswitch", relaybindswitch);
-    run("relayrepend", relayrepend);
-    run("revrepend2", revrepend2);
-    run("relayrpark", relayrpark);
-    run("relayhdrctx", relayhdrctx);
-    run("relayrbindr", relayrbindr);
-    run("relayrparkseal", relayrparkseal);
-    run("relayrparkgone", relayrparkgone);
-    run("revjunkbig", revjunkbig);
-    run("revdueorder", revdueorder);
-    run("relayqfull", relayqfull);
-    run("relayreoffercap", relayreoffercap);
-    run("relayrxbind2", relayrxbind2);
-    run("ownrxrun", ownrxrun);
-    run("relayp40", relayp40);
-    run("relayp50", relayp50);
-    run("relayjoint", relayjoint);
-    run("relaypace", relaypace);
-    run("regtestk30", regtestk30);
-    run("prune_young", prune_young);
-    run("prune_default", prune_default);
-    run("prune_flags", prune_flags);
-    run("prune_side", prune_side);
-    run("sideprune", sideprune);
-    run("prune_hold", prune_hold);
-    run("below", below);
-    run("jobslot", jobslot);
-    run("minerwithdraw", minerwithdraw);
-    run("minerflush", minerflush);
-    run("ctxgate", ctxgate);
-    run("parkidx", parkidx);
-    run("catchjoin", catchjoin);
-    run("catchwalk", catchwalk);
-    run("catchgate", catchgate);
-    run("catchrestart", catchrestart);
-    run("catchlocator", catchlocator);
-    run("pwalk", pwalk);
-    run("pwalkshapes", pwalkshapes);
-    run("pwalkfull", pwalkfull);
-    run("pwalkcrawl", pwalkcrawl);
-    run("pwalkstall", pwalkstall);
-    run("pwalklost", pwalklost);
-    run("pwalksilent", pwalksilent);
-    run("rcsilent", rcsilent);
-    run("rclate", rclate);
-    run("rcrehello", rcrehello);
-    run("pwalkgone", pwalkgone);
-    run("pwalkjunk", pwalkjunk);
-    run("pwalkskipfull", pwalkskipfull);
-    run("pwalkasked", pwalkasked);
-    run("pwalkdup", pwalkdup);
-    run("sealall", sealall);
-    run("placedcopy", placedcopy);
-    run("placedvariant", placedvariant);
-    run("revnotcarrier", revnotcarrier);
-    run("statustime", statustime);
-    run("catchkeep", catchkeep);
-    run("catchlight", catchlight);
-    run("catchoffer", catchoffer);
-    run("revcatchundec", revcatchundec);
-    run("catchtok", catchtok);
-    run("catchheavy", catchheavy);
-    run("catchctx", catchctx);
-    run("floorpr", floorpr);
-    return finish("v37_xmr_pathb_node_kat");
+    return run_sections("v37_xmr_pathb_node_kat",
+                        {
+                                {"genesis", genesis, 0},
+                                {"relay", relay, 1},
+                                {"race", race, 0},
+                                {"racelate", racelate, 0},
+                                {"raceskip", raceskip, 0},
+                                {"carriage", carriage, 0},
+                                {"feediverse", feediverse, 1},
+                                {"repend", repend, 0},
+                                {"n3", n3, 0},
+                                {"own", own_share, 0},
+                                {"m23", m23, 0},
+                                {"restart", restart, 1},
+                                {"n5", n5, 0},
+                                {"hold", hold_kind2, 0},
+                                {"c48", c48, 0},
+                                {"rrfix3", rrfix3, 3},
+                                {"deep", deep, 0},
+                                {"joinserve", joinserve, 11},
+                                {"n7b2", n7b2, 1},
+                                {"startup", startup, 0},
+                                {"poison", poison, 0},
+                                {"joinpages", joinpages, 1},
+                                {"tokens", tokens, 0},
+                                {"receive", receive, 3},
+                                {"hellobound", hellobound, 0},
+                                {"base", base, 0},
+                                {"boundary", boundary, 1},
+                                {"timers", timers, 0},
+                                {"j1stale", j1stale, 0},
+                                {"relayj1stale", relayj1stale, 0},
+                                {"hdrstrike", hdrstrike, 0},
+                                {"hdrseed", hdrseed, 0},
+                                {"catchpage", catchpage, 46},
+                                {"catchhold", catchhold, 7},
+                                {"catchslow", catchslow, 8},
+                                {"catchgone", catchgone, 3},
+                                {"catchlost", catchlost, 1},
+                                {"catchfull", catchfull, 0},
+                                {"hp_stale", hp_stale, 0},
+                                {"hp_tipkeep", hp_tipkeep, 2},
+                                {"hp_tip_in_page", hp_tip_in_page, 0},
+                                {"hp_stale_after_tip", hp_stale_after_tip, 0},
+                                {"hp_side_in_page", hp_side_in_page, 0},
+                                {"hp_ctxslot", hp_ctxslot, 0},
+                                {"hp_firstround", hp_firstround, 0},
+                                {"hp_guard", hp_guard, 0},
+                                {"hp_crawl", hp_crawl, 7},
+                                {"hp_qbound", hp_qbound, 53},
+                                {"buckets", buckets, 1},
+                                {"relaytok", relaytok, 0},
+                                {"relaym4", relaym4, 0},
+                                {"relaybudget", relaybudget, 0},
+                                {"relayfetch", relayfetch, 0},
+                                {"relaysmoke", relaysmoke, 0},
+                                {"relayq", relayq, 0},
+                                {"relayindex", relayindex, 0},
+                                {"relayp15", relayp15, 0},
+                                {"relayp15rx", relayp15rx, 0},
+                                {"ownbound", ownbound, 0},
+                                {"deferfound", deferfound, 0},
+                                {"blockblob", blockblob, 0},
+                                {"alarmbound", alarmbound, 0},
+                                {"relaystale", relaystale, 4},
+                                {"relaytip", relaytip, 0},
+                                {"relaysq", relaysq, 0},
+                                {"revrx_drain", revrx_drain, 0},
+                                {"drainban", drainban, 0},
+                                {"drainstrike", drainstrike, 0},
+                                {"drainhonest", drainhonest, 0},
+                                {"draingone", draingone, 0},
+                                {"relayrxhdr", relayrxhdr, 0},
+                                {"hdrnohash", hdrnohash, 0},
+                                {"relayrxnohash", relayrxnohash, 0},
+                                {"relayrxtype", relayrxtype, 0},
+                                {"relaystalem", relaystalem, 0},
+                                {"relayrxbind", relayrxbind, 0},
+                                {"relaymaxpage", relaymaxpage, 0},
+                                {"rev99_complete", rev99_complete, 0},
+                                {"ownrx", ownrx, 0},
+                                {"relayrxbindr", relayrxbindr, 0},
+                                {"relayrxbindk", relayrxbindk, 0},
+                                {"relayp15once", relayp15once, 0},
+                                {"relayverdictlog", relayverdictlog, 0},
+                                {"relayparkstrike", relayparkstrike, 0},
+                                {"repevict", repevict, 0},
+                                {"openstate", openstate, 0},
+                                {"opendead", opendead, 0},
+                                {"statusperiod", statusperiod, 0},
+                                {"ownorphan", ownorphan, 0},
+                                {"liveness", liveness, 0},
+                                {"wingolden", wingolden, 0},
+                                {"wingoldenmb", wingoldenmb, 0},
+                                {"relayomit", relayomit, 0},
+                                {"relayomitgone", relayomitgone, 0},
+                                {"omitrules", omitrules, 0},
+                                {"omitfresh", omitfresh, 0},
+                                {"omitopen", omitopen, 1},
+                                {"omitcompete", omitcompete, 0},
+                                {"omitwalk", omitwalk, 0},
+                                {"omithonest", omithonest, 0},
+                                {"relayswitchlog", relayswitchlog, 0},
+                                {"relaybindswitch", relaybindswitch, 0},
+                                {"relayrepend", relayrepend, 0},
+                                {"revrepend2", revrepend2, 0},
+                                {"relayrpark", relayrpark, 0},
+                                {"relayhdrctx", relayhdrctx, 0},
+                                {"relayrbindr", relayrbindr, 0},
+                                {"relayrparkseal", relayrparkseal, 0},
+                                {"relayrparkgone", relayrparkgone, 0},
+                                {"revjunkbig", revjunkbig, 13},
+                                {"revdueorder", revdueorder, 0},
+                                {"relayqfull", relayqfull, 0},
+                                {"relayreoffercap", relayreoffercap, 0},
+                                {"relayrxbind2", relayrxbind2, 0},
+                                {"ownrxrun", ownrxrun, 0},
+                                {"relayp40", relayp40, 0},
+                                {"relayp50", relayp50, 0},
+                                {"relayjoint", relayjoint, 2},
+                                {"relaypace", relaypace, 9},
+                                {"regtestk30", regtestk30, 0},
+                                {"prune_young", prune_young, 12, "prune_chain"},
+                                {"prune_default", prune_default, 5, "prune_chain"},
+                                {"prune_flags", prune_flags, 4, "prune_chain"},
+                                {"prune_side", prune_side, 0, "prune_chain"},
+                                {"sideprune", sideprune, 5, "prune_chain"},
+                                {"prune_hold", prune_hold, 4, "prune_chain"},
+                                {"below", below, 111},
+                                {"jobslot", jobslot, 1},
+                                {"minerwithdraw", minerwithdraw, 0},
+                                {"minerflush", minerflush, 0},
+                                {"ctxgate", ctxgate, 1},
+                                {"parkidx", parkidx, 0},
+                                {"catchjoin", catchjoin, 0},
+                                {"catchwalk", catchwalk, 0},
+                                {"catchgate", catchgate, 0},
+                                {"catchrestart", catchrestart, 0},
+                                {"catchlocator", catchlocator, 0},
+                                {"pwalk", pwalk, 99},
+                                {"pwalkshapes_1000_8", pwalkshapes<1000, 8>, 116},
+                                {"pwalkshapes_500_8", pwalkshapes<500, 8>, 117},
+                                {"pwalkshapes_1000_10", pwalkshapes<1000, 10>, 108},
+                                {"pwalkshapes_1500_8", pwalkshapes<1500, 8>, 84},
+                                {"pwalkshapes_2000_5", pwalkshapes<2000, 5>, 75},
+                                {"pwalkfull", pwalkfull, 102},
+                                {"pwalkcrawl", pwalkcrawl, 111},
+                                {"pwalkstall", pwalkstall, 94},
+                                {"pwalklost", pwalklost, 1},
+                                {"pwalksilent", pwalksilent, 3},
+                                {"rcsilent", rcsilent, 6},
+                                {"rclate", rclate, 5},
+                                {"rcrehello", rcrehello, 0},
+                                {"pwalkgone", pwalkgone, 0},
+                                {"pwalkjunk", pwalkjunk, 0},
+                                {"pwalkskipfull", pwalkskipfull, 0},
+                                {"pwalkasked", pwalkasked, 1},
+                                {"pwalkdup", pwalkdup, 0},
+                                {"sealall", sealall, 1},
+                                {"placedcopy", placedcopy, 0},
+                                {"placedvariant", placedvariant, 0},
+                                {"revnotcarrier", revnotcarrier, 0},
+                                {"statustime", statustime, 0},
+                                {"catchkeep", catchkeep, 0},
+                                {"catchlight", catchlight, 0},
+                                {"catchoffer", catchoffer, 0},
+                                {"revcatchundec", revcatchundec, 0},
+                                {"catchtok", catchtok, 0},
+                                {"catchheavy", catchheavy, 0},
+                                {"catchctx", catchctx, 0},
+                                {"floorpr", floorpr, 0},
+                        },
+                        argc, argv);
 }

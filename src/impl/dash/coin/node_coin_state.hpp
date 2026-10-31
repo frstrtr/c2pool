@@ -419,6 +419,16 @@ public:
     void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; }
     bool include_mn_special_txs() const { return m_include_mn_special_txs; }
 
+    /// B.9: the BLS verifier for the operator signature of ProUpServTx /
+    /// ProUpRevTx in the types 1-4 fold — the builder's and the emit gate's
+    /// (one context, sml_special_fold.hpp). c2pool-dash wires
+    /// vendor::verify_protx_operator_sig. UNSET (default) => the fold refuses
+    /// both types: no provider tx whose signature we cannot check ever rides.
+    void set_protx_operator_sig_verifier(MnFoldContext::OperatorSigFn fn)
+    {
+        m_protx_sig_verifier = std::move(fn);
+    }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -1636,14 +1646,24 @@ public:
                               "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
                               "known-registration-height");
             apply_qc_pose_bans(proj.sml, pose_bans);
+            // The SAME context the builder folded with
+            // (make_template_fold_context): pre-block list, collateral proofs,
+            // operator-signature verifier.
+            const MnFoldContext fold_ctx = make_template_fold_context(
+                m_mnstates, m_mempool,
+                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr);
             auto fold = fold_mn_special_txs(
                 proj.sml, w.m_txs,
                 [](const Transaction& t) {
                     return dash::coin::dash_txid(MutableTransaction(t));
-                });
+                },
+                fold_ctx);
             if (!fold.clean())
                 return reject("emit-mnlist-fold-refused",
-                              std::to_string(fold.refused),
+                              std::to_string(fold.refused)
+                                  + (fold.refused_reasons.empty()
+                                         ? std::string()
+                                         : ":" + fold.refused_reasons.front()),
                               "0-refused");
             expected_mn_root = fold.sml.CalcMerkleRoot();
         } else if (!pose_bans.empty()) {
@@ -1903,6 +1923,8 @@ public:
         // (pointers into this state, like mnstates/mempool).
         e.qc_pose_members = m_qc_pose_members_fn ? &m_qc_pose_members_fn : nullptr;
         e.qc_pose_oracle  = &m_qc_pose_oracle;
+        // B.9: same verifier the emit gate folds with (unset => refused).
+        e.protx_sig_verifier = m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr;
         return e;
     }
 
@@ -2367,6 +2389,7 @@ private:
     // Consumed by make_embedded_work_inputs (builder) and
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
+    MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after

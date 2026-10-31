@@ -583,6 +583,52 @@ TEST(DashPoseOracleFeeder, FoldsContiguouslyBuffersOutOfOrderAndDropsForkBodies)
     // (Missing heights are requested — next test.)
 }
 
+// The quorum lane's cursor is forward-contiguous like the fold's: a body the
+// fold refuses with its state unchanged (a tx dashd's
+// ContextualCheckTransaction rejects) must never reach it, or the lane sits
+// one block ahead and refuses the valid sibling at that height.
+TEST(DashPoseOracleFeeder, RefusedBodyNeverReachesTheQuorumLane)
+{
+    SynthChain ch;
+    Shadow sh(ch);
+    ch.seed_via_lane();
+    ASSERT_TRUE(ch.feeder->seeded());
+    const uint64_t observed0 = ch.br.stats().blocks_observed;
+    const uint32_t qh0 = ch.qeng.height();
+
+    MutableTransaction neg;           // nVersion -1: v23.1.9 bad-txns-version
+    neg.version = 0xFFFF;
+    bitcoin_family::coin::TxIn in;
+    in.prevout.hash = raw256(0xA9);
+    in.prevout.index = 3;
+    in.sequence = 0xffffffff;
+    neg.vin.push_back(in);
+    bitcoin_family::coin::TxOut out;
+    out.value = 5;
+    neg.vout.push_back(out);
+    const BlockType bad = ch.make(101, {neg}, sh.eng);
+    ch.feeder->on_block(bad, 101);
+    EXPECT_EQ(ch.eng.height(), 100u);
+    EXPECT_FALSE(ch.eng.poisoned());
+    EXPECT_EQ(ch.feeder->stats().refused_unchanged, 1u);
+    EXPECT_EQ(ch.feeder->refused_unchanged_count(), 1u);
+    EXPECT_EQ(ch.br.stats().blocks_observed, observed0)
+        << "the refused body reached the quorum lane";
+    EXPECT_EQ(ch.qeng.height(), qh0);
+    EXPECT_NE(ch.feeder->status_line().find("refused_unchanged=1"), std::string::npos)
+        << ch.feeder->status_line();
+
+    // The best chain moves to the valid sibling: it folds, and the quorum
+    // lane observes exactly that block.
+    const BlockType good = ch.make(101, {}, sh.eng, {}, /*salt=*/1);
+    sh.fold(good, 101);
+    ch.feeder->on_block(good, 101);
+    EXPECT_EQ(ch.eng.height(), 101u);
+    EXPECT_EQ(ch.feeder->stats().folded, 1u);
+    EXPECT_EQ(ch.br.stats().blocks_observed, observed0 + 1);
+    EXPECT_EQ(ch.qeng.height(), qh0 + 1);
+}
+
 TEST(DashPoseOracleFeeder, RequestsHeightsNobodyDeliversAndRefetchesOnTimeout)
 {
     SynthChain ch;
