@@ -2981,7 +2981,7 @@ private:
     }
     // A due end of K_NCU tried again (not under the node lock: after a judged frame, a job, a pump).
     void recheck_caught_up() {
-        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this || defer_ends_) return;
+        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this || defer_ends_.load()) return;
         const NodeGuard g(*this);
         std::lock_guard<std::mutex> lk(cumtx_);
         if (caught_due_.load()) caught_up_locked();
@@ -4620,7 +4620,7 @@ private:
     std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
     std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
     std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)
-    bool defer_ends_ = false;                  // test_defer_ends
+    std::atomic<bool> defer_ends_{false};      // test_defer_ends
     std::atomic<bool> kept_due_{false};        // a kept join attempt or an adoption; K_NCU's end waits for the drain
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;

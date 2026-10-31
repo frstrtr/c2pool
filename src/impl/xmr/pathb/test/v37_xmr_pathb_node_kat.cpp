@@ -10906,6 +10906,7 @@ struct GateReads {
 struct GateSib {
     bool setup = false, y_held = false, line = false, caught_up = false;
     GateReads r;
+    int uc_in_hand = 0, uc_after = 0, no_uc_after = 0;  // unverified_claims() at the reads: in hand true; after: true, false
     std::uint64_t j_pos = 0, y_pos = 0, strikes = 0, bans = 0;
 };
 GateSib gate_sib(int mode) {  // 0 keep, 1 silent, 2 tie
@@ -10979,7 +10980,14 @@ GateSib gate_sib(int mode) {  // 0 keep, 1 silent, 2 tie
     for (int k = 0; k < 40; ++k) {
         h.now += 1;
         rj.tick();
-        if (caught_of(lines, j.node).empty() && !h[j.node].caught_up()) o.r.read(h, j.node);
+        if (caught_of(lines, j.node).empty() && !h[j.node].caught_up()) {
+            o.r.read(h, j.node);
+            const bool uc = h[j.node].unverified_claims();
+            if (!h[j.node].drain_done())
+                o.uc_in_hand += uc ? 1 : 0;
+            else
+                ++(uc ? o.uc_after : o.no_uc_after);
+        }
         rj.pump();
         for (pb::PathbRelayNode* r : {a.relay.get(), b.relay.get()}) {
             r->tick();
@@ -11004,17 +11012,22 @@ void gatesib() {
     for (int mode : {0, 2, 1}) {
         const GateSib o = gate_sib(mode);
         const std::string name = mode == 0 ? "gatesib keep" : mode == 2 ? "gatesib tie" : "gatesib silent";
-        std::printf("  %s: setup %d; J %llu, Y's tip %llu held %d; reads before the line: %s; line %d caught up %d; "
-                    "strikes %llu bans %llu\n",
+        std::printf("  %s: setup %d; J %llu, Y's tip %llu held %d; reads before the line: %s; unverified_claims in "
+                    "hand %d, after the drain %d true %d false; line %d caught up %d; strikes %llu bans %llu\n",
                     name.c_str(), o.setup ? 1 : 0, (unsigned long long)o.j_pos, (unsigned long long)o.y_pos,
-                    o.y_held ? 1 : 0, o.r.str().c_str(), o.line ? 1 : 0, o.caught_up ? 1 : 0,
-                    (unsigned long long)o.strikes, (unsigned long long)o.bans);
+                    o.y_held ? 1 : 0, o.r.str().c_str(), o.uc_in_hand, o.uc_after, o.no_uc_after, o.line ? 1 : 0,
+                    o.caught_up ? 1 : 0, (unsigned long long)o.strikes, (unsigned long long)o.bans);
         check(o.setup, name + ": setup (Y's tip unheld at J, frames of X in hand when J holds X's tip)");
         check(o.r.open_in_hand == 0 && o.r.held_in_hand >= 10,
               name + ": no template while frames are in hand (" + o.r.str() + ")");
-        if (mode == 1)
+        if (mode == 1) {
             check(o.r.open_after >= 5 && !o.line && !o.caught_up,
                   name + ": after the drain a claim alone opens the gate; K_NCU set, no line (Y's catch-up open)");
+            check(o.uc_in_hand == 0 && o.uc_after >= 5 && o.no_uc_after == 0,
+                  name + ": unverified_claims() reads the gate: false while frames are in hand, true after the drain "
+                         "(in hand " + std::to_string(o.uc_in_hand) + ", after " + std::to_string(o.uc_after) + "/" +
+                         std::to_string(o.no_uc_after) + ")");
+        }
         else
             check(o.r.open_after == 0 && o.line && o.caught_up && !o.y_held && o.strikes == 0 && o.bans == 0,
                   name + ": the Keep ends the catch-up with Y's tip not held; held until the line; no token");
@@ -11026,7 +11039,7 @@ void gatesib() {
 // ends by its reply's own decision:
 //   strike       B's reply reaches J with a link broken inside it (STRIKE);
 //   undecodable  B's reply reaches J truncated (STRIKE);
-//   ban          B's tip fails its PoW at d at J (BAN; B's link dropped);
+//   ban          B's tip fails its PoW at d at J (BAN; B's link dropped): with no peer left J's reads are NoPathbPeer;
 //   ban, C       the ban with a third peer C (its own carrier on position 1, never answering J's FC_GETHEADERS)
 //                connected first: J's catch-up toward C stays open, so after B's link drops a HELLO tip is still not
 //                held; held while frames are in hand, then the claim (C) opens the gate with K_NCU set.
@@ -11202,6 +11215,242 @@ void gatehand() {
           "gatehand: the hand-over is no end: no caught-up line and K_NCU set, A's catch-up ended or not");
     check(!h[j.node].attempting() && h[j.node].drain_done() && !h[j.node].caught_up() && gate_open(h, j.node),
           "gatehand: the end state (a hand-over, no attempt open, nothing in hand): the gate open with K_NCU set");
+}
+
+// gatejp (E-166 (v), E-194 (vi)): a hand-over by JoinerPath is no end. J, a store not caught up, walked D's chain
+// 1..10 (C's 1, 2 and D's own 3..10), its journal base at 6 (above tip - J); C holds C's 1, 2 and its own 3..14
+// (heavier). Three copies of D's carriers are parked at J's relay (run again 20 s later). J meets C: its catch-up steps
+// down to position 2, C's headers win and fork below J's journal base, so C's tip is handed to the joiner (no attempt:
+// one HELLO tail, P-40). Then D connects (its tip held at J). Read after every tick of J for 30 s: held while frames
+// are in hand; after the drain the handed-over claim opens the gate; no caught-up line, K_NCU set.
+void gatejp() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay c = kat_relay(h, w, table0(net), true);
+    KatRelay d = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    for (int i = 0; i < 2; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, c.node, static_cast<std::size_t>(i), 5100 + static_cast<std::uint32_t>(i));
+    }
+    ok = ok && h[d.node].tree().best().id == h[c.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    for (int i = 0; i < 8; ++i) {
+        h.tick_monero();
+        ok = ok && mine_on(h, w, d.node, static_cast<std::size_t>(i % 5), 5200 + static_cast<std::uint32_t>(i));
+    }
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, c.node, static_cast<std::size_t>(i % 5), 5300 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip_c = h[c.node].tree().best().id;
+    const std::size_t jw = h.add(table0(net), false, 1152, true);
+    MemoryKv& kvw = *h.kvs.back();
+    std::vector<std::vector<std::uint8_t>> copies;
+    for (std::uint64_t x = 1; x <= 10; ++x)
+        if (const std::optional<pb::Hash32> id = h[d.node].store().best_at(x)) {
+            copies.push_back(*pb::encode_fc_carrier(0, *h[d.node].bodies().get(*id), 16));
+            (void)h[jw].on_carrier(77, copies.back());
+        }
+    h.q.clear();
+    ok = ok && h[jw].tree().best().pos == 10 && !h[jw].caught_up() && h[c.node].tree().best().pos == 14 &&
+         copies.size() == 10;
+    {  // the journal base at 6: above tip - J
+        pb::StoreHead hd = *pb::decode_phead(kvw.data[pb::store_keys::phead(0)]);
+        hd.base_pos = 6;
+        kvw.data[pb::store_keys::phead(0)] = pb::encode_phead(hd);
+    }
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    KatRelay j = kat_relay_loaded(h, w, kvw, h.config(table0(net)));
+    pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t base = h[j.node].store().base_pos(), tip = h[j.node].tree().best().pos;
+    const std::size_t jwire = 2;
+    for (std::size_t k = 0; k < 3; ++k) rj.test_park(77, copies[k], (h.now + 20) * 1000);
+    w.edit = [jwire](FakeWire::Msg& m) {  // C's and D's own catch-ups toward J get no reply
+        if (!m.f.empty() && m.f[0] == pb::kOpFcHeaders && m.from == jwire) m.f.clear();
+    };
+    w.connect(0, jwire);
+    w.run();
+    const std::size_t pairs = h[j.node].joiner().queue().size();
+    const bool c_held = h[j.node].holds_tip(tip_c);
+    const std::uint64_t offers = rj.stats().empty_store_offers.load(), steps = rj.stats().catchup_steps.load();
+    // JoinerPath: no empty reply from position 0, no deferred catch-up's offer
+    const bool jp = offers == 0 && rj.stats().catchup_join_offers.load() == 0 && steps >= 1 && pairs == 1;
+    w.connect(1, jwire);  // D: its tip held at J
+    w.run();
+    GateReads r;
+    for (int k = 0; k < 30; ++k) {
+        h.now += 1;
+        rj.tick();
+        if (caught_of(lines, j.node).empty() && !h[j.node].caught_up()) r.read(h, j.node);
+        rj.pump();
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
+    w.edit = nullptr;
+    g_relay_lines = nullptr;
+    std::printf("  gatejp: base %llu, tip %llu; locator steps %llu, empty-store offers %llu, pairs %zu, C's tip held %d; "
+                "reads: %s; lines %zu; caught up %d; attempt open %d\n",
+                (unsigned long long)base, (unsigned long long)tip, (unsigned long long)steps, (unsigned long long)offers,
+                pairs, c_held ? 1 : 0, r.str().c_str(), caught_of(lines, j.node).size(), h[j.node].caught_up() ? 1 : 0,
+                h[j.node].attempting() ? 1 : 0);
+    check(ok && base == 6 && tip == 10 && jp && !c_held,
+          "gatejp: setup (journal base 6 at tip 10; C's heavier tip handed to the joiner by JoinerPath; one pair)");
+    check(r.open_in_hand == 0 && r.held_in_hand >= 10 && r.open_after >= 5 && r.held_after == 0,
+          "gatejp: held while frames are in hand; after the drain the handed-over claim opens the gate (" + r.str() + ")");
+    check(caught_of(lines, j.node).empty() && !h[j.node].caught_up() && !h[j.node].attempting(),
+          "gatejp: the JoinerPath hand-over is no end: no caught-up line and K_NCU set, D's catch-up ended or not");
+}
+
+// drainevict (E-193): frames evicted from the deferred store (P-47) leave the drain. J's deferred store holds at most 4
+// frames. A and B share 4 positions; A holds 10 more (14), B 8 of its own. J, an empty store not caught up, catches up
+// from A; three copies of A's carriers are parked at J's relay (run again 20 s later) with J at 4 or more. After J
+// places the HELLO tip, B's own carriers 6..12 reach J over A's link (their parents unknown at J): parked, and the
+// oldest three (6..8) evicted; then B's 5..8 over the same link: placed, the four kept frames released and placed. The
+// caught-up line comes once the three copies are judged.
+void drainevict() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    Branches br = branches(h, w, net, 4, 8, 10, 5400);
+    const std::size_t a = br.a.node, b = br.b.node;
+    const pb::Hash32 tip = h[a].tree().best().id;
+    const pb::Hash32 tip_b = h[b].tree().best().id;
+    std::vector<std::vector<std::uint8_t>> copies, foreign, again;
+    for (const std::uint64_t x : {1, 2, 3})
+        if (const std::optional<pb::Hash32> id = h[a].store().best_at(x))
+            copies.push_back(*pb::encode_fc_carrier(0, *h[a].bodies().get(*id), 16));
+    for (std::uint64_t x = 5; x <= 12; ++x)
+        if (const std::optional<pb::Hash32> id = h[b].store().best_at(x))
+            (x >= 6 ? foreign : again).push_back(*pb::encode_fc_carrier(0, *h[b].bodies().get(*id), 16));
+    for (std::size_t k = 0; k < 3 && k < foreign.size(); ++k) again.push_back(foreign[k]);
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    const auto cap4 = [](pb::PathbNodeConfig& cfg) { cfg.waiting_cap = 4; };
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, cap4, nullptr, true);
+    pb::PathbRelayNode& rj = *j.relay;
+    const std::uint64_t pa = w.id(2, 0);  // A at J
+    w.connect(0, 2);
+    bool parked = false, reached = false;
+    for (int secs = 0; secs < 120 && !reached; ++secs) {
+        h.now += 1;
+        br.a.relay->tick();
+        br.a.relay->pump();
+        rj.tick();
+        rj.pump();
+        for (int m = 0; m < 100 && !reached; ++m) {
+            if (!parked && h[j.node].tree().best().pos >= 4 && copies.size() == 3) {
+                for (const auto& f : copies) rj.test_park(77, f, (h.now + 20) * 1000);
+                parked = true;
+            }
+            reached = h[j.node].holds_tip(tip);
+            if (reached || !w.step()) break;
+        }
+        reached = reached || h[j.node].holds_tip(tip);
+    }
+    for (const auto& f : foreign) {  // B's carriers over A's link: their parents unknown at J
+        rj.receive(pa, f);
+        rj.pump();
+    }
+    const std::size_t deferred = h[j.node].deferred().size();
+    for (const auto& f : again) {  // B's 5, then the evicted 6..8
+        rj.receive(pa, f);
+        rj.pump();
+    }
+    const bool line_before = !caught_of(lines, j.node).empty();
+    for (int k = 0; k < 30 && caught_of(lines, j.node).empty(); ++k) {
+        h.now += 1;
+        rj.tick();
+        rj.pump();
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
+    const std::vector<std::string> cl = caught_of(lines, j.node);
+    g_relay_lines = nullptr;
+    const pb::CarrierNode* nb = h[j.node].tree().find(tip_b);
+    const bool b_placed = nb != nullptr && nb->verified;
+    std::printf("  drainevict: parked %d, J at the HELLO tip %d; B's carriers sent %zu, the deferred store %zu "
+                "(cap 4); B's 5..8 sent %zu: B's tip placed %d, the deferred store %zu; line before %d; lines %zu; "
+                "caught up %d; parked %zu\n",
+                parked ? 1 : 0, reached ? 1 : 0, foreign.size(), deferred, again.size(), b_placed ? 1 : 0,
+                h[j.node].deferred().size(), line_before ? 1 : 0, cl.size(), h[j.node].caught_up() ? 1 : 0,
+                rj.parked_size());
+    check(br.ok && parked && reached && foreign.size() == 7 && deferred == 4 && again.size() == 4 && b_placed &&
+                  h[j.node].deferred().size() == 0 && !line_before,
+          "drainevict: setup (frames in hand at the HELLO tip; 7 frames of B parked in a store of 4: 3 evicted; "
+          "B's 5..8 again: B's tip placed, the store empty)");
+    check(cl.size() == 1 && h[j.node].caught_up() && rj.parked_size() == 0,
+          "drainevict: the evicted frames leave the drain: the caught-up line comes once the parked frames are judged");
+}
+
+// drainleft (E-193): the jobs of a peer gone while they are in hand leave the drain. A holds 40 positions; G, a full
+// node at A's tip, is connected to J too. J, an empty store not caught up, catches up from A; three copies of A's
+// carriers are parked at J's relay as G's, run again 10 s later; after J places the HELLO tip G's link drops. The
+// jobs run at their time and the caught-up line comes.
+void drainleft() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    KatRelay g = kat_relay(h, w, table0(net), true);
+    w.connect(0, 1);
+    w.run();
+    bool mined = true;
+    for (std::uint64_t i = 0; i < 40 && mined; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        mined = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 5500 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    const bool g_synced = h[g.node].tree().best().id == tip;
+    std::vector<std::vector<std::uint8_t>> copies;
+    for (const std::uint64_t x : {10, 20, 30})
+        if (const std::optional<pb::Hash32> id = h[a.node].store().best_at(x))
+            copies.push_back(*pb::encode_fc_carrier(0, *h[a.node].bodies().get(*id), 16));
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    KatRelay j = kat_relay(h, w, table0(net), false, false, nullptr, nullptr, nullptr, true);
+    pb::PathbRelayNode& rj = *j.relay;
+    w.connect(2, 0);
+    w.connect(2, 1);
+    const std::uint64_t pg = w.id(2, 1);  // G at J
+    for (const auto& f : copies) rj.test_park(pg, f, (h.now + 10) * 1000);
+    bool reached = false;
+    for (int secs = 0; secs < 60 && !reached; ++secs) {
+        h.now += 1;
+        for (pb::PathbRelayNode* r : {a.relay.get(), g.relay.get(), j.relay.get()}) {
+            r->tick();
+            r->pump();
+        }
+        for (int m = 0; m < 100 && !reached && w.step(); ++m) reached = h[j.node].holds_tip(tip);
+        reached = reached || h[j.node].holds_tip(tip);
+    }
+    const bool in_hand = !h[j.node].drain_done();
+    const bool line_before = !caught_of(lines, j.node).empty();
+    w.links[2]->disconnect(pg);  // G gone with its jobs in hand
+    w.run();
+    const bool g_gone = !rj.hello_ok(pg);
+    for (int k = 0; k < 30 && caught_of(lines, j.node).empty(); ++k) {
+        h.now += 1;
+        rj.tick();
+        rj.pump();
+        for (int m = 0; m < 100 && w.step(); ++m) {
+        }
+    }
+    const std::vector<std::string> cl = caught_of(lines, j.node);
+    g_relay_lines = nullptr;
+    std::printf("  drainleft: J at the HELLO tip %d with G's jobs in hand %d; line before %d; G gone %d; lines %zu; "
+                "caught up %d; parked %zu\n",
+                reached ? 1 : 0, in_hand ? 1 : 0, line_before ? 1 : 0, g_gone ? 1 : 0, cl.size(),
+                h[j.node].caught_up() ? 1 : 0, rj.parked_size());
+    check(mined && g_synced && copies.size() == 3 && reached && in_hand && !line_before && g_gone,
+          "drainleft: setup (J at the HELLO tip, G's jobs in hand, G's link dropped)");
+    check(cl.size() == 1 && h[j.node].caught_up() && rj.parked_size() == 0,
+          "drainleft: the gone peer's jobs leave the drain: the caught-up line comes");
 }
 
 // gatekept (E-178, E-194 (vi)): catchheavy's B part. J not caught up (journal depth 4) walked D's chain 1..8; B (A's
@@ -13546,6 +13795,9 @@ int main(int argc, char** argv) {
                                 {"gatesib", gatesib, 30},
                                 {"gatebad", gatebad, 1},
                                 {"gatehand", gatehand, 1},
+                                {"gatejp", gatejp, 1},
+                                {"drainevict", drainevict, 1},
+                                {"drainleft", drainleft, 1},
                                 {"gatekept", gatekept, 1},
                                 {"gateadopt", gateadopt, 1},
                                 {"gatewin", gatewin, 18},
