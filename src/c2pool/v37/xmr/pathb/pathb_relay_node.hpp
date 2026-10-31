@@ -2279,7 +2279,8 @@ private:
             std::deque<HdrWant>& q = it->second;
             while (!q.empty()) {
                 const HdrWant& w = q.front();
-                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr) {
+                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr
+                    || (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(it->first) == 0)) {  // its catch-up ended
                     q.pop_front();
                     continue;
                 }
@@ -3234,6 +3235,18 @@ private:
         v.push_back(w);
         if (v.back().since_ms == 0) v.back().since_ms = now_ms();
     }
+    // Under cumtx_: the catch-up of `p` ended: its deferral and its waiting request go.
+    void drop_catchup_asks_locked(std::uint64_t p) {
+        const auto cu = [](const auto& e) { return e.owner == PathbNode::HeaderOwner::CatchUp; };
+        if (const auto d = headers_on_ctx_.find(p); d != headers_on_ctx_.end()) {
+            d->second.erase(std::remove_if(d->second.begin(), d->second.end(), cu), d->second.end());
+            if (d->second.empty()) headers_on_ctx_.erase(d);
+        }
+        if (const auto q = header_wants_.find(p); q != header_wants_.end()) {
+            q->second.erase(std::remove_if(q->second.begin(), q->second.end(), cu), q->second.end());
+            if (q->second.empty()) header_wants_.erase(q);
+        }
+    }
     // Under cumtx_: the catch-up's own deferral of peer `p` (none: nullptr).
     HdrOnCtx* catchup_ctx_locked(std::uint64_t p) {
         const auto it = headers_on_ctx_.find(p);
@@ -3260,6 +3273,7 @@ private:
             it = v.empty() ? headers_on_ctx_.erase(it) : std::next(it);
             for (const HdrOnCtx& w : asks) {
                 if (!hello_ok(p) || node_->tree().find(w.from) == nullptr) continue;
+                if (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(p) == 0) continue;  // its catch-up ended
                 want_headers_locked(p, w.owner, w.from, w.stop, w.objs);
                 st_.headers_ctx_reasks++;
             }
@@ -3829,6 +3843,7 @@ private:
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
                     node_->end_comparison(it->first);  // no next page of its comparison
+                    drop_catchup_asks_locked(it->first);  // nor a deferred or waiting request of it
                     it = catchup_.erase(it);
                     continue;
                 }

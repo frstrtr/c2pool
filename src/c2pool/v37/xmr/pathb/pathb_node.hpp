@@ -2086,6 +2086,25 @@ public:
                 offer(req.stop != Hash32{} ? req.stop : fo.last, peer, U128{});  // the branch's tip with this server
                 return out;
             }
+            if (!fo.keep_above) {
+                // F was deep when fixed (its ids above not kept) and is not now (the base dropped): the comparison
+                // restarts from F, held on the best chain
+                const std::optional<Hash32> fid = store_->best_at(f_pos);
+                if (const CarrierNode* fn = fid ? tree_->find(*fid) : nullptr) {
+                    out.kind = HeadersOutcome::Kind::Continue;
+                    req.fold = new_fold(*fn, req.stop, req.max);
+                    req.fork = fn->id;
+                    req.from = fn->id;
+                    req.sent_s = now_s;
+                    req.arrived = false;
+                    req.first = false;
+                    const GetHeaders q{cfg_.identity.chain_id, req.from, req.stop, req.max};
+                    header_req_[peer] = std::move(req);
+                    timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
+                    send(peer, encode_fc_getheaders(q));
+                    return out;
+                }
+            }
             out.kind = HeadersOutcome::Kind::FetchBodies;
             // the bodies this node neither holds nor has parked, at most the deferred store's free room (its cap less
             // the parked frames and the bodies asked within P-53: an asked body is on its way to the store) and at least
@@ -2318,10 +2337,11 @@ private:
         Hash32 last{};                            // the last checked header (the seed before any)
         std::uint64_t own_h = 0;                  // the greatest h among the checked headers
         U128 work{};                              // cum_work(seed) + the d of every checked header
-        // F: the last header of the prefix, from the seed up, held on the best chain at its position
+        // F: the last header of the prefix, from the seed up, held on the best chain at its position (a seed off the
+        // best chain: the seed, read as its newest common ancestor with the best chain)
         Hash32 f{};
         std::uint64_t f_pos = 0;
-        bool fixed = false;                       // a header not held there fixed F
+        bool fixed = false;                       // a header not held there (or a seed off the best chain) fixed F
         bool keep_above = true;                   // the ids above F are kept (F not deep when fixed)
         std::uint64_t above_from = 0;             // the position below above[0]
         std::vector<Hash32> above;                // the checked ids above F
@@ -3714,8 +3734,8 @@ private:
         first_round_open_ = false;
         first_round_ = false;
     }
-    // A comparison seeded at the held `seed`: its state after the seed; F at the seed when the seed is held on the best
-    // chain, else at its newest common ancestor with the best chain (no ids above it kept).
+    // A comparison seeded at the held `seed`: its state after the seed; F at the seed. A seed off the best chain fixes F
+    // at once (read as its newest common ancestor with the best chain); its checked ids are kept while F is not deep.
     HeaderFold new_fold(const CarrierNode& seed, const Hash32& stop, std::uint16_t max) const {
         HeaderFold f;
         f.seed = seed.id;
@@ -3730,12 +3750,8 @@ private:
         const std::optional<Hash32> on_best = store_->best_at(seed.pos);
         if (!on_best || *on_best != seed.id) {
             f.fixed = true;
-            f.keep_above = false;
-            if (const std::optional<Hash32> fp = tree_->fork_point(seed.id, tree_->best().id))
-                if (const CarrierNode* n = tree_->find(*fp)) {
-                    f.f = n->id;
-                    f.f_pos = n->pos;
-                }
+            f.above_from = seed.pos;
+            f.keep_above = !deep_switch(fold_fork_pos(f));  // ids above a deep F are not kept
         }
         return f;
     }
