@@ -491,8 +491,14 @@ add_test(NAME bip110_m2_workshape_kat COMMAND bip110_m2_workshape_kat)
 # child ordering, fail-closed exclusion of an unpriced-parent child and an
 # over-weight tx, coinbasevalue == subsidy + Σ(fees) to the satoshi, and the
 # txid-merkle / witness-commitment SSOT. A failure is a money-path defect.
+# Also (7) the stratum latency refresh on Bip110WorkSource's worker registry,
+# which needs the work source TU (and blake2b.c for its pow.hpp callers). FOLDED
+# into this EXISTING allowlisted target rather than a new add_executable -- a new
+# one would silently report "Not Run" (see merged PR #868).
 add_executable(bip110_m3_serving_kat
     bip110_m3_serving_kat.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/stratum/work_source.cpp
+    ${CMAKE_SOURCE_DIR}/src/impl/bip110/crypto/blake2b.c
 )
 target_compile_definitions(bip110_m3_serving_kat PRIVATE __C2POOL_COIN_BIP110__=1)
 target_link_libraries(bip110_m3_serving_kat
