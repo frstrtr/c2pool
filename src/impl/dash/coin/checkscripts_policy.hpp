@@ -11,7 +11,8 @@
 ///
 /// Armed, the gate runs over every served mempool-tx input (the selector) and
 /// over every inject at admission (Mempool::add_inject, inject-script-invalid).
-/// Off, the inject lane refuses inject-script-check-unarmed.
+/// Off, the inject lane refuses inject-script-check-unarmed, and the served
+/// txs go unverified: kCheckscriptsOffConsequence is what the start log says.
 
 namespace dash {
 namespace coin {
@@ -20,6 +21,14 @@ struct CheckscriptsArm {
     bool        on;
     const char* reason;
 };
+
+/// The trade an operator makes with --embedded-fold-checkscripts=false
+/// (VERIFY-S2 S-3): an unverified script is a REJECTED BLOCK, not a lost fee.
+inline constexpr const char* kCheckscriptsOffConsequence =
+    "served mempool txs are NOT script-verified: a tx with a bad signature (dashd never relays "
+    "one; a peer that is not a dashd can) is SERVED, and dashd REJECTS the block it rides in - a "
+    "lost block, not a lost fee. Every inject is refused (inject-script-check-unarmed): none rides "
+    "unverified";
 
 inline CheckscriptsArm resolve_checkscripts_arm(bool flag_on, bool flag_off, bool view_armed, bool fold_live)
 {

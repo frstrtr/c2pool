@@ -7661,9 +7661,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                              "every served mempool-tx input and every inject at admission; "
                              "fail-closed exclude\n";
             } else {
-                LOG_WARNING << "[run] embedded-fold-checkscripts OFF: " << cs.reason
-                            << " -- served mempool txs are NOT script-verified; the inject lane "
-                               "refuses inject-script-check-unarmed";
+                LOG_WARNING << "[run] embedded-fold-checkscripts OFF: " << cs.reason << " -- "
+                            << dash::coin::kCheckscriptsOffConsequence;
             }
         }
 

@@ -1552,3 +1552,14 @@ TEST(DashTxInject, ConfirmedInjectsKeptAsDeepAsTheUndoKeep)
     ms.remember_confirmed_injects(empty, 200);
     EXPECT_EQ(ms.confirmed_injects_kept(), 0u);
 }
+
+// (VERIFY-S2 S-3) The checkscripts=false start warning names the real trade:
+// an unverified tx costs the block, not a fee.
+TEST(DashTxInject, CheckscriptsOffWarningNamesTheLostBlock)
+{
+    const std::string w = dash::coin::kCheckscriptsOffConsequence;
+    EXPECT_NE(w.find("NOT script-verified"), std::string::npos);
+    EXPECT_NE(w.find("REJECTS the block"), std::string::npos);
+    EXPECT_NE(w.find("lost block, not a lost fee"), std::string::npos);
+    EXPECT_NE(w.find("inject-script-check-unarmed"), std::string::npos);
+}
