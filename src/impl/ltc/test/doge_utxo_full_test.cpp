@@ -846,6 +846,42 @@ TEST(DogeUtxoBootstrap, TheColdStartWaitsForACaughtUpChain)
     EXPECT_NE(l.lane.fill().window, ltc::coin::COLD_START_WINDOW) << "the cold start's window outlived it";
 }
 
+// A restart near the tip (10 behind, keep 10) whose tip is over 2 h old: the
+// cold start is not decided and its gate skips every body above keep, so
+// the chase asks for none; decided (a fresh tip), it chases (VERIFY9 S3).
+TEST(DogeUtxoBootstrap, TheChaseWaitsForTheColdStartDecision)
+{
+    const uint256 g = genesis(0x75);
+    const auto chain = chain_with(g, 25);
+    GatedLane l(10);
+    l.net.peers = {"a", "b", "c"};
+    l.grow(std::vector<BlockType>(chain.begin(), chain.begin() + 15));
+    ASSERT_EQ(l.t.cache->get_best_height(), 15u);
+
+    // The restart: the same set, the header chain at 25, its tip 3 h old.
+    l.net.set_chain(chain, 1);
+    l.net.tip_age = 3 * 3600;
+    l.net.chase = true;
+    l.net.requested.clear();
+    l.net.peer_requests.clear();
+    UtxoLane restarted(*l.t.cache, *l.t.db, l.net.host(), 10, Mode::Accrual, 0);
+    for (int i = 0; i < 20; ++i) {
+        l.net.clock += std::chrono::seconds(1);
+        restarted.tick();
+    }
+    EXPECT_TRUE(l.net.requested.empty()) << "the chase asked h=" << l.net.requested.front()
+                                         << " before the cold start was decided";
+    EXPECT_EQ(restarted.stats().tip_chases.load(), 0u);
+
+    l.net.tip_age = 60;
+    for (int i = 0; i < 3; ++i) {
+        l.net.clock += std::chrono::seconds(1);
+        restarted.tick();
+    }
+    ASSERT_FALSE(l.net.requested.empty()) << "no chase once decided";
+    EXPECT_EQ(l.net.requested.front(), 16u);
+}
+
 // A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.
 TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
 {

@@ -1041,6 +1041,13 @@ private:
             m_chase_height = 0;
             return;
         }
+        // The accrual cold start not decided yet (a tip over 2 h old at the
+        // start): its gate skips every body above `keep`, a chased one too.
+        // The chase waits for the decision, as the Bootstrap does (VERIFY9 S3).
+        if (m_mode == Mode::Accrual && !m_bootstrap_done && best + 1 > m_keep && !cold_start_ready()) {
+            m_chase_height = 0;
+            return;
+        }
         // An accrual set more than `keep` behind (a restart after a while)
         // is the Bootstrap's: its first body above keep jumps to tip - keep.
         // A chased best + 1 landing first would take that body's place and
