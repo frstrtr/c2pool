@@ -1992,6 +1992,8 @@ public:
     bool rests_on_claims() const noexcept { return a() == nullptr; }
 
     const AttemptQueue& queue() const noexcept { return queue_; }
+    // The pair of the attempt taken from the queue and not yet applied (P-52: it lives); nullopt: none.
+    const std::optional<AttemptQueue::Pair>& running() const noexcept { return running_; }
     std::size_t release_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
         return queue_.release_waits(id, cause);
     }
@@ -2020,6 +2022,7 @@ public:
             if (!p) return std::nullopt;
             const auto li = links_.find(p->server);
             if (li == links_.end()) continue;
+            running_ = *p;
             JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
             att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
             att.set_force_young(p->young);
@@ -2038,6 +2041,7 @@ public:
     }
     AttemptReport apply(Attempted&& t) {
         const std::optional<AttemptQueue::Pair> p = t.pair;
+        running_.reset();
         AttemptReport rep = std::move(t.report);
         switch_ = SwitchReport{};
         switch (rep.end) {
@@ -2092,6 +2096,7 @@ private:
     std::unique_ptr<JoinedState> adopted_;
     const AdoptedChain* own_ = nullptr;
     std::set<Hash32> known_;
+    std::optional<AttemptQueue::Pair> running_;
     SwitchReport switch_;
     std::function<void(JoinedState&, std::uint64_t)> on_step_;
 };

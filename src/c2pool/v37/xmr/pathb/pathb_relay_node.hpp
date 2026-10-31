@@ -1561,6 +1561,10 @@ private:
             const NodeGuard g(*this);
             node_->disconnect(p);
             strip_gone_peer_asks_locked(p);
+            {  // a departure takes the peer's catch-up and hand-over out of the count: K_NCU's end evaluated (E-193)
+                std::lock_guard<std::mutex> lk(cumtx_);
+                caught_up_locked();
+            }
             std::lock_guard<std::mutex> lk(omtx_);
             omissions_.erase(p);
         });
@@ -2936,15 +2940,18 @@ private:
         caught_due_ = false;  // a catch-up open again
         catchup_ask_locked(p, c);
     }
-    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
-    // that ended its catch-up by the node's own decision; a hand-over to the joiner is no end, E-166 (v)) is caught up
-    // (its record leaves the store) once the node holds no frame it received and has not judged, and no parked frame
-    // whose parent it holds (E-193); until then the end is due and is tried again after each judged frame and at each
-    // tick.
+    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (those of peers whose connection
+    // is open: each HELLO tip held, or a reply that ended its catch-up by the node's own decision; a hand-over to the
+    // joiner whose pair lives is no end, E-166 (v)) is caught up (its record leaves the store) once the node holds no
+    // frame it received and has not judged, and no parked frame whose parent it holds (E-193); until then the end is
+    // due and is tried again after each judged frame and at each tick. Evaluated also at a departure and at an
+    // attempt's end.
     void caught_up_locked() {
         if (node_->caught_up()) handed_over_.clear();
-        // a due end keeps its first conjunct when the peers leave meanwhile
-        if (node_->caught_up() || !catchup_.empty() || handed_over_locked()
+        if (node_->attempt_server_gone()) return;  // an attempt open with a server that left: its own end first
+        // a kept attempt or an adoption ends K_NCU itself (kept_locked); with no peer left NoPathbPeer governs, and a
+        // due end keeps its first conjunct when the peers leave meanwhile
+        if (node_->caught_up() || node_->kept_due() || node_->adopt_due() || !catchup_.empty() || handed_over_locked()
             || (!node_->has_pathb_peer() && !caught_due_.load())) {
             caught_due_ = false;
             return;
@@ -2994,12 +3001,23 @@ private:
         std::lock_guard<std::mutex> lk(vmtx_);
         return vq_.empty() && parked_.empty() && vbusy_.load() == 0;
     }
-    // Under cumtx_: a catch-up handed to the joiner (an empty reply from position 0, JoinerPath) whose tip is still not
-    // held; a held one ended by its done test.
+    // Under the node lock and cumtx_: a catch-up handed to the joiner (an empty reply from position 0, JoinerPath)
+    // whose tip is still not held and whose (tip, server) pair lives; a held one ended by its done test, one whose pair
+    // no longer lives (its server excluded or gone, its attempt ended) holds nothing.
     bool handed_over_locked() {
         for (auto it = handed_over_.begin(); it != handed_over_.end();)
-            it = node_->holds_tip(it->second) ? handed_over_.erase(it) : std::next(it);
+            it = node_->holds_tip(it->second) || !node_->pair_lives(it->second, it->first) ? handed_over_.erase(it)
+                                                                                          : std::next(it);
         return !handed_over_.empty();
+    }
+    // Under the node lock and cumtx_: a catch-up handed to the joiner is recorded while its (tip, server) pair lives
+    // (P-52; no end, E-166 (v)); an offer that leaves no pair: the catch-up ended by its reply.
+    void hand_over_locked(std::uint64_t p, const Hash32& tip) {
+        if (node_->pair_lives(tip, p)) {
+            handed_over_[p] = tip;
+            return;
+        }
+        caught_up_locked();
     }
     // Under the node lock: a HELLO catch-up not ended toward a tip the node does not hold, open or handed to the
     // joiner (the template gate's claim case, E-194 (vi)).
@@ -3008,7 +3026,7 @@ private:
         for (const auto& [p, c] : catchup_)
             if (!node_->holds_tip(c.tip)) return true;
         for (const auto& [p, tip] : handed_over_)
-            if (!node_->holds_tip(tip)) return true;
+            if (!node_->holds_tip(tip) && node_->pair_lives(tip, p)) return true;
         return false;
     }
     // A reply frame's arrival at its link (E-194): the relay clock and the node lock's busy total now.
@@ -3110,18 +3128,21 @@ private:
                                     st_.empty_store_offers++;
                                     join = true;
                                 }
-                                handed_over_[p] = it->second.tip;  // handed to the joiner: no end (E-166 (v))
+                                const Hash32 tip = it->second.tip;
                                 catchup_.erase(it);
+                                hand_over_locked(p, tip);
                                 break;
                             }
                             // the node's own header work kept its chain: this catch-up ended by its reply
                             catchup_.erase(it);
                             caught_up_locked();
                             break;
-                        case K::JoinerPath:
-                            handed_over_[p] = it->second.tip;  // handed to the joiner: no end (E-166 (v))
+                        case K::JoinerPath: {
+                            const Hash32 tip = it->second.tip;
                             catchup_.erase(it);
+                            hand_over_locked(p, tip);
                             break;
+                        }
                         case K::Ban:
                         case K::Strike:
                         case K::Undecodable:  // the catch-up ended by its reply
@@ -3419,6 +3440,11 @@ private:
             if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt", s->report->what);
             if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
                 join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
+        }
+        {  // the attempt's end: a hand-over whose pair it ended (excluded, gone, not queued again) holds nothing
+            const NodeGuard g(*this);
+            std::lock_guard<std::mutex> lk(cumtx_);
+            caught_up_locked();
         }
         return s;
     }

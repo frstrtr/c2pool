@@ -692,6 +692,8 @@ public:
     }
     // An attempt runs (3.3a: A keeps building templates, relaying and judging meanwhile).
     bool attempting() const noexcept { return attempting_; }
+    // The pair of the attempt taken from the queue and not yet applied; nullopt: none.
+    const std::optional<AttemptQueue::Pair>& open_attempt() const noexcept { return joiner_->running(); }
     // E-72: the claimed leaves wait to be asked again after a switch by the journal (a joined store, in its session or
     // after a restart).
     bool reask_pending() const noexcept { return reask_pending_; }
@@ -846,6 +848,19 @@ public:
         const std::size_t before = joiner_->queue().size();
         offer(t.best_tip, peer, t.best_cum_work);
         return joiner_->queue().size() > before;
+    }
+    // P-52: the (tip, server) pair lives: queued, or the open attempt's (taken from the queue, not yet applied). The
+    // caller's hand-over to the joiner is recorded, and holds, only while its pair lives (E-193).
+    bool pair_lives(const Hash32& tip, std::uint64_t server) const {
+        for (const AttemptQueue::Pair& q : joiner_->queue().pairs())
+            if (q.candidate == tip && q.server == server) return true;
+        const std::optional<AttemptQueue::Pair>& r = open_attempt();
+        return r && r->candidate == tip && r->server == server;
+    }
+    // An attempt open with a server that left: K_NCU's end is not evaluated before the attempt's own end (E-193).
+    bool attempt_server_gone() const {
+        const std::optional<AttemptQueue::Pair>& r = open_attempt();
+        return r && peers_.count(r->server) == 0;
     }
     // Caught up (node policy; K_NCU): a store that started empty and was not launched here is not caught up until
     // every catch-up the caller started from a HELLO ended (its tip held, or its reply's own decision), a join adopts,
