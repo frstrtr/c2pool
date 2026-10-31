@@ -72,6 +72,7 @@ inline constexpr const char* kWriteFailed         = "utxo-snapshot-write-failed"
 inline constexpr const char* kDbNoBest            = "utxo-snapshot-db-no-best-block";
 inline constexpr const char* kDbCorrupt           = "utxo-snapshot-db-corrupt";
 inline constexpr const char* kCountChanged        = "utxo-snapshot-db-count-changed";
+inline constexpr const char* kSpentShapedCoin     = "utxo-snapshot-spent-shaped-coin";
 } // namespace snapshot_refusal
 
 // ─── Metadata ───────────────────────────────────────────────────────────────
@@ -282,6 +283,15 @@ struct SnapshotImportOptions {
     /// TEST ONLY: fail the write pass after this many coins have been
     /// committed (exercises the wipe-back-to-empty path). 0 = off.
     uint64_t test_fail_write_after{0};
+    /// Records written in the final synced batch together with 'B' (a node's
+    /// sync state and assumed-base record), so the set and what describes it
+    /// land at once or not at all.
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> final_records;
+    /// Refuse a coin with value 0 and an empty script. Core stores one like
+    /// any other coin, but core::coin::Coin::is_spent() reads it as "absent",
+    /// so a node whose paths rely on is_spent() refuses the set instead of
+    /// drifting silently (utxo-snapshot-spent-shaped-coin).
+    bool refuse_spent_shaped_coins{false};
 
     static core::LevelDBOptions default_db_options()
     {
@@ -346,11 +356,13 @@ SnapshotDumpResult dump_utxo_snapshot(core::LevelDBStore& store, const std::stri
 
 // ─── DB helpers ─────────────────────────────────────────────────────────────
 
-/// True when another process holds the LevelDB LOCK of `dir` (fcntl F_GETLK
-/// on <dir>/LOCK, the record lock LevelDB's env_posix takes). A missing LOCK
-/// file is not held. The probe opens and closes <dir>/LOCK: it must not run
-/// in a process that has this DB open (closing any descriptor of a file
-/// drops that process's own record locks on it).
+/// True when the LevelDB LOCK of `dir` is held: by this process (an open
+/// descriptor of <dir>/LOCK in /proc/self/fd, holder = our pid, checked first
+/// so the probe below never runs where closing a descriptor would drop our own
+/// record lock), or by another process (fcntl F_GETLK on <dir>/LOCK, the
+/// record lock LevelDB's env_posix takes). A missing LOCK file is not held.
+/// Without /proc (not Linux) the self check is skipped: there the caller must
+/// not probe a DB it has open.
 bool leveldb_dir_lock_held(const std::string& dir, long* holder_pid = nullptr);
 
 /// True when the store holds no key at all.

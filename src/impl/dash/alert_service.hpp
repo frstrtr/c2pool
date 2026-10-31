@@ -507,6 +507,20 @@ public:
         publish_status(now);
     }
 
+    /// The DASH full UTXO set withheld (Kind::UtxoWithheld): one page for the
+    /// episode, sent now to every configured relay. The lane withholds once
+    /// and never heals by itself, so there is no paired "resumed" kind; a
+    /// restart after the operator's fix starts a new episode. Origin only.
+    void raise_utxo_withheld(const std::string& detail, int64_t now)
+    {
+        if (!m_cfg.origin) return;
+        DetectorEvent ev;
+        ev.kind = Kind::UtxoWithheld;
+        ev.ts = now;
+        ev.detail = sanitize_utf8(detail.size() > 200 ? detail.substr(0, 200) : detail);
+        enqueue_event(ev, now);
+    }
+
     // Origin: queue one event for every configured relay and send it now.
     void enqueue_event(const DetectorEvent& ev, int64_t now)
     {

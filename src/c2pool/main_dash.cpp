@@ -75,6 +75,7 @@
 #include <impl/dash/coin/node_coin_state.hpp>  // dash::coin::NodeCoinState (embedded work bundle)
 #include <impl/dash/coin/fold_live_controller.hpp>  // dash::coin::FoldLiveController (PR-C1 live tip-tracking fold)
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>  // PR-C4 consensus-exact CheckInputScripts C API
+#include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: the script check defaults ON with a view
 #include <impl/dash/coin/arm_resolution.hpp>   // dash::coin::resolve_embedded_arm (#738 arm decision, one place)
 #include <impl/dash/coin/good_citizen_defaults.hpp>   // dash::coin::resolve_good_citizen_tx_serve — daemonless FULL-MEMPOOL default
 #include <impl/dash/coin/embedded_startup_invariant.hpp>  // C-startup-invariant: embedded fresh-gate => body-first serve tip
@@ -88,6 +89,8 @@
 #include <impl/dash/coin/llmq_type_reconciler.hpp>  // negative-capable enabled_llmqs backstop
 #include <impl/dash/coin/quorum_member_source.hpp>  // E1 Phase-L: daemonless member-set sourcing (the provider)
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
+#include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
+#include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
@@ -270,6 +273,17 @@ const char* const kDashMnCheckpointTestnet =
 uint32_t g_mn_bridge_max_blocks =
     dash::coin::MnCheckpointLane::kDefaultMaxBridgeBlocks;
 
+// S2 (DASH full UTXO set from a pinned snapshot). File scope for the same
+// reason as g_mn_bridge_max_blocks: written once while parsing argv, read in
+// run_node.
+struct UtxoSnapshotCli {
+    std::string file;                 // --embedded-utxo-snapshot / --utxo-snapshot FILE
+    std::string pin_file;             // --embedded-utxo-snapshot-pin PINFILE
+    bool        full_off{false};      // --embedded-utxo-full=false: open the accrual view
+    std::string import_file;          // --utxo-import FILE: import into the full-set dir and exit
+};
+UtxoSnapshotCli g_utxo_snapshot;
+
 // --embedded-mn-bridge-no-cursor (#91): DISABLE the bridge's resumable replay
 // cursor, so every process start replays the whole window from the pinned
 // anchor — exactly the behaviour before #91 existed.
@@ -376,6 +390,11 @@ struct AlertRelayCli {
     bool any() const { return origin || telegram || forward; }
 };
 AlertRelayCli g_alert_relay;
+
+// --embedded-fold-checkscripts=false (S3a): opt out of the consensus-exact
+// script check that is now armed by default whenever a view exists. Same
+// file-scope posture as g_mn_bridge_max_blocks.
+bool g_embedded_fold_checkscripts_off = false;
 
 // Strict non-negative integer parse for the --alert-relay-* numeric knobs.
 static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
@@ -528,6 +547,13 @@ void print_banner(const char* argv0)
         << "           [--embedded-asn-diversity]\n"
         << "           [--embedded-mn-bridge-no-cursor]\n"
         << "           [--embedded-utxo-immature-serve-empty] [--embedded-serve-mempool-txs[=false]]\n"
+        << "           [--embedded-utxo-snapshot FILE] [--embedded-utxo-snapshot-pin PINFILE]\n"
+        << "           [--embedded-utxo-full=false]\n"
+        << "       " << argv0 << " --utxo-import FILE[,PART...] [--embedded-utxo-snapshot-pin PINFILE]\n"
+        << "             (import into <datadir>/<net>/utxo_full_leveldb and exit; safe beside a\n"
+        << "              running node that is not using that set; the next start opens it)\n"
+        << "             (full UTXO set: import a pinned dumptxoutset into <net>/utxo_full_leveldb\n"
+        << "              at start, then connect strictly from its base; alias --utxo-snapshot)\n"
         << "           [--embedded-tx-serve-own-set[=false]]\n"
         << "             (ALL embedded serving levers default ON when NO dashd arm is given —\n"
         << "              bare `--run` = daemonless, serves the FULL mempool + special txs (DIP\n"
@@ -535,7 +561,7 @@ void print_banner(const char* argv0)
         << "           [--embedded-fresh-datum-race] [--embedded-fresh-datum-race-k N]\n"
         << "           [--embedded-getmnlistd-tracker]\n"
         << "           [--embedded-fold-live PATH] [--embedded-fold-live-expect HASH]\n"
-        << "           [--embedded-fold-checkscripts]\n"
+        << "           [--embedded-fold-checkscripts[=false]]\n"
         << "           [--embedded-tx-inject] [--embedded-tx-inject-hex FILE]\n"
         << "           [--control-plane-token-file FILE]\n"
         << "           [--alert-relay-origin --alert-relay-to PUBHEX... [--alert-relay-label STR]]\n"
@@ -3209,8 +3235,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     if (embedded_tx_inject) {
         std::cout << "[run] embedded-tx-inject ARMED (#157): miner/user tx-injection "
                      "ON -- submitted txs ride the block with priority through the "
-                     "SAME validity gate; reward path byte-unchanged. Requires "
-                     "--embedded-fold-checkscripts + the served-body posture. M2 "
+                     "SAME validity gate; reward path byte-unchanged. Needs the "
+                     "script check (armed by default with --embedded-utxo, S3a) + "
+                     "the served-body posture. M2 "
                      "peer tx_inject transport is live (first-see fan-out, "
                      "per-peer DoS guard).\n";
     }
@@ -3276,6 +3303,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     flags = req["flags"].get<uint32_t>();
                 if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
                     expiry = req["expiry_height"].get<int32_t>();
+                // S2: the fee the operator allows (duffs). Default 0: the
+                // zero-fee sweep; a fee-paying tx the operator did not ask for
+                // refuses inject-fee-above-max.
+                uint64_t max_fee = 0;
+                if (req.contains("max_fee")) {
+                    if (!req["max_fee"].is_number_unsigned())
+                        return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
+                                              {"http_status", 400}};
+                    max_fee = req["max_fee"].get<uint64_t>();
+                }
                 dash::coin::MutableTransaction tx;
                 try {
                     auto raw = ParseHex(hex);
@@ -3291,7 +3328,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // rate, never the aggregate-peer budget a flood can exhaust.
                 auto r = node_coin_state.submit_inject(
                     tx, flags, expiry,
-                    dash::coin::NodeCoinState::InjectOrigin::Local);
+                    dash::coin::NodeCoinState::InjectOrigin::Local, max_fee);
                 // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
                 const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
                 return nlohmann::json{
@@ -3561,10 +3598,78 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         [&payee_feeder](const dash::interfaces::BlockConnected& bc) {
             payee_feeder.on_block_connected(bc);
         });
+    // S2: the full UTXO set (DESIGN 4.3). <net>/utxo_full_leveldb is opened
+    // instead of the accrual view when it holds a set that passes the S2-2
+    // rule; --embedded-utxo-snapshot FILE imports one there first when the
+    // directory holds none (idempotent: a present set is never re-imported).
+    // Any refusal is loud and leaves the node on the accrual view (today's
+    // behaviour). The base is placed on the header chain by the lane before
+    // the set connects or prices anything at the tip.
+    std::string utxo_full_refusal;   // for the status line
+    double      utxo_import_seconds = -1;
+    if (embedded_utxo && !g_utxo_snapshot.full_off) {
+        const std::string net_name = testnet ? "testnet" : "mainnet";
+        const auto chain_params = testnet ? dash::coin::make_dash_chain_params_testnet()
+                                          : dash::coin::make_dash_chain_params_mainnet();
+        const uint32_t min_base = chain_params.fast_start_checkpoint
+                                      ? chain_params.fast_start_checkpoint->height : 0;
+        const auto full_path = (core::filesystem::config_path()
+            / net_subdir / "utxo_full_leveldb").string();
+        auto full = dash::coin::open_dash_full_utxo_set(full_path, net_name, min_base);
+        const bool importable = !full.ok()
+            && (full.absent || full.refusal == dash::coin::utxo_snapshot_refusal::kFullDbEmpty);
+        if (importable && !g_utxo_snapshot.file.empty()) {
+            full.db.reset();
+            const auto pin = dash::coin::load_dash_utxo_pin(g_utxo_snapshot.pin_file, net_name);
+            std::vector<std::string> parts;
+            {
+                std::stringstream ps(g_utxo_snapshot.file);
+                std::string part;
+                while (std::getline(ps, part, ',')) if (!part.empty()) parts.push_back(part);
+            }
+            std::cout << "[run] UTXO snapshot import: " << g_utxo_snapshot.file << " -> " << full_path
+                      << " against the " << pin.source << " pin"
+                      << (pin.pin ? " (height " + std::to_string(pin.pin->height) + ", "
+                                        + std::to_string(pin.pin->coins) + " coins)"
+                                  : std::string()) << "\n";
+            dash::coin::DashUtxoImportConfig cfg;
+            cfg.network = net_name;
+            cfg.min_base_height = min_base;
+            cfg.log = [](const std::string& l) { std::cout << "[run] " << l << "\n"; };
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = dash::coin::import_dash_utxo_snapshot(parts, full_path, pin, cfg);
+            utxo_import_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (res.ok) {
+                std::cout << "[run] UTXO snapshot IMPORTED: coins=" << res.coins
+                          << " base=" << res.best_height << " " << res.base_blockhash.GetHex()
+                          << " muhash=" << res.hashes.muhash.GetHex()
+                          << " hash_serialized_2=" << res.hashes.hash_serialized_2.GetHex()
+                          << " in " << static_cast<long>(utxo_import_seconds) << " s (verify "
+                          << static_cast<long>(res.verify_seconds) << " s, write "
+                          << static_cast<long>(res.write_seconds) << " s)\n";
+                full = dash::coin::open_dash_full_utxo_set(full_path, net_name, min_base);
+            } else {
+                utxo_full_refusal = res.refusal + ": " + res.detail;
+                LOG_ERROR << "[run] UTXO snapshot import REFUSED " << utxo_full_refusal
+                          << " -- the node stays on the accrual view";
+            }
+        }
+        if (full.ok()) {
+            utxo_lane.open_full(std::move(full.db), full.assumed, min_base);
+            std::cout << "[run] UTXO set: FULL at " << full_path << " base=" << full.assumed.base_height
+                      << " " << full.assumed.base_hash.GetHex() << " validated=" << int(full.assumed.validated)
+                      << " (strict connect from the base; never jumps; withholds on a refusal)\n";
+        } else if (!full.absent && !full.refusal.empty()
+                   && full.refusal != dash::coin::utxo_snapshot_refusal::kFullDbEmpty) {
+            utxo_full_refusal = full.refusal + ": " + full.detail;
+            LOG_ERROR << "[run] UTXO full set REFUSED " << utxo_full_refusal
+                      << " -- the node stays on the accrual view";
+        }
+    }
     if (embedded_utxo) {
         const auto utxo_path = (core::filesystem::config_path()
             / net_subdir / "utxo_leveldb").string();
-        if (utxo_lane.open(utxo_path)) {
+        if (utxo_lane.full() || utxo_lane.open(utxo_path)) {
             utxo_lane.attach(node_coin_state.mempool());
             // Mining gate: coinbase_maturity + reorg buffer = 100 + 6 = 106
             // (DASH_MINING_GATE_DEPTH, utxo_adapter.hpp; mirrors the LTC
@@ -3627,7 +3732,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         utxo_lane.db()->prune_raw_blocks(bc.height, DASH_EXPLORER_DEPTH);
                     }
                 });
-            std::cout << "[run] embedded UTXO/fee lane ARMED: db=" << utxo_path
+            std::cout << "[run] embedded UTXO/fee lane ARMED: db="
+                      << (utxo_lane.full() ? std::string("utxo_full_leveldb (FULL set)") : utxo_path)
                       << " best_height=" << utxo_lane.cache()->get_best_height()
                       << " (mempool fee pricing live; block feed = E1/E2a leg;"
                          " maturity gate " << dash::coin::DASH_MINING_GATE_DEPTH
@@ -5700,7 +5806,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // ioc.run() returns, BEFORE header_chain / coin_p2p unwind.
             web_server->get_mining_interface()->set_coin_sync_status_fn(
                 [hc = header_chain.get(), cp = coin_p2p.get(),
-                 lanes = dml_lanes]() -> nlohmann::json {
+                 lanes = dml_lanes, &utxo_lane, &utxo_full_refusal,
+                 &utxo_import_seconds]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -5758,6 +5865,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         {"oracle_refused_unchanged", lanes->oracle_refused_unchanged()},
                         {"replay_refused_unchanged", lanes->replay_refused_unchanged()},
                     };
+                    // S2: the UTXO set (full / accrual), passed through as-is.
+                    s["utxo"] = dash::coin::utxo_status_json(utxo_lane, utxo_full_refusal,
+                                                             utxo_import_seconds);
                     return s;
                 });
         }
@@ -7508,27 +7618,6 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return ctl->at_tip(hc->height(), hash_at);
                 });
 
-            // PR-C4 (embedded-fold-checkscripts): wire dashcore's consensus-exact
-            // VerifyScript as the per-input serve-path script gate. Armed ONLY
-            // when --embedded-fold-checkscripts is set (and the fold is live --
-            // this block only runs when fold_live_ctl exists). The mempool
-            // resolves each input's coin scriptPubKey from the at-tip fold and
-            // calls this to confirm the scriptSig satisfies it; any failure drops
-            // the tx from the template (fail-closed). Unset => the selector runs
-            // no check (byte-identical to master). Reward-safe: can only DROP.
-            if (embedded_fold_checkscripts) {
-                node_coin_state.set_script_check(
-                    [](const std::vector<uint8_t>& tx_bytes, uint32_t nIn,
-                       const std::vector<uint8_t>& spk, uint32_t flags) -> bool {
-                        return c2pool_dash_verify_input(
-                                   spk.data(), (unsigned)spk.size(),
-                                   tx_bytes.data(), (unsigned)tx_bytes.size(),
-                                   nIn, flags) == 1;
-                    });
-                std::cout << "[run] embedded-fold-checkscripts ARMED: consensus-exact "
-                             "CheckInputScripts (dashcore VerifyScript) over every served "
-                             "mempool-tx input against the at-tip fold; fail-closed exclude\n";
-            }
             node_coin_state.set_pin_external_coin_lookup(
                 [ctl, hc, hash_at, rpc_pin_lookup](
                     const ::core::coin::Outpoint& op,
@@ -7544,6 +7633,37 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                          "advance-on-connect + reorg-undo + at-tip serving guard "
                          "(fold consulted only while fold_height >= serve_tip and "
                          "chain-identical; behind tip => fee-unknown = master)\n";
+        }
+
+        // S3a: arm dashcore's consensus-exact VerifyScript as the per-input
+        // gate whenever an at-tip scriptPubKey source exists: the --embedded-utxo
+        // view (accrual or the full set) or the C1 fold. resolve_input_spk_locked
+        // reads the view first, then an in-pool parent, then the fold, so every
+        // fee_fold_proven tx's prevouts resolve here too. Armed, the selector
+        // checks every served mempool-tx input and add_inject checks every
+        // inject at admission (inject-script-invalid). Reward-safe: it only
+        // excludes / refuses. --embedded-fold-checkscripts=false opts out.
+        {
+            const auto cs = dash::coin::resolve_checkscripts_arm(
+                embedded_fold_checkscripts, g_embedded_fold_checkscripts_off,
+                utxo_lane.cache() != nullptr, static_cast<bool>(fold_live_ctl));
+            if (cs.on) {
+                node_coin_state.set_script_check(
+                    [](const std::vector<uint8_t>& tx_bytes, uint32_t nIn,
+                       const std::vector<uint8_t>& spk, uint32_t flags) -> bool {
+                        return c2pool_dash_verify_input(
+                                   spk.data(), (unsigned)spk.size(),
+                                   tx_bytes.data(), (unsigned)tx_bytes.size(),
+                                   nIn, flags) == 1;
+                    });
+                std::cout << "[run] embedded-fold-checkscripts ARMED (" << cs.reason
+                          << "): consensus-exact CheckInputScripts (dashcore VerifyScript) over "
+                             "every served mempool-tx input and every inject at admission; "
+                             "fail-closed exclude\n";
+            } else {
+                LOG_WARNING << "[run] embedded-fold-checkscripts OFF: " << cs.reason << " -- "
+                            << dash::coin::kCheckscriptsOffConsequence;
+            }
         }
 
         // #157 (--embedded-tx-inject-hex): local submit path (M1). Parse the
@@ -7589,7 +7709,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             }
             if (inj_load_ok && !inj_txs.empty()) {
                 for (auto& tx : inj_txs) {
-                    auto r = node_coin_state.submit_inject(tx);
+                    // S2: the file loader is a local operator submit: max_fee 0.
+                    auto r = node_coin_state.submit_inject(
+                        tx, 0, 0, dash::coin::NodeCoinState::InjectOrigin::Local, /*max_fee=*/0);
                     std::cout << "[run] tx-inject submit txid="
                               << r.txid.GetHex().substr(0, 16)
                               << " => " << r.cause
@@ -7833,7 +7955,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
              &payee_feeder,
              // PoSe oracle (PR-B): constructed later in this function; a tip
              // change drives its reorg check + fetch window immediately.
-             &pose_oracle]
+             &pose_oracle,
+             // S2 full UTXO set: a header past the set's best is a height to
+             // fill (and a reorg below it a rewind) without waiting for an inv.
+             &utxo_lane]
             (const uint256&, uint32_t, const uint256& new_tip, uint32_t new_height,
              bool was_reorg) {
                 // E2d bridge driver. Safe + REACHABLE here: HeaderChain fires
@@ -7846,6 +7971,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 // No-op unless the lane was armed on the daemonless path.
                 if (mnl) mnl->pump();
                 payee_feeder.on_tip_changed();
+                utxo_lane.on_header_tip(new_height);
                 if (pose_oracle) pose_oracle->on_tick();
                 // #108 QC-PREFETCH: ask for the member sets this DKG cycle
                 // will need while the tip is still ~10 blocks short of the
@@ -7980,6 +8106,21 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // is active, so dead sends and lost bodies recover without waiting
             // for the next live block.
             utxo_lane.arm_stall_timer(ioc);
+            // S2 full set: the header chain places the base, judges every body
+            // and drives the rewind; a withhold reaches the alert relay.
+            if (utxo_lane.full()) {
+                utxo_lane.set_hash_at_fn(
+                    [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                        if (auto e = hc->get_header_by_height(h)) return e->hash;
+                        return std::nullopt;
+                    });
+                utxo_lane.set_alert_fn(
+                    [&alert_relay](const std::string& event, const std::string& detail) {
+                        if (alert_relay)
+                            alert_relay->raise_utxo_withheld(event + ": " + detail, core::timestamp());
+                    });
+                utxo_lane.on_header_tip(header_chain->height());
+            }
         }
 
         // Peer's reported chain height -> header-chain sync-progress gauge.
@@ -10834,7 +10975,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
 
         *diag_tick = [diag_timer, diag_tick, ticks, diag_mi, embed_shape,
                       embed_since, embed_last, &node_coin_state, &maintainer,
-                      dml_lanes,
+                      dml_lanes, &utxo_lane,
                       &header_chain, &mn_ckpt_lane,
                       ws_ri = work_source.get(), &stratum_server](
                          const boost::system::error_code& ec) {
@@ -10874,7 +11015,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                       << (node_coin_state.have_sml() ? 1 : 0) << '|'
                       << (node_coin_state.mn_needs_reseed() ? 1 : 0) << '|'
                       << (node_coin_state.tip_body_pending_dbg() ? 1 : 0) << '|'
-                      << (mn_ckpt_lane ? mn_ckpt_lane->state_name() : "none");
+                      << (mn_ckpt_lane ? mn_ckpt_lane->state_name() : "none")
+                      // S2: the full set's state is part of the shape (a
+                      // withhold is a shape change); its best height is not.
+                      << '|' << (utxo_lane.full() ? utxo_lane.full_status().state
+                                                  : std::string(utxo_lane.live() ? "accrual" : "off"));
                 const int64_t now = ddiag::steady_now_ms();
                 const bool changed = shape.str() != *embed_shape;
                 // 5-minute heartbeat: an UNCHANGED state must still prove it is
@@ -10907,6 +11052,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                                       : std::string("n/a"))
                         << " reseed_latch="
                         << (node_coin_state.mn_needs_reseed() ? 1 : 0)
+                        << " " << dash::coin::utxo_status_line(utxo_lane)
                         // Body-first transient (landed on master after this
                         // branch point): a known-newer header tip whose block
                         // body / tip-targeted cbTx has not been parsed yet. It
@@ -11862,6 +12008,15 @@ int main(int argc, char** argv)
             embedded_utxo = true;
         else if (std::strcmp(argv[i], "--embedded-utxo=false") == 0)
             embedded_utxo_off = true;               // good-citizen opt-out
+        else if ((std::strcmp(argv[i], "--embedded-utxo-snapshot") == 0
+                  || std::strcmp(argv[i], "--utxo-snapshot") == 0) && i + 1 < argc)
+            g_utxo_snapshot.file = argv[++i];       // S2: import a pinned snapshot at start
+        else if (std::strcmp(argv[i], "--embedded-utxo-snapshot-pin") == 0 && i + 1 < argc)
+            g_utxo_snapshot.pin_file = argv[++i];   // S2: pin for a snapshot newer than the built-in one
+        else if (std::strcmp(argv[i], "--embedded-utxo-full=false") == 0)
+            g_utxo_snapshot.full_off = true;        // S2: rollback to the accrual view
+        else if (std::strcmp(argv[i], "--utxo-import") == 0 && i + 1 < argc)
+            g_utxo_snapshot.import_file = argv[++i];  // S2: offline import, exits
         else if (std::strcmp(argv[i], "--explorer") == 0)
             explorer_enabled = true;
         else if (std::strcmp(argv[i], "--no-explorer") == 0)
@@ -11938,6 +12093,8 @@ int main(int argc, char** argv)
             embedded_fold_live_expect = argv[++i];  // PR-C1: store hash_serialized_2 verify (D)
         else if (std::strcmp(argv[i], "--embedded-fold-checkscripts") == 0)
             embedded_fold_checkscripts = true;  // PR-C4: consensus-exact input-script check on the served template
+        else if (std::strcmp(argv[i], "--embedded-fold-checkscripts=false") == 0)
+            g_embedded_fold_checkscripts_off = true;  // S3a opt-out (the check defaults ON with a view)
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock") == 0)
             embedded_ingest_isdlock = true;   // G4 conflict-tx-lock feed
         else if (std::strcmp(argv[i], "--embedded-ingest-isdlock=false") == 0)
@@ -12416,6 +12573,59 @@ int main(int argc, char** argv)
     // Both values were validated (and lower-cased) on the merged file+CLI value
     // in the settings block above, before the --dump-resolved-config exit.
     dash::apply_sharechain_identity(named_network, network_id_hex, prefix_hex_cli);
+
+    // S2: --utxo-import FILE[,PART...]. The full set's offline import: the same
+    // pin, checks and records as the import at start, into the directory a
+    // node of this --data-dir / network opens as its full set. It runs and
+    // EXITS, so an operator imports beside the node still serving on the
+    // accrual view and restarts once. A present set is never re-imported; a
+    // directory another process holds is refused by name.
+    if (!g_utxo_snapshot.import_file.empty()) {
+        const std::string net_name = testnet ? "testnet" : "mainnet";
+        const auto chain_params = testnet ? dash::coin::make_dash_chain_params_testnet()
+                                          : dash::coin::make_dash_chain_params_mainnet();
+        const uint32_t min_base = chain_params.fast_start_checkpoint
+                                      ? chain_params.fast_start_checkpoint->height : 0;
+        const auto full_path = (core::filesystem::config_path()
+            / dash::SharechainConfig::data_subdir(testnet) / "utxo_full_leveldb").string();
+        auto probe = dash::coin::open_dash_full_utxo_set(full_path, net_name, min_base);
+        if (probe.ok()) {
+            std::cout << "[UTXO-IMPORT] " << full_path << " already holds a full set (base "
+                      << probe.assumed.base_height << " " << probe.assumed.base_hash.GetHex()
+                      << "); nothing imported\n";
+            return 0;
+        }
+        if (!probe.absent && probe.refusal != dash::coin::utxo_snapshot_refusal::kFullDbEmpty) {
+            std::cout << "[UTXO-IMPORT] REFUSED " << probe.refusal << ": " << probe.detail << "\n";
+            return 1;
+        }
+        probe.db.reset();
+        const auto pin = dash::coin::load_dash_utxo_pin(g_utxo_snapshot.pin_file, net_name);
+        std::vector<std::string> parts;
+        {
+            std::stringstream ps(g_utxo_snapshot.import_file);
+            std::string part;
+            while (std::getline(ps, part, ',')) if (!part.empty()) parts.push_back(part);
+        }
+        dash::coin::DashUtxoImportConfig cfg;
+        cfg.network = net_name;
+        cfg.min_base_height = min_base;
+        cfg.log = [](const std::string& l) { std::cout << l << "\n"; };
+        std::cout << "[UTXO-IMPORT] " << g_utxo_snapshot.import_file << " -> " << full_path
+                  << " against the " << pin.source << " pin\n";
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto res = dash::coin::import_dash_utxo_snapshot(parts, full_path, pin, cfg);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (!res.ok) {
+            std::cout << "[UTXO-IMPORT] REFUSED " << res.refusal << ": " << res.detail << "\n";
+            return 1;
+        }
+        std::cout << "[UTXO-IMPORT] IMPORTED coins=" << res.coins << " base=" << res.best_height << " "
+                  << res.base_blockhash.GetHex() << " muhash=" << res.hashes.muhash.GetHex()
+                  << " in " << static_cast<long>(secs) << " s; the next start of this node opens it"
+                  << " (its base is placed on the header chain before it is used)\n";
+        return 0;
+    }
 
     // D-MINER.7 key exchange helper: create-or-load the alert key (same default
     // path run_node uses, identity-scoped by --testnet / --network-id), print

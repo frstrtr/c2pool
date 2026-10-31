@@ -206,3 +206,42 @@ against **real captured testnet data** —
 generator from a real `protx list valid true 1519543`) replayed over the real
 accepted blocks 1519544–1519546 — in `test/test_dash_mn_checkpoint.cpp`. That
 fixture is a 6-masternode KAT subset and is **not** a shippable anchor.
+
+# UTXO snapshot — a second trust anchor
+
+`dash_utxo_snapshot_mainnet.inc` pins a Dash Core `dumptxoutset` file: the
+full UTXO set at one block. A node given that file with
+`--embedded-utxo-snapshot FILE` (alias `--utxo-snapshot`) imports it into
+`<datadir>/dash/utxo_full_leveldb` at start and then runs on the full set
+(strict connect from the snapshot's base; it never jumps and withholds on a
+refusal). Without a matching pin the file is never loaded.
+
+What the pin binds (`c2pool-utxo-snapshot/1`, parsed by
+`core/coin/utxo_snapshot.hpp`):
+
+| line | checked at import |
+|---|---|
+| `network`, `coin` | must be the node's (`mainnet`, `dash`) |
+| `height`, `blockhash` | the file's base hash; the lane refuses to use the set until the header chain holds that hash at that height (at or above the 2549400 checkpoint) |
+| `coins` | the file's coin count and the number of coins decoded |
+| `muhash` | MuHash3072 over the decoded set (`gettxoutsetinfo muhash`) |
+| `hash_serialized_2` | the legacy set hash (`dumptxoutset` `txoutset_hash`) |
+| `parts`, `part i SIZE SHA256` | each part's size and sha256 |
+| `url`, `sources`, `generated` | provenance (not checked) |
+| `digest` | SHA-256 over every other line (same rule as the MN checkpoint) |
+
+The 2564044 pin: dumped on VM210 (dashd 23.1.7, coinstatsindex) at
+2026-10-30T18:06Z; its muhash was answered by two independent dashd at the
+same height (VM210 coinstatsindex; the tertiary at its tip). The published
+pin of a release needs a third witness (DESIGN §5.1).
+
+To make a pin for a new snapshot:
+
+```
+c2pool-utxo --dump-utxo-snapshot-pin FILE --coin dash --network mainnet \
+    --height H --url URL --sources "vm210:coinstatsindex ..." --inc
+```
+
+then compare its `muhash` with `gettxoutsetinfo muhash H` on at least two
+independent dashd before committing it. A node can take a newer pin without a
+release through `--embedded-utxo-snapshot-pin PINFILE` (same text, digest-gated).

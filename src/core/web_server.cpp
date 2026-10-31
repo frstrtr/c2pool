@@ -5430,6 +5430,9 @@ nlohmann::json MiningInterface::rest_local_stats()
             // absent for every other coin.
             if (css.is_object() && css.contains("dml_fold") && css["dml_fold"].is_object())
                 result["dml_fold"] = css["dml_fold"];
+            // The coin's UTXO set (DASH: full / accrual, assumeutxo state).
+            if (css.is_object() && css.contains("utxo") && css["utxo"].is_object())
+                result["utxo"] = css["utxo"];
         }
 
         // 1. Coin block-source contact check (issue #1482).
