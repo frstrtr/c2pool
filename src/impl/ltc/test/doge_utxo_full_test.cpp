@@ -396,6 +396,139 @@ TEST(DogeUtxoFull, ZeroValueOutputIsACoin)
     EXPECT_FALSE(l.t.cache->have_coin(Outpoint(txid_of(z), 1))) << "spent at 3";
 }
 
+namespace {
+
+/// A chain a1..a4 whose a2 creates a coin with value 0 and an empty
+/// scriptPubKey (z:1) and whose a3 spends it with OP_1, and a heavier branch
+/// b3 b4 b5 forking at a2 whose b3 spends the same coin.
+struct SpentShapedChains {
+    MutableTransaction z;
+    Outpoint coin;
+    std::vector<BlockType> a, b;
+
+    explicit SpentShapedChains(const uint256& g)
+    {
+        const auto pre = chain_with(g, 1);
+        z = spend(txid_of(pre[0].m_txs[0]), 0, DOGE_SUBSIDY - 1000, 0x61);
+        TxOut empty;
+        empty.value = 0;  // and no scriptPubKey
+        z.vout.push_back(empty);
+        coin = Outpoint(txid_of(z), 1);
+        auto spend_it = [&](uint8_t tag) {
+            auto t = spend(coin.txid, coin.index, 0, tag);
+            t.vin[0].scriptSig.m_data = {0x51};  // OP_1 satisfies the empty script
+            return t;
+        };
+        a = chain_with(g, 4, {{2, {z}}, {3, {spend_it(0x62)}}});
+        const BlockType b3 = make_block(hash_of(a[1]), 3, 0x63, {spend_it(0x63)});
+        const auto b45 = make_chain(hash_of(b3), 4, 2, 0x64);
+        b = {a[0], a[1], b3, b45[0], b45[1]};
+    }
+};
+
+} // namespace
+
+// A coin with value 0 and an empty scriptPubKey is a coin in Dogecoin Core's
+// chainstate (coins.cpp AddCoin skips only IsUnspendable; Coin::IsSpent is
+// nValue == -1). The strict connect keeps it and a later block spends it;
+// but Coin::is_spent() reads that shape as "not in the view at connect", so
+// a rewind skipped it: a reorg undoing the block that spent it left the set
+// without the coin, and the new branch spending it again was refused for
+// good (the set stuck, templates coinbase-only). The full set's rewind puts
+// back every coin of its strict records.
+TEST(DogeUtxoFull, SpentShapedCoinIsRestoredByARewind)
+{
+    const uint256 g = genesis(0x61);
+    const SpentShapedChains c(g);
+    Lane l(20, Mode::Full, 16);
+    l.net.set_chain(c.a, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(c.a[3], hash_of(c.a[3]), 4);
+    serve(l.lane, l.net, c.a);
+    ASSERT_EQ(l.t.cache->get_best_height(), 4u);
+    EXPECT_EQ(l.lane.stats().strict_refusals.load(), 0u) << "a3 spends the (0, empty) coin";
+    EXPECT_FALSE(l.t.cache->have_coin(c.coin)) << "spent at 3";
+    EXPECT_EQ(l.t.cache->sync_state().coins, 5u);
+
+    l.net.requested.clear();
+    EXPECT_TRUE(l.switch_to(c.b, 1));
+    ASSERT_EQ(l.t.cache->get_best_block(), hash_of(c.a[1])) << "walked back to the fork";
+    core::coin::Coin back;
+    ASSERT_TRUE(l.t.cache->get_coin(c.coin, back)) << "the rewind did not put the (0, empty) coin back";
+    EXPECT_EQ(back.value, 0);
+    EXPECT_TRUE(back.scriptPubKey.m_data.empty());
+    EXPECT_EQ(back.height, 2u);
+    EXPECT_FALSE(back.coinbase);
+    EXPECT_EQ(l.t.cache->sync_state().coins, 3u);
+
+    serve(l.lane, l.net, c.b);
+    EXPECT_EQ(l.lane.stats().strict_refusals.load(), 0u) << "b3 spends the coin again";
+    EXPECT_FALSE(l.lane.stuck());
+    EXPECT_EQ(l.t.cache->get_best_height(), 5u);
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(c.b[4]));
+    EXPECT_FALSE(l.t.cache->have_coin(c.coin));
+    EXPECT_EQ(l.t.cache->sync_state().coins, 6u);
+
+    // Exactly the set built on b directly (--utxo-digest).
+    Lane d(20, Mode::Full, 16);
+    d.net.set_chain(c.b, 1);
+    d.net.best[0] = g;
+    d.lane.on_block(c.b[4], hash_of(c.b[4]), 5);
+    serve(d.lane, d.net, c.b);
+    ASSERT_EQ(d.t.cache->get_best_height(), 5u);
+    const auto dl = core::coin::utxo_digest(*l.t.db);
+    const auto dd = core::coin::utxo_digest(*d.t.db);
+    ASSERT_TRUE(dl.ok && dd.ok);
+    EXPECT_EQ(dl.coins, dd.coins);
+    EXPECT_EQ(dl.sha256_hex, dd.sha256_hex) << "the rewound and rebuilt set is not the set of b";
+}
+
+// The digest counts a (0, empty) coin like any other: it is a 'C' record of
+// the full set's DB from its block until a block spends it.
+TEST(DogeUtxoFull, SpentShapedCoinIsARecordOfTheSet)
+{
+    const uint256 g = genesis(0x65);
+    const SpentShapedChains c(g);
+    Lane l(20, Mode::Full, 16);
+    l.net.set_chain(std::vector<BlockType>(c.a.begin(), c.a.begin() + 2), 1);
+    l.net.best[0] = g;
+    l.lane.on_block(c.a[1], hash_of(c.a[1]), 2);
+    serve(l.lane, l.net, c.a);
+    ASSERT_EQ(l.t.cache->get_best_height(), 2u);
+    core::coin::Coin held;
+    ASSERT_TRUE(l.t.db->get_coin(c.coin, held)) << "the DB does not hold the (0, empty) coin";
+    EXPECT_EQ(held.value, 0);
+    EXPECT_TRUE(held.scriptPubKey.m_data.empty());
+    const auto d = core::coin::utxo_digest(*l.t.db);
+    ASSERT_TRUE(d.ok);
+    EXPECT_EQ(d.coins, 3u) << "cb2, z:0, z:1";
+    EXPECT_EQ(d.coins, l.t.cache->sync_state().coins);
+}
+
+// The accrual view drops zero-value outputs (a partial view: an input it
+// does not hold is recorded as unknown, never refused). The same chains,
+// reorg included, connect to b5 without a refusal or a stuck set, and the
+// coin is never held.
+TEST(DogeUtxoOrder, AccrualViewPassesASpentShapedCoinThroughAReorg)
+{
+    const uint256 g = genesis(0x66);
+    const SpentShapedChains c(g);
+    Lane l;
+    l.grow(c.a);
+    ASSERT_EQ(l.t.cache->get_best_height(), 4u);
+    EXPECT_FALSE(l.t.cache->have_coin(c.coin));
+    EXPECT_TRUE(l.switch_to(c.b, 1));
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(c.a[1]));
+    EXPECT_FALSE(l.t.cache->have_coin(c.coin)) << "the accrual view does not hold zero-value outputs";
+    l.deliver(c.b[4], 5);
+    l.deliver(c.b[2], 3);
+    l.deliver(c.b[3], 4);
+    EXPECT_EQ(l.t.cache->get_best_height(), 5u);
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(c.b[4]));
+    EXPECT_FALSE(l.lane.stuck());
+    EXPECT_FALSE(l.t.cache->have_coin(c.coin));
+}
+
 // A body whose transactions are not the ones its header commits to (Merkle
 // root) is not connected; the height is fetched again.
 TEST(DogeUtxoFull, BodyNotMatchingItsHeaderIsRefetched)
