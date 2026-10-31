@@ -292,6 +292,18 @@ public:
     nlohmann::json rest_broadcaster_status();        // /broadcaster_status — parent chain broadcaster
     nlohmann::json rest_merged_broadcaster_status(); // /merged_broadcaster_status — merged broadcaster
     nlohmann::json rest_network_difficulty();         // /network_difficulty — historical network diff
+    /// /network_difficulty?period=hour|day|week|month|year (#1142 item 11,
+    /// p2pool-dash web.py get_network_difficulty_samples parity). An empty
+    /// period keeps the legacy whole-history answer above.
+    nlohmann::json rest_network_difficulty(const std::string& period);
+    /// Pure windowing used by the period overload: samples are (ts, diff)
+    /// oldest-first. Unknown period reads as "day". Anchors the window start
+    /// with the last pre-window sample, appends the live diff at `now`,
+    /// downsamples long windows, and interpolates a sparse window to a fixed
+    /// point count. Display-only.
+    static nlohmann::json window_network_difficulty(
+        const std::vector<std::pair<double, double>>& samples,
+        double now, const std::string& period, double current_diff);
 
     // /web/ sub-endpoints (share chain inspection)
     nlohmann::json rest_web_heads();                 // /web/heads

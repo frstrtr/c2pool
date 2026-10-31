@@ -8663,6 +8663,99 @@ nlohmann::json MiningInterface::rest_network_difficulty()
     return arr;
 }
 
+nlohmann::json MiningInterface::rest_network_difficulty(const std::string& period)
+{
+    std::vector<std::pair<double, double>> samples;
+    {
+        std::lock_guard<std::mutex> lock(m_netdiff_mutex);
+        samples.reserve(m_netdiff_history.size());
+        for (const auto& s : m_netdiff_history)
+            samples.emplace_back(s.ts, s.difficulty);
+    }
+    return window_network_difficulty(
+        samples, static_cast<double>(std::time(nullptr)), period,
+        m_network_difficulty.load(std::memory_order_relaxed));
+}
+
+nlohmann::json MiningInterface::window_network_difficulty(
+    const std::vector<std::pair<double, double>>& samples,
+    double now, const std::string& period, double current_diff)
+{
+    // Same tables as p2pool-dash web.py get_network_difficulty_samples().
+    struct PeriodSpec { const char* name; double seconds; size_t max_points; int num_fill; };
+    static const PeriodSpec kSpecs[] = {
+        {"hour",  3600.0,             30, 6},
+        {"day",   86400.0,           600, 12},
+        {"week",  86400.0 * 7,      1000, 14},
+        {"month", 86400.0 * 30,     1500, 15},
+        {"year",  86400.0 * 365,    2000, 26},
+    };
+    const PeriodSpec* spec = &kSpecs[1];
+    for (const auto& k : kSpecs)
+        if (period == k.name) { spec = &k; break; }
+    const double min_time = now - spec->seconds;
+
+    struct Point { double ts; double diff; const char* source; };
+    std::vector<Point> out;
+    const std::pair<double, double>* prior = nullptr;
+    std::vector<Point> in_window;
+    for (const auto& s : samples) {
+        if (s.first < min_time) prior = &s;
+        else in_window.push_back({s.first, s.second, "sample"});
+    }
+
+    if (!in_window.empty()) {
+        if (prior) out.push_back({min_time, prior->second, "window_start"});
+        out.insert(out.end(), in_window.begin(), in_window.end());
+        if (current_diff > 0 && std::abs(out.back().ts - now) > 30)
+            out.push_back({now, current_diff, "current"});
+        if (out.size() > spec->max_points) {
+            // Keep every Nth point plus the first and last.
+            const double step = static_cast<double>(out.size()) / spec->max_points;
+            std::vector<Point> ds{out.front()};
+            for (double pos = step; static_cast<size_t>(pos) < out.size() - 1; pos += step)
+                ds.push_back(out[static_cast<size_t>(pos)]);
+            ds.push_back(out.back());
+            out.swap(ds);
+        }
+    } else {
+        // No sample inside the window: hold the last known value across it.
+        const double start = prior ? prior->second : current_diff;
+        if (start <= 0) return nlohmann::json::array();
+        out.push_back({min_time, start, "window_start"});
+        if (current_diff > 0) out.push_back({now, current_diff, "current"});
+        // Gap interpolation so a sparse window still draws a line.
+        const double step = spec->seconds / spec->num_fill;
+        const std::vector<Point> known = out;
+        for (int i = 1; i < spec->num_fill; ++i) {
+            const double t = min_time + i * step;
+            bool near = false;
+            for (const auto& r : known)
+                if (std::abs(r.ts - t) < step / 2) { near = true; break; }
+            if (near) continue;
+            const Point* prev = nullptr;
+            const Point* next = nullptr;
+            for (const auto& r : known) {
+                if (r.ts <= t) prev = &r;
+                else if (!next) next = &r;
+            }
+            double d = start;
+            if (prev && next && next->ts > prev->ts)
+                d = prev->diff + (t - prev->ts) / (next->ts - prev->ts) * (next->diff - prev->diff);
+            else if (prev) d = prev->diff;
+            else if (next) d = next->diff;
+            out.push_back({t, d, "interpolated"});
+        }
+        std::stable_sort(out.begin(), out.end(),
+                         [](const Point& a, const Point& b) { return a.ts < b.ts; });
+    }
+
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& p : out)
+        arr.push_back({{"ts", p.ts}, {"network_diff", p.diff}, {"source", p.source}});
+    return arr;
+}
+
 // ──────────── Stratum worker session tracking ───────────────────────────
 
 void MiningInterface::register_stratum_worker(const std::string& session_id, const WorkerInfo& info)
