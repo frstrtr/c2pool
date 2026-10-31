@@ -32,6 +32,7 @@
 #include <impl/dgb/coin/aux_doge_mm_commitment.hpp>  // AUX_MM_COMMITMENT_SIZE (44-byte MM blob)
 #include <impl/dgb/coin/won_block_serialize.hpp>   // serialize_won_block SSOT (won-block framing)
 #include <impl/dgb/coin/header_sample_build.hpp>// compact_to_target (compact bits -> u256)
+#include <impl/dgb/coin/u256_core_bridge.hpp>   // to_core_uint256 (DC merged-submit parent_hash)
 
 #include <core/log.hpp>
 #include <core/hash.hpp>                        // Hash (sha256d) for coinbase txid + merkle pair
@@ -814,16 +815,10 @@ nlohmann::json DGBWorkSource::mining_submit(
                     HexStr(Span<const uint8_t>(header.data(), 80));
                 std::string parent_coinbase_hex =
                     HexStr(Span<const uint8_t>(coinbase.data(), coinbase.size()));
-                // dgb::coin::u256 -> core uint256: both hold a 32-byte
-                // little-endian image; serialize pow_hash's limbs LE and read
-                // them back through uint256's LE-vector ctor. The scrypt PoW hash
-                // IS the parent block hash the aux-target gate compares.
-                std::vector<unsigned char> ph_le(32, 0);
-                for (int i = 0; i < 4; ++i)
-                    for (int j = 0; j < 8; ++j)
-                        ph_le[i * 8 + j] =
-                            static_cast<unsigned char>((pow_hash.limb[i] >> (8 * j)) & 0xff);
-                uint256 parent_hash(ph_le);
+                // The scrypt PoW hash IS the parent hash the aux-target gate
+                // compares; bridge it through the KAT-pinned SSOT
+                // (coin/u256_core_bridge.hpp).
+                const uint256 parent_hash = dgb::coin::to_core_uint256(pow_hash);
                 mm_manager_->try_submit_merged_blocks(
                     parent_header_hex, parent_coinbase_hex,
                     job->merkle_branches, 0, parent_hash);
