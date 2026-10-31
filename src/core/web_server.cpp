@@ -2279,8 +2279,6 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
     }
 }
 
-thread_local bool MiningInterface::t_direct_local_request = false;
-
 std::optional<std::string> MiningInterface::aux_template_chain(const nlohmann::json& params) const
 {
     const nlohmann::json* req = nullptr;
