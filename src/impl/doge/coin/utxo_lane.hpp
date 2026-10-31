@@ -193,6 +193,10 @@ struct UtxoLaneHost {
     /// body above keep arms it, as before.
     std::function<bool()> chain_synced;
     std::function<int64_t()> tip_age_s;
+    /// The node is shutting down: a drain ends after the block it is
+    /// connecting (the set stays at that block's flush), and no new body or
+    /// tick is taken, so the lane's pool joins at once. Unset: never.
+    std::function<bool()> stopping;
 };
 
 /// The serialized size of a body, estimated from its parts (memory bounds:
@@ -326,6 +330,9 @@ public:
 
     Mode mode() const { return m_mode; }
 
+    /// UtxoLaneHost::stopping.
+    bool stopping() const { return m_host.stopping && m_host.stopping(); }
+
     UtxoLane(const UtxoLane&) = delete;
     UtxoLane& operator=(const UtxoLane&) = delete;
 
@@ -336,6 +343,10 @@ public:
     {
         using namespace ltc::coin;
         FeedResult r;
+        if (stopping()) {
+            r.fed = Fed::Skipped;
+            return r;
+        }
         uint256 at = height ? m_host.chain_hash_at(height) : uint256();
         // A body often arrives before the header chain knows its block: a
         // peer's inv is answered with the body at once, while headers come
@@ -953,6 +964,8 @@ public:
     /// retries a stuck height after STUCK_RETRY and updates the rate.
     void tick()
     {
+        if (stopping())
+            return;
         const auto t = now();
         if (m_mode == Mode::Full) {
             if (m_stuck)
@@ -1311,7 +1324,7 @@ private:
         ltc::coin::DrainResult r;
         FullConnect failed = FullConnect::Connected;
         std::string from;
-        while (m_fill.buffer.count(m_fill.next_height)) {
+        while (!stopping() && m_fill.buffer.count(m_fill.next_height)) {
             auto node = m_fill.buffer.extract(m_fill.next_height);
             auto& [b, bh] = node.mapped();
             const uint32_t h = m_fill.next_height;

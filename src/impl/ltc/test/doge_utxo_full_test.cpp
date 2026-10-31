@@ -30,10 +30,16 @@
 
 #include <core/coin/utxo_digest.hpp>
 #include <core/leveldb_store.hpp>
+#include <core/worker_pools.hpp>
 #include <impl/doge/coin/process_memory.hpp>
 #include <impl/doge/coin/store_fds.hpp>
 
+#include <boost/asio/post.hpp>
+#include <boost/asio/thread_pool.hpp>
+
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 #include <map>
 #include <numeric>
@@ -527,6 +533,57 @@ TEST(DogeUtxoOrder, AccrualViewPassesASpentShapedCoinThroughAReorg)
     EXPECT_EQ(l.t.cache->get_best_block(), hash_of(c.b[4]));
     EXPECT_FALSE(l.lane.stuck());
     EXPECT_FALSE(l.t.cache->have_coin(c.coin));
+}
+
+// The shutdown (release blocker, live IBD 10-31: the stores closed while the
+// lane's pool still worked, then a hang of 4.3 h): with the host stopping,
+// the full lane's drain ends after the block it is connecting and takes no
+// new body, so its pool joins at once, before the stores close; the set is
+// at its last flush and a restart resumes from it to the tip.
+TEST(DogeUtxoFull, AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
+{
+    constexpr uint32_t N = 20000;
+    const uint256 g = genesis(0x67);
+    const auto chain = chain_with(g, N);
+    Lane l(20, Mode::Full, N);
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[N - 1], hash_of(chain[N - 1]), N);  // arms the fill from 1
+    for (uint32_t h = N - 1; h >= 2; --h)
+        l.lane.on_block(chain[h - 1], hash_of(chain[h - 1]), h);  // buffered: 1 is missing
+    ASSERT_EQ(l.t.cache->get_best_height(), 0u);
+
+    // Block 1 on the lane's pool: the drain connects 1..N, an IBD in flight.
+    auto pool = std::make_shared<boost::asio::thread_pool>(1);
+    boost::asio::post(*pool, [&]() { l.lane.on_block(chain[0], hash_of(chain[0]), 1); });
+    while (l.lane.stats().connected.load() < 100)
+        std::this_thread::yield();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    l.net.stopping = true;
+    ASSERT_TRUE(core::stop_and_join_within(pool, std::chrono::seconds(5))) << "the lane's pool did not join";
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(took, std::chrono::seconds(1));
+    const uint64_t connected = l.lane.stats().connected.load();
+    EXPECT_LT(connected, N) << "the drain ran to the tip after the stop";
+    EXPECT_EQ(l.t.cache->get_best_height(), connected) << "the set is not at its last connected block";
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(chain[connected - 1]));
+    EXPECT_EQ(l.lane.on_block(chain[connected], hash_of(chain[connected]), connected + 1).fed,
+              UtxoLane::Fed::Skipped) << "a body taken while stopping";
+    EXPECT_EQ(l.t.cache->get_best_height(), connected);
+
+    // The stores close after the join; a restart resumes from the flush.
+    l.t.reopen();
+    ASSERT_EQ(l.t.db->get_best_height(), connected);
+    l.net.stopping = false;
+    l.net.requested.clear();
+    UtxoLane again(*l.t.cache, *l.t.db, l.net.host(), 20, Mode::Full, N);
+    again.on_block(chain[N - 1], hash_of(chain[N - 1]), N);
+    ASSERT_FALSE(l.net.requested.empty());
+    EXPECT_EQ(l.net.requested.front(), connected + 1) << "not resumed from the flushed height";
+    serve(again, l.net, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), N);
+    EXPECT_EQ(again.stats().strict_refusals.load(), 0u);
 }
 
 // A body whose transactions are not the ones its header commits to (Merkle
