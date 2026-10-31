@@ -36,6 +36,7 @@
 #include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
 #include <core/worker_pools.hpp>
+#include <core/host_port.hpp>
 #include <core/filesystem.hpp>
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
@@ -421,6 +422,23 @@ static void start_shutdown_watchdog()
     }).detach();
 }
 
+/// --ltc-connect / --doge-connect: each HOST[:PORT] (`port` when absent) as
+/// a connect-only dial target (c2pool::merged::PeerManagerConfig::connect_only).
+static std::vector<NetService> connect_only_peers(const std::vector<std::string>& specs, uint16_t port,
+                                                  const char* coin)
+{
+    std::vector<NetService> out;
+    for (const auto& spec : specs) {
+        const auto hp = core::parse_host_port(spec);
+        if (hp.host.empty()) {
+            LOG_ERROR << "[" << coin << "] connect-only peer without a host: '" << spec << "' (ignored)";
+            continue;
+        }
+        out.emplace_back(hp.host, hp.port.value_or(port));
+    }
+    return out;
+}
+
 // C2Pool configuration
 struct C2PoolConfig {
     std::string m_name = "c2pool_sharechain";
@@ -572,6 +590,9 @@ void print_help() {
     std::cout << "                            be complete into the configured --doge-header-checkpoint\n";
     std::cout << "  --utxo-digest DIR         Print the digest of the UTXO LevelDB at DIR (SHA256 over\n";
     std::cout << "                            its coins, sync state and best block) and exit\n";
+    std::cout << "  --ltc-connect HOST[:PORT] Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
+    std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
+    std::cout << "  --doge-connect HOST[:PORT] Dial only this DOGE peer (repeatable), as --ltc-connect\n";
     std::cout << "  --no-ltc-cmpct-v3         Do not ask LTC peers for v3 (MWEB) compact blocks\n";
     std::cout << "  --ltc-cmpct-hb-peers N    LTC peers asked to push compact blocks (default: 0 = all)\n";
     std::cout << "  --no-ltc-mweb-fetch-retry Fetch each announced LTC block from every announcing peer\n";
@@ -850,6 +871,10 @@ int main(int argc, char* argv[]) {
     //   doge_utxo_full_dir  its LevelDB (default <data>/dogecoin/utxo_full_leveldb)
     bool        doge_utxo_full = true;
     std::string doge_utxo_full_dir;
+    // Core's -connect for the coin P2P: the LTC / DOGE peers to dial and no
+    // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
+    std::vector<std::string> ltc_connect;
+    std::vector<std::string> doge_connect;
     int doge_p2p_port = 0;                   // --doge-p2p-port PORT
     // Embedded LTC block relay (MWEB state at block announce):
     //   ltc_cmpct_v3          announce sendcmpct (true,3) then (false,2): MWEB peers
@@ -1213,6 +1238,14 @@ int main(int argc, char* argv[]) {
         else if (arg == "--doge-utxo-full-dir" && i + 1 < argc) {
             doge_utxo_full_dir = argv[++i];
             cli_explicit.insert("doge_utxo_full_dir");
+        }
+        else if (arg == "--ltc-connect" && i + 1 < argc) {
+            ltc_connect.push_back(argv[++i]);
+            cli_explicit.insert("ltc_connect");
+        }
+        else if (arg == "--doge-connect" && i + 1 < argc) {
+            doge_connect.push_back(argv[++i]);
+            cli_explicit.insert("doge_connect");
         }
         else if (arg == "--dump-doge-schedule-anchors" && i + 1 < argc) {
             // The anchors of a complete hash schedule (no node is started);
@@ -1641,6 +1674,12 @@ int main(int argc, char* argv[]) {
                 coind_p2p_address = cfg["coind_p2p_address"].as<std::string>();
 
             // Sharechain seed nodes (appends to -n CLI nodes)
+            for (auto [key, list] : {std::pair<const char*, std::vector<std::string>*>{"ltc_connect", &ltc_connect},
+                                     std::pair<const char*, std::vector<std::string>*>{"doge_connect", &doge_connect}}) {
+                if (!cli_explicit.count(key) && cfg[key] && cfg[key].IsSequence())
+                    for (const auto& item : cfg[key])
+                        list->push_back(item.as<std::string>());
+            }
             if (cfg["seed_nodes"] && cfg["seed_nodes"].IsSequence()) {
                 for (const auto& item : cfg["seed_nodes"])
                     seed_nodes.push_back(item.as<std::string>());
@@ -2340,11 +2379,16 @@ int main(int argc, char* argv[]) {
                                    << " — falling back to seed-only mode";
                     }
                 }
+                c2pool::merged::PeerManagerConfig ltc_pm_cfg;
+                ltc_pm_cfg.connect_only = connect_only_peers(
+                    ltc_connect, static_cast<uint16_t>(coind_p2p_port > 0 ? coind_p2p_port : 9333), "EMB-LTC");
                 embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
                     ioc, parent_symbol, p2p_prefix,
                     std::move(ltc_local_daemon),
-                    pm_data_dir, c2pool::merged::PeerManagerConfig{});
-                LOG_INFO << "[EMB-LTC] Broadcaster: " << ltc_daemon_str;
+                    pm_data_dir, ltc_pm_cfg);
+                LOG_INFO << "[EMB-LTC] Broadcaster: " << ltc_daemon_str
+                         << (ltc_pm_cfg.connect_only.empty() ? std::string()
+                             : " connect-only (" + std::to_string(ltc_pm_cfg.connect_only.size()) + " peer(s))");
 
                 // Wire DNS seeds + fixed seed fallback into peer manager
                 auto& pm = embedded_broadcaster->peer_manager();
@@ -7192,6 +7236,9 @@ int main(int argc, char* argv[]) {
                                 pm_cfg.max_peers = 20;
                                 pm_cfg.min_peers = 4;
                             }
+                            if (cfg.symbol == "DOGE" || cfg.symbol == "doge")
+                                pm_cfg.connect_only = connect_only_peers(
+                                    doge_connect, static_cast<uint16_t>(cfg.p2p_port), "EMB-DOGE");
                             // Populate valid ports for this chain
                             if (cfg.symbol == "DOGE" || cfg.symbol == "doge") {
                                 pm_cfg.valid_ports = {22556, 44556, 44557};

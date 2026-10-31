@@ -259,6 +259,14 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
 
+// Core's -connect for the embedded coin P2P: these peers and no other (no
+// peer DB, DNS / fixed / HTTP seeds, getpeerinfo or addr gossip). Repeatable.
+C2P_PARAM("coin_p2p.ltc_connect", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "dial only this LTC peer HOST[:PORT] (repeatable; Core -connect)")
+  C2P_ALIAS("coin_p2p.ltc_connect", BIN_LTC, "--ltc-connect", VALUE)
+
+C2P_PARAM("coin_p2p.doge_connect", CoinP2P, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "dial only this DOGE peer HOST[:PORT] (repeatable; Core -connect)")
+  C2P_ALIAS("coin_p2p.doge_connect", BIN_LTC, "--doge-connect", VALUE)
+
 C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--bitcoind-p2p-port", VALUE)
