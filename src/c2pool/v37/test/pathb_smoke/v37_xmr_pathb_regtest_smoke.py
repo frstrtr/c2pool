@@ -62,7 +62,11 @@
 #   block; t rises within a run and lies within the rig's run; every
 #   `relay: caught up (` line is a known form ending ` at pos <n>
 #   t=<unix ms>`, t within the rig's run and at most the next block's t
-#   (at least one such line when the part pool ran)
+#   (at least one such line when the part pool ran); every status block has
+#   one `  roots: tip=` line, the tip of the last `template <n>: tip=` line
+#   before it (`-` when window_root and mmr_root are `-`); every polled
+#   /xmr/pathb answer carries roots_tip (64 hex, empty when window_root is
+#   empty), the tip of a `template <n>: tip=` line of its node
 # Inputs: --daemon (the c2pool-v37-xmr under test); XMR_REGTEST_MONEROD,
 # XMR_REGTEST_WALLET_RPC (default: beside monerod), XMR_PATHB_SMOKE_OLD_BINARY
 # (the old binary; the part "old" needs it). A missing monerod, wallet-rpc
@@ -121,6 +125,9 @@ FOLLOW_RE = re.compile(r"^\[follow-only\] follow h=(\d+) id=([0-9a-f]{64}) prev=
 TEMPLATE_RE = re.compile(r"^\[follow-only\] template h=(\d+) (.*)$")
 WIRE_RE = re.compile(r"wire RPC to monerod: TOTAL=(\d+)")
 TIME_RE = re.compile(r"^  time: t=(\d+)$")
+ROOTS_RE = re.compile(r"^  roots: tip=([0-9a-f]{16}|-)$")
+TPL_TIP_RE = re.compile(r"^template \d+: tip=([0-9a-f]{16}) ")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 CAUGHT_RE = re.compile(r"^  relay: caught up \((.*)\) at pos (\d+) t=(\d+)$")
 CAUGHT_FORMS = ("the catch-up from every HELLO peer ended by its done test",
                 "a join attempt completed; rule (4) kept the node's chain")
@@ -324,6 +331,7 @@ class WebPoller:
         self.last = {}      # name -> last answer
         self.pend = {}      # name -> every pending receipt id (12 hex digits) seen since clear_pending
         self.hist = {}      # name -> [(monotonic time, switches, set(pending ids))] since clear_pending
+        self.roots = {}     # name -> answers, answers without roots_tip, malformed, roots tips (16 hex), off best_tip
         self.lock = threading.Lock()
         self.stop_ev = threading.Event()
         self.t = threading.Thread(target=self._run, daemon=True)
@@ -358,6 +366,16 @@ class WebPoller:
                         (time.monotonic(), int(pb.get("switches", -1)), set(pb.get("pending_ids", []))))
                     self.seen.setdefault(name, {}).setdefault(tip, set()).add(
                         (pb.get("window_root", ""), sum(amounts), amounts))
+                    r = self.roots.setdefault(name, {"n": 0, "absent": 0, "bad": 0, "tips": set(), "other": 0})
+                    r["n"] += 1
+                    rt = pb.get("roots_tip")
+                    if rt is None:
+                        r["absent"] += 1
+                    elif (rt == "") != (pb.get("window_root", "") == "") or (rt and not HEX64_RE.match(rt)):
+                        r["bad"] += 1
+                    elif rt:
+                        r["tips"].add(rt[:16])
+                        r["other"] += 1 if rt != tip else 0
             self.stop_ev.wait(0.4)
 
     def get(self, name):
@@ -376,6 +394,10 @@ class WebPoller:
     def pending_seen(self, name):
         with self.lock:
             return set(self.pend.get(name, set()))
+
+    def roots_seen(self):
+        with self.lock:
+            return {n: dict(v, tips=set(v["tips"])) for n, v in self.roots.items()}
 
     def views_at(self, name, tip):
         with self.lock:
@@ -1540,6 +1562,44 @@ class Rig:
                 if not self.t0_ms <= t <= t1 or (nxt is not None and t > nxt):
                     bad_caught.append("%s line %d: t %d, the next block's t %s" % (name, i + 1, t, nxt))
                 caught.append((name, CAUGHT_FORMS.index(m.group(1)), int(m.group(2)), t))
+        rblocks = rcut = rother = 0
+        bad_roots, tpl_tips = [], {}
+        for p in runs:
+            lines = p.text().splitlines()
+            name = os.path.basename(p.logpath)
+            tips = tpl_tips.setdefault(p.name, set())
+            idx = [i for i, l in enumerate(lines) if l.startswith("status: up=")]
+            last_tpl, prev = None, 0
+            for k, i in enumerate(idx):
+                for m in (TPL_TIP_RE.match(l) for l in lines[prev:i]):
+                    if m:
+                        last_tpl = m.group(1)
+                        tips.add(last_tpl)
+                prev = i
+                end = idx[k + 1] if k + 1 < len(idx) else len(lines)
+                rl = [m for m in (ROOTS_RE.match(l) for l in lines[i + 1:end]) if m]
+                st = STATUS_RE.match(lines[i])
+                rblocks += 1
+                if len(rl) != 1:
+                    if not rl and k + 1 == len(idx) and end <= i + 2:
+                        rcut += 1   # the run's last lines: a block cut by the stop
+                    else:
+                        bad_roots.append("%s line %d: %d roots lines" % (name, i + 1, len(rl)))
+                    continue
+                tip = rl[0].group(1)
+                want = "-" if not st or st.group(8) == "-" else last_tpl
+                if not st or tip != want or (tip == "-") != (st.group(9) == "-"):
+                    bad_roots.append("%s line %d: roots tip %s, the last template's %s, window_root %s" %
+                                     (name, i + 1, tip, want, st.group(8) if st else "?"))
+                elif tip != "-" and tip != st.group(4):
+                    rother += 1
+            tips.update(m.group(1) for m in (TPL_TIP_RE.match(l) for l in lines[prev:]) if m)
+        wv = self.web.roots_seen()
+        wn = sum(v["n"] for v in wv.values())
+        wabsent = sum(v["absent"] for v in wv.values())
+        wbad = sum(v["bad"] for v in wv.values())
+        wother = sum(v["other"] for v in wv.values())
+        wunknown = sorted("%s:%s" % (n, t) for n, v in wv.items() for t in v["tips"] - tpl_tips.get(n, set()))
         for x in caught:
             self.res.note("lines", "caught up: %s form %d pos %d t %d" % x)
         self.res.check("lines", blocks > 0 and timed + cut == blocks and not bad_time,
@@ -1554,6 +1614,16 @@ class Rig:
                        "within the rig's run and at most the next block's t%s" %
                        (len(caught), sum(1 for x in caught if x[1] == 0), sum(1 for x in caught if x[1] == 1),
                         (": " + "; ".join(bad_caught[:4])) if bad_caught else ""))
+        self.res.check("lines", rblocks > 0 and not bad_roots,
+                       "every status block has one `  roots: tip=` line, the tip of the last `template <n>: tip=` line "
+                       "before it, `-` when window_root and mmr_root are `-` (blocks %d, cut by a stop %d, on another "
+                       "tip than id= %d)%s" % (rblocks, rcut, rother,
+                                               (": " + "; ".join(bad_roots[:4])) if bad_roots else ""))
+        self.res.check("lines", (wn > 0 or "pool" not in self.a.parts) and not wabsent and not wbad and not wunknown,
+                       "every /xmr/pathb answer carries roots_tip (64 hex; empty when window_root is empty), the tip of "
+                       "a `template <n>: tip=` line of its node (answers %d, without roots_tip %d, malformed %d, not a "
+                       "template tip %d, on another tip than best_tip.id %d)%s" %
+                       (wn, wabsent, wbad, len(wunknown), wother, (": " + "; ".join(wunknown[:4])) if wunknown else ""))
 
     # ---- the run ----
     def run(self):

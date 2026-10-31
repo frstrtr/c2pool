@@ -248,7 +248,8 @@ nlohmann::json XmrWebDashboard::Impl::pathb_status() const {
     return nlohmann::json{
         {"best_tip", {{"pos", p.tip_pos}, {"id", p.tip_id_hex}, {"cum_work", p.cum_work}}},
         {"epoch_cur", p.epoch_cur}, {"h_hold", p.h_hold},
-        {"window_root", p.window_root_hex}, {"mmr_root", p.mmr_root_hex}, {"leaf_count", p.leaf_count},
+        {"window_root", p.window_root_hex}, {"mmr_root", p.mmr_root_hex}, {"roots_tip", p.roots_tip_hex},
+        {"leaf_count", p.leaf_count},
         {"pending", p.pending}, {"pending_ids", p.pending_ids}, {"deferred", p.deferred},
         {"repended_last_switch", p.repended_last_switch}, {"switches", p.switches},
         {"template", p.template_status},
