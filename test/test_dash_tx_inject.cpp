@@ -44,6 +44,7 @@
 #include <impl/dash/coin/inject_sandbox.hpp>    // #157 M3: bounded-work script-verify sandbox
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: node-wide count+byte rate limiter
 #include <impl/dash/coin/good_citizen_defaults.hpp>
+#include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: resolve_checkscripts_arm
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
 // std-only: the c2wallet-qt mirror of the node caps, pinned below.
@@ -53,6 +54,8 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <secp256k1.h>
+
+#include "dash_utxo_full_fixture.hpp"   // S2: a full set built as the node builds it
 
 #include <cstdint>
 #include <cstring>
@@ -148,15 +151,17 @@ struct Key {
     }
 };
 
-// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee.
-MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
-                                     int64_t out_value) {
+// Signed 1-in P2PKH spend of (prev:0) paying `outs`. The version and the
+// input's sequence are set before signing (both are signed).
+MutableTransaction make_signed_spend_outs(const Key& k, const uint256& prev,
+                                          std::vector<TxOut> outs, int32_t version = 1,
+                                          uint32_t sequence = 0xffffffffu) {
     MutableTransaction tx;
-    tx.version = 1; tx.type = 0; tx.locktime = 0;
-    TxIn in; in.prevout.hash = prev; in.prevout.index = 0; in.sequence = 0xffffffffu;
+    tx.version = version; tx.type = 0; tx.locktime = 0;
+    TxIn in; in.prevout.hash = prev; in.prevout.index = 0; in.sequence = sequence;
     in.scriptSig = to_script(k.spk);
     tx.vin.push_back(in);
-    TxOut out; out.value = out_value; tx.vout.push_back(out);
+    tx.vout = std::move(outs);
 
     auto unsigned_bytes = ser(tx);
     uint8_t sighash[32];
@@ -166,6 +171,14 @@ MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
     auto ss = k.sign_scriptsig(std::vector<uint8_t>(sighash, sighash + 32));
     tx.vin[0].scriptSig = to_script(ss);
     return tx;
+}
+
+// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee.
+MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
+                                     int64_t out_value, int32_t version = 1,
+                                     uint32_t sequence = 0xffffffffu) {
+    TxOut out; out.value = out_value;
+    return make_signed_spend_outs(k, prev, {out}, version, sequence);
 }
 
 uint256 prevhash(uint8_t b) { uint256 h; std::memset(h.begin(), b, 32); return h; }
@@ -281,10 +294,11 @@ TEST(DashTxInject, InjectDoubleSpendStillDropsTheConflict)
     EXPECT_EQ(fees, 0u) << "the 0-fee inject won; the fee tx it conflicts with is dropped";
 }
 
-// (3c) VALIDITY: a bad-script inject is admitted to the pool (priceable from the
-//      UTXO value) but DROPPED at template build by the ARMED script check —
-//      never served. Priority is not a guard bypass.
-TEST(DashTxInject, BadScriptInjectDroppedAtTemplateBuild)
+// (3c) VALIDITY (S3a, A4): a bad-script inject is priceable from the UTXO value
+//      but REFUSED AT ADMISSION by the armed script check, by name, and rolled
+//      back — it never occupies the pool. (Before S3a it was admitted and only
+//      dropped at template build; the selector still re-checks as the belt.)
+TEST(DashTxInject, BadScriptInjectRefusedAtAdmissionByName)
 {
     Key k(0x55);
     uint256 prev = prevhash(0xe1);
@@ -297,12 +311,36 @@ TEST(DashTxInject, BadScriptInjectDroppedAtTemplateBuild)
     utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
     Mempool mp; mp.set_utxo(&utxo);
     arm_script_check(mp);
-    // Priceable ⇒ admitted with priority.
-    ASSERT_EQ(mp.add_inject(bad), Mempool::InjectGate::Ok);
-    // ...but the armed selector script-check DROPS it: never served.
+    EXPECT_EQ(mp.add_inject(bad), Mempool::InjectGate::ScriptInvalid);
+    EXPECT_STREQ(Mempool::inject_gate_name(Mempool::InjectGate::ScriptInvalid), "inject-script-invalid");
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value()) << "rolled back";
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty());
     auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
-    EXPECT_EQ(selected.size(), 0u) << "an invalid-script inject must be dropped at template build";
+    EXPECT_EQ(selected.size(), 0u);
     EXPECT_EQ(fees, 0u);
+    // The correctly signed spend of the same coin is admitted.
+    EXPECT_EQ(mp.add_inject(good), Mempool::InjectGate::Ok);
+}
+
+// (S2, A3) A fee above the submitter's max_fee is refused by name and rolled
+// back; the same tx with a ceiling that covers it is admitted.
+TEST(DashTxInject, InjectFeeAboveMaxRefusedAndRolledBack)
+{
+    Key k(0x57);
+    uint256 prev = prevhash(0xe3);
+    auto tx = make_signed_spend(k, prev, 90'000);   // fee 10'000
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/0), Mempool::InjectGate::FeeAboveMax);
+    EXPECT_STREQ(Mempool::inject_gate_name(Mempool::InjectGate::FeeAboveMax), "inject-fee-above-max");
+    EXPECT_FALSE(mp.get_entry(dash_txid(tx)).has_value());
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty()) << "the priority delta is gone too";
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/9'999), Mempool::InjectGate::FeeAboveMax);
+    EXPECT_EQ(mp.add_inject(tx, /*max_fee=*/10'000), Mempool::InjectGate::Ok);
+    ASSERT_EQ(mp.inject_txids_in_pool().size(), 1u);
+    EXPECT_EQ(mp.get_entry(dash_txid(tx))->fee, 10'000u);
 }
 
 // (3d) VALIDITY: an inject whose input is not in the view is REFUSED at submit,
@@ -413,16 +451,16 @@ TEST(DashTxInject, Bip68RelativeLockInjectRefusedFailClosed)
     arm_script_check(mp);
 
     // NEGATIVE: nVersion==2 with a BIP68 relative-lock input (bit 31 clear).
-    auto rel = make_signed_spend(k, prev, 90'000);
-    rel.version = 2;
-    rel.vin[0].sequence = 0x0000000au;   // disable-flag clear ⇒ relative lock ON
+    // (Each tx is signed after its version and sequence are set: since S3a an
+    // inject's scripts are verified at admission.)
+    auto rel = make_signed_spend(k, prev, 90'000, /*version=*/2,
+                                 /*sequence=*/0x0000000au);   // disable-flag clear ⇒ relative lock ON
     EXPECT_EQ(mp.add_inject(rel), Mempool::InjectGate::Bip68Unsupported)
         << "a v2 inject that opts into a BIP68 relative lock must be fail-closed refused";
 
     // POSITIVE TWIN 1: nVersion==2 but every input disables the relative lock
     // (SEQUENCE_FINAL has bit 31 set) ⇒ no BIP68 opt-in ⇒ admitted.
-    auto v2_final = make_signed_spend(k, prev, 90'000);
-    v2_final.version = 2;                 // vin sequence stays 0xffffffff
+    auto v2_final = make_signed_spend(k, prev, 90'000, /*version=*/2);   // sequence 0xffffffff
     EXPECT_EQ(mp.add_inject(v2_final), Mempool::InjectGate::Ok)
         << "a v2 inject with no relative-lock input rides the normal path";
 
@@ -430,9 +468,7 @@ TEST(DashTxInject, Bip68RelativeLockInjectRefusedFailClosed)
     // relative-lock sequence bits — version-gated, exactly as consensus does it.
     uint256 prev2 = prevhash(0xbb);
     utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
-    auto v1_rel = make_signed_spend(k, prev2, 90'000);
-    v1_rel.version = 1;
-    v1_rel.vin[0].sequence = 0x0000000au;
+    auto v1_rel = make_signed_spend(k, prev2, 90'000, /*version=*/1, /*sequence=*/0x0000000au);
     EXPECT_EQ(mp.add_inject(v1_rel), Mempool::InjectGate::Ok)
         << "BIP68 is nVersion>=2 only; a v1 inject is unaffected";
 }
@@ -1267,4 +1303,503 @@ TEST(DashTxInject, StatusCountersLeaveAcceptVerdictUnchanged)
     EXPECT_EQ(obs.sb_max_inputs.load(), InjectSandbox::kMaxInputs);
     EXPECT_GE(obs.rl_local_in_window.load(), 1u)
         << "the accepted local inject must show in the mirrored window occupancy";
+}
+
+// (S2, A11) An inject whose expiry_height the tip passes leaves the inject
+// pool and the mempool on the tip advance itself, without a second submit.
+TEST(DashTxInject, ExpiredInjectReapedOnTipAdvance)
+{
+    Key k(0xa7);
+    uint256 prev = prevhash(0x77);
+    auto tx = make_signed_spend(k, prev, 100'000);   // fee 0
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    auto r = st.submit_inject(tx, 0, /*expiry_height=*/101, NodeCoinState::InjectOrigin::Local, /*max_fee=*/0);
+    ASSERT_TRUE(r.ok) << r.cause;
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    st.set_tip(101, prevhash(0x11), 0x1d00ffff, 0, 76, 16);   // next block 102 > expiry 101
+    EXPECT_EQ(st.inject_pool_size(), 0u) << "reaped on the tip advance";
+    EXPECT_FALSE(st.mempool().get_entry(dash_txid(tx)).has_value()) << "and evicted from the mempool";
+}
+
+// (S2) The full UTXO set prices an inject whose input is older than any
+// forward view (the 71-of-170 case): the same tx is inject-unpriceable on an
+// accrual view and admitted against the full set; a fee-paying one is refused
+// by the operator's max_fee 0 with the fee computed from the full set.
+TEST(DashMempool, InjectPricedFromFullView)
+{
+    using namespace dash_utxo_full;
+    Key k(0xb7);
+    const uint256 prevA = prevhash(0x81), prevB = prevhash(0x82);
+    auto zero_fee = make_signed_spend(k, prevA, 100'000);
+    auto paying = make_signed_spend(k, prevB, 90'000);
+
+    // Accrual view that never saw the coin's block.
+    {
+        UTXOViewCache accrual(nullptr);
+        NodeCoinState st; arm_ncs(st, accrual);
+        auto r = st.submit_inject(zero_fee, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+        EXPECT_FALSE(r.ok);
+        EXPECT_EQ(r.cause, "inject-unpriceable");
+    }
+    // The full set holds both coins (created at h=500, long before the base).
+    TempDir tmp("inject");
+    dash::coin::UtxoLane lane;
+    SnapCoin a, b;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    b.op = Outpoint(prevB, 0);
+    b.coin = Coin(100'000, to_script(k.spk), 500, false);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, 2000, prevhash(0x99)));
+    NodeCoinState st; arm_ncs(st, *lane.cache());
+    auto r = st.submit_inject(zero_fee, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_TRUE(r.ok) << r.cause;
+    auto e = st.mempool().get_entry(dash_txid(zero_fee));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_fold_proven);
+    EXPECT_EQ(e->fee, 0u);
+    auto r2 = st.submit_inject(paying, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_FALSE(r2.ok);
+    EXPECT_EQ(r2.cause, "inject-fee-above-max");
+}
+
+// (S3a, A1) The script check is armed by default whenever an at-tip
+// scriptPubKey source exists; the operator can opt out.
+TEST(DashTxInject, CheckscriptsArmResolverDefaultOnWithView)
+{
+    using dash::coin::resolve_checkscripts_arm;
+    EXPECT_TRUE(resolve_checkscripts_arm(false, false, /*view=*/true, false).on);
+    EXPECT_STREQ(resolve_checkscripts_arm(false, false, true, false).reason, "default-on (view-backed)");
+    EXPECT_TRUE(resolve_checkscripts_arm(false, false, false, /*fold=*/true).on);
+    EXPECT_STREQ(resolve_checkscripts_arm(true, false, true, false).reason, "explicit");
+    EXPECT_FALSE(resolve_checkscripts_arm(true, /*off=*/true, true, true).on);
+    EXPECT_FALSE(resolve_checkscripts_arm(false, false, false, false).on);
+    EXPECT_FALSE(resolve_checkscripts_arm(true, false, false, false).on) << "explicit with no source stays off";
+}
+
+// (VERIFY-S2 Must-Fix 1) An output with value 0 and an empty scriptPubKey is
+// the shape the view's is_spent() sentinel reads as "no coin": the full set's
+// lane refuses a block that creates one (utxo-spent-shaped-output) and, at
+// the second refusal, withholds for good. dashd never relays such a tx (an
+// empty scriptPubKey is non-standard), so only our own inject lane could put
+// one into a block we mine: the gate refuses it by name, before pricing, and
+// rolls nothing into the pool. A value-0 output WITH a script (OP_RETURN) and
+// a valued output with an empty script are ordinary and still admitted.
+TEST(DashTxInject, SpentShapedOutputRefusedAtAdmissionByName)
+{
+    Key k(0x5b);
+    const uint256 prev = prevhash(0xe5), prev2 = prevhash(0xe6);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+
+    TxOut change; change.value = 90'000; change.scriptPubKey = to_script(k.spk);
+    TxOut spent_shaped; spent_shaped.value = 0;               // value 0, empty script
+    const auto bad = make_signed_spend_outs(k, prev, {change, spent_shaped});
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(bad)), "inject-spent-shaped-output");
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value()) << "nothing admitted";
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty()) << "no priority delta left behind";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+        EXPECT_TRUE(selected.empty());
+        EXPECT_EQ(fees, 0u);
+    }
+    // The same shape as the only output.
+    const auto bad_only = make_signed_spend(k, prev, 0);
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(bad_only)), "inject-spent-shaped-output");
+
+    // A value-0 output that carries a script is an ordinary output.
+    TxOut burn; burn.value = 0; burn.scriptPubKey = to_script({0x6a});   // OP_RETURN
+    const auto ok_burn = make_signed_spend_outs(k, prev, {change, burn});
+    EXPECT_EQ(mp.add_inject(ok_burn), Mempool::InjectGate::Ok);
+    // So is a valued output with an empty script.
+    const auto ok_valued = make_signed_spend(k, prev2, 90'000);
+    EXPECT_EQ(mp.add_inject(ok_valued), Mempool::InjectGate::Ok);
+}
+
+// (VERIFY-S2 Must-Fix 1, the relay seam) A peer that is not a dashd can relay
+// the same shape (dashd itself never does). add_tx refuses it too, so no path
+// serves a tx whose block our own full set would refuse.
+TEST(DashMempool, RelaySeamNeverAdmitsASpentShapedOutput)
+{
+    Key k(0x5c);
+    const uint256 prev = prevhash(0xe8);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    TxOut change; change.value = 90'000; change.scriptPubKey = to_script(k.spk);
+    TxOut spent_shaped; spent_shaped.value = 0;
+    const auto bad = make_signed_spend_outs(k, prev, {change, spent_shaped});
+    EXPECT_FALSE(mp.add_tx(bad)) << "a relayed (value 0, empty script) output is never admitted";
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value());
+    auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+    EXPECT_TRUE(selected.empty());
+    EXPECT_EQ(fees, 0u);
+    // The tx without that output is relayed as before.
+    EXPECT_TRUE(mp.add_tx(make_signed_spend_outs(k, prev, {change})));
+}
+
+// (VERIFY-S2 S-2) An inject confirmed in a block that a reorg takes out is put
+// back into the inject set by the rewind (dashd peers will not relay a
+// zero-fee tx, so ours may be its only copy), through the normal admission
+// gate, and leaves it again when the new branch confirms it.
+TEST(DashTxInject, InjectInARewoundBlockIsBackInTheInjectSet)
+{
+    using namespace dash_utxo_full;
+    Key k(0xc3);
+    const uint256 prevA = prevhash(0x83);
+    const auto inj = make_signed_spend(k, prevA, 100'000);   // zero fee
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-inject");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    Mempool mp;
+    lane.attach(mp);
+    arm_script_check(mp);
+    lane.on_header_tip(kB);
+    ASSERT_EQ(mp.add_inject(inj, /*max_fee=*/0), Mempool::InjectGate::Ok);
+
+    // a1 confirms the inject: it leaves the pool.
+    const BlockType a1 = block(base_hash, {coinbase(50, 2001), inj}, 2001);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_FALSE(mp.get_entry(dash_txid(inj)).has_value());
+
+    // a1 leaves the header chain's best: the rewind puts the inject back.
+    chain.hashes[kB + 1] = fake_hash(6001);
+    lane.on_header_tip(kB + 1);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    ASSERT_EQ(lane.cache()->get_best_block(), base_hash);
+    const auto back = mp.inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 1u) << "the rewound block's inject is back in the inject set";
+    EXPECT_EQ(back[0], dash_txid(inj));
+    const auto e = mp.get_entry(dash_txid(inj));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_fold_proven);
+    EXPECT_EQ(e->fee, 0u);
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 1, 0);
+        ASSERT_EQ(selected.size(), 1u) << "and it rides the next template";
+        EXPECT_EQ(dash_txid(selected[0].tx), dash_txid(inj));
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // The new branch confirms it again: out of the pool again.
+    const BlockType b1 = block(base_hash, {coinbase(50, 3001), inj}, 3001);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty());
+}
+
+// (VERIFY-S2 S-2) The kept confirmed injects are bounded: as deep as the undo
+// keep (a rewind cannot reach further), and a branch that was not rewound
+// through the lane does not leave stale entries behind.
+TEST(DashTxInject, ConfirmedInjectsKeptAsDeepAsTheUndoKeep)
+{
+    Key k(0xc4);
+    const uint256 prev = prevhash(0x84);
+    const auto inj = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    ASSERT_EQ(mp.add_inject(inj, 0), Mempool::InjectGate::Ok);
+    dash::coin::BlockType b;
+    b.m_txs.push_back(inj);
+    mp.remember_confirmed_injects(b, 100);
+    mp.remove_for_block(b);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 1u);
+    dash::coin::BlockType empty;
+    mp.remember_confirmed_injects(empty, 100 + Mempool::kConfirmedInjectDepth);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 1u) << "still reachable by a rewind";
+    mp.remember_confirmed_injects(empty, 101 + Mempool::kConfirmedInjectDepth);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "beyond the undo keep";
+    EXPECT_TRUE(mp.readmit_disconnected_injects(100).readmitted.empty());
+    static_assert(Mempool::kConfirmedInjectDepth == 288, "the undo keep, DASH_MIN_BLOCKS_TO_KEEP");
+
+    // A non-inject (relayed) tx in a block is not kept.
+    Mempool mr; mr.set_utxo(&utxo);
+    arm_script_check(mr);
+    ASSERT_TRUE(mr.add_tx(inj));
+    mr.remember_confirmed_injects(b, 100);
+    EXPECT_EQ(mr.confirmed_injects_kept(), 0u);
+
+    // A connect at or below a kept height replaces that branch's entries.
+    Mempool ms; ms.set_utxo(&utxo);
+    arm_script_check(ms);
+    ASSERT_EQ(ms.add_inject(inj, 0), Mempool::InjectGate::Ok);
+    ms.remember_confirmed_injects(b, 200);
+    ms.remove_for_block(b);
+    ASSERT_EQ(ms.confirmed_injects_kept(), 1u);
+    ms.remember_confirmed_injects(empty, 200);
+    EXPECT_EQ(ms.confirmed_injects_kept(), 0u);
+}
+
+// (VERIFY-S2 S-3) The checkscripts=false start warning names the real trade:
+// an unverified tx costs the block, not a fee.
+TEST(DashTxInject, CheckscriptsOffWarningNamesTheLostBlock)
+{
+    const std::string w = dash::coin::kCheckscriptsOffConsequence;
+    EXPECT_NE(w.find("NOT script-verified"), std::string::npos);
+    EXPECT_NE(w.find("REJECTS the block"), std::string::npos);
+    EXPECT_NE(w.find("lost block, not a lost fee"), std::string::npos);
+    EXPECT_NE(w.find("inject-script-check-unarmed"), std::string::npos);
+}
+
+// (VERIFY-S2 N-1, M9) The script flags per served height are dashd 23.1.9's
+// GetBlockScriptFlags with the mainnet buried heights: P2SH always, DERSIG
+// from 245817, CLTV from 619382, CSV from 622944, NULLDUMMY from 939456
+// (dashcore bit values: P2SH 1<<0, DERSIG 1<<2, NULLDUMMY 1<<4, CLTV 1<<9,
+// CSV 1<<10). A height-0 caller and inject admission get every flag.
+TEST(DashTxInject, ScriptFlagsPerServedHeightAreDashds)
+{
+    constexpr uint32_t P2SH = 1u << 0, DERSIG = 1u << 2, NULLDUMMY = 1u << 4,
+                       CLTV = 1u << 9, CSV = 1u << 10;
+    constexpr uint32_t ALL = P2SH | DERSIG | NULLDUMMY | CLTV | CSV;
+    Key k(0x5d);
+    const uint256 prev = prevhash(0xe7);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+
+    uint32_t seen = 0;
+    int calls = 0;
+    auto spy = [&](const std::vector<uint8_t>&, uint32_t, const std::vector<uint8_t>&, uint32_t f) {
+        seen = f;
+        ++calls;
+        return true;
+    };
+    Mempool mp; mp.set_utxo(&utxo);
+    mp.set_script_check(spy);
+    ASSERT_TRUE(mp.add_tx(make_signed_spend(k, prev, 90'000)));
+    auto flags_at = [&](uint32_t next_height) {
+        seen = 0xffffffffu;
+        calls = 0;
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, next_height, 0);
+        EXPECT_EQ(selected.size(), 1u) << "h=" << next_height;
+        EXPECT_EQ(calls, 1) << "h=" << next_height;
+        return seen;
+    };
+    EXPECT_EQ(flags_at(1), P2SH);
+    EXPECT_EQ(flags_at(245816), P2SH);
+    EXPECT_EQ(flags_at(245817), P2SH | DERSIG);
+    EXPECT_EQ(flags_at(619381), P2SH | DERSIG);
+    EXPECT_EQ(flags_at(619382), P2SH | DERSIG | CLTV);
+    EXPECT_EQ(flags_at(622943), P2SH | DERSIG | CLTV);
+    EXPECT_EQ(flags_at(622944), P2SH | DERSIG | CLTV | CSV);
+    EXPECT_EQ(flags_at(939455), P2SH | DERSIG | CLTV | CSV);
+    EXPECT_EQ(flags_at(939456), ALL);
+    EXPECT_EQ(flags_at(2564045), ALL);
+    EXPECT_EQ(flags_at(0), ALL) << "a caller that serves no template gets every buried flag";
+
+    // Inject admission checks with every flag.
+    const uint256 prev2 = prevhash(0xe9);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mi; mi.set_utxo(&utxo);
+    mi.set_script_check(spy);
+    seen = 0;
+    calls = 0;
+    ASSERT_EQ(mi.add_inject(make_signed_spend(k, prev2, 100'000)), Mempool::InjectGate::Ok);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(seen, ALL);
+}
+
+// (M9, the consensus side of the table) A signature in lax DER (a needless
+// 0x00 pad on R) is valid before BIP66 and invalid from 245817 on, through
+// the real dashcore VerifyScript: the served height's DERSIG flag decides.
+TEST(DashTxInject, LaxDerSignatureServedOnlyBelowBip66)
+{
+    Key k(0x5e);
+    const uint256 prev = prevhash(0xea);
+    auto tx = make_signed_spend(k, prev, 90'000);
+    {
+        // scriptSig = <push L+1> <DER sig, sighash byte> <push 33> <pubkey>
+        auto ss = tx.vin[0].scriptSig.m_data;
+        ASSERT_EQ(ss[1], 0x30);
+        ASSERT_EQ(ss[3], 0x02);
+        std::vector<uint8_t> lax;
+        lax.push_back(static_cast<uint8_t>(ss[0] + 1));
+        lax.push_back(0x30);
+        lax.push_back(static_cast<uint8_t>(ss[2] + 1));
+        lax.push_back(0x02);
+        lax.push_back(static_cast<uint8_t>(ss[4] + 1));
+        lax.push_back(0x00);                       // the needless pad
+        lax.insert(lax.end(), ss.begin() + 5, ss.end());
+        tx.vin[0].scriptSig = to_script(lax);
+    }
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    ASSERT_TRUE(mp.add_tx(tx));
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 245816, 0).first.size(), 1u)
+        << "lax DER is valid before BIP66";
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 245817, 0).first.size(), 0u)
+        << "and non-DER from BIP66 on";
+    EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 2564045, 0).first.size(), 0u);
+}
+
+// (VERIFY-S2b N-B, R3-2; the verifier's KAT V1, ported) A child inject
+// spending a parent inject, confirmed in two consecutive blocks that a reorg
+// takes out together: both come back, the parent first (re-admitting the
+// child first refuses it inject-unpriceable), both priced at fee 0, and the
+// next template carries P before C. Then the new branch double-spends P's
+// input: P is conflict-evicted at the connect and the orphaned child is never
+// served.
+TEST(DashTxInject, ChainOfInjectsAcrossTwoRewoundBlocksComesBackParentFirst)
+{
+    using namespace dash_utxo_full;
+    Key k(0xd1);
+    const uint256 prevA = prevhash(0x91);
+    TxOut toK; toK.value = 100'000; toK.scriptPubKey = to_script(k.spk);
+    const auto P = make_signed_spend_outs(k, prevA, {toK});              // zero fee
+    const auto C = make_signed_spend_outs(k, dash_txid(P), {toK});       // zero fee, spends P:0
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-chain");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    Mempool mp;
+    lane.attach(mp);
+    arm_script_check(mp);
+    lane.on_header_tip(kB);
+
+    ASSERT_EQ(mp.add_inject(P, 0), Mempool::InjectGate::Ok);
+    const BlockType a1 = block(base_hash, {coinbase(50, 2001), P}, 2001);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_EQ(mp.confirmed_injects_kept(), 1u);
+
+    ASSERT_EQ(mp.add_inject(C, 0), Mempool::InjectGate::Ok) << "P:0 is in the view now";
+    const BlockType a2 = block(hash_of(a1), {coinbase(50, 2002), C}, 2002);
+    chain.hashes[kB + 2] = hash_of(a2);
+    lane.on_block_connected(a2, kB + 2);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a2));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_EQ(mp.confirmed_injects_kept(), 2u);
+
+    // Both blocks leave the header chain.
+    chain.hashes[kB + 1] = fake_hash(6001);
+    chain.hashes[kB + 2] = fake_hash(6002);
+    lane.on_header_tip(kB + 2);
+    ASSERT_EQ(lane.full_status().rewinds, 2u);
+    ASSERT_EQ(lane.cache()->get_best_block(), base_hash);
+    ASSERT_FALSE(lane.withheld());
+    const auto back = mp.inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 2u) << "parent and child are both back";
+    const auto eP = mp.get_entry(dash_txid(P));
+    const auto eC = mp.get_entry(dash_txid(C));
+    ASSERT_TRUE(eP.has_value());
+    ASSERT_TRUE(eC.has_value());
+    EXPECT_TRUE(eP->fee_fold_proven);
+    EXPECT_TRUE(eC->fee_fold_proven);
+    EXPECT_EQ(eP->fee, 0u);
+    EXPECT_EQ(eC->fee, 0u);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "each one left the kept list";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 1, 0);
+        ASSERT_EQ(selected.size(), 2u) << "both ride the next template";
+        EXPECT_EQ(dash_txid(selected[0].tx), dash_txid(P)) << "parent first";
+        EXPECT_EQ(dash_txid(selected[1].tx), dash_txid(C));
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // The new branch double-spends P's input.
+    TxOut toK90; toK90.value = 90'000; toK90.scriptPubKey = to_script(k.spk);
+    const auto T = make_signed_spend_outs(k, prevA, {toK90});           // fee 10'000, not ours
+    const BlockType b1 = block(base_hash, {coinbase(50, 3001), T}, 3001);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_FALSE(mp.get_entry(dash_txid(P)).has_value()) << "P conflicts with T: evicted";
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "b1 confirmed no inject of ours";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 2, 0);
+        EXPECT_TRUE(selected.empty()) << "the orphaned child is not served";
+        EXPECT_EQ(fees, 0u);
+    }
+}
+
+// (VERIFY-S2b S-B, R3-3) A rewind puts back only the injects the inject
+// ledger still tracks: one whose expiry_height the tip passed while it was
+// confirmed was reaped from the ledger and stays out (it would otherwise come
+// back untracked and never expire); one without an expiry comes back.
+TEST(DashTxInject, ExpiredInjectIsNotPutBackByARewind)
+{
+    using namespace dash_utxo_full;
+    Key k(0xc5);
+    const uint256 prevA = prevhash(0x85), prevB = prevhash(0x86);
+    const auto expiring = make_signed_spend(k, prevA, 100'000);
+    const auto standing = make_signed_spend(k, prevB, 100'000);
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-expiry");
+    dash::coin::UtxoLane lane;
+    SnapCoin a, b;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    b.op = Outpoint(prevB, 0);
+    b.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    NodeCoinState st;
+    arm_ncs(st, *lane.cache());
+    lane.attach(st.mempool());
+    lane.on_header_tip(kB);
+    st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+    ASSERT_TRUE(st.submit_inject(expiring, 0, /*expiry_height=*/kB + 1,
+                                 NodeCoinState::InjectOrigin::Local, 0).ok);
+    ASSERT_TRUE(st.submit_inject(standing, 0, /*expiry_height=*/0,
+                                 NodeCoinState::InjectOrigin::Local, 0).ok);
+
+    const BlockType a1 = block(base_hash, {coinbase(50, 2301), expiring, standing}, 2301);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_EQ(st.mempool().confirmed_injects_kept(), 2u);
+    // The tip moves to kB+1: the next block is kB+2, past the expiry.
+    st.set_tip(kB + 1, hash_of(a1), 0x1b104be3u, 1'700'000'100u, 76, 16);
+    ASSERT_EQ(st.inject_pool_size(), 1u) << "the ledger reaped the expired inject";
+
+    chain.hashes[kB + 1] = fake_hash(6301);
+    lane.on_header_tip(kB + 1);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    const auto back = st.mempool().inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 1u) << "only the inject the ledger still tracks comes back";
+    EXPECT_EQ(back[0], dash_txid(standing));
+    EXPECT_FALSE(st.mempool().get_entry(dash_txid(expiring)).has_value());
+    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
 }

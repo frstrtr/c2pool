@@ -679,6 +679,22 @@ bool leveldb_dir_lock_held(const std::string& dir, long* holder_pid)
     return false;
 #else
     const std::string lock = (std::filesystem::path(dir) / "LOCK").string();
+    {
+        // Our own open DB first: the probe below closes a descriptor of LOCK,
+        // which would drop this process's record lock if it held one.
+        std::error_code ec;
+        const auto want = std::filesystem::weakly_canonical(lock, ec);
+        if (!ec && std::filesystem::exists("/proc/self/fd", ec)) {
+            for (const auto& ent : std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+                std::error_code lec;
+                const auto target = std::filesystem::read_symlink(ent.path(), lec);
+                if (!lec && target == want) {
+                    if (holder_pid) *holder_pid = static_cast<long>(::getpid());
+                    return true;
+                }
+            }
+        }
+    }
     const int fd = ::open(lock.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return false;  // no LOCK file: nobody has opened this directory as a DB
@@ -798,6 +814,9 @@ SnapshotImportResult import_utxo_snapshot(const std::vector<std::string>& parts,
     Outpoint op;
     Coin coin;
     while (rd.next(op, coin)) {
+        if (opts.refuse_spent_shaped_coins && coin.value == 0 && coin.scriptPubKey.m_data.empty())
+            return fail(R::kSpentShapedCoin, "coin " + outpoint_str(op) +
+                                                 " has value 0 and an empty script (Coin::is_spent() reads it as absent)");
         if (!hasher.add(op, coin))
             return fail(R::kUnordered, hasher.refusal());
         if (opts.log_every && rd.coins_read() % opts.log_every == 0)
@@ -888,6 +907,8 @@ SnapshotImportResult import_utxo_snapshot(const std::vector<std::string>& parts,
     {
         core::LevelDBStore::BatchWriter fb(&store);
         fb.put(std::string(1, 'B'), encode_view_db_best(meta.base_blockhash, pin.height));
+        for (const auto& [key, value] : opts.final_records)
+            fb.put(key, value);
         if (!fb.commit_sync())
             return abort_wipe(R::kDbWriteFailed, "best block record");
     }
