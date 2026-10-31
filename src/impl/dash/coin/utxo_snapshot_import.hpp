@@ -26,10 +26,11 @@
 /// (FullOpen below leaves it to UtxoLane::verify_base).
 ///
 /// OPEN RULE (VERIFY-S1 S2-2). The directory is the node's full set only if:
-///   'B' and 'S' are present, 'S' is tracked with anchor 0 and strict, 'A'
-///   parses, 'A' is DASH on the node's network, its base is at or above the
-///   checkpoint and at or below the set's best. 'C' records without 'B'/'S'
-///   (an import cut short) refuse by name; the operator deletes the directory.
+///   'B' and 'S' are present, 'S' is tracked with anchor 0 and strict, 'S'
+///   names 'B''s height as its best, 'A' parses, 'A' is DASH on the node's
+///   network, its base is at or above the checkpoint and at or below the set's
+///   best. 'C' records without 'B'/'S' (an import cut short), or 'S' apart
+///   from 'B', refuse by name; the operator deletes the directory.
 ///   header(best) == best is the lane's check (UtxoLane::verify_base), run when
 ///   the header chain holds that height.
 ///
@@ -280,6 +281,12 @@ inline DashFullSetOpen open_dash_full_utxo_set(const std::string& db_path, const
         return refuse(R::kFullDbNotTracked, "sync state anchor=" + std::to_string(sync.anchor_height) +
                                                 " strict=" + std::to_string(int(sync.strict)) +
                                                 ": not a full set");
+    // 'B' and 'S' are written in one batch: apart, the set is corrupt or tampered (VERIFY-S2 N-2).
+    if (sync.best_height != out.db->get_best_height())
+        return refuse(R::kFullDbIncomplete, "sync state best " + std::to_string(sync.best_height) +
+                                                " != best block height " +
+                                                std::to_string(out.db->get_best_height()) +
+                                                "; delete the directory and import again");
     std::vector<uint8_t> raw;
     if (!out.db->get_record(::core::coin::AssumedBase::key(), raw) || !out.assumed.deserialize(raw))
         return refuse(R::kFullDbNoAssumed, "no readable assumed-base record");

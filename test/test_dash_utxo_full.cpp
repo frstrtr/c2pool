@@ -585,3 +585,27 @@ TEST(DashUtxoLane, FailedFlushDropsTheUnflushedChanges)
         << "the failed block's changes are dropped: the view is the DB's again";
     ASSERT_EQ(r.alerts.size(), 1u);
 }
+
+TEST(DashUtxoLane, FullDbOpenRefusesASyncStateApartFromTheBestBlock)
+{
+    // VERIFY-S2 N-2: 'B' and 'S' are written in one batch, so a sync state
+    // whose best height is not the best block's is corruption or tampering.
+    // The open refuses it like a cut-short import and the node stays on the
+    // accrual view.
+    TempDir tmp("sbest");
+    import_only(tmp, "full", fake_hash(1000));
+    {
+        ::core::LevelDBStore s(tmp.sub("full"), ::core::LevelDBOptions{});
+        ASSERT_TRUE(s.open());
+        std::vector<uint8_t> b;
+        ASSERT_TRUE(s.get("B", b));
+        ASSERT_EQ(b.size(), 36u);
+        const uint32_t h = kBase + 1;   // 'S' still says kBase
+        for (int i = 0; i < 4; ++i) b[32 + i] = static_cast<uint8_t>(h >> (8 * i));
+        ASSERT_TRUE(s.put("B", b));
+        s.close();
+    }
+    auto o = dash::coin::open_dash_full_utxo_set(tmp.sub("full"), "regtest", 0);
+    EXPECT_FALSE(o.ok());
+    EXPECT_EQ(o.refusal, R::kFullDbIncomplete) << o.detail;
+}
