@@ -10151,6 +10151,66 @@ void statustime() {
           "bracket, and rise");
 }
 
+// statusroots: the status block's roots line (serve_pathb prints it after `  time: t=`) from the current template
+// (PathbJobSource::current()): "  roots: tip=<16 hex>", the tip whose window_root and mmr_root `status: up=` prints;
+// "-" with no template. A's pass: the view at its start (id= on `status: up=`) at tip T; B's carrier on T reaches A in
+// the pass; A's template at print is on T's successor S: the roots line names S, and S's window_root and mmr_root
+// equal B's at S (B's view and template both at S); T's own window_root differs.
+void statusroots() {
+    const KatNet net;
+    Harness h(net);
+    const std::size_t a = h.add(table0(net), true), b = h.add(table0(net), true);
+    for (int i = 0; i < 6; ++i) {
+        h.tick_monero();
+        h.mine(i % 2 == 0 ? a : b, static_cast<std::size_t>(1 + i % 3), 300 + static_cast<std::uint32_t>(i));
+    }
+    const auto hex16 = [](const pb::Hash32& x) { return hex(x.data(), x.size()).substr(0, 16); };
+    pb::PathbJobSource js([&](const pb::PathbTemplate& t, const pb::PathbSession& ss) { return h[a].make_job(t, ss); });
+    const auto roots_now = [&js] {
+        const std::optional<pb::PathbTemplate> c = js.current();
+        return pb::status_roots_line(c ? &c->tip : nullptr);
+    };
+    const std::string none = roots_now();
+    // the pass's view at its start
+    const pb::Hash32 view_id = h[a].tree().best().id;
+    const std::uint64_t view_pos = h[a].tree().best().pos;
+    const pb::PathbTemplate t0 = h[a].make_template(h.now);
+    (void)js.set_template(t0, pb::JobNetwork{});
+    const std::string same = roots_now();
+    // B's carrier on T reaches A within the pass
+    h.tick_monero();
+    const pb::NodeEventResult rb = h.mine(b, 4, 400);
+    const pb::Hash32 succ = h[a].tree().best().id;
+    const pb::CarrierNode* sn = h[a].tree().find(succ);
+    const pb::PathbTemplate t1 = h[a].make_template(h.now);
+    (void)js.set_template(t1, pb::JobNetwork{});
+    const std::optional<pb::PathbTemplate> cur = js.current();
+    const std::string moved = roots_now();
+    const pb::PathbTemplate tb = h[b].make_template(h.now);
+    js.clear();
+    const std::string cleared = roots_now();
+    std::printf("  statusroots: view %s pos %llu; template %s x %llu: \"%s\"; window_root %s (B at %s: %s; T: %s)\n",
+                hex16(view_id).c_str(), (unsigned long long)view_pos, hex16(t1.tip).c_str(), (unsigned long long)t1.x,
+                moved.c_str(), hex16(t1.window.window_root).c_str(), hex16(tb.tip).c_str(),
+                hex16(tb.window.window_root).c_str(), hex16(t0.window.window_root).c_str());
+    check(none == "  roots: tip=-" && pb::status_roots_line(nullptr) == "  roots: tip=-",
+          "statusroots: no template: \"  roots: tip=-\"");
+    check(t0.status == pb::TemplateStatus::Ok && t0.tip == view_id && same == "  roots: tip=" + hex16(view_id),
+          "statusroots: the template on the view's tip: the roots line names that tip (" + same + ")");
+    check(rb.action == pb::NodeAction::Placed && sn != nullptr && sn->parent == view_id && sn->pos == view_pos + 1 &&
+                  t1.status == pb::TemplateStatus::Ok && t1.tip == succ && t1.x == view_pos + 2 && cur && cur->tip == succ,
+          "statusroots: setup (B's carrier on the view's tip placed at A; A's template at print on that successor)");
+    check(moved == "  roots: tip=" + hex16(succ) && hex16(succ) != hex16(view_id) && moved.size() == 29,
+          "statusroots: the template on the view tip's successor: the roots line names the successor, not id= (" + moved +
+                  ")");
+    check(cur && h[b].tree().best().id == succ && tb.status == pb::TemplateStatus::Ok && tb.tip == succ &&
+                  tb.window.window_root == cur->window.window_root && tb.window.mmr_root == cur->window.mmr_root &&
+                  t0.window.window_root != cur->window.window_root,
+          "statusroots: window_root and mmr_root of A's template equal B's at the roots tip; the view tip's window_root "
+          "differs");
+    check(cleared == "  roots: tip=-", "statusroots: the template withdrawn (clear()): \"  roots: tip=-\"");
+}
+
 struct Branches {
     KatRelay a, b;
     bool ok = true;
@@ -14462,6 +14522,7 @@ int main(int argc, char** argv) {
                                 {"placedvariant", placedvariant, 0},
                                 {"revnotcarrier", revnotcarrier, 0},
                                 {"statustime", statustime, 0},
+                                {"statusroots", statusroots, 0},
                                 {"catchkeep", catchkeep, 0},
                                 {"catchlight", catchlight, 0},
                                 {"catchoffer", catchoffer, 0},

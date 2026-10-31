@@ -92,6 +92,7 @@ static xweb::XmrWebState fixture(std::uint64_t foreign) {
     s.pathb.tip_pos = 120; s.pathb.tip_id_hex = std::string(64, 'd'); s.pathb.cum_work = "123456789";
     s.pathb.epoch_cur = 0; s.pathb.h_hold = 0;
     s.pathb.window_root_hex = std::string(64, 'e'); s.pathb.mmr_root_hex = std::string(64, 'f'); s.pathb.leaf_count = 7;
+    s.pathb.roots_tip_hex = std::string(64, 'a');
     s.pathb.pending = 3; s.pathb.deferred = 1; s.pathb.repended_last_switch = 2; s.pathb.template_status = "ok";
     s.window = {{kA, 0.6, 600000000000ULL}, {kB, 0.4, 400000000000ULL}};
     xweb::XmrWebFound b1; b1.height = 2999; b1.id_hex = std::string(64, 'b'); b1.time = 1700000000;
@@ -181,6 +182,9 @@ int main() {
           vs["pathb"].value("window_root", std::string()) == std::string(64, 'e') &&
           vs["pathb"].value("mmr_root", std::string()) == std::string(64, 'f') && vs["pathb"].value("leaf_count", 0ULL) == 7ULL,
           "/v37_status pathb: best tip (pos, id, cum_work), epoch_cur, window_root, mmr_root, leaf_count");
+    CHECK(vs.contains("pathb") && vs["pathb"].value("roots_tip", std::string()) == std::string(64, 'a') &&
+          vs["pathb"]["best_tip"].value("id", std::string()) == std::string(64, 'd'),
+          "/v37_status pathb: roots_tip (the template's tip of window_root and mmr_root) beside best_tip.id");
     CHECK(vs.contains("relay") && vs["relay"].value("ready", 0ULL) == 2ULL && vs["relay"].value("conns", 0ULL) == 2ULL, "/v37_status relay");
     CHECK(vs.contains("stratum") && vs["stratum"].value("port", 0) == 7251 && vs["stratum"].value("host", std::string()) == "127.0.0.1",
           "/v37_status stratum endpoint");
@@ -194,6 +198,10 @@ int main() {
     CHECK(xp.contains("pathb") && xp["pathb"].value("pending", 0ULL) == 3ULL && xp["pathb"].value("deferred", 0ULL) == 1ULL &&
           xp["pathb"].value("repended_last_switch", 0ULL) == 2ULL && xp["pathb"].value("template", std::string()) == "ok" &&
           xp["pathb"].value("h_hold", 9ULL) == 0ULL, "/xmr/pathb status: pending, deferred, re-pended, template, H_hold");
+    CHECK(xp.contains("pathb") && xp["pathb"].value("roots_tip", std::string()) == std::string(64, 'a') &&
+          xp["pathb"].value("window_root", std::string()) == std::string(64, 'e') &&
+          xp["pathb"].value("mmr_root", std::string()) == std::string(64, 'f'),
+          "/xmr/pathb status: roots_tip, window_root, mmr_root");
     CHECK(xp.contains("pathb") && xp["pathb"].contains("alarms") && !xp["pathb"]["alarms"].value("hold", true) &&
           !xp["pathb"]["alarms"].value("fork_fuse", true) && !xp["pathb"]["alarms"].value("store_poisoned", true) &&
           xp["pathb"]["alarms"].value("coinbase_internal", 9ULL) == 0ULL, "/xmr/pathb alarms");

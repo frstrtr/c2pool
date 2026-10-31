@@ -16,11 +16,15 @@
 // An absent pool transport reports 0 for its counters.
 // serve_pathb's status block also prints
 //   time: t=                 the wall time at the block's print, unix ms
+//   roots: tip=              the tip of the current template (16 hex digits; -:
+//                            no template), the tip of window_root= and
+//                            mmr_root= on status: up=
 //
 // Header-only.
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <array>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +134,19 @@ inline std::string find_path_line(const KeptStatusValues& v) {
 // serve_pathb's status block: the line after `status: up=`.
 inline std::string status_time_line(std::uint64_t unix_ms) {
     return status_detail::fmt("  time: t=%llu", status_detail::u(unix_ms));
+}
+
+// serve_pathb's status block: the line after `  time: t=`: the first 16 hex digits of the current template's tip, the
+// tip of the window_root= and mmr_root= that `status: up=` prints; "-": no template.
+inline std::string status_roots_line(const std::array<std::uint8_t, 32>* tip) {
+    std::string s = "  roots: tip=";
+    if (tip == nullptr) return s + "-";
+    static const char* const k = "0123456789abcdef";
+    for (std::size_t i = 0; i < 8; ++i) {
+        s.push_back(k[(*tip)[i] >> 4]);
+        s.push_back(k[(*tip)[i] & 0x0f]);
+    }
+    return s;
 }
 
 // The four lines in the order master prints them.
