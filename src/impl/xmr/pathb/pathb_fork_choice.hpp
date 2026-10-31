@@ -610,22 +610,29 @@ public:
         return rt_wide::u128_sub(find(tip)->cum_work, find(fork)->cum_work);
     }
 
-    // Headers-first: the side headers after `fork` (chain order) with their
-    // retarget d as work. pow_ok(header, d) is the caller's PoW check. Headers
-    // after the first failed one are marked failed. nullopt: fork not held.
-    // A header carries no carried bodies: no receipts_root fold and no S here;
-    // both are checked when the carrier is placed with its carried list.
-    template <class PowCheck>
-    std::optional<std::vector<SideHeader>> check_side_headers(const Hash32& fork,
-                                                              std::span<const CarrierAnnounce> headers,
-                                                              PowCheck&& pow_ok) const {
+    // The carried state of a side-header check: the retarget window after the
+    // last checked header, its id and record height.
+    struct SideFold {
+        RetargetWindow window;
+        Hash32 prev{};
+        std::uint64_t record = 0;
+    };
+    // The state at a held `fork`; nullopt: not held, or its window leaves the
+    // held prefix of a joined tree.
+    std::optional<SideFold> side_fold_at(const Hash32& fork) const {
         const auto fi = index_.find(fork);
         if (fi == index_.end()) return std::nullopt;
-        const std::optional<RetargetWindow> w0 = window_after_index(fi->second);
-        if (!w0) return std::nullopt;  // the window leaves the held prefix of a joined tree
-        RetargetWindow w = *w0;
-        Hash32 prev = fork;
-        std::uint64_t prev_record = nodes_[fi->second].H;
+        std::optional<RetargetWindow> w0 = window_after_index(fi->second);
+        if (!w0) return std::nullopt;
+        return SideFold{std::move(*w0), fork, nodes_[fi->second].H};
+    }
+    // The side headers after the state `f` (chain order) with their retarget
+    // d as work; `f` advances over the headers that pass. pow_ok(header, d)
+    // is the caller's PoW check. Headers after the first failed one are
+    // marked failed.
+    template <class PowCheck>
+    std::vector<SideHeader> step_side_headers(SideFold& f, std::span<const CarrierAnnounce> headers,
+                                              PowCheck&& pow_ok) const {
         bool failed = false;
         std::vector<SideHeader> out;
         out.reserve(headers.size());
@@ -637,18 +644,31 @@ public:
                 out.push_back(s);
                 continue;
             }
-            s.work = w.next_difficulty();
-            if (hdr.parent != prev || !carrier_height_admissible(prev_record, hdr.h) || !pow_ok(hdr, s.work)) {
+            s.work = f.window.next_difficulty();
+            if (hdr.parent != f.prev || !carrier_height_admissible(f.record, hdr.h) || !pow_ok(hdr, s.work)) {
                 s.check = HeaderCheck::Failed;
                 failed = true;
             } else {
-                prev_record = record_height(prev_record, hdr.h);
-                w.push(RetargetEntry{s.work, prev_record});
-                prev = hdr.id;
+                f.record = record_height(f.record, hdr.h);
+                f.window.push(RetargetEntry{s.work, f.record});
+                f.prev = hdr.id;
             }
             out.push_back(s);
         }
         return out;
+    }
+    // Headers-first: the side headers after `fork` (chain order) with their
+    // retarget d as work. pow_ok(header, d) is the caller's PoW check. Headers
+    // after the first failed one are marked failed. nullopt: fork not held.
+    // A header carries no carried bodies: no receipts_root fold and no S here;
+    // both are checked when the carrier is placed with its carried list.
+    template <class PowCheck>
+    std::optional<std::vector<SideHeader>> check_side_headers(const Hash32& fork,
+                                                              std::span<const CarrierAnnounce> headers,
+                                                              PowCheck&& pow_ok) const {
+        std::optional<SideFold> f = side_fold_at(fork);
+        if (!f) return std::nullopt;
+        return step_side_headers(*f, headers, std::forward<PowCheck>(pow_ok));
     }
 
     // decide_side_branch against the best tip, for side headers after `fork`.

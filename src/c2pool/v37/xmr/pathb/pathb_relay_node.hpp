@@ -2289,6 +2289,7 @@ private:
                     hdr_sent_[it->first] = HdrSent{w.from, w.stop, w.objs};
                 } else {
                     hdr_sent_.erase(it->first);
+                    if (const auto c = catchup_.find(it->first); c != catchup_.end()) c->second.asked_ms = now_ms();
                 }
                 q.pop_front();
                 break;  // one in flight per peer
@@ -3067,6 +3068,7 @@ private:
         using K = PathbNode::HeadersOutcome::Kind;
         PathbNode::HeadersOutcome o;
         bool join = false;
+        std::string jp_line;
         {
             const NodeGuard g(*this);
             PathbNode::Arrival arrival;  // a reply to the node's own request: its arrival in link order (E-194)
@@ -3151,6 +3153,9 @@ private:
                             catchup_.erase(it);
                             caught_up_locked();
                             break;
+                        case K::Continue:  // the next page of the comparison went out
+                            it->second.asked_ms = now_ms();
+                            break;
                         case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
                                               // the page lapses
                             if (o.fetch_last != Hash32{}) {
@@ -3164,8 +3169,17 @@ private:
                 }
                 serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
-            if (o.kind == K::JoinerPath) join = true;
+            if (o.kind == K::JoinerPath) {
+                join = true;
+                const std::uint64_t base = node_->store().base_pos();
+                const std::optional<std::uint64_t> x1 = node_->switch_x1();
+                const std::string test = o.fork_pos < base || !x1 ? " below the journal base " + std::to_string(base)
+                                                                  : " at or below x1 " + std::to_string(*x1);
+                jp_line = "relay: headers from peer " + std::to_string(p) + " win; fork at " + std::to_string(o.fork_pos) +
+                          test + ": offered to the joiner";
+            }
         }
+        if (!jp_line.empty()) log(jp_line);
         if ((o.kind == K::Unsolicited || o.kind == K::Retired) && !o.why.empty())
             log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
@@ -3814,6 +3828,7 @@ private:
                 const bool done = node_->holds_tip(it->second.tip) || node_->rests_on_claims();
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
+                    node_->end_comparison(it->first);  // no next page of its comparison
                     it = catchup_.erase(it);
                     continue;
                 }
@@ -3845,7 +3860,7 @@ private:
                 }
                 // again from the new best tip (the locator from its step 0), or after a request that got no reply
                 // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
-                if (c.fetch_tip == Hash32{} && c.asked_best != b.id) {
+                if (c.fetch_tip == Hash32{} && c.asked_best != b.id && !node_->comparison_paused(it->first)) {
                     c.step = 0;
                     catchup_ask_locked(it->first, c);
                 } else if (c.fetch_tip == Hash32{} && !deferred && now_ms() >= c.asked_ms + abandon_s_ * 1000) {

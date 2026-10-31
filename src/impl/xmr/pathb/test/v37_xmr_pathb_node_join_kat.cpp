@@ -1682,6 +1682,78 @@ void x8claim() {
 
 
 // ---------------------------------------------------------------------------
+// r60seed (ruling 60 at the comparison's seed; "alone" across pages): a joined node, the seed (B's fork, f) at x <= x1.
+//   (a) the comparison's first header with its h below the seed's claimed record: ClaimLeaf (alarm + DEFER), 0 tokens;
+//   (b) a comparison at max 2: page 1, B's next two headers (they raise the record); page 2's first header with its h
+//       below the seed's record: STRIKE (the record it fails is not the seed's alone).
+void r60seed() {
+    const auto t0 = std::chrono::steady_clock::now();
+    JoinNet net(900);
+    const std::uint64_t L = 4704, f = 2400, J = 4000;
+    ChainShape sb;
+    sb.nonce0 = 7270000;
+    KatNode a(net, kJ);
+    grow(a, f);
+    KatNode b(a);
+    grow(a, L - f);
+    grow(b, L + 120 - f, sb);
+    Harness h(net);
+    Joined jd = join_at(h, net, a, J);
+    check(jd.ok, "r60seed: joined at L with P-01 4,000");
+    if (!jd.ok) return;
+    const std::size_t j = jd.jn.j;
+    const std::size_t sb_ = h.nodes.size();
+    h.nodes.push_back(server_from(h, b, kJ, sb_));
+    const std::uint64_t x1 = h[j].joined()->x1;
+    const pb::CarrierBodyV3* early = a.bodies.get(at_pos(a, 10));
+    (void)h.hello(j, sb_);
+    using K = pb::PathbNode::HeadersOutcome::Kind;
+    // the request at the head of the queue served by B: its first frame decoded
+    const auto serve = [&](pb::HeadersReply& rep) {
+        for (auto it = h.q.begin(); it != h.q.end(); ++it)
+            if (!it->frame.empty() && it->frame[0] == pb::kOpFcGetHeaders) {
+                const std::vector<std::vector<std::uint8_t>> r = h[sb_].serve_getheaders(j, it->frame, h.now).frames;
+                h.q.erase(it);
+                return !r.empty() && pb::decode_fc_headers(r[0], 0, 1u << 22, pb::kRuledLaneParams, rep).ok() &&
+                       !rep.headers.empty();
+            }
+        return false;
+    };
+    // (a)
+    h.q.clear();
+    pb::HeadersReply ra;
+    const bool asked_a = h[j].request_headers(sb_, at_pos(a, f), b.store.best_tip(), 1, h.now) && serve(ra);
+    if (asked_a) ra.headers[0].own.blob.prev_id = early->own.blob.prev_id;
+    const std::size_t al0 = h[j].alarms().count();
+    const pb::PathbNode::HeadersOutcome oa =
+            asked_a ? h[j].on_headers(sb_, *pb::encode_fc_headers(ra, 1u << 22), h.now) : pb::PathbNode::HeadersOutcome{};
+    const std::size_t al_a = h[j].alarms().count() - al0;
+    // (b)
+    h.q.clear();
+    pb::HeadersReply r1, r2;
+    const bool asked_b = h[j].request_headers(sb_, at_pos(a, f), b.store.best_tip(), 2, h.now) && serve(r1);
+    const pb::PathbNode::HeadersOutcome o1 =
+            asked_b ? h[j].on_headers(sb_, *pb::encode_fc_headers(r1, 1u << 22), h.now) : pb::PathbNode::HeadersOutcome{};
+    const bool cont = o1.kind == K::Continue && serve(r2);
+    if (cont) {
+        r2.headers.resize(1);
+        r2.headers[0].own.blob.prev_id = early->own.blob.prev_id;
+    }
+    const std::size_t al1 = h[j].alarms().count();
+    const pb::PathbNode::HeadersOutcome o2 =
+            cont ? h[j].on_headers(sb_, *pb::encode_fc_headers(r2, 1u << 22), h.now) : pb::PathbNode::HeadersOutcome{};
+    const std::size_t al_b = h[j].alarms().count() - al1;
+    std::printf("  r60seed: x1 %llu, the seed %llu; (a) kind %d, alarms +%zu; (b) page 1 kind %d, page 2 kind %d, alarms +%zu; "
+                "%.1f s\n",
+                (unsigned long long)x1, (unsigned long long)f, static_cast<int>(oa.kind), al_a, static_cast<int>(o1.kind),
+                static_cast<int>(o2.kind), al_b, secs_since(t0));
+    check(f <= x1 && asked_a && oa.kind == K::Defer && oa.indexed == 0 && al_a == 1,
+          "r60seed (a): the comparison's first header below the seed's claimed record: ClaimLeaf, no STRIKE");
+    check(asked_b && cont && o2.kind == K::Strike && al_b == 0,
+          "r60seed (b): page 1 raised the record; page 2's header below the seed's record: STRIKE, no alarm");
+}
+
+// ---------------------------------------------------------------------------
 // bwyoung: a young chain joined in full, pruned (--pathb-body-keep 10) and restarted: A's bound work counts from
 // position 1 (K_BWORK below the root, written from 1), the profile of its session.
 void bwyoung() {
@@ -2984,6 +3056,7 @@ int main(int argc, char** argv) {
                                 {"x1r", x1r, 41},
                                 {"x1l", x1l, 29},
                                 {"x8claim", x8claim, 31},
+                                {"r60seed", r60seed, 20},
                                 {"prunedj", prunedj, 43},
                                 {"reaskrelay", reaskrelay, 28},
                                 {"joinedpeer", joinedpeer, 45},

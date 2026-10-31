@@ -209,7 +209,7 @@ if (BUILD_TESTING)
         add_test(NAME v37_xmr_pathb_node_kat_s${_node_shard}
                 COMMAND v37_xmr_pathb_node_kat --shard=${_node_shard}/${_node_n} --out=${_node_out})
         set_tests_properties(v37_xmr_pathb_node_kat_s${_node_shard} PROPERTIES
-                LABELS slow COST 341 FIXTURES_SETUP v37_xmr_pathb_node_kat_shards)
+                LABELS slow COST 369 FIXTURES_SETUP v37_xmr_pathb_node_kat_shards)
     endforeach()
     add_test(NAME v37_xmr_pathb_node_kat COMMAND v37_xmr_pathb_node_kat --gather=${_node_n} --out=${_node_out})
     set_tests_properties(v37_xmr_pathb_node_kat PROPERTIES
