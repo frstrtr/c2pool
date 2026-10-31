@@ -67,6 +67,8 @@
 ///     named reason in the status), and never heals by jumping or wiping;
 ///   - a best block that left the header chain's best is disconnected from
 ///     its undo record (rewind), back to the base at most; deeper withholds.
+///     An inject the rewound blocks had confirmed is put back into the inject
+///     set (Mempool::readmit_disconnected_injects, the normal admission gate);
 ///   - a flush that fails drops the unflushed changes (discard_pending) and
 ///     withholds, so nothing prices from coins the DB does not have.
 ///
@@ -624,10 +626,20 @@ private:
     }
 
     /// Disconnect, from the undo records, every best block that is no longer
-    /// the header chain's block at its height. False = withheld.
+    /// the header chain's block at its height. False = withheld. The injects
+    /// the disconnected blocks had confirmed go back into the inject set once
+    /// the rewind is done (parents before children, VERIFY-S2 S-2).
     bool rewind_to_best_chain()
     {
         if (!m_hash_at) return true;
+        uint32_t lowest = 0;   // the lowest height disconnected (0: none)
+        const bool ok = rewind_steps(lowest);
+        if (lowest != 0) put_back_injects(lowest);
+        return ok;
+    }
+
+    bool rewind_steps(uint32_t& lowest)
+    {
         while (true) {
             const uint32_t bh = m_cache->get_best_height();
             const uint256 best = m_cache->get_best_block();
@@ -661,10 +673,29 @@ private:
             }
             m_db->remove_block_undo(bh);
             ++m_rewinds;
+            lowest = bh;
             LOG_WARNING << "[EMB-DASH] UTXO rewind: h=" << bh << " " << best.GetHex().substr(0, 16)
-                        << " left the header chain's best; best is now h=" << (bh - 1);
+                        << " left the header chain's best; best is now h=" << (bh - 1) << "; its "
+                        << u.tx_undos.size() << " non-coinbase tx(s) left the chain (relayed txs are"
+                        << " not put back; injects are)";
             if (m_bs.active) restart_fill();
         }
+    }
+
+    /// The injects confirmed at `from_height` and above, back into the inject
+    /// set through the normal admission gate; each verdict is logged.
+    void put_back_injects(uint32_t from_height)
+    {
+        if (!m_pool) return;
+        const auto r = m_pool->readmit_disconnected_injects(from_height);
+        if (r.readmitted.empty() && r.refused.empty()) return;
+        LOG_WARNING << "[EMB-DASH] UTXO rewind from h=" << from_height << ": " << r.readmitted.size()
+                    << " inject(s) the rewound block(s) confirmed are back in the inject set, "
+                    << r.refused.size() << " refused";
+        for (const auto& [txid, gate] : r.refused)
+            LOG_WARNING << "[EMB-DASH] UTXO rewind: inject " << txid.GetHex().substr(0, 16)
+                        << " not re-admitted (" << Mempool::inject_gate_name(gate)
+                        << "); resubmit it if it is still wanted";
     }
 
     void start_fill(uint32_t best_h)
@@ -791,7 +822,10 @@ private:
             return FullConnect::Refused;
         }
         m_cache->prune_undo(height, DASH_MIN_BLOCKS_TO_KEEP);
-        if (m_pool) m_pool->remove_for_block(block);
+        if (m_pool) {
+            m_pool->remember_confirmed_injects(block, height);   // for a rewind (S-2)
+            m_pool->remove_for_block(block);
+        }
         ++m_full_connected;
         return FullConnect::Connected;
     }

@@ -899,6 +899,79 @@ public:
         return out;
     }
 
+    // ── Confirmed injects, kept for a rewind (VERIFY-S2 S-2) ──────────────
+    /// c2pool has no DisconnectedBlockTransactions: a tx a rewound block had
+    /// confirmed is not put back by itself, and dashd peers do not relay a
+    /// zero-fee inject back to us, so our node may hold its only copy. The
+    /// full set's lane hands every connected block here before
+    /// remove_for_block; the injects it confirms are kept (body and fee) for
+    /// as many blocks as a rewind can reach (the undo keep), bounded in bytes.
+    static constexpr uint32_t kConfirmedInjectDepth = DASH_MIN_BLOCKS_TO_KEEP;
+    static constexpr size_t   kMaxConfirmedInjectBytes = 4 * kMaxPinnedTotalBytes;
+
+    /// Keep the injects `block` (at `height`) confirms. Call before
+    /// remove_for_block(block), while they are still pool entries. Entries at
+    /// `height` or above (a branch no rewind went through) are dropped first.
+    void remember_confirmed_injects(const dash::coin::BlockType& block, uint32_t height) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= height)
+            pop_confirmed_inject_locked(/*front=*/false);
+        for (const auto& tx : block.m_txs) {
+            const uint256 txid = dash_txid(tx);
+            auto d = m_fee_deltas.find(txid);
+            auto it = m_pool.find(txid);
+            if (d == m_fee_deltas.end() || it == m_pool.end() || d->second != INJECT_FEE_DELTA)
+                continue;
+            ConfirmedInject c;
+            c.height = height;
+            c.txid = txid;
+            c.tx = it->second.tx;
+            c.fee = it->second.fee;
+            c.bytes = it->second.base_size;
+            m_confirmed_inject_bytes += c.bytes;
+            m_confirmed_injects.push_back(std::move(c));
+        }
+        while (!m_confirmed_injects.empty() &&
+               (m_confirmed_injects.front().height + kConfirmedInjectDepth < height ||
+                m_confirmed_inject_bytes > kMaxConfirmedInjectBytes))
+            pop_confirmed_inject_locked(/*front=*/true);
+    }
+
+    struct InjectReadmit {
+        std::vector<uint256> readmitted;
+        std::vector<std::pair<uint256, InjectGate>> refused;
+    };
+
+    /// A rewind disconnected every block from `from_height` up: the injects
+    /// they confirmed go back through add_inject (the normal admission gate,
+    /// max_fee = the fee each was confirmed with), lowest height first so a
+    /// parent is back before its child. Each one leaves the kept list.
+    InjectReadmit readmit_disconnected_injects(uint32_t from_height) {
+        std::vector<ConfirmedInject> back;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= from_height) {
+                back.push_back(m_confirmed_injects.back());
+                pop_confirmed_inject_locked(/*front=*/false);
+            }
+        }
+        InjectReadmit r;
+        for (auto it = back.rbegin(); it != back.rend(); ++it) {
+            const InjectGate g = add_inject(it->tx, it->fee);
+            if (g == InjectGate::Ok || g == InjectGate::AlreadyKnown)
+                r.readmitted.push_back(it->txid);
+            else
+                r.refused.emplace_back(it->txid, g);
+        }
+        return r;
+    }
+
+    /// How many confirmed injects are kept (diagnostics, KATs).
+    size_t confirmed_injects_kept() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_confirmed_injects.size();
+    }
+
 private:
     bool add_tx_locked(const MutableTransaction& tx,
                        ::core::coin::UTXOViewCache* utxo,
@@ -2408,6 +2481,23 @@ private:
     static constexpr size_t MAX_FEE_DELTAS = 10'000;
     std::map<uint256, uint64_t>                        m_fee_deltas;
     std::deque<uint256>                                m_fee_delta_order;
+    // VERIFY-S2 S-2: injects confirmed by the last kConfirmedInjectDepth
+    // connected blocks, oldest first (remember_confirmed_injects).
+    struct ConfirmedInject {
+        uint32_t           height{0};
+        uint256            txid;
+        MutableTransaction tx;
+        uint64_t           fee{0};
+        size_t             bytes{0};
+    };
+    std::deque<ConfirmedInject>                        m_confirmed_injects;
+    size_t                                             m_confirmed_inject_bytes{0};
+    void pop_confirmed_inject_locked(bool front) {
+        auto& c = front ? m_confirmed_injects.front() : m_confirmed_injects.back();
+        m_confirmed_inject_bytes -= c.bytes;
+        if (front) m_confirmed_injects.pop_front();
+        else       m_confirmed_injects.pop_back();
+    }
     // Feed-liveness tick (last add_islock wall time; 0 = never) — the hold's
     // ISLOCK_FEED_FRESH_SECS self-disarm reads this under m_mutex.
     time_t                                             m_last_islock_seen{0};

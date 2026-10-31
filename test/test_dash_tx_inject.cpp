@@ -1443,3 +1443,112 @@ TEST(DashMempool, RelaySeamNeverAdmitsASpentShapedOutput)
     // The tx without that output is relayed as before.
     EXPECT_TRUE(mp.add_tx(make_signed_spend_outs(k, prev, {change})));
 }
+
+// (VERIFY-S2 S-2) An inject confirmed in a block that a reorg takes out is put
+// back into the inject set by the rewind (dashd peers will not relay a
+// zero-fee tx, so ours may be its only copy), through the normal admission
+// gate, and leaves it again when the new branch confirms it.
+TEST(DashTxInject, InjectInARewoundBlockIsBackInTheInjectSet)
+{
+    using namespace dash_utxo_full;
+    Key k(0xc3);
+    const uint256 prevA = prevhash(0x83);
+    const auto inj = make_signed_spend(k, prevA, 100'000);   // zero fee
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-inject");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    Mempool mp;
+    lane.attach(mp);
+    arm_script_check(mp);
+    lane.on_header_tip(kB);
+    ASSERT_EQ(mp.add_inject(inj, /*max_fee=*/0), Mempool::InjectGate::Ok);
+
+    // a1 confirms the inject: it leaves the pool.
+    const BlockType a1 = block(base_hash, {coinbase(50, 2001), inj}, 2001);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_FALSE(mp.get_entry(dash_txid(inj)).has_value());
+
+    // a1 leaves the header chain's best: the rewind puts the inject back.
+    chain.hashes[kB + 1] = fake_hash(6001);
+    lane.on_header_tip(kB + 1);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    ASSERT_EQ(lane.cache()->get_best_block(), base_hash);
+    const auto back = mp.inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 1u) << "the rewound block's inject is back in the inject set";
+    EXPECT_EQ(back[0], dash_txid(inj));
+    const auto e = mp.get_entry(dash_txid(inj));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->fee_fold_proven);
+    EXPECT_EQ(e->fee, 0u);
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 1, 0);
+        ASSERT_EQ(selected.size(), 1u) << "and it rides the next template";
+        EXPECT_EQ(dash_txid(selected[0].tx), dash_txid(inj));
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // The new branch confirms it again: out of the pool again.
+    const BlockType b1 = block(base_hash, {coinbase(50, 3001), inj}, 3001);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty());
+}
+
+// (VERIFY-S2 S-2) The kept confirmed injects are bounded: as deep as the undo
+// keep (a rewind cannot reach further), and a branch that was not rewound
+// through the lane does not leave stale entries behind.
+TEST(DashTxInject, ConfirmedInjectsKeptAsDeepAsTheUndoKeep)
+{
+    Key k(0xc4);
+    const uint256 prev = prevhash(0x84);
+    const auto inj = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    ASSERT_EQ(mp.add_inject(inj, 0), Mempool::InjectGate::Ok);
+    dash::coin::BlockType b;
+    b.m_txs.push_back(inj);
+    mp.remember_confirmed_injects(b, 100);
+    mp.remove_for_block(b);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 1u);
+    dash::coin::BlockType empty;
+    mp.remember_confirmed_injects(empty, 100 + Mempool::kConfirmedInjectDepth);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 1u) << "still reachable by a rewind";
+    mp.remember_confirmed_injects(empty, 101 + Mempool::kConfirmedInjectDepth);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "beyond the undo keep";
+    EXPECT_TRUE(mp.readmit_disconnected_injects(100).readmitted.empty());
+    static_assert(Mempool::kConfirmedInjectDepth == 288, "the undo keep, DASH_MIN_BLOCKS_TO_KEEP");
+
+    // A non-inject (relayed) tx in a block is not kept.
+    Mempool mr; mr.set_utxo(&utxo);
+    arm_script_check(mr);
+    ASSERT_TRUE(mr.add_tx(inj));
+    mr.remember_confirmed_injects(b, 100);
+    EXPECT_EQ(mr.confirmed_injects_kept(), 0u);
+
+    // A connect at or below a kept height replaces that branch's entries.
+    Mempool ms; ms.set_utxo(&utxo);
+    arm_script_check(ms);
+    ASSERT_EQ(ms.add_inject(inj, 0), Mempool::InjectGate::Ok);
+    ms.remember_confirmed_injects(b, 200);
+    ms.remove_for_block(b);
+    ASSERT_EQ(ms.confirmed_injects_kept(), 1u);
+    ms.remember_confirmed_injects(empty, 200);
+    EXPECT_EQ(ms.confirmed_injects_kept(), 0u);
+}
