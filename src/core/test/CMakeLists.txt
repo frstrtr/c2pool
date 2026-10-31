@@ -144,6 +144,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         broadcast_convergence_matrix_test.cpp
         chain_test.cpp
         coin_addrman_test.cpp
+        coin_compressor_test.cpp
         coin_registry_symbol_test.cpp
         core_merkle_branches_test.cpp
         dual_family_dial_test.cpp
@@ -158,6 +159,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         known_txs_eviction_test.cpp
         leveldb_store_lock_test.cpp
         listener_family_test.cpp
+        muhash_chacha20_test.cpp
         netaddress_resolution_test.cpp
         p2p_message_stats_test.cpp
         pack_test.cpp
@@ -168,6 +170,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         socket_read_empty_prefix_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
+        utxo_set_hash_test.cpp
+        utxo_snapshot_test.cpp
+        utxo_tools_test.cpp
         version_gate_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
@@ -185,6 +190,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     )
     target_compile_definitions(core_test PRIVATE C2POOL_SRC_ROOT="${CMAKE_SOURCE_DIR}/src")
     target_link_libraries(core_test PRIVATE GTest::gtest_main core c2pool_merged_mining GTest::gtest)
+    target_link_libraries(core_test PRIVATE core_utxo)  # UTXO snapshot KATs (coin_compressor, muhash_chacha20, utxo_*)
     target_link_libraries(core_test PRIVATE c2pool_payout c2pool_hashrate ltc_coin)  # OBJECT-lib SCC direct-naming (#22/#39)
     target_link_libraries(core_test PRIVATE c2pool_storage)  # leveldb_store_lock_test: SharechainStorage
 
