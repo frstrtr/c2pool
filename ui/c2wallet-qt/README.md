@@ -88,3 +88,42 @@ ui/c2wallet-qt/ci/check_no_network.sh build-c2wallet/c2wallet-qt-signer
 #   ... or via ctest:
 ( cd build-c2wallet && ctest --output-on-failure )
 ```
+
+## DASH inject / collateral (slice 2)
+
+The **DASH Inject / Collateral** screen consolidates the mature UTXOs of one
+DASH P2PKH address (zero fee for a c2pool node's pin / inject lane, or a
+fee-paying tx for `dash-cli sendrawtransaction`) or builds a governance
+collateral, and signs it offline. All of its rules live in the Qt-free
+`DashInjectModel` (`src/family/bitcoin/dash/`), KAT'd by `c2wallet-dash-test`.
+
+Produce its input on the online host, next to a dashd with `addressindex=1`:
+
+```sh
+python3 ui/c2wallet-qt/tools/export_utxos.py <ADDRESS> utxos.json
+# DASH_CLI="dash-cli -conf=/path/dash.conf" to point at a specific node
+```
+
+Carry `utxos.json` to the signer; carry back `<name>.hex` (one raw tx per line,
+the c2pool loader format) and `<name>.manifest.json` (txids, sizes, inputs,
+maturity, node requirements, the file's sha256 / sha256d; no secrets).
+
+**Before `dash-cli sendrawtransaction` (the relay lane), check every input's
+amount on the online host.** Legacy sighash commits no input amounts, so the
+amounts in the export are the trust root: on the relay lane an understated one
+is paid as extra fee (the zero-fee pin / inject lanes refuse such a tx instead).
+Every manifest input must still be unspent with exactly its `value` and
+`script_hex`, and each tx's inputs must sum to its `value_out + fee`:
+
+```sh
+python3 - name.manifest.json <<'PY'
+import json, subprocess, sys
+m = json.load(open(sys.argv[1]))
+for t in m["txs"]:
+    for i in t["inputs"]:
+        o = json.loads(subprocess.check_output(["dash-cli", "gettxout", i["txid"], str(i["vout"]), "true"]) or b"null")
+        assert o and round(o["value"] * 1e8) == i["value"] and o["scriptPubKey"]["hex"] == i["script_hex"], i
+    assert sum(i["value"] for i in t["inputs"]) == t["value_out"] + t["fee"], t["txid"]
+print("preflight OK: every input is unspent with the manifest's amount")
+PY
+```

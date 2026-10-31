@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "Keystore.hpp"
+#include "MiniJson.hpp" // kMaxNestingDepth
 
 #include "Bip32.hpp"
 #include "HexUtil.hpp"
@@ -27,6 +28,8 @@ struct JParser {
     const std::string& s;
     size_t i = 0;
     bool err = false;
+    int depth = 0;           // containers currently open (capped like MiniJson)
+    bool too_deep = false;
     explicit JParser(const std::string& src) : s(src) {}
 
     void skip() { while (i < s.size() && std::isspace((unsigned char)s[i])) ++i; }
@@ -73,6 +76,16 @@ struct JParser {
         JVal v;
         if (i >= s.size()) { err = true; return v; }
         char c = s[i];
+        const bool container = c == '{' || c == '[';
+        if (container) {
+            if (depth >= mjson::kMaxNestingDepth) { err = true; too_deep = true; return v; }
+            ++depth;
+        }
+        struct DepthGuard {
+            int& d;
+            bool on;
+            ~DepthGuard() { if (on) --d; }
+        } depth_guard{depth, container};
         if (c == '{') {
             ++i; v.t = JVal::T::Obj; skip();
             if (i < s.size() && s[i] == '}') { ++i; return v; }
@@ -198,6 +211,7 @@ KeystoreImport import_json_keystore(const std::string& json)
     KeystoreImport r;
     JParser p(json);
     JVal root = p.parse();
+    if (p.too_deep) { r.error = "JSON keystore nesting too deep"; return r; }
     if (p.err) { r.error = "invalid JSON keystore"; return r; }
     p.skip();
     if (p.i != json.size()) {
