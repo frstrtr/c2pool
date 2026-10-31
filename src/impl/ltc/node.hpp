@@ -817,6 +817,15 @@ public:
     /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
     void shutdown();
 
+    /// Before the owner's objects go away: no compute cycle reaches them
+    /// again. The locked-best hook is cleared (waiting out a running call),
+    /// the think and verify pools are stopped (queued work dropped) and
+    /// joined within `deadline`. False when a running cycle outlived it (the
+    /// caller must then exit without destroying what the cycle uses). A
+    /// cycle left running after its owner's scope used freed objects: a
+    /// segfault, or a hang (live 10-31).
+    bool stop_compute(std::chrono::milliseconds deadline);
+
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
