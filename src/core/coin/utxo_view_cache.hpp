@@ -367,6 +367,14 @@ public:
         return true;
     }
 
+    /// Drop the changes not flushed yet (after a flush that failed): the
+    /// view is the backing DB's again, at its best block.
+    void discard_pending() {
+        std::unique_lock<std::shared_mutex> lock(m_mu);
+        m_cache.clear();
+        m_coin_delta = 0;
+    }
+
     // ── Sync state ('S', UTXOViewDB) ────────────────────────────────────
 
     /// The backing DB's sync state ({anchor unknown} without a DB or record).
