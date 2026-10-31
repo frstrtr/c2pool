@@ -480,9 +480,13 @@ RewindResult rewind_to_best_chain(uint32_t max_depth, uint32_t chain_height, uin
 /// validation.cpp:1676-1678, 1872 — a record without a hash is unbound) and be
 /// able to put its spent coins back; then the block is disconnected. A record
 /// that cannot bring the set back touches nothing (the caller logs the reason
-/// with the height, once).
+/// with the height, once). every_coin_known: the records come from a strict
+/// connect (a set built from genesis), so every spent coin in them is put
+/// back, a (value 0, empty script) one included
+/// (UTXOViewCache::disconnect_from_undo).
 template <typename UndoDbT, typename UtxoT>
-RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, const uint256& hash)
+RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, const uint256& hash,
+                                       bool every_coin_known = false)
 {
     using Why = RewindResult::Why;
     core::coin::BlockUndo undo;
@@ -492,7 +496,7 @@ RewindResult::Why disconnect_with_undo(UndoDbT& db, UtxoT& utxo, uint32_t h, con
         return Why::BlockMismatch;
     if (!undo.restorable())
         return Why::Legacy;
-    if (!utxo.disconnect_from_undo(undo))
+    if (!utxo.disconnect_from_undo(undo, every_coin_known))
         return Why::Legacy;
     return Why::None;
 }

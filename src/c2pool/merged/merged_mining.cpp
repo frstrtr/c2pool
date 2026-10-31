@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
+#include <core/coin/mweb_shape.hpp>
+#include <impl/nmc/coin/header_chain.hpp>  // aux_expected_index (CAuxPow::getExpectedIndex)
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
+#include <core/target_utils.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -93,23 +96,26 @@ AuxPowTree AuxPowTree::build(const std::vector<uint32_t>& chain_ids)
     tree.size = 1;
     while (tree.size < n) tree.size <<= 1;
 
-    // Assign slots using p2pool LCG convention:
-    //   slot = ((1103515245 * chain_id + 1103515245 * 12345 + 12345) & 0xFFFFFFFF) % size
-    // Simplified: slot = ((1103515245 * (chain_id + 12345) + 12345) & 0xFFFFFFFF) % size
-    // Actually the exact formula from p2pool Python:
-    //   pos = (1103515245 * chain_id * 1103515245 + 12345) — but let's use the real one.
-    // From mm_adapter code: slot = hash_to_int(chain_id_bytes) % size, but the simpler
-    // p2pool approach for make_auxpow_tree is:
-    //   nonce = 0; for each chain_id: slot[chain_id] = (chain_id * 1103515245 + 12345) % size
-    //   Retry with size *= 2 if collision occurs.
-    
+    // Slots as the aux daemons check them: CAuxPow::getExpectedIndex(nonce,
+    // chain_id, h) with h = log2(size) (dogecoin/namecoin auxpow.cpp;
+    // "Aux POW wrong index" otherwise), ported in
+    // nmc::coin::aux_expected_index. The commitment carries nonce 0
+    // (build_auxpow_commitment's default).
+    //
+    // A collision is resolved by doubling the tree, never by another nonce:
+    // for a fixed nonce the slot is an odd-multiplier affine map of
+    // chain_id mod 2^h, so two chains share a slot exactly when their ids
+    // agree mod 2^h, whatever the nonce.
     for (;;) {
+        unsigned height = 0;
+        while ((1u << height) < tree.size)
+            ++height;
         tree.slot_map.clear();
         bool collision = false;
         std::vector<bool> used(tree.size, false);
         for (uint32_t cid : chain_ids) {
-            uint32_t slot = static_cast<uint32_t>(
-                (static_cast<uint64_t>(cid) * 1103515245ULL + 12345ULL) % tree.size);
+            const uint32_t slot =
+                nmc::coin::aux_expected_index(0, static_cast<int32_t>(cid), height);
             if (used[slot]) {
                 collision = true;
                 break;
@@ -551,9 +557,18 @@ std::vector<NetService> AuxChainRPC::getpeerinfo()
 
 // ─── MergedMiningManager ────────────────────────────────────────────────────
 
+namespace {
+thread_local bool t_mm_rpc_thread = false;
+thread_local std::string t_payout_miss;
+thread_local uint256 t_payout_basis;
+} // namespace
+
 MergedMiningManager::MergedMiningManager(boost::asio::io_context& ioc)
     : m_ioc(ioc), m_poll_timer(ioc)
 {
+    // The RPC pool's one thread may wait for a busy tracker lock in a payout
+    // provider (on_rpc_thread); the network thread may not.
+    boost::asio::post(m_rpc_pool, []() { t_mm_rpc_thread = true; });
 }
 
 MergedMiningManager::~MergedMiningManager()
@@ -640,6 +655,77 @@ void MergedMiningManager::stop()
     m_rpc_pool.join();
 }
 
+void MergedMiningManager::request_refresh()
+{
+    if (m_refresh_in_progress.exchange(true))
+        return;
+    boost::asio::post(m_rpc_pool, [this]() {
+        try {
+            refresh_aux_work();
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[MM] refresh_aux_work exception: " << e.what();
+        }
+        m_refresh_in_progress.store(false);
+    });
+}
+
+void MergedMiningManager::note_payout_miss(const std::string& reason) { t_payout_miss = reason; }
+
+void MergedMiningManager::note_payout_basis(const uint256& best) { t_payout_basis = best; }
+
+bool MergedMiningManager::on_rpc_thread() { return t_mm_rpc_thread; }
+
+namespace {
+nlohmann::json payout_source_json(const MergedPayoutSource::Stats& st)
+{
+    return {{"published", st.published},
+            {"from_weights", st.from_weights},
+            {"computed", st.computed},
+            {"busy", st.busy}};
+}
+} // namespace
+
+nlohmann::json MergedMiningManager::get_rebuild_stats_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json no_payouts = nlohmann::json::object();
+    for (const auto& [reason, n] : m_rebuild_no_payouts)
+        no_payouts[reason] = n;
+    // Seconds without payouts (no block built, so no commitment unless the
+    // last block on the same parent was kept): closed episodes plus the open one.
+    const int64_t now = now_sec();
+    int64_t no_payout_seconds = 0;
+    nlohmann::json no_payout_now = nlohmann::json::array();
+    for (const auto& chain : m_chains) {
+        no_payout_seconds += chain.no_payout_seconds;
+        if (chain.no_payout_episode) {
+            no_payout_seconds += now - chain.no_payout_since;
+            no_payout_now.push_back(chain.config.symbol);
+        }
+    }
+    return {{"no_payouts", std::move(no_payouts)},
+            {"kept_last_block", m_rebuild_kept_last_block},
+            {"dropped_commitment", m_rebuild_dropped_commitment},
+            {"dropped_best_moved", m_rebuild_dropped_best_moved},
+            {"stale_results", m_rebuild_stale_results},
+            {"work_changed", m_rebuild_work_changed},
+            {"work_unchanged", m_rebuild_work_unchanged},
+            {"snapshot_target_refusals", m_snapshot_target_refusals},
+            {"no_payout_seconds", no_payout_seconds},
+            {"no_payout_now", std::move(no_payout_now)},
+            {"payout_source", payout_source_json(m_payout_source->stats())}};
+}
+
+void MergedMiningManager::set_clock_for_test(ClockFn fn) { m_clock = std::move(fn); }
+
+int64_t MergedMiningManager::now_sec() const
+{
+    if (m_clock)
+        return m_clock();
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void MergedMiningManager::poll_loop()
 {
     if (!m_running) return;
@@ -649,6 +735,7 @@ void MergedMiningManager::poll_loop()
     // Skip if previous refresh is still in progress (RPC latency spike).
     if (!m_refresh_in_progress.exchange(true)) {
         boost::asio::post(m_rpc_pool, [this]() {
+            t_mm_rpc_thread = true;
             try {
                 refresh_aux_work();
             } catch (const std::exception& e) {
@@ -676,10 +763,21 @@ void MergedMiningManager::refresh_aux_work()
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     for (auto& chain : m_chains) {
+        // Size budget for the template about to be built: the backends that
+        // build their own (embedded) keep header + AuxPoW + coinbase room.
+        {
+            const uint32_t reserve = block_size_reserve_locked(chain);
+            chain.rpc->set_block_size_reserve(reserve);
+            if (chain.fallback)
+                chain.fallback->set_block_size_reserve(reserve);
+        }
         try {
-            // Check if tip changed
+            // Check if tip changed. A degraded template (built before the
+            // tip's body cleaned the mempool: coinbase only) is fetched again
+            // on every poll until a clean one comes back.
             auto tip = chain.rpc->get_best_block_hash();
-            if (tip == chain.last_tip && !chain.current_work.block_hash.IsNull()) {
+            const bool same_tip = tip == chain.last_tip && !chain.current_work.block_hash.IsNull();
+            if (same_tip && !chain.template_degraded) {
                 continue;  // no change
             }
             chain.last_tip = tip;
@@ -725,13 +823,36 @@ void MergedMiningManager::refresh_aux_work()
                 }
             }
 
-            chain.current_work = std::move(new_work);
             if (chain.config.multiaddress) {
                 auto tmpl_work = chain.rpc->get_work_template();
                 // Keep the template data but preserve the createauxblock hash
-                chain.current_work.block_template = std::move(tmpl_work.block_template);
-                chain.current_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
-                chain.current_work.coinbase_value = tmpl_work.coinbase_value;
+                new_work.block_template = std::move(tmpl_work.block_template);
+                new_work.prev_block_hash = std::move(tmpl_work.prev_block_hash);
+                new_work.coinbase_value = tmpl_work.coinbase_value;
+            }
+            // Still degraded on the same tip: keep the block already being
+            // mined. A new one would differ only in its time, and each rebuild
+            // would push new work to every miner and fill frozen_history.
+            if (same_tip && chain.template_degraded
+                && core::coin::template_degraded_code(new_work.block_template)) {
+                ++chain.templates_still_degraded;
+                continue;
+            }
+            chain.current_work = std::move(new_work);
+            {
+                const bool was_degraded = chain.template_degraded;
+                const auto why = core::coin::template_degraded_code(chain.current_work.block_template);
+                chain.template_degraded = why.has_value();
+                if (chain.template_degraded) {
+                    ++chain.templates_degraded;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " degraded (" << *why
+                             << "): coinbase only, fetching again next poll";
+                } else if (was_degraded) {
+                    ++chain.templates_refetched_clean;
+                    LOG_INFO << "[MM:" << chain.config.symbol << "] Template at height "
+                             << chain.current_work.height << " fetched again, clean";
+                }
             }
 
             // Like p2pool: get authoritative target from the daemon via
@@ -824,12 +945,15 @@ void MergedMiningManager::refresh_aux_work()
     // rebuild_cached_blocks() manages its own lock acquisition/release to
     // safely call payout_fn (which calls into tracker) without deadlock.
     if (any_changed || pplns_was_dirty) {
-        rebuild_cached_blocks();
+        const bool work_changed = rebuild_cached_blocks();
 
         // Notify stratum to push new work with the fresh MM commitment.
         // Without this, miners keep working on old coinbases that commit to
         // the previous DOGE block hash — any found DOGE blocks are stale.
-        if (m_on_work_changed) {
+        // Only when the commitment (or the header infos) changed: a chain
+        // left without a block is fetched again on every poll to retry, and
+        // each retry would otherwise push the same work to every miner.
+        if (work_changed && m_on_work_changed) {
             boost::asio::post(m_ioc, m_on_work_changed);
         }
     }
@@ -854,7 +978,9 @@ void MergedMiningManager::try_submit_merged_blocks(
 
     // For each aux chain, check if the parent PoW meets the aux target
     for (auto& chain : m_chains) {
-        if (chain.current_work.block_hash.IsNull()) continue;
+        // No current block (e.g. no payouts for the new parent yet): a share
+        // from an older job may still commit to a frozen one.
+        if (chain.current_work.block_hash.IsNull() && chain.frozen_history.empty()) continue;
 
         auto it = m_tree.slot_map.find(chain.config.chain_id);
         if (it == m_tree.slot_map.end()) continue;
@@ -1019,6 +1145,22 @@ void MergedMiningManager::try_submit_merged_blocks(
             // Build 80-byte header
             uint256 prev_hash; prev_hash.SetHex(prev_hash_hex);
             uint32_t nbits = std::stoul(bits_hex, nullptr, 16);
+
+            // The block carries the snapshot's bits, so the parent PoW must
+            // meet THEIR target. A snapshot of an older job can be on
+            // another parent than the current work (DOGE retargets every
+            // block): the check against the current target above does not
+            // cover it, and a PoW-invalid block is never submitted or
+            // relayed (peers ban for it).
+            if (!(parent_hash <= chain::bits_to_target(nbits))) {
+                ++m_snapshot_target_refusals;
+                LOG_WARNING << "[MM:" << chain.config.symbol
+                            << "] Parent PoW " << parent_hash.GetHex().substr(0, 16)
+                            << " does not meet the snapshot's bits " << bits_hex
+                            << " (block " << committed_block_hash.GetHex().substr(0, 16)
+                            << " on " << prev_hash_hex.substr(0, 16) << ") — not submitted";
+                continue;
+            }
             std::vector<unsigned char> header_bytes(80);
             auto* p = header_bytes.data();
             std::memcpy(p, &version, 4); p += 4;
@@ -1053,6 +1195,18 @@ void MergedMiningManager::try_submit_merged_blocks(
             }
 
             auto block_hex = blk.str();
+            // DOGE (chain id 98): dogecoind's CheckBlock refuses a block above 1,000,000 bytes
+            // (bad-blk-length, AuxPoW included): such a block can never be
+            // accepted, so it is refused here and counted, not relayed.
+            if (chain.config.chain_id == 98 && block_hex.size() / 2 > kAuxMaxBlockBytes) {
+                ++m_block_refusals_by_code[chain.config.symbol + ":oversize"];
+                LOG_ERROR << "[MM:" << chain.config.symbol << "] Merged block REFUSED: "
+                          << block_hex.size() / 2 << " bytes > " << kAuxMaxBlockBytes
+                          << " (auxpow " << auxpow.size() / 2 << " B, coinbase "
+                          << use_coinbase->size() / 2 << " B, " << n_tx - 1
+                          << " txs) — not submitted";
+                continue;
+            }
             if (!block_hex.empty()) {
                 LOG_INFO << "[MM:" << chain.config.symbol
                          << "] Merged block submitted (" << block_hex.size()/2 << " bytes"
@@ -1084,7 +1238,11 @@ void MergedMiningManager::try_submit_merged_blocks(
                 // the trustless merged-payout invariant. So the canonical aux path
                 // is deliberately NOT wired as a fallback.
                 bool ok = chain.rpc->submit_block(block_hex);
-                record_discovered_block(chain, ok, parent_hash.GetHex());
+                // The block found is the snapshot's (a share on a stale job
+                // commits to an older block than the current work).
+                record_discovered_block(chain, ok, parent_hash.GetHex(), committed_block_hash,
+                                        tmpl.value("height", chain.current_work.height),
+                                        tmpl.value("coinbasevalue", chain.current_work.coinbase_value));
                 if (m_block_relay_fn) {
                     try { m_block_relay_fn(chain.config.chain_id, block_hex); }
                     catch (...) {}
@@ -1116,6 +1274,108 @@ void MergedMiningManager::submit_aux_and_relay(ChainState& chain, const std::str
     }
 }
 
+nlohmann::json MergedMiningManager::aux_template_json(const std::string& symbol) const
+{
+    auto upper = [](std::string v) {
+        for (auto& ch : v)
+            if (ch >= 'a' && ch <= 'z')
+                ch = static_cast<char>(ch - 32);
+        return v;
+    };
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains) {
+        if (upper(chain.config.symbol) != upper(symbol))
+            continue;
+        const auto& w = chain.current_work;
+        const auto& t = w.block_template;
+        nlohmann::json j = nlohmann::json::object();
+        j["chain"] = chain.config.symbol;
+        j["chain_id"] = chain.config.chain_id;
+        j["height"] = w.height;
+        j["previousblockhash"] = t.is_object() ? t.value("previousblockhash", w.prev_block_hash)
+                                               : w.prev_block_hash;
+        j["bits"] = t.is_object() ? t.value("bits", std::string()) : std::string();
+        j["version"] = t.is_object() ? t.value("version", 0) : 0;
+        j["curtime"] = t.is_object() ? t.value("curtime", int64_t{0}) : int64_t{0};
+        j["mintime"] = t.is_object() ? t.value("mintime", int64_t{0}) : int64_t{0};
+        j["coinbasevalue"] = w.coinbase_value;
+        j["target"] = w.target.GetHex();
+        j["block_hash"] = w.block_hash.GetHex();
+        j["coinbase_hex"] = chain.frozen_coinbase_hex;
+        j["using_fallback"] = chain.using_fallback;
+        const auto why = core::coin::template_degraded_code(t);
+        j["degraded"] = why ? nlohmann::json(*why) : nlohmann::json(nullptr);
+        nlohmann::json txs = nlohmann::json::array();
+        uint64_t tx_bytes = 0;
+        if (t.is_object() && t.contains("transactions") && t["transactions"].is_array()) {
+            for (const auto& e : t["transactions"]) {
+                if (!e.is_object())
+                    continue;
+                const std::string data = e.value("data", std::string());
+                tx_bytes += data.size() / 2;
+                txs.push_back({{"txid", e.value("txid", std::string())},
+                               {"data", data},
+                               {"fee", e.contains("fee") ? e["fee"] : nlohmann::json(nullptr)}});
+            }
+        }
+        j["tx_count"] = txs.size();
+        j["tx_bytes"] = tx_bytes;
+        j["transactions"] = std::move(txs);
+        return j;
+    }
+    return nullptr;
+}
+
+nlohmann::json MergedMiningManager::get_template_gate_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& chain : m_chains)
+        j[chain.config.symbol] = {{"degraded", chain.templates_degraded},
+                                  {"refetched_clean", chain.templates_refetched_clean},
+                                  {"still_degraded", chain.templates_still_degraded},
+                                  {"degraded_now", chain.template_degraded}};
+    return j;
+}
+
+bool MergedMiningManager::has_frozen_snapshot(uint32_t chain_id, const uint256& block_hash) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains)
+        if (chain.config.chain_id == chain_id)
+            return chain.frozen_history.count(block_hash) > 0;
+    return false;
+}
+
+uint32_t MergedMiningManager::block_size_reserve_locked(const ChainState& chain) const
+{
+    uint32_t aux_branch_len = 0;
+    for (uint32_t n = 1; n < m_tree.size; n <<= 1)
+        ++aux_branch_len;
+    return aux_block_reserve_bytes(m_parent_coinbase_bytes.load(std::memory_order_relaxed),
+                                   m_parent_branch_len.load(std::memory_order_relaxed),
+                                   aux_branch_len,
+                                   static_cast<uint32_t>(chain.frozen_coinbase_hex.size() / 2));
+}
+
+uint32_t MergedMiningManager::block_size_reserve(uint32_t chain_id) const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    for (const auto& chain : m_chains)
+        if (chain.config.chain_id == chain_id)
+            return block_size_reserve_locked(chain);
+    return 0;
+}
+
+nlohmann::json MergedMiningManager::get_block_refusals_json() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    nlohmann::json j = nlohmann::json::object();
+    for (const auto& [code, n] : m_block_refusals_by_code)
+        j[code] = n;
+    return j;
+}
+
 std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -1134,7 +1394,7 @@ std::map<uint32_t, AuxWork> MergedMiningManager::get_current_work() const
 //
 // Lock strategy: snapshot chain data under m_mutex, release, call payout_fn
 // (which calls back into tracker), then re-acquire to store results + freeze.
-void MergedMiningManager::rebuild_cached_blocks()
+bool MergedMiningManager::rebuild_cached_blocks()
 {
     m_pplns_dirty.store(false, std::memory_order_relaxed);
 
@@ -1160,12 +1420,11 @@ void MergedMiningManager::rebuild_cached_blocks()
     // ── Lock released — safe to call payout_fn ──
 
     std::vector<MergedHeaderInfo> header_infos;
-    if (!payout_fn) {
-        // No payout provider yet — cache empty results
-        std::lock_guard<std::recursive_mutex> lock(m_mutex);
-        m_cached_header_infos.clear();
-        return;
-    }
+    std::vector<nlohmann::json> built_templates;   // the template each header_infos entry was built from
+    // Chains whose block could not be built this time (no payouts): chain id -> why.
+    std::map<uint32_t, std::string> no_payouts;
+    // The best share each chain's payouts are (or would have been) split at.
+    std::map<uint32_t, uint256> payout_basis;
 
     for (auto& snap : snapshots)
     {
@@ -1176,8 +1435,20 @@ void MergedMiningManager::rebuild_cached_blocks()
         info.block_height = static_cast<uint32_t>(snap.height);
 
         // Build PPLNS coinbase for this chain (NO lock held — safe)
+        payout_basis[snap.chain_id] = uint256();
+        if (!payout_fn) {
+            no_payouts[snap.chain_id] = "no_provider";
+            continue;
+        }
+        t_payout_miss.clear();
+        t_payout_basis.SetNull();
         auto payouts = payout_fn(snap.chain_id, snap.coinbase_value);
-        if (payouts.empty()) continue;
+        payout_basis[snap.chain_id] = t_payout_basis;
+        info.payout_basis = t_payout_basis;
+        if (payouts.empty()) {
+            no_payouts[snap.chain_id] = t_payout_miss.empty() ? "empty" : t_payout_miss;
+            continue;
+        }
 
         uint32_t version = tmpl.value("version", 1u);
         if ((version >> 16) > 0)  // has chain_id → AuxPoW chain
@@ -1233,6 +1504,7 @@ void MergedMiningManager::rebuild_cached_blocks()
                      << " cb_len=" << coinbase_hex.size()/2;
 
             header_infos.push_back(std::move(info));
+            built_templates.push_back(tmpl);
         } catch (const std::exception& e) {
             LOG_WARNING << "[MM:chain_" << snap.chain_id
                         << "] rebuild_cached_blocks failed: " << e.what();
@@ -1241,33 +1513,61 @@ void MergedMiningManager::rebuild_cached_blocks()
 
     // ── Step 2: Re-acquire lock, freeze snapshots, compute commitment, cache ──
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto now_sec = this->now_sec();
 
-    for (const auto& hi : header_infos) {
+    std::vector<MergedHeaderInfo> adopted;   // the header infos stratum sessions will read
+    for (size_t k = 0; k < header_infos.size(); ++k) {
+        const auto& hi = header_infos[k];
         for (auto& chain : m_chains) {
             if (chain.config.chain_id != hi.chain_id) continue;
+            // The work moved on while the payouts were computed (a refresh
+            // replaced the template): this block is of the old template and
+            // nobody commits to it. Freezing it under the new template would
+            // leave a snapshot whose header does not hash to its key.
+            if (chain.current_work.block_template != built_templates[k]) {
+                ++m_rebuild_stale_results;
+                break;
+            }
+            adopted.push_back(hi);
+            if (chain.no_payout_episode) {
+                const int64_t secs = now_sec - chain.no_payout_since;
+                LOG_INFO << "[MM:" << chain.config.symbol << "] payouts back: " << chain.no_payout_rebuilds
+                         << " rebuild(s) without payouts over " << secs << "s";
+                chain.no_payout_seconds += secs;
+                chain.no_payout_episode = false;
+                chain.no_payout_rebuilds = 0;
+            }
             if (hi.block_header.size() == 80) {
                 chain.current_work.block_hash = Hash(hi.block_header);
                 chain.frozen_block_hash = chain.current_work.block_hash;
             }
             chain.frozen_coinbase_hex = hi.coinbase_hex;
-            chain.frozen_template = chain.current_work.block_template;
+            chain.frozen_template = built_templates[k];
+            chain.frozen_payout_basis = hi.payout_basis;
 
             if (!chain.frozen_block_hash.IsNull()) {
                 chain.frozen_history[chain.frozen_block_hash] = {
                     chain.frozen_template,
                     chain.frozen_coinbase_hex,
-                    now_sec
+                    now_sec,
+                    ++m_frozen_seq
                 };
-                // Expire old snapshots
+                // Expire old snapshots, then keep at most MAX_FROZEN_HISTORY,
+                // dropping the oldest first. (The map is keyed by block hash:
+                // trimming in key order could drop the snapshot just frozen,
+                // and a find committing to it would be skipped at submit.)
                 for (auto it = chain.frozen_history.begin(); it != chain.frozen_history.end(); ) {
-                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC
-                        || chain.frozen_history.size() > ChainState::MAX_FROZEN_HISTORY) {
+                    if (now_sec - it->second.timestamp > ChainState::FROZEN_EXPIRY_SEC)
                         it = chain.frozen_history.erase(it);
-                    } else {
+                    else
                         ++it;
-                    }
+                }
+                while (chain.frozen_history.size() > ChainState::MAX_FROZEN_HISTORY) {
+                    auto oldest = chain.frozen_history.begin();
+                    for (auto it = chain.frozen_history.begin(); it != chain.frozen_history.end(); ++it)
+                        if (it->second.seq < oldest->second.seq)
+                            oldest = it;
+                    chain.frozen_history.erase(oldest);
                 }
                 LOG_INFO << "[MM-cache] chain " << hi.chain_id
                          << " frozen hash=" << chain.frozen_block_hash.GetHex().substr(0, 16)
@@ -1275,6 +1575,84 @@ void MergedMiningManager::rebuild_cached_blocks()
             }
             break;
         }
+    }
+
+    // A chain whose block the merged manager builds itself (multiaddress)
+    // can only be committed to with a block it froze: try_submit rebuilds
+    // the found block from that snapshot. After a refresh its current work
+    // carries the backend's hash instead (for the embedded DOGE backend the
+    // PARENT's hash) until a rebuild freezes a block; when this rebuild
+    // could not (no payouts, or the work moved on meanwhile), a share
+    // committing to that hash would find a DOGE block that cannot be built.
+    // Keep the last block frozen on the same parent (valid, submittable),
+    // else take the chain out of the commitment until a block is built.
+    const auto prev_of = [](const nlohmann::json& t) {
+        return t.is_object() ? t.value("previousblockhash", std::string()) : std::string();
+    };
+    // The last block's payouts must also still be for the current best share:
+    // a job's LTC share carries that best as its prev share, and a V36 peer
+    // re-derives the merged payouts from it (p2pool data.py
+    // verify_merged_coinbase_commitment) and rejects the share otherwise.
+    for (auto& chain : m_chains) {
+        const auto np = no_payouts.find(chain.config.chain_id);
+        const auto basis = payout_basis.find(chain.config.chain_id);
+        const bool same_best = basis == payout_basis.end()
+            || basis->second == chain.frozen_payout_basis;
+        const char* action = "its last block stays committed";
+        if (chain.config.multiaddress && !chain.current_work.block_hash.IsNull()
+            && (chain.current_work.block_hash != chain.frozen_block_hash || !same_best)) {
+            const std::string parent = prev_of(chain.current_work.block_template);
+            const bool keep = same_best && !chain.frozen_block_hash.IsNull() && !parent.empty()
+                && prev_of(chain.frozen_template) == parent
+                && chain.frozen_history.count(chain.frozen_block_hash) > 0;
+            if (!same_best)
+                ++m_rebuild_dropped_best_moved;
+            if (keep) {
+                chain.current_work.block_hash = chain.frozen_block_hash;
+                // Jobs keep committing to it: it ages from now, not from when
+                // it was frozen (else the next freeze expires it under them),
+                // and it is the newest for the oldest-first size trim too.
+                auto& kept = chain.frozen_history[chain.frozen_block_hash];
+                kept.timestamp = now_sec;
+                kept.seq = ++m_frozen_seq;
+                ++m_rebuild_kept_last_block;
+                action = "keeping the last block built on this parent";
+            } else {
+                chain.current_work.block_hash.SetNull();
+                ++m_rebuild_dropped_commitment;
+                action = same_best ? "no commitment to this chain until a block is built"
+                                   : "the last block pays another best share: no commitment until a block is built";
+            }
+        }
+        if (np == no_payouts.end())
+            continue;
+        ++m_rebuild_no_payouts[np->second];
+        ++chain.no_payout_rebuilds;
+        if (!chain.no_payout_episode) {
+            chain.no_payout_episode = true;
+            chain.no_payout_since = now_sec;
+            LOG_INFO << "[MM:" << chain.config.symbol << "] rebuild without payouts (" << np->second
+                     << "): " << action;
+        }
+    }
+
+    // A chain committed to a block this rebuild did not build (kept, or a
+    // stale result, or no payouts on a block already frozen) keeps the
+    // header info stratum sessions put in their shares for that block.
+    for (const auto& chain : m_chains) {
+        if (chain.current_work.block_hash.IsNull())
+            continue;
+        bool have = false;
+        for (const auto& a : adopted)
+            have = have || a.chain_id == chain.config.chain_id;
+        if (have)
+            continue;
+        for (const auto& old : m_cached_header_infos)
+            if (old.chain_id == chain.config.chain_id && old.block_header.size() == 80
+                && Hash(old.block_header) == chain.current_work.block_hash) {
+                adopted.push_back(old);
+                break;
+            }
     }
 
     // Rebuild commitment from PPLNS-derived block hashes
@@ -1286,16 +1664,30 @@ void MergedMiningManager::rebuild_cached_blocks()
                 slot_hashes[it->second] = chain.current_work.block_hash;
         }
     }
+    std::vector<uint8_t> commitment;
     if (!slot_hashes.empty()) {
         auto proof = m_tree.compute_root(slot_hashes, 0);
-        m_cached_commitment = build_auxpow_commitment(proof.root, m_tree.size);
-    }
+        commitment = build_auxpow_commitment(proof.root, m_tree.size);
+    }   // else nothing buildable to commit to
 
+    // What the miners' work carries: the commitment, and the header infos
+    // their shares claim. Unchanged (e.g. a chain without payouts retried
+    // and dropped again): nothing to push.
+    bool work_changed = commitment != m_cached_commitment
+        || adopted.size() != m_cached_header_infos.size();
+    for (size_t k = 0; !work_changed && k < adopted.size(); ++k)
+        work_changed = adopted[k].chain_id != m_cached_header_infos[k].chain_id
+            || adopted[k].block_header != m_cached_header_infos[k].block_header;
+    ++(work_changed ? m_rebuild_work_changed : m_rebuild_work_unchanged);
+
+    m_cached_commitment = std::move(commitment);
     // Store the cached header infos for stratum sessions to read
-    m_cached_header_infos = std::move(header_infos);
+    m_cached_header_infos = std::move(adopted);
 
     LOG_INFO << "[MM-cache] rebuild complete: " << m_cached_header_infos.size()
-             << " chains, commitment=" << m_cached_commitment.size() << " bytes";
+             << " chains, commitment=" << m_cached_commitment.size() << " bytes"
+             << (work_changed ? "" : " (unchanged)");
+    return work_changed;
 }
 
 // ─── get_cached_header_infos_and_commitment ─────────────────────────────────
@@ -1671,18 +2063,26 @@ std::string MergedMiningManager::build_multiaddress_block(
 void MergedMiningManager::record_discovered_block(
     const ChainState& chain, bool accepted, const std::string& parent_hash)
 {
+    record_discovered_block(chain, accepted, parent_hash, chain.current_work.block_hash,
+                            chain.current_work.height, chain.current_work.coinbase_value);
+}
+
+void MergedMiningManager::record_discovered_block(
+    const ChainState& chain, bool accepted, const std::string& parent_hash,
+    const uint256& block_hash, int height, uint64_t coinbase_value)
+{
     // Caller must hold m_mutex
     LOG_INFO << "[MM:" << chain.config.symbol << "] record_discovered_block: building record...";
     DiscoveredMergedBlock blk;
     blk.chain_id    = chain.config.chain_id;
     blk.symbol      = chain.config.symbol;
-    blk.height      = chain.current_work.height;
-    blk.block_hash  = chain.current_work.block_hash.GetHex();
+    blk.height      = height;
+    blk.block_hash  = block_hash.GetHex();
     blk.parent_hash = parent_hash;
     blk.timestamp      = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
     blk.accepted       = accepted;
-    blk.coinbase_value = chain.current_work.coinbase_value;
+    blk.coinbase_value = coinbase_value;
     blk.is_local       = true;  // our own submission
 
     m_discovered_blocks.push_back(std::move(blk));
@@ -1694,10 +2094,8 @@ void MergedMiningManager::record_discovered_block(
     if (m_on_merged_block_found) {
         try {
             LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
-            m_on_merged_block_found(chain.config.symbol,
-                chain.current_work.height,
-                chain.current_work.block_hash.GetHex(), accepted,
-                chain.current_work.coinbase_value);
+            m_on_merged_block_found(chain.config.symbol, height, block_hash.GetHex(), accepted,
+                                    coinbase_value);
             LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << chain.config.symbol

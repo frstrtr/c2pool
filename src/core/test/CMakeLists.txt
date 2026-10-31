@@ -131,6 +131,22 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # vin/vout, HogEx not last / missing, txid, pegin outputs vs HogEx inputs,
     # fees vs coinbasevalue) refuses the template that breaks it. Same
     # fold-into-core_test reasoning as every TU here.
+    # web_server_aux_template_test.cpp: getblocktemplate [{"chain":"DOGE"}]
+    # answers with the merged DOGE template (prev, height, bits, curtime,
+    # coinbase value, txs, degraded mark), over JSON-RPC to a direct local
+    # client only; the call without "chain" is unchanged. Same
+    # fold-into-core_test reasoning as every TU here.
+    # web_server_block_budget_test.cpp: the LTC block weight (bad-blk-weight):
+    # a REAL TemplateBuilder template over a mempool above 4 MWU, built within
+    # the embedded node's budget over the web server's coinbase reserve,
+    # yields a found block of at most 4,000,000 weight with a 4,000-output
+    # PPLNS coinbase; a job above the limit is refused at assembly and
+    # counted. Same fold-into-core_test reasoning as every TU here.
+    # web_server_merged_drop_test.cpp: the share side follows the merged
+    # commitment. With no buildable DOGE block the job carries neither mm_data
+    # nor the share's merged_coinbase_info (a V36 peer rejects info without
+    # mm_data). Real MiningInterface + MergedMiningManager; same
+    # fold-into-core_test reasoning as every TU here (c2pool_merged_mining linked).
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
@@ -169,6 +185,8 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         version_gate_test.cpp
+        web_server_aux_template_test.cpp
+        web_server_block_budget_test.cpp
         web_server_config_endpoint_test.cpp
         web_server_current_payouts_test.cpp
         web_server_daemonless_graph_feed_test.cpp
@@ -178,6 +196,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp
         web_server_local_share_hash_rates_test.cpp
+        web_server_merged_drop_test.cpp
         web_server_mweb_hogex_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp

@@ -126,6 +126,8 @@ public:
 
     const c2pool::merged::AuxChainConfig& config() const override { return m_config; }
 
+    void set_block_size_reserve(uint32_t bytes) override { m_embedded.set_block_size_reserve(bytes); }
+
     /// Expose embedded node for UTXO maturity gate wiring.
     EmbeddedCoinNode& embedded_node() { return m_embedded; }
 
