@@ -1655,3 +1655,95 @@ TEST(DashTxInject, LaxDerSignatureServedOnlyBelowBip66)
         << "and non-DER from BIP66 on";
     EXPECT_EQ(mp.get_sorted_txs_with_fees(1u << 20, false, 2564045, 0).first.size(), 0u);
 }
+
+// (VERIFY-S2b N-B, R3-2; the verifier's KAT V1, ported) A child inject
+// spending a parent inject, confirmed in two consecutive blocks that a reorg
+// takes out together: both come back, the parent first (re-admitting the
+// child first refuses it inject-unpriceable), both priced at fee 0, and the
+// next template carries P before C. Then the new branch double-spends P's
+// input: P is conflict-evicted at the connect and the orphaned child is never
+// served.
+TEST(DashTxInject, ChainOfInjectsAcrossTwoRewoundBlocksComesBackParentFirst)
+{
+    using namespace dash_utxo_full;
+    Key k(0xd1);
+    const uint256 prevA = prevhash(0x91);
+    TxOut toK; toK.value = 100'000; toK.scriptPubKey = to_script(k.spk);
+    const auto P = make_signed_spend_outs(k, prevA, {toK});              // zero fee
+    const auto C = make_signed_spend_outs(k, dash_txid(P), {toK});       // zero fee, spends P:0
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-chain");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    Mempool mp;
+    lane.attach(mp);
+    arm_script_check(mp);
+    lane.on_header_tip(kB);
+
+    ASSERT_EQ(mp.add_inject(P, 0), Mempool::InjectGate::Ok);
+    const BlockType a1 = block(base_hash, {coinbase(50, 2001), P}, 2001);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_EQ(mp.confirmed_injects_kept(), 1u);
+
+    ASSERT_EQ(mp.add_inject(C, 0), Mempool::InjectGate::Ok) << "P:0 is in the view now";
+    const BlockType a2 = block(hash_of(a1), {coinbase(50, 2002), C}, 2002);
+    chain.hashes[kB + 2] = hash_of(a2);
+    lane.on_block_connected(a2, kB + 2);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a2));
+    ASSERT_TRUE(mp.inject_txids_in_pool().empty());
+    ASSERT_EQ(mp.confirmed_injects_kept(), 2u);
+
+    // Both blocks leave the header chain.
+    chain.hashes[kB + 1] = fake_hash(6001);
+    chain.hashes[kB + 2] = fake_hash(6002);
+    lane.on_header_tip(kB + 2);
+    ASSERT_EQ(lane.full_status().rewinds, 2u);
+    ASSERT_EQ(lane.cache()->get_best_block(), base_hash);
+    ASSERT_FALSE(lane.withheld());
+    const auto back = mp.inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 2u) << "parent and child are both back";
+    const auto eP = mp.get_entry(dash_txid(P));
+    const auto eC = mp.get_entry(dash_txid(C));
+    ASSERT_TRUE(eP.has_value());
+    ASSERT_TRUE(eC.has_value());
+    EXPECT_TRUE(eP->fee_fold_proven);
+    EXPECT_TRUE(eC->fee_fold_proven);
+    EXPECT_EQ(eP->fee, 0u);
+    EXPECT_EQ(eC->fee, 0u);
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "each one left the kept list";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 1, 0);
+        ASSERT_EQ(selected.size(), 2u) << "both ride the next template";
+        EXPECT_EQ(dash_txid(selected[0].tx), dash_txid(P)) << "parent first";
+        EXPECT_EQ(dash_txid(selected[1].tx), dash_txid(C));
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // The new branch double-spends P's input.
+    TxOut toK90; toK90.value = 90'000; toK90.scriptPubKey = to_script(k.spk);
+    const auto T = make_signed_spend_outs(k, prevA, {toK90});           // fee 10'000, not ours
+    const BlockType b1 = block(base_hash, {coinbase(50, 3001), T}, 3001);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_FALSE(mp.get_entry(dash_txid(P)).has_value()) << "P conflicts with T: evicted";
+    EXPECT_EQ(mp.confirmed_injects_kept(), 0u) << "b1 confirmed no inject of ours";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, kB + 2, 0);
+        EXPECT_TRUE(selected.empty()) << "the orphaned child is not served";
+        EXPECT_EQ(fees, 0u);
+    }
+}
