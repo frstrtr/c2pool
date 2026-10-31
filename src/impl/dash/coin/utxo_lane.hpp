@@ -67,6 +67,8 @@
 ///     named reason in the status), and never heals by jumping or wiping;
 ///   - a best block that left the header chain's best is disconnected from
 ///     its undo record (rewind), back to the base at most; deeper withholds.
+///   - a flush that fails drops the unflushed changes (discard_pending) and
+///     withholds, so nothing prices from coins the DB does not have.
 ///
 /// THREADS. Every lane entry point runs on the node io thread. The HTTP thread
 /// (/local_stats) reads full_status(), the copy the io thread publishes when
@@ -653,6 +655,7 @@ private:
                 prev = pu.block_hash;
             }
             if (!m_cache->disconnect_from_undo(u) || !m_cache->flush(prev, bh - 1)) {
+                m_cache->discard_pending();   // the view is the DB's again (S-4)
                 withhold("utxo-rewind-failed", "h=" + std::to_string(bh));
                 return false;
             }
@@ -783,6 +786,7 @@ private:
                                      std::to_string(why.missing.index));
         if (m_db) m_db->put_block_undo(height, *undo);
         if (!m_cache->flush(block_hash, height)) {
+            m_cache->discard_pending();   // the view is the DB's again (S-4)
             withhold("utxo-flush-failed", "h=" + std::to_string(height));
             return FullConnect::Refused;
         }

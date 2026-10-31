@@ -564,3 +564,24 @@ TEST(DashUtxoLane, StatusReadFromAnotherThreadWhileTheLaneMoves)
     EXPECT_EQ(st.strict_refusals, 2u);
     EXPECT_EQ(st.withheld_reason.rfind("utxo-strict-refusal", 0), 0u) << st.withheld_reason;
 }
+
+TEST(DashUtxoLane, FailedFlushDropsTheUnflushedChanges)
+{
+    // VERIFY-S2 S-4: a flush that fails withholds AND drops the block's
+    // unflushed changes, so the view the mempool prices from is the DB's
+    // again (not coins the DB does not have).
+    Rig r;
+    ASSERT_TRUE(r.open({snap_coin(fake_hash(61), 0, 1000, 61)}));
+    r.lane.on_header_tip(kBase);
+    ASSERT_EQ(r.lane.full_status().state, "serving");
+    ASSERT_EQ(r.lane.cache()->cache_size(), 0u);
+    r.lane.db()->close();   // every write fails from here on
+    const BlockType a1 = block(r.base_hash, {coinbase(50, 601)}, 601);
+    r.deliver(a1, kBase + 1);
+    EXPECT_TRUE(r.lane.withheld());
+    EXPECT_NE(r.lane.full_status().withheld_reason.find("utxo-flush-failed"), std::string::npos)
+        << r.lane.full_status().withheld_reason;
+    EXPECT_EQ(r.lane.cache()->cache_size(), 0u)
+        << "the failed block's changes are dropped: the view is the DB's again";
+    ASSERT_EQ(r.alerts.size(), 1u);
+}
