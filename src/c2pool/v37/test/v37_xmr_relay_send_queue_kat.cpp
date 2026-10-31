@@ -12,15 +12,20 @@
 //
 //   S1  two Path B relay nodes over loopback TCP, each holding a full pending
 //       set (P-09 receipts on a tip it has moved past) the other lacks; they
-//       HELLO and both re-offer every pending receipt (FB_RECEIPTS v3). While
-//       the mutual re-offer runs, A mines a carrier (a small flood from another
-//       thread): the call returns at once and the frame reaches B in < 1 s;
-//       every re-offered frame is delivered, both directions; no send timeout,
-//       no hard drop, no redial (one HELLO per side); no frame of either
-//       re-offer dropped by the receiver's valid-object budget (P-15).
+//       HELLO and both re-offer every pending receipt (FB_RECEIPTS v3). B's
+//       reader is held at A's first re-offer frame (B reads nothing more from
+//       A) while A floods a small frame from another thread (its share of a
+//       job made before the HELLO): the call returns while B is held; once B
+//       reads again, the frame reaches B in the link's order, behind every
+//       re-offer frame A queued before it; every re-offered frame is
+//       delivered, both directions; no send timeout, no hard drop, no redial
+//       (one HELLO per side); no frame of either re-offer dropped by the
+//       receiver's valid-object budget (P-15).
 //   S3  the per-link send queue stays bounded (high-water mark measured), with
 //       0 queue-full drops and 0 send-timeout drops.
-//   S4  a peer that reads slowly (a raw socket, 16 KiB per 100 ms) HELLOs A,
+//   S4  first A runs every job of the S1 exchange (its verify queue empty,
+//       nothing parked, no ticket open; one verify thread). A peer that reads
+//       slowly (a raw socket, 16 KiB per 100 ms) HELLOs A,
 //       which re-offers its full pending set: at A's send queue bound the link
 //       is kept and the queue holds the re-offer. At a bound below the
 //       re-offer's bytes (an eighth of them: paged; and the re-offer x
@@ -42,6 +47,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -66,13 +72,23 @@ static pb::PathbRelayOptions opts(bool listen, std::vector<u16> dial) {
 }
 
 // The first arrival time of each small frame by the id it carries: an FC_CARRIER (its carrier) or an FB_RECEIPTS of
-// one body (that receipt).
+// one body (that receipt); and the FB_RECEIPTS frames read before it on the link.
 struct SmallArrivals {
     std::mutex m;
     std::map<pb::Hash32, SClock::time_point> at;
+    std::map<pb::Hash32, std::uint64_t> behind;
+    std::uint64_t receipts = 0;   // FB_RECEIPTS frames read
     pb::RelayBuffers buf;
     void tap(const std::vector<u8>& f) {
-        if (f.empty() || f.size() < pb::kFrameHeaderBytes) return;
+        if (f.empty()) return;
+        const bool rf = f[0] == pb::kOpFbReceipts;
+        if (f.size() < pb::kFrameHeaderBytes) {
+            if (rf) {
+                std::lock_guard<std::mutex> lk(m);
+                ++receipts;
+            }
+            return;
+        }
         std::optional<pb::Hash32> id;
         if (f[0] == pb::kOpFcCarrier) {
             pb::CarrierBodyV3 c;
@@ -85,15 +101,52 @@ struct SmallArrivals {
                                            pb::receipt_limits(buf), r) == pb::WireError::None)
                 id = pb::receipt_id(r);
         }
-        if (!id) return;
         std::lock_guard<std::mutex> lk(m);
-        at.emplace(*id, SClock::now());
+        if (id && at.emplace(*id, SClock::now()).second) behind.emplace(*id, receipts);
+        if (rf) ++receipts;
     }
     std::optional<SClock::time_point> of(const pb::Hash32& id) {
         std::lock_guard<std::mutex> lk(m);
         const auto it = at.find(id);
         if (it == at.end()) return std::nullopt;
         return it->second;
+    }
+    std::optional<std::uint64_t> behind_of(const pb::Hash32& id) {
+        std::lock_guard<std::mutex> lk(m);
+        const auto it = behind.find(id);
+        if (it == behind.end()) return std::nullopt;
+        return it->second;
+    }
+};
+
+// Holds the reader it runs on (a node's tap) at the first FB_RECEIPTS frame after arm(), until open(): the node reads
+// nothing more from that link meanwhile.
+struct ReadGate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool armed = false, held = false, opened = false;
+    void arm() {
+        std::lock_guard<std::mutex> lk(m);
+        armed = true;
+    }
+    void at(const std::vector<u8>& f) {
+        if (f.empty() || f[0] != pb::kOpFbReceipts) return;
+        std::unique_lock<std::mutex> lk(m);
+        if (!armed || held || opened) return;
+        held = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return opened; });
+    }
+    bool wait_held(std::chrono::milliseconds limit) {
+        std::unique_lock<std::mutex> lk(m);
+        return cv.wait_for(lk, limit, [&] { return held; });
+    }
+    void open() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            opened = true;
+        }
+        cv.notify_all();
     }
 };
 
@@ -180,6 +233,7 @@ int main() {
         return k;
     };
     SmallArrivals arrivals;   // before B: B's reader threads use it until B stops
+    ReadGate gate;            // the same
     const auto t_pend = SClock::now();
     auto A = rig.make("A", opts(true, {}), /*launch=*/true);
     const std::size_t pa = pend(*A, 1, 0xA1, 0x10000000u);
@@ -188,7 +242,10 @@ int main() {
     auto B = rig.make("B", opts(false, {A->port()}), /*launch=*/true);
     const std::size_t pb_ = pend(*B, 2, 0xB2, 0x20000000u);
     arrivals.buf = B->node->config().buffers;
-    B->links.set_tap([&](std::uint64_t, const std::vector<u8>& f) { arrivals.tap(f); });
+    B->links.set_tap([&](std::uint64_t, const std::vector<u8>& f) {
+        arrivals.tap(f);
+        gate.at(f);
+    });
     const std::vector<pb::ReceiptBodyV3> one{A->r().with_node([](pb::PathbNode& n) { return n.pending().all().front()->body; })};
     const std::size_t body = pb::encode_fb_receipts(0, one, pb::kRuledLaneParams).value_or(std::vector<u8>{}).size();
     std::printf("    pending A=%zu B=%zu (P-09 = %zu) in %lld ms; a one-body frame %zu B; ~%zu B each way\n", pa, pb_, K,
@@ -205,18 +262,32 @@ int main() {
         C(false, "S1 A builds a job on its best tip");
         return C.done("v37_xmr_relay_send_queue_kat");
     }
+    gate.arm();   // B's reader stops at A's first re-offer frame
     const auto t_start = SClock::now();
     C(B->start(why), "S1 B dials A " + why);
     const bool up = wait_until([&] { return A->r().ready_peers().size() == 1 && B->r().ready_peers().size() == 1; }, 5000ms, 10ms);
     C(up, "S1 HELLO A<->B (both re-offer their pending sets now)");
-    std::this_thread::sleep_for(100ms);   // the mutual re-offer is in flight
+    const bool parked = gate.wait_held(30000ms);   // B holds A's first re-offer frame: B reads nothing more from A
+    const std::vector<std::uint64_t> ra = A->r().ready_peers();
+    const std::uint64_t r0 = A->st().reoffer_frames.load();   // A's re-offer frames queued before the small frame
+    const std::size_t q0 = ra.empty() ? 0 : A->links.net().queued_bytes(ra.front());
 
     // A concurrent small sender: A's share of a job made before the HELLO, flooded as one frame (the stratum /
-    // verify-flood path in the daemon).
+    // verify-flood path in the daemon), while B is held.
+    std::atomic<bool> returned{false};
+    pb::NodeEventResult shared;
+    long long call_ms = -1;
+    bool link_up = false;   // A's link to B still up as the call returns
     const auto t0 = SClock::now();
-    const pb::NodeEventResult shared = rig.share(*A, *jsmall, 0x30000000u);
-    const auto t1 = SClock::now();
-    const long long call_ms = ms_since(t0, t1);
+    std::thread caller([&] {
+        shared = rig.share(*A, *jsmall, 0x30000000u);
+        call_ms = ms_since(t0, SClock::now());
+        link_up = !ra.empty() && A->links.has_peer(ra.front());
+        returned = true;
+    });
+    const bool while_held = parked && wait_until([&] { return returned.load(); }, 30000ms, 1ms);
+    gate.open();
+    caller.join();
     const pb::Hash32 small = pb::receipt_id(body_of(*jsmall, 0x30000000u));
 
     const bool delivered = wait_until([&] {
@@ -227,16 +298,21 @@ int main() {
     const auto t_done = SClock::now();
     const std::optional<SClock::time_point> at = arrivals.of(small);
     const long long arrive_ms = at ? ms_since(t0, *at) : -1;
+    const std::optional<std::uint64_t> behind = arrivals.behind_of(small);
     const auto helloA = A->st().hello_ok.load(), helloB = B->st().hello_ok.load();
-    std::printf("    S1 METRIC small_send_call_ms=%lld small_arrive_ms=%lld | re-offered A->B %llu (B got %llu) B->A %llu "
-                "(A got %llu) frames in %lld ms | hello_ok A=%llu B=%llu\n",
-                call_ms, arrive_ms, (unsigned long long)A->st().reoffer_frames.load(),
-                (unsigned long long)B->links.frames(pb::kOpFbReceipts), (unsigned long long)B->st().reoffer_frames.load(),
-                (unsigned long long)A->links.frames(pb::kOpFbReceipts), ms_since(t_start, t_done),
-                (unsigned long long)helloA, (unsigned long long)helloB);
-    C((shared.action == pb::NodeAction::Placed || shared.action == pb::NodeAction::Pending) && call_ms < 1000,
-      "S1 a concurrent small send never blocks behind the re-offer (call < 1 s)");
-    C(arrive_ms >= 0 && arrive_ms < 1000, "S1 ... and reaches the peer in < 1 s");
+    std::printf("    S1 METRIC small_send_call_ms=%lld small_arrive_ms=%lld | B held=%d, returned held=%d link up=%d, A queued %zu B, "
+                "%llu re-offer frames before the small one, B read it behind %lld | re-offered A->B %llu (B got %llu) B->A "
+                "%llu (A got %llu) frames in %lld ms | hello_ok A=%llu B=%llu\n",
+                call_ms, arrive_ms, parked ? 1 : 0, while_held ? 1 : 0, link_up ? 1 : 0, q0, (unsigned long long)r0,
+                behind ? (long long)*behind : -1LL,
+                (unsigned long long)A->st().reoffer_frames.load(), (unsigned long long)B->links.frames(pb::kOpFbReceipts),
+                (unsigned long long)B->st().reoffer_frames.load(), (unsigned long long)A->links.frames(pb::kOpFbReceipts),
+                ms_since(t_start, t_done), (unsigned long long)helloA, (unsigned long long)helloB);
+    C((shared.action == pb::NodeAction::Placed || shared.action == pb::NodeAction::Pending) && while_held && link_up,
+      "S1 a concurrent small send never blocks behind the re-offer (the call returns while B reads nothing, the link up)");
+    C(behind.has_value() && *behind >= r0 && r0 > 0,
+      "S1 ... and reaches the peer in the link's order, behind the " + std::to_string(r0) +
+              " re-offer frames queued before it");
     C(delivered, "S1 every re-offered frame is delivered, both directions");
     C(helloA == 1 && helloB == 1, "S1 no send timeout -> no hard drop -> no redial (one HELLO per side)");
     std::printf("    S1 METRIC p15 A drops=%llu counted=%llu | B drops=%llu counted=%llu\n",
@@ -263,6 +339,20 @@ int main() {
     // ── S4 a slow peer while a full pending set is re-offered ────────────────
     {
         auto& na = A->links.net();
+        // A runs every job of the S1 exchange first (B's re-offered receipts); one verify thread
+        const auto ti = SClock::now();
+        const std::uint64_t fl0 = A->st().flood_frames.load();
+        const std::size_t vq0 = A->r().verify_queue_size();
+        const bool idle = wait_until([&] {
+            return A->r().verify_queue_size() == 0 && A->r().parked_size() == 0 && A->r().open_tickets() == 0 &&
+                   A->r().parked_receipts() == 0;
+        }, 60000ms, 20ms);
+        std::printf("    S4 METRIC A idle=%d in %lld ms (verify queue %zu at the start; %llu frames flooded meanwhile; verify "
+                    "threads %llu)\n",
+                    idle ? 1 : 0, ms_since(ti, SClock::now()), vq0,
+                    (unsigned long long)(A->st().flood_frames.load() - fl0), (unsigned long long)A->st().verify_threads.load());
+        C(idle && A->st().verify_threads.load() == 1,
+          "S4 A has run every job of the S1 exchange before a slow peer HELLOs (verify queue empty, nothing parked)");
         const std::size_t reoffer = body * K;
         const std::uint64_t full0 = na.peers_dropped_queue_full();
         const std::uint64_t ro0 = A->st().reoffer_frames.load();
