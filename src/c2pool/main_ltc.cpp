@@ -13,6 +13,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <csignal>
@@ -34,6 +35,7 @@
 #include <core/coinbase_builder.hpp>
 #include <c2pool/storage/the_checkpoint.hpp>
 #include <core/pack.hpp>
+#include <core/worker_pools.hpp>
 #include <core/filesystem.hpp>
 #include <core/settings_cli.hpp>          // M0b control-plane wiring
 #include <core/config_endpoint.hpp>       // M1 control-plane READ-ONLY endpoints
@@ -383,11 +385,40 @@ static size_t estimate_block_bytes(const ltc::coin::BlockType& b)
 }
 
 // Global signal handling
-static bool g_shutdown_requested = false;
+static std::atomic<bool> g_shutdown_requested{false};
 
 void signal_handler(int signal) {
+    if (g_shutdown_requested.exchange(true)) {
+        // A second SIGINT/SIGTERM while the shutdown runs: exit now, as
+        // Core does on a repeated interrupt. Only async-signal-safe calls.
+        static const char msg[] = "c2pool: second signal during shutdown: exiting now\n";
+#ifndef _WIN32
+        (void)!::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+        std::_Exit(128 + signal);
+    }
     LOG_INFO << "Received signal " << signal << ", initiating shutdown...";
-    g_shutdown_requested = true;
+}
+
+// The shutdown's watchdog: started when the main loop ends. If the process
+// is still running SHUTDOWN_DEADLINE later (a join that never returns, a
+// destructor blocked behind a worker), it exits: status 0 once every store
+// was closed (only the exit-time teardown hung), 1 before.
+static std::atomic<bool> g_shutdown_stores_closed{false};
+static constexpr auto SHUTDOWN_DEADLINE = std::chrono::seconds(10);
+static void start_shutdown_watchdog()
+{
+    std::thread([]() {
+        const auto until = std::chrono::steady_clock::now() + SHUTDOWN_DEADLINE;
+        while (std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const bool closed = g_shutdown_stores_closed.load();
+        LOG_ERROR << "Shutdown still running after "
+                  << std::chrono::duration_cast<std::chrono::seconds>(SHUTDOWN_DEADLINE).count()
+                  << " s (" << (closed ? "stores closed; exit-time teardown blocked" : "stores not closed")
+                  << "): exiting now";
+        std::_Exit(closed ? 0 : 1);
+    }).detach();
 }
 
 // C2Pool configuration
@@ -2014,6 +2045,10 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
             std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
+            // The header-validation pools (LTC, DOGE, NMC): their tasks use the
+            // header chains and the DOGE schedule, and callbacks keep them alive
+            // past those; the shutdown below joins them first (core::WorkerPools).
+            core::WorkerPools worker_pools;
             // UTXO set for fee computation (block reward + mempool tx fees)
             std::unique_ptr<core::coin::UTXOViewDB>     ltc_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache>  ltc_utxo_cache;
@@ -2648,7 +2683,7 @@ int main(int argc, char* argv[]) {
 
                 // Header validation thread pool (1 thread) — keeps scrypt off io_context.
                 // Shared_ptr so it stays alive for the lifetime of the callbacks.
-                auto hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                auto hdr_pool = worker_pools.make(1, "LTC headers");
 
                 // Header sync (ltc/coin/header_sync.hpp): the batches go to the
                 // header thread (add_headers runs scrypt near the tip), the
@@ -6689,7 +6724,7 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<doge::coin::HashSchedule>  doge_hash_schedule;
             std::unique_ptr<doge::coin::HashScheduleSync> doge_sched_sync;
             std::unique_ptr<doge::coin::RangeSync>        doge_range_sync;
-            std::unique_ptr<boost::asio::thread_pool>  doge_full_pool;
+            std::shared_ptr<boost::asio::thread_pool>  doge_full_pool;
             // Shared with the lanes' callbacks: whether the pool prices against
             // the full set, which bodies the full lane asked for, whether its
             // lane can run. The DB the explorer reads DOGE blocks from follows
@@ -7227,7 +7262,7 @@ int main(int argc, char* argv[]) {
                             // Always active when HeaderChain + broadcaster exist
                             // (not gated on --embedded-doge anymore).
                             if (cfg.symbol == "DOGE" && doge_chain) {
-                                auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                                auto doge_hdr_pool = worker_pools.make(1, "DOGE headers");
                                 auto* bcaster_ptr = broadcaster.get();
                                 // A block announced by inv or a small headers message is not
                                 // fetched from its announcer at once (every announcer sent the
@@ -7544,6 +7579,7 @@ int main(int argc, char* argv[]) {
                                 if (doge_utxo_cache && doge_utxo_db) {
                                     doge::coin::UtxoLaneHost host;
                                     auto* dc = doge_chain.get();
+                                    host.stopping = [full = doge_full]() { return full->stopping.load(); };
                                     host.chain_height = [dc]() { return dc->height(); };
                                     host.chain_hash_at = [dc](uint32_t h) {
                                         auto e = dc->get_header_by_height(h);
@@ -7748,12 +7784,13 @@ int main(int argc, char* argv[]) {
                                 // view and the full lane takes them over.
                                 std::shared_ptr<doge::coin::UtxoLane> doge_full_lane;
                                 if (doge_full_cache && doge_full_db) {
-                                    doge_full_pool = std::make_unique<boost::asio::thread_pool>(1);
+                                    doge_full_pool = std::make_shared<boost::asio::thread_pool>(1);
                                     auto* fpool = doge_full_pool.get();
                                     auto* dc = doge_chain.get();
                                     auto full = doge_full;
                                     auto* pool = doge_pool.get();
                                     doge::coin::UtxoLaneHost host;
+                                    host.stopping = [full]() { return full->stopping.load(); };
                                     host.chain_height = [dc]() { return dc->height(); };
                                     // Below the header chain's root the hash schedule names
                                     // the best chain's block.
@@ -8395,7 +8432,7 @@ int main(int argc, char* argv[]) {
                             // is structurally insufficient for a chain that has been
                             // AuxPoW since 2014). Mirrors the DOGE header-sync block.
                             if (cfg.symbol == "NMC" && nmc_chain) {
-                                auto nmc_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
+                                auto nmc_hdr_pool = worker_pools.make(1, "NMC headers");
                                 auto* bcaster_ptr = broadcaster.get();
                                 auto* nc = nmc_chain.get();
 
@@ -9887,8 +9924,15 @@ int main(int argc, char* argv[]) {
                                       rss_limit_mb]() {
                 constexpr int CHECK_SEC = 10;
                 constexpr int FREEZE_SEC = 30;
+                // Sleeps that end at the shutdown: the main thread joins this
+                // thread first thing after its loop (it waited up to 30 s).
+                auto nap = [](int sec) {
+                    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
+                    while (!g_shutdown_requested && std::chrono::steady_clock::now() < until)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                };
                 // Grace period: let the event loop start up before monitoring
-                std::this_thread::sleep_for(std::chrono::seconds(FREEZE_SEC));
+                nap(FREEZE_SEC);
 
                 // RSS reader (works on Linux via /proc, returns 0 elsewhere)
                 auto read_rss_mb = []() -> long {
@@ -9911,7 +9955,7 @@ int main(int argc, char* argv[]) {
                 };
 
                 while (!g_shutdown_requested) {
-                    std::this_thread::sleep_for(std::chrono::seconds(CHECK_SEC));
+                    nap(CHECK_SEC);
                     if (g_shutdown_requested) break;
 
                     // RSS limit check — catch memory leaks before OOM killer
@@ -10019,9 +10063,59 @@ int main(int argc, char* argv[]) {
             }
             work_guard.reset();
 
+            // ── Shutdown, in order ──────────────────────────────────────
+            // The stores (the DOGE full and accrual sets, the header chains)
+            // close when this scope ends. Every worker that uses them is
+            // stopped and joined first: the header pools and the DOGE full
+            // lane's pool were kept alive by callbacks past the stores, and
+            // a task running on a closed store aborted the process or blocked
+            // it for good (the live IBD hung 4.3 h after "shutdown complete").
+            start_shutdown_watchdog();
+
             // Stop external watchdog thread (g_shutdown_requested is already true)
             if (ext_watchdog.joinable())
                 ext_watchdog.join();
+
+            // 1. No new work: the HTTP API and stratum, the coin peers (no
+            //    more blocks, headers or txs), the merged-mining poll.
+            web_server.stop();
+            if (embedded_broadcaster)
+                embedded_broadcaster->stop();
+            for (auto& [chain_id, b] : merged_broadcasters)
+                if (b)
+                    b->stop();
+            if (mm_manager)
+                mm_manager->stop();
+
+            // 2. The workers: the sharechain's compute thread (its locked-best
+            //    hook is this scope's lambda: a cycle running after the scope
+            //    segfaulted, live 10-31), then the DOGE lanes end a drain after
+            //    the block being connected (each block is flushed when
+            //    connected, so the sets stay at their last flush), the pools
+            //    drop their queued tasks and are joined.
+            constexpr auto JOIN_DEADLINE = std::chrono::seconds(3);
+            std::vector<std::string> still_running;
+            if (p2p_node && !p2p_node->stop_compute(JOIN_DEADLINE))
+                still_running.push_back("sharechain compute");
+            doge_full->stopping = true;
+            for (auto& name : worker_pools.stop_and_join(JOIN_DEADLINE))
+                still_running.push_back(name);
+            if (doge_full_pool && !core::stop_and_join_within(doge_full_pool, JOIN_DEADLINE))
+                still_running.push_back("DOGE full set");
+            if (!still_running.empty()) {
+                std::string names;
+                for (const auto& n : still_running)
+                    names += (names.empty() ? "" : ", ") + n;
+                // Closing the stores under a running worker is what this order
+                // prevents: exit with them at their last flush instead.
+                LOG_ERROR << "Shutdown: worker(s) still running after "
+                          << std::chrono::duration_cast<std::chrono::seconds>(JOIN_DEADLINE).count()
+                          << " s: " << names << "; exiting without closing the stores";
+                std::_Exit(1);
+            }
+            if (doge_full_db)
+                LOG_INFO << "[EMB-DOGE] Full UTXO set at h=" << doge_full_db->get_best_height()
+                         << " on shutdown (a restart resumes there)";
 
             // Save stats on shutdown
             mi_ptr->save_stat_log();
@@ -10158,6 +10252,7 @@ int main(int argc, char* argv[]) {
             work_guard.reset();
         }
         
+        g_shutdown_stores_closed = true;
         LOG_INFO << "c2pool shutdown complete";
         
     } catch (const std::exception& e) {
