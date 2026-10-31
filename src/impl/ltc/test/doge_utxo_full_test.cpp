@@ -882,6 +882,71 @@ TEST(DogeUtxoBootstrap, TheChaseWaitsForTheColdStartDecision)
     EXPECT_EQ(l.net.requested.front(), 16u);
 }
 
+// Rule 3 (FRESH-IMPL-NOTES §7): under the Bootstrap's download a body beyond
+// the window is not held in memory. One inside the range is asked again in
+// its turn; one above the range (a block mined meanwhile) extends it
+// (VERIFY9 S2, M-R3: the bound in full mode only).
+TEST(DogeUtxoBootstrap, ABodyBeyondTheWindowExtendsTheRangeInsteadOfWaitingInMemory)
+{
+    const uint256 g = genesis(0x76);
+    const auto chain = chain_with(g, 62);
+    Lane l(40, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(std::vector<BlockType>(chain.begin(), chain.begin() + 60), 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[59], hash_of(chain[59]), 60, "a");
+    ASSERT_TRUE(l.lane.fill().active);
+    ASSERT_EQ(l.lane.fill().phase, "Bootstrap");
+    ASSERT_EQ(l.lane.fill().next_height, 20u);
+    ASSERT_EQ(l.lane.fill().end_height, 60u);
+    l.lane.fill().window = 8;  // a range longer than its window
+
+    l.lane.on_block(chain[39], hash_of(chain[39]), 40, "b");
+    EXPECT_EQ(l.lane.fill().buffer.count(40), 0u) << "a body beyond the window waits in memory";
+
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[61], hash_of(chain[61]), 62, "c");
+    EXPECT_EQ(l.lane.fill().end_height, 62u) << "the range did not grow to the new block";
+    EXPECT_EQ(l.lane.fill().buffer.count(62), 0u) << "a body above the range waits in memory";
+
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 62u);
+    EXPECT_FALSE(l.lane.fill().active);
+}
+
+// Rule 4 (FRESH-IMPL-NOTES §7): the Bootstrap's download has its own request
+// timeouts and staller rule. 31 s without a drain sends no broadcast beside
+// it, and the body that came resets the stall clock the host's 30-s timer
+// reads (VERIFY9 S2, M-R4: the 30-s broadcast beside the download).
+TEST(DogeUtxoBootstrap, NoBroadcastBesideTheBootstrapsDownload)
+{
+    const uint256 g = genesis(0x77);
+    const auto chain = chain_with(g, 60);
+    Lane l(40, Mode::Accrual, 0, /*download=*/true);
+    l.net.peers = {"a", "b", "c"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[59], hash_of(chain[59]), 60, "a");
+    ASSERT_TRUE(l.lane.fill().active);
+    ASSERT_EQ(l.lane.fill().next_height, 20u);
+    l.net.requested.clear();
+    l.net.asked_how.clear();
+
+    l.lane.fill().last_drain_time -= std::chrono::seconds(31);
+    l.lane.on_block(chain[24], hash_of(chain[24]), 25, "b");  // not the next height: no drain
+    EXPECT_EQ(l.lane.fill().next_height, 20u);
+    EXPECT_TRUE(l.net.asked_how.empty()) << "a broadcast beside the download";
+    EXPECT_TRUE(l.net.requested.empty());
+    EXPECT_LT(std::chrono::steady_clock::now() - l.lane.fill().last_drain_time,
+              std::chrono::seconds(l.lane.fill().STALL_TIMEOUT_SEC))
+        << "the host's stall timer would fire";
+
+    serve_peers(l, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), 60u);
+    EXPECT_TRUE(l.net.asked_how.empty());
+}
+
 // A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.
 TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
 {
