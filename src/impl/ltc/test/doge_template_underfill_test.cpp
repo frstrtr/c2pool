@@ -20,7 +20,37 @@
 // ---------------------------------------------------------------------------
 #include "doge_utxo_lane_harness.hpp"
 
+#include <boost/log/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
+
+#include <sstream>
+
 namespace {
+
+/// What the node logs while it lives (a Boost.Log sink on the core).
+class LogCapture {
+public:
+    LogCapture()
+        : stream_(boost::make_shared<std::ostringstream>())
+    {
+        auto backend = boost::make_shared<boost::log::sinks::text_ostream_backend>();
+        backend->add_stream(stream_);
+        backend->auto_flush(true);
+        sink_ = boost::make_shared<sink_t>(backend);
+        boost::log::core::get()->add_sink(sink_);
+    }
+    ~LogCapture() { boost::log::core::get()->remove_sink(sink_); }
+
+    bool has(const std::string& s) const { return stream_->str().find(s) != std::string::npos; }
+
+private:
+    using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+    boost::shared_ptr<std::ostringstream> stream_;
+    boost::shared_ptr<sink_t> sink_;
+};
 
 constexpr int      KNOWN      = 24;
 constexpr int      ORPHANS    = 6;
@@ -40,10 +70,10 @@ uint256 tag_hash(uint8_t kind, uint32_t i)
     return h;
 }
 
-MutableTransaction pay_from(const uint256& prev, int64_t value)
+MutableTransaction pay_from(const uint256& prev, int64_t value, size_t sig_bytes = 107)
 {
     MutableTransaction tx = spend(prev, 0, value, 0x40);
-    tx.vin[0].scriptSig.m_data.assign(107, 0x30);  // ~ a signature and a key
+    tx.vin[0].scriptSig.m_data.assign(sig_bytes, 0x30);  // 107: ~ a signature and a key
     return tx;
 }
 
@@ -56,7 +86,9 @@ struct Fixture {
     std::vector<MutableTransaction> txs;
     uint64_t known_fee_sum{0};
 
-    Fixture()
+    /// `priced_sig` / `unpriced_sig`: the scriptSig bytes of the priced txs
+    /// and of the others (larger ones make the pool's bytes a backlog).
+    explicit Fixture(size_t priced_sig = 107, size_t unpriced_sig = 107)
     {
         core::coin::UTXOViewDB::ChangeMap coins;
         for (int i = 0; i < KNOWN; ++i)
@@ -76,23 +108,30 @@ struct Fixture {
         for (int i = 0; i < TOTAL; ++i) {
             if (i < KNOWN) {
                 const int64_t fee = 100000 + i;
-                txs.push_back(pay_from(tag_hash(0xa0, i), 1'000'000'000LL - fee));
+                txs.push_back(pay_from(tag_hash(0xa0, i), 1'000'000'000LL - fee, priced_sig));
                 known_fee_sum += static_cast<uint64_t>(fee);
             } else if (i < KNOWN + ORPHANS) {
-                txs.push_back(pay_from(tag_hash(0xb0, i), 500'000'000LL));  // nobody has this coin
+                // nobody has this coin
+                txs.push_back(pay_from(tag_hash(0xb0, i), 500'000'000LL, unpriced_sig));
             } else {
-                txs.push_back(pay_from(tag_hash(0xc0, i - KNOWN - ORPHANS), DOGE_SUBSIDY - 1'000'000));
+                txs.push_back(pay_from(tag_hash(0xc0, i - KNOWN - ORPHANS), DOGE_SUBSIDY - 1'000'000,
+                                       unpriced_sig));
             }
         }
     }
 
-    void admit_all()
+    void admit_all(bool clean = true)
     {
         for (const auto& tx : txs)
             pool.admit(tx, t.cache.get());
-        tip.clean(pool);
+        if (clean)
+            tip.clean(pool);
     }
 };
+
+constexpr const char* kUnderfill = "TemplateBuilder UNDERFILL";
+// Priced txs of ~2.5 kB: the 24 hold over UNDERFILL_BACKLOG_SLACK.
+constexpr size_t BIG_SIG = 2400;
 
 } // namespace
 
@@ -120,7 +159,63 @@ TEST(DogeTemplateUnderfill, PricedTxsFillTheTemplateUnpricedNeverDo)
     }
     EXPECT_EQ(t["coinbasevalue"].get<int64_t>(), f.tip.subsidy() + static_cast<int64_t>(f.known_fee_sum));
     EXPECT_EQ(f.pool.byte_size(), selected_bytes) << "the pool holds priced txs only";
-    EXPECT_FALSE(doge::coin::TemplateBuilder::underfill(selected_bytes, f.pool.byte_size(), f.pool.total_fees()));
+    EXPECT_EQ(f.pool.priced_bytes(), selected_bytes);
+    EXPECT_FALSE(doge::coin::TemplateBuilder::underfill(selected_bytes, f.pool.priced_bytes(), f.pool.total_fees()));
+}
+
+// The clean-tip gate's coinbase-only template (the tip's body has not run
+// through the pool yet) is marked degraded and fetched again: not a fill, so
+// no UNDERFILL, though the pool holds 24 priced txs over the backlog slack
+// (VERIFY9 S1: 144 of 150 warnings in an hour were these).
+TEST(DogeTemplateUnderfill, ADegradedTemplateDoesNotWarn)
+{
+    Fixture f(BIG_SIG);
+    f.admit_all(/*clean=*/false);
+    ASSERT_EQ(f.pool.size(), static_cast<size_t>(KNOWN));
+    ASSERT_TRUE(doge::coin::TemplateBuilder::underfill(0, f.pool.priced_bytes(), f.pool.total_fees()))
+        << "the pool is no backlog: the KAT would prove nothing";
+
+    LogCapture log;
+    const auto t = f.tip.build(f.pool);
+    ASSERT_TRUE(t.contains("degraded"));
+    EXPECT_EQ(t["degraded"], "mempool-not-cleaned-for-tip");
+    EXPECT_TRUE(t["transactions"].empty());
+    EXPECT_FALSE(log.has(kUnderfill)) << "a degraded template warned UNDERFILL";
+}
+
+// A clean template that selects none of the 24 priced txs (here: no weight
+// left for them) still warns.
+TEST(DogeTemplateUnderfill, ACleanTemplateThatSelectsNoneOfThePricedTxsWarns)
+{
+    Fixture f(BIG_SIG);
+    f.admit_all();
+    ASSERT_EQ(f.pool.size(), static_cast<size_t>(KNOWN));
+
+    LogCapture log;
+    const auto t = f.tip.build(f.pool, /*max_weight=*/1);
+    EXPECT_FALSE(t.contains("degraded"));
+    EXPECT_TRUE(t["transactions"].empty());
+    EXPECT_TRUE(log.has(kUnderfill)) << "0 of " << KNOWN << " priced txs (" << f.pool.priced_bytes()
+                                     << " B) selected without a warning";
+}
+
+// Unpriced txs forced past admission (6 orphans and 5 premature spends of
+// ~12 kB each) are no backlog: no template can take them. The 24 small
+// priced txs, all selected (near-empty by bytes), do not warn (VERIFY9 S1:
+// "64 tx / 27804B while mempool holds 148 tx / 79143B" was this).
+TEST(DogeTemplateUnderfill, UnpricedBytesAreNoBacklog)
+{
+    Fixture f(107, /*unpriced_sig=*/12000);
+    for (const auto& tx : f.txs)
+        EXPECT_TRUE(f.pool.add_tx_unchecked(tx, f.t.cache.get()));
+    f.tip.clean(f.pool);
+    ASSERT_GT(f.pool.byte_size(), f.pool.priced_bytes() + doge::coin::TemplateBuilder::UNDERFILL_BACKLOG_SLACK);
+
+    LogCapture log;
+    const auto t = f.tip.build(f.pool);
+    EXPECT_FALSE(t.contains("degraded"));
+    EXPECT_EQ(t["transactions"].size(), static_cast<size_t>(KNOWN));
+    EXPECT_FALSE(log.has(kUnderfill)) << "the unpriced txs counted as backlog";
 }
 
 // Unpriced txs forced past admission (add_tx_unchecked) are still never

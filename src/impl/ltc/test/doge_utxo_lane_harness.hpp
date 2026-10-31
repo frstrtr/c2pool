@@ -418,9 +418,11 @@ struct DogeTip {
     /// The tip's body ran through the pool's cleanup (the template builds).
     void clean(Mempool& pool) const { pool.remove_for_block(body); }
 
-    nlohmann::json build(const Mempool& pool) const
+    nlohmann::json build(const Mempool& pool,
+                         uint32_t max_weight = doge::coin::TemplateBuilder::MAX_BLOCK_WEIGHT
+                                             - doge::coin::TemplateBuilder::COINBASE_RESERVE) const
     {
-        auto wd = doge::coin::TemplateBuilder::build_template(chain, pool, params);
+        auto wd = doge::coin::TemplateBuilder::build_template(chain, pool, params, max_weight);
         EXPECT_TRUE(wd.has_value());
         return wd ? wd->m_data : nlohmann::json();
     }

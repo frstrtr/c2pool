@@ -186,7 +186,7 @@ TEST(DogeUtxoFull, DeepInputConsolidationIsPricedAndSelected)
     EXPECT_EQ(t["transactions"][0]["fee"].get<int64_t>(), FEE);
     EXPECT_EQ(t["coinbasevalue"].get<int64_t>(), tip.subsidy() + FEE);
     const uint64_t selected = t["transactions"][0]["data"].get<std::string>().size() / 2;
-    EXPECT_FALSE(doge::coin::TemplateBuilder::underfill(selected, pool.byte_size(), pool.total_fees()));
+    EXPECT_FALSE(doge::coin::TemplateBuilder::underfill(selected, pool.priced_bytes(), pool.total_fees()));
 }
 
 // KAT 2. A set complete at 10 restarts with the chain at 10 + keep + 5. The

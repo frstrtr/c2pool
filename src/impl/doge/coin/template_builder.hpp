@@ -140,12 +140,14 @@ public:
     static constexpr uint64_t UNDERFILL_BACKLOG_SLACK  = 50'000ull; // unselected fee-paying material that should have filled it
 
     /// The underfill guard's predicate: a near-empty template while the pool
-    /// holds fee-paying backlog that should have filled it.
-    static bool underfill(uint64_t selected_bytes, uint64_t mempool_bytes, uint64_t mempool_fees)
+    /// holds fee-paying backlog that should have filled it. `priced_bytes` is
+    /// the pool's priced txs (Mempool::priced_bytes): an unpriced tx enters
+    /// no template, so it is no backlog.
+    static bool underfill(uint64_t selected_bytes, uint64_t priced_bytes, uint64_t mempool_fees)
     {
         const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
         const bool has_backlog = mempool_fees > 0
-                              && mempool_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
+                              && priced_bytes > selected_bytes + UNDERFILL_BACKLOG_SLACK;
         return near_empty && has_backlog;
     }
 
@@ -252,14 +254,19 @@ public:
         // DOGE mempool held fee-paying backlog that should have filled it. We
         // cannot fabricate transactions, so surface loudly (WARNING) for
         // contabo-prod-watch / the operator. Genuinely empty mempools never trip.
-        {
-            const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
-            const uint64_t mempool_fees  = pool.total_fees();
-            if (underfill(selected_bytes, mempool_bytes, mempool_fees)) {
+        // A degraded template is not a fill: the clean-tip gate or an
+        // incomplete set chose coinbase-only, it is marked degraded and fetched
+        // again, so the guard skips it (144 of 150 warnings in an hour were
+        // those, VERIFY9 S1). The backlog is the priced txs only.
+        if (degraded == nullptr) {
+            const uint64_t priced_bytes = pool.priced_bytes();
+            const uint64_t mempool_fees = pool.total_fees();
+            if (underfill(selected_bytes, priced_bytes, mempool_fees)) {
                 LOG_WARNING << "[EMB-DOGE] TemplateBuilder UNDERFILL: selected "
                             << selected_txs.size() << " tx / " << selected_bytes
                             << "B into template while mempool holds " << pool.size()
-                            << " tx / " << mempool_bytes << "B (" << mempool_fees
+                            << " tx / " << pool.byte_size() << "B (" << priced_bytes
+                            << "B priced, " << mempool_fees
                             << " sat fees) — near-empty block on a non-empty "
                             << "mempool; template-fill regression, gates cutover.";
             }

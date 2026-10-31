@@ -604,6 +604,19 @@ public:
         return m_total_bytes;
     }
 
+    /// Wire bytes of the priced (fee_known) transactions: what a selection
+    /// can take, as TemplateBuilder counts a selected tx (base + witness).
+    /// An unpriced (quarantined) tx enters no template.
+    uint64_t priced_bytes() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        uint64_t sum = 0;
+        for (const auto& [txid, entry] : m_pool) {
+            if (entry.fee_known)
+                sum += uint64_t{entry.base_size} + entry.witness_size;
+        }
+        return sum;
+    }
+
     /// Sum of all known fees across mempool transactions.
     uint64_t total_fees() const {
         std::lock_guard<std::mutex> lock(m_mutex);
