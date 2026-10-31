@@ -328,3 +328,117 @@ TEST(BtcZombieReapOptIn, DefaultStratumConfigLeavesAllKnobsOff) {
     EXPECT_EQ(def.session_idle_timeout_sec, 0u);
     EXPECT_EQ(def.max_write_queue_depth, static_cast<size_t>(0));
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Template block time — Core UpdateTime / BIP113 (MTP + 1 lower bound).
+// ════════════════════════════════════════════════════════════════════════
+// Regression: the template stamped raw wall clock as curtime and reported
+// mintime = tip.nTime + 1. When the chain's MedianTimePast runs ahead of
+// local time (testnet3 min-diff storms, a regtest chain seeded in the
+// future) every won block is rejected "time-too-old". The G3b testnet3
+// block found 2026-10-25 died this way with MTP ~98 min ahead. Core stamps
+// nTime = max(MTP + 1, now) and reports mintime = MTP + 1. (Folded into
+// this already-allowlisted BTC template target, like the zombie-reap KAT.)
+
+using btc::coin::BlockHeaderType;
+using btc::coin::MEDIAN_TIME_SPAN;
+using btc::coin::check_pow;
+using btc::coin::clamp_block_time;
+using btc::coin::median_time_past;
+using btc::coin::restamp_curtime;
+using btc::coin::scrypt_hash;
+
+namespace {
+
+/// Regtest chain (fast-start root = genesis hash, header ts 0) extended with
+/// one mined header per entry of `times`. Regtest pow_limit makes each header
+/// a couple of SHA256d tries; heights stay inside the first retarget window
+/// after the checkpoint, so the difficulty check is trusted.
+std::unique_ptr<HeaderChain> make_timed_chain(const std::vector<uint32_t>& times) {
+    auto p = BTCChainParams::regtest();
+    auto chain = std::make_unique<HeaderChain>(p);
+    EXPECT_TRUE(chain->init());
+    uint256 prev = p.genesis_hash;
+    for (uint32_t t : times) {
+        BlockHeaderType h;
+        h.m_version = 0x20000000;
+        h.m_previous_block = prev;
+        h.m_merkle_root = raw256(static_cast<uint8_t>(t));
+        h.m_timestamp = t;
+        h.m_bits = 0x207fffff;
+        h.m_nonce = 0;
+        while (!check_pow(scrypt_hash(h), h.m_bits, p.pow_limit)) ++h.m_nonce;
+        EXPECT_TRUE(chain->add_header(h));
+        prev = btc::coin::block_hash(h);
+    }
+    return chain;
+}
+
+uint32_t wall_now() { return static_cast<uint32_t>(std::time(nullptr)); }
+
+} // namespace
+
+TEST(BtcTemplateTime, ClampNeverGoesBelowMtpPlusOne) {
+    EXPECT_EQ(clamp_block_time(1000, 500), 1000u);   // normal: wall clock wins
+    EXPECT_EQ(clamp_block_time(1000, 1000), 1001u);  // now == MTP is still too old
+    EXPECT_EQ(clamp_block_time(1000, 6880), 6881u);  // MTP ahead: MTP + 1
+}
+
+TEST(BtcTemplateTime, RestampHonoursTemplateMintime) {
+    EXPECT_EQ(restamp_curtime(nlohmann::json::object(), 1000), 1000u);
+    EXPECT_EQ(restamp_curtime({{"mintime", 999}}, 1000), 1000u);
+    EXPECT_EQ(restamp_curtime({{"mintime", 6881}}, 1000), 6881u);
+}
+
+TEST(BtcTemplateTime, MedianOfFullWindowMatchesCore) {
+    // 12 headers, out of order: the window is the tip + 10 ancestors, so the
+    // oldest (100) is excluded. Window = {650,200,1000,300,900,400,800,500,
+    // 600,700,1100}; sorted[5] = 650, while the tip itself is 1100.
+    auto chain = make_timed_chain(
+        {100, 650, 200, 1000, 300, 900, 400, 800, 500, 600, 700, 1100});
+    auto tip = chain->tip();
+    ASSERT_TRUE(tip.has_value());
+    EXPECT_EQ(MEDIAN_TIME_SPAN, 11u);
+    EXPECT_EQ(median_time_past(*chain, *tip), 650u);
+}
+
+TEST(BtcTemplateTime, MedianOfShortChainUsesAvailableAncestors) {
+    // 3 headers + the checkpoint root (ts 0): {0, 10, 20, 30} → sorted[2] = 20.
+    auto chain = make_timed_chain({10, 30, 20});
+    auto tip = chain->tip();
+    ASSERT_TRUE(tip.has_value());
+    EXPECT_EQ(median_time_past(*chain, *tip), 20u);
+}
+
+TEST(BtcTemplateTime, TemplateClampsCurtimeWhenMtpIsAheadOfWallClock) {
+    // The G3b shape: every header ~98 min in the future.
+    const uint32_t ahead = wall_now() + 98 * 60;
+    std::vector<uint32_t> times;
+    for (uint32_t i = 0; i < MEDIAN_TIME_SPAN; ++i) times.push_back(ahead + i);
+    auto chain = make_timed_chain(times);
+    Mempool mp;
+    auto wd = TemplateBuilder::build_template(*chain, mp, /*is_testnet=*/false);
+    ASSERT_TRUE(wd.has_value());
+    const uint32_t mtp = ahead + 5;
+    EXPECT_EQ(wd->m_data["mintime"].get<int64_t>(), int64_t{mtp} + 1);
+    EXPECT_GE(wd->m_data["curtime"].get<int64_t>(), int64_t{mtp} + 1)
+        << "curtime must not be wall clock when MTP is ahead (time-too-old)";
+    // The stratum re-stamp keeps the clamp too.
+    EXPECT_GE(restamp_curtime(wd->m_data, wall_now()), mtp + 1);
+}
+
+TEST(BtcTemplateTime, TemplateUsesWallClockOnAHealthyChain) {
+    const uint32_t past = wall_now() - 3600;
+    std::vector<uint32_t> times;
+    for (uint32_t i = 0; i < MEDIAN_TIME_SPAN; ++i) times.push_back(past + 60 * i);
+    auto chain = make_timed_chain(times);
+    Mempool mp;
+    const uint32_t before = wall_now();
+    auto wd = TemplateBuilder::build_template(*chain, mp, /*is_testnet=*/false);
+    const uint32_t after = wall_now();
+    ASSERT_TRUE(wd.has_value());
+    EXPECT_EQ(wd->m_data["mintime"].get<int64_t>(), int64_t{past + 300} + 1);
+    const auto cur = wd->m_data["curtime"].get<int64_t>();
+    EXPECT_GE(cur, int64_t{before});
+    EXPECT_LE(cur, int64_t{after});
+}
