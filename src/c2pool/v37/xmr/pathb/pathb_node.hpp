@@ -1805,6 +1805,7 @@ public:
         HeaderOwner owner = HeaderOwner::None;
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
+        bool offered = false;  // K::JoinerPath: a pair offered to the joiner (the server's link held)
         std::vector<Hash32> ids;
         // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
         // again once it resolves
@@ -1874,11 +1875,12 @@ public:
         if (!decoded) {
             out.kind = HeadersOutcome::Kind::Undecodable;
             headers_->release_peer(peer);
+            paused_.erase(peer);  // a token ends the peer's paused comparison (its pages' variants released)
             return out;
         }
-        // positions follow the hash links from the held seed (first_pos is a claim the links decide)
-        const CarrierNode* fork = tree_->find(req.fork);
-        if (fork == nullptr || !req.fold || !req.fold->st) {
+        // positions follow the hash links from the seed (first_pos is a claim the links decide); the fold carries the
+        // seed's state from the request's send (the seed need not stay held)
+        if (!req.fold || !req.fold->st) {
             out.kind = HeadersOutcome::Kind::Keep;
             return out;
         }
@@ -1911,6 +1913,7 @@ public:
                 out.kind = HeadersOutcome::Kind::Ban;  // its earlier variants released as on every BAN
                 out.why = "FC_HEADERS: S1.3 #4 P_r " + hex32(h.own.blob.prev_id).substr(0, 16) + " served failing its branch PoW";
                 headers_->release_peer(peer);
+                paused_.erase(peer);  // a token ends the peer's paused comparison
                 return out;
             }
             heights.push_back(pr.height + 1);
@@ -1970,7 +1973,15 @@ public:
             return true;
         };
         CarrierTree::SideFold st = *fo.st;
-        const std::vector<SideHeader> side = tree_->step_side_headers(st, ann, pow_ok);
+        std::vector<SideHeader> side;
+        try {
+            side = tree_->step_side_headers(st, ann, pow_ok);
+        } catch (const RandomxFailure&) {
+            // node-internal (a local alarm, DEFER): the catch-up's comparison pauses, resumed from its last checked
+            // header on the P-53 clock
+            pause_fold(peer, req);
+            throw;
+        }
         for (std::size_t i = 0; i < side.size(); ++i) {
             const SideHeader& sh = side[i];
             if (sh.check != HeaderCheck::Passed) {
@@ -2029,6 +2040,7 @@ public:
                 out.why = "FC_HEADERS header " + std::to_string(i) + " (" + hex32(sh.id).substr(0, 16) + ", pos " +
                           std::to_string(pos0 + 1 + i) + "): " + cause;
                 headers_->release_peer(peer);  // no variant of the reply indexed, the server's earlier ones released
+                paused_.erase(peer);           // a token ends the peer's paused comparison
                 return out;
             }
         }
@@ -2083,7 +2095,7 @@ public:
             // below its x1
             if (deep_switch(f_pos)) {
                 out.kind = HeadersOutcome::Kind::JoinerPath;
-                offer(req.stop != Hash32{} ? req.stop : fo.last, peer, U128{});  // the branch's tip with this server
+                out.offered = offer(req.stop != Hash32{} ? req.stop : fo.last, peer, U128{});  // the branch's tip with this server
                 return out;
             }
             out.kind = HeadersOutcome::Kind::FetchBodies;
@@ -2952,13 +2964,15 @@ private:
     }
 
     // A (candidate, server) pair for the joiner (P-52; the server's link).
-    void offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed) {
+    // True: the pair was offered (the server's link held).
+    bool offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed) {
         const auto it = links_.find(peer);
-        if (it == links_.end()) return;
+        if (it == links_.end()) return false;
         U128 work = claimed;
         if (const auto pt = peers_.find(peer); pt != peers_.end() && pt->second.best_tip == candidate && work.lo == 0 && work.hi == 0)
             work = pt->second.best_cum_work;  // the server's claimed work for its HELLO tip
         joiner_->offer(candidate, *it->second, work);
+        return true;
     }
 
     // The at header (id and digest) of a carrier this node placed.

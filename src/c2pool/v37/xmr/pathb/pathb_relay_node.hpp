@@ -950,6 +950,14 @@ public:
         const auto it = header_wants_.find(peer);
         return it == header_wants_.end() ? 0 : it->second.size();
     }
+    // KAT hook: the waiting header requests of `peer` under `owner`.
+    std::size_t header_waiting(std::uint64_t peer, PathbNode::HeaderOwner owner) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = header_wants_.find(peer);
+        if (it == header_wants_.end()) return 0;
+        return static_cast<std::size_t>(
+                std::count_if(it->second.begin(), it->second.end(), [&](const HdrWant& w) { return w.owner == owner; }));
+    }
     // KAT hook: the parked objects the waiting header requests of `peer` carry.
     std::size_t header_waiting_objects(std::uint64_t peer) const {
         std::lock_guard<std::mutex> lk(cumtx_);
@@ -3170,8 +3178,8 @@ private:
                 }
                 serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
-            if (o.kind == K::JoinerPath) {
-                join = true;
+            if (o.kind == K::JoinerPath) join = true;
+            if (o.kind == K::JoinerPath && o.offered) {  // the line where a pair was offered
                 const std::uint64_t base = node_->store().base_pos();
                 const std::optional<std::uint64_t> x1 = node_->switch_x1();
                 const std::string test = o.fork_pos < base || !x1 ? " below the journal base " + std::to_string(base)
@@ -3246,6 +3254,14 @@ private:
             q->second.erase(std::remove_if(q->second.begin(), q->second.end(), cu), q->second.end());
             if (q->second.empty()) header_wants_.erase(q);
         }
+    }
+    // Under cumtx_: an adoption; every catch-up's comparison restarts against the adopted chain: the catch-ups'
+    // deferrals and waiting requests go (a tip request's stay).
+    void drop_all_catchup_asks_locked() {
+        std::set<std::uint64_t> ps;
+        for (const auto& [p, v] : headers_on_ctx_) ps.insert(p);
+        for (const auto& [p, q] : header_wants_) ps.insert(p);
+        for (const std::uint64_t p : ps) drop_catchup_asks_locked(p);
     }
     // Under cumtx_: the catch-up's own deferral of peer `p` (none: nullptr).
     HdrOnCtx* catchup_ctx_locked(std::uint64_t p) {
@@ -3427,6 +3443,10 @@ private:
         } else {
             const NodeGuard g(*this);
             s = node_->apply_join(std::move(t));
+        }
+        if (s->switched) {  // an adoption: the catch-ups' deferrals and waiting requests go
+            std::lock_guard<std::mutex> lk(cumtx_);
+            drop_all_catchup_asks_locked();
         }
         if (s->report) {
             const AttemptReport& rep = *s->report;

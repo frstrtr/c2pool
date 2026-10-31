@@ -12452,6 +12452,94 @@ void basedrop() {
     }
 }
 
+// seedprune (the seed need not stay held: the fold carries its state from the request's send): A (journal depth 20,
+// body_keep 5) and B share 1,200 positions (the fork); cut, A mines a of its own, B b. A asks B from A's position 10 with
+// max 50; A prunes (its tree's root above the seed) before the first reply or between pages 1 and 2; the decision:
+//   win deep (a 21, b 29; pruned before the first reply): JoinerPath, fork point 1,200;
+//   win      (a 20, b 28; pruned between pages): FetchBodies, fork point 1,200;
+//   loss     (a 24, b 20; pruned between pages): Keep at the reply carrying `stop`.
+void seedprune() {
+    struct Case {
+        const char* name;
+        int a_own, b_own;
+        bool before;
+    };
+    for (const Case cs : {Case{"win deep", 21, 29, true}, Case{"win", 20, 28, false}, Case{"loss", 24, 20, false}}) {
+        const KatNet net;
+        Harness h(net);
+        pb::PathbNodeConfig cfg = h.config(table0(net), true, 20);
+        cfg.body_keep = 5;
+        Pair2 s;
+        s.a = h.nodes.size();
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, h.io(s.a), nullptr));
+        s.b = h.add(table0(net), true);
+        for (std::uint32_t i = 0; i < 1200; ++i) {
+            if (i % 12 == 0) h.tick_monero(1);
+            h.mine(s.a, i % 5, 20000 + i);
+        }
+        s.fork = h[s.a].tree().best().id;
+        s.fork_pos = h[s.a].tree().best().pos;
+        h.cut = {{s.a, s.b}, {s.b, s.a}};
+        for (int i = 0; i < cs.a_own; ++i) {
+            h.tick_monero(1);
+            h.mine(s.a, 0, 22000 + static_cast<std::uint32_t>(i));
+        }
+        for (int i = 0; i < cs.b_own; ++i) {
+            h.tick_monero(1);
+            h.mine(s.b, 1, 23000 + static_cast<std::uint32_t>(i));
+        }
+        s.b_tip = h[s.b].tree().best().id;
+        const pb::Hash32 seed = *h[s.a].store().best_at(10);
+        const std::string tag = std::string("seedprune ") + cs.name;
+        check(h[s.a].request_headers(s.b, seed, s.b_tip, 50, h.now), tag + ": A asks B from its position 10 (max 50)");
+        if (cs.before) (void)h[s.a].prune(h.now);
+        std::vector<HK> kinds;
+        pb::PathbNode::HeadersOutcome o;
+        for (int p = 0; p < 40; ++p) {
+            o = serve_page(h, s);
+            kinds.push_back(o.kind);
+            if (!cs.before && p == 0) (void)h[s.a].prune(h.now);
+            if (o.kind != HK::Continue) break;
+        }
+        const std::uint64_t root = h[s.a].tree().genesis().pos;
+        const bool pruned = root > 10 && h[s.a].tree().find(seed) == nullptr;
+        std::printf("  %s: the seed pruned %d (root %llu, base %llu); pages %zu, the decision kind %d fork_pos %llu, at stop %d\n",
+                    tag.c_str(), pruned ? 1 : 0, (unsigned long long)root, (unsigned long long)h[s.a].store().base_pos(),
+                    kinds.size(), static_cast<int>(o.kind), (unsigned long long)o.fork_pos,
+                    !o.ids.empty() && o.ids.back() == s.b_tip ? 1 : 0);
+        check(pruned && kinds.size() > 2, tag + ": setup (the seed pruned; the comparison spans pages)");
+        if (cs.a_own == 21)
+            check(o.kind == HK::JoinerPath && o.fork_pos == s.fork_pos, tag + ": the win, F deep: JoinerPath at the fork point");
+        else if (cs.a_own == 20)
+            check(o.kind == HK::FetchBodies && o.fork_pos == s.fork_pos, tag + ": the win, F not deep: FetchBodies at the fork point");
+        else
+            check(o.kind == HK::Keep && !o.ids.empty() && o.ids.back() == s.b_tip, tag + ": the loss: Keep at the reply carrying stop");
+    }
+}
+
+// jpnolink (the O-17 line where a pair was offered): bestmove (2)'s JoinerPath at a node with no link to the server (no
+// transport): no pair offered (offered 0; the joiner's queue empty).
+void jpnolink() {
+    const KatNet net;
+    Harness h(net);
+    const Pair2 s = pair2(h, 6, 4, 12, 1, 6);
+    check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 3, h.now), "jpnolink: A asks B (max 3)");
+    (void)serve_page(h, s);
+    for (int i = 0; i < 4; ++i) {
+        h.tick_monero(1);
+        h.mine(s.a, 0, 7500 + static_cast<std::uint32_t>(i), false);
+    }
+    pb::PathbNode::HeadersOutcome o;
+    for (int p = 0; p < 6; ++p) {
+        o = serve_page(h, s);
+        if (o.kind != HK::Continue) break;
+    }
+    std::printf("  jpnolink: kind %d; offered %d; the joiner's queue %zu\n", static_cast<int>(o.kind), o.offered ? 1 : 0,
+                h[s.a].joiner().queue().size());
+    check(o.kind == HK::JoinerPath && !o.offered && h[s.a].joiner().queue().size() == 0,
+          "jpnolink: JoinerPath with no link to the server: no pair offered");
+}
+
 // bestmove (the fork point re-derived at the decision; F-1):
 //   (1) A 6 + 4, B 6 + 10, max 3: after page 1 A places B's first 5 carriers (a journal switch onto them); page 2 wins:
 //       FetchBodies, the fork point re-derived to B's 5th (6 + 5);
@@ -13316,6 +13404,94 @@ void basedropnext() {
           "basedropnext: the next round is the catch-up's own locator ask after P-53; C reaches A's tip");
 }
 
+// rxpause (E-113; E-197 (3): a node-internal RandomX failure pauses): CmpRig (C a full node, its branch 19, journal
+// depth 20; A's 27). RandomX computes no hash on A's 50th at C (page 2): no token; the comparison pauses; the next
+// FC_GETHEADERS is from page 2's `from` (page 1's last header: a resume, not a locator ask), P-53 after page 2's send;
+// C reaches A's tip; each header hashed once (the failed call aside).
+void rxpause() {
+    CmpRig r(false, 19, false);
+    const pb::Hash32 armed = *r.h[r.a.node].store().best_at(r.f + 10);
+    r.h.nohash_pow.insert(armed);
+    const std::uint64_t v0 = pb::PathbNodeTestAccess::verify_calls(r.nc()), n0 = r.h.nohash_calls;
+    r.connect();
+    const std::uint64_t pa = r.w.id(r.cw, 0);
+    std::size_t at_fail = 0;
+    bool paused = false;
+    for (int k = 0; k < 40; ++k) {
+        r.second();
+        if (at_fail == 0 && r.h.nohash_calls > n0) {
+            at_fail = r.asks.size();
+            paused = r.nc().comparison_paused(pa);
+        }
+    }
+    const bool next = at_fail >= 1 && r.asks.size() > at_fail;
+    const bool resumed = next && r.asks[at_fail].second == r.asks[at_fail - 1].second;
+    const std::uint64_t gap = next ? r.asks[at_fail].first - r.asks[at_fail - 1].first : 0;
+    const std::uint64_t hashed = pb::PathbNodeTestAccess::verify_calls(r.nc()) - v0 - (r.h.nohash_calls - n0);
+    const std::uint64_t branch = r.h[r.a.node].tree().best().pos - r.f;
+    std::printf("  rxpause: RandomX failed %llu; paused %d; the next ask from the failed page's from %d, %llu s after its "
+                "send; C on A's tip %d; strikes %llu; headers hashed %llu for A's %llu\n",
+                (unsigned long long)(r.h.nohash_calls - n0), paused ? 1 : 0, resumed ? 1 : 0, (unsigned long long)gap,
+                r.nc().holds_tip(r.a_tip) ? 1 : 0, (unsigned long long)r.c.relay->stats().strikes.load(),
+                (unsigned long long)hashed, (unsigned long long)branch);
+    check(r.ok && r.h.nohash_calls - n0 == 1 && paused, "rxpause: setup (RandomX failed on page 2; the comparison paused)");
+    check(resumed && gap >= 11 && gap <= 12 && r.c.relay->stats().strikes.load() == 0,
+          "rxpause: resumed from the failed page's from P-53 after its send (no locator ask); no token");
+    check(r.nc().holds_tip(r.a_tip) && hashed == branch, "rxpause: C reaches A's tip; each header hashed once");
+}
+
+// tokenpause (a token ends the peer's paused comparison): emptycont's shape (J a store not caught up, its branch 19;
+// A's 27): A answers the comparison's continuation with no header (paused); J's tip request to A is answered with a
+// page whose second header's link is broken (STRIKE): the paused comparison ends; the catch-up stays open; its next
+// FC_GETHEADERS is its own locator ask (not from the paused page's `from`); J reaches A's tip.
+void tokenpause() {
+    CmpRig r(true, 19, false);
+    int replaced = 0;
+    r.reply_edit = [&](FakeWire::Msg& m) {
+        if (replaced == 0) m.f = empty_headers_frame();
+        else if (replaced == 1) m.f.clear();  // A's reply to the tip request: a page by hand below
+        ++replaced;
+    };
+    r.connect();
+    for (int k = 0; k < 3 && replaced == 0; ++k) r.second();
+    const std::uint64_t pa = r.w.id(r.cw, 0);
+    const bool paused = replaced == 1 && r.nc().comparison_paused(pa);
+    const pb::Hash32 paused_from = r.asks.empty() ? pb::Hash32{} : r.asks.back().second;
+    const pb::Hash32 from = *r.nc().store().best_at(r.f);
+    const bool asked = r.nc().request_headers(pa, from, r.a_tip, 3, r.h.now, pb::PathbNode::HeaderOwner::Tip);
+    r.w.run();
+    std::vector<pb::CarrierHeader> pg = b_headers(r.h, r.a.node, r.f + 1, r.f + 3);
+    pg[1].own.side.tip = pg[0].own.side.tip;  // the second header's parent is not the first: a broken link
+    r.w.links[r.cw]->frame(pa, *pb::encode_fc_headers(pb::HeadersReply{0, r.f + 1, pg}, 1u << 22));
+    r.c.relay->pump();
+    r.w.run();
+    const std::uint64_t strikes = r.c.relay->stats().strikes.load();
+    const bool ended = !r.nc().comparison_paused(pa);
+    const bool open = r.c.relay->catchup_view(pa).has_value() && !r.nc().caught_up();
+    const std::size_t asks0 = r.asks.size();
+    pb::Hash32 locator_at_ask{};
+    for (int k = 0; k < 30; ++k) {
+        if (r.asks.size() == asks0)
+            if (const std::optional<pb::PathbRelayNode::CatchupView> v = r.c.relay->catchup_view(pa)) {
+                const pb::CarrierNode& b = r.nc().tree().best();
+                const std::uint64_t root = r.nc().tree().genesis().pos;
+                const std::uint64_t back = v->step == 0 ? 0 : std::uint64_t{1} << (v->step - 1);
+                const std::uint64_t pos = b.pos > root && b.pos - root > back ? b.pos - back : root;
+                locator_at_ask = v->step == 0 ? b.id : r.nc().store().best_at(pos).value_or(r.nc().tree().genesis().id);
+            }
+        r.second();
+    }
+    const bool next = r.asks.size() > asks0;
+    const bool locator = next && r.asks[asks0].second == locator_at_ask && r.asks[asks0].second != paused_from;
+    std::printf("  tokenpause: paused %d; the tip request %d; strikes %llu; the paused comparison ended %d; the catch-up "
+                "open %d; the next ask the catch-up's locator ask %d; J on A's tip %d\n",
+                paused ? 1 : 0, asked ? 1 : 0, (unsigned long long)strikes, ended ? 1 : 0, open ? 1 : 0, locator ? 1 : 0,
+                r.nc().holds_tip(r.a_tip) ? 1 : 0);
+    check(r.ok && paused && asked && replaced >= 2, "tokenpause: setup (the comparison paused; the tip request out)");
+    check(strikes == 1 && ended && open, "tokenpause: the token ends the paused comparison; the catch-up stays open");
+    check(locator && r.nc().holds_tip(r.a_tip), "tokenpause: the next ask is the catch-up's locator ask; J reaches A's tip");
+}
+
 // gatekept (E-178, E-194 (vi)): catchheavy's B part. J not caught up (journal depth 4) walked D's chain 1..8; B (A's
 // 1, 2 and its own 3: lighter) answers J's catch-up with no header; its tip is handed to the joiner and its attempt
 // completes, rule (4) keeping J's chain. A third peer C (its own carrier on position 1) never answers J's FC_GETHEADERS:
@@ -13685,6 +13861,82 @@ void gateadopt() {
     check(window && held_window, "gateadopt: the drain done, K_NCU's end due before the tick: the gate held");
     check(cline && cline->form == kCaughtDone && h[j.node].caught_up() && gate_open(h, j.node),
           "gateadopt: the caught-up line at the tick; K_NCU ended, the gate open");
+}
+
+// adoptdefer (an adoption: the catch-ups' deferrals go, a tip request's stay): gateadopt's setup (J empty, not caught
+// up; A's tip adopted; C's catch-up open, never answered). Before the adoption J notes a deferral of its catch-up toward
+// C and a tip request's toward C, both on a P_r it never holds. After it: the catch-up's deferral gone, the tip
+// request's kept; the deferrals' re-run (ungated): the tip request waits to be asked under its owner, no catch-up
+// request.
+void adoptdefer() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    const HiddenRows hrows(net.rows, hidden);
+    const pb::FollowerBranchView hview(hrows);
+    KatRelay a = kat_relay(h, w, table0(net), true);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        if (i % 3 == 0) h.tick_monero();
+        ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), 2900 + static_cast<std::uint32_t>(i));
+    }
+    const pb::Hash32 tip = h[a.node].tree().best().id;
+    const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+    const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+    const pb::CarrierBodyV3* bt = h[a.node].bodies().get(tip);
+    if (!ok || b1 == nullptr || bt == nullptr) {
+        check(false, "adoptdefer: setup (A's chain)");
+        return;
+    }
+    const pb::Hash32 X = b1->own.blob.prev_id;
+    hidden.insert(X);
+    KatRelay j = kat_relay(h, w, table0(net), false, false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, nullptr,
+                           hide_blocks(hidden, hview), true);
+    KatRelay c = kat_relay(h, w, table0(net), true);  // wire 2
+    (void)mine_only(h, c.node, 4, 2990);
+    const pb::Hash32 tip_c = h[c.node].tree().best().id;
+    pb::PathbRelayNode& rj = *j.relay;
+    w.edit = [](FakeWire::Msg& m) {  // J and C never answer each other's FC_GETHEADERS
+        if (!m.f.empty() && m.f[0] == pb::kOpFcHeaders && ((m.from == 1 && m.to == 2) || (m.from == 2 && m.to == 1)))
+            m.f.clear();
+    };
+    w.connect(0, 1);
+    w.connect(2, 1);
+    w.run();
+    for (int k = 0; k < 130 && h[j.node].joiner().queue().size() == 0; ++k) {  // kCtxTtlMs: A's tip offered
+        h.now += 5;
+        rj.tick();
+        w.run();
+    }
+    hidden.erase(X);
+    const std::uint64_t pc = w.id(1, 2);
+    pb::Hash32 never{};
+    never[0] = 0xd5;
+    never[1] = 0x5d;
+    rj.test_defer_headers(pc, pb::PathbNode::HeaderOwner::CatchUp, tip, tip_c, never);
+    rj.test_defer_headers(pc, pb::PathbNode::HeaderOwner::Tip, tip, tip_c, never);
+    const bool both = rj.header_deferred(pc, pb::PathbNode::HeaderOwner::CatchUp) == 1
+                      && rj.header_deferred(pc, pb::PathbNode::HeaderOwner::Tip) == 1;
+    std::optional<pb::JoinStep> st;
+    for (int k = 0; k < 12 && !(st && st->switched); ++k) {
+        st = rj.join_step();
+        w.run();
+    }
+    const bool adopted = st && st->switched && st->sw.adopted && h[j.node].joined() != nullptr;
+    const std::size_t cu_def = rj.header_deferred(pc, pb::PathbNode::HeaderOwner::CatchUp);
+    const std::size_t tip_def = rj.header_deferred(pc, pb::PathbNode::HeaderOwner::Tip);
+    rj.test_rerun(pb::Missing::MoneroBlock);  // the deferrals asked again (ungated)
+    w.run();
+    const std::size_t cu_wait = rj.header_waiting(pc, pb::PathbNode::HeaderOwner::CatchUp);
+    const std::size_t tip_wait = rj.header_waiting(pc, pb::PathbNode::HeaderOwner::Tip);
+    w.edit = nullptr;
+    std::printf("  adoptdefer: both deferrals noted %d; adopted %d; after the adoption: the catch-up's deferrals %zu, the "
+                "tip request's %zu; after the re-run: waiting catch-up requests %zu, tip requests %zu\n",
+                both ? 1 : 0, adopted ? 1 : 0, cu_def, tip_def, cu_wait, tip_wait);
+    check(both && adopted, "adoptdefer: setup (both deferrals noted; A's tip adopted)");
+    check(cu_def == 0 && tip_def == 1, "adoptdefer: the adoption drops the catch-up's deferral, the tip request's stays");
+    check(cu_wait == 0 && tip_wait == 1, "adoptdefer: the tip request asked again under its owner; no catch-up request");
 }
 
 // catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
@@ -15693,6 +15945,11 @@ int main(int argc, char** argv) {
                                 {"tipside", tipside, 1},
                                 {"basedrop", basedrop, 1},
                                 {"basedropnext", basedropnext, 2},
+                                {"seedprune", seedprune, 6},
+                                {"jpnolink", jpnolink, 1},
+                                {"rxpause", rxpause, 2},
+                                {"tokenpause", tokenpause, 2},
+                                {"adoptdefer", adoptdefer, 3},
                                 {"pauseorphan", pauseorphan, 2},
                                 {"foldsplit", foldsplit, 1},
                                 {"bestmove", bestmove, 1},
