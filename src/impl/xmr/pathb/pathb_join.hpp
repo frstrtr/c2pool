@@ -1994,6 +1994,8 @@ public:
     const AttemptQueue& queue() const noexcept { return queue_; }
     // The pair of the attempt taken from the queue and not yet applied (P-52: it lives); nullopt: none.
     const std::optional<AttemptQueue::Pair>& running() const noexcept { return running_; }
+    // The attempt taken from the queue is not applied (the caller's store is poisoned): its pair no longer open.
+    void drop_running() noexcept { running_.reset(); }
     std::size_t release_waits(const std::optional<Hash32>& id, const std::optional<Missing>& cause = std::nullopt) {
         return queue_.release_waits(id, cause);
     }

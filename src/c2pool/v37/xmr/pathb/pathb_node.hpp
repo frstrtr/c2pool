@@ -729,7 +729,10 @@ public:
     }
     JoinStep apply_join(JoinAttempted&& t) {
         JoinStep out;
-        if (poisoned_) return out;
+        if (poisoned_) {
+            joiner_->drop_running();  // not applied: its pair is no longer open
+            return out;
+        }
         reask_apply(t, out);
         if (t.attempt) {
             out.report = joiner_->apply(std::move(*t.attempt));

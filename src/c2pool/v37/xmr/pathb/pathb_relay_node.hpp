@@ -1546,8 +1546,6 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(cumtx_);
-            catchup_.erase(p);
-            handed_over_.erase(p);
             header_wants_.erase(p);
             headers_on_ctx_.erase(p);
             hdr_sent_.erase(p);
@@ -1561,8 +1559,12 @@ private:
             const NodeGuard g(*this);
             node_->disconnect(p);
             strip_gone_peer_asks_locked(p);
-            {  // a departure takes the peer's catch-up and hand-over out of the count: K_NCU's end evaluated (E-193)
+            // a departure: the peer's catch-up and hand-over leave the count together with its HELLO, and K_NCU's end
+            // is evaluated (E-193)
+            {
                 std::lock_guard<std::mutex> lk(cumtx_);
+                catchup_.erase(p);
+                handed_over_.erase(p);
                 caught_up_locked();
             }
             std::lock_guard<std::mutex> lk(omtx_);
