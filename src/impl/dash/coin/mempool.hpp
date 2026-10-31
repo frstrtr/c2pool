@@ -937,7 +937,15 @@ public:
     struct InjectReadmit {
         std::vector<uint256> readmitted;
         std::vector<std::pair<uint256, InjectGate>> refused;
+        std::vector<uint256> not_wanted;   // the inject ledger no longer tracks it
     };
+
+    /// Whether a confirmed inject a rewind would put back is still wanted
+    /// (VERIFY-S2b S-B). NodeCoinState wires its inject ledger: an inject whose
+    /// expiry_height the tip passed was reaped from it, and would otherwise
+    /// come back untracked and never expire. Unset (a bare mempool): wanted.
+    using InjectWantedFn = std::function<bool(const uint256& txid)>;
+    void set_inject_still_wanted_fn(InjectWantedFn fn) { m_inject_still_wanted = std::move(fn); }
 
     /// A rewind disconnected every block from `from_height` up: the injects
     /// they confirmed go back through add_inject (the normal admission gate,
@@ -954,6 +962,10 @@ public:
         }
         InjectReadmit r;
         for (auto it = back.rbegin(); it != back.rend(); ++it) {
+            if (m_inject_still_wanted && !m_inject_still_wanted(it->txid)) {
+                r.not_wanted.push_back(it->txid);
+                continue;
+            }
             const InjectGate g = add_inject(it->tx, it->fee);
             if (g == InjectGate::Ok || g == InjectGate::AlreadyKnown)
                 r.readmitted.push_back(it->txid);
@@ -2488,6 +2500,7 @@ private:
     };
     std::deque<ConfirmedInject>                        m_confirmed_injects;
     size_t                                             m_confirmed_inject_bytes{0};
+    InjectWantedFn                                     m_inject_still_wanted;
     void pop_confirmed_inject_locked(bool front) {
         auto& c = front ? m_confirmed_injects.front() : m_confirmed_injects.back();
         m_confirmed_inject_bytes -= c.bytes;

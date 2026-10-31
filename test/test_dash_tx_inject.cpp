@@ -1747,3 +1747,59 @@ TEST(DashTxInject, ChainOfInjectsAcrossTwoRewoundBlocksComesBackParentFirst)
         EXPECT_EQ(fees, 0u);
     }
 }
+
+// (VERIFY-S2b S-B, R3-3) A rewind puts back only the injects the inject
+// ledger still tracks: one whose expiry_height the tip passed while it was
+// confirmed was reaped from the ledger and stays out (it would otherwise come
+// back untracked and never expire); one without an expiry comes back.
+TEST(DashTxInject, ExpiredInjectIsNotPutBackByARewind)
+{
+    using namespace dash_utxo_full;
+    Key k(0xc5);
+    const uint256 prevA = prevhash(0x85), prevB = prevhash(0x86);
+    const auto expiring = make_signed_spend(k, prevA, 100'000);
+    const auto standing = make_signed_spend(k, prevB, 100'000);
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-expiry");
+    dash::coin::UtxoLane lane;
+    SnapCoin a, b;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    b.op = Outpoint(prevB, 0);
+    b.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    NodeCoinState st;
+    arm_ncs(st, *lane.cache());
+    lane.attach(st.mempool());
+    lane.on_header_tip(kB);
+    st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+    ASSERT_TRUE(st.submit_inject(expiring, 0, /*expiry_height=*/kB + 1,
+                                 NodeCoinState::InjectOrigin::Local, 0).ok);
+    ASSERT_TRUE(st.submit_inject(standing, 0, /*expiry_height=*/0,
+                                 NodeCoinState::InjectOrigin::Local, 0).ok);
+
+    const BlockType a1 = block(base_hash, {coinbase(50, 2301), expiring, standing}, 2301);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_EQ(st.mempool().confirmed_injects_kept(), 2u);
+    // The tip moves to kB+1: the next block is kB+2, past the expiry.
+    st.set_tip(kB + 1, hash_of(a1), 0x1b104be3u, 1'700'000'100u, 76, 16);
+    ASSERT_EQ(st.inject_pool_size(), 1u) << "the ledger reaped the expired inject";
+
+    chain.hashes[kB + 1] = fake_hash(6301);
+    lane.on_header_tip(kB + 1);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    const auto back = st.mempool().inject_txids_in_pool();
+    ASSERT_EQ(back.size(), 1u) << "only the inject the ledger still tracks comes back";
+    EXPECT_EQ(back[0], dash_txid(standing));
+    EXPECT_FALSE(st.mempool().get_entry(dash_txid(expiring)).has_value());
+    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
+}

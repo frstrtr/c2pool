@@ -692,10 +692,11 @@ private:
     {
         if (!m_pool) return;
         const auto r = m_pool->readmit_disconnected_injects(from_height);
-        if (r.readmitted.empty() && r.refused.empty()) return;
+        if (r.readmitted.empty() && r.refused.empty() && r.not_wanted.empty()) return;
         LOG_WARNING << "[EMB-DASH] UTXO rewind from h=" << from_height << ": " << r.readmitted.size()
                     << " inject(s) the rewound block(s) confirmed are back in the inject set, "
-                    << r.refused.size() << " refused";
+                    << r.refused.size() << " refused, " << r.not_wanted.size()
+                    << " left out (expired in the inject ledger)";
         for (const auto& [txid, gate] : r.refused)
             LOG_WARNING << "[EMB-DASH] UTXO rewind: inject " << txid.GetHex().substr(0, 16)
                         << " not re-admitted (" << Mempool::inject_gate_name(gate)

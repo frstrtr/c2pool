@@ -190,7 +190,16 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 /// through select_work().
 class NodeCoinState {
 public:
-    NodeCoinState() = default;
+    NodeCoinState() {
+        // VERIFY-S2b S-B: a rewind puts back only the injects this ledger
+        // still tracks. The ledger keeps a confirmed inject until its
+        // expiry_height (reconcile_inject_pool), so a reaped one is expired
+        // and stays out instead of coming back untracked. (If the ledger ever
+        // forgets on confirm, it must keep confirmed entries for the undo keep
+        // or this must change with it.)
+        m_mempool.set_inject_still_wanted_fn(
+            [this](const uint256& txid) { return m_inject_pool.contains(txid); });
+    }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
 
