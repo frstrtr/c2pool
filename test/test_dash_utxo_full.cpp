@@ -309,20 +309,63 @@ TEST(FullLane, Bip30DuplicateRefused)
     EXPECT_TRUE(r.has(c_plain)) << "nothing of the refused block was applied";
 }
 
-TEST(FullLane, SpentShapedOutputRefused)
+TEST(FullLane, SpentShapedOutputIsACoinAsInDashd)
 {
-    // An output Coin::is_spent() would read as absent never enters the set.
+    // VERIFY-S2b section 3 (R3-1): dashd keeps an output with value 0 and an
+    // empty scriptPubKey as a coin (coins.cpp AddCoin skips only
+    // IsUnspendable; Coin::IsSpent is nValue == -1). Anyone's block carrying
+    // one connects, a later block can spend it, and a rewind puts it back
+    // exactly - the set never withholds on it.
+    const Outpoint c1(fake_hash(81), 0);
     Rig r;
-    ASSERT_TRUE(r.open({snap_coin(fake_hash(13), 0, 3000, 13)}));
+    ASSERT_TRUE(r.open({snap_coin(c1.txid, 0, 1000, 81)}));
     r.lane.on_header_tip(kBase);
-    MutableTransaction cb = coinbase(50, 1);
-    cb.vout.push_back(out(0, {}));
-    const BlockType b1 = block(r.base_hash, {cb}, 1);
-    r.deliver(b1, kBase + 1);
-    r.deliver(b1, kBase + 1);
-    EXPECT_TRUE(r.lane.withheld());
-    EXPECT_NE(r.lane.full_status().withheld_reason.find("utxo-spent-shaped-output"), std::string::npos)
-        << r.lane.full_status().withheld_reason;
+    const MutableTransaction x = spend({c1}, {out(990, p2pkh(82)), out(0, {})}, 82);
+    const Outpoint x0(dash_txid(x), 0), x1(dash_txid(x), 1);
+    const BlockType a1 = block(r.base_hash, {coinbase(50, 801), x}, 801);
+    r.deliver(a1, kBase + 1);
+    ASSERT_EQ(r.lane.cache()->get_best_block(), hash_of(a1)) << r.lane.full_status().withheld_reason;
+    Coin z;
+    ASSERT_TRUE(r.get(x1, z)) << "the (0, empty) output is a coin of the set";
+    EXPECT_EQ(z.value, 0);
+    EXPECT_TRUE(z.scriptPubKey.m_data.empty());
+    EXPECT_EQ(z.height, kBase + 1);
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 3u) << "c1 spent; the coinbase, x:0 and x:1 added";
+
+    // A later block spends it (an empty scriptPubKey: scriptSig OP_1 suffices).
+    MutableTransaction y = spend({x0, x1}, {out(980, p2pkh(83))}, 83);
+    y.vin[1].scriptSig = script({0x51});
+    const BlockType a2 = block(hash_of(a1), {coinbase(50, 802), y}, 802);
+    r.deliver(a2, kBase + 2);
+    ASSERT_EQ(r.lane.cache()->get_best_block(), hash_of(a2)) << r.lane.full_status().withheld_reason;
+    EXPECT_FALSE(r.has(x1));
+    EXPECT_FALSE(r.has(x0));
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 3u);
+
+    // a2 leaves the header chain: the rewind restores x:1 exactly.
+    r.chain.hashes[kBase + 2] = fake_hash(8002);
+    r.lane.on_header_tip(kBase + 2);
+    ASSERT_EQ(r.lane.full_status().rewinds, 1u);
+    ASSERT_EQ(r.lane.cache()->get_best_block(), hash_of(a1));
+    Coin back;
+    ASSERT_TRUE(r.get(x1, back)) << "the undo record puts the (0, empty) coin back";
+    EXPECT_EQ(back.value, 0);
+    EXPECT_TRUE(back.scriptPubKey.m_data.empty());
+    EXPECT_EQ(back.height, kBase + 1);
+    EXPECT_TRUE(r.has(x0));
+    EXPECT_FALSE(r.has(Outpoint(dash_txid(y), 0)));
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 3u);
+
+    // a1 too: back to the base, x:1 gone with the block that created it.
+    r.chain.hashes[kBase + 1] = fake_hash(8001);
+    r.lane.on_header_tip(kBase + 2);
+    ASSERT_EQ(r.lane.cache()->get_best_block(), r.base_hash);
+    EXPECT_FALSE(r.has(x1));
+    EXPECT_TRUE(r.has(c1));
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 1u);
+    EXPECT_FALSE(r.lane.withheld());
+    EXPECT_EQ(r.lane.full_status().strict_refusals, 0u);
+    EXPECT_TRUE(r.alerts.empty());
 }
 
 TEST(DashUtxoLane, FullSetRewindsAReorgFromUndo)
@@ -411,22 +454,29 @@ TEST(DashSnapshot, RefusesBaseBelowCheckpointOrAbsent)
     }
 }
 
-TEST(DashSnapshot, ImportRefusesSpentShapedCoin)
+TEST(DashSnapshot, ImportKeepsASpentShapedCoin)
 {
-    TempDir tmp("spentshape");
+    // R3-1: a (0, empty) coin is a coin of dashd's set, so a snapshot holding
+    // one is imported as it is, and the set can spend it.
     SnapCoin zero;
     zero.op = Outpoint(fake_hash(9), 0);
     zero.coin = Coin(0, OPScript(), 400, false);
-    const auto pin = make_pinned_snapshot(tmp.sub("s.dat"), {snap_coin(fake_hash(3), 0, 10, 3), zero}, kBase,
-                                          fake_hash(1000));
-    ASSERT_TRUE(pin.pin) << pin.refusal;
-    dash::coin::DashUtxoImportConfig cfg;
-    cfg.network = "regtest";
-    const auto r = dash::coin::import_dash_utxo_snapshot({tmp.sub("s.dat")}, tmp.sub("db"), pin, cfg);
-    EXPECT_EQ(r.refusal, ::core::coin::snapshot_refusal::kSpentShapedCoin) << r.detail;
-    auto o = dash::coin::open_dash_full_utxo_set(tmp.sub("db"), "regtest", 0);
-    EXPECT_FALSE(o.ok());
-    EXPECT_EQ(o.refusal, R::kFullDbEmpty) << "the refused import left no record";
+    Rig r;
+    ASSERT_TRUE(r.open({snap_coin(fake_hash(3), 0, 10, 3), zero}));
+    Coin c;
+    ASSERT_TRUE(r.get(zero.op, c));
+    EXPECT_EQ(c.value, 0);
+    EXPECT_TRUE(c.scriptPubKey.m_data.empty());
+    EXPECT_EQ(c.height, 400u);
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 2u);
+    r.lane.on_header_tip(kBase);
+    MutableTransaction t = spend({zero.op}, {out(0, {0x6a})}, 91);
+    t.vin[0].scriptSig = script({0x51});
+    const BlockType b1 = block(r.base_hash, {coinbase(50, 901), t}, 901);
+    r.deliver(b1, kBase + 1);
+    ASSERT_EQ(r.lane.cache()->get_best_block(), hash_of(b1)) << r.lane.full_status().withheld_reason;
+    EXPECT_FALSE(r.has(zero.op));
+    EXPECT_EQ(r.lane.cache()->sync_state().coins, 2u) << "the zero coin spent, the coinbase added";
 }
 
 TEST(DashSnapshotPin, DigestGatedLoad)

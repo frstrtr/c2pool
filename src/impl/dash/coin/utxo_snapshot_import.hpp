@@ -19,8 +19,8 @@
 ///        every coin of the chain up to its base;
 ///   'A'  the assumed base (core/coin/utxo_assumed.hpp): height, hash, muhash,
 ///        hash_serialized_2, coins, coin, network, pin digest, validated = 0.
-/// A coin with value 0 and an empty script refuses the import: c2pool's
-/// Coin::is_spent() reads it as absent (VERIFY-S1 S2-3).
+/// A coin with value 0 and an empty script is imported like any other: dashd
+/// keeps it, and the full set stores, spends and restores it (VERIFY-S2b 3).
 /// The base-in-header-chain check runs here when the header chain already
 /// holds the pin's height; otherwise the lane runs it before it uses the set
 /// (FullOpen below leaves it to UtxoLane::verify_base).
@@ -222,7 +222,6 @@ import_dash_utxo_snapshot(const std::vector<std::string>& parts, const std::stri
     }
     opts.batch_records = cfg.batch_records;
     opts.log = cfg.log;
-    opts.refuse_spent_shaped_coins = true;
     opts.final_records = dash_full_set_final_records(*pin.pin, pin.digest, cfg.network);
     return ::core::coin::import_utxo_snapshot(parts, db_path, *pin.pin, opts);
 }

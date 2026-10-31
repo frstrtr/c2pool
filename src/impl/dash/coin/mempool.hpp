@@ -717,12 +717,10 @@ public:
         ScriptInvalid,       // S3a: an input's scriptSig fails dashcore VerifyScript
                              // at admission, or its scriptPubKey cannot be resolved.
         SpentShapedOutput,   // VERIFY-S2 Must-Fix 1: an output with value 0 and an
-                             // empty scriptPubKey. The view reads that coin shape as
-                             // absent (Coin::is_spent()), so the full set's lane
-                             // refuses a block creating one (utxo-spent-shaped-output)
-                             // and withholds at the second refusal: mining our own
-                             // inject would stop our set for good. Non-standard in
-                             // dashd, which never relays it.
+                             // empty scriptPubKey. Consensus-valid and a coin of the
+                             // full set, but non-standard in dashd (IsStandardTx:
+                             // scriptpubkey), which never relays or mines it; c2pool
+                             // admits nothing dashd would refuse to relay here.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -810,10 +808,9 @@ public:
         //     Refuse by name here, ahead of admission/pricing. No-op for any
         //     valid tx (every vout already in range).
         //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
-        //     scriptPubKey is refused too (inject-spent-shaped-output). It is
-        //     consensus-valid, but our view cannot hold it (Coin::is_spent()
-        //     is that shape), so the full set's lane would refuse the block we
-        //     mine with it and withhold permanently.
+        //     scriptPubKey is refused too (inject-spent-shaped-output): it is
+        //     consensus-valid (the full set keeps it as dashd does) but
+        //     non-standard in dashd, so no dashd-built block carries it.
         {
             int64_t vout_running = 0;
             for (const auto& vout : tx.vout) {
@@ -996,12 +993,11 @@ private:
             }
         }
         // VERIFY-S2 Must-Fix 1, every seam: an output with value 0 and an
-        // empty scriptPubKey is the shape our view reads as absent
-        // (Coin::is_spent()), so a block we mine with it is refused by our own
-        // full set (utxo-spent-shaped-output) and the set withholds for good.
-        // dashd never relays one (an empty scriptPubKey is non-standard), so
-        // only a peer that is not a dashd can send it; it is never admitted
-        // and never served. A lost fee at most, never a lost block.
+        // empty scriptPubKey is consensus-valid (the full set keeps it as
+        // dashd does) but non-standard: dashd never relays or mines one, so
+        // only a peer that is not a dashd can send it, and it is never
+        // admitted or served here either (dashd relay parity). A lost fee at
+        // most, never a lost block.
         for (const auto& vout : tx.vout) {
             if (vout.value == 0 && vout.scriptPubKey.m_data.empty()) {
                 LOG_INFO << "[MEMPOOL] reject spent-shaped-output txid="

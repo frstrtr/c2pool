@@ -53,14 +53,15 @@
 ///   - best+1 .. the header tip is filled in order (FULL_WINDOW requests in
 ///     flight, one per height, stall re-ask as in the bootstrap), from the
 ///     first block_connected or from on_header_tip();
-///   - connect = BIP30 (an output whose outpoint is already a coin refuses)
-///     and an output with value 0 and an empty script refuses
-///     (Coin::is_spent() reads such a coin as absent, VERIFY-S1 S2-3), then
-///     UTXOViewCache::connect_block(strict): every input a coin of the set or
+///   - connect = BIP30 (an output whose outpoint is already a coin refuses),
+///     then UTXOViewCache::connect_block(strict): every input a coin of the set or
 ///     of an earlier tx of the block, each spent once. Special txs need no
 ///     rule of their own: QcTx/MnHfTx have no inputs and no outputs, an
 ///     AssetUnlock has no inputs and adds its outputs, an AssetLock's
-///     OP_RETURN is unspendable and skipped, a CbTx is the coinbase;
+///     OP_RETURN is unspendable and skipped, a CbTx is the coinbase. An
+///     output with value 0 and an empty script is a coin, as in dashd
+///     (coins.cpp AddCoin skips only IsUnspendable): stored, spendable, and
+///     restored by a rewind (disconnect_from_undo every_coin_known);
 ///   - a refusal asks the body again once; a second refusal at the same
 ///     height means the SET is wrong: the lane WITHHOLDS (stops advancing,
 ///     utxo_current_at() false so templates carry no mempool tx, an alert, a
@@ -666,7 +667,10 @@ private:
                 }
                 prev = pu.block_hash;
             }
-            if (!m_cache->disconnect_from_undo(u) || !m_cache->flush(prev, bh - 1)) {
+            // A strict record holds no unknown coin: restore every one, a
+            // (value 0, empty script) coin too (VERIFY-S2b section 3).
+            if (!m_cache->disconnect_from_undo(u, /*every_coin_known=*/true) ||
+                !m_cache->flush(prev, bh - 1)) {
                 m_cache->discard_pending();   // the view is the DB's again (S-4)
                 withhold("utxo-rewind-failed", "h=" + std::to_string(bh));
                 return false;
@@ -789,17 +793,13 @@ private:
                 return FullConnect::Dropped;
             }
         }
-        // BIP30 and the is_spent()-shaped output, before anything is touched.
+        // BIP30, before anything is touched.
         for (size_t t = 0; t < block.m_txs.size(); ++t) {
             const auto& tx = block.m_txs[t];
             const uint256 txid = dash_txid(tx);
             for (uint32_t i = 0; i < static_cast<uint32_t>(tx.vout.size()); ++i) {
                 const auto& out = tx.vout[i];
                 if (::core::coin::is_unspendable(out.scriptPubKey)) continue;
-                if (out.value == 0 && out.scriptPubKey.m_data.empty())
-                    return refuse_strict(height, "utxo-spent-shaped-output",
-                                         "txid=" + txid.GetHex() + " vout=" + std::to_string(i) +
-                                             " has value 0 and an empty script");
                 if (m_cache->have_coin(Outpoint(txid, i)))
                     return refuse_strict(height, "bad-txns-BIP30",
                                          "txid=" + txid.GetHex() + " vout=" + std::to_string(i) +
