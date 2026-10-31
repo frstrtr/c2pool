@@ -3094,7 +3094,8 @@ private:
             }
             try {
                 o = node_->on_headers(p, f, now_s(), arrival);
-            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
+            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; a comparison
+                                                 // past its first checked header pauses (its next request resumes it)
                 rx_alarm("headers of peer " + std::to_string(p), e.what());
                 log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
@@ -3179,7 +3180,7 @@ private:
                 serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
             if (o.kind == K::JoinerPath) join = true;
-            if (o.kind == K::JoinerPath && o.offered) {  // the line where a pair was offered
+            if (o.kind == K::JoinerPath && o.offered) {  // the line where the offer left a live pair
                 const std::uint64_t base = node_->store().base_pos();
                 const std::optional<std::uint64_t> x1 = node_->switch_x1();
                 const std::string test = o.fork_pos < base || !x1 ? " below the journal base " + std::to_string(base)

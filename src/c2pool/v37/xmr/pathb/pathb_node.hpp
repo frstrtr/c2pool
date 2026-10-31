@@ -1805,7 +1805,7 @@ public:
         HeaderOwner owner = HeaderOwner::None;
         std::size_t indexed = 0;
         std::uint64_t fork_pos = 0;
-        bool offered = false;  // K::JoinerPath: a pair offered to the joiner (the server's link held)
+        bool offered = false;  // K::JoinerPath: the offer left a live pair (queued, or its attempt open)
         std::vector<Hash32> ids;
         // Defer on a P_r the node does not hold: that Monero block, and the request (from its fork to stop) to ask
         // again once it resolves
@@ -2095,7 +2095,8 @@ public:
             // below its x1
             if (deep_switch(f_pos)) {
                 out.kind = HeadersOutcome::Kind::JoinerPath;
-                out.offered = offer(req.stop != Hash32{} ? req.stop : fo.last, peer, U128{});  // the branch's tip with this server
+                const Hash32 cand = req.stop != Hash32{} ? req.stop : fo.last;  // the branch's tip with this server
+                out.offered = offer(cand, peer, U128{}) && pair_lives(cand, peer);  // a live pair after the offer
                 return out;
             }
             out.kind = HeadersOutcome::Kind::FetchBodies;
