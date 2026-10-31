@@ -151,17 +151,17 @@ struct Key {
     }
 };
 
-// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee. The
-// version and the input's sequence are set before signing (both are signed).
-MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
-                                     int64_t out_value, int32_t version = 1,
-                                     uint32_t sequence = 0xffffffffu) {
+// Signed 1-in P2PKH spend of (prev:0) paying `outs`. The version and the
+// input's sequence are set before signing (both are signed).
+MutableTransaction make_signed_spend_outs(const Key& k, const uint256& prev,
+                                          std::vector<TxOut> outs, int32_t version = 1,
+                                          uint32_t sequence = 0xffffffffu) {
     MutableTransaction tx;
     tx.version = version; tx.type = 0; tx.locktime = 0;
     TxIn in; in.prevout.hash = prev; in.prevout.index = 0; in.sequence = sequence;
     in.scriptSig = to_script(k.spk);
     tx.vin.push_back(in);
-    TxOut out; out.value = out_value; tx.vout.push_back(out);
+    tx.vout = std::move(outs);
 
     auto unsigned_bytes = ser(tx);
     uint8_t sighash[32];
@@ -171,6 +171,14 @@ MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
     auto ss = k.sign_scriptsig(std::vector<uint8_t>(sighash, sighash + 32));
     tx.vin[0].scriptSig = to_script(ss);
     return tx;
+}
+
+// Signed 1-in 1-out P2PKH spend of (prev:0). Coin value = out + fee.
+MutableTransaction make_signed_spend(const Key& k, const uint256& prev,
+                                     int64_t out_value, int32_t version = 1,
+                                     uint32_t sequence = 0xffffffffu) {
+    TxOut out; out.value = out_value;
+    return make_signed_spend_outs(k, prev, {out}, version, sequence);
 }
 
 uint256 prevhash(uint8_t b) { uint256 h; std::memset(h.begin(), b, 32); return h; }
@@ -1369,4 +1377,46 @@ TEST(DashTxInject, CheckscriptsArmResolverDefaultOnWithView)
     EXPECT_FALSE(resolve_checkscripts_arm(true, /*off=*/true, true, true).on);
     EXPECT_FALSE(resolve_checkscripts_arm(false, false, false, false).on);
     EXPECT_FALSE(resolve_checkscripts_arm(true, false, false, false).on) << "explicit with no source stays off";
+}
+
+// (VERIFY-S2 Must-Fix 1) An output with value 0 and an empty scriptPubKey is
+// the shape the view's is_spent() sentinel reads as "no coin": the full set's
+// lane refuses a block that creates one (utxo-spent-shaped-output) and, at
+// the second refusal, withholds for good. dashd never relays such a tx (an
+// empty scriptPubKey is non-standard), so only our own inject lane could put
+// one into a block we mine: the gate refuses it by name, before pricing, and
+// rolls nothing into the pool. A value-0 output WITH a script (OP_RETURN) and
+// a valued output with an empty script are ordinary and still admitted.
+TEST(DashTxInject, SpentShapedOutputRefusedAtAdmissionByName)
+{
+    Key k(0x5b);
+    const uint256 prev = prevhash(0xe5), prev2 = prevhash(0xe6);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+
+    TxOut change; change.value = 90'000; change.scriptPubKey = to_script(k.spk);
+    TxOut spent_shaped; spent_shaped.value = 0;               // value 0, empty script
+    const auto bad = make_signed_spend_outs(k, prev, {change, spent_shaped});
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(bad)), "inject-spent-shaped-output");
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value()) << "nothing admitted";
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty()) << "no priority delta left behind";
+    {
+        auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+        EXPECT_TRUE(selected.empty());
+        EXPECT_EQ(fees, 0u);
+    }
+    // The same shape as the only output.
+    const auto bad_only = make_signed_spend(k, prev, 0);
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(bad_only)), "inject-spent-shaped-output");
+
+    // A value-0 output that carries a script is an ordinary output.
+    TxOut burn; burn.value = 0; burn.scriptPubKey = to_script({0x6a});   // OP_RETURN
+    const auto ok_burn = make_signed_spend_outs(k, prev, {change, burn});
+    EXPECT_EQ(mp.add_inject(ok_burn), Mempool::InjectGate::Ok);
+    // So is a valued output with an empty script.
+    const auto ok_valued = make_signed_spend(k, prev2, 90'000);
+    EXPECT_EQ(mp.add_inject(ok_valued), Mempool::InjectGate::Ok);
 }

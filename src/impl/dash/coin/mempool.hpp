@@ -716,6 +716,13 @@ public:
                              // tx the operator did not ask for is refused).
         ScriptInvalid,       // S3a: an input's scriptSig fails dashcore VerifyScript
                              // at admission, or its scriptPubKey cannot be resolved.
+        SpentShapedOutput,   // VERIFY-S2 Must-Fix 1: an output with value 0 and an
+                             // empty scriptPubKey. The view reads that coin shape as
+                             // absent (Coin::is_spent()), so the full set's lane
+                             // refuses a block creating one (utxo-spent-shaped-output)
+                             // and withholds at the second refusal: mining our own
+                             // inject would stop our set for good. Non-standard in
+                             // dashd, which never relays it.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -730,6 +737,7 @@ public:
             case InjectGate::BadVersionOrType:   return "inject-bad-txns-version-or-type";
             case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
             case InjectGate::ScriptInvalid:      return "inject-script-invalid";
+            case InjectGate::SpentShapedOutput:  return "inject-spent-shaped-output";
         }
         return "inject-unknown";
     }
@@ -801,11 +809,18 @@ public:
         //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
         //     Refuse by name here, ahead of admission/pricing. No-op for any
         //     valid tx (every vout already in range).
+        //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
+        //     scriptPubKey is refused too (inject-spent-shaped-output). It is
+        //     consensus-valid, but our view cannot hold it (Coin::is_spent()
+        //     is that shape), so the full set's lane would refuse the block we
+        //     mine with it and withhold permanently.
         {
             int64_t vout_running = 0;
             for (const auto& vout : tx.vout) {
                 if (!money_range(vout.value) || !money_range(vout_running + vout.value))
                     return InjectGate::BadVoutRange;
+                if (vout.value == 0 && vout.scriptPubKey.m_data.empty())
+                    return InjectGate::SpentShapedOutput;
                 vout_running += vout.value;
             }
         }
