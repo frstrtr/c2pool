@@ -370,7 +370,7 @@ TEST(DashAlertRelay, BodyCodecRejectsGarbageAndClips)
     junk.push_back(0);
     EXPECT_FALSE(decode_body(junk)) << "trailing bytes are rejected";
     Bytes bad_kind = encode_body(sample_body());
-    bad_kind[0] = 9;
+    bad_kind[0] = kMaxKind + 1;   // past the last kind this build decodes
     EXPECT_FALSE(decode_body(bad_kind));
     EXPECT_FALSE(decode_body(Bytes{1, 2}));
 }
@@ -3401,7 +3401,7 @@ TEST(DashAlertHashrate, OutstandingLowIsPersistedAcrossARestart)
 // must ship together with (or before) its origins.
 TEST(DashAlertRelay, HashrateKindsOnTheWireAndAnOlderRelaysRefusal)
 {
-    ASSERT_EQ(kMaxKind, 8);
+    ASSERT_GE(kMaxKind, 8);
     EXPECT_STREQ(kind_name(7), "hashrate_low");
     EXPECT_STREQ(kind_name(8), "hashrate_ok");
     for (Kind k : {Kind::HashrateLow, Kind::HashrateOk}) {
@@ -3533,4 +3533,25 @@ TEST(DashAlertHashrate, StratumRecordsAcceptedWorkAndMainDashWiresIt)
     EXPECT_NE(code.find("dash::alert::parse_hashrate(argv[i + 1])"), std::string::npos);
     EXPECT_NE(code.find("\"--alert-relay-hashrate-window\""), std::string::npos);
     EXPECT_NE(code.find("double  hashrate_min = 0;"), std::string::npos) << "off by default";
+}
+
+// S2: kind 9 (UtxoWithheld) on the wire. This build decodes it; a relay built
+// before it (kMaxKind 8) refuses the body, so ship the relay with its origins.
+TEST(DashAlertRelay, UtxoWithheldKindOnTheWireAndAnOlderRelaysRefusal)
+{
+    ASSERT_EQ(kMaxKind, 9);
+    EXPECT_STREQ(kind_name(9), "utxo_withheld");
+    AlertBody b = sample_body(Kind::UtxoWithheld);
+    b.worker.clear();
+    b.detail = "utxo-strict-refusal: bad-txns-inputs-missingorspent h=2564101";
+    const Bytes enc = encode_body(b);
+    auto dec = decode_body(enc);
+    ASSERT_TRUE(dec);
+    EXPECT_EQ(*dec, b);
+    EXPECT_FALSE(is_work_kind(9));
+    EXPECT_FALSE(is_hashrate_kind(9));
+    EXPECT_FALSE(decode_body(enc, /*an older relay's kMaxKind=*/8)) << "an older relay refuses it";
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
 }

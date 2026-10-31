@@ -550,6 +550,17 @@ C2P_PARAM("embedded.utxo", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, 
 C2P_PARAM("embedded.utxo_immature_serve_empty", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "serve coinbase-only until mature")
   C2P_ALIAS("embedded.utxo_immature_serve_empty", BIN_DASH, "--embedded-utxo-immature-serve-empty", FLAG)
 
+// S2: the DASH full UTXO set from a pinned dumptxoutset snapshot. RESTART: the
+// import runs at start into <net>/utxo_full_leveldb (a present set is never
+// re-imported); the pin is the built-in .inc unless a pin file is given.
+C2P_PARAM("embedded.utxo_snapshot", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import this pinned dumptxoutset snapshot into the full UTXO set at start (comma-separated parts)")
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--embedded-utxo-snapshot", VALUE)
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--utxo-snapshot", VALUE)
+C2P_PARAM("embedded.utxo_snapshot_pin", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: digest-gated pin file for a snapshot newer than the built-in pin")
+  C2P_ALIAS("embedded.utxo_snapshot_pin", BIN_DASH, "--embedded-utxo-snapshot-pin", VALUE)
+C2P_PARAM("replay.utxo_import", Replay, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import a pinned dumptxoutset snapshot into <datadir>/<net>/utxo_full_leveldb and exit (beside a running node)")
+  C2P_ALIAS("replay.utxo_import", BIN_DASH, "--utxo-import", VALUE)
+
 C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "daemonless superblock payee sourcing")
   C2P_ALIAS("embedded.superblock", BIN_DASH, "--embedded-superblock", FLAG)
 
