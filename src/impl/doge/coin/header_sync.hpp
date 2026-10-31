@@ -162,7 +162,9 @@ private:
         return it != m_sent.end() && now - it->second < RESPONSE_TIME;
     }
 
-    void sent_locked(const std::string& peer, Clock::time_point now)
+    /// `peer` by value: the pruning below may erase (or clear) the entry a
+    /// reference would point into (VERIFY9 N3).
+    void sent_locked(std::string peer, Clock::time_point now)
     {
         if (m_sent.size() >= MAX_PEERS) {
             for (auto it = m_sent.begin(); it != m_sent.end();)
@@ -170,7 +172,7 @@ private:
             if (m_sent.size() >= MAX_PEERS)
                 m_sent.clear();
         }
-        m_sent[peer] = now;
+        m_sent[std::move(peer)] = now;
     }
 
     std::mutex m_mu;
