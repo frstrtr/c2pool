@@ -398,6 +398,14 @@ struct PathbNodeTestAccess {
         if (const auto it = n.paused_.find(peer); it != n.paused_.end()) return it->second.work;
         return std::nullopt;
     }
+    // The comparison of the request in flight to `peer` keeps no ids above F (the state of an F deep when fixed).
+    static bool fold_forget_ids(PathbNode& n, std::uint64_t peer) {
+        const auto it = n.header_req_.find(peer);
+        if (it == n.header_req_.end() || !it->second.fold || !it->second.fold->fixed) return false;
+        it->second.fold->keep_above = false;
+        it->second.fold->above.clear();
+        return true;
+    }
     static std::uint64_t omissions(PathbNode& n, const AdmitResult& a) { return n.omissions_of(a); }
     // A frame parked through the node's own park as a DEFER of `cause` at `row` (`fetch`: the id it waits on).
     static void park(PathbNode& n, std::uint64_t peer, const std::vector<std::uint8_t>& frame, Missing cause, RowId row,
@@ -12288,9 +12296,11 @@ void tipside() {
           "tipside: A's tip request to B from B's 3rd (max 3)");
     std::vector<HK> kinds;
     pb::PathbNode::HeadersOutcome o;
+    std::size_t checked = 0;  // the headers the comparison checked
     for (int p = 0; p < 6; ++p) {
         o = serve_page(h, s);
         kinds.push_back(o.kind);
+        checked += o.ids.size();
         if (o.kind != HK::Continue) break;
     }
     std::size_t asked = 0;
@@ -12299,7 +12309,6 @@ void tipside() {
             pb::GetCarrier q;
             if (pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok()) asked += q.ids.size();
         }
-    const std::size_t checked = 3 * kinds.size();
     h.cut.clear();
     h.pump();
     const bool switched = !o.ids.empty() && h[s.a].tree().best().id == o.ids.back();
@@ -12401,6 +12410,46 @@ void place_from(Harness& h, std::size_t to, std::size_t from, std::uint64_t lo, 
     for (std::uint64_t x = lo; x <= hi; ++x)
         if (const std::optional<pb::Hash32> id = h[from].store().best_at(x))
             (void)h[to].on_carrier(from, *pb::encode_fc_carrier(0, *h[from].bodies().get(*id), 16));
+}
+
+// basedrop (the win stands and the comparison ends with it where the ids above F were not kept: F deep when fixed, not
+// deep at the decision). The journal base never moves back, so that state is forced after page 1 (the fold's ids
+// dropped, as for a deep F). A 6 + 4, B 6 + 10, max 3:
+//   plain : page 2 wins: FetchBodies asks the body of the last id (B's 6th) and names it the fetch tip; fork point 6; no
+//           FC_GETHEADERS; no comparison left;
+//   ended : the comparison ended (the done test) before page 2: the same.
+void basedrop() {
+    for (int mode = 0; mode < 2; ++mode) {
+        const KatNet net;
+        Harness h(net);
+        const Pair2 s = pair2(h, 6, 4, 10);
+        const std::string tag = std::string("basedrop ") + (mode == 0 ? "plain" : "ended");
+        check(h[s.a].request_headers(s.b, s.fork, s.b_tip, 3, h.now), tag + ": A asks B (max 3)");
+        const pb::PathbNode::HeadersOutcome o1 = serve_page(h, s);
+        const bool forced = pb::PathbNodeTestAccess::fold_forget_ids(h[s.a], s.b);
+        if (mode == 1) h[s.a].end_comparison(s.b);
+        const pb::PathbNode::HeadersOutcome o = serve_page(h, s);
+        std::vector<pb::Hash32> asked;
+        std::size_t asks = 0;
+        for (const Msg& m : h.q) {
+            if (m.from != s.a || m.to != s.b || m.frame.empty()) continue;
+            if (m.frame[0] == pb::kOpFcGetHeaders) ++asks;
+            pb::GetCarrier q;
+            if (m.frame[0] == pb::kOpFcGetCarrier && pb::decode_fc_getcarrier(m.frame, 0, pb::kRuledLaneParams, q).ok())
+                asked.insert(asked.end(), q.ids.begin(), q.ids.end());
+        }
+        const bool open = h[s.a].header_slot(s.b).has_value() || h[s.a].comparison_paused(s.b);
+        const bool last = asked.size() == 1 && asked[0] == s.b_ids[5];
+        std::printf("  %s: page 1 kind %d, the ids dropped %d; page 2 kind %d fork_pos %llu; the fetch tip is B's 6th %d; "
+                    "bodies asked %zu (B's 6th only %d); FC_GETHEADERS %zu; a comparison open %d\n",
+                    tag.c_str(), static_cast<int>(o1.kind), forced ? 1 : 0, static_cast<int>(o.kind),
+                    (unsigned long long)o.fork_pos, o.fetch_last == s.b_ids[5] ? 1 : 0, asked.size(), last ? 1 : 0, asks,
+                    open ? 1 : 0);
+        check(o1.kind == HK::Continue && forced, tag + ": setup (page 1; the comparison's ids above F dropped)");
+        check(o.kind == HK::FetchBodies && o.fork_pos == s.fork_pos && o.fetch_last == s.b_ids[5] && last,
+              tag + ": the win stands: FetchBodies asks the last id's body and names it the fetch tip");
+        check(asks == 0 && !open, tag + ": no FC_GETHEADERS from F; the comparison ended with the win");
+    }
 }
 
 // bestmove (the fork point re-derived at the decision; F-1):
@@ -13126,6 +13175,7 @@ void orphan() {
 void pausedefer() {
     for (int mode = 0; mode < 2; ++mode) {
         CmpRig r(false, 19, true);
+        const std::uint64_t v0 = pb::PathbNodeTestAccess::verify_calls(r.nc());
         bool shown = false, edit_armed = false;
         int replaced = 0;
         std::uint64_t shown_at = 0;
@@ -13151,6 +13201,8 @@ void pausedefer() {
         std::uint64_t gap = 0;
         if (mode == 1 && r.asks.size() > asks_at_show + 1) gap = r.asks[asks_at_show + 1].first - r.asks[asks_at_show].first;
         const std::string tag = std::string("pausedefer ") + (mode == 0 ? "resumed" : "empty");
+        const std::uint64_t hashed = pb::PathbNodeTestAccess::verify_calls(r.nc()) - v0;
+        const std::uint64_t branch = r.h[r.a.node].tree().best().pos - r.f;  // A's headers above F
         std::printf("  %s: deferred %llu; asks %zu (%zu at the P_r shown); the resumed ask from the deferred page's from %d; "
                     "C on A's tip %d; strikes %llu; the next ask %llu s after the resumed one\n",
                     tag.c_str(), (unsigned long long)r.c.relay->stats().headers_ctx_deferred.load(), r.asks.size(),
@@ -13159,6 +13211,9 @@ void pausedefer() {
         check(r.ok && shown, tag + ": setup (the page carrying A's tip deferred on its P_r)");
         check(same_from && done && r.c.relay->stats().strikes.load() == 0,
               tag + ": resumed from the deferred page's from; the comparison completes; no token");
+        std::printf("  %s: headers hashed %llu for A's %llu above F\n", tag.c_str(), (unsigned long long)hashed,
+                    (unsigned long long)branch);
+        check(hashed == branch, tag + ": each header hashed once (" + std::to_string(hashed) + " of " + std::to_string(branch) + ")");
         if (mode == 1)
             check(replaced >= 1 && gap >= 11 && gap <= 12,
                   tag + ": the resumed page answered empty: the next ask P-53 after its send (" + std::to_string(gap) + " s)");
@@ -13197,6 +13252,68 @@ void pauseorphan() {
     check(r.ok && paused && holds, "pauseorphan: setup (the comparison paused on the P_r; C holds A's tip)");
     check(cu == 0 && asks1 == asks0,
           "pauseorphan: the catch-up ended by its done test: no FC_GETHEADERS when the P_r arrives");
+}
+
+// basedropnext (the next round is the catch-up's own locator ask): CmpRig (C a full node, its branch 19, journal depth
+// 20; A's 27). A's reply to C's second page is held; C's comparison is forced to keep no ids above F (as for a deep F);
+// then the reply: C asks the body of A's tip only and names it the fetch tip; no FC_GETHEADERS from F; the next
+// FC_GETHEADERS is the catch-up's own locator ask (its step's point on C's best chain) once the page lapsed (P-53); C
+// reaches A's tip.
+void basedropnext() {
+    CmpRig r(false, 19, false);
+    std::vector<std::uint8_t> held;
+    r.reply_edit = [&](FakeWire::Msg& m) {
+        if (held.empty()) held.swap(m.f);
+    };
+    std::vector<std::pair<std::uint64_t, std::vector<pb::Hash32>>> bodies;  // C's FC_GETCARRIER to A (time, ids)
+    const std::function<void(FakeWire::Msg&)> inner = r.w.edit;
+    r.w.edit = [&](FakeWire::Msg& m) {
+        if (m.from == r.cw && m.to == 0 && !m.f.empty() && m.f[0] == pb::kOpFcGetCarrier) {
+            pb::GetCarrier q;
+            if (pb::decode_fc_getcarrier(m.f, 0, pb::kRuledLaneParams, q).ok()) bodies.emplace_back(r.h.now, q.ids);
+        }
+        inner(m);
+    };
+    r.connect();
+    for (int k = 0; k < 3 && held.empty(); ++k) r.second();
+    const std::uint64_t pa = r.w.id(r.cw, 0);
+    const bool forced = !held.empty() && pb::PathbNodeTestAccess::fold_forget_ids(r.nc(), pa);
+    const pb::Hash32 f_id = *r.h[r.a.node].store().best_at(r.f);
+    const std::size_t asks0 = r.asks.size(), bodies0 = bodies.size();
+    const std::uint64_t t0 = r.h.now;
+    r.w.links[r.cw]->frame(pa, held);
+    r.c.relay->pump();
+    r.w.run();
+    const std::optional<pb::PathbRelayNode::CatchupView> cv = r.c.relay->catchup_view(pa);
+    const bool tip_named = cv && cv->fetch_tip == r.a_tip;
+    const bool tip_only = bodies.size() > bodies0 && bodies[bodies0].second == std::vector<pb::Hash32>{r.a_tip};
+    pb::Hash32 locator_at_ask{};  // the catch-up's locator point at its step (catchup_ask_locked)
+    for (int k = 0; k < 30; ++k) {
+        if (r.asks.size() == asks0)
+            if (const std::optional<pb::PathbRelayNode::CatchupView> v = r.c.relay->catchup_view(pa)) {
+                const pb::CarrierNode& b = r.nc().tree().best();
+                const std::uint64_t root = r.nc().tree().genesis().pos;
+                const std::uint64_t back = v->step == 0 ? 0 : std::uint64_t{1} << (v->step - 1);
+                const std::uint64_t pos = b.pos > root && b.pos - root > back ? b.pos - back : root;
+                locator_at_ask = v->step == 0 ? b.id : r.nc().store().best_at(pos).value_or(r.nc().tree().genesis().id);
+            }
+        r.second();
+    }
+    bool from_f = false;
+    for (std::size_t i = asks0; i < r.asks.size(); ++i) from_f = from_f || r.asks[i].second == f_id;
+    const bool next = r.asks.size() > asks0;
+    const std::uint64_t gap = next ? r.asks[asks0].first - t0 : 0;
+    const bool locator = next && r.asks[asks0].second == locator_at_ask;
+    std::printf("  basedropnext: page 2's reply held %d, the ids dropped %d; the fetch tip is A's tip %d; the first body ask "
+                "A's tip only %d; asks after the reply %zu, from F %d; the next ask %llu s after, from the catch-up's locator %d; "
+                "C on A's tip %d\n",
+                held.empty() ? 0 : 1, forced ? 1 : 0, tip_named ? 1 : 0, tip_only ? 1 : 0, r.asks.size() - asks0,
+                from_f ? 1 : 0, (unsigned long long)gap, locator ? 1 : 0, r.nc().holds_tip(r.a_tip) ? 1 : 0);
+    check(r.ok && forced, "basedropnext: setup (page 2's reply held; the comparison's ids above F dropped)");
+    check(tip_named && tip_only && !from_f,
+          "basedropnext: the win stands: the body of A's tip asked, named the fetch tip; no FC_GETHEADERS from F");
+    check(locator && gap >= 11 && r.nc().holds_tip(r.a_tip),
+          "basedropnext: the next round is the catch-up's own locator ask after P-53; C reaches A's tip");
 }
 
 // gatekept (E-178, E-194 (vi)): catchheavy's B part. J not caught up (journal depth 4) walked D's chain 1..8; B (A's
@@ -15574,6 +15691,8 @@ int main(int argc, char** argv) {
                                 {"sharedforge", sharedforge, 1},
                                 {"recordcarry", recordcarry, 1},
                                 {"tipside", tipside, 1},
+                                {"basedrop", basedrop, 1},
+                                {"basedropnext", basedropnext, 2},
                                 {"pauseorphan", pauseorphan, 2},
                                 {"foldsplit", foldsplit, 1},
                                 {"bestmove", bestmove, 1},

@@ -2086,25 +2086,6 @@ public:
                 offer(req.stop != Hash32{} ? req.stop : fo.last, peer, U128{});  // the branch's tip with this server
                 return out;
             }
-            if (!fo.keep_above) {
-                // F was deep when fixed (its ids above not kept) and is not now (the base dropped): the comparison
-                // restarts from F, held on the best chain
-                const std::optional<Hash32> fid = store_->best_at(f_pos);
-                if (const CarrierNode* fn = fid ? tree_->find(*fid) : nullptr) {
-                    out.kind = HeadersOutcome::Kind::Continue;
-                    req.fold = new_fold(*fn, req.stop, req.max);
-                    req.fork = fn->id;
-                    req.from = fn->id;
-                    req.sent_s = now_s;
-                    req.arrived = false;
-                    req.first = false;
-                    const GetHeaders q{cfg_.identity.chain_id, req.from, req.stop, req.max};
-                    header_req_[peer] = std::move(req);
-                    timers_.sent(Req{peer, ReqKind::Headers, Hash32{}}, now_s);
-                    send(peer, encode_fc_getheaders(q));
-                    return out;
-                }
-            }
             out.kind = HeadersOutcome::Kind::FetchBodies;
             // the bodies this node neither holds nor has parked, at most the deferred store's free room (its cap less
             // the parked frames and the bodies asked within P-53: an asked body is on its way to the store) and at least
@@ -2115,7 +2096,10 @@ public:
             const std::uint64_t used = deferred_.size() + bodies_asked_.size();
             std::uint64_t room = deferred_.cap() > used ? deferred_.cap() - used : 0;
             std::vector<Hash32> want;
-            for (const Hash32& id : fo.above) {
+            // F deep when fixed (the ids above it not kept) and not deep now (the base dropped): the win stands; the
+            // last id is named, the catch-up's next round pages the rest
+            const std::vector<Hash32> named = fo.keep_above ? std::vector<Hash32>{} : std::vector<Hash32>{fo.last};
+            for (const Hash32& id : fo.keep_above ? fo.above : named) {
                 if (room == 0 && !want.empty()) break;
                 if (tree_->find(id) != nullptr || tree_->is_waiting(id)) continue;
                 want.push_back(id);
