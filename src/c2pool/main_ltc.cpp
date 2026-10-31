@@ -10134,30 +10134,33 @@ int main(int argc, char* argv[]) {
             if (mm_manager)
                 mm_manager->stop();
 
-            // 2. The workers: the sharechain's compute thread (its locked-best
-            //    hook is this scope's lambda: a cycle running after the scope
-            //    segfaulted, live 10-31), then the DOGE lanes end a drain after
-            //    the block being connected (each block is flushed when
-            //    connected, so the sets stay at their last flush), the pools
-            //    drop their queued tasks and are joined.
-            constexpr auto JOIN_DEADLINE = std::chrono::seconds(3);
+            // 2. The workers. The DOGE lanes end a drain after the block being
+            //    connected (each block is flushed when connected, so the sets
+            //    stay at their last flush); the header pools and the full
+            //    lane's pool drop their queued tasks and are joined (a task
+            //    of theirs is short). Then the sharechain's compute thread: its
+            //    callbacks (the locked-best hook, block_rel_height, ...) are
+            //    this scope's lambdas, and a cycle running after the scope
+            //    segfaulted (live 10-31); a think+clean cycle takes seconds,
+            //    so it gets the larger share of the 10-s budget.
+            constexpr auto POOLS_DEADLINE = std::chrono::seconds(1);
+            constexpr auto COMPUTE_DEADLINE = std::chrono::seconds(7);
             std::vector<std::string> still_running;
-            if (p2p_node && !p2p_node->stop_compute(JOIN_DEADLINE))
-                still_running.push_back("sharechain compute");
             doge_full->stopping = true;
-            for (auto& name : worker_pools.stop_and_join(JOIN_DEADLINE))
+            for (auto& name : worker_pools.stop_and_join(POOLS_DEADLINE))
                 still_running.push_back(name);
-            if (doge_full_pool && !core::stop_and_join_within(doge_full_pool, JOIN_DEADLINE))
+            if (doge_full_pool && !core::stop_and_join_within(doge_full_pool, POOLS_DEADLINE))
                 still_running.push_back("DOGE full set");
+            if (p2p_node && !p2p_node->stop_compute(COMPUTE_DEADLINE))
+                still_running.push_back("sharechain compute");
             if (!still_running.empty()) {
                 std::string names;
                 for (const auto& n : still_running)
                     names += (names.empty() ? "" : ", ") + n;
                 // Closing the stores under a running worker is what this order
                 // prevents: exit with them at their last flush instead.
-                LOG_ERROR << "Shutdown: worker(s) still running after "
-                          << std::chrono::duration_cast<std::chrono::seconds>(JOIN_DEADLINE).count()
-                          << " s: " << names << "; exiting without closing the stores";
+                LOG_ERROR << "Shutdown: worker(s) still running past their deadline: " << names
+                          << "; exiting without closing the stores";
                 std::_Exit(1);
             }
             if (doge_full_db)
