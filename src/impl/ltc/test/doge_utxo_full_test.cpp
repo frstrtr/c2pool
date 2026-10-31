@@ -30,10 +30,17 @@
 
 #include <core/coin/utxo_digest.hpp>
 #include <core/leveldb_store.hpp>
+#include <core/worker_pools.hpp>
 #include <impl/doge/coin/process_memory.hpp>
 #include <impl/doge/coin/store_fds.hpp>
 
+#include <boost/asio/post.hpp>
+#include <boost/asio/thread_pool.hpp>
+
+#include <chrono>
 #include <cstdio>
+#include <deque>
+#include <thread>
 
 #include <map>
 #include <numeric>
@@ -529,6 +536,57 @@ TEST(DogeUtxoOrder, AccrualViewPassesASpentShapedCoinThroughAReorg)
     EXPECT_FALSE(l.t.cache->have_coin(c.coin));
 }
 
+// The shutdown (release blocker, live IBD 10-31: the stores closed while the
+// lane's pool still worked, then a hang of 4.3 h): with the host stopping,
+// the full lane's drain ends after the block it is connecting and takes no
+// new body, so its pool joins at once, before the stores close; the set is
+// at its last flush and a restart resumes from it to the tip.
+TEST(DogeUtxoFull, AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
+{
+    constexpr uint32_t N = 20000;
+    const uint256 g = genesis(0x67);
+    const auto chain = chain_with(g, N);
+    Lane l(20, Mode::Full, N);
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[N - 1], hash_of(chain[N - 1]), N);  // arms the fill from 1
+    for (uint32_t h = N - 1; h >= 2; --h)
+        l.lane.on_block(chain[h - 1], hash_of(chain[h - 1]), h);  // buffered: 1 is missing
+    ASSERT_EQ(l.t.cache->get_best_height(), 0u);
+
+    // Block 1 on the lane's pool: the drain connects 1..N, an IBD in flight.
+    auto pool = std::make_shared<boost::asio::thread_pool>(1);
+    boost::asio::post(*pool, [&]() { l.lane.on_block(chain[0], hash_of(chain[0]), 1); });
+    while (l.lane.stats().connected.load() < 100)
+        std::this_thread::yield();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    l.net.stopping = true;
+    ASSERT_TRUE(core::stop_and_join_within(pool, std::chrono::seconds(5))) << "the lane's pool did not join";
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(took, std::chrono::seconds(1));
+    const uint64_t connected = l.lane.stats().connected.load();
+    EXPECT_LT(connected, N) << "the drain ran to the tip after the stop";
+    EXPECT_EQ(l.t.cache->get_best_height(), connected) << "the set is not at its last connected block";
+    EXPECT_EQ(l.t.cache->get_best_block(), hash_of(chain[connected - 1]));
+    EXPECT_EQ(l.lane.on_block(chain[connected], hash_of(chain[connected]), connected + 1).fed,
+              UtxoLane::Fed::Skipped) << "a body taken while stopping";
+    EXPECT_EQ(l.t.cache->get_best_height(), connected);
+
+    // The stores close after the join; a restart resumes from the flush.
+    l.t.reopen();
+    ASSERT_EQ(l.t.db->get_best_height(), connected);
+    l.net.stopping = false;
+    l.net.requested.clear();
+    UtxoLane again(*l.t.cache, *l.t.db, l.net.host(), 20, Mode::Full, N);
+    again.on_block(chain[N - 1], hash_of(chain[N - 1]), N);
+    ASSERT_FALSE(l.net.requested.empty());
+    EXPECT_EQ(l.net.requested.front(), connected + 1) << "not resumed from the flushed height";
+    serve(again, l.net, chain);
+    EXPECT_EQ(l.t.cache->get_best_height(), N);
+    EXPECT_EQ(again.stats().strict_refusals.load(), 0u);
+}
+
 // A body whose transactions are not the ones its header commits to (Merkle
 // root) is not connected; the height is fetched again.
 TEST(DogeUtxoFull, BodyNotMatchingItsHeaderIsRefetched)
@@ -784,6 +842,146 @@ TEST(DogeUtxoDownload, ReorderBufferMemoryBoundStopsRequests)
     l.lane.on_block(chain[0], hash_of(chain[0]), 1, "a");
     EXPECT_GE(l.t.cache->get_best_height(), 16u);
     EXPECT_GT(l.net.peer_requests.size(), held) << "requests resume once the buffer drains";
+}
+
+// ── The canary's IBD stall (sg-ltc, 10-31, h 4.72M+) ─────────────────────
+//
+// 2023's 0.5-1 MB blocks put the 1,024-block window over the 256 MB byte
+// bound of the reorder buffer. The peer holding the next height stalled and
+// was rotated out (its requests dropped); with the buffer at the bound the
+// refill asked nothing, not even the next height, so it came only with the
+// host's 30 s broadcast: ten blocks per ten minutes, inflight 0, peers_used 0,
+// buffer_bytes 375 MB (bodies in flight arrived over the bound), the stall
+// timeout at 64 s for good (it decayed only after 1,000 blocks).
+
+namespace {
+
+/// The block download against simulated peers: each answers its requests in
+/// order, at most `rate` a second (0: never, a staller). One step is one
+/// simulated second: the lane's tick, then every peer's answers. Records the
+/// buffer's peak and the seconds in which the next height was neither
+/// buffered nor asked of any peer.
+struct DownloadSim {
+    Lane& l;
+    const std::vector<BlockType>& chain;
+    std::map<std::string, uint32_t> rate;
+    std::map<std::string, std::deque<uint32_t>> queue;
+    size_t seen = 0;
+    uint64_t max_buffer = 0;
+    uint64_t next_not_asked = 0;
+
+    void take_requests()
+    {
+        for (; seen < l.net.peer_requests.size(); ++seen)
+            queue[l.net.peer_requests[seen].first].push_back(l.net.peer_requests[seen].second);
+    }
+    void step()
+    {
+        l.net.clock += std::chrono::seconds(1);
+        l.lane.tick();
+        take_requests();
+        for (auto& [peer, q] : queue) {
+            const uint32_t r = rate.count(peer) ? rate.at(peer) : 1;
+            for (uint32_t i = 0; i < r && !q.empty(); ++i) {
+                const uint32_t h = q.front();
+                q.pop_front();
+                l.lane.on_block(chain[h - 1], hash_of(chain[h - 1]), h, peer);
+                take_requests();
+                max_buffer = std::max<uint64_t>(max_buffer, l.lane.stats().buffer_bytes.load());
+            }
+        }
+        const auto& f = l.lane.fill();
+        if (f.active && !l.lane.in_flight(f.next_height) && !f.buffer.count(f.next_height))
+            ++next_not_asked;
+    }
+    uint32_t best() const { return l.t.cache->get_best_height(); }
+};
+
+} // namespace
+
+// The canary's shape, scaled: 1 MB bodies, a 64 MB bound under a 256-block
+// window, the peer holding the next height never answering. The next height
+// is in flight to some peer every second, the buffer stays within the bound
+// (+ the heights the drain waits for), the stall timeout decays, and the set
+// reaches the tip. Before: stuck at 0 after the rotation, buffer over bound.
+TEST(DogeUtxoDownload, TheNextHeightIsAlwaysInFlightAtTheByteBound)
+{
+    constexpr uint32_t N = 600;
+    constexpr uint64_t MB = 1u << 20;
+    const uint256 g = genesis(0x68);
+    const auto chain = chain_with(g, N);
+    Lane l(20, Mode::Full, 256, /*download=*/true);
+    l.net.peers = {"slow", "b", "c", "d"};
+    l.net.body_bytes = MB;
+    l.lane.set_buffer_limit(64 * MB);
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[N - 1], hash_of(chain[N - 1]), N);
+    DownloadSim sim{l, chain, {{"slow", 0}, {"b", 8}, {"c", 8}, {"d", 8}}};
+    for (int s = 0; s < 600 && sim.best() < N; ++s)
+        sim.step();
+    std::printf("[sim] scaled canary: h=%u, next height unasked %llu s, buffer peak %llu MB, stalls %llu, "
+                "evicted %llu, stall timeout %llu ms\n",
+                sim.best(), (unsigned long long)sim.next_not_asked, (unsigned long long)(sim.max_buffer / MB),
+                (unsigned long long)l.lane.stats().stalls.load(), (unsigned long long)l.lane.stats().buffer_evicted.load(),
+                (unsigned long long)l.lane.stats().stall_timeout_ms.load());
+    EXPECT_EQ(sim.best(), N) << "the IBD stalled at " << sim.best();
+    EXPECT_EQ(sim.next_not_asked, 0u) << "seconds with the next height asked of nobody";
+    EXPECT_LE(sim.max_buffer, (64 + UtxoLane::HOLE_SPAN) * MB) << "the byte bound";
+    EXPECT_GE(l.lane.stats().stalls.load(), 1u) << "the staller was never rotated out";
+    EXPECT_LE(l.lane.stats().stall_timeout_ms.load(), 3000u) << "the stall timeout did not decay";
+}
+
+// The canary at full scale: a 1,024 window and the 256 MB bound, 1 MB
+// bodies, eight peers throttling historic blocks (four at 1 a second, two
+// at 3, one at 6) and one never answering. The set keeps the peers' pace
+// (16 a second), the next height is always asked, memory stays bounded.
+TEST(DogeUtxoDownload, OneMegabyteBlocksFromSlowThrottlingPeers)
+{
+    constexpr uint32_t N = 3000;
+    constexpr uint64_t MB = 1u << 20;
+    const uint256 g = genesis(0x69);
+    const auto chain = chain_with(g, N);
+    Lane l(20, Mode::Full, UtxoLane::FULL_WINDOW, /*download=*/true);
+    l.net.peers = {"dead", "t1", "t2", "t3", "t4", "m1", "m2", "f1"};
+    l.net.body_bytes = MB;
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[N - 1], hash_of(chain[N - 1]), N);
+    DownloadSim sim{l, chain,
+                    {{"dead", 0}, {"t1", 1}, {"t2", 1}, {"t3", 1}, {"t4", 1}, {"m1", 3}, {"m2", 3}, {"f1", 6}}};
+    int seconds = 0;
+    for (; seconds < 900 && sim.best() < N; ++seconds)
+        sim.step();
+    std::printf("[sim] 1 MB blocks: h=%u in %d s (%.1f blocks/s), next height unasked %llu s, buffer peak %llu MB, "
+                "stalls %llu, request timeouts %llu, evicted %llu\n",
+                sim.best(), seconds, seconds ? double(sim.best()) / seconds : 0.0,
+                (unsigned long long)sim.next_not_asked, (unsigned long long)(sim.max_buffer / MB),
+                (unsigned long long)l.lane.stats().stalls.load(),
+                (unsigned long long)l.lane.stats().request_timeouts.load(),
+                (unsigned long long)l.lane.stats().buffer_evicted.load());
+    EXPECT_EQ(sim.best(), N) << "the IBD stalled at " << sim.best() << " after " << seconds << " s";
+    EXPECT_LE(seconds, 400) << "far below the peers' 16 blocks a second";
+    EXPECT_EQ(sim.next_not_asked, 0u);
+    EXPECT_LE(sim.max_buffer, UtxoLane::BUFFER_BYTES_MAX + UtxoLane::HOLE_SPAN * MB);
+}
+
+// Cooling never leaves the download with nobody to ask: with every peer
+// rotated out (none answers), the next height is still asked, of them.
+TEST(DogeUtxoDownload, CoolingNeverLeavesNoPeerToAsk)
+{
+    const uint256 g = genesis(0x6a);
+    const auto chain = chain_with(g, 100);
+    Lane l(20, Mode::Full, 64, /*download=*/true);
+    l.net.peers = {"x", "y"};
+    l.net.set_chain(chain, 1);
+    l.net.best[0] = g;
+    l.lane.on_block(chain[99], hash_of(chain[99]), 100);
+    DownloadSim sim{l, chain, {{"x", 0}, {"y", 0}}};
+    for (int s = 0; s < 200; ++s)
+        sim.step();
+    EXPECT_GE(l.lane.stats().request_timeouts.load(), 1u);
+    EXPECT_EQ(sim.next_not_asked, 0u) << "every peer cooling left the next height unasked";
 }
 
 // Only a peer advertising NODE_NETWORK serves the IBD (a pruned node does

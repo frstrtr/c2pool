@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -201,6 +202,8 @@ struct Net {
     std::chrono::steady_clock::time_point clock{std::chrono::steady_clock::time_point{} + std::chrono::hours(1)};
     bool bodies_wait{false};  // the host's bodies_wait (headers first)
     bool chase{false};        // the host's chase_tip
+    std::atomic<bool> stopping{false};  // the host's stopping (a shutdown)
+    size_t body_bytes{0};     // the host's body_size (0: the real estimate)
     // The host's chain_synced / tip_age_s (the cold start's caught-up gate),
     // wired when cold_gate is set before the Lane is built.
     bool cold_gate{false};
@@ -282,6 +285,10 @@ struct Net {
         };
         h.completed = [this]() { ++completed; };
         h.chase_tip = [this]() { return chase; };
+        h.stopping = [this]() { return stopping.load(); };
+        h.body_size = [this](const BlockType& b) {
+            return body_bytes ? body_bytes : doge::coin::estimate_body_bytes(b);
+        };
         if (cold_gate) {
             h.chain_synced = [this]() { return synced; };
             h.tip_age_s = [this]() { return tip_age; };

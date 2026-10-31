@@ -193,6 +193,14 @@ struct UtxoLaneHost {
     /// body above keep arms it, as before.
     std::function<bool()> chain_synced;
     std::function<int64_t()> tip_age_s;
+    /// The node is shutting down: a drain ends after the block it is
+    /// connecting (the set stays at that block's flush), and no new body or
+    /// tick is taken, so the lane's pool joins at once. Unset: never.
+    std::function<bool()> stopping;
+    /// Tests: the bytes a body counts for in the reorder buffer's bound
+    /// (unset: estimate_body_bytes). A simulation of 1 MB blocks without
+    /// building them.
+    std::function<size_t(const BlockType&)> body_size;
 };
 
 /// The serialized size of a body, estimated from its parts (memory bounds:
@@ -242,6 +250,7 @@ struct UtxoLaneStats {
     std::atomic<uint64_t> stalls{0};           // full mode: peers that held the window's first block
     std::atomic<uint64_t> request_timeouts{0}; // full mode: requests unanswered for REQUEST_TIMEOUT
     std::atomic<uint64_t> buffer_bytes{0};     // full mode: bodies received, waiting to connect
+    std::atomic<uint64_t> buffer_evicted{0};   // full mode: bodies far ahead dropped at the byte bound
     std::atomic<uint64_t> stall_timeout_ms{0}; // full mode: the current stall timeout
     std::atomic<uint64_t> stuck_retries{0};    // full mode: retries of a stuck height
     std::atomic<uint64_t> tip_chases{0};       // the set behind the tip asked its next block (chase_tip)
@@ -260,6 +269,7 @@ struct UtxoLaneStats {
             {"inflight", v(inflight)},         {"peers_used", v(peers_used)},
             {"peers_cooling", v(peers_cooling)}, {"stalls", v(stalls)},
             {"request_timeouts", v(request_timeouts)}, {"buffer_bytes", v(buffer_bytes)},
+            {"buffer_evicted", v(buffer_evicted)},
             {"stall_timeout_ms", v(stall_timeout_ms)}, {"stuck_retries", v(stuck_retries)},
             {"tip_chases", v(tip_chases)},
         };
@@ -277,7 +287,7 @@ public:
     /// (BLOCK_DOWNLOAD_WINDOW), requests outstanding per peer
     /// (MAX_BLOCKS_IN_TRANSIT_PER_PEER), the stall timeout for the window's
     /// first block (BLOCK_STALLING_TIMEOUT, doubled after each stall up to
-    /// 64 s, halved again after 1,000 blocks without one).
+    /// 64 s, and x0.85 for every block connected, as Core decays it).
     static constexpr size_t   FULL_WINDOW = 1024;
     static constexpr uint32_t PER_PEER_IN_FLIGHT = 16;
     static constexpr std::chrono::milliseconds STALL_TIMEOUT_MIN{2000};
@@ -291,6 +301,13 @@ public:
     /// held: this + the requests in flight (<= PER_PEER_IN_FLIGHT per peer)
     /// x DOGE's 1 MB block size limit.
     static constexpr size_t   BUFFER_BYTES_MAX = 256u * 1024 * 1024;
+    /// At the byte bound the heights the drain waits for are still asked:
+    /// the holes among the first HOLE_SPAN heights of the window (the next
+    /// height first). Without this the next height of a rotated-out peer
+    /// was asked by nobody but the 30 s broadcast (sg-ltc canary, 10-31:
+    /// 4.72M+, 2023's 0.5-1 MB blocks put 1,024 bodies over 256 MB; ten
+    /// blocks per ten minutes).
+    static constexpr uint32_t HOLE_SPAN = PER_PEER_IN_FLIGHT;
     /// A height refused REFUSALS_MAX times is left alone this long, then
     /// fetched again (not only at a restart).
     static constexpr std::chrono::seconds STUCK_RETRY{600};
@@ -326,6 +343,12 @@ public:
 
     Mode mode() const { return m_mode; }
 
+    /// UtxoLaneHost::stopping.
+    bool stopping() const { return m_host.stopping && m_host.stopping(); }
+
+    /// Tests: whether height h is asked of a peer now.
+    bool in_flight(uint32_t h) const { return m_inflight.count(h) != 0; }
+
     UtxoLane(const UtxoLane&) = delete;
     UtxoLane& operator=(const UtxoLane&) = delete;
 
@@ -336,6 +359,10 @@ public:
     {
         using namespace ltc::coin;
         FeedResult r;
+        if (stopping()) {
+            r.fed = Fed::Skipped;
+            return r;
+        }
         uint256 at = height ? m_host.chain_hash_at(height) : uint256();
         // A body often arrives before the header chain knows its block: a
         // peer's inv is answered with the body at once, while headers come
@@ -604,9 +631,11 @@ private:
             return;
         }
         const bool fresh = height >= m_fill.next_height && !m_fill.buffer.count(height);
+        const size_t bytes = bounded && fresh ? body_bytes(block) : 0;
+        if (bounded && fresh && m_mode == Mode::Full && !make_room(height, bytes))
+            return;  // far ahead at the bound: asked again when there is room
         ltc::coin::ordered_buffer(m_fill, height, block, hash);
         if (bounded && fresh && m_fill.buffer.count(height)) {
-            const size_t bytes = body_bytes(block);
             m_sizes[height] = bytes;
             m_buffer_bytes += bytes;
             m_from[height] = m_last_peer;
@@ -614,7 +643,35 @@ private:
         }
     }
 
-    static size_t body_bytes(const BlockType& b) { return estimate_body_bytes(b); }
+    /// The byte bound on every body that enters the reorder buffer (not only
+    /// on the requests: bodies already in flight, a broadcast's copies, an
+    /// announced tip arrive over it, 375 MB of a 256 MB bound on the canary).
+    /// A body that would cross the bound takes the room of the buffered
+    /// bodies farthest ahead of it (they are asked again in their turn); the
+    /// heights the drain waits for (the first HOLE_SPAN) always enter and are
+    /// never evicted. False: nothing farther ahead to give room, and the body
+    /// is not one the drain waits for: it is not kept.
+    bool make_room(uint32_t height, size_t bytes)
+    {
+        const uint64_t needed_end = uint64_t(m_fill.next_height) + HOLE_SPAN;
+        const bool needed = height < needed_end;
+        while (m_buffer_bytes + bytes > m_buffer_limit) {
+            auto far = m_sizes.empty() ? m_sizes.end() : std::prev(m_sizes.end());
+            if (far == m_sizes.end() || far->first <= height || far->first < needed_end)
+                return needed;
+            m_buffer_bytes -= std::min(m_buffer_bytes, far->second);
+            m_fill.buffer.erase(far->first);
+            m_from.erase(far->first);
+            m_sizes.erase(far);
+            m_stats.buffer_evicted.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    size_t body_bytes(const BlockType& b) const
+    {
+        return m_host.body_size ? m_host.body_size(b) : estimate_body_bytes(b);
+    }
 
     /// Full mode, the first block: arm the fill. A set that is empty or not
     /// built from genesis (no sync state, or another anchor) is (wiped and)
@@ -896,7 +953,9 @@ private:
         uint32_t asked = 0;
         const uint64_t last = std::min<uint64_t>(m_fill.end_height, uint64_t(m_fill.next_height) + m_fill.window - 1);
         for (uint64_t hh = m_fill.next_height; hh <= last && !peers.empty(); ++hh) {
-            if (m_buffer_bytes >= m_buffer_limit)
+            // At the byte bound only the heights the drain waits for: the
+            // next height is always in flight to some peer.
+            if (m_buffer_bytes >= m_buffer_limit && hh >= uint64_t(m_fill.next_height) + HOLE_SPAN)
                 break;
             const uint32_t h = static_cast<uint32_t>(hh);
             if (m_fill.buffer.count(h) || m_inflight.count(h))
@@ -953,6 +1012,8 @@ public:
     /// retries a stuck height after STUCK_RETRY and updates the rate.
     void tick()
     {
+        if (stopping())
+            return;
         const auto t = now();
         if (m_mode == Mode::Full) {
             if (m_stuck)
@@ -1005,7 +1066,6 @@ public:
                          << " ms, timeout " << m_stall_timeout.count() << " ms): rotated out, its requests reassigned";
                 cool_down(staller, t);
                 m_stall_timeout = std::min(m_stall_timeout * 2, std::chrono::milliseconds(STALL_TIMEOUT_MAX));
-                m_drained_since_stall = 0;
             }
         }
         m_stats.stall_timeout_ms.store(static_cast<uint64_t>(m_stall_timeout.count()), std::memory_order_relaxed);
@@ -1311,7 +1371,7 @@ private:
         ltc::coin::DrainResult r;
         FullConnect failed = FullConnect::Connected;
         std::string from;
-        while (m_fill.buffer.count(m_fill.next_height)) {
+        while (!stopping() && m_fill.buffer.count(m_fill.next_height)) {
             auto node = m_fill.buffer.extract(m_fill.next_height);
             auto& [b, bh] = node.mapped();
             const uint32_t h = m_fill.next_height;
@@ -1331,10 +1391,12 @@ private:
             ++m_fill.processed;
             m_fill.last_drain_time = std::chrono::steady_clock::now();
             ++r.connected;
-            if (++m_drained_since_stall >= 1000 && m_stall_timeout > STALL_TIMEOUT_MIN) {
-                m_stall_timeout = std::max(m_stall_timeout / 2, std::chrono::milliseconds(STALL_TIMEOUT_MIN));
-                m_drained_since_stall = 0;
-            }
+            // Core: the stall timeout decays by 0.85 for every block received
+            // (it was halved only after 1,000 blocks: at ten blocks per ten
+            // minutes it stayed at 64 s for good).
+            if (m_stall_timeout > STALL_TIMEOUT_MIN)
+                m_stall_timeout = std::max(std::chrono::milliseconds(m_stall_timeout.count() * 85 / 100),
+                                           std::chrono::milliseconds(STALL_TIMEOUT_MIN));
         }
         m_stats.buffer_bytes.store(m_buffer_bytes, std::memory_order_relaxed);
         switch (failed) {
@@ -1588,7 +1650,6 @@ private:
     size_t                              m_buffer_bytes{0};
     size_t                              m_buffer_limit{BUFFER_BYTES_MAX};
     std::chrono::milliseconds           m_stall_timeout{STALL_TIMEOUT_MIN};
-    uint32_t                            m_drained_since_stall{0};
     std::chrono::steady_clock::time_point m_synced_since{};  // cold_start_ready
     size_t                              m_default_window{0};  // the fill window outside the cold start
     uint32_t                            m_chase_height{0};  // chase_tip: the height asked, 0 = none

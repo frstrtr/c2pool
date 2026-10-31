@@ -652,6 +652,9 @@ void MergedMiningManager::stop()
 {
     m_running = false;
     m_poll_timer.cancel();
+    // Queued refreshes are dropped (their backends may be the embedded
+    // chains, which close after this); the one running finishes.
+    m_rpc_pool.stop();
     m_rpc_pool.join();
 }
 

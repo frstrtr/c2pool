@@ -1851,6 +1851,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                         static_cast<unsigned long long>(nv.sw.switches), template_status_name(tstatus),
                         tstatus_why.empty() ? "" : " ", tstatus_why.c_str(), static_cast<unsigned long long>(templates));
             std::printf("%s\n", pb::status_time_line(status_t_ms).c_str());
+            std::printf("%s\n", pb::status_roots_line(cur ? &cur->tip : nullptr).c_str());
             if (nv.poisoned || fork_fuse || template_kept || nv.coinbase_internal != 0 || nv.hold.hold)
                 std::printf("  ALARM:%s%s%s%s%s\n", nv.poisoned ? " store-poisoned(no template; the joiner path at the next start)" : "",
                             fork_fuse ? " fork-fuse" : "", template_kept ? " template-kept" : "",
@@ -2057,6 +2058,7 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
             if (cur) {
                 w.pathb.window_root_hex = hex_of(cur->window.window_root);
                 w.pathb.mmr_root_hex = hex_of(cur->window.mmr_root);
+                w.pathb.roots_tip_hex = hex_of(cur->tip);
             }
             w.pathb.leaf_count = nv.leaf_count;
             w.pathb.pending = nv.pending;

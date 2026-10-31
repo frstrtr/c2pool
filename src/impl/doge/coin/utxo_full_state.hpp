@@ -47,6 +47,8 @@ struct UtxoFullState {
     /// below the header checkpoint is proven, not needed (a header chain
     /// from genesis), or the set's best is already past the checkpoint.
     std::atomic<bool> schedule_ready{false};
+    /// The node is shutting down (UtxoLaneHost::stopping of both lanes).
+    std::atomic<bool> stopping{false};
     /// The DB the explorer reads DOGE blocks from (the lane writing them).
     std::atomic<core::coin::UTXOViewDB*> explorer_db{nullptr};
     /// How many times the pool was swapped to the full set (adopt()).

@@ -559,17 +559,13 @@ if (BUILD_TESTING)
     # cmake/RetryTest.cmake, up to 3 tries, so a known race does not block
     # unrelated PRs. The races stay OPEN in their issues; a test that fails
     # all 3 tries still fails. Drop a name when its issue's race is fixed.
-    #   v37_xmr_relay_send_queue_kat  #1889 S2 re-HELLO: a frame not yet
-    #                                 PONG-confirmed at the forced drop is
-    #                                 re-offered.
     #   v37_xmr_relay_discovery_kat   #1890 D2: one link per node pair under
     #                                 load.
     #   v37_xmr_relay_node_nonce_kat  #1885 N5: duplicate in/out pair closed
     #                                 by the acceptor.
     # (v37_convergence_soak, #1905, is an undiagnosed safety pin and is NOT
     # retried; see its add_test below.)
-    set(V37_FLAKY_RETRY v37_xmr_relay_send_queue_kat v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
-    set(V37_FLAKY_ISSUE_v37_xmr_relay_send_queue_kat 1889)
+    set(V37_FLAKY_RETRY v37_xmr_relay_discovery_kat v37_xmr_relay_node_nonce_kat)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_discovery_kat 1890)
     set(V37_FLAKY_ISSUE_v37_xmr_relay_node_nonce_kat 1885)
     foreach(_gap2_kat xmr_relay_wire_kat)
@@ -726,9 +722,9 @@ if (BUILD_TESTING)
     # RELAY-SEND-QUEUE: v37_xmr_relay_send_queue_kat -- two Path B relay nodes
     # over loopback TCP, each holding a pending set the other lacks, HELLO at
     # once: the re-offer goes through the per-link send queue (no send timeout,
-    # no redial, every frame delivered), a concurrent small send is not blocked
-    # (< 1 s), the per-link send queue stays bounded. ALSO on BOTH build.yml
-    # --target lists.
+    # no redial, every frame delivered), a concurrent small send returns while
+    # the peer reads nothing and reaches it in the link's order, the per-link
+    # send queue stays bounded. ALSO on BOTH build.yml --target lists.
     if (XMR_BUILD_RANDOMX AND TARGET randomx)
         target_link_libraries(xmr_receipt_bind_v2_kat PRIVATE randomx)
         target_include_directories(xmr_receipt_bind_v2_kat PRIVATE ${CMAKE_SOURCE_DIR}/src/impl/xmr/third_party/randomx)

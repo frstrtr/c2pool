@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "node.hpp"
+#include <future>
+#include <thread>
 
 #include "share_tx_refs.hpp"
 
@@ -2155,6 +2157,32 @@ void NodeImpl::flush_verified_to_leveldb()
     }
     m_storage->mark_shares_verified_with_pow(hash_pow_pairs);
     m_verified_flush_buf.clear();
+}
+
+bool NodeImpl::stop_compute(std::chrono::milliseconds deadline)
+{
+    {
+        // Held by a running call of the hook: this waits it out.
+        std::lock_guard<std::mutex> lock(m_locked_best_hook_mutex);
+        m_locked_best_hook = nullptr;
+    }
+    m_think_pool.stop();
+    m_verify_pool.stop();
+    auto joined = std::make_shared<std::promise<void>>();
+    auto done = joined->get_future();
+    std::thread joiner([this, joined]() {
+        m_think_pool.join();
+        m_verify_pool.join();
+        joined->set_value();
+    });
+    if (done.wait_for(deadline) == std::future_status::ready) {
+        joiner.join();
+        return true;
+    }
+    joiner.detach();  // the caller exits without destroying the node
+    LOG_ERROR << "[Pool] compute thread still running after "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(deadline).count() << " ms";
+    return false;
 }
 
 void NodeImpl::shutdown()

@@ -391,7 +391,7 @@ changes a job's payee.
 - **Repair answers.** A relayed receipt that this node could not decide, but
   admitted as part of a winner's lane repair, is trusted on the winner's
   word (`coinbase-recompute.md` §6).
-- **Test flakes.** #1885, #1889 and #1890 are timing-sensitive relay tests.
+- **Test flakes.** #1885 and #1890 are timing-sensitive relay tests.
   They do not touch the payout rules.
 - **Merged mining.** The V36 merged-mining path has no V37 counterpart: there
   is no AuxPoW in the V37 code. On XMR the 0x03 merge-mining tag only carries

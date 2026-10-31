@@ -302,6 +302,11 @@ public:
         // Connect to local daemon immediately (if validated)
         if (m_local_daemon)
             connect_peer(*m_local_daemon);
+        // Connect-only: the given peers at once (the maintenance tick dials
+        // a lost one again).
+        for (const auto& ep : m_peer_manager.connect_only() ? m_peer_manager.get_peers_to_connect({})
+                                                            : std::vector<PeerEndpoint>{})
+            connect_peer(ep);
 
         schedule_maintenance();
         if (m_local_daemon) {

@@ -252,8 +252,8 @@ and does not yet exist, so the work can be judged on what it actually is.
   the Linux x86_64 and ASan/UBSan legs and the other CI lanes are not required
   checks; the CI badge above shows the state of the latest master run. The
   RandomX-dependent XMR checks run CI-gated in light mode, and the CodeQL
-  security scan is a non-gating job. Three v37 relay KATs have known timing
-  flakes (#1885, #1889, #1890) and are retried up to 3 times; CI reports every
+  security scan is a non-gating job. Two v37 relay KATs have known timing
+  flakes (#1885, #1890) and are retried up to 3 times; CI reports every
   retry as a warning. `v37_convergence_soak` is an undiagnosed safety pin
   (#1905) and is not retried.
 

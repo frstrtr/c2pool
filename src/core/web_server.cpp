@@ -72,12 +72,24 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
 
 MiningInterface::~MiningInterface()
 {
-    // Stop and join the background graph-view seed thread (if it is still
-    // replaying the flat log). Never blocks shutdown for long: the flag is
-    // checked between entries.
+    stop_background();
+}
+
+void MiningInterface::stop_background()
+{
+    // The background graph-view seed thread (if it is still replaying the
+    // flat log) and the PPLNS pre-computation. Neither blocks the shutdown
+    // for long: each checks its flag between entries / every 100 ms, and a
+    // running m_pplns_fn call is one share's walk. The pre-computation was
+    // detached: it woke every second and read m_pplns_fn on a freed
+    // MiningInterface after ~WebServer (ASan heap-use-after-free, a SIGTERM
+    // during the LTC sync, r16 live harness).
     m_views_seed_stop.store(true, std::memory_order_relaxed);
+    m_pplns_precompute_stop.store(true, std::memory_order_relaxed);
     if (m_views_seed_thread.joinable())
         m_views_seed_thread.join();
+    if (m_pplns_precompute_thread.joinable())
+        m_pplns_precompute_thread.join();
 }
 
 void MiningInterface::setup_methods()
@@ -3794,8 +3806,17 @@ void MiningInterface::start_pplns_precompute()
         // Wait for: PPLNS function + sharechain sync + valid work template
         uint256 block_target;
         uint64_t subsidy = 0;
-        for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto stop = [this]() { return m_pplns_precompute_stop.load(std::memory_order_relaxed); };
+        // A sleep that ends at stop_background().
+        auto nap = [&stop](std::chrono::milliseconds d) {
+            const auto until = std::chrono::steady_clock::now() + d;
+            while (!stop() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        };
+        for (int wait = 0; wait < 600 && !stop(); ++wait) {  // up to 10 minutes
+            nap(std::chrono::seconds(1));
+            if (stop())
+                return;
             if (!m_pplns_fn || !m_sharechain_window_fn) continue;
 
             // Need meaningful chain
@@ -3826,6 +3847,8 @@ void MiningInterface::start_pplns_precompute()
             }
             if (!block_target.IsNull() && subsidy > 0) break;
         }
+        if (stop())
+            return;
 
         if (!m_pplns_fn || !m_sharechain_window_fn) {
             LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
@@ -3863,10 +3886,10 @@ void MiningInterface::start_pplns_precompute()
         constexpr auto kPrecomputeBootSettle  = std::chrono::seconds(30);      // let boot backfill/think quiesce
         constexpr auto kPrecomputeBurstBudget = std::chrono::milliseconds(250); // ~160x under the 40s watchdog
         constexpr auto kPrecomputeYield       = std::chrono::milliseconds(50);  // hand the tracker lock back
-        std::this_thread::sleep_for(kPrecomputeBootSettle);
+        nap(kPrecomputeBootSettle);
         auto burst_start = std::chrono::steady_clock::now();
 
-        for (int i = 0; i < total; ++i) {
+        for (int i = 0; i < total && !stop(); ++i) {
             auto& s = shares[i];
             if (!s.contains("H") || !s.contains("h")) continue;
 
@@ -3940,6 +3963,8 @@ void MiningInterface::start_pplns_precompute()
                 continue;
             }
         }
+        if (stop())
+            return;
 
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start_time).count();
@@ -4017,7 +4042,8 @@ void MiningInterface::start_pplns_precompute()
                  << m_pplns_per_tip.size() << ")";
     });
 
-    m_pplns_precompute_thread.detach();
+    // Joined by stop_background() (not detached: it runs this object's
+    // callbacks).
 }
 
 void MiningInterface::cache_pplns_at_tip()
