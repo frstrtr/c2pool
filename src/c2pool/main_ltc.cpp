@@ -673,9 +673,15 @@ static int dump_doge_schedule_anchors(const std::string& dir, const std::string&
         std::cerr << "dump-doge-schedule-anchors: not dumped: " << err << "\n";
         return 1;
     }
-    const auto now = std::time(nullptr);
+    const std::time_t now = std::time(nullptr);
+    std::tm now_tm{};
+#ifdef _WIN32
+    gmtime_s(&now_tm, &now);
+#else
+    gmtime_r(&now, &now_tm);
+#endif
     char date[32];
-    std::strftime(date, sizeof(date), "%Y-%m-%d %H:%MZ", std::gmtime(&now));
+    std::strftime(date, sizeof(date), "%Y-%m-%d %H:%MZ", &now_tm);
     const std::vector<std::string> header = {
         "c2pool DOGE hash-schedule anchors -- generated, do not hand-edit.",
         "tool        c2pool --dump-doge-schedule-anchors (read from a copy of the header DB)",
@@ -6904,13 +6910,13 @@ int main(int argc, char* argv[]) {
                             };
                             if (open_full()) {
                                 doge_full_cache = std::make_unique<core::coin::UTXOViewCache>(doge_full_db.get());
-                                const auto ss = doge_full_db->get_sync_state();
+                                const auto full_ss = doge_full_db->get_sync_state();
                                 doge_full_live = doge::coin::UtxoFullState::start_live(
-                                    ss, doge_full_db->get_best_height(), doge_chain->height());
+                                    full_ss, doge_full_db->get_best_height(), doge_chain->height());
                                 LOG_INFO << "[EMB-DOGE] Full UTXO set at " << full_path << ": best_height="
                                          << doge_full_db->get_best_height() << " anchor="
-                                         << (ss.tracked() ? std::to_string(ss.anchor_height) : std::string("none"))
-                                         << " synced=" << int(ss.synced) << " coins=" << ss.coins
+                                         << (full_ss.tracked() ? std::to_string(full_ss.anchor_height) : std::string("none"))
+                                         << " synced=" << int(full_ss.synced) << " coins=" << full_ss.coins
                                          << " header_height=" << doge_chain->height()
                                          << (doge_full_live ? " — the templates price against it"
                                                             : " — catching up; the accrual set prices meanwhile");
@@ -7745,7 +7751,6 @@ int main(int argc, char* argv[]) {
                                     doge_full_pool = std::make_unique<boost::asio::thread_pool>(1);
                                     auto* fpool = doge_full_pool.get();
                                     auto* dc = doge_chain.get();
-                                    auto* sched = doge_hash_schedule.get();
                                     auto full = doge_full;
                                     auto* pool = doge_pool.get();
                                     doge::coin::UtxoLaneHost host;
