@@ -876,6 +876,10 @@ public:
     }
     // The caller's inbound frames: true when it holds none it received and has not given to the node (unset: none).
     void set_inbound_idle(std::function<bool()> f) { inbound_idle_ = std::move(f); }
+    // The caller's catch-ups: one not ended toward a tip this node does not hold (the template gate's claim case).
+    void set_catchup_claim(std::function<bool()> f) { catchup_claim_ = std::move(f); }
+    // The template gate's final state (the KATs).
+    bool gate_held() const { return gate_holds(); }
     // A completed join attempt that rule (4) did not take, or an adoption, at a store not caught up: K_NCU ends when
     // the drain is done (finish_kept, finish_adopted).
     bool kept_due() const noexcept { return ncu_due_ == NcuDue::Kept && not_caught_up_; }
@@ -890,10 +894,10 @@ public:
         note_caught_up();
         return true;
     }
-    // Not caught up, templates built: a HELLO tail's tip is not held here and the header path delivers nothing toward
-    // a tip it does not hold (the caller logs it).
+    // Not caught up, templates built: the gate open (gate_holds) with a HELLO tail's tip not held here (the caller logs
+    // it).
     bool unverified_claims() const {
-        if (!gate_applies() || first_round_open_ || delivery_hold()) return false;
+        if (!gate_applies() || gate_holds()) return false;
         for (const auto& [peer, t] : peers_)
             if (!holds_tip(t.best_tip)) return true;
         return false;
@@ -1297,11 +1301,8 @@ public:
         if (rests_on_claims()) return status(t, TemplateStatus::RestsOnClaims);
         if (!cfg_.launch && peers_.empty() && ((started_empty_ && tree_->best().pos == 0) || not_caught_up_))
             return status(t, TemplateStatus::NoPathbPeer);
-        // not caught up (K_NCU): no template while the first catch-up round after the start is in flight, while the
-        // header path delivers toward a tip this node does not hold, or while every HELLO tip is held and the drain
-        // that ends K_NCU is not done (E-194); a HELLO claim alone holds no template past that round
-        if (gate_applies() && (first_round_open_ || delivery_hold() || drain_hold()))
-            return status(t, TemplateStatus::CatchingUp);
+        // not caught up (K_NCU): the template gate (gate_holds)
+        if (gate_holds()) return status(t, TemplateStatus::CatchingUp);
         const CarrierNode& tip = tree_->best();
         t.tip = tip.id;
         t.x = tip.pos + 1;
@@ -3623,9 +3624,21 @@ private:
         const auto it = peers_.find(peer);
         return it != peers_.end() && !holds_tip(it->second.best_tip);
     }
-    // E-194 (vi): every HELLO tip held and K_NCU not ended yet: its drain (E-193) not done, or the done test that ends
-    // it not run yet. The gate and the caught-up line read one state.
-    bool drain_hold() const { return gate_applies() && !peers_.empty() && !hello_unheld(); }
+    // The template gate at a store not caught up (F-D2 as amended; E-194 (v), (vi); E-196): it holds in the first
+    // round, while the header path delivers, while R-CU-1's drain clause is unmet (frames in hand), and, once R-CU-1's
+    // first conjunct is met (every HELLO catch-up ended by its done test or its reply's own decision, a completed
+    // attempt kept, or an adoption), until K_NCU ends. Before K_NCU ends it opens only where a claim alone opens it: a
+    // HELLO catch-up still open toward a tip the node does not hold, nothing delivered and nothing in hand.
+    bool gate_holds() const {
+        if (!gate_applies()) return false;
+        if (first_round_open_ || delivery_hold()) return true;
+        if (!drain_done()) return true;             // frames in hand
+        if (ncu_due_ != NcuDue::None) return true;  // a kept attempt or an adoption, until K_NCU ends
+        return !claim_open();                       // until K_NCU ends, but for a claim-only open catch-up
+    }
+    // A HELLO catch-up not ended (open, or handed to the joiner) toward a tip the node does not hold: the caller's
+    // catch-ups (unset: a HELLO tail's tip not held).
+    bool claim_open() const { return catchup_claim_ ? catchup_claim_() : hello_unheld(); }
     // The verified winning headers' tip: not held, still winning against the best tip.
     bool win_open() const {
         if (!hp_win_) return false;
@@ -3705,6 +3718,7 @@ private:
     enum class NcuDue : std::uint8_t { None, Kept, Adopted };
     NcuDue ncu_due_ = NcuDue::None;       // a kept attempt or an adoption; K_NCU ends at its drain (E-193)
     std::function<bool()> inbound_idle_;  // the caller's inbound frames all judged (E-193)
+    std::function<bool()> catchup_claim_;  // the caller's catch-ups: one not ended toward an unheld tip
     std::optional<ChainTip> hp_win_;      // headers this node verified that win (their tip and work)
     std::uint64_t hp_win_peer_ = 0;
     Delivery hp_page_;                    // the last page or side-header delivery (E-194 (v))

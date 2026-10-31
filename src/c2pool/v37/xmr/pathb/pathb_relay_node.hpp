@@ -409,6 +409,7 @@ public:
         n.set_join_transport(&port_);
         n.set_join_step([this] { const JoinRelease r(*this); });
         n.set_inbound_idle([this] { return inbound_idle(); });
+        n.set_catchup_claim([this] { return catchup_claim_open(); });
         const PathbNodeConfig& c = n.config();
         chain_id_ = c.identity.chain_id;
         p_ = c.p;
@@ -768,6 +769,8 @@ public:
     }
     // The node lock's busy total (ms).
     std::uint64_t node_busy_ms() { return lock_.busy_ms(); }
+    // The KATs: a due end of K_NCU is tried only at the tick (the window between the last judged frame and its end).
+    void test_defer_ends(bool on) { defer_ends_ = on; }
     // Parks a carrier frame of `peer` in the verify parked list, run again at `not_before_ms` (default: never; the
     // parked-cap KAT).
     std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame,
@@ -1544,6 +1547,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(cumtx_);
             catchup_.erase(p);
+            handed_over_.erase(p);
             header_wants_.erase(p);
             headers_on_ctx_.erase(p);
             hdr_sent_.erase(p);
@@ -2921,6 +2925,7 @@ private:
     // reply decides fetch or keep (the tail's best_cum_work is not read).
     void catchup_start(std::uint64_t p, const HelloTail& tail) {
         std::lock_guard<std::mutex> lk(cumtx_);
+        handed_over_.erase(p);  // a new HELLO: its catch-up starts again
         if (node_->holds_tip(tail.best_tip)) {
             caught_up_locked();  // nothing to catch up from this peer (the done test at the start)
             return;
@@ -2932,11 +2937,15 @@ private:
         catchup_ask_locked(p, c);
     }
     // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
-    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store) once the node
-    // holds no frame it received and has not judged, and no parked frame whose parent it holds (E-193); until then
-    // the end is due and is tried again after each judged frame and at each tick.
+    // that ended its catch-up by the node's own decision; a hand-over to the joiner is no end, E-166 (v)) is caught up
+    // (its record leaves the store) once the node holds no frame it received and has not judged, and no parked frame
+    // whose parent it holds (E-193); until then the end is due and is tried again after each judged frame and at each
+    // tick.
     void caught_up_locked() {
-        if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) {
+        if (node_->caught_up()) handed_over_.clear();
+        // a due end keeps its first conjunct when the peers leave meanwhile
+        if (node_->caught_up() || !catchup_.empty() || handed_over_locked()
+            || (!node_->has_pathb_peer() && !caught_due_.load())) {
             caught_due_ = false;
             return;
         }
@@ -2955,6 +2964,7 @@ private:
         if (node_->kept_due()) {
             if (!node_->finish_kept()) return;
             kept_due_ = false;
+            handed_over_.clear();
             st_.caught_up_at_ms = now_ms();
             log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at_pos_t_locked());
             return;
@@ -2962,6 +2972,7 @@ private:
         if (node_->adopt_due()) {
             if (!node_->finish_adopted()) return;
             kept_due_ = false;
+            handed_over_.clear();
             st_.caught_up_at_ms = now_ms();
             log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
             return;
@@ -2970,7 +2981,7 @@ private:
     }
     // A due end of K_NCU tried again (not under the node lock: after a judged frame, a job, a pump).
     void recheck_caught_up() {
-        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this) return;
+        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this || defer_ends_) return;
         const NodeGuard g(*this);
         std::lock_guard<std::mutex> lk(cumtx_);
         if (caught_due_.load()) caught_up_locked();
@@ -2982,6 +2993,23 @@ private:
         if (rx_events_.load() != 0) return false;
         std::lock_guard<std::mutex> lk(vmtx_);
         return vq_.empty() && parked_.empty() && vbusy_.load() == 0;
+    }
+    // Under cumtx_: a catch-up handed to the joiner (an empty reply from position 0, JoinerPath) whose tip is still not
+    // held; a held one ended by its done test.
+    bool handed_over_locked() {
+        for (auto it = handed_over_.begin(); it != handed_over_.end();)
+            it = node_->holds_tip(it->second) ? handed_over_.erase(it) : std::next(it);
+        return !handed_over_.empty();
+    }
+    // Under the node lock: a HELLO catch-up not ended toward a tip the node does not hold, open or handed to the
+    // joiner (the template gate's claim case, E-194 (vi)).
+    bool catchup_claim_open() const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        for (const auto& [p, c] : catchup_)
+            if (!node_->holds_tip(c.tip)) return true;
+        for (const auto& [p, tip] : handed_over_)
+            if (!node_->holds_tip(tip)) return true;
+        return false;
     }
     // A reply frame's arrival at its link (E-194): the relay clock and the node lock's busy total now.
     PathbNode::Arrival arrival_now() { return PathbNode::Arrival{now_ms(), lock_.busy_ms(), true}; }
@@ -3082,6 +3110,7 @@ private:
                                     st_.empty_store_offers++;
                                     join = true;
                                 }
+                                handed_over_[p] = it->second.tip;  // handed to the joiner: no end (E-166 (v))
                                 catchup_.erase(it);
                                 break;
                             }
@@ -3089,7 +3118,10 @@ private:
                             catchup_.erase(it);
                             caught_up_locked();
                             break;
-                        case K::JoinerPath: catchup_.erase(it); break;
+                        case K::JoinerPath:
+                            handed_over_[p] = it->second.tip;  // handed to the joiner: no end (E-166 (v))
+                            catchup_.erase(it);
+                            break;
                         case K::Ban:
                         case K::Strike:
                         case K::Undecodable:  // the catch-up ended by its reply
@@ -3792,6 +3824,10 @@ private:
                     catchup_ask_locked(it->first, c);
                 }
                 ++it;
+            }
+            if (!handed_over_.empty()) {  // a handed-over catch-up whose tip is held now: ended by its done test
+                const std::size_t n = handed_over_.size();
+                if (!handed_over_locked() && n > 0) done_any = done_any || !node_->rests_on_claims();
             }
             if (done_any || caught_due_.load()) caught_up_locked();
             if (kept_due_.load()) kept_locked();
@@ -4584,6 +4620,7 @@ private:
     std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
     std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
     std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)
+    bool defer_ends_ = false;                  // test_defer_ends
     std::atomic<bool> kept_due_{false};        // a kept join attempt or an adoption; K_NCU's end waits for the drain
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
@@ -4617,6 +4654,7 @@ private:
 
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
+    std::map<std::uint64_t, Hash32> handed_over_;  // catch-ups handed to the joiner: peer -> its HELLO tip (cumtx_)
     std::map<std::uint64_t, std::deque<HdrWant>> header_wants_;  // peer -> its waiting header requests, oldest first
     std::map<std::uint64_t, std::vector<HdrOnCtx>> headers_on_ctx_;  // deferred on a P_r: peer -> per (owner, from, stop)
     std::map<std::uint64_t, HdrSent> hdr_sent_;  // the tip request in flight per peer and its objects (cumtx_)
