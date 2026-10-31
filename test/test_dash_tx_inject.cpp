@@ -1420,3 +1420,26 @@ TEST(DashTxInject, SpentShapedOutputRefusedAtAdmissionByName)
     const auto ok_valued = make_signed_spend(k, prev2, 90'000);
     EXPECT_EQ(mp.add_inject(ok_valued), Mempool::InjectGate::Ok);
 }
+
+// (VERIFY-S2 Must-Fix 1, the relay seam) A peer that is not a dashd can relay
+// the same shape (dashd itself never does). add_tx refuses it too, so no path
+// serves a tx whose block our own full set would refuse.
+TEST(DashMempool, RelaySeamNeverAdmitsASpentShapedOutput)
+{
+    Key k(0x5c);
+    const uint256 prev = prevhash(0xe8);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    Mempool mp; mp.set_utxo(&utxo);
+    arm_script_check(mp);
+    TxOut change; change.value = 90'000; change.scriptPubKey = to_script(k.spk);
+    TxOut spent_shaped; spent_shaped.value = 0;
+    const auto bad = make_signed_spend_outs(k, prev, {change, spent_shaped});
+    EXPECT_FALSE(mp.add_tx(bad)) << "a relayed (value 0, empty script) output is never admitted";
+    EXPECT_FALSE(mp.get_entry(dash_txid(bad)).has_value());
+    auto [selected, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+    EXPECT_TRUE(selected.empty());
+    EXPECT_EQ(fees, 0u);
+    // The tx without that output is relayed as before.
+    EXPECT_TRUE(mp.add_tx(make_signed_spend_outs(k, prev, {change})));
+}

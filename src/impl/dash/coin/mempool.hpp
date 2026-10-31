@@ -922,6 +922,21 @@ private:
                 return false;
             }
         }
+        // VERIFY-S2 Must-Fix 1, every seam: an output with value 0 and an
+        // empty scriptPubKey is the shape our view reads as absent
+        // (Coin::is_spent()), so a block we mine with it is refused by our own
+        // full set (utxo-spent-shaped-output) and the set withholds for good.
+        // dashd never relays one (an empty scriptPubKey is non-standard), so
+        // only a peer that is not a dashd can send it; it is never admitted
+        // and never served. A lost fee at most, never a lost block.
+        for (const auto& vout : tx.vout) {
+            if (vout.value == 0 && vout.scriptPubKey.m_data.empty()) {
+                LOG_INFO << "[MEMPOOL] reject spent-shaped-output txid="
+                         << dash_txid(tx).GetHex().substr(0, 16)
+                         << " (an output with value 0 and an empty script)";
+                return false;
+            }
+        }
         uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
 
