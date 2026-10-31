@@ -152,7 +152,11 @@ public:
     nlohmann::json getblocktemplate(const nlohmann::json& params = nlohmann::json::array(), const std::string& request_id = "");
     // Set by the HTTP session around a JSON-RPC call from a direct local
     // client (loopback, no proxy headers).
-    static thread_local bool t_direct_local_request;
+    // Inline with its constant initializer: every TU accesses it directly,
+    // with no thread_local wrapper (_ZTW/_ZTH). Through the wrapper, GCC 13's
+    // -fsanitize=null check read the flags of an `add x@gottpoff(%rip)` that
+    // ld relaxes to a flagless `lea`, and UBSan reported a store to null.
+    inline static thread_local bool t_direct_local_request = false;
     // The aux chain a getblocktemplate params names, if not the node's own.
     std::optional<std::string> aux_template_chain(const nlohmann::json& params) const;
     nlohmann::json submitblock(const std::string& hex_data, const std::string& request_id = "");
