@@ -240,6 +240,19 @@ jobs:
             esac
             cp -Lv "$so" "${PKG}/lib/"
           done
+          # Bare start: the binary finds the bundled lib/ through RUNPATH, so the
+          # tarball runs without LD_LIBRARY_PATH or start.sh. Each bundled lib gets
+          # $ORIGIN too, so a lib that needs another bundled lib (libgmp under the
+          # dash BLS build) resolves it from the same directory. The v0.2.8 tarball
+          # carried no RUNPATH, so a pristine host needed LD_LIBRARY_PATH=./lib
+          # (#1906 repro). patchelf comes from PyPI because the self-hosted runners
+          # have no passwordless sudo for apt.
+          python -m pip install --quiet 'patchelf>=0.17,<0.19'
+          patchelf --set-rpath '$ORIGIN/lib' "${PKG}/c2pool-${COIN}"
+          for so in "${PKG}"/lib/*.so*; do
+            patchelf --set-rpath '$ORIGIN' "$so"
+          done
+          bash scripts/ci/linux_pkg_runpath_guard.sh "${PKG}" "c2pool-${COIN}"
           cp start.sh "${PKG}/" && chmod +x "${PKG}/start.sh"
           cp "config/${COIN}/c2pool_mainnet.yaml" "${PKG}/config/c2pool_mainnet.yaml.example"
           cp "config/${COIN}/c2pool_testnet.yaml" "${PKG}/config/c2pool_testnet.yaml"
