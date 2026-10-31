@@ -16,9 +16,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <fstream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace dash_utxo_full;
@@ -509,4 +511,56 @@ TEST(DashMempool, ZeroValueEmptyScriptCoinIsPresent)
     Coin c;
     EXPECT_EQ(mp.prove_chain_coin(op, c), dash::coin::Mempool::CoinProof::Unspent);
     EXPECT_EQ(c.value, 0);
+}
+
+TEST(DashUtxoLane, StatusReadFromAnotherThreadWhileTheLaneMoves)
+{
+    // VERIFY-S2 S-1: /local_stats reads the lane's status on the HTTP thread
+    // while the io thread connects, re-asks and withholds. The read must be a
+    // published copy, never the live members (a torn withheld_reason string
+    // could crash the node). Run under TSan this is the race detector's pin;
+    // without it, a crash-or-garbage smoke.
+    Rig r;
+    ASSERT_TRUE(r.open({snap_coin(fake_hash(71), 0, 1000, 71)}));
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> reads{0};
+    std::atomic<bool> garbage{false};
+    std::thread http([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const auto j = dash::coin::utxo_status_json(r.lane);
+            const auto st = r.lane.full_status();
+            const auto line = dash::coin::utxo_status_line(r.lane);
+            if (st.state != "verifying-base" && st.state != "catching-up" && st.state != "serving" &&
+                st.state != "withheld")
+                garbage = true;
+            if (!st.withheld_reason.empty() && st.withheld_reason.rfind("utxo-strict-refusal", 0) != 0)
+                garbage = true;
+            if (j.is_null() || line.empty()) garbage = true;
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    r.lane.on_header_tip(kBase);
+    uint256 prev = r.base_hash;
+    for (uint32_t i = 1; i <= 150; ++i) {
+        const BlockType b = block(prev, {coinbase(50, 7000 + i)}, 7000 + i);
+        r.deliver(b, kBase + i);
+        prev = hash_of(b);
+    }
+    // A body spending a coin the set does not hold, twice: the second refusal
+    // withholds, writing the reason while the reader runs.
+    const BlockType bad = block(prev, {coinbase(50, 7999), spend({Outpoint(fake_hash(72), 0)},
+                                                                 {out(5, p2pkh(72))}, 7999)}, 7999);
+    r.deliver(bad, kBase + 151);
+    r.lane.on_block_connected(bad, kBase + 151);
+    while (reads.load() < 1000) std::this_thread::yield();
+    stop = true;
+    http.join();
+    EXPECT_FALSE(garbage.load());
+    EXPECT_TRUE(r.lane.withheld());
+    const auto st = r.lane.full_status();
+    EXPECT_EQ(st.state, "withheld");
+    EXPECT_EQ(st.best_height, kBase + 150);
+    EXPECT_EQ(st.connected, 150u);
+    EXPECT_EQ(st.strict_refusals, 2u);
+    EXPECT_EQ(st.withheld_reason.rfind("utxo-strict-refusal", 0), 0u) << st.withheld_reason;
 }

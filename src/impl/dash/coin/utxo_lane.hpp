@@ -68,6 +68,12 @@
 ///   - a best block that left the header chain's best is disconnected from
 ///     its undo record (rewind), back to the base at most; deeper withholds.
 ///
+/// THREADS. Every lane entry point runs on the node io thread. The HTTP thread
+/// (/local_stats) reads full_status(), the copy the io thread publishes when
+/// an entry point returns (the AlertRelayService status_json pattern); the
+/// mode and the base-verified / withheld latches are atomics, read by the
+/// template path.
+///
 /// FENCED: src/impl/dash only. Constructed exclusively by the opt-in
 /// embedded path in main_dash.cpp; the dashd-RPC fallback (production
 /// prod) never touches this file.
@@ -88,10 +94,12 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -207,6 +215,7 @@ public:
                  << " assumed_base=" << assumed.base_height
                  << " validated=" << int(assumed.validated)
                  << " coins=" << m_db->get_sync_state().coins;
+        publish_status();
         return true;
     }
 
@@ -221,7 +230,32 @@ public:
     void set_hash_at_fn(HashAtFn fn) { m_hash_at = std::move(fn); }
     void set_alert_fn(AlertFn fn) { m_alert = std::move(fn); }
 
+    /// Any thread: the status the io thread last published (VERIFY-S2 S-1).
     FullStatus full_status() const
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        return m_status;
+    }
+
+    /// Full mode: the header tip moved. Places the base, rewinds a best block
+    /// that left the best chain, and asks for best+1 .. tip without waiting
+    /// for a block to be announced. No-op in accrual mode.
+    void on_header_tip(uint32_t tip_height)
+    {
+        if (m_mode != Mode::Full || !m_cache) return;
+        const PublishOnReturn publish{*this};
+        if (m_withheld) return;
+        if (!verify_base() || !rewind_to_best_chain()) return;
+        const uint32_t best_h = m_cache->get_best_height();
+        if (tip_height <= best_h && !m_bs.active) return;
+        start_fill(best_h);
+        if (tip_height > m_bs.end_height) m_bs.end_height = tip_height;
+        fill_step();
+    }
+
+private:
+    /// io thread: the status from the live members.
+    FullStatus compute_status() const
     {
         FullStatus st;
         st.full = m_mode == Mode::Full;
@@ -248,20 +282,21 @@ public:
         return st;
     }
 
-    /// Full mode: the header tip moved. Places the base, rewinds a best block
-    /// that left the best chain, and asks for best+1 .. tip without waiting
-    /// for a block to be announced. No-op in accrual mode.
-    void on_header_tip(uint32_t tip_height)
+    /// io thread: publish compute_status() for full_status().
+    void publish_status()
     {
-        if (m_mode != Mode::Full || !m_cache || m_withheld) return;
-        if (!verify_base() || !rewind_to_best_chain()) return;
-        const uint32_t best_h = m_cache->get_best_height();
-        if (tip_height <= best_h && !m_bs.active) return;
-        start_fill(best_h);
-        if (tip_height > m_bs.end_height) m_bs.end_height = tip_height;
-        fill_step();
+        FullStatus st = compute_status();
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status = std::move(st);
     }
 
+    /// Publishes the status when an io-thread entry point returns.
+    struct PublishOnReturn {
+        UtxoLane& lane;
+        ~PublishOnReturn() { lane.publish_status(); }
+    };
+
+public:
     /// The set_utxo call the dash arm never made (main_ltc.cpp:1770).
     /// After this, Mempool::add_tx prices via UTXO+CPFP and
     /// recompute_unknown_fees can resolve backlog entries.
@@ -401,6 +436,7 @@ public:
             ::dash::crypto::hash_x11(packed_hdr.get_span());
 
         if (m_mode == Mode::Full) {
+            const PublishOnReturn publish{*this};
             on_block_full(block, height, block_hash);
             return;
         }
@@ -880,19 +916,22 @@ private:
         std::chrono::seconds(BootstrapState::STALL_CHECK_SEC)};
 
     // Full mode.
-    Mode                           m_mode{Mode::Accrual};
+    std::atomic<Mode>              m_mode{Mode::Accrual};
     ::core::coin::AssumedBase      m_assumed;
     uint32_t                       m_min_base_height{0};
     HashAtFn                       m_hash_at;
     AlertFn                        m_alert;
-    bool                           m_base_verified{false};
-    bool                           m_withheld{false};
+    std::atomic<bool>              m_base_verified{false};
+    std::atomic<bool>              m_withheld{false};
     std::string                    m_withheld_reason;
     std::set<uint32_t>             m_refused_heights;
     uint64_t                       m_full_connected{0};
     uint64_t                       m_strict_refusals{0};
     uint64_t                       m_bad_bodies{0};
     uint64_t                       m_rewinds{0};
+    // The status full_status() hands to any thread (S-1).
+    mutable std::mutex             m_status_mutex;
+    FullStatus                     m_status;
 };
 
 } // namespace coin
