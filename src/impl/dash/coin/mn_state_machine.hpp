@@ -87,6 +87,7 @@
 
 #include <impl/dash/coin/block.hpp>
 #include <impl/dash/coin/mn_state_db.hpp>
+#include <impl/dash/coin/tx_version_rules.hpp>      // ContextualCheckTransaction (v23.1.9)
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/bls_verify.hpp>   // opkey_to_basic — canonical-BASIC store contract (#154 legacy<->basic ProUpReg)
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
@@ -268,6 +269,15 @@ public:
         //          defect signature, not a statistic.
         size_t split_adopted{0};
         size_t split_desync{0};
+        // ── CONSENSUS REFUSAL (Dash Core v23.1.9 port) ───────────────────
+        // Non-empty: dashd rejects this block, named by its reject reason
+        // (ContextualCheckTransaction: bad-txns-type / bad-txns-cb-type /
+        // bad-txns-version for a negative nVersion; ProUpServTx bad-protx-type
+        // / bad-protx-type-mismatch). The WHOLE apply was refused BEFORE any
+        // mutation and the cursor did not move — the held set is still exactly
+        // the post-state of the cursor block. The caller must not serve on
+        // this block (demote); the valid block at this height still folds.
+        std::string refused;
     };
 
     /// ─────────────────────────────────────────────────────────────────────
@@ -463,6 +473,13 @@ public:
     // apply_block is FORWARD-ONLY: any call at height <= this is skipped
     // whole (see ApplyResult::skipped_out_of_order).
     uint32_t last_applied_height() const { return m_last_applied_height; }
+
+    /// DIP3 activation height for the ContextualCheckTransaction pre-scan in
+    /// apply_block: the rules apply to a block at height >= this value
+    /// (dashd DeploymentActiveAfter(pindexPrev, DIP0003)). Defaults to the
+    /// MAINNET value (1028160); a smaller real value on another network only
+    /// leaves blocks in between unchecked, never refuses a valid one.
+    void set_dip0003_height(uint32_t h) { m_dip0003_height = h; }
 
     /// The height a wholesale masternode-list fold last reconciled this set's
     /// PoSe ban state at (0 = never). Set by sync_validity_from_sml(), which
@@ -1267,6 +1284,18 @@ public:
                         << " (" << (height - m_last_applied_height - 1)
                         << " block(s) never folded) — apply refused"
                            " (fail closed, re-seed required)";
+            return r;
+        }
+
+        // Consensus pre-scan (v23.1.9 port), BEFORE any mutation: a block
+        // dashd rejects is refused whole — see ApplyResult::refused.
+        if (auto why = consensus_refusal(block, height)) {
+            r.refused = *why;
+            r.total_after = m_entries.size();
+            LOG_WARNING << "[MNS-SM] block h=" << height << " REFUSED: "
+                        << r.refused << " — dashd rejects this block; apply"
+                           " skipped, cursor stays at h="
+                        << m_last_applied_height;
             return r;
         }
 
@@ -2135,6 +2164,44 @@ private:
     // Forward-only apply cursor: height of the last block folded by
     // apply_block (0 = none since load). See ApplyResult::skipped_out_of_order.
     uint32_t m_last_applied_height{0};
+
+    // ContextualCheckTransaction gate (set_dip0003_height). Mainnet default.
+    uint32_t m_dip0003_height{1028160};
+
+    /// The block-level rejects apply_block mirrors, as dashd's reject reason
+    /// ("tx[i]: <reason>"), or nullopt. Pure: reads the pre-block set only.
+    ///   * ContextualCheckTransaction (validation.cpp:317-349 @ v23.1.9) on
+    ///     every tx, coinbase included, once DIP3 is active for the block.
+    ///   * ProUpServTx (#7488, specialtxman.cpp RebuildListFromBlock +
+    ///     CheckProUpServTx): IsValidMnType(nType) else bad-protx-type, and
+    ///     nType must equal the registered MN's nType else
+    ///     bad-protx-type-mismatch. A ProUpServTx naming an MN this set does
+    ///     not hold stays the counted revive_dropped_unknown path below.
+    std::optional<std::string> consensus_refusal(const dash::coin::BlockType& block,
+                                                 uint32_t height) const
+    {
+        for (size_t i = 0; i < block.m_txs.size(); ++i) {
+            const auto& tx = block.m_txs[i];
+            if (height >= m_dip0003_height) {
+                if (auto why = contextual_tx_check(tx, i == 0))
+                    return "tx[" + std::to_string(i) + "]: " + std::string(*why);
+            }
+            if (i == 0 || tx.type != vendor::CProUpServTx::SPECIALTX_TYPE
+                || tx.extra_payload.empty())
+                continue;
+            vendor::CProUpServTx ptx;
+            if (!vendor::parse_protx_payload(tx.extra_payload, ptx)) continue;
+            if (ptx.nType != vendor::MnType::REGULAR && ptx.nType != vendor::MnType::EVO)
+                return "tx[" + std::to_string(i) + "]: bad-protx-type (ProUpServTx nType="
+                     + std::to_string(ptx.nType) + ")";
+            auto it = m_entries.find(ptx.proTxHash);
+            if (it != m_entries.end() && it->second.nType != ptx.nType)
+                return "tx[" + std::to_string(i) + "]: bad-protx-type-mismatch (ProUpServTx nType="
+                     + std::to_string(ptx.nType) + ", registered nType="
+                     + std::to_string(it->second.nType) + ")";
+        }
+        return std::nullopt;
+    }
 
     // Height of the last wholesale ban-state reconcile (sync_validity_from_sml).
     // 0 = the ban state in this set has NEVER been measured against a dated

@@ -413,7 +413,7 @@ public:
         std::unordered_set<uint64_t> block_indexes;
         for (size_t i = 1; i < block.m_txs.size(); ++i) {
             const auto& tx = block.m_txs[i];
-            if (tx.version != 3 ||
+            if (!tx_has_extra_payload(tx.version, tx.type) ||
                 tx.type != vendor::CAssetUnlockPayload::SPECIALTX_TYPE) continue;
             vendor::CAssetUnlockPayload pl;
             if (!vendor::parse_assetunlock_payload(tx.extra_payload, pl)) {
@@ -561,7 +561,7 @@ public:
         std::unordered_set<uint64_t> session_indexes;
 
         for (const auto& tx : candidates) {
-            if (tx.version != 3 ||
+            if (!tx_has_extra_payload(tx.version, tx.type) ||
                 tx.type != vendor::CAssetUnlockPayload::SPECIALTX_TYPE) continue;
             if (!tx.vin.empty()) continue;                    // bad-assetunlocktx-have-input
             if (tx.vout.size() > unlockverify::kMaximumWithdrawals) continue;

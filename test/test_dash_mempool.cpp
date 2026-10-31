@@ -616,7 +616,9 @@ static MutableTransaction make_asset_unlock(int64_t out_value, uint32_t fee,
     pl.fee = fee;
     pl.requestedHeight = 1000 + salt;
     MutableTransaction tx;
-    tx.version = 1;
+    // A special tx is IsSpecialTxVersion() (nVersion >= 3): a typed
+    // version-1 tx is bad-txns-type at admission (ContextualCheckTransaction).
+    tx.version = 3;
     tx.type = dash::coin::vendor::CAssetUnlockPayload::SPECIALTX_TYPE;  // 9
     tx.locktime = 0;
     tx.vout.push_back(make_output(out_value));
@@ -674,7 +676,7 @@ TEST(DashMempool, AssetUnlockType9PricedFromPayloadFee)
 
     // Malformed payload: conservative — stays unknown, stays excluded.
     MutableTransaction bad;
-    bad.version = 1;
+    bad.version = 3;   // special version: the malformed PAYLOAD is under test
     bad.type = 9;
     bad.vout.push_back(make_output(1'000));
     bad.extra_payload = {0x01};   // truncated

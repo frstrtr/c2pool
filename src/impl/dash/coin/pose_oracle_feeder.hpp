@@ -97,6 +97,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -196,6 +197,10 @@ public:
     struct Stats {
         uint64_t folded{0};             // folds that passed the root self-check
         uint64_t root_mismatches{0};    // folds that poisoned
+        // Bodies the engine refused with its state unchanged (a tx dashd's
+        // ContextualCheckTransaction rejects) — not a poison; dropped.
+        uint64_t refused_unchanged{0};
+        std::string last_refused_unchanged;
         uint64_t root_resolved_bans{0};
         uint64_t root_resolved_nobans{0};
         uint64_t holds{0};              // distinct (height) holds for members
@@ -268,6 +273,12 @@ public:
         return p;
     }
     const Stats& stats() const { return m_stats; }
+    /// stats().refused_unchanged, readable from any thread (the status
+    /// endpoints run off the oracle's io thread).
+    uint64_t refused_unchanged_count() const
+    {
+        return m_refused_unchanged_count.load(std::memory_order_relaxed);
+    }
     bool bootstrap_complete() const { return m_boot.active && m_boot.complete; }
     bool hashes_ready() const { return m_boot.hashes_ready; }
     size_t buffered() const { return m_buf.size(); }
@@ -393,6 +404,7 @@ public:
         s += " h=" + std::to_string(seeded() ? m_eng.height() : 0);
         s += " tip=" + std::to_string(tip);
         s += " poisoned=" + std::to_string(m_eng.poisoned() ? 1 : 0);
+        s += " refused_unchanged=" + std::to_string(m_stats.refused_unchanged);
         s += " folded=" + std::to_string(m_stats.folded);
         s += " root_mismatch=" + std::to_string(m_stats.root_mismatches);
         s += " root_resolved=" + std::to_string(m_stats.root_resolved_bans)
@@ -474,6 +486,7 @@ private:
     bool     m_post_scheduled{false};
     Boot     m_boot;
     Stats    m_stats;
+    std::atomic<uint64_t> m_refused_unchanged_count{0};
 
     uint64_t now() const { return m_io.now_ms ? m_io.now_ms() : 0; }
 
@@ -627,6 +640,17 @@ private:
             it = (it->first <= S) ? m_buf.erase(it) : std::next(it);
         start_bootstrap(S);
         if (m_io.on_reseeded) m_io.on_reseeded();
+    }
+
+    void note_refused_unchanged(uint32_t h, const std::string& why)
+    {
+        ++m_stats.refused_unchanged;
+        m_stats.last_refused_unchanged = why;
+        m_refused_unchanged_count.store(m_stats.refused_unchanged,
+                                        std::memory_order_relaxed);
+        LOG_WARNING << "[POSE-ORACLE] body h=" << h
+                    << " refused, state unchanged (refused_unchanged="
+                    << m_stats.refused_unchanged << ") — " << why;
     }
 
     void on_poisoned()
@@ -1021,6 +1045,16 @@ private:
                 m_repump = true;
                 return;
             }
+            // The engine's other pre-mutation refusal (a tx dashd's
+            // ContextualCheckTransaction rejects), asked BEFORE the quorum
+            // lane observes the block for the same reason: its cursor is
+            // forward-contiguous, and a block the fold refuses must not move
+            // it past the height the valid sibling still has to fill.
+            if (auto why = m_eng.refused_unchanged_reason(blk, h)) {
+                note_refused_unchanged(h, *why);
+                m_buf.erase(it);
+                return;
+            }
             auto miss = m_br.unresolved_member_sets(blk, /*kick=*/true);
             if (!miss.empty()) {
                 if (m_last_hold_logged != h) {
@@ -1052,6 +1086,11 @@ private:
             m_br.after_fold(h);
             if (!r.ok) {
                 if (m_eng.poisoned()) { on_poisoned(); return; }
+                if (r.refused_unchanged) {
+                    note_refused_unchanged(h, r.error);
+                    m_buf.erase(it);
+                    return;
+                }
                 // A refusal without poison leaves the engine untouched (e.g.
                 // a prev-link the pre-check above already excludes).
                 LOG_WARNING << "[POSE-ORACLE] fold of h=" << h << " refused: "
