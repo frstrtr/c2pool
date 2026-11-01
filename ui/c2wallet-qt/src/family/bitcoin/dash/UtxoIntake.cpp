@@ -3,6 +3,7 @@
 
 #include "DashAddress.hpp"
 #include "DashError.hpp"
+#include "InjectMaturity.hpp"
 
 // Reused M1-A hdkeys leaf helpers (btclibs closure). NO dashscript headers.
 #include "../hdkeys/HexUtil.hpp"
@@ -519,14 +520,12 @@ int64_t effective_height(const Utxo& u, int64_t tip_height)
 
 int64_t safe_from_height(const std::vector<Utxo>& inputs, int64_t tip_height)
 {
-    int64_t safe = 0;
-    for (const Utxo& u : inputs) {
-        const int64_t h = effective_height(u, tip_height);
-        if (h <= 0) return 0;
+    // The rule itself lives in the std-only InjectMaturity.hpp, shared with the
+    // online companion's inject scheduler.
+    return maturity::safe_from_height(inputs, [tip_height](const Utxo& u) {
         const bool known_non_coinbase = u.coinbase.has_value() && !*u.coinbase;
-        safe = std::max(safe, h + (known_non_coinbase ? 1 : kCoinbaseMaturity));
-    }
-    return safe;
+        return maturity::InputHeight{effective_height(u, tip_height), !known_non_coinbase};
+    });
 }
 
 TargetScreen rescreen_at_height(const std::vector<Utxo>& utxos,
