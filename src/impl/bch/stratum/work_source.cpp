@@ -29,6 +29,7 @@
 #include <impl/bch/stratum/coinbase_outputs.hpp>  // assemble_v36_coinbase_outputs
 #include <impl/bch/stratum/coinbase_slot_guard.hpp> // coinb1_ends_in_commitment_slot
 
+#include <impl/bch/coinbase_commitment.hpp>           // build_bip34_height_push (BCHN CScript() << h)
 #include <impl/bch/coin/header_chain.hpp>
 #include <impl/bch/coin/mempool.hpp>
 #include <impl/bch/coin/merkle.hpp>            // merkle_hash_pair (CTOR SHA256d)
@@ -74,17 +75,6 @@ inline void push_varint(std::vector<uint8_t>& v, uint64_t n) {
     } else if (n <= 0xffffffff) {
         v.push_back(0xfe); push_u32_le(v, static_cast<uint32_t>(n));
     } else { v.push_back(0xff); push_u64_le(v, n); }
-}
-// BIP34 minimally-encoded height push for the coinbase scriptSig.
-inline std::vector<uint8_t> bip34_height_push(uint32_t h) {
-    std::vector<uint8_t> enc; uint32_t tmp = h;
-    while (tmp) { enc.push_back(static_cast<uint8_t>(tmp & 0xff)); tmp >>= 8; }
-    if (enc.empty()) enc.push_back(0);
-    if (enc.back() & 0x80) enc.push_back(0);
-    std::vector<uint8_t> out;
-    out.push_back(static_cast<uint8_t>(enc.size()));   // OP_PUSHBYTES_n
-    out.insert(out.end(), enc.begin(), enc.end());
-    return out;
 }
 inline uint32_t parse_be_hex_u32(const std::string& str) {
     uint32_t v = 0; std::sscanf(str.c_str(), "%x", &v); return v;
@@ -468,7 +458,9 @@ core::stratum::CoinbaseResult BCHWorkSource::build_connection_coinbase(
     const int64_t author_version = author_version_fn ? author_version_fn() : 35;
 
     // scriptSig (deterministic): BIP34 height + pool tag.
-    auto bip34 = bip34_height_push(height);
+    // One BCH encoder (OP_0 / OP_1..OP_16 / data push) shared with the
+    // consensus validator + regtest builder -- see coinbase_commitment.hpp.
+    auto bip34 = bch::consensus::build_bip34_height_push(static_cast<int64_t>(height));
     static const std::string POOL_TAG = "/c2pool-bch/";
     std::vector<uint8_t> scriptsig;
     scriptsig.insert(scriptsig.end(), bip34.begin(), bip34.end());

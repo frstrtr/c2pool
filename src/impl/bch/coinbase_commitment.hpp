@@ -56,7 +56,18 @@ inline constexpr size_t   STATE_ROOT_LEN   = 32;                        // SHA25
 // minimally encoded as a CScriptNum (signed, little-endian, with the canonical
 // sign-byte rule), preceded by its length as a direct push opcode. Heights are
 // always positive and small enough to fit a direct (<=0x4b) push.
+//
+// EXCEPT heights 0..16: BCHN builds the prefix as `CScript() << nHeight`, and
+// CScript::push_int64 emits OP_0 for 0 and the small-int opcodes OP_1..OP_16
+// (0x51..0x60) for 1..16 -- NOT a data push. ContextualCheckBlock compares the
+// coinbase scriptSig prefix byte-for-byte, so a `01 01` push for height 1 is
+// bad-cb-height. p2pool-merged-v36 script.create_push_script does the same
+// (chr(datum + 80) for 1..16). Heights >= 17 are unaffected.
 // ---------------------------------------------------------------------------
+
+inline constexpr unsigned char BIP34_OP_0  = 0x00;
+inline constexpr unsigned char BIP34_OP_1  = 0x51;
+inline constexpr unsigned char BIP34_OP_16 = 0x60;
 
 // Encode `height` as a minimal little-endian CScriptNum byte vector (no opcode).
 inline std::vector<unsigned char> encode_script_num(int64_t height)
@@ -84,11 +95,21 @@ inline std::vector<unsigned char> encode_script_num(int64_t height)
     return out;
 }
 
-// Build the full BIP34 height push: [len opcode][little-endian height bytes].
+// Build the full BIP34 height push, byte-identical to BCHN `CScript() << height`:
+//   0      -> OP_0
+//   1..16  -> OP_1..OP_16
+//   17+    -> [len opcode][little-endian height bytes]
+// This is the ONE BCH encoder: the stratum work source and the regtest block
+// builder both call it.
 inline std::vector<unsigned char> build_bip34_height_push(int64_t height)
 {
     if (height < 0)
         throw std::invalid_argument("bch::consensus: BIP34 height must be non-negative");
+
+    if (height == 0)
+        return {BIP34_OP_0};
+    if (height <= 16)
+        return {static_cast<unsigned char>(BIP34_OP_1 + (height - 1))};
 
     std::vector<unsigned char> num = encode_script_num(height);
     if (num.size() > 0x4b)
@@ -170,23 +191,44 @@ inline CommitmentValidationResult validate_coinbase_commitment(
     CommitmentValidationResult r;
     size_t                     pos = 0;
 
-    // 1. BIP34 height push: [len][bytes].
+    // 1. BIP34 height: OP_0 / OP_1..OP_16 / [len][bytes].
     if (script_sig.empty())
     {
         r.error = "empty coinbase scriptSig (BIP34 height missing)";
         return r;
     }
-    const size_t hlen = script_sig[0];
-    if (hlen == 0 || hlen > 0x4b || 1 + hlen > script_sig.size())
+    const unsigned char op = script_sig[0];
+    if (op == BIP34_OP_0 || (op >= BIP34_OP_1 && op <= BIP34_OP_16))
     {
-        r.error = "malformed BIP34 height push";
+        r.height = op == BIP34_OP_0 ? 0 : static_cast<int64_t>(op - BIP34_OP_1) + 1;
+        pos      = 1;
+    }
+    else
+    {
+        // Heights fit int64; a longer push can never be a valid block height.
+        const size_t hlen = op;
+        if (hlen > 8 || 1 + hlen > script_sig.size())
+        {
+            r.error = "malformed BIP34 height push";
+            return r;
+        }
+        pos = 1;
+        std::vector<unsigned char> hbytes(script_sig.begin() + pos,
+                                          script_sig.begin() + pos + hlen);
+        pos += hlen;
+        r.height = decode_script_num(hbytes);
+    }
+
+    // BCHN matches the scriptSig prefix byte-for-byte against CScript() << h,
+    // so a non-minimal encoding (e.g. `01 01` for 1, or a padded push) is
+    // bad-cb-height even when the decoded value is right.
+    if (r.height < 0 ||
+        build_bip34_height_push(r.height) !=
+            std::vector<unsigned char>(script_sig.begin(), script_sig.begin() + pos))
+    {
+        r.error = "non-canonical BIP34 height push (bad-cb-height)";
         return r;
     }
-    pos = 1;
-    std::vector<unsigned char> hbytes(script_sig.begin() + pos,
-                                      script_sig.begin() + pos + hlen);
-    pos += hlen;
-    r.height = decode_script_num(hbytes);
 
     if (expected_height >= 0 && r.height != expected_height)
     {
