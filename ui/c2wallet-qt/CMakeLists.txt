@@ -70,6 +70,15 @@ endif()
 if(NOT TARGET c2wallet-artifact)
     add_subdirectory(src/family/bitcoin/artifact)
 endif()
+# Slice 2 (DASH): the special-tx core — c2wallet-dash-common (btclibs closure:
+# intake, planners, the std-only DashInjectModel, the manifest) and
+# c2wallet-dash-tx (dashscript closure: the signers and DashInjectModel::sign).
+# Both Qt-free and network-free: libsecp256k1 + the vendored interpreter only,
+# so the ci/check_no_network.sh link-guard stays green. With
+# -DC2WALLET_QT_BUILD_TESTS=ON it also registers c2wallet-dash-test (dash_kats).
+if(NOT TARGET c2wallet-dash-tx)
+    add_subdirectory(src/family/bitcoin/dash)
+endif()
 
 add_executable(c2wallet-qt-signer
     src/main.cpp
@@ -82,6 +91,7 @@ add_executable(c2wallet-qt-signer
     src/shell/PageBuildTxMonero.cpp
     src/shell/PageSignMonero.cpp
     src/shell/PageAirGap.cpp
+    src/shell/PageDashInject.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the
@@ -106,6 +116,8 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
     c2wallet_monero
     c2wallet-signer
     c2wallet-artifact
+    c2wallet-dash-tx
+    c2wallet-dash-common
 )
 
 # ═══════════════════════════════════════════════════════════════════════════

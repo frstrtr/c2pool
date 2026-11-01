@@ -64,6 +64,9 @@ struct Utxo {
     // true or nullopt (unknown, treated as coinbase) => max(min_confirmations,
     // kCoinbaseMaturity) confirmations; false => one confirmation is enough.
     std::optional<bool> coinbase = std::nullopt;
+    // Block height that created the output; 0 = unknown. The target-height
+    // re-screen (rescreen_at_height) projects confirmations from it.
+    int64_t height = 0;
 };
 
 struct CollateralPlan {
@@ -138,7 +141,11 @@ CollateralPlan plan_collateral(const CollateralRequest& req);
 // about to be signed differ from plan.unsigned_tx, if a zero fee and
 // InjectOnlyZeroFee do not go together, if an inject plan is over the input
 // cap, or if any input fails self-verify. An inject plan's signed size is
-// re-checked against the node cap after signing.
+// re-checked against the node cap after signing. A Relay plan's fee must cover
+// dashd's 1 duff/B minimum relay fee: at plan time for the request's
+// key_encoding (148 B/input compressed or unknown, 180 uncompressed — the low-S
+// DER maxima), before signing for the encoding of the key actually given, and
+// after signing for the real size.
 SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool confirm_spend);
 
 } // namespace c2w::dash
