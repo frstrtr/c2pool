@@ -95,6 +95,7 @@
 #include <impl/dash/coin/fresh_datum_race.hpp>   // PR-2: fresh-datum race (K-way fan-out selector + single-flight dedup; flag/K default-OFF)
 #include <impl/dash/coin/getmnlistd_tracker.hpp> // #154: getmnlistd slot tracker (fixed 10s per-slot re-ask, 3 boolean tiers, capability filter; flag default-OFF)
 #include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
+#include <impl/dash/coin/compact_block_receive.hpp>      // #968a: BIP152 cmpctblock/blocktxn receive state machine
 #include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
 #include <algorithm>
@@ -796,6 +797,12 @@ private:
     // master). Touched only on the single io_context thread, like every other
     // member here.
     dash::coin::GetmnlistdSlotTracker m_getmnlistd_tracker;
+
+    // #968a: BIP 152 compact-block receive. One parked block per peer while a
+    // getblocktxn is outstanding. No mempool provider yet, so every
+    // non-prefilled tx is fetched by getblocktxn. The bound is dashcore's
+    // MaxBlockSize(true) / MIN_TRANSACTION_SIZE = 2'000'000 / 10.
+    dash::coin::CompactBlockReceiver m_cmpct_rx{nullptr, 200000};
     // dashd TipMayBeStale/SetTryNewOutboundPeer analog for the STATEFUL leg: a
     // bridging getmnlistd (fold / ondemand-mnlist) that the mn-ckpt lane has
     // found outstanding past its wall-clock re-ask grace. While set,
@@ -3075,6 +3082,7 @@ private:
         // disconnect, exactly as the spec requires). No-op unless the tracker was
         // ever consulted; harmless when the flag is OFF.
         m_getmnlistd_tracker.on_disconnect(key);
+        m_cmpct_rx.on_disconnect(key);
 
         // Erase LAST: the unique_ptr destructor tears the Connection (and its
         // socket) down, so nothing may hold p afterwards.
@@ -4150,23 +4158,32 @@ private:
 
     ADD_P2P_HANDLER(block)
     {
+        deliver_block_body(msg->m_block);
+    }
+
+    // The full-block delivery path, shared by `block` and by a compact block
+    // that #968a reassembled (cmpctblock / blocktxn). Both end here so the
+    // matcher, watchdog, bulk demux and full_block event treat a reassembled
+    // body exactly like a downloaded one.
+    void deliver_block_body(const BlockType& block)
+    {
         // PR-0 instrumentation (record-only): time the tip/body delivery on the
         // peer that answered. Pure telemetry; the block is verified identically
         // downstream. The emit is gated on the default-OFF flag.
         record_delivery_latency(DatumClass::TipBody);
         // E2a: BlockType now deserializes the full body (header + tx set), so
-        // msg->m_block carries the transactions the ingest legs consume
+        // block carries the transactions the ingest legs consume
         // (MnStateMachine::apply_block special txs, UTXO connect_block). The
         // full_block event below feeds the E2a live-feed bridge, which derives
         // the block height off the header chain and fires block_connected.
         PeerSession* p = m_active;
         if (!p) return;
-        auto header = static_cast<BlockHeaderType>(msg->m_block);
+        auto header = static_cast<BlockHeaderType>(block);
         auto packed_header = pack(header);
         auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
         // Complete the matcher on the peer that was ASKED — this reply arrived
         // on its socket, and its deferral state is the one waiting.
-        try { p->conn->get_block(blockhash, msg->m_block); } catch (...) {}
+        try { p->conn->get_block(blockhash, block); } catch (...) {}
         try { p->conn->get_header(blockhash, header); } catch (...) {}
         // Lost-body watchdog: the body has arrived (from whichever peer
         // answered first) — disarm its slot.
@@ -4195,7 +4212,7 @@ private:
         // bulk scheduler itself requested, so a tip body can never be
         // swallowed. DEBUG, not INFO: bulk arrival rate would flood the
         // journal (the [BULK] telemetry line is the throughput surface).
-        if (m_block_body_filter && m_block_body_filter(blockhash, msg->m_block))
+        if (m_block_body_filter && m_block_body_filter(blockhash, block))
         {
             LOG_DEBUG_COIND << "[" << m_chain_label << "] bulk body from "
                             << p->key << ": "
@@ -4205,7 +4222,7 @@ private:
         }
         LOG_INFO << "[" << m_chain_label << "] block received from " << p->key
                  << ": " << blockhash.GetHex().substr(0, 16) << "...";
-        m_coin->full_block.happened(msg->m_block);
+        m_coin->full_block.happened(block);
     }
 
     ADD_P2P_HANDLER(headers)
@@ -4754,9 +4771,66 @@ private:
     ADD_P2P_HANDLER(getheaders)    { /* we don't serve headers */ }
     ADD_P2P_HANDLER(getmnlistd)    { /* we don't serve SML diffs */ }
     ADD_P2P_HANDLER(getqrinfo)     { /* we don't serve rotation info either */ }
-    ADD_P2P_HANDLER(cmpctblock)    { LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock ignored (E1)"; }
     ADD_P2P_HANDLER(getblocktxn)   { /* we never announce compact blocks */ }
-    ADD_P2P_HANDLER(blocktxn)      { /* no pending compact block in E1 */ }
+
+    // #968a: BIP 152 receive. We do not send sendcmpct yet, so a peer only
+    // sends these if it pushes compact blocks unasked; the path is live for
+    // that case and for the later opt-in announce slice.
+    ADD_P2P_HANDLER(cmpctblock)
+    {
+        PeerSession* p = m_active;
+        if (!p) return;
+        auto packed_header = pack(msg->m_cmpct.header);
+        auto blockhash = dash::crypto::hash_x11(packed_header.get_span());
+        apply_cmpct_verdict(p, m_cmpct_rx.on_cmpctblock(p->key, msg->m_cmpct, blockhash));
+    }
+
+    ADD_P2P_HANDLER(blocktxn)
+    {
+        PeerSession* p = m_active;
+        if (!p) return;
+        apply_cmpct_verdict(p, m_cmpct_rx.on_blocktxn(p->key, msg->m_txs));
+    }
+
+    void apply_cmpct_verdict(PeerSession* p, dash::coin::CompactReceiveVerdict v)
+    {
+        using K = dash::coin::CompactReceiveVerdict::Kind;
+        const auto tag = v.blockhash.GetHex().substr(0, 16);
+        switch (v.kind) {
+        case K::Complete:
+            LOG_INFO << "[" << m_chain_label << "] compact block reassembled from "
+                     << p->key << ": " << tag << "...";
+            deliver_block_body(v.block);
+            break;
+        case K::NeedTxn:
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] cmpctblock " << tag
+                            << "... from " << p->key << ": getblocktxn for "
+                            << v.request.indexes.size() << " tx";
+            {
+                auto req_msg = message_getblocktxn::make_raw(v.request);
+                p->write(req_msg);
+            }
+            break;
+        case K::FallbackFull:
+            LOG_WARNING << "[" << m_chain_label << "] compact block " << tag
+                        << "... from " << p->key << ": " << v.reason
+                        << ", fetching the full block";
+            {
+                auto full_msg = message_getdata::make_raw(
+                    {inventory_type(inventory_type::block, v.blockhash)});
+                p->write(full_msg);
+            }
+            break;
+        case K::Reject:
+            LOG_WARNING << "[" << m_chain_label << "] compact block " << tag
+                        << "... from " << p->key << " rejected: " << v.reason;
+            break;
+        case K::Ignore:
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] " << v.reason
+                            << " from " << p->key;
+            break;
+        }
+    }
 
     #undef ADD_P2P_HANDLER
 };
