@@ -26,7 +26,10 @@
 #include <core/pow.hpp>                 // core::SubsidyFunc
 
 #include <core/stratum_work_source.hpp>
+#include <c2pool/merged/merged_mining.hpp>  // MergedMiningManager (DC has_merged_chain)
+#include <impl/dgb/coin/u256_core_bridge.hpp>  // to_core_uint256 (DC parent_hash bridge)
 
+#include <boost/asio/io_context.hpp>
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -105,9 +108,71 @@ TEST(DgbWorkSource, NoMergedChainInDefaultBuild)
 {
     Fixture fx;
     auto ws = fx.make();
-    // DGB V36 default build is a standalone Scrypt parent (no merged mining;
-    // -DAUX_DOGE dual-parent is a parked STRETCH).
+    // DGB V36 default build is a standalone Scrypt parent: no --merged spec =>
+    // main_dgb never sets a manager => no merged chain.
     EXPECT_FALSE(ws->has_merged_chain(0x0001));
+    EXPECT_FALSE(ws->has_merged_chain(98));
+}
+
+TEST(DgbWorkSource, HasMergedChainConsultsManager)
+{
+    // DC: with a --merged DOGE manager set, has_merged_chain must report the
+    // registered chain_id (stratum keeps the DOGE login address / accepts a
+    // DOGE-primary username) and stay false for any unregistered id.
+    Fixture fx;
+    auto ws = fx.make();
+    boost::asio::io_context ioc;
+    c2pool::merged::MergedMiningManager mm(ioc);
+    ws->set_merged_mining_manager(&mm);
+    EXPECT_FALSE(ws->has_merged_chain(98));  // manager set, no chain yet
+
+    c2pool::merged::AuxChainConfig cfg;
+    cfg.symbol = "DOGE";
+    cfg.chain_id = 98;
+    mm.add_chain(cfg);  // RPC backend, never started: no I/O
+    EXPECT_TRUE(ws->has_merged_chain(98));
+    EXPECT_FALSE(ws->has_merged_chain(0x0001));
+
+    ws->set_merged_mining_manager(nullptr);
+    EXPECT_FALSE(ws->has_merged_chain(98));
+}
+
+TEST(DgbWorkSource, U256ToCoreUint256PreservesValue)
+{
+    // DC: the per-share merged submit feeds the scrypt pow_hash (dgb u256) to
+    // try_submit_merged_blocks as a core uint256. Pin the bridge by VALUE:
+    // limb[0] is least significant, so the big-endian GetHex must read the
+    // limbs back-to-front, and small values must round-trip numerically.
+    EXPECT_EQ(dgb::coin::to_core_uint256(dgb::coin::u256{}), uint256::ZERO);
+    EXPECT_EQ(dgb::coin::to_core_uint256(dgb::coin::u256(1)), uint256::ONE);
+    EXPECT_EQ(dgb::coin::to_core_uint256(dgb::coin::u256(0x0123456789abcdefULL)).GetLow64(),
+              0x0123456789abcdefULL);
+
+    dgb::coin::u256 v;
+    v.limb[0] = 0x0011223344556677ULL;
+    v.limb[1] = 0x8899aabbccddeeffULL;
+    v.limb[2] = 0x0102030405060708ULL;
+    v.limb[3] = 0xf0e0d0c0b0a09080ULL;
+    EXPECT_EQ(dgb::coin::to_core_uint256(v).GetHex(),
+              "f0e0d0c0b0a09080"
+              "0102030405060708"
+              "8899aabbccddeeff"
+              "0011223344556677");
+}
+
+TEST(DgbWorkSource, U256ToCoreUint256PreservesOrder)
+{
+    // The aux gate is `parent_hash <= aux_target`. The bridge must preserve
+    // ordering across limb boundaries, where a word-swap bug would flip it.
+    dgb::coin::u256 lo, hi;
+    lo.limb[0] = ~0ULL; lo.limb[1] = ~0ULL; lo.limb[2] = ~0ULL; lo.limb[3] = 0;
+    hi.limb[3] = 1;  // 2^192 > lo
+    const uint256 clo = dgb::coin::to_core_uint256(lo);
+    const uint256 chi = dgb::coin::to_core_uint256(hi);
+    EXPECT_TRUE(clo < chi);
+    EXPECT_TRUE(clo <= chi);
+    EXPECT_FALSE(chi <= clo);
+    EXPECT_TRUE(chi <= chi);
 }
 
 TEST(DgbWorkSource, BestShareHashFnEmptyUntilWired)
