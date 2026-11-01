@@ -39,6 +39,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         serve_from_storage_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        stale_submit_classifier_test.cpp
         stratum_merkle_branch_test.cpp
         submit_flood_gate_test.cpp
         template_capture_test.cpp
