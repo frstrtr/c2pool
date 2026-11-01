@@ -2521,6 +2521,16 @@ nlohmann::json MiningInterface::getinfo(const std::string& request_id)
         if (!m_cached_template.is_null() && m_cached_template.contains("height"))
             block_height = m_cached_template["height"].get<uint64_t>();
     }
+    // #891 coin-side: coin targets that drive their own work pipeline (DASH)
+    // never fill m_cached_template, so "blocks" stayed 0 on a node synced to
+    // the mainnet tip while networkhashps was already live. Fall back to the
+    // same coin-work summary /local_stats reads for block_value_height. Called
+    // after the block above so m_work_mutex is not held across the hook.
+    if (block_height == 0 && m_coin_work_fn) {
+        auto cw = m_coin_work_fn();
+        if (cw.valid)
+            block_height = cw.height;
+    }
     // Real network hashrate -- same source as /global_rate (net_difficulty
     // * 2^32 / block_period, template fallback). Previously left at 0.0,
     // which made the dashboard graphs/stats tabs report networkhashps:0
