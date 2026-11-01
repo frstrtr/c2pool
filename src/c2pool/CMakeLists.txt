@@ -753,6 +753,12 @@ target_link_libraries(coin_peer_rearm_kat c2pool_payout c2pool_merged_mining c2p
 target_link_libraries(coin_peer_rearm_kat nlohmann_json::nlohmann_json)
 add_test(NAME coin_peer_rearm_kat COMMAND coin_peer_rearm_kat)
 
+# ── KAT: LTC/DOGE coin-daemon net identity incl. --regtest (G3a node-in-the-loop) ──
+# ltc_doge_chain_net.hpp is pure policy (standard library only) -> links nothing.
+add_executable(ltc_doge_regtest_net_kat ltc_doge_regtest_net_kat.cpp)
+target_include_directories(ltc_doge_regtest_net_kat PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME ltc_doge_regtest_net_kat COMMAND ltc_doge_regtest_net_kat)
+
 # ── KAT: PR-0 ARRIVAL INSTRUMENTATION schema (dashd-cut coin-P2P foundation) ──
 # Locks the OffEmbeddedWindow arrival/fold split invariant
 # (arrival_ms + fold_ms == window_ms) and the per-peer per-datum-class
