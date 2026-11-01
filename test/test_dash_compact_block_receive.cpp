@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/compact_block_receive.hpp>
+#include <impl/dash/coin/compact_negotiation.hpp>
 #include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/vendor/blockencodings.hpp>
 #include <impl/dash/coin/block.hpp>
@@ -225,4 +226,81 @@ TEST(DashCompactReceive, DeserializedCmpctblockReassembles) {
     auto done = rx.on_blocktxn(kPeer, answer(vd.request, b));
     ASSERT_EQ(done.kind, Kind::Complete) << done.reason;
     expect_same(done.block, b);
+}
+
+// ── #968a slice 2: sendcmpct negotiation ───────────────────────────────────
+//
+// Revert-red arms: drop the version != 1 guard in on_sendcmpct
+// (Version2IsIgnored and Version2DoesNotOverwriteVersion1 go red), drop the
+// SHORT_IDS_BLOCKS_VERSION gate in sendcmpct_on_verack (VerackBelowShortIds...
+// goes red), or send announce=true (VerackSendsLowBandwidthVersion1 goes red).
+
+TEST(DashCompactNegotiation, VerackSendsLowBandwidthVersion1) {
+    auto sc = dash::coin::sendcmpct_on_verack(70230, 70230);
+    ASSERT_TRUE(sc.has_value());
+    EXPECT_FALSE(sc->announce);
+    EXPECT_EQ(sc->version, 1u);
+}
+
+TEST(DashCompactNegotiation, VerackUsesCommonVersion) {
+    // our 70230 vs peer exactly at the gate: common = 70209, send.
+    EXPECT_TRUE(dash::coin::sendcmpct_on_verack(70230, 70209).has_value());
+    // our side below the gate wins even if the peer is new.
+    EXPECT_FALSE(dash::coin::sendcmpct_on_verack(70208, 70230).has_value());
+}
+
+TEST(DashCompactNegotiation, VerackBelowShortIdsVersionSendsNothing) {
+    EXPECT_FALSE(dash::coin::sendcmpct_on_verack(70230, 70208).has_value());
+}
+
+TEST(DashCompactNegotiation, UnknownPeerHasNoCompactState) {
+    dash::coin::CompactPeerNegotiation n;
+    EXPECT_FALSE(n.supports_compact("a"));
+    EXPECT_FALSE(n.prefers_compact_announce("a"));
+    EXPECT_EQ(n.peer_count(), 0u);
+}
+
+TEST(DashCompactNegotiation, Version1LowBandwidthIsRecorded) {
+    dash::coin::CompactPeerNegotiation n;
+    EXPECT_TRUE(n.on_sendcmpct("a", false, 1));
+    EXPECT_TRUE(n.supports_compact("a"));
+    EXPECT_TRUE(n.state("a").provides_header_and_ids);
+    EXPECT_FALSE(n.prefers_compact_announce("a"));
+}
+
+TEST(DashCompactNegotiation, AnnounceFlagFollowsLatestMessage) {
+    dash::coin::CompactPeerNegotiation n;
+    ASSERT_TRUE(n.on_sendcmpct("a", true, 1));
+    EXPECT_TRUE(n.prefers_compact_announce("a"));
+    ASSERT_TRUE(n.on_sendcmpct("a", false, 1));
+    EXPECT_FALSE(n.prefers_compact_announce("a"));
+    EXPECT_TRUE(n.supports_compact("a"));   // latched, not cleared by announce=false
+}
+
+TEST(DashCompactNegotiation, Version2IsIgnored) {
+    dash::coin::CompactPeerNegotiation n;
+    EXPECT_FALSE(n.on_sendcmpct("a", true, 2));
+    EXPECT_FALSE(n.supports_compact("a"));
+    EXPECT_FALSE(n.prefers_compact_announce("a"));
+    EXPECT_EQ(n.peer_count(), 0u);
+}
+
+TEST(DashCompactNegotiation, Version2DoesNotOverwriteVersion1) {
+    dash::coin::CompactPeerNegotiation n;
+    ASSERT_TRUE(n.on_sendcmpct("a", false, 1));
+    EXPECT_FALSE(n.on_sendcmpct("a", true, 2));
+    EXPECT_TRUE(n.supports_compact("a"));
+    EXPECT_FALSE(n.prefers_compact_announce("a"));
+}
+
+TEST(DashCompactNegotiation, PeersAreIndependentAndDisconnectClears) {
+    dash::coin::CompactPeerNegotiation n;
+    ASSERT_TRUE(n.on_sendcmpct("a", true, 1));
+    ASSERT_TRUE(n.on_sendcmpct("b", false, 1));
+    EXPECT_TRUE(n.prefers_compact_announce("a"));
+    EXPECT_FALSE(n.prefers_compact_announce("b"));
+    n.on_disconnect("a");
+    EXPECT_FALSE(n.supports_compact("a"));
+    EXPECT_TRUE(n.supports_compact("b"));
+    EXPECT_EQ(n.peer_count(), 1u);
 }

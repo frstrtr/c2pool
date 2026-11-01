@@ -96,6 +96,7 @@
 #include <impl/dash/coin/getmnlistd_tracker.hpp> // #154: getmnlistd slot tracker (fixed 10s per-slot re-ask, 3 boolean tiers, capability filter; flag default-OFF)
 #include <impl/dash/coin/coin_peer_manager.hpp> // PR-2: peer_network_group() for distinct-netgroup racing
 #include <impl/dash/coin/compact_block_receive.hpp>      // #968a: BIP152 cmpctblock/blocktxn receive state machine
+#include <impl/dash/coin/compact_negotiation.hpp>        // #968a slice 2: BIP152 sendcmpct negotiation
 #include <impl/dash/coin/proactive_rotation_policy.hpp>  // PR-3: LOW-RATE proactive rotation decision helpers (pure, shared with the KAT)
 
 #include <algorithm>
@@ -803,6 +804,9 @@ private:
     // non-prefilled tx is fetched by getblocktxn. The bound is dashcore's
     // MaxBlockSize(true) / MIN_TRANSACTION_SIZE = 2'000'000 / 10.
     dash::coin::CompactBlockReceiver m_cmpct_rx{nullptr, 200000};
+    // #968a slice 2: per-peer sendcmpct state (dashcore fProvidesHeaderAndIDs /
+    // fPreferHeaderAndIDs / fSupportsDesiredCmpctVersion).
+    dash::coin::CompactPeerNegotiation m_cmpct_neg;
     // dashd TipMayBeStale/SetTryNewOutboundPeer analog for the STATEFUL leg: a
     // bridging getmnlistd (fold / ondemand-mnlist) that the mn-ckpt lane has
     // found outstanding past its wall-clock re-ask grace. While set,
@@ -3083,6 +3087,7 @@ private:
         // ever consulted; harmless when the flag is OFF.
         m_getmnlistd_tracker.on_disconnect(key);
         m_cmpct_rx.on_disconnect(key);
+        m_cmpct_neg.on_disconnect(key);
 
         // Erase LAST: the unique_ptr destructor tears the Connection (and its
         // socket) down, so nothing may hold p afterwards.
@@ -3900,6 +3905,16 @@ private:
         // N-witness refinement of the assume-active seed.
         auto msg_getsporks = message_getsporks::make_raw();
         p->write(msg_getsporks);
+
+        // #968a slice 2: dashcore VERACK sends sendcmpct(false, 1) once the
+        // common version reaches SHORT_IDS_BLOCKS_VERSION. Low-bandwidth mode:
+        // the peer still announces by inv/headers and never pushes cmpctblock
+        // unasked, so block fetch is unchanged.
+        if (auto sc = dash::coin::sendcmpct_on_verack(PROTOCOL_VERSION, p->version))
+        {
+            auto msg_sendcmpct = message_sendcmpct::make_raw(sc->announce, sc->version);
+            p->write(msg_sendcmpct);
+        }
 
         // E-SUPERBLOCK GOVSYNC PRIME (routing class 3), mirroring getsporks:
         // ask THIS peer for the full governance object set exactly once, so a
@@ -4752,8 +4767,12 @@ private:
 
     ADD_P2P_HANDLER(sendcmpct)
     {
-        LOG_DEBUG_COIND << "[" << m_chain_label << "] peer sendcmpct v"
-                        << msg->m_version << " (compact-block lane is a later slice)";
+        PeerSession* p = m_active;
+        if (!p) return;
+        const bool ok = m_cmpct_neg.on_sendcmpct(p->key, msg->m_announce, msg->m_version);
+        LOG_DEBUG_COIND << "[" << m_chain_label << "] peer " << p->key << " sendcmpct v"
+                        << msg->m_version << " announce=" << msg->m_announce
+                        << (ok ? "" : " (ignored: only version 1 is understood)");
     }
 
     ADD_P2P_HANDLER(feefilter)
@@ -4773,9 +4792,10 @@ private:
     ADD_P2P_HANDLER(getqrinfo)     { /* we don't serve rotation info either */ }
     ADD_P2P_HANDLER(getblocktxn)   { /* we never announce compact blocks */ }
 
-    // #968a: BIP 152 receive. We do not send sendcmpct yet, so a peer only
-    // sends these if it pushes compact blocks unasked; the path is live for
-    // that case and for the later opt-in announce slice.
+    // #968a: BIP 152 receive. We send sendcmpct in low-bandwidth mode only
+    // (announce=false), so a peer only sends these if it pushes compact blocks
+    // unasked; the path is live for that case and for the later high-bandwidth
+    // opt-in slice.
     ADD_P2P_HANDLER(cmpctblock)
     {
         PeerSession* p = m_active;
