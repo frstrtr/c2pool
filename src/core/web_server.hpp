@@ -142,10 +142,29 @@ public:
     MiningInterface(bool testnet = false, std::shared_ptr<IMiningNode> node = nullptr, Blockchain blockchain = Blockchain::LITECOIN);
     ~MiningInterface();
 
+    /// Stop and join the background threads (the PPLNS pre-computation, the
+    /// graph-view seed). Their work runs the owner's callbacks: the owner
+    /// calls this before those go away (main_ltc's ordered shutdown). Also
+    /// run by the destructor; idempotent.
+    void stop_background();
+
     // Core mining methods that miners expect
     nlohmann::json getwork(const std::string& request_id = "");
     nlohmann::json submitwork(const std::string& nonce, const std::string& header, const std::string& mix, const std::string& request_id = "");
+    // params [{"chain": "<aux symbol>"}] (e.g. "DOGE"): the merged chain's
+    // current block template instead (MergedMiningManager::aux_template_json),
+    // read-only, for local cross-checks; over JSON-RPC only to a direct local
+    // request (t_direct_local_request). Any other chain: the node's own.
     nlohmann::json getblocktemplate(const nlohmann::json& params = nlohmann::json::array(), const std::string& request_id = "");
+    // Set by the HTTP session around a JSON-RPC call from a direct local
+    // client (loopback, no proxy headers).
+    // Inline with its constant initializer: every TU accesses it directly,
+    // with no thread_local wrapper (_ZTW/_ZTH). Through the wrapper, GCC 13's
+    // -fsanitize=null check read the flags of an `add x@gottpoff(%rip)` that
+    // ld relaxes to a flagless `lea`, and UBSan reported a store to null.
+    inline static thread_local bool t_direct_local_request = false;
+    // The aux chain a getblocktemplate params names, if not the node's own.
+    std::optional<std::string> aux_template_chain(const nlohmann::json& params) const;
     nlohmann::json submitblock(const std::string& hex_data, const std::string& request_id = "");
 
     // Recent-won-block dedup (#886). Keyed on the BLOCK HASH (SHA256d of the
@@ -561,8 +580,12 @@ public:
         std::vector<uint256> coinbase_merkle_branches;
         std::vector<unsigned char> coinbase_script;
         std::string coinbase_hex;
+        uint256 payout_basis;   // best share the merged payouts were split at (null: not sharechain)
     };
     const std::vector<CachedMergedHeaderInfo>& get_last_merged_header_infos() const { return m_last_merged_header_infos; }
+    /// Jobs built without the merged block because its payouts were split at
+    /// another best share than the job's prev share.
+    uint64_t get_merged_basis_mismatch_jobs() const { return m_merged_basis_mismatch_jobs.load(); }
     double get_local_hashrate() const { return m_cached_pool_hashrate; }
     void set_local_hashrate(double hr) { m_cached_pool_hashrate = hr; }
     double get_network_difficulty() const { return m_network_difficulty.load(); }
@@ -923,6 +946,18 @@ public:
     //   mweb_hold_seconds      — total time spent holding the previous template
     uint64_t get_aux_checks() const { return m_aux_checks.load(std::memory_order_relaxed); }
     uint64_t get_mweb_refusals() const { return m_mweb_block_refusals.load(std::memory_order_relaxed); }
+
+    // Template budget (LTC): the weight a template must leave free for the
+    // coinbase. The last coinbase's weight (the largest built for the
+    // current template) plus kCoinbaseWeightMargin, which also covers the
+    // header, the tx count, the HogEx appended after selection, extranonces
+    // and a few new payees; before the first coinbase, the largest one
+    // max_coinbase_outputs allows. The embedded template builder selects
+    // transactions within MAX_BLOCK_WEIGHT minus this.
+    static constexpr uint32_t kCoinbaseWeightMargin = 4000;
+    static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
+    uint32_t coinbase_weight_reserve() const;
+    static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -958,6 +993,12 @@ public:
     void set_coin_metrics_fn(coin_metrics_fn_t fn) {
         std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
         m_coin_metrics_fn = std::move(fn);
+    }
+    // The hook set so far, so a later coin (embedded DOGE) can add its keys
+    // next to it.
+    coin_metrics_fn_t coin_metrics_fn() const {
+        std::lock_guard<std::mutex> lock(m_coin_metrics_mutex);
+        return m_coin_metrics_fn;
     }
     // Return the P2Pool witness commitment hex (computed in refresh_work)
     std::string get_cached_witness_commitment() const;
@@ -1469,6 +1510,10 @@ private:
     void note_mweb_template_refusal(const std::string& why);
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
+    // A coinbase was built (refresh_work: fresh_template; per connection:
+    // raises the mark): records its weight for coinbase_weight_reserve().
+    void note_coinbase_built(const std::string& coinb1, const std::string& coinb2, bool segwit,
+                             size_t branch_len, bool fresh_template) const;
     void close_mweb_hold_window(const char* reason);
     // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
     // (height, code).
@@ -1646,7 +1691,8 @@ private:
     std::mutex m_pplns_cache_mutex;
     std::unordered_map<std::string, nlohmann::json> m_pplns_per_tip;
     std::atomic<bool> m_pplns_precompute_done{false};
-    std::atomic<bool> m_pplns_precompute_started{false};  // prevents re-spawn after detach
+    std::atomic<bool> m_pplns_precompute_started{false};  // spawned once
+    std::atomic<bool> m_pplns_precompute_stop{false};     // stop_background(): end the thread
     // Cached full merged payouts (LTC + DOGE) — updated by cache_pplns_at_tip()
     mutable std::mutex m_merged_payouts_mutex;
     nlohmann::json m_cached_merged_payouts;
@@ -1686,6 +1732,7 @@ private:
     uint256 m_cached_witness_root;  // raw wtxid merkle root
     std::vector<uint8_t> m_cached_mm_commitment;
     mutable std::vector<CachedMergedHeaderInfo> m_last_merged_header_infos;
+    mutable std::atomic<uint64_t> m_merged_basis_mismatch_jobs{0};
     uint256 m_cached_the_state_root;  // THE state root for sharechain anchoring
     std::string m_cached_mweb;  // MWEB extension data from GBT (Litecoin)
     bool m_cached_mweb_active{false};  // template rules named MWEB (Litecoin)
@@ -1717,6 +1764,10 @@ private:
     mutable std::mutex m_template_tx_mutex;
     TemplateTxRefusalLog m_template_tx_refusals;                     // ingress
     mutable std::map<std::string, uint64_t> m_mweb_refusals_by_code; // assembly (const path)
+    // Weight of the largest coinbase built for the current template (its own
+    // and the per-connection ones built on it): the next template leaves room
+    // for it (coinbase_weight_reserve). 0 = none built yet.
+    mutable std::atomic<uint32_t> m_coinbase_weight{0};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;
