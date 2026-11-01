@@ -521,6 +521,9 @@ C2P_PARAM("utility.dump_doge_schedule_anchors", Meta, PATH, COMPILE_TIME_READONL
 C2P_PARAM("utility.utxo_digest", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print the digest of the UTXO LevelDB at DIR, then exit")
   C2P_ALIAS("utility.utxo_digest", BIN_LTC, "--utxo-digest", VALUE)
 
+C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print gettxoutsetinfo (Dogecoin Core 1.14.9 GetUTXOStats) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_stats", BIN_LTC, "--utxo-stats", VALUE)
+
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)

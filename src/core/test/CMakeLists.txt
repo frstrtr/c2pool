@@ -187,6 +187,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         utxo_set_hash_test.cpp
+        utxo_stats_test.cpp
         utxo_snapshot_test.cpp
         utxo_tools_test.cpp
         version_gate_test.cpp
