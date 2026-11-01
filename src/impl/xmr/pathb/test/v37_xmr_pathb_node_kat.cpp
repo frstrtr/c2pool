@@ -398,6 +398,15 @@ struct PathbNodeTestAccess {
         if (const auto it = n.paused_.find(peer); it != n.paused_.end()) return it->second.work;
         return std::nullopt;
     }
+    // The joiner excludes `server` (as an attempt ending Header does).
+    static void exclude_server(PathbNode& n, std::uint64_t server) {
+        AttemptQueue::Pair p;
+        p.server = server;
+        AttemptReport r;
+        r.end = AttemptEnd::Header;
+        r.server = server;
+        (void)n.joiner_->apply(Joiner::Attempted{p, std::move(r)});
+    }
     // The comparison of the request in flight to `peer` keeps no ids above F (the state of an F deep when fixed).
     static bool fold_forget_ids(PathbNode& n, std::uint64_t peer) {
         const auto it = n.header_req_.find(peer);
@@ -3195,9 +3204,10 @@ void prune_hold() {
 }
 
 // ---------------------------------------------------------------------------
-// below: a full node holding its chain from position 0 offers no candidate on a HELLO;
-// once it pruned, a heavier branch forking below its first retained record (fork 200) is a candidate without the
-// header-work condition, the attempt completes and rule (4) replaces A.
+// below: a full node holding its chain from position 0 offers no candidate on a HELLO; once it pruned (no joined x1) it
+// offers none either; its catch-up's reply with no header from its root offers B's tip as a root-evidence pair: the
+// fork (200) lies below its first retained record, so the candidate is in scope, the attempt completes and rule (4)
+// replaces A.
 void below() {
     JoinNet net(900);
     const std::uint64_t L = 6000, f = 200;
@@ -3222,7 +3232,10 @@ void below() {
     check(r.root > f && h[fa].tree().genesis().pos == r.root,
           "below: the full node pruned (root " + std::to_string(r.root) + "); the fork " + std::to_string(f) + " lies below it");
     (void)h.hello(fa, fbn);
-    check(h[fa].joiner().queue().size() == 1, "below: B's tip, forking below what A holds, is a candidate");
+    check(h[fa].joiner().queue().size() == 0, "below: a pruned full node offers no candidate on a HELLO");
+    const bool offered = h[fa].offer_empty_store_tip(fbn, /*root_evidence=*/true);
+    check(offered && h[fa].joiner().queue().size() == 1 && h[fa].joiner().queue().pairs().front().root_evidence,
+          "below: the root-evidence offer: B's tip, forking below what A holds, is a candidate");
     h.mon_tip = h_pos(L + 200) + 1;
     const pb::JoinStep st = h[fa].run_join();
     check(st.report && st.report->end == pb::AttemptEnd::Completed && st.sw.replaced && st.switched
@@ -10057,7 +10070,8 @@ void revnotcarrier() {
 
 // A relay node in manual mode on the harness's clock over a node loaded from a copy of `from` (the copy in h.kvs).
 KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const pb::PathbNodeConfig& cfg,
-                          const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr) {
+                          const std::function<void(pb::PathbRelayOptions&)>& tweak = nullptr,
+                          const std::function<void(pb::PathbNodeIo&)>& io_tweak = nullptr) {
     KatRelay k;
     k.links = std::make_unique<FakeLinks>();
     k.links->wire = &w;
@@ -10081,7 +10095,9 @@ KatRelay kat_relay_loaded(Harness& h, FakeWire& w, const MemoryKv& from, const p
     in.journal_depth = cfg.journal_depth;
     pb::LoadResult lr = pb::pathb_load(kv, h.net.pool_id, h.net.rules_g, in);
     if (!lr.state) throw std::runtime_error("kat_relay_loaded: the store does not load");
-    h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, k.relay->bind_io(h.io(k.node)), std::move(*lr.state), &kv));
+    pb::PathbNodeIo io = k.relay->bind_io(h.io(k.node));
+    if (io_tweak) io_tweak(io);
+    h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), std::move(*lr.state), &kv));
     k.relay->attach(*h.nodes.back());
     k.relay->set_drive([&w] { return w.step(); });
     std::string why;
@@ -12917,16 +12933,18 @@ void deepband() {
     }
 }
 
-// deeppruned (S1.5, E-38; F-3 as at master, D48: a pruned full node offers an unheld HELLO tip): deepband's shape at a
-// pruned C. A and C (journal depth 20, body_keep 5) share S positions (F = S); C, cut off, mines d of its own, A d + 8
-// (heavier) or d - 4 (lighter: C's headers and carriers do not reach A); C prunes (its tree's root above 0), then
-// reconnects; its join worker is stepped every second for 60 s.
+// deeppruned (S1.5, E-38; a pruned full node offers no HELLO tip; its catch-up's reply with no header from its root
+// offers the peer's tip as a root-evidence pair): deepband's shape at a pruned C. A and C (journal depth 20, body_keep 5)
+// share S positions (F = S); C, cut off, mines d of its own, A d + 8 (heavier) or d - 4 (lighter: C's headers and
+// carriers do not reach A); C prunes (its tree's root above 0), then reconnects; its join worker is stepped every
+// second for 60 s.
 //   base - 1 (d 21): one attempt, Completed, a joiner switch;
-//   base (d 20), base + 1 (d 19): one attempt OutOfScope (0 tokens), a journal switch;
-//   lighter, root <= F < base (d 24, A d - 4): one attempt, Completed, C's chain kept;
+//   base (d 20), base + 1 (d 19): a journal switch in phase 1; 0 attempts;
+//   lighter, root <= F < base (d 24, A d - 4): Keep at `stop`; 0 attempts;
 //   F < root (d 1,200): one attempt, Completed, a joiner switch.
 struct DeepPruned {
     bool setup = false, healed = false, kept = false;
+    bool catchup_open = true, stop_indexed = false;  // the catch-up toward A; A's tip header indexed (the comparison read it)
     std::uint64_t f = 0, root = 0, base = 0, sw = 0, jsw = 0, strikes = 0;
     int attempts = 0, oos = 0, completed = 0;
     std::string ends;
@@ -12991,6 +13009,8 @@ DeepPruned deep_pruned(std::uint64_t shared, std::uint64_t d_c, std::uint64_t d_
         }
     }
     w.edit = nullptr;
+    o.catchup_open = c.relay->catchup_view(w.id(1, 0)).has_value();
+    o.stop_indexed = !h[c.node].headers().variants(a_tip0).empty();
     o.healed = h[c.node].tree().best().id == a_tip0;
     o.kept = h[c.node].tree().best().id == c_tip0;
     o.sw = h[c.node].switch_counts().switches;
@@ -13015,23 +13035,181 @@ void deeppruned() {
                           Case{"lighter", 1175, 24, 20}, Case{"F < root", 40, 1200, 1208}}) {
         const DeepPruned o = deep_pruned(cs.shared, cs.d_c, cs.d_a, std::string(cs.name) == "lighter");
         const std::string tag = std::string("deeppruned ") + cs.name;
+        const std::string n0 = cs.name;
         std::printf("  %s: setup %d; F %llu, root %llu, base %llu; attempts %d (OutOfScope %d, Completed %d); on A's tip %d, "
                     "kept %d; switches %llu, joiner %llu; strikes %llu\n",
                     tag.c_str(), o.setup ? 1 : 0, (unsigned long long)o.f, (unsigned long long)o.root,
                     (unsigned long long)o.base, o.attempts, o.oos, o.completed, o.healed ? 1 : 0, o.kept ? 1 : 0,
                     (unsigned long long)o.sw, (unsigned long long)o.jsw, (unsigned long long)o.strikes);
+        if (n0 == "lighter")
+            std::printf("  %s: the catch-up toward A ended %d; A's tip header read (the reply carrying stop) %d\n", tag.c_str(),
+                        o.catchup_open ? 0 : 1, o.stop_indexed ? 1 : 0);
         check(o.setup, tag + ": setup (C pruned: its tree's root above 0)");
         const std::string n = cs.name;
         if (n == "base - 1" || n == "F < root")
             check(o.healed && o.attempts == 1 && o.completed == 1 && o.jsw >= 1 && (n != "F < root" || o.f < o.root),
                   tag + ": one attempt, Completed, a joiner switch");
         else if (n == "lighter")
-            check(o.kept && o.attempts == 1 && o.completed == 1 && o.jsw == 0 && o.base > o.f && o.root <= o.f,
-                  tag + ": root <= F < base, lighter: one attempt, Completed, C's chain kept");
+            check(o.kept && o.attempts == 0 && o.jsw == 0 && o.base > o.f && o.root <= o.f && !o.catchup_open && o.stop_indexed,
+                  tag + ": root <= F < base, lighter: Keep at stop; 0 attempts");
         else
-            check(o.healed && o.attempts == 1 && o.oos == 1 && o.strikes == 0 && o.jsw == 0 && o.sw >= 1,
-                  tag + ": one attempt OutOfScope (0 tokens), a journal switch");
+            check(o.healed && o.attempts == 0 && o.strikes == 0 && o.jsw == 0 && o.sw >= 1,
+                  tag + ": a journal switch in phase 1; 0 attempts");
     }
+}
+
+// A pruned store not caught up: A and D share `shared` positions; D, cut off, mines `d_c` of its own, A `d_a`; a store
+// not caught up (journal depth 20, body_keep 5) walks D's chain and prunes; it restarts from its store as C2 (wire 2).
+// `hide_pos` (C2's view): the P_r of A's carrier at that position hidden (0: none).
+struct PrunedRestart {
+    KatNet net;
+    Harness h;
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    HiddenRows hrows;
+    pb::FollowerBranchView hview;
+    KatRelay a, d, c2;
+    bool ok = true;
+    std::uint64_t root = 0;
+    pb::Hash32 a_tip{};
+    PrunedRestart(std::uint64_t shared, std::uint64_t d_c, std::uint64_t d_a, std::uint64_t hide_pos)
+        : h(net), hrows(net.rows, hidden), hview(hrows) {
+        a = kat_relay(h, w, table0(net), true);  // wire 0
+        d = kat_relay(h, w, table0(net), true);  // wire 1
+        w.connect(0, 1);
+        w.run();
+        std::uint32_t nonce = 69000;
+        for (std::uint64_t i = 0; i < shared && ok; ++i) {
+            if (i % 12 == 0) h.tick_monero();
+            ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+        }
+        ok = ok && h[d.node].tree().best().id == h[a.node].tree().best().id;
+        w.links[1]->disconnect(w.id(1, 0));
+        w.run();
+        for (std::uint64_t i = 0; i < d_c && ok; ++i) {
+            if (i % 12 == 0) h.tick_monero();
+            ok = mine_on(h, w, d.node, static_cast<std::size_t>(i % 5), nonce++);
+        }
+        for (std::uint64_t i = 0; i < d_a && ok; ++i) {
+            if (i % 12 == 0) h.tick_monero();
+            ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+        }
+        a_tip = h[a.node].tree().best().id;
+        pb::PathbNodeConfig cfg = h.config(table0(net), false, 20);
+        cfg.body_keep = 5;
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        MemoryKv& kvw = *h.kvs.back();
+        const std::size_t jw = h.nodes.size();
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, h.io(jw), &kvw));
+        for (std::uint64_t x = 1; x <= h[d.node].tree().best().pos; ++x)
+            if (const std::optional<pb::Hash32> id = h[d.node].store().best_at(x))
+                (void)h[jw].on_carrier(77, *pb::encode_fc_carrier(0, *h[d.node].bodies().get(*id), 16));
+        h.q.clear();
+        ok = ok && h[jw].tree().best().id == h[d.node].tree().best().id && !h[jw].caught_up();
+        (void)h[jw].prune(h.now);
+        if (hide_pos != 0)
+            if (const std::optional<pb::Hash32> id = h[a.node].store().best_at(hide_pos))
+                hidden.insert(h[a.node].bodies().get(*id)->own.blob.prev_id);
+        c2 = kat_relay_loaded(h, w, kvw, cfg, [](pb::PathbRelayOptions& r) { r.join_min_peers = 1; },
+                              hide_blocks(hidden, hview));
+        root = h[c2.node].tree().genesis().pos;
+        ok = ok && root > 0 && h[c2.node].pruned_full_node() && !h[c2.node].caught_up();
+    }
+    PrunedRestart(const PrunedRestart&) = delete;
+    PrunedRestart& operator=(const PrunedRestart&) = delete;
+    // One second: A's and C2's ticks, the wire; C2's join worker when `join`.
+    void second(bool join) {
+        h.now += 1;
+        a.relay->tick();
+        c2.relay->tick();
+        a.relay->pump();
+        c2.relay->pump();
+        for (int m = 0; m < 400 && w.step(); ++m) {
+        }
+        if (join)
+            for (int m = 0; m < 4; ++m)
+                if (const std::optional<pb::JoinStep> st = c2.relay->join_step(); !st) break;
+        w.run();
+    }
+};
+
+// rootevid (a pruned full node's reply with no header from its root; a store not caught up): A and D share 40; D mines
+// 1,200 of its own, A 1,208; C2 walked D's chain, pruned (its root above the fork 40). C2 meets A: its catch-up's request from its
+// lowest held position gets no header: the root-evidence line (that position), A's tip a root-evidence pair, the
+// hand-over recorded (no caught-up line at the reply); the attempt Completed, adopted; then the caught-up line.
+void rootevid() {
+    PrunedRestart r(40, 1200, 1208, 0);
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    r.w.connect(0, 2);
+    r.w.run();
+    const std::uint64_t pa = r.w.id(2, 0);
+    const auto re_lines = [&] {
+        std::size_t n = 0;
+        for (const std::string& l : lines[r.c2.node])
+            if (l.find("(root evidence)") != std::string::npos) ++n;
+        return n;
+    };
+    for (int k = 0; k < 10 && re_lines() == 0; ++k) r.second(false);
+    const std::string want = "relay: catch-up from peer " + std::to_string(pa) + ": no header from the lowest held position " +
+                             std::to_string(r.root) + ": its tip offered to the joiner (root evidence)";
+    bool exact = false, marked = false;
+    for (const std::string& l : lines[r.c2.node]) exact = exact || l == want;
+    for (const pb::AttemptQueue::Pair& q : r.h[r.c2.node].joiner().queue().pairs())
+        if (q.candidate == r.a_tip && q.server == pa) marked = q.root_evidence;
+    const std::size_t caught_at_reply = caught_of(lines, r.c2.node).size();
+    const bool handed = !r.c2.relay->catchup_view(pa).has_value() && r.h[r.c2.node].pair_lives(r.a_tip, pa);
+    for (int k = 0; k < 30 && !r.h[r.c2.node].holds_tip(r.a_tip); ++k) r.second(true);
+    for (int k = 0; k < 5; ++k) r.second(true);
+    int attempts = 0, completed = 0;
+    for (const std::string& l : lines[r.c2.node])
+        if (l.find("relay: join attempt at peer") != std::string::npos) {
+            ++attempts;
+            if (l.find("Completed") != std::string::npos && l.find("adopted") != std::string::npos) ++completed;
+        }
+    const std::size_t caught_end = caught_of(lines, r.c2.node).size();
+    g_relay_lines = nullptr;
+    std::printf("  rootevid: setup %d (root %llu); root-evidence lines %zu, the text exact %d; the pair marked %d; at the "
+                "reply: handed over %d, caught-up lines %zu; attempts %d (Completed, adopted %d); C2 on A's tip %d; "
+                "caught-up lines %zu\n",
+                r.ok ? 1 : 0, (unsigned long long)r.root, re_lines(), exact ? 1 : 0, marked ? 1 : 0, handed ? 1 : 0,
+                caught_at_reply, attempts, completed, r.h[r.c2.node].holds_tip(r.a_tip) ? 1 : 0, caught_end);
+    check(r.ok, "rootevid: setup (C2 a pruned full node, not caught up)");
+    check(re_lines() == 1 && exact && marked,
+          "rootevid: the reply with no header from C2's root: the root-evidence line; A's tip a root-evidence pair");
+    check(handed && caught_at_reply == 0, "rootevid: the hand-over recorded; no caught-up line at the reply");
+    check(attempts == 1 && completed == 1 && r.h[r.c2.node].holds_tip(r.a_tip) && caught_end == 1,
+          "rootevid: one attempt, Completed, adopted; then the caught-up line");
+}
+
+// fd1mark (a deferred catch-up step's offer at a pruned full node): A and D share 1,200; D mines 20 of its own, A 28;
+// C2 walked D's chain, pruned, the P_r of A's position 1,205 hidden at C2. C2's catch-up toward A defers on it past its
+// context's time: A's tip offered to the joiner as a root-evidence pair.
+void fd1mark() {
+    PrunedRestart r(1200, 20, 28, 1205);
+    r.w.connect(0, 2);
+    r.w.run();
+    const std::uint64_t pa = r.w.id(2, 0);
+    bool deferred = false;
+    for (int k = 0; k < 10 && !deferred; ++k) {
+        r.second(false);
+        deferred = r.c2.relay->header_deferred(pa, pb::PathbNode::HeaderOwner::CatchUp) > 0;
+    }
+    for (int k = 0; k < 130 && r.c2.relay->stats().catchup_join_offers.load() == 0; ++k) {
+        r.h.now += 4;
+        r.second(false);
+    }
+    bool queued = false, marked = false;
+    for (const pb::AttemptQueue::Pair& q : r.h[r.c2.node].joiner().queue().pairs())
+        if (q.candidate == r.a_tip && q.server == pa) {
+            queued = true;
+            marked = q.root_evidence;
+        }
+    std::printf("  fd1mark: setup %d (root %llu); deferred %d; offers %llu; A's tip queued %d, marked %d\n", r.ok ? 1 : 0,
+                (unsigned long long)r.root, deferred ? 1 : 0,
+                (unsigned long long)r.c2.relay->stats().catchup_join_offers.load(), queued ? 1 : 0, marked ? 1 : 0);
+    check(r.ok && deferred, "fd1mark: setup (C2 pruned, not caught up; its catch-up step deferred on a P_r)");
+    check(queued && marked, "fd1mark: the deferred step's offer at a pruned full node: A's tip a root-evidence pair");
 }
 
 // deepncu (E-193, E-194; the comparison at a store not caught up): A and D (launched) share 40 positions; D, cut off,
@@ -14020,10 +14198,12 @@ void adoptdefer() {
 
 // adoptresume (a paused comparison's resume, P-53 after the paused page's send, from its last checked header):
 //   adoption    : J (journal depth 4; the shared 2, then its own 10) asks C (the shared 2, then its own 10; the P_r of
-//                 C's 6th hidden at J, never shown): the comparison pauses on it (page 2), a catch-up deferral. A (the
-//                 shared 2, then its own 14) wins at J below J's base: JoinerPath, the attempt Completed, adopted. J's
-//                 catch-up toward C restarts: page 1, its continuation answered with no header (paused, no catch-up
-//                 deferral left); the next FC_GETHEADERS to C: from page 1's last header, P-53 after that page's send.
+//                 C's position 6 hidden at J): the comparison pauses on it (page 2), a catch-up deferral. The P_r is then
+//                 shown to J's view with no Monero tip event, the stand-in for an input that never arrives: the deferral
+//                 is never asked again. A (the shared 2, then its own 14) wins at J below J's base: JoinerPath, the
+//                 attempt Completed, adopted. J's catch-up toward C restarts: page 1, its continuation answered with no
+//                 header (paused, no catch-up deferral left); the next FC_GETHEADERS to C: from page 1's last header,
+//                 P-53 after that page's send.
 //   seed pruned : C (journal depth 20, body_keep 5) and A share 40; C mines 1,200 of its own, A 1,208; the P_r of A's 41st
 //                 (page 3 of C's comparison from its root) hidden at C. The comparison pauses on it; 15 s later C prunes
 //                 (the seed, its root, no longer held) and the P_r is shown: the deferral's re-ask is dropped (its seed
@@ -14140,7 +14320,8 @@ void adoptresume() {
                     "its send\n",
                     paused0 ? 1 : 0, adopted ? 1 : 0, paused1 ? 1 : 0, ungated ? 1 : 0, from_last ? 1 : 0,
                     (unsigned long long)gap);
-        check(ok && paused0 && adopted, "adoptresume adoption: setup (paused on a P_r never shown; A's tip adopted)");
+        check(ok && paused0 && adopted,
+              "adoptresume adoption: setup (paused on a hidden P_r, shown with no Monero tip event; A's tip adopted)");
         check(paused1 && ungated, "adoptresume adoption: the restarted comparison paused; no catch-up deferral");
         check(from_last && gap >= 11 && gap <= 12,
               "adoptresume adoption: resumed P-53 after the paused page's send, from its last checked header (" +
@@ -14243,6 +14424,152 @@ void adoptresume() {
               "page's from");
         check(jp == 1, "adoptresume seed pruned: the comparison reaches its decision (JoinerPath at 40)");
     }
+}
+
+// e185mark (an empty reply to a request from position 0 at a node that pruned meanwhile): A and C (journal depth 20,
+// body_keep 5) share 1,175 (F); C, cut off, mines 24 of its own, A 20 (lighter; C's headers and carriers do not reach
+// A). C reconnects unpruned; A's replies to C's catch-up carry no header (the locator walks to position 0); C prunes (its
+// first prune) before the reply to its request from position 0 arrives: A's tip a root-evidence pair; its attempt
+// checks the branch's work from F from C's records (its root <= F < its base): A lighter, OutOfScope, no token; C's
+// chain kept.
+void e185mark() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);  // wire 0
+    KatRelay c = kat_relay(h, w, table0(net), true, false, [](pb::PathbRelayOptions& r) { r.join_min_peers = 1; },
+                           [](pb::PathbNodeConfig& cf) {
+                               cf.journal_depth = 20;
+                               cf.body_keep = 5;
+                           });  // wire 1
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    std::uint32_t nonce = 70000;
+    for (std::uint64_t i = 0; i < 1175 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    ok = ok && h[c.node].tree().best().id == h[a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    for (std::uint64_t i = 0; i < 24 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, c.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    for (std::uint64_t i = 0; i < 20 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    const pb::Hash32 a_tip = h[a.node].tree().best().id, c_tip = h[c.node].tree().best().id;
+    const pb::Hash32 g0 = h[c.node].tree().genesis().id;
+    const bool unpruned = h[c.node].tree().genesis().pos == 0;
+    bool editing = true, asked0 = false;
+    std::vector<std::uint8_t> held;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        // A keeps its lighter chain: C's headers and carriers do not reach A
+        if (m.from == 1 && m.to == 0 && (m.f[0] == pb::kOpFcHeaders || m.f[0] == pb::kOpFcCarrier)) {
+            m.f.clear();
+            return;
+        }
+        if (!editing) return;
+        if (m.from == 1 && m.to == 0 && m.f[0] == pb::kOpFcGetHeaders) {
+            pb::GetHeaders q;
+            if (pb::decode_fc_getheaders(m.f, 0, q).ok() && q.from == g0) asked0 = true;
+            return;
+        }
+        if (m.from == 0 && m.to == 1 && m.f[0] == pb::kOpFcHeaders) {
+            if (asked0 && held.empty()) {  // the reply to the request from position 0: held back
+                held = empty_headers_frame();
+                m.f.clear();
+                return;
+            }
+            m.f = empty_headers_frame();
+        }
+    };
+    const auto step = [&](bool join) {
+        h.now += 1;
+        a.relay->tick();
+        c.relay->tick();
+        a.relay->pump();
+        c.relay->pump();
+        for (int m = 0; m < 400 && w.step(); ++m) {
+        }
+        if (join)
+            for (int m = 0; m < 4; ++m)
+                if (const std::optional<pb::JoinStep> st = c.relay->join_step(); !st) break;
+        w.run();
+    };
+    w.reconnect(0, 1);
+    w.run();
+    const std::uint64_t pa = w.id(1, 0);
+    for (int k = 0; k < 20 && held.empty(); ++k) step(false);
+    const pb::PathbNode::PruneReport pr = h[c.node].prune(h.now);
+    const bool pruned = h[c.node].pruned_full_node();
+    editing = false;
+    if (!held.empty()) {
+        w.links[1]->frame(pa, held);
+        c.relay->pump();
+        w.run();
+    }
+    bool marked = false;
+    for (const pb::AttemptQueue::Pair& q : h[c.node].joiner().queue().pairs())
+        if (q.candidate == a_tip && q.server == pa) marked = q.root_evidence;
+    for (int k = 0; k < 10; ++k) step(true);
+    int attempts = 0;
+    bool w_out = false;
+    std::string end;
+    for (const std::string& l : lines[c.node])
+        if (l.find("relay: join attempt at peer") != std::string::npos) {
+            ++attempts;
+            w_out = w_out || (l.find("OutOfScope") != std::string::npos && l.find("E-78's condition") != std::string::npos);
+            end = l.substr(l.find(':') + 2, 160);
+        }
+    w.edit = nullptr;
+    g_relay_lines = nullptr;
+    const bool kept = h[c.node].tree().best().id == c_tip;
+    const std::uint64_t strikes = c.relay->stats().strikes.load();
+    std::printf("  e185mark: setup %d; unpruned at the request from position 0 %d, pruned before its reply %d (root %llu); "
+                "A's tip marked %d; attempts %d, OutOfScope by the work check %d; strikes %llu; C's chain kept %d [%s]\n",
+                ok ? 1 : 0, unpruned ? 1 : 0, pruned ? 1 : 0, (unsigned long long)pr.root, marked ? 1 : 0, attempts,
+                w_out ? 1 : 0, (unsigned long long)strikes, kept ? 1 : 0, end.c_str());
+    check(ok && unpruned && !held.empty() && pruned,
+          "e185mark: setup (C unpruned at its request from position 0, pruned before the reply)");
+    check(marked, "e185mark: the reply with no header from position 0 at a node pruned meanwhile: A's tip a root-evidence pair");
+    check(attempts == 1 && w_out && strikes == 0 && kept,
+          "e185mark: its attempt checks the branch's work from F (A lighter): OutOfScope, no token; C's chain kept");
+}
+
+// rootevidneg (the offer at a pruned full node's root reply leaves no live pair): rootevid's shape, A excluded at C2's
+// joiner before C2 meets A: no root-evidence line; the catch-up ends by its reply (the caught-up line); no attempt.
+void rootevidneg() {
+    PrunedRestart r(40, 1200, 1208, 0);
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    r.w.connect(0, 2);
+    const std::uint64_t pa = r.w.id(2, 0);
+    pb::PathbNodeTestAccess::exclude_server(r.h[r.c2.node], pa);
+    const bool excluded = r.h[r.c2.node].joiner().queue().excluded(pa);
+    r.w.run();
+    for (int k = 0; k < 15; ++k) r.second(true);
+    std::size_t re = 0;
+    int attempts = 0;
+    for (const std::string& l : lines[r.c2.node]) {
+        if (l.find("(root evidence)") != std::string::npos) ++re;
+        if (l.find("relay: join attempt at peer") != std::string::npos) ++attempts;
+    }
+    const std::size_t caught = caught_of(lines, r.c2.node).size();
+    const bool ended = !r.c2.relay->catchup_view(pa).has_value();
+    g_relay_lines = nullptr;
+    std::printf("  rootevidneg: setup %d (root %llu); A excluded %d; root-evidence lines %zu; the catch-up ended %d, "
+                "caught-up lines %zu; attempts %d\n",
+                r.ok ? 1 : 0, (unsigned long long)r.root, excluded ? 1 : 0, re, ended ? 1 : 0, caught, attempts);
+    check(r.ok && excluded, "rootevidneg: setup (C2 a pruned full node, not caught up; A excluded at its joiner)");
+    check(re == 0 && ended && caught == 1 && attempts == 0,
+          "rootevidneg: no live pair: no root-evidence line; the catch-up ended by its reply; no attempt");
 }
 
 // catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
@@ -16257,6 +16584,10 @@ int main(int argc, char** argv) {
                                 {"tokenpause", tokenpause, 2},
                                 {"adoptdefer", adoptdefer, 3},
                                 {"adoptresume", adoptresume, 12},
+                                {"rootevid", rootevid, 12},
+                                {"fd1mark", fd1mark, 12},
+                                {"e185mark", e185mark, 12},
+                                {"rootevidneg", rootevidneg, 12},
                                 {"jpdeclined", jpdeclined, 4},
                                 {"pauseorphan", pauseorphan, 2},
                                 {"foldsplit", foldsplit, 1},

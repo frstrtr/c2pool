@@ -824,13 +824,15 @@ public:
             // hold (its fork may lie below what the node holds; the attempt's scope at the reply's L decides, 3.3a
             // (4), ruling 46 S4wa-1 (b)). An empty store at position 0 offers none: it catches up headers first
             // (ruling 39 P-S4w-6; the joiner path for a tip beyond what peers retain is S4w-bc's, with the prune step)
-            // A full node that pruned (its tree no longer reaches position 0) offers a tip it does not hold in the same
-            // way: a fork below what it holds has no header work its own records compute; the scope decides.
+            // A pruned full node (no joined x1) offers none at HELLO: its catch-up's empty reply from its root offers
+            // the peer's tip as a root-evidence pair. A restarted joined store (its x1 from its store) offers as a
+            // joined node does.
             const bool after_failure = load_failed_ && joiner_->a() == nullptr;
             const bool unheld = tree_->find(theirs.tail.best_tip) == nullptr;
-            const bool pruned = joined_ == nullptr && !load_failed_ && tree_->genesis().pos > 0;
+            const bool restarted_joined = joined_ == nullptr && !load_failed_ && tree_->genesis().pos > 0
+                                          && own_chain_.joined_x1().has_value();
             if (theirs.tail.best_tip != cfg_.identity.pool_id
-                && (after_failure || ((joined_ != nullptr || pruned) && unheld)))
+                && (after_failure || ((joined_ != nullptr || restarted_joined) && unheld)))
                 offer(theirs.tail.best_tip, peer, theirs.tail.best_cum_work);
         }
         return c;
@@ -846,16 +848,27 @@ public:
     // on a P_r past its context's time. The peer's HELLO tip becomes a join candidate with that peer as its server (no
     // load failure, no adopted state, not poisoned; K_NCU not read) when the tip is not position 0 and not held here;
     // one pair per (tip, server) (P-52); rule (4) of the attempt decides whether it replaces the node's own chain.
-    // True: the pair was queued.
-    bool offer_empty_store_tip(std::uint64_t peer) {
+    // True: the pair was queued. `root_evidence`: a root-evidence pair (a pruned full node; its attempt checks E-78's
+    // condition at a fork at or above its root and below its base); a marked offer marks the pair if queued.
+    bool offer_empty_store_tip(std::uint64_t peer, bool root_evidence = false) {
         if (poisoned_ || load_failed_ || joined_ != nullptr) return false;
         const auto it = peers_.find(peer);
         if (it == peers_.end()) return false;
         const HelloTail& t = it->second;
         if (holds_tip(t.best_tip)) return false;
         const std::size_t before = joiner_->queue().size();
-        offer(t.best_tip, peer, t.best_cum_work);
+        offer(t.best_tip, peer, t.best_cum_work, root_evidence);
         return joiner_->queue().size() > before;
+    }
+    // A full node that pruned: its tree's root above position 0, no joined x1 (a restarted joined store has one).
+    bool pruned_full_node() const {
+        return joined_ == nullptr && !load_failed_ && tree_->genesis().pos > 0 && !own_chain_.joined_x1();
+    }
+    // The peer's HELLO tip (none: no HELLO from it).
+    std::optional<Hash32> hello_tip(std::uint64_t peer) const {
+        const auto it = peers_.find(peer);
+        if (it == peers_.end()) return std::nullopt;
+        return it->second.best_tip;
     }
     // P-52: the (tip, server) pair lives: queued, or the open attempt's (taken from the queue, not yet applied). The
     // caller's hand-over to the joiner is recorded, and holds, only while its pair lives (E-193).
@@ -2741,6 +2754,16 @@ private:
         std::uint64_t store_base() const override { return n_->store_->base_pos(); }
         Hash32 tip() const override { return n_->store_->best_tip(); }
         std::uint64_t open_placements() const override { return open_bin_placements(*n_->store_); }
+        std::optional<WorkSeed> seed_at(const Hash32& id) const override {
+            const CarrierNode* c = n_->tree_->find(id);
+            std::optional<CarrierTree::SideFold> f = c ? n_->tree_->side_fold_at(id) : std::nullopt;
+            if (!f) return std::nullopt;
+            return WorkSeed{std::move(*f), c->cum_work};
+        }
+        std::optional<ChainTip> best() const override {
+            const CarrierNode& b = n_->tree_->best();
+            return ChainTip{b.cum_work, b.id};
+        }
         std::shared_ptr<const BoundWork> bound_work() const override {
             sync();
             return profile_;
@@ -2966,13 +2989,13 @@ private:
 
     // A (candidate, server) pair for the joiner (P-52; the server's link).
     // True: the pair was offered (the server's link held).
-    bool offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed) {
+    bool offer(const Hash32& candidate, std::uint64_t peer, const U128& claimed, bool root_evidence = false) {
         const auto it = links_.find(peer);
         if (it == links_.end()) return false;
         U128 work = claimed;
         if (const auto pt = peers_.find(peer); pt != peers_.end() && pt->second.best_tip == candidate && work.lo == 0 && work.hi == 0)
             work = pt->second.best_cum_work;  // the server's claimed work for its HELLO tip
-        joiner_->offer(candidate, *it->second, work);
+        joiner_->offer(candidate, *it->second, work, root_evidence);
         return true;
     }
 

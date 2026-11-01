@@ -77,6 +77,7 @@
 #include "pathb_admit.hpp"
 #include "pathb_bucket_wire.hpp"
 #include "pathb_emission.hpp"  // kHf16
+#include "pathb_headers_first.hpp"  // side_work_wins
 #include "pathb_joiner.hpp"
 
 namespace c2pool::xmr::pathb {
@@ -323,6 +324,12 @@ inline std::uint64_t open_bin_placements(const BinStore& store) {
 // ---------------------------------------------------------------------------
 // The adopted state A as an attempt sees it (3.3a (4), (6)).
 // ---------------------------------------------------------------------------
+// The work state of A at a held id (E-78's condition): the header path's fold state there and its cum_work.
+struct WorkSeed {
+    CarrierTree::SideFold fold;
+    U128 cum_work{};
+};
+
 class AdoptedChain {
 public:
     virtual ~AdoptedChain() = default;
@@ -339,6 +346,11 @@ public:
     virtual Hash32 tip() const = 0;
     // the open-bin placements of A's best chain (the lost count when A is replaced)
     virtual std::uint64_t open_placements() const = 0;
+    // E-78's condition from A's own records (a root-evidence pair at a full node): the state after `id` (its retarget
+    // window, record and id) and its cum_work, by value; nullopt: A does not compute it (a joined A).
+    virtual std::optional<WorkSeed> seed_at(const Hash32&) const { return std::nullopt; }
+    // A's best tip (cum_work, id); nullopt: not given.
+    virtual std::optional<ChainTip> best() const { return std::nullopt; }
 };
 
 class JoinedState;
@@ -894,14 +906,24 @@ public:
         std::optional<Hash32> waits_on;  // a Monero input the pair's last attempt could not resolve (NotServed)
         Missing waits_cause = Missing::MoneroBlock;  // its cause: MoneroBlock (a P_r), MissingWeights (a held block's)
         bool waits_offer = false;  // its last attempt: no side header served; it waits for a new candidate of its server
+        bool root_evidence = false;  // a root-evidence pair: its attempt checks E-78's condition (W); never cleared
+        bool attempted = false;      // an attempt of this pair ran (re-queued after it)
     };
 
-    void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}) {
+    // `root_evidence`: a marked offer; one that finds its pair queued and not yet attempted marks it.
+    void offer(const Hash32& candidate, std::uint64_t server, const U128& claimed_work = {}, bool root_evidence = false) {
         if (excluded_.count(server) != 0) return;
         const Key k{candidate, server};
-        if (known_.count(k) != 0) return;  // queued, or attempted once
+        if (known_.count(k) != 0) {  // queued, or attempted once
+            if (root_evidence)
+                for (Pair& q : q_)
+                    if (q.candidate == candidate && q.server == server && !q.attempted) q.root_evidence = true;
+            return;
+        }
         known_.insert(k);
-        q_.push_back(Pair{candidate, server, claimed_work, ++seq_});
+        Pair np{candidate, server, claimed_work, ++seq_};
+        np.root_evidence = root_evidence;
+        q_.push_back(np);
         // the server's pairs waiting for a new candidate: queued again, after it
         std::vector<Pair> moved;
         for (auto it = q_.begin(); it != q_.end();) {
@@ -1091,6 +1113,8 @@ public:
     void set_known(std::function<bool(const Hash32&)> f) { known_ = std::move(f); }
     // The pair's young mark (the ruling-47 fallback): the whole chain [1, L] in full, no claim.
     void set_force_young(bool y) noexcept { force_young_ = y; }
+    // The pair's root-evidence mark: a fork at or above A's root and below its base needs E-78's condition (W).
+    void set_root_evidence(bool r) noexcept { root_evidence_ = r; }
 
 private:
     // ---- the result ----
@@ -1320,9 +1344,96 @@ private:
             const std::uint64_t f = a_->pos_of(id).value_or(x);
             const std::optional<std::uint64_t> ax1 = a_->joined_x1();
             const bool deep = (ax1 && f <= *ax1) || f < a_->store_base();
-            return deep ? true : fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
+            if (!deep) return fail(AttemptEnd::OutOfScope, "the fork lies above A's x1 and at or above its base");
+            // a root-evidence pair at a full node (no x1), the fork held (at or above A's root) below its base: W
+            if (root_evidence_ && !ax1) return w_condition(id, f);
+            return true;
         }
         scope_lo_ = lo;
+        return true;
+    }
+    // W: E-78's condition over the branch the attempt holds from f up to L, from A's own records at f; each header
+    // with the header path's rows at d (#6 h against the record, #8 t_origin == d, #7 the header fields against P_r's
+    // branch, #11 the PoW at d); the work against A's best read after the last hash (the header path's tie rule).
+    // Wins: in scope. Does not win, or a row fails: OutOfScope. An input it cannot decide (P_r's weights, the seed):
+    // NotServed on that input.
+    bool w_condition(const Hash32& f_id, std::uint64_t f) {
+        std::optional<WorkSeed> seed = a_->seed_at(f_id);
+        if (!seed) {  // an input W cannot decide: non-service
+            rep_.unresolved_pr.reset();
+            return fail(AttemptEnd::NotServed, "E-78's condition: no work state at the fork");
+        }
+        CarrierTree::SideFold st = std::move(seed->fold);
+        std::vector<CarrierAnnounce> ann;
+        std::vector<const CarrierHeader*> hs;
+        for (std::uint64_t x = f + 1; x <= rep_.L; ++x) {
+            const CarrierHeader* h = header_at(x);
+            if (h == nullptr) return fail(AttemptEnd::OutOfScope, "E-78's condition: a header from the fork up not held");
+            const std::uint64_t hh = join_detail::height_of(in_, h->own);
+            if (hh == 0) {
+                rep_.unresolved_pr = h->own.blob.prev_id;
+                rep_.unresolved_cause = Missing::MoneroBlock;
+                return fail(AttemptEnd::NotServed, "E-78's condition: a header's P_r not resolved");
+            }
+            ann.push_back(CarrierAnnounce{receipt_id(h->own), h->own.side.tip, hh, h->own.side.receipts_root,
+                                          h->own.side.ballot});
+            hs.push_back(h);
+        }
+        std::size_t k = 0;
+        std::optional<Missing> undecided;
+        Hash32 undecided_pr{};
+        std::string why;
+        const auto rows = [&](const CarrierAnnounce&, std::uint64_t d) {
+            const CarrierHeader& h = *hs[k++];
+            if (h.own.side.t_origin != d) {
+                why = "#8 t_origin " + std::to_string(h.own.side.t_origin) + " != d " + std::to_string(d);
+                return false;
+            }
+            const PrInfo pr = in_.resolve_pr ? in_.resolve_pr(h.own.blob.prev_id) : PrInfo{};
+            const HeaderFault hf = header_fields(h.own, encoded_length(h.own), pr.in);
+            if (hf == HeaderFault::SizeUndecided) {
+                undecided = Missing::MissingWeights;
+                undecided_pr = h.own.blob.prev_id;
+                return false;
+            }
+            if (header_fields_verdict(hf)) {
+                why = "#7 header fault " + std::to_string(static_cast<int>(hf));
+                return false;
+            }
+            const std::optional<Hash32> sd = in_.seed_of ? in_.seed_of(h.own.blob.prev_id) : std::nullopt;
+            if (!sd) {
+                undecided = Missing::Seed;
+                undecided_pr = h.own.blob.prev_id;
+                return false;
+            }
+            if (!join_detail::header_path_ok(in_, h)) {  // the PoW at t_origin == d
+                why = "#11 PoW below d " + std::to_string(d);
+                return false;
+            }
+            return true;
+        };
+        const std::vector<SideHeader> side = CarrierTree::step_side_headers(st, ann, rows);
+        U128 work = seed->cum_work;
+        for (std::size_t i = 0; i < side.size(); ++i) {
+            if (side[i].check != HeaderCheck::Passed) {
+                if (undecided && k == i + 1) {
+                    rep_.unresolved_pr = undecided_pr;
+                    rep_.unresolved_cause = *undecided;
+                    return fail(AttemptEnd::NotServed, "E-78's condition: an input not held");
+                }
+                if (why.empty() || k != i + 1) why = ann[i].parent != (i == 0 ? f_id : ann[i - 1].id) ? "the link" : "#6 h below the record";
+                return fail(AttemptEnd::OutOfScope, "E-78's condition: header " + std::to_string(f + 1 + i) + ": " + why);
+            }
+            work = ::c2pool::xmr::native::u128_add(work, U128{side[i].work, 0});
+        }
+        const std::optional<ChainTip> b = a_->best();  // read after the last hash
+        if (!b) {  // an input W cannot decide: non-service
+            rep_.unresolved_pr.reset();
+            return fail(AttemptEnd::NotServed, "E-78's condition: no best tip of A");
+        }
+        const Hash32 last = ann.empty() ? f_id : ann.back().id;
+        if (!side_work_wins(b->cum_work, b->id, work, last))
+            return fail(AttemptEnd::OutOfScope, "E-78's condition: the branch's work from the fork does not win");
         return true;
     }
     bool in_scope() {
@@ -1929,6 +2040,7 @@ private:
     std::uint64_t x0_ = 0;
     std::uint64_t pow_lo_ = 0;    // the lowest position (5)-checked so far (0 = none)
     bool force_young_ = false;    // the young path forced by the pair's mark (the ruling-47 fallback)
+    bool root_evidence_ = false;  // a root-evidence pair (W at a full node's fork below its base)
     std::optional<std::pair<Hash32, std::uint64_t>> named_;  // the page named to the link and not yet taken
     bool scope_done_ = false;     // the fork with A's best chain met (in scope: deep)
     std::uint64_t scope_lo_ = 0;  // the lowest position the scope scan has read (0: none)
@@ -1972,9 +2084,9 @@ public:
 
     // A server offers its best tip (HELLO; a trigger of 3.1): the pair is
     // queued in the order of first offer. A trigger never discards A.
-    void offer(const Hash32& candidate, JoinLink& server, const U128& claimed_work = {}) {
+    void offer(const Hash32& candidate, JoinLink& server, const U128& claimed_work = {}, bool root_evidence = false) {
         links_[server.peer()] = &server;
-        queue_.offer(candidate, server.peer(), claimed_work);
+        queue_.offer(candidate, server.peer(), claimed_work, root_evidence);
     }
     void disconnect(std::uint64_t server) {
         links_.erase(server);
@@ -2028,6 +2140,7 @@ public:
             JoinAttempt att(in_, *li->second, timeout_, a(), on_step_);
             att.set_known([this](const Hash32& tip) { return known_.count(tip) != 0; });
             att.set_force_young(p->young);
+            att.set_root_evidence(p->root_evidence);
             try {
                 return Attempted{*p, att.run(p->candidate)};
             } catch (const RandomxFailure& e) {  // node-internal: the attempt ends; no token; the pair stays queued
@@ -2051,6 +2164,7 @@ public:
             case AttemptEnd::NotServed: {
                 // ruling 47: the pair's next attempt runs the young path (the mark rides the queue)
                 AttemptQueue::Pair q = *p;
+                q.attempted = true;
                 q.young = q.young || rep.force_young;
                 q.waits_on = rep.unresolved_pr;  // re-attempted once that input moves (release_waits)
                 q.waits_cause = rep.unresolved_cause;
@@ -2058,7 +2172,12 @@ public:
                 queue_.requeue(q);
                 break;
             }
-            case AttemptEnd::NodeInternal: queue_.requeue(*p); break;
+            case AttemptEnd::NodeInternal: {
+                AttemptQueue::Pair q = *p;
+                q.attempted = true;
+                queue_.requeue(q);
+                break;
+            }
             case AttemptEnd::Alarm:
             case AttemptEnd::Contradiction:
             case AttemptEnd::Unplaceable:

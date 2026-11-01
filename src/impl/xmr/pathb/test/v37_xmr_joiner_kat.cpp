@@ -3479,6 +3479,290 @@ void forgedlive() {
 }
 
 }  // namespace
+// ---------------------------------------------------------------------------
+// wcond (W: E-78's condition at a root-evidence pair): A, a full node's own chain (journal depth 20) with A's work
+// reads, and b share 200 carriers (the fork f = 200); a grows on to 230 (its base 210 above f) unless named; b's own
+// branch from f; b's tip offered with the root-evidence mark.
+//   heavier (b 40): in scope, Completed, A replaced;
+//   lighter (b 25): OutOfScope, no token, the server not excluded; over-claimed (b 25, the HELLO claim x10 and every
+//            t_origin above f x3): OutOfScope; equal (b 30, the same work, b's tip id above a's): OutOfScope;
+//   base (a to 210: f not below its base 190; b 40): OutOfScope (the base test), no token;
+//   forged (b 40; the header at f + 3 with t_origin d + 1): OutOfScope, no token, the server not excluded;
+//   fields (b 40; the P_r of the header at f + 2 read at hf 17, its header at 16: a header-field fault): OutOfScope, no
+//            token, the server not excluded;
+//   no reads (A without its work reads; b 40): NotServed, no token;
+//   queue: a marked offer marks a queued pair not yet attempted; a pair re-queued after its attempt is not marked; a
+//          decided pair is not queued again; a mark is never cleared.
+// ---------------------------------------------------------------------------
+// A full node's own chain as A with its work reads (E-78's condition).
+struct WChain final : pb::AdoptedChain {
+    KatNode* n;
+    explicit WChain(KatNode& k) : n(&k) {}
+    bool holds(const pb::Hash32& id) const override { return n->tree.find(id) != nullptr; }
+    bool on_chain(const pb::Hash32& id) const override {
+        const pb::CarrierNode* c = n->tree.find(id);
+        return c != nullptr && n->store.best_at(c->pos) == id;
+    }
+    std::optional<std::uint64_t> pos_of(const pb::Hash32& id) const override {
+        const pb::CarrierNode* c = n->tree.find(id);
+        if (c == nullptr) return std::nullopt;
+        return c->pos;
+    }
+    std::optional<std::uint64_t> joined_x1() const override { return std::nullopt; }
+    std::uint64_t store_base() const override { return n->store.base_pos(); }
+    std::shared_ptr<const pb::BoundWork> bound_work() const override {
+        auto w = std::make_shared<pb::BoundWork>();
+        for (std::uint64_t x = n->store.tip_pos(); x >= 1; --x) {
+            const pb::CarrierNode* c = n->tree.find(*n->store.best_at(x));
+            w->add(c->h, c->d);
+        }
+        return w;
+    }
+    pb::Hash32 tip() const override { return n->store.best_tip(); }
+    std::uint64_t open_placements() const override { return pb::open_bin_placements(n->store); }
+    std::optional<pb::WorkSeed> seed_at(const pb::Hash32& id) const override {
+        const pb::CarrierNode* c = n->tree.find(id);
+        std::optional<pb::CarrierTree::SideFold> f = c ? n->tree.side_fold_at(id) : std::nullopt;
+        if (!f) return std::nullopt;
+        return pb::WorkSeed{std::move(*f), c->cum_work};
+    }
+    std::optional<pb::ChainTip> best() const override {
+        const pb::CarrierNode& b = n->tree.best();
+        return pb::ChainTip{b.cum_work, b.id};
+    }
+};
+struct WOut {
+    std::optional<pb::AttemptReport> r;
+    bool replaced = false, excluded = false;
+    std::string desc() const { return r ? rep_desc(*r) : std::string("none"); }
+};
+// b's tip offered with the root-evidence mark to a Joiner whose A is a's own chain (with its work reads, or not).
+WOut w_attempt(const JoinNet& net, KatNode& a, KatNode& b, std::uint64_t peer, bool reads = true,
+               const pb::U128& claimed = {}, const std::function<void(KatServer&)>& tweak = nullptr,
+               const std::function<void(JoinerEnv&)>& env_tweak = nullptr) {
+    WChain wa(a);
+    FullChain fa(a);
+    KatServer s(b, peer);
+    if (tweak) tweak(s);
+    JoinerEnv je(net);
+    if (env_tweak) env_tweak(je);
+    pb::Joiner j(je.in, kP53);
+    j.set_own_chain(reads ? static_cast<const pb::AdoptedChain*>(&wa) : static_cast<const pb::AdoptedChain*>(&fa));
+    j.offer(s.best_id(), s, claimed, /*root_evidence=*/true);
+    WOut o;
+    o.r = j.run_next();
+    o.replaced = j.last_switch().replaced;
+    o.excluded = j.queue().excluded(peer);
+    return o;
+}
+void wcond() {
+    JoinNet net(900);
+    KatNode base(net, 20);
+    grow(base, 200);
+    KatNode a(base);
+    grow(a, 30);
+    const std::uint64_t f = 200;
+    check(a.store.base_pos() == 210, "wcond: setup (A's base 210 above the fork 200)");
+    const auto own = [&](std::uint64_t n, std::uint64_t nonce0) {
+        ChainShape sb;
+        sb.nonce0 = nonce0;
+        auto b = std::make_unique<KatNode>(base);
+        grow(*b, n, sb);
+        return b;
+    };
+    {
+        auto b = own(40, 8100000);
+        const WOut o = w_attempt(net, a, *b, 401);
+        std::printf("  wcond heavier: %s; replaced %d\n", o.desc().c_str(), o.replaced ? 1 : 0);
+        check(o.r && o.r->end == pb::AttemptEnd::Completed && o.replaced && o.r->strike == 0,
+              "wcond heavier: the branch's work from f wins: in scope, Completed, A replaced");
+    }
+    {
+        auto b = own(25, 8200000);
+        const WOut o = w_attempt(net, a, *b, 402);
+        std::printf("  wcond lighter: %s; excluded %d\n", o.desc().c_str(), o.excluded ? 1 : 0);
+        check(o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded && !o.replaced,
+              "wcond lighter: the branch's work from f does not win: OutOfScope, no token, not excluded");
+        const WOut c = w_attempt(net, a, *b, 403, true, pb::U128{0, 10}, [f](KatServer& s) {
+            s.on_headers = [f](const pb::Hash32&, pb::ChainHeaders& out) {
+                for (std::size_t i = 0; i < out.headers.size(); ++i)
+                    if (out.first_pos + i > f) out.headers[i].own.side.t_origin *= 3;
+            };
+        });
+        std::printf("  wcond over-claimed: %s; excluded %d\n", c.desc().c_str(), c.excluded ? 1 : 0);
+        check(c.r && c.r->end == pb::AttemptEnd::OutOfScope && c.r->strike == 0 && !c.excluded && !c.replaced,
+              "wcond over-claimed: the claimed work and t_origin read nothing: OutOfScope, no token, not excluded");
+    }
+    {
+        std::unique_ptr<KatNode> b;
+        for (std::uint64_t k = 0; k < 64 && !b; ++k) {
+            auto t = own(30, 8300000 + 1000 * k);
+            if (t->tree.best().cum_work.lo == a.tree.best().cum_work.lo && t->tree.best().cum_work.hi == a.tree.best().cum_work.hi
+                && a.store.best_tip() < t->store.best_tip())
+                b = std::move(t);
+        }
+        const WOut o = b ? w_attempt(net, a, *b, 404) : WOut{};
+        std::printf("  wcond equal: found %d; %s\n", b ? 1 : 0, o.desc().c_str());
+        check(b && o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded,
+              "wcond equal: the same work, b's tip id above a's (the tie rule): OutOfScope, no token");
+    }
+    {
+        KatNode a2(base);
+        grow(a2, 10);
+        auto b = own(40, 8400000);
+        const WOut o = w_attempt(net, a2, *b, 405);
+        std::printf("  wcond base: A's base %llu; %s\n", (unsigned long long)a2.store.base_pos(), o.desc().c_str());
+        check(a2.store.base_pos() <= f && o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded &&
+                      o.r->what.find("base") != std::string::npos,
+              "wcond base: a fork not below A's base: OutOfScope by the base test, no token");
+    }
+    {
+        auto b = own(40, 8100000);
+        const WOut o = w_attempt(net, a, *b, 406, true, {}, [f](KatServer& s) {
+            s.on_headers = [f](const pb::Hash32&, pb::ChainHeaders& out) {
+                for (std::size_t i = 0; i < out.headers.size(); ++i)
+                    if (out.first_pos + i == f + 3) out.headers[i].own.side.t_origin += 1;
+            };
+        });
+        std::printf("  wcond forged: %s; excluded %d\n", o.desc().c_str(), o.excluded ? 1 : 0);
+        check(o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded && !o.replaced &&
+                      o.r->what.find("#8") != std::string::npos,
+              "wcond forged: a header's t_origin not A's d: OutOfScope, no token, not excluded");
+    }
+    {
+        auto b = own(40, 8100000);
+        const pb::Hash32 pr2 = b->bodies.get(at_pos(*b, f + 2))->own.blob.prev_id;
+        const WOut o = w_attempt(net, a, *b, 408, true, {}, nullptr, [pr2](JoinerEnv& je) {
+            const auto rp = je.in.resolve_pr;
+            je.in.resolve_pr = [rp, pr2](const pb::Hash32& p_r) {
+                pb::PrInfo out = rp(p_r);
+                if (p_r == pr2) out.in.hf = 17;
+                return out;
+            };
+        });
+        std::printf("  wcond fields: %s; excluded %d\n", o.desc().c_str(), o.excluded ? 1 : 0);
+        check(o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded && !o.replaced &&
+                      o.r->what.find("#7") != std::string::npos,
+              "wcond fields: a header's fields fail against its P_r's branch: OutOfScope, no token, not excluded");
+    }
+    {
+        auto b = own(40, 8100000);
+        const WOut o = w_attempt(net, a, *b, 407, false);
+        std::printf("  wcond no reads: %s\n", o.desc().c_str());
+        check(o.r && o.r->end == pb::AttemptEnd::NotServed && o.r->strike == 0 && !o.excluded && !o.replaced,
+              "wcond no reads: A without its work reads: NotServed (an input W cannot decide), no token");
+    }
+    {
+        pb::AttemptQueue q;
+        const pb::Hash32 c1 = hid(0x61), c2 = hid(0x62), c3 = hid(0x63);
+        q.offer(c1, 9);
+        q.offer(c1, 9, {}, true);
+        const bool marked = q.size() == 1 && q.pairs().front().root_evidence;
+        q.offer(c2, 9);
+        pb::AttemptQueue::Pair p = *q.next();  // c1 taken (attempted)
+        p.attempted = true;
+        q.requeue(p);                          // c1 re-queued after its attempt, still marked
+        pb::AttemptQueue::Pair p2 = *q.next(); // c2 taken
+        p2.attempted = true;
+        q.requeue(p2);                         // c2 re-queued after its attempt, unmarked
+        q.offer(c2, 9, {}, true);
+        bool c2_marked = true, c1_kept = false;
+        for (const pb::AttemptQueue::Pair& x : q.pairs()) {
+            if (x.candidate == c2) c2_marked = x.root_evidence;
+            if (x.candidate == c1) c1_kept = x.root_evidence;
+        }
+        q.offer(c3, 9);
+        (void)q.next();
+        (void)q.next();
+        (void)q.next();                        // every pair taken: c3 decided
+        q.offer(c3, 9, {}, true);
+        const bool decided = q.size() == 0;
+        std::printf("  wcond queue: marked %d; re-queued pair marked %d; mark kept %d; decided re-queued %d\n",
+                    marked ? 1 : 0, c2_marked ? 1 : 0, c1_kept ? 1 : 0, decided ? 0 : 1);
+        check(marked, "wcond queue: a marked offer marks the queued pair not yet attempted");
+        check(!c2_marked && c1_kept, "wcond queue: a pair re-queued after its attempt is not marked; a mark is never cleared");
+        check(decided, "wcond queue: a decided pair is not queued again");
+    }
+}
+
+// wpre (W over the retarget prefix): A (journal depth 20) and b share 1,000 carriers (the fork f = 1,000); a grows on
+// to 1,030 (its base 1,010 above f); b's own 3,600 (L = 4,600, x0 = 1,265: f in the prefix [x0 - N_rt, x0)); b's tip
+// offered with the root-evidence mark.
+//   honest   : in scope, Completed, A replaced; each prefix header above f hashed once (by W);
+//   bad PoW  : b's header at f + 5 (in the prefix, its page after x0 is known) fails its PoW at d: OutOfScope (W), no
+//              token, the server not excluded;
+//   no seed  : the seed of that header's P_r not held: NotServed on it (the pair re-queued, waiting on it, its mark
+//              kept); the seed held: the pair attempted again, Completed, A replaced.
+void wpre() {
+    JoinNet net(900);
+    KatNode base(net, 20);
+    grow(base, 1000);
+    KatNode a(base);
+    grow(a, 30);
+    ChainShape sb;
+    sb.nonce0 = 8500000;
+    KatNode b(base);
+    grow(b, 3600, sb);
+    const std::uint64_t f = 1000;
+    const pb::Hash32 h5 = at_pos(b, f + 5);
+    const pb::Hash32 pr5 = b.bodies.get(h5)->own.blob.prev_id;
+    for (int mode = 0; mode < 3; ++mode) {
+        WChain wa(a);
+        KatServer s(b, 510 + static_cast<std::uint64_t>(mode));
+        JoinerEnv je(net);
+        std::map<pb::Hash32, int> hashed;
+        const auto rx = je.in.randomx;
+        je.in.randomx = [&hashed, rx](const pb::HashingBlob& blob, std::uint64_t d, const pb::Hash32& seed) {
+            ++hashed[pb::receipt_id(blob)];
+            return rx(blob, d, seed);
+        };
+        bool seed_held = mode != 2;
+        if (mode == 1) je.bad_pow.insert(h5);
+        const auto so = je.in.seed_of;
+        je.in.seed_of = [&seed_held, so, pr5](const pb::Hash32& p_r) -> std::optional<pb::Hash32> {
+            if (p_r == pr5 && !seed_held) return std::nullopt;
+            return so(p_r);
+        };
+        pb::Joiner j(je.in, kP53);
+        j.set_own_chain(&wa);
+        j.offer(s.best_id(), s, {}, /*root_evidence=*/true);
+        const std::optional<pb::AttemptReport> r = j.run_next();
+        const std::string tag = std::string("wpre ") + (mode == 0 ? "honest" : mode == 1 ? "bad PoW" : "no seed");
+        if (mode == 0) {
+            int once = 0, pre = 0;
+            for (std::uint64_t x = f + 1; r && x < r->span.x0; ++x) {
+                ++pre;
+                if (hashed[at_pos(b, x)] == 1) ++once;
+            }
+            std::printf("  %s: %s; prefix headers above f %d, hashed once %d\n", tag.c_str(), r ? rep_desc(*r).c_str() : "none",
+                        pre, once);
+            check(r && r->end == pb::AttemptEnd::Completed && j.last_switch().replaced && r->span.x0 > f &&
+                          r->span.x0 <= f + pb::join_n_rt(pb::kRuledLaneParams),
+                  tag + ": f in the prefix; the branch's work from f wins: Completed, A replaced");
+            check(pre > 0 && once == pre, tag + ": each prefix header above f hashed once");
+        } else if (mode == 1) {
+            std::printf("  %s: %s; excluded %d\n", tag.c_str(), r ? rep_desc(*r).c_str() : "none",
+                        j.queue().excluded(s.peer()) ? 1 : 0);
+            check(r && r->end == pb::AttemptEnd::OutOfScope && r->strike == 0 && !j.queue().excluded(s.peer()) &&
+                          r->what.find("#11") != std::string::npos,
+                  tag + ": a prefix header's PoW at d fails: OutOfScope (W), no token, not excluded");
+        } else {
+            const bool waits = r && r->end == pb::AttemptEnd::NotServed && r->unresolved_pr == pr5 &&
+                               r->unresolved_cause == pb::Missing::Seed && j.queue().size() == 1 &&
+                               j.queue().pairs().front().waits_on == pr5 && j.queue().pairs().front().root_evidence &&
+                               j.queue().pairs().front().attempted;
+            std::printf("  %s: %s; waits on it %d\n", tag.c_str(), r ? rep_desc(*r).c_str() : "none", waits ? 1 : 0);
+            check(waits && r->strike == 0, tag + ": an input W cannot decide: NotServed, the pair waiting on it, its mark kept");
+            seed_held = true;
+            (void)j.release_waits(pr5, pb::Missing::Seed);
+            const std::optional<pb::AttemptReport> r2 = j.run_next();
+            std::printf("  %s again: %s\n", tag.c_str(), r2 ? rep_desc(*r2).c_str() : "none");
+            check(r2 && r2->end == pb::AttemptEnd::Completed && j.last_switch().replaced,
+                  tag + ": the seed held: attempted again, Completed, A replaced");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     return run_sections("v37_xmr_joiner_kat",
                         {
@@ -3502,6 +3786,8 @@ int main(int argc, char** argv) {
                                 {"jc6", jc6, 31},   // N-1 (E-86): the FC_HEADERS v0x02 frame head; N-3 (E-102): the header floor
                                 {"deadspan", deadspan, 60},      // ruling 62 (E-195): a dead receipt in the span
                                 {"forgedlive", forgedlive, 60},  // ruling 62 (E-195), E-73: a substituted tip, both liveness values
+                                {"wcond", wcond, 10},            // W: E-78's condition at a root-evidence pair
+                                {"wpre", wpre, 30},              // W over the retarget prefix; an input W cannot decide
                         },
                         argc, argv);
 }
