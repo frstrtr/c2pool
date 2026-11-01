@@ -631,8 +631,8 @@ public:
     // is the caller's PoW check. Headers after the first failed one are
     // marked failed.
     template <class PowCheck>
-    std::vector<SideHeader> step_side_headers(SideFold& f, std::span<const CarrierAnnounce> headers,
-                                              PowCheck&& pow_ok) const {
+    static std::vector<SideHeader> step_side_headers(SideFold& f, std::span<const CarrierAnnounce> headers,
+                                                     PowCheck&& pow_ok) {
         bool failed = false;
         std::vector<SideHeader> out;
         out.reserve(headers.size());

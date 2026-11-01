@@ -228,6 +228,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> strikes{0}, bans{0}, drops{0}, addr_bans{0}, banned_src_dropped{0};
     std::atomic<std::uint64_t> queue_dropped{0}, rx_deferred{0}, verify_threads{0};
     std::atomic<std::uint64_t> flood_frames{0}, reoffer_frames{0}, catchup_requests{0}, empty_store_offers{0};
+    std::atomic<std::uint64_t> root_evidence_offers{0};  // root-evidence pairs queued (a pruned full node's root reply)
     std::atomic<std::uint64_t> bucket_requests{0}, parked_reruns{0}, rewalks{0}, solicited_jobs{0};
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
@@ -3077,7 +3078,7 @@ private:
         using K = PathbNode::HeadersOutcome::Kind;
         PathbNode::HeadersOutcome o;
         bool join = false;
-        std::string jp_line;
+        std::string jp_line, re_line;
         {
             const NodeGuard g(*this);
             PathbNode::Arrival arrival;  // a reply to the node's own request: its arrival in link order (E-194)
@@ -3147,6 +3148,23 @@ private:
                                 hand_over_locked(p, tip);
                                 break;
                             }
+                            // the reply to a request from a pruned full node's lowest held position (its root) carried
+                            // no header: the peer's tip a root-evidence pair (the joiner path), the hand-over recorded
+                            // while that pair lives
+                            if (o.ids.empty() && node_->pruned_full_node()) {
+                                if (node_->offer_empty_store_tip(p, /*root_evidence=*/true)) st_.root_evidence_offers++;
+                                const Hash32 tip = it->second.tip;
+                                if (node_->pair_lives(tip, p)) {
+                                    join = true;
+                                    re_line = "relay: catch-up from peer " + std::to_string(p) +
+                                              ": no header from the lowest held position " +
+                                              std::to_string(node_->tree().genesis().pos) +
+                                              ": its tip offered to the joiner (root evidence)";
+                                }
+                                catchup_.erase(it);
+                                hand_over_locked(p, tip);
+                                break;
+                            }
                             // the node's own header work kept its chain: this catch-up ended by its reply
                             catchup_.erase(it);
                             caught_up_locked();
@@ -3190,6 +3208,7 @@ private:
             }
         }
         if (!jp_line.empty()) log(jp_line);
+        if (!re_line.empty()) log(re_line);
         if ((o.kind == K::Unsolicited || o.kind == K::Retired) && !o.why.empty())
             log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
@@ -3875,7 +3894,8 @@ private:
                 if (deferred && !node_->caught_up() && !hd->offered && hd->since_ms != 0
                     && now_ms() >= hd->since_ms + kCtxTtlMs && !node_->monero_input_held(hd->cause, hd->fetch)) {
                     hd->offered = true;
-                    if (node_->offer_empty_store_tip(it->first)) {
+                    // at a pruned full node a root-evidence pair
+                    if (node_->offer_empty_store_tip(it->first, node_->pruned_full_node())) {
                         st_.catchup_join_offers++;
                         log("relay: catch-up from peer " + std::to_string(it->first) + " deferred on P_r " +
                             hex_short(hd->fetch) + " past its context's time: its tip offered to the joiner");
