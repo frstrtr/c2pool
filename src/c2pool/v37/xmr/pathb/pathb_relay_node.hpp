@@ -950,6 +950,14 @@ public:
         const auto it = header_wants_.find(peer);
         return it == header_wants_.end() ? 0 : it->second.size();
     }
+    // KAT hook: the waiting header requests of `peer` under `owner`.
+    std::size_t header_waiting(std::uint64_t peer, PathbNode::HeaderOwner owner) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = header_wants_.find(peer);
+        if (it == header_wants_.end()) return 0;
+        return static_cast<std::size_t>(
+                std::count_if(it->second.begin(), it->second.end(), [&](const HdrWant& w) { return w.owner == owner; }));
+    }
     // KAT hook: the parked objects the waiting header requests of `peer` carry.
     std::size_t header_waiting_objects(std::uint64_t peer) const {
         std::lock_guard<std::mutex> lk(cumtx_);
@@ -2279,7 +2287,8 @@ private:
             std::deque<HdrWant>& q = it->second;
             while (!q.empty()) {
                 const HdrWant& w = q.front();
-                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr) {
+                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr
+                    || (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(it->first) == 0)) {  // its catch-up ended
                     q.pop_front();
                     continue;
                 }
@@ -2289,6 +2298,7 @@ private:
                     hdr_sent_[it->first] = HdrSent{w.from, w.stop, w.objs};
                 } else {
                     hdr_sent_.erase(it->first);
+                    if (const auto c = catchup_.find(it->first); c != catchup_.end()) c->second.asked_ms = now_ms();
                 }
                 q.pop_front();
                 break;  // one in flight per peer
@@ -3067,6 +3077,7 @@ private:
         using K = PathbNode::HeadersOutcome::Kind;
         PathbNode::HeadersOutcome o;
         bool join = false;
+        std::string jp_line;
         {
             const NodeGuard g(*this);
             PathbNode::Arrival arrival;  // a reply to the node's own request: its arrival in link order (E-194)
@@ -3083,7 +3094,8 @@ private:
             }
             try {
                 o = node_->on_headers(p, f, now_s(), arrival);
-            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
+            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; a comparison
+                                                 // past its first checked header pauses (its next request resumes it)
                 rx_alarm("headers of peer " + std::to_string(p), e.what());
                 log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
@@ -3151,6 +3163,9 @@ private:
                             catchup_.erase(it);
                             caught_up_locked();
                             break;
+                        case K::Continue:  // the next page of the comparison went out
+                            it->second.asked_ms = now_ms();
+                            break;
                         case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
                                               // the page lapses
                             if (o.fetch_last != Hash32{}) {
@@ -3165,7 +3180,16 @@ private:
                 serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
             if (o.kind == K::JoinerPath) join = true;
+            if (o.kind == K::JoinerPath && o.offered) {  // the line where the offer left a live pair
+                const std::uint64_t base = node_->store().base_pos();
+                const std::optional<std::uint64_t> x1 = node_->switch_x1();
+                const std::string test = o.fork_pos < base || !x1 ? " below the journal base " + std::to_string(base)
+                                                                  : " at or below x1 " + std::to_string(*x1);
+                jp_line = "relay: headers from peer " + std::to_string(p) + " win; fork at " + std::to_string(o.fork_pos) +
+                          test + ": offered to the joiner";
+            }
         }
+        if (!jp_line.empty()) log(jp_line);
         if ((o.kind == K::Unsolicited || o.kind == K::Retired) && !o.why.empty())
             log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
@@ -3220,6 +3244,26 @@ private:
         v.push_back(w);
         if (v.back().since_ms == 0) v.back().since_ms = now_ms();
     }
+    // Under cumtx_: the catch-up of `p` ended: its deferral and its waiting request go.
+    void drop_catchup_asks_locked(std::uint64_t p) {
+        const auto cu = [](const auto& e) { return e.owner == PathbNode::HeaderOwner::CatchUp; };
+        if (const auto d = headers_on_ctx_.find(p); d != headers_on_ctx_.end()) {
+            d->second.erase(std::remove_if(d->second.begin(), d->second.end(), cu), d->second.end());
+            if (d->second.empty()) headers_on_ctx_.erase(d);
+        }
+        if (const auto q = header_wants_.find(p); q != header_wants_.end()) {
+            q->second.erase(std::remove_if(q->second.begin(), q->second.end(), cu), q->second.end());
+            if (q->second.empty()) header_wants_.erase(q);
+        }
+    }
+    // Under cumtx_: an adoption; every catch-up's comparison restarts against the adopted chain: the catch-ups'
+    // deferrals and waiting requests go (a tip request's stay).
+    void drop_all_catchup_asks_locked() {
+        std::set<std::uint64_t> ps;
+        for (const auto& [p, v] : headers_on_ctx_) ps.insert(p);
+        for (const auto& [p, q] : header_wants_) ps.insert(p);
+        for (const std::uint64_t p : ps) drop_catchup_asks_locked(p);
+    }
     // Under cumtx_: the catch-up's own deferral of peer `p` (none: nullptr).
     HdrOnCtx* catchup_ctx_locked(std::uint64_t p) {
         const auto it = headers_on_ctx_.find(p);
@@ -3246,6 +3290,7 @@ private:
             it = v.empty() ? headers_on_ctx_.erase(it) : std::next(it);
             for (const HdrOnCtx& w : asks) {
                 if (!hello_ok(p) || node_->tree().find(w.from) == nullptr) continue;
+                if (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(p) == 0) continue;  // its catch-up ended
                 want_headers_locked(p, w.owner, w.from, w.stop, w.objs);
                 st_.headers_ctx_reasks++;
             }
@@ -3399,6 +3444,10 @@ private:
         } else {
             const NodeGuard g(*this);
             s = node_->apply_join(std::move(t));
+        }
+        if (s->switched) {  // an adoption: the catch-ups' deferrals and waiting requests go
+            std::lock_guard<std::mutex> lk(cumtx_);
+            drop_all_catchup_asks_locked();
         }
         if (s->report) {
             const AttemptReport& rep = *s->report;
@@ -3814,6 +3863,8 @@ private:
                 const bool done = node_->holds_tip(it->second.tip) || node_->rests_on_claims();
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
+                    node_->end_comparison(it->first);  // no next page of its comparison
+                    drop_catchup_asks_locked(it->first);  // nor a deferred or waiting request of it
                     it = catchup_.erase(it);
                     continue;
                 }
@@ -3845,7 +3896,7 @@ private:
                 }
                 // again from the new best tip (the locator from its step 0), or after a request that got no reply
                 // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
-                if (c.fetch_tip == Hash32{} && c.asked_best != b.id) {
+                if (c.fetch_tip == Hash32{} && c.asked_best != b.id && !node_->comparison_paused(it->first)) {
                     c.step = 0;
                     catchup_ask_locked(it->first, c);
                 } else if (c.fetch_tip == Hash32{} && !deferred && now_ms() >= c.asked_ms + abandon_s_ * 1000) {
