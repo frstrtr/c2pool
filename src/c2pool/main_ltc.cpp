@@ -294,6 +294,7 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/schedule_anchors.hpp>
 #include <impl/doge/coin/schedule_dispatch.hpp>
 #include <core/coin/utxo_digest.hpp>
+#include <core/coin/utxo_stats.hpp>
 // 2b-ii: embedded NMC merged-mining backend (host activation)
 #include <impl/nmc/coin/aux_chain_embedded.hpp>
 // #980: embedded NMC P2P AuxPoW header-feed (seeds + wire parser)
@@ -600,6 +601,8 @@ void print_help() {
     std::cout << "                            be complete into the configured --doge-header-checkpoint\n";
     std::cout << "  --utxo-digest DIR         Print the digest of the UTXO LevelDB at DIR (SHA256 over\n";
     std::cout << "                            its coins, sync state and best block) and exit\n";
+    std::cout << "  --utxo-stats DIR          Print gettxoutsetinfo for the UTXO LevelDB at DIR (Dogecoin\n";
+    std::cout << "                            Core 1.14.9's fields and hash_serialized) and exit\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -1295,6 +1298,54 @@ int main(int argc, char* argv[]) {
                           << " synced=" << int(d.sync.synced) << " coins=" << d.sync.coins << "\n";
             else
                 std::cout << "  sync          none (an accrual view: anchor unknown)\n";
+            return 0;
+        }
+        else if (arg == "--utxo-stats" && i + 1 < argc) {
+            // gettxoutsetinfo of a UTXO LevelDB, Dogecoin Core 1.14.9's
+            // GetUTXOStats (no node is started; the DB must not be open in a
+            // running node: LevelDB's lock).
+            const std::string dir = argv[++i];
+            if (!std::filesystem::exists(std::filesystem::path(dir) / "CURRENT")) {
+                std::cerr << "utxo-stats: no LevelDB at " << dir << "\n";
+                return 1;
+            }
+            core::coin::UTXOViewDB db(dir);
+            if (!db.open()) {
+                std::cerr << "utxo-stats: cannot open " << dir << " (in use by a running node?)\n";
+                return 1;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto st = core::coin::utxo_stats(db, [&t0](uint64_t records) {
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::cerr << "utxo-stats: " << records << " records scanned (" << secs << " s)\n";
+            });
+            if (!st.ok) {
+                std::cerr << "utxo-stats: scan error in " << dir << "\n";
+                return 1;
+            }
+            const std::string total = core::coin::format_coin_amount(st.total_amount);
+            std::cout << "utxo-stats " << dir << "\n"
+                      << "  height            " << st.best_height << "\n"
+                      << "  bestblock         " << st.best_block.GetHex() << "\n"
+                      << "  transactions      " << st.transactions << "\n"
+                      << "  txouts            " << st.txouts << "\n"
+                      << "  bytes_serialized  " << st.bytes_serialized << " (tx version counted as 1 byte)\n"
+                      << "  hash_serialized   " << st.hash_serialized.GetHex() << "\n"
+                      << "  total_amount      " << total << " (" << core::coin::u128_to_string(st.total_amount) << " koinu)\n";
+            if (st.sync.tracked())
+                std::cout << "  sync              anchor=" << st.sync.anchor_height << " strict=" << int(st.sync.strict)
+                          << " synced=" << int(st.sync.synced) << " coins=" << st.sync.coins << "\n";
+            else
+                std::cout << "  sync              none (an accrual view: anchor unknown)\n";
+            if (st.unspendable_skipped)
+                std::cout << "  WARNING           " << st.unspendable_skipped
+                          << " unspendable records skipped (Core never stores one)\n";
+            // The gettxoutsetinfo JSON (total_amount a number, as Core's).
+            std::cout << "{\"height\":" << st.best_height << ",\"bestblock\":\"" << st.best_block.GetHex()
+                      << "\",\"transactions\":" << st.transactions << ",\"txouts\":" << st.txouts
+                      << ",\"bytes_serialized\":" << st.bytes_serialized << ",\"hash_serialized\":\""
+                      << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
             return 0;
         }
         else if (arg == "--config" && i + 1 < argc) {
