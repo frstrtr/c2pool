@@ -411,6 +411,10 @@ public:
         n.set_join_step([this] { const JoinRelease r(*this); });
         n.set_inbound_idle([this] { return inbound_idle(); });
         n.set_catchup_claim([this] { return catchup_claim_open(); });
+        n.set_join_delivered([this](std::uint64_t a) {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            return a != 0 && join_mark_ == a;
+        });
         const PathbNodeConfig& c = n.config();
         chain_id_ = c.identity.chain_id;
         p_ = c.p;
@@ -1207,6 +1211,7 @@ private:
         std::vector<std::vector<std::uint8_t>> frames;
         std::uint64_t last_ms = 0;       // the send, then each frame
         bool closed = false;             // the peer disconnected
+        std::uint64_t attempt = 0;       // the open join attempt's id at the send (0: none)
     };
     struct HdrWait {
         bool node = true;                // a request of the node (else a ticket's)
@@ -3540,6 +3545,7 @@ private:
             GetBuckets q;
             if (decode_getbuckets(req, chain_id_, q) == BucketsWireError::None) t.at = q.at;
         }
+        t.attempt = node_ != nullptr && node_->open_attempt() ? node_->join_seq() : 0;  // on the join worker, under the node lock
         const bool live = links_.has_peer(peer);
         std::uint64_t id = 0;
         {
@@ -3595,6 +3601,10 @@ private:
         std::lock_guard<std::mutex> lk(kmtx_);
         const auto it = tickets_.find(id);
         if (it != tickets_.end()) finish_ticket_locked(it);
+    }
+    // Under kmtx_: a reply frame of a join attempt's own request arrived (E-194 (vii)): its id marked.
+    void mark_join_locked(std::uint64_t attempt) {
+        if (attempt > join_mark_) join_mark_ = attempt;
     }
     void finish_ticket_locked(std::map<std::uint64_t, Ticket>::iterator it) {
         const auto q = hdr_fifo_.find(it->second.peer);
@@ -3659,6 +3669,7 @@ private:
             }
             it->second.frames.push_back(f);
             it->second.last_ms = now_ms();
+            if (f.size() <= headers_frame_) mark_join_locked(it->second.attempt);  // in the link's buffer (a larger one DROPs)
             kcv_.notify_all();
             return true;
         }
@@ -3679,6 +3690,7 @@ private:
                 if (id && t.ids.erase(*id) != 0) {
                     t.frames.push_back(f);
                     t.last_ms = now_ms();
+                    mark_join_locked(t.attempt);
                     kcv_.notify_all();
                     return true;
                 }
@@ -3686,6 +3698,7 @@ private:
             if (!id && oldest != nullptr) {  // does not decode: the asked server's reply (its link strikes it)
                 oldest->frames.push_back(f);
                 oldest->last_ms = now_ms();
+                mark_join_locked(oldest->attempt);
                 kcv_.notify_all();
                 return true;
             }
@@ -3703,6 +3716,7 @@ private:
                 if (ok && t.at == v.at) {
                     t.frames.push_back(f);
                     t.last_ms = now_ms();
+                    mark_join_locked(t.attempt);
                     kcv_.notify_all();
                     return true;
                 }
@@ -3710,6 +3724,7 @@ private:
             if (!ok && oldest != nullptr) {
                 oldest->frames.push_back(f);
                 oldest->last_ms = now_ms();
+                mark_join_locked(oldest->attempt);
                 kcv_.notify_all();
                 return true;
             }
@@ -4744,6 +4759,7 @@ private:
     mutable std::mutex kmtx_;  // tickets
     std::condition_variable kcv_;
     std::map<std::uint64_t, Ticket> tickets_;
+    std::uint64_t join_mark_ = 0;  // the last join attempt id a reply frame of its own request reached (kmtx_)
     std::map<std::uint64_t, std::deque<HdrWait>> hdr_fifo_;
     std::map<std::uint64_t, std::uint64_t> hdr_arrived_;  // replies to node requests arrived, not handled yet (kmtx_)
     std::map<std::uint64_t, std::deque<PathbNode::Arrival>> hdr_at_;  // ... their arrivals in link order (kmtx_)

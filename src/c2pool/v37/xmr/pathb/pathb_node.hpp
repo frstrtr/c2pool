@@ -699,6 +699,8 @@ public:
     }
     // The pair of the attempt taken from the queue and not yet applied; nullopt: none.
     const std::optional<AttemptQueue::Pair>& open_attempt() const noexcept { return joiner_->running(); }
+    // The id of the join attempt taken last (0: none yet); the open attempt's while open_attempt() is set.
+    std::uint64_t join_seq() const noexcept { return join_seq_; }
     // E-72: the claimed leaves wait to be asked again after a switch by the journal (a joined store, in its session or
     // after a restart).
     bool reask_pending() const noexcept { return reask_pending_; }
@@ -727,7 +729,10 @@ public:
         for (const auto& [peer, l] : links_) held.push_back(l);
         attempting_ = true;
         if (reask_pending_ && joined_store()) reask_fetch(out);
-        if (attempt) out.attempt = joiner_->attempt_next();
+        if (attempt) {
+            ++join_seq_;  // the id of the attempt this call may take (open while its pair is running)
+            out.attempt = joiner_->attempt_next();
+        }
         attempting_ = false;
         for (const std::shared_ptr<PathbJoinLink>& l : held) l->reset();  // what an attempt received is its own
         return out;
@@ -914,6 +919,9 @@ public:
     void set_inbound_idle(std::function<bool()> f) { inbound_idle_ = std::move(f); }
     // The caller's catch-ups: one not ended toward a tip this node does not hold (the template gate's claim case).
     void set_catchup_claim(std::function<bool()> f) { catchup_claim_ = std::move(f); }
+    // The caller's join deliveries: a frame answering one of the requests of the join attempt with this id arrived
+    // (unset: none).
+    void set_join_delivered(std::function<bool(std::uint64_t)> f) { join_delivered_ = std::move(f); }
     // The template gate's final state (the KATs).
     bool gate_held() const { return gate_holds(); }
     // A completed join attempt that rule (4) did not take, or an adoption, at a store not caught up: K_NCU ends when
@@ -3828,13 +3836,20 @@ private:
     // round, while the header path delivers, while R-CU-1's drain clause is unmet (frames in hand), and, once R-CU-1's
     // first conjunct is met (every HELLO catch-up ended by its done test or its reply's own decision, a completed
     // attempt kept, or an adoption), until K_NCU ends. Before K_NCU ends it opens only where a claim alone opens it: a
-    // HELLO catch-up still open toward a tip the node does not hold, nothing delivered and nothing in hand.
+    // HELLO catch-up still open toward a tip the node does not hold, nothing delivered and nothing in hand. A join
+    // attempt open whose server has delivered in it holds too (E-194 (vii)); a claim opens the gate only after it.
     bool gate_holds() const {
         if (!gate_applies()) return false;
         if (first_round_open_ || delivery_hold()) return true;
         if (!drain_done()) return true;             // frames in hand
         if (ncu_due_ != NcuDue::None) return true;  // a kept attempt or an adoption, until K_NCU ends
+        if (join_hold()) return true;               // a join attempt open, its server delivered in it
         return !claim_open();                       // until K_NCU ends, but for a claim-only open catch-up
+    }
+    // E-194 (vii): a join attempt is open (its pair taken and not yet applied) and a frame answering one of its own
+    // requests arrived (the caller's mark); it ends with the attempt.
+    bool join_hold() const {
+        return gate_applies() && open_attempt().has_value() && join_delivered_ && join_delivered_(join_seq_);
     }
     // A HELLO catch-up not ended (open, or handed to the joiner) toward a tip the node does not hold: the caller's
     // catch-ups (unset: a HELLO tail's tip not held).
@@ -3919,6 +3934,7 @@ private:
     NcuDue ncu_due_ = NcuDue::None;       // a kept attempt or an adoption; K_NCU ends at its drain (E-193)
     std::function<bool()> inbound_idle_;  // the caller's inbound frames all judged (E-193)
     std::function<bool()> catchup_claim_;  // the caller's catch-ups: one not ended toward an unheld tip
+    std::function<bool(std::uint64_t)> join_delivered_;  // the caller's join deliveries, by attempt id (E-194 (vii))
     std::optional<ChainTip> hp_win_;      // headers this node verified that win (their tip and work)
     std::uint64_t hp_win_peer_ = 0;
     Delivery hp_page_;                    // the last page or side-header delivery (E-194 (v))
@@ -3985,6 +4001,7 @@ private:
     bool load_failed_ = false;
     bool reask_pending_ = false;
     bool attempting_ = false;
+    std::uint64_t join_seq_ = 0;  // the id of the join attempt taken last (attempt_join, under the node lock)
     std::set<std::uint64_t> mismatched_;  // claimed bins a claim-leaf mismatch entered (E-72)
     JoinBuckets reask_jb_{cfg_.identity.height + 1, cfg_.p.open_bins, cfg_.bucket_policy.frame_bytes,
                           cfg_.identity.chain_id};

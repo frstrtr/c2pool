@@ -2399,6 +2399,8 @@ struct MultiServerLinks final : pb::RelayLinks {
     EventFn event;
     std::set<std::uint64_t> up;
     std::deque<std::pair<std::uint64_t, std::vector<std::uint8_t>>> inbox;
+    // A request's reply frames edited before they reach the inbox (unset: none).
+    std::function<void(std::uint64_t, const std::vector<std::uint8_t>&, std::vector<std::vector<std::uint8_t>>&)> on_reply;
     void bind(FrameFn f, FrameFn c, EventFn e) override {
         frame = std::move(f);
         control = std::move(c);
@@ -2418,6 +2420,7 @@ struct MultiServerLinks final : pb::RelayLinks {
         if (f[0] == pb::kOpFcGetHeaders) out = sv.serve_getheaders(self, f, h->now).frames;
         if (f[0] == pb::kOpFcGetCarrier) out = sv.serve_getcarrier(self, f, h->now).frames;
         if (f[0] == pb::kOpFcGetBuckets) out = sv.serve_getbuckets(self, f, h->now).frames;
+        if (on_reply) on_reply(p, f, out);
         for (std::vector<std::uint8_t>& x : out) inbox.emplace_back(p, std::move(x));
         return true;
     }
@@ -3019,6 +3022,243 @@ void sideoffer() {
           "sideoffer: then the waiting pair once, then no further attempt");
 }
 
+// ---------------------------------------------------------------------------
+// E-194 (vii) in a relay section. A read of the fresh store's template gate: open, or held; held by (vii) alone when no
+// other clause of the gate holds at that read (nothing in hand, the first round ended, no header-path delivery, no kept
+// attempt or adoption due).
+struct NjViiReads {
+    int open = 0, held = 0, alone = 0;
+    void read(Harness& h, std::size_t n) {
+        pb::PathbNode& x = h[n];
+        const pb::TemplateStatus s = x.make_template(h.now).status;
+        if (s != pb::TemplateStatus::CatchingUp && s != pb::TemplateStatus::NoPathbPeer) {
+            ++open;
+            return;
+        }
+        ++held;
+        if (x.drain_done() && !x.first_round_open() && !x.delivering() && !x.kept_due() && !x.adopt_due()) ++alone;
+    }
+    bool held_alone(int at_least) const { return open == 0 && alone == held && held >= at_least; }
+    bool all_open(int at_least) const { return held == 0 && open >= at_least; }
+    std::string str() const {
+        return "open " + std::to_string(open) + ", held " + std::to_string(held) + " (alone " + std::to_string(alone) + ")";
+    }
+};
+bool nj_vii_end(const std::optional<pb::JoinStep>& st, pb::AttemptEnd e, const std::string& what) {
+    return st && st->report && st->report->end == e && st->report->what == what;
+}
+
+// joinedfresh's setup: two nodes joined at L = 4,704 and at L + 120 (both at L + 120); a fresh store (K_NCU) behind a
+// relay node in manual mode whose servers are the first `n_servers` of them (peer 1: the node joined at L); `min_peers`:
+// P-40's join_min_peers (0: the default). The catch-up from position 0 gets no header: the HELLO tips offered to the
+// joiner.
+struct ViiFresh {
+    JoinNet net{900};
+    KatNode a{net, kJ};
+    Harness h{net};
+    MultiServerLinks links;
+    std::unique_ptr<pb::PathbRelayNode> relay;
+    std::size_t r = 0;
+    pb::Hash32 tip{};
+    ~ViiFresh() {
+        if (relay) relay->stop();
+    }
+};
+bool vii_fresh(ViiFresh& f, std::size_t n_servers, std::size_t min_peers) {
+    const std::uint64_t L = 4704, k = 120;
+    grow(f.a, L);
+    Joined j1 = join_at(f.h, f.net, f.a, kJ);
+    Joining j2 = joining_node(f.h, f.net, kJ);
+    f.h.hello(j2.j, j1.s);
+    const pb::JoinStep st2 = f.h[j2.j].run_join();
+    if (!j1.ok || !st2.switched || f.h[j2.j].joined() == nullptr) return false;
+    const std::vector<pb::Hash32> next = grow(f.a, k);
+    f.h.mon_tip = h_pos(L + k) + 1;
+    for (const std::size_t j : {j1.jn.j, j2.j})
+        for (const pb::Hash32& id : next)
+            (void)f.h[j].on_carrier(j1.s, *pb::encode_fc_carrier(0, *f.a.bodies.get(id), pb::kRuledLaneParams.r_max));
+    f.h.q.clear();
+    f.tip = f.a.store.best_tip();
+    f.links.h = &f.h;
+    f.links.servers = {j1.jn.j, j2.j};
+    f.links.servers.resize(n_servers);
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    if (min_peers != 0) o.join_min_peers = min_peers;
+    pb::RelayClock clock;
+    Harness* hp = &f.h;
+    clock.mono_ms = [hp] { return hp->now * 1000; };
+    clock.wall_s = [hp] { return hp->now; };
+    f.relay = std::make_unique<pb::PathbRelayNode>(o, f.links, clock);
+    f.links.relay = f.relay.get();
+    f.r = f.h.nodes.size();
+    f.links.self = f.r;
+    f.h.kvs.push_back(std::make_unique<MemoryKv>());
+    MemoryKv& kv = *f.h.kvs.back();
+    f.h.nodes.push_back(
+            std::make_unique<pb::PathbNode>(f.h.config(kat_table(f.net), false, kJ), f.relay->bind_io(f.h.io(f.r)), &kv));
+    f.relay->attach(*f.h.nodes[f.r]);
+    MultiServerLinks* lp = &f.links;
+    f.relay->set_drive([lp] { return lp->step(); });
+    std::string why;
+    if (!f.relay->start(why)) return false;
+    f.links.connect_all();
+    f.links.run();
+    return f.h[f.r].tree().best().pos == 0 && !f.h[f.r].caught_up() && f.h[f.r].joiner().queue().size() >= 1;
+}
+
+// viiwait g1 (RC 11.6 item 4): joinedfresh's setup; the attempt (not young: x0 > 1) reaches fetch A (FC_GETBUCKETS at
+// c_x0). Once the bucket stream's frames are delivered, the clock is driven 1 s at a time with the relay's tick and a
+// read until the collect's own deadline (P-53 after the last bucket frame) ends it; then, at the first drive call after
+// the next request is sent, the tick and a read before its reply.
+void viiwaitg1() {
+    ViiFresh f;
+    if (!vii_fresh(f, 2, 0)) {
+        check(false, "viiwait g1: setup (two joined servers; a fresh store with a join pair)");
+        return;
+    }
+    pb::PathbNode& n = f.h[f.r];
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    const bool round_over = !n.first_round_open();
+    bool in_att = false, bucket_open = false, bucket_done = false, post_pending = false;
+    std::uint64_t bucket_t = 0, next_t = 0;
+    std::size_t bucket_frames = 0;
+    std::uint8_t next_op = 0;
+    int late = 0;
+    NjViiReads in, post;
+    f.links.on_reply = [&](std::uint64_t, const std::vector<std::uint8_t>& req, std::vector<std::vector<std::uint8_t>>& out) {
+        if (!in_att || req.empty() || bucket_done) return;
+        if (!bucket_open && req[0] == pb::kOpFcGetBuckets) {
+            bucket_open = true;
+            bucket_t = f.h.now;
+            bucket_frames = out.size();
+            return;
+        }
+        if (bucket_open) {  // the attempt's next request after fetch A's stream ended
+            bucket_open = false;
+            bucket_done = true;
+            post_pending = true;
+            next_t = f.h.now;
+            next_op = req[0];
+        }
+    };
+    f.relay->set_drive([&] {
+        if (post_pending) {
+            post_pending = false;
+            f.relay->tick();
+            post.read(f.h, f.r);
+        }
+        if (f.links.step()) return true;
+        if (!in_att || f.relay->open_tickets() == 0) return false;
+        f.h.now += 1;  // the request's own P-53 runs; the collect's deadline ends it
+        f.relay->tick();
+        if (bucket_open) {
+            in.read(f.h, f.r);
+            if (f.h.now >= bucket_t + p53) ++late;
+        }
+        return true;
+    });
+    in_att = true;
+    const std::optional<pb::JoinStep> st = f.relay->join_step();
+    in_att = false;
+    MultiServerLinks* lp = &f.links;
+    f.relay->set_drive([lp] { return lp->step(); });
+    f.links.run();
+    std::printf("  viiwait g1: first round ended %d; fetch A sent at %llu with %zu frames; the next request (op 0x%02x) "
+                "%llu s after it; in fetch A's end-of-stream: %s (at or past P-53 %d); before the next reply: %s; the "
+                "attempt %s\n",
+                round_over ? 1 : 0, (unsigned long long)bucket_t, bucket_frames, next_op,
+                (unsigned long long)(next_t - bucket_t), in.str().c_str(), late, post.str().c_str(),
+                st && st->report ? pb::attempt_end_name(st->report->end) : "none");
+    check(round_over && bucket_t != 0 && bucket_frames >= 1 && next_t == bucket_t + p53 && post.held + post.open == 1,
+          "viiwait g1: setup (fetch A sent; its collect ended P-53 after its last frame; the next request in the same "
+          "attempt)");
+    check(in.held_alone(static_cast<int>(p53)) && post.held_alone(1) && late >= 1,
+          "viiwait g1: held by (vii) alone across the bucket end-of-stream (" + in.str() + "; then " + post.str() + ")");
+}
+
+// viialarm (RC 11.6 item 5): joinedfresh's setup; the attempt's server answers fetch A with its S_parent changed (one
+// bit, re-encoded): AttemptEnd::Alarm, the server excluded with all its pairs (P-52). Read inside the attempt after its
+// first frame. Two servers: the other server's pair stays; between attempts the gate is open by its hand-over claim,
+// K_NCU set. One server (join_min_peers 1): no pair is left; K_NCU's end is evaluated at the exclusion; the gate opens.
+struct ViiAlarm {
+    bool setup = false, edited = false, alarm = false, excluded = false, ncu = false, open_after = false;
+    std::size_t pairs = 0, pairs_after = 0;
+    std::string end;
+    NjViiReads in, between;
+};
+ViiAlarm vii_alarm(bool two) {
+    ViiAlarm o;
+    ViiFresh f;
+    if (!vii_fresh(f, two ? 2 : 1, two ? 0 : 1)) return o;
+    pb::PathbNode& n = f.h[f.r];
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    o.pairs = n.joiner().queue().size();
+    bool in_att = false;
+    std::uint64_t server = 0;
+    f.links.on_reply = [&](std::uint64_t p, const std::vector<std::uint8_t>& req, std::vector<std::vector<std::uint8_t>>& out) {
+        if (!in_att || req.empty() || o.edited || req[0] != pb::kOpFcGetBuckets) return;
+        o.edited = true;
+        server = p;
+        for (std::vector<std::uint8_t>& fr : out) {
+            pb::BucketsReply br;
+            if (pb::decode_buckets(fr, 0, br) != pb::BucketsWireError::None) continue;
+            br.s_parent[2] ^= 1;
+            if (std::optional<std::vector<std::uint8_t>> e = pb::encode_buckets(br)) fr = std::move(*e);
+        }
+    };
+    f.relay->set_drive([&] {
+        if (!f.links.step()) return false;
+        if (in_att && f.relay->open_tickets() > 0) o.in.read(f.h, f.r);
+        return true;
+    });
+    in_att = true;
+    const std::optional<pb::JoinStep> st = f.relay->join_step();
+    in_att = false;
+    MultiServerLinks* lp = &f.links;
+    f.relay->set_drive([lp] { return lp->step(); });
+    f.links.run();
+    o.end = st && st->report ? std::string(pb::attempt_end_name(st->report->end)) + " (" + st->report->what + ")" : "none";
+    o.alarm = nj_vii_end(st, pb::AttemptEnd::Alarm, "a bucket reply against a claimed at header");
+    o.excluded = server != 0 && n.joiner().queue().excluded(server);
+    o.pairs_after = n.joiner().queue().size();
+    if (two)
+        for (std::uint64_t k = 0; k < p53; ++k) {  // between attempts (an Alarm end does not pace; no join step here)
+            f.h.now += 1;
+            f.relay->tick();
+            o.between.read(f.h, f.r);
+            f.links.run();
+        }
+    o.ncu = !n.caught_up();
+    const pb::TemplateStatus s = n.make_template(f.h.now).status;
+    o.open_after = s != pb::TemplateStatus::CatchingUp && s != pb::TemplateStatus::NoPathbPeer;
+    o.setup = o.edited && o.alarm;
+    return o;
+}
+void viialarm() {
+    const ViiAlarm t = vii_alarm(true);
+    std::printf("  viialarm (two servers): pairs %zu; edited %d; the attempt %s; excluded %d; pairs after %zu; in the "
+                "attempt: %s; between attempts: %s; K_NCU %d\n",
+                t.pairs, t.edited ? 1 : 0, t.end.c_str(), t.excluded ? 1 : 0, t.pairs_after, t.in.str().c_str(),
+                t.between.str().c_str(), t.ncu ? 1 : 0);
+    check(t.setup && t.pairs == 2, "viialarm: setup (two servers; fetch A's S_parent changed: Alarm, a bucket reply "
+                                   "against a claimed at header)");
+    check(t.in.held_alone(1), "viialarm: held by (vii) alone (" + t.in.str() + ")");
+    check(t.excluded && t.pairs_after == 1 && t.between.all_open(10) && t.ncu,
+          "viialarm: the excluded server's delivered frame holds nothing after the end (" + t.between.str() +
+                  "); the other pair queued; K_NCU set");
+    const ViiAlarm one = vii_alarm(false);
+    std::printf("  viialarm (one server): pairs %zu; edited %d; the attempt %s; excluded %d; pairs after %zu; in the "
+                "attempt: %s; K_NCU %d; the gate open %d\n",
+                one.pairs, one.edited ? 1 : 0, one.end.c_str(), one.excluded ? 1 : 0, one.pairs_after, one.in.str().c_str(),
+                one.ncu ? 1 : 0, one.open_after ? 1 : 0);
+    check(one.setup && one.pairs == 1, "viialarm: setup (one server; Alarm)");
+    check(one.in.held_alone(1), "viialarm: held by (vii) alone, one server (" + one.in.str() + ")");
+    check(one.excluded && one.pairs_after == 0 && !one.ncu && one.open_after,
+          "viialarm: one server: excluded, no pair left; K_NCU's end evaluated at the exclusion; the gate open");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3070,6 +3310,8 @@ int main(int argc, char** argv) {
                                 {"sidedeep", sidedeep, 40},
                                 {"sideempty", sideempty, 1},
                                 {"sideoffer", sideoffer, 1},
+                                {"viiwaitg1", viiwaitg1, 30},
+                                {"viialarm", viialarm, 45},
                         },
                         argc, argv);
 }
