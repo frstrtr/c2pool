@@ -15488,6 +15488,965 @@ void minerflush() {
                   ")");
 }
 
+// ---------------------------------------------------------------------------
+// E-194 (vii): the template gate during a join attempt. A held read counts as held by (vii) alone when no other clause
+// of the gate holds at that read: nothing in hand, the first round ended, no header-path delivery, no kept attempt or
+// adoption due.
+bool vii_alone(Harness& h, std::size_t n) {
+    const pb::PathbNode& x = h[n];
+    return x.drain_done() && !x.first_round_open() && !x.delivering() && !x.kept_due() && !x.adopt_due();
+}
+struct ViiReads {
+    int open = 0, held = 0, alone = 0;
+    void read(Harness& h, std::size_t n) {
+        if (gate_open(h, n)) {
+            ++open;
+            return;
+        }
+        ++held;
+        if (vii_alone(h, n)) ++alone;
+    }
+    bool held_alone(int at_least) const { return open == 0 && alone == held && held >= at_least; }
+    bool all_open(int at_least) const { return held == 0 && open >= at_least; }
+    std::string str() const {
+        return "open " + std::to_string(open) + ", held " + std::to_string(held) + " (alone " + std::to_string(alone) + ")";
+    }
+};
+bool vii_end(const std::optional<pb::JoinStep>& st, pb::AttemptEnd e, const std::string& what) {
+    return st && st->report && st->report->end == e && st->report->what == what;
+}
+std::string vii_end_text(const std::optional<pb::JoinStep>& st) {
+    return st && st->report ? std::string(pb::attempt_end_name(st->report->end)) + " (" + st->report->what + ")" : "none";
+}
+
+// The departure rig's joiner requests: J's FC_GETHEADERS to B from the zero id, in link order with the catch-up's;
+// `on_reply` edits B's FC_HEADERS reply to a joiner request (after the rig's own edit); `sent`: the last one's time.
+struct DepJoin {
+    std::deque<bool> kinds;  // true: a joiner request
+    std::uint64_t sent = 0;
+    std::function<void(FakeWire::Msg&)> on_reply;
+};
+void dep_join_edit(DepRig& r, DepJoin& dj) {
+    const std::function<void(FakeWire::Msg&)> base = r.w.edit;
+    r.w.edit = [&r, &dj, base](FakeWire::Msg& m) {
+        bool joiner_reply = false;
+        if (!m.f.empty() && m.from == DepRig::jwire && m.to == 1 && m.f[0] == pb::kOpFcGetHeaders) {
+            pb::GetHeaders q;
+            const bool j = pb::decode_fc_getheaders(m.f, 0, q).ok() && q.from == pb::Hash32{};
+            dj.kinds.push_back(j);
+            if (j) dj.sent = r.h.now;
+        } else if (!m.f.empty() && m.from == 1 && m.to == DepRig::jwire && m.f[0] == pb::kOpFcHeaders && !dj.kinds.empty()) {
+            joiner_reply = dj.kinds.front();
+            dj.kinds.pop_front();
+        }
+        base(m);
+        if (joiner_reply && !m.f.empty() && dj.on_reply) dj.on_reply(m);
+    };
+}
+// The departure rig between attempts: `secs` seconds of J (the tick, a read, the pump and the wire).
+void dep_pace(DepRig& r, std::uint64_t secs, ViiReads& rd) {
+    for (std::uint64_t k = 0; k < secs; ++k) {
+        r.h.now += 1;
+        r.rj().tick();
+        rd.read(r.h, r.j.node);
+        r.rj().pump();
+        for (int m = 0; m < 100 && r.w.step(); ++m) {
+        }
+    }
+}
+
+// viins (RC 11.6 item 2): the departure rig (B's catch-up handed to the joiner, no frame parked), B silent to every
+// joiner page. Three attempts, each waiting P-53 from its send (the clock driven while the wire is idle) and ending
+// NotServed, each followed by P-53 of J. Read inside each attempt and between attempts.
+void viins() {
+    DepRig r(7100, true, 0);
+    r.silent = false;
+    r.hand = true;
+    r.pages_silent = true;
+    r.connect_b_a();
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    const std::size_t pairs = n.joiner().queue().size();
+    const bool round_over = !n.first_round_open();
+    DepJoin dj;
+    dep_join_edit(r, dj);
+    ViiReads in, pace;
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;  // the request's own P-53 runs; its collect's deadline ends it
+        in.read(r.h, r.j.node);
+        return true;
+    });
+    int ns = 0, other = 0;
+    bool waited = true;
+    for (int c = 0; c < 3; ++c) {
+        dj.sent = 0;
+        const std::optional<pb::JoinStep> st = r.rj().join_step();
+        ++(vii_end(st, pb::AttemptEnd::NotServed, "headers not served") ? ns : other);
+        waited = waited && dj.sent != 0 && r.h.now >= dj.sent + p53;
+        dep_pace(r, p53, pace);
+    }
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    const bool ncu = !n.caught_up();
+    std::printf("  viins: pairs %zu; first round ended %d; attempts NotServed %d, other %d; P-53 waited %d; in the "
+                "attempts: %s; between: %s; K_NCU %d; pairs after %zu; lines %zu\n",
+                pairs, round_over ? 1 : 0, ns, other, waited ? 1 : 0, in.str().c_str(), pace.str().c_str(), ncu ? 1 : 0,
+                n.joiner().queue().size(), r.n_lines());
+    check(r.walked && pairs == 1 && round_over && ns == 3 && other == 0 && waited,
+          "viins: setup (B's pair attempted three times, each NotServed P-53 after its send; the first round ended)");
+    check(in.all_open(3 * static_cast<int>(p53 - 1)), "viins: an open attempt with no frame holds nothing (" + in.str() + ")");
+    check(pace.all_open(3 * static_cast<int>(p53)) && ncu && n.joiner().queue().size() == 1 && r.n_lines() == 0,
+          "viins: the pacing holds nothing (" + pace.str() + "); K_NCU set; the pair queued again; no line");
+}
+
+// A reply to fetch_top made short (S4wa-2): its first header dropped, first_pos one higher; false: not possible.
+bool vii_shorten(FakeWire::Msg& m, const pb::PathbNode& n) {
+    pb::HeadersReply rep;
+    if (!pb::decode_fc_headers(m.f, n.config().identity.chain_id, n.frame_bytes_headers(), n.config().p, rep).ok()
+        || rep.headers.size() < 2)
+        return false;
+    rep.headers.erase(rep.headers.begin());
+    rep.first_pos += 1;
+    const std::optional<std::vector<std::uint8_t>> f = pb::encode_fc_headers(rep, n.frame_bytes_headers());
+    if (!f) return false;
+    m.f = *f;
+    return true;
+}
+
+// viishort (RC 11.6 item 3): the departure rig; B's reply to each attempt's fetch_top carries one header fewer than it
+// could (a short reply, S4wa-2): NotServed. Three attempts, each followed by P-53 of J. Read inside each attempt before
+// B's frame, and between attempts.
+void viishort() {
+    DepRig r(7200, true, 0);
+    r.silent = false;
+    r.hand = true;
+    r.connect_b_a();
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    const std::size_t pairs = n.joiner().queue().size();
+    const bool round_over = !n.first_round_open();
+    DepJoin dj;
+    bool got = false, shortened = true;
+    dj.on_reply = [&](FakeWire::Msg& m) {
+        shortened = vii_shorten(m, n) && shortened;
+        got = true;
+    };
+    dep_join_edit(r, dj);
+    ViiReads first, later, pace;
+    int attempt = 0;
+    r.rj().set_drive([&] {
+        if (!got && r.rj().open_tickets() > 0) (attempt == 0 ? first : later).read(r.h, r.j.node);
+        if (r.w.step()) return true;
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;
+        return true;
+    });
+    int ns = 0, other = 0;
+    for (; attempt < 3; ++attempt) {
+        got = false;
+        const std::optional<pb::JoinStep> st = r.rj().join_step();
+        ++(vii_end(st, pb::AttemptEnd::NotServed, "a short FC_HEADERS reply") ? ns : other);
+        dep_pace(r, p53, pace);
+    }
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    const bool ncu = !n.caught_up();
+    std::printf("  viishort: pairs %zu; first round ended %d; shortened %d; short-reply ends %d, other %d; before B's "
+                "frame: attempt 1 %s, attempts 2-3 %s; between: %s; K_NCU %d; pairs after %zu\n",
+                pairs, round_over ? 1 : 0, shortened ? 1 : 0, ns, other, first.str().c_str(), later.str().c_str(),
+                pace.str().c_str(), ncu ? 1 : 0, n.joiner().queue().size());
+    check(r.walked && pairs == 1 && round_over && shortened && ns == 3 && other == 0,
+          "viishort: setup (three attempts, each ended NotServed on a short reply to fetch_top)");
+    check(later.all_open(2) && first.all_open(1), "viishort: a new attempt holds nothing before its frame (" +
+                                                          first.str() + "; " + later.str() + ")");
+    check(pace.all_open(3 * static_cast<int>(p53)) && ncu && n.joiner().queue().size() == 1,
+          "viishort: the pacing holds nothing (" + pace.str() + "); K_NCU set; the pair queued again");
+}
+
+// viibig (MF-1): the departure rig; B answers each attempt's fetch_top with one FC_HEADERS frame of its buffer + 1
+// bytes, 5 s after the request (the link DROPs it: no header, NotServed). Three attempts, each followed by P-53 of J.
+// Read inside each attempt after the big frame (through its P-53) and between attempts.
+void viibig() {
+    DepRig r(7300, true, 0);
+    r.silent = false;
+    r.hand = true;
+    r.connect_b_a();
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    const std::size_t pairs = n.joiner().queue().size();
+    const bool round_over = !n.first_round_open();
+    std::vector<std::uint8_t> big(static_cast<std::size_t>(n.frame_bytes_headers()) + 1, 0);
+    big[0] = pb::kOpFcHeaders;
+    DepJoin dj;
+    std::uint64_t due = 0, big_at = 0;
+    dj.on_reply = [&](FakeWire::Msg& m) {
+        m.f.clear();  // B's own reply held back: its big frame 5 s after the request instead
+        due = r.h.now + 5;
+    };
+    dep_join_edit(r, dj);
+    ViiReads after, pace;
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;
+        if (due != 0 && r.h.now >= due) {
+            due = 0;
+            big_at = r.h.now;
+            r.w.links[DepRig::jwire]->frame(r.w.id(DepRig::jwire, 1), big);
+            r.rj().pump();
+        }
+        if (big_at != 0) after.read(r.h, r.j.node);
+        return true;
+    });
+    int ns = 0, other = 0;
+    bool timed = true;
+    for (int c = 0; c < 3; ++c) {
+        due = big_at = 0;
+        const std::optional<pb::JoinStep> st = r.rj().join_step();
+        ++(vii_end(st, pb::AttemptEnd::NotServed, "headers not served") ? ns : other);
+        timed = timed && big_at != 0 && r.h.now == big_at + p53;
+        dep_pace(r, p53, pace);
+    }
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    const bool ncu = !n.caught_up();
+    std::printf("  viibig: pairs %zu; first round ended %d; the frame %llu bytes (buffer %llu); NotServed %d, other %d; "
+                "each request ended P-53 after the big frame %d; after the frame: %s; between: %s; K_NCU %d\n",
+                pairs, round_over ? 1 : 0, (unsigned long long)big.size(), (unsigned long long)n.frame_bytes_headers(),
+                ns, other, timed ? 1 : 0, after.str().c_str(), pace.str().c_str(), ncu ? 1 : 0);
+    check(r.walked && pairs == 1 && round_over && ns == 3 && other == 0 && timed,
+          "viibig: setup (the big frame pushed to the attempt's ticket: each request ended P-53 after the big frame; "
+          "NotServed)");
+    check(after.all_open(3 * static_cast<int>(p53)), "viibig: an over-buffer FC_HEADERS frame holds nothing (" +
+                                                             after.str() + ")");
+    check(pace.all_open(3 * static_cast<int>(p53)) && ncu && n.joiner().queue().size() == 1,
+          "viibig: between attempts the gate open (" + pace.str() + "); K_NCU set");
+}
+
+// gatekept's rig (E-178): J not caught up (journal depth 4) walked D's chain 1..8; B (A's 1, 2 and its own 3) answers
+// J's catch-up with no header (its tip handed to the joiner: one pair); C (its own carrier on 1) never answers J's
+// FC_GETHEADERS (J's catch-up toward it a claim). No frame parked; C's first round ended (P-53 + 1 s of J) before any
+// attempt. `joiner` sees B's replies to J's joiner requests (FC_HEADERS from the zero id; FC_CARRIER).
+struct KeptRig {
+    KatNet net;
+    Harness h;
+    FakeWire w;
+    KatRelay a, b, d, j, c;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    std::vector<std::vector<std::uint8_t>> copies;
+    std::deque<bool> asked;  // J's FC_GETHEADERS to B: true = a catch-up request (from a held id)
+    pb::Hash32 own_tip{}, tip_c{};
+    bool ok = true, handed = false, round_over = false;
+    std::uint64_t carrier_sent = 0;  // the last FC_GETCARRIER of J to B
+    std::function<void(FakeWire::Msg&)> joiner;
+    static constexpr std::size_t jwire = 3;
+    explicit KeptRig(std::uint32_t nonce) : h(net) {
+        a = kat_relay(h, w, table0(net), true);
+        b = kat_relay(h, w, table0(net), true);
+        d = kat_relay(h, w, table0(net), true);
+        w.connect(0, 1);
+        w.connect(0, 2);
+        w.run();
+        for (int i = 0; i < 2; ++i) {
+            h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i), nonce + static_cast<std::uint32_t>(i));
+        }
+        w.links[1]->disconnect(w.id(1, 0));
+        w.links[2]->disconnect(w.id(2, 0));
+        w.run();
+        h.tick_monero();
+        ok = ok && mine_on(h, w, b.node, 2, nonce + 100);
+        for (int i = 0; i < 6; ++i) {
+            h.tick_monero();
+            ok = ok && mine_on(h, w, d.node, static_cast<std::size_t>(i % 5), nonce + 200 + static_cast<std::uint32_t>(i));
+        }
+        const std::uint64_t J = 4;
+        const std::size_t jw = h.add(table0(net), false, J, true);
+        MemoryKv& kvw = *h.kvs.back();
+        for (std::uint64_t x = 1; x <= 8; ++x)
+            if (const std::optional<pb::Hash32> id = h[d.node].store().best_at(x)) {
+                copies.push_back(*pb::encode_fc_carrier(0, *h[d.node].bodies().get(*id), 16));
+                (void)h[jw].on_carrier(77, copies.back());
+            }
+        h.q.clear();
+        own_tip = h[jw].tree().best().id;
+        ok = ok && h[jw].tree().best().pos == 8 && !h[jw].caught_up() && h[b.node].tree().best().pos == 3;
+        j = kat_relay_loaded(h, w, kvw, h.config(table0(net), false, J),
+                             [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; });
+        j.relay->test_defer_ends(true);
+        c = kat_relay(h, w, table0(net), true);  // wire 4: its own carrier on position 1
+        (void)mine_only(h, c.node, 4, nonce + 290);
+        tip_c = h[c.node].tree().best().id;
+        g_relay_lines = &lines;
+        w.edit = [this](FakeWire::Msg& m) {
+            if (m.f.empty()) return;
+            if (m.from == jwire && m.to == 1 && m.f[0] == pb::kOpFcGetHeaders) {
+                pb::GetHeaders q;
+                if (pb::decode_fc_getheaders(m.f, 0, q).ok()) asked.push_back(q.from != pb::Hash32{});
+                return;
+            }
+            if (m.from == jwire && m.to == 1 && m.f[0] == pb::kOpFcGetCarrier) {
+                carrier_sent = h.now;
+                return;
+            }
+            if (m.from == 1 && m.to == jwire && m.f[0] == pb::kOpFcCarrier) {
+                if (joiner) joiner(m);
+                return;
+            }
+            if (m.f[0] != pb::kOpFcHeaders) return;
+            if (m.from == jwire || m.from == 4) {  // J's and C's FC_HEADERS: never answered
+                m.f.clear();
+                return;
+            }
+            if (m.from != 1 || m.to != jwire || asked.empty()) return;
+            const bool catchup = asked.front();
+            asked.pop_front();
+            if (catchup)
+                m.f = *pb::encode_fc_headers(pb::HeadersReply{0, 0, {}}, 1u << 22);
+            else if (joiner)
+                joiner(m);
+        };
+        w.connect(1, jwire);
+        w.run();
+        w.connect(4, jwire);  // C: J's catch-up toward it stays open (a claim)
+        w.run();
+        handed = h[j.node].joiner().queue().size() == 1 && !h[j.node].holds_tip(tip_c);
+        for (std::uint64_t k = 0; k <= h[j.node].config().abandon_timeout_s; ++k) {  // C's first round ends (P-53)
+            h.now += 1;
+            j.relay->tick();
+            w.run();
+        }
+        round_over = !h[j.node].first_round_open();
+    }
+    ~KeptRig() {
+        w.edit = nullptr;
+        g_relay_lines = nullptr;
+    }
+    KeptRig(const KeptRig&) = delete;
+    KeptRig& operator=(const KeptRig&) = delete;
+    pb::PathbRelayNode& rj() { return *j.relay; }
+    pb::PathbNode& nj() { return h[j.node]; }
+    std::size_t n_lines() const { return caught_of(lines, j.node).size(); }
+    // `secs` seconds of J between attempts: the tick, a read, the pump and the wire.
+    void pace(std::uint64_t secs, ViiReads& rd, const std::function<void()>& at = nullptr) {
+        for (std::uint64_t k = 0; k < secs; ++k) {
+            h.now += 1;
+            rj().tick();
+            rd.read(h, j.node);
+            if (at) at();
+            rj().pump();
+            for (int m = 0; m < 100 && w.step(); ++m) {
+            }
+        }
+    }
+};
+
+// The gatekept rig's stall: B serves each attempt's fetch_top page, then never answers its body request (FC_GETCARRIER):
+// the request's own P-53 from its send (the clock driven while the wire is idle) ends the attempt NotServed, "bodies not
+// served"; the pair queued again. `cycles` attempts, each followed by P-53 of J. Read inside each attempt after B's
+// page, and between attempts; unverified_claims() at each read.
+struct KeptStall {
+    bool setup = false, dmin = true, waited = true, ncu = false;
+    int ns = 0, other = 0, uc_in = 0, uc_pace = 0, p53 = 0;
+    std::size_t pairs = 0, pairs_after = 0;
+    ViiReads in, pace;
+    std::string str() const {
+        return "pairs " + std::to_string(pairs) + "; NotServed (bodies) " + std::to_string(ns) + ", other " +
+               std::to_string(other) + "; P-53 waited " + std::to_string(waited ? 1 : 0) + "; in the attempts: " +
+               in.str() + " (unverified claims " + std::to_string(uc_in) + "); between: " + pace.str() +
+               " (unverified claims " + std::to_string(uc_pace) + "); K_NCU " + std::to_string(ncu ? 1 : 0) +
+               "; pairs after " + std::to_string(pairs_after) + "; d_min " + std::to_string(dmin ? 1 : 0);
+    }
+};
+KeptStall kept_stall(std::uint32_t nonce, int cycles) {
+    KeptStall o;
+    KeptRig r(nonce);
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    o.p53 = static_cast<int>(p53);
+    o.pairs = n.joiner().queue().size();
+    for (std::uint64_t x = 1; x <= 3; ++x) {  // B's headers at d_min (R-4's flat chain)
+        const std::optional<pb::Hash32> id = r.h[r.b.node].store().best_at(x);
+        const pb::CarrierBodyV3* bd = id ? r.h[r.b.node].bodies().get(*id) : nullptr;
+        o.dmin = o.dmin && bd != nullptr && bd->own.side.t_origin == n.config().p.d_min;
+    }
+    bool page = false;
+    r.joiner = [&](FakeWire::Msg& m) {
+        if (m.f[0] == pb::kOpFcHeaders) page = true;
+        if (m.f[0] == pb::kOpFcCarrier) m.f.clear();  // the body request never answered
+    };
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;
+        if (page) {
+            o.in.read(r.h, r.j.node);
+            if (n.unverified_claims()) ++o.uc_in;
+        }
+        return true;
+    });
+    for (int c = 0; c < cycles; ++c) {
+        page = false;
+        r.carrier_sent = 0;
+        const std::optional<pb::JoinStep> st = r.rj().join_step();
+        ++(vii_end(st, pb::AttemptEnd::NotServed, "bodies not served") ? o.ns : o.other);
+        o.waited = o.waited && page && r.carrier_sent != 0 && r.h.now >= r.carrier_sent + p53;
+        r.pace(p53, o.pace, [&] {
+            if (n.unverified_claims()) ++o.uc_pace;
+        });
+    }
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    o.ncu = !n.caught_up();
+    o.pairs_after = n.joiner().queue().size();
+    o.setup = r.ok && r.handed && r.round_over && o.pairs == 1 && o.ns == cycles && o.other == 0 && o.waited;
+    return o;
+}
+
+// viistall (RC 12.1, REPORTED: the deliver-then-stall repeat; pins today's behaviour, no bound): held from B's page to
+// each attempt's end, open between attempts.
+void viistall() {
+    const KeptStall o = kept_stall(5100, 3);
+    std::printf("  viistall: %s\n", o.str().c_str());
+    check(o.setup, "viistall: setup (B in scope; each attempt reaches the body request, ends NotServed P-53 after its "
+                   "send; the pair queued again; C's first round ended)");
+    check(o.in.held_alone(3 * (o.p53 - 1)), "viistall: held from B's page to the attempt's end, by (vii) alone (" +
+                                                          o.in.str() + ")");
+    check(o.pace.all_open(3 * o.p53) && o.ncu && o.pairs_after == 1, "viistall: open between attempts (" + o.pace.str() +
+                                                                        "); K_NCU set");
+}
+
+// viir4 (RC 11.6 item 7, REPORTED: R-4, a flat d_min chain served in every queue round; pins today's behaviour, no
+// bound): B's headers all at t_origin = d_min; held through each round's header phase, open between attempts.
+void viir4() {
+    const KeptStall o = kept_stall(5300, 3);
+    std::printf("  viir4: %s\n", o.str().c_str());
+    check(o.dmin, "viir4: setup (B's headers 1-3 all at t_origin == d_min)");
+    check(o.setup, "viir4: setup (each round delivers the header phase, then stalls: NotServed, the pair queued again)");
+    check(o.in.held_alone(3 * (o.p53 - 1)), "viir4: held through each round, by (vii) alone (" + o.in.str() + ")");
+    check(o.pace.all_open(3 * o.p53) && o.ncu, "viir4: open between rounds (" + o.pace.str() + "); K_NCU set");
+}
+
+// viiclaims (RC 11.6 item 8): unverified_claims() reads the final predicate, (vii) included: no report while (vii)
+// holds; between attempts (the gate open by the claims, B's and C's tips unheld) the report.
+void viiclaims() {
+    const KeptStall o = kept_stall(5500, 2);
+    std::printf("  viiclaims: %s\n", o.str().c_str());
+    check(o.setup, "viiclaims: setup (B's attempts reach the body request and end NotServed; C's first round ended)");
+    check(o.in.held_alone(2 * (o.p53 - 1)) && o.uc_in == 0, "viiclaims: no unverified-claims report while (vii) holds (" +
+                                                           o.in.str() + ", reports " + std::to_string(o.uc_in) + ")");
+    check(o.pace.all_open(2 * o.p53) && o.uc_pace == o.pace.open && o.ncu,
+          "viiclaims: between attempts the gate open with the report (" + o.pace.str() + ", reports " +
+                  std::to_string(o.uc_pace) + ")");
+}
+
+// viitrickle (RC 11.6 item 7, REPORTED: the trickle; pins today's behaviour, no bound): B's three body frames released
+// one per P-53 - 1 s, the third withheld: the request's P-53 after the second frame ends the attempt NotServed (a short
+// FC_GETCARRIER reply). Two attempts, each followed by P-53 of J.
+void viitrickle() {
+    KeptRig r(5700);
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    const std::size_t pairs = n.joiner().queue().size();
+    bool page = false;
+    std::deque<std::vector<std::uint8_t>> held;
+    int released = 0;
+    std::uint64_t last = 0;
+    r.joiner = [&](FakeWire::Msg& m) {
+        if (m.f[0] == pb::kOpFcHeaders) page = true;
+        if (m.f[0] == pb::kOpFcCarrier) {
+            if (held.empty() && released == 0 && last == 0) last = r.h.now;  // the reply's time: the first P-53 - 1 s from it
+            held.push_back(std::move(m.f));
+            m.f.clear();
+        }
+    };
+    ViiReads in, pace;
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;
+        if (!held.empty() && released < 2 && r.h.now >= last + p53 - 1) {
+            std::vector<std::uint8_t> f = std::move(held.front());
+            held.pop_front();
+            ++released;
+            last = r.h.now;
+            r.w.links[KeptRig::jwire]->frame(r.w.id(KeptRig::jwire, 1), f);
+            r.rj().pump();
+        }
+        if (page) in.read(r.h, r.j.node);
+        return true;
+    });
+    int ns = 0, other = 0;
+    bool timed = true;
+    for (int c = 0; c < 2; ++c) {
+        page = false;
+        held.clear();
+        released = 0;
+        last = 0;
+        r.carrier_sent = 0;
+        const std::optional<pb::JoinStep> st = r.rj().join_step();
+        ++(vii_end(st, pb::AttemptEnd::NotServed, "a short FC_GETCARRIER reply") ? ns : other);
+        timed = timed && released == 2 && r.carrier_sent != 0 && r.h.now == last + p53;
+        r.pace(p53, pace);
+    }
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    const bool ncu = !n.caught_up();
+    std::printf("  viitrickle: pairs %zu; short-reply ends %d, other %d; two frames P-53 - 1 s apart, the end P-53 after "
+                "the second %d; in the attempts: %s; between: %s; K_NCU %d\n",
+                pairs, ns, other, timed ? 1 : 0, in.str().c_str(), pace.str().c_str(), ncu ? 1 : 0);
+    check(r.ok && r.handed && r.round_over && pairs == 1 && ns == 2 && other == 0 && timed,
+          "viitrickle: setup (two frames inside P-53, the third withheld: NotServed, a short FC_GETCARRIER reply)");
+    check(in.held_alone(2 * 2 * static_cast<int>(p53 - 1)), "viitrickle: held while frames arrive, by (vii) alone (" +
+                                                                   in.str() + ")");
+    check(pace.all_open(2 * static_cast<int>(p53)) && ncu, "viitrickle: the hold ends at the attempt's end; open "
+                                                           "between attempts (" + pace.str() + ")");
+}
+
+// viikept (RC 11.6 item 5, the hand-over half): the gatekept rig; B's attempt completes and rule (4) keeps J's chain.
+// Read inside the attempt after B's page; the three copies of D's carriers parked at the attempt's last drive call (run
+// again 20 s later); then K_NCU's end due with frames in hand, the drain done before the tick, the line at the tick.
+void viikept() {
+    KeptRig r(4700);
+    pb::PathbNode& n = r.nj();
+    bool page = false, parked = false;
+    std::size_t carriers = 0;
+    r.joiner = [&](FakeWire::Msg& m) {
+        if (m.f[0] == pb::kOpFcHeaders) page = true;
+        if (m.f[0] == pb::kOpFcCarrier) ++carriers;
+    };
+    ViiReads in;
+    r.rj().set_drive([&] {
+        if (!r.w.step()) return false;
+        if (page && r.rj().open_tickets() > 0) in.read(r.h, r.j.node);
+        if (!parked && carriers >= 3) {  // the attempt's last request answered: the frames in hand from now
+            parked = true;
+            for (std::size_t k = 0; k < 3; ++k) r.rj().test_park(r.w.id(KeptRig::jwire, 1), r.copies[k], (r.h.now + 20) * 1000);
+        }
+        return true;
+    });
+    const std::optional<pb::JoinStep> st = r.rj().join_step();
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    r.w.run();
+    const bool kept_attempt = st && st->report && st->report->end == pb::AttemptEnd::Completed && !st->sw.adopted &&
+                              !st->sw.replaced && n.tree().best().id == r.own_tip;
+    const bool due = n.kept_due() && !n.caught_up() && r.n_lines() == 0;
+    const bool held_in_hand = !n.drain_done() && !gate_open(r.h, r.j.node);
+    bool window = false, held_window = false;
+    for (int secs = 0; secs < 40 && r.n_lines() == 0; ++secs) {
+        r.h.now += 1;
+        r.rj().tick();
+        r.rj().pump();
+        if (n.drain_done() && n.kept_due() && !window) {
+            window = true;
+            held_window = !gate_open(r.h, r.j.node);
+        }
+    }
+    r.h.now += 1;
+    r.rj().tick();
+    const std::vector<std::string> cl = caught_of(r.lines, r.j.node);
+    const std::optional<CaughtLine> c = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
+    std::printf("  viikept: handed %d; C's first round ended %d; parked at the last drive call %d; the attempt kept J's "
+                "chain %d; in the attempt: %s; due %d; held in hand %d; the window seen %d held %d; line %s\n",
+                r.handed ? 1 : 0, r.round_over ? 1 : 0, parked ? 1 : 0, kept_attempt ? 1 : 0, in.str().c_str(), due ? 1 : 0,
+                held_in_hand ? 1 : 0, window ? 1 : 0, held_window ? 1 : 0, cl.empty() ? "none" : cl[0].c_str());
+    check(r.ok && r.handed && r.round_over && parked && kept_attempt,
+          "viikept: setup (B handed over, C's first round ended, its attempt completes, J's chain kept)");
+    check(in.held_alone(3), "viikept: held by (vii) alone during the attempt (" + in.str() + ")");
+    check(due && held_in_hand, "viikept: the kept attempt with frames in hand: K_NCU's end due, the gate held");
+    check(window && held_window, "viikept: the drain done, K_NCU's end due before the tick: the gate held");
+    check(c && c->form == kCaughtJoin && n.caught_up() && gate_open(r.h, r.j.node),
+          "viikept: the kept-attempt line at the tick; K_NCU ended, the gate open");
+}
+
+// kat_relay with `pre_io` applied to the node's I/O before the relay binds it (the relay's verify then runs it inside
+// its node-lock release) and `io_tweak` after.
+KatRelay kat_relay_vii(Harness& h, FakeWire& w, const pb::EpochTable& T, bool launch,
+                       const std::function<void(pb::PathbRelayOptions&)>& tweak,
+                       const std::function<void(pb::PathbNodeIo&)>& pre_io,
+                       const std::function<void(pb::PathbNodeIo&)>& io_tweak, bool persist) {
+    KatRelay k;
+    k.links = std::make_unique<FakeLinks>();
+    k.links->wire = &w;
+    k.links->self = w.links.size();
+    w.links.push_back(k.links.get());
+    pb::PathbRelayOptions o;
+    o.threads = false;
+    o.keepalive_ms = 0;
+    if (tweak) tweak(o);
+    pb::RelayClock clock;
+    clock.mono_ms = [&h] { return h.now * 1000; };
+    clock.wall_s = [&h] { return h.now; };
+    k.relay = std::make_unique<pb::PathbRelayNode>(o, *k.links, clock, [n = h.nodes.size()](const std::string& line) {
+        if (g_relay_lines != nullptr) (*g_relay_lines)[n].push_back(line);
+    });
+    k.node = h.nodes.size();
+    pb::PathbNodeIo io0 = h.io(k.node);
+    if (pre_io) pre_io(io0);
+    pb::PathbNodeIo io = k.relay->bind_io(std::move(io0));
+    if (io_tweak) io_tweak(io);
+    const pb::PathbNodeConfig cfg = h.config(T, launch);
+    if (persist) {
+        h.kvs.push_back(std::make_unique<MemoryKv>());
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io), h.kvs.back().get()));
+    } else {
+        h.nodes.push_back(std::make_unique<pb::PathbNode>(cfg, std::move(io)));
+    }
+    k.relay->attach(*h.nodes.back());
+    k.relay->set_drive([&w] { return w.step(); });
+    std::string why;
+    if (!k.relay->start(why)) throw std::runtime_error(why);
+    w.relays.push_back(k.relay.get());
+    return k;
+}
+
+// gateadopt's setup (E-194 (vi)): A's chain of 8 carriers; J empty, not caught up, its catch-up toward A DEFERs on a
+// hidden P_r X (the P_r of A's 1..3); A's tip offered to the joiner after kCtxTtlMs (one pair; C's first round ended);
+// C (its own carrier on 1) and J never answer each other's FC_GETHEADERS (J's catch-up toward C a claim). No frame
+// parked. `pre` / `post`: J's I/O before / after the relay binds it. `joiner` sees A's frames to J answering J's joiner
+// requests (FC_HEADERS from the zero id; FC_CARRIER).
+struct AdoptRig {
+    KatNet net;
+    Harness h;
+    FakeWire w;
+    std::set<pb::Hash32> hidden;
+    HiddenRows hrows;
+    pb::FollowerBranchView hview;
+    KatRelay a, j, c;
+    std::map<std::size_t, std::vector<std::string>> lines;
+    std::deque<bool> kinds;  // J's FC_GETHEADERS to A in order: true = a joiner request
+    pb::Hash32 tip{}, tip_c{}, X{};
+    const pb::CarrierBodyV3* bt = nullptr;
+    bool ok = true, offered = false, round_over = false;
+    std::size_t asked_n = 0;  // the ids of J's last FC_GETCARRIER to A
+    std::function<void(FakeWire::Msg&)> joiner;
+    static constexpr std::size_t jwire = 1;
+    AdoptRig(std::uint32_t nonce, const std::function<void(pb::PathbNodeIo&)>& pre,
+             const std::function<void(pb::PathbNodeIo&)>& post)
+        : h(net), hrows(net.rows, hidden), hview(hrows) {
+        a = kat_relay(h, w, table0(net), true);
+        for (int i = 0; i < 8; ++i) {
+            if (i % 3 == 0) h.tick_monero();
+            ok = ok && mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce + static_cast<std::uint32_t>(i));
+        }
+        tip = h[a.node].tree().best().id;
+        const std::optional<pb::Hash32> c1 = h[a.node].store().best_at(1);
+        const pb::CarrierBodyV3* b1 = c1 ? h[a.node].bodies().get(*c1) : nullptr;
+        bt = h[a.node].bodies().get(tip);
+        if (!ok || b1 == nullptr || bt == nullptr) {
+            ok = false;
+            return;
+        }
+        X = b1->own.blob.prev_id;
+        hidden.insert(X);
+        j = kat_relay_vii(h, w, table0(net), false, [](pb::PathbRelayOptions& o) { o.join_min_peers = 1; }, pre,
+                          [this, post](pb::PathbNodeIo& io) {
+                              hide_blocks(hidden, hview)(io);
+                              if (post) post(io);
+                          },
+                          true);
+        c = kat_relay(h, w, table0(net), true);  // wire 2
+        (void)mine_only(h, c.node, 4, nonce + 90);
+        tip_c = h[c.node].tree().best().id;
+        j.relay->test_defer_ends(true);
+        g_relay_lines = &lines;
+        w.edit = [this](FakeWire::Msg& m) {
+            if (m.f.empty()) return;
+            const std::uint8_t op = m.f[0];
+            if (op == pb::kOpFcHeaders && ((m.from == 1 && m.to == 2) || (m.from == 2 && m.to == 1))) {
+                m.f.clear();  // J and C never answer each other's FC_GETHEADERS
+                return;
+            }
+            if (m.from == jwire && m.to == 0 && op == pb::kOpFcGetHeaders) {
+                pb::GetHeaders q;
+                kinds.push_back(pb::decode_fc_getheaders(m.f, 0, q).ok() && q.from == pb::Hash32{});
+                return;
+            }
+            if (m.from == jwire && m.to == 0 && op == pb::kOpFcGetCarrier) {
+                pb::GetCarrier q;
+                if (pb::decode_fc_getcarrier(m.f, 0, h[j.node].config().p, q).ok()) asked_n = q.ids.size();
+                return;
+            }
+            if (m.from == 0 && m.to == jwire && op == pb::kOpFcHeaders && !kinds.empty()) {
+                const bool jr = kinds.front();
+                kinds.pop_front();
+                if (jr && joiner) joiner(m);
+                return;
+            }
+            if (m.from == 0 && m.to == jwire && op == pb::kOpFcCarrier && joiner) joiner(m);
+        };
+        w.connect(0, 1);
+        w.connect(2, 1);
+        w.run();
+        for (int k = 0; k < 130 && h[j.node].joiner().queue().size() == 0; ++k) {  // kCtxTtlMs: A's tip offered
+            h.now += 5;
+            j.relay->tick();
+            w.run();
+        }
+        offered = h[j.node].joiner().queue().size() == 1 && !h[j.node].caught_up() && !h[j.node].holds_tip(tip_c);
+        round_over = !h[j.node].first_round_open();
+    }
+    ~AdoptRig() {
+        w.edit = nullptr;
+        g_relay_lines = nullptr;
+    }
+    AdoptRig(const AdoptRig&) = delete;
+    AdoptRig& operator=(const AdoptRig&) = delete;
+    pb::PathbRelayNode& rj() { return *j.relay; }
+    pb::PathbNode& nj() { return h[j.node]; }
+    std::size_t n_lines() const { return caught_of(lines, j.node).size(); }
+};
+
+// viislow (RC 11.6 item 1): gateadopt's setup without its parked frame (X shown again before the attempt); A answers
+// every joiner request slowly, each frame P-53 - 1 s after the one before (or after the request). Read inside the
+// attempt after A's first frame; the attempt adopts, and K_NCU ends at the adoption (nothing in hand): templates resume.
+void viislow() {
+    AdoptRig r(2900, nullptr, nullptr);
+    if (!r.ok) {
+        check(false, "viislow: setup (A's chain)");
+        return;
+    }
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    r.hidden.erase(r.X);
+    std::deque<std::vector<std::uint8_t>> held;
+    std::uint64_t rel = 0;
+    bool got = false;
+    int frames = 0;
+    r.joiner = [&](FakeWire::Msg& m) {
+        if (held.empty() && r.h.now > rel) rel = r.h.now;
+        held.push_back(std::move(m.f));
+        m.f.clear();
+    };
+    ViiReads in;
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (!held.empty() && r.h.now >= rel + p53 - 1) {
+            std::vector<std::uint8_t> f = std::move(held.front());
+            held.pop_front();
+            rel = r.h.now;
+            got = true;
+            ++frames;
+            r.w.links[AdoptRig::jwire]->frame(r.w.id(AdoptRig::jwire, 0), f);
+            r.rj().pump();
+            return true;
+        }
+        if (r.rj().open_tickets() == 0) return false;
+        r.h.now += 1;
+        if (got) in.read(r.h, r.j.node);
+        return true;
+    });
+    const std::uint64_t t0 = r.h.now;
+    const std::optional<pb::JoinStep> st = r.rj().join_step();
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    r.w.run();
+    const bool adopted = st && st->switched && st->sw.adopted && n.joined() != nullptr;
+    std::printf("  viislow: offered %d; C's first round ended %d; frames %d over %llu s (each P-53 - 1 s apart); in the "
+                "attempt: %s; adopted %d; caught up %d; gate open %d\n",
+                r.offered ? 1 : 0, r.round_over ? 1 : 0, frames, (unsigned long long)(r.h.now - t0), in.str().c_str(),
+                adopted ? 1 : 0, n.caught_up() ? 1 : 0, gate_open(r.h, r.j.node) ? 1 : 0);
+    check(r.ok && r.offered && r.round_over && frames >= 2 && adopted,
+          "viislow: setup (A's tip offered; C's first round ended; replies P-53 - 1 s apart; the attempt adopts)");
+    check(in.held_alone(static_cast<int>(frames - 1) * static_cast<int>(p53 - 2)),
+          "viislow: held by (vii) alone (" + in.str() + ")");
+    check(n.caught_up() && gate_open(r.h, r.j.node), "viislow: K_NCU ends at the adoption; templates resume");
+}
+
+// viiadopt (RC 11.6 item 5, the hand-over half): gateadopt's setup; read inside the attempt after A's first frame; a
+// frame of A parked at the attempt's last drive call (run again 30 s later); then K_NCU's end due with the frame in hand,
+// the drain done before the tick, the caught-up line at the tick.
+void viiadopt() {
+    AdoptRig r(3100, nullptr, nullptr);
+    if (!r.ok) {
+        check(false, "viiadopt: setup (A's chain)");
+        return;
+    }
+    pb::PathbNode& n = r.nj();
+    r.hidden.erase(r.X);
+    bool got = false, parked = false;
+    std::size_t carriers = 0;
+    r.joiner = [&](FakeWire::Msg& m) {
+        got = true;
+        if (m.f[0] == pb::kOpFcCarrier) ++carriers;
+    };
+    ViiReads in;
+    r.rj().set_drive([&] {
+        if (!r.w.step()) return false;
+        if (got && r.rj().open_tickets() > 0) in.read(r.h, r.j.node);
+        if (!parked && r.asked_n > 0 && carriers >= r.asked_n) {  // the attempt's last request answered
+            parked = true;
+            r.rj().test_park(r.w.id(AdoptRig::jwire, 0), *pb::encode_fc_carrier(0, *r.bt, 16), (r.h.now + 30) * 1000);
+        }
+        return true;
+    });
+    const std::optional<pb::JoinStep> st = r.rj().join_step();
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    r.w.run();
+    const bool adopted = st && st->switched && st->sw.adopted && n.joined() != nullptr;
+    const bool due = n.adopt_due() && !n.caught_up() && r.n_lines() == 0;
+    const bool held_in_hand = !n.drain_done() && !gate_open(r.h, r.j.node);
+    bool window = false, held_window = false;
+    for (int secs = 0; secs < 45 && r.n_lines() == 0; ++secs) {
+        r.h.now += 1;
+        r.rj().tick();
+        r.w.run();
+        if (!window && n.drain_done() && n.adopt_due()) {
+            window = true;
+            held_window = !gate_open(r.h, r.j.node);
+        }
+    }
+    const std::vector<std::string> cl = caught_of(r.lines, r.j.node);
+    const std::optional<CaughtLine> cline = cl.size() == 1 ? parse_caught(cl[0]) : std::nullopt;
+    std::printf("  viiadopt: offered %d; C's first round ended %d; parked at the last drive call %d; in the attempt: %s; "
+                "adopted %d; due %d; held in hand %d; the window seen %d held %d; line %s\n",
+                r.offered ? 1 : 0, r.round_over ? 1 : 0, parked ? 1 : 0, in.str().c_str(), adopted ? 1 : 0, due ? 1 : 0,
+                held_in_hand ? 1 : 0, window ? 1 : 0, held_window ? 1 : 0, cl.empty() ? "none" : cl[0].c_str());
+    check(r.ok && r.offered && r.round_over && parked && adopted,
+          "viiadopt: setup (A's tip adopted; C's first round ended; a frame parked at the attempt's last drive call)");
+    check(in.held_alone(3), "viiadopt: held by (vii) alone (" + in.str() + ")");
+    check(due && held_in_hand, "viiadopt: after the adoption, the frame in hand: K_NCU's end due, the gate held");
+    check(window && held_window, "viiadopt: the drain done, K_NCU's end due before the tick: the gate held");
+    check(cline && cline->form == kCaughtDone && n.caught_up() && gate_open(r.h, r.j.node),
+          "viiadopt: the caught-up line at the tick; K_NCU ended, the gate open");
+}
+
+// viiwait g2 (RC 11.6 item 4): gateadopt's setup without its parked frame; each RandomX hash of the attempt takes 2 s
+// with the node lock released (J's verify wrapped before the relay binds it): at each hash the wire's pending frames are
+// delivered, then J's tick and a read. The attempt's PoW pass over A's headers runs past P-53 after A's last frame.
+struct ViiG2 {
+    Harness* h = nullptr;
+    FakeWire* w = nullptr;
+    pb::PathbRelayNode* rj = nullptr;
+    std::size_t node = 0;
+    bool armed = false, in = false;
+    int hashes = 0, late = 0;
+    std::uint64_t last = 0, p53 = 0;
+    ViiReads reads;
+};
+void viiwaitg2() {
+    ViiG2 g;
+    AdoptRig r(3300,
+               [&g](pb::PathbNodeIo& io) {
+                   const auto inner = io.verify;
+                   io.verify = [inner, &g](const pb::HashingBlob& b, std::uint64_t d, const pb::Hash32& s) {
+                       const bool ok = inner ? inner(b, d, s) : false;
+                       if (g.armed && !g.in && (*g.h)[g.node].attempting() && (*g.h)[g.node].open_attempt().has_value()) {
+                           g.in = true;
+                           ++g.hashes;
+                           g.h->now += 2;  // the hash, the node lock released
+                           while (g.w->step()) {
+                           }
+                           g.rj->tick();
+                           g.reads.read(*g.h, g.node);
+                           if (g.last != 0 && g.h->now >= g.last + g.p53) ++g.late;
+                           g.in = false;
+                       }
+                       return ok;
+                   };
+               },
+               nullptr);
+    if (!r.ok) {
+        check(false, "viiwait g2: setup (A's chain)");
+        return;
+    }
+    pb::PathbNode& n = r.nj();
+    g.h = &r.h;
+    g.w = &r.w;
+    g.rj = &r.rj();
+    g.node = r.j.node;
+    g.p53 = n.config().abandon_timeout_s;
+    r.hidden.erase(r.X);
+    r.joiner = [&](FakeWire::Msg&) { g.last = r.h.now; };
+    r.rj().set_drive([&] {
+        g.in = true;  // frames judged in the drive hash under the node lock: not the attempt's
+        const bool moved = r.w.step();
+        g.in = false;
+        return moved;
+    });
+    g.armed = true;
+    const std::optional<pb::JoinStep> st = r.rj().join_step();
+    g.armed = false;
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    r.w.run();
+    std::printf("  viiwait g2: offered %d; C's first round ended %d; hashes in the attempt %d (2 s each), reads past P-53 "
+                "after A's last frame %d; reads: %s; the attempt %s\n",
+                r.offered ? 1 : 0, r.round_over ? 1 : 0, g.hashes, g.late, g.reads.str().c_str(), vii_end_text(st).c_str());
+    check(r.ok && r.offered && r.round_over && g.hashes >= 6 && g.late >= 1,
+          "viiwait g2: setup (the attempt hashed at least 6 headers with the lock released, past P-53 after A's last "
+          "frame)");
+    check(g.reads.held_alone(g.hashes), "viiwait g2: held by (vii) alone while hashing past P-53 (" + g.reads.str() + ")");
+}
+
+// viiwait g3 (RC 11.6 item 4; DESIGN-VII v4): gateadopt's setup without its parked frame, X left hidden: the attempt's
+// check (3) waits in fetch_context(X) its full timeout (P-53, the node lock released), J's tick and a read each second;
+// the wait returns false, the attempt ends NotServed on X (the pair waits on it), and the hold ends with it.
+struct ViiG3 {
+    bool on = false, ret = true;
+    int calls = 0;
+    pb::Hash32 id{};
+    std::uint64_t t0 = 0, t1 = 0;
+};
+void viiwaitg3() {
+    ViiG3 g;
+    Harness* hp = nullptr;
+    AdoptRig r(3500, nullptr, [&g, &hp](pb::PathbNodeIo& io) {
+        const auto inner = io.fetch_context;
+        io.fetch_context = [inner, &g, &hp](const pb::Hash32& id, std::uint64_t t) {
+            if (!g.on) return inner ? inner(id, t) : false;
+            ++g.calls;
+            g.id = id;
+            g.t0 = hp->now;
+            const bool ok = inner ? inner(id, t) : false;
+            g.t1 = hp->now;
+            g.ret = ok;
+            return ok;
+        };
+    });
+    hp = &r.h;
+    if (!r.ok) {
+        check(false, "viiwait g3: setup (A's chain)");
+        return;
+    }
+    pb::PathbNode& n = r.nj();
+    const std::uint64_t p53 = n.config().abandon_timeout_s;
+    bool got = false, in_att = false;
+    std::uint64_t last = 0;
+    int late = 0;
+    r.joiner = [&](FakeWire::Msg&) {
+        got = true;
+        last = r.h.now;
+    };
+    ViiReads in, after;
+    r.rj().set_drive([&] {
+        if (r.w.step()) return true;
+        if (!in_att) return false;
+        r.h.now += 1;
+        r.rj().tick();
+        if (got) {
+            in.read(r.h, r.j.node);
+            if (r.h.now >= last + p53) ++late;
+        }
+        return true;
+    });
+    g.on = in_att = true;
+    const std::optional<pb::JoinStep> st = r.rj().join_step();
+    g.on = in_att = false;
+    r.rj().set_drive([&w = r.w] { return w.step(); });
+    r.w.run();
+    after.read(r.h, r.j.node);
+    const bool ns_x = st && st->report && st->report->end == pb::AttemptEnd::NotServed && st->report->unresolved_pr &&
+                      *st->report->unresolved_pr == r.X;
+    std::printf("  viiwait g3: offered %d; C's first round ended %d; fetch_context calls %d (X %d), waited %llu s, "
+                "returned %d; reads in the wait: %s, at or past P-53 after A's last frame %d; the attempt %s; after it: "
+                "%s; pairs %zu\n",
+                r.offered ? 1 : 0, r.round_over ? 1 : 0, g.calls, g.id == r.X ? 1 : 0, (unsigned long long)(g.t1 - g.t0),
+                g.ret ? 1 : 0, in.str().c_str(), late, vii_end_text(st).c_str(), after.str().c_str(),
+                n.joiner().queue().size());
+    check(r.ok && r.offered && r.round_over && g.calls == 1 && g.id == r.X && g.t1 - g.t0 == p53 && !g.ret && ns_x,
+          "viiwait g3: setup (fetch_context entered once for X, ran P-53 to its deadline and returned false; the "
+          "attempt ended NotServed with unresolved_pr X)");
+    check(in.held_alone(static_cast<int>(p53)) && late >= 1,
+          "viiwait g3: held by (vii) alone across fetch_context (" + in.str() + ", past P-53 " + std::to_string(late) + ")");
+    check(after.all_open(1) && !n.caught_up(), "viiwait g3: the attempt's end ends the hold (" + after.str() + ")");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -16628,6 +17587,18 @@ int main(int argc, char** argv) {
                                 {"catchheavy", catchheavy, 0},
                                 {"catchctx", catchctx, 0},
                                 {"floorpr", floorpr, 0},
+                                {"viins", viins, 1},
+                                {"viishort", viishort, 1},
+                                {"viibig", viibig, 1},
+                                {"viistall", viistall, 1},
+                                {"viitrickle", viitrickle, 1},
+                                {"viir4", viir4, 1},
+                                {"viiclaims", viiclaims, 1},
+                                {"viikept", viikept, 1},
+                                {"viislow", viislow, 1},
+                                {"viiadopt", viiadopt, 1},
+                                {"viiwaitg2", viiwaitg2, 1},
+                                {"viiwaitg3", viiwaitg3, 1},
                         },
                         argc, argv);
 }
