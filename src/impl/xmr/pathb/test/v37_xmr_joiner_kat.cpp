@@ -3488,6 +3488,8 @@ void forgedlive() {
 //            t_origin above f x3): OutOfScope; equal (b 30, the same work, b's tip id above a's): OutOfScope;
 //   base (a to 210: f not below its base 190; b 40): OutOfScope (the base test), no token;
 //   forged (b 40; the header at f + 3 with t_origin d + 1): OutOfScope, no token, the server not excluded;
+//   fields (b 40; the P_r of the header at f + 2 read at hf 17, its header at 16: a header-field fault): OutOfScope, no
+//            token, the server not excluded;
 //   no reads (A without its work reads; b 40): NotServed, no token;
 //   queue: a marked offer marks a queued pair not yet attempted; a pair re-queued after its attempt is not marked; a
 //          decided pair is not queued again; a mark is never cleared.
@@ -3536,12 +3538,14 @@ struct WOut {
 };
 // b's tip offered with the root-evidence mark to a Joiner whose A is a's own chain (with its work reads, or not).
 WOut w_attempt(const JoinNet& net, KatNode& a, KatNode& b, std::uint64_t peer, bool reads = true,
-               const pb::U128& claimed = {}, const std::function<void(KatServer&)>& tweak = nullptr) {
+               const pb::U128& claimed = {}, const std::function<void(KatServer&)>& tweak = nullptr,
+               const std::function<void(JoinerEnv&)>& env_tweak = nullptr) {
     WChain wa(a);
     FullChain fa(a);
     KatServer s(b, peer);
     if (tweak) tweak(s);
     JoinerEnv je(net);
+    if (env_tweak) env_tweak(je);
     pb::Joiner j(je.in, kP53);
     j.set_own_chain(reads ? static_cast<const pb::AdoptedChain*>(&wa) : static_cast<const pb::AdoptedChain*>(&fa));
     j.offer(s.best_id(), s, claimed, /*root_evidence=*/true);
@@ -3624,6 +3628,22 @@ void wcond() {
         check(o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded && !o.replaced &&
                       o.r->what.find("#8") != std::string::npos,
               "wcond forged: a header's t_origin not A's d: OutOfScope, no token, not excluded");
+    }
+    {
+        auto b = own(40, 8100000);
+        const pb::Hash32 pr2 = b->bodies.get(at_pos(*b, f + 2))->own.blob.prev_id;
+        const WOut o = w_attempt(net, a, *b, 408, true, {}, nullptr, [pr2](JoinerEnv& je) {
+            const auto rp = je.in.resolve_pr;
+            je.in.resolve_pr = [rp, pr2](const pb::Hash32& p_r) {
+                pb::PrInfo out = rp(p_r);
+                if (p_r == pr2) out.in.hf = 17;
+                return out;
+            };
+        });
+        std::printf("  wcond fields: %s; excluded %d\n", o.desc().c_str(), o.excluded ? 1 : 0);
+        check(o.r && o.r->end == pb::AttemptEnd::OutOfScope && o.r->strike == 0 && !o.excluded && !o.replaced &&
+                      o.r->what.find("#7") != std::string::npos,
+              "wcond fields: a header's fields fail against its P_r's branch: OutOfScope, no token, not excluded");
     }
     {
         auto b = own(40, 8100000);

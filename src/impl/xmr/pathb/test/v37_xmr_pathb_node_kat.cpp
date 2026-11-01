@@ -398,6 +398,15 @@ struct PathbNodeTestAccess {
         if (const auto it = n.paused_.find(peer); it != n.paused_.end()) return it->second.work;
         return std::nullopt;
     }
+    // The joiner excludes `server` (as an attempt ending Header does).
+    static void exclude_server(PathbNode& n, std::uint64_t server) {
+        AttemptQueue::Pair p;
+        p.server = server;
+        AttemptReport r;
+        r.end = AttemptEnd::Header;
+        r.server = server;
+        (void)n.joiner_->apply(Joiner::Attempted{p, std::move(r)});
+    }
     // The comparison of the request in flight to `peer` keeps no ids above F (the state of an F deep when fixed).
     static bool fold_forget_ids(PathbNode& n, std::uint64_t peer) {
         const auto it = n.header_req_.find(peer);
@@ -12935,6 +12944,7 @@ void deepband() {
 //   F < root (d 1,200): one attempt, Completed, a joiner switch.
 struct DeepPruned {
     bool setup = false, healed = false, kept = false;
+    bool catchup_open = true, stop_indexed = false;  // the catch-up toward A; A's tip header indexed (the comparison read it)
     std::uint64_t f = 0, root = 0, base = 0, sw = 0, jsw = 0, strikes = 0;
     int attempts = 0, oos = 0, completed = 0;
     std::string ends;
@@ -12999,6 +13009,8 @@ DeepPruned deep_pruned(std::uint64_t shared, std::uint64_t d_c, std::uint64_t d_
         }
     }
     w.edit = nullptr;
+    o.catchup_open = c.relay->catchup_view(w.id(1, 0)).has_value();
+    o.stop_indexed = !h[c.node].headers().variants(a_tip0).empty();
     o.healed = h[c.node].tree().best().id == a_tip0;
     o.kept = h[c.node].tree().best().id == c_tip0;
     o.sw = h[c.node].switch_counts().switches;
@@ -13023,18 +13035,22 @@ void deeppruned() {
                           Case{"lighter", 1175, 24, 20}, Case{"F < root", 40, 1200, 1208}}) {
         const DeepPruned o = deep_pruned(cs.shared, cs.d_c, cs.d_a, std::string(cs.name) == "lighter");
         const std::string tag = std::string("deeppruned ") + cs.name;
+        const std::string n0 = cs.name;
         std::printf("  %s: setup %d; F %llu, root %llu, base %llu; attempts %d (OutOfScope %d, Completed %d); on A's tip %d, "
                     "kept %d; switches %llu, joiner %llu; strikes %llu\n",
                     tag.c_str(), o.setup ? 1 : 0, (unsigned long long)o.f, (unsigned long long)o.root,
                     (unsigned long long)o.base, o.attempts, o.oos, o.completed, o.healed ? 1 : 0, o.kept ? 1 : 0,
                     (unsigned long long)o.sw, (unsigned long long)o.jsw, (unsigned long long)o.strikes);
+        if (n0 == "lighter")
+            std::printf("  %s: the catch-up toward A ended %d; A's tip header read (the reply carrying stop) %d\n", tag.c_str(),
+                        o.catchup_open ? 0 : 1, o.stop_indexed ? 1 : 0);
         check(o.setup, tag + ": setup (C pruned: its tree's root above 0)");
         const std::string n = cs.name;
         if (n == "base - 1" || n == "F < root")
             check(o.healed && o.attempts == 1 && o.completed == 1 && o.jsw >= 1 && (n != "F < root" || o.f < o.root),
                   tag + ": one attempt, Completed, a joiner switch");
         else if (n == "lighter")
-            check(o.kept && o.attempts == 0 && o.jsw == 0 && o.base > o.f && o.root <= o.f,
+            check(o.kept && o.attempts == 0 && o.jsw == 0 && o.base > o.f && o.root <= o.f && !o.catchup_open && o.stop_indexed,
                   tag + ": root <= F < base, lighter: Keep at stop; 0 attempts");
         else
             check(o.healed && o.attempts == 0 && o.strikes == 0 && o.jsw == 0 && o.sw >= 1,
@@ -14408,6 +14424,152 @@ void adoptresume() {
               "page's from");
         check(jp == 1, "adoptresume seed pruned: the comparison reaches its decision (JoinerPath at 40)");
     }
+}
+
+// e185mark (an empty reply to a request from position 0 at a node that pruned meanwhile): A and C (journal depth 20,
+// body_keep 5) share 1,175 (F); C, cut off, mines 24 of its own, A 20 (lighter; C's headers and carriers do not reach
+// A). C reconnects unpruned; A's replies to C's catch-up carry no header (the locator walks to position 0); C prunes (its
+// first prune) before the reply to its request from position 0 arrives: A's tip a root-evidence pair; its attempt
+// checks the branch's work from F from C's records (its root <= F < its base): A lighter, OutOfScope, no token; C's
+// chain kept.
+void e185mark() {
+    const KatNet net;
+    Harness h(net);
+    FakeWire w;
+    KatRelay a = kat_relay(h, w, table0(net), true);  // wire 0
+    KatRelay c = kat_relay(h, w, table0(net), true, false, [](pb::PathbRelayOptions& r) { r.join_min_peers = 1; },
+                           [](pb::PathbNodeConfig& cf) {
+                               cf.journal_depth = 20;
+                               cf.body_keep = 5;
+                           });  // wire 1
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    w.connect(0, 1);
+    w.run();
+    bool ok = true;
+    std::uint32_t nonce = 70000;
+    for (std::uint64_t i = 0; i < 1175 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    ok = ok && h[c.node].tree().best().id == h[a.node].tree().best().id;
+    w.links[1]->disconnect(w.id(1, 0));
+    w.run();
+    for (std::uint64_t i = 0; i < 24 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, c.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    for (std::uint64_t i = 0; i < 20 && ok; ++i) {
+        if (i % 12 == 0) h.tick_monero();
+        ok = mine_on(h, w, a.node, static_cast<std::size_t>(i % 5), nonce++);
+    }
+    const pb::Hash32 a_tip = h[a.node].tree().best().id, c_tip = h[c.node].tree().best().id;
+    const pb::Hash32 g0 = h[c.node].tree().genesis().id;
+    const bool unpruned = h[c.node].tree().genesis().pos == 0;
+    bool editing = true, asked0 = false;
+    std::vector<std::uint8_t> held;
+    w.edit = [&](FakeWire::Msg& m) {
+        if (m.f.empty()) return;
+        // A keeps its lighter chain: C's headers and carriers do not reach A
+        if (m.from == 1 && m.to == 0 && (m.f[0] == pb::kOpFcHeaders || m.f[0] == pb::kOpFcCarrier)) {
+            m.f.clear();
+            return;
+        }
+        if (!editing) return;
+        if (m.from == 1 && m.to == 0 && m.f[0] == pb::kOpFcGetHeaders) {
+            pb::GetHeaders q;
+            if (pb::decode_fc_getheaders(m.f, 0, q).ok() && q.from == g0) asked0 = true;
+            return;
+        }
+        if (m.from == 0 && m.to == 1 && m.f[0] == pb::kOpFcHeaders) {
+            if (asked0 && held.empty()) {  // the reply to the request from position 0: held back
+                held = empty_headers_frame();
+                m.f.clear();
+                return;
+            }
+            m.f = empty_headers_frame();
+        }
+    };
+    const auto step = [&](bool join) {
+        h.now += 1;
+        a.relay->tick();
+        c.relay->tick();
+        a.relay->pump();
+        c.relay->pump();
+        for (int m = 0; m < 400 && w.step(); ++m) {
+        }
+        if (join)
+            for (int m = 0; m < 4; ++m)
+                if (const std::optional<pb::JoinStep> st = c.relay->join_step(); !st) break;
+        w.run();
+    };
+    w.reconnect(0, 1);
+    w.run();
+    const std::uint64_t pa = w.id(1, 0);
+    for (int k = 0; k < 20 && held.empty(); ++k) step(false);
+    const pb::PathbNode::PruneReport pr = h[c.node].prune(h.now);
+    const bool pruned = h[c.node].pruned_full_node();
+    editing = false;
+    if (!held.empty()) {
+        w.links[1]->frame(pa, held);
+        c.relay->pump();
+        w.run();
+    }
+    bool marked = false;
+    for (const pb::AttemptQueue::Pair& q : h[c.node].joiner().queue().pairs())
+        if (q.candidate == a_tip && q.server == pa) marked = q.root_evidence;
+    for (int k = 0; k < 10; ++k) step(true);
+    int attempts = 0;
+    bool w_out = false;
+    std::string end;
+    for (const std::string& l : lines[c.node])
+        if (l.find("relay: join attempt at peer") != std::string::npos) {
+            ++attempts;
+            w_out = w_out || (l.find("OutOfScope") != std::string::npos && l.find("E-78's condition") != std::string::npos);
+            end = l.substr(l.find(':') + 2, 160);
+        }
+    w.edit = nullptr;
+    g_relay_lines = nullptr;
+    const bool kept = h[c.node].tree().best().id == c_tip;
+    const std::uint64_t strikes = c.relay->stats().strikes.load();
+    std::printf("  e185mark: setup %d; unpruned at the request from position 0 %d, pruned before its reply %d (root %llu); "
+                "A's tip marked %d; attempts %d, OutOfScope by the work check %d; strikes %llu; C's chain kept %d [%s]\n",
+                ok ? 1 : 0, unpruned ? 1 : 0, pruned ? 1 : 0, (unsigned long long)pr.root, marked ? 1 : 0, attempts,
+                w_out ? 1 : 0, (unsigned long long)strikes, kept ? 1 : 0, end.c_str());
+    check(ok && unpruned && !held.empty() && pruned,
+          "e185mark: setup (C unpruned at its request from position 0, pruned before the reply)");
+    check(marked, "e185mark: the reply with no header from position 0 at a node pruned meanwhile: A's tip a root-evidence pair");
+    check(attempts == 1 && w_out && strikes == 0 && kept,
+          "e185mark: its attempt checks the branch's work from F (A lighter): OutOfScope, no token; C's chain kept");
+}
+
+// rootevidneg (the offer at a pruned full node's root reply leaves no live pair): rootevid's shape, A excluded at C2's
+// joiner before C2 meets A: no root-evidence line; the catch-up ends by its reply (the caught-up line); no attempt.
+void rootevidneg() {
+    PrunedRestart r(40, 1200, 1208, 0);
+    std::map<std::size_t, std::vector<std::string>> lines;
+    g_relay_lines = &lines;
+    r.w.connect(0, 2);
+    const std::uint64_t pa = r.w.id(2, 0);
+    pb::PathbNodeTestAccess::exclude_server(r.h[r.c2.node], pa);
+    const bool excluded = r.h[r.c2.node].joiner().queue().excluded(pa);
+    r.w.run();
+    for (int k = 0; k < 15; ++k) r.second(true);
+    std::size_t re = 0;
+    int attempts = 0;
+    for (const std::string& l : lines[r.c2.node]) {
+        if (l.find("(root evidence)") != std::string::npos) ++re;
+        if (l.find("relay: join attempt at peer") != std::string::npos) ++attempts;
+    }
+    const std::size_t caught = caught_of(lines, r.c2.node).size();
+    const bool ended = !r.c2.relay->catchup_view(pa).has_value();
+    g_relay_lines = nullptr;
+    std::printf("  rootevidneg: setup %d (root %llu); A excluded %d; root-evidence lines %zu; the catch-up ended %d, "
+                "caught-up lines %zu; attempts %d\n",
+                r.ok ? 1 : 0, (unsigned long long)r.root, excluded ? 1 : 0, re, ended ? 1 : 0, caught, attempts);
+    check(r.ok && excluded, "rootevidneg: setup (C2 a pruned full node, not caught up; A excluded at its joiner)");
+    check(re == 0 && ended && caught == 1 && attempts == 0,
+          "rootevidneg: no live pair: no root-evidence line; the catch-up ended by its reply; no attempt");
 }
 
 // catchoffer: a store not caught up (journal depth 4) that walked A's chain to position 8 is offered B's unheld lighter
@@ -16424,6 +16586,8 @@ int main(int argc, char** argv) {
                                 {"adoptresume", adoptresume, 12},
                                 {"rootevid", rootevid, 12},
                                 {"fd1mark", fd1mark, 12},
+                                {"e185mark", e185mark, 12},
+                                {"rootevidneg", rootevidneg, 12},
                                 {"jpdeclined", jpdeclined, 4},
                                 {"pauseorphan", pauseorphan, 2},
                                 {"foldsplit", foldsplit, 1},

@@ -3137,9 +3137,10 @@ private:
                                 break;
                             }
                             // the reply to a request from position 0 carried no header: the peer serves none of this
-                            // node's chain (the joiner path: its tip a join candidate)
+                            // node's chain (the joiner path: its tip a join candidate; a root-evidence pair where the
+                            // node pruned meanwhile)
                             if (o.ids.empty() && it->second.from_pos0) {
-                                if (node_->offer_empty_store_tip(p)) {
+                                if (node_->offer_empty_store_tip(p, node_->pruned_full_node())) {
                                     st_.empty_store_offers++;
                                     join = true;
                                 }
