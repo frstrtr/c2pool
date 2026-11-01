@@ -202,6 +202,7 @@ J encode_item(const Item& it)
     node["last_build"] = nullptr; // per-build verdict: needs the optional node ledger endpoint (S4)
     node["scan_from_height"] = n.scan_from_height;
     node["mined_height_unknown"] = n.mined_height_unknown;
+    node["probe_at_height"] = json::opt(n.probe_at_height);
     j["node"] = std::move(node);
 
     const RetryState& r = it.retry;
@@ -306,6 +307,7 @@ std::string queue_to_json(const Queue& q)
     runner["last_enabled"] = json::opt(q.runner.last_enabled);
     runner["tick_count"] = q.runner.tick_count;
     runner["last_tick_at"] = json::opt(q.runner.last_tick_at);
+    runner["explorer_off"] = q.runner.explorer_off;
     root["runner"] = std::move(runner);
 
     return json::dump(root);
@@ -415,6 +417,7 @@ bool decode_item(json::Reader& rd, const J& j, const std::string& p, Item& it)
         nr.last_seen_in_mempool = rd.ostr(*n, "last_seen_in_mempool", np);
         nr.scan_from_height = rd.i64(*n, "scan_from_height", np);
         nr.mined_height_unknown = rd.boolean(*n, "mined_height_unknown", np);
+        nr.probe_at_height = rd.oi64(*n, "probe_at_height", np);
     }
 
     if (const J* r = rd.obj(j, "retry", p)) {
@@ -546,6 +549,7 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
         q.runner.last_enabled = rd.obool(*r, "last_enabled", "queue.runner");
         q.runner.tick_count = rd.i64(*r, "tick_count", "queue.runner");
         q.runner.last_tick_at = rd.ostr(*r, "last_tick_at", "queue.runner");
+        q.runner.explorer_off = rd.boolean(*r, "explorer_off", "queue.runner");
     }
     if (!rd.ok()) {
         why = rd.err;
@@ -809,6 +813,30 @@ bool retry_item(Queue& q, const std::string& id, int64_t now, std::string& why)
     it->retry.not_before.reset();
     it->retry.token_fingerprint.reset();
     edit_state(*it, State::Ready, format_utc(now), "operator Retry", "retry");
+    return true;
+}
+
+bool set_submit_max_fee(Queue& q, const std::string& id, int64_t max_fee, int64_t now, std::string& why)
+{
+    Item* it = find_item(q, id);
+    if (!it) { why = "no item " + id; return false; }
+    if (max_fee < 0) { why = "max_fee must be >= 0"; return false; }
+    switch (it->state) {
+    case State::Submitting:
+    case State::SubmittedUnknown:
+    case State::Admitted:
+    case State::IsHold:
+    case State::Riding:
+    case State::Mined:
+        why = id + " is " + state_name(it->state) + " (in flight); max_fee applies to the next submit only";
+        return false;
+    default: break;
+    }
+    const int64_t old_fee = it->submit.max_fee;
+    it->submit.max_fee = max_fee;
+    ++it->rev;
+    journal(*it, format_utc(now), "max_fee",
+            "submit.max_fee " + std::to_string(old_fee) + " -> " + std::to_string(max_fee) + " duffs (operator)");
     return true;
 }
 

@@ -132,6 +132,7 @@ struct NodeRecord {
     std::optional<std::string> last_seen_in_mempool;
     int64_t scan_from_height = 0;          // lowest height the tx can be found in
     bool mined_height_unknown = false;     // already-confirmed, block outside the body window
+    std::optional<int64_t> probe_at_height; // re-probe a height-unknown "mined" at this tip
 };
 
 struct RetryState {
@@ -224,6 +225,7 @@ struct RunnerState {
     std::optional<bool> last_enabled; // last /api/tx-inject-status "enabled" seen
     int64_t tick_count = 0;
     std::optional<std::string> last_tick_at;
+    bool explorer_off = false;        // the node answered "Explorer not enabled" (alert raised once)
 };
 
 struct Queue {
@@ -295,6 +297,9 @@ bool resume_item(Queue& q, const std::string& id, int64_t now, std::string& why)
 bool requeue_item(Queue& q, const std::string& id, int64_t now, std::string& why);
 // blocked_* -> ready now (operator "Retry").
 bool retry_item(Queue& q, const std::string& id, int64_t now, std::string& why);
+// Change submit.max_fee (duffs) of an item that is not in flight (waiting,
+// ready, blocked_*, paused or terminal): the fix for inject-fee-above-max.
+bool set_submit_max_fee(Queue& q, const std::string& id, int64_t max_fee, int64_t now, std::string& why);
 // Only terminal or paused items may be removed.
 bool remove_item(Queue& q, const std::string& id, std::string& why);
 

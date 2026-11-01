@@ -35,6 +35,7 @@ struct TipInfo {
     int64_t height = 0;
     std::string hash;
     bool transport_error = false;
+    bool explorer_disabled = false; // the node runs with --no-explorer
     std::string why;             // why unknown
 };
 

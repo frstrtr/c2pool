@@ -289,6 +289,8 @@ struct FakeNode : NodeApi {
     int64_t rl_in_window = 0, rl_max = 200, rl_window = 60;
     std::set<std::string> mempool;
     std::map<std::string, int64_t> time_added;
+    std::map<std::string, int64_t> expiry; // txid -> expiry_height (0 = none)
+    bool explorer = true;                   // false: --no-explorer
     std::map<int64_t, FakeBlock> blocks;
     int64_t salt = 0;
     std::string issued_nonce;
@@ -309,11 +311,23 @@ struct FakeNode : NodeApi {
         auto it = blocks.find(h);
         return it != blocks.end() ? it->second.hash : synth_hash(h, 0);
     }
+    // The node's reaper on every tip advance: reconcile_inject_pool() calls
+    // reap_expired(tip + 1), which drops entries with tip + 1 > expiry_height
+    // (node_coin_state.hpp, tx_inject_pool.hpp), from the pool and the mempool.
+    void reap()
+    {
+        for (auto it = mempool.begin(); it != mempool.end();) {
+            auto e = expiry.find(*it);
+            if (e != expiry.end() && e->second != 0 && tip + 1 > e->second) it = mempool.erase(it);
+            else ++it;
+        }
+    }
     void mine(const std::vector<std::string>& txids = {})
     {
         ++tip;
         blocks[tip] = FakeBlock{synth_hash(tip, salt), txids, true};
         for (const auto& t : txids) mempool.erase(t);
+        reap();
     }
     void advance(int n)
     {
@@ -380,6 +394,8 @@ struct FakeNode : NodeApi {
                                          {"window_sec", rl_window}}}};
             return reply(200, j);
         }
+        if (!explorer && path.rfind("/api/explorer/", 0) == 0)
+            return reply(404, nj{{"error", "Explorer not enabled"}});
         if (path == route::kChainInfo) {
             nj j = nj::object();
             j["chain"] = "main";
@@ -455,6 +471,9 @@ struct FakeNode : NodeApi {
                              nj{{"ok", false}, {"cause", "inject-already-confirmed"}, {"txid", txid}, {"armed", true}});
             mempool.insert(txid);
             time_added[txid] = clock ? clock->t : 0;
+            expiry[txid] = b.contains("expiry_height") && b["expiry_height"].is_number_integer()
+                               ? b["expiry_height"].get<int64_t>()
+                               : 0;
             return reply(200, nj{{"ok", true}, {"cause", "ok"}, {"txid", txid}, {"armed", true}});
         }
         if (path == route::kConfigApply) {
@@ -833,6 +852,13 @@ static void k9_refusal_cause_table()
         {"inject-sandbox-scriptsig-too-large", 422, State::Refused, RetryClass::None, false},
         {"inject-sandbox-total-scriptsig-too-large", 422, State::Refused, RetryClass::None, false},
         {"inject-sandbox-too-many-sigops", 422, State::Refused, RetryClass::None, false},
+        {"inject-sandbox-unknown", 422, State::BlockedNode, RetryClass::Operator, true},
+        {"inject-unknown", 422, State::BlockedNode, RetryClass::Operator, true},
+        {"inject-pool-unknown", 422, State::BlockedNode, RetryClass::Operator, true},
+        {"inject-rate-limited-unknown", 422, State::BlockedNode, RetryClass::Operator, true},
+        {"inject-rate-limited-peers-unknown", 422, State::BlockedNode, RetryClass::Operator, true},
+        {"inject-rate-limited-peers-count", 422, State::Ready, RetryClass::RateWindow, false},
+        {"inject-rate-limited-peers-bytes", 422, State::Ready, RetryClass::RateWindow, false},
         {"inject-script-invalid", 422, State::Refused, RetryClass::None, false},
         {"inject-fee-above-max", 422, State::Refused, RetryClass::None, false},
         {"inject-immature-coinbase-input", 422, State::Waiting, RetryClass::None, true},
@@ -1215,6 +1241,34 @@ static void k16_dropped_and_resubmit()
     CHECK(b.item().state == State::Mined && b.item().node.mined_height_unknown &&
               b.item().why.find("mined (height unknown)") != std::string::npos,
           "K16b: mined (height unknown)");
+    CHECK(!b.q.alerts.empty() && b.q.alerts.back().kind == "mined_unverified" &&
+              b.item().node.probe_at_height == b.node.tip + 6,
+          "K16b/L1: one alert (verify with dash-cli); re-probe scheduled after the display threshold");
+    const size_t posts = b.node.count("POST", route::kSubmit);
+    b.node.advance(5);
+    b.tick();
+    CHECK(b.item().state == State::Mined && b.node.count("POST", route::kSubmit) == posts, "K16b/L1: no probe before the threshold");
+    b.node.advance(1);
+    b.tick();
+    CHECK(b.item().state == State::Confirmed && is_terminal(b.item()) && b.node.count("POST", route::kSubmit) == posts + 1 &&
+              b.item().why.find("confirmed by probe") != std::string::npos,
+          "K16b/L1: the probe still answers already-confirmed -> confirmed (terminal)");
+    b.tick();
+    CHECK(b.node.count("POST", route::kSubmit) == posts + 1, "K16b/L1: no POST after confirmed");
+
+    // The inference was wrong: the probe is accepted -> normal tracking.
+    World c2;
+    const Art d = simple(122);
+    c2.add(d);
+    c2.node.script.push_back({"POST /api/tx-inject/submit",
+                              FakeNode::reply(422, nj{{"ok", false}, {"cause", "inject-already-confirmed"}, {"txid", d.txids[0]}})});
+    c2.tick();
+    c2.tick();
+    CHECK(c2.item().state == State::Mined && c2.item().node.mined_height_unknown, "K16b/L1: already-confirmed, no block found");
+    c2.node.advance(6);
+    c2.tick();
+    CHECK(c2.item().state == State::Admitted && c2.node.mempool.count(d.txids[0]),
+          "K16b/L1: a probe answered ok -> admitted (the tx was not mined; it is injected now)");
 }
 
 static void k17_expiry_and_renew()
@@ -1241,6 +1295,57 @@ static void k17_expiry_and_renew()
                       w.item().attempts.back().expiry_height == w.node.tip + 5,
                   "K17: auto_renew -> ready with a fresh expiry");
         }
+    }
+
+    // M1: the node reaps at tip >= expiry_height (reap_expired(tip + 1) drops
+    // tip + 1 > expiry). Walk the boundary one block at a time.
+    {
+        World w;
+        const Art a = simple(132);
+        EnqueueRequest r = req_for(a);
+        r.expiry_blocks = 4;
+        w.add(a, r);
+        w.tick();
+        const int64_t E = *w.item().node.expiry_height;
+        w.node.advance(static_cast<int>(E - 1 - w.node.tip)); // tip = E - 1: expiry at tip + 1
+        CHECK(w.node.tip == E - 1 && w.node.mempool.count(a.txids[0]), "K17/M1: fake node keeps it at tip = E - 1");
+        w.tick();
+        CHECK(w.item().state == State::IsHold || w.item().state == State::Riding, "K17/M1: expiry at tip + 1 -> still admitted");
+        w.node.mine(); // tip = E: the node reaps it
+        CHECK(w.node.tip == E && !w.node.mempool.count(a.txids[0]), "K17/M1: fake node reaps at tip = E like the node");
+        w.tick();
+        CHECK(w.item().state == State::Expired && w.item().why.find(">= expiry_height") != std::string::npos,
+              "K17/M1: expiry at tip -> expired (not dropped)");
+        for (int i = 0; i < 4; ++i) w.tick(60);
+        CHECK(w.item().state == State::Expired && is_terminal(w.item()) && w.node.count("POST", route::kSubmit) == 1 &&
+                  w.item().retry.resubmits == 0,
+              "K17/M1: auto_renew=false never resubmits");
+    }
+    {
+        World w; // expiry at tip - 1: two blocks between ticks
+        const Art a = simple(133);
+        EnqueueRequest r = req_for(a);
+        r.expiry_blocks = 3;
+        w.add(a, r);
+        w.tick();
+        const int64_t E = *w.item().node.expiry_height;
+        w.node.advance(static_cast<int>(E + 1 - w.node.tip));
+        w.tick();
+        CHECK(w.node.tip == E + 1 && w.item().state == State::Expired, "K17/M1: expiry at tip - 1 -> expired");
+    }
+    {
+        World w; // mined in the block at height E itself (template built at tip E - 1)
+        const Art a = simple(134);
+        EnqueueRequest r = req_for(a);
+        r.expiry_blocks = 3;
+        w.add(a, r);
+        w.tick();
+        const int64_t E = *w.item().node.expiry_height;
+        w.node.advance(static_cast<int>(E - 1 - w.node.tip));
+        w.node.mine({a.txids[0]});
+        w.tick();
+        CHECK(w.node.tip == E && w.item().state == State::Mined && w.item().node.mined_height == E,
+              "K17/M1: mined in block E -> mined, not expired");
     }
 }
 
@@ -1614,6 +1719,270 @@ static void misc_operator_edits_and_status()
     CHECK(f.node.bodies(route::kSubmit).back().find("\"max_fee\":2711") != std::string::npos, "submit: max_fee in the body");
 }
 
+
+// ── VERIFY-S1 follow-ups ─────────────────────────────────────────────────────
+
+// M2: a foreign parent (not a queue item) found by the body scan, through the
+// mempool short-cut, and across a reorg of its block.
+static void k6b_foreign_parent_tracking()
+{
+    SchedulerOptions so;
+    so.reorg_check_every = 1;
+    const std::string F = txid_of(make_tx(300));
+    {
+        // Mined before the child was queued, inside the body window.
+        World w(so);
+        w.node.blocks[w.node.tip - 10] = FakeBlock{w.node.synth_hash(w.node.tip - 10, 3), {F}, true};
+        const Art c = simple(301);
+        EnqueueRequest r = req_for(c);
+        r.after_parent = {{F, 1}};
+        w.add(c, r);
+        CHECK(w.q.tracked.size() == 1 && !w.q.tracked[0].window_scanned, "K6b: foreign parent tracked at enqueue");
+        w.tick();
+        CHECK(w.q.tracked[0].mined_height == w.node.tip - 10 && w.q.tracked[0].window_scanned &&
+                  w.q.tracked[0].first_requested_height == w.node.tip,
+              "K6b: first tick scans the body window and finds the parent");
+        CHECK(w.item().state == State::Admitted, "K6b: parent mined (11 confs >= 1) -> child submitted");
+    }
+    {
+        // In the mempool first, then mined, then reorged out and mined again.
+        World w(so);
+        w.node.mempool.insert(F);
+        const Art c = simple(302);
+        EnqueueRequest r = req_for(c);
+        r.after_parent = {{F, 2}};
+        w.add(c, r);
+        w.tick();
+        CHECK(!w.q.tracked[0].mined_height && w.q.tracked[0].scan_from_height == w.node.tip + 1 &&
+                  w.node.count("GET", route::kBlockAtHeight) == 0,
+              "K6b: parent in the mempool -> no scan, scan_from = tip + 1");
+        CHECK(w.item().state == State::Waiting && w.item().why.find("foreign parent") != std::string::npos,
+              "K6b: child waits on the foreign parent");
+        w.node.mine({F});
+        const int64_t H = w.node.tip;
+        w.node.log.clear();
+        w.tick();
+        CHECK(w.q.tracked[0].mined_height == H && w.node.count("GET", route::kBlockAtHeight) == 1,
+              "K6b: parent leaves the mempool -> one getblock finds it at H");
+        CHECK(w.item().state == State::Waiting && w.item().why.find("1/2 confirmations") != std::string::npos,
+              "K6b: child needs 2 confirmations");
+        w.node.reorg(H);
+        w.tick();
+        CHECK(!w.q.tracked[0].mined_height && w.q.tracked[0].scan_from_height == H && w.item().state == State::Waiting,
+              "K6b: reorg of H -> foreign parent reset, rescan from H, child waiting");
+        w.node.blocks[H + 1] = FakeBlock{w.node.synth_hash(H + 1, 5), {F}, true};
+        w.node.tip = H + 1;
+        w.tick();
+        CHECK(w.q.tracked[0].mined_height == H + 1, "K6b: re-mined at H + 1 -> found again");
+        w.node.mine();
+        w.tick();
+        CHECK(w.item().state == State::Admitted, "K6b: 2 confirmations -> child submitted");
+        const size_t gets = w.node.count("GET", route::kBlockAtHeight);
+        w.item().state = State::Refused; // no live child: the record is no longer scanned
+        w.q.tracked[0].mined_height.reset();
+        w.node.mine();
+        w.tick();
+        CHECK(w.node.count("GET", route::kBlockAtHeight) == gets, "K6b: no live child -> no scan");
+    }
+}
+
+// M2: a crash after the persisted "submitting" transition, before the reply.
+static void k11b_resume_from_submitting()
+{
+    for (int reached = 0; reached < 2; ++reached) {
+        World a;
+        std::vector<std::string> snaps;
+        a.s->set_persist([&](const Queue& qq, std::string&) {
+            snaps.push_back(queue_to_json(qq));
+            return true;
+        });
+        const Art art = simple(310 + reached);
+        a.add(art);
+        a.tick();
+        std::string on_disk;
+        for (const auto& sn : snaps)
+            if (sn.find("\"state\": \"submitting\"") != std::string::npos) on_disk = sn;
+        CHECK(!on_disk.empty(), "K11b: the submitting state is on disk before the POST");
+        World b;
+        std::string why;
+        CHECK(queue_from_json(on_disk, b.q, why) && b.item().state == State::Submitting, "K11b: loads as submitting");
+        b.q.node.token_file = a.q.node.token_file;
+        b.rebuild();
+        if (reached) {
+            b.node.mempool.insert(art.txids[0]);
+            b.node.time_added[art.txids[0]] = b.clock.t;
+        }
+        b.tick();
+        if (reached) {
+            CHECK(b.item().state == State::Admitted && b.node.count("POST", route::kSubmit) == 0,
+                  "K11b: POST had landed -> submitted_unknown -> admitted, no resubmit");
+        } else {
+            CHECK(b.item().state == State::SubmittedUnknown && b.item().retry.unknown_polls == 1 &&
+                      b.node.count("POST", route::kSubmit) == 0,
+                  "K11b: POST lost -> submitted_unknown, polling");
+            b.tick();
+            b.tick();
+            CHECK(b.item().state == State::Admitted && b.node.count("POST", route::kSubmit) == 1,
+                  "K11b: absent after 3 polls -> one resubmit");
+        }
+    }
+}
+
+// M2: mined -> admitted when a reorg drops the block and the node re-admits.
+static void k15b_reorg_readmitted()
+{
+    SchedulerOptions so;
+    so.reorg_check_every = 1;
+    World w(so);
+    const Art a = simple(320);
+    w.add(a);
+    w.tick();
+    w.node.mine({a.txids[0]});
+    const int64_t H = w.node.tip;
+    w.tick();
+    CHECK(w.item().state == State::Mined && w.item().node.mined_height == H, "K15b: mined at H");
+    w.node.reorg(H);
+    w.node.mempool.insert(a.txids[0]); // the node re-admitted the inject after the rewind
+    w.tick();
+    CHECK(w.item().state == State::Admitted && !w.item().node.mined_height &&
+              w.item().why.find("re-admitted") != std::string::npos && w.node.count("POST", route::kSubmit) == 1,
+          "K15b: block hash at H changed + tx back in the mempool -> admitted, no resubmit");
+    w.tick();
+    CHECK(w.item().state == State::IsHold || w.item().state == State::Riding, "K15b: tracked again from the mempool");
+}
+
+// M2: detect_disarm moves ready items to blocked_not_armed.
+static void k26b_disarm_moves_ready()
+{
+    World w;
+    w.add(simple(330));
+    w.node.script.push_back({"POST /api/tx-inject/submit", HttpReply{false, 0, "", "connection reset"}});
+    w.tick();
+    CHECK(w.item().state == State::Ready && w.item().retry.not_before == w.clock.t + 30 && w.q.runner.last_enabled == true,
+          "K26b: ready inside a back-off, node armed");
+    w.node.enabled = false;
+    w.tick(5);
+    bool moved = false;
+    for (const auto& e : w.item().journal)
+        if (e.event == "state" && e.detail.rfind("ready -> blocked_not_armed: blocked: node disarmed", 0) == 0) moved = true;
+    CHECK(moved && w.item().state == State::BlockedNotArmed && w.node.count("POST", route::kSubmit) == 1,
+          "K26b: enabled true -> false moves the ready item to blocked_not_armed");
+    int disarmed = 0;
+    for (const auto& al : w.q.alerts) disarmed += al.kind == "disarmed";
+    CHECK(disarmed == 1, "K26b: one disarm alert");
+}
+
+// M2: a 422 inject-rate-limited-* through the scheduler.
+static void k9b_rate_limited_through_scheduler()
+{
+    World w;
+    w.add(simple(340));
+    w.node.script.push_back({"POST /api/tx-inject/submit",
+                             FakeNode::reply(422, nj{{"ok", false}, {"cause", "inject-rate-limited-count"}})});
+    w.tick();
+    CHECK(w.item().state == State::Ready && w.item().retry.cls == RetryClass::RateWindow &&
+              w.item().retry.not_before == w.clock.t + 75,
+          "K9b: 422 rate-limited -> ready, retry after window_sec + 15");
+    w.tick(60);
+    CHECK(w.node.count("POST", route::kSubmit) == 1, "K9b: no POST inside the window");
+    w.tick(15);
+    CHECK(w.item().state == State::Admitted && w.node.count("POST", route::kSubmit) == 2, "K9b: after the window -> admitted");
+}
+
+// L3: fee-above-max is the operator's ceiling, not a signer error.
+static void k9c_fee_above_max()
+{
+    const Outcome o = classify_cause("inject-fee-above-max", 422);
+    CHECK(o.next == State::Refused && o.why.find("submit.max_fee") != std::string::npos &&
+              o.why.find("No re-sign") != std::string::npos && o.why.find("signer must rebuild") == std::string::npos,
+          "K9c/L3: fee-above-max names max_fee, does not blame the signer");
+    World w;
+    w.add(simple(350));
+    w.node.script.push_back({"POST /api/tx-inject/submit",
+                             FakeNode::reply(422, nj{{"ok", false}, {"cause", "inject-fee-above-max"}})});
+    w.tick();
+    std::string why;
+    CHECK(w.item().state == State::Refused, "K9c/L3: refused");
+    CHECK(set_submit_max_fee(w.q, w.item().id, 2711, w.clock.t, why) && requeue_item(w.q, w.item().id, w.clock.t, why),
+          "K9c/L3: raise max_fee + re-queue (no re-sign)");
+    w.tick();
+    CHECK(w.item().state == State::Admitted && w.node.bodies(route::kSubmit).back().find("\"max_fee\":2711") != std::string::npos,
+          "K9c/L3: resubmitted with the new ceiling");
+    CHECK(!set_submit_max_fee(w.q, w.item().id, 1, w.clock.t, why), "K9c/L3: max_fee is not edited in flight");
+}
+
+// L4: a node without the explorer raises one visible alert.
+static void k27b_explorer_disabled_alert()
+{
+    World w;
+    w.node.explorer = false;
+    w.add(simple(360));
+    w.tick();
+    w.tick();
+    w.tick();
+    int n = 0;
+    for (const auto& al : w.q.alerts) n += al.kind == "explorer_disabled";
+    CHECK(n == 1 && w.q.runner.explorer_off && w.item().state == State::Waiting &&
+              w.item().why.find("--no-explorer") != std::string::npos && w.node.count("POST", route::kSubmit) == 0,
+          "K27b/L4: --no-explorer -> one alert, items wait with the flag named, no submit");
+    w.node.explorer = true;
+    w.tick();
+    CHECK(!w.q.runner.explorer_off && w.item().state == State::Admitted, "K27b/L4: explorer back -> cleared, submitted");
+}
+
+// L6: the cause table against the node vocabulary, string for string.
+static void k9d_node_vocabulary()
+{
+    size_t n = 0;
+    const char* const* names = node_cause_names(n);
+    // Master c7a3bd0cd, copied from the node sources (see SubmitOutcome.hpp).
+    const char* master[] = {
+        "ok", "inject-disabled", "inject-type-unsupported", "inject-oversize", "inject-script-check-unarmed",
+        "inject-already-known", "inject-already-confirmed", "inject-unpriceable", "inject-bip68-unsupported",
+        "inject-bad-txns-vout-range", "inject-bad-txns-version-or-type", "inject-fee-above-max",
+        "inject-script-invalid", "inject-spent-shaped-output", "inject-unknown", "inject-pool-duplicate",
+        "inject-pool-full", "inject-pool-total-bytes-exceeded", "inject-pool-oversize", "inject-pool-unknown",
+        "inject-rate-limited-count", "inject-rate-limited-bytes", "inject-rate-limited-unknown",
+        "inject-rate-limited-peers-count", "inject-rate-limited-peers-bytes", "inject-rate-limited-peers-unknown",
+        "inject-sandbox-too-many-inputs", "inject-sandbox-too-many-outputs", "inject-sandbox-scriptsig-too-large",
+        "inject-sandbox-total-scriptsig-too-large", "inject-sandbox-too-many-sigops", "inject-sandbox-unknown",
+    };
+    std::set<std::string> ours(names, names + n), want(std::begin(master), std::end(master));
+    CHECK(ours == want, "K9d/L6: scheduler vocabulary == master node vocabulary (32 names)");
+    int recognized = 0;
+    for (size_t i = 0; i < n; ++i) recognized += classify_cause(names[i], 422).recognized ? 1 : 0;
+    CHECK(recognized == static_cast<int>(n) && !classify_cause("inject-some-future-cause", 422).recognized,
+          "K9d/L6: every node name is recognized; a future name is not");
+
+    // Drift tripwire: every "inject-*" string in this tree's node headers must
+    // be in the vocabulary (after a merge with master these are master's).
+    int files = 0, found = 0, missing = 0;
+#ifdef C2POOL_NODE_COIN_DIR
+    for (const char* f : {"node_coin_state.hpp", "mempool.hpp", "tx_inject_pool.hpp", "inject_rate_limiter.hpp",
+                          "inject_sandbox.hpp"}) {
+        std::ifstream in(std::string(C2POOL_NODE_COIN_DIR) + "/" + f);
+        if (!in) continue;
+        ++files;
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string text = ss.str();
+        for (size_t p = text.find("\"inject-"); p != std::string::npos; p = text.find("\"inject-", p + 1)) {
+            const size_t e = text.find('"', p + 1);
+            if (e == std::string::npos) break;
+            const std::string name = text.substr(p + 1, e - p - 1);
+            if (name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos) continue;
+            ++found;
+            if (!ours.count(name)) {
+                ++missing;
+                std::printf("  node cause not in the scheduler vocabulary: %s (%s)\n", name.c_str(), f);
+            }
+        }
+    }
+#endif
+    std::printf("  K9d: %d node headers scanned, %d cause strings, %d missing\n", files, found, missing);
+    CHECK(missing == 0, "K9d/L6: no node cause string outside the scheduler vocabulary");
+}
+
 int main()
 {
     k1_maturity_boundary();
@@ -1643,6 +2012,14 @@ int main()
     k26_disarm_detection_alert();
     k27_tip_unknown_waits();
     misc_operator_edits_and_status();
+    k6b_foreign_parent_tracking();
+    k11b_resume_from_submitting();
+    k15b_reorg_readmitted();
+    k26b_disarm_moves_ready();
+    k9b_rate_limited_through_scheduler();
+    k9c_fee_above_max();
+    k27b_explorer_disabled_alert();
+    k9d_node_vocabulary();
 
     for (const auto& f : g_tmpfiles) {
         ::unlink(f.c_str());

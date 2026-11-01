@@ -169,7 +169,12 @@ ArmResult two_phase_apply(NodeApi& api, const c2w::secure::SecureString& token, 
     // Phase 2: the same diff + the nonce, appended last so the two bodies differ
     // only by this member.
     std::string& nonce_ref = j1["money_nonce"].get_ref<std::string&>();
-    std::string rest = changes + ",\"money_nonce\":\"";
+    std::string rest;
+    // Reserve once (worst-case escaping) so the buffer holding the nonce never
+    // reallocates and leaves a stale copy behind.
+    rest.reserve(changes.size() + 20 + nonce_ref.size() * 6);
+    rest += changes;
+    rest += ",\"money_nonce\":\"";
     append_json_escaped(rest, reinterpret_cast<const uint8_t*>(nonce_ref.data()), nonce_ref.size());
     rest += "\"";
     wipe_string(nonce_ref);

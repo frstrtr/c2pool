@@ -110,6 +110,9 @@ if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
     add_executable(c2wallet-companion-sched-test tests/test_sched.cpp)
     target_link_libraries(c2wallet-companion-sched-test PRIVATE
         c2wallet-companion nlohmann_json::nlohmann_json)
+    # The node headers in this tree, for the cause-vocabulary drift check.
+    target_compile_definitions(c2wallet-companion-sched-test PRIVATE
+        C2POOL_NODE_COIN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/impl/dash/coin")
     add_test(NAME companion_sched_kats COMMAND c2wallet-companion-sched-test)
 
     # Mechanical key-free proof over the companion objects (the analog of the

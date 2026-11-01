@@ -53,6 +53,7 @@ const TipInfo& ChainView::tip()
     std::string why;
     if (!read_reply(api_.get(route::kChainInfo), j, why, t.transport_error)) {
         t.why = "tip unknown: getblockchaininfo: " + why;
+        t.explorer_disabled = why.rfind("Explorer not enabled", 0) == 0;
     } else if (!j.is_object()) {
         t.why = "tip unknown: getblockchaininfo is not an object";
     } else {

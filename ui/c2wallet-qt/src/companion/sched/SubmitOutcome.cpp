@@ -12,13 +12,58 @@ bool starts_with(const std::string& s, const char* p)
     return s.rfind(p, 0) == 0;
 }
 
-bool is_terminal_tx_cause(const std::string& c)
+// The tx itself is wrong: only a rebuilt (re-signed) tx can pass.
+bool is_rebuild_cause(const std::string& c)
 {
     return c == cause::Oversize || c == cause::PoolOversize || c == cause::TypeUnsupported ||
            c == cause::BadVersionOrType || c == cause::Bip68Unsupported || c == cause::BadVoutRange ||
-           c == cause::SpentShapedOutput || starts_with(c, cause::SandboxPrefix) ||
-           c == cause::ScriptInvalid || c == cause::FeeAboveMax;
+           c == cause::SpentShapedOutput || c == cause::SandboxTooManyInputs ||
+           c == cause::SandboxTooManyOutputs || c == cause::SandboxScriptsigTooLarge ||
+           c == cause::SandboxTotalScriptsigTooLarge || c == cause::SandboxTooManySigops ||
+           c == cause::ScriptInvalid;
 }
+
+// The node's own unreachable switch defaults.
+bool is_node_unknown_default(const std::string& c)
+{
+    return c == cause::GateUnknown || c == cause::PoolUnknown || c == cause::RateLimitedUnknown ||
+           c == cause::RateLimitedPeersUnknown || c == cause::SandboxUnknown;
+}
+
+const char* const kNodeCauses[] = {
+    cause::Ok,
+    cause::Disabled,
+    cause::TypeUnsupported,
+    cause::Oversize,
+    cause::ScriptCheckUnarmed,
+    cause::AlreadyKnown,
+    cause::AlreadyConfirmed,
+    cause::Unpriceable,
+    cause::Bip68Unsupported,
+    cause::BadVoutRange,
+    cause::BadVersionOrType,
+    cause::FeeAboveMax,
+    cause::ScriptInvalid,
+    cause::SpentShapedOutput,
+    cause::GateUnknown,
+    cause::PoolDuplicate,
+    cause::PoolFull,
+    cause::PoolTotalBytes,
+    cause::PoolOversize,
+    cause::PoolUnknown,
+    cause::RateLimitedCount,
+    cause::RateLimitedBytes,
+    cause::RateLimitedUnknown,
+    cause::RateLimitedPeersCount,
+    cause::RateLimitedPeersBytes,
+    cause::RateLimitedPeersUnknown,
+    cause::SandboxTooManyInputs,
+    cause::SandboxTooManyOutputs,
+    cause::SandboxScriptsigTooLarge,
+    cause::SandboxTotalScriptsigTooLarge,
+    cause::SandboxTooManySigops,
+    cause::SandboxUnknown,
+};
 
 Outcome make(State s, RetryClass r, const std::string& c, const std::string& why, int http)
 {
@@ -65,9 +110,22 @@ Outcome classify_cause(const std::string& c, int http)
                     "node cannot price an input (UTXO lane withheld or behind, or the input is spent); "
                     "retry in 10 min",
                     http);
-    if (is_terminal_tx_cause(c))
+    if (is_rebuild_cause(c))
         return make(State::Refused, RetryClass::None, c,
                     "refused by the node (" + c + "): the tx itself is wrong; the signer must rebuild it", http);
+    if (c == cause::FeeAboveMax)
+        return make(State::Refused, RetryClass::None, c,
+                    "refused by the node (" + c + "): the tx pays a fee above this item's submit.max_fee (0 for a "
+                    "zero-fee inject unless the manifest's fee_mode is relay). No re-sign is needed: if the fee is "
+                    "intended, raise submit.max_fee and re-queue",
+                    http);
+    if (is_node_unknown_default(c)) {
+        Outcome o = make(State::BlockedNode, RetryClass::Operator, c,
+                         "node answered its own unreachable default '" + c + "' (a node bug); operator Retry only",
+                         http);
+        o.alert = true;
+        return o;
+    }
     if (c == cause::ImmatureCoinbaseInput) {
         Outcome o = make(State::Waiting, RetryClass::None, c,
                          "node refused an immature coinbase input: the scheduler fired early (bug); waiting",
@@ -85,7 +143,14 @@ Outcome classify_cause(const std::string& c, int http)
     Outcome o = make(State::BlockedNode, RetryClass::Operator, c,
                      "node answered an unknown cause '" + c + "'; operator Retry only", http);
     o.alert = true;
+    o.recognized = false;
     return o;
+}
+
+const char* const* node_cause_names(size_t& count)
+{
+    count = sizeof(kNodeCauses) / sizeof(kNodeCauses[0]);
+    return kNodeCauses;
 }
 
 Outcome classify_submit(const HttpReply& r, const std::string& our_txid)

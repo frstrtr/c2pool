@@ -82,11 +82,13 @@ private:
 
     // phase 0
     void detect_disarm(const InjectStatus& st);
+    void check_explorer();
     // phase 1
     void observe_tracked();
     void observe_unknown(Item& it);
     void observe_admitted(Item& it);
     void observe_mined(Item& it);
+    void probe_mined(Item& it, int64_t tip);
     void mark_mined(Item& it, int64_t height, const std::string& hash, int64_t tip);
     // phase 2
     void act_waiting_or_ready(Item& it);

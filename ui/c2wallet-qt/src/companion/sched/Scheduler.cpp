@@ -175,6 +175,7 @@ TickReport Scheduler::tick()
     q_.runner.last_tick_at = at_;
 
     detect_disarm(view_.inject_status());
+    check_explorer();
 
     // Phase 1: observe what the node holds.
     observe_tracked();
@@ -248,6 +249,22 @@ void Scheduler::detect_disarm(const InjectStatus& st)
         q_.arm_policy.armed_by_scheduler_at.reset();
     }
     q_.runner.last_enabled = st.enabled;
+}
+
+void Scheduler::check_explorer()
+{
+    const TipInfo& t = view_.tip();
+    if (t.explorer_disabled) {
+        if (!q_.runner.explorer_off) {
+            q_.runner.explorer_off = true;
+            raise_alert("explorer_disabled",
+                        "node explorer disabled (--no-explorer): tip, mempool and block reads are refused, so every "
+                        "height / parent trigger and all post-submit tracking wait until it is re-enabled");
+        }
+    } else if (t.known && q_.runner.explorer_off) {
+        q_.runner.explorer_off = false;
+        queue_note("explorer", "node explorer answers again");
+    }
 }
 
 // ── phase 1: observe ─────────────────────────────────────────────────────────
@@ -400,9 +417,14 @@ void Scheduler::observe_admitted(Item& it)
                                                : std::string("(no new block)");
     const std::string gap =
         f.missing > 0 ? " (" + std::to_string(f.missing) + " heights without a retained body)" : std::string();
-    if (it.node.expiry_height && tip.height > *it.node.expiry_height) {
+    // The node reaps an inject once its next template height passes the expiry:
+    // reap_expired(tip + 1) drops entries with tip + 1 > expiry_height
+    // (node_coin_state.hpp reconcile_inject_pool, tx_inject_pool.hpp
+    // reap_expired), i.e. at tip >= expiry_height. A block at height
+    // expiry_height may still carry it; the scan above already looked.
+    if (it.node.expiry_height && tip.height >= *it.node.expiry_height) {
         transition(it, State::Expired,
-                   "expired — tip " + std::to_string(tip.height) + " > expiry_height " +
+                   "expired — tip " + std::to_string(tip.height) + " >= expiry_height " +
                        std::to_string(*it.node.expiry_height) + ", not found in blocks " + range + gap +
                        (it.submit.auto_renew ? "; auto-renew resubmits with a fresh expiry" : "; terminal"));
         return;
@@ -416,6 +438,65 @@ void Scheduler::observe_admitted(Item& it)
                            : std::string("auto-resubmit exhausted; terminal")));
 }
 
+void Scheduler::probe_mined(Item& it, int64_t tip)
+{
+    if (!it.node.probe_at_height) it.node.probe_at_height = tip + std::max<int64_t>(1, q_.defaults.display_confirmations);
+    if (tip < *it.node.probe_at_height) {
+        set_why(it, "mined (height unknown) — re-probed at tip >= " + std::to_string(*it.node.probe_at_height) +
+                        " (tip " + std::to_string(tip) + ")");
+        return;
+    }
+    const InjectStatus& st = view_.inject_status();
+    if (!st.ok || !st.enabled) {
+        set_why(it, "mined (height unknown) — probe deferred: the node is " +
+                        std::string(st.ok ? "not armed" : "unreachable (" + st.error + ")"));
+        return;
+    }
+    std::string why;
+    if (!load_token(why)) {
+        set_why(it, "mined (height unknown) — probe deferred: token file: " + why);
+        return;
+    }
+    const int64_t expiry = tip + it.submit.expiry_blocks;
+    const std::string rest = "\"raw_tx\":\"" + it.tx.raw_tx + "\",\"flags\":" + std::to_string(it.submit.flags) +
+                             ",\"expiry_height\":" + std::to_string(expiry) +
+                             ",\"max_fee\":" + std::to_string(it.submit.max_fee);
+    std::string body = build_token_body(token_, rest);
+    const int64_t t0 = clock_.monotonic_ms();
+    const HttpReply reply = api_.post_json(route::kSubmit, body);
+    const int64_t dur = clock_.monotonic_ms() - t0;
+    wipe_string(body);
+    ++report_.submits;
+    view_.invalidate_mempool();
+    const Outcome o = classify_submit(reply, it.tx.txid);
+    Attempt a;
+    a.at = at_;
+    a.http = o.http;
+    a.cause = belt(o.cause);
+    a.txid_echo = o.txid_echo.value_or("");
+    a.expiry_height = expiry;
+    a.armed = o.armed;
+    a.duration_ms = dur;
+    add_attempt(it, a);
+    if (o.cause == cause::AlreadyConfirmed) {
+        transition(it, State::Confirmed,
+                   "confirmed by probe — the node still answers inject-already-confirmed at tip " + std::to_string(tip) +
+                       ", " + std::to_string(q_.defaults.display_confirmations) +
+                       " blocks after the first answer; block height unknown (outside the body window)");
+        return;
+    }
+    if (o.next == State::Ready || o.next == State::BlockedNotArmed || o.next == State::BlockedToken ||
+        o.next == State::SubmittedUnknown) {
+        // No verdict: keep the inference and probe again after the threshold.
+        it.node.probe_at_height = tip + std::max<int64_t>(1, q_.defaults.display_confirmations);
+        set_why(it, "mined (height unknown) — probe inconclusive (" + o.cause + "); again at tip >= " +
+                        std::to_string(*it.node.probe_at_height));
+        return;
+    }
+    note(it, "probe", "the re-probe answered " + o.cause + ": the already-confirmed inference did not hold");
+    apply_outcome(it, o, expiry, tip);
+}
+
 void Scheduler::observe_mined(Item& it)
 {
     const TipInfo& tip = view_.tip();
@@ -424,16 +505,30 @@ void Scheduler::observe_mined(Item& it)
         return;
     }
     if (!it.node.mined_height) {
-        if (it.node.mined_height_unknown) return;
+        if (it.node.mined_height_unknown) {
+            probe_mined(it, tip.height);
+            return;
+        }
         const int64_t lo = std::max<int64_t>(1, tip.height - opt_.body_window + 1);
         const FindResult f = view_.find_tx(it.tx.txid, lo, tip.height);
         if (!f.found) {
+            // "Mined" is the node's inference (own output present in its UTXO
+            // view), not a block we saw. Re-probe after the display threshold:
+            // still already-confirmed => confirmed; anything else is classified
+            // normally (an ok means it was not mined and is now admitted).
             it.node.mined_height_unknown = true;
+            it.node.probe_at_height = tip.height + std::max<int64_t>(1, q_.defaults.display_confirmations);
             set_why(it, "mined (height unknown) — the node answered inject-already-confirmed and no retained block "
                         "body in " +
                             std::to_string(lo) + ".." + std::to_string(tip.height) +
-                            " carries it (mined before the body window?)");
+                            " carries it (mined before the body window?); re-probed at tip >= " +
+                            std::to_string(*it.node.probe_at_height));
             note(it, "mined", it.why);
+            raise_alert("mined_unverified",
+                        it.id + ": inject-already-confirmed with no block in the body window; confirmed only if the "
+                                "node still reports it at tip >= " +
+                            std::to_string(*it.node.probe_at_height) + ". Verify with dash-cli gettxout " +
+                            it.tx.txid + " 0 on a full node if it matters");
             persist();
             return;
         }
