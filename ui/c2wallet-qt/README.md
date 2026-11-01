@@ -89,6 +89,10 @@ ui/c2wallet-qt/ci/check_no_network.sh build-c2wallet/c2wallet-qt-signer
 ( cd build-c2wallet && ctest --output-on-failure )
 ```
 
+The online companion (built by default) also needs `nlohmann-json3-dev` for
+its inject scheduler. A signer-only build needs neither it nor Qt Network:
+add `-DC2WALLET_QT_BUILD_COMPANION=OFF`.
+
 ## DASH inject / collateral (slice 2)
 
 The **DASH Inject / Collateral** screen consolidates the mature UTXOs of one

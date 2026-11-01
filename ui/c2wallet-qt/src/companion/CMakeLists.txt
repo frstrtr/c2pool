@@ -62,8 +62,15 @@ endif()
 
 # The inject scheduler core (sched/) parses queue files, manifests and node
 # replies with nlohmann::json, the node's own wire library (header-only). It is
-# a dependency of the companion ONLY: the signer target never links it.
-find_package(nlohmann_json 3.9 REQUIRED)
+# a dependency of the companion ONLY: the signer target never links it, and a
+# signer-only build (-DC2WALLET_QT_BUILD_COMPANION=OFF) never reaches this file.
+find_package(nlohmann_json 3.9 QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(FATAL_ERROR
+        "c2wallet-qt companion: nlohmann_json >= 3.9 not found (Debian/Ubuntu: "
+        "apt install nlohmann-json3-dev). For a signer-only build configure "
+        "ui/c2wallet-qt with -DC2WALLET_QT_BUILD_COMPANION=OFF.")
+endif()
 
 set(COMPANION_SOURCES
     FundingData.cpp

@@ -129,20 +129,28 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
 # only the vendored SHA-256), NEVER the key-bearing signer core. The mechanical
 # proof is ci/check_key_free.sh, registered as a ctest by src/companion.
 # ═══════════════════════════════════════════════════════════════════════════
-find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
+# A signer-only build (-DC2WALLET_QT_BUILD_COMPANION=OFF) needs neither
+# Qt6::Network nor nlohmann_json (the companion's inject scheduler parses JSON
+# with it); the signer target never depends on either.
+option(C2WALLET_QT_BUILD_COMPANION
+    "Build the online key-free companion (needs Qt6::Network and nlohmann_json)" ON)
 
-# The key-free companion library + its KATs + the key-free guard.
-add_subdirectory(src/companion)
+if(C2WALLET_QT_BUILD_COMPANION)
+    find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
 
-add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
-target_include_directories(c2wallet-qt-companion PRIVATE src)
-target_link_libraries(c2wallet-qt-companion PRIVATE
-    c2wallet-companion
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Network
-)
+    # The key-free companion library + its KATs + the key-free guard.
+    add_subdirectory(src/companion)
+
+    add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
+    target_include_directories(c2wallet-qt-companion PRIVATE src)
+    target_link_libraries(c2wallet-qt-companion PRIVATE
+        c2wallet-companion
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+    )
+endif()
 
 # ── Network-incapable link-guard as a ctest ────────────────────────────────
 # The same mechanical proof CI runs, available locally: build the target, then
