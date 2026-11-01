@@ -54,6 +54,10 @@ uint288 pow2(unsigned k) {
 constexpr uint32_t COLD   = 1700;  // DASH oracle dash.py:23 MINIMUM_PROTOCOL_VERSION
 constexpr uint32_t TARGET = 3600;  // v36-successor floor STAND-IN (set at S8 wire-up)
 
+// #920: the pre-#920 cases below pin the WEIGHT math, so they run with the distinct-
+// origin precondition satisfied (self + one peer). The origin cases are at the end.
+constexpr int MULTI = dash::MIN_DISTINCT_ORIGINS;
+
 }  // namespace
 
 // ============================================================================
@@ -134,9 +138,9 @@ TEST(DashAutoRatchet, WeightedDivergesFromPlainCount) {
     const int32_t CL = 100;  // full window present (parent_height >= CL) for both arms
 
     const uint32_t weighted_decision =
-        dash::apply_min_protocol_ratchet_decision(CL, CL, weighted, 36, COLD, TARGET);
+        dash::apply_min_protocol_ratchet_decision(CL, CL, weighted, 36, COLD, TARGET, MULTI);
     const uint32_t flat_decision =
-        dash::apply_min_protocol_ratchet_decision(CL, CL, flat, 36, COLD, TARGET);
+        dash::apply_min_protocol_ratchet_decision(CL, CL, flat, 36, COLD, TARGET, MULTI);
 
     EXPECT_EQ(weighted_decision, TARGET);  // work-weighted -> ratchets
     EXPECT_EQ(flat_decision,     COLD);    // plain-count   -> does NOT ratchet
@@ -154,33 +158,33 @@ constexpr int32_t CL = 100;  // stand-in CHAIN_LENGTH for the window guard
 TEST(DashAutoRatchetWiring, ShortChainNeverLifts) {
     auto w = std::map<uint64_t, uint288>{{36, u(100)}};  // unanimous
     EXPECT_EQ(dash::ratchet_min_protocol_version(w, 36, COLD, TARGET), TARGET);  // pure fn would
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL - 1, CL, w, 36, COLD, TARGET), COLD);
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(0,      CL, w, 36, COLD, TARGET), COLD);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL - 1, CL, w, 36, COLD, TARGET, MULTI), COLD);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(0,      CL, w, 36, COLD, TARGET, MULTI), COLD);
 }
 
 // --- empty window + short chain -> no lift.
 TEST(DashAutoRatchetWiring, ShortChainEmptyWindowNoLift) {
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL - 1, CL, {}, 36, COLD, TARGET), COLD);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL - 1, CL, {}, 36, COLD, TARGET, MULTI), COLD);
 }
 
 // --- FULL WINDOW present (parent_height >= CHAIN_LENGTH) + unanimous -> lift.
 TEST(DashAutoRatchetWiring, FullWindowUnanimousLifts) {
     auto w = std::map<uint64_t, uint288>{{36, u(100)}};
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL,     CL, w, 36, COLD, TARGET), TARGET);
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL * 5, CL, w, 36, COLD, TARGET), TARGET);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL,     CL, w, 36, COLD, TARGET, MULTI), TARGET);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL * 5, CL, w, 36, COLD, TARGET, MULTI), TARGET);
 }
 
 // --- FULL WINDOW present but best < 95% -> stays cold (delegates to pure fn).
 TEST(DashAutoRatchetWiring, FullWindowBelow95StaysCold) {
     auto w = std::map<uint64_t, uint288>{{36, u(94)}, {35, u(6)}};  // sum=100, 94<95
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET), COLD);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, MULTI), COLD);
 }
 
 // --- already at/above target short-circuits regardless of window/height (latch).
 TEST(DashAutoRatchetWiring, AlreadyAtTargetShortCircuits) {
     auto w = std::map<uint64_t, uint288>{{36, u(100)}};
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, TARGET, TARGET), TARGET);
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(0,  CL, w, 36, TARGET, TARGET), TARGET);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, TARGET, TARGET, MULTI), TARGET);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(0,  CL, w, 36, TARGET, TARGET, MULTI), TARGET);
 }
 
 // ============================================================================
@@ -256,7 +260,7 @@ TEST(DashRatchetCrossing, IsolatedFloorAboveTargetLatchedRefuses3600) {
 
     const uint32_t seed = iso.ratchet_floor_protocol_version;
     auto all_v36 = std::map<uint64_t, uint288>{{36, u(100)}};
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v36, 36, seed, TARGET), seed);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v36, 36, seed, TARGET, MULTI), seed);
     EXPECT_EQ(dash::ratchet_min_protocol_version(all_v36, 36, seed, TARGET), seed);
 
     dash::MinProtocolGate gate;  // default operator knob = 1700 cannot lower it
@@ -276,10 +280,10 @@ TEST(DashRatchetCrossing, IsolatedFloorAboveTargetLatchedRefuses3600) {
 TEST(DashRatchetCrossing, GuardPreventsPreCrossingFalseLift) {
     auto all_v16 = std::map<uint64_t, uint288>{{16, u(100)}};  // unanimous pre-crossing
     // Raw decision keyed on the CURRENT vote (16): weights[16]=100% -> WOULD lift.
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 16, COLD, TARGET),
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 16, COLD, TARGET, MULTI),
               TARGET);  // <-- the danger the node's best_desired>=36 guard blocks
     // Keyed on the crossing vote (36): weights[36]=0 -> stays COLD (correct).
-    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 36, COLD, TARGET),
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, all_v16, 36, COLD, TARGET, MULTI),
               COLD);
 }
 
@@ -292,7 +296,7 @@ TEST(DashRatchetCrossing, LatchDrivenByRatchetVerdict) {
     // Crossed window: v36 heavy (work 96), v16 light (work 4) -> 96 >= 100*95//100=95.
     auto crossed = std::map<uint64_t, uint288>{{36, u(96)}, {16, u(4)}};
     const bool crossed_active =
-        dash::apply_min_protocol_ratchet_decision(CL, CL, crossed, 36, COLD, TARGET) == TARGET;
+        dash::apply_min_protocol_ratchet_decision(CL, CL, crossed, 36, COLD, TARGET, MULTI) == TARGET;
     EXPECT_TRUE(crossed_active);  // the ratchet fires -> the latch's "active" input
 
     val::ActivationLatch latch;
@@ -339,4 +343,89 @@ TEST(DashRatchetCrossing, SuccessorGateIsWeightedNotFlatCount) {
     // By flat COUNT it would be 1/10 = 10% -> fail. Proves the weighting.
     auto weights = std::map<uint64_t, uint288>{{36, u(70)}, {16, u(9)}};
     EXPECT_TRUE(vn::successor_switch_allowed(weights, 36));
+}
+
+// ============================================================================
+// #920 DISTINCT-ORIGIN PRECONDITION. A 95% supermajority that traces to ONE origin
+// (self alone, or one relaying peer) must NOT lift the floor; a genuine multi-origin
+// crossing -- including the legitimate 2-operator pool -- still must.
+// ============================================================================
+
+namespace {
+const NetService SELF{};                         // locally minted / LevelDB-restored
+const NetService SELF_ZERO{"0.0.0.0", 0};        // the other local marker
+const NetService PEER_A{"10.0.0.1", 8999};
+const NetService PEER_B{"10.0.0.2", 8999};
+
+// n YES-votes (desired 36), all received from `from`.
+std::vector<dash::VoteOrigin> yes_window(int n, const NetService& from) {
+    return std::vector<dash::VoteOrigin>(n, dash::VoteOrigin{36, from});
+}
+}  // namespace
+
+TEST(DashRatchetDistinctOrigin, SelfMarkersCollapseToOneOrigin) {
+    EXPECT_TRUE(dash::is_self_origin(SELF));
+    EXPECT_TRUE(dash::is_self_origin(SELF_ZERO));
+    EXPECT_FALSE(dash::is_self_origin(PEER_A));
+    auto w = yes_window(5, SELF);
+    auto z = yes_window(5, SELF_ZERO);
+    w.insert(w.end(), z.begin(), z.end());
+    EXPECT_EQ(dash::count_distinct_yes_origins(w, 36), 1);
+}
+
+TEST(DashRatchetDistinctOrigin, OnlyYesVotesCount) {
+    // PEER_A votes 16 (NO) and must not count as an origin of the v36 supermajority.
+    auto w = yes_window(9, SELF);
+    w.push_back({16, PEER_A});
+    EXPECT_EQ(dash::count_distinct_yes_origins(w, 36), 1);
+    w.push_back({36, PEER_A});
+    EXPECT_EQ(dash::count_distinct_yes_origins(w, 36), 2);
+}
+
+// THE #920 BUG: a node alone on its sharechain, 100% desired_version=36, full window.
+// The weight gate alone lifts; the origin precondition must hold it COLD.
+TEST(DashRatchetDistinctOrigin, SelfAuthoredSupermajorityDoesNotLift) {
+    auto window = yes_window(CL / 10, SELF);
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    const int origins = dash::count_distinct_yes_origins(window, 36);
+    EXPECT_EQ(origins, 1);
+    EXPECT_EQ(dash::ratchet_min_protocol_version(w, 36, COLD, TARGET), TARGET);  // weight alone would
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, origins), COLD);
+}
+
+// The relayed shape: every YES-vote arrives through ONE external peer.
+TEST(DashRatchetDistinctOrigin, SinglePeerRelayedSupermajorityDoesNotLift) {
+    auto window = yes_window(CL / 10, PEER_A);
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    const int origins = dash::count_distinct_yes_origins(window, 36);
+    EXPECT_EQ(origins, 1);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, origins), COLD);
+}
+
+// COMPANION: the legitimate 2-operator crossing (self + the other node) still lifts.
+TEST(DashRatchetDistinctOrigin, TwoOperatorCrossingLifts) {
+    auto window = yes_window(5, SELF);
+    auto other  = yes_window(5, PEER_A);
+    window.insert(window.end(), other.begin(), other.end());
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    const int origins = dash::count_distinct_yes_origins(window, 36);
+    EXPECT_EQ(origins, 2);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, origins), TARGET);
+}
+
+// COMPANION: two external origins with no local YES-vote also lifts.
+TEST(DashRatchetDistinctOrigin, TwoExternalOriginsLift) {
+    auto window = yes_window(5, PEER_A);
+    auto other  = yes_window(5, PEER_B);
+    window.insert(window.end(), other.begin(), other.end());
+    auto w = std::map<uint64_t, uint288>{{36, u(100)}};
+    const int origins = dash::count_distinct_yes_origins(window, 36);
+    EXPECT_EQ(origins, 2);
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, origins), TARGET);
+}
+
+// The origin precondition never substitutes for weight: 2 origins below 95% stays cold.
+TEST(DashRatchetDistinctOrigin, OriginsDoNotOverrideWeightGate) {
+    auto w = std::map<uint64_t, uint288>{{36, u(94)}, {16, u(6)}};
+    EXPECT_EQ(dash::apply_min_protocol_ratchet_decision(CL, CL, w, 36, COLD, TARGET, MULTI), COLD);
 }
