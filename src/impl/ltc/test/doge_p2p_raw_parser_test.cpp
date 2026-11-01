@@ -6,7 +6,15 @@
 //     chain (it reads AuxPoW data as transactions: garbage headers);
 //   - a 'block' the raw block parser cannot read is dropped, never handed on
 //     from the standard parse;
-//   - what the raw parser returns is the batch (the control).
+//   - what the raw parser returns is the batch (the control);
+//   - a raw parse that stops before the message's count (it returned fewer
+//     entries than the CompactSize declares) goes to the truncation hook
+//     with what parsed and the count, never to new_headers (VERIFY5 S3); a
+//     complete one goes to new_headers, not the hook;
+//   - an inv announcing a block, with announced fetches off: the header
+//     chain hears of it (new_block), no body getdata goes out (the embedded
+//     DOGE node's tip handler asks the announcer once; every announcer sent
+//     the body before: 18-22 copies of each tip).
 // Driven through NodeP2P's public handle(RawMessage) with payloads the
 // standard parser reads, so a fallback would deliver them. The pre-fix
 // fallback also touched the connection, which a unit test has none of: each
@@ -105,7 +113,57 @@ BlockType a_block(uint32_t nonce)
     std::exit(h.header_events == 1 && h.headers_delivered == 3 ? 0 : 1);
 }
 
+/// A message declaring three headers; the raw parser returns `parsed` of
+/// them. Exits 0 when the truncation hook got (parsed, 3) and new_headers
+/// nothing (parsed < 3), or new_headers got all three and the hook nothing.
+[[noreturn]] void truncation_case(size_t parsed)
+{
+    Harness h;
+    const std::vector<BlockType> sent{a_block(1), a_block(2), a_block(3)};
+    std::vector<BlockHeaderType> prefix(sent.begin(), sent.begin() + parsed);
+    h.node.set_raw_headers_parser([prefix](const uint8_t*, size_t) { return prefix; });
+    int hooked = 0;
+    size_t hook_headers = 0;
+    uint64_t hook_count = 0;
+    h.node.set_on_headers_truncated([&](const std::vector<BlockHeaderType>& v, uint64_t count) {
+        ++hooked;
+        hook_headers = v.size();
+        hook_count = count;
+    });
+    h.deliver(ltc::coin::p2p::message_headers::make_raw(sent, {}));
+    const bool ok = parsed < 3
+        ? hooked == 1 && hook_headers == parsed && hook_count == 3 && h.header_events == 0
+        : hooked == 0 && h.header_events == 1 && h.headers_delivered == 3;
+    std::exit(ok ? 0 : 1);
+}
+
+/// An inv for a block on a DOGE node whose announced fetches are off. The
+/// harness has no connection: a getdata would crash the child.
+[[noreturn]] void inv_case()
+{
+    Harness h;
+    int announced = 0;
+    h.coin.new_block.subscribe([&](const uint256&) { ++announced; });
+    h.node.set_fetch_announced_blocks(false);
+    uint256 b;
+    b.SetHex("00000000000000000000000000000000000000000000000000000000c0ffee01");
+    h.deliver(ltc::coin::p2p::message_inv::make_raw(
+        {ltc::coin::p2p::inventory_type(ltc::coin::p2p::inventory_type::block, b)}));
+    std::exit(announced == 1 ? 0 : 1);
+}
+
 } // namespace
+
+TEST(DogeP2PRawParser, AShortRawParseGoesToTheTruncationHookNotNewHeaders)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(truncation_case(2), ::testing::ExitedWithCode(0), "")
+        << "2 of 3 parsed: not handed to the truncation hook as (2, 3), or delivered as new headers";
+    EXPECT_EXIT(truncation_case(0), ::testing::ExitedWithCode(0), "")
+        << "0 of 3 parsed: not handed to the truncation hook as (0, 3)";
+    EXPECT_EXIT(truncation_case(3), ::testing::ExitedWithCode(0), "")
+        << "3 of 3 parsed: not delivered as new headers, or the hook was called";
+}
 
 TEST(DogeP2PRawParser, AHeadersMessageTheRawParserCannotReadDeliversNothing)
 {
@@ -125,4 +183,10 @@ TEST(DogeP2PRawParser, WhatTheRawParserReturnsIsTheBatch)
 {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(raw_batch_case(), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(DogeP2PRawParser, AnInvAsksNoBodyWhenAnnouncedFetchesAreOff)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(inv_case(), ::testing::ExitedWithCode(0), "");
 }

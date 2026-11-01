@@ -200,6 +200,8 @@ public:
         Outpoint missing;      // the input's prevout
         uint256  txid;         // the transaction spending it
         uint32_t tx_index{0};  // its position in the block
+        bool     spent_in_block{false};  // an earlier tx of the same block spent it (no valid
+                                         // block does: a mutated or forged body)
     };
 
     /// connect_block with the mode explicit. strict = false is the call above
@@ -221,11 +223,14 @@ public:
         std::unique_lock<std::shared_mutex> lock(m_mu);
         // The block's changes, applied to the view only once every input resolved.
         std::unordered_map<Outpoint, std::optional<Coin>, OutpointHasher> overlay;
+        bool spent_in_block = false;
         auto lookup = [&](const Outpoint& op, Coin& coin) {
             auto it = overlay.find(op);
             if (it != overlay.end()) {
-                if (!it->second.has_value())
-                    return false;  // spent earlier in this block
+                if (!it->second.has_value()) {
+                    spent_in_block = true;  // spent earlier in this block
+                    return false;
+                }
                 coin = *it->second;
                 return true;
             }
@@ -252,6 +257,7 @@ public:
                             why->missing = op;
                             why->txid = txid;
                             why->tx_index = static_cast<uint32_t>(t);
+                            why->spent_in_block = spent_in_block;
                         }
                         return std::nullopt;
                     }
@@ -400,13 +406,16 @@ public:
     /// legacy accrual view that never recorded one).
     uint32_t anchor_height() const { return sync_state().anchor_height; }
 
-    /// The set holds every coin of the best chain up to `chain_height`: it was
-    /// built from genesis and its best block is at that height.
-    bool complete(uint32_t chain_height) const {
+    /// The set holds every coin of the best chain up to its tip: it was
+    /// built from genesis and its best block IS the tip (`chain_hash` at
+    /// `chain_height`), not only at the tip's height (a sibling of the tip
+    /// is not the tip's set).
+    bool complete(uint32_t chain_height, const uint256& chain_hash) const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
-        if (!m_base)
+        if (!m_base || chain_hash.IsNull())
             return false;
-        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height;
+        return m_base->get_sync_state().anchor_height == 0 && m_base->get_best_height() == chain_height
+            && m_base->get_best_block() == chain_hash;
     }
 
     /// Re-anchor the view: drop all in-memory pending changes AND wipe the

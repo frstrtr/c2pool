@@ -31,6 +31,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/block.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 #include <core/uint256.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -310,6 +311,8 @@ TEST(TemplateBuilderTest, MempoolTxsAppearInTemplate) {
         pool.add_tx(tx);
         pool.set_tx_fee(txid, 1000);
     }
+    ltc_test::CoveringView view;
+    view.cover(pool);
     clean_for_genesis(pool);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
@@ -327,6 +330,8 @@ TEST(TemplateBuilderTest, TxArrayHasDataAndTxidFields) {
     auto txid99 = compute_txid(tx99);
     pool.add_tx(tx99);
     pool.set_tx_fee(txid99, 500);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     clean_for_genesis(pool);
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
@@ -348,6 +353,8 @@ TEST(TemplateBuilderTest, TxHashConsistencyWithHashes) {
     auto txid42 = compute_txid(tx);
     pool.add_tx(tx);
     pool.set_tx_fee(txid42, 500);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     clean_for_genesis(pool);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);

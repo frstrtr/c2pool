@@ -13,7 +13,10 @@
 //   - a pegin output without its kernel (litecoind kernel-mismatch);
 //   - empty vin or vout outside MWEB-only txs (CheckTransaction), which also
 //     catches the 10-byte stub a SERIALIZE_NO_MWEB relay would give;
-//   - a loose HogEx.
+//   - a loose HogEx;
+//   - with a view: a premature coinbase spend (inputs_invalid) and, with a
+//     set built from genesis, a tx whose input is in neither the set nor the
+//     pool (missing_inputs: an orphan, outside the pool).
 // Real bytes: the peg-in and peg-out mempool txs and 3200601's HogEx
 // (ltc_mweb_tx_fixtures.hpp). Refusals are counted by code, with the kernel
 // fees given up.
@@ -23,7 +26,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,6 +39,9 @@
 #include <core/uint256.hpp>
 #include <btclibs/util/strencodings.h>
 
+#include <core/coin/utxo.hpp>
+#include <core/coin/utxo_view_cache.hpp>
+#include <core/coin/utxo_view_db.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 
@@ -198,6 +206,44 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
     r = pool.admit(ok, nullptr);
     ASSERT_TRUE(r);
     EXPECT_EQ(r->code, Code::duplicate);
+
+    // A coinbase 5 blocks deep (maturity 100): refused, not pooled.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin cb;
+        cb.value = 5000000000LL;
+        cb.scriptPubKey.m_data = {0x51};
+        cb.height = 95;
+        cb.coinbase = true;
+        view.add_coin(core::coin::Outpoint(pay(0x08, 1000).vin[0].prevout.hash, 0), cb);
+        pool.set_tip_height(100);
+        r = pool.admit(pay(0x08, 1000), &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::inputs_invalid);
+        pool.set_tip_height(0);
+    }
+
+    // An input in neither the set nor the pool, the set built from genesis:
+    // an orphan (outside the pool).
+    {
+        std::mt19937_64 rng(std::random_device{}());
+        const auto dir = std::filesystem::temp_directory_path() / ("ltc_admission_" + std::to_string(rng()));
+        {
+            core::coin::UTXOViewDB db(dir.string());
+            ASSERT_TRUE(db.open());
+            core::coin::UTXOViewCache full(&db);
+            core::coin::SyncState s;
+            s.anchor_height = 0;
+            s.strict = 1;
+            ASSERT_TRUE(full.set_sync_state(s));
+            r = pool.admit(pay(0x09, 1000), &full);
+            ASSERT_TRUE(r);
+            EXPECT_EQ(r->code, Code::missing_inputs);
+            EXPECT_EQ(pool.orphan_count(), 1u);
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
 
     // The rules key on MWEB data only: an ordinary legacy tx (any coin
     // sharing this pool, e.g. DOGE) is admitted as before.
