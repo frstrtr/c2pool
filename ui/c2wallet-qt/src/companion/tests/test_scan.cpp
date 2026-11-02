@@ -447,6 +447,19 @@ static void k9_gettxout_disagrees()
     t.rows = rows;
     t.chain = "test";
     CHECK(refuses([&] { dashd_scan(t); }, cause::kWrongNetwork), "a testnet dashd for a mainnet scan refuses");
+    FakeDashd a401;
+    a401.rows = rows;
+    a401.bare_http_status = 401;
+    CHECK(refuses([&] { dashd_scan(a401); }, cause::kAuthRefused, &what) && what.find("cookie") != std::string::npos,
+          "HTTP 401 without a JSON-RPC body: scan-auth-refused, pointing at the credentials");
+    FakeDashd a403;
+    a403.rows = rows;
+    a403.bare_http_status = 403;
+    CHECK(refuses([&] { dashd_scan(a403); }, cause::kAuthRefused), "HTTP 403 (rpcallowip): scan-auth-refused");
+    FakeDashd a500;
+    a500.rows = rows;
+    a500.bare_http_status = 500;
+    CHECK(refuses([&] { dashd_scan(a500); }, cause::kBadReply), "HTTP 500 without a body stays scan-bad-reply");
     FakeDashd f;
     f.rows = rows;
     Row foreign = rows[0];
@@ -504,6 +517,83 @@ static void k10_classification()
     const dash::UtxoImport small = import_of(synthetic_rows(kXdgf, 5, 15000, 2500000), 2600000);
     CHECK(classify(small, {}, {}, relay).uneconomic.size() == 5 && classify(small, {}, {}, ClassifyParams{}).uneconomic.empty(),
           "15000-duff rows are uneconomic at 100 duffs/B x 181 B (relay only)");
+}
+
+// L3: the consensus coinbase floor on the companion path, at the real tip.
+static void k10b_consensus_maturity_floor()
+{
+    std::printf("[K10b coinbase younger than 100 blocks at tip 2563986: the consensus floor, end to end]\n");
+    std::vector<Row> rows = fixture_rows();
+    auto row = [&](const char* tag, int64_t height, bool coinbase, int64_t sat) {
+        Row r;
+        r.address = kXdgf;
+        r.txid = sha_hex(std::string("K10b ") + tag);
+        r.vout = 0;
+        r.script = kXdgfScript;
+        r.sat = sat;
+        r.height = height;
+        r.coinbase = coinbase;
+        rows.push_back(r);
+        return Outpoint{r.txid, 0};
+    };
+    const Outpoint young_cb = row("coinbase 50 blocks", kTip - 50, true, 500000);
+    const Outpoint young_tx = row("non-coinbase 50 blocks", kTip - 50, false, 400000);
+    const Outpoint edge_cb = row("coinbase 98 blocks", kTip - 98, true, 300000);
+    FakeDashd d;
+    d.rows = rows;
+    const ScanResult r = dashd_scan(d);
+    const dash::UtxoImport& imp = r.imports.at(0);
+    CHECK(imp.utxos.size() == 173, "173 rows at the real tip");
+    auto find_imm = [](const Classification& c, const Outpoint& o) -> const ImmatureRow* {
+        for (const ImmatureRow& x : c.immature)
+            if (x.utxo.txid == o.txid && x.utxo.vout == o.vout) return &x;
+        return nullptr;
+    };
+    auto is_mature = [](const Classification& c, const Outpoint& o) {
+        for (const dash::Utxo& u : c.mature)
+            if (u.txid == o.txid && u.vout == o.vout) return true;
+        return false;
+    };
+    // Default (min_confirmations 101, target tip + 2): the 50-block coinbase
+    // needs 101 - 52 = 49 more blocks; the 98-block one is one block short.
+    const Classification def = classify(imp, r.mempool_spent, {}, ClassifyParams{});
+    const ImmatureRow* a = find_imm(def, young_cb);
+    const ImmatureRow* e = find_imm(def, edge_cb);
+    CHECK(def.immature.size() == 2 && a && e, "two coinbase rows immature at the default rule");
+    CHECK(a && a->matures_in == 49 && a->spendable_from_height == kTip + 50 && a->eta == "~2 h 7 m" &&
+              a->utxo.confirmations == 51,
+          "50-block coinbase: 49 blocks, spendable from h0 + 100, ~2 h 7 m, 51 confirmations at the tip");
+    CHECK(e && e->matures_in == 1, "98-block coinbase: one block short of the 101 default");
+    CHECK(is_mature(def, young_tx), "the 50-block non-coinbase row is mature (one confirmation)");
+    // min_confirmations 1: the operator cannot lower a coinbase below the
+    // consensus 100 — the 50-block coinbase still waits (100 - 52 = 48),
+    // the 98-block one lands exactly at h0 + 100 = target.
+    ClassifyParams one;
+    one.min_confirmations = 1;
+    const Classification low = classify(imp, r.mempool_spent, {}, one);
+    const ImmatureRow* a1 = find_imm(low, young_cb);
+    CHECK(low.immature.size() == 1 && a1 && a1->matures_in == 48, "min_confirmations 1: the coinbase floor of 100 holds");
+    CHECK(is_mature(low, edge_cb), "98-block coinbase is spendable in block h0 + 100 = the target");
+    // The plan (the signer's path) agrees with the classification.
+    const ScanPlan p = make_plan(def.exportable, PlanParams{});
+    bool has_young_cb = false, has_young_tx = false;
+    for (const PlannedBatch& b : p.batches)
+        for (const dash::Utxo& u : b.inputs) {
+            has_young_cb |= u.txid == young_cb.txid;
+            has_young_tx |= u.txid == young_tx.txid;
+        }
+    CHECK(!has_young_cb && has_young_tx && p.batches.at(0).vin == 129, "the plan spends the non-coinbase row, not the young coinbase");
+    // L1: a target at or below the tip is its own refusal.
+    ClassifyParams at_tip;
+    at_tip.target_height = kTip;
+    CHECK(refuses([&] { classify(imp, r.mempool_spent, {}, at_tip); }, cause::kBadTarget),
+          "classify: target == tip is scan-bad-target");
+    PlanParams pt;
+    pt.target_height = kTip - 1;
+    CHECK(refuses([&] { make_plan(def.exportable, pt); }, cause::kBadTarget), "plan: target below the tip is scan-bad-target");
+    ClassifyParams neg;
+    neg.dust_floor = -1;
+    CHECK(refuses([&] { classify(imp, r.mempool_spent, {}, neg); }, cause::kBadParams), "a negative dust floor is scan-bad-params");
 }
 
 // A structurally valid signed legacy tx spending `ins`.
@@ -835,6 +925,7 @@ int main(int argc, char** argv)
     k8_mempool_spent();
     k9_gettxout_disagrees();
     k10_classification();
+    k10b_consensus_maturity_floor();
     k11_queued_skip();
     k12_plan_digests_stable();
     k13_sidecar_deterministic();

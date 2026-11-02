@@ -32,6 +32,12 @@ public:
         const RpcReply r = api_.call(method, sched::json::dump_compact(params));
         if (!r.transport_ok)
             throw ScanRefusal(cause::kTransport, "dashd " + method + ": " + r.error);
+        // dashd answers a bad cookie / rpcauth with 401 and a client outside
+        // rpcallowip with 403, both without a JSON-RPC envelope: name it, so
+        // the operator fixes the credentials file, not the node.
+        if (r.http_status == 401 || r.http_status == 403)
+            throw ScanRefusal(cause::kAuthRefused, "dashd " + method + ": HTTP " + std::to_string(r.http_status) +
+                                                       " (check the RPC cookie / rpcauth file and rpcallowip)");
         J env;
         std::string why;
         if (!sched::json::parse_bounded(r.body, env, why) || !env.is_object())

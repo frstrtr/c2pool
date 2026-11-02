@@ -96,6 +96,15 @@ Classification classify(const UtxoImport& imp, const std::vector<Outpoint>& memp
         c.exportable.total += u.satoshis;
     }
 
+    // Parameter refusals get their own names before the screen runs, so a
+    // scan-foreign-script below always means a row that pays another script.
+    if (c.target_height <= imp.tip_height)
+        throw ScanRefusal(cause::kBadTarget, "target height " + std::to_string(c.target_height) +
+                                                 " is not above the scan tip " + std::to_string(imp.tip_height) +
+                                                 ": a tx can only land in a later block");
+    if (params.min_confirmations < 1 || params.dust_floor < 0)
+        throw ScanRefusal(cause::kBadParams, "min_confirmations must be >= 1 and dust_floor >= 0");
+
     c2w::dash::TargetScreen ts;
     try {
         ts = c2w::dash::rescreen_at_height(c.exportable.utxos, c2w::dash::addr_to_h160(imp.address, imp.testnet),

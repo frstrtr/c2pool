@@ -134,7 +134,11 @@ ScanPlan make_plan(const UtxoImport& ex, const PlanParams& in)
         } else if (!p.gov_hash.empty() || !p.change_address.empty()) {
             refuse("a consolidation takes a destination, not a gov hash or change address");
         }
-        if (p.min_confirmations < 1) refuse("min_confirmations must be >= 1");
+        if (p.target_height <= ex.tip_height)
+            throw ScanRefusal(cause::kBadTarget, "target height " + std::to_string(p.target_height) +
+                                                     " is not above the scan tip " + std::to_string(ex.tip_height));
+        if (p.min_confirmations < 1 || p.dust_floor < 0)
+            throw ScanRefusal(cause::kBadParams, "min_confirmations must be >= 1 and dust_floor >= 0");
 
         const std::array<uint8_t, 20> h160 = c2w::dash::addr_to_h160(ex.address, ex.testnet);
         const c2w::dash::TargetScreen ts = c2w::dash::rescreen_at_height(

@@ -198,11 +198,13 @@ public:
     std::map<Outpoint, std::string> script_override;
     std::function<void(FakeDashd&, const std::string&)> hook;
     std::vector<std::string> calls;
+    int bare_http_status = 0; // e.g. 401: answer with that status and an empty body (no JSON-RPC envelope)
 
     RpcReply call(const std::string& method, const std::string& params_json) override
     {
         calls.push_back(method);
         if (hook) hook(*this, method);
+        if (bare_http_status) return {true, bare_http_status, "", ""};
         const nj p = nj::parse(params_json);
         if (method == "getblockchaininfo")
             return ok({{"chain", chain}, {"blocks", tip}, {"headers", tip}, {"bestblockhash", tip_hash_of(tip)}});

@@ -132,6 +132,42 @@ print("preflight OK: every input is unspent with the manifest's amount")
 PY
 ```
 
+## Companion Scan & Plan (core: slices S-A, S-B)
+
+The companion scans the UTXOs of up to 16 P2PKH addresses from dashd
+(`getaddressutxos`, else `scantxoutset`; `gettxout` per row) and/or the c2pool
+node's `GET /api/utxo/scan` (node slice N1), cross-checks both at one tip,
+classifies every output at a target landing height and plans with the signer's
+own code: `c2wallet-dash-plan`, the key-free half of the DASH library
+(`src/family/bitcoin/dash/DashPlan.cmake`). It writes `<name>.utxos.json`
+(`c2wallet-utxo-export/1`, byte-identical to `tools/export_utxos.py`),
+`<name>.scanplan.json` (`c2wallet-scan-plan/1`, advisory: the signer re-plans
+and compares digests), a report with the `c2wallet-qt-schedd add` lines and,
+optionally, C2WU containers. The core is `src/companion/scan/` (Qt-free, inside
+`c2wallet-companion`, covered by `ci/check_key_free.sh`). KATs:
+`c2wallet-companion-scan-test` (ctest `companion_scan_kats`),
+`companion_scan_export_parity`, `scan_signer_roundtrip` (through
+`DashInjectModel`). A companion-only configure builds the plan library on a
+leaf helper target and needs no libsecp256k1 / zlib dev package.
+
+Slice S-C (CLI `scan` / `plan` / `preflight` / `watch`, the GUI tab, the dashd
+Qt transport) must also close these review items:
+
+- [ ] Fence the two-stage collateral's stage 2: its intake dates the stage-1
+      outputs at a projected landing height (`stage2_export`), so its manifest
+      has `screen_tip_hash: null`. `add` (or `enqueue`) must refuse such a
+      manifest unless `--after-parent` is set, and the sidecar / report must say
+      the heights are projected.
+- [ ] Fill `scan::ClassifyParams` and `scan::PlanParams` from ONE option set
+      (target height, min confirmations, dust floor, fee mode and rate, key
+      encoding), or derive one from the other, so `classify.*` and `params.*`
+      in the sidecar cannot contradict each other.
+- [ ] Cancel: `scantxoutset "abort"` when the operator cancels a running
+      dashd scan (DESIGN §3.2); S-B has no cancel path.
+- [ ] Mark the MN-collateral helper (DESIGN §3.4, §6 #8) and the relay
+      governance collateral (planned in the signer; the companion answers
+      `scan-unsupported`) as deferred, or implement them.
+
 ## Companion inject scheduler (core)
 
 The online, key-free companion carries an **inject scheduler**: it queues the

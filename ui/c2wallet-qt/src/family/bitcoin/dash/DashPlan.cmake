@@ -14,21 +14,44 @@
 #   GovCollateral.cpp   gobject collateral hash + OP_RETURN script (no key)
 #
 # Its headers are std-only and none declares or includes a key type (FoundKey,
-# KeyScan.hpp, the signer): see SweepPlan.hpp. The btclibs closure (base58,
-# sha256, the hdkeys hex/JSON leaf helpers) comes through c2wallet-hdkeys
-# PRIVATE, as for c2wallet-dash-common; static linking pulls only the objects
-# these files reference, and ci/check_key_free.sh over the archive and over the
-# binaries that link it proves no key or signing symbol is among them.
+# KeyScan.hpp, the signer): see SweepPlan.hpp. ci/check_key_free.sh over the
+# archive and over the binaries that link it proves no key or signing symbol
+# is among the objects it pulls in.
+#
+# Its .cpp files need only leaf helpers: the hdkeys hex and JSON readers and
+# the btclibs base58 / hash / sha256 closure. When c2wallet-hdkeys exists (the
+# full ui/c2wallet-qt tree, the DASH standalone build) those come from it,
+# PRIVATE, as for c2wallet-dash-common; static linking pulls only the
+# referenced objects. A companion-only configure has no hdkeys target and
+# builds c2wallet-dash-plan-leaf instead: the same leaf sources and include
+# tree, no libsecp256k1 and no zlib, so it needs neither dev package.
 # ═══════════════════════════════════════════════════════════════════════════
 
-if(NOT TARGET c2wallet-hdkeys)
-    # The hdkeys KATs belong to the signer-side build; a companion-only
-    # configure that reaches this file only needs the library itself.
-    set(_c2w_dash_plan_saved_tests "${C2WALLET_QT_BUILD_TESTS}")
-    set(C2WALLET_QT_BUILD_TESTS OFF)
-    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../hdkeys ${CMAKE_BINARY_DIR}/_dash_plan_hdkeys)
-    set(C2WALLET_QT_BUILD_TESTS "${_c2w_dash_plan_saved_tests}")
-    unset(_c2w_dash_plan_saved_tests)
+if(TARGET c2wallet-hdkeys)
+    set(_c2w_dash_plan_helpers c2wallet-hdkeys)
+else()
+    get_filename_component(_c2w_root "${CMAKE_CURRENT_LIST_DIR}/../../../../../.." ABSOLUTE)
+    add_library(c2wallet-dash-plan-leaf STATIC
+        ${CMAKE_CURRENT_LIST_DIR}/../hdkeys/HexUtil.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/../hdkeys/MiniJson.cpp
+        ${_c2w_root}/src/btclibs/crypto/sha256.cpp
+        ${_c2w_root}/src/btclibs/crypto/sha512.cpp
+        ${_c2w_root}/src/btclibs/crypto/ripemd160.cpp
+        ${_c2w_root}/src/btclibs/crypto/hmac_sha512.cpp
+        ${_c2w_root}/src/btclibs/crypto/hmac_sha256.cpp
+        ${_c2w_root}/src/btclibs/base58.cpp
+        ${_c2w_root}/src/btclibs/hash.cpp
+        ${_c2w_root}/src/btclibs/uint256.cpp
+        ${_c2w_root}/src/btclibs/util/strencodings.cpp
+        ${_c2w_root}/src/btclibs/util/str.cpp
+    )
+    set_target_properties(c2wallet-dash-plan-leaf PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    # The include tree c2wallet-hdkeys publishes, without its libraries.
+    target_include_directories(c2wallet-dash-plan-leaf PUBLIC
+        ${_c2w_root}/src ${_c2w_root}/src/btclibs ${_c2w_root}/src/btclibs/util
+        ${_c2w_root}/src/btclibs/crypto ${_c2w_root}/src/btclibs/compat)
+    set(_c2w_dash_plan_helpers c2wallet-dash-plan-leaf)
+    unset(_c2w_root)
 endif()
 
 add_library(c2wallet-dash-plan STATIC
@@ -43,4 +66,5 @@ target_include_directories(c2wallet-dash-plan PUBLIC ${CMAKE_CURRENT_LIST_DIR})
 # PRIVATE on purpose (same reason as c2wallet-dash-common): the .cpp files need
 # the btclibs include tree, the headers are std-only, and btclibs must not leak
 # into a dashscript translation unit.
-target_link_libraries(c2wallet-dash-plan PRIVATE c2wallet-hdkeys)
+target_link_libraries(c2wallet-dash-plan PRIVATE ${_c2w_dash_plan_helpers})
+unset(_c2w_dash_plan_helpers)

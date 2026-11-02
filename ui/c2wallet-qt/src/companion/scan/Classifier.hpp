@@ -80,8 +80,9 @@ std::map<Outpoint, std::string> queued_outpoints(const sched::Queue& q);
 // failure.
 std::vector<Outpoint> tx_prevouts(const std::string& raw_tx_hex);
 
-// Throws ScanRefusal(kForeignScript) when a row does not pay the address's
-// P2PKH (the strict screen), and on a target at or below the tip.
+// Throws ScanRefusal: kBadTarget for a target at or below the tip, kBadParams
+// for min_confirmations < 1 or dust_floor < 0, kForeignScript when a row does
+// not pay the address's P2PKH (the strict screen).
 Classification classify(const c2w::dash::UtxoImport& imp, const std::vector<Outpoint>& mempool_spent,
                         const std::map<Outpoint, std::string>& queued, const ClassifyParams& params);
 
