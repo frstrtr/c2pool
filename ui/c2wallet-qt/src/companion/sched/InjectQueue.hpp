@@ -243,6 +243,9 @@ struct Queue {
     std::vector<Item> items;
     std::vector<Tracked> tracked;
     std::vector<Alert> alerts;
+    // Operator acknowledgement (the daemon's ack-alerts): alerts raised at or
+    // before this UTC time no longer count as pending for `status`.
+    std::optional<std::string> alerts_acked_at;
     RunnerState runner;
 };
 
@@ -260,8 +263,12 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why);
 bool save_queue_file(const std::string& path, const Queue& q, std::string& why);
 bool load_queue_file(const std::string& path, Queue& out, std::string& why);
 
-// flock(path + ".lock"). The runner takes it non-blocking (a second runner
-// exits "lock held"); edits take it blocking for a short read-modify-write.
+// flock(path + ".lock"). Two locks guard a queue (the headless runner, slice
+// S2): the RUNNER lock, acquire(queue_path + ".runner", non-blocking) =
+// queue.json.runner.lock, held for the runner's lifetime so a second runner
+// exits "lock held"; and the EDIT lock, acquire(queue_path, blocking) =
+// queue.json.lock, held only for each short read-modify-write (operator
+// edits and every runner persist), so edits never wait for a running loop.
 class QueueLock {
 public:
     QueueLock() = default;
@@ -324,6 +331,12 @@ struct EnqueueRequest {
     bool allow_unconfirmed_parent = false;     // explicit opt-in only (CLI flag / dialog checkbox)
     // Required when maturity is unknown and no not_before_height is given.
     std::optional<std::string> inputs_known_mature_consent;
+    // Operator-stated height h0 of the youngest input, taken as a coinbase
+    // (spendable in block h0 + 100). With a manifest whose maturity is known
+    // the later of the two rules applies (an explicit h0 can only delay); with
+    // a bare hex or an unknown manifest maturity it enables the maturity
+    // trigger by itself.
+    std::optional<int64_t> explicit_h0;
     int64_t maturity_slack_blocks = 0;
     std::optional<int64_t> expiry_blocks;
     std::optional<int64_t> max_fee;

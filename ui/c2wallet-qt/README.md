@@ -138,14 +138,17 @@ The online, key-free companion carries an **inject scheduler**: it queues the
 signed `<name>.hex` + `<name>.manifest.json` pair and submits each tx to a c2pool
 node's loopback `POST /api/tx-inject/submit` when its triggers hold. This tree
 holds the Qt-free core (`src/companion/sched/`, inside the key-free
-`c2wallet-companion` library, so `ci/check_key_free.sh` covers it); the Qt
-transport, the headless `c2wallet-qt-schedd` runner and the GUI queue tab are
-later slices.
+`c2wallet-companion` library, so `ci/check_key_free.sh` covers it), the Qt
+Network transport and the headless `c2wallet-qt-schedd` runner (below); the
+GUI queue tab is a later slice.
 
 - **Queue file** `queue.json` (`c2wallet-inject-queue/1`): public data only —
   the raw signed txs, txids, provenance digests, triggers, node observations,
-  attempts and a journal. Deterministic JSON, atomic writes, `flock` on
-  `queue.json.lock`. Never the control token, a money nonce or a key.
+  attempts and a journal. Deterministic JSON, atomic writes (mode 0600). Two
+  `flock`s: `queue.json.runner.lock` held by the one runner for its lifetime,
+  `queue.json.lock` held for each short read-modify-write (operator edits and
+  every runner persist; edits bump the item's `rev`, the runner never
+  overwrites a higher one). Never the control token, a money nonce or a key.
 - **Enqueue** verifies the hex file's sha256 against the manifest, each line's
   txid, the manifest's maturity claim against its own inputs, and the node caps
   (100000 B, 1000 inputs, 1000 outputs, a signed shape). An input txid that is
@@ -180,4 +183,38 @@ later slices.
   remote node).
 
 KATs: `c2wallet-companion-sched-test` (ctest `companion_sched_kats`) drives the
-core against a scripted fake node and a fake clock (K1-K27).
+core, the runner merge and every daemon subcommand against a scripted fake
+node and a fake clock (K1-K39).
+
+### Headless runner `c2wallet-qt-schedd`
+
+`c2wallet-qt-schedd` runs the loop next to the node (Qt6::Core + Qt6::Network
+only; `ci/check_no_gui_link.sh` and `ci/check_key_free.sh` run over the binary).
+The transport (`sched/QtNodeApi`, library `c2wallet-companion-qtnet`) talks to a
+loopback URL only, with no proxy, no redirects, no HTTP/2, no cookies and a
+15 s timeout per request. Operator commands (all accept `--queue PATH`,
+`--node-url URL`, `--token-file PATH`; there is no `--token`):
+
+```sh
+Q=/home/c2pool/.local/share/c2wallet-qt/companion/queue.json
+S="sudo -u c2pool c2wallet-qt-schedd --queue $Q"
+$S --node-url http://127.0.0.1:8080 --token-file /home/c2pool/c2pool/control.token init
+$S add --hex sweep.hex                       # sweep.manifest.json beside it gives the maturity
+$S add --hex collateral.hex --manifest collateral.manifest.json \
+       --after-parent 539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28:1
+$S add --hex tx.hex --h0 2565145 --not-before-time 2026-11-05T10:00:00Z   # bare hex, explicit h0
+$S arm-policy --auto-arm yes --consent "operator G, hotel queue, 2026-11-02"   # recorded, timestamped
+$S list                  # state, why it waits, live IS-hold / retry ETA
+$S show q-20261102-002   # one item: triggers, node record, attempts, journal
+$S pause ID | resume ID | rm ID | requeue ID | retry ID | set-max-fee ID DUFFS
+$S status                # exit 1 when blocked / disarmed / alert pending / runner down
+$S ack-alerts
+$S run                   # the loop (the systemd unit runs this); run --once for one tick
+```
+
+`tools/c2wallet-qt-schedd.service` is the unit for the node host (a system
+unit with `User=c2pool`, sandboxed to loopback HTTP and the queue directory;
+its header lists the install steps). Exit codes: 0 ok, 1 refused/attention,
+2 usage/config, 3 queue unreadable, 4 another runner holds the queue. Qt KATs:
+`c2wallet-qt-schedd-test` (ctest `schedd_qt_kats`: the transport against a
+local `QTcpServer` fake node, and the daemon binary end to end).

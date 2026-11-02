@@ -303,6 +303,7 @@ std::string queue_to_json(const Queue& q)
         alerts.push_back(std::move(aj));
     }
     root["alerts"] = std::move(alerts);
+    root["alerts_acked_at"] = json::opt(q.alerts_acked_at);
 
     J runner = J::object();
     runner["last_enabled"] = json::opt(q.runner.last_enabled);
@@ -546,6 +547,12 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
             q.alerts.push_back(
                 {rd.str((*al)[i], "at", ap), rd.str((*al)[i], "kind", ap), rd.str((*al)[i], "detail", ap)});
         }
+    }
+    q.alerts_acked_at = rd.ostr(root, "alerts_acked_at", "queue");
+    if (q.alerts_acked_at) {
+        int64_t v = 0;
+        std::string perr;
+        if (!parse_utc(*q.alerts_acked_at, v, perr)) rd.fail("queue.alerts_acked_at", perr);
     }
     if (const J* r = rd.obj(root, "runner", "queue")) {
         q.runner.last_enabled = rd.obool(*r, "last_enabled", "queue.runner");
@@ -1105,6 +1112,7 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
     }
     if (req.inputs_known_mature_consent && req.inputs_known_mature_consent->empty())
         return refuse("the inputs-are-mature override needs a consent text");
+    if (req.explicit_h0 && *req.explicit_h0 <= 0) return refuse("h0 must be > 0");
 
     Queue staged = q;
     for (size_t idx : lines) {
@@ -1144,7 +1152,26 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         }
 
         MaturityTrigger& mt = it.triggers.maturity;
-        if (have_manifest && mv.maturity_known) {
+        if (req.explicit_h0) {
+            const int64_t h0 = *req.explicit_h0;
+            const int64_t s_h0 = c2w::dash::maturity::spendable_from_height(h0, /*coinbase_or_unknown=*/true);
+            mt.enabled = true;
+            if (have_manifest && mv.maturity_known) {
+                mt.safe_from_height = std::max(*mv.safe_from_height, s_h0);
+                mt.youngest_input_height = std::max(mv.youngest_input_height.value_or(0), h0);
+                mt.source = s_h0 > *mv.safe_from_height
+                                ? "operator h0=" + std::to_string(h0) + " (later than manifest.maturity.safe_from_height " +
+                                      std::to_string(*mv.safe_from_height) + ")"
+                                : "manifest.maturity.safe_from_height (operator h0=" + std::to_string(h0) +
+                                      " is not later)";
+            } else {
+                mt.safe_from_height = s_h0;
+                mt.youngest_input_height = h0;
+                mt.source = "operator h0=" + std::to_string(h0) + " (coinbase rule: spendable in block h0+100)";
+                mt.inputs_with_unknown_height =
+                    have_manifest ? mv.inputs_with_unknown_height : src.vin;
+            }
+        } else if (have_manifest && mv.maturity_known) {
             mt.enabled = true;
             mt.safe_from_height = *mv.safe_from_height;
             mt.youngest_input_height = mv.youngest_input_height.value_or(0);

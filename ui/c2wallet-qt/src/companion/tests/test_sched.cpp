@@ -21,6 +21,8 @@
 #include "../sched/SubmitOutcome.hpp"
 #include "../sched/TokenFile.hpp"
 #include "../sched/Triggers.hpp"
+#include "../sched/Runner.hpp"
+#include "../sched/SchedCli.hpp"
 
 #include "../../family/bitcoin/dash/InjectMaturity.hpp"
 
@@ -31,7 +33,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <functional>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -45,6 +49,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+extern char** environ;
 
 using namespace c2w::companion::sched;
 namespace art = c2w::artifact;
@@ -2256,6 +2262,525 @@ static void k28e_reorg_after_child_submitted()
           "K28e: parent final again -> child resubmitted");
 }
 
+// ── slice S2: the runner and the daemon's command line (Qt-free) ────────────
+
+namespace cli = c2w::companion::sched::cli;
+
+// make_api hands out a forwarder so every command talks to the one FakeNode.
+struct ForwardApi : NodeApi {
+    NodeApi& n;
+    explicit ForwardApi(NodeApi& x) : n(x) {}
+    HttpReply get(const std::string& p) override { return n.get(p); }
+    HttpReply post_json(const std::string& p, const std::string& b) override { return n.post_json(p, b); }
+    const char* name() const override { return "forward"; }
+};
+
+// The FakeNode with a hook on submit POSTs (an operator edit "during" a tick).
+struct HookApi : NodeApi {
+    NodeApi& n;
+    std::function<void()> on_submit;
+    explicit HookApi(NodeApi& x) : n(x) {}
+    HttpReply get(const std::string& p) override { return n.get(p); }
+    HttpReply post_json(const std::string& p, const std::string& b) override
+    {
+        if (p == route::kSubmit && on_submit) {
+            auto f = std::move(on_submit);
+            on_submit = nullptr;
+            f();
+        }
+        return n.post_json(p, b);
+    }
+    const char* name() const override { return "hook"; }
+};
+
+static std::string make_dir()
+{
+    char tmpl[] = "/tmp/c2w-cli-kat-XXXXXX";
+    const char* d = ::mkdtemp(tmpl);
+    return d ? std::string(d) : std::string();
+}
+
+static void write_text(const std::string& path, const std::string& text)
+{
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f << text;
+}
+
+static std::string slurp(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+struct CliWorld {
+    FakeClock clock;
+    FakeNode node;
+    std::ostringstream out, err;
+    std::string all_output; // every command's stdout + stderr
+    std::vector<std::vector<std::string>> argvs;
+    std::string dir, queue, token;
+    cli::Env env;
+    int sleeps = 0, max_sleeps = 0;
+    std::function<void(int)> on_sleep;
+
+    CliWorld()
+    {
+        clock.t = T("2026-11-02T00:10:12Z");
+        node.clock = &clock;
+        dir = make_dir();
+        queue = dir + "/data/c2wallet-qt/companion/queue.json";
+        token = dir + "/control.token";
+        write_text(token, std::string(kToken) + "\n");
+        ::chmod(token.c_str(), 0600);
+        env.out = &out;
+        env.err = &err;
+        env.clock = &clock;
+        env.make_api = [this](const std::string&, std::string&) -> std::unique_ptr<NodeApi> {
+            return std::make_unique<ForwardApi>(node);
+        };
+        env.sleep_ms = [this](int64_t ms) {
+            clock.t += ms / 1000;
+            ++sleeps;
+            if (on_sleep) on_sleep(sleeps);
+        };
+        env.stop_requested = [this] { return sleeps >= max_sleeps; };
+    }
+    int run(std::vector<std::string> a)
+    {
+        argvs.push_back(a);
+        out.str("");
+        err.str("");
+        a.insert(a.begin(), {"--queue", queue});
+        const int rc = cli::run(a, env);
+        all_output += out.str() + err.str();
+        return rc;
+    }
+    int init() { return run({"--node-url", "http://127.0.0.1:8080", "--token-file", token, "init"}); }
+    std::string put(const std::string& name, const Art& a, bool manifest = true)
+    {
+        write_text(dir + "/" + name + ".hex", a.hex_text);
+        if (manifest) write_text(dir + "/" + name + ".manifest.json", a.manifest);
+        return dir + "/" + name + ".hex";
+    }
+    Queue load()
+    {
+        Queue q;
+        std::string why;
+        if (!load_queue_file(queue, q, why)) std::printf("  load failed: %s\n", why.c_str());
+        return q;
+    }
+};
+
+// K29: argv rules: no --token VALUE, loopback URL, strict option parsing.
+static void k29_cli_parsing()
+{
+    CliWorld w;
+    CHECK(w.run({"--token", kToken, "list"}) == cli::kExitUsage && w.err.str().find("--token-file") != std::string::npos,
+          "K29: --token VALUE is a usage error naming --token-file");
+    CHECK(w.run({std::string("--token=") + kToken, "status"}) == cli::kExitUsage, "K29: --token=VALUE too");
+    w.all_output.clear(); // those two carried the token in argv on purpose
+    w.argvs.clear();
+    CHECK(w.run({"--node-url", "http://10.0.0.5:8080", "init"}) == cli::kExitUsage, "K29: non-loopback --node-url refused");
+    CHECK(w.run({}) == cli::kExitUsage && w.err.str().find("usage:") != std::string::npos, "K29: no command -> usage");
+    CHECK(w.run({"help"}) == cli::kExitOk && w.out.str().find("arm-policy") != std::string::npos, "K29: help");
+    CHECK(w.run({"frobnicate"}) == cli::kExitUsage, "K29: unknown command");
+    CHECK(w.run({"add"}) == cli::kExitUsage && w.err.str().find("--hex") != std::string::npos, "K29: add needs --hex");
+    const std::string hex = w.put("p", simple(500));
+    CHECK(w.run({"add", "--hex", hex, "--bogus"}) == cli::kExitUsage, "K29: unknown option");
+    CHECK(w.run({"add", "--hex", hex, "--after-parent", "zz"}) == cli::kExitUsage, "K29: --after-parent needs a txid");
+    CHECK(w.run({"add", "--hex", hex, "--after-parent", std::string(64, 'a') + ":0"}) == cli::kExitUsage,
+          "K29: --after-parent TXID:0 refused");
+    CHECK(w.run({"add", "--hex", hex, "--not-before-time", "2026-11-03T00:00:00"}) == cli::kExitUsage,
+          "K29: --not-before-time without Z refused");
+    CHECK(w.run({"add", "--hex", hex, "--manifest", "x", "--no-manifest"}) == cli::kExitUsage, "K29: conflicting manifest flags");
+    CHECK(w.run({"add", "--hex", hex, "--allow-auto-arm", "maybe"}) == cli::kExitUsage, "K29: --allow-auto-arm yes|no");
+    CHECK(w.run({"list"}) == cli::kExitQueue, "K29: list without a queue -> exit 3");
+    if (::geteuid() != 0) {
+        const std::vector<std::string> a = {"--queue", "/etc/c2w-kat-queue.json", "add", "--hex", hex};
+        CHECK(cli::run(a, w.env) == cli::kExitUsage && ::access("/etc/c2w-kat-queue.json", F_OK) != 0,
+              "K29: editing a queue in a directory owned by another user is refused");
+    }
+}
+
+// K30: init, add (manifest auto-located, bare hex with --h0, after_parent
+// TXID:N, heights, times, opt-in flags), list and show.
+static void k30_cli_add_list_show()
+{
+    CliWorld w;
+    CHECK(w.init() == cli::kExitOk && w.out.str().find("(created)") != std::string::npos &&
+              w.out.str().find("readable by this user") != std::string::npos,
+          "K30: init creates the queue and checks the token file");
+    Queue q = w.load();
+    CHECK(q.node.url == "http://127.0.0.1:8080" && q.node.token_file == w.token && !q.arm_policy.auto_arm &&
+              !q.arm_policy.consented_at,
+          "K30: node config recorded, no auto-arm consent by default");
+
+    const Art pa = simple(510);
+    const std::string ph = w.put("parent", pa);
+    CHECK(w.run({"add", "--hex", ph}) == cli::kExitOk && w.out.str().find("manifest: auto-located") != std::string::npos &&
+              w.out.str().find("submit at tip >= 2565244") != std::string::npos,
+          "K30: add uses the sibling manifest; prints the maturity fire tip");
+    const std::string ptx = pa.txids[0];
+
+    const Art ca = simple(511);
+    const std::string ch = w.put("child", ca, /*manifest=*/false);
+    std::string up = ptx;
+    for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    CHECK(w.run({"add", "--hex", ch, "--label", "collateral", "--after-parent", up + ":3", "--not-before-height", "2565310",
+                 "--not-before-time", "2026-11-02T06:00:00Z", "--h0", "2565200"}) == cli::kExitOk,
+          "K30: add a bare-hex child with after_parent TXID:N, heights, time and an explicit h0");
+    q = w.load();
+    const Item& c = q.items.back();
+    CHECK(c.label == "collateral" && c.triggers.after_parent.size() == 1 && c.triggers.after_parent[0].txid == ptx &&
+              c.triggers.after_parent[0].min_confirmations == 3 && c.triggers.not_before_height == 2565310 &&
+              c.triggers.not_before_time == std::string("2026-11-02T06:00:00Z") && c.triggers.maturity.enabled &&
+              c.triggers.maturity.safe_from_height == 2565300 &&
+              c.triggers.maturity.source.find("operator h0=2565200") != std::string::npos &&
+              !c.triggers.allow_unconfirmed_parent,
+          "K30: the child's triggers as given (txid lower-cased, h0 -> S = h0 + 100)");
+    CHECK(w.out.str().find("final (ChainLocked") != std::string::npos, "K30: add explains the parent finality rule");
+
+    const std::string oh = w.put("other", simple(512), false);
+    CHECK(w.run({"add", "--hex", oh}) == cli::kExitAttention && w.err.str().find("maturity is unknown") != std::string::npos,
+          "K30: bare hex without --h0 / --not-before-height refused (exit 1)");
+    CHECK(w.run({"add", "--hex", oh, "--h0", "2565145", "--allow-auto-arm", "yes"}) == cli::kExitAttention &&
+              w.err.str().find("consent") != std::string::npos,
+          "K30: --allow-auto-arm yes without a recorded consent refused");
+    CHECK(w.run({"add", "--hex", oh, "--h0", "2565145", "--after-parent", ptx, "--allow-unconfirmed-parent", "--pause"}) ==
+              cli::kExitOk,
+          "K30: add with --allow-unconfirmed-parent and --pause");
+    q = w.load();
+    CHECK(q.items.size() == 3 && q.items[2].triggers.after_parent[0].min_confirmations == 1 &&
+              q.items[2].triggers.allow_unconfirmed_parent && q.items[2].paused,
+          "K30: default N = 1; the opt-in and the pause are recorded");
+
+    CHECK(w.run({"list"}) == cli::kExitOk, "K30: list");
+    const std::string l = w.out.str();
+    CHECK(l.find(q.items[0].id) != std::string::npos && l.find(q.items[1].id) != std::string::npos &&
+              l.find("why:") != std::string::npos && l.find("NOT RUNNING") != std::string::npos,
+          "K30: list shows every item with its reason and the runner state");
+    CHECK(w.run({"show", q.items[1].id}) == cli::kExitOk && w.out.str().find("after parent") != std::string::npos &&
+              w.out.str().find("not_before_time: 2026-11-02T06:00:00Z") != std::string::npos,
+          "K30: show prints the triggers");
+    CHECK(w.run({"show", ptx.substr(0, 10)}) == cli::kExitOk && w.out.str().find(q.items[0].id) != std::string::npos,
+          "K30: show by txid prefix");
+    CHECK(w.run({"show", "q-nope"}) == cli::kExitAttention, "K30: show of an unknown id refused");
+}
+
+// K31: auto-arm consent is recorded only explicitly, timestamped, with its
+// text; auto-disarm stays off unless given; revocation is checked.
+static void k31_cli_arm_policy()
+{
+    CliWorld w;
+    w.init();
+    CHECK(w.run({"arm-policy"}) == cli::kExitOk && w.out.str().find("no consent recorded") != std::string::npos &&
+              w.out.str().find("reward path") != std::string::npos,
+          "K31: arm-policy without options prints the policy and the exposure text");
+    CHECK(w.run({"arm-policy", "--auto-arm", "yes"}) == cli::kExitUsage && w.err.str().find("--consent") != std::string::npos,
+          "K31: auto-arm without a consent text is a usage error");
+    CHECK(w.run({"arm-policy", "--auto-arm", "yes", "--consent", ""}) == cli::kExitUsage, "K31: an empty consent text too");
+    CHECK(!w.load().arm_policy.auto_arm, "K31: nothing recorded by the refusals");
+    w.clock.t += 60;
+    CHECK(w.run({"arm-policy", "--auto-arm", "yes", "--consent", "hotel queue: operator G, 2026-11-02"}) == cli::kExitOk,
+          "K31: consent recorded");
+    Queue q = w.load();
+    CHECK(q.arm_policy.auto_arm && !q.arm_policy.auto_disarm_when_idle &&
+              q.arm_policy.consented_at == format_utc(w.clock.t) &&
+              q.arm_policy.consent_text == std::string("hotel queue: operator G, 2026-11-02"),
+          "K31: auto_arm with consented_at = now and the text; auto-disarm off");
+    CHECK(w.out.str().find("reward path") != std::string::npos, "K31: the exposure text is restated on consent");
+
+    const std::string h = w.put("a", simple(520));
+    CHECK(w.run({"add", "--hex", h, "--allow-auto-arm", "yes"}) == cli::kExitOk, "K31: per-item allow_auto_arm under consent");
+    CHECK(w.run({"arm-policy", "--auto-arm", "no"}) == cli::kExitAttention &&
+              w.err.str().find("allow_auto_arm") != std::string::npos && w.load().arm_policy.auto_arm,
+          "K31: revoking while an item widens auto-arm is refused, the queue unchanged");
+    CHECK(w.run({"set-arm-policy", "--auto-disarm-when-idle", "yes", "--consent", "disarm too"}) == cli::kExitOk &&
+              w.load().arm_policy.auto_disarm_when_idle,
+          "K31: alias set-arm-policy; auto-disarm only when given");
+    const std::string id = w.load().items[0].id;
+    w.run({"pause", id});
+    w.run({"rm", id});
+    CHECK(w.run({"arm-policy", "--auto-arm", "no", "--auto-disarm-when-idle", "no"}) == cli::kExitOk, "K31: revoke");
+    q = w.load();
+    CHECK(!q.arm_policy.auto_arm && !q.arm_policy.auto_disarm_when_idle && !q.arm_policy.consented_at &&
+              !q.arm_policy.consent_text,
+          "K31: revocation clears the consent record");
+}
+
+// K32: run --once, then a Runner in this process while the CLI edits the
+// file: adds, pauses, resumes and removals land at the next step; an edit
+// made during a tick keeps the operator's version.
+static void k32_cli_run_and_merge()
+{
+    CliWorld w;
+    w.init();
+    const std::string ha = w.put("a", simple(530));
+    w.run({"add", "--hex", ha, "--label", "A"});
+    CHECK(w.run({"run", "--once"}) == cli::kExitOk && w.node.count("POST", route::kSubmit) == 1,
+          "K32: run --once submits the ready item");
+    CHECK(w.out.str().find("runner: start") != std::string::npos && w.out.str().find("token file usable") != std::string::npos &&
+              w.out.str().find("waiting -> ready") != std::string::npos,
+          "K32: the run logs its start and the transitions");
+    CHECK(w.load().items[0].state == State::Admitted, "K32: persisted as admitted");
+
+    Queue q = w.load();
+    ForwardApi fwd(w.node);
+    CaptureJournal sink;
+    SchedulerOptions so;
+    so.token_file = w.token;
+    Runner r(w.queue, q, fwd, w.clock, sink, so);
+    const std::string hb = w.put("b", simple(531));
+    w.run({"add", "--hex", hb, "--label", "B", "--pause"});
+    w.clock.t += 15;
+    Runner::Step s = r.step();
+    const std::string idb = w.load().items[1].id;
+    CHECK(s.ticked && r.queue().items.size() == 2 && r.queue().items[1].paused &&
+              w.node.count("POST", route::kSubmit) == 1,
+          "K32: an item added while the runner lives is merged; paused -> no submit");
+    w.run({"resume", idb});
+    w.clock.t += 15;
+    r.step();
+    CHECK(w.node.count("POST", route::kSubmit) == 2 && w.load().items[1].state == State::Admitted,
+          "K32: resume lands at the next step -> submitted");
+
+    // An operator pause during the tick (the hook runs inside the submit POST).
+    const std::string hc = w.put("c", simple(532));
+    const std::string hd = w.put("d", simple(533));
+    w.run({"add", "--hex", hc, "--label", "C"});
+    w.run({"add", "--hex", hd, "--label", "D"});
+    const std::string idd = w.load().items[3].id;
+    HookApi hook(w.node);
+    Runner r2(w.queue, w.load(), hook, w.clock, sink, so);
+    hook.on_submit = [&] { w.run({"pause", idd}); };
+    w.clock.t += 15;
+    r2.step();
+    Queue after = w.load();
+    CHECK(after.items[2].state == State::Admitted && after.items[3].paused && after.items[3].rev == 1,
+          "K32: mid-tick operator pause survives the runner's persist (higher rev wins), C admitted");
+    w.clock.t += 15;
+    r2.step();
+    CHECK(r2.queue().items[3].paused && w.load().items[3].paused, "K32: the runner adopts the pause at its next step");
+    CHECK(w.run({"rm", idd}) == cli::kExitOk, "K32: rm of the paused item");
+    w.clock.t += 15;
+    r2.step();
+    CHECK(r2.queue().items.size() == 3 && w.load().items.size() == 3, "K32: the removal is merged, not resurrected");
+    CHECK(w.run({"rm", after.items[2].id}) == cli::kExitAttention && w.err.str().find("pause it first") != std::string::npos,
+          "K32: a live item cannot be removed without a pause");
+}
+
+// K33: one runner per queue.
+static void k33_cli_single_instance()
+{
+    CliWorld w;
+    w.init();
+    QueueLock held;
+    std::string why;
+    CHECK(held.acquire(runner_lock_base(w.queue), false, why), "K33: test holds the runner lock");
+    CHECK(runner_lock_held(w.queue), "K33: runner_lock_held sees it");
+    CHECK(w.run({"run", "--once"}) == cli::kExitLock && w.err.str().find("lock held") != std::string::npos,
+          "K33: a second runner exits 4");
+    held.release();
+    CHECK(!runner_lock_held(w.queue) && w.run({"run", "--once"}) == cli::kExitOk, "K33: free again -> runs");
+}
+
+// K34: status exit codes for monitoring, alert acknowledgement, the arm source.
+static void k34_cli_status()
+{
+    CliWorld w;
+    w.init();
+    w.run({"add", "--hex", w.put("a", simple(540))});
+    w.node.enabled = false;
+    w.run({"run", "--once"});
+    CHECK(w.load().items[0].state == State::BlockedNotArmed, "K34: no consent, node disarmed -> blocked_not_armed");
+    CHECK(w.run({"status"}) == cli::kExitAttention, "K34: status exit 1");
+    const std::string s1 = w.out.str();
+    CHECK(s1.find("ARM     none (enabled=false)") != std::string::npos && s1.find("blocked_not_armed") != std::string::npos &&
+              s1.find("no usable consent") != std::string::npos && s1.find("pending alert") != std::string::npos &&
+              s1.find("no runner holds the queue") != std::string::npos,
+          "K34: status names the arm state, the blocked item, the alert and the missing runner");
+    w.node.enabled = true;
+    w.clock.t += 15;
+    w.run({"run", "--once"});
+    QueueLock held;
+    std::string why;
+    held.acquire(runner_lock_base(w.queue), false, why);
+    CHECK(w.run({"status"}) == cli::kExitAttention && w.out.str().find("ARM     standing") != std::string::npos,
+          "K34: armed again (standing); the old alert is still pending");
+    CHECK(w.run({"ack-alerts"}) == cli::kExitOk && w.out.str().find("acknowledged") != std::string::npos, "K34: ack-alerts");
+    CHECK(w.run({"status"}) == cli::kExitOk && w.out.str().find("RESULT  OK") != std::string::npos,
+          "K34: runner holds the queue, fresh tick, nothing blocked, alerts read -> exit 0");
+    w.clock.t += 1000;
+    CHECK(w.run({"status"}) == cli::kExitAttention && w.out.str().find("older than") != std::string::npos,
+          "K34: a stale runner tick needs attention");
+    w.clock.t -= 1000;
+    w.node.down = true;
+    CHECK(w.run({"status"}) == cli::kExitAttention && w.out.str().find("unreachable") != std::string::npos,
+          "K34: node unreachable -> exit 1");
+    w.node.down = false;
+    w.node.cl_exposed = true;
+    w.node.cl_height = w.node.tip - 1;
+    w.run({"status"});
+    CHECK(w.out.str().find("ChainLock " + std::to_string(w.node.tip - 1)) != std::string::npos,
+          "K34: status reports the node's ChainLock when exposed");
+}
+
+// K35: the token never reaches argv, the environment, any output or the file.
+static void k35_cli_token_hygiene()
+{
+    CliWorld w;
+    w.init();
+    w.run({"arm-policy", "--auto-arm", "yes", "--consent", "kat consent"});
+    w.run({"add", "--hex", w.put("a", simple(550))});
+    w.node.enabled = false; // the run arms the node (two-phase) and submits
+    w.run({"run", "--once"});
+    w.run({"list"});
+    w.run({"status"});
+    CHECK(w.node.count("POST", route::kConfigApply) == 2 && w.node.count("POST", route::kSubmit) == 1,
+          "K35: the run armed (2 apply POSTs) and submitted");
+    CHECK(!leaks_secret(w.all_output), "K35: no token or nonce in any command's stdout/stderr");
+    CHECK(!leaks_secret(slurp(w.queue)), "K35: none in the queue file");
+    std::string args;
+    for (const auto& a : w.argvs)
+        for (const auto& x : a) args += x + " ";
+    CHECK(!leaks_secret(args), "K35: none in any argv");
+    bool env_leak = false;
+    for (char** e = environ; e && *e; ++e)
+        if (leaks_secret(*e)) env_leak = true;
+    CHECK(!env_leak, "K35: none in the environment");
+    for (const auto& b : w.node.bodies(route::kSubmit))
+        CHECK(count_of(b, kToken) == 1, "K35: the submit body carries it exactly once");
+}
+
+// K36: the run loop over a node restart: with the standing arm (unit flag) the
+// dropped item is simply resubmitted; without it the disarm is alerted and the
+// recorded consent re-arms the node (two-phase) before the resubmit.
+static void k36_run_loop_restart_and_disarm()
+{
+    for (const bool standing : {true, false}) {
+        CliWorld w;
+        w.init();
+        if (!standing) w.run({"arm-policy", "--auto-arm", "yes", "--consent", "hotel queue consent"});
+        w.run({"add", "--hex", w.put("a", simple(standing ? 560 : 561))});
+        w.max_sleeps = 4;
+        w.on_sleep = [&](int n) {
+            if (n == 1) { // the node restarts between tick 1 and tick 2
+                w.node.mempool.clear();
+                w.node.wired = !standing ? false : true;
+                w.node.enabled = standing;
+            }
+        };
+        CHECK(w.run({"--poll-sec", "15", "run"}) == cli::kExitOk, "K36: the loop stops cleanly on request");
+        const std::string log = w.out.str();
+        const Item it = w.load().items[0];
+        CHECK(w.sleeps == 4 && log.find("runner: stop") != std::string::npos, "K36: ticks, sleeps, stop");
+        CHECK(it.state == State::Admitted || it.state == State::IsHold, "K36: resubmitted after the restart");
+        CHECK(it.retry.resubmits == 1 && w.node.count("POST", route::kSubmit) == 2, "K36: exactly one resubmit");
+        if (standing) {
+            CHECK(w.node.count("POST", route::kConfigApply) == 0 && log.find("ALERT disarmed") == std::string::npos,
+                  "K36: standing arm survives the restart: no alert, no apply");
+        } else {
+            CHECK(log.find("ALERT disarmed") != std::string::npos && log.find("ARMED by scheduler") != std::string::npos &&
+                      w.node.count("POST", route::kConfigApply) == 2 && w.node.enabled,
+                  "K36: runtime disarm after the restart: alerted, re-armed with the recorded consent");
+        }
+    }
+    // Without consent the disarm leaves the item blocked and alerted.
+    CliWorld w;
+    w.init();
+    w.run({"add", "--hex", w.put("a", simple(562))});
+    w.max_sleeps = 3;
+    w.on_sleep = [&](int n) {
+        if (n == 1) {
+            w.node.mempool.clear();
+            w.node.enabled = false;
+        }
+    };
+    w.run({"run"});
+    CHECK(w.load().items[0].state == State::BlockedNotArmed && w.node.count("POST", route::kConfigApply) == 0 &&
+              w.out.str().find("ALERT disarmed") != std::string::npos,
+          "K36: no consent -> blocked_not_armed, alerted, never arms");
+}
+
+// K37: list re-reads the IS-hold clock at the time it runs.
+static void k37_cli_list_is_hold_eta()
+{
+    CliWorld w;
+    w.init();
+    w.run({"add", "--hex", w.put("a", simple(570))});
+    w.run({"run", "--once"});
+    const int64_t t0 = w.clock.t;
+    w.clock.t += 15;
+    w.run({"run", "--once"});
+    CHECK(w.load().items[0].state == State::IsHold, "K37: is_hold");
+    w.clock.t += 100;
+    w.run({"list"});
+    CHECK(w.out.str().find("IS-hold ends ~" + format_utc(t0 + 600)) != std::string::npos &&
+              w.out.str().find("(in ~9 m") != std::string::npos,
+          "K37: list shows the IS-hold end and the time left");
+    w.clock.t = t0 + 700;
+    w.run({"list"});
+    CHECK(w.out.str().find("IS-hold elapsed at") != std::string::npos, "K37: after the hold, list says it elapsed");
+}
+
+// K38: the merge rule in isolation.
+static void k38_merge_rule()
+{
+    World w;
+    const std::string a = w.add(simple(580)), b = w.add(simple(581)), d = w.add(simple(582));
+    Queue mem = w.q;
+    find_item(mem, a)->state = State::Admitted;    // the runner's progress
+    mem.arm_policy.armed_by_scheduler_at = "2026-11-02T00:00:00Z";
+    Queue disk = w.q;
+    std::string why;
+    pause_item(disk, b, w.clock.t, why);           // operator edit: rev 1
+    disk.items.erase(std::remove_if(disk.items.begin(), disk.items.end(), [&](const Item& i) { return i.id == d; }),
+                     disk.items.end());            // removed by the operator
+    const std::string c = std::string("q-x");
+    Item extra = disk.items[0];
+    extra.id = c;
+    extra.tx.txid = std::string(64, '7');
+    disk.items.push_back(extra);                   // added by the operator
+    disk.tracked.push_back(Tracked{std::string(64, '8')});
+    arm::record_consent(disk.arm_policy, true, false, "operator", w.clock.t, why);
+    Queue m = merge_runner_view(mem, disk);
+    CHECK(m.items.size() == 3 && find_item(m, a)->state == State::Admitted, "K38: runner state kept at the same rev");
+    CHECK(find_item(m, b)->paused && find_item(m, b)->rev == 1, "K38: operator edit (higher rev) wins");
+    CHECK(!find_item(m, d) && find_item(m, c), "K38: removed item dropped, added item taken");
+    CHECK(m.arm_policy.auto_arm && m.arm_policy.consent_text == std::string("operator") &&
+              m.arm_policy.armed_by_scheduler_at == std::string("2026-11-02T00:00:00Z"),
+          "K38: re-recorded consent taken from the file; the runner keeps its own arm record");
+    CHECK(find_tracked(m, std::string(64, '8')) != nullptr, "K38: tracked parents merged");
+    Queue persisted;
+    CHECK(queue_from_json(queue_to_json(m), persisted, why) &&
+              queue_to_json(merge_runner_view(m, persisted)) == queue_to_json(m),
+          "K38: merging with its own persisted copy is idempotent");
+}
+
+// K39: --h0 with a manifest can only delay maturity.
+static void k39_explicit_h0_with_manifest()
+{
+    World w;
+    const Art a = simple(590); // manifest S = 2565245
+    EnqueueRequest r = req_for(a);
+    r.explicit_h0 = 2565200;
+    const EnqueueResult e1 = enqueue(w.q, r, w.clock.t);
+    CHECK(e1.ok && w.item(0).triggers.maturity.safe_from_height == 2565300 &&
+              w.item(0).triggers.maturity.source.find("later than manifest") != std::string::npos,
+          "K39: a later h0 raises S to h0 + 100");
+    World x;
+    EnqueueRequest r2 = req_for(simple(591));
+    r2.explicit_h0 = 2565100;
+    CHECK(enqueue(x.q, r2, x.clock.t).ok && x.item(0).triggers.maturity.safe_from_height == 2565245 &&
+              x.item(0).triggers.maturity.source.find("is not later") != std::string::npos,
+          "K39: an earlier h0 never lowers the manifest's S");
+    EnqueueRequest r3 = req_for(simple(592));
+    r3.explicit_h0 = 0;
+    CHECK(!enqueue(x.q, r3, x.clock.t).ok, "K39: h0 must be > 0");
+}
+
 int main()
 {
     k1_maturity_boundary();
@@ -2298,6 +2823,17 @@ int main()
     k28c_reorg_before_chainlock();
     k28d_allow_unconfirmed_parent();
     k28e_reorg_after_child_submitted();
+    k29_cli_parsing();
+    k30_cli_add_list_show();
+    k31_cli_arm_policy();
+    k32_cli_run_and_merge();
+    k33_cli_single_instance();
+    k34_cli_status();
+    k35_cli_token_hygiene();
+    k36_run_loop_restart_and_disarm();
+    k37_cli_list_is_hold_eta();
+    k38_merge_rule();
+    k39_explicit_h0_with_manifest();
 
     for (const auto& f : g_tmpfiles) {
         ::unlink(f.c_str());
