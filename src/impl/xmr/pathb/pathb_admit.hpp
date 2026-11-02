@@ -1475,14 +1475,8 @@ inline AdmitResult admit_carrier(const AdmitEnv& env, std::span<const std::uint8
     for (std::size_t k = 0; k < bodies.size(); ++k) {
         const Body& b = bodies[k];
         const std::uint64_t p_own = b.tip->pos + 1;  // p(r) = pos(t) + 1
+        // row 31 on every basis: a dead placement is placed with weight 0 (ruling 62, E-195)
         const bool is_live = live(b.h, q, p_own, [&](std::uint64_t x) { return pv.record(x); });
-        // row 31 on a claim basis (C-8): a dead placement is ClaimAlarm
-        const Basis bl = basis_of(env.claims, RowClass::Live, b.tip->id, p_own);
-        if (!is_live && is_claim_basis(bl)) {
-            AdmitResult r = claim_alarm(env, RowId::R31, bl, b.id, k + 1);
-            r.randomx_called = rx;
-            return r;
-        }
         out.placements.push_back(CarriedPlacement{b.id, b.r->side.t_origin, b.r->side.ballot, is_live});
         out.store_placements.push_back(placement_of(*b.r, b.id, b.h, p_own));
     }

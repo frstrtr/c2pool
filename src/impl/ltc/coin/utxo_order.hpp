@@ -187,14 +187,14 @@ bool ordered_rearm_after_reorg(core::coin::BlockBootstrapState<BlockT>& bs, uint
     return true;
 }
 
-/// Keep up to WINDOW_SIZE requests in flight: request(height) for every
+/// Keep up to bs.window requests in flight: request(height) for every
 /// height not yet requested and not buffered. Returns how many were asked.
 template <typename BlockT, typename RequestFn>
 uint32_t ordered_refill(core::coin::BlockBootstrapState<BlockT>& bs, RequestFn&& request)
 {
     uint32_t n = 0;
     while (bs.next_request <= bs.end_height
-           && (bs.next_request - bs.next_height) < bs.WINDOW_SIZE) {
+           && (bs.next_request - bs.next_height) < bs.window) {
         if (!bs.buffer.count(bs.next_request)) {
             request(bs.next_request);
             ++n;
@@ -209,6 +209,171 @@ template <typename BlockT>
 bool ordered_done(const core::coin::BlockBootstrapState<BlockT>& bs)
 {
     return bs.next_height > bs.end_height;
+}
+
+/// Extend the running pipeline's range to `height` without buffering a block
+/// (a new tip, or a block ahead of the window: asked in order later).
+template <typename BlockT>
+void ordered_extend(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t height)
+{
+    if (height > bs.end_height) {
+        bs.end_height = height;
+        bs.total = bs.processed + (bs.end_height - bs.next_height + 1);
+    }
+}
+
+/// Buffer a best-chain body for a fill whose download bounds what it keeps
+/// (core::coin::BlockDownload::keep: its window, its byte bound): kept and
+/// counted, or only the range extended (the height is asked in order when
+/// the window gets there). Returns true when kept. Before, the accrual
+/// set's fill buffered every body at or above its next height (FRESH-NODE
+/// 3: the accrual buffer had no bound).
+template <typename BlockT, typename Download>
+bool ordered_buffer_bounded(core::coin::BlockBootstrapState<BlockT>& bs, Download& dl, uint32_t height,
+                            const BlockT& block, const uint256& hash, size_t bytes)
+{
+    if (!dl.keep(bs, height, bytes)) {
+        ordered_extend(bs, height);
+        return false;
+    }
+    const bool fresh = height >= bs.next_height && !bs.buffer.count(height);
+    ordered_buffer(bs, height, block, hash);
+    if (fresh && bs.buffer.count(height))
+        dl.buffered(height, bytes);
+    return true;
+}
+
+/// How a fill's heights are asked for.
+enum class FillAsk {
+    Download,  // the cold start ("Bootstrap"): one peer per height, core::coin::BlockDownload
+    Targeted,  // gap / reorg / rebuild fills: one peer round robin
+};
+
+inline FillAsk fill_ask(const std::string& phase)
+{
+    return phase == "Bootstrap" ? FillAsk::Download : FillAsk::Targeted;
+}
+
+/// The cold-start Bootstrap of a partial UTXO view (the embedded LTC set,
+/// the DOGE accrual set): when it starts and over which heights.
+///   - only once the header chain is synced (tip age < 24 h). Before, the
+///     first block above `keep` armed it at whatever tip the header chain
+///     had then, on a fresh node the checkpoint-era one, and every
+///     best-chain block extended it to the real tip (FRESH-NODE 2.2: LTC
+///     289 -> 114,549 blocks; 2.3: DOGE 1,441 -> 276,000) while templates
+///     waited for it to reach the tip;
+///   - over the synced tip's last `blocks` heights, or from the set's best
+///     + 1 when that is within them (a warm restart catches up, one block
+///     behind included: nothing else asks for a tip whose announcement came
+///     before we connected); only a set at the tip needs none;
+///   - a fill that falls more than `blocks` + its window behind the tip is
+///     armed again at the tip (cold_start_rearm).
+struct ColdStart {
+    enum class Action {
+        Wait,  // not yet (header chain not synced): no fill, the set takes no block
+        Warm,  // the set is at the tip: no fill
+        Arm,   // fetch [from, to] in order
+    };
+    Action   action{Action::Wait};
+    uint32_t from{0};
+    uint32_t to{0};
+    uint32_t jump_from{0};  // the deliberate jump over a non-empty set too far behind (0 = none)
+};
+
+/// The cold start's download window: heights asked ahead of the next to
+/// drain, one peer each (core::coin::BlockDownload). Wide enough that a slow
+/// block is left to the request timeout rather than its peer called a
+/// staller, and that 20 peers work in parallel (Core's
+/// BLOCK_DOWNLOAD_WINDOW is 1,024); the bodies kept stay under the
+/// download's byte bound. A 16-height window rotated out every peer whose
+/// block took more than 2 s on a busy link.
+constexpr size_t COLD_START_WINDOW = 256;
+
+/// Arm the cold start over [from, to] ("Bootstrap", COLD_START_WINDOW).
+template <typename BlockT>
+void cold_start_arm(core::coin::BlockBootstrapState<BlockT>& bs, uint32_t from, uint32_t to)
+{
+    ordered_arm(bs, from, to);
+    bs.phase = "Bootstrap";
+    bs.window = COLD_START_WINDOW;
+}
+
+inline ColdStart cold_start_plan(uint32_t blocks, bool synced, uint32_t tip, uint32_t utxo_best)
+{
+    ColdStart p;
+    if (!synced || blocks == 0 || tip == 0)
+        return p;
+    if (utxo_best >= tip) {
+        p.action = ColdStart::Action::Warm;
+        return p;
+    }
+    const uint32_t lo = tip >= blocks ? tip - blocks + 1 : 1;
+    p.action = ColdStart::Action::Arm;
+    p.from = (utxo_best > 0 && utxo_best + 1 >= lo) ? utxo_best + 1 : lo;
+    p.to = tip;
+    p.jump_from = (utxo_best > 0 && p.from > utxo_best + 1) ? p.from : 0;
+    return p;
+}
+
+/// When the cold start may be decided: the header chain is synced (tip age
+/// < 24 h, Core's IsInitialBlockDownload) and caught up: its tip is less
+/// than COLD_START_CAUGHT_UP_AGE_S old, or it has stayed synced for
+/// COLD_START_CAUGHT_UP_WAIT_S (a quiet network). "Synced" alone comes up to
+/// a day of blocks before the header sync ends (live: LTC synced at a tip
+/// 46,016 s old, 314 blocks short); armed there, the next header batch
+/// re-armed the Bootstrap a second later and every request of its first
+/// window was wasted, the peers serving them first.
+constexpr int64_t COLD_START_CAUGHT_UP_AGE_S = 2 * 60 * 60;
+constexpr int64_t COLD_START_CAUGHT_UP_WAIT_S = 60;
+
+inline bool cold_start_ready(bool synced, int64_t tip_age_s, int64_t synced_for_s)
+{
+    return synced
+        && (tip_age_s < COLD_START_CAUGHT_UP_AGE_S || synced_for_s >= COLD_START_CAUGHT_UP_WAIT_S);
+}
+
+/// A running Bootstrap whose next height is more than `blocks` + its window
+/// below the tip (it downloads slower than blocks are found, or the node
+/// was away): the range to arm it again, the tip's last `blocks` heights.
+/// The caller wipes the partial set first (the new range does not continue
+/// it). nullopt: keep going.
+template <typename BlockT>
+std::optional<std::pair<uint32_t, uint32_t>> cold_start_rearm(
+    const core::coin::BlockBootstrapState<BlockT>& bs, uint32_t tip, uint32_t blocks)
+{
+    if (!bs.active || blocks == 0 || tip < bs.next_height)
+        return std::nullopt;
+    if (uint64_t(tip) - bs.next_height <= uint64_t(blocks) + bs.window)
+        return std::nullopt;
+    return std::make_pair(tip >= blocks ? tip - blocks + 1 : 1u, tip);
+}
+
+/// Who is asked for a new tip's body (the DOGE tip-change handler).
+enum class TipBodyAsk {
+    None,       // the initial header sync, or the cold start runs: nobody
+    Announcer,  // the peer whose headers brought the tip
+    OnePeer,    // the announcer is gone: one peer, round robin
+    EveryPeer,  // no peer could be asked one at a time
+};
+
+/// Nothing during the initial header sync (no body is of use before the
+/// cold start, which waits for the synced chain) nor while the cold start
+/// runs (its download takes the tip in order); else the announcer, else one
+/// peer, else every peer. from(peer) / one() return whether the request was
+/// sent. Before, every peer was asked for every new tip, sync or not
+/// (FRESH-NODE 2.3: 2-5 copies of each tip body).
+template <typename FromFn, typename OneFn, typename AllFn>
+TipBodyAsk ask_tip_body(bool chain_synced, bool cold_start_runs, const std::string& announcer,
+                        FromFn&& from, OneFn&& one, AllFn&& all)
+{
+    if (!chain_synced || cold_start_runs)
+        return TipBodyAsk::None;
+    if (!announcer.empty() && from(announcer))
+        return TipBodyAsk::Announcer;
+    if (one())
+        return TipBodyAsk::OnePeer;
+    all();
+    return TipBodyAsk::EveryPeer;
 }
 
 /// Result of walking the UTXO set back to the best chain.

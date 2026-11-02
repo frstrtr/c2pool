@@ -374,6 +374,7 @@ target_link_libraries(c2pool-dash
                        # view (dashcore interpreter vendored as a hidden-visibility
                        # .so exporting only the c2pool_dash_* C API;
                        # --embedded-fold-checkscripts, default-OFF => dormant).
+    core_utxo          # S2: dumptxoutset pin / import / open of the full UTXO set
     btclibs
     yaml-cpp::yaml-cpp
     nlohmann_json::nlohmann_json

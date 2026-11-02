@@ -228,6 +228,7 @@ struct PathbRelayStats {
     std::atomic<std::uint64_t> strikes{0}, bans{0}, drops{0}, addr_bans{0}, banned_src_dropped{0};
     std::atomic<std::uint64_t> queue_dropped{0}, rx_deferred{0}, verify_threads{0};
     std::atomic<std::uint64_t> flood_frames{0}, reoffer_frames{0}, catchup_requests{0}, empty_store_offers{0};
+    std::atomic<std::uint64_t> root_evidence_offers{0};  // root-evidence pairs queued (a pruned full node's root reply)
     std::atomic<std::uint64_t> bucket_requests{0}, parked_reruns{0}, rewalks{0}, solicited_jobs{0};
     std::atomic<std::uint64_t> owner_queue_hwm{0}, owner_waits{0};  // the owner's event queue: high-water mark; reader waits
     std::atomic<std::uint64_t> stale_events{0}, reoffer_paused{0}, p15_drops{0}, p15_counted{0}, rx_failures{0};
@@ -322,17 +323,34 @@ struct PathbCtxSource {
 // ---------------------------------------------------------------------------
 class RelayNodeLock {
 public:
+    // The clock (ms) of the busy total (unset: none kept).
+    void set_clock(std::function<std::uint64_t()> c) { clock_ = std::move(c); }
     void lock() {
         std::unique_lock<std::mutex> l(m_);
         const std::uint64_t t = next_++;
         cv_.wait(l, [&] { return serving_ == t; });
+        held_ = true;
+        if (clock_) since_ = clock_();
     }
     void unlock() {
         {
             std::lock_guard<std::mutex> l(m_);
+            if (held_ && clock_) {
+                const std::uint64_t n = clock_();
+                busy_ += n > since_ ? n - since_ : 0;
+            }
+            held_ = false;
             ++serving_;
         }
         cv_.notify_all();
+    }
+    // The node's own processing: the time the lock was held (ms), the hold in progress included (the template gate's
+    // delivery clock leaves it out, E-194).
+    std::uint64_t busy_ms() {
+        std::lock_guard<std::mutex> l(m_);
+        if (!held_ || !clock_) return busy_;
+        const std::uint64_t n = clock_();
+        return busy_ + (n > since_ ? n - since_ : 0);
     }
 
 private:
@@ -340,6 +358,10 @@ private:
     std::condition_variable cv_;
     std::uint64_t next_ = 0;
     std::uint64_t serving_ = 0;
+    std::function<std::uint64_t()> clock_;
+    bool held_ = false;
+    std::uint64_t since_ = 0;
+    std::uint64_t busy_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -353,6 +375,7 @@ public:
     PathbRelayNode(PathbRelayOptions o, RelayLinks& links, RelayClock clock = RelayClock::system(), LogFn log = {})
         : o_(std::move(o)), links_(links), clock_(std::move(clock)), log_(std::move(log)), budget_(budget_of(o_)),
           dos_(budget_.dos), port_(*this) {
+        lock_.set_clock([this] { return now_ms(); });
         solicited_ = static_cast<double>(o_.solicited_credits);
         std::random_device rd;
         do {
@@ -386,6 +409,12 @@ public:
         node_ = &n;
         n.set_join_transport(&port_);
         n.set_join_step([this] { const JoinRelease r(*this); });
+        n.set_inbound_idle([this] { return inbound_idle(); });
+        n.set_catchup_claim([this] { return catchup_claim_open(); });
+        n.set_join_delivered([this](std::uint64_t a) {
+            std::lock_guard<std::mutex> lk(kmtx_);
+            return a != 0 && join_mark_ == a;
+        });
         const PathbNodeConfig& c = n.config();
         chain_id_ = c.identity.chain_id;
         p_ = c.p;
@@ -571,6 +600,18 @@ public:
             else
                 post_from(p, std::move(fn));
         };
+        // a frame the node judges: received and not judged until its event runs (E-193)
+        const auto judge = [&](std::function<void()> fn) {
+            if (owner) {
+                fn();
+                return;
+            }
+            ++rx_events_;
+            post_from(p, [this, fn = std::move(fn)] {
+                --rx_events_;
+                fn();
+            }, [this] { --rx_events_; });
+        };
         const std::uint8_t op = f[0];
         switch (op) {
             case kOpFbPing:
@@ -587,7 +628,7 @@ public:
                 on_addr(p, f);
                 return;
             case kOpFbGetCtx: run([this, p, f] { serve_getctx(p, f); }); return;
-            case kOpFbCtx: run([this, p, f] { on_ctx(p, f); }); return;
+            case kOpFbCtx: judge([this, p, f] { on_ctx(p, f); }); return;
             case kOpFbReceipts:
                 if (f.size() > 1 && f[1] != kFrameVersion2) break;  // the old receipts v2 frame: unknown
                 on_receipts_frame(p, f);
@@ -600,21 +641,23 @@ public:
                 }
                 const CarrierReply k = carrier_reply(p, f);
                 if (k == CarrierReply::BodySet) {
-                    run([this, p, f] { handle_body_set(p, f); });
+                    judge([this, p, f] { handle_body_set(p, f); });
                     return;
                 }
-                enqueue_job(Job{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited});
+                Job j{Job::Kind::Carrier, p, src_of(p), f, 0, k == CarrierReply::Solicited};
+                if (j.solicited) j.arrival = arrival_now();  // a reply to the node's own request: its arrival (E-194)
+                enqueue_job(std::move(j));
                 return;
             }
             case kOpFcHeaders: {
                 bool node_reply = false;  // the frame answers this node's own request in link order
                 if (route_reply(p, f, &node_reply)) return;
-                run([this, p, f, node_reply] { handle_headers(p, f, node_reply); });
+                judge([this, p, f, node_reply] { handle_headers(p, f, node_reply); });
                 return;
             }
             case kOpFcBuckets:
                 if (route_reply(p, f)) return;
-                run([this, p, f] { handle_buckets(p, f); });
+                judge([this, p, f] { handle_buckets(p, f); });
                 return;
             case kOpFcGetCarrier:
             case kOpFcGetHeaders:
@@ -668,14 +711,17 @@ public:
                 std::lock_guard<std::mutex> lk(vmtx_);
                 due_parked_locked();
                 jobs.swap(vq_);
+                vbusy_ += jobs.size();
             }
             for (Job& j : jobs) {
                 run_job(std::move(j));
+                --vbusy_;
                 ++n;
                 any = true;
             }
             if (!any) break;
         }
+        recheck_caught_up();
         return n;
     }
     // One join step: the next pair's attempt (the node lock held, released at its waits), then its outcome applied.
@@ -721,10 +767,21 @@ public:
         o_.book_save(book_.records());
         st_.disc_saves++;
     }
-    // Parks a carrier frame of `peer` in the verify parked list with no retry time (the parked-cap KAT).
-    std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame) {
+    // The node lock held while `during` runs (the KATs: a pass of the node's own, its frames arriving meanwhile).
+    void test_hold_node(const std::function<void()>& during) {
+        const NodeGuard g(*this);
+        during();
+    }
+    // The node lock's busy total (ms).
+    std::uint64_t node_busy_ms() { return lock_.busy_ms(); }
+    // The KATs: a due end of K_NCU is tried only at the tick (the window between the last judged frame and its end).
+    void test_defer_ends(bool on) { defer_ends_ = on; }
+    // Parks a carrier frame of `peer` in the verify parked list, run again at `not_before_ms` (default: never; the
+    // parked-cap KAT).
+    std::size_t test_park(std::uint64_t peer, const std::vector<std::uint8_t>& frame,
+                          std::uint64_t not_before_ms = UINT64_MAX) {
         Job j{Job::Kind::Carrier, peer, peer, frame, 0};
-        park_job(std::move(j), UINT64_MAX);
+        park_job(std::move(j), not_before_ms);
         return parked_size();
     }
     bool parked_has(const std::vector<std::uint8_t>& frame) const {
@@ -897,6 +954,14 @@ public:
         std::lock_guard<std::mutex> lk(cumtx_);
         const auto it = header_wants_.find(peer);
         return it == header_wants_.end() ? 0 : it->second.size();
+    }
+    // KAT hook: the waiting header requests of `peer` under `owner`.
+    std::size_t header_waiting(std::uint64_t peer, PathbNode::HeaderOwner owner) const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        const auto it = header_wants_.find(peer);
+        if (it == header_wants_.end()) return 0;
+        return static_cast<std::size_t>(
+                std::count_if(it->second.begin(), it->second.end(), [&](const HdrWant& w) { return w.owner == owner; }));
     }
     // KAT hook: the parked objects the waiting header requests of `peer` carry.
     std::size_t header_waiting_objects(std::uint64_t peer) const {
@@ -1132,6 +1197,7 @@ private:
         // a parked receipt's asks: (peer, cause, object), each made once while the receipt is parked or runs again
         std::set<std::tuple<std::uint64_t, Missing, Hash32>> asked;
         std::uint64_t origin_h = 0;  // a parked receipt's origin height h(r) (0: its P_r not held yet)
+        PathbNode::Arrival arrival{};  // a reply to the node's own FC_GETCARRIER: its arrival (E-194)
     };
     static constexpr std::uint64_t kParkRetryMs = 500;  // a job with no token waits this long before its next try
     static constexpr std::size_t kRependLogIds = 16;  // the re-pended ids named on one re-pend offer line
@@ -1145,6 +1211,7 @@ private:
         std::vector<std::vector<std::uint8_t>> frames;
         std::uint64_t last_ms = 0;       // the send, then each frame
         bool closed = false;             // the peer disconnected
+        std::uint64_t attempt = 0;       // the open join attempt's id at the send (0: none)
     };
     struct HdrWait {
         bool node = true;                // a request of the node (else a ticket's)
@@ -1370,6 +1437,8 @@ private:
                 events_.pop_front();
             }
             fn();
+            fn = nullptr;
+            recheck_caught_up();
         }
     }
     void maint_loop() {
@@ -1491,7 +1560,6 @@ private:
         }
         {
             std::lock_guard<std::mutex> lk(cumtx_);
-            catchup_.erase(p);
             header_wants_.erase(p);
             headers_on_ctx_.erase(p);
             hdr_sent_.erase(p);
@@ -1505,6 +1573,14 @@ private:
             const NodeGuard g(*this);
             node_->disconnect(p);
             strip_gone_peer_asks_locked(p);
+            // a departure: the peer's catch-up and hand-over leave the count together with its HELLO, and K_NCU's end
+            // is evaluated (E-193)
+            {
+                std::lock_guard<std::mutex> lk(cumtx_);
+                catchup_.erase(p);
+                handed_over_.erase(p);
+                caught_up_locked();
+            }
             std::lock_guard<std::mutex> lk(omtx_);
             omissions_.erase(p);
         });
@@ -1640,8 +1716,11 @@ private:
                 if (vq_.empty()) continue;
                 j = std::move(vq_.front());
                 vq_.pop_front();
+                ++vbusy_;
             }
             run_job(std::move(j));
+            --vbusy_;
+            recheck_caught_up();
         }
     }
     // One job: the sender's token, then the admission under the node lock; the token goes back unless the outcome
@@ -1683,7 +1762,7 @@ private:
                 }
                 if (!j.solicited) fresh = new_carried(j.frame);
                 try {
-                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited);
+                    t = node_->begin_carrier(j.peer, j.frame, true, j.solicited, j.arrival);
                 } catch (const RandomxFailure& e) {
                     rx_fail = true;
                     rx_why = e.what();
@@ -1699,7 +1778,11 @@ private:
             if (!kept) refund(j);
             const bool taken = kept && !j.solicited;
             const bool solicited = j.solicited;
-            post([this, t = std::move(t), taken, solicited, fresh]() mutable { complete_job(std::move(t), taken, solicited, fresh); });
+            ++rx_events_;  // not judged until its placement runs (E-193)
+            post([this, t = std::move(t), taken, solicited, fresh]() mutable {
+                --rx_events_;
+                complete_job(std::move(t), taken, solicited, fresh);
+            });
             return;
         }
         std::vector<NodeEventResult> rs;
@@ -1751,6 +1834,7 @@ private:
         const std::uint64_t peer = t.peer;
         const Hash32 digest = ::v37::sha256d(t.frame);
         std::vector<std::uint8_t> frame = t.frame;
+        const PathbNode::Arrival arrival = t.arrival;
         NodeEventResult r;
         Effects fx;
         bool rx_fail = false;
@@ -1768,7 +1852,9 @@ private:
         }
         if (rx_fail) {
             rx_alarm("carrier placement", rx_why);
-            park_job(Job{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true}, now_ms() + kParkRetryMs);
+            Job j{Job::Kind::Carrier, peer, src_of(peer), std::move(frame), 0, solicited, true};
+            j.arrival = arrival;
+            park_job(std::move(j), now_ms() + kParkRetryMs);
             run_effects(fx);
             return;
         }
@@ -2207,7 +2293,8 @@ private:
             std::deque<HdrWant>& q = it->second;
             while (!q.empty()) {
                 const HdrWant& w = q.front();
-                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr) {
+                if (!hello_ok(it->first) || node_->tree().find(w.from) == nullptr
+                    || (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(it->first) == 0)) {  // its catch-up ended
                     q.pop_front();
                     continue;
                 }
@@ -2217,6 +2304,7 @@ private:
                     hdr_sent_[it->first] = HdrSent{w.from, w.stop, w.objs};
                 } else {
                     hdr_sent_.erase(it->first);
+                    if (const auto c = catchup_.find(it->first); c != catchup_.end()) c->second.asked_ms = now_ms();
                 }
                 q.pop_front();
                 break;  // one in flight per peer
@@ -2859,6 +2947,7 @@ private:
     // reply decides fetch or keep (the tail's best_cum_work is not read).
     void catchup_start(std::uint64_t p, const HelloTail& tail) {
         std::lock_guard<std::mutex> lk(cumtx_);
+        handed_over_.erase(p);  // a new HELLO: its catch-up starts again
         if (node_->holds_tip(tail.best_tip)) {
             caught_up_locked();  // nothing to catch up from this peer (the done test at the start)
             return;
@@ -2866,16 +2955,100 @@ private:
         Catchup& c = catchup_[p];
         c.tip = tail.best_tip;
         c.step = 0;
+        caught_due_ = false;  // a catch-up open again
         catchup_ask_locked(p, c);
     }
-    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (each HELLO tip held, or a reply
-    // that ended its catch-up by the node's own decision) is caught up (its record leaves the store).
+    // Under the node lock and cumtx_: a store not caught up whose catch-ups all ended (those of peers whose connection
+    // is open: each HELLO tip held, or a reply that ended its catch-up by the node's own decision; a hand-over to the
+    // joiner whose pair lives is no end, E-166 (v)) is caught up (its record leaves the store) once the node holds no
+    // frame it received and has not judged, and no parked frame whose parent it holds (E-193); until then the end is
+    // due and is tried again after each judged frame and at each tick. Evaluated also at a departure and at an
+    // attempt's end.
     void caught_up_locked() {
-        if (node_->caught_up() || !catchup_.empty() || !node_->has_pathb_peer()) return;
+        if (node_->caught_up()) handed_over_.clear();
+        if (node_->attempt_server_gone()) return;  // an attempt open with a server that left: its own end first
+        // a kept attempt or an adoption ends K_NCU itself (kept_locked); with no peer left NoPathbPeer governs, and a
+        // due end keeps its first conjunct when the peers leave meanwhile
+        if (node_->caught_up() || node_->kept_due() || node_->adopt_due() || !catchup_.empty() || handed_over_locked()
+            || (!node_->has_pathb_peer() && !caught_due_.load())) {
+            caught_due_ = false;
+            return;
+        }
+        if (!node_->drain_done()) {
+            caught_due_ = true;
+            return;
+        }
+        caught_due_ = false;
         node_->note_caught_up();
         st_.caught_up_at_ms = now_ms();
         log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
     }
+    // Under the node lock and cumtx_: a completed join attempt that rule (4) did not take (E-178), or an adoption, at
+    // a store not caught up: K_NCU ends once the drain is done (E-193), and the caught-up line is printed.
+    void kept_locked() {
+        if (node_->kept_due()) {
+            if (!node_->finish_kept()) return;
+            kept_due_ = false;
+            handed_over_.clear();
+            st_.caught_up_at_ms = now_ms();
+            log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at_pos_t_locked());
+            return;
+        }
+        if (node_->adopt_due()) {
+            if (!node_->finish_adopted()) return;
+            kept_due_ = false;
+            handed_over_.clear();
+            st_.caught_up_at_ms = now_ms();
+            log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at_pos_t_locked());
+            return;
+        }
+        kept_due_ = false;
+    }
+    // A due end of K_NCU tried again (not under the node lock: after a judged frame, a job, a pump).
+    void recheck_caught_up() {
+        if ((!caught_due_.load() && !kept_due_.load()) || t_node_held == this || defer_ends_.load()) return;
+        const NodeGuard g(*this);
+        std::lock_guard<std::mutex> lk(cumtx_);
+        if (caught_due_.load()) caught_up_locked();
+        if (kept_due_.load()) kept_locked();
+    }
+    // E-193: the node holds no frame this relay received and has not given it to judge (an owner event of a frame,
+    // a verify job queued, parked for a token or running).
+    bool inbound_idle() const {
+        if (rx_events_.load() != 0) return false;
+        std::lock_guard<std::mutex> lk(vmtx_);
+        return vq_.empty() && parked_.empty() && vbusy_.load() == 0;
+    }
+    // Under the node lock and cumtx_: a catch-up handed to the joiner (an empty reply from position 0, JoinerPath)
+    // whose tip is still not held and whose (tip, server) pair lives; a held one ended by its done test, one whose pair
+    // no longer lives (its server excluded or gone, its attempt ended) holds nothing.
+    bool handed_over_locked() {
+        for (auto it = handed_over_.begin(); it != handed_over_.end();)
+            it = node_->holds_tip(it->second) || !node_->pair_lives(it->second, it->first) ? handed_over_.erase(it)
+                                                                                          : std::next(it);
+        return !handed_over_.empty();
+    }
+    // Under the node lock and cumtx_: a catch-up handed to the joiner is recorded while its (tip, server) pair lives
+    // (P-52; no end, E-166 (v)); an offer that leaves no pair: the catch-up ended by its reply.
+    void hand_over_locked(std::uint64_t p, const Hash32& tip) {
+        if (node_->pair_lives(tip, p)) {
+            handed_over_[p] = tip;
+            return;
+        }
+        caught_up_locked();
+    }
+    // Under the node lock: a HELLO catch-up not ended toward a tip the node does not hold, open or handed to the
+    // joiner (the template gate's claim case, E-194 (vi)).
+    bool catchup_claim_open() const {
+        std::lock_guard<std::mutex> lk(cumtx_);
+        for (const auto& [p, c] : catchup_)
+            if (!node_->holds_tip(c.tip)) return true;
+        for (const auto& [p, tip] : handed_over_)
+            if (!node_->holds_tip(tip) && node_->pair_lives(tip, p)) return true;
+        return false;
+    }
+    // A reply frame's arrival at its link (E-194): the relay clock and the node lock's busy total now.
+    PathbNode::Arrival arrival_now() { return PathbNode::Arrival{now_ms(), lock_.busy_ms(), true}; }
     // Under the node lock and cumtx_: FC_GETHEADERS to the peer's tip (one in flight per peer), from the best tip,
     // then, after empty replies, a locator step down the best chain: pos - 1, pos - 2, pos - 4, ..., then the lowest
     // position held (position 0 on an unpruned store): at most floor(log2 pos) + 2 requests per round.
@@ -2910,16 +3083,25 @@ private:
         using K = PathbNode::HeadersOutcome::Kind;
         PathbNode::HeadersOutcome o;
         bool join = false;
+        std::string jp_line, re_line;
         {
             const NodeGuard g(*this);
+            PathbNode::Arrival arrival;  // a reply to the node's own request: its arrival in link order (E-194)
             if (node_reply) {  // handled now: no longer waiting for the owner
                 std::lock_guard<std::mutex> lk(kmtx_);
                 const auto a = hdr_arrived_.find(p);
                 if (a != hdr_arrived_.end() && --a->second == 0) hdr_arrived_.erase(a);
+                const auto at = hdr_at_.find(p);
+                if (at != hdr_at_.end() && !at->second.empty()) {
+                    arrival = at->second.front();
+                    at->second.pop_front();
+                    if (at->second.empty()) hdr_at_.erase(at);
+                }
             }
             try {
-                o = node_->on_headers(p, f, now_s());
-            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; the catch-up asks again
+                o = node_->on_headers(p, f, now_s(), arrival);
+            } catch (const RandomxFailure& e) {  // node-internal, a local alarm; no token, no ban; a comparison
+                                                 // past its first checked header pauses (its next request resumes it)
                 rx_alarm("headers of peer " + std::to_string(p), e.what());
                 log("relay: peer " + std::to_string(p) + " FC_HEADERS not judged: " + e.what() + " (no token, no ban)");
                 return;
@@ -2960,25 +3142,53 @@ private:
                                 break;
                             }
                             // the reply to a request from position 0 carried no header: the peer serves none of this
-                            // node's chain (the joiner path: its tip a join candidate)
+                            // node's chain (the joiner path: its tip a join candidate; a root-evidence pair where the
+                            // node pruned meanwhile)
                             if (o.ids.empty() && it->second.from_pos0) {
-                                if (node_->offer_empty_store_tip(p)) {
+                                if (node_->offer_empty_store_tip(p, node_->pruned_full_node())) {
                                     st_.empty_store_offers++;
                                     join = true;
                                 }
+                                const Hash32 tip = it->second.tip;
                                 catchup_.erase(it);
+                                hand_over_locked(p, tip);
+                                break;
+                            }
+                            // the reply to a request from a pruned full node's lowest held position (its root) carried
+                            // no header: the peer's tip a root-evidence pair (the joiner path), the hand-over recorded
+                            // while that pair lives
+                            if (o.ids.empty() && node_->pruned_full_node()) {
+                                if (node_->offer_empty_store_tip(p, /*root_evidence=*/true)) st_.root_evidence_offers++;
+                                const Hash32 tip = it->second.tip;
+                                if (node_->pair_lives(tip, p)) {
+                                    join = true;
+                                    re_line = "relay: catch-up from peer " + std::to_string(p) +
+                                              ": no header from the lowest held position " +
+                                              std::to_string(node_->tree().genesis().pos) +
+                                              ": its tip offered to the joiner (root evidence)";
+                                }
+                                catchup_.erase(it);
+                                hand_over_locked(p, tip);
                                 break;
                             }
                             // the node's own header work kept its chain: this catch-up ended by its reply
                             catchup_.erase(it);
                             caught_up_locked();
                             break;
-                        case K::JoinerPath: catchup_.erase(it); break;
+                        case K::JoinerPath: {
+                            const Hash32 tip = it->second.tip;
+                            catchup_.erase(it);
+                            hand_over_locked(p, tip);
+                            break;
+                        }
                         case K::Ban:
                         case K::Strike:
                         case K::Undecodable:  // the catch-up ended by its reply
                             catchup_.erase(it);
                             caught_up_locked();
+                            break;
+                        case K::Continue:  // the next page of the comparison went out
+                            it->second.asked_ms = now_ms();
                             break;
                         case K::FetchBodies:  // one page in flight: no new ask until its last asked body is placed or
                                               // the page lapses
@@ -2994,7 +3204,17 @@ private:
                 serve_header_wants_locked(p);  // the peer's slot may be free: its waiting requests, the oldest first
             }
             if (o.kind == K::JoinerPath) join = true;
+            if (o.kind == K::JoinerPath && o.offered) {  // the line where the offer left a live pair
+                const std::uint64_t base = node_->store().base_pos();
+                const std::optional<std::uint64_t> x1 = node_->switch_x1();
+                const std::string test = o.fork_pos < base || !x1 ? " below the journal base " + std::to_string(base)
+                                                                  : " at or below x1 " + std::to_string(*x1);
+                jp_line = "relay: headers from peer " + std::to_string(p) + " win; fork at " + std::to_string(o.fork_pos) +
+                          test + ": offered to the joiner";
+            }
         }
+        if (!jp_line.empty()) log(jp_line);
+        if (!re_line.empty()) log(re_line);
         if ((o.kind == K::Unsolicited || o.kind == K::Retired) && !o.why.empty())
             log("relay: peer " + std::to_string(p) + " DROP: " + o.why);
         switch (o.kind) {
@@ -3049,6 +3269,26 @@ private:
         v.push_back(w);
         if (v.back().since_ms == 0) v.back().since_ms = now_ms();
     }
+    // Under cumtx_: the catch-up of `p` ended: its deferral and its waiting request go.
+    void drop_catchup_asks_locked(std::uint64_t p) {
+        const auto cu = [](const auto& e) { return e.owner == PathbNode::HeaderOwner::CatchUp; };
+        if (const auto d = headers_on_ctx_.find(p); d != headers_on_ctx_.end()) {
+            d->second.erase(std::remove_if(d->second.begin(), d->second.end(), cu), d->second.end());
+            if (d->second.empty()) headers_on_ctx_.erase(d);
+        }
+        if (const auto q = header_wants_.find(p); q != header_wants_.end()) {
+            q->second.erase(std::remove_if(q->second.begin(), q->second.end(), cu), q->second.end());
+            if (q->second.empty()) header_wants_.erase(q);
+        }
+    }
+    // Under cumtx_: an adoption; every catch-up's comparison restarts against the adopted chain: the catch-ups'
+    // deferrals and waiting requests go (a tip request's stay).
+    void drop_all_catchup_asks_locked() {
+        std::set<std::uint64_t> ps;
+        for (const auto& [p, v] : headers_on_ctx_) ps.insert(p);
+        for (const auto& [p, q] : header_wants_) ps.insert(p);
+        for (const std::uint64_t p : ps) drop_catchup_asks_locked(p);
+    }
     // Under cumtx_: the catch-up's own deferral of peer `p` (none: nullptr).
     HdrOnCtx* catchup_ctx_locked(std::uint64_t p) {
         const auto it = headers_on_ctx_.find(p);
@@ -3075,6 +3315,7 @@ private:
             it = v.empty() ? headers_on_ctx_.erase(it) : std::next(it);
             for (const HdrOnCtx& w : asks) {
                 if (!hello_ok(p) || node_->tree().find(w.from) == nullptr) continue;
+                if (w.owner == PathbNode::HeaderOwner::CatchUp && catchup_.count(p) == 0) continue;  // its catch-up ended
                 want_headers_locked(p, w.owner, w.from, w.stop, w.objs);
                 st_.headers_ctx_reasks++;
             }
@@ -3229,6 +3470,10 @@ private:
             const NodeGuard g(*this);
             s = node_->apply_join(std::move(t));
         }
+        if (s->switched) {  // an adoption: the catch-ups' deferrals and waiting requests go
+            std::lock_guard<std::mutex> lk(cumtx_);
+            drop_all_catchup_asks_locked();
+        }
         if (s->report) {
             const AttemptReport& rep = *s->report;
             log("relay: join attempt at peer " + std::to_string(rep.server) + ": " + attempt_end_name(rep.end) + " (L " +
@@ -3245,6 +3490,17 @@ private:
                     at = at_pos_t_locked();
                 }
                 log("relay: caught up (a join attempt completed; rule (4) kept the node's chain)" + at);
+            } else if (s->adopt_caught_up) {  // the adoption ended K_NCU (E-193): the line
+                st_.caught_up_at_ms = now_ms();
+                std::string at;
+                {
+                    const NodeGuard g(*this);
+                    at = at_pos_t_locked();
+                }
+                log("relay: caught up (the catch-up from every HELLO peer ended by its done test)" + at);
+            } else {
+                const NodeGuard g(*this);
+                if (node_->kept_due() || node_->adopt_due()) kept_due_ = true;  // its drain first (E-193)
             }
             if (rep.side_needs > 0) {
                 st_.join_side_attempts++;
@@ -3260,6 +3516,11 @@ private:
             if (s->report->end == AttemptEnd::NodeInternal) rx_alarm("join attempt", s->report->what);
             if (s->report->end == AttemptEnd::NotServed || s->report->end == AttemptEnd::NodeInternal)
                 join_not_before_ms_ = now_ms() + abandon_s_ * 1000;
+        }
+        {  // the attempt's end: a hand-over whose pair it ended (excluded, gone, not queued again) holds nothing
+            const NodeGuard g(*this);
+            std::lock_guard<std::mutex> lk(cumtx_);
+            caught_up_locked();
         }
         return s;
     }
@@ -3284,6 +3545,7 @@ private:
             GetBuckets q;
             if (decode_getbuckets(req, chain_id_, q) == BucketsWireError::None) t.at = q.at;
         }
+        t.attempt = node_ != nullptr && node_->open_attempt() ? node_->join_seq() : 0;  // on the join worker, under the node lock
         const bool live = links_.has_peer(peer);
         std::uint64_t id = 0;
         {
@@ -3340,6 +3602,10 @@ private:
         const auto it = tickets_.find(id);
         if (it != tickets_.end()) finish_ticket_locked(it);
     }
+    // Under kmtx_: a reply frame of a join attempt's own request arrived (E-194 (vii)): its id marked.
+    void mark_join_locked(std::uint64_t attempt) {
+        if (attempt > join_mark_) join_mark_ = attempt;
+    }
     void finish_ticket_locked(std::map<std::uint64_t, Ticket>::iterator it) {
         const auto q = hdr_fifo_.find(it->second.peer);
         if (q != hdr_fifo_.end())
@@ -3354,6 +3620,7 @@ private:
                 if (t.peer == p) t.closed = true;
             hdr_fifo_.erase(p);
             hdr_arrived_.erase(p);
+            hdr_at_.erase(p);
             asked_carriers_.erase(p);
             bodyset_asked_.erase(p);
         }
@@ -3391,6 +3658,7 @@ private:
             q->second.pop_front();
             if (h.node) {
                 ++hdr_arrived_[peer];  // node_tick stops the request's P-53 clock while the frame waits for the owner
+                hdr_at_[peer].push_back(arrival_now());
                 if (node_reply != nullptr) *node_reply = true;
                 return false;
             }
@@ -3401,6 +3669,7 @@ private:
             }
             it->second.frames.push_back(f);
             it->second.last_ms = now_ms();
+            if (f.size() <= headers_frame_) mark_join_locked(it->second.attempt);  // in the link's buffer (a larger one DROPs)
             kcv_.notify_all();
             return true;
         }
@@ -3421,6 +3690,7 @@ private:
                 if (id && t.ids.erase(*id) != 0) {
                     t.frames.push_back(f);
                     t.last_ms = now_ms();
+                    mark_join_locked(t.attempt);
                     kcv_.notify_all();
                     return true;
                 }
@@ -3428,6 +3698,7 @@ private:
             if (!id && oldest != nullptr) {  // does not decode: the asked server's reply (its link strikes it)
                 oldest->frames.push_back(f);
                 oldest->last_ms = now_ms();
+                mark_join_locked(oldest->attempt);
                 kcv_.notify_all();
                 return true;
             }
@@ -3445,6 +3716,7 @@ private:
                 if (ok && t.at == v.at) {
                     t.frames.push_back(f);
                     t.last_ms = now_ms();
+                    mark_join_locked(t.attempt);
                     kcv_.notify_all();
                     return true;
                 }
@@ -3452,6 +3724,7 @@ private:
             if (!ok && oldest != nullptr) {
                 oldest->frames.push_back(f);
                 oldest->last_ms = now_ms();
+                mark_join_locked(oldest->attempt);
                 kcv_.notify_all();
                 return true;
             }
@@ -3605,6 +3878,7 @@ private:
                 }
                 for (const std::uint64_t p : arrived) node_->headers_arrived(p);
             }
+            node_->gate_clock(now_ms(), lock_.busy_ms());  // the template gate's delivery clock (E-194)
             if (node_->tick(now_s()) > 0) rerun = true;  // a request abandoned (P-53): another peer
             // the lowest frame of a parked chain: its parent, once per P-53, within each peer's asked-carrier record
             node_->reask_parents([this](std::uint64_t p) { return ask_room(p); });
@@ -3624,6 +3898,8 @@ private:
                 const bool done = node_->holds_tip(it->second.tip) || node_->rests_on_claims();
                 if (done) {
                     done_any = done_any || !node_->rests_on_claims();
+                    node_->end_comparison(it->first);  // no next page of its comparison
+                    drop_catchup_asks_locked(it->first);  // nor a deferred or waiting request of it
                     it = catchup_.erase(it);
                     continue;
                 }
@@ -3634,7 +3910,8 @@ private:
                 if (deferred && !node_->caught_up() && !hd->offered && hd->since_ms != 0
                     && now_ms() >= hd->since_ms + kCtxTtlMs && !node_->monero_input_held(hd->cause, hd->fetch)) {
                     hd->offered = true;
-                    if (node_->offer_empty_store_tip(it->first)) {
+                    // at a pruned full node a root-evidence pair
+                    if (node_->offer_empty_store_tip(it->first, node_->pruned_full_node())) {
                         st_.catchup_join_offers++;
                         log("relay: catch-up from peer " + std::to_string(it->first) + " deferred on P_r " +
                             hex_short(hd->fetch) + " past its context's time: its tip offered to the joiner");
@@ -3655,7 +3932,7 @@ private:
                 }
                 // again from the new best tip (the locator from its step 0), or after a request that got no reply
                 // within P-53 (a request deferred on a P_r is asked again when that P_r resolves)
-                if (c.fetch_tip == Hash32{} && c.asked_best != b.id) {
+                if (c.fetch_tip == Hash32{} && c.asked_best != b.id && !node_->comparison_paused(it->first)) {
                     c.step = 0;
                     catchup_ask_locked(it->first, c);
                 } else if (c.fetch_tip == Hash32{} && !deferred && now_ms() >= c.asked_ms + abandon_s_ * 1000) {
@@ -3663,7 +3940,12 @@ private:
                 }
                 ++it;
             }
-            if (done_any) caught_up_locked();
+            if (!handed_over_.empty()) {  // a handed-over catch-up whose tip is held now: ended by its done test
+                const std::size_t n = handed_over_.size();
+                if (!handed_over_locked() && n > 0) done_any = done_any || !node_->rests_on_claims();
+            }
+            if (done_any || caught_due_.load()) caught_up_locked();
+            if (kept_due_.load()) kept_locked();
             join = (node_->joiner().queue().ready() > 0 || reask_due_) && now_ms() >= join_not_before_ms_;
         }
         {
@@ -4450,6 +4732,11 @@ private:
     std::condition_variable vcv_;
     std::deque<Job> vq_;
     std::deque<Job> parked_;
+    std::atomic<std::size_t> vbusy_{0};        // verify jobs taken from vq_ and still running (taken under vmtx_)
+    std::atomic<std::int64_t> rx_events_{0};   // owner events of received frames posted and not run yet (E-193)
+    std::atomic<bool> caught_due_{false};      // every HELLO catch-up ended; K_NCU's end waits for the drain (E-193)
+    std::atomic<bool> defer_ends_{false};      // test_defer_ends
+    std::atomic<bool> kept_due_{false};        // a kept join attempt or an adoption; K_NCU's end waits for the drain
     ::c2pool::xmr::CarrierDosBudget dos_;
     std::map<std::uint64_t, std::uint64_t> strikes_by_peer_;
     std::map<std::uint64_t, ValidBucket> valid_;  // P-15 (vmtx_)
@@ -4472,8 +4759,10 @@ private:
     mutable std::mutex kmtx_;  // tickets
     std::condition_variable kcv_;
     std::map<std::uint64_t, Ticket> tickets_;
+    std::uint64_t join_mark_ = 0;  // the last join attempt id a reply frame of its own request reached (kmtx_)
     std::map<std::uint64_t, std::deque<HdrWait>> hdr_fifo_;
     std::map<std::uint64_t, std::uint64_t> hdr_arrived_;  // replies to node requests arrived, not handled yet (kmtx_)
+    std::map<std::uint64_t, std::deque<PathbNode::Arrival>> hdr_at_;  // ... their arrivals in link order (kmtx_)
     std::map<std::uint64_t, std::set<Hash32>> asked_carriers_;  // ids of the node's own FC_GETCARRIER, per peer
     std::map<std::uint64_t, std::set<Hash32>> bodyset_asked_;   // walked carriers whose body set is asked, per peer
     std::uint64_t next_ticket_ = 0;
@@ -4481,6 +4770,7 @@ private:
 
     mutable std::mutex cumtx_;  // catch-up and t's branch headers waiting for a free request (under the node lock)
     std::map<std::uint64_t, Catchup> catchup_;
+    std::map<std::uint64_t, Hash32> handed_over_;  // catch-ups handed to the joiner: peer -> its HELLO tip (cumtx_)
     std::map<std::uint64_t, std::deque<HdrWant>> header_wants_;  // peer -> its waiting header requests, oldest first
     std::map<std::uint64_t, std::vector<HdrOnCtx>> headers_on_ctx_;  // deferred on a P_r: peer -> per (owner, from, stop)
     std::map<std::uint64_t, HdrSent> hdr_sent_;  // the tip request in flight per peer and its objects (cumtx_)

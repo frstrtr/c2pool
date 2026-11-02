@@ -98,11 +98,16 @@ constexpr unsigned char kSealVersion   = 0x01;
 // back above it (AlertDetector, HASHRATE). Same compatibility as 5 and 6, so
 // the same rule: a relay built before them (kMaxKind 6) refuses them as
 // invalid and the page is lost. Ship the relay together with its origins.
+//
+// UtxoWithheld (9) is node-level: the DASH full UTXO set stopped advancing
+// (a strict refusal, a reorg beyond its undo records, a base the header chain
+// does not hold) and the node serves no mempool tx until the operator acts.
+// Same compatibility rule: a relay built before it (kMaxKind 8) refuses it.
 enum class Kind : uint8_t {
     Offline = 1, BackOnline = 2, Digest = 3, Test = 4, WorkStalled = 5, WorkResumed = 6,
-    HashrateLow = 7, HashrateOk = 8,
+    HashrateLow = 7, HashrateOk = 8, UtxoWithheld = 9,
 };
-constexpr uint8_t kMaxKind = 8;   // highest kind this build decodes
+constexpr uint8_t kMaxKind = 9;   // highest kind this build decodes
 
 inline const char* kind_name(uint8_t k)
 {
@@ -115,6 +120,7 @@ inline const char* kind_name(uint8_t k)
     case 6: return "work_resumed";
     case 7: return "hashrate_low";
     case 8: return "hashrate_ok";
+    case 9: return "utxo_withheld";
     }
     return "unknown";
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,8 +31,15 @@ public:
     /**
      * @brief Construct sharechain storage for a specific network
      * @param network_name Name of the network (mainnet/testnet)
+     *
+     * A sharechain DB another c2pool holds (the same --data-dir) is waited
+     * for, `lock_attempts` opens `lock_wait` apart (a restart overlapping the
+     * process it replaces); still held, the process exits with an error: a
+     * node without its sharechain store would lose every share it records.
+     * Any other open failure leaves the node without persistence, as before.
      */
-    explicit SharechainStorage(const std::string& network_name);
+    explicit SharechainStorage(const std::string& network_name, int lock_attempts = 5,
+                               std::chrono::milliseconds lock_wait = std::chrono::seconds(2));
     
     /**
      * @brief Destructor with cleanup

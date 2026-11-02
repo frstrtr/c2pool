@@ -79,6 +79,7 @@
 
 // UTXO bootstrap pipeline (ordered block download for cold-start sync)
 #include <core/coin/block_bootstrapper.hpp>
+#include <core/coin/block_download.hpp>
 
 // Enhanced C2Pool components
 #include <c2pool/node/enhanced_node.hpp>
@@ -272,6 +273,8 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/header_sync.hpp>
+#include <impl/ltc/coin/cold_start_tick.hpp>
 // Phase 5: Embedded DOGE node for daemonless merged mining
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
@@ -337,6 +340,24 @@ static nlohmann::json doge_block_detail_json(const c2pool::merged::DiscoveredMer
     o["is_local"]      = db.is_local;
     o["accepted"]      = db.accepted;
     return o;
+}
+
+// A block body's serialized size, estimated from its parts (the cold-start
+// downloads' buffer bound; LTC and DOGE bodies alike).
+static size_t estimate_block_bytes(const ltc::coin::BlockType& b)
+{
+    size_t n = 80 + 9 + b.m_mweb_raw.size();
+    for (const auto& tx : b.m_txs) {
+        n += 4 + 4 + 9 + 9;
+        for (const auto& in : tx.vin) {
+            n += 32 + 4 + 4 + 9 + in.scriptSig.m_data.size();
+            for (const auto& w : in.scriptWitness.stack)
+                n += 1 + w.size();
+        }
+        for (const auto& out : tx.vout)
+            n += 8 + 9 + out.scriptPubKey.m_data.size();
+    }
+    return n;
 }
 
 // Global signal handling
@@ -2437,65 +2458,62 @@ int main(int argc, char* argv[]) {
                 // Shared_ptr so it stays alive for the lifetime of the callbacks.
                 auto hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
 
-                // Header sync: self-propelling chain catch-up.
-                // add_headers() runs scrypt for each header (~20ms each), so we offload
-                // it to a background thread and post the follow-up back to ioc.
+                // Header sync (ltc/coin/header_sync.hpp): the batches go to the
+                // header thread (add_headers runs scrypt near the tip), the
+                // follow-up getheaders and the poll go out on ioc.
+                std::shared_ptr<ltc::coin::HeaderSync> ltc_hdr_sync;
+                {
+                    ltc::coin::HeaderSyncHost hs;
+                    auto* chain = embedded_chain.get();
+                    auto* bcaster = embedded_broadcaster.get();
+                    hs.has_header = [chain](const uint256& h) { return chain->has_header(h); };
+                    hs.add_headers = [chain](const std::vector<ltc::coin::BlockHeaderType>& batch) {
+                        auto t0 = std::chrono::steady_clock::now();
+                        int accepted = chain->add_headers(batch);
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+                        if (accepted > 0)
+                            LOG_INFO << "[EMB-LTC] Processed batch: " << batch.size() << " headers"
+                                     << " accepted=" << accepted
+                                     << " chain_height=" << chain->height()
+                                     << " elapsed=" << elapsed << "ms";
+                        else
+                            LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch.size();
+                        return accepted;
+                    };
+                    hs.post_worker = [hdr_pool](std::function<void()> fn) {
+                        boost::asio::post(*hdr_pool, std::move(fn));
+                    };
+                    hs.post_io = [&ioc](std::function<void()> fn) {
+                        boost::asio::post(ioc, [fn = std::move(fn)]() {
+                            try {
+                                fn();
+                            } catch (const std::exception& e) {
+                                LOG_WARNING << "[EMB-LTC] Header post-process error: " << e.what();
+                            }
+                        });
+                    };
+                    hs.locator = [chain]() { return chain->get_locator(); };
+                    hs.synced = [chain]() { return chain->is_synced(); };
+                    hs.height = [chain]() { return chain->height(); };
+                    hs.ask_one = [bcaster](const std::vector<uint256>& locator, size_t rr, const std::string& peer) {
+                        return bcaster->request_headers_targeted(locator, uint256::ZERO, rr, peer);
+                    };
+                    hs.ask_all = [bcaster](const std::vector<uint256>& locator) {
+                        bcaster->request_headers(locator, uint256::ZERO);
+                    };
+                    hs.accepted = [&web_server](int) {
+                        LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
+                        web_server.trigger_work_refresh_debounced();
+                    };
+                    ltc_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs));
+                }
                 LOG_INFO << "[EMB-LTC] Wiring on_new_headers callback (background thread pool)";
                 embedded_broadcaster->set_on_new_headers(
-                    [chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
-                     &web_server, &ioc, hdr_pool](
-                        const std::string& peer_key,
-                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
+                    [ltc_hdr_sync](const std::string& peer_key,
+                                   const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                         LOG_INFO << "[EMB-LTC] Received " << hdrs.size() << " headers from " << peer_key;
-                        // Copy batch — caller's vector may be freed after return
-                        auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
-                        boost::asio::post(*hdr_pool,
-                            [batch, chain, bcaster, &web_server, &ioc]() {
-                                auto t0 = std::chrono::steady_clock::now();
-                                int accepted = chain->add_headers(*batch);
-                                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - t0).count();
-                                if (accepted > 0)
-                                    LOG_INFO << "[EMB-LTC] Processed batch: " << batch->size() << " headers"
-                                             << " accepted=" << accepted
-                                             << " chain_height=" << chain->height()
-                                             << " elapsed=" << elapsed << "ms";
-                                // Always use the LAST header in the batch as locator for the
-                                // next getheaders — this advances past known-but-duplicate
-                                // headers loaded from LevelDB.  The peer recognises the hash
-                                // (it sent it) and continues from there.
-                                uint256 last_hash;
-                                if (!batch->empty()) {
-                                    auto& last_hdr = batch->back();
-                                    auto packed = pack(last_hdr);
-                                    last_hash = Hash(packed.get_span());
-                                }
-                                bool full_batch = (batch->size() >= 2000);
-                                if (accepted > 0 || full_batch) {
-                                    boost::asio::post(ioc, [accepted, last_hash, chain, bcaster, &web_server]() {
-                                      try {
-                                        if (accepted > 0) {
-                                            LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
-                                            web_server.trigger_work_refresh_debounced();
-                                            // New headers accepted — use last_hash to continue
-                                            if (!last_hash.IsNull()) {
-                                                bcaster->request_headers({last_hash}, uint256::ZERO);
-                                            } else {
-                                                bcaster->request_headers(chain->get_locator(), uint256::ZERO);
-                                            }
-                                        } else {
-                                            // Full batch but all duplicates — use chain tip locator
-                                            // to skip past known headers and find new ones
-                                            bcaster->request_headers(chain->get_locator(), uint256::ZERO);
-                                        }
-                                      } catch (const std::exception& e) {
-                                        LOG_WARNING << "[EMB-LTC] Header post-process error: " << e.what();
-                                      }
-                                    });
-                                } else {
-                                    LOG_DEBUG_COIND << "[EMB-LTC] No new headers accepted (all known), batch=" << batch->size();
-                                }
-                            });
+                        ltc_hdr_sync->on_headers(peer_key, hdrs);
                     });
                 LOG_INFO << "[EMB-LTC] Embedded coin node wired to web server";
 
@@ -2535,10 +2553,59 @@ int main(int argc, char* argv[]) {
                 // Round-robin counter for targeted gap / reorg fill requests.
                 auto fill_rr = std::make_shared<size_t>(0);
                 // The one deliberate jump: a cold-start bootstrap over a UTXO set
-                // too far behind starts its partial view at height - LTC_KEEP
-                // (unchanged behaviour); that first block is allowed past the
-                // next-height / parent checks. 0 = none.
+                // too far behind starts its partial view at the window's first
+                // height; that first block is allowed past the next-height /
+                // parent checks. 0 = none.
                 auto utxo_jump_from = std::make_shared<uint32_t>(0);
+                // Cold start (utxo_order.hpp cold_start_plan): decided once, by
+                // the 1-s tick below, when the header chain is synced; over the
+                // tip's last score-backlog heights (5 * SHARE_PERIOD *
+                // CHAIN_LENGTH / BLOCK_PERIOD = 4,320, the blocks the share
+                // chain's scoring reaches back to). Until then the UTXO set
+                // takes no block.
+                const uint32_t ltc_cold_blocks = 5 * ltc::PoolConfig::share_period()
+                    * ltc::PoolConfig::chain_length() / 150;
+                auto ltc_cold_decided = std::make_shared<bool>(false);
+                auto ltc_synced_since = std::make_shared<std::chrono::steady_clock::time_point>();
+                // The Bootstrap's block download: one peer per height
+                // (core/coin/block_download.hpp), NODE_NETWORK peers first.
+                std::shared_ptr<core::coin::BlockDownload> ltc_dl;
+                {
+                    core::coin::BlockDownload::Host dh;
+                    auto* chain = embedded_chain.get();
+                    auto* bcaster = embedded_broadcaster.get();
+                    dh.peers = [bcaster]() {
+                        constexpr uint64_t NODE_NETWORK = 1;
+                        auto p = bcaster->ready_peers(NODE_NETWORK);
+                        return p.empty() ? bcaster->ready_peers(0) : p;
+                    };
+                    dh.request_from = [chain, bcaster](const std::string& peer, uint32_t h) {
+                        auto e = chain->get_header_by_height(h);
+                        return e && bcaster->request_full_block_from(peer, e->block_hash);
+                    };
+                    dh.request_all = [chain, bcaster](uint32_t h) {
+                        if (auto e = chain->get_header_by_height(h))
+                            bcaster->request_full_block_peers(
+                                e->block_hash, core::coin::block_request_services(chain->height(), h));
+                    };
+                    ltc_dl = std::make_shared<core::coin::BlockDownload>(
+                        std::move(dh), "[EMB-LTC] Bootstrap:", 64u * 1024 * 1024);
+                }
+                // The fill's 30-s stall timer: the Bootstrap asks another peer
+                // (every peer on the third stall of a height); the gap / reorg /
+                // rebuild fills ask every peer.
+                auto ltc_stall_request = std::make_shared<std::function<void(uint32_t)>>(
+                    [ltc_bs, ltc_dl, chain = embedded_chain.get(),
+                     bcaster = embedded_broadcaster.get()](uint32_t h) {
+                        if (ltc::coin::fill_ask(ltc_bs->phase) == ltc::coin::FillAsk::Download) {
+                            ltc_dl->on_fill_stall(*ltc_bs, h);
+                            return;
+                        }
+                        auto e = chain->get_header_by_height(h);
+                        if (e && bcaster)
+                            bcaster->request_full_block_peers(
+                                e->block_hash, core::coin::block_request_services(chain->height(), h));
+                    });
 
                 // Bring the UTXO set back onto the best chain: walk its best back by
                 // height (undo data, at most LTC_KEEP blocks) until its block is the
@@ -2564,7 +2631,7 @@ int main(int argc, char* argv[]) {
                     [chain = embedded_chain.get(), utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(), bcaster = embedded_broadcaster.get(),
                      pool = embedded_pool.get(),
-                     ltc_bs, fill_rr, utxo_jump_from, &ioc](
+                     ltc_bs, fill_rr, utxo_jump_from, ltc_dl, ltc_stall_request, &ioc](
                         UtxoHeal kind, uint32_t target_height) -> bool {
                         if (!chain || !utxo || !utxo_db)
                             return false;
@@ -2636,7 +2703,9 @@ int main(int argc, char* argv[]) {
                             }
                             ltc::coin::ordered_arm(*ltc_bs, from, to);
                             ltc_bs->phase = "UTXO rebuild";
+                            ltc_bs->window = ltc_bs->WINDOW_SIZE;
                             *utxo_jump_from = from;
+                            ltc_dl->reset();
                             if (bcaster) {
                                 ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
                                     auto e = chain->get_header_by_height(rh);
@@ -2646,11 +2715,7 @@ int main(int argc, char* argv[]) {
                                         bcaster->request_full_block(e->block_hash);
                                 });
                                 ltc_bs->start_stall_timer(ioc,
-                                    [chain, bcaster](uint32_t h) {
-                                        auto e = chain->get_header_by_height(h);
-                                        if (e && bcaster)
-                                            bcaster->request_full_block(e->block_hash);
-                                    }, "EMB-LTC");
+                                    [ltc_stall_request](uint32_t h) { (*ltc_stall_request)(h); }, "EMB-LTC");
                             }
                             return true;
                         }
@@ -2683,23 +2748,27 @@ int main(int argc, char* argv[]) {
                             && ltc::coin::ordered_rearm_after_reorg(*ltc_bs, best_now, target_height)) {
                             if (!was_cold_start) {
                                 ltc_bs->phase = "UTXO reorg fill";
+                                ltc_bs->window = ltc_bs->WINDOW_SIZE;
                                 *utxo_jump_from = 0;
                             }
                             LOG_WARNING << "[EMB-LTC] UTXO reorg fill (" << reason << "): connecting "
                                         << best_now + 1 << ".." << target_height << " in order";
-                            ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
-                                auto e = chain->get_header_by_height(rh);
-                                if (!e)
-                                    return;
-                                if (!bcaster->request_full_block_targeted(e->block_hash, (*fill_rr)++))
-                                    bcaster->request_full_block(e->block_hash);
-                            });
-                            ltc_bs->start_stall_timer(ioc,
-                                [chain, bcaster](uint32_t h) {
-                                    auto e = chain->get_header_by_height(h);
-                                    if (e && bcaster)
+                            ltc_dl->reset();
+                            if (ltc::coin::fill_ask(ltc_bs->phase) == ltc::coin::FillAsk::Download) {
+                                // A reorg during the cold start: its download goes on
+                                // from the set's real next height.
+                                ltc_dl->refill(*ltc_bs);
+                            } else {
+                                ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
+                                    auto e = chain->get_header_by_height(rh);
+                                    if (!e)
+                                        return;
+                                    if (!bcaster->request_full_block_targeted(e->block_hash, (*fill_rr)++))
                                         bcaster->request_full_block(e->block_hash);
-                                }, "EMB-LTC");
+                                });
+                            }
+                            ltc_bs->start_stall_timer(ioc,
+                                [ltc_stall_request](uint32_t h) { (*ltc_stall_request)(h); }, "EMB-LTC");
                         }
                         return true;
                     });
@@ -2734,7 +2803,7 @@ int main(int argc, char* argv[]) {
                 // Compact blocks: coin-side decision before reconstruction.
                 embedded_broadcaster->set_on_cmpct_block(
                     [chain = embedded_chain.get(), tracker = mweb_tracker.get(),
-                     bcaster = embedded_broadcaster.get(),
+                     ltc_hdr_sync,
                      mweb_stats, seen_blocks, cmpct_inflight, cmpct_headers_req,
                      ltc_mweb_activation](const std::string& peer,
                                           const ltc::coin::CompactBlock& cb) {
@@ -2765,7 +2834,7 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "[EMB-LTC] Compact block " << hash.GetHex().substr(0, 16)
                                          << "... from " << peer
                                          << " does not connect (parent unknown) — requesting headers";
-                                bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                                ltc_hdr_sync->on_unconnected(peer);
                             }
                             return CmpctAction::Drop;
                         }
@@ -2825,7 +2894,7 @@ int main(int argc, char* argv[]) {
                 // seen, kernel fees given up, template drops, the last block the
                 // pool was cleaned for).
                 mi->set_coin_metrics_fn(
-                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry,
+                    [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync, ltc_dl,
                      pool = embedded_pool.get(), tracker = mweb_tracker.get()]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
@@ -2842,7 +2911,9 @@ int main(int argc, char* argv[]) {
                         mp["last_cleaned_ago_s"] = cleaned
                             ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
                             : nlohmann::json(nullptr);
-                        return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)}};
+                        return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
+                                              {"ltc_headers", ltc_hdr_sync->to_json()},
+                                              {"ltc_bootstrap", ltc_dl->to_json()}};
                     });
 
                 // Full block handler: MWEB state extraction + mempool cleanup.
@@ -2869,7 +2940,7 @@ int main(int argc, char* argv[]) {
                          explorer_enabled, explorer_depth_ltc,
                          pending_merged_resolve, on_full_block_merged,
                          ltc_bs, mweb_retry, mweb_stats, seen_blocks, on_mweb_state, fill_rr,
-                         utxo_jump_from, utxo_heal,
+                         utxo_jump_from, utxo_heal, ltc_dl, ltc_cold_decided, ltc_stall_request,
                          ltc_mweb_activation, self = std::weak_ptr<FullBlockFn>(full_block_fn),
                          &ioc, &web_server](
                             const std::string& peer,
@@ -2976,98 +3047,47 @@ int main(int argc, char* argv[]) {
                             };
                             auto start_fill_stall_timer = [&]() {
                                 ltc_bs->start_stall_timer(ioc,
-                                    [chain, bcaster](uint32_t h) {
-                                        auto e = chain->get_header_by_height(h);
-                                        if (e && bcaster)
-                                            bcaster->request_full_block(e->block_hash);
-                                    }, "EMB-LTC");
+                                    [ltc_stall_request](uint32_t h) { (*ltc_stall_request)(h); }, "EMB-LTC");
                             };
 
                             auto txid_fn = [](const ltc::coin::MutableTransaction& tx) {
                                 return ltc::coin::compute_txid(tx);
                             };
                             static bool mempool_requested = false;
-                            static bool ltc_bootstrap_done = false;
                             constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+                            if (height > 0)
+                                ltc_dl->delivered(height, peer);
+                            // The cold start is decided once the header chain is
+                            // synced (the 1-s tick): until then the UTXO set takes
+                            // no block (MWEB state, mempool and explorer still do).
+                            const bool utxo_waits = !*ltc_cold_decided && !ltc_bs->active;
 
                             // ═══ BOOTSTRAP PIPELINE ═══════════════════════════════════
                             // Buffers blocks and processes in strict height order.
-                            // Single-peer targeting with round-robin eliminates 20x
-                            // duplicate bandwidth. Sliding window of 16 in-flight
-                            // requests hides latency. Stall detection re-requests from
-                            // all peers if a block doesn't arrive within 30s.
+                            // The cold start downloads one peer per height
+                            // (core/coin/block_download.hpp); gap / reorg fills ask
+                            // one peer round robin. Sliding window of 16 in-flight
+                            // requests hides latency. A height stalled for 30 s goes
+                            // to another peer (the cold start: every peer on its
+                            // third stall; the other fills: every peer).
 
-                            if (utxo && utxo_db) {
-                                // 1. Bootstrap trigger — fires BEFORE connecting first
-                                //    block so best_height isn't set prematurely.
-                                if (!ltc_bootstrap_done && !ltc_bs->active &&
-                                    chain && bcaster && height > LTC_KEEP) {
-                                    ltc_bootstrap_done = true;
-                                    uint32_t utxo_best = utxo->get_best_height();
-                                    uint32_t start_from =
-                                        (utxo_best > 0 && utxo_best >= height - LTC_KEEP)
-                                        ? utxo_best + 1 : height - LTC_KEEP;
-
-                                    if (start_from < height) {
-                                        ltc_bs->active = true;
-                                        ltc_bs->next_height = start_from;
-                                        ltc_bs->end_height = height;
-                                        ltc_bs->next_request = start_from;
-                                        ltc_bs->total = height - start_from + 1;
-                                        ltc_bs->phase = "Bootstrap";
-                                        *utxo_jump_from = (utxo_best > 0 && start_from > utxo_best + 1)
-                                            ? start_from : 0;
-                                        if (on_best_chain)
-                                            ltc_bs->buffer[height] = {block, block_hash};
-                                        ltc_bs->last_drain_time =
-                                            std::chrono::steady_clock::now();
-
-                                        // Request initial window via broadcast (all peers)
-                                        // to guarantee responses. Targeted requests are
-                                        // used for window refill after drain starts.
-                                        int requested = 0;
-                                        while (ltc_bs->next_request <= ltc_bs->end_height &&
-                                               (ltc_bs->next_request - ltc_bs->next_height)
-                                                   < ltc_bs->WINDOW_SIZE) {
-                                            if (!ltc_bs->buffer.count(ltc_bs->next_request)) {
-                                                auto e = chain->get_header_by_height(
-                                                    ltc_bs->next_request);
-                                                if (e) {
-                                                    bcaster->request_full_block(
-                                                        e->block_hash);
-                                                    ++requested;
-                                                }
-                                            }
-                                            ++ltc_bs->next_request;
-                                        }
-                                        LOG_INFO << "[EMB-LTC] Bootstrap pipeline: "
-                                                 << ltc_bs->total << " blocks ["
-                                                 << start_from << ".." << height << "]"
-                                                 << " window=" << ltc_bs->WINDOW_SIZE
-                                                 << " requests=" << requested
-                                                 << " peers=" << bcaster->peer_count();
-                                        // Timer-based stall detection
-                                        ltc_bs->start_stall_timer(ioc,
-                                            [chain, bcaster](uint32_t h) {
-                                                auto e = chain->get_header_by_height(h);
-                                                if (e && bcaster)
-                                                    bcaster->request_full_block(e->block_hash);
-                                            }, "EMB-LTC");
-                                        return;
-                                    } else {
-                                        LOG_INFO << "[EMB-LTC] UTXO warm restart: best="
-                                                 << utxo_best << " — no bootstrap needed";
-                                    }
-                                }
-
+                            if (utxo && utxo_db && !utxo_waits) {
                                 // 2. Bootstrap active: buffer → drain → refill window
                                 if (ltc_bs->active) {
+                                    const bool cold_start =
+                                        ltc::coin::fill_ask(ltc_bs->phase) == ltc::coin::FillAsk::Download;
                                     // Only the best chain's block for a height is
                                     // buffered (a late copy from another branch would
                                     // otherwise be connected in its place). A block past
-                                    // the range extends it (mined meanwhile).
-                                    if (on_best_chain)
+                                    // the range extends it (mined meanwhile). The cold
+                                    // start keeps only its window, within the download's
+                                    // byte bound (a block further ahead is asked in order).
+                                    if (on_best_chain && cold_start) {
+                                        ltc::coin::ordered_buffer_bounded(*ltc_bs, *ltc_dl, height, block,
+                                                                          block_hash, estimate_block_bytes(block));
+                                    } else if (on_best_chain) {
                                         ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
+                                    }
                                     // The tip's block arriving mid-fill: its MWEB state
                                     // and mempool cleanup do not depend on the UTXO set,
                                     // so a stalled fill does not hold templates on stale
@@ -3087,7 +3107,9 @@ int main(int argc, char* argv[]) {
                                         }
                                     }
 
-                                    // Stall detection: re-request from all peers if stuck
+                                    // Stall detection: the cold start asks another peer
+                                    // (every peer on the third stall of a height), the
+                                    // other fills every peer.
                                     auto now = std::chrono::steady_clock::now();
                                     auto stall = std::chrono::duration_cast<
                                         std::chrono::seconds>(
@@ -3098,8 +3120,8 @@ int main(int argc, char* argv[]) {
                                         if (e) {
                                             LOG_WARNING << "[EMB-LTC] " << ltc_bs->phase << " stall h="
                                                 << ltc_bs->next_height << " (" << stall
-                                                << "s) — broadcast fallback";
-                                            bcaster->request_full_block(e->block_hash);
+                                                << (cold_start ? "s)" : "s) — broadcast fallback");
+                                            (*ltc_stall_request)(ltc_bs->next_height);
                                         }
                                         ltc_bs->last_drain_time = now;
                                     }
@@ -3181,9 +3203,14 @@ int main(int argc, char* argv[]) {
                                         } else if (ltc::coin::ordered_recover(*ltc_bs, drained.refused,
                                                                               recover_base,
                                                                               chain->height())) {
-                                            ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
-                                                fill_request(rh, false);
-                                            });
+                                            ltc_dl->reset();
+                                            if (cold_start) {
+                                                ltc_dl->refill(*ltc_bs);
+                                            } else {
+                                                ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
+                                                    fill_request(rh, false);
+                                                });
+                                            }
                                         } else {
                                             ltc_bs->stop_stall_timer();
                                             *utxo_jump_from = 0;
@@ -3192,6 +3219,8 @@ int main(int argc, char* argv[]) {
                                                       << ltc::coin::connect_check_name(drained.refused) << ")";
                                         }
                                     }
+                                    if (cold_start && drained.connected > 0)
+                                        ltc_dl->drained(drained.connected);
                                     // Fees and inputs once per drain, as the normal path does.
                                     if (drained.connected > 0 && pool && utxo) {
                                         int resolved = pool->recompute_unknown_fees(utxo);
@@ -3210,24 +3239,24 @@ int main(int argc, char* argv[]) {
                                                  << " buf=" << ltc_bs->buffer.size();
                                     }
 
-                                    // Refill sliding window: broadcast for the cold
-                                    // start, one peer at a time for gap / reorg fills.
+                                    // Refill sliding window: the cold start's download
+                                    // (one peer per height), one peer at a time for gap /
+                                    // reorg fills.
                                     if (chain && bcaster && ltc_bs->active) {
-                                        const bool cold_start = ltc_bs->phase == "Bootstrap";
-                                        ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
-                                            if (cold_start) {
-                                                auto e = chain->get_header_by_height(rh);
-                                                if (e)
-                                                    bcaster->request_full_block(e->block_hash);
-                                            } else {
+                                        if (ltc::coin::fill_ask(ltc_bs->phase) == ltc::coin::FillAsk::Download) {
+                                            ltc_dl->refill(*ltc_bs);
+                                        } else {
+                                            ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
                                                 fill_request(rh, false);
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
 
                                     if (ltc_bs->active && ltc::coin::ordered_done(*ltc_bs)) {
                                         ltc_bs->active = false;
                                         ltc_bs->stop_stall_timer();
+                                        ltc_bs->window = ltc_bs->WINDOW_SIZE;
+                                        ltc_dl->reset();
                                         LOG_INFO << "[EMB-LTC] " << ltc_bs->phase << " complete: "
                                                  << ltc_bs->processed << " blocks";
                                         // The drain fed MWEB state up to the tip: end
@@ -3264,7 +3293,7 @@ int main(int argc, char* argv[]) {
                                 return;
                             }
 
-                            if (utxo && utxo_db) {
+                            if (utxo && utxo_db && !utxo_waits) {
                                 // 3. Normal processing (after bootstrap or warm restart):
                                 // strictly in order. connect_block has no continuity
                                 // check, so a block is connected only as best + 1; one
@@ -3293,6 +3322,7 @@ int main(int argc, char* argv[]) {
                                     }
                                     ltc::coin::ordered_arm(*ltc_bs, utxo_best + 1, height);
                                     ltc_bs->phase = "UTXO gap fill";
+                                    ltc_bs->window = ltc_bs->WINDOW_SIZE;
                                     *utxo_jump_from = 0;
                                     ltc::coin::ordered_buffer(*ltc_bs, height, block, block_hash);
                                     ltc::coin::ordered_refill(*ltc_bs, [&](uint32_t rh) {
@@ -3442,7 +3472,7 @@ int main(int argc, char* argv[]) {
                         const auto step_now = std::chrono::steady_clock::now();
                         // Keep the UTXO set chasing its next block even when the
                         // tip fetch has moved on: after a second of lag, ask for
-                        // utxo_best + 1 (one peer twice, then every peer), every 2 s.
+                        // utxo_best + 1 (one peer three times, then every peer), every 2 s.
                         if (utxo) {
                             const uint32_t best = utxo->get_best_height();
                             if (best > 0 && best + 1 < tip->height) {
@@ -3451,10 +3481,12 @@ int main(int argc, char* argv[]) {
                                 } else if (step_now - utxo_catchup->since >= std::chrono::seconds(1)
                                            && step_now - utxo_catchup->last >= std::chrono::seconds(2)) {
                                     if (auto e = chain->get_header_by_height(best + 1)) {
-                                        const bool all = utxo_catchup->tries >= 2;
+                                        const bool all = utxo_catchup->tries >= 3;
                                         if (all || !bcaster->request_full_block_targeted(
                                                        e->block_hash, (*mweb_fetch_rr)++))
-                                            bcaster->request_full_block(e->block_hash);
+                                            bcaster->request_full_block_peers(
+                                                e->block_hash,
+                                                core::coin::block_request_services(tip->height, best + 1));
                                         LOG_INFO << "[EMB-LTC] UTXO behind the tip (h=" << best
                                                  << ", tip h=" << tip->height << ") — requesting h="
                                                  << best + 1 << (all ? " from all peers" : "");
@@ -3598,11 +3630,16 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         // Fetch the new tip's full block for MWEB state + mempool
-                        // cleanup: once (retry driver, attempt 0 now). During the
-                        // initial header sync and while the bootstrap pipeline
-                        // runs (a new tip extends its range), or with the retry
-                        // off, from every peer as before.
-                        if (ltc_mweb_fetch_retry && steady) {
+                        // cleanup: once (retry driver, attempt 0 now). Nothing
+                        // during the initial header sync (no body is of use before
+                        // the cold start, which waits for the synced chain) nor
+                        // while the cold start runs (its download takes the new tip
+                        // in order: the 1-s tick extends its range). During a gap /
+                        // reorg fill (a new tip extends its range), or with the
+                        // retry off, from every peer as before.
+                        const bool cold_start_runs = ltc_bs->active && ltc_bs->phase == "Bootstrap";
+                        if (!chain->is_synced() || cold_start_runs) {
+                        } else if (ltc_mweb_fetch_retry && steady) {
                             (*mweb_fetch_step)();
                         } else if (bcaster) {
                             bcaster->request_full_block(new_tip);
@@ -3616,22 +3653,22 @@ int main(int argc, char* argv[]) {
                     });
                 LOG_INFO << "[EMB-LTC] Chain reorg handler registered";
 
-                // Periodic fallback: re-request headers every 60s even if no batch arrived.
+                // Periodic getheaders (HeaderSync::poll), also when no batch arrived.
                 // Uses shared_ptr self-capture so the lambda stays alive for the run duration.
                 auto sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                 auto sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
-                *sync_fn = [sync_fn, sync_timer, now_ms, hb_ltc_sync,
+                *sync_fn = [sync_fn, sync_timer, now_ms, hb_ltc_sync, ltc_hdr_sync,
                             chain   = embedded_chain.get(),
                             bcaster = embedded_broadcaster.get()](boost::system::error_code ec) {
                     if (ec) return; // cancelled (ioc stopped)
                     hb_ltc_sync->store(now_ms());
-                    sync_timer->expires_after(std::chrono::seconds(60));
+                    sync_timer->expires_after(ltc_hdr_sync->poll_interval());
                     sync_timer->async_wait(*sync_fn);
                     try {
                         LOG_DEBUG_COIND << "[EMB-LTC] Periodic header sync: height=" << chain->height()
                                   << " synced=" << chain->is_synced()
                                   << " peers=" << bcaster->connected_count();
-                        bcaster->request_headers(chain->get_locator(), uint256::ZERO);
+                        ltc_hdr_sync->poll();
                     } catch (const std::exception& e) {
                         LOG_WARNING << "[EMB-LTC] Header sync error: " << e.what();
                     }
@@ -3642,6 +3679,101 @@ int main(int argc, char* argv[]) {
                 sync_timer->expires_after(std::chrono::seconds(3));
                 sync_timer->async_wait(*sync_fn);
                 LOG_INFO << "Embedded header sync timer started (60s interval)";
+
+                // Cold start (1 s tick): once the header chain is synced, decide
+                // it (utxo_order.hpp cold_start_plan: the tip's last
+                // score_backlog heights, a warm restart's catch-up, or none);
+                // while it runs, take new tips into its range, arm it again
+                // when it falls more than score_backlog + its window behind the
+                // tip, and keep its download moving (request timeouts, the
+                // stalling peer).
+                {
+                    auto cold_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto cold_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                    *cold_fn = [cold_fn, cold_timer, ltc_bs, ltc_dl, ltc_cold_decided, ltc_cold_blocks,
+                                ltc_synced_since, ltc_stall_request, utxo_jump_from,
+                                chain = embedded_chain.get(), bcaster = embedded_broadcaster.get(),
+                                utxo = ltc_utxo_cache.get(), utxo_db = ltc_utxo_db.get(),
+                                pool = embedded_pool.get(), &ioc](boost::system::error_code ec) {
+                        if (ec) return; // cancelled (ioc stopped)
+                        cold_timer->expires_after(std::chrono::seconds(1));
+                        cold_timer->async_wait(*cold_fn);
+                        try {
+                            if (!chain || !bcaster || !utxo || !utxo_db)
+                                return;
+                            auto arm = [&](uint32_t from, uint32_t to, uint32_t jump_from) {
+                                ltc::coin::cold_start_arm(*ltc_bs, from, to);
+                                *utxo_jump_from = jump_from;
+                                ltc_dl->reset();
+                                const uint32_t asked = ltc_dl->refill(*ltc_bs);
+                                LOG_INFO << "[EMB-LTC] Bootstrap pipeline: " << ltc_bs->total << " blocks ["
+                                         << from << ".." << to << "] window=" << ltc_bs->window
+                                         << " requests=" << asked << " peers=" << bcaster->peer_count()
+                                         << " (one peer per block)";
+                                ltc_bs->start_stall_timer(ioc,
+                                    [ltc_stall_request](uint32_t h) { (*ltc_stall_request)(h); }, "EMB-LTC");
+                            };
+                            if (!*ltc_cold_decided) {
+                                // Synced and caught up (cold_start_ready).
+                                const auto now = std::chrono::steady_clock::now();
+                                if (!chain->is_synced()) {
+                                    *ltc_synced_since = {};
+                                    return;
+                                }
+                                if (*ltc_synced_since == std::chrono::steady_clock::time_point{})
+                                    *ltc_synced_since = now;
+                                const auto tip_e = chain->tip();
+                                const int64_t tip_age = tip_e
+                                    ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
+                                const int64_t synced_for = std::chrono::duration_cast<std::chrono::seconds>(
+                                    now - *ltc_synced_since).count();
+                                if (!ltc::coin::cold_start_ready(true, tip_age, synced_for))
+                                    return;
+                                *ltc_cold_decided = true;
+                                if (ltc_bs->active) {
+                                    LOG_INFO << "[EMB-LTC] UTXO " << ltc_bs->phase << " running at h="
+                                             << ltc_bs->next_height << " — no cold start";
+                                    return;
+                                }
+                                const uint32_t best = utxo->get_best_height();
+                                const auto plan = ltc::coin::cold_start_plan(
+                                    ltc_cold_blocks, true, chain->height(), best);
+                                if (plan.action != ltc::coin::ColdStart::Action::Arm) {
+                                    LOG_INFO << "[EMB-LTC] UTXO warm restart: best=" << best
+                                             << " — no bootstrap needed";
+                                    return;
+                                }
+                                arm(plan.from, plan.to, plan.jump_from);
+                                return;
+                            }
+                            if (!ltc_bs->active || ltc_bs->phase != "Bootstrap")
+                                return;
+                            const uint32_t tip = chain->height();
+                            if (auto r = ltc::coin::cold_start_rearm(*ltc_bs, tip, ltc_cold_blocks)) {
+                                LOG_WARNING << "[EMB-LTC] Bootstrap at h=" << ltc_bs->next_height << " is "
+                                            << tip - ltc_bs->next_height << " blocks behind the tip h=" << tip
+                                            << ": arming it again at [" << r->first << ".." << r->second << "]";
+                                if (!utxo->get_best_block().IsNull()) {
+                                    if (!utxo->reanchor()) {
+                                        LOG_ERROR << "[EMB-LTC] UTXO wipe for the Bootstrap failed; set left at h="
+                                                  << utxo->get_best_height();
+                                        return;
+                                    }
+                                    if (pool)
+                                        pool->requarantine_all();
+                                }
+                                arm(r->first, r->second, 0);
+                                return;
+                            }
+                            ltc::coin::ordered_extend(*ltc_bs, tip);
+                            ltc_dl->tick(*ltc_bs);
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-LTC] Cold start tick error: " << e.what();
+                        }
+                    };
+                    cold_timer->expires_after(std::chrono::seconds(1));
+                    cold_timer->async_wait(*cold_fn);
+                }
 
                 // MWEB fetch retry driver: 250 ms tick (same shared_ptr pattern).
                 if (ltc_mweb_fetch_retry) {
@@ -6760,6 +6892,14 @@ int main(int argc, char* argv[]) {
                             if (cfg.symbol == "DOGE" && doge_chain) {
                                 auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
                                 auto* bcaster_ptr = broadcaster.get();
+                                // The peer whose headers batch the header thread is
+                                // adding: a tip change it fires asks that peer for the
+                                // tip's body first.
+                                struct DogeHdrFrom {
+                                    std::mutex mu;
+                                    std::string peer;
+                                };
+                                auto doge_hdr_from = std::make_shared<DogeHdrFrom>();
 
                                 // Wire peer tip height for fast-sync scrypt skip
                                 broadcaster->set_on_peer_height(
@@ -6787,75 +6927,90 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "DOGE mempool wired via P2P broadcaster";
                                 }
 
+                                // Header sync (ltc/coin/header_sync.hpp, as the LTC one): one
+                                // sync peer, no re-ask on a batch with nothing new, a known or
+                                // queued batch dropped before the header thread, that queue
+                                // bounded. Before, every batch with new headers and every full
+                                // one asked every peer, and the 5-s poll too: 3.1 GB of AuxPoW
+                                // headers in 17 minutes on a fresh node, the link's whole share.
+                                std::shared_ptr<ltc::coin::HeaderSync> doge_hdr_sync;
+                                {
+                                    ltc::coin::HeaderSyncHost hs;
+                                    auto* dc = doge_chain.get();
+                                    hs.has_header = [dc](const uint256& h) { return dc->has_header(h); };
+                                    hs.add_headers = [dc](const std::vector<ltc::coin::BlockHeaderType>& batch) {
+                                        int accepted = dc->add_headers(batch);
+                                        if (accepted > 0)
+                                            LOG_INFO << "[EMB-DOGE] add_headers: " << accepted << "/" << batch.size()
+                                                     << " accepted, chain height=" << dc->height();
+                                        return accepted;
+                                    };
+                                    hs.adding_from = [doge_hdr_from](const std::string& peer) {
+                                        std::lock_guard<std::mutex> lock(doge_hdr_from->mu);
+                                        doge_hdr_from->peer = peer;
+                                    };
+                                    hs.post_worker = [doge_hdr_pool](std::function<void()> fn) {
+                                        boost::asio::post(*doge_hdr_pool, std::move(fn));
+                                    };
+                                    hs.post_io = [&ioc](std::function<void()> fn) {
+                                        boost::asio::post(ioc, [fn = std::move(fn)]() {
+                                            try {
+                                                fn();
+                                            } catch (const std::exception& e) {
+                                                LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
+                                            }
+                                        });
+                                    };
+                                    hs.locator = [dc]() { return dc->get_locator(); };
+                                    hs.synced = [dc]() { return dc->is_synced(); };
+                                    hs.height = [dc]() { return dc->height(); };
+                                    hs.ask_one = [bcaster_ptr](const std::vector<uint256>& locator, size_t rr,
+                                                               const std::string& peer) {
+                                        return bcaster_ptr->request_headers_targeted(locator, uint256::ZERO, rr, peer);
+                                    };
+                                    hs.ask_all = [bcaster_ptr](const std::vector<uint256>& locator) {
+                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                    };
+                                    doge_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs), "[EMB-DOGE]");
+                                }
+                                // A block announcement (DOGE peers get no sendheaders and
+                                // announce by inv): ask the announcer for headers at once
+                                // (HeaderSync::on_block_announced: Core's getheaders to the
+                                // announcing peer, none while one to it is unanswered).
+                                // Before, the DOGE tip moved only on the poll, 0-60 s after
+                                // the block; the batch's peer is then the announcer the tip
+                                // body is asked of first (adding_from).
+                                broadcaster->set_on_new_block(
+                                    [doge_hdr_sync](const std::string& peer, const uint256& hash) {
+                                        doge_hdr_sync->on_block_announced(peer, hash);
+                                    });
+                                // No BIP 130 body getdata on each small headers answer (as
+                                // LTC with its fetch retry): the tip body is asked of its
+                                // announcer by the tip handler and chased by the cold-start
+                                // tick until it is in; with every announcer asked for headers,
+                                // this path fetched each DOGE tip body ~15 more times.
+                                broadcaster->set_fetch_announced_blocks(false);
                                 // Wire headers: parse AuxPoW extended format → base headers → HeaderChain
                                 broadcaster->set_on_new_headers(
-                                    [dc = doge_chain.get(), doge_hdr_pool, bcaster_ptr, &ioc](
-                                        const std::string& /*key*/,
-                                        const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
-                                        // The broadcaster's on_new_headers gives us raw BlockHeaderType
-                                        // from the standard parser. For DOGE AuxPoW, the P2P message
-                                        // handler in NodeP2P already parses the headers using the
-                                        // standard 80+1 byte format. AuxPoW blocks have the AuxPoW
-                                        // data INSIDE the block, not the header in 'headers' message.
-                                        //
-                                        // NOTE: Dogecoin's P2P 'headers' message DOES include AuxPoW
-                                        // data. However, our NodeP2P handler parses each header as
-                                        // 80 bytes + tx_count. If the DOGE peer sends AuxPoW headers,
-                                        // the parser will fail on the variable-length data.
-                                        //
-                                        // For testnet4alpha (all AuxPoW from genesis), we may need
-                                        // the dedicated AuxPoW parser. For now, pass through directly
-                                        // and handle parse errors gracefully.
+                                    [doge_hdr_sync](const std::string& key,
+                                                    const std::vector<ltc::coin::BlockHeaderType>& hdrs) {
                                         LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
                                                  << " headers from P2P";
-                                        auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
-                                        boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc]() {
-                                                int accepted = dc->add_headers(*batch);
-                                                if (accepted > 0)
-                                                    LOG_INFO << "[EMB-DOGE] add_headers: "
-                                                             << accepted << "/" << batch->size()
-                                                             << " accepted, chain height="
-                                                             << dc->height();
-
-                                                // Pipeline: immediate follow-up getheaders for fast sync
-                                                uint256 last_hash;
-                                                if (!batch->empty()) {
-                                                    auto packed = pack(batch->back());
-                                                    last_hash = Hash(packed.get_span());
-                                                }
-                                                bool full_batch = (batch->size() >= 2000);
-                                                if (accepted > 0 || full_batch) {
-                                                    boost::asio::post(ioc, [accepted, last_hash, dc, bcaster_ptr]() {
-                                                      try {
-                                                        if (accepted > 0 && !last_hash.IsNull()) {
-                                                            bcaster_ptr->request_headers({last_hash}, uint256::ZERO);
-                                                        } else {
-                                                            bcaster_ptr->request_headers(dc->get_locator(), uint256::ZERO);
-                                                        }
-                                                      } catch (const std::exception& e) {
-                                                        LOG_WARNING << "[EMB-DOGE] Header post-process error: " << e.what();
-                                                      }
-                                                    });
-                                                }
-                                            });
+                                        doge_hdr_sync->on_headers(key, hdrs);
                                     });
 
-                                // Periodic DOGE header sync (every 60s)
+                                // Periodic DOGE getheaders (HeaderSync::poll: one peer; every
+                                // 10 s while catching up, a minute once synced).
                                 auto doge_sync_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
                                 auto doge_sync_timer = std::make_shared<boost::asio::steady_timer>(ioc);
                                 *doge_sync_fn = [doge_sync_fn, doge_sync_timer, now_ms, hb_doge_sync,
-                                                 dc = doge_chain.get(),
-                                                 bcaster_ptr](boost::system::error_code ec) {
+                                                 doge_hdr_sync](boost::system::error_code ec) {
                                     if (ec) return;
                                     hb_doge_sync->store(now_ms());
-                                    // Fast poll during sync (5s), slow when caught up (60s)
-                                    int interval = dc->is_synced() ? 60 : 5;
-                                    doge_sync_timer->expires_after(std::chrono::seconds(interval));
+                                    doge_sync_timer->expires_after(doge_hdr_sync->poll_interval());
                                     doge_sync_timer->async_wait(*doge_sync_fn);
                                     try {
-                                        auto locator = dc->get_locator();
-                                        bcaster_ptr->request_headers(locator, uint256::ZERO);
+                                        doge_hdr_sync->poll();
                                     } catch (const std::exception& e) {
                                         LOG_WARNING << "[EMB-DOGE] Header sync error: " << e.what();
                                     }
@@ -6866,10 +7021,94 @@ int main(int argc, char* argv[]) {
                                 LOG_INFO << "DOGE embedded header sync wired via P2P";
 
                                 // Wire full-block handler: UTXO bootstrap + mempool cleanup.
-                                // Same bootstrap pipeline as LTC — see EMB-LTC handler.
-                                {
+                                // Same ordered pipeline as LTC — see the EMB-LTC handler.
+                                // The cold start is decided by the 1-s tick below once the
+                                // DOGE header chain is synced (cold_start_plan: the tip's
+                                // last 1,441 heights); its heights go to one peer each
+                                // (core::coin::BlockDownload). Until then the UTXO set
+                                // takes no block.
                                 auto doge_bs = std::make_shared<
                                     core::coin::BlockBootstrapState<ltc::coin::BlockType>>();
+                                std::shared_ptr<core::coin::BlockDownload> doge_dl;
+                                {
+                                    core::coin::BlockDownload::Host dh;
+                                    auto* chain = doge_chain.get();
+                                    auto* bc = broadcaster.get();
+                                    dh.peers = [bc]() {
+                                        constexpr uint64_t NODE_NETWORK = 1;
+                                        auto p = bc->ready_peers(NODE_NETWORK);
+                                        return p.empty() ? bc->ready_peers(0) : p;
+                                    };
+                                    dh.request_from = [chain, bc](const std::string& p, uint32_t h) {
+                                        auto e = chain->get_header_by_height(h);
+                                        return e && bc->request_full_block_from(p, e->block_hash);
+                                    };
+                                    dh.request_all = [chain, bc](uint32_t h) {
+                                        if (auto e = chain->get_header_by_height(h))
+                                            bc->request_full_block_peers(
+                                                e->block_hash, core::coin::block_request_services(chain->height(), h));
+                                    };
+                                    doge_dl = std::make_shared<core::coin::BlockDownload>(
+                                        std::move(dh), "[EMB-DOGE] Bootstrap:");
+                                }
+                                // The cold start's 1-s tick (ltc/coin/cold_start_tick.hpp).
+                                std::shared_ptr<ltc::coin::AccrualColdStart<ltc::coin::BlockType>> doge_cold;
+                                {
+                                    ltc::coin::ColdStartTickHost ch;
+                                    auto* chain = doge_chain.get();
+                                    auto* bc = broadcaster.get();
+                                    auto* utxo = doge_utxo_cache.get();
+                                    auto* pool = doge_pool.get();
+                                    ch.synced = [chain]() { return chain->is_synced(); };
+                                    ch.tip_age_s = [chain]() -> int64_t {
+                                        const auto tip_e = chain->tip();
+                                        return tip_e ? int64_t(std::time(nullptr)) - int64_t(tip_e->header.m_timestamp) : 0;
+                                    };
+                                    ch.tip = [chain]() { return chain->height(); };
+                                    ch.utxo_best = [utxo]() { return utxo ? utxo->get_best_height() : 0u; };
+                                    ch.utxo_empty = [utxo]() { return !utxo || utxo->get_best_block().IsNull(); };
+                                    ch.wipe = [utxo, pool]() {
+                                        if (!utxo || !utxo->reanchor()) {
+                                            LOG_ERROR << "[EMB-DOGE] UTXO wipe for the Bootstrap failed; set left at h="
+                                                      << (utxo ? utxo->get_best_height() : 0);
+                                            return false;
+                                        }
+                                        if (pool)
+                                            pool->requarantine_all();
+                                        return true;
+                                    };
+                                    ch.armed = [doge_bs, doge_dl, bc, &ioc](uint32_t from, uint32_t to, uint32_t asked) {
+                                        LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: " << doge_bs->total
+                                                 << " blocks [" << from << ".." << to << "] window="
+                                                 << doge_bs->window << " requests=" << asked
+                                                 << " peers=" << bc->peer_count() << " (one peer per block)";
+                                        doge_bs->start_stall_timer(ioc,
+                                            [doge_bs, doge_dl](uint32_t h) { doge_dl->on_fill_stall(*doge_bs, h); },
+                                            "EMB-DOGE");
+                                    };
+                                    // The chase of the set's next block: one peer
+                                    // (NODE_NETWORK first) round robin, else every peer.
+                                    ch.ask_one = [chain, bc, rr = std::make_shared<size_t>(0)](uint32_t h) {
+                                        auto e = chain->get_header_by_height(h);
+                                        if (!e)
+                                            return true;  // no block there (yet): nothing to ask
+                                        constexpr uint64_t NODE_NETWORK = 1;
+                                        auto peers = bc->ready_peers(NODE_NETWORK);
+                                        if (peers.empty())
+                                            peers = bc->ready_peers(0);
+                                        if (peers.empty())
+                                            return false;
+                                        return bc->request_full_block_from(peers[(*rr)++ % peers.size()], e->block_hash);
+                                    };
+                                    ch.ask_all = [chain, bc](uint32_t h) {
+                                        if (auto e = chain->get_header_by_height(h))
+                                            bc->request_full_block_peers(
+                                                e->block_hash, core::coin::block_request_services(chain->height(), h));
+                                    };
+                                    doge_cold = std::make_shared<ltc::coin::AccrualColdStart<ltc::coin::BlockType>>(
+                                        *doge_bs, *doge_dl, core::coin::DOGE_MIN_BLOCKS_TO_KEEP + 1, std::move(ch));
+                                }
+                                {
                                 broadcaster->set_on_full_block(
                                     [pool = doge_pool.get(),
                                      chain = doge_chain.get(),
@@ -6879,7 +7118,7 @@ int main(int argc, char* argv[]) {
                                      coinbase_maturity = core::coin::DOGE_LIMITS.coinbase_maturity,
                                      explorer_enabled, explorer_depth_doge,
                                      mm_ptr = mm_manager.get(),
-                                     doge_bs, &ioc, &web_server](
+                                     doge_bs, doge_dl, doge_cold, &ioc, &web_server](
                                         const std::string& peer,
                                         const ltc::coin::BlockType& block) {
                                         auto packed_hdr = pack(static_cast<const ltc::coin::BlockHeaderType&>(block));
@@ -6895,95 +7134,36 @@ int main(int argc, char* argv[]) {
                                             return ltc::coin::compute_txid(tx);
                                         };
                                         static bool doge_mempool_requested = false;
-                                        static bool doge_bootstrap_done = false;
                                         constexpr uint32_t DOGE_KEEP = core::coin::DOGE_MIN_BLOCKS_TO_KEEP;
+                                        if (height > 0)
+                                            doge_dl->delivered(height, peer);
+                                        // The cold start waits for the synced header chain.
+                                        const bool utxo_waits = !doge_cold->decided() && !doge_bs->active;
 
                                         // ═══ BOOTSTRAP PIPELINE (same as LTC) ═════════
-                                        if (utxo && utxo_db) {
-                                            // 1. Bootstrap trigger
-                                            if (!doge_bootstrap_done && !doge_bs->active &&
-                                                chain && bcaster_ptr && height > DOGE_KEEP) {
-                                                doge_bootstrap_done = true;
-                                                uint32_t utxo_best = utxo->get_best_height();
-                                                uint32_t start_from =
-                                                    (utxo_best > 0 && utxo_best >= height - DOGE_KEEP)
-                                                    ? utxo_best + 1 : height - DOGE_KEEP;
-
-                                                if (start_from < height) {
-                                                    doge_bs->active = true;
-                                                    doge_bs->next_height = start_from;
-                                                    doge_bs->end_height = height;
-                                                    doge_bs->next_request = start_from;
-                                                    doge_bs->total = height - start_from + 1;
-                                                    doge_bs->buffer[height] = {block, block_hash};
-                                                    doge_bs->last_drain_time =
-                                                        std::chrono::steady_clock::now();
-
-                                                    int requested = 0;
-                                                    while (doge_bs->next_request <= doge_bs->end_height &&
-                                                           (doge_bs->next_request - doge_bs->next_height)
-                                                               < doge_bs->WINDOW_SIZE) {
-                                                        if (!doge_bs->buffer.count(doge_bs->next_request)) {
-                                                            auto e = chain->get_header_by_height(
-                                                                doge_bs->next_request);
-                                                            if (e) {
-                                                                bcaster_ptr->request_full_block(
-                                                                    e->block_hash);
-                                                                ++requested;
-                                                            }
-                                                        }
-                                                        ++doge_bs->next_request;
-                                                    }
-                                                    LOG_INFO << "[EMB-DOGE] Bootstrap pipeline: "
-                                                             << doge_bs->total << " blocks ["
-                                                             << start_from << ".." << height << "]"
-                                                             << " window=" << doge_bs->WINDOW_SIZE
-                                                             << " requests=" << requested
-                                                             << " peers=" << bcaster_ptr->peer_count();
-                                                    doge_bs->start_stall_timer(ioc,
-                                                        [chain, bcaster_ptr](uint32_t h) {
-                                                            auto e = chain->get_header_by_height(h);
-                                                            if (e && bcaster_ptr)
-                                                                bcaster_ptr->request_full_block(e->block_hash);
-                                                        }, "EMB-DOGE");
-                                                    return;
-                                                } else {
-                                                    LOG_INFO << "[EMB-DOGE] UTXO warm restart: best="
-                                                             << utxo_best << " — no bootstrap needed";
-                                                }
-                                            }
-
-                                            // 2. Bootstrap active: buffer → drain → refill
+                                        if (utxo && utxo_db && !utxo_waits) {
+                                            // 2. Bootstrap active: buffer → drain → refill.
+                                            // Only the window is kept, within the download's
+                                            // byte bound; a body further ahead extends the
+                                            // range and is asked in order.
                                             if (doge_bs->active) {
-                                                if (height >= doge_bs->next_height &&
-                                                    height <= doge_bs->end_height) {
-                                                    doge_bs->buffer.try_emplace(
-                                                        height, std::make_pair(block, block_hash));
-                                                } else if (height > doge_bs->end_height) {
-                                                    doge_bs->end_height = height;
-                                                    doge_bs->total = doge_bs->processed
-                                                        + (doge_bs->end_height - doge_bs->next_height + 1);
-                                                    doge_bs->buffer.try_emplace(
-                                                        height, std::make_pair(block, block_hash));
-                                                }
+                                                if (height >= doge_bs->next_height)
+                                                    ltc::coin::ordered_buffer_bounded(*doge_bs, *doge_dl, height, block,
+                                                                                      block_hash, estimate_block_bytes(block));
 
                                                 auto now = std::chrono::steady_clock::now();
                                                 auto stall = std::chrono::duration_cast<
                                                     std::chrono::seconds>(
                                                     now - doge_bs->last_drain_time).count();
                                                 if (stall >= doge_bs->STALL_TIMEOUT_SEC && chain && bcaster_ptr) {
-                                                    auto e = chain->get_header_by_height(
-                                                        doge_bs->next_height);
-                                                    if (e) {
-                                                        LOG_WARNING << "[EMB-DOGE] Bootstrap stall h="
-                                                            << doge_bs->next_height << " (" << stall
-                                                            << "s) — broadcast fallback";
-                                                        bcaster_ptr->request_full_block(e->block_hash);
-                                                    }
+                                                    LOG_WARNING << "[EMB-DOGE] Bootstrap stall h="
+                                                        << doge_bs->next_height << " (" << stall << "s)";
+                                                    doge_dl->on_fill_stall(*doge_bs, doge_bs->next_height);
                                                     doge_bs->last_drain_time = now;
                                                 }
 
                                                 // Drain consecutive blocks
+                                                uint32_t doge_drained = 0;
                                                 while (doge_bs->buffer.count(doge_bs->next_height)) {
                                                     auto node =
                                                         doge_bs->buffer.extract(doge_bs->next_height);
@@ -7030,9 +7210,11 @@ int main(int argc, char* argv[]) {
 
                                                     ++doge_bs->next_height;
                                                     ++doge_bs->processed;
+                                                    ++doge_drained;
                                                     doge_bs->last_drain_time =
                                                         std::chrono::steady_clock::now();
                                                 }
+                                                doge_dl->drained(doge_drained);
 
                                                 static int dbs_log = 0;
                                                 if (++dbs_log % 50 == 0 ||
@@ -7043,33 +7225,33 @@ int main(int argc, char* argv[]) {
                                                              << " buf=" << doge_bs->buffer.size();
                                                 }
 
-                                                if (chain && bcaster_ptr) {
-                                                    while (doge_bs->next_request <= doge_bs->end_height
-                                                           && (doge_bs->next_request - doge_bs->next_height)
-                                                               < doge_bs->WINDOW_SIZE) {
-                                                        if (!doge_bs->buffer.count(
-                                                                doge_bs->next_request)) {
-                                                            auto e = chain->get_header_by_height(
-                                                                doge_bs->next_request);
-                                                            if (e)
-                                                                bcaster_ptr->request_full_block(
-                                                                    e->block_hash);
-                                                        }
-                                                        ++doge_bs->next_request;
-                                                    }
-                                                }
-
                                                 if (doge_bs->next_height > doge_bs->end_height) {
                                                     doge_bs->active = false;
                                                     doge_bs->stop_stall_timer();
+                                                    doge_bs->window = doge_bs->WINDOW_SIZE;
+                                                    doge_dl->reset();
                                                     LOG_INFO << "[EMB-DOGE] Bootstrap complete: "
                                                              << doge_bs->processed << " blocks";
+                                                    // The set reached the tip: price the pool
+                                                    // against it now, as the normal path does.
+                                                    if (pool) {
+                                                        int resolved = pool->recompute_unknown_fees(utxo);
+                                                        int evicted = pool->revalidate_inputs(utxo);
+                                                        if (resolved > 0 || evicted > 0)
+                                                            web_server.trigger_work_refresh_debounced();
+                                                    }
+                                                } else if (chain && bcaster_ptr) {
+                                                    doge_dl->refill(*doge_bs);
                                                 }
                                                 return;
                                             }
 
-                                            // 3. Normal processing
-                                            if (height > utxo->get_best_height()) {
+                                            // 3. Normal processing: only the set's next block is
+                                            // connected. A block further ahead waits: the cold
+                                            // start's tick chases best + 1 in order, so a missed
+                                            // body is fetched instead of left a hole under it.
+                                            if (ltc::coin::utxo_connect_action(utxo->get_best_height(), height)
+                                                == ltc::coin::UtxoConnect::Connect) {
                                                 auto undo = utxo->connect_block(
                                                     block, height, txid_fn, block_hash);
                                                 utxo_db->put_block_undo(height, undo);
@@ -7133,6 +7315,32 @@ int main(int argc, char* argv[]) {
                                     });
                                 } // doge_bs scope
 
+                                // DOGE cold start (1 s tick, ltc/coin/cold_start_tick.hpp), as the
+                                // LTC one: decided once the header chain is synced and caught up
+                                // (the tip's last 1,441 heights, a warm restart's catch-up, or
+                                // none); while it runs, new tips join its range, it is armed again
+                                // at the tip when it falls more than keep + its window behind, and
+                                // its download moves on (request timeouts, the stalling peer).
+                                {
+                                    auto cold_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                                    auto cold_timer = std::make_shared<boost::asio::steady_timer>(ioc);
+                                    *cold_fn = [cold_fn, cold_timer, doge_cold,
+                                                utxo = doge_utxo_cache.get(), utxo_db = doge_utxo_db.get()](
+                                                   boost::system::error_code ec) {
+                                        if (ec) return; // cancelled (ioc stopped)
+                                        cold_timer->expires_after(std::chrono::seconds(1));
+                                        cold_timer->async_wait(*cold_fn);
+                                        try {
+                                            if (utxo && utxo_db)
+                                                doge_cold->tick();
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-DOGE] Cold start tick error: " << e.what();
+                                        }
+                                    };
+                                    cold_timer->expires_after(std::chrono::seconds(1));
+                                    cold_timer->async_wait(*cold_fn);
+                                }
+
                                 // Tip-changed handler: trigger work refresh so stratum miners
                                 // get updated merged mining targets immediately.
                                 // Tip-changed handler.  Mirrors the LTC handler's structure:
@@ -7144,15 +7352,25 @@ int main(int argc, char* argv[]) {
                                 //      refresh chain killed the whole process on fresh installs).
                                 //   3. gate work refresh on merged-mining readiness so we don't
                                 //      fire thousands of no-op refreshes during header sync.
+                                auto doge_tip_rr = std::make_shared<size_t>(0);
                                 doge_chain->set_on_tip_changed(
                                     [bcaster_ptr, &web_server, &ioc,
                                      chain = doge_chain.get(),
                                      utxo = doge_utxo_cache.get(),
-                                     utxo_db = doge_utxo_db.get()](
+                                     utxo_db = doge_utxo_db.get(),
+                                     doge_bs, doge_hdr_from, doge_tip_rr](
                                         const uint256& old_tip, uint32_t old_height,
                                         const uint256& new_tip, uint32_t new_height) {
+                                        // Fires on the header thread, inside add_headers of
+                                        // the batch from this peer.
+                                        std::string announcer;
+                                        {
+                                            std::lock_guard<std::mutex> lock(doge_hdr_from->mu);
+                                            announcer = doge_hdr_from->peer;
+                                        }
                                         boost::asio::post(ioc,
                                             [bcaster_ptr, &web_server, chain, utxo, utxo_db,
+                                             doge_bs, doge_tip_rr, announcer,
                                              old_tip, old_height, new_tip, new_height]() {
                                       try {
                                         bool is_reorg = (new_height <= old_height);
@@ -7186,10 +7404,26 @@ int main(int argc, char* argv[]) {
                                             }
                                         }
 
-                                        // Request the new tip's full block for UTXO build + mempool cleanup.
-                                        // Always fires during sync — the block body drives UTXO construction.
-                                        if (bcaster_ptr)
-                                            bcaster_ptr->request_full_block(new_tip);
+                                        // The new tip's full block for the UTXO set + mempool
+                                        // cleanup (utxo_order.hpp ask_tip_body): nothing during
+                                        // the initial header sync nor while the cold start runs
+                                        // (its download takes the tip in order); else from the
+                                        // peer whose headers brought it, then one peer, then
+                                        // every peer.
+                                        if (bcaster_ptr) {
+                                            ltc::coin::ask_tip_body(
+                                                chain->is_synced(),
+                                                doge_bs->active && doge_bs->phase == "Bootstrap",
+                                                announcer,
+                                                [&](const std::string& p) {
+                                                    return bcaster_ptr->request_full_block_from(p, new_tip);
+                                                },
+                                                [&]() {
+                                                    return bcaster_ptr->request_full_block_targeted(
+                                                        new_tip, (*doge_tip_rr)++);
+                                                },
+                                                [&]() { bcaster_ptr->request_full_block(new_tip); });
+                                        }
 
                                         // Merged-mining readiness gate.  aux_chain_embedded's
                                         // get_work_template() would return empty AuxWork until
