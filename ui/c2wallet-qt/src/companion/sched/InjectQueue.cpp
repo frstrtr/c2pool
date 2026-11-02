@@ -268,6 +268,7 @@ std::string queue_to_json(const Queue& q)
 
     const ArmPolicyRecord& p = q.arm_policy;
     J ap = J::object();
+    ap["rev"] = p.rev;
     ap["auto_arm"] = p.auto_arm;
     ap["auto_disarm_when_idle"] = p.auto_disarm_when_idle;
     ap["consented_at"] = json::opt(p.consented_at);
@@ -310,6 +311,9 @@ std::string queue_to_json(const Queue& q)
     runner["tick_count"] = q.runner.tick_count;
     runner["last_tick_at"] = json::opt(q.runner.last_tick_at);
     runner["explorer_off"] = q.runner.explorer_off;
+    runner["enabled_seen_at"] = json::opt(q.runner.enabled_seen_at);
+    runner["enabled_seen_uptime"] = json::opt(q.runner.enabled_seen_uptime);
+    runner["chainlock_fork"] = q.runner.chainlock_fork;
     root["runner"] = std::move(runner);
 
     return json::dump(root);
@@ -506,6 +510,7 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
     }
     if (const J* a = rd.obj(root, "arm_policy", "queue")) {
         ArmPolicyRecord& p = q.arm_policy;
+        p.rev = rd.i64(*a, "rev", "queue.arm_policy");
         p.auto_arm = rd.boolean(*a, "auto_arm", "queue.arm_policy");
         p.auto_disarm_when_idle = rd.boolean(*a, "auto_disarm_when_idle", "queue.arm_policy");
         p.consented_at = rd.ostr(*a, "consented_at", "queue.arm_policy");
@@ -559,6 +564,9 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
         q.runner.tick_count = rd.i64(*r, "tick_count", "queue.runner");
         q.runner.last_tick_at = rd.ostr(*r, "last_tick_at", "queue.runner");
         q.runner.explorer_off = rd.boolean(*r, "explorer_off", "queue.runner");
+        q.runner.enabled_seen_at = rd.oi64(*r, "enabled_seen_at", "queue.runner");
+        q.runner.enabled_seen_uptime = rd.oi64(*r, "enabled_seen_uptime", "queue.runner");
+        q.runner.chainlock_fork = rd.boolean(*r, "chainlock_fork", "queue.runner");
     }
     if (!rd.ok()) {
         why = rd.err;

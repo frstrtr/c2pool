@@ -64,7 +64,9 @@ int main(int argc, char** argv)
     env.err = &std::cerr;
     env.clock = &clock;
     env.make_api = [](const std::string& url, std::string& why) -> std::unique_ptr<sched::NodeApi> {
-        return sched::QtNodeApi::create(url, why);
+        auto api = sched::QtNodeApi::create(url, why);
+        if (api) api->set_stop_check([] { return g_stop != 0; });
+        return api;
     };
     env.sleep_ms = [](int64_t ms) {
         while (ms > 0 && !g_stop) {

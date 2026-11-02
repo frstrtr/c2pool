@@ -765,9 +765,18 @@ int cmd_status(Ctx& c, const std::vector<std::string>& v)
               << " enabled=" << (st.enabled ? "true" : "false") << "; ";
             if (tip.known) o << "tip " << tip.height << " (synced)";
             else o << tip.why;
-            if (tip.chainlock.known) o << "; ChainLock " << tip.chainlock.height;
-            else if (tip.chainlock.exposed) o << "; ChainLock: " << tip.chainlock.why;
-            else o << "; ChainLock not exposed (parents need >= 2 confirmations)";
+            if (tip.chainlock.known) {
+                o << "; ChainLock " << tip.chainlock.height;
+                if (tip.chainlock.known_block && !*tip.chainlock.known_block) o << " (NOT on the node's header chain)";
+                else if (tip.chainlock.blockhash.empty()) o << " (adopted without a block hash)";
+            } else if (tip.chainlock.exposed) {
+                o << "; ChainLock: " << tip.chainlock.why;
+            } else {
+                o << "; ChainLock not exposed (parents need >= 2 confirmations)";
+            }
+            const UptimeInfo& up = view.uptime();
+            if (up.ok) o << "; up " << up.seconds << " s";
+            else o << "; " << up.why << " (any disarm counts as deliberate)";
             o << "\n";
             o << "pool    " << st.pool_entries << "/" << st.pool_max_entries << " entries, " << st.pool_bytes << "/"
               << st.pool_max_total_bytes << " B";

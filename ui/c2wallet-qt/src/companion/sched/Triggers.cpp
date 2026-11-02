@@ -110,10 +110,14 @@ Verdict evaluate(const Item& it, const ChainSnapshot& chain, int64_t now, const 
         }
         if (t.allow_unconfirmed_parent) {
             // Operator opt-in: the parent in the node mempool (or mined at any
-            // depth) is enough; neither N nor finality applies.
-            if (ps.mined || ps.in_mempool) continue;
-            unmet(name + " is " + state + " and not in the node mempool (allow_unconfirmed_parent needs it at least "
-                                          "in the mempool)");
+            // depth) is enough; neither N nor finality applies. A block that
+            // left the chain does not count: the parent must be back in the
+            // mempool or mined again.
+            const bool reorged = ps.mined && ps.block_still_at_height && !*ps.block_still_at_height;
+            if (ps.in_mempool || (ps.mined && !reorged)) continue;
+            unmet(name + (reorged ? " was mined but its block left the chain (" + ps.block_check_why + ")"
+                                  : " is " + state) +
+                  " and it is not in the node mempool (allow_unconfirmed_parent needs it at least in the mempool)");
             continue;
         }
         if (!ps.mined) {

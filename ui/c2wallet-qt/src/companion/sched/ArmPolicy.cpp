@@ -61,6 +61,7 @@ bool record_consent(ArmPolicyRecord& p, bool auto_arm, bool auto_disarm_when_idl
     }
     p.suspended_reason.reset();
     p.last_arm_attempt_at.reset();
+    ++p.rev; // an operator decision: the runner's merge takes it from the file
     return true;
 }
 

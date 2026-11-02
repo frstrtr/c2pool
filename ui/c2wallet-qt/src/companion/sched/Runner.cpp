@@ -3,8 +3,10 @@
 
 #include <cerrno>
 #include <cstring>
+#include <vector>
 
 #if !defined(_WIN32)
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -14,12 +16,6 @@
 namespace c2w::companion::sched {
 
 namespace {
-
-bool same_consent(const ArmPolicyRecord& a, const ArmPolicyRecord& b)
-{
-    return a.auto_arm == b.auto_arm && a.auto_disarm_when_idle == b.auto_disarm_when_idle &&
-           a.consented_at == b.consented_at && a.consent_text == b.consent_text;
-}
 
 bool file_exists(const std::string& path)
 {
@@ -83,6 +79,34 @@ bool runner_lock_held(const std::string& queue_path)
 #endif
 }
 
+int sweep_stale_temp_files(const std::string& queue_path)
+{
+#if defined(_WIN32)
+    (void)queue_path;
+    return 0;
+#else
+    const size_t slash = queue_path.rfind('/');
+    const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : queue_path.substr(0, slash));
+    const std::string prefix = (slash == std::string::npos ? queue_path : queue_path.substr(slash + 1)) + ".tmp.";
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return 0;
+    std::vector<std::string> stale;
+    while (const struct dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() <= prefix.size() || n.compare(0, prefix.size(), prefix) != 0) continue;
+        bool digits = true;
+        for (size_t i = prefix.size(); i < n.size(); ++i)
+            if (n[i] < '0' || n[i] > '9') digits = false;
+        if (digits) stale.push_back(dir + "/" + n);
+    }
+    ::closedir(d);
+    int removed = 0;
+    for (const std::string& f : stale)
+        if (::unlink(f.c_str()) == 0) ++removed;
+    return removed;
+#endif
+}
+
 Queue merge_runner_view(const Queue& mem, const Queue& disk)
 {
     Queue out = mem;
@@ -94,16 +118,14 @@ Queue merge_runner_view(const Queue& mem, const Queue& disk)
     out.defaults = disk.defaults;
     out.alerts_acked_at = disk.alerts_acked_at;
 
-    // Consent: the operator changed it (re-recorded, revoked, or cleared a
-    // suspension: record_consent resets suspended_reason and
-    // last_arm_attempt_at) -> the file wins for the policy; the runner keeps
-    // its own record of having armed the node.
-    const ArmPolicyRecord& m = mem.arm_policy;
-    const ArmPolicyRecord& d = disk.arm_policy;
-    const bool cleared_by_operator = m.suspended_reason && !d.suspended_reason && !d.last_arm_attempt_at;
-    if (!same_consent(m, d) || cleared_by_operator) {
-        const std::optional<std::string> armed = m.armed_by_scheduler_at;
-        out.arm_policy = d;
+    // Consent: an operator change (record_consent: record, revoke, or clear a
+    // suspension) bumps arm_policy.rev -> the file wins for the policy; the
+    // runner keeps its own record of having armed the node. Otherwise the
+    // runner's copy stands (it may have just set a suspension the file has
+    // not seen yet).
+    if (disk.arm_policy.rev > mem.arm_policy.rev) {
+        const std::optional<std::string> armed = mem.arm_policy.armed_by_scheduler_at;
+        out.arm_policy = disk.arm_policy;
         out.arm_policy.armed_by_scheduler_at = armed;
     }
 
@@ -127,6 +149,7 @@ bool load_or_create_queue(const std::string& path, Queue& out, bool& created, st
     if (!make_parent_dirs(path, why)) return false;
     QueueLock edit;
     if (!edit.acquire(path, /*blocking=*/true, why)) return false;
+    sweep_stale_temp_files(path);
     if (file_exists(path)) return load_queue_file(path, out, why);
     Queue q;
     if (init) init(q);
@@ -142,6 +165,7 @@ bool edit_queue_file(const std::string& path, const std::function<bool(Queue&, s
     if (create_if_missing && !make_parent_dirs(path, why)) return false;
     QueueLock lock;
     if (!lock.acquire(path, /*blocking=*/true, why)) return false;
+    sweep_stale_temp_files(path);
     Queue q;
     if (file_exists(path)) {
         if (!load_queue_file(path, q, why)) return false;

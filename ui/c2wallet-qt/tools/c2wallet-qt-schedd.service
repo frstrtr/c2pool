@@ -45,8 +45,6 @@
 
 [Unit]
 Description=c2wallet-qt inject scheduler (key-free; submits queued signed txs to the local c2pool node)
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -59,7 +57,9 @@ ExecStart=/usr/local/bin/c2wallet-qt-schedd \
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=2 3
-TimeoutStopSec=60
+# On SIGTERM the runner sends no new request and aborts an in-flight GET; an
+# in-flight POST finishes within its 15 s timeout, then the tick ends.
+TimeoutStopSec=90
 UMask=0077
 
 # Sandbox: loopback HTTP only, write access only to the queue directory.

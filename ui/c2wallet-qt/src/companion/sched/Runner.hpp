@@ -14,8 +14,8 @@
 //
 // Ownership, so neither side overwrites the other:
 //   * operator-owned: adding and removing items, every edit of an item (each
-//     bumps the item's rev), the arm-policy consent fields, node/defaults, and
-//     alerts_acked_at;
+//     bumps the item's rev), the arm policy when the operator changed it (its
+//     own rev), node/defaults, and alerts_acked_at;
 //   * runner-owned: the state machine of items whose rev it already holds,
 //     tracked parents, alerts and the runner record.
 // The runner re-reads the file at the start of every step and merges it into
@@ -61,6 +61,12 @@ bool load_or_create_queue(const std::string& path, Queue& out, bool& created, st
 // when it returns true. The edit's own refusal text comes back in `why`.
 bool edit_queue_file(const std::string& path, const std::function<bool(Queue&, std::string&)>& edit,
                      std::string& why, bool create_if_missing = true);
+
+// Remove queue.json.tmp.<pid> files left by a writer that died between its
+// write and its rename. Call only with the edit lock held (every writer holds
+// it for the whole write, so any temp file seen then is stale). Returns the
+// number removed. load_or_create_queue and edit_queue_file do it themselves.
+int sweep_stale_temp_files(const std::string& queue_path);
 
 // Is the file at `path` owned by another user? Editing it would leave a file
 // the runner (its owner) cannot read back after the atomic rename.

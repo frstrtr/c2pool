@@ -25,12 +25,19 @@
 // buffer is outside our reach, the same exposure class as the kernel's
 // loopback buffer, readable only by the token's owner or root.
 //
+// Shutdown: with a stop check installed (the daemon's SIGTERM flag), a request
+// is not started once a stop was requested (transport error "runner
+// stopping"), and an in-flight GET is aborted within 200 ms; an in-flight
+// POST (submit, config apply) is left to finish within its timeout, so a
+// stop never cuts a submit or a two-phase apply in half on our side.
+//
 // A QCoreApplication must exist in the process (the daemon's main creates
 // one). Not thread-safe: one instance per thread.
 
 #include "NodeApi.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -52,6 +59,8 @@ public:
     HttpReply post_json(const std::string& path, const std::string& body) override;
     const char* name() const override { return name_.c_str(); }
 
+    void set_stop_check(std::function<bool()> fn) { stop_check_ = std::move(fn); }
+
 private:
     QtNodeApi(std::string base, int timeout_ms);
     HttpReply request(bool post, const std::string& path, const std::string* body);
@@ -60,6 +69,7 @@ private:
     std::string name_;
     int timeout_ms_;
     std::unique_ptr<QNetworkAccessManager> nam_;
+    std::function<bool()> stop_check_;
 };
 
 } // namespace c2w::companion::sched

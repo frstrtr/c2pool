@@ -21,7 +21,8 @@
 //                      A parent that is only in the node mempool never
 //                      satisfies it, unless the item opts in with
 //                      allow_unconfirmed_parent (then mempool or mined is
-//                      enough and finality is not required).
+//                      enough and finality is not required, but a block
+//                      that left the chain still does not count).
 // A height-based condition with the tip unknown (node not synced) waits.
 // The `why` text lists the unmet conditions in the order maturity -> height ->
 // time -> parents, each with an ETA (blocks at 2.6 min per block).

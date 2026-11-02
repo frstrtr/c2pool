@@ -160,8 +160,11 @@ GUI queue tab is a later slice.
   `not_before_time` (UTC, trailing `Z` required) and `after_parent`. A parent
   must be **final**, not merely mined: N confirmations (default 1), its block
   still on the node's chain, and ChainLocked (`bestchainlock.height >=` the
-  parent's height in `getblockchaininfo`); a node that does not expose
-  `bestchainlock` gets at least 2 confirmations instead ("ChainLock not
+  parent's height in `getblockchaininfo`, on the node's own chain:
+  `known_block` true or the hash checked by `getblockhash`). A node that knows
+  the field but has not adopted a ChainLock yet (`unavailable.bestchainlock`,
+  e.g. right after a restart) makes children wait; only a node with neither
+  form (an older build) gets at least 2 confirmations instead ("ChainLock not
   exposed by node"). A parent only in the node mempool never fires a child
   unless the item sets `allow_unconfirmed_parent` (default false). Unknown
   input heights never auto-fire: set `not_before_height` or record an
@@ -176,7 +179,12 @@ GUI queue tab is a later slice.
   (`--embedded-tx-inject`). The scheduler arms the node itself only with a
   recorded consent (`arm_policy.auto_arm` + `consented_at`), through the
   two-phase `POST /api/config/apply`, at most once per 10 minutes, and never
-  again after a `money_gate` refusal.
+  again after a `money_gate` refusal. A disarm is classified by the node's
+  `GET /uptime`: a restart (uptime went back, or is shorter than the time since
+  the node was last seen armed) may be re-armed under consent; a disarm while
+  the node kept running, or with no usable `/uptime`, is the operator's:
+  auto-arm is suspended (alert `operator_disarm`, `status` exit 1) until
+  `arm-policy --auto-arm yes --consent "..."` records consent again.
 - **Token**: read at use from a 0600 file (the node's own loader rules), held in
   a zeroizing buffer, placed only into the POST body; there is no
   `--token VALUE` option. The node URL must be loopback (use `ssh -L` for a

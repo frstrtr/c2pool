@@ -211,6 +211,7 @@ struct Defaults {
 
 // The recorded auto-arm consent (§7.2). Logic lives in ArmPolicy.hpp.
 struct ArmPolicyRecord {
+    int64_t rev = 0; // bumped by every operator change (record_consent); the runner never writes it
     bool auto_arm = false;
     bool auto_disarm_when_idle = false;
     std::optional<std::string> consented_at;
@@ -231,6 +232,12 @@ struct RunnerState {
     int64_t tick_count = 0;
     std::optional<std::string> last_tick_at;
     bool explorer_off = false;        // the node answered "Explorer not enabled" (alert raised once)
+    // The last tick that saw the node armed (enabled=true) and the node's
+    // /uptime then: a later disarm is a restart when the uptime went back
+    // (or is shorter than the time since), else a deliberate runtime disarm.
+    std::optional<int64_t> enabled_seen_at;     // unix seconds
+    std::optional<int64_t> enabled_seen_uptime; // seconds, when /uptime answered
+    bool chainlock_fork = false;      // the node's ChainLock is not on its chain (alert raised once)
 };
 
 struct Queue {

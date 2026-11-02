@@ -34,6 +34,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <QUrlQuery>
 
 #include <cstdio>
@@ -201,6 +202,17 @@ struct DashFake {
     std::map<int64_t, std::vector<QByteArray>> blocks; // height -> txids
     QByteArray nonce;
     int submits = 0, applies = 0;
+    int64_t boot = SystemClock().now_unix() - 100000; // /uptime base (a restart resets it)
+
+    // The process restarts: empty mempool, /uptime from zero, the arm as the
+    // unit flag leaves it; wired stays true (a fresh process publishes).
+    void restart(bool unit_flag_arm)
+    {
+        mempool.clear();
+        boot = SystemClock().now_unix();
+        enabled = unit_flag_arm;
+        wired = true;
+    }
 
     static QByteArray hash_at(int64_t h)
     {
@@ -236,6 +248,8 @@ struct DashFake {
             return json_resp(200, QJsonObject{{"wired", wired}, {"enabled", enabled}, {"updated_at", 1}, {"pool", pool},
                                               {"rate_limit", QJsonObject{{"local", local}, {"peers", local}, {"caps", caps}}}});
         }
+        if (r.method == "GET" && r.path == "/uptime")
+            return HttpResp{200, QByteArray::number(static_cast<qint64>(SystemClock().now_unix() - boot)), {}, false};
         if (r.method == "GET" && r.path == "/api/explorer/getblockchaininfo") {
             QJsonObject o{{"chain", "main"}, {"synced", true}, {"blocks", static_cast<qint64>(tip)},
                           {"headers", static_cast<qint64>(tip)}, {"bestblockhash", QString::fromLatin1(hash_at(tip))}};
@@ -406,6 +420,31 @@ static void q_transport()
     auto down = QtNodeApi::create("http://127.0.0.1:" + std::to_string(dead_port), why, 2000);
     HttpReply refused = down->get("/api/tx-inject-status");
     CHECK(!refused.transport_ok && !refused.error.empty(), "Q7: connection refused -> transport error");
+
+    // Stop handling (daemon SIGTERM): no new request; an in-flight GET is
+    // aborted; an in-flight POST is left to finish within its timeout.
+    {
+        bool stop = true;
+        auto s2 = QtNodeApi::create(http.url(), why, 2000);
+        s2->set_stop_check([&stop] { return stop; });
+        const size_t n0 = http.log.size();
+        HttpReply refused2 = s2->get("/api/tx-inject-status");
+        CHECK(!refused2.transport_ok && refused2.error.find("not sent") != std::string::npos && http.log.size() == n0,
+              "L2: stop requested -> the request is not sent");
+        stop = false;
+        QTimer::singleShot(300, [&stop] { stop = true; });
+        QElapsedTimer st;
+        st.start();
+        HttpReply aborted = s2->get("/hang");
+        CHECK(!aborted.transport_ok && aborted.error.find("aborted") != std::string::npos && st.elapsed() < 1500,
+              "L2: an in-flight GET is aborted promptly on stop");
+        stop = false;
+        QTimer::singleShot(300, [&stop] { stop = true; });
+        st.restart();
+        HttpReply post_hang = s2->post_json("/hang", "{}");
+        CHECK(!post_hang.transport_ok && post_hang.error.find("timeout") != std::string::npos && st.elapsed() >= 1900,
+              "L2: an in-flight POST is not cut by the stop (it ends at its own timeout)");
+    }
 
     // The ChainView over the real transport: the bare-string getblockhash.
     http.handler = [](const HttpReq&) { return HttpResp{200, "\"" + QByteArray(64, 'b') + "\"", {}, false}; };
@@ -580,10 +619,9 @@ static void q_daemon_end_to_end(const QString& dir)
         CHECK(p.rc == 4 && p.err.contains("lock held"), "Q11: a second runner exits 4 (lock held)");
     }
 
-    // The node restarts without its standing arm: mempool empty, enabled=false.
-    node.mempool.clear();
-    node.enabled = false;
-    node.wired = false;
+    // The node restarts without its standing arm: mempool empty, enabled=false,
+    // /uptime from zero (wired stays true, as on the real node).
+    node.restart(false);
     p = run({"run", "--once"});
     CHECK(p.rc == 0 && p.out.contains("ALERT disarmed") && read_all(queue).contains("\"state\": \"dropped\""),
           "Q11: disarm after a restart detected and alerted; the child left the emptied mempool -> dropped");
@@ -594,6 +632,27 @@ static void q_daemon_end_to_end(const QString& dir)
           "Q11: consented auto-arm on the resubmit: two-phase apply, node armed");
     CHECK(node.mempool.count(ctx.toLatin1()) == 1 && after.contains("resubmit 1/3"),
           "Q11: the dropped child is resubmitted after the re-arm");
+
+    // A deliberate runtime disarm (the node keeps running): never re-armed
+    // until the operator records consent again.
+    const std::string lhex = make_tx(1103);
+    write_file(dir + "/late.hex", QByteArray::fromStdString(lhex + "\n"), 0644);
+    const QByteArray ltx = QByteArray::fromStdString(art::crossgap_txid(lhex));
+    node.enabled = false;
+    p = run({"add", "--hex", dir + "/late.hex", "--h0", "2565145", "--label", "late"});
+    p = run({"run", "--once"});
+    CHECK(p.rc == 0 && p.out.contains("ALERT operator_disarm") && node.applies == 2 && !node.mempool.count(ltx),
+          "Q11: deliberate disarm (uptime continuous) -> operator_disarm, no apply, the new item waits");
+    p = run({"status"});
+    CHECK(p.rc == 1 && p.out.contains("AUTO-ARM SUSPENDED") && p.out.contains("; up "),
+          "Q11: status shows the suspension and the node uptime");
+    p = run({"run", "--once"});
+    CHECK(node.applies == 2, "Q11: still no apply on the next run");
+    p = run({"arm-policy", "--auto-arm", "yes", "--consent", "hotel queue: resume after maintenance"});
+    CHECK(p.rc == 0 && read_all(queue).contains("\"suspended_reason\": null"),
+          "Q11: consent recorded again clears the suspension");
+    p = run({"run", "--once"});
+    CHECK(node.applies == 4 && node.enabled && node.mempool.count(ltx) == 1, "Q11: re-armed and the late item submitted");
 
     p = run({"pause", ctx.left(16)});
     CHECK(p.rc == 0, "Q11: pause by txid prefix");

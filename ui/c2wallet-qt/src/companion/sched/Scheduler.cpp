@@ -127,9 +127,9 @@ ChainSnapshot Scheduler::snapshot()
     c.tip_known = t.known;
     c.tip = t.height;
     c.tip_unknown_why = t.why;
-    c.chainlock_exposed = t.chainlock.exposed;
-    if (t.chainlock.known) c.chainlock_height = t.chainlock.height;
-    c.chainlock_why = t.chainlock.why;
+    c.chainlock_exposed = cl_.exposed;
+    if (cl_.usable) c.chainlock_height = cl_.height;
+    c.chainlock_why = cl_.why;
     return c;
 }
 
@@ -160,11 +160,11 @@ ParentStatus Scheduler::parent_status(const std::string& txid)
         }
     }
     if (!ps.known) return ps;
-    if (!ps.mined) {
+    if (ps.mined && ps.mined_height) verify_parent_block(ps);
+    // In the node mempool? (asked when not mined, or when its block left the chain)
+    if (!ps.mined || (ps.block_still_at_height && !*ps.block_still_at_height)) {
         const MempoolView& mp = view_.mempool();
         ps.in_mempool = mp.ok && mp.txids.count(txid) != 0;
-    } else if (ps.mined_height) {
-        verify_parent_block(ps);
     }
     return ps;
 }
@@ -189,12 +189,13 @@ void Scheduler::verify_parent_block(ParentStatus& ps)
         ps.block_check_why = "height " + std::to_string(h) + " is above the tip " + std::to_string(tip.height);
         return;
     }
-    if (tip.chainlock.known && tip.chainlock.height == h) {
-        ps.block_still_at_height = tip.chainlock.blockhash == *ps.mined_hash;
+    // The ChainLock's own hash answers for its height (a chain-committed
+    // adoption without a hash takes the getblockhash path below).
+    if (cl_.usable && !cl_.hash.empty() && cl_.height == h) {
+        ps.block_still_at_height = cl_.hash == *ps.mined_hash;
         if (!*ps.block_still_at_height)
-            ps.block_check_why = "the ChainLock at " + std::to_string(h) + " is block " +
-                                 tip.chainlock.blockhash.substr(0, 16) + ", the parent was in " +
-                                 ps.mined_hash->substr(0, 16);
+            ps.block_check_why = "the ChainLock at " + std::to_string(h) + " is block " + cl_.hash.substr(0, 16) +
+                                 ", the parent was in " + ps.mined_hash->substr(0, 16);
         return;
     }
     std::string err;
@@ -228,6 +229,7 @@ TickReport Scheduler::tick()
 
     detect_disarm(view_.inject_status());
     check_explorer();
+    check_chainlock();
 
     // Phase 1: observe what the node holds.
     observe_tracked();
@@ -283,24 +285,128 @@ TickReport Scheduler::tick()
 
 // ── phase 0: disarm detection ────────────────────────────────────────────────
 
+// Why did the arm go away? A node restart (the process started after the
+// last tick that saw it armed: /uptime went back, or is shorter than the time
+// since) loses a runtime arm by design -> the recorded consent may re-arm. A
+// disarm inside a process that kept running is an operator's decision -> the
+// consent is suspended until it is recorded again. No usable /uptime -> never
+// guess a restart (fail-safe: treated as deliberate).
+bool Scheduler::node_restarted(std::string& cause)
+{
+    const UptimeInfo& up = view_.uptime();
+    const RunnerState& r = q_.runner;
+    if (!up.ok) {
+        cause = "node uptime unavailable (" + up.why + "): treated as a deliberate disarm";
+        return false;
+    }
+    const int64_t u = up.seconds;
+    if (r.enabled_seen_uptime && u < *r.enabled_seen_uptime) {
+        cause = "node restarted: uptime " + std::to_string(u) + " s < " + std::to_string(*r.enabled_seen_uptime) +
+                " s when last seen armed";
+        return true;
+    }
+    if (r.enabled_seen_at) {
+        const int64_t since = now_ - *r.enabled_seen_at;
+        if (u + kRestartSlackSeconds < since) {
+            cause = "node restarted: up " + std::to_string(u) + " s, last seen armed " + std::to_string(since) + " s ago";
+            return true;
+        }
+        cause = "node up " + std::to_string(u) + " s, running since before it was last seen armed " +
+                std::to_string(since) + " s ago";
+        return false;
+    }
+    cause = "node up " + std::to_string(u) + " s; no record of when it was last seen armed: treated as a deliberate disarm";
+    return false;
+}
+
+void Scheduler::record_armed_seen()
+{
+    q_.runner.enabled_seen_at = now_;
+    const UptimeInfo& up = view_.uptime();
+    if (up.ok) q_.runner.enabled_seen_uptime = up.seconds;
+    else q_.runner.enabled_seen_uptime.reset();
+}
+
 void Scheduler::detect_disarm(const InjectStatus& st)
 {
     if (!st.ok) return;
     if (q_.runner.last_enabled.value_or(false) && !st.enabled) {
-        const bool any_live = std::any_of(q_.items.begin(), q_.items.end(),
-                                          [](const Item& it) { return !it.paused && !is_terminal(it); });
-        if (any_live) {
-            raise_alert("disarmed", std::string("node disarmed (restart or operator): tx-inject-status enabled "
-                                                "true -> false") +
-                                        (st.wired ? "" : "; wired=false (the node restarted)"));
-            for (Item& it : q_.items) {
-                if (!it.paused && it.state == State::Ready)
-                    block_not_armed(it, "blocked: node disarmed (restart or operator) — enabled=false", false);
-            }
+        std::string cause;
+        const bool restarted = node_restarted(cause);
+        ArmPolicyRecord& p = q_.arm_policy;
+        const bool consent = p.consented_at.has_value() && !p.consented_at->empty();
+        std::string blocked_why;
+        if (restarted) {
+            const bool any_live = std::any_of(q_.items.begin(), q_.items.end(),
+                                              [](const Item& it) { return !it.paused && !is_terminal(it); });
+            if (any_live)
+                raise_alert("disarmed", "node disarmed by a restart without its standing arm (" + cause +
+                                            "): tx-inject-status enabled true -> false" +
+                                            (consent ? "; auto-arm consent applies" : "; no auto-arm consent recorded"));
+            blocked_why = "blocked: node disarmed by a restart (enabled=false; " + cause + ")";
+        } else {
+            if (consent)
+                p.suspended_reason = at_ + " operator disarm: the node was disarmed while it ran (" + cause +
+                                     "); record consent again to resume auto-arm";
+            raise_alert("operator_disarm",
+                        "node disarmed while it ran (" + cause + ")" +
+                            (consent ? "; auto-arm SUSPENDED until consent is recorded again "
+                                       "(arm-policy --auto-arm yes --consent \"<text>\")"
+                                     : "; no auto-arm consent recorded"));
+            blocked_why = "blocked: node disarmed while it ran (operator; " + cause + ")" +
+                          (consent ? "; auto-arm suspended" : "");
         }
-        q_.arm_policy.armed_by_scheduler_at.reset();
+        for (Item& it : q_.items) {
+            if (!it.paused && it.state == State::Ready) block_not_armed(it, blocked_why, false);
+        }
+        p.armed_by_scheduler_at.reset();
     }
+    if (st.enabled) record_armed_seen();
     q_.runner.last_enabled = st.enabled;
+}
+
+// The node's ChainLock as a finality oracle for parents: usable only when it
+// is on the node's chain (known_block true, or a hash we verify ourselves
+// with getblockhash at its height). known_block false or a mismatch is a
+// ChainLock on another chain: chained children wait and one alert is raised.
+void Scheduler::check_chainlock()
+{
+    cl_ = ClVerdict{};
+    const TipInfo& t = view_.tip();
+    if (!t.known) return;
+    const ChainLockInfo& c = t.chainlock;
+    cl_.exposed = c.exposed;
+    cl_.why = c.why;
+    if (!c.known) return;
+    std::string fork;
+    const std::string where = "the node's ChainLock at " + std::to_string(c.height) +
+                              (c.blockhash.empty() ? std::string() : " (block " + c.blockhash.substr(0, 16) + ")");
+    if (c.known_block && !*c.known_block) {
+        fork = where + " is not on its header chain (known_block:false)";
+    } else if (!c.known_block && !c.blockhash.empty()) {
+        std::string err;
+        const auto h = view_.block_hash(c.height, err);
+        if (!h) {
+            cl_.why = "cannot verify " + where + " is on the node's chain: " + err;
+            return;
+        }
+        if (*h != c.blockhash) fork = where + " but its chain holds " + h->substr(0, 16) + " at that height";
+    }
+    if (!fork.empty()) {
+        cl_.why = "not final: " + fork;
+        if (!q_.runner.chainlock_fork) {
+            q_.runner.chainlock_fork = true;
+            raise_alert("chainlock_fork", fork + "; children of parents at or below it wait");
+        }
+        return;
+    }
+    if (q_.runner.chainlock_fork) {
+        q_.runner.chainlock_fork = false;
+        queue_note("chainlock", "the node's ChainLock is on its chain again");
+    }
+    cl_.usable = true;
+    cl_.height = c.height;
+    cl_.hash = c.blockhash;
 }
 
 void Scheduler::check_explorer()
@@ -869,6 +975,7 @@ Scheduler::ArmTry Scheduler::try_auto_arm(Item& it, std::string& why)
         const InjectStatus& st = view_.inject_status(true);
         if (st.ok && st.enabled) {
             q_.runner.last_enabled = true;
+            record_armed_seen();
             return ArmTry::Armed;
         }
         why = "blocked: armed by the scheduler but tx-inject-status still reports enabled=false";

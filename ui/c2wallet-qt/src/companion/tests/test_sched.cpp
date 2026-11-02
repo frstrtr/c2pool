@@ -297,8 +297,16 @@ struct FakeNode : NodeApi {
     std::map<std::string, int64_t> time_added;
     std::map<std::string, int64_t> expiry; // txid -> expiry_height (0 = none)
     bool explorer = true;                   // false: --no-explorer
-    bool cl_exposed = false;                // getblockchaininfo carries "bestchainlock"
-    std::optional<int64_t> cl_height;       // the best ChainLock (null when exposed without one)
+    // The node PR-B getblockchaininfo forms (chainlock_obs_json.hpp):
+    bool cl_exposed = false;                // false: an older node (neither form)
+    std::optional<int64_t> cl_height;       // adopted ChainLock; nullopt -> "unavailable.bestchainlock"
+    bool cl_null_style = false;             // nullopt as the ledger's top-level null instead
+    bool cl_hash_null = false;              // chain-committed without a hash: blockhash + known_block null
+    std::optional<bool> cl_known_block = true; // nullopt -> "known_block": null
+    std::optional<std::string> cl_hash_override; // a ChainLock on another block at that height
+    // /uptime: seconds since `boot` (a restart resets it).
+    bool uptime_route = true;
+    int64_t boot = 0;
     std::map<int64_t, FakeBlock> blocks;
     int64_t salt = 0;
     std::string issued_nonce;
@@ -336,6 +344,16 @@ struct FakeNode : NodeApi {
         blocks[tip] = FakeBlock{synth_hash(tip, salt), txids, true};
         for (const auto& t : txids) mempool.erase(t);
         reap();
+    }
+    // The node process restarts: empty mempool, /uptime from zero, the arm
+    // as the unit flag leaves it. wired stays true: a fresh process publishes
+    // its status at start (node_coin_state.hpp publish_inject_status).
+    void restart(bool unit_flag_arm)
+    {
+        mempool.clear();
+        boot = clock ? clock->t : 0;
+        enabled = unit_flag_arm;
+        wired = true;
     }
     void advance(int n)
     {
@@ -402,6 +420,10 @@ struct FakeNode : NodeApi {
                                          {"window_sec", rl_window}}}};
             return reply(200, j);
         }
+        if (path == route::kUptime) {
+            if (!uptime_route) return reply(404, nj{{"error", "no route"}});
+            return HttpReply{true, 200, std::to_string((clock ? clock->t : 0) - boot), ""};
+        }
         if (!explorer && path.rfind("/api/explorer/", 0) == 0)
             return reply(404, nj{{"error", "Explorer not enabled"}});
         if (path == route::kChainInfo) {
@@ -412,9 +434,22 @@ struct FakeNode : NodeApi {
                 j["blocks"] = tip;
                 j["headers"] = tip;
                 j["bestblockhash"] = hash_at(tip);
-                if (cl_exposed)
-                    j["bestchainlock"] = cl_height ? nj{{"height", *cl_height}, {"blockhash", hash_at(*cl_height)}}
-                                                   : nj(nullptr);
+                if (cl_exposed) {
+                    if (cl_height) {
+                        nj cl = nj::object();
+                        cl["height"] = *cl_height;
+                        cl["blockhash"] = cl_hash_null ? nj(nullptr) : nj(cl_hash_override.value_or(hash_at(*cl_height)));
+                        cl["provenance"] = cl_hash_null ? "chain-committed" : "bls-verified";
+                        cl["updated_at"] = 1762069990;
+                        cl["known_block"] = cl_hash_null || !cl_known_block ? nj(nullptr) : nj(*cl_known_block);
+                        j["bestchainlock"] = cl;
+                    } else if (cl_null_style) {
+                        j["bestchainlock"] = nullptr;
+                    } else {
+                        j["unavailable"] = {
+                            {"bestchainlock", "no ChainLock adopted yet (verified clsig or chain-committed cbTx)"}};
+                    }
+                }
             } else {
                 j["sync_blocked_by"] = blocked_by;
                 j["stale"] = {{"tip_height", tip}};
@@ -536,6 +571,7 @@ struct World {
     {
         clock.t = T("2026-11-02T00:10:12Z");
         node.clock = &clock;
+        node.boot = clock.t - 3600;
         token_path = make_file(std::string(kToken) + "\n", 0600);
         q.node.token_file = token_path;
         rebuild();
@@ -1636,10 +1672,8 @@ static void k26_disarm_detection_alert()
         w.tick();
         w.tick();
         CHECK(w.item().state == State::IsHold, "K26: in the mempool");
-        // Node restart: arm lost, mempool empty.
-        w.node.enabled = false;
-        w.node.wired = false;
-        w.node.mempool.clear();
+        // Node restart without the unit flag: arm lost, mempool empty, uptime from zero.
+        w.node.restart(false);
         w.tick();
         w.tick();
         w.tick(700);
@@ -1881,8 +1915,8 @@ static void k26b_disarm_moves_ready()
     CHECK(moved && w.item().state == State::BlockedNotArmed && w.node.count("POST", route::kSubmit) == 1,
           "K26b: enabled true -> false moves the ready item to blocked_not_armed");
     int disarmed = 0;
-    for (const auto& al : w.q.alerts) disarmed += al.kind == "disarmed";
-    CHECK(disarmed == 1, "K26b: one disarm alert");
+    for (const auto& al : w.q.alerts) disarmed += al.kind == "operator_disarm";
+    CHECK(disarmed == 1, "K26b: one disarm alert (the node kept running: a deliberate disarm)");
 }
 
 // M2: a 422 inject-rate-limited-* through the scheduler.
@@ -2118,8 +2152,9 @@ static void k28b_chainlock_present()
     n.node.mine({q.ptx});
     n.node.advance(6);
     n.tick();
-    CHECK(n.item(1).state == State::Waiting && n.item(1).why.find("no ChainLock yet") != std::string::npos,
-          "K28b: bestchainlock null -> waits, never falls back to a confirmation count");
+    CHECK(n.item(1).state == State::Waiting && n.item(1).why.find("not adopted a ChainLock yet") != std::string::npos &&
+              n.item(1).why.find("ChainLock not exposed") == std::string::npos,
+          "K28b: unavailable.bestchainlock (exposed, none adopted) -> waits, never falls back to a confirmation count");
     n.node.cl_height = n.node.tip;
     n.tick();
     CHECK(n.item(1).state == State::Admitted, "K28b: ChainLock above H -> final (block at H verified) -> submitted");
@@ -2134,8 +2169,20 @@ static void k28b_chainlock_present()
     m.node.script.push_back({"GET /api/explorer/getblockchaininfo",
                              FakeNode::reply(200, nj{{"synced", true}, {"blocks", m.node.tip}, {"bestchainlock", "x"}})});
     m.tick();
-    CHECK(m.item(1).state == State::Waiting && m.item(1).why.find("not {height, blockhash}") != std::string::npos,
+    CHECK(m.item(1).state == State::Waiting && m.item(1).why.find("not {height, blockhash") != std::string::npos,
           "K28b: malformed bestchainlock -> waits with the shape named");
+
+    // The ledger route's convention (top-level null) also means exposed, none adopted.
+    World l;
+    l.node.cl_exposed = true;
+    l.node.cl_null_style = true;
+    const Pair r3 = add_pair(l, 416);
+    l.tick();
+    l.node.mine({r3.ptx});
+    l.node.advance(6);
+    l.tick();
+    CHECK(l.item(1).state == State::Waiting && l.item(1).why.find("bestchainlock is null") != std::string::npos,
+          "K28b: bestchainlock null -> waits");
 }
 
 // K28c: the parent's block is reorged out before it is ChainLocked -> the
@@ -2329,6 +2376,7 @@ struct CliWorld {
     {
         clock.t = T("2026-11-02T00:10:12Z");
         node.clock = &clock;
+        node.boot = clock.t - 3600;
         dir = make_dir();
         queue = dir + "/data/c2wallet-qt/companion/queue.json";
         token = dir + "/control.token";
@@ -2666,11 +2714,7 @@ static void k36_run_loop_restart_and_disarm()
         w.run({"add", "--hex", w.put("a", simple(standing ? 560 : 561))});
         w.max_sleeps = 4;
         w.on_sleep = [&](int n) {
-            if (n == 1) { // the node restarts between tick 1 and tick 2
-                w.node.mempool.clear();
-                w.node.wired = !standing ? false : true;
-                w.node.enabled = standing;
-            }
+            if (n == 1) w.node.restart(standing); // the node restarts between tick 1 and tick 2
         };
         CHECK(w.run({"--poll-sec", "15", "run"}) == cli::kExitOk, "K36: the loop stops cleanly on request");
         const std::string log = w.out.str();
@@ -2693,10 +2737,7 @@ static void k36_run_loop_restart_and_disarm()
     w.run({"add", "--hex", w.put("a", simple(562))});
     w.max_sleeps = 3;
     w.on_sleep = [&](int n) {
-        if (n == 1) {
-            w.node.mempool.clear();
-            w.node.enabled = false;
-        }
+        if (n == 1) w.node.restart(false);
     };
     w.run({"run"});
     CHECK(w.load().items[0].state == State::BlockedNotArmed && w.node.count("POST", route::kConfigApply) == 0 &&
@@ -2753,6 +2794,14 @@ static void k38_merge_rule()
               m.arm_policy.armed_by_scheduler_at == std::string("2026-11-02T00:00:00Z"),
           "K38: re-recorded consent taken from the file; the runner keeps its own arm record");
     CHECK(find_tracked(m, std::string(64, '8')) != nullptr, "K38: tracked parents merged");
+    // A suspension the runner set mid-tick is not yet in the file: same rev ->
+    // the runner's copy stands (VERIFY-S2 follow-up: it used to be dropped).
+    Queue mem2 = w.q, disk2 = w.q;
+    mem2.arm_policy.suspended_reason = "2026-11-02T00:10:12Z operator disarm: KAT";
+    CHECK(merge_runner_view(mem2, disk2).arm_policy.suspended_reason == mem2.arm_policy.suspended_reason,
+          "K38: a runner-set suspension survives the merge until the operator changes the policy");
+    arm::record_consent(disk2.arm_policy, true, false, "operator again", w.clock.t, why);
+    CHECK(!merge_runner_view(mem2, disk2).arm_policy.suspended_reason, "K38: ...and record_consent (rev bump) clears it");
     Queue persisted;
     CHECK(queue_from_json(queue_to_json(m), persisted, why) &&
               queue_to_json(merge_runner_view(m, persisted)) == queue_to_json(m),
@@ -2779,6 +2828,307 @@ static void k39_explicit_h0_with_manifest()
     EnqueueRequest r3 = req_for(simple(592));
     r3.explicit_h0 = 0;
     CHECK(!enqueue(x.q, r3, x.clock.t).ok, "K39: h0 must be > 0");
+}
+
+// ── VERIFY-S2 follow-ups ─────────────────────────────────────────────────────
+
+// A NodeApi answering one canned getblockchaininfo body (and failing block
+// reads with a transport error), for the parser and the scan bound.
+struct CannedApi : NodeApi {
+    std::string chaininfo;
+    size_t getblock_calls = 0;
+    HttpReply get(const std::string& p) override
+    {
+        if (p == route::kChainInfo) return HttpReply{true, 200, chaininfo, ""};
+        if (p.rfind(route::kBlockAtHeight, 0) == 0) {
+            ++getblock_calls;
+            return HttpReply{false, 0, "", "timeout"};
+        }
+        return HttpReply{true, 404, "{\"error\":\"no route\"}", ""};
+    }
+    HttpReply post_json(const std::string&, const std::string&) override { return HttpReply{}; }
+    const char* name() const override { return "canned"; }
+};
+
+static ChainLockInfo parse_cl(const std::string& body)
+{
+    CannedApi api;
+    api.chaininfo = body;
+    ChainView v(api);
+    return v.tip().chainlock;
+}
+
+// K28f: the getblockchaininfo bestchainlock shapes of node PR-B, as its own
+// KAT (BestChainlockJsonKnownBlock, test_dash_tx_inject.cpp) produces them.
+static void k28f_chainlock_shapes()
+{
+    // uint256 with every byte 0x3c / 0x3d, as PR-B's KAT builds them.
+    const std::string h3c = [] { std::string x; for (int i = 0; i < 32; ++i) x += "3c"; return x; }();
+    const std::string h3d = [] { std::string x; for (int i = 0; i < 32; ++i) x += "3d"; return x; }();
+    const std::string head = R"J({"chain":"main","synced":true,"blocks":2565300,"headers":2565300,)J";
+    ChainLockInfo c = parse_cl(head + R"J("bestblockhash":"00"})J");
+    CHECK(!c.exposed && !c.known, "K28f: older node (no key, no unavailable.bestchainlock) -> not exposed");
+    c = parse_cl(head + R"J("unavailable":{"bestchainlock":"no ChainLock adopted yet (verified clsig or chain-committed cbTx)"}})J");
+    CHECK(c.exposed && !c.known && c.why.find("no ChainLock adopted yet") != std::string::npos,
+          "K28f: before any adoption -> exposed, not adopted, the node's own text kept");
+    c = parse_cl(head + R"J("unavailable":{"chainwork":"x"},"bestchainlock":{"height":2565260,"blockhash":")J" + h3c +
+                 R"J(","provenance":"bls-verified","updated_at":1762069990,"known_block":true}})J");
+    CHECK(c.exposed && c.known && c.height == 2565260 && c.blockhash == h3c && c.known_block == true &&
+              c.provenance == "bls-verified",
+          "K28f: adopted, on the node's chain");
+    c = parse_cl(head + R"J("bestchainlock":{"height":2565260,"blockhash":")J" + h3d +
+                 R"J(","provenance":"bls-verified","updated_at":1762069990,"known_block":false}})J");
+    CHECK(c.known && c.known_block == false, "K28f: known_block false kept (a ChainLock off the node's chain)J");
+    c = parse_cl(head + R"J("bestchainlock":{"height":2565260,"blockhash":null,"provenance":"chain-committed","updated_at":1762069990,"known_block":null}})J");
+    CHECK(c.known && c.blockhash.empty() && !c.known_block && c.provenance == "chain-committed",
+          "K28f: chain-committed without a hash -> adopted, empty hash, known_block unknown");
+    c = parse_cl(head + R"J("bestchainlock":{"height":2565260,"blockhash":")J" + h3c +
+                 R"J(","provenance":"bls-verified","updated_at":0,"known_block":null}})J");
+    CHECK(c.known && c.blockhash == h3c && !c.known_block, "K28f: no height index on the node -> known_block unknown");
+    c = parse_cl(head + R"J("bestchainlock":null})J");
+    CHECK(c.exposed && !c.known, "K28f: the ledger's null -> exposed, not adopted");
+    c = parse_cl(head + R"J("bestchainlock":{"height":2565260,"blockhash":7}})J");
+    CHECK(c.exposed && !c.known && c.why.find("blockhash") != std::string::npos, "K28f: malformed blockhash -> not usable");
+    c = parse_cl(head + R"J("bestchainlock":{"height":2565260,"blockhash":")J" + h3c + R"J(","known_block":"yes"}})J");
+    CHECK(c.exposed && !c.known, "K28f: malformed known_block -> not usable");
+}
+
+// K28g: what the scheduler does with each adopted form.
+static void k28g_chainlock_forms_in_the_scheduler()
+{
+    {
+        // known_block false: a ChainLock above the parent but off the node's chain.
+        World w;
+        w.node.cl_exposed = true;
+        w.node.cl_height = w.node.tip;
+        const Pair p = add_pair(w, 450);
+        w.tick();
+        w.node.mine({p.ptx});
+        w.node.advance(2);
+        w.node.cl_height = w.node.tip;
+        w.node.cl_known_block = false;
+        w.tick();
+        w.tick();
+        int forks = 0;
+        for (const auto& a : w.q.alerts) forks += a.kind == "chainlock_fork";
+        CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0 &&
+                  w.item(1).why.find("not on its header chain") != std::string::npos && forks == 1,
+              "K28g: known_block false -> the child waits; one chainlock_fork alert");
+        w.node.cl_known_block = true;
+        w.tick();
+        CHECK(w.item(1).state == State::Admitted && !w.q.runner.chainlock_fork, "K28g: back on the chain -> child fires");
+    }
+    {
+        // Chain-committed without a hash, exactly at the parent's height: the
+        // getblockhash path verifies the parent's block (no hash shortcut).
+        World w;
+        w.node.cl_exposed = true;
+        w.node.cl_height = w.node.tip;
+        const Pair p = add_pair(w, 452);
+        w.tick();
+        w.node.mine({p.ptx});
+        const int64_t H = w.node.tip;
+        w.node.cl_height = H;
+        w.node.cl_hash_null = true;
+        w.node.log.clear();
+        w.tick();
+        CHECK(w.item(1).state == State::Admitted && child_posts(w, p.ctx) == 1 &&
+                  w.node.count("GET", std::string(route::kBlockHash) + std::to_string(H)) >= 1,
+              "K28g: chain-committed (blockhash null) at H -> verified by getblockhash(H) -> child fires");
+    }
+    {
+        // known_block null with a hash: the scheduler checks the ChainLock's block itself.
+        World w;
+        w.node.cl_exposed = true;
+        w.node.cl_height = w.node.tip;
+        w.node.cl_known_block.reset();
+        const Pair p = add_pair(w, 454);
+        w.tick();
+        w.node.mine({p.ptx});
+        w.node.mine();
+        const int64_t C = w.node.tip;
+        w.node.cl_height = C;
+        w.node.cl_hash_override = std::string(64, 'f'); // not the block the node holds at C
+        w.tick();
+        int forks = 0;
+        for (const auto& a : w.q.alerts) forks += a.kind == "chainlock_fork";
+        CHECK(w.item(1).state == State::Waiting && forks == 1 &&
+                  w.node.count("GET", std::string(route::kBlockHash) + std::to_string(C)) >= 1,
+              "K28g: known_block unknown, the ChainLock's hash is not the node's block -> waits, fork alert");
+        w.node.cl_hash_override.reset();
+        w.tick();
+        CHECK(w.item(1).state == State::Admitted, "K28g: known_block unknown, hash verified at its height -> child fires");
+    }
+}
+
+// K40: a disarm while the node kept running (continuous /uptime) is the
+// operator's: auto-arm is suspended until consent is recorded again; a
+// restart (uptime back to zero, or shorter than the time since the node was
+// last seen armed) re-arms under consent; no /uptime -> deliberate.
+static void k40_restart_vs_operator_disarm()
+{
+    auto ready_in_backoff = [](World& w, uint32_t seed, int64_t node_up_for = 3600) {
+        w.node.boot = w.clock.t - node_up_for;
+        std::string why;
+        arm::record_consent(w.q.arm_policy, true, false, "hotel queue consent (KAT)", w.clock.t, why);
+        w.add(simple(seed));
+        w.node.script.push_back({"POST /api/tx-inject/submit", HttpReply{false, 0, "", "connection reset"}});
+        w.tick();
+        return w.item().state == State::Ready && w.q.runner.enabled_seen_uptime.has_value();
+    };
+    {
+        World w;
+        CHECK(ready_in_backoff(w, 600), "K40: ready item, node seen armed with its uptime");
+        w.clock.t += 5;
+        w.node.restart(false);
+        w.tick(30);
+        int disarmed = 0;
+        for (const auto& a : w.q.alerts) disarmed += a.kind == "disarmed";
+        CHECK(disarmed == 1 && !w.q.arm_policy.suspended_reason, "K40: uptime went back -> restart, consent not suspended");
+        CHECK(w.node.count("POST", route::kConfigApply) == 2 && w.node.enabled && w.item().state == State::Admitted,
+              "K40: restart -> re-armed under consent and submitted");
+    }
+    {
+        World w;
+        CHECK(ready_in_backoff(w, 601), "K40: ready item (deliberate case)");
+        w.node.enabled = false; // operator runtime disarm, the node keeps running
+        w.tick(5);
+        int op = 0;
+        for (const auto& a : w.q.alerts) op += a.kind == "operator_disarm";
+        CHECK(op == 1 && w.q.arm_policy.suspended_reason &&
+                  w.q.arm_policy.suspended_reason->find("operator disarm") != std::string::npos &&
+                  w.item().state == State::BlockedNotArmed,
+              "K40: continuous uptime -> operator_disarm alert, auto-arm suspended, item blocked");
+        for (int i = 0; i < 12; ++i) w.tick(120);
+        CHECK(w.node.count("POST", route::kConfigApply) == 0 && w.node.count("POST", route::kSubmit) == 1 &&
+                  w.item().why.find("auto-arm suspended") != std::string::npos,
+              "K40: 24 minutes later: zero apply POSTs, the item says why");
+        std::string why;
+        arm::record_consent(w.q.arm_policy, true, false, "resume after maintenance (KAT)", w.clock.t, why);
+        w.tick();
+        CHECK(w.node.count("POST", route::kConfigApply) == 2 && w.item().state == State::Admitted,
+              "K40: consent recorded again (new timestamp) -> re-armed and submitted");
+    }
+    {
+        World w;
+        CHECK(ready_in_backoff(w, 602), "K40: ready item (no /uptime case)");
+        w.node.uptime_route = false;
+        w.node.restart(false);
+        w.tick(30);
+        for (int i = 0; i < 3; ++i) w.tick(700);
+        CHECK(w.q.arm_policy.suspended_reason && w.q.arm_policy.suspended_reason->find("uptime unavailable") != std::string::npos &&
+                  w.node.count("POST", route::kConfigApply) == 0,
+              "K40: /uptime missing -> any disarm counts as deliberate: suspended, never armed");
+    }
+    {
+        // The runner was down for two hours; the node restarted an hour ago:
+        // uptime 3600 s is not below the old sample but shorter than the time since.
+        World w;
+        CHECK(ready_in_backoff(w, 603, 100), "K40: ready item (runner down, node restarted meanwhile)");
+        w.clock.t += 3600;
+        w.node.restart(false);
+        w.clock.t += 3600;
+        w.tick(0);
+        CHECK(!w.q.arm_policy.suspended_reason && w.node.count("POST", route::kConfigApply) == 2,
+              "K40: wall-clock rule -> restart -> re-armed");
+    }
+    {
+        // The runner was down for two hours; the node ran throughout: deliberate.
+        World w;
+        CHECK(ready_in_backoff(w, 604), "K40: ready item (runner down, node kept running)");
+        w.clock.t += 7200;
+        w.node.enabled = false;
+        w.tick(0);
+        CHECK(w.q.arm_policy.suspended_reason && w.node.count("POST", route::kConfigApply) == 0,
+              "K40: node up since before it was last seen armed -> deliberate");
+    }
+    {
+        // Over the CLI: status keeps saying so after ack-alerts; arm-policy --consent resumes.
+        CliWorld w;
+        w.init();
+        w.run({"arm-policy", "--auto-arm", "yes", "--consent", "hotel queue consent"});
+        w.run({"add", "--hex", w.put("a", simple(605))});
+        w.run({"run", "--once"});
+        w.node.enabled = false;
+        w.clock.t += 15;
+        w.run({"add", "--hex", w.put("b", simple(606))});
+        w.run({"run", "--once"});
+        Queue q = w.load();
+        CHECK(q.items[1].state == State::BlockedNotArmed && w.node.count("POST", route::kConfigApply) == 0 &&
+                  w.out.str().find("ALERT operator_disarm") != std::string::npos,
+              "K40: CLI run: deliberate disarm -> new item blocked, no apply, alert logged");
+        w.run({"ack-alerts"});
+        QueueLock held;
+        std::string why;
+        held.acquire(runner_lock_base(w.queue), false, why);
+        CHECK(w.run({"status"}) == cli::kExitAttention && w.out.str().find("AUTO-ARM SUSPENDED") != std::string::npos &&
+                  w.out.str().find("auto-arm suspended") != std::string::npos,
+              "K40: status stays ATTENTION while suspended, even after ack-alerts");
+        held.release();
+        w.clock.t += 15;
+        CHECK(w.run({"arm-policy", "--auto-arm", "yes", "--consent", "resume after maintenance"}) == cli::kExitOk &&
+                  !w.load().arm_policy.suspended_reason,
+              "K40: arm-policy --consent clears the suspension");
+        w.clock.t += 15;
+        w.run({"run", "--once"});
+        CHECK(w.node.count("POST", route::kConfigApply) == 2 && w.load().items[1].state == State::Admitted,
+              "K40: the next run re-arms and submits");
+    }
+}
+
+// K41 (L1): with allow_unconfirmed_parent a parent whose block left the chain
+// counts again only once it is back in the mempool (or mined again).
+static void k41_opt_in_respects_reorg()
+{
+    SchedulerOptions lazy;
+    lazy.reorg_check_every = 1000;
+    World w(lazy);
+    const Art pa = simple(610);
+    w.add(pa);
+    w.tick();
+    w.node.mine({pa.txids[0]});
+    const int64_t H = w.node.tip;
+    w.tick();
+    CHECK(w.item(0).state == State::Mined, "K41: parent mined");
+    w.node.reorg(H);
+    const Art ca = simple(611);
+    EnqueueRequest cr = req_for(ca);
+    cr.after_parent = {{pa.txids[0], 1}};
+    cr.allow_unconfirmed_parent = true;
+    w.add(ca, cr);
+    w.tick();
+    CHECK(w.item(1).state == State::Waiting && w.item(1).why.find("left the chain") != std::string::npos &&
+              child_posts(w, ca.txids[0]) == 0,
+          "K41: opt-in, parent's block reorged out, not in the mempool -> the child waits");
+    w.node.mempool.insert(pa.txids[0]);
+    w.tick();
+    CHECK(w.item(1).state == State::Admitted, "K41: the parent is back in the mempool -> the opt-in child fires");
+}
+
+// K42 (L2): an unresponsive node costs one block read per scan, not one per height.
+static void k42_scan_stops_on_transport_error()
+{
+    CannedApi api;
+    ChainView v(api);
+    const FindResult f = v.find_tx(std::string(64, 'a'), 2565013, 2565300);
+    CHECK(api.getblock_calls == 1 && f.missing == 288 && !f.found, "K42: first transport error ends the scan");
+}
+
+// K43 (L3): temp files of a writer that died before its rename are swept.
+static void k43_stale_temp_sweep()
+{
+    CliWorld w;
+    w.init();
+    const std::string dead = w.queue + ".tmp.99999", other = w.queue + ".tmp.keep";
+    write_text(dead, "partial");
+    write_text(other, "not ours");
+    CHECK(w.run({"run", "--once"}) == cli::kExitOk && ::access(dead.c_str(), F_OK) != 0 &&
+              ::access(other.c_str(), F_OK) == 0,
+          "K43: queue.json.tmp.<pid> removed under the edit lock; other names untouched");
+    write_text(dead, "partial");
+    w.run({"init"});
+    CHECK(::access(dead.c_str(), F_OK) != 0, "K43: edits sweep too");
+    ::unlink(other.c_str());
 }
 
 int main()
@@ -2834,6 +3184,12 @@ int main()
     k37_cli_list_is_hold_eta();
     k38_merge_rule();
     k39_explicit_h0_with_manifest();
+    k28f_chainlock_shapes();
+    k28g_chainlock_forms_in_the_scheduler();
+    k40_restart_vs_operator_disarm();
+    k41_opt_in_respects_reorg();
+    k42_scan_stops_on_transport_error();
+    k43_stale_temp_sweep();
 
     for (const auto& f : g_tmpfiles) {
         ::unlink(f.c_str());

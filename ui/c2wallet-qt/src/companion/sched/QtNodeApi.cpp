@@ -56,6 +56,10 @@ HttpReply QtNodeApi::post_json(const std::string& path, const std::string& body)
 HttpReply QtNodeApi::request(bool post, const std::string& path, const std::string* body)
 {
     HttpReply out;
+    if (stop_check_ && stop_check_()) {
+        out.error = "runner stopping: request not sent";
+        return out;
+    }
     if (path.empty() || path[0] != '/') {
         out.error = "request path must start with '/'";
         return out;
@@ -85,9 +89,21 @@ HttpReply QtNodeApi::request(bool post, const std::string& path, const std::stri
     QByteArray data;
     bool timed_out = false;
     bool too_large = false;
+    bool stopped = false;
     QEventLoop loop;
     QTimer guard;
     guard.setSingleShot(true);
+    QTimer stop_poll; // GETs only: a POST is never cut in half on our side
+    if (!post && stop_check_) {
+        stop_poll.setInterval(200);
+        QObject::connect(&stop_poll, &QTimer::timeout, &loop, [&] {
+            if (stop_check_()) {
+                stopped = true;
+                reply->abort();
+            }
+        });
+        stop_poll.start();
+    }
     QObject::connect(reply, &QNetworkReply::readyRead, &loop, [&] {
         data += reply->readAll();
         if (data.size() > kMaxReplyBytes) {
@@ -103,8 +119,9 @@ HttpReply QtNodeApi::request(bool post, const std::string& path, const std::stri
     guard.start(timeout_ms_);
     if (!reply->isFinished()) loop.exec(QEventLoop::ExcludeUserInputEvents);
     guard.stop();
+    stop_poll.stop();
 
-    const bool aborted = timed_out || too_large;
+    const bool aborted = timed_out || too_large || stopped;
     if (!aborted) data += reply->readAll();
     const QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
     if (!aborted && status.isValid()) {
@@ -113,6 +130,8 @@ HttpReply QtNodeApi::request(bool post, const std::string& path, const std::stri
         out.body.assign(data.constData(), static_cast<size_t>(data.size()));
     } else if (timed_out) {
         out.error = "no complete reply within " + std::to_string(timeout_ms_) + " ms (timeout)";
+    } else if (stopped) {
+        out.error = "runner stopping: request aborted";
     } else if (too_large) {
         out.error = "reply larger than " + std::to_string(kMaxReplyBytes) + " bytes";
     } else {
