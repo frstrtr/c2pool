@@ -374,10 +374,16 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
             }
         }
 
-        // Advertise ourselves to the peer (matching Python p2pool sendAdvertisement)
+        // Advertise ourselves to the peer. Canonical p2pool-merged-v36
+        // p2p.py:127 sendAdvertisement: `if self.node.serverfactory.listen_port
+        // is not None`. A node whose
+        // listen() bind failed (main_ltc.cpp:3892 logs and carries on) has a
+        // closed acceptor, and the bare core::Server::listen_port() throws
+        // bad_descriptor out of this handler, dropping every peer (#925).
+        // No listener means nothing to advertise: skip the addrme.
+        if (auto our_listen_port = core::Server::listen_port_or_none())
         {
-            auto port = core::Server::listen_port();
-            auto addrme_msg = ltc::message_addrme::make_raw(port);
+            auto addrme_msg = ltc::message_addrme::make_raw(*our_listen_port);
             peer->write(std::move(addrme_msg));
         }
 
