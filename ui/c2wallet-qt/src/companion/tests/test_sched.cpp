@@ -911,6 +911,10 @@ static void k9_refusal_cause_table()
         {"inject-script-invalid", 422, State::Refused, RetryClass::None, false},
         {"inject-fee-above-max", 422, State::Refused, RetryClass::None, false},
         {"inject-immature-coinbase-input", 422, State::Waiting, RetryClass::None, true},
+        // node slice N3 (pending, not on master): a node without a tip waits;
+        // an input spent by another pool tx is terminal with an alert.
+        {"inject-tip-unknown", 422, State::Ready, RetryClass::Retry5m, false},
+        {"inject-input-spent-in-mempool", 422, State::Refused, RetryClass::None, true},
         {"inject-prevout-missing", 422, State::Refused, RetryClass::None, false},
         {"inject-prevout-spent", 422, State::Refused, RetryClass::None, false},
         {"inject-oracle-unavailable", 422, State::Ready, RetryClass::Retry5m, false},
@@ -1995,6 +1999,12 @@ static void k9d_node_vocabulary()
         "inject-sandbox-total-scriptsig-too-large", "inject-sandbox-too-many-sigops", "inject-sandbox-unknown",
     };
     std::set<std::string> ours(names, names + n), want(std::begin(master), std::end(master));
+    size_t pn = 0;
+    const char* const* pending = pending_node_cause_names(pn);
+    // N3 names (inject-tip-unknown, inject-input-spent-in-mempool) land with
+    // the node PR: the tripwire below accepts them in node headers, the
+    // 32-name master equality does not count them (K9e).
+    const std::set<std::string> pending_set(pending, pending + pn);
     CHECK(ours == want, "K9d/L6: scheduler vocabulary == master node vocabulary (32 names)");
     int recognized = 0;
     for (size_t i = 0; i < n; ++i) recognized += classify_cause(names[i], 422).recognized ? 1 : 0;
@@ -2019,7 +2029,7 @@ static void k9d_node_vocabulary()
             const std::string name = text.substr(p + 1, e - p - 1);
             if (name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") != std::string::npos) continue;
             ++found;
-            if (!ours.count(name)) {
+            if (!ours.count(name) && !pending_set.count(name)) {
                 ++missing;
                 std::printf("  node cause not in the scheduler vocabulary: %s (%s)\n", name.c_str(), f);
             }
@@ -2028,6 +2038,60 @@ static void k9d_node_vocabulary()
 #endif
     std::printf("  K9d: %d node headers scanned, %d cause strings, %d missing\n", files, found, missing);
     CHECK(missing == 0, "K9d/L6: no node cause string outside the scheduler vocabulary");
+}
+
+// The node slice N3 names (validate dry-run branch; they land with that node
+// PR). They stay OUT of the 32-name master list K9d pins, are recognized and
+// classified on their own (never the generic unknown-cause alert), and the
+// drift tripwire accepts them once the node headers carry them.
+static void k9e_pending_n3_vocabulary()
+{
+    size_t n = 0, m = 0;
+    const char* const* pending = pending_node_cause_names(n);
+    const char* const* master = node_cause_names(m);
+    const std::set<std::string> ps(pending, pending + n), ms(master, master + m);
+    CHECK((ps == std::set<std::string>{"inject-tip-unknown", "inject-input-spent-in-mempool",
+                                       "inject-immature-coinbase-input"}),
+          "K9e: the pending N3 names");
+    bool disjoint = true;
+    for (const auto& s : ps) disjoint &= !ms.count(s);
+    CHECK(disjoint && m == 32, "K9e: none of them is in the master list (still 32 names)");
+    for (const auto& s : ps) {
+        const Outcome o = classify_cause(s, 422);
+        CHECK(o.recognized && !(o.next == State::BlockedNode && o.retry == RetryClass::Operator),
+              ("K9e: " + s + " is classified, not the generic unknown-cause block").c_str());
+    }
+
+    // Through the scheduler: no tip yet -> ready, retried in 5 min, no alert.
+    {
+        World w;
+        w.add(simple(370));
+        w.node.script.push_back({"POST /api/tx-inject/submit",
+                                 FakeNode::reply(422, nj{{"ok", false}, {"cause", "inject-tip-unknown"}})});
+        w.tick();
+        CHECK(w.item().state == State::Ready && w.item().retry.cls == RetryClass::Retry5m &&
+                  w.item().retry.not_before == w.clock.t + 300 && w.q.alerts.empty(),
+              "K9e: inject-tip-unknown -> ready, retry in 300 s, no alert");
+        w.tick(300);
+        CHECK(w.node.count("POST", route::kSubmit) == 2 && w.item().state == State::Admitted,
+              "K9e: resubmitted after 5 min, admitted once the node has a tip");
+    }
+    // Input already spent by another pool tx -> refused, operator alert.
+    {
+        World w;
+        w.add(simple(380));
+        w.node.script.push_back({"POST /api/tx-inject/submit",
+                                 FakeNode::reply(422, nj{{"ok", false}, {"cause", "inject-input-spent-in-mempool"}})});
+        w.tick();
+        int alerts = 0;
+        for (const auto& al : w.q.alerts) alerts += al.detail.find("inject-input-spent-in-mempool") != std::string::npos;
+        CHECK(w.item().state == State::Refused && is_terminal(w.item()) && alerts == 1,
+              "K9e: inject-input-spent-in-mempool -> refused (terminal), one operator alert");
+        w.tick(600);
+        CHECK(w.node.count("POST", route::kSubmit) == 1, "K9e: never retried automatically");
+        std::string why;
+        CHECK(requeue_item(w.q, w.item().id, w.clock.t, why), "K9e: the operator may requeue once the other tx left the pool");
+    }
 }
 
 // ── parent finality (operator requirement 2026-11-02) ───────────────────────
@@ -3168,6 +3232,7 @@ int main()
     k9c_fee_above_max();
     k27b_explorer_disabled_alert();
     k9d_node_vocabulary();
+    k9e_pending_n3_vocabulary();
     k28a_chainlock_absent_fallback();
     k28b_chainlock_present();
     k28c_reorg_before_chainlock();

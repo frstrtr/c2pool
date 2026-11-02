@@ -59,7 +59,7 @@ enum class RetryClass : uint8_t {
     RateWindow,   // local rate budget: window_sec + 15 s
     PoolFull,     // inject pool full: 300 s
     Unpriceable,  // 600 s, at most 3 retries
-    Retry5m,      // reserved oracle-* causes: 300 s
+    Retry5m,      // oracle-* causes, inject-tip-unknown (N3): 300 s
     TokenChange,  // until the token file changes (or operator Retry)
     Arm,          // until the node is armed (or consented auto-arm)
     Operator,     // operator Retry only
