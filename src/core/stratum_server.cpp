@@ -1786,24 +1786,33 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 // already built a script is byte-identical.
                 if (payout_script.empty())
                     payout_script = core::address_to_script_for_coin(username_, own);
-            }
-        }
 
-        // ── EMPTY-SCRIPT GUARD (all coins): an authorized, non-empty username
-        // that still yields NO payout script would make build_connection_
-        // coinbase() drop the finder output from the job coinbase while the
-        // share created at submit commits the real address — the verify_share
-        // GENTX mismatch (regtest bcrt1 repro), or on a won block a
-        // payout-less coinbase. Refuse the job and log loudly instead. Fires
-        // ONLY when the script is empty: the pre-authorize job (username_
-        // still empty) and every decodable address are unchanged.
-        if (!username_.empty() && payout_script.empty()) {
-            const auto& scfg = mining_interface_->get_stratum_config();
-            LOG_WARNING << "[Stratum] REFUSING to build work: payout address "
-                           "decodes to an EMPTY script (user=" << username_ << ")"
-                        << (scfg.coin_symbol.empty() ? "" : " on " + scfg.coin_symbol)
-                        << " — no finder-less coinbase will be issued";
-            return;
+                // ── EMPTY-SCRIPT GUARD (acceptance-configured lanes only): the
+                // address PASSED decide_payout_address() (own-coin or configured
+                // merged) yet still built NO script — a decoder gap. Issuing the
+                // job would drop the finder output from the job coinbase while
+                // the share created at submit commits the real address (the
+                // verify_share GENTX mismatch, regtest bcrt1 repro), or pay a
+                // won block with no finder output. Refuse the job instead.
+                //
+                // Deliberately NOT applied on the legacy path above (payout_*
+                // left empty): there an undecodable username (e.g. a bare
+                // worker name) is accept-any by contract — the work source
+                // validates at mining_submit and falls back to the node-owner /
+                // donation script (see handle_authorize). Master behaviour on
+                // that path is unchanged.
+                if (payout_script.empty()) {
+                    if (!empty_script_warned_) {
+                        empty_script_warned_ = true;
+                        LOG_WARNING << "[Stratum] REFUSING to build work: payout address "
+                                       "decodes to an EMPTY script (user=" << username_ << ")"
+                                    << (scfg.coin_symbol.empty() ? "" : " on " + scfg.coin_symbol)
+                                    << " — no finder-less coinbase will be issued"
+                                       " (logged once per session)";
+                    }
+                    return;
+                }
+            }
         }
 
         // Build merged address entries (bech32+base58, P2PKH+P2SH)

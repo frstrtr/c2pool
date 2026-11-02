@@ -624,4 +624,18 @@ TEST(AddressCoinValidation, EmptyScriptGuardFallbackKeepsOwnHrp)
     EXPECT_EQ(core::address_to_script_for_coin(dgb, dgb_acc), p2wpkh_script());
     // The fallback never repurposes a foreign address: LTC's set rejects dgb1.
     EXPECT_TRUE(core::address_to_script_for_coin(dgb, ltc::address_acceptance(false)).empty());
+
+    // Testnet (dgbt) and regtest (dgbrt) rows: same gap, same fallback, each
+    // only under its own network's acceptance set.
+    struct Row { const char* hrp; bool testnet; bool regtest; };
+    for (const Row r : {Row{"dgbt", true, false}, Row{"dgbrt", false, true}}) {
+        SCOPED_TRACE(r.hrp);
+        const std::string a = bech32_v0(r.hrp);
+        const CoinAddressAcceptance acc = dgb::address_acceptance(r.testnet, r.regtest);
+        EXPECT_EQ(decide_payout_address(a, acc, {}), PayoutAddressDecision::AcceptOwn);
+        EXPECT_TRUE(core::address_to_script(a).empty());
+        EXPECT_EQ(core::address_to_script_for_coin(a, acc), p2wpkh_script());
+        // Mainnet DGB set does not accept a testnet/regtest HRP.
+        EXPECT_TRUE(core::address_to_script_for_coin(a, dgb_acc).empty());
+    }
 }
