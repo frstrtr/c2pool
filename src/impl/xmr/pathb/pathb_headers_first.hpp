@@ -74,4 +74,13 @@ inline SideBranchDecision decide_side_branch(const ::c2pool::xmr::native::U128& 
     return d;
 }
 
+// A side branch's work (the fork's work plus the work of its checked headers) wins the fork choice against the best
+// tip: heavier, or equal with the id of its last header lower than the best tip id.
+inline bool side_work_wins(const ::c2pool::xmr::native::U128& best_work, const Hash32& best_tip,
+                           const ::c2pool::xmr::native::U128& work, const Hash32& last) noexcept {
+    const bool heavier = ::c2pool::xmr::native::u128_greater(work, best_work);
+    const bool equal = !heavier && !::c2pool::xmr::native::u128_less(work, best_work);
+    return heavier || (equal && last < best_tip);
+}
+
 }  // namespace c2pool::xmr::pathb

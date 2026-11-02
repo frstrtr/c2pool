@@ -65,7 +65,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_hardening PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_utxo test_utxo.cpp)
+    add_executable(test_utxo test_utxo.cpp test_block_download.cpp test_utxo_cold_start.cpp)
     target_link_libraries(test_utxo PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
@@ -99,7 +99,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_phase0_live PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_header_chain test_header_chain.cpp)
+    add_executable(test_header_chain test_header_chain.cpp test_ltc_header_sync.cpp)
     target_link_libraries(test_header_chain PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
@@ -759,10 +759,11 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_inject.cpp           # #157: miner/user tx-injection (priority + validity + DoS)
         test_dash_fold_fee_source.cpp     # W5-A: fold-backed fee pricing source
         test_dash_tx_version_rules.cpp    # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
-        test_dash_protx_mempool_eviction.cpp)  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
+        test_dash_protx_mempool_eviction.cpp  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
+        test_dash_utxo_full.cpp)          # S2: full UTXO set from a pinned snapshot (lane, open rule, pin, status)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_x11 core core_utxo
         dash_scriptcheck ${SECP256K1_LIBRARIES}   # PR-C4: dashcore VerifyScript .so + secp256k1 (KAT signs a real P2PKH spend)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}

@@ -71,6 +71,7 @@
 #include <atomic>
 #include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
+#include <limits>               // add_inject: the default max_fee (no cap)
 #include <cstdint>
 #include <ctime>
 #include <deque>
@@ -332,7 +333,10 @@ public:
         }
         if (auto* utxo = m_utxo.load()) {
             ::core::coin::Coin c;
-            if (utxo->get_coin(op, c) && !c.is_spent()) { out = c; return CoinProof::Unspent; }
+            // get_coin is true exactly for a coin the view holds (absence is an
+            // erased or missing entry). Coin::is_spent() would also read a real
+            // (value 0, empty script) coin as absent (VERIFY-S1 S2-3).
+            if (utxo->get_coin(op, c)) { out = c; return CoinProof::Unspent; }
         }
         if (fold_active()) {
             ::core::coin::Coin c;
@@ -550,7 +554,8 @@ public:
         for (const auto& vin : tx.vin) {
             ::core::coin::Coin coin;
             ::core::coin::Outpoint op{vin.prevout.hash, vin.prevout.index};
-            bool found = utxo != nullptr && utxo->get_coin(op, coin) && !coin.is_spent();
+            // View: present == unspent (no is_spent() filter, VERIFY-S1 S2-3).
+            bool found = utxo != nullptr && utxo->get_coin(op, coin);
             if (!found && m_external_coin_lookup) {
                 coin = ::core::coin::Coin{};
                 found = m_external_coin_lookup(op, coin) && !coin.is_spent();
@@ -706,6 +711,16 @@ public:
         BadVersionOrType,    // ContextualCheckTransaction (v23.1.9): unknown
                              // special type, or a negative nVersion
                              // (bad-txns-type / bad-txns-version).
+        FeeAboveMax,         // S2: the priced fee exceeds the submitter's max_fee
+                             // (a local operator submit defaults to 0: a fee-paying
+                             // tx the operator did not ask for is refused).
+        ScriptInvalid,       // S3a: an input's scriptSig fails dashcore VerifyScript
+                             // at admission, or its scriptPubKey cannot be resolved.
+        SpentShapedOutput,   // VERIFY-S2 Must-Fix 1: an output with value 0 and an
+                             // empty scriptPubKey. Consensus-valid and a coin of the
+                             // full set, but non-standard in dashd (IsStandardTx:
+                             // scriptpubkey), which never relays or mines it; c2pool
+                             // admits nothing dashd would refuse to relay here.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -718,6 +733,9 @@ public:
             case InjectGate::Bip68Unsupported:   return "inject-bip68-unsupported";
             case InjectGate::BadVoutRange:       return "inject-bad-txns-vout-range";
             case InjectGate::BadVersionOrType:   return "inject-bad-txns-version-or-type";
+            case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
+            case InjectGate::ScriptInvalid:      return "inject-script-invalid";
+            case InjectGate::SpentShapedOutput:  return "inject-spent-shaped-output";
         }
         return "inject-unknown";
     }
@@ -741,8 +759,18 @@ public:
     /// whose inputs cannot be fold-priced is REFUSED here BY NAME (never left
     /// in the pool to be silently template-excluded).
     ///
+    /// S2: `max_fee` caps the priced fee (inject-fee-above-max); the library
+    /// default is no cap, the operator entry points (main_dash: the hex file
+    /// loader, the loopback HTTP submit) pass 0 unless told otherwise. S3a:
+    /// after pricing, every input is script-verified once at admission with
+    /// the full buried flag set (script_flags_for_height(0)); a failure, or an
+    /// input whose scriptPubKey no at-tip source resolves, refuses by name
+    /// (inject-script-invalid). The selector keeps re-checking at each build
+    /// with the serving height's flags (the belt).
+    ///
     /// Caller holds no lock. Returns a named InjectGate verdict.
-    InjectGate add_inject(const MutableTransaction& tx) {
+    InjectGate add_inject(const MutableTransaction& tx,
+                          uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         std::lock_guard<std::mutex> lock(m_mutex);
         // (1) size — cheapest, chain-state-independent.
         if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
@@ -779,11 +807,17 @@ public:
         //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
         //     Refuse by name here, ahead of admission/pricing. No-op for any
         //     valid tx (every vout already in range).
+        //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
+        //     scriptPubKey is refused too (inject-spent-shaped-output): it is
+        //     consensus-valid (the full set keeps it as dashd does) but
+        //     non-standard in dashd, so no dashd-built block carries it.
         {
             int64_t vout_running = 0;
             for (const auto& vout : tx.vout) {
                 if (!money_range(vout.value) || !money_range(vout_running + vout.value))
                     return InjectGate::BadVoutRange;
+                if (vout.value == 0 && vout.scriptPubKey.m_data.empty())
+                    return InjectGate::SpentShapedOutput;
                 vout_running += vout.value;
             }
         }
@@ -811,10 +845,140 @@ public:
             m_fee_deltas.erase(txid);
             return InjectGate::Unpriceable;
         }
+        // (7) S2 fee ceiling: the coinbase moves by exactly this fee.
+        if (it->second.fee > max_fee) {
+            LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                        << " fee=" << it->second.fee << " > max_fee=" << max_fee
+                        << " (inject-fee-above-max)";
+            remove_tx_locked(txid);
+            m_fee_deltas.erase(txid);
+            return InjectGate::FeeAboveMax;
+        }
+        // (8) S3a admission-time script verify (consensus-exact, every input).
+        {
+            std::vector<uint8_t> tx_bytes;
+            {
+                auto ps = ::pack(tx);
+                auto sp = ps.get_span();
+                const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+                tx_bytes.assign(b, b + sp.size());
+            }
+            const uint32_t sflags = script_flags_for_height(0);
+            for (uint32_t vi = 0; vi < tx.vin.size(); ++vi) {
+                ::core::coin::Outpoint op(tx.vin[vi].prevout.hash, tx.vin[vi].prevout.index);
+                std::vector<uint8_t> spk;
+                const bool resolved = resolve_input_spk_locked(op, spk);
+                if (!resolved || !m_script_check(tx_bytes, vi, spk, sflags)) {
+                    LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                                << " input " << vi << (resolved ? " fails VerifyScript"
+                                                                : " has no resolvable scriptPubKey")
+                                << " (inject-script-invalid)";
+                    remove_tx_locked(txid);
+                    m_fee_deltas.erase(txid);
+                    return InjectGate::ScriptInvalid;
+                }
+            }
+        }
         LOG_INFO << "[MEMPOOL] inject admitted txid=" << txid.GetHex().substr(0, 16)
-                 << " base_fee=" << it->second.fee
-                 << " prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
+                 << " base_fee=" << it->second.fee << " max_fee=" << max_fee
+                 << " scripts=ok prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
         return InjectGate::Ok;
+    }
+
+    /// The injects in the pool (the txids carrying INJECT_FEE_DELTA), for the
+    /// per-build RIDES / HELD lines.
+    std::vector<uint256> inject_txids_in_pool() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        for (const auto& [txid, delta] : m_fee_deltas)
+            if (delta == static_cast<decltype(delta)>(INJECT_FEE_DELTA) && m_pool.count(txid))
+                out.push_back(txid);
+        return out;
+    }
+
+    // ── Confirmed injects, kept for a rewind (VERIFY-S2 S-2) ──────────────
+    /// c2pool has no DisconnectedBlockTransactions: a tx a rewound block had
+    /// confirmed is not put back by itself, and dashd peers do not relay a
+    /// zero-fee inject back to us, so our node may hold its only copy. The
+    /// full set's lane hands every connected block here before
+    /// remove_for_block; the injects it confirms are kept (body and fee) for
+    /// as many blocks as a rewind can reach (the undo keep), bounded in bytes.
+    static constexpr uint32_t kConfirmedInjectDepth = DASH_MIN_BLOCKS_TO_KEEP;
+    static constexpr size_t   kMaxConfirmedInjectBytes = 4 * kMaxPinnedTotalBytes;
+
+    /// Keep the injects `block` (at `height`) confirms. Call before
+    /// remove_for_block(block), while they are still pool entries. Entries at
+    /// `height` or above (a branch no rewind went through) are dropped first.
+    void remember_confirmed_injects(const dash::coin::BlockType& block, uint32_t height) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= height)
+            pop_confirmed_inject_locked(/*front=*/false);
+        for (const auto& tx : block.m_txs) {
+            const uint256 txid = dash_txid(tx);
+            auto d = m_fee_deltas.find(txid);
+            auto it = m_pool.find(txid);
+            if (d == m_fee_deltas.end() || it == m_pool.end() || d->second != INJECT_FEE_DELTA)
+                continue;
+            ConfirmedInject c;
+            c.height = height;
+            c.txid = txid;
+            c.tx = it->second.tx;
+            c.fee = it->second.fee;
+            c.bytes = it->second.base_size;
+            m_confirmed_inject_bytes += c.bytes;
+            m_confirmed_injects.push_back(std::move(c));
+        }
+        while (!m_confirmed_injects.empty() &&
+               (m_confirmed_injects.front().height + kConfirmedInjectDepth < height ||
+                m_confirmed_inject_bytes > kMaxConfirmedInjectBytes))
+            pop_confirmed_inject_locked(/*front=*/true);
+    }
+
+    struct InjectReadmit {
+        std::vector<uint256> readmitted;
+        std::vector<std::pair<uint256, InjectGate>> refused;
+        std::vector<uint256> not_wanted;   // the inject ledger no longer tracks it
+    };
+
+    /// Whether a confirmed inject a rewind would put back is still wanted
+    /// (VERIFY-S2b S-B). NodeCoinState wires its inject ledger: an inject whose
+    /// expiry_height the tip passed was reaped from it, and would otherwise
+    /// come back untracked and never expire. Unset (a bare mempool): wanted.
+    using InjectWantedFn = std::function<bool(const uint256& txid)>;
+    void set_inject_still_wanted_fn(InjectWantedFn fn) { m_inject_still_wanted = std::move(fn); }
+
+    /// A rewind disconnected every block from `from_height` up: the injects
+    /// they confirmed go back through add_inject (the normal admission gate,
+    /// max_fee = the fee each was confirmed with), lowest height first so a
+    /// parent is back before its child. Each one leaves the kept list.
+    InjectReadmit readmit_disconnected_injects(uint32_t from_height) {
+        std::vector<ConfirmedInject> back;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= from_height) {
+                back.push_back(m_confirmed_injects.back());
+                pop_confirmed_inject_locked(/*front=*/false);
+            }
+        }
+        InjectReadmit r;
+        for (auto it = back.rbegin(); it != back.rend(); ++it) {
+            if (m_inject_still_wanted && !m_inject_still_wanted(it->txid)) {
+                r.not_wanted.push_back(it->txid);
+                continue;
+            }
+            const InjectGate g = add_inject(it->tx, it->fee);
+            if (g == InjectGate::Ok || g == InjectGate::AlreadyKnown)
+                r.readmitted.push_back(it->txid);
+            else
+                r.refused.emplace_back(it->txid, g);
+        }
+        return r;
+    }
+
+    /// How many confirmed injects are kept (diagnostics, KATs).
+    size_t confirmed_injects_kept() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_confirmed_injects.size();
     }
 
 private:
@@ -837,6 +1001,20 @@ private:
                          << dash_txid(tx).GetHex().substr(0, 16)
                          << " version16=" << wire_version_i16(tx.version)
                          << " type=" << tx.type;
+                return false;
+            }
+        }
+        // VERIFY-S2 Must-Fix 1, every seam: an output with value 0 and an
+        // empty scriptPubKey is consensus-valid (the full set keeps it as
+        // dashd does) but non-standard: dashd never relays or mines one, so
+        // only a peer that is not a dashd can send it, and it is never
+        // admitted or served here either (dashd relay parity). A lost fee at
+        // most, never a lost block.
+        for (const auto& vout : tx.vout) {
+            if (vout.value == 0 && vout.scriptPubKey.m_data.empty()) {
+                LOG_INFO << "[MEMPOOL] reject spent-shaped-output txid="
+                         << dash_txid(tx).GetHex().substr(0, 16)
+                         << " (an output with value 0 and an empty script)";
                 return false;
             }
         }
@@ -2311,6 +2489,24 @@ private:
     static constexpr size_t MAX_FEE_DELTAS = 10'000;
     std::map<uint256, uint64_t>                        m_fee_deltas;
     std::deque<uint256>                                m_fee_delta_order;
+    // VERIFY-S2 S-2: injects confirmed by the last kConfirmedInjectDepth
+    // connected blocks, oldest first (remember_confirmed_injects).
+    struct ConfirmedInject {
+        uint32_t           height{0};
+        uint256            txid;
+        MutableTransaction tx;
+        uint64_t           fee{0};
+        size_t             bytes{0};
+    };
+    std::deque<ConfirmedInject>                        m_confirmed_injects;
+    size_t                                             m_confirmed_inject_bytes{0};
+    InjectWantedFn                                     m_inject_still_wanted;
+    void pop_confirmed_inject_locked(bool front) {
+        auto& c = front ? m_confirmed_injects.front() : m_confirmed_injects.back();
+        m_confirmed_inject_bytes -= c.bytes;
+        if (front) m_confirmed_injects.pop_front();
+        else       m_confirmed_injects.pop_back();
+    }
     // Feed-liveness tick (last add_islock wall time; 0 = never) — the hold's
     // ISLOCK_FEED_FRESH_SECS self-disarm reads this under m_mutex.
     time_t                                             m_last_islock_seen{0};
@@ -2422,7 +2618,7 @@ private:
                                   std::vector<uint8_t>& spk_out) const {
         auto* utxo = m_utxo.load();
         ::core::coin::Coin coin;
-        if (utxo && utxo->get_coin(op, coin) && !coin.is_spent()) {
+        if (utxo && utxo->get_coin(op, coin)) {   // present == unspent (S2-3)
             spk_out = coin.scriptPubKey.m_data; return true;
         }
         auto pit = m_pool.find(op.txid);

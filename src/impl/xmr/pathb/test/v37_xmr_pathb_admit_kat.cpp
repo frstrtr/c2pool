@@ -1719,7 +1719,8 @@ void contract() {
             check(nc.verdict == AdmitVerdict::AdmitPending && m.keys.computations() == 0,
                   "extension point: a NotComputed #12 is not run (key-cache counter 0)");
             dv.only_tip.reset();
-            // row 31 (Live) on a claim basis: a dead placement -> ClaimAlarm; a live one is placed
+            // row 31 (Live) on a claim basis: a dead placement is placed with weight 0, as with claims == nullptr
+            // (ruling 62); a live one is placed
             {
                 std::uint64_t tp = 59;
                 while (tp % 12 != 11) --tp;
@@ -1733,11 +1734,12 @@ void contract() {
                 const std::size_t al = m.alarm.count();
                 const pb::AdmitResult d1 = admit(m, cd), l1 = admit(m, cl);
                 check(d0.verdict == AdmitVerdict::AdmitCarrier && d0.placements.size() == 1 && !d0.placements[0].live
-                              && deferred(d1, Missing::ClaimAlarm) && d1.row == RowId::R31 && d1.alarm && d1.strike == 0
-                              && m.alarm.count() == al + 1 && m.alarm.last()->basis == pb::Basis::ClaimSpan
+                              && d1.verdict == AdmitVerdict::AdmitCarrier && d1.placements.size() == 1 && !d1.placements[0].live
+                              && d1.placements[0].id == d0.placements[0].id && !d1.alarm && d1.strike == 0
+                              && m.alarm.count() == al
                               && l1.verdict == AdmitVerdict::AdmitCarrier && l1.placements.size() == 1 && l1.placements[0].live,
-                      "extension point: row 31 on a ClaimSpan basis: a dead placement -> DEFER + local alarm, 0 tokens "
-                      "(claims == nullptr: placed with weight 0); a live one placed (" + desc(d1) + ")");
+                      "extension point: row 31 on a ClaimSpan basis: a dead placement is placed with weight 0, no alarm, "
+                      "0 tokens (as with claims == nullptr; ruling 62); a live one placed (" + desc(d1) + ")");
             }
             // row 17 (Walk) on a claim basis: a walk that does not pass -> ClaimAlarm
             {

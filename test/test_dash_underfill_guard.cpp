@@ -115,9 +115,10 @@ static MutableTransaction make_spend(const uint256& prev, uint32_t idx,
 }
 
 // A deliberately BULKY spend: one funded input, n_outputs zero-value
-// empty-script outputs (~9 wire bytes each). Zero-value outputs make the
+// OP_RETURN outputs (~10 wire bytes each). Zero-value outputs make the
 // whole input a KNOWN fee, and the output fan inflates base_size past the
-// near-empty floor without needing thousands of separate txs.
+// near-empty floor without needing thousands of separate txs. (An output
+// with value 0 and an EMPTY script is never admitted: VERIFY-S2 Must-Fix 1.)
 static MutableTransaction make_bulk_spend(const uint256& prev, uint32_t idx,
                                           size_t n_outputs, uint32_t salt) {
     MutableTransaction tx;
@@ -128,6 +129,8 @@ static MutableTransaction make_bulk_spend(const uint256& prev, uint32_t idx,
     tx.vout.reserve(n_outputs);
     for (size_t i = 0; i < n_outputs; ++i) {
         TxOut o; o.value = 0;       // zero-value → entire input value is fee
+        const unsigned char op_return = 0x6a;
+        o.scriptPubKey = OPScript(&op_return, &op_return + 1);
         tx.vout.push_back(o);
     }
     return tx;
@@ -211,8 +214,8 @@ TEST(DashUnderfillGuard, BuildTripsWhenSelectionGoesEmptyOnFeePayingBacklog) {
                     Coin(1'000'000, {}, /*height=*/1, /*cb=*/false));
     Mempool mp;
     mp.set_utxo(&funded);
-    // ~9 wire bytes per zero-value empty-script output → 12'000 outputs
-    // (~108 kB) is comfortably past floor+slack. Assert instead of assuming.
+    // ~10 wire bytes per zero-value OP_RETURN output → 12'000 outputs
+    // (~120 kB) is comfortably past floor+slack. Assert instead of assuming.
     auto bulk = make_bulk_spend(prev, 0, /*n_outputs=*/12'000, /*salt=*/1);
     ASSERT_TRUE(mp.add_tx(bulk));
     ASSERT_GT(mp.byte_size(), UNDERFILL_MIN_FILL_BYTES + UNDERFILL_BACKLOG_SLACK);

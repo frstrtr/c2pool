@@ -26,6 +26,8 @@
 
 #include <secp256k1.h>
 
+#include <btclibs/crypto/sha256.h>   // S2 A8: the independent sighash
+
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -232,4 +234,52 @@ TEST(DashCheckInputScripts, OffIsByteIdenticalToMaster)
     EXPECT_EQ(selected.size(), 2u)
         << "OFF: selection is byte-identical to master (both priced txs kept)";
     EXPECT_EQ(fees, 30'000u);   // 10000 + 20000
+}
+
+// (S2, A8) dashd v23.1.9 PackVersionAndType (07494dd62): nVersion fills the
+// low half of the 32-bit version field as raw bits. A tx whose wire field is
+// 0x0001FFFF (nVersion -1, nType 1) must sign over ff ff 01 00, not the
+// sign-extended ff ff ff ff that overwrote nType before. The expected sighash
+// is assembled here independently (legacy SIGHASH_ALL preimage, SHA256d).
+TEST(DashCheckInputScripts, PackVersionAndTypeSighashParity)
+{
+    const std::vector<uint8_t> spk = {0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                      11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x88, 0xac};
+    auto body = [&](bool with_script_code) {
+        std::vector<uint8_t> t = {0xff, 0xff, 0x01, 0x00};          // nVersion -1, nType 1
+        t.push_back(1);                                              // vin
+        t.insert(t.end(), 32, 0x11);                                 // prevout hash
+        t.insert(t.end(), {0, 0, 0, 0});                             // prevout n
+        if (with_script_code) {
+            t.push_back(static_cast<uint8_t>(spk.size()));
+            t.insert(t.end(), spk.begin(), spk.end());
+        } else {
+            t.push_back(0);                                          // empty scriptSig
+        }
+        t.insert(t.end(), {0xff, 0xff, 0xff, 0xff});                 // nSequence
+        t.push_back(1);                                              // vout
+        t.insert(t.end(), {0xe8, 0x03, 0, 0, 0, 0, 0, 0});           // 1000
+        t.push_back(static_cast<uint8_t>(spk.size()));
+        t.insert(t.end(), spk.begin(), spk.end());
+        t.insert(t.end(), {0, 0, 0, 0});                             // nLockTime
+        return t;
+    };
+    const std::vector<uint8_t> tx = body(false);
+    std::vector<uint8_t> preimage = body(true);
+    preimage.insert(preimage.end(), {0x01, 0, 0, 0});                // SIGHASH_ALL
+    uint8_t first[32], want[32];
+    CSHA256().Write(preimage.data(), preimage.size()).Finalize(first);
+    CSHA256().Write(first, 32).Finalize(want);
+
+    uint8_t got[32];
+    ASSERT_EQ(c2pool_dash_legacy_sighash(tx.data(), (unsigned)tx.size(), 0, spk.data(), (unsigned)spk.size(),
+                                         1, got), 1);
+    EXPECT_EQ(std::memcmp(got, want, 32), 0) << "the sighash preimage must start ff ff 01 00";
+
+    c2pool_dash_tx_probe probe{};
+    ASSERT_EQ(c2pool_dash_tx_decode_probe(tx.data(), (unsigned)tx.size(), &probe), 1);
+    EXPECT_EQ(probe.n_version, -1);
+    EXPECT_EQ(probe.n_type, 1u);
+    EXPECT_EQ(probe.payload_len, 0u);
+    EXPECT_EQ(probe.consumed, tx.size());
 }

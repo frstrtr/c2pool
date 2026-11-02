@@ -14,6 +14,8 @@
 ///                                       height, aged out by prune_undo)
 ///   'R' + height(4B BE)             →  BlockUndo format 2 (serialize_block_undo_v2)
 ///   'F' + height(4B BE)             →  raw serialized full block (explorer)
+///   'S'                              →  sync state (SyncState below), written
+///                                       in the same batch as 'B'
 ///
 /// Reference: Litecoin Core txdb.h CCoinsViewDB
 
@@ -24,6 +26,7 @@
 #include <core/log.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -31,6 +34,60 @@
 
 namespace core {
 namespace coin {
+
+/// What the set holds and how it was built ('S'). A DB without the record is
+/// a legacy accrual view: anchor unknown, not strict.
+///
+/// Value: u8 version (1) | u32 LE anchor_height | u32 LE best_height |
+///        u8 flags (bit 0 strict, bit 1 synced) | u64 LE coins
+struct SyncState {
+    static constexpr uint32_t ANCHOR_UNKNOWN = 0xFFFFFFFFu;
+    static constexpr uint8_t  VERSION = 1;
+    static constexpr uint8_t  FLAG_STRICT = 1;
+    static constexpr uint8_t  FLAG_SYNCED = 2;
+    static constexpr size_t   SIZE = 1 + 4 + 4 + 1 + 8;
+
+    uint32_t anchor_height{ANCHOR_UNKNOWN};  // first height whose coins the set holds (0 = from genesis)
+    uint32_t best_height{0};                 // mirrors 'B'
+    uint8_t  strict{0};                      // 1 = connect refuses an unknown input (full mode)
+    uint8_t  synced{0};                      // 1 = the set has reached the header chain's tip once
+    uint64_t coins{0};                       // coins in the set (counted by the connects since anchor 0)
+
+    /// The record exists (the set knows its anchor).
+    bool tracked() const { return anchor_height != ANCHOR_UNKNOWN; }
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> v(SIZE, 0);
+        v[0] = VERSION;
+        for (int i = 0; i < 4; ++i) {
+            v[1 + i] = static_cast<uint8_t>(anchor_height >> (8 * i));
+            v[5 + i] = static_cast<uint8_t>(best_height >> (8 * i));
+        }
+        v[9] = static_cast<uint8_t>((strict ? FLAG_STRICT : 0) | (synced ? FLAG_SYNCED : 0));
+        for (int i = 0; i < 8; ++i)
+            v[10 + i] = static_cast<uint8_t>(coins >> (8 * i));
+        return v;
+    }
+
+    /// False (state left as it was) for a record of another version or size.
+    bool deserialize(const std::vector<uint8_t>& v) {
+        if (v.size() != SIZE || v[0] != VERSION)
+            return false;
+        SyncState s;
+        s.anchor_height = 0;
+        s.best_height = 0;
+        for (int i = 0; i < 4; ++i) {
+            s.anchor_height |= uint32_t(v[1 + i]) << (8 * i);
+            s.best_height |= uint32_t(v[5 + i]) << (8 * i);
+        }
+        s.strict = (v[9] & FLAG_STRICT) ? 1 : 0;
+        s.synced = (v[9] & FLAG_SYNCED) ? 1 : 0;
+        for (int i = 0; i < 8; ++i)
+            s.coins |= uint64_t(v[10 + i]) << (8 * i);
+        *this = s;
+        return true;
+    }
+};
 
 class UTXOViewDB {
 public:
@@ -45,9 +102,12 @@ public:
             return false;
         // Load best block state
         load_best_block();
+        load_sync_state();
         LOG_INFO << "[UTXO-DB] opened at " << m_store.is_open()
                  << " best_height=" << m_best_height
-                 << " best_block=" << m_best_block.GetHex().substr(0, 16);
+                 << " best_block=" << m_best_block.GetHex().substr(0, 16)
+                 << " anchor=" << (m_sync.tracked() ? std::to_string(m_sync.anchor_height) : std::string("unknown"))
+                 << " strict=" << int(m_sync.strict) << " synced=" << int(m_sync.synced);
         return true;
     }
 
@@ -76,6 +136,36 @@ public:
     uint256 get_best_block() const { return m_best_block; }
     uint32_t get_best_height() const { return m_best_height; }
 
+    // ── Sync state ('S') ────────────────────────────────────────────────
+
+    /// The set's sync state; {anchor unknown, not strict} without a record.
+    SyncState get_sync_state() const { return m_sync; }
+
+    /// Write the sync state now (its best_height is the DB's best). Every
+    /// later write_batch rewrites it with the new best in the same batch.
+    bool put_sync_state(SyncState s) {
+        s.best_height = m_best_height;
+        auto batch = m_store.create_batch();
+        batch.put(make_sync_key(), s.serialize());
+        if (!batch.commit())
+            return false;
+        m_sync = s;
+        return true;
+    }
+
+    // ── Raw records (digest) ────────────────────────────────────────────
+
+    /// Ordered scan of the raw records under `prefix` (false: scan error).
+    bool for_each_record(const std::string& prefix,
+                         const std::function<bool(const std::string&, const std::vector<uint8_t>&)>& fn) {
+        return m_store.for_each_prefix(prefix, fn);
+    }
+
+    /// One raw record (false: absent).
+    bool get_record(const std::string& key, std::vector<uint8_t>& value) {
+        return m_store.get(key, value);
+    }
+
     // ── Batch write (atomic block connection) ───────────────────────────
 
     /// Flags for coin changes:
@@ -85,10 +175,13 @@ public:
     using ChangeMap = std::unordered_map<Outpoint, CoinChange, OutpointHasher>;
 
     /// Atomically apply a batch of coin changes and update best block.
-    /// This is called once per block connection or disconnection.
+    /// This is called once per block connection or disconnection. A tracked
+    /// set ('S' present) gets its sync state in the same batch: best_height
+    /// and coins (+ coin_delta) never disagree with 'B' after a crash.
     bool write_batch(const ChangeMap& changes,
                      const uint256& best_block,
-                     uint32_t best_height) {
+                     uint32_t best_height,
+                     int64_t coin_delta = 0) {
         auto batch = m_store.create_batch();
 
         for (const auto& [op, change] : changes) {
@@ -115,11 +208,20 @@ public:
             batch.put(make_state_key(), state_data);
         }
 
+        SyncState sync = m_sync;
+        if (sync.tracked()) {
+            sync.best_height = best_height;
+            const int64_t coins = static_cast<int64_t>(sync.coins) + coin_delta;
+            sync.coins = coins > 0 ? static_cast<uint64_t>(coins) : 0;
+            batch.put(make_sync_key(), sync.serialize());
+        }
+
         if (!batch.commit())
             return false;
 
         m_best_block = best_block;
         m_best_height = best_height;
+        m_sync = sync;
         return true;
     }
 
@@ -256,7 +358,8 @@ public:
 
     /// Wipe the entire persisted accrual view — every coin ('C'), undo record
     /// ('U', 'R') and retained raw block ('F') — and reset best-block state to zero,
-    /// so accrual restarts fresh from the next connected block. Used when the
+    /// so accrual restarts fresh from the next connected block. The sync state
+    /// ('S') goes too: the anchor is unknown until the next arm writes one. Used when the
     /// confirmed header tip has advanced past the persisted view by more than
     /// one block (e.g. after a restart): the stale view cannot legally extend
     /// by one, so it is dropped and re-anchored rather than latching dead.
@@ -286,11 +389,13 @@ public:
             std::vector<uint8_t> state_data(36, 0);
             batch.put(make_state_key(), state_data);
         }
+        batch.remove(make_sync_key());
         if (!batch.commit())
             return false;  // commit failure -> fail-closed, cached fields intact.
         m_best_block = uint256();
         m_best_height = 0;
         m_oldest_block_height = 0;
+        m_sync = SyncState{};
         return true;
     }
 
@@ -299,6 +404,7 @@ private:
     uint256  m_best_block;
     uint32_t m_best_height{0};
     uint32_t m_oldest_block_height{0};  // for raw block pruning
+    SyncState m_sync;
 
     // ── Key construction ────────────────────────────────────────────────
 
@@ -310,10 +416,16 @@ private:
         return key;
     }
 
+public:
+    /// 'B' (best block) and 'S' (sync state) record keys.
     static std::string make_state_key() {
         return std::string(1, 'B');
     }
+    static std::string make_sync_key() {
+        return std::string(1, 'S');
+    }
 
+private:
     static std::string make_height_key(char prefix, uint32_t height) {
         std::string key;
         key.reserve(5);  // prefix + 4 bytes (big-endian for sorted iteration)
@@ -336,6 +448,17 @@ private:
             m_best_height = uint32_t(data[32]) | (uint32_t(data[33]) << 8)
                           | (uint32_t(data[34]) << 16) | (uint32_t(data[35]) << 24);
         }
+    }
+
+    void load_sync_state() {
+        m_sync = SyncState{};
+        std::vector<uint8_t> data;
+        if (m_store.get(make_sync_key(), data) && !m_sync.deserialize(data))
+            LOG_ERROR << "[UTXO-DB] sync state record unreadable (" << data.size()
+                      << " bytes); read as a legacy accrual view";
+        if (m_sync.tracked() && m_sync.best_height != m_best_height)
+            LOG_ERROR << "[UTXO-DB] sync state best_height=" << m_sync.best_height
+                      << " disagrees with the best block's height " << m_best_height;
     }
 };
 

@@ -44,6 +44,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -189,7 +190,16 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 /// through select_work().
 class NodeCoinState {
 public:
-    NodeCoinState() = default;
+    NodeCoinState() {
+        // VERIFY-S2b S-B: a rewind puts back only the injects this ledger
+        // still tracks. The ledger keeps a confirmed inject until its
+        // expiry_height (reconcile_inject_pool), so a reaped one is expired
+        // and stays out instead of coming back untracked. (If the ledger ever
+        // forgets on confirm, it must keep confirmed entries for the undo keep
+        // or this must change with it.)
+        m_mempool.set_inject_still_wanted_fn(
+            [this](const uint256& txid) { return m_inject_pool.contains(txid); });
+    }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
 
@@ -554,6 +564,9 @@ public:
         m_curtime              = curtime;
         m_version              = version;
         m_populated            = true;
+        // S2: an inject whose expiry_height the new tip reached leaves the pool
+        // and the mempool now, not at the next submit.
+        reconcile_inject_pool();
     }
 
     /// Invalidate the bundle (reorg / mempool flush / MN list gap) so the next
@@ -688,10 +701,15 @@ public:
     /// finality / double-spend) runs at template build and DROPS an invalid
     /// inject there — it is never served. `flags` and `expiry_height` are the
     /// design's wire fields (carried for M2/M3). io-thread only.
+    /// `max_fee` (S2): the highest fee the submitter allows; a priced fee above
+    /// it refuses inject-fee-above-max. The library default is no cap; the
+    /// operator entry points in main_dash pass 0 (the zero-fee sweep) unless
+    /// the submit body names one.
     InjectSubmitResult submit_inject(const MutableTransaction& tx,
                                      uint32_t flags = 0,
                                      int32_t expiry_height = 0,
-                                     InjectOrigin origin = InjectOrigin::Local) {
+                                     InjectOrigin origin = InjectOrigin::Local,
+                                     uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         InjectSubmitResult r;
         r.txid = dash::coin::dash_txid(tx);
         if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
@@ -796,7 +814,7 @@ public:
         }
         // Mempool admission with priority (runs the validity/dedup/script-armed
         // gate). Priority = offered first, NOT a guard bypass.
-        auto gv = m_mempool.add_inject(tx);
+        auto gv = m_mempool.add_inject(tx, max_fee);
         if (gv != dash::coin::Mempool::InjectGate::Ok) {
             r.cause = dash::coin::Mempool::inject_gate_name(gv); return r;
         }
@@ -810,8 +828,9 @@ public:
 
     /// Reconcile the inject ledger with the live mempool + tip: drop tracked
     /// injects that have left the mempool (confirmed / conflict-evicted) or have
-    /// expired, evicting the expired ones from the mempool too. Called lazily
-    /// from submit_inject and exposed for a block-connect wiring in a later PR.
+    /// expired, evicting the expired ones from the mempool too. Called from
+    /// submit_inject and (S2) on every tip advance (set_tip), so an expiry_height
+    /// withdraws an inject without a second submit.
     void reconcile_inject_pool() {
         if (m_inject_pool.empty()) return;
         // Expiry against our own tip.
