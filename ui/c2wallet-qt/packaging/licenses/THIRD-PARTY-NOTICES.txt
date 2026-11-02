@@ -1,0 +1,34 @@
+c2wallet-qt-signer: licenses of what this package contains
+===========================================================
+
+c2wallet-qt-signer itself
+    GNU Affero General Public License v3.0 or later: LICENSE-AGPL-3.0.txt.
+    Source: https://github.com/frstrtr/c2pool (ui/c2wallet-qt), at the tag
+    this package was built from.
+
+Qt 6 (Core, Gui, Widgets and their plugins), dynamically linked and shipped
+as separate libraries next to the program, so they can be replaced
+    GNU Lesser General Public License v3.0: LGPL-3.0.txt, which supplements
+    GPL-3.0.txt. Copyright (C) The Qt Company Ltd. and other contributors.
+    Source: https://download.qt.io/official_releases/qt/ (the version that
+    `c2wallet-qt-signer --version` prints).
+
+libsecp256k1
+    MIT license: libsecp256k1-COPYING.txt (macOS and Windows packages, built
+    from the pinned bitcoin-core/secp256k1 tag), or the Debian copyright file
+    under usr/share/doc/ (Linux package, Ubuntu libsecp256k1).
+    Source: https://github.com/bitcoin-core/secp256k1
+
+zlib (Linux and macOS: the system library; Windows: statically linked)
+    zlib license. Copyright (C) Jean-loup Gailly and Mark Adler.
+    Source: https://zlib.net/
+
+Monero crypto (crypto-ops, keccak, hash), compiled into the program
+    BSD 3-Clause: Monero-BSD-3-Clause.txt.
+
+btclibs (hashing, base58), compiled into the program
+    MIT license, Copyright (c) The Bitcoin Core developers, as carried in the
+    c2pool source tree.
+
+On Linux, the Debian copyright file of every bundled system library is also
+kept under usr/share/doc/ inside the package.

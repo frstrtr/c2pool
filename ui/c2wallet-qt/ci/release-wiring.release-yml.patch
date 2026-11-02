@@ -1,0 +1,653 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index c6b37a6..ae2c036 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -46,6 +46,10 @@ on:
+         description: "Route every lane to GitHub-hosted runners (fresh default-boost per run). Set true for release builds that must dodge the self-hosted cppstd=20 spirit::x3 boost issue."
+         required: false
+         default: ""
++      components:
++        description: "What to package: node, c2wallet, or node,c2wallet (default). c2wallet = the c2wallet-qt jobs only (dry run without six coins)."
++        required: false
++        default: "node,c2wallet"
+ 
+ concurrency:
+   group: release-${{ github.ref }}
+@@ -68,6 +72,7 @@ jobs:
+   # ════════════════════════════════════════════════════════════════════════════
+   linux:
+     name: ${{ matrix.coin }} package (Linux x86_64)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'node')
+     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+     strategy:
+       fail-fast: false
+@@ -293,6 +298,7 @@ jobs:
+   # ════════════════════════════════════════════════════════════════════════════
+   macos:
+     name: ${{ matrix.coin }} ${{ matrix.arch }} (macOS build)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'node')
+     runs-on: ${{ matrix.runner }}
+     strategy:
+       fail-fast: false
+@@ -409,7 +415,7 @@ jobs:
+   macos-universal:
+     name: ${{ matrix.coin }} package (macOS universal)
+     needs: macos
+-    if: always()
++    if: always() && contains(github.event.inputs.components || 'node,c2wallet', 'node')
+     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
+     strategy:
+       fail-fast: false
+@@ -514,6 +520,7 @@ jobs:
+   # ════════════════════════════════════════════════════════════════════════════
+   windows:
+     name: ${{ matrix.coin }} package (Windows x86_64)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'node')
+     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
+     defaults:
+       run:
+@@ -743,6 +750,595 @@ jobs:
+           # Still non-fatal — the portable .zip remains the must-have deliverable.
+           if-no-files-found: warn
+ 
++  # ════════════════════════════════════════════════════════════════════════════
++  # c2wallet-qt packages (ui/c2wallet-qt/ci/CI_WIRING.md). The offline,
++  # key-bearing signer ships next to the node packages, in the same draft and
++  # the same SHA256SUMS (pkg-c2wallet-* artifacts): Linux x86_64 (AppImage +
++  # tarball), macOS universal (.app zip + DMG), Windows x86_64 (zip +
++  # setup.exe). Every signer job re-runs the network-incapable proof on the
++  # PACKAGED binary (platform link-guard + package scan) and a --version smoke.
++  # Qt is linked dynamically and bundled by the official deploy tools. The
++  # online companion ships in its own tarball: the signer and the companion
++  # are never in one package (one is proven network-incapable, the other
++  # key-free). workflow_dispatch components=c2wallet builds these jobs only.
++  # ════════════════════════════════════════════════════════════════════════════
++  c2wallet-linux:
++    name: c2wallet-qt-signer package (Linux x86_64)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'c2wallet')
++    # draft-release: the persistent pool with NOPASSWD sudo + Qt6 that build.yml's
++    # c2wallet-signer-guard uses, so the PR-time proof and the shipped package
++    # come from one toolchain (Ubuntu 24.04 qt6-base-dev; glibc floor 2.39).
++    runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
++    timeout-minutes: 40
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Resolve version
++        id: ver
++        run: |
++          if [ -n "${{ github.event.inputs.version }}" ]; then
++            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
++          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
++            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
++          else
++            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
++          fi
++
++      - name: Check source presence
++        id: presence
++        run: |
++          if [ -f ui/c2wallet-qt/CMakeLists.txt ] && [ -f installer/linux/c2wallet-appimage.sh ]; then
++            echo "exists=1" >> "$GITHUB_OUTPUT"
++          else
++            echo "exists=0" >> "$GITHUB_OUTPUT"
++            echo "::warning::c2wallet-qt packaging not on this ref -- no signer Linux package will be produced."
++          fi
++
++      - name: Install Qt6 base + toolchain
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          flock /tmp/c2pool-apt.lock bash -e -c '
++            sudo apt-get update -qq
++            sudo apt-get install -y --no-install-recommends \
++              cmake g++ binutils file curl ca-certificates \
++              qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins libgl1-mesa-dev libxkbcommon-dev \
++              libsecp256k1-dev zlib1g-dev
++          '
++          # Qt and secp256k1 are pinned by the distro release; record what was used.
++          dpkg-query -W qt6-base-dev libsecp256k1-dev zlib1g-dev g++ cmake
++
++      - name: Configure (packaging, reproducible flags)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          cmake -S ui/c2wallet-qt -B build-c2w -DCMAKE_BUILD_TYPE=Release \
++            -DC2WALLET_QT_PACKAGING=ON -DC2WALLET_QT_VERSION="${{ steps.ver.outputs.version }}" \
++            -DCMAKE_C_FLAGS="-ffile-prefix-map=$PWD=." -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$PWD=."
++
++      - name: Build c2wallet-qt-signer
++        if: steps.presence.outputs.exists == '1'
++        run: cmake --build build-c2w --target c2wallet-qt-signer -j"${BUILD_J:-8}"
++
++      - name: Network-incapable link-guard (build tree, before packaging)
++        if: steps.presence.outputs.exists == '1'
++        run: ./ui/c2wallet-qt/ci/check_no_network.sh build-c2w/c2wallet-qt-signer
++
++      - name: AppDir -> AppImage + tarball (pinned linuxdeploy)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          bash installer/linux/c2wallet-appimage.sh --profile signer \
++            --version "${{ steps.ver.outputs.version }}" \
++            --binary build-c2w/c2wallet-qt-signer --out dist-c2w
++
++      - name: Guards + smoke on the PACKAGED signer
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          V="${{ steps.ver.outputs.version }}"
++          PKG="c2wallet-qt-signer-${V}-linux-x86_64"
++          cd dist-c2w
++          rm -rf squashfs-root unpacked
++          chmod +x "${PKG}.AppImage"
++          "./${PKG}.AppImage" --appimage-extract >/dev/null
++          ../ui/c2wallet-qt/ci/check_no_network.sh squashfs-root/usr/bin/c2wallet-qt-signer
++          ../ui/c2wallet-qt/ci/check_package_no_network.sh squashfs-root
++          (cd squashfs-root && sha256sum -c --quiet MANIFEST.txt)
++          out="$(squashfs-root/AppRun --version)"
++          echo "$out"
++          echo "$out" | grep -qxF "c2wallet-qt-signer ${V}"
++          echo "$out" | grep -q "network-incapable build"
++          APPIMAGE_EXTRACT_AND_RUN=1 "./${PKG}.AppImage" --version | grep -q "network-incapable build"
++          mkdir unpacked && tar -xzf "${PKG}.tar.gz" -C unpacked
++          (cd "unpacked/${PKG}" && sha256sum -c --quiet MANIFEST.txt)
++          ../ui/c2wallet-qt/ci/check_package_no_network.sh "unpacked/${PKG}"
++          rm -rf squashfs-root unpacked
++
++      - name: Upload signer packages
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-linux
++          path: |
++            dist-c2w/c2wallet-qt-signer-*-linux-x86_64.tar.gz
++            dist-c2w/c2wallet-qt-signer-*-linux-x86_64.AppImage
++
++      - name: Prune runner workspace
++        if: always()
++        uses: ./.github/actions/prune-runner-workspace
++
++  # macOS: ONE job builds the universal app from one universal Qt (aqt
++  # clang_64 is arm64 + x86_64) with CMAKE_OSX_ARCHITECTURES, instead of the
++  # node's two-runner lipo merge. Fallback if the universal Qt misbehaves: two
++  # copies of this job on c2pool-mac-arm / c2pool-mac-intel, each with
++  # -DCMAKE_OSX_ARCHITECTURES=<arch>, then `lipo -create` of the two
++  # Contents/MacOS binaries into one bundle before macdeployqt and codesign
++  # (the macos-universal pattern above).
++  c2wallet-macos:
++    name: c2wallet-qt-signer package (macOS universal)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'c2wallet')
++    runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","macOS","ARM64","c2pool-mac-arm"]') || 'macos-14' }}
++    timeout-minutes: 60
++    env:
++      QT_VERSION: '6.8.3'      # last open-source 6.8 LTS patch; needs macOS 12+ (6.5.3 for macOS 11)
++      AQT_VERSION: '3.3.0'
++      SECP256K1_TAG: 'v0.7.1'
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Resolve version
++        id: ver
++        run: |
++          if [ -n "${{ github.event.inputs.version }}" ]; then
++            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
++          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
++            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
++          else
++            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
++          fi
++
++      - name: Check source presence
++        id: presence
++        run: |
++          if [ -f ui/c2wallet-qt/CMakeLists.txt ] && [ -f ui/c2wallet-qt/packaging/Info.plist.in ]; then
++            echo "exists=1" >> "$GITHUB_OUTPUT"
++          else
++            echo "exists=0" >> "$GITHUB_OUTPUT"
++            echo "::warning::c2wallet-qt packaging not on this ref -- no signer macOS package will be produced."
++          fi
++
++      - name: Toolchain (cmake from Homebrew if missing, aqtinstall in a private venv)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          for p in /opt/homebrew/bin /usr/local/bin; do [ -x "$p/brew" ] && export PATH="$p:$PATH" && echo "$p" >> "$GITHUB_PATH"; done
++          command -v cmake >/dev/null || brew install cmake
++          xcodebuild -version; cmake --version; python3 --version
++          python3 -m venv "$RUNNER_TEMP/aqt-venv"
++          "$RUNNER_TEMP/aqt-venv/bin/pip" install --quiet "aqtinstall==${AQT_VERSION}"
++
++      - name: Restore Qt
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/cache@v5
++        with:
++          path: ${{ runner.temp }}/Qt
++          key: qt-${{ env.QT_VERSION }}-mac-clang_64-aqt${{ env.AQT_VERSION }}
++
++      - name: Install Qt (universal clang_64, pinned)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          QT_DIR="$RUNNER_TEMP/Qt/${QT_VERSION}/macos"
++          if [ ! -x "$QT_DIR/bin/macdeployqt" ]; then
++            "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt mac desktop "${QT_VERSION}" clang_64 --outputdir "$RUNNER_TEMP/Qt"
++          fi
++          lipo -info "$QT_DIR/lib/QtCore.framework/QtCore"
++          echo "QT_DIR=$QT_DIR" >> "$GITHUB_ENV"
++
++      - name: Build libsecp256k1 (pinned tag, universal, static, recovery module)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          for i in 1 2 3; do
++            git clone --depth 1 --branch "${SECP256K1_TAG}" https://github.com/bitcoin-core/secp256k1 secp256k1-src && break
++            [ "$i" = 3 ] && { echo "::error::secp256k1 clone failed after 3 attempts"; exit 1; }
++            rm -rf secp256k1-src; sleep $((i * 5))
++          done
++          cmake -S secp256k1-src -B secp256k1-src/build -DCMAKE_BUILD_TYPE=Release \
++            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
++            -DBUILD_SHARED_LIBS=OFF -DSECP256K1_ENABLE_MODULE_RECOVERY=ON \
++            -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF \
++            -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF \
++            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/secp256k1-universal"
++          cmake --build secp256k1-src/build -j 8
++          cmake --install secp256k1-src/build
++          lipo -info secp256k1-universal/lib/libsecp256k1.a
++
++      - name: Configure (universal, packaging)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          SECP="$GITHUB_WORKSPACE/secp256k1-universal"
++          cmake -S ui/c2wallet-qt -B build-c2w -DCMAKE_BUILD_TYPE=Release \
++            -DCMAKE_PREFIX_PATH="$QT_DIR" \
++            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
++            -DSECP256K1_LIB="$SECP/lib/libsecp256k1.a" \
++            -DCMAKE_C_FLAGS="-I$SECP/include -ffile-prefix-map=$PWD=." \
++            -DCMAKE_CXX_FLAGS="-I$SECP/include -ffile-prefix-map=$PWD=." \
++            -DC2WALLET_QT_PACKAGING=ON -DC2WALLET_QT_VERSION="${{ steps.ver.outputs.version }}"
++
++      - name: Build c2wallet-qt-signer.app
++        if: steps.presence.outputs.exists == '1'
++        run: cmake --build build-c2w --target c2wallet-qt-signer -j 8
++
++      - name: Deploy Qt into the bundle, ad-hoc sign
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          APP=build-c2w/c2wallet-qt-signer.app
++          "$QT_DIR/bin/macdeployqt" "$APP" -verbose=1 -always-overwrite
++          mkdir -p "$APP/Contents/Resources/licenses"
++          cp LICENSE "$APP/Contents/Resources/licenses/LICENSE-AGPL-3.0.txt"
++          cp ui/c2wallet-qt/packaging/licenses/*.txt "$APP/Contents/Resources/licenses/"
++          cp secp256k1-src/COPYING "$APP/Contents/Resources/licenses/libsecp256k1-COPYING.txt"
++          cp ui/c2wallet-qt/packaging/README-SIGNER.txt "$APP/Contents/Resources/"
++          # macdeployqt / install_name_tool invalidate the linker's ad-hoc
++          # signature, and arm64 refuses to run unsigned code: re-sign ad hoc.
++          codesign --force --deep --sign - "$APP"
++          codesign --verify --deep --strict --verbose=2 "$APP"
++
++      - name: Guards + smoke on the PACKAGED app
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          APP=build-c2w/c2wallet-qt-signer.app
++          BIN="$APP/Contents/MacOS/c2wallet-qt-signer"
++          lipo -info "$BIN"
++          bash ui/c2wallet-qt/ci/check_no_network_macho.sh "$BIN"
++          bash ui/c2wallet-qt/ci/check_package_no_network.sh "$APP"
++          out="$("$BIN" --version)"
++          echo "$out"
++          echo "$out" | grep -qxF "c2wallet-qt-signer ${{ steps.ver.outputs.version }}"
++          if arch -x86_64 /usr/bin/true 2>/dev/null; then
++            arch -x86_64 "$BIN" --version | grep -q "network-incapable build"
++            echo "x86_64 slice executed under Rosetta"
++          else
++            echo "::notice::Rosetta absent: the x86_64 slice is build-only on this runner (weaker proof than an Intel runner)"
++          fi
++
++      - name: Stage, zip, DMG
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          V="${{ steps.ver.outputs.version }}"
++          PKG="c2wallet-qt-signer-${V}-macos-universal"
++          rm -rf "$PKG" && mkdir -p "$PKG/licenses"
++          ditto build-c2w/c2wallet-qt-signer.app "$PKG/c2wallet-qt-signer.app"
++          cp ui/c2wallet-qt/packaging/README-SIGNER.txt "$PKG/"
++          cp "$PKG/c2wallet-qt-signer.app/Contents/Resources/licenses/"* "$PKG/licenses/"
++          (cd "$PKG" && find . -type f ! -name MANIFEST.txt -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) > MANIFEST.tmp
++          mv MANIFEST.tmp "$PKG/MANIFEST.txt"
++          codesign --verify --deep --strict "$PKG/c2wallet-qt-signer.app"
++          TS="$(TZ=UTC date -r "$(git log -1 --format=%ct)" +%Y%m%d%H%M.%S)"
++          TZ=UTC find "$PKG" -exec touch -h -t "$TS" {} +
++          # ditto keeps the framework symlinks and the code signature intact.
++          ditto -c -k --sequesterRsrc --keepParent "$PKG" "${PKG}.zip"
++          bash installer/macos/create-dmg.sh --staged "$PKG" --name c2wallet-qt-signer --version "$V" --arch universal
++
++      - name: Upload signer zip
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-macos
++          path: c2wallet-qt-signer-*-macos-universal.zip
++
++      - name: Upload signer DMG
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-macos-dmg
++          path: c2wallet-qt-signer-*-macos-universal.dmg
++
++  c2wallet-windows:
++    name: c2wallet-qt-signer package (Windows x86_64)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'c2wallet')
++    runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
++    timeout-minutes: 75
++    defaults:
++      run:
++        # VM217: no Git-bash, ExecutionPolicy Restricted -- same shell as the
++        # node's Windows cell. cmd steps override.
++        shell: powershell -ExecutionPolicy Bypass -Command ". '{0}'"
++    env:
++      QT_VERSION: '6.8.3'      # win64_msvc2022_64: dynamic CRT (/MD), like the node
++      AQT_VERSION: '3.3.0'
++      SECP256K1_TAG: 'v0.7.1'
++      ZLIB_TAG: 'v1.3.1'
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Resolve version
++        id: ver
++        run: |
++          if ("${{ github.event.inputs.version }}") {
++            Add-Content -Path $env:GITHUB_OUTPUT -Value "version=${{ github.event.inputs.version }}"
++          } elseif ("${env:GITHUB_REF}" -like "refs/tags/v*") {
++            Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$("${env:GITHUB_REF_NAME}".TrimStart('v'))"
++          } else {
++            Add-Content -Path $env:GITHUB_OUTPUT -Value "version=0.0.0-$("${env:GITHUB_SHA}".Substring(0,8))"
++          }
++
++      - name: Check source presence
++        id: presence
++        run: |
++          if ((Test-Path "ui/c2wallet-qt/CMakeLists.txt") -and (Test-Path "installer/windows/c2wallet-qt-setup.iss")) {
++            Add-Content -Path $env:GITHUB_OUTPUT -Value "exists=1"
++          } else {
++            Add-Content -Path $env:GITHUB_OUTPUT -Value "exists=0"
++            Write-Host "::warning::c2wallet-qt packaging not on this ref -- no signer Windows package will be produced."
++          }
++
++      - uses: actions/setup-python@v6
++        if: steps.presence.outputs.exists == '1' && runner.environment == 'github-hosted'
++        with: { python-version: '3.12' }
++
++      - name: aqtinstall (pinned)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          # Same interpreter resolution as the node cell's Conan step (VM217 has
++          # only the py launcher on the runner-service PATH).
++          $py = $null
++          foreach ($cand in @('py','python3','python')) {
++            if (Get-Command $cand -ErrorAction SilentlyContinue) { $py = $cand; break }
++          }
++          if (-not $py) { throw "no Python interpreter on the runner-service PATH" }
++          & $py -m pip install --quiet "aqtinstall==$env:AQT_VERSION"
++          if ($LASTEXITCODE -ne 0) { throw "pip install aqtinstall failed" }
++          Add-Content -Path $env:GITHUB_ENV -Value "C2W_PY=$py"
++
++      - name: Restore Qt
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/cache@v5
++        with:
++          path: ${{ runner.temp }}/Qt
++          key: qt-${{ env.QT_VERSION }}-win64_msvc2022_64-aqt${{ env.AQT_VERSION }}
++
++      - name: Install Qt (win64_msvc2022_64, pinned)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          $qt = Join-Path $env:RUNNER_TEMP "Qt\$env:QT_VERSION\msvc2022_64"
++          if (-not (Test-Path (Join-Path $qt 'bin\windeployqt.exe'))) {
++            & $env:C2W_PY -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2022_64 --outputdir (Join-Path $env:RUNNER_TEMP 'Qt')
++            if ($LASTEXITCODE -ne 0) { throw "aqt install-qt failed" }
++          }
++          Add-Content -Path $env:GITHUB_ENV -Value "QT_DIR=$qt"
++
++      - name: Build zlib + libsecp256k1 (pinned tags)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          function Clone-Pinned($url, $tag, $dir) {
++            for ($i = 1; $i -le 3; $i++) {
++              git clone --depth 1 --branch $tag $url $dir
++              if ($LASTEXITCODE -eq 0) { return }
++              if ($i -eq 3) { throw "$url clone failed after 3 attempts" }
++              Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
++              Start-Sleep -Seconds ($i * 5)
++            }
++          }
++          Clone-Pinned https://github.com/madler/zlib $env:ZLIB_TAG zlib-src
++          cmake -S zlib-src -B zlib-src/build -G "Visual Studio 17 2022" -A x64 -DZLIB_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/zlib"
++          cmake --build zlib-src/build --config Release
++          cmake --install zlib-src/build --config Release
++          # Shared libsecp256k1-N.dll next to the exe, with the recovery module,
++          # as the node cell builds it (here from a pinned tag).
++          Clone-Pinned https://github.com/bitcoin-core/secp256k1 $env:SECP256K1_TAG secp256k1-src
++          cmake -S secp256k1-src -B secp256k1-src/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/secp256k1" -DSECP256K1_ENABLE_MODULE_RECOVERY=ON -DSECP256K1_BUILD_TESTS=OFF -DSECP256K1_BUILD_EXHAUSTIVE_TESTS=OFF -DSECP256K1_BUILD_BENCHMARK=OFF -DSECP256K1_BUILD_EXAMPLES=OFF
++          cmake --build secp256k1-src/build --config Release
++          cmake --install secp256k1-src/build --config Release
++
++      - name: Configure (packaging, /Brepro)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          $secpLib = (Get-ChildItem "$env:GITHUB_WORKSPACE/secp256k1/lib" -Filter *.lib | Select-Object -First 1).FullName
++          if (-not $secpLib) { throw "no libsecp256k1 import library" }
++          # CFLAGS/CXXFLAGS/LDFLAGS seed CMAKE_*_FLAGS on top of the MSVC defaults.
++          $env:CFLAGS = "/I$env:GITHUB_WORKSPACE/secp256k1/include /Brepro"
++          $env:CXXFLAGS = "/I$env:GITHUB_WORKSPACE/secp256k1/include /Brepro /D_WIN32_WINNT=0x0A00"
++          $env:LDFLAGS = "/Brepro"
++          cmake -S ui/c2wallet-qt -B build-c2w -G "Visual Studio 17 2022" -A x64 `
++            "-DCMAKE_PREFIX_PATH=$env:QT_DIR" "-DSECP256K1_LIB=$secpLib" `
++            "-DZLIB_LIBRARY=$env:GITHUB_WORKSPACE/zlib/lib/zlibstatic.lib" "-DZLIB_INCLUDE_DIR=$env:GITHUB_WORKSPACE/zlib/include" `
++            -DC2WALLET_QT_PACKAGING=ON "-DC2WALLET_QT_VERSION=${{ steps.ver.outputs.version }}"
++          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
++
++      - name: Build c2wallet-qt-signer
++        if: steps.presence.outputs.exists == '1'
++        shell: cmd
++        # -j 8: VM217's fixed 2GB pagefile (see the node cell).
++        run: cmake --build build-c2w --target c2wallet-qt-signer --config Release -j 8
++
++      - name: Stage (windeployqt, no network plugins)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          $PKG = "c2wallet-qt-signer-${{ steps.ver.outputs.version }}-windows-x86_64"
++          if (Test-Path $PKG) { Remove-Item -Recurse -Force $PKG }
++          New-Item -ItemType Directory -Path $PKG, "$PKG/licenses" -Force | Out-Null
++          Copy-Item build-c2w/Release/c2wallet-qt-signer.exe "$PKG/"
++          Copy-Item "$env:GITHUB_WORKSPACE/secp256k1/bin/libsecp256k1-*.dll" "$PKG/"
++          & (Join-Path $env:QT_DIR 'bin\windeployqt.exe') --release --no-translations --no-opengl-sw --no-system-d3d-compiler --no-compiler-runtime --skip-plugin-types tls,networkinformation,qmltooling,generic "$PKG/c2wallet-qt-signer.exe"
++          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
++          Copy-Item LICENSE "$PKG/licenses/LICENSE-AGPL-3.0.txt"
++          Copy-Item ui/c2wallet-qt/packaging/licenses/*.txt "$PKG/licenses/"
++          Copy-Item secp256k1-src/COPYING "$PKG/licenses/libsecp256k1-COPYING.txt"
++          Copy-Item zlib-src/LICENSE "$PKG/licenses/zlib-LICENSE.txt"
++          Copy-Item ui/c2wallet-qt/packaging/README-SIGNER.txt "$PKG/"
++          # MANIFEST.txt: sha256 of every file, ordinal-sorted relative paths.
++          $root = (Resolve-Path $PKG).Path
++          $rels = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object { $_.FullName.Substring($root.Length + 1).Replace('\', '/') })
++          [System.Array]::Sort($rels, [System.StringComparer]::Ordinal)
++          $lines = @(foreach ($r in $rels) { if ($r -ne 'MANIFEST.txt') { '{0}  ./{1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $root $r)).Hash.ToLower(), $r } })
++          [System.IO.File]::WriteAllLines((Join-Path $root 'MANIFEST.txt'), [string[]]$lines)
++
++      - name: Guards + smoke on the PACKAGED exe
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          $V = "${{ steps.ver.outputs.version }}"
++          $PKG = "c2wallet-qt-signer-$V-windows-x86_64"
++          & powershell -NoProfile -ExecutionPolicy Bypass -File ui/c2wallet-qt/ci/check_no_network_pe.ps1 -Binary "$PKG/c2wallet-qt-signer.exe"
++          if ($LASTEXITCODE -ne 0) { throw "PE link-guard failed" }
++          & powershell -NoProfile -ExecutionPolicy Bypass -File ui/c2wallet-qt/ci/check_package_no_network.ps1 -Package $PKG
++          if ($LASTEXITCODE -ne 0) { throw "package scan failed" }
++          $exe = (Resolve-Path "$PKG/c2wallet-qt-signer.exe").Path
++          $log = Join-Path $env:RUNNER_TEMP 'c2wallet-version.txt'
++          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -NoNewWindow -PassThru -RedirectStandardOutput $log
++          Get-Content $log | Write-Host
++          if ($p.ExitCode -ne 0) { throw "--version exited $($p.ExitCode)" }
++          if (-not (Select-String -Path $log -SimpleMatch -Quiet -Pattern "c2wallet-qt-signer $V")) { throw "--version did not print the version" }
++          if (-not (Select-String -Path $log -SimpleMatch -Quiet -Pattern 'network-incapable build')) { throw "--version did not print the build line" }
++
++      - name: Zip
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          $PKG = "c2wallet-qt-signer-${{ steps.ver.outputs.version }}-windows-x86_64"
++          Compress-Archive -Path $PKG -DestinationPath "$PKG.zip" -Force
++
++      - name: Upload signer zip
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-windows
++          path: c2wallet-qt-signer-*-windows-x86_64.zip
++
++      # Same Inno provisioning as the node cell (choco is broken on VM217).
++      - name: Ensure Inno Setup 6 (for setup.exe installer)
++        if: steps.presence.outputs.exists == '1'
++        continue-on-error: true
++        run: |
++          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
++          if (Test-Path $iscc) { Write-Host "Inno Setup already installed: $iscc"; exit 0 }
++          $out = Join-Path $env:RUNNER_TEMP "innosetup-6.exe"
++          Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $out -UseBasicParsing
++          Start-Process -FilePath $out -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-','/NOICONS' -Wait -NoNewWindow
++          if (-not (Test-Path $iscc)) { throw "Inno Setup install failed: ISCC.exe not found at $iscc" }
++
++      # installer/windows/c2wallet-qt-setup.iss: per-user, no admin, NO firewall
++      # rule, no launch parameters, post-install launch unticked.
++      - name: Build setup.exe installer (Inno Setup)
++        if: steps.presence.outputs.exists == '1'
++        shell: cmd
++        continue-on-error: true
++        run: |
++          set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
++          if not exist "%ISCC%" (
++            echo ::warning::Inno Setup absent; skipping the signer setup.exe. The portable .zip is uploaded.
++            exit /b 0
++          )
++          set "PKG=c2wallet-qt-signer-${{ steps.ver.outputs.version }}-windows-x86_64"
++          for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-ChildItem -Path 'C:\Program Files\Microsoft Visual Studio\2022' -Recurse -Filter vc_redist.x64.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName"') do set "VCREDIST=%%i"
++          "%ISCC%" installer\windows\c2wallet-qt-setup.iss ^
++            /DPACKAGE_DIR="%CD%\%PKG%" ^
++            /DVCREDIST_PATH="%VCREDIST%" ^
++            /DMyAppVersion=${{ steps.ver.outputs.version }} ^
++            /DOutputBase=%PKG%-setup
++          copy "installer\windows\Output\%PKG%-setup.exe" .
++
++      - name: Upload setup.exe installer
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-windows-setup
++          path: c2wallet-qt-signer-*-windows-x86_64-setup.exe
++          if-no-files-found: warn
++
++  # The ONLINE, key-free companion: the GUI + the headless inject scheduler
++  # c2wallet-qt-schedd + its systemd unit, in their own tarball (never with the
++  # signer). Green-skips until the scheduler (PR #2123) is on the ref. The
++  # .service file ships in the tarball; CI never installs it.
++  c2wallet-companion-linux:
++    name: c2wallet-qt companion package (Linux x86_64)
++    if: contains(github.event.inputs.components || 'node,c2wallet', 'c2wallet')
++    runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
++    timeout-minutes: 40
++    steps:
++      - uses: actions/checkout@v6
++
++      - name: Resolve version
++        id: ver
++        run: |
++          if [ -n "${{ github.event.inputs.version }}" ]; then
++            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
++          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
++            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
++          else
++            echo "version=0.0.0-${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
++          fi
++
++      - name: Check source presence
++        id: presence
++        run: |
++          if [ -f ui/c2wallet-qt/src/companion/schedd/main.cpp ] && [ -f ui/c2wallet-qt/tools/c2wallet-qt-schedd.service ] \
++             && [ -f ui/c2wallet-qt/ci/check_no_gui_link.sh ] && [ -f installer/linux/c2wallet-appimage.sh ]; then
++            echo "exists=1" >> "$GITHUB_OUTPUT"
++          else
++            echo "exists=0" >> "$GITHUB_OUTPUT"
++            echo "::notice::c2wallet-qt-schedd not on this ref (PR #2123) -- no companion package; green skip."
++          fi
++
++      - name: Install Qt6 base + toolchain
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          flock /tmp/c2pool-apt.lock bash -e -c '
++            sudo apt-get update -qq
++            sudo apt-get install -y --no-install-recommends \
++              cmake g++ binutils file curl ca-certificates \
++              qt6-base-dev qt6-base-dev-tools qt6-qpa-plugins libgl1-mesa-dev libxkbcommon-dev \
++              libsecp256k1-dev zlib1g-dev nlohmann-json3-dev
++          '
++          dpkg-query -W qt6-base-dev nlohmann-json3-dev g++ cmake
++
++      - name: Configure + build the companion and the scheduler
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          cmake -S ui/c2wallet-qt -B build-c2w -DCMAKE_BUILD_TYPE=Release \
++            -DC2WALLET_QT_VERSION="${{ steps.ver.outputs.version }}" \
++            -DCMAKE_C_FLAGS="-ffile-prefix-map=$PWD=." -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$PWD=."
++          cmake --build build-c2w --target c2wallet-qt-companion c2wallet-qt-schedd -j"${BUILD_J:-8}"
++
++      - name: Key-free + headless guards (build tree)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          SCHEDD="$(find build-c2w -type f -name c2wallet-qt-schedd -perm -u+x | head -1)"
++          ./ui/c2wallet-qt/ci/check_key_free.sh build-c2w/c2wallet-qt-companion
++          ./ui/c2wallet-qt/ci/check_key_free.sh "$SCHEDD"
++          ./ui/c2wallet-qt/ci/check_no_gui_link.sh "$SCHEDD"
++          echo "SCHEDD=$SCHEDD" >> "$GITHUB_ENV"
++
++      - name: Package (tarball; linuxdeploy-deployed Qt)
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          bash installer/linux/c2wallet-appimage.sh --profile companion \
++            --version "${{ steps.ver.outputs.version }}" \
++            --binary build-c2w/c2wallet-qt-companion --binary "$SCHEDD" \
++            --extra ui/c2wallet-qt/tools/c2wallet-qt-schedd.service --out dist-c2w
++
++      - name: Guards on the PACKAGED companion
++        if: steps.presence.outputs.exists == '1'
++        run: |
++          PKG="c2wallet-qt-companion-${{ steps.ver.outputs.version }}-linux-x86_64"
++          cd dist-c2w && rm -rf unpacked && mkdir unpacked && tar -xzf "${PKG}.tar.gz" -C unpacked
++          (cd "unpacked/${PKG}" && sha256sum -c --quiet MANIFEST.txt)
++          ../ui/c2wallet-qt/ci/check_key_free.sh "unpacked/${PKG}/usr/bin/c2wallet-qt-companion"
++          ../ui/c2wallet-qt/ci/check_key_free.sh "unpacked/${PKG}/usr/bin/c2wallet-qt-schedd"
++          ../ui/c2wallet-qt/ci/check_no_gui_link.sh "unpacked/${PKG}/usr/bin/c2wallet-qt-schedd"
++          test -f "unpacked/${PKG}/c2wallet-qt-schedd.service"
++          rm -rf unpacked
++
++      - name: Upload companion package
++        if: steps.presence.outputs.exists == '1'
++        uses: actions/upload-artifact@v7
++        with:
++          name: pkg-c2wallet-companion-linux
++          path: dist-c2w/c2wallet-qt-companion-*-linux-x86_64.tar.gz
++
++      - name: Prune runner workspace
++        if: always()
++        uses: ./.github/actions/prune-runner-workspace
++
+   # ════════════════════════════════════════════════════════════════════════════
+   # Aggregate: single SHA256SUMS over every produced package; on tags,
+   # attach everything to a DRAFT release (operator publishes manually).
+@@ -752,7 +1348,7 @@ jobs:
+   checksums:
+     name: SHA256SUMS + draft release
+     runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+-    needs: [linux, macos-universal, windows]
++    needs: [linux, macos-universal, windows, c2wallet-linux, c2wallet-macos, c2wallet-windows, c2wallet-companion-linux]
+     if: always()
+     permissions:
+       contents: write
