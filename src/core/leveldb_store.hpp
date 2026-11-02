@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdint>
 #include <leveldb/db.h>
@@ -103,6 +104,21 @@ public:
     bool for_each_prefix(const std::string& prefix,
                          const std::function<bool(const std::string& key,
                                                   const std::vector<uint8_t>& value)>& fn);
+
+    /// A read view of the whole store at one instant (a LevelDB snapshot): a
+    /// scan through it sees no write committed after it was taken. Released
+    /// when the last copy is dropped, so the store must stay open until then.
+    /// Null when the store is closed.
+    using Snapshot = std::shared_ptr<const leveldb::Snapshot>;
+    Snapshot snapshot();
+
+    /// for_each_prefix over `at`, without copying: the callback gets the key
+    /// and value bytes in place, valid only during the call. The pass does
+    /// not fill the block cache (a full-prefix scan must not evict the
+    /// working set). Same return contract as for_each_prefix.
+    bool for_each_prefix_at(const Snapshot& at, const std::string& prefix,
+                            const std::function<bool(std::string_view key,
+                                                     std::string_view value)>& fn);
 
     void compact();
 

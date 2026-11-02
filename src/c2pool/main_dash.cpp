@@ -91,6 +91,7 @@
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
+#include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
@@ -3338,6 +3339,29 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     {"armed",       node_coin_state.tx_inject_enabled()},
                     {"http_status", http},
                 };
+            });
+    }
+    // c2wallet Scan & Plan (N1): GET /api/utxo/scan -- read-only scan of the
+    // full UTXO set for a few scripts, direct-local only. The pass runs on the
+    // web server's scan thread (never the io thread) and reads the lane's set
+    // (refused unless it is full and serving) and the mempool's spends; it
+    // changes neither. The detach guard is declared after utxo_lane and
+    // node_coin_state, so on every way out of run_node it cancels a running
+    // pass and waits for it before either is destroyed.
+    auto utxo_scan_source = std::make_shared<dash::coin::UtxoScanSource>(
+        utxo_lane,
+        [&node_coin_state](const std::vector<::core::coin::Outpoint>& ops) {
+            return node_coin_state.mempool().pool_spenders(ops);
+        },
+        testnet);
+    struct UtxoScanDetach {
+        std::shared_ptr<dash::coin::UtxoScanSource> source;
+        ~UtxoScanDetach() { source->detach(); }
+    } utxo_scan_detach{utxo_scan_source};
+    if (web_server) {
+        web_server->get_mining_interface()->set_utxo_scan_fn(
+            [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
+                return source->handle(query, cancel);
             });
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────

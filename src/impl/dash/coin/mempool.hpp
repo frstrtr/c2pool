@@ -885,6 +885,28 @@ public:
         return InjectGate::Ok;
     }
 
+    /// Which of `ops` a pool entry spends, each with the spending txid (one
+    /// pair per spender, in pool order). Read-only, any thread. Every entry's
+    /// inputs are read: m_spent_outputs keeps one spender per outpoint and
+    /// loses the outpoint when one of two pool txs spending it leaves. Used by
+    /// GET /api/utxo/scan (mempool_spent).
+    std::vector<std::pair<::core::coin::Outpoint, uint256>>
+    pool_spenders(const std::vector<::core::coin::Outpoint>& ops) const {
+        std::vector<std::pair<::core::coin::Outpoint, uint256>> out;
+        if (ops.empty()) return out;
+        std::vector<std::pair<uint256, uint32_t>> want;
+        want.reserve(ops.size());
+        for (const auto& op : ops) want.emplace_back(op.txid, op.index);
+        std::sort(want.begin(), want.end());
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool)
+            for (const auto& vin : e.tx.vin)
+                if (std::binary_search(want.begin(), want.end(),
+                                       std::make_pair(vin.prevout.hash, vin.prevout.index)))
+                    out.emplace_back(::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), txid);
+        return out;
+    }
+
     /// The injects in the pool (the txids carrying INJECT_FEE_DELTA), for the
     /// per-build RIDES / HELD lines.
     std::vector<uint256> inject_txids_in_pool() const {

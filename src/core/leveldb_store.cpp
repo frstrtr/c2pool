@@ -368,6 +368,48 @@ bool LevelDBStore::for_each_prefix(const std::string& prefix,
     return true;
 }
 
+LevelDBStore::Snapshot LevelDBStore::snapshot()
+{
+    if (!m_db)
+        return nullptr;
+    leveldb::DB* db = m_db.get();
+    return Snapshot(db->GetSnapshot(),
+                    [db](const leveldb::Snapshot* s) { db->ReleaseSnapshot(s); });
+}
+
+bool LevelDBStore::for_each_prefix_at(const Snapshot& at, const std::string& prefix,
+                                      const std::function<bool(std::string_view key,
+                                                               std::string_view value)>& fn)
+{
+    if (!m_db) {
+        LOG_ERROR << "LevelDB store not open";
+        return false;
+    }
+    leveldb::ReadOptions ro;
+    ro.snapshot = at.get();
+    ro.fill_cache = false;
+    std::unique_ptr<leveldb::Iterator> it(m_db->NewIterator(ro));
+    if (prefix.empty())
+        it->SeekToFirst();
+    else
+        it->Seek(prefix);
+    for (; it->Valid(); it->Next()) {
+        const leveldb::Slice key = it->key();
+        if (!prefix.empty() &&
+            (key.size() < prefix.size() ||
+             std::memcmp(key.data(), prefix.data(), prefix.size()) != 0))
+            break;
+        const leveldb::Slice val = it->value();
+        if (!fn(std::string_view(key.data(), key.size()), std::string_view(val.data(), val.size())))
+            return true;   // caller-requested early stop is not an error
+    }
+    if (!it->status().ok()) {
+        LOG_ERROR << "Error scanning prefix: " << it->status().ToString();
+        return false;
+    }
+    return true;
+}
+
 void LevelDBStore::compact()
 {
     if (!m_db) {
