@@ -6559,6 +6559,20 @@ nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
         {"http_status", 503}};
 }
 
+nlohmann::json MiningInterface::rest_tx_inject_validate(const std::string& body)
+{
+    // N3: the installed fn runs NodeCoinState::validate_inject on the node
+    // io_context (thread_safe_wrap), like the submit; nothing is admitted.
+    if (m_tx_inject_validate_fn) {
+        auto j = m_tx_inject_validate_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"ok", false},
+        {"error", "tx-inject validate not wired"},
+        {"http_status", 503}};
+}
+
 // ── GET /api/utxo/scan: the dedicated scan thread ─────────────────────────────
 
 void MiningInterface::set_utxo_scan_fn(utxo_scan_fn_t fn)

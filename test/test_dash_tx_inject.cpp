@@ -45,6 +45,7 @@
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: node-wide count+byte rate limiter
 #include <impl/dash/coin/good_citizen_defaults.hpp>
 #include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: resolve_checkscripts_arm
+#include <impl/dash/coin/inject_validate.hpp>      // N3: the dry run's reply
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
 
 // std-only: the c2wallet-qt mirror of the node caps, pinned below.
@@ -59,6 +60,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <sstream>
 #include <vector>
 
 using dash::coin::Mempool;
@@ -1802,4 +1804,381 @@ TEST(DashTxInject, ExpiredInjectIsNotPutBackByARewind)
     EXPECT_EQ(back[0], dash_txid(standing));
     EXPECT_FALSE(st.mempool().get_entry(dash_txid(expiring)).has_value());
     EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
+}
+
+// ── N3 (c2wallet Scan & Plan): POST /api/tx-inject/validate, the dry run ────
+// NodeCoinState::validate_inject / Mempool::validate_inject answer what a
+// submit would, plus what admission does not check (input maturity at the
+// next height, a pool tx already spending an input), and change nothing.
+
+namespace {
+
+// Everything the dry run must leave as it was, observed from outside: the
+// pool (size, the given entries' fee / delta / flags, its injects, its
+// spends of the given coins, what a template would select), the inject
+// ledger, both rate windows and the status counters.
+std::string dry_run_state(NodeCoinState& st, const std::vector<uint256>& txids,
+                          const std::vector<Outpoint>& ops)
+{
+    std::ostringstream o;
+    auto& mp = st.mempool();
+    o << "size=" << mp.size() << " kept=" << mp.confirmed_injects_kept();
+    for (const auto& t : mp.inject_txids_in_pool()) o << " inj=" << t.GetHex();
+    for (const auto& t : txids) {
+        const auto e = mp.get_entry(t);
+        o << " e=" << t.GetHex();
+        if (e)
+            o << ":" << e->fee << "/" << e->fee_delta << "/" << e->fee_known << e->fee_fold_proven;
+        else
+            o << ":absent";
+    }
+    for (const auto& [op, by] : mp.pool_spenders(ops))
+        o << " sp=" << op.txid.GetHex() << ":" << op.index << ">" << by.GetHex();
+    const auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+    o << " sel=" << sel.size() << " fees=" << fees;
+    for (const auto& s : sel) o << " " << dash_txid(s.tx).GetHex();
+    o << " ledger=" << st.inject_pool_size() << " rl=" << st.inject_rate_count() << "/"
+      << st.inject_rate_count_peer() << "/" << st.inject_rate_bytes();
+    auto& obs = core::obs::inject_status();
+    o << " obs=" << obs.sb_refused_total.load() << "/" << obs.rl_local_count_refused.load() << "/"
+      << obs.rl_local_bytes_refused.load() << "/" << obs.pool_entries.load() << "/"
+      << obs.rl_local_in_window.load();
+    return o.str();
+}
+
+} // namespace
+
+// V1: a valid zero-fee spend — would admit, cause "ok", the fee and the input
+// as the pool resolves it — and the pool, the ledger, the rate windows and the
+// counters are exactly as before, a second time too. No fee delta is left:
+// the same tx admitted afterwards on the relay path carries none.
+TEST(DashTxInjectValidate, ValidTxWouldAdmitAndNothingChanges)
+{
+    Key k(0xd1);
+    const uint256 prev = prevhash(0xd1);
+    const auto tx = make_signed_spend(k, prev, 100'000);   // fee 0
+    Key k2(0xd2);
+    const uint256 prev2 = prevhash(0xd2);
+    const auto other = make_signed_spend(k2, prev2, 90'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 40, /*coinbase=*/true));
+    utxo.add_coin(Outpoint(prev2, 0), Coin(100'000, to_script(k2.spk), 30, false));
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(200, prevhash(0x20), 0x1d00ffff, 0, 76, 16);   // next 201: h 40 is mature
+    ASSERT_TRUE(st.mempool().add_tx(other));   // a non-empty pool
+    const std::vector<uint256> ids{dash_txid(tx), dash_txid(other)};
+    const std::vector<Outpoint> ops{Outpoint(prev, 0), Outpoint(prev2, 0)};
+    const auto before = dry_run_state(st, ids, ops);
+
+    const auto r = st.validate_inject(tx, /*max_fee=*/0);
+    EXPECT_TRUE(r.ok);
+    EXPECT_TRUE(r.would_admit);
+    EXPECT_EQ(r.cause, "ok");
+    EXPECT_EQ(r.gate, "ok");
+    EXPECT_TRUE(r.armed);
+    EXPECT_EQ(r.txid, dash_txid(tx));
+    EXPECT_EQ(r.next_height, 201u);
+    EXPECT_EQ(r.immature_at_next_height, 0u);
+    ASSERT_TRUE(r.analysed);
+    EXPECT_TRUE(r.dry.priced);
+    EXPECT_EQ(r.dry.fee, 0u);
+    ASSERT_EQ(r.dry.inputs.size(), 1u);
+    const auto& in = r.dry.inputs[0];
+    EXPECT_TRUE(in.resolved);
+    EXPECT_STREQ(in.source, "utxo");
+    EXPECT_EQ(in.value, 100'000);
+    EXPECT_EQ(in.height, 40u);
+    EXPECT_TRUE(in.coinbase);
+    EXPECT_FALSE(in.pool_spender.has_value());
+    EXPECT_EQ(dry_run_state(st, ids, ops), before) << "the dry run changed state";
+    EXPECT_EQ(st.validate_inject(tx, 0).cause, "ok");
+    EXPECT_EQ(dry_run_state(st, ids, ops), before) << "a second dry run changed state";
+
+    const auto j = dash::coin::inject_validate_json(r);
+    EXPECT_EQ(j["ok"], true);
+    EXPECT_EQ(j["dry_run"], true);
+    EXPECT_EQ(j["http_status"], 200);
+    EXPECT_EQ(j["fee"], 0);
+    EXPECT_EQ(j["next_height"], 201);
+    ASSERT_EQ(j["inputs"].size(), 1u);
+    EXPECT_EQ(j["inputs"][0]["txid"], prev.GetHex());
+    EXPECT_EQ(j["inputs"][0]["vout"], 0);
+    EXPECT_EQ(j["inputs"][0]["spendable_from_height"], 140);
+    EXPECT_EQ(j["inputs"][0]["immature"], false);
+    EXPECT_TRUE(j["conflicts"].empty());
+
+    ASSERT_TRUE(st.mempool().add_tx(tx));
+    EXPECT_EQ(st.mempool().get_entry(dash_txid(tx))->fee_delta, 0u) << "no inject delta left behind";
+    EXPECT_TRUE(st.mempool().inject_txids_in_pool().empty());
+}
+
+// V2: a coinbase input below 100 confirmations at the next height is named
+// (inject-immature-input) while the gate itself would admit the tx — the
+// template build would drop it silently. Mature one block later.
+TEST(DashTxInjectValidate, ImmatureCoinbaseInputIsNamed)
+{
+    Key k(0xd3);
+    const uint256 prev = prevhash(0xd3);
+    const auto tx = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 150, /*coinbase=*/true));
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(200, prevhash(0x21), 0x1d00ffff, 0, 76, 16);   // next 201 < 150 + 100
+
+    auto r = st.validate_inject(tx, 0);
+    EXPECT_FALSE(r.ok);
+    EXPECT_TRUE(r.would_admit) << "admission does not check maturity";
+    EXPECT_EQ(r.gate, "ok");
+    EXPECT_EQ(r.cause, "inject-immature-input");
+    EXPECT_EQ(r.immature_at_next_height, 1u);
+    auto j = dash::coin::inject_validate_json(r);
+    EXPECT_EQ(j["http_status"], 422);
+    EXPECT_EQ(j["immature_at_next_height"], 1);
+    EXPECT_EQ(j["inputs"][0]["immature"], true);
+    EXPECT_EQ(j["inputs"][0]["spendable_from_height"], 250);
+    EXPECT_EQ(j["inputs"][0]["coinbase"], true);
+    EXPECT_EQ(j["inputs"][0]["height"], 150);
+
+    st.set_tip(248, prevhash(0x22), 0x1d00ffff, 0, 76, 16);   // next 249: one short
+    EXPECT_EQ(st.validate_inject(tx, 0).cause, "inject-immature-input");
+    st.set_tip(249, prevhash(0x23), 0x1d00ffff, 0, 76, 16);   // next 250 = 150 + 100
+    r = st.validate_inject(tx, 0);
+    EXPECT_TRUE(r.ok) << r.cause;
+    EXPECT_EQ(r.immature_at_next_height, 0u);
+
+    // A plain (non-coinbase) coin as young is spendable at once.
+    Key k2(0xd4);
+    const uint256 prev2 = prevhash(0xd4);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(50'000, to_script(k2.spk), 249, false));
+    EXPECT_EQ(st.validate_inject(make_signed_spend(k2, prev2, 50'000), 0).cause, "ok");
+
+    // The tip unknown: maturity cannot be judged, so not ok, by name.
+    NodeCoinState fresh;
+    arm_ncs(fresh, utxo);
+    r = fresh.validate_inject(tx, 0);
+    EXPECT_TRUE(r.would_admit);
+    EXPECT_EQ(r.cause, "inject-tip-unknown");
+    EXPECT_EQ(r.next_height, 0u);
+    j = dash::coin::inject_validate_json(r);
+    EXPECT_TRUE(j["next_height"].is_null());
+    EXPECT_TRUE(j["inputs"][0]["immature"].is_null());
+}
+
+// V3: an input no source knows, or one a block already spent, is the gate's
+// inject-unpriceable with the input unresolved; an input another pool tx
+// already spends is admitted by the gate (the selector keeps one of the two)
+// and the dry run names the conflict and the spender.
+TEST(DashTxInjectValidate, UnknownSpentAndPoolDoubleSpendInputsAreNamed)
+{
+    Key k(0xd5);
+    const uint256 known = prevhash(0xd5), unknown = prevhash(0xd6), spent = prevhash(0xd7);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(known, 0), Coin(100'000, to_script(k.spk), 10, false));
+    utxo.add_coin(Outpoint(spent, 0), Coin(100'000, to_script(k.spk), 10, false));
+    ASSERT_TRUE(utxo.spend_coin(Outpoint(spent, 0)).has_value());   // gone: spent in a block
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(300, prevhash(0x24), 0x1d00ffff, 0, 76, 16);
+
+    for (const auto& prev : {unknown, spent}) {
+        const auto r = st.validate_inject(make_signed_spend(k, prev, 100'000), 0);
+        EXPECT_FALSE(r.would_admit);
+        EXPECT_EQ(r.gate, "inject-unpriceable");
+        EXPECT_EQ(r.cause, "inject-unpriceable");
+        ASSERT_EQ(r.dry.inputs.size(), 1u);
+        EXPECT_FALSE(r.dry.inputs[0].resolved);
+        EXPECT_STREQ(r.dry.inputs[0].source, "none");
+        const auto j = dash::coin::inject_validate_json(r);
+        EXPECT_TRUE(j["fee"].is_null());
+        EXPECT_TRUE(j["inputs"][0]["value"].is_null());
+        EXPECT_EQ(j["http_status"], 422);
+    }
+
+    const auto body_tx = make_signed_spend(k, known, 80'000);   // a relay tx, fee 20'000
+    ASSERT_TRUE(st.mempool().add_tx(body_tx));
+    const auto inj = make_signed_spend(k, known, 100'000);
+    const auto before = dry_run_state(st, {dash_txid(inj), dash_txid(body_tx)}, {Outpoint(known, 0)});
+    const auto r = st.validate_inject(inj, 0);
+    EXPECT_TRUE(r.would_admit);
+    EXPECT_EQ(r.gate, "ok");
+    EXPECT_EQ(r.cause, "inject-input-spent-in-mempool");
+    ASSERT_TRUE(r.dry.inputs[0].pool_spender.has_value());
+    EXPECT_EQ(*r.dry.inputs[0].pool_spender, dash_txid(body_tx));
+    const auto j = dash::coin::inject_validate_json(r);
+    ASSERT_EQ(j["conflicts"].size(), 1u);
+    EXPECT_EQ(j["conflicts"][0]["txid"], known.GetHex());
+    EXPECT_EQ(j["conflicts"][0]["spent_by"], dash_txid(body_tx).GetHex());
+    EXPECT_EQ(j["inputs"][0]["mempool_spent_by"], dash_txid(body_tx).GetHex());
+    EXPECT_EQ(dry_run_state(st, {dash_txid(inj), dash_txid(body_tx)}, {Outpoint(known, 0)}), before);
+}
+
+// V4: the dry run's gate equals add_inject's, case by case, on the same pool,
+// and the dry run leaves that pool as it was.
+TEST(DashTxInjectValidate, VerdictMatchesAddInjectCaseByCase)
+{
+    using G = Mempool::InjectGate;
+    Key k(0xd8);
+    struct Case {
+        const char* name;
+        MutableTransaction tx;
+        uint64_t max_fee;
+        G want;
+        bool arm = true;
+        std::function<void(UTXOViewCache&, Mempool&, const MutableTransaction&)> setup;
+    };
+    const uint256 p = prevhash(0xe0);
+    auto coin_at = [&](UTXOViewCache& u, int64_t v) {
+        u.add_coin(Outpoint(p, 0), Coin(v, to_script(k.spk), 10, false));
+    };
+    auto bad_sig = make_signed_spend(k, p, 90'000);
+    { auto ss = bad_sig.vin[0].scriptSig.m_data; ss[4] ^= 0x01; bad_sig.vin[0].scriptSig = to_script(ss); }
+    MutableTransaction neg_out = minimal_tx(0xe1);
+    neg_out.vout[0].value = -1;
+    MutableTransaction spent_shaped = minimal_tx(0xe2);
+    spent_shaped.vout[0].value = 0;
+    MutableTransaction oversize = minimal_tx(0xe3);
+    oversize.vout[0].scriptPubKey = to_script(std::vector<uint8_t>(Mempool::kMaxInjectTxBytes + 64, 0x51));
+    MutableTransaction neg_version = make_signed_spend(k, p, 100'000);
+    neg_version.version = -1;
+    const auto mined = make_signed_spend(k, prevhash(0xe4), 100'000);   // its input gone, its output a coin
+
+    std::vector<Case> cases;
+    cases.push_back({"ok", make_signed_spend(k, p, 100'000), 0, G::Ok, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"fee-above-max", make_signed_spend(k, p, 90'000), 0, G::FeeAboveMax, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"fee-within-max", make_signed_spend(k, p, 90'000), 10'000, G::Ok, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"script-invalid", bad_sig, 20'000, G::ScriptInvalid, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"unpriceable", make_signed_spend(k, p, 100'000), 0, G::Unpriceable, true, {}});
+    cases.push_back({"bip68", make_signed_spend(k, p, 100'000, /*version=*/2, /*sequence=*/0), 0,
+                     G::Bip68Unsupported, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"vout-range", neg_out, 0, G::BadVoutRange, true, {}});
+    cases.push_back({"spent-shaped", spent_shaped, 0, G::SpentShapedOutput, true, {}});
+    cases.push_back({"oversize", oversize, 0, G::TooLarge, true, {}});
+    cases.push_back({"version", neg_version, 0, G::BadVersionOrType, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"unarmed", make_signed_spend(k, p, 100'000), 0, G::ScriptCheckUnarmed, false,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction&) { coin_at(u, 100'000); }});
+    cases.push_back({"already-known", make_signed_spend(k, p, 100'000), 0, G::AlreadyKnown, true,
+                     [&](UTXOViewCache& u, Mempool& mp, const MutableTransaction& tx) {
+                         coin_at(u, 100'000);
+                         ASSERT_TRUE(mp.add_tx(tx));
+                     }});
+    cases.push_back({"already-confirmed", mined, 0, G::AlreadyConfirmed, true,
+                     [&](UTXOViewCache& u, Mempool&, const MutableTransaction& tx) {
+                         u.add_coin(Outpoint(dash_txid(tx), 0), Coin(100'000, OPScript(), 20, false));
+                     }});
+
+    for (const auto& c : cases) {
+        UTXOViewCache utxo(nullptr);
+        Mempool mp;
+        mp.set_utxo(&utxo);
+        if (c.arm) arm_script_check(mp);
+        if (c.setup) c.setup(utxo, mp, c.tx);
+        auto pool_state = [&] {
+            std::ostringstream o;
+            o << mp.size() << "/" << mp.inject_txids_in_pool().size();
+            if (const auto e = mp.get_entry(dash_txid(c.tx))) o << "/" << e->fee_delta;
+            const auto [sel, fees] = mp.get_sorted_txs_with_fees(1u << 20, false, 2'000'000u, 0);
+            o << "/" << sel.size() << "/" << fees;
+            return o.str();
+        };
+        const auto before = pool_state();
+        const auto dry = mp.validate_inject(c.tx, c.max_fee);
+        EXPECT_EQ(pool_state(), before) << c.name;
+        EXPECT_EQ(dry.txid, dash_txid(c.tx)) << c.name;
+        EXPECT_EQ(dry.gate, c.want) << c.name << ": dry run " << Mempool::inject_gate_name(dry.gate);
+        const auto real = mp.add_inject(c.tx, c.max_fee);
+        EXPECT_EQ(dry.gate, real) << c.name << ": dry run " << Mempool::inject_gate_name(dry.gate)
+                                  << " vs add_inject " << Mempool::inject_gate_name(real);
+        if (c.want == G::ScriptInvalid) {
+            ASSERT_TRUE(dry.script_failed_input.has_value());
+            EXPECT_EQ(*dry.script_failed_input, 0u);
+        }
+        if (c.want == G::Ok || c.want == G::FeeAboveMax) {
+            EXPECT_TRUE(dry.priced) << c.name;
+        }
+    }
+}
+
+// V5: the dry run never charges the rate limiter, the sandbox or the status
+// counters: 250 dry runs (above the 200 per-window cap) leave the local
+// window empty and a real submit still passes. Disarmed, the cause is
+// inject-disabled but the inputs are still analysed; a tx the structural
+// checks refuse (type, sandbox) is not analysed and counts nowhere.
+TEST(DashTxInjectValidate, NoRateChargeNoCountersAndTheStructuralOrder)
+{
+    Key k(0xd9);
+    const uint256 prev = prevhash(0xd9);
+    const auto tx = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 10, false));
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(400, prevhash(0x25), 0x1d00ffff, 0, 76, 16);
+    const auto before = dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)});
+    for (int i = 0; i < 250; ++i) ASSERT_EQ(st.validate_inject(tx, 0).cause, "ok") << i;
+    auto sandboxed = tx_with_inputs(InjectSandbox::kMaxInputs + 1);
+    auto r = st.validate_inject(sandboxed, 0);
+    EXPECT_EQ(r.cause, "inject-sandbox-too-many-inputs");
+    EXPECT_FALSE(r.analysed);
+    EXPECT_EQ(r.gate, "");
+    auto typed = tx;
+    typed.type = 1;
+    EXPECT_EQ(st.validate_inject(typed, 0).cause, "inject-type-unsupported");
+    EXPECT_EQ(dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)}), before)
+        << "dry runs charged a rate window or a counter";
+    EXPECT_EQ(st.inject_rate_count(), 0u);
+    const auto submitted = st.submit_inject(tx, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_TRUE(submitted.ok) << submitted.cause;
+
+    st.set_tx_inject_enabled(false);
+    Key k2(0xda);
+    const uint256 prev2 = prevhash(0xda);
+    utxo.add_coin(Outpoint(prev2, 0), Coin(70'000, to_script(k2.spk), 10, false));
+    r = st.validate_inject(make_signed_spend(k2, prev2, 70'000), 0);
+    EXPECT_FALSE(r.armed);
+    EXPECT_FALSE(r.would_admit);
+    EXPECT_EQ(r.cause, "inject-disabled");
+    EXPECT_EQ(r.gate, "ok") << "disarmed, the inputs are still analysed";
+    EXPECT_TRUE(r.analysed);
+    EXPECT_EQ(dash::coin::inject_validate_json(r)["http_status"], 409);
+    EXPECT_EQ(st.validate_inject(sandboxed, 0).cause, "inject-disabled") << "submit order: disarmed first";
+}
+
+// V6: an input from an unconfirmed pool parent resolves from the pool (the
+// fee and the script are known) and reports no height: unknown is null,
+// never guessed.
+TEST(DashTxInjectValidate, AnInputFromAPoolParentHasNoHeight)
+{
+    Key k(0xdb);
+    const uint256 prev = prevhash(0xdb);
+    TxOut back;
+    back.value = 100'000;
+    back.scriptPubKey = to_script(k.spk);
+    const auto parent = make_signed_spend_outs(k, prev, {back});
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 10, false));
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(500, prevhash(0x26), 0x1d00ffff, 0, 76, 16);
+    ASSERT_TRUE(st.mempool().add_tx(parent));
+    const auto child = make_signed_spend(k, dash_txid(parent), 100'000);
+    const auto r = st.validate_inject(child, 0);
+    EXPECT_TRUE(r.ok) << r.cause;
+    ASSERT_EQ(r.dry.inputs.size(), 1u);
+    EXPECT_STREQ(r.dry.inputs[0].source, "mempool");
+    EXPECT_EQ(r.dry.inputs[0].value, 100'000);
+    const auto j = dash::coin::inject_validate_json(r);
+    EXPECT_EQ(j["inputs"][0]["source"], "mempool");
+    EXPECT_EQ(j["inputs"][0]["value"], 100'000);
+    EXPECT_TRUE(j["inputs"][0]["height"].is_null());
+    EXPECT_TRUE(j["inputs"][0]["spendable_from_height"].is_null());
+    EXPECT_TRUE(j["inputs"][0]["immature"].is_null());
+    EXPECT_FALSE(j["inputs"][0].contains("mempool_spent_by")) << "the parent is not a conflict";
 }

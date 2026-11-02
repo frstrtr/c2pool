@@ -1345,6 +1345,54 @@ void HttpSession::process_request()
                 send_response(std::move(response));
                 return;
             }
+            // ── c2wallet Scan & Plan (N3): POST /api/tx-inject/validate ──────
+            // The dry run of /api/tx-inject/submit: the same body, the same
+            // direct-local and control-token rules, the same io-thread
+            // dispatch; NodeCoinState::validate_inject answers the submit's
+            // verdict plus per-input maturity and pool conflicts, and changes
+            // nothing (no admission, no rate charge, no fee delta). A dispatch
+            // timeout is a plain 504: a dry run has nothing to take back.
+            if (std::string(request_.target()) == "/api/tx-inject/validate") {
+                auto answer = [&](int status, const std::string& body) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = body;
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, R"({"error":"tx-inject API is local-only"})");
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_validate_fn()) {
+                    answer(503, R"({"ok":false,"error":"tx-inject validate not wired"})");
+                    return;
+                }
+                {
+                    std::string presented;
+                    auto body_j = nlohmann::json::parse(request_.body(), nullptr,
+                                                        /*allow_exceptions=*/false);
+                    if (body_j.is_object() && body_j.contains("control_token") &&
+                        body_j["control_token"].is_string())
+                        presented = body_j["control_token"].get<std::string>();
+                    if (!c2pool::config_endpoint::check_control_token(presented)) {
+                        answer(403, R"({"ok":false,"cause":"missing or invalid control token"})");
+                        return;
+                    }
+                }
+                nlohmann::json j;
+                try {
+                    j = mining_interface_->rest_tx_inject_validate(request_.body());
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[tx-inject] validate dispatch failed: " << e.what();
+                    answer(504, R"({"ok":false,"timed_out":true,"cause":"validate dispatch timed out"})");
+                    return;
+                }
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j.dump());
+                return;
+            }
             // Handle JSON-RPC POST request.
             // Accept both 1.0 and 2.0 — upgrade 1.0 to 2.0 for the library.
             std::string request_body = request_.body();

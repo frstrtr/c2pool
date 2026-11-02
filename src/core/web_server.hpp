@@ -651,6 +651,15 @@ public:
     bool has_tx_inject_submit_fn() const { return static_cast<bool>(m_tx_inject_submit_fn); }
     nlohmann::json rest_tx_inject_submit(const std::string& body);  // POST /api/tx-inject/submit
 
+    // POST /api/tx-inject/validate (c2wallet Scan & Plan, N3): the dry run of
+    // the submit — same body, same control-token rule, same io-thread
+    // marshalling (thread_safe_wrap) — answered without admitting anything
+    // (NodeCoinState::validate_inject). UNWIRED by default: 503.
+    using tx_inject_validate_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_tx_inject_validate_fn(tx_inject_validate_fn_t fn) { m_tx_inject_validate_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_tx_inject_validate_fn() const { return static_cast<bool>(m_tx_inject_validate_fn); }
+    nlohmann::json rest_tx_inject_validate(const std::string& body);  // POST /api/tx-inject/validate
+
     // GET /api/utxo/scan (c2wallet Scan & Plan, N1): a read-only scan of the
     // coin's full UTXO set for a few scripts. The fn takes the raw query
     // string and answers the reply JSON with an "http_status" hint; `cancel`
@@ -1624,6 +1633,7 @@ private:
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
     tx_inject_submit_fn_t m_tx_inject_submit_fn;  // POST /api/tx-inject/submit — Slice B raw-tx submit (optional; unwired => 503)
+    tx_inject_validate_fn_t m_tx_inject_validate_fn;  // POST /api/tx-inject/validate — N3 dry run (optional; unwired => 503)
     // GET /api/utxo/scan: the scan fn, its thread and the one job slot.
     struct UtxoScanJob {
         std::string query;

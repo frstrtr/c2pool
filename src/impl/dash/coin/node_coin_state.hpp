@@ -826,6 +826,83 @@ public:
         return r;
     }
 
+    /// Outcome of validate_inject (POST /api/tx-inject/validate).
+    struct InjectValidateResult {
+        bool        ok{false};           // would_admit, a known tip, no input immature at
+                                         // next_height, no other pool tx spending an input
+        bool        would_admit{false};  // submit_inject would answer "ok" now (its rate
+                                         // limiter aside: the dry run does not charge it)
+        std::string cause;               // the first refusal in submit order, then
+                                         // inject-tip-unknown / inject-immature-input /
+                                         // inject-input-spent-in-mempool; else "ok"
+        std::string gate;                // Mempool::add_inject's verdict ("" when a
+                                         // structural check refused before it)
+        uint256     txid;
+        bool        armed{false};
+        uint32_t    next_height{0};      // 0: tip unknown
+        uint32_t    immature_at_next_height{0};
+        bool        analysed{false};     // the mempool dry run ran (inputs / fee below)
+        Mempool::InjectDryRun dry;
+    };
+
+    /// Dash coinbase maturity (consensus.h COINBASE_MATURITY).
+    static constexpr uint32_t kCoinbaseMaturity = 100;
+
+    /// The dry run of submit_inject (c2wallet Scan & Plan N3): the same gate
+    /// in the same order, answered without changing anything — the inject
+    /// ledger, the mempool, the fee deltas, the rate limiters and the status
+    /// counters are left exactly as they were (no reconcile, no rate charge,
+    /// no admission; Mempool::validate_inject prices on a scratch entry). It
+    /// adds what admission does not check: each input's coin, its maturity at
+    /// the next height (a coinbase input needs height + 100 <= next_height;
+    /// the template build would drop an immature inject silently), and any
+    /// other pool tx spending an input. A tx the structural checks refuse
+    /// (type, size, sandbox) is not analysed further. io-thread only, like
+    /// submit_inject (it reads the inject ledger and the tip).
+    InjectValidateResult validate_inject(const MutableTransaction& tx,
+                                         uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectValidateResult r;
+        r.txid = dash::coin::dash_txid(tx);
+        r.armed = m_tx_inject_enabled;
+        r.next_height = m_prev_height != 0 ? m_prev_height + 1 : 0;
+        std::string structural;
+        const uint32_t byte_size = static_cast<uint32_t>(::pack(tx).get_span().size());
+        if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+            structural = "inject-type-unsupported";
+        } else if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            structural = dash::coin::TxInjectPool::admit_name(dash::coin::TxInjectPool::Admit::TooLarge);
+        } else {
+            const auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) structural = sb.name();
+        }
+        if (!structural.empty()) {
+            r.cause = r.armed ? structural : "inject-disabled";
+            return r;
+        }
+        r.dry = m_mempool.validate_inject(tx, max_fee);
+        r.analysed = true;
+        r.gate = dash::coin::Mempool::inject_gate_name(r.dry.gate);
+        const auto pv = m_inject_pool.would_admit(r.txid, byte_size);
+        bool conflict = false;
+        for (const auto& in : r.dry.inputs) {
+            if (in.pool_spender) conflict = true;
+            if (r.next_height != 0 && in.resolved && in.coinbase &&
+                static_cast<uint64_t>(in.height) + kCoinbaseMaturity > r.next_height)
+                ++r.immature_at_next_height;
+        }
+        r.would_admit = r.armed && pv == dash::coin::TxInjectPool::Admit::Ok &&
+                        r.dry.gate == dash::coin::Mempool::InjectGate::Ok;
+        if (!r.armed) r.cause = "inject-disabled";
+        else if (pv != dash::coin::TxInjectPool::Admit::Ok) r.cause = dash::coin::TxInjectPool::admit_name(pv);
+        else if (r.dry.gate != dash::coin::Mempool::InjectGate::Ok) r.cause = r.gate;
+        else if (r.next_height == 0) r.cause = "inject-tip-unknown";
+        else if (r.immature_at_next_height != 0) r.cause = "inject-immature-input";
+        else if (conflict) r.cause = "inject-input-spent-in-mempool";
+        else r.cause = "ok";
+        r.ok = r.cause == "ok";
+        return r;
+    }
+
     /// Reconcile the inject ledger with the live mempool + tip: drop tracked
     /// injects that have left the mempool (confirmed / conflict-evicted) or have
     /// expired, evicting the expired ones from the mempool too. Called from

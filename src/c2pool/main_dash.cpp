@@ -92,6 +92,7 @@
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
 #include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
@@ -409,6 +410,57 @@ static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
     }
     out = static_cast<int64_t>(v);
     return true;
+}
+
+// The body POST /api/tx-inject/submit and /api/tx-inject/validate share:
+// {raw_tx, flags?, expiry_height?, max_fee?}. A bad body answers its 400
+// reply (returned); nullopt = parsed into `out`.
+struct TxInjectBody {
+    dash::coin::MutableTransaction tx;
+    uint32_t flags{0};
+    int32_t  expiry{0};
+    uint64_t max_fee{0};
+};
+static std::optional<nlohmann::json> parse_tx_inject_body(const std::string& body, TxInjectBody& out)
+{
+    nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
+        return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
+                              {"http_status", 400}};
+    std::string hex = req["raw_tx"].get<std::string>();
+    hex.erase(std::remove_if(hex.begin(), hex.end(),
+                  [](unsigned char c) { return std::isspace(c); }), hex.end());
+    if (hex.empty() || hex.size() % 2 != 0 ||
+        !std::all_of(hex.begin(), hex.end(),
+                     [](unsigned char c) { return std::isxdigit(c) != 0; }))
+        return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
+                              {"http_status", 400}};
+    out.flags  = 0;
+    out.expiry = 0;
+    if (req.contains("flags") && req["flags"].is_number_unsigned())
+        out.flags = req["flags"].get<uint32_t>();
+    if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
+        out.expiry = req["expiry_height"].get<int32_t>();
+    // S2: the fee the operator allows (duffs). Default 0: the
+    // zero-fee sweep; a fee-paying tx the operator did not ask for
+    // refuses inject-fee-above-max.
+    out.max_fee = 0;
+    if (req.contains("max_fee")) {
+        if (!req["max_fee"].is_number_unsigned())
+            return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
+                                  {"http_status", 400}};
+        out.max_fee = req["max_fee"].get<uint64_t>();
+    }
+    try {
+        auto raw = ParseHex(hex);
+        PackStream ps(raw);
+        ps >> out.tx;
+    } catch (const std::exception& e) {
+        return nlohmann::json{{"ok", false},
+                              {"cause", std::string("tx parse failed: ") + e.what()},
+                              {"http_status", 400}};
+    }
+    return std::nullopt;
 }
 
 // ── PR-2 FORWARD: mined-commitment index arming flags ─────────────────────
@@ -3286,50 +3338,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 "marshals onto the node strand and never races m_inject_pool");
         web_server->get_mining_interface()->set_tx_inject_submit_fn(
             [&node_coin_state](const std::string& body) -> nlohmann::json {
-                nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
-                if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
-                    return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
-                                          {"http_status", 400}};
-                std::string hex = req["raw_tx"].get<std::string>();
-                hex.erase(std::remove_if(hex.begin(), hex.end(),
-                              [](unsigned char c) { return std::isspace(c); }), hex.end());
-                if (hex.empty() || hex.size() % 2 != 0 ||
-                    !std::all_of(hex.begin(), hex.end(),
-                                 [](unsigned char c) { return std::isxdigit(c) != 0; }))
-                    return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
-                                          {"http_status", 400}};
-                uint32_t flags  = 0;
-                int32_t  expiry = 0;
-                if (req.contains("flags") && req["flags"].is_number_unsigned())
-                    flags = req["flags"].get<uint32_t>();
-                if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
-                    expiry = req["expiry_height"].get<int32_t>();
-                // S2: the fee the operator allows (duffs). Default 0: the
-                // zero-fee sweep; a fee-paying tx the operator did not ask for
-                // refuses inject-fee-above-max.
-                uint64_t max_fee = 0;
-                if (req.contains("max_fee")) {
-                    if (!req["max_fee"].is_number_unsigned())
-                        return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
-                                              {"http_status", 400}};
-                    max_fee = req["max_fee"].get<uint64_t>();
-                }
-                dash::coin::MutableTransaction tx;
-                try {
-                    auto raw = ParseHex(hex);
-                    PackStream ps(raw);
-                    ps >> tx;
-                } catch (const std::exception& e) {
-                    return nlohmann::json{{"ok", false},
-                                          {"cause", std::string("tx parse failed: ") + e.what()},
-                                          {"http_status", 400}};
-                }
+                TxInjectBody b;
+                if (auto bad = parse_tx_inject_body(body, b))
+                    return *bad;
                 // #157 Slice B: an operator's own loopback submit draws on the
                 // LOCAL inject budget (InjectOrigin::Local) -- its own reserved
                 // rate, never the aggregate-peer budget a flood can exhaust.
                 auto r = node_coin_state.submit_inject(
-                    tx, flags, expiry,
-                    dash::coin::NodeCoinState::InjectOrigin::Local, max_fee);
+                    b.tx, b.flags, b.expiry,
+                    dash::coin::NodeCoinState::InjectOrigin::Local, b.max_fee);
                 // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
                 const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
                 return nlohmann::json{
@@ -3339,6 +3356,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     {"armed",       node_coin_state.tx_inject_enabled()},
                     {"http_status", http},
                 };
+            });
+        // c2wallet Scan & Plan (N3): POST /api/tx-inject/validate -- the dry
+        // run of the submit above (same body, same io-thread dispatch). It
+        // admits nothing and charges no rate budget; it adds each input's
+        // maturity at the next height and any pool tx spending an input.
+        web_server->get_mining_interface()->set_tx_inject_validate_fn(
+            [&node_coin_state](const std::string& body) -> nlohmann::json {
+                TxInjectBody b;
+                if (auto bad = parse_tx_inject_body(body, b))
+                    return *bad;
+                return dash::coin::inject_validate_json(
+                    node_coin_state.validate_inject(b.tx, b.max_fee));
             });
     }
     // c2wallet Scan & Plan (N1): GET /api/utxo/scan -- read-only scan of the
