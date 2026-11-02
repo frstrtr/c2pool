@@ -18,12 +18,16 @@
 ///     tip_moved, truncated, scripts[{address?,script_hex}],
 ///     unspents[{txid,vout,value,script_hex,height,coinbase}],
 ///     mempool_spent[{txid,vout,spent_by}], total_value }
-/// The rows are the set at tip_hash (UTXOViewCache::scan_coins reads one
-/// LevelDB snapshot taken with the best block). tip_moved: the lane connected
-/// a block during the pass, or had unflushed changes when it began; the
-/// caller scans again. truncated: more rows matched than `limit`; the pass
-/// stopped there. A coin a pool tx spends is listed in mempool_spent and,
-/// with exclude_mempool_spent=1, left out of unspents and total_value.
+/// UTXOViewCache::scan_coins reads one LevelDB snapshot taken with the best
+/// block. tip_moved false: the rows are exactly the set at tip_hash.
+/// tip_moved true: a block was flushed during the pass (the rows are still
+/// the set at tip_hash), or the cache held unflushed changes of a block being
+/// connected when the pass began (the rows are tip_hash plus those changes);
+/// either way the caller scans again. truncated: more rows matched than
+/// `limit` and the pass stopped there; it counts rows before the mempool
+/// exclusion, so a truncated reply can hold fewer than `limit` unspents. A
+/// coin a pool tx spends is listed in mempool_spent and, with
+/// exclude_mempool_spent=1, left out of unspents and total_value.
 ///
 /// Refusals, named in "error", with an "http_status" hint:
 ///   400 utxo-scan-bad-param | utxo-scan-bad-address | utxo-scan-bad-script |

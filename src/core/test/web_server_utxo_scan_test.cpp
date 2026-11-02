@@ -228,3 +228,36 @@ TEST(WebUtxoScan, AThrowingScanAnswers500)
     mi.set_utxo_scan_fn([](const std::string& q, const std::atomic<bool>&) { return scanned_reply(q); });
     EXPECT_EQ(mi.rest_utxo_scan("script=51")["http_status"], 200);
 }
+
+// WebServer::stop() cancels a running pass before it joins the HTTP thread
+// (which waits for the pass), so shutdown never waits a pass out.
+TEST(WebUtxoScan, StopDoesNotWaitOutARunningPass)
+{
+    net::io_context ioc;
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    std::atomic<bool> started{false}, saw_cancel{false};
+    ws->get_mining_interface()->set_utxo_scan_fn([&](const std::string&, const std::atomic<bool>& cancel) {
+        started = true;
+        const auto until = std::chrono::steady_clock::now() + 10s;
+        while (!cancel.load() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(1ms);
+        saw_cancel = cancel.load();
+        return nlohmann::json{{"ok", false}, {"error", "utxo-scan-cancelled"}, {"scanned", 0}, {"http_status", 503}};
+    });
+    ws->start();
+    const uint16_t port = ws->bound_port();
+    std::thread client([port] {
+        try {
+            fetch(port, "/api/utxo/scan?script=51");
+        } catch (...) {
+        }
+    });
+    while (!started.load()) std::this_thread::sleep_for(1ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    ws->stop();
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_TRUE(saw_cancel.load()) << "the pass was cancelled by stop()";
+    EXPECT_LT(took, 3s) << "stop() waited the pass out";
+    ws.reset();
+    client.join();
+}

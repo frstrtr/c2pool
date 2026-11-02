@@ -11470,6 +11470,11 @@ void WebServer::stop()
     if (running_) {
         try {
             running_ = false;
+            // The UTXO scan first: an HTTP handler waiting for a pass returns
+            // as soon as the pass sees the cancel, so the join below never
+            // waits out a pass.
+            if (mining_interface_)
+                mining_interface_->stop_utxo_scan();
             acceptor_.close();
             // Stop the dedicated HTTP event loop and join its thread
             http_ioc_.stop();

@@ -485,7 +485,8 @@ TEST(DashUtxoScan, AScanChangesNothing)
 // K9: the tenant payout address's 170 real rows (the dashd getaddressutxos
 // capture at tip 2563986 the wallet tests use), loaded into a full set among
 // other coins, come back through address= byte-equal: txid, vout, value,
-// script, height; total 60963705 duffs.
+// script, height; total 60963705 duffs. The capture has no coinbase flag, so
+// the rows are planted with a mixed one and it must come back as planted.
 TEST(DashUtxoScan, TheXdgF55FixtureRowsComeBackByteEqual)
 {
     std::ifstream f(XDGF_GETADDRESSUTXOS_FIXTURE);
@@ -501,9 +502,11 @@ TEST(DashUtxoScan, TheXdgF55FixtureRowsComeBackByteEqual)
         std::vector<uint8_t> spk;
         ASSERT_TRUE(dash::coin::utxo_scan_detail::unhex(u.at("script").get<std::string>(), spk));
         const uint32_t vout = u.at("outputIndex").get<uint32_t>();
+        const bool cb = coins.size() % 3 != 0;
         coins.push_back(coin_with(Outpoint(txid, vout), u.at("satoshis").get<int64_t>(), spk,
-                                  u.at("height").get<uint32_t>(), true));
+                                  u.at("height").get<uint32_t>(), cb));
         want[{txid.GetHex(), vout}] = u;
+        want[{txid.GetHex(), vout}]["coinbase"] = cb;
         want_total += u.at("satoshis").get<int64_t>();
     }
     ASSERT_EQ(want_total, 60963705);
@@ -528,5 +531,6 @@ TEST(DashUtxoScan, TheXdgF55FixtureRowsComeBackByteEqual)
         EXPECT_EQ(it->second["value"], u["satoshis"]);
         EXPECT_EQ(it->second["script_hex"], u["script"]);
         EXPECT_EQ(it->second["height"], u["height"]);
+        EXPECT_EQ(it->second["coinbase"], u["coinbase"]);
     }
 }
