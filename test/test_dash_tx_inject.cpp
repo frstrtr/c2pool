@@ -57,6 +57,7 @@
 
 #include "dash_utxo_full_fixture.hpp"   // S2: a full set built as the node builds it
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -2215,4 +2216,249 @@ TEST(DashTxInject, ChildInjectWaitsForItsReorgedParent)
         EXPECT_EQ(dash_txid(selected[0].tx), idC) << "C rides on the confirmed P:0";
         EXPECT_EQ(fees, 0u);
     }
+}
+
+// ── #2121 A-L2: re-tracking after a rewind is parent-first ─────────────────
+// still_wanted checks each put-back inject against the same active set, before
+// any of them is back, so a rewind can return more than the caps hold. The
+// retrack then refuses some of them; it must never keep a child whose parent it
+// refused (the child's input would be neither in the view nor in the pool, and
+// it would hold a slot it can never use).
+
+namespace {
+
+// A zero-fee spend of (prev:0) worth `value`, with `n_out` outputs to `k`.
+MutableTransaction filler_tx(const Key& k, const uint256& prev, int64_t value, uint32_t n_out) {
+    std::vector<TxOut> outs(n_out);
+    for (auto& o : outs) { o.value = 100; o.scriptPubKey = to_script(k.spk); }
+    outs.back().value = value - 100 * static_cast<int64_t>(n_out - 1);
+    return make_signed_spend_outs(k, prev, std::move(outs));
+}
+
+// A full set holding `coins` (100'000 each) plus filler coins, all spendable by
+// `k`, with the lane wired to a NodeCoinState through main_dash's hook.
+struct RewindCapsFixture {
+    static constexpr uint32_t kB = 2000;
+    static constexpr int64_t  kFillerValue = 1'000'000;
+    static constexpr uint32_t kFillers = 32;
+    Key k;
+    dash_utxo_full::TempDir tmp;
+    dash::coin::UtxoLane lane;
+    dash_utxo_full::Chain chain;
+    NodeCoinState st;
+    uint256 base_hash;
+    std::vector<uint256> filler_coins;
+    size_t next_filler = 0;
+    bool ok = false;
+
+    RewindCapsFixture(uint8_t seed, const std::string& tag, const std::vector<uint256>& coins)
+        : k(seed), tmp(tag) {
+        using namespace dash_utxo_full;
+        std::vector<SnapCoin> snap;
+        for (const auto& c : coins) {
+            SnapCoin s;
+            s.op = Outpoint(c, 0);
+            s.coin = Coin(100'000, to_script(k.spk), 500, false);
+            snap.push_back(s);
+        }
+        for (uint32_t i = 0; i < kFillers; ++i) {
+            filler_coins.push_back(nth_id(i, seed));
+            SnapCoin s;
+            s.op = Outpoint(filler_coins.back(), 0);
+            s.coin = Coin(kFillerValue, to_script(k.spk), 500, false);
+            snap.push_back(s);
+        }
+        const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+        base_hash = hash_of(base_block);
+        ok = open_full_set(lane, tmp, snap, kB, base_hash);
+        if (!ok) return;
+        chain.hashes[kB] = base_hash;
+        lane.set_hash_at_fn(chain.fn());
+        lane.set_request_block_fn([](uint32_t) { return true; });
+        arm_ncs(st, *lane.cache());
+        lane.attach(st.mempool());
+        lane.set_mempool_changed_fn([this]() { st.reconcile_inject_pool(); });
+        lane.on_header_tip(kB);
+        st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+    }
+
+    bool submit(const MutableTransaction& tx) {
+        const auto r = st.submit_inject(tx, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+        EXPECT_TRUE(r.ok) << r.cause;
+        return r.ok;
+    }
+
+    // Connect a block carrying `txs` at `h` on `prev`, then promote the tip.
+    uint256 connect(uint32_t h, const uint256& prev, std::vector<MutableTransaction> txs, uint32_t salt) {
+        using namespace dash_utxo_full;
+        std::vector<MutableTransaction> all{coinbase(50, salt)};
+        for (auto& t : txs) all.push_back(std::move(t));
+        const BlockType b = block(prev, std::move(all), salt);
+        const uint256 bh = hash_of(b);
+        chain.hashes[h] = bh;
+        lane.on_block_connected(b, h);
+        EXPECT_EQ(lane.cache()->get_best_block(), bh);
+        st.set_tip(h, bh, 0x1b104be3u, 1'700'000'000u + h, 76, 16);
+        return bh;
+    }
+
+    // Submit fillers until the pool's free byte room is near the middle of
+    // [lo, hi); returns the room reached (the caller asserts the window).
+    size_t fill_to_room(size_t lo, size_t hi) {
+        const size_t cap = TxInjectPool::kMaxInjectTotalBytes;
+        const size_t target = (lo + hi) / 2;
+        const size_t one_out = ser(filler_tx(k, filler_coins[0], kFillerValue, 1)).size();
+        const size_t big = ser(filler_tx(k, filler_coins[0], kFillerValue, 1000)).size();
+        auto want = [&]() { return cap - target - st.inject_pool_bytes(); };
+        while (want() > big && next_filler + 1 < filler_coins.size())
+            submit(filler_tx(k, filler_coins[next_filler++], kFillerValue, 500));
+        const size_t w = want();
+        // size(n) = one_out + 34 * (n - 1), plus 2 once n needs a 3-byte varint.
+        uint32_t n = 1 + static_cast<uint32_t>((w - one_out) / 34);
+        if (n >= 253) n = 1 + static_cast<uint32_t>((w - one_out - 2) / 34);
+        submit(filler_tx(k, filler_coins[next_filler++], kFillerValue, n));
+        return cap - st.inject_pool_bytes();
+    }
+};
+
+} // namespace
+
+// (#2121 A-L2, A11) A parent and its child come back together with room for
+// only one: the parent takes it and the child is refused and evicted. The
+// child is chosen to sort BEFORE its parent by txid, the order the retrack
+// used to walk (it refused the parent and kept the child).
+TEST(DashTxInject, RewindRetrackIsParentFirstAtTheCapsEdge)
+{
+    using namespace dash_utxo_full;
+    constexpr uint32_t kB = RewindCapsFixture::kB;
+    const uint256 prevA = prevhash(0xc1);
+    RewindCapsFixture f(0xec, "caps-parent-first", {prevA});
+    ASSERT_TRUE(f.ok);
+    TxOut toK; toK.value = 100'000; toK.scriptPubKey = to_script(f.k.spk);
+    const auto P = make_signed_spend_outs(f.k, prevA, {toK});
+    MutableTransaction C;
+    uint32_t seq = 0xffffffffu;
+    do { C = make_signed_spend_outs(f.k, dash_txid(P), {toK}, 1, seq--); }
+    while (!(dash_txid(C) < dash_txid(P)));
+    const uint256 idP = dash_txid(P), idC = dash_txid(C);
+
+    ASSERT_TRUE(f.submit(P));
+    const uint256 a1 = f.connect(kB + 1, f.base_hash, {P}, 2701);
+    ASSERT_TRUE(f.submit(C)) << "P:0 is in the view";
+    f.connect(kB + 2, a1, {C}, 2702);
+    ASSERT_EQ(f.st.inject_pool_size(), 0u);
+
+    const size_t sP = ser(P).size(), sC = ser(C).size();
+    const size_t room = f.fill_to_room(std::max(sP, sC), sP + sC);
+    ASSERT_GE(room, std::max(sP, sC)) << "each one fits alone, so both are wanted";
+    ASSERT_LT(room, sP + sC) << "but not both";
+    const size_t entries = f.st.inject_pool_size();
+
+    f.chain.hashes[kB + 1] = fake_hash(6701);
+    f.chain.hashes[kB + 2] = fake_hash(6702);
+    f.lane.on_header_tip(kB + 2);
+    ASSERT_EQ(f.lane.full_status().rewinds, 2u);
+    EXPECT_TRUE(f.st.inject_entry(idP).has_value()) << "the parent takes the room";
+    EXPECT_TRUE(f.st.mempool().get_entry(idP).has_value());
+    EXPECT_FALSE(f.st.inject_entry(idC).has_value()) << "the child is refused";
+    EXPECT_FALSE(f.st.mempool().get_entry(idC).has_value()) << "and evicted";
+    EXPECT_EQ(f.st.inject_pool_size(), entries + 1);
+    EXPECT_EQ(f.st.inject_pool_bytes(), TxInjectPool::kMaxInjectTotalBytes - room + sP);
+}
+
+// (#2121 A-L2, A12) A refused parent takes its put-back child with it even
+// when the child alone would fit: an unrelated put-back inject X (smallest
+// txid) takes room first, the larger parent P no longer fits, and the smaller
+// child C, which would, is refused by name with it.
+TEST(DashTxInject, RefusedRetrackTakesItsUntrackedChildWithIt)
+{
+    using namespace dash_utxo_full;
+    constexpr uint32_t kB = RewindCapsFixture::kB;
+    const uint256 prevX = prevhash(0xc2), prevP = prevhash(0xc3);
+    RewindCapsFixture f(0xed, "caps-cascade", {prevX, prevP});
+    ASSERT_TRUE(f.ok);
+    TxOut q; q.value = 25'000; q.scriptPubKey = to_script(f.k.spk);
+    TxOut whole; whole.value = 100'000; whole.scriptPubKey = to_script(f.k.spk);
+    const auto P = make_signed_spend_outs(f.k, prevP, {q, q, q, q});   // larger than C
+    const auto C = make_signed_spend_outs(f.k, dash_txid(P), {q});      // spends P:0
+    MutableTransaction X;
+    uint32_t seq = 0xffffffffu;
+    do { X = make_signed_spend_outs(f.k, prevX, {whole}, 1, seq--); }
+    while (!(dash_txid(X) < dash_txid(P) && dash_txid(X) < dash_txid(C)));
+    const uint256 idX = dash_txid(X), idP = dash_txid(P), idC = dash_txid(C);
+
+    ASSERT_TRUE(f.submit(X));
+    ASSERT_TRUE(f.submit(P));
+    const uint256 a1 = f.connect(kB + 1, f.base_hash, {X, P}, 2801);
+    ASSERT_TRUE(f.submit(C));
+    f.connect(kB + 2, a1, {C}, 2802);
+    ASSERT_EQ(f.st.inject_pool_size(), 0u);
+
+    const size_t sX = ser(X).size(), sP = ser(P).size(), sC = ser(C).size();
+    ASSERT_GT(sP, sC + 72) << "the window below must be wider than the filler step";
+    const size_t room = f.fill_to_room(sX + sC, sX + sP);
+    ASSERT_GE(room, sX + sC) << "after X, C would still fit";
+    ASSERT_LT(room, sX + sP) << "after X, P does not";
+    ASSERT_GE(room, sP) << "P alone fits, so the rewind wants it";
+
+    f.chain.hashes[kB + 1] = fake_hash(6801);
+    f.chain.hashes[kB + 2] = fake_hash(6802);
+    f.lane.on_header_tip(kB + 2);
+    ASSERT_EQ(f.lane.full_status().rewinds, 2u);
+    EXPECT_TRUE(f.st.inject_entry(idX).has_value());
+    EXPECT_FALSE(f.st.inject_entry(idP).has_value()) << "P is refused by the caps";
+    EXPECT_FALSE(f.st.mempool().get_entry(idP).has_value());
+    EXPECT_FALSE(f.st.inject_entry(idC).has_value()) << "C is refused with its parent";
+    EXPECT_FALSE(f.st.mempool().get_entry(idC).has_value());
+    EXPECT_EQ(f.st.inject_pool_bytes(), TxInjectPool::kMaxInjectTotalBytes - room + sX);
+}
+
+// (#2121 A-L2, A13) A child already back and tracked (an earlier rewind took
+// only its block) is evicted when a later rewind puts its parent back and the
+// caps refuse the parent.
+TEST(DashTxInject, RefusedRetrackEvictsItsTrackedChild)
+{
+    using namespace dash_utxo_full;
+    constexpr uint32_t kB = RewindCapsFixture::kB;
+    const uint256 prevX = prevhash(0xc4), prevP = prevhash(0xc5);
+    RewindCapsFixture f(0xee, "caps-tracked-child", {prevX, prevP});
+    ASSERT_TRUE(f.ok);
+    TxOut toK; toK.value = 100'000; toK.scriptPubKey = to_script(f.k.spk);
+    const auto P = make_signed_spend_outs(f.k, prevP, {toK});
+    const auto C = make_signed_spend_outs(f.k, dash_txid(P), {toK});
+    MutableTransaction X;
+    uint32_t seq = 0xffffffffu;
+    do { X = make_signed_spend_outs(f.k, prevX, {toK}, 1, seq--); }
+    while (!(dash_txid(X) < dash_txid(P)));
+    const uint256 idX = dash_txid(X), idP = dash_txid(P), idC = dash_txid(C);
+
+    ASSERT_TRUE(f.submit(X));
+    ASSERT_TRUE(f.submit(P));
+    const uint256 a1 = f.connect(kB + 1, f.base_hash, {X, P}, 2901);
+    ASSERT_TRUE(f.submit(C));
+    f.connect(kB + 2, a1, {C}, 2902);
+    ASSERT_EQ(f.st.inject_pool_size(), 0u);
+
+    // Rewind a2 only: C is back and tracked on top of the view's P:0.
+    f.chain.hashes[kB + 2] = fake_hash(6902);
+    f.lane.on_header_tip(kB + 2);
+    ASSERT_EQ(f.lane.full_status().rewinds, 1u);
+    ASSERT_TRUE(f.st.inject_entry(idC).has_value());
+
+    const size_t sX = ser(X).size(), sP = ser(P).size(), sC = ser(C).size();
+    const size_t room = f.fill_to_room(std::max(sX, sP), sX + sP);
+    ASSERT_GE(room, std::max(sX, sP)) << "X and P each fit alone";
+    ASSERT_LT(room, sX + sP) << "but not both";
+
+    // Rewind a1: X and P come back; X is retracked first, P is refused, and
+    // the tracked C, whose input is now nowhere, goes with it.
+    f.chain.hashes[kB + 1] = fake_hash(6901);
+    f.lane.on_header_tip(kB + 2);
+    ASSERT_EQ(f.lane.full_status().rewinds, 2u);
+    EXPECT_TRUE(f.st.inject_entry(idX).has_value());
+    EXPECT_FALSE(f.st.inject_entry(idP).has_value());
+    EXPECT_FALSE(f.st.mempool().get_entry(idP).has_value());
+    EXPECT_FALSE(f.st.inject_entry(idC).has_value()) << "the tracked child is evicted with its parent";
+    EXPECT_FALSE(f.st.mempool().get_entry(idC).has_value());
+    EXPECT_EQ(f.st.inject_pool_bytes(), TxInjectPool::kMaxInjectTotalBytes - room + sX - sC);
 }
