@@ -1870,8 +1870,10 @@ TEST(DashTxInjectValidate, ValidTxWouldAdmitAndNothingChanges)
     const std::vector<uint256> ids{dash_txid(tx), dash_txid(other)};
     const std::vector<Outpoint> ops{Outpoint(prev, 0), Outpoint(prev2, 0)};
     const auto before = dry_run_state(st, ids, ops);
+    ASSERT_EQ(st.inject_validate_rate_count(), 0u);
 
     const auto r = st.validate_inject(tx, /*max_fee=*/0);
+    EXPECT_EQ(st.inject_validate_rate_count(), 1u) << "charged to the dry run's own budget";
     EXPECT_TRUE(r.ok);
     EXPECT_TRUE(r.would_admit);
     EXPECT_EQ(r.cause, "ok");
@@ -1894,6 +1896,7 @@ TEST(DashTxInjectValidate, ValidTxWouldAdmitAndNothingChanges)
     EXPECT_EQ(dry_run_state(st, ids, ops), before) << "the dry run changed state";
     EXPECT_EQ(st.validate_inject(tx, 0).cause, "ok");
     EXPECT_EQ(dry_run_state(st, ids, ops), before) << "a second dry run changed state";
+    EXPECT_EQ(st.inject_validate_rate_count(), 2u);
 
     const auto j = dash::coin::inject_validate_json(r);
     EXPECT_EQ(j["ok"], true);
@@ -1914,8 +1917,9 @@ TEST(DashTxInjectValidate, ValidTxWouldAdmitAndNothingChanges)
 }
 
 // V2: a coinbase input below 100 confirmations at the next height is named
-// (inject-immature-input) while the gate itself would admit the tx — the
-// template build would drop it silently. Mature one block later.
+// (inject-immature-coinbase-input, the companion's reserved name) while the
+// gate itself would admit the tx — the template build would drop it
+// silently. Mature one block later.
 TEST(DashTxInjectValidate, ImmatureCoinbaseInputIsNamed)
 {
     Key k(0xd3);
@@ -1931,7 +1935,7 @@ TEST(DashTxInjectValidate, ImmatureCoinbaseInputIsNamed)
     EXPECT_FALSE(r.ok);
     EXPECT_TRUE(r.would_admit) << "admission does not check maturity";
     EXPECT_EQ(r.gate, "ok");
-    EXPECT_EQ(r.cause, "inject-immature-input");
+    EXPECT_EQ(r.cause, "inject-immature-coinbase-input");
     EXPECT_EQ(r.immature_at_next_height, 1u);
     auto j = dash::coin::inject_validate_json(r);
     EXPECT_EQ(j["http_status"], 422);
@@ -1942,7 +1946,7 @@ TEST(DashTxInjectValidate, ImmatureCoinbaseInputIsNamed)
     EXPECT_EQ(j["inputs"][0]["height"], 150);
 
     st.set_tip(248, prevhash(0x22), 0x1d00ffff, 0, 76, 16);   // next 249: one short
-    EXPECT_EQ(st.validate_inject(tx, 0).cause, "inject-immature-input");
+    EXPECT_EQ(st.validate_inject(tx, 0).cause, "inject-immature-coinbase-input");
     st.set_tip(249, prevhash(0x23), 0x1d00ffff, 0, 76, 16);   // next 250 = 150 + 100
     r = st.validate_inject(tx, 0);
     EXPECT_TRUE(r.ok) << r.cause;
@@ -2106,12 +2110,12 @@ TEST(DashTxInjectValidate, VerdictMatchesAddInjectCaseByCase)
     }
 }
 
-// V5: the dry run never charges the rate limiter, the sandbox or the status
-// counters: 250 dry runs (above the 200 per-window cap) leave the local
-// window empty and a real submit still passes. Disarmed, the cause is
-// inject-disabled but the inputs are still analysed; a tx the structural
-// checks refuse (type, sandbox) is not analysed and counts nowhere.
-TEST(DashTxInjectValidate, NoRateChargeNoCountersAndTheStructuralOrder)
+// V5: the dry run is charged to a local budget of its own, on attempt, as a
+// submit is to its budget: a tight loop is throttled by name at the
+// per-window cap with nothing analysed, while the submit windows, the status
+// counters and the pool stay untouched and a real submit still has its whole
+// budget. The type and size checks are charge-free (as for a submit).
+TEST(DashTxInjectValidate, ATightLoopIsThrottledAndSubmitsKeepTheirBudget)
 {
     Key k(0xd9);
     const uint256 prev = prevhash(0xd9);
@@ -2121,34 +2125,69 @@ TEST(DashTxInjectValidate, NoRateChargeNoCountersAndTheStructuralOrder)
     NodeCoinState st;
     arm_ncs(st, utxo);
     st.set_tip(400, prevhash(0x25), 0x1d00ffff, 0, 76, 16);
-    const auto before = dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)});
-    for (int i = 0; i < 250; ++i) ASSERT_EQ(st.validate_inject(tx, 0).cause, "ok") << i;
-    auto sandboxed = tx_with_inputs(InjectSandbox::kMaxInputs + 1);
-    auto r = st.validate_inject(sandboxed, 0);
-    EXPECT_EQ(r.cause, "inject-sandbox-too-many-inputs");
-    EXPECT_FALSE(r.analysed);
-    EXPECT_EQ(r.gate, "");
+
     auto typed = tx;
     typed.type = 1;
     EXPECT_EQ(st.validate_inject(typed, 0).cause, "inject-type-unsupported");
-    EXPECT_EQ(dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)}), before)
-        << "dry runs charged a rate window or a counter";
-    EXPECT_EQ(st.inject_rate_count(), 0u);
-    const auto submitted = st.submit_inject(tx, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
-    EXPECT_TRUE(submitted.ok) << submitted.cause;
+    MutableTransaction big = minimal_tx(0x61);
+    big.vout[0].scriptPubKey = to_script(std::vector<uint8_t>(TxInjectPool::kMaxInjectTxBytes + 64, 0x51));
+    EXPECT_EQ(st.validate_inject(big, 0).cause, "inject-pool-oversize");
+    EXPECT_EQ(st.inject_validate_rate_count(), 0u) << "the type and size checks are charge-free";
 
+    const auto before = dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)});
+    const std::size_t cap = InjectRateLimiter::kMaxInjectsPerWindow;
+    for (std::size_t i = 0; i < cap; ++i) ASSERT_EQ(st.validate_inject(tx, 0).cause, "ok") << i;
+    const auto r = st.validate_inject(tx, 0);
+    EXPECT_EQ(r.cause, "inject-rate-limited-count") << "the loop is throttled by name";
+    EXPECT_FALSE(r.analysed) << "a throttled dry run runs no script verify";
+    EXPECT_FALSE(r.would_admit);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(dash::coin::inject_validate_json(r)["http_status"], 422);
+    EXPECT_EQ(st.validate_inject(tx_with_inputs(InjectSandbox::kMaxInputs + 1), 0).cause,
+              "inject-rate-limited-count") << "throttled before the sandbox, as a submit is";
+    EXPECT_EQ(st.inject_validate_rate_count(), cap);
+
+    EXPECT_EQ(dry_run_state(st, {dash_txid(tx)}, {Outpoint(prev, 0)}), before)
+        << "dry runs touched a submit window, a counter or the pool";
+    EXPECT_EQ(st.inject_rate_count(), 0u);
+    EXPECT_EQ(st.inject_rate_count_peer(), 0u);
+    const auto submitted = st.submit_inject(tx, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    EXPECT_TRUE(submitted.ok) << submitted.cause << ": the submit budget is the operator's, whole";
+    EXPECT_EQ(st.inject_rate_count(), 1u);
+}
+
+// V5b: disarmed, the cause is inject-disabled (submit order) but the inputs
+// are still analysed, so the dry run is still charged; the sandbox runs after
+// the charge, as in a submit, and counts nowhere.
+TEST(DashTxInjectValidate, DisarmedStillAnalysesAndIsCharged)
+{
+    Key k(0xda);
+    const uint256 prev = prevhash(0xda);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(70'000, to_script(k.spk), 10, false));
+    NodeCoinState st;
+    arm_ncs(st, utxo);
+    st.set_tip(400, prevhash(0x27), 0x1d00ffff, 0, 76, 16);
     st.set_tx_inject_enabled(false);
-    Key k2(0xda);
-    const uint256 prev2 = prevhash(0xda);
-    utxo.add_coin(Outpoint(prev2, 0), Coin(70'000, to_script(k2.spk), 10, false));
-    r = st.validate_inject(make_signed_spend(k2, prev2, 70'000), 0);
+    const auto sb_before = core::obs::inject_status().sb_refused_total.load();
+
+    auto r = st.validate_inject(make_signed_spend(k, prev, 70'000), 0);
     EXPECT_FALSE(r.armed);
     EXPECT_FALSE(r.would_admit);
     EXPECT_EQ(r.cause, "inject-disabled");
     EXPECT_EQ(r.gate, "ok") << "disarmed, the inputs are still analysed";
     EXPECT_TRUE(r.analysed);
     EXPECT_EQ(dash::coin::inject_validate_json(r)["http_status"], 409);
-    EXPECT_EQ(st.validate_inject(sandboxed, 0).cause, "inject-disabled") << "submit order: disarmed first";
+    EXPECT_EQ(st.inject_validate_rate_count(), 1u);
+
+    r = st.validate_inject(tx_with_inputs(InjectSandbox::kMaxInputs + 1), 0);
+    EXPECT_EQ(r.cause, "inject-disabled") << "submit order: disarmed first";
+    EXPECT_FALSE(r.analysed);
+    EXPECT_EQ(r.gate, "");
+    EXPECT_EQ(st.inject_validate_rate_count(), 2u) << "charged before the sandbox, as a submit is";
+    EXPECT_EQ(core::obs::inject_status().sb_refused_total.load(), sb_before)
+        << "a dry run's sandbox refusal counts nowhere";
+    EXPECT_EQ(st.inject_rate_count(), 0u);
 }
 
 // V6: an input from an unconfirmed pool parent resolves from the pool (the

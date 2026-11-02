@@ -25,6 +25,7 @@
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
 #include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
+#include <impl/dash/coin/inject_dry_run_causes.hpp> // N3: the causes only the dry run answers
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -833,8 +834,8 @@ public:
         bool        would_admit{false};  // submit_inject would answer "ok" now (its rate
                                          // limiter aside: the dry run does not charge it)
         std::string cause;               // the first refusal in submit order, then
-                                         // inject-tip-unknown / inject-immature-input /
-                                         // inject-input-spent-in-mempool; else "ok"
+                                         // the dry-run-only causes
+                                         // (inject_dry_run_causes.hpp); else "ok"
         std::string gate;                // Mempool::add_inject's verdict ("" when a
                                          // structural check refused before it)
         uint256     txid;
@@ -849,15 +850,20 @@ public:
     static constexpr uint32_t kCoinbaseMaturity = 100;
 
     /// The dry run of submit_inject (c2wallet Scan & Plan N3): the same gate
-    /// in the same order, answered without changing anything — the inject
-    /// ledger, the mempool, the fee deltas, the rate limiters and the status
-    /// counters are left exactly as they were (no reconcile, no rate charge,
-    /// no admission; Mempool::validate_inject prices on a scratch entry). It
-    /// adds what admission does not check: each input's coin, its maturity at
-    /// the next height (a coinbase input needs height + 100 <= next_height;
-    /// the template build would drop an immature inject silently), and any
-    /// other pool tx spending an input. A tx the structural checks refuse
-    /// (type, size, sandbox) is not analysed further. io-thread only, like
+    /// in the same order, answered without admitting anything — the inject
+    /// ledger, the mempool, the fee deltas, the submit rate windows and the
+    /// status counters are left exactly as they were (no reconcile, no
+    /// admission; Mempool::validate_inject prices on a scratch entry). Its
+    /// one write is its own budget: like a submit it is charged on attempt
+    /// (after the charge-free type and size checks, before the sandbox and
+    /// the script verify, armed or not) to m_inject_rate_validate, a local
+    /// window of its own, so a preflight loop cannot hold the io thread and
+    /// cannot spend the operator's submit budget. It adds what admission does
+    /// not check: each input's coin, its maturity at the next height (a
+    /// coinbase input needs height + 100 <= next_height; the template build
+    /// would drop an immature inject silently), and any other pool tx
+    /// spending an input. A tx the structural checks refuse (type, size,
+    /// sandbox) or the budget refuses is not analysed. io-thread only, like
     /// submit_inject (it reads the inject ledger and the tip).
     InjectValidateResult validate_inject(const MutableTransaction& tx,
                                          uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
@@ -871,7 +877,13 @@ public:
             structural = "inject-type-unsupported";
         } else if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
             structural = dash::coin::TxInjectPool::admit_name(dash::coin::TxInjectPool::Admit::TooLarge);
-        } else {
+        }
+        if (structural.empty()) {
+            const auto rl = m_inject_rate_validate.try_consume(byte_size, std::time(nullptr));
+            if (!rl.ok()) {
+                r.cause = rl.name();   // the dry run itself was refused, armed or not
+                return r;
+            }
             const auto sb = dash::coin::InjectSandbox::vet(tx);
             if (!sb.ok()) structural = sb.name();
         }
@@ -895,9 +907,9 @@ public:
         if (!r.armed) r.cause = "inject-disabled";
         else if (pv != dash::coin::TxInjectPool::Admit::Ok) r.cause = dash::coin::TxInjectPool::admit_name(pv);
         else if (r.dry.gate != dash::coin::Mempool::InjectGate::Ok) r.cause = r.gate;
-        else if (r.next_height == 0) r.cause = "inject-tip-unknown";
-        else if (r.immature_at_next_height != 0) r.cause = "inject-immature-input";
-        else if (conflict) r.cause = "inject-input-spent-in-mempool";
+        else if (r.next_height == 0) r.cause = inject_dry_run_cause::kTipUnknown;
+        else if (r.immature_at_next_height != 0) r.cause = inject_dry_run_cause::kImmatureCoinbaseInput;
+        else if (conflict) r.cause = inject_dry_run_cause::kInputSpentInMempool;
         else r.cause = "ok";
         r.ok = r.cause == "ok";
         return r;
@@ -961,6 +973,8 @@ public:
     size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
     // #157 M3: same, for the aggregate-PEER rate limiter.
     size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // N3: dry runs (validate_inject) the dry-run budget still counts in its window.
+    size_t inject_validate_rate_count() const { return m_inject_rate_validate.count_in_window(); }
     // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
     // an oversize blob was refused BEFORE the byte-window was charged.
     uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
@@ -2473,6 +2487,11 @@ private:
     // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
     dash::coin::InjectRateLimiter m_inject_rate_peer{
         dash::coin::InjectRateLimiter::Scope::Peers};
+    // N3: the LOCAL budget of the dry run (validate_inject). Same caps and
+    // the same local cause names as m_inject_rate, but its own window, so a
+    // preflight loop is throttled without spending the operator's submit
+    // budget (the split the peer budget already has).
+    dash::coin::InjectRateLimiter m_inject_rate_validate;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs

@@ -14,13 +14,21 @@
 ///
 /// `cause` is what a submit would answer first ("inject-disabled", a pool
 /// cap, an add_inject gate name), then what admission does not check:
-/// "inject-tip-unknown", "inject-immature-input" (a coinbase input below 100
-/// confirmations at next_height: the template build would drop the tx
-/// silently), "inject-input-spent-in-mempool" (another pool tx spends an
-/// input). `ok` = cause "ok". http_status as for a submit: 200 ok, 409
-/// inject-disabled, 422 otherwise. Unknown fields stay absent, never guessed:
-/// an input from an unconfirmed pool parent has height and
-/// spendable_from_height null.
+///   "inject-tip-unknown"              the node has no tip yet, so maturity
+///                                     cannot be judged (transient: ask again)
+///   "inject-immature-coinbase-input"  a coinbase input below 100
+///                                     confirmations at next_height: the
+///                                     template build would drop the tx
+///                                     silently (wait for spendable_from_height)
+///   "inject-input-spent-in-mempool"   another pool tx spends an input
+///                                     (conflicts[] names it; the selector
+///                                     would keep one of the two)
+/// A dry run refused by its own budget answers the submit's local names
+/// "inject-rate-limited-count" / "inject-rate-limited-bytes" with nothing
+/// analysed (retry after the 60 s window). `ok` = cause "ok". http_status as
+/// for a submit: 200 ok, 409 inject-disabled, 422 otherwise. Unknown fields
+/// stay absent, never guessed: an input from an unconfirmed pool parent has
+/// height and spendable_from_height null.
 
 #include "node_coin_state.hpp"
 
