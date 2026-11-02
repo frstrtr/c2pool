@@ -25,7 +25,10 @@ cmake_minimum_required(VERSION 3.21)
 # <hash.h>, <script/*>) added BEFORE the include path; hdkeys pulls c2pool's
 # btclibs tree (which also has <hash.h>, <uint256.h>). To keep the two trees
 # from meeting in one translation unit, the DASH sources are split:
-#   c2wallet-dash-common  — btclibs closure only  (hash/address/key/message)
+#   c2wallet-dash-plan    — btclibs closure, KEY-FREE (address/intake/planner/
+#                           manifest/gov hash); the online companion links it
+#   c2wallet-dash-common  — btclibs closure, key code (key scan/message/model);
+#                           links c2wallet-dash-plan PUBLIC
 #   c2wallet-dash-tx      — dashscript closure only (the tx assembly via signer)
 # Neither pulls the other's header tree; both link cleanly into one binary
 # because static-archive symbol resolution is lazy (the collision is at the
@@ -61,21 +64,25 @@ if(NOT TARGET c2wallet-signer)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../signer ${CMAKE_BINARY_DIR}/_dash_signer)
 endif()
 
-# ── btclibs-closure lib: hash / address / key-scan / message ────────────────
-# plus the key-free half of the zero-fee inject builders: UTXO intake/screening
-# and the sweep planner / unsigned serializer / loader-file emit.
+# ── key-free plan lib (scan & plan slice S-A) ─────────────────────────────
+# c2wallet-dash-plan: address decode, UTXO intake/screening, the sweep planner /
+# unsigned serializer / loader-file emit, the manifest and the gobject hash. No
+# key code; the online companion links it (DashPlan.cmake, shared with
+# src/companion/CMakeLists.txt).
+if(NOT TARGET c2wallet-dash-plan)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/DashPlan.cmake)
+endif()
+
+# ── btclibs-closure lib: key-scan / message / the inject page model ────────
+# The key-bearing half of the btclibs closure. It links c2wallet-dash-plan
+# PUBLIC, so every consumer links the same closure as before the split.
 add_library(c2wallet-dash-common STATIC
-    GovCollateral.cpp
-    DashAddress.cpp
     KeyScan.cpp
     DashMessage.cpp
-    UtxoIntake.cpp
-    SweepTx.cpp
-    # slice 2: PageDashInject's std-only model (all but sign()) + the manifest.
+    # slice 2: PageDashInject's std-only model (all but sign()).
     # DashInjectModel.cpp plans a collateral through plan_collateral
     # (CollateralTx.cpp, c2wallet-dash-tx): a consumer of the model links BOTH
     # libs, c2wallet-dash-tx first, as the signer app and c2wallet-dash-test do.
-    InjectManifest.cpp
     DashInjectModel.cpp
 )
 target_include_directories(c2wallet-dash-common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -84,7 +91,7 @@ target_include_directories(c2wallet-dash-common PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 # c2wallet-dash-tx (below) — btclibs and dashscript share the compat/endian.h
 # include guard, and leaking btclibs into the dashscript TU guard-skips
 # le16toh_internal. The static-lib link dependency still reaches the final exe.
-target_link_libraries(c2wallet-dash-common PRIVATE c2wallet-hdkeys)
+target_link_libraries(c2wallet-dash-common PUBLIC c2wallet-dash-plan PRIVATE c2wallet-hdkeys)
 
 # ── dashscript-closure lib: the tx assembly, via the M3-A signer ────────────
 # (collateral build + sign, and the signing half of the sweep builder)
@@ -113,6 +120,29 @@ if(C2WALLET_QT_BUILD_TESTS OR _dash_standalone)
     target_compile_definitions(c2wallet-dash-test PRIVATE
         C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
     add_test(NAME dash_kats COMMAND c2wallet-dash-test)
+
+    # Slice S-A: the key-free plan library on its own. The KATs (P1 on the real
+    # fixture, P2 the byte-cap boundary) link ONLY c2wallet-dash-plan, and the
+    # key-free guard runs over both the archive and that linked binary. The
+    # negative control runs the same guard over a probe binary that links the
+    # funding-key scan (KeyScan.cpp) and nothing else of the key layer: it
+    # must FAIL, which proves the guard sees the key code the split keeps out
+    # of the plan library (the token list before the split passed it).
+    add_executable(c2wallet-dash-plan-test tests/test_dash_plan.cpp)
+    target_link_libraries(c2wallet-dash-plan-test PRIVATE c2wallet-dash-plan)
+    target_compile_definitions(c2wallet-dash-plan-test PRIVATE
+        C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME dash_plan_kats COMMAND c2wallet-dash-plan-test)
+    set(_c2w_key_free_guard "${CMAKE_CURRENT_SOURCE_DIR}/../../../../ci/check_key_free.sh")
+    add_test(NAME dash_plan_key_free_guard
+             COMMAND "${_c2w_key_free_guard}" "$<TARGET_FILE:c2wallet-dash-plan>")
+    add_test(NAME dash_plan_test_key_free_guard
+             COMMAND "${_c2w_key_free_guard}" "$<TARGET_FILE:c2wallet-dash-plan-test>")
+    add_executable(c2wallet-dash-key-scan-probe tests/key_scan_probe.cpp)
+    target_link_libraries(c2wallet-dash-key-scan-probe PRIVATE c2wallet-dash-common)
+    add_test(NAME dash_key_scan_probe_key_free_guard_negative_control
+             COMMAND "${_c2w_key_free_guard}" "$<TARGET_FILE:c2wallet-dash-key-scan-probe>")
+    set_tests_properties(dash_key_scan_probe_key_free_guard_negative_control PROPERTIES WILL_FAIL TRUE)
 
     # The "drive the proven Python as the oracle" leg: proto_hash_oracle.py (the
     # stdlib-only reference port) recomputes the gobject hashes and asserts the

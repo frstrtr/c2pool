@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Key-free half of the zero-fee sweep builder (planning, serialization and the
-// loader-file emit). Lives in c2wallet-dash-common on the btclibs closure and
-// touches no signing code; the signing half is SweepSign.cpp in c2wallet-dash-tx.
-#include "SweepTx.hpp"
+// loader-file emit). Lives in c2wallet-dash-plan on the btclibs closure and
+// touches no key or signing code; the signing half is SweepSign.cpp in
+// c2wallet-dash-tx. Includes only key-free headers (SweepPlan.hpp rule).
+#include "SweepPlan.hpp"
 
 #include "DashAddress.hpp"
 #include "DashError.hpp"
@@ -11,6 +12,7 @@
 #include "../hdkeys/HexUtil.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace c2w::dash {
 

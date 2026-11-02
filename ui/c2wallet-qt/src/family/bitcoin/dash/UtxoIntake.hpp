@@ -14,9 +14,10 @@
 // a template before it matures is dropped silently by the node, so this gate is
 // the only guard).
 //
-// std-only header; the .cpp sits on the btclibs closure (hdkeys MiniJson / hex).
+// std-only, key-free header (c2wallet-dash-plan); the .cpp sits on the btclibs
+// closure (hdkeys MiniJson / hex).
 
-#include "CollateralTx.hpp"
+#include "SweepPlan.hpp"
 
 #include <array>
 #include <cstdint>
