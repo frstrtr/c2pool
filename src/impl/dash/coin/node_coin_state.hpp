@@ -46,6 +46,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -191,14 +192,18 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 class NodeCoinState {
 public:
     NodeCoinState() {
-        // VERIFY-S2b S-B: a rewind puts back only the injects this ledger
-        // still tracks. The ledger keeps a confirmed inject until its
-        // expiry_height (reconcile_inject_pool), so a reaped one is expired
-        // and stays out instead of coming back untracked. (If the ledger ever
-        // forgets on confirm, it must keep confirmed entries for the undo keep
-        // or this must change with it.)
-        m_mempool.set_inject_still_wanted_fn(
-            [this](const uint256& txid) { return m_inject_pool.contains(txid); });
+        // VERIFY-S2b S-B / #2121: a rewind puts back only the injects this
+        // ledger still wants. The ledger releases an inject when it leaves the
+        // mempool (reconcile_inject_pool) but keeps its record in the released
+        // ledger as deep as the mempool's confirmed keep, so a confirmed inject
+        // a rewind takes out is put back and re-tracked with its original
+        // metadata. One whose expiry_height the next block passes, or one the
+        // active caps have no room for, stays out instead of coming back
+        // untracked. Called inside Mempool::readmit_disconnected_injects on the
+        // io thread (the lane's rewind).
+        m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
+            return m_inject_pool.still_wanted(txid, next_block_height());
+        });
     }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
@@ -565,7 +570,8 @@ public:
         m_version              = version;
         m_populated            = true;
         // S2: an inject whose expiry_height the new tip reached leaves the pool
-        // and the mempool now, not at the next submit.
+        // and the mempool now, not at the next submit. #2121: so does one that
+        // left the mempool (the lane's hook usually released it already).
         reconcile_inject_pool();
     }
 
@@ -802,8 +808,8 @@ public:
                 r.cause = sb.name(); return r;
             }
         }
-        // Lazily reconcile the pool with the mempool before admitting: forget
-        // any tracked inject no longer in the mempool (confirmed / evicted) and
+        // Reconcile the pool with the mempool before admitting: release any
+        // tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
@@ -826,24 +832,77 @@ public:
         return r;
     }
 
-    /// Reconcile the inject ledger with the live mempool + tip: drop tracked
-    /// injects that have left the mempool (confirmed / conflict-evicted) or have
-    /// expired, evicting the expired ones from the mempool too. Called from
-    /// submit_inject and (S2) on every tip advance (set_tip), so an expiry_height
-    /// withdraws an inject without a second submit.
+    /// Reconcile the inject ledger with the live mempool + tip (#2121). After
+    /// it, the active set equals Mempool::inject_txids_in_pool(): nothing that
+    /// left the mempool counts against the caps, and every inject in the
+    /// mempool is tracked. Five steps, io thread:
+    ///   1. expiry: reap the injects the next block passes (expiry_height != 0
+    ///      && next height > expiry_height) and evict them from the mempool;
+    ///   2. read the injects live in the mempool;
+    ///   3. release every tracked inject that is not live (confirmed or
+    ///      conflict-evicted by a block); its record stays in the released
+    ///      ledger for a rewind;
+    ///   4. re-track every live inject that is not tracked: a rewind put it
+    ///      back (original metadata from the released ledger), or it has no
+    ///      record (tracked fresh: flags 0, expiry 0, its mempool size). A
+    ///      refusal by the caps evicts it from the mempool again by name;
+    ///   5. prune released records the undo-keep depth no longer reaches.
+    /// Then the status mirror is published. Called from submit_inject (before
+    /// the caps check), set_tip (every tip advance), and the UTXO lane's
+    /// mempool-changed hook (main_dash: after every block connect / rewind the
+    /// lane runs, so a confirm releases before the next promotion).
+    /// Rate-limiter windows are never refunded here.
     void reconcile_inject_pool() {
-        if (m_inject_pool.empty()) return;
-        // Expiry against our own tip.
+        const int32_t next_h = next_block_height();
+        // (1) Expiry against our own tip.
         if (m_prev_height != 0) {
-            for (const auto& id : m_inject_pool.reap_expired(
-                     static_cast<int32_t>(m_prev_height + 1))) {
+            for (const auto& id : m_inject_pool.reap_expired(next_h)) {
                 m_mempool.remove_tx(id);
             }
         }
+        // (2) The injects live in the mempool.
+        const std::vector<uint256> live = m_mempool.inject_txids_in_pool();
+        const std::set<uint256> live_set(live.begin(), live.end());
+        // (3) Release what left the mempool.
+        for (const auto& id : m_inject_pool.tracked_ids()) {
+            if (live_set.count(id)) continue;
+            m_inject_pool.release(id, m_prev_height);
+            LOG_INFO << "[MEMPOOL] inject released txid=" << id.GetHex().substr(0, 16)
+                     << " cause=left-mempool height=" << m_prev_height;
+        }
+        // (4) Re-track what came back (or was never tracked).
+        for (const auto& id : live) {
+            if (m_inject_pool.contains(id)) continue;
+            const char* how = "rewind";
+            auto v = m_inject_pool.retrack(id);
+            if (v == TxInjectPool::Admit::NotTracked) {
+                how = "untracked";
+                const auto e = m_mempool.get_entry(id);
+                v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+            }
+            if (v != TxInjectPool::Admit::Ok) {
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject readmit refused txid=" << id.GetHex().substr(0, 16)
+                            << " cause=" << TxInjectPool::admit_name(v)
+                            << "; evicted from the mempool, resubmit it if it is still wanted";
+            } else {
+                LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
+                         << " cause=" << how;
+            }
+        }
+        // (5) Released records a rewind can no longer reach.
+        if (m_prev_height != 0)
+            m_inject_pool.prune_released(m_prev_height, Mempool::kConfirmedInjectDepth);
         publish_inject_status();
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+    /// Bytes the active inject set counts against kMaxInjectTotalBytes.
+    size_t inject_pool_bytes() const { return m_inject_pool.total_bytes(); }
+    /// The active ledger entry for `txid` (nullopt when it is not tracked).
+    std::optional<InjectEntry> inject_entry(const uint256& txid) const {
+        return m_inject_pool.entry(txid);
+    }
 
     /// Publish the current tx-inject lane state into the process-global
     /// read-only observability snapshot (core::obs::inject_status()),
@@ -1989,6 +2048,12 @@ public:
     }
 
 private:
+    /// The height of the block the next template builds (tip + 1), or 0 while
+    /// no tip is known (the inject ledger then treats nothing as expired).
+    int32_t next_block_height() const {
+        return m_prev_height ? static_cast<int32_t>(m_prev_height + 1) : 0;
+    }
+
     /// THE clause list. The ONLY transcription of embedded-arm viability:
     /// make_embedded_work_inputs() derives has_state from `.viable`, and
     /// describe_decline()/classify_decline() read the very same object, so the

@@ -248,6 +248,22 @@ This is the key reuse: **construct-and-broadcast-arbitrary-tx is already proven*
   cache; an inject already in a recent block or the current body is dropped.
 - **Expiry.** `expiry_height` bounds how long a node keeps re-offering an
   inject; expired entries are evicted without further gossip.
+- **Release on confirm (#2121).** The inject pool's active set always equals
+  the injects live in the mempool. `NodeCoinState::reconcile_inject_pool()`
+  runs on every tip advance, before every submit, and from the UTXO lane's
+  mempool-changed hook (once at the end of every block connect / rewind, on
+  the io thread): it reaps expired injects, RELEASES every tracked inject that
+  left the mempool (confirmed or conflict-evicted, whatever its
+  `expiry_height`), and RE-TRACKS every live inject that is not tracked. A
+  released inject's bytes leave the DoS caps at once; its metadata moves to a
+  bounded released ledger (at most `INJECT_POOL_MAX_ENTRIES` records, pruned
+  at the confirmed-inject keep depth, `DASH_MIN_BLOCKS_TO_KEEP`) that the caps
+  never count. A rewind asks `TxInjectPool::still_wanted` before it puts a
+  confirmed inject back (active, or released with an unexpired
+  `expiry_height` and room in the caps); the put-back tx is re-tracked with
+  its original flags / expiry / size / submit time through the same caps as a
+  fresh admit. A live inject with no record is tracked fresh (expiry 0).
+  Rate-limiter windows are never refunded by a release or a retrack.
 - **No amplification.** `tx-inject` is forwarded on first-see only, with TTL, so
   it cannot loop the mesh. A node never re-derives or re-signs the tx; it
   forwards the bytes verbatim or drops them.
@@ -476,7 +492,7 @@ means any signer suffices — so it is correctly deferred without blocking M1.
 | M2 (implemented) | relay policy (flag short-circuit, per-peer dedup + rate guard, node-level seen set, first-see fan-out) | `src/impl/dash/tx_inject_relay.hpp` (`ingest_peer_inject`), `src/impl/dash/peer.hpp` (`m_inject_guard`) |
 | M2 (implemented) | submit sink seam (routes the peer path through the armed `NodeCoinState::submit_inject`) | `node.hpp` (`set_tx_inject_sink` / `handle_peer_tx_inject` / `relay_tx_inject`), `src/c2pool/main_dash.cpp` (wired next to the arm) |
 | M2 (implemented) | first-see fan-out + `register_template_txs` ride | `relay_tx_inject` (fan-out); an accepted inject is an ordinary body tx, so it rides `register_template_txs` unchanged (KAT-proven) |
-| M2 (staged) | continuous re-submission per tip | block-connect wiring of `reconcile_inject_pool` (lazy reconcile inside `submit_inject` suffices for M2) |
+| M2 (implemented, #2121) | release on confirm / evict, re-track on rewind | `reconcile_inject_pool` wired to `UtxoLane::set_mempool_changed_fn` (block connect / rewind), `set_tip`, `submit_inject`; `TxInjectPool::release` / `retrack` / `still_wanted` |
 | **M3** | per-peer token buckets, misbehaviour score, capability advertisement | coin_peer_manager / handler |
 | M3 | `submitter_hint` rate-accounting | inject pool |
 | M3 | full sandboxed signer (§10) | new isolated build/sign module |

@@ -70,6 +70,12 @@
 ///     its undo record (rewind), back to the base at most; deeper withholds.
 ///     An inject the rewound blocks had confirmed is put back into the inject
 ///     set (Mempool::readmit_disconnected_injects, the normal admission gate);
+///   - every entry point that can change the mempool (on_block_connected,
+///     on_header_tip) fires the mempool-changed hook once when it returns,
+///     after every remove_for_block / remember_confirmed_injects /
+///     put_back_injects it ran, so the inject ledger releases a confirmed or
+///     evicted inject and re-tracks a put-back one on the same io-thread call
+///     (set_mempool_changed_fn; NodeCoinState::reconcile_inject_pool);
 ///   - a flush that fails drops the unflushed changes (discard_pending) and
 ///     withholds, so nothing prices from coins the DB does not have.
 ///
@@ -134,6 +140,9 @@ public:
     using HashAtFn = std::function<std::optional<uint256>(uint32_t height)>;
     /// A withhold, for the alert relay: (event, detail).
     using AlertFn = std::function<void(const std::string& event, const std::string& detail)>;
+    /// The mempool may have changed (a block connected, a rewind put injects
+    /// back). Fired once when an entry point returns, on the io thread.
+    using MempoolChangedFn = std::function<void()>;
 
     /// Requests in flight while a full set fills best+1 .. tip (the DOGE
     /// branch's ordered-fill window, DESIGN 4.3).
@@ -234,6 +243,9 @@ public:
     bool base_verified() const { return m_base_verified; }
     void set_hash_at_fn(HashAtFn fn) { m_hash_at = std::move(fn); }
     void set_alert_fn(AlertFn fn) { m_alert = std::move(fn); }
+    /// #2121: main_dash wires NodeCoinState::reconcile_inject_pool here, so
+    /// the inject ledger follows every mempool change the lane makes.
+    void set_mempool_changed_fn(MempoolChangedFn fn) { m_mempool_changed = std::move(fn); }
 
     /// Any thread: the status the io thread last published (VERIFY-S2 S-1).
     FullStatus full_status() const
@@ -295,10 +307,24 @@ private:
         m_status = std::move(st);
     }
 
-    /// Publishes the status when an io-thread entry point returns.
+    /// io thread: tell the inject ledger the mempool may have changed.
+    void notify_mempool_changed()
+    {
+        if (m_mempool_changed) m_mempool_changed();
+    }
+
+    /// Publishes the status when an io-thread entry point returns, then fires
+    /// the mempool-changed hook (after every mempool mutation the entry point
+    /// ran).
     struct PublishOnReturn {
         UtxoLane& lane;
-        ~PublishOnReturn() { lane.publish_status(); }
+        ~PublishOnReturn() { lane.publish_status(); lane.notify_mempool_changed(); }
+    };
+
+    /// Accrual mode's entry point: the mempool-changed hook only.
+    struct MempoolChangedOnReturn {
+        UtxoLane& lane;
+        ~MempoolChangedOnReturn() { lane.notify_mempool_changed(); }
     };
 
 public:
@@ -445,6 +471,9 @@ public:
             on_block_full(block, height, block_hash);
             return;
         }
+        // Accrual mode removes confirmed txs too (connect_one, the raced
+        // branch below): the inject ledger hears of it when this returns.
+        const MempoolChangedOnReturn mempool_changed{*this};
 
         constexpr uint32_t DASH_KEEP = DASH_MIN_BLOCKS_TO_KEEP;  // 288
 
@@ -696,7 +725,7 @@ private:
         LOG_WARNING << "[EMB-DASH] UTXO rewind from h=" << from_height << ": " << r.readmitted.size()
                     << " inject(s) the rewound block(s) confirmed are back in the inject set, "
                     << r.refused.size() << " refused, " << r.not_wanted.size()
-                    << " left out (expired in the inject ledger)";
+                    << " left out (not wanted by the inject ledger: expired or pool full)";
         for (const auto& [txid, gate] : r.refused)
             LOG_WARNING << "[EMB-DASH] UTXO rewind: inject " << txid.GetHex().substr(0, 16)
                         << " not re-admitted (" << Mempool::inject_gate_name(gate)
@@ -960,6 +989,7 @@ private:
     uint32_t                       m_min_base_height{0};
     HashAtFn                       m_hash_at;
     AlertFn                        m_alert;
+    MempoolChangedFn               m_mempool_changed;
     std::atomic<bool>              m_base_verified{false};
     std::atomic<bool>              m_withheld{false};
     std::string                    m_withheld_reason;

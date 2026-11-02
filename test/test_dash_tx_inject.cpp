@@ -1748,29 +1748,185 @@ TEST(DashTxInject, ChainOfInjectsAcrossTwoRewoundBlocksComesBackParentFirst)
     }
 }
 
-// (VERIFY-S2b S-B, R3-3) A rewind puts back only the injects the inject
-// ledger still tracks: one whose expiry_height the tip passed while it was
-// confirmed was reaped from the ledger and stays out (it would otherwise come
-// back untracked and never expire); one without an expiry comes back.
+// (VERIFY-S2b S-B, R3-3; #2121 A4) A rewind puts back only the injects the
+// inject ledger still wants: one whose expiry_height the next block passes
+// stays out (it would otherwise come back untracked and never expire); one
+// without an expiry comes back and is re-tracked. Run twice: with the lane's
+// mempool-changed hook (main_dash's wiring: both injects are released at the
+// connect, the put-back one is re-tracked when the rewind returns) and
+// without it (the set_tip belt does both, one promotion later).
 TEST(DashTxInject, ExpiredInjectIsNotPutBackByARewind)
 {
     using namespace dash_utxo_full;
-    Key k(0xc5);
-    const uint256 prevA = prevhash(0x85), prevB = prevhash(0x86);
-    const auto expiring = make_signed_spend(k, prevA, 100'000);
-    const auto standing = make_signed_spend(k, prevB, 100'000);
+    for (const bool hook : {true, false}) {
+        SCOPED_TRACE(hook ? "with the lane hook" : "set_tip belt only");
+        Key k(0xc5);
+        const uint256 prevA = prevhash(0x85), prevB = prevhash(0x86);
+        const auto expiring = make_signed_spend(k, prevA, 100'000);
+        const auto standing = make_signed_spend(k, prevB, 100'000);
+
+        constexpr uint32_t kB = 2000;
+        TempDir tmp(hook ? "rewind-expiry-hook" : "rewind-expiry-belt");
+        dash::coin::UtxoLane lane;
+        SnapCoin a, b;
+        a.op = Outpoint(prevA, 0);
+        a.coin = Coin(100'000, to_script(k.spk), 500, false);
+        b.op = Outpoint(prevB, 0);
+        b.coin = Coin(100'000, to_script(k.spk), 500, false);
+        const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+        const uint256 base_hash = hash_of(base_block);
+        ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, kB, base_hash));
+        Chain chain;
+        chain.hashes[kB] = base_hash;
+        lane.set_hash_at_fn(chain.fn());
+        lane.set_request_block_fn([](uint32_t) { return true; });
+        NodeCoinState st;
+        arm_ncs(st, *lane.cache());
+        lane.attach(st.mempool());
+        if (hook) lane.set_mempool_changed_fn([&st]() { st.reconcile_inject_pool(); });
+        lane.on_header_tip(kB);
+        st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+        ASSERT_TRUE(st.submit_inject(expiring, 0, /*expiry_height=*/kB + 1,
+                                     NodeCoinState::InjectOrigin::Local, 0).ok);
+        ASSERT_TRUE(st.submit_inject(standing, 0, /*expiry_height=*/0,
+                                     NodeCoinState::InjectOrigin::Local, 0).ok);
+
+        const BlockType a1 = block(base_hash, {coinbase(50, 2301), expiring, standing}, 2301);
+        chain.hashes[kB + 1] = hash_of(a1);
+        lane.on_block_connected(a1, kB + 1);
+        ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+        ASSERT_EQ(st.mempool().confirmed_injects_kept(), 2u);
+        EXPECT_EQ(st.inject_pool_size(), hook ? 0u : 2u)
+            << "the hook releases both at the connect; without it they wait for the tip";
+        // The tip moves to kB+1: the next block is kB+2, past the expiry.
+        st.set_tip(kB + 1, hash_of(a1), 0x1b104be3u, 1'700'000'100u, 76, 16);
+        ASSERT_EQ(st.inject_pool_size(), 0u)
+            << "both released on confirm; the expired one is also past its expiry";
+        EXPECT_EQ(st.inject_pool_bytes(), 0u);
+
+        chain.hashes[kB + 1] = fake_hash(6301);
+        lane.on_header_tip(kB + 1);
+        ASSERT_EQ(lane.full_status().rewinds, 1u);
+        const auto back = st.mempool().inject_txids_in_pool();
+        ASSERT_EQ(back.size(), 1u) << "only the inject the ledger still wants comes back";
+        EXPECT_EQ(back[0], dash_txid(standing));
+        EXPECT_FALSE(st.mempool().get_entry(dash_txid(expiring)).has_value());
+        EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
+        if (!hook) {
+            EXPECT_EQ(st.inject_pool_size(), 0u) << "not re-tracked until the next reconcile";
+            st.set_tip(kB + 1, fake_hash(6301), 0x1b104be3u, 1'700'000'200u, 76, 16);
+        }
+        EXPECT_EQ(st.inject_pool_size(), 1u) << "the put-back inject is tracked again";
+        const auto e = st.inject_entry(dash_txid(standing));
+        ASSERT_TRUE(e.has_value());
+        EXPECT_EQ(e->expiry_height, 0);
+        EXPECT_FALSE(st.inject_entry(dash_txid(expiring)).has_value());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2121 — a mined or evicted inject leaves the inject pool. Before the fix the
+// ledger only reaped injects with an expiry_height, so a confirmed inject with
+// the default expiry 0 kept counting against INJECT_POOL_MAX_ENTRIES and
+// kMaxInjectTotalBytes until a restart. After every reconcile the active set
+// equals Mempool::inject_txids_in_pool(); a released inject keeps a record in
+// the bounded released ledger so a rewind puts it back and re-tracks it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A distinct txid-shaped id per index (more than prevhash's 256).
+uint256 nth_id(uint32_t i, uint8_t tag = 0x5a) {
+    uint256 h;
+    std::memset(h.begin(), tag, 32);
+    std::memcpy(h.begin(), &i, sizeof(i));
+    return h;
+}
+
+} // namespace
+
+// (#2121 A1, the issue's repro) A mined inject submitted with expiry 0 leaves
+// the pool, its bytes leave the caps, and the status mirror says so. The rate
+// window is not refunded; the mempool still keeps the body for a rewind.
+TEST(DashTxInject, MinedInjectWithoutExpiryLeavesThePoolOnConfirm)
+{
+    Key k(0xe1);
+    const uint256 prev = prevhash(0xa1);
+    const auto tx = make_signed_spend(k, prev, 100'000);   // zero fee
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    auto r = st.submit_inject(tx, 0, /*expiry_height=*/0, NodeCoinState::InjectOrigin::Local, 0);
+    ASSERT_TRUE(r.ok) << r.cause;
+    ASSERT_EQ(st.inject_pool_size(), 1u);
+    ASSERT_EQ(st.inject_pool_bytes(), ser(tx).size());
+    ASSERT_EQ(st.inject_rate_count(), 1u);
+
+    dash::coin::BlockType b;
+    b.m_txs.push_back(tx);
+    st.mempool().remember_confirmed_injects(b, 101);
+    st.mempool().remove_for_block(b);
+    st.set_tip(101, prevhash(0x11), 0x1d00ffff, 0, 76, 16);
+
+    EXPECT_EQ(st.inject_pool_size(), 0u) << "a mined inject no longer counts against the pool";
+    EXPECT_EQ(st.inject_pool_bytes(), 0u) << "nor against the byte budget";
+    EXPECT_EQ(core::obs::inject_status().pool_entries.load(), 0u);
+    EXPECT_EQ(core::obs::inject_status().pool_bytes.load(), 0u);
+    EXPECT_EQ(st.inject_rate_count(), 1u) << "the rate window is not refunded";
+    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 1u) << "the body is still kept for a rewind";
+}
+
+// (#2121 A2) An inject a block conflict-evicts (another tx spends its input)
+// leaves the pool; it is not a confirmed inject, so nothing keeps it.
+TEST(DashTxInject, ConflictEvictedInjectLeavesThePool)
+{
+    Key k(0xe2);
+    const uint256 prev = prevhash(0xa2);
+    const auto inj = make_signed_spend(k, prev, 100'000);   // zero fee
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    ASSERT_TRUE(st.submit_inject(inj, 0, 0, NodeCoinState::InjectOrigin::Local, 0).ok);
+    ASSERT_EQ(st.inject_pool_size(), 1u);
+
+    TxOut toK90; toK90.value = 90'000; toK90.scriptPubKey = to_script(k.spk);
+    const auto T = make_signed_spend_outs(k, prev, {toK90});   // spends the same coin
+    ASSERT_NE(dash_txid(T), dash_txid(inj));
+    dash::coin::BlockType b;
+    b.m_txs.push_back(T);
+    st.mempool().remember_confirmed_injects(b, 101);
+    st.mempool().remove_for_block(b);
+    st.set_tip(101, prevhash(0x11), 0x1d00ffff, 0, 76, 16);
+
+    EXPECT_EQ(st.inject_pool_size(), 0u);
+    EXPECT_EQ(st.inject_pool_bytes(), 0u);
+    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
+    EXPECT_FALSE(st.mempool().get_entry(dash_txid(inj)).has_value());
+}
+
+// (#2121 A3) With main_dash's wiring (the lane's mempool-changed hook), the
+// connect that confirms an inject releases it before any tip promotion; a
+// rewind that puts it back re-tracks it with its original metadata, without
+// charging the rate window; the new branch confirming it releases it again.
+TEST(DashTxInject, ReleasedInjectIsRetrackedWhenARewindPutsItBack)
+{
+    using namespace dash_utxo_full;
+    Key k(0xe3);
+    const uint256 prevA = prevhash(0xa3);
+    const auto standing = make_signed_spend(k, prevA, 100'000);   // zero fee
+    const uint256 id = dash_txid(standing);
 
     constexpr uint32_t kB = 2000;
-    TempDir tmp("rewind-expiry");
+    TempDir tmp("retrack-inject");
     dash::coin::UtxoLane lane;
-    SnapCoin a, b;
+    SnapCoin a;
     a.op = Outpoint(prevA, 0);
     a.coin = Coin(100'000, to_script(k.spk), 500, false);
-    b.op = Outpoint(prevB, 0);
-    b.coin = Coin(100'000, to_script(k.spk), 500, false);
     const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
     const uint256 base_hash = hash_of(base_block);
-    ASSERT_TRUE(open_full_set(lane, tmp, {a, b}, kB, base_hash));
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
     Chain chain;
     chain.hashes[kB] = base_hash;
     lane.set_hash_at_fn(chain.fn());
@@ -1778,28 +1934,285 @@ TEST(DashTxInject, ExpiredInjectIsNotPutBackByARewind)
     NodeCoinState st;
     arm_ncs(st, *lane.cache());
     lane.attach(st.mempool());
+    lane.set_mempool_changed_fn([&st]() { st.reconcile_inject_pool(); });
     lane.on_header_tip(kB);
     st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
-    ASSERT_TRUE(st.submit_inject(expiring, 0, /*expiry_height=*/kB + 1,
+    constexpr uint32_t kFlags = 0x5;   // zero-fee intent + priority request
+    ASSERT_TRUE(st.submit_inject(standing, kFlags, /*expiry_height=*/0,
                                  NodeCoinState::InjectOrigin::Local, 0).ok);
-    ASSERT_TRUE(st.submit_inject(standing, 0, /*expiry_height=*/0,
-                                 NodeCoinState::InjectOrigin::Local, 0).ok);
+    const auto e0 = st.inject_entry(id);
+    ASSERT_TRUE(e0.has_value());
+    const auto t0 = e0->submit_time;
+    ASSERT_EQ(st.inject_rate_count(), 1u);
 
-    const BlockType a1 = block(base_hash, {coinbase(50, 2301), expiring, standing}, 2301);
+    // a1 confirms it: released by the lane's hook, no set_tip.
+    const BlockType a1 = block(base_hash, {coinbase(50, 2401), standing}, 2401);
     chain.hashes[kB + 1] = hash_of(a1);
     lane.on_block_connected(a1, kB + 1);
     ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
-    ASSERT_EQ(st.mempool().confirmed_injects_kept(), 2u);
-    // The tip moves to kB+1: the next block is kB+2, past the expiry.
-    st.set_tip(kB + 1, hash_of(a1), 0x1b104be3u, 1'700'000'100u, 76, 16);
-    ASSERT_EQ(st.inject_pool_size(), 1u) << "the ledger reaped the expired inject";
+    EXPECT_EQ(st.inject_pool_size(), 0u) << "released at the connect, before any promotion";
+    EXPECT_EQ(st.inject_pool_bytes(), 0u);
+    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 1u);
 
-    chain.hashes[kB + 1] = fake_hash(6301);
+    // a1 leaves the header chain's best: the rewind puts it back.
+    chain.hashes[kB + 1] = fake_hash(6401);
     lane.on_header_tip(kB + 1);
     ASSERT_EQ(lane.full_status().rewinds, 1u);
     const auto back = st.mempool().inject_txids_in_pool();
-    ASSERT_EQ(back.size(), 1u) << "only the inject the ledger still tracks comes back";
-    EXPECT_EQ(back[0], dash_txid(standing));
-    EXPECT_FALSE(st.mempool().get_entry(dash_txid(expiring)).has_value());
-    EXPECT_EQ(st.mempool().confirmed_injects_kept(), 0u);
+    ASSERT_EQ(back.size(), 1u) << "the released inject is still wanted and comes back";
+    EXPECT_EQ(back[0], id);
+    EXPECT_EQ(st.inject_pool_size(), 1u) << "and is tracked again";
+    EXPECT_EQ(st.inject_pool_bytes(), ser(standing).size());
+    const auto e1 = st.inject_entry(id);
+    ASSERT_TRUE(e1.has_value());
+    EXPECT_EQ(e1->submit_time, t0) << "original metadata, not a fresh track";
+    EXPECT_EQ(e1->expiry_height, 0);
+    EXPECT_EQ(e1->flags, kFlags);
+    EXPECT_EQ(e1->byte_size, ser(standing).size());
+    EXPECT_EQ(st.inject_rate_count(), 1u) << "a retrack is not an attempt";
+
+    // The new branch confirms it again: released again.
+    const BlockType b1 = block(base_hash, {coinbase(50, 3401), standing}, 3401);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_EQ(st.inject_pool_size(), 0u);
+    EXPECT_EQ(st.inject_pool_bytes(), 0u);
+    EXPECT_TRUE(st.mempool().inject_txids_in_pool().empty());
+}
+
+// (#2121 A5, guard) An inject still in the mempool stays tracked across a
+// block that does not carry it.
+TEST(DashTxInject, LiveInjectStaysTrackedAcrossTipAdvance)
+{
+    Key k(0xe5);
+    const uint256 prev = prevhash(0xa5);
+    const auto inj = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    ASSERT_TRUE(st.submit_inject(inj, 0, 0, NodeCoinState::InjectOrigin::Local, 0).ok);
+
+    dash::coin::BlockType b;   // a block without the inject
+    st.mempool().remember_confirmed_injects(b, 101);
+    st.mempool().remove_for_block(b);
+    st.set_tip(101, prevhash(0x11), 0x1d00ffff, 0, 76, 16);
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    EXPECT_EQ(st.inject_pool_bytes(), ser(inj).size());
+    EXPECT_TRUE(st.mempool().get_entry(dash_txid(inj)).has_value());
+    st.reconcile_inject_pool();
+    EXPECT_EQ(st.inject_pool_size(), 1u) << "a reconcile is idempotent on a live inject";
+}
+
+// (#2121 A7) The released ledger is bounded by count and pruned by depth;
+// still_wanted follows it.
+TEST(DashTxInject, ReleasedLedgerIsBoundedAndPruned)
+{
+    TxInjectPool pool;
+    constexpr uint32_t h = 100;
+    constexpr uint32_t n = 1100;
+    for (uint32_t i = 0; i < n; ++i) {
+        ASSERT_EQ(pool.admit(nth_id(i), 0, 0, 250), TxInjectPool::Admit::Ok);
+        ASSERT_TRUE(pool.release(nth_id(i), h));
+    }
+    EXPECT_EQ(pool.size(), 0u);
+    EXPECT_EQ(pool.total_bytes(), 0u);
+    EXPECT_LE(pool.released_size(), TxInjectPool::kMaxReleased);
+    EXPECT_EQ(pool.released_size(), TxInjectPool::kMaxReleased);
+    EXPECT_FALSE(pool.still_wanted(nth_id(0), int32_t(h + 1))) << "the oldest record was dropped";
+    EXPECT_TRUE(pool.still_wanted(nth_id(n - 1), int32_t(h + 1))) << "a kept record is wanted";
+    EXPECT_EQ(pool.would_retrack(nth_id(0)), TxInjectPool::Admit::NotTracked);
+
+    constexpr uint32_t depth = Mempool::kConfirmedInjectDepth;
+    EXPECT_EQ(pool.prune_released(h + depth, depth), 0u) << "still reachable by a rewind";
+    EXPECT_EQ(pool.prune_released(h + depth + 1, depth), TxInjectPool::kMaxReleased);
+    EXPECT_EQ(pool.released_size(), 0u);
+    EXPECT_FALSE(pool.still_wanted(nth_id(n - 1), int32_t(h + depth + 2)));
+
+    // An expired released record is not wanted (as reap_expired: next > expiry).
+    const uint256 x = nth_id(5000);
+    ASSERT_EQ(pool.admit(x, 0, /*expiry_height=*/150, 250), TxInjectPool::Admit::Ok);
+    ASSERT_TRUE(pool.release(x, h));
+    EXPECT_TRUE(pool.still_wanted(x, 150));
+    EXPECT_FALSE(pool.still_wanted(x, 151));
+    // A fresh admission of the same txid supersedes its released record.
+    ASSERT_EQ(pool.admit(x, 0, 0, 250), TxInjectPool::Admit::Ok);
+    EXPECT_EQ(pool.released_size(), 0u);
+    EXPECT_TRUE(pool.still_wanted(x, 151)) << "active is always wanted";
+}
+
+// (#2121 A8) A retrack goes through the same count/byte caps as a fresh
+// admit, and restores the inject's exact bytes and metadata.
+TEST(DashTxInject, RetrackHonoursTheCaps)
+{
+    TxInjectPool pool;
+    constexpr int32_t h = 100;
+    const uint256 R = nth_id(0, 0x6b);
+    ASSERT_EQ(pool.admit(R, /*flags=*/3, /*expiry_height=*/500, 333), TxInjectPool::Admit::Ok);
+    const auto r0 = pool.entry(R);
+    ASSERT_TRUE(r0.has_value());
+    for (uint32_t i = 1; i < TxInjectPool::INJECT_POOL_MAX_ENTRIES; ++i)
+        ASSERT_EQ(pool.admit(nth_id(i, 0x6b), 0, 0, 250), TxInjectPool::Admit::Ok);
+    ASSERT_EQ(pool.size(), TxInjectPool::INJECT_POOL_MAX_ENTRIES);
+    const size_t full_bytes = pool.total_bytes();
+
+    ASSERT_TRUE(pool.release(R, h));
+    EXPECT_EQ(pool.total_bytes(), full_bytes - 333);
+    const uint256 X = nth_id(9999, 0x6b);
+    ASSERT_EQ(pool.admit(X, 0, 0, 250), TxInjectPool::Admit::Ok) << "the released slot is free";
+    EXPECT_EQ(pool.would_retrack(R), TxInjectPool::Admit::PoolFull);
+    EXPECT_FALSE(pool.still_wanted(R, h + 1)) << "no room: a rewind leaves it out";
+    EXPECT_EQ(pool.retrack(R), TxInjectPool::Admit::PoolFull);
+    EXPECT_EQ(pool.released_size(), 1u) << "a refused retrack keeps the record";
+
+    ASSERT_TRUE(pool.release(X, h));
+    EXPECT_TRUE(pool.still_wanted(R, h + 1));
+    EXPECT_EQ(pool.retrack(R), TxInjectPool::Admit::Ok);
+    EXPECT_EQ(pool.total_bytes(), full_bytes) << "bytes restored exactly";
+    EXPECT_EQ(pool.size(), TxInjectPool::INJECT_POOL_MAX_ENTRIES);
+    const auto r1 = pool.entry(R);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->flags, r0->flags);
+    EXPECT_EQ(r1->expiry_height, r0->expiry_height);
+    EXPECT_EQ(r1->byte_size, r0->byte_size);
+    EXPECT_EQ(r1->submit_time, r0->submit_time);
+    EXPECT_EQ(pool.retrack(R), TxInjectPool::Admit::NotTracked) << "the record moved to active";
+    EXPECT_EQ(pool.released_size(), 1u) << "only X's record is left";
+}
+
+// (#2121 A9) An inject in the mempool that the ledger never admitted (a bare
+// Mempool::add_inject) is tracked fresh by the next reconcile, so the
+// invariant holds unconditionally; it charges no rate window.
+TEST(DashTxInject, ReconcileTracksABareInjectFresh)
+{
+    Key k(0xe9);
+    const uint256 prev = prevhash(0xa9);
+    const auto tx = make_signed_spend(k, prev, 100'000);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    ASSERT_EQ(st.mempool().add_inject(tx, 0), Mempool::InjectGate::Ok);
+    EXPECT_EQ(st.inject_pool_size(), 0u);
+    st.reconcile_inject_pool();
+    ASSERT_EQ(st.inject_pool_size(), 1u);
+    const auto e = st.inject_entry(dash_txid(tx));
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->expiry_height, 0);
+    EXPECT_EQ(e->flags, 0u);
+    const auto me = st.mempool().get_entry(dash_txid(tx));
+    ASSERT_TRUE(me.has_value());
+    EXPECT_EQ(e->byte_size, me->base_size);
+    EXPECT_EQ(st.inject_pool_bytes(), me->base_size);
+    EXPECT_EQ(st.inject_rate_count(), 0u);
+}
+
+// (#2121 A10) A child inject and its parent across reorgs, with the lane hook:
+// rewinding only the child's block puts the child back on top of the view's
+// parent output (selected alone); rewinding the parent's block too puts the
+// parent back in the same call, so both are tracked and selected parent first;
+// a branch that confirms only the parent releases it and the child rides on
+// the parent's now-confirmed output.
+TEST(DashTxInject, ChildInjectWaitsForItsReorgedParent)
+{
+    using namespace dash_utxo_full;
+    Key k(0xea);
+    const uint256 prevA = prevhash(0xaa);
+    TxOut toK; toK.value = 100'000; toK.scriptPubKey = to_script(k.spk);
+    const auto P = make_signed_spend_outs(k, prevA, {toK});          // zero fee
+    const auto C = make_signed_spend_outs(k, dash_txid(P), {toK});   // zero fee, spends P:0
+    const uint256 idP = dash_txid(P), idC = dash_txid(C);
+
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("rewind-child");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    NodeCoinState st;
+    arm_ncs(st, *lane.cache());
+    lane.attach(st.mempool());
+    lane.set_mempool_changed_fn([&st]() { st.reconcile_inject_pool(); });
+    lane.on_header_tip(kB);
+    st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+
+    // P confirmed in a1; C admitted on top of the view's P:0, confirmed in a2.
+    ASSERT_TRUE(st.submit_inject(P, 0, 0, NodeCoinState::InjectOrigin::Local, 0).ok);
+    const BlockType a1 = block(base_hash, {coinbase(50, 2501), P}, 2501);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    ASSERT_EQ(st.inject_pool_size(), 0u);
+    st.set_tip(kB + 1, hash_of(a1), 0x1b104be3u, 1'700'000'100u, 76, 16);
+    auto rc = st.submit_inject(C, 0, 0, NodeCoinState::InjectOrigin::Local, 0);
+    ASSERT_TRUE(rc.ok) << rc.cause << " (P:0 is in the view)";
+    const BlockType a2 = block(hash_of(a1), {coinbase(50, 2502), C}, 2502);
+    chain.hashes[kB + 2] = hash_of(a2);
+    lane.on_block_connected(a2, kB + 2);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a2));
+    ASSERT_EQ(st.inject_pool_size(), 0u);
+    ASSERT_EQ(st.mempool().confirmed_injects_kept(), 2u);
+    st.set_tip(kB + 2, hash_of(a2), 0x1b104be3u, 1'700'000'200u, 76, 16);
+
+    // Rewind a2 only: C is back, P stays confirmed in a1.
+    chain.hashes[kB + 2] = fake_hash(6502);
+    lane.on_header_tip(kB + 2);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    {
+        const auto back = st.mempool().inject_txids_in_pool();
+        ASSERT_EQ(back.size(), 1u);
+        EXPECT_EQ(back[0], idC);
+    }
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    EXPECT_TRUE(st.inject_entry(idC).has_value());
+    EXPECT_FALSE(st.inject_entry(idP).has_value());
+    {
+        auto [selected, fees] = st.mempool().get_sorted_txs_with_fees(1u << 20, false, kB + 2, 0);
+        ASSERT_EQ(selected.size(), 1u) << "C rides alone on the view's P:0";
+        EXPECT_EQ(dash_txid(selected[0].tx), idC);
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // Rewind a1 too: P is back in the same call, both are tracked, P first.
+    chain.hashes[kB + 1] = fake_hash(6501);
+    lane.on_header_tip(kB + 2);
+    ASSERT_EQ(lane.full_status().rewinds, 2u);
+    ASSERT_EQ(lane.cache()->get_best_block(), base_hash);
+    ASSERT_FALSE(lane.withheld());
+    EXPECT_EQ(st.mempool().inject_txids_in_pool().size(), 2u);
+    EXPECT_EQ(st.inject_pool_size(), 2u);
+    EXPECT_TRUE(st.inject_entry(idP).has_value());
+    EXPECT_TRUE(st.inject_entry(idC).has_value());
+    {
+        auto [selected, fees] = st.mempool().get_sorted_txs_with_fees(1u << 20, false, kB + 1, 0);
+        ASSERT_EQ(selected.size(), 2u) << "both ride the next template";
+        EXPECT_EQ(dash_txid(selected[0].tx), idP) << "parent first";
+        EXPECT_EQ(dash_txid(selected[1].tx), idC);
+        EXPECT_EQ(fees, 0u);
+    }
+
+    // A branch that confirms P only: P released, C stays and rides on P:0.
+    const BlockType b1 = block(base_hash, {coinbase(50, 3501), P}, 3501);
+    chain.hashes[kB + 1] = hash_of(b1);
+    lane.on_block_connected(b1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(b1));
+    EXPECT_EQ(st.inject_pool_size(), 1u);
+    EXPECT_FALSE(st.inject_entry(idP).has_value()) << "P confirmed: released";
+    EXPECT_TRUE(st.inject_entry(idC).has_value()) << "C still live: tracked";
+    EXPECT_EQ(st.inject_pool_bytes(), ser(C).size());
+    {
+        auto [selected, fees] = st.mempool().get_sorted_txs_with_fees(1u << 20, false, kB + 2, 0);
+        ASSERT_EQ(selected.size(), 1u);
+        EXPECT_EQ(dash_txid(selected[0].tx), idC) << "C rides on the confirmed P:0";
+        EXPECT_EQ(fees, 0u);
+    }
 }
