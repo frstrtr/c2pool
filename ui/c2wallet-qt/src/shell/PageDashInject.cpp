@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "shell/PageDashInject.hpp"
-#include "shell/ScopedSecret.hpp"
+#include "shell/KeyInputWidgets.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -52,18 +52,6 @@ QSpinBox* spin(QWidget* parent, int lo, int hi, int value, const QString& specia
     if (!special.isEmpty()) s->setSpecialValueText(special);
     return s;
 }
-
-// Wipes a KeyInput's two secret strings when the bind attempt ends.
-struct KeyInputWipe {
-    dash::KeyInput& k;
-    ~KeyInputWipe()
-    {
-        if (!k.secret.empty()) c2w::secure::secure_wipe(&k.secret[0], k.secret.size());
-        if (!k.passphrase.empty()) c2w::secure::secure_wipe(&k.passphrase[0], k.passphrase.size());
-        k.secret.clear();
-        k.passphrase.clear();
-    }
-};
 
 } // namespace
 
@@ -196,31 +184,7 @@ PageDashInject::PageDashInject(QWidget* parent)
     // ── 4. key ──────────────────────────────────────────────────────────────
     keyBox_ = new QGroupBox(QStringLiteral("4. Key (secret: wiped from the widgets the moment it is read)"), body);
     auto* kv = new QVBoxLayout(keyBox_);
-    auto* kform = new QFormLayout();
-    keySrcCombo_ = new QComboBox(keyBox_);
-    keySrcCombo_->addItem(QStringLiteral("BIP39 mnemonic"), int(dash::KeySource::Mnemonic));
-    keySrcCombo_->addItem(QStringLiteral("WIF"), int(dash::KeySource::Wif));
-    keySrcCombo_->addItem(QStringLiteral("BIP38 (6P...)"), int(dash::KeySource::Bip38));
-    keySrcCombo_->addItem(QStringLiteral("descriptor pkh(...)"), int(dash::KeySource::Descriptor));
-    keySrcCombo_->addItem(QStringLiteral("JSON keystore"), int(dash::KeySource::JsonKeystore));
-    kform->addRow(QStringLiteral("format:"), keySrcCombo_);
-    secretEdit_ = new QLineEdit(keyBox_);
-    secretEdit_->setEchoMode(QLineEdit::Password);
-    kform->addRow(QStringLiteral("secret:"), secretEdit_);
-    passEdit_ = new QLineEdit(keyBox_);
-    passEdit_->setEchoMode(QLineEdit::Password);
-    kform->addRow(QStringLiteral("passphrase:"), passEdit_);
-    accountsSpin_ = spin(keyBox_, 1, 100, 2);
-    indicesSpin_ = spin(keyBox_, 1, 100000, 50);
-    kform->addRow(QStringLiteral("scan accounts:"), accountsSpin_);
-    kform->addRow(QStringLiteral("scan indices:"), indicesSpin_);
-    kv->addLayout(kform);
-    internalChk_ = new QCheckBox(QStringLiteral("scan the internal (change) chain too"), keyBox_);
-    internalChk_->setChecked(true);
-    uncompChk_ = new QCheckBox(QStringLiteral("try uncompressed keys too"), keyBox_);
-    uncompChk_->setChecked(true);
-    kv->addWidget(internalChk_);
-    kv->addWidget(uncompChk_);
+    keyIn_ = new KeyInputWidgets(keyBox_, kv);
     bindBtn_ = new QPushButton(QStringLiteral("4) Bind key"), keyBox_);
     kv->addWidget(bindBtn_);
     keyCard_ = new QLabel(keyBox_);
@@ -260,7 +224,6 @@ PageDashInject::PageDashInject(QWidget* parent)
     connect(modeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &PageDashInject::onModeChanged);
     connect(feeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &PageDashInject::onModeChanged);
     connect(planBtn_, &QPushButton::clicked, this, &PageDashInject::onPlan);
-    connect(keySrcCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, &PageDashInject::onKeySourceChanged);
     connect(bindBtn_, &QPushButton::clicked, this, &PageDashInject::onBindKey);
     connect(reviewedChk_, &QCheckBox::toggled, this, &PageDashInject::onGateChanged);
     connect(burnChk_, &QCheckBox::toggled, this, &PageDashInject::onGateChanged);
@@ -270,7 +233,6 @@ PageDashInject::PageDashInject(QWidget* parent)
     connect(saveManBtn_, &QPushButton::clicked, this, &PageDashInject::onSaveManifest);
 
     onModeChanged();
-    onKeySourceChanged();
     refresh();
 }
 
@@ -408,59 +370,16 @@ void PageDashInject::onPlan()
     refresh();
 }
 
-void PageDashInject::onKeySourceChanged()
-{
-    const auto src = dash::KeySource(keySrcCombo_->currentData().toInt());
-    const bool scans = src == dash::KeySource::Mnemonic || src == dash::KeySource::JsonKeystore;
-    switch (src) {
-    case dash::KeySource::Mnemonic: secretEdit_->setPlaceholderText(QStringLiteral("12/15/18/21/24 BIP39 words")); break;
-    case dash::KeySource::Wif: secretEdit_->setPlaceholderText(QStringLiteral("DASH WIF (X... / 7...)")); break;
-    case dash::KeySource::Bip38: secretEdit_->setPlaceholderText(QStringLiteral("6P... encrypted key")); break;
-    case dash::KeySource::Descriptor: secretEdit_->setPlaceholderText(QStringLiteral("pkh([fp/44'/5'/0']xprv.../0/*)#checksum")); break;
-    case dash::KeySource::JsonKeystore:
-        secretEdit_->setPlaceholderText(QStringLiteral("paste the keystore JSON, or leave empty to choose the file at Bind"));
-        break;
-    }
-    passEdit_->setEnabled(src == dash::KeySource::Mnemonic || src == dash::KeySource::Bip38 ||
-                          src == dash::KeySource::JsonKeystore);
-    accountsSpin_->setEnabled(scans);
-    indicesSpin_->setEnabled(scans || src == dash::KeySource::Descriptor);
-    internalChk_->setEnabled(scans);
-    uncompChk_->setEnabled(scans);
-}
-
 void PageDashInject::onBindKey()
 {
     clearStatus();
     dash::KeyInput k;
     KeyInputWipe wipe{k};
-    k.source = dash::KeySource(keySrcCombo_->currentData().toInt());
-    {
-        // Read each secret ONCE and clear its widget at once.
-        ScopedSecret secret(secretEdit_->text().toStdString());
-        ScopedSecret pass(passEdit_->text().toStdString());
-        secretEdit_->clear();
-        passEdit_->clear();
-        k.secret.swap(secret.s);
-        k.passphrase.swap(pass.s);
+    QString err;
+    if (!keyIn_->read(this, k, &err)) {
+        if (!err.isEmpty()) report(QStringLiteral("Key"), err);
+        return;
     }
-    if (k.source == dash::KeySource::JsonKeystore && k.secret.empty()) {
-        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Choose the JSON keystore"), QString(),
-                                                          QStringLiteral("JSON (*.json);;All files (*)"));
-        if (path.isEmpty()) return;
-        QFile f(path);
-        if (!f.open(QIODevice::ReadOnly)) {
-            report(QStringLiteral("Key"), QStringLiteral("could not read the keystore file"));
-            return;
-        }
-        QByteArray bytes = f.readAll();
-        k.secret.assign(bytes.constData(), size_t(bytes.size()));
-        if (!bytes.isEmpty()) c2w::secure::secure_wipe(bytes.data(), size_t(bytes.size()));
-    }
-    k.range.accounts = uint32_t(accountsSpin_->value());
-    k.range.indices = uint32_t(indicesSpin_->value());
-    k.range.scan_internal = internalChk_->isChecked();
-    k.range.try_uncompressed = uncompChk_->isChecked();
 
     QApplication::setOverrideCursor(Qt::WaitCursor); // BIP38 / long scans are CPU-bound
     try {
