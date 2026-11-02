@@ -493,6 +493,7 @@ means any signer suffices — so it is correctly deferred without blocking M1.
 | M2 (implemented) | submit sink seam (routes the peer path through the armed `NodeCoinState::submit_inject`) | `node.hpp` (`set_tx_inject_sink` / `handle_peer_tx_inject` / `relay_tx_inject`), `src/c2pool/main_dash.cpp` (wired next to the arm) |
 | M2 (implemented) | first-see fan-out + `register_template_txs` ride | `relay_tx_inject` (fan-out); an accepted inject is an ordinary body tx, so it rides `register_template_txs` unchanged (KAT-proven) |
 | M2 (implemented, #2121) | release on confirm / evict, re-track on rewind | `reconcile_inject_pool` wired to `UtxoLane::set_mempool_changed_fn` (block connect / rewind), `set_tip`, `submit_inject`; `TxInjectPool::release` / `retrack` / `still_wanted` |
+| S4 (implemented) | read-only per-inject ledger + best ChainLock (loopback `GET /api/tx-inject/ledger`; `bestchainlock` on daemonless `getblockchaininfo`) | `src/core/inject_ledger_obs.hpp` (mutex-guarded mirror), publishers in `node_coin_state.hpp` (admit / reconcile), `inject_ride_log.hpp` (per-build verdict), `coin_state_maintainer.hpp` (ChainLock adoption); route in `src/core/http_session.cpp`; `src/impl/dash/coin/chainlock_obs_json.hpp` |
 | **M3** | per-peer token buckets, misbehaviour score, capability advertisement | coin_peer_manager / handler |
 | M3 | `submitter_hint` rate-accounting | inject pool |
 | M3 | full sandboxed signer (§10) | new isolated build/sign module |

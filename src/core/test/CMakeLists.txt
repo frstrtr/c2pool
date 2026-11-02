@@ -134,6 +134,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # inject_ledger_obs_test.cpp: the S4 read-only per-inject ledger and
+    # best-ChainLock mirrors behind GET /api/tx-inject/ledger (bound + overflow
+    # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
+    # round-trip). Header-only over core/uint256. Same fold-into-core_test
+    # reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -154,6 +159,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         found_block_store_test.cpp
         graph_history_test.cpp
         host_port_test.cpp
+        inject_ledger_obs_test.cpp
         inject_status_test.cpp
         known_txs_backing_test.cpp
         known_txs_eviction_test.cpp
