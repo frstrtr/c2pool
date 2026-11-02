@@ -183,7 +183,10 @@ option(C2WALLET_QT_BUILD_COMPANION
 if(C2WALLET_QT_BUILD_COMPANION)
     find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
 
-    # The key-free companion library + its KATs + the key-free guard.
+    # The key-free companion library + its KATs + the key-free guard, and
+    # (slice S2) the Qt Network transport library c2wallet-companion-qtnet and
+    # the headless inject scheduler c2wallet-qt-schedd (Qt6::Core + Network
+    # only) with its guards; see src/companion/CMakeLists.txt.
     add_subdirectory(src/companion)
 
     add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)

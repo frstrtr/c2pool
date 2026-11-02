@@ -4,7 +4,10 @@
 // Inject scheduler — the per-item state machine (design §5), one tick at a time.
 //
 // tick() is a plain synchronous function over the injected NodeApi and Clock:
-//   0. read /api/tx-inject-status once; detect a disarm (enabled true -> false);
+//   0. read /api/tx-inject-status once; detect a disarm (enabled true -> false)
+//      and tell a node restart (re-arm under consent) from a deliberate
+//      runtime disarm (consent suspended) by the node's /uptime; take the
+//      node's ChainLock as a parent-finality oracle only if it is on its chain;
 //   1. OBSERVE: tracked foreign parents, then every item the node holds or may
 //      hold (submitted_unknown, admitted, is_hold, riding, mined): mempool
 //      presence, the IS-hold clock, block-body scans, confirmations, reorgs;
@@ -46,6 +49,11 @@ struct NullJournal : JournalSink {
     void line(const std::string&) override {}
 };
 
+// A disarm counts as a restart only when the node process provably started
+// after the last tick that saw it armed; this margin absorbs whole-second
+// rounding and a small wall-clock step (a doubtful case stays "deliberate").
+inline constexpr int64_t kRestartSlackSeconds = 5;
+
 struct SchedulerOptions {
     std::string token_file;         // overrides queue.node.token_file when non-empty
     int64_t is_hold_secs = 600;     // WAIT_FOR_ISLOCK_TIMEOUT_SECS (mempool.hpp:223)
@@ -82,7 +90,10 @@ private:
 
     // phase 0
     void detect_disarm(const InjectStatus& st);
+    bool node_restarted(std::string& cause);
+    void record_armed_seen();
     void check_explorer();
+    void check_chainlock();
     // phase 1
     void observe_tracked();
     void observe_unknown(Item& it);
@@ -110,7 +121,8 @@ private:
 
     // helpers
     ChainSnapshot snapshot();
-    ParentStatus parent_status(const std::string& txid) const;
+    ParentStatus parent_status(const std::string& txid);
+    void verify_parent_block(ParentStatus& ps);
     Verdict evaluate_item(const Item& it);
     void transition(Item& it, State s, const std::string& why);
     void set_why(Item& it, const std::string& why);
@@ -131,6 +143,14 @@ private:
     ChainView view_;
 
     // per tick
+    struct ClVerdict {
+        bool exposed = false; // the node knows bestchainlock (either form)
+        bool usable = false;  // an adopted ChainLock on the node's own chain
+        int64_t height = 0;
+        std::string hash;     // empty for a chain-committed adoption without a hash
+        std::string why;      // why not usable
+    };
+    ClVerdict cl_;
     int64_t now_ = 0;
     std::string at_;
     TickReport report_;

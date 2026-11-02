@@ -179,3 +179,27 @@ claims it.
 
 Until the patches are applied, the ELF guard still runs locally via `ctest`
 (`no_network_link_guard`, registered by `-DC2WALLET_QT_BUILD_TESTS=ON`).
+
+## The companion and the headless scheduler
+
+`cmake -S ui/c2wallet-qt -B build-c2wallet -DC2WALLET_QT_BUILD_TESTS=ON` also
+builds the online companion (needs `qt6-base-dev` and `nlohmann-json3-dev`):
+the key-free `c2wallet-companion` library, the Qt Network transport library
+`c2wallet-companion-qtnet`, and the headless inject scheduler
+`c2wallet-qt-schedd`. `ctest --test-dir build-c2wallet` then runs, besides the
+signer's `no_network_link_guard`:
+
+- `companion_kats`, `companion_sched_kats` (Qt-free core, runner merge and
+  every daemon subcommand against a fake node) and `companion_key_free_guard`
+  (`check_key_free.sh` over `libc2wallet-companion.a`);
+- `schedd_qt_kats` (`QtNodeApi` against a local `QTcpServer` fake node; the
+  daemon binary end to end through `QProcess`; loopback only);
+- `schedd_key_free_guard` (`check_key_free.sh` over the linked daemon) and
+  `schedd_no_gui_link_guard` ([`check_no_gui_link.sh`](check_no_gui_link.sh):
+  the daemon's NEEDED entries carry Qt6Core + Qt6Network and no Gui, Widgets,
+  GL, X11 or Wayland library).
+
+The same targets build standalone from `ui/c2wallet-qt/src/companion` when Qt6
+Core + Network are installed. The prepared `build.yml` patch above installs
+`nlohmann-json3-dev` and runs the full `ctest`, so these tests run in CI once
+the operator applies it. Until then they run locally only.
