@@ -33,6 +33,7 @@ class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
 class QSpinBox;
+class KeyInputWidgets;
 
 namespace c2w::dash { class DashInjectModel; }
 
@@ -50,7 +51,6 @@ private slots:
     void onRescreen();
     void onModeChanged();
     void onPlan();
-    void onKeySourceChanged();
     void onBindKey();
     void onGateChanged();
     void onSign();
@@ -101,13 +101,7 @@ private:
 
     // 4. key
     QGroupBox*      keyBox_{nullptr};
-    QComboBox*      keySrcCombo_{nullptr};
-    QLineEdit*      secretEdit_{nullptr};
-    QLineEdit*      passEdit_{nullptr};
-    QSpinBox*       accountsSpin_{nullptr};
-    QSpinBox*       indicesSpin_{nullptr};
-    QCheckBox*      internalChk_{nullptr};
-    QCheckBox*      uncompChk_{nullptr};
+    KeyInputWidgets* keyIn_{nullptr};   // shared with PageSignMessage
     QPushButton*    bindBtn_{nullptr};
     QLabel*         keyCard_{nullptr};
 

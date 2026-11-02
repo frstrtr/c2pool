@@ -191,8 +191,7 @@ GUI queue tab is a later slice.
   remote node).
 
 KATs: `c2wallet-companion-sched-test` (ctest `companion_sched_kats`) drives the
-core, the runner merge and every daemon subcommand against a scripted fake
-node and a fake clock (K1-K39).
+core against a scripted fake node and a fake clock (K1-K27).
 
 ### Headless runner `c2wallet-qt-schedd`
 
@@ -226,3 +225,60 @@ its header lists the install steps). Exit codes: 0 ok, 1 refused/attention,
 2 usage/config, 3 queue unreadable, 4 another runner holds the queue. Qt KATs:
 `c2wallet-qt-schedd-test` (ctest `schedd_qt_kats`: the transport against a
 local `QTcpServer` fake node, and the daemon binary end to end).
+
+## Sign / verify message
+
+The **Sign / Verify Message** screen signs an exact message with the key of a
+DASH P2PKH address, in the Dash Core `signmessage` format, and verifies other
+people's signatures. All of its rules live in the Qt-free `MessageModel` /
+`DashMessage` (`src/family/bitcoin/dash/`), KAT'd by `c2wallet-dash-test`
+against signatures produced by Dash Core v23.1.7 `signmessagewithprivkey`:
+ours must equal Core's byte for byte, for compressed and uncompressed keys.
+
+Example: a DashCentral proposal-ownership claim.
+
+1. **Target**: coin `DASH`, the address that paid the proposal collateral.
+   The card shows its version byte and hash160.
+2. **Message**: type exactly what the site asks for, e.g.
+   `dashcentral-proposal-1556`. Nothing is trimmed: the live counter shows the
+   byte count and the sha256, and warns about a trailing newline,
+   leading/trailing whitespace, a CR, an empty message or the long form
+   (>= 253 bytes). Typed text is signed as UTF-8 with LF line breaks; for
+   arbitrary bytes, load them from a file.
+3. **Key**: mnemonic (with passphrase and scan range), WIF, BIP38, descriptor
+   or JSON keystore. The key is bound on both the address and hash160(pubkey);
+   an uncompressed key (a WIF without the `01` suffix, old p2pool-era keys)
+   signs with Core's uncompressed header.
+4. **Sign**: tick the review box and type `SIGN`. The signer signs, verifies
+   the emitted signature, wipes the key, and shows:
+
+```
+address:   Xn9KtWHuvMBuSbpzPFTzYG2bC9Wp2ZZJJG
+message:   dashcentral-proposal-1556
+signature: IPFklzhS3xSUKSIxB5IBWLS/r9Jbc9whftHCjweVVx1aCYwaeRLIO56GvYR6P6ITr4A13dWc20JgSBX/4oK0e6w=
+```
+
+(that is a public test key's signature, from the KATs). These three lines are
+exactly what the python stopgap `c2wallet.py sign-message` prints for the same
+key and message, so switching tools changes nothing for the site. "Copy
+signature" puts only the base64 on the clipboard; "Save signature.txt" writes
+the three lines; "Verify this in the Verify tab" runs the independent check.
+
+The **Verify** tab takes an address, the exact message and a base64 signature
+and answers `VALID` (with the recovered address, key encoding and recovery id)
+or `INVALID` with the reason, like `dash-cli verifymessage`. It has no key
+field.
+
+Two typed confirmation words exist and mean different things:
+
+- `SPEND` (DASH Inject / Collateral): signs a transaction that moves money.
+- `SIGN` (Sign / Verify Message): signs a message. It moves no money, and the
+  coin's message magic in the signed digest means a message signature can
+  never be replayed as a transaction signature.
+
+Only DASH is enabled. BTC, LTC, DGB and DOGE are listed but refused until a
+vector from that coin's own node is committed to
+`src/family/bitcoin/dash/tests/msg_vectors.hpp`.
+
+core, the runner merge and every daemon subcommand against a scripted fake
+node and a fake clock (K1-K39).

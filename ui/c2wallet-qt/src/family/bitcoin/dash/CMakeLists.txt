@@ -69,6 +69,8 @@ add_library(c2wallet-dash-common STATIC
     DashAddress.cpp
     KeyScan.cpp
     DashMessage.cpp
+    # the Sign / Verify Message page's std-only model (design A.4)
+    MessageModel.cpp
     UtxoIntake.cpp
     SweepTx.cpp
     # slice 2: PageDashInject's std-only model (all but sign()) + the manifest.

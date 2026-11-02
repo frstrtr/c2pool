@@ -9,6 +9,7 @@
 #include "shell/PageImport.hpp"
 #include "shell/PageScan.hpp"
 #include "shell/PageSign.hpp"
+#include "shell/PageSignMessage.hpp"
 #include "shell/PageSignMonero.hpp"
 
 #include <QFont>
@@ -65,6 +66,13 @@ MainWindow::MainWindow(QWidget* parent)
     // interpreter, so the link-guard stays green.
     navList_->addItem(QStringLiteral("DASH Inject / Collateral"));
     stack_->addWidget(new PageDashInject(stack_));
+
+    // Sign / verify a message in the Dash Core signmessage format (e.g. a
+    // DashCentral proposal-ownership claim). A thin binding over the std-only,
+    // Core-vector-KAT'd MessageModel; it links nothing new, so the link-guard
+    // stays green.
+    navList_->addItem(QStringLiteral("Sign / Verify Message"));
+    stack_->addWidget(new PageSignMessage(stack_));
 
     // Slice-2b (Family B — Monero / RingCT). The key-free composer and the
     // offline signer are WIRED to the merged Monero libraries (seed/key/address,
