@@ -31,6 +31,7 @@
 // never split, when it would not fit one inject tx.
 
 #include "InjectCaps.hpp"
+#include "InjectMaturity.hpp"
 #include "KeyScan.hpp"
 
 #include <array>
@@ -48,7 +49,7 @@ inline constexpr int64_t kMaxMoney = 21000000 * kCoin; // Dash Core amount.h MAX
 inline constexpr int64_t kDustDuffs = 5460;
 inline constexpr int64_t kDefaultFeeRate = 1000; // duffs/kB (Dash min relay)
 inline constexpr int64_t kDefaultMinConf = 101;  // funding UTXOs are often coinbase
-inline constexpr int64_t kCoinbaseMaturity = 100; // consensus COINBASE_MATURITY
+inline constexpr int64_t kCoinbaseMaturity = maturity::kCoinbaseMaturity; // consensus COINBASE_MATURITY
 
 // Relay: a relayable tx paying fee_rate. InjectOnlyZeroFee: fee exactly 0, for
 // the c2pool inject / pin lane only (Dash Core peers will not relay it).

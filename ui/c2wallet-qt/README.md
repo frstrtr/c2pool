@@ -89,6 +89,10 @@ ui/c2wallet-qt/ci/check_no_network.sh build-c2wallet/c2wallet-qt-signer
 ( cd build-c2wallet && ctest --output-on-failure )
 ```
 
+The online companion (built by default) also needs `nlohmann-json3-dev` for
+its inject scheduler. A signer-only build needs neither it nor Qt Network:
+add `-DC2WALLET_QT_BUILD_COMPANION=OFF`.
+
 ## DASH inject / collateral (slice 2)
 
 The **DASH Inject / Collateral** screen consolidates the mature UTXOs of one
@@ -127,3 +131,47 @@ for t in m["txs"]:
 print("preflight OK: every input is unspent with the manifest's amount")
 PY
 ```
+
+## Companion inject scheduler (core)
+
+The online, key-free companion carries an **inject scheduler**: it queues the
+signed `<name>.hex` + `<name>.manifest.json` pair and submits each tx to a c2pool
+node's loopback `POST /api/tx-inject/submit` when its triggers hold. This tree
+holds the Qt-free core (`src/companion/sched/`, inside the key-free
+`c2wallet-companion` library, so `ci/check_key_free.sh` covers it); the Qt
+transport, the headless `c2wallet-qt-schedd` runner and the GUI queue tab are
+later slices.
+
+- **Queue file** `queue.json` (`c2wallet-inject-queue/1`): public data only —
+  the raw signed txs, txids, provenance digests, triggers, node observations,
+  attempts and a journal. Deterministic JSON, atomic writes, `flock` on
+  `queue.json.lock`. Never the control token, a money nonce or a key.
+- **Enqueue** verifies the hex file's sha256 against the manifest, each line's
+  txid, the manifest's maturity claim against its own inputs, and the node caps
+  (100000 B, 1000 inputs, 1000 outputs, a signed shape). An input txid that is
+  already queued pre-fills `after_parent`.
+- **Triggers** (all-of): maturity `tip >= safe_from_height - 1` (a coinbase
+  created at `h0` is spendable in block `h0 + 100`, the next template is
+  `tip + 1`; the rule is shared with the signer in
+  `src/family/bitcoin/dash/InjectMaturity.hpp`), `not_before_height`,
+  `not_before_time` (UTC, trailing `Z` required) and `after_parent` (N
+  confirmations, default 1). Unknown input heights never auto-fire: set
+  `not_before_height` or record an explicit override.
+- **State machine**: waiting → ready → submitting → admitted → is_hold (the
+  node's 600 s InstantSend hold for a zero-fee inject) → riding → mined →
+  confirmed, with blocked_not_armed / blocked_token / blocked_node,
+  submitted_unknown (504), dropped (bounded resubmits), expired (optional
+  renew) and refused. Re-submits are safe: the node answers
+  `inject-already-known` / `inject-already-confirmed`.
+- **Arming**: the normal posture is the node's unit flag
+  (`--embedded-tx-inject`). The scheduler arms the node itself only with a
+  recorded consent (`arm_policy.auto_arm` + `consented_at`), through the
+  two-phase `POST /api/config/apply`, at most once per 10 minutes, and never
+  again after a `money_gate` refusal.
+- **Token**: read at use from a 0600 file (the node's own loader rules), held in
+  a zeroizing buffer, placed only into the POST body; there is no
+  `--token VALUE` option. The node URL must be loopback (use `ssh -L` for a
+  remote node).
+
+KATs: `c2wallet-companion-sched-test` (ctest `companion_sched_kats`) drives the
+core against a scripted fake node and a fake clock (K1-K27).
