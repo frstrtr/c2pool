@@ -45,6 +45,19 @@ Verdict evaluate(const Item& it, const ChainSnapshot& chain, int64_t now, const 
     Verdict v;
     const Triggers& t = it.triggers;
 
+    // A stage-2 tx with projected heights never fires while a parent of its
+    // raw tx is not an after_parent (enqueue refuses that; this holds it for
+    // a queue file edited afterwards).
+    if (const std::vector<std::string> missing = projected_parents_missing(it); !missing.empty()) {
+        std::string list;
+        for (const std::string& m : missing) list += (list.empty() ? "" : ", ") + m;
+        v.unmet.push_back({TriggerKind::Parent,
+                           "projected heights (stage-2 tx): parent(s) " + list +
+                               " not in after_parent; it never fires until every parent is named (rm, then add "
+                               "with --after-parent)",
+                           std::nullopt, std::nullopt});
+    }
+
     if (t.maturity.enabled) {
         const int64_t fire = maturity_fire_tip(t.maturity);
         const std::string rule = "inputs spendable in block >= " + std::to_string(t.maturity.safe_from_height) +

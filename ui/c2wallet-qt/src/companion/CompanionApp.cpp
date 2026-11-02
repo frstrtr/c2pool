@@ -12,6 +12,11 @@
 //   * SUBMIT  : signed artifact -> write the --pin-local-tx-hex FILE the node
 //               loads (primary proven seam) + validate_inject dry-run;
 //   * QR      : reassemble the signed artifact from scanned animated-QR frames.
+//   * SCAN & PLAN (slice S-C): scan an address (dashd and/or the node), write
+//               the files the offline signer imports, then preflight and
+//               queue the signed pair the operator brings back. It runs the
+//               headless scheduler's own command line (sched::cli::run) in a
+//               worker thread; it never signs and never arms the node.
 
 #include "FundingData.hpp"
 #include "Produce.hpp"
@@ -22,13 +27,25 @@
 #include "Digest.hpp"
 #include "TransferContainer.hpp"
 
+#include "scan/CliJob.hpp"
+#include "sched/SchedCli.hpp"
+
 #include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QFileDialog>
+#include <QFormLayout>
+#include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
+#include <QPointer>
+#include <QSpinBox>
+
 #include <QMainWindow>
 #include <QNetworkAccessManager> // online side: network-capable (contrast the signer)
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QString>
 #include <QTabWidget>
 #include <QVBoxLayout>
@@ -61,6 +78,14 @@ struct QtLoopbackTransport : c2w::companion::NodeTransport {
 QString qstr(const std::string& s) { return QString::fromStdString(s); }
 std::string sstr(const QString& s) { return s.toStdString(); }
 
+std::vector<std::string> words(const QString& s)
+{
+    std::vector<std::string> v;
+    for (const QString& w : s.split(QRegularExpression(QStringLiteral("[\\s,]+")), Qt::SkipEmptyParts))
+        v.push_back(sstr(w));
+    return v;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -70,6 +95,9 @@ int main(int argc, char** argv) {
     win.setWindowTitle("c2wallet-qt companion (online, key-free)");
     auto* tabs = new QTabWidget(&win);
     win.setCentralWidget(tabs);
+    // The Scan & Plan worker. Declared after the window, so it is destroyed
+    // (cancelled and joined) before the widgets its results would touch.
+    std::shared_ptr<c2w::companion::scan::CliJob> scan_job;
 
     // The online-side network transport. Instantiating it constructs a live
     // QNetworkAccessManager, so this binary genuinely LINKS Qt6::Network — the
@@ -184,6 +212,178 @@ int main(int argc, char** argv) {
             out->setPlainText(qstr(text));
         });
         tabs->addTab(page, "QR reassembly");
+    }
+
+    // ── SCAN & PLAN tab (slice S-C) ─────────────────────────────────────────
+    {
+        auto* page = new QWidget;
+        auto* lay = new QVBoxLayout(page);
+        lay->addWidget(new QLabel(
+            "Scan an address, write the files the OFFLINE signer imports, then bring back the signed pair.\n"
+            "This tab never signs and never arms the node: it writes files and queues signed txs."));
+        auto* form = new QFormLayout;
+        auto* addresses = new QLineEdit;
+        addresses->setPlaceholderText("XdgF55... (up to 16, space separated)");
+        auto* source = new QComboBox;
+        source->addItems({"both", "dashd", "c2pool"});
+        auto* dashdUrl = new QLineEdit("http://127.0.0.1:9998");
+        auto* authFile = new QLineEdit;
+        authFile->setPlaceholderText("0600 file: dashd .cookie or user:password (never typed here)");
+        auto* nodeUrl = new QLineEdit("http://127.0.0.1:8080");
+        auto* single = new QCheckBox("allow a single source when the other cannot serve (not cross-checked)");
+        auto* mode = new QComboBox;
+        mode->addItems({"consolidate", "collateral"});
+        auto* govHash = new QLineEdit;
+        govHash->setPlaceholderText("collateral: the 64-hex hash `gobject check` prints");
+        auto* feeMode = new QComboBox;
+        feeMode->addItems({"inject", "relay"});
+        auto* feeRate = new QSpinBox;
+        feeRate->setRange(1, 100);
+        auto* keyEnc = new QComboBox;
+        keyEnc->addItems({"unknown", "compressed", "uncompressed"});
+        auto* maxInputs = new QSpinBox;
+        maxInputs->setRange(0, 1000);
+        maxInputs->setSpecialValueText("node cap (1000)");
+        auto* outName = new QLineEdit;
+        outName->setPlaceholderText("path/name (writes name.utxos.json, name.scanplan.json, name.report.txt)");
+        auto* c2wu = new QCheckBox("also write name.c2wu.hex (generic Air-Gap route)");
+        form->addRow("addresses", addresses);
+        form->addRow("source", source);
+        form->addRow("dashd URL (loopback)", dashdUrl);
+        form->addRow("dashd credentials file", authFile);
+        form->addRow("node URL (loopback)", nodeUrl);
+        form->addRow("", single);
+        form->addRow("mode", mode);
+        form->addRow("gov hash", govHash);
+        form->addRow("fee mode", feeMode);
+        form->addRow("relay fee rate (duffs/B)", feeRate);
+        form->addRow("key encoding", keyEnc);
+        form->addRow("max inputs per tx", maxInputs);
+        form->addRow("output", outName);
+        form->addRow("", c2wu);
+        lay->addLayout(form);
+        auto* row1 = new QHBoxLayout;
+        auto* scanBtn = new QPushButton("Scan && write files for the signer");
+        auto* cancelBtn = new QPushButton("Cancel");
+        row1->addWidget(scanBtn);
+        row1->addWidget(cancelBtn);
+        lay->addLayout(row1);
+
+        lay->addWidget(new QLabel("Signed pair from the offline signer:"));
+        auto* form2 = new QFormLayout;
+        auto* hexFile = new QLineEdit;
+        hexFile->setPlaceholderText("name.hex (its name.manifest.json beside it)");
+        auto* utxosFile = new QLineEdit;
+        auto* scanplanFile = new QLineEdit;
+        auto* queueFile = new QLineEdit(qstr(c2w::companion::sched::cli::default_queue_path()));
+        auto* tokenFile = new QLineEdit;
+        tokenFile->setPlaceholderText("the node's 0600 control-token file (for the dry run and the queue)");
+        auto* parents = new QLineEdit;
+        parents->setPlaceholderText("stage 2: the stage-1 txids (--after-parent)");
+        auto* force = new QLineEdit;
+        force->setPlaceholderText("empty, or the reason to queue despite a dry-run cause (journaled)");
+        form2->addRow("signed hex", hexFile);
+        form2->addRow("utxos file", utxosFile);
+        form2->addRow("scan-plan sidecar", scanplanFile);
+        form2->addRow("queue", queueFile);
+        form2->addRow("token file", tokenFile);
+        form2->addRow("after parents", parents);
+        form2->addRow("force reason", force);
+        lay->addLayout(form2);
+        auto* row2 = new QHBoxLayout;
+        auto* preBtn = new QPushButton("Preflight");
+        auto* addBtn = new QPushButton("Preflight && queue (add)");
+        row2->addWidget(preBtn);
+        row2->addWidget(addBtn);
+        lay->addLayout(row2);
+        auto* out = new QPlainTextEdit;
+        out->setReadOnly(true);
+        lay->addWidget(out);
+
+        // The worker delivers to `out` only while it exists; closing the window
+        // cancels it and waits for it (aboutToQuit), and the job's destructor
+        // joins it in any case.
+        scan_job = std::make_shared<c2w::companion::scan::CliJob>(out);
+        const std::weak_ptr<c2w::companion::scan::CliJob> weak_job = scan_job;
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, [weak_job] {
+            if (auto j = weak_job.lock()) {
+                j->cancel();
+                j->wait(35000);
+            }
+        });
+        const std::vector<QPointer<QPushButton>> busy = {scanBtn, preBtn, addBtn};
+        auto run_cli = [weak_job, out, busy](const std::vector<std::string>& args) {
+            auto job = weak_job.lock();
+            if (!job) return;
+            std::string shown = "c2wallet-qt-schedd";
+            for (const std::string& a : args) shown += " " + a;
+            const QPointer<QPlainTextEdit> view(out);
+            if (!job->start(args, [view, busy](int rc, const std::string& text) {
+                    if (view) view->appendPlainText(qstr(text + "\n(exit " + std::to_string(rc) + ")\n"));
+                    for (const auto& b : busy)
+                        if (b) b->setEnabled(true);
+                })) {
+                out->appendPlainText("a command is still running (Cancel it first)");
+                return;
+            }
+            for (const auto& b : busy)
+                if (b) b->setEnabled(false);
+            out->setPlainText(qstr("running: " + shown + "\n"));
+        };
+        auto source_args = [=](std::vector<std::string>& a) {
+            const std::string src = sstr(source->currentText());
+            a.insert(a.end(), {"--source", src});
+            if (src != "c2pool") a.insert(a.end(), {"--dashd-url", sstr(dashdUrl->text()), "--dashd-auth-file", sstr(authFile->text())});
+        };
+        QObject::connect(cancelBtn, &QPushButton::clicked, [weak_job] {
+            if (auto j = weak_job.lock()) j->cancel();
+        });
+        QObject::connect(scanBtn, &QPushButton::clicked, [=] {
+            std::vector<std::string> a = {"--node-url", sstr(nodeUrl->text()), "scan"};
+            for (const std::string& w : words(addresses->text())) a.insert(a.end(), {"--address", w});
+            source_args(a);
+            if (single->isChecked()) a.push_back("--allow-single-source");
+            a.insert(a.end(), {"--mode", sstr(mode->currentText())});
+            if (mode->currentText() == "collateral") a.insert(a.end(), {"--gov-hash", sstr(govHash->text())});
+            a.insert(a.end(), {"--fee-mode", sstr(feeMode->currentText())});
+            if (feeMode->currentText() == "relay") a.insert(a.end(), {"--fee-rate", std::to_string(feeRate->value())});
+            a.insert(a.end(), {"--key-encoding", sstr(keyEnc->currentText())});
+            if (maxInputs->value() > 0) a.insert(a.end(), {"--max-inputs", std::to_string(maxInputs->value())});
+            if (!outName->text().isEmpty()) {
+                a.insert(a.end(), {"--out", sstr(outName->text())});
+                if (utxosFile->text().isEmpty()) utxosFile->setText(outName->text() + ".utxos.json");
+                if (scanplanFile->text().isEmpty()) scanplanFile->setText(outName->text() + ".scanplan.json");
+            }
+            if (c2wu->isChecked()) a.push_back("--emit-c2wu");
+            run_cli(a);
+        });
+        auto pair_args = [=](std::vector<std::string>& a) {
+            a.insert(a.end(), {"--hex", sstr(hexFile->text())});
+            if (!utxosFile->text().isEmpty()) a.insert(a.end(), {"--utxos", sstr(utxosFile->text())});
+            if (!scanplanFile->text().isEmpty()) a.insert(a.end(), {"--scanplan", sstr(scanplanFile->text())});
+            source_args(a);
+            if (!force->text().isEmpty()) a.insert(a.end(), {"--force", sstr(force->text())});
+        };
+        auto globals = [=] {
+            std::vector<std::string> a = {"--queue", sstr(queueFile->text()), "--node-url", sstr(nodeUrl->text())};
+            if (!tokenFile->text().isEmpty()) a.insert(a.end(), {"--token-file", sstr(tokenFile->text())});
+            return a;
+        };
+        QObject::connect(preBtn, &QPushButton::clicked, [=] {
+            std::vector<std::string> a = globals();
+            a.push_back("preflight");
+            pair_args(a);
+            run_cli(a);
+        });
+        QObject::connect(addBtn, &QPushButton::clicked, [=] {
+            std::vector<std::string> a = globals();
+            a.push_back("add");
+            for (const std::string& t : words(parents->text())) a.insert(a.end(), {"--after-parent", t});
+            a.push_back("--preflight");
+            pair_args(a);
+            run_cli(a);
+        });
+        tabs->addTab(page, "Scan & Plan");
     }
 
     win.resize(760, 560);

@@ -53,8 +53,15 @@ struct FeeAdvice {
 // has room for every batch; otherwise relay, naming the first unmet condition.
 FeeAdvice advise_fee_mode(const NodePosture& node, const ScanPlan& plan);
 
+// Review L2: the classification and the plan must come from one PlanParams
+// (classify_params_of); throws ScanRefusal(kBadParams) naming every field that
+// differs. Both writers below call it, so neither file can contradict itself.
+void check_one_param_set(const Classification& cls, const ScanPlan& plan);
+
 // The sidecar. `utxos_file` is the exact text written to <name>.utxos.json
-// (its sha256 binds the two files).
+// (its sha256 binds the two files). A stage-2 intake (tip hash
+// "projected:<h>") is marked source.heights_projected, and every batch that
+// spends unmined outputs batches[].heights_projected.
 std::string write_scan_plan(const ScanResult& scan, const Classification& cls, const ScanPlan& plan,
                             const std::string& utxos_file, const FeeAdvice& advice);
 

@@ -24,6 +24,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -60,6 +61,7 @@ inline constexpr const char* kSourceMismatch = "scan-source-mismatch";     // bo
 inline constexpr const char* kNothingToExport = "scan-nothing-to-export";  // no row left for an address
 inline constexpr const char* kPlanRefused = "scan-plan-refused";           // the planner refused (DashAbort text kept)
 inline constexpr const char* kUnsupported = "scan-unsupported";            // a plan shape this slice does not build
+inline constexpr const char* kCancelled = "scan-cancelled";                // the operator cancelled the scan
 } // namespace cause
 
 class ScanRefusal : public std::runtime_error {
@@ -80,8 +82,13 @@ bool operator<(const Outpoint& a, const Outpoint& b);
 bool operator==(const Outpoint& a, const Outpoint& b);
 std::string outpoint_str(const Outpoint& o); // "txid:vout"
 
+// The operator's cancel (SIGINT in the daemon, the GUI's Cancel button): polled
+// between requests, and by the transport while a long request runs.
+using CancelCheck = std::function<bool()>;
+
 struct ScanOptions {
     bool testnet = false;
+    CancelCheck cancelled;       // empty: never cancelled
     int dashd_tip_retries = 5;   // getaddressutxos: read until the tip did not move (export_utxos.py)
     int scantxoutset_retries = 2; // one scan, plus one retry when the tip moved under it
     int c2pool_tip_retries = 3;  // /api/utxo/scan answered tip_moved:true
@@ -142,6 +149,7 @@ std::vector<c2w::dash::UtxoImport> group_rows(const std::vector<RawRow>& rows,
 bool dash_to_duffs(double x, int64_t& duffs);
 
 bool is_hex64(const std::string& s);
+inline bool is_cancelled(const ScanOptions& o) { return o.cancelled && o.cancelled(); }
 std::string lower(std::string s);
 
 } // namespace c2w::companion::scan

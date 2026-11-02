@@ -26,9 +26,11 @@
 #include "../sched/NodeApi.hpp"
 
 #include "../../family/bitcoin/dash/DashAddress.hpp"
+#include "../../family/bitcoin/dash/InjectManifest.hpp"
 #include "../../family/bitcoin/dash/UtxoIntake.hpp"
 
 #include "Digest.hpp"
+#include "ValidateSeam.hpp" // crossgap_txid
 
 #include <nlohmann/json.hpp>
 
@@ -199,10 +201,32 @@ public:
     std::function<void(FakeDashd&, const std::string&)> hook;
     std::vector<std::string> calls;
     int bare_http_status = 0; // e.g. 401: answer with that status and an empty body (no JSON-RPC envelope)
+    std::vector<std::string> params_log;          // the params of every call, in order
+    int aborts = 0;                               // scantxoutset "abort" calls seen
+    std::function<void(FakeDashd&)> long_hook;    // runs while a long call (scantxoutset start) is in flight
+
+    // The operator's cancel arriving while scantxoutset "start" runs: the
+    // long hook may set it; the source's on_cancel sends "abort", and the
+    // start then returns dashd's answer to an aborted scan (success false).
+    RpcReply call_long(const std::string& method, const std::string& params_json, const CancelCheck& cancelled,
+                       const std::function<void()>& on_cancel) override
+    {
+        if (long_hook) long_hook(*this);
+        if (cancelled && cancelled()) {
+            on_cancel();
+            if (aborts > 0) {
+                calls.push_back(method);
+                params_log.push_back(params_json);
+                return ok({{"success", false}});
+            }
+        }
+        return call(method, params_json);
+    }
 
     RpcReply call(const std::string& method, const std::string& params_json) override
     {
         calls.push_back(method);
+        params_log.push_back(params_json);
         if (hook) hook(*this, method);
         if (bare_http_status) return {true, bare_http_status, "", ""};
         const nj p = nj::parse(params_json);
@@ -225,6 +249,10 @@ public:
         if (method == "scantxoutset") {
             // SYNTHESISED scantxoutset reply: the field set of the real vm210
             // capture (K2b) and the RPC help, built from the same rows.
+            if (p[0] == "abort") {
+                ++aborts;
+                return ok(true);
+            }
             if (p[0] != "start") return err(-8, "Invalid command");
             std::vector<std::string> want;
             for (const nj& d : p[1]) {
@@ -327,11 +355,16 @@ public:
     int64_t total_value_delta = 0;
     std::function<void(FakeUtxoNode&)> hook;
     std::vector<std::string> paths;
+    bool fail_transport = false;                  // the GET was aborted on our side (cancel)
+    // POST /api/tx-inject/validate (node slice N3) and any other POST.
+    std::function<sched::HttpReply(const std::string& path, const std::string& body)> post_handler;
+    std::vector<std::pair<std::string, std::string>> posts;
 
     sched::HttpReply get(const std::string& path) override
     {
         paths.push_back(path);
         if (hook) hook(*this);
+        if (fail_transport) return {false, 0, "", "request aborted"};
         if (status != 200) return {true, status, error_body, ""};
         std::vector<std::string> want;
         for (size_t at = path.find("address="); at != std::string::npos; at = path.find("address=", at + 1)) {
@@ -364,7 +397,11 @@ public:
                           {"total_value", total + total_value_delta}};
         return {true, 200, reply.dump(), ""};
     }
-    sched::HttpReply post_json(const std::string&, const std::string&) override { return {true, 404, "", ""}; }
+    sched::HttpReply post_json(const std::string& path, const std::string& body) override
+    {
+        posts.push_back({path, body});
+        return post_handler ? post_handler(path, body) : sched::HttpReply{true, 404, "", ""};
+    }
     const char* name() const override { return "fake-utxo-node"; }
 };
 
@@ -393,6 +430,110 @@ inline dash::UtxoImport import_of(const std::vector<Row>& rows, int64_t tip)
     d.rows = rows;
     d.tip = tip;
     return dashd_scan(d, {rows[0].address}).imports[0];
+}
+
+// A STRUCTURALLY signed tx (a companion test holds no key): the planned
+// inputs in order, each with a 106-byte dummy scriptSig, and the planned
+// outputs. Blanking the scriptSigs gives the planned unsigned tx back.
+inline std::string fake_signed(const std::vector<dash::Utxo>& inputs,
+                               const std::vector<std::pair<int64_t, std::vector<uint8_t>>>& outputs)
+{
+    std::vector<uint8_t> t = {2, 0, 0, 0};
+    auto varint = [&](uint64_t n) {
+        if (n < 0xfd) {
+            t.push_back(static_cast<uint8_t>(n));
+        } else {
+            t.push_back(0xfd);
+            t.push_back(static_cast<uint8_t>(n & 0xff));
+            t.push_back(static_cast<uint8_t>((n >> 8) & 0xff));
+        }
+    };
+    auto le = [&](uint64_t v, int n) {
+        for (int i = 0; i < n; ++i) t.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    };
+    varint(inputs.size());
+    for (const dash::Utxo& u : inputs) {
+        std::vector<uint8_t> id = *art::from_hex(u.txid);
+        t.insert(t.end(), id.rbegin(), id.rend());
+        le(u.vout, 4);
+        varint(106);
+        for (int i = 0; i < 106; ++i) t.push_back(0x44);
+        le(0xffffffffu, 4);
+    }
+    varint(outputs.size());
+    for (const auto& [v, spk] : outputs) {
+        le(static_cast<uint64_t>(v), 8);
+        varint(spk.size());
+        t.insert(t.end(), spk.begin(), spk.end());
+    }
+    le(0, 4);
+    return art::to_hex(t);
+}
+inline std::string fake_signed(const PlannedBatch& b) { return fake_signed(b.inputs, b.outputs); }
+
+// The <name>.manifest.json the signer would write for `plan` and the hex file
+// `hex_file` (one line per batch, `lines`), through the plan library's own
+// manifest writer.
+inline std::string manifest_for(const ScanPlan& plan, const std::string& hex_file, const std::vector<std::string>& lines)
+{
+    dash::ManifestData d;
+    d.testnet = plan.testnet;
+    d.mode = plan_mode_name(plan.params.mode);
+    d.fee_mode = plan.params.fee_mode;
+    d.fee_rate_per_byte = plan.params.fee_rate_per_byte;
+    d.funding_address = plan.address;
+    d.destination = plan.destination;
+    d.gov_hash = plan.params.gov_hash;
+    d.hex_file = hex_file;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const PlannedBatch& b = plan.batches.at(i);
+        dash::ManifestTx t;
+        t.txid = art::crossgap_txid(lines[i]);
+        t.size = lines[i].size() / 2;
+        t.est_signed_bytes = b.est_signed_bytes;
+        t.value_out = b.value_out;
+        t.fee = b.fee;
+        for (const auto& [v, spk] : b.outputs) {
+            dash::ManifestOutput o;
+            o.value = v;
+            o.script_hex = art::to_hex(spk);
+            o.kind = spk.size() == 25 ? "p2pkh" : "op_return";
+            if (o.kind == "p2pkh") o.address = plan.destination;
+            t.outputs.push_back(o);
+        }
+        t.inputs = b.inputs;
+        d.txs.push_back(t);
+    }
+    d.intake_source = "c2wallet export v1";
+    d.coinbase_flags_known = true;
+    d.screen_tip_height = plan.tip_height;
+    d.screen_tip_hash = plan.tip_hash;
+    d.target_height = plan.params.target_height;
+    d.min_confirmations = plan.params.min_confirmations;
+    // The maturity block over the inputs of the txs in this file (the
+    // signer's rule; enqueue recomputes it from the inputs).
+    std::vector<dash::Utxo> all;
+    for (const dash::ManifestTx& t : d.txs) all.insert(all.end(), t.inputs.begin(), t.inputs.end());
+    d.safe_from_height = dash::safe_from_height(all, plan.tip_height);
+    for (const dash::Utxo& u : all) d.youngest_input_height = std::max(d.youngest_input_height, u.height);
+    d.dust_floor = plan.params.dust_floor;
+    d.key_source = "test";
+    d.key_encoding = "compressed";
+    return dash::build_inject_manifest(d);
+}
+
+// The node's dry-run reply (POST /api/tx-inject/validate, node slice N3) for
+// a request body: the txid its raw_tx hashes to, and `cause`.
+inline sched::HttpReply validate_reply(const std::string& body, const std::string& cause = "ok",
+                                       const nj& extra = nj::object())
+{
+    const nj b = nj::parse(body);
+    const std::string txid = art::crossgap_txid(b["raw_tx"].get<std::string>());
+    nj j = {{"ok", cause == "ok"}, {"dry_run", true}, {"would_admit", cause == "ok"}, {"cause", cause},
+            {"txid", txid}, {"armed", true}, {"fee", 0}, {"next_height", kTip + 1}, {"immature_at_next_height", 0},
+            {"inputs", nj::array()}, {"conflicts", nj::array()}};
+    for (auto it = extra.begin(); it != extra.end(); ++it) j[it.key()] = it.value();
+    return {true, cause == "ok" ? 200 : (cause == "inject-disabled" ? 409 : 422), j.dump(), ""};
 }
 
 } // namespace scan_kat

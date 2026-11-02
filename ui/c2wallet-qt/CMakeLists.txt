@@ -146,7 +146,10 @@ if(C2WALLET_QT_BUILD_COMPANION)
 
     add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
     target_include_directories(c2wallet-qt-companion PRIVATE src)
+    # The Scan & Plan tab (slice S-C) runs the daemon's own command line
+    # (sched::cli::run) over the Qt transports of c2wallet-companion-qtnet.
     target_link_libraries(c2wallet-qt-companion PRIVATE
+        c2wallet-companion-qtnet
         c2wallet-companion
         Qt6::Core
         Qt6::Gui
@@ -211,6 +214,13 @@ if(C2WALLET_QT_BUILD_TESTS)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_no_network.sh"
                 "$<TARGET_FILE:c2wallet-qt-signer>"
     )
+    if(TARGET c2wallet-qt-companion)
+        # The companion GUI (with its Scan & Plan tab) is key-free too: the
+        # guard over the linked GUI binary.
+        add_test(NAME companion_gui_key_free_guard
+                 COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/ci/check_key_free.sh"
+                         "$<TARGET_FILE:c2wallet-qt-companion>")
+    endif()
 
     # ── Family B (Monero) seed/key/address core (M1-X) ──────────────────────
     # Qt-FREE static lib + KAT executable (c2wallet-monero-seed-test). It links

@@ -10,7 +10,8 @@
 //                      [--poll-sec N] <command> [options]
 //
 // Commands: init, add, list, show, pause, resume, rm, requeue, retry,
-// set-max-fee, arm-policy (alias set-arm-policy), ack-alerts, status, run.
+// set-max-fee, arm-policy (alias set-arm-policy), ack-alerts, status, run,
+// and the Scan & Plan commands scan, plan, preflight, watch (scan/ScanCli).
 // usage_text() is the reference. Rules the parser enforces:
 //   * there is no --token VALUE in any spelling (argv is world-readable): the
 //     token is only ever read from the 0600 --token-file by the runner;
@@ -25,6 +26,8 @@
 
 #include "Clock.hpp"
 #include "NodeApi.hpp"
+
+#include "../scan/RpcApi.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -53,6 +56,15 @@ struct Env {
     std::function<bool()> stop_requested;
     // Used when --queue is not given (see default_queue_path()).
     std::string default_queue_path;
+    // Scan & Plan (scan/ScanCli): the dashd JSON-RPC transport for a validated
+    // loopback URL and a 0600 credentials file (QtRpcApi in the daemon and the
+    // GUI, a scripted fake in the KATs); empty: the dashd source is refused.
+    std::function<std::unique_ptr<scan::RpcApi>(const std::string& url, const std::string& auth_file, std::string& why)>
+        make_rpc;
+    // The node transport for GET /api/utxo/scan: a long timeout (the node may
+    // take up to 120 s) and aborted on stop_requested (the operator's cancel).
+    // Empty: make_api. The scan commands poll stop_requested as their cancel.
+    std::function<std::unique_ptr<NodeApi>(const std::string& url, std::string& why)> make_scan_api;
 };
 
 // $XDG_DATA_HOME/c2wallet-qt/companion/queue.json when XDG_DATA_HOME is an

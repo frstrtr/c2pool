@@ -175,6 +175,7 @@ J encode_item(const Item& it)
     trig["not_before_time"] = json::opt(it.triggers.not_before_time);
     trig["after_parent"] = std::move(parents);
     trig["allow_unconfirmed_parent"] = it.triggers.allow_unconfirmed_parent;
+    if (it.triggers.projected_heights) trig["projected_heights"] = true; // only when set: older files stay byte-identical
     j["triggers"] = std::move(trig);
 
     J sub = J::object();
@@ -390,6 +391,7 @@ bool decode_item(json::Reader& rd, const J& j, const std::string& p, Item& it)
             }
         }
         it.triggers.allow_unconfirmed_parent = rd.boolean(*t, "allow_unconfirmed_parent", tp);
+        it.triggers.projected_heights = rd.boolean(*t, "projected_heights", tp);
     }
 
     if (const J* s = rd.obj(j, "submit", p)) {
@@ -940,6 +942,7 @@ struct ManifestView {
     std::optional<int64_t> youngest_input_height;
     bool maturity_known = false;  // every input height present and safe_from_height set
     int64_t inputs_with_unknown_height = 0;
+    std::string screen_tip_hash;  // maturity.screen_tip_hash ("" when null)
 };
 
 bool parse_manifest(const std::string& text, const std::string& network, ManifestView& mv, std::string& why)
@@ -993,6 +996,7 @@ bool parse_manifest(const std::string& text, const std::string& network, Manifes
     if (const J* m = rd.obj(root, "maturity", "manifest")) {
         mv.safe_from_height = rd.oi64(*m, "safe_from_height", "manifest.maturity");
         mv.youngest_input_height = rd.oi64(*m, "youngest_input_height", "manifest.maturity");
+        mv.screen_tip_hash = rd.str(*m, "screen_tip_hash", "manifest.maturity");
     }
     if (!rd.ok()) {
         why = rd.err;
@@ -1057,6 +1061,56 @@ std::string next_item_id(const Queue& q, int64_t now)
 
 } // namespace
 
+std::vector<std::string> raw_tx_parent_txids(const std::string& raw_tx_hex)
+{
+    std::vector<std::string> out;
+    const auto bytes = c2w::artifact::from_hex(raw_tx_hex);
+    if (!bytes || bytes->size() < 10) return out;
+    const std::vector<uint8_t>& b = *bytes;
+    size_t p = 4;
+    if (b[4] == 0x00 && b[5] == 0x01) p += 2; // BIP144 marker + flag
+    auto compact = [&](uint64_t& n) {
+        if (p >= b.size()) return false;
+        const uint8_t c = b[p++];
+        if (c < 0xfd) { n = c; return true; }
+        const size_t w = c == 0xfd ? 2 : (c == 0xfe ? 4 : 8);
+        if (p + w > b.size()) return false;
+        n = 0;
+        for (size_t i = 0; i < w; ++i) n |= static_cast<uint64_t>(b[p + i]) << (8 * i);
+        p += w;
+        return true;
+    };
+    uint64_t nin = 0;
+    if (!compact(nin) || nin > b.size()) return {};
+    for (uint64_t i = 0; i < nin; ++i) {
+        if (p + 36 > b.size()) return {};
+        std::vector<uint8_t> id(b.begin() + static_cast<long>(p), b.begin() + static_cast<long>(p) + 32);
+        std::reverse(id.begin(), id.end());
+        p += 36;
+        uint64_t slen = 0;
+        if (!compact(slen) || p + slen + 4 > b.size()) return {};
+        p += slen + 4;
+        const std::string t = c2w::artifact::to_hex(id);
+        if (std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
+    }
+    return out;
+}
+
+std::vector<std::string> projected_parents_missing(const Item& it)
+{
+    std::vector<std::string> missing;
+    if (!it.triggers.projected_heights) return missing;
+    const std::vector<std::string> parents = raw_tx_parent_txids(it.tx.raw_tx);
+    if (parents.empty()) return {"(the raw tx does not parse)"};
+    for (const std::string& t : parents) {
+        const bool named = std::any_of(it.triggers.after_parent.begin(), it.triggers.after_parent.end(),
+                                       [&](const ParentReq& p) { return p.txid == t; });
+        if (!named) missing.push_back(t);
+    }
+    return missing;
+}
+
+
 EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
 {
     EnqueueResult r;
@@ -1099,6 +1153,19 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         if (mv.txs.size() != nlines)
             return refuse("manifest lists " + std::to_string(mv.txs.size()) + " txs, the hex file carries " +
                           std::to_string(nlines) + " lines");
+    }
+
+    // The stage-2 marker: from the manifest used, or from one beside the hex
+    // that --no-manifest left out.
+    bool projected = have_manifest && mv.screen_tip_hash.rfind(kProjectedTipHashPrefix, 0) == 0;
+    std::string projected_marker = projected ? mv.screen_tip_hash : std::string();
+    if (!projected && req.fence_manifest_text) {
+        ManifestView fv;
+        if (parse_manifest(*req.fence_manifest_text, q.network, fv, err) &&
+            fv.screen_tip_hash.rfind(kProjectedTipHashPrefix, 0) == 0) {
+            projected = true;
+            projected_marker = fv.screen_tip_hash + " (from the manifest beside the hex; --no-manifest)";
+        }
     }
 
     if (req.not_before_height && *req.not_before_height <= 0) return refuse("not_before_height must be > 0");
@@ -1201,19 +1268,47 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         it.triggers.not_before_height = req.not_before_height;
         it.triggers.not_before_time = req.not_before_time;
 
-        // Parents: explicit ones, then inputs whose txid is already queued.
+        // Parents: explicit ones, then inputs whose txid is already queued —
+        // the manifest's inputs and the raw tx's own (so a bare hex is
+        // covered too).
         for (const ParentReq& p : req.after_parent) it.triggers.after_parent.push_back(p);
-        if (have_manifest && req.discover_parents) {
-            for (const ManifestInput& in : mv.txs[idx].inputs) {
-                if (!find_item_by_txid(staged, in.txid)) continue;
+        std::vector<std::string> parent_txids;
+        if (have_manifest)
+            for (const ManifestInput& in : mv.txs[idx].inputs)
+                if (std::find(parent_txids.begin(), parent_txids.end(), in.txid) == parent_txids.end())
+                    parent_txids.push_back(in.txid);
+        for (const std::string& t : raw_tx_parent_txids(hex))
+            if (std::find(parent_txids.begin(), parent_txids.end(), t) == parent_txids.end()) parent_txids.push_back(t);
+        if (req.discover_parents) {
+            for (const std::string& ptx : parent_txids) {
+                if (!find_item_by_txid(staged, ptx)) continue;
                 const bool present =
                     std::any_of(it.triggers.after_parent.begin(), it.triggers.after_parent.end(),
-                                [&](const ParentReq& p) { return p.txid == in.txid; });
+                                [&](const ParentReq& p) { return p.txid == ptx; });
                 if (present) continue;
-                it.triggers.after_parent.push_back({in.txid, staged.defaults.after_parent_min_confirmations});
-                r.notes.push_back(it.id + ": after_parent pre-filled from input " + short_txid(in.txid) +
-                                  " (queued as " + find_item_by_txid(staged, in.txid)->id + ")");
+                it.triggers.after_parent.push_back({ptx, staged.defaults.after_parent_min_confirmations});
+                r.notes.push_back(it.id + ": after_parent pre-filled from input " + short_txid(ptx) +
+                                  " (queued as " + find_item_by_txid(staged, ptx)->id + ")");
             }
+        }
+        // A stage-2 manifest (Scan & Plan two-stage plan): its inputs are the
+        // outputs of txs that were not mined when it was planned, and its
+        // heights are a projection. Only the parents' finality can stand for
+        // them, so every parent must be an after_parent (explicit, or a queued
+        // item discovered above).
+        if (projected) {
+            it.triggers.projected_heights = true;
+            const std::vector<std::string> missing = projected_parents_missing(it);
+            if (!missing.empty()) {
+                std::string list;
+                for (const std::string& m : missing) list += (list.empty() ? "" : ", ") + m;
+                return refuse(ln + ": the manifest's heights are projected (maturity.screen_tip_hash \"" +
+                              projected_marker + "\": a stage-2 tx spending outputs that were not mined when it "
+                              "was planned); name every parent with --after-parent TXID (missing: " + list +
+                              "); no maturity override replaces them");
+            }
+            journal(it, at, "projected_heights",
+                    "stage-2 tx (" + projected_marker + "): every parent is an after_parent");
         }
         for (const ParentReq& p : it.triggers.after_parent) {
             if (p.txid == txid) return refuse(ln + ": a tx cannot be its own parent");

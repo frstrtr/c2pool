@@ -25,11 +25,33 @@ constexpr int64_t kRpcInvalidRequest = -32600; // "Address index is disabled"
 
 class Rpc {
 public:
-    explicit Rpc(RpcApi& api) : api_(api) {}
+    Rpc(RpcApi& api, CancelCheck cancelled) : api_(api), cancelled_(std::move(cancelled)) {}
+
+    bool cancelled() const { return cancelled_ && cancelled_(); }
 
     J call(const std::string& method, const J& params)
     {
-        const RpcReply r = api_.call(method, sched::json::dump_compact(params));
+        if (cancelled()) throw ScanRefusal(cause::kCancelled, "cancelled before dashd " + method);
+        return finish(method, api_.call(method, sched::json::dump_compact(params)));
+    }
+
+    // scantxoutset "start": on a cancel the transport sends scantxoutset
+    // "abort" on its own request and waits for the start to return.
+    J call_scan(const J& params, bool& aborted)
+    {
+        if (cancelled()) throw ScanRefusal(cause::kCancelled, "cancelled before dashd scantxoutset");
+        const RpcReply r = api_.call_long("scantxoutset", sched::json::dump_compact(params), cancelled_, [&] {
+            aborted = true;
+            (void)api_.call("scantxoutset", R"(["abort"])");
+        });
+        if (aborted || cancelled())
+            throw ScanRefusal(cause::kCancelled, "cancelled: dashd scantxoutset was aborted (scantxoutset \"abort\")");
+        return finish("scantxoutset", r);
+    }
+
+private:
+    J finish(const std::string& method, const RpcReply& r)
+    {
         if (!r.transport_ok)
             throw ScanRefusal(cause::kTransport, "dashd " + method + ": " + r.error);
         // dashd answers a bad cookie / rpcauth with 401 and a client outside
@@ -62,8 +84,8 @@ public:
         return *res;
     }
 
-private:
     RpcApi& api_;
+    CancelCheck cancelled_;
 };
 
 [[noreturn]] void bad(const std::string& what) { throw ScanRefusal(cause::kBadReply, what); }
@@ -186,7 +208,8 @@ bool read_scantxoutset(Rpc& rpc, const std::vector<AddressScript>& scripts, bool
     check_chain(info, testnet);
     J descs = J::array();
     for (const AddressScript& a : scripts) descs.push_back("addr(" + a.address + ")");
-    const J res = rpc.call("scantxoutset", J::array({"start", descs}));
+    bool aborted = false;
+    const J res = rpc.call_scan(J::array({"start", descs}), aborted);
     if (!res.is_object()) bad("scantxoutset: not an object");
     const auto ok = res.find("success");
     if (ok == res.end() || !ok->is_boolean() || !ok->get<bool>())
@@ -265,11 +288,45 @@ bool confirm_rows(Rpc& rpc, Snapshot& s)
 
 } // namespace
 
+std::vector<UnspentCheck> SourceDashd::check_unspent(const std::vector<Utxo>& inputs, const ScanOptions& opt)
+{
+    Rpc rpc(rpc_, opt.cancelled);
+    std::vector<UnspentCheck> out;
+    try {
+        for (const Utxo& u : inputs) {
+            UnspentCheck c;
+            c.outpoint = {lower(u.txid), u.vout};
+            const std::string where = "gettxout " + outpoint_str(c.outpoint);
+            const J t = rpc.call("gettxout", J::array({c.outpoint.txid, u.vout, true}));
+            if (t.is_null()) {
+                c.problem = "spent (in a block or in dashd's mempool)";
+            } else if (!t.is_object()) {
+                bad(where + ": neither null nor an object");
+            } else {
+                const int64_t value = need_amount(t, "value", where);
+                const auto spk = t.find("scriptPubKey");
+                const std::string hex =
+                    spk != t.end() && spk->is_object() ? lower(need_str(*spk, "hex", where)) : std::string();
+                if (value != u.satoshis)
+                    c.problem = "value " + std::to_string(value) + " duffs, the manifest says " + std::to_string(u.satoshis);
+                else if (hex != lower(u.script_pubkey_hex))
+                    c.problem = "scriptPubKey " + hex + ", the manifest says " + u.script_pubkey_hex;
+                else
+                    c.unspent = true;
+            }
+            out.push_back(std::move(c));
+        }
+    } catch (const RpcErr& e) {
+        throw ScanRefusal(cause::kRpcError, "dashd answered error " + std::to_string(e.code) + ": " + e.message);
+    }
+    return out;
+}
+
 ScanResult SourceDashd::scan(const std::vector<std::string>& addresses, const ScanOptions& opt)
 {
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<AddressScript> scripts = address_scripts(addresses, opt.testnet);
-    Rpc rpc(rpc_);
+    Rpc rpc(rpc_, opt.cancelled);
     std::string warning;
     try {
         bool index = true;

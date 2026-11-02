@@ -9,11 +9,13 @@
 // Widgets: it runs under systemd with no display; ci/check_no_gui_link.sh).
 //
 // Everything operator-facing lives in sched/SchedCli (Qt-free, KAT-covered);
-// this file only supplies the Qt Network transport, the system clock,
+// this file only supplies the Qt Network transports (the node, and dashd for
+// the Scan & Plan commands), the system clock,
 // stdout/stderr and SIGTERM/SIGINT-aware sleeping between ticks. The control
 // token is never read from argv or the environment: only the runner reads it,
 // from the 0600 --token-file, at the moment of each request.
 
+#include "../scan/QtRpcApi.hpp"
 #include "../sched/Clock.hpp"
 #include "../sched/QtNodeApi.hpp"
 #include "../sched/SchedCli.hpp"
@@ -65,6 +67,19 @@ int main(int argc, char** argv)
     env.clock = &clock;
     env.make_api = [](const std::string& url, std::string& why) -> std::unique_ptr<sched::NodeApi> {
         auto api = sched::QtNodeApi::create(url, why);
+        if (api) api->set_stop_check([] { return g_stop != 0; });
+        return api;
+    };
+    // Scan & Plan: dashd over the loopback JSON-RPC (credentials from the 0600
+    // file at each request), and the node scan with the node's own 120 s cap
+    // plus a margin. SIGINT / SIGTERM cancel a scan: the node request is
+    // dropped, a running scantxoutset is aborted.
+    env.make_rpc = [](const std::string& url, const std::string& auth_file,
+                      std::string& why) -> std::unique_ptr<c2w::companion::scan::RpcApi> {
+        return c2w::companion::scan::QtRpcApi::create(url, auth_file, why);
+    };
+    env.make_scan_api = [](const std::string& url, std::string& why) -> std::unique_ptr<sched::NodeApi> {
+        auto api = sched::QtNodeApi::create(url, why, 130000);
         if (api) api->set_stop_check([] { return g_stop != 0; });
         return api;
     };

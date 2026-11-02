@@ -2015,8 +2015,11 @@ static void k9d_node_vocabulary()
     // be in the vocabulary (after a merge with master these are master's).
     int files = 0, found = 0, missing = 0;
 #ifdef C2POOL_NODE_COIN_DIR
+    // inject_dry_run_causes.hpp: the dry-run-only names of node slice N3 (not
+    // on master: skipped until that node PR lands; its names are the pending
+    // set, accepted below).
     for (const char* f : {"node_coin_state.hpp", "mempool.hpp", "tx_inject_pool.hpp", "inject_rate_limiter.hpp",
-                          "inject_sandbox.hpp"}) {
+                          "inject_sandbox.hpp", "inject_dry_run_causes.hpp"}) {
         std::ifstream in(std::string(C2POOL_NODE_COIN_DIR) + "/" + f);
         if (!in) continue;
         ++files;

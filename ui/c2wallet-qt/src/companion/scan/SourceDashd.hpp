@@ -29,11 +29,22 @@
 
 namespace c2w::companion::scan {
 
+// One input of a signed tx, re-checked right before it is queued (preflight).
+struct UnspentCheck {
+    Outpoint outpoint;
+    bool unspent = false;
+    std::string problem;          // empty: unspent with the expected value and script
+};
+
 class SourceDashd : public UtxoSource {
 public:
     explicit SourceDashd(RpcApi& rpc) : rpc_(rpc) {}
     ScanResult scan(const std::vector<std::string>& addresses, const ScanOptions& opt) override;
     const char* kind() const override { return "dashd"; }
+
+    // gettxout txid n true per input (mempool spends count as spent): each
+    // must still be unspent with exactly the value and script given.
+    std::vector<UnspentCheck> check_unspent(const std::vector<c2w::dash::Utxo>& inputs, const ScanOptions& opt);
 
 private:
     RpcApi& rpc_;

@@ -89,7 +89,7 @@ static CompanionOut companion(const std::vector<Row>& rows, int64_t tip, const P
     SourceC2pool sc(n);
     CompanionOut o;
     o.scan = scan_both(sd, sc, {rows[0].address}, ScanOptions{}, CrossCheckOptions{});
-    o.cls = classify(o.scan.imports.at(0), o.scan.mempool_spent, {}, ClassifyParams{});
+    o.cls = classify(o.scan.imports.at(0), o.scan.mempool_spent, {}, classify_params_of(pp));
     o.plan = make_plan(o.cls.exportable, pp);
     o.export_text = write_export_v1(o.cls.exportable);
     o.sidecar_text = write_scan_plan(o.scan, o.cls, o.plan, o.export_text, FeeAdvice{});
@@ -285,6 +285,32 @@ static void r5_two_stage_intake()
     CHECK(cp && cp->selected.size() == 2 && mine.batches.size() == 1 &&
               art::sha256d_display(cp->unsigned_tx) == mine.batches[0].unsigned_sha256d && cp->change == 40000000,
           "the signer's stage-2 collateral bytes = the companion's plan of the same intake");
+
+    // Review L2: the marker through the REAL signer path. Bind the test key,
+    // sign the stage-2 collateral, read the manifest the signer emits.
+    dash::KeyInput k;
+    k.source = dash::KeySource::Wif;
+    k.secret = testvec::kK7Wif;
+    CHECK(runs([&] {
+              s2.load_key(k);
+              s2.set_gate(true, true, dash::kSpendWord);
+              s2.sign();
+          }, "sign stage 2"),
+          "the signer signs the stage-2 collateral");
+    const std::string man = s2.manifest_json();
+    CHECK(man.find("\"screen_tip_hash\": \"projected:2600002\"") != std::string::npos,
+          "the projected marker survives into the signer's manifest (maturity.screen_tip_hash)");
+    sched::Queue q;
+    sched::EnqueueRequest req;
+    req.hex_text = s2.inject_file();
+    req.manifest_text = man;
+    const sched::EnqueueResult refused = sched::enqueue(q, req, 1793600000);
+    CHECK(!refused.ok && refused.why.find("projected") != std::string::npos && q.items.empty(),
+          "the signed stage-2 pair is refused without its parents");
+    req.after_parent = {{txids[0], 1}, {txids[1], 1}};
+    const sched::EnqueueResult er = sched::enqueue(q, req, 1793600000);
+    CHECK(er.ok && q.items.size() == 1 && q.items[0].triggers.projected_heights,
+          "with both stage-1 parents: queued, flagged projected");
 }
 
 int main()

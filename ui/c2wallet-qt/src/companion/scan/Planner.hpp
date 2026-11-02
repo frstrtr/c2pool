@@ -96,6 +96,12 @@ struct ScanPlan {
     std::vector<std::string> warnings;
 };
 
+// The ONE parameter set (review L2): the classification of a scan is always
+// derived from the plan's parameters, so the sidecar's classify.* and params.*
+// cannot disagree. write_scan_plan / write_report refuse a pair that did not
+// come from one PlanParams (scan-bad-params).
+ClassifyParams classify_params_of(const PlanParams& p);
+
 // sha256 over the sorted "txid:vout\n" lines (lowercase hex).
 std::string inputs_digest(const std::vector<c2w::dash::Utxo>& inputs);
 
@@ -110,9 +116,12 @@ ScanPlan make_plan(const c2w::dash::UtxoImport& exportable, const PlanParams& pa
 // signed: one row per stage-1 batch (output 0 of txid i, its value_out, the
 // funding P2PKH, coinbase false). Stage 1 has not landed when this is written,
 // so the rows are dated at `landing_height`, the height stage 1 is expected in
-// (tip_height = height = landing_height, confirmations 1, no tip hash): the
-// signer's maturity rule for a non-coinbase input is then met one block later,
-// and the scheduler holds the stage-2 tx behind --after-parent anyway.
+// (tip_height = height = landing_height, confirmations 1, tip hash
+// "projected:<landing_height>", sched::kProjectedTipHashPrefix): the
+// signer's maturity rule for a non-coinbase input is then met one block later.
+// The marker travels into the signer's manifest; the scheduler's enqueue then
+// refuses the stage-2 tx unless every stage-1 parent is an --after-parent (the
+// heights were never observed; only the parents' finality stands for them).
 // Returns the c2wallet-utxo-export/1 text. Throws ScanRefusal on a plan that
 // is not two-stage or a txid list that does not match stage 1.
 std::string stage2_export(const ScanPlan& plan, const std::vector<std::string>& stage1_txids,
