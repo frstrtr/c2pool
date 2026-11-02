@@ -32,12 +32,26 @@ size_t compact_size_len(uint64_t n)
     return 9;
 }
 
-// Worst-case P2PKH legacy-tx size (matches dash_collateral_tx.py estimate_size):
-// 4 version + cs(nin) + nin*148 + cs(nout) + 43 (OP_RETURN out) + 34 (change) + 4.
-size_t estimate_size(size_t n_inputs, bool with_change)
+// Signed bytes of one P2PKH input at the low-S DER maximum, for the Relay fee:
+// a DER signature with low S is at most 71 bytes (r <= 33, s <= 32), 72 with the
+// hashtype, so the input is 32 + 4 + 1 + (1+72 + 1+33) + 4 = 148 with a
+// compressed key and 148 + 32 = 180 with an uncompressed one. 148 is
+// dash_collateral_tx.py's figure and stays the estimate for an Unknown key, as
+// in the classic tool; sign_collateral then refuses, before signing, a Relay
+// plan whose fee does not cover the key it is actually given. (InjectCaps'
+// 149/181 assume a 73-byte signature and only feed the size caps.)
+size_t relay_input_bytes(PubkeyEncoding e)
+{
+    return e == PubkeyEncoding::Uncompressed ? 180 : 148;
+}
+
+// Worst-case P2PKH legacy-tx size (dash_collateral_tx.py estimate_size, with the
+// per-input size of the key encoding): 4 version + cs(nin) + nin*per_input +
+// cs(nout) + 43 (OP_RETURN out) + 34 (change) + 4.
+size_t estimate_size(size_t n_inputs, bool with_change, size_t per_input)
 {
     const size_t n_out = with_change ? 2 : 1;
-    return 4 + compact_size_len(n_inputs) + n_inputs * 148 + compact_size_len(n_out) + 43 +
+    return 4 + compact_size_len(n_inputs) + n_inputs * per_input + compact_size_len(n_out) + 43 +
            (with_change ? 34 : 0) + 4;
 }
 
@@ -55,7 +69,7 @@ struct Selection {
     int64_t change = 0;
 };
 
-Selection select_coins(std::vector<Utxo> utxos, int64_t feerate_per_kb)
+Selection select_coins(std::vector<Utxo> utxos, int64_t feerate_per_kb, size_t per_input)
 {
     std::sort(utxos.begin(), utxos.end(),
               [](const Utxo& a, const Utxo& b) { return a.satoshis > b.satoshis; });
@@ -64,13 +78,14 @@ Selection select_coins(std::vector<Utxo> utxos, int64_t feerate_per_kb)
     for (const Utxo& u : utxos) {
         sel.selected.push_back(u);
         total += u.satoshis;
-        const int64_t fee = fee_for(estimate_size(sel.selected.size(), true), feerate_per_kb);
+        const int64_t fee =
+            fee_for(estimate_size(sel.selected.size(), true, per_input), feerate_per_kb);
         const int64_t need = kGovernanceProposalFee + fee;
         if (total >= need) {
             const int64_t change = total - need;
             if (change < kDustDuffs) {
                 const int64_t fee_nc =
-                    fee_for(estimate_size(sel.selected.size(), false), feerate_per_kb);
+                    fee_for(estimate_size(sel.selected.size(), false, per_input), feerate_per_kb);
                 if (total - kGovernanceProposalFee >= fee_nc) {
                     sel.fee = total - kGovernanceProposalFee;
                     sel.change = 0;
@@ -90,7 +105,7 @@ Selection select_coins(std::vector<Utxo> utxos, int64_t feerate_per_kb)
 // sweep_all: every spendable UTXO goes in. Inject mode pays no fee and gives
 // the change everything above the burn; Relay mode pays fee_rate for the whole
 // set and folds a sub-dust change into the fee, as select_coins does.
-Selection sweep_coins(std::vector<Utxo> inputs, bool inject, int64_t feerate_per_kb,
+Selection sweep_coins(std::vector<Utxo> inputs, bool inject, int64_t feerate_per_kb, size_t per_input,
                       size_t skipped_immature, size_t skipped_dust)
 {
     Selection sel;
@@ -113,7 +128,7 @@ Selection sweep_coins(std::vector<Utxo> inputs, bool inject, int64_t feerate_per
         return sel;
     }
     const size_t n = sel.selected.size();
-    const int64_t fee = fee_for(estimate_size(n, true), feerate_per_kb);
+    const int64_t fee = fee_for(estimate_size(n, true, per_input), feerate_per_kb);
     if (total >= kGovernanceProposalFee + fee) {
         sel.fee = fee;
         sel.change = total - kGovernanceProposalFee - fee;
@@ -123,7 +138,7 @@ Selection sweep_coins(std::vector<Utxo> inputs, bool inject, int64_t feerate_per
         }
         return sel;
     }
-    const int64_t fee_nc = fee_for(estimate_size(n, false), feerate_per_kb);
+    const int64_t fee_nc = fee_for(estimate_size(n, false, per_input), feerate_per_kb);
     if (total >= kGovernanceProposalFee + fee_nc) {
         sel.fee = total - kGovernanceProposalFee;
         sel.change = 0;
@@ -215,7 +230,7 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
         // The classic Relay selection, unchanged: largest-first, minimal set.
         if (screen.spendable.empty())
             throw DashAbort("no spendable UTXOs after maturity filtering");
-        sel = select_coins(screen.spendable, req.fee_rate);
+        sel = select_coins(screen.spendable, req.fee_rate, relay_input_bytes(req.key_encoding));
     } else {
         if (screen.spendable.empty())
             throw DashAbort("no spendable UTXOs: every UTXO is immature (" +
@@ -223,7 +238,8 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
                             std::to_string(screen.dust.size()) + "). Nothing was signed.");
         std::vector<Utxo> inputs = screen.spendable;
         if (!req.preserve_input_order) sort_by_outpoint(inputs);
-        sel = sweep_coins(std::move(inputs), inject, req.fee_rate, screen.immature.size(),
+        sel = sweep_coins(std::move(inputs), inject, req.fee_rate, relay_input_bytes(req.key_encoding),
+                          screen.immature.size(),
                           screen.dust.size());
     }
     plan.selected = sel.selected;
@@ -243,6 +259,18 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
     plan.unsigned_tx = serialize_unsigned_legacy_tx(plan.selected, outputs);
     plan.est_signed_bytes =
         est_signed_size(plan.unsigned_tx.size(), plan.selected.size(), req.key_encoding);
+
+    // Relay: the fee must meet dashd's minimum relay fee (1 duff/B) for the
+    // worst-case signed size of this key encoding, or the tx is refused here,
+    // before any key is used (a sub-1000 duffs/kB rate passes only while the
+    // 1000-duff minimum fee still covers the size).
+    const size_t relay_bytes =
+        estimate_size(plan.selected.size(), plan.change > 0, relay_input_bytes(req.key_encoding));
+    if (!inject && plan.fee < kMinRelayFeePerByte * static_cast<int64_t>(relay_bytes))
+        throw DashAbort("RELAY fee " + std::to_string(plan.fee) + " duffs is below dashd's " +
+                        std::to_string(kMinRelayFeePerByte) + " duff/B minimum relay fee for the " +
+                        std::to_string(relay_bytes) + " B this tx can sign to; raise fee_rate to >= " +
+                        std::to_string(kMinRelayFeePerByte * 1000) + " duffs/kB. Nothing was signed.");
 
     // A collateral is ONE tx: over the node's inject caps it is refused, never split.
     const bool extended = inject || req.sweep_all;
@@ -287,13 +315,24 @@ CollateralPlan plan_collateral(const CollateralRequest& req)
              "block)\n";
     else
         s << "fee:               " << format_dash(plan.fee) << " DASH (" << plan.fee
-          << " duffs)\n";
+          << " duffs; est " << relay_bytes << " B at " << relay_input_bytes(req.key_encoding)
+          << " B/input, "
+          << (req.key_encoding == PubkeyEncoding::Uncompressed ? "uncompressed key"
+              : req.key_encoding == PubkeyEncoding::Compressed ? "compressed key"
+                                                                : "key encoding unknown: compressed assumed")
+          << ", " << req.fee_rate << " duffs/kB)\n";
     if (extended) {
         s << "est signed " << plan.est_signed_bytes << "/" << caps::kMaxInjectTxBytes << " B\n";
         s << describe_skipped(screen, req.min_confirmations, req.dust_floor);
-        s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
-             "      understated the difference becomes block fee; if it is overstated the\n"
-             "      node refuses the tx.\n";
+        if (inject)
+            s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
+                 "      understated, the inject lane takes the difference as block fee and the\n"
+                 "      pin lane EXCLUDES the tx (fee-not-zero); if it is overstated the node\n"
+                 "      refuses the tx.\n";
+        else
+            s << "NOTE: legacy sighash commits no input amounts. If a UTXO amount above is\n"
+                 "      understated the difference is paid as extra fee; if it is overstated\n"
+                 "      dashd refuses the tx.\n";
     }
     s << "----------------------------------------------------------------------\n";
     s << "WARNING: this transaction SPENDS REAL FUNDS and irreversibly BURNS 1 DASH.\n";
@@ -332,6 +371,21 @@ SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool c
         throw DashAbort("the plan does not balance: inputs " + std::to_string(sum_in) +
                         " != 1 DASH + change " + std::to_string(plan.change) + " + fee " +
                         std::to_string(plan.fee) + " duffs — refusing to sign");
+
+    // Relay: the fee must cover dashd's minimum relay fee at the worst-case size
+    // for THIS key's encoding. A plan made for a compressed (or unknown) key and
+    // handed an uncompressed one is refused here, before anything is signed.
+    if (!inject) {
+        const size_t worst = estimate_size(plan.selected.size(), plan.change > 0,
+                                           relay_input_bytes(key.compressed ? PubkeyEncoding::Compressed
+                                                                            : PubkeyEncoding::Uncompressed));
+        if (plan.fee < kMinRelayFeePerByte * static_cast<int64_t>(worst))
+            throw DashAbort("RELAY fee " + std::to_string(plan.fee) + " duffs is below dashd's " +
+                            std::to_string(kMinRelayFeePerByte) + " duff/B minimum relay fee for the " +
+                            std::to_string(worst) + " B this key can sign to (" +
+                            (key.compressed ? "compressed" : "uncompressed") +
+                            ") — re-plan with this key's encoding; nothing was signed");
+    }
 
     const std::array<uint8_t, 20> funding_h160 = addr_to_h160(plan.funding_address, plan.testnet);
     if (signer::hash160(key.pub) != h160_bytes(funding_h160))
@@ -377,6 +431,11 @@ SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool c
     if (inject && out.size() > caps::kMaxInjectTxBytes)
         throw DashAbort("signed size " + std::to_string(out.size()) + " B exceeds the node's " +
                         std::to_string(caps::kMaxInjectTxBytes) + " B inject cap");
+    // The same post-sign floor as sign_sweep: the real rate is never below 1 duff/B.
+    if (!inject && plan.fee < kMinRelayFeePerByte * static_cast<int64_t>(out.size()))
+        throw DashAbort("RELAY fee " + std::to_string(plan.fee) + " duffs is below dashd's " +
+                        std::to_string(kMinRelayFeePerByte) + " duff/B minimum relay fee for " +
+                        std::to_string(out.size()) + " signed bytes — nothing was emitted");
 
     SignedTx tx;
     tx.hex = hdkeys::to_hex(out);

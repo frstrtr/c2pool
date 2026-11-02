@@ -5,6 +5,7 @@
 #include "shell/PageAirGap.hpp"
 #include "shell/PageBuildTxMonero.hpp"
 #include "shell/PageConstructConvert.hpp"
+#include "shell/PageDashInject.hpp"
 #include "shell/PageImport.hpp"
 #include "shell/PageScan.hpp"
 #include "shell/PageSign.hpp"
@@ -56,6 +57,14 @@ MainWindow::MainWindow(QWidget* parent)
 
     navList_->addItem(QStringLiteral("Sign & Self-Verify"));
     stack_->addWidget(new PageSign(stack_));
+
+    // Slice 2 (DASH): consolidate a funding address's mature UTXOs or build a
+    // governance collateral, zero-fee for the c2pool pin / inject lane or
+    // fee-paying for dashd relay. A thin binding over the std-only, KAT'd
+    // DashInjectModel; the DASH libs link only libsecp256k1 + the vendored
+    // interpreter, so the link-guard stays green.
+    navList_->addItem(QStringLiteral("DASH Inject / Collateral"));
+    stack_->addWidget(new PageDashInject(stack_));
 
     // Slice-2b (Family B — Monero / RingCT). The key-free composer and the
     // offline signer are WIRED to the merged Monero libraries (seed/key/address,
