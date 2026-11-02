@@ -21,7 +21,12 @@ cmake_minimum_required(VERSION 3.21)
 #   * QrReassembly  — online-side animated-QR reassembly of the signed artifact
 #                     (reuses M5-A QrTransport);
 #   * MoneroSeam    — the Family-B (v37 XMR) online leg as a named cross-lane
-#                     stub.
+#                     stub;
+#   * sched/        — the inject scheduler core: queue file, triggers (maturity,
+#                     height, time, parents), the per-item state machine, the
+#                     submit outcome map, consented auto-arm and the 0600
+#                     token-file reader. Qt-free; the node is reached only
+#                     through the sched::NodeApi seam.
 #
 # KEY-FREE by construction: it links ONLY the M5-A c2wallet-artifact library
 # (which links only the vendored btclibs SHA-256) — NOT the key-bearing signer
@@ -55,12 +60,38 @@ if(NOT TARGET c2wallet-artifact)
         ${CMAKE_CURRENT_BINARY_DIR}/artifact)
 endif()
 
+# The inject scheduler core (sched/) parses queue files, manifests and node
+# replies with nlohmann::json, the node's own wire library (header-only). It is
+# a dependency of the companion ONLY: the signer target never links it, and a
+# signer-only build (-DC2WALLET_QT_BUILD_COMPANION=OFF) never reaches this file.
+find_package(nlohmann_json 3.9 QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(FATAL_ERROR
+        "c2wallet-qt companion: nlohmann_json >= 3.9 not found (Debian/Ubuntu: "
+        "apt install nlohmann-json3-dev). For a signer-only build configure "
+        "ui/c2wallet-qt with -DC2WALLET_QT_BUILD_COMPANION=OFF.")
+endif()
+
 set(COMPANION_SOURCES
     FundingData.cpp
     Produce.cpp
     Submit.cpp
     ValidateClient.cpp
     QrReassembly.cpp
+    # Inject scheduler core (Qt-free, no network I/O of its own: it talks to the
+    # node only through the sched::NodeApi seam). Design: the c2wallet-qt
+    # inject scheduler, slice S1.
+    sched/InjectQueue.cpp
+    sched/Triggers.cpp
+    sched/SubmitOutcome.cpp
+    sched/Scheduler.cpp
+    sched/ChainView.cpp
+    sched/ArmPolicy.cpp
+    sched/TokenFile.cpp
+    sched/Config.cpp
+    # Zeroizing buffer for the control token. One std-only TU with no key
+    # symbols (the same file the signer libraries compile).
+    ${CMAKE_CURRENT_SOURCE_DIR}/../secure/SecureString.cpp
 )
 
 add_library(c2wallet-companion STATIC ${COMPANION_SOURCES})
@@ -69,7 +100,10 @@ target_include_directories(c2wallet-companion PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 
 # Link ONLY the key-free artifact library. Deliberately NOT the signer core —
 # that is what keeps the companion key-free (proven by ci/check_key_free.sh).
-target_link_libraries(c2wallet-companion PUBLIC c2wallet-artifact)
+# nlohmann::json is private: no public companion header includes it.
+target_link_libraries(c2wallet-companion
+    PUBLIC c2wallet-artifact
+    PRIVATE nlohmann_json::nlohmann_json)
 
 option(C2WALLET_QT_BUILD_TESTS "Build the companion KAT test + key-free guard" OFF)
 if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
@@ -77,6 +111,16 @@ if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
     add_executable(c2wallet-companion-test tests/test_companion.cpp)
     target_link_libraries(c2wallet-companion-test PRIVATE c2wallet-companion)
     add_test(NAME companion_kats COMMAND c2wallet-companion-test)
+
+    # Inject scheduler KATs (K1-K27): a scripted fake node + a fake clock drive
+    # the Qt-free core end to end; no network, no Qt.
+    add_executable(c2wallet-companion-sched-test tests/test_sched.cpp)
+    target_link_libraries(c2wallet-companion-sched-test PRIVATE
+        c2wallet-companion nlohmann_json::nlohmann_json)
+    # The node headers in this tree, for the cause-vocabulary drift check.
+    target_compile_definitions(c2wallet-companion-sched-test PRIVATE
+        C2POOL_NODE_COIN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/impl/dash/coin")
+    add_test(NAME companion_sched_kats COMMAND c2wallet-companion-sched-test)
 
     # Mechanical key-free proof over the companion objects (the analog of the
     # signer's network-incapable link-guard). Runs nm/grep over the built
