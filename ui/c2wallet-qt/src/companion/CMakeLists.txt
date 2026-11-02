@@ -27,11 +27,19 @@ cmake_minimum_required(VERSION 3.21)
 #                     submit outcome map, consented auto-arm and the 0600
 #                     token-file reader. Qt-free; the node is reached only
 #                     through the sched::NodeApi seam.
+#   * scan/         — Scan & Plan: the UTXO sources (dashd over the RpcApi seam,
+#                     the c2pool /api/utxo/scan client over sched::NodeApi), the
+#                     dual-source cross-check, the classifier, the planner
+#                     wrapper and the export-v1 / scan-plan sidecar / report /
+#                     C2WU writers. Qt-free, key-free.
 #
 # KEY-FREE by construction: it links ONLY the M5-A c2wallet-artifact library
-# (which links only the vendored btclibs SHA-256) — NOT the key-bearing signer
-# core. The ci/check_key_free.sh guard is the mechanical proof (registered as a
-# ctest, the analog of the signer's network-incapable link-guard). This library
+# (which links only the vendored btclibs SHA-256) and the key-free DASH plan
+# library c2wallet-dash-plan (the signer's planner, split from the key code by
+# scan & plan slice S-A) — NOT the key-bearing signer core. The
+# ci/check_key_free.sh guard is the mechanical proof (registered as a ctest,
+# over this library and over the binaries that link it — the analog of the
+# signer's network-incapable link-guard). This library
 # is Qt-free and network-free so its KATs build/run without the Qt app.
 #
 # Standalone (what a developer / CI runs for just this target):
@@ -64,6 +72,14 @@ endif()
 # replies with nlohmann::json, the node's own wire library (header-only). It is
 # a dependency of the companion ONLY: the signer target never links it, and a
 # signer-only build (-DC2WALLET_QT_BUILD_COMPANION=OFF) never reaches this file.
+# The key-free DASH plan library (address decode, UTXO intake, plan_sweep, the
+# manifest, the gobject hash): the scan module plans with the signer's own code.
+# Defined in DashPlan.cmake so a companion-only configure does not reach the
+# signer core; from ui/c2wallet-qt the DASH directory has defined it already.
+if(NOT TARGET c2wallet-dash-plan)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/DashPlan.cmake)
+endif()
+
 find_package(nlohmann_json 3.9 QUIET)
 if(NOT nlohmann_json_FOUND)
     message(FATAL_ERROR
@@ -93,6 +109,16 @@ set(COMPANION_SOURCES
     # command line of c2wallet-qt-schedd (slice S2), still Qt-free.
     sched/Runner.cpp
     sched/SchedCli.cpp
+    # Scan & Plan core (slice S-B): sources, cross-check, classifier, planner
+    # wrapper and file writers. Qt-free and key-free; the dashd transport is
+    # the scan::RpcApi seam, the node the sched::NodeApi seam.
+    scan/ScanTypes.cpp
+    scan/SourceDashd.cpp
+    scan/SourceC2pool.cpp
+    scan/CrossCheck.cpp
+    scan/Classifier.cpp
+    scan/Planner.cpp
+    scan/ScanFiles.cpp
     # Zeroizing buffer for the control token. One std-only TU with no key
     # symbols (the same file the signer libraries compile).
     ${CMAKE_CURRENT_SOURCE_DIR}/../secure/SecureString.cpp
@@ -106,7 +132,7 @@ target_include_directories(c2wallet-companion PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 # that is what keeps the companion key-free (proven by ci/check_key_free.sh).
 # nlohmann::json is private: no public companion header includes it.
 target_link_libraries(c2wallet-companion
-    PUBLIC c2wallet-artifact
+    PUBLIC c2wallet-artifact c2wallet-dash-plan
     PRIVATE nlohmann_json::nlohmann_json)
 
 option(C2WALLET_QT_BUILD_TESTS "Build the companion KAT test + key-free guard" OFF)
@@ -134,6 +160,52 @@ if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_key_free.sh"
                 "$<TARGET_FILE:c2wallet-companion>"
     )
+
+    # Scan & Plan KATs (K1-K16): scripted fake dashd + fake node over the real
+    # getaddressutxos fixture, the recorded vm210 dashd session, synthesised
+    # scantxoutset / N1 shapes. The key-free guard then runs over the LINKED
+    # test binary: the companion objects plus every c2wallet-dash-plan and
+    # hdkeys object the scan code pulled in.
+    add_executable(c2wallet-companion-scan-test tests/test_scan.cpp)
+    target_link_libraries(c2wallet-companion-scan-test PRIVATE
+        c2wallet-companion nlohmann_json::nlohmann_json)
+    target_compile_definitions(c2wallet-companion-scan-test PRIVATE
+        C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/fixtures"
+        C2W_SCAN_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME companion_scan_kats COMMAND c2wallet-companion-scan-test)
+    add_test(
+        NAME companion_scan_key_free_guard
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_key_free.sh"
+                "$<TARGET_FILE:c2wallet-companion-scan-test>")
+
+    # The export the scan writes is byte-identical to tools/export_utxos.py run
+    # against tests/mock_dash_cli.py (the same chain view on both sides).
+    find_program(C2W_COMPANION_PYTHON3 NAMES python3 python)
+    if(C2W_COMPANION_PYTHON3)
+        add_test(NAME companion_scan_export_parity
+                 COMMAND ${C2W_COMPANION_PYTHON3} -I
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/export_parity.py
+                         --cpp-bin $<TARGET_FILE:c2wallet-companion-scan-test>
+                         --exporter ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/export_utxos.py
+                         --mock ${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/mock_dash_cli.py
+                         --fixture ${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/fixtures/xdgf-getaddressutxos-tip2563986.json)
+    endif()
+
+    # The round trip through the SIGNER's own importer and planner
+    # (DashInjectModel: import -> screen -> plan -> key -> sign). Needs the
+    # key-bearing DASH libraries, so it exists only in the full ui/c2wallet-qt
+    # build; it is a test binary, never a companion artifact, and the key-free
+    # guard does not run over it.
+    if(TARGET c2wallet-dash-tx AND TARGET c2wallet-dash-common)
+        add_executable(c2wallet-scan-signer-roundtrip-test tests/test_scan_roundtrip.cpp)
+        target_link_libraries(c2wallet-scan-signer-roundtrip-test PRIVATE
+            c2wallet-companion c2wallet-dash-tx c2wallet-dash-common c2wallet-artifact
+            nlohmann_json::nlohmann_json)
+        target_compile_definitions(c2wallet-scan-signer-roundtrip-test PRIVATE
+            C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/fixtures"
+            C2W_DASH_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests")
+        add_test(NAME scan_signer_roundtrip COMMAND c2wallet-scan-signer-roundtrip-test)
+    endif()
 endif()
 
 # ═══════════════════════════════════════════════════════════════════════════
