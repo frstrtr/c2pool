@@ -93,6 +93,18 @@ The companion's Scan & Plan core (`src/companion/scan/`, inside
   and sign; a test binary that links the key libraries, so no key-free guard
   runs over it).
 
+Slice S-C (the scan / plan / preflight / watch commands, the dashd Qt
+transport, the GUI tab) adds:
+
+- `companion_scan_cli_kats` (C1-C9 through `sched::cli::run` with scripted
+  fakes) and `companion_scan_cli_key_free_guard` over that binary;
+- `scan_qt_kats` (`QtRpcApi` and `QtNodeApi` against local fake servers:
+  Basic auth from the 0600 file, 401, `scantxoutset "abort"` on cancel, a
+  dropped node scan; the daemon's `scan` end to end);
+- `companion_gui_key_free_guard` (`check_key_free.sh` over the linked
+  `c2wallet-qt-companion`, which now carries the Scan & Plan tab).
+  `schedd_key_free_guard` now also covers the scan code the daemon links.
+
 The same targets build standalone from `ui/c2wallet-qt/src/companion` when Qt6
 Core + Network are installed. A CI job for them would extend the patch above
 with `nlohmann-json3-dev` and run the full `ctest`; it is not part of the

@@ -132,7 +132,7 @@ print("preflight OK: every input is unspent with the manifest's amount")
 PY
 ```
 
-## Companion Scan & Plan (core: slices S-A, S-B)
+## Companion Scan & Plan (slices S-A, S-B, S-C)
 
 The companion scans the UTXOs of up to 16 P2PKH addresses from dashd
 (`getaddressutxos`, else `scantxoutset`; `gettxout` per row) and/or the c2pool
@@ -144,29 +144,53 @@ own code: `c2wallet-dash-plan`, the key-free half of the DASH library
 `<name>.scanplan.json` (`c2wallet-scan-plan/1`, advisory: the signer re-plans
 and compares digests), a report with the `c2wallet-qt-schedd add` lines and,
 optionally, C2WU containers. The core is `src/companion/scan/` (Qt-free, inside
-`c2wallet-companion`, covered by `ci/check_key_free.sh`). KATs:
-`c2wallet-companion-scan-test` (ctest `companion_scan_kats`),
+`c2wallet-companion`, covered by `ci/check_key_free.sh`; the daemon and the GUI
+that link it are guarded too). Nothing here signs, arms or submits: the
+offline signer signs, and the scheduler submits only what `add` queued under
+its own arm policy.
+
+```sh
+S="c2wallet-qt-schedd --queue $Q --node-url http://127.0.0.1:8080 --token-file /path/control.token"
+# scan (dashd + node cross-checked); credentials only from a 0600 file, never argv
+$S scan --address XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u --source both \
+        --dashd-url http://127.0.0.1:9998 --dashd-auth-file ~/.dash-rpc.auth \
+        --key-encoding compressed --out xdgf-2565514
+# ... sign xdgf-2565514.utxos.json (+ .scanplan.json) offline -> xdgf-2565514.hex + .manifest.json
+$S preflight --hex xdgf-2565514.hex --utxos xdgf-2565514.utxos.json \
+        --scanplan xdgf-2565514.scanplan.json --source dashd \
+        --dashd-url http://127.0.0.1:9998 --dashd-auth-file ~/.dash-rpc.auth
+$S add --hex xdgf-2565514.hex --preflight --utxos xdgf-2565514.utxos.json \
+        --scanplan xdgf-2565514.scanplan.json --source c2pool
+# a two-stage collateral: after signing stage 1, write the stage-2 intake
+$S plan --stage2 --utxos gov.utxos.json --scanplan gov.scanplan.json --stage1-hex gov.hex --out gov-s2
+$S watch --address XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u --source c2pool   # every 50 blocks; one alert per batch
+```
+
+`preflight` (also `add --preflight`) checks, right before a pair is queued: the
+structure and the hex/manifest binding; every manifest input is an export row
+and each signed tx is the planned one (its unsigned sha256d = the sidecar's);
+every input is still unspent on the chosen source(s); and the node's dry run
+`POST /api/tx-inject/validate` (node slice N3) when the node offers it (404,
+503 or a reply without `dry_run` is a notice, the other checks stand). `--force
+"<reason>"` turns a dry-run cause or a plan-digest mismatch into a warning and
+is journaled on the queued items; a spent input is never forceable. Ctrl-C (or
+the GUI's Cancel) aborts a running `scantxoutset` with `scantxoutset "abort"`
+and drops a node scan request. A stage-2 intake (two-stage collateral) dates
+the unmined stage-1 outputs at a projected height (`tip_hash
+"projected:<h>"`, marked in the sidecar and the report); `add` refuses its
+manifest unless every parent is an `--after-parent`. The companion GUI's
+"Scan & Plan" tab runs the same commands in a worker thread.
+
+KATs: `companion_scan_kats` (K1-K21), `companion_scan_cli_kats` (C1-C9: the
+commands through `sched::cli::run` with fakes), `scan_qt_kats` (the Qt
+transports against local fake servers, the daemon end to end),
 `companion_scan_export_parity`, `scan_signer_roundtrip` (through
 `DashInjectModel`). A companion-only configure builds the plan library on a
 leaf helper target and needs no libsecp256k1 / zlib dev package.
 
-Slice S-C (CLI `scan` / `plan` / `preflight` / `watch`, the GUI tab, the dashd
-Qt transport) must also close these review items:
-
-- [ ] Fence the two-stage collateral's stage 2: its intake dates the stage-1
-      outputs at a projected landing height (`stage2_export`), so its manifest
-      has `screen_tip_hash: null`. `add` (or `enqueue`) must refuse such a
-      manifest unless `--after-parent` is set, and the sidecar / report must say
-      the heights are projected.
-- [ ] Fill `scan::ClassifyParams` and `scan::PlanParams` from ONE option set
-      (target height, min confirmations, dust floor, fee mode and rate, key
-      encoding), or derive one from the other, so `classify.*` and `params.*`
-      in the sidecar cannot contradict each other.
-- [ ] Cancel: `scantxoutset "abort"` when the operator cancels a running
-      dashd scan (DESIGN §3.2); S-B has no cancel path.
-- [ ] Mark the MN-collateral helper (DESIGN §3.4, §6 #8) and the relay
-      governance collateral (planned in the signer; the companion answers
-      `scan-unsupported`) as deferred, or implement them.
+Not done yet: the MN-collateral helper (DESIGN §3.4, §6 #8) and a relay
+governance collateral are not planned by the companion (the signer plans the
+latter; the companion answers `scan-unsupported`).
 
 ## Companion inject scheduler (core)
 
