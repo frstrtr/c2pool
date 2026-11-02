@@ -709,7 +709,17 @@ void MergedMiningManager::refresh_aux_work()
                                      << " height=" << new_work.height;
                         }
                     } catch (const std::exception& e3) {
-                        // Fallback also unavailable
+                        // Fallback also unavailable. Say why: a daemon error
+                        // here (e.g. createauxblock -8, invalid payout address
+                        // for the network) otherwise reads as "still syncing".
+                        static std::map<uint32_t, int64_t> s_last_fb_warn;
+                        auto now_fb = std::chrono::steady_clock::now().time_since_epoch().count();
+                        auto& lfb = s_last_fb_warn[chain.config.chain_id];
+                        if (now_fb - lfb > 30'000'000'000LL) { // 30s rate limit
+                            lfb = now_fb;
+                            LOG_WARNING << "[MM:" << chain.config.symbol
+                                        << "] RPC jumpstart createauxblock failed: " << e3.what();
+                        }
                     }
                 }
                 if (new_work.block_hash.IsNull() && new_work.height == 0) {
@@ -794,7 +804,12 @@ void MergedMiningManager::refresh_aux_work()
                              << "] Using " << (chain.using_fallback ? "RPC (jumpstart)" : "embedded (preferred)")
                              << " — height " << chain.current_work.height;
                 } catch (const std::exception& e2) {
-                    // Both failed — swap back, wait for next cycle
+                    // Both failed — swap back, wait for next cycle. Log the
+                    // second backend's reason too (same 30s window as above).
+                    if (lw == now) {
+                        LOG_WARNING << "[MM:" << chain.config.symbol
+                                    << "] Fallback backend also failed: " << e2.what();
+                    }
                     chain.rpc.swap(chain.fallback);
                     chain.using_fallback = !chain.using_fallback;
                 }
