@@ -2354,6 +2354,9 @@ static void test_message_model()
         CHECK(F("abc ").trailing_ws && F("abc\t").trailing_ws && !F("abc ").leading_ws, "flags: trailing whitespace");
         CHECK(F("a\rb").has_cr && !F("a\nb").has_cr && F("a\nb").lines == 2, "flags: CR");
         CHECK(F("").empty && F("").bytes == 0, "flags: empty");
+        CHECK(plain.non_ascii == 0 && F("a\xc2\xa0" "b").non_ascii == 2 && !F("a\xc2\xa0" "b").invalid_utf8 &&
+                  F("\xe2\x82\xac").non_ascii == 3 && message_flags({0xff}).non_ascii == 1,
+              "flags: non-ASCII byte count (a pasted no-break space is 2 bytes)");
         CHECK(message_flags(mv::message_bytes(mv::Msg::Long)).long_form && !F(std::string(252, 'a')).long_form &&
                   F(std::string(253, 'a')).long_form,
               "flags: long form from 253 bytes (300 B is long)");
@@ -2492,46 +2495,53 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    // Each section prints its own count, so a silent pass is still visible.
+#define RUN(fn)                                                                              \
+    do {                                                                                     \
+        const int p0_ = g_pass, f0_ = g_fail;                                                \
+        fn();                                                                                \
+        std::printf("    -> %s: %d passed, %d failed\n", #fn, g_pass - p0_, g_fail - f0_);   \
+    } while (0)
     std::printf("=== c2wallet-qt M3-A-DASH KATs ===\n");
-    test_gov_hash();
-    test_address();
-    test_key_scan();
-    test_collateral_tx();
+    RUN(test_gov_hash);
+    RUN(test_address);
+    RUN(test_key_scan);
+    RUN(test_collateral_tx);
 
     std::printf("\n=== zero-fee inject builders ===\n");
-    test_k1_onchain_collateral();
-    test_k2_fee_flags();
-    test_k3_sweep_all();
-    test_k4_maturity();
-    test_k5_batch_split();
-    test_k6_sign_verify();
-    test_k7_python_parity();
-    test_k8_uncompressed_scan();
-    test_k9_emit_format();
-    test_k10_bip68();
-    test_k12_refusals();
-    test_k13_display_roundtrip();
-    test_utxo_intake();
+    RUN(test_k1_onchain_collateral);
+    RUN(test_k2_fee_flags);
+    RUN(test_k3_sweep_all);
+    RUN(test_k4_maturity);
+    RUN(test_k5_batch_split);
+    RUN(test_k6_sign_verify);
+    RUN(test_k7_python_parity);
+    RUN(test_k8_uncompressed_scan);
+    RUN(test_k9_emit_format);
+    RUN(test_k10_bip68);
+    RUN(test_k12_refusals);
+    RUN(test_k13_display_roundtrip);
+    RUN(test_utxo_intake);
 
     std::printf("\n=== slice 2: DashInjectModel / PageDashInject ===\n");
-    test_s2_k1_export_v1();
-    test_s2_k2_getaddressutxos_fixture();
-    test_s2_k3_rescreen();
-    test_s2_k4_state_machine();
-    test_s2_f1_relay_collateral_fee();
-    test_s2_k5_key_paths();
-    test_s2_k6_end_to_end();
-    test_s2_k7_manifest();
-    test_s2_k8_collateral();
-    test_s2_k9_secret_hygiene();
-    test_s2_k10_split();
-    test_s2_f3_json_depth();
-    test_s2_k13_relay_fee_mode();
+    RUN(test_s2_k1_export_v1);
+    RUN(test_s2_k2_getaddressutxos_fixture);
+    RUN(test_s2_k3_rescreen);
+    RUN(test_s2_k4_state_machine);
+    RUN(test_s2_f1_relay_collateral_fee);
+    RUN(test_s2_k5_key_paths);
+    RUN(test_s2_k6_end_to_end);
+    RUN(test_s2_k7_manifest);
+    RUN(test_s2_k8_collateral);
+    RUN(test_s2_k9_secret_hygiene);
+    RUN(test_s2_k10_split);
+    RUN(test_s2_f3_json_depth);
+    RUN(test_s2_k13_relay_fee_mode);
     CHECK(kDefaultMinConf == kCoinbaseMaturity + 1, "S2-K11: kDefaultMinConf == kCoinbaseMaturity + 1 (also static_assert)");
 
     std::printf("\n=== Sign / Verify Message (design A.7) ===\n");
-    test_message_kats();
-    test_message_model();
+    RUN(test_message_kats);
+    RUN(test_message_model);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

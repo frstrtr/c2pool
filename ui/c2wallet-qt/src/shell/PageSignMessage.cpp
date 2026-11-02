@@ -207,6 +207,9 @@ struct PageSignMessage::MessageEditor {
         if (f.leading_ws || f.trailing_ws) w << QStringLiteral("leading/trailing whitespace");
         if (f.has_cr) w << QStringLiteral("contains CR");
         if (f.invalid_utf8) w << QStringLiteral("not valid UTF-8 (signed as-is)");
+        if (f.non_ascii)
+            w << QStringLiteral("contains %1 non-ASCII byte(s): check for a no-break space or a look-alike letter")
+                     .arg(qulonglong(f.non_ascii));
         if (f.long_form) w << QStringLiteral("long form (>=253 B)");
         if (committed && *committed != b)
             w << QStringLiteral("the box differs from the message set in step 2 (press 2) Set message again)");

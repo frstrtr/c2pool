@@ -79,6 +79,7 @@ MessageFlags message_flags(const std::vector<uint8_t>& m)
     for (uint8_t c : m) {
         if (c == '\n') ++f.lines;
         if (c == '\r') f.has_cr = true;
+        if (c >= 0x80) ++f.non_ascii;
     }
     if (!m.empty()) {
         f.leading_ws = ascii_ws(m.front());
@@ -203,8 +204,9 @@ void MessageModel::load_key(const KeyInput& in)
     if (!message_set_)
         throw DashAbort("load_key: set the message first, so the exact bytes are fixed before any key is loaded");
     drop_signed(); // replaces (and wipes) any key held
-    if (ticker_ != "DASH")
-        throw DashAbort("key import is DASH-only in this build");
+    // load_funding_key is DASH-only (DASH WIF version, coin type 5) and refuses
+    // an address with any other version byte; set_target admits proven coins
+    // only, and DASH is the only proven one.
     FoundKey k = load_funding_key(in, address_, testnet_);
     key_ = std::make_unique<FoundKey>(std::move(k));
     key_source_ = in.source;

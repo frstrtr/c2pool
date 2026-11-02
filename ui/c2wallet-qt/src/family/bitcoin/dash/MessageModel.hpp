@@ -53,6 +53,7 @@ struct MessageFlags {
     bool trailing_newline = false; // last byte is LF
     bool has_cr = false;           // a CR byte (cannot come from the text widget; only from a file)
     bool invalid_utf8 = false;     // only possible from a file; the bytes are signed as-is
+    size_t non_ascii = 0;          // bytes >= 0x80: a pasted no-break space or a look-alike letter
     bool long_form = false;        // >= 253 bytes: compactsize 0xfd prefix
 };
 

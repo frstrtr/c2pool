@@ -14,6 +14,7 @@
 
 #include "../hdkeys/Bip32.hpp" // hdkeys::hash160
 #include "../hdkeys/CoinParams.hpp"
+#include "../hdkeys/Csprng.hpp"
 
 #include <array>
 #include <cstring>
@@ -52,9 +53,23 @@ void append_varstr(std::vector<uint8_t>& out, const uint8_t* p, size_t n64)
 
 // A private secp context for the recovery ops (the signer's Crypto wrapper does
 // not expose recovery, and this TU stays off the dashscript closure).
+// Randomized once with CSPRNG bytes, as hdkeys/Secp.cpp does: side-channel
+// blinding for the signing path (it changes no signature: RFC6979 stays
+// deterministic).
 secp256k1_context* ctx()
 {
-    static secp256k1_context* c = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+    static secp256k1_context* c = [] {
+        secp256k1_context* x = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        uint8_t seed[32];
+        hdkeys::csprng_bytes(seed, sizeof seed);
+        const int ok = secp256k1_context_randomize(x, seed);
+        secure::secure_wipe(seed, sizeof seed);
+        if (!ok) {
+            secp256k1_context_destroy(x);
+            throw DashAbort("could not randomize the secp256k1 context");
+        }
+        return x;
+    }();
     return c;
 }
 
