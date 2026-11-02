@@ -23,6 +23,9 @@
 namespace c2w::companion::scan {
 
 inline constexpr const char* kWatchSchema = "c2wallet-scan-watch/1";
+// Named load failures (anything but a missing file, which is a first run).
+inline constexpr const char* kWatchStateUnreadable = "watch-state-unreadable";
+inline constexpr const char* kWatchStateCorrupt = "watch-state-corrupt";
 
 struct WatchAddress {
     std::string address;
@@ -37,7 +40,9 @@ struct WatchState {
     WatchAddress& entry(const std::string& address); // created on first use
 };
 
-// A missing file is an empty state (true). Refuses another schema or network.
+// A missing file (ENOENT) is an empty state (true). Any other open / read
+// failure is watch-state-unreadable; a file that does not parse, another
+// schema or another network is watch-state-corrupt.
 bool load_watch_state(const std::string& path, const std::string& network, WatchState& out, std::string& why);
 bool save_watch_state(const std::string& path, const WatchState& st, std::string& why);
 

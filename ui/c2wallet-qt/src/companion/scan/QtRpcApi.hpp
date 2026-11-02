@@ -12,6 +12,8 @@
 // cap. The one header it adds is Authorization: Basic, built at the moment of
 // each request from the 0600 credentials file (read_rpc_auth_file) and wiped
 // after it; the credentials are never kept between requests, never in argv.
+// Residual (as for QtNodeApi's token body): Qt's HTTP thread serialises its
+// own copy of the request headers, which this code cannot reach to wipe.
 //
 // call_long (scantxoutset "start") polls the cancel check every 100 ms; on a
 // cancel it runs the caller's on_cancel (SourceDashd sends scantxoutset

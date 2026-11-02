@@ -188,9 +188,27 @@ transports against local fake servers, the daemon end to end),
 `DashInjectModel`). A companion-only configure builds the plan library on a
 leaf helper target and needs no libsecp256k1 / zlib dev package.
 
-Not done yet: the MN-collateral helper (DESIGN §3.4, §6 #8) and a relay
-governance collateral are not planned by the companion (the signer plans the
-latter; the companion answers `scan-unsupported`).
+The stage-2 marker is also persisted on the queued item
+(`triggers.projected_heights`): the runner never fires such an item while a
+parent txid of its raw tx is missing from `after_parent` (a hand-edited queue
+file included), `add --no-manifest` still honours a projected manifest beside
+the hex, and a bare hex whose inputs spend queued items gets those parents
+pre-filled. A preflight source that cannot answer (transport, auth, HTTP 403,
+a reply that is not a dry run) is an UNKNOWN that fails the preflight unless
+`--force "<reason>"`; the PASS line names the checks that ran.
+
+Open items:
+
+- [ ] Preflight becomes the default for `add` (with `--no-preflight`) before
+      slice S-E's policy / drop-folder enqueue (design §6 #10).
+- [ ] A projected (stage-2) manifest reads an input missing from the sources
+      as "parent not mined yet" (a notice); a stage-1 output that was mined
+      and then spent elsewhere passes preflight and is refused by the node at
+      submit. Tell the two apart with a parent-tx lookup where a source offers
+      one.
+- [ ] The MN-collateral helper (DESIGN §3.4, §6 #8) and a relay governance
+      collateral are not planned by the companion (the signer plans the
+      latter; the companion answers `scan-unsupported`).
 
 ## Companion inject scheduler (core)
 

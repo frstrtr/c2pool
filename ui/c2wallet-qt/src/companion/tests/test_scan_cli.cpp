@@ -253,6 +253,17 @@ static void c5_preflight_and_add()
           "a non-ok dry run refuses");
     CHECK(w.run(cat(pre, {"--force", "checked the pool tx by hand"})) == 0 && w.out.str().find("FORCED") != std::string::npos,
           "--force passes it with a warning");
+    // L1: --source none and a node that does not answer: not a PASS.
+    w.node.post_handler = [](const std::string&, const std::string&) { return sched::HttpReply{false, 0, "", "connection refused"}; };
+    const std::vector<std::string> none = {"--node-url", kNodeUrl, "--token-file", w.token, "preflight", "--hex",
+                                           base + ".hex", "--source", "none"};
+    CHECK(w.run(none) == 1 && w.out.str().find("UNKNOWN: (d)") != std::string::npos &&
+              w.out.str().find("preflight: FAILED") != std::string::npos,
+          "L1: --source none with a dead node: FAILED (UNKNOWN)");
+    CHECK(w.run(cat(none, {"--force", "node restarting, checked by hand"})) == 0 &&
+              w.out.str().find("preflight: PASS (forced) (checks run: a)") != std::string::npos,
+          "L1: forced with a reason; the PASS line says only (a) ran");
+    w.node.post_handler = [](const std::string&, const std::string& b) { return validate_reply(b, "inject-input-spent-in-mempool"); };
 
     // add --preflight: refused -> nothing queued; forced -> queued with the reason journaled.
     CHECK(w.run({"--queue", w.queue, "--node-url", kNodeUrl, "--token-file", w.token, "init"}) == 0, "queue created");
@@ -356,6 +367,11 @@ static void c7_stage2()
     put(s2 + ".manifest.json", manifest_for(plan2, l2 + "\n", {l2}), 0644);
     CHECK(w.run({"--queue", w.queue, "add", "--hex", s2 + ".hex"}) == 1 && w.err.str().find("projected") != std::string::npos,
           "add without --after-parent: refused");
+    CHECK(w.run({"--queue", w.queue, "add", "--hex", s2 + ".hex", "--no-manifest", "--inputs-known-mature", "trust me"}) == 1 &&
+              w.err.str().find("projected") != std::string::npos,
+          "M-A: add --no-manifest --inputs-known-mature: still refused (the manifest beside the hex marks it)");
+    CHECK(w.run({"--queue", w.queue, "add", "--hex", s2 + ".hex", "--no-manifest", "--not-before-height", "2600010"}) == 1,
+          "M-A: add --no-manifest --not-before-height: still refused");
     CHECK(w.run({"--queue", w.queue, "add", "--hex", s2 + ".hex", "--after-parent", art::crossgap_txid(t1), "--after-parent",
                  art::crossgap_txid(t2)}) == 0,
           "add with both parents: queued");

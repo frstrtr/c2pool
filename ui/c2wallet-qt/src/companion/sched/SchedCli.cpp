@@ -433,6 +433,18 @@ int cmd_add(Ctx& c, const std::vector<std::string>& v_in)
         } else {
             manifest_note = "manifest: none beside the hex (" + mp + "); bare hex";
         }
+    } else {
+        // --no-manifest: the manifest beside the hex is not used, but a
+        // stage-2 (projected heights) marker in it still applies.
+        std::string base = *hex_path;
+        if (base.size() > 4 && base.compare(base.size() - 4, 4, ".hex") == 0) base.resize(base.size() - 4);
+        const std::string mp = base + ".manifest.json";
+        if (file_exists(mp)) {
+            std::string text;
+            if (!read_file(mp, kMaxManifestBytes, text, why)) return refuse(c, why);
+            req.fence_manifest_text = text;
+            manifest_note = "manifest: " + mp + " not used (--no-manifest); a projected-heights marker in it still applies";
+        }
     }
 
     std::string forced_reason, preflight_summary;

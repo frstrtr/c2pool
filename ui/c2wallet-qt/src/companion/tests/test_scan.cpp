@@ -35,6 +35,7 @@
 #include "../scan/Watch.hpp"
 
 #include "../sched/InjectQueue.hpp"
+#include "../sched/Triggers.hpp"
 #include "../sched/NodeApi.hpp"
 
 #include "../../family/bitcoin/dash/DashAddress.hpp"
@@ -61,6 +62,7 @@
 #include <tuple>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 using oj = nlohmann::ordered_json;
@@ -1104,6 +1106,7 @@ static void k20_preflight()
     PreflightOptions opt;
     PreflightReport rep = run_preflight(in, opt, &sd, &sc, &n, &token);
     CHECK(rep.ok && !rep.forced && rep.refusals.empty(), "a clean pair passes");
+    CHECK(rep.text().find("preflight: PASS (checks run: a, b, c, d)") != std::string::npos, "the PASS line names the checks that ran");
     CHECK(rep.text().find("(a) 1 signed tx(s)") != std::string::npos && rep.text().find("(b) every manifest input (128)") != std::string::npos &&
               rep.text().find("compared with the planned unsigned digests") != std::string::npos &&
               rep.text().find("(c) dashd: 128 input(s)") != std::string::npos &&
@@ -1131,6 +1134,16 @@ static void k20_preflight()
     rep = run_preflight(in, opt, &sd, nullptr, nullptr, nullptr);
     CHECK(!rep.ok && rep.text().find("value") != std::string::npos, "dashd: a changed value refuses");
     d.value_override.clear();
+    d.bare_http_status = 500;
+    rep = run_preflight(in, opt, &sd, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("UNKNOWN: (c) the still-unspent check could not run") != std::string::npos,
+          "L1: a source that fails is UNKNOWN, not a pass");
+    rep = run_preflight(in, forced, &sd, nullptr, nullptr, nullptr);
+    CHECK(rep.ok && rep.forced, "L1: ... forceable with a reason");
+    d.bare_http_status = 401;
+    rep = run_preflight(in, opt, &sd, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("scan-auth-refused") != std::string::npos, "L1: dashd auth refused is UNKNOWN");
+    d.bare_http_status = 0;
 
     // (d) the dry run's answers.
     auto with_node = [&](std::function<sched::HttpReply(const std::string&, const std::string&)> h, const PreflightOptions& o) {
@@ -1143,7 +1156,21 @@ static void k20_preflight()
     rep = with_node([](const std::string&, const std::string&) {
         return sched::HttpReply{true, 200, R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"bad"},"id":null})", ""};
     }, opt);
-    CHECK(rep.ok && rep.text().find("without a dry-run reply") != std::string::npos, "a non-dry-run answer: notice");
+    CHECK(!rep.ok && rep.text().find("UNKNOWN: (d) the node answered POST /api/tx-inject/validate without a dry-run reply") !=
+                         std::string::npos,
+          "L1: a non-dry-run answer is UNKNOWN, not a pass");
+    rep = with_node([](const std::string&, const std::string&) {
+        return sched::HttpReply{true, 200, R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"bad"},"id":null})", ""};
+    }, forced);
+    CHECK(rep.ok && rep.forced, "L1: ... unless forced with a reason");
+    rep = with_node([](const std::string&, const std::string&) { return sched::HttpReply{false, 0, "", "connection refused"}; }, opt);
+    CHECK(!rep.ok && rep.text().find("UNKNOWN: (d) tx 1: the node did not answer the dry run") != std::string::npos,
+          "L1: a node that does not answer is UNKNOWN");
+    rep = with_node([](const std::string&, const std::string&) { return sched::HttpReply{true, 403, R"({"error":"x"})", ""}; }, opt);
+    CHECK(!rep.ok && rep.text().find("UNKNOWN: (d) the node refused the dry run (HTTP 403") != std::string::npos,
+          "L1: HTTP 403 is UNKNOWN");
+    rep = run_preflight(in, opt, nullptr, nullptr, nullptr, nullptr);
+    CHECK(rep.ok && rep.text().find("checks run: a, b)") != std::string::npos, "no source and no node: the PASS line says only a, b ran");
     const nj conflict = {{"conflicts", nj::array({{{"txid", in0.txid}, {"vout", in0.vout}, {"spent_by", sha_hex("pool tx")}}})}};
     rep = with_node([&](const std::string&, const std::string& b) { return validate_reply(b, "inject-input-spent-in-mempool", conflict); }, opt);
     CHECK(!rep.ok && rep.text().find("inject-input-spent-in-mempool") != std::string::npos &&
@@ -1230,8 +1257,118 @@ static void k21_watch()
               back.addresses[0].known == st.known && back.addresses[0].alerted == st.alerted &&
               back.addresses[0].last_tip == kTip,
           "the state file round-trips");
-    CHECK(!load_watch_state(tmpl, "testnet", back, why), "another network's state is refused");
+    CHECK(!load_watch_state(tmpl, "testnet", back, why) && why.rfind(kWatchStateCorrupt, 0) == 0,
+          "another network's state: watch-state-corrupt");
+    ::chmod(tmpl, 0000);
+    if (::geteuid() != 0)
+        CHECK(!load_watch_state(tmpl, "mainnet", back, why) && why.rfind(kWatchStateUnreadable, 0) == 0,
+              "L6: an unreadable state file is watch-state-unreadable, not a first run");
+    ::chmod(tmpl, 0600);
+    FILE* f = std::fopen(tmpl, "wb");
+    if (f) {
+        std::fputs("{\"schema\": \"c2wallet-scan-watch/1\", \"addresses\": [", f);
+        std::fclose(f);
+    }
+    CHECK(!load_watch_state(tmpl, "mainnet", back, why) && why.rfind(kWatchStateCorrupt, 0) == 0,
+          "L6: a truncated state file is watch-state-corrupt");
     ::unlink(tmpl);
+    CHECK(load_watch_state(tmpl, "mainnet", back, why) && back.addresses.empty(), "a missing file is the first run");
+}
+
+// ── S-C review M-A: the stage-2 fence persisted on the item ─────────────────
+static void k22_projected_item_fence()
+{
+    std::printf("[K22 a projected item never fires without every parent (hand edits, --no-manifest, bare hex)]\n");
+    const int64_t tip = 2600000;
+    PlanParams coll;
+    coll.mode = PlanMode::Collateral;
+    coll.gov_hash = kGovHash;
+    const ScanPlan two = make_plan(import_of(synthetic_rows(kXdgf, 700, 200000, 2500000), tip), coll);
+    const std::string t1 = fake_signed(two.batches.at(0)), t2 = fake_signed(two.batches.at(1));
+    const std::vector<std::string> txids = {art::crossgap_txid(t1), art::crossgap_txid(t2)};
+    const dash::UtxoImport imp2 = dash::parse_utxo_export_v1(stage2_export(two, txids, tip + 2), false);
+    const ScanPlan plan2 = make_plan(imp2, coll);
+    const std::string line = fake_signed(plan2.batches.at(0));
+    const std::string hexfile = line + "\n";
+    const std::string man = manifest_for(plan2, hexfile, {line});
+    const std::vector<std::string> read = sched::raw_tx_parent_txids(line);
+    CHECK((std::set<std::string>(read.begin(), read.end()) == std::set<std::string>(txids.begin(), txids.end())) &&
+              read.size() == 2,
+          "the parents read from the raw tx");
+
+    // (1) queued with both parents: the flag is persisted.
+    sched::Queue q;
+    sched::EnqueueRequest req;
+    req.hex_text = hexfile;
+    req.manifest_text = man;
+    req.after_parent = {{txids[0], 1}, {txids[1], 1}};
+    const sched::EnqueueResult ok = sched::enqueue(q, req, 1793600000);
+    CHECK(ok.ok && q.items.at(0).triggers.projected_heights && sched::projected_parents_missing(q.items[0]).empty(),
+          "queued with both parents: projected_heights set, nothing missing");
+    const std::string text = sched::queue_to_json(q);
+    CHECK(text.find("\"projected_heights\": true") != std::string::npos, "the flag is in the queue file");
+
+    // (2) the queue file edited by hand: the parents removed.
+    nj edited = nj::parse(text);
+    edited["items"][0]["triggers"]["after_parent"] = nj::array();
+    edited["items"][0]["triggers"]["maturity"]["enabled"] = false;
+    edited["items"][0]["triggers"]["maturity"]["override_consent"] = "edited";
+    sched::Queue q2;
+    std::string why;
+    CHECK(sched::queue_from_json(edited.dump(2), q2, why) && q2.items.at(0).triggers.projected_heights,
+          "the edited file loads, the flag with it");
+    sched::ChainSnapshot chain;
+    chain.tip_known = true;
+    chain.tip = tip + 1000;
+    const sched::ParentLookup none = [](const std::string&) { return sched::ParentStatus{}; };
+    const sched::Verdict v = sched::evaluate(q2.items[0], chain, 1793600000, none);
+    CHECK(!v.ready && v.why().find("projected heights (stage-2 tx)") != std::string::npos &&
+              v.why().find(txids[0]) != std::string::npos && v.why().find(txids[1]) != std::string::npos,
+          "the runner's trigger evaluation never fires it, both parents named");
+    sched::Item honest = q2.items[0];
+    honest.triggers.projected_heights = false; // the same item without the flag would be ready
+    CHECK(sched::evaluate(honest, chain, 1793600000, none).ready, "(control: without the flag it would fire)");
+
+    // (3) add --no-manifest with a maturity override: the manifest beside the
+    // hex still marks it projected.
+    for (int variant = 0; variant < 3; ++variant) {
+        sched::Queue q3;
+        sched::EnqueueRequest bare;
+        bare.hex_text = hexfile;
+        bare.fence_manifest_text = man;
+        if (variant == 0) bare.inputs_known_mature_consent = "operator: inputs are mature";
+        if (variant == 1) bare.not_before_height = tip + 3;
+        if (variant == 2) bare.explicit_h0 = tip;
+        const sched::EnqueueResult er = sched::enqueue(q3, bare, 1793600000);
+        CHECK(!er.ok && er.why.find("--no-manifest") != std::string::npos && er.why.find(txids[0]) != std::string::npos &&
+                  q3.items.empty(),
+              "--no-manifest + an override (consent / not-before-height / h0): refused");
+    }
+    sched::Queue q4;
+    sched::EnqueueRequest bare;
+    bare.hex_text = hexfile;
+    bare.fence_manifest_text = man;
+    bare.inputs_known_mature_consent = "operator: inputs are mature";
+    bare.after_parent = {{txids[0], 1}, {txids[1], 1}};
+    CHECK(sched::enqueue(q4, bare, 1793600000).ok && q4.items.at(0).triggers.projected_heights,
+          "--no-manifest with both parents: queued, flagged");
+
+    // (4) no manifest anywhere, stage 1 queued in the same queue: the parents
+    // are discovered from the raw tx itself.
+    sched::Queue q5;
+    sched::EnqueueRequest s1;
+    s1.hex_text = t1 + "\n" + t2 + "\n";
+    s1.manifest_text = manifest_for(two, s1.hex_text, {t1, t2});
+    CHECK(sched::enqueue(q5, s1, 1793600000).ok && q5.items.size() == 2, "stage 1 queued");
+    sched::EnqueueRequest child;
+    child.hex_text = hexfile;
+    child.inputs_known_mature_consent = "operator: inputs are mature";
+    const sched::EnqueueResult er5 = sched::enqueue(q5, child, 1793600000);
+    std::set<std::string> found;
+    if (er5.ok && q5.items.size() == 3)
+        for (const auto& p : q5.items[2].triggers.after_parent) found.insert(p.txid);
+    CHECK(er5.ok && found == std::set<std::string>(txids.begin(), txids.end()),
+          "a bare stage-2 hex: both queued parents pre-filled from its inputs");
 }
 
 // ── the export_utxos.py parity hook ─────────────────────────────────────────
@@ -1281,6 +1418,7 @@ int main(int argc, char** argv)
     k19_cancel();
     k20_preflight();
     k21_watch();
+    k22_projected_item_fence();
     std::printf("\n== scan KATs: %d passed, %d failed ==\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

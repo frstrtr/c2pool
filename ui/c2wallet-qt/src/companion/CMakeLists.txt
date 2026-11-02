@@ -242,7 +242,7 @@ if(NOT TARGET Qt6::Network AND _companion_standalone)
     find_package(Qt6 6.2 QUIET COMPONENTS Core Network)
 endif()
 if(TARGET Qt6::Network)
-    add_library(c2wallet-companion-qtnet STATIC sched/QtNodeApi.cpp scan/QtRpcApi.cpp)
+    add_library(c2wallet-companion-qtnet STATIC sched/QtNodeApi.cpp scan/QtRpcApi.cpp scan/CliJob.cpp)
     target_link_libraries(c2wallet-companion-qtnet PUBLIC c2wallet-companion Qt6::Core Qt6::Network)
 
     add_executable(c2wallet-qt-schedd schedd/main.cpp)

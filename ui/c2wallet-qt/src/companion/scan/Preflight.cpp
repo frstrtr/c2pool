@@ -178,7 +178,10 @@ std::string PreflightReport::text() const
     for (const auto& n : notices) s += "notice: " + n + "\n";
     for (const auto& w : warnings) s += "warning: " + w + "\n";
     for (const auto& r : refusals) s += "REFUSED: " + r + "\n";
-    s += ok ? (forced ? "preflight: PASS (forced)\n" : "preflight: PASS\n") : "preflight: FAILED\n";
+    std::string checks;
+    for (const auto& c : ran) checks += (checks.empty() ? "" : ", ") + c;
+    s += std::string(ok ? "preflight: PASS" : "preflight: FAILED") + (ok && forced ? " (forced)" : "") +
+         " (checks run: " + (checks.empty() ? std::string("none") : checks) + ")\n";
     return s;
 }
 
@@ -239,6 +242,7 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
     if (!r.refusals.empty()) return finish();
     r.lines.push_back("(a) " + std::to_string(m.txs.size()) + " signed tx(s): sha256 bound to the manifest, txids "
                       "and inputs match, within the node caps");
+    r.ran.push_back("a");
     if (projected)
         r.notices.push_back("stage-2 manifest: heights are projected (" + m.screen_tip_hash +
                             "); queue it with --after-parent for every parent");
@@ -303,6 +307,7 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
                               " signed tx(s) compared with the planned unsigned digests");
         }
     }
+    if (in.utxos_text || in.scanplan_text) r.ran.push_back("b");
     if (!r.refusals.empty()) return finish();
 
     // ── (c) still unspent ────────────────────────────────────────────────────
@@ -369,9 +374,15 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
             r.lines.push_back("(c) node: " + std::to_string(inputs.size()) + " input(s) checked against the full UTXO set at " +
                               std::to_string(sr.tip_height));
         }
+        if (dashd || c2pool) r.ran.push_back("c");
     } catch (const ScanRefusal& e) {
-        r.refusals.push_back(std::string("still-unspent check failed: ") + e.what());
-        return finish();
+        // The chosen source could not answer: the inputs are UNKNOWN, not
+        // unspent.
+        if (e.cause() == cause::kCancelled) {
+            r.refusals.push_back(std::string("cancelled: ") + e.what());
+            return finish();
+        }
+        forceable(std::string("UNKNOWN: (c) the still-unspent check could not run: ") + e.what());
     }
     if (!dashd && !c2pool) r.notices.push_back("(c) no source configured: inputs not re-checked");
     for (const std::string& t : parents_unmined)
@@ -401,8 +412,8 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
             const sched::HttpReply rep = node->post_json(kValidateRoute, body);
             sched::wipe_string(body);
             if (!rep.transport_ok) {
-                r.warnings.push_back("(d) " + ln + ": the node did not answer the dry run (" + rep.error + ")");
-                continue;
+                forceable("UNKNOWN: (d) " + ln + ": the node did not answer the dry run (" + rep.error + ")");
+                break;
             }
             if (rep.status == 404 || rep.status == 503) {
                 r.notices.push_back("(d) validate: the node has no dry-run route (HTTP " + std::to_string(rep.status) +
@@ -410,14 +421,15 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
                 break;
             }
             if (rep.status == 403) {
-                r.warnings.push_back("(d) the node refused the dry run (HTTP 403: token, or not a direct local request)");
+                forceable("UNKNOWN: (d) the node refused the dry run (HTTP 403: the token, or not a direct local "
+                          "request); the queued item would block on it too");
                 break;
             }
             J j;
             if (!sched::json::parse_bounded(rep.body, j, why) || !j.is_object() || !j.contains("dry_run") ||
                 j["dry_run"] != true) {
-                r.notices.push_back("(d) validate: the node answered without a dry-run reply (HTTP " +
-                                    std::to_string(rep.status) + "; older node); relying on (a)-(c)");
+                forceable("UNKNOWN: (d) the node answered POST " + std::string(kValidateRoute) +
+                          " without a dry-run reply (HTTP " + std::to_string(rep.status) + ")");
                 break;
             }
             const std::string echo = j.contains("txid") && j["txid"].is_string() ? lower(j["txid"].get<std::string>()) : "";
@@ -431,6 +443,7 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
                                       ? std::to_string(j["fee"].get<int64_t>()) + " duffs"
                                       : std::string("unpriced");
                 r.lines.push_back("(d) " + ln + ": the node would admit it (dry run, fee " + fee + ")");
+                if (std::find(r.ran.begin(), r.ran.end(), "d") == r.ran.end()) r.ran.push_back("d");
                 continue;
             }
             std::string detail;
@@ -445,6 +458,7 @@ PreflightReport run_preflight(const PreflightInput& in, const PreflightOptions& 
                         detail += "; immature input " + c.value("txid", std::string()) + ":" +
                                   std::to_string(c.value("vout", 0)) + " spendable from " +
                                   (c["spendable_from_height"].is_number() ? std::to_string(c["spendable_from_height"].get<int64_t>()) : "?");
+            if (std::find(r.ran.begin(), r.ran.end(), "d") == r.ran.end()) r.ran.push_back("d");
             const sched::Outcome o = sched::classify_cause(cause, rep.status);
             const std::string text = "(d) " + ln + ": dry run " + cause + " — " + o.why + detail;
             if (cause == sched::cause::Disabled || cause == sched::cause::TipUnknown ||

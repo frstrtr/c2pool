@@ -22,9 +22,14 @@
 //       ("the node has no dry-run route"), the checks above still stand.
 //
 // Refusals that --force "<reason>" can turn into warnings (the reason is
-// journaled with the queued items): a dry-run cause and a plan-digest
-// mismatch. Never forceable: a structural failure, a reconciliation failure,
-// a spent or changed input, a dry run that echoes another txid.
+// journaled with the queued items): a dry-run cause, a plan-digest mismatch,
+// and an UNKNOWN — a chosen source that could not answer (the still-unspent
+// check failed to run: transport, auth, a bad reply; the dry run got no
+// answer, an HTTP 403, or a reply that is not a dry run). Never forceable: a
+// structural failure, a reconciliation failure, a spent or changed input, a
+// dry run that echoes another txid. A 404 / 503 dry-run route (an older node,
+// or one without the dry run wired) is a notice. The PASS line names the
+// checks that ran.
 //
 // A stage-2 manifest (maturity.screen_tip_hash "projected:<h>") spends outputs
 // of txs that may not be mined yet: an input missing from the sources is then
@@ -79,6 +84,7 @@ struct PreflightReport {
     std::vector<std::string> notices;   // checks that could not run (no route, projected heights)
     std::vector<std::string> warnings;  // forced refusals, transient node states
     std::vector<std::string> refusals;
+    std::vector<std::string> ran;       // "a", "b", "c", "d": the checks that ran
     std::string text() const;           // all of the above, one per line
 };
 

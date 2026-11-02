@@ -10,9 +10,13 @@
 //   Q5 cancel during a node scan: QtNodeApi's stop check drops the GET
 //   Q6 the c2wallet-qt-schedd binary: scan end to end; --dashd-auth VALUE
 //      refused before any request
+//   Q7 the GUI's worker (CliJob): the window closed mid-scan -> cancel, the
+//      scantxoutset aborted, no callback into the destroyed receiver, the
+//      worker joined; with the receiver alive the result is delivered
 // The fake dashd answers through FakeDashd (scan_fakes.hpp), the fake node
 // through FakeUtxoNode, each behind a minimal HTTP/1.1 server on 127.0.0.1.
 
+#include "../scan/CliJob.hpp"
 #include "../scan/QtRpcApi.hpp"
 #include "../scan/SourceC2pool.hpp"
 #include "../scan/SourceDashd.hpp"
@@ -347,6 +351,59 @@ static void q6_daemon(const QString& dir)
           "Q6: --dashd-auth VALUE: usage error, no request, the value not echoed");
 }
 
+static bool pump_until(const std::function<bool()>& cond, int ms)
+{
+    QElapsedTimer t;
+    t.start();
+    while (!cond() && t.elapsed() < ms) QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    return cond();
+}
+
+static void q7_cli_job(const QString& dir)
+{
+    std::printf("[Q7 the GUI worker: close while scanning, cancel, join]\n");
+    const std::string auth = put_file(dir, "dashd7.cookie", kCookie + "\n", 0600);
+    for (int alive = 0; alive < 2; ++alive) {
+        DashdHttp d;
+        d.logic.rows = fixture_rows();
+        d.logic.addressindex = false;
+        d.expect_auth = basic_of(kCookie);
+        d.hold_scan = true;
+        CHECK(d.start(), "fake dashd listens");
+        auto* receiver = new QObject;
+        int calls = 0, rc = -1;
+        std::string output;
+        {
+            scan::CliJob job(receiver);
+            const std::vector<std::string> args = {"--queue", (dir + "/q7.json").toStdString(), "scan", "--address", kXdgf,
+                                                   "--source", "dashd", "--dashd-url", d.http.url(), "--dashd-auth-file",
+                                                   auth, "--out", (dir + "/q7").toStdString()};
+            CHECK(job.start(args, [&](int r, const std::string& out) {
+                ++calls;
+                rc = r;
+                output = out;
+            }), "the job starts");
+            CHECK(!job.start(args, nullptr), "one command at a time");
+            CHECK(pump_until([&] { return d.held != nullptr; }, 10000), "the worker reached scantxoutset (held)");
+            if (!alive) {
+                delete receiver; // the window is closed while the scan runs
+                receiver = nullptr;
+            }
+            job.cancel();
+            CHECK(pump_until([&] { return !job.running(); }, 10000), "cancelled: the worker ends");
+            pump_until([] { return false; }, 200); // deliver anything queued
+            CHECK(d.aborts == 1, "the scan was aborted (scantxoutset \"abort\")");
+            if (alive)
+                CHECK(calls == 1 && rc == 1 && output.find("scan-cancelled") != std::string::npos,
+                      "receiver alive: the result is delivered on this thread");
+            else
+                CHECK(calls == 0, "receiver destroyed: no callback into it");
+            CHECK(job.wait(0), "joined");
+        } // the job is destroyed: nothing left running
+        delete receiver;
+    }
+}
+
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
@@ -359,6 +416,7 @@ int main(int argc, char** argv)
     q4_scantxoutset_abort(tmp.path());
     q5_node_scan_cancel();
     q6_daemon(tmp.path());
+    q7_cli_job(tmp.path());
     std::printf("\n== scan Qt KATs: %d passed, %d failed ==\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

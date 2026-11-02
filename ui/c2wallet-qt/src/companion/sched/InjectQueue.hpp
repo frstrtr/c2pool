@@ -123,6 +123,12 @@ struct Triggers {
     // final (ChainLocked, or >= 2 confirmations when the node exposes no
     // ChainLock), so a reorg of the parent's block cannot strand the child.
     bool allow_unconfirmed_parent = false;
+    // Scan & Plan stage-2 tx (its manifest's maturity.screen_tip_hash is
+    // "projected:<h>": it spends outputs that were not mined when it was
+    // planned). Persisted with the item, so the fence holds after enqueue too:
+    // evaluate() never lets such an item fire while any parent txid of its raw
+    // tx is missing from after_parent (a hand-edited queue file included).
+    bool projected_heights = false;
 };
 
 struct SubmitOptions {
@@ -337,6 +343,10 @@ struct EnqueueRequest {
     std::string hex_path;                      // provenance only
     std::optional<std::string> manifest_text;  // content of <name>.manifest.json
     std::string manifest_path;
+    // A manifest that sits beside the hex but is not used (add --no-manifest):
+    // only its projected-heights marker is honoured, so --no-manifest cannot
+    // switch the stage-2 fence off.
+    std::optional<std::string> fence_manifest_text;
     std::optional<int64_t> line;               // 1-based; nullopt = every line
     std::string label;
     std::optional<int64_t> not_before_height;
@@ -381,6 +391,14 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now);
 // recomputed txid equals `expected_txid` (when non-empty).
 bool preflight_raw_tx(const std::string& raw_tx_hex, const std::string& expected_txid,
                       std::string& why);
+
+// The txids a raw tx spends outputs of (display order, each once, in input
+// order). Empty when the hex does not parse.
+std::vector<std::string> raw_tx_parent_txids(const std::string& raw_tx_hex);
+
+// For an item with projected heights: the parent txids of its raw tx that are
+// not an after_parent (empty otherwise, or when every parent is named).
+std::vector<std::string> projected_parents_missing(const Item& it);
 
 // Short txid for display: first 8 hex chars + "...".
 std::string short_txid(const std::string& txid);

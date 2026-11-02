@@ -27,9 +27,7 @@
 #include "Digest.hpp"
 #include "TransferContainer.hpp"
 
-#include "scan/QtRpcApi.hpp"
-#include "sched/Clock.hpp"
-#include "sched/QtNodeApi.hpp"
+#include "scan/CliJob.hpp"
 #include "sched/SchedCli.hpp"
 
 #include <QApplication>
@@ -40,9 +38,9 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMetaObject>
+#include <QPointer>
 #include <QSpinBox>
-#include <QThread>
+
 #include <QMainWindow>
 #include <QNetworkAccessManager> // online side: network-capable (contrast the signer)
 #include <QPlainTextEdit>
@@ -53,7 +51,6 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
-#include <atomic>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -81,54 +78,6 @@ struct QtLoopbackTransport : c2w::companion::NodeTransport {
 QString qstr(const std::string& s) { return QString::fromStdString(s); }
 std::string sstr(const QString& s) { return s.toStdString(); }
 
-// Run one c2wallet-qt-schedd command line (the daemon's own sched::cli::run)
-// in a worker thread: the Qt transports are created there, the output is
-// appended to `out` when it finishes, and `cancel` is the operator's Cancel
-// (it aborts a running scantxoutset and drops a node scan request).
-void run_cli(QPlainTextEdit* out, std::vector<QPushButton*> buttons, std::shared_ptr<std::atomic<bool>> cancel,
-             std::vector<std::string> args)
-{
-    namespace sched = c2w::companion::sched;
-    for (QPushButton* b : buttons) b->setEnabled(false);
-    cancel->store(false);
-    std::string shown = "c2wallet-qt-schedd";
-    for (const std::string& a : args) shown += " " + a;
-    out->setPlainText(qstr("running: " + shown + "\n"));
-    QThread* t = QThread::create([out, buttons, cancel, args]() {
-        std::ostringstream os;
-        sched::SystemClock clock;
-        sched::cli::Env env;
-        env.out = &os;
-        env.err = &os;
-        env.clock = &clock;
-        env.make_api = [](const std::string& url, std::string& why) -> std::unique_ptr<sched::NodeApi> {
-            return sched::QtNodeApi::create(url, why);
-        };
-        env.make_scan_api = [cancel](const std::string& url, std::string& why) -> std::unique_ptr<sched::NodeApi> {
-            auto api = sched::QtNodeApi::create(url, why, 130000);
-            if (api) api->set_stop_check([cancel] { return cancel->load(); });
-            return api;
-        };
-        env.make_rpc = [](const std::string& url, const std::string& auth,
-                          std::string& why) -> std::unique_ptr<c2w::companion::scan::RpcApi> {
-            return c2w::companion::scan::QtRpcApi::create(url, auth, why);
-        };
-        env.sleep_ms = [](int64_t) {};
-        env.stop_requested = [cancel] { return cancel->load(); };
-        const int rc = sched::cli::run(args, env);
-        const QString text = qstr(os.str() + "\n(exit " + std::to_string(rc) + ")\n");
-        QMetaObject::invokeMethod(
-            out,
-            [out, buttons, text] {
-                out->appendPlainText(text);
-                for (QPushButton* b : buttons) b->setEnabled(true);
-            },
-            Qt::QueuedConnection);
-    });
-    QObject::connect(t, &QThread::finished, t, &QObject::deleteLater);
-    t->start();
-}
-
 std::vector<std::string> words(const QString& s)
 {
     std::vector<std::string> v;
@@ -146,6 +95,9 @@ int main(int argc, char** argv) {
     win.setWindowTitle("c2wallet-qt companion (online, key-free)");
     auto* tabs = new QTabWidget(&win);
     win.setCentralWidget(tabs);
+    // The Scan & Plan worker. Declared after the window, so it is destroyed
+    // (cancelled and joined) before the widgets its results would touch.
+    std::shared_ptr<c2w::companion::scan::CliJob> scan_job;
 
     // The online-side network transport. Instantiating it constructs a live
     // QNetworkAccessManager, so this binary genuinely LINKS Qt6::Network — the
@@ -348,14 +300,44 @@ int main(int argc, char** argv) {
         out->setReadOnly(true);
         lay->addWidget(out);
 
-        auto cancel = std::make_shared<std::atomic<bool>>(false);
-        const std::vector<QPushButton*> busy = {scanBtn, preBtn, addBtn};
+        // The worker delivers to `out` only while it exists; closing the window
+        // cancels it and waits for it (aboutToQuit), and the job's destructor
+        // joins it in any case.
+        scan_job = std::make_shared<c2w::companion::scan::CliJob>(out);
+        const std::weak_ptr<c2w::companion::scan::CliJob> weak_job = scan_job;
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, [weak_job] {
+            if (auto j = weak_job.lock()) {
+                j->cancel();
+                j->wait(35000);
+            }
+        });
+        const std::vector<QPointer<QPushButton>> busy = {scanBtn, preBtn, addBtn};
+        auto run_cli = [weak_job, out, busy](const std::vector<std::string>& args) {
+            auto job = weak_job.lock();
+            if (!job) return;
+            std::string shown = "c2wallet-qt-schedd";
+            for (const std::string& a : args) shown += " " + a;
+            const QPointer<QPlainTextEdit> view(out);
+            if (!job->start(args, [view, busy](int rc, const std::string& text) {
+                    if (view) view->appendPlainText(qstr(text + "\n(exit " + std::to_string(rc) + ")\n"));
+                    for (const auto& b : busy)
+                        if (b) b->setEnabled(true);
+                })) {
+                out->appendPlainText("a command is still running (Cancel it first)");
+                return;
+            }
+            for (const auto& b : busy)
+                if (b) b->setEnabled(false);
+            out->setPlainText(qstr("running: " + shown + "\n"));
+        };
         auto source_args = [=](std::vector<std::string>& a) {
             const std::string src = sstr(source->currentText());
             a.insert(a.end(), {"--source", src});
             if (src != "c2pool") a.insert(a.end(), {"--dashd-url", sstr(dashdUrl->text()), "--dashd-auth-file", sstr(authFile->text())});
         };
-        QObject::connect(cancelBtn, &QPushButton::clicked, [cancel] { cancel->store(true); });
+        QObject::connect(cancelBtn, &QPushButton::clicked, [weak_job] {
+            if (auto j = weak_job.lock()) j->cancel();
+        });
         QObject::connect(scanBtn, &QPushButton::clicked, [=] {
             std::vector<std::string> a = {"--node-url", sstr(nodeUrl->text()), "scan"};
             for (const std::string& w : words(addresses->text())) a.insert(a.end(), {"--address", w});
@@ -373,7 +355,7 @@ int main(int argc, char** argv) {
                 if (scanplanFile->text().isEmpty()) scanplanFile->setText(outName->text() + ".scanplan.json");
             }
             if (c2wu->isChecked()) a.push_back("--emit-c2wu");
-            run_cli(out, busy, cancel, a);
+            run_cli(a);
         });
         auto pair_args = [=](std::vector<std::string>& a) {
             a.insert(a.end(), {"--hex", sstr(hexFile->text())});
@@ -391,7 +373,7 @@ int main(int argc, char** argv) {
             std::vector<std::string> a = globals();
             a.push_back("preflight");
             pair_args(a);
-            run_cli(out, busy, cancel, a);
+            run_cli(a);
         });
         QObject::connect(addBtn, &QPushButton::clicked, [=] {
             std::vector<std::string> a = globals();
@@ -399,7 +381,7 @@ int main(int argc, char** argv) {
             for (const std::string& t : words(parents->text())) a.insert(a.end(), {"--after-parent", t});
             a.push_back("--preflight");
             pair_args(a);
-            run_cli(out, busy, cancel, a);
+            run_cli(a);
         });
         tabs->addTab(page, "Scan & Plan");
     }

@@ -34,22 +34,54 @@ bool load_watch_state(const std::string& path, const std::string& network, Watch
 {
     out = WatchState{};
     out.network = network;
+    // Only a file that does not exist is a first run: any other failure is an
+    // error, so a permission problem cannot reset the state and re-fire the
+    // first-scan alert.
+    std::string text;
+#if defined(_WIN32)
     std::ifstream f(path, std::ios::binary);
-    if (!f) return true; // first run
+    if (!f) return true;
     std::stringstream ss;
     ss << f.rdbuf();
+    text = ss.str();
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno == ENOENT) return true; // first run
+        why = std::string(kWatchStateUnreadable) + ": " + path + " (" + std::strerror(errno) + ")";
+        return false;
+    }
+    char buf[65536];
+    for (;;) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            why = std::string(kWatchStateUnreadable) + ": " + path + " (" + std::strerror(errno) + ")";
+            ::close(fd);
+            return false;
+        }
+        if (n == 0) break;
+        text.append(buf, static_cast<size_t>(n));
+        if (text.size() > 64u * 1024u * 1024u) {
+            ::close(fd);
+            why = std::string(kWatchStateCorrupt) + ": " + path + " is implausibly large";
+            return false;
+        }
+    }
+    ::close(fd);
+#endif
     J j;
-    if (!sched::json::parse_bounded(ss.str(), j, why) || !j.is_object()) {
-        why = "watch state " + path + ": " + (why.empty() ? std::string("not a JSON object") : why);
+    if (!sched::json::parse_bounded(text, j, why) || !j.is_object()) {
+        why = std::string(kWatchStateCorrupt) + ": " + path + ": " + (why.empty() ? std::string("not a JSON object") : why);
         return false;
     }
     sched::json::Reader rd;
     if (rd.str(j, "schema", "watch") != kWatchSchema) {
-        why = "watch state " + path + ": schema is not " + std::string(kWatchSchema);
+        why = std::string(kWatchStateCorrupt) + ": " + path + ": schema is not " + std::string(kWatchSchema);
         return false;
     }
     if (rd.str(j, "network", "watch") != network) {
-        why = "watch state " + path + " is for another network";
+        why = std::string(kWatchStateCorrupt) + ": " + path + " is for another network";
         return false;
     }
     if (const J* arr = rd.arr(j, "addresses", "watch")) {
@@ -67,7 +99,7 @@ bool load_watch_state(const std::string& path, const std::string& network, Watch
         }
     }
     if (!rd.ok()) {
-        why = "watch state " + path + ": " + rd.err;
+        why = std::string(kWatchStateCorrupt) + ": " + path + ": " + rd.err;
         return false;
     }
     return true;
