@@ -2,6 +2,7 @@
 #include "ScanFiles.hpp"
 
 #include "../Produce.hpp"
+#include "../sched/InjectQueue.hpp" // kProjectedTipHashPrefix
 #include "../sched/Json.hpp"
 
 #include "../../family/bitcoin/dash/DashAddress.hpp"
@@ -10,6 +11,7 @@
 #include "Digest.hpp"
 
 #include <algorithm>
+#include <set>
 
 namespace c2w::companion::scan {
 
@@ -28,7 +30,33 @@ J int_or_null(int64_t v) { return v == 0 ? J(nullptr) : J(v); }
 
 std::string short_addr(const std::string& a) { return a.substr(0, std::min<size_t>(6, a.size())); }
 
+bool projected(const std::string& tip_hash)
+{
+    return tip_hash.rfind(sched::kProjectedTipHashPrefix, 0) == 0;
+}
+
 } // namespace
+
+void check_one_param_set(const Classification& cls, const ScanPlan& plan)
+{
+    const ClassifyParams& c = cls.params;
+    const PlanParams& p = plan.params;
+    std::string diff;
+    auto cmp = [&](const char* name, int64_t a, int64_t b) {
+        if (a != b) diff += std::string(diff.empty() ? "" : ", ") + name + " " + std::to_string(a) + " vs " + std::to_string(b);
+    };
+    cmp("target_height", cls.target_height, p.target_height);
+    cmp("min_confirmations", c.min_confirmations, p.min_confirmations);
+    cmp("dust_floor", c.dust_floor, p.dust_floor);
+    cmp("fee_mode", static_cast<int64_t>(c.fee_mode), static_cast<int64_t>(p.fee_mode));
+    cmp("fee_rate_per_byte", c.fee_rate_per_byte, p.fee_rate_per_byte);
+    cmp("key_encoding", static_cast<int64_t>(c.key_encoding), static_cast<int64_t>(p.key_encoding));
+    if (cls.address != plan.address || cls.tip_hash != plan.tip_hash)
+        diff += std::string(diff.empty() ? "" : ", ") + "address / tip";
+    if (!diff.empty())
+        throw ScanRefusal(cause::kBadParams, "the classification and the plan were made with different parameters (" +
+                                                 diff + "); derive both from one PlanParams (classify_params_of)");
+}
 
 std::string write_export_v1(const c2w::dash::UtxoImport& imp)
 {
@@ -90,6 +118,8 @@ FeeAdvice advise_fee_mode(const NodePosture& node, const ScanPlan& plan)
 std::string write_scan_plan(const ScanResult& scan, const Classification& cls, const ScanPlan& plan,
                             const std::string& utxos_file, const FeeAdvice& advice)
 {
+    check_one_param_set(cls, plan);
+    const bool proj = projected(plan.tip_hash);
     J doc = J::object();
     doc["schema"] = kScanPlanSchema;
     doc["coin"] = "dash";
@@ -104,6 +134,9 @@ std::string write_scan_plan(const ScanResult& scan, const Classification& cls, c
     src["cross_checked"] = scan.cross_checked;
     src["dashd"] = str_or_null(scan.dashd_detail);
     src["c2pool"] = str_or_null(scan.c2pool_detail);
+    // A stage-2 intake: the tip and every height are a projection of where
+    // stage 1 lands, not chain observations.
+    src["heights_projected"] = proj;
     doc["source"] = std::move(src);
 
     J cl = J::object();
@@ -176,6 +209,7 @@ std::string write_scan_plan(const ScanResult& scan, const Classification& cls, c
         o["est_signed_bytes"] = b.est_signed_bytes;
         o["unsigned_sha256d"] = str_or_null(b.unsigned_sha256d);
         o["inputs_sha256"] = str_or_null(b.inputs_sha256);
+        o["heights_projected"] = proj || !b.depends_on.empty();
         batches.push_back(std::move(o));
     }
     ex["batches"] = std::move(batches);
@@ -196,8 +230,15 @@ std::string write_report(const ScanResult& scan, const Classification& cls, cons
                          const FeeAdvice& advice, const std::string& name)
 {
     using c2w::dash::format_dash;
+    check_one_param_set(cls, plan);
+    const bool proj = projected(plan.tip_hash);
     std::string s;
     s += "c2wallet-qt companion: scan & plan report\n";
+    if (proj)
+        s += "HEIGHTS ARE PROJECTED: this is a stage-2 intake. Its rows are the outputs of stage-1 txs that are\n"
+             "signed but not mined, dated at the projected landing height " + plan.tip_hash.substr(10) + ";\n"
+             "nothing below was observed on chain. The add lines name every stage-1 parent with\n"
+             "--after-parent; the scheduler refuses this manifest without them.\n";
     s += "address:        " + plan.address + (plan.testnet ? " (testnet)\n" : " (mainnet)\n");
     s += "source:         " + scan.source + (scan.cross_checked ? " (cross-checked)" : " (single source, NOT cross-checked)") +
          "\n";
@@ -265,6 +306,11 @@ std::string write_report(const ScanResult& scan, const Classification& cls, cons
         if (plan.safe_from_height > plan.tip_height + 2)
             line += " --expiry-blocks " + std::to_string(plan.safe_from_height - plan.tip_height + 576);
         for (int d : b.depends_on) line += " --after-parent <stage-1 txid " + std::to_string(d) + ">:1";
+        if (proj) {
+            std::set<std::string> parents;
+            for (const Utxo& u : b.inputs) parents.insert(u.txid);
+            for (const std::string& t : parents) line += " --after-parent " + t + ":1";
+        }
         if (!b.depends_on.empty())
             line = "# stage 2: write its intake from the stage-1 txids, re-plan it in the signer, then\n" + line;
         s += line + "\n";

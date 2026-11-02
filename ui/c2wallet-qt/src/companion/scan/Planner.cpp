@@ -8,6 +8,8 @@
 #include "../../family/bitcoin/dash/GovCollateral.hpp"
 #include "../../family/bitcoin/dash/UtxoIntake.hpp"
 
+#include "../sched/InjectQueue.hpp" // kProjectedTipHashPrefix
+
 #include "Digest.hpp"
 
 #include <algorithm>
@@ -104,6 +106,18 @@ std::string plan_identity_text(const ScanPlan& p)
 [[noreturn]] void refuse(const std::string& why) { throw ScanRefusal(cause::kPlanRefused, why); }
 
 } // namespace
+
+ClassifyParams classify_params_of(const PlanParams& p)
+{
+    ClassifyParams c;
+    c.target_height = p.target_height;
+    c.min_confirmations = p.min_confirmations;
+    c.dust_floor = p.dust_floor;
+    c.fee_mode = p.fee_mode;
+    c.fee_rate_per_byte = p.fee_rate_per_byte;
+    c.key_encoding = p.key_encoding;
+    return c;
+}
 
 std::string inputs_digest(const std::vector<Utxo>& inputs)
 {
@@ -278,6 +292,7 @@ std::string stage2_export(const ScanPlan& plan, const std::vector<std::string>& 
     imp.address = plan.address;
     imp.testnet = plan.testnet;
     imp.tip_height = landing_height;
+    imp.tip_hash = std::string(sched::kProjectedTipHashPrefix) + std::to_string(landing_height);
     imp.coinbase_flags = true;
     for (size_t i = 0; i < k; ++i) {
         if (!is_hex64(stage1_txids[i]))

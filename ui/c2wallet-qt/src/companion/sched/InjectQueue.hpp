@@ -25,6 +25,14 @@ namespace c2w::companion::sched {
 inline constexpr const char* kQueueSchema = "c2wallet-inject-queue/1";
 inline constexpr const char* kManifestSchema = "c2wallet-inject-manifest/1";
 
+// The tip hash a stage-2 intake carries (Scan & Plan, a two-stage plan): its
+// rows are the outputs of stage-1 txs that were signed but not yet mined,
+// dated at a PROJECTED landing height, "projected:<height>". The signer copies
+// it into the manifest's maturity.screen_tip_hash; enqueue then refuses the
+// manifest unless every input's parent is an after_parent (the heights were
+// never observed, only the parents' finality can stand for them).
+inline constexpr const char* kProjectedTipHashPrefix = "projected:";
+
 inline constexpr size_t kMaxAttempts = 50;
 inline constexpr size_t kMaxJournal = 200;
 inline constexpr size_t kMaxAlerts = 50;

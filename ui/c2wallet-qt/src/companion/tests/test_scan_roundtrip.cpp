@@ -89,7 +89,7 @@ static CompanionOut companion(const std::vector<Row>& rows, int64_t tip, const P
     SourceC2pool sc(n);
     CompanionOut o;
     o.scan = scan_both(sd, sc, {rows[0].address}, ScanOptions{}, CrossCheckOptions{});
-    o.cls = classify(o.scan.imports.at(0), o.scan.mempool_spent, {}, ClassifyParams{});
+    o.cls = classify(o.scan.imports.at(0), o.scan.mempool_spent, {}, classify_params_of(pp));
     o.plan = make_plan(o.cls.exportable, pp);
     o.export_text = write_export_v1(o.cls.exportable);
     o.sidecar_text = write_scan_plan(o.scan, o.cls, o.plan, o.export_text, FeeAdvice{});

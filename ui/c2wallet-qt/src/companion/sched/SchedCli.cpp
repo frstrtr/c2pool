@@ -10,6 +10,8 @@
 #include "TokenFile.hpp"
 #include "Triggers.hpp"
 
+#include "../scan/ScanCli.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -389,10 +391,15 @@ int cmd_init(Ctx& c, const std::vector<std::string>& v)
     return kExitOk;
 }
 
-int cmd_add(Ctx& c, const std::vector<std::string>& v)
+int cmd_add(Ctx& c, const std::vector<std::string>& v_in)
 {
     Args a;
     std::string why;
+    // Scan & Plan: add ... --preflight [preflight options] checks the pair
+    // right before it is queued (scan/ScanCli).
+    std::vector<std::string> v;
+    scan::cli::AddPreflight pf;
+    if (!scan::cli::split_add_preflight(v_in, v, pf, why)) return usage_error(c, why);
     if (!parse_args(v, 1, {"--no-manifest", "--no-discover-parents", "--allow-unconfirmed-parent", "--auto-renew", "--pause"},
                     {"--hex", "--manifest", "--line", "--label", "--after-parent", "--not-before-height",
                      "--not-before-time", "--h0", "--maturity-slack", "--inputs-known-mature", "--expiry-blocks",
@@ -425,6 +432,16 @@ int cmd_add(Ctx& c, const std::vector<std::string>& v)
             manifest_note = "manifest: auto-located " + mp;
         } else {
             manifest_note = "manifest: none beside the hex (" + mp + "); bare hex";
+        }
+    }
+
+    std::string forced_reason, preflight_summary;
+    if (pf.requested) {
+        const int prc = scan::cli::preflight_for_add(pf, req.hex_text, req.manifest_text, c.env, c.g, c.path,
+                                                     forced_reason, preflight_summary);
+        if (prc != kExitOk) {
+            c.err() << "refused: the preflight did not pass; nothing was queued\n";
+            return prc;
         }
     }
 
@@ -516,6 +533,13 @@ int cmd_add(Ctx& c, const std::vector<std::string>& v)
                 w = er.why;
                 return false;
             }
+            if (pf.requested)
+                for (const std::string& id : er.ids)
+                    if (Item* it = find_item(q, id)) {
+                        journal(*it, format_utc(c.now()), "preflight", preflight_summary);
+                        if (!forced_reason.empty())
+                            journal(*it, format_utc(c.now()), "preflight_forced", "operator reason: " + forced_reason);
+                    }
             after = q;
             return true;
         },
@@ -952,7 +976,8 @@ std::string default_queue_path()
     return base + "/c2wallet-qt/companion/queue.json";
 }
 
-const char* usage_text()
+namespace {
+const char* sched_usage_text()
 {
     return R"(c2wallet-qt-schedd - headless inject scheduler for a local c2pool DASH node (key-free).
 
@@ -972,6 +997,8 @@ commands:
       [--h0 H] [--maturity-slack N] [--inputs-known-mature "<consent text>"]
       [--expiry-blocks N] [--max-fee DUFFS] [--auto-resubmit-max N] [--auto-renew]
       [--allow-auto-arm yes|no] [--pause]
+      [--preflight [--utxos FILE] [--scanplan FILE] [--source dashd|c2pool|both|none]
+       [--dashd-url URL --dashd-auth-file PATH] [--no-validate] [--force "<reason>"]]
         queue each line of a signed .hex (the sibling NAME.manifest.json is used when present).
         Maturity comes from the manifest, or from --h0 (youngest input height, coinbase rule
         h0+100); without either, --not-before-height or --inputs-known-mature is required.
@@ -994,6 +1021,13 @@ commands:
 
 exit codes: 0 ok, 1 refused / attention, 2 usage or config error, 3 queue unreadable, 4 lock held
 )";
+}
+} // namespace
+
+const char* usage_text()
+{
+    static const std::string text = std::string(sched_usage_text()) + "\n" + scan::cli::usage_text();
+    return text.c_str();
 }
 
 int run(const std::vector<std::string>& args, Env& env)
@@ -1026,6 +1060,7 @@ int run(const std::vector<std::string>& args, Env& env)
     if (cmd == "ack-alerts") return cmd_ack_alerts(c, v);
     if (cmd == "status") return cmd_status(c, v);
     if (cmd == "run") return cmd_run(c, v);
+    if (scan::cli::is_scan_command(cmd)) return scan::cli::run(v, env, g, c.path);
     err << "usage: unknown command '" << cmd << "'\n" << usage_text();
     return kExitUsage;
 }

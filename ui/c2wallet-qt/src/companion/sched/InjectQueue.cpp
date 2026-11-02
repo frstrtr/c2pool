@@ -940,6 +940,7 @@ struct ManifestView {
     std::optional<int64_t> youngest_input_height;
     bool maturity_known = false;  // every input height present and safe_from_height set
     int64_t inputs_with_unknown_height = 0;
+    std::string screen_tip_hash;  // maturity.screen_tip_hash ("" when null)
 };
 
 bool parse_manifest(const std::string& text, const std::string& network, ManifestView& mv, std::string& why)
@@ -993,6 +994,7 @@ bool parse_manifest(const std::string& text, const std::string& network, Manifes
     if (const J* m = rd.obj(root, "maturity", "manifest")) {
         mv.safe_from_height = rd.oi64(*m, "safe_from_height", "manifest.maturity");
         mv.youngest_input_height = rd.oi64(*m, "youngest_input_height", "manifest.maturity");
+        mv.screen_tip_hash = rd.str(*m, "screen_tip_hash", "manifest.maturity");
     }
     if (!rd.ok()) {
         why = rd.err;
@@ -1214,6 +1216,29 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
                 r.notes.push_back(it.id + ": after_parent pre-filled from input " + short_txid(in.txid) +
                                   " (queued as " + find_item_by_txid(staged, in.txid)->id + ")");
             }
+        }
+        // A stage-2 manifest (Scan & Plan two-stage plan): its inputs are the
+        // outputs of txs that were not mined when it was planned, and its
+        // heights are a projection. Only the parents' finality can stand for
+        // them, so every parent must be an after_parent (explicit, or a queued
+        // item discovered above).
+        if (have_manifest && mv.screen_tip_hash.rfind(kProjectedTipHashPrefix, 0) == 0) {
+            std::vector<std::string> missing;
+            for (const ManifestInput& in : mv.txs[idx].inputs) {
+                const bool named = std::any_of(it.triggers.after_parent.begin(), it.triggers.after_parent.end(),
+                                               [&](const ParentReq& p) { return p.txid == in.txid; });
+                if (!named && std::find(missing.begin(), missing.end(), in.txid) == missing.end())
+                    missing.push_back(in.txid);
+            }
+            if (!missing.empty()) {
+                std::string list;
+                for (const std::string& m : missing) list += (list.empty() ? "" : ", ") + m;
+                return refuse(ln + ": the manifest's heights are projected (maturity.screen_tip_hash \"" +
+                              mv.screen_tip_hash + "\": a stage-2 tx spending outputs that were not mined when it "
+                              "was planned); name every parent with --after-parent TXID (missing: " + list + ")");
+            }
+            journal(it, at, "projected_heights",
+                    "stage-2 manifest (" + mv.screen_tip_hash + "): every parent is an after_parent");
         }
         for (const ParentReq& p : it.triggers.after_parent) {
             if (p.txid == txid) return refuse(ln + ": a tx cannot be its own parent");

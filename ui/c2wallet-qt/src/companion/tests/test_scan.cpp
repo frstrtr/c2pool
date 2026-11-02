@@ -26,11 +26,13 @@
 #include "../scan/Classifier.hpp"
 #include "../scan/CrossCheck.hpp"
 #include "../scan/Planner.hpp"
+#include "../scan/Preflight.hpp"
 #include "../scan/RpcApi.hpp"
 #include "../scan/ScanFiles.hpp"
 #include "../scan/ScanTypes.hpp"
 #include "../scan/SourceC2pool.hpp"
 #include "../scan/SourceDashd.hpp"
+#include "../scan/Watch.hpp"
 
 #include "../sched/InjectQueue.hpp"
 #include "../sched/NodeApi.hpp"
@@ -45,7 +47,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -56,6 +60,8 @@
 #include <string>
 #include <tuple>
 #include <vector>
+
+#include <unistd.h>
 
 using oj = nlohmann::ordered_json;
 
@@ -733,10 +739,10 @@ static void k13_sidecar_deterministic()
     SourceDashd sd(d);
     SourceC2pool sc(n);
     const ScanResult r = scan_both(sd, sc, {kXdgf}, ScanOptions{}, CrossCheckOptions{});
-    const Classification c = classify(r.imports[0], r.mempool_spent, {}, ClassifyParams{});
     PlanParams pp;
     pp.max_inputs_per_tx = 600;
     pp.key_encoding = dash::PubkeyEncoding::Compressed;
+    const Classification c = classify(r.imports[0], r.mempool_spent, {}, classify_params_of(pp));
     const ScanPlan p = make_plan(c.exportable, pp);
     const std::string ex = write_export_v1(c.exportable);
     NodePosture np;
@@ -830,7 +836,8 @@ static void k14_two_stage_collateral()
     CHECK(runs([&] { back = dash::parse_utxo_export_v1(s2x, false); }, "parse"), "the signer imports it");
     CHECK(back.utxos.size() == 2 && back.coinbase_flags && back.utxos[0].coinbase == false &&
               back.utxos[0].satoshis == two.batches[0].value_out && back.utxos[1].txid == txids[1] && back.utxos[1].vout == 0 &&
-              back.tip_height == tip + 2 && back.utxos[0].confirmations == 1 && back.tip_hash.empty(),
+              back.tip_height == tip + 2 && back.utxos[0].confirmations == 1 &&
+              back.tip_hash == "projected:" + std::to_string(tip + 2),
           "stage-1 outputs, coinbase false, dated at the landing height");
     ScanPlan fin;
     CHECK(runs([&] { fin = make_plan(back, coll); }, "plan") && !fin.two_stage && fin.batches.size() == 1 &&
@@ -889,6 +896,344 @@ static void k15_c2wu()
           "a stage-2 batch has no container yet");
 }
 
+// ── S-C: K17 one parameter set (review L2) ──────────────────────────────────
+static void k17_one_parameter_set()
+{
+    std::printf("[K17 the classification and the plan come from one PlanParams (L2)]\n");
+    FakeDashd d;
+    d.rows = fixture_rows();
+    const ScanResult r = dashd_scan(d);
+    PlanParams pp;
+    pp.key_encoding = dash::PubkeyEncoding::Compressed;
+    pp.min_confirmations = 150;
+    pp.dust_floor = 2000;
+    pp.fee_mode = dash::FeeMode::Relay;
+    pp.fee_rate_per_byte = 2;
+    pp.target_height = kTip + 5;
+    const ClassifyParams cp = classify_params_of(pp);
+    CHECK(cp.key_encoding == pp.key_encoding && cp.min_confirmations == 150 && cp.dust_floor == 2000 &&
+              cp.fee_mode == pp.fee_mode && cp.fee_rate_per_byte == 2 && cp.target_height == kTip + 5,
+          "classify_params_of copies every shared field");
+    const Classification good = classify(r.imports[0], r.mempool_spent, {}, cp);
+    const ScanPlan plan = make_plan(good.exportable, pp);
+    const std::string ex = write_export_v1(good.exportable);
+    std::string side;
+    CHECK(runs([&] { side = write_scan_plan(r, good, plan, ex, FeeAdvice{}); }, "sidecar"), "derived pair: the sidecar is written");
+    const oj j = oj::parse(side);
+    CHECK(j["classify"]["target_height"] == j["params"]["target_height"] &&
+              j["classify"]["dust_floor"] == j["params"]["dust_floor"],
+          "classify.* and params.* agree in the file");
+    std::string what;
+    const Classification other = classify(r.imports[0], r.mempool_spent, {}, ClassifyParams{});
+    CHECK(refuses([&] { write_scan_plan(r, other, plan, ex, FeeAdvice{}); }, cause::kBadParams, &what) &&
+              what.find("min_confirmations 101 vs 150") != std::string::npos && what.find("key_encoding") != std::string::npos,
+          "a classification made with other parameters is refused, every differing field named");
+    CHECK(refuses([&] { write_report(r, other, plan, FeeAdvice{}, "x"); }, cause::kBadParams), "the report refuses it too");
+    ClassifyParams one_off = cp;
+    one_off.dust_floor = 1000;
+    CHECK(refuses([&] { write_scan_plan(r, classify(r.imports[0], r.mempool_spent, {}, one_off), plan, ex, FeeAdvice{}); },
+                  cause::kBadParams, &what) &&
+              what.find("dust_floor 1000 vs 2000") != std::string::npos,
+          "one field off is enough");
+}
+
+// ── S-C: K18 stage-2 fence (review M1) ──────────────────────────────────────
+static void k18_stage2_fence()
+{
+    std::printf("[K18 a stage-2 intake is marked projected and queued only behind --after-parent (M1)]\n");
+    const int64_t tip = 2600000;
+    PlanParams coll;
+    coll.mode = PlanMode::Collateral;
+    coll.gov_hash = kGovHash;
+    const dash::UtxoImport big = import_of(synthetic_rows(kXdgf, 700, 200000, 2500000), tip);
+    const ScanPlan two = make_plan(big, coll);
+    const oj s1 = oj::parse(write_scan_plan(ScanResult{}, classify(big, {}, {}, classify_params_of(coll)), two,
+                                            write_export_v1(big), FeeAdvice{}));
+    CHECK(s1["source"]["heights_projected"] == false && s1["expected"]["batches"][0]["heights_projected"] == false &&
+              s1["expected"]["batches"][2]["heights_projected"] == true,
+          "stage-1 sidecar: stage 1 observed, the stage-2 batch projected");
+    const std::vector<std::string> txids = {sha_hex("K18 stage-1 tx 1"), sha_hex("K18 stage-1 tx 2")};
+    const std::string s2x = stage2_export(two, txids, tip + 2);
+    const dash::UtxoImport imp2 = dash::parse_utxo_export_v1(s2x, false);
+    CHECK(imp2.tip_hash == "projected:2600002", "the intake's tip hash is the projected marker");
+    PlanParams coll2 = coll;
+    const Classification cls2 = classify(imp2, {}, {}, classify_params_of(coll2));
+    const ScanPlan plan2 = make_plan(imp2, coll2);
+    ScanResult r2;
+    r2.source = "stage2-intake";
+    r2.tip_height = imp2.tip_height;
+    r2.tip_hash = imp2.tip_hash;
+    const oj side2 = oj::parse(write_scan_plan(r2, cls2, plan2, s2x, FeeAdvice{}));
+    CHECK(side2["source"]["heights_projected"] == true && side2["expected"]["batches"][0]["heights_projected"] == true,
+          "stage-2 sidecar: heights_projected");
+    const std::string rep2 = write_report(r2, cls2, plan2, FeeAdvice{}, "s2");
+    CHECK(rep2.rfind("c2wallet-qt companion: scan & plan report\nHEIGHTS ARE PROJECTED", 0) == 0 &&
+              rep2.find("--after-parent " + txids[0] + ":1") != std::string::npos &&
+              rep2.find("--after-parent " + txids[1] + ":1") != std::string::npos,
+          "the report says so first and its add line names both stage-1 parents");
+
+    // The signer's manifest carries the marker; enqueue fences it.
+    const std::string line = fake_signed(plan2.batches.at(0));
+    const std::string hexfile = line + "\n";
+    const std::string man = manifest_for(plan2, hexfile, {line});
+    CHECK(man.find("\"screen_tip_hash\": \"projected:2600002\"") != std::string::npos, "the manifest carries the marker");
+    sched::EnqueueRequest req;
+    req.hex_text = hexfile;
+    req.manifest_text = man;
+    sched::Queue q;
+    sched::EnqueueResult er = sched::enqueue(q, req, 1793600000);
+    CHECK(!er.ok && er.why.find("projected") != std::string::npos && er.why.find(txids[0]) != std::string::npos &&
+              er.why.find(txids[1]) != std::string::npos && q.items.empty(),
+          "no --after-parent: refused, both missing parents named, nothing queued");
+    req.after_parent = {{txids[0], 1}};
+    er = sched::enqueue(q, req, 1793600000);
+    CHECK(!er.ok && er.why.find(txids[1]) != std::string::npos && er.why.find(txids[0]) == std::string::npos,
+          "one parent named: still refused for the other");
+    req.after_parent = {{txids[0], 1}, {txids[1], 1}};
+    er = sched::enqueue(q, req, 1793600000);
+    bool journaled = false;
+    if (er.ok)
+        for (const auto& je : q.items[0].journal) journaled |= je.event == "projected_heights";
+    CHECK(er.ok && q.items.size() == 1 && q.items[0].triggers.after_parent.size() == 2 && journaled,
+          "every parent named: queued behind both, journaled");
+    // A stage-1 manifest (observed tip) needs no parent, as before.
+    const std::string l1 = fake_signed(two.batches.at(0));
+    sched::EnqueueRequest r1;
+    r1.hex_text = l1 + "\n";
+    r1.manifest_text = manifest_for(two, r1.hex_text, {l1});
+    sched::Queue q1;
+    CHECK(sched::enqueue(q1, r1, 1793600000).ok, "an observed-tip manifest queues without a parent");
+}
+
+// ── S-C: K19 cancel (review L5) ─────────────────────────────────────────────
+static void k19_cancel()
+{
+    std::printf("[K19 cancel: scantxoutset abort, the gettxout pass, the node scan (L5)]\n");
+    bool cancel = false;
+    ScanOptions so;
+    so.cancelled = [&] { return cancel; };
+    {
+        FakeDashd d;
+        d.rows = fixture_rows();
+        d.addressindex = false;
+        d.long_hook = [&](FakeDashd&) { cancel = true; }; // Cancel pressed while scantxoutset runs
+        SourceDashd s(d);
+        std::string what;
+        CHECK(refuses([&] { s.scan({kXdgf}, so); }, cause::kCancelled, &what) && what.find("abort") != std::string::npos,
+              "cancel during scantxoutset: scan-cancelled");
+        size_t aborts = 0;
+        for (const std::string& p : d.params_log) aborts += p == R"(["abort"])";
+        CHECK(d.aborts == 1 && aborts == 1 && d.count("gettxout") == 0, "exactly one scantxoutset \"abort\" sent; nothing after it");
+    }
+    cancel = false;
+    {
+        FakeDashd d;
+        d.rows = fixture_rows();
+        int n = 0;
+        d.hook = [&](FakeDashd&, const std::string& m) { if (m == "gettxout" && ++n == 10) cancel = true; };
+        SourceDashd s(d);
+        CHECK(refuses([&] { s.scan({kXdgf}, so); }, cause::kCancelled) && d.count("gettxout") == 10,
+              "cancel during the gettxout pass: stops before the next call");
+    }
+    cancel = true;
+    {
+        FakeDashd d;
+        d.rows = fixture_rows();
+        SourceDashd s(d);
+        CHECK(refuses([&] { s.scan({kXdgf}, so); }, cause::kCancelled) && d.calls.empty(), "cancelled before: no call at all");
+    }
+    cancel = false;
+    {
+        FakeUtxoNode n;
+        n.rows = fixture_rows();
+        n.hook = [&](FakeUtxoNode& m) {
+            cancel = true;          // the operator's cancel ...
+            m.fail_transport = true; // ... aborts the GET on our side
+        };
+        SourceC2pool s(n);
+        std::string what;
+        CHECK(refuses([&] { s.scan({kXdgf}, so); }, cause::kCancelled, &what) && what.find("rate window") != std::string::npos,
+              "node scan cancelled: scan-cancelled, the rate window named");
+    }
+    cancel = false;
+    {
+        FakeDashd d;
+        d.rows = fixture_rows();
+        d.addressindex = false;
+        d.long_hook = [&](FakeDashd&) { cancel = true; };
+        FakeUtxoNode n;
+        n.rows = fixture_rows();
+        SourceDashd sd(d);
+        SourceC2pool sc(n);
+        CrossCheckOptions single;
+        single.allow_single_source = true;
+        CHECK(refuses([&] { scan_both(sd, sc, {kXdgf}, so, single); }, cause::kCancelled) && n.paths.empty(),
+              "a cancel is never downgraded to a single-source scan");
+    }
+}
+
+// ── S-C: K20 preflight ──────────────────────────────────────────────────────
+static void k20_preflight()
+{
+    std::printf("[K20 preflight: structure, reconciliation, still unspent, the node's dry run]\n");
+    const std::vector<Row> rows = fixture_rows();
+    FakeDashd d;
+    d.rows = rows;
+    FakeUtxoNode n;
+    n.rows = rows;
+    n.post_handler = [](const std::string&, const std::string& body) { return validate_reply(body); };
+    SourceDashd sd(d);
+    SourceC2pool sc(n);
+    const ScanResult r = scan_both(sd, sc, {kXdgf}, ScanOptions{}, CrossCheckOptions{});
+    PlanParams pp;
+    const Classification cls = classify(r.imports[0], r.mempool_spent, {}, classify_params_of(pp));
+    const ScanPlan plan = make_plan(cls.exportable, pp);
+    const std::string ex = write_export_v1(cls.exportable);
+    const std::string side = write_scan_plan(r, cls, plan, ex, FeeAdvice{});
+    const std::string line = fake_signed(plan.batches.at(0));
+    TxIO io;
+    std::string why;
+    CHECK(parse_tx_io(line, io, why) && io.unsigned_sha256d == plan.batches[0].unsigned_sha256d && io.inputs.size() == 128,
+          "parse_tx_io: blanking the scriptSigs gives the planned unsigned digest");
+    PreflightInput in;
+    in.hex_text = line + "\n";
+    in.manifest_text = manifest_for(plan, in.hex_text, {line});
+    in.utxos_text = ex;
+    in.scanplan_text = side;
+    const c2w::secure::SecureString token(std::string("PREFLIGHT-KAT-TOKEN-0123456789abcdef0123"));
+    PreflightOptions opt;
+    PreflightReport rep = run_preflight(in, opt, &sd, &sc, &n, &token);
+    CHECK(rep.ok && !rep.forced && rep.refusals.empty(), "a clean pair passes");
+    CHECK(rep.text().find("(a) 1 signed tx(s)") != std::string::npos && rep.text().find("(b) every manifest input (128)") != std::string::npos &&
+              rep.text().find("compared with the planned unsigned digests") != std::string::npos &&
+              rep.text().find("(c) dashd: 128 input(s)") != std::string::npos &&
+              rep.text().find("(c) node: 128 input(s)") != std::string::npos &&
+              rep.text().find("(d) tx 1: the node would admit it") != std::string::npos,
+          "every check (a)-(d) reported");
+    CHECK(n.posts.size() == 1 && n.posts[0].first == kValidateRoute &&
+              n.posts[0].second.find("\"control_token\":\"PREFLIGHT-KAT-TOKEN") == 1 &&
+              n.posts[0].second.find("\"raw_tx\":\"" + line + "\"") != std::string::npos,
+          "the dry run posts the token-gated submit body");
+
+    // (c) an input spent since the scan, on either source: refused, never forceable.
+    const dash::Utxo& in0 = plan.batches[0].inputs[0];
+    d.spent.insert({in0.txid, in0.vout});
+    PreflightOptions forced = opt;
+    forced.force_reason = "operator says so";
+    rep = run_preflight(in, forced, &sd, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("on dashd: spent") != std::string::npos, "dashd: a spent input refuses, even with --force");
+    d.spent.clear();
+    n.spent.insert({in0.txid, in0.vout});
+    rep = run_preflight(in, opt, nullptr, &sc, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("spent by a tx in the node's mempool") != std::string::npos, "node: a mempool spend refuses");
+    n.spent.clear();
+    d.value_override[{in0.txid, in0.vout}] = in0.satoshis + 1;
+    rep = run_preflight(in, opt, &sd, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("value") != std::string::npos, "dashd: a changed value refuses");
+    d.value_override.clear();
+
+    // (d) the dry run's answers.
+    auto with_node = [&](std::function<sched::HttpReply(const std::string&, const std::string&)> h, const PreflightOptions& o) {
+        n.post_handler = std::move(h);
+        return run_preflight(in, o, nullptr, nullptr, &n, &token);
+    };
+    rep = with_node([](const std::string&, const std::string&) { return sched::HttpReply{true, 404, "Not Found", ""}; }, opt);
+    CHECK(rep.ok && rep.text().find("notice: (d) validate: the node has no dry-run route") != std::string::npos,
+          "404: skipped with a notice (older node)");
+    rep = with_node([](const std::string&, const std::string&) {
+        return sched::HttpReply{true, 200, R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"bad"},"id":null})", ""};
+    }, opt);
+    CHECK(rep.ok && rep.text().find("without a dry-run reply") != std::string::npos, "a non-dry-run answer: notice");
+    const nj conflict = {{"conflicts", nj::array({{{"txid", in0.txid}, {"vout", in0.vout}, {"spent_by", sha_hex("pool tx")}}})}};
+    rep = with_node([&](const std::string&, const std::string& b) { return validate_reply(b, "inject-input-spent-in-mempool", conflict); }, opt);
+    CHECK(!rep.ok && rep.text().find("inject-input-spent-in-mempool") != std::string::npos &&
+              rep.text().find("already spent by pool tx " + sha_hex("pool tx")) != std::string::npos,
+          "a dry-run cause refuses, naming the conflicting pool tx");
+    rep = with_node([&](const std::string&, const std::string& b) { return validate_reply(b, "inject-input-spent-in-mempool", conflict); }, forced);
+    CHECK(rep.ok && rep.forced && rep.text().find("warning: FORCED (operator says so)") != std::string::npos,
+          "--force turns it into a warning");
+    rep = with_node([&](const std::string&, const std::string& b) { return validate_reply(b, "inject-tip-unknown"); }, opt);
+    CHECK(rep.ok && rep.text().find("transient") != std::string::npos, "inject-tip-unknown: a warning, the scheduler waits");
+    rep = with_node([&](const std::string&, const std::string& b) {
+        nj j = nj::parse(validate_reply(b).body);
+        j["txid"] = sha_hex("another tx");
+        return sched::HttpReply{true, 200, j.dump(), ""};
+    }, forced);
+    CHECK(!rep.ok && rep.text().find("analysed txid") != std::string::npos, "a dry run of another txid refuses, even forced");
+    rep = run_preflight(in, opt, nullptr, nullptr, &n, nullptr);
+    CHECK(rep.ok && rep.text().find("needs the node's control token") != std::string::npos, "no token: the dry run is skipped");
+
+    // (b) the pair is not the plan, or not the export.
+    PlanParams split;
+    split.max_inputs_per_tx = 85;
+    const ScanPlan plan85 = make_plan(cls.exportable, split);
+    PreflightInput other = in;
+    other.scanplan_text = write_scan_plan(r, cls, plan85, ex, FeeAdvice{});
+    rep = run_preflight(other, opt, nullptr, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("is not the planned tx") != std::string::npos, "another plan's sidecar: digest mismatch");
+    rep = run_preflight(other, forced, nullptr, nullptr, nullptr, nullptr);
+    CHECK(rep.ok && rep.forced, "forceable (the signer may have planned with another key encoding)");
+    PreflightInput moved = in;
+    moved.hex_text = in.hex_text + "\n";
+    rep = run_preflight(moved, forced, nullptr, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("hex_file_sha256") != std::string::npos, "a hex file the manifest does not bind refuses");
+    PreflightInput wrong_export = in;
+    wrong_export.utxos_text = write_export_v1(import_of(synthetic_rows(kXdgf, 3, 50000, 2500000), kTip));
+    wrong_export.scanplan_text.reset();
+    rep = run_preflight(wrong_export, forced, nullptr, nullptr, nullptr, nullptr);
+    CHECK(!rep.ok && rep.text().find("is not a row of the utxos file") != std::string::npos,
+          "a manifest input that is not an export row refuses");
+}
+
+// ── S-C: K21 the maturity watch ─────────────────────────────────────────────
+static void k21_watch()
+{
+    std::printf("[K21 watch: arrivals with ETA, one alert per crossing]\n");
+    FakeDashd d;
+    d.rows = fixture_rows();
+    const ScanResult r = dashd_scan(d);
+    WatchPolicy pol;
+    pol.min_mature = 110;
+    ClassifyParams strict;
+    strict.min_confirmations = 2000; // 108 mature, 20 immature
+    WatchAddress st;
+    st.address = kXdgf;
+    WatchStep s = watch_step(st, classify(r.imports[0], {}, {}, strict), pol);
+    CHECK(s.first_scan && s.arrivals.size() == 170 && s.arriving_immature.size() == 20 && s.mature == 108 && !s.alert,
+          "first scan: every row new, 20 immature with ETA, 108 mature < 110: no alert");
+    s = watch_step(st, classify(r.imports[0], {}, {}, ClassifyParams{}), pol);
+    CHECK(!s.first_scan && s.arrivals.empty() && s.mature == 128 && s.alert &&
+              s.alert_text.find("128 mature UTXOs, 0.60963663 DASH") != std::string::npos,
+          "128 mature >= 110: the alert, once");
+    s = watch_step(st, classify(r.imports[0], {}, {}, ClassifyParams{}), pol);
+    CHECK(s.policy_holds && !s.alert, "still holding: no second alert");
+    const dash::UtxoImport swept = import_of(synthetic_rows(kXdgf, 5, 50000, 2500000), kTip);
+    s = watch_step(st, classify(swept, {}, {}, ClassifyParams{}), pol);
+    CHECK(!s.policy_holds && !s.alert && s.arrivals.size() == 5 && !st.alerted, "after a sweep: below the policy, re-armed");
+    s = watch_step(st, classify(r.imports[0], {}, {}, ClassifyParams{}), pol);
+    CHECK(s.alert, "the next crossing alerts again");
+    WatchPolicy by_value;
+    by_value.min_mature = SIZE_MAX;
+    by_value.min_value = 60000000;
+    WatchAddress sv;
+    CHECK(watch_step(sv, classify(r.imports[0], {}, {}, ClassifyParams{}), by_value).alert, "a value policy: 0.6096 DASH >= 0.6");
+
+    char tmpl[] = "/tmp/c2w-watch-kat-XXXXXX";
+    const int fd = ::mkstemp(tmpl);
+    if (fd >= 0) ::close(fd);
+    ::unlink(tmpl);
+    WatchState ws;
+    ws.entry(kXdgf) = st;
+    std::string why;
+    WatchState back;
+    CHECK(save_watch_state(tmpl, ws, why) && load_watch_state(tmpl, "mainnet", back, why) && back.addresses.size() == 1 &&
+              back.addresses[0].known == st.known && back.addresses[0].alerted == st.alerted &&
+              back.addresses[0].last_tip == kTip,
+          "the state file round-trips");
+    CHECK(!load_watch_state(tmpl, "testnet", back, why), "another network's state is refused");
+    ::unlink(tmpl);
+}
+
 // ── the export_utxos.py parity hook ─────────────────────────────────────────
 static int write_mock_export(const char* out)
 {
@@ -931,6 +1276,11 @@ int main(int argc, char** argv)
     k13_sidecar_deterministic();
     k14_two_stage_collateral();
     k15_c2wu();
+    k17_one_parameter_set();
+    k18_stage2_fence();
+    k19_cancel();
+    k20_preflight();
+    k21_watch();
     std::printf("\n== scan KATs: %d passed, %d failed ==\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

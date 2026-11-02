@@ -72,7 +72,14 @@ ScanResult SourceC2pool::scan(const std::vector<std::string>& addresses, const S
     const std::vector<AddressScript> scripts = address_scripts(addresses, opt.testnet);
     const std::string path = utxo_scan_path(addresses, true);
     for (int attempt = 1;; ++attempt) {
+        if (is_cancelled(opt)) throw ScanRefusal(cause::kCancelled, "cancelled before the node scan");
         const sched::HttpReply r = node_.get(path);
+        // A cancel aborts the GET on our side (the transport's stop check);
+        // the node finishes its pass and drops the result, and refuses
+        // another scan within its 10 s rate window (utxo-scan-rate).
+        if (is_cancelled(opt))
+            throw ScanRefusal(cause::kCancelled, "cancelled: the node scan request was dropped (the node finishes its "
+                                                 "pass and discards it; a new scan may wait out its 10 s rate window)");
         if (!r.transport_ok) throw ScanRefusal(cause::kTransport, "c2pool " + path + ": " + r.error);
         if (r.status != 200) {
             const std::string name = refusal_name(r.body);
@@ -109,11 +116,22 @@ ScanResult SourceC2pool::scan(const std::vector<std::string>& addresses, const S
         // The scripts the node matched must be exactly the requested ones.
         const auto sc = j.find("scripts");
         if (sc == j.end() || !sc->is_array()) bad("no \"scripts\" array");
+        // The node names the address it matched when asked by address; the
+        // script is the match itself and always present.
         std::set<std::string> want, got;
-        for (const AddressScript& a : scripts) want.insert(a.address + " " + a.script_hex);
+        for (const AddressScript& a : scripts) want.insert(a.script_hex);
         for (const J& s : *sc) {
             if (!s.is_object()) bad("scripts: not an object");
-            got.insert(need_str(s, "address", "scripts") + " " + lower(need_str(s, "script_hex", "scripts")));
+            const std::string hex = lower(need_str(s, "script_hex", "scripts"));
+            const auto ad = s.find("address");
+            if (ad != s.end() && ad->is_string()) {
+                bool named = false;
+                for (const AddressScript& a : scripts) named |= a.address == ad->get<std::string>() && a.script_hex == hex;
+                if (!named)
+                    throw ScanRefusal(cause::kSourceInconsistent, "the node matched " + ad->get<std::string>() +
+                                                                      " to another script than its P2PKH");
+            }
+            got.insert(hex);
         }
         if (got != want)
             throw ScanRefusal(cause::kSourceInconsistent, "the node matched other scripts than the requested addresses");

@@ -17,6 +17,9 @@
 //   scantxoutset "start" ["addr(A)", ...]                    (fallback)
 //   gettxout txid n true                                     (per row)
 
+#include "ScanTypes.hpp" // CancelCheck
+
+#include <functional>
 #include <string>
 
 namespace c2w::companion::scan {
@@ -33,6 +36,21 @@ struct RpcApi {
     // `params_json` is the JSON array of positional parameters, e.g. "[]".
     virtual RpcReply call(const std::string& method, const std::string& params_json) = 0;
     virtual const char* name() const = 0;
+
+    // A call that may run long and that the operator may cancel (scantxoutset
+    // "start"). While it waits, the transport polls `cancelled`; the first time
+    // it turns true it runs `on_cancel` (which sends the method's own abort,
+    // e.g. scantxoutset "abort", as a separate call) and keeps waiting for the
+    // original answer, which dashd then returns early. A dropped connection
+    // would not stop dashd's scan (and would keep its one-scan reservation),
+    // hence an abort, not a disconnect. This default, for transports that
+    // cannot poll, honours a cancel requested before the call only.
+    virtual RpcReply call_long(const std::string& method, const std::string& params_json,
+                               const CancelCheck& cancelled, const std::function<void()>& on_cancel)
+    {
+        if (cancelled && cancelled()) on_cancel();
+        return call(method, params_json);
+    }
 };
 
 } // namespace c2w::companion::scan

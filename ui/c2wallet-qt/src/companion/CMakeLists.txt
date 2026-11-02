@@ -119,6 +119,12 @@ set(COMPANION_SOURCES
     scan/Classifier.cpp
     scan/Planner.cpp
     scan/ScanFiles.cpp
+    # Slice S-C: preflight, the maturity watch, the dashd credentials file and
+    # the scan / plan / preflight / watch commands of c2wallet-qt-schedd.
+    scan/Preflight.cpp
+    scan/Watch.cpp
+    scan/RpcAuth.cpp
+    scan/ScanCli.cpp
     # Zeroizing buffer for the control token. One std-only TU with no key
     # symbols (the same file the signer libraries compile).
     ${CMAKE_CURRENT_SOURCE_DIR}/../secure/SecureString.cpp
@@ -206,6 +212,20 @@ if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
             C2W_DASH_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests")
         add_test(NAME scan_signer_roundtrip COMMAND c2wallet-scan-signer-roundtrip-test)
     endif()
+
+    # Slice S-C: the scan / plan / preflight / watch commands and add
+    # --preflight through sched::cli::run with scripted fakes (C1-C9), the
+    # dashd credentials file rules, and the key-free guard over that binary.
+    add_executable(c2wallet-companion-scan-cli-test tests/test_scan_cli.cpp)
+    target_link_libraries(c2wallet-companion-scan-cli-test PRIVATE
+        c2wallet-companion nlohmann_json::nlohmann_json)
+    target_compile_definitions(c2wallet-companion-scan-cli-test PRIVATE
+        C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/fixtures")
+    add_test(NAME companion_scan_cli_kats COMMAND c2wallet-companion-scan-cli-test)
+    add_test(
+        NAME companion_scan_cli_key_free_guard
+        COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_key_free.sh"
+                "$<TARGET_FILE:c2wallet-companion-scan-cli-test>")
 endif()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -222,7 +242,7 @@ if(NOT TARGET Qt6::Network AND _companion_standalone)
     find_package(Qt6 6.2 QUIET COMPONENTS Core Network)
 endif()
 if(TARGET Qt6::Network)
-    add_library(c2wallet-companion-qtnet STATIC sched/QtNodeApi.cpp)
+    add_library(c2wallet-companion-qtnet STATIC sched/QtNodeApi.cpp scan/QtRpcApi.cpp)
     target_link_libraries(c2wallet-companion-qtnet PUBLIC c2wallet-companion Qt6::Core Qt6::Network)
 
     add_executable(c2wallet-qt-schedd schedd/main.cpp)
@@ -240,6 +260,18 @@ if(TARGET Qt6::Network)
             C2WALLET_SCHEDD_BIN="$<TARGET_FILE:c2wallet-qt-schedd>")
         add_dependencies(c2wallet-qt-schedd-test c2wallet-qt-schedd)
         add_test(NAME schedd_qt_kats COMMAND c2wallet-qt-schedd-test)
+
+        # Slice S-C: QtRpcApi against a local fake dashd (Basic auth, 401,
+        # scantxoutset abort on cancel), the node scan cancelled through
+        # QtNodeApi's stop check, and the daemon's scan command end to end.
+        add_executable(c2wallet-scan-qt-test tests/test_scan_qt.cpp)
+        target_link_libraries(c2wallet-scan-qt-test PRIVATE
+            c2wallet-companion-qtnet c2wallet-companion Qt6::Core Qt6::Network nlohmann_json::nlohmann_json)
+        target_compile_definitions(c2wallet-scan-qt-test PRIVATE
+            C2WALLET_SCHEDD_BIN="$<TARGET_FILE:c2wallet-qt-schedd>"
+            C2W_DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../family/bitcoin/dash/tests/fixtures")
+        add_dependencies(c2wallet-scan-qt-test c2wallet-qt-schedd)
+        add_test(NAME scan_qt_kats COMMAND c2wallet-scan-qt-test)
 
         add_test(
             NAME schedd_key_free_guard
