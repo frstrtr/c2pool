@@ -7,7 +7,7 @@
 #
 # It fails (non-zero) if, in ANY architecture slice of the binary:
 #   (1) a load command names a networking library or framework (otool -L):
-#       QtNetwork / QtWebEngine* / QtWebChannel, libcurl, libssl, c-ares,
+#       QtNetwork / QtWebEngine* / QtWebChannel, libcurl, libssl, libcrypto, c-ares,
 #       boost_asio, CFNetwork.framework, Network.framework; or
 #   (2) the binary imports a network C-ABI symbol (nm -u): the ELF guard's
 #       token list with the Mach-O leading underscore (_connect, _socket,
@@ -57,7 +57,7 @@ fi
 echo "slices: $archs"
 echo
 
-FORBIDDEN_LIB_RE='QtNetwork|Qt6Network|QtWebEngine|QtWebChannel|libcurl|libssl|libcares|libc-ares|boost_asio|CFNetwork\.framework|/Network\.framework'
+FORBIDDEN_LIB_RE='QtNetwork|Qt6Network|QtWebEngine|QtWebChannel|libcurl|libssl|libcrypto|libcares|libc-ares|boost_asio|CFNetwork\.framework|/Network\.framework'
 
 is_forbidden_symbol() {
     case "$1" in

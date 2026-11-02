@@ -16,8 +16,10 @@ Air-gap rules
 
 Verify the download BEFORE copying it to the offline machine
 ------------------------------------------------------------
-The release has a SHA256SUMS file signed by the maintainer
-(SHA256SUMS.asc). On a machine with the maintainer's public key:
+The release carries SHA256SUMS, the sha256 of every package, written by the
+release build. The maintainer signs it separately, by hand, as SHA256SUMS.asc;
+if a release has no SHA256SUMS.asc, treat the sums as unauthenticated and
+ask for the signature before trusting them. With the maintainer's public key:
 
     gpg --verify SHA256SUMS.asc SHA256SUMS
     shasum -a 256 -c SHA256SUMS --ignore-missing      (macOS)
@@ -55,8 +57,12 @@ Windows (x86_64)
 Unsigned: SmartScreen shows "Windows protected your PC". Press "More info",
 then "Run anyway". The setup.exe installs per user, needs no administrator
 rights and opens no firewall port; the .zip runs from any folder. The
-program needs the Microsoft Visual C++ 2015-2022 runtime (x64); setup.exe
-installs it when it is missing (that one step asks for administrator rights).
+program needs the Microsoft Visual C++ 2015-2022 runtime (x64). When the
+build bundled the runtime installer, setup.exe installs it if it is missing
+(that one step asks for administrator rights); otherwise setup.exe only
+reports that it is missing, and the runtime must be installed from
+vc_redist.x64.exe (https://aka.ms/vs/17/release/vc_redist.x64.exe, copied to
+the offline machine). The .zip never installs it.
 
 Confirmation words
 ------------------

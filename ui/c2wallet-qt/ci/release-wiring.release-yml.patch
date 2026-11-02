@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
-index c6b37a6..ae2c036 100644
+index c6b37a6..b5d8110 100644
 --- a/.github/workflows/release.yml
 +++ b/.github/workflows/release.yml
 @@ -46,6 +46,10 @@ on:
@@ -46,7 +46,7 @@ index c6b37a6..ae2c036 100644
      runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Windows","X64","c2pool-build"]') || 'windows-2022' }}
      defaults:
        run:
-@@ -743,6 +750,595 @@ jobs:
+@@ -743,6 +750,615 @@ jobs:
            # Still non-fatal — the portable .zip remains the must-have deliverable.
            if-no-files-found: warn
  
@@ -111,7 +111,10 @@ index c6b37a6..ae2c036 100644
 +        if: steps.presence.outputs.exists == '1'
 +        run: |
 +          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
++          # Signer only: COMPANION=OFF keeps the online side (Qt6::Network,
++          # nlohmann_json) out of the signer's configure entirely.
 +          cmake -S ui/c2wallet-qt -B build-c2w -DCMAKE_BUILD_TYPE=Release \
++            -DC2WALLET_QT_BUILD_COMPANION=OFF \
 +            -DC2WALLET_QT_PACKAGING=ON -DC2WALLET_QT_VERSION="${{ steps.ver.outputs.version }}" \
 +            -DCMAKE_C_FLAGS="-ffile-prefix-map=$PWD=." -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$PWD=."
 +
@@ -229,7 +232,12 @@ index c6b37a6..ae2c036 100644
 +          if [ ! -x "$QT_DIR/bin/macdeployqt" ]; then
 +            "$RUNNER_TEMP/aqt-venv/bin/aqt" install-qt mac desktop "${QT_VERSION}" clang_64 --outputdir "$RUNNER_TEMP/Qt"
 +          fi
-+          lipo -info "$QT_DIR/lib/QtCore.framework/QtCore"
++          # The one-job universal build needs a universal Qt: fail fast if not.
++          QTCORE_ARCHS="$(lipo -archs "$QT_DIR/lib/QtCore.framework/QtCore")"
++          echo "QtCore slices: $QTCORE_ARCHS"
++          for a in arm64 x86_64; do
++            case " $QTCORE_ARCHS " in *" $a "*) ;; *) echo "::error::Qt is not universal (no $a slice)"; exit 1 ;; esac
++          done
 +          echo "QT_DIR=$QT_DIR" >> "$GITHUB_ENV"
 +
 +      - name: Build libsecp256k1 (pinned tag, universal, static, recovery module)
@@ -248,14 +256,20 @@ index c6b37a6..ae2c036 100644
 +            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/secp256k1-universal"
 +          cmake --build secp256k1-src/build -j 8
 +          cmake --install secp256k1-src/build
-+          lipo -info secp256k1-universal/lib/libsecp256k1.a
++          SECP_ARCHS="$(lipo -archs secp256k1-universal/lib/libsecp256k1.a)"
++          echo "libsecp256k1.a slices: $SECP_ARCHS"
++          for a in arm64 x86_64; do
++            case " $SECP_ARCHS " in *" $a "*) ;; *) echo "::error::libsecp256k1.a has no $a slice"; exit 1 ;; esac
++          done
 +
 +      - name: Configure (universal, packaging)
 +        if: steps.presence.outputs.exists == '1'
 +        run: |
 +          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 +          SECP="$GITHUB_WORKSPACE/secp256k1-universal"
++          # Signer only (COMPANION=OFF): no Qt6::Network, no nlohmann_json.
 +          cmake -S ui/c2wallet-qt -B build-c2w -DCMAKE_BUILD_TYPE=Release \
++            -DC2WALLET_QT_BUILD_COMPANION=OFF \
 +            -DCMAKE_PREFIX_PATH="$QT_DIR" \
 +            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
 +            -DSECP256K1_LIB="$SECP/lib/libsecp256k1.a" \
@@ -287,7 +301,11 @@ index c6b37a6..ae2c036 100644
 +        run: |
 +          APP=build-c2w/c2wallet-qt-signer.app
 +          BIN="$APP/Contents/MacOS/c2wallet-qt-signer"
-+          lipo -info "$BIN"
++          BIN_ARCHS="$(lipo -archs "$BIN")"
++          echo "signer slices: $BIN_ARCHS"
++          for a in arm64 x86_64; do
++            case " $BIN_ARCHS " in *" $a "*) ;; *) echo "::error::the packaged signer has no $a slice"; exit 1 ;; esac
++          done
 +          bash ui/c2wallet-qt/ci/check_no_network_macho.sh "$BIN"
 +          bash ui/c2wallet-qt/ci/check_package_no_network.sh "$APP"
 +          out="$("$BIN" --version)"
@@ -438,7 +456,9 @@ index c6b37a6..ae2c036 100644
 +          $env:CFLAGS = "/I$env:GITHUB_WORKSPACE/secp256k1/include /Brepro"
 +          $env:CXXFLAGS = "/I$env:GITHUB_WORKSPACE/secp256k1/include /Brepro /D_WIN32_WINNT=0x0A00"
 +          $env:LDFLAGS = "/Brepro"
++          # Signer only (COMPANION=OFF): no Qt6::Network, no nlohmann_json.
 +          cmake -S ui/c2wallet-qt -B build-c2w -G "Visual Studio 17 2022" -A x64 `
++            -DC2WALLET_QT_BUILD_COMPANION=OFF `
 +            "-DCMAKE_PREFIX_PATH=$env:QT_DIR" "-DSECP256K1_LIB=$secpLib" `
 +            "-DZLIB_LIBRARY=$env:GITHUB_WORKSPACE/zlib/lib/zlibstatic.lib" "-DZLIB_INCLUDE_DIR=$env:GITHUB_WORKSPACE/zlib/include" `
 +            -DC2WALLET_QT_PACKAGING=ON "-DC2WALLET_QT_VERSION=${{ steps.ver.outputs.version }}"
@@ -642,7 +662,7 @@ index c6b37a6..ae2c036 100644
    # ════════════════════════════════════════════════════════════════════════════
    # Aggregate: single SHA256SUMS over every produced package; on tags,
    # attach everything to a DRAFT release (operator publishes manually).
-@@ -752,7 +1348,7 @@ jobs:
+@@ -752,7 +1368,7 @@ jobs:
    checksums:
      name: SHA256SUMS + draft release
      runs-on: ${{ inputs.force-github-hosted != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}

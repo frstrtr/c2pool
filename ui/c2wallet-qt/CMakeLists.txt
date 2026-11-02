@@ -107,11 +107,12 @@ target_include_directories(c2wallet-qt-signer PRIVATE src)
 # ── Version + packaging (release packaging, ci/CI_WIRING.md) ────────────────
 # C2WALLET_QT_VERSION is printed by `c2wallet-qt-signer --version` (which exits
 # before any QApplication exists, so it needs no display). CI passes the release
-# version; a developer build takes `git describe --tags --dirty`.
+# version; a developer build takes `git describe --tags --match "v*" --dirty`
+# (release tags only: the coin-lane tags such as ltc-0.2.9-dev.* never match).
 if(NOT C2WALLET_QT_VERSION)
     find_package(Git QUIET)
     if(GIT_FOUND)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --dirty
+        execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
                         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                         OUTPUT_VARIABLE _c2w_git_version
                         OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)

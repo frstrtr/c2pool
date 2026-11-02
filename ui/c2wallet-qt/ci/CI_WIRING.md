@@ -77,7 +77,10 @@ download picks them up unchanged; its `needs:` gains the four jobs and keeps
 | `c2wallet-companion-linux` | `draft-release` / `ubuntu-24.04` | `c2wallet-qt-companion-<v>-linux-x86_64.tar.gz` (GUI + `c2wallet-qt-schedd` + `.service`) | `check_key_free.sh` on both binaries, `check_no_gui_link.sh` on the daemon; green-skip until PR #2123 (the scheduler) is on the ref |
 
 The signer and the companion are never in one package: one is proven
-network-incapable, the other key-free.
+network-incapable, the other key-free. The three signer jobs configure with
+`-DC2WALLET_QT_BUILD_COMPANION=OFF`, so the online side (Qt6::Network,
+nlohmann_json) never enters the signer's configure; only the companion job
+installs `nlohmann-json3-dev`.
 
 Qt per platform (dynamic everywhere, bundled by the official deploy tools;
 LGPL notices in `licenses/`):
@@ -87,7 +90,9 @@ LGPL notices in `licenses/`):
   `linuxdeploy-plugin-qt` and `appimagetool`, each pinned by release tag and
   sha256 (and the AppImage runtime file too). glibc floor 2.39 (Ubuntu 24.04).
 - macOS: `aqtinstall==3.3.0`, `aqt install-qt mac desktop 6.8.3 clang_64`
-  (one universal Qt), one job with `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`;
+  (one universal Qt, asserted with `lipo -archs` before the build, as are
+  libsecp256k1 and the packaged binary), one job with
+  `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`;
   libsecp256k1 `v0.7.1` built universal and static with the recovery module;
   `macdeployqt`, then an ad-hoc `codesign`; `installer/macos/create-dmg.sh`
   in staged mode (unchanged). The two-runner `lipo` fallback is described in

@@ -6,7 +6,7 @@
 # It fails (non-zero exit) if the exe:
 #   (1) imports from a networking DLL (dumpbin /dependents): Qt6Network,
 #       Qt6WebEngine*, Qt6WebChannel, ws2_32, wsock32, mswsock, wininet,
-#       winhttp, dnsapi, libcurl*, libssl*; or
+#       winhttp, dnsapi, libcurl*, libssl*, libcrypto*; or
 #   (2) imports a network function by name (dumpbin /imports): connect,
 #       socket, bind, listen, accept, getaddrinfo, freeaddrinfo, getnameinfo,
 #       gethostbyname, gethostbyaddr, sendto, recvfrom, getpeername, and the
@@ -66,7 +66,7 @@ $dlls = @($depOut | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[^
 Write-Host "-- imported DLLs --"
 $dlls | ForEach-Object { Write-Host "   $_" }
 if ($dlls.Count -eq 0) { Write-Host "FAIL: no imported DLL read (not a PE image?)"; exit 2 }
-$forbiddenDll = '^(Qt6Network|Qt6WebEngine\w*|Qt6WebChannel|ws2_32|wsock32|mswsock|wininet|winhttp|dnsapi|libcurl[\w\-\.]*|libssl[\w\-\.]*)\.dll$'
+$forbiddenDll = '^(Qt6Network|Qt6WebEngine\w*|Qt6WebChannel|ws2_32|wsock32|mswsock|wininet|winhttp|dnsapi|libcurl[\w\-\.]*|libssl[\w\-\.]*|libcrypto[\w\-\.]*)\.dll$'
 $badDlls = @($dlls | Where-Object { $_ -match $forbiddenDll })
 if ($badDlls.Count -gt 0) {
     Write-Host "FAIL: the exe imports a networking DLL:"
