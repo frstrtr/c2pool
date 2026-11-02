@@ -74,14 +74,22 @@ struct StubCommunicator : public core::ICommunicator
 
 // Real TCP pair. `ours` is wrapped in the core::Socket handed to the handler;
 // `theirs` is the remote peer, read back to see exactly what we sent.
+//
+// The io_context is NOT owned here. handle_version keeps the peer in the
+// node's m_peers map (ltc/node.cpp:351), so the core::Socket wrapping `ours`
+// lives until the node is destroyed. An io_context owned by SocketPair died
+// when handshake() returned, and the node's teardown then destroyed a socket
+// whose reactive_socket_service was already freed (heap-use-after-free under
+// ASan). The fixture owns this context and declares it before m_node so it
+// outlives every socket the node retains.
 struct SocketPair
 {
-    boost::asio::io_context ioc;
+    boost::asio::io_context& ioc;
     std::unique_ptr<tcp::acceptor> acceptor;
     std::unique_ptr<tcp::socket> theirs;
     std::unique_ptr<tcp::socket> ours;
 
-    SocketPair()
+    explicit SocketPair(boost::asio::io_context& ctx) : ioc(ctx)
     {
         acceptor = std::make_unique<tcp::acceptor>(
             ioc, tcp::endpoint(boost::asio::ip::make_address("127.0.0.2"), 0));
@@ -132,9 +140,9 @@ struct HandshakeResult
     std::vector<Frame> frames;
 };
 
-HandshakeResult handshake(ltc::Node& node)
+HandshakeResult handshake(ltc::Node& node, boost::asio::io_context& peer_ioc)
 {
-    SocketPair pair;
+    SocketPair pair(peer_ioc);
     StubCommunicator stub;
     auto sock = std::make_shared<core::Socket>(
         std::move(pair.ours), core::outgoing, &stub,
@@ -211,6 +219,9 @@ protected:
     }
 
     boost::asio::io_context m_ioc;
+    // Owns the test peer sockets. Declared before m_node so it is destroyed
+    // after it: the node keeps those sockets alive in m_peers.
+    boost::asio::io_context m_peer_ioc;
     std::unique_ptr<ltc::Config> m_config;
     std::unique_ptr<ltc::Node> m_node;
 
@@ -245,7 +256,7 @@ TEST_F(LtcListenPortGuard, BindFailureKeepsTheHandshakeAndSkipsAddrme)
     ASSERT_FALSE(m_node->listen_port_or_none().has_value())
         << "bind should have failed on port " << taken;
 
-    const auto r = handshake(*m_node);
+    const auto r = handshake(*m_node, m_peer_ioc);
 
     EXPECT_FALSE(r.threw)
         << "handle_version threw (" << r.what << "): the unguarded listen_port() "
@@ -266,7 +277,7 @@ TEST_F(LtcListenPortGuard, ListeningNodeAdvertisesItsBoundPort)
     ASSERT_TRUE(port.has_value());
     ASSERT_NE(*port, 0);
 
-    const auto r = handshake(*m_node);
+    const auto r = handshake(*m_node, m_peer_ioc);
     ASSERT_FALSE(r.threw) << r.what;
     ASSERT_TRUE(r.verdict.has_value());
 
