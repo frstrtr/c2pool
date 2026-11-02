@@ -51,4 +51,17 @@ inline int p2p_port(const std::string& symbol, bool testnet,
     return 0;
 }
 
+// DOGE fallback payout address for createauxblock, per network. All three
+// encode hash160 = 20 zero bytes (an unspendable burn); only the base58
+// version byte differs: mainnet 30 (D), testnet 113 (n), regtest 111 (m).
+// Until now main_ltc.cpp sent the testnet address on every --testnet run, and
+// a regtest dogecoind rejects it (createauxblock -8, the aux leg silently
+// never gets work). t4a keeps the testnet address, as before this change.
+inline const char* doge_aux_fallback_address(bool testnet, bool regtest)
+{
+    if (regtest) return "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8";
+    if (testnet) return "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
+    return "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+}
+
 } // namespace c2pool::ltc_doge

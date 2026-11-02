@@ -6521,10 +6521,9 @@ int main(int argc, char* argv[]) {
                     // Fallback payout address for createauxblock RPC.
                     // Used when no per-miner address is available for a chain.
                     // PPLNS payouts override this in multiaddress mode.
-                    if (cfg.symbol == "DOGE" && settings->m_testnet)
-                        cfg.aux_payout_address = "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt";
-                    else if (cfg.symbol == "DOGE")
-                        cfg.aux_payout_address = "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr";
+                    if (cfg.symbol == "DOGE")
+                        cfg.aux_payout_address = c2pool::ltc_doge::doge_aux_fallback_address(
+                            settings->m_testnet, coin_regtest);
                     else if (cfg.symbol == "PEP")
                         cfg.aux_payout_address = "PSimbaxxxxxxxxxxxxxxxxxxxxUMbTDw";
                     else if (cfg.symbol == "BELLS")

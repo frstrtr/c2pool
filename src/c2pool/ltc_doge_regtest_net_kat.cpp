@@ -4,6 +4,7 @@
 // and the main_ltc.cpp table had no regtest row at all.
 #include <c2pool/ltc_doge_chain_net.hpp>
 #include <cstdio>
+#include <string>
 
 using namespace c2pool::ltc_doge;
 
@@ -38,6 +39,14 @@ int main()
     // Non-LTC/DOGE symbols are not ours: caller falls through to its own table.
     CHECK(p2p_magic_hex("BTC", false, false, true).empty());
     CHECK(p2p_port("DGB", true, false, true) == 0);
+
+    // DOGE createauxblock fallback address: mainnet/testnet unchanged, regtest
+    // gets the version-111 encoding of the same zero hash160 (validateaddress
+    // isvalid=true on dogecoind 1.14.9 -regtest; the testnet one is invalid there).
+    CHECK(std::string(doge_aux_fallback_address(false, false)) == "DDogepartyxxxxxxxxxxxxxxxxxxw1dfzr");
+    CHECK(std::string(doge_aux_fallback_address(true,  false)) == "nUCAGGgZEPN1QyknmQe1oAku817bQAFKFt");
+    CHECK(std::string(doge_aux_fallback_address(true,  true))  == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8");
+    CHECK(std::string(doge_aux_fallback_address(false, true))  == "mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8");
 
     if (g_fail) { std::printf("ltc_doge_regtest_net_kat: %d FAIL\n", g_fail); return 1; }
     std::printf("ltc_doge_regtest_net_kat: ALL PASS\n");
