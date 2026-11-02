@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -874,26 +875,59 @@ public:
             LOG_INFO << "[MEMPOOL] inject released txid=" << id.GetHex().substr(0, 16)
                      << " cause=left-mempool height=" << m_prev_height;
         }
-        // (4) Re-track what came back (or was never tracked).
+        // (4) Re-track what came back (or was never tracked), PARENTS FIRST. A
+        //     rewind can put back a parent and its child together while the
+        //     caps have room for only part of the set (still_wanted checked
+        //     each one against the same active set, before any of them came
+        //     back). In txid order the parent could be the one refused, leaving
+        //     the child live and tracked with an input that is neither in the
+        //     view nor in the pool. In topological order the parent takes the
+        //     room first, and a refused inject takes its live descendants with
+        //     it: an untracked one is refused by name, a tracked one evicted.
+        std::vector<uint256> untracked;
+        for (const auto& id : live)
+            if (!m_inject_pool.contains(id)) untracked.push_back(id);
+        std::set<uint256> refused;
         std::vector<uint256> retracked;
-        for (const auto& id : live) {
-            if (m_inject_pool.contains(id)) continue;
+        for (const auto& id : inject_parents_first(untracked)) {
             const char* how = "rewind";
-            auto v = m_inject_pool.retrack(id);
-            if (v == TxInjectPool::Admit::NotTracked) {
-                how = "untracked";
-                const auto e = m_mempool.get_entry(id);
-                v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+            std::string cause;
+            if (spends_one_of(id, refused)) {
+                cause = "inject-pool-parent-refused";
+            } else {
+                auto v = m_inject_pool.retrack(id);
+                if (v == TxInjectPool::Admit::NotTracked) {
+                    how = "untracked";
+                    const auto e = m_mempool.get_entry(id);
+                    v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+                }
+                if (v != TxInjectPool::Admit::Ok) cause = TxInjectPool::admit_name(v);
             }
-            if (v != TxInjectPool::Admit::Ok) {
+            if (!cause.empty()) {
+                refused.insert(id);
                 m_mempool.remove_tx(id);
                 LOG_WARNING << "[MEMPOOL] inject readmit refused txid=" << id.GetHex().substr(0, 16)
-                            << " cause=" << TxInjectPool::admit_name(v)
+                            << " cause=" << cause
                             << "; evicted from the mempool, resubmit it if it is still wanted";
             } else {
                 LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
                          << " cause=" << how;
                 retracked.push_back(id);
+            }
+        }
+        // A tracked inject that spends a refused one (its child came back in an
+        // earlier rewind) cannot ride without it: evict it too, transitively.
+        for (bool more = !refused.empty(); more;) {
+            more = false;
+            for (const auto& id : m_inject_pool.tracked_ids()) {
+                if (!spends_one_of(id, refused)) continue;
+                refused.insert(id);
+                m_inject_pool.forget(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject evicted txid=" << id.GetHex().substr(0, 16)
+                            << " cause=inject-pool-parent-refused"
+                            << "; resubmit it with its parent if it is still wanted";
+                more = true;
             }
         }
         // (5) Released records a rewind can no longer reach.
@@ -2080,6 +2114,56 @@ private:
         le.flags         = e.flags;
         le.in_mempool    = true;
         return le;
+    }
+
+    /// Whether the mempool tx `id` spends an output of a tx in `txids`.
+    bool spends_one_of(const uint256& id, const std::set<uint256>& txids) const {
+        if (txids.empty()) return false;
+        const auto e = m_mempool.get_entry(id);
+        if (!e) return false;
+        for (const auto& in : e->tx.vin)
+            if (txids.count(in.prevout.hash)) return true;
+        return false;
+    }
+
+    /// `ids` (mempool txids) reordered so every tx comes after the txs of
+    /// `ids` it spends; otherwise the given order is kept.
+    std::vector<uint256> inject_parents_first(const std::vector<uint256>& ids) const {
+        const std::set<uint256> in_set(ids.begin(), ids.end());
+        std::map<uint256, std::vector<uint256>> parents;
+        for (const auto& id : ids) {
+            const auto e = m_mempool.get_entry(id);
+            if (!e) continue;
+            for (const auto& vin : e->tx.vin)
+                if (vin.prevout.hash != id && in_set.count(vin.prevout.hash))
+                    parents[id].push_back(vin.prevout.hash);
+        }
+        std::vector<uint256> out;
+        out.reserve(ids.size());
+        std::set<uint256> placed;
+        // Iterative post-order walk (a chain of injects can be long).
+        for (const auto& root : ids) {
+            if (placed.count(root)) continue;
+            std::vector<std::pair<uint256, size_t>> stack{{root, 0}};
+            std::set<uint256> on_stack{root};
+            while (!stack.empty()) {
+                auto& [cur, next] = stack.back();
+                const auto it = parents.find(cur);
+                if (it != parents.end() && next < it->second.size()) {
+                    const uint256 p = it->second[next++];
+                    if (!placed.count(p) && !on_stack.count(p)) {
+                        on_stack.insert(p);
+                        stack.emplace_back(p, 0);
+                    }
+                    continue;
+                }
+                placed.insert(cur);
+                out.push_back(cur);
+                on_stack.erase(cur);
+                stack.pop_back();
+            }
+        }
+        return out;
     }
 
     /// THE clause list. The ONLY transcription of embedded-arm viability:

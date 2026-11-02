@@ -263,6 +263,11 @@ This is the key reuse: **construct-and-broadcast-arbitrary-tx is already proven*
   `expiry_height` and room in the caps); the put-back tx is re-tracked with
   its original flags / expiry / size / submit time through the same caps as a
   fresh admit. A live inject with no record is tracked fresh (expiry 0).
+  Re-tracking runs parents before children: a rewind can put back more than
+  the caps hold (each one was wanted against the same active set), and the
+  parent takes the room first. An inject the caps refuse is evicted by name
+  and takes its live descendants with it (`inject-pool-parent-refused`), so a
+  child is never kept whose input is neither in the view nor in the pool.
   Rate-limiter windows are never refunded by a release or a retrack.
 - **No amplification.** `tx-inject` is forwarded on first-see only, with TTL, so
   it cannot loop the mesh. A node never re-derives or re-signs the tx; it
