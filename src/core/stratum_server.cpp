@@ -1778,7 +1778,32 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
                 }
                 // Accepted (own-coin OR configured-merged): byte-identical build.
                 payout_script = address_to_script(username_);
+                // The chain-agnostic decoder knows a fixed HRP list; an own-coin
+                // HRP outside it (e.g. DGB "dgb"/"dgbt"/"dgbrt") decoded EMPTY
+                // here even though decide_payout_address() accepted it. Fall
+                // back to the running coin's own network-aware decode. Only
+                // reached when the legacy build is empty, so every address that
+                // already built a script is byte-identical.
+                if (payout_script.empty())
+                    payout_script = core::address_to_script_for_coin(username_, own);
             }
+        }
+
+        // ── EMPTY-SCRIPT GUARD (all coins): an authorized, non-empty username
+        // that still yields NO payout script would make build_connection_
+        // coinbase() drop the finder output from the job coinbase while the
+        // share created at submit commits the real address — the verify_share
+        // GENTX mismatch (regtest bcrt1 repro), or on a won block a
+        // payout-less coinbase. Refuse the job and log loudly instead. Fires
+        // ONLY when the script is empty: the pre-authorize job (username_
+        // still empty) and every decodable address are unchanged.
+        if (!username_.empty() && payout_script.empty()) {
+            const auto& scfg = mining_interface_->get_stratum_config();
+            LOG_WARNING << "[Stratum] REFUSING to build work: payout address "
+                           "decodes to an EMPTY script (user=" << username_ << ")"
+                        << (scfg.coin_symbol.empty() ? "" : " on " + scfg.coin_symbol)
+                        << " — no finder-less coinbase will be issued";
+            return;
         }
 
         // Build merged address entries (bech32+base58, P2PKH+P2SH)

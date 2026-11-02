@@ -541,3 +541,87 @@ TEST(AddressCoinValidation, NativeDecoderOwnAddressAcceptedAtDoor)
     EXPECT_EQ(decide_payout_address(b58(0x4c), bch_acc, no_merged),
               PayoutAddressDecision::Reject);
 }
+
+// ── bcrt1 payout decode (verify_share h2 GENTX root cause) ──────────────────
+// The chain-agnostic core decoder knew {"tltc","ltc","bc","tb"} but not "bcrt",
+// so a BTC/BIP-110 REGTEST bech32 payout decoded to an EMPTY script. The stratum
+// job coinbase then dropped the finder output while the share committed the real
+// address, and verify_share failed GenerateShareTransaction at sharechain h2. A
+// legacy base58 payout on the same binary was clean (control run). RED on parent:
+// address_to_script(bcrt1...) returns {} there.
+TEST(AddressCoinValidation, BcrtPayoutDecodesToP2wpkh)
+{
+    const std::string bcrt = bech32_v0("bcrt");
+    ASSERT_EQ(bcrt.rfind("bcrt1q", 0), 0u) << bcrt;
+
+    // bcrt1 P2WPKH -> 0014<prog>.
+    EXPECT_EQ(core::address_to_script(bcrt), p2wpkh_script());
+
+    std::string atype;
+    EXPECT_EQ(core::address_to_hash160(bcrt, atype),
+              "62e907b15cbf27d5425399ebf6f0fb50ebb88f18");
+    EXPECT_EQ(atype, "p2wpkh");
+
+    // The exact pair send_notify_work() consults on a BTC / BIP-110 regtest node:
+    // the door accepts it AND the build yields a non-empty, correct script.
+    const std::vector<MergedChainAddr> no_merged{};
+    for (const auto& acc : {btc::address_acceptance(false, true),
+                            bip110::address_acceptance(false, true)}) {
+        EXPECT_EQ(decide_payout_address(bcrt, acc, no_merged),
+                  PayoutAddressDecision::AcceptOwn);
+        EXPECT_EQ(core::address_to_script(bcrt), p2wpkh_script());
+    }
+
+    // Additive only: a bc1 / tb1 address is unchanged and is not caught by "bcrt".
+    EXPECT_EQ(core::address_to_script(bech32_v0("bc")), p2wpkh_script());
+    EXPECT_EQ(core::address_to_script(bech32_v0("tb")), p2wpkh_script());
+    // A checksum-broken bcrt1 string still decodes to nothing.
+    std::string bad = bcrt;
+    bad.back() = (bad.back() == 'q') ? 'p' : 'q';
+    EXPECT_TRUE(core::address_to_script(bad).empty());
+}
+
+// LTC + DOGE preservation: address -> script -> address round-trips are
+// byte-identical to before the "bcrt" addition (the shared-core change must not
+// move any merged-mining parent / aux payout).
+TEST(AddressCoinValidation, LtcDogeAddressRoundTripPreserved)
+{
+    // LTC mainnet bech32 P2WPKH (ltc1...) and P2PKH (L..., 0x30); testnet tltc1.
+    const std::string ltc_bech = bech32_v0("ltc");
+    EXPECT_EQ(core::address_to_script(ltc_bech), p2wpkh_script());
+    EXPECT_EQ(core::script_to_address(p2wpkh_script(), "ltc", 0x30, 0x32), ltc_bech);
+    const std::string ltc_p2pkh = b58(0x30);
+    EXPECT_EQ(core::address_to_script(ltc_p2pkh), p2pkh_script());
+    EXPECT_EQ(core::script_to_address(p2pkh_script(), "ltc", 0x30, 0x32), ltc_p2pkh);
+    EXPECT_EQ(core::address_to_script(bech32_v0("tltc")), p2wpkh_script());
+
+    // DOGE mainnet P2PKH (D..., 0x1e) and P2SH (9/A..., 0x16) — the merged-mining
+    // aux payout path (address_to_hash160 -> hash160_to_merged_script).
+    const std::string doge_p2pkh = b58(0x1e);
+    EXPECT_EQ(core::address_to_script(doge_p2pkh), p2pkh_script());
+    EXPECT_EQ(core::script_to_address(p2pkh_script(), "", 0x1e, 0x16), doge_p2pkh);
+    const std::string doge_p2sh = b58(0x16);
+    EXPECT_EQ(core::address_to_script(doge_p2sh), p2sh_script());
+    EXPECT_EQ(core::script_to_address(p2sh_script(), "", 0x1e, 0x16), doge_p2sh);
+    std::string atype;
+    EXPECT_EQ(core::hash160_to_merged_script(core::address_to_hash160(doge_p2pkh, atype), atype),
+              p2pkh_script());
+    EXPECT_EQ(atype, "p2pkh");
+}
+
+// send_notify_work() empty-script guard fallback: an own-coin HRP outside the
+// chain-agnostic list (DGB "dgb") decodes EMPTY via address_to_script() even
+// though the door accepts it. The guard's fallback (address_to_script_for_coin
+// with the running coin's own set) must yield the real script, so the new guard
+// never refuses an address the coin itself accepts.
+TEST(AddressCoinValidation, EmptyScriptGuardFallbackKeepsOwnHrp)
+{
+    const std::string dgb = bech32_v0("dgb");
+    const CoinAddressAcceptance dgb_acc = dgb::address_acceptance(false, false);
+    EXPECT_EQ(decide_payout_address(dgb, dgb_acc, {}), PayoutAddressDecision::AcceptOwn);
+    EXPECT_TRUE(core::address_to_script(dgb).empty())
+        << "documents the chain-agnostic gap the guard fallback covers";
+    EXPECT_EQ(core::address_to_script_for_coin(dgb, dgb_acc), p2wpkh_script());
+    // The fallback never repurposes a foreign address: LTC's set rejects dgb1.
+    EXPECT_TRUE(core::address_to_script_for_coin(dgb, ltc::address_acceptance(false)).empty());
+}
