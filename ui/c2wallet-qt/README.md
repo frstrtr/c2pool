@@ -154,9 +154,15 @@ later slices.
   created at `h0` is spendable in block `h0 + 100`, the next template is
   `tip + 1`; the rule is shared with the signer in
   `src/family/bitcoin/dash/InjectMaturity.hpp`), `not_before_height`,
-  `not_before_time` (UTC, trailing `Z` required) and `after_parent` (N
-  confirmations, default 1). Unknown input heights never auto-fire: set
-  `not_before_height` or record an explicit override.
+  `not_before_time` (UTC, trailing `Z` required) and `after_parent`. A parent
+  must be **final**, not merely mined: N confirmations (default 1), its block
+  still on the node's chain, and ChainLocked (`bestchainlock.height >=` the
+  parent's height in `getblockchaininfo`); a node that does not expose
+  `bestchainlock` gets at least 2 confirmations instead ("ChainLock not
+  exposed by node"). A parent only in the node mempool never fires a child
+  unless the item sets `allow_unconfirmed_parent` (default false). Unknown
+  input heights never auto-fire: set `not_before_height` or record an
+  explicit override.
 - **State machine**: waiting → ready → submitting → admitted → is_hold (the
   node's 600 s InstantSend hold for a zero-fee inject) → riding → mined →
   confirmed, with blocked_not_armed / blocked_token / blocked_node,

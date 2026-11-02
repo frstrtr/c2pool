@@ -127,10 +127,13 @@ ChainSnapshot Scheduler::snapshot()
     c.tip_known = t.known;
     c.tip = t.height;
     c.tip_unknown_why = t.why;
+    c.chainlock_exposed = t.chainlock.exposed;
+    if (t.chainlock.known) c.chainlock_height = t.chainlock.height;
+    c.chainlock_why = t.chainlock.why;
     return c;
 }
 
-ParentStatus Scheduler::parent_status(const std::string& txid) const
+ParentStatus Scheduler::parent_status(const std::string& txid)
 {
     ParentStatus ps;
     if (const Item* p = find_item_by_txid(q_, txid)) {
@@ -140,21 +143,70 @@ ParentStatus Scheduler::parent_status(const std::string& txid) const
         if (in_block && (p->node.mined_height || p->node.mined_height_unknown)) {
             ps.mined = true;
             ps.mined_height = p->node.mined_height;
+            ps.mined_hash = p->node.mined_hash;
             ps.height_unknown = !p->node.mined_height.has_value();
         } else if (in_block) {
             ps.state_text = "mined (locating its block)";
         }
-        return ps;
+    } else {
+        for (const Tracked& t : q_.tracked) {
+            if (t.txid != txid) continue;
+            ps.known = true;
+            ps.mined = t.mined_height.has_value();
+            ps.mined_height = t.mined_height;
+            ps.mined_hash = t.mined_hash;
+            ps.state_text = "not seen in a block yet (foreign parent)";
+            break;
+        }
     }
-    for (const Tracked& t : q_.tracked) {
-        if (t.txid != txid) continue;
-        ps.known = true;
-        ps.mined = t.mined_height.has_value();
-        ps.mined_height = t.mined_height;
-        ps.state_text = "not seen in a block yet (foreign parent)";
-        return ps;
+    if (!ps.known) return ps;
+    if (!ps.mined) {
+        const MempoolView& mp = view_.mempool();
+        ps.in_mempool = mp.ok && mp.txids.count(txid) != 0;
+    } else if (ps.mined_height) {
+        verify_parent_block(ps);
     }
     return ps;
+}
+
+// Finality needs the parent's block still on the node's active chain: the
+// best ChainLock's own hash when it sits exactly at the parent's height,
+// otherwise getblockhash at that height (cached for the tick).
+void Scheduler::verify_parent_block(ParentStatus& ps)
+{
+    const TipInfo& tip = view_.tip();
+    if (!tip.known) {
+        ps.block_check_why = tip.why;
+        return;
+    }
+    if (!ps.mined_hash || ps.mined_hash->empty()) {
+        ps.block_check_why = "the parent's block hash was not recorded";
+        return;
+    }
+    const int64_t h = *ps.mined_height;
+    if (h > tip.height) {
+        ps.block_still_at_height = false;
+        ps.block_check_why = "height " + std::to_string(h) + " is above the tip " + std::to_string(tip.height);
+        return;
+    }
+    if (tip.chainlock.known && tip.chainlock.height == h) {
+        ps.block_still_at_height = tip.chainlock.blockhash == *ps.mined_hash;
+        if (!*ps.block_still_at_height)
+            ps.block_check_why = "the ChainLock at " + std::to_string(h) + " is block " +
+                                 tip.chainlock.blockhash.substr(0, 16) + ", the parent was in " +
+                                 ps.mined_hash->substr(0, 16);
+        return;
+    }
+    std::string err;
+    const auto hash = view_.block_hash(h, err);
+    if (!hash) {
+        ps.block_check_why = "getblockhash " + std::to_string(h) + ": " + err;
+        return;
+    }
+    ps.block_still_at_height = *hash == *ps.mined_hash;
+    if (!*ps.block_still_at_height)
+        ps.block_check_why = "block at " + std::to_string(h) + " is now " + hash->substr(0, 16) + ", the parent was in " +
+                             ps.mined_hash->substr(0, 16);
 }
 
 Verdict Scheduler::evaluate_item(const Item& it)

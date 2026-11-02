@@ -43,7 +43,41 @@ void ChainView::begin_tick()
     status_.reset();
     mempool_.reset();
     blocks_.clear();
+    hashes_.clear();
 }
+
+namespace {
+
+// "bestchainlock": absent -> not exposed; {height:int, blockhash:string} ->
+// known; anything else -> exposed without a usable ChainLock.
+ChainLockInfo read_chainlock(const json::J& j)
+{
+    ChainLockInfo c;
+    if (!j.is_object() || !j.contains("bestchainlock")) return c;
+    c.exposed = true;
+    const json::J& cl = j["bestchainlock"];
+    if (cl.is_null()) {
+        c.why = "the node reports no ChainLock yet (bestchainlock is null)";
+        return c;
+    }
+    if (!cl.is_object() || !cl.contains("height") || !cl["height"].is_number_integer() || !cl.contains("blockhash") ||
+        !cl["blockhash"].is_string()) {
+        c.why = "bestchainlock is not {height, blockhash}";
+        return c;
+    }
+    const int64_t h = cl["height"].get<int64_t>();
+    const std::string hash = cl["blockhash"].get<std::string>();
+    if (h < 1 || hash.empty()) {
+        c.why = "bestchainlock carries no height/blockhash";
+        return c;
+    }
+    c.known = true;
+    c.height = h;
+    c.blockhash = hash;
+    return c;
+}
+
+} // namespace
 
 const TipInfo& ChainView::tip()
 {
@@ -71,6 +105,7 @@ const TipInfo& ChainView::tip()
             if (j.contains("bestblockhash") && j["bestblockhash"].is_string())
                 t.hash = j["bestblockhash"].get<std::string>();
         }
+        t.chainlock = read_chainlock(j);
     }
     tip_ = t;
     return *tip_;
@@ -190,14 +225,22 @@ const BlockInfo& ChainView::block_at(int64_t height)
 
 std::optional<std::string> ChainView::block_hash(int64_t height, std::string& why)
 {
+    auto cached = hashes_.find(height);
+    if (cached != hashes_.end()) {
+        why = cached->second.why;
+        return cached->second.hash;
+    }
+    HashAnswer a;
     json::J j;
     bool te = false;
-    if (!read_reply(api_.get(std::string(route::kBlockHash) + std::to_string(height)), j, why, te))
-        return std::nullopt;
-    if (j.is_string()) return j.get<std::string>();
-    if (j.is_object() && j.contains("result") && j["result"].is_string()) return j["result"].get<std::string>();
-    why = "getblockhash: unexpected reply shape";
-    return std::nullopt;
+    if (read_reply(api_.get(std::string(route::kBlockHash) + std::to_string(height)), j, a.why, te)) {
+        if (j.is_string()) a.hash = j.get<std::string>();
+        else if (j.is_object() && j.contains("result") && j["result"].is_string()) a.hash = j["result"].get<std::string>();
+        else a.why = "getblockhash: unexpected reply shape";
+    }
+    hashes_.emplace(height, a);
+    why = a.why;
+    return a.hash;
 }
 
 FindResult ChainView::find_tx(const std::string& txid, int64_t lo, int64_t hi)

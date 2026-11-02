@@ -110,6 +110,11 @@ struct Triggers {
     std::optional<int64_t> not_before_height;
     std::optional<std::string> not_before_time; // UTC ISO-8601 'Z'
     std::vector<ParentReq> after_parent;
+    // Operator opt-in (default false): a parent in the node mempool satisfies
+    // after_parent. Without it a child waits until every parent is mined AND
+    // final (ChainLocked, or >= 2 confirmations when the node exposes no
+    // ChainLock), so a reorg of the parent's block cannot strand the child.
+    bool allow_unconfirmed_parent = false;
 };
 
 struct SubmitOptions {
@@ -316,6 +321,7 @@ struct EnqueueRequest {
     std::optional<std::string> not_before_time;
     std::vector<ParentReq> after_parent;       // explicit parents (merged with discovered ones)
     bool discover_parents = true;
+    bool allow_unconfirmed_parent = false;     // explicit opt-in only (CLI flag / dialog checkbox)
     // Required when maturity is unknown and no not_before_height is given.
     std::optional<std::string> inputs_known_mature_consent;
     int64_t maturity_slack_blocks = 0;

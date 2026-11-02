@@ -12,6 +12,10 @@
 //     "txid", or txid strings); outside the 288-block body window, or without
 //     --embedded-utxo, the reply has no "tx" (header-only partial).
 //   getblockhash?height=H -> a JSON string (DASH coin hook) or {"result": "..."}.
+//   getblockchaininfo "bestchainlock" -> {height, blockhash} of the node's best
+//     ChainLock. Feature-detected: absent on nodes that do not expose it (the
+//     scheduler then falls back to a confirmation count for parent finality);
+//     present but null/malformed means "exposed, no usable ChainLock yet".
 //   getrawmempool -> ["<txid>", ...]; getmempoolentry -> {..., "time_added"}
 //     or {"error": "Transaction not in mempool"}.
 // Confirmation of a txid must come from block bodies: getrawtransaction is
@@ -30,6 +34,15 @@ namespace c2w::companion::sched {
 
 inline constexpr int64_t kBodyWindow = 288; // DASH_EXPLORER_DEPTH
 
+// The node's best ChainLock, as reported next to the tip.
+struct ChainLockInfo {
+    bool exposed = false;        // getblockchaininfo carries "bestchainlock" at all
+    bool known = false;          // ...and it is a usable {height, blockhash}
+    int64_t height = 0;
+    std::string blockhash;
+    std::string why;             // exposed but not usable (null, malformed)
+};
+
 struct TipInfo {
     bool known = false;          // a synced tip
     int64_t height = 0;
@@ -37,6 +50,7 @@ struct TipInfo {
     bool transport_error = false;
     bool explorer_disabled = false; // the node runs with --no-explorer
     std::string why;             // why unknown
+    ChainLockInfo chainlock;
 };
 
 struct InjectStatus {
@@ -99,6 +113,8 @@ public:
     void invalidate_mempool() { mempool_.reset(); }
     MempoolEntryInfo mempool_entry(const std::string& txid);
     const BlockInfo& block_at(int64_t height);
+    // Cached for the tick (a reorg check and a parent-finality check of the
+    // same height cost one request).
     std::optional<std::string> block_hash(int64_t height, std::string& why);
 
     // Search heights [lo, hi] newest-first for `txid` in retained bodies.
@@ -112,6 +128,11 @@ private:
     std::optional<InjectStatus> status_;
     std::optional<MempoolView> mempool_;
     std::map<int64_t, BlockInfo> blocks_;
+    struct HashAnswer {
+        std::optional<std::string> hash;
+        std::string why;
+    };
+    std::map<int64_t, HashAnswer> hashes_;
 };
 
 } // namespace c2w::companion::sched

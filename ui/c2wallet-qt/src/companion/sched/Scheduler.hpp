@@ -110,7 +110,8 @@ private:
 
     // helpers
     ChainSnapshot snapshot();
-    ParentStatus parent_status(const std::string& txid) const;
+    ParentStatus parent_status(const std::string& txid);
+    void verify_parent_block(ParentStatus& ps);
     Verdict evaluate_item(const Item& it);
     void transition(Item& it, State s, const std::string& why);
     void set_why(Item& it, const std::string& why);

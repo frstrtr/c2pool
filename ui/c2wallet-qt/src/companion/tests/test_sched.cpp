@@ -291,6 +291,8 @@ struct FakeNode : NodeApi {
     std::map<std::string, int64_t> time_added;
     std::map<std::string, int64_t> expiry; // txid -> expiry_height (0 = none)
     bool explorer = true;                   // false: --no-explorer
+    bool cl_exposed = false;                // getblockchaininfo carries "bestchainlock"
+    std::optional<int64_t> cl_height;       // the best ChainLock (null when exposed without one)
     std::map<int64_t, FakeBlock> blocks;
     int64_t salt = 0;
     std::string issued_nonce;
@@ -404,6 +406,9 @@ struct FakeNode : NodeApi {
                 j["blocks"] = tip;
                 j["headers"] = tip;
                 j["bestblockhash"] = hash_at(tip);
+                if (cl_exposed)
+                    j["bestchainlock"] = cl_height ? nj{{"height", *cl_height}, {"blockhash", hash_at(*cl_height)}}
+                                                   : nj(nullptr);
             } else {
                 j["sync_blocked_by"] = blocked_by;
                 j["stale"] = {{"tip_height", tip}};
@@ -792,6 +797,8 @@ static void k7_all_of_combination()
         p.known = true;
         p.mined = t == foreign;
         p.mined_height = 2565250;
+        p.mined_hash = std::string(64, 'e');
+        p.block_still_at_height = true; // the block at 2565250 is still the parent's
         return p;
     };
     v = evaluate(it, tipat(2565260), now, mined_parent);
@@ -1983,6 +1990,272 @@ static void k9d_node_vocabulary()
     CHECK(missing == 0, "K9d/L6: no node cause string outside the scheduler vocabulary");
 }
 
+// ── parent finality (operator requirement 2026-11-02) ───────────────────────
+
+// A parent + child pair: the child's after_parent names the parent with N.
+struct Pair {
+    std::string ptx, ctx;
+};
+static Pair add_pair(World& w, uint32_t seed, int64_t n = 1, bool allow_unconfirmed = false)
+{
+    const Art pa = simple(seed);
+    w.add(pa);
+    const Art ca = simple(seed + 1);
+    EnqueueRequest cr = req_for(ca);
+    cr.after_parent = {{pa.txids[0], n}};
+    cr.allow_unconfirmed_parent = allow_unconfirmed;
+    w.add(ca, cr);
+    return {pa.txids[0], ca.txids[0]};
+}
+
+// Submit POSTs that carried the child's raw tx.
+static size_t child_posts(const World& w, const std::string& ctx)
+{
+    const Item* c = find_item_by_txid(w.q, ctx);
+    size_t n = 0;
+    if (!c) return n;
+    for (const auto& b : w.node.bodies(route::kSubmit))
+        if (b.find(c->tx.raw_tx) != std::string::npos) ++n;
+    return n;
+}
+
+// K28a: no bestchainlock on the node -> N is raised to 2 with a named reason.
+static void k28a_chainlock_absent_fallback()
+{
+    World w;
+    const Pair p = add_pair(w, 400);
+    w.tick();
+    w.node.mine({p.ptx});
+    const int64_t H = w.node.tip;
+    w.tick();
+    CHECK(w.item(0).state == State::Mined && w.item(0).node.mined_height == H, "K28a: parent mined at H");
+    CHECK(w.item(1).state == State::Waiting &&
+              w.item(1).why.find("ChainLock not exposed by node; waiting for 2 confirmations") != std::string::npos &&
+              w.item(1).why.find("1/2 confirmations") != std::string::npos,
+          "K28a: N=1 but no ChainLock oracle -> waits for 2 confirmations, reason named");
+    CHECK(child_posts(w, p.ctx) == 0, "K28a: no child POST at 1 confirmation");
+    w.node.mine();
+    w.tick();
+    CHECK(w.item(1).state == State::Admitted && child_posts(w, p.ctx) == 1, "K28a: 2 confirmations -> child submitted");
+
+    // An explicit N above the fallback still applies.
+    World x;
+    const Pair q = add_pair(x, 402, 3);
+    x.tick();
+    x.node.mine({q.ptx});
+    x.node.mine();
+    x.tick();
+    CHECK(x.item(1).state == State::Waiting && x.item(1).why.find("2/3 confirmations") != std::string::npos,
+          "K28a: N=3 > fallback -> 2/3 waits");
+    x.node.mine();
+    x.tick();
+    CHECK(x.item(1).state == State::Admitted, "K28a: N=3 reached -> child submitted");
+
+    // Pure evaluation: the fallback depends only on the node not exposing the field.
+    const Item& it = x.item(1);
+    auto mined_at = [&](int64_t h) {
+        return [h](const std::string&) {
+            ParentStatus ps;
+            ps.known = true;
+            ps.mined = true;
+            ps.mined_height = h;
+            ps.mined_hash = std::string(64, 'a');
+            ps.block_still_at_height = true;
+            return ps;
+        };
+    };
+    Item one = it;
+    one.triggers.after_parent[0].min_confirmations = 1;
+    one.triggers.maturity.enabled = false;
+    one.triggers.not_before_height = 1;
+    ChainSnapshot c = tipat(2565400);
+    CHECK(!evaluate(one, c, 0, mined_at(2565400)).ready, "K28a: pure: 1 conf, no CL field -> waits");
+    CHECK(evaluate(one, c, 0, mined_at(2565399)).ready, "K28a: pure: 2 confs, no CL field -> final");
+    c.chainlock_exposed = true;
+    c.chainlock_height = 2565400;
+    CHECK(evaluate(one, c, 0, mined_at(2565400)).ready, "K28a: pure: CL at the parent's height, N=1 -> final at 1 conf");
+}
+
+// K28b: bestchainlock exposed -> mined is not enough; the ChainLock must
+// reach the parent's height, and the child fires in the tick it does.
+static void k28b_chainlock_present()
+{
+    World w;
+    w.node.cl_exposed = true;
+    w.node.cl_height = w.node.tip;
+    const Pair p = add_pair(w, 410);
+    w.tick();
+    w.node.mine({p.ptx});
+    const int64_t H = w.node.tip;
+    w.node.cl_height = H - 1;
+    w.tick();
+    CHECK(w.item(0).state == State::Mined && w.item(1).state == State::Waiting &&
+              w.item(1).why.find("not final yet: bestchainlock height " + std::to_string(H - 1) + " < " +
+                                 std::to_string(H)) != std::string::npos,
+          "K28b: parent mined, ChainLock below it -> child waits, reason names the ChainLock");
+    w.node.advance(4);
+    w.tick();
+    CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0,
+          "K28b: 5 confirmations but no ChainLock on the parent's block -> still waits");
+    CHECK(w.item(1).why.find("ChainLock not exposed") == std::string::npos, "K28b: no fallback text when the field exists");
+    w.node.cl_height = H;
+    const TickReport r = w.tick();
+    CHECK(w.item(1).state == State::Admitted && child_posts(w, p.ctx) == 1 && r.submits == 1,
+          "K28b: ChainLock reaches H -> child fires in the same tick");
+
+    // Exposed but null: no usable ChainLock -> wait (no fallback to a count).
+    World n;
+    n.node.cl_exposed = true;
+    n.node.cl_height.reset();
+    const Pair q = add_pair(n, 412);
+    n.tick();
+    n.node.mine({q.ptx});
+    n.node.advance(6);
+    n.tick();
+    CHECK(n.item(1).state == State::Waiting && n.item(1).why.find("no ChainLock yet") != std::string::npos,
+          "K28b: bestchainlock null -> waits, never falls back to a confirmation count");
+    n.node.cl_height = n.node.tip;
+    n.tick();
+    CHECK(n.item(1).state == State::Admitted, "K28b: ChainLock above H -> final (block at H verified) -> submitted");
+    CHECK(n.node.count("GET", route::kBlockHash) >= 1, "K28b: CL above H -> getblockhash verifies the block at H");
+
+    // A malformed field is treated as exposed-without-ChainLock.
+    World m;
+    const Pair r2 = add_pair(m, 414);
+    m.tick();
+    m.node.mine({r2.ptx});
+    m.node.advance(3);
+    m.node.script.push_back({"GET /api/explorer/getblockchaininfo",
+                             FakeNode::reply(200, nj{{"synced", true}, {"blocks", m.node.tip}, {"bestchainlock", "x"}})});
+    m.tick();
+    CHECK(m.item(1).state == State::Waiting && m.item(1).why.find("not {height, blockhash}") != std::string::npos,
+          "K28b: malformed bestchainlock -> waits with the shape named");
+}
+
+// K28c: the parent's block is reorged out before it is ChainLocked -> the
+// child never fires on the stale record, through either verification path.
+static void k28c_reorg_before_chainlock()
+{
+    SchedulerOptions lazy;
+    lazy.reorg_check_every = 1000; // the parent's own reorg check stays quiet: the child's check must catch it
+    {
+        World w(lazy);
+        w.node.cl_exposed = true;
+        w.node.cl_height = w.node.tip;
+        const Pair p = add_pair(w, 420);
+        w.tick();
+        w.node.mine({p.ptx});
+        const int64_t H = w.node.tip;
+        w.node.cl_height = H - 1;
+        w.tick();
+        CHECK(w.item(0).state == State::Mined && w.item(1).state == State::Waiting, "K28c: mined, not ChainLocked");
+        w.node.reorg(H);       // block H replaced, without the parent
+        w.node.cl_height = H;  // ...and the ChainLock lands on the replacement
+        w.tick();
+        CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0 &&
+                  w.item(1).why.find("no longer on the node's chain") != std::string::npos,
+              "K28c: ChainLock at H is another block -> child does not fire");
+        w.node.mine();
+        w.node.cl_height = w.node.tip; // ChainLock above H: the getblockhash path
+        w.tick();
+        CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0,
+              "K28c: ChainLock above H, block at H changed -> child still does not fire");
+    }
+    {
+        // With the parent's own reorg check on, the parent returns to waiting,
+        // is resubmitted, and the child fires only once it is final again.
+        SchedulerOptions eager;
+        eager.reorg_check_every = 1;
+        World w(eager);
+        w.node.cl_exposed = true;
+        w.node.cl_height = w.node.tip;
+        const Pair p = add_pair(w, 422);
+        w.tick();
+        w.node.mine({p.ptx});
+        const int64_t H = w.node.tip;
+        w.node.cl_height = H - 1;
+        w.tick();
+        w.node.reorg(H);
+        w.tick();
+        CHECK(w.item(0).state == State::Admitted && w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0,
+              "K28c: parent reorged out -> resubmitted; child waits (parent not mined)");
+        w.node.mine({p.ptx});
+        const int64_t H2 = w.node.tip;
+        w.tick();
+        CHECK(w.item(0).node.mined_height == H2 && w.item(1).state == State::Waiting, "K28c: parent re-mined, not final");
+        w.node.cl_height = H2;
+        w.tick();
+        CHECK(w.item(1).state == State::Admitted && child_posts(w, p.ctx) == 1, "K28c: parent final again -> child fires");
+    }
+}
+
+// K28d: allow_unconfirmed_parent defaults to false; only the explicit opt-in
+// lets a mempool parent fire the child.
+static void k28d_allow_unconfirmed_parent()
+{
+    World w;
+    const Pair p = add_pair(w, 430);
+    CHECK(!w.item(1).triggers.allow_unconfirmed_parent, "K28d: default false");
+    CHECK(queue_to_json(w.q).find("\"allow_unconfirmed_parent\": false") != std::string::npos,
+          "K28d: persisted explicitly as false");
+    for (int i = 0; i < 7; ++i) w.tick(120);
+    CHECK(w.item(0).state == State::Riding && w.node.mempool.count(p.ptx) == 1, "K28d: parent riding in the node mempool");
+    CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == 0 &&
+              w.item(1).why.find("never rides an unconfirmed parent") != std::string::npos,
+          "K28d: parent in the mempool -> child waits without the opt-in");
+
+    World o;
+    const Pair q = add_pair(o, 432, 1, /*allow_unconfirmed=*/true);
+    CHECK(o.item(1).triggers.allow_unconfirmed_parent &&
+              queue_to_json(o.q).find("\"allow_unconfirmed_parent\": true") != std::string::npos,
+          "K28d: opt-in recorded");
+    o.tick(); // the parent is submitted and enters the mempool; the child follows in the same tick
+    CHECK(o.item(0).state == State::Admitted && o.item(1).state == State::Admitted && child_posts(o, q.ctx) == 1,
+          "K28d: opt-in -> child fires while the parent is only in the mempool");
+    bool noted = false;
+    for (const auto& e : o.item(1).journal)
+        if (e.event == "allow_unconfirmed_parent") noted = true;
+    CHECK(noted, "K28d: the opt-in is journaled at enqueue");
+    Queue back;
+    std::string why;
+    CHECK(queue_from_json(queue_to_json(o.q), back, why) && back.items[1].triggers.allow_unconfirmed_parent,
+          "K28d: opt-in survives a round trip");
+}
+
+// K28e: the parent's block is reorged out AFTER the child was submitted and
+// mined -> both return to waiting; the child is resubmitted only once its
+// parent is final again (no ChainLock oracle: 2 confirmations).
+static void k28e_reorg_after_child_submitted()
+{
+    SchedulerOptions so;
+    so.reorg_check_every = 1;
+    World w(so);
+    const Pair p = add_pair(w, 440);
+    w.tick();
+    w.node.mine({p.ptx});
+    const int64_t H = w.node.tip;
+    w.tick();
+    w.node.mine();
+    w.tick();
+    CHECK(w.item(1).state == State::Admitted, "K28e: parent final (2 confs) -> child submitted");
+    w.node.mine({p.ctx});
+    w.tick();
+    CHECK(w.item(1).state == State::Mined, "K28e: child mined");
+    w.node.reorg(H);
+    w.node.reorg(H + 2);
+    const size_t before = child_posts(w, p.ctx);
+    w.tick();
+    CHECK(w.item(0).state == State::Admitted && w.item(1).state == State::Waiting && child_posts(w, p.ctx) == before,
+          "K28e: both blocks reorged -> parent resubmitted, child back to waiting, no child resubmit");
+    w.node.mine({p.ptx});
+    w.tick();
+    CHECK(w.item(1).state == State::Waiting && child_posts(w, p.ctx) == before, "K28e: parent re-mined, 1 conf -> child waits");
+    w.node.mine();
+    w.tick();
+    CHECK(w.item(1).state == State::Admitted && child_posts(w, p.ctx) == before + 1,
+          "K28e: parent final again -> child resubmitted");
+}
+
 int main()
 {
     k1_maturity_boundary();
@@ -2020,6 +2293,11 @@ int main()
     k9c_fee_above_max();
     k27b_explorer_disabled_alert();
     k9d_node_vocabulary();
+    k28a_chainlock_absent_fallback();
+    k28b_chainlock_present();
+    k28c_reorg_before_chainlock();
+    k28d_allow_unconfirmed_parent();
+    k28e_reorg_after_child_submitted();
 
     for (const auto& f : g_tmpfiles) {
         ::unlink(f.c_str());

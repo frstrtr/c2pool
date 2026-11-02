@@ -174,6 +174,7 @@ J encode_item(const Item& it)
     trig["not_before_height"] = json::opt(it.triggers.not_before_height);
     trig["not_before_time"] = json::opt(it.triggers.not_before_time);
     trig["after_parent"] = std::move(parents);
+    trig["allow_unconfirmed_parent"] = it.triggers.allow_unconfirmed_parent;
     j["triggers"] = std::move(trig);
 
     J sub = J::object();
@@ -383,6 +384,7 @@ bool decode_item(json::Reader& rd, const J& j, const std::string& p, Item& it)
                 it.triggers.after_parent.push_back(pr);
             }
         }
+        it.triggers.allow_unconfirmed_parent = rd.boolean(*t, "allow_unconfirmed_parent", tp);
     }
 
     if (const J* s = rd.obj(j, "submit", p)) {
@@ -1192,6 +1194,8 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
             }
         }
 
+        it.triggers.allow_unconfirmed_parent = req.allow_unconfirmed_parent;
+
         SubmitOptions& so = it.submit;
         so.expiry_blocks = req.expiry_blocks.value_or(staged.defaults.expiry_blocks);
         so.max_fee = req.max_fee.value_or(src.fee_mode == "relay" ? src.fee : staged.defaults.max_fee);
@@ -1207,6 +1211,10 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         journal(it, at, "enqueued",
                 have_manifest ? "hex sha256 matches manifest; txid matches txs[" + std::to_string(idx) + "]"
                               : "bare hex (no manifest)");
+        if (it.triggers.allow_unconfirmed_parent && !it.triggers.after_parent.empty())
+            journal(it, at, "allow_unconfirmed_parent",
+                    "operator opt-in: this child may be submitted while a parent is only in the node mempool "
+                    "(no finality wait)");
         r.ids.push_back(it.id);
         staged.items.push_back(std::move(it));
     }
