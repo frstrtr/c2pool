@@ -5,6 +5,8 @@
 
 #include "../../family/bitcoin/dash/InjectMaturity.hpp"
 
+#include <algorithm>
+
 namespace c2w::companion::sched {
 
 std::string format_eta_seconds(int64_t seconds)
@@ -95,45 +97,87 @@ Verdict evaluate(const Item& it, const ChainSnapshot& chain, int64_t now, const 
     }
 
     for (const ParentReq& p : t.after_parent) {
-        const int64_t need = p.min_confirmations > 0 ? p.min_confirmations : 1;
+        const int64_t req = p.min_confirmations > 0 ? p.min_confirmations : 1;
         const std::string name = "parent " + short_txid(p.txid);
-        const std::string needs =
-            "needs " + std::to_string(need) + (need == 1 ? " confirmation" : " confirmations");
         const ParentStatus ps = parents ? parents(p.txid) : ParentStatus{};
+        const std::string state = ps.state_text.empty() ? std::string("not mined") : ps.state_text;
+        auto unmet = [&](const std::string& why, std::optional<int64_t> eta = std::nullopt) {
+            v.unmet.push_back({TriggerKind::Parent, why, eta, std::nullopt});
+        };
         if (!ps.known) {
-            v.unmet.push_back({TriggerKind::Parent, name + " is not tracked; " + needs, std::nullopt, std::nullopt});
+            unmet(name + " is not tracked; needs to be mined and final");
+            continue;
+        }
+        if (t.allow_unconfirmed_parent) {
+            // Operator opt-in: the parent in the node mempool (or mined at any
+            // depth) is enough; neither N nor finality applies. A block that
+            // left the chain does not count: the parent must be back in the
+            // mempool or mined again.
+            const bool reorged = ps.mined && ps.block_still_at_height && !*ps.block_still_at_height;
+            if (ps.in_mempool || (ps.mined && !reorged)) continue;
+            unmet(name + (reorged ? " was mined but its block left the chain (" + ps.block_check_why + ")"
+                                  : " is " + state) +
+                  " and it is not in the node mempool (allow_unconfirmed_parent needs it at least in the mempool)");
             continue;
         }
         if (!ps.mined) {
-            v.unmet.push_back({TriggerKind::Parent,
-                               name + " is " + (ps.state_text.empty() ? std::string("not mined") : ps.state_text) +
-                                   " (not mined yet); " + needs,
-                               std::nullopt, std::nullopt});
+            unmet(name + " is " + state + " (not mined yet" +
+                  (ps.in_mempool ? "; it is in the node mempool, but a child never rides an unconfirmed parent "
+                                   "without allow_unconfirmed_parent"
+                                 : "") +
+                  "); needs to be mined and final");
             continue;
         }
         if (ps.height_unknown || !ps.mined_height) {
-            if (need > 1)
-                v.unmet.push_back({TriggerKind::Parent,
-                                   name + " is mined at an unknown height (outside the body window); cannot count " +
-                                       std::to_string(need) + " confirmations",
-                                   std::nullopt, std::nullopt});
-            continue; // mined => at least one confirmation
-        }
-        if (!chain.tip_known) {
-            v.unmet.push_back({TriggerKind::Parent,
-                               name + " mined at " + std::to_string(*ps.mined_height) + "; " + needs + "; " +
-                                   chain.tip_unknown_why,
-                               std::nullopt, std::nullopt});
+            unmet(name + " is mined at an unknown height (outside the body window): its finality cannot be "
+                         "verified; verify it on a full node, then re-add the child with allow_unconfirmed_parent");
             continue;
         }
-        const int64_t confs = chain.tip - *ps.mined_height + 1;
+        const int64_t h = *ps.mined_height;
+        if (!chain.tip_known) {
+            unmet(name + " mined at " + std::to_string(h) + "; " + chain.tip_unknown_why);
+            continue;
+        }
+        const bool cl = chain.chainlock_exposed;
+        const int64_t need = cl ? req : std::max(req, kFallbackParentConfirmations);
+        const int64_t confs = std::max<int64_t>(0, chain.tip - h + 1);
+        const std::string fallback =
+            "ChainLock not exposed by node; waiting for " + std::to_string(need) +
+            (need == 1 ? " confirmation" : " confirmations");
         if (confs < need) {
-            const int64_t left = need - (confs > 0 ? confs : 0);
-            v.unmet.push_back({TriggerKind::Parent,
-                               name + " mined at " + std::to_string(*ps.mined_height) + ", " +
-                                   std::to_string(confs > 0 ? confs : 0) + "/" + std::to_string(need) +
-                                   " confirmations; " + std::to_string(left) + " blocks " + format_eta_blocks(left),
-                               left, std::nullopt});
+            const int64_t left = need - confs;
+            unmet(name + " mined at " + std::to_string(h) + ", " + std::to_string(confs) + "/" + std::to_string(need) +
+                      " confirmations" + (cl ? std::string() : "; " + fallback) + "; " + std::to_string(left) +
+                      " blocks " + format_eta_blocks(left),
+                  left);
+            continue;
+        }
+        if (!ps.block_still_at_height) {
+            unmet(name + " mined at " + std::to_string(h) + ": cannot verify the block at " + std::to_string(h) +
+                  " is still its block (" + (ps.block_check_why.empty() ? std::string("not checked") : ps.block_check_why) +
+                  ")");
+            continue;
+        }
+        if (!*ps.block_still_at_height) {
+            unmet(name + " was mined at " + std::to_string(h) + " but that block is no longer on the node's chain (" +
+                  ps.block_check_why + "): reorged out; waiting for the parent to be mined and final again");
+            continue;
+        }
+        if (cl) {
+            if (!chain.chainlock_height) {
+                unmet(name + " mined at " + std::to_string(h) + ", " + std::to_string(confs) +
+                      (confs == 1 ? " confirmation" : " confirmations") + "; not final yet: " +
+                      (chain.chainlock_why.empty() ? std::string("no ChainLock reported") : chain.chainlock_why));
+                continue;
+            }
+            if (*chain.chainlock_height < h) {
+                const int64_t left = h - *chain.chainlock_height;
+                unmet(name + " mined at " + std::to_string(h) + ", " + std::to_string(confs) +
+                          (confs == 1 ? " confirmation" : " confirmations") + "; not final yet: bestchainlock height " +
+                          std::to_string(*chain.chainlock_height) + " < " + std::to_string(h),
+                      left);
+                continue;
+            }
         }
     }
 

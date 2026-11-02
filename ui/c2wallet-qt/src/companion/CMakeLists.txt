@@ -89,6 +89,10 @@ set(COMPANION_SOURCES
     sched/ArmPolicy.cpp
     sched/TokenFile.cpp
     sched/Config.cpp
+    # The runner side of the queue file (merge + locks) and the operator
+    # command line of c2wallet-qt-schedd (slice S2), still Qt-free.
+    sched/Runner.cpp
+    sched/SchedCli.cpp
     # Zeroizing buffer for the control token. One std-only TU with no key
     # symbols (the same file the signer libraries compile).
     ${CMAKE_CURRENT_SOURCE_DIR}/../secure/SecureString.cpp
@@ -130,4 +134,50 @@ if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_key_free.sh"
                 "$<TARGET_FILE:c2wallet-companion>"
     )
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Slice S2: the Qt Network transport (sched/QtNodeApi) and the headless runner
+# c2wallet-qt-schedd. Built whenever Qt6::Network is available: always from
+# ui/c2wallet-qt (the parent found it for the companion GUI), and standalone
+# when Qt6 Core + Network are installed. The Qt-free library above never links
+# Qt: QtNodeApi lives in its own static library that only the companion GUI
+# and this binary link. The daemon links Qt6::Core + Qt6::Network only: no
+# Gui, no Widgets (ci/check_no_gui_link.sh), and it is key-free like the
+# library (ci/check_key_free.sh over the linked binary).
+# ═══════════════════════════════════════════════════════════════════════════
+if(NOT TARGET Qt6::Network AND _companion_standalone)
+    find_package(Qt6 6.2 QUIET COMPONENTS Core Network)
+endif()
+if(TARGET Qt6::Network)
+    add_library(c2wallet-companion-qtnet STATIC sched/QtNodeApi.cpp)
+    target_link_libraries(c2wallet-companion-qtnet PUBLIC c2wallet-companion Qt6::Core Qt6::Network)
+
+    add_executable(c2wallet-qt-schedd schedd/main.cpp)
+    target_link_libraries(c2wallet-qt-schedd PRIVATE
+        c2wallet-companion-qtnet c2wallet-companion Qt6::Core Qt6::Network)
+
+    if(C2WALLET_QT_BUILD_TESTS OR _companion_standalone)
+        # QtNodeApi against a local QTcpServer fake node, the scheduler over
+        # it, and an end-to-end run of the daemon binary (init, add, consent,
+        # run, list, status, single instance, disarm after a node restart).
+        add_executable(c2wallet-qt-schedd-test tests/test_schedd_qt.cpp)
+        target_link_libraries(c2wallet-qt-schedd-test PRIVATE
+            c2wallet-companion-qtnet c2wallet-companion Qt6::Core Qt6::Network)
+        target_compile_definitions(c2wallet-qt-schedd-test PRIVATE
+            C2WALLET_SCHEDD_BIN="$<TARGET_FILE:c2wallet-qt-schedd>")
+        add_dependencies(c2wallet-qt-schedd-test c2wallet-qt-schedd)
+        add_test(NAME schedd_qt_kats COMMAND c2wallet-qt-schedd-test)
+
+        add_test(
+            NAME schedd_key_free_guard
+            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_key_free.sh"
+                    "$<TARGET_FILE:c2wallet-qt-schedd>")
+        add_test(
+            NAME schedd_no_gui_link_guard
+            COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../ci/check_no_gui_link.sh"
+                    "$<TARGET_FILE:c2wallet-qt-schedd>")
+    endif()
+else()
+    message(STATUS "c2wallet-qt companion: Qt6 Network not found; c2wallet-qt-schedd is not built")
 endif()

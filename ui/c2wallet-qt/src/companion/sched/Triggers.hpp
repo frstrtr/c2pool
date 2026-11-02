@@ -11,7 +11,18 @@
 //                      block h0 + 100)
 //   not_before_height  tip >= H
 //   not_before_time    now >= T (the online host's UTC clock)
-//   after_parent       each parent mined with tip - H + 1 >= N confirmations
+//   after_parent       each parent FINAL: mined at H with tip - H + 1 >= N
+//                      confirmations (default N = 1), the block at H still the
+//                      parent's block on the node's active chain, AND
+//                        - the node exposes bestchainlock: its height >= H
+//                          (the parent's block is ChainLocked), or
+//                        - it does not: N is raised to at least 2
+//                          ("ChainLock not exposed by node").
+//                      A parent that is only in the node mempool never
+//                      satisfies it, unless the item opts in with
+//                      allow_unconfirmed_parent (then mempool or mined is
+//                      enough and finality is not required, but a block
+//                      that left the chain still does not count).
 // A height-based condition with the tip unknown (node not synced) waits.
 // The `why` text lists the unmet conditions in the order maturity -> height ->
 // time -> parents, each with an ETA (blocks at 2.6 min per block).
@@ -28,10 +39,18 @@ namespace c2w::companion::sched {
 
 inline constexpr int64_t kSecondsPerBlock = 156; // 2.6 min, the DASH target spacing
 
+// Without a ChainLock oracle on the node, a parent counts as final only from
+// this many confirmations (an operator N above it still applies).
+inline constexpr int64_t kFallbackParentConfirmations = 2;
+
 struct ChainSnapshot {
     bool tip_known = false;
     int64_t tip = 0;
     std::string tip_unknown_why; // e.g. "tip unknown: node not synced (sync_blocked_by=...)"
+    // The node's best ChainLock (getblockchaininfo "bestchainlock").
+    bool chainlock_exposed = false;          // the field exists on this node
+    std::optional<int64_t> chainlock_height; // usable ChainLock height
+    std::string chainlock_why;               // exposed but unusable (null / malformed)
 };
 
 struct ParentStatus {
@@ -40,6 +59,12 @@ struct ParentStatus {
     std::optional<int64_t> mined_height;
     bool height_unknown = false;        // mined, block outside the body window
     std::string state_text;             // e.g. "riding", "in the mempool", "not seen in a block yet"
+    std::optional<std::string> mined_hash;
+    // Is the block at mined_height on the node's active chain still the block
+    // the parent was found in? nullopt: not verified (block_check_why says why).
+    std::optional<bool> block_still_at_height;
+    std::string block_check_why;
+    bool in_mempool = false;            // the node's mempool holds the parent now
 };
 
 using ParentLookup = std::function<ParentStatus(const std::string& txid)>;

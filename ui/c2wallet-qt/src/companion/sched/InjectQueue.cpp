@@ -174,6 +174,7 @@ J encode_item(const Item& it)
     trig["not_before_height"] = json::opt(it.triggers.not_before_height);
     trig["not_before_time"] = json::opt(it.triggers.not_before_time);
     trig["after_parent"] = std::move(parents);
+    trig["allow_unconfirmed_parent"] = it.triggers.allow_unconfirmed_parent;
     j["triggers"] = std::move(trig);
 
     J sub = J::object();
@@ -267,6 +268,7 @@ std::string queue_to_json(const Queue& q)
 
     const ArmPolicyRecord& p = q.arm_policy;
     J ap = J::object();
+    ap["rev"] = p.rev;
     ap["auto_arm"] = p.auto_arm;
     ap["auto_disarm_when_idle"] = p.auto_disarm_when_idle;
     ap["consented_at"] = json::opt(p.consented_at);
@@ -302,12 +304,16 @@ std::string queue_to_json(const Queue& q)
         alerts.push_back(std::move(aj));
     }
     root["alerts"] = std::move(alerts);
+    root["alerts_acked_at"] = json::opt(q.alerts_acked_at);
 
     J runner = J::object();
     runner["last_enabled"] = json::opt(q.runner.last_enabled);
     runner["tick_count"] = q.runner.tick_count;
     runner["last_tick_at"] = json::opt(q.runner.last_tick_at);
     runner["explorer_off"] = q.runner.explorer_off;
+    runner["enabled_seen_at"] = json::opt(q.runner.enabled_seen_at);
+    runner["enabled_seen_uptime"] = json::opt(q.runner.enabled_seen_uptime);
+    runner["chainlock_fork"] = q.runner.chainlock_fork;
     root["runner"] = std::move(runner);
 
     return json::dump(root);
@@ -383,6 +389,7 @@ bool decode_item(json::Reader& rd, const J& j, const std::string& p, Item& it)
                 it.triggers.after_parent.push_back(pr);
             }
         }
+        it.triggers.allow_unconfirmed_parent = rd.boolean(*t, "allow_unconfirmed_parent", tp);
     }
 
     if (const J* s = rd.obj(j, "submit", p)) {
@@ -503,6 +510,7 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
     }
     if (const J* a = rd.obj(root, "arm_policy", "queue")) {
         ArmPolicyRecord& p = q.arm_policy;
+        p.rev = rd.i64(*a, "rev", "queue.arm_policy");
         p.auto_arm = rd.boolean(*a, "auto_arm", "queue.arm_policy");
         p.auto_disarm_when_idle = rd.boolean(*a, "auto_disarm_when_idle", "queue.arm_policy");
         p.consented_at = rd.ostr(*a, "consented_at", "queue.arm_policy");
@@ -545,11 +553,20 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why)
                 {rd.str((*al)[i], "at", ap), rd.str((*al)[i], "kind", ap), rd.str((*al)[i], "detail", ap)});
         }
     }
+    q.alerts_acked_at = rd.ostr(root, "alerts_acked_at", "queue");
+    if (q.alerts_acked_at) {
+        int64_t v = 0;
+        std::string perr;
+        if (!parse_utc(*q.alerts_acked_at, v, perr)) rd.fail("queue.alerts_acked_at", perr);
+    }
     if (const J* r = rd.obj(root, "runner", "queue")) {
         q.runner.last_enabled = rd.obool(*r, "last_enabled", "queue.runner");
         q.runner.tick_count = rd.i64(*r, "tick_count", "queue.runner");
         q.runner.last_tick_at = rd.ostr(*r, "last_tick_at", "queue.runner");
         q.runner.explorer_off = rd.boolean(*r, "explorer_off", "queue.runner");
+        q.runner.enabled_seen_at = rd.oi64(*r, "enabled_seen_at", "queue.runner");
+        q.runner.enabled_seen_uptime = rd.oi64(*r, "enabled_seen_uptime", "queue.runner");
+        q.runner.chainlock_fork = rd.boolean(*r, "chainlock_fork", "queue.runner");
     }
     if (!rd.ok()) {
         why = rd.err;
@@ -1103,6 +1120,7 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
     }
     if (req.inputs_known_mature_consent && req.inputs_known_mature_consent->empty())
         return refuse("the inputs-are-mature override needs a consent text");
+    if (req.explicit_h0 && *req.explicit_h0 <= 0) return refuse("h0 must be > 0");
 
     Queue staged = q;
     for (size_t idx : lines) {
@@ -1142,7 +1160,26 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         }
 
         MaturityTrigger& mt = it.triggers.maturity;
-        if (have_manifest && mv.maturity_known) {
+        if (req.explicit_h0) {
+            const int64_t h0 = *req.explicit_h0;
+            const int64_t s_h0 = c2w::dash::maturity::spendable_from_height(h0, /*coinbase_or_unknown=*/true);
+            mt.enabled = true;
+            if (have_manifest && mv.maturity_known) {
+                mt.safe_from_height = std::max(*mv.safe_from_height, s_h0);
+                mt.youngest_input_height = std::max(mv.youngest_input_height.value_or(0), h0);
+                mt.source = s_h0 > *mv.safe_from_height
+                                ? "operator h0=" + std::to_string(h0) + " (later than manifest.maturity.safe_from_height " +
+                                      std::to_string(*mv.safe_from_height) + ")"
+                                : "manifest.maturity.safe_from_height (operator h0=" + std::to_string(h0) +
+                                      " is not later)";
+            } else {
+                mt.safe_from_height = s_h0;
+                mt.youngest_input_height = h0;
+                mt.source = "operator h0=" + std::to_string(h0) + " (coinbase rule: spendable in block h0+100)";
+                mt.inputs_with_unknown_height =
+                    have_manifest ? mv.inputs_with_unknown_height : src.vin;
+            }
+        } else if (have_manifest && mv.maturity_known) {
             mt.enabled = true;
             mt.safe_from_height = *mv.safe_from_height;
             mt.youngest_input_height = mv.youngest_input_height.value_or(0);
@@ -1192,6 +1229,8 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
             }
         }
 
+        it.triggers.allow_unconfirmed_parent = req.allow_unconfirmed_parent;
+
         SubmitOptions& so = it.submit;
         so.expiry_blocks = req.expiry_blocks.value_or(staged.defaults.expiry_blocks);
         so.max_fee = req.max_fee.value_or(src.fee_mode == "relay" ? src.fee : staged.defaults.max_fee);
@@ -1207,6 +1246,10 @@ EnqueueResult enqueue(Queue& q, const EnqueueRequest& req, int64_t now)
         journal(it, at, "enqueued",
                 have_manifest ? "hex sha256 matches manifest; txid matches txs[" + std::to_string(idx) + "]"
                               : "bare hex (no manifest)");
+        if (it.triggers.allow_unconfirmed_parent && !it.triggers.after_parent.empty())
+            journal(it, at, "allow_unconfirmed_parent",
+                    "operator opt-in: this child may be submitted while a parent is only in the node mempool "
+                    "(no finality wait)");
         r.ids.push_back(it.id);
         staged.items.push_back(std::move(it));
     }

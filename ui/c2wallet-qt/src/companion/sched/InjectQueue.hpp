@@ -110,6 +110,11 @@ struct Triggers {
     std::optional<int64_t> not_before_height;
     std::optional<std::string> not_before_time; // UTC ISO-8601 'Z'
     std::vector<ParentReq> after_parent;
+    // Operator opt-in (default false): a parent in the node mempool satisfies
+    // after_parent. Without it a child waits until every parent is mined AND
+    // final (ChainLocked, or >= 2 confirmations when the node exposes no
+    // ChainLock), so a reorg of the parent's block cannot strand the child.
+    bool allow_unconfirmed_parent = false;
 };
 
 struct SubmitOptions {
@@ -206,6 +211,7 @@ struct Defaults {
 
 // The recorded auto-arm consent (§7.2). Logic lives in ArmPolicy.hpp.
 struct ArmPolicyRecord {
+    int64_t rev = 0; // bumped by every operator change (record_consent); the runner never writes it
     bool auto_arm = false;
     bool auto_disarm_when_idle = false;
     std::optional<std::string> consented_at;
@@ -226,6 +232,12 @@ struct RunnerState {
     int64_t tick_count = 0;
     std::optional<std::string> last_tick_at;
     bool explorer_off = false;        // the node answered "Explorer not enabled" (alert raised once)
+    // The last tick that saw the node armed (enabled=true) and the node's
+    // /uptime then: a later disarm is a restart when the uptime went back
+    // (or is shorter than the time since), else a deliberate runtime disarm.
+    std::optional<int64_t> enabled_seen_at;     // unix seconds
+    std::optional<int64_t> enabled_seen_uptime; // seconds, when /uptime answered
+    bool chainlock_fork = false;      // the node's ChainLock is not on its chain (alert raised once)
 };
 
 struct Queue {
@@ -238,6 +250,9 @@ struct Queue {
     std::vector<Item> items;
     std::vector<Tracked> tracked;
     std::vector<Alert> alerts;
+    // Operator acknowledgement (the daemon's ack-alerts): alerts raised at or
+    // before this UTC time no longer count as pending for `status`.
+    std::optional<std::string> alerts_acked_at;
     RunnerState runner;
 };
 
@@ -255,8 +270,12 @@ bool queue_from_json(const std::string& text, Queue& out, std::string& why);
 bool save_queue_file(const std::string& path, const Queue& q, std::string& why);
 bool load_queue_file(const std::string& path, Queue& out, std::string& why);
 
-// flock(path + ".lock"). The runner takes it non-blocking (a second runner
-// exits "lock held"); edits take it blocking for a short read-modify-write.
+// flock(path + ".lock"). Two locks guard a queue (the headless runner, slice
+// S2): the RUNNER lock, acquire(queue_path + ".runner", non-blocking) =
+// queue.json.runner.lock, held for the runner's lifetime so a second runner
+// exits "lock held"; and the EDIT lock, acquire(queue_path, blocking) =
+// queue.json.lock, held only for each short read-modify-write (operator
+// edits and every runner persist), so edits never wait for a running loop.
 class QueueLock {
 public:
     QueueLock() = default;
@@ -316,8 +335,15 @@ struct EnqueueRequest {
     std::optional<std::string> not_before_time;
     std::vector<ParentReq> after_parent;       // explicit parents (merged with discovered ones)
     bool discover_parents = true;
+    bool allow_unconfirmed_parent = false;     // explicit opt-in only (CLI flag / dialog checkbox)
     // Required when maturity is unknown and no not_before_height is given.
     std::optional<std::string> inputs_known_mature_consent;
+    // Operator-stated height h0 of the youngest input, taken as a coinbase
+    // (spendable in block h0 + 100). With a manifest whose maturity is known
+    // the later of the two rules applies (an explicit h0 can only delay); with
+    // a bare hex or an unknown manifest maturity it enables the maturity
+    // trigger by itself.
+    std::optional<int64_t> explicit_h0;
     int64_t maturity_slack_blocks = 0;
     std::optional<int64_t> expiry_blocks;
     std::optional<int64_t> max_fee;

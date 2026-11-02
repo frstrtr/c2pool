@@ -17,6 +17,7 @@
 //   GET  /api/explorer/getmempoolentry?txid=   time_added (the IS-hold clock)
 //   GET  /api/explorer/getblock?height=H       mined? (retained bodies)
 //   GET  /api/explorer/getblockhash?height=H   reorg check
+//   GET  /uptime                         node process uptime (restart vs operator disarm)
 
 #include <string>
 
@@ -45,6 +46,7 @@ inline constexpr const char* kRawMempool = "/api/explorer/getrawmempool";
 inline constexpr const char* kMempoolEntry = "/api/explorer/getmempoolentry?txid=";
 inline constexpr const char* kBlockAtHeight = "/api/explorer/getblock?height=";
 inline constexpr const char* kBlockHash = "/api/explorer/getblockhash?height=";
+inline constexpr const char* kUptime = "/uptime"; // bare integer: seconds since the node process started
 } // namespace route
 
 } // namespace c2w::companion::sched

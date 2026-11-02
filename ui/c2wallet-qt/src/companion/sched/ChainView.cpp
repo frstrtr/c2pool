@@ -41,9 +41,61 @@ void ChainView::begin_tick()
 {
     tip_.reset();
     status_.reset();
+    uptime_.reset();
     mempool_.reset();
     blocks_.clear();
+    hashes_.clear();
 }
+
+namespace {
+
+// "bestchainlock" in its node forms (see ChainView.hpp): an object -> an
+// adopted ChainLock (blockhash / known_block may be null); the top-level
+// null (the ledger route's convention) or "unavailable.bestchainlock" -> the
+// node knows the field but has adopted none; neither -> not exposed.
+ChainLockInfo read_chainlock(const json::J& j)
+{
+    ChainLockInfo c;
+    if (!j.is_object()) return c;
+    if (!j.contains("bestchainlock")) {
+        if (j.contains("unavailable") && j["unavailable"].is_object() && j["unavailable"].contains("bestchainlock")) {
+            c.exposed = true;
+            const json::J& u = j["unavailable"]["bestchainlock"];
+            c.why = "the node has not adopted a ChainLock yet (" +
+                    (u.is_string() ? u.get<std::string>() : std::string("unavailable")) + ")";
+        }
+        return c;
+    }
+    c.exposed = true;
+    const json::J& cl = j["bestchainlock"];
+    if (cl.is_null()) {
+        c.why = "the node reports no ChainLock yet (bestchainlock is null)";
+        return c;
+    }
+    if (!cl.is_object() || !cl.contains("height") || !cl["height"].is_number_integer() ||
+        cl["height"].get<int64_t>() < 1) {
+        c.why = "bestchainlock is not {height, blockhash, ...}";
+        return c;
+    }
+    const json::J* bh = cl.contains("blockhash") ? &cl["blockhash"] : nullptr;
+    if (bh && !bh->is_null() && !bh->is_string()) {
+        c.why = "bestchainlock.blockhash is neither a string nor null";
+        return c;
+    }
+    const json::J* kb = cl.contains("known_block") ? &cl["known_block"] : nullptr;
+    if (kb && !kb->is_null() && !kb->is_boolean()) {
+        c.why = "bestchainlock.known_block is neither a boolean nor null";
+        return c;
+    }
+    c.known = true;
+    c.height = cl["height"].get<int64_t>();
+    if (bh && bh->is_string()) c.blockhash = bh->get<std::string>();
+    if (kb && kb->is_boolean()) c.known_block = kb->get<bool>();
+    if (cl.contains("provenance") && cl["provenance"].is_string()) c.provenance = cl["provenance"].get<std::string>();
+    return c;
+}
+
+} // namespace
 
 const TipInfo& ChainView::tip()
 {
@@ -71,6 +123,7 @@ const TipInfo& ChainView::tip()
             if (j.contains("bestblockhash") && j["bestblockhash"].is_string())
                 t.hash = j["bestblockhash"].get<std::string>();
         }
+        t.chainlock = read_chainlock(j);
     }
     tip_ = t;
     return *tip_;
@@ -112,6 +165,24 @@ const InjectStatus& ChainView::inject_status(bool refresh)
     }
     status_ = s;
     return *status_;
+}
+
+const UptimeInfo& ChainView::uptime()
+{
+    if (uptime_) return *uptime_;
+    UptimeInfo u;
+    json::J j;
+    bool te = false;
+    if (!read_reply(api_.get(route::kUptime), j, u.why, te)) {
+        u.why = "/uptime: " + u.why;
+    } else if (!j.is_number_integer() || j.get<int64_t>() < 0) {
+        u.why = "/uptime is not a non-negative integer";
+    } else {
+        u.ok = true;
+        u.seconds = j.get<int64_t>();
+    }
+    uptime_ = u;
+    return *uptime_;
 }
 
 const MempoolView& ChainView::mempool()
@@ -171,6 +242,7 @@ const BlockInfo& ChainView::block_at(int64_t height)
     bool te = false;
     if (!read_reply(api_.get(std::string(route::kBlockAtHeight) + std::to_string(height)), j, why, te)) {
         b.error = "getblock " + std::to_string(height) + ": " + why;
+        b.transport_error = te;
     } else if (!j.is_object()) {
         b.error = "getblock " + std::to_string(height) + ": not an object";
     } else {
@@ -190,14 +262,22 @@ const BlockInfo& ChainView::block_at(int64_t height)
 
 std::optional<std::string> ChainView::block_hash(int64_t height, std::string& why)
 {
+    auto cached = hashes_.find(height);
+    if (cached != hashes_.end()) {
+        why = cached->second.why;
+        return cached->second.hash;
+    }
+    HashAnswer a;
     json::J j;
     bool te = false;
-    if (!read_reply(api_.get(std::string(route::kBlockHash) + std::to_string(height)), j, why, te))
-        return std::nullopt;
-    if (j.is_string()) return j.get<std::string>();
-    if (j.is_object() && j.contains("result") && j["result"].is_string()) return j["result"].get<std::string>();
-    why = "getblockhash: unexpected reply shape";
-    return std::nullopt;
+    if (read_reply(api_.get(std::string(route::kBlockHash) + std::to_string(height)), j, a.why, te)) {
+        if (j.is_string()) a.hash = j.get<std::string>();
+        else if (j.is_object() && j.contains("result") && j["result"].is_string()) a.hash = j["result"].get<std::string>();
+        else a.why = "getblockhash: unexpected reply shape";
+    }
+    hashes_.emplace(height, a);
+    why = a.why;
+    return a.hash;
 }
 
 FindResult ChainView::find_tx(const std::string& txid, int64_t lo, int64_t hi)
@@ -209,6 +289,11 @@ FindResult ChainView::find_tx(const std::string& txid, int64_t lo, int64_t hi)
         if (!b.ok || !b.has_body) {
             ++f.missing;
             if (f.why.empty()) f.why = b.ok ? "no retained body at " + std::to_string(h) : b.error;
+            // An unresponsive node: stop instead of paying one timeout per height.
+            if (b.transport_error) {
+                f.missing += h - lo;
+                break;
+            }
             continue;
         }
         ++f.searched;
