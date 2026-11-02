@@ -65,7 +65,13 @@ inline constexpr const char* SandboxScriptsigTooLarge = "inject-sandbox-scriptsi
 inline constexpr const char* SandboxTotalScriptsigTooLarge = "inject-sandbox-total-scriptsig-too-large";
 inline constexpr const char* SandboxTooManySigops = "inject-sandbox-too-many-sigops";
 inline constexpr const char* SandboxUnknown = "inject-sandbox-unknown";
-// Reserved (runtime-submit design; not on master):
+// Node slice N3 (POST /api/tx-inject/validate and the submit path it shares;
+// branch dash/utxo-scan-endpoint, NOT on master yet). They land with that node
+// PR, so they are kept out of node_cause_names() (the master list the parity
+// KAT pins) and listed by pending_node_cause_names() instead.
+inline constexpr const char* TipUnknown = "inject-tip-unknown";                     // node has no tip yet: wait
+inline constexpr const char* InputSpentInMempool = "inject-input-spent-in-mempool"; // another pool tx spends an input
+// Reserved (runtime-submit design; not on master; N3 emits it too):
 inline constexpr const char* ImmatureCoinbaseInput = "inject-immature-coinbase-input";
 inline constexpr const char* PrevoutPrefix = "inject-prevout-";
 inline constexpr const char* OraclePrefix = "inject-oracle-";
@@ -74,8 +80,15 @@ inline constexpr const char* BadToken = "missing or invalid control token";
 } // namespace cause
 
 // Every cause name the master node can put in a submit reply (the list above,
-// without the reserved prefixes), for the KAT drift check.
+// without the reserved prefixes and the pending N3 names), for the KAT drift check.
 const char* const* node_cause_names(size_t& count);
+
+// The names a node built from a pending node slice emits on top of master
+// (N3: inject-tip-unknown, inject-input-spent-in-mempool,
+// inject-immature-coinbase-input). Each is classified; the drift tripwire
+// accepts them in node headers, and they move into node_cause_names() when
+// that node slice is merged.
+const char* const* pending_node_cause_names(size_t& count);
 
 struct Outcome {
     State next = State::Ready;

@@ -65,6 +65,12 @@ const char* const kNodeCauses[] = {
     cause::SandboxUnknown,
 };
 
+const char* const kPendingNodeCauses[] = {
+    cause::TipUnknown,
+    cause::InputSpentInMempool,
+    cause::ImmatureCoinbaseInput,
+};
+
 Outcome make(State s, RetryClass r, const std::string& c, const std::string& why, int http)
 {
     Outcome o;
@@ -126,6 +132,21 @@ Outcome classify_cause(const std::string& c, int http)
         o.alert = true;
         return o;
     }
+    if (c == cause::TipUnknown)
+        return make(State::Ready, RetryClass::Retry5m, c,
+                    "node has no chain tip yet (starting or syncing; inject-tip-unknown); retry in 5 min", http);
+    if (c == cause::InputSpentInMempool) {
+        // Terminal for this blob: another tx in the node's pool spends one of
+        // its inputs. It can only pass if that tx leaves the pool, which is an
+        // operator call (requeue), never an automatic retry.
+        Outcome o = make(State::Refused, RetryClass::None, c,
+                         "refused by the node (" + c + "): another tx in the node's mempool already spends an "
+                         "input of this tx (a double spend of a queued or foreign tx?); requeue only if that tx "
+                         "leaves the pool",
+                         http);
+        o.alert = true;
+        return o;
+    }
     if (c == cause::ImmatureCoinbaseInput) {
         Outcome o = make(State::Waiting, RetryClass::None, c,
                          "node refused an immature coinbase input: the scheduler fired early (bug); waiting",
@@ -151,6 +172,12 @@ const char* const* node_cause_names(size_t& count)
 {
     count = sizeof(kNodeCauses) / sizeof(kNodeCauses[0]);
     return kNodeCauses;
+}
+
+const char* const* pending_node_cause_names(size_t& count)
+{
+    count = sizeof(kPendingNodeCauses) / sizeof(kPendingNodeCauses[0]);
+    return kPendingNodeCauses;
 }
 
 Outcome classify_submit(const HttpReply& r, const std::string& our_txid)

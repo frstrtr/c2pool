@@ -59,10 +59,33 @@ names="$(echo "$syms" | awk '{print $NF}' | sed 's/@.*//' | sort -u)"
 #   * secp256k1_ecdsa_sign / secp256k1_schnorrsig_sign — the ec signing entry points
 #   * RFC6979 / rfc6979     — deterministic-nonce signing
 #   * c2w::signer namespace  — the whole key-bearing module
-FORBIDDEN_RE='CKey|CExtKey|SignatureHash|make_legacy_sig|make_bip143_sig|make_taproot|secp256k1_ecdsa_sign|secp256k1_schnorrsig_sign|[Rr][Ff][Cc]6979|c2w::signer|N3c2w6signer|_ZN3c2w6signer'
+# and the DASH key layer the key-free plan library (c2wallet-dash-plan, scan &
+# plan slice S-A) is split away from, which the tokens above do not see:
+#   * FoundKey / find_key_for_address / KeyScanRange — the BIP32 funding-key
+#     scan (KeyScan.cpp) and the scalar it returns
+#   * KeyInput / load_funding_key / bind_found_key — the inject model's key stage
+#   * secp256k1_ec_seckey_* / secp256k1_ec_privkey_* / secp256k1_keypair_* /
+#     secp256k1_ec_pubkey_create — every secret-scalar EC operation
+FORBIDDEN_RE='CKey|CExtKey|SignatureHash|make_legacy_sig|make_bip143_sig|make_taproot|secp256k1_ecdsa_sign|secp256k1_schnorrsig_sign|[Rr][Ff][Cc]6979|c2w::signer|N3c2w6signer|_ZN3c2w6signer|FoundKey|find_key_for_address|KeyScanRange|8KeyInput|load_funding_key|bind_found_key|secp256k1_ec_seckey|secp256k1_ec_privkey|secp256k1_keypair|secp256k1_ec_pubkey_create'
+
+# The hdkeys library (c2w::hdkeys) is the signer's key layer: BIP39 seeds,
+# BIP32 derivation, WIF/BIP38/keystore/wallet-file import. A key-free target may
+# reference ONLY its leaf helpers — hex (from_hex / to_hex) and the JSON reader
+# (mjson) — which the plan library's intake uses; any other c2w::hdkeys symbol
+# means key code was linked.
+HDKEYS_RE='3c2w6hdkeys'
+HDKEYS_ALLOWED_RE='3c2w6hdkeys(8from_hex|6to_hex|5mjson)'
 
 echo "-- signing / private-key symbol scan --"
 hits="$(echo "$names" | grep -E "$FORBIDDEN_RE" || true)"
+# A name is a hit when it still names c2w::hdkeys after the allowed helper
+# components are deleted from it (so a helper in a key function's signature
+# does not hide that function).
+hd_hits="$(echo "$names" | awk -v allowed="$HDKEYS_ALLOWED_RE" -v re="$HDKEYS_RE" \
+    '{ s = $0; gsub(allowed, "", s); if (s ~ re) print $0 }')"
+if [[ -n "$hd_hits" ]]; then
+    hits="$(printf '%s\n%s' "$hits" "$hd_hits" | sed '/^$/d')"
+fi
 
 if [[ -n "$hits" ]]; then
     echo "FAIL: companion imports/defines private-key or signing symbol(s):" >&2

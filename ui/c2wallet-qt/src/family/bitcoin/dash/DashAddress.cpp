@@ -3,12 +3,15 @@
 
 #include "DashError.hpp"
 
-// btclibs base58check codec (reused, design §2.4) + the hdkeys P2PKH encoder
-// which is itself base58check over the CoinParams version byte. NO dashscript
-// headers here.
+// btclibs base58check codec (reused, design §2.4), for both directions. The
+// encoder is the same framing hdkeys::encode_p2pkh uses (base58check over the
+// version byte + hash160), called directly so this key-free file
+// (c2wallet-dash-plan) never references hdkeys Address.cpp: that object also
+// derives address candidates from a secret scalar and would pull the BIP32 /
+// secp256k1 key code into the online companion. NO dashscript headers here.
 #include <base58.h>
 
-#include "../hdkeys/Address.hpp"
+#include <vector>
 
 namespace c2w::dash {
 
@@ -38,7 +41,11 @@ std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet)
 
 std::string h160_to_addr(const std::array<uint8_t, 20>& h160, bool testnet)
 {
-    return hdkeys::encode_p2pkh(p2pkh_version(testnet), h160);
+    std::vector<unsigned char> v;
+    v.reserve(21);
+    v.push_back(p2pkh_version(testnet));
+    v.insert(v.end(), h160.begin(), h160.end());
+    return EncodeBase58Check(Span<const unsigned char>(v.data(), v.size()));
 }
 
 std::array<uint8_t, 25> p2pkh_script(const std::array<uint8_t, 20>& h160)

@@ -4,7 +4,7 @@
 #include "DashAddress.hpp"
 #include "DashError.hpp"
 #include "InjectCaps.hpp"
-#include "SweepTx.hpp"
+#include "SweepPlan.hpp"
 #include "UtxoIntake.hpp"
 
 #include "../hdkeys/HexUtil.hpp"

@@ -62,6 +62,37 @@ signer's `no_network_link_guard`:
   the daemon's NEEDED entries carry Qt6Core + Qt6Network and no Gui, Widgets,
   GL, X11 or Wayland library).
 
+The key-free DASH plan library `c2wallet-dash-plan` (address decode, UTXO
+intake, the sweep planner, the manifest, the gobject hash; split out of
+`c2wallet-dash-common` so the companion can plan without key code) adds:
+
+- `dash_plan_kats` (`c2wallet-dash-plan-test`, linked against the plan library
+  only);
+- `dash_plan_key_free_guard` and `dash_plan_test_key_free_guard`
+  (`check_key_free.sh` over `libc2wallet-dash-plan.a` and over that test
+  binary);
+- `dash_key_scan_probe_key_free_guard_negative_control`: the same guard over
+  `c2wallet-dash-key-scan-probe`, a binary that links only the funding-key
+  scan (`KeyScan.cpp`, BIP32 derivation) of the key layer. It must FAIL
+  (`WILL_FAIL`): it proves the guard sees the key code the split keeps out of
+  the plan library (the token list before the split passed it).
+
+The companion's Scan & Plan core (`src/companion/scan/`, inside
+`c2wallet-companion`, which now also links `c2wallet-dash-plan`) adds:
+
+- `companion_scan_kats` (K1-K16: scripted fake dashd and fake c2pool node over
+  the real getaddressutxos fixture, a replayed real dashd scantxoutset session,
+  synthesised scantxoutset / `/api/utxo/scan` shapes);
+- `companion_scan_key_free_guard` (`check_key_free.sh` over the LINKED scan
+  test binary: the companion objects plus every plan-library and hdkeys object
+  the scan code pulls in);
+- `companion_scan_export_parity` (the scan's `<name>.utxos.json` is
+  byte-identical to `tools/export_utxos.py` against `mock_dash_cli.py`);
+- `scan_signer_roundtrip` (full `ui/c2wallet-qt` build only: the export and
+  sidecar through the signer's own `DashInjectModel` import, screen, plan, key
+  and sign; a test binary that links the key libraries, so no key-free guard
+  runs over it).
+
 The same targets build standalone from `ui/c2wallet-qt/src/companion` when Qt6
 Core + Network are installed. A CI job for them would extend the patch above
 with `nlohmann-json3-dev` and run the full `ctest`; it is not part of the

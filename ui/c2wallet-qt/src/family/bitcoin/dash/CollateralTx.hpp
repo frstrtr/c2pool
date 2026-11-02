@@ -33,6 +33,7 @@
 #include "InjectCaps.hpp"
 #include "InjectMaturity.hpp"
 #include "KeyScan.hpp"
+#include "SweepPlan.hpp" // Utxo, SignedTx, FeeMode and the amount constants (key-free)
 
 #include <array>
 #include <cstdint>
@@ -41,34 +42,6 @@
 #include <vector>
 
 namespace c2w::dash {
-
-// duffs per DASH; the governance fee is 1 DASH (governance/object.h:30).
-inline constexpr int64_t kCoin = 100000000;
-inline constexpr int64_t kGovernanceProposalFee = 1 * kCoin;
-inline constexpr int64_t kMaxMoney = 21000000 * kCoin; // Dash Core amount.h MAX_MONEY
-inline constexpr int64_t kDustDuffs = 5460;
-inline constexpr int64_t kDefaultFeeRate = 1000; // duffs/kB (Dash min relay)
-inline constexpr int64_t kDefaultMinConf = 101;  // funding UTXOs are often coinbase
-inline constexpr int64_t kCoinbaseMaturity = maturity::kCoinbaseMaturity; // consensus COINBASE_MATURITY
-
-// Relay: a relayable tx paying fee_rate. InjectOnlyZeroFee: fee exactly 0, for
-// the c2pool inject / pin lane only (Dash Core peers will not relay it).
-enum class FeeMode : uint8_t { Relay, InjectOnlyZeroFee };
-
-struct Utxo {
-    std::string txid;                // display-order hex
-    uint32_t vout = 0;
-    int64_t satoshis = 0;
-    int64_t confirmations = 0;
-    std::string script_pubkey_hex;   // validated against the funding script when present;
-                                     // REQUIRED in inject mode, with sweep_all, and for SweepTx
-    // true or nullopt (unknown, treated as coinbase) => max(min_confirmations,
-    // kCoinbaseMaturity) confirmations; false => one confirmation is enough.
-    std::optional<bool> coinbase = std::nullopt;
-    // Block height that created the output; 0 = unknown. The target-height
-    // re-screen (rescreen_at_height) projects confirmations from it.
-    int64_t height = 0;
-};
 
 struct CollateralPlan {
     std::array<uint8_t, 32> gov_hash_internal{};
@@ -88,12 +61,6 @@ struct CollateralPlan {
     size_t skipped_dust = 0;             // below dust_floor; listed in the summary
     size_t est_signed_bytes = 0;         // worst case for the request's key_encoding
     std::vector<uint8_t> unsigned_tx;    // the exact bytes sign_collateral will sign (blank scriptSigs)
-};
-
-struct SignedTx {
-    std::string hex;   // raw signed transaction hex — the only secret-free artifact
-    std::string txid;  // display-order txid
-    size_t size = 0;
 };
 
 // The gobject params + funding/UTXO inputs for one collateral tx.

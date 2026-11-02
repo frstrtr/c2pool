@@ -8,10 +8,10 @@
 // air-gapped machine's clock is not trusted, so the online side records the
 // receipt time. The output is deterministic (fixed key order, no floats).
 //
-// std-only header; the .cpp sits on the btclibs closure (CSHA256 for the
-// digests), in c2wallet-dash-common.
+// std-only, key-free header; the .cpp sits on the btclibs closure (CSHA256 for
+// the digests), in c2wallet-dash-plan.
 
-#include "CollateralTx.hpp"
+#include "SweepPlan.hpp"
 
 #include <cstdint>
 #include <string>
