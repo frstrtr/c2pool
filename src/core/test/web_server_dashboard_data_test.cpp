@@ -1575,7 +1575,7 @@ TEST(FoundBlockExplorer, MergedFindInsideSubmitScopeCarriesParentMinerAndSubsidy
         ctx.miner = "ltc1qstratumminer";
         MiningInterface::MergedSubmitScope scope(std::move(ctx));
         mi.record_merged_found_block("DOGE", 5400010, h, /*accepted=*/false,
-                                     1000000000000ULL);
+                                     1000000000000ULL, 0.0);
     }
     auto d = mi.rest_found_block(h);
     ASSERT_TRUE(d.is_object());
@@ -1602,7 +1602,7 @@ TEST(FoundBlockExplorer, MergedFindNamesTheShareItsSubmitMinted)
         MiningInterface::MergedSubmitContext ctx;
         ctx.share_hash = share;
         MiningInterface::MergedSubmitScope scope(std::move(ctx));
-        mi.record_merged_found_block("DOGE", 5400014, h, /*accepted=*/false, 0);
+        mi.record_merged_found_block("DOGE", 5400014, h, /*accepted=*/false, 0, 0.0);
     }
     auto d = mi.rest_found_block(h);
     ASSERT_TRUE(d.is_object());
@@ -1614,7 +1614,7 @@ TEST(FoundBlockExplorer, MergedFindNamesTheShareItsSubmitMinted)
         MiningInterface::MergedSubmitContext ctx;
         ctx.miner = "ltc1qstratumminer";
         MiningInterface::MergedSubmitScope scope(std::move(ctx));
-        mi.record_merged_found_block("DOGE", 5400015, h_miss, false, 0);
+        mi.record_merged_found_block("DOGE", 5400015, h_miss, false, 0, 0.0);
     }
     EXPECT_TRUE(mi.rest_found_block(h_miss)["share"].is_null());
 }
@@ -1625,7 +1625,7 @@ TEST(FoundBlockExplorer, MergedFindOutsideScopeLeavesParentNull)
                        c2pool::address::Blockchain::LITECOIN);
     const std::string h =
         "946946946946946946946946946946946946946946946946946946946946f002";
-    mi.record_merged_found_block("DOGE", 5400011, h, /*accepted=*/false, 0);
+    mi.record_merged_found_block("DOGE", 5400011, h, /*accepted=*/false, 0, 0.0);
     auto d = mi.rest_found_block(h);
     ASSERT_TRUE(d.is_object());
     EXPECT_TRUE(d["parent_hash"].is_null());
@@ -1638,9 +1638,58 @@ TEST(FoundBlockExplorer, MergedFindOutsideScopeLeavesParentNull)
         MiningInterface::MergedSubmitContext ctx;
         ctx.parent_height = 0;
         MiningInterface::MergedSubmitScope scope(std::move(ctx));
-        mi.record_merged_found_block("DOGE", 5400012, h0, false, 0);
+        mi.record_merged_found_block("DOGE", 5400012, h0, false, 0, 0.0);
     }
     EXPECT_TRUE(mi.rest_found_block(h0)["parent_height"].is_null());
+}
+
+// ── #1738: a DOGE row is priced at the DOGE difficulty ──────────────────────
+// The merged row took mi->get_network_difficulty(), the LTC parent's, so every
+// DOGE luck point used the wrong chain. It now records the aux job target's
+// difficulty, and none of the LTC fallbacks (template, cache, header chain)
+// may fill a merged row when that is unknown.
+
+TEST(FoundBlockExplorer, MergedRowRecordsTheAuxDifficultyNotTheParents)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const double ltc_diff = 47674323.0;
+    mi.set_coin_work_fn([ltc_diff]() {
+        MiningInterface::CoinWorkInfo cw;
+        cw.valid              = true;
+        cw.network_difficulty = ltc_diff;
+        cw.coinbase_value_sat = 625000000;
+        return cw;
+    });
+    mi.set_block_field_lookups(
+        [ltc_diff](const std::string&) { return ltc_diff; }, nullptr);
+
+    auto diff_of = [&mi](const std::string& hash, const std::string& chain) {
+        for (const auto& b : mi.get_found_blocks())
+            if (b.hash == hash && b.chain == chain) return b.network_difficulty;
+        return -1.0;
+    };
+
+    const std::string h_doge =
+        "173817381738173817381738173817381738173817381738173817381738d001";
+    mi.record_merged_found_block("DOGE", 5400020, h_doge, /*accepted=*/false,
+                                 1000000000000ULL, /*aux_difficulty=*/12345.5);
+    EXPECT_DOUBLE_EQ(diff_of(h_doge, "DOGE"), 12345.5);
+
+    // Unknown aux difficulty stays unknown (luck null), never the LTC value.
+    const std::string h_doge0 =
+        "173817381738173817381738173817381738173817381738173817381738d002";
+    mi.record_merged_found_block("DOGE", 5400021, h_doge0, false, 0, 0.0);
+    EXPECT_DOUBLE_EQ(diff_of(h_doge0, "DOGE"), 0.0);
+    // A repeat record must not repair it from the LTC header chain either.
+    mi.record_merged_found_block("DOGE", 5400021, h_doge0, false, 0, 0.0);
+    EXPECT_DOUBLE_EQ(diff_of(h_doge0, "DOGE"), 0.0);
+
+    // The primary chain still takes its fallbacks.
+    uint256 h_ltc;
+    h_ltc.SetHex("173817381738173817381738173817381738173817381738173817381738c001");
+    mi.record_found_block(3000020, h_ltc, 0, "LTC", "ltc1qminer", "", 0.0);
+    EXPECT_DOUBLE_EQ(diff_of(h_ltc.GetHex(), "LTC"), ltc_diff);
 }
 
 TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)

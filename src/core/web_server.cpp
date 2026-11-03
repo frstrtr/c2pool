@@ -4174,7 +4174,8 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
                                           double share_difficulty,
                                           double pool_hashrate,
                                           uint64_t subsidy,
-                                          BlockAuthorship authorship)
+                                          BlockAuthorship authorship,
+                                          bool primary_chain_row)
 {
     if (ts == 0) ts = static_cast<uint64_t>(std::time(nullptr));
     std::string hash_hex = hash.GetHex();
@@ -4189,7 +4190,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
     // difficulty at find time; ask it before accepting a zero. Same for a
     // zero subsidy on the primary chain (row 2516914 recorded subsidy=0
     // because the embedded arm leaves get_current_work_template() empty).
-    if (network_difficulty <= 0.0 || subsidy == 0) {
+    if (primary_chain_row && (network_difficulty <= 0.0 || subsidy == 0)) {
         CoinWorkInfo cw;
         if (m_coin_work_fn) cw = m_coin_work_fn();
         if (cw.valid) {
@@ -4294,7 +4295,7 @@ void MiningInterface::record_found_block(uint64_t height, const uint256& hash, u
             // enrichment fill, lifted out of the unattributed-only branch.
             if (existing.network_difficulty <= 0.0) {
                 double nd = network_difficulty > 0.0 ? network_difficulty : 0.0;
-                if (nd <= 0.0 && m_block_diff_lookup_fn) {
+                if (nd <= 0.0 && primary_chain_row && m_block_diff_lookup_fn) {
                     try {
                         double d = m_block_diff_lookup_fn(existing.hash);
                         if (d > 0.0) nd = d;
@@ -4506,18 +4507,21 @@ MiningInterface::MergedSubmitScope::~MergedSubmitScope()
 
 void MiningInterface::record_merged_found_block(const std::string& symbol, int height,
                                                 const std::string& block_hash, bool accepted,
-                                                uint64_t coinbase_value)
+                                                uint64_t coinbase_value, double aux_difficulty)
 {
     const MergedSubmitContext* ctx = t_merged_submit_ctx;
     uint256 h;
     h.SetHex(block_hash);
     const std::string miner = (ctx && !ctx->miner.empty()) ? ctx->miner : get_payout_address();
     // share = the one this submit minted; "" (JSON null) when the solve
-    // missed the share target. Network difficulty is still the parent's (#1738).
+    // missed the share target.
     const std::string share = ctx ? ctx->share_hash : std::string();
+    // #1738: priced at the aux chain's difficulty. The same hashrate mines
+    // both chains, so luck = aux_difficulty * 2^32 / pool hashrate.
     record_found_block(static_cast<uint64_t>(height), h, 0, symbol,
-                       miner, share, get_network_difficulty(), 0, get_local_hashrate(),
-                       coinbase_value, BlockAuthorship::this_node);
+                       miner, share, aux_difficulty, 0, get_local_hashrate(),
+                       coinbase_value, BlockAuthorship::this_node,
+                       /*primary_chain_row=*/false);
     if (ctx) {
         std::optional<uint64_t> parent_height = ctx->parent_height;
         if (!parent_height && !ctx->parent_prev_hash.empty()) {

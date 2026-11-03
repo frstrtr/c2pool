@@ -3,6 +3,7 @@
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
+#include <core/target_utils.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -1694,10 +1695,12 @@ void MergedMiningManager::record_discovered_block(
     if (m_on_merged_block_found) {
         try {
             LOG_INFO << "[MM:" << chain.config.symbol << "] calling on_merged_block_found...";
+            // #1738: the aux target, not the parent's, prices this block.
             m_on_merged_block_found(chain.config.symbol,
                 chain.current_work.height,
                 chain.current_work.block_hash.GetHex(), accepted,
-                chain.current_work.coinbase_value);
+                chain.current_work.coinbase_value,
+                ::chain::target_to_difficulty(chain.current_work.target));
             LOG_INFO << "[MM:" << chain.config.symbol << "] on_merged_block_found returned OK";
         } catch (const std::exception& e) {
             LOG_ERROR << "[MM:" << chain.config.symbol

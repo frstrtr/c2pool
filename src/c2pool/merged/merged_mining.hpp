@@ -308,11 +308,12 @@ public:
     void set_block_relay_fn(BlockRelayFn fn);
 
     /// Callback when a merged block is found:
-    /// (symbol, height, block_hash, accepted, coinbase_value = aux block reward in satoshis)
+    /// (symbol, height, block_hash, accepted, coinbase_value = aux block reward in satoshis,
+    ///  difficulty = the aux chain's network difficulty from the job target; 0 = unknown)
     /// Used by MiningInterface to record in FoundBlock list for unified verification.
     using MergedBlockFoundFn = std::function<void(const std::string& symbol, int height,
                                                    const std::string& block_hash, bool accepted,
-                                                   uint64_t coinbase_value)>;
+                                                   uint64_t coinbase_value, double difficulty)>;
     void set_on_merged_block_found(MergedBlockFoundFn fn) { m_on_merged_block_found = std::move(fn); }
 
     /// Callback when aux work changes (new block on any merged chain).
