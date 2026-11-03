@@ -5481,17 +5481,43 @@ int main(int argc, char* argv[]) {
                     sd["min_difficulty"] = max_target_diff;
                     result["share_data"] = sd;
 
-                    // Block header
+                    // Block header. gentx hash and merkle root are derived
+                    // from the share itself, exactly as share_check.hpp does
+                    // (derive_gentx_hash + check_merkle_link over the txid
+                    // merkle link). Read-only, no tracker mutation. On a
+                    // derivation failure the fields are null with a reason,
+                    // never a fake empty string (#1142 item 3).
+                    nlohmann::json gentx_hash_j = nullptr;
+                    nlohmann::json merkle_root_j = nullptr;
+                    std::string forensics_err;
+                    try {
+                        using ShareT = std::remove_cvref_t<decltype(*obj)>;
+                        uint256 gentx_hash = ltc::derive_gentx_hash(*obj, p2p_node->coin_params());
+                        gentx_hash_j = gentx_hash.GetHex();
+                        uint256 merkle_root = ltc::check_merkle_link(gentx_hash, obj->m_merkle_link);
+                        if constexpr (ShareT::version >= ltc::SEGWIT_ACTIVATION_VERSION) {
+                            if constexpr (requires { obj->m_segwit_data; }) {
+                                if (obj->m_segwit_data.has_value())
+                                    merkle_root = ltc::check_merkle_link(
+                                        gentx_hash, obj->m_segwit_data->m_txid_merkle_link);
+                            }
+                        }
+                        merkle_root_j = merkle_root.GetHex();
+                    } catch (const std::exception& e) {
+                        forensics_err = e.what();
+                    }
                     auto& hdr = obj->m_min_header;
                     nlohmann::json hdr_j;
                     hdr_j["version"] = hdr.m_version;
                     hdr_j["previous_block"] = hdr.m_previous_block.GetHex();
-                    hdr_j["merkle_root"] = "";
+                    hdr_j["merkle_root"] = merkle_root_j;
                     hdr_j["timestamp"] = hdr.m_timestamp;
                     hdr_j["target"] = hdr.m_bits;
                     hdr_j["nonce"] = hdr.m_nonce;
                     nlohmann::json gentx_j;
-                    gentx_j["hash"] = "";
+                    gentx_j["hash"] = gentx_hash_j;
+                    if (!forensics_err.empty())
+                        gentx_j["derive_error"] = forensics_err;
                     gentx_j["coinbase"] = HexStr(obj->m_coinbase.m_data);
                     gentx_j["value"] = static_cast<double>(obj->m_subsidy) / 1e8;
                     gentx_j["last_txout_nonce"] = obj->m_last_txout_nonce;
@@ -5499,12 +5525,24 @@ int main(int argc, char* argv[]) {
                     block_j["hash"] = hash.GetHex();
                     block_j["header"] = hdr_j;
                     block_j["gentx"] = gentx_j;
-                    block_j["other_transaction_hashes"] = nlohmann::json::array();
+                    // V34+ shares carry no transaction list (only the merkle
+                    // link), so the honest value is null + a label, not [].
+                    block_j["other_transaction_hashes"] = nullptr;
+                    block_j["other_transaction_hashes_note"] =
+                        "not carried by v34+ shares (merkle link only)";
                     result["block"] = block_j;
 
                     // Children (shares whose parent is this hash)
+                    // Children: shares whose prev_hash is this share, from the
+                    // tracker reverse index (p2pool tracker.reverse parity).
                     nlohmann::json children_arr = nlohmann::json::array();
-                    // (would need reverse index — skip for now)
+                    {
+                        const auto& rev = chain.get_reverse();
+                        auto it = rev.find(hash);
+                        if (it != rev.end())
+                            for (const auto& child : it->second)
+                                children_arr.push_back(child.GetHex());
+                    }
                     result["children"] = children_arr;
 
                     // V36 metadata
