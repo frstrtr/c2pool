@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### DASH: a fresh daemonless node serves its first template after about one hour
+- Measured 2026-10-09 on default flags: about 56 minutes from a cold start to the
+  first `mining.notify`. The UTXO maturity gate refuses to serve until the embedded
+  fee lane has connected enough blocks. Add `--embedded-utxo-immature-serve-empty`
+  to serve coinbase-only work during that window. A fix that backfills the window
+  at start is in progress.
+
 ### BIP-110 — new experimental parent-chain lane (BLAKE2b minority Bitcoin fork)
 - **Foundation (#1430):** clean-room BLAKE2b-256 (RFC 7693), KAT-proven, plus the
   `c2pool-bip110` coin-lane skeleton and per-binary define. BIP-110 is the Bitcoin
