@@ -3544,11 +3544,12 @@ int main(int argc, char* argv[]) {
                                     // and mempool cleanup do not depend on the UTXO set,
                                     // so a stalled fill does not hold templates on stale
                                     // state or on transactions this block confirmed.
-                                    // Templates still wait for the fill: the blocks
-                                    // between the UTXO set and the tip are cleaned only
-                                    // as the drain connects them (the segment gate,
-                                    // #2136). The pool's height follows the drain, which
-                                    // sets it as it reaches each height.
+                                    // With the tip's MWEB state the template is
+                                    // coinbase + HogEx on the tip until the drain
+                                    // brings the UTXO set to the tip (the pool's txs
+                                    // need a view at the tip, #2136; the drain's
+                                    // completion refreshes). The pool's height follows
+                                    // the drain, which sets it as it reaches each height.
                                     if (ltc_bs->phase != "Bootstrap" && on_best_chain) {
                                         auto tip_now = chain->tip();
                                         if (tip_now && tip_now->block_hash == block_hash) {
@@ -3770,11 +3771,11 @@ int main(int argc, char* argv[]) {
                                                 << " — buffering it and fetching " << utxo_best + 1
                                                 << ".." << height - 1 << " in order";
                                     // Its MWEB state and mempool cleanup do not depend
-                                    // on the UTXO set: do them now. Templates still
-                                    // wait for the fill (the segment gate, #2136: the
-                                    // blocks in between are cleaned as the drain
-                                    // connects them), and the pool's height stays the
-                                    // UTXO set's until the drain reaches this block.
+                                    // on the UTXO set: do them now. Until the fill
+                                    // brings the UTXO set to this block the template
+                                    // is coinbase + HogEx on it (the pool's txs need a
+                                    // view at the tip, #2136), and the pool's height
+                                    // stays the set's until the drain reaches it.
                                     if (pool)
                                         pool->remove_for_block(block);
                                     if (tracker && tracker->update(block, height, block.m_mweb_raw)) {

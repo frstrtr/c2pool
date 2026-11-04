@@ -197,17 +197,21 @@ public:
     /// MWEB is active once the tracker has seen an MWEB block or the next
     /// height reaches ChainParams::mweb_activation_height; an MWEB-active
     /// template without a HogEx + mweb is never emitted.
-    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis),
-    /// the built template fails the MWEB shape check, or the mempool has not
-    /// been cleaned for the tip yet (its block body has not run through
-    /// Mempool::remove_for_block, so txs the tip confirmed may still be in it),
-    /// or not for every block between the UTXO view's best and the tip, or
-    /// the view's best is not on the tip's ancestry
-    /// (mempool-not-cleaned-for-ancestor, core::coin::segment_cleaned); in
-    /// the latter cases the refused template is handed out through
-    /// `refused` when given (the caller decides between HOLD and a degraded
-    /// start; a refusal the shape check cannot see is named under
-    /// core::coin::kTemplateRefusalKey).
+    /// The pool's txs enter the template only when the pool was cleaned for
+    /// the tip and the UTXO view's best block IS the tip
+    /// (core::coin::template_pool_gate, #2136). Otherwise the template is
+    /// coinbase + HogEx only on the tip, marked degraded under
+    /// core::coin::kTemplateDegradedKey and served: valid whatever the view
+    /// and the pool hold (mempool-not-cleaned-for-tip, utxo-view-not-at-tip).
+    /// Returns std::nullopt if the chain has no tip yet (not synced to genesis)
+    /// or the built template fails the MWEB shape check -- MWEB is active and
+    /// there is no MWEB state for the tip (its body has not arrived), so no
+    /// HogEx can be built; the refused template (no pool txs, no HogEx) is
+    /// then handed out through `refused` when given, and the caller keeps
+    /// today's MWEB behaviour: HOLD the previous template, or with none serve
+    /// it degraded (shares and merged work only; block assembly refuses every
+    /// LTC block from it). A refusal the shape check cannot see is named under
+    /// core::coin::kTemplateRefusalKey.
     /// max_weight bounds the mempool selection (the HogEx is appended after it).
     /// The built template also passes core::coin::check_template_txs and
     /// coinbasevalue == subsidy + listed fees (fee-reconcile); with
@@ -271,49 +275,46 @@ public:
         // ── Subsidy ────────────────────────────────────────────────────────
         uint64_t subsidy = get_block_subsidy(next_h);
 
-        // ── Mempool cleaned for this tip ───────────────────────────────────
+        // ── What the template may take from the pool (#2136) ──────────────
         // The txs the tip confirmed leave the pool when the tip's body runs
-        // through remove_for_block. Until then a template on the tip could
-        // carry them (bad-txns-inputs-missingorspent), whatever path brought
-        // the tip or its MWEB state first.
+        // through remove_for_block, and the selection prices against the UTXO
+        // view: only a pool cleaned for the tip, priced on a view whose best
+        // block IS the tip, can show every input unspent at the tip. A view
+        // behind the tip (a gap or reorg fill, a body nobody serves), beside
+        // it (a heal that cannot rewind) or above it would price a tx one of
+        // the tip's ancestors confirmed (cleaned once, relayed again
+        // afterwards). Otherwise: coinbase + HogEx only, on the tip, marked
+        // degraded and served -- valid whatever the view and the pool hold;
+        // the fees wait until the view reaches the tip (the drain's refresh).
         const size_t pool_size = pool.size();
-        const bool pool_cleaned = pool_size == 0 || pool.cleaned_for(tip.block_hash);
-
-        // ── ... and for every block between the UTXO view and the tip ──────
-        // The selection prices against the UTXO view. When the view's best is
-        // behind the tip (the tip's body came before its parent's: a UTXO gap,
-        // a fill running, a reorg across a sibling), the pool was cleaned for
-        // the tip at once but the blocks in between are cleaned only when the
-        // fill connects them; their txs are still priced and selectable
-        // (#2136). The view's best must also be on the tip's ancestry. A view
-        // with no best block yet prices nothing.
-        std::optional<core::coin::SegmentCheck> segment;
-        uint32_t view_best_height = 0;
+        std::optional<core::coin::BlockRef> view_best;
         if (pool_size != 0) {
             if (const auto* view = pool.utxo()) {
                 const auto [best_hash, best_height] = view->get_best();
-                view_best_height = best_height;
-                if (!best_hash.IsNull()) {
-                    segment = core::coin::segment_cleaned(
-                        core::coin::BlockRef{best_height, best_hash},
-                        core::coin::BlockRef{tip.height, tip.block_hash},
-                        [&pool](const uint256& bh) { return pool.cleaned_for(bh); },
-                        [&chain](const uint256& bh) -> std::optional<uint256> {
-                            auto e = chain.get_header(bh);
-                            if (!e)
-                                return std::nullopt;
-                            return e->prev_hash;
-                        },
-                        static_cast<uint32_t>(Mempool::CLEANED_BLOCKS_KEPT));
-                }
+                if (!best_hash.IsNull())
+                    view_best = core::coin::BlockRef{best_height, best_hash};
+            }
+        }
+        const char* degraded = core::coin::template_pool_gate(
+            pool_size == 0, pool_size == 0 || pool.cleaned_for(tip.block_hash), view_best,
+            core::coin::BlockRef{tip.height, tip.block_hash});
+        if (degraded) {
+            static std::atomic<uint32_t> s_last_degraded_height{0};
+            if (s_last_degraded_height.exchange(next_h) != next_h) {
+                LOG_WARNING << "[EMB-LTC] TemplateBuilder: empty template on the tip at height " << next_h
+                            << " (" << degraded << ": UTXO view at h="
+                            << (view_best ? std::to_string(view_best->height) : std::string("none"))
+                            << ", tip h=" << tip.height << ")";
             }
         }
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
-        // Only txs final in this block: IsFinalTx at next_h and the tip's
-        // median time past (litecoind BlockAssembler's nLockTimeCutoff).
-        auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp});
+        // Only txs final in this block and spendable in it: IsFinalTx and
+        // coinbase maturity at next_h, the lock time against the tip's median
+        // time past (litecoind BlockAssembler's nLockTimeCutoff).
+        auto [selected_txs, total_fees] = degraded == nullptr
+            ? pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp})
+            : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
         // Matches litecoind's getblocktemplate coinbasevalue field.
@@ -354,8 +355,9 @@ public:
         // mempool held fee-paying backlog that should have filled it. We cannot
         // fabricate transactions, so we surface loudly (WARNING) for
         // contabo-prod-watch / the operator rather than shipping a false-empty
-        // block as normal. Genuinely empty mempools never trip this.
-        {
+        // block as normal. Genuinely empty mempools never trip this, nor does a
+        // degraded template (the gate chose empty; it says so itself).
+        if (!degraded) {
             const uint64_t mempool_bytes = static_cast<uint64_t>(pool.byte_size());
             const uint64_t mempool_fees  = pool.total_fees();
             const bool near_empty  = selected_bytes < UNDERFILL_MIN_FILL_BYTES;
@@ -452,17 +454,8 @@ public:
                 ? nullptr : &txs.back()["data"].get_ref<const std::string&>();
             refusal = core::coin::check_block_shape(last_tx_hex, mweb_hex, mweb_active);
         }
-        if (!refusal && !pool_cleaned) {
-            refusal = "mempool-not-cleaned-for-tip";
-            data[core::coin::kTemplateRefusalKey] = *refusal;
-        }
-        if (!refusal && segment && !segment->ok()) {
-            refusal = std::string(core::coin::kNotCleanedForAncestor) + " ("
-                    + core::coin::segment_gate_name(segment->gate) + " at h=" + std::to_string(segment->height)
-                    + (segment->hash.IsNull() ? std::string() : " " + segment->hash.GetHex().substr(0, 16))
-                    + ", UTXO view at h=" + std::to_string(view_best_height) + ")";
-            data[core::coin::kTemplateRefusalKey] = core::coin::kNotCleanedForAncestor;
-        }
+        if (degraded)
+            data[core::coin::kTemplateDegradedKey] = degraded;
         // Structural check of the transactions (what litecoind would reject
         // the block for) and the fee total: c2pool's own selection must never
         // yield either; refusing turns such a bug into a HOLD.
@@ -559,9 +552,10 @@ public:
             m_chain, m_pool, m_testnet, m_mweb_tracker, tx_weight_budget(), &refused,
             m_template_tx_check_strict.load(std::memory_order_relaxed));
         if (!result && refused) {
-            // MWEB is active but there is no MWEB state for the next block yet,
-            // the mempool is not cleaned for the tip yet, or the template fails
-            // the template-tx check (logged by the builder). Not a work
+            // MWEB is active but there is no MWEB state for the next block yet
+            // (a pool or view not ready for the tip gives a served empty
+            // template instead), or the template fails the template-tx check
+            // (logged by the builder). Not a work
             // failure: hand the template to refresh_work's ingress guard,
             // which keeps the previous valid template (HOLD) or, with none,
             // serves this one degraded. Without MWEB state its rules name

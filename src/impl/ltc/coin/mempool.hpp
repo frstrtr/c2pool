@@ -720,10 +720,9 @@ public:
         return m_last_block_hash;
     }
 
-    /// How many cleaned blocks cleaned_for() remembers. The template gate
-    /// (core::coin::segment_cleaned) checks every block between the UTXO
-    /// view's best and the tip against it, so it bounds the segment a
-    /// template may build on (#2136); a view further behind is a bootstrap.
+    /// How many cleaned blocks cleaned_for() remembers: late copies of older
+    /// blocks and stale siblings' bodies are cleaned after the tip's too, so
+    /// the tip's entry must outlive a burst of them (#2136).
     static constexpr size_t CLEANED_BLOCKS_KEPT = 32;
 
     /// True when remove_for_block() ran for `block_hash` (one of the last

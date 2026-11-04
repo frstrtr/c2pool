@@ -2,25 +2,27 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// core::coin template gate: the mempool is cleaned for the whole segment a
-// template builds on (#2136, #2137 S0).
+// core::coin template gate: what a template on the tip may take from the
+// mempool (#2136, #2137 S0).
 //
-// A template on the tip prices its transactions against the UTXO view, whose
-// best block can be behind the tip: when the tip's body arrives while the view
-// is short of its parent (a UTXO gap, a fill running, a reorg across a
-// sibling), the full-block handler cleans the mempool for the tip at once but
-// the blocks between the view's best and the tip are cleaned only when the
-// fill connects them. Until then the txs those blocks confirmed are still in
-// the pool, priced against the older view and selectable; a template carrying
-// one is a block litecoind rejects (bad-txns-inputs-missingorspent).
-//
-// The gate: every block from the view's best (exclusive) to the tip
-// (inclusive), along the tip's own ancestry, ran through the mempool cleanup,
-// and the view's best is an ancestor of the tip (a view above the tip or on a
-// sibling branch is a reorg in progress). Anything else refuses the template
-// (kNotCleanedForAncestor), which the ingress guard HOLDs.
-//
-// Header-only and pure over the two lookups so the KATs can pin it directly.
+// The selection prices the pool's txs against the UTXO view. A view behind
+// the tip, beside it or above it cannot show that an input is still unspent
+// at the tip: a tx the tip or one of its ancestors confirmed (cleaned once,
+// then relayed again by a peer that had not seen the block) is priced
+// against the older view and selected, and the block is one litecoind
+// rejects (bad-txns-inputs-missingorspent). Likewise, before the tip's body
+// ran through Mempool::remove_for_block the pool still holds the txs the tip
+// confirmed. So the pool's txs enter a template only when
+//   - the pool was cleaned for the tip, and
+//   - the view's best block IS the tip (DOGE's utxo_view_prices for its
+//     full set: complete at the tip).
+// Otherwise the template carries none of them: coinbase (and HogEx) only on
+// the tip, marked degraded under kTemplateDegradedKey and served. That block
+// is valid whatever the view and the pool hold, so miners keep working on
+// the tip instead of a held template on the old prev; only the fees wait for
+// the view. A view without a best block (no set yet, a wiped set) prices
+// nothing and is not gated, and neither is an empty pool.
+// Header-only and pure so the KATs can pin it directly.
 // ---------------------------------------------------------------------------
 
 #include <core/uint256.hpp>
@@ -30,9 +32,10 @@
 
 namespace core::coin {
 
-/// Refusal code a template builder puts under kTemplateRefusalKey when the
-/// segment gate fails.
-inline constexpr const char* kNotCleanedForAncestor = "mempool-not-cleaned-for-ancestor";
+/// Degraded codes (kTemplateDegradedKey) of a template that takes nothing
+/// from the pool.
+inline constexpr const char* kNotCleanedForTip = "mempool-not-cleaned-for-tip";
+inline constexpr const char* kUtxoViewNotAtTip = "utxo-view-not-at-tip";
 
 /// A block by height and hash.
 struct BlockRef {
@@ -40,57 +43,20 @@ struct BlockRef {
     uint256  hash;
 };
 
-enum class SegmentGate {
-    Ok,           // every block of (view best, tip] cleaned; the view's best is on the tip's ancestry
-    NotCleaned,   // a block of the segment was not cleaned, or the segment is longer than kept
-    NotAncestor,  // the view's best is above the tip, on another branch, or its link is missing
-};
-
-inline const char* segment_gate_name(SegmentGate g)
+/// What a template on `tip` may take from the pool: nullptr = its priced
+/// txs; else the degraded code (nothing from the pool). `view_best` is the
+/// UTXO view's best block (nullopt: no view, or a view without a best block).
+inline const char* template_pool_gate(bool pool_empty, bool cleaned_for_tip,
+                                      const std::optional<BlockRef>& view_best,
+                                      const BlockRef& tip)
 {
-    switch (g) {
-        case SegmentGate::Ok:          return "ok";
-        case SegmentGate::NotCleaned:  return "not-cleaned";
-        case SegmentGate::NotAncestor: return "view-not-an-ancestor";
-    }
-    return "unknown";
-}
-
-struct SegmentCheck {
-    SegmentGate gate{SegmentGate::Ok};
-    uint32_t    height{0};  // where it failed: the uncleaned block, or the height the ancestry broke at
-    uint256     hash;       // the block at `height` on the tip's ancestry (null when unknown)
-    bool ok() const { return gate == SegmentGate::Ok; }
-};
-
-/// The segment gate. `cleaned_for(hash)` is the pool's Mempool::cleaned_for;
-/// `parent_of(hash)` gives a header's parent hash (nullopt: unknown header).
-/// The walk goes down from the tip by parent links (the tip's own ancestry,
-/// not the live height index, which may already belong to a newer tip).
-/// A segment of more than `max_blocks` blocks fails as NotCleaned without a
-/// walk: the pool remembers only that many cleaned blocks, and a view that far
-/// behind is a bootstrap.
-template <typename CleanedFn, typename ParentFn>
-SegmentCheck segment_cleaned(const BlockRef& view_best, const BlockRef& tip,
-                             CleanedFn&& cleaned_for, ParentFn&& parent_of,
-                             uint32_t max_blocks)
-{
-    if (view_best.height > tip.height)
-        return {SegmentGate::NotAncestor, view_best.height, view_best.hash};
-    if (tip.height - view_best.height > max_blocks)
-        return {SegmentGate::NotCleaned, tip.height, tip.hash};
-    uint256 cur = tip.hash;
-    for (uint32_t h = tip.height; h > view_best.height; --h) {
-        if (!cleaned_for(cur))
-            return {SegmentGate::NotCleaned, h, cur};
-        const std::optional<uint256> parent = parent_of(cur);
-        if (!parent)
-            return {SegmentGate::NotAncestor, h - 1, uint256()};
-        cur = *parent;
-    }
-    if (cur != view_best.hash)
-        return {SegmentGate::NotAncestor, view_best.height, cur};
-    return {};
+    if (pool_empty)
+        return nullptr;
+    if (!cleaned_for_tip)
+        return kNotCleanedForTip;
+    if (view_best && (view_best->hash != tip.hash || view_best->height != tip.height))
+        return kUtxoViewNotAtTip;
+    return nullptr;
 }
 
 } // namespace core::coin

@@ -24,8 +24,10 @@
 //     a tx no block can carry that got into the pool anyway is dropped and
 //     counted (template_tx_dropped);
 //   - a non-empty mempool not yet cleaned for the tip (remove_for_block has
-//     not seen the tip's body) refuses the template:
-//     mempool-not-cleaned-for-tip, marked for the ingress HOLD.
+//     not seen the tip's body) gives coinbase + HogEx only on the tip,
+//     marked degraded mempool-not-cleaned-for-tip and served (#2136): a
+//     block that is valid whatever the pool holds, not a HOLD on the old
+//     prev.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -469,11 +471,12 @@ TEST(LtcTemplateHogex, TxNoBlockCanCarryIsDroppedAndCounted)
     EXPECT_EQ(pool.reject_stats().template_tx_dropped.load(), 1u);
 }
 
-// The first template on a new tip waits for the mempool cleanup of the tip's
-// body: a non-empty pool not cleaned for the tip refuses the template (HOLD
-// at ingress); once remove_for_block saw the tip it builds. A late copy of an
-// older block cleaned afterwards does not undo it.
-TEST(LtcTemplateHogex, MempoolNotCleanedForTipRefuses)
+// The first template on a new tip takes nothing from the pool until the
+// mempool cleanup of the tip's body: a non-empty pool not cleaned for the tip
+// gives coinbase + HogEx on the tip (degraded, served: valid whatever the
+// pool holds); once remove_for_block saw the tip the pool's txs ship. A late
+// copy of an older block cleaned afterwards does not undo it.
+TEST(LtcTemplateHogex, MempoolNotCleanedForTipMinesEmptyOnTheTip)
 {
     const auto hdr_n = synthetic_header(1);
     const auto hdr_n1 = synthetic_header(2);
@@ -487,22 +490,23 @@ TEST(LtcTemplateHogex, MempoolNotCleanedForTipRefuses)
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, hdr_n);
 
-    // Never cleaned.
-    std::optional<ltc::coin::rpc::WorkData> refused;
-    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker,
-                                              TemplateBuilder::MAX_BLOCK_WEIGHT
-                                                  - TemplateBuilder::COINBASE_RESERVE,
-                                              &refused);
-    EXPECT_FALSE(wd) << "the pool may still hold txs the tip confirmed";
-    ASSERT_TRUE(refused);
-    EXPECT_EQ(core::coin::template_refusal_code(refused->m_data),
+    // Never cleaned: the pool may still hold txs the tip confirmed.
+    auto wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd) << "work on the tip, not a HOLD";
+    EXPECT_EQ(core::coin::template_degraded_code(wd->m_data),
               std::optional<std::string>("mempool-not-cleaned-for-tip"));
-    EXPECT_TRUE(core::coin::check_template_shape(refused->m_data)) << "ingress HOLDs it";
+    EXPECT_FALSE(core::coin::template_refusal_code(wd->m_data));
+    EXPECT_FALSE(core::coin::check_template_shape(wd->m_data)) << "ingress serves it";
+    ASSERT_EQ(wd->m_data["transactions"].size(), 1u) << "the HogEx only";
+    EXPECT_TRUE(core::coin::tx_hex_is_hogex(wd->m_data["transactions"][0]["data"].get<std::string>()));
+    EXPECT_EQ(wd->m_data["previousblockhash"].get<std::string>(), block_hash_of(hdr_n).GetHex());
 
     // Cleaned for another block only.
     clean_for(pool, hdr_n1);
     EXPECT_EQ(pool.last_block_hash(), block_hash_of(hdr_n1));
-    EXPECT_FALSE(TemplateBuilder::build_template(*chain, pool, false, &tracker));
+    wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd);
+    EXPECT_EQ(wd->m_data["transactions"].size(), 1u);
 
     // Cleaned for the tip.
     clean_for(pool, hdr_n);
@@ -510,11 +514,14 @@ TEST(LtcTemplateHogex, MempoolNotCleanedForTipRefuses)
     wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
     ASSERT_TRUE(wd);
     EXPECT_FALSE(core::coin::template_refusal_code(wd->m_data));
+    EXPECT_FALSE(core::coin::template_degraded_code(wd->m_data));
     EXPECT_EQ(wd->m_data["transactions"].size(), 2u);
 
     // A late copy of another block cleaned after the tip's.
     clean_for(pool, synthetic_header(3));
-    EXPECT_TRUE(TemplateBuilder::build_template(*chain, pool, false, &tracker));
+    wd = TemplateBuilder::build_template(*chain, pool, false, &tracker);
+    ASSERT_TRUE(wd);
+    EXPECT_EQ(wd->m_data["transactions"].size(), 2u);
 
     // An empty pool needs no cleanup.
     Mempool empty;

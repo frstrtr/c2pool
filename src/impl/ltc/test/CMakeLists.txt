@@ -235,20 +235,23 @@ if (BUILD_TESTING AND GTest_FOUND)
     # h6101857) extends by the whole batch; an asked peer's answer cuts
     # nothing. Same folding rule.
     #
-    # template_gap_gate_test.cpp: the embedded LTC template waits for the
-    # mempool cleanup of every block between the UTXO view and the tip
-    # (#2136): back-to-back blocks and a reorg across a same-height sibling
-    # are refused mempool-not-cleaned-for-ancestor until the parent is cleaned
-    # / the view rewinds (REAL HeaderChain, Mempool, UTXOViewCache/UTXOViewDB),
-    # core::coin::segment_cleaned, and the 32-block cleaned_for window. Same
-    # folding rule.
+    # template_gap_gate_test.cpp: the embedded LTC template takes the pool's
+    # txs only on a UTXO view at the tip, else it is coinbase + HogEx on the
+    # tip, served (#2136): back-to-back blocks, a reorg across a same-height
+    # sibling, a tx its parent confirmed relayed again, a stuck heal or a
+    # body nobody serves all yield work on the tip; without the tip's MWEB
+    # state the MWEB HOLD stays (REAL HeaderChain, Mempool,
+    # UTXOViewCache/UTXOViewDB, MWEBTracker), core::coin::template_pool_gate,
+    # and the 32-block cleaned_for window. Same folding rule.
     #
     # mempool_final_tx_test.cpp: the embedded LTC mempool and template take
     # only txs final in the next block (litecoind IsFinalTx, #2137 S1):
     # admission refuses non_final at the tip's height + 1 / MTP, the
     # template selects at its own height / its parent's MTP (a child stays
-    # out with its parent), and priced_changes() moves exactly when a tx is
-    # priced (the tx-triggered refresh). Same folding rule.
+    # out with its parent), coinbase maturity at the template's height in the
+    # selection and at the next block's at admission, and priced_changes()
+    # moves exactly when a tx is priced (the tx-triggered refresh). Same
+    # folding rule.
     #
     # utxo_view_stats_test.cpp: /local_stats ltc_utxo (#2137): the anchor,
     # depth and completeness of the UTXO view the template prices against
