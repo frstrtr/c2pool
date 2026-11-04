@@ -18,7 +18,10 @@
 ///   - a tx with an MWEB part (peg-in, peg-out, MWEB-to-MWEB or mixed);
 ///   - a pegin output without its kernel (mweb_policy.cpp kernel-mismatch);
 ///   - empty vin or vout, unless MWEB-only (consensus/tx_check.cpp);
-///   - a HogEx (valid only in a block; validation.cpp PreChecks).
+///   - a HogEx (valid only in a block; validation.cpp PreChecks);
+///   - a tx not final in the next block (CheckFinalTx: IsFinalTx at the
+///     tip's height + 1 and the tip's median time past), once the caller set
+///     that block (set_lock_time_cutoff).
 /// Children of a refused tx need no rule: their input is in neither the UTXO
 /// set nor the pool, so their fee stays unknown and they are never selected.
 ///
@@ -120,6 +123,37 @@ inline void compute_tx_weight(const MutableTransaction& tx,
     weight = base_size * 4 + witness_size;
 }
 
+/// The block a tx must be final in: its height and the lock-time cutoff, the
+/// median time past of its parent (litecoind uses MTP for both relay,
+/// CheckFinalTx with STANDARD_LOCKTIME_VERIFY_FLAGS, and its own templates,
+/// BlockAssembler's nLockTimeCutoff; BIP113).
+struct LockTimeCutoff {
+    uint32_t height{0};  // the block's height (tip + 1)
+    int64_t  mtp{0};     // the median time past of its parent (the tip)
+};
+
+/// litecoind IsFinalTx (consensus/tx_verify.cpp): a tx with nLockTime 0 is
+/// final; one whose nLockTime (a height below LOCKTIME_THRESHOLD, else a
+/// time) is below the block's height / cutoff time is final; otherwise it is
+/// final only when every input's nSequence is SEQUENCE_FINAL. litecoind also
+/// refuses an MWEB part whose kernel lock height is above the block's: not
+/// checked here, since admission refuses every tx with an MWEB part first and
+/// no block tx may carry one.
+inline bool is_final_tx(const MutableTransaction& tx, uint32_t block_height, int64_t block_time)
+{
+    constexpr int64_t  LOCKTIME_THRESHOLD = 500000000;   // script.h (Tue Nov  5 00:53:20 1985 UTC)
+    constexpr uint32_t SEQUENCE_FINAL     = 0xffffffff;  // CTxIn::SEQUENCE_FINAL
+    if (tx.locktime == 0)
+        return true;
+    const int64_t lt = static_cast<int64_t>(tx.locktime);
+    if (lt < (lt < LOCKTIME_THRESHOLD ? static_cast<int64_t>(block_height) : block_time))
+        return true;
+    for (const auto& in : tx.vin)
+        if (in.sequence != SEQUENCE_FINAL)
+            return false;
+    return true;
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 class Mempool {
@@ -150,6 +184,25 @@ public:
     uint32_t tip_height() const { return m_tip_height; }
     void set_utxo(core::coin::UTXOViewCache* u) { m_utxo.store(u); }
 
+    /// The next block relayed txs must be final in (litecoind CheckFinalTx:
+    /// the header tip's height + 1 and the tip's median time past). Set on
+    /// every tip change; until it is set (height 0) admission does not check
+    /// finality.
+    void set_lock_time_cutoff(uint32_t next_height, int64_t median_time_past) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_lock_time_cutoff = LockTimeCutoff{next_height, median_time_past};
+    }
+    LockTimeCutoff lock_time_cutoff() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_lock_time_cutoff;
+    }
+
+    /// Counts every time an entry became priced (admitted priced, a child or
+    /// an orphan priced by its parent, a fee recomputed after a block, a fee
+    /// set): a caller compares it before and after admit() to learn whether
+    /// the selectable set grew (the transaction-triggered template refresh).
+    uint64_t priced_changes() const { return m_priced_seq.load(std::memory_order_relaxed); }
+
     // Disable copy
     Mempool(const Mempool&) = delete;
     Mempool& operator=(const Mempool&) = delete;
@@ -171,6 +224,7 @@ public:
             duplicate,               // already in the pool
             inputs_invalid,          // premature coinbase/pegout spend, money range, outputs above inputs
             missing_inputs,          // an input in neither the set nor the pool: parked as an orphan
+            non_final,               // not final in the next block (CheckFinalTx)
             count
         };
         Code     code{malformed};
@@ -194,6 +248,7 @@ public:
             case Reject::duplicate:              return "duplicate";
             case Reject::inputs_invalid:         return "inputs_invalid";
             case Reject::missing_inputs:         return "missing_inputs";
+            case Reject::non_final:              return "non_final";
             case Reject::count:                  break;
         }
         return "unknown";
@@ -210,6 +265,7 @@ public:
         std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
         std::atomic<uint64_t> orphans_promoted{0};      // orphans admitted once their parent was
         std::atomic<uint64_t> orphans_dropped{0};       // orphans expired, evicted or too large
+        std::atomic<uint64_t> admitted_unpriced{0};     // admitted with a view but fee unknown (an input the partial view lacks)
     };
 
     /// Orphan set bounds (Dogecoin Core 1.14 net_processing.cpp / net_processing.h).
@@ -220,7 +276,8 @@ public:
     /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
     /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
     /// pegin output without one (litecoind PreChecks refuses each of these);
-    /// then the pool's own duplicate check; then, with a view, the inputs
+    /// not final in the next block (CheckFinalTx, once set_lock_time_cutoff
+    /// named it); then the pool's own duplicate check; then, with a view, the inputs
     /// (inputs_invalid; missing_inputs parks the tx as an orphan when the
     /// view is built from genesis). Fees are computed as add_tx does. An
     /// admitted tx admits the orphans waiting for it.
@@ -277,6 +334,14 @@ private:
         if (pegin_output)
             return refuse(Reject::pegin_output_no_kernel);
 
+        // litecoind PreChecks: CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS)
+        // -- IsFinalTx at the tip's height + 1 and the tip's median time past.
+        {
+            const LockTimeCutoff cut = lock_time_cutoff();
+            if (cut.height != 0 && !is_final_tx(tx, cut.height, cut.mtp))
+                return refuse(Reject::non_final);
+        }
+
         if (utxo) {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_pool.count(r.txid))
@@ -299,10 +364,14 @@ private:
             }
         }
 
+        const uint64_t priced_before = m_priced_seq.load(std::memory_order_relaxed);
         if (!add_tx_unchecked(tx, utxo))
             return refuse(Reject::duplicate);
-        if (count)
+        if (count) {
             m_stats.admitted.fetch_add(1, std::memory_order_relaxed);
+            if (utxo && m_priced_seq.load(std::memory_order_relaxed) == priced_before)
+                m_stats.admitted_unpriced.fetch_add(1, std::memory_order_relaxed);
+        }
         if (utxo)
             reprice_children(r.txid, utxo);
         return std::nullopt;
@@ -329,6 +398,7 @@ private:
                     continue;
                 if (compute_fee_locked(cit->second, utxo)) {
                     m_feerate_index.emplace(cit->second.feerate(), cit->first);
+                    m_priced_seq.fetch_add(1, std::memory_order_relaxed);
                     work.push_back(cit->first);
                 }
             }
@@ -378,7 +448,8 @@ public:
 
     /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
     ///  "pegins_seen", "pegouts_seen", "template_tx_dropped", "orphans",
-    ///  "orphans_promoted", "orphans_dropped"}
+    ///  "orphans_promoted", "orphans_dropped", "admitted_unpriced",
+    ///  "still_unknown"}
     nlohmann::json reject_stats_json() const {
         nlohmann::json rejected = nlohmann::json::object();
         for (int c = 0; c < Reject::count; ++c)
@@ -395,7 +466,20 @@ public:
             {"orphans", orphan_count()},
             {"orphans_promoted", m_stats.orphans_promoted.load(std::memory_order_relaxed)},
             {"orphans_dropped", m_stats.orphans_dropped.load(std::memory_order_relaxed)},
+            {"admitted_unpriced", m_stats.admitted_unpriced.load(std::memory_order_relaxed)},
+            {"still_unknown", unpriced_count()},
         };
+    }
+
+    /// Pool entries whose fee is unknown (never selected): with a partial
+    /// view, the txs spending a coin older than the view.
+    size_t unpriced_count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (const auto& [txid, entry] : m_pool)
+            if (!entry.fee_known)
+                ++n;
+        return n;
     }
 
     // ─── Mutation ────────────────────────────────────────────────────────
@@ -457,6 +541,7 @@ public:
         // Add to feerate index if fee is known
         if (stored.fee_known) {
             m_feerate_index.emplace(stored.feerate(), txid);
+            m_priced_seq.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Periodic mempool stats (every 100 txs)
@@ -485,6 +570,7 @@ public:
         it->second.fee = fee;
         it->second.fee_known = true;
         m_feerate_index.emplace(it->second.feerate(), txid);
+        m_priced_seq.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Remove confirmed txs + double-spend conflicts from mempool.
@@ -731,8 +817,13 @@ public:
     ///       both passes) refuses the second spender.
     /// Reward-neutral: total_fees sums only INCLUDED txs' known fees, so
     /// coinbasevalue tracks exactly the txs that ship.
+    /// With `final_at` (the template's height and its parent's median time
+    /// past) a tx not final in that block is not selected (litecoind
+    /// BlockAssembler::TestPackageTransactions, IsFinalTx): a no-op while
+    /// admission checks finality, but a reorg can lower the next height.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_weight) const {
+    get_sorted_txs_with_fees(uint32_t max_weight,
+                             std::optional<LockTimeCutoff> final_at = std::nullopt) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<SelectedTx> result;
@@ -769,6 +860,9 @@ public:
         //     stale/orphan — refuse.
         auto admissible = [&](const MempoolEntry& entry) -> bool {
             if (barred.count(entry.txid))
+                return false;
+            if (final_at && final_at->height != 0
+                && !is_final_tx(entry.tx, final_at->height, final_at->mtp))
                 return false;
             for (const auto& vin : entry.tx.vin) {
                 std::pair<uint256, uint32_t> op(vin.prevout.hash, vin.prevout.index);
@@ -851,6 +945,7 @@ public:
             if (entry.fee_known) continue;
             if (compute_fee_locked(entry, utxo)) {
                 m_feerate_index.emplace(entry.feerate(), txid);
+                m_priced_seq.fetch_add(1, std::memory_order_relaxed);
                 resolved_total_fee += entry.fee;
                 ++resolved;
                 continue;
@@ -1462,6 +1557,8 @@ private:
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
     std::atomic<uint32_t> m_tip_height{0};  // current chain tip (maturity); set from the io_context and the DOGE full set's thread
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
+    LockTimeCutoff m_lock_time_cutoff;          // the next block, for admission's finality check (m_mutex)
+    std::atomic<uint64_t> m_priced_seq{0};      // see priced_changes()
 
     // Blocks remove_for_block() ran for (most recent last), for cleaned_for().
     std::deque<uint256> m_cleaned_blocks;

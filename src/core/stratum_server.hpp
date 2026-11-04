@@ -398,7 +398,10 @@ public:
 
     /// Push new work to ALL connected miners immediately (p2pool: new_work_event).
     /// Called when best_share changes or new block template arrives.
-    void notify_all();
+    /// force_clean=false (a template rebuilt for new transactions on the
+    /// same block) sends clean_jobs only where the block's prevhash changed,
+    /// so the ASIC pipelines are not wiped once a second.
+    void notify_all(bool force_clean = true);
 
     /// Sum of all connected miners' hashrate (H/s).
     double get_total_hashrate() const;

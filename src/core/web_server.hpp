@@ -38,6 +38,7 @@
 #include <c2pool/hashrate/tracker.hpp>
 #include <core/address_utils.hpp>
 #include <core/graph_history.hpp>
+#include <core/template_refresh.hpp>
 
 // Forward declaration for merged mining integration
 namespace c2pool { namespace merged { class MergedMiningManager; } }
@@ -983,6 +984,14 @@ public:
     nlohmann::json get_mweb_refusals_by_code_json() const;
     uint64_t get_template_fee_outliers() const { return m_template_fee_outliers.load(std::memory_order_relaxed); }
 
+    // Template rebuilds (/local_stats "template_refresh", #2137 S1): executed
+    // rebuilds by cause (tx, share, block, mweb), the last one's duration,
+    // the mempool changes reported and the tx-triggered pacing interval.
+    // WebServer::trigger_work_refresh records each rebuild here.
+    void note_template_refresh(core::RefreshCause cause, uint64_t took_ms,
+                               uint64_t tx_changes, uint64_t tx_interval_ms);
+    nlohmann::json get_template_refresh_json() const;
+
     // Coin-side metrics merged into /local_stats next to the MWEB counters
     // above: the function returns a JSON object whose keys are copied into
     // the payload (LTC embedded: {"ltc_mweb": {...}}). Called from whichever
@@ -1750,6 +1759,11 @@ private:
     // Template-tx check (see set_template_tx_check_strict).
     std::atomic<bool>     m_template_tx_check_strict{true};
     std::atomic<uint64_t> m_template_fee_outliers{0};
+    std::atomic<uint64_t> m_template_refresh_by_cause[static_cast<size_t>(core::RefreshCause::count)] = {};
+    std::atomic<uint64_t> m_template_refresh_ms_last{0};
+    std::atomic<int8_t>   m_template_refresh_last_cause{-1};
+    std::atomic<uint64_t> m_template_refresh_tx_changes{0};
+    std::atomic<uint64_t> m_template_refresh_tx_interval_ms{core::TxRefreshPacer::INTERVAL.count()};
     struct TemplateTxRefusalLog {
         std::map<std::string, uint64_t> by_code;
         uint64_t    total{0};
@@ -2488,6 +2502,15 @@ class WebServer
     bool m_work_refresh_pending = false;
     std::chrono::steady_clock::time_point m_last_work_refresh{};  // last executed refresh
     std::string m_last_refresh_tip_hash;  // sharechain tip at last executed refresh
+    core::RefreshCause m_work_refresh_pending_cause = core::RefreshCause::share;  // the trailing refresh's
+
+    // Transaction-triggered refresh (trigger_work_refresh_mempool, #2137 S1):
+    // the pacer (core/template_refresh.hpp) and its timer. Every rebuild,
+    // whatever its cause, reports to the pacer (it covers the mempool changes
+    // before it). The mutex guards the pacer only, never a rebuild.
+    std::mutex m_tx_refresh_mutex;
+    core::TxRefreshPacer m_tx_refresh;
+    std::shared_ptr<net::steady_timer> m_tx_refresh_timer;
 
     // Payout system integration
     c2pool::payout::PayoutManager* payout_manager_ptr_ = nullptr;
@@ -2543,11 +2566,19 @@ public:
     // Forward P2P block relay callback to the underlying MiningInterface
     void set_on_block_relay(std::function<void(const std::string&)> fn);
     // Immediately refresh the cached block template and push to all miners.
-    // Use for time-critical events (new LTC block).
-    void trigger_work_refresh();
+    // Use for time-critical events (new LTC block). `cause` is what
+    // /local_stats template_refresh.by_cause counts it under.
+    void trigger_work_refresh(core::RefreshCause cause = core::RefreshCause::block);
     // Debounced variant: coalesces rapid-fire calls (share arrivals) into one
-    // refresh after 100ms. Matches p2pool's Twisted reactor tick coalescing.
-    void trigger_work_refresh_debounced();
+    // refresh after 300 ms, gated on a sharechain tip change. Matches
+    // p2pool's Twisted reactor tick coalescing.
+    void trigger_work_refresh_debounced(core::RefreshCause cause = core::RefreshCause::share);
+    // The mempool changed (a tx was priced): rebuild the template, at most
+    // once a second (every 2 s while a rebuild takes over 500 ms), counted
+    // from the last rebuild of any cause; gated on a mempool-change counter,
+    // not on the sharechain tip, so a change no rebuild has covered always
+    // gets one (core::TxRefreshPacer). Main ioc thread.
+    void trigger_work_refresh_mempool();
     // Wire the share tracker's best hash into MiningInterface
     void set_best_share_hash_fn(std::function<uint256()> fn);
     // Wire the PPLNS computation from the share tracker
@@ -2576,7 +2607,9 @@ private:
     void handle_accept(beast::error_code ec, tcp::socket socket);
     // Body of a debounced work refresh (capture prev tip → refresh → caches →
     // SSE). Runs on the leading edge and on the trailing coalesced timer.
-    void execute_debounced_work_refresh();
+    void execute_debounced_work_refresh(core::RefreshCause cause);
+    // Arm the transaction-triggered refresh timer for `at`.
+    void arm_tx_refresh_timer(core::TxRefreshPacer::clock::time_point at);
 };
 
 // StratumSession and StratumServer — see stratum_server.hpp

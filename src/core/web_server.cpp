@@ -2025,6 +2025,35 @@ nlohmann::json MiningInterface::get_template_tx_refusals_json() const
     return out;
 }
 
+void MiningInterface::note_template_refresh(core::RefreshCause cause, uint64_t took_ms,
+                                            uint64_t tx_changes, uint64_t tx_interval_ms)
+{
+    const auto c = static_cast<size_t>(cause);
+    if (c < static_cast<size_t>(core::RefreshCause::count))
+        m_template_refresh_by_cause[c].fetch_add(1, std::memory_order_relaxed);
+    m_template_refresh_ms_last.store(took_ms, std::memory_order_relaxed);
+    m_template_refresh_last_cause.store(static_cast<int8_t>(c), std::memory_order_relaxed);
+    m_template_refresh_tx_changes.store(tx_changes, std::memory_order_relaxed);
+    m_template_refresh_tx_interval_ms.store(tx_interval_ms, std::memory_order_relaxed);
+}
+
+nlohmann::json MiningInterface::get_template_refresh_json() const
+{
+    nlohmann::json by_cause = nlohmann::json::object();
+    for (size_t c = 0; c < static_cast<size_t>(core::RefreshCause::count); ++c)
+        by_cause[core::refresh_cause_name(static_cast<core::RefreshCause>(c))] =
+            m_template_refresh_by_cause[c].load(std::memory_order_relaxed);
+    const int8_t last = m_template_refresh_last_cause.load(std::memory_order_relaxed);
+    return {
+        {"by_cause", std::move(by_cause)},
+        {"ms_last", m_template_refresh_ms_last.load(std::memory_order_relaxed)},
+        {"last_cause", last < 0 ? nlohmann::json(nullptr)
+                                : nlohmann::json(core::refresh_cause_name(static_cast<core::RefreshCause>(last)))},
+        {"tx_changes", m_template_refresh_tx_changes.load(std::memory_order_relaxed)},
+        {"tx_interval_ms", m_template_refresh_tx_interval_ms.load(std::memory_order_relaxed)},
+    };
+}
+
 nlohmann::json MiningInterface::get_mweb_refusals_by_code_json() const
 {
     std::lock_guard<std::mutex> lk(m_template_tx_mutex);
@@ -5915,6 +5944,8 @@ nlohmann::json MiningInterface::rest_local_stats()
                                                            : nlohmann::json::object();
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
+    // Template rebuilds by cause (tx, share, block, mweb) and the last one's ms.
+    result["template_refresh"] = get_template_refresh_json();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
     // Merged (aux) templates fetched degraded (built before the tip's body
     // cleaned the mempool: coinbase only) and fetched again clean, per chain.
@@ -11344,8 +11375,17 @@ std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() cons
     return result;
 }
 
-void WebServer::trigger_work_refresh()
+void WebServer::trigger_work_refresh(core::RefreshCause cause)
 {
+    using namespace std::chrono;
+    // The mempool changes this rebuild reads (the tx-triggered pacing skips
+    // a rebuild for changes an earlier one already covered).
+    uint64_t changes_at_start = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        changes_at_start = m_tx_refresh.changes();
+    }
+    const auto t0 = steady_clock::now();
     // Update local hashrate from stratum sessions (p2pool: get_local_addr_rates)
     if (stratum_server_)
         mining_interface_->set_local_hashrate(stratum_server_->get_total_hashrate());
@@ -11353,11 +11393,59 @@ void WebServer::trigger_work_refresh()
     // Push new work to all miners immediately (p2pool: new_work_event).
     // Old jobs stay valid — miner submits by job_id, which maps to frozen data.
     // Stale shares only occur when MAX_ACTIVE_JOBS (256) is exceeded.
+    // A rebuild for new transactions on the same block does not force
+    // clean_jobs (as a VARDIFF push does not): it can come once a second.
     if (stratum_server_)
-        stratum_server_->notify_all();
+        stratum_server_->notify_all(/*force_clean=*/cause != core::RefreshCause::tx);
+    const auto took = duration_cast<milliseconds>(steady_clock::now() - t0);
+    uint64_t tx_changes = 0, interval_ms = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        m_tx_refresh.on_rebuild(t0, took, changes_at_start);
+        tx_changes = m_tx_refresh.changes();
+        interval_ms = static_cast<uint64_t>(m_tx_refresh.interval().count());
+    }
+    mining_interface_->note_template_refresh(cause, static_cast<uint64_t>(took.count()),
+                                             tx_changes, interval_ms);
 }
 
-void WebServer::execute_debounced_work_refresh()
+void WebServer::trigger_work_refresh_mempool()
+{
+    core::TxRefreshPacer::Plan plan;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        plan = m_tx_refresh.on_change(core::TxRefreshPacer::clock::now());
+    }
+    if (plan.rebuild)
+        trigger_work_refresh(core::RefreshCause::tx);
+    else if (plan.schedule)
+        arm_tx_refresh_timer(plan.at);
+}
+
+void WebServer::arm_tx_refresh_timer(core::TxRefreshPacer::clock::time_point at)
+{
+    if (!m_tx_refresh_timer)
+        m_tx_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    m_tx_refresh_timer->expires_at(at);
+    m_tx_refresh_timer->async_wait([this](beast::error_code ec) {
+        // Cancelled only when the timer goes away with the server.
+        if (ec)
+            return;
+        core::TxRefreshPacer::Plan plan;
+        {
+            std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+            plan = m_tx_refresh.on_timer(core::TxRefreshPacer::clock::now());
+        }
+        if (!running_)
+            return;
+        if (plan.rebuild)
+            trigger_work_refresh(core::RefreshCause::tx);
+        else if (plan.schedule)
+            arm_tx_refresh_timer(plan.at);
+    });
+}
+
+void WebServer::execute_debounced_work_refresh(core::RefreshCause cause)
 {
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
     // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
@@ -11370,7 +11458,7 @@ void WebServer::execute_debounced_work_refresh()
     if (auto* mm = mining_interface_->get_mm_manager())
         mm->mark_pplns_dirty();
 
-    trigger_work_refresh();
+    trigger_work_refresh(cause);
 
     // Invalidate sharechain window cache (new share changed the tip)
     mining_interface_->invalidate_window_cache();
@@ -11394,7 +11482,7 @@ void WebServer::execute_debounced_work_refresh()
     m_last_refresh_tip_hash = refreshed_tip ? refreshed_tip->hash : std::string{};
 }
 
-void WebServer::trigger_work_refresh_debounced()
+void WebServer::trigger_work_refresh_debounced(core::RefreshCause cause)
 {
     // ── Notify debounce (interim hardening fix #3) ──
     // Share-arrival storms used to fan out into one full refresh_work() +
@@ -11417,7 +11505,7 @@ void WebServer::trigger_work_refresh_debounced()
                            && (now - m_last_work_refresh < DEBOUNCE_WINDOW);
 
     if (!in_window && !m_work_refresh_pending) {
-        execute_debounced_work_refresh();  // leading edge — immediate
+        execute_debounced_work_refresh(cause);  // leading edge — immediate
         return;
     }
 
@@ -11425,6 +11513,7 @@ void WebServer::trigger_work_refresh_debounced()
         return;  // trailing refresh already scheduled — this call coalesces
 
     m_work_refresh_pending = true;
+    m_work_refresh_pending_cause = cause;
     if (!m_work_refresh_timer)
         m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
     // Fire at the end of the window that opened with the leading-edge refresh.
@@ -11440,7 +11529,7 @@ void WebServer::trigger_work_refresh_debounced()
         std::string tip_hash = tip ? tip->hash : std::string{};
         if (tip_hash == m_last_refresh_tip_hash)
             return;
-        execute_debounced_work_refresh();
+        execute_debounced_work_refresh(m_work_refresh_pending_cause);
     });
 }
 

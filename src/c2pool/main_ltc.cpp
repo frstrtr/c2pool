@@ -2560,13 +2560,21 @@ int main(int argc, char* argv[]) {
                 LOG_INFO << "[EMB-LTC] Wiring P2P tx → Mempool callback";
                 // Admission refuses what an embedded block can never carry
                 // (Mempool::admit: txs with an MWEB part, pegin outputs
-                // without a kernel, empty vin/vout, a loose HogEx).
+                // without a kernel, empty vin/vout, a loose HogEx) and what is
+                // not final in the next block. An admission that priced a tx
+                // (it, a child waiting for it, an orphan it resolved) asks for
+                // a template rebuild, paced to one a second (#2137 S1): the
+                // share-driven refreshes left templates tens of seconds old.
                 embedded_broadcaster->set_on_new_tx(
                     [pool = embedded_pool.get(),
-                     utxo = ltc_utxo_cache.get()](const std::string& peer_key,
-                                                   const ltc::coin::Transaction& tx) {
+                     utxo = ltc_utxo_cache.get(),
+                     &web_server](const std::string& peer_key,
+                                  const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
+                        const uint64_t priced_before = pool->priced_changes();
                         auto reject = pool->admit(mtx, utxo);
+                        if (pool->priced_changes() != priced_before)
+                            web_server.trigger_work_refresh_mempool();
                         if (!reject) {
                             LOG_DEBUG_COIND << "[EMB-LTC] TX from " << peer_key
                                       << " added to mempool (size=" << pool->size() << ")";
@@ -2934,7 +2942,7 @@ int main(int argc, char* argv[]) {
                     };
                     hs.accepted = [&web_server](int) {
                         LOG_INFO << "[EMB-LTC] Triggering work refresh (new headers)";
-                        web_server.trigger_work_refresh_debounced();
+                        web_server.trigger_work_refresh_debounced(core::RefreshCause::block);
                     };
                     ltc_hdr_sync = std::make_shared<ltc::coin::HeaderSync>(std::move(hs));
                 }
@@ -3535,7 +3543,7 @@ int main(int argc, char* argv[]) {
                                             if (tracker && tracker->state_hash() != block_hash
                                                 && tracker->update(block, height, block.m_mweb_raw)) {
                                                 on_mweb_state(block_hash, state_source());
-                                                web_server.trigger_work_refresh();
+                                                web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                             }
                                         }
                                     }
@@ -3655,11 +3663,13 @@ int main(int argc, char* argv[]) {
                                     if (cold_start && drained.connected > 0)
                                         ltc_dl->drained(drained.connected);
                                     // Fees and inputs once per drain, as the normal path does.
+                                    // A mempool change: the paced rebuild (the debounced
+                                    // one drops its trailing call on an unchanged sharechain).
                                     if (drained.connected > 0 && pool && utxo) {
                                         int resolved = pool->recompute_unknown_fees(utxo);
                                         int evicted = pool->revalidate_inputs(utxo);
                                         if (resolved > 0 || evicted > 0)
-                                            web_server.trigger_work_refresh_debounced();
+                                            web_server.trigger_work_refresh_mempool();
                                     }
 
                                     // Progress log
@@ -3714,7 +3724,7 @@ int main(int argc, char* argv[]) {
                                     LOG_INFO << "[EMB-LTC] MWEB state updated from " << peer
                                              << " h=" << height << " (repeat delivery)";
                                     on_mweb_state(block_hash, state_source());
-                                    web_server.trigger_work_refresh();
+                                    web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                 }
                                 auto pit = pending_merged_resolve->find(block_hash);
                                 if (pit != pending_merged_resolve->end()
@@ -3752,7 +3762,7 @@ int main(int argc, char* argv[]) {
                                         pool->remove_for_block(block);
                                     if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
                                         on_mweb_state(block_hash, state_source());
-                                        web_server.trigger_work_refresh();
+                                        web_server.trigger_work_refresh(core::RefreshCause::mweb);
                                     }
                                     ltc::coin::ordered_arm(*ltc_bs, utxo_best + 1, height);
                                     ltc_bs->phase = "UTXO gap fill";
@@ -3835,7 +3845,7 @@ int main(int argc, char* argv[]) {
                                     int resolved = pool->recompute_unknown_fees(utxo);
                                     int evicted = pool->revalidate_inputs(utxo);
                                     if (resolved > 0 || evicted > 0)
-                                        web_server.trigger_work_refresh_debounced();
+                                        web_server.trigger_work_refresh_mempool();
                                 }
                             }
 
@@ -3852,7 +3862,7 @@ int main(int argc, char* argv[]) {
                                 // trailing edge on a sharechain change, so a call
                                 // right after the tip-change refresh would be dropped.
                                 // Main ioc; the tracker mutex is already released.
-                                web_server.trigger_work_refresh();
+                                web_server.trigger_work_refresh(core::RefreshCause::mweb);
                             } else if (tracker && on_best_chain
                                        && !tracker->mweb_active_at(height, ltc_mweb_activation)) {
                                 // Before MWEB the block itself is what the fetch waits for.
@@ -3990,12 +4000,26 @@ int main(int argc, char* argv[]) {
                 // full_block callback above — same as Litecoin Core, which
                 // runs removeForBlock() identically for both normal advances
                 // and reorgs (no clear()).
+                // Admission's finality check (Mempool::set_lock_time_cutoff):
+                // the next block after the header tip, set now and on every
+                // tip change below.
+                auto set_ltc_lock_time_cutoff = [](ltc::coin::Mempool* pool, const ltc::coin::HeaderChain* chain,
+                                                   const uint256& tip_hash) {
+                    if (!pool || !chain)
+                        return;
+                    if (auto e = chain->get_header(tip_hash))
+                        pool->set_lock_time_cutoff(
+                            e->height + 1, ltc::coin::TemplateBuilder::median_time_past(*chain, *e));
+                };
+                if (auto t = embedded_chain->tip())
+                    set_ltc_lock_time_cutoff(embedded_pool.get(), embedded_chain.get(), t->block_hash);
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
                      bcaster = embedded_broadcaster.get(),
                      chain = embedded_chain.get(),
                      utxo = ltc_utxo_cache.get(),
                      utxo_db = ltc_utxo_db.get(),
+                     pool = embedded_pool.get(), set_ltc_lock_time_cutoff,
                      mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
                      ltc_mweb_activation, ltc_mweb_fetch_retry,
                      &web_server, &ioc](
@@ -4007,11 +4031,14 @@ int main(int argc, char* argv[]) {
                         // bcaster/web_server/UTXO which are ioc-thread objects.
                         const auto tip_seen_at = std::chrono::steady_clock::now();
                         boost::asio::post(ioc,
-                            [tracker, bcaster, chain, utxo, utxo_db, &web_server, &ioc,
+                            [tracker, bcaster, chain, utxo, utxo_db, pool, set_ltc_lock_time_cutoff,
+                             &web_server, &ioc,
                              mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
                              ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at,
                              old_tip, old_height, new_tip, new_height]() {
                       try {
+                        // Relayed txs must be final in the block after this tip.
+                        set_ltc_lock_time_cutoff(pool, chain, new_tip);
                         // A reorg is any switch to a tip that does not descend from
                         // the old one: a sibling or shorter branch, and also a heavier
                         // side branch that ends higher than the old tip.
@@ -4082,7 +4109,7 @@ int main(int argc, char* argv[]) {
                             bcaster->request_full_block(new_tip);
                         }
                         // Trigger work refresh so stratum miners get the new tip
-                        web_server.trigger_work_refresh_debounced();
+                        web_server.trigger_work_refresh_debounced(core::RefreshCause::block);
                       } catch (const std::exception& e) {
                         LOG_ERROR << "[EMB-LTC] Reorg handler error: " << e.what();
                       }

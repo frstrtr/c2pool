@@ -310,8 +310,10 @@ public:
         }
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
+        // Only txs final in this block: IsFinalTx at next_h and the tip's
+        // median time past (litecoind BlockAssembler's nLockTimeCutoff).
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(max_weight);
+            pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp});
 
         // coinbasevalue = block reward + included transaction fees
         // Matches litecoind's getblocktemplate coinbasevalue field.

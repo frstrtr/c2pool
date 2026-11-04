@@ -242,6 +242,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # / the view rewinds (REAL HeaderChain, Mempool, UTXOViewCache/UTXOViewDB),
     # core::coin::segment_cleaned, and the 32-block cleaned_for window. Same
     # folding rule.
+    #
+    # mempool_final_tx_test.cpp: the embedded LTC mempool and template take
+    # only txs final in the next block (litecoind IsFinalTx, #2137 S1):
+    # admission refuses non_final at the tip's height + 1 / MTP, the
+    # template selects at its own height / its parent's MTP (a child stays
+    # out with its parent), and priced_changes() moves exactly when a tx is
+    # priced (the tx-triggered refresh). Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -284,6 +291,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
+        mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
         merged_found_record_test.cpp
         merged_rebuild_payouts_test.cpp

@@ -150,6 +150,13 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # leveldb_store_lock_test.cpp: LevelDBStore::open on a DB whose LOCK is
     # held (another process, another handle) fails and leaves LOCK alone; an
     # unheld LOCK file opens. Same fold-into-core_test reasoning as every TU here.
+    # template_refresh_on_tx_test.cpp: the transaction-triggered template
+    # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
+    # last rebuild, rebuild at once after a quiet interval, skip what another
+    # rebuild covered, 2 s back-off above 500 ms) and a REAL WebServer whose
+    # tx-triggered rebuild fires after a sharechain-unchanged debounce window,
+    # counted in /local_stats template_refresh. Same fold-into-core_test
+    # reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
         addr_store_save_test.cpp
@@ -184,6 +191,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         random_choice_guard_test.cpp
         socket_write_queue_test.cpp
         socket_read_empty_prefix_test.cpp
+        template_refresh_on_tx_test.cpp
         template_txs_check_test.cpp
         tx_advertiser_test.cpp
         utxo_set_hash_test.cpp
