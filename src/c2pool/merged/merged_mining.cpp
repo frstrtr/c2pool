@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
 #include <core/coin/mweb_shape.hpp>
-#include <impl/nmc/coin/header_chain.hpp>  // aux_expected_index (CAuxPow::getExpectedIndex)
+#include <impl/nmc/coin/aux_expected_index.hpp>  // CAuxPow::getExpectedIndex; leveldb-free
 
 #include <core/log.hpp>
 #include <core/hash.hpp>
