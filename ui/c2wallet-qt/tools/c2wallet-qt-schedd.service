@@ -1,0 +1,90 @@
+# c2wallet-qt-schedd — the headless inject scheduler next to a c2pool DASH node.
+#
+# Submits queued, already-signed transactions to the node's loopback
+# POST /api/tx-inject/submit when their triggers hold (maturity, height, time,
+# a final parent). Key-free: it holds no wallet key; it reads the node's 0600
+# control token from the token file at the moment of each request. This file
+# carries no secret, only paths.
+#
+# Shipped as a SYSTEM unit with User=c2pool (deviation from the design's
+# user unit, on purpose):
+#   * it must run as the token file's owner (the node and the scheduler both
+#     require mode 0600 + owner == euid), and on the hotel primary the node
+#     itself is a system unit running as c2pool;
+#   * the sandbox below (ProtectSystem=strict, ProtectHome=read-only,
+#     IPAddressDeny/IPAddressAllow, CapabilityBoundingSet=, RestrictNamespaces)
+#     is only fully enforced by the system manager; an unprivileged user
+#     manager silently skips the IP filter and the mount namespace;
+#   * it starts at boot without `loginctl enable-linger c2pool`.
+#
+# Install on the node host (as root), adjusting the paths if they differ:
+#   install -m 0755 c2wallet-qt-schedd /usr/local/bin/c2wallet-qt-schedd
+#   sudo -u c2pool c2wallet-qt-schedd \
+#       --queue /home/c2pool/.local/share/c2wallet-qt/companion/queue.json \
+#       --node-url http://127.0.0.1:8080 --token-file /home/c2pool/c2pool/control.token init
+#   # optional, the operator's explicit consent (timestamped in the queue file):
+#   sudo -u c2pool c2wallet-qt-schedd \
+#       --queue /home/c2pool/.local/share/c2wallet-qt/companion/queue.json \
+#       arm-policy --auto-arm yes --consent "<who, when, why>"
+#   install -m 0644 c2wallet-qt-schedd.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now c2wallet-qt-schedd
+# `init` creates the queue directory (0700); it must exist before the unit
+# starts, because ReadWritePaths= is set up before the daemon runs.
+#
+# Operate it over SSH as the same user (the queue file is shared, flock'ed):
+#   sudo -u c2pool c2wallet-qt-schedd --queue ... add --hex child.hex --after-parent <txid>:1
+#   sudo -u c2pool c2wallet-qt-schedd --queue ... list | status | pause ID | resume ID | rm ID
+#   journalctl -u c2wallet-qt-schedd -f
+#
+# Exit codes: 0 stop, 2 config error, 3 queue unreadable (both need a human,
+# no restart loop), 4 another runner holds the queue (retried).
+#
+# To run it as a user unit instead (`systemctl --user`, with linger): drop
+# User=, the IPAddress* lines and CapabilityBoundingSet=, use %h for the home
+# paths and WantedBy=default.target.
+
+[Unit]
+Description=c2wallet-qt inject scheduler (key-free; submits queued signed txs to the local c2pool node)
+
+[Service]
+Type=simple
+User=c2pool
+ExecStart=/usr/local/bin/c2wallet-qt-schedd \
+    --queue /home/c2pool/.local/share/c2wallet-qt/companion/queue.json \
+    --node-url http://127.0.0.1:8080 \
+    --token-file /home/c2pool/c2pool/control.token \
+    run
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2 3
+# On SIGTERM the runner sends no new request and aborts an in-flight GET; an
+# in-flight POST finishes within its 15 s timeout, then the tick ends.
+TimeoutStopSec=90
+UMask=0077
+
+# Sandbox: loopback HTTP only, write access only to the queue directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/c2pool/.local/share/c2wallet-qt
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

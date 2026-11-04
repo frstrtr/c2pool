@@ -1327,6 +1327,12 @@ void HttpSession::process_request()
                 }
             }
 
+            // A merged chain's getblocktemplate is answered to a direct
+            // local client only (MiningInterface::t_direct_local_request).
+            struct DirectLocalScope {
+                explicit DirectLocalScope(bool v) { MiningInterface::t_direct_local_request = v; }
+                ~DirectLocalScope() { MiningInterface::t_direct_local_request = false; }
+            } direct_local_scope(is_direct_local());
             response_body = mining_interface_->HandleRequest(request_body);
         }
         else {

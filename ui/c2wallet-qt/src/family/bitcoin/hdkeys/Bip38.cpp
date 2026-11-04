@@ -24,24 +24,40 @@ void sha256d(const uint8_t* in, size_t n, uint8_t out[32])
 }
 
 // The BIP38 address-hash: first 4 bytes of SHA256d over the ASCII P2PKH address
-// string (BTC mainnet version byte 0x00), using the compressed/uncompressed
-// pubkey per the flag byte. Returns true iff it matches the embedded 4 bytes.
-bool address_hash_ok(const uint8_t scalar[32], bool compressed, const uint8_t want[4])
+// string, using the compressed/uncompressed pubkey per the flag byte. BIP38
+// defines it over the BTC address (version 0x00); altcoin encryptors hash their
+// own coin's address, so the caller names the version bytes to accept. Returns
+// true iff one of them matches the embedded 4 bytes, and reports which.
+bool address_hash_ok(const uint8_t scalar[32], bool compressed, const uint8_t want[4],
+                     const std::vector<uint8_t>& versions, uint8_t& matched)
 {
     auto pub = Secp::instance().pubkey_create(scalar, compressed);
     if (pub.empty()) return false;
     auto h = hash160(pub.data(), pub.size());
-    std::string addr = encode_p2pkh(0x00, h);   // BIP38 checksum is defined over the BTC address
-    uint8_t chk[32];
-    sha256d(reinterpret_cast<const uint8_t*>(addr.data()), addr.size(), chk);
-    return std::memcmp(chk, want, 4) == 0;
+    for (uint8_t version : versions) {
+        std::string addr = encode_p2pkh(version, h);
+        uint8_t chk[32];
+        sha256d(reinterpret_cast<const uint8_t*>(addr.data()), addr.size(), chk);
+        if (std::memcmp(chk, want, 4) == 0) {
+            matched = version;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
 
 Bip38Decode decode_bip38(const std::string& encrypted, const std::string& passphrase)
 {
+    return decode_bip38(encrypted, passphrase, std::vector<uint8_t>{0x00});
+}
+
+Bip38Decode decode_bip38(const std::string& encrypted, const std::string& passphrase,
+                         const std::vector<uint8_t>& address_versions)
+{
     Bip38Decode r;
+    if (address_versions.empty()) { r.error = "no address version to check the BIP38 address hash against"; return r; }
     std::vector<unsigned char> data;
     if (!DecodeBase58Check(encrypted, data, 43)) { r.error = "not valid base58check"; return r; }
     if (data.size() != 39) { r.error = "wrong BIP38 payload length"; return r; }
@@ -68,7 +84,7 @@ Bip38Decode decode_bip38(const std::string& encrypted, const std::string& passph
         std::memset(derived.data(), 0, derived.size());
 
         if (!secp.seckey_verify(sk)) { r.error = "decrypted scalar out of range"; secure::secure_wipe(sk, 32); return r; }
-        if (!address_hash_ok(sk, r.compressed, addresshash)) {
+        if (!address_hash_ok(sk, r.compressed, addresshash, address_versions, r.address_version)) {
             r.error = "wrong passphrase (address-hash checksum mismatch)";
             secure::secure_wipe(sk, 32); return r;
         }
@@ -142,7 +158,7 @@ Bip38Decode decode_bip38(const std::string& encrypted, const std::string& passph
         secure::secure_wipe(passfactor, 32); secure::secure_wipe(ep1full, 16);
 
         if (!mul_ok || !secp.seckey_verify(sk)) { r.error = "decrypted scalar out of range"; secure::secure_wipe(sk, 32); return r; }
-        if (!address_hash_ok(sk, r.compressed, addresshash)) {
+        if (!address_hash_ok(sk, r.compressed, addresshash, address_versions, r.address_version)) {
             r.error = "wrong passphrase (address-hash checksum mismatch)";
             secure::secure_wipe(sk, 32); return r;
         }

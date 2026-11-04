@@ -13,6 +13,11 @@
 
 namespace c2w::hdkeys::mjson {
 
+// Deepest object/array nesting parse() accepts. The parser recurses once per
+// level, so an unbounded depth (e.g. 200000 '[') would exhaust the stack; every
+// document these modules read (wallet files, UTXO lists, manifests) is under 10.
+inline constexpr int kMaxNestingDepth = 64;
+
 struct JVal {
     enum class T { Null, Bool, Num, Str, Arr, Obj } t = T::Null;
     bool b = false;
@@ -30,7 +35,8 @@ struct JVal {
     std::string str_of(const std::string& key) const;
 };
 
-// Parse a whole JSON document. ok=false on syntax error (or trailing garbage).
+// Parse a whole JSON document. ok=false on syntax error, trailing garbage, or
+// nesting deeper than kMaxNestingDepth.
 struct ParseResult { bool ok = false; JVal root; std::string error; };
 ParseResult parse(const std::string& s);
 

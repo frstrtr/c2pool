@@ -192,6 +192,10 @@ tools/dash/*
 !tools/canon/
 tools/xmr-anchor-gen/*
 !tools/xmr-anchor-gen/xmr_anchor_gen.py
+# DOGE hash-schedule anchor cross-check -- tracked source: the generated
+# src/impl/doge/coin/doge_schedule_anchors.inc names it as the check that
+# ships with the anchor list.
+!tools/doge-anchor-check.py
 # C4 template-parity capture -- tracked source, same reason again: the golden
 # header and its generator both name this script as the capture step, and a
 # golden whose capture leg is not in the tree is a golden nobody can reproduce.

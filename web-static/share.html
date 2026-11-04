@@ -618,9 +618,10 @@
             // Generation TX
             var gentx = block.gentx || {};
             html += '<h3>Generation Transaction</h3><div class="kv-grid">';
-            var txLink = tx_prefix
-                ? '<a href="' + tx_prefix + (gentx.hash || '') + '" target="_blank">' + esc(gentx.hash || '') + '</a>'
-                : esc(gentx.hash || '');
+            var txLink = !gentx.hash ? '-'
+                : tx_prefix
+                ? '<a href="' + tx_prefix + gentx.hash + '" target="_blank">' + esc(gentx.hash) + '</a>'
+                : esc(gentx.hash);
             html += kv('TX Hash', txLink);
             html += kv('Value', (gentx.value != null ? gentx.value.toFixed(8) : '-') + ' ' + symbol);
             var txNonce = gentx.last_txout_nonce;
@@ -644,6 +645,9 @@
                     html += '<a href="' + link + '" target="_blank">' + (i+1) + '</a>';
                 });
                 html += '</div>';
+            } else if (block.other_transaction_hashes_note) {
+                html += '<h3>Other Transactions</h3>';
+                html += '<div class="kv-label">' + esc(block.other_transaction_hashes_note) + '</div>';
             }
 
             html += '</div>'; // close block section

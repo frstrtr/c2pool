@@ -39,6 +39,7 @@ set(source
     stratum_work_source.hpp
     address_utils.hpp address_utils.cpp
     leveldb_store.hpp leveldb_store.cpp
+    leveldb_pread_env.hpp leveldb_pread_env.cpp
     address_validator.hpp address_validator.cpp
     # Control-plane settings foundation (M0): declarative param catalog +
     # monolithic settings-file loader with per-key source, tri-state, money gate.
@@ -66,6 +67,12 @@ add_library(core_util STATIC core_util.cpp)
 # only as conan target-scoped includes, so the leaf must carry the header path.
 target_link_libraries(core_util PUBLIC Boost::headers)
 
+# The pread Env derives from LevelDB's classes; LevelDB is built without RTTI
+# (no typeinfo for them), so that file is too.
+if(NOT MSVC)
+    set_source_files_properties(leveldb_pread_env.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
+endif()
+
 add_library(core OBJECT ${source})
 target_link_libraries(core PUBLIC core_util btclibs)
 
@@ -77,13 +84,16 @@ target_include_directories(core PUBLIC ${LEVELDB_INCLUDE_DIRS})
 # UTXO snapshots (DASH full UTXO set, PR S1): MuHash3072 + ChaCha20 and the
 # compressor / Coin codec ported from Dash Core v23.1.7 (crypto/VENDOR.md),
 # the dumptxoutset reader / writer / pin / import / dump, and the set hashes
-# over a UTXOViewDB. Its own OBJECT library: only the targets that name it
-# link it (core_test, c2pool-utxo), so no node binary changes in this PR.
+# over a UTXOViewDB, and gettxoutsetinfo for the DOGE full set (utxo_stats,
+# Dogecoin Core 1.14.9). Its own OBJECT library: only the targets that name it
+# link it (core_test, c2pool-utxo, c2pool-dash, and the LTC binaries for
+# --utxo-stats).
 add_library(core_utxo OBJECT
     crypto/chacha20.hpp crypto/chacha20.cpp
     crypto/muhash.hpp crypto/muhash.cpp
     coin/coin_compressor.hpp coin/coin_compressor.cpp
     coin/utxo_set_hash.hpp coin/utxo_set_hash.cpp
+    coin/utxo_stats.hpp coin/utxo_stats.cpp
     coin/utxo_snapshot.hpp coin/utxo_snapshot.cpp
     utxo_tools.hpp utxo_tools.cpp
 )
