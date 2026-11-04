@@ -8,11 +8,17 @@
 // SubstitutedBlocktxn..., HeaderMerkleMismatch...) are the revert-red arm:
 // drop block_body_binds_to_header from CompactBlockReceiver::fill and they
 // come back Complete instead of FallbackFull.
+//
+// DashCompactMempool (slice 3) drives the same receiver over a real Mempool
+// through make_mempool_short_id_provider; its revert-red arms are listed at
+// that section.
 
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/compact_block_receive.hpp>
 #include <impl/dash/coin/compact_negotiation.hpp>
+#include <impl/dash/coin/compact_mempool_provider.hpp>
+#include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/vendor/blockencodings.hpp>
 #include <impl/dash/coin/block.hpp>
@@ -303,4 +309,127 @@ TEST(DashCompactNegotiation, PeersAreIndependentAndDisconnectClears) {
     EXPECT_FALSE(n.supports_compact("a"));
     EXPECT_TRUE(n.supports_compact("b"));
     EXPECT_EQ(n.peer_count(), 1u);
+}
+
+// ── #968a slice 3: mempool short-id lookup ──────────────────────────────────
+// make_mempool_short_id_provider (compact_mempool_provider.hpp) over a real
+// dash::coin::Mempool. Revert-red arms (fresh binary per arm):
+//   A provider returns an empty snapshot          -> 6 of 7 red (all but NullMempool...)
+//   B snapshot taken when the provider is built   -> TxAdmittedAfter..., Evicted... red
+//   C snapshot key is not dash_txid (1 bit flip)  -> 6 of 7 red (all but NullMempool...)
+//   D set_mempool_provider does not store         -> SetterArmsAndClears... red
+
+namespace {
+
+uint256 dtxid(const MutableTransaction& tx) { return dash_txid(tx); }
+
+void add_block_txs(Mempool& mp, const BlockType& b, std::vector<size_t> idx) {
+    for (size_t i : idx)
+        ASSERT_TRUE(mp.add_tx(b.m_txs[i])) << "index " << i;
+}
+
+} // namespace
+
+TEST(DashCompactMempool, NullMempoolGivesNullProvider) {
+    EXPECT_FALSE(static_cast<bool>(make_mempool_short_id_provider(nullptr)));
+
+    const BlockType b = mk_block(3);
+    CompactBlockReceiver rx(make_mempool_short_id_provider(nullptr), kMaxTx);
+    EXPECT_FALSE(rx.has_mempool_provider());
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(40));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn);
+    EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{1, 2}));
+}
+
+TEST(DashCompactMempool, LiveMempoolCompletesWithoutRoundTrip) {
+    const BlockType b = mk_block(5);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 2, 3, 4});
+    ASSERT_TRUE(mp.add_tx(mk_tx(9999)));   // in the pool, not in the block
+
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(41));
+    ASSERT_EQ(vd.kind, Kind::Complete) << vd.reason;
+    expect_same(vd.block, b);
+    EXPECT_EQ(rx.parked_count(), 0u);
+    EXPECT_EQ(mp.size(), 5u);   // lookup does not consume the pool
+}
+
+TEST(DashCompactMempool, PartialMempoolRequestsOnlyTheMissing) {
+    const BlockType b = mk_block(5);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 3});
+
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(42));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn);
+    EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{2, 4}));
+
+    auto done = rx.on_blocktxn(kPeer, answer(vd.request, b));
+    ASSERT_EQ(done.kind, Kind::Complete) << done.reason;
+    expect_same(done.block, b);
+}
+
+TEST(DashCompactMempool, TxAdmittedAfterProviderIsBuiltIsFound) {
+    const BlockType b = mk_block(4);
+    Mempool mp;
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    add_block_txs(mp, b, {1, 2, 3});
+
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(43));
+    ASSERT_EQ(vd.kind, Kind::Complete) << vd.reason;
+    expect_same(vd.block, b);
+}
+
+TEST(DashCompactMempool, EvictedTxIsRequested) {
+    const BlockType b = mk_block(4);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 2, 3});
+    CompactBlockReceiver rx(make_mempool_short_id_provider(&mp), kMaxTx);
+    mp.remove_tx(dtxid(b.m_txs[2]));
+
+    auto vd = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(44));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn);
+    EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{2}));
+}
+
+TEST(DashCompactMempool, SnapshotKeysAreDashTxid) {
+    Mempool mp;
+    std::vector<MutableTransaction> txs{mk_tx(7001), mk_tx(7002), mk_tx(7003)};
+    for (const auto& tx : txs) ASSERT_TRUE(mp.add_tx(tx));
+
+    auto provider = make_mempool_short_id_provider(&mp);
+    ASSERT_TRUE(static_cast<bool>(provider));
+    const auto snap = provider();
+    ASSERT_EQ(snap.size(), txs.size());
+    for (const auto& [key, ref] : snap) {
+        ASSERT_TRUE(ref);
+        EXPECT_EQ(key, dtxid(*ref));
+        EXPECT_EQ(key, txid(*ref));   // the hash the vendored GetShortID is fed
+        EXPECT_TRUE(mp.contains(key));
+    }
+}
+
+TEST(DashCompactMempool, SetterArmsAndClearsTheReceiver) {
+    const BlockType b = mk_block(4);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 2, 3});
+
+    CompactBlockReceiver rx(nullptr, kMaxTx);
+    auto first = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(45));
+    ASSERT_EQ(first.kind, Kind::NeedTxn);
+    EXPECT_EQ(first.request.indexes, (std::vector<uint16_t>{1, 2, 3}));
+
+    rx.set_mempool_provider(make_mempool_short_id_provider(&mp));
+    EXPECT_TRUE(rx.has_mempool_provider());
+    auto second = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(45));
+    ASSERT_EQ(second.kind, Kind::Complete) << second.reason;
+    expect_same(second.block, b);
+    EXPECT_FALSE(rx.has_parked(kPeer));   // the re-announce replaced the park
+
+    rx.set_mempool_provider(nullptr);
+    EXPECT_FALSE(rx.has_mempool_provider());
+    auto third = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(45));
+    ASSERT_EQ(third.kind, Kind::NeedTxn);
+    EXPECT_EQ(third.request.indexes, (std::vector<uint16_t>{1, 2, 3}));
 }

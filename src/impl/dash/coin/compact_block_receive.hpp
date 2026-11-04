@@ -133,6 +133,15 @@ public:
 
     void on_disconnect(const std::string& peer) { m_parked.erase(peer); }
 
+    // #968a slice 3: install (or clear, with nullptr) the mempool the next
+    // cmpctblock is matched against. A block already parked keeps the
+    // provider it was built with; it only waits for blocktxn.
+    void set_mempool_provider(vendor::MempoolShortIdProvider mempool)
+    {
+        m_mempool = std::move(mempool);
+    }
+    bool has_mempool_provider() const { return static_cast<bool>(m_mempool); }
+
     size_t parked_count() const { return m_parked.size(); }
     bool has_parked(const std::string& peer) const { return m_parked.count(peer) != 0; }
 

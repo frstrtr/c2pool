@@ -800,8 +800,9 @@ private:
     dash::coin::GetmnlistdSlotTracker m_getmnlistd_tracker;
 
     // #968a: BIP 152 compact-block receive. One parked block per peer while a
-    // getblocktxn is outstanding. No mempool provider yet, so every
-    // non-prefilled tx is fetched by getblocktxn. The bound is dashcore's
+    // getblocktxn is outstanding. Starts with no mempool provider, so every
+    // non-prefilled tx is fetched by getblocktxn until the owner calls
+    // set_compact_mempool_provider (slice 3). The bound is dashcore's
     // MaxBlockSize(true) / MIN_TRANSACTION_SIZE = 2'000'000 / 10.
     dash::coin::CompactBlockReceiver m_cmpct_rx{nullptr, 200000};
     // #968a slice 2: per-peer sendcmpct state (dashcore fProvidesHeaderAndIDs /
@@ -1652,6 +1653,14 @@ public:
     /// coverage. Reporting only — see m_on_govsync_primed.
     void set_on_govsync_primed(std::function<void(const std::string&)> fn)
     { m_on_govsync_primed = std::move(fn); }
+    /// #968a slice 3: the mempool cmpctblock short ids are matched against
+    /// (build it with make_mempool_short_id_provider, compact_mempool_provider.hpp).
+    /// Unset = every non-prefilled tx goes to getblocktxn. Call before the
+    /// first dial or on the io thread; the provider's Mempool must outlive
+    /// this client.
+    void set_compact_mempool_provider(dash::coin::vendor::MempoolShortIdProvider p)
+    { m_cmpct_rx.set_mempool_provider(std::move(p)); }
+    bool has_compact_mempool_provider() const { return m_cmpct_rx.has_mempool_provider(); }
     /// Register ONE historical-mnlistdiff consumer. Additive, not a slot: the
     /// Phase-L member source and the MN-checkpoint lane both source historical
     /// snapshots off this client and both must be offered every reply.
