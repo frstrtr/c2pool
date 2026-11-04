@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=c2wallet-qt signer
+Comment=Air-gapped, network-incapable c2pool wallet signer
+Exec=c2wallet-qt-signer
+Icon=c2wallet-qt-signer
+Categories=Utility;
+Terminal=false

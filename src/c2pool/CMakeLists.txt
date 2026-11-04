@@ -147,6 +147,7 @@ target_link_libraries(c2pool
     ${Boost_LIBRARIES}
 )
 target_link_libraries(c2pool c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+target_link_libraries(c2pool core_utxo)  # --utxo-stats (Dogecoin Core 1.14.9 gettxoutsetinfo)
 
 # Enhanced version with explicit name (for backward compatibility)
 add_executable(c2pool_enhanced main_ltc.cpp)
@@ -163,6 +164,7 @@ target_link_libraries(c2pool_enhanced
     ${Boost_LIBRARIES}
 )
 target_link_libraries(c2pool_enhanced c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+target_link_libraries(c2pool_enhanced core_utxo)  # --utxo-stats (Dogecoin Core 1.14.9 gettxoutsetinfo)
 
 # c2pool-ltc: LTC (+ embedded DOGE aux merged-mining) reference entrypoint.
 # The coin-matrix / release presence gate keys on src/c2pool/main_ltc.cpp
@@ -185,6 +187,7 @@ target_link_libraries(c2pool-ltc
     ${Boost_LIBRARIES}
 )
 target_link_libraries(c2pool-ltc c2pool_hashrate pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+target_link_libraries(c2pool-ltc core_utxo)  # --utxo-stats (Dogecoin Core 1.14.9 gettxoutsetinfo)
 
 # c2pool-btc: BTC SPV embedded p2pool — Phase B0 scaffold (stub entry).
 # Library `btc` is a clone of `ltc` with namespace renamed and CMake targets

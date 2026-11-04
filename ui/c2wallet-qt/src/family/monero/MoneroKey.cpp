@@ -16,6 +16,10 @@
 #if defined(__linux__)
 #  include <sys/random.h>   // getrandom(2)
 #  include <cerrno>
+#elif defined(__APPLE__)
+#  include <sys/types.h>
+#  include <sys/random.h>   // getentropy(2), macOS 10.12+
+#  include <unistd.h>
 #endif
 
 namespace c2wallet::monero {
@@ -182,6 +186,14 @@ bool generate_wallet(GeneratedWallet& out, std::string& err)
             return false;
         }
         got += static_cast<std::size_t>(n);
+    }
+#elif defined(__APPLE__)
+    // Darwin has no getrandom(2): getentropy(2), the kernel CSPRNG, at most 256
+    // bytes per call (32 here, one call). Failure refuses to generate.
+    static_assert(sizeof(entropy) <= 256, "getentropy fills at most 256 bytes per call");
+    if (::getentropy(entropy.data(), entropy.size()) != 0) {
+        err = "getentropy(2) failed";
+        return false;
     }
 #else
     err = "no vetted CSPRNG available on this platform (getrandom/BCryptGenRandom required)";

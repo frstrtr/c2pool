@@ -17,7 +17,7 @@ uint8_t p2pkh_version(bool testnet)
     return testnet ? kTestnetP2PKHVersion : kMainnetP2PKHVersion;
 }
 
-std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet)
+std::array<uint8_t, 20> p2pkh_to_h160(const std::string& addr, uint8_t version)
 {
     std::vector<unsigned char> raw;
     // 21 = 1 version byte + 20 payload; DecodeBase58Check strips+verifies the
@@ -26,9 +26,7 @@ std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet)
         throw DashAbort("bad base58 checksum or over-long address: " + addr);
     if (raw.size() != 21)
         throw DashAbort("address " + addr + " payload is not 21 bytes (version + hash160)");
-    const uint8_t version = raw[0];
-    const uint8_t expected = p2pkh_version(testnet);
-    if (version != expected)
+    if (raw[0] != version)
         throw DashAbort("address " + addr + " has the wrong version byte for this network "
                         "(wrong network or not a P2PKH address)");
     std::array<uint8_t, 20> h160{};
@@ -36,9 +34,19 @@ std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet)
     return h160;
 }
 
+std::string h160_to_p2pkh(const std::array<uint8_t, 20>& h160, uint8_t version)
+{
+    return hdkeys::encode_p2pkh(version, h160);
+}
+
+std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet)
+{
+    return p2pkh_to_h160(addr, p2pkh_version(testnet));
+}
+
 std::string h160_to_addr(const std::array<uint8_t, 20>& h160, bool testnet)
 {
-    return hdkeys::encode_p2pkh(p2pkh_version(testnet), h160);
+    return h160_to_p2pkh(h160, p2pkh_version(testnet));
 }
 
 std::array<uint8_t, 25> p2pkh_script(const std::array<uint8_t, 20>& h160)
