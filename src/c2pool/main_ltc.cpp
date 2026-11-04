@@ -3112,6 +3112,10 @@ int main(int argc, char* argv[]) {
                             }
                             for (uint32_t h : undone)
                                 utxo_db->remove_block_undo(h);
+                            // The pool judges maturity at the set's height:
+                            // follow it down (#2136).
+                            if (pool)
+                                pool->set_tip_height(rw.height);
                             LOG_WARNING << "[EMB-LTC] UTXO rewound to the best chain (" << reason
                                         << "): disconnected " << rw.disconnected << " blocks (h="
                                         << before << "→" << rw.height << ") best="

@@ -837,6 +837,13 @@ public:
         if (!utxo)
             return {std::move(result), total_fees};  // no view, no selection
 
+        // The height of the block being built (Core GetSpendHeight): the
+        // template's own when given, else the pool's height + 1 (0: unknown,
+        // maturity unchecked). The pool's height follows the UTXO view and
+        // can be above the template's after a reorg onto a lower branch.
+        const uint32_t spend_height = (final_at && final_at->height != 0) ? final_at->height
+                                    : (m_tip_height > 0 ? m_tip_height + 1 : 0);
+
         // Belt under admit(): a tx no block can carry never joins a template,
         // however it reached the pool. Counted per template; expected 0.
         std::set<uint256> barred;
@@ -880,8 +887,8 @@ public:
                     core::coin::Coin coin;
                     if (!utxo->get_coin(uop, coin))
                         return false;  // absent from UTXO and mempool — stale
-                    // Not spendable in the block being built (height tip + 1).
-                    if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                    // Not spendable in the block being built.
+                    if (spend_height != 0 && !coin.is_mature(spend_height, m_limits))
                         return false;
                 }
             }
@@ -1184,19 +1191,31 @@ private:
     /// What check_inputs_locked found.
     enum class Inputs { Ok, Missing, Invalid };
 
+    /// The next block's height, at which admission judges coinbase / pegout
+    /// maturity (Core GetSpendHeight = tip + 1): the header tip's next block
+    /// once set_lock_time_cutoff named it, else the pool's height + 1 (0:
+    /// unknown). Not the UTXO view's height + 1: during a fill the view lags
+    /// the tip, and a spend maturing in between would be refused for good.
+    uint32_t spend_height_locked() const {
+        if (m_lock_time_cutoff.height != 0)
+            return m_lock_time_cutoff.height;
+        return m_tip_height > 0 ? m_tip_height + 1 : 0;
+    }
+
     /// Core HaveInputs + CheckTxInputs against the view and the pool: every
     /// input in the view or an in-pool parent (else Missing, with the missing
-    /// parents' txids); a view coin mature at the next block's height (Core
-    /// GetSpendHeight = tip + 1) and in money range; inputs cover outputs.
+    /// parents' txids); a view coin mature at the next block's height
+    /// (spend_height_locked) and in money range; inputs cover outputs.
     Inputs check_inputs_locked(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo,
                                std::vector<uint256>& missing) const {
+        const uint32_t spend_height = spend_height_locked();
         int64_t value_in = 0;
         for (const auto& vin : tx.vin) {
             core::coin::Outpoint op(vin.prevout.hash, vin.prevout.index);
             core::coin::Coin coin;
             int64_t v = 0;
             if (utxo->get_coin(op, coin)) {
-                if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
+                if (spend_height != 0 && !coin.is_mature(spend_height, m_limits))
                     return Inputs::Invalid;  // bad-txns-premature-spend-of-coinbase
                 v = coin.value;
             } else {

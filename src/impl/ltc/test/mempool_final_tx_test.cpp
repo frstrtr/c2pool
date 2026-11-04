@@ -11,6 +11,9 @@
 //   - the template's selection takes only txs final at its own height and
 //     its parent's MTP (a REAL HeaderChain and TemplateBuilder), and a child
 //     of a non-final tx stays out with it;
+//   - coinbase maturity: the selection at the template's own height, the
+//     admission at the next block's (header tip + 1), never at a lagging
+//     pool height (#2136);
 //   - priced_changes() moves exactly when admission prices a tx (itself, or
 //     a child waiting for it): the transaction-triggered template refresh
 //     main_ltc wires on it; admitted_unpriced / still_unknown count the txs
@@ -245,4 +248,73 @@ TEST(LtcMempoolFinalTx, PricedChangesDriveTheTxRefresh)
     seq = pool.priced_changes();
     EXPECT_TRUE(pool.admit(tx_with(0, kFinal, fund(1)), &view)) << "duplicate";
     EXPECT_EQ(pool.priced_changes(), seq);
+}
+
+namespace {
+
+core::coin::Coin coinbase_at(uint32_t height)
+{
+    core::coin::Coin cb;
+    cb.value = 50'000'000;
+    cb.scriptPubKey.m_data = {0x51};
+    cb.height = height;
+    cb.coinbase = true;
+    return cb;
+}
+
+} // namespace
+
+// The selection judges coinbase maturity at the template's own height (Core
+// GetSpendHeight), not at the pool's height + 1: the pool's height follows
+// the UTXO view and stays above the template's after a reorg onto a lower
+// branch. The verifier's VerifyS0.SelectionMaturityIgnoresTheTemplateHeight,
+// inverted: pool height 106, a block at 105 spending a coinbase from height
+// 6 (mature from 106) is bad-txns-premature-spend-of-coinbase.
+TEST(LtcMempoolFinalTx, SelectionJudgesCoinbaseMaturityAtTheTemplateHeight)
+{
+    Mempool pool;
+    core::coin::UTXOViewCache view(nullptr);
+    view.add_coin(core::coin::Outpoint(fund(9), 0), coinbase_at(6));
+    pool.set_utxo(&view);
+    pool.set_tip_height(106);
+    const MutableTransaction t = tx_with(0, kFinal, fund(9), 0, 49'000'000);
+    ASSERT_FALSE(pool.admit(t, &view));
+    const auto at105 = pool.get_sorted_txs_with_fees(TemplateBuilder::MAX_BLOCK_WEIGHT, LockTimeCutoff{105, 0});
+    EXPECT_EQ(at105.first.size(), 0u) << "immature in a block at height 105";
+    const auto at106 = pool.get_sorted_txs_with_fees(TemplateBuilder::MAX_BLOCK_WEIGHT, LockTimeCutoff{106, 0});
+    EXPECT_EQ(at106.first.size(), 1u) << "mature in a block at height 106";
+}
+
+// Admission judges maturity at the next block's height (the header tip + 1,
+// set_lock_time_cutoff), not at the UTXO view's height + 1: during a fill the
+// view lags the tip, and a spend that matures in between was refused
+// inputs_invalid and erased for good. Unset (DOGE), the pool's height + 1.
+TEST(LtcMempoolFinalTx, AdmissionJudgesMaturityAtTheNextBlock)
+{
+    core::coin::UTXOViewCache view(nullptr);
+    view.add_coin(core::coin::Outpoint(fund(9), 0), coinbase_at(6));
+    const MutableTransaction t = tx_with(0, kFinal, fund(9), 0, 49'000'000);
+    {
+        Mempool pool;
+        pool.set_utxo(&view);
+        pool.set_tip_height(100);            // the view, mid-fill
+        pool.set_lock_time_cutoff(106, kMtp);  // the header tip is 105
+        EXPECT_FALSE(pool.admit(t, &view)) << "spendable in the next block";
+        EXPECT_EQ(pool.size(), 1u);
+    }
+    {
+        Mempool pool;
+        pool.set_utxo(&view);
+        pool.set_tip_height(100);
+        pool.set_lock_time_cutoff(105, kMtp);
+        auto r = pool.admit(t, &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Mempool::Reject::inputs_invalid) << "premature in the next block";
+    }
+    {
+        Mempool pool;  // no cutoff: the pool's height + 1
+        pool.set_utxo(&view);
+        pool.set_tip_height(105);
+        EXPECT_FALSE(pool.admit(t, &view));
+    }
 }
