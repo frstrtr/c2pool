@@ -190,6 +190,11 @@ struct PeerManagerConfig
     bool        is_merged{false};               // merged chain uses inv instead of full block
     bool        disable_discovery{false};       // isolated network — only connect to specified peers
     std::set<uint16_t> valid_ports;             // only connect to peers on known ports
+    /// Core's -connect: dial these peers and no other. No peer DB, no
+    /// anchors, no DNS / fixed / HTTP seeds, no getpeerinfo, no addr gossip,
+    /// no emergency re-arm; a lost peer is dialed again (with backoff).
+    /// Empty: the normal peer manager.
+    std::vector<NetService> connect_only;
 
     // Hardening: network group limits (Sybil resistance)
     int         max_peers_per_group{4};         // max peers from same /16 (IPv4) or /32 (IPv6)
@@ -276,9 +281,47 @@ public:
         m_http_peer_seeds = std::move(seeds);
     }
 
+    /// PeerManagerConfig::connect_only is set.
+    bool connect_only() const { return !m_config.connect_only.empty(); }
+
     /// Start peer management (bootstrap + periodic refresh + maintenance).
     void start()
     {
+        if (connect_only()) {
+            // Nothing from the peer DB, the seeds or the daemon: the peers
+            // given, each protected (never dropped, dialed again when lost).
+            {
+                // The protected local daemon (set_local_node) stays.
+                std::lock_guard<std::mutex> lock(m_mutex);
+                for (auto it = m_peers.begin(); it != m_peers.end();)
+                    it = it->first == m_local_node_key ? std::next(it) : m_peers.erase(it);
+                m_anchors.clear();
+            }
+            std::string list;
+            for (const auto& addr : m_config.connect_only) {
+                auto ep = PeerEndpoint::from(addr);
+                if (!ep) {
+                    LOG_WARNING << "[" << m_symbol << "] connect-only: rejected invalid address "
+                                << addr.to_string();
+                    continue;
+                }
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto key = ep->to_string();
+                auto& peer = m_peers[key];
+                peer.address = ep->to_net_service();
+                peer.addr_class = ep->addr_class();
+                peer.score = 999999;
+                peer.is_protected = true;
+                peer.source = PeerInfo::Source::manual;
+                peer.first_seen = peer.last_seen = std::chrono::steady_clock::now();
+                peer.max_attempts = 999999;
+                list += (list.empty() ? "" : " ") + key;
+            }
+            m_running = true;
+            LOG_INFO << "[" << m_symbol << "] PeerManager started connect-only: " << list
+                     << " (no peer DB, seeds, getpeerinfo or addr gossip)";
+            return;
+        }
         load_peers();
         boost_anchor_scores();
         bootstrap_from_getpeerinfo();
@@ -309,7 +352,8 @@ public:
         m_fixed_seed_timer.cancel();
         m_http_seed_timer.cancel();
         m_emergency_timer.cancel();
-        save_peers();
+        if (!connect_only())  // the peer DB keeps the peers of a normal run
+            save_peers();
     }
 
     /// Add a peer discovered via P2P addr message.
@@ -320,6 +364,8 @@ public:
     void add_discovered_peer(const NetService& addr,
                              const std::string& source_host = std::string())
     {
+        if (connect_only())
+            return;
         std::lock_guard<std::mutex> lock(m_mutex);
         try_add_peer_locked(addr, PeerInfo::Source::addr_crawl, /*require_routable=*/true,
                             source_host);
@@ -333,6 +379,18 @@ public:
         const std::set<std::string>& connected_keys) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (connect_only()) {
+            // The given peers (and the local daemon) only, each when not
+            // connected and not backing off.
+            std::vector<PeerEndpoint> result;
+            for (const auto& [key, peer] : m_peers) {
+                if (connected_keys.count(key) || !peer.can_retry())
+                    continue;
+                if (auto ep = PeerEndpoint::from(peer.address))
+                    result.push_back(*ep);
+            }
+            return result;
+        }
         int pending = static_cast<int>(connected_keys.size());
         if (pending >= m_config.max_peers) return {};
 
@@ -479,7 +537,7 @@ public:
     /// Check if we're below min_peers — triggers emergency refresh.
     bool needs_emergency_refresh(int connected_count) const
     {
-        if (m_config.disable_discovery) return false;
+        if (m_config.disable_discovery || connect_only()) return false;
         return connected_count < m_config.min_peers;
     }
 
@@ -502,7 +560,7 @@ public:
     /// gives up while starved+running. See docs/coin-peer-manager-rearm.md.
     void arm_emergency_fallbacks()
     {
-        if (m_config.disable_discovery || !m_running) return;
+        if (m_config.disable_discovery || connect_only() || !m_running) return;
         if (m_emergency_active) return;                 // re-entry guard
         m_emergency_active = true;
 
@@ -554,7 +612,7 @@ public:
     /// Whether discovery (getaddr) should be enabled.
     bool discovery_enabled() const
     {
-        if (m_config.disable_discovery) return false;
+        if (m_config.disable_discovery || connect_only()) return false;
         // The bucketed DB is the getaddr sink now: keep harvesting until
         // it is of table order (~82k slots) — in practice always, exactly
         // like dashd keeps banking addr gossip. The old working-set gate
