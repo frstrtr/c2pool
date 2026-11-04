@@ -249,6 +249,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # template selects at its own height / its parent's MTP (a child stays
     # out with its parent), and priced_changes() moves exactly when a tx is
     # priced (the tx-triggered refresh). Same folding rule.
+    #
+    # utxo_view_stats_test.cpp: /local_stats ltc_utxo (#2137): the anchor,
+    # depth and completeness of the UTXO view the template prices against
+    # (sync state, else the anchor this process observed, else unknown) and
+    # the admission counters of what it cannot price. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -313,6 +318,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         template_hogex_survives_truncation_test.cpp
         template_topology_spend_test.cpp
         utxo_order_test.cpp
+        utxo_view_stats_test.cpp
         version_switch_floor_test.cpp
         wirecompat_runtime_test.cpp
     )

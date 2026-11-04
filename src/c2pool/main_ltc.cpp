@@ -277,6 +277,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
+#include <impl/ltc/coin/utxo_view_stats.hpp>
 #include <impl/ltc/coin/found_block_verify.hpp>
 #include <impl/ltc/coin/header_sync.hpp>
 #include <impl/ltc/coin/cold_start_tick.hpp>
@@ -2995,6 +2996,10 @@ int main(int argc, char* argv[]) {
                 // height; that first block is allowed past the next-height /
                 // parent checks. 0 = none.
                 auto utxo_jump_from = std::make_shared<uint32_t>(0);
+                // The first height this process connected into an empty UTXO
+                // set (a cold start, a re-anchor): the view's anchor, which an
+                // accrual set does not record (/local_stats ltc_utxo). 0 = none.
+                auto ltc_view_anchor = std::make_shared<std::atomic<uint32_t>>(0);
                 // Cold start (utxo_order.hpp cold_start_plan): decided once, by
                 // the 1-s tick below, when the header chain is synced; over the
                 // tip's last score-backlog heights (5 * SHARE_PERIOD *
@@ -3331,9 +3336,12 @@ int main(int argc, char* argv[]) {
                 // matter) and "ltc_mempool" (admission: refusals by code, MWEB txs
                 // seen, kernel fees given up, template drops, the last block the
                 // pool was cleaned for).
+                // "ltc_utxo" is the depth of the UTXO view the template prices
+                // against and what it cannot price (utxo_view_stats.hpp).
                 mi->set_coin_metrics_fn(
                     [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync, ltc_dl,
-                     pool = embedded_pool.get(), tracker = mweb_tracker.get()]() {
+                     pool = embedded_pool.get(), tracker = mweb_tracker.get(),
+                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
                             {"cmpct_v3", ltc_cmpct_v3},
@@ -3349,7 +3357,12 @@ int main(int argc, char* argv[]) {
                         mp["last_cleaned_ago_s"] = cleaned
                             ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
                             : nlohmann::json(nullptr);
+                        const auto tip = chain ? chain->tip() : std::nullopt;
+                        nlohmann::json u = ltc::coin::utxo_view_json(
+                            utxo, ltc_view_anchor->load(std::memory_order_relaxed),
+                            tip ? tip->height : 0, tip ? tip->block_hash : uint256(), pool);
                         return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
+                                              {"ltc_utxo", std::move(u)},
                                               {"ltc_headers", ltc_hdr_sync->to_json()},
                                               {"ltc_bootstrap", ltc_dl->to_json()}};
                     });
@@ -3379,6 +3392,7 @@ int main(int argc, char* argv[]) {
                          pending_merged_resolve, on_full_block_merged,
                          ltc_bs, mweb_retry, mweb_stats, seen_blocks, on_mweb_state, fill_rr,
                          utxo_jump_from, utxo_heal, ltc_dl, ltc_cold_decided, ltc_stall_request,
+                         ltc_view_anchor,
                          ltc_mweb_activation, self = std::weak_ptr<FullBlockFn>(full_block_fn),
                          &ioc, &web_server](
                             const std::string& peer,
@@ -3574,10 +3588,13 @@ int main(int argc, char* argv[]) {
                                             uint32_t h) {
                                         if (h == *utxo_jump_from)
                                             *utxo_jump_from = 0;
+                                        const bool into_empty_set = utxo->get_best_block().IsNull();
                                         auto undo = utxo->connect_block(b, h, txid_fn, bh);
                                         utxo_db->put_block_undo(h, undo);
                                         utxo->flush(bh, h);
                                         utxo->prune_undo(h, LTC_KEEP);
+                                        if (into_empty_set)
+                                            ltc_view_anchor->store(h, std::memory_order_relaxed);
 
                                         if (explorer_enabled) {
                                             PackStream ps;
