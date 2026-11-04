@@ -234,6 +234,14 @@ if (BUILD_TESTING AND GTest_FOUND)
     # captured witness-coinbase batches (h4715979, h5080796, h5641398,
     # h6101857) extends by the whole batch; an asked peer's answer cuts
     # nothing. Same folding rule.
+    #
+    # template_gap_gate_test.cpp: the embedded LTC template waits for the
+    # mempool cleanup of every block between the UTXO view and the tip
+    # (#2136): back-to-back blocks and a reorg across a same-height sibling
+    # are refused mempool-not-cleaned-for-ancestor until the parent is cleaned
+    # / the view rewinds (REAL HeaderChain, Mempool, UTXOViewCache/UTXOViewDB),
+    # core::coin::segment_cleaned, and the 32-block cleaned_for window. Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -293,6 +301,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_topology_spend_test.cpp
         utxo_order_test.cpp

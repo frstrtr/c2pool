@@ -30,6 +30,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace core {
@@ -454,6 +455,14 @@ public:
     uint32_t get_best_height() const {
         std::shared_lock<std::shared_mutex> lock(m_mu);
         return m_base ? m_base->get_best_height() : 0;
+    }
+    /// Best block and its height, read together (a flush between two
+    /// separate reads would pair one block's hash with another's height).
+    std::pair<uint256, uint32_t> get_best() const {
+        std::shared_lock<std::shared_mutex> lock(m_mu);
+        if (!m_base)
+            return {uint256(), 0};
+        return {m_base->get_best_block(), m_base->get_best_height()};
     }
 
     /// Number of blocks connected since startup (or loaded from DB on restart).

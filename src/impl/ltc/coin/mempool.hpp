@@ -634,6 +634,12 @@ public:
         return m_last_block_hash;
     }
 
+    /// How many cleaned blocks cleaned_for() remembers. The template gate
+    /// (core::coin::segment_cleaned) checks every block between the UTXO
+    /// view's best and the tip against it, so it bounds the segment a
+    /// template may build on (#2136); a view further behind is a bootstrap.
+    static constexpr size_t CLEANED_BLOCKS_KEPT = 32;
+
     /// True when remove_for_block() ran for `block_hash` (one of the last
     /// CLEANED_BLOCKS_KEPT blocks it saw): the txs that block confirmed are
     /// gone. Late copies of an older block or a stale sibling's body also run
@@ -1458,7 +1464,6 @@ private:
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
 
     // Blocks remove_for_block() ran for (most recent last), for cleaned_for().
-    static constexpr size_t CLEANED_BLOCKS_KEPT = 16;
     std::deque<uint256> m_cleaned_blocks;
     uint256 m_last_block_hash;
     time_t  m_last_cleaned_time{0};

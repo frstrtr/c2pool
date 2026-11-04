@@ -3522,13 +3522,16 @@ int main(int argc, char* argv[]) {
                                     // and mempool cleanup do not depend on the UTXO set,
                                     // so a stalled fill does not hold templates on stale
                                     // state or on transactions this block confirmed.
+                                    // Templates still wait for the fill: the blocks
+                                    // between the UTXO set and the tip are cleaned only
+                                    // as the drain connects them (the segment gate,
+                                    // #2136). The pool's height follows the drain, which
+                                    // sets it as it reaches each height.
                                     if (ltc_bs->phase != "Bootstrap" && on_best_chain) {
                                         auto tip_now = chain->tip();
                                         if (tip_now && tip_now->block_hash == block_hash) {
-                                            if (pool) {
-                                                pool->set_tip_height(height);
+                                            if (pool)
                                                 pool->remove_for_block(block);
-                                            }
                                             if (tracker && tracker->state_hash() != block_hash
                                                 && tracker->update(block, height, block.m_mweb_raw)) {
                                                 on_mweb_state(block_hash, state_source());
@@ -3740,12 +3743,13 @@ int main(int argc, char* argv[]) {
                                                 << " — buffering it and fetching " << utxo_best + 1
                                                 << ".." << height - 1 << " in order";
                                     // Its MWEB state and mempool cleanup do not depend
-                                    // on the UTXO set: do them now so templates do not
-                                    // wait for the fill.
-                                    if (pool) {
-                                        pool->set_tip_height(height);
+                                    // on the UTXO set: do them now. Templates still
+                                    // wait for the fill (the segment gate, #2136: the
+                                    // blocks in between are cleaned as the drain
+                                    // connects them), and the pool's height stays the
+                                    // UTXO set's until the drain reaches this block.
+                                    if (pool)
                                         pool->remove_for_block(block);
-                                    }
                                     if (tracker && tracker->update(block, height, block.m_mweb_raw)) {
                                         on_mweb_state(block_hash, state_source());
                                         web_server.trigger_work_refresh();
@@ -3822,7 +3826,10 @@ int main(int argc, char* argv[]) {
                             }
 
                             if (pool) {
-                                pool->set_tip_height(height);
+                                // The pool judges maturity at the UTXO set's height,
+                                // never at a block's the set has not connected (a side
+                                // branch's, an older copy's).
+                                pool->set_tip_height(utxo ? utxo->get_best_height() : height);
                                 pool->remove_for_block(block);
                                 if (utxo) {
                                     int resolved = pool->recompute_unknown_fees(utxo);

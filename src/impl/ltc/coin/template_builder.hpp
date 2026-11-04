@@ -25,6 +25,7 @@
 #include <core/pack.hpp>
 #include <core/log.hpp>
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/template_gate.hpp>
 #include <core/coin/template_txs_check.hpp>
 
 #include <btclibs/util/strencodings.h>
@@ -199,8 +200,11 @@ public:
     /// Returns std::nullopt if the chain has no tip yet (not synced to genesis),
     /// the built template fails the MWEB shape check, or the mempool has not
     /// been cleaned for the tip yet (its block body has not run through
-    /// Mempool::remove_for_block, so txs the tip confirmed may still be in it);
-    /// in the latter cases the refused template is handed out through
+    /// Mempool::remove_for_block, so txs the tip confirmed may still be in it),
+    /// or not for every block between the UTXO view's best and the tip, or
+    /// the view's best is not on the tip's ancestry
+    /// (mempool-not-cleaned-for-ancestor, core::coin::segment_cleaned); in
+    /// the latter cases the refused template is handed out through
     /// `refused` when given (the caller decides between HOLD and a degraded
     /// start; a refusal the shape check cannot see is named under
     /// core::coin::kTemplateRefusalKey).
@@ -272,7 +276,38 @@ public:
         // through remove_for_block. Until then a template on the tip could
         // carry them (bad-txns-inputs-missingorspent), whatever path brought
         // the tip or its MWEB state first.
-        const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
+        const size_t pool_size = pool.size();
+        const bool pool_cleaned = pool_size == 0 || pool.cleaned_for(tip.block_hash);
+
+        // ── ... and for every block between the UTXO view and the tip ──────
+        // The selection prices against the UTXO view. When the view's best is
+        // behind the tip (the tip's body came before its parent's: a UTXO gap,
+        // a fill running, a reorg across a sibling), the pool was cleaned for
+        // the tip at once but the blocks in between are cleaned only when the
+        // fill connects them; their txs are still priced and selectable
+        // (#2136). The view's best must also be on the tip's ancestry. A view
+        // with no best block yet prices nothing.
+        std::optional<core::coin::SegmentCheck> segment;
+        uint32_t view_best_height = 0;
+        if (pool_size != 0) {
+            if (const auto* view = pool.utxo()) {
+                const auto [best_hash, best_height] = view->get_best();
+                view_best_height = best_height;
+                if (!best_hash.IsNull()) {
+                    segment = core::coin::segment_cleaned(
+                        core::coin::BlockRef{best_height, best_hash},
+                        core::coin::BlockRef{tip.height, tip.block_hash},
+                        [&pool](const uint256& bh) { return pool.cleaned_for(bh); },
+                        [&chain](const uint256& bh) -> std::optional<uint256> {
+                            auto e = chain.get_header(bh);
+                            if (!e)
+                                return std::nullopt;
+                            return e->prev_hash;
+                        },
+                        static_cast<uint32_t>(Mempool::CLEANED_BLOCKS_KEPT));
+                }
+            }
+        }
 
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         auto [selected_txs, total_fees] =
@@ -418,6 +453,13 @@ public:
         if (!refusal && !pool_cleaned) {
             refusal = "mempool-not-cleaned-for-tip";
             data[core::coin::kTemplateRefusalKey] = *refusal;
+        }
+        if (!refusal && segment && !segment->ok()) {
+            refusal = std::string(core::coin::kNotCleanedForAncestor) + " ("
+                    + core::coin::segment_gate_name(segment->gate) + " at h=" + std::to_string(segment->height)
+                    + (segment->hash.IsNull() ? std::string() : " " + segment->hash.GetHex().substr(0, 16))
+                    + ", UTXO view at h=" + std::to_string(view_best_height) + ")";
+            data[core::coin::kTemplateRefusalKey] = core::coin::kNotCleanedForAncestor;
         }
         // Structural check of the transactions (what litecoind would reject
         // the block for) and the fee total: c2pool's own selection must never
