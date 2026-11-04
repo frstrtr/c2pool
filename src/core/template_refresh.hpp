@@ -16,11 +16,15 @@
 //     cause (a block's or a share's rebuild covers the changes before it);
 //   - leading edge: after a quiet interval the change rebuilds at once;
 //     changes inside the interval coalesce into one rebuild at its end;
-//   - the interval is 1 s, 2 s while the last rebuild took over 500 ms.
+//   - the interval is at least 1 s and at least DUTY_FACTOR (4) times the
+//     rebuild cost (fast-attack, slow-decay estimate over every rebuild), so
+//     tx-triggered rebuilds take at most about 25 % of the io thread whatever
+//     a rebuild costs on the host (#2137).
 // Single-threaded by contract (the caller serializes): pure, the clock is
 // passed in, so the KATs pin it directly.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 
@@ -52,9 +56,8 @@ public:
     using clock = std::chrono::steady_clock;
     using ms = std::chrono::milliseconds;
 
-    static constexpr ms INTERVAL{1000};       // at most one tx-triggered rebuild a second
-    static constexpr ms SLOW_INTERVAL{2000};  // ... every 2 s while a rebuild is slow:
-    static constexpr ms SLOW_REBUILD{500};    // the last one took longer than this
+    static constexpr ms INTERVAL{1000};        // at most one tx-triggered rebuild a second
+    static constexpr int64_t DUTY_FACTOR = 4;  // ... and one per 4 rebuild costs (<= 25 % duty)
 
     /// What the caller does now.
     struct Plan {
@@ -91,10 +94,16 @@ public:
         m_last_start = start;
         m_rebuilt = true;
         m_last_took = took;
+        // Fast attack, slow decay: one slow rebuild widens the interval at
+        // once; a run of cheap ones (a HOLD that returned early) narrows it
+        // by a quarter each.
+        m_cost = took > m_cost ? took : ms((3 * m_cost.count() + took.count()) / 4);
     }
 
     /// The pacing interval now.
-    ms interval() const { return m_last_took > SLOW_REBUILD ? SLOW_INTERVAL : INTERVAL; }
+    ms interval() const { return std::max(INTERVAL, ms(DUTY_FACTOR * m_cost.count())); }
+    /// The rebuild cost estimate the interval scales with.
+    ms cost() const { return m_cost; }
 
     uint64_t changes() const { return m_changes; }
     uint64_t covered() const { return m_covered; }
@@ -117,6 +126,7 @@ private:
     bool              m_timer_armed{false};
     clock::time_point m_last_start{};
     ms                m_last_took{0};
+    ms                m_cost{0};
 };
 
 } // namespace core

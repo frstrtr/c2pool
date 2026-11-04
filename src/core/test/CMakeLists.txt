@@ -153,9 +153,11 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # template_refresh_on_tx_test.cpp: the transaction-triggered template
     # refresh (#2137 S1): core::TxRefreshPacer (coalesce within 1 s of the
     # last rebuild, rebuild at once after a quiet interval, skip what another
-    # rebuild covered, 2 s back-off above 500 ms) and a REAL WebServer whose
-    # tx-triggered rebuild fires after a sharechain-unchanged debounce window,
-    # counted in /local_stats template_refresh. Same fold-into-core_test
+    # rebuild covered, an interval of at least 4 rebuild costs) and a REAL
+    # WebServer whose tx-triggered rebuild fires after a sharechain-unchanged
+    # debounce window, notifies nobody when the template did not change, and
+    # is counted in /local_stats template_refresh; every session's job of a
+    # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(core_test
