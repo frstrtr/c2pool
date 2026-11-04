@@ -18,9 +18,10 @@
 // Plus: the tx-merkle over the pruned set is well-defined and the pruned set
 // upholds both invariants (no double-spend, parents-before-children).
 //
-// UTXO-free: fees are pinned with Mempool::set_tx_fee (utxo view = null), the
-// exact legacy no-UTXO path the old selector treated as "admit every fee-known
-// tx in feerate order". Per-coin isolation: src/impl/ltc/ only.
+// Fees are pinned with Mempool::set_tx_fee; the confirmed inputs sit in an
+// in-memory view (selection needs one: no view, no selection). The old
+// selector treated this as "admit every fee-known tx in feerate order".
+// Per-coin isolation: src/impl/ltc/ only.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -35,6 +36,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/coin/transaction.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 
 namespace {
 
@@ -110,6 +112,8 @@ TEST(LtcTemplateTopologySpend, CpfpChildOrderedAfterParent)
     ASSERT_TRUE(pe && ce);
     ASSERT_GT(ce->feerate(), pe->feerate());
 
+    ltc_test::CoveringView v;
+    v.cover(mp);
     auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
     ASSERT_EQ(sel.size(), 2u);
@@ -134,6 +138,8 @@ TEST(LtcTemplateTopologySpend, ChildWithoutSelectableParentExcluded)
     ASSERT_TRUE(mp.add_tx(C));
     mp.set_tx_fee(cid, 8000);    // child fee known
 
+    ltc_test::CoveringView v;
+    v.cover(mp);
     auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
     auto s = txid_set(sel);
@@ -159,6 +165,8 @@ TEST(LtcTemplateTopologySpend, IntraTemplateDoubleSpendPruned)
     mp.set_tx_fee(d1, 5000);    // higher feerate -> visited first -> wins
     mp.set_tx_fee(d2, 1000);
 
+    ltc_test::CoveringView v;
+    v.cover(mp);
     auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
     ASSERT_EQ(sel.size(), 1u) << "both double-spenders admitted -> lost block";
@@ -199,6 +207,8 @@ TEST(LtcTemplateTopologySpend, PrunedSetIsValidBodyAndMerkleMatches)
     mp.set_tx_fee(d2, 4000);
     mp.set_tx_fee(ocid, 8000);
 
+    ltc_test::CoveringView v;
+    v.cover(mp);
     auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
     auto s = txid_set(sel);
@@ -239,20 +249,19 @@ TEST(LtcTemplateTopologySpend, PrunedSetIsValidBodyAndMerkleMatches)
 }
 
 // ===========================================================================
-// DOGE Pass-2 (fill_unknown_fee=true) topology KATs.
+// DOGE: unknown-fee txs never reach the template.
 //
-// The DOGE embedded template builder calls get_sorted_txs_with_fees(cap, true),
-// which packs unknown-fee txs (fee=null-shaped) after the fee-known Pass 1. The
-// pre-#1437 Pass 2 walked m_time_index with only a "parent present in pool"
-// guard -> it could pack an unknown-fee child before/without its parent, or a
-// second unknown-fee spender of an already-consumed outpoint. The fix shares
-// Pass 1's `admissible` predicate and `consumed` set and runs Pass 2 as its own
-// fixed point. total_fees is never touched by Pass 2 (doge underfill invariants
-// stay green).
+// The DOGE template builder used to call get_sorted_txs_with_fees(cap, true),
+// a Pass 2 that packed unknown-fee txs (fee=null-shaped) after the priced
+// ones; #1437 made it share Pass 1's topology and double-spend guards. With a
+// view a tx is unpriced only when it is an orphan, a premature coinbase
+// spend or a money-range failure, none of which a block may carry: Pass 2 is
+// gone and these pin that an unpriced tx is never selected, whatever its
+// parent or its outpoint.
 // ===========================================================================
 
-// --- Test 5: unknown-fee child packed AFTER its known-fee parent --------------
-TEST(LtcTemplateTopologySpend, DogeUnknownChildOrderedAfterKnownParent)
+// --- Test 5: an unknown-fee child is left out; its known-fee parent ships ----
+TEST(LtcTemplateTopologySpend, DogeUnknownChildIsLeftOut)
 {
     Mempool mp;
 
@@ -263,17 +272,17 @@ TEST(LtcTemplateTopologySpend, DogeUnknownChildOrderedAfterKnownParent)
 
     ASSERT_TRUE(mp.add_tx(P));
     ASSERT_TRUE(mp.add_tx(C));
-    mp.set_tx_fee(pid, 200);    // known-fee parent -> Pass 1
-    // C left fee-unknown -> Pass 2 fill territory
+    mp.set_tx_fee(pid, 200);    // known-fee parent
+    // C left fee-unknown
 
-    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000, /*fill_unknown_fee=*/true);
+    ltc_test::CoveringView v;
+    v.cover(mp);
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
-    ASSERT_EQ(sel.size(), 2u);
-    int ip = index_of(sel, pid), ic = index_of(sel, cid);
-    ASSERT_GE(ip, 0);
-    ASSERT_GE(ic, 0);
-    EXPECT_LT(ip, ic) << "unknown-fee child before parent -> bad-txns-inputs-missingorspent";
-    EXPECT_EQ(fees, 200u);      // only the known-fee parent contributes; Pass 2 fee=null
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(index_of(sel, pid), 0);
+    EXPECT_EQ(index_of(sel, cid), -1) << "an unpriced tx reached the template";
+    EXPECT_EQ(fees, 200u);
 }
 
 // --- Test 6: unknown-fee second spender refused (intra-template double-spend) --
@@ -289,10 +298,12 @@ TEST(LtcTemplateTopologySpend, DogeUnknownDoubleSpendRefused)
 
     ASSERT_TRUE(mp.add_tx(D1));
     ASSERT_TRUE(mp.add_tx(D2));
-    mp.set_tx_fee(d1, 5000);    // D1 known -> consumes CONFIRMED_X:0 in Pass 1
-    // D2 unknown -> Pass 2 must refuse the already-consumed outpoint
+    mp.set_tx_fee(d1, 5000);    // D1 known -> consumes CONFIRMED_X:0
+    // D2 unknown -> never selected
 
-    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000, /*fill_unknown_fee=*/true);
+    ltc_test::CoveringView v;
+    v.cover(mp);
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
     auto s = txid_set(sel);
     EXPECT_EQ(s.count(d1), 1u);
@@ -306,10 +317,10 @@ TEST(LtcTemplateTopologySpend, DogeUnknownDoubleSpendRefused)
     EXPECT_EQ(consumers, 1);
 }
 
-// --- Test 7: unknown-fee child of an unknown-fee parent -> fixed point ---------
-// Both P and C are fee-unknown; only the Pass-2 fixed point lands them, parent
-// first. A single non-iterating pass ordered by arrival could emit C before P.
-TEST(LtcTemplateTopologySpend, DogeUnknownChainFixedPointParentFirst)
+// --- Test 7: unknown-fee child of an unknown-fee parent -> neither -----------
+// Both P and C are fee-unknown: the template carries neither (before, the
+// Pass-2 fixed point packed both, parent first).
+TEST(LtcTemplateTopologySpend, DogeUnknownChainIsLeftOut)
 {
     Mempool mp;
 
@@ -323,12 +334,12 @@ TEST(LtcTemplateTopologySpend, DogeUnknownChainFixedPointParentFirst)
     ASSERT_TRUE(mp.add_tx(P));
     // both fee-unknown
 
-    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000, /*fill_unknown_fee=*/true);
+    ltc_test::CoveringView v;
+    v.cover(mp);
+    auto [sel, fees] = mp.get_sorted_txs_with_fees(4'000'000);
 
-    ASSERT_EQ(sel.size(), 2u);
-    int ip = index_of(sel, pid), ic = index_of(sel, cid);
-    ASSERT_GE(ip, 0);
-    ASSERT_GE(ic, 0);
-    EXPECT_LT(ip, ic) << "fixed point failed to order unknown-fee parent before child";
-    EXPECT_EQ(fees, 0u);        // both Pass 2 -> fee=null, total_fees untouched
+    EXPECT_TRUE(sel.empty()) << "an unpriced tx reached the template";
+    EXPECT_EQ(index_of(sel, pid), -1);
+    EXPECT_EQ(index_of(sel, cid), -1);
+    EXPECT_EQ(fees, 0u);
 }
