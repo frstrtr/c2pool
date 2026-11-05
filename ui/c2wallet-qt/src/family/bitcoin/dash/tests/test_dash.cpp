@@ -23,6 +23,7 @@
 #include "../GovCollateral.hpp"
 #include "../InjectCaps.hpp"
 #include "../KeyScan.hpp"
+#include "../MessageModel.hpp"
 #include "../SweepTx.hpp"
 #include "../UtxoIntake.hpp"
 
@@ -40,9 +41,11 @@
 
 #include "gov_vectors.hpp"
 #include "inject_vectors.hpp"
+#include "msg_vectors.hpp"
 #include "s2_vectors.hpp"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cstdint>
 #include <exception>
@@ -245,32 +248,6 @@ static void test_collateral_tx()
     CollateralRequest badexp = make_request(DUMMY_ADDR0);
     badexp.expected_hash_display = std::string(64, '0');
     CHECK(aborts([&] { plan_collateral(badexp); }), "expected-hash mismatch hard-aborts");
-}
-
-static void test_message()
-{
-    std::printf("[message sign / verify — DarkCoin magic, recover-and-check]\n");
-    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, 0, 3, false);
-    const std::string msg = "c2wallet-qt dash proposal-ownership test";
-
-    std::string sig = sign_message(key.priv, msg, DUMMY_ADDR0, false);
-    CHECK(!sig.empty(), "signature produced");
-    CHECK(verify_message(DUMMY_ADDR0, msg, sig, false), "sign->verify roundtrip (recovers to address)");
-
-    // RFC6979 determinism.
-    std::string sig2 = sign_message(key.priv, msg, DUMMY_ADDR0, false);
-    CHECK(sig == sig2, "recoverable signing is deterministic");
-
-    // Tampered message / wrong address / tampered sig all fail.
-    CHECK(!verify_message(DUMMY_ADDR0, msg + "!", sig, false), "tampered message fails");
-    CHECK(!verify_message(DUMMY_ADDR1, msg, sig, false), "wrong claimed address fails");
-    std::string bad = sig;
-    bad[0] = (bad[0] == 'A' ? 'B' : 'A'); // corrupt the leading base64 char
-    CHECK(!verify_message(DUMMY_ADDR0, msg, bad, false), "tampered signature fails");
-
-    // Self-verify gate: signing while claiming the WRONG address must hard-abort
-    // (the recovered pubkey hashes to ADDR0, not ADDR1).
-    CHECK(aborts([&] { sign_message(key.priv, msg, DUMMY_ADDR1, false); }), "self-verify gate: wrong address hard-aborts");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1966,6 +1943,506 @@ static void test_s2_k13_relay_fee_mode()
     CHECK(contains(plan_sweep(sweep_of(2, 70000)).summary, "pin lane EXCLUDES"), "inject NOTE names the pin-lane outcome (nit 1)");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Sign / Verify Message (design A.7). The signatures are Dash Core v23.1.7
+// `signmessagewithprivkey` output for public throwaway keys (msg_vectors.hpp);
+// ours must equal them byte for byte, and Core's must verify here.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace mv = c2w::dash::msgvec;
+
+static std::vector<uint8_t> bytes_of(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+
+// An independent RFC 4648 base64 codec, so the KATs do not judge the library's
+// btclibs codec with itself.
+static const char* const kB64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string b64_encode(const std::vector<uint8_t>& v)
+{
+    std::string out;
+    size_t i = 0;
+    for (; i + 3 <= v.size(); i += 3) {
+        const uint32_t n = (uint32_t(v[i]) << 16) | (uint32_t(v[i + 1]) << 8) | v[i + 2];
+        for (int k = 3; k >= 0; --k) out += kB64Alphabet[(n >> (6 * k)) & 63];
+    }
+    const size_t rest = v.size() - i;
+    if (rest) {
+        const uint32_t n = (uint32_t(v[i]) << 16) | (rest == 2 ? uint32_t(v[i + 1]) << 8 : 0u);
+        out += kB64Alphabet[(n >> 18) & 63];
+        out += kB64Alphabet[(n >> 12) & 63];
+        out += rest == 2 ? kB64Alphabet[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+static std::vector<uint8_t> b64_decode(const std::string& s)
+{
+    std::vector<uint8_t> out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : s) {
+        if (c == '=') break;
+        const char* p = c ? std::strchr(kB64Alphabet, c) : nullptr;
+        if (!p) return {};
+        acc = (acc << 6) | uint32_t(p - kB64Alphabet);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(uint8_t((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// The high-S twin of a compact signature: s' = n - s (secp256k1 order n) and
+// the recovery id's parity bit flipped (R' = -R); it recovers the same key.
+static std::vector<uint8_t> high_s_twin(std::vector<uint8_t> sig65)
+{
+    static const uint8_t N[32] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                  0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48,
+                                  0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41};
+    int borrow = 0;
+    for (int i = 31; i >= 0; --i) {
+        int d = int(N[i]) - int(sig65[33 + i]) - borrow;
+        borrow = d < 0 ? 1 : 0;
+        if (d < 0) d += 256;
+        sig65[33 + i] = uint8_t(d);
+    }
+    const int h = sig65[0] - 27;
+    sig65[0] = uint8_t(27 + ((h & 3) ^ 1) + (h & 4));
+    return sig65;
+}
+
+template <typename F>
+static std::string sig_or_empty(F&& fn, const char* what)
+{
+    try { return fn(); }
+    catch (const std::exception& e) { std::printf("    (%s threw: %s)\n", what, e.what()); return {}; }
+}
+
+static void test_message_kats()
+{
+    std::printf("[message KATs: Dash Core v23.1.7 signmessagewithprivkey vectors, byte-identical]\n");
+    const MessageCoin& dash = message_coin("DASH");
+    CHECK(std::string(dash.ticker) == "DASH" && std::string(dash.magic) == "DarkCoin Signed Message:\n" &&
+              dash.p2pkh_mainnet == kMainnetP2PKHVersion && dash.p2pkh_testnet == kTestnetP2PKHVersion && dash.kat_proven,
+          "DASH row: DarkCoin magic, 0x4c / 0x8c, proven by a node vector");
+    CHECK(&message_coins().front() == &dash, "DASH is the first row");
+    CHECK(message_coin("BTC").p2pkh_mainnet == 0x00 && message_coin("LTC").p2pkh_mainnet == 0x30 &&
+              message_coin("DOGE").p2pkh_mainnet == 0x1e && message_coin("DGB").p2pkh_mainnet == 0x1e,
+          "the other rows take their mainnet P2PKH byte from the CoinParams SSOT");
+    bool only_dash = true;
+    for (const MessageCoin& c : message_coins())
+        if (c.kat_proven != (std::string(c.ticker) == "DASH")) only_dash = false;
+    CHECK(only_dash, "only DASH is kat_proven");
+    CHECK(aborts([] { message_coin("XYZ"); }) && aborts([] { message_coin("dash"); }), "an unknown or lower-case ticker aborts");
+
+    // ── M1 digest layout ────────────────────────────────────────────────────
+    const std::string magic = "DarkCoin Signed Message:\n";
+    std::vector<uint8_t> pre = {0x19};
+    pre.insert(pre.end(), magic.begin(), magic.end());
+    std::vector<uint8_t> m1 = pre;
+    m1.insert(m1.end(), {0x02, 'a', 'b'});
+    CHECK(message_digest(dash, bytes_of("ab")) == c2w::artifact::sha256d(m1),
+          "M1: digest == dsha256(\"\\x19DarkCoin Signed Message:\\n\\x02ab\")");
+    const std::vector<uint8_t> lng = mv::message_bytes(mv::Msg::Long);
+    std::vector<uint8_t> m1b = pre;
+    m1b.insert(m1b.end(), {0xfd, 0x2c, 0x01});
+    m1b.insert(m1b.end(), lng.begin(), lng.end());
+    CHECK(lng.size() == 300 && lng.back() == ' ' && message_digest(dash, lng) == c2w::artifact::sha256d(m1b),
+          "M1b: the 300-byte message's varstr is fd 2c 01 + the bytes");
+    std::vector<uint8_t> m1c = pre;
+    m1c.push_back(0x00);
+    CHECK(message_digest(dash, {}) == c2w::artifact::sha256d(m1c), "M1c: the empty message's varstr is 00");
+
+    // ── the two keys, through the importers ────────────────────────────────
+    FoundKey kA, kA2, kU;
+    CHECK(runs([&] { kA = load_funding_key(key_of(KeySource::Wif, mv::kWifA), mv::kAddrA, false); }, "WIF A") &&
+              kA.compressed && kA.pub.size() == 33,
+          "key A via WIF: compressed, bound to Xn9K...");
+    CHECK(runs([&] { kA2 = find_key_for_address(DUMMY_MNEMONIC, testvec::kPyParityPassphrase, mv::kAddrA, false, KeyScanRange{}); },
+               "mnemonic A") &&
+              kA2.compressed && kA2.path == "m/44'/5'/0'/0/0",
+          "key A via mnemonic + TREZOR: m/44'/5'/0'/0/0, compressed");
+    CHECK(runs([&] { kU = load_funding_key(key_of(KeySource::Wif, mv::kWifU), mv::kAddrU, false); }, "WIF U") &&
+              !kU.compressed && hexstr(kU.pub) == mv::kPubUHex && kU.address == mv::kAddrU,
+          "key U via WIF: scalar 1, uncompressed pub == G, computed address == XoyDQ...");
+    SecureBytes one(32);
+    for (size_t i = 0; i < 32; ++i) one[i] = 0;
+    one[31] = 1;
+
+    // ── M2..M6 + negatives M7..M14 on every row ────────────────────────────
+    for (const mv::CoreMsgVector& v : mv::kCoreVectors) {
+        const std::string L = v.label;
+        const std::vector<uint8_t> msg = mv::message_bytes(v.msg);
+        const char* addr = v.key_a ? mv::kAddrA : mv::kAddrU;
+        const char* other = v.key_a ? mv::kAddrU : mv::kAddrA;
+        std::string s1, s2;
+        if (v.key_a) {
+            s1 = sig_or_empty([&] { return sign_message(dash, kA, msg, false); }, "sign A (WIF)");
+            s2 = sig_or_empty([&] { return sign_message(dash, kA2, msg, false); }, "sign A (mnemonic)");
+        } else {
+            s1 = sig_or_empty([&] { return sign_message(dash, kU, msg, false); }, "sign U (WIF)");
+            s2 = sig_or_empty([&] { return sign_message(dash, one, false, msg, addr, false); }, "sign U (scalar 1)");
+        }
+        const bool same = s1 == v.sig_b64 && s2 == v.sig_b64;
+        std::printf("    %-8s %s\n", v.label, same ? "byte-identical to Dash Core" : "MISMATCH");
+        CHECK(same, ("M2-M5 " + L + ": our signature == Dash Core's, through both importers").c_str());
+
+        VerifyReport r;
+        const std::vector<uint8_t> raw = b64_decode(v.sig_b64);
+        CHECK(raw.size() == 65 && b64_encode(raw) == v.sig_b64, ("independent base64 round trip " + L).c_str());
+        CHECK(verify_message(dash, addr, msg, v.sig_b64, false, &r) && r.valid && r.why.empty() &&
+                  r.header_compressed == v.key_a && r.recovered_address == addr && r.recid == ((raw.at(0) - 27) & 3),
+              ("M6 " + L + ": Core's signature verifies; header_compressed == key encoding").c_str());
+
+        std::vector<uint8_t> altered = msg;
+        altered.back() ^= 0x01;
+        CHECK(!verify_message(dash, addr, altered, v.sig_b64, false, &r) && !r.valid && contains(r.why, "recovers to"),
+              ("M7 " + L + ": one altered message byte is INVALID").c_str());
+        CHECK(!verify_message(dash, other, msg, v.sig_b64, false, &r) && contains(r.why, "recovers to"),
+              ("M8 " + L + ": the other address is INVALID").c_str());
+        std::vector<uint8_t> flip = raw; // the compressed bit of (header - 27)
+        flip[0] = uint8_t(27 + ((raw[0] - 27) ^ 4));
+        CHECK(!verify_message(dash, addr, msg, b64_encode(flip), false, &r) && r.header_compressed == !v.key_a &&
+                  contains(r.why, "recovers to"),
+              ("M9 " + L + ": the compressed flag flipped is INVALID").c_str());
+        std::vector<uint8_t> ts = raw;
+        ts[64] ^= 1;
+        CHECK(!verify_message(dash, addr, msg, b64_encode(ts), false, &r) && !r.why.empty(),
+              ("M10 " + L + ": the last byte of s altered is INVALID").c_str());
+        std::vector<uint8_t> h35 = raw;
+        h35[0] = 0x23;
+        CHECK(!verify_message(dash, addr, msg, b64_encode(h35), false, &r) && contains(r.why, "out of 27..34"),
+              ("M11 " + L + ": header 35 is out of range").c_str());
+        const std::vector<uint8_t> s64(raw.begin(), raw.begin() + 64);
+        CHECK(!verify_message(dash, addr, msg, b64_encode(s64), false, &r) && contains(r.why, "not 65 bytes"),
+              ("M12 " + L + ": a 64-byte signature is INVALID").c_str());
+        CHECK(!verify_message(dash, addr, msg, "not*base64!", false, &r) && r.why == "bad base64" &&
+                  !verify_message(dash, addr, msg, std::string(88, '!'), false, &r) && r.why == "bad base64",
+              ("M13 " + L + ": non-base64 input is INVALID").c_str());
+        CHECK(!verify_message(dash, addr, msg, "", false, &r) && r.why == "empty signature",
+              ("M14 " + L + ": an empty signature is INVALID").c_str());
+        const std::vector<uint8_t> twin = high_s_twin(raw);
+        CHECK(twin != raw && verify_message(dash, addr, msg, b64_encode(twin), false, &r) && r.recovered_address == addr,
+              ("M6b " + L + ": the high-S twin verifies, as Core's RecoverCompact accepts it").c_str());
+    }
+
+    const std::vector<uint8_t> shortm = mv::message_bytes(mv::Msg::Short);
+    const std::string a_short = mv::kCoreVectors[0].sig_b64, u_short = mv::kCoreVectors[2].sig_b64;
+
+    // ── M15 self-verify gate ────────────────────────────────────────────────
+    CHECK(aborts_with([&] { sign_message(dash, kA.priv, true, shortm, mv::kAddrU, false); }, "self-verify FAILED"),
+          "M15a: key A claiming XoyDQ... hard-aborts");
+    CHECK(aborts_with([&] { sign_message(dash, one, true, shortm, mv::kAddrU, false); }, "self-verify FAILED"),
+          "M15b: key U signed as compressed while claiming XoyDQ... hard-aborts (the flag is load-bearing)");
+    CHECK(aborts_with([&] { sign_message(dash, one, false, shortm, mv::kAddrA, false); }, "self-verify FAILED"),
+          "M15c: key U uncompressed claiming Xn9K... hard-aborts");
+    FoundKey bad;
+    bad.priv = kA.priv.copy();
+    bad.pub = kA.pub;
+    bad.compressed = false;
+    bad.address = mv::kAddrA;
+    CHECK(aborts_with([&] { sign_message(dash, bad, shortm, false); }, "malformed"),
+          "M15d: a FoundKey whose pubkey length contradicts its encoding is refused");
+    CHECK(aborts_with([&] { sign_message(dash, kA.priv, true, shortm, "Xn9KtWHuvMBuSbpzPFTzYG2bC9Wp2ZZJJH", false); }, "checksum"),
+          "M15e: a bad address checksum aborts before signing");
+
+    // ── M16 determinism ─────────────────────────────────────────────────────
+    CHECK(sig_or_empty([&] { return sign_message(dash, kA, shortm, false); }, "sign") ==
+              sig_or_empty([&] { return sign_message(dash, kA, shortm, false); }, "sign"),
+          "M16: two signs are equal (RFC6979)");
+
+    // ── M17 empty message: byte-identical to Core ──────────────────────────
+    for (const mv::CoreMsgVector& v : mv::kCoreEmptyVectors) {
+        const char* addr = v.key_a ? mv::kAddrA : mv::kAddrU;
+        const std::string s = sig_or_empty([&] { return sign_message(dash, v.key_a ? kA : kU, {}, false); }, "sign empty");
+        VerifyReport r;
+        CHECK(s == v.sig_b64 && verify_message(dash, addr, {}, v.sig_b64, false, &r) && r.header_compressed == v.key_a,
+              ("M17 " + std::string(v.label) + ": the empty message signs byte-identical to Core and verifies").c_str());
+    }
+
+    // ── M18 unproven coin ───────────────────────────────────────────────────
+    const MessageCoin& btc = message_coin("BTC");
+    CHECK(aborts_with([&] { sign_message(btc, kA.priv, true, shortm, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", false); },
+                      "no node vector"),
+          "M18: sign refuses a coin without a node vector");
+    VerifyReport r18;
+    CHECK(!verify_message(btc, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", shortm, a_short, false, &r18) &&
+              contains(r18.why, "no node vector"),
+          "M18: verify refuses it with the reason");
+
+    // ── M19 the original wrappers ───────────────────────────────────────────
+    CHECK(sig_or_empty([&] { return sign_message(kA.priv, std::string(mv::kMsgShort), mv::kAddrA, false); }, "wrapper") == a_short,
+          "M19: the old sign wrapper still produces A-short exactly");
+    CHECK(verify_message(mv::kAddrA, mv::kMsgShort, a_short, false), "M19: the old verify wrapper accepts A-short");
+    CHECK(verify_message(mv::kAddrU, mv::kMsgShort, u_short, false),
+          "M19 / gap 2: the old verify wrapper now accepts an uncompressed-key Core signature");
+    // The pre-existing roundtrip checks, on a key and message off the vectors.
+    FoundKey k0 = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, 0, 3, false);
+    const std::string rt = "c2wallet-qt dash proposal-ownership test";
+    const std::string sig = sig_or_empty([&] { return sign_message(k0.priv, rt, DUMMY_ADDR0, false); }, "roundtrip");
+    std::string corrupt = sig;
+    if (!corrupt.empty()) corrupt[0] = (corrupt[0] == 'A' ? 'B' : 'A');
+    CHECK(!sig.empty() && verify_message(DUMMY_ADDR0, rt, sig, false) && !verify_message(DUMMY_ADDR0, rt + "!", sig, false) &&
+              !verify_message(DUMMY_ADDR1, rt, sig, false) && !verify_message(DUMMY_ADDR0, rt, corrupt, false),
+          "M19: wrapper roundtrip; tampered message / other address / tampered signature fail");
+    CHECK(aborts([&] { sign_message(k0.priv, rt, DUMMY_ADDR1, false); }), "M19: wrapper self-verify gate on the wrong address");
+
+    // ── network ─────────────────────────────────────────────────────────────
+    VerifyReport rn;
+    CHECK(!verify_message(dash, mv::kAddrA, shortm, a_short, true, &rn) && contains(rn.why, "wrong version byte"),
+          "a mainnet address under testnet is INVALID (wrong network)");
+    const std::string tA = h160_to_addr(addr_to_h160(mv::kAddrA, false), true);
+    const std::string st = sig_or_empty([&] { return sign_message(dash, kA.priv, true, shortm, tA, true); }, "testnet sign");
+    CHECK(tA[0] == 'y' && st == a_short && verify_message(dash, tA, shortm, st, true),
+          "testnet: key A's y-address signs and verifies; the address version is not part of the digest");
+}
+
+static void test_message_model()
+{
+    std::printf("[message model: target -> message -> key -> SIGN -> sign, verify, wipe]\n");
+    const MessageCoin& dash = message_coin("DASH");
+    const std::vector<uint8_t> shortm = mv::message_bytes(mv::Msg::Short);
+    const std::string a_short = mv::kCoreVectors[0].sig_b64;
+    auto drive = [](MessageModel& m, const char* addr, const std::vector<uint8_t>& msg, const KeyInput& k) {
+        return runs([&] {
+            m.set_target("DASH", addr);
+            m.set_message(msg);
+            m.load_key(k);
+            m.set_gate(true, kSignWord);
+            m.sign();
+        }, "drive the message model");
+    };
+    const std::array<uint8_t, 20> hA = addr_to_h160(mv::kAddrA, false);
+    const std::string hA_hex = hexstr(std::vector<uint8_t>(hA.begin(), hA.end()));
+
+    {
+        MessageModel m;
+        CHECK(m.stage() == MessageStage::Empty && !m.has_message() && m.export_text().empty() && !m.armed(),
+              "a fresh model is empty");
+        CHECK(runs([&] { m.set_target("DASH", mv::kAddrA); }, "target") && m.stage() == MessageStage::Targeted &&
+                  contains(m.target_card(), "0x4c") && contains(m.target_card(), hA_hex.c_str()) &&
+                  contains(m.target_card(), "DarkCoin Signed Message:\\n"),
+              "target card: magic, version byte, hash160");
+        m.set_message(shortm);
+        CHECK(runs([&] { m.load_key(key_of(KeySource::Wif, mv::kWifA)); }, "key") && m.stage() == MessageStage::KeyBound &&
+                  m.has_key() && contains(m.key_card(), "(compressed) via WIF"),
+              "WIF bound; key card names the encoding");
+        const size_t before = m.keys_wiped();
+        m.set_gate(true, kSignWord);
+        CHECK(m.armed() && runs([&] { m.sign(); }, "sign") && m.stage() == MessageStage::Signed, "signed");
+        CHECK(m.signature_b64() == a_short, "model (WIF) signature == Dash Core A-short");
+        const std::string want = std::string("address:   ") + mv::kAddrA +
+                                 "\nmessage:   dashcentral-proposal-1556\nsignature: " + a_short + "\n";
+        CHECK(m.export_text() == want, "export_text == the python stopgap's stdout, byte for byte");
+        CHECK(!m.has_key() && m.keys_wiped() == before + 1 && contains(m.key_card(), "wiped") && !m.armed(),
+              "sentinel: the key was destroyed by sign");
+        const std::string card = m.sign_card();
+        CHECK(contains(card, (std::string("self-verify: OK (recovered ") + mv::kAddrA + ", compressed, recid ").c_str()) &&
+                  contains(card, m.message_sha256_hex().c_str()) && contains(card, "25 bytes") &&
+                  contains(card, a_short.c_str()) && contains(card, "replayed as a transaction"),
+              "sign card: address, bytes, sha256, signature, self-verify line, domain note");
+        m.set_message(shortm);
+        CHECK(m.stage() == MessageStage::Targeted && m.signature_b64().empty() && m.export_text().empty() &&
+                  m.sign_card() == "not signed",
+              "a new message after signing drops the signature (back to Targeted)");
+    }
+
+    {
+        MessageModel m;
+        CHECK(drive(m, mv::kAddrA, shortm, key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase)) &&
+                  m.signature_b64() == a_short,
+              "model (mnemonic + TREZOR, default scan) == Dash Core A-short");
+    }
+    auto model_rows = [&](const mv::CoreMsgVector* rows, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            const mv::CoreMsgVector& v = rows[i];
+            MessageModel m;
+            const std::vector<uint8_t> msg = mv::message_bytes(v.msg);
+            const bool ok = drive(m, v.key_a ? mv::kAddrA : mv::kAddrU, msg, key_of(KeySource::Wif, v.key_a ? mv::kWifA : mv::kWifU));
+            std::string want = std::string("address:   ") + (v.key_a ? mv::kAddrA : mv::kAddrU) + "\nmessage:   ";
+            want.append(msg.begin(), msg.end());
+            want += std::string("\nsignature: ") + v.sig_b64 + "\n";
+            CHECK(ok && m.signature_b64() == v.sig_b64 && m.export_text() == want &&
+                      contains(m.sign_card(), v.key_a ? ", compressed, recid" : ", uncompressed, recid") &&
+                      contains(m.sign_card(), v.key_a ? "imported WIF key (compressed), wiped"
+                                                      : "imported WIF key (uncompressed), wiped"),
+                  ("model " + std::string(v.label) + " (WIF): byte-identical to Dash Core").c_str());
+        }
+    };
+    model_rows(mv::kCoreVectors, sizeof(mv::kCoreVectors) / sizeof(mv::kCoreVectors[0]));
+    model_rows(mv::kCoreEmptyVectors, sizeof(mv::kCoreEmptyVectors) / sizeof(mv::kCoreEmptyVectors[0]));
+
+    // ── refusals leave the stage untouched ──────────────────────────────────
+    {
+        MessageModel m;
+        const KeyInput wifA = key_of(KeySource::Wif, mv::kWifA);
+        CHECK(aborts_with([&] { m.load_key(wifA); }, "target") && m.stage() == MessageStage::Empty && !m.has_key(),
+              "load_key before the target aborts");
+        m.set_target("DASH", mv::kAddrA);
+        CHECK(aborts_with([&] { m.load_key(wifA); }, "set the message first") && m.stage() == MessageStage::Targeted &&
+                  !m.has_key(),
+              "load_key before the message aborts");
+        m.set_message(shortm);
+        CHECK(aborts_with([&] { m.sign(); }, "no key is bound") && m.stage() == MessageStage::Targeted,
+              "sign before the key aborts");
+        CHECK(aborts_with([&] { m.load_key(key_of(KeySource::Wif, testvec::kDecoyWif)); }, "is for") && !m.has_key() &&
+                  m.stage() == MessageStage::Targeted,
+              "a key for another address aborts; nothing is bound");
+        CHECK(aborts_with([&] { m.load_key(key_of(KeySource::Wif, testvec::kK7WifBtcVersion)); }, "version byte") &&
+                  !m.has_key(),
+              "a non-DASH WIF version aborts");
+        m.load_key(wifA);
+        m.set_gate(true, "SIGn");
+        CHECK(!m.armed() && aborts_with([&] { m.sign(); }, "not armed") && m.stage() == MessageStage::KeyBound && m.has_key(),
+              "\"SIGn\" does not arm; the refusal keeps the key and the stage");
+        m.set_gate(false, kSignWord);
+        CHECK(!m.armed() && aborts_with([&] { m.sign(); }, "not armed") && m.stage() == MessageStage::KeyBound && m.has_key(),
+              "the unticked review box does not arm");
+        m.set_gate(true, kSpendWord);
+        CHECK(!m.armed() && std::string(kSignWord) != kSpendWord, "the money word SPEND does not arm a message signature");
+        const std::string tA = h160_to_addr(hA, true);
+        CHECK(aborts_with([&] { m.set_target("DASH", tA); }, "wrong version byte") && m.stage() == MessageStage::KeyBound &&
+                  m.has_key() && m.address() == mv::kAddrA,
+              "a testnet address on a mainnet model is refused; nothing changes");
+        CHECK(aborts_with([&] { m.set_target("BTC", "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"); }, "no node vector") &&
+                  m.stage() == MessageStage::KeyBound && m.has_key() && m.ticker() == "DASH",
+              "an unproven coin is refused; nothing changes");
+        CHECK(aborts_with([&] { m.set_target("XYZ", mv::kAddrA); }, "unknown") && m.stage() == MessageStage::KeyBound,
+              "an unknown coin is refused");
+        CHECK(aborts_with([&] { m.set_target("DASH", "Xn9KtWHuvMBuSbpzPFTzYG2bC9Wp2ZZJJH"); }, "checksum") &&
+                  m.stage() == MessageStage::KeyBound && m.has_key(),
+              "a bad checksum is refused");
+
+        size_t w = m.keys_wiped();
+        m.set_message(shortm);
+        CHECK(m.stage() == MessageStage::Targeted && !m.has_key() && m.keys_wiped() == w + 1,
+              "re-set_message after KeyBound wipes the key (sentinel) and drops to Targeted");
+        m.load_key(wifA);
+        w = m.keys_wiped();
+        m.set_target("DASH", mv::kAddrU);
+        CHECK(m.stage() == MessageStage::Targeted && !m.has_key() && m.keys_wiped() == w + 1 && m.has_message() &&
+                  m.address() == mv::kAddrU,
+              "a re-target wipes the key and keeps the message");
+        m.set_target("DASH", mv::kAddrA);
+        m.load_key(wifA);
+        w = m.keys_wiped();
+        m.reset();
+        CHECK(m.stage() == MessageStage::Empty && !m.has_key() && m.keys_wiped() == w + 1 && !m.has_message() &&
+                  m.address().empty() && m.target_card() == "no target set",
+              "reset() wipes the key and everything else");
+    }
+    {
+        MessageModel t(true);
+        CHECK(t.testnet() && aborts_with([&] { t.set_target("DASH", mv::kAddrA); }, "wrong version byte") &&
+                  runs([&] { t.set_target("DASH", h160_to_addr(hA, true)); }, "testnet target") &&
+                  contains(t.target_card(), "0x8c") && contains(t.target_card(), "testnet"),
+              "a testnet model takes a y-address and refuses an X-address");
+    }
+
+    // ── message flags ───────────────────────────────────────────────────────
+    {
+        auto F = [](const std::string& s) { return message_flags(bytes_of(s)); };
+        const MessageFlags plain = F(mv::kMsgShort);
+        CHECK(plain.bytes == 25 && plain.lines == 1 && !plain.empty && !plain.leading_ws && !plain.trailing_ws &&
+                  !plain.trailing_newline && !plain.has_cr && !plain.invalid_utf8 && !plain.long_form,
+              "flags: the DashCentral claim raises nothing");
+        CHECK(F("abc\n").trailing_newline && !F("abc\n").trailing_ws && F("abc\n").lines == 2, "flags: trailing newline");
+        CHECK(F(" abc").leading_ws && !F(" abc").trailing_ws, "flags: leading whitespace");
+        CHECK(F("abc ").trailing_ws && F("abc\t").trailing_ws && !F("abc ").leading_ws, "flags: trailing whitespace");
+        CHECK(F("a\rb").has_cr && !F("a\nb").has_cr && F("a\nb").lines == 2, "flags: CR");
+        CHECK(F("").empty && F("").bytes == 0, "flags: empty");
+        CHECK(plain.non_ascii == 0 && F("a\xc2\xa0" "b").non_ascii == 2 && !F("a\xc2\xa0" "b").invalid_utf8 &&
+                  F("\xe2\x82\xac").non_ascii == 3 && message_flags({0xff}).non_ascii == 1,
+              "flags: non-ASCII byte count (a pasted no-break space is 2 bytes)");
+        CHECK(message_flags(mv::message_bytes(mv::Msg::Long)).long_form && !F(std::string(252, 'a')).long_form &&
+                  F(std::string(253, 'a')).long_form,
+              "flags: long form from 253 bytes (300 B is long)");
+        CHECK(!F("\xc3\xa9").invalid_utf8 && !F("\xe2\x82\xac").invalid_utf8 && !F("\xf0\x9f\x98\x80").invalid_utf8,
+              "flags: valid 2/3/4-byte UTF-8");
+        CHECK(message_flags({0xff}).invalid_utf8 && message_flags({0xc0, 0x80}).invalid_utf8 &&
+                  message_flags({0xed, 0xa0, 0x80}).invalid_utf8 && message_flags({0xe2, 0x82}).invalid_utf8 &&
+                  message_flags({0xf4, 0x90, 0x80, 0x80}).invalid_utf8,
+              "flags: invalid UTF-8 (0xff, overlong, surrogate, truncated, above U+10FFFF)");
+        CHECK(message_sha256_hex(bytes_of("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+              "sha256 fingerprint of the exact bytes");
+        MessageModel m;
+        const std::vector<uint8_t> ff = {0xff};
+        CHECK(drive(m, mv::kAddrA, ff, key_of(KeySource::Wif, mv::kWifA)) && m.flags().invalid_utf8 &&
+                  verify_message(dash, mv::kAddrA, ff, m.signature_b64(), false),
+              "invalid-UTF-8 bytes are still signed as-is and verify");
+    }
+
+    // ── secret hygiene (the S2-K9 pattern) ──────────────────────────────────
+    {
+        c2w::hdkeys::WifDecode wd = c2w::hdkeys::decode_wif(mv::kWifA);
+        const std::string scalar_hex = hexstr(std::vector<uint8_t>(wd.scalar.data(), wd.scalar.data() + wd.scalar.size()));
+        CHECK(wd.ok && scalar_hex.size() == 64, "test scalar decoded for the grep");
+        const std::vector<std::string> secrets = {
+            mv::kWifA, mv::kWifU, testvec::kK7WifBtcVersion, testvec::kK7Bip38Dash, testvec::kK7AccountXprv,
+            testvec::kDecoyWif, testvec::kBip38Pass, testvec::kPyParityPassphrase, "abandon", DUMMY_MNEMONIC, scalar_hex};
+        std::vector<std::string> outputs;
+        auto cards = [&](const MessageModel& m) {
+            for (const std::string& t : {m.target_card(), m.key_card(), m.sign_card(), m.export_text()}) outputs.push_back(t);
+        };
+        const std::vector<std::pair<const char*, KeyInput>> keys = {
+            {mv::kAddrA, key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase)},
+            {mv::kAddrA, key_of(KeySource::Wif, mv::kWifA)},
+            {mv::kAddrA, key_of(KeySource::Bip38, testvec::kK7Bip38Dash, testvec::kBip38Pass)},
+            {mv::kAddrA, key_of(KeySource::Descriptor, testvec::kK7Descriptor)},
+            {mv::kAddrA, key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\",\"" + mv::kWifA + "\"]}")},
+            {mv::kAddrA, key_of(KeySource::JsonKeystore, std::string("{\"xprv\":\"") + testvec::kK7AccountXprv + "\"}")},
+            {mv::kAddrU, key_of(KeySource::Wif, mv::kWifU)},
+        };
+        for (const auto& entry : keys) {
+            const char* addr = entry.first;
+            const KeyInput& k = entry.second;
+            MessageModel m;
+            m.set_target("DASH", addr);
+            m.set_message(shortm);
+            CHECK(runs([&] { m.load_key(k); }, "load_key"), "bound");
+            cards(m);
+            const size_t before = m.keys_wiped();
+            m.set_gate(true, kSignWord);
+            CHECK(runs([&] { m.sign(); }, "sign") && !m.has_key() && m.keys_wiped() == before + 1,
+                  "signed; the key died at sign");
+            cards(m);
+        }
+        MessageModel m;
+        m.set_target("DASH", mv::kAddrA);
+        m.set_message(shortm);
+        std::string broken_desc = testvec::kK7Descriptor;
+        broken_desc.replace(broken_desc.find("xprv9z") + 10, 1, "!");
+        const std::vector<KeyInput> bad = {
+            key_of(KeySource::Descriptor, broken_desc),
+            key_of(KeySource::Wif, std::string(mv::kWifA).substr(0, 40) + "0"),
+            key_of(KeySource::Wif, testvec::kK7WifBtcVersion),
+            key_of(KeySource::Wif, testvec::kDecoyWif),
+            key_of(KeySource::Bip38, testvec::kK7Bip38Dash, "wrong"),
+            key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\"]}"),
+            key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, "x"),
+            key_of(KeySource::Mnemonic, std::string(DUMMY_MNEMONIC).replace(0, 7, "zzzzzzz"), ""),
+        };
+        size_t refused = 0;
+        for (const KeyInput& k : bad) {
+            try { m.load_key(k); }
+            catch (const DashAbort& e) { ++refused; outputs.push_back(e.what()); }
+        }
+        CHECK(refused == bad.size(), "every bad key input is refused");
+        cards(m);
+        bool clean = true;
+        for (const std::string& o : outputs)
+            for (const std::string& sec : secrets)
+                if (!sec.empty() && o.find(sec) != std::string::npos) {
+                    clean = false;
+                    std::printf("    LEAK of a test secret in: %.80s...\n", o.c_str());
+                }
+        CHECK(clean && outputs.size() > 50, "no card, export or error message carries a test secret");
+    }
+}
+
 int main(int argc, char** argv)
 {
     // Oracle hook: emit the gobject display hashes for the fixed mainnet vectors
@@ -2018,43 +2495,53 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    // Each section prints its own count, so a silent pass is still visible.
+#define RUN(fn)                                                                              \
+    do {                                                                                     \
+        const int p0_ = g_pass, f0_ = g_fail;                                                \
+        fn();                                                                                \
+        std::printf("    -> %s: %d passed, %d failed\n", #fn, g_pass - p0_, g_fail - f0_);   \
+    } while (0)
     std::printf("=== c2wallet-qt M3-A-DASH KATs ===\n");
-    test_gov_hash();
-    test_address();
-    test_key_scan();
-    test_collateral_tx();
-    test_message();
+    RUN(test_gov_hash);
+    RUN(test_address);
+    RUN(test_key_scan);
+    RUN(test_collateral_tx);
 
     std::printf("\n=== zero-fee inject builders ===\n");
-    test_k1_onchain_collateral();
-    test_k2_fee_flags();
-    test_k3_sweep_all();
-    test_k4_maturity();
-    test_k5_batch_split();
-    test_k6_sign_verify();
-    test_k7_python_parity();
-    test_k8_uncompressed_scan();
-    test_k9_emit_format();
-    test_k10_bip68();
-    test_k12_refusals();
-    test_k13_display_roundtrip();
-    test_utxo_intake();
+    RUN(test_k1_onchain_collateral);
+    RUN(test_k2_fee_flags);
+    RUN(test_k3_sweep_all);
+    RUN(test_k4_maturity);
+    RUN(test_k5_batch_split);
+    RUN(test_k6_sign_verify);
+    RUN(test_k7_python_parity);
+    RUN(test_k8_uncompressed_scan);
+    RUN(test_k9_emit_format);
+    RUN(test_k10_bip68);
+    RUN(test_k12_refusals);
+    RUN(test_k13_display_roundtrip);
+    RUN(test_utxo_intake);
 
     std::printf("\n=== slice 2: DashInjectModel / PageDashInject ===\n");
-    test_s2_k1_export_v1();
-    test_s2_k2_getaddressutxos_fixture();
-    test_s2_k3_rescreen();
-    test_s2_k4_state_machine();
-    test_s2_f1_relay_collateral_fee();
-    test_s2_k5_key_paths();
-    test_s2_k6_end_to_end();
-    test_s2_k7_manifest();
-    test_s2_k8_collateral();
-    test_s2_k9_secret_hygiene();
-    test_s2_k10_split();
-    test_s2_f3_json_depth();
-    test_s2_k13_relay_fee_mode();
+    RUN(test_s2_k1_export_v1);
+    RUN(test_s2_k2_getaddressutxos_fixture);
+    RUN(test_s2_k3_rescreen);
+    RUN(test_s2_k4_state_machine);
+    RUN(test_s2_f1_relay_collateral_fee);
+    RUN(test_s2_k5_key_paths);
+    RUN(test_s2_k6_end_to_end);
+    RUN(test_s2_k7_manifest);
+    RUN(test_s2_k8_collateral);
+    RUN(test_s2_k9_secret_hygiene);
+    RUN(test_s2_k10_split);
+    RUN(test_s2_f3_json_depth);
+    RUN(test_s2_k13_relay_fee_mode);
     CHECK(kDefaultMinConf == kCoinbaseMaturity + 1, "S2-K11: kDefaultMinConf == kCoinbaseMaturity + 1 (also static_assert)");
+
+    std::printf("\n=== Sign / Verify Message (design A.7) ===\n");
+    RUN(test_message_kats);
+    RUN(test_message_model);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

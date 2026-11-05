@@ -23,6 +23,11 @@ extern "C" {
 // Windows: draw from the OS CSPRNG via BCryptGenRandom (bcrypt.lib).
 #  include <windows.h>
 #  include <bcrypt.h>
+#elif defined(__APPLE__)
+// macOS: no getrandom(2); getentropy(2) draws from the kernel CSPRNG.
+#  include <sys/types.h>
+#  include <sys/random.h>
+#  include <unistd.h>
 #endif
 
 namespace xr = c2pool::xmr::native::rct;
@@ -51,6 +56,16 @@ void csprng_bytes(std::uint8_t* out, std::size_t len) {
     if (::BCryptGenRandom(nullptr, out, static_cast<ULONG>(len),
                           BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
         throw std::runtime_error("BCryptGenRandom failed: prover CSPRNG unavailable");
+    }
+#elif defined(__APPLE__)
+    // getentropy(2) fills at most 256 bytes per call: draw in chunks; any
+    // failure throws (fail-closed, as the other arms).
+    std::size_t got = 0;
+    while (got < len) {
+        const std::size_t chunk = (len - got) < 256 ? (len - got) : 256;
+        if (::getentropy(out + got, chunk) != 0)
+            throw std::runtime_error("getentropy(2) failed: prover CSPRNG unavailable");
+        got += chunk;
     }
 #else
     (void)out; (void)len;

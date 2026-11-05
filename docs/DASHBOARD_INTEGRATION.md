@@ -177,6 +177,11 @@ require `explorer: true` in the config:
 | `/api/explorer/getblockhash` | Block hash by height |
 | `/api/explorer/getblock` | Full block JSON by hash or height |
 
+On the DASH node, `getblockchaininfo` also carries the best ChainLock the node
+adopted (`bestchainlock`, or `unavailable.bestchainlock` before any), and the
+loopback `/api/tx-inject/ledger` lists the node's own tracked injects; both
+are specified in `docs/design/miner-tx-injection.md` §4.7.
+
 Enable and point the bundled explorer at them:
 
 ```yaml

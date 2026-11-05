@@ -12,6 +12,7 @@
 #include "../Bip39.hpp"
 #include "../Bip32.hpp"
 #include "../CoinParams.hpp"
+#include "../Csprng.hpp"
 #include "../Derivation.hpp"
 #include "../Address.hpp"
 #include "../KeyImport.hpp"
@@ -26,6 +27,9 @@
 #include <impl/btc/address_encoding.hpp>
 
 #include <cstdio>
+#include <algorithm>
+#include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -224,6 +228,65 @@ static void test_ssot_crosscheck()
     CHECK(!acc.bech32_hrps.empty() && acc.bech32_hrps[0] == std::string(btc->bech32_hrp), "btc hrp matches SSOT");
 }
 
+// The OS CSPRNG, and the chunked fill the macOS arm uses (getentropy(2) caps one
+// call at 256 bytes). The chunking is driven by a fake source so it runs here on
+// Linux too; the real source is then sanity-checked on whatever this host is.
+static void test_csprng()
+{
+    std::printf("[csprng: OS entropy + chunked fill]\n");
+    using c2w::hdkeys::detail::fill_in_chunks;
+
+    std::vector<uint8_t> buf(1000, 0);
+    std::vector<size_t> offs, lens;
+    fill_in_chunks(buf.data(), buf.size(), 256, [&](uint8_t* p, size_t len) {
+        offs.push_back(size_t(p - buf.data()));
+        lens.push_back(len);
+        for (size_t i = 0; i < len; ++i) p[i] = uint8_t(0xA0 | lens.size());
+        return true;
+    }, "fake");
+    CHECK(lens == std::vector<size_t>({256, 256, 256, 232}) && offs == std::vector<size_t>({0, 256, 512, 768}),
+          "1000 bytes = 256 + 256 + 256 + 232, contiguous slices");
+    bool all_written = true;
+    for (size_t i = 0; i < buf.size(); ++i)
+        if (buf[i] != uint8_t(0xA0 | (i / 256 + 1))) all_written = false;
+    CHECK(all_written, "every byte written by exactly its own chunk");
+
+    lens.clear();
+    fill_in_chunks(buf.data(), 512, 256, [&](uint8_t*, size_t len) { lens.push_back(len); return true; }, "fake");
+    CHECK(lens == std::vector<size_t>({256, 256}), "an exact multiple takes two full chunks");
+    bool called = false;
+    fill_in_chunks(buf.data(), 0, 256, [&](uint8_t*, size_t) { called = true; return true; }, "fake");
+    CHECK(!called, "n == 0 calls the source not at all");
+
+    int calls = 0;
+    bool threw = false;
+    try {
+        fill_in_chunks(buf.data(), 1000, 256, [&](uint8_t*, size_t) { return ++calls < 3; }, "fake failure");
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()) == "fake failure";
+    }
+    CHECK(threw && calls == 3, "a failing chunk throws: no partial result is returned");
+    bool logic = false;
+    try { fill_in_chunks(buf.data(), 1, 0, [](uint8_t*, size_t) { return true; }, "x"); }
+    catch (const std::logic_error&) { logic = true; }
+    CHECK(logic, "a zero chunk size is refused");
+
+    // The real source: 1000 bytes, twice.
+    const std::vector<uint8_t> a = c2w::hdkeys::csprng_bytes(1000), b = c2w::hdkeys::csprng_bytes(1000);
+    const std::set<uint8_t> distinct(a.begin(), a.end());
+    size_t zeros = 0, run = 0, longest = 0;
+    for (uint8_t v : a) {
+        if (v == 0) { ++zeros; longest = std::max(longest, ++run); }
+        else run = 0;
+    }
+    std::printf("    1000 OS bytes: %zu distinct values, %zu zero bytes, longest zero run %zu\n",
+                distinct.size(), zeros, longest);
+    CHECK(a.size() == 1000 && b.size() == 1000, "csprng_bytes(1000) returns 1000 bytes");
+    CHECK(distinct.size() >= 200 && zeros < 20 && longest < 4,
+          "entropy heuristics: >= 200 distinct byte values, < 20 zero bytes, no zero run of 4");
+    CHECK(a != b, "two draws differ");
+}
+
 int main()
 {
     std::printf("== c2wallet-qt hdkeys KATs ==\n");
@@ -233,6 +296,7 @@ int main()
     test_wif_and_rawhex();
     test_generation_roundtrip();
     test_ssot_crosscheck();
+    test_csprng();
     std::printf("\n== %d passed, %d failed ==\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

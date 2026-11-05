@@ -1,48 +1,56 @@
 diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
-index d93e6ad6..869c3a11 100644
+index 92a2c2b..54b43e8 100644
 --- a/.github/workflows/build.yml
 +++ b/.github/workflows/build.yml
-@@ -1399,6 +1399,50 @@ jobs:
+@@ -2013,6 +2013,58 @@ jobs:
          if: always()
          uses: ./.github/actions/prune-runner-workspace
  
 +  # ════════════════════════════════════════════════════════════════════════════
-+  # c2wallet-qt network-incapable link-guard (design PR #1621, docs/design/
-+  # c2wallet-qt.md §5.2). Builds ONLY the air-gapped signer target
-+  # (c2wallet-qt-signer — Qt6 Core/Gui/Widgets, no Network, no WebEngine) and
-+  # runs ci/check_no_network.sh over the produced binary. This is the mechanical
-+  # proof that the signing binary is network-incapable: a networking NEEDED
++  # c2wallet-qt: network-incapable link-guard + the full c2wallet-qt ctest
++  # (design PR #1621, docs/design/c2wallet-qt.md §5.2). Builds the air-gapped
++  # signer (c2wallet-qt-signer: Qt6 Core/Gui/Widgets, no Network, no
++  # WebEngine) and runs ci/check_no_network.sh over it: a networking NEEDED
 +  # library, or an imported network C-ABI symbol (connect/socket/bind/listen/
-+  # getaddrinfo/gethostbyname/SSL_*/curl_*/res_*), turns this job red. It is the
-+  # binary-level analog of the reward-safety grep proof, enforced on every PR
-+  # touching the tree via the `qt` path filter (ui/**).
++  # getaddrinfo/gethostbyname/SSL_*/curl_*/res_*), turns this job red. Then it
++  # builds every c2wallet-qt test and runs ctest: hdkeys / convert / signer /
++  # artifact / DASH KATs (including the Dash Core signed-message vectors and
++  # their python oracles), the companion KATs and the key-free guard. Enforced
++  # on every PR touching the tree via the `qt` path filter (ui/**, src/**).
 +  # ════════════════════════════════════════════════════════════════════════════
 +  c2wallet-signer-guard:
 +    name: c2wallet-qt network-incapable link-guard
 +    needs: changes
 +    if: ${{ needs.changes.outputs.qt == 'true' || github.event_name != 'pull_request' }}
 +    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","draft-release"]') || 'ubuntu-24.04' }}
-+    timeout-minutes: 15
++    timeout-minutes: 25
 +    steps:
 +      - uses: actions/checkout@v6
 +
-+      - name: Install Qt6 base (Core/Gui/Widgets) + toolchain
++      - name: Install Qt6 base + toolchain
 +        run: |
 +          flock /tmp/c2pool-apt.lock bash -e -c '
 +            sudo apt-get update -qq
 +            sudo apt-get install -y --no-install-recommends \
-+              cmake g++ ccache binutils \
-+              qt6-base-dev libgl1-mesa-dev libxkbcommon-dev
++              cmake g++ ccache binutils python3 \
++              qt6-base-dev libgl1-mesa-dev libxkbcommon-dev \
++              libsecp256k1-dev zlib1g-dev nlohmann-json3-dev
 +          '
 +
-+      - name: Configure (Widgets-only signer, guard test registered)
-+        run: cmake -S ui/c2wallet-qt -B build-c2wallet -DC2WALLET_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
++      - name: Configure (signer, companion, every c2wallet-qt test)
++        run: cmake -S ui/c2wallet-qt -B build-c2wallet -DCMAKE_BUILD_TYPE=Release -DC2WALLET_QT_BUILD_TESTS=ON -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 +
-+      - name: Build the signer target only
++      - name: Build the signer target
 +        run: cmake --build build-c2wallet --target c2wallet-qt-signer -j"${BUILD_J:-8}"
 +
 +      - name: Network-incapable link-guard (the mechanical proof)
 +        run: ./ui/c2wallet-qt/ci/check_no_network.sh build-c2wallet/c2wallet-qt-signer
++
++      - name: Build every c2wallet-qt test target
++        run: cmake --build build-c2wallet -j"${BUILD_J:-8}"
++
++      - name: ctest (KATs, oracles, link-guard, key-free guard)
++        run: ctest --test-dir build-c2wallet --output-on-failure
 +
 +      # Steady-state disk hygiene on the self-hosted runners: drop the checkout
 +      # payload and _temp, keep _actions/_tool/_update. Always runs.

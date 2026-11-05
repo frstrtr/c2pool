@@ -49,10 +49,10 @@ fail=0
 
 # ── Part 1: no networking shared library may be a load-time dependency ──────
 # Qt6::Core/Gui/Widgets only. QtNetwork, QtWebEngine*, QtWebChannel, libcurl,
-# OpenSSL (libssl), c-ares and boost_asio are all forbidden. Read the ELF
+# OpenSSL (libssl, libcrypto), c-ares and boost_asio are all forbidden. Read the ELF
 # NEEDED entries directly (objdump -p) so we do not require the loader to
 # actually resolve the libraries on the CI host.
-FORBIDDEN_LIB_RE='libQt6Network|libQt6WebEngine|libQt6WebChannel|libcurl|libssl|libcares|libc-ares|boost_asio|libboost_asio'
+FORBIDDEN_LIB_RE='libQt6Network|libQt6WebEngine|libQt6WebChannel|libcurl|libssl|libcrypto|libcares|libc-ares|boost_asio|libboost_asio'
 
 echo "-- NEEDED shared libraries --"
 needed="$(objdump -p "$BIN" 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u)"

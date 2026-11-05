@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <map>
@@ -12,6 +13,7 @@
 
 #include <core/uint256.hpp>
 #include <core/netaddress.hpp>
+#include <c2pool/merged/payout_source.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -52,8 +54,8 @@ struct AuxWork
 };
 
 // ─── AuxPoW tree ─────────────────────────────────────────────────────────────
-// Assigns chain_ids to slots in a binary merkle tree.
-// p2pool convention: slot = lcg(chain_id) % size
+// Assigns chain_ids to slots in a binary merkle tree: the slot the aux
+// daemons expect, CAuxPow::getExpectedIndex(nonce 0, chain_id, log2(size)).
 // Size is smallest power of 2 >= number of chains.
 
 struct AuxPowTree
@@ -81,6 +83,35 @@ struct AuxPowTree
 std::vector<uint8_t> build_auxpow_commitment(const uint256& mm_root,
                                               uint32_t tree_size,
                                               uint32_t nonce = 0);
+
+// ─── Aux block size budget ───────────────────────────────────────────────────
+// dogecoind refuses a block whose serialization, AuxPoW in the header
+// included, exceeds MAX_BLOCK_BASE_SIZE = 1,000,000 bytes (CheckBlock
+// bad-blk-length, validation.cpp:2972; primitives/block.h serializes the
+// auxpow with the header). The AuxPoW carries the whole parent (LTC) coinbase,
+// so with PPLNS coinbases of many outputs on both chains a template filled to
+// 1 MB of transactions cannot be a valid block.
+inline constexpr uint32_t kAuxMaxBlockBytes = 1'000'000;
+inline constexpr uint32_t kAuxBlockSizeMargin = 1'000;
+// Before the first parent coinbase is known: room for one of ~4,000 outputs.
+inline constexpr uint32_t kUnknownParentCoinbaseBytes = 200'000;
+
+/// Bytes of an aux block that are not its transactions: header (80), the
+/// AuxPoW as build_auxpow_proof writes it (parent coinbase, parent hash 32,
+/// coinbase branch, its index 4, chain branch, its index 4, parent header 80),
+/// the tx count (at most 9) and the aux coinbase, plus kAuxBlockSizeMargin.
+/// A zero parent coinbase size means unknown (kUnknownParentCoinbaseBytes);
+/// a zero aux coinbase size means unknown (taken as large as the parent's).
+inline uint32_t aux_block_reserve_bytes(uint32_t parent_coinbase_bytes, uint32_t parent_branch_len,
+                                        uint32_t aux_branch_len, uint32_t aux_coinbase_bytes)
+{
+    const uint64_t parent_cb = parent_coinbase_bytes ? parent_coinbase_bytes : kUnknownParentCoinbaseBytes;
+    const uint64_t aux_cb = aux_coinbase_bytes ? aux_coinbase_bytes : parent_cb;
+    const uint64_t auxpow = parent_cb + 32 + 9 + 32ull * parent_branch_len + 4
+                          + 9 + 32ull * aux_branch_len + 4 + 80;
+    const uint64_t total = 80 + auxpow + 9 + aux_cb + kAuxBlockSizeMargin;
+    return static_cast<uint32_t>(std::min<uint64_t>(total, kAuxMaxBlockBytes));
+}
 
 // ─── AuxPoW proof serialization ──────────────────────────────────────────────
 // Builds the auxpow structure that gets prepended to merged block txs:
@@ -110,6 +141,10 @@ public:
     virtual std::string get_best_block_hash() = 0;
     virtual std::vector<NetService> getpeerinfo() = 0;
     virtual const AuxChainConfig& config() const = 0;
+    // Bytes of the next aux block that go to the header, AuxPoW and coinbase
+    // (aux_block_reserve_bytes): a backend that builds its own template keeps
+    // its transactions within the rest. A daemon's template cannot be told.
+    virtual void set_block_size_reserve(uint32_t /*bytes*/) {}
 };
 
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
@@ -203,6 +238,21 @@ public:
     // Current aux work per chain_id
     std::map<uint32_t, AuxWork> get_current_work() const;
 
+    // The parent (LTC) coinbase the next shares carry: its size without
+    // witness (bytes) and its merkle branch length. Set by the web server on
+    // every coinbase it builds; sizes the aux blocks' AuxPoW for the template
+    // budget (aux_block_reserve_bytes).
+    void set_parent_coinbase_shape(uint32_t coinbase_bytes, uint32_t branch_len)
+    {
+        m_parent_coinbase_bytes.store(coinbase_bytes, std::memory_order_relaxed);
+        m_parent_branch_len.store(branch_len, std::memory_order_relaxed);
+    }
+    // The reserve the chain's next template leaves (see aux_block_reserve_bytes).
+    uint32_t block_size_reserve(uint32_t chain_id) const;
+
+    // Aux blocks refused at assembly, by "<symbol>:<code>" (oversize).
+    nlohmann::json get_block_refusals_json() const;
+
     // V36: Build merged block header info for share_info.merged_coinbase_info.
     // Returns (80-byte header, coinbase_merkle_link_branches) per chain.
     // Builds the PPLNS coinbase, computes merkle root, assembles header.
@@ -214,6 +264,12 @@ public:
         std::vector<uint256> coinbase_merkle_branches;
         std::vector<unsigned char> coinbase_script;  // scriptSig from the merged coinbase
         std::string coinbase_hex;  // full coinbase TX hex (for freezing at submission time)
+        // The sharechain best share the coinbase's PPLNS payouts were split
+        // at (note_payout_basis); null when they do not come from the
+        // sharechain. Only a job whose LTC share has this prev share may
+        // carry the block: a V36 peer re-derives the payouts from the share's
+        // previous_share_hash.
+        uint256 payout_basis;
     };
 
     // ─── Cached DOGE block data (p2pool: merged_work variable) ──────────
@@ -234,7 +290,9 @@ public:
     // merkle + header + freeze + commitment).  Called from refresh_work()
     // when PPLNS changed so the commitment is fresh before notify_all().
     // Runs the expensive payout_fn outside m_mutex to avoid deadlock.
-    void rebuild_cached_blocks();
+    // Returns true when the commitment or the header infos changed (what
+    // the miners' work carries), false when the rebuild left them as they were.
+    bool rebuild_cached_blocks();
 
     // Check if any aux chains are configured
     bool has_chains() const { return !m_chains.empty(); }
@@ -290,6 +348,11 @@ public:
             uint32_t chain_id, uint64_t coinbase_value)>;
 
     void set_payout_provider(PayoutProvider provider);
+
+    /// Where a payout provider gets the payouts while the sharechain
+    /// tracker's lock is busy (payout_source.hpp); its counters are in
+    /// get_rebuild_stats_json()["payout_source"].
+    std::shared_ptr<MergedPayoutSource> payout_source() const { return m_payout_source; }
     /// Get merged payouts for a chain (delegates to payout_provider)
     std::vector<std::pair<std::vector<unsigned char>, uint64_t>>
     get_payouts(uint32_t chain_id, uint64_t coinbase_value) const
@@ -320,9 +383,59 @@ public:
     using WorkChangedFn = std::function<void()>;
     void set_on_work_changed(WorkChangedFn fn) { m_on_work_changed = std::move(fn); }
 
+    /// One poll of the aux chains (called every second by poll_loop on the
+    /// RPC thread; public so a test can drive one). A chain's template is
+    /// fetched when its tip changed, and again on every poll while the last
+    /// one came back degraded (core::coin::kTemplateDegradedKey).
+    void refresh_aux_work();
+
+    /// Read-only view of an aux chain's current block template (symbol,
+    /// case-insensitive), for local cross-checks: prev, height, bits,
+    /// curtime, coinbase value, the tx list (txid, raw, fee), tx bytes, the
+    /// degraded mark, the block hash the parent commits to and the frozen
+    /// coinbase. null when there is no such chain.
+    nlohmann::json aux_template_json(const std::string& symbol) const;
+
+    /// Per chain symbol: {"degraded": templates fetched degraded,
+    /// "refetched_clean": clean templates fetched after a degraded one}.
+    nlohmann::json get_template_gate_json() const;
+
+    /// The chain keeps a frozen snapshot for this committed block hash (a
+    /// share committing to it can still be turned into a block).
+    bool has_frozen_snapshot(uint32_t chain_id, const uint256& block_hash) const;
+
+    /// Run one poll of the aux chains now, on the RPC thread, instead of
+    /// waiting for the next 1 s tick (e.g. the DOGE tip just moved). Skipped
+    /// when a poll is already running.
+    void request_refresh();
+
+    /// The payout provider calls this before returning no payouts, with why
+    /// ("no_best_share", "tracker_busy", ...); the rebuild that asked counts
+    /// it (get_rebuild_stats_json).
+    static void note_payout_miss(const std::string& reason);
+    /// The payout provider calls this with the sharechain best share its
+    /// payouts are (or would be) split at; the rebuild records it with the
+    /// block (MergedHeaderInfo::payout_basis).
+    static void note_payout_basis(const uint256& best);
+    /// True on the merged-mining RPC thread (polls / refreshes), where a
+    /// payout provider may wait a little for a busy lock; false on the
+    /// network thread, which must not.
+    static bool on_rpc_thread();
+
+    /// {"no_payouts": {reason: rebuilds}, "kept_last_block": n,
+    ///  "dropped_commitment": n, "dropped_best_moved": n, "stale_results": n, "work_changed": n,
+    ///  "work_unchanged": n, "snapshot_target_refusals": n,
+    ///  "no_payout_seconds": s, "no_payout_now": [symbols],
+    ///  "payout_source": {published, from_weights, computed, busy}}.
+    nlohmann::json get_rebuild_stats_json() const;
+
+    /// Steady-clock seconds the manager stamps snapshots and episodes with
+    /// (a test drives its own clock).
+    using ClockFn = std::function<int64_t()>;
+    void set_clock_for_test(ClockFn fn);
+
 private:
     void poll_loop();
-    void refresh_aux_work();
 
 public:
     // ─── Shared helpers (used by both build_multiaddress_block and rebuild_cached_blocks) ───
@@ -367,6 +480,11 @@ private:
 
     // Registered aux chains
     struct ChainState {
+        // A run of rebuilds that got no payouts for this chain (logged once).
+        bool                                 no_payout_episode{false};
+        int64_t                              no_payout_since{0};      // steady seconds
+        uint64_t                             no_payout_rebuilds{0};
+        int64_t                              no_payout_seconds{0};    // closed episodes
         AuxChainConfig                       config;
         std::unique_ptr<IAuxChainBackend>    rpc;       // primary backend (RPC or embedded)
         std::unique_ptr<IAuxChainBackend>    fallback;  // fallback backend (embedded if primary is RPC)
@@ -374,6 +492,12 @@ private:
         std::string                          last_tip;
         bool                                 using_fallback{false};
         int64_t                              last_update_time{0}; // monotonic seconds
+        // The last template came back degraded (the mempool was not cleaned
+        // for the tip yet): the tip is not latched, the next poll fetches again.
+        bool                                 template_degraded{false};
+        uint64_t                             templates_degraded{0};
+        uint64_t                             templates_refetched_clean{0};
+        uint64_t                             templates_still_degraded{0};  // re-fetches kept back
         // Frozen DOGE block data from rebuild_cached_blocks().
         // Contains the pre-built DOGE coinbase hex and template snapshot that
         // match the block hash committed in the LTC parent's mm_data.
@@ -381,6 +505,7 @@ private:
         std::string frozen_coinbase_hex;   // pre-built PPLNS coinbase from ref_hash_fn time
         nlohmann::json frozen_template;    // template snapshot from ref_hash_fn time
         uint256 frozen_block_hash;         // block hash at commit time (for AuxPoW proof)
+        uint256 frozen_payout_basis;       // best share its payouts were split at
 
         // History of frozen snapshots keyed by block hash.
         // Solves the stale-commitment race: the LTC coinbase contains an MM root
@@ -391,6 +516,7 @@ private:
             nlohmann::json tmpl;
             std::string    coinbase_hex;
             int64_t        timestamp;   // monotonic seconds for expiration
+            uint64_t       seq{0};      // insertion order: the cap drops the oldest
         };
         std::map<uint256, FrozenSnapshot> frozen_history;  // block_hash → snapshot
         // Keep enough frozen snapshots to cover FROZEN_EXPIRY_SEC (300s).
@@ -401,6 +527,7 @@ private:
         static constexpr int64_t FROZEN_EXPIRY_SEC = 300;  // 5 minutes
     };
     std::vector<ChainState> m_chains;
+    uint64_t m_frozen_seq{0};  // FrozenSnapshot::seq source (under m_mutex)
 
     // Submit via submitauxblock and relay the accepted block via P2P
     void submit_aux_and_relay(ChainState& chain, const std::string& auxpow,
@@ -422,6 +549,25 @@ private:
 
     // Per-chain payout provider (set by integration layer)
     PayoutProvider m_payout_provider;
+    std::shared_ptr<MergedPayoutSource> m_payout_source = std::make_shared<MergedPayoutSource>();
+
+    // Rebuilds without payouts (guarded by m_mutex).
+    std::map<std::string, uint64_t> m_rebuild_no_payouts;
+    uint64_t m_rebuild_kept_last_block{0};
+    uint64_t m_rebuild_dropped_commitment{0};
+    // ...of which because the last block's payouts are for another best share.
+    uint64_t m_rebuild_dropped_best_moved{0};
+    uint64_t m_rebuild_stale_results{0};
+    // Rebuilds whose result reached the miners (work pushed) or did not
+    // change what they commit to (no push).
+    uint64_t m_rebuild_work_changed{0};
+    uint64_t m_rebuild_work_unchanged{0};
+    // Finds refused at submit: the parent PoW meets the current target but
+    // not the bits of the snapshot the block is built from.
+    uint64_t m_snapshot_target_refusals{0};
+
+    ClockFn m_clock;
+    int64_t now_sec() const;
 
     // THE state root provider for sharechain anchoring
     StateRootProvider m_state_root_provider;
@@ -431,6 +577,13 @@ private:
     MergedBlockFoundFn m_on_merged_block_found;
     WorkChangedFn m_on_work_changed;
 
+    // Parent coinbase shape for the aux size budget (set_parent_coinbase_shape).
+    std::atomic<uint32_t> m_parent_coinbase_bytes{0};
+    std::atomic<uint32_t> m_parent_branch_len{0};
+    // Aux blocks refused at assembly (guarded by m_mutex).
+    std::map<std::string, uint64_t> m_block_refusals_by_code;
+    uint32_t block_size_reserve_locked(const ChainState& chain) const;
+
     // Discovered merged blocks history
     std::vector<DiscoveredMergedBlock> m_discovered_blocks;
     std::map<uint32_t, uint64_t>       m_blocks_per_chain;
@@ -438,6 +591,12 @@ private:
     // Helper: record a discovered block (caller must hold m_mutex)
     void record_discovered_block(const ChainState& chain, bool accepted,
                                  const std::string& parent_hash = "");
+    // The block a share actually committed to: its hash, height and coinbase
+    // value from the frozen snapshot the block was built from (a stale job's
+    // is not the current work).
+    void record_discovered_block(const ChainState& chain, bool accepted,
+                                 const std::string& parent_hash, const uint256& block_hash,
+                                 int height, uint64_t coinbase_value);
 
     // recursive_mutex: rebuild_cached_blocks() acquires/releases m_mutex
     // in phases (snapshot → payout_fn → re-acquire to store).  poll_loop

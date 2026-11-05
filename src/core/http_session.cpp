@@ -19,6 +19,7 @@
 #include "config_endpoint.hpp"   // #157 Slice B: check_control_token() on the submit route
 #include "filesystem.hpp"
 #include "p2p_message_stats.hpp"
+#include "inject_ledger_obs.hpp"   // S4: /api/tx-inject/ledger
 
 #include <filesystem>
 #include <fstream>
@@ -172,6 +173,74 @@ static nlohmann::json build_tx_inject_status_json()
     } else {
         out["rate_limit"] = nullptr;
         out["sandbox"]    = nullptr;
+    }
+    return out;
+}
+
+// ── /api/tx-inject/ledger — read-only per-inject ledger (S4) ────────────
+//
+// Serialises core::obs::inject_ledger() (one entry per inject the DASH inject
+// pool tracks: submit time, expiry_height, size, flags, and the last template
+// build's RIDES / HELD verdict) with the pool counts from inject_status() and
+// the best ChainLock the node adopted (core::obs::best_chainlock()). Pure
+// reader: the ledger is copied out under its own mutex, no node lock is taken
+// and no node call is made.
+//
+// A build that has the route always answers 200 (a wallet feature-detects the
+// ledger by a 404): "wired": false with an empty entries array while the lane
+// has never published. "bestchainlock" is null until an adoption is
+// published; its blockhash is null when the adoption did not name one.
+static nlohmann::json build_tx_inject_ledger_json()
+{
+    const auto& s   = obs::inject_status();
+    const auto& led = obs::inject_ledger();
+    const auto updated = led.updated_at();
+
+    nlohmann::json out;
+    out["wired"]      = (updated != 0);
+    out["enabled"]    = s.enabled.load(std::memory_order_relaxed);
+    out["updated_at"] = updated;
+    out["tip_height"] = led.tip();
+    out["pool"] = {
+        {"entries",         s.pool_entries.load(std::memory_order_relaxed)},
+        {"bytes",           s.pool_bytes.load(std::memory_order_relaxed)},
+        {"max_entries",     s.max_entries.load(std::memory_order_relaxed)},
+        {"max_total_bytes", s.max_total_bytes.load(std::memory_order_relaxed)}
+    };
+    nlohmann::json entries = nlohmann::json::array();
+    for (const auto& e : led.snapshot()) {
+        nlohmann::json j;
+        j["txid"]          = e.txid.GetHex();
+        j["submit_time"]   = e.submit_time;
+        j["expiry_height"] = e.expiry_height;
+        j["byte_size"]     = e.byte_size;
+        j["flags"]         = e.flags;
+        j["in_mempool"]    = e.in_mempool;
+        if (e.last_build) {
+            j["last_build"] = {
+                {"height",  e.last_build->height},
+                {"verdict", e.last_build->rides ? "RIDES" : "HELD"},
+                {"cause",   e.last_build->cause},
+                {"vin",     e.last_build->vin},
+                {"fee",     e.last_build->fee}
+            };
+        } else {
+            j["last_build"] = nullptr;
+        }
+        entries.push_back(std::move(j));
+    }
+    out["entries"] = std::move(entries);
+    out["overflow_dropped"] = led.overflow_dropped();
+    if (const auto cl = obs::best_chainlock().snapshot()) {
+        out["bestchainlock"] = {
+            {"height",     cl->height},
+            {"blockhash",  cl->blockhash.IsNull() ? nlohmann::json(nullptr)
+                                                  : nlohmann::json(cl->blockhash.GetHex())},
+            {"provenance", cl->provenance},
+            {"updated_at", cl->updated_at}
+        };
+    } else {
+        out["bestchainlock"] = nullptr;
     }
     return out;
 }
@@ -609,6 +678,19 @@ void HttpSession::process_request()
                 if (j.is_object()) j.erase("http_status");
                 answer(st, j);
                 return;
+            }
+            else if (target == "/api/tx-inject/ledger") {
+                // Read-only per-inject ledger (S4). Loopback-only, same posture
+                // as /api/tx-inject-status: it names the txids this node is
+                // injecting. SHOWS state only.
+                if (!is_direct_local()) {
+                    response.result(http::status::forbidden);
+                    response.body() = R"({"error":"tx-inject ledger is local-only"})";
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                    return;
+                }
+                rest_result = build_tx_inject_ledger_json();
             }
             else if (target == "/api/config" || target == "/api/config/schema") {
                 if (!is_direct_local()) {
@@ -1405,6 +1487,12 @@ void HttpSession::process_request()
                 }
             }
 
+            // A merged chain's getblocktemplate is answered to a direct
+            // local client only (MiningInterface::t_direct_local_request).
+            struct DirectLocalScope {
+                explicit DirectLocalScope(bool v) { MiningInterface::t_direct_local_request = v; }
+                ~DirectLocalScope() { MiningInterface::t_direct_local_request = false; }
+            } direct_local_scope(is_direct_local());
             response_body = mining_interface_->HandleRequest(request_body);
         }
         else {

@@ -13,6 +13,10 @@
 #  include <windows.h>
 #  include <bcrypt.h>
 #  pragma comment(lib, "bcrypt.lib")
+#elif defined(__APPLE__)
+#  include <sys/types.h>
+#  include <sys/random.h>   // getentropy(2), macOS 10.12+
+#  include <unistd.h>
 #else
 #  include <cerrno>
 #  include <sys/random.h>   // getrandom(2)
@@ -28,6 +32,13 @@ void csprng_bytes(uint8_t* out, size_t n)
                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     if (s != 0)
         throw std::runtime_error("csprng: BCryptGenRandom failed");
+#elif defined(__APPLE__)
+    // Darwin has no getrandom(2). getentropy(2) draws from the same kernel
+    // CSPRNG as arc4random and fills at most 256 bytes per call; any failure
+    // throws, so no partial buffer is ever handed back as a result.
+    detail::fill_in_chunks(out, n, 256,
+                           [](uint8_t* p, size_t len) { return ::getentropy(p, len) == 0; },
+                           "csprng: getentropy(2) failed");
 #else
     size_t got = 0;
     while (got < n) {

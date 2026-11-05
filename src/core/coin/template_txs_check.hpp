@@ -64,6 +64,11 @@ struct TxShape {
     std::optional<uint8_t> mweb_presence;   // set when flag 0x08 is
     bool consumed_all{false};               // the walk ended at the last byte
     uint256 txid;                           // SHA256d(version | vin | vout | locktime)
+    // Bytes of the serialization without witness and without MWEB data
+    // (version | vin | vout | locktime), and what the witness adds to it
+    // (marker, flag, witness stacks; 0 without one). Set when consumed_all.
+    size_t stripped_size{0};
+    size_t witness_size{0};
 };
 
 namespace template_txs_detail {
@@ -163,6 +168,7 @@ inline std::optional<TxShape> walk_tx_hex(std::string_view hex)
         const size_t body_to = r.pos;
 
         uint8_t flags = t.flags;
+        size_t witness_bytes = 0;
         if (flags & 0x01) {
             flags ^= 0x01;
             bool any = false;
@@ -174,6 +180,7 @@ inline std::optional<TxShape> walk_tx_hex(std::string_view hex)
             }
             if (!any)
                 return std::nullopt;  // "Superfluous witness record"
+            witness_bytes = 2 + (r.pos - body_to);  // marker, flag, the stacks
         }
         if (flags & 0x08) {
             flags ^= 0x08;
@@ -196,6 +203,8 @@ inline std::optional<TxShape> walk_tx_hex(std::string_view hex)
         stripped.insert(stripped.end(), b.begin() + body_from, b.begin() + body_to);
         stripped.insert(stripped.end(), b.begin() + lock_at, b.begin() + lock_at + 4);
         t.txid = Hash(std::span<const unsigned char>(stripped.data(), stripped.size()));
+        t.stripped_size = stripped.size();
+        t.witness_size = witness_bytes;
         return t;
     } catch (const std::ios_base::failure&) {
         return std::nullopt;
@@ -334,6 +343,36 @@ inline std::optional<TemplateTxRefusal> check_template_txs(const nlohmann::json&
                                      "fees " + std::to_string(fee_sum) + " > coinbasevalue " + std::to_string(cbv)};
     }
     return std::nullopt;
+}
+
+/// litecoind's consensus weight limit (consensus/consensus.h:18).
+inline constexpr uint64_t kLtcMaxBlockWeight = 4'000'000;
+
+/// A transaction's weight as litecoind counts it inside a block: its size
+/// without witness and MWEB data x3 plus its size without MWEB data
+/// (consensus/validation.h:165-168 GetBlockWeight, the block-level form; with
+/// SERIALIZE_NO_MWEB a HogEx serializes without the extended format,
+/// primitives/transaction.h:331-366).
+inline uint64_t ltc_tx_weight(const TxShape& t)
+{
+    return static_cast<uint64_t>(t.stripped_size) * 4 + t.witness_size;
+}
+
+/// GetBlockWeight of a block: header, transaction count, the coinbase
+/// (`coinbase_stripped_bytes` = its serialization without witness; with
+/// `segwit` it carries the one-item 32-byte witness reserved value: marker,
+/// flag, item count, length, 32 bytes) and `txs` (walked, in block order).
+/// The MWEB extension block is not part of the weight.
+inline uint64_t ltc_block_weight(size_t coinbase_stripped_bytes, bool segwit,
+                                 const std::vector<TxShape>& txs)
+{
+    const uint64_t n = 1 + txs.size();
+    const uint64_t count_bytes = n < 0xfd ? 1 : n <= 0xffff ? 3 : n <= 0xffffffffULL ? 5 : 9;
+    uint64_t w = (80 + count_bytes) * 4;
+    w += static_cast<uint64_t>(coinbase_stripped_bytes) * 4 + (segwit ? 2 + 1 + 1 + 32 : 0);
+    for (const auto& t : txs)
+        w += ltc_tx_weight(t);
+    return w;
 }
 
 } // namespace core::coin
