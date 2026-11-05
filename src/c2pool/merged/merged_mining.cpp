@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "merged_mining.hpp"
 #include <core/coin/mweb_shape.hpp>
+#include <core/coin/sigop_cost.hpp>
 #include <impl/nmc/coin/aux_expected_index.hpp>  // CAuxPow::getExpectedIndex; leveldb-free
 
 #include <core/log.hpp>
@@ -773,6 +774,10 @@ void MergedMiningManager::refresh_aux_work()
             chain.rpc->set_block_size_reserve(reserve);
             if (chain.fallback)
                 chain.fallback->set_block_size_reserve(reserve);
+            const uint32_t sigops = block_sigop_reserve_locked(chain);
+            chain.rpc->set_block_sigop_reserve(sigops);
+            if (chain.fallback)
+                chain.fallback->set_block_sigop_reserve(sigops);
         }
         try {
             // Check if tip changed. A degraded template (built before the
@@ -1359,6 +1364,16 @@ uint32_t MergedMiningManager::block_size_reserve_locked(const ChainState& chain)
                                    m_parent_branch_len.load(std::memory_order_relaxed),
                                    aux_branch_len,
                                    static_cast<uint32_t>(chain.frozen_coinbase_hex.size() / 2));
+}
+
+uint32_t MergedMiningManager::block_sigop_reserve_locked(const ChainState& chain) const
+{
+    if (chain.frozen_coinbase_hex.empty())
+        return kAuxCoinbaseSigopsUnknown;
+    const auto ops = core::coin::sigops::tx_hex_legacy_sigops(chain.frozen_coinbase_hex);
+    if (!ops)
+        return kAuxCoinbaseSigopsUnknown;
+    return *ops + kAuxCoinbaseSigopMargin;
 }
 
 uint32_t MergedMiningManager::block_size_reserve(uint32_t chain_id) const

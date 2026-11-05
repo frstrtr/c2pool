@@ -17,6 +17,7 @@
 #include <core/coin/node_iface.hpp>
 #include <core/coin/mweb_shape.hpp>
 #include <core/coin/template_txs_check.hpp>
+#include <core/coin/sigop_cost.hpp>
 // Phase 4: embedded coin node interface
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -875,24 +876,48 @@ uint32_t MiningInterface::coinbase_weight(const std::string& coinb1, const std::
     return static_cast<uint32_t>(std::min<uint64_t>(w, UINT32_MAX));
 }
 
+std::optional<uint32_t> MiningInterface::coinbase_sigops(const std::string& coinb1, const std::string& coinb2)
+{
+    return core::coin::sigops::tx_hex_legacy_sigops(coinb1 + "0000000000000000" + coinb2);
+}
+
 void MiningInterface::note_coinbase_built(const std::string& coinb1, const std::string& coinb2,
                                           bool segwit, size_t branch_len, bool fresh_template) const
 {
     const uint32_t w = coinbase_weight(coinb1, coinb2, segwit);
+    // A coinbase that does not parse counts as the worst case its size allows.
+    const uint32_t ops = coinbase_sigops(coinb1, coinb2).value_or(
+        static_cast<uint32_t>(std::min<uint64_t>((coinb1.size() + coinb2.size()) / 2 * 20, UINT32_MAX)));
     if (fresh_template) {
         // A new template: start from its own coinbase; the per-connection
         // coinbases built on it raise the mark.
         m_coinbase_weight.store(w, std::memory_order_relaxed);
+        m_coinbase_sigops.store(ops, std::memory_order_relaxed);
     } else {
         uint32_t cur = m_coinbase_weight.load(std::memory_order_relaxed);
         while (w > cur && !m_coinbase_weight.compare_exchange_weak(cur, w, std::memory_order_relaxed)) {
         }
+        uint32_t cur_ops = m_coinbase_sigops.load(std::memory_order_relaxed);
+        while (ops > cur_ops && !m_coinbase_sigops.compare_exchange_weak(cur_ops, ops, std::memory_order_relaxed)) {
+        }
     }
+    m_coinbase_sigops_known.store(true, std::memory_order_relaxed);
     // The merged blocks carry this coinbase (without witness) in their AuxPoW.
     if (m_mm_manager) {
         const uint32_t mark = m_coinbase_weight.load(std::memory_order_relaxed);
         m_mm_manager->set_parent_coinbase_shape((mark + 3) / 4, static_cast<uint32_t>(branch_len));
     }
+}
+
+uint32_t MiningInterface::coinbase_sigop_reserve() const
+{
+    if (m_coinbase_sigops_known.load(std::memory_order_relaxed))
+        return m_coinbase_sigops.load(std::memory_order_relaxed) + kCoinbaseSigopMargin;
+    // No coinbase built yet (the first template): one sigop per output the
+    // cap allows (an address payee has at most one), plus a 64-byte scriptSig
+    // whose every byte were CHECKMULTISIG.
+    const uint64_t outputs = m_stratum_config.max_coinbase_outputs + 4;
+    return static_cast<uint32_t>(std::min<uint64_t>(outputs + 64 * 20 + kCoinbaseSigopMargin, UINT32_MAX));
 }
 
 uint32_t MiningInterface::coinbase_weight_reserve() const

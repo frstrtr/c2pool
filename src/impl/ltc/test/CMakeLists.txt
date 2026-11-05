@@ -240,6 +240,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # HogEx's inputs spent and never spends a HogAddr coin, and admission
     # refuses a HogAddr input (hogaddr_spend). REAL tip 3200604 and its MWEB
     # state, REAL Mempool and UTXOViewCache/UTXOViewDB. Same folding rule.
+    #
+    # template_sigop_budget_test.cpp: the block sigop budget of the embedded
+    # LTC and DOGE templates: Core's counting (GetSigOpCount, the P2SH redeem
+    # script, CountWitnessSigOps, GetTransactionSigOpCost) reproducing
+    # litecoind's per-entry "sigops" on its REAL 3200605 template, the
+    # selection's boundary (exactly the limit, 1 over), the coinbase
+    # reservation, DOGE's own rules and 20,000 limit. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -301,6 +308,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_remove_owns_data_test.cpp
         share_test.cpp
         template_hogex_survives_truncation_test.cpp
+        template_sigop_budget_test.cpp
         template_topology_spend_test.cpp
         utxo_order_test.cpp
         version_switch_floor_test.cpp
