@@ -813,6 +813,99 @@ TEST(ConfigEndpointHttp, SliceBSubmitTimeoutIs5xxNotHang) {
     ce::clear_control_token();
 }
 
+// N3 (c2wallet Scan & Plan): POST /api/tx-inject/validate, the dry run of the
+// submit. Unwired: 503. Wired: the submit's rules — direct-local only (a
+// forwarded header is refused), the control token (403, the fn untouched) —
+// the body passed verbatim, the http_status hint mapped and stripped, and the
+// fn run on the producer io_context thread (thread_safe_wrap) like the submit.
+TEST(ConfigEndpointHttp, N3ValidateRouteGatesLikeTheSubmit) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    {
+        net::io_context ioc;
+        auto ws = make_wired_server(ioc);
+        int status = 0;
+        auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/validate",
+                               status, nlohmann::json{{"raw_tx", "00"}}.dump());
+        EXPECT_EQ(status, 503) << body;
+        EXPECT_NE(body.find("not wired"), std::string::npos) << body;
+    }
+
+    net::io_context ioc;
+    net::io_context producer;
+    auto guard = net::make_work_guard(producer);
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    auto* mi = ws->get_mining_interface();
+    std::promise<std::thread::id> ready;
+    std::thread producer_thread([&]() {
+        mi->set_io_context(&producer);
+        ready.set_value(std::this_thread::get_id());
+        producer.run();
+    });
+    const std::thread::id producer_tid = ready.get_future().get();
+    std::atomic<int> calls{0};
+    std::thread::id fn_tid{};
+    std::string seen;
+    mi->set_tx_inject_validate_fn([&](const std::string& body) -> nlohmann::json {
+        ++calls;
+        fn_tid = std::this_thread::get_id();
+        seen = body;
+        return nlohmann::json{{"ok", false}, {"dry_run", true}, {"cause", "inject-immature-input"},
+                              {"would_admit", true}, {"http_status", 422}};
+    });
+    EXPECT_FALSE(mi->has_tx_inject_submit_fn()) << "the dry run needs no submit fn";
+    ws->start();
+    const uint16_t port = ws->bound_port();
+
+    int status = 0;
+    const nlohmann::json no_token = {{"raw_tx", "0100000000"}};
+    auto body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, no_token.dump());
+    EXPECT_EQ(status, 403) << body;
+    ce::set_control_token("tok-val");
+    const nlohmann::json wrong = {{"control_token", "nope"}, {"raw_tx", "0100000000"}};
+    body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, wrong.dump());
+    EXPECT_EQ(status, 403) << body;
+    EXPECT_EQ(calls.load(), 0) << "no token, no dry run";
+
+    const nlohmann::json good = {{"control_token", "tok-val"}, {"raw_tx", "0100000000"}, {"max_fee", 0}};
+    {
+        // A same-host reverse proxy adds a forwarded header: refused.
+        net::io_context c;
+        tcp::socket sock(c);
+        sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port));
+        http::request<http::string_body> req{http::verb::post, "/api/tx-inject/validate", 11};
+        req.set(http::field::host, "127.0.0.1");
+        req.set("X-Forwarded-For", "203.0.113.7");
+        req.set(http::field::content_type, "application/json");
+        req.body() = good.dump();
+        req.prepare_payload();
+        http::write(sock, req);
+        beast::flat_buffer buf;
+        http::response<http::string_body> res;
+        http::read(sock, buf, res);
+        EXPECT_EQ(res.result_int(), 403) << res.body();
+        beast::error_code ec;
+        sock.shutdown(tcp::socket::shutdown_both, ec);
+    }
+    EXPECT_EQ(calls.load(), 0) << "a proxied request never reaches the dry run";
+
+    body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, good.dump());
+    EXPECT_EQ(status, 422) << body;
+    const auto j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("cause", std::string()), "inject-immature-input");
+    EXPECT_FALSE(j.contains("http_status"));
+    EXPECT_EQ(calls.load(), 1);
+    EXPECT_EQ(seen, good.dump()) << "the body reaches the fn verbatim";
+    EXPECT_EQ(fn_tid, producer_tid) << "the dry run runs on the node io thread, like the submit";
+
+    ws->stop();
+    guard.reset();
+    producer.stop();
+    if (producer_thread.joinable()) producer_thread.join();
+    ce::clear_control_token();
+}
+
 // A RESTART-class key has no registered runtime applier, so applying it like a
 // LIVE key would swap the reporting mirror while the running process keeps the
 // OLD value (a mirror-vs-runtime lie). The apply path must REFUSE it by a named

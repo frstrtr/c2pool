@@ -73,6 +73,8 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
 
 MiningInterface::~MiningInterface()
 {
+    // The UTXO scan thread first: its fn reads coin state the target owns.
+    stop_utxo_scan();
     stop_background();
 }
 
@@ -6790,6 +6792,130 @@ nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
         {"http_status", 503}};
 }
 
+nlohmann::json MiningInterface::rest_tx_inject_validate(const std::string& body)
+{
+    // N3: the installed fn runs NodeCoinState::validate_inject on the node
+    // io_context (thread_safe_wrap), like the submit; nothing is admitted.
+    if (m_tx_inject_validate_fn) {
+        auto j = m_tx_inject_validate_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"ok", false},
+        {"error", "tx-inject validate not wired"},
+        {"http_status", 503}};
+}
+
+// ── GET /api/utxo/scan: the dedicated scan thread ─────────────────────────────
+
+void MiningInterface::set_utxo_scan_fn(utxo_scan_fn_t fn)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    if (m_utxo_scan_stopping)
+        return;
+    m_utxo_scan_fn = std::move(fn);
+    if (m_utxo_scan_fn && !m_utxo_scan_thread.joinable())
+        m_utxo_scan_thread = std::thread([this] { utxo_scan_worker(); });
+}
+
+bool MiningInterface::has_utxo_scan_fn() const
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    return static_cast<bool>(m_utxo_scan_fn) && !m_utxo_scan_stopping;
+}
+
+void MiningInterface::set_utxo_scan_timeout(std::chrono::milliseconds t)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    m_utxo_scan_timeout = t;
+}
+
+void MiningInterface::utxo_scan_worker()
+{
+    std::unique_lock<std::mutex> lk(m_utxo_scan_mu);
+    for (;;) {
+        m_utxo_scan_cv.wait(lk, [this] { return m_utxo_scan_stopping || m_utxo_scan_job.has_value(); });
+        if (!m_utxo_scan_job)
+            return;   // stopping, nothing queued
+        UtxoScanJob job = std::move(*m_utxo_scan_job);
+        m_utxo_scan_job.reset();
+        const utxo_scan_fn_t fn = m_utxo_scan_fn;
+        lk.unlock();
+        nlohmann::json j;
+        try {
+            j = fn ? fn(job.query, m_utxo_scan_cancel)
+                   : nlohmann::json{{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[utxo-scan] scan failed: " << e.what();
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"detail", e.what()}, {"http_status", 500}};
+        } catch (...) {
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"http_status", 500}};
+        }
+        lk.lock();
+        m_utxo_scan_busy = false;   // before the answer: a caller that has it may scan again
+        lk.unlock();
+        job.done->set_value(std::move(j));
+        lk.lock();
+    }
+}
+
+nlohmann::json MiningInterface::rest_utxo_scan(const std::string& query)
+{
+    using Clock = std::chrono::steady_clock;
+    std::future<nlohmann::json> fut;
+    std::optional<Clock::time_point> prev_start;
+    Clock::time_point start;
+    std::chrono::milliseconds timeout;
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (!m_utxo_scan_fn || m_utxo_scan_stopping)
+            return {{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        if (m_utxo_scan_busy)
+            return {{"ok", false}, {"error", "utxo-scan-busy"},
+                    {"detail", "one scan at a time"}, {"http_status", 409}};
+        start = Clock::now();
+        if (m_utxo_scan_last_start && start - *m_utxo_scan_last_start < kUtxoScanMinInterval) {
+            const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+                kUtxoScanMinInterval - (start - *m_utxo_scan_last_start));
+            return {{"ok", false}, {"error", "utxo-scan-rate"},
+                    {"detail", "one scan per " + std::to_string(kUtxoScanMinInterval.count()) + " s"},
+                    {"retry_after_ms", wait.count()}, {"http_status", 429}};
+        }
+        prev_start = m_utxo_scan_last_start;
+        m_utxo_scan_last_start = start;
+        m_utxo_scan_busy = true;
+        auto done = std::make_shared<std::promise<nlohmann::json>>();
+        fut = done->get_future();
+        m_utxo_scan_job = UtxoScanJob{query, std::move(done)};
+        timeout = m_utxo_scan_timeout;
+    }
+    m_utxo_scan_cv.notify_one();
+    if (fut.wait_for(timeout) != std::future_status::ready)
+        return {{"ok", false}, {"error", "utxo-scan-timeout"},
+                {"detail", "the scan did not finish in time; it still runs and its result is dropped"},
+                {"http_status", 504}};
+    nlohmann::json j = fut.get();
+    if (!j.is_object() || !j.contains("scanned")) {
+        // Refused before the pass: the interval stays free.
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (m_utxo_scan_last_start == start)
+            m_utxo_scan_last_start = prev_start;
+    }
+    return j;
+}
+
+void MiningInterface::stop_utxo_scan()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        m_utxo_scan_stopping = true;
+    }
+    m_utxo_scan_cancel.store(true);
+    m_utxo_scan_cv.notify_all();
+    if (m_utxo_scan_thread.joinable() && m_utxo_scan_thread.get_id() != std::this_thread::get_id())
+        m_utxo_scan_thread.join();
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
@@ -11577,6 +11703,11 @@ void WebServer::stop()
     if (running_) {
         try {
             running_ = false;
+            // The UTXO scan first: an HTTP handler waiting for a pass returns
+            // as soon as the pass sees the cancel, so the join below never
+            // waits out a pass.
+            if (mining_interface_)
+                mining_interface_->stop_utxo_scan();
             acceptor_.close();
             // Stop the dedicated HTTP event loop and join its thread
             http_ioc_.stop();

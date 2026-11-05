@@ -1800,6 +1800,8 @@ static int run_pathb(XmrNodeConfig& cfg, const PathbFlags& pf) {
                 mine::MinerHit h;
                 while (cpu_miner->pop_hit(h)) on_hit(h);
             }
+            cpu_miner->install_ready();
+            for (const std::string& l : cpu_miner->take_events()) std::printf("  [cpu-miner] %s\n", l.c_str());
         }
 #endif
 

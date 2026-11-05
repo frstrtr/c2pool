@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <deque>
 #include <chrono>
 #include <future>
@@ -672,6 +673,40 @@ public:
     void set_tx_inject_submit_fn(tx_inject_submit_fn_t fn) { m_tx_inject_submit_fn = thread_safe_wrap(std::move(fn)); }
     bool has_tx_inject_submit_fn() const { return static_cast<bool>(m_tx_inject_submit_fn); }
     nlohmann::json rest_tx_inject_submit(const std::string& body);  // POST /api/tx-inject/submit
+
+    // POST /api/tx-inject/validate (c2wallet Scan & Plan, N3): the dry run of
+    // the submit — same body, same control-token rule, same io-thread
+    // marshalling (thread_safe_wrap) — answered without admitting anything
+    // (NodeCoinState::validate_inject). UNWIRED by default: 503.
+    using tx_inject_validate_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_tx_inject_validate_fn(tx_inject_validate_fn_t fn) { m_tx_inject_validate_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_tx_inject_validate_fn() const { return static_cast<bool>(m_tx_inject_validate_fn); }
+    nlohmann::json rest_tx_inject_validate(const std::string& body);  // POST /api/tx-inject/validate
+
+    // GET /api/utxo/scan (c2wallet Scan & Plan, N1): a read-only scan of the
+    // coin's full UTXO set for a few scripts. The fn takes the raw query
+    // string and answers the reply JSON with an "http_status" hint; `cancel`
+    // turns true when the scan must stop (shutdown). It runs on a DEDICATED
+    // scan thread owned here — never on the node io thread (a multi-second
+    // pass there would delay block connection and template serving) and
+    // never through thread_safe_wrap (its 10 s dispatch timeout cannot carry
+    // a multi-million-row pass). rest_utxo_scan waits for it up to the scan
+    // timeout (120 s, then 504 utxo-scan-timeout; the pass still finishes and
+    // its result is dropped). One scan at a time (409 utxo-scan-busy) and one
+    // started per kUtxoScanMinInterval (429 utxo-scan-rate); a reply without
+    // "scanned" (refused before the pass: bad request, set not serving) does
+    // not use the interval. UNWIRED by default: the route answers 404.
+    using utxo_scan_fn_t = std::function<nlohmann::json(const std::string& query,
+                                                        const std::atomic<bool>& cancel)>;
+    static constexpr std::chrono::seconds kUtxoScanMinInterval{10};
+    void set_utxo_scan_fn(utxo_scan_fn_t fn);
+    bool has_utxo_scan_fn() const;
+    nlohmann::json rest_utxo_scan(const std::string& query);   // GET /api/utxo/scan
+    /// Refuse new scans, cancel a running one and join the scan thread
+    /// (idempotent; the destructor calls it).
+    void stop_utxo_scan();
+    /// The wait cap of rest_utxo_scan (tests shorten it).
+    void set_utxo_scan_timeout(std::chrono::milliseconds t);
 
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
@@ -1669,6 +1704,23 @@ private:
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
     tx_inject_submit_fn_t m_tx_inject_submit_fn;  // POST /api/tx-inject/submit — Slice B raw-tx submit (optional; unwired => 503)
+    tx_inject_validate_fn_t m_tx_inject_validate_fn;  // POST /api/tx-inject/validate — N3 dry run (optional; unwired => 503)
+    // GET /api/utxo/scan: the scan fn, its thread and the one job slot.
+    struct UtxoScanJob {
+        std::string query;
+        std::shared_ptr<std::promise<nlohmann::json>> done;
+    };
+    void utxo_scan_worker();
+    mutable std::mutex                          m_utxo_scan_mu;
+    std::condition_variable                     m_utxo_scan_cv;
+    utxo_scan_fn_t                              m_utxo_scan_fn;
+    std::optional<UtxoScanJob>                  m_utxo_scan_job;
+    bool                                        m_utxo_scan_busy{false};
+    bool                                        m_utxo_scan_stopping{false};
+    std::atomic<bool>                           m_utxo_scan_cancel{false};
+    std::optional<std::chrono::steady_clock::time_point> m_utxo_scan_last_start;
+    std::chrono::milliseconds                   m_utxo_scan_timeout{std::chrono::seconds(120)};
+    std::thread                                 m_utxo_scan_thread;
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
