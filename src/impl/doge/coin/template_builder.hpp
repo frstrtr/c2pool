@@ -97,6 +97,10 @@ public:
     // DOGE uses (chain_id << 16) | base_version, e.g. 0x00620004 for BIP65.
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;
+    // Legacy sigops reserved for the coinbase when its own count is not known
+    // (MergedMiningManager passes the frozen coinbase's own): 4,000 P2PKH
+    // payees and a margin.
+    static constexpr uint32_t COINBASE_SIGOP_RESERVE = 4'200u;
     // dogecoind CheckBlock: the serialized block, AuxPoW in the header
     // included, at most MAX_BLOCK_BASE_SIZE bytes (validation.cpp:2972,
     // consensus/consensus.h:17; primitives/block.h serializes the auxpow with
@@ -154,11 +158,15 @@ public:
     /// max_weight bounds the mempool selection: tx_weight_budget(reserve)
     /// with the bytes the header, AuxPoW and coinbase take (MergedMiningManager
     /// passes them through AuxChainEmbedded).
+    /// coinbase_sigops: the coinbase's legacy sigops; the block's sigops
+    /// (dogecoind ConnectBlock: bad-blk-sigops) stay within the pool's rules
+    /// (DOGE: legacy and P2SH, 20,000) with them reserved.
     static std::optional<ltc::coin::rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
         const DOGEChainParams& params,
-        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE)
+        uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
+        uint32_t           coinbase_sigops = COINBASE_SIGOP_RESERVE)
     {
         auto tip_opt = chain.tip();
         if (!tip_opt) return std::nullopt;
@@ -218,8 +226,10 @@ public:
                              : nullptr;
 
         // ── Transactions from mempool: priced txs only (fee-sorted) ──────
+        ltc::coin::Mempool::SelectionSeed seed;
+        seed.sigop_cost = static_cast<int64_t>(coinbase_sigops) * pool.sigop_rules().scale;
         auto [selected_txs, total_fees] = degraded == nullptr
-            ? pool.get_sorted_txs_with_fees(max_weight)
+            ? pool.get_sorted_txs_with_fees(max_weight, &seed)
             : std::pair<std::vector<ltc::coin::Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
@@ -327,7 +337,8 @@ public:
                 + std::to_string(m_chain.height()) + ")");
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_params,
-            TemplateBuilder::tx_weight_budget(m_reserve_bytes.load(std::memory_order_relaxed)));
+            TemplateBuilder::tx_weight_budget(m_reserve_bytes.load(std::memory_order_relaxed)),
+            m_coinbase_sigops.load(std::memory_order_relaxed));
         if (!result)
             throw std::runtime_error("DOGE EmbeddedCoinNode: chain has no tip");
         return *result;
@@ -383,6 +394,9 @@ public:
     /// and the coinbase (0: COINBASE_RESERVE weight only).
     void set_block_size_reserve(uint32_t bytes) { m_reserve_bytes.store(bytes, std::memory_order_relaxed); }
 
+    /// Legacy sigops of the next template's coinbase (0 is taken as given).
+    void set_coinbase_sigop_reserve(uint32_t sigops) { m_coinbase_sigops.store(sigops, std::memory_order_relaxed); }
+
     bool is_synced() const override {
         if (!m_chain.is_synced()) return false;
         if (m_utxo_ready && !m_utxo_ready()) return false;
@@ -402,6 +416,7 @@ private:
     const DOGEChainParams& m_params;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     std::atomic<uint32_t> m_reserve_bytes{0};
+    std::atomic<uint32_t> m_coinbase_sigops{TemplateBuilder::COINBASE_SIGOP_RESERVE};
 };
 
 } // namespace coin

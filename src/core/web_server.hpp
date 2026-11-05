@@ -993,6 +993,30 @@ public:
     static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
     uint32_t coinbase_weight_reserve() const;
     static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
+
+    // Sigop budget (LTC): the legacy sigops (GetLegacySigOpCount; a coinbase
+    // has no other kind) the template's coinbase can carry -- the bound
+    // (coinbase_sigop_bound) of the largest coinbase built for the current
+    // template plus kCoinbaseSigopMargin for a few new payees; before the
+    // first coinbase, one per output max_coinbase_outputs allows plus the
+    // scriptSig's worst case. The embedded template builder keeps the block's
+    // sigop cost within the limit with this reserved.
+    static constexpr uint32_t kCoinbaseSigopMargin = 20;
+    // The per-connection coinbase's scriptSig ends with the 32-byte state
+    // root, not pushed: its bytes parse as opcodes and change with every
+    // template.
+    static constexpr size_t kCoinbaseRawScriptSigTail = 32;
+    uint32_t coinbase_sigop_reserve() const;
+    /// The legacy sigops of coinb1 | extranonce1 | extranonce2 | coinb2
+    /// (the extranonces, 8 bytes in the OP_RETURN push, as zeros: no
+    /// opcode); nullopt when that does not parse as a transaction.
+    static std::optional<uint32_t> coinbase_sigops(const std::string& coinb1, const std::string& coinb2);
+    /// The same with the state root at its worst case, 20 per byte: an upper
+    /// bound for this coinbase whatever its root. With has_state_root the
+    /// scriptSig's last 32 bytes are the root; without (the template's own
+    /// coinbase) the 32 x 20 are added for the root its connections append.
+    static std::optional<uint32_t> coinbase_sigop_bound(const std::string& coinb1, const std::string& coinb2,
+                                                        bool has_state_root);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -1546,9 +1570,11 @@ private:
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
     // A coinbase was built (refresh_work: fresh_template; per connection:
-    // raises the mark): records its weight for coinbase_weight_reserve().
+    // raises the mark): records its weight for coinbase_weight_reserve() and
+    // its sigop bound for coinbase_sigop_reserve(); has_state_root when the
+    // scriptSig ends with the root.
     void note_coinbase_built(const std::string& coinb1, const std::string& coinb2, bool segwit,
-                             size_t branch_len, bool fresh_template) const;
+                             size_t branch_len, bool fresh_template, bool has_state_root) const;
     void close_mweb_hold_window(const char* reason);
     // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
     // (height, code).
@@ -1820,6 +1846,8 @@ private:
     // and the per-connection ones built on it): the next template leaves room
     // for it (coinbase_weight_reserve). 0 = none built yet.
     mutable std::atomic<uint32_t> m_coinbase_weight{0};
+    mutable std::atomic<uint32_t> m_coinbase_sigops{0};
+    mutable std::atomic<bool>     m_coinbase_sigops_known{false};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;

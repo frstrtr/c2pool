@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <core/coin/sigop_cost.hpp>
+
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -89,11 +91,12 @@ MutableTransaction big_tx(uint8_t tag, uint32_t index, size_t outputs)
     for (size_t k = 0; k < outputs; ++k) {
         ltc::coin::TxOut out;
         out.value = 100000000 + static_cast<int64_t>(k);
-        out.scriptPubKey.m_data = {0x76, 0xa9, 0x14};
+        // P2SH (no legacy sigop): the block's size binds here, not its
+        // 20,000-sigop limit.
+        out.scriptPubKey.m_data = {0xa9, 0x14};
         for (int i = 0; i < 20; ++i)
             out.scriptPubKey.m_data.push_back(static_cast<unsigned char>(k + i));
-        out.scriptPubKey.m_data.push_back(0x88);
-        out.scriptPubKey.m_data.push_back(0xac);
+        out.scriptPubKey.m_data.push_back(0x87);
         tx.vout.push_back(out);
     }
     return tx;
@@ -160,8 +163,12 @@ TEST(DogeTemplateBudget, FullTemplateWithAuxPowStaysUnder1MB)
         parent_cb_bytes, parent_branch_len, /*aux_branch_len=*/0,
         static_cast<uint32_t>(doge_cb.size() / 2));
 
+    // The DOGE coinbase's own sigops, as MergedMiningManager counts them.
+    const auto cb_sigops = core::coin::sigops::tx_hex_legacy_sigops(doge_cb);
+    ASSERT_TRUE(cb_sigops);
+    EXPECT_GE(*cb_sigops, 4000u) << "4,000 P2PKH payees";
     auto wd = doge::coin::TemplateBuilder::build_template(
-        c.chain, pool, c.params, doge::coin::TemplateBuilder::tx_weight_budget(reserve));
+        c.chain, pool, c.params, doge::coin::TemplateBuilder::tx_weight_budget(reserve), *cb_sigops);
     ASSERT_TRUE(wd.has_value());
     const auto& txs = wd->m_data["transactions"];
     ASSERT_GT(txs.size(), 10u);
@@ -180,6 +187,12 @@ TEST(DogeTemplateBudget, FullTemplateWithAuxPowStaysUnder1MB)
     EXPECT_LE(bytes, 1'000'000u) << "bad-blk-length (auxpow " << auxpow.size() / 2 << " B, coinbase "
                                  << doge_cb.size() / 2 << " B, " << txs.size() << " txs)";
     EXPECT_GT(bytes, 980'000u) << "the template is still full";
+    // And within dogecoind's 20,000 sigops (legacy here: the txs' P2SH
+    // outputs have none, their inputs spend OP_TRUE coins).
+    uint64_t ops = *cb_sigops;
+    for (const auto& t : txs)
+        ops += core::coin::sigops::tx_hex_legacy_sigops(t["data"].get<std::string>()).value_or(1'000'000);
+    EXPECT_LE(ops, 20'000u) << "bad-blk-sigops";
 }
 
 TEST(DogeTemplateTime, CurtimeNeverAtOrBelowMtp)
