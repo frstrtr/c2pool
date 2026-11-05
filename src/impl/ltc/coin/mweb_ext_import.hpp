@@ -30,19 +30,28 @@
 ///     kernel-count-mismatch, mweb-body-malformed);
 ///   4 the value: peg-in coins == the body's peg-in kernels (litecoind
 ///     ValidatePegInCoins), HogEx vout[1..] == the body's peg-outs as a
-///     multiset (ValidatePegOutCoins), HogAddr value == the tip's HogAddr
-///     value + peg-ins - peg-outs - kernel fees (mweb-amount-mismatch), HogEx
-///     fee == the body's kernel fees (bad-txns-mweb-fee-mismatch); the listed
-///     fees never claim more than the body and G carry;
+///     multiset (ValidatePegOutCoins) and no HogEx output is a pegin script
+///     (bad-tx-unexpected-pegin), HogAddr value == the tip's HogAddr value +
+///     peg-ins - peg-outs - kernel fees (mweb-amount-mismatch), HogEx fee ==
+///     the body's kernel fees (bad-txns-mweb-fee-mismatch); G's fees sum to
+///     its coinbasevalue - subsidy, and the HogEx lists no more than the
+///     kernel fees outside the imported peg-ins;
+///   4f the imported txs against the UTXO view at the tip, in order: every
+///     input unspent there (mature, not a HogAddr) or an output of an
+///     earlier imported tx, inputs cover outputs, and each listed fee is
+///     inputs - outputs plus the tx's peg-in kernel fees from the body;
 ///   5 the carried state: with an empty body the header is exactly
 ///     next_empty_header(tip's header); otherwise its txo count is the tip's
 ///     plus the body's outputs, and the roots no output / no input can
 ///     change are the tip's.
+/// The imported txs are ordered parents first (by their inputs, whatever G's
+/// "depends" says), and a parent another imported tx spends is imported with
+/// it.
 /// What stays trusted (not re-derivable without the MWEB UTXO state): the
 /// body's validity (signatures, range proofs, sums), the new output and
-/// leafset roots and the kernel offset of a non-empty body, and each
-/// imported entry's fee -- the trust --coin-rpc mode places in litecoind for
-/// the whole block, confined to the extension.
+/// leafset roots and the kernel offset of a non-empty body, the body's
+/// kernel fees, and the imported txs' scripts -- the trust --coin-rpc mode
+/// places in litecoind for the whole block, confined to the extension.
 ///
 /// Header-only and pure apart from MwebExtSource, the thread-safe holder of
 /// the latest G and of the /local_stats counters.
@@ -56,6 +65,7 @@
 #include <core/uint256.hpp>
 #include <core/coin/mweb_shape.hpp>
 #include <core/coin/template_txs_check.hpp>
+#include <core/coin/utxo.hpp>
 #include <btclibs/util/strencodings.h>
 
 #include <nlohmann/json.hpp>
@@ -66,6 +76,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -104,13 +115,21 @@ inline constexpr const char* kPegoutMismatch = "pegout-mismatch";
 inline constexpr const char* kHogaddrValueMismatch = "hogaddr-value-mismatch";
 inline constexpr const char* kHogexFeeMismatch = "hogex-fee-mismatch";
 inline constexpr const char* kHogexFeeEntryTooHigh = "hogex-fee-entry-too-high";
-inline constexpr const char* kPeginFeeBelowKernelFee = "pegin-fee-below-kernel-fee";
-inline constexpr const char* kFeeExceedsG = "fee-exceeds-g";
+inline constexpr const char* kHogexPeginOutput = "hogex-pegin-output";
+inline constexpr const char* kGFeeSumMismatch = "g-fee-sum-mismatch";
+inline constexpr const char* kImportedInputMissing = "imported-input-missing";
+inline constexpr const char* kImportedInputImmature = "imported-input-immature";
+inline constexpr const char* kImportedInputHogaddr = "imported-input-hogaddr";
+inline constexpr const char* kImportedInputsBelowOutputs = "imported-inputs-below-outputs";
+inline constexpr const char* kImportedFeeMismatch = "imported-fee-mismatch";
 inline constexpr const char* kCarriedStateMismatch = "carried-state-mismatch";
 inline constexpr const char* kTxoCountMismatch = "txo-count-mismatch";
 // The merged template failed core::coin::check_template_txs / fee-reconcile
 // (prefix; the rule's code follows).
 inline constexpr const char* kMergedCheckPrefix = "merged-";
+// The same template without the extension is refused too: c2pool's own
+// selection failed the check (prefix; the rule's code follows).
+inline constexpr const char* kOwnCheckPrefix = "own-";
 
 // Templates that never import (counted under "skipped").
 inline constexpr const char* kSkipNotFull = "not-full-template";
@@ -156,6 +175,7 @@ struct ExtensionBundle {
     mweb_wire::MwebBodySummary body;
     std::set<Outpoint> spent;        // every input of txs
     std::set<uint256> txids;         // of txs
+    int64_t g_fees{0};               // the sum of every G entry's "fee"
 
     int64_t fee_hogex() const { return hogex.fee; }
     int64_t txs_fee() const
@@ -274,9 +294,20 @@ inline ParseResult parse_extension(const nlohmann::json& g)
                 return fail(kHogexNotLast, "the last entry is not a HogEx");
             shapes[i] = std::move(*t);
             raw[i] = std::move(*bytes);
+            x->g_fees += e["fee"].get<int64_t>();
+            if (!money_range(x->g_fees))
+                return fail(kGMalformed, "fees out of range");
         }
 
-        // Peg-ins and the closure of their in-template parents.
+        // Every canonical entry by txid (a txid twice: malformed).
+        std::map<uint256, size_t> g_of;
+        for (size_t i = 0; i + 1 < n; ++i)
+            if (!g_of.emplace(shapes[i].txid, i).second)
+                return fail(kGMalformed, "entry " + std::to_string(i) + " repeats a txid");
+
+        // Peg-ins and the closure of their in-template parents: by "depends"
+        // and by the inputs themselves (an input another entry creates), so a
+        // parent missing from "depends" still ships, before its child.
         std::vector<bool> take(n, false);
         std::deque<size_t> work;
         for (size_t i = 0; i + 1 < n; ++i) {
@@ -307,6 +338,50 @@ inline ParseResult parse_extension(const nlohmann::json& g)
                 }
             }
         }
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (size_t i = 0; i + 1 < n; ++i) {
+                if (!take[i])
+                    continue;
+                for (const auto& op : shapes[i].prevouts) {
+                    auto p = g_of.find(op.first);
+                    if (p != g_of.end() && !take[p->second]) {
+                        take[p->second] = true;
+                        grew = true;
+                    }
+                }
+            }
+        }
+        // Parents before children, else G's order.
+        std::vector<size_t> order;
+        {
+            std::vector<bool> placed(n, false);
+            size_t want = 0;
+            for (size_t i = 0; i + 1 < n; ++i)
+                want += take[i] ? 1 : 0;
+            while (order.size() < want) {
+                bool progress = false;
+                for (size_t i = 0; i + 1 < n; ++i) {
+                    if (!take[i] || placed[i])
+                        continue;
+                    bool ready = true;
+                    for (const auto& op : shapes[i].prevouts) {
+                        auto p = g_of.find(op.first);
+                        if (p != g_of.end() && !placed[p->second]) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                    if (ready) {
+                        placed[i] = true;
+                        order.push_back(i);
+                        progress = true;
+                    }
+                }
+                if (!progress)
+                    return fail(kGMalformed, "the imported txs spend each other in a cycle");
+            }
+        }
 
         auto make = [&](size_t i, ImportedTx& out) -> std::optional<ParseResult> {
             const auto& e = entries[i];
@@ -333,9 +408,7 @@ inline ParseResult parse_extension(const nlohmann::json& g)
             return std::nullopt;
         };
 
-        for (size_t i = 0; i + 1 < n; ++i) {
-            if (!take[i])
-                continue;
+        for (const size_t i : order) {
             const auto& t = shapes[i];
             if (t.n_vin == 0 || t.n_vout == 0)
                 return fail(kEntryMalformed, "entry " + std::to_string(i) + " has no inputs or outputs");
@@ -397,13 +470,18 @@ struct Failure {
     std::string detail;
 };
 
+/// A coin of the UTXO view at the tip (false: not there).
+using CoinLookup = std::function<bool(const Outpoint&, core::coin::Coin&)>;
+
 /// Checks 0-5 (see the file comment) of `x` against `state`, the tip's MWEB
-/// state (MWEBTracker, captured from the tip block), for a block on
-/// `tip_hash` at `tip_height` + 1 whose subsidy is `subsidy`. nullopt: the
-/// extension may be merged.
+/// state (MWEBTracker, captured from the tip block), and the imported txs'
+/// inputs against `coin_of`, the UTXO view at the tip (check 4f), for a
+/// block on `tip_hash` at `tip_height` + 1 whose subsidy is `subsidy`.
+/// nullopt: the extension may be merged.
 inline std::optional<Failure> check_extension(const ExtensionBundle& x, const MWEBState& state,
                                               const uint256& tip_hash, uint32_t tip_height,
-                                              int64_t subsidy)
+                                              int64_t subsidy, const CoinLookup& coin_of,
+                                              const core::coin::ChainLimits& limits = core::coin::LTC_LIMITS)
 {
     auto fail = [](const char* r, std::string d) { return std::optional<Failure>(Failure{r, std::move(d)}); };
     const uint32_t next_h = tip_height + 1;
@@ -499,6 +577,9 @@ inline std::optional<Failure> check_extension(const ExtensionBundle& x, const MW
             hog_value_out += hog.vout[i].value;
             if (!money_range(hog_value_out))
                 return fail(kPegoutMismatch, "HogEx outputs out of range");
+            // litecoind ContextualCheckBlock: bad-tx-unexpected-pegin.
+            if (mweb_wire::pegin_kernel_of(hog.vout[i].scriptPubKey))
+                return fail(kHogexPeginOutput, "HogEx output " + std::to_string(i) + " is a pegin script");
             if (i > 0)
                 hog_out.emplace(hog.vout[i].value, hog.vout[i].scriptPubKey.m_data);
         }
@@ -538,29 +619,72 @@ inline std::optional<Failure> check_extension(const ExtensionBundle& x, const MW
             return fail(kHogexFeeMismatch, "HogEx fee " + std::to_string(value_in - hog_value_out)
                         + ", kernel fees " + std::to_string(fees));
 
-        // The listed fees. The HogEx lists the MWEB-only txs' fees: at most
-        // the kernel fees outside the imported peg-ins' kernels. A peg-in
-        // lists its canonical fee plus its kernels': at least its peg-in
-        // kernel's. All of them together: at most what G's coinbasevalue
-        // carries.
+        // The listed fees. G's own total is coinbasevalue - subsidy (litecoind
+        // lists every block tx's fee, the HogEx the MWEB-only txs'). The HogEx
+        // lists the MWEB-only txs' fees: at most the kernel fees outside the
+        // imported peg-ins' kernels.
+        if (x.g_fees != x.coinbasevalue - subsidy)
+            return fail(kGFeeSumMismatch, "G's fees " + std::to_string(x.g_fees) + ", coinbasevalue - subsidy "
+                        + std::to_string(x.coinbasevalue - subsidy));
         if (x.hogex.fee > fees - pegin_kernel_fees)
             return fail(kHogexFeeEntryTooHigh, "HogEx fee entry " + std::to_string(x.hogex.fee)
                         + " > kernel fees outside the peg-ins " + std::to_string(fees - pegin_kernel_fees));
-        int64_t listed = x.hogex.fee;
+
+        // 4f. The imported txs against the UTXO view at the tip, in order:
+        // every input unspent there (mature at the next height, not a HogAddr)
+        // or an output of an earlier imported tx; the canonical fee is
+        // inputs - outputs, and the listed fee must be it plus the fees of the
+        // tx's peg-in kernels (from the body): litecoind's number is not
+        // used unchecked.
+        std::map<Outpoint, int64_t> created;
         for (const auto& t : x.txs) {
+            int64_t in_sum = 0;
+            for (const auto& op : t.prevouts) {
+                int64_t v = 0;
+                if (auto c = created.find(op); c != created.end()) {
+                    v = c->second;
+                } else {
+                    if (op.first == state.prev_hogex_txid && op.second == state.prev_hogex_vout)
+                        return fail(kImportedInputHogaddr, "entry " + std::to_string(t.g_index) + " spends the HogEx's input");
+                    core::coin::Coin coin;
+                    if (!coin_of || !coin_of(op, coin))
+                        return fail(kImportedInputMissing, "entry " + std::to_string(t.g_index) + " input "
+                                    + op.first.GetHex().substr(0, 16) + ":" + std::to_string(op.second)
+                                    + " neither in the view nor an earlier imported tx's");
+                    if (mweb_wire::is_hogaddr(coin.scriptPubKey))
+                        return fail(kImportedInputHogaddr, "entry " + std::to_string(t.g_index) + " spends a HogAddr");
+                    if (!coin.is_mature(next_h, limits))
+                        return fail(kImportedInputImmature, "entry " + std::to_string(t.g_index) + " input "
+                                    + op.first.GetHex().substr(0, 16) + ":" + std::to_string(op.second));
+                    v = coin.value;
+                }
+                if (!money_range(v))
+                    return fail(kImportedInputsBelowOutputs, "an input out of range");
+                in_sum += v;
+                if (!money_range(in_sum))
+                    return fail(kImportedInputsBelowOutputs, "inputs out of range");
+            }
+            int64_t out_sum = 0;
             int64_t own_kernel_fees = 0;
-            for (const auto& [value, spk] : t.vout)
+            for (const auto& [value, spk] : t.vout) {
+                out_sum += value;  // each output and the sum are in range (pegin coins above, the walk)
+                if (!money_range(value) || !money_range(out_sum))
+                    return fail(kImportedInputsBelowOutputs, "outputs out of range");
                 if (auto id = mweb_wire::pegin_kernel_of(std::span<const unsigned char>(spk.data(), spk.size())))
                     if (auto k = kernel_fee.find(*id); k != kernel_fee.end())
                         own_kernel_fees += k->second;
-            if (t.fee < own_kernel_fees)
-                return fail(kPeginFeeBelowKernelFee, "entry " + std::to_string(t.g_index) + " fee "
-                            + std::to_string(t.fee) + " < its peg-in kernel fee " + std::to_string(own_kernel_fees));
-            listed += t.fee;
+            }
+            if (in_sum < out_sum)
+                return fail(kImportedInputsBelowOutputs, "entry " + std::to_string(t.g_index) + ": inputs "
+                            + std::to_string(in_sum) + " < outputs " + std::to_string(out_sum));
+            const int64_t computed = in_sum - out_sum + own_kernel_fees;
+            if (t.fee != computed)
+                return fail(kImportedFeeMismatch, "entry " + std::to_string(t.g_index) + " lists "
+                            + std::to_string(t.fee) + ", inputs - outputs + its peg-in kernel fees = "
+                            + std::to_string(computed));
+            for (uint32_t n = 0; n < t.vout.size(); ++n)
+                created[{t.txid, n}] = t.vout[n].first;
         }
-        if (listed > x.coinbasevalue - subsidy)
-            return fail(kFeeExceedsG, "imported fees " + std::to_string(listed) + " > G fees "
-                        + std::to_string(x.coinbasevalue - subsidy));
     }
 
     // 5. The carried state.

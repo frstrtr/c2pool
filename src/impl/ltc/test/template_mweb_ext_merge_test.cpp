@@ -22,8 +22,12 @@
 //     it) never imports, nor one without the tip's MWEB state;
 //   - a merged template failing check_template_txs falls back;
 //   - the selection budget leaves room for the imported txs;
+//   - the coinbase is exactly what litecoind's ConnectBlock allows (its
+//     nFees recomputed over the template's bytes and the view);
 //   - the selection reserves litecoind's HogEx inputs too: a pool tx
-//     spending the tip's HogAddr never rides along.
+//     spending the tip's HogAddr never rides along;
+//   - every imported fee is recomputed from the view: any listed fee off it
+//     falls back; a parent missing from "depends" ships first.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -100,6 +104,7 @@ struct LitecoindG {
     int64_t q_fee = 15'000;
     int64_t hogex_fee = 2'540;
     int64_t cbv_delta = 0;  // G's coinbasevalue off its fees
+    bool pegin_depends = true;
     uint256 prev = u256(xf::kHash3200604);
 
     LitecoindG()
@@ -153,7 +158,7 @@ struct LitecoindG {
         const std::vector<E> es = {
             {tx_hex(p), p_fee, {}},
             {q, q_fee, {}},
-            {tx_hex(pegin), pegin_fee, {1}},
+            {tx_hex(pegin), pegin_fee, pegin_depends ? std::vector<int>{1} : std::vector<int>{}},
             {MWEBBuilder::serialize_hogex_hex(hogex), hogex_fee, {}},
         };
         nlohmann::json txs = nlohmann::json::array();
@@ -297,7 +302,6 @@ CoreFees core_nfees(const nlohmann::json& d, core::coin::UTXOViewCache& view, co
     return r;
 }
 
-
 } // namespace
 
 // none: the S0+S1 head's templates, byte for byte; a source in mode none is
@@ -354,6 +358,10 @@ TEST(LtcTemplateMwebExtMerge, MergedTemplateCarriesLitecoindsExtension)
     for (const auto& e : d["transactions"])
         listed += e["fee"].get<int64_t>();
     EXPECT_EQ(d["coinbasevalue"].get<int64_t>(), kSubsidy + listed);
+    // ... which is exactly what litecoind's ConnectBlock allows.
+    const auto cf = core_nfees(d, *t.view.cache, *t.tracker.get_state());
+    ASSERT_TRUE(cf.nfees) << cf.why;
+    EXPECT_EQ(d["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees);
     // The stratum merkle branches and the block use the same txs.
     ASSERT_EQ(wd->m_hashes.size(), 5u);
     for (size_t i = 0; i < 5; ++i)
@@ -392,7 +400,10 @@ TEST(LtcTemplateMwebExtMerge, EveryFallbackIsTheEmptyBodyTemplate)
              g.header.output_mmr_size = 381309;
              commit(g.hogex, g.header);
          }},
-        {mx::kFeeExceedsG, [](LitecoindG& g) { g.cbv_delta = -(g.q_fee + 1); }},
+        {mx::kGFeeSumMismatch, [](LitecoindG& g) { g.cbv_delta = -(g.q_fee + 1); }},
+        {mx::kImportedFeeMismatch, [](LitecoindG& g) {
+             g.p_fee += 1'000'000;  // G's coinbasevalue carries it
+         }},
     };
     for (const auto& k : cases) {
         Tip t;
@@ -465,9 +476,10 @@ TEST(LtcTemplateMwebExtMerge, OnlyAFullTemplateImports)
         EXPECT_EQ(src.skipped_count(mx::kSkipNotFull), 1u);
     }
     {
-        // An empty pool cleaned for the tip, the view at it: litecoind's
-        // extension alone.
+        // An empty pool cleaned for the tip, the view at it (holding P's
+        // input): litecoind's extension alone.
         Tip t;
+        t.view.add(fund(10), 0, 1'000'000'000);
         mx::MwebExtSource src("litecoind");
         source(src);
         auto wd = t.build(&src);
@@ -490,9 +502,9 @@ TEST(LtcTemplateMwebExtMerge, OnlyAFullTemplateImports)
     }
 }
 
-// A merged template that fails check_template_txs (a bundle whose txid
-// field disagrees with its tx; parse_extension never yields one) is not
-// served: the template without the extension is.
+// A merged template that fails check_template_txs (a bundle whose bytes
+// disagree with its txid; parse_extension never yields one) is not served:
+// the template without the extension is.
 TEST(LtcTemplateMwebExtMerge, MergedCheckFailureFallsBack)
 {
     Tip t;
@@ -502,12 +514,17 @@ TEST(LtcTemplateMwebExtMerge, MergedCheckFailureFallsBack)
     ASSERT_TRUE(parsed.bundle);
     auto forged = std::make_shared<mx::ExtensionBundle>(*parsed.bundle);
     ASSERT_FALSE(forged->txs[0].pegin);
-    forged->txs[0].txid.data()[0] ^= 1;  // P's "txid" (check_extension does not read it)
+    // P's bytes swapped for another tx's, its txid, inputs and outputs kept
+    // (check_extension reads those, the template the bytes).
+    forged->txs[0].hex = tx_hex(spend(fund(11), 0, 1'000, 99));
     mx::ParseResult pr;
     pr.bundle = forged;
     mx::MwebExtSource src("litecoind");
     src.set_parsed(std::move(pr), mx::MwebExtSource::clock::now());
-    ASSERT_FALSE(mx::check_extension(*forged, *t.tracker.get_state(), hash_of(t.hdr), xf::kHeight3200604, kSubsidy));
+    ASSERT_FALSE(mx::check_extension(*forged, *t.tracker.get_state(), hash_of(t.hdr), xf::kHeight3200604, kSubsidy,
+                                     [&t](const mx::Outpoint& op, core::coin::Coin& c) {
+                                         return t.view.cache->get_coin(core::coin::Outpoint(op.first, op.second), c);
+                                     }));
 
     auto with = t.build(&src);
     auto without = t.build(nullptr);
@@ -564,4 +581,73 @@ TEST(LtcTemplateMwebExtMerge, SelectionReservesTheHogexInputsWithTheExtension)
         EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees) << "with_ext=" << with_ext;
         (void)hogaddr_spk;
     }
+}
+
+// Each imported tx's fee is recomputed from the UTXO view (inputs -
+// outputs, plus its peg-in kernel fees from the body): a listed fee off by
+// any amount, inside or beyond what G's coinbasevalue carries, gives the
+// empty-body template, never a coinbase above what litecoind allows.
+TEST(LtcTemplateMwebExtMerge, ImportedFeesAreRecomputedFromTheView)
+{
+    struct Case {
+        const char* reason;
+        std::function<void(LitecoindG&)> mutate;
+    };
+    const std::vector<Case> cases = {
+        // P listed at 1,010,000, priced at 10,000; coinbasevalue carries it.
+        {mx::kImportedFeeMismatch, [](LitecoindG& g) { g.p_fee += 1'000'000; }},
+        // The peg-in listed 15,000 above, within the slack of Q's fee: G's
+        // coinbasevalue as an honest litecoind prints it.
+        {mx::kGFeeSumMismatch, [](LitecoindG& g) {
+             g.pegin_fee += 15'000;
+             g.cbv_delta = -15'000;
+         }},
+        // The same with coinbasevalue following the listed fees.
+        {mx::kImportedFeeMismatch, [](LitecoindG& g) { g.pegin_fee += 15'000; }},
+        // Listed below: refused as well (the number is litecoind's, not ours).
+        {mx::kImportedFeeMismatch, [](LitecoindG& g) { g.pegin_fee -= 1; }},
+    };
+    for (const auto& k : cases) {
+        Tip t;
+        LitecoindG g;
+        fill(t, g);
+        k.mutate(g);
+        mx::MwebExtSource src("litecoind");
+        src.set_parsed(mx::parse_extension(g.json()), mx::MwebExtSource::clock::now());
+        ASSERT_TRUE(src.current().bundle) << k.reason;
+        auto with = t.build(&src);
+        auto without = t.build(nullptr);
+        ASSERT_TRUE(with && without);
+        EXPECT_EQ(src.templates_imported(), 0u) << k.reason;
+        EXPECT_EQ(src.fallback_count(k.reason), 1u) << k.reason;
+        EXPECT_EQ(template_dump(*with), template_dump(*without)) << k.reason;
+        const auto cf = core_nfees(with->m_data, *t.view.cache, *t.tracker.get_state());
+        ASSERT_TRUE(cf.nfees) << cf.why;
+        EXPECT_EQ(with->m_data["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees) << k.reason;
+    }
+}
+
+// A peg-in whose parent P is missing from its "depends": P is imported all
+// the same (the peg-in spends it), first; our own copy of P is not selected
+// after it. The block is one litecoind accepts.
+TEST(LtcTemplateMwebExtMerge, ImportedParentsShipFirstWithoutDepends)
+{
+    Tip t;
+    LitecoindG g;
+    g.pegin_depends = false;
+    fill(t, g);
+    mx::MwebExtSource src("litecoind");
+    src.set_parsed(mx::parse_extension(g.json()), mx::MwebExtSource::clock::now());
+    auto wd = t.build(&src);
+    ASSERT_TRUE(wd);
+    ASSERT_EQ(src.templates_imported(), 1u);
+    const auto ids = txids_of(*wd);
+    ASSERT_GE(ids.size(), 3u);
+    EXPECT_EQ(ids[0], compute_txid(g.p).GetHex());
+    EXPECT_EQ(ids[1], compute_txid(g.pegin).GetHex());
+    EXPECT_EQ(std::count(ids.begin(), ids.end(), compute_txid(g.p).GetHex()), 1);
+    EXPECT_FALSE(core::coin::check_template_txs(wd->m_data));
+    const auto cf = core_nfees(wd->m_data, *t.view.cache, *t.tracker.get_state());
+    ASSERT_TRUE(cf.nfees) << cf.why;
+    EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees);
 }

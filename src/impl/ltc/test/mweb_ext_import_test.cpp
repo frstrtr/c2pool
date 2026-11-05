@@ -14,13 +14,16 @@
 //     two outputs) imports the peg-in alone, not an unrelated tx; each check
 //     refuses its own mutation (prev, prev HogEx, peg-ins missing / extra /
 //     out of order, commitment, height, kernel count, peg-in coins, peg-outs,
-//     HogAddr value, listed fees, txo count) and the parse refuses malformed
-//     templates;
+//     HogAddr value, a pegin script among the HogEx outputs, G's fee sum,
+//     the HogEx's listed fee, txo count), and the peg-in against the view
+//     (its fee recomputed, an input missing / immature / a HogAddr / worth
+//     less than the outputs); the parse refuses malformed templates;
 //   - block 3200603 (6 inputs, 2 outputs, a 25 LTC peg-out) as a template on
 //     the state of 3200602 DERIVED from the real block 3200601 (3200602's
 //     body was empty): c2pool's own empty-body HogEx for 3200602 is the txid
 //     3200603 spends, and every check passes on real values;
-//   - a peg-in's in-template ancestors ship with it (G "depends");
+//   - a peg-in's in-template ancestors ship with it, first: by G "depends"
+//     and by its inputs, whatever G's order;
 //   - MwebExtSource's /local_stats block in both modes.
 // ---------------------------------------------------------------------------
 
@@ -29,6 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -202,12 +206,52 @@ std::shared_ptr<const mx::ExtensionBundle> parse_ok(const nlohmann::json& g)
     return r.bundle;
 }
 
-std::string check_3200601(const G3200601& g, const MWEBState& st = state_3200600())
+// A UTXO view for check 4f: outpoint -> coin.
+using Coins = std::map<mx::Outpoint, core::coin::Coin>;
+
+core::coin::Coin coin_of_value(int64_t value, std::vector<unsigned char> spk = {0x51}, uint32_t height = 1,
+                               bool coinbase = false)
+{
+    core::coin::Coin c;
+    c.value = value;
+    c.scriptPubKey.m_data = std::move(spk);
+    c.height = height;
+    c.coinbase = coinbase;
+    return c;
+}
+
+mx::CoinLookup lookup(const Coins& coins)
+{
+    return [coins](const mx::Outpoint& op, core::coin::Coin& c) {
+        auto it = coins.find(op);
+        if (it == coins.end())
+            return false;
+        c = it->second;
+        return true;
+    };
+}
+
+// The three coins the real peg-in 92dd3109.. spends, as the view at 3200600
+// would hold them. Their values are not among the captures: these sum to
+// the peg-in output plus a canonical fee of 1,880, which G3200601 lists.
+Coins coins_3200600()
+{
+    const MutableTransaction pegin = tx_from_hex(xf::kPeginTx3200601Hex);
+    Coins c;
+    const int64_t in[3] = {300'000'000, 200'000'000, xf::kPegin3200601 + 1'880 - 500'000'000};
+    for (size_t i = 0; i < 3; ++i)
+        c[{pegin.vin[i].prevout.hash, pegin.vin[i].prevout.index}] = coin_of_value(in[i]);
+    return c;
+}
+
+std::string check_3200601(const G3200601& g, const MWEBState& st = state_3200600(),
+                          const Coins& coins = coins_3200600())
 {
     auto r = mx::parse_extension(g.json());
     if (!r.bundle)
         return "parse:" + r.reason;
-    auto f = mx::check_extension(*r.bundle, st, u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy);
+    auto f = mx::check_extension(*r.bundle, st, u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy,
+                                 lookup(coins));
     return f ? f->reason : std::string("ok");
 }
 
@@ -231,7 +275,8 @@ TEST(LtcMwebExtImport, RealGbt3200605OnTheRealTip3200604)
     EXPECT_TRUE(x->txs.empty()) << "no peg-in: nothing but the HogEx is imported";
     EXPECT_TRUE(x->body_empty());
     EXPECT_EQ(x->fee_hogex(), 0);
-    EXPECT_FALSE(mx::check_extension(*x, *st, st->captured_block_hash, xf::kHeight3200604, kSubsidy));
+    EXPECT_FALSE(mx::check_extension(*x, *st, st->captured_block_hash, xf::kHeight3200604, kSubsidy, {}))
+        << "no imported tx: the view is not asked";
 
     const auto own = MWEBBuilder::build_hogex(*st, 3200605);
     EXPECT_EQ(x->hogex.hex, MWEBBuilder::serialize_hogex_hex(own)) << "litecoind's HogEx == c2pool's own";
@@ -253,7 +298,7 @@ TEST(LtcMwebExtImport, RealGbt3200605OnTheRealTip3200604)
     g["mweb"] = mweb_hex(m.header, m.body);
     auto bad = parse_ok(g);
     ASSERT_TRUE(bad);
-    auto f = mx::check_extension(*bad, *st, st->captured_block_hash, xf::kHeight3200604, kSubsidy);
+    auto f = mx::check_extension(*bad, *st, st->captured_block_hash, xf::kHeight3200604, kSubsidy, {});
     ASSERT_TRUE(f);
     EXPECT_EQ(f->reason, mx::kCarriedStateMismatch);
 }
@@ -352,17 +397,51 @@ TEST(LtcMwebExtImport, Block3200601PeginAndPegoutAndEveryCheck)
         p.pegin.vout[0].value -= 1;
         p.hogex.vin[1].prevout.hash = compute_txid(p.pegin);
         EXPECT_EQ(check_3200601(p), mx::kPeginKernelMismatch);
-        // The listed fees: the HogEx's above the kernel fees outside the
-        // peg-in, the peg-in's below its kernel fee, together above G's.
+        // A HogEx output paying a pegin script (bad-tx-unexpected-pegin),
+        // the body's peg-out unchanged.
+        G3200601 q;
+        TxOut extra;
+        extra.value = 0;
+        extra.scriptPubKey = q.pegin.vout[0].scriptPubKey;
+        q.hogex.vout.push_back(extra);
+        EXPECT_EQ(check_3200601(q), mx::kHogexPeginOutput);
+        // The listed fees: G's own sum off its coinbasevalue; the HogEx's
+        // above the kernel fees outside the peg-in.
+        G3200601 c;
+        c.coinbasevalue = kSubsidy + c.unrelated_fee + c.pegin_fee + c.hogex_fee - 1;
+        EXPECT_EQ(check_3200601(c), mx::kGFeeSumMismatch);
         G3200601 f;
         f.hogex_fee += 1;
         EXPECT_EQ(check_3200601(f), mx::kHogexFeeEntryTooHigh);
+    }
+    // 4f. The peg-in against the view: its listed fee is inputs - outputs +
+    // its peg-in kernel fee, one satoshi either way is refused (G's sum
+    // kept consistent); an input missing from the view, immature, a
+    // HogAddr, or worth less than the outputs is refused.
+    {
+        for (int64_t d : {+1, -1}) {
+            G3200601 g;
+            g.pegin_fee += d;
+            EXPECT_EQ(check_3200601(g), mx::kImportedFeeMismatch) << d;
+        }
         G3200601 k;
         k.pegin_fee = xf::kPeginKernelFee3200601 - 1;
-        EXPECT_EQ(check_3200601(k), mx::kPeginFeeBelowKernelFee);
-        G3200601 c;
-        c.coinbasevalue = kSubsidy + c.pegin_fee + c.hogex_fee - 1;
-        EXPECT_EQ(check_3200601(c), mx::kFeeExceedsG);
+        EXPECT_EQ(check_3200601(k), mx::kImportedFeeMismatch) << "below its own kernel fee";
+        const MutableTransaction pegin = tx_from_hex(xf::kPeginTx3200601Hex);
+        const mx::Outpoint in2{pegin.vin[2].prevout.hash, pegin.vin[2].prevout.index};
+        Coins missing = coins_3200600();
+        missing.erase(in2);
+        EXPECT_EQ(check_3200601(G3200601{}, state_3200600(), missing), mx::kImportedInputMissing);
+        Coins immature = coins_3200600();
+        immature[in2].coinbase = true;
+        immature[in2].height = xf::kHeight3200601 - 50;
+        EXPECT_EQ(check_3200601(G3200601{}, state_3200600(), immature), mx::kImportedInputImmature);
+        Coins hogaddr = coins_3200600();
+        hogaddr[in2].scriptPubKey = tx_from_hex(tf::kBlock3200601HogexHex).vout[0].scriptPubKey;
+        EXPECT_EQ(check_3200601(G3200601{}, state_3200600(), hogaddr), mx::kImportedInputHogaddr);
+        Coins short_in = coins_3200600();
+        short_in[in2].value -= 10'000;
+        EXPECT_EQ(check_3200601(G3200601{}, state_3200600(), short_in), mx::kImportedInputsBelowOutputs);
     }
     // 5. A txo count that is not the parent's plus the body's outputs.
     {
@@ -481,13 +560,13 @@ TEST(LtcMwebExtImport, Block3200603OnTheStateDerivedFrom3200601)
     EXPECT_EQ(x->body.n_inputs, 6u);
     EXPECT_EQ(x->body.n_outputs, 2u);
     EXPECT_EQ(x->header.output_mmr_size, 381309u);
-    auto f = mx::check_extension(*x, s602, u256(xf::kHash3200602), xf::kHeight3200601 + 1, kSubsidy);
+    auto f = mx::check_extension(*x, s602, u256(xf::kHash3200602), xf::kHeight3200601 + 1, kSubsidy, {});
     EXPECT_FALSE(f) << f->reason << ": " << f->detail;
     EXPECT_EQ(x->hogex_tx.vout[0].value, tf::kBlock3200603HogaddrValue);
     EXPECT_EQ(s602.hogaddr_value - xf::kPegout3200603 - xf::kKernelFees3200603, tf::kBlock3200603HogaddrValue);
 
     // The same G on 3200601's state (one block too early) is refused.
-    auto early = mx::check_extension(*x, s601, u256(xf::kHash3200602), xf::kHeight3200601 + 1, kSubsidy);
+    auto early = mx::check_extension(*x, s601, u256(xf::kHash3200602), xf::kHeight3200601 + 1, kSubsidy, {});
     ASSERT_TRUE(early);
     EXPECT_EQ(early->reason, mx::kStateNotForTip);
 }
@@ -522,7 +601,39 @@ TEST(LtcMwebExtImport, PeginAncestorsShipWithIt)
     EXPECT_EQ(x->spent.count({fund(9), 0}), 1u);
     EXPECT_EQ(x->spent.count({compute_txid(p), 0}), 1u);
     EXPECT_EQ(x->txs_fee(), 500 + pegin_fee);
-    EXPECT_FALSE(mx::check_extension(*x, state_3200600(), u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy));
+    const Coins coins = {{{fund(9), 0}, coin_of_value(600'000'500)}};
+    EXPECT_FALSE(mx::check_extension(*x, state_3200600(), u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy,
+                                     lookup(coins)));
+
+    // The same G with the peg-in BEFORE its parent and no "depends": the
+    // parent is still imported (the peg-in spends it), and first.
+    auto swapped = make_g(u256(xf::kHash3200600), xf::kHeight3200601,
+                          kSubsidy + 500 + pegin_fee + 15000 + xf::kPegoutKernelFee3200601,
+                          {{tx_hex(pegin), pegin_fee, {}, {}, {}},
+                           {unrelated_tx(), 15000, {}, {}, {}},
+                           {tx_hex(p), 500, {}, {}, {}},
+                           {hogex_hex(hogex), xf::kPegoutKernelFee3200601, {}, {}, {}}},
+                          mweb_hex(m.header, m.body));
+    auto y = parse_ok(swapped);
+    ASSERT_TRUE(y);
+    ASSERT_EQ(y->txs.size(), 2u);
+    EXPECT_EQ(y->txs[0].txid, compute_txid(p)) << "parents first, whatever G's order";
+    EXPECT_EQ(y->txs[1].txid, compute_txid(pegin));
+    EXPECT_FALSE(mx::check_extension(*y, state_3200600(), u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy,
+                                     lookup(coins)));
+    // Without the view's coin for P's input the import is refused.
+    auto f = mx::check_extension(*y, state_3200600(), u256(xf::kHash3200600), xf::kHeight3200601 - 1, kSubsidy, {});
+    ASSERT_TRUE(f);
+    EXPECT_EQ(f->reason, mx::kImportedInputMissing);
+    // A tx listed twice is malformed.
+    auto twice = make_g(u256(xf::kHash3200600), xf::kHeight3200601,
+                        kSubsidy + 1000 + pegin_fee + xf::kPegoutKernelFee3200601,
+                        {{tx_hex(p), 500, {}, {}, {}},
+                         {tx_hex(p), 500, {}, {}, {}},
+                         {tx_hex(pegin), pegin_fee, {1}, {}, {}},
+                         {hogex_hex(hogex), xf::kPegoutKernelFee3200601, {}, {}, {}}},
+                        mweb_hex(m.header, m.body));
+    EXPECT_EQ(mx::parse_extension(twice).reason, mx::kGMalformed);
 }
 
 // ─── the source and its /local_stats block ──────────────────────────────────

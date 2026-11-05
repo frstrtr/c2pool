@@ -367,8 +367,11 @@ public:
                 if (!cur.bundle)
                     why = mweb_ext::Failure{cur.reason, cur.detail};
                 else
-                    why = mweb_ext::check_extension(*cur.bundle, *mweb_state, tip.block_hash, tip.height,
-                                                    static_cast<int64_t>(subsidy));
+                    why = mweb_ext::check_extension(
+                        *cur.bundle, *mweb_state, tip.block_hash, tip.height, static_cast<int64_t>(subsidy),
+                        [view = pool.utxo()](const mweb_ext::Outpoint& op, core::coin::Coin& coin) {
+                            return view && view->get_coin(core::coin::Outpoint(op.first, op.second), coin);
+                        });
                 if (why) {
                     ext_outcome.kind = mweb_ext::Outcome::fallback;
                     ext_outcome.reason = why->reason;
@@ -431,6 +434,9 @@ public:
         }
 
         uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
+        if (ext)
+            for (const auto& t : ext->txs)
+                selected_bytes += t.hex.size() / 2;  // litecoind's txs fill it too
         for (const auto& stx : selected_txs) {
             uint256     txid     = compute_txid(stx.tx);
             auto        packed   = pack(TX_WITH_WITNESS(stx.tx));
@@ -602,14 +608,20 @@ public:
         if (refusal && ext) {
             // Never a template with litecoind's extension that fails a check:
             // the same template without it (the empty body, c2pool's HogEx).
+            // When that one is refused too, the failure was c2pool's own
+            // selection, not the extension (own-<code>).
             if (ext_outcome.reason.empty()) {
                 ext_outcome.reason = std::string(mweb_ext::kMergedCheckPrefix) + "shape";
                 ext_outcome.detail = *refusal;
             }
+            auto without = build_template(chain, pool, is_testnet, mweb_tracker, max_weight, refused,
+                                          template_tx_check_strict, nullptr);
+            if (!without)
+                ext_outcome.reason = std::string(mweb_ext::kOwnCheckPrefix)
+                                   + ext_outcome.reason.substr(std::string(mweb_ext::kMergedCheckPrefix).size());
             ext_outcome.kind = mweb_ext::Outcome::fallback;
             mweb_ext->note(next_h, ext_outcome);
-            return build_template(chain, pool, is_testnet, mweb_tracker, max_weight, refused,
-                                  template_tx_check_strict, nullptr);
+            return without;
         }
         if (mweb_ext) {
             if (ext) {
