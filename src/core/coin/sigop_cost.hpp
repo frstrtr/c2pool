@@ -24,6 +24,7 @@
 // Header-only and pure over bytes, so the KATs pin it directly.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -223,7 +224,13 @@ inline unsigned witness_sigops(Bytes script_sig, Bytes prevout_spk,
 /// every scriptSig and scriptPubKey): what a coinbase costs, x scale. The
 /// witness and MWEB parts carry none and are not read. nullopt when the hex
 /// does not parse.
-inline std::optional<unsigned> tx_hex_legacy_sigops(std::string_view hex)
+/// With `worst_tail_bytes` the last that many bytes of the first input's
+/// scriptSig count at their worst case (MAX_PUBKEYS_PER_MULTISIG each, as if
+/// every one were CHECKMULTISIG) and the rest is counted alone: an upper
+/// bound for any value of those bytes. The ops that start before the tail
+/// parse the same either way (a push running into it ends the shorter parse
+/// and counts 0); each op that starts in the tail counts at most 20.
+inline std::optional<unsigned> tx_hex_legacy_sigops(std::string_view hex, size_t worst_tail_bytes = 0)
 {
     auto nib = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
@@ -276,8 +283,11 @@ inline std::optional<unsigned> tx_hex_legacy_sigops(std::string_view hex)
         p += 36;
         if (!compact(len) || !need(len))
             return std::nullopt;
-        n += script_sigops(Bytes(b.data() + p, static_cast<size_t>(len)), false);
-        p += static_cast<size_t>(len);
+        const size_t l = static_cast<size_t>(len);
+        const size_t tail = i == 0 ? std::min(worst_tail_bytes, l) : 0;
+        n += script_sigops(Bytes(b.data() + p, l - tail), false)
+           + static_cast<unsigned>(tail) * MAX_PUBKEYS_PER_MULTISIG;
+        p += l;
         if (!need(4))
             return std::nullopt;
         p += 4;
