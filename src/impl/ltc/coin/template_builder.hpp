@@ -383,21 +383,25 @@ public:
         // Only txs final in this block and spendable in it: IsFinalTx and
         // coinbase maturity at next_h, the lock time against the tip's median
         // time past (litecoind BlockAssembler's nLockTimeCutoff).
-        // With litecoind's extension the selection starts from its txs: no
-        // pool tx spends what they spend or repeats one of them, and the
-        // budget leaves room for them and their HogEx.
-        std::optional<Mempool::SelectionSeed> seed;
+        // The HogEx appended below spends the tip's HogEx output 0 (its
+        // vin[0]): the selection starts with that outpoint spent, so no pool
+        // tx spends it too (bad-txns-inputs-missingorspent).
+        Mempool::SelectionSeed seed;
+        if (mweb_state)
+            seed.consumed.emplace(mweb_state->prev_hogex_txid, mweb_state->prev_hogex_vout);
+        // With litecoind's extension the selection also starts from its txs
+        // and its HogEx's inputs: no pool tx spends what they spend or repeats
+        // one of them, and the budget leaves room for them and their HogEx.
         uint32_t select_weight = max_weight;
         if (ext) {
-            seed.emplace();
-            seed->consumed = ext->spent;
-            seed->in_template = ext->txids;
+            seed.consumed.insert(ext->hogex.prevouts.begin(), ext->hogex.prevouts.end());
+            seed.consumed.insert(ext->spent.begin(), ext->spent.end());
+            seed.in_template = ext->txids;
             const uint64_t w = ext->weight();
             select_weight = w < max_weight ? static_cast<uint32_t>(max_weight - w) : 0;
         }
         auto [selected_txs, total_fees] = degraded == nullptr
-            ? pool.get_sorted_txs_with_fees(select_weight, LockTimeCutoff{next_h, mtp},
-                                            seed ? &*seed : nullptr)
+            ? pool.get_sorted_txs_with_fees(select_weight, LockTimeCutoff{next_h, mtp}, &seed)
             : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees

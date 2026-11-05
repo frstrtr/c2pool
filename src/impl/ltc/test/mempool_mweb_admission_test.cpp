@@ -224,6 +224,20 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
         pool.set_tip_height(0);
     }
 
+    // A HogAddr input (a HogEx output 0, which only the next block's HogEx
+    // spends): refused, not pooled.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin hog;
+        hog.value = 5000000000LL;
+        hog.scriptPubKey.m_data = hogaddr_spk;
+        hog.height = 99;
+        view.add_coin(core::coin::Outpoint(pay(0x0a, 1000).vin[0].prevout.hash, 0), hog);
+        r = pool.admit(pay(0x0a, 1000), &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::hogaddr_spend);
+    }
+
     // An input in neither the set nor the pool, the set built from genesis:
     // an orphan (outside the pool).
     {

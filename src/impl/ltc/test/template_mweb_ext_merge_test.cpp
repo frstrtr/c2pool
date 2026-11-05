@@ -21,7 +21,9 @@
 //   - a degraded template (the view behind the tip, the pool not cleaned for
 //     it) never imports, nor one without the tip's MWEB state;
 //   - a merged template failing check_template_txs falls back;
-//   - the selection budget leaves room for the imported txs.
+//   - the selection budget leaves room for the imported txs;
+//   - the selection reserves litecoind's HogEx inputs too: a pool tx
+//     spending the tip's HogAddr never rides along.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -30,7 +32,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -227,6 +231,72 @@ std::vector<std::string> txids_of(const rpc::WorkData& wd)
 }
 
 const std::string kOwnHogex3200605 = "48c7ebb937e2a26cce9ea47dead179ed5f8ca8242e8282c1dd4c7f2355d59239";
+
+// litecoind ConnectBlock's nFees over the template's bytes
+// (Consensus::CheckTxInputs per tx: inputs from the view or earlier txs of
+// the block; the HogEx's vin[0] is the tip's HogAddr, worth the state's
+// value). nullopt with the reason when an input is neither, an outpoint is
+// spent twice, or a tx's inputs are below its outputs.
+struct CoreFees {
+    std::optional<int64_t> nfees;
+    std::string why;
+};
+CoreFees core_nfees(const nlohmann::json& d, core::coin::UTXOViewCache& view, const MWEBState& st)
+{
+    CoreFees r;
+    std::map<std::pair<uint256, uint32_t>, int64_t> created;
+    std::set<std::pair<uint256, uint32_t>> spent;
+    int64_t total = 0;
+    const auto& txs = d["transactions"];
+    for (size_t i = 0; i < txs.size(); ++i) {
+        auto t = core::coin::walk_tx_hex(txs[i]["data"].get<std::string>());
+        if (!t) {
+            r.why = "undecodable " + std::to_string(i);
+            return r;
+        }
+        const bool hogex = (t->flags & 0x08) != 0;
+        int64_t in = 0;
+        for (size_t k = 0; k < t->prevouts.size(); ++k) {
+            const auto& op = t->prevouts[k];
+            if (!spent.insert(op).second) {
+                r.why = "double spend at tx " + std::to_string(i);
+                return r;
+            }
+            if (hogex && k == 0) {
+                if (op.first != st.prev_hogex_txid || op.second != 0) {
+                    r.why = "hogex vin0";
+                    return r;
+                }
+                in += st.hogaddr_value;
+                continue;
+            }
+            if (auto c = created.find(op); c != created.end()) {
+                in += c->second;
+                continue;
+            }
+            core::coin::Coin coin;
+            if (view.get_coin(core::coin::Outpoint(op.first, op.second), coin)) {
+                in += coin.value;
+                continue;
+            }
+            r.why = "missing input at tx " + std::to_string(i);
+            return r;
+        }
+        int64_t out = 0;
+        for (const auto& [v, spk] : t->vout)
+            out += v;
+        if (in < out) {
+            r.why = "in below out at tx " + std::to_string(i);
+            return r;
+        }
+        total += in - out;
+        for (uint32_t n = 0; n < t->vout.size(); ++n)
+            created[{t->txid, n}] = t->vout[n].first;
+    }
+    r.nfees = total;
+    return r;
+}
+
 
 } // namespace
 
@@ -464,5 +534,34 @@ TEST(LtcTemplateMwebExtMerge, SelectionBudgetLeavesRoomForTheImport)
         ASSERT_TRUE(wd);
         EXPECT_EQ(txids_of(*wd).size(), 3u + k.ours) << "budget " << k.budget;
         EXPECT_EQ(src.templates_imported(), 1u);
+    }
+}
+
+// Only the next block's HogEx spends the tip's HogAddr, with litecoind's
+// extension too: the selection starts with litecoind's HogEx's inputs
+// spent, and a pool tx spending the HogAddr never rides along (the same
+// rule as hogaddr_spend_guard_test.cpp without the extension).
+TEST(LtcTemplateMwebExtMerge, SelectionReservesTheHogexInputsWithTheExtension)
+{
+    for (bool with_ext : {false, true}) {
+        Tip t;
+        const LitecoindG g;
+        fill(t, g);
+        const auto st = *t.tracker.get_state();
+        const auto hogaddr_spk = tx_from_hex(tf::kBlock3200604HogexHex).vout[0].scriptPubKey.m_data;
+        t.view.add(st.prev_hogex_txid, 0, st.hogaddr_value);  // under an ordinary script: the reservation alone
+        const MutableTransaction x = spend(st.prev_hogex_txid, 0, st.hogaddr_value - 1'000'000, 30);
+        ASSERT_TRUE(t.pool.add_tx_unchecked(x, t.view.cache.get()));
+        mx::MwebExtSource src("litecoind");
+        src.set_parsed(mx::parse_extension(g.json()), mx::MwebExtSource::clock::now());
+        auto wd = t.build(with_ext ? &src : nullptr);
+        ASSERT_TRUE(wd);
+        for (const auto& id : txids_of(*wd))
+            EXPECT_NE(id, compute_txid(x).GetHex()) << "with_ext=" << with_ext;
+        EXPECT_EQ(src.templates_imported(), with_ext ? 1u : 0u);
+        const auto cf = core_nfees(wd->m_data, *t.view.cache, st);
+        ASSERT_TRUE(cf.nfees) << "with_ext=" << with_ext << ": " << cf.why;
+        EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees) << "with_ext=" << with_ext;
+        (void)hogaddr_spk;
     }
 }
