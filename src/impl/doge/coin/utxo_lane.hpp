@@ -656,13 +656,14 @@ private:
         const uint64_t needed_end = uint64_t(m_fill.next_height) + HOLE_SPAN;
         const bool needed = height < needed_end;
         while (m_buffer_bytes + bytes > m_buffer_limit) {
-            auto far = m_sizes.empty() ? m_sizes.end() : std::prev(m_sizes.end());
-            if (far == m_sizes.end() || far->first <= height || far->first < needed_end)
+            // Not "far": <windows.h> defines far (and near) as empty macros.
+            auto farthest = m_sizes.empty() ? m_sizes.end() : std::prev(m_sizes.end());
+            if (farthest == m_sizes.end() || farthest->first <= height || farthest->first < needed_end)
                 return needed;
-            m_buffer_bytes -= std::min(m_buffer_bytes, far->second);
-            m_fill.buffer.erase(far->first);
-            m_from.erase(far->first);
-            m_sizes.erase(far);
+            m_buffer_bytes -= std::min(m_buffer_bytes, farthest->second);
+            m_fill.buffer.erase(farthest->first);
+            m_from.erase(farthest->first);
+            m_sizes.erase(farthest);
             m_stats.buffer_evicted.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
