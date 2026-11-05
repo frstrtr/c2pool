@@ -1884,6 +1884,22 @@ int main(int argc, char* argv[]) {
         std::cerr << "c2pool: " << msg << std::endl;
         return 1;
     }
+    // Its getblocktemplate poller connects to an IP address: a name would
+    // need a DNS query no timeout bounds (the LAN-only runs allow none).
+    // "localhost" is 127.0.0.1.
+    if (ltc_mweb_ext == "litecoind") {
+        if (rpc_host == "localhost")
+            rpc_host = "127.0.0.1";
+        boost::system::error_code ec;
+        boost::asio::ip::make_address(rpc_host, ec);
+        if (ec) {
+            const std::string msg = "ltc_mweb_ext litecoind: --rpchost " + rpc_host
+                + " is not an IP address (an IPv4 or IPv6 literal; a name is not resolved)";
+            LOG_ERROR << msg;
+            std::cerr << "c2pool: " << msg << std::endl;
+            return 1;
+        }
+    }
 
     // ---- M0b control-plane wiring ------------------------------------------
     // compiled defaults (L0) -> settings file (L1, TOML) -> CLI (L2). No file =>
@@ -2200,15 +2216,16 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
-            std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
-            std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
             // The MWEB extension's source and its getblocktemplate poller
             // (ltc_mweb_ext, #2137 S3). The source exists in every mode (its
             // /local_stats block); the poller only with litecoind, and the
-            // ordered shutdown stops it first.
+            // ordered shutdown stops it first. Declared before the embedded
+            // node, which holds the source: it outlives the node.
             auto ltc_mweb_ext_src = std::make_unique<ltc::coin::mweb_ext::MwebExtSource>(ltc_mweb_ext);
             std::unique_ptr<ltc::coin::mweb_ext::MwebExtPoller> ltc_mweb_ext_poller;
             auto ltc_mweb_ext_alive = std::make_shared<std::atomic<bool>>(true);
+            std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
+            std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
             // The header-validation pools (LTC, DOGE, NMC): their tasks use the
             // header chains and the DOGE schedule, and callbacks keep them alive
             // past those; the shutdown below joins them first (core::WorkerPools).
@@ -2577,6 +2594,10 @@ int main(int argc, char* argv[]) {
                                 changed = key != ext_state->last_key;
                                 ext_state->last_key = key;
                                 prev = parsed.bundle->prev;
+                            } else {
+                                // The stored G is now the failure: the next good
+                                // one is a change, whatever came before.
+                                ext_state->last_key = {};
                             }
                             src->set_parsed(std::move(parsed), r.at);
                             if (!changed)

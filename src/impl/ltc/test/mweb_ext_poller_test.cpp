@@ -8,7 +8,8 @@
 //     retry cadence, the period, nothing after stop();
 //   - fetch_gbt against a local JSON-RPC server (the request litecoind
 //     needs, the credentials, the result; an RPC error), a server that never
-//     answers (one timeout) and a closed port (at once);
+//     answers (one timeout), a closed port and a host name (at once: only IP
+//     addresses, no name is resolved);
 //   - a live litecoind when C2POOL_LTC_MWEB_EXT_LIVE names one (skipped
 //     otherwise).
 // ---------------------------------------------------------------------------
@@ -263,6 +264,16 @@ TEST(LtcMwebExtPoller, FetchGbtIsBoundedByItsTimeout)
         auto r = mx::fetch_gbt({"127.0.0.1", closed, "u:p"}, std::chrono::milliseconds(2000));
         EXPECT_FALSE(r.ok);
         EXPECT_LT(clock::now() - t0, std::chrono::milliseconds(1500));
+    }
+    {
+        // A name is never resolved (no DNS query, whose time no timeout
+        // bounds): refused at once.
+        const auto t0 = clock::now();
+        auto r = mx::fetch_gbt({"litecoind.invalid", 9332, "u:p"}, std::chrono::milliseconds(2000));
+        EXPECT_FALSE(r.ok);
+        EXPECT_FALSE(r.timeout);
+        EXPECT_NE(r.error.find("not an IP address"), std::string::npos) << r.error;
+        EXPECT_LT(clock::now() - t0, std::chrono::milliseconds(100));
     }
 }
 

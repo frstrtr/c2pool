@@ -5,8 +5,9 @@
 ///
 /// A worker thread of its own fetches G = litecoind getblocktemplate
 /// {rules:[mweb,segwit]} over HTTP JSON-RPC, so a slow or dead litecoind
-/// never stalls the io thread: every fetch is bounded by a timeout (resolve,
-/// connect, write and read), and the template builder only ever reads the
+/// never stalls the io thread: every fetch is bounded by a timeout (connect,
+/// write and read; the host is an IP address, no name is resolved), and the
+/// template builder only ever reads the
 /// last G the worker stored (MwebExtSource), never waits for one.
 ///
 /// When (PollSchedule):
@@ -70,7 +71,8 @@ struct FetchResult {
 inline constexpr size_t kMaxGbtResponseBytes = 64u * 1024u * 1024u;
 
 /// One getblocktemplate {rules:[mweb,segwit]} over HTTP JSON-RPC, bounded by
-/// `timeout` from the start (DNS included). Never throws.
+/// `timeout` from the start. `ep.host` must be an IP address: no name is
+/// resolved (a DNS query is not bounded by the timeout). Never throws.
 inline FetchResult fetch_gbt(const RpcEndpoint& ep, std::chrono::milliseconds timeout)
 {
     namespace beast = boost::beast;
@@ -85,8 +87,15 @@ inline FetchResult fetch_gbt(const RpcEndpoint& ep, std::chrono::milliseconds ti
         r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(r.at - t0).count();
     };
     try {
+        boost::system::error_code addr_ec;
+        const auto addr = net::ip::make_address(ep.host, addr_ec);
+        if (addr_ec) {
+            finish();
+            r.error = "not an IP address: " + ep.host;
+            return r;
+        }
+        const tcp::endpoint target(addr, ep.port);
         net::io_context io;
-        tcp::resolver resolver(io);
         beast::tcp_stream stream(io);
 
         std::string auth;
@@ -106,33 +115,25 @@ inline FetchResult fetch_gbt(const RpcEndpoint& ep, std::chrono::milliseconds ti
         bool done = false;
         beast::error_code result_ec;
 
-        resolver.async_resolve(ep.host, std::to_string(ep.port),
-            [&](beast::error_code ec, tcp::resolver::results_type results) {
-                if (ec) {
-                    result_ec = ec;
+        stream.expires_after(timeout);
+        stream.async_connect(target, [&](beast::error_code ec) {
+            if (ec) {
+                result_ec = ec;
+                done = true;
+                return;
+            }
+            http::async_write(stream, req, [&](beast::error_code ec2, std::size_t) {
+                if (ec2) {
+                    result_ec = ec2;
                     done = true;
                     return;
                 }
-                stream.expires_after(timeout);
-                stream.async_connect(results, [&](beast::error_code ec2, const tcp::endpoint&) {
-                    if (ec2) {
-                        result_ec = ec2;
-                        done = true;
-                        return;
-                    }
-                    http::async_write(stream, req, [&](beast::error_code ec3, std::size_t) {
-                        if (ec3) {
-                            result_ec = ec3;
-                            done = true;
-                            return;
-                        }
-                        http::async_read(stream, buffer, parser, [&](beast::error_code ec4, std::size_t) {
-                            result_ec = ec4;
-                            done = true;
-                        });
-                    });
+                http::async_read(stream, buffer, parser, [&](beast::error_code ec3, std::size_t) {
+                    result_ec = ec3;
+                    done = true;
                 });
             });
+        });
         io.run_for(timeout);
         finish();
         if (!done) {
