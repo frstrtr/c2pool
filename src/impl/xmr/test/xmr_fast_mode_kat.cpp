@@ -24,7 +24,13 @@
 //       would ship is correct, not merely fast;
 //   F3  informational: dataset init seconds and steady-state H/s for the fast
 //       miner, printed for the record. Not asserted — a shared CI runner's
-//       hashrate is not a property of this code.
+//       hashrate is not a property of this code;
+//   V-f a verifier cache key on another thread completes while the miner's
+//       real dataset build runs;
+//   V-g the dataset parity check passes on a correct build;
+//   V-c, V-d, V-k, R-DV3  a newer seed, stop(), the destructor and a build
+//       thread that fails to start, each during a real dataset build: the
+//       build is abandoned or failed promptly and every thread is joined.
 //
 // HONEST SKIP. If randomx_alloc_dataset() returns null (a host that cannot
 // spare ~2 GiB) the fast half reports SKIP and the test still exits 0 — but it
@@ -36,13 +42,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <dirent.h>
+#endif
 
 #include "randomx.h"
 #include "randomx_verify.hpp"
@@ -51,6 +67,7 @@
 namespace mn = c2pool::xmr::miner;
 
 static int g_fail = 0;
+static double g_full_build_s = 0.0;   // F2's build, set_job to install
 static void check(bool ok, const char* name, const std::string& detail = {}) {
     std::printf("  [%s] %s%s%s\n", ok ? "PASS" : "FAIL", name,
                 detail.empty() ? "" : " — ", detail.c_str());
@@ -93,8 +110,100 @@ static c2pool::xmr::SeedHash to_vseed(const mn::SeedBytes& s) {
     return v;
 }
 
+// A failure bound on a fast-mode build (the dataset build dominates).
+static const std::chrono::seconds kBuildWait{1200};
+
+// Signals at the miner's test points, and an injected failure at
+// BuildThreadStart(i). Every point reached is recorded with its time.
+using TP = mn::TestPoint;
+struct Signals {
+    struct Mark { TP p; std::uint64_t gen; unsigned idx; std::chrono::steady_clock::time_point t; };
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::vector<Mark>       marks;
+    std::atomic<int>        fail_build_start{-1};
+
+    mn::TestHook hook() {
+        return [this](TP p, std::uint64_t g, unsigned i, const std::function<bool()>&) {
+            if (p == TP::BuildThreadStart && fail_build_start.load() == static_cast<int>(i))
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                        "injected");
+            std::lock_guard<std::mutex> lk(mu);
+            marks.push_back({p, g, i, std::chrono::steady_clock::now()});
+            cv.notify_all();
+        };
+    }
+    bool wait(TP p, std::uint64_t gen, std::chrono::seconds bound,
+              std::chrono::steady_clock::time_point* at = nullptr) {
+        std::unique_lock<std::mutex> lk(mu);
+        const bool ok = cv.wait_for(lk, bound, [&] { return find(p, gen) != nullptr; });
+        if (ok && at) *at = find(p, gen)->t;
+        return ok;
+    }
+    bool reached(TP p, std::uint64_t gen) {
+        std::lock_guard<std::mutex> lk(mu);
+        return find(p, gen) != nullptr;
+    }
+
+private:
+    const Mark* find(TP p, std::uint64_t gen) const {
+        for (const Mark& m : marks)
+            if (m.p == p && (gen == 0 || m.gen == gen)) return &m;
+        return nullptr;
+    }
+};
+
+static int count_tasks() {
+#if defined(__linux__)
+    int n = 0;
+    if (DIR* d = opendir("/proc/self/task")) {
+        while (dirent* e = readdir(d))
+            if (e->d_name[0] != '.') ++n;
+        closedir(d);
+        return n;
+    }
+#endif
+    return -1;
+}
+// This process's thread count with no miner alive: the least count seen over
+// one second after a thread has been started and joined (a sanitizer runtime
+// may start a thread of its own at the first thread start).
+static int g_base_tasks = -1;
+static void measure_base_tasks() {
+    std::thread([] {}).join();
+    int least = count_tasks();
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < dl) {
+        const int n = count_tasks();
+        if (n >= 0 && n < least) least = n;
+        std::this_thread::yield();
+    }
+    g_base_tasks = least;
+}
+static bool tasks_settle_to(int want) {
+    if (want < 0) return true;
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < dl) {
+        if (count_tasks() == want) return true;
+        std::this_thread::yield();
+    }
+    return count_tasks() == want;
+}
+static double secs_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+static bool any_has(const std::vector<std::string>& v, const char* sub) {
+    for (const std::string& s : v) if (s.find(sub) != std::string::npos) return true;
+    return false;
+}
+// key_items=<done>/<total> from the miner's status line.
+static bool key_items(const std::string& d, unsigned long long& done, unsigned long long& total) {
+    const std::size_t at = d.find("key_items=");
+    return at != std::string::npos && std::sscanf(d.c_str() + at, "key_items=%llu/%llu", &done, &total) == 2;
+}
+
 // Build the dataset over `threads` disjoint item ranges, the same split the
-// miner's init_dataset_parallel() does. Returns seconds spent.
+// miner's dataset build does. Returns seconds spent.
 static double init_dataset_parallel(randomx_dataset* ds, randomx_cache* cache,
                                     unsigned threads) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -118,6 +227,7 @@ static double init_dataset_parallel(randomx_dataset* ds, randomx_cache* cache,
 int main() {
     std::printf("== xmr_fast_mode_kat: --mine-fast is an optimisation, not a second "
                 "algorithm ==\n");
+    measure_base_tasks();
 
     const unsigned hc = std::max(1u, std::thread::hardware_concurrency());
     const unsigned init_threads = std::min(4u, hc);
@@ -222,6 +332,27 @@ int main() {
             mo.fast_mode   = true;      // <-- exactly what --mine-fast sets
             mo.large_pages = true;      // graceful fallback to 4 KiB
             mo.pin_threads = true;
+            Signals sig;
+            mo.test_hook   = sig.hook();
+
+            // V-f's reference: a fixed blob hashed on a cache keyed to another
+            // seed, before the miner's build.
+            const mn::SeedBytes other = make_seed(0x6B);
+            const c2pool::xmr::SeedHash vother = to_vseed(other);
+            const std::vector<std::uint8_t> vf_blob = make_blob(9);
+            std::array<std::uint8_t, 32> vf_ref{};
+            bool vf_ref_ok = false;
+            {
+                c2pool::xmr::CacheSlot ref(randomx_get_flags() | RANDOMX_FLAG_JIT);
+                if (ref.rekey(vother)) {
+                    randomx_vm* vm = randomx_create_vm(randomx_get_flags() | RANDOMX_FLAG_JIT, ref.raw(), nullptr);
+                    if (vm) {
+                        randomx_calculate_hash(vm, vf_blob.data(), vf_blob.size(), vf_ref.data());
+                        randomx_destroy_vm(vm);
+                        vf_ref_ok = true;
+                    }
+                }
+            }
 
             mn::MinerJob job;
             job.blob           = make_blob(0);
@@ -236,10 +367,44 @@ int main() {
             mn::CpuMiner miner(mo);
             std::string why;
             const auto t0 = std::chrono::steady_clock::now();
-            const bool started = miner.set_job(job, &why);
+            const bool posted = miner.set_job(job, &why);
+
+            // V-f: while the build runs, this thread keys a CacheSlot to
+            // another seed; the key returns before the dataset build ends.
+            {
+                const bool building = posted && sig.wait(TP::BuildThreadStart, 0, kBuildWait);
+                c2pool::xmr::CacheSlot slot(randomx_get_flags() | RANDOMX_FLAG_JIT);
+                const auto k0 = std::chrono::steady_clock::now();
+                const bool keyed = building && slot.rekey(vother);
+                const double argon_s = secs_since(k0);
+                unsigned long long done = 0, total = 0;
+                const bool items = key_items(miner.describe(), done, total);
+                std::array<std::uint8_t, 32> h{};
+                bool same = false;
+                if (keyed) {
+                    randomx_vm* vm = randomx_create_vm(randomx_get_flags() | RANDOMX_FLAG_JIT, slot.raw(), nullptr);
+                    if (vm) {
+                        randomx_calculate_hash(vm, vf_blob.data(), vf_blob.size(), h.data());
+                        randomx_destroy_vm(vm);
+                        same = vf_ref_ok && h == vf_ref;
+                    }
+                }
+                std::printf("       V-f: verifier cache key %.2f s; dataset items done %llu/%llu when it returned\n",
+                            argon_s, done, total);
+                check(keyed && items && total > 0 && done * 2 < total,
+                      "V-f.1 a verifier cache key returns while the dataset build is under half done",
+                      std::to_string(done) + "/" + std::to_string(total));
+                check(same, "V-f.2 that key's hash of a fixed blob equals the reference");
+            }
+
+            const bool started = posted && miner.wait_result_for(kBuildWait) && miner.install_ready();
             const double init_s =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            check(started, "F2.a CpuMiner(fast_mode=true).set_job() succeeded", why);
+            check(started, "F2.a CpuMiner(fast_mode=true): set_job, the build, install_ready", why);
+            if (started) g_full_build_s = init_s;
+            const std::vector<std::string> ev = miner.take_events();
+            check(started && !any_has(ev, "dataset parity") && miner.describe().find("key=ready") != std::string::npos,
+                  "V-g the dataset parity check passed (key=ready)");
 
             if (started) {
                 std::printf("       fast miner: threads=%u init=%.2f s %s\n",
@@ -288,6 +453,117 @@ int main() {
                             st.threads ? hps / st.threads : 0.0, init_s);
             }
             miner.stop();
+        }
+    }
+
+    // ---- V-c, V-d, V-k, R-DV3 (b): during a real dataset build --------------
+    // One dataset at a time: each miner below is destroyed before the next.
+    // A full build's seconds (F2's) bound the prompt cases: each must end in
+    // under a quarter of it.
+    {
+        const unsigned threads = std::min(2u, hc);
+        auto fast_opts = [&](Signals& sig) {
+            mn::MinerOptions mo;
+            mo.threads     = threads;
+            mo.fast_mode   = true;
+            mo.large_pages = false;
+            mo.pin_threads = false;
+            mo.test_hook   = sig.hook();
+            return mo;
+        };
+        auto fast_job = [&](std::uint8_t seed_tag, std::uint32_t tid) {
+            mn::MinerJob j;
+            j.blob           = make_blob(static_cast<std::uint8_t>(tid & 0xFF));
+            j.nonce_offset   = kNonceOffset;
+            j.template_id    = tid;
+            j.extra_nonce    = 5;
+            j.height         = 123457;
+            j.seed_hash      = make_seed(seed_tag);
+            j.network_target = 0;
+            j.lane_target    = target_from_diff(256);
+            return j;
+        };
+        // F2's whole build (set_job to install) on the same thread count.
+        const double full_s = g_full_build_s > 0 ? g_full_build_s : 0.0;
+        std::printf("       a full build here took %.2f s (F2)\n", full_s);
+
+        // V-c: a newer seed during SA's real build is consumed promptly.
+        {
+            Signals sig;
+            mn::CpuMiner m(fast_opts(sig));
+            std::string why;
+            const bool pa = m.set_job(fast_job(0x31, 31), &why);
+            const bool building = pa && sig.wait(TP::BuildThreadStart, 0, kBuildWait);
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool pb = m.set_job(fast_job(0x32, 32), &why);
+            const std::uint64_t gB = m.build_progress().request_gen;
+            std::chrono::steady_clock::time_point at{};
+            const bool consumed = pb && sig.wait(TP::AfterConsume, gB, kBuildWait, &at);
+            const double dt = consumed ? std::chrono::duration<double>(at - t0).count() : -1.0;
+            const mn::CpuMiner::BuildProgress bp = m.build_progress();
+            std::printf("       V-c: gB consumed %.2f s after the post\n", dt);
+            check(building && consumed && full_s > 0 && dt < full_s / 4 && bp.abandoned == 1,
+                  "V-c (fast) a newer seed during the real build is consumed in under a quarter build",
+                  "abandoned=" + std::to_string(bp.abandoned));
+        }
+
+        // V-d: stop() during the real dataset build returns promptly.
+        {
+            const int base = g_base_tasks;
+            Signals sig;
+            mn::CpuMiner m(fast_opts(sig));
+            std::string why;
+            const bool pa = m.set_job(fast_job(0x41, 41), &why);
+            const bool building = pa && sig.wait(TP::BuildThreadStart, 0, kBuildWait);
+            const auto t0 = std::chrono::steady_clock::now();
+            m.stop();
+            const double dt = secs_since(t0);
+            std::printf("       V-d: stop() during the build took %.2f s\n", dt);
+            check(building && full_s > 0 && dt < full_s / 4 && tasks_settle_to(base),
+                  "V-d (fast) stop() during the real build returns in under a quarter build; no thread remains");
+        }
+
+        // V-k: the destructor during the real build, without stop().
+        {
+            const int base = g_base_tasks;
+            Signals sig;
+            double dt = -1.0;
+            bool building = false;
+            {
+                auto m = std::make_unique<mn::CpuMiner>(fast_opts(sig));
+                std::string why;
+                building = m->set_job(fast_job(0x61, 61), &why) && sig.wait(TP::BuildThreadStart, 0, kBuildWait);
+                const auto t0 = std::chrono::steady_clock::now();
+                m.reset();
+                dt = secs_since(t0);
+            }
+            std::printf("       V-k: destruction during the build took %.2f s\n", dt);
+            check(building && full_s > 0 && dt < full_s / 4 && tasks_settle_to(base),
+                  "V-k (fast) the destructor during the real build returns promptly; no thread remains");
+        }
+
+        // R-DV3 (b): build thread 1 fails to start.
+        {
+            const int base = g_base_tasks;
+            Signals sig;
+            mn::CpuMiner m(fast_opts(sig));
+            const mn::MinerJob A = fast_job(0x71, 71), A2 = fast_job(0x71, 72);
+            std::string why;
+            sig.fail_build_start = threads > 1 ? 1 : 0;
+            const bool pa = m.set_job(A, &why);
+            const bool wr = pa && m.wait_result_for(kBuildWait);
+            const bool ir = m.install_ready();
+            const std::vector<std::string> ev = m.take_events();
+            const bool with_k = tasks_settle_to(base < 0 ? -1 : base + 1);
+            check(wr && !ir && any_has(ev, "key failed") && any_has(ev, "injected") && with_k,
+                  "R-DV3.b a build thread that fails to start: Failed(injected), every build thread joined");
+            sig.fail_build_start = -1;
+            std::string w2;
+            const bool retry = m.set_job(A2, &w2);
+            const bool reoffer = m.set_job(A2, &w2);
+            const bool in = m.wait_result_for(kBuildWait) && m.install_ready();
+            check(!retry && w2.find("injected") != std::string::npos && reoffer && in && m.running(),
+                  "R-DV3.b the retry (false), the re-offer (true), then the build installs", w2);
         }
     }
 
