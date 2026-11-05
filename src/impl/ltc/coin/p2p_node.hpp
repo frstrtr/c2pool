@@ -67,7 +67,8 @@ private:
     std::string m_chain_label = "CoinP2P";
     // BIP 152 compact block state
     bool m_peer_supports_cmpct{false};
-    uint64_t m_peer_cmpct_version{0};
+    uint64_t m_peer_cmpct_version{0};      // last sendcmpct version received
+    uint64_t m_peer_cmpct_version_max{0};  // highest this connection (MWEB peers)
     bool m_peer_wants_cmpct_announce{false};
     // BIP 339 wtxidrelay state
     bool m_peer_wtxidrelay{false};
@@ -81,7 +82,27 @@ private:
     bool m_request_mempool_on_connect{false};
     // Compact block reconstruction state: pending compact block awaiting blocktxn
     std::unique_ptr<CompactBlock> m_pending_cmpct;
-    std::vector<uint32_t> m_pending_missing_indexes;
+    uint256 m_pending_cmpct_hash;
+    CompactBlockReconstructionResult m_pending_partial;  // incomplete ReconstructBlock result
+    // What we announce in sendcmpct after verack (see cmpct_announcements):
+    // version 2 = (false,2) only; version 3 = (hb,3) then (false,2).
+    uint64_t m_cmpct_announce_version{2};
+    bool m_cmpct_announce_hb{false};
+    // Coin-side decision for a received compact block (chain lookups, MWEB
+    // gate, cross-peer dedup). Unset = always reconstruct.
+    using CmpctBlockCallback = std::function<CmpctAction(const CompactBlock&)>;
+    CmpctBlockCallback m_on_cmpct_block;
+    using CmpctOutcomeCallback = std::function<void(const uint256&, CmpctOutcome)>;
+    CmpctOutcomeCallback m_on_cmpct_outcome;
+    // How the block passed to the last full_block event arrived.
+    BlockSource m_last_block_source{BlockSource::Block};
+    // BIP 130: getdata the body of every small headers announcement. The LTC
+    // embedded node turns this off and fetches the tip's block once
+    // (mweb_fetch_retry) instead of once per announcing peer. On DOGE it also
+    // gates the inv announcement's body getdata (the embedded DOGE node turns
+    // it off: its tip handler asks the announcer once, its UTXO lane fills a
+    // gap).
+    bool m_fetch_announced_blocks{true};
     // Last compact block we SENT — cached to serve getblocktxn requests
     BlockType m_sent_cmpct_block;
     uint256   m_sent_cmpct_hash;
@@ -97,6 +118,11 @@ private:
     // the standard 80+1 byte parser.  Used for DOGE AuxPoW extended headers.
     using RawHeadersParser = std::function<std::vector<BlockHeaderType>(const uint8_t*, size_t)>;
     RawHeadersParser m_raw_headers_parser;
+    // A raw parse that stopped before the message's count (an entry it could
+    // not read): the headers before it and the count go here instead of to
+    // new_headers, when set (the DOGE hash schedule: a strike, not a cut).
+    using HeadersTruncatedFn = std::function<void(const std::vector<BlockHeaderType>&, uint64_t count)>;
+    HeadersTruncatedFn m_on_headers_truncated;
     // Raw headers SINK: if set, receives the raw 'headers' payload bytes and
     // short-circuits the standard handler entirely (both the 80+1 parse and the
     // BIP130 body getdata). Additive and OPTIONAL — only the NMC lane sets it, so
@@ -108,6 +134,9 @@ private:
     // Raw block parser: if set, re-parses DOGE AuxPoW full blocks from raw P2P bytes.
     using RawBlockParser = std::function<BlockType(const uint8_t*, size_t)>;
     RawBlockParser m_raw_block_parser;
+    // A block whose arrival is logged at DEBUG instead of INFO (the DOGE full
+    // set's IBD: millions of historical bodies).
+    std::function<bool(const uint256&)> m_block_log_quiet;
 
 public:
     NodeP2P(io::io_context* context, ltc::interfaces::Node* coin, config_t* config,
@@ -140,6 +169,8 @@ public:
     {
         m_peer = std::make_unique<Connection>(m_context, socket);
         m_handshake_complete = false;
+        // The highest-version fold is per connection.
+        m_peer_cmpct_version_max = 0;
         LOG_INFO << "" << "[" << m_chain_label << "] Connected to " << m_target_addr.to_string();
 
         // Require version/verack progress soon after connect.
@@ -282,6 +313,10 @@ public:
     void set_on_peer_height(PeerHeightCallback cb) { m_on_peer_height = std::move(cb); }
     /// Set custom raw headers parser (for DOGE AuxPoW extended headers).
     void set_raw_headers_parser(RawHeadersParser p) { m_raw_headers_parser = std::move(p); }
+
+    /// A 'headers' message the raw parser did not read to its end: its clean
+    /// prefix and the message's count, instead of new_headers.
+    void set_on_headers_truncated(HeadersTruncatedFn f) { m_on_headers_truncated = std::move(f); }
     /// Set a raw headers SINK (for NMC AuxPoW header-feed). When set, the 'headers'
     /// handler forwards the raw payload bytes and returns immediately — the standard
     /// 80+1 parse and BIP130 body getdata are skipped. Additive; unset for every
@@ -290,6 +325,7 @@ public:
 
     /// Set custom raw block parser (for DOGE AuxPoW full blocks).
     void set_raw_block_parser(RawBlockParser p) { m_raw_block_parser = std::move(p); }
+    void set_block_log_quiet(std::function<bool(const uint256&)> f) { m_block_log_quiet = std::move(f); }
 
     /// Send getaddr to request peer addresses.
     void send_getaddr()
@@ -357,23 +393,61 @@ public:
     /// Set mempool reference for compact block reconstruction.
     void set_mempool(Mempool* mp) { m_mempool = mp; }
 
+    /// What to announce in sendcmpct after verack (takes effect on the next
+    /// handshake). version 3 asks an MWEB peer for v3 compact blocks; hb asks
+    /// it to push them unsolicited (BIP 152 high-bandwidth).
+    void set_cmpct_announce(uint64_t version, bool high_bandwidth) {
+        m_cmpct_announce_version = version;
+        m_cmpct_announce_hb = high_bandwidth;
+    }
+    bool cmpct_announce_hb() const { return m_cmpct_announce_version >= 3 && m_cmpct_announce_hb; }
+    /// Coin-side decision hook for received compact blocks.
+    void set_on_cmpct_block(CmpctBlockCallback cb) { m_on_cmpct_block = std::move(cb); }
+    /// Reconstruction outcome notifications (metrics, in-flight bookkeeping).
+    void set_on_cmpct_outcome(CmpctOutcomeCallback cb) { m_on_cmpct_outcome = std::move(cb); }
+    /// How the block of the current/last full_block event arrived.
+    BlockSource last_block_source() const { return m_last_block_source; }
+    /// BIP 130 body getdata for small headers announcements (default on); on
+    /// DOGE also the inv announcement's body getdata.
+    void set_fetch_announced_blocks(bool on) { m_fetch_announced_blocks = on; }
+
+    /// getdata type for a block body from this peer: MSG_MWEB_BLOCK for an
+    /// MWEB peer (the plain MSG_BLOCK answer is served with SERIALIZE_NO_MWEB:
+    /// no witness, no mweb tail), MSG_BLOCK otherwise.
+    inventory_type::inv_type block_body_inv_type() const {
+        return (m_peer_services & NODE_MWEB_SERVICE)
+            ? inventory_type::mweb_block
+            : inventory_type::block;
+    }
+
     /// Enable BIP 35 mempool request after handshake.
     /// Call after UTXO is initialized so incoming txs can have fees computed.
     void enable_mempool_request() { m_request_mempool_on_connect = true; }
 
     /// Relay a pre-serialized block via P2P.
-    /// Uses compact block format (BIP 152 v2) for peers that support it,
-    /// falling back to full block otherwise.
+    /// Uses compact block format (BIP 152 v2) for v2 peers when the block has
+    /// no HogEx (see relay_mode_for), falling back to full block otherwise.
     void submit_block_raw(const std::vector<unsigned char>& block_bytes)
     {
         if (!m_peer) return;
 
-        if (m_peer_supports_cmpct && m_peer_cmpct_version >= 2) {
-            // Deserialize the block to build a compact representation
+        const uint64_t cmpct_version = relay_cmpct_version(
+            m_peer_services, m_peer_cmpct_version, m_peer_cmpct_version_max);
+        if (m_peer_supports_cmpct && cmpct_version == 2) {
+            // Deserialize the block to pick the relay mode and, for a compact
+            // relay, build the compact representation.
             try {
                 PackStream ps(block_bytes);
                 BlockType block;
                 ps >> block;
+                if (relay_mode_for(cmpct_version, block) == RelayMode::Full) {
+                    // A v2 compact block cannot carry the MWEB extension data;
+                    // the full block bytes already include "01" + mweb.
+                    LOG_INFO << "[" << m_chain_label << "] HogEx block: sending full block ("
+                             << block_bytes.size() << " bytes) instead of a v2 compact block";
+                    submit_block_full(block_bytes);
+                    return;
+                }
                 auto cb = BuildCompactBlock(
                     static_cast<BlockHeaderType&>(block), block.m_txs);
                 auto rmsg = message_cmpctblock::make_raw(cb);
@@ -397,9 +471,9 @@ public:
                             << "), sending full block: " << e.what();
             }
         } else {
-            LOG_DEBUG_COIND << "[" << m_chain_label << "] Peer does not support compact blocks"
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] No v2 compact relay to this peer"
                      << " (cmpct=" << m_peer_supports_cmpct
-                     << " ver=" << m_peer_cmpct_version
+                     << " ver=" << cmpct_version
                      << "), sending full block (" << block_bytes.size() << " bytes)";
         }
 
@@ -527,10 +601,14 @@ private:
             auto msg_sendheaders = message_sendheaders::make_raw();
             m_peer->write(msg_sendheaders);
         }
-        // BIP 152: compact blocks — DOGE doesn't support segwit compact blocks (v2)
+        // BIP 152: compact blocks — DOGE doesn't support segwit compact blocks (v2).
+        // The order is load-bearing: litecoind locks the version on the first
+        // sendcmpct it accepts (see cmpct_announcements).
         if (!is_doge) {
-            auto msg_cmpct = message_sendcmpct::make_raw(false, 2);
-            m_peer->write(msg_cmpct);
+            for (const auto& a : cmpct_announcements(m_cmpct_announce_version, m_cmpct_announce_hb)) {
+                auto msg_cmpct = message_sendcmpct::make_raw(a.high_bandwidth, a.version);
+                m_peer->write(msg_cmpct);
+            }
         }
 
         // BIP 133: advertise minimum feerate (0 = accept all transactions)
@@ -600,8 +678,15 @@ private:
                 break;
             case inventory_type::block:
                 m_coin->new_block.happened(inv.m_hash);
-                // Request full block for MWEB state extraction
-                vinv.push_back(inv);
+                // DOGE: like the BIP 130 getdata, only while
+                // fetch_announced_blocks (every announcer sent the body:
+                // 18-22 copies of each tip).
+                if (!m_fetch_announced_blocks && (m_chain_label == "DOGE" || m_chain_label == "doge"))
+                    break;
+                // Request the full block for MWEB state extraction. An MWEB
+                // peer answers MSG_BLOCK without the mweb tail, so ask it
+                // for MSG_MWEB_BLOCK.
+                vinv.push_back(inventory_type(block_body_inv_type(), inv.m_hash));
                 break;
             case inventory_type::filtered_block:
             case inventory_type::cmpct_block:
@@ -630,16 +715,18 @@ private:
     {
         // When a raw block parser is set (DOGE AuxPoW), re-parse the block from
         // raw P2P bytes.  The standard BlockType deserialization misinterprets
-        // AuxPoW data as transactions, producing garbage.
+        // AuxPoW data as transactions, producing garbage, so a body the raw
+        // parser cannot read is dropped, never handed on from that parse.
         BlockType block;
         if (m_raw_block_parser && !msg->m_raw_payload.empty()) {
             try {
                 block = m_raw_block_parser(msg->m_raw_payload.data(),
                                            msg->m_raw_payload.size());
             } catch (const std::exception& e) {
-                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed: " << e.what()
-                            << " — falling back to standard parse";
-                block = msg->m_block;
+                LOG_WARNING << "[" << m_chain_label << "] AuxPoW block parser failed on a "
+                            << msg->m_raw_payload.size() << "-byte block from "
+                            << m_target_addr.to_string() << ": " << e.what() << " — dropped";
+                return;
             }
         } else {
             block = msg->m_block;
@@ -648,17 +735,37 @@ private:
         auto header = static_cast<BlockHeaderType>(block);
         auto packed_header = pack(header);
         auto blockhash = Hash(packed_header.get_span());
+
+        // The transactions must be the ones the header commits to before
+        // anything (UTXO, mempool cleanup, MWEB state) trusts them. A
+        // reconstructed compact block is checked the same way. Standard
+        // 80-byte-header chains only: AuxPoW chains (DOGE re-parse, NMC
+        // header sink) are left as they were.
+        if (standard_header_chain() && !block_merkle_ok(block)) {
+            LOG_WARNING << "[" << m_chain_label << "] Full block "
+                        << blockhash.GetHex().substr(0, 16) << "..."
+                        << " FAILED the header Merkle check (txs=" << block.m_txs.size()
+                        << ") from " << m_target_addr.to_string() << " — discarded";
+            return;
+        }
+
         // ReplyMatcher may throw if nobody registered a pending request for
         // this block (e.g., unsolicited block or getdata-triggered response).
         // Catch to ensure full_block event always fires for MWEB extraction.
         try { m_peer->get_block(blockhash, block); } catch (...) {}
         try { m_peer->get_header(blockhash, header); } catch (...) {}
-        LOG_INFO << "[" << m_chain_label << "] Full block received: "
-                 << blockhash.GetHex().substr(0, 16) << "..."
-                 << " txs=" << block.m_txs.size()
-                 << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        if (m_block_log_quiet && m_block_log_quiet(blockhash)) {
+            LOG_DEBUG_COIND << "[" << m_chain_label << "] Full block received: "
+                            << blockhash.GetHex().substr(0, 16) << "..."
+                            << " txs=" << block.m_txs.size();
+        } else {
+            LOG_INFO << "[" << m_chain_label << "] Full block received: "
+                     << blockhash.GetHex().substr(0, 16) << "..."
+                     << " txs=" << block.m_txs.size()
+                     << " mweb_raw=" << block.m_mweb_raw.size() << " bytes";
+        }
         // Fire full block event (carries MWEB data for state extraction)
-        m_coin->full_block.happened(block);
+        deliver_full_block(block, BlockSource::Block);
     }
 
     ADD_P2P_HANDLER(headers)
@@ -677,11 +784,15 @@ private:
 
         std::vector<BlockHeaderType> vheaders;
 
-        // When a raw parser is set (DOGE AuxPoW), always prefer it over the
-        // standard parser.  The standard parser misinterprets AuxPoW data as
-        // block transactions, producing a small number of garbage entries
-        // instead of the full 2000-header batch.
-        if (m_raw_headers_parser && !msg->m_raw_payload.empty()) {
+        // When a raw parser is set (DOGE AuxPoW), its result is the batch: the
+        // standard parser misinterprets AuxPoW data as block transactions,
+        // producing a small number of garbage entries instead of the full
+        // 2000-header batch, so it is never a fallback for an AuxPoW chain
+        // (the raw parser returns the entries that parsed; none is none).
+        const bool raw_parsed = m_raw_headers_parser && !msg->m_raw_payload.empty();
+        bool truncated = false;
+        uint64_t declared = 0;
+        if (raw_parsed) {
             try {
                 vheaders = m_raw_headers_parser(
                     msg->m_raw_payload.data(), msg->m_raw_payload.size());
@@ -691,9 +802,22 @@ private:
             } catch (const std::exception& e) {
                 LOG_WARNING << "[" << m_chain_label << "] AuxPoW headers parser failed: " << e.what();
             }
+            // The raw parser returns the entries that parsed, in order: fewer
+            // than the message's count means it stopped at one it could not read.
+            if (m_on_headers_truncated) {
+                try {
+                    PackStream cs(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(msg->m_raw_payload.data()),
+                        std::min<size_t>(msg->m_raw_payload.size(), 9)));
+                    declared = ReadCompactSize(cs);
+                } catch (const std::exception&) {
+                    declared = 0;
+                }
+                truncated = vheaders.size() < declared;
+            }
         }
 
-        if (vheaders.empty() && !msg->m_headers.empty()) {
+        if (!raw_parsed && !msg->m_headers.empty()) {
             // Standard path: headers parsed as 80-byte BlockType (LTC, BTC)
             for (auto block : msg->m_headers)
             {
@@ -707,15 +831,21 @@ private:
             }
         }
 
+        if (truncated)
+            m_on_headers_truncated(vheaders, declared);
         if (!vheaders.empty()) {
-            m_coin->new_headers.happened(vheaders);
+            if (!truncated)
+                m_coin->new_headers.happened(vheaders);
 
             // BIP 130: when receiving a small headers batch (new block announcement),
             // request the full block via getdata.
             // LTC: MSG_MWEB_BLOCK (0x60000002) for MWEB state extraction
             // DOGE: MSG_BLOCK (0x02) — no segwit/MWEB
             bool is_doge_chain = (m_chain_label == "DOGE" || m_chain_label == "doge");
-            if (vheaders.size() <= 3 && m_peer) {
+            // Off for the LTC embedded node (set_fetch_announced_blocks): the
+            // tip change fetches the block once instead of every announcing
+            // peer sending it in full.
+            if (vheaders.size() <= 3 && m_peer && m_fetch_announced_blocks) {
                 for (auto& hdr : vheaders) {
                     auto packed = pack(hdr);
                     auto bhash = Hash(packed.get_span());
@@ -803,6 +933,7 @@ private:
         // BIP 152: Compact block negotiation — record peer capability
         m_peer_supports_cmpct = true;
         m_peer_cmpct_version = msg->m_version;
+        m_peer_cmpct_version_max = fold_cmpct_version(m_peer_cmpct_version_max, msg->m_version);
         m_peer_wants_cmpct_announce = msg->m_announce;
         LOG_INFO << "[" << m_chain_label << "] Peer supports compact blocks v"
                  << msg->m_version << " (announce=" << msg->m_announce << ")";
@@ -817,30 +948,37 @@ private:
         LOG_INFO << "[" << m_chain_label << "] Received compact block "
                  << blockhash.GetHex()
                  << " (" << cb.short_ids.size() << " short IDs, "
-                 << cb.prefilled_txns.size() << " prefilled)";
+                 << cb.prefilled_txns.size() << " prefilled)"
+                 << " v" << static_cast<int>(cb.cmpct_version)
+                 << " mweb=" << cb.mweb_raw.size() << "B";
 
         // Always announce the new block to the node (header-based)
         m_coin->new_block.happened(blockhash);
 
+        // Header first: a high-bandwidth peer pushes the cmpctblock INSTEAD
+        // of a headers message, so this is how the header chain learns the
+        // new tip (PoW, difficulty and connection are checked there).
+        // Standard 80-byte header chains only.
+        if (standard_header_chain())
+            m_coin->new_headers.happened(std::vector<BlockHeaderType>{cb.header});
+
+        // Coin-side decision: duplicate, unknown parent, or a compact block
+        // that cannot carry the MWEB state (fetch the full block instead).
+        if (m_on_cmpct_block) {
+            switch (m_on_cmpct_block(cb)) {
+            case CmpctAction::Drop:
+                return;
+            case CmpctAction::FetchFull:
+                request_block_body(blockhash);
+                return;
+            case CmpctAction::Reconstruct:
+                break;
+            }
+        }
+
         // Attempt reconstruction from mempool + known_txs
         // BIP 152 v2: short IDs are keyed by wtxid (witness txid).
-        std::map<uint256, MutableTransaction> known;
-
-        // Gather from node's known_txs (re-key by wtxid)
-        for (const auto& [txid, tx] : m_coin->known_txs) {
-            MutableTransaction mtx(tx);
-            auto packed = pack(TX_WITH_WITNESS(mtx));
-            uint256 wtxid = Hash(packed.get_span());
-            known[wtxid] = std::move(mtx);
-        }
-
-        // Gather from mempool (wtxid-keyed)
-        if (m_mempool) {
-            auto mp_txs = m_mempool->all_txs_map_wtxid();
-            known.merge(mp_txs);
-        }
-
-        auto result = ReconstructBlock(cb, known);
+        auto result = ReconstructBlock(cb, gather_known_txs());
 
         if (result.complete) {
             LOG_INFO << "[" << m_chain_label << "] Compact block reconstructed: "
@@ -848,32 +986,36 @@ private:
                      << " txs=" << result.block.m_txs.size()
                      << " mweb_raw=" << result.block.m_mweb_raw.size() << " bytes";
             // Deliver as a full block
-            m_peer->get_block(blockhash, result.block);
+            try { m_peer->get_block(blockhash, result.block); } catch (...) {}
             auto header = static_cast<BlockHeaderType>(result.block);
-            m_peer->get_header(blockhash, header);
+            try { m_peer->get_header(blockhash, header); } catch (...) {}
+            notify_cmpct_outcome(blockhash, CmpctOutcome::Reconstructed);
             // Fire full block event (carries MWEB data for state extraction)
-            m_coin->full_block.happened(result.block);
-        } else if (result.merkle_mismatch) {
+            deliver_full_block(result.block, BlockSource::CmpctReconstructed);
+        } else if (result.merkle_mismatch || result.invalid) {
             // Defect 1: every slot filled but the reconstructed txs fail the header
             // Merkle root -> a short-ID collision substituted a wrong tx. Discard and
             // pull the authoritative full block; never deliver the mismatched one.
             LOG_WARNING << "[" << m_chain_label << "] Compact block " << blockhash.GetHex()
-                        << " reconstructed but FAILED header Merkle check — discarding, "
-                        << "requesting full block via getdata";
-            auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, blockhash)});
-            m_peer->write(getdata_msg);
+                        << (result.invalid ? " is malformed" : " reconstructed but FAILED header Merkle check")
+                        << " — discarding, requesting full block via getdata";
+            notify_cmpct_outcome(blockhash, result.invalid ? CmpctOutcome::Invalid
+                                                           : CmpctOutcome::MerkleMismatch);
+            request_block_body(blockhash);
         } else {
             LOG_INFO << "[" << m_chain_label << "] Compact block incomplete, "
                      << result.missing_indexes.size() << " txs missing — requesting via getblocktxn";
             // Save pending state and request missing transactions
-            m_pending_cmpct = std::make_unique<CompactBlock>(cb);
-            m_pending_missing_indexes = result.missing_indexes;
-
             BlockTransactionsRequest req;
             req.blockhash = blockhash;
             req.indexes = result.missing_indexes;
+            m_pending_cmpct = std::make_unique<CompactBlock>(cb);
+            m_pending_cmpct_hash = blockhash;
+            m_pending_partial = std::move(result);
+
             auto req_msg = message_getblocktxn::make_raw(req);
             m_peer->write(req_msg);
+            notify_cmpct_outcome(blockhash, CmpctOutcome::AwaitingBlocktxn);
         }
     }
 
@@ -911,39 +1053,87 @@ private:
     {
         auto& resp = msg->m_response;
 
-        if (!m_pending_cmpct || m_pending_missing_indexes.empty()) {
+        if (!m_pending_cmpct || m_pending_partial.missing_indexes.empty()) {
             LOG_WARNING << "[" << m_chain_label << "] Received blocktxn without pending compact block";
             return;
         }
-
-        if (resp.txs.size() != m_pending_missing_indexes.size()) {
-            LOG_WARNING << "[" << m_chain_label << "] blocktxn size mismatch: got "
-                        << resp.txs.size() << ", expected " << m_pending_missing_indexes.size();
-            m_pending_cmpct.reset();
-            m_pending_missing_indexes.clear();
+        if (resp.blockhash != m_pending_cmpct_hash) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn for "
+                        << resp.blockhash.GetHex().substr(0, 16)
+                        << "... does not match the pending compact block "
+                        << m_pending_cmpct_hash.GetHex().substr(0, 16) << "... — ignored";
             return;
         }
 
-        // Reconstruct the full block with the missing transactions
-        auto& cb = *m_pending_cmpct;
-        size_t total_txs = cb.short_ids.size() + cb.prefilled_txns.size();
-        std::vector<MutableTransaction> txs(total_txs);
-        std::vector<bool> filled(total_txs, false);
+        // Fill exactly the slots the first pass left empty (litecoind
+        // PartiallyDownloadedBlock::FillBlock), then verify the header Merkle
+        // root (Defect 1 backstop: a collision or a malicious blocktxn answer
+        // never reaches the UTXO cache) and carry the v3 MWEB field.
+        const CompactBlock cb = std::move(*m_pending_cmpct);
+        const uint256 blockhash = m_pending_cmpct_hash;
+        auto result = FillBlockFromBlocktxn(cb, m_pending_partial, resp.txs);
+        m_pending_cmpct.reset();
+        m_pending_partial = CompactBlockReconstructionResult{};
 
-        // Place prefilled transactions
-        for (const auto& pt : cb.prefilled_txns) {
-            if (pt.index < total_txs) {
-                txs[pt.index] = pt.tx;
-                filled[pt.index] = true;
-            }
+        if (!result.complete) {
+            LOG_WARNING << "[" << m_chain_label << "] blocktxn-completed block "
+                        << blockhash.GetHex()
+                        << (result.invalid ? " is malformed (got " + std::to_string(resp.txs.size()) + " txs)"
+                                           : std::string(" FAILED header Merkle check"))
+                        << " — discarding, requesting full block via getdata";
+            notify_cmpct_outcome(blockhash, result.invalid ? CmpctOutcome::Invalid
+                                                           : CmpctOutcome::MerkleMismatch);
+            request_block_body(blockhash);
+            return;
         }
 
-        // Re-match from mempool (same as cmpctblock handler).
-        // Defect 2: BIP 152 v2 short IDs are keyed by WTXID; the cmpctblock pass and
-        // BuildCompactBlock both use wtxid, so this pass must too. Keying by txid here
-        // would mis-key every segwit tx and ship default-constructed empties once a
-        // mempool is wired. For non-segwit txs wtxid == txid, so this is a strict
-        // superset of the old behaviour.
+        try { m_peer->get_block(blockhash, result.block); } catch (...) {}
+        auto header = static_cast<BlockHeaderType>(result.block);
+        try { m_peer->get_header(blockhash, header); } catch (...) {}
+
+        LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
+                 << blockhash.GetHex()
+                 << " txs=" << result.block.m_txs.size()
+                 << " mweb_raw=" << result.block.m_mweb_raw.size() << " bytes";
+        notify_cmpct_outcome(blockhash, CmpctOutcome::BlocktxnCompleted);
+        // The completed block is a full block like any other: UTXO, mempool
+        // cleanup and MWEB state all hang off the full_block event.
+        deliver_full_block(result.block, BlockSource::CmpctBlocktxn);
+    }
+
+    /// Plain 80-byte headers and standard blocks (LTC): no AuxPoW parser or
+    /// header sink installed.
+    bool standard_header_chain() const
+    {
+        return !m_raw_block_parser && !m_raw_headers_parser && !m_raw_headers_sink;
+    }
+
+    /// Fire the full_block event, tagging how the block arrived.
+    void deliver_full_block(BlockType& block, BlockSource source)
+    {
+        m_last_block_source = source;
+        m_coin->full_block.happened(block);
+        m_last_block_source = BlockSource::Block;
+    }
+
+    /// getdata for one block body from this peer (MSG_MWEB_BLOCK for an MWEB peer).
+    void request_block_body(const uint256& blockhash)
+    {
+        if (!m_peer) return;
+        auto getdata_msg = message_getdata::make_raw({inventory_type(block_body_inv_type(), blockhash)});
+        m_peer->write(getdata_msg);
+    }
+
+    void notify_cmpct_outcome(const uint256& blockhash, CmpctOutcome outcome)
+    {
+        if (m_on_cmpct_outcome)
+            m_on_cmpct_outcome(blockhash, outcome);
+    }
+
+    /// Transactions a compact block can be reconstructed from, keyed by wtxid
+    /// (BIP 152 v2/v3 short ids): the node's known txs and the mempool.
+    std::map<uint256, MutableTransaction> gather_known_txs() const
+    {
         std::map<uint256, MutableTransaction> known;
         for (const auto& [txid, tx] : m_coin->known_txs) {
             MutableTransaction mtx(tx);
@@ -955,65 +1145,7 @@ private:
             auto mp_txs = m_mempool->all_txs_map_wtxid();
             known.merge(mp_txs);
         }
-
-        uint64_t k0, k1;
-        cb.GetSipHashKeys(k0, k1);
-        std::map<uint64_t, const MutableTransaction*> sid_map;
-        for (const auto& [txid, tx] : known) {
-            ShortTxID sid = CompactBlock::GetShortID(k0, k1, txid);
-            sid_map[sid.to_uint64()] = &tx;
-        }
-
-        size_t sid_idx = 0;
-        for (size_t i = 0; i < total_txs; ++i) {
-            if (filled[i]) continue;
-            if (sid_idx < cb.short_ids.size()) {
-                auto it = sid_map.find(cb.short_ids[sid_idx].to_uint64());
-                if (it != sid_map.end() && it->second)
-                    txs[i] = *(it->second);
-                // else: will be filled from blocktxn response below
-            }
-            ++sid_idx;
-        }
-
-        // Fill in the missing transactions from blocktxn response
-        for (size_t i = 0; i < m_pending_missing_indexes.size(); ++i) {
-            uint32_t idx = m_pending_missing_indexes[i];
-            if (idx < total_txs)
-                txs[idx] = resp.txs[i];
-        }
-
-        // Build and deliver the full block
-        auto packed_hdr = pack(cb.header);
-        auto blockhash = Hash(packed_hdr.get_span());
-
-        BlockType block;
-        static_cast<BlockHeaderType&>(block) = cb.header;
-        block.m_txs = std::move(txs);
-
-        // Defect 1 backstop on the getblocktxn completion path (same invariant as
-        // ReconstructBlock): verify the header Merkle root before delivering. A
-        // collision or a malicious blocktxn response must never reach the UTXO cache.
-        if (ComputeTxMerkleRoot(block.m_txs) != cb.header.m_merkle_root) {
-            LOG_WARNING << "[" << m_chain_label << "] blocktxn-completed block "
-                        << blockhash.GetHex() << " FAILED header Merkle check — discarding, "
-                        << "requesting full block via getdata";
-            auto getdata_msg = message_getdata::make_raw({inventory_type(inventory_type::block, blockhash)});
-            m_peer->write(getdata_msg);
-            m_pending_cmpct.reset();
-            m_pending_missing_indexes.clear();
-            return;
-        }
-
-        m_peer->get_block(blockhash, block);
-        auto header = static_cast<BlockHeaderType>(block);
-        m_peer->get_header(blockhash, header);
-
-        LOG_INFO << "[" << m_chain_label << "] Compact block completed via blocktxn: "
-                 << blockhash.GetHex();
-
-        m_pending_cmpct.reset();
-        m_pending_missing_indexes.clear();
+        return known;
     }
 
     ADD_P2P_HANDLER(wtxidrelay)

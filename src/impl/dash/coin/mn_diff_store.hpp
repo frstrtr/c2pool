@@ -818,6 +818,20 @@ public:
             }
             out_total_registered = it->second.total_registered_count;
         }
+        // PoSe certainty bound: a diff row carries nPoSePenalty (the lower
+        // bound) but not nPoSePenaltyHi (replay_fold_engine.hpp keeps the
+        // row format unchanged), so a list replayed through ANY diff holds a
+        // stale upper bound. Widen it to the seed ceiling — the same
+        // "unknown" reading a v3 snapshot loads with — so every ReplayMNState
+        // this store hands out still satisfies lo <= dashd <= hi. (The
+        // store's consumers read the payee/SML fields; nothing here feeds
+        // the penalty oracle, which runs off the live engine.)
+        if (!path.empty()) {
+            const int32_t ceiling = DmlFoldEngine::kSeedPenaltyCeilingFactor
+                * pose::calc_max_pose_penalty(out.size());
+            for (auto& [protx, st] : out)
+                st.nPoSePenaltyHi = std::max(st.nPoSePenalty, ceiling);
+        }
 
         // ── Verify before trusting: DIP-4 SML root vs the committed root
         // at target. This proves the SET; the ORDER (nLastPaidHeight) is

@@ -55,28 +55,180 @@ wiring it to this transport is a follow-up.
 | `--alert-relay-online-after S` | back this long ⇒ BACK_ONLINE | 60 |
 | `--alert-relay-min-interval S` | min gap between OFFLINE alerts per worker | 600 |
 | `--alert-relay-startup-grace S` | no OFFLINE right after start | 600 |
-| `--alert-relay-stall-after S` | connected but no accepted share this long ⇒ down (0 = off) | 900 |
+| `--alert-relay-stall-after S` | connected but no accepted share this long ⇒ down (0 = presence only: a connection is up) | 900 |
 | `--alert-relay-retry-every S` | retransmit an unacked alert | 60 |
 | `--alert-relay-retry-max N` | total transmissions before "undelivered" | 60 |
+| `--alert-relay-serve-stall-after S` | origin: no work handed to hashing miners this long ⇒ WORK_STALLED, later WORK_RESUMED (0 = off) | 300 |
+| `--alert-relay-hashrate-min RATE` | origin: a worker hashing below RATE ⇒ HASHRATE_LOW, later HASHRATE_OK (0 = off). RATE ≈ 0.8 × the slowest healthy rig and ≥ 1.1 × a rig with one failed board, e.g. `1.35T` for 1.64-2.02 TH/s rigs (see "Choosing RATE"); units `1350G`, `1.35T`, `1.35TH/s`, a plain number is H/s | off |
+| `--alert-relay-hashrate-window S` | origin: seconds of shares per hashrate evaluation (120-86400) | 900 |
 
 ## Presence detection (origin)
 
 Every 5 s the node samples the same per-session stratum registry that feeds
 `/local_stats` (`DASHWorkSource::get_stratum_workers()`), keyed `ADDRESS.worker`.
 A worker is **up** while at least one session maps to its key and (if the stall
-check is on) it produced live evidence — a new session or an advancing accepted
-counter — within `stall-after`. Hashrate is not used as evidence: it is a 1000 s
-sliding average that keeps a dead rig "alive" for ~17 minutes.
+check is on) it produced live evidence — an advancing accepted-share counter —
+within `stall-after`. A connection alone is not evidence: all nodes are peers,
+and a rig keeps a failover (standby) connection to a node it does not mine on.
+With `stall-after 0` the check is off and a connection counts as up (presence
+only). Hashrate is not used as evidence: it is a 1000 s sliding average that
+keeps a dead rig "alive" for ~17 minutes.
+
+- **Standby.** A worker that never shared on this node is never paged: on
+  connect, flap, disconnect or after a restart (it is not persisted).
+- **Mining on another node.** A worker that hashed here and then went down
+  (disconnected, or connected but stalled) is not paged when its payout address
+  has a share minted on another node (received from a pool peer) more than
+  60 s after the worker's last share here and within the last 900 s, while no
+  worker of that address is up here. This is checked from the moment the
+  worker goes down, and it becomes standby here at once: it is neither paged
+  nor counted as hashing on this node; the node it now mines on is the one
+  that pages if it dies. The sharechain is read through the tracker's try-lock
+  (newest peer-received share per address over the last 400 shares) and cached
+  for 30 s; a cache older than 120 s counts as unreadable, and the OFFLINE
+  decision then waits up to 120 s more before it pages. Share times come from
+  the minting node's clock (NTP-synced peers assumed).
+- The dashboard applies the same rule to the same read
+  (`src/core/hashing_elsewhere.hpp`): a session that shared here, went silent
+  and whose address is mining on another node reads **standby** ("hashing
+  elsewhere"), not stalled. The pager and the dashboard therefore agree on a
+  failback rig.
+- Shares carry the payout address, not the worker name. With rigs of one
+  address on two nodes, a hung rig here is masked while none of its siblings
+  hashes here, and a rig that returned to its first pool is paged while a
+  sibling still hashes here.
+- Upgrade: an older build persisted standby workers too. Restored entries are
+  treated as rigs that hashed here; one that reconnects and never shares is
+  paged once at the end of the startup grace unless it is mining on another
+  node. Clear `workers` in `state.json` on a node that ran with standby rigs to
+  start clean.
 
 - OFFLINE fires after `offline-after` continuous seconds down, never inside the
   startup grace, and at most once per `min-interval` per worker.
 - BACK_ONLINE fires only after an emitted OFFLINE, once the worker has been up
   for `online-after`.
-- A worker never seen up never alerts. Known workers (and whether an OFFLINE is
-  outstanding) persist in `state.json`, so a restart neither forgets a rig that
-  never reconnects nor re-pages one already reported.
-- Global cap: 30 events per rolling hour; the first refused event produces one
-  digest message and refused events stay pending (they fire when the window frees).
+- A worker never seen up never alerts. Known workers that hashed here (and
+  whether an OFFLINE is outstanding) persist in `state.json`, so a restart
+  neither forgets a rig that never reconnects nor re-pages one already reported.
+- Global cap: 30 worker events per rolling hour; the first refused event produces
+  one digest message and refused events stay pending (they fire when the window
+  frees). The node-level events below have their own budget.
+
+## Node level: no work served (origin)
+
+The worker rules see rigs, not the node. On 2026-10-25 the bestCL gate of a
+daemonless node declined every template for 376 s while 26 rigs stayed attached
+and hashed the last job; the block they found (2561316) sat on a dead parent and
+was orphaned. `[STALE-SERVE] check=serve-silence` logged it at 300 s, and nothing
+reached the operator. The same 5 s tick therefore also reads when a template was
+last handed to a miner (the datum the serve-silence check reads):
+
+- **WORK_STALLED** fires once per episode when no template has been handed out for
+  `serve-stall-after` seconds while hashing sessions are attached, not inside the
+  startup grace and not within `min-interval` of the previous one. The quiet time
+  counts from the later of the last hand-out and the start of the attached span
+  (a span survives a gap under 60 s, so a reconnecting rig does not restart it).
+  Text: `WORK STALLED: no new work for miners for 6m (cause bestcl-stale);
+  26 miner sessions attached (+2 standby)`. The cause is the serve gate's decline
+  cause (`no_work_reason` on `/api/node_topology`), read only to build the page.
+- **WORK_RESUMED** fires once a template is handed out again: `WORK RESUMED: new
+  work for miners again after 6m (cause was bestcl-stale); 26 miner sessions
+  attached`.
+- **Standby sessions do not count.** With no session, or only standby sessions,
+  nothing pages: a standby connection is a failover link that never submits here,
+  so no hashrate is lost on this node. A rig that hashes here leaves standby with
+  its first accepted share and stays so across restarts (persisted). Missed by
+  design: a rig failing over here from a dead pool while this node is already
+  stalled never gets a job, so it stays standby.
+- Own budget: at most 4 node-level events per rolling hour, outside the
+  30/h worker cap, so a rig flap (26 OFFLINE + 26 BACK_ONLINE) cannot hold a
+  real WORK_STALLED back. An event the budget refuses stays pending and goes
+  out when the window frees, if still due.
+- An outstanding WORK_STALLED is persisted (`serve` in `state.json`), so a
+  restart neither pages the episode twice nor loses its WORK_RESUMED.
+- Status: `detector.serve` on `/api/alert-relay/status` (quiet, sessions,
+  standby_sessions, alerted, since, cause, held_by_budget).
+
+## Worker level: low hashrate (origin, opt-in)
+
+A rig that keeps submitting at reduced speed (a dead hashboard) stays up, so
+OFFLINE never pages it. With `--alert-relay-hashrate-min RATE` the same 5 s tick
+also measures each hashing worker's rate from the work it delivered here:
+
+- **Measurement.** Per session, the advance of the accepted-share counter and of
+  the accepted work (the sum of the difficulty each accepted share is credited
+  at, recorded by the stratum session next to its hashrate tracker), and the
+  exposure `dt / (vardiff × 2^32)`. Over a window (`hashrate-window`, 900 s)
+  that ends at the worker's last share: `rate = work × 2^32 / T`, the share
+  count N, and the count expected at the threshold, Λ = RATE × exposure.
+- **Test.** Every window/3 (with new shares since the previous evaluation):
+  low evidence = rate < RATE and P(Poisson(Λ) ≤ N) < 0.05; ok evidence = rate >
+  1.1 × RATE and P(Poisson(1.1 Λ) ≥ N) < 0.05. HASHRATE_LOW fires after two
+  consecutive evaluations with low evidence, HASHRATE_OK after two with ok
+  evidence while a LOW is outstanding. [RATE, 1.1 RATE] is the hysteresis band:
+  a rig inside it keeps its state, so a rig at the threshold pages once.
+  Consecutive evaluations overlap (each window shares 2/3 of its shares with
+  the previous one), so two in a row is not α²: for a rig at the threshold the
+  pair probability at α = 0.05 is ≈ 0.018 (≈ 7 α²). The measured rates below
+  are simulated end to end and already include this; do not tighten α
+  expecting a square.
+  Text: `worker X.D7 HASHRATE LOW 1.05 TH/s < 1.20 TH/s (15 min)` and
+  `worker X.D7 hashrate OK again 1.78 TH/s (threshold 1.20 TH/s, 15 min); low for 47m`.
+- **What a window can tell.** At the DASH vardiff (a share per ~10 s) a 900 s
+  window holds ~90-180 shares, so a rate is known to about ±10 %, and the test
+  level trades detection delay against pages for rigs just above the
+  threshold. Measured on simulated shares (1.2 TH/s threshold, 900 s window,
+  two evaluations):
+
+  | level | 1.8 → 1.0 TH/s: median delay | within 3 windows | pages per 210 rig-days at 1.32 / 1.44 TH/s |
+  |---|---|---|---|
+  | 0.001 | 8.9 windows | 12 % | 0 / 0 |
+  | 0.02 | 2.6 windows | 62 % | 4 / 0 |
+  | **0.05** (default) | 1.6 windows | 81 % | 15 / 2 |
+
+  Healthy rigs at 1.5× the threshold never page at any of these levels (the
+  KATs measure a week of 30 rigs).
+- **Choosing RATE.** Rule: RATE ≈ 0.8 × the slowest healthy rig, and ≥ 1.1 ×
+  the rate of a rig with one failed board. A rig within ~20 % above RATE is in
+  the gray zone: it pages now and then, and its outstanding LOW then masks
+  any later real drop on it until HASHRATE_OK (one LOW per episode). A rig
+  that loses one of three boards (1.77 → 1.18 TH/s) sits right at a 1.2 TH/s
+  threshold and cannot be told from it in useful time. Simulated for a fleet
+  of 30 rigs at 1.64-2.02 TH/s (420 rig-days, window 900 s) and a dead board
+  (1.77 → 1.18 TH/s, 100 trials):
+
+  | RATE | healthy fleet: LOW pages in 420 rig-days | dead board paged: median | p90 | worst |
+  |---|---|---|---|---|
+  | 1.2T | 0 | 4.0 h | 15 h | 21 h |
+  | **1.35T** | 0 | 28 min | 74 min | 2.2 h |
+  | 1.5T | 6 | 18 min | 29 min | 48 min |
+
+  So for that fleet: `--alert-relay-hashrate-min 1.35T`. After the first week
+  read `detector.hashrate.low_evidence / evaluations` on
+  `/api/alert-relay/status`: it should stay around 1e-4 or below. Higher
+  means a rig has drifted into the gray zone (per-worker `hashrate_low` and
+  `hashrate` show which): lower RATE a step, or use
+  `--alert-relay-hashrate-window 1800` (about half the gray-zone evidence, a
+  dead board paged ~15 min later).
+- **One worker name per rig.** Sessions of one worker name are judged as one
+  rig on their combined rate (the same key OFFLINE uses), so with two rigs
+  under one name a dead board on one of them is invisible.
+- **Not judged** (no page either way): standby workers and connections (they
+  submit nothing here); a worker that is down (OFFLINE's business; a window
+  ending at the last share never sees the silence of a rig that stopped or
+  moved to another node); a worker without a full window of settled data: the
+  data restart when its session set changes, when it comes back up, after a
+  gap of 20 share intervals at the threshold rate (a paused rig is not a slow
+  one), and while a WORK_STALLED is outstanding (the node is at fault, not the
+  rigs), and they count from 180 s later (vardiff ramp-up).
+- **Budget.** The worker events' 30/h cap (digest, held events stay pending);
+  a LOW not within `min-interval` of the worker's previous LOW; nothing inside
+  the startup grace. An outstanding LOW is persisted (`hashrate_low` under
+  `workers` in `state.json`) and outlives an OFFLINE episode: no second LOW
+  when the rig comes back still slow, one HASHRATE_OK when it hashes at speed
+  again. A worker that moved to another node drops it silently.
+- Status: `detector.hashrate` (min, window, evaluations, low_evidence) and,
+  per worker, `hashrate` (last measured H/s) and `hashrate_low`.
 
 ## Wire format
 
@@ -90,9 +242,14 @@ var relay_pubkey(33) | var signature` — status 1 delivered (Telegram ok:true),
 malformed body), 4 queued at the relay (sidecar has not delivered yet), 5 expired
 at the relay (the sidecar will not page it: too old).
 
-Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test) |
-event_ts u32 | label | worker | detail` (length-prefixed, clipped to 32/64/128
-bytes). The strings are UTF-8: the origin replaces malformed bytes with `?` and
+Body plaintext: `kind(1: offline, 2: back_online, 3: digest, 4: test,
+5: work_stalled, 6: work_resumed, 7: hashrate_low, 8: hashrate_ok) | event_ts u32 |
+label | worker | detail` (length-prefixed, clipped to 32/64/128 bytes; the
+node-level kinds 3-6 carry an empty worker). Kinds 5-8 changed nothing outside
+the sealed body, so an older forwarder carries them unchanged; an older relay
+(kinds 1-4, or 1-6 for 7 and 8) refuses them with a signed status 3, which the
+origin records in its ledger and warns about. The page is then lost: ship the
+relay (and its sidecar) together with, or before, its origins. The strings are UTF-8: the origin replaces malformed bytes with `?` and
 clips on a code-point boundary (Cyrillic worker names and labels are common),
 and the relay refuses a body whose strings are not well-formed UTF-8
 (status 3; such a frame is never cached in the seen set). Every JSON dump on
@@ -340,18 +497,43 @@ counters. The origin's outbox block also carries `stale_refusal`.
   which stops re-arming on an unguarded throw); a stale re-probe crossing a
   restarted forwarder to recover a lost delivered ack; the writer queue cap and
   trailing-Replace coalescing, and the relay deferring alerts when the queue is
-  full; the sidecar's `expired.jsonl` acked "expired" at once.
+  full; the sidecar's `expired.jsonl` acked "expired" at once. Node level:
+  WORK_STALLED once at the threshold with its fields and no repeat in the
+  episode, WORK_RESUMED on recovery, no page with zero or standby-only
+  sessions, the startup grace and the reconnect span, kinds 5/6 on the wire and
+  an older relay's refusal, delivery through a forwarder and an origin restart
+  mid-episode, the main_dash wiring of the serve sample, and the node-level
+  budget (a saturated worker cap does not hold WORK_STALLED back; the budget
+  itself is bounded). Hashrate (simulated Poisson shares at the DASH vardiff,
+  fixed seeds): 30 healthy 1.8 TH/s rigs for a week never page (the measured
+  false-alarm rate is printed), rigs 10 % / 20 % above the threshold, a drop
+  to 1.0 TH/s paging exactly once (delay distribution over 200 trials), the
+  recovery paging HASHRATE_OK once, standby / failback / hung / just-connected
+  / reconnecting / vardiff ramp-up / paused rigs never paging LOW, no second
+  page around an OFFLINE episode or a node restart, no LOW during WORK_STALLED,
+  the worker cap and min-interval, the exact Poisson tails, the rate parser,
+  kinds 7/8 on the wire with an older relay's refusal, and the stratum and
+  main_dash wiring.
 - `scripts/alert_relay_telegram.py --selftest`: fake in-process Bot API (200,
   429 retry_after, 500, ok:false, connection refused, restart, token redaction,
   `--max-age` for new rows and for rows that age out while being retried, the
   `expired.jsonl` contract the node reads, and the destination group: a negative
   `-100...` id is carried unchanged as a JSON integer, and the CLI refuses to
-  start with no id or with a private-chat id).
+  start with no id or with a private-chat id; the node-level kinds render
+  without a worker; the hashrate kinds render worker, rate, threshold and
+  window).
 - `scripts/alert_relay_e2e.sh`: two nodes + fake Telegram + stratum simulator on
   loopback with a private network id, plus a master-built peer and a flag-off
   parity phase.
 
 ## Follow-ups (not in this change)
+
+- Hashrate: a fleet-correlation guard. A node-side cause that thins ACCEPTED
+  shares for every rig at once (a stale-job window, a reject regression,
+  upstream latency) would page each rig HASHRATE_LOW (up to the 30/h cap plus
+  a digest); WORK_STALLED covers only "no template handed out". If more than
+  N % of the hashing workers show low evidence in the same round, emit one
+  node-level event instead of per-worker LOWs.
 
 - On master, a dash node never re-dials a `--connect`/`--addnode` peer whose
   dial was refused: `dash::NodeImpl` has no `connect_failed()` override, so the

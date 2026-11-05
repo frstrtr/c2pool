@@ -15,8 +15,8 @@
 // the daemon TU and the stdlib-only relay KATs never see core's include paths
 // (the xmr_web_dashboard pattern, src/c2pool/CMakeLists.txt).
 //
-// One file per pool id + network: <data-dir>/relay_peers_<net>_<pool-tag 16 hex>.json
-// (a book can therefore only ever answer FB_GETADDR with peers of ITS pool).
+// One file per pool id + network: <data-dir>/relay_peers_<net>_<pool_id 16 hex>.json, pool_id the C23
+// pool identity (pathb_pool_identity.hpp); a book answers FB_GETADDR with peers of its pool only.
 // core::AddrValue carries: m_first_seen / m_last_seen = PeerRecord's, and
 // m_service = the relay flags  bit 0 GOOD | bits 8..15 consecutive dial failures.
 // ===========================================================================
@@ -40,8 +40,8 @@ inline void peer_service_apply(std::uint64_t svc, PeerRecord& r) {
     r.fails = static_cast<std::uint32_t>((svc >> 8) & 0xff);
 }
 
-inline std::string peerstore_file_name(std::uint8_t network, const std::string& pool_tag_hex) {
-    return "relay_peers_" + std::to_string(network) + "_" + pool_tag_hex.substr(0, 16) + ".json";
+inline std::string peerstore_file_name(std::uint8_t network, const std::string& pool_id_hex) {
+    return "relay_peers_" + std::to_string(network) + "_" + pool_id_hex.substr(0, 16) + ".json";
 }
 
 // Load every record of the store at `path` (created empty if absent). false +

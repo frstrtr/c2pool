@@ -25,6 +25,7 @@
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
 #include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
+#include <impl/dash/coin/inject_dry_run_causes.hpp> // N3: the causes only the dry run answers
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -38,13 +39,17 @@
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+#include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
 #include <ctime>
 
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,7 +59,7 @@ namespace coin {
 /// Where the currently-held best ChainLock came from. The bestCL* fields are
 /// COMMITTED into the coinbase of every template we serve, and dashcore
 /// re-verifies a non-null committed signature with BLS
-/// (specialtxman.cpp:164-167 VerifyChainLock => bad-cbtx-invalid-clsig), so
+/// (specialtxman.cpp:74-88 VerifyChainLock => bad-cbtx-invalid-clsig), so
 /// "how do we justify this signature" is a consensus question, not bookkeeping.
 ///
 ///  - Unknown        : no provenance recorded. FAIL-CLOSED — the consensus-exact
@@ -76,10 +81,62 @@ enum class ClProvenance { Unknown, ChainCommitted, BlsVerified };
 ///
 ///  - Off             : no bestCL gate (pre-#780 behaviour).
 ///  - Freshness       : the ORIGINAL proxy — require the best observed ChainLock
-///                      to be within one block of the tip. Conservative,
-///                      over-restrictive, and the DEFAULT when the gate is on.
-///  - ConsensusExact  : require exactly what dashcore requires, no more.
+///                      to be within one block of the tip. Over-restrictive;
+///                      kept selectable (--bestcl-policy freshness) as the
+///                      rollback.
+///  - ConsensusExact  : require exactly what dashcore requires, no more. The
+///                      node DEFAULT (kDefaultBestClPolicy).
 enum class BestClPolicy { Off, Freshness, ConsensusExact };
+
+/// The policy a node runs when its embedded arm is armed and --bestcl-policy
+/// is not given.
+///
+/// ConsensusExact, under the operator's C4 rule (2026-08-08): a consensus-exact
+/// check may change served bytes unflagged. It refuses only what dashcore's
+/// CheckCbTxBestChainlock would refuse; Freshness is a stricter proxy that
+/// dashd itself never applies.
+///
+/// THE INCIDENT THAT MOVED THE DEFAULT (DASH mainnet, 2026-10-25). Blocks
+/// 2561315..2561318 carried no ChainLock. Under Freshness the gate declined
+/// every template for 376 s; the node is daemonless, so nothing else served,
+/// and the miners kept hashing the last job. They found 2561316 on a parent
+/// the network had already left, and it was orphaned. Under ConsensusExact the
+/// node re-commits block H-1's ChainLock, as dashd's own miner does, and keeps
+/// serving.
+inline constexpr BestClPolicy kDefaultBestClPolicy = BestClPolicy::ConsensusExact;
+
+/// The --bestcl-policy spelling of a policy. "off" is printed for Off but is
+/// not a selectable value: Off is what a node without an embedded arm runs.
+constexpr const char* bestcl_policy_name(BestClPolicy p)
+{
+    switch (p) {
+    case BestClPolicy::Freshness:      return "freshness";
+    case BestClPolicy::ConsensusExact: return "consensus-exact";
+    default:                           return "off";
+    }
+}
+
+/// Parse a --bestcl-policy value. nullopt for anything that is not a
+/// selectable policy; the node refuses to start on it rather than guess.
+inline std::optional<BestClPolicy> parse_bestcl_policy(const std::string& s)
+{
+    if (s == bestcl_policy_name(BestClPolicy::ConsensusExact))
+        return BestClPolicy::ConsensusExact;
+    if (s == bestcl_policy_name(BestClPolicy::Freshness))
+        return BestClPolicy::Freshness;
+    return std::nullopt;
+}
+
+/// The policy a node installs on its NodeCoinState. Off without an embedded
+/// arm (work_source never consults viability then); otherwise the
+/// --bestcl-policy value, and the default for a value that does not parse
+/// (unreachable from the CLI, which refuses one).
+inline BestClPolicy resolve_bestcl_policy(bool embedded_arm_enabled,
+                                          const std::string& flag)
+{
+    if (!embedded_arm_enabled) return BestClPolicy::Off;
+    return parse_bestcl_policy(flag).value_or(kDefaultBestClPolicy);
+}
 
 /// What the embedded arm does while the UTXO/fee lane is below its maturity
 /// depth (UtxoLane::mining_utxo_ready == false, i.e. blocks_connected < 106).
@@ -137,7 +194,20 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 /// through select_work().
 class NodeCoinState {
 public:
-    NodeCoinState() = default;
+    NodeCoinState() {
+        // VERIFY-S2b S-B / #2121: a rewind puts back only the injects this
+        // ledger still wants. The ledger releases an inject when it leaves the
+        // mempool (reconcile_inject_pool) but keeps its record in the released
+        // ledger as deep as the mempool's confirmed keep, so a confirmed inject
+        // a rewind takes out is put back and re-tracked with its original
+        // metadata. One whose expiry_height the next block passes, or one the
+        // active caps have no room for, stays out instead of coming back
+        // untracked. Called inside Mempool::readmit_disconnected_injects on the
+        // io thread (the lane's rewind).
+        m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
+            return m_inject_pool.still_wanted(txid, next_block_height());
+        });
+    }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
 
@@ -157,6 +227,9 @@ public:
     // mnstates() bumps too: the confirmation-pass projection reads MN
     // registration heights from it (sml_projection.hpp).
     MnStateMachine& mnstates() { bump_root_memo_epoch(); return m_mnstates; }
+    // Read-only view (no epoch bump): the payee ordered-connect cursor and the
+    // gap-seed capture read the queue per block and per tick.
+    const MnStateMachine& mnstates() const { return m_mnstates; }
     // Mempool contents feed the template TX SET, not either committed root —
     // no epoch bump (a per-tx bump would chill the memo for nothing).
     Mempool&        mempool()  { return m_mempool; }
@@ -252,14 +325,14 @@ public:
     /// block's coinbase CCbTx.
     ///
     /// THIS IS THE DATUM THE CONSENSUS RULE IS STATED IN. dashcore's
-    /// CheckCbTxBestChainlock (dash v23.1.7 src/evo/specialtxman.cpp:102-177)
-    /// constrains our block at height H only RELATIVE to what block H-1
-    /// committed:
+    /// CheckCbTxBestChainlock (src/evo/specialtxman.cpp:32-98, the same in dash
+    /// v23.1.7 and v23.1.8) constrains our block at height H only RELATIVE to
+    /// what block H-1 committed:
     ///
-    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :129-131
-    ///     if (prevCL) {
-    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :134-137
-    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :138-140
+    ///     prevCL = GetNonNullCoinbaseChainlock(pindex->pprev)   // :54-60
+    ///     if (prevCL) {                                         // :62-71
+    ///         if (!cbTx.bestCLSignature.IsValid())      -> bad-cbtx-null-clsig    // :64-67
+    ///         if (cbTx.bestCLHeightDiff > prevCL.diff+1) -> bad-cbtx-older-clsig  // :68-70
     ///     }
     ///
     /// i.e. "committed CL height must not go BACKWARDS from the previous
@@ -363,6 +436,16 @@ public:
     /// the folded root over the served body and refuses on any mismatch.
     void set_include_mn_special_txs(bool v) { m_include_mn_special_txs = v; }
     bool include_mn_special_txs() const { return m_include_mn_special_txs; }
+
+    /// B.9: the BLS verifier for the operator signature of ProUpServTx /
+    /// ProUpRevTx in the types 1-4 fold — the builder's and the emit gate's
+    /// (one context, sml_special_fold.hpp). c2pool-dash wires
+    /// vendor::verify_protx_operator_sig. UNSET (default) => the fold refuses
+    /// both types: no provider tx whose signature we cannot check ever rides.
+    void set_protx_operator_sig_verifier(MnFoldContext::OperatorSigFn fn)
+    {
+        m_protx_sig_verifier = std::move(fn);
+    }
 
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
@@ -489,6 +572,10 @@ public:
         m_curtime              = curtime;
         m_version              = version;
         m_populated            = true;
+        // S2: an inject whose expiry_height the new tip reached leaves the pool
+        // and the mempool now, not at the next submit. #2121: so does one that
+        // left the mempool (the lane's hook usually released it already).
+        reconcile_inject_pool();
     }
 
     /// Invalidate the bundle (reorg / mempool flush / MN list gap) so the next
@@ -623,10 +710,15 @@ public:
     /// finality / double-spend) runs at template build and DROPS an invalid
     /// inject there — it is never served. `flags` and `expiry_height` are the
     /// design's wire fields (carried for M2/M3). io-thread only.
+    /// `max_fee` (S2): the highest fee the submitter allows; a priced fee above
+    /// it refuses inject-fee-above-max. The library default is no cap; the
+    /// operator entry points in main_dash pass 0 (the zero-fee sweep) unless
+    /// the submit body names one.
     InjectSubmitResult submit_inject(const MutableTransaction& tx,
                                      uint32_t flags = 0,
                                      int32_t expiry_height = 0,
-                                     InjectOrigin origin = InjectOrigin::Local) {
+                                     InjectOrigin origin = InjectOrigin::Local,
+                                     uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         InjectSubmitResult r;
         r.txid = dash::coin::dash_txid(tx);
         if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
@@ -719,8 +811,8 @@ public:
                 r.cause = sb.name(); return r;
             }
         }
-        // Lazily reconcile the pool with the mempool before admitting: forget
-        // any tracked inject no longer in the mempool (confirmed / evicted) and
+        // Reconcile the pool with the mempool before admitting: release any
+        // tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
@@ -731,35 +823,223 @@ public:
         }
         // Mempool admission with priority (runs the validity/dedup/script-armed
         // gate). Priority = offered first, NOT a guard bypass.
-        auto gv = m_mempool.add_inject(tx);
+        auto gv = m_mempool.add_inject(tx, max_fee);
         if (gv != dash::coin::Mempool::InjectGate::Ok) {
             r.cause = dash::coin::Mempool::inject_gate_name(gv); return r;
         }
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
         publish_inject_status();
+        // S4: mirror the new entry into the read-only per-inject ledger.
+        if (const auto e = m_inject_pool.entry(r.txid))
+            core::obs::inject_ledger().upsert(to_ledger_entry(*e));
         r.ok = true;
         r.cause = "ok";
         return r;
     }
 
-    /// Reconcile the inject ledger with the live mempool + tip: drop tracked
-    /// injects that have left the mempool (confirmed / conflict-evicted) or have
-    /// expired, evicting the expired ones from the mempool too. Called lazily
-    /// from submit_inject and exposed for a block-connect wiring in a later PR.
+    /// Outcome of validate_inject (POST /api/tx-inject/validate).
+    struct InjectValidateResult {
+        bool        ok{false};           // would_admit, a known tip, no input immature at
+                                         // next_height, no other pool tx spending an input
+        bool        would_admit{false};  // submit_inject would answer "ok" now (its rate
+                                         // limiter aside: the dry run does not charge it)
+        std::string cause;               // the first refusal in submit order, then
+                                         // the dry-run-only causes
+                                         // (inject_dry_run_causes.hpp); else "ok"
+        std::string gate;                // Mempool::add_inject's verdict ("" when a
+                                         // structural check refused before it)
+        uint256     txid;
+        bool        armed{false};
+        uint32_t    next_height{0};      // 0: tip unknown
+        uint32_t    immature_at_next_height{0};
+        bool        analysed{false};     // the mempool dry run ran (inputs / fee below)
+        Mempool::InjectDryRun dry;
+    };
+
+    /// Dash coinbase maturity (consensus.h COINBASE_MATURITY).
+    static constexpr uint32_t kCoinbaseMaturity = 100;
+
+    /// The dry run of submit_inject (c2wallet Scan & Plan N3): the same gate
+    /// in the same order, answered without admitting anything — the inject
+    /// ledger, the mempool, the fee deltas, the submit rate windows and the
+    /// status counters are left exactly as they were (no reconcile, no
+    /// admission; Mempool::validate_inject prices on a scratch entry). Its
+    /// one write is its own budget: like a submit it is charged on attempt
+    /// (after the charge-free type and size checks, before the sandbox and
+    /// the script verify, armed or not) to m_inject_rate_validate, a local
+    /// window of its own, so a preflight loop cannot hold the io thread and
+    /// cannot spend the operator's submit budget. It adds what admission does
+    /// not check: each input's coin, its maturity at the next height (a
+    /// coinbase input needs height + 100 <= next_height; the template build
+    /// would drop an immature inject silently), and any other pool tx
+    /// spending an input. A tx the structural checks refuse (type, size,
+    /// sandbox) or the budget refuses is not analysed. io-thread only, like
+    /// submit_inject (it reads the inject ledger and the tip).
+    InjectValidateResult validate_inject(const MutableTransaction& tx,
+                                         uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectValidateResult r;
+        r.txid = dash::coin::dash_txid(tx);
+        r.armed = m_tx_inject_enabled;
+        r.next_height = m_prev_height != 0 ? m_prev_height + 1 : 0;
+        std::string structural;
+        const uint32_t byte_size = static_cast<uint32_t>(::pack(tx).get_span().size());
+        if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+            structural = "inject-type-unsupported";
+        } else if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            structural = dash::coin::TxInjectPool::admit_name(dash::coin::TxInjectPool::Admit::TooLarge);
+        }
+        if (structural.empty()) {
+            const auto rl = m_inject_rate_validate.try_consume(byte_size, std::time(nullptr));
+            if (!rl.ok()) {
+                r.cause = rl.name();   // the dry run itself was refused, armed or not
+                return r;
+            }
+            const auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) structural = sb.name();
+        }
+        if (!structural.empty()) {
+            r.cause = r.armed ? structural : "inject-disabled";
+            return r;
+        }
+        r.dry = m_mempool.validate_inject(tx, max_fee);
+        r.analysed = true;
+        r.gate = dash::coin::Mempool::inject_gate_name(r.dry.gate);
+        const auto pv = m_inject_pool.would_admit(r.txid, byte_size);
+        bool conflict = false;
+        for (const auto& in : r.dry.inputs) {
+            if (in.pool_spender) conflict = true;
+            if (r.next_height != 0 && in.resolved && in.coinbase &&
+                static_cast<uint64_t>(in.height) + kCoinbaseMaturity > r.next_height)
+                ++r.immature_at_next_height;
+        }
+        r.would_admit = r.armed && pv == dash::coin::TxInjectPool::Admit::Ok &&
+                        r.dry.gate == dash::coin::Mempool::InjectGate::Ok;
+        if (!r.armed) r.cause = "inject-disabled";
+        else if (pv != dash::coin::TxInjectPool::Admit::Ok) r.cause = dash::coin::TxInjectPool::admit_name(pv);
+        else if (r.dry.gate != dash::coin::Mempool::InjectGate::Ok) r.cause = r.gate;
+        else if (r.next_height == 0) r.cause = inject_dry_run_cause::kTipUnknown;
+        else if (r.immature_at_next_height != 0) r.cause = inject_dry_run_cause::kImmatureCoinbaseInput;
+        else if (conflict) r.cause = inject_dry_run_cause::kInputSpentInMempool;
+        else r.cause = "ok";
+        r.ok = r.cause == "ok";
+        return r;
+    }
+
+    /// Reconcile the inject ledger with the live mempool + tip (#2121). After
+    /// it, the active set equals Mempool::inject_txids_in_pool(): nothing that
+    /// left the mempool counts against the caps, and every inject in the
+    /// mempool is tracked. Five steps, io thread:
+    ///   1. expiry: reap the injects the next block passes (expiry_height != 0
+    ///      && next height > expiry_height) and evict them from the mempool;
+    ///   2. read the injects live in the mempool;
+    ///   3. release every tracked inject that is not live (confirmed or
+    ///      conflict-evicted by a block); its record stays in the released
+    ///      ledger for a rewind;
+    ///   4. re-track every live inject that is not tracked: a rewind put it
+    ///      back (original metadata from the released ledger), or it has no
+    ///      record (tracked fresh: flags 0, expiry 0, its mempool size). A
+    ///      refusal by the caps evicts it from the mempool again by name;
+    ///   5. prune released records the undo-keep depth no longer reaches.
+    /// Then the status mirror is published. Called from submit_inject (before
+    /// the caps check), set_tip (every tip advance), and the UTXO lane's
+    /// mempool-changed hook (main_dash: after every block connect / rewind the
+    /// lane runs, so a confirm releases before the next promotion).
+    /// Rate-limiter windows are never refunded here.
     void reconcile_inject_pool() {
-        if (m_inject_pool.empty()) return;
-        // Expiry against our own tip.
+        const int32_t next_h = next_block_height();
+        // (1) Expiry against our own tip.
         if (m_prev_height != 0) {
-            for (const auto& id : m_inject_pool.reap_expired(
-                     static_cast<int32_t>(m_prev_height + 1))) {
+            for (const auto& id : m_inject_pool.reap_expired(next_h)) {
                 m_mempool.remove_tx(id);
             }
         }
+        // (2) The injects live in the mempool.
+        const std::vector<uint256> live = m_mempool.inject_txids_in_pool();
+        const std::set<uint256> live_set(live.begin(), live.end());
+        // (3) Release what left the mempool.
+        for (const auto& id : m_inject_pool.tracked_ids()) {
+            if (live_set.count(id)) continue;
+            m_inject_pool.release(id, m_prev_height);
+            LOG_INFO << "[MEMPOOL] inject released txid=" << id.GetHex().substr(0, 16)
+                     << " cause=left-mempool height=" << m_prev_height;
+        }
+        // (4) Re-track what came back (or was never tracked), PARENTS FIRST. A
+        //     rewind can put back a parent and its child together while the
+        //     caps have room for only part of the set (still_wanted checked
+        //     each one against the same active set, before any of them came
+        //     back). In txid order the parent could be the one refused, leaving
+        //     the child live and tracked with an input that is neither in the
+        //     view nor in the pool. In topological order the parent takes the
+        //     room first, and a refused inject takes its live descendants with
+        //     it: an untracked one is refused by name, a tracked one evicted.
+        std::vector<uint256> untracked;
+        for (const auto& id : live)
+            if (!m_inject_pool.contains(id)) untracked.push_back(id);
+        std::set<uint256> refused;
+        std::vector<uint256> retracked;
+        for (const auto& id : inject_parents_first(untracked)) {
+            const char* how = "rewind";
+            std::string cause;
+            if (spends_one_of(id, refused)) {
+                cause = "inject-pool-parent-refused";
+            } else {
+                auto v = m_inject_pool.retrack(id);
+                if (v == TxInjectPool::Admit::NotTracked) {
+                    how = "untracked";
+                    const auto e = m_mempool.get_entry(id);
+                    v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+                }
+                if (v != TxInjectPool::Admit::Ok) cause = TxInjectPool::admit_name(v);
+            }
+            if (!cause.empty()) {
+                refused.insert(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject readmit refused txid=" << id.GetHex().substr(0, 16)
+                            << " cause=" << cause
+                            << "; evicted from the mempool, resubmit it if it is still wanted";
+            } else {
+                LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
+                         << " cause=" << how;
+                retracked.push_back(id);
+            }
+        }
+        // A tracked inject that spends a refused one (its child came back in an
+        // earlier rewind) cannot ride without it: evict it too, transitively.
+        for (bool more = !refused.empty(); more;) {
+            more = false;
+            for (const auto& id : m_inject_pool.tracked_ids()) {
+                if (!spends_one_of(id, refused)) continue;
+                refused.insert(id);
+                m_inject_pool.forget(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject evicted txid=" << id.GetHex().substr(0, 16)
+                            << " cause=inject-pool-parent-refused"
+                            << "; resubmit it with its parent if it is still wanted";
+                more = true;
+            }
+        }
+        // (5) Released records a rewind can no longer reach.
+        if (m_prev_height != 0)
+            m_inject_pool.prune_released(m_prev_height, Mempool::kConfirmedInjectDepth);
         publish_inject_status();
+        // S4: the read-only per-inject ledger follows the active set: the
+        // re-tracked / fresh entries are (re)inserted, everything else that
+        // is no longer tracked (released, reaped, refused) is dropped.
+        auto& ledger = core::obs::inject_ledger();
+        for (const auto& id : retracked)
+            if (const auto e = m_inject_pool.entry(id)) ledger.upsert(to_ledger_entry(*e));
+        ledger.retain(m_inject_pool.tracked_ids());
+        ledger.set_tip(m_prev_height);
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+    /// Bytes the active inject set counts against kMaxInjectTotalBytes.
+    size_t inject_pool_bytes() const { return m_inject_pool.total_bytes(); }
+    /// The active ledger entry for `txid` (nullopt when it is not tracked).
+    std::optional<InjectEntry> inject_entry(const uint256& txid) const {
+        return m_inject_pool.entry(txid);
+    }
 
     /// Publish the current tx-inject lane state into the process-global
     /// read-only observability snapshot (core::obs::inject_status()),
@@ -800,6 +1080,8 @@ public:
     size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
     // #157 M3: same, for the aggregate-PEER rate limiter.
     size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // N3: dry runs (validate_inject) the dry-run budget still counts in its window.
+    size_t inject_validate_rate_count() const { return m_inject_rate_validate.count_in_window(); }
     // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
     // an oversize blob was refused BEFORE the byte-window was charged.
     uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
@@ -1036,29 +1318,72 @@ public:
         m_qc_pull_fn = std::move(fn);
     }
 
-    /// PoSe no-op proof for one REAL (non-null) type-6 commitment — the
-    /// enforcement of the #1083 landmine comment at the inclusion site
-    /// (embedded_gbt.hpp). dashd's verifier PoSe-punishes every member a
-    /// non-null in-block commitment marks invalid (specialtxman.cpp:159-174),
-    /// which can flip that MN's validity in the SAME block's list and change
-    /// the merkleRootMNList this coinbase commits — bad-cbtx-mnmerkleroot, a
-    /// silently lost block. c2pool does not fold that pass, so the pre-emit
-    /// gate refuses any real commitment whose PoSe pass is not PROVABLY a
-    /// no-op (qc_pose_pass_provably_noop: every listed member valid).
+    /// PoSe-pass inputs for REAL (non-null) type-6 commitments — the
+    /// enforcement of the #1083 landmine, now as dashd's own pass instead of
+    /// the old "every listed member valid" predicate (incident h=2561514:
+    /// that predicate refused correct templates at most DKG windows).
     ///
-    /// The fn answers exactly that question for one commitment:
-    ///   true    => the PoSe pass provably touches nothing — servable;
-    ///   false   => at least one listed member would be punished — refuse;
-    ///   nullopt => cannot be established (member set not sourced) — refuse.
-    /// UNSET (default) => the capability is absent and every non-null
-    /// commitment is refused (fail-closed insurance until a real PoSe fold
-    /// into the committed MN root is built). Null commitments are exempt by
-    /// dashd's own IsNull() guard (specialtxman.cpp:427-432) and are never
-    /// consulted, so the all-null production plans are byte-unchanged.
-    void set_qc_pose_noop_fn(
-        std::function<std::optional<bool>(const vendor::CFinalCommitment&)> fn) {
-        m_qc_pose_noop_fn = std::move(fn);
+    /// dashd's verifier PoSe-punishes every member a non-null in-block
+    /// commitment marks invalid (specialtxman.cpp:159-174), and a punishment
+    /// that crosses the ban threshold flips that MN's validity in the SAME
+    /// block's list — the committed merkleRootMNList must carry it or the
+    /// block is bad-cbtx-mnmerkleroot. sml_pose_fold.hpp runs that pass in
+    /// dashd order (DecreaseScores -> punish -> ban) on certainty bounds:
+    ///   `members` — the index-aligned member proTxHashes of a quorum (the
+    ///               set the BLS verifier used); nullopt => not sourced;
+    ///   `oracle`  — nPoSePenalty bounds at the tip (no wire carries them).
+    /// A ban provable either way is SERVED (folded into the committed root);
+    /// anything else refuses with a stage-named cause
+    /// (emit-qc-real-pose-unfolded / qc-real-pose-unfolded).
+    ///
+    /// UNSET members (default) => every non-null commitment refuses
+    /// (members-missing) — fail closed. UNSET oracle => every punishment of a
+    /// listed, valid MN refuses (penalty-unknown), i.e. exactly the old
+    /// refusal set minus the two free exact no-op proofs: the punished member
+    /// is absent from the list, or already banned. Null commitments are
+    /// exempt by dashd's own IsNull() guard (specialtxman.cpp:432).
+    ///
+    /// `oracle_cursor` (optional) names the block the oracle's penalties
+    /// describe; when supplied, an oracle not at this state's tip refuses
+    /// with stage=oracle-not-at-tip instead of being consulted.
+    void set_qc_pose_fold_inputs(QcMembersFn members_fn,
+                                 PoSeOracleFn oracle_fn = {},
+                                 PoSeOracleCursorFn oracle_cursor = {}) {
+        m_qc_pose_members_fn    = std::move(members_fn);
+        m_qc_pose_oracle.penalty = std::move(oracle_fn);
+        m_qc_pose_oracle.cursor  = std::move(oracle_cursor);
     }
+
+    /// The PoSe pass over `commitments` against the tip this state serves —
+    /// the SAME decision the viability probe, the builder and the pre-emit
+    /// gate take. Pure; exposed for diagnostics ([QC-NULL-ARM] logs whether
+    /// an instant upgrade will be refused) and tests.
+    QcPoseDecision qc_pose_decision(
+        const std::vector<vendor::CFinalCommitment>& commitments) const {
+        return decide_qc_pose(m_sml, commitments, m_qc_pose_members_fn,
+                              &m_qc_pose_oracle, m_prev_height, m_prev_hash);
+    }
+
+    /// The refusal VALUE for a PoSe-pass decision: names the commitment by
+    /// llmqType, quorumIndex and the DISCRIMINATING quorum-hash tail (the
+    /// head of a mainnet block hash is difficulty padding), and the stage.
+    static std::string qc_pose_value(const QcPoseDecision& d) {
+        std::string stage = qc_pose_stage_name(d.stage);
+        if (d.stage == QcPoseStage::PenaltyInexact)
+            stage += "(protx=" + d.pro_tx_hash.GetHex().substr(0, 12) + ")";
+        else if (!d.pro_tx_hash.IsNull())
+            stage += ",protx=" + d.pro_tx_hash.GetHex().substr(0, 12);
+        return "qc[" + std::to_string(d.qc_index) + "]:type="
+             + std::to_string(static_cast<int>(d.llmq_type))
+             + ",qi=" + std::to_string(d.quorum_index)
+             + ",quorum=..." + discriminating_hash_tail(d.quorum_hash)
+             + ",stage=" + stage;
+    }
+    static constexpr const char* kQcPoseThreshold =
+        "pose-pass-exact(ban-decision-provable)";
+
+    /// The tip this state builds on (prev_height + 1 is the template height).
+    uint32_t prev_height() const { return m_prev_height; }
 
     /// bestCL freshness guard (review PR #780 BLOCKER-2, HIGH). dashcore
     /// CheckCbTxBestChainlock rejects a block whose committed bestCLSignature is
@@ -1074,16 +1399,18 @@ public:
     /// ⚠ THE FRESHNESS PREDICATE IS A PROXY, AND IT IS EXPENSIVE. See
     /// set_bestcl_policy() for the consensus-exact replacement and the measured
     /// cost of keeping this one. This setter is retained verbatim: it selects
-    /// BestClPolicy::Freshness, which stays the default, so every existing
-    /// caller and KAT keeps byte-identical behaviour.
+    /// BestClPolicy::Freshness, so every existing caller and KAT keeps
+    /// byte-identical behaviour. The node no longer calls it; it installs
+    /// resolve_bestcl_policy(), whose default is ConsensusExact.
     void set_require_fresh_bestcl(bool v) {
         m_require_fresh_bestcl = v;
         m_bestcl_policy = v ? BestClPolicy::Freshness : BestClPolicy::Off;
     }
 
-    /// Select the bestCL gate policy. `Freshness` (the default whenever the
-    /// gate is enabled) is the original #780 BLOCKER-2 proxy. `ConsensusExact`
-    /// enforces dashcore's ACTUAL rule and nothing more.
+    /// Select the bestCL gate policy. `Freshness` is the original #780
+    /// BLOCKER-2 proxy, kept as the rollback. `ConsensusExact` enforces
+    /// dashcore's ACTUAL rule and nothing more, and is the node default
+    /// (kDefaultBestClPolicy, with the incident that made it so).
     ///
     /// WHY THE PROXY IS WRONG (and it is a proxy — its own docs above call it
     /// "a sufficient condition"). dashcore constrains the committed ChainLock
@@ -1162,7 +1489,7 @@ public:
             if (m_tip_cbtx_cl_null) {
                 // Block H-1 committed a NULL ChainLock =>
                 // GetNonNullCoinbaseChainlock returns nullopt and dashcore
-                // imposes NO constraint (specialtxman.cpp:130-141 is skipped
+                // imposes NO constraint (specialtxman.cpp:62-71 is skipped
                 // entirely). We may commit null, or any signature we can
                 // justify. Committing null is what dashd does here when it
                 // holds nothing (miner.cpp:167-171).
@@ -1170,13 +1497,13 @@ public:
                 break;   // non-null: fall through to the justification check
             }
 
-            // (2) NON-NULL. dashcore :134-137 bad-cbtx-null-clsig — once block
+            // (2) NON-NULL. dashcore :64-67 bad-cbtx-null-clsig — once block
             // H-1 committed a real ChainLock, ours may not be null.
             if (m_best_cl_height <= 0)
                 return no("bestcl-absent", "n/a",
                           "non-null (prev committed CL @"
                               + std::to_string(m_tip_cbtx_cl_height) + ")");
-            // (3) NOT OLDER. dashcore :138-140 bad-cbtx-older-clsig, restated on
+            // (3) NOT OLDER. dashcore :68-70 bad-cbtx-older-clsig, restated on
             // the absolute-height axis: bestCLHeightDiff > prevDiff + 1 is
             // exactly "our committed CL height < the previous block's".
             if (m_best_cl_height < m_tip_cbtx_cl_height)
@@ -1188,8 +1515,9 @@ public:
 
         // (4) JUSTIFICATION. Reached only under ConsensusExact with a non-null
         // value about to be committed. dashcore BLS-verifies what we commit
-        // (specialtxman.cpp:164-167 => bad-cbtx-invalid-clsig), so we must be
-        // able to say why this signature is good:
+        // (specialtxman.cpp:74-88 => bad-cbtx-invalid-clsig; a validator skips
+        // the check only for a value equal to its own best ChainLock), so we
+        // must be able to say why this signature is good:
         //   - ChainCommitted: the network already accepted it inside block H-1.
         //     Re-committing it is dashd's own fallback and needs no local BLS.
         //   - BlsVerified: we verified it ourselves against its signing quorum.
@@ -1305,6 +1633,10 @@ public:
         // order). Any drift => discard for the reward-safe fallback. Without
         // a plan fn the PHASE-1 refusal stays.
         std::optional<QcBlockPlan> qc_plan;
+        // MNs the PoSe pass PROVES banned in this block (empty: no real
+        // commitment / no punishment crosses max). Folded into the expected
+        // merkleRootMNList below.
+        std::vector<uint256> pose_bans;
         if (m_qc_plan_fn) {
             QcPlanGap qc_gap;
             qc_plan = m_qc_plan_fn(next_h, &qc_gap);
@@ -1329,36 +1661,23 @@ public:
                     return reject("emit-qc-payload-drift", "qc[" + std::to_string(i) + "]-bytes",
                                   "planned-qc[" + std::to_string(i) + "]-bytes");
             }
-            // ── PoSe-fold gate on REAL commitments (the #1083 landmine, now
-            // ENFORCED — a comment refuses nothing). A verified real
-            // commitment carrying !validMembers[i] for a listed member makes
-            // dashd's verifier PoSePunish that MN (specialtxman.cpp:159-174),
-            // and a punishment crossing the ban threshold flips the MN's
-            // validity in THIS block's list — the committed merkleRootMNList
-            // above is then wrong: bad-cbtx-mnmerkleroot, a silently lost
-            // block. c2pool folds no PoSe pass, so serve a real commitment
-            // ONLY when its PoSe pass is PROVABLY a no-op (every listed
-            // member valid — the common case, so real-commitment serving
-            // stays unblocked). Absent capability / unprovable => refuse:
-            // fail-closed insurance until a real PoSe fold (mirror of the
-            // confirmedHash rollover projection) is built. Null commitments
-            // are exempt by dashd's own IsNull() guard (specialtxman.cpp:432)
-            // — all-null plans are byte-unchanged through here.
-            for (size_t i = 0; i < qc_plan->commitments.size(); ++i) {
-                const auto& c = qc_plan->commitments[i];
-                if (qc_commitment_is_null(c)) continue;   // IsNull() exempt
-                const std::optional<bool> noop =
-                    m_qc_pose_noop_fn ? m_qc_pose_noop_fn(c) : std::nullopt;
-                if (!noop.has_value() || !*noop)
-                    return reject(
-                        "emit-qc-real-pose-unfolded",
-                        "qc[" + std::to_string(i) + "]:type="
-                            + std::to_string(static_cast<int>(c.llmqType))
-                            + ",quorum=" + c.quorumHash.GetHex().substr(0, 12)
-                            + ",pose_noop="
-                            + (noop.has_value() ? "unproven" : "n/a"),
-                        "pose-pass-provably-noop(all-listed-members-valid)");
-            }
+            // ── PoSe pass on REAL commitments (the #1083 landmine) ──────
+            // A verified real commitment carrying !validMembers[i] for a
+            // listed member makes dashd's verifier PoSePunish that MN
+            // (specialtxman.cpp:159-174), and a punishment crossing the ban
+            // threshold flips the MN's validity in THIS block's list. The
+            // pass (sml_pose_fold.hpp: DecreaseScores -> punish -> ban, on
+            // oracle certainty bounds) either PROVES the ban decision — and
+            // the expected root below then carries every proven ban — or
+            // refuses, naming the commitment and the stage. Same decision
+            // the viability probe and the builder take. Null commitments are
+            // exempt by dashd's own IsNull() guard (specialtxman.cpp:432) —
+            // all-null plans are byte-unchanged through here.
+            const QcPoseDecision pose = qc_pose_decision(qc_plan->commitments);
+            if (!pose.ok())
+                return reject("emit-qc-real-pose-unfolded", qc_pose_value(pose),
+                              kQcPoseThreshold);
+            pose_bans = pose.bans;
         } else if (m_commitment_window_fn && m_commitment_window_fn(next_h)) {
             return reject("emit-dkg-commitment-window",
                           "in-window@h=" + std::to_string(next_h), "off-window");
@@ -1419,6 +1738,15 @@ public:
                         // Occurrence-counted so a 50/50 split (owner amount
                         // == operator amount) needs TWO outputs, not one
                         // double-matched.
+                        //
+                        // dashd masternode/payments.cpp:74-79 emits each
+                        // output only when its amount is > 0. The operator
+                        // amount is > 0 here by construction, so it is always
+                        // required; the owner amount is 0 exactly when
+                        // bps == 10000 (the whole share goes to the operator)
+                        // and then dashd emits NO owner output — requiring one
+                        // rejected every correct full-operator template
+                        // (owner=0-MISSING, 2026-10-28).
                         const uint64_t own_amt =
                             static_cast<uint64_t>(mn_payment - op_due);
                         const uint64_t op_amt = static_cast<uint64_t>(op_due);
@@ -1429,7 +1757,9 @@ public:
                             if (p.amount == op_amt)  ++op_n;
                         }
                         const bool owner_ok =
-                            own_amt == op_amt ? own_n >= 2 : own_n >= 1;
+                            own_amt == 0
+                                ? true
+                                : (own_amt == op_amt ? own_n >= 2 : own_n >= 1);
                         const bool op_ok =
                             own_amt == op_amt ? op_n >= 2 : op_n >= 1;
                         if (!owner_ok || !op_ok)
@@ -1511,6 +1841,18 @@ public:
         // BuildNewListFromBlock parity, sml_special_fold.hpp) and refuse the
         // template if the fold cannot apply the body exactly (fail-closed:
         // an unfoldable body must never be served with a guessed root).
+        //
+        // PoSe pass (fold order = dashd's: confirmations -> PoSe -> special
+        // txs, specialtxman.cpp:206-229 then vtx order — the type-6 txs lead
+        // the body). A proven ban changes the expected root; the memo above
+        // is deliberately NOT keyed on the plan or the oracle: it stays the
+        // pre-PoSe projected root. The post-ban root has its OWN memo, keyed
+        // on (epoch, the exact ban list): the projection it is derived from
+        // is the one the epoch already covers, and the bans are the only
+        // other input, so a different ban list (an oracle or plan move) can
+        // never land on it. Without it a banning height re-ran the full
+        // projection + root hash on EVERY evaluation — the D2 freeze shape
+        // above, at exactly the height a proven ban is being served.
         uint256 expected_mn_root = m_sml_root_memo;
         if (m_include_mn_special_txs) {
             auto proj = project_sml_confirmations(m_sml, m_prev_height,
@@ -1520,16 +1862,45 @@ public:
                 return reject("emit-mn-confirm-rollover-pending",
                               "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
                               "known-registration-height");
+            apply_qc_pose_bans(proj.sml, pose_bans);
+            // The SAME context the builder folded with
+            // (make_template_fold_context): pre-block list, collateral proofs,
+            // operator-signature verifier.
+            const MnFoldContext fold_ctx = make_template_fold_context(
+                m_mnstates, m_mempool,
+                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr);
             auto fold = fold_mn_special_txs(
                 proj.sml, w.m_txs,
                 [](const Transaction& t) {
                     return dash::coin::dash_txid(MutableTransaction(t));
-                });
+                },
+                fold_ctx);
             if (!fold.clean())
                 return reject("emit-mnlist-fold-refused",
-                              std::to_string(fold.refused),
+                              std::to_string(fold.refused)
+                                  + (fold.refused_reasons.empty()
+                                         ? std::string()
+                                         : ":" + fold.refused_reasons.front()),
                               "0-refused");
             expected_mn_root = fold.sml.CalcMerkleRoot();
+        } else if (!pose_bans.empty()) {
+            if (!(m_ban_root_memo_valid
+                  && m_ban_root_memo_epoch == m_root_memo_epoch
+                  && m_ban_root_memo_bans == pose_bans)) {
+                auto proj = project_sml_confirmations(m_sml, m_prev_height,
+                                                      m_prev_hash, m_mnstates,
+                                                      m_mn_min_confirmations);
+                if (!proj.ok)   // unreachable: the memo path above passed
+                    return reject("emit-mn-confirm-rollover-pending",
+                                  "protx=" + proj.unprojectable_protx.GetHex().substr(0, 12),
+                                  "known-registration-height");
+                apply_qc_pose_bans(proj.sml, pose_bans);
+                m_ban_root_memo       = proj.sml.CalcMerkleRoot();
+                m_ban_root_memo_epoch = m_root_memo_epoch;
+                m_ban_root_memo_bans  = pose_bans;
+                m_ban_root_memo_valid = true;
+            }
+            expected_mn_root = m_ban_root_memo;
         }
         if (cb.merkleRootMNList != expected_mn_root)
             return reject("emit-mnlist-root-drift",
@@ -1558,7 +1929,7 @@ public:
                           expected_quorum_root.GetHex().substr(0, 12));
         // A null committed clsig is a defect ONLY when dashcore forbids it —
         // i.e. when block H-1 itself committed a non-null ChainLock
-        // (specialtxman.cpp:134-137). Under ConsensusExact, when block H-1
+        // (specialtxman.cpp:64-67). Under ConsensusExact, when block H-1
         // committed null, a null commit is legal and is what dashd emits
         // (miner.cpp:167-171); refusing it there would be pure loss.
         const bool null_commit_forbidden =
@@ -1663,8 +2034,15 @@ public:
         // logging — and the two had already drifted (classify_decline never
         // checked payee_resolvable, so a #996 money-path refusal surfaced as
         // "viable-race"). There is now exactly one list.
+        // The PoSe pass over the plan's REAL commitments, decided ONCE here
+        // (no SML copy, no hashing — presence/isValid lookups only) and
+        // threaded into the viability clause; the builder and the pre-emit
+        // gate take the same decision over the same plan.
+        std::optional<QcPoseDecision> qc_pose;
+        if (qc_plan) qc_pose = qc_pose_decision(qc_plan->commitments);
         e.decline   = evaluate_viability(qc_ok, qc_gap, sb.ok, payee_resolvable,
-                                         utxo_immature);
+                                         utxo_immature,
+                                         qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
@@ -1758,6 +2136,12 @@ public:
             e.has_quorum_root_override = true;
             e.quorum_root_override = qc_plan->merkle_root_quorums;
         }
+        // PoSe pass inputs for the builder's own fold over qc_commitments
+        // (pointers into this state, like mnstates/mempool).
+        e.qc_pose_members = m_qc_pose_members_fn ? &m_qc_pose_members_fn : nullptr;
+        e.qc_pose_oracle  = &m_qc_pose_oracle;
+        // B.9: same verifier the emit gate folds with (unset => refused).
+        e.protx_sig_verifier = m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr;
         return e;
     }
 
@@ -1803,6 +2187,76 @@ public:
     }
 
 private:
+    /// The height of the block the next template builds (tip + 1), or 0 while
+    /// no tip is known (the inject ledger then treats nothing as expired).
+    int32_t next_block_height() const {
+        return m_prev_height ? static_cast<int32_t>(m_prev_height + 1) : 0;
+    }
+
+    /// S4: the read-only ledger's copy of an active inject entry. in_mempool
+    /// is true by the reconcile invariant (the active set equals the injects
+    /// live in the mempool); last_build is left to the ride log.
+    static core::obs::InjectLedgerEntry to_ledger_entry(const InjectEntry& e) {
+        core::obs::InjectLedgerEntry le;
+        le.txid          = e.txid;
+        le.submit_time   = static_cast<int64_t>(e.submit_time);
+        le.expiry_height = e.expiry_height;
+        le.byte_size     = e.byte_size;
+        le.flags         = e.flags;
+        le.in_mempool    = true;
+        return le;
+    }
+
+    /// Whether the mempool tx `id` spends an output of a tx in `txids`.
+    bool spends_one_of(const uint256& id, const std::set<uint256>& txids) const {
+        if (txids.empty()) return false;
+        const auto e = m_mempool.get_entry(id);
+        if (!e) return false;
+        for (const auto& in : e->tx.vin)
+            if (txids.count(in.prevout.hash)) return true;
+        return false;
+    }
+
+    /// `ids` (mempool txids) reordered so every tx comes after the txs of
+    /// `ids` it spends; otherwise the given order is kept.
+    std::vector<uint256> inject_parents_first(const std::vector<uint256>& ids) const {
+        const std::set<uint256> in_set(ids.begin(), ids.end());
+        std::map<uint256, std::vector<uint256>> parents;
+        for (const auto& id : ids) {
+            const auto e = m_mempool.get_entry(id);
+            if (!e) continue;
+            for (const auto& vin : e->tx.vin)
+                if (vin.prevout.hash != id && in_set.count(vin.prevout.hash))
+                    parents[id].push_back(vin.prevout.hash);
+        }
+        std::vector<uint256> out;
+        out.reserve(ids.size());
+        std::set<uint256> placed;
+        // Iterative post-order walk (a chain of injects can be long).
+        for (const auto& root : ids) {
+            if (placed.count(root)) continue;
+            std::vector<std::pair<uint256, size_t>> stack{{root, 0}};
+            std::set<uint256> on_stack{root};
+            while (!stack.empty()) {
+                auto& [cur, next] = stack.back();
+                const auto it = parents.find(cur);
+                if (it != parents.end() && next < it->second.size()) {
+                    const uint256 p = it->second[next++];
+                    if (!placed.count(p) && !on_stack.count(p)) {
+                        on_stack.insert(p);
+                        stack.emplace_back(p, 0);
+                    }
+                    continue;
+                }
+                placed.insert(cur);
+                out.push_back(cur);
+                on_stack.erase(cur);
+                stack.pop_back();
+            }
+        }
+        return out;
+    }
+
     /// THE clause list. The ONLY transcription of embedded-arm viability:
     /// make_embedded_work_inputs() derives has_state from `.viable`, and
     /// describe_decline()/classify_decline() read the very same object, so the
@@ -1819,10 +2273,13 @@ private:
     /// are passed in: it was measured at the one place that CAN measure it —
     /// the plan call — and re-deriving it here would mean a second plan build
     /// that could answer differently. It is meaningful only when !qc_ok.
+    /// `qc_pose` is the PoSe-pass decision over the same plan (null when no
+    /// plan was derived), passed in for the same reason as qc_gap.
     DeclineReport evaluate_viability(bool qc_ok, const QcPlanGap& qc_gap,
                                      bool sb_ok,
                                      bool payee_resolvable,
-                                     bool utxo_immature) const {
+                                     bool utxo_immature,
+                                     const QcPoseDecision* qc_pose = nullptr) const {
         const uint32_t next_h = m_prev_height + 1;
         const std::string tip = std::to_string(m_prev_height);
         auto refuse = [](const char* c, std::string v, std::string t) {
@@ -1933,6 +2390,17 @@ private:
                        "protx=" + find_unprojectable_confirmation(m_sml, m_mnstates)
                                       ->GetHex().substr(0, 12),
                        "known-registration-height");
+        else if (m_require_sml && qc_pose != nullptr && !qc_pose->ok())
+            // The PoSe sibling of the clause above: a REAL commitment in the
+            // plan punishes a listed MN whose ban decision cannot be PROVEN
+            // (sml_pose_fold.hpp — member set unsourced, no oracle / oracle
+            // not at the tip, or bounds straddling the threshold), so the
+            // merkleRootMNList block next_h must commit cannot be derived.
+            // Same decision the pre-emit gate takes
+            // (emit-qc-real-pose-unfolded); refusing HERE names it before a
+            // template is built only to be discarded.
+            d = refuse("qc-real-pose-unfolded", qc_pose_value(*qc_pose),
+                       kQcPoseThreshold);
         else if (!payee_resolvable)
             d = refuse("payee-unresolvable",
                        std::to_string(m_mnstates.entries().size())
@@ -2135,6 +2603,13 @@ private:
     mutable bool     m_sml_root_memo_valid{false};
     mutable uint64_t m_sml_root_memo_epoch{0};
     mutable uint256  m_sml_root_memo;         // projected-SML merkle root
+    // Post-PoSe-ban projected root, keyed on (epoch, ban list) — see the
+    // emit gate. Distinct slot: the no-ban memo above must stay the pre-ban
+    // root that every non-banning evaluation reads.
+    mutable bool                 m_ban_root_memo_valid{false};
+    mutable uint64_t             m_ban_root_memo_epoch{0};
+    mutable std::vector<uint256> m_ban_root_memo_bans;
+    mutable uint256              m_ban_root_memo;
     mutable bool     m_quorum_root_memo_valid{false};
     mutable uint64_t m_quorum_root_memo_epoch{0};
     mutable uint256  m_quorum_root_memo;      // plain active-set quorum root
@@ -2189,6 +2664,11 @@ private:
     // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
     dash::coin::InjectRateLimiter m_inject_rate_peer{
         dash::coin::InjectRateLimiter::Scope::Peers};
+    // N3: the LOCAL budget of the dry run (validate_inject). Same caps and
+    // the same local cause names as m_inject_rate, but its own window, so a
+    // preflight loop is throttled without spending the operator's submit
+    // budget (the split the peer budget already has).
+    dash::coin::InjectRateLimiter m_inject_rate_validate;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs
@@ -2201,6 +2681,7 @@ private:
     // Consumed by make_embedded_work_inputs (builder) and
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
+    MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after
@@ -2228,11 +2709,13 @@ private:
     // Fired only when the gap names a single quorum (slot_known); UNSET
     // (default) => the refusal simply waits for the next relay, byte-identical.
     std::function<void(const QcPlanGap&)> m_qc_pull_fn;
-    // PoSe no-op proof for a REAL commitment (emit-qc-real-pose-unfolded gate);
-    // unset => capability absent => every non-null commitment refused.
-    std::function<std::optional<bool>(const vendor::CFinalCommitment&)> m_qc_pose_noop_fn;
+    // PoSe-pass inputs for REAL commitments (sml_pose_fold.hpp): member
+    // proTxHash source + penalty oracle. Unset => fail closed (see
+    // set_qc_pose_fold_inputs).
+    QcMembersFn m_qc_pose_members_fn;
+    PoSeOracle  m_qc_pose_oracle;
     bool     m_require_fresh_bestcl{false};  // refuse embedded on a stale/absent bestCL
-    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // Freshness stays the default when enabled
+    BestClPolicy m_bestcl_policy{BestClPolicy::Off};  // the node installs resolve_bestcl_policy() (default ConsensusExact)
     bool     m_require_fresh_credit_pool{false}; // refuse embedded on a lagged credit-pool seed
     bool     m_require_fresh_mn_payee{false};    // refuse embedded on a lagged payee queue (stale cursor)
     // #996: fail-CLOSED default -- reads only mnstates (always present), needs

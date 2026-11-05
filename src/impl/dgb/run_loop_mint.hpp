@@ -111,4 +111,45 @@ inline uint256 mint_local_share_with_ratchet(
         static_cast<uint64_t>(vote_version)); // desired_version (always target)
 }
 
+// #884 (ruled 2026-10-02): the PRODUCTION mint main_dgb binds. Unlike
+// mint_local_share_with_ratchet above it does NOT ask the AutoRatchet: the
+// producer asked ONCE when it built the job's coinbase and froze the answer into
+// in.share_version / in.desired_version (JobSnapshot::frozen_ref). Re-asking
+// here could pick a different version if the ratchet moved between template
+// and submit, and the rebuilt gentx would no longer match the coinbase the miner
+// hashed. Every other argument mirrors the producer: no merged addrs (standalone
+// DGB parent) and segwit_active=false (the producer emits a non-segwit
+// coinbase). The caller owns the tracker lock and the header parse.
+template <typename TrackerT, typename InputsT>
+inline uint256 mint_local_share_at_frozen_version(
+    const InputsT&                      in,
+    const coin::SmallBlockHeaderType&   min_header,
+    TrackerT&                           tracker,
+    const core::CoinParams&             params,
+    uint16_t                            donation)
+{
+    BaseScript coinbase;
+    coinbase.m_data = in.coinbase_bytes;
+
+    return create_local_share(
+        tracker, params, min_header, coinbase,
+        in.subsidy, in.prev_share, in.merkle_branches,
+        in.payout_script,
+        donation,
+        std::vector<MergedAddressEntry>{},
+        StaleInfo::none,
+        /*segwit_active=*/false,             // producer emits non-segwit coinbase
+        std::string{},                       // witness_commitment_hex
+        std::vector<unsigned char>{},        // message_data
+        std::vector<unsigned char>{},        // actual_coinbase_bytes
+        uint256(),                           // witness_root
+        0u, 0u,                              // override_max_bits / override_bits
+        0u, uint128(), uint256(), 0u, uint256(),
+        /*has_frozen=*/false,
+        std::vector<uint256>{}, uint256(),
+        std::vector<unsigned char>{},
+        static_cast<int64_t>(in.share_version),     // frozen at template time
+        static_cast<uint64_t>(in.desired_version)); // frozen at template time
+}
+
 } // namespace dgb

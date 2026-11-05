@@ -11,9 +11,10 @@ Original forum thread: <https://bitcointalk.org/index.php?topic=18313>
 
 ## Daemonless Dash
 
-Security Model: Zero RPC / Zero Local Credentials".
-
-Explicitly highlight: "Unlike legacy P2Pool forks that require RPC credentials to a local Dash Core daemon, C2Pool speaks the Dash P2P wire protocol natively. It requires zero RPC credentials, zero local wallet access, and zero administrative daemon permissions.
+Security model: no RPC and no local credentials. Older P2Pool forks need RPC
+credentials to a local Dash Core daemon. c2pool speaks the Dash P2P wire protocol
+itself, so it needs no RPC credentials, no local wallet access and no
+administrative access to a daemon.
 
 c2pool-dash builds valid Dash mainnet blocks from embedded coin-state. The
 deterministic masternode list, LLMQ quorums, ChainLocks and the DIP-4 coinbase
@@ -31,22 +32,83 @@ supported by the same binary. The remaining work is the daemonless-finalize item
 below (retiring the `--coin-rpc` fallback entirely). See
 [Per-binary launch reference](#per-binary-launch-reference) for the flags.
 
+**DASH v36 network (code merged 2026-10-03, seed nodes not yet deployed).**
+`c2pool-dash --net dash-v36` joins a separate DASH sharechain that uses the V36
+share format. It has its own identity (network id `ac2785363c0180b8`, protocol
+3601), so it never mixes with the v16 `p2pool-dash` sharechain, and its own P2P
+port **8998**. The v16 network keeps 8999 and is unchanged. What the v36 network
+adds:
+- v36 shares commit the template's transactions, and the node that finds a block
+  assembles the full block (PR #1856);
+- cheap pre-checks before X11, plus size and count caps on incoming shares
+  (PR #1850);
+- a graded misbehaviour score and ban for sharechain peers (PR #1858);
+- built-in seeds on port 8998, so a node started with `--net dash-v36` and no
+  `--addnode` finds the network by itself (PR #1859).
+The two public seed nodes are being deployed; until they listen on 8998, the
+v36 network has no public peers.
+
 ## Governance
 
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
-The c2pool-daemonless-finalize proposal is in its voting phase; masternode
-operators can vote on it before the next superblock.
+Daemonless-Dash finalization has a funding proposal in Dash on-chain governance:
+c2pool-daemonless-delivered, 252 DASH, paid once at superblock 2575480 (around
+2026-11-20). The voting cutoff is around 2026-11-17.
 
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
-- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
+- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered
+- Governance object: c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247
+- Collateral: 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined
+  in block 2565421 by this pool through runtime transaction injection (below)
 - Vote from a masternode:
 
   ```
-  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
+  dash-cli gobject vote-many c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247 funding yes
   ```
 
 Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-next superblock.
+superblock.
+
+The earlier proposal, c2pool-daemonless-finalize
+(fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH),
+reached the threshold only after the last superblock inside its window (2558864)
+had passed. Its window ends on 2026-11-04, before superblock 2575480, so it will
+never be paid. The new amount is its 251 DASH plus the 1 DASH collateral it burned.
+Votes do not carry over to the new hash.
+
+## Runtime transaction injection and the offline signer
+
+A running c2pool-dash node can carry an already-signed transaction in its own block
+template, with no restart. This includes zero-fee transactions that ordinary nodes do
+not relay. The node never holds keys; transactions are signed on an offline machine.
+
+- **Control plane.** Start the node once with `--control-plane-token-file FILE`
+  (mode 0600, owned by the node user, 32 to 128 printable characters). Without it
+  `/api/config/apply` answers `503 {"armed":false}` and `/api/tx-inject/submit` refuses
+  with 403.
+- **Arm at runtime.** `POST /api/config/apply` with `embedded.tx_inject=true`. This is a
+  money-path key, so it needs the control token plus a two-phase nonce bound to the
+  exact change. `--embedded-tx-inject` arms it at start-up instead and survives
+  restarts.
+- **Submit.** `POST /api/tx-inject/submit` with `{"control_token": ..., "raw_tx": ...}`.
+  Status: `GET /api/tx-inject-status`. All three endpoints answer only direct loopback
+  requests; forwarded requests are refused. A remote node is reached through an SSH
+  port-forward.
+- **What to expect.** A transaction without an InstantSend lock waits 10 minutes before
+  it is selected (the same rule as Dash Core), then rides every template until the pool
+  finds a block. A coinbase input must be mature in the block being built.
+- **Examples on mainnet.** Block 2565253 carries a zero-fee consolidation of 189 outputs
+  (539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28). Block 2565421
+  carries the collateral of the proposal above.
+
+Tools in this repository, under `ui/c2wallet-qt/` (see its README):
+
+- **c2wallet-qt-signer**, the air-gapped signer. It is built with no network code, and
+  a link guard checks this. It builds and signs zero-fee consolidations and governance
+  collaterals (PageDashInject) and exports the signed hex. A Sign / Verify Message page
+  at Dash Core parity is in review (#2127).
+- **The inject scheduler** in the key-free companion. It queues signed transactions and
+  submits them when their inputs mature, at a height or time, or after a parent
+  transaction is ChainLocked. The core is merged (#2120). The headless daemon
+  `c2wallet-qt-schedd` is in review (#2123).
 
 ## Daemonless BIP-110
 
@@ -94,6 +156,7 @@ c2pool builds one binary per **parent chain** (`c2pool-<coin>`). Several parents
 | **Bitcoin Cash** (BCH) | SHA256d | — | Live, daemonless (`c2pool-bch --pool`; bch.voidbind.com) |
 | **Dash** (DASH) | X11 | — | Live, daemonless (`c2pool-dash --run`; dash.voidbind.com); dashd-attached posture via `--coin-rpc` still supported |
 | **BIP-110** (Knots BLAKE2b fork) | BLAKE2b² (SHA256d until height 961640) | — | **Experimental** (new fork; daemonless embedded; live on bip110.voidbind.com) — `c2pool-bip110 --run` |
+| **Monero** (XMR) | RandomX | none | **Experimental**, stagenet only (v37 lane; daemonless, several nodes, one owed ledger; `c2pool-v37-xmr`); mainnet fenced, see [docs/xmr-lane](docs/xmr-lane/README.md) |
 
 "Live" means a public voidbind node runs that per-coin binary with no coin
 daemon on the serve path. It is not a production-maturity claim: only the LTC
@@ -115,7 +178,9 @@ and does not yet exist, so the work can be judged on what it actually is.
 ### What exists
 - A **formally specified** settlement/lanes core: TLA⁺ specs, model-checked with
   TLC (green over the bounded configurations checked in). This is a proof over a
-  *model*, not evidence at scale.
+  *model*, not evidence at scale. `proto/tla/Settlement.tla` revision 2 records
+  the owed-sign decisions (a per-key floor, a non-negative aggregate, no
+  clawback; PR #1846).
 - **A v37 engine consumer tree implemented in C++** under `src/c2pool/v37/` — the
   Work Receipts / Roundabout settlement pipeline as a **reference/prototype engine
   behind CI, not a production node.** Merged behind CI: the W1 O1 executor and W2
@@ -123,8 +188,8 @@ and does not yet exist, so the work can be judged on what it actually is.
   prerequisites (identity view + read-at-version ring — PR #1485), W4 per-lane
   settlement (OWED-ledger fold + O2 cut + O5.5 — PR #1486), W5 coinbase assembly
   (oldest-owed-first K_fair + h_min carry + §13 root — PR #1487), and W3 carrier
-  relay over the v36 p2p (wire extension + R_MAX — PR #1484). W6 persistence /
-  restart-recovery is a **reviewed draft, not landed** (PR #1506).
+  relay over the v36 p2p (wire extension + R_MAX — PR #1484), and W6 persistence /
+  restart-recovery (PR #1506).
 - An isolated **"Family B: XMR lane"** (Monero / RandomX) under `src/impl/xmr/`,
   which does **not** touch the v37 consensus digest. Merged: the lane foundation
   (scaffold + vendored RandomX + X0 — PR #1500), buildable KAT-tested primitives
@@ -132,29 +197,57 @@ and does not yet exist, so the work can be judged on what it actually is.
   envelope (PR #1503), and stratum + FCMP-fenced coinbase-settlement + carrier wire
   (PR #1507). Goldens, real-RandomX verify, and the end-to-end KAT are **merged**
   (PR #1512); a **single-node stagenet daemon is live** (monerod-bound, PRs
-  #1520 / #1529). Multi-node canonical payees + section-13 state root are a
-  reviewed draft (PR #1551).
+  #1520 / #1529). Multi-node settlement commits one owed ledger (`owed_digest`)
+  with an on-chain credit cut (PRs #1697 / #1704); the earlier section-13
+  state-root draft (PR #1551) was closed in its favour. Every node recomputes the
+  lane coinbase and books a block that does not match as debit-only (PR #1884);
+  every consensus parameter is part of the pool identity (PR #1894); and old
+  balances drain from a capped slice of each block (PR #1895).
+  Since 2026-09-27 the lane also has: an installable node package with a
+  run-a-node guide (PR #1817, [docs/xmr-lane/RUN-A-NODE.md](docs/xmr-lane/RUN-A-NODE.md));
+  raindrops (sub-threshold work credited like shares) on by default (PR #1818); a built-in mainnet
+  bootstrap list, peer discovery and a persistent peer book (PRs #1819 / #1820);
+  repair below the vault horizon that survives restarts (PR #1824); a verify worker
+  pool for raindrops (PR #1839); a refusal of node-local settings that would split
+  the owed ledger on mainnet (PR #1872); and the node's fees disclosed in every
+  stratum login reply (PR #1880). The payout rules, fees and known limits are
+  written up in [docs/xmr-lane/payout-fairness.md](docs/xmr-lane/payout-fairness.md)
+  (PR #1879), and a public comparison with other decentralized pools is in
+  [docs/xmr-lane/comparison.md](docs/xmr-lane/comparison.md) (PR #1901).
+- **Rule upgrades without stopping the pool, voted by miners' work (designed, not
+  implemented).** Rule epochs are appended to the lane's history and activate by a
+  vote weighted by miners' finalized work. Each miner's work votes; by default the
+  vote is delegated to the node operator, and any miner can override it with one
+  word in a stock xmrig password. Old nodes hold instead of forking, and a fixed
+  constitution means earned balances cannot be reduced, delayed or redirected by
+  any vote. Today a rule change on the XMR lane is still a new pool genesis. The
+  design note is in PR #1908 (draft). The first slice, which fixes the pool identity
+  from a derived genesis and adds the epoch and vote sections to the wire and the
+  store, is in PR #1911 (draft). It is meant to be the last flag day before the
+  Monero mainnet genesis.
 - **Reference prototypes** under `proto/` (TLA⁺, MRR refimpl + goldens, the M4 sync
   feasibility harness, testbeds) and the v37 design-track spec/headers under
   `src/sharechain/v37/`. These are for study and reproduction, not deployment.
 - The production multi-coin pool code (v36 line) that c2pool actually runs.
 
 ### What does NOT yet exist — the honest gaps
-- **Not wired into a live node.** The v37 engine exists as a **reference/prototype
-  behind CI**; it is **not** connected to a live production node lifecycle for
-  settlement. The F1 finalize-driver obligation is **dormant** — no production
-  finalize caller is wired — so nothing settles on a live network today.
-- **No public v37 testnet.** There is no running v37 network; the engine and lanes
-  exercise **simnet / loopback only**. The runnable v37 artifacts are the engine
-  tree and the prototypes above.
+- **Not wired into a production node.** Outside the XMR lane, the v37 engine is a
+  **reference/prototype behind CI** and nothing settles on a live network. The
+  XMR lane settles on Monero stagenet in the author's multi-node test runs; it is
+  not in production anywhere.
+- **No public v37 network.** The XMR lane runs on Monero stagenet in test runs;
+  the other lanes exercise **simnet / loopback only**.
 - **No performance benchmark.** The only performance artifact is a Python
   *feasibility* harness (M4). There is **no benchmark of the real engine**;
   throughput, latency, and scaling claims are **unproven** until one exists.
-- **XMR lane is single-node stagenet.** Its RandomX verify runs CI-gated in light
-  mode and against a live `monerod`-stagenet single node (PRs #1520 / #1529); the
-  XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR #1518).
-  The remaining gaps are multi-node consensus (PR #1551, draft) and mainnet, which
-  stays double-fenced.
+- **XMR lane is stagenet only.** Its RandomX verify runs CI-gated in light mode;
+  the XMR PayoutDescriptor kind-bytes (0x10 / 0x11) are activated add-only (PR
+  #1518). Three daemonless nodes have run together on stagenet in day-long
+  capstone tests (PRs #1697 / #1704 / #1857); no multi-node run has yet met the
+  full capstone bar. Attempt 9 started on 2026-10-03 at 09:36 UTC (24 hours).
+  Mainnet stays double-fenced. Funding for the mainnet milestone is requested in
+  Monero CCS proposal !699 (25 XMR), which is on the agenda of the Monero community
+  workgroup meeting of 2026-10-03.
 - **No token, no production deployments.** There is no v37 token, and nothing v37 is
   deployed in production.
 - **Formal ≠ empirical.** Model-checking bounds behavior over small configurations;
@@ -196,11 +289,18 @@ and does not yet exist, so the work can be judged on what it actually is.
 
 ### CI / repo state
 - The v37 research line is merged to `master` (PR #809, "V37 dev"), and the v37
-  engine consumer tree (`src/c2pool/v37/`, W1–W5) and the isolated XMR Family-B lane
-  (`src/impl/xmr/`) now build behind CI on both build legs. **Current master CI is
-  green across the required per-coin gates and the coin matrix** (DASH / LTC / BCH /
-  DGB / DOGE); the RandomX-dependent XMR checks run CI-gated in light mode, and the
-  CodeQL security scan is a non-gating job.
+  engine consumer tree (`src/c2pool/v37/`, W1 to W6) and the isolated XMR Family-B lane
+  (`src/impl/xmr/`) now build behind CI on both build legs. The checks required
+  before a merge to `master` are `attribution-gate`, the DASH gates G1 and G3a,
+  the BCH gates G3a and G3b, `PR path filter`, `PR platform coverage status` and
+  `Test allowlist drift-guard`. The coin matrix (DASH / LTC / BCH / DGB / DOGE),
+  the Linux x86_64 and ASan/UBSan legs and the other CI lanes are not required
+  checks; the CI badge above shows the state of the latest master run. The
+  RandomX-dependent XMR checks run CI-gated in light mode, and the CodeQL
+  security scan is a non-gating job. Two v37 relay KATs have known timing
+  flakes (#1885, #1890) and are retried up to 3 times; CI reports every
+  retry as a warning. `v37_convergence_soak` is an undiagnosed safety pin
+  (#1905) and is not retried.
 
 ### Provenance
 c2pool builds on ideas from p2pool but is an **independent codebase**. No outside
@@ -257,7 +357,17 @@ Pre-built binaries are available on the [Releases page](https://github.com/frstr
 
 ### Verify downloads
 
-Each release includes a `SHA256SUMS` file. Verify after downloading:
+Each release includes a `SHA256SUMS` file, and recent releases also include a
+detached signature `SHA256SUMS.asc` (from v0.2.7; added to v0.2.8 on 2026-10-03).
+Check the signature with the maintainer key published at
+<https://github.com/frstrtr.gpg> (key `50AB1379285EFE76`):
+
+```bash
+curl -s https://github.com/frstrtr.gpg | gpg --import
+gpg --verify SHA256SUMS.asc SHA256SUMS
+```
+
+Then verify the files:
 
 ```bash
 # Linux / macOS
@@ -581,6 +691,10 @@ the DGB pool. See [c2pool-dgb](#c2pool-dgb--digibyte-scrypt) below.
 | 9327 | Stratum mining |
 | 8080 | Web dashboard + REST API |
 
+Per-coin binaries use their own defaults. For DASH: sharechain 8999 on the v16
+network and **8998** on the v36 network (`--net dash-v36`); a private
+`--network-id` chain keeps 8999 (18999 on testnet).
+
 ---
 
 ## Configuration
@@ -834,7 +948,7 @@ dashd-attached default OFF)
 | `--embedded-mn-bridge-no-cursor` | Replay the whole window from the anchor on every start instead of resuming the saved cursor. |
 | `--embedded-fold-live PATH` + `--embedded-fold-live-expect HASH`, `--embedded-fold-checkscripts` | Wire a full-history UTXO fold store as the live input-pricing view (store hash must match); consensus-exact input-script check. |
 | `--embedded-utxo-fold-fees DBPATH` + `--embedded-utxo-fold-expect HEX` | Graduated fold fee pricing; both required together. |
-| `--bestcl-policy freshness\|consensus-exact` | How the bestCL gate decides (default `freshness`). |
+| `--bestcl-policy consensus-exact\|freshness` | How the bestCL gate decides: `consensus-exact` (default) is dashcore's CheckCbTxBestChainlock rule; `freshness` is the stricter rollback proxy. |
 | `--serve-staleness-sentinel[=off]` | Report-only served-height staleness detector, ON by default; `=off`/`=0`/`=false` disables. |
 | `--serve-gate-state-file PATH` | Cross-restart serve-gate accounting (soak convenience). |
 | `--regtest-force-won-block` | Regtest-only: drive one won block through the dual-path dispatch. |
@@ -843,7 +957,8 @@ dashd-attached default OFF)
 
 | Flag | Meaning |
 |------|---------|
-| `--embedded-tx-inject`, `--embedded-tx-inject-hex FILE` | Opt-in miner/user tx injection (#157), default OFF. |
+| `--embedded-tx-inject`, `--embedded-tx-inject-hex FILE` | Opt-in miner/user tx injection (#157), default OFF. Runtime arming and submit: see *Runtime transaction injection* above. |
+| `--control-plane-token-file FILE` | Registers the loopback control token (0600, owner-only, 32-128 chars) that unlocks `/api/config/apply` and `/api/tx-inject/submit`. Absent: apply answers 503, submit 403. |
 | `--pin-local-tx-hex FILE`, `--pin-splice-xcheck-arm`, `--pin-splice-block-budget` | Pin a zero-fee self-mined tx (e.g. donation consolidation) into served templates; splice policy knobs default OFF. |
 | `--replay-bulk`, `--replay-bulk-capture DIR`, `--replay-bulk-start H` | Full-history bulk block-fetch lane from DIP3 (1028160); capture caches bodies. |
 | `--replay-fold-prestate FILE`, `--replay-fold-quorums`, `--replay-fold-qsnapshot FILE`, `--replay-fold-worklists FILE` | Anchor-seeded DML fold driven by the bulk lane, with derived quorum member sets. |
@@ -910,10 +1025,9 @@ loop. Unknown argument → `unknown arg: …` + usage, exit 1. There is **no
 Source: `src/c2pool/main_dgb.cpp` — `print_banner()` and the `main()` parse
 loop. Unknown argument → `unknown argument: …`, exit 1. **Mainnet only**: there
 is no `--testnet` flag and `make_coin_params(/*testnet=*/false)` is hardwired;
-a settings file that sets `network.testnet` is refused. The DGB parser has no
-`--fee` / `--give-author` (the catalog's `money.give_author_pct` and
-`money.node_owner_fee_pct` rows exclude DGB); operator payout goes through
-`--redistribute` + `--node-owner-address`.
+a settings file that sets `network.testnet` is refused. Operator payout goes
+through `-f`/`--fee` or `--redistribute`, with `--node-owner-address` as the
+destination.
 
 ```bash
 # Daemonless public pool (dgb.voidbind.com posture)
@@ -939,7 +1053,9 @@ a settings file that sets `network.testnet` is refused. The DGB parser has no
 | `--no-p2p-relay` | off | Suppress the embedded won-block relay (isolates the RPC arm). |
 | `--dev-relax-algo-softforks` | off | Dev-only: relax the algo-softfork readiness gate for an isolated tuned testnet; ignored on mainnet. |
 | `--redistribute SPEC` | `pplns` | `pplns\|fee\|boost\|donate` or hybrid `boost:70,donate:20`. |
-| `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm. |
+| `--node-owner-address ADDR` | — | Operator payout identity for the `fee` arm and for `-f`/`--fee`. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
 | `--merged SYMBOL:CHAIN_ID[:HOST:PORT:USER:PASS[:P2P_PORT]]` (repeatable) | — | Embedded DOGE aux backend (`-DAUX_DOGE` build; DOGE chain_id 98, P2P 22556). |
 | `--doge-p2p-address HOST`, `--doge-p2p-port PORT`, `--embedded-doge` | — | DOGE peer overrides; `--embedded-doge` forces the embedded path. |
 | `--embedded-serve-mempool-txs[=true\|=false]` | posture default | Arm / opt out of the embedded UTXO fee-proof lane. CLI wins over the settings file. |
@@ -966,16 +1082,17 @@ loop. Unknown argument → `unknown argument: …`, exit 1. The pool mode is
 | `--selftest` | default | ABLA budget self-test, exit. |
 | `--ibd [--near-tip] [--auto-kick]`, `--with-peer-verify`, `--max-seconds N` (600) | | Headers-first IBD / peer-verify harnesses against one BCHN peer. |
 | `--leg-c-capture [--rpc-conf PATH]`, `--leg-c-capture-p2p [--p2p-port N]` (18444) | | Regtest capture harnesses; `--rpc-conf` defaults to `~/bch-regtest/bitcoin.conf` here. **`--p2p-port` is the leg-C BCHN regtest port, not the sharechain port** (the catalog maps it to `sharechain.listen`; the parser does not). |
-| `--peer HOST[:PORT]` | `192.168.86.110:8333` (a developer-host default — always supply your own) | BCHN coin-P2P peer. Port `0` = no explicit peer → SeedTier discovery ladder (`src/impl/bch/coin/embedded_daemon.hpp` `maybe_start_p2p`). |
+| `--peer HOST[:PORT]` | none (port 8333) | BCHN coin-P2P peer. `--pool` refuses to start without `--peer` or `--coin-p2p-discover`. Port `0` = no explicit peer → SeedTier discovery ladder (`src/impl/bch/coin/embedded_daemon.hpp` `maybe_start_p2p`). |
 | `--testnet` / `--testnet4` / `--regtest` | mainnet | Chain selection; also moves the default peer port (18333 / 28333 / 18444). |
 | `--anchor N` | 0 | Cold-start ABLA floor anchor height. |
 | `--stratum [HOST:]PORT` | off | Stratum listener. |
 | `--http [HOST:]PORT` | off | Dashboard. |
 | `--rpc-conf PATH` | — | BCHN `bitcoin.conf` for the external-RPC fallback (`rpcuser`/`rpcpassword`; endpoint is `127.0.0.1:<rpcport>`). |
+| `--coin-p2p-discover` | off | Daemonless coin-peer discovery (CoinAddrMan); no `--peer` needed. |
 | `--sharechain-addnode HOST:PORT` (repeatable) | public defaults | Pin sharechain peers (`92.53.224.27:9349` is the live public BCH sharechain seed named in the source). |
-
-No money flags on this binary: BCH has no `--fee` / `--give-author` /
-`--node-owner-address` in the parser (the catalog rows exclude `C_BCH`).
+| `--give-author PCT` (alias `--dev-donation`) | 0.1 | Author donation percent. |
+| `-f` / `--fee PCT` | 0 | Node-owner fee percent; needs `--node-owner-address`. |
+| `--node-owner-address ADDR` | — | Node-owner fee destination. |
 
 ### c2pool-bip110 — Bitcoin Knots BLAKE2b fork
 
@@ -1202,6 +1319,10 @@ cd build && ctest --output-on-failure -j$(nproc)
 ## V37 development
 
 - **V37 Purple Paper** (Work Receipts design): https://frstrtr.github.io/c2pool/purple-paper.html
+  Erratum E-1: section 9 says the coinbase pays owed amounts "largest first". The
+  code and the ratified rule pay **oldest first** (by when a balance became
+  eligible, ties broken by a salted hash no participant can choose). The corrected
+  text is in PR #1884 (repository copy) and PR #1881 (site).
 - Dev chat (Telegram): https://t.me/c2pooldev
 - V37 dev-branch primitives (diff): https://github.com/frstrtr/c2pool/compare/master...v37-dev
 

@@ -65,7 +65,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_hardening PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_utxo test_utxo.cpp)
+    add_executable(test_utxo test_utxo.cpp test_block_download.cpp test_utxo_cold_start.cpp)
     target_link_libraries(test_utxo PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
@@ -99,7 +99,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     )
     target_link_libraries(test_phase0_live PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
 
-    add_executable(test_header_chain test_header_chain.cpp)
+    add_executable(test_header_chain test_header_chain.cpp test_ltc_header_sync.cpp)
     target_link_libraries(test_header_chain PRIVATE
         GTest::gtest_main GTest::gtest
         core ltc
@@ -290,10 +290,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # are linked in here too: the profile is keyed on the same global identity.
     # So are the v36 ref-stream / share_init_verify(DashV36Share) /
     # message_data KATs (test_dash_v36_ref_stream_verify.cpp): the message
-    # authority set is selected by the same profile.
+    # authority set is selected by the same profile. So are the v36 generation-
+    # transaction KATs (test_dash_v36_gentx.cpp): the v36 donation script is
+    # selected by the same profile.
     add_executable(test_dash_network_id_override test_dash_network_id_override.cpp
         test_dash_v36_future_timestamp.cpp test_dash_v36_future_timestamp_bound.cpp
-        test_dash_v36_ref_stream_verify.cpp)
+        test_dash_v36_ref_stream_verify.cpp test_dash_v36_gentx.cpp)
     target_link_libraries(test_dash_network_id_override PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -411,6 +413,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # same reason as the second: a standalone target would need a build.yml
     # --target edit and would trip CI's NOT_BUILT sentinel until it had one
     # (#769/#883/#893).
+    # test_dash_standing_forget.cpp (#950): the standing remembered set must sit
+    # OUTSIDE the send_shares transient remember_tx/forget_tx bracket
+    # (canonical p2p.py:377). Drives the REAL NodeImpl::handle_version and
+    # send_shares over a REAL loopback socket via the shared
+    # dash_socket_harness.hpp, so it needs the same link set as
+    # test_dash_addrme.cpp. FOLDED in for the same reason.
     # test_dash_block_confirm_lane.cpp: the post-broadcast found-block
     # confirmation / orphan lane (daemonless resolve_status verdict + the
     # MiningInterface pending→confirmed / pending→orphaned status flip). FOLDED
@@ -429,11 +437,45 @@ if (BUILD_TESTING AND GTest_FOUND)
     # the per-share split on an individual share's page. FOLDED in for the same
     # reason; needs the same link set plus the header-only mint/producer weight
     # walk and coinbase allocator, both already reachable from `dash`.
+    # test_dash_v36_live_variant.cpp: the private/isolated DASH v36 sharechain
+    # live-variant KATs (load gate, share-type admission, type dispatch, node
+    # receive -> tracker verify -> LevelDB persist -> reload of v36 shares).
+    # FOLDED in for the same reason; needs exactly this link set (a real
+    # ctx-bound dash::NodeImpl + ShareTracker + c2pool_storage).
+    # test_dash_v36_flip.cpp: the private/isolated DASH v36 sharechain MINTS
+    # v36 (current_share_version 36, v36 producer job + mint, ratchet seed 3601,
+    # emergency decay retarget, operator blob embed, version-keyed data subdir,
+    # web label, payout view). Same harness (test/dash_v36_live_fixture.hpp) and
+    # link set as the live-variant KATs; folded in for the same reason.
+    # test_dash_v36_e2e.cpp: the private/isolated DASH v36 sharechain two-node
+    # end-to-end KATs (genesis from either node, byte-identical gentx + PPLNS
+    # weights on both nodes, restart reload, emergency decay seen by both, v16
+    # peers and builds without v36 isolated support refused at the handshake)
+    # plus the seeder of
+    # scripts/dash_v36_isolated_e2e.sh (skipped unless its env is set). Same
+    # harness (dash_v36_live_fixture.hpp + dash_v36_mint_fixture.hpp) and link
+    # set; folded in for the same reason.
+    # test_dash_v36_template_txs.cpp + test_dash_v36_finder_block.cpp: the DASH
+    # v36 network commits the template's transactions (the coinbase
+    # merkle_link a peer verifies the PoW from, no tx body on the wire) and the
+    # finder assembles the full won block from its frozen job. Same harness and
+    # link set; folded in for the same reason.
+    # test_dash_share_precheck.cpp (#1828): the per-message caps on incoming
+    # 'shares' / 'sharereply' and the no-hashing field checks, driven through
+    # the REAL Legacy / Actual handle_message of a dash::Node with a counting
+    # X11 (dropped before X11 is measured). Same harness and link set; folded
+    # in for the same reason.
     # #1835 outbound-redial KAT (test_dash_outbound_redial.cpp) drives the REAL
     # NodeImpl dial path against a refused loopback port; folded into this
     # EXISTING allowlisted target (it needs the `dash` OBJECT lib linked below)
     # so it is built and run by CI rather than reported "Not Run".
-    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_outbound_redial.cpp)
+    # test_dash_peer_misbehaviour.cpp (#1829): the graded misbehaviour score
+    # and IP ban for sharechain peers, driven through the REAL connected() +
+    # Legacy / Actual handle_message of a dash::Node over loopback sockets
+    # (disconnect, inbound refusal, decay, per-offence weights, public-network
+    # oracle parity, whitelist). Same harness and link set; folded in for the
+    # same reason.
+    add_executable(test_dash_node test_dash_node.cpp test_dash_dashboard_found_block.cpp test_dash_addrme.cpp test_dash_standing_forget.cpp test_dash_block_confirm_lane.cpp test_dash_dashboard_views.cpp test_dash_dashboard_pplns.cpp test_dash_shutdown_order.cpp test_dash_v36_live_variant.cpp test_dash_v36_flip.cpp test_dash_v36_e2e.cpp test_dash_v36_template_txs.cpp test_dash_v36_finder_block.cpp test_dash_share_precheck.cpp test_dash_outbound_redial.cpp test_dash_peer_misbehaviour.cpp test_dash_self_connection_ban.cpp)
     target_link_libraries(test_dash_node PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -528,6 +570,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_alert_relay PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # Source-scan KAT: main_dash.cpp wires the detector's address-activity seam.
+    target_compile_definitions(test_dash_alert_relay PRIVATE
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_alert_relay "" AUTO)
 
     # Featured developer-node banner (signed authority subtype 0x06): freshest-
@@ -712,15 +757,22 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_mempool_validity_gate.cpp
         test_dash_checkinputscripts.cpp   # PR-C4: consensus-exact CheckInputScripts KAT
         test_dash_tx_inject.cpp           # #157: miner/user tx-injection (priority + validity + DoS)
-        test_dash_fold_fee_source.cpp)    # W5-A: fold-backed fee pricing source
+        test_dash_fold_fee_source.cpp     # W5-A: fold-backed fee pricing source
+        test_dash_tx_version_rules.cpp    # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
+        test_dash_protx_mempool_eviction.cpp  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
+        test_dash_utxo_full.cpp           # S2: full UTXO set from a pinned snapshot (lane, open rule, pin, status)
+        test_dash_utxo_scan.cpp)          # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_x11 core core_utxo
         dash_scriptcheck ${SECP256K1_LIBRARIES}   # PR-C4: dashcore VerifyScript .so + secp256k1 (KAT signs a real P2PKH spend)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_mempool PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # N1 K9: the tenant payout address's real getaddressutxos capture (170 rows).
+    target_compile_definitions(test_dash_mempool PRIVATE
+        XDGF_GETADDRESSUTXOS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../ui/c2wallet-qt/src/family/bitcoin/dash/tests/fixtures/xdgf-getaddressutxos-tip2563986.json")
     gtest_add_tests(test_dash_mempool "" AUTO)
 
     # DASH SimplifiedMNList (DIP-0004, S7 leaf): vendored CSimplifiedMNListEntry /
@@ -943,7 +995,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # never phantom-registered into the default-OFF build_ci leg -- the #818
     # drift that reddened Linux x86_64 (cases registered at configure time by
     # source-scan while the binary is never built, so ctest cannot find it).
-    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp)
+    # test_dash_protx_sig_bls.cpp (Dash Core v23.1.8 B.9): the template fold's
+    # ProUpServTx / ProUpRevTx operator-signature check against real dashbls
+    # keys — rides this BLS-backend target because it signs.
+    add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp
+        test_dash_protx_sig_bls.cpp)
     target_link_libraries(test_dash_govvote_bls PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify
@@ -1008,14 +1064,25 @@ if (BUILD_TESTING AND GTest_FOUND)
     # FAILS CLOSED. Folded into this SAME allowlisted target for the #143/#769
     # NOT_BUILT reason (a standalone add_executable is not in build.yml's
     # --target list and would silently report "Not Run").
+    # Eighth TU (PoSe penalty oracle, design PR-B): test_dash_pose_oracle_feeder.cpp
+    # — the feeder that keeps the bridge DML fold engine at the live tip
+    # (coin/pose_oracle_feeder.hpp): members_for fallback + request-on-miss,
+    # the deferred straddle bootstrap on real mainnet bytes (cycle 2513088 at
+    # cursor 2513129, block 2513130), hold-not-poison, v4 persist/resume,
+    # reorg rollback. Same allowlisted target, same #143 NOT_BUILT reason.
     add_executable(test_dash_mn_state test_dash_mn_state.cpp
                    test_dash_mn_diff_store.cpp
+                   test_dash_pose_oracle_feeder.cpp
                    test_dash_replay_fold.cpp
                    test_dash_replay_run.cpp
                    test_dash_replay_quorum_seam.cpp
                    test_dash_replay_payee_publish.cpp
                    test_dash_replay_mnlist_seed.cpp
-                   test_dash_replay_prestate_empty_dip3.cpp)
+                   test_dash_replay_prestate_empty_dip3.cpp
+                   # Differential KAT (Dash Core v23.1.9 PR-1 verify, M1/M2): the
+                   # template fold must commit the root the root-proven DML fold
+                   # computes and refuse what it refuses (real dashbls keys).
+                   test_dash_protx_fold_differential.cpp)
     target_link_libraries(test_dash_mn_state PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify dash_x11 core
@@ -1076,6 +1143,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_embedded_shadow_compare.cpp
         test_dash_mn_confirm_rollover.cpp
         test_dash_collateral_spend_filter.cpp
+        # test_dash_sml_pose_fold.cpp (sml_pose_fold.hpp): the serve-time PoSe
+        # pass over a template's real quorum commitments (incident h=2561514)
+        # — dashd's DecreaseScores -> HandleQuorumCommitment -> PoSePunish on
+        # penalty-oracle bounds, the 2561514 shape from the block's real
+        # payloads, the fail-closed equivalence to the pre-fix predicate, and
+        # builder x gate root parity. Folded here per the same #769 rule.
+        test_dash_sml_pose_fold.cpp
         # test_dash_root_memo.cpp: D2 of the 2026-08-07/08 production freeze —
         # NodeCoinState-level memo of the projected-SML root + quorum root
         # (epoch-invalidated). Pins: warm emit_ok does no hashing (T1),
@@ -1107,7 +1181,13 @@ if (BUILD_TESTING AND GTest_FOUND)
         # dash_mainnet_quorum_scan_* / _active_quorums_ fixtures as the W4
         # suite above, and is folded into this target for the same #769
         # reason (the push bot cannot add a build.yml --target).
-        test_dash_mined_commitment_index.cpp)
+        test_dash_mined_commitment_index.cpp
+        # test_dash_protx_fold_ctx.cpp: Dash Core v23.1.9 B (+ v23.1.8 B.9
+        # plumbing) — the MnFoldContext template fold (#7488 nType, #7489
+        # collateral reuse, #7846 owner/platform namespace, dup service,
+        # collateral spends, external-collateral proof, ExtAddr refusal) and
+        # the A7 builder belt. Folded here per the same #769 rule.
+        test_dash_protx_fold_ctx.cpp)
     target_compile_definitions(test_dash_embedded_gbt PRIVATE
         DASH_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     target_link_libraries(test_dash_embedded_gbt PRIVATE
@@ -1245,7 +1325,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     gtest_add_tests(test_dash_node_coin_state "" AUTO)
 
     # bestCL template gate: dashcore's CheckCbTxBestChainlock rule (consensus-
-    # exact) vs the original freshness proxy, plus the fail-closed fences
+    # exact, the node default) vs the freshness rollback, plus the fail-closed fences
     # (missing prev-block committed CL, unverified advance, unjustified
     # provenance). DELIBERATELY NOT BLS-gated: the gate is a pure state
     # decision over heights + provenance and must be exercised on EVERY build,
@@ -1260,6 +1340,9 @@ if (BUILD_TESTING AND GTest_FOUND)
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_bestcl_gate PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # Source-scan KAT: main_dash.cpp initialises --bestcl-policy from the default.
+    target_compile_definitions(test_dash_bestcl_gate PRIVATE
+        DASH_MAIN_SRC="${CMAKE_CURRENT_SOURCE_DIR}/../src/c2pool/main_dash.cpp")
     gtest_add_tests(test_dash_bestcl_gate "" AUTO)
 
     # DASHWorkSource (dash::stratum): concrete core::stratum::IWorkSource for
@@ -1310,7 +1393,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # re-seed ask) unchanged; and the consumer half of the G7 split (below-tip
     # seed catch-up / refusal-to-arm). Links leveldb via core.
     add_executable(test_dash_coin_state_maintainer test_dash_coin_state_maintainer.cpp
-                   test_dash_mn_gap_repair.cpp)
+                   test_dash_mn_gap_repair.cpp
+                   test_dash_payee_fold_feeder.cpp)   # ordered connect (payee + UTXO lanes)
     target_link_libraries(test_dash_coin_state_maintainer PRIVATE
         GTest::gtest_main GTest::gtest
         dash_x11 core
@@ -1832,9 +1916,16 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_stratum_extensions PRIVATE c2pool_payout ltc_coin c2pool_storage c2pool_merged_mining pool)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_stratum_extensions "" AUTO)
 
+    # Stratum login-field parser KATs (#865 slice 2): exercises the header-only
+    # core/stratum_username.hpp that StratumSession calls, not a copy.
+    add_executable(test_stratum_username test_stratum_username.cpp)
+    target_link_libraries(test_stratum_username PRIVATE GTest::gtest_main GTest::gtest)
+    gtest_add_tests(test_stratum_username "" AUTO)
+
     # Interim hardening fix KATs: strict per-node miner cap (refused
     # connections + counter), FIFO+TTL job eviction under a 600-notify stale
-    # storm, and the flat-RSS shared-payload pointer-identity scaffold.
+    # storm, the flat-RSS shared-payload pointer-identity scaffold, and the
+    # inbound line cap (StratumSession::kMaxStratumLineBytes).
     # Loopback-only (synthetic IWorkSource, ephemeral test port) — no daemon /
     # RPC / sharechain. DASH byte-parity note: the notify/coinbase/share BYTE
     # checks live in the dash lane against the frstrtr/p2pool-dash oracle

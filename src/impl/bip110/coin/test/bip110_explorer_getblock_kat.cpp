@@ -122,6 +122,9 @@ static IndexEntry make_entry(const BlockType& b, const uint256& hash, uint32_t h
     return e;
 }
 
+// BIP 152 short ids against bitcoind (bip110_cmpct_shortid_kat.cpp, #2055).
+int run_cmpct_shortid_kat();
+
 int main()
 {
     uint256 pow_limit;
@@ -243,6 +246,8 @@ int main()
         std::printf("[D] retained bodies = %u (expect ~%u)\n", retained, EXPLORER_DEPTH + 1);
         CHECK(retained <= EXPLORER_DEPTH + 1, "[D] retained count bounded by window");
     }
+
+    g_fail += run_cmpct_shortid_kat();
 
     if (g_fail == 0) std::printf("\nALL PASS: bip110 explorer retention + full-then-partial getblock\n");
     else             std::printf("\n%d CHECK(s) FAILED\n", g_fail);

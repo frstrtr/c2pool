@@ -42,6 +42,10 @@
 //                   with a peer on a rival -> abandoned after the bound (and
 //                   not before), the rival followed; solo -> never; every peer
 //                   lost -> abandoned.
+//   F  OWN FORK  -- the guard against the peers' chains: our block at h is on
+//                   the peer's chain, the peer's block at h+1 came first and our
+//                   own sibling at h+1 won D-14; past the bound only the sibling
+//                   is abandoned and the node is on the peer's branch.
 //
 // All five are RED on 00bb77c0 (with the test surfaces stubbed in) and GREEN
 // with the fix. Registered in BOTH `--target` lists in
@@ -64,6 +68,8 @@
 #include "impl/xmr/native/consensus/xmr_block_parse.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_fetcher.hpp"
 #include "impl/xmr/native/contracts/fakes/fake_txpool.hpp"
+#include "impl/xmr/native/node/xmr_sync_driver.hpp"
+#include "impl/xmr/native/node/xmr_sync_telemetry.hpp"
 #include "impl/xmr/native/template/xmr_native_miner_data.hpp"
 #include "impl/xmr/native/txpool/xmr_tx_decode.hpp"
 #include "xmr_input_consensus_golden.hpp"
@@ -580,14 +586,502 @@ void test_e_guard() {
     }
 }
 
+// ===========================================================================
+// F. the own-fork guard against the peers' chains
+// ===========================================================================
+//   A    the anchor
+//   b1   OUR block at A+1; the peer's chain carries it
+//   p2   the peer's block on b1 at A+2, connected first
+//   o2   OUR block on b1 at A+2: D-14 PREFER-OWN switches to it (p2 is parked)
+//   p3   the peer's next block, on p2 at A+3
+bool has_alt(const native::ChainIndex& idx, const Hash& id) {
+    for (const auto& t : idx.alt_tips()) if (t.id == id) return true;
+    return false;
+}
+
+struct OwnForkShape {
+    Chain      c;
+    BlockEntry b1, p2, o2, p3;
+    Hash       b1_id{}, p2_id{}, o2_id{}, p3_id{};
+    std::uint64_t h1 = kAnchorHeight + 1;
+    OwnForkShape() {
+        std::string why;
+        b1 = c.make(c.anchor_id, h1, {}, 0x91);
+        b1_id = id_of_blob(b1.block_blob);
+        kat::check(c.idx->submit_own_block(b1, why) && c.tip_id() == b1_id, "F setup: our b1 is the tip");
+        p2 = c.make(b1_id, h1 + 1, {}, 0x92);
+        p2_id = id_of_blob(p2.block_blob);
+        const auto r = c.offer(p2, c.pa);
+        kat::checkf(r.outcome == OfferOutcome::Connected && c.tip_id() == p2_id,
+                    "F setup: the peer's p2 on b1 connects (%s)", native::to_string(r.outcome));
+        c.advertise(c.pa, p2_id, h1 + 1);
+        o2 = c.make(b1_id, h1 + 1, {}, 0x93);
+        o2_id = id_of_blob(o2.block_blob);
+        kat::check(c.idx->submit_own_block(o2, why) && c.tip_id() == o2_id,
+                   "F setup: our o2 at the same height, D-14 switches to it");
+        kat::check(has_alt(*c.idx, p2_id), "F setup: p2 is held as an alternative");
+        p3 = c.make(p2_id, h1 + 2, {}, 0x94);
+        p3_id = id_of_blob(p3.block_blob);
+    }
+    // Past the bound, the tracking started at t0.
+    bool fire(std::string* why = nullptr, std::uint64_t t0 = 1000) {
+        (void)c.idx->check_own_fork(t0);
+        return c.idx->check_own_fork(t0 + kBoundMs + 1, why);
+    }
+};
+
+// F1: the fork base is taken above the height the peers' chains share with ours.
+void test_f1_common_height() {
+    std::printf("== F1. own-fork guard: the base above the peers' common height ==\n");
+    {   // OF-1 (the shape), OF-2, OF-3
+        OwnForkShape s;
+        Chain& c = s.c;
+        std::string why;
+        const bool ab = s.fire(&why);
+        std::printf("   guard: %s\n", why.c_str());
+        char from[48];
+        std::snprintf(from, sizeof from, "own fork from h=%llu ", (unsigned long long)(s.h1 + 1));
+        kat::checkf(ab && why.find(from) != std::string::npos && why.find("ABANDONED 1 ") != std::string::npos,
+                    "OF-1a only o2 is abandoned: the base is h=%llu, above b1, which the peer's chain carries",
+                    (unsigned long long)(s.h1 + 1));
+        kat::checkf(c.tip_id() == s.p2_id, "OF-1b the node is on the peer's p2 at once (tip h=%llu %s)",
+                    (unsigned long long)c.tip_height(), hex8(c.tip_id()).c_str());
+        kat::check(c.idx->is_on_best_chain(s.b1_id) && c.idx->is_on_best_chain(s.p2_id),
+                   "OF-1c b1 and p2 are on the best chain");
+        const auto r3 = c.offer(s.p3, c.pa);
+        kat::checkf(r3.outcome == OfferOutcome::Connected && c.tip_id() == s.p3_id,
+                    "OF-2 the peer's p3 extends the tip (%s)", native::to_string(r3.outcome));
+        std::string w;
+        const bool back = c.idx->submit_own_block(s.o2, w);
+        kat::checkf(!back && c.tip_id() == s.p3_id, "OF-3 the abandoned o2 is not re-adopted on a re-submit (%s)",
+                    w.c_str());
+        kat::check(c.idx->own_forks_abandoned() == 1, "OF-1d one abandonment counted");
+    }
+    {   // OF-5: two peers; the greatest common height counts
+        OwnForkShape s;
+        Chain& c = s.c;
+        const BlockEntry r1 = c.make(c.anchor_id, s.h1, {}, 0x95);   // a lighter rival on A, from pb
+        const Hash r1_id = id_of_blob(r1.block_blob);
+        (void)c.offer(r1, c.pb);
+        kat::check(has_alt(*c.idx, r1_id), "OF-5 setup: pb's rival r1 on A is held");
+        c.advertise(c.pb, r1_id, s.h1);
+        std::string why;
+        const bool ab = s.fire(&why);
+        kat::checkf(ab && why.find("ABANDONED 1 ") != std::string::npos && c.tip_id() == s.p2_id,
+                    "OF-5 pa's chain carries b1, pb's forks at A: only o2 is abandoned, the tip is p2 (tip %s)",
+                    hex8(c.tip_id()).c_str());
+    }
+    {   // OF-11: no own block on the tip: the guard never tracks
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0x96), q2 = c.make(c.anchor_id, h1, {}, 0x97);
+        (void)c.offer(q1, c.pa);
+        (void)c.offer(q2, c.pb);
+        c.advertise(c.pa, id_of_blob(q1.block_blob), h1);
+        c.advertise(c.pb, id_of_blob(q2.block_blob), h1);
+        bool ab = c.idx->check_own_fork(0);
+        ab = c.idx->check_own_fork(kBoundMs * 10) || ab;
+        kat::check(!ab && !c.idx->own_fork_tracking() && c.idx->own_forks_abandoned() == 0,
+                   "OF-11 a node with no own block on its tip never tracks or abandons");
+    }
+}
+
+// F2: the abandon erases nothing held: the peer's branch above an abandoned own
+// block stays (here the peer's top is unknown, so the whole own suffix goes).
+void test_f2_no_erase() {
+    std::printf("== F2. own-fork guard: nothing held is erased ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    c.advertise(c.pa, tag_hash(77, 0x7e), s.h1 + 2);   // a top we do not hold
+    std::string why;
+    const bool ab = s.fire(&why);
+    kat::checkf(ab && why.find("ABANDONED 2 ") != std::string::npos && c.tip_id() == c.anchor_id,
+                "OF-6a with no placeable peer top the whole own suffix is abandoned, tip A (%s)", why.c_str());
+    kat::check(has_alt(*c.idx, s.p2_id) && c.idx->have_block(s.p2_id),
+               "OF-6b the peer's p2 (a child of the abandoned b1) is still held");
+    kat::check(!has_alt(*c.idx, s.b1_id) && !has_alt(*c.idx, s.o2_id),
+               "OF-6c the abandoned own blocks are not parked (no D-14 way back)");
+}
+
+// F3: after the abandon, an own block on the abandoned parent is refused (never
+// parked); a Monero block is publishable only on a parent held verified that the
+// guard did not abandon.
+void test_f3_abandoned_parent() {
+    std::printf("== F3. own-fork guard: the abandoned parent ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    std::string w;
+    const bool on_tip = c.idx->network_parent_publishable(s.o2_id, &w);
+    const bool on_alt = c.idx->network_parent_publishable(s.p2_id, &w);
+    kat::checkf(on_tip && on_alt,
+                "OF-13a before the abandon: publishable on the tip o2 and on the held p2 (a lost race) (%s)", w.c_str());
+    kat::check(!c.idx->network_parent_publishable(tag_hash(5, 0x55), &w) && w.find("not held") != std::string::npos,
+               "OF-13b a parent the index does not hold: not publishable");
+    std::string why;
+    kat::check(s.fire(&why) && c.tip_id() == s.p2_id, "F3 setup: o2 abandoned, the tip is p2");
+    const bool on_abandoned = c.idx->network_parent_publishable(s.o2_id, &w);
+    kat::checkf(!on_abandoned && w.find("abandoned") != std::string::npos,
+                "OF-13c on the abandoned o2: not publishable (%s)", w.c_str());
+    kat::check(c.idx->network_parent_publishable(s.p2_id) && c.idx->abandoned_own(s.o2_id)
+                   && !c.idx->abandoned_own(s.b1_id),
+               "OF-13d on the new tip p2: publishable; o2 is abandoned, b1 is not");
+    const BlockEntry o3 = c.make(s.o2_id, s.h1 + 2, {}, 0x98);   // found on the stale job built on o2
+    const Hash o3_id = id_of_blob(o3.block_blob);
+    const bool adopted = c.idx->submit_own_block(o3, w);
+    kat::checkf(!adopted && w.find("abandoned") != std::string::npos && c.idx->own_on_abandoned_refused() == 1,
+                "OF-4a an own block on the abandoned o2 is refused (%s)", w.c_str());
+    kat::check(!has_alt(*c.idx, o3_id) && !c.idx->have_block(o3_id) && c.tip_id() == s.p2_id,
+               "OF-4b it is not parked and the tip stays p2");
+}
+
+// The peer side of a resync: a chain request is answered with `ids` (from the
+// splice point up), an objects request with the blocks of `served` it names.
+struct PeerServes {
+    std::vector<Hash>       ids;
+    std::uint64_t           start = 0;
+    std::vector<BlockEntry> served;
+    std::size_t             chain_seen = 0, objects_seen = 0, chain_answers = 0;
+    std::vector<Hash>       asked;
+    void step(Chain& c, const PeerRef& p) {
+        for (; chain_seen < c.fetcher.chain_requests.size(); ++chain_seen) {
+            native::ChainEntry e;
+            e.start_height = start;
+            e.total_height = start + ids.size();
+            e.ids = ids;
+            c.idx->on_chain_entry(p, std::move(e));
+            ++chain_answers;
+        }
+        for (; objects_seen < c.fetcher.object_requests.size(); ++objects_seen) {
+            std::vector<BlockEntry> out;
+            for (const Hash& id : c.fetcher.object_requests[objects_seen].ids) {
+                asked.push_back(id);
+                for (const BlockEntry& b : served)
+                    if (id_of_blob(b.block_blob) == id) out.push_back(b);
+            }
+            c.idx->on_objects(p, std::move(out), {}, start + ids.size());
+        }
+    }
+};
+
+PeerSyncData claim(const Hash& top, std::uint64_t top_height) {
+    PeerSyncData d;
+    d.current_height = top_height + 1;
+    d.top_id = top;
+    d.top_version = 16;
+    d.cumulative_difficulty = U128{~0ull, ~0ull >> 1};   // above any chain of this rig
+    d.support_flags = 1;
+    return d;
+}
+
+// F4a: a body the entry cache kept for a detached block does not count as held:
+// the resync asks the peer for it, and the peer's branch connects.
+void test_f4a_resync() {
+    std::printf("== F4a. own-fork guard: the resync re-asks a detached block ==\n");
+    {   // OF-6d, OF-7a: the peer's top unknown at the bound, then the resync
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(78, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = s.h1 + 3;
+        e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, s.b1_id) && has(want, s.p3_id) && !has(want, s.p2_id),
+                    "OF-6d the chain entry wants b1 (its body only in the entry cache) and p3, not the held p2 "
+                    "(%zu ids)", want.size());
+        c.idx->on_objects(c.pa, {s.b1, s.p3}, {}, s.h1 + 3);
+        kat::checkf(c.tip_id() == s.p3_id, "OF-6e b1 and p3 delivered: the node is on the peer's p3 (tip h=%llu)",
+                    (unsigned long long)c.tip_height());
+    }
+    {   // OF-6g: a solicited block on the abandoned o2 parks and puts o2 on the refetch list; o2 (its body only in
+        // the entry cache) is wanted from it
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(84, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        const BlockEntry q = c.make(s.o2_id, s.h1 + 2, {}, 0x9a);
+        const Hash q_id = id_of_blob(q.block_blob);
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = kAnchorHeight + 2;
+        e.ids = {c.anchor_id, q_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        c.idx->on_objects(c.pa, {q}, {}, s.h1 + 3);
+        kat::check(has_alt(*c.idx, q_id), "OF-6g setup: the solicited q on o2 parks (its parent not held)");
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, s.o2_id) && !has(want, q_id),
+                    "OF-6g the refetch list wants o2 (a detached block, its body only cached), not the held q (%zu ids)",
+                    want.size());
+    }
+    {   // OF-7a: the sync driver over the same state, the peer answering what it is asked
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(79, 0x7e), s.h1 + 2);
+        kat::check(s.fire() && c.tip_id() == c.anchor_id, "F4a setup: the whole own suffix abandoned, tip A");
+        c.fetcher.chain_requests.clear();
+        c.fetcher.object_requests.clear();
+        c.fetcher.peer_table = {{c.pa, claim(s.p3_id, s.h1 + 2)}};
+        PeerServes peer;
+        peer.start = kAnchorHeight;
+        peer.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        peer.served = {s.b1, s.p2, s.p3};
+        native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                                   [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); });
+        std::uint64_t now = 100000;
+        int ticks = 0;
+        for (; ticks < 40 && c.tip_id() != s.p3_id; ++ticks, now += 500) {
+            drv.tick(now);
+            peer.step(c, c.pa);
+        }
+        kat::checkf(has(peer.asked, s.b1_id) && c.tip_id() == s.p3_id,
+                    "OF-7a the driver asks the peer for b1 and the node reaches p3 in %d ticks (%zu chain requests)",
+                    ticks, c.fetcher.chain_requests.size());
+    }
+    {   // OF-8: every peer lost, the whole suffix abandoned; the redialled peer's chain carries it
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        std::string w;
+        const BlockEntry b1 = c.make(c.anchor_id, h1, {}, 0xa1);
+        const Hash b1_id = id_of_blob(b1.block_blob);
+        kat::check(c.idx->submit_own_block(b1, w), "OF-8 setup: our b1");
+        const BlockEntry c2 = c.make(b1_id, h1 + 1, {}, 0xa2);
+        const Hash c2_id = id_of_blob(c2.block_blob);
+        kat::check(c.idx->submit_own_block(c2, w) && c.tip_id() == c2_id, "OF-8 setup: our c2 on b1");
+        c.advertise(c.pa, c2_id, h1 + 1);                       // the peer's chain carries both
+        (void)c.idx->check_own_fork(0);
+        c.idx->on_peer_gone(c.pa);
+        (void)c.idx->check_own_fork(1);
+        kat::check(c.idx->check_own_fork(kBoundMs + 2) && c.tip_id() == c.anchor_id,
+                   "OF-8a every peer lost past the bound: the whole own suffix is abandoned, tip A");
+        c.advertise(c.pa, c2_id, h1 + 1);                       // the peer redials
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = h1 + 2;
+        e.ids = {c.anchor_id, b1_id, c2_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const std::vector<Hash> want = c.idx->refetch_wanted();
+        kat::checkf(has(want, b1_id) && has(want, c2_id), "OF-8b the redialled peer's chain entry wants b1 and c2 "
+                    "(%zu ids)", want.size());
+        c.idx->on_objects(c.pa, {b1, c2}, {}, h1 + 2);
+        kat::checkf(c.tip_id() == c2_id, "OF-8c served by the peer, b1 and c2 connect again (tip h=%llu)",
+                    (unsigned long long)c.tip_height());
+    }
+}
+
+// F4b: a chain answer that moves nothing (no height, nothing to fetch) is asked
+// again after chain_request_timeout_ms, not on every tick; it is never dropped.
+void test_f4b_quiet_ask() {
+    std::printf("== F4b. sync driver: no-progress answers are re-asked per timeout ==\n");
+    Chain c;
+    if (!c.ok) return;
+    const std::uint64_t h1 = kAnchorHeight + 1;
+    const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0xb1);
+    const Hash q1_id = id_of_blob(q1.block_blob);
+    (void)c.offer(q1, c.pa);
+    kat::check(c.tip_id() == q1_id, "F4b setup: the peer's q1 is the tip");
+    c.fetcher.peer_table = {{c.pa, claim(tag_hash(80, 0x7e), h1 + 5)}};   // claims more than it serves
+    PeerServes peer;
+    peer.start = h1;
+    peer.ids = {q1_id};
+    native::rt::SyncDriverConfig cfg;
+    native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                               [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); }, cfg);
+    std::uint64_t now = 100000;
+    for (int t = 0; t < 120; ++t, now += 500) {   // 60 s of 500 ms ticks
+        drv.tick(now);
+        peer.step(c, c.pa);
+    }
+    const std::size_t asked = c.fetcher.chain_requests.size();
+    const std::size_t bound = static_cast<std::size_t>(60000 / cfg.chain_request_timeout_ms) + 1;
+    kat::checkf(asked >= 2 && asked <= bound && peer.chain_answers == asked,
+                "OF-7b over 60 s of answers that move nothing: %zu chain requests (re-asked, at most %zu)", asked,
+                bound);
+    kat::checkf(drv.stats().chain_quiet_waits > 0, "OF-7c the waits are counted (%llu)",
+                (unsigned long long)drv.stats().chain_quiet_waits);
+    // OF-7d: the height moves inside a wait: the chain is asked again on the next tick
+    const std::size_t before = c.fetcher.chain_requests.size();
+    const BlockEntry q2 = c.make(q1_id, h1 + 1, {}, 0xb2);
+    kat::check(c.offer(q2, c.pa).outcome == OfferOutcome::Connected, "F4b setup: q2 extends the tip");
+    drv.tick(now);
+    kat::checkf(c.fetcher.chain_requests.size() == before + 1,
+                "OF-7d the height moved: the wait ends and the chain is asked on the next tick (%zu new)",
+                c.fetcher.chain_requests.size() - before);
+}
+
+// F5: the sync telemetry: the guard line names what it abandoned and where the
+// node is; the no-progress edge; the status line and the chain-answer line.
+void test_f5_telemetry() {
+    std::printf("== F5. sync telemetry ==\n");
+    {   // OF-14a the guard line
+        OwnForkShape s;
+        std::string why;
+        (void)s.fire(&why);
+        const std::string popped = "[" + std::to_string(s.h1 + 1) + ":" + native::rt::sync_hex16(s.o2_id) + "]";
+        const std::string now_on = ", now on h=" + std::to_string(s.h1 + 1) + " " + native::rt::sync_hex16(s.p2_id);
+        kat::checkf(why.find(popped) != std::string::npos && why.find(now_on) != std::string::npos
+                        && why.find("peers_common=" + std::to_string(s.h1)) != std::string::npos,
+                    "OF-14a the guard line names the common height, the abandoned o2 and the tip p2 (%s)", why.c_str());
+    }
+    {   // OF-14b the no-progress edge: raised past stall_report_ms with answers, cleared when the height moves
+        Chain c;
+        if (!c.ok) return;
+        const std::uint64_t h1 = kAnchorHeight + 1;
+        const BlockEntry q1 = c.make(c.anchor_id, h1, {}, 0xc1);
+        const Hash q1_id = id_of_blob(q1.block_blob);
+        (void)c.offer(q1, c.pa);
+        c.fetcher.peer_table = {{c.pa, claim(tag_hash(81, 0x7e), h1 + 5)}};
+        PeerServes peer;
+        peer.start = h1;
+        peer.ids = {q1_id};
+        native::rt::SyncDriverConfig cfg;
+        cfg.stall_report_ms = kBoundMs;
+        native::rt::SyncDriver drv(c.fetcher, *c.idx, *c.idx, c.anchor_id, [] { return true; },
+                                   [&c] { return c.idx->refetch_wanted(); }, [&c] { return c.idx->bodies_wanted(); },
+                                   cfg);
+        std::uint64_t now = 100000;
+        bool early = false;
+        for (int t = 0; t < 60; ++t, now += 500) {   // 30 s
+            drv.tick(now);
+            peer.step(c, c.pa);
+            if (now - 100000 < kBoundMs && drv.stats().stalled) early = true;
+        }
+        const native::rt::SyncDriver::Stats st = drv.stats();
+        kat::checkf(!early && st.stalled && st.stall_edges == 1 && st.stall_answers > 0,
+                    "OF-14b no progress for the bound with chain answers: raised once (edges %llu, %llu answers)",
+                    (unsigned long long)st.stall_edges, (unsigned long long)st.stall_answers);
+        const std::string line = native::rt::format_native_sync_stall(st, c.idx->sync_telemetry());
+        kat::checkf(line.find("NO PROGRESS") != std::string::npos && line.find("198.51.100.1:38080") != std::string::npos,
+                    "OF-14c the edge line: %s", line.c_str());
+        (void)c.offer(c.make(q1_id, h1 + 1, {}, 0xc2), c.pa);   // the height moves
+        drv.tick(now);
+        kat::check(!drv.stats().stalled && drv.stats().stall_clears == 1, "OF-14d the height moved: cleared once");
+    }
+    {   // OF-14e the status line and the chain-answer line in the resync state
+        OwnForkShape s;
+        Chain& c = s.c;
+        c.advertise(c.pa, tag_hash(82, 0x7e), s.h1 + 2);
+        (void)s.fire();
+        native::ChainEntry e;
+        e.start_height = kAnchorHeight;
+        e.total_height = s.h1 + 3;
+        e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+        c.idx->on_chain_entry(c.pa, std::move(e));
+        const native::ChainIndex::SyncTelemetry x = c.idx->sync_telemetry();
+        const std::string line = native::rt::format_native_sync(native::rt::SyncDriver::Stats{}, x, 2000);
+        const std::string ans = native::rt::format_native_sync_answer(x.last_answer);
+        kat::checkf(line.find("native-sync: tip=" + std::to_string(kAnchorHeight) + ":") == 0
+                        && line.find(" want=2 detached=1 ") != std::string::npos
+                        && line.find(" abandoned=1 ") != std::string::npos
+                        && line.find(" last_answer=" + std::to_string(kAnchorHeight) + "/3/1/2/1") != std::string::npos,
+                    "OF-14e the status line: %s", line.c_str());
+        kat::checkf(ans.find("split " + std::to_string(kAnchorHeight) + ", 3 ids: 1 held, 2 wanted (1 detached)")
+                        != std::string::npos,
+                    "OF-14f the chain-answer line: %s", ans.c_str());
+    }
+}
+
+// F3b: an own block the guard abandoned that a peer's chain brings back to the
+// best chain is no longer abandoned: blocks on it are publishable, and an own block
+// on it is not refused.
+void test_f3b_readopted() {
+    std::printf("== F3b. own-fork guard: an abandoned block back on the best chain ==\n");
+    OwnForkShape s;
+    Chain& c = s.c;
+    c.advertise(c.pa, tag_hash(83, 0x7e), s.h1 + 2);   // a top we do not hold: the whole own suffix goes
+    kat::check(s.fire() && c.tip_id() == c.anchor_id, "F3b setup: b1 and o2 abandoned, tip A");
+    native::ChainEntry e;
+    e.start_height = kAnchorHeight;
+    e.total_height = s.h1 + 3;
+    e.ids = {c.anchor_id, s.b1_id, s.p2_id, s.p3_id};
+    c.idx->on_chain_entry(c.pa, std::move(e));
+    c.idx->on_objects(c.pa, {s.b1, s.p3}, {}, s.h1 + 3);
+    kat::check(c.tip_id() == s.p3_id && c.idx->is_on_best_chain(s.b1_id),
+               "F3b setup: the peer served b1; the node is on p3 with b1 on the best chain");
+    std::string w;
+    const bool pub = c.idx->network_parent_publishable(s.b1_id, &w);
+    kat::checkf(pub && !c.idx->abandoned_own(s.b1_id),
+                "OF-13e b1, back on the best chain, is not abandoned and blocks on it are publishable (%s)", w.c_str());
+    const bool pub_tip = c.idx->network_parent_publishable(s.p3_id, &w);
+    kat::check(pub_tip && !c.idx->network_parent_publishable(s.o2_id),
+               "OF-13f on the tip p3: publishable; on o2 (abandoned, off the best chain): not");
+    const BlockEntry q2 = c.make(s.b1_id, s.h1 + 1, {}, 0x99);   // our block on the re-adopted b1
+    const bool kept = c.idx->submit_own_block(q2, w);
+    (void)kept;
+    kat::checkf(c.idx->own_on_abandoned_refused() == 0 && w.find("abandoned") == std::string::npos,
+                "OF-4c an own block on the re-adopted b1 is not refused as on an abandoned parent (%s)", w.c_str());
+}
+
+// F2b: an alternative block whose branch left the pool (an own block above an
+// abandoned one) never hides a candidate that reaches the best chain: the node
+// switches to the peer's heavier branch at once.
+void test_f2b_switch_reaches() {
+    std::printf("== F2b. the switch takes the heaviest candidate that reaches the best chain ==\n");
+    Chain c;
+    if (!c.ok) return;
+    const std::uint64_t A = kAnchorHeight;
+    std::string w;
+    const BlockEntry r1 = c.make(c.anchor_id, A + 1, {}, 0xd1);
+    const Hash r1_id = id_of_blob(r1.block_blob);
+    (void)c.offer(r1, c.pa);
+    const BlockEntry r2 = c.make(r1_id, A + 2, {}, 0xd2);
+    const Hash r2_id = id_of_blob(r2.block_blob);
+    (void)c.offer(r2, c.pa);
+    const BlockEntry b3 = c.make(r2_id, A + 3, {}, 0xd3);
+    const Hash b3_id = id_of_blob(b3.block_blob);
+    kat::check(c.idx->submit_own_block(b3, w), "F2b setup: our b3 on the peer's r2");
+    const BlockEntry o4 = c.make(b3_id, A + 4, {}, 0xd4);
+    kat::check(c.idx->submit_own_block(o4, w) && c.tip_id() == id_of_blob(o4.block_blob), "F2b setup: our o4 is the tip");
+    const BlockEntry o4x = c.make(b3_id, A + 4, {}, 0xd5);   // our sibling of o4 (a stale job): held
+    const Hash o4x_id = id_of_blob(o4x.block_blob);
+    (void)c.idx->submit_own_block(o4x, w);
+    kat::check(has_alt(*c.idx, o4x_id), "F2b setup: our sibling o4x is held as an alternative");
+    const BlockEntry s2 = c.make(r1_id, A + 2, {}, 0xd6);    // the other peer's branch, forked at r1
+    const Hash s2_id = id_of_blob(s2.block_blob);
+    (void)c.offer(s2, c.pb);
+    const BlockEntry s3 = c.make(s2_id, A + 3, {}, 0xd7);
+    const Hash s3_id = id_of_blob(s3.block_blob);
+    (void)c.offer(s3, c.pb);
+    const BlockEntry s4 = c.make(s3_id, A + 4, {}, 0xd8);
+    const Hash s4_id = id_of_blob(s4.block_blob);
+    (void)c.offer(s4, c.pb);
+    kat::check(has_alt(*c.idx, s4_id) && c.tip_id() == id_of_blob(o4.block_blob),
+               "F2b setup: the peer's s2-s4 are held (equal work: the tip stays o4)");
+    c.advertise(c.pa, r2_id, A + 2);
+    c.advertise(c.pb, s4_id, A + 4);
+    (void)c.idx->check_own_fork(1000);
+    std::string why;
+    const bool ab = c.idx->check_own_fork(1000 + kBoundMs + 1, &why);
+    kat::checkf(ab && why.find("ABANDONED 2 ") != std::string::npos, "F2b the guard abandons b3 and o4 (%s)",
+                why.c_str());
+    kat::checkf(c.tip_id() == s4_id,
+                "OF-6f our sibling o4x (its parent b3 abandoned) does not hide the peer's heavier s4: tip %s h=%llu",
+                hex8(c.tip_id()).c_str(), (unsigned long long)c.tip_height());
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("=== xmr_template_dup_tx_kat ===\n");
-    test_a_oracle();
-    test_b_own_block();
-    test_c_reorg();
-    test_d_template();
-    test_e_guard();
+    const std::string only = argc > 1 ? argv[1] : "";
+    const auto run = [&](const char* name, void (*fn)()) {
+        if (only.empty() || only == name) fn();
+    };
+    run("a", test_a_oracle);
+    run("b", test_b_own_block);
+    run("c", test_c_reorg);
+    run("d", test_d_template);
+    run("e", test_e_guard);
+    run("f1", test_f1_common_height);
+    run("f2", test_f2_no_erase);
+    run("f2b", test_f2b_switch_reaches);
+    run("f3", test_f3_abandoned_parent);
+    run("f3b", test_f3b_readopted);
+    run("f4a", test_f4a_resync);
+    run("f4b", test_f4b_quiet_ask);
+    run("f5", test_f5_telemetry);
     return kat::report("xmr_template_dup_tx_kat");
 }

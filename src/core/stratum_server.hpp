@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <iomanip>
 #include <sstream>
@@ -91,8 +92,20 @@ class StratumServer;
 /// NiceHash extranonce protocol, and mining.suggest_difficulty.
 class StratumSession : public std::enable_shared_from_this<StratumSession>
 {
+public:
+    /// Longest inbound Stratum line, excluding the '\n' delimiter. Same bound
+    /// as p2pool: its stratum peer is twisted's LineOnlyReceiver
+    /// (p2pool util/jsonrpc.py LineBasedPeer, MAX_LENGTH not overridden), and
+    /// twisted drops the connection once a line exceeds MAX_LENGTH = 16384.
+    /// The read buffer holds kMaxStratumLineBytes + 1 bytes so a line of
+    /// exactly kMaxStratumLineBytes plus its '\n' is still accepted.
+    static constexpr std::size_t kMaxStratumLineBytes = 16384;
+
+private:
     tcp::socket socket_;
-    boost::asio::streambuf buffer_;
+    // Bounded line buffer: a peer whose line runs past kMaxStratumLineBytes
+    // without a '\n' is dropped (see read_message()).
+    boost::asio::streambuf buffer_{kMaxStratumLineBytes + 1};
     std::deque<std::string> write_queue_;  // async write queue (non-blocking)
     bool writing_ = false;                 // true while an async_write is in flight
     std::shared_ptr<IWorkSource> mining_interface_;
@@ -137,6 +150,8 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
         uint32_t    version{};
         std::shared_ptr<const std::vector<std::string>> tx_data;     // raw tx hex from GBT template (a1: shared/lazy)
         std::string mweb;                      // MWEB extension data
+        bool        mweb_active{false};        // template rules named MWEB
+        bool        degraded{false};           // template ingress refused (served degraded)
         bool        segwit_active{false};
         uint256     prev_share_hash;  // share chain tip when this job was built
         uint64_t    subsidy{0};       // coinbasevalue frozen at job creation
@@ -176,6 +191,13 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // (FIFO), and a 300 s TTL sweep on insert mirrors p2pool's ExpiringDict.
     // The most recently issued job (back of the deque) is never evicted.
     std::deque<std::string> job_order_;
+    // Ids of jobs this session issued and has since evicted (newest at the
+    // back, at most RECENT_EXPIRED_JOBS). A submit whose job id is neither
+    // active nor listed here was never issued on this connection, e.g. a
+    // result the rig buffered before a node restart: it is still answered
+    // "Stale share" but counted as an unknown job, not as genuine stale.
+    std::deque<std::string> expired_job_ids_;
+    static constexpr size_t RECENT_EXPIRED_JOBS = 256;
     // Per-generation payload cache: reuse the previous job's SharedJobPayload
     // when the freshly built bytes are identical (same work generation, same
     // coinbase, same branches). Byte-compare gate ⇒ wire-identical by design.
@@ -189,8 +211,14 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
     // Per-worker statistics
     uint64_t accepted_shares_ = 0;
     uint64_t rejected_shares_ = 0;
-    uint64_t stale_shares_    = 0;
+    uint64_t stale_shares_    = 0;  // job id not active: genuine stale + unknown job
     uint64_t doa_shares_      = 0;  // block-template changed at submit (live-vs-frozen prevhash mismatch); accounting only, share still broadcasts
+    // Rolling accepted / stale / unknown-job outcomes for the miner page;
+    // shared with the worker registry through WorkerInfo::submit_window.
+    // Unknown-job submits (job id never issued on this connection) are a
+    // subset of stale_shares_.
+    std::shared_ptr<core::stratum::SubmitOutcomeWindow> submit_window_ =
+        std::make_shared<core::stratum::SubmitOutcomeWindow>();
     std::chrono::steady_clock::time_point connected_at_;
     // Last inbound-line timestamp (zombie-session reaper, StratumConfig::
     // session_idle_timeout_sec). Updated on every received stratum line; a
@@ -224,6 +252,11 @@ class StratumSession : public std::enable_shared_from_this<StratumSession>
 
     // Suggested difficulty from miner (mining.suggest_difficulty)
     double suggested_difficulty_ = 0.0;
+
+    // Per-miner SHARE difficulty from a colon-less "ADDR/<diff>" login token
+    // (p2pool desired_share_target). Unset when absent or not a finite
+    // value > 0. Parsed here only; consumers wire it per coin.
+    std::optional<double> share_difficulty_override_;
 
     // Periodic work-push timer — member (not shared_ptr) so RAII guarantees
     // the timer outlives all its callbacks.  Matches p2pool Twisted semantics
@@ -269,6 +302,7 @@ public:
     double get_hashrate() const { return hashrate_tracker_.get_current_hashrate(); }
     const std::array<uint8_t, 20>& get_pubkey_hash() const { return pubkey_hash_; }
     const std::map<uint32_t, std::string>& get_merged_addresses() const { return merged_addresses_; }
+    const std::optional<double>& get_share_difficulty_override() const { return share_difficulty_override_; }
 
 private:
     std::string generate_subscription_id();
@@ -337,6 +371,10 @@ class StratumServer
     std::atomic<bool> accepting_{true};
     std::atomic<uint64_t> refused_draining_{0};
 
+    // Sessions dropped because an inbound line exceeded
+    // StratumSession::kMaxStratumLineBytes without a '\n'.
+    std::atomic<uint64_t> oversized_line_drops_{0};
+
     // p2pool RateMonitor pair (work.py:223-226):
     //   local_rate_monitor: per-user hashrate (for get_local_rates)
     //   local_addr_rate_monitor: per-address hashrate (for get_local_addr_rates)
@@ -366,7 +404,10 @@ public:
 
     /// Push new work to ALL connected miners immediately (p2pool: new_work_event).
     /// Called when best_share changes or new block template arrives.
-    void notify_all();
+    /// force_clean=false (a template rebuilt for new transactions on the
+    /// same block) sends clean_jobs only where the block's prevhash changed,
+    /// so the ASIC pipelines are not wiped once a second.
+    void notify_all(bool force_clean = true);
 
     /// Sum of all connected miners' hashrate (H/s).
     double get_total_hashrate() const;
@@ -402,6 +443,9 @@ public:
 
     /// Connections refused by the strict per-node miner cap (fix #5).
     uint64_t get_refused_connections() const { return refused_connections_.load(); }
+    /// Sessions dropped for an over-length line (no '\n' within the cap).
+    uint64_t get_oversized_line_drops() const { return oversized_line_drops_.load(); }
+    void record_oversized_line_drop() { oversized_line_drops_.fetch_add(1); }
     /// Live session count (dead sessions pruned lazily — see notify_all()).
     size_t get_session_count() const;
 

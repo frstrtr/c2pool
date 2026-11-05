@@ -619,12 +619,16 @@ public:
     static constexpr std::uint64_t OVERLAY_MAGIC = 0x31594C564F583243ull;   // "C2XOVLY1"
     static constexpr std::uint64_t OVERLAY_VER   = 1;
 
+    // With no anchor snapshot seeded (a genesis boot, an anchor boot without --native-output-set) the overlay sits
+    // on the EMPTY set the boot started from: base, no snapshot rows or leaves, and the tip the set had before its
+    // first block (the boot tip); load_overlay() replays it onto an empty set the same way.
     bool serialize_overlay(std::vector<std::uint8_t>& out, std::string& why) const {
         std::lock_guard<std::mutex> lk(mu_);
         out.clear();
-        if (!snap_.bytes) { why = "no anchor snapshot is seeded; there is no overlay to persist"; return false; }
         const std::size_t so = static_cast<std::size_t>(snap_.out_peaks.leaf_count);
         const std::size_t sk = static_cast<std::size_t>(snap_.ki_peaks.leaf_count);
+        const std::uint64_t sth = snap_.bytes ? snap_.tip_height : boot_tip_height_locked_();
+        const Hash          sti = snap_.bytes ? snap_.tip_id : boot_tip_id_locked_();
         if (out_leaves_.size() != so + undo_.size() || ki_leaves_.size() != sk + undo_.size()
             || out_leaf_first_.size() != out_leaves_.size()) {
             why = "overlay undo frames disagree with the leaf logs";
@@ -640,8 +644,8 @@ public:
         put_h32_(p, ::v37::Lane::mmr_bag(snap_.out_peaks.peaks));
         put_u64(p, snap_.ki_peaks.leaf_count);
         put_h32_(p, ::v37::Lane::mmr_bag(snap_.ki_peaks.peaks));
-        put_u64(p, snap_.tip_height);
-        put_h32_(p, snap_.tip_id);
+        put_u64(p, sth);
+        put_h32_(p, sti);
         put_u64(p, tip_height_);
         put_h32_(p, tip_id_);
         put_u64(p, base_ + total_outputs_());
@@ -680,7 +684,6 @@ public:
 
     bool load_overlay(const std::vector<std::uint8_t>& blob, std::string& why) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!snap_.bytes) { why = "no anchor snapshot is seeded to lay the overlay over"; return false; }
         if (!undo_.empty() || !outputs_.empty() || !spent_.empty()
             || out_peaks_.leaf_count != snap_.out_peaks.leaf_count
             || ki_peaks_.leaf_count != snap_.ki_peaks.leaf_count
@@ -699,7 +702,6 @@ public:
     // this before falling back to the from-anchor re-walk.
     bool drop_overlay() {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!snap_.bytes) return false;
         rollback_to_snapshot_locked_();
         return true;
     }
@@ -708,6 +710,13 @@ private:
     static void put_h32_(std::vector<std::uint8_t>& s, const bytes32& h) {
         s.insert(s.end(), h.begin(), h.end());
     }
+
+    // The boot tip of an unseeded set: the height below its first block (a genesis boot: 0; an anchor boot: the
+    // anchor's height) and the tip id the set had then.
+    std::uint64_t boot_tip_height_locked_() const {
+        return undo_.empty() ? tip_height_ : (undo_.front().height > 0 ? undo_.front().height - 1 : 0);
+    }
+    Hash boot_tip_id_locked_() const { return undo_.empty() ? tip_id_ : undo_.front().prev_tip_id; }
 
     void rollback_to_snapshot_locked_() {
         std::vector<OutputRecord>().swap(outputs_);
@@ -759,9 +768,14 @@ private:
         if (base != base_ || sn != snap_.n
             || sol != snap_.out_peaks.leaf_count || sor != ::v37::Lane::mmr_bag(snap_.out_peaks.peaks)
             || skl != snap_.ki_peaks.leaf_count || skr != ::v37::Lane::mmr_bag(snap_.ki_peaks.peaks)
-            || sth != snap_.tip_height || sti != snap_.tip_id) {
-            why = "overlay is bound to a different anchor snapshot than the one seeded";
+            || (snap_.bytes && (sth != snap_.tip_height || sti != snap_.tip_id))) {
+            why = snap_.bytes ? "overlay is bound to a different anchor snapshot than the one seeded"
+                              : "overlay is bound to a seeded anchor snapshot or another numbering base";
             return false;
+        }
+        if (!snap_.bytes) {  // the empty set the boot started from: its tip is the overlay's boot tip
+            tip_height_ = sth;
+            tip_id_     = sti;
         }
         if (nb != th - sth || th < sth) {
             why = "overlay block count disagrees with its tip height";

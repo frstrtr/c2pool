@@ -31,7 +31,9 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
+#include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
 #include <impl/dash/coin/asset_lock_fold.hpp>   // #107 phase 2: DIP-0027 type-8 credit-pool fold
 #include <impl/dash/coin/asset_unlock_admission.hpp>  // #143 Variant B: verified type-9 set (light bridge struct)
 #include <impl/dash/coin/subsidy.hpp>
@@ -55,6 +57,7 @@
 #include <array>
 #include <cstdint>
 #include <ctime>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -381,6 +384,35 @@ inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
     return splice_verdicted_pins(w, pins, verdicts, arm, enforce_block_budget);
 }
 
+/// The ONE MnFoldContext both the template builder and the NodeCoinState emit
+/// gate fold with (sml_special_fold.hpp): the pre-block list from the live
+/// MnStateMachine, external-collateral proofs from the same chain views the
+/// selector priced from (Mempool::prove_chain_coin), and the BLS operator-
+/// signature verifier (nullptr/empty ⇒ ProUpServTx / ProUpRevTx refused).
+inline MnFoldContext make_template_fold_context(
+    const MnStateMachine& mnstates, const Mempool& mempool,
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier)
+{
+    MnFoldContext::CollateralCoinFn coin =
+        [&mempool](const MnFoldContext::Outpoint& op, int64_t& value) {
+            ::core::coin::Coin c;
+            switch (mempool.prove_chain_coin(::core::coin::Outpoint(op.hash, op.index), c)) {
+            case Mempool::CoinProof::Unspent:
+                value = c.value;
+                return MnFoldContext::CollateralProof::Unspent;
+            case Mempool::CoinProof::Absent:
+                return MnFoldContext::CollateralProof::Absent;
+            case Mempool::CoinProof::Unknown:
+                break;
+            }
+            return MnFoldContext::CollateralProof::Unknown;
+        };
+    return MnFoldContext::from(
+        mnstates, std::move(coin),
+        protx_sig_verifier != nullptr ? *protx_sig_verifier
+                                      : MnFoldContext::OperatorSigFn{});
+}
+
 inline DashWorkData build_embedded_workdata(
     uint32_t prev_height,
     const uint256& prev_hash,
@@ -541,7 +573,25 @@ inline DashWorkData build_embedded_workdata(
     // The type-8 (asset-lock) selection leg rides accrue_pending_asset_locks;
     // types 5/6/7/9 are never selected (type-6 is builder-generated, type-9 is
     // admission-path-only via admitted_asset_unlocks).
-    bool include_mn_special_txs = false)
+    bool include_mn_special_txs = false,
+    // ── PoSe PASS seams (sml_pose_fold.hpp, incident h=2561514) ──────────
+    // The member proTxHash source and the penalty oracle for dashd's
+    // HandleQuorumCommitment/PoSePunish pass over the REAL commitments in
+    // qc_commitments (specialtxman.cpp:159-174, :427-451). When the pass
+    // proves a ban, the committed merkleRootMNList carries it (isValid=false
+    // on that leaf); when it cannot be decided exactly, the unfolded root is
+    // committed exactly as before and the NodeCoinState viability + pre-emit
+    // gates refuse the template (emit-qc-real-pose-unfolded). Default
+    // nullptr => every existing positional caller is byte-unchanged: no
+    // member source means no ban can be proven, so no root changes.
+    const QcMembersFn* qc_pose_members = nullptr,
+    const PoSeOracle* qc_pose_oracle = nullptr,
+    // ── B.9 seam: the BLS operator-signature verifier for ProUpServTx /
+    // ProUpRevTx in the types 1-4 fold (vendor::verify_protx_operator_sig in
+    // c2pool-dash). nullptr => those two types are REFUSED (fail closed): a
+    // stale-key ProUpServTx is bad-protx-sig on every block that carries it.
+    // Only consulted when include_mn_special_txs admitted types 1-4.
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -700,6 +750,9 @@ inline DashWorkData build_embedded_workdata(
         }
         selected.resize(kept);
     }
+    // S2: is each admitted inject in this body? One RIDES / HELD line per
+    // inject per height (telemetry only; the body is untouched).
+    log_inject_rides(mempool, selected, prev_height + 1, suppress_mempool_txs);
     // ── TYPES 1-4 MN-LIST FOLD (merkleRootMNList parity) ──────────────────
     // When the mask admitted provider special txs (types 1-4), fold their
     // effect over a COPY of the projected SML now, BEFORE body assembly, so
@@ -710,44 +763,120 @@ inline DashWorkData build_embedded_workdata(
     // Never mutates any follower state: the fold runs on a projected COPY. When
     // the mask did not admit types 1-4 (default), this whole block is skipped
     // and the template is byte-identical to before.
+    //
+    // ── PoSe PASS over the body's REAL type-6 commitments (sml_pose_fold.hpp)
+    // dashd's list rebuild runs confirmedHash pass -> DecreaseScores -> vtx in
+    // block order (specialtxman.cpp:206-229, :232-453), and every type-6 tx of
+    // this body sits directly after the coinbase, ahead of every provider tx.
+    // So the PoSe pass is decided ONCE here and applied to each projected
+    // copy BEFORE the types 1-4 fold and before the CbTx root: a ProUpServTx
+    // later in the same body must see (and revive) a ban this pass applies.
+    // Decided on the TIP list — the pass reads only presence, isValid and the
+    // entry count, which the confirmation projection never changes. A pass
+    // that cannot be decided exactly bans nothing here (the unfolded root is
+    // committed, exactly as before this pass existed) and the NodeCoinState
+    // viability + pre-emit gates refuse the template — never a guessed ban.
+    std::vector<uint256> qc_pose_bans;
+    if (sml != nullptr && qc_commitments != nullptr && !qc_commitments->empty()) {
+        static const QcMembersFn kNoMemberSource;
+        const QcPoseDecision pose = decide_qc_pose(
+            *sml, *qc_commitments,
+            qc_pose_members != nullptr ? *qc_pose_members : kNoMemberSource,
+            qc_pose_oracle, prev_height, prev_hash);
+        if (!pose.ok()) {
+            LOG_WARNING << "[GBT-EMB] PoSe pass UNDECIDABLE at h="
+                        << (prev_height + 1) << ": qc[" << pose.qc_index
+                        << "] type=" << static_cast<int>(pose.llmq_type)
+                        << " qi=" << pose.quorum_index
+                        << " stage=" << qc_pose_stage_name(pose.stage)
+                        << " — committed merkleRootMNList carries no PoSe ban"
+                        << " (emit gate refuses this template)";
+        } else {
+            qc_pose_bans = pose.bans;
+            if (!qc_pose_bans.empty())
+                LOG_INFO << "[GBT-EMB] PoSe pass h=" << (prev_height + 1)
+                         << " punished=" << pose.punished
+                         << " banned=" << qc_pose_bans.size()
+                         << " — committing the post-ban merkleRootMNList";
+        }
+    }
     std::optional<vendor::CSimplifiedMNList> mn_folded_sml;
     if (special_mask.allow_mn_types && sml != nullptr) {
         auto proj_for_fold = project_sml_confirmations(
             *sml, prev_height, prev_hash, mnstates, mn_min_confirmations);
+        // dashd order: the type-6 PoSe pass precedes the provider txs.
+        apply_qc_pose_bans(proj_for_fold.sml, qc_pose_bans);
         if (proj_for_fold.ok) {
-            std::vector<MutableTransaction> body_for_fold;
-            body_for_fold.reserve(selected.size());
-            for (const auto& s : selected) body_for_fold.push_back(s.tx);
-            auto fold = fold_mn_special_txs(
-                proj_for_fold.sml, body_for_fold,
-                [](const MutableTransaction& t) {
-                    return dash::coin::dash_txid(t);
-                });
-            if (!fold.refused_ids.empty()) {
-                std::set<uint256> drop(fold.refused_ids.begin(),
-                                       fold.refused_ids.end());
-                size_t kept = 0;
-                for (size_t i = 0; i < selected.size(); ++i) {
-                    if (drop.count(dash::coin::dash_txid(selected[i].tx))) {
-                        total_fees -= selected[i].fee;
-                        LOG_WARNING << "[GBT-EMB] excluding provider special tx "
-                                    << dash::coin::dash_txid(selected[i].tx).GetHex().substr(0, 16)
-                                    << " from template h=" << (prev_height + 1)
-                                    << ": MN-list fold refused it (unknown proTxHash"
-                                    << " / dup key / parse failure)";
-                        continue;
+            // The SAME context the emit gate folds with (B10 parity).
+            const MnFoldContext fold_ctx =
+                make_template_fold_context(mnstates, mempool, protx_sig_verifier);
+            // Fold, drop what it refused (fee follows the tx out), and repeat
+            // while a drop also takes an in-body DESCENDANT with it: a child of
+            // a dropped tx would spend an output the block no longer creates
+            // (bad-txns-inputs-missingorspent), and a dropped child that the
+            // fold had applied changes the list, so the body is re-folded.
+            // Every pass removes at least one tx, so this terminates.
+            for (;;) {
+                std::vector<MutableTransaction> body_for_fold;
+                body_for_fold.reserve(selected.size());
+                for (const auto& s : selected) body_for_fold.push_back(s.tx);
+                auto fold = fold_mn_special_txs(
+                    proj_for_fold.sml, body_for_fold,
+                    [](const MutableTransaction& t) {
+                        return dash::coin::dash_txid(t);
+                    },
+                    fold_ctx);
+                bool dropped_descendant = false;
+                if (!fold.refused_ids.empty()) {
+                    std::map<uint256, std::string> why;
+                    for (size_t k = 0; k < fold.refused_ids.size(); ++k)
+                        why.emplace(fold.refused_ids[k], fold.refused_reasons[k]);
+                    std::set<uint256> drop(fold.refused_ids.begin(),
+                                           fold.refused_ids.end());
+                    size_t kept = 0;
+                    for (size_t i = 0; i < selected.size(); ++i) {
+                        const uint256 id = dash::coin::dash_txid(selected[i].tx);
+                        bool child_of_dropped = false;
+                        for (const auto& in : selected[i].tx.vin)
+                            if (drop.count(in.prevout.hash)) { child_of_dropped = true; break; }
+                        if (drop.count(id) || child_of_dropped) {
+                            total_fees -= selected[i].fee;
+                            if (!drop.count(id)) {
+                                drop.insert(id);
+                                dropped_descendant = true;
+                                LOG_WARNING << "[GBT-EMB] excluding tx "
+                                            << id.GetHex().substr(0, 16)
+                                            << " from template h=" << (prev_height + 1)
+                                            << ": it spends an output of an excluded"
+                                               " provider special tx";
+                            } else {
+                                LOG_WARNING << "[GBT-EMB] excluding provider special tx "
+                                            << id.GetHex().substr(0, 16)
+                                            << " from template h=" << (prev_height + 1)
+                                            << ": MN-list fold refused it ("
+                                            << why[id] << ")";
+                            }
+                            continue;
+                        }
+                        if (kept != i) selected[kept] = std::move(selected[i]);
+                        ++kept;
                     }
-                    if (kept != i) selected[kept] = std::move(selected[i]);
-                    ++kept;
+                    selected.resize(kept);
                 }
-                selected.resize(kept);
+                if (dropped_descendant) continue;   // re-fold the reduced body
+                // A refused tx never mutated the list and its inputs were not
+                // counted as spends, so this fold IS the fold of the body that
+                // remains.
+                mn_folded_sml = std::move(fold.sml);
+                if (fold.applied > 0 || fold.collateral_removed > 0)
+                    LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
+                             << (prev_height + 1) << " applied=" << fold.applied
+                             << " refused=" << fold.refused
+                             << " replaced=" << fold.replaced
+                             << " collateral_removed=" << fold.collateral_removed
+                             << " — committing folded merkleRootMNList";
+                break;
             }
-            mn_folded_sml = std::move(fold.sml);
-            if (fold.applied > 0)
-                LOG_INFO << "[GBT-EMB] types 1-4 MN-list fold h="
-                         << (prev_height + 1) << " applied=" << fold.applied
-                         << " refused=" << fold.refused
-                         << " — committing folded merkleRootMNList";
         } else {
             // Projection unavailable ⇒ degrade leg (b): mask types 1-4 out by
             // dropping them from the body (the credit-pool / type-8 leg is
@@ -859,19 +988,17 @@ inline DashWorkData build_embedded_workdata(
     // that for byte parity. Zero fee, zero in/out; consensus-checked via
     // the NodeCoinState emit gate against the same deterministic plan.
     //
-    // ██ PHASE-L LANDMINE — PoSe punishment on REAL commitments ██
-    // dashd's verifier PoSe-punishes every !validMembers[i] quorum member
-    // when a NON-NULL commitment is in the block (specialtxman.cpp:159-174
+    // PoSe punishment on REAL commitments (the #1083 landmine): dashd's
+    // verifier PoSe-punishes every !validMembers[i] quorum member when a
+    // NON-NULL commitment is in the block (specialtxman.cpp:159-174
     // HandleQuorumCommitment -> PoSePunish(CalcPenalty(66))), and a penalty
     // that crosses the ban threshold flips that MN's isValid IN THE SAME
     // BLOCK's MN list — changing the merkleRootMNList THIS coinbase commits.
-    // Null commitments are exempt (specialtxman.cpp:432 IsNull() guard), so
-    // today's all-null qc plans cannot trip it and the projected root above
-    // stays correct. THE DAY Phase L serves REAL (non-null) commitments,
-    // this inclusion site MUST fold the PoSe pass into the committed MN root
-    // (mirror of the confirmedHash rollover projection above) or every block
-    // carrying a commitment with a failed member is bad-cbtx-mnmerkleroot —
-    // a silently lost block. Do not ship real commitments without it.
+    // That pass is folded above (qc_pose_bans, sml_pose_fold.hpp) in dashd's
+    // order; whatever it cannot decide exactly is refused by the
+    // NodeCoinState gates. Null commitments are exempt (specialtxman.cpp:432
+    // IsNull() guard). Moving these txs after any provider tx would break
+    // the fold order — keep them directly after the coinbase.
     if (qc_commitments != nullptr) {
         for (const auto& c : *qc_commitments) {
             MutableTransaction qtx = build_qc_tx(w.m_height, c);
@@ -1203,11 +1330,17 @@ inline DashWorkData build_embedded_workdata(
                      << (prev_height + 1)
                      << " — committing projected merkleRootMNList";
         }
+        // The type-6 PoSe pass (decided above, before the types 1-4 fold):
+        // a proven ban flips that leaf's isValid in the list this block
+        // commits (PoSePunish -> BanIfNotBanned, deterministicmns.cpp:319-321).
+        // Empty (no real commitment / no punishment crosses max / undecidable)
+        // => the projection is untouched.
+        apply_qc_pose_bans(proj.sml, qc_pose_bans);
         // merkleRootMNList source: the types-1-4 fold above (when armed and the
-        // projection was available) has already applied the body's provider
-        // special txs to a projected COPY — commit THAT list's root so the
-        // CbTx matches the list the block's own txs produce (dashd
-        // BuildNewListFromBlock). Otherwise commit the plain projected root.
+        // projection was available) has already applied the PoSe bans and the
+        // body's provider special txs to a projected COPY — commit THAT list's
+        // root so the CbTx matches the list the block's own txs produce (dashd
+        // BuildNewListFromBlock). Otherwise commit the projected root.
         const vendor::CSimplifiedMNList& cbtx_sml =
             mn_folded_sml.has_value() ? *mn_folded_sml : proj.sml;
         vendor::CCbTx cb = build_embedded_cbtx(

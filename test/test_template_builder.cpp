@@ -31,6 +31,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/block.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 #include <core/uint256.hpp>
 #include <core/hash.hpp>
 #include <core/pack.hpp>
@@ -88,6 +89,15 @@ static std::unique_ptr<HeaderChain> make_chain_with_genesis(bool testnet = true)
     EXPECT_TRUE(chain->init());
     EXPECT_TRUE(chain->add_header(ltc_testnet_genesis()));
     return chain;
+}
+
+/// Run the tip's (genesis, empty) block body through the mempool cleanup, as
+/// the full-block handler does: a non-empty pool builds a template only once
+/// it has been cleaned for the tip.
+static void clean_for_genesis(Mempool& pool) {
+    BlockType b;
+    static_cast<BlockHeaderType&>(b) = ltc_testnet_genesis();
+    pool.remove_for_block(b);
 }
 
 // ─── Test 1–2: Subsidy ───────────────────────────────────────────────────────
@@ -301,6 +311,9 @@ TEST(TemplateBuilderTest, MempoolTxsAppearInTemplate) {
         pool.add_tx(tx);
         pool.set_tx_fee(txid, 1000);
     }
+    ltc_test::CoveringView view;
+    view.cover(pool);
+    clean_for_genesis(pool);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
@@ -317,6 +330,9 @@ TEST(TemplateBuilderTest, TxArrayHasDataAndTxidFields) {
     auto txid99 = compute_txid(tx99);
     pool.add_tx(tx99);
     pool.set_tx_fee(txid99, 500);
+    ltc_test::CoveringView view;
+    view.cover(pool);
+    clean_for_genesis(pool);
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
 
@@ -337,6 +353,9 @@ TEST(TemplateBuilderTest, TxHashConsistencyWithHashes) {
     auto txid42 = compute_txid(tx);
     pool.add_tx(tx);
     pool.set_tx_fee(txid42, 500);
+    ltc_test::CoveringView view;
+    view.cover(pool);
+    clean_for_genesis(pool);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());
@@ -357,6 +376,7 @@ TEST(TemplateBuilderTest, WeightBudgetNotExceeded) {
     // Add many transactions
     for (int i = 0; i < 200; ++i)
         pool.add_tx(make_tx(static_cast<uint32_t>(1000 + i)));
+    clean_for_genesis(pool);
 
     auto wd = TemplateBuilder::build_template(*chain, pool, true);
     ASSERT_TRUE(wd.has_value());

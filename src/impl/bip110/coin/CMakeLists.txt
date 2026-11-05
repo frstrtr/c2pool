@@ -242,8 +242,14 @@ add_test(NAME bip110_coin_reachability_kat COMMAND bip110_coin_reachability_kat)
 # in-window body-miss degrades identically; [D] prune keeps the window bounded to
 # ~288 recent bodies (daemonless storage bound). Pure decode/store, network-free,
 # reward-safe. Same link closure as the sibling coin KATs.
+# Also runs bip110_cmpct_shortid_kat.cpp (#2055): BIP 152 short ids of
+# bip110::coin::CompactBlock against a cmpctblock bitcoind 27.0 produced (the
+# BTC vector in src/impl/btc/test/btc_regtest_cmpct_fixtures.hpp; bip110 is the
+# BTC twin before the fork). It rides this executable, which is already in both
+# build.yml target lists, instead of adding a target.
 add_executable(bip110_explorer_getblock_kat
     test/bip110_explorer_getblock_kat.cpp
+    test/bip110_cmpct_shortid_kat.cpp
 )
 target_compile_definitions(bip110_explorer_getblock_kat PRIVATE __C2POOL_COIN_BIP110__=1)
 target_link_libraries(bip110_explorer_getblock_kat

@@ -8,6 +8,7 @@
 #include "share.hpp"
 #include "share_messages.hpp"
 #include "share_types.hpp"
+#include "version_switch_gate.hpp"
 #include <core/version_gate.hpp>   // SSOT: core::version_gate::is_v36_active
 
 #include <core/hash.hpp>
@@ -1813,7 +1814,8 @@ bool share_check(const ShareT& share,
                             new_ver_weight = new_ver_weight + w;
                     }
                     // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100
-                    if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+                    // (floored threshold -- see version_switch_gate.hpp)
+                    if (version_switch_underweight(new_ver_weight, total_weight))
                         throw std::invalid_argument("switch without enough hash power upgraded");
                 }
                 else if (parent_version == share_ver + 1)

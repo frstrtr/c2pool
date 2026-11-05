@@ -47,6 +47,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <core/durable_file.hpp>   // rename_over: replaces the target on Windows too
 #include <impl/dash/coin/serve_gate_journal.hpp>
 
 namespace dash {
@@ -270,7 +271,7 @@ inline bool save_serve_gate_state_atomic(const std::string& path,
             return false;
         }
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!core::durable_file::rename_over(tmp, path)) {
         std::remove(tmp.c_str());
         return false;
     }

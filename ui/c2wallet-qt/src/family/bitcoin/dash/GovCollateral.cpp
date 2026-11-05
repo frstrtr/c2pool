@@ -108,6 +108,17 @@ std::string gov_hash_display(const std::array<uint8_t, 32>& internal)
     return hdkeys::to_hex(rev.data(), rev.size());
 }
 
+std::array<uint8_t, 32> gov_hash_from_display(const std::string& display_hex)
+{
+    auto bytes = display_hex.size() == 64 ? hdkeys::from_hex(display_hex) : std::nullopt;
+    if (!bytes || bytes->size() != 32)
+        throw DashAbort("governance hash must be exactly 64 hex characters (display order, "
+                        "as `gobject prepare` / `gobject check` print it)");
+    std::array<uint8_t, 32> internal{};
+    for (size_t i = 0; i < 32; ++i) internal[i] = (*bytes)[31 - i];
+    return internal;
+}
+
 std::vector<uint8_t> collateral_op_return_script(const std::array<uint8_t, 32>& internal)
 {
     std::vector<uint8_t> s;

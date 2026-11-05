@@ -6,356 +6,207 @@
 // version. See COPYING in the repository root.
 //
 // ---------------------------------------------------------------------------
-// src/impl/xmr/receipt/test/xmr_receipt_kat.cpp  --  X4 receipt-envelope KAT.
+// src/impl/xmr/test/xmr_receipt_kat.cpp  --  the Path B receipt (v3 body) KAT.
 //
-// Two KATs, RandomX CI-gated throughout (no 256-MiB cache, no heavy hash):
-//
-//   KAT-1  REAL Monero mainnet block 3000000. Build the coinbase opening from the
-//          real miner_tx prefix, verify_crypto_opening() end-to-end, and confirm
-//          the Keccak-midstate opening reproduces  H(prefix) -> miner_tx_hash ->
-//          tree_root == the root inside the RandomX-signed hashing blob. Ground
-//          truth = monerod get_block, carried in
-//          src/impl/xmr/test/x0-kat-3000000.json (values inlined below, cited).
-//
-//   KAT-2  SYNTHETIC v37 receipt (real X1 coinbase serializer + a v37 tx_extra
-//          0x03 leaf committing info_digest). Runs the FULL keyed_heavy W2
-//          admission ORDER and proves: (a) a clean receipt is accepted with
-//          RandomX CI-gated (SkippedCIGated); (b) a replayed receipt dies at
-//          stage 1 (Dedup) with RandomX NEVER reached; (c) an expired receipt
-//          dies at stage 2 (Expiry), RandomX NEVER reached; (d) a tampered
-//          T_origin breaks the binding at stage 3 (Structural); (e) an
-//          off-consensus T_origin dies at stage 4 (R1Target); (f) with a stub
-//          hasher wired, stage 5 (RandomX) runs LAST and its verdict is honoured.
-//
-// Build (light, single TU, uses X1's already-vendored primitives; no cmake):
-//   g++ -std=c++20 -O1 \
-//     -I <c2pool>/src/impl/xmr/coin \
-//     -I <c2pool>/src/impl/xmr/receipt \
-//     xmr_receipt_kat.cpp \
-//     xmr_receipt_verify.cpp \
-//     <c2pool>/src/impl/xmr/coin/xmr_blob.cpp \
-//     <c2pool>/src/impl/xmr/coin/vendor/{keccak,hash,tree-hash}.c \
-//     -o /tmp/xmr_receipt_kat && /tmp/xmr_receipt_kat
+//   KAT-1  REAL Monero mainnet block 3000000 (ground truth: monerod get_block,
+//          src/impl/xmr/test/x0-kat-3000000.json, values inlined below):
+//          miner_tx_prefix_hash(prefix) == H(prefix); miner_tx_hash == the
+//          block's miner tx hash; the tree fold tree_root_fold(tx hash, branch)
+//          == the root inside the RandomX-hashed blob; the 76-byte hashing blob
+//          decodes (tx_count 38) and re-encodes byte-exact; a flipped branch
+//          byte no longer reproduces the root.
+//   KAT-2  a v3 receipt body through the S2.3 order (admit_receipt):
+//          (a) admitted PENDING, RandomX called last, once;
+//          (b) the same receipt placed on the best chain -> DUPLICATE row 22,
+//              no RandomX;
+//          (c) h(r) - h(tip) > Fresh -> REFUSE row 20, no RandomX;
+//          (d) t_origin changed in the body -> STRIKE row 25, no RandomX;
+//          (e) credit = work(t_origin): the placement's work is
+//              t_origin = d_at(tip), whatever the PoW achieves (a zero hash);
+//              an off-consensus t_origin (the body built consistently on it)
+//              -> STRIKE row 25, no RandomX;
+//          (f) RandomX false -> BAN row 29 (RandomX called, last);
+//          the v3 body round-trips (encode / decode) and its id is
+//          keccak256(hashing blob).
 // ---------------------------------------------------------------------------
-#include <cassert>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
-#include "xmr_receipt.hpp"
-#include "xmr_admission.hpp"
-#include "xmr_receipt_verify.hpp"
-#include "xmr_blob.hpp"           // X1 coinbase serializer for KAT-2
+#include "impl/xmr/pathb/test/pathb_kat_admit.hpp"
 
-using namespace v37::xmr;
-namespace vf = v37::xmr::verify;
+using namespace pathb_kat;
+namespace pb = ::c2pool::xmr::pathb;
+using pb::AdmitVerdict;
+using pb::RowId;
 
-// ------------------------------ hex helpers --------------------------------
-static std::vector<u8> unhex(const std::string& s) {
-    auto nyb = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    std::vector<u8> out;
+namespace {
+
+std::vector<std::uint8_t> unhex_v(const std::string& s) {
+    std::vector<std::uint8_t> out;
     for (std::size_t i = 0; i + 1 < s.size(); i += 2)
-        out.push_back(static_cast<u8>((nyb(s[i]) << 4) | nyb(s[i + 1])));
+        out.push_back(static_cast<std::uint8_t>((hex_nibble(s[i]) << 4) | hex_nibble(s[i + 1])));
     return out;
 }
-static bytes32 unhex32(const std::string& s) {
-    auto v = unhex(s);
-    bytes32 b{};
-    for (int i = 0; i < 32 && i < (int)v.size(); ++i) b[i] = v[i];
-    return b;
-}
-static std::string hex(const bytes32& b) {
-    static const char* d = "0123456789abcdef";
-    std::string s;
-    for (u8 c : b) { s.push_back(d[c >> 4]); s.push_back(d[c & 15]); }
-    return s;
-}
-static void put_varint(std::vector<u8>& b, u64 v) {
-    while (v >= 0x80) { b.push_back(static_cast<u8>(v) | 0x80); v >>= 7; }
-    b.push_back(static_cast<u8>(v));
-}
 
-// ------------------- REAL block 3000000 KAT vectors ------------------------
-// Source: src/impl/xmr/test/x0-kat-3000000.json (monerod get_block, X0 leg).
 namespace kat3000000 {
 const std::string HASHING_BLOB =
-  "1010dea6caa906cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd5b4b5347"
-  "bc43ae2b8000313cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e"
-  "7bdf0626";
+        "1010dea6caa906cc64d29f62794dbb5309732f74447d88389198cfbf86a499bd5b4b5347"
+        "bc43ae2b8000313cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e"
+        "7bdf0626";
 const std::string PREFIX_BLOB =
-  "02fc8db70101ffc08db7010180bde2a1c911031f214b304e74e9fe437ccd1f62b4777b20"
-  "4dea7afdf844420dc5214971ef8d6cf334017543af4f79becc9e3d8701bfc6c405696a52"
-  "d60332692703faad3475e0a8cfe402110000007147a42756000000000000000000";
-const std::size_t EXTRA_START = 53;    // extra_start_in_prefix
-const std::string H_PREFIX =
-  "18b7efb2ab347082fc161ff480b0554dbf94de87251e676d8b67d7f5d9173b24";
-const std::string MINER_TX_HASH =
-  "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6";
-const std::string TREE_ROOT =
-  "3cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e7bdf06";
-const std::uint8_t DEPTH = 5;          // tree_branch_leaf0.depth (n_tx=38 -> clean 32)
-const std::uint32_t PATH_BITS = 0;     // path_bits "00000" (leaf 0 is always left)
+        "02fc8db70101ffc08db7010180bde2a1c911031f214b304e74e9fe437ccd1f62b4777b20"
+        "4dea7afdf844420dc5214971ef8d6cf334017543af4f79becc9e3d8701bfc6c405696a52"
+        "d60332692703faad3475e0a8cfe402110000007147a42756000000000000000000";
+const std::string H_PREFIX = "18b7efb2ab347082fc161ff480b0554dbf94de87251e676d8b67d7f5d9173b24";
+const std::string MINER_TX_HASH = "7f88a52afdab303ddb9d444cb5b53adb5a12c63a82e898a9d2db9f76dd1127f6";
+const std::string TREE_ROOT = "3cc88694451e92299e5283b2c51985e5c0d31b8d910f53d9a8b167a24e7bdf06";
 const char* BRANCH[5] = {
-  "e4516854a5984eaf5f8750ac7af41d1e0b2c602a2297a673001e8c0af88eba11",
-  "160b280159f52461dcb661e49f30cae2a7f235acbdd68a8d002183b2358ed144",
-  "03330ad5f7bee104763d8c19b207d52d4323d86a888229790801934c177629d3",
-  "2244a793730a85480efc9301dde5045088ee4d8b61e4849ccf757ab8a99d5f44",
-  "3d5a1ba12f721187cf632d75f220ee7c412420572fe6aca17cce1eecb569e93d",
+        "e4516854a5984eaf5f8750ac7af41d1e0b2c602a2297a673001e8c0af88eba11",
+        "160b280159f52461dcb661e49f30cae2a7f235acbdd68a8d002183b2358ed144",
+        "03330ad5f7bee104763d8c19b207d52d4323d86a888229790801934c177629d3",
+        "2244a793730a85480efc9301dde5045088ee4d8b61e4849ccf757ab8a99d5f44",
+        "3d5a1ba12f721187cf632d75f220ee7c412420572fe6aca17cce1eecb569e93d",
 };
-} // namespace kat3000000
+}  // namespace kat3000000
 
-static int g_pass = 0, g_fail = 0;
-#define CHECK(name, cond) do { \
-    if (cond) { std::printf("  PASS  %s\n", name); ++g_pass; } \
-    else      { std::printf("  FAIL  %s\n", name); ++g_fail; } } while (0)
-
-// ===========================================================================
-// KAT-1: real block 3000000 -- Keccak-midstate opening reproduces tx->root.
-// ===========================================================================
-static void kat1_real_block() {
+void kat1_real_block() {
     using namespace kat3000000;
-    std::printf("[KAT-1] REAL Monero mainnet block 3000000 (RandomX CI-gated)\n");
+    std::printf("[KAT-1] REAL Monero mainnet block 3000000\n");
+    const std::vector<std::uint8_t> prefix = unhex_v(PREFIX_BLOB);
+    check(prefix.size() == 105, "KAT-1 prefix length 105");
+    const pb::Hash32 hp = pb::miner_tx_prefix_hash(prefix);
+    check(hex32(hp) == H_PREFIX, "KAT-1 miner_tx_prefix_hash(prefix) == monerod get_transaction_prefix_hash");
+    const pb::Hash32 tx = pb::miner_tx_hash(hp);
+    check(hex32(tx) == MINER_TX_HASH, "KAT-1 miner_tx_hash == monerod get_block");
+    std::vector<pb::Hash32> branch;
+    for (const char* b : BRANCH) branch.push_back(h32(b));
+    const pb::Hash32 root = pb::tree_root_fold(tx, branch);
+    check(hex32(root) == TREE_ROOT, "KAT-1 tree_root_fold(miner tx hash, branch) == the block's tree root");
 
-    MoneroReceipt r;
-    r.hashing_blob.bytes = unhex(HASHING_BLOB);
-    CHECK("hashing_blob length == 76", r.hashing_blob.size() == 76);
+    const std::vector<std::uint8_t> blob = unhex_v(HASHING_BLOB);
+    check(blob.size() == 76, "KAT-1 hashing blob length 76");
+    pb::BlobReader r(blob.data(), blob.size());
+    pb::HashingBlob hb;
+    check(pb::detail::read_hashing_blob(r, blob.size(), hb) == pb::WireError::None, "KAT-1 the hashing blob decodes");
+    check(hex32(hb.tree_root) == TREE_ROOT && hb.tx_count == 38 && hb.major == 16 && hb.minor == 16,
+          "KAT-1 the blob carries the folded root, tx_count 38, version 16 / 16");
+    std::vector<std::uint8_t> again;
+    pb::encode_hashing_blob(hb, again);
+    check(again == blob, "KAT-1 the blob re-encodes byte-exact");
+    check(pb::receipt_id(hb) == pb::keccak256_hash(blob), "KAT-1 receipt_id == keccak256(hashing blob)");
 
-    // build the coinbase opening from the real miner_tx prefix at the extra boundary
-    std::vector<u8> prefix = unhex(PREFIX_BLOB);
-    CHECK("prefix length == 105", prefix.size() == 105);
-    bool bok = vf::build_coinbase_opening(prefix, EXTRA_START, r.coinbase_opening);
-    CHECK("build_coinbase_opening ok", bok);
-    // block 3000000: 0 complete 136-blocks before boundary => midstate all-zero,
-    // prefix_tail == the 53-byte head, tx_extra == the 52 opened bytes.
-    bool tail_is_head = r.coinbase_opening.prefix_tail.size() == EXTRA_START;
-    bool extra_is_52  = r.coinbase_opening.tx_extra.size() == 105 - EXTRA_START;
-    CHECK("opening: prefix_tail == 53-byte head", tail_is_head);
-    CHECK("opening: tx_extra == 52 opened bytes", extra_is_52);
-
-    // (i) the midstate resume reproduces H(prefix)
-    bytes32 h_prefix{};
-    bool rok = vf::resume_prefix_hash(r.coinbase_opening, h_prefix);
-    CHECK("resume_prefix_hash ok", rok);
-    CHECK("H(prefix) == monerod get_transaction_prefix_hash", hex(h_prefix) == H_PREFIX);
-
-    // fill the tree branch from the real proof
-    r.tree_branch.depth     = DEPTH;
-    r.tree_branch.path_bits = PATH_BITS;
-    for (int i = 0; i < DEPTH; ++i) r.tree_branch.path.push_back(unhex32(BRANCH[i]));
-
-    // (ii) verify_crypto_opening: resume -> tx hash -> tree branch -> root match
-    OpenedCommitment oc;
-    std::string why;
-    bool vok = vf::verify_crypto_opening(r, oc, &why);
-    CHECK("verify_crypto_opening ok (RandomX CI-gated)", vok);
-    if (!vok) std::printf("        why: %s\n", why.c_str());
-
-    // (iii) the recovered leaf-0 tx hash and root match monerod ground truth
-    CHECK("miner_tx_hash == monerod get_block", hex(oc.miner_tx_hash) == MINER_TX_HASH);
-    CHECK("recovered tree_root == monerod tree_root", hex(oc.tree_root) == TREE_ROOT);
-
-    // (iv) and that root IS the one embedded in the RandomX-signed hashing blob
-    vf::ParsedBlob pb;
-    bool pok = vf::parse_hashing_blob(r.hashing_blob, pb);
-    CHECK("parse_hashing_blob ok", pok);
-    CHECK("blob-embedded tree_root == recovered tree_root", hex(pb.tree_root) == TREE_ROOT);
-    CHECK("blob n_tx == 38", pb.n_tx == 38);
-
-    // (v) tamper: flip one branch byte -> root no longer reproduces -> reject
-    MoneroReceipt bad = r;
-    bad.tree_branch.path[2][0] ^= 0x01;
-    OpenedCommitment oc2;
-    bool vbad = vf::verify_crypto_opening(bad, oc2, nullptr);
-    CHECK("tampered branch is rejected", !vbad);
-
-    std::printf("        opening chain reproduced: H(prefix)=%s...\n", H_PREFIX.substr(0,16).c_str());
-    std::printf("                                  tx_hash =%s...\n", MINER_TX_HASH.substr(0,16).c_str());
-    std::printf("                                  root    =%s...\n", TREE_ROOT.substr(0,16).c_str());
+    std::vector<pb::Hash32> bad = branch;
+    bad[2][0] ^= 0x01;
+    check(pb::tree_root_fold(tx, bad) != root, "KAT-1 a flipped branch byte no longer reproduces the root");
 }
 
-// ===========================================================================
-// KAT-2: synthetic v37 receipt -- full keyed_heavy admission ORDER.
-// ===========================================================================
-static ::xmr::coin::PublicKey mk_key(u8 seed) {
-    ::xmr::coin::PublicKey k;
-    for (int i = 0; i < 32; ++i) k.data()[i] = static_cast<u8>(seed + i);
-    return k;
-}
-static bytes32 mk_id(u8 seed) {
-    bytes32 b{}; for (int i = 0; i < 32; ++i) b[i] = static_cast<u8>(0xA0 ^ (seed + i)); return b;
-}
+const std::uint64_t kJ0 = pb::admit_j0(pb::kRuledLaneParams);
 
-static bool build_synth_receipt(const ReceiptSideData& sd, MoneroReceipt& out) {
-    // real X1 coinbase serializer: one payee, height 3000000
-    const std::uint64_t height = 3000000;
-    const std::uint64_t amount = 600000000000ULL;   // ~0.6 XMR
-    ::xmr::coin::PublicKey key = mk_key(0x40);
-    ::xmr::coin::ViewTag vt; vt.tag = 0x11;
-    std::vector<u8> head =
-        ::xmr::coin::write_coinbase_prefix_head(height, &amount, &key, &vt, 1);
-
-    // v37 tx_extra: 0x01 pubkey || 0x02 nonce(4) || 0x03 MM{depth0, mm_leaf}
-    const bytes32 info    = vf::side_data_digest(sd);
-    const bytes32 mm_leaf = vf::mm_commitment_leaf(sd.chain_id, info);
-    std::vector<u8> extra;
-    extra.push_back(0x01);
-    for (int i = 0; i < 32; ++i) extra.push_back(static_cast<u8>(0x70 + i));   // tx pubkey R
-    extra.push_back(0x02); put_varint(extra, 4);
-    for (int i = 0; i < 4; ++i) extra.push_back(static_cast<u8>(i));            // nonce
-    extra.push_back(0x03);
-    { std::vector<u8> inner; put_varint(inner, 0);                              // depth
-      inner.insert(inner.end(), mm_leaf.begin(), mm_leaf.end());               // root
-      put_varint(extra, inner.size());
-      extra.insert(extra.end(), inner.begin(), inner.end()); }
-
-    // prefix = head || varint(len(extra)) || extra
-    std::vector<u8> prefix = head;
-    put_varint(prefix, extra.size());
-    const std::size_t extra_start = prefix.size();
-    prefix.insert(prefix.end(), extra.begin(), extra.end());
-
-    vf::BuildInputs in;
-    in.major = 16; in.minor = 16; in.timestamp = 1697813342;
-    in.prev_id = mk_id(0x01); in.nonce = 0xdeadbeef;
-    in.prefix_bytes = prefix; in.extra_start = extra_start;
-    in.side_data = sd;                       // other_leaves empty => n_tx == 1
-    in.seed_policy = SeedRefPolicy::DerivedFromBin;
-    std::string why;
-    bool ok = vf::build_v37_receipt(in, out, &why);
-    if (!ok) std::printf("        build_v37_receipt failed: %s\n", why.c_str());
-    return ok;
+std::vector<pb::Hash32> chain_of(KatNode& n, std::uint64_t count) {
+    std::vector<pb::Hash32> out;
+    pb::Hash32 prev = n.tree.best().id;
+    const std::uint64_t base = n.node(prev).pos;
+    for (std::uint64_t i = 1; i <= count; ++i) {
+        const pb::CarrierBodyV3 c = carrier_on(n, prev, h_pos(base + i), {}, (base + i) % 4, 1 + base + i);
+        const Admitted a = admit_place(n, c);
+        if (!a.placed) {
+            check(false, "chain: carrier not placed at " + std::to_string(base + i) + ": " + desc(a.r));
+            break;
+        }
+        prev = pb::receipt_id(c.own);
+        out.push_back(prev);
+    }
+    return out;
 }
 
-static void kat2_admission_order() {
-    std::printf("[KAT-2] synthetic v37 receipt -- keyed_heavy admission ORDER\n");
+bool is(const pb::AdmitResult& r, AdmitVerdict v, RowId row) { return r.verdict == v && r.row == row; }
 
-    const u32 CHAIN = 0x584d5200u;                 // 'XMR\0' lane id (arbitrary)
-    const bytes32 IDENT = mk_id(0x11);             // miner's payout identity == carrier
-    const Difficulty T_ORIGIN{100000, 0};          // p2pool-class share target
+void kat2_v3_order() {
+    std::printf("[KAT-2] a v3 receipt body through the S2.3 order\n");
+    KatNet net;
+    KatNode n(net, kJ0);
+    std::vector<pb::Hash32> chain = chain_of(n, 12);
+    if (chain.empty()) return;
+    const pb::Hash32 tip = chain.back();
+    const std::uint64_t ht = h_pos(13);
 
-    ReceiptSideData sd;
-    sd.t_origin = T_ORIGIN;
-    sd.payout_identity = IDENT;
-    sd.chain_id = CHAIN;
-    // prev_own_share display-only, left zero
+    const pb::ReceiptBodyV3 r = body_on(n, tip, ht, 1, 8001);
+    const std::vector<std::uint8_t> bytes = bytes_of(r);
+    pb::ReceiptBodyV3 dec;
+    check(pb::decode_receipt_body_v3(bytes.data(), bytes.size(), pb::ReceiptLimits{n.buffers.receipt}, dec) ==
+                          pb::WireError::None &&
+                  dec == r,
+          "KAT-2 the v3 body round-trips");
+    std::vector<std::uint8_t> hb;
+    pb::encode_hashing_blob(r.blob, hb);
+    check(pb::receipt_id(r) == pb::keccak256_hash(hb), "KAT-2 the receipt id is keccak256(hashing blob)");
 
-    MoneroReceipt r;
-    bool bok = build_synth_receipt(sd, r);
-    CHECK("build synthetic v37 receipt", bok);
-    CHECK("receipt within per-receipt byte budget",
-          r.wire_size() <= budget::PER_RECEIPT_BUDGET);
-    std::printf("        receipt wire_size = %zu B (cap %zu)\n",
-                r.wire_size(), (std::size_t)budget::PER_RECEIPT_BUDGET);
-
-    LaneKeyedHeavy lp;                              // r_max=2, n_ctx=2
-    const u64 RECEIPT_BIN = 3000000;
-    const u64 CARRIER_BIN = 3000001;               // 1 bin ahead, within n_ctx=2
-
-    // ----- base config: index oracles wired; RandomX null => CI-gated -----
-    vf::VerifyConfig cfg;
-    cfg.bin_of = [&](const HashingBlob&, u64& b) { b = RECEIPT_BIN; return true; };
-    cfg.consensus_difficulty = [&](u64, Difficulty& d) { d = T_ORIGIN; return true; };
-    cfg.seed_for_bin = [&](u64, const SeedRef&, bytes32& s) { s = bytes32{}; return true; };
-    cfg.seen = [&](const bytes32&) { return false; };
-    // cfg.rx_check left null => stage 5 CI-gated
-
-    // (a) clean receipt -> accepted, RandomX CI-gated
+    // (a)
+    std::uint64_t rx = n.rx_calls;
+    const pb::AdmitResult a = pb::admit_receipt(n.env(), bytes, pb::Role::Pending);
+    check(is(a, AdmitVerdict::AdmitPending, RowId::R30) && a.randomx_called && n.rx_calls == rx + 1,
+          "KAT-2 (a) admitted PENDING, RandomX called once, last: " + desc(a));
+    // (e) credit = work(t_origin), not the achieved difficulty (the stub's hash meets any d)
+    const std::uint64_t d_at = n.tree.next_difficulty(tip).value_or(0);
+    check(d_at > 0 && r.side.t_origin == d_at && a.store_placements.size() == 1 && a.store_placements[0].work == d_at,
+          "KAT-2 (e) the placement's work is t_origin = d_at(tip) = " + std::to_string(d_at));
+    // (b) the same receipt carried by the next carrier on the best chain -> DUPLICATE
     {
-        OpenedCommitment oc;
-        AdmitOutcome o = vf::verify_receipt(r, IDENT, CARRIER_BIN, CHAIN, lp, cfg, oc);
-        CHECK("(a) clean receipt accepted", o.ok && o.stage == AdmitStage::Accepted);
-        CHECK("(a) RandomX CI-gated (SkippedCIGated)",
-              o.randomx == RandomXStatus::SkippedCIGated);
-        CHECK("(a) opened T_origin == committed side data", oc.t_origin == T_ORIGIN);
-        CHECK("(a) opened payout identity bound", oc.payout_identity == IDENT);
-        CHECK("(a) opened chain_id bound", oc.chain_id == CHAIN);
+        const pb::CarrierBodyV3 c = carrier_on(n, tip, h_pos(13), {r}, 2, 8101);
+        const Admitted p = admit_place(n, c);
+        check(p.placed, "KAT-2 (b) a carrier carrying the receipt is placed: " + desc(p.r));
+        rx = n.rx_calls;
+        const pb::AdmitResult b = pb::admit_receipt(n.env(), bytes, pb::Role::Pending);
+        check(is(b, AdmitVerdict::Duplicate, RowId::R22) && n.rx_calls == rx && !b.randomx_called,
+              "KAT-2 (b) the replayed receipt -> DUPLICATE row 22, no RandomX: " + desc(b));
+        if (p.placed) chain.push_back(pb::receipt_id(c.own));
     }
-
-    // (b) replayed receipt -> killed at stage 1 (Dedup); RandomX NEVER reached
+    const pb::Hash32 tip2 = chain.back();
+    const std::uint64_t ht2 = h_pos(14);
+    // (c) beyond Fresh
     {
-        vf::VerifyConfig c2 = cfg;
-        c2.seen = [&](const bytes32&) { return true; };     // dedup hit
-        OpenedCommitment oc;
-        AdmitOutcome o = vf::verify_receipt(r, IDENT, CARRIER_BIN, CHAIN, lp, c2, oc);
-        CHECK("(b) replay rejected at Dedup", !o.ok && o.stage == AdmitStage::Dedup);
-        CHECK("(b) replay never touched RandomX", o.randomx == RandomXStatus::NotReached);
+        const pb::ReceiptBodyV3 late = body_on(n, tip2, ht2 + pb::kRuledLaneParams.fresh_max + 1, 3, 8201);
+        rx = n.rx_calls;
+        const pb::AdmitResult c = pb::admit_receipt(n.env(), bytes_of(late), pb::Role::Pending);
+        check(is(c, AdmitVerdict::Refuse, RowId::R20) && n.rx_calls == rx,
+              "KAT-2 (c) h(r) - h(tip) > Fresh -> REFUSE row 20, no RandomX: " + desc(c));
     }
-
-    // (c) expired receipt (bin too old) -> killed at stage 2 (Expiry), no RandomX
+    // (d) t_origin changed in a committed body
     {
-        OpenedCommitment oc;
-        // carrier is 5 bins ahead; n_ctx = 2 => expired
-        AdmitOutcome o = vf::verify_receipt(r, IDENT, RECEIPT_BIN + 5, CHAIN, lp, cfg, oc);
-        CHECK("(c) expired rejected at Expiry", !o.ok && o.stage == AdmitStage::Expiry);
-        CHECK("(c) expired never touched RandomX", o.randomx == RandomXStatus::NotReached);
+        pb::ReceiptBodyV3 t = body_on(n, tip2, ht2, 4, 8301);
+        t.side.t_origin += 1;
+        rx = n.rx_calls;
+        const pb::AdmitResult d = pb::admit_receipt(n.env(), bytes_of(t), pb::Role::Pending);
+        check(is(d, AdmitVerdict::Strike, RowId::R25) && n.rx_calls == rx,
+              "KAT-2 (d) t_origin changed -> STRIKE row 25, no RandomX: " + desc(d));
     }
-
-    // (d) tampered T_origin in the preimage -> info_digest changes -> the 0x03 MM
-    //     leaf no longer matches -> killed at stage 3 (Structural), no RandomX
+    // (e) an off-consensus t_origin, the body built consistently on it
     {
-        MoneroReceipt bad = r;
-        bad.side_data->t_origin = Difficulty{999999, 0};    // preimage lie
-        // (info_digest is NOT recomputed => info_digest != keccak256(side_data))
-        OpenedCommitment oc;
-        AdmitOutcome o = vf::verify_receipt(bad, IDENT, CARRIER_BIN, CHAIN, lp, cfg, oc);
-        CHECK("(d) tampered T_origin rejected at Structural",
-              !o.ok && o.stage == AdmitStage::Structural);
-        CHECK("(d) tampered T_origin never touched RandomX",
-              o.randomx == RandomXStatus::NotReached);
+        const pb::ReceiptBodyV3 off =
+                body_on(n, tip2, ht2, 5, 8401, {}, [](pb::ReceiptBodyV3& b) { b.side.t_origin = b.side.t_origin * 3 + 7; });
+        rx = n.rx_calls;
+        const pb::AdmitResult e = pb::admit_receipt(n.env(), bytes_of(off), pb::Role::Pending);
+        check(is(e, AdmitVerdict::Strike, RowId::R25) && n.rx_calls == rx,
+              "KAT-2 (e) an off-consensus t_origin -> STRIKE row 25, no RandomX: " + desc(e));
     }
-
-    // (e) off-consensus T_origin: consistent preimage (rebuild) but consensus
-    //     pins a different target -> killed at stage 4 (R1Target), no RandomX
+    // (f) RandomX false
     {
-        ReceiptSideData sd2 = sd;
-        sd2.t_origin = Difficulty{424242, 0};               // internally consistent...
-        MoneroReceipt r2;
-        bool ok2 = build_synth_receipt(sd2, r2);
-        CHECK("(e) build off-consensus receipt", ok2);
-        OpenedCommitment oc;
-        // consensus still pins T_ORIGIN=100000, receipt says 424242
-        AdmitOutcome o = vf::verify_receipt(r2, IDENT, CARRIER_BIN, CHAIN, lp, cfg, oc);
-        CHECK("(e) off-consensus T_origin rejected at R1Target",
-              !o.ok && o.stage == AdmitStage::R1Target);
-        CHECK("(e) off-consensus never touched RandomX",
-              o.randomx == RandomXStatus::NotReached);
+        const pb::ReceiptBodyV3 f = body_on(n, tip2, ht2, 6, 8501);
+        n.bad_pow.insert(pb::receipt_id(f));
+        rx = n.rx_calls;
+        const pb::AdmitResult x = pb::admit_receipt(n.env(), bytes_of(f), pb::Role::Pending);
+        check(is(x, AdmitVerdict::Ban, RowId::R29) && x.randomx_called && n.rx_calls == rx + 1,
+              "KAT-2 (f) RandomX false -> BAN row 29, RandomX called last: " + desc(x));
     }
-
-    // (f) with a stub hasher wired, stage 5 runs LAST and its verdict is honoured.
-    {
-        vf::VerifyConfig cpass = cfg;
-        cpass.rx_check = [&](const bytes32&, const HashingBlob&, const Difficulty&,
-                             bytes32& pow) { pow = bytes32{}; return true; };  // PoW meets target
-        OpenedCommitment oc;
-        AdmitOutcome o = vf::verify_receipt(r, IDENT, CARRIER_BIN, CHAIN, lp, cpass, oc);
-        CHECK("(f) stub-PoW pass: accepted with RandomX Ran (last)",
-              o.ok && o.stage == AdmitStage::Accepted && o.randomx == RandomXStatus::Ran);
-
-        vf::VerifyConfig cfail = cfg;
-        cfail.rx_check = [&](const bytes32&, const HashingBlob&, const Difficulty&,
-                             bytes32&) { return false; };                      // PoW below target
-        AdmitOutcome o2 = vf::verify_receipt(r, IDENT, CARRIER_BIN, CHAIN, lp, cfail, oc);
-        CHECK("(f) stub-PoW fail: rejected at RandomX (only heavy reject)",
-              !o2.ok && o2.stage == AdmitStage::RandomX && o2.randomx == RandomXStatus::Ran);
-    }
-
-    // path dispatch sanity
-    CHECK("keyed_heavy dispatches to RandomX-last path",
-          verify_path_for(PowVerifyClass::keyed_heavy) == VerifyPath::FamilyB_RandomXLast);
-    CHECK("stateless_cheap keeps Family-A PoW-first path",
-          verify_path_for(PowVerifyClass::stateless_cheap) == VerifyPath::FamilyA_PoWFirst);
 }
+
+}  // namespace
 
 int main() {
-    std::printf("=== X4 MoneroReceipt envelope KAT (X1 primitives; RandomX CI-gated) ===\n");
+    std::printf("=== xmr_receipt_kat: the Path B receipt ===\n");
     kat1_real_block();
-    kat2_admission_order();
-    std::printf("=== %d passed, %d failed ===\n", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    kat2_v3_order();
+    return finish("xmr_receipt_kat");
 }

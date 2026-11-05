@@ -18,8 +18,8 @@
 // only under Monero's EXACT acceptance rule (hash * difficulty < 2^256).
 //
 // What it fixes versus the two earlier IPowVerifier adapters in the tree:
-//   * mbp_wiring.hpp LivePowVerifier never prefetches a seed, so every call
-//     returns SeedNotResident ("Couldn't check PoW"). Here the seeds of the
+//   * a verifier that never prefetches a seed returns SeedNotResident
+//     ("Couldn't check PoW") on every call. Here the seeds of the
 //     current template (seed_hash + next_seed_hash) are prefetched by the
 //     new-template hook, OFF the submit path (invariant I2 of randomx_verify).
 //   * both adapters decide the NETWORK block with the top-64-bit-word <= target

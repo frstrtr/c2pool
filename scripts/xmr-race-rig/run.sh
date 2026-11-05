@@ -1,4 +1,6 @@
 #!/bin/bash
+# Removed at the S4w flag day: this rig runs the old payout path. The current c2pool-v37-xmr runs Path B and
+# refuses these flags ("removed at the S4w flag day"); the rig needs a binary built before the flag day.
 # run.sh : ONE race-heavy 3-node regtest run (REGTEST ONLY). Three native p2p-first nodes A,B,C (BIN or
 # BIN_A/BIN_B/BIN_C), D_conf DCONF (10), each with a paced stratum miner (burst.py: one nonce every LO..HI s;
 # at regtest difficulty 1 every nonce is a block, so three miners at 2-4 s produce same-height races and

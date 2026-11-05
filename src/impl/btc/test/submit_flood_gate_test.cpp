@@ -61,6 +61,8 @@ bool submit_model(WedgedDaemon& d, SubmitDedupe& dedupe, const std::string& bloc
     const auto key = SubmitDedupe::key_of(block_hex);
     if (auto prior = dedupe.lookup(key))
         return SubmitDedupe::reached(*prior);
+    if (dedupe.lookup_sibling(key))
+        return false;
     const int before = d.delivered;
     auto body = send_model(d, /*non_idempotent=*/true);
     if (!body) {
@@ -76,6 +78,14 @@ std::string block_hex(char fill)
 {
     // 80-byte header (160 hex) + a body tail that differs from the header.
     return std::string(160, fill) + "01" + std::string(64, 'e');
+}
+
+// A block on a chosen parent: version(8) + prev-hash(64) + merkle/time/bits/
+// nonce(88) with the nonce region varied, so siblings differ in hash only.
+std::string child_of(char parent, char nonce)
+{
+    return std::string(8, '2') + std::string(64, parent) + std::string(80, '0')
+         + std::string(8, nonce) + "01" + std::string(64, 'e');
 }
 
 } // namespace
@@ -186,4 +196,64 @@ TEST(SubmitFloodGate, WindowIsBoundedFifo)
     EXPECT_FALSE(dedupe.lookup(SubmitDedupe::key_of(block_hex('0'))).has_value());
     EXPECT_FALSE(dedupe.lookup(SubmitDedupe::key_of(block_hex('1'))).has_value());
     EXPECT_TRUE(dedupe.lookup(SubmitDedupe::key_of(block_hex('h'))).has_value());
+}
+
+// --- (c) same-parent coalescing -------------------------------------------
+
+TEST(SubmitFloodGate, ParentIsThePrevHashField)
+{
+    const auto key = SubmitDedupe::key_of(child_of('p', '1'));
+    EXPECT_EQ(SubmitDedupe::parent_of(key), std::string(64, 'p'));
+    EXPECT_EQ(SubmitDedupe::parent_of(SubmitDedupe::key_of(child_of('p', '2'))),
+              SubmitDedupe::parent_of(key));
+    EXPECT_TRUE(SubmitDedupe::parent_of("deadbeef").empty());
+}
+
+TEST(SubmitFloodGate, SiblingStormCollapsesToOneDeliveredSubmit)
+{
+    // .234 arm D: 288 distinct wins on ONE parent while bitcoind is wedged.
+    // The per-block dedupe never fires (all hashes differ); coalescing must.
+    WedgedDaemon d;
+    SubmitDedupe dedupe;
+    const std::string nonces = "0123456789abcdef";
+    for (char n : nonces)
+        submit_model(d, dedupe, child_of('p', n));
+    EXPECT_EQ(d.delivered, 1);
+    EXPECT_EQ(dedupe.size(), 1u);
+}
+
+TEST(SubmitFloodGate, SkippedSiblingReportsNotReached)
+{
+    // The sibling never hit the RPC path, so the caller must not count it as
+    // reached; the first child keeps its own replayable verdict.
+    WedgedDaemon d;
+    d.wedged = false;
+    SubmitDedupe dedupe;
+    EXPECT_TRUE(submit_model(d, dedupe, child_of('p', '1')));
+    EXPECT_FALSE(submit_model(d, dedupe, child_of('p', '2')));
+    EXPECT_TRUE(submit_model(d, dedupe, child_of('p', '1')));
+    EXPECT_EQ(d.delivered, 1);
+}
+
+TEST(SubmitFloodGate, RejectedSiblingDoesNotBlockTheNext)
+{
+    SubmitDedupe dedupe;
+    const auto bad  = SubmitDedupe::key_of(child_of('p', '1'));
+    const auto next = SubmitDedupe::key_of(child_of('p', '2'));
+    dedupe.record(bad, Verdict::Rejected);
+    EXPECT_FALSE(dedupe.lookup_sibling(next).has_value());
+    dedupe.record(next, Verdict::DeliveredUnknown);
+    EXPECT_EQ(dedupe.lookup_sibling(SubmitDedupe::key_of(child_of('p', '3'))),
+              Verdict::DeliveredUnknown);
+}
+
+TEST(SubmitFloodGate, DifferentParentsDoNotCoalesce)
+{
+    // The next height's block has a new parent and must always be delivered.
+    WedgedDaemon d;
+    SubmitDedupe dedupe;
+    submit_model(d, dedupe, child_of('p', '1'));
+    submit_model(d, dedupe, child_of('q', '1'));
+    EXPECT_EQ(d.delivered, 2);
+    EXPECT_FALSE(dedupe.lookup_sibling(SubmitDedupe::key_of(child_of('r', '1'))).has_value());
 }

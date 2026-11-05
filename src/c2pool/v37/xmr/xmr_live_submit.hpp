@@ -52,10 +52,9 @@
 // THREADING (O-2 contract, survey §E): submit() runs on the STRATUM LISTENER
 // thread. It uses only the transport (LiveMonerodTransport opens a fresh socket
 // per call, so it is safe alongside the main loop's pump_poll) and its own
-// state. It NEVER touches MonerodAdapter / MainchainIndex / XmrFinalizeDriver.
-// A found block crosses to the main thread through FoundBlockQueue (mutex),
-// where the main loop calls XmrNode::on_network_block_won(). The transport
-// must complete rpc_post synchronously (LiveMonerodTransport and
+// state. A found block is counted and handed to the caller's found hook (on
+// the listener thread); nothing is booked and no event is queued. The
+// transport must complete rpc_post synchronously (LiveMonerodTransport and
 // MockMonerodTransport both do); an asynchronous transport is detected and
 // reported as an error rather than mis-read as a rejection.
 //
@@ -179,7 +178,7 @@ struct BlockCandidate {
     std::size_t reserved_size   = 0;
 
     Hash          prev_id{};                  // template prev_hash (zero = unknown)
-    std::uint64_t expected_reward = 0;        // piconero (get_block_template.expected_reward)
+    std::uint64_t expected_reward = 0;        // piconero: the block's coinbase reward
     std::uint8_t  major_version = 0;          // template major_version (diagnostic)
 };
 
@@ -526,17 +525,29 @@ private:
 };
 
 // ===========================================================================
-// FoundBlockEvent / FoundBlockQueue — the listener→main hand-off for an
-// ACCEPTED block. Carries everything wire (4) needs: height + block_id (for
-// XmrNode::on_network_block_won), reward (for the credit/payout amounts),
-// prev_id, and attribution for the log. Worker/address are filled in a beat
-// later by on_accepted_share (see LiveSubmitShareSink) via annotate().
+// FoundBlockEvent — one found block as a publish arm saw it land: the block
+// (height, id, prev_id, the job triple), how it landed and the id checks.
+// FoundBlockQueue — a mutex queue of events (kept for the users that still
+// queue them; the publish arms hand each event to their found hook).
 // ===========================================================================
+// How a found block landed: monerod's submit_block said OK, a peer took the
+// levin frame, or (--native-solo only) our own chain index accepted it.
+enum class Landed : std::uint8_t { Monerod = 0, Peer = 1, OwnIndex = 2 };
+
+inline const char* to_string(Landed l) {
+    switch (l) {
+        case Landed::Monerod:  return "monerod";
+        case Landed::Peer:     return "peer";
+        case Landed::OwnIndex: return "own-index";
+    }
+    return "monerod";
+}
+
 struct FoundBlockEvent {
     std::uint64_t height = 0;
     Hash          block_id{};
     Hash          prev_id{};
-    std::uint64_t reward = 0;            // piconero (template expected_reward)
+    std::uint64_t reward = 0;            // piconero (the candidate's expected_reward)
     std::uint32_t template_id = 0;
     std::uint32_t nonce = 0;
     std::uint32_t extra_nonce = 0;
@@ -545,11 +556,16 @@ struct FoundBlockEvent {
     IdSource      id_source = IdSource::None;
     bool          id_mismatch = false;
     HeaderCheck   header_check = HeaderCheck::NotRun;
+    Landed        landed = Landed::Monerod;
+    std::size_t   peers = 0;             // peers a levin frame reached (0 for the other landings)
     double        rpc_ms = 0.0;
     std::chrono::steady_clock::time_point at{};
 
     std::string block_id_hex() const { return mj::hash_to_hex(block_id); }
 };
+
+// A found block handed to the caller (the publish arm's thread).
+using FoundHook = std::function<void(const FoundBlockEvent&)>;
 
 class FoundBlockQueue {
 public:
@@ -593,15 +609,13 @@ private:
 
 // ===========================================================================
 // LiveSubmitShareSink — the X5 IShareSink that plugs LiveBlockSubmitter into
-// XmrStratumServer. handle_submit (xmr_stratum.cpp:402-406) calls
+// XmrStratumServer (the monerod publish arm). handle_submit calls
 // submit_network_block(template_id, nonce, extra_nonce) BEFORE the lane-target
-// check and BEFORE on_accepted_share (:426), so:
-//   * submit_network_block: look the candidate up (CandidateLookup — the
-//     assembler binds it to the template provider's full blob + the template
-//     source's rebuild_blob hashing blob), submit, and on OK push a
-//     FoundBlockEvent;
-//   * on_accepted_share (is_network_block): annotate that event with the
-//     worker/address (same triple, same thread, moments later).
+// check and BEFORE on_accepted_share, so:
+//   * submit_network_block: look the candidate up (CandidateLookup), submit,
+//     and on OK count the block and hand its event (landed=monerod) to the
+//     found hook; nothing is booked and nothing is queued;
+//   * on_accepted_share: counted.
 // ===========================================================================
 class LiveSubmitShareSink final : public strat::IShareSink {
 public:
@@ -609,14 +623,13 @@ public:
     using CandidateLookup =
         std::function<bool(std::uint32_t template_id, std::uint32_t extra_nonce, BlockCandidate& out)>;
 
-    LiveSubmitShareSink(LiveBlockSubmitter& submitter, FoundBlockQueue& found, CandidateLookup lookup)
-        : m_submitter(submitter), m_found(found), m_lookup(std::move(lookup)) {}
+    LiveSubmitShareSink(LiveBlockSubmitter& submitter, CandidateLookup lookup)
+        : m_submitter(submitter), m_lookup(std::move(lookup)) {}
 
-    void on_accepted_share(const strat::AcceptedShare& s) override {
-        m_accepted.fetch_add(1);
-        if (s.is_network_block)
-            m_found.annotate(s.template_id, s.nonce, s.extra_nonce, s.worker, s.address);
-    }
+    // The found hook (call before serving).
+    void set_found_hook(FoundHook h) { m_hook = std::move(h); }
+
+    void on_accepted_share(const strat::AcceptedShare&) override { m_accepted.fetch_add(1); }
 
     void submit_network_block(std::uint32_t template_id, std::uint32_t nonce,
                               std::uint32_t extra_nonce) override {
@@ -629,8 +642,8 @@ public:
         const SubmitOutcome o = m_submitter.submit(c, nonce, extra_nonce);
         if (!o.accepted) { set_error(o.error); return; }
         if (!o.has_block_id()) {
-            // Accepted by monerod but we cannot name it: NEVER hand a zero bid to
-            // the finalize driver (is_canonical would orphan it at maturity).
+            // Accepted by monerod but we cannot name it: no found event.
+            m_unnamed.fetch_add(1);
             set_error(o.error);
             return;
         }
@@ -645,15 +658,29 @@ public:
         ev.id_source    = o.id_source;
         ev.id_mismatch  = o.id_mismatch;
         ev.header_check = o.header_check;
+        ev.landed       = Landed::Monerod;
         ev.rpc_ms       = o.rpc_ms;
         ev.at           = std::chrono::steady_clock::now();
-        m_found.push(std::move(ev));
+        m_found.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_last_found = ev;
+        }
+        if (m_hook) m_hook(ev);
         set_error({});
     }
 
     // --- diagnostics ------------------------------------------------------
     std::size_t accepted_shares() const { return m_accepted.load(); }
     std::size_t stale_lookups()   const { return m_stale.load(); }
+    // Blocks monerod accepted that this arm could name (each handed to the hook).
+    std::size_t found()           const { return m_found.load(); }
+    // Blocks monerod accepted with no block id (no found event).
+    std::size_t unnamed()         const { return m_unnamed.load(); }
+    std::optional<FoundBlockEvent> last_found() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_last_found;
+    }
     std::string last_error() const {
         std::lock_guard<std::mutex> lk(m_mtx);
         return m_last_error;
@@ -666,34 +693,19 @@ private:
     }
 
     LiveBlockSubmitter&      m_submitter;
-    FoundBlockQueue&         m_found;
     CandidateLookup          m_lookup;
-    std::atomic<std::size_t> m_accepted{0}, m_stale{0};
+    FoundHook                m_hook;
+    std::atomic<std::size_t> m_accepted{0}, m_stale{0}, m_found{0}, m_unnamed{0};
     mutable std::mutex       m_mtx;
     std::string              m_last_error;
+    std::optional<FoundBlockEvent> m_last_found;
 };
-
-// ===========================================================================
-// Main-thread helper for wire (4): the credit/payout maps for an option-A
-// block. Recommended (survey §4): credit == payout == {identity_key : reward}
-// so finalW nets to 0 and the FOUND/FINALIZE trail is amount-honest. Templated
-// on the ledger's Amounts (std::map<::v37::bytes32, long long>; bytes32 ==
-// std::array<uint8_t,32>) so this header never pulls the engine. Pass
-// reward == 0 to get the degenerate {} (the ledger still registers the block).
-// ===========================================================================
-template <class AmountsT>
-AmountsT single_key_amounts(const std::array<std::uint8_t, 32>& identity_key,
-                            std::uint64_t reward_piconero) {
-    AmountsT a;
-    if (reward_piconero != 0)
-        a[identity_key] = static_cast<long long>(reward_piconero);
-    return a;
-}
 
 // One-line log rendering of a FOUND event (main thread).
 inline std::string describe(const FoundBlockEvent& e) {
     std::string s = "FOUND h=" + std::to_string(e.height) + " bid=" + e.block_id_hex().substr(0, 16) +
-                    "… id-source=" + to_string(e.id_source) +
+                    "… landed=" + to_string(e.landed) +
+                    " id-source=" + to_string(e.id_source) +
                     " header=" + to_string(e.header_check) +
                     (e.id_mismatch ? " ID-MISMATCH(monerod!=local)" : "") +
                     " reward=" + std::to_string(e.reward) + "pico" +

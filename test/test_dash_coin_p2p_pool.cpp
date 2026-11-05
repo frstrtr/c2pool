@@ -1280,6 +1280,39 @@ TEST(DashCoinP2PPool, lost_tip_body_is_rerequested_from_a_rotated_peer_at_T)
     EXPECT_EQ(rig.client.pending_body_count(), 1u) << "still unanswered";
 }
 
+// A caller that re-drives a missing body on its OWN clock (PayeeFoldFeeder:
+// first ask, then every ~12 s) must not mute the watchdog. Every
+// request_block_tracked() re-ask refreshes the slot's last_req. With one peer
+// the watchdog re-asks that same peer on a DOUBLING window (2,4,8,16,32,64 s),
+// so once the window passes 12 s a 12 s caller re-ask keeps it from ever
+// expiring: the stall schedule (and with it the strike that churns a staller
+// out) stops. request_block_if_untracked leaves a tracked slot alone, so the
+// watchdog keeps stalling and re-requesting on its own schedule. (In a
+// rotating multi-peer pool the window resets to 2 s per rotation and a 12 s
+// re-ask only costs a duplicate getdata.)
+TEST(DashCoinP2PPool, reask_on_a_caller_clock_does_not_mute_the_stall_schedule)
+{
+    PoolRig rig;
+    rig.use_fake_clock();
+    rig.handshake(1);
+    const uint256 h = hash_n(0xFEED);
+
+    EXPECT_FALSE(rig.client.body_tracked(h));
+    rig.client.request_block_if_untracked(h);
+    EXPECT_TRUE(rig.client.body_tracked(h));
+    EXPECT_EQ(rig.client.pending_body_count(), 1u);
+
+    // The feeder's cadence: one re-ask every 12 s, for 300 s, nobody answers.
+    rig.run_seconds(300, [&](int64_t t) {
+        if (t % 12 == 0) rig.client.request_block_if_untracked(h);
+    });
+    EXPECT_EQ(rig.client.pending_body_count(), 1u) << "one slot, never duplicated";
+    // Unmuted: stalls at ~2, 6, 14, 30, 62, 126, 190, 254 s.
+    EXPECT_GE(rig.client.body_rerequests_total(), 6u)
+        << "the watchdog's doubling stall schedule must keep running under a"
+           " caller re-ask (a last_req refresh every 12 s freezes it at ~3)";
+}
+
 // ANTI-WEDGE (dashd mapBlocksInFlight + disconnect-on-stall). The height-967736
 // wedge: connected=8/8 but none serves THAT body; master ERASED the slot after
 // BODY_REREQUEST_MAX tries and the lane froze forever. dashd never abandons a

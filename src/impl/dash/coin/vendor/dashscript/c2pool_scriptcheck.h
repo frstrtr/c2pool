@@ -66,6 +66,27 @@ int c2pool_dash_legacy_sighash(const unsigned char* tx_to, unsigned int tx_to_le
 C2POOL_DASH_SCRIPT_EXPORT
 void c2pool_dash_hash160(const unsigned char* data, unsigned int len, unsigned char* out20);
 
+// KAT helper: decode ONE transaction from the front of `buf` with dashcore's
+// own CMutableTransaction codec (primitives/transaction.h) and report what it
+// read — the reference for the c2pool codec's differential test (the nVersion
+// / nType split and the IsSpecialTxVersion() extra-payload gate). Bytes after
+// the transaction are left unread; `consumed` says how many were used.
+// Returns 1 on success, 0 on a deserialization error. Test-only; never on the
+// serve path.
+typedef struct {
+    int          n_version;     // dashd int16_t nVersion
+    unsigned int n_type;        // dashd uint16_t nType
+    unsigned int n_vin;
+    unsigned int n_vout;
+    unsigned int lock_time;
+    unsigned int payload_len;   // vExtraPayload.size()
+    unsigned int consumed;      // bytes of `buf` the decode used
+} c2pool_dash_tx_probe;
+
+C2POOL_DASH_SCRIPT_EXPORT
+int c2pool_dash_tx_decode_probe(const unsigned char* buf, unsigned int len,
+                                c2pool_dash_tx_probe* out);
+
 #ifdef __cplusplus
 }
 #endif

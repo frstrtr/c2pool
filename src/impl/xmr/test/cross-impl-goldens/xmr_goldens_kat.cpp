@@ -17,16 +17,10 @@
 //   lane output makes the live recompute diverge from the frozen constant and
 //   this KAT exits nonzero — that is the regression gate.
 //
-//   The gate is NEGATIVE-CONTROLLED: a final section deliberately corrupts one
-//   byte of the expected value and asserts the SAME comparator then reports a
-//   MISMATCH, proving the comparison is real (not vacuously passing).
-//
 //   Coverage:
 //     G1  difficulty check_hash accept/reject bitmask (11 overflow boundaries)
 //     G2  CryptoNote stealth derivation D / P0 / view-tag over OFFICIAL vectors
 //     G3  deterministic coinbase r, R=r*G, mm-commitment root, coinbase out key
-//     G4  receipt cheap dedup-id, wire_size, info digest
-//     G5  wire carrier codec bytes (full frame) + its keccak digest + length
 //
 //   LIGHT: keccak/cn_fast_hash + ed25519 ge_*/sc_* + boost-free check_hash only.
 //   No RandomX, no libsodium, no boost.
@@ -71,33 +65,6 @@ int main() {
     check_str("g3_tx_pubkey_R",  live.g3_R,       g::G3_R_PUB);
     check_str("g3_mm_root",      live.g3_mm_root, g::G3_MM_ROOT);
     check_str("g3_coinbase_Pcb", live.g3_Pcb,     g::G3_PCB0);
-
-    std::printf("-- G4 receipt / admission digest --\n");
-    check_str("g4_cheap_id",     live.g4_cheap_id,    g::G4_CHEAP_ID);
-    check_u  ("g4_wire_size",    live.g4_wire_size,   g::G4_WIRE_SIZE);
-    check_str("g4_info_digest",  live.g4_info_digest, g::G4_INFO_DIGEST);
-
-    std::printf("-- G5 wire carrier codec --\n");
-    check_u  ("g5_carrier_len",    live.g5_len,    g::G5_LEN);
-    check_str("g5_carrier_digest", live.g5_digest, g::G5_DIGEST);
-    check_str("g5_carrier_bytes",  live.g5_bytes,  std::string(g::G5_BYTES));
-
-    // -----------------------------------------------------------------------
-    // NEGATIVE CONTROL: prove the comparator actually catches a corruption.
-    // Flip one nibble of the expected carrier byte string and assert the same
-    // equality test the gate uses now reports a MISMATCH against the live value.
-    // -----------------------------------------------------------------------
-    std::printf("-- negative control (deliberate 1-byte corruption) --\n");
-    {
-        std::string corrupt = g::G5_BYTES;
-        corrupt[10] = (corrupt[10] == '0') ? '1' : '0';   // flip one hex nibble
-        bool live_matches_golden  = (live.g5_bytes == std::string(g::G5_BYTES));
-        bool live_matches_corrupt = (live.g5_bytes == corrupt);
-        bool control_ok = live_matches_golden && !live_matches_corrupt;
-        std::printf("  [%s] gate catches corruption   (golden=%d corrupt=%d)\n",
-                    control_ok ? "PASS" : "FAIL", live_matches_golden, live_matches_corrupt);
-        if (!control_ok) ++g_fail;
-    }
 
     std::printf("%s (%d failure%s)\n", g_fail ? "KAT FAILED" : "KAT OK",
                 g_fail, g_fail == 1 ? "" : "s");

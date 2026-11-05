@@ -4,6 +4,7 @@
 #include <optional>
 
 #include <core/log.hpp>
+#include <core/dial.hpp>
 #include <core/socket.hpp>
 #include <core/inetwork.hpp>
 #include <core/addr_store.hpp>
@@ -314,7 +315,7 @@ private:
 	// re-derive them by dereferencing m_node: on the dial-teardown race m_node may
 	// already be dangling. When `strong` is non-null (explicit set_lifetime path)
 	// it PINS the node across this whole call and its async_connect handler.
-	void connect_socket(boost::asio::ip::tcp::resolver::results_type endpoints, NetService addr,
+	void connect_socket(std::vector<io::ip::tcp::endpoint> endpoints, NetService addr,
 	                    std::shared_ptr<INetwork> strong, std::weak_ptr<INetwork> weak_node,
 	                    bool was_managed)
 	{
@@ -339,8 +340,13 @@ private:
 		auto tcp_socket = std::make_unique<io::ip::tcp::socket>(*m_context);
 		auto socket = core::make_socket(std::move(tcp_socket), core::connection_type::outgoing, live_node);
 
-		io::async_connect(*socket->raw(), endpoints,
-			[this, strong, weak_node, was_managed, addr, socket = socket]
+		// #965 Phase-3: a single-family list (every v4-only host) goes to the same
+		// range async_connect as before; a mixed A+AAAA list gets per-attempt
+		// deadlines so a hung family falls through to the other (core/dial.hpp).
+		const bool mixed = core::is_mixed_family(endpoints);
+		core::dial_endpoints(*socket->raw(), std::move(endpoints),
+			core::FAMILY_FALLBACK_ATTEMPT_TIMEOUT, m_label,
+			[this, strong, weak_node, was_managed, mixed, addr, socket = socket]
 			(const auto& ec, boost::asio::ip::tcp::endpoint ep)
 			{
 				if (ec)
@@ -375,6 +381,12 @@ private:
 				std::shared_ptr<INetwork> strong_node = strong ? strong : weak_node.lock();
 				if (was_managed && !strong_node) return;  // node destroyed mid-flight
 				INetwork* node_ptr = strong_node ? strong_node.get() : m_node;
+
+				// #965 Phase-3: remember which family won so the next dial to this
+				// name leads with it. Only for a real choice (mixed list); a
+				// single-family dial writes no new state.
+				if (mixed)
+					core::record_dial_family(addr.address(), core::dial_family_of(ep.address()));
 
 				LOG_TRACE << "[" << m_label << "] Handshake with " << ep.address() << ":" << ep.port();
 				socket->init();
@@ -459,7 +471,16 @@ private:
 				// Thread the alive-captured strong/weak_node/was_managed into
 				// connect_socket so its pre-make_socket guard uses THIS liveness
 				// proof (it must not re-derive from a possibly-dangling m_node).
-				connect_socket(endpoints, addr, strong, weak_node, was_managed);
+				//
+				// #965 Phase-3: the resolver already returns A AND AAAA (AF_UNSPEC);
+				// order them A/AAAA-interleaved, led by the family that last worked
+				// for this host. Single-family lists come back unchanged.
+				std::vector<io::ip::tcp::endpoint> ordered;
+				for (const auto& entry : endpoints)
+					ordered.push_back(entry.endpoint());
+				ordered = core::order_dial_endpoints(std::move(ordered),
+					core::preferred_dial_family(addr.address()));
+				connect_socket(std::move(ordered), addr, strong, weak_node, was_managed);
 			}
 		);
 	}

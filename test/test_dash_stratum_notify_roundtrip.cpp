@@ -39,10 +39,14 @@
 
 #include <gtest/gtest.h>
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <new>
 #include <span>
 #include <string>
 #include <vector>
@@ -50,7 +54,7 @@
 #include <impl/dash/coinbase_builder.hpp>  // merkle_branches_raw, sha256d, EXTRANONCE2_SIZE
 #include <impl/dash/stratum/tip_refresh.hpp>   // fire_share_tip_refresh (tip-change fan-out)
 #include <impl/dash/local_mint_ledger.hpp>     // LocalMintLedger / classify_local_mint
-#include <impl/dash/think_gate.hpp>            // acquire/release_think_slot, clean_cycle_best_changed (#854)
+#include <impl/dash/think_gate.hpp>            // acquire/release_think_slot, ThinkSlotGuard, clean_cycle_best_changed (#854/#857)
 #include <btclibs/util/strencodings.h>     // HexStr
 #include <core/uint256.hpp>
 
@@ -718,4 +722,150 @@ TEST(DashThinkGate, MintDuringThinkIoPhaseStillReachesTheMiners) {
     EXPECT_EQ(log.calls[0], "bump");
     EXPECT_EQ(log.calls[1], "notify");
     EXPECT_EQ(log.calls[2], "web");
+}
+
+// ── #857: the think slot survives a throwing post() ─────────────────────────
+//
+// Every cycle is "acquire the slot, then boost::asio::post() the work that
+// releases it". These KATs drive a REAL boost::asio::post() into an
+// io_context and make it throw: the handler's copy/move constructor throws
+// std::bad_alloc, which is what an allocation failure inside post() looks like
+// to the caller. The guarded shape is the one node.cpp uses at all three
+// sites (run_think prologue, clean_tracker prologue, both IO-phase epilogues).
+
+namespace {
+
+// A completion handler that cannot be stored: any copy or move throws, so the
+// post() that tries to store it throws after the slot was acquired.
+struct ThrowingHandler {
+    ThrowingHandler() = default;
+    ThrowingHandler(const ThrowingHandler&) { throw std::bad_alloc(); }
+    ThrowingHandler(ThrowingHandler&&) { throw std::bad_alloc(); }
+    ThrowingHandler& operator=(const ThrowingHandler&) = delete;
+    ThrowingHandler& operator=(ThrowingHandler&&) = delete;
+    void operator()() const {}
+};
+
+// The run_think() prologue shape, with the post() supplied by the caller.
+template <class PostFn>
+bool start_guarded_cycle(std::atomic<bool>& running, std::atomic<bool>& pending,
+                         PostFn&& post_work)
+{
+    if (!dash::think::acquire_think_slot(running, pending))
+        return false;
+    dash::think::ThinkSlotGuard slot(running, pending);
+    post_work();
+    slot.commit();
+    return true;
+}
+
+} // namespace
+
+// (24) THE #857 PIN: post() throws while the slot is held, and the slot is
+//      released anyway. Without the guard the same throw leaves `running`
+//      stuck true, so every later run_think() only records a pending request
+//      and no election ever runs again.
+TEST(DashThinkGate, ThrowingPostReleasesTheSlot) {
+    boost::asio::io_context ioc;
+
+    // The pre-#857 shape, for contrast: acquire, then a bare post() that throws.
+    {
+        std::atomic<bool> running{false}, pending{false};
+        ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+        EXPECT_THROW(boost::asio::post(ioc, ThrowingHandler{}), std::bad_alloc);
+        EXPECT_TRUE(running.load()) << "unguarded: the slot leaks";
+        EXPECT_FALSE(dash::think::acquire_think_slot(running, pending))
+            << "unguarded: the next think is refused, the stall is permanent";
+    }
+
+    std::atomic<bool> running{false}, pending{false};
+    EXPECT_THROW(start_guarded_cycle(running, pending, [&] {
+                     boost::asio::post(ioc, ThrowingHandler{});
+                 }),
+                 std::bad_alloc);
+    EXPECT_FALSE(running.load()) << "the throwing post() leaked the think slot";
+    EXPECT_FALSE(pending.load());
+
+    // The node is still live: the next request takes the slot and runs.
+    bool ran = false;
+    ASSERT_TRUE(start_guarded_cycle(running, pending, [&] {
+        boost::asio::post(ioc, [&] {
+            ran = true;
+            dash::think::ThinkSlotGuard io_slot(running, pending);
+            EXPECT_FALSE(io_slot.release());
+        });
+    }));
+    EXPECT_TRUE(running.load()) << "a committed slot belongs to the posted cycle";
+    ioc.run();
+    EXPECT_TRUE(ran);
+    EXPECT_FALSE(running.load());
+}
+
+// (25) A request queued while the slot is held is not stranded by the throw:
+//      the unwinding release clears it with the slot, and the next trigger
+//      runs a full re-election (one pass subsumes it).
+TEST(DashThinkGate, ThrowingPostWithQueuedRequestDoesNotStall) {
+    boost::asio::io_context ioc;
+    std::atomic<bool> running{false}, pending{false};
+
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_THROW(
+        {
+            dash::think::ThinkSlotGuard slot(running, pending);
+            EXPECT_FALSE(dash::think::acquire_think_slot(running, pending));
+            EXPECT_TRUE(pending.load());
+            boost::asio::post(ioc, ThrowingHandler{});
+            slot.commit();
+        },
+        std::bad_alloc);
+    EXPECT_FALSE(running.load());
+    EXPECT_FALSE(pending.load());
+    EXPECT_TRUE(dash::think::acquire_think_slot(running, pending));
+}
+
+// (26) release() is release-ONCE. The IO-phase epilogue releases in its try
+//      and again in its catch when the re-post throws; the second release, and
+//      the destructor, must not touch a slot a NEW cycle owns by then.
+TEST(DashThinkGate, GuardReleasesExactlyOnce) {
+    std::atomic<bool> running{false}, pending{false};
+    ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+    EXPECT_FALSE(dash::think::acquire_think_slot(running, pending));   // queued
+
+    {
+        dash::think::ThinkSlotGuard slot(running, pending);
+        EXPECT_TRUE(slot.release()) << "the queued re-think must be reported";
+        EXPECT_FALSE(slot.held());
+
+        // A new cycle takes the slot before this guard goes out of scope.
+        ASSERT_TRUE(dash::think::acquire_think_slot(running, pending));
+        EXPECT_FALSE(dash::think::acquire_think_slot(running, pending));
+
+        EXPECT_FALSE(slot.release()) << "second release must be a no-op";
+    }   // ...and so must the destructor
+    EXPECT_TRUE(running.load()) << "the stale guard released the new owner's slot";
+    EXPECT_TRUE(pending.load()) << "the stale guard consumed the new owner's request";
+}
+
+// (27) The CLEAN prologue: a throwing post() must release the slot AND the
+//      clean re-entry flag, or clean_tracker() is refused forever even after
+//      thinks resume.
+TEST(DashThinkGate, ThrowingCleanPostReleasesSlotAndCleanFlag) {
+    boost::asio::io_context ioc;
+    std::atomic<bool> running{false}, pending{false}, clean_running{false};
+
+    ASSERT_FALSE(clean_running.exchange(true));
+    ASSERT_TRUE(dash::think::acquire_clean_slot(running));
+    EXPECT_THROW(
+        {
+            dash::think::ThinkSlotGuard slot(running, pending, &clean_running);
+            boost::asio::post(ioc, ThrowingHandler{});
+            slot.commit();
+        },
+        std::bad_alloc);
+    EXPECT_FALSE(running.load());
+    EXPECT_FALSE(clean_running.load());
+
+    // Both cycles can start again.
+    EXPECT_FALSE(clean_running.exchange(true));
+    EXPECT_TRUE(dash::think::acquire_clean_slot(running));
 }

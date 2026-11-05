@@ -280,6 +280,11 @@ public:
     void update_stratum_worker(const std::string& session_id,
                                double hashrate, double dead_hashrate, double difficulty,
                                uint64_t accepted, uint64_t rejected, uint64_t stale) override;
+    /// Refresh the session's TCP round-trip latency (ms). The stratum session
+    /// samples it from the kernel on every accepted submit; without this
+    /// override the base no-op kept the value sampled at authorize, so the
+    /// dashboard's Latency column froze at the connect-time reading.
+    void update_stratum_worker_rtt(const std::string& session_id, double rtt_ms) override;
 
     /// Thread-safe snapshot of the per-connection worker registry
     /// (session_id -> WorkerInfo). The DASH stratum acceptor is a standalone
@@ -357,6 +362,17 @@ public:
     /// ONLY when NodeCoinState viability holds — SML+quorum fresh AT the tip and
     /// not a superblock height — else it fails safe to the dashd fallback.
     void set_embedded_mainnet(bool v) { embedded_mainnet_ = v; }
+
+    /// The DASH v36 network with a dashd RPC arm takes its mining work from
+    /// dashd getblocktemplate only (coin/v36_work_policy.hpp; a daemonless v36
+    /// node leaves this OFF and serves the embedded arm): when ON, the embedded template arm is
+    /// never served -- on testnet/regtest and under --embedded-mainnet alike --
+    /// and every template comes from the dashd fallback, whose tx bodies the
+    /// finder assembles the won block from. The decline is published as
+    /// no_work_reason "dashd-templates-only". Default OFF: the public profile
+    /// is unchanged.
+    void set_dashd_templates_only(bool v) { dashd_templates_only_ = v; }
+    bool dashd_templates_only() const { return dashd_templates_only_; }
 
     /// GBT-xcheck reward-safety BACKSTOP (soak). When a dashd is reachable (the
     /// fallback arm), cross-check the EMBEDDED CbTx's creditPoolBalance against
@@ -503,13 +519,19 @@ public:
     /// mining_submit the moment a submission meets the full network block
     /// target AND is dispatched to the network (NOT on a local payee-guard
     /// reject). Carries the block height, the X11 block hash (== pow_hash for
-    /// DASH), the submitting miner, and whether at least one network sink was
-    /// reached. main_dash.cpp binds this to MiningInterface::record_found_block
-    /// so DASH block wins appear in the found-block history. Display only —
-    /// never gates the won-block dispatch. While unbound this is a no-op.
+    /// DASH), the submitting miner, whether at least one network sink was
+    /// reached, and the block's subsidy. Height and subsidy are the JOB's (the
+    /// coinbase's BIP34 height and the coinbasevalue frozen with the job), not
+    /// the current template's: a solve on a stale job must be recorded at the
+    /// height it was built at, or the confirm/orphan lane checks the wrong
+    /// height (won_block_record.hpp). Height 0 means unknown. main_dash.cpp
+    /// binds this to MiningInterface::record_found_block so DASH block wins
+    /// appear in the found-block history. Display only — never gates the
+    /// won-block dispatch. While unbound this is a no-op.
     using FoundBlockFn =
         std::function<void(uint32_t height, const uint256& block_hash,
-                           const std::string& miner, bool reached_network)>;
+                           const std::string& miner, bool reached_network,
+                           uint64_t subsidy)>;
     void set_on_found_block_fn(FoundBlockFn fn);
 
     /// Wire the CUMULATIVE cross-restart serve-gate ledger to its persisted
@@ -798,6 +820,14 @@ public:
     /// contended.
     nlohmann::json serve_staleness_json() const;
 
+    /// F4 — the embedded arm WOULD serve (NodeCoinState::describe_decline()
+    /// viable) and no miner is connected, so no template will be sourced to
+    /// close the open decline segment. Close it now with terminal=ready-idle
+    /// (journal + cumulative ledger, same lock as note_arm_decision). main_dash
+    /// calls this from the 30 s diagnostics tick only while sessions == 0.
+    /// Returns true when a segment was closed.
+    bool note_ready_idle(uint32_t height) const;
+
 private:
     /// Record ONE arm-selection outcome and, if the rate policy says so, emit
     /// the single named line. `why` MUST be the report the selecting branch
@@ -826,6 +856,7 @@ private:
     bool is_testnet_{false};
     bool is_regtest_{false};  // #961: --regtest payout-address acceptance set
     bool embedded_mainnet_{false};   // gate-lift opt-in: daemonless embedded arm on mainnet
+    bool dashd_templates_only_{false};   // DASH v36 network with dashd RPC (or no work source): never serve the embedded arm
     bool gbt_xcheck_{false};         // reward-safety backstop: cross-check embedded creditPool vs dashd
     bool tx_serve_own_set_{false};   // --embedded-tx-serve-own-set: serve own valid tx set instead of dashd-parity swap (DEFAULT OFF)
     // Observability for the own-set referee (lock-free; published in embedded_arm_status_json).

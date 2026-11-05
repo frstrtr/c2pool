@@ -24,6 +24,7 @@
 #include <core/web_server.hpp>
 #include <core/uint256.hpp>
 
+#include <cctype>
 #include <cstdio>
 #include <string>
 #include <chrono>
@@ -1404,6 +1405,29 @@ TEST(CoinP2pDialVisibility, IdleNeverDialedIsDistinctAndSilent) {
     EXPECT_FALSE(has_warning_substr(stats, "DIAL FAILING"));
 }
 
+// The DASH fold lanes' refused-unchanged counters ride the coin-sync status
+// object and surface in /local_stats as-is; a provider without them leaves the
+// payload unchanged.
+TEST(CoinP2pDialVisibility, LocalStatsPassesTheDmlFoldCountersThrough) {
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    wire_coin_p2p(mi, "connected", /*reachable=*/true,
+                  /*connected=*/3, /*dial_failures=*/0);
+    EXPECT_FALSE(mi.rest_local_stats().contains("dml_fold"));
+
+    mi.set_coin_sync_status_fn([]() {
+        nlohmann::json s = nlohmann::json::object();
+        s["peers"] = nlohmann::json::array();
+        s["dml_fold"] = {{"oracle_refused_unchanged", 2},
+                         {"replay_refused_unchanged", 0}};
+        return s;
+    });
+    auto stats = mi.rest_local_stats();
+    ASSERT_TRUE(stats.contains("dml_fold"));
+    EXPECT_EQ(stats["dml_fold"].value("oracle_refused_unchanged", -1), 2);
+    EXPECT_EQ(stats["dml_fold"].value("replay_refused_unchanged", -1), 0);
+}
+
 TEST(CoinP2pDialVisibility, V36StatusCarriesDialState) {
     MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
                        c2pool::address::Blockchain::DASH);
@@ -1414,4 +1438,365 @@ TEST(CoinP2pDialVisibility, V36StatusCarriesDialState) {
     ASSERT_TRUE(v36.contains("coin_p2p"));
     EXPECT_EQ(v36["coin_p2p"].value("state", std::string{}), "dial_failing");
     EXPECT_EQ(v36["coin_p2p"].value("dial_failures", -1), 4);
+}
+
+// ── #946 found-block explorer contract (integrator, frozen 2026-09-23) ───────
+// /recent_blocks stays the ONE feed: its existing keys are unchanged and the
+// only new keys are parent_hash, parent_height, coinbase_txid and tx_count. A
+// value the node does not know is JSON null, never "" or 0. GET
+// /found_block/<hash> returns the same row, and an unknown hash is null (the
+// route answers 404).
+
+TEST(FoundBlockExplorer, NewKeysArePresentAndNullWhenUnknown)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946aaaa";
+    mi.record_found_block(3000000, uint256S(h), 1790000000, "LTC",
+                          "ltc1qminer", h, 0.0, 0.0, 0.0, 0);
+
+    auto blk = find_block(mi.rest_recent_blocks(), h);
+    ASSERT_TRUE(blk.is_object());
+    for (const char* k : {"parent_hash", "parent_height", "coinbase_txid", "tx_count"}) {
+        ASSERT_TRUE(blk.contains(k)) << k << " must always be emitted";
+        EXPECT_TRUE(blk[k].is_null()) << k << " unknown must be null, never \"\" or 0";
+    }
+    // The existing keys keep their names and meaning; "share" (not share_hash).
+    EXPECT_EQ(blk["share"].get<std::string>(), h);
+    EXPECT_FALSE(blk.contains("share_hash"));
+    EXPECT_EQ(blk["miner"].get<std::string>(), "ltc1qminer");
+}
+
+TEST(FoundBlockExplorer, EndpointReturnsTheFeedRowOrNull)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h_old =
+        "946946946946946946946946946946946946946946946946946946946946b001";
+    const std::string h_new =
+        "946946946946946946946946946946946946946946946946946946946946b002";
+    mi.record_found_block(3000001, uint256S(h_old), 1790000000, "LTC",
+                          "ltc1qminer", h_old, 0.0, 0.0, 0.0, 0);
+    mi.record_found_block(3000002, uint256S(h_new), 1790000100, "LTC",
+                          "ltc1qminer", h_new, 0.0, 0.0, 0.0, 0);
+
+    // The older row carries no first-row aggregate keys, so the endpoint row
+    // must equal the feed row byte for byte.
+    auto feed_row = find_block(mi.rest_recent_blocks(), h_old);
+    ASSERT_TRUE(feed_row.is_object());
+    EXPECT_EQ(mi.rest_found_block(h_old), feed_row);
+
+    // Hashes are stored lowercase; an uppercase request still resolves.
+    std::string upper = h_new;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    auto by_upper = mi.rest_found_block(upper);
+    ASSERT_TRUE(by_upper.is_object());
+    EXPECT_EQ(by_upper["hash"].get<std::string>(), h_new);
+
+    EXPECT_TRUE(mi.rest_found_block(std::string(64, 'f')).is_null())
+        << "an unknown hash is null so the route can answer 404";
+}
+
+TEST(FoundBlockExplorer, RestoredRowsServeExplorerFieldsAndPreChangeRowsStayNull)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h_doge =
+        "946946946946946946946946946946946946946946946946946946946946c001";
+    const std::string h_legacy =
+        "946946946946946946946946946946946946946946946946946946946946c002";
+    const std::string parent =
+        "946946946946946946946946946946946946946946946946946946946946d001";
+    const std::string cb_txid =
+        "946946946946946946946946946946946946946946946946946946946946e001";
+
+    MiningInterface::FoundBlock doge{};
+    doge.height = 5400000; doge.hash = h_doge; doge.ts = 1790000200;
+    doge.chain = "DOGE"; doge.miner = "Dminer"; doge.share_hash = h_doge;
+    doge.parent_hash = parent; doge.parent_height = 3000003;
+    doge.coinbase_txid = cb_txid; doge.tx_count = 17;
+
+    // A pre-#946 record restores with every explorer field unset.
+    MiningInterface::FoundBlock legacy{};
+    legacy.height = 3000004; legacy.hash = h_legacy; legacy.ts = 1790000300;
+    legacy.chain = "LTC"; legacy.miner = "ltc1qminer"; legacy.share_hash = h_legacy;
+
+    std::vector<MiningInterface::FoundBlock> restored = {doge, legacy};
+    mi.set_found_block_persistence(
+        [](const MiningInterface::FoundBlock&) -> bool { return true; },
+        [&restored]() { return restored; });
+    mi.load_persisted_found_blocks();
+
+    auto d = mi.rest_found_block(h_doge);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_EQ(d["parent_hash"].get<std::string>(), parent);
+    EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000003u);
+    EXPECT_EQ(d["coinbase_txid"].get<std::string>(), cb_txid);
+    EXPECT_EQ(d["tx_count"].get<uint32_t>(), 17u);
+    EXPECT_EQ(d["share"].get<std::string>(), h_doge);
+
+    auto l = mi.rest_found_block(h_legacy);
+    ASSERT_TRUE(l.is_object());
+    for (const char* k : {"parent_hash", "parent_height", "coinbase_txid", "tx_count"})
+        EXPECT_TRUE(l[k].is_null()) << k << " on a pre-#946 row must be null";
+
+    // parent_height 0 is "unknown", never a real height.
+    restored = {};
+    MiningInterface mi2(/*testnet=*/false, /*node=*/nullptr,
+                        c2pool::address::Blockchain::LITECOIN);
+    doge.parent_height = 0;
+    restored.push_back(doge);
+    mi2.set_found_block_persistence(
+        [](const MiningInterface::FoundBlock&) -> bool { return true; },
+        [&restored]() { return restored; });
+    mi2.load_persisted_found_blocks();
+    EXPECT_TRUE(mi2.rest_found_block(h_doge)["parent_height"].is_null());
+}
+
+// ── #946 slice 2b: the DOGE (merged) writer ──────────────────────────────────
+// The aux solve is recorded from the merged-found callback, which fires
+// synchronously inside check_merged_mining. The stratum submit installs a
+// MergedSubmitScope there carrying what MergedMiningManager cannot know: the
+// parent LTC block id, the LTC template height and the miner.
+
+TEST(FoundBlockExplorer, MergedFindInsideSubmitScopeCarriesParentMinerAndSubsidy)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f001";
+    const std::string parent =
+        "946946946946946946946946946946946946946946946946946946946946f0aa";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.parent_hash = parent;
+        ctx.parent_height = 3000010;
+        ctx.miner = "ltc1qstratumminer";
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400010, h, /*accepted=*/false,
+                                     1000000000000ULL);
+    }
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_EQ(d["chain"].get<std::string>(), "DOGE");
+    EXPECT_EQ(d["miner"].get<std::string>(), "ltc1qstratumminer");
+    EXPECT_EQ(d["subsidy"].get<uint64_t>(), 1000000000000ULL);
+    EXPECT_EQ(d["parent_hash"].get<std::string>(), parent);
+    EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000010u);
+    EXPECT_TRUE(d["share"].is_null()) << "no share minted on this submit";
+}
+
+TEST(FoundBlockExplorer, MergedFindNamesTheShareItsSubmitMinted)
+{
+    // The stratum submit passes the share create_share_fn just minted into
+    // check_merged_mining; the DOGE row's "share" names it. A solve that
+    // missed the share target leaves share_hash empty -> JSON null.
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f005";
+    const std::string share =
+        "946946946946946946946946946946946946946946946946946946946946f0c1";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.share_hash = share;
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400014, h, /*accepted=*/false, 0);
+    }
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_EQ(d["share"].get<std::string>(), share);
+
+    const std::string h_miss =
+        "946946946946946946946946946946946946946946946946946946946946f006";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.miner = "ltc1qstratumminer";
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400015, h_miss, false, 0);
+    }
+    EXPECT_TRUE(mi.rest_found_block(h_miss)["share"].is_null());
+}
+
+TEST(FoundBlockExplorer, MergedFindOutsideScopeLeavesParentNull)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f002";
+    mi.record_merged_found_block("DOGE", 5400011, h, /*accepted=*/false, 0);
+    auto d = mi.rest_found_block(h);
+    ASSERT_TRUE(d.is_object());
+    EXPECT_TRUE(d["parent_hash"].is_null());
+    EXPECT_TRUE(d["parent_height"].is_null());
+
+    // A template height of 0 is unknown, never a real parent height.
+    const std::string h0 =
+        "946946946946946946946946946946946946946946946946946946946946f003";
+    {
+        MiningInterface::MergedSubmitContext ctx;
+        ctx.parent_height = 0;
+        MiningInterface::MergedSubmitScope scope(std::move(ctx));
+        mi.record_merged_found_block("DOGE", 5400012, h0, false, 0);
+    }
+    EXPECT_TRUE(mi.rest_found_block(h0)["parent_height"].is_null());
+}
+
+TEST(FoundBlockExplorer, ParentFieldsAreFillOnly)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::LITECOIN);
+    const std::string h =
+        "946946946946946946946946946946946946946946946946946946946946f004";
+    const std::string p1 =
+        "946946946946946946946946946946946946946946946946946946946946f0b1";
+    const std::string p2 =
+        "946946946946946946946946946946946946946946946946946946946946f0b2";
+    int persisted = 0;
+    mi.set_found_block_persistence(
+        [&persisted](const MiningInterface::FoundBlock&) -> bool { ++persisted; return true; },
+        []() { return std::vector<MiningInterface::FoundBlock>{}; });
+    mi.record_found_block(5400013, uint256S(h), 1790000400, "DOGE",
+                          "Dminer", "", 0.0, 0.0, 0.0, 0);
+    const int after_record = persisted;
+
+    std::string upper = p1;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    mi.set_found_block_parent(h, upper, 3000013);
+    EXPECT_EQ(persisted, after_record + 1);
+    mi.set_found_block_parent(h, p2, 3000099);           // known values never overwritten
+    EXPECT_EQ(persisted, after_record + 1) << "an unchanged row is not re-persisted";
+    mi.set_found_block_parent(std::string(64, 'f'), p2, 1);  // unknown hash: no new row
+
+    auto d = mi.rest_found_block(h);
+    EXPECT_EQ(d["parent_hash"].get<std::string>(), p1);
+    EXPECT_EQ(d["parent_height"].get<uint64_t>(), 3000013u);
+    EXPECT_TRUE(mi.rest_found_block(std::string(64, 'f')).is_null());
+}
+
+// ── Stale-job block of 2026-10-25 (DASH v36 primary, block 2561316) ──────────
+// The block was recorded at height 0, so newest-first-by-height put it after
+// every real row; after a restart the derived interval was recomputed from
+// that order, found no predecessor, and /recent_blocks labelled it
+// "first_block" -- the chart then said "1st block" for a block with 23 earlier
+// rows. A row with an earlier same-chain row is not the first block.
+TEST(DashboardData, RowWithEarlierBlocksIsNeverLabelledFirstBlock)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+
+    const std::string h_first =
+        "6666666666666666666666666666666666666666666666666666666666660001";
+    const std::string h_second =
+        "6666666666666666666666666666666666666666666666666666666666660002";
+    const std::string h_stale =
+        "000000000000001c9e20a446e73e4a734fd79adba4b7c4d736e34551bc37f10f";
+    auto make_row = [](uint64_t height, const std::string& hash, uint64_t ts) {
+        MiningInterface::FoundBlock b{};
+        b.height = height; b.hash = hash; b.ts = ts;
+        b.status = MiningInterface::BlockStatus::confirmed;
+        b.chain = "DASH"; b.confirmations = 50;
+        b.miner = "Xminer"; b.share_hash = hash;
+        b.network_difficulty = 1.0;
+        b.pool_hashrate = 4294967296.0;
+        return b;
+    };
+    std::vector<MiningInterface::FoundBlock> restored = {
+        make_row(2561244, h_first,  1792942805),
+        make_row(2561265, h_second, 1792945704),
+        make_row(0,       h_stale,  1792954341),   // the persisted stale-job row
+    };
+    restored[2].status = MiningInterface::BlockStatus::pending;
+    mi.set_found_block_persistence(
+        [](const MiningInterface::FoundBlock&) { return true; },
+        [&restored]() { return restored; });
+    mi.load_persisted_found_blocks();
+
+    auto arr = mi.rest_recent_blocks();
+    auto first = find_block(arr, h_first);
+    auto second = find_block(arr, h_second);
+    auto stale = find_block(arr, h_stale);
+    ASSERT_TRUE(first.is_object() && second.is_object() && stale.is_object());
+    EXPECT_EQ(first["luck_method"].get<std::string>(), "first_block")
+        << "the genuinely first block keeps its label";
+    EXPECT_EQ(second["luck_method"].get<std::string>(), "simple_avg");
+    EXPECT_TRUE(stale["luck"].is_null());
+    EXPECT_NE(stale["luck_method"].get<std::string>(), "first_block")
+        << "a block with earlier same-chain rows is not the pool's first";
+    EXPECT_EQ(stale["luck_method"].get<std::string>(), "interval_unavailable");
+}
+
+// The confirm/orphan verdict runs with the blocks lock released, and every
+// record_found_block re-sorts the list newest-first by height. A block
+// recorded in that window moved the row being verified, and the verdict was
+// written to whatever row then sat at the old index: the newcomer was flipped
+// to orphaned and the block actually checked stayed pending.
+TEST(DashboardData, VerdictLandsOnTheVerifiedRowWhenTheListReSorts)
+{
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    const std::string h_old =
+        "7777777777777777777777777777777777777777777777777777777777770001";
+    const std::string h_new =
+        "7777777777777777777777777777777777777777777777777777777777770002";
+    mi.record_found_block(2561316, uint256S(h_old), 1792954341, "DASH",
+                          "Xminer", h_old, 1.0, 0.0, 4294967296.0, 1);
+
+    mi.set_block_verify_fn([&mi, &h_old, &h_new](const std::string& hash) -> int {
+        if (hash != h_old) return 0;
+        // Another block of ours lands while the verdict is out.
+        mi.record_found_block(2561320, uint256S(h_new), 1792955000, "DASH",
+                              "Xminer", h_new, 1.0, 0.0, 4294967296.0, 1);
+        return -1;   // a competitor holds 2561316
+    });
+    EXPECT_EQ(mi.run_block_verification_now(h_old), -1);
+
+    MiningInterface::BlockStatus st_old{}, st_new{};
+    for (const auto& b : mi.get_found_blocks()) {
+        if (b.hash == h_old) st_old = b.status;
+        if (b.hash == h_new) st_new = b.status;
+    }
+    EXPECT_EQ(st_old, MiningInterface::BlockStatus::orphaned)
+        << "the verdict belongs to the block it was asked about";
+    EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending)
+        << "a block recorded during the verdict must not inherit it";
+}
+
+// The scheduled checks must follow the block, not the index it had when they
+// were armed: a block recorded after the schedule takes index 0, and the
+// first check then verified the newcomer and never the scheduled block. DGB
+// has the shortest first check (3 s), which keeps this test short.
+TEST(DashboardData, ScheduledChecksFollowTheBlockAcrossAnInsert)
+{
+    boost::asio::io_context ioc;
+    MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                       c2pool::address::Blockchain::DASH);
+    mi.set_io_context(&ioc);
+    const std::string h_old =
+        "8888888888888888888888888888888888888888888888888888888888880001";
+    const std::string h_new =
+        "8888888888888888888888888888888888888888888888888888888888880002";
+    mi.set_block_verify_fn([&h_old](const std::string& hash) -> int {
+        return hash == h_old ? -1 : 0;
+    });
+    mi.record_found_block(100, uint256S(h_old), 1792954341, "DGB",
+                          "Xminer", h_old, 1.0, 0.0, 4294967296.0, 1);
+    mi.schedule_block_verification(h_old);
+    mi.record_found_block(101, uint256S(h_new), 1792954350, "DGB",
+                          "Xminer", h_new, 1.0, 0.0, 4294967296.0, 1);
+
+    ioc.run_for(std::chrono::milliseconds(3500));   // first check fires at +3 s
+
+    MiningInterface::BlockStatus st_old{}, st_new{};
+    uint8_t checks_new = 0;
+    for (const auto& b : mi.get_found_blocks()) {
+        if (b.hash == h_old) st_old = b.status;
+        if (b.hash == h_new) { st_new = b.status; checks_new = b.check_count; }
+    }
+    EXPECT_EQ(st_old, MiningInterface::BlockStatus::orphaned)
+        << "the first scheduled check must verify the scheduled block";
+    EXPECT_EQ(st_new, MiningInterface::BlockStatus::pending);
+    EXPECT_EQ(checks_new, 0u) << "the newcomer was never scheduled";
 }

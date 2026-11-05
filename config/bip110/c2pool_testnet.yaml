@@ -6,7 +6,7 @@
 
 # --- Network -----------------------------------------------------------------
 # port:                        # BIP-110 testnet sharechain port — binary default applies; set to override
-# stratum_port:                # Stratum is opt-in for this coin: enable with --stratum [HOST:]PORT
+# stratum_port: 9336           # Stratum is on by default (0.0.0.0:9336); --stratum [HOST:]PORT moves it, --no-stratum disables it
 web_port: 8080                 # Web dashboard / JSON-RPC API port
 http_host: "0.0.0.0"           # HTTP bind address
 # external_ip: ""              # Public IP/domain for stratum URL display

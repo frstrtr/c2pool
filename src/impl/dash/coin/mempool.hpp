@@ -54,7 +54,9 @@
 
 #include "block.hpp"
 #include "transaction.hpp"
+#include "tx_version_rules.hpp"    // ContextualCheckTransaction (v23.1.9 bad-txns-version)
 #include "utxo_adapter.hpp"
+#include "vendor/providertx.hpp"  // B.8: ProTx payloads for block-connect eviction
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 
@@ -65,9 +67,11 @@
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <algorithm>             // get_summary(): feerate percentile sort (display-only)
+#include <array>
 #include <atomic>
 #include <cmath>                 // block_min_fee_for_size: dashd CFeeRate::GetFee std::ceil
 #include <functional>
+#include <limits>               // add_inject: the default max_fee (no cap)
 #include <cstdint>
 #include <ctime>
 #include <deque>
@@ -75,6 +79,7 @@
 #include <set>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -239,6 +244,107 @@ public:
     Mempool& operator=(const Mempool&) = delete;
 
     void set_utxo(::core::coin::UTXOViewCache* u) { m_utxo.store(u); }
+
+    /// What the chain's UTXO set can PROVE about one outpoint, for checks that
+    /// may only DROP a tx on proof (sml_special_fold.hpp external-collateral
+    /// check). The forward-built view is complete only for coins created since
+    /// it started, so a miss there proves nothing; the at-tip full-history fold
+    /// (fold_active: wired AND at the tip) is authoritative both ways.
+    ///   Unspent — the coin exists unspent; `out` holds it.
+    ///   Absent  — a block among the last kRecentSpentBlocks connected spent
+    ///             it, or the at-tip fold proves no such unspent coin exists.
+    ///   Unknown — neither source can decide (forward-view miss, no live fold).
+    enum class CoinProof : uint8_t { Unknown, Unspent, Absent };
+    /// How many connected blocks' spent outpoints prove_chain_coin remembers
+    /// (recorded by remove_protx_conflicts_for_block), and the hard cap on
+    /// outpoints held — the oldest blocks leave first. ~100 blocks is ~4 hours
+    /// of mainnet: a ProRegTx relayed later than that by a lagging peer is
+    /// not covered (see IMPL-NOTES S2).
+    static constexpr size_t kRecentSpentBlocks       = 100;
+    static constexpr size_t kRecentSpentMaxOutpoints = 200'000;
+    /// Where a recorded block sits: its height and identity hash, so a reorg
+    /// can tell the blocks it disconnected from the ones still on the chain.
+    struct ChainPos {
+        uint32_t height{0};
+        uint256  hash;
+    };
+    /// Reorg undo for the spent ring: forget every recorded block that is no
+    /// longer on the active chain (`active_hash_at(height)` differs from the
+    /// recorded hash, or the height is above the new tip), and every block
+    /// recorded without a position. With no lookup the whole ring is cleared:
+    /// that only gives up proof (Unknown), it never refuses a valid ProRegTx.
+    /// Per-outpoint counts keep an outpoint the surviving chain also spent.
+    /// Returns the number of blocks forgotten. The lookup runs outside the
+    /// pool lock (it reads the header chain, which has its own).
+    size_t forget_chain_spends_off_chain(
+        const std::function<std::optional<uint256>(uint32_t)>& active_hash_at)
+    {
+        std::vector<ChainPos> held;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const auto& b : m_recent_chain_spend_blocks)
+                if (b.pos) held.push_back(*b.pos);
+        }
+        std::set<std::pair<uint32_t, uint256>> on_chain;
+        if (active_hash_at)
+            for (const auto& p : held)
+                if (const auto h = active_hash_at(p.height); h && *h == p.hash)
+                    on_chain.emplace(p.height, p.hash);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        size_t n = 0;
+        for (auto it = m_recent_chain_spend_blocks.begin();
+             it != m_recent_chain_spend_blocks.end();) {
+            if (it->pos && on_chain.count({it->pos->height, it->pos->hash})) {
+                ++it;
+                continue;
+            }
+            it = drop_spend_block_locked(it);
+            ++n;
+        }
+        return n;
+    }
+    /// Forget one recorded block (the live lane refused it: dashd rejects
+    /// it, so its spends are not chain spends). Returns whether it was held.
+    bool forget_chain_spends_of_block(const uint256& block_hash)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto it = m_recent_chain_spend_blocks.end();
+             it != m_recent_chain_spend_blocks.begin();) {
+            --it;
+            if (it->pos && it->pos->hash == block_hash) {
+                drop_spend_block_locked(it);
+                return true;
+            }
+        }
+        return false;
+    }
+    size_t recent_chain_spend_blocks() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_recent_chain_spend_blocks.size();
+    }
+    CoinProof prove_chain_coin(const ::core::coin::Outpoint& op,
+                               ::core::coin::Coin& out) const
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_recent_chain_spends.count({op.txid, op.index}))
+                return CoinProof::Absent;
+        }
+        if (auto* utxo = m_utxo.load()) {
+            ::core::coin::Coin c;
+            // get_coin is true exactly for a coin the view holds (absence is an
+            // erased or missing entry). Coin::is_spent() would also read a real
+            // (value 0, empty script) coin as absent (VERIFY-S1 S2-3).
+            if (utxo->get_coin(op, c)) { out = c; return CoinProof::Unspent; }
+        }
+        if (fold_active()) {
+            ::core::coin::Coin c;
+            if (fold_resolve(op, c)) { out = c; return CoinProof::Unspent; }
+            return CoinProof::Absent;
+        }
+        return CoinProof::Unknown;
+    }
 
     /// blockmintxfee-equivalent knob (dashd -blockmintxfee / BlockAssembler
     /// Options::blockMinFeeRate, miner.cpp:100). Sets the min ancestor-package
@@ -448,7 +554,8 @@ public:
         for (const auto& vin : tx.vin) {
             ::core::coin::Coin coin;
             ::core::coin::Outpoint op{vin.prevout.hash, vin.prevout.index};
-            bool found = utxo != nullptr && utxo->get_coin(op, coin) && !coin.is_spent();
+            // View: present == unspent (no is_spent() filter, VERIFY-S1 S2-3).
+            bool found = utxo != nullptr && utxo->get_coin(op, coin);
             if (!found && m_external_coin_lookup) {
                 coin = ::core::coin::Coin{};
                 found = m_external_coin_lookup(op, coin) && !coin.is_spent();
@@ -480,6 +587,17 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return add_tx_locked(tx, utxo, /*is_dstx=*/false);
+    }
+
+    /// TEST SEAM ONLY: admit WITHOUT the ContextualCheckTransaction gate, to
+    /// model an entry that entered the pool before that gate existed (a node
+    /// upgraded mid-flight) so the selector's belt can be pinned. Never called
+    /// on a live path.
+    bool add_tx_skipping_contextual_check_for_test(const MutableTransaction& tx)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return add_tx_locked(tx, m_utxo.load(), /*is_dstx=*/false,
+                             /*contextual_check=*/false);
     }
 
     /// W5-B: dashd's DSTX prioritisation delta — PrioritiseTransaction(hash,
@@ -590,6 +708,19 @@ public:
                              // (INT64_MIN → huge) → inflated total_fees → the
                              // coinbase value moves → an invalid, reward-unsafe
                              // block (CheckTransaction bad-txns-vout-* / -txouttotal).
+        BadVersionOrType,    // ContextualCheckTransaction (v23.1.9): unknown
+                             // special type, or a negative nVersion
+                             // (bad-txns-type / bad-txns-version).
+        FeeAboveMax,         // S2: the priced fee exceeds the submitter's max_fee
+                             // (a local operator submit defaults to 0: a fee-paying
+                             // tx the operator did not ask for is refused).
+        ScriptInvalid,       // S3a: an input's scriptSig fails dashcore VerifyScript
+                             // at admission, or its scriptPubKey cannot be resolved.
+        SpentShapedOutput,   // VERIFY-S2 Must-Fix 1: an output with value 0 and an
+                             // empty scriptPubKey. Consensus-valid and a coin of the
+                             // full set, but non-standard in dashd (IsStandardTx:
+                             // scriptpubkey), which never relays or mines it; c2pool
+                             // admits nothing dashd would refuse to relay here.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -601,6 +732,10 @@ public:
             case InjectGate::Unpriceable:        return "inject-unpriceable";
             case InjectGate::Bip68Unsupported:   return "inject-bip68-unsupported";
             case InjectGate::BadVoutRange:       return "inject-bad-txns-vout-range";
+            case InjectGate::BadVersionOrType:   return "inject-bad-txns-version-or-type";
+            case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
+            case InjectGate::ScriptInvalid:      return "inject-script-invalid";
+            case InjectGate::SpentShapedOutput:  return "inject-spent-shaped-output";
         }
         return "inject-unknown";
     }
@@ -624,48 +759,22 @@ public:
     /// whose inputs cannot be fold-priced is REFUSED here BY NAME (never left
     /// in the pool to be silently template-excluded).
     ///
+    /// S2: `max_fee` caps the priced fee (inject-fee-above-max); the library
+    /// default is no cap, the operator entry points (main_dash: the hex file
+    /// loader, the loopback HTTP submit) pass 0 unless told otherwise. S3a:
+    /// after pricing, every input is script-verified once at admission with
+    /// the full buried flag set (script_flags_for_height(0)); a failure, or an
+    /// input whose scriptPubKey no at-tip source resolves, refuses by name
+    /// (inject-script-invalid). The selector keeps re-checking at each build
+    /// with the serving height's flags (the belt).
+    ///
     /// Caller holds no lock. Returns a named InjectGate verdict.
-    InjectGate add_inject(const MutableTransaction& tx) {
+    InjectGate add_inject(const MutableTransaction& tx,
+                          uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        // (1) size — cheapest, chain-state-independent.
-        if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
-            return InjectGate::TooLarge;
-        // (2) new-seam script-verify requirement (fail-closed).
-        if (!m_script_check)
-            return InjectGate::ScriptCheckUnarmed;
-        // (2a) GAP-1 — BIP68 relative-locktime FAIL-CLOSED. This is a NEW
-        //     ingestion seam, so the sole-ingestion-path invariant's argument
-        //     that bad-txns-nonfinal is N/A ("relay-admitted txs are final at
-        //     admission") no longer holds: a directly-injected tx never passed a
-        //     relaying dashd's SequenceLocks. We port absolute-locktime finality
-        //     (is_final_tx, run in the selector), but NOT relative BIP68
-        //     SequenceLocks (that is M2). Until then, refuse any tx that OPTS IN
-        //     to a relative lock — nVersion >= 2 with an input whose nSequence
-        //     leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — rather than risk
-        //     selecting a bad-txns-nonfinal tx into a template. Chain-state
-        //     independent, so it sits with the other cheap pre-admission gates.
-        if (tx.version >= 2) {
-            for (const auto& vin : tx.vin) {
-                if ((vin.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0)
-                    return InjectGate::Bip68Unsupported;
-            }
-        }
-        // (2b) GAP-2 — CheckTransaction output value-range (bad-txns-vout-*).
-        //     dashcore CheckTransaction / CTransaction::GetValueOut reject any
-        //     vout outside MoneyRange and any running-sum overflow BEFORE the tx
-        //     is priced. compute_fee_locked casts vout.value to uint64 for
-        //     out_sum, so an out-of-range value (e.g. INT64_MIN) would wrap the
-        //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
-        //     Refuse by name here, ahead of admission/pricing. No-op for any
-        //     valid tx (every vout already in range).
-        {
-            int64_t vout_running = 0;
-            for (const auto& vout : tx.vout) {
-                if (!money_range(vout.value) || !money_range(vout_running + vout.value))
-                    return InjectGate::BadVoutRange;
-                vout_running += vout.value;
-            }
-        }
+        // (1) .. (2b): the chain-state-independent checks (inject_shape_gate_locked).
+        if (const auto g = inject_shape_gate_locked(tx))
+            return *g;
         const uint256 txid = dash_txid(tx);
         // (3) dedup against our own pool.
         if (m_pool.count(txid))
@@ -690,17 +799,294 @@ public:
             m_fee_deltas.erase(txid);
             return InjectGate::Unpriceable;
         }
+        // (7) S2 fee ceiling: the coinbase moves by exactly this fee.
+        if (it->second.fee > max_fee) {
+            LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                        << " fee=" << it->second.fee << " > max_fee=" << max_fee
+                        << " (inject-fee-above-max)";
+            remove_tx_locked(txid);
+            m_fee_deltas.erase(txid);
+            return InjectGate::FeeAboveMax;
+        }
+        // (8) S3a admission-time script verify (consensus-exact, every input).
+        {
+            uint32_t vi = 0;
+            bool resolved = true;
+            if (!inject_scripts_ok_locked(tx, vi, resolved)) {
+                LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                            << " input " << vi << (resolved ? " fails VerifyScript"
+                                                            : " has no resolvable scriptPubKey")
+                            << " (inject-script-invalid)";
+                remove_tx_locked(txid);
+                m_fee_deltas.erase(txid);
+                return InjectGate::ScriptInvalid;
+            }
+        }
         LOG_INFO << "[MEMPOOL] inject admitted txid=" << txid.GetHex().substr(0, 16)
-                 << " base_fee=" << it->second.fee
-                 << " prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
+                 << " base_fee=" << it->second.fee << " max_fee=" << max_fee
+                 << " scripts=ok prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
         return InjectGate::Ok;
+    }
+
+    /// Which of `ops` a pool entry spends, each with the spending txid (one
+    /// pair per spender, in pool order). Read-only, any thread. Every entry's
+    /// inputs are read: m_spent_outputs keeps one spender per outpoint and
+    /// loses the outpoint when one of two pool txs spending it leaves. Used by
+    /// GET /api/utxo/scan (mempool_spent).
+    std::vector<std::pair<::core::coin::Outpoint, uint256>>
+    pool_spenders(const std::vector<::core::coin::Outpoint>& ops) const {
+        std::vector<std::pair<::core::coin::Outpoint, uint256>> out;
+        if (ops.empty()) return out;
+        std::vector<std::pair<uint256, uint32_t>> want;
+        want.reserve(ops.size());
+        for (const auto& op : ops) want.emplace_back(op.txid, op.index);
+        std::sort(want.begin(), want.end());
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool)
+            for (const auto& vin : e.tx.vin)
+                if (std::binary_search(want.begin(), want.end(),
+                                       std::make_pair(vin.prevout.hash, vin.prevout.index)))
+                    out.emplace_back(::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), txid);
+        return out;
+    }
+
+    /// The injects in the pool (the txids carrying INJECT_FEE_DELTA), for the
+    /// per-build RIDES / HELD lines.
+    std::vector<uint256> inject_txids_in_pool() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<uint256> out;
+        for (const auto& [txid, delta] : m_fee_deltas)
+            if (delta == static_cast<decltype(delta)>(INJECT_FEE_DELTA) && m_pool.count(txid))
+                out.push_back(txid);
+        return out;
+    }
+
+    // ── Confirmed injects, kept for a rewind (VERIFY-S2 S-2) ──────────────
+    /// c2pool has no DisconnectedBlockTransactions: a tx a rewound block had
+    /// confirmed is not put back by itself, and dashd peers do not relay a
+    /// zero-fee inject back to us, so our node may hold its only copy. The
+    /// full set's lane hands every connected block here before
+    /// remove_for_block; the injects it confirms are kept (body and fee) for
+    /// as many blocks as a rewind can reach (the undo keep), bounded in bytes.
+    static constexpr uint32_t kConfirmedInjectDepth = DASH_MIN_BLOCKS_TO_KEEP;
+    static constexpr size_t   kMaxConfirmedInjectBytes = 4 * kMaxPinnedTotalBytes;
+
+    /// Keep the injects `block` (at `height`) confirms. Call before
+    /// remove_for_block(block), while they are still pool entries. Entries at
+    /// `height` or above (a branch no rewind went through) are dropped first.
+    void remember_confirmed_injects(const dash::coin::BlockType& block, uint32_t height) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= height)
+            pop_confirmed_inject_locked(/*front=*/false);
+        for (const auto& tx : block.m_txs) {
+            const uint256 txid = dash_txid(tx);
+            auto d = m_fee_deltas.find(txid);
+            auto it = m_pool.find(txid);
+            if (d == m_fee_deltas.end() || it == m_pool.end() || d->second != INJECT_FEE_DELTA)
+                continue;
+            ConfirmedInject c;
+            c.height = height;
+            c.txid = txid;
+            c.tx = it->second.tx;
+            c.fee = it->second.fee;
+            c.bytes = it->second.base_size;
+            m_confirmed_inject_bytes += c.bytes;
+            m_confirmed_injects.push_back(std::move(c));
+        }
+        while (!m_confirmed_injects.empty() &&
+               (m_confirmed_injects.front().height + kConfirmedInjectDepth < height ||
+                m_confirmed_inject_bytes > kMaxConfirmedInjectBytes))
+            pop_confirmed_inject_locked(/*front=*/true);
+    }
+
+    struct InjectReadmit {
+        std::vector<uint256> readmitted;
+        std::vector<std::pair<uint256, InjectGate>> refused;
+        std::vector<uint256> not_wanted;   // the inject ledger no longer tracks it
+    };
+
+    /// Whether a confirmed inject a rewind would put back is still wanted
+    /// (VERIFY-S2b S-B). NodeCoinState wires its inject ledger: an inject whose
+    /// expiry_height the tip passed was reaped from it, and would otherwise
+    /// come back untracked and never expire. Unset (a bare mempool): wanted.
+    using InjectWantedFn = std::function<bool(const uint256& txid)>;
+    void set_inject_still_wanted_fn(InjectWantedFn fn) { m_inject_still_wanted = std::move(fn); }
+
+    /// A rewind disconnected every block from `from_height` up: the injects
+    /// they confirmed go back through add_inject (the normal admission gate,
+    /// max_fee = the fee each was confirmed with), lowest height first so a
+    /// parent is back before its child. Each one leaves the kept list.
+    InjectReadmit readmit_disconnected_injects(uint32_t from_height) {
+        std::vector<ConfirmedInject> back;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            while (!m_confirmed_injects.empty() && m_confirmed_injects.back().height >= from_height) {
+                back.push_back(m_confirmed_injects.back());
+                pop_confirmed_inject_locked(/*front=*/false);
+            }
+        }
+        InjectReadmit r;
+        for (auto it = back.rbegin(); it != back.rend(); ++it) {
+            if (m_inject_still_wanted && !m_inject_still_wanted(it->txid)) {
+                r.not_wanted.push_back(it->txid);
+                continue;
+            }
+            const InjectGate g = add_inject(it->tx, it->fee);
+            if (g == InjectGate::Ok || g == InjectGate::AlreadyKnown)
+                r.readmitted.push_back(it->txid);
+            else
+                r.refused.emplace_back(it->txid, g);
+        }
+        return r;
+    }
+
+    /// How many confirmed injects are kept (diagnostics, KATs).
+    size_t confirmed_injects_kept() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_confirmed_injects.size();
+    }
+
+    // ── Inject dry run (POST /api/tx-inject/validate, c2wallet N3) ─────────
+    /// One input of a dry-run tx as the pool resolves it: the forward/full
+    /// view, an in-pool parent, the at-tip fold, the fee fold (the order
+    /// compute_fee_locked prices in).
+    struct InjectInput {
+        ::core::coin::Outpoint op;
+        bool        resolved{false};
+        const char* source{"none"};   // "utxo" | "mempool" | "fold" | "fee-fold" | "none"
+        int64_t     value{0};
+        uint32_t    height{0};        // 0 for "mempool": unconfirmed
+        bool        coinbase{false};
+        std::optional<uint256> pool_spender;   // another pool tx spending the same coin
+    };
+    struct InjectDryRun {
+        InjectGate gate{InjectGate::Ok};
+        uint256    txid;
+        bool       priced{false};     // every input resolved and in >= out
+        uint64_t   fee{0};
+        std::optional<uint32_t> script_failed_input;   // gate ScriptInvalid: the first failing input
+        std::vector<InjectInput> inputs;
+    };
+
+    /// add_inject's verdict for `tx` against the pool as it is now, with
+    /// NOTHING changed: the same checks in the same order (the shape checks,
+    /// dedup, add_tx_locked's #125 already-confirmed check, pricing, max_fee,
+    /// the admission script verify), but the tx is priced on a scratch entry
+    /// and never inserted, no fee delta is recorded, nothing is logged as
+    /// admitted. It also reports every input's coin and any other pool tx
+    /// spending it (add_inject admits such a conflict; the selector then
+    /// keeps one of the two). The one thing it cannot see: a real admission
+    /// into a FULL pool first evicts the oldest entries, which could include
+    /// an in-pool parent of `tx`.
+    InjectDryRun validate_inject(const MutableTransaction& tx,
+                                 uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectDryRun r;
+        r.txid = dash_txid(tx);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto* utxo = m_utxo.load();
+        std::map<std::pair<uint256, uint32_t>, size_t> index;
+        for (const auto& vin : tx.vin) {
+            InjectInput in;
+            in.op = ::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index);
+            ::core::coin::Coin c;
+            if (utxo && utxo->get_coin(in.op, c)) {
+                in.source = "utxo";
+            } else if (auto pit = m_pool.find(in.op.txid);
+                       pit != m_pool.end() && in.op.index < pit->second.tx.vout.size()) {
+                in.source = "mempool";
+                c = ::core::coin::Coin(pit->second.tx.vout[in.op.index].value,
+                                       pit->second.tx.vout[in.op.index].scriptPubKey, 0, false);
+            } else if (fold_resolve(in.op, c)) {
+                in.source = "fold";
+            } else if (m_fee_coin_lookup && m_fee_coin_lookup(in.op, c) && !c.is_spent()) {
+                in.source = "fee-fold";
+            }
+            in.resolved = std::string(in.source) != "none";
+            if (in.resolved) {
+                in.value = c.value;
+                in.height = c.height;
+                in.coinbase = c.coinbase;
+            }
+            index.emplace(std::make_pair(in.op.txid, in.op.index), r.inputs.size());
+            r.inputs.push_back(in);
+        }
+        for (const auto& [txid, e] : m_pool) {
+            if (txid == r.txid) continue;
+            for (const auto& vin : e.tx.vin) {
+                auto it = index.find(std::make_pair(vin.prevout.hash, vin.prevout.index));
+                if (it != index.end() && !r.inputs[it->second].pool_spender)
+                    r.inputs[it->second].pool_spender = txid;
+            }
+        }
+        // (1) .. (2b)
+        if (const auto g = inject_shape_gate_locked(tx)) { r.gate = *g; return r; }
+        // (3) dedup
+        if (m_pool.count(r.txid)) { r.gate = InjectGate::AlreadyKnown; return r; }
+        // (5) add_tx_locked: its contextual and spent-shaped refusals are in
+        //     the shape gate above; what is left is the #125 check.
+        if (own_output_already_a_coin_locked(tx, r.txid, utxo)) {
+            r.gate = InjectGate::AlreadyConfirmed;
+            return r;
+        }
+        // (6) priced on a scratch entry (compute_fee_locked writes only it).
+        MempoolEntry scratch;
+        scratch.tx = tx;
+        scratch.txid = r.txid;
+        compute_fee_locked(scratch, utxo);
+        r.priced = scratch.fee_fold_proven;
+        r.fee = scratch.fee;
+        if (!scratch.fee_fold_proven) { r.gate = InjectGate::Unpriceable; return r; }
+        // (7)
+        if (scratch.fee > max_fee) { r.gate = InjectGate::FeeAboveMax; return r; }
+        // (8)
+        uint32_t vi = 0;
+        bool resolved = true;
+        if (!inject_scripts_ok_locked(tx, vi, resolved)) {
+            r.gate = InjectGate::ScriptInvalid;
+            r.script_failed_input = vi;
+            return r;
+        }
+        r.gate = InjectGate::Ok;
+        return r;
     }
 
 private:
     bool add_tx_locked(const MutableTransaction& tx,
                        ::core::coin::UTXOViewCache* utxo,
-                       bool is_dstx)
+                       bool is_dstx,
+                       bool contextual_check = true)
     {
+        // ContextualCheckTransaction (dashd validation.cpp:317-349 @ v23.1.9),
+        // post-DIP3 — the pool only ever serves the live tip. The single choke
+        // point for relay (add_tx), DSTX (add_dstx) and inject (add_inject):
+        // an unknown special type, a typed non-special-version tx, or (v23.1.9,
+        // 07494dd62) a negative nVersion is a consensus-invalid tx that would
+        // make any block we serve with it bad-txns-*. No dashd of any version
+        // relays one (IsStandardTx rejects nVersion < 1), so only a dialled
+        // non-dashd peer can push it.
+        if (contextual_check) {
+            if (auto why = contextual_tx_check(tx, /*is_coinbase=*/false)) {
+                LOG_INFO << "[MEMPOOL] reject " << *why << " txid="
+                         << dash_txid(tx).GetHex().substr(0, 16)
+                         << " version16=" << wire_version_i16(tx.version)
+                         << " type=" << tx.type;
+                return false;
+            }
+        }
+        // VERIFY-S2 Must-Fix 1, every seam: an output with value 0 and an
+        // empty scriptPubKey is consensus-valid (the full set keeps it as
+        // dashd does) but non-standard: dashd never relays or mines one, so
+        // only a peer that is not a dashd can send it, and it is never
+        // admitted or served here either (dashd relay parity). A lost fee at
+        // most, never a lost block.
+        for (const auto& vout : tx.vout) {
+            if (vout.value == 0 && vout.scriptPubKey.m_data.empty()) {
+                LOG_INFO << "[MEMPOOL] reject spent-shaped-output txid="
+                         << dash_txid(tx).GetHex().substr(0, 16)
+                         << " (an output with value 0 and an empty script)";
+                return false;
+            }
+        }
         uint256 txid = dash_txid(tx);
         if (m_pool.count(txid)) return false;
 
@@ -954,6 +1340,246 @@ public:
                      << " conflicts=" << conflicts
                      << " remaining=" << m_pool.size();
         }
+    }
+
+    // ── B.8: block-connect ProTx eviction (dashd removeProTxConflicts) ──
+    /// Owner of a TRACKED masternode collateral in the PRE-block list, or
+    /// nullopt (MnStateMachine::find_by_collateral, read before apply_block).
+    using CollateralOwnerFn = std::function<std::optional<uint256>(
+        const bitcoin_family::coin::TxPrevOut&)>;
+    /// The operator key a masternode holds in the PRE-block list, as BYTES
+    /// under that masternode's own scheme (legacy iff its nVersion <
+    /// BasicBLS) — what dashd's validForProTxKey hashes. nullopt = unknown MN.
+    using PreBlockOperatorKeyFn =
+        std::function<std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>>(
+            const uint256& protx)>;
+
+    /// Phase 3 of block-connect eviction: drop the pending provider txs a
+    /// connected block invalidates — dashd CTxMemPool::removeForBlock →
+    /// removeProTxConflicts (txmempool.cpp:1034-1110 @ v23.1.9, with
+    /// removeProTxSpentCollateralConflicts / removeProTxKeyChangedConflicts /
+    /// removeProTxReferences / removeProTx*Conflicts). Without it a pending
+    /// ProUpServTx signed with an operator key a mined ProUpRegTx/ProUpRevTx
+    /// just replaced stays here (no dashd will ever mine it) and every block
+    /// we serve with it is bad-protx-sig. Phases 1-2 (confirmed txids,
+    /// outpoint double-spends) stay in remove_for_block, which the UTXO lane
+    /// calls; this phase needs the PRE-block masternode list, so the
+    /// CoinStateMaintainer calls it before apply_block.
+    ///
+    /// Rules, per mined tx (pool entries are matched by parsed payload; a
+    /// pool tx whose payload does not parse is left alone — the template fold
+    /// refuses it):
+    ///   1. every vin: an outpoint that is a tracked MN collateral evicts the
+    ///      pool types 2-4 naming that MN; an outpoint that is the collateral
+    ///      of a pool ProRegTx evicts that ProRegTx (and updates naming it).
+    ///   2. ProRegTx P: evicts pool ProRegTx with the same keyIDOwner,
+    ///      pubKeyOperator, collateral or service, and (Evo) pool ProRegTx /
+    ///      ProUpServTx with the same platformNodeID; keyIDOwner and
+    ///      platformNodeID are ONE namespace (#7846). If P's external
+    ///      collateral backed MN X, evicts the pool types 2-4 naming X (#7489).
+    ///   3. ProUpServTx(X): evicts pool ProRegTx/ProUpServTx with the same
+    ///      service, and (Evo) the same platformNodeID / an owner key equal to
+    ///      it.
+    ///   4. ProUpRegTx(X): removeProTxKeyChangedConflicts(X, hash(newKey))
+    ///      evicts every pool entry naming X whose validForProTxKey differs.
+    ///      dashd sets validForProTxKey only for ProUpRegTx / ProUpRevTx (the
+    ///      MN's key at admission, txmempool.cpp:686,694); a ProUpServTx keeps
+    ///      the null default (txmempool.h:178), so it is evicted by EVERY mined
+    ///      ProUpRegTx(X). A pending ProUpRegTx / ProUpRevTx(X) stays when the
+    ///      key does not change: the pre-block key's bytes under its holder's
+    ///      scheme equal the new key's wire bytes (SerializeHash compares bytes,
+    ///      so a legacy key re-sent in the basic encoding IS a change here).
+    ///      Unknown MN or no `pre_block_operator_key` ⇒ evicted. Also evicts
+    ///      pool ProRegTx/ProUpRegTx with the same pubKeyOperator.
+    ///   5. ProUpRevTx(X): evicts every pool type 2-4 naming X.
+    /// It also records the block's spent outpoints for prove_chain_coin (S2),
+    /// under `at` (height + hash) so a reorg can forget them again
+    /// (forget_chain_spends_off_chain); a block recorded without a position
+    /// is forgotten on any reorg.
+    /// Drop-only: a false eviction costs that tx's fee, never a block.
+    /// Returns the number of pool txs evicted.
+    size_t remove_protx_conflicts_for_block(
+        const dash::coin::BlockType& block,
+        const CollateralOwnerFn& pre_block_collateral_owner,
+        const PreBlockOperatorKeyFn& pre_block_operator_key = {},
+        const std::optional<ChainPos>& at = std::nullopt)
+    {
+        using bitcoin_family::coin::TxPrevOut;
+        using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
+        auto service_of = [](const vendor::LegacyNetService& n) -> std::optional<Service> {
+            if (n.port_be == 0) {
+                bool zero = true;
+                for (uint8_t b : n.ip) if (b != 0) { zero = false; break; }
+                if (zero) return std::nullopt;     // empty netInfo carries no entry
+            }
+            return Service{n.ip, n.port_be};
+        };
+        auto same_out = [](const TxPrevOut& a, const TxPrevOut& b) {
+            return a.hash == b.hash && a.index == b.index;
+        };
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        record_chain_spends_locked(block, at);
+
+        // Index the pool's provider txs once (special txs are rare).
+        struct PoolProTx {
+            uint256  txid;
+            uint16_t type{0};
+            uint256  names_mn;                  // types 2-4: the proTxHash
+            TxPrevOut collateral;               // type 1: resolved collateral
+            uint160  owner;                     // type 1
+            std::array<uint8_t, vendor::BLS_PUBKEY_SIZE> opkey{};   // types 1,3
+            bool     has_opkey{false};
+            uint160  platform;                  // types 1,2 (Evo only)
+            std::optional<Service> service;     // types 1,2
+        };
+        std::vector<PoolProTx> pro;
+        for (const auto& [txid, e] : m_pool) {
+            const auto& tx = e.tx;
+            if (tx.type < 1 || tx.type > 4) continue;
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
+            PoolProTx p;
+            p.txid = txid;
+            p.type = tx.type;
+            bool ok = false;
+            if (tx.type == vendor::CProRegTx::SPECIALTX_TYPE) {
+                vendor::CProRegTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.collateral = pl.collateralOutpoint;
+                    if (pl.collateralOutpoint.hash.IsNull()) p.collateral.hash = txid;
+                    p.owner = pl.keyIDOwner;
+                    p.opkey = pl.pubKeyOperator; p.has_opkey = true;
+                    if (pl.nType == vendor::MnType::EVO) p.platform = pl.platformNodeID;
+                    p.service = service_of(pl.netInfo);
+                }
+            } else if (tx.type == vendor::CProUpServTx::SPECIALTX_TYPE) {
+                vendor::CProUpServTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    if (pl.nType == vendor::MnType::EVO) p.platform = pl.platformNodeID;
+                    p.service = service_of(pl.netInfo);
+                }
+            } else if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+                vendor::CProUpRegTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl))) {
+                    p.names_mn = pl.proTxHash;
+                    p.opkey = pl.pubKeyOperator; p.has_opkey = true;
+                }
+            } else {
+                vendor::CProUpRevTx pl;
+                if ((ok = vendor::parse_protx_payload(tx.extra_payload, pl)))
+                    p.names_mn = pl.proTxHash;
+            }
+            if (ok) pro.push_back(std::move(p));
+        }
+        if (pro.empty()) return 0;
+
+        std::map<uint256, std::string> evict;   // txid -> reason (first wins)
+        auto mark = [&](const PoolProTx& p, const uint256& mined, const char* why) {
+            if (p.txid == mined) return;        // dashd: conflictHash != tx_hash
+            evict.emplace(p.txid, why);
+        };
+        auto evict_updates_of = [&](const uint256& mn, const uint256& mined,
+                                    const char* why) {
+            for (const auto& p : pro)
+                if (p.type >= 2 && p.type <= 4 && p.names_mn == mn) mark(p, mined, why);
+        };
+        auto evict_id_conflicts = [&](const uint160& id, const uint256& mined) {
+            if (id.IsNull()) return;
+            for (const auto& p : pro) {
+                if (p.type == 1 && p.owner == id)
+                    mark(p, mined, "dup-owner-or-platform-id");
+                if ((p.type == 1 || p.type == 2) && !p.platform.IsNull() && p.platform == id)
+                    mark(p, mined, "dup-owner-or-platform-id");
+            }
+        };
+        auto evict_service_conflicts = [&](const std::optional<Service>& s,
+                                           const uint256& mined) {
+            if (!s) return;
+            for (const auto& p : pro)
+                if ((p.type == 1 || p.type == 2) && p.service && *p.service == *s)
+                    mark(p, mined, "dup-service");
+        };
+        auto evict_opkey_conflicts = [&](const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& k,
+                                         const uint256& mined) {
+            for (const auto& p : pro)
+                if ((p.type == 1 || p.type == 3) && p.has_opkey && p.opkey == k)
+                    mark(p, mined, "dup-operator-key");
+        };
+
+        for (const auto& tx : block.m_txs) {
+            const uint256 mined = dash_txid(tx);
+            // Rule 1 — removeProTxSpentCollateralConflicts.
+            for (const auto& in : tx.vin) {
+                if (pre_block_collateral_owner) {
+                    if (auto mn = pre_block_collateral_owner(in.prevout))
+                        evict_updates_of(*mn, mined, "mn-collateral-spent");
+                }
+                for (const auto& p : pro) {
+                    if (p.type == 1 && same_out(p.collateral, in.prevout)) {
+                        mark(p, mined, "registration-collateral-spent");
+                        evict_updates_of(p.txid, mined, "registration-collateral-spent");
+                    }
+                }
+            }
+            if (!tx_has_extra_payload(tx.version, tx.type)) continue;
+            if (tx.type == vendor::CProRegTx::SPECIALTX_TYPE) {
+                // Rule 2.
+                vendor::CProRegTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                TxPrevOut coll = pl.collateralOutpoint;
+                if (coll.hash.IsNull()) coll.hash = mined;
+                evict_service_conflicts(service_of(pl.netInfo), mined);
+                evict_id_conflicts(pl.keyIDOwner, mined);
+                evict_opkey_conflicts(pl.pubKeyOperator, mined);
+                if (pl.nType == vendor::MnType::EVO)
+                    evict_id_conflicts(pl.platformNodeID, mined);
+                for (const auto& p : pro)
+                    if (p.type == 1 && same_out(p.collateral, coll))
+                        mark(p, mined, "dup-collateral");
+                if (!pl.collateralOutpoint.hash.IsNull() && pre_block_collateral_owner) {
+                    if (auto mn = pre_block_collateral_owner(pl.collateralOutpoint))
+                        evict_updates_of(*mn, mined, "mn-replaced-by-collateral-reuse");
+                }
+            } else if (tx.type == vendor::CProUpServTx::SPECIALTX_TYPE) {
+                // Rule 3.
+                vendor::CProUpServTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_service_conflicts(service_of(pl.netInfo), mined);
+                if (pl.nType == vendor::MnType::EVO)
+                    evict_id_conflicts(pl.platformNodeID, mined);
+            } else if (tx.type == vendor::CProUpRegTx::SPECIALTX_TYPE) {
+                // Rule 4 — removeProTxPubKeyConflicts + removeProTxKeyChangedConflicts.
+                vendor::CProUpRegTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_opkey_conflicts(pl.pubKeyOperator, mined);
+                std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> held;
+                if (pre_block_operator_key) held = pre_block_operator_key(pl.proTxHash);
+                const bool key_changes = !held || *held != pl.pubKeyOperator;
+                for (const auto& p : pro) {
+                    if (p.names_mn != pl.proTxHash) continue;
+                    if (p.type == vendor::CProUpServTx::SPECIALTX_TYPE)
+                        mark(p, mined, "operator-key-update");   // validForProTxKey null
+                    else if ((p.type == vendor::CProUpRegTx::SPECIALTX_TYPE
+                              || p.type == vendor::CProUpRevTx::SPECIALTX_TYPE)
+                             && key_changes)
+                        mark(p, mined, "operator-key-changed");
+                }
+            } else if (tx.type == vendor::CProUpRevTx::SPECIALTX_TYPE) {
+                // Rule 5 — removeProTxKeyChangedConflicts(null key).
+                vendor::CProUpRevTx pl;
+                if (!vendor::parse_protx_payload(tx.extra_payload, pl)) continue;
+                evict_updates_of(pl.proTxHash, mined, "operator-revoked");
+            }
+        }
+
+        for (const auto& [txid, why] : evict) {
+            LOG_INFO << "[MEMPOOL] evicting provider tx "
+                     << txid.GetHex().substr(0, 16)
+                     << " (" << why << ", invalidated by the connected block)";
+            remove_tx_locked(txid);
+        }
+        return evict.size();
     }
 
     // ── G4 (audit): InstantSend-lock conflict tracking ──────────────────
@@ -1642,6 +2268,11 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // Belt for the admission gate (add_tx_locked): a pool entry
+                // that predates it (or any future seam that bypasses it) must
+                // never ride — dashd rejects the block (bad-txns-version /
+                // bad-txns-type, ContextualCheckTransaction post-DIP3).
+                if (contextual_tx_check(e->tx, /*is_coinbase=*/false)) { ok = false; break; }
 
                 // ── dashd TestPackageTransactions (node/miner.cpp:374-391),
                 // member-level; either failure drops the WHOLE package and —
@@ -1927,6 +2558,24 @@ private:
     static constexpr size_t MAX_FEE_DELTAS = 10'000;
     std::map<uint256, uint64_t>                        m_fee_deltas;
     std::deque<uint256>                                m_fee_delta_order;
+    // VERIFY-S2 S-2: injects confirmed by the last kConfirmedInjectDepth
+    // connected blocks, oldest first (remember_confirmed_injects).
+    struct ConfirmedInject {
+        uint32_t           height{0};
+        uint256            txid;
+        MutableTransaction tx;
+        uint64_t           fee{0};
+        size_t             bytes{0};
+    };
+    std::deque<ConfirmedInject>                        m_confirmed_injects;
+    size_t                                             m_confirmed_inject_bytes{0};
+    InjectWantedFn                                     m_inject_still_wanted;
+    void pop_confirmed_inject_locked(bool front) {
+        auto& c = front ? m_confirmed_injects.front() : m_confirmed_injects.back();
+        m_confirmed_inject_bytes -= c.bytes;
+        if (front) m_confirmed_injects.pop_front();
+        else       m_confirmed_injects.pop_back();
+    }
     // Feed-liveness tick (last add_islock wall time; 0 = never) — the hold's
     // ISLOCK_FEED_FRESH_SECS self-disarm reads this under m_mutex.
     time_t                                             m_last_islock_seen{0};
@@ -2038,7 +2687,7 @@ private:
                                   std::vector<uint8_t>& spk_out) const {
         auto* utxo = m_utxo.load();
         ::core::coin::Coin coin;
-        if (utxo && utxo->get_coin(op, coin) && !coin.is_spent()) {
+        if (utxo && utxo->get_coin(op, coin)) {   // present == unspent (S2-3)
             spk_out = coin.scriptPubKey.m_data; return true;
         }
         auto pit = m_pool.find(op.txid);
@@ -2047,6 +2696,108 @@ private:
         }
         ::core::coin::Coin fc;
         if (fold_resolve(op, fc)) { spk_out = fc.scriptPubKey.m_data; return true; }
+        return false;
+    }
+
+    // add_inject (1) .. (2b): the chain-state-independent checks, shared with
+    // the dry run (validate_inject). nullopt = passed. Caller holds m_mutex.
+    std::optional<InjectGate> inject_shape_gate_locked(const MutableTransaction& tx) const {
+        // (1) size — cheapest, chain-state-independent.
+        if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
+            return InjectGate::TooLarge;
+        // (1a) ContextualCheckTransaction — add_tx_locked refuses it too, but
+        //     that refusal would surface here as AlreadyConfirmed; name it.
+        if (contextual_tx_check(tx, /*is_coinbase=*/false))
+            return InjectGate::BadVersionOrType;
+        // (2) new-seam script-verify requirement (fail-closed).
+        if (!m_script_check)
+            return InjectGate::ScriptCheckUnarmed;
+        // (2a) GAP-1 — BIP68 relative-locktime FAIL-CLOSED. This is a NEW
+        //     ingestion seam, so the sole-ingestion-path invariant's argument
+        //     that bad-txns-nonfinal is N/A ("relay-admitted txs are final at
+        //     admission") no longer holds: a directly-injected tx never passed a
+        //     relaying dashd's SequenceLocks. We port absolute-locktime finality
+        //     (is_final_tx, run in the selector), but NOT relative BIP68
+        //     SequenceLocks (that is M2). Until then, refuse any tx that OPTS IN
+        //     to a relative lock — nVersion >= 2 with an input whose nSequence
+        //     leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — rather than risk
+        //     selecting a bad-txns-nonfinal tx into a template. Chain-state
+        //     independent, so it sits with the other cheap pre-admission gates.
+        if (tx.version >= 2) {
+            for (const auto& vin : tx.vin) {
+                if ((vin.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0)
+                    return InjectGate::Bip68Unsupported;
+            }
+        }
+        // (2b) GAP-2 — CheckTransaction output value-range (bad-txns-vout-*).
+        //     dashcore CheckTransaction / CTransaction::GetValueOut reject any
+        //     vout outside MoneyRange and any running-sum overflow BEFORE the tx
+        //     is priced. compute_fee_locked casts vout.value to uint64 for
+        //     out_sum, so an out-of-range value (e.g. INT64_MIN) would wrap the
+        //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
+        //     Refuse by name here, ahead of admission/pricing. No-op for any
+        //     valid tx (every vout already in range).
+        //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
+        //     scriptPubKey is refused too (inject-spent-shaped-output): it is
+        //     consensus-valid (the full set keeps it as dashd does) but
+        //     non-standard in dashd, so no dashd-built block carries it.
+        {
+            int64_t vout_running = 0;
+            for (const auto& vout : tx.vout) {
+                if (!money_range(vout.value) || !money_range(vout_running + vout.value))
+                    return InjectGate::BadVoutRange;
+                if (vout.value == 0 && vout.scriptPubKey.m_data.empty())
+                    return InjectGate::SpentShapedOutput;
+                vout_running += vout.value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // add_inject (8): every input's scriptSig against its resolved
+    // scriptPubKey with the full buried flag set. False at the first input
+    // that fails (`failed_vin`; `resolved` false when no at-tip source has its
+    // scriptPubKey). Shared with the dry run. Caller holds m_mutex.
+    bool inject_scripts_ok_locked(const MutableTransaction& tx, uint32_t& failed_vin,
+                                  bool& resolved) const {
+        std::vector<uint8_t> tx_bytes;
+        {
+            auto ps = ::pack(tx);
+            auto sp = ps.get_span();
+            const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+            tx_bytes.assign(b, b + sp.size());
+        }
+        const uint32_t sflags = script_flags_for_height(0);
+        for (uint32_t vi = 0; vi < tx.vin.size(); ++vi) {
+            ::core::coin::Outpoint op(tx.vin[vi].prevout.hash, tx.vin[vi].prevout.index);
+            std::vector<uint8_t> spk;
+            resolved = resolve_input_spk_locked(op, spk);
+            if (!resolved || !m_script_check(tx_bytes, vi, spk, sflags)) {
+                failed_vin = vi;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // add_tx_locked's #125 predicate for the dry run: an input is missing
+    // from the view while one of the tx's own outputs is already a coin, so
+    // the identical tx is mined. Same predicate as the block in
+    // add_tx_locked (kept in step by the dry-run parity KAT).
+    bool own_output_already_a_coin_locked(const MutableTransaction& tx, const uint256& txid,
+                                          ::core::coin::UTXOViewCache* utxo) const {
+        if (utxo == nullptr) return false;
+        bool any_input_missing = false;
+        for (const auto& vin : tx.vin) {
+            if (!utxo->have_coin(::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index))) {
+                any_input_missing = true;
+                break;
+            }
+        }
+        if (!any_input_missing) return false;
+        for (size_t out = 0; out < tx.vout.size(); ++out)
+            if (utxo->have_coin(::core::coin::Outpoint(txid, static_cast<uint32_t>(out))))
+                return true;
         return false;
     }
 
@@ -2266,6 +3017,47 @@ private:
     void evict_one_locked(const uint256& txid)
     {
         remove_tx_locked(txid);
+    }
+
+    // S2: outpoints spent by the last kRecentSpentBlocks connected blocks, in
+    // connect order (count per outpoint so forgetting one block never drops
+    // an outpoint another recorded block also spent).
+    struct RecentSpendBlock {
+        std::optional<ChainPos>                    pos;
+        std::vector<std::pair<uint256, uint32_t>>  spent;
+    };
+    using RecentSpendBlocks = std::deque<RecentSpendBlock>;
+    std::map<std::pair<uint256, uint32_t>, uint32_t>  m_recent_chain_spends;
+    RecentSpendBlocks                                 m_recent_chain_spend_blocks;
+    size_t                                            m_recent_chain_spend_count{0};
+
+    void record_chain_spends_locked(const dash::coin::BlockType& block,
+                                    const std::optional<ChainPos>& at)
+    {
+        RecentSpendBlock rec;
+        rec.pos = at;
+        for (size_t i = 1; i < block.m_txs.size(); ++i)   // the coinbase spends nothing
+            for (const auto& in : block.m_txs[i].vin)
+                rec.spent.emplace_back(in.prevout.hash, in.prevout.index);
+        for (const auto& op : rec.spent) ++m_recent_chain_spends[op];
+        m_recent_chain_spend_count += rec.spent.size();
+        m_recent_chain_spend_blocks.push_back(std::move(rec));
+        while (!m_recent_chain_spend_blocks.empty()
+               && (m_recent_chain_spend_blocks.size() > kRecentSpentBlocks
+                   || m_recent_chain_spend_count > kRecentSpentMaxOutpoints))
+            drop_spend_block_locked(m_recent_chain_spend_blocks.begin());
+    }
+
+    RecentSpendBlocks::iterator
+    drop_spend_block_locked(RecentSpendBlocks::iterator blk)
+    {
+        for (const auto& op : blk->spent) {
+            auto it = m_recent_chain_spends.find(op);
+            if (it != m_recent_chain_spends.end() && --it->second == 0)
+                m_recent_chain_spends.erase(it);
+        }
+        m_recent_chain_spend_count -= blk->spent.size();
+        return m_recent_chain_spend_blocks.erase(blk);
     }
 
     void remove_tx_locked(const uint256& txid)

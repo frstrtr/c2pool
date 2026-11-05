@@ -3,12 +3,14 @@
 #include "stratum_server.hpp"
 #include "web_server.hpp"       // MiningInterface
 #include "address_utils.hpp"    // address utilities
+#include "stratum_username.hpp"  // pure login-field parsers
 
 #include <core/hash.hpp>
 #include <core/target_utils.hpp>
 #include <btclibs/util/strencodings.h>
 #include <crypto/scrypt.h>
 
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <ctime>
@@ -411,7 +413,7 @@ void StratumServer::record_pseudoshare(double work, const std::array<uint8_t, 20
     local_addr_rate_monitor_.add_datum(work, pubkey_hash, user, dead);
 }
 
-void StratumServer::notify_all()
+void StratumServer::notify_all(bool force_clean)
 {
     // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) ──
     // send_notify_work() acquires m_work_mutex internally.
@@ -449,7 +451,8 @@ void StratumServer::notify_all()
     for (auto& s : snapshot) {
         try {
             if (s->is_connected() && s->is_subscribed())
-                s->send_notify_work(true, &frozen_best);  // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
+                // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
+                s->send_notify_work(force_clean, &frozen_best);
         } catch (...) {}
     }
 }
@@ -559,6 +562,21 @@ void StratumSession::read_message()
                 self->process_message(bytes_read);
                 self->read_message();  // Continue reading
             } else {
+                if (ec == boost::asio::error::not_found) {
+                    // The buffer filled to its max_size with no '\n': the line
+                    // is longer than kMaxStratumLineBytes. Drop the peer, as
+                    // p2pool's LineOnlyReceiver does. Read the endpoint before
+                    // cancel_timers() closes the socket.
+                    boost::system::error_code ep_ec;
+                    auto ep = self->socket_.remote_endpoint(ep_ec);
+                    if (self->server_)
+                        self->server_->record_oversized_line_drop();
+                    LOG_WARNING << "Stratum session " << self->session_id_
+                                << " dropped: line over " << kMaxStratumLineBytes
+                                << " bytes without a newline"
+                                << (ep_ec ? std::string{} : " peer=" + ep.address().to_string()
+                                                + ":" + std::to_string(ep.port()));
+                }
                 // Session disconnected — cancel timers to break prevent zombie callbacks,
                 // then unregister from worker tracking.
                 self->cancel_timers();
@@ -677,36 +695,21 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
 
         // ─── Step 1: Strip fixed difficulty suffix (+N) before any parsing ───
         // Format: "ADDRESS+1024" or "ADDR,ADDR+512"  →  suggested_difficulty_=N
-        {
-            auto plus_pos = username_.rfind('+');
-            if (plus_pos != std::string::npos && plus_pos + 1 < username_.size()) {
-                std::string diff_str = username_.substr(plus_pos + 1);
-                try {
-                    double fixed_diff = std::stod(diff_str);
-                    if (fixed_diff > 0.0) {
-                        suggested_difficulty_ = fixed_diff;
-                        hashrate_tracker_.set_difficulty_hint(fixed_diff);
-                        LOG_INFO << "[Stratum] Fixed difficulty from username: " << fixed_diff;
-                    }
-                } catch (...) {}
-                username_ = username_.substr(0, plus_pos);
-            }
+        // "+0", negatives, "+inf" and "+nan" set no difficulty (std::stod
+        // accepts inf/nan, so a bare "> 0" check let "+inf" through).
+        if (auto fixed_diff = stratum_username::strip_fixed_diff_suffix(username_)) {
+            suggested_difficulty_ = *fixed_diff;
+            hashrate_tracker_.set_difficulty_hint(*fixed_diff);
+            LOG_INFO << "[Stratum] Fixed difficulty from username: " << *fixed_diff;
         }
 
         // ─── Step 2: Strip worker name suffix ───
         // Separators: "." and "_" (Python compat)
         // Worker name is always AFTER the last address, so strip from the end.
-        auto dot_pos = username_.rfind('.');
-        if (dot_pos != std::string::npos && dot_pos > 20) {
-            worker_name_ = username_.substr(dot_pos + 1);
-            username_ = username_.substr(0, dot_pos);
-        }
-        auto underscore_pos = username_.rfind('_');
-        if (underscore_pos != std::string::npos && underscore_pos > 20) {
-            if (worker_name_.empty())
-                worker_name_ = username_.substr(underscore_pos + 1);
-            username_ = username_.substr(0, underscore_pos);
-        }
+        // A dot inside a valid "/<diff>" tail is not a worker, and only the
+        // ".worker" segment is cut, so "ADDR/1.5" and "ADDR.rig/1024" keep their diff.
+        if (auto worker = stratum_username::strip_worker_suffix(username_); !worker.empty())
+            worker_name_ = std::move(worker);
 
         // ─── Step 3: Parse multi-chain addresses ───
         // Supported separator formats for merged mining addresses:
@@ -924,6 +927,7 @@ nlohmann::json StratumSession::handle_authorize(const nlohmann::json& params, co
                     + ":" + std::to_string(rep.port());
             } catch (...) {}
             wi.rtt_ms = sample_tcp_rtt_ms(socket_.native_handle());
+            wi.submit_window = submit_window_;
             mining_interface_->register_stratum_worker(session_id_, wi);
         }
         
@@ -1196,8 +1200,28 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     bool is_stale = (job_it == active_jobs_.end());
     if (is_stale) {
         ++stale_shares_;
-        LOG_INFO << "[Stratum] Stale share from " << username_ << " for expired job " << job_id
+        // A job id that is neither active nor among this session's recently
+        // expired ids was never issued on this connection: typically results
+        // a rig buffered before a node restart (job ids from the previous
+        // process) or from its previous connection. Same reply to the miner
+        // and still in stale_shares_; counted apart so the miner page does
+        // not show the burst as DOA.
+        const bool unknown_job =
+            std::find(expired_job_ids_.begin(), expired_job_ids_.end(), job_id)
+            == expired_job_ids_.end();
+        submit_window_->record(unknown_job
+            ? core::stratum::SubmitOutcomeWindow::Outcome::UnknownJob
+            : core::stratum::SubmitOutcomeWindow::Outcome::Stale);
+        LOG_INFO << "[Stratum] Stale share from " << username_ << " for "
+                 << (unknown_job ? "unknown job " : "expired job ") << job_id
                  << " (active_jobs=" << active_jobs_.size() << ")";
+        if (mining_interface_) {
+            mining_interface_->update_stratum_worker(session_id_,
+                hashrate_tracker_.get_current_hashrate(),
+                0.0,
+                hashrate_tracker_.get_current_difficulty(),
+                accepted_shares_, rejected_shares_, stale_shares_);
+        }
         // Job data evicted — can't reconstruct block or share.
         // Return stale response to the miner.
         nlohmann::json response;
@@ -1337,6 +1361,8 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     snapshot.merkle_branches = job.payload->merkle_branches;
     snapshot.tx_data         = job.tx_data;
     snapshot.mweb            = job.mweb;
+    snapshot.mweb_active     = job.mweb_active;
+    snapshot.degraded        = job.degraded;
     snapshot.segwit_active   = job.segwit_active;
     snapshot.prev_share_hash = job.prev_share_hash;
     snapshot.subsidy         = job.subsidy;
@@ -1394,6 +1420,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // p2pool: work = target_to_average_attempts(effective_target)
     // For us: work = credited_difficulty × 2^32 (equivalent unit conversion)
     ++accepted_shares_;
+    submit_window_->record(core::stratum::SubmitOutcomeWindow::Outcome::Accepted);
     static constexpr double TWO_32 = 4294967296.0;
     // #766/#762: credit the hashrate estimate at the difficulty THIS job was
     // actually issued/mined at, not the live vardiff. A vardiff retarget
@@ -1403,6 +1430,7 @@ nlohmann::json StratumSession::handle_submit(const nlohmann::json& params, const
     // acceptance gate above is unchanged.
     double credited_difficulty =
         (job.issued_difficulty > 0.0) ? job.issued_difficulty : vardiff_difficulty;
+    submit_window_->add_accepted_work(credited_difficulty);
     double work = credited_difficulty * TWO_32;
     bool is_dead = (job.stale_info != 0);
 
@@ -1944,6 +1972,14 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
     // ExpiringDict semantics. The most recently issued job (deque back) is
     // never evicted — it is the job the miner is currently on.
     const auto now_steady = std::chrono::steady_clock::now();
+    // Evicted ids are remembered (bounded) so a late submit for one is told
+    // apart from a submit for a job id this connection never issued.
+    auto evict_oldest = [this] {
+        expired_job_ids_.push_back(std::move(job_order_.front()));
+        job_order_.pop_front();
+        if (expired_job_ids_.size() > RECENT_EXPIRED_JOBS)
+            expired_job_ids_.pop_front();
+    };
     // TTL sweep (oldest-first; stop at the first young entry).
     while (job_order_.size() > 1) {
         auto oldest = active_jobs_.find(job_order_.front());
@@ -1954,12 +1990,12 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         if (now_steady - oldest->second.created_at < JOB_TTL)
             break;
         active_jobs_.erase(oldest);
-        job_order_.pop_front();
+        evict_oldest();
     }
     // FIFO capacity eviction (keep MAX_ACTIVE_JOBS for late shares).
     while (active_jobs_.size() >= MAX_ACTIVE_JOBS && job_order_.size() > 1) {
         active_jobs_.erase(job_order_.front());
-        job_order_.pop_front();
+        evict_oldest();
     }
     {
         JobEntry je;
@@ -1993,6 +2029,8 @@ void StratumSession::send_notify_work(bool force_clean, const uint256* frozen_be
         // to prevent race with refresh_work() changing witness data.
         je.segwit_active = cbr.snapshot.segwit_active;
         je.mweb = std::move(cbr.snapshot.mweb);
+        je.mweb_active = cbr.snapshot.mweb_active;
+        je.degraded = cbr.snapshot.degraded;
         je.subsidy = cbr.snapshot.subsidy;
         je.witness_commitment_hex = std::move(cbr.snapshot.witness_commitment_hex);
         je.witness_root = cbr.snapshot.witness_root;
@@ -2204,6 +2242,8 @@ void StratumSession::drop_stale(const char* reason)
 // Parse multi-chain addresses from username string.
 // Tries multiple separator formats for maximum miner compatibility:
 //   1. Slash+colon: "LTC_ADDR/98:DOGE_ADDR"  (explicit chain ID)
+//      A colon-less numeric slash token ("ADDR/1024") is the per-miner share
+//      difficulty -> share_difficulty_override_.
 //   2. Comma:       "LTC_ADDR,DOGE_ADDR"      (standard)
 //   3. Pipe:        "LTC_ADDR|DOGE_ADDR"       (Vnish firmware)
 //   4. Semicolon:   "LTC_ADDR;DOGE_ADDR"       (alternative)
@@ -2213,21 +2253,14 @@ void StratumSession::drop_stale(const char* reason)
 // Simple formats extract merged_addr_raw for chain auto-detection.
 void StratumSession::parse_address_separators(std::string& username, std::string& merged_addr_raw)
 {
-    // Priority 1: Slash format with explicit chain IDs
-    auto slash_pos = username.find('/');
-    if (slash_pos != std::string::npos) {
-        std::string remainder = username.substr(slash_pos + 1);
-        username = username.substr(0, slash_pos);
-        std::istringstream ss(remainder);
-        std::string token;
-        while (std::getline(ss, token, '/')) {
-            auto colon = token.find(':');
-            if (colon != std::string::npos && colon > 0 && colon + 1 < token.size()) {
-                try {
-                    uint32_t chain_id = static_cast<uint32_t>(std::stoul(token.substr(0, colon)));
-                    merged_addresses_[chain_id] = token.substr(colon + 1);
-                } catch (...) {}
-            }
+    // Priority 1: Slash format with explicit chain IDs and/or "/<share_diff>"
+    auto slash = stratum_username::parse_slash_tokens(username);
+    if (slash.had_slash) {
+        for (auto& [chain_id, addr] : slash.merged_addresses)
+            merged_addresses_[chain_id] = std::move(addr);
+        if (slash.share_diff) {
+            share_difficulty_override_ = slash.share_diff;
+            LOG_INFO << "[Stratum] Share difficulty from username: " << *slash.share_diff;
         }
         return;
     }

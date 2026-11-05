@@ -9,7 +9,7 @@
 ///   - NO witness / MWEB (Dash is non-segwit); txid = sha256d(canonical tx).
 ///   - per-tx `type` field (Dash version|type<<16 special-tx nType).
 ///   - per-tx `extraPayload` hex emitted for DIP2/DIP3/DIP4 special txs
-///     (version==3 && type!=0) — explorer.py's dash profile decodes the DIP4
+///     (IsSpecialTxVersion() && type!=0) — explorer.py's dash profile decodes the DIP4
 ///     CbTx (height, MN-list/quorum roots, bestCLSignature) CLIENT-SIDE from
 ///     this hex (decode_dip4_cbtx / coinbase_tx["extraPayload"]).
 ///   - X-shaped addresses via core::classify_script (empty hrp, p2pkh 0x4c /
@@ -219,11 +219,11 @@ inline nlohmann::json block_to_explorer_json(
         tx["type"] = static_cast<int>(mtx.type);
         tx["version"] = mtx.version;
 
-        // DIP2/DIP3/DIP4 extra payload (present on the wire iff version==3 &&
-        // type!=0). explorer.py's dash profile reads this hex to decode the
+        // DIP2/DIP3/DIP4 extra payload (present on the wire iff int16 version
+        // >= 3 && type!=0, tx_version_rules.hpp). explorer.py's dash profile reads this hex to decode the
         // DIP4 CbTx (height, MN-list/quorum merkle roots, bestCLSignature) and
         // the other special-tx payloads CLIENT-SIDE.
-        if (mtx.version == 3 && mtx.type != 0 && !mtx.extra_payload.empty()) {
+        if (tx_has_extra_payload(mtx.version, mtx.type) && !mtx.extra_payload.empty()) {
             tx["extraPayload"] = to_hex(mtx.extra_payload.data(),
                                         mtx.extra_payload.size());
         }

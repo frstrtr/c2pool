@@ -1,4 +1,6 @@
 #!/bin/bash
+# Removed at the S4w flag day: this rig runs the old payout path. The current c2pool-v37-xmr runs Path B and
+# refuses these flags ("removed at the S4w flag day"); the rig needs a binary built before the flag day.
 # node.sh A|B|C : one c2pool-v37-xmr node (BIN_<N> or BIN): native template, p2p-first, relay ON, settlement
 # ON, D_conf DCONF (10). A is the relay hub; B dials A; C dials A and B.
 N=$1; shift; source "$(dirname "$0")/common.sh"

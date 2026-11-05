@@ -94,6 +94,7 @@
 
 #include "v37_descriptor.hpp"   // the ratified canon — included, never edited here
 #include "v37_hash.hpp"         // sha256d, bytes32
+#include "v37_fixed.hpp"        // U256 (xmr_ga_split)
 
 namespace v37 {
 namespace xmr {
@@ -105,6 +106,12 @@ namespace xmr {
 // named enumerators ScriptKind::XMR_STD / ScriptKind::XMR_SUB.
 inline constexpr ScriptKind XMR_STD = static_cast<ScriptKind>(0x10);
 inline constexpr ScriptKind XMR_SUB = static_cast<ScriptKind>(0x11);
+// A2 (fee model, one lane position per receipt): the COMPOSITE lane identity
+// of a receipt whose give_author d is strictly between 0 and 65535. It is a
+// lane key only, never a payout target: project() splits its weight into the
+// payee and the donation before any consumer sees it. 0x12 is NOT used (the
+// P-1 fence in v37_xmr_canon_p1_kat pins 0x12 as a non-dispatch kind).
+inline constexpr ScriptKind XMR_LANE_GA = static_cast<ScriptKind>(0x1F);
 
 inline constexpr std::size_t XMR_POINT_LEN   = 32;  // one ed25519 point encoding
 inline constexpr std::size_t XMR_PAYLOAD_LEN = 64;  // B||A or D_i||A_main
@@ -178,8 +185,16 @@ inline bool xmr_ref_valid(const ScriptRef& r) {
 // Validate a whole PayoutDescriptor whose `pay` (or any XMR aux ref) carries an
 // XMR kind. Non-XMR refs defer to the canon's own valid(). This is what the
 // wired canon does inline; provided here for pre-tap use and for tests.
+inline bool xmr_ga_valid(const ScriptRef& r);   // A2, defined below
 inline bool xmr_descriptor_valid(const PayoutDescriptor& d,
                                  bool allow_attribution = false) {
+    // A2: the composite lane kind is a lane key, never an attribution or aux
+    // target. Refuse it there FIRST: the delegated canon valid() would
+    // re-dispatch on 0x1F and recurse.
+    if (d.attribution.has_value() && d.attribution->kind == XMR_LANE_GA) return false;
+    for (const auto& e : d.aux) if (e.ref.kind == XMR_LANE_GA) return false;
+    if (d.pay.kind == XMR_LANE_GA)
+        return xmr_ga_valid(d.pay) && !d.attribution.has_value() && d.raw_script.empty() && d.aux.empty();
     // XMR pay: enforce the torsion rule (the canon's ref_well_formed by itself
     // would reject the unknown kind byte; here we accept it once valid).
     if (is_xmr_kind(d.pay.kind)) {
@@ -257,6 +272,71 @@ inline ScriptRef make_xmr_sub(const std::array<std::uint8_t, 32>& sub_spend_D,
     r.payload.insert(r.payload.end(), sub_spend_D.begin(), sub_spend_D.end());
     r.payload.insert(r.payload.end(), main_view_A.begin(), main_view_A.end());
     return r;
+}
+
+// --- A2: composite lane identity (give_author) ------------------------------
+// payload (132 B) = d u16 LE | payee kind u8 | payee payload (64) |
+//                   donation kind u8 | donation payload (64)
+// Valid iff 1 <= d <= 65534, both halves are valid XMR address refs and the
+// payee differs from the donation. The canon identity_key() of the composite
+// is its lane key (append_ref's u8 length field fits 132).
+inline constexpr std::size_t   XMR_GA_PAYLOAD_LEN = 2 + 2 * (1 + XMR_PAYLOAD_LEN);
+inline constexpr std::uint32_t XMR_GA_SCALE = 65535;
+struct XmrGiveAuthor { std::uint16_t d = 0; ScriptRef payee{}; ScriptRef donation{}; };
+inline ScriptRef make_xmr_give_author(std::uint16_t d, const ScriptRef& payee, const ScriptRef& donation) {
+    ScriptRef r;
+    r.kind = XMR_LANE_GA;
+    r.payload.reserve(XMR_GA_PAYLOAD_LEN);
+    r.payload.push_back(static_cast<std::uint8_t>(d & 0xff));
+    r.payload.push_back(static_cast<std::uint8_t>(d >> 8));
+    r.payload.push_back(static_cast<std::uint8_t>(payee.kind));
+    r.payload.insert(r.payload.end(), payee.payload.begin(), payee.payload.end());
+    r.payload.push_back(static_cast<std::uint8_t>(donation.kind));
+    r.payload.insert(r.payload.end(), donation.payload.begin(), donation.payload.end());
+    return r;
+}
+// Structural decode only (no torsion check): kind, length and the two inner
+// kinds must be XMR address kinds with 64-byte payloads.
+inline bool decode_xmr_give_author(const ScriptRef& r, XmrGiveAuthor& out) {
+    if (r.kind != XMR_LANE_GA || r.payload.size() != XMR_GA_PAYLOAD_LEN) return false;
+    const std::uint8_t* p = r.payload.data();
+    XmrGiveAuthor g;
+    g.d = static_cast<std::uint16_t>(p[0] | (static_cast<std::uint16_t>(p[1]) << 8));
+    g.payee.kind = static_cast<ScriptKind>(p[2]);
+    g.payee.payload.assign(p + 3, p + 3 + XMR_PAYLOAD_LEN);
+    const std::uint8_t* q = p + 3 + XMR_PAYLOAD_LEN;
+    g.donation.kind = static_cast<ScriptKind>(q[0]);
+    g.donation.payload.assign(q + 1, q + 1 + XMR_PAYLOAD_LEN);
+    if (!is_xmr_kind(g.payee.kind) || !is_xmr_kind(g.donation.kind)) return false;
+    out = std::move(g);
+    return true;
+}
+inline bool xmr_ga_well_formed(const ScriptRef& r) {
+    XmrGiveAuthor g;
+    return decode_xmr_give_author(r, g) && g.d >= 1 && g.d <= XMR_GA_SCALE - 1 && !(g.payee == g.donation);
+}
+inline bool xmr_ga_valid(const ScriptRef& r) {
+    XmrGiveAuthor g;
+    if (!decode_xmr_give_author(r, g)) return false;
+    if (g.d < 1 || g.d > XMR_GA_SCALE - 1 || g.payee == g.donation) return false;
+    return xmr_ref_valid(g.payee) && xmr_ref_valid(g.donation);
+}
+// Split a composite's lane weight W: donation = floor(W*d/65535), payee = W - donation
+// (the payee keeps the floor remainder, as split_receipt_weight does per receipt).
+// Integer only: W = q*65535 + r, so W*d/65535 = q*d + floor(r*d/65535), q*d <= W.
+struct XmrGaSplit { ::v37::U256 payee{}; ::v37::U256 donation{}; };
+inline XmrGaSplit xmr_ga_split(const ::v37::U256& W, std::uint16_t d) {
+    ::v37::U256 q; unsigned __int128 rem = 0;
+    for (int i = 3; i >= 0; --i) {
+        const unsigned __int128 cur = (rem << 64) | W.v[i];
+        q.v[i] = static_cast<std::uint64_t>(cur / XMR_GA_SCALE);
+        rem = cur % XMR_GA_SCALE;
+    }
+    XmrGaSplit s;
+    s.donation = q.mul_small(d);
+    s.donation += ::v37::U256::from_u128((rem * d) / XMR_GA_SCALE);
+    s.payee = W - s.donation;
+    return s;
 }
 
 // The canon identity_key() (sha256d of VERSION||kind||len||payload) works

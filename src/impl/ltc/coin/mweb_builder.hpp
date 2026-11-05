@@ -61,6 +61,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ltc {
@@ -120,14 +121,18 @@ struct MWEBHeader {
     }
 };
 
-// ─── MWEB TxBody (empty) ───────────────────────────────────────────────────
+// ─── MWEB TxBody ───────────────────────────────────────────────────────────
 
-/// Empty MWEB transaction body — 3 zero-varint vectors.
+/// MWEB transaction body (libmw TxBody: vec<Input> vec<Output> vec<Kernel>,
+/// CompactSize lengths). Embedded mode only produces empty bodies, so
+/// Serialize writes three empty vectors; Unserialize walks a real body item
+/// by item (mweb_tx_wire.hpp) and keeps its summary.
 struct MWEBTxBody {
-    // For carry-forward with no MWEB activity, all vectors are empty.
+    mweb_wire::MwebBodySummary summary;
+
     template <typename Stream>
     void Serialize(Stream& s) const {
-        // inputs: varint(0), outputs: varint(0), kernels: varint(0)
+        // inputs, outputs, kernels: CompactSize(0) each
         uint8_t zero = 0;
         ::Serialize(s, zero);
         ::Serialize(s, zero);
@@ -136,12 +141,7 @@ struct MWEBTxBody {
 
     template <typename Stream>
     void Unserialize(Stream& s) {
-        // Skip varint-encoded vector lengths
-        uint64_t n_inputs, n_outputs, n_kernels;
-        ::Unserialize(s, VARINT(n_inputs));
-        ::Unserialize(s, VARINT(n_outputs));
-        ::Unserialize(s, VARINT(n_kernels));
-        // We don't parse individual items — embedded mode only produces empty bodies
+        summary = mweb_wire::read_mw_body(s);
     }
 };
 
@@ -198,14 +198,17 @@ struct MWEBState {
     uint32_t prev_hogex_vout{0};  // always 0 (first output)
     int64_t  hogaddr_value{0};    // carry-forward value in satoshis
 
-    // MWEB header fields to carry forward (roots don't change without MWEB activity)
+    // The previous block's MWEB header. The next empty-body header takes its
+    // cumulative fields and zeroes the per-block ones (next_empty_header).
     MWEBHeader prev_header;
 
     // The raw serialized MWEB block from the previous block (for reference)
     std::vector<unsigned char> prev_mweb_raw;
 
-    // Height at which this state was captured
+    // Block this state was captured from (height + SHA256d header hash). A
+    // template may only use it when building on exactly that block.
     uint32_t captured_at_height{0};
+    uint256  captured_block_hash;
     bool     valid{false};
 };
 
@@ -221,6 +224,17 @@ public:
             LOG_DEBUG_COIND << "[MWEB] Block has " << block.m_txs.size()
                            << " txs, need >=2 for HogEx";
             return false;
+        }
+
+        // A block's transactions never carry MWEB data: litecoind strips it
+        // from a peg-in and keeps MWEB-only txs out of vtx; a block with it
+        // is mutated (mweb_node.cpp CheckBlock: unexpected-mweb-data).
+        for (size_t i = 0; i < block.m_txs.size(); ++i) {
+            if (block.m_txs[i].HasMWEBTx()) {
+                LOG_WARNING << "[MWEB] Block at height " << block_height
+                            << " refused: unexpected-mweb-data (tx " << i << ")";
+                return false;
+            }
         }
 
         // Last transaction should be HogEx
@@ -249,6 +263,10 @@ public:
         state.prev_hogex_vout = 0;
         state.hogaddr_value = hogaddr_out.value;
         state.captured_at_height = block_height;
+        {
+            auto packed_hdr = pack(static_cast<const BlockHeaderType&>(block));
+            state.captured_block_hash = Hash(packed_hdr.get_span());
+        }
         state.valid = true;
 
         LOG_INFO << "[MWEB] Extracted state from height " << block_height
@@ -263,6 +281,9 @@ public:
     /// Extract MWEB header from raw MWEB block bytes.
     /// These bytes come after the transaction list in the full block serialization,
     /// prefixed by the OptionalPtr 0x01 byte.
+    /// The bytes must be exactly one mw::Block (header + body walked to the
+    /// end), and the header's kernel count must be the body's
+    /// (mw::Block::Validate); otherwise the block is not trusted for state.
     static bool extract_mweb_header_from_raw(const std::vector<unsigned char>& mweb_raw,
                                               MWEBState& state) {
         if (mweb_raw.empty()) {
@@ -275,12 +296,26 @@ public:
             // The raw bytes ARE the mw::Block (Header + TxBody), no OptionalPtr wrapper
             MWEBBlock mweb_block;
             ps >> mweb_block;
+            if (ps.cursor_size() != 0) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: " << ps.cursor_size()
+                            << " bytes after the mw::Block (" << mweb_raw.size() << " B)";
+                return false;
+            }
+            if (mweb_block.header.kernel_mmr_size != mweb_block.body.summary.kernels.size()) {
+                LOG_WARNING << "[MWEB] mweb-body-malformed: header kernel count "
+                            << mweb_block.header.kernel_mmr_size << " != body kernels "
+                            << mweb_block.body.summary.kernels.size();
+                return false;
+            }
             state.prev_header = mweb_block.header;
             state.prev_mweb_raw = mweb_raw;
 
             LOG_INFO << "[MWEB] Parsed header: height=" << mweb_block.header.height
                      << " output_mmr=" << mweb_block.header.output_mmr_size
-                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size;
+                     << " kernel_mmr=" << mweb_block.header.kernel_mmr_size
+                     << " body=" << mweb_block.body.summary.n_inputs << "/"
+                     << mweb_block.body.summary.n_outputs << "/"
+                     << mweb_block.body.summary.kernels.size();
             return true;
         } catch (const std::exception& e) {
             LOG_WARNING << "[MWEB] Failed to parse MWEB block: " << e.what();
@@ -288,20 +323,41 @@ public:
         }
     }
 
-    /// Build an empty MWEB block for the given height.
-    /// Carries forward all roots/sizes from the previous block.
+    /// The MWEB header of the next block when its body is empty, built the way
+    /// libmw builds it (CoinsViewCache::BuildNextBlock):
+    ///   - cumulative chain state carries over from `prev`: output_root and
+    ///     output_mmr_size (the output PMMR), leafset_root (the unspent-output
+    ///     leafset) and kernel_offset (the running total of kernel offsets) --
+    ///     an empty block adds no output, spends none and adds a zero offset;
+    ///   - per-block fields are zero: kernel_root and kernel_mmr_size (a fresh
+    ///     kernel MMR over this block's kernels; with no leaves its root is the
+    ///     null hash) and stealth_offset (this block's own offset).
+    /// Copying the per-block fields from a block that had kernels is rejected
+    /// by litecoind (bad-blk-mweb: mw::Block::Validate checks the kernel count,
+    /// the stealth sum and the kernel root against the body).
+    static MWEBHeader next_empty_header(const MWEBHeader& prev, uint32_t next_height)
+    {
+        MWEBHeader hdr;
+        hdr.height = static_cast<int64_t>(next_height);
+        hdr.output_root = prev.output_root;
+        hdr.leafset_root = prev.leafset_root;
+        hdr.output_mmr_size = prev.output_mmr_size;
+        hdr.kernel_offset = prev.kernel_offset;
+        hdr.kernel_root.SetNull();
+        hdr.kernel_mmr_size = 0;
+        hdr.stealth_offset.fill(0);
+        return hdr;
+    }
+
+    /// Build an empty MWEB block for the given height: next_empty_header() and
+    /// an empty body (no inputs/outputs/kernels).
     /// Returns the serialized mw::Block bytes (WITHOUT OptionalPtr wrapper).
     static std::vector<unsigned char> build_empty_mweb_block(
         const MWEBState& state,
         uint32_t next_height)
     {
         MWEBBlock block;
-        // Carry forward header roots and sizes
-        block.header = state.prev_header;
-        // Update height to next block
-        block.header.height = static_cast<int64_t>(next_height);
-        // Offsets stay zero for empty MWEB activity
-        // Body is empty (no inputs/outputs/kernels)
+        block.header = next_empty_header(state.prev_header, next_height);
 
         PackStream ps;
         ps << block;
@@ -311,11 +367,10 @@ public:
             reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
     }
 
-    /// Compute the blake3 hash of an MWEB block's header.
+    /// Compute the blake3 hash of the next (empty-body) block's MWEB header.
     /// This hash goes into the HogAddr output script.
     static uint256 compute_mweb_hash(const MWEBState& state, uint32_t next_height) {
-        MWEBHeader hdr = state.prev_header;
-        hdr.height = static_cast<int64_t>(next_height);
+        MWEBHeader hdr = next_empty_header(state.prev_header, next_height);
         // Debug: dump serialized header for hash verification
         PackStream dbg_ps;
         dbg_ps << hdr;
@@ -413,6 +468,31 @@ public:
     static uint256 compute_hogex_wtxid(const MutableTransaction& tx) {
         return compute_hogex_txid(tx);
     }
+
+    /// The commitment checks litecoind runs on a block's HogEx and MWEB header
+    /// (mweb_node.cpp ContextualCheckBlock): the tx is a HogEx, its first
+    /// output is the HogAddr OP_8 PUSH32 blake3(serialized MWEB header), and
+    /// the MWEB header height is the block height (an old mweb block replayed
+    /// under a new header fails). Returns the refusal reason, nullopt when the
+    /// HogEx commits to `hdr` at `height`.
+    static std::optional<std::string> check_commitment(const MutableTransaction& hogex,
+                                                       const MWEBHeader& hdr,
+                                                       uint32_t height)
+    {
+        if (!hogex.m_hogEx)
+            return std::string("last-tx-not-hogex");
+        if (hogex.vout.empty())
+            return std::string("hogex-no-outputs");
+        const auto& script = hogex.vout[0].scriptPubKey.m_data;
+        if (script.size() != 34 || script[0] != 0x58 || script[1] != 0x20)
+            return std::string("hogaddr-malformed");
+        const uint256 mweb_hash = blake3_hash_serialized(hdr);
+        if (std::memcmp(script.data() + 2, mweb_hash.data(), 32) != 0)
+            return std::string("mweb-hash-mismatch");
+        if (hdr.height != static_cast<int64_t>(height))
+            return std::string("mweb-height-mismatch");
+        return std::nullopt;
+    }
 };
 
 // ─── Thread-safe MWEB State Tracker ─────────────────────────────────────────
@@ -421,7 +501,15 @@ public:
 class MWEBTracker {
 public:
     /// Update state from a full block.
-    /// Called when a new block is received via P2P.
+    /// Called when a new block is received via P2P. The caller has checked
+    /// the header (it is in the header chain: PoW, difficulty, connects) and
+    /// that the transactions are the ones the header commits to (Merkle
+    /// root). update() checks the rest before trusting the block:
+    ///   - the last tx is the block's only HogEx;
+    ///   - the HogEx commits to the MWEB header and the MWEB header height is
+    ///     the block height (MWEBBuilder::check_commitment);
+    /// The state records the block it came from (captured_at_height and
+    /// captured_block_hash, set by extract_state).
     /// Only accepts blocks that advance the state — bootstrap/historical blocks
     /// are silently ignored to prevent stale HogEx references.
     bool update(const BlockType& block, uint32_t height,
@@ -430,11 +518,24 @@ public:
             LOG_WARNING << "[MWEB] Block has no MWEB raw data — cannot extract header roots";
             return false;
         }
+        size_t hogex_count = 0;
+        for (const auto& tx : block.m_txs)
+            hogex_count += tx.m_hogEx ? 1 : 0;
+        if (block.m_txs.empty() || !block.m_txs.back().m_hogEx || hogex_count != 1) {
+            LOG_WARNING << "[MWEB] Block at height " << height << " refused: "
+                        << (hogex_count > 1 ? "more than one HogEx" : "last tx is not a HogEx");
+            return false;
+        }
         MWEBState new_state;
         if (!MWEBBuilder::extract_state(block, height, new_state))
             return false;
         if (!MWEBBuilder::extract_mweb_header_from_raw(mweb_raw, new_state))
             return false;
+        if (auto why = MWEBBuilder::check_commitment(block.m_txs.back(), new_state.prev_header, height)) {
+            LOG_WARNING << "[MWEB] Block at height " << height << " refused: " << *why
+                        << " (mweb header height=" << new_state.prev_header.height << ")";
+            return false;
+        }
         std::lock_guard<std::mutex> lock(m_mutex);
         // Only accept blocks that advance or match current height.
         // Bootstrap delivers hundreds of old blocks whose HogEx references
@@ -443,7 +544,24 @@ public:
             return false;
         }
         m_state = std::move(new_state);
+        if (height > m_seen_height)
+            m_seen_height = height;
         return true;
+    }
+
+    /// Highest height of a block whose MWEB state was accepted (0 = never).
+    /// Monotonic: invalidate() does not clear it, so once an MWEB block has
+    /// been seen the chain is known to be MWEB-active even while the state
+    /// itself is being re-fetched.
+    uint32_t mweb_seen_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_seen_height;
+    }
+
+    /// MWEB is active for a block at `height`: an MWEB block has been seen,
+    /// or `height` reaches the chain's activation height (0 = not pinned).
+    bool mweb_active_at(uint32_t height, uint32_t activation_height) const {
+        return mweb_seen_height() > 0 || (activation_height != 0 && height >= activation_height);
     }
 
     /// Get current MWEB state (thread-safe copy).
@@ -459,8 +577,16 @@ public:
         return m_state.valid;
     }
 
+    /// Hash of the block the current state was captured from; null when
+    /// there is no state.
+    uint256 state_hash() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_state.valid ? m_state.captured_block_hash : uint256();
+    }
+
     /// Invalidate current MWEB state (e.g., after a chain reorg).
-    /// Blocks will not include MWEB data until a fresh full block is received.
+    /// Templates are refused (HOLD) until a fresh full block is received;
+    /// mweb_seen_height() is kept.
     void invalidate() {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_state.valid) {
@@ -470,9 +596,26 @@ public:
         m_state = MWEBState{};  // reset to default (valid=false)
     }
 
+    /// Tip change: keep the state if it belongs to `tip` (it can be captured
+    /// before the header chain reports the new tip), drop it otherwise.
+    /// Returns true when the state for `tip` was kept.
+    bool invalidate_unless(const uint256& tip) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state.valid && m_state.captured_block_hash == tip)
+            return true;
+        if (m_state.valid) {
+            LOG_INFO << "[MWEB] State for h=" << m_state.captured_at_height << " "
+                     << m_state.captured_block_hash.GetHex().substr(0, 16)
+                     << "... dropped: the tip is now " << tip.GetHex().substr(0, 16) << "...";
+        }
+        m_state = MWEBState{};
+        return false;
+    }
+
 private:
     mutable std::mutex m_mutex;
     MWEBState m_state;
+    uint32_t  m_seen_height{0};
 };
 
 } // namespace coin

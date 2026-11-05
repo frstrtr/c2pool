@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026, The c2pool developers (frstrtr/c2pool)
 //
-// v37_xmr_relay_fd_kat -- RELAY-FD: the GAP-2 receipt relay must not leak a
-// descriptor per dropped connection, and its accept loop must back off (not
-// spin) on an exhausted descriptor table.
-//
-// Found live (stagenet pre-capstone smoke, node A; D2 verify defect D-7): after
-// the SIGUSR1 relay partition (the rig knob, XmrRelayNode::partition_for) node
-// A's relay never healed -- fds=1024/1024, the accept thread spinning on EMFILE
-// with a full listen backlog. Root cause: CarrierPeerNode never closed the
-// descriptor of a dropped connection (only stop() did, and not even stop() once
-// the drop had removed it from the peer set), so every connection the partition
-// refused -- a peer redials about once a second -- leaked one fd on EACH side;
-// and accept() failing with EMFILE was retried at once, forever.
+// v37_xmr_relay_fd_kat -- RELAY-FD: the relay transport must not leak a
+// descriptor per dropped connection, its accept loop must back off (not spin)
+// on an exhausted descriptor table, and the Path B relay node heals after a
+// partition.
 //
 //   F1  transport churn: 300 connections dialed and dropped (either side) leave
 //       the process's open-descriptor count where it was (<= +8), and the
 //       reader threads of unwound connections are reaped
-//   F2  relay partition: B keeps redialing a partitioned A; the fd count stays
-//       bounded during the partition and returns to the baseline after it, and
-//       the relay HEALS (a fresh HELLO on both sides) once it ends, with no
-//       ghost peer entry left behind by a refused dial
+//   F2  relay partition: B keeps redialing a partitioned A (Path B relay nodes,
+//       each with its own PathbNode); the fd count stays bounded during the
+//       partition and returns to the baseline after it, and the relay HEALS (a
+//       fresh HELLO on both sides) once it ends, with no ghost peer entry left
+//       behind by a refused dial
 //   F3  EMFILE: with the descriptor table full and a connection queued, the
 //       accept loop backs off (process CPU < 10% of one core, exhaustion
 //       notices rate-limited to <= 1 per 5 s) and accepts the queued connection
@@ -36,16 +29,12 @@
 #include <mutex>
 #include <thread>
 
-#include "xmr_relay_test_util.hpp"
+#include "xmr_pathb_relay_test_util.hpp"
 #include <c2pool/v37/carrier_net.hpp>
-#include <c2pool/v37/xmr/relay/xmr_relay_node.hpp>
 
-using namespace gap2test;
+using namespace pathb_relay_test;
 using namespace std::chrono_literals;
 using c2pool::v37n::CarrierPeerNode;
-
-static constexpr u32 kChain = 7;
-static constexpr u64 kShareDiff = 1000;
 
 static int open_fds() {
     int n = 0;
@@ -60,17 +49,6 @@ static double cpu_seconds() {
     ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
-template <class F>
-static bool wait_until(F cond, std::chrono::milliseconds limit) {
-    const auto dl = std::chrono::steady_clock::now() + limit;
-    while (std::chrono::steady_clock::now() < dl) {
-        if (cond()) return true;
-        std::this_thread::sleep_for(20ms);
-    }
-    return cond();
-}
-// Diagnostics that only the fixed transport has; the KAT still builds (and goes
-// red on the behaviour, not on a compile error) against the base tree.
 template <class N> static void try_set_log(N& n, std::function<void(const std::string&)> f) {
     if constexpr (requires { n.set_log(f); }) n.set_log(std::move(f));
 }
@@ -78,29 +56,6 @@ template <class N> static long reader_threads(const N& n) {
     if constexpr (requires { n.reader_threads(); }) return static_cast<long>(n.reader_threads());
     else return -1;
 }
-
-static RelayOptions opts(bool listen, std::vector<u16> dial) {
-    RelayOptions o;
-    o.network = 3; o.chain = kChain; o.share_diff = kShareDiff; o.bind = BindMode::None;
-    o.lane_params_digest = lane_params_digest(::v37::LaneParams{}, kShareDiff, BindMode::None);
-    o.listen = listen; o.listen_host = "127.0.0.1"; o.listen_port = 0;
-    for (u16 p : dial) o.peers.emplace_back("127.0.0.1", p);
-    o.hello_timeout_ms = 3000;
-    return o;
-}
-
-struct RNode {
-    ChainView chain;
-    std::unique_ptr<XmrRelayNode> relay;
-    RNode(RelayOptions o) {
-        relay = std::make_unique<XmrRelayNode>(
-            std::move(o), chain,
-            [](const std::vector<u8>&, const bytes32&, bytes32& pow) { pow.fill(0); return true; },
-            []() -> std::pair<u64, bytes32> { return {0, bytes32{}}; },
-            [](const std::string&) {});
-    }
-    ~RNode() { relay->stop(); }
-};
 
 int main() {
     Checker C;
@@ -149,28 +104,29 @@ int main() {
     // ── F2 relay partition + heal ───────────────────────────────────────────
     {
         std::printf("-- F2 relay partition (A partitioned 6 s, B redials) + heal\n");
-        RNode A(opts(true, {}));
+        Rig rig;
+        auto A = rig.make("A", Rig::opts(true));
         std::string why;
-        C(A.relay->start(why), "F2 A starts (listening)");
-        RNode B(opts(false, {A.relay->listen_port()}));
-        C(B.relay->start(why), "F2 B starts (dialing A)");
-        C(wait_until([&] { return A.relay->stats().hello_ok.load() >= 1 && B.relay->stats().hello_ok.load() >= 1; }, 10000ms),
+        C(A->start(why), "F2 A starts (listening)");
+        auto B = rig.make("B", Rig::opts(false, {A->port()}));
+        C(B->start(why), "F2 B starts (dialing A)");
+        C(wait_until([&] { return A->st().hello_ok.load() >= 1 && B->st().hello_ok.load() >= 1; }, 10000ms),
           "F2 A<->B HELLO ok before the partition");
         std::this_thread::sleep_for(300ms);
         const int base = open_fds();
-        const u64 ha0 = A.relay->stats().hello_ok.load(), hb0 = B.relay->stats().hello_ok.load();
-        const u64 dials0 = B.relay->stats().dials.load();
-        A.relay->partition_for(std::chrono::seconds(6));
+        const u64 ha0 = A->st().hello_ok.load(), hb0 = B->st().hello_ok.load();
+        const u64 dials0 = B->st().dials.load();
+        A->r().partition_for(std::chrono::seconds(6));
         int peak = base;
         const auto t0 = std::chrono::steady_clock::now();
         while (std::chrono::steady_clock::now() - t0 < 6s) {
             peak = std::max(peak, open_fds());
             std::this_thread::sleep_for(100ms);
         }
-        const u64 dials_during = B.relay->stats().dials.load() - dials0;
+        const u64 dials_during = B->st().dials.load() - dials0;
         const bool healed = wait_until([&] {
             peak = std::max(peak, open_fds());
-            return A.relay->stats().hello_ok.load() > ha0 && B.relay->stats().hello_ok.load() > hb0;
+            return A->st().hello_ok.load() > ha0 && B->st().hello_ok.load() > hb0;
         }, 15000ms);
         const double heal_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - 6.0;
         std::this_thread::sleep_for(1500ms);
@@ -183,16 +139,15 @@ int main() {
         C(after - base <= 2, "F2 fds back to steady after the heal (" + std::to_string(after) + " vs " +
                                  std::to_string(base) + ")");
         C(healed, "F2 relay healed after the partition (fresh HELLO ok on A and B)");
-        C(A.relay->n_connections() == 1 && B.relay->n_connections() == 1,
-          "F2 exactly one live A<->B link after the heal");
+        C(A->links.n_peers() == 1 && B->links.n_peers() == 1, "F2 exactly one live A<->B link after the heal");
         // A dial the partitioned A refused at once must not leave a GHOST peer
         // entry on B (its down event raced ahead of its up event): a ghost is
         // re-counted as a HELLO timeout every maintenance tick and holds a
-        // max_peers slot forever. Past the HELLO timeout, the counter is flat.
+        // peer slot forever. Past the HELLO timeout, the counter is flat.
         std::this_thread::sleep_for(3500ms);
-        const u64 t1 = B.relay->stats().hello_timeout.load() + A.relay->stats().hello_timeout.load();
+        const u64 t1 = B->st().hello_timeout.load() + A->st().hello_timeout.load();
         std::this_thread::sleep_for(2000ms);
-        const u64 t2 = B.relay->stats().hello_timeout.load() + A.relay->stats().hello_timeout.load();
+        const u64 t2 = B->st().hello_timeout.load() + A->st().hello_timeout.load();
         std::printf("    HELLO timeouts after the heal: %llu -> %llu over 2 s\n", (unsigned long long)t1, (unsigned long long)t2);
         C(t2 == t1, "F2 no ghost peer entries after the partition (HELLO-timeout counter flat)");
     }

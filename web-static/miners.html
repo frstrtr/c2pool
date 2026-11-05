@@ -1028,8 +1028,12 @@
                     var thead = table.append('thead').append('tr');
                     thead.append('th').text('Worker Name');
                     thead.append('th').text('Hashrate');
+                    thead.append('th')
+                        .attr('title', 'Mean of the last-24h samples where this worker was reporting; blank when there are none')
+                        .text('24h Avg HR');
                     thead.append('th').text('Difficulty');
                     thead.append('th').text('DOA Rate');
+                    thead.append('th').text('DOA Hashrate');
                     
                     var tbody = table.append('tbody');
                     miner.workers.forEach(function(worker) {
@@ -1044,9 +1048,11 @@
                         row.append('td')
                             .attr('title', worker.isEstimated ? 'Estimated from difficulty' : '')
                             .text(workerHashrateText);
+                        row.append('td').text(avg_24h[worker.name] === undefined ? '-' : format_hashrate(avg_24h[worker.name]));
                         row.append('td').text(d3.format('.2f')(worker.difficulty));
                         var worker_doa_percent = worker.hashrate > 0 ? worker.doa_hashrate / worker.hashrate : 0;
                         row.append('td').text(d3.format('.2%')(worker_doa_percent));
+                        row.append('td').text(format_hashrate(worker.doa_hashrate));
                     });
                 }
             });

@@ -60,6 +60,7 @@
 #include <set>
 #include <vector>
 
+#include <core/known_txs_eviction.hpp>
 #include <core/uint256.hpp>
 
 namespace dgb {
@@ -226,6 +227,28 @@ inline std::size_t readvertise_and_record(Peers& peers,
         ++peers_reached;
     }
     return peers_reached;
+}
+
+// Live-pass cap enforcement for the remember_tx-fed m_known_txs cache. The
+// guarded core::evict_known_txs_to_cap call used to sit only in prune_shares(),
+// which has zero callers, so the cap never ran and both containers grew without
+// bound on a long-lived node. NodeImpl::evict_known_txs_io_phase() runs this
+// once per clean_tracker() cycle. Returns how many map entries were evicted.
+//
+// IO-THREAD ONLY at the call site: remember_tx inserts into m_known_txs on the
+// io thread with no lock (protocol_{legacy,actual}.cpp), so evicting from the
+// compute thread, even under the exclusive tracker lock, would race those
+// inserts. This follows the LTC IO-phase shape (#1586), not the compute-thread
+// shape (BCH #1116).
+template <typename Map, typename Key>
+inline std::size_t enforce_known_txs_cap(Map& known_txs, std::deque<Key>& order,
+                                         std::size_t cap)
+{
+    if (known_txs.size() <= cap)
+        return 0;
+    const std::size_t before = known_txs.size();
+    core::evict_known_txs_to_cap(known_txs, order, cap);
+    return before - known_txs.size();
 }
 
 } // namespace dgb

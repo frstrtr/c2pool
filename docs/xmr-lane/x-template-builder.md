@@ -1,5 +1,13 @@
 # XMR lane — whole-block template builder (v37 Family B, item 10)
 
+> **Status 2026-10-04 (operator ruling 20:27 +04).** The p2pool-derived whole-block
+> template (`src/impl/xmr/template/xmr_block_template.{hpp,cpp}`, GPL-3.0-only) was
+> replaced by a clean-room implementation, frstrtr's own code written from Monero-core
+> v0.18.5.1 and the public CryptoNote protocol without p2pool source, under the c2pool
+> AGPL-3.0-or-later header. No GPL-3.0-only file remains in the XMR lane, and the lane
+> keeps the repository licence (design canon C32). The text below is the earlier plan,
+> kept as a record.
+
 Foundation slice of the Monero/RandomX settlement lane for the v37 Work-Receipts
 substrate (frstrtr/c2pool, AGPL-3.0). Design of record:
 `v37-monero-randomx-lane-scoping.md` §1.4/6, §2.1–2.4, §4 item 10.

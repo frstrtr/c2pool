@@ -19,17 +19,26 @@
 ///   + CAuxPow (variable)        merge-mining proof, present iff IsAuxpow(version)
 ///   + tx_count (CompactSize)    0 in a 'headers' message
 ///
-/// §12-Q1 RESOLVED (M2): the parent (LTC) coinbase carried in CAuxPow.merkle_tx.tx
-/// is the pool's OWN generated coinbase (gentx), NOT a getblock RPC result.
-/// Reference: p2pool/work.py:3043-3047
-///     ltc_coinbase_hash          = bitcoin_data.get_txid(new_gentx)
-///     packed_coinbase_for_auxpow = bitcoin_data.tx_id_type.pack(new_gentx)
-/// i.e. the coinbase is serialized via tx_id_type (witness-stripped) from new_gentx.
-/// No divergence from the reference -> no decisions@ escalation required.
+/// §12-Q1 (M2) is about what c2pool EMITS: the parent (LTC) coinbase in the
+/// proofs c2pool builds is the pool's own gentx, serialized witness-stripped
+/// (p2pool/work.py:3043-3047, tx_id_type.pack(new_gentx); here
+/// merged_mining.cpp build_auxpow_proof, from hex). That is unchanged.
+///
+/// What c2pool ACCEPTS is whatever Dogecoin Core emits. Core (auxpow.h:81
+/// READWRITE(tx) in CMerkleTx) serializes the parent coinbase with the
+/// stream's default params: witness ALLOWED (primitives/transaction.h:212),
+/// so a 'headers' message carries another pool's LTC coinbase with its
+/// BIP144 marker, flag and witness-reserved value whenever the node stored it
+/// that way (only a 'block' answering MSG_BLOCK, net_processing.cpp:1125, and
+/// a compact block for a peer that wants no witnesses, :1161, are sent
+/// stripped). Both encodings are legal; CMerkleTx reads and
+/// writes with parent_coinbase_wire_params below, and the txid the merkle
+/// branch commits to stays the witness-stripped hash (parent_coinbase_txid).
 
 #include <impl/ltc/coin/transaction.hpp>            // MutableTransaction, TX_NO_WITNESS
 #include <impl/bitcoin_family/coin/base_block.hpp>   // BlockHeaderType
 
+#include <core/hash.hpp>
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/pack_types.hpp>
@@ -69,8 +78,9 @@ struct CMerkleLink
     bool IsNull() const { return m_branch.empty() && m_index == 0; }
 };
 
-/// Witness-strip params for the PARENT coinbase tx (tx_id_type, data.py:232).
-/// Each parent chain owns its TxParams *type*: LTC/DASH reuse
+/// Witness-strip params for the PARENT coinbase tx (tx_id_type, data.py:232):
+/// the txid (parent_coinbase_txid), never the wire form (see
+/// parent_coinbase_wire_params). Each parent chain owns its TxParams *type*: LTC/DASH reuse
 /// bitcoin_family::coin::TxParams via a using-declaration, while DGB declares
 /// its own dgb::coin::TxParams. The no-witness wrapper must therefore resolve
 /// from the PARENT type instead of hardcoding bitcoin_family's -- a DGB parent
@@ -89,8 +99,36 @@ struct parent_coinbase_no_witness
     static constexpr auto value = bitcoin_family::coin::TX_NO_WITNESS;
 };
 
+/// Wire params of the PARENT coinbase inside CMerkleTx: Dogecoin Core
+/// (auxpow.h:81 READWRITE(tx)) uses the stream's default, i.e. witness
+/// ALLOWED (transaction.h:212) and no MWEB (flag 8 -> "Unknown transaction
+/// optional data", transaction.h:238). A stripped coinbase (vin non-empty)
+/// parses the same way, so both legal encodings are accepted; a witness-
+/// carrying one round-trips byte-identical, and one without a witness
+/// serializes exactly as before. One refusal is stricter than Dogecoin Core
+/// 1.14.9: flag 1 with every witness stack empty ("Superfluous witness
+/// record", the LTC transaction reader) - Core accepts it, but never emits
+/// it (it writes flag 1 only for a non-empty stack, transaction.h:252-256).
+/// Same per-parent rule as above: a parent with its own TxParams type
+/// specializes this in its own tree.
+template <typename ParentCoinbaseTx>
+struct parent_coinbase_wire_params
+{
+    static constexpr bitcoin_family::coin::TxParams value{.allow_witness = true, .allow_mweb = false};
+};
+
+/// The parent coinbase's txid: SHA256d of its witness-stripped serialization
+/// (CTransaction::GetHash), the leaf CMerkleTx's branch commits to in the
+/// parent block's merkle root, whichever encoding the proof carried.
+template <typename ParentCoinbaseTx>
+uint256 parent_coinbase_txid(const ParentCoinbaseTx& tx)
+{
+    auto packed = pack(parent_coinbase_no_witness<ParentCoinbaseTx>::value(tx));
+    return Hash(packed.get_span());
+}
+
 /// merkle_tx_type (data.py:231-235)
-///     ('tx',          tx_id_type)        -> m_tx  (witness-stripped; see §12-Q1)
+///     ('tx',          tx_id_type)        -> m_tx  (wire: parent_coinbase_wire_params)
 ///     ('block_hash',  IntType(256))      -> m_block_hash
 ///     ('merkle_link', merkle_link_type)  -> m_merkle_link
 template <typename ParentCoinbaseTx = ltc::coin::MutableTransaction>
@@ -100,14 +138,14 @@ struct CMerkleTx
     uint256                       m_block_hash;
     CMerkleLink                   m_merkle_link;
 
-    // tx_id_type == witness-stripped tx serialization (data.py:232).
+    // Core's CMerkleTx field order; the coinbase as Core reads and writes it.
     template <typename Stream> void Serialize(Stream& s) const {
-        ::Serialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
+        ::Serialize(s, parent_coinbase_wire_params<ParentCoinbaseTx>::value(m_tx));
         ::Serialize(s, m_block_hash);
         ::Serialize(s, m_merkle_link);
     }
     template <typename Stream> void Unserialize(Stream& s) {
-        ::Unserialize(s, parent_coinbase_no_witness<ParentCoinbaseTx>::value(m_tx));
+        ::Unserialize(s, parent_coinbase_wire_params<ParentCoinbaseTx>::value(m_tx));
         ::Unserialize(s, m_block_hash);
         ::Unserialize(s, m_merkle_link);
     }

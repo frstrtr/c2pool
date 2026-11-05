@@ -119,11 +119,19 @@ TxDecodeStatus decode_relayed_tx(const std::uint8_t* data, std::size_t size, Dec
     // them (it no longer walks over them) into out.clsags for the txpool's
     // input-consensus step. They must be exactly as long as the ring sizes in
     // the prefix say, or the pseudo-outputs that follow are not where we think.
+    //
+    // Nothing below is sized before its bytes are known to be present: every
+    // input needs at least one s scalar, c1, D and one pseudo-output (4 * 32),
+    // and each s vector is sized only once ring + 2 keys remain. The ring sizes
+    // themselves are bounded by the prefix parser (their sum is below Monero's
+    // MAX_TOTAL_KEY_OFFSETS).
     if (out.w.ring_sizes.size() != n_in) return TxDecodeStatus::PrunableMalformed;
+    if (r.remaining() / (4 * 32) < n_in) return TxDecodeStatus::PrunableMalformed;
     out.clsags.resize(n_in);
     for (std::size_t i = 0; i < n_in; ++i) {
         const std::uint64_t ring = out.w.ring_sizes[i];
-        if (ring == 0 || ring > TX_MAX_RING) return TxDecodeStatus::PrunableMalformed;
+        if (ring == 0) return TxDecodeStatus::PrunableMalformed;
+        if (r.remaining() / 32 < ring + 2) return TxDecodeStatus::PrunableMalformed;
         rct::Clsag& cl = out.clsags[i];
         cl.s.resize(static_cast<std::size_t>(ring));
         for (auto& sc : cl.s)
@@ -133,6 +141,7 @@ TxDecodeStatus decode_relayed_tx(const std::uint8_t* data, std::size_t size, Dec
         cl.I = out.rct.key_images[i];   // the key image is carried in the prefix
     }
 
+    if (r.remaining() / 32 < n_in) return TxDecodeStatus::PrunableMalformed;
     out.rct.pseudoOuts.resize(n_in);
     for (auto& k : out.rct.pseudoOuts)
         if (!r.read_key(k)) return TxDecodeStatus::PrunableMalformed;

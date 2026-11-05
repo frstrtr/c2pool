@@ -132,7 +132,7 @@ struct PayoutDescriptor;  // forward decl for the dispatch-hook signature
 // reached solely through the hook below.
 inline bool is_xmr_dispatch_kind(ScriptKind k) {
     const auto b = static_cast<std::uint8_t>(k);
-    return b == 0x10 || b == 0x11;
+    return b == 0x10 || b == 0x11 || b == 0x1F;   // 0x1F: A2 composite lane identity
 }
 
 // Whole-descriptor XMR validator hook. Installed by the XMR extension via

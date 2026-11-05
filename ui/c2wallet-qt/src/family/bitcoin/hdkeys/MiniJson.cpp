@@ -25,6 +25,8 @@ struct Parser {
     const std::string& s;
     size_t i = 0;
     bool err = false;
+    int depth = 0;           // containers currently open
+    bool too_deep = false;
     explicit Parser(const std::string& src) : s(src) {}
 
     void skip() { while (i < s.size() && std::isspace((unsigned char)s[i])) ++i; }
@@ -69,6 +71,35 @@ struct Parser {
         JVal v;
         if (i >= s.size()) { err = true; return v; }
         char c = s[i];
+        if (c == '{' || c == '[') {
+            if (depth >= kMaxNestingDepth) { err = true; too_deep = true; return v; }
+            ++depth;
+            v = parse_container(c);
+            --depth;
+            return v;
+        }
+        if (c == '"') {
+            v.t = JVal::T::Str; parse_string(v.str);
+        } else if (c == 't' || c == 'f') {
+            if (s.compare(i, 4, "true") == 0) { v.t = JVal::T::Bool; v.b = true; i += 4; }
+            else if (s.compare(i, 5, "false") == 0) { v.t = JVal::T::Bool; v.b = false; i += 5; }
+            else err = true;
+        } else if (c == 'n') {
+            if (s.compare(i, 4, "null") == 0) { v.t = JVal::T::Null; i += 4; } else err = true;
+        } else if (c == '-' || std::isdigit((unsigned char)c)) {
+            size_t start = i;
+            if (s[i] == '-') ++i;
+            while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.' ||
+                   s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-')) ++i;
+            v.t = JVal::T::Num; v.num = std::atof(s.substr(start, i - start).c_str());
+        } else {
+            err = true;
+        }
+        return v;
+    }
+
+    JVal parse_container(char c) {
+        JVal v;
         if (c == '{') {
             ++i; v.t = JVal::T::Obj; skip();
             if (i < s.size() && s[i] == '}') { ++i; return v; }
@@ -96,22 +127,6 @@ struct Parser {
                 if (i < s.size() && s[i] == ']') { ++i; break; }
                 err = true; break;
             }
-        } else if (c == '"') {
-            v.t = JVal::T::Str; parse_string(v.str);
-        } else if (c == 't' || c == 'f') {
-            if (s.compare(i, 4, "true") == 0) { v.t = JVal::T::Bool; v.b = true; i += 4; }
-            else if (s.compare(i, 5, "false") == 0) { v.t = JVal::T::Bool; v.b = false; i += 5; }
-            else err = true;
-        } else if (c == 'n') {
-            if (s.compare(i, 4, "null") == 0) { v.t = JVal::T::Null; i += 4; } else err = true;
-        } else if (c == '-' || std::isdigit((unsigned char)c)) {
-            size_t start = i;
-            if (s[i] == '-') ++i;
-            while (i < s.size() && (std::isdigit((unsigned char)s[i]) || s[i] == '.' ||
-                   s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-')) ++i;
-            v.t = JVal::T::Num; v.num = std::atof(s.substr(start, i - start).c_str());
-        } else {
-            err = true;
         }
         return v;
     }
@@ -124,6 +139,10 @@ ParseResult parse(const std::string& s)
     ParseResult r;
     Parser p(s);
     JVal root = p.parse_value();
+    if (p.too_deep) {
+        r.error = "JSON nesting too deep (more than " + std::to_string(kMaxNestingDepth) + " levels)";
+        return r;
+    }
     if (p.err) { r.error = "invalid JSON"; return r; }
     p.skip();
     for (size_t k = p.i; k < s.size(); ++k)

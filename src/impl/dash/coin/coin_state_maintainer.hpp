@@ -50,6 +50,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/log.hpp>
+#include <core/inject_ledger_obs.hpp>          // core::obs::best_chainlock (read-only mirror)
 
 #include <algorithm>
 #include <array>
@@ -817,9 +818,11 @@ public:
                         // NOT regress our best. A stale/replayed diff carrying an
                         // older bestCL must not roll the committed bestCL* back
                         // (that would desync the next template's CCbTx from dashd).
-                        if (best_h > 0 && best_h >= m_state.best_cl_height())
+                        if (best_h > 0 && best_h >= m_state.best_cl_height()) {
                             m_state.set_best_cl(best_h, observed.bestCLSignature,
                                                 ClProvenance::ChainCommitted);
+                            publish_chain_committed_chainlock(best_h);
+                        }
                     }
                     // Record what THIS block's coinbase committed, keyed by its
                     // own on-wire nHeight. Distinct from the "best" above: this
@@ -963,8 +966,11 @@ public:
         }
         // BlsVerified is the ONLY provenance that lets the consensus-exact gate
         // commit a ChainLock NEWER than the one block H-1 committed — that is
-        // the case dashcore makes us prove with BLS (specialtxman.cpp:164-167).
+        // the case dashcore makes us prove with BLS (specialtxman.cpp:74-88).
         m_state.set_best_cl(height, sig, ClProvenance::BlsVerified);
+        // S4 read-only mirror (/api/tx-inject/ledger, getblockchaininfo).
+        ::core::obs::best_chainlock().publish(
+            {height, block_hash, "bls-verified", static_cast<int64_t>(std::time(nullptr))});
         LOG_INFO << "[CL] adopted VERIFIED ChainLock height=" << height
                  << " block=" << block_hash.GetHex().substr(0, 16) << "...";
         // A fresher bestCL* changes the next template's committed CCbTx —
@@ -1082,6 +1088,16 @@ public:
     /// and then re-requests a full diff. (Distinct from on_invalidate, which
     /// only drops tip-readiness and deliberately KEEPS the MN payee list.)
     void on_sml_reorg() {
+        // The mempool's recent-spent ring (external-collateral proof) holds
+        // the spends of every connected block; the ones the reorg
+        // disconnected are no longer chain spends. Forget them against the
+        // switched chain's height index; unwired (KAT / RPC posture) the
+        // ring is cleared, which only gives up proof.
+        if (const size_t n = m_state.mempool().forget_chain_spends_off_chain(
+                m_chain_hash_at_height_fn))
+            LOG_INFO << "[EMB-DASH] reorg: forgot the recorded spends of " << n
+                     << " block(s) no longer on the active chain"
+                        " (external-collateral proof)";
         m_state.sml().mnList.clear();
         m_state.qmgr().clear();
         m_have_mn_sml = false;
@@ -1416,6 +1432,36 @@ private:
             return r;
         }
 
+        // B.8 (dashd removeForBlock -> removeProTxConflicts): evict the pending
+        // provider txs this block invalidates — operator key changed/revoked,
+        // collateral spent or re-registered, duplicate keys / collateral /
+        // service / platform id — and record the block's spent outpoints for
+        // the external-collateral proof. Runs HERE, before apply_block,
+        // because the collateral and operator-key rules read the PRE-block
+        // masternode list. Drop-only. The spends are recorded under this
+        // block's height + hash so a reorg (on_sml_reorg) or a refusal below
+        // can forget them again.
+        const uint256 connected_hash = block_identity_hash(block);
+        {
+            const MnStateMachine& pre = std::as_const(m_state).mnstates();
+            m_state.mempool().remove_protx_conflicts_for_block(
+                block,
+                [&pre](const bitcoin_family::coin::TxPrevOut& op) {
+                    return pre.find_by_collateral(op);
+                },
+                // dashd validForProTxKey: the key's bytes under the holder's
+                // own scheme (the store is canonical basic; re-encode).
+                [&pre](const uint256& protx)
+                    -> std::optional<std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>> {
+                    auto it = pre.entries().find(protx);
+                    if (it == pre.entries().end()) return std::nullopt;
+                    return vendor::opkey_for_leaf(
+                        it->second.pubKeyOperator,
+                        it->second.nVersion < vendor::ProTxVersion::BASIC_BLS);
+                },
+                Mempool::ChainPos{height, connected_hash});
+        }
+
         // E2 (independent credit-pool advance): fold THIS block's own credit-pool
         // accrual so the DIP-0027 balance tracks the tip on every ingested block,
         // NOT only when the periodic mnlistdiff re-seeds it. This is what lets the
@@ -1515,6 +1561,22 @@ private:
             return r;
         }
         auto r    = m_state.mnstates().apply_block(block, height);
+        // CONSENSUS REFUSAL (v23.1.9 port): dashd rejects this block. The apply
+        // mutated nothing and the cursor stayed put, so the set is still right
+        // for the previous block — no wipe, no re-seed. Stop serving on this
+        // block; the valid block at this height (the chain the network
+        // ChainLocks) folds normally, and a child of the refused block trips
+        // the gap guard.
+        if (!r.refused.empty()) {
+            LOG_WARNING << "[EMB-DASH] MN payee fold REFUSED block h=" << height
+                        << ": " << r.refused
+                        << " — dashd rejects it; not serving on it (demote)";
+            // Its spends are not chain spends: they must not prove an
+            // external collateral absent.
+            m_state.mempool().forget_chain_spends_of_block(connected_hash);
+            demote();
+            return r;
+        }
         // ── DIFF-STORE GAP REPAIR (dashd GetListForBlockInternal analogue,
         // evo/deterministicmns.cpp:778-870, as a cold repair path). An APPLY
         // GAP means blocks between the cursor and this one were never folded
@@ -1575,8 +1637,33 @@ private:
             LOG_WARNING << "[EMB-DASH] MN payee queue "
                         << (r.gap_detected ? "APPLY GAP" : "DESYNC")
                         << " at h=" << height
-                        << " — wiping payee set, demoting to dashd fallback,"
-                           " requesting authoritative re-seed";
+                        << (m_fallback_armed
+                                ? " — wiping payee set, demoting to dashd fallback,"
+                                  " requesting authoritative re-seed"
+                                : " — wiping payee set and requesting an"
+                                  " authoritative re-seed; DAEMONLESS: no dashd"
+                                  " fallback is armed, so NO work is served until"
+                                  " the re-seed publishes");
+            // F2: a gap is not divergence. The queue was never offered
+            // cursor+1 and is still correct as of its cursor, so keep a copy
+            // the re-seed may resume from. A desync (even one reported
+            // together with a gap after a repair re-apply) is divergence and
+            // keeps no seed.
+            m_last_reseed_reason = r.payee_desync ? ReseedReason::Desync
+                                                  : ReseedReason::Gap;
+            m_gap_seed.reset();
+            if (!r.payee_desync && m_mn_snapshot_height != 0) {
+                const MnStateMachine& sm = std::as_const(m_state).mnstates();
+                if (!sm.entries().empty() && sm.last_applied_height() != 0) {
+                    GapSeed g;
+                    g.entries.assign(sm.entries().begin(), sm.entries().end());
+                    g.as_of      = sm.last_applied_height();
+                    g.as_of_hash = (g.as_of == m_payee_cursor_hash_height)
+                                       ? m_payee_cursor_hash : uint256();
+                    g.source     = m_mn_source;
+                    m_gap_seed   = std::move(g);
+                }
+            }
             m_state.mnstates().load({});
             m_mn_snapshot_height = 0;
             m_have_mn = false;
@@ -1596,6 +1683,18 @@ private:
             notify_state_dirty();
             if (m_on_mn_reseed) m_on_mn_reseed();
             return r;
+        }
+        // A CLEAN fold advanced the queue to `height`: remember which block
+        // it folded (the gap seed's R4 evidence) and hand the queue to the
+        // live cursor persistence (F3).
+        if (!r.skipped_out_of_order
+            && std::as_const(m_state).mnstates().last_applied_height() == height) {
+            m_payee_cursor_hash        = block_identity_hash(block);
+            m_payee_cursor_hash_height = height;
+            if (m_on_payee_folded && m_mn_snapshot_height != 0
+                && !m_mn_needs_reseed)
+                m_on_payee_folded(std::as_const(m_state).mnstates().entries(),
+                                  height, m_payee_cursor_hash);
         }
         // ANTI-MINT (E2d): with the latch on, block-connect alone can NEVER
         // arm MN-readiness. Absent a seed the payee set starts empty and
@@ -1806,6 +1905,72 @@ public:
         m_on_mn_reseed = std::move(fn);
     }
 
+    /// WHY the last authoritative re-seed was asked for (read by the re-seed
+    /// sink, which keeps its no-argument signature). A GAP and a DESYNC are
+    /// opposite evidence and the MN-CKPT re-arm must not treat them alike:
+    ///   * Desync — the connected block's coinbase disagreed with the queue at
+    ///     a contiguous height: the queue itself is wrong (divergence);
+    ///   * Gap    — the queue was never offered cursor+1 (a transport hole):
+    ///     the queue is CORRECT as of its cursor, it is merely behind.
+    /// Every re-drive of the ask (the SML carve-out) repeats the last reason.
+    enum class ReseedReason { None, Desync, Gap };
+    ReseedReason last_reseed_reason() const { return m_last_reseed_reason; }
+    static const char* reseed_reason_name(ReseedReason r) {
+        switch (r) {
+            case ReseedReason::None:   return "none";
+            case ReseedReason::Desync: return "desync";
+            case ReseedReason::Gap:    return "gap";
+        }
+        return "unknown";
+    }
+
+    /// The payee queue exactly as it stood when an APPLY GAP wiped it: still
+    /// contiguous through `as_of`, so a re-seed may RESUME from it (replay
+    /// as_of+1 .. tip) instead of replaying from a persisted cursor or the
+    /// anchor. Captured only for a gap (never a desync), only off an
+    /// authoritative height-stamped snapshot, and handed out once.
+    struct GapSeed {
+        std::vector<std::pair<uint256, MNState>> entries;
+        uint32_t    as_of{0};
+        uint256     as_of_hash;     // block folded at as_of (null: snapshot load)
+        std::string source;         // the lane that seeded the lineage
+    };
+    std::optional<GapSeed> take_gap_seed() {
+        std::optional<GapSeed> out;
+        out.swap(m_gap_seed);
+        return out;
+    }
+    bool has_gap_seed() const { return m_gap_seed.has_value(); }
+
+    /// Called after every CLEAN payee fold (no gap, no desync, not skipped)
+    /// with the queue as of `height` and the block folded there. main_dash
+    /// points this at MnCheckpointLane::note_live_fold so the bridge cursor is
+    /// persisted at the tip (F3) and a restart / gap re-seed resumes from
+    /// blocks-since-the-last-fold instead of blocks-since-the-last-publish.
+    using PayeeFoldedFn = std::function<void(const MnStateMachine::Entries&,
+                                             uint32_t height,
+                                             const uint256& block_hash)>;
+    void set_on_payee_folded(PayeeFoldedFn fn) { m_on_payee_folded = std::move(fn); }
+
+    /// The ordered-connect cursor PayeeFoldFeeder delivers against: the
+    /// payee machine's apply cursor WHILE an authoritative, height-stamped,
+    /// non-empty snapshot is in force; 0 otherwise (unseeded, unheighted,
+    /// wiped awaiting its re-seed), which puts the feeder in passthrough.
+    /// Read through the const accessor: this runs per block and per tick and
+    /// must not bump the root-memo epoch.
+    uint32_t payee_fold_cursor() const {
+        if (m_mn_needs_reseed || m_mn_snapshot_height == 0) return 0;
+        const MnStateMachine& sm = std::as_const(m_state).mnstates();
+        if (sm.entries().empty()) return 0;
+        return sm.last_applied_height();
+    }
+
+    /// Is a dashd fallback arm actually configured? Purely for the wording of
+    /// the fail-closed lines: on a daemonless node "demoting to dashd
+    /// fallback" serves NO work, and the log must say so (F4). Default true
+    /// keeps every existing line byte-identical.
+    void set_fallback_armed(bool armed) { m_fallback_armed = armed; }
+
     /// Wire the MN diff-store gap-repair seam (mn_gap_repair.hpp; main_dash
     /// points this at MnDiffStore::reconstruct over the PoW-validated header
     /// chain — the c2pool port of dashd's snapshot+diff walk,
@@ -1947,9 +2112,24 @@ private:
                                        observed.has_best_cl_signature(),
                                        committed_cl_h);
         if (observed.has_best_cl_signature() && committed_cl_h > 0
-            && committed_cl_h >= m_state.best_cl_height())
+            && committed_cl_h >= m_state.best_cl_height()) {
             m_state.set_best_cl(committed_cl_h, observed.bestCLSignature,
                                 ClProvenance::ChainCommitted);
+            publish_chain_committed_chainlock(committed_cl_h);
+        }
+    }
+
+    /// S4 read-only mirror of a chain-committed ChainLock adoption: the cbTx
+    /// carries only the height, so the block hash comes from the current
+    /// chain's height index when one is wired (null = unknown, never guessed).
+    void publish_chain_committed_chainlock(int32_t height) {
+        ::core::obs::BestChainLock cl;
+        cl.height = height;
+        if (m_chain_hash_at_height_fn && height > 0)
+            if (auto h = m_chain_hash_at_height_fn(static_cast<uint32_t>(height))) cl.blockhash = *h;
+        cl.provenance = "chain-committed";
+        cl.updated_at = static_cast<int64_t>(std::time(nullptr));
+        ::core::obs::best_chainlock().publish(cl);
     }
 
     void advance_credit_pool_on_block(const dash::coin::BlockType& block,
@@ -2495,6 +2675,12 @@ private:
     std::function<int64_t(uint32_t)> m_sb_budget_fn;  // superblock budget cap (duffs)
     std::function<void()> m_on_state_dirty;  // SML/bestCL/reorg -> re-issue work
     std::function<void()> m_on_mn_reseed;    // payee desync -> authoritative protx re-seed
+    ReseedReason m_last_reseed_reason{ReseedReason::None};   // F2: why the last ask fired
+    std::optional<GapSeed> m_gap_seed;       // F2: the queue a GAP wiped (resume point)
+    PayeeFoldedFn m_on_payee_folded;         // F3: clean fold -> live cursor persistence
+    uint256  m_payee_cursor_hash;            // block folded at m_payee_cursor_hash_height
+    uint32_t m_payee_cursor_hash_height{0};
+    bool     m_fallback_armed{true};         // F4: wording only (daemonless = false)
     MnGapRepairFn m_mn_gap_repair;           // diff-store gap repair (mn_gap_repair.hpp); unset = historical fail-closed
     std::function<void()> m_on_full_resync;  // H-1 heal -> reset sml_base + full re-sync
     std::function<void(const uint256&, const uint256&)> m_on_sml_rerequest;  // SML-behind-tip -> bounded getmnlistd(base,target)

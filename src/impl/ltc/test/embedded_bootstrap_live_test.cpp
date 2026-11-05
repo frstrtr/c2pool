@@ -24,6 +24,14 @@
 ///     A reachable network that fails to advance the tip is a real FAILURE of
 ///     the bootstrap path — exactly what this gate exists to catch.
 ///
+/// Peer rotation: public LTC nodes with full inbound slots evict a fresh,
+/// zero-relay peer within seconds of verack (runs 39005660193 + 39010744011,
+/// 2026-10-17: EOF 0.5-4.4s after connect, every reconnect). One unlucky pick
+/// must not red the gate, so up to kMaxCandidates reachable peers are tried in
+/// turn, and getheaders is sent on every completed handshake (including
+/// reconnects) instead of once on a fixed timer. The gate still FAILS when
+/// every candidate completes TCP connect and none delivers headers.
+///
 /// Seed source: ltc_mainnet_dns_seeds() (the real public LTC DNS seeds) by
 /// default, overridable to our own deterministic bootstrap host via the
 /// LTC_BOOTSTRAP_DNS_SEED env var once
@@ -45,8 +53,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -118,29 +126,26 @@ TEST(EmbeddedBootstrapGate, DnsResolveHandshakeGetheadersTipAdvance)
     std::cout << "[bootstrap-gate] DNS resolved " << peers.size()
               << " candidate peers" << std::endl;
 
-    // ── Stage 2: find a TCP-reachable peer on the P2P port ───────────────────
-    std::optional<NetService> reachable;
+    // ── Stage 2: collect TCP-reachable peers on the P2P port ─────────────────
+    constexpr int kProbeBudget = 16;          // bound the probe time (3s each)
+    constexpr size_t kMaxCandidates = 4;
+    std::vector<NetService> reachable;
     int probed = 0;
     for (const auto& p : peers) {
-        ++probed;
-        if (tcp_probe(p.address(), p.port())) { reachable = p; break; }
-        if (probed >= 12) break;   // bound the probe budget
+        if (probed++ >= kProbeBudget || reachable.size() >= kMaxCandidates) break;
+        if (tcp_probe(p.address(), p.port())) reachable.push_back(p);
     }
-    if (!reachable.has_value()) {
+    if (reachable.empty()) {
         GTEST_SKIP() << "SKIP[p2p-egress-blocked]: DNS resolved " << peers.size()
                      << " peers but NONE accepted a TCP connection on the LTC "
                         "P2P port within the probe window — P2P egress is blocked "
                         "on this runner. Handshake was NOT exercised.";
     }
-    std::cout << "[bootstrap-gate] TCP-reachable peer: "
-              << reachable->to_string() << std::endl;
+    std::cout << "[bootstrap-gate] TCP-reachable peers: " << reachable.size()
+              << " of " << probed << " probed" << std::endl;
 
-    // ── Stage 3: real handshake + getheaders against that peer ───────────────
+    // ── Stage 3: real handshake + getheaders, rotating across candidates ─────
     // Network is reachable from here on — NO further skips; we ASSERT.
-    io::io_context ioc;
-    NetService addr = *reachable;
-    BroadcastPeer peer(&ioc, addr.to_string(), LTC_MAINNET_PREFIX, addr);
-
     auto params = make_ltc_chain_params_mainnet();
     HeaderChain chain(params);
     ASSERT_TRUE(chain.init());
@@ -158,46 +163,81 @@ TEST(EmbeddedBootstrapGate, DnsResolveHandshakeGetheadersTipAdvance)
 
     std::atomic<int> header_msgs{0};
     std::atomic<int> accepted_total{0};
+    std::string served_by;
+    size_t tried = 0;
 
-    peer.coin_node.new_headers.subscribe(
-        [&](const std::vector<BlockHeaderType>& hdrs) {
-            header_msgs.fetch_add(1, std::memory_order_relaxed);
-            int accepted = chain.add_headers(hdrs);
-            accepted_total.fetch_add(accepted, std::memory_order_relaxed);
-            std::cout << "[bootstrap-gate] headers msg: got " << hdrs.size()
-                      << " accepted " << accepted
-                      << " tip=" << chain.height() << std::endl;
-            if (accepted > 0) {
-                // Keep pulling to demonstrate a sustained advance.
-                peer.node_p2p.send_getheaders(70017, chain.get_locator(), uint256::ZERO);
-            }
-        });
+    using clock = std::chrono::steady_clock;
+    const auto stage3_deadline = clock::now() + std::chrono::seconds(120);
+    constexpr auto kIdleWindow = std::chrono::seconds(30);   // no headers -> next peer
 
-    peer.node_p2p.connect(addr);
+    for (const auto& addr : reachable) {
+        if (clock::now() >= stage3_deadline) break;
+        ++tried;
+        std::cout << "[bootstrap-gate] candidate " << tried << "/" << reachable.size()
+                  << ": " << addr.to_string() << std::endl;
 
-    // After version/verack settles, issue getheaders from genesis.
-    io::steady_timer handshake_wait(ioc);
-    handshake_wait.expires_after(std::chrono::seconds(5));
-    handshake_wait.async_wait([&](const boost::system::error_code& ec) {
-        if (ec) return;
-        peer.node_p2p.send_getheaders(70017, chain.get_locator(), uint256::ZERO);
-    });
+        io::io_context ioc;
+        BroadcastPeer peer(&ioc, addr.to_string(), LTC_MAINNET_PREFIX, addr);
+        auto last_progress = clock::now();
+        bool requested = false;
 
-    io::steady_timer deadline(ioc);
-    deadline.expires_after(std::chrono::seconds(90));
-    deadline.async_wait([&](const boost::system::error_code&) { ioc.stop(); });
+        peer.coin_node.new_headers.subscribe(
+            [&](const std::vector<BlockHeaderType>& hdrs) {
+                header_msgs.fetch_add(1, std::memory_order_relaxed);
+                last_progress = clock::now();
+                int accepted = chain.add_headers(hdrs);
+                accepted_total.fetch_add(accepted, std::memory_order_relaxed);
+                std::cout << "[bootstrap-gate] headers msg: got " << hdrs.size()
+                          << " accepted " << accepted
+                          << " tip=" << chain.height() << std::endl;
+                if (accepted > 0) {
+                    // Keep pulling to demonstrate a sustained advance.
+                    peer.node_p2p.send_getheaders(70017, chain.get_locator(), uint256::ZERO);
+                }
+            });
 
-    ioc.run();
+        peer.node_p2p.connect(addr);
+
+        // Send getheaders once per completed handshake (verack), so a peer
+        // that drops us and is reconnected gets asked again.
+        io::steady_timer tick(ioc);
+        std::function<void()> arm = [&]() {
+            tick.expires_after(std::chrono::milliseconds(250));
+            tick.async_wait([&](const boost::system::error_code& ec) {
+                if (ec) return;
+                const auto now = clock::now();
+                if (now >= stage3_deadline || now - last_progress >= kIdleWindow) {
+                    ioc.stop();
+                    return;
+                }
+                if (!peer.node_p2p.is_handshake_complete()) {
+                    requested = false;
+                } else if (!requested) {
+                    peer.node_p2p.send_getheaders(70017, chain.get_locator(), uint256::ZERO);
+                    requested = true;
+                }
+                arm();
+            });
+        };
+        arm();
+
+        ioc.run();
+
+        if (accepted_total.load() > 0) { served_by = addr.to_string(); break; }
+        std::cout << "[bootstrap-gate] " << addr.to_string()
+                  << " delivered no headers; rotating" << std::endl;
+    }
 
     const uint32_t final_height = chain.height();
     std::cout << "[bootstrap-gate] RESULT: header_msgs=" << header_msgs.load()
               << " accepted_total=" << accepted_total.load()
-              << " tip_height=" << final_height << std::endl;
+              << " tip_height=" << final_height
+              << " candidates_tried=" << tried << std::endl;
 
     // ── Assertions: the TIP ADVANCED (not merely "no crash") ─────────────────
     ASSERT_GT(header_msgs.load(), 0)
-        << "Reachable peer completed TCP connect but delivered no headers "
-           "message — the version/verack or getheaders path is BROKEN.";
+        << tried << " reachable peer(s) completed TCP connect but none delivered "
+           "a headers message — the version/verack or getheaders path is BROKEN.";
     EXPECT_GT(final_height, 0u)
         << "TIP DID NOT ADVANCE past genesis after getheaders — the embedded "
            "bootstrap header-sync path is broken.";
@@ -213,5 +253,5 @@ TEST(EmbeddedBootstrapGate, DnsResolveHandshakeGetheadersTipAdvance)
 
     std::cout << "[bootstrap-gate] PASS: tip advanced genesis(0) -> "
               << final_height << " via DNS-discovered peer "
-              << addr.to_string() << std::endl;
+              << served_by << std::endl;
 }

@@ -14,6 +14,7 @@
 #include <impl/btc/stratum/work_source.hpp>
 #include <impl/btc/stratum/tx_data_memo.hpp>   // H5 tx_data memo seam (work_source.cpp:634 churn fix)
 #include <impl/btc/stratum/finder_fee.hpp>  // D2 v35_finder_fee_split integer-exact SSOT
+#include <impl/btc/stratum/bip34_height.hpp> // BIP34 height push (OP_0/OP_1..OP_16 small heights)
 #include <memory>
 
 #include <impl/btc/coin/header_chain.hpp>
@@ -69,26 +70,6 @@ inline void push_varint(std::vector<uint8_t>& v, uint64_t n) {
         v.push_back(0xff);
         push_u64_le(v, n);
     }
-}
-
-// BIP 34 minimally-encoded height push for the coinbase scriptSig.
-// Returns: [opcode_pushbytes_n][n bytes height_LE], where n is the smallest
-// number of bytes needed to encode the height with the high bit clear (script
-// integer convention — sign-bit safety prevents the value from being parsed
-// as negative).
-inline std::vector<uint8_t> bip34_height_push(uint32_t h) {
-    std::vector<uint8_t> enc;
-    uint32_t tmp = h;
-    while (tmp) {
-        enc.push_back(static_cast<uint8_t>(tmp & 0xff));
-        tmp >>= 8;
-    }
-    if (enc.empty()) enc.push_back(0);
-    if (enc.back() & 0x80) enc.push_back(0);
-    std::vector<uint8_t> out;
-    out.push_back(static_cast<uint8_t>(enc.size()));   // OP_PUSHBYTES_n
-    out.insert(out.end(), enc.begin(), enc.end());
-    return out;
 }
 
 // Parse a BE hex string into a uint32_t. Stratum sends ntime/nonce/version
@@ -479,7 +460,7 @@ core::stratum::CoinbaseResult BTCWorkSource::build_connection_coinbase(
                        && mm_commitment.size() < 76;
 
     // ── ScriptSig assembly (always the same — coinbase deterministic) ──
-    auto bip34 = bip34_height_push(height);
+    auto bip34 = btc::stratum::bip34_height_push(height);
     static const std::string POOL_TAG = "/c2pool-btc/";
 
     std::vector<uint8_t> scriptsig;

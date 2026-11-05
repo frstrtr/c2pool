@@ -37,7 +37,7 @@ BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build_bch}"
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
   echo "[$GATE] no build dir at $BUILD_DIR — configuring (conan + cmake -DCOIN_BCH=ON)"
   . "$REPO_ROOT/tests/gates/lib/conan_prune_unreachable_remotes.sh" && prune_unreachable_conan_remotes
-  conan install "$REPO_ROOT" -pr:a="$REPO_ROOT/ci/conan/linux-gcc13.profile" --lockfile="$REPO_ROOT/conan.lock" --build=missing --output-folder="$BUILD_DIR" --settings=build_type=Release
+  conan_install_resilient "$REPO_ROOT" -pr:a="$REPO_ROOT/ci/conan/linux-gcc13.profile" --lockfile="$REPO_ROOT/conan.lock" --build=missing --output-folder="$BUILD_DIR" --settings=build_type=Release
   cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/conan_toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release \

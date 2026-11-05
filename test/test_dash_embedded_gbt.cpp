@@ -67,6 +67,7 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <btclibs/util/strencodings.h>                // ParseHex (v36 body/hash agreement pin)
 
 #include <array>
 #include <cstdint>
@@ -263,6 +264,7 @@ TEST(DashEmbeddedGbt, EmbeddedBlockExcludesAllDipSpecialTxs) {
         uint256 pv = mint_hash(seed++);
         utxo.add_coin(Outpoint(pv, 0), Coin(100'000, {}, 1, false));
         auto sp = make_spend(pv, 0, 90'000, /*salt=*/100u + t);
+        sp.version = 3;                  // special version (else bad-txns-type)
         sp.type = t;                     // DIP special type
         ASSERT_TRUE(mp.add_tx(sp));
         special_ids.push_back(dash::coin::dash_txid(sp));
@@ -1312,6 +1314,49 @@ TEST(DashEmbeddedGbt, PinnedLocalTxRidesWithZeroFeeAndExactCoinbase) {
     EXPECT_FALSE(w.m_tx_data_hex[0].empty());
 }
 
+// The DASH v36 network serves embedded templates when no dashd RPC arm exists
+// (coin/v36_work_policy.hpp). A v36 producer job freezes the template's bodies
+// and the finder rebuilds the won block from them, so every listed tx must
+// carry exactly its own body: m_tx_data_hex parallels m_tx_hashes and each body
+// hashes to its txid. A mismatch makes build_producer_job decline (no v36
+// share is minted) and a won block could not be assembled.
+TEST(DashEmbeddedGbt, EveryTemplateTxCarriesItsOwnBody) {
+    auto expect_own_bodies = [](const dash::coin::DashWorkData& w, const char* what) {
+        ASSERT_FALSE(w.m_tx_hashes.empty()) << what;
+        ASSERT_EQ(w.m_tx_data_hex.size(), w.m_tx_hashes.size()) << what;
+        for (size_t i = 0; i < w.m_tx_hashes.size(); ++i) {
+            const auto body = ParseHex(w.m_tx_data_hex[i]);
+            ASSERT_FALSE(body.empty()) << what << " tx " << i;
+            EXPECT_EQ(Hash(std::span<const unsigned char>(body.data(), body.size())),
+                      w.m_tx_hashes[i])
+                << what << " tx " << i << ": the body is the committed tx";
+        }
+    };
+
+    // A pinned local tx (rides in both postures).
+    UTXOViewCache utxo(nullptr);
+    uint256 don1 = mint_hash(72), don2 = mint_hash(73);
+    utxo.add_coin(Outpoint(don1, 0), Coin(60'000, {}, H - 5'000, /*cb=*/true));
+    utxo.add_coin(Outpoint(don2, 0), Coin(40'000, {}, H - 4'000, /*cb=*/true));
+    Mempool mp; mp.set_utxo(&utxo);
+
+    MutableTransaction pin;
+    pin.version = 2; pin.type = 0; pin.locktime = 0;
+    { TxIn i; i.prevout.hash = don1; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxIn i; i.prevout.hash = don2; i.prevout.index = 0; i.sequence = 0xffffffffu; pin.vin.push_back(i); }
+    { TxOut o; o.value = 100'000; pin.vout.push_back(o); }
+
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    expect_own_bodies(build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/true),
+                      "pinned tx, coinbase-only posture");
+    expect_own_bodies(build_with_pin(mnstates, mp, raw256(0xAB), &pin, /*suppress=*/false),
+                      "pinned tx, mempool posture");
+
+    // A selected mempool tx (the mempool-sourced range).
+    ImmatureFixture f;
+    expect_own_bodies(f.build(/*suppress=*/false), "selected mempool tx");
+}
+
 TEST(DashEmbeddedGbt, PinnedLocalTxExcludedFacesLeaveTemplateUntouched) {
     auto mnstates = single_mn(p2pkh_script(0x30));
     uint256 prev_hash = raw256(0xAB);
@@ -2051,10 +2096,13 @@ TEST(DashSupersetSpecialTx, Type4FoldRevokesOperatorAndRecomputesRoot) {
     std::array<uint8_t, 48> zero{};
     EXPECT_EQ(fold.sml.mnList[0].pubKeyOperator, zero) << "operator key cleared";
 
-    // Independent expected root (hand-built, never from the fold).
+    // Independent expected root (hand-built, never from the fold). dashd's
+    // ResetOperatorFields also puts the state back to nVersion LegacyBLS
+    // (evo/dmnstate.h:112-120), and the leaf takes the state's nVersion.
     CSimplifiedMNListEntry exp = base_e;
     exp.isValid = false; exp.pubKeyOperator = {};
     exp.netAddress = {}; exp.netPort = 0;
+    exp.nVersion = CSimplifiedMNListEntry::VER_LEGACY_BLS;
     CSimplifiedMNList expsml(std::vector<CSimplifiedMNListEntry>{exp});
     EXPECT_EQ(fold.sml.CalcMerkleRoot(), expsml.CalcMerkleRoot());
     EXPECT_NE(fold.sml.CalcMerkleRoot(), root_before)

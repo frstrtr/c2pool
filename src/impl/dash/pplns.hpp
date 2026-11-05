@@ -101,7 +101,11 @@ inline Result compute_payouts(
             (void)h;
             data.share.invoke([&](auto* obj) {
                 using S = std::remove_pointer_t<decltype(obj)>;
-                if constexpr (std::is_same_v<S, dash::DashShare>) {
+                // Both DASH share types (v16 DashShare, v36 DashV36Share on
+                // the private/isolated sharechain) carry m_bits / m_donation /
+                // m_pubkey_hash. Display path only: the v36 consensus window
+                // is pplns_v36.hpp v36_pplns_window.
+                if constexpr (dash::is_live_share<S>) {
                     double w = dash::coinbase::bits_to_difficulty(obj->m_bits);
                     if (w <= 0.0) return;
                     double dono_frac = static_cast<double>(obj->m_donation)

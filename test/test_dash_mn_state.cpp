@@ -46,6 +46,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using dash::coin::MNState;
@@ -612,6 +613,106 @@ TEST(DashMnState, UpdateServiceRevivesBannedMN) {
     EXPECT_TRUE(m.entries().at(h).isValid);
     EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 0u);
     EXPECT_EQ(m.entries().at(h).nPoSeRevivedHeight, 2400022u);
+}
+
+// ── Dash Core v23.1.9 port: the live lane refuses blocks dashd rejects ──
+// A block carrying a negative-nVersion tx (07494dd62, bad-txns-version) or a
+// ProUpServTx whose nType is invalid / not the registered one (#7488) is
+// refused WHOLE, before any mutation: the cursor stays on the previous block
+// and the valid block at that height still applies.
+namespace {
+MnStateMachine v2319_one_regular_mn(uint256& pro, uint32_t at)
+{
+    auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
+    auto regtx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg));
+    pro = tx_hash(regtx);
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xD0)}));
+    b.m_txs.push_back(regtx);
+    MnStateMachine m;
+    m.apply_block(b, at);
+    return m;
+}
+CProUpServTx v2319_serv(const uint256& pro, uint16_t nType)
+{
+    CProUpServTx ups;
+    ups.nVersion = ProTxVersion::BASIC_BLS;
+    ups.nType = nType;
+    ups.proTxHash = pro;
+    ups.netInfo.ip = seq_array<16>(0x66);
+    ups.netInfo.port_be = 0x2334;
+    ups.inputsHash = raw256(0x37);
+    if (nType == MnType::EVO) {
+        ups.platformNodeID = raw160(0x71);
+        ups.platformP2PPort = 0x6f4c;
+        ups.platformHTTPPort = 0x6f4d;
+    }
+    return ups;
+}
+} // namespace
+
+TEST(DashMnState, NegativeVersionBlockIsRefusedWhole) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400030);
+    const MNState before = m.entries().at(h);
+
+    MutableTransaction neg;
+    neg.version = 0xFFFF;                  // int16 nVersion -1
+    TxIn in; in.prevout.hash = raw256(0x91); in.prevout.index = 0; in.sequence = 0xFFFFFFFF;
+    neg.vin.push_back(in);
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xD1)}));
+    b.m_txs.push_back(special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                 protx_payload(v2319_serv(h, MnType::REGULAR))));
+    b.m_txs.push_back(neg);
+    auto r = m.apply_block(b, 2400031);
+    EXPECT_NE(r.refused.find("bad-txns-version"), std::string::npos) << r.refused;
+    EXPECT_EQ(r.updated, 0u) << "nothing of the refused block is applied";
+    EXPECT_EQ(m.last_applied_height(), 2400030u);
+    EXPECT_EQ(m.entries().at(h).netInfo.ip, before.netInfo.ip);
+
+    BlockType valid;
+    valid.m_txs.push_back(coinbase_tx({script_bytes(0xD2)}));
+    auto r2 = m.apply_block(valid, 2400031);
+    EXPECT_TRUE(r2.refused.empty()) << r2.refused;
+    EXPECT_EQ(m.last_applied_height(), 2400031u);
+}
+
+TEST(DashMnState, ProUpServTxInvalidOrMismatchedTypeRefusesTheBlock) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400040);
+    auto block_with = [&](uint16_t nType) {
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xD3)}));
+        b.m_txs.push_back(special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                     protx_payload(v2319_serv(h, nType))));
+        return b;
+    };
+    auto mismatch = m.apply_block(block_with(MnType::EVO), 2400041);
+    EXPECT_NE(mismatch.refused.find("bad-protx-type-mismatch"), std::string::npos)
+        << mismatch.refused;
+    auto invalid = m.apply_block(block_with(2), 2400041);
+    EXPECT_NE(invalid.refused.find("bad-protx-type"), std::string::npos) << invalid.refused;
+    EXPECT_EQ(invalid.refused.find("mismatch"), std::string::npos) << invalid.refused;
+    EXPECT_EQ(m.last_applied_height(), 2400040u);
+    auto ok = m.apply_block(block_with(MnType::REGULAR), 2400041);
+    EXPECT_TRUE(ok.refused.empty()) << ok.refused;
+    EXPECT_EQ(ok.updated, 1u);
+}
+
+// Control: the contextual rules are post-DIP3 only.
+TEST(DashMnState, NegativeVersionBeforeDip3IsOutsideTheRule) {
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400050);
+    m.set_dip0003_height(2400052);         // DIP3 active from 2400052 on
+    MutableTransaction neg;
+    neg.version = 0xFFFF;
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xD4)}));
+    b.m_txs.push_back(neg);
+    auto r = m.apply_block(b, 2400051);
+    EXPECT_TRUE(r.refused.empty()) << r.refused;
+    EXPECT_EQ(m.last_applied_height(), 2400051u);
 }
 
 TEST(DashMnState, CollateralSpendRemovesMN) {

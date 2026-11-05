@@ -60,6 +60,13 @@ struct Prestate
     std::string mnroot_display; // the committed root the seed must reproduce
 
     std::vector<std::pair<uint256, ReplayMNState>> entries;
+
+    /// Whether `entries[].nPoSePenalty` is dashd's own value. TRUE for the
+    /// `protx list` prestate this parser was written for (field 19
+    /// poSePenalty); the getmnlistdiff escape hatch (mnlist_seed.hpp) clears
+    /// it — an SML carries no penalty, so its zeros are placeholders and the
+    /// engine must widen the upper bound (SeedPenalties::Unknown).
+    bool penalties_exact{true};
 };
 
 namespace prestate_detail {
@@ -390,7 +397,8 @@ inline std::string seed_engine_from_prestate(DmlFoldEngine& eng,
     anchor_hash.SetHex(ps.blockhash_display);
     auto entries = ps.entries;
     eng.seed(std::move(entries), ps.entries.size(), ps.height, anchor_hash,
-             ps.network);
+             ps.network,
+             ps.penalties_exact ? SeedPenalties::Exact : SeedPenalties::Unknown);
     const std::string got = eng.compute_sml_root().GetHex();
     if (got != ps.mnroot_display)
         return "ANCHOR SEED REJECTED at h=" + std::to_string(ps.height)

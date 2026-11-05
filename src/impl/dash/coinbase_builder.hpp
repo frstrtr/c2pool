@@ -40,6 +40,7 @@
 #include "config_pool.hpp"                 // SSOT: SharechainConfig::COINBASEEXT_HEX / IMPL_TAG
 #include "share_check.hpp"                 // decode_payee_script, pubkey_hash_to_script2, DONATION_SCRIPT
 #include "payout_muldiv.hpp"               // dash::payout::payout_share (MSVC-portable 128-bit muldiv)
+#include "pplns_v36.hpp"                   // dash::compute_v36_amounts (v36 arm: shared with the v36 gentx)
 
 #include <algorithm>
 #include <cstdint>
@@ -127,74 +128,78 @@ inline std::vector<MinerPayout> compute_dash_payouts(
     const bool v36 =
         core::version_gate::is_v36_active(params.current_share_version);
     std::map<Script, uint64_t> amounts;
-    if (total_weight > 0) {
-        // weights/total_weight fit uint64 at the DASH layer, but the muldiv
-        // intermediate (worker_payout*weight*49 ~ 2^120, pre-v36 den > 2^64)
-        // needs a true 128-bit type. dash::payout::payout_share uses native
-        // __uint128_t on GCC/Clang and boost uint128 on MSVC (no __int128);
-        // the two are pinned bit-identical by test_dash_coinbase_muldiv.
-        for (const auto& [script, w] : weights) {
-            amounts[script] =
-                dash::payout::payout_share(w, worker_payout, total_weight, v36);
-        }
-    }
-
-    // 4. (pre-v36 only) 2% block-finder fee to the share creator.
-    //
-    // ZERO-PKH GUARD (#960, money path). A zero miner_pubkey_hash is not a
-    // miner -- it is the sentinel every caller of this function already uses
-    // to mean "this coinbase has no finder":
-    //   * work_source.cpp build_connection_coinbase, ownerless stratum
-    //     session whose login carried no P2PKH script -- its own comment
-    //     reads "No usable miner script: all-to-donation";
-    //   * main_dash.cpp --mine-block with no --payout-pubkey-hash
-    //     ("uint160 payout_pkh;   // default all-zero");
-    //   * main_dash.cpp embedded-oracle proposal coinbase
-    //     ("uint160 zero_pkh;   // pool-only coinbase (no finder)");
-    //   * main_dash.cpp --regtest-force-won-block
-    //     ("uint160 payout_pkh;   // all-zero placeholder finder").
-    // Paying the slice anyway emitted P2PKH(0x0000...0000) -- an output no
-    // key can ever spend. The 2% was BURNED, not credited: strictly worse
-    // than p2pool-dash, which credits ownerless work to the node operator
-    // and destroys nothing. Suppressing the output lets step 5 sweep the
-    // slice into the donation tail, which is exactly what all four call
-    // sites above already claim to do.
-    //
-    // NOT consensus-visible. Every path that MINTS or VERIFIES a share
-    // derives the finder script from the share's own m_pubkey_hash through
-    // share_producer.hpp build_gentx / share_check.hpp, never through this
-    // function; and the mint fail-closes on a non-P2PKH payout script
-    // (share_producer_bind.hpp pubkey_hash_from_p2pkh returns nullopt), so a
-    // minted share cannot carry a zero pubkey hash in the first place.
-    // compute_dash_payouts only shapes coinbases that no share commits to.
     auto this_script = dash::pubkey_hash_to_script2(miner_pubkey_hash);
-    if (!v36 && !miner_pubkey_hash.IsNull())
-        amounts[this_script] = amounts[this_script] + (worker_payout / 50);
-
-    // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
     uint64_t current_sum = 0;
-    for (const auto& [s, a] : amounts) current_sum += a;
-    uint64_t donation_remainder = (worker_payout > current_sum)
-        ? (worker_payout - current_sum) : 0;
+    uint64_t donation_remainder = 0;
 
-    // v36 consensus (a60f7f7f): the donation output MUST carry >= 1 satoshi.
-    // If the remainder rounds to 0, deduct 1 sat from the largest miner
-    // (deterministic tiebreak: (amount, script)); the sum invariant holds.
-    if (v36 && donation_remainder < 1 && worker_payout > 0 && !amounts.empty()) {
-        auto largest = std::max_element(amounts.begin(), amounts.end(),
-            [&](const auto& a, const auto& b) {
-                if (a.first == donation_script) return true;   // never pick donation
-                if (b.first == donation_script) return false;
-                if (a.second != b.second) return a.second < b.second;
-                return a.first < b.first;
-            });
-        if (largest != amounts.end() && largest->first != donation_script
-            && largest->second >= 1) {
-            largest->second -= 1;
-            donation_remainder += 1;
+    if (v36) {
+        // v36 arm: THE shared v36 amounts rule (pplns_v36.hpp
+        // compute_v36_amounts over payout::v36_worker_amount) — the same
+        // function the v36 share verifier and producer use (share_check.hpp
+        // build_v36_gentx), so the stratum coinbase cannot drift from the
+        // share commitment. Full weight, no finder fee, remainder to the
+        // donation, donation >= 1 sat (a60f7f7f), 1 sat taken from the largest
+        // non-donation miner (tiebreak (amount, script)). The uint64 weights
+        // widen losslessly to the helper's uint288 inputs.
+        std::map<Script, uint288> weights_wide;
+        for (const auto& [script, w] : weights)
+            weights_wide[script] = uint288(w);
+        auto split = dash::compute_v36_amounts(
+            weights_wide, uint288(total_weight), worker_payout, donation_script);
+        amounts = std::move(split.amounts);
+        current_sum = split.pplns_sum;
+        donation_remainder = split.remainder;
+        amounts[donation_script] = split.donation_amount;
+    } else {
+        if (total_weight > 0) {
+            // weights/total_weight fit uint64 at the DASH layer, but the muldiv
+            // intermediate (worker_payout*weight*49 ~ 2^120, pre-v36 den > 2^64)
+            // needs a true 128-bit type. dash::payout::payout_share uses native
+            // __uint128_t on GCC/Clang and boost uint128 on MSVC (no __int128);
+            // the two are pinned bit-identical by test_dash_coinbase_muldiv.
+            for (const auto& [script, w] : weights) {
+                amounts[script] =
+                    dash::payout::payout_share(w, worker_payout, total_weight, v36);
+            }
         }
+
+        // 4. (pre-v36 only) 2% block-finder fee to the share creator.
+        //
+        // ZERO-PKH GUARD (#960, money path). A zero miner_pubkey_hash is not a
+        // miner -- it is the sentinel every caller of this function already uses
+        // to mean "this coinbase has no finder":
+        //   * work_source.cpp build_connection_coinbase, ownerless stratum
+        //     session whose login carried no P2PKH script -- its own comment
+        //     reads "No usable miner script: all-to-donation";
+        //   * main_dash.cpp --mine-block with no --payout-pubkey-hash
+        //     ("uint160 payout_pkh;   // default all-zero");
+        //   * main_dash.cpp embedded-oracle proposal coinbase
+        //     ("uint160 zero_pkh;   // pool-only coinbase (no finder)");
+        //   * main_dash.cpp --regtest-force-won-block
+        //     ("uint160 payout_pkh;   // all-zero placeholder finder").
+        // Paying the slice anyway emitted P2PKH(0x0000...0000) -- an output no
+        // key can ever spend. The 2% was BURNED, not credited: strictly worse
+        // than p2pool-dash, which credits ownerless work to the node operator
+        // and destroys nothing. Suppressing the output lets step 5 sweep the
+        // slice into the donation tail, which is exactly what all four call
+        // sites above already claim to do.
+        //
+        // NOT consensus-visible. Every path that MINTS or VERIFIES a share
+        // derives the finder script from the share's own m_pubkey_hash through
+        // share_producer.hpp build_gentx / share_check.hpp, never through this
+        // function; and the mint fail-closes on a non-P2PKH payout script
+        // (share_producer_bind.hpp pubkey_hash_from_p2pkh returns nullopt), so a
+        // minted share cannot carry a zero pubkey hash in the first place.
+        // compute_dash_payouts only shapes coinbases that no share commits to.
+        if (!v36 && !miner_pubkey_hash.IsNull())
+            amounts[this_script] = amounts[this_script] + (worker_payout / 50);
+
+        // 5. amounts[DONATION] += worker_payout - Σamounts  (remainder incl. rounding).
+        for (const auto& [s, a] : amounts) current_sum += a;
+        donation_remainder = (worker_payout > current_sum)
+            ? (worker_payout - current_sum) : 0;
+        amounts[donation_script] = amounts[donation_script] + donation_remainder;
     }
-    amounts[donation_script] = amounts[donation_script] + donation_remainder;
 
     // Sanity: Σ(amounts) == worker_payout (matches p2pool-dash assertion).
     {

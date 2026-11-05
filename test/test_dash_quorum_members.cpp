@@ -172,6 +172,10 @@ TEST(DashQuorumMembers, ReproducesDashdMemberSet)
         EXPECT_EQ(got.legacy_scheme, want.legacy)
             << "scheme flag mismatch at index " << i
             << " (SML nVersion plumb-through — a mixed quorum would mis-decode)";
+        // PoSe identity (sml_pose_fold.hpp): dashd punishes
+        // members[i]->proTxHash for !validMembers[i].
+        EXPECT_EQ(got.proTxHash, u256_disp(want.proReg))
+            << "proTxHash mismatch at member index " << i;
     }
 }
 

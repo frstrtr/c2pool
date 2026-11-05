@@ -502,11 +502,21 @@ private:
 // Configure the FEE-mode operator payout identity from a node-owner address.
 // This is the DGB analogue of main_ltc.cpp's operator-identity wiring
 // (set_operator_identity fed by get_node_fee_hash160): DGB has no
-// MiningInterface bridge, so the hash160 is decoded directly from the
-// operator's base58check / bech32 payout address via core::address_to_hash160.
+// MiningInterface bridge, so the operator's payout address is classified
+// against DGB's OWN registry-sourced acceptance (`acc`, from
+// dgb::address_acceptance(testnet, regtest)) via core::classify_address_for_coin.
 //
-// Returns true iff the address decoded to a 20-byte hash160 and the identity
-// was set; on empty / undecodable input it returns false and leaves the
+// Issue #1312: the chain-agnostic core::address_to_hash160 used before has no
+// DGB P2SH byte (mainnet 0x3f 'S', testnet 0x8c) in its P2SH whitelist, so an
+// S-address was typed P2PKH and the fee arm paid 76a914<h160>88ac -- a script
+// nobody holds the key for (fee burn). It also accepted any OTHER coin's
+// address. The type is now read from the classified scriptPubKey SHAPE, never
+// from a version-byte whitelist.
+//
+// Returns true iff the address is an own-coin P2PKH / P2SH address and the
+// identity was set; on empty / foreign-coin / undecodable input, or an own
+// bech32 address (a witness program has no (hash160, type) form the fallback
+// closure's script builder can reproduce), it returns false and leaves the
 // operator identity NULL (fail-safe: --redistribute fee then yields an empty
 // script, never a burn output to the all-zero hash).
 //
@@ -514,22 +524,33 @@ private:
 // mints from broken-credential submissions; it touches nothing on the
 // sharechain (validation / codec / PPLNS unchanged).
 inline bool set_operator_identity_from_address(Redistributor& redistributor,
-                                               const std::string& address)
+                                               const std::string& address,
+                                               const core::CoinAddressAcceptance& acc)
 {
     if (address.empty())
         return false;
-    std::string addr_type;
-    const std::string h160 = core::address_to_hash160(address, addr_type);
-    if (h160.size() != 40)
-        return false;  // undecodable / non-convertible (segwit v0 P2WSH, P2TR)
+    std::vector<unsigned char> script;
+    if (core::classify_address_for_coin(address, acc, script) != core::AddressCoinMatch::Own)
+        return false;  // foreign-coin / undecodable: never arm a misdirected identity
+    // Script shape -> type. Matches the fallback closure's script builder in
+    // main_dgb.cpp (0x76a914..88ac for P2PKH vs 0xa914..87 for P2SH) and the ltc
+    // operator-identity convention (2 = P2SH, 0 = P2PKH).
+    const unsigned char* h160 = nullptr;
+    uint8_t type = 0;
+    if (script.size() == 23 && script[0] == 0xa9 && script[1] == 0x14
+            && script[22] == 0x87) {
+        h160 = script.data() + 2;
+        type = 2;
+    } else if (script.size() == 25 && script[0] == 0x76 && script[1] == 0xa9
+            && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac) {
+        h160 = script.data() + 3;
+        type = 0;
+    } else {
+        return false;  // own bech32 witness program: not representable here
+    }
     uint160 op_hash;
-    for (int i = 0; i < 20; ++i)
-        op_hash.data()[i] = static_cast<uint8_t>(
-            std::stoul(h160.substr(i * 2, 2), nullptr, 16));
-    // addr_type: "p2sh" -> 2, everything else -> 0 (P2PKH). Matches the fallback
-    // closure's script builder in main_dgb.cpp (0x76a914..88ac for P2PKH vs
-    // 0xa914..87 for P2SH) and the ltc operator-identity convention.
-    redistributor.set_operator_identity(op_hash, (addr_type == "p2sh") ? 2 : 0);
+    std::memcpy(op_hash.data(), h160, 20);
+    redistributor.set_operator_identity(op_hash, type);
     return true;
 }
 

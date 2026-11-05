@@ -14,8 +14,8 @@
 //   F4  a block the node never served a template on (a missed block) resolves.
 //   F5  a seed or row the index does not hold is a counted skip, never a note.
 //   F6  the compare-only oracle's window verdict (equal / mismatch / one-sided).
-// Context blobs are not this feed's: RC-CTX's NativeCtxFeeder::serve is the one
-// server (v37_xmr_relay_native_ctx_kat N1/N2).
+// Context blobs are not this feed's: the Path B relay node serves them
+// (v37_xmr_relay_native_ctx_kat N1/N2).
 #include <c2pool/v37/xmr/relay/xmr_relay_chain_feed.hpp>
 
 #include <cstdio>

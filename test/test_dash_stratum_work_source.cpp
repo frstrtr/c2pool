@@ -18,6 +18,8 @@
 #include <impl/dash/stratum/work_source.hpp>
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (stale-payee fix)
+#include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (stale-job block height)
+#include <impl/dash/coin/block_confirm.hpp>         // resolve_status (confirm/orphan verdict)
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, be_hex_u32
 #include <impl/dash/coin/block_producer.hpp>  // coinbase_txid, compute_merkle_root, serialize_header80, target_from_nbits
 #include <impl/dash/coin/zmq_tip_notify.hpp>  // dash::coin::TipHashDedup, zmq_hashblock_frame_to_hex (ZMQ hashblock instant tip-notify)
@@ -28,6 +30,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>           // parse_cbtx (read served creditPool)
 #include <impl/dash/coin/embedded_gbt.hpp>          // encode_cbtx (GBT-xcheck fallback fixture)
 #include <impl/dash/coin/arm_resolution.hpp>       // #738 resolve_embedded_arm (run-path arm decision)
+#include <impl/dash/coin/v36_work_policy.hpp>      // resolve_v36_work_policy (DASH v36 network: work source)
 #include <impl/dash/coin/mn_state_db.hpp>         // MNState (seed a resolvable MN payee for the #996 fail-closed gate)
 
 #include <core/stratum_work_source.hpp>
@@ -43,10 +46,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -277,6 +284,38 @@ TEST(DashStratumWorkSource, WorkerRegistryRoundTrip)
     ws->unregister_stratum_worker("sess-1");
     ws->unregister_stratum_worker("sess-unknown");
     SUCCEED();
+}
+
+// The dashboard's per-connection Latency column reads WorkerInfo::rtt_ms from
+// this registry. The stratum session samples the kernel RTT at authorize
+// (into the registered WorkerInfo) and again on every accepted submit through
+// update_stratum_worker_rtt. The registry must take the fresh sample; a
+// connect-time reading (taken while many rigs connect at once) must not stick.
+TEST(DashStratumWorkSource, WorkerRttRefreshesAfterRegistration)
+{
+    Fixture fx(true);
+    auto ws = fx.make();
+    core::stratum::WorkerInfo info;
+    info.username    = "Xaddr.D14";
+    info.worker_name = "D14";
+    info.rtt_ms      = 90.4;   // sampled at authorize
+    ws->register_stratum_worker("sess-1", info);
+    ASSERT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 90.4);
+
+    ws->update_stratum_worker_rtt("sess-1", 23.1);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1)
+        << "a submit-time RTT sample replaces the connect-time one";
+
+    // The share-stats update leaves the fresh RTT alone.
+    ws->update_stratum_worker("sess-1", 1.0e9, 0.0, 16.0, 4, 0, 0);
+    EXPECT_DOUBLE_EQ(ws->get_stratum_workers().at("sess-1").rtt_ms, 23.1);
+
+    // An unknown session is dropped, never inserted.
+    ws->update_stratum_worker_rtt("sess-unknown", 5.0);
+    EXPECT_EQ(ws->get_stratum_workers().count("sess-unknown"), 0u);
+
+    ws->unregister_stratum_worker("sess-1");
+    EXPECT_TRUE(ws->get_stratum_workers().empty());
 }
 
 // The fused adapter: with an UNPOPULATED coin-state, get_work() routes to the
@@ -563,6 +602,50 @@ TEST(DashStratumWorkSource, MiningSubmitRejectsLowDifficulty)
     EXPECT_FALSE(result[0].get<bool>());
     EXPECT_EQ(result[1][0].get<int>(), 23);   // Low difficulty share
     EXPECT_FALSE(rig.fx.submit_called);
+}
+
+// The DASH registry stamps when a session's accepted counter last moved, so the
+// dashboard's share age and stalled state are exact.
+TEST(DashStratumWorkSource, UpdateStratumWorkerStampsLastAccepted)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo w;
+    w.username = "XfixtureMinerAddress";
+    rig.ws->register_stratum_worker("s", w);
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 0, 1, 0);
+    EXPECT_EQ(rig.ws->get_stratum_workers().at("s").last_accepted_at,
+              std::chrono::steady_clock::time_point{});
+    const auto before = std::chrono::steady_clock::now();
+    rig.ws->update_stratum_worker("s", 1e9, 0.0, 1.0, 3, 1, 0);
+    EXPECT_GE(rig.ws->get_stratum_workers().at("s").last_accepted_at, before);
+}
+
+// The per-session counters belong to the stratum session (update_stratum_worker
+// by session id). mining_submit must not credit another session of the same
+// address: a rig's idle failover connection would then read as hashing.
+TEST(DashStratumWorkSource, MiningSubmitLeavesSessionCountersToTheSession)
+{
+    SubmitRig rig;
+    core::stratum::WorkerInfo idle;
+    idle.username = "XfixtureMinerAddress";
+    idle.worker_name = "rig1";
+    rig.ws->register_stratum_worker("a-failover", idle);   // sorts first
+    core::stratum::WorkerInfo live = idle;
+    rig.ws->register_stratum_worker("b-hashing", live);
+
+    // A low-difficulty reject, then a share accept, from the same address.
+    rig.job.share_bits  = 0x1c00ffffu;
+    rig.job.block_nbits = "1c00ffff";
+    const uint256 hard_target = dash::coin::target_from_nbits(0x1c00ffffu);
+    auto r1 = rig.submit(rig.find_nonce([&](const uint256& pow) { return pow > hard_target; }));
+    ASSERT_TRUE(r1.is_array());
+
+    const auto w = rig.ws->get_stratum_workers();
+    EXPECT_EQ(w.at("a-failover").accepted, 0u);
+    EXPECT_EQ(w.at("a-failover").rejected, 0u)
+        << "the failover session was credited a sibling's submit";
+    EXPECT_EQ(w.at("b-hashing").rejected, 0u)
+        << "mining_submit writes no registry counters";
 }
 
 TEST(DashStratumWorkSource, MiningSubmitWonBlockAssemblesAndBroadcasts)
@@ -1629,6 +1712,205 @@ TEST(DashStratumWorkSource, WonBlockAcrossTipMoveIsSubmittedAsHeightRace)
     EXPECT_TRUE(result.get<bool>());          // the miner's work was honest
     EXPECT_TRUE(rig.fx.submit_called);        // ...and the race block IS dispatched
     EXPECT_TRUE(rig.fx.submit_height_race);   // ...flagged HeightRace -> RPC-first dispatch
+}
+
+// ── A block solved on a STALE job is recorded at the JOB's height ───────────
+//
+// 2026-10-25 18:52:21Z, private DASH v36 primary: the --bestcl-policy freshness
+// gate declined new templates for 376 s, the rigs kept the last job (prev =
+// 2561315) and solved it while the network was at 2561318. The won-block arm
+// took the height from cached_work() -- empty at that moment -- so the node
+// logged height~=0, stored the /recent_blocks row at height 0, the confirm lane
+// asked which block won height 0 and left the row pending forever, and the
+// hashrate chart drew it as a green "Block Found!" with Height "?". The reserve
+// read the height from the block's own coinbase (BIP34) and got 2561316 /
+// orphaned. These KATs pin the finder's stratum arm to the same answer.
+
+namespace {
+
+// Won-block rig: trivial block target, nonce mined in-test (as above).
+uint32_t won_nonce(SubmitRig& rig)
+{
+    rig.job.share_bits  = 0x207fffffu;
+    rig.job.block_nbits = "207fffff";
+    const uint256 block_target = dash::coin::target_from_nbits(0x207fffffu);
+    return rig.find_nonce([&](const uint256& pow) { return pow <= block_target; });
+}
+
+struct FoundCapture {
+    bool     called = false;
+    uint32_t height = 0;
+    uint64_t subsidy = 0;
+    uint256  hash;
+};
+
+void capture_found(SubmitRig& rig, FoundCapture& out)
+{
+    rig.ws->set_on_found_block_fn(
+        [&out](uint32_t height, const uint256& block_hash, const std::string&,
+               bool, uint64_t subsidy) {
+            out.called  = true;
+            out.height  = height;
+            out.subsidy = subsidy;
+            out.hash    = block_hash;
+        });
+}
+
+}  // namespace
+
+// The job's height and subsidy, not the cache's, when the cached template has
+// moved on to the next height between job issue and the solve.
+TEST(DashStratumWorkSource, WonBlockOnMovedTemplateRecordsTheJobsHeight)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+    FoundCapture found;
+    capture_found(rig, found);
+
+    rig.fx.fallback_work = rotated_work();      // cache moves to h=424243
+    rig.fx.fallback_work.m_coinbase_value = kCoinbaseValue + 5555;
+    rig.ws->bump_work_generation();
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u)
+        << "the broadcaster must be told the block's own height, not the cache's";
+    ASSERT_TRUE(found.called);
+    EXPECT_EQ(found.height, 424242u)
+        << "the dashboard record must carry the job's height (cache is at 424243)";
+    EXPECT_EQ(found.subsidy, kCoinbaseValue)
+        << "the record must carry the job's frozen subsidy, not the cache's";
+    EXPECT_EQ(found.hash, rig.pow_for(nonce));
+}
+
+// The incident shape: nothing cached at all when the solve arrives (the serve
+// gate declining, a set-gap). Before the fix the height was 0.
+TEST(DashStratumWorkSource, WonBlockOnEmptyCacheRecordsTheJobsHeight)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+    FoundCapture found;
+    capture_found(rig, found);
+
+    rig.fx.fallback_work = dash::coin::DashWorkData{};   // set-gap: no template
+    rig.ws->invalidate_template_cache("kat: serve gate declining");
+    ASSERT_TRUE(rig.ws->get_current_work_template().empty())
+        << "precondition: the cache must be empty when the solve arrives";
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    EXPECT_TRUE(result.get<bool>());
+    ASSERT_TRUE(rig.fx.submit_called);
+    EXPECT_EQ(rig.fx.submit_height, 424242u);
+    ASSERT_TRUE(found.called);
+    EXPECT_EQ(found.height, 424242u) << "an empty cache must not record height 0";
+    EXPECT_EQ(found.subsidy, kCoinbaseValue);
+}
+
+// End to end, the way main_dash wires it: the stale-job block lands in
+// /recent_blocks at its real height, the confirm/orphan lane (the daemonless
+// resolve_status verdict main_dash arms) sees a different block on the best
+// chain at that height and flips the row to orphaned, and the row the
+// dashboard's hashrate chart reads carries that height and status.
+TEST(DashStratumWorkSource, StaleJobBlockResolvesOrphanedOnTheDashboard)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const uint32_t nonce = won_nonce(rig);
+
+    core::MiningInterface mi(/*testnet=*/false, nullptr,
+                             c2pool::address::Blockchain::DASH);
+    mi.set_pool_hashrate_fn([]() { return 4294967296.0; });
+    // An earlier block of ours, so the stale one is not the pool's first.
+    uint256 earlier;
+    earlier.SetHex("00000000000000aa000000000000000000000000000000000000000000000001");
+    mi.record_found_block(424100, earlier, 1751000000u, "DASH", "XfixtureMinerAddress",
+                          earlier.GetHex(), 1.0, 0.0, 0.0, kCoinbaseValue,
+                          core::MiningInterface::BlockAuthorship::this_node);
+
+    rig.ws->set_on_found_block_fn(
+        [&mi](uint32_t height, const uint256& block_hash, const std::string& miner,
+              bool, uint64_t subsidy) {
+            mi.record_found_block(height, block_hash, 1751000600u, "DASH", miner,
+                                  block_hash.GetHex(), 1.0, 0.0, 0.0, subsidy,
+                                  core::MiningInterface::BlockAuthorship::this_node);
+        });
+
+    rig.fx.fallback_work = dash::coin::DashWorkData{};   // the incident: no template
+    rig.ws->invalidate_template_cache("kat: serve gate declining");
+
+    auto result = rig.submit(nonce);
+    ASSERT_TRUE(result.is_boolean());
+    ASSERT_TRUE(result.get<bool>());
+    const uint256 ours = rig.pow_for(nonce);
+
+    // The network moved on: a competitor holds 424242 and the tip is 424245.
+    uint256 competitor;
+    competitor.SetHex("00000000000000bb000000000000000000000000000000000000000000000002");
+    std::map<uint32_t, uint256> best = {{424242u, competitor}};
+    const uint32_t tip = 424245u;
+    mi.set_block_verify_fn([&mi, &best, tip](const std::string& hash_hex) -> int {
+        uint256 h; h.SetHex(hash_hex);
+        uint32_t found_height = 0;
+        for (const auto& b : mi.get_found_blocks())
+            if (b.hash == hash_hex) { found_height = static_cast<uint32_t>(b.height); break; }
+        return dash::coin::block_confirm::resolve_status(
+            [&best](uint32_t hh) -> std::optional<uint256> {
+                auto it = best.find(hh);
+                if (it == best.end()) return std::nullopt;
+                return it->second;
+            },
+            tip, h, found_height);
+    });
+    EXPECT_LT(mi.run_block_verification_now(ours.GetHex()), 0)
+        << "a block replaced at its height must resolve orphaned, not stay pending";
+
+    nlohmann::json row;
+    for (const auto& b : mi.rest_recent_blocks())
+        if (b.value("hash", "") == ours.GetHex()) row = b;
+    ASSERT_TRUE(row.is_object()) << "the stale-job block must be in /recent_blocks";
+    EXPECT_EQ(row["height"].get<uint64_t>(), 424242u);
+    EXPECT_EQ(row["number"].get<uint64_t>(), 424242u);
+    EXPECT_EQ(row["status"].get<std::string>(), "orphaned");
+    EXPECT_EQ(row["subsidy"].get<uint64_t>(), kCoinbaseValue);
+    EXPECT_NE(row["luck_method"].get<std::string>(), "first_block");
+    // Newest first by height: the stale block heads the list the table shows.
+    EXPECT_EQ(mi.rest_recent_blocks()[0].value("hash", ""), ours.GetHex());
+}
+
+// The pure derivation behind the three KATs above.
+TEST(DashWonBlockRecord, HeightComesFromTheCoinbaseBip34Push)
+{
+    SubmitRig rig;                              // job cut at h=424242
+    const auto coinbase = reassemble(rig.job.coinb1, rig.en1, rig.en2, rig.job.coinb2);
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(coinbase), 424242u);
+
+    // A mainnet-scale height round-trips through the real coinbase builder.
+    Fixture fx(true);
+    fx.fallback_work.m_height = 2561316u;
+    auto ws = fx.make();
+    auto cbr = ws->build_connection_coinbase(uint256::ZERO, "00000000",
+                                             fixture_miner_script(), {});
+    ASSERT_FALSE(cbr.coinb1.empty());
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(
+                  reassemble(cbr.coinb1, "00000000", "00000000", cbr.coinb2)),
+              2561316u);
+
+    // The cache is consulted only when it IS the job's template.
+    const auto moved = rotated_work();
+    const auto same  = rich_work();
+    EXPECT_EQ(dash::stratum::won_block_height(coinbase, kPrevHashHex, &moved), 424242u);
+    EXPECT_EQ(dash::stratum::won_block_height(coinbase, kPrevHashHex, nullptr), 424242u);
+    const std::vector<unsigned char> garbage = {0x01, 0x02, 0x03};
+    EXPECT_EQ(dash::stratum::coinbase_bip34_height(garbage), 0u);
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, &same), 424242u);
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, &moved), 0u)
+        << "another height's template must never stand in for the job's";
+    EXPECT_EQ(dash::stratum::won_block_height(garbage, kPrevHashHex, nullptr), 0u);
+    EXPECT_TRUE(dash::stratum::template_is_jobs(&same, kPrevHashHex));
+    EXPECT_FALSE(dash::stratum::template_is_jobs(&moved, kPrevHashHex));
+    EXPECT_FALSE(dash::stratum::template_is_jobs(nullptr, kPrevHashHex));
 }
 
 // ── Dashboard stats seam (issue: /local_stats hashrate under-reported) ───────
@@ -4099,4 +4381,202 @@ TEST(DashStratumSpliceGuards, DropAlarmKeysOnPresenceNotOnTheCauseString)
             << "the served pin's 50000 sat was added to the loss: "
             << w.m_pin_drop_alarm;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Where the DASH v36 network takes its mining work from.
+//
+// A v36 share commits the template's txs through the coinbase merkle_link and
+// the finder assembles the won block from the bodies it served. With a dashd
+// RPC arm the work comes from dashd getblocktemplate only; without one the
+// embedded (daemonless) arm serves it when eligible; with neither there is no
+// mining work at all. The public profile is unchanged.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST(DashV36WorkPolicy, ResolveV36WorkPolicy)
+{
+    using dash::coin::resolve_v36_work_policy;
+    for (bool rpc : {false, true}) {
+        for (bool emb : {false, true}) {
+            const auto pub = resolve_v36_work_policy(/*v36_network=*/false, rpc, emb);
+            EXPECT_FALSE(pub.dashd_templates_only)
+                << "public profile unchanged (rpc=" << rpc << " emb=" << emb << ")";
+            EXPECT_TRUE(pub.serve_stratum);
+            EXPECT_STREQ(pub.reason, "public-profile");
+        }
+    }
+    for (bool emb : {false, true}) {
+        const auto with_rpc = resolve_v36_work_policy(true, true, emb);
+        EXPECT_TRUE(with_rpc.dashd_templates_only) << "dashd RPC armed wins (emb=" << emb << ")";
+        EXPECT_TRUE(with_rpc.serve_stratum);
+        EXPECT_STREQ(with_rpc.reason, "v36-network-dashd-templates");
+    }
+    const auto embedded = resolve_v36_work_policy(true, false, true);
+    EXPECT_FALSE(embedded.dashd_templates_only)
+        << "no dashd RPC arm, embedded arm eligible -> embedded templates on the v36 network";
+    EXPECT_TRUE(embedded.serve_stratum);
+    EXPECT_STREQ(embedded.reason, "v36-network-embedded-templates");
+    const auto none = resolve_v36_work_policy(true, false, false);
+    EXPECT_TRUE(none.dashd_templates_only);
+    EXPECT_FALSE(none.serve_stratum) << "no work source -> no mining work on the v36 network";
+    EXPECT_STREQ(none.reason, "v36-network-requires-coin-rpc");
+}
+
+// Testnet with a populated, viable coin-state serves the EMBEDDED template
+// (DashStratumC1MainnetGate.TestnetPopulatedCoinStateServesEmbedded). With
+// set_dashd_templates_only(true) the same work source serves dashd's template
+// -- its transactions and merkle branches -- and names the policy as the
+// decline cause.
+TEST(DashV36WorkPolicy, DashdTemplatesOnlyDeclinesEmbeddedArm)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto fallback = []() -> dash::coin::DashWorkData { return rich_work(); };
+    auto submit   = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+    dash::stratum::DASHWorkSource ws(cs, fallback, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    EXPECT_FALSE(ws.dashd_templates_only()) << "default OFF";
+    ws.set_dashd_templates_only(true);
+    ASSERT_TRUE(ws.dashd_templates_only());
+
+    auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty());
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), std::string(kPrevHashHex))
+        << "dashd's template, not the embedded one";
+    EXPECT_EQ(tmpl.value("height", 0u), 424242u);
+    EXPECT_EQ(ws.get_stratum_merkle_branches().size(), 2u)
+        << "the dashd template's two transactions reach the miner's merkle branches";
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    const auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::DashdFallback);
+    EXPECT_EQ(gw.work.m_height, 424242u);
+    EXPECT_EQ(gw.work.m_tx_hashes.size(), 2u);
+
+    const auto st = ws.embedded_arm_status_json();
+    EXPECT_EQ(st.value("arm", ""), "dashd-fallback");
+    EXPECT_EQ(st.value("no_work_reason", ""), "dashd-templates-only");
+    EXPECT_EQ(st.value("no_work_value", ""), "v36-network");
+    EXPECT_EQ(st.value("no_work_threshold", ""), "--coin-rpc");
+
+    // The same work source with the policy OFF (the public profile) serves the
+    // embedded template exactly as before.
+    dash::stratum::DASHWorkSource pub(cs, fallback, submit,
+                                      core::stratum::StratumConfig{},
+                                      /*is_testnet=*/true);
+    const auto pt = pub.get_current_work_template();
+    ASSERT_FALSE(pt.empty());
+    EXPECT_NE(pt.value("previousblockhash", ""), std::string(kPrevHashHex));
+    EXPECT_EQ(pub.get_work(job_in).source, dash::coin::WorkSource::Embedded);
+}
+
+// The daemonless v36 node: no dashd RPC arm, so the fallback is the unarmed
+// empty DashWorkData (main_dash.cpp binds no GBT fetch without --coin-rpc).
+// With the embedded arm eligible the policy leaves set_dashd_templates_only
+// OFF, so the work source serves the embedded template and freezes its bodies
+// for the v36 finder. With the arm ineligible the policy turns the flag ON and
+// the same work source has no work at all (stratum is not started).
+TEST(DashV36WorkPolicy, EmbeddedArmServesV36WithoutDashd)
+{
+    dash::coin::NodeCoinState cs;
+    seed_populated(cs);
+    ASSERT_TRUE(cs.populated());
+    ASSERT_TRUE(cs.make_embedded_work_inputs().viable());
+
+    auto unarmed = []() -> dash::coin::DashWorkData { return dash::coin::DashWorkData{}; };
+    auto submit  = [](const std::vector<unsigned char>&, uint32_t, bool) { return true; };
+
+    dash::stratum::WorkJobTargetInputs job_in;
+    job_in.sane_target_min.SetHex(
+        "0000000000000000000000000000000000000000000000000000000000000001");
+    job_in.sane_target_max.SetHex(
+        "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+    job_in.share_info_bits_target.SetHex(
+        "0000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+    const auto pol = dash::coin::resolve_v36_work_policy(/*v36_network=*/true,
+                                                         /*rpc_armed=*/false,
+                                                         /*embedded_eligible=*/true);
+    ASSERT_TRUE(pol.serve_stratum);
+    dash::stratum::DASHWorkSource ws(cs, unarmed, submit,
+                                     core::stratum::StratumConfig{},
+                                     /*is_testnet=*/true);
+    ws.set_dashd_templates_only(pol.dashd_templates_only);
+    EXPECT_FALSE(ws.dashd_templates_only());
+
+    uint256 emb_prev;
+    emb_prev.SetHex(kEmbeddedPrevHashHex);
+    const auto tmpl = ws.get_current_work_template();
+    ASSERT_FALSE(tmpl.empty()) << "the v36 network serves the embedded template without dashd";
+    EXPECT_EQ(tmpl.value("previousblockhash", ""), emb_prev.GetHex());
+    EXPECT_EQ(tmpl.value("height", 0u), kEmbeddedPrevHeight + 1u);
+
+    const auto gw = ws.get_work(job_in);
+    EXPECT_EQ(gw.source, dash::coin::WorkSource::Embedded);
+    // The seeded coin-state has no mempool and no pins: a coinbase-only
+    // template, which the v36 finder frames as [gentx]. That every served tx
+    // carries its own body is pinned by
+    // DashEmbeddedGbt.EveryTemplateTxCarriesItsOwnBody.
+    EXPECT_TRUE(gw.work.m_tx_hashes.empty());
+    EXPECT_TRUE(gw.work.m_tx_data_hex.empty());
+
+    auto cb = ws.build_connection_coinbase(uint256::ZERO, "deadbeef",
+                                           fixture_miner_script(), {});
+    EXPECT_FALSE(cb.coinb1.empty()) << "a miner gets a coinbase to work on";
+
+    // No work source at all: the policy turns the flag ON, nothing is served.
+    const auto none = dash::coin::resolve_v36_work_policy(true, false, false);
+    ASSERT_FALSE(none.serve_stratum);
+    dash::stratum::DASHWorkSource ws_none(cs, unarmed, submit,
+                                          core::stratum::StratumConfig{},
+                                          /*is_testnet=*/true);
+    ws_none.set_dashd_templates_only(none.dashd_templates_only);
+    EXPECT_TRUE(ws_none.get_current_work_template().empty())
+        << "dashd-templates-only with no dashd arm serves no template";
+}
+
+// main_dash.cpp binds its own core::StratumServer (the dashboard WebServer's
+// acceptor is disabled), so it must wire every stratum seam WebServer::
+// start_stratum wires for LTC. Without set_local_rates_fn the local-hashrate
+// history graph falls back to the per-session estimate, which freezes for
+// sessions that stay connected but stop submitting (a backup pool) instead of
+// decaying with the RateMonitor window.
+TEST(DashStratumDashboardSeams, MainDashWiresLocalRatesFromItsStratumServer)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string src = buf.str();
+    // Drop /* */ and // comments so a quoted expression in a doc block cannot
+    // satisfy it.
+    for (auto b = src.find("/*"); b != std::string::npos; b = src.find("/*", b)) {
+        const auto e = src.find("*/", b + 2);
+        src.erase(b, e == std::string::npos ? std::string::npos : e + 2 - b);
+    }
+    std::string code;
+    std::istringstream lines(src);
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    const auto hashrate_seam = code.find("mi->set_stratum_hashrate_fn(");
+    ASSERT_NE(hashrate_seam, std::string::npos);
+    const auto local_seam = code.find("mi->set_local_rates_fn(", hashrate_seam);
+    ASSERT_NE(local_seam, std::string::npos)
+        << "main_dash.cpp must feed the local-hashrate graph from its StratumServer";
+    const auto getter = code.find("ss->get_local_rates()", local_seam);
+    ASSERT_NE(getter, std::string::npos);
+    EXPECT_LT(getter - local_seam, 200u) << "the seam is fed by this StratumServer";
+    EXPECT_LT(local_seam - hashrate_seam, 2000u)
+        << "wired in the same block as the other stratum dashboard seams";
 }

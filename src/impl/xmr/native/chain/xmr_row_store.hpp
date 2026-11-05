@@ -194,6 +194,17 @@ public:
         pre_begin_  = rows.size() ? end_height + 1 - rows.size() : end_height + 1;
     }
 
+    // A seeded pre-window row (at or below the seed height), or nullopt.
+    std::optional<DifficultyRow> pre_window_row(std::uint64_t h) const {
+        if (pre_window_.empty() || h < pre_begin_ || h > pre_end_) return std::nullopt;
+        return pre_window_[static_cast<std::size_t>(h - pre_begin_)];
+    }
+    // The lowest row height held, or nullopt when no row is held.
+    std::optional<std::uint64_t> lowest_height() const noexcept {
+        if (rows_.empty()) return std::nullopt;
+        return rows_.front().row.height;
+    }
+
     // The height of the first block this store can speak for: the start of the
     // seeded pre-window when there is one, and otherwise the oldest row it
     // retains. Zero means we hold the chain from its very first block, so there

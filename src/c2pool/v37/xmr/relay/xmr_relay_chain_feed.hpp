@@ -24,9 +24,9 @@
 // (it counts, it never decides).
 //
 // Receipt CONTEXT (the block blob behind our own wants and a peer's
-// FB_GETCTX) is NOT served here: RC-CTX's NativeCtxFeeder::serve
-// (xmr_relay_native_ctx.hpp) is the one place that serves it, from the
-// native node's retained bodies and held alternatives.
+// FB_GETCTX) is NOT served here: the Path B relay node's FB_GETCTX service
+// (pathb_relay_node.hpp) serves it, from the native node's retained bodies
+// and held alternatives.
 //
 // Differences from the daemon arm, all additive (a note is idempotent):
 //   * it re-ingests on a tip-ID change, not only on a best-HEIGHT change, so a

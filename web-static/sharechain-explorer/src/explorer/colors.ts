@@ -103,6 +103,29 @@ export function getColor(
   }
 }
 
+/** Block-solution cell look: a dark core with a bright ring and a centre
+ *  pip, so a block differs from every share colour in fill and shape, not
+ *  hue alone (a thin gold outline on a bright green cell was nearly
+ *  invisible; a gold fill would read as an orphan). */
+export interface BlockCellStyle {
+  color: string;
+  stroke: { color: string; lineWidth: number };
+  blockMark: string;
+}
+
+export function blockCellStyle(isPrimary: boolean, isChild: boolean): BlockCellStyle | undefined {
+  if (isPrimary && isChild) {
+    return { color: '#1d0e00', stroke: { color: '#ffaa00', lineWidth: 2 }, blockMark: '#ffaa00' };
+  }
+  if (isPrimary) {
+    return { color: '#1a1400', stroke: { color: '#ffd700', lineWidth: 2 }, blockMark: '#ffd700' };
+  }
+  if (isChild) {
+    return { color: '#001a1d', stroke: { color: '#00e5ff', lineWidth: 2 }, blockMark: '#00e5ff' };
+  }
+  return undefined;
+}
+
 export const ColorsPlugin: PluginDescriptor = {
   id: 'explorer.colors',
   version: '1.0.0',

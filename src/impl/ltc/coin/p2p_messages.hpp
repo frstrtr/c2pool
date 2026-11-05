@@ -60,6 +60,9 @@ BEGIN_MESSAGE(tx)
     {
         READWRITE(TX_WITH_WITNESS(obj.m_tx));
     }
+    // A tx message is exactly one transaction (MWEB part included): bytes
+    // left over mean a mis-parse, and the message is dropped.
+    static constexpr bool k_strict_framing = true;
 END_MESSAGE()
 
 BEGIN_MESSAGE(block)

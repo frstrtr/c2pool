@@ -24,6 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <core/durable_file.hpp>   // rename_over: replaces the target on Windows too
 #include <impl/dash/coin/serve_gate_ledger.hpp>
 
 namespace dash {
@@ -147,7 +148,7 @@ inline bool serve_gate_ledger_save(const std::string& path,
         if (!os) return false;
     }
     // Best-effort durability: rename is atomic on the same filesystem.
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!core::durable_file::rename_over(tmp, path)) {
         std::remove(tmp.c_str());
         return false;
     }

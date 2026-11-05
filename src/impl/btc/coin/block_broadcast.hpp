@@ -36,9 +36,10 @@ inline bool broadcast_block_with_fallback(
 // CONNECT-AUTHORITATIVE broadcast (BTC lane ONLY). Distinct policy from the
 // cross-coin FALLBACK orchestration above: a P2P relay "success" only means
 // the block was ANNOUNCED to a peer (a cmpctblock header). Under compact-block
-// relay the daemon then requests the body via getblocktxn, which the c2pool
-// broadcaster does NOT serve, so the daemon never ConnectBlock()s the block and
-// the full subsidy is silently lost even though relay_p2p() returned true. The
+// relay the daemon then asks for the missing txs via getblocktxn, which the
+// P2P node answers only for the last cmpctblock it sent on that connection; if
+// that fails the daemon never ConnectBlock()s the block and the full subsidy
+// is silently lost even though relay_p2p() returned true. The
 // submitblock RPC, by contrast, delivers the FULL block and is therefore
 // connect-authoritative. So the connect path ALWAYS fires the RPC leg, in
 // ADDITION to the P2P relay (kept for best-effort fast propagation). Returns

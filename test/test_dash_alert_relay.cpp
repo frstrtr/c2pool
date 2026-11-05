@@ -13,11 +13,14 @@
 #include <impl/dash/messages.hpp>
 
 #include <core/timer.hpp>
+#include <core/hashing_elsewhere.hpp>
+#include <core/web_server.hpp>   // MiningInterface session states (failback agreement KAT)
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <deque>
 #include <filesystem>
@@ -27,11 +30,16 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <variant>
 #include <vector>
 
 #include <thread>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <random>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -362,7 +370,7 @@ TEST(DashAlertRelay, BodyCodecRejectsGarbageAndClips)
     junk.push_back(0);
     EXPECT_FALSE(decode_body(junk)) << "trailing bytes are rejected";
     Bytes bad_kind = encode_body(sample_body());
-    bad_kind[0] = 9;
+    bad_kind[0] = kMaxKind + 1;   // past the last kind this build decodes
     EXPECT_FALSE(decode_body(bad_kind));
     EXPECT_FALSE(decode_body(Bytes{1, 2}));
 }
@@ -821,11 +829,11 @@ TEST(DashAlertDetector, BackOnlineOnlyAfterEmittedOfflineAndDwell)
     auto c = det_cfg();
     c.startup_grace = 0;
     AlertDetector d(c, T0);
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     // short blip: back before offline fired -> no events at all
     d.tick({}, T0 + 10);
-    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 0), T0 + 100).empty());
-    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 0), T0 + 400).empty()) << "no back_online without an offline";
+    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 1), T0 + 100).empty());
+    EXPECT_TRUE(d.tick(one("A.rig1", "s2", 1), T0 + 400).empty()) << "no back_online without an offline";
     // real outage
     d.tick({}, T0 + 410);
     ASSERT_EQ(d.tick({}, T0 + 710).size(), 1u);
@@ -840,7 +848,7 @@ TEST(DashAlertDetector, StartupGraceAndRestoredWorkers)
 {
     auto c = det_cfg();
     AlertDetector d(c, T0);   // grace 600
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     d.tick({}, T0 + 10);
     EXPECT_TRUE(d.tick({}, T0 + 400).empty()) << "inside the startup grace";
     auto ev = d.tick({}, T0 + 600);
@@ -857,8 +865,8 @@ TEST(DashAlertDetector, StartupGraceAndRestoredWorkers)
     ASSERT_EQ(ev2.size(), 1u);
     EXPECT_EQ(ev2[0].worker, "B.rig2") << "A.rig1 was already alerted before the restart";
     // A.rig1 reconnects after the restart -> its outstanding offline pairs with a back_online
-    d2.tick(one("A.rig1", "x", 0), T0 + 1700);
-    auto ev3 = d2.tick(one("A.rig1", "x", 0), T0 + 1760);
+    d2.tick(one("A.rig1", "x", 1), T0 + 1700);
+    auto ev3 = d2.tick(one("A.rig1", "x", 1), T0 + 1760);
     ASSERT_EQ(ev3.size(), 1u);
     EXPECT_EQ(ev3[0].kind, Kind::BackOnline);
 }
@@ -890,7 +898,7 @@ TEST(DashAlertDetector, MinIntervalThrottlesFlaps)
     // flap: 70 s down / 30 s up, for 20 minutes
     for (int64_t t = T0; t < T0 + 1200; t += 10) {
         const bool up = ((t - T0) % 100) >= 70;
-        auto ev = d.tick(up ? one("A.rig1", "s" + std::to_string(sid), 0) : std::vector<WorkerSample>{}, t);
+        auto ev = d.tick(up ? one("A.rig1", "s" + std::to_string(sid), 1) : std::vector<WorkerSample>{}, t);
         if (!up) ++sid;
         for (auto& e : ev) (e.kind == Kind::Offline ? offlines : backs)++;
     }
@@ -932,7 +940,7 @@ TEST(DashAlertDetector, HourlyCapProducesOneDigestAndHoldsTheRest)
     c.max_per_hour = 30;
     AlertDetector d(c, T0);
     std::vector<WorkerSample> all;
-    for (int i = 0; i < 40; ++i) all.push_back({"A.rig" + std::to_string(i), "s" + std::to_string(i), 0});
+    for (int i = 0; i < 40; ++i) all.push_back({"A.rig" + std::to_string(i), "s" + std::to_string(i), 1});
     d.tick(all, T0);
     d.tick({}, T0 + 10);
     auto ev = d.tick({}, T0 + 310);
@@ -944,6 +952,428 @@ TEST(DashAlertDetector, HourlyCapProducesOneDigestAndHoldsTheRest)
     EXPECT_TRUE(d.tick({}, T0 + 600).empty()) << "no digest storm while saturated";
     auto later = d.tick({}, T0 + 310 + 3600);
     EXPECT_EQ(later.size(), 10u) << "held events fire when the window frees";
+}
+
+// ── (10b) standby / failover connections (all nodes are peers) ──────────────
+// A rig keeps a failover connection to a node it does not mine on. Such a
+// STANDBY connection never shares; it must never page, on connect, flap,
+// disconnect or after a restart.
+TEST(DashAlertDetector, FailoverSessionNeverPages)
+{
+    for (int64_t stall : {int64_t{900}, int64_t{120}}) {
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        c.stall_after = stall;
+        AlertDetector d(c, T0);
+        int sid = 0;
+        for (int64_t t = T0; t < T0 + 4 * 3600; t += 30) {
+            // connected for 50 min, then flapping (the D9 no-notify watchdog)
+            const bool connected = t < T0 + 3000 || ((t - T0) % 120) < 60;
+            if (!connected) ++sid;
+            EXPECT_TRUE(d.tick(connected ? one("A.rig1", "s" + std::to_string(sid), 0)
+                                         : std::vector<WorkerSample>{}, t).empty())
+                << "stall_after=" << stall << " t=" << t - T0;
+        }
+        EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+        EXPECT_FALSE(d.persist().contains("A.rig1"))
+            << "a standby-only worker would be paged as 'not reconnected' after a restart";
+    }
+}
+
+// stall_after 0 turns every share check off: presence only, so a connection
+// is up and its disconnect pages (the documented meaning of 0, unchanged).
+TEST(DashAlertDetector, StallOffIsPresenceOnly)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    c.stall_after = 0;
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 0), T0);
+    EXPECT_TRUE(d.workers().at("A.rig1").up);
+    d.tick({}, T0 + 10);
+    auto ev = d.tick({}, T0 + 310);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+}
+
+TEST(DashAlertDetector, FirstShareMakesUpAndAHashedWorkerPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 0), T0);                  // standby
+    EXPECT_FALSE(d.workers().at("A.rig1").up);
+    d.tick(one("A.rig1", "s1", 1), T0 + 600);            // pool #1 died: first share here
+    EXPECT_TRUE(d.workers().at("A.rig1").up);
+    EXPECT_TRUE(d.persist().contains("A.rig1"));
+    d.tick({}, T0 + 700);                                // the rig dies
+    auto ev = d.tick({}, T0 + 1000);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+    EXPECT_NE(ev[0].detail.find("disconnected"), std::string::npos);
+}
+
+namespace {
+// A hashing rig on this node that stops sharing at T0+100 and keeps its TCP
+// connection open (the failback shape and the hung-rig shape look the same
+// locally). Ticks every 30 s over [from, until]; returns every event.
+std::vector<DetectorEvent> stall_after_hashing(AlertDetector& d, int64_t from, int64_t until,
+                                               const std::string& key = "A.rig1")
+{
+    std::vector<DetectorEvent> all;
+    for (int64_t t = from; t <= until; t += 30) {
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one(key, "s1", acc), t)) all.push_back(e);
+    }
+    return all;
+}
+} // namespace
+
+TEST(DashAlertDetector, FailbackWithSharechainActivityDoesNotPage)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    // The address keeps getting sharechain shares (minted on the other node).
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        EXPECT_EQ(addr, "A");
+        return now_seen - 20;
+    });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 4 * 3600; t += 30) {
+        now_seen = t;
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one("A.rig1", "s1", acc), t)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+    EXPECT_FALSE(d.persist().contains("A.rig1"));
+    // The standby connection then drops: still no page from this node.
+    for (int64_t t = T0 + 4 * 3600 + 30; t <= T0 + 5 * 3600; t += 30) {
+        now_seen = t;
+        EXPECT_TRUE(d.tick({}, t).empty());
+    }
+}
+
+// A small miner's other-node shares are sparse: one share well inside the
+// stall window still proves the rig mines elsewhere (the margin is measured
+// from the rig's last share HERE, not from the stall detection).
+TEST(DashAlertDetector, SparseOtherNodeShareStillCountsAsReturned)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> {
+        return now_seen >= T0 + 500 ? T0 + 500 : 0;   // one share on the other node
+    });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 1380; t += 30) {
+        now_seen = t;
+        const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        for (auto& e : d.tick(one("A.rig1", "s1", acc), t)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.status_json(T0)["workers"]["A.rig1"]["standby"].get<bool>());
+}
+
+// After RETURNED, a standby reconnect is not "up" on the strength of the old
+// evidence (no false BACK_ONLINE, no re-arm without a share).
+TEST(DashAlertDetector, ReturnedWorkerReconnectingAsStandbyStaysStandby)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen - 20; });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 3000; t += 30) {
+        now_seen = t;
+        std::vector<WorkerSample> smp;
+        if (t <= T0 + 90) smp = one("A.rig1", "s1", static_cast<uint64_t>(1 + (t - T0) / 30));
+        else if (t >= T0 + 450) smp = one("A.rig1", "s2", 0);   // standby reconnect
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+        if (t == T0 + 420) {
+            ASSERT_FALSE(d.workers().at("A.rig1").ever_up) << "returned at the first eligible tick";
+        }
+        if (t == T0 + 480) {
+            ASSERT_FALSE(d.workers().at("A.rig1").up) << "a standby reconnect is not up on old evidence";
+        }
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_FALSE(d.workers().at("A.rig1").up);
+    EXPECT_FALSE(d.persist().contains("A.rig1"));
+}
+
+TEST(DashAlertDetector, HungRigWhoseAddressWentDarkPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    // The newest share for the address is the rig's own last one, here.
+    d.set_address_activity([](const std::string&) -> std::optional<int64_t> { return T0 + 100; });
+    auto ev = stall_after_hashing(d, T0, T0 + 100 + c.stall_after + c.offline_after + 60);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::Offline);
+    EXPECT_NE(ev[0].detail.find("no accepted shares"), std::string::npos);
+}
+
+TEST(DashAlertDetector, SiblingHashingHereStillPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    int64_t now_seen = 0;
+    // Fresh shares for the address -- but a sibling rig of the same address
+    // hashes on THIS node, so they prove nothing about rig1.
+    d.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen; });
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 1500; t += 30) {
+        now_seen = t;
+        const uint64_t acc1 = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 30) : 4;
+        std::vector<WorkerSample> smp{{"A.rig1", "s1", acc1},
+                                      {"A.rig2", "s2", static_cast<uint64_t>(1 + (t - T0) / 30)}};
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+    }
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].worker, "A.rig1");
+}
+
+TEST(DashAlertDetector, UnreadableChainDefersThenPages)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    AlertDetector d(c, T0);
+    d.set_address_activity([](const std::string&) -> std::optional<int64_t> { return std::nullopt; });
+    const int64_t due = T0 + 100 + c.stall_after + c.offline_after;   // first OFFLINE-eligible tick
+    auto early = stall_after_hashing(d, T0, due + 60);
+    EXPECT_TRUE(early.empty()) << "waits for the chain";
+    auto late = stall_after_hashing(d, due + 90, due + c.returned_defer_max + 60);
+    ASSERT_EQ(late.size(), 1u) << "never waits forever";
+    EXPECT_EQ(late[0].kind, Kind::Offline);
+}
+
+TEST(DashAlertDetector, RestoredWorkerMiningElsewhereIsNotPaged)
+{
+    auto c = det_cfg();
+    AlertDetector d(c, T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
+    auto snap = d.persist();
+    ASSERT_TRUE(snap.contains("A.rig1"));
+    // Restart; the rig keeps only a standby connection here and mines elsewhere.
+    AlertDetector d2(c, T0 + 1000);
+    d2.restore(snap);
+    int64_t now_seen = 0;
+    d2.set_address_activity([&](const std::string&) -> std::optional<int64_t> { return now_seen - 15; });
+    for (int64_t t = T0 + 1000; t <= T0 + 1000 + 3600; t += 30) {
+        now_seen = t;
+        EXPECT_TRUE(d2.tick(one("A.rig1", "x", 0), t).empty());
+    }
+    // Without that activity, the same restored worker pages, naming the cause.
+    AlertDetector d3(c, T0 + 1000);
+    d3.restore(snap);
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0 + 1000; t <= T0 + 1000 + 1200 && ev.empty(); t += 30)
+        ev = d3.tick(one("A.rig1", "x", 0), t);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_NE(ev[0].detail.find("connected, no accepted share since node restart"), std::string::npos)
+        << ev[0].detail;
+}
+
+// ── (10c) failback: the pager and the dashboard agree ──────────────────────
+// The 2026-10-25 reserve incident, replayed at the alert tick's 5 s cadence.
+// The node restarts (T0); 25 rigs hold failover connections; their primary
+// restarts and they hash here for two minutes inside the startup grace, then
+// fail back. The primary keeps minting shares for their address (except
+// during its restart). Nothing pages, and every rig is standby from the tick
+// it goes down -- the moment its dashboard session goes silent -- not 300 s
+// later at the OFFLINE timer, so a node-level check that counts hashing
+// sessions never counts a rig that hashes elsewhere.
+//
+// FAIL WITHOUT THE FIX: RETURNED was checked only when the OFFLINE fell due,
+// so at the stall the rigs still counted as having hashed here (ever_up).
+TEST(DashAlertDetector, FailbackIsStandbyFromTheStallAndNeverPages)
+{
+    auto c = det_cfg();   // grace 600, stall 900, offline 300
+    AlertDetector d(c, T0);
+    const int64_t hash_from = T0 + 270, hash_until = T0 + 390;
+    const int64_t primary_down_from = T0 + 240, primary_down_until = T0 + 400;
+    int64_t now_seen = T0;
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        EXPECT_EQ(addr, "XoZc");
+        if (now_seen >= primary_down_from && now_seen < primary_down_until)
+            return primary_down_from - 20;   // the primary is restarting
+        return now_seen - 20;
+    });
+    // Rig i stops 0, 5 or 10 s before the last one.
+    auto last_share = [&](int i) { return hash_until - 5 * (i % 3); };
+    const int64_t last_down = hash_until + c.stall_after;   // the last rig stalls
+    std::vector<DetectorEvent> ev;
+    for (int64_t t = T0; t <= T0 + 4 * 3600; t += 5) {
+        now_seen = t;
+        std::vector<WorkerSample> smp;
+        if (t >= T0 + 60) {
+            for (int i = 1; i <= 25; ++i) {
+                const int64_t until = last_share(i);
+                const uint64_t acc = t < hash_from ? 0
+                    : static_cast<uint64_t>(1 + ((t < until ? t : until) - hash_from) / 5);
+                smp.push_back({"XoZc.D" + std::to_string(i), "s" + std::to_string(i), acc});
+            }
+        }
+        for (auto& e : d.tick(smp, t)) ev.push_back(e);
+        if (t == last_down - 5) {
+            ASSERT_TRUE(d.workers().at("XoZc.D3").up) << "the last rig is still inside its stall window";
+        }
+        if (t == last_down) {
+            for (int i = 1; i <= 25; ++i) {
+                const auto& st = d.workers().at("XoZc.D" + std::to_string(i));
+                ASSERT_FALSE(st.up);
+                ASSERT_FALSE(st.ever_up) << "D" << i << " still counts as hashing here at the stall";
+                ASSERT_TRUE(d.status_json(t)["workers"]["XoZc.D" + std::to_string(i)]["standby"].get<bool>());
+            }
+        }
+    }
+    EXPECT_TRUE(ev.empty()) << ev.front().detail;
+    EXPECT_TRUE(d.persist().empty()) << "state.json workers stays {} (as observed live)";
+}
+
+// One rule, two consumers. For the same sharechain evidence, the pager
+// (RETURNED: the worker becomes standby, ever_up false) and the dashboard
+// (MiningInterface session state: failback reads standby) decide alike, at
+// the same moment, on every boundary of core/hashing_elsewhere.hpp.
+TEST(DashAlertDetector, PagerAndDashboardApplyTheSameElsewhereRule)
+{
+    EXPECT_EQ(DetectorConfig{}.returned_margin, core::stratum::kElsewhereMarginSeconds);
+    EXPECT_EQ(DetectorConfig{}.returned_horizon, core::stratum::kElsewhereHorizonSeconds);
+    EXPECT_EQ(DetectorConfig{}.stall_after, core::MiningInterface::kSilentFloorSeconds)
+        << "the pager's stall and the dashboard's silence floor start the rule together";
+
+    struct Case {
+        const char* name;
+        int64_t at;        // evaluated at L + at (L = the rig's last share here)
+        int64_t newest;    // newest other-node share, relative to L; INT64_MIN = none
+        bool sibling;      // another rig of the address hashes here
+        bool expect_elsewhere;
+    };
+    constexpr int64_t kNone = INT64_MIN;
+    const Case cases[] = {
+        {"failback (incident)",        900,  880,  false, true},
+        {"shares minted here only",    900,  kNone, false, false},
+        {"margin edge: +60",           900,  60,   false, false},
+        {"margin edge: +61",           900,  61,   false, true},
+        {"sibling hashing here",       900,  880,  true,  false},
+        {"horizon edge: now - 900",    2000, 1100, false, true},
+        {"horizon edge: now - 901",    2000, 1099, false, false},
+    };
+    for (const auto& k : cases) {
+        const int64_t L = T0;
+        const int64_t now = L + k.at;
+        const int64_t newest = k.newest == kNone ? 0 : L + k.newest;
+
+        // Pager. The chain becomes readable at `now` (a late read decides the
+        // horizon cases); a long offline_after keeps the OFFLINE path out of it.
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        c.offline_after = 10'000;
+        AlertDetector d(c, L - 60);
+        int64_t t_seen = 0;
+        d.set_address_activity([&](const std::string&) -> std::optional<int64_t> {
+            if (t_seen < now) return std::nullopt;
+            return newest;
+        });
+        auto smp = [&](uint64_t acc1, uint64_t acc2) {
+            std::vector<WorkerSample> v{{"A.rig1", "s1", acc1}};
+            if (k.sibling) v.push_back({"A.rig2", "s2", acc2});
+            return v;
+        };
+        t_seen = L;
+        d.tick(smp(1, 1), L);                       // the rig's last share here
+        t_seen = now;
+        EXPECT_TRUE(d.tick(smp(1, 2), now).empty()) << k.name;
+        ASSERT_FALSE(d.workers().at("A.rig1").up) << k.name;
+        const bool pager_elsewhere = !d.workers().at("A.rig1").ever_up;
+
+        // Dashboard: the same session, silent since L, the same evidence.
+        using MI = core::MiningInterface;
+        const auto steady = std::chrono::steady_clock::now();
+        std::map<std::string, MI::WorkerInfo> workers;
+        MI::WorkerInfo w1;
+        w1.username = "A";
+        w1.worker_name = "rig1";
+        w1.accepted = 1;
+        w1.difficulty = 1.0;
+        w1.connected_at = steady - std::chrono::seconds(k.at + 600);
+        workers["s1"] = w1;
+        std::map<std::string, MI::WorkerLiveness> lv{
+            {"s1", MI::classify_worker_liveness(w1, steady - std::chrono::seconds(k.at), steady)}};
+        if (k.sibling) {
+            MI::WorkerInfo w2 = w1;
+            w2.worker_name = "rig2";
+            w2.accepted = 2;
+            workers["s2"] = w2;
+            lv["s2"] = MI::classify_worker_liveness(w2, steady, steady);
+        }
+        core::stratum::AddressActivity act;
+        act.valid = true;
+        act.built_at = now;
+        if (k.newest != kNone) act.newest_elsewhere["A"] = newest;
+        MI::mark_hashing_elsewhere(workers, lv, act, now);
+        const std::string state = MI::session_state(lv.at("s1"));
+        ASSERT_NE(state, "hashing") << k.name;
+        const bool dashboard_elsewhere = state == "standby";
+
+        EXPECT_EQ(pager_elsewhere, dashboard_elsewhere) << k.name << ": the pager and the dashboard disagree";
+        EXPECT_EQ(dashboard_elsewhere, k.expect_elsewhere) << k.name;
+    }
+}
+
+// main_dash.cpp feeds the RETURNED rule from the sharechain (the tracker's
+// try-lock read, cached), only on an origin -- and the dashboard's session
+// states from the SAME read, so the two cannot disagree.
+TEST(DashAlertDetector, MainDashWiresAddressActivityFromTheSharechain)
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    ASSERT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string code;
+    std::istringstream lines(buf.str());
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    // One read: the cached sharechain walk, under the tracker read guard.
+    const auto reader = code.find("auto read_addr_activity = ");
+    ASSERT_NE(reader, std::string::npos) << "no shared address-activity read";
+    const auto walk = code.find("dash::dashboard::newest_share_time_by_address(", reader);
+    ASSERT_NE(walk, std::string::npos);
+    EXPECT_LT(walk - reader, 900u);
+    const auto lock = code.find("node->read_tracker()", reader);
+    ASSERT_NE(lock, std::string::npos);
+    EXPECT_LT(lock, walk) << "the walk runs under the tracker read guard";
+    EXPECT_NE(code.find("/*peer_received_only=*/true", walk), std::string::npos);
+    EXPECT_EQ(code.find("dash::dashboard::newest_share_time_by_address(", walk + 1), std::string::npos)
+        << "a second walk: the pager and the dashboard could read different evidence";
+
+    // The relay reads it (origin only).
+    const auto seam = code.find("alert_relay->set_address_activity(");
+    ASSERT_NE(seam, std::string::npos)
+        << "without the seam a failback (rig returned to another node) pages from this node";
+    const auto origin_gate = code.rfind("if (alert_relay->config().origin)", seam);
+    ASSERT_NE(origin_gate, std::string::npos);
+    EXPECT_LT(seam - origin_gate, 600u);
+    const auto relay_read = code.find("read_addr_activity()", seam);
+    ASSERT_NE(relay_read, std::string::npos);
+    EXPECT_LT(relay_read - seam, 300u);
+
+    // The dashboard reads it, installed before the web server starts.
+    const auto web_seam = code.find("mi->set_address_activity_fn(read_addr_activity)");
+    ASSERT_NE(web_seam, std::string::npos)
+        << "without it a failback session reads stalled on the dashboard while the pager stays quiet";
+    const auto web_start = code.find("web_server->start()");
+    ASSERT_NE(web_start, std::string::npos);
+    EXPECT_LT(web_seam, web_start);
+    EXPECT_LT(reader, web_seam);
 }
 
 // ── (11) bounded memory ─────────────────────────────────────────────────────
@@ -1415,10 +1845,10 @@ TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
     auto c = det_cfg();
     c.startup_grace = 0;
     AlertDetector d(c, T0);
-    d.tick(one("A.rig1", "s1", 0), T0);
+    d.tick(one("A.rig1", "s1", 1), T0);
     d.tick({}, T0 + 100);                                  // A drops at T0+100
     ASSERT_EQ(d.tick({}, T0 + 400).size(), 1u);            // OFFLINE
-    d.tick(one("B.rig2", "s2", 0), T0 + 500);              // B up when the node stops
+    d.tick(one("B.rig2", "s2", 1), T0 + 500);              // B up when the node stops
     auto snap = d.persist();
     EXPECT_EQ(snap["A.rig1"]["outage_since"], T0 + 100);
     EXPECT_EQ(snap["B.rig2"]["outage_since"], 0);
@@ -1426,7 +1856,7 @@ TEST(DashAlertDetector, RestoredWorkerReportsTheRealOutage)
     AlertDetector d2(c, T0 + 10000);                       // node restarts much later
     d2.restore(snap);
     const uint64_t g0 = d2.generation();
-    d2.tick(one("A.rig1", "x", 0), T0 + 10100);
+    d2.tick(one("A.rig1", "x", 1), T0 + 10100);
     auto ev = d2.tick(one("A.rig1", "x", 1), T0 + 10160);
     ASSERT_EQ(ev.size(), 1u);
     EXPECT_EQ(ev[0].kind, Kind::BackOnline);
@@ -1616,7 +2046,7 @@ TEST(DashAlertRelay, MalformedUtf8FromMinersNeverBreaksADump)
     org.set_transport(capture_transport(acks, &sent));
     const std::string bad = "A.\xff\xfe" "rig";
     for (int64_t t = T0; t <= T0 + 400; t += 5)
-        org.run_tick([&] { return t < T0 + 50 ? one(bad, "s1", 0) : std::vector<WorkerSample>{}; }, t);
+        org.run_tick([&] { return t < T0 + 50 ? one(bad, "s1", 1) : std::vector<WorkerSample>{}; }, t);
     EXPECT_EQ(org.counters().tick_errors, 0u) << "no dump threw";
     auto s = org.status_json();
     EXPECT_TRUE(s["detector"]["workers"].contains("A.??rig"));
@@ -1956,4 +2386,1172 @@ TEST(DashAlertRelay, SidecarExpiredRowIsAckedExpiredPromptly)
     EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u);
     EXPECT_EQ(ack_shape_error(acks[0]), nullptr) << "status 5 is a valid wire status";
     EXPECT_EQ(wire_ack(acks[0]), acks[0]);
+}
+
+// ── (13) node level: no work served while hashing miners are attached ──────
+// The 2026-10-25 shape: the bestCL gate declined every template for 376 s on a
+// daemonless node, 26 rigs stayed attached and kept hashing the last job, and
+// the [STALE-SERVE] serve-silence ERROR at 300 s reached nobody.
+namespace {
+// Three hashing sessions (their accepted counters advance: the rigs keep
+// submitting on the last job they were given) and one failover connection
+// that never shares here.
+std::vector<WorkerSample> hashing_and_standby(uint64_t acc)
+{
+    return {{"XaddrA.rig1", "s1", acc}, {"XaddrA.rig2", "s2", acc}, {"XaddrB.rig1", "s3", acc},
+            {"XaddrC.backup", "s9", 0}};
+}
+
+// The serve path as the node samples it: a stamp that changes per hand-out,
+// its age, and the decline cause (counted, to show it is read only for a page).
+ServeSample served(int64_t stamp, int64_t age, int* cause_calls = nullptr)
+{
+    ServeSample s;
+    s.served_stamp = stamp;
+    s.served_age = age;
+    s.cause = [cause_calls]() {
+        if (cause_calls) ++*cause_calls;
+        return std::string("bestcl-stale");
+    };
+    return s;
+}
+
+std::string main_dash_code()
+{
+    std::ifstream in(DASH_MAIN_SRC);
+    EXPECT_TRUE(in.good()) << "cannot open " << DASH_MAIN_SRC;
+    std::stringstream buf; buf << in.rdbuf();
+    std::string code;
+    std::istringstream lines(buf.str());
+    for (std::string line; std::getline(lines, line);) {
+        const auto c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c)) + "\n";
+    }
+    return code;
+}
+} // namespace
+
+TEST(DashAlertDetector, WorkStalledFiresOnceAtTheThresholdThenResumes)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    ASSERT_EQ(c.serve_stall_after, 300) << "the [STALE-SERVE] serve-silence threshold";
+    AlertDetector d(c, T0);
+    int causes = 0;
+    uint64_t acc = 1;
+    auto step = [&](int64_t t, int64_t stamp, int64_t served_at) {
+        auto s = served(stamp, t - served_at, &causes);
+        return d.tick(hashing_and_standby(acc++), t, &s);
+    };
+
+    // Work handed out at T0, then none: the gate declines every template.
+    for (int64_t t = T0; t < T0 + 300; t += 5)
+        EXPECT_TRUE(step(t, 1000, T0).empty()) << "t=" << t - T0;
+    EXPECT_EQ(causes, 0) << "no page, no cause lookup";
+    auto ev = step(T0 + 300, 1000, T0);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+    EXPECT_EQ(ev[0].worker, "") << "node-level: no worker";
+    EXPECT_EQ(ev[0].ts, T0 + 300);
+    EXPECT_EQ(ev[0].detail,
+              "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_EQ(causes, 1);
+
+    // Still stalled for the next hour: once per episode, no repeat.
+    for (int64_t t = T0 + 305; t <= T0 + 3900; t += 5)
+        EXPECT_TRUE(step(t, 1000, T0).empty()) << "t=" << t - T0;
+    EXPECT_EQ(causes, 1) << "the cause is read only to build the page";
+    EXPECT_TRUE(d.serve_state().alerted);
+    EXPECT_EQ(d.serve_state().quiet, 3900);
+    EXPECT_EQ(d.serve_state().sessions, 3u);
+    EXPECT_EQ(d.serve_state().standby, 1u);
+
+    // Templates flow again (handed out 2 s before this tick).
+    ev = step(T0 + 3905, 2000, T0 + 3903);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkResumed);
+    EXPECT_EQ(ev[0].worker, "");
+    EXPECT_EQ(ev[0].detail,
+              "new work for miners again after 65m (cause was bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_FALSE(d.serve_state().alerted);
+    for (int64_t t = T0 + 3910; t <= T0 + 5000; t += 5)
+        EXPECT_TRUE(step(t, 2000 + t, t).empty()) << "healthy serving is silent, t=" << t - T0;
+    EXPECT_EQ(causes, 1);
+
+    // A second episode pages again (min_interval long past).
+    for (int64_t t = T0 + 5005; t < T0 + 5300; t += 5) EXPECT_TRUE(step(t, 9000, T0 + 5000).empty());
+    ev = step(T0 + 5300, 9000, T0 + 5000);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+}
+
+TEST(DashAlertDetector, WorkStalledNeverPagesWithoutHashingSessions)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    int causes = 0;
+
+    // (a) No session attached: nothing is handed out because nobody asks.
+    {
+        AlertDetector d(c, T0);
+        for (int64_t t = T0; t <= T0 + 7200; t += 5) {
+            auto s = served(1000, t - T0 + 600, &causes);
+            EXPECT_TRUE(d.tick({}, t, &s).empty()) << "t=" << t - T0;
+        }
+        EXPECT_EQ(d.serve_state().sessions, 0u);
+        EXPECT_EQ(d.serve_state().quiet, 0);
+        EXPECT_FALSE(d.serve_state().alerted);
+    }
+
+    // (b) Only a standby (failover) connection, never served: no hashrate is
+    // lost here, so no page however long it lasts.
+    {
+        AlertDetector d(c, T0);
+        for (int64_t t = T0; t <= T0 + 7200; t += 5) {
+            auto s = served(0, -1, &causes);
+            EXPECT_TRUE(d.tick(one("XaddrC.backup", "s9", 0), t, &s).empty()) << "t=" << t - T0;
+        }
+        EXPECT_EQ(d.serve_state().sessions, 0u);
+        EXPECT_EQ(d.serve_state().standby, 1u);
+        EXPECT_FALSE(d.serve_state().alerted);
+
+        // Its pool dies: it takes a job here and its first share is accepted,
+        // so it hashes here now. The quiet clock starts with it, not at T0.
+        const int64_t first = T0 + 7205;
+        uint64_t acc = 1;
+        for (int64_t t = first; t < first + 300; t += 5) {
+            auto s = served(1000, t - (first - 1), &causes);
+            EXPECT_TRUE(d.tick(one("XaddrC.backup", "s9", acc++), t, &s).empty()) << "t=" << t - first;
+        }
+        auto s = served(1000, 301, &causes);
+        auto ev = d.tick(one("XaddrC.backup", "s9", acc++), first + 300, &s);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+        EXPECT_EQ(ev[0].detail, "no new work for miners for 5m (cause bestcl-stale); 1 miner session attached");
+    }
+    EXPECT_EQ(causes, 1);
+
+    // (c) serve_stall_after 0 turns the node-level rules off.
+    {
+        auto c0 = c;
+        c0.serve_stall_after = 0;
+        AlertDetector d(c0, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 3600; t += 5) {
+            auto s = served(1000, t - T0);
+            EXPECT_TRUE(d.tick(hashing_and_standby(acc++), t, &s).empty());
+        }
+    }
+}
+
+TEST(DashAlertDetector, WorkStalledHonoursTheGraceAndSurvivesAReconnect)
+{
+    // Inside the startup grace the node may still be syncing: no page; at its
+    // end the full quiet time is reported.
+    {
+        auto c = det_cfg();   // grace 600
+        AlertDetector d(c, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t < T0 + 600; t += 5) {
+            auto s = served(0, -1);
+            EXPECT_TRUE(d.tick(hashing_and_standby(acc++), t, &s).empty()) << "t=" << t - T0;
+        }
+        auto s = served(0, -1);
+        auto ev = d.tick(hashing_and_standby(acc++), T0 + 600, &s);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+        EXPECT_NE(ev[0].detail.find("for 10m"), std::string::npos) << ev[0].detail;
+    }
+    // A rig that drops and reconnects inside kServeDetachGrace does not
+    // restart the quiet clock; a longer absence does.
+    auto run = [](int64_t gap) {
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        AlertDetector d(c, T0);
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 1200; t += 5) {
+            const bool away = t >= T0 + 100 && t < T0 + 100 + gap;
+            auto s = served(1000, t - T0);
+            auto ev = d.tick(away ? std::vector<WorkerSample>{}
+                                  : one("XaddrA.rig1", t < T0 + 100 ? "s1" : "s2", acc++), t, &s);
+            if (!ev.empty()) return ev[0].kind == Kind::WorkStalled ? t - T0 : int64_t{-1};
+        }
+        return int64_t{0};
+    };
+    EXPECT_LT(30, AlertDetector::kServeDetachGrace);
+    EXPECT_EQ(run(30), 300) << "a reconnect blip keeps the span";
+    EXPECT_EQ(run(90), 100 + 90 + 300) << "a real absence restarts it";
+}
+
+TEST(DashAlertRelay, WorkKindsOnTheWireAndAnOlderRelaysRefusal)
+{
+    // Kinds 5 and 6 round-trip; anything past kMaxKind is still refused.
+    for (Kind k : {Kind::WorkStalled, Kind::WorkResumed}) {
+        AlertBody b = sample_body(k);
+        b.worker.clear();
+        auto dec = decode_body(encode_body(b));
+        ASSERT_TRUE(dec);
+        EXPECT_EQ(*dec, b);
+        EXPECT_TRUE(is_work_kind(static_cast<uint8_t>(k)));
+    }
+    EXPECT_STREQ(kind_name(5), "work_stalled");
+    EXPECT_STREQ(kind_name(6), "work_resumed");
+    EXPECT_FALSE(is_work_kind(static_cast<uint8_t>(Kind::Digest)));
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
+
+    // The frame around a work kind is the frame of every other kind: version 1,
+    // same shape, the kind sealed inside the body (an older forwarder carries it).
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o");
+    AlertRelayService org(origin_cfg(od, rkey.pubkey), okey, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AlertFrame> sent;
+    Transport t;
+    t.broadcast_alert = [&](uint64_t, const AlertFrame& f) { sent.push_back(f); return std::size_t{1}; };
+    org.set_transport(t);
+    DetectorEvent ev;
+    ev.kind = Kind::WorkStalled;
+    ev.ts = T0;
+    ev.detail = "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached";
+    org.enqueue_event(ev, T0);
+    ASSERT_EQ(sent.size(), 1u);
+    const AlertFrame f = wire_alert(sent[0]);
+    EXPECT_EQ(alert_shape_error(f), nullptr);
+    EXPECT_EQ(f.version, kWireVersion);
+    auto body = open_alert(rkey, f);
+    ASSERT_TRUE(body);
+    EXPECT_EQ(body->kind, static_cast<uint8_t>(Kind::WorkStalled));
+    EXPECT_EQ(body->label, "farm-1");
+
+    // An older relay decodes kinds 1..4 only and answers a signed
+    // refused_invalid: the origin ends the event with a ledger row. No crash,
+    // no retransmit storm, no disconnect.
+    PeerAlertGuard g;
+    auto ack = build_ack(rkey, okey.pubkey, f.nonce, AckStatus::RefusedInvalid);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(org.on_ack(wire_ack(*ack), 7, g, T0 + 1), Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    EXPECT_EQ(org.counters().refused, 1u);
+    auto ledger = read_lines(od / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 1u);
+    EXPECT_NE(ledger[0].find("\"work_stalled\""), std::string::npos);
+    EXPECT_NE(ledger[0].find("refused_invalid"), std::string::npos);
+    for (int64_t now = T0 + 5; now <= T0 + 600; now += 5) org.on_tick({}, now);
+    EXPECT_EQ(sent.size(), 1u) << "a final refusal ends the event";
+}
+
+TEST(DashAlertRelay, WorkStalledReachesTheRelayOnceAndResumesAfterARestart)
+{
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    auto oc = origin_cfg(od, rkey.pubkey);
+    oc.det.startup_grace = 0;
+    Mesh m;
+    m.add(1, oc, okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    uint64_t acc = 1;
+    auto tick = [&](int64_t t, int64_t stamp, int64_t age) {
+        auto s = served(stamp, age);
+        m.nodes[1].svc->on_tick(hashing_and_standby(acc++), t, &s);
+        m.pump(t);
+    };
+
+    for (int64_t t = T0; t <= T0 + 900; t += 5) tick(t, 1000, t - T0);
+    auto rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 1u) << "one page for the episode, carried across the forwarder";
+    auto row = nlohmann::json::parse(rows[0]);
+    EXPECT_EQ(row["kind"], "work_stalled");
+    EXPECT_EQ(row["worker"], "");
+    EXPECT_EQ(row["label"], "farm-1");
+    EXPECT_EQ(row["detail"],
+              "no new work for miners for 5m (cause bestcl-stale); 3 miner sessions attached (+1 standby)");
+    EXPECT_EQ(row["event_ts"], T0 + 300);
+    EXPECT_TRUE(m.nodes[1].svc->pending().begin()->second.queued_at_relay);
+    auto st = m.nodes[1].svc->status_json();
+    EXPECT_TRUE(st["detector"]["serve"]["alerted"].get<bool>());
+    EXPECT_EQ(st["detector"]["serve"]["cause"], "bestcl-stale");
+    EXPECT_EQ(st["detector"]["serve"]["sessions"], 3u);
+    {
+        std::ifstream f(od / "state.json");
+        auto j = nlohmann::json::parse(f);
+        EXPECT_TRUE(j["serve"]["alerted"].get<bool>()) << "the open episode is persisted";
+        EXPECT_EQ(j["serve"]["stall_since"], T0);
+    }
+
+    // The origin restarts mid-episode (same state dir): its new process has
+    // served nothing yet. No second page for the same outage...
+    m.add(1, oc, okey, T0 + 1000);
+    for (int64_t t = T0 + 1000; t <= T0 + 2000; t += 5) tick(t, 0, -1);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 1u) << "not paged twice across a restart";
+
+    // ...and the first template it hands out ends it with WORK_RESUMED.
+    tick(T0 + 2005, 5000, 0);
+    rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 2u);
+    row = nlohmann::json::parse(rows[1]);
+    EXPECT_EQ(row["kind"], "work_resumed");
+    EXPECT_EQ(row["worker"], "");
+    EXPECT_EQ(row["detail"],
+              "new work for miners again after 33m (cause was bestcl-stale); 3 miner sessions attached (+1 standby)");
+    for (int64_t t = T0 + 2010; t <= T0 + 2600; t += 5) tick(t, 5000 + t, 0);
+    EXPECT_EQ(read_lines(rd / "outbox.jsonl").size(), 2u);
+}
+
+// main_dash.cpp feeds the alert tick the served-at datum and, for the page,
+// the serve gate's decline cause; the flag reaches the detector.
+TEST(DashAlertDetector, MainDashFeedsTheServeSampleToTheAlertTick)
+{
+    const std::string code = main_dash_code();
+    const auto tick = code.find("alert_relay_timer->start(");
+    ASSERT_NE(tick, std::string::npos);
+    const auto served_at = code.find("wsrc->last_served_at_ms()", tick);
+    ASSERT_NE(served_at, std::string::npos);
+    EXPECT_LT(served_at - tick, 2500u) << "inside the alert tick";
+    const auto cause = code.find("\"no_work_reason\"", served_at);
+    ASSERT_NE(cause, std::string::npos);
+    EXPECT_LT(cause - served_at, 800u);
+    EXPECT_NE(code.find("w->embedded_arm_status_json()", served_at), std::string::npos)
+        << "the try-locking status read, never a lock the serve path holds";
+    EXPECT_NE(code.find("ac.det.serve_stall_after = g_alert_relay.serve_stall_after;"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-serve-stall-after\""), std::string::npos);
+}
+
+// The node-level events have their own hourly budget. On the shared worker cap,
+// a 26-rig flap (26 OFFLINE + 26 BACK_ONLINE against 30/h) held a real
+// WORK_STALLED back for up to an hour.
+TEST(DashAlertDetector, WorkStalledHasItsOwnBudgetOutsideTheWorkerCap)
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    ASSERT_EQ(c.max_per_hour, 30u);
+    ASSERT_EQ(c.serve_max_per_hour, 4u);
+
+    // (a) A saturated worker cap does not hold WORK_STALLED back.
+    {
+        AlertDetector d(c, T0);
+        auto rigs = [](int gen, uint64_t acc) {
+            std::vector<WorkerSample> v;
+            for (int i = 0; i < 26; ++i)
+                v.push_back({"XaddrA.rig" + std::to_string(i),
+                             "g" + std::to_string(gen) + "s" + std::to_string(i), acc});
+            return v;
+        };
+        std::size_t off = 0, back = 0, dig = 0, stalled = 0;
+        int64_t stalled_at = 0, served_at = T0, stamp = 1;
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 1600; t += 10) {
+            std::vector<WorkerSample> smp;
+            bool serve = false;
+            if (t < T0 + 10) { smp = rigs(0, acc++); serve = true; }      // hashing, served
+            else if (t < T0 + 320) {}                                     // the flap: all gone
+            else if (t < T0 + 1200) { smp = rigs(1, acc++); serve = true; } // back, served
+            else smp = rigs(1, acc++);                                     // attached, no work
+            if (serve) { served_at = t; ++stamp; }
+            auto s = served(stamp, t - served_at);
+            for (const auto& e : d.tick(smp, t, &s)) {
+                if (e.kind == Kind::Offline) ++off;
+                else if (e.kind == Kind::BackOnline) ++back;
+                else if (e.kind == Kind::Digest) ++dig;
+                else if (e.kind == Kind::WorkStalled) { ++stalled; stalled_at = t; }
+            }
+        }
+        EXPECT_EQ(off, 26u);
+        EXPECT_EQ(back, 4u) << "the worker cap is full: 26 + 4 = 30 in the hour";
+        EXPECT_EQ(dig, 1u);
+        EXPECT_EQ(d.suppressed_by_cap(), 22u) << "22 BACK_ONLINEs still held";
+        EXPECT_EQ(stalled, 1u) << "the stall pages although the worker cap is saturated";
+        EXPECT_EQ(stalled_at, T0 + 1190 + 300) << "last hand-out at +1190";
+        EXPECT_EQ(d.serve_held_by_budget(), 0u);
+    }
+
+    // (b) The node-level budget is itself bounded: a serve path that stalls
+    // for 120 s out of every 120 s pages at most 4 node-level events in any
+    // rolling hour; what it holds back stays due and goes out as the window
+    // frees.
+    {
+        auto cb = c;
+        cb.serve_stall_after = 60;
+        cb.min_interval = 0;
+        AlertDetector d(cb, T0);
+        std::vector<int64_t> node_events;
+        int64_t served_at = T0, stamp = 1;
+        uint64_t acc = 1;
+        for (int64_t t = T0; t <= T0 + 2 * 3600; t += 5) {
+            if ((t - T0) % 120 == 0) { served_at = t; ++stamp; }
+            auto s = served(stamp, t - served_at);
+            for (const auto& e : d.tick(one("XaddrA.rig1", "s1", acc++), t, &s))
+                if (is_work_kind(static_cast<uint8_t>(e.kind))) node_events.push_back(e.ts);
+        }
+        ASSERT_GE(node_events.size(), 4u) << "the budget was actually reached";
+        for (std::size_t i = 0; i < node_events.size(); ++i) {
+            std::size_t in_hour = 0;
+            for (int64_t ts : node_events)
+                if (ts > node_events[i] - 3600 && ts <= node_events[i]) ++in_hour;
+            EXPECT_LE(in_hour, 4u) << "rolling hour ending at t=" << node_events[i] - T0;
+        }
+        EXPECT_LE(node_events.size(), 8u) << "two hours, 4 per rolling hour";
+        EXPECT_GT(node_events.back(), T0 + 3600) << "held events go out once the window frees";
+        EXPECT_GE(d.serve_held_by_budget(), 1u);
+        EXPECT_EQ(d.status_json(T0 + 7200)["serve"]["held_by_budget"], d.serve_held_by_budget());
+    }
+}
+
+// Merge of the failback state with the node-level check: a rig that hashed
+// here and failed back to another node stops counting as a hashing session at
+// its stall (RETURNED, step 3a, runs before the serve check, step 3b), so a
+// serve stall that begins after it left does not page for it.
+TEST(DashAlertDetector, FailbackRigIsNotAHashingSessionForWorkStalled)
+{
+    for (bool elsewhere : {true, false}) {
+        auto c = det_cfg();
+        c.startup_grace = 0;
+        c.offline_after = 3000;   // keep the rig's own OFFLINE out of the window
+        AlertDetector d(c, T0);
+        int64_t now_seen = T0;
+        d.set_address_activity([&](const std::string&) -> std::optional<int64_t> {
+            return elsewhere ? now_seen - 20 : int64_t{0};
+        });
+        std::vector<DetectorEvent> ev;
+        for (int64_t t = T0; t <= T0 + 2400; t += 5) {
+            now_seen = t;
+            // Shares here until T0+100, then failback (the connection stays).
+            const uint64_t acc = t <= T0 + 100 ? static_cast<uint64_t>(1 + (t - T0) / 5) : 21;
+            // Templates handed out every tick until T0+950, none after.
+            auto s = t <= T0 + 950 ? served(1000 + t, 0) : served(1000 + T0 + 950, t - (T0 + 950));
+            for (auto& e : d.tick(one("XaddrA.rig1", "s1", acc), t, &s)) ev.push_back(e);
+        }
+        if (elsewhere) {
+            EXPECT_TRUE(ev.empty()) << ev.front().detail;
+            EXPECT_EQ(d.serve_state().sessions, 0u);
+            EXPECT_EQ(d.serve_state().standby, 1u);
+        } else {
+            // No evidence elsewhere: a stalled rig that hashed here is still a
+            // hashing session, and the serve stall pages (at T0+950+300).
+            ASSERT_FALSE(ev.empty());
+            EXPECT_EQ(ev[0].kind, Kind::WorkStalled);
+            EXPECT_EQ(ev[0].ts, T0 + 1250);
+        }
+    }
+}
+
+// ── HASHRATE: per-worker low-hashrate alerts (kinds 7 / 8) ──────────────────
+namespace {
+constexpr double kTwo32 = 4294967296.0;
+constexpr double kTH = 1e12;
+
+// The DASH vardiff (DASHWorkSource target_time 10 s): one share per ~10 s,
+// advertised on a power-of-two grid, rounded down. 1.8 TH/s -> 4096,
+// 1.0 TH/s -> 2048.
+double dash_vardiff(double rate)
+{
+    return std::exp2(std::floor(std::log2(rate * 10.0 / kTwo32)));
+}
+
+// One rig on one stratum session. Shares arrive as a Poisson process of rate
+// rate / (difficulty * 2^32); after a rate change its vardiff follows
+// `lag` seconds later (the tracker's EWMA has tau 90 s).
+struct Rig {
+    std::string key, session;
+    double rate{0}, difficulty{1}, next_difficulty{1};
+    int64_t retarget_at{0};
+    uint64_t accepted{0};
+    double work{0};
+
+    Rig(std::string k, std::string s, double r)
+        : key(std::move(k)), session(std::move(s)), rate(r), difficulty(dash_vardiff(r)), next_difficulty(difficulty) {}
+
+    void set_rate(double r, int64_t now, int64_t lag = 120)
+    {
+        rate = r;
+        if (r > 0) {
+            next_difficulty = dash_vardiff(r);
+            retarget_at = now + lag;
+        }
+    }
+    void step(std::mt19937_64& rng, int64_t now, double dt)
+    {
+        if (retarget_at && now >= retarget_at) { difficulty = next_difficulty; retarget_at = 0; }
+        if (rate <= 0) return;
+        std::poisson_distribution<uint64_t> p(rate * dt / (difficulty * kTwo32));
+        const uint64_t k = p(rng);
+        accepted += k;
+        work += static_cast<double>(k) * difficulty;   // credited at the job's difficulty
+    }
+    WorkerSample sample() const
+    {
+        WorkerSample s{key, session, accepted};
+        s.difficulty = difficulty;
+        s.work = work;
+        return s;
+    }
+};
+
+DetectorConfig rate_cfg()
+{
+    auto c = det_cfg();
+    c.startup_grace = 0;
+    c.hashrate_min = 1.2 * kTH;
+    c.hashrate_window = 900;
+    return c;
+}
+
+struct Timed {
+    int64_t t;
+    DetectorEvent ev;
+};
+
+// Run one rig through (seconds, rate) phases on 5 s ticks, like the node.
+std::vector<Timed> run_rig(AlertDetector& d, Rig& rig, std::mt19937_64& rng,
+                           const std::vector<std::pair<int64_t, double>>& phases, int64_t& now)
+{
+    std::vector<Timed> out;
+    for (const auto& [dur, r] : phases) {
+        if (r != rig.rate) rig.set_rate(r, now);
+        for (const int64_t end = now + dur; now < end;) {
+            now += 5;
+            rig.step(rng, now, 5);
+            for (auto& e : d.tick({rig.sample()}, now)) out.push_back({now, e});
+        }
+    }
+    return out;
+}
+
+double quantile(std::vector<double> v, double q)
+{
+    std::sort(v.begin(), v.end());
+    return v[static_cast<std::size_t>(q * static_cast<double>(v.size() - 1))];
+}
+
+bool ends_with(const std::string& s, const std::string& tail)
+{
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+} // namespace
+
+TEST(DashAlertHashrate, ParseFormatAndPoissonTails)
+{
+    EXPECT_EQ(parse_hashrate("1200G"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2T"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2TH/s"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1200 GH/s"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1200gh"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("500M"), 5e8);
+    EXPECT_EQ(parse_hashrate("1200000000000"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("1.2e12"), 1.2e12);
+    EXPECT_EQ(parse_hashrate("0"), 0.0);
+    for (const char* bad : {"", " ", "-1T", "1.2X", "1.2TB", "abc", "nan", "inf", "1.2T/s/s", "T"})
+        EXPECT_FALSE(parse_hashrate(bad)) << bad;
+
+    EXPECT_EQ(fmt_hashrate(1.2e12), "1.20 TH/s");
+    EXPECT_EQ(fmt_hashrate(1.05e12), "1.05 TH/s");
+    EXPECT_EQ(fmt_hashrate(1.78e12), "1.78 TH/s");
+    EXPECT_EQ(fmt_hashrate(950e9), "950 GH/s");
+    EXPECT_EQ(fmt_hashrate(12.5e9), "12.5 GH/s");
+    EXPECT_EQ(fmt_hashrate(0), "0.00 H/s");
+    EXPECT_EQ(fmt_window(900), "15 min");
+    EXPECT_EQ(fmt_window(90), "90 s");
+
+    // Exact tails against direct summation, both sides of the mean.
+    for (double lam : {0.5, 7.0, 61.4, 122.7, 1000.0}) {
+        double cdf = 0;
+        for (uint64_t n = 0; n < static_cast<uint64_t>(lam * 2 + 10); ++n) {
+            const double dn = static_cast<double>(n);
+            cdf += std::exp(dn * std::log(lam) - lam - std::lgamma(dn + 1.0));
+            EXPECT_NEAR(poisson_cdf(n, lam), cdf, 1e-9) << "lam " << lam << " n " << n;
+            EXPECT_NEAR(poisson_sf(n + 1, lam), 1.0 - cdf, 1e-9) << "lam " << lam << " n " << n;
+        }
+    }
+    // Deep tails stay accurate (relative), not 0 by cancellation.
+    EXPECT_NEAR(poisson_cdf(0, 50.0), std::exp(-50.0), 1e-30);
+    EXPECT_GT(poisson_cdf(40, 92.1), 0.0);
+    EXPECT_LT(poisson_cdf(40, 92.1), 1e-7);
+    EXPECT_GT(poisson_sf(200, 92.1), 0.0);
+    EXPECT_LT(poisson_sf(200, 92.1), 1e-15);
+    EXPECT_EQ(poisson_sf(0, 3.0), 1.0);
+    EXPECT_EQ(poisson_cdf(5, 0.0), 1.0);
+}
+
+// KAT 1: healthy rigs at the hotel's rate never page. 30 rigs at 1.75-1.85
+// TH/s (vardiff 2048 or 4096), threshold 1.2 TH/s, one week on 5 s ticks:
+// ~60 000 evaluations, and the measured false-alarm rate is printed.
+TEST(DashAlertHashrate, SteadyRigsNeverPage)
+{
+    AlertDetector d(rate_cfg(), T0);
+    std::mt19937_64 rng(20261029);
+    std::vector<Rig> rigs;
+    for (int i = 0; i < 30; ++i)
+        rigs.emplace_back("XaddrHotel.D" + std::to_string(i + 1), "s" + std::to_string(i + 1),
+                          (1.75 + 0.10 * i / 29.0) * kTH);
+    std::vector<WorkerSample> samples(rigs.size());
+    std::size_t events = 0;
+    const int64_t end = T0 + 7 * 86400;
+    for (int64_t now = T0 + 5; now <= end; now += 5) {
+        for (std::size_t i = 0; i < rigs.size(); ++i) {
+            rigs[i].step(rng, now, 5);
+            samples[i] = rigs[i].sample();
+        }
+        for (const auto& e : d.tick(samples, now)) {
+            ++events;
+            ADD_FAILURE() << kind_name(static_cast<uint8_t>(e.kind)) << " " << e.worker << " " << e.detail;
+        }
+    }
+    const uint64_t evals = d.hashrate_evaluations();
+    std::cout << "[hashrate KAT1] 30 rigs x 7 days at 1.75-1.85 TH/s, threshold 1.20 TH/s: " << evals
+              << " evaluations, " << d.hashrate_low_evidence() << " with low evidence, " << events
+              << " pages (false-alarm rate " << static_cast<double>(events) / (30 * 7) << " per rig-day)\n";
+    EXPECT_EQ(events, 0u);
+    EXPECT_EQ(d.hashrate_low_evidence(), 0u) << "not even one evaluation leaned low";
+    EXPECT_GT(evals, uint64_t{30} * 7 * 86400 / 300 * 9 / 10) << "every rig judged every ~300 s";
+    const auto st = d.status_json(end)["workers"];
+    for (const auto& r : rigs) {
+        const double measured = st[r.key]["hashrate"].get<double>();
+        EXPECT_NEAR(measured / r.rate, 1.0, 0.3) << r.key;
+        EXPECT_FALSE(st[r.key]["hashrate_low"].get<bool>());
+    }
+}
+
+// KAT 1b: the measured gray zone. Rigs 10 % and 20 % above the threshold
+// (1.32 TH/s, the top of the hysteresis band, and 1.44 TH/s), 30 rigs x 7 days
+// each. A window of ~130 shares cannot tell 1.32 from 1.2 TH/s for certain, so
+// such a rig pages now and then; 20 % above, almost never.
+TEST(DashAlertHashrate, RigsAboveTheThresholdBarelyPage)
+{
+    for (double rate : {1.32 * kTH, 1.44 * kTH}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(7 + static_cast<uint64_t>(rate / 1e9));
+        std::vector<Rig> rigs;
+        for (int i = 0; i < 30; ++i)
+            rigs.emplace_back("XaddrHotel.D" + std::to_string(i + 1), "s" + std::to_string(i + 1), rate);
+        std::vector<WorkerSample> samples(rigs.size());
+        std::size_t pages = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 7 * 86400; now += 5) {
+            for (std::size_t i = 0; i < rigs.size(); ++i) {
+                rigs[i].step(rng, now, 5);
+                samples[i] = rigs[i].sample();
+            }
+            for (const auto& e : d.tick(samples, now))
+                if (e.kind == Kind::HashrateLow) ++pages;
+        }
+        std::cout << "[hashrate KAT1b] 30 rigs x 7 days at " << fmt_hashrate(rate) << ": " << pages
+                  << " HASHRATE_LOW (" << static_cast<double>(pages) / (30 * 7) << " per rig-day), "
+                  << d.hashrate_low_evidence() << " of " << d.hashrate_evaluations()
+                  << " evaluations with low evidence\n";
+        if (rate > 1.4 * kTH)
+            EXPECT_LE(pages, 3u) << "20 % above the threshold: at most a stray page in 210 rig-days";
+        else
+            EXPECT_LE(pages, 30u) << "10 % above the threshold: well under one page per rig-week";
+    }
+}
+
+// The rate is the work the shares were CREDITED at, not their count x the
+// advertised vardiff. After a retarget the registry already shows the new
+// vardiff while shares of jobs issued before it (still in the rig's pipeline:
+// the retarget sends set_difficulty with a non-clean notify) are credited at
+// their job's issued difficulty (stratum_server.cpp, credited_difficulty). A
+// steady 1.76 TH/s rig is retargeted 2048 -> 4096 and keeps submitting old-job
+// shares for 120 s: every window must read 1.76 TH/s. Counting those shares at
+// the advertised 4096 would read ~13 % high in each window that holds them.
+TEST(DashAlertHashrate, RateIsTheCreditedWorkAcrossARetarget)
+{
+    AlertDetector d(rate_cfg(), T0);
+    const double rate = 2048.0 * kTwo32 / 5.0;   // one 2048 share per 5 s tick
+    const int64_t retarget = T0 + 3600, lag = 120;
+    WorkerSample s{"XaddrHotel.D11", "s11", 0};
+    s.work = 0;
+    uint64_t seen = 0;
+    int spanning = 0;   // evaluations whose window holds old-job shares after the retarget
+    double worst = 0;
+    for (int64_t now = T0 + 5; now <= T0 + 3 * 3600; now += 5) {
+        s.difficulty = now <= retarget ? 2048 : 4096;   // what the registry shows
+        const bool old_job = now <= retarget + lag;     // still credited at 2048
+        if (old_job || (now / 5) % 2 == 0) {            // 2048 every tick, 4096 every other tick
+            ++s.accepted;
+            s.work += old_job ? 2048 : 4096;
+        }
+        for (const auto& e : d.tick({s}, now)) ADD_FAILURE() << kind_name(static_cast<uint8_t>(e.kind));
+        if (d.hashrate_evaluations() == seen) continue;
+        seen = d.hashrate_evaluations();
+        const double measured = d.status_json(now)["workers"][s.key]["hashrate"].get<double>();
+        worst = std::max(worst, std::fabs(measured / rate - 1.0));
+        if (now > retarget && now <= retarget + lag + 900) ++spanning;
+    }
+    std::cout << "[hashrate] credited work across a retarget: " << seen << " evaluations (" << spanning
+              << " spanning the old-job shares), worst deviation " << 100 * worst << " %\n";
+    EXPECT_GE(spanning, 2);
+    EXPECT_LT(worst, 0.03) << "every window reads the credited work, old-job shares at their own difficulty";
+}
+
+// KAT 2: a rig that drops from 1.8 to 1.0 TH/s (a dead hashboard) pages
+// HASHRATE_LOW exactly once, in about two windows. 200 seeded trials; the
+// detection delay is measured from the drop.
+TEST(DashAlertHashrate, DropToOneTerahashPagesOnceInAboutTwoWindows)
+{
+    std::vector<double> delay;
+    for (int trial = 0; trial < 200; ++trial) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(1000 + trial);
+        Rig rig("XaddrHotel.D7", "s7", 1.8 * kTH);
+        int64_t now = T0;
+        const auto before = run_rig(d, rig, rng, {{3600, 1.8 * kTH}}, now);
+        EXPECT_TRUE(before.empty()) << "trial " << trial;
+        const int64_t drop = now;
+        const auto after = run_rig(d, rig, rng, {{16 * 900, 1.0 * kTH}}, now);
+        ASSERT_EQ(after.size(), 1u) << "trial " << trial << ": exactly one page";
+        EXPECT_EQ(after[0].ev.kind, Kind::HashrateLow);
+        EXPECT_EQ(after[0].ev.worker, "XaddrHotel.D7");
+        EXPECT_EQ(after[0].ev.ts, after[0].t);
+        EXPECT_TRUE(ends_with(after[0].ev.detail, " < 1.20 TH/s (15 min)")) << after[0].ev.detail;
+        delay.push_back(static_cast<double>(after[0].t - drop) / 900.0);
+    }
+    const double med = quantile(delay, 0.5), p90 = quantile(delay, 0.9), mx = quantile(delay, 1.0);
+    std::size_t within2 = 0, within3 = 0;
+    for (double x : delay) { within2 += x <= 2.0; within3 += x <= 3.0; }
+    std::cout << "[hashrate KAT2] 1.8 -> 1.0 TH/s, 200 trials: delay in windows median " << med << ", p90 " << p90
+              << ", max " << mx << "; within 2 windows " << within2 / 2.0 << " %, within 3 " << within3 / 2.0
+              << " %\n";
+    EXPECT_LE(med, 2.0) << "about two windows";
+    EXPECT_LE(p90, 4.5);
+    EXPECT_GE(within3, 150u) << "three in four within three windows";
+    EXPECT_GE(quantile(delay, 0.0), 0.5) << "never before the window holds the new rate";
+}
+
+// KAT 3: recovery to 1.78 TH/s pages HASHRATE_OK exactly once, then nothing.
+TEST(DashAlertHashrate, RecoveryPagesOkOnce)
+{
+    std::vector<double> delay;
+    for (int trial = 0; trial < 100; ++trial) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(5000 + trial);
+        Rig rig("XaddrHotel.D7", "s7", 1.8 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3600, 1.8 * kTH}, {16 * 900, 1.0 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        ASSERT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        const int64_t fixed = now;
+        ev = run_rig(d, rig, rng, {{16 * 900, 1.78 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u) << "trial " << trial << ": exactly one HASHRATE_OK, nothing after";
+        EXPECT_EQ(ev[0].ev.kind, Kind::HashrateOk);
+        EXPECT_EQ(ev[0].ev.worker, "XaddrHotel.D7");
+        EXPECT_NE(ev[0].ev.detail.find(" TH/s (threshold 1.20 TH/s, 15 min); low for "), std::string::npos)
+            << ev[0].ev.detail;
+        delay.push_back(static_cast<double>(ev[0].t - fixed) / 900.0);
+        EXPECT_FALSE(d.status_json(now)["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>());
+    }
+    std::cout << "[hashrate KAT3] recovery to 1.78 TH/s, 100 trials: delay in windows median "
+              << quantile(delay, 0.5) << ", p90 " << quantile(delay, 0.9) << ", max " << quantile(delay, 1.0)
+              << "\n";
+    EXPECT_LE(quantile(delay, 0.5), 2.0);
+    EXPECT_LE(quantile(delay, 0.9), 3.0);
+}
+
+// KAT 4a: standby connections, failback ("hashing elsewhere") and a rig that
+// stops never page HASHRATE_LOW; a stopped rig pages OFFLINE only.
+TEST(DashAlertHashrate, StandbyElsewhereAndStoppedRigsNeverPageLow)
+{
+    auto c = rate_cfg();
+    c.offline_after = 300;
+    AlertDetector d(c, T0);
+    int64_t now = T0;
+    bool elsewhere = false;
+    d.set_address_activity([&](const std::string& addr) -> std::optional<int64_t> {
+        return elsewhere && addr == "XaddrHotel" ? now - 20 : int64_t{0};
+    });
+    std::mt19937_64 rng(42);
+    Rig standby("XaddrHotel.D1", "s1", 0);          // failover connection: never submits here
+    standby.difficulty = 1;
+    Rig failback("XaddrHotel.D2", "s2", 0.7 * kTH);  // hashes here (LOW), then fails back
+    Rig stopper("XaddrOther.D3", "s3", 1.8 * kTH);   // hashes, then hangs with the connection open
+    std::vector<Timed> ev;
+    auto tick = [&](int64_t until) {
+        while (now < until) {
+            now += 5;
+            failback.step(rng, now, 5);
+            stopper.step(rng, now, 5);
+            for (auto& e : d.tick({standby.sample(), failback.sample(), stopper.sample()}, now))
+                ev.push_back({now, e});
+        }
+    };
+    tick(T0 + 3 * 3600);
+    ASSERT_EQ(ev.size(), 1u) << "the slow rig pages; the standby connection and the healthy rig do not";
+    EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(ev[0].ev.worker, "XaddrHotel.D2");
+    EXPECT_TRUE(d.workers().at("XaddrHotel.D2").rate.low_alerted);
+
+    // D2 fails back to the primary (its session here stays open, silent; its
+    // address hashes there) and D3 hangs. No HASHRATE event for either.
+    failback.rate = 0;
+    stopper.rate = 0;
+    elsewhere = true;
+    ev.clear();
+    tick(now + 2 * 3600);
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].ev.kind, Kind::Offline) << "the hung rig: OFFLINE, never HASHRATE_LOW";
+    EXPECT_EQ(ev[0].ev.worker, "XaddrOther.D3");
+    const auto& w = d.workers();
+    EXPECT_FALSE(w.at("XaddrHotel.D2").rate.low_alerted) << "moved to another node: that node judges it";
+    EXPECT_TRUE(d.status_json(now)["workers"]["XaddrHotel.D1"]["standby"].get<bool>());
+    EXPECT_TRUE(d.status_json(now)["workers"]["XaddrHotel.D2"]["standby"].get<bool>());
+}
+
+// KAT 4b: a just-connected rig is not judged before warm-up + one window, a
+// reconnecting rig never gathers a window, and the vardiff ramp of a fresh
+// session (difficulty 1 -> 4096) never reads as a slow rig.
+TEST(DashAlertHashrate, JustConnectedAndReconnectingRigsNeverPage)
+{
+    {
+        // A genuinely slow rig (0.6 TH/s) is judged only after 180 s + 900 s.
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(7);
+        Rig rig("XaddrHotel.D9", "s9", 0.6 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3 * 3600, 0.6 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        EXPECT_GE(ev[0].t, T0 + 180 + 900 + 300)
+            << "no page before warm-up + a window of settled shares + the confirming evaluation";
+        EXPECT_LE(ev[0].t, T0 + 180 + 900 + 2 * 300 + 30) << "far below: the first two evaluations";
+    }
+    {
+        // 0.6 TH/s, but the session is replaced every 10 minutes (reconnects):
+        // no window ever fills, so nothing pages (no OFFLINE either: it is up).
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(8);
+        Rig rig("XaddrHotel.D9", "s0", 0.6 * kTH);
+        std::size_t events = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 6 * 3600; now += 5) {
+            if ((now - T0) % 600 == 0) rig.session = "s" + std::to_string((now - T0) / 600);
+            rig.step(rng, now, 5);
+            events += d.tick({rig.sample()}, now).size();
+        }
+        EXPECT_EQ(events, 0u);
+        EXPECT_EQ(d.hashrate_evaluations(), 0u);
+    }
+    {
+        // A healthy 1.8 TH/s rig on a fresh session: vardiff starts at 1 and
+        // steps to 256 after 20 s and to 4096 after 90 s. Never a page.
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(9);
+        Rig rig("XaddrHotel.D4", "s4", 1.8 * kTH);
+        rig.difficulty = 1;
+        std::size_t events = 0;
+        for (int64_t now = T0 + 5; now <= T0 + 4 * 3600; now += 5) {
+            if (now == T0 + 20) rig.difficulty = 256;
+            if (now == T0 + 90) rig.difficulty = 4096;
+            rig.step(rng, now, 5);
+            events += d.tick({rig.sample()}, now).size();
+        }
+        EXPECT_EQ(events, 0u);
+        EXPECT_GT(d.hashrate_evaluations(), 30u);
+        EXPECT_EQ(d.hashrate_low_evidence(), 0u);
+    }
+}
+
+// KAT 4c: no double page around an OFFLINE episode. A LOW rig that goes
+// offline pages OFFLINE (not another LOW); back still slow: BACK_ONLINE, no
+// second LOW; back at speed after a repair: BACK_ONLINE, then HASHRATE_OK.
+// A pause of a healthy rig (10 min with the connection open: shorter than the
+// 15 min stall, so no OFFLINE either) is not a slow rig.
+TEST(DashAlertHashrate, OfflineEpisodeIsNeverDoublePaged)
+{
+    for (bool repaired : {false, true}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(repaired ? 11 : 12);
+        Rig rig("XaddrHotel.D5", "s5", 0.7 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{3 * 3600, 0.7 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        ASSERT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+        // Disconnected for 20 minutes.
+        std::vector<Timed> got;
+        for (const int64_t end = now + 1200; now < end;) {
+            now += 5;
+            for (auto& e : d.tick({}, now)) got.push_back({now, e});
+        }
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].ev.kind, Kind::Offline);
+        EXPECT_TRUE(d.workers().at("XaddrHotel.D5").rate.low_alerted) << "outlives the outage";
+        rig.session = "s5b";
+        const double back = repaired ? 1.78 * kTH : 0.7 * kTH;
+        got = run_rig(d, rig, rng, {{3 * 3600, back}}, now);
+        ASSERT_EQ(got.size(), repaired ? 2u : 1u);
+        EXPECT_EQ(got[0].ev.kind, Kind::BackOnline);
+        if (repaired) EXPECT_EQ(got[1].ev.kind, Kind::HashrateOk);
+    }
+    {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(13);
+        Rig rig("XaddrHotel.D6", "s6", 1.8 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{2 * 3600, 1.8 * kTH}, {600, 0.0}, {2 * 3600, 1.8 * kTH}}, now);
+        EXPECT_TRUE(ev.empty()) << ev.front().ev.detail;
+        EXPECT_GT(d.hashrate_evaluations(), 30u);
+    }
+}
+
+// KAT 4d: while the node itself serves no work (WORK_STALLED outstanding),
+// slow shares are the node's fault, not the rigs': no HASHRATE_LOW.
+TEST(DashAlertHashrate, NoLowWhileTheNodeServesNoWork)
+{
+    auto c = rate_cfg();
+    AlertDetector d(c, T0);
+    std::mt19937_64 rng(14);
+    Rig rig("XaddrHotel.D8", "s8", 1.8 * kTH);
+    std::vector<DetectorEvent> ev;
+    int64_t now = T0;
+    for (; now < T0 + 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        auto s = served(1000 + now, 0);
+        for (auto& e : d.tick({rig.sample()}, now, &s)) ev.push_back(e);
+    }
+    EXPECT_TRUE(ev.empty());
+    rig.set_rate(0.5 * kTH, now);   // shares thin out while no new work is served
+    const int64_t stalled = now;
+    for (; now < stalled + 2 * 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        auto s = served(1000 + stalled, now - stalled);
+        for (auto& e : d.tick({rig.sample()}, now, &s)) ev.push_back(e);
+    }
+    ASSERT_EQ(ev.size(), 1u);
+    EXPECT_EQ(ev[0].kind, Kind::WorkStalled) << "the node pages; the rig is not blamed";
+}
+
+// The hashrate events share the worker budget: the cap holds a LOW (pending,
+// one digest), and a second LOW waits out min_interval after the first.
+TEST(DashAlertHashrate, WorkerBudgetAndMinIntervalApply)
+{
+    auto c = rate_cfg();
+    c.max_per_hour = 1;
+    AlertDetector d(c, T0);
+    std::mt19937_64 rng(15);
+    Rig a("XaddrHotel.D1", "s1", 0.5 * kTH), b("XaddrHotel.D2", "s2", 0.5 * kTH);
+    std::vector<Timed> ev;
+    for (int64_t now = T0 + 5; now <= T0 + 3 * 3600; now += 5) {
+        a.step(rng, now, 5);
+        b.step(rng, now, 5);
+        for (auto& e : d.tick({a.sample(), b.sample()}, now)) ev.push_back({now, e});
+    }
+    ASSERT_EQ(ev.size(), 3u);
+    EXPECT_EQ(ev[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(ev[1].ev.kind, Kind::Digest) << "the second LOW is held by the 1/h cap";
+    EXPECT_EQ(ev[2].ev.kind, Kind::HashrateLow);
+    EXPECT_NE(ev[0].ev.worker, ev[2].ev.worker);
+    EXPECT_GE(ev[2].t - ev[0].t, 3600) << "held until the hourly window freed";
+
+    // LOW -> OK -> LOW within min_interval: the second LOW waits.
+    auto c2 = rate_cfg();
+    c2.min_interval = 4 * 3600;
+    AlertDetector d2(c2, T0);
+    Rig r("XaddrHotel.D3", "s3", 0.5 * kTH);
+    int64_t now = T0;
+    auto e2 = run_rig(d2, r, rng, {{3600, 0.5 * kTH}, {3600, 1.8 * kTH}, {3 * 3600, 0.5 * kTH}}, now);
+    ASSERT_EQ(e2.size(), 3u);
+    EXPECT_EQ(e2[0].ev.kind, Kind::HashrateLow);
+    EXPECT_EQ(e2[1].ev.kind, Kind::HashrateOk);
+    EXPECT_EQ(e2[2].ev.kind, Kind::HashrateLow);
+    EXPECT_GE(e2[2].t - e2[0].t, 4 * 3600);
+}
+
+// An outstanding LOW survives a node restart (persisted): still slow, no
+// second page; at speed again, one HASHRATE_OK.
+TEST(DashAlertHashrate, OutstandingLowIsPersistedAcrossARestart)
+{
+    for (bool repaired : {false, true}) {
+        AlertDetector d(rate_cfg(), T0);
+        std::mt19937_64 rng(repaired ? 21 : 22);
+        Rig rig("XaddrHotel.D1", "s1", 0.6 * kTH);
+        int64_t now = T0;
+        auto ev = run_rig(d, rig, rng, {{2 * 3600, 0.6 * kTH}}, now);
+        ASSERT_EQ(ev.size(), 1u);
+        const auto saved = d.persist();
+        ASSERT_TRUE(saved["XaddrHotel.D1"]["hashrate_low"].get<bool>());
+
+        AlertDetector d2(rate_cfg(), now + 60);
+        d2.restore(saved);
+        EXPECT_TRUE(d2.workers().at("XaddrHotel.D1").rate.low_alerted);
+        rig.session = "s1b";
+        now += 60;
+        ev = run_rig(d2, rig, rng, {{3 * 3600, repaired ? 1.8 * kTH : 0.6 * kTH}}, now);
+        if (!repaired) {
+            EXPECT_TRUE(ev.empty()) << "not paged twice across a restart";
+        } else {
+            ASSERT_EQ(ev.size(), 1u);
+            EXPECT_EQ(ev[0].ev.kind, Kind::HashrateOk);
+        }
+    }
+    // Off (the default): nothing is evaluated or persisted.
+    AlertDetector off(det_cfg(), T0);
+    std::mt19937_64 rng(23);
+    Rig rig("XaddrHotel.D1", "s1", 0.3 * kTH);
+    int64_t now = T0;
+    EXPECT_TRUE(run_rig(off, rig, rng, {{3 * 3600, 0.3 * kTH}}, now).empty());
+    EXPECT_EQ(off.hashrate_evaluations(), 0u);
+    EXPECT_FALSE(off.status_json(now)["workers"]["XaddrHotel.D1"].contains("hashrate"));
+}
+
+// KAT 5: kinds 7 and 8 on the wire. This build decodes them; a relay built
+// before them (kMaxKind 6) refuses the body -- the page is lost, so the relay
+// must ship together with (or before) its origins.
+TEST(DashAlertRelay, HashrateKindsOnTheWireAndAnOlderRelaysRefusal)
+{
+    ASSERT_GE(kMaxKind, 8);
+    EXPECT_STREQ(kind_name(7), "hashrate_low");
+    EXPECT_STREQ(kind_name(8), "hashrate_ok");
+    for (Kind k : {Kind::HashrateLow, Kind::HashrateOk}) {
+        AlertBody b = sample_body(k);
+        b.worker = "XdashAddress123.D17";
+        b.detail = "1.05 TH/s < 1.20 TH/s (15 min)";
+        const Bytes enc = encode_body(b);
+        auto dec = decode_body(enc);
+        ASSERT_TRUE(dec);
+        EXPECT_EQ(*dec, b);
+        EXPECT_TRUE(is_hashrate_kind(static_cast<uint8_t>(k)));
+        EXPECT_FALSE(is_work_kind(static_cast<uint8_t>(k)));
+        EXPECT_FALSE(decode_body(enc, /*an older relay's kMaxKind=*/6)) << "an older relay refuses it";
+    }
+    EXPECT_TRUE(decode_body(encode_body(sample_body(Kind::WorkResumed)), 6)) << "kinds 1-6 unchanged";
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
+
+    // End to end: origin -> forwarder -> relay outbox (the row the sidecar reads).
+    auto okey = key_from_byte(0x11), rkey = key_from_byte(0x22);
+    auto od = fresh_dir("o"), rd = fresh_dir("r");
+    auto oc = origin_cfg(od, rkey.pubkey);
+    oc.det = rate_cfg();
+    Mesh m;
+    m.add(1, oc, okey, T0);
+    m.add(2, fwd_cfg(fresh_dir("f")), std::nullopt, T0);
+    m.add(3, relay_cfg(rd, {okey.pubkey}), rkey, T0);
+    m.link(1, 2);
+    m.link(2, 3);
+    std::mt19937_64 rng(31);
+    Rig rig("XaddrHotel.D7", "s7", 0.7 * kTH);
+    int64_t now = T0;
+    for (; now < T0 + 2 * 3600;) {
+        now += 5;
+        rig.step(rng, now, 5);
+        m.nodes[1].svc->on_tick({rig.sample()}, now);
+        m.pump(now);
+    }
+    auto rows = read_lines(rd / "outbox.jsonl");
+    ASSERT_EQ(rows.size(), 1u);
+    auto row = nlohmann::json::parse(rows[0]);
+    EXPECT_EQ(row["kind"], "hashrate_low");
+    EXPECT_EQ(row["worker"], "XaddrHotel.D7");
+    EXPECT_EQ(row["label"], "farm-1");
+    EXPECT_TRUE(ends_with(row["detail"].get<std::string>(), " < 1.20 TH/s (15 min)")) << row["detail"];
+    auto st = m.nodes[1].svc->status_json();
+    EXPECT_TRUE(st["detector"]["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>());
+    EXPECT_EQ(st["detector"]["hashrate"]["min"].get<double>(), 1.2e12);
+    {
+        std::ifstream f(od / "state.json");
+        auto j = nlohmann::json::parse(f);
+        EXPECT_TRUE(j["workers"]["XaddrHotel.D7"]["hashrate_low"].get<bool>()) << "persisted";
+    }
+
+    // An older relay answers refused_invalid: the origin ends the event with a
+    // ledger row (and a warning to upgrade the relay), no retransmit storm.
+    auto okey2 = key_from_byte(0x33);
+    auto od2 = fresh_dir("o2");
+    AlertRelayService org(origin_cfg(od2, rkey.pubkey), okey2, T0);
+    std::string err;
+    ASSERT_TRUE(org.init(err));
+    std::vector<AlertFrame> sent;
+    Transport t;
+    t.broadcast_alert = [&](uint64_t, const AlertFrame& f) { sent.push_back(f); return std::size_t{1}; };
+    org.set_transport(t);
+    DetectorEvent ev;
+    ev.kind = Kind::HashrateLow;
+    ev.worker = "XaddrHotel.D7";
+    ev.ts = T0;
+    ev.detail = "1.05 TH/s < 1.20 TH/s (15 min)";
+    org.enqueue_event(ev, T0);
+    ASSERT_EQ(sent.size(), 1u);
+    const AlertFrame f = wire_alert(sent[0]);
+    auto shared = ecdh_shared(rkey.seckey.data(), f.origin_pubkey);
+    ASSERT_TRUE(shared);
+    auto pt = open_body(*shared, f.body);
+    ASSERT_TRUE(pt);
+    EXPECT_FALSE(decode_body(*pt, 6)) << "what an older relay sees: a body it cannot decode";
+    PeerAlertGuard g;
+    auto ack = build_ack(rkey, okey2.pubkey, f.nonce, AckStatus::RefusedInvalid);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(org.on_ack(wire_ack(*ack), 7, g, T0 + 1), Verdict::AckConsumed);
+    EXPECT_TRUE(org.pending().empty());
+    auto ledger = read_lines(od2 / "ledger.jsonl");
+    ASSERT_EQ(ledger.size(), 1u);
+    EXPECT_NE(ledger[0].find("\"hashrate_low\""), std::string::npos);
+    EXPECT_NE(ledger[0].find("refused_invalid"), std::string::npos);
+}
+
+// The stratum session records the work of each accepted share (the credited
+// difficulty its hashrate tracker gets), and main_dash hands it, the vardiff
+// and the two flags to the detector.
+TEST(DashAlertHashrate, StratumRecordsAcceptedWorkAndMainDashWiresIt)
+{
+    core::stratum::SubmitOutcomeWindow w;
+    EXPECT_EQ(w.accepted_work_total(), 0.0);
+    w.add_accepted_work(4096);
+    w.add_accepted_work(2048);
+    w.add_accepted_work(0);
+    w.add_accepted_work(-5);
+    EXPECT_EQ(w.accepted_work_total(), 6144.0);
+
+    std::string root = DASH_MAIN_SRC;
+    root.resize(root.rfind("c2pool/main_dash.cpp"));
+    std::ifstream in(root + "core/stratum_server.cpp");
+    ASSERT_TRUE(in.good());
+    std::stringstream buf;
+    buf << in.rdbuf();
+    const std::string ss = buf.str();
+    const auto credited = ss.find("double credited_difficulty =");
+    ASSERT_NE(credited, std::string::npos);
+    const auto add = ss.find("submit_window_->add_accepted_work(credited_difficulty);", credited);
+    ASSERT_NE(add, std::string::npos);
+    EXPECT_LT(add - credited, 200u) << "recorded with the credited difficulty of the accepted share";
+    EXPECT_LT(add, ss.find("hashrate_tracker_.record_mining_share_submission(credited_difficulty, true);", credited));
+
+    const std::string code = main_dash_code();
+    const auto tick = code.find("alert_relay_timer->start(");
+    ASSERT_NE(tick, std::string::npos);
+    const auto diff = code.find("smp.difficulty = w.difficulty;", tick);
+    const auto work = code.find("smp.work = w.submit_window ? w.submit_window->accepted_work_total() : -1.0;", tick);
+    ASSERT_NE(diff, std::string::npos);
+    ASSERT_NE(work, std::string::npos);
+    EXPECT_LT(work - tick, 1500u) << "inside the alert tick's sampler";
+    EXPECT_NE(code.find("ac.det.hashrate_min = g_alert_relay.hashrate_min;"), std::string::npos);
+    EXPECT_NE(code.find("ac.det.hashrate_window = g_alert_relay.hashrate_window;"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-hashrate-min\""), std::string::npos);
+    EXPECT_NE(code.find("dash::alert::parse_hashrate(argv[i + 1])"), std::string::npos);
+    EXPECT_NE(code.find("\"--alert-relay-hashrate-window\""), std::string::npos);
+    EXPECT_NE(code.find("double  hashrate_min = 0;"), std::string::npos) << "off by default";
+}
+
+// S2: kind 9 (UtxoWithheld) on the wire. This build decodes it; a relay built
+// before it (kMaxKind 8) refuses the body, so ship the relay with its origins.
+TEST(DashAlertRelay, UtxoWithheldKindOnTheWireAndAnOlderRelaysRefusal)
+{
+    ASSERT_EQ(kMaxKind, 9);
+    EXPECT_STREQ(kind_name(9), "utxo_withheld");
+    AlertBody b = sample_body(Kind::UtxoWithheld);
+    b.worker.clear();
+    b.detail = "utxo-strict-refusal: bad-txns-inputs-missingorspent h=2564101";
+    const Bytes enc = encode_body(b);
+    auto dec = decode_body(enc);
+    ASSERT_TRUE(dec);
+    EXPECT_EQ(*dec, b);
+    EXPECT_FALSE(is_work_kind(9));
+    EXPECT_FALSE(is_hashrate_kind(9));
+    EXPECT_FALSE(decode_body(enc, /*an older relay's kMaxKind=*/8)) << "an older relay refuses it";
+    Bytes past = encode_body(sample_body());
+    past[0] = kMaxKind + 1;
+    EXPECT_FALSE(decode_body(past));
 }

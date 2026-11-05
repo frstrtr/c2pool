@@ -36,6 +36,7 @@
 #include <impl/dash/stratum/work_source.hpp>
 
 #include <impl/dash/stratum/submit_payee_guard.hpp>  // check_submit_payee (won-block stale-payee gate)
+#include <impl/dash/stratum/won_block_record.hpp>    // won_block_height (the JOB's height, not the cache's)
 #include <impl/dash/coin/serve_gate_rollup_json.hpp>  // serve_gate_rollup_json — #119 follow-up web leg (per-cause TIME)
 #include <impl/dash/coin/serve_gate_ledger_json.hpp>  // serve_gate_ledger_{to_json,save,load} — cumulative cross-restart accounting
 #include <impl/dash/coinbase_builder.hpp>     // compute_dash_payouts, build, split_coinb, merkle helpers
@@ -209,7 +210,7 @@ GetWork DASHWorkSource::get_work(const WorkJobTargetInputs& job_in) const
     // Mainnet embedded gate (see resource_template_now): default OFF keeps an
     // unconfigured mainnet node on the reward-safe dashd fallback (fail-closed);
     // testnet/regtest and the --embedded-mainnet opt-in run the embedded arm.
-    if (!is_testnet_ && !embedded_mainnet_) {
+    if ((!is_testnet_ && !embedded_mainnet_) || dashd_templates_only_) {
         coin::DashWorkData w =
             dashd_fallback_ ? dashd_fallback_() : coin::DashWorkData{};
         // THE THIRD FALLBACK PRODUCER, and the last silent one. This legacy
@@ -320,12 +321,22 @@ void DASHWorkSource::update_stratum_worker(const std::string& session_id,
     std::lock_guard<std::mutex> lk(workers_mutex_);
     auto it = workers_.find(session_id);
     if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    if (accepted > it->second.accepted)
+        it->second.last_accepted_at = std::chrono::steady_clock::now();
     it->second.hashrate      = hashrate;
     it->second.dead_hashrate = dead_hashrate;
     it->second.difficulty    = difficulty;
     it->second.accepted      = accepted;
     it->second.rejected      = rejected;
     it->second.stale         = stale;
+}
+
+void DASHWorkSource::update_stratum_worker_rtt(const std::string& session_id, double rtt_ms)
+{
+    std::lock_guard<std::mutex> lk(workers_mutex_);
+    auto it = workers_.find(session_id);
+    if (it == workers_.end()) return;  // update for an unregistered session: drop.
+    it->second.rtt_ms = rtt_ms;
 }
 
 std::map<std::string, core::stratum::WorkerInfo>
@@ -937,10 +948,14 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
     // run the embedded arm. Even when enabled, the NodeCoinState viability gate
     // (SML+quorum fresh at the tip, non-superblock, credit-pool seed height at
     // tip, bestCL fresh) fails safe to the fallback, so no invalid template mines.
-    const bool embedded_arm_enabled = is_testnet_ || embedded_mainnet_;
+    // set_dashd_templates_only (the DASH v36 network with a dashd RPC arm, or
+    // with no work source at all) never serves the embedded arm. A daemonless
+    // v36 node leaves it OFF and serves the embedded arm like the public profile.
+    const bool embedded_arm_enabled =
+        (is_testnet_ || embedded_mainnet_) && !dashd_templates_only_;
     try {
         const bool populated = coin_state_.populated();
-        if (!embedded_arm_enabled && populated) {
+        if (!embedded_arm_enabled && populated && !dashd_templates_only_) {
             static std::once_flag mainnet_gate_logged;
             std::call_once(mainnet_gate_logged, [] {
                 LOG_WARNING << "[DASH-STRATUM-GBT] embedded template arm disabled on "
@@ -959,7 +974,14 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
             // The mainnet gate refused BEFORE viability was ever consulted;
             // name that, or the operator reads "dashd-fallback" and starts
             // hunting a coin-state fault that does not exist.
-            if (!embedded_arm_enabled) {
+            if (!embedded_arm_enabled && dashd_templates_only_) {
+                // The DASH v36 network takes dashd templates only: the
+                // embedded arm is refused by policy, not by coin state.
+                arm.decline.viable    = false;
+                arm.decline.cause     = "dashd-templates-only";
+                arm.decline.value     = "v36-network";
+                arm.decline.threshold = "--coin-rpc";
+            } else if (!embedded_arm_enabled) {
                 // The mainnet opt-in is off, so viability was never even
                 // consulted. Name the GATE, not the coin state -- an
                 // operator here must flip a flag, not chase a sync fault.
@@ -986,6 +1008,13 @@ DASHWorkSource::CoinStateArm DASHWorkSource::resolve_coin_state_arm() const
             coin_state_.select_work([]() { return coin::DashWorkData{}; });
         if (sel.source != coin::WorkSource::Embedded) {
             arm.decline = std::move(sel.decline);
+            // Keep the height a VIABILITY refusal was refusing at too, exactly
+            // like the emit refusal below: on a daemonless node the fallback
+            // template is empty (m_height == 0), and every [EMBED-GATE-SEG]
+            // line closed by a cause change into a viability cause printed
+            // h=0 (2026-10-26 incident logs). 0 = no tip yet => stays 0.
+            if (coin_state_.prev_height() != 0)
+                arm.declined_height = coin_state_.prev_height() + 1;
             return arm;
         }
 
@@ -1885,6 +1914,38 @@ void DASHWorkSource::note_arm_decision(coin::ServeGateJournal::Served served,
                 << " suppressed=" << d.suppressed;
 }
 
+bool DASHWorkSource::note_ready_idle(uint32_t height) const
+{
+    const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    coin::ServeGateJournal::Decision d;
+    {
+        std::lock_guard<std::mutex> lk(serve_gate_mutex_);
+        d = serve_gate_journal_.observe_ready_idle(now_sec);
+        if (!d.emit()) return false;
+        serve_gate_ledger_.bank_ready_idle(d, now_sec);
+        last_decline_ = coin::DeclineReport{};
+    }
+    if (d.prev_cause_sec >= 0 && !d.previous_cause.empty()) {
+        LOG_WARNING << "[EMBED-GATE-SEG] h=" << height
+                    << " cause=" << d.previous_cause
+                    << " dur=" << d.prev_cause_sec << "s"
+                    << " terminal=ready-idle";
+    }
+    LOG_WARNING << "[EMBED-GATE] h=" << height
+                << " arm=READY-IDLE (the embedded arm would serve; no miner is"
+                   " connected, so no template was sourced) — closed cause="
+                << (d.previous_cause.empty() ? "unknown" : d.previous_cause)
+                << (d.episode_sec >= 0
+                        ? " episode dur=" + std::to_string(d.episode_sec) + "s"
+                        : std::string())
+                << " " << d.suppressed << " decline(s) suppressed. Time from"
+                   " here until a miner asks is miner absence, not node"
+                   " downtime, and is charged to no cause.";
+    return true;
+}
+
 // Operator surface (per-coin /api/node_topology no_work_reason). Publishes the
 // SAME DeclineReport the journal logged, so the page and the log cannot
 // disagree; "unknown" before the first template is sourced, never a fabricated
@@ -2569,15 +2630,11 @@ nlohmann::json DASHWorkSource::mining_submit(
     const uint256 share_target = dash::coin::target_from_nbits(
         job->share_bits != 0 ? job->share_bits : 0x1d00ffffu);
 
-    auto bump = [&](bool accepted) {
-        std::lock_guard<std::mutex> lk(workers_mutex_);
-        for (auto& kv : workers_) {
-            if (kv.second.username == username) {
-                accepted ? kv.second.accepted++ : kv.second.rejected++;
-                break;
-            }
-        }
-    };
+    // The per-session accepted/rejected counters are owned by the stratum
+    // session, which reports them through update_stratum_worker(session_id,
+    // ...). Bumping here by username credited the FIRST registered session of
+    // that address, so a failover connection of a rig that hashes through a
+    // sibling session read as hashing. No registry write on this path.
 
     // NOTE: the dashboard "Best Share" feed is NOT recorded here — mining_submit
     // only runs for pool-quality shares / block solutions (the stratum session
@@ -2695,7 +2752,15 @@ nlohmann::json DASHWorkSource::mining_submit(
     if (pow_hash <= block_target) {
         // A full network block. NEVER drop it.
         auto wd = cached_work();
-        const uint32_t height = wd ? wd->m_height : 0;
+        // The block's height comes from the JOB the miner hashed (its own
+        // BIP34 coinbase push), never from the CURRENT template: a solve on a
+        // stale job (the serve gate declining, the cache empty, the tip moved)
+        // was recorded at the cache's height -- h=0 for block 2561316 on
+        // 2026-10-25 -- and the confirm/orphan lane then asked about the wrong
+        // height forever. Facts read off `wd` below describe the job only when
+        // `wd` is the job's own template.
+        const bool wd_is_jobs = template_is_jobs(wd.get(), job->gbt_prevhash);
+        const uint32_t height = won_block_height(coinbase, job->gbt_prevhash, wd.get());
         LOG_WARNING << "[DASH-STRATUM-BLOCK] *** BLOCK FOUND *** user=" << username
                     << " height~=" << height
                     << " pow_hash=" << pow_hash.GetHex().substr(0, 16)
@@ -2720,7 +2785,7 @@ nlohmann::json DASHWorkSource::mining_submit(
                 arm_seen     = arm_ever_observed_;
                 arm_embedded = last_arm_embedded_;
             }
-            if (wd) {
+            if (wd_is_jobs) {
                 for (const auto& pp : wd->m_packed_payments) {
                     // dashd surfaces the platform credit-pool burn as a
                     // masternode[] entry with an EMPTY payee; counting it as a
@@ -2729,19 +2794,29 @@ nlohmann::json DASHWorkSource::mining_submit(
                     else ++mn_outs;
                 }
             }
+            // The payout split and the arm describe the CURRENT template. When
+            // that is not the job's template (moved on, or none cached) they
+            // say nothing about this block: print "?" rather than another
+            // block's facts, and name why in template=.
+            const char* arm_label = arm_seen ? (arm_embedded ? "EMBEDDED"
+                                                             : "dashd-fallback")
+                                             : "unobserved";
+            const std::string unknown = "?";
             LOG_WARNING
                 << "[BLOCK-LEDGER] event=found h=" << height
                 << " hash=" << pow_hash.GetHex().substr(0, 16)
                 << " miner=" << username
-                << " arm=" << (arm_seen ? (arm_embedded ? "EMBEDDED"
-                                                        : "dashd-fallback")
-                                        : "unobserved")
+                << " arm=" << (wd_is_jobs ? std::string(arm_label) : unknown)
                 << " coinbase_bytes=" << coinbase.size()
-                << " mn_payout_outputs=" << mn_outs
-                << " split=" << (mn_outs >= 2 ? "operator" : "none")
-                << " burn_outputs=" << burn_outs
+                << " mn_payout_outputs="
+                << (wd_is_jobs ? std::to_string(mn_outs) : unknown)
+                << " split=" << (wd_is_jobs ? (mn_outs >= 2 ? "operator" : "none")
+                                            : unknown)
+                << " burn_outputs="
+                << (wd_is_jobs ? std::to_string(burn_outs) : unknown)
                 << " txs=" << (job->tx_data ? job->tx_data->size() : 0)
-                << " subsidy=" << (wd ? wd->m_coinbase_value : 0)
+                << " subsidy=" << job->subsidy
+                << " template=" << (wd_is_jobs ? "job" : (wd ? "moved" : "none"))
                 << " job=" << job_id;
         }
 
@@ -2858,15 +2933,15 @@ nlohmann::json DASHWorkSource::mining_submit(
 
         // Recent-blocks dashboard record: a genuine block solution we
         // dispatched to the network. A local payee-guard reject was never sent
-        // (not a won block) so it is skipped. Display only; fired after the
-        // dispatch decision, never gates it.
+        // (not a won block) so it is skipped. Height and subsidy are the job's.
+        // Display only; fired after the dispatch decision, never gates it.
         if (!payee_guard_reject) {
             FoundBlockFn fb_fn;
             {
                 std::lock_guard<std::mutex> lk(found_block_mutex_);
                 fb_fn = on_found_block_fn_;
             }
-            if (fb_fn) fb_fn(height, pow_hash, username, reached_network);
+            if (fb_fn) fb_fn(height, pow_hash, username, reached_network, job->subsidy);
         }
 
         // #887: the won block is a SHARE too. Everything above (guard verdict,
@@ -2883,8 +2958,6 @@ nlohmann::json DASHWorkSource::mining_submit(
         // never consulted the payee guard either. Withholding here would be a
         // second, self-inflicted loss on top of the forfeited block.
         mint_solved_share(/*won_block=*/true);
-
-        bump(true);
         return nlohmann::json(true);
     }
 
@@ -2894,12 +2967,9 @@ nlohmann::json DASHWorkSource::mining_submit(
         // creation seam is unbound, accept for vardiff + LOUD log (documented
         // 4d follow-up) -- never a silent drop, never a false reject.
         mint_solved_share(/*won_block=*/false);
-
-        bump(true);
         return nlohmann::json(true);
     }
 
-    bump(false);
     return reject(23, "Low difficulty share");
 }
 

@@ -490,7 +490,7 @@
                         <span style="color: var(--success);"><span id="good_shares_pct">100%</span> good shares</span>
                     </div>
                     <div class="stat-label" style="margin-top: 5px;">
-                        DOA Rate: <span id="doa_rate_detail">0%</span>
+                        DOA Rate <span id="doa_rate_scope"></span>: <span id="doa_rate_detail">0%</span>
                     </div>
                 </div>
                 
@@ -501,7 +501,10 @@
                     <div style="margin-top: 8px; font-size: 0.75rem;">
                         <span style="color: var(--danger);"><span id="dead_shares">0</span> dead (<span id="dead_shares_pct">0%</span>)</span>
                     </div>
-                    <div class="stat-label">Current window</div>
+                    <div id="unknown_job_line" style="display: none; margin-top: 4px; font-size: 0.75rem; color: var(--text-muted);" title="Results submitted for job ids this connection never issued, e.g. work the rig buffered before a node restart. Not counted as dead/DOA.">
+                        <span id="unknown_job_shares">0</span> unknown job (previous session)
+                    </div>
+                    <div class="stat-label">Since connect</div>
                 </div>
                 
                 <!-- Best Difficulty Card -->
@@ -764,6 +767,26 @@
             errorDiv.style.display = 'block';
         }
         
+        // Headline Error / Efficiency / DOA: the rate over the last window
+        // (doa_rate_window), which leaves out submits for job ids this
+        // connection never issued (results rigs flush after a node restart).
+        // A node without the window fields: the cumulative doa_rate.
+        function renderDoaRate(stats) {
+            var windowed = stats.doa_rate_window !== undefined;
+            var doaRate = (windowed ? stats.doa_rate_window : stats.doa_rate) * 100;
+            document.getElementById('doa_rate_inline').textContent = d3.format('.2f')(doaRate) + '%';
+            document.getElementById('doa_rate_detail').textContent = d3.format('.2f')(doaRate) + '%';
+            document.getElementById('doa_rate_scope').textContent = windowed
+                ? '(last ' + Math.round(stats.window_seconds / 60) + ' min)' : '(since connect)';
+
+            // Efficiency (inverse of DOA rate)
+            var efficiency = 100 - doaRate;
+            var effElement = document.getElementById('efficiency_value');
+            effElement.textContent = d3.format('.2f')(efficiency) + '%';
+            effElement.className = 'stat-value ' + (efficiency > 98 ? 'success' : (efficiency > 95 ? 'warning' : 'danger'));
+            document.getElementById('good_shares_pct').textContent = d3.format('.2f')(efficiency) + '%';
+        }
+
         function loadMinerStats() {
             minerAddress = getMinerAddress();
             
@@ -807,17 +830,8 @@
                     }
                     document.getElementById('current_hashrate').textContent = hashrateText;
                     
-                    // DOA Rate - update multiple elements
-                    const doaRate = stats.doa_rate * 100;
-                    document.getElementById('doa_rate_inline').textContent = d3.format('.2f')(doaRate) + '%';
-                    document.getElementById('doa_rate_detail').textContent = d3.format('.2f')(doaRate) + '%';
-                    
-                    // Efficiency (inverse of DOA rate)
-                    var efficiency = 100 - doaRate;
-                    var effElement = document.getElementById('efficiency_value');
-                    effElement.textContent = d3.format('.2f')(efficiency) + '%';
-                    effElement.className = 'stat-value ' + (efficiency > 98 ? 'success' : (efficiency > 95 ? 'warning' : 'danger'));
-                    document.getElementById('good_shares_pct').textContent = d3.format('.2f')(efficiency) + '%';
+                    // DOA Rate + Efficiency
+                    renderDoaRate(stats);
                     
                     // Hashrate periods
                     if (stats.hashrate_periods) {
@@ -901,10 +915,17 @@
                     
                     // Update share counts
                     if (stats.total_shares !== undefined) {
-                        document.getElementById('total_shares').textContent = stats.total_shares;
-                        document.getElementById('dead_shares').textContent = stats.dead_shares || 0;
-                        var deadPct = stats.total_shares > 0 ? (stats.dead_shares / stats.total_shares * 100) : 0;
+                        // Unknown-job submits (job ids this connection never
+                        // issued) are inside total/dead_shares; shown apart.
+                        var unknownJobs = stats.unknown_job_shares || 0;
+                        var ownShares = Math.max(0, stats.total_shares - unknownJobs);
+                        var deadShares = Math.max(0, (stats.dead_shares || 0) - unknownJobs);
+                        document.getElementById('total_shares').textContent = ownShares;
+                        document.getElementById('dead_shares').textContent = deadShares;
+                        var deadPct = ownShares > 0 ? (deadShares / ownShares * 100) : 0;
                         document.getElementById('dead_shares_pct').textContent = d3.format('.1f')(deadPct) + '%';
+                        document.getElementById('unknown_job_shares').textContent = unknownJobs;
+                        document.getElementById('unknown_job_line').style.display = unknownJobs > 0 ? '' : 'none';
                     }
                 }
                 
@@ -1556,15 +1577,7 @@
                     if (stats && stats.active) {
                         document.getElementById('current_hashrate').textContent = format_hashrate(stats.hashrate);
                         
-                        var doaRate = stats.doa_rate * 100;
-                        document.getElementById('doa_rate_inline').textContent = d3.format('.2f')(doaRate) + '%';
-                        document.getElementById('doa_rate_detail').textContent = d3.format('.2f')(doaRate) + '%';
-                        
-                        var efficiency = 100 - doaRate;
-                        var effElement = document.getElementById('efficiency_value');
-                        effElement.textContent = d3.format('.2f')(efficiency) + '%';
-                        effElement.className = 'stat-value ' + (efficiency > 98 ? 'success' : (efficiency > 95 ? 'warning' : 'danger'));
-                        document.getElementById('good_shares_pct').textContent = d3.format('.2f')(efficiency) + '%';
+                        renderDoaRate(stats);
                         
                         document.getElementById('share_difficulty').textContent = d3.format('.3r')(stats.share_difficulty);
                         document.getElementById('current_payout').textContent = d3.format('.4f')(stats.current_payout);

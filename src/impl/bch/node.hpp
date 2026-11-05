@@ -833,6 +833,21 @@ public:
     /// True if addr's IP matches a whitelist entry (IP or host:port).
 
 protected:
+    /// Ban the host behind a self-connection, as canonical does (#1716 part B).
+    void ban_self_connection(const NetService& addr);
+    /// One canonical hourly pass over m_banscores (p2poolBCH p2p.py:715).
+    void forgive_transgressions();
+    /// Apply every forgiveness pass due by `now` since the node started.
+    void run_forgiveness(std::chrono::steady_clock::time_point now);
+
+    // Per-host self-connection offence count (canonical Node.banscores). In
+    // memory only, as canonical. Touched on the IO thread only.
+    std::map<std::string, int> m_banscores;
+    // Hourly forgiveness clock (canonical forgiveness_task, p2p.py:712-713).
+    static constexpr std::chrono::seconds FORGIVENESS_INTERVAL{3600};
+    std::chrono::steady_clock::time_point m_forgiveness_epoch = std::chrono::steady_clock::now();
+    uint64_t m_forgiveness_passes = 0;
+
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;

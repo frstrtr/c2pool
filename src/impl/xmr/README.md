@@ -18,7 +18,7 @@ FCMP++/CARROT timing).
 | `pow/` | `randomx_verify.hpp` — c2pool's own two-cache **light-mode** (256 MiB, never the 2 GiB dataset) RandomX verifier over the vendored `third_party/randomx/` C API. `randomx_verify_kat.cpp` needs `librandomx.a`. | header compiles; KAT needs the lib |
 | `third_party/randomx/` | tevador/RandomX public headers + LICENSE (BSD-3, verbatim). The library is a pinned submodule at package time. | vendored |
 | `node/` | monerod adapter (X2): JSON-RPC + ZMQ → bounded mainchain index (≥ 2112-block seed reach), fee-sorted backlog, reorg/orphan events. Parsers are skeleton stubs. | index check GREEN; RPC/ZMQ skeleton |
-| `template/` | Whole-block template builder (p2pool plumbing, GPL-3.0-only): penalty-aware knapsack, `create_miner_tx`, per-worker extra-nonce jobs, Keccak-midstate opening. Pool model excised. | not built in CI (needs coin+primitives) |
+| `template/` | Whole-block template builder (clean-room from Monero-core v0.18.5.1 and the CryptoNote protocol; no p2pool code): penalty-aware knapsack, `create_miner_tx`, per-worker extra-nonce jobs, Keccak-midstate opening. Pool model excised. | not built in CI (needs coin+primitives) |
 | `stratum/` | CryptoNote / XMRig `login`/`job`/`submit` dialect. Separate from the v36 Bitcoin stratum. | selftest GREEN (53 KATs) |
 | `receipt/` | Family-B receipt envelope (`MoneroReceipt`) + the **inverted** `keyed_heavy` admission order (RandomX LAST). | check GREEN |
 | `wire/` | W3 carrier/receipt message codec (byte-exact, one-canon) + the RandomX-evaluation DoS budget. | check GREEN |
@@ -51,8 +51,8 @@ the new major version — do not edit the pre-CARROT path in place.
 ## Licensing
 
 c2pool is AGPL-3.0. RandomX + Monero-core crypto are BSD-3 (combine freely);
-p2pool-derived plumbing is GPL-3.0-only, combined under AGPLv3 §13 / GPLv3 §13
-and kept under its GPLv3 header. Fresh c2pool files are AGPL-3.0 and
+the lane holds no p2pool-derived code (the whole-block template is a clean-room
+implementation since 2026-10-04, design canon C32). Fresh c2pool files are AGPL-3.0 and
 attribution-clean. See `docs/xmr-lane/{LICENSING,PROVENANCE}.md`, the repo-root
 `NOTICE`, and `xmr_provenance.hpp`.
 

@@ -1,0 +1,38 @@
+#include "xmr/xmr_o2_template.hpp"           // O-2: monerod template provider + ITemplateSource (option A)
+static inline std::uint64_t snap_reward(const o2::MonerodTemplate& t)    { return t.expected_reward; }
+static inline std::string   snap_extra(const o2::MonerodTemplate& t) {
+    return "hashing=" + std::to_string(t.hashing_blob.size()) + "B full=" + std::to_string(t.full_blob.size()) + "B";
+}
+    // ── option A (default): monerod's own get_block_template ────────────────
+    const bool serving = !cfg.payout_address.empty();
+    o2::MonerodTemplateProvider provider(transport, cfg.payout_address, cfg.template_reserve_size);
+    o2::MonerodStratumTemplateSource template_source(provider, cfg.stratum_share_diff);
+    auto candidate = [&provider, &template_source](std::uint32_t tid, std::uint32_t en,
+                                                   sub::BlockCandidate& out) {
+        o2::MonerodTemplate t;
+        if (!provider.by_id(tid, t)) return false;
+        strat::TemplateJob tj;
+        if (!template_source.rebuild_blob(tid, en, tj)) return false;
+        out.template_id     = tid;
+        out.height          = t.height;
+        out.full_blob       = t.full_blob;
+        out.hashing_blob    = tj.blob;          // the exact blob served for this job
+        out.nonce_offset    = t.nonce_offset;
+        out.major_version   = t.major_version;
+        out.prev_id         = t.prev_id;
+        out.expected_reward = t.expected_reward;
+        out.reserved_offset = 0;                // single template, extra_nonce not baked
+        out.reserved_size   = 0;
+        return true;
+    };
+    return serve_and_run(cfg, transport, node, fc, found_q, payee_key, rx, serving,
+                         "no --payout-address", provider, template_source, candidate);
+        else if (a == "--template-reserve") cfg.template_reserve_size = u32();
+        else if (a == "--coinbase") {
+            const std::string m = value();
+            cs::one_of(a, m, {"monerod", "v37", "settlement", "v37-settlement"});
+            cfg.coinbase = (m == "v37" || m == "settlement" || m == "v37-settlement")
+                               ? CoinbaseMode::V37Settlement : CoinbaseMode::MonerodTemplate;
+        }
+                "  --template-reserve <n>       get_block_template reserve_size (default 0)\n"
+                "  --coinbase <monerod|v37>     monerod (default, option A) | v37 (option B)\n"

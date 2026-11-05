@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/replay_fold_engine.hpp>
+#include <impl/dash/coin/replay_fold_consumer.hpp>   // S1: a refused block does not latch the lane
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/llmq_commitment.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -55,6 +56,8 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <set>
+#include <span>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -329,8 +332,10 @@ static DmlFoldEngine seed_from_fixture(const PrestateFixture& fx)
     auto entries = fx.entries;
     uint256 anchor_hash;
     anchor_hash.SetHex(fx.blockhash_display);
+    // The fixtures are dashd `protx list` captures: their poSePenalty IS
+    // dashd's value, so the certainty bounds start exact.
     eng.seed(std::move(entries), fx.entries.size(), fx.height, anchor_hash,
-             fx.network);
+             fx.network, dash::coin::replay::SeedPenalties::Exact);
     EXPECT_EQ(eng.compute_sml_root().GetHex(), fx.mnroot_display)
         << "prestate does not reproduce the committed root at h=" << fx.height;
     return eng;
@@ -612,6 +617,10 @@ TEST(DashReplayFoldReal, PoSePunishAndCaseDBan2516412)
     ASSERT_NE(still_valid, nullptr);
     EXPECT_FALSE(still_valid->IsBanned());
     EXPECT_EQ(still_valid->nPoSePenalty, 1961);
+    // Exact seed => exact bounds through decay + punish + ban.
+    EXPECT_EQ(still_valid->nPoSePenaltyHi, 1961);
+    EXPECT_EQ(banned->nPoSePenaltyHi, 2972);
+    EXPECT_EQ(r.root_resolved_bans, 0u);
 
     expect_coinbase_pays(blk, eng, r);
 }
@@ -927,7 +936,7 @@ TEST(DashReplayFoldSynthetic, EmptyNetInfoRegistersBannedThenProUpServRevives)
     e2.netAddress = up.netInfo.ip;
     e2.netPort    = up.netInfo.port_be;
     auto r2 = eng.fold_block(
-        make_block(102, raw256(10), root_of({e2}), {uptx}), 102);
+        make_block(102, eng.block_hash(), root_of({e2}), {uptx}), 102);
     ASSERT_TRUE(r2.ok) << r2.error;
     EXPECT_EQ(r2.revived, 1u);
     EXPECT_FALSE(eng.find(mn)->IsBanned());
@@ -1001,7 +1010,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
         up.scriptOperatorPayout.m_data = script_bytes(0x99);
         auto uptx = make_special_tx(2, up, 2);
         auto r = eng.fold_block(
-            make_block(102, raw256(10), root_of({expected_entry_of(p, mn)}),
+            make_block(102, eng.block_hash(), root_of({expected_entry_of(p, mn)}),
                        {uptx}, &eng), 102);
         ASSERT_TRUE(r.ok) << r.error;
         EXPECT_FALSE(eng.find(mn)->scriptOperatorPayout.m_data.empty());
@@ -1027,7 +1036,7 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     e.keyIDVoting    = upr.keyIDVoting;
     e.isValid        = false; // banned until a ProUpServTx revives
     e.nType          = MnType::REGULAR;
-    auto r = eng.fold_block(make_block(103, raw256(11), root_of({e}), {uprtx}, &eng),
+    auto r = eng.fold_block(make_block(103, eng.block_hash(), root_of({e}), {uprtx}, &eng),
                             103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.banned, 1u);
@@ -1042,6 +1051,83 @@ TEST(DashReplayFoldSynthetic, OperatorKeyChangeResetsAndBans)
     EXPECT_EQ(st->scriptPayout.m_data, upr.scriptPayout.m_data);
     // The split BPS is DMN-level and survives the operator reset.
     EXPECT_EQ(st->nOperatorReward, 800);
+}
+
+// nOperatorReward == 10000 (the 2026-10-28 mn-payout-split-unprovable
+// incident class). dashd masternode/payments.cpp:65-79: with the operator
+// script set, operatorReward == masternodeReward, the owner remainder is 0 and
+// `if (masternodeReward > 0)` emits NO owner output — the coinbase pays the
+// projected masternode at its OPERATOR script only. The fold's pass-6 payee
+// cross-check must therefore look for that script; checking scriptPayout here
+// false-poisons a byte-correct fold (and this engine also runs on the cold
+// MN-CKPT path that feeds the diff store).
+TEST(DashReplayFoldSynthetic, ReplayFoldPayeeCheckAcceptsFullOperatorSplit)
+{
+    // Build the same two-block history twice: one engine sees the operator-
+    // only payment dashd makes, the other an owner-only payment dashd could
+    // not have made for this state.
+    auto history = [](DmlFoldEngine& eng, uint256& mn, CProRegTx& p) {
+        eng.seed({}, 0, 100, raw256(9));
+        p  = make_proreg(1, /*operator_reward_bps=*/10000);
+        auto tx = make_special_tx(1, p, 1);
+        mn = tx_hash_of(tx);
+        auto r1 = eng.fold_block(
+            make_block(101, raw256(9), root_of({expected_entry_of(p, mn)}),
+                       {tx}, &eng), 101);
+        ASSERT_TRUE(r1.ok) << r1.error;
+        // The operator sets its payout script (ProUpServTx). Block 102 is
+        // still built from the PRE-block list, where no operator script is
+        // set yet, so dashd pays the owner the whole share there.
+        CProUpServTx up;
+        up.nVersion  = ProTxVersion::BASIC_BLS;
+        up.proTxHash = mn;
+        up.netInfo   = p.netInfo;
+        up.scriptOperatorPayout.m_data = script_bytes(0x99);
+        auto uptx = make_special_tx(2, up, 2);
+        auto r2 = eng.fold_block(
+            make_block(102, eng.block_hash(), root_of({expected_entry_of(p, mn)}),
+                       {uptx}, &eng), 102);
+        ASSERT_TRUE(r2.ok) << r2.error;
+        ASSERT_EQ(eng.find(mn)->nOperatorReward, 10000);
+        ASSERT_EQ(eng.find(mn)->scriptOperatorPayout.m_data, script_bytes(0x99));
+    };
+    auto paying = [](const DmlFoldEngine& eng, const CProRegTx& p, const uint256& mn,
+                     const std::vector<unsigned char>& script) {
+        auto b = make_block(103, eng.block_hash(), root_of({expected_entry_of(p, mn)}));
+        TxOut out;
+        out.value = 77'055'682;
+        out.scriptPubKey.m_data = script;
+        b.m_txs[0].vout.push_back(std::move(out));
+        return b;
+    };
+
+    {
+        DmlFoldEngine eng(synth_cfg());
+        uint256 mn; CProRegTx p;
+        history(eng, mn, p);
+        if (HasFatalFailure()) return;
+        ASSERT_TRUE(eng.project_payee(103).has_value());
+        ASSERT_EQ(*eng.project_payee(103), mn);
+        auto r = eng.fold_block(paying(eng, p, mn, script_bytes(0x99)), 103);
+        ASSERT_TRUE(r.ok)
+            << "a coinbase paying ONLY the operator script is dashd's exact"
+               " output set for a bps=10000 masternode: " << r.error;
+        EXPECT_TRUE(r.payee_paid_verified);
+        EXPECT_FALSE(eng.poisoned());
+        EXPECT_EQ(eng.find(mn)->nLastPaidHeight, 103);
+    }
+    {
+        DmlFoldEngine eng(synth_cfg());
+        uint256 mn; CProRegTx p;
+        history(eng, mn, p);
+        if (HasFatalFailure()) return;
+        auto r = eng.fold_block(paying(eng, p, mn, p.scriptPayout.m_data), 103);
+        ASSERT_FALSE(r.ok)
+            << "an owner-only coinbase cannot have been built by dashd from a"
+               " bps=10000 state with an operator script — exact script"
+               " equality, never 'any script of this masternode'";
+        EXPECT_NE(r.error.find("PAYEE MISMATCH"), std::string::npos) << r.error;
+    }
 }
 
 TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
@@ -1067,7 +1153,7 @@ TEST(DashReplayFoldSynthetic, ProUpRevRevokesAndRecordsReason)
     e.proRegTxHash = mn;
     e.keyIDVoting  = p.keyIDVoting;
     e.isValid      = false;
-    auto r = eng.fold_block(make_block(102, raw256(10), root_of({e}), {revtx}, &eng),
+    auto r = eng.fold_block(make_block(102, eng.block_hash(), root_of({e}), {revtx}, &eng),
                             102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revoked, 1u);
@@ -1097,7 +1183,7 @@ TEST(DashReplayFoldSynthetic, CollateralReplacementRemovesOldMN)
     auto tx2 = make_special_tx(1, p2, 2);
     const uint256 mn2 = tx_hash_of(tx2);
     auto r = eng.fold_block(
-        make_block(102, raw256(10), root_of({expected_entry_of(p2, mn2)}),
+        make_block(102, eng.block_hash(), root_of({expected_entry_of(p2, mn2)}),
                    {tx2}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.collateral_replaced, 1u);
@@ -1180,7 +1266,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
 
     // Block 102: punish #1 → penalty 66, no ban (66 < 100), root unchanged.
     auto r = eng.fold_block(
-        make_block(102, raw256(10), root_of({ea, eb, ec}), {make_qc(4)}, &eng), 102);
+        make_block(102, eng.block_hash(), root_of({ea, eb, ec}), {make_qc(4)}, &eng), 102);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 1u);
     EXPECT_EQ(r.banned, 0u);
@@ -1193,7 +1279,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     auto ea_banned = ea;
     ea_banned.isValid = false;
     r = eng.fold_block(
-        make_block(103, raw256(11), root_of({ea_banned, eb, ec}),
+        make_block(103, eng.block_hash(), root_of({ea_banned, eb, ec}),
                    {make_qc(5)}, &eng), 103);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.decayed, 1u);
@@ -1213,7 +1299,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     null_qc.commitment.signers      = {false, false, false};
     null_qc.commitment.validMembers = {false, false, false};
     r = eng.fold_block(
-        make_block(104, raw256(12), root_of({ea_banned, eb, ec}),
+        make_block(104, eng.block_hash(), root_of({ea_banned, eb, ec}),
                    {make_special_tx(6, null_qc, 6)}, &eng), 104);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.punished, 0u);
@@ -1226,7 +1312,7 @@ TEST(DashReplayFoldSynthetic, PunishDecayBanReviveLifecycle)
     up.proTxHash = a;
     up.netInfo   = pa.netInfo;
     r = eng.fold_block(
-        make_block(105, raw256(13), root_of({ea, eb, ec}),
+        make_block(105, eng.block_hash(), root_of({ea, eb, ec}),
                    {make_special_tx(2, up, 7)}, &eng), 105);
     ASSERT_TRUE(r.ok) << r.error;
     EXPECT_EQ(r.revived, 1u);
@@ -1252,12 +1338,14 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
     // confirmedHash = hash(116) = that block's own hashPrevBlock.
     for (uint32_t h = 102; h <= 116; ++h) {
         auto r = eng.fold_block(
-            make_block(h, raw256(static_cast<uint8_t>(h)), root_of({e}), {}, &eng), h);
+            make_block(h, eng.block_hash(), root_of({e}), {}, &eng), h);
         ASSERT_TRUE(r.ok) << "h=" << h << ": " << r.error;
         EXPECT_EQ(r.confirmed, 0u) << "h=" << h;
         EXPECT_TRUE(eng.find(mn)->confirmedHash.IsNull()) << "h=" << h;
     }
-    const uint256 hash116 = raw256(117); // prev-hash we hand block 117
+    // The prev-link block 117 must carry = the cursor block (116) — and
+    // that hash is what becomes the confirmedHash.
+    const uint256 hash116 = eng.block_hash();
     auto e_conf = e;
     e_conf.confirmedHash = hash116;
     auto r = eng.fold_block(make_block(117, hash116, root_of({e_conf}), {}, &eng), 117);
@@ -1277,6 +1365,38 @@ TEST(DashReplayFoldSynthetic, ConfirmedHashSetAtMinimumConfirmations)
         std::memcpy(expect_pair.data(), out, 32);
     }
     EXPECT_EQ(eng.find(mn)->confirmedHashWithProRegTxHash, expect_pair);
+}
+
+// The engine's state is the post-state of (m_height, m_block_hash) and the
+// penalty oracle answers for exactly that pair (PR-B verify, must-fix
+// 2): a block whose prev-link names a different block is REFUSED — no
+// mutation, no poison (the held state is still right for its own block) —
+// and the correct child still folds afterwards.
+TEST(DashReplayFoldSynthetic, FoldRefusesABlockThatDoesNotExtendTheCursor)
+{
+    DmlFoldEngine eng(synth_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    auto p  = make_proreg(1);
+    auto tx = make_special_tx(1, p, 1);
+    const uint256 mn = tx_hash_of(tx);
+    const auto e = expected_entry_of(p, mn);
+    ASSERT_TRUE(eng.fold_block(
+        make_block(101, raw256(9), root_of({e}), {tx}, &eng), 101).ok);
+    const uint256 cursor = eng.block_hash();
+    const ReplayMNState before = *eng.find(mn);
+
+    auto r = eng.fold_block(make_block(102, raw256(0x55), root_of({e}), {}, &eng), 102);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("prev-link"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned()) << "a foreign block is a refusal, not a poison";
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_EQ(eng.block_hash(), cursor);
+    EXPECT_TRUE(*eng.find(mn) == before) << "a refused fold must not mutate";
+    EXPECT_EQ(eng.find(mn)->nLastPaidHeight, before.nLastPaidHeight);
+
+    auto ok = eng.fold_block(make_block(102, cursor, root_of({e}), {}, &eng), 102);
+    ASSERT_TRUE(ok.ok) << ok.error;
+    EXPECT_EQ(eng.height(), 102u);
 }
 
 TEST(DashReplayFoldSynthetic, RootMismatchIsAHardStopWithNamedHeight)
@@ -1424,6 +1544,303 @@ TEST(DashReplayFoldSynthetic, SnapshotV3FailLoudPaths)
     EXPECT_EQ(eng.size(), 1u);
     EXPECT_EQ(eng.height(), 100u);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Dash Core v23.1.9 port — chain-side rules (items A and B)
+// ════════════════════════════════════════════════════════════════════════
+
+// A seeded, already-confirmed masternode (pass 1 leaves it alone).
+static ReplayMNState v2319_mn(uint8_t tag, uint8_t type = MnType::REGULAR)
+{
+    ReplayMNState st;
+    st.nVersion = ProTxVersion::BASIC_BLS;
+    st.nType = type;
+    st.keyIDOwner = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.keyIDVoting = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.pubKeyOperator = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.collateralOutpoint.hash = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.netInfo.ip = seq_array<16>(static_cast<uint8_t>(0x10 + tag));
+    st.netInfo.port_be = 9999;
+    st.scriptPayout.m_data = script_bytes(static_cast<uint8_t>(0x60 + tag));
+    st.nRegisteredHeight = 50;
+    st.confirmedHash = raw256(0x77);
+    if (type == MnType::EVO) {
+        st.platformNodeID = raw160(static_cast<uint8_t>(0x90 + tag));
+        st.platformP2PPort = 26656;
+        st.platformHTTPPort = 443;
+    }
+    return st;
+}
+
+static MutableTransaction v2319_plain_tx(int32_t version, uint16_t type = 0)
+{
+    MutableTransaction tx;
+    tx.version = version;
+    tx.type = type;
+    TxIn in;
+    in.prevout.hash = raw256(0xA9);
+    in.prevout.index = 3;
+    in.sequence = 0xffffffff;
+    tx.vin.push_back(in);
+    TxOut out;
+    out.value = 5;
+    out.scriptPubKey.m_data = script_bytes(0xAA);
+    tx.vout.push_back(out);
+    if (type != 0) tx.extra_payload = {0x01, 0x02};
+    return tx;
+}
+
+// A5 (07494dd62): after DIP3 a negative-nVersion tx makes the block invalid
+// (bad-txns-version). The fold refuses it BEFORE any pass mutates the list —
+// no poison, cursor unmoved — and the valid block at that height still folds.
+TEST(DashReplayFoldSynthetic, NegativeVersionTxRefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;   // DIP3 active for blocks at h > 100
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    ASSERT_NE(eng.find(mn), nullptr);
+    const ReplayMNState before = *eng.find(mn);
+
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    ASSERT_FALSE(r.ok) << "dashd: bad-txns-version";
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned()) << "a block dashd rejects is another chain, not a desync";
+    EXPECT_EQ(eng.height(), 100u);
+    ASSERT_NE(eng.find(mn), nullptr);
+    EXPECT_TRUE(*eng.find(mn) == before) << "the held list is unchanged";
+
+    auto ok = eng.fold_block(make_block(101, raw256(9), root, {}, &eng), 101);
+    EXPECT_TRUE(ok.ok) << ok.error;
+}
+
+// A5 boundary: DeploymentActiveAfter(pindexPrev, DIP0003) is active for the
+// DIP3 block itself (height >= dip0003_height) — the first block the DML folds
+// is already under the rule. (Blocks below it are never folded at all.)
+TEST(DashReplayFoldSynthetic, NegativeVersionTxIsRefusedFromTheDip3BlockOn)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 101;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(0xFFFF)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-version"), std::string::npos) << r.error;
+    EXPECT_TRUE(r.refused_unchanged);
+}
+
+// S1: a block the engine refuses with its state unchanged (here one dashd
+// rejects, bad-txns-version) must not latch the consumer's sticky
+// divergence — the valid block at that height still folds through the same
+// consumer, and so does the next one.
+TEST(DashReplayFoldSynthetic, RefusedBlockDoesNotLatchTheConsumerAndTheValidSiblingFolds)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    const auto bad = make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng);
+    EXPECT_FALSE(consumer.on_replay_block(101, raw256(0xB1), bad));
+    EXPECT_FALSE(consumer.stats().diverged)
+        << "a refusal with the state unchanged is not a divergence";
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 1u);
+    EXPECT_EQ(eng.height(), 100u);
+
+    const auto good = make_block(101, raw256(9), root, {}, &eng);
+    EXPECT_TRUE(consumer.on_replay_block(101, raw256(0xB2), good));
+    EXPECT_FALSE(consumer.stats().diverged);
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_EQ(consumer.stats().blocks_folded, 1u);
+}
+
+// The pre-fold companions (the W4 quorum bridge, the mined-commitment index)
+// are forward-contiguous cursors. A block the fold refuses with its state
+// unchanged must not reach them, or they sit one block ahead and refuse the
+// valid sibling at the same height.
+TEST(DashReplayFoldSynthetic, RefusedBlockNeverReachesThePreFoldCompanions)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    const uint256 root = root_of({st.to_sml_entry(mn)});
+    dash::coin::replay::FoldReplayConsumer consumer(eng);
+
+    uint32_t companion = 100;    // a forward-contiguous companion cursor
+    std::vector<uint32_t> observed;
+    consumer.set_pre_fold([&](uint32_t h, const uint256&,
+                              const dash::coin::BlockType&) -> std::string {
+        observed.push_back(h);
+        if (h != companion + 1)
+            return "cursor is at h=" + std::to_string(companion);
+        companion = h;
+        return {};
+    });
+
+    // A block dashd rejects (negative nVersion), then one on another chain.
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB1), make_block(101, raw256(9), root, {v2319_plain_tx(0xFFFF)}, &eng)));
+    EXPECT_FALSE(consumer.on_replay_block(
+        101, raw256(0xB3), make_block(101, raw256(0x77), root, {}, &eng)));
+    EXPECT_EQ(consumer.stats().blocks_refused_unchanged, 2u);
+    EXPECT_EQ(consumer.refused_unchanged_count(), 2u);
+    EXPECT_TRUE(observed.empty()) << "a refused block reached a companion";
+    EXPECT_EQ(companion, 100u);
+
+    // The valid sibling: every companion accepts it.
+    EXPECT_TRUE(consumer.on_replay_block(
+        101, raw256(0xB2), make_block(101, raw256(9), root, {}, &eng)));
+    EXPECT_EQ(companion, 101u);
+    EXPECT_EQ(consumer.stats().quorum_lane_refusals, 0u)
+        << consumer.stats().first_quorum_refusal;
+    EXPECT_EQ(eng.height(), 101u);
+    EXPECT_NE(consumer.summary().find("refused_unchanged=2"), std::string::npos)
+        << consumer.summary();
+}
+
+// A6: an unknown special type post-DIP3 is bad-txns-type.
+TEST(DashReplayFoldSynthetic, UnknownSpecialTypePostDip3RefusesTheBlock)
+{
+    auto cfg = synth_cfg();
+    cfg.gates.dip0003_height = 100;
+    DmlFoldEngine eng(cfg);
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({st.to_sml_entry(mn)}),
+                   {v2319_plain_tx(3, /*type=*/42)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-txns-type"), std::string::npos) << r.error;
+    EXPECT_FALSE(eng.poisoned());
+    EXPECT_EQ(eng.height(), 100u);
+}
+
+// B9 (#7488): IsValidMnType is checked by name, ahead of the lookup.
+TEST(DashReplayFoldSynthetic, ProUpServInvalidNTypeRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    eng.seed({{mn, v2319_mn(11)}}, 1, 100, raw256(9));
+    CProUpServTx up;
+    up.nVersion  = ProTxVersion::BASIC_BLS;
+    up.nType     = 2;
+    up.proTxHash = mn;
+    up.netInfo.ip = seq_array<16>(0x19);
+    up.netInfo.port_be = 9999;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), uint256{}, {make_special_tx(2, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("(bad-protx-type)"), std::string::npos) << r.error;
+}
+
+// B9: a ProRegTx whose keyIDOwner an existing MN holds (bad-protx-dup-key).
+// The block commits the root a fold WITHOUT the check would compute, so the
+// only thing refusing it is the uniqueness rule.
+TEST(DashReplayFoldSynthetic, DupOwnerKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 mn = raw256(0xE1);
+    const auto st = v2319_mn(11);
+    eng.seed({{mn, st}}, 1, 100, raw256(9));
+    auto p = make_proreg(1);
+    p.keyIDOwner = st.keyIDOwner;
+    auto tx = make_special_tx(1, p, 1);
+    auto r = eng.fold_block(
+        make_block(101, raw256(9),
+                   root_of({st.to_sml_entry(mn), expected_entry_of(p, tx_hash_of(tx))}),
+                   {tx}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
+// B9 (#7846): keyIDOwner and platformNodeID are ONE namespace — both ways.
+TEST(DashReplayFoldSynthetic, OwnerPlatformNamespaceRefusesFold)
+{
+    {   // a ProRegTx owner key equal to an Evo MN's platformNodeID
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 evo = raw256(0xE2);
+        const auto se = v2319_mn(12, MnType::EVO);
+        eng.seed({{evo, se}}, 1, 100, raw256(9));
+        auto p = make_proreg(1);
+        p.keyIDOwner = se.platformNodeID;
+        auto tx = make_special_tx(1, p, 1);
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({se.to_sml_entry(evo), expected_entry_of(p, tx_hash_of(tx))}),
+                       {tx}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+    }
+    {   // an Evo ProUpServTx platformNodeID equal to another MN's owner key
+        DmlFoldEngine eng(synth_cfg());
+        const uint256 x = raw256(0xE1), evo = raw256(0xE3);
+        const auto sx = v2319_mn(11);
+        const auto se = v2319_mn(13, MnType::EVO);
+        eng.seed({{x, sx}, {evo, se}}, 2, 100, raw256(9));
+        CProUpServTx up;
+        up.nVersion = ProTxVersion::BASIC_BLS;
+        up.nType = MnType::EVO;
+        up.proTxHash = evo;
+        up.netInfo = se.netInfo;
+        up.platformNodeID = sx.keyIDOwner;
+        up.platformP2PPort = se.platformP2PPort;
+        up.platformHTTPPort = se.platformHTTPPort;
+        auto upd = se;
+        upd.platformNodeID = up.platformNodeID;
+        auto r = eng.fold_block(
+            make_block(101, raw256(9),
+                       root_of({sx.to_sml_entry(x), upd.to_sml_entry(evo)}),
+                       {make_special_tx(2, up, 1)}, &eng), 101);
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("bad-protx-dup-platformnodeid"), std::string::npos) << r.error;
+    }
+}
+
+// B9: a ProUpRegTx moving to an operator key another MN holds
+// (UpdateUniqueProperty throws => bad-protx-dup-key).
+TEST(DashReplayFoldSynthetic, DupOperatorKeyRefusesFold)
+{
+    DmlFoldEngine eng(synth_cfg());
+    const uint256 x = raw256(0xE1), y = raw256(0xE4);
+    const auto sx = v2319_mn(11);
+    const auto sy = v2319_mn(14);
+    eng.seed({{x, sx}, {y, sy}}, 2, 100, raw256(9));
+    CProUpRegTx up;
+    up.nVersion = ProTxVersion::BASIC_BLS;
+    up.proTxHash = y;
+    up.pubKeyOperator = sx.pubKeyOperator;
+    up.keyIDVoting = sy.keyIDVoting;
+    up.scriptPayout = sy.scriptPayout;
+    // What a fold without the rule produces: Y reset + banned on the new key.
+    auto ey = sy;
+    ey.ResetOperatorFields();
+    ey.BanIfNotBanned(101);
+    ey.nVersion = ProTxVersion::BASIC_BLS;
+    ey.pubKeyOperator = sx.pubKeyOperator;
+    auto r = eng.fold_block(
+        make_block(101, raw256(9), root_of({sx.to_sml_entry(x), ey.to_sml_entry(y)}),
+                   {make_special_tx(3, up, 1)}, &eng), 101);
+    ASSERT_FALSE(r.ok);
+    EXPECT_NE(r.error.find("bad-protx-dup-key"), std::string::npos) << r.error;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // task #154 — INCREMENTAL merkleRootMNList cache KATs.
@@ -1832,7 +2249,7 @@ TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeeMismatchFoldsThrough)
     PayeeGateFixture fx(/*enforcement_height=*/103);  // 102 < 103 ⇒ pre-enforcement
     ASSERT_TRUE(fx.eng.project_payee(102).has_value())
         << "a payee must be projected (else the test proves nothing)";
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_TRUE(r.ok) << "pre-enforcement payee mismatch must NOT poison (dashd "
@@ -1854,7 +2271,7 @@ TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
 {
     PayeeGateFixture fx(/*enforcement_height=*/102);  // 102 >= 102 ⇒ enforced
     ASSERT_TRUE(fx.eng.project_payee(102).has_value());
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/nullptr);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_FALSE(r.ok) << "at/after enforcement a payee mismatch MUST poison";
@@ -1868,11 +2285,463 @@ TEST(DashReplayFoldPreEnforcement, AtEnforcementPayeeMismatchStillPoisons)
 TEST(DashReplayFoldPreEnforcement, BelowEnforcementPayeePaidIsNotFlaggedSkipped)
 {
     PayeeGateFixture fx(/*enforcement_height=*/103);
-    auto pay_blk = make_block(102, raw256(9), fx.payment_root,
+    auto pay_blk = make_block(102, fx.eng.block_hash(), fx.payment_root,
                               /*special_txs=*/{}, /*pay_from=*/&fx.eng);
     auto r = fx.eng.fold_block(pay_blk, 102);
     ASSERT_TRUE(r.ok) << r.error;
     // Below enforcement the check is skipped regardless of whether the coinbase
     // happens to pay the projection; the flag reflects the GATE, not the match.
     EXPECT_TRUE(r.payee_check_preenforcement_skipped);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PoSe PENALTY CERTAINTY BOUNDS (design PR-B §4.2, KAT 13) — the penalty
+// oracle. nPoSePenalty is the LOWER bound (the model the ban is decided on),
+// nPoSePenaltyHi the UPPER bound; dashd's value sits between them.
+// ════════════════════════════════════════════════════════════════════════
+namespace pose_bounds_kat {
+
+using dash::coin::replay::PoSeBounds;
+using dash::coin::replay::PoSeExactness;
+using dash::coin::replay::SeedPenalties;
+
+// A confirmed, valid, regular MN as an anchor seed would carry it.
+static ReplayMNState synth_state(uint8_t tag, int32_t lo = 0)
+{
+    ReplayMNState st;
+    st.nVersion       = ProTxVersion::BASIC_BLS;
+    st.nType          = MnType::REGULAR;
+    st.internalId     = tag;
+    st.collateralOutpoint.hash  = raw256(static_cast<uint8_t>(0x40 + tag));
+    st.collateralOutpoint.index = 1;
+    st.netInfo.ip      = seq_array<16>(static_cast<uint8_t>(0x10 + tag));
+    st.netInfo.port_be = 9999;
+    st.keyIDOwner      = raw160(static_cast<uint8_t>(0x20 + tag));
+    st.pubKeyOperator  = seq_array<48>(static_cast<uint8_t>(0x30 + tag));
+    st.keyIDVoting     = raw160(static_cast<uint8_t>(0x50 + tag));
+    st.scriptPayout.m_data = script_bytes(static_cast<uint8_t>(0x60 + tag));
+    st.nRegisteredHeight = 1;
+    st.confirmedHash   = raw256(static_cast<uint8_t>(0x70 + tag));
+    st.nPoSePenalty    = lo;
+    return st;
+}
+
+// Independent hand-build of the DIP-4 entry (never the engine's own output).
+static CSimplifiedMNListEntry synth_entry(const uint256& protx,
+                                          const ReplayMNState& st, bool valid)
+{
+    CSimplifiedMNListEntry e;
+    e.nVersion       = st.nVersion;
+    e.proRegTxHash   = protx;
+    e.confirmedHash  = st.confirmedHash;
+    e.netAddress     = st.netInfo.ip;
+    e.netPort        = st.netInfo.port_be;
+    e.pubKeyOperator = st.pubKeyOperator;
+    e.keyIDVoting    = st.keyIDVoting;
+    e.isValid        = valid;
+    e.nType          = st.nType;
+    return e;
+}
+
+static MutableTransaction punish_qc(const uint256& quorum_hash,
+                                    std::vector<bool> valid, uint8_t vin_tag)
+{
+    CFinalCommitmentTxPayload qc;
+    qc.nVersion = 1;
+    qc.nHeight  = 0;
+    qc.commitment.nVersion   = CFinalCommitment::BASIC_BLS_NON_INDEXED_QUORUM_VERSION;
+    qc.commitment.llmqType   = CFinalCommitment::LLMQ_100_67;
+    qc.commitment.quorumHash = quorum_hash;
+    qc.commitment.signers      = valid;
+    qc.commitment.validMembers = valid;
+    qc.commitment.quorumPublicKey = seq_array<48>(0xD0);
+    qc.commitment.quorumVvecHash  = raw256(0xD1);
+    qc.commitment.quorumSig  = seq_array<96>(0xD2);
+    qc.commitment.membersSig = seq_array<96>(0xD3);
+    return make_special_tx(6, qc, vin_tag);
+}
+
+// Three seeded MNs a, b, c (count 3 => CalcMaxPoSePenalty 100, P = 66, seed
+// ceiling 200) with a quorum whose members are (a, b, c) in bitset order.
+struct BoundsChain
+{
+    DmlFoldEngine eng{synth_cfg()};
+    uint256 a{raw256(0xE1)}, b{raw256(0xE2)}, c{raw256(0xE3)};
+    std::map<uint256, ReplayMNState> st;
+    uint256  quorum{raw256(0xC0)};
+    uint32_t h{100};
+    uint256  prev{raw256(9)};
+    uint8_t  tag{10};
+
+    explicit BoundsChain(SeedPenalties mode, int32_t lo_a = 0)
+    {
+        st[a] = synth_state(1, lo_a);
+        st[b] = synth_state(2);
+        st[c] = synth_state(3);
+        eng.seed({{a, st[a]}, {b, st[b]}, {c, st[c]}}, 3, h, prev, "mainnet",
+                 mode);
+        eng.set_members_fn([this](uint8_t, const uint256& qh)
+                               -> std::optional<std::vector<uint256>> {
+            if (qh == quorum) return std::vector<uint256>{a, b, c};
+            return std::nullopt;
+        });
+    }
+
+    uint256 root(const std::set<uint256>& banned) const
+    {
+        std::vector<CSimplifiedMNListEntry> v;
+        for (const auto& [p, s] : st) v.push_back(synth_entry(p, s, !banned.count(p)));
+        return root_of(std::move(v));
+    }
+
+    MutableTransaction qc_marking(const uint256& who)
+    {
+        return punish_qc(quorum, {who != a, who != b, who != c}, ++tag);
+    }
+
+    MutableTransaction proupserv(const uint256& who)
+    {
+        CProUpServTx up;
+        up.nVersion  = ProTxVersion::BASIC_BLS;
+        up.proTxHash = who;
+        up.netInfo   = st.at(who).netInfo;   // root-neutral service update
+        return make_special_tx(2, up, ++tag);
+    }
+
+    // Fold the next block; `banned_after` is the set dashd's committed root
+    // carries (the answer key the test chooses).
+    FoldResult next(std::vector<MutableTransaction> txs,
+                    const std::set<uint256>& banned_after = {})
+    {
+        ++h;
+        auto blk = make_block(h, prev, root(banned_after), std::move(txs), &eng);
+        auto r = eng.fold_block(blk, h);
+        if (r.ok) prev = DmlFoldEngine::block_header_hash(blk);
+        return r;
+    }
+
+    PoSeBounds bounds(const uint256& p) const { return *eng.pose_bounds(p); }
+};
+
+} // namespace pose_bounds_kat
+
+using namespace pose_bounds_kat;
+
+// Seed without penalties: lo = 0 (the placeholder), hi = the ceiling
+// 2 x CalcMaxPoSePenalty. Seed WITH dashd's penalties: hi = lo. The caller's
+// own nPoSePenaltyHi is ignored either way. Mutation "seed hi=0" reds here.
+TEST(DashPoSeBounds, UnknownSeedWidensHiExactSeedKeepsItTight)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown, /*lo_a=*/7);
+        EXPECT_EQ(ch.eng.calc_max_pose_penalty(), 100);
+        EXPECT_EQ(ch.eng.seed_penalty_ceiling(), 200);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 7);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 200);
+        EXPECT_EQ(ch.bounds(ch.b).lo, 0);
+        EXPECT_EQ(ch.bounds(ch.b).hi, 200);
+        const PoSeExactness x = ch.eng.pose_exactness();
+        EXPECT_EQ(x.valid_exact, 0u);
+        EXPECT_EQ(x.valid_inexact, 3u);
+        EXPECT_EQ(x.max_gap, 200);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Exact, /*lo_a=*/7);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 7);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 7);
+        EXPECT_EQ(ch.bounds(ch.b).hi, 0);
+        EXPECT_EQ(ch.eng.pose_exactness().valid_exact, 3u);
+    }
+    {
+        // Default is Unknown, and a stray caller-side hi never survives.
+        DmlFoldEngine eng(synth_cfg());
+        auto s = synth_state(1, 0);
+        s.nPoSePenaltyHi = 3;
+        eng.seed({{raw256(0xE1), s}}, 1, 100, raw256(9));
+        EXPECT_EQ(eng.find(raw256(0xE1))->nPoSePenaltyHi, 200);
+    }
+}
+
+// Convergence: with no punish after the seed, hi decays one per block and the
+// bound is exact (0) after exactly `ceiling` blocks.
+TEST(DashPoSeBounds, BoundsConvergeOverACleanRun)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    for (int k = 1; k <= 200; ++k) {
+        auto r = ch.next({});
+        ASSERT_TRUE(r.ok) << "k=" << k << " " << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).hi, 200 - k);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 0);
+        if (k == 199) EXPECT_EQ(ch.eng.pose_exactness().valid_inexact, 3u);
+    }
+    const PoSeExactness x = ch.eng.pose_exactness();
+    EXPECT_EQ(x.valid_exact, 3u);
+    EXPECT_EQ(x.valid_inexact, 0u);
+    EXPECT_EQ(x.max_gap, 0);
+}
+
+// A punish moves BOTH bounds (decay first, then +P, clamp at max); the ban is
+// decided on lo only. dashd's hidden value 0 => no ban at the first punish,
+// the root is unchanged and nothing needs resolving; the second punish takes
+// lo to max and the model bans.
+TEST(DashPoSeBounds, PunishMovesBothBoundsAndTheBanStaysOnLo)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    auto r = ch.next({ch.qc_marking(ch.a)});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.punished, 1u);
+    EXPECT_EQ(r.banned, 0u);
+    EXPECT_EQ(r.root_resolved_bans + r.root_resolved_nobans, 0u);
+    EXPECT_EQ(ch.bounds(ch.a).lo, 66);          // 0 -> decay 0 -> +66
+    EXPECT_EQ(ch.bounds(ch.a).hi, 100);         // 200 -> 199 -> +66 -> clamp 100
+    EXPECT_FALSE(ch.bounds(ch.a).banned);
+    EXPECT_EQ(ch.bounds(ch.b).hi, 199);         // decay only
+
+    r = ch.next({ch.qc_marking(ch.a)}, {ch.a});
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.banned, 1u);
+    EXPECT_EQ(ch.bounds(ch.a).lo, 100);         // 65 + 66 -> clamp 100 = max
+    EXPECT_EQ(ch.bounds(ch.a).hi, 100);         // 99 + 66 -> clamp 100
+    EXPECT_TRUE(ch.bounds(ch.a).banned);
+    EXPECT_EQ(ch.eng.find(ch.a)->nPoSeBanHeight, 102);
+}
+
+// The ambiguous band (lo < max <= hi): dashd MAY have banned. The committed
+// root decides — exactly one candidate subset reproduces it, and it is
+// adopted (banned, penalty = max exactly). With the resolver removed this
+// block poisons (the pre-bounds behaviour on an unknown-penalty seed).
+TEST(DashPoSeBounds, AmbiguousPunishIsResolvedFromTheCommittedRoot)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a)}, /*dashd banned=*/{ch.a});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.root_resolved_bans, 1u);
+        EXPECT_EQ(r.banned, 1u);
+        EXPECT_EQ(r.computed_root, r.committed_root);
+        EXPECT_TRUE(ch.bounds(ch.a).banned);
+        EXPECT_EQ(ch.bounds(ch.a).lo, 100);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+        EXPECT_EQ(ch.eng.find(ch.a)->nPoSeBanHeight, 101);
+        // and the fold keeps going on the adopted state
+        auto r2 = ch.next({}, {ch.a});
+        ASSERT_TRUE(r2.ok) << r2.error;
+    }
+    {
+        // A divergence the PoSe ambiguity cannot explain (b banned, b was
+        // never punished) still poisons, exactly as before.
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a)}, {ch.b});
+        ASSERT_FALSE(r.ok);
+        EXPECT_NE(r.error.find("ROOT MISMATCH"), std::string::npos) << r.error;
+        EXPECT_TRUE(ch.eng.poisoned());
+    }
+    {
+        // An EXACT seed never enters the band: lo = hi = 66 < 100, so a root
+        // showing `a` banned is a genuine divergence and poisons.
+        BoundsChain ch(SeedPenalties::Exact);
+        auto r = ch.next({ch.qc_marking(ch.a)}, {ch.a});
+        ASSERT_FALSE(r.ok);
+        EXPECT_TRUE(ch.eng.poisoned());
+    }
+}
+
+// Same block: ambiguous punish of `a`, then a ProUpServTx for `a`. dashd may
+// have banned and then revived it (penalty 0) — indistinguishable by the root
+// — so the lower bound must drop to 0. Before the punish, or after an exact
+// (non-ambiguous) punish, the ProUpServTx leaves the bounds alone.
+TEST(DashPoSeBounds, ProUpServAfterAmbiguousPunishWidensTheLowerBound)
+{
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.qc_marking(ch.a), ch.proupserv(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 0);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+        EXPECT_FALSE(ch.bounds(ch.a).banned);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Unknown);
+        auto r = ch.next({ch.proupserv(ch.a), ch.qc_marking(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 66);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 100);
+    }
+    {
+        BoundsChain ch(SeedPenalties::Exact);
+        auto r = ch.next({ch.qc_marking(ch.a), ch.proupserv(ch.a)});
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(ch.bounds(ch.a).lo, 66);
+        EXPECT_EQ(ch.bounds(ch.a).hi, 66);
+    }
+}
+
+// The oracle accessor answers ONLY for the post-state of the exact block the
+// engine stands on, never when poisoned, never for an MN it does not hold.
+TEST(DashPoSeBounds, OracleAccessorAnswersOnlyAtItsOwnTip)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    ASSERT_TRUE(ch.eng.pose_bounds_at(100, raw256(9), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(101, raw256(9), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(8), ch.a).has_value());
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(9), raw256(0xEE)).has_value());
+
+    ASSERT_TRUE(ch.next({ch.qc_marking(ch.a)}).ok);
+    auto v = ch.eng.pose_bounds_at(101, ch.prev, ch.a);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->lo, 66);
+    EXPECT_EQ(v->hi, 100);
+    EXPECT_FALSE(ch.eng.pose_bounds_at(100, raw256(9), ch.a).has_value());
+
+    const uint256 tip = ch.prev;
+    ASSERT_FALSE(ch.next({}, {ch.c}).ok);        // poisons at 102
+    EXPECT_FALSE(ch.eng.pose_bounds_at(101, tip, ch.a).has_value());
+}
+
+// v4 round trip carries both bounds and is byte-stable.
+TEST(DashPoSeBounds, SnapshotV4RoundTripCarriesTheBounds)
+{
+    BoundsChain ch(SeedPenalties::Unknown);
+    ASSERT_TRUE(ch.next({ch.qc_marking(ch.a)}).ok);
+    const auto bytes = ch.eng.save_snapshot();
+    ASSERT_EQ(std::memcmp(bytes.data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+
+    DmlFoldEngine e2(synth_cfg());
+    std::string err;
+    ASSERT_TRUE(e2.load_snapshot(bytes, err)) << err;
+    EXPECT_EQ(e2.loaded_snapshot_version(), 4u);
+    for (const auto& p : {ch.a, ch.b, ch.c}) {
+        EXPECT_EQ(e2.find(p)->nPoSePenalty, ch.eng.find(p)->nPoSePenalty);
+        EXPECT_EQ(e2.find(p)->nPoSePenaltyHi, ch.eng.find(p)->nPoSePenaltyHi);
+    }
+    EXPECT_EQ(e2.find(ch.a)->nPoSePenaltyHi, 100);
+    EXPECT_EQ(e2.find(ch.b)->nPoSePenaltyHi, 199);
+    EXPECT_EQ(e2.save_snapshot(), bytes);
+    EXPECT_TRUE(e2.at_block(101, ch.prev));
+}
+
+// A v3 file (no bound on disk) still loads, with hi widened to the ceiling —
+// the same reading as an Unknown-penalty seed. Magic/version must agree.
+TEST(DashPoSeBounds, SnapshotV3LoadsWithTheUpperBoundAtTheCeiling)
+{
+    auto v3_bytes = [](const char* magic, uint32_t version,
+                       const std::vector<std::pair<uint256, ReplayMNState>>& es) {
+        ::PackStream s;
+        s.write(std::as_bytes(std::span<const char>(magic, 24)));
+        s << version;
+        s << std::string("mainnet");
+        s << uint32_t{100};
+        s << raw256(9);
+        s << uint64_t{es.size()};
+        s << uint64_t{es.size()};
+        for (const auto& [p, st] : es) { s << p; s << st; }
+        auto sp = s.get_span();
+        uint256 d;
+        CHash256()
+            .Write(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(sp.data()), sp.size()))
+            .Finalize(std::span<unsigned char>(d.data(), 32));
+        s << d;
+        auto full = s.get_span();
+        return std::vector<uint8_t>(
+            reinterpret_cast<const uint8_t*>(full.data()),
+            reinterpret_cast<const uint8_t*>(full.data()) + full.size());
+    };
+    const std::vector<std::pair<uint256, ReplayMNState>> es = {
+        {raw256(0xE1), synth_state(1, 0)},
+        {raw256(0xE2), synth_state(2, 150)},
+        {raw256(0xE3), synth_state(3, 0)}};
+
+    DmlFoldEngine e(synth_cfg());
+    std::string err;
+    ASSERT_TRUE(e.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v03", 3, es), err))
+        << err;
+    EXPECT_EQ(e.loaded_snapshot_version(), 3u);
+    EXPECT_EQ(e.find(raw256(0xE1))->nPoSePenalty, 0);
+    EXPECT_EQ(e.find(raw256(0xE1))->nPoSePenaltyHi, 200);
+    EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenalty, 150);
+    EXPECT_EQ(e.find(raw256(0xE2))->nPoSePenaltyHi, 200);
+    // Re-saved as v4.
+    EXPECT_EQ(std::memcmp(e.save_snapshot().data(), "C2POOL-DASH-DML-SNAP/v04", 24), 0);
+
+    DmlFoldEngine e2(synth_cfg());
+    EXPECT_FALSE(e2.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v03", 4, es), err));
+    EXPECT_FALSE(e2.load_snapshot(v3_bytes("C2POOL-DASH-DML-SNAP/v04", 3, es), err));
+    EXPECT_EQ(e2.size(), 0u);
+}
+
+// REAL CHAIN BYTES, h=2516412 (the case-D event): what an anchor seeded from
+// an SML (no penalties) sees. Every MN starts at [0, 2 x 2972]; dashd's own
+// pre-state value is inside the interval for all 2972. The block punishes
+// two MNs into the ambiguous band; the committed root proves one ban
+// (1e5112a9…, dashd 1937 -> clamp 2972) and one non-ban (104b336e…, dashd
+// 0 -> 1961), and after the fold every MN's dashd value (the exact-seeded
+// engine) is still bracketed. The exact seed stays exact throughout.
+TEST(DashPoSeBoundsReal, UnknownSeedBracketsDashdAndTheRootResolvesCaseD2516412)
+{
+    auto fx = parse_prestate(kDashReplayPrestate2516411);
+    auto qf = parse_quorum(kDashReplayQuorum2516412);
+    const uint256 quorum_hash = from_display(qf.quorum_hash_display.c_str());
+    auto members = [&](uint8_t t, const uint256& qh)
+        -> std::optional<std::vector<uint256>> {
+        if (t == qf.llmq_type && qh == quorum_hash) return qf.members;
+        return std::nullopt;
+    };
+    uint256 anchor_hash;
+    anchor_hash.SetHex(fx.blockhash_display);
+
+    FoldConfig cfg;
+    cfg.enabled = true;
+    DmlFoldEngine truth(cfg);   // dashd's penalties (protx list): EXACT
+    {
+        auto es = fx.entries;
+        truth.seed(std::move(es), fx.entries.size(), fx.height, anchor_hash,
+                   fx.network, SeedPenalties::Exact);
+    }
+    DmlFoldEngine blind(cfg);   // an SML anchor: penalties unknown
+    {
+        auto es = fx.entries;
+        for (auto& [p, st] : es) st.nPoSePenalty = 0;
+        blind.seed(std::move(es), fx.entries.size(), fx.height, anchor_hash,
+                   fx.network, SeedPenalties::Unknown);
+    }
+    EXPECT_EQ(blind.compute_sml_root().GetHex(), kRoot2516411);
+    EXPECT_EQ(blind.seed_penalty_ceiling(), 2 * 2972);
+    for (const auto& [p, st] : truth.entries()) {
+        const auto* bs = blind.find(p);
+        ASSERT_NE(bs, nullptr);
+        EXPECT_LE(bs->nPoSePenalty, st.nPoSePenalty);
+        EXPECT_GE(bs->nPoSePenaltyHi, st.nPoSePenalty);
+    }
+    EXPECT_EQ(truth.pose_exactness().valid_inexact, 0u);
+
+    truth.set_members_fn(members);
+    blind.set_members_fn(members);
+    const auto blk = parse_block(kDashReplayBlock2516412);
+    auto rt = truth.fold_block(blk, 2516412);
+    ASSERT_TRUE(rt.ok) << rt.error;
+    EXPECT_EQ(rt.root_resolved_bans, 0u);         // exact: the model banned it
+    auto rb = blind.fold_block(blk, 2516412);
+    ASSERT_TRUE(rb.ok) << rb.error;
+    EXPECT_EQ(rb.computed_root.GetHex(), kRoot2516412);
+    EXPECT_EQ(rb.root_resolved_bans, 1u);
+    EXPECT_EQ(rb.root_resolved_nobans, 1u);
+
+    const uint256 to_ban   = from_display(kBannedMN);
+    const uint256 punished = from_display(kPunishedMN);
+    EXPECT_TRUE(blind.find(to_ban)->IsBanned());
+    EXPECT_EQ(blind.find(to_ban)->nPoSeBanHeight, 2516412);
+    EXPECT_EQ(blind.find(to_ban)->nPoSePenalty, 2972);
+    EXPECT_EQ(blind.find(to_ban)->nPoSePenaltyHi, 2972);
+    EXPECT_EQ(blind.find(punished)->nPoSePenalty, 1961);
+    EXPECT_EQ(blind.find(punished)->nPoSePenaltyHi, 2971);   // proven < max
+
+    for (const auto& [p, st] : truth.entries()) {
+        const auto* bs = blind.find(p);
+        ASSERT_NE(bs, nullptr);
+        EXPECT_EQ(bs->IsBanned(), st.IsBanned());
+        EXPECT_LE(bs->nPoSePenalty, st.nPoSePenalty) << p.GetHex();
+        EXPECT_GE(bs->nPoSePenaltyHi, st.nPoSePenalty) << p.GetHex();
+        EXPECT_EQ(st.nPoSePenalty, st.nPoSePenaltyHi) << "exact seed drifted";
+    }
 }

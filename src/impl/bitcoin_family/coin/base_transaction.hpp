@@ -18,6 +18,9 @@ namespace coin
 struct TxParams
 {
     const bool allow_witness;
+    // LTC only: serialize the MWEB part (flag 0x08) when witnesses are
+    // serialized too. Off for the wtxid (litecoind SERIALIZE_NO_MWEB).
+    const bool allow_mweb{true};
 
     SER_PARAMS_OPFUNC
 };

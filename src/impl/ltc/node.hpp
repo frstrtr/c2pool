@@ -362,19 +362,42 @@ protected:
             }
         }
 
-        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
-        // Carry the last-good pool hashrate forward when this cycle produced none
-        // (empty/short chain), so a transient gap does not blank the graph; the
-        // web fn applies the 600 s staleness bound on pool_hashrate_ts to break
-        // the line if think() itself has stalled.
-        if (s.pool_hashrate <= 0.0 && m_snapshot.pool_hashrate > 0.0) {
-            s.pool_hashrate = m_snapshot.pool_hashrate;
-            s.pool_hashrate_ts = m_snapshot.pool_hashrate_ts;
+        {
+            std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+            // Carry the last-good pool hashrate forward when this cycle produced none
+            // (empty/short chain), so a transient gap does not blank the graph; the
+            // web fn applies the 600 s staleness bound on pool_hashrate_ts to break
+            // the line if think() itself has stalled.
+            if (s.pool_hashrate <= 0.0 && m_snapshot.pool_hashrate > 0.0) {
+                s.pool_hashrate = m_snapshot.pool_hashrate;
+                s.pool_hashrate_ts = m_snapshot.pool_hashrate_ts;
+            }
+            m_snapshot = s;
         }
-        m_snapshot = s;
+
+        // Still under the exclusive tracker lock, after the best-share
+        // decision: consumers copy what they need from the tracker now
+        // (set_locked_best_hook) instead of trying for the lock later.
+        run_locked_best_hook();
+    }
+    /// Compute thread, exclusive tracker lock held, right after
+    /// m_best_share_hash is set (publish_snapshot, and clean_tracker before
+    /// its prune).
+    void run_locked_best_hook()
+    {
+        std::lock_guard<std::mutex> hook_lock(m_locked_best_hook_mutex);
+        if (m_locked_best_hook) {
+            try {
+                m_locked_best_hook(m_tracker, m_best_share_hash);
+            } catch (const std::exception& e) {
+                LOG_WARNING << "[locked-best-hook] " << e.what();
+            }
+        }
     }
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
+    std::mutex m_locked_best_hook_mutex;
+    std::function<void(ShareTracker&, const uint256&)> m_locked_best_hook;
 
     // ── Lock-free peer-info snapshot (display-only) ──────────────────────
     // m_peers / m_outbound_addrs are IO-thread-owned with NO lock; the
@@ -551,6 +574,13 @@ public:
     // BaseNode:
     void send_ping(peer_ptr peer) override;
     std::optional<pool::PeerConnectionType> handle_version(std::unique_ptr<RawMessage> rmsg, peer_ptr peer) override;
+
+    /// Ban the host behind a self-connection, as canonical does (#1716 part B).
+    void ban_self_connection(const NetService& addr);
+    /// One canonical hourly pass over m_banscores (p2pool-merged-v36 p2p.py:787).
+    void forgive_transgressions();
+    /// Apply every forgiveness pass due by `now` since the node started.
+    void run_forgiveness(std::chrono::steady_clock::time_point now);
 
     // ltc
     void send_version(peer_ptr peer);
@@ -787,6 +817,15 @@ public:
     /// Graceful shutdown: flush pending verified/removal buffers to LevelDB.
     void shutdown();
 
+    /// Before the owner's objects go away: no compute cycle reaches them
+    /// again. The locked-best hook is cleared (waiting out a running call),
+    /// the think and verify pools are stopped (queued work dropped) and
+    /// joined within `deadline`. False when a running cycle outlived it (the
+    /// caller must then exit without destroying what the cycle uses). A
+    /// cycle left running after its owner's scope used freed objects: a
+    /// segfault, or a hang (live 10-31).
+    bool stop_compute(std::chrono::milliseconds deadline);
+
     /// Start dialing outbound peers from AddrStore / bootstrap list.
     /// Maintains target outbound peer count active outbound connections.
     void start_outbound_connections();
@@ -931,6 +970,19 @@ public:
     using block_rel_height_fn_t = std::function<int32_t(uint256)>;
     void set_block_rel_height_fn(block_rel_height_fn_t fn) { m_block_rel_height_fn = std::move(fn); }
 
+    /// Called on the compute thread while it holds the tracker lock
+    /// exclusively, each time it publishes the lock-free snapshot (after
+    /// every best-share decision), with the tracker and the best share: a
+    /// consumer copies what it needs from the tracker then instead of trying
+    /// for the lock later (the merged payouts' PPLNS weights). It must not
+    /// call back into the node.
+    using locked_best_hook_t = std::function<void(ShareTracker&, const uint256& best)>;
+    void set_locked_best_hook(locked_best_hook_t fn)
+    {
+        std::lock_guard<std::mutex> lock(m_locked_best_hook_mutex);
+        m_locked_best_hook = std::move(fn);
+    }
+
     /// Lock-free stats snapshot — published by think(), never fails, never needs tracker lock.
     /// Inline definition must precede callers in the same header.
     TrackerSnapshot get_tracker_snapshot() const;
@@ -987,6 +1039,13 @@ public:
 
 protected:
     std::string m_software_version = "/c2pool:0.1/";  // overridden by set_software_version()
+    // Per-host self-connection offence count (canonical Node.banscores). In
+    // memory only, as canonical. Touched on the IO thread only.
+    std::map<std::string, int> m_banscores;
+    // Hourly forgiveness clock (canonical forgiveness_task, p2p.py:783-784).
+    static constexpr std::chrono::seconds FORGIVENESS_INTERVAL{3600};
+    std::chrono::steady_clock::time_point m_forgiveness_epoch = std::chrono::steady_clock::now();
+    uint64_t m_forgiveness_passes = 0;
     std::function<void(const uint256&)> m_on_bestblock;
     std::function<void()> m_on_best_share_changed;
     std::function<double()> m_local_hashrate_fn;

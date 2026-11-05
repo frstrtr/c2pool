@@ -98,7 +98,11 @@ inline void verify_version_transition(
                     new_ver_weight = new_ver_weight + w;
             }
             // canonical: counts.get(VERSION,0) < sum(counts)*60//100
-            if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+            // The threshold is FLOOR(total*60/100). Cross-multiplying
+            // (new*100 < total*60) is not equivalent: when 60*total is not a
+            // multiple of 100 it rejects new == floor(0.6*total), which the
+            // oracle accepts -- a share-validity split at a version switch.
+            if (new_ver_weight < (total_weight * uint32_t(60)) / WeightT(100))
                 throw std::invalid_argument("switch without enough hash power upgraded");
         }
         else if (parent_version == share_version + 1)

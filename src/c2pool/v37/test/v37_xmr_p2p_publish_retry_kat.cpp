@@ -13,22 +13,24 @@
 // P2pBlockPublisher's success condition is a peer receipt. Until this branch a
 // found block whose 2008 reached no peer (every monerod restarting, every link
 // just re-dialled) was counted and DROPPED: it sat on our own index, nobody
-// was ever told about it, and no FoundBlockEvent was pushed. Now it is parked
-// and re-announced on a bounded backoff. Pinned here, with an injected clock:
+// was ever told about it, and no found event was delivered. Now it is parked
+// and re-announced on a bounded backoff. Pinned here on the publisher's
+// counters and its found hook, with an injected clock:
 //
-//   R1  zero peers -> parked, NOT booked, NOT silently dropped; failed() still
-//       counts the first push exactly as before.
-//   R2  a peer appears -> the next due tick re-announces, and THE one
-//       FoundBlockEvent is pushed; later ticks send nothing and push nothing,
-//       and a repeated submit of the same block is not a second event.
+//   R1  zero peers -> parked, no found event, NOT silently dropped; failed()
+//       counts the first push.
+//   R2  a peer appears -> the next due tick re-announces, and THE one found
+//       event is delivered; later ticks send nothing and deliver nothing, and
+//       a repeated submit of the same block is not a second event.
 //   R3  peers never appear -> bounded: at most max_attempts re-announce frames,
-//       nothing past the window, ABANDONED at ERROR, nothing booked -- and the
+//       nothing past the window, ABANDONED at ERROR, no found event -- and the
 //       line says whether the block is on our own best chain.
 //   R4  our own best chain no longer carries the block -> dropped on the first
-//       due tick without another frame (re-announcing a lost height helps no
-//       one).
-//   R5  what did NOT change: solo keeps its own rule, a refused block is never
-//       parked, and a block that reached a peer first time is booked at once.
+//       due tick without another frame.
+//   R5  solo ON + own index accepts -> solo_landed() == 1, nothing parked;
+//       solo ON + own index refuses -> failed() == 1, no landing, nothing
+//       parked; a refused block is never parked; a block that reached a peer
+//       first time is delivered at once.
 //
 // No sockets, no daemon, no RandomX, no threads. Links xmr_node + xmr_coin.
 //
@@ -111,8 +113,8 @@ struct Rig {
     native::fakes::FakeMinerDataSource bodies;
     native::fakes::FakeChain           chain;     // accepts our own block
     native::relay::LevinBlockRelay     relay;
-    submit::FoundBlockQueue            found;
     o2::P2pBlockPublisher              pub;
+    std::vector<submit::FoundBlockEvent> found;   // the found hook's events
     std::uint64_t                      now = 1'000'000;
     std::vector<std::string>           errors;    // the ERROR log lines
     bool                               corrupt_id = false;   // hashing blob != full blob
@@ -127,7 +129,7 @@ struct Rig {
     explicit Rig(const BlockFixture& fx, bool on_best_chain = true)
         : f(fx),
           relay(port, native::relay::DaemonSubmitSink{}, &bodies, &chain, relay_cfg()),
-          pub(relay, found, [this](std::uint32_t, std::uint32_t, submit::BlockCandidate& out) {
+          pub(relay, [this](std::uint32_t, std::uint32_t, submit::BlockCandidate& out) {
               out.template_id     = 1;
               out.height          = f.height;
               out.full_blob       = f.blob;
@@ -137,6 +139,7 @@ struct Rig {
               out.expected_reward = 600000000000ull;
               return true;
           }) {
+        pub.set_found_hook([this](const submit::FoundBlockEvent& e) { found.push_back(e); });
         pub.enable_network_relay(true);
         pub.set_clock([this] { return now; });
         pub.set_log([this](bool err, const std::string& l) {
@@ -168,7 +171,7 @@ static void suite_r(const BlockFixture& f) {
         std::printf("R1/R2: zero peers parks the block; the first peer gets it, once\n");
         Rig r(f);
         r.pub.submit_network_block(1, f.nonce, 0);
-        check(r.found.pushed() == 0, "R1a zero peers -> no FOUND event yet", r.pub.last_error());
+        check(r.pub.delivered() == 0 && r.found.empty(), "R1a zero peers -> no found event yet", r.pub.last_error());
         check(r.pub.failed() == 1 && r.pub.relayed() == 0,
               "R1b the first push is still counted as reached-nobody (failed()=1)");
         check(r.pub.parked() == 1 && r.pub.parked_total() == 1,
@@ -183,8 +186,8 @@ static void suite_r(const BlockFixture& f) {
 
         r.now += 1'000;                       // t0 + 2 s: attempt 1, still no peer
         r.pub.tick();
-        check(r.frames() == 2 && r.pub.parked() == 1 && r.found.pushed() == 0,
-              "R1g a due tick re-announces once; still nobody -> still parked, still unbooked");
+        check(r.frames() == 2 && r.pub.parked() == 1 && r.pub.delivered() == 0,
+              "R1g a due tick re-announces once; still nobody -> still parked, no found event");
 
         r.port.state_normal_peers = 2;        // the network comes back
         r.now += 3'000;                       // t0 + 5 s: not yet due (next at t0 + 6 s)
@@ -193,27 +196,27 @@ static void suite_r(const BlockFixture& f) {
         r.now += 1'000;                       // t0 + 6 s
         r.pub.tick();
         check(r.frames() == 3, "R2b the due tick re-announces from the retained book");
-        check(r.found.pushed() == 1, "R2c ... and THE FoundBlockEvent is pushed", r.pub.last_error());
+        check(r.pub.delivered() == 1 && r.found.size() == 1, "R2c ... and THE found event is delivered", r.pub.last_error());
         check(r.pub.late_reached() == 1 && r.pub.relayed() == 1 && r.pub.parked() == 0,
               "R2d counted late_reached=1 relayed=1, nothing left parked");
         check(r.pub.peers() == 2, "R2e the late receipt's peers are counted");
-        submit::FoundBlockEvent ev;
-        const bool got = r.found.pop(ev);
-        check(got && ev.block_id == f.id && ev.height == f.height,
-              "R2f the event is OUR block (id off the relayed bytes, the template height)");
+        const bool got = r.found.size() == 1;
+        const submit::FoundBlockEvent ev = got ? r.found[0] : submit::FoundBlockEvent{};
+        check(got && ev.block_id == f.id && ev.height == f.height && ev.landed == submit::Landed::Peer,
+              "R2f the event is OUR block (id off the relayed bytes, the template height), landed=peer");
         check(got && ev.header_check == submit::HeaderCheck::NotRun &&
                   ev.id_source == submit::IdSource::Local && ev.rpc_ms == 0.0,
               "R2g with the same honesty fields as a first-time relay");
 
         for (int i = 0; i < 20; ++i) { r.now += 30'000; r.pub.tick(); }
-        check(r.frames() == 3 && r.found.pushed() == 1,
-              "R2h later ticks send nothing and push nothing");
+        check(r.frames() == 3 && r.pub.delivered() == 1,
+              "R2h later ticks send nothing and deliver nothing");
 
         // The same block submitted again (a duplicate share) reaches peers now,
         // but it is the same block: no second event.
         r.pub.submit_network_block(1, f.nonce, 0);
-        check(r.found.pushed() == 1 && r.pub.duplicate_found() == 1,
-              "R2i a re-submit of a delivered block is NOT a second FoundBlockEvent");
+        check(r.pub.delivered() == 1 && r.found.size() == 1 && r.pub.duplicate_found() == 1,
+              "R2i a re-submit of a delivered block is NOT a second found event");
     }
 
     // --- R3: bounded, then abandoned loudly ------------------------------------
@@ -224,7 +227,7 @@ static void suite_r(const BlockFixture& f) {
         r.pub.submit_network_block(1, f.nonce, 0);
         const std::uint64_t t0 = r.now;
         for (int i = 0; i < 400; ++i) { r.now += 1'000; r.pub.tick(); }   // 400 s
-        check(r.found.pushed() == 0, "R3a nothing is ever booked for a block nobody received");
+        check(r.pub.delivered() == 0 && r.found.empty(), "R3a no found event for a block nobody received");
         check(r.pub.abandoned() == 1 && r.pub.parked() == 0, "R3b the block is ABANDONED, once");
         check(r.frames() <= 1u + pol.max_attempts,
               "R3c at most max_attempts re-announce frames (" + std::to_string(r.frames()) +
@@ -263,8 +266,8 @@ static void suite_r(const BlockFixture& f) {
         r.pub.tick();
         check(r.pub.orphaned_unreached() == 1 && r.pub.parked() == 0,
               "R4b the first due tick drops it as orphaned_unreached");
-        check(r.frames() == 1 && r.found.pushed() == 0,
-              "R4c no re-announce frame and nothing booked");
+        check(r.frames() == 1 && r.pub.delivered() == 0,
+              "R4c no re-announce frame and no found event");
         check(r.logged("RELAY DROPPED"), "R4d at ERROR");
     }
 
@@ -275,24 +278,26 @@ static void suite_r(const BlockFixture& f) {
             Rig r(f);
             r.port.state_normal_peers = 1;
             r.pub.submit_network_block(1, f.nonce, 0);
-            check(r.found.pushed() == 1 && r.pub.relayed() == 1 && r.pub.parked() == 0 &&
+            check(r.pub.delivered() == 1 && r.pub.relayed() == 1 && r.pub.parked() == 0 &&
                       r.pub.failed() == 0,
-                  "R5a a first push that reached a peer is booked at once, never parked");
+                  "R5a a first push that reached a peer is delivered at once, never parked");
         }
         {
             Rig r(f);
             r.pub.enable_solo_own_index(true);
             r.pub.submit_network_block(1, f.nonce, 0);
-            check(r.found.pushed() == 1 && r.pub.solo_landed() == 1 && r.pub.parked() == 0,
-                  "R5b SOLO still books on our own index at once and parks nothing");
+            check(r.pub.solo_landed() == 1 && r.pub.relayed() == 0 && r.pub.parked() == 0 &&
+                      r.pub.parked_total() == 0,
+                  "R5b SOLO, own index accepts: solo_landed() == 1, nothing parked");
         }
         {
             Rig r(f);
             r.pub.enable_solo_own_index(true);
             r.chain.accept_own_block = false;
             r.pub.submit_network_block(1, f.nonce, 0);
-            check(r.found.pushed() == 0 && r.pub.failed() == 1 && r.pub.parked() == 0,
-                  "R5c SOLO with an index that said no: nothing booked, nothing parked");
+            check(r.pub.solo_landed() == 0 && r.pub.delivered() == 0 && r.pub.failed() == 1 &&
+                      r.pub.parked() == 0 && r.pub.parked_total() == 0,
+                  "R5c SOLO, own index refuses: failed() == 1, no landing, nothing parked");
         }
         {
             // A refused block never reaches the retained book, so there is
@@ -300,11 +305,11 @@ static void suite_r(const BlockFixture& f) {
             Rig r(f);
             r.corrupt_id = true;   // the id the gate "verified" is not this blob's
             r.pub.submit_network_block(1, f.nonce, 0);
-            check(r.pub.parked() == 0 && r.found.pushed() == 0,
+            check(r.pub.parked() == 0 && r.pub.delivered() == 0,
                   "R5d a block the relay REFUSED is never parked", r.pub.last_error());
             r.port.state_normal_peers = 2;
             for (int i = 0; i < 10; ++i) { r.now += 5'000; r.pub.tick(); }
-            check(r.found.pushed() == 0 && r.pub.late_reached() == 0,
+            check(r.pub.delivered() == 0 && r.pub.late_reached() == 0,
                   "R5e ... and never delivered later");
         }
         {

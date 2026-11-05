@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### DOGE: the embedded UTXO set is built from genesis (templates no longer underfill)
+- The embedded DOGE UTXO set was a partial view born from the last 1,440 blocks:
+  a tx spending any older coin (e.g. the 499-input consolidations the network
+  mines every other block, ~36.7 DOGE of fees each) stayed fee-unknown and never
+  entered a template, and a restart more than a day behind left a hole. A second
+  set is now built from genesis (bodies below the header checkpoint are fetched
+  by a hash schedule proven to link into the checkpoint) and connected strictly:
+  a body spending a coin the set does not hold is refused. The current set keeps
+  pricing the templates until the full set reaches the tip; then the pool
+  switches to it. `doge_utxo_full: false` (`--no-doge-utxo-full`) keeps the old
+  set only; `doge_utxo_full_dir` moves its LevelDB.
+- Mempool (LTC and DOGE): a premature coinbase spend or a money-range failure is
+  refused at admission (`inputs_invalid`); with the full set, a tx whose input
+  is in neither the set nor the pool waits in a bounded orphan set (100 txs,
+  20 min). Templates select priced txs only and nothing without a UTXO view; the
+  DOGE template is coinbase-only (`degraded: utxo-incomplete`) while the set
+  that prices it is not at the tip.
+- `c2pool --utxo-digest DIR` prints a SHA256 digest of a UTXO LevelDB (coins,
+  sync state, best block) to compare a set copied between hosts.
+
 ### BIP-110 — new experimental parent-chain lane (BLAKE2b minority Bitcoin fork)
 - **Foundation (#1430):** clean-room BLAKE2b-256 (RFC 7693), KAT-proven, plus the
   `c2pool-bip110` coin-lane skeleton and per-binary define. BIP-110 is the Bitcoin
@@ -22,6 +42,14 @@
   from `params.hpp`). This lane imports no Dash consensus machinery. Status is
   experimental — the fork coin is effectively unlisted (block reward ≈ 0), so the
   value is strategic, not revenue.
+
+### DASH: stale compiled masternode anchor fixed by #1963 (#1906)
+- The compiled masternode anchor moves from h=2522504 to h=2549400. The old
+  anchor had fallen more than 20000 blocks behind the tip, so a fresh node on
+  default flags failed closed (`[MN-CKPT] FAIL-CLOSED: checkpoint is STALE`) and
+  served no embedded template. A fresh daemonless node no longer needs
+  `--embedded-mn-bridge-max`; on default flags the bridge replays from the
+  new anchor to the tip and completes. Fixed by #1963.
 
 ### DASH — good-citizen serving is the daemonless binary default (opt-out)
 - **A bare `c2pool-dash --run` (no `--coin-rpc`/`--coin-rpc-auth`/`--submit-block`)

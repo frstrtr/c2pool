@@ -48,6 +48,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "aux_id.hpp"        // NMC_AUXPOW_CHAIN_ID SSOT
+#include "aux_expected_index.hpp"  // aux_expected_index (CAuxPow::getExpectedIndex)
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -184,20 +185,6 @@ inline uint32_t read_le32(const unsigned char* p) {
          | (static_cast<uint32_t>(p[1]) << 8)
          | (static_cast<uint32_t>(p[2]) << 16)
          | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-/// Deterministic chain-merkle slot for a (nonce, chain_id, height) triple.
-/// Byte-faithful port of Namecoin/Bitcoin CAuxPow::getExpectedIndex: pins each
-/// aux chain to a pseudo-random-but-fixed slot so the same parent work cannot be
-/// replayed for two chains and inter-chain slot clashes are minimised. The
-/// arithmetic is intentionally wrap-around uint32 (LCG constants 1103515245 /
-/// 12345) to match the reference bit-for-bit.
-inline uint32_t aux_expected_index(uint32_t nonce, int32_t chain_id, unsigned height) {
-    uint32_t rnd = nonce;
-    rnd = rnd * 1103515245u + 12345u;
-    rnd += static_cast<uint32_t>(chain_id);
-    rnd = rnd * 1103515245u + 12345u;
-    return rnd % (1u << height);
 }
 
 /// Result of scanning a parent coinbase scriptSig for the merged-mining
@@ -399,9 +386,13 @@ struct AuxPow {
     /// CMerkleTx coinbase leg, then the chain-merkle leg, then the parent
     /// header, in daemon field order:
     ///   1. parent_coinbase        -- parent (BTC) coinbase CTransaction,
-    ///      serialized WITNESS-STRIPPED (TX_NO_WITNESS) so the bytes match the
-    ///      txid the parent tx-merkle tree commits (see parent_coinbase_txid)
-    ///      and the daemon auxpow encoding -- NOT the wtxid form;
+    ///      read and written WITNESS-ALLOWED (TX_WITH_WITNESS), as the daemon
+    ///      does (auxpow.h READWRITE(tx) with the stream's default params): a
+    ///      BTC coinbase carries the BIP141 witness-reserved value since 2017,
+    ///      and a peer serves it with the marker/flag whenever it stored it
+    ///      that way; a stripped one (non-empty vin) reads the same, and one
+    ///      without a witness writes exactly as before. The txid the parent
+    ///      tx-merkle tree commits stays witness-stripped (parent_coinbase_txid);
     ///   2. parent_block_hash      -- CMerkleTx::hashBlock;
     ///   3. parent_coinbase_branch -- CMerkleTx::vMerkleBranch;
     ///   4. parent_coinbase_index  -- CMerkleTx::nIndex (int32 LE);
@@ -409,11 +400,11 @@ struct AuxPow {
     ///   6. chain_merkle_index     -- CAuxPow::nChainIndex (int32 LE);
     ///   7. parent_header          -- CAuxPow::parentBlock (80-byte header).
     /// Hand-written (not C2POOL_SERIALIZE_METHODS) because the parent coinbase
-    /// needs the explicit TX_NO_WITNESS param wrapper. Backs the P1f on-disk
+    /// needs the explicit TX_WITH_WITNESS param wrapper. Backs the P1f on-disk
     /// auxpow blob and is reused by PD dual-target wire path.
     template<typename Stream>
     void Serialize(Stream& s) const {
-        ::Serialize(s, TX_NO_WITNESS(parent_coinbase));
+        ::Serialize(s, TX_WITH_WITNESS(parent_coinbase));
         ::Serialize(s, parent_block_hash);
         ::Serialize(s, parent_coinbase_branch);
         ::Serialize(s, parent_coinbase_index);
@@ -423,7 +414,7 @@ struct AuxPow {
     }
     template<typename Stream>
     void Unserialize(Stream& s) {
-        ::Unserialize(s, TX_NO_WITNESS(parent_coinbase));
+        ::Unserialize(s, TX_WITH_WITNESS(parent_coinbase));
         ::Unserialize(s, parent_block_hash);
         ::Unserialize(s, parent_coinbase_branch);
         ::Unserialize(s, parent_coinbase_index);

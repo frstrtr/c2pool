@@ -103,3 +103,27 @@ TEST(CurrentMergedPayoutsColdCache, HonestEmptyWithoutSource) {
     ASSERT_TRUE(merged.is_object());
     EXPECT_TRUE(merged.empty());
 }
+
+// The donation output is emitted even at --give-author 0 as a 1-duff dust
+// marker, so /current_payouts lists the donation address at 1e-8. The merged
+// view behind the "Current Payouts" card must keep it too; only an exact-zero
+// entry with no merged payouts is dropped.
+TEST(CurrentMergedPayoutsCompute, KeepsDustDonationMarker) {
+    core::MiningInterface mi(/*testnet=*/false, /*node=*/nullptr,
+                             c2pool::address::Blockchain::DASH);
+
+    nlohmann::json feed = {
+        {"XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u", 1e-08},   // dust marker
+        {"XmR5w1yQ8oExampleDashAddr0000000000", 0.41},
+        {"XpQ7z2aB9nExampleDashAddr1111111111", 0.0},    // zero: dropped
+    };
+    mi.set_current_payouts_fn([feed]() { return feed; });
+
+    auto merged = mi.compute_current_merged_payouts();
+    ASSERT_TRUE(merged.is_object());
+    ASSERT_TRUE(merged.contains("XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u"))
+        << "the 1e-8 donation marker must reach the Current Payouts card";
+    EXPECT_DOUBLE_EQ(merged["XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u"]["amount"].get<double>(), 1e-08);
+    EXPECT_TRUE(merged.contains("XmR5w1yQ8oExampleDashAddr0000000000"));
+    EXPECT_FALSE(merged.contains("XpQ7z2aB9nExampleDashAddr1111111111"));
+}

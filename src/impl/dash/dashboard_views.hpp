@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -238,6 +239,46 @@ inline nlohmann::json build_window(TrackerT& tracker, const ViewContext& ctx)
     result["blocks"] = std::move(blocks_arr);
     result["total"]  = static_cast<int>(chain.size());
     return result;
+}
+
+// ── Newest share per payout address ─────────────────────────────────────────
+// Walks back up to `max_shares` from the tallest head and records, per payout
+// address, the newest share timestamp at or after `not_before`. With
+// `peer_received_only`, only shares that arrived from a pool peer count (a
+// share minted here, or loaded from the local store, has no peer port), i.e.
+// shares minted on OTHER nodes. Feeds the alert relay's "mining on another
+// node" test (alert_detector.hpp RETURNED rule). Share timestamps are not
+// monotonic along the chain, so the walk filters by time instead of stopping
+// at the first old share.
+template <typename TrackerT>
+inline std::map<std::string, int64_t> newest_share_time_by_address(
+    TrackerT& tracker, bool testnet, int64_t not_before, int max_shares,
+    bool peer_received_only = false)
+{
+    std::map<std::string, int64_t> out;
+    auto& chain = tracker.chain;
+    int32_t best_height = -1;
+    const uint256 best = tallest_head(chain, best_height);
+    if (best.IsNull() || max_shares <= 0) return out;
+    const int walk = std::min(chain.get_height(best), max_shares);
+    if (walk <= 0) return out;
+    try {
+        for (auto [hash, data] : chain.get_chain(best, walk)) {
+            (void)data;
+            chain.get_share(hash).invoke([&](auto* obj) {
+                const int64_t t = static_cast<int64_t>(obj->m_timestamp);
+                if (t < not_before) return;
+                if (peer_received_only && obj->peer_addr.port() == 0) return;
+                const std::string addr = script_to_dash_address(dash::get_share_script(obj), testnet);
+                if (addr.empty()) return;
+                auto [it, fresh] = out.try_emplace(addr, t);
+                if (!fresh && t > it->second) it->second = t;
+            });
+        }
+    } catch (...) {
+        // Partial results on chain inconsistency, as build_window.
+    }
+    return out;
 }
 
 // ── Delta ───────────────────────────────────────────────────────────────────

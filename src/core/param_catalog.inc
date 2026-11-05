@@ -216,6 +216,12 @@ C2P_PARAM("sharechain.prefix", Sharechain, HEX, MONEY_RESTART, C_LTC|C_BTC|C_DAS
   C2P_ALIAS("sharechain.prefix", BIN_BTC, "--prefix", VALUE)
   C2P_ALIAS("sharechain.prefix", BIN_DASH, "--prefix", VALUE)
 
+// Named sharechain network (DASH): "v36" / "dash-v36" = the DASH v36 network
+// (identifier ac2785363c0180b8, prefix 8d8516bac9edd280). Money-class: it
+// changes the chain identity like network_id. Exclusive with network_id/prefix.
+C2P_PARAM("sharechain.network", Sharechain, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "", ENUM_MEMBER, "named sharechain network: v36 = the DASH v36 network (forks chain)")
+  C2P_ALIAS("sharechain.network", BIN_DASH, "--net", VALUE)
+
 C2P_PARAM("coin_p2p.connect", CoinP2P, LIST_HOSTPORT, RESTART, C_DASH|C_BCH, LIT, "", HOSTPORT_V, "explicit coin-network dial")
   C2P_ALIAS("coin_p2p.connect", BIN_DASH, "--coin-p2p-connect", VALUE)
   C2P_ALIAS("coin_p2p.connect", BIN_BCH, "--peer", VALUE)
@@ -252,6 +258,14 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
+
+// Core's -connect for the embedded coin P2P: these peers and no other (no
+// peer DB, DNS / fixed / HTTP seeds, getpeerinfo or addr gossip). Repeatable.
+C2P_PARAM("coin_p2p.ltc_connect", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "dial only this LTC peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.ltc_connect", BIN_LTC, "--ltc-connect", VALUE)
+
+C2P_PARAM("coin_p2p.doge_connect", CoinP2P, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "dial only this DOGE peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.doge_connect", BIN_LTC, "--doge-connect", VALUE)
 
 C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
@@ -489,6 +503,44 @@ C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "
 C2P_PARAM("embedded.doge_header_checkpoint", Embedded, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "DOGE header checkpoint H:HASH")
   C2P_ALIAS("embedded.doge_header_checkpoint", BIN_LTC, "--doge-header-checkpoint", VALUE)
 
+// The full DOGE UTXO set (built from genesis; prices the DOGE template once
+// complete). Off keeps the accrual view only (the rollback).
+C2P_PARAM("embedded.doge_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_DOGE, NONE, "", NONE, "embedded DOGE full UTXO set built from genesis (default on)")
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--doge-utxo-full", FLAG)
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--no-doge-utxo-full", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.doge_utxo_full_dir", Embedded, PATH, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "the full DOGE UTXO set's LevelDB (default <data-dir>/dogecoin/utxo_full_leveldb)")
+  C2P_ALIAS("embedded.doge_utxo_full_dir", BIN_LTC, "--doge-utxo-full-dir", VALUE)
+
+// One-shot LevelDB tools: run, print, exit; no node starts. Compile-time
+// readonly like the other print-and-exit rows (refused in a settings file,
+// never mirrored into the resolved config).
+C2P_PARAM("utility.dump_doge_schedule_anchors", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "write the DOGE hash schedule's anchors from the header LevelDB DIR (to OUT, else stdout), then exit")
+  C2P_ALIAS("utility.dump_doge_schedule_anchors", BIN_LTC, "--dump-doge-schedule-anchors", VALUE)
+
+C2P_PARAM("utility.utxo_digest", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print the digest of the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_digest", BIN_LTC, "--utxo-digest", VALUE)
+
+C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print gettxoutsetinfo (Dogecoin Core 1.14.9 GetUTXOStats) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_stats", BIN_LTC, "--utxo-stats", VALUE)
+
+C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
+  C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
+  C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_cmpct_hb_peers", Embedded, INT64, RESTART, C_LTC, LIT, "0", NONE, "LTC peers asked for high-bandwidth compact block pushes (0 = all)")
+  C2P_ALIAS("embedded.ltc_cmpct_hb_peers", BIN_LTC, "--ltc-cmpct-hb-peers", VALUE)
+
+C2P_PARAM("embedded.ltc_mweb_fetch_retry", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "fetch the LTC tip's full block once until its MWEB state is in (default on)")
+  C2P_ALIAS("embedded.ltc_mweb_fetch_retry", BIN_LTC, "--ltc-mweb-fetch-retry", FLAG)
+  C2P_ALIAS("embedded.ltc_mweb_fetch_retry", BIN_LTC, "--no-ltc-mweb-fetch-retry", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_mweb_cmpct_provisional", Embedded, BOOL, RESTART, C_LTC, LIT, "false", NONE, "reserved: MWEB state from an unverified compact block (not implemented)")
+  C2P_ALIAS("embedded.ltc_mweb_cmpct_provisional", BIN_LTC, "--ltc-mweb-cmpct-provisional", FLAG)
+
+C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
+  C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
+
 C2P_PARAM("embedded.anchor", Embedded, STRING, RESTART, C_BCH, LIT, "", NONE, "BCH anchor H:HASH")
   C2P_ALIAS("embedded.anchor", BIN_BCH, "--anchor", VALUE)
 
@@ -500,6 +552,17 @@ C2P_PARAM("embedded.utxo", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, 
 
 C2P_PARAM("embedded.utxo_immature_serve_empty", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "serve coinbase-only until mature")
   C2P_ALIAS("embedded.utxo_immature_serve_empty", BIN_DASH, "--embedded-utxo-immature-serve-empty", FLAG)
+
+// S2: the DASH full UTXO set from a pinned dumptxoutset snapshot. RESTART: the
+// import runs at start into <net>/utxo_full_leveldb (a present set is never
+// re-imported); the pin is the built-in .inc unless a pin file is given.
+C2P_PARAM("embedded.utxo_snapshot", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import this pinned dumptxoutset snapshot into the full UTXO set at start (comma-separated parts)")
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--embedded-utxo-snapshot", VALUE)
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--utxo-snapshot", VALUE)
+C2P_PARAM("embedded.utxo_snapshot_pin", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: digest-gated pin file for a snapshot newer than the built-in pin")
+  C2P_ALIAS("embedded.utxo_snapshot_pin", BIN_DASH, "--embedded-utxo-snapshot-pin", VALUE)
+C2P_PARAM("replay.utxo_import", Replay, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import a pinned dumptxoutset snapshot into <datadir>/<net>/utxo_full_leveldb and exit (beside a running node)")
+  C2P_ALIAS("replay.utxo_import", BIN_DASH, "--utxo-import", VALUE)
 
 C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "daemonless superblock payee sourcing")
   C2P_ALIAS("embedded.superblock", BIN_DASH, "--embedded-superblock", FLAG)
@@ -620,6 +683,15 @@ C2P_PARAM("alert_relay.retry_every", Global, INT64, RESTART, C_DASH, LIT, "60", 
 C2P_PARAM("alert_relay.retry_max", Global, INT64, RESTART, C_DASH, LIT, "60", NONE, "origin: total transmissions per alert before it is recorded undelivered")
   C2P_ALIAS("alert_relay.retry_max", BIN_DASH, "--alert-relay-retry-max", VALUE)
 
+C2P_PARAM("alert_relay.serve_stall_after", Global, INT64, RESTART, C_DASH, LIT, "300", NONE, "origin: no work handed to hashing miners this long => WORK_STALLED, then WORK_RESUMED (0=off)")
+  C2P_ALIAS("alert_relay.serve_stall_after", BIN_DASH, "--alert-relay-serve-stall-after", VALUE)
+
+C2P_PARAM("alert_relay.hashrate_min", Global, STRING, RESTART, C_DASH, LIT, "0", NONE, "origin: page HASHRATE LOW when a worker's credited rate stays below RATE (e.g. 1.35T, 1350G; 0=off), HASHRATE OK on recovery")
+  C2P_ALIAS("alert_relay.hashrate_min", BIN_DASH, "--alert-relay-hashrate-min", VALUE)
+
+C2P_PARAM("alert_relay.hashrate_window", Global, INT64, RESTART, C_DASH, LIT, "900", NONE, "origin: seconds of credited work per HASHRATE LOW/OK evaluation (120-86400)")
+  C2P_ALIAS("alert_relay.hashrate_window", BIN_DASH, "--alert-relay-hashrate-window", VALUE)
+
 C2P_PARAM("embedded.tx_inject_hex", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "#157 local tx-inject submit file (raw tx hex per line)")
   C2P_ALIAS("embedded.tx_inject_hex", BIN_DASH, "--embedded-tx-inject-hex", VALUE)
 
@@ -656,7 +728,7 @@ C2P_PARAM("embedded.oracle_graduation_blocks", Embedded, INT64, LIVE, C_DASH, LI
 C2P_PARAM("embedded.oracle_class_coverage", Embedded, INT64, LIVE, C_DASH, LIT, "20", NONE, "oracle class coverage")
   C2P_ALIAS("embedded.oracle_class_coverage", BIN_DASH, "--oracle-class-coverage", VALUE)
 
-C2P_PARAM("embedded.bestcl_policy", Embedded, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "freshness", ENUM_MEMBER, "bestCL policy freshness|consensus-exact")
+C2P_PARAM("embedded.bestcl_policy", Embedded, ENUM_STR, MONEY_RESTART, C_DASH, LIT, "consensus-exact", ENUM_MEMBER, "bestCL policy consensus-exact|freshness")
   C2P_ALIAS("embedded.bestcl_policy", BIN_DASH, "--bestcl-policy", VALUE)
 
 C2P_PARAM("embedded.serve_gate_state_file", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "cross-restart serve-gate accounting file")

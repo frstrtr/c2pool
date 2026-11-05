@@ -18,7 +18,9 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 
+#include <chrono>
 #include <filesystem>
+#include <thread>
 #include <vector>
 #include <cstdint>
 
@@ -621,4 +623,65 @@ TEST_F(HeaderChainTest, PeerTipHeightIsAtomic) {
 
     // No crash, no data race — the final value is one of the written values
     // (no specific ordering guarantee with relaxed atomics)
+}
+// ─── Known headers cost no yield (FRESH-NODE §3) ────────────────────────────
+
+/// `n` headers linked on top of the testnet genesis, 150 s apart, the
+/// genesis bits. With the peer tip far ahead they are accepted without
+/// scrypt (fast sync), and below interval + 10 headers the difficulty is not
+/// checked.
+static std::vector<BlockHeaderType> make_linked_headers(size_t n) {
+    std::vector<BlockHeaderType> out;
+    out.reserve(n);
+    BlockHeaderType prev = make_testnet_genesis();
+    uint256 prev_hash = block_hash(prev);
+    for (size_t i = 0; i < n; ++i) {
+        BlockHeaderType h;
+        h.m_version = 0x20000000;
+        h.m_previous_block = prev_hash;
+        h.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
+        h.m_timestamp = prev.m_timestamp + 150;
+        h.m_bits = prev.m_bits;
+        h.m_nonce = static_cast<uint32_t>(i);
+        prev_hash = block_hash(h);
+        prev = h;
+        out.push_back(h);
+    }
+    return out;
+}
+
+// A 2,000-header batch the chain already has, at the tip (50-header
+// sub-batches): before, 39 sleeps of 10 ms (~390 ms) per duplicate batch,
+// which let 20 peers' duplicates queue up faster than the header thread
+// drained them (the fresh node's 2.5 GB).
+TEST_F(HeaderChainTest, ADuplicateBatchCostsNoYield) {
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+    chain.set_peer_tip_height(1000000);
+    ASSERT_TRUE(chain.add_header(make_testnet_genesis()));
+    const auto batch = make_linked_headers(2000);
+    ASSERT_EQ(chain.add_headers(batch), 2000);
+    ASSERT_EQ(chain.height(), 2000u);
+
+    chain.set_peer_tip_height(chain.height());  // at the tip: 50-header sub-batches
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(chain.add_headers(batch), 0);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(ms, 10) << "a batch of 2,000 known headers at the tip took " << ms << " ms";
+}
+
+// The early return is for a known LAST header only: a batch whose head the
+// chain has and whose tail is new still connects the tail.
+TEST_F(HeaderChainTest, AKnownPrefixStillConnectsTheNewTail) {
+    HeaderChain chain(params);
+    ASSERT_TRUE(chain.init());
+    chain.set_peer_tip_height(1000000);
+    ASSERT_TRUE(chain.add_header(make_testnet_genesis()));
+    const auto batch = make_linked_headers(2000);
+    const std::vector<BlockHeaderType> head(batch.begin(), batch.begin() + 1500);
+    ASSERT_EQ(chain.add_headers(head), 1500);
+    EXPECT_EQ(chain.add_headers(batch), 500);
+    EXPECT_EQ(chain.height(), 2000u);
+    EXPECT_EQ(chain.add_headers(batch), 0);
 }

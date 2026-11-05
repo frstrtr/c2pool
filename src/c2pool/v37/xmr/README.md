@@ -1,74 +1,33 @@
-# c2pool-v37-xmr — the live single-node Monero/RandomX daemon (Milestone A)
+# c2pool-v37-xmr — the Monero / RandomX pool node (Path B)
 
-> **EXPERIMENTAL — PROTOTYPE / STAGENET ONLY. DO NOT RUN AGAINST MAINNET VALUE.**
-> This is a research bring-up of the v37 Work-Receipts Family-B (Monero /
-> RandomX) settlement lane. It is not audited, not production, and defaults to
-> **stagenet**. Mainnet is fenced twice: `--i-understand-mainnet` is required to
-> even attempt it, and the X6 coinbase builder is FCMP/CARROT-fenced on the
-> Monero hard-fork `major_version` regardless.
+> **EXPERIMENTAL.** Regtest, stagenet and testnet run a pool; mainnet runs
+> only `--follow-only` (`--i-understand-mainnet` is required even for that).
 
-This directory is the **daemon lifecycle** that ties the already-merged
-Family-B lane code (`src/impl/xmr/`, `src/c2pool/v37/`) into a runnable node.
-It defines **no consensus digest**: every consensus operation is delegated to
-the merged `V37Engine` / `OwedLedger` / lane executor / X6 coinbase builder.
+This directory is the daemon around the Path B lane code: the lane rules,
+receipts, carriers, window and coinbase split in `src/impl/xmr/pathb/`, and
+the node, relay and stratum glue in `pathb/` here. How to run a node:
+[docs/xmr-lane/RUN-A-NODE.md](../../../../docs/xmr-lane/RUN-A-NODE.md).
 
 ## Files
 
 | file | role |
 |------|------|
-| `xmr_node_config.hpp` | config surface (network, monerod RPC/ZMQ, stratum bind, lane params, D_conf) |
-| `xmr_settle_store.hpp` | W6 `ISettleStore` seam + `FileSettleStore` + `RecoveryDriver` (fail-closed open) |
-| `xmr_finalize_driver.hpp` | **the F1 finalize driver** — `on_block_finalized` once per coin-height, in order, `bin_height` = the high-water AT THE STEP, never the live tip |
-| `xmr_node.hpp` | `XmrNode` — owns the wiring + donor lifecycle order |
-| `xmr_same_height_race.hpp` | **c2pool#1551** — the same-height double-block refusal, decided prefer-own **within bounds**: the tie-break moves the levers we control (what we build on, what we re-announce, what we nominate) and can never make an unburied or an orphaned block creditable |
-| `xmr_live_transport.hpp` | production `IMonerodTransport` (dependency-free raw-socket RPC; RPC-poll ZMQ fallback) |
-| `xmr_node_smoke.hpp` | shared network-free smoke (monerod stub) |
+| `pathb/pathb_node.hpp` | `PathbNode`: admission, placement, the switch by the journal and its re-pend, templates and jobs |
+| `pathb/pathb_relay_node.hpp` | `PathbRelayNode`: the Path B relay (HELLO, frames, the verify pool, catch-up, the re-offer, the joiner, context blocks) |
+| `pathb/pathb_relay_links.hpp` | `CarrierLinks`: the relay's TCP links over `carrier_net.hpp` |
+| `pathb/pathb_job_source.hpp`, `pathb/pathb_stratum*.hpp`, `pathb/pathb_own_share.hpp` | the stratum template source, the stratum hooks, the node's own shares |
+| `pathb/pathb_template_select.hpp` | the template's transaction selection |
+| `pathb/pathb_follow_only.hpp`, `pathb/pathb_follow_template.hpp` | `--follow-only` |
+| `pathb/pathb_mainnet_refusal.hpp`, `pathb/pathb_startup.hpp` | the start-up checks and refusals |
+| `pathb/pathb_status.hpp`, `xmr_web_dashboard.*` | the status lines and the web status |
+| `pathb/xmr_pathb_store.*`, `pathb/pathb_follower_rows.hpp` | the Path B store, the follower's rows |
+| `xmr_node_config.hpp` | the configuration surface and the flag parser |
+| `xmr_node.hpp` | the descriptor backends (installed and checked at start) |
+| `xmr_native_chain_source.hpp`, `xmr_native_template_backend.hpp` | the embedded native Monero node as the chain and template source |
+| `xmr_live_transport.hpp`, `xmr_live_submit.hpp` | the monerod RPC transport and found-block submit |
+| `xmr_p2p_block_publisher.hpp` | found-block publish over levin |
+| `xmr_o2_randomx_verify.hpp` | RandomX verify |
+| `xmr_stratum_listener.hpp`, `xmr_lane_suspend_state.hpp`, `xmr_lane_resume_fresh.hpp` | the stratum listener and its suspend / resume gate |
+| `xmr_lane_constants.hpp` | lane constants shared by the configuration and stratum |
+| `relay/` | the relay's address book and peer store, the bootstrap list, the chain-view feed, the context-block module, payout addresses (`xmr_address.hpp`) and the kept frames (`xmr_relay_wire.hpp`) |
 | `../main_v37_xmr.cpp` | the `c2pool-v37-xmr` entrypoint |
-| `../test/v37_xmr_node_smoke.cpp` | CI gate (both build.yml legs) |
-
-## Run
-
-```
-# CI / offline smoke (monerod stub, no RandomX, no sockets):
-c2pool-v37-xmr --mock-smoke
-
-# against a live stagenet monerod (run monerod with --stagenet --zmq-pub ... and
-# an unrestricted/no-login RPC on 38081):
-c2pool-v37-xmr --network stagenet --rpc-host 127.0.0.1 --rpc-port 38081 --zmq-port 38083
-```
-
-## Construction order (donor lifecycle)
-
-1. install BOTH descriptor backends (P-1 descriptor validator + ed25519
-   point-check) and **assert** they are live — else refuse to start (fail-closed);
-2. open the W6 settlement store at `config_path()/<net>/v37_settle_db`;
-3. run `RecoveryDriver` to rebuild the OWED ledger + high-water + finalize
-   cursor **before** `V37Engine::start()` (a torn store aborts — F2);
-4. start the engine, seed `AddLane` for the Monero-parent lane;
-5. bind the X2 `MonerodAdapter` and route its Extend/Reorg/Orphan stream into
-   the F1 finalize driver;
-6. start the adapter (ZMQ subscribe + initial RPC sync).
-
-Teardown reverses it: stop the network first, then drain-and-join the engine.
-
-## Hard safety
-
-- **No consensus-digest change.** The daemon calls the merged types; the smoke
-  proves the lane digest and `owed_digest` are byte-identical to a bare-library
-  replay.
-- **F1 contract.** The finalize driver steps per coin-height off the
-  mainchain-index progression; it never copies the w4 test harness's
-  at-current-tip `reconcile()` shape.
-- **FCMP/CARROT fence** stays at the X6 coinbase (`major_version <= 16`).
-- **Fail-closed descriptors.** Both backends install at startup or the node refuses to run.
-
-## Known follow-ons (not in this cut)
-
-- Real multi-node p2p carrier relay (`src/pool` p2p) — this cut is single-node.
-- Heavy RandomX verify + the X6 coinbase crypto are linked only in the
-  CI/stagenet build; the light build runs index + settlement + the F1 driver.
-- The W6 store here is a self-contained `FileSettleStore` on merged-master
-  types; production swaps in the `v37/w6-persistence` branch's
-  `LevelDBSettleStore` + `RecoveryDriver` (same `ISettleStore` shape) once merged.
-- Real libzmq SUB (`XMR_NODE_HAVE_ZMQ`) — the default build uses the RPC-poll
-  tip fallback.

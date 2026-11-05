@@ -35,18 +35,18 @@
 //      -- and reached_network() is UNCHANGED by all of it, because the wire
 //      claim and the own-chain claim must never become the same sentence.
 //
-//   D  THE PUBLISHER, BOTH WAYS. Default (solo OFF) is #1662's behaviour to the
-//      letter: zero peers -> no FOUND event, failed()+1, whatever our own index
-//      did. Solo ON: the same relay books exactly one FOUND event, counts it in
-//      solo_landed() and NOT in relayed(), and still refuses when the index
-//      itself said no. The negative case is the one that matters: without D1,
-//      turning solo on would be indistinguishable from removing the gate.
+//   D  THE PUBLISHER, BOTH WAYS, on its counters and its found hook. Default
+//      (solo OFF): zero peers -> failed() == 1, solo_landed() == 0, no found
+//      event, whatever our own index did. Solo ON: the same relay lands the
+//      block once in solo_landed() and NOT in relayed(), the found event says
+//      landed=own-index with the block id, and the block does not land when the
+//      index itself said no.
 //
 //   E  THE REFUSALS, as pure functions. solo_refusal() is regtest-only,
-//      p2p-first-only, takes no peers and no anchor; arm_order_refusal() drops
-//      its one-peer requirement for solo and keeps it for everybody else. And
-//      --mine stays OFF and --native-solo stays OFF in a default config, which
-//      is the one property a reader of this branch will want checked first.
+//      p2p-first-only, takes no peers, no anchor, no --relay-peer and no
+//      --relay-listen; arm_order_refusal() drops its one-peer requirement for
+//      solo and keeps it for everybody else. --mine and --native-solo are OFF in
+//      a default config.
 //
 // No sockets, no daemon, no RandomX, no threads: this links xmr_node for the
 // boot/index/relay and xmr_coin for keccak and block parsing.
@@ -312,7 +312,7 @@ bool load_fixture(BlockFixture& f) {
 } // namespace
 
 static void suite_cd() {
-    std::printf("C/D: reached_network() is untouched; solo books on our own index, opt-in only\n");
+    std::printf("C/D: reached_network() is untouched; solo lands on our own index, opt-in only\n");
 
     // --- C: the verdict shape, independent of any relay -------------------
     {
@@ -346,7 +346,7 @@ static void suite_cd() {
         return true;
     };
 
-    // --- D1: DEFAULT (solo OFF) is #1662 to the letter ---------------------
+    // --- D1: DEFAULT (solo OFF) ----------------------------------------------
     {
         native::fakes::FakeBroadcastPort port;    // zero state_normal peers
         native::fakes::FakeMinerDataSource bodies;
@@ -356,20 +356,20 @@ static void suite_cd() {
         rcfg.policy.include_all_tx_bodies = true;
         native::relay::LevinBlockRelay relay(port, native::relay::DaemonSubmitSink{}, &bodies,
                                              &chain, rcfg);
-        submit::FoundBlockQueue found;
-        o2::P2pBlockPublisher   pub(relay, found, lookup);
+        o2::P2pBlockPublisher   pub(relay, lookup);
+        std::vector<submit::FoundBlockEvent> found;
+        pub.set_found_hook([&found](const submit::FoundBlockEvent& e) { found.push_back(e); });
         pub.enable_network_relay(true);
         check(!pub.solo_own_index_enabled(), "D1 solo is OFF in a freshly built publisher");
 
         pub.submit_network_block(1, f.nonce, 0);
-        check(found.pushed() == 0,
-              "D2 zero peers -> NO FOUND event, even though our own index took the block",
+        check(found.empty() && pub.delivered() == 0,
+              "D2 zero peers -> no found event, even though our own index took the block",
               pub.last_error());
         check(pub.failed() == 1 && pub.relayed() == 0 && pub.solo_landed() == 0,
-              "D3 it is counted as reached-nobody, exactly as before this branch");
+              "D3 failed() == 1, relayed() == 0, solo_landed() == 0");
         check(!chain.own_blocks.empty(),
-              "D4 (and the own-index push DID happen -- D2 is a booking decision, not a "
-              "missing write)");
+              "D4 the own-index push happened (D2 is a landing decision, not a missing write)");
     }
 
     // --- D2: SOLO ON, own index accepts -----------------------------------
@@ -382,29 +382,29 @@ static void suite_cd() {
         rcfg.policy.include_all_tx_bodies = true;
         native::relay::LevinBlockRelay relay(port, native::relay::DaemonSubmitSink{}, &bodies,
                                              &chain, rcfg);
-        submit::FoundBlockQueue found;
-        o2::P2pBlockPublisher   pub(relay, found, lookup);
+        o2::P2pBlockPublisher   pub(relay, lookup);
+        std::vector<submit::FoundBlockEvent> found;
+        pub.set_found_hook([&found](const submit::FoundBlockEvent& e) { found.push_back(e); });
         pub.enable_network_relay(true);
         pub.enable_solo_own_index(true);
 
         pub.submit_network_block(1, f.nonce, 0);
-        check(found.pushed() == 1,
-              "D5 SOLO: one FOUND event for a block only our own chain index received",
+        check(pub.solo_landed() == 1 && pub.delivered() == 1,
+              "D5 SOLO: one landing for a block only our own chain index received",
               pub.last_error());
         check(pub.solo_landed() == 1 && pub.relayed() == 0,
-              "D6 counted in solo_landed(), NOT in relayed() -- the two never add up");
+              "D6 counted in solo_landed(), NOT in relayed()");
         check(pub.failed() == 0, "D7 and it is not also counted as a failure");
         check(pub.last_error().find("SOLO") != std::string::npos,
-              "D8 the status line still says the block reached no peer", pub.last_error());
-        submit::FoundBlockEvent ev;
-        const bool got = found.pop(ev);
-        check(got && ev.block_id == f.id,
-              "D9 the FOUND event carries OUR id, off the bytes the gate verified");
-        check(got && ev.header_check == submit::HeaderCheck::NotRun && ev.rpc_ms == 0.0,
-              "D10 with header_check NotRun and no RPC: nothing confirmed the height for us");
+              "D8 the status line names SOLO", pub.last_error());
+        check(found.size() == 1 && found[0].block_id == f.id && found[0].landed == submit::Landed::OwnIndex &&
+                  std::string(submit::to_string(found[0].landed)) == "own-index",
+              "D9 the found event: landed=own-index, OUR id off the bytes the gate verified");
+        check(found.size() == 1 && found[0].header_check == submit::HeaderCheck::NotRun && found[0].rpc_ms == 0.0,
+              "D10 with header_check NotRun and no RPC");
     }
 
-    // --- D3: SOLO ON, own index REFUSES -> still nothing is booked ---------
+    // --- D3: SOLO ON, own index REFUSES -> no landing ----------------------
     {
         native::fakes::FakeBroadcastPort port;
         native::fakes::FakeMinerDataSource bodies;
@@ -416,15 +416,15 @@ static void suite_cd() {
         rcfg.policy.include_all_tx_bodies = true;
         native::relay::LevinBlockRelay relay(port, native::relay::DaemonSubmitSink{}, &bodies,
                                              &chain, rcfg);
-        submit::FoundBlockQueue found;
-        o2::P2pBlockPublisher   pub(relay, found, lookup);
+        o2::P2pBlockPublisher   pub(relay, lookup);
+        std::vector<submit::FoundBlockEvent> found;
+        pub.set_found_hook([&found](const submit::FoundBlockEvent& e) { found.push_back(e); });
         pub.enable_network_relay(true);
         pub.enable_solo_own_index(true);
 
         pub.submit_network_block(1, f.nonce, 0);
-        check(found.pushed() == 0 && pub.solo_landed() == 0 && pub.failed() == 1,
-              "D11 SOLO with an index that said NO books nothing -- solo relaxes WHO must "
-              "accept, never WHETHER anybody did",
+        check(found.empty() && pub.solo_landed() == 0 && pub.failed() == 1,
+              "D11 SOLO with an index that said NO: no landing, failed() == 1",
               pub.last_error());
     }
 
@@ -438,13 +438,13 @@ static void suite_cd() {
         rcfg.policy.include_all_tx_bodies = true;
         native::relay::LevinBlockRelay relay(port, native::relay::DaemonSubmitSink{}, &bodies,
                                              &chain, rcfg);
-        submit::FoundBlockQueue found;
-        o2::P2pBlockPublisher   pub(relay, found, lookup);
+        o2::P2pBlockPublisher   pub(relay, lookup);
+        std::vector<submit::FoundBlockEvent> found;
+        pub.set_found_hook([&found](const submit::FoundBlockEvent& e) { found.push_back(e); });
         pub.enable_solo_own_index(true);   // solo on, network relay still OFF
         pub.submit_network_block(1, f.nonce, 0);
-        check(pub.refused() == 1 && found.pushed() == 0 && pub.solo_landed() == 0,
-              "D12 solo does not open the fail-closed RandomX gate: a disabled relay still "
-              "REFUSES and books nothing",
+        check(pub.refused() == 1 && found.empty() && pub.solo_landed() == 0,
+              "D12 solo does not open the fail-closed RandomX gate: refused() == 1, no landing",
               pub.last_error());
         check(chain.own_blocks.empty(),
               "D13 and a refusal never reaches our own index either");
@@ -457,7 +457,6 @@ static void suite_cd() {
 static XmrNodeConfig solo_config() {
     XmrNodeConfig c;
     c.network         = MoneroNetwork::Regtest;
-    c.coinbase        = CoinbaseMode::V37Settlement;
     c.template_source = TemplateSourceMode::Native;
     c.arm_order       = ArmOrderMode::P2PFirst;
     c.native_solo     = true;
@@ -520,6 +519,18 @@ static void suite_e() {
         XmrNodeConfig c = solo_config();
         c.native_anchor_path = "/tmp/anchor.bin";
         check(!solo_refusal(c).empty(), "E13 solo WITH an anchor is refused: pick one trust root");
+    }
+
+    {
+        XmrNodeConfig c = solo_config();
+        c.relay_peers.push_back("127.0.0.1:7322");
+        check(!solo_refusal(c).empty(), "E14 solo WITH --relay-peer is refused", solo_refusal(c));
+    }
+
+    {
+        XmrNodeConfig c = solo_config();
+        c.relay_listen = "127.0.0.1:7320";
+        check(!solo_refusal(c).empty(), "E15 solo WITH --relay-listen is refused", solo_refusal(c));
     }
 }
 

@@ -114,7 +114,7 @@ struct Entry {
 // The porting plan, one row per file. `upstream_id==None` rows are fresh AGPL
 // files recorded here ONLY to pin the boundary of what we deliberately did NOT
 // port from p2pool's pool-model.
-inline constexpr std::array<Entry, 14> kManifest{{
+inline constexpr std::array<Entry, 13> kManifest{{
     // ---- BSD-3: RandomX (verbatim vendor of the hasher library) ----
     {"vendor/randomx/", UpstreamId::RandomX, "src/ (whole library)", Disposition::Verbatim,
      License::BSD_3_Clause,
@@ -168,10 +168,6 @@ inline constexpr std::array<Entry, 14> kManifest{{
      "at offset 39, seed_hash/next_seed_hash, algo rx/0; per-worker extranonce."},
 
     // ---- AGPL-3: authored fresh for c2pool (NOT ported) ----
-    {"src/impl/xmr/receipt/xmr_receipt.hpp", UpstreamId::None, "", Disposition::CleanRoom,
-     License::AGPL_3_0,
-     "Family-B receipt envelope (~600-660 B): hashing_blob, seed_ref, coinbase_"
-     "opening, tree_branch, info_digest. v37-original; no p2pool ancestor."},
     {"src/impl/xmr/settle/k_fair_xmr.cpp", UpstreamId::None, "", Disposition::CleanRoom,
      License::AGPL_3_0,
      "v37 OWED-ledger K_fair split + exact-sum residual-sink rule. Clean-room: "

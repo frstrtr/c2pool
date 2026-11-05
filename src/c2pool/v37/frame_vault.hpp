@@ -157,7 +157,7 @@ struct VaultServeChunk {
 };
 
 // REPAIR-CHAIN (F2-S): an optional DEEP source behind the in-memory vault --
-// the owner's durable lane order (xmr/relay/xmr_durable_order.hpp). `order`
+// the owner's durable lane order. `order`
 // is offered exactly the asks the vault would answer BELOW_HORIZON and may
 // fill `out` (ids + p_served; the status stays OK) -- the same paging contract,
 // own lineage only, contiguous or not at all. `frame` is offered an id the

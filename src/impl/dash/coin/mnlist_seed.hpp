@@ -162,6 +162,10 @@ inline Prestate load_and_validate_mnlist_seed(const MnListSeedRequest& r)
     ps = load_prestate_file(r.file);
     if (!ps.ok)
         return ps;   // error already NAMED by the shared parser
+    // A getmnlistdiff snapshot carries isValid, never nPoSePenalty: the
+    // parsed zeros are placeholders, so the fold engine must treat the seed's
+    // penalties as UNKNOWN (upper bound widened to the seed ceiling).
+    ps.penalties_exact = false;
 
     // (6) HEIGHT MATCH — the operator's declared height must equal the height
     //     the snapshot actually carries. A mismatch means the peer/file

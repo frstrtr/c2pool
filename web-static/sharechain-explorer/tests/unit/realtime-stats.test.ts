@@ -168,17 +168,20 @@ test('stats: chainLength from /sharechain/window', async () => {
   await o.stop();
 });
 
-test('stats: primaryBlocks + dogeBlocks from /sharechain/window', async () => {
+test('stats: primaryBlocks + dogeBlocks count only block shares IN the window', async () => {
+  // 'old-blk' / 'old-dog' are found blocks whose shares already left the
+  // window: listed by /sharechain/window but not counted, so the number has
+  // the same scope as Shares / Verified / Orphan next to it.
   const t = makeTransport({
-    shares: [sh('a'), sh('b')],
-    blocks: ['block-a'],
-    doge_blocks: ['dog-a', 'dog-b'],
+    shares: [sh('a'), sh('b'), sh('c', { blk: 1 }), sh('d')],
+    blocks: ['a', 'old-blk'],
+    doge_blocks: ['b', 'd', 'old-dog'],
   });
   const o = new RealtimeOrchestrator({ transport: t, userContext: CTX, containerWidth: CW });
   await o.start();
   const s = o.getState().stats;
-  assert.equal(s.primaryBlocks, 1);
-  assert.equal(s.dogeBlocks, 2);
+  assert.equal(s.primaryBlocks, 2);  // 'a' via list, 'c' via blk flag
+  assert.equal(s.dogeBlocks, 2);     // 'b', 'd'
   await o.stop();
 });
 

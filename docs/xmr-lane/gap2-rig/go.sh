@@ -1,4 +1,6 @@
 #!/bin/bash
+# Removed at the S4w flag day: this rig runs the old payout path. The current c2pool-v37-xmr runs Path B and
+# refuses these flags ("removed at the S4w flag day"); the rig needs a binary built before the flag day.
 # GAP-2 rig: 3 regtest monerods (P2P line), 3 c2pool-v37-xmr nodes on separate data dirs exchanging receipts ONLY over the
 # TCP relay (full mesh), 1 xmrig per node with a distinct payee wallet, tx generator (good-citizen). NO --credit-feed, NO --wire-*.
 if ss -ltn | grep -qE ":(4500[0-2]|4490[01]) "; then echo "REFUSED: a GAP-2 rig is already up"; exit 1; fi

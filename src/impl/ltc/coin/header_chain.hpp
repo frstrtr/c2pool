@@ -93,6 +93,9 @@ inline LTCChainParams make_ltc_chain_params_mainnet() {
     p.no_retargeting = false;
     p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     p.genesis_hash.SetHex("12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2");
+    // MWEB (LIP-0002/3/4): nStartHeight 2217600, active from 2217600 + 6 x 8064.
+    // Block 2265984 is the first mainnet block whose last tx is a HogEx.
+    p.mweb_activation_height = 2265984;
     p.halving_interval = 840000;
     p.initial_subsidy = 5000000000ULL;
     p.pow_func = core::pow::scrypt;
@@ -108,6 +111,9 @@ inline LTCChainParams make_ltc_chain_params_testnet() {
     p.no_retargeting = false;
     p.pow_limit.SetHex("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     p.genesis_hash.SetHex("4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0");
+    // MWEB: nStartHeight 2209536, active from 2209536 + 3 x 2016. Block 2215584
+    // is the first testnet4 block whose last tx is a HogEx.
+    p.mweb_activation_height = 2215584;
     p.halving_interval = 840000;
     p.initial_subsidy = 5000000000ULL;
     p.pow_func = core::pow::scrypt;
@@ -420,6 +426,25 @@ public:
         return true;
     }
 
+    /// Would `header` pass add_header's checks: it connects to a known
+    /// header, its PoW meets its bits, and its bits are the expected
+    /// difficulty? Nothing is stored. Screens announced headers (compact
+    /// blocks) before acting on them; the scrypt runs outside the lock.
+    bool check_header(const BlockHeaderType& header) const {
+        uint32_t new_height = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto prev_it = m_headers.find(header.m_previous_block);
+            if (prev_it == m_headers.end())
+                return false;
+            new_height = prev_it->second.height + 1;
+        }
+        if (!check_pow(pow_hash(header, m_params.pow_func), header.m_bits, m_params.pow_limit))
+            return false;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return validate_difficulty(header, new_height);
+    }
+
     /// Set the estimated network tip height (from peer's version message).
     /// Used to skip scrypt PoW validation for old headers during initial sync.
     /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
@@ -458,28 +483,44 @@ public:
     /// With fast-sync (scrypt skipped for old headers), structural validation
     /// is microseconds per header, so large batches are fine.  Near the tip
     /// (scrypt active), each header takes ~20ms, so we use smaller batches.
+    /// A batch whose last header is known has nothing new (its headers are
+    /// that header's ancestors) and returns at once; a sub-batch that
+    /// accepted nothing ran no scrypt and is followed by no yield. Before, a
+    /// known 2,000-header batch at the tip slept 39 x 10 ms.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
+        if (headers.empty())
+            return 0;
+        const uint256 last_hash = block_hash(headers.back());
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_headers.count(last_hash))
+                return 0;
+        }
         uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
         // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
         size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
         int accepted = 0;
         PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
+            int sub_accepted = 0;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 size_t end = std::min(offset + BATCH_SIZE, headers.size());
                 for (size_t i = offset; i < end; ++i) {
                     if (add_header_internal(headers[i]))
-                        ++accepted;
+                        ++sub_accepted;
                 }
+                accepted += sub_accepted;
                 // Capture any pending tip change from this batch
                 if (m_pending_tip_change.fired)
                     last_ptc = m_pending_tip_change;
                 m_pending_tip_change.fired = false;
             }
             // Yield between batches so ioc-thread callers (get_height,
-            // is_synced, get_tip) can acquire the mutex.
-            if (offset + BATCH_SIZE < headers.size()) {
+            // is_synced, get_tip) can acquire the mutex. Only after a
+            // sub-batch that accepted headers: a run of known ones held the
+            // lock for look-ups only.
+            if (sub_accepted > 0 && offset + BATCH_SIZE < headers.size()) {
                 // Short yield during fast-sync (structural only), longer near tip (scrypt)
                 auto ms = (BATCH_SIZE >= 500) ? 1 : 10;
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -701,7 +742,7 @@ private:
     }
 
     /// Validate that the header's nBits matches the expected difficulty.
-    bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) {
+    bool validate_difficulty(const BlockHeaderType& header, uint32_t new_height) const {
         int64_t interval = m_params.difficulty_adjustment_interval();
         if (new_height < 2) return true; // genesis + first block
 

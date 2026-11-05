@@ -56,6 +56,10 @@ struct ChainParams
     };
     std::optional<Checkpoint> fast_start_checkpoint;
 
+    // First block height that must carry the MWEB extension block (HogEx +
+    // mweb). LTC only; 0 = no MWEB on this chain, or the height is not pinned.
+    uint32_t mweb_activation_height{0};
+
     // Halving
     uint32_t halving_interval{0};    // LTC: 840000, BTC: 210000, DOGE: 0 (no halving)
     uint64_t initial_subsidy{0};     // LTC: 5000000000, BTC: 5000000000

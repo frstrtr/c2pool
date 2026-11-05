@@ -20,6 +20,8 @@
 #include "share.hpp"
 #include "share_chain.hpp"
 #include "share_tracker.hpp"
+#include "share_precheck.hpp"        // #1828 per-message caps on incoming shares
+#include "peer_misbehaviour.hpp"     // #1829 graded misbehaviour score + IP ban
 #include "peer.hpp"
 #include "min_protocol_gate.hpp"
 #include "tracker_acquire.hpp"       // #889: bounded acquisition — BLOCK-WINNING mint path only
@@ -44,6 +46,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -387,15 +390,40 @@ protected:
     // gauge, not a synchronisation point.
     std::atomic<uint64_t> m_block_share_lock_forfeits{0};
 
+    // #1828: incoming 'shares' / 'sharereply' messages dropped whole by the
+    // per-message caps, and shares dropped by them (whole-message drops plus
+    // per-share oversize drops). IO thread writes, anyone reads; diagnostic
+    // gauges, relaxed. Node-global: per-peer attribution is #1829.
+    std::atomic<uint64_t> m_precheck_dropped_messages{0};
+    std::atomic<uint64_t> m_precheck_dropped_shares{0};
+
+    // #1829: offences charged per kind (after the network filter and the
+    // whitelist exemption) and IP bans issued by the scorer. IO thread
+    // writes, anyone reads; diagnostic gauges, relaxed.
+    std::array<std::atomic<uint64_t>, misbehaviour::OFFENCE_COUNT> m_misbehaviour_notes{};
+    std::atomic<uint64_t> m_misbehaviour_bans{0};
+
     // ── v36 min-protocol accept-floor ratchet (#643/#646, mirrors dgb) ──────────
-    // Runtime P2P accept-floor, seeded from the COLD config floor (1700, accept-all)
-    // and lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by apply_min_protocol_ratchet()
-    // once the work-weighted desired-version tally over the [9/10..10/10] window behind
-    // the best share holds >= 95% for v36. Mutated ONLY on the compute thread under the
-    // exclusive m_tracker_mutex (same sites as m_best_share_hash); it drives the LIVE
-    // m_min_protocol_gate.min_version so the handshake reception reflects the ratchet.
+    // Runtime P2P accept-floor, seeded from the per-network share profile
+    // (SharechainConfig::share_profile().ratchet_floor_protocol_version):
+    //   * public network: the COLD config floor MINIMUM_PROTOCOL_VERSION (1700,
+    //     accept-all) — the same initial value as before the profile existed —
+    //     lifted to NEW_MINIMUM_PROTOCOL_VERSION (3600) by
+    //     apply_min_protocol_ratchet() once the work-weighted desired-version tally
+    //     over the [9/10..10/10] window behind the best share holds >= 95% for v36;
+    //   * private/isolated DASH v36 sharechain: ISOLATED_V36_PROTOCOL_VERSION
+    //     (3601) from the start — the chain is v36 from genesis, so a pre-v36
+    //     peer (1700) AND a build without v36 isolated support (advert 3600,
+    //     cannot parse a type-36 share) are refused at the handshake, and the
+    //     ratchet is a latched no-op there (3601 >= the 3600 target).
+    // The profile is read when the node is CONSTRUCTED, so the identity must be set
+    // first (main_dash.cpp sets it before constructing dash::Node). Mutated ONLY on
+    // the compute thread under the exclusive m_tracker_mutex (same sites as
+    // m_best_share_hash); handle_version composes it with the operator knob
+    // (m_min_protocol_gate) by max(), so a --min-protocol below 3601 cannot lower
+    // the isolated floor.
     std::atomic<uint32_t> m_runtime_min_protocol_version{
-        SharechainConfig::MINIMUM_PROTOCOL_VERSION};
+        SharechainConfig::share_profile().ratchet_floor_protocol_version};
 
     // De-dup set for broadcast_share (hashes already relayed to peers).
     std::set<uint256> m_shared_share_hashes;
@@ -499,10 +527,42 @@ protected:
     std::set<std::string> m_whitelist_ips;
     std::set<NetService> m_whitelist_hosts;
 
+    // #1829 graded misbehaviour score (peer_misbehaviour.hpp), keyed by source
+    // IP so a redial from a new port keeps its score. IO thread only, like
+    // m_ban_list. Crossing the threshold writes m_ip_ban_list (the IP-only ban
+    // that connected() and the dialer already honour) and closes every
+    // connection from that IP. Not persisted; pruned each think cycle.
+    misbehaviour::PeerMisbehaviourScorer<std::string> m_misbehaviour;
+    // Monotonic seconds for the score decay. A seam for the decay KATs; the
+    // ban expiry itself stays on steady_clock like every other ban.
+    std::function<double()> m_misbehaviour_now = [] {
+        return std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+    // #1716 part B: self-nonce attempts per non-loopback host, canonical
+    // Node.self_nonce_attempts (p2pool-dash p2p.py:740). Not persisted, as
+    // canonical. IO thread only, like m_ip_ban_list.
+    struct SelfNonceAttempts
+    {
+        int count;
+        std::chrono::steady_clock::time_point first;
+    };
+    std::map<std::string, SelfNonceAttempts> m_self_nonce_attempts;
+    static constexpr int SELF_NONCE_TOLERATED = 3;                  // p2p.py:195
+    static constexpr std::chrono::seconds SELF_NONCE_WINDOW{600};   // p2p.py:188
+    static constexpr std::chrono::seconds SELF_NONCE_BAN{300};      // p2p.py:197
+    // Clock for the 600 s window. A seam for the window KATs; the ban expiry
+    // stays on steady_clock like every other ban.
+    std::function<std::chrono::steady_clock::time_point()> m_self_nonce_now = [] {
+        return std::chrono::steady_clock::now();
+    };
+
 public:
     // DISPLAY-ONLY read of the live P2P accept-floor (v36 ratchet output). Read
     // atomically off any thread; the dashboard's /version_signaling surfaces this
-    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet).
+    // as the "min-protocol floor" gauge (1700 pre-crossing -> 3600 post-ratchet;
+    // 3601 from the start on the private/isolated v36 sharechain).
     // Consensus-neutral: a plain atomic load, no side effects.
     uint32_t runtime_min_protocol_version() const {
         return m_runtime_min_protocol_version.load(std::memory_order_relaxed);
@@ -667,6 +727,78 @@ public:
     }
     void set_ban_duration(int seconds) { m_ban_duration = std::chrono::seconds(seconds); }
 
+    // ── Self-connection rate limit (#1716 part B) ───────────────────────
+    // Port of the DASH canonical, frstrtr/p2pool-dash @81bf1618
+    // p2pool/p2p.py:168-206. A version carrying our own nonce is a self-dial
+    // (a second ISP, or our own address handed back by a peer) or a peer
+    // spoofing our nonce, and every attempt is dropped. A loopback attempt
+    // (127.0.0.0/8 or ::1, is_loopback :20-28) is only dropped. It is never
+    // counted or banned (:179-183): a 127.0.0.1 ban RSTs every co-located
+    // reconnect (p2pool-dash #757). Any other host is counted (:192-201). Its
+    // count resets once its first attempt is more than 600 s old (:186-189).
+    // The attempt that finds 3 already counted, i.e. the 4th inside the
+    // window, bans the host for a flat 300 s (:195-199). Before this the
+    // attempt was dropped uncounted and the self endpoint was redialled on
+    // every maintenance pass.
+    //
+    // This is the DASH canonical, not the sibling lanes' shape: no
+    // 3600*banscore^2 and no hourly forgiveness. The ban is host-keyed
+    // (m_ip_ban_list), so connected() and the dialer refuse the host on any
+    // port through is_banned(), as canonical buildProtocol (:560) and _think
+    // (:692) do. Like every other ban here it does not bind a whitelisted seed.
+    //
+    // INLINE: handle_version is inline for the link-deferred KAT targets.
+    // IO thread only, like m_ip_ban_list.
+    void note_self_nonce(const NetService& addr)
+    {
+        const std::string host = addr.address();
+        if (::classify_address(host) == ::AddrClass::loopback)
+        {
+            LOG_DEBUG_P2P << "[Pool] Loopback self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting (no ban)";
+            return;
+        }
+        const auto now = m_self_nonce_now();
+        auto it = m_self_nonce_attempts.find(host);
+        if (it != m_self_nonce_attempts.end() && now - it->second.first > SELF_NONCE_WINDOW)
+        {
+            m_self_nonce_attempts.erase(it);
+            it = m_self_nonce_attempts.end();
+        }
+        if (it == m_self_nonce_attempts.end())
+        {
+            m_self_nonce_attempts.emplace(host, SelfNonceAttempts{1, now});
+            LOG_DEBUG_P2P << "[Pool] Self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting";
+            return;
+        }
+        const int seen = it->second.count++;
+        if (seen < SELF_NONCE_TOLERATED)
+        {
+            LOG_DEBUG_P2P << "[Pool] Self-connection (our nonce) from "
+                          << addr.to_string() << ", disconnecting";
+            return;
+        }
+        LOG_WARNING << "[Pool] Peer " << addr.to_string() << " sent our nonce "
+                    << (seen + 1) << " times - possible attack, banning host "
+                    << host << " for " << SELF_NONCE_BAN.count() << "s";
+        m_ip_ban_list[host] = std::chrono::steady_clock::now() + SELF_NONCE_BAN;
+    }
+
+    // Drop counts whose window has passed. Canonical drops one only when its
+    // host comes back (p2p.py:186-189) and never otherwise, so its map grows
+    // without bound. Dropping it early gives every later attempt the same
+    // result and keeps the map bounded. Run from the think-cycle ban sweep.
+    void prune_self_nonce_attempts()
+    {
+        const auto now = m_self_nonce_now();
+        for (auto it = m_self_nonce_attempts.begin(); it != m_self_nonce_attempts.end(); )
+        {
+            if (now - it->second.first > SELF_NONCE_WINDOW) it = m_self_nonce_attempts.erase(it);
+            else ++it;
+        }
+    }
+
     void connected(std::shared_ptr<core::Socket> socket) override
     {
         // Reject banned peers (btc node.cpp:133-139).
@@ -780,10 +912,31 @@ public:
         }
     }
 
+    /// A peer-supplied subversion made safe for one log line: printable ASCII
+    /// only (anything else, and '"', becomes '?'), at most 64 characters.
+    static std::string printable_subversion(const std::string& s)
+    {
+        const std::size_t n = std::min<std::size_t>(s.size(), 64);
+        std::string out;
+        out.reserve(n + 3);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const auto c = static_cast<unsigned char>(s[i]);
+            out.push_back((c >= 0x20 && c < 0x7f && c != '"') ? static_cast<char>(c) : '?');
+        }
+        if (s.size() > n)
+            out += "...";
+        return out;
+    }
+
     void send_version(peer_ptr peer)
     {
         auto rmsg = dash::message_version::make_raw(
-            SharechainConfig::ADVERTISED_PROTOCOL_VERSION,  // advertise v36 capability (3600); >= ratchet target so ratcheted peers accept us. Legacy peers (floor 1700) accept any >=1700, so backward-compatible.
+            // The active profile's advert: public 3600 (v36 capability, >= the
+            // ratchet target so ratcheted peers accept us; legacy peers, floor
+            // 1700, accept any >= 1700, so backward-compatible), private/isolated
+            // v36 sharechain 3601 (== its accept floor).
+            SharechainConfig::share_profile().advertised_protocol_version,
             1,                                           // services
             addr_t{1, peer->addr()},                     // addr_to (the remote)
             addr_t{1, NetService{"0.0.0.0", SharechainConfig::p2p_port()}},  // addr_from
@@ -850,9 +1003,14 @@ public:
         peer->m_other_version = msg->m_version;
         peer->m_other_subversion = msg->m_subversion;
 
-        // Self-connection guard: we dialled our own advertised nonce.
+        // Self-connection guard: we dialled our own advertised nonce. Every
+        // attempt is dropped; a non-loopback host's 4th inside 600 s also
+        // bans it (#1716 part B, note_self_nonce).
         if (m_nonce == msg->m_nonce)
+        {
+            note_self_nonce(peer->addr());
             return std::nullopt;
+        }
 
         // Duplicate-connection guard: already peered with this nonce.
         if (m_peers.contains(msg->m_nonce))
@@ -862,14 +1020,30 @@ public:
         // the NodeBridge close the connection (pool/node.hpp handle()). The
         // effective floor is the MAX of the operator knob (m_min_protocol_gate,
         // IO-thread-owned) and the auto-ratchet floor (m_runtime_min_protocol_version,
-        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet).
+        // lifted 1700 -> 3600 on the compute thread by apply_min_protocol_ratchet;
+        // seeded at 3601 on the private/isolated v36 sharechain).
         // Reading the atomic here is race-free; at the cold default (both 1700) every
-        // real DASH peer is admitted (accept-all).
+        // real DASH peer is admitted (accept-all). A refusal is a disconnect, never a
+        // ban: an old build is not misbehaving.
         const uint32_t effective_floor = std::max(
             m_min_protocol_gate.min_version,
             m_runtime_min_protocol_version.load(std::memory_order_relaxed));
         if (msg->m_version < effective_floor)
-            throw std::runtime_error("peer protocol below min-protocol floor");
+        {
+            // The generic text is kept verbatim (public network, operator knob);
+            // on the private/isolated v36 sharechain it is extended so the
+            // operator sees WHY: the peer build cannot follow a v36 chain.
+            std::string why = "peer protocol below min-protocol floor";
+            if (SharechainConfig::v36_network())
+            {
+                why += ": peer build lacks v36 isolated support — upgrade (peer advertises protocol "
+                     + std::to_string(msg->m_version) + " \""
+                     + printable_subversion(msg->m_subversion)
+                     + "\", the DASH v36 network requires >= "
+                     + std::to_string(effective_floor) + ")";
+            }
+            throw std::runtime_error(why);
+        }
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
@@ -985,6 +1159,31 @@ public:
     // translation unit (slice .4) and are intentionally link-deferred here;
     // the dispatch layer object-compiles against these declarations.
     void processing_shares(HandleSharesData& data, NetService addr);
+
+    /// #1828: the per-message caps (share_precheck.hpp precheck_raw_shares,
+    /// numbers from the live SharechainConfig::share_profile()) applied to an
+    /// incoming 'shares' / 'sharereply' before any share is parsed or hashed.
+    /// Erases oversize items in place; returns false when the whole message
+    /// is dropped. Counts, logs (rate-limited) and, on the DASH v36 network,
+    /// charges the sender one precheck_drop offence (#1829).
+    /// IO thread. Body in node.cpp.
+    bool precheck_raw_shares(std::vector<chain::RawShare>& shares,
+                             precheck::Kind kind, const NetService& addr);
+
+    /// #1829: charge one offence to the peer at `addr` (peer_misbehaviour.hpp).
+    /// No-op for a whitelisted peer, for a db-load pseudo-peer (port 0) and for
+    /// an offence the active network does not grade. When the decayed score of
+    /// the peer's IP reaches the threshold: IP ban for m_ban_duration, and
+    /// every connection from that IP is closed. IO thread. Body in node.cpp.
+    void note_misbehaviour(const NetService& addr, misbehaviour::Offence offence);
+
+    /// #1829: drop decayed scorer entries (run_think IO phase). Body in node.cpp.
+    void prune_misbehaviour();
+
+    /// #1829: close every connection (and pending dial) whose address is `ip`.
+    /// Body in node.cpp.
+    void disconnect_ip(const std::string& ip);
+
     std::vector<dash::ShareType> handle_get_share(std::vector<uint256> hashes,
         uint64_t parents, std::vector<uint256> stops, NetService peer_addr);
 
@@ -1115,6 +1314,28 @@ public:
     /// a line someone has to notice.
     uint64_t block_share_lock_forfeits() const {
         return m_block_share_lock_forfeits.load(std::memory_order_relaxed);
+    }
+
+    /// #1828 observability: incoming share messages dropped whole by the
+    /// per-message caps, and shares dropped by them.
+    uint64_t precheck_dropped_messages() const {
+        return m_precheck_dropped_messages.load(std::memory_order_relaxed);
+    }
+    uint64_t precheck_dropped_shares() const {
+        return m_precheck_dropped_shares.load(std::memory_order_relaxed);
+    }
+
+    /// #1829 observability: the decayed misbehaviour score of `addr`'s IP,
+    /// offences charged of one kind, and IP bans issued by the scorer.
+    /// The score read is IO-thread only (the scorer map is not locked).
+    double misbehaviour_score(const NetService& addr) const {
+        return m_misbehaviour.score(addr.address(), m_misbehaviour_now());
+    }
+    uint64_t misbehaviour_notes(misbehaviour::Offence o) const {
+        return m_misbehaviour_notes[static_cast<std::size_t>(o)].load(std::memory_order_relaxed);
+    }
+    uint64_t misbehaviour_bans() const {
+        return m_misbehaviour_bans.load(std::memory_order_relaxed);
     }
 
     /// Register the current template's txs in m_known_txs so send_shares can

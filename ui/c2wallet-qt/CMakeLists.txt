@@ -70,6 +70,15 @@ endif()
 if(NOT TARGET c2wallet-artifact)
     add_subdirectory(src/family/bitcoin/artifact)
 endif()
+# Slice 2 (DASH): the special-tx core — c2wallet-dash-common (btclibs closure:
+# intake, planners, the std-only DashInjectModel, the manifest) and
+# c2wallet-dash-tx (dashscript closure: the signers and DashInjectModel::sign).
+# Both Qt-free and network-free: libsecp256k1 + the vendored interpreter only,
+# so the ci/check_no_network.sh link-guard stays green. With
+# -DC2WALLET_QT_BUILD_TESTS=ON it also registers c2wallet-dash-test (dash_kats).
+if(NOT TARGET c2wallet-dash-tx)
+    add_subdirectory(src/family/bitcoin/dash)
+endif()
 
 add_executable(c2wallet-qt-signer
     src/main.cpp
@@ -82,6 +91,9 @@ add_executable(c2wallet-qt-signer
     src/shell/PageBuildTxMonero.cpp
     src/shell/PageSignMonero.cpp
     src/shell/PageAirGap.cpp
+    src/shell/PageDashInject.cpp
+    src/shell/KeyInputWidgets.cpp
+    src/shell/PageSignMessage.cpp
 )
 
 # The wired pages include the C++20 hdkeys/convert public headers; build the
@@ -91,6 +103,49 @@ set_target_properties(c2wallet-qt-signer PROPERTIES
     CXX_STANDARD_REQUIRED ON)
 
 target_include_directories(c2wallet-qt-signer PRIVATE src)
+
+# ── Version + packaging (release packaging, ci/CI_WIRING.md) ────────────────
+# C2WALLET_QT_VERSION is printed by `c2wallet-qt-signer --version` (which exits
+# before any QApplication exists, so it needs no display). CI passes the release
+# version; a developer build takes `git describe --tags --match "v*" --dirty`
+# (release tags only: the coin-lane tags such as ltc-0.2.9-dev.* never match).
+if(NOT C2WALLET_QT_VERSION)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v*" --dirty
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                        OUTPUT_VARIABLE _c2w_git_version
+                        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(NOT _c2w_git_version)
+        set(_c2w_git_version "0.0.0-unknown")
+    endif()
+    set(C2WALLET_QT_VERSION "${_c2w_git_version}" CACHE STRING
+        "Version printed by c2wallet-qt-signer --version")
+endif()
+# Only main.cpp sees the version, so a version bump recompiles one TU.
+set_property(SOURCE src/main.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+             "C2WALLET_QT_VERSION=\"${C2WALLET_QT_VERSION}\"")
+
+# Bundle-friendly target properties for the release jobs: a macOS .app with
+# packaging/Info.plist.in, a Windows GUI-subsystem exe (main.cpp borrows the
+# parent console for --version). No effect on Linux. Off for the PR-time build.
+option(C2WALLET_QT_PACKAGING "Bundle-friendly target properties (macOS .app, Windows GUI subsystem)" OFF)
+if(C2WALLET_QT_PACKAGING)
+    string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" _c2w_numeric_version "${C2WALLET_QT_VERSION}")
+    if(NOT _c2w_numeric_version)
+        set(_c2w_numeric_version "0.0.0")
+    endif()
+    set_target_properties(c2wallet-qt-signer PROPERTIES
+        OUTPUT_NAME c2wallet-qt-signer
+        MACOSX_BUNDLE ON
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER org.c2pool.c2wallet-qt-signer
+        MACOSX_BUNDLE_BUNDLE_NAME c2wallet-qt-signer
+        MACOSX_BUNDLE_BUNDLE_VERSION "${_c2w_numeric_version}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${_c2w_numeric_version}"
+        WIN32_EXECUTABLE ON)
+endif()
 
 # The whole security invariant in one place. If a future phase adds
 # Qt6::Network / Qt6::WebEngine* / Qt6::WebChannel / a curl / an asio here, the
@@ -106,6 +161,8 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
     c2wallet_monero
     c2wallet-signer
     c2wallet-artifact
+    c2wallet-dash-tx
+    c2wallet-dash-common
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -117,20 +174,31 @@ target_link_libraries(c2wallet-qt-signer PRIVATE
 # only the vendored SHA-256), NEVER the key-bearing signer core. The mechanical
 # proof is ci/check_key_free.sh, registered as a ctest by src/companion.
 # ═══════════════════════════════════════════════════════════════════════════
-find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
+# A signer-only build (-DC2WALLET_QT_BUILD_COMPANION=OFF) needs neither
+# Qt6::Network nor nlohmann_json (the companion's inject scheduler parses JSON
+# with it); the signer target never depends on either.
+option(C2WALLET_QT_BUILD_COMPANION
+    "Build the online key-free companion (needs Qt6::Network and nlohmann_json)" ON)
 
-# The key-free companion library + its KATs + the key-free guard.
-add_subdirectory(src/companion)
+if(C2WALLET_QT_BUILD_COMPANION)
+    find_package(Qt6 6.2 REQUIRED COMPONENTS Network)
 
-add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
-target_include_directories(c2wallet-qt-companion PRIVATE src)
-target_link_libraries(c2wallet-qt-companion PRIVATE
-    c2wallet-companion
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Network
-)
+    # The key-free companion library + its KATs + the key-free guard, and
+    # (slice S2) the Qt Network transport library c2wallet-companion-qtnet and
+    # the headless inject scheduler c2wallet-qt-schedd (Qt6::Core + Network
+    # only) with its guards; see src/companion/CMakeLists.txt.
+    add_subdirectory(src/companion)
+
+    add_executable(c2wallet-qt-companion src/companion/CompanionApp.cpp)
+    target_include_directories(c2wallet-qt-companion PRIVATE src)
+    target_link_libraries(c2wallet-qt-companion PRIVATE
+        c2wallet-companion
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        Qt6::Network
+    )
+endif()
 
 # ── Network-incapable link-guard as a ctest ────────────────────────────────
 # The same mechanical proof CI runs, available locally: build the target, then

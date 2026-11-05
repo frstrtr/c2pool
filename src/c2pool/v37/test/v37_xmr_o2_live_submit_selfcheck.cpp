@@ -13,7 +13,7 @@
 // extra_nonce at reserved_offset), the submit_block ack parser INCLUDING
 // result.block_id, LiveBlockSubmitter's fail-closed default + the three
 // block-id sources (monerod > local keccak > header) + their cross-checks, and
-// the IShareSink -> FoundBlockQueue hand-off in XmrStratumServer's call order.
+// the monerod arm's counters and found hook in XmrStratumServer's call order.
 // REAL golden: keccak256(varint(len) || hashing_blob) of the Monero mainnet
 // genesis block reproduces its published id, pinning the object-hash framing.
 // ===========================================================================
@@ -239,32 +239,34 @@ int main() {
             CHECK(sub.transport_errors() == 1, "transport counter");
             CHECK(sub.last_error() == o2.error, "last_error tracks");
         }
-        // (vii) sink -> queue, with the handle_submit ordering (submit first, then on_accepted_share).
+        // (vii) the monerod arm: counters and the found hook, with the handle_submit
+        // ordering (submit first, then on_accepted_share).
         {
             mock.set_method_body("submit_block",
                 R"({"id":"0","jsonrpc":"2.0","result":{"block_id":")" + GEN + R"(","status":"OK"}})");
             SubmitPolicy p; p.network_submit_enabled = true;
             LiveBlockSubmitter sub(mock, p);
-            FoundBlockQueue q;
-            LiveSubmitShareSink sink(sub, q, [&](std::uint32_t tid, std::uint32_t, BlockCandidate& out) {
+            std::vector<FoundBlockEvent> found;
+            LiveSubmitShareSink sink(sub, [&](std::uint32_t tid, std::uint32_t, BlockCandidate& out) {
                 if (tid != 42) return false;
                 out = c; return true;
             });
+            sink.set_found_hook([&found](const FoundBlockEvent& e) { found.push_back(e); });
             sink.submit_network_block(42, 10000, 3);
-            CHECK(q.size() == 1 && q.pushed() == 1, "found event queued on OK");
+            CHECK(sink.found() == 1 && found.size() == 1 && sink.unnamed() == 0, "found counted and handed to the hook on OK");
             strat::AcceptedShare sh; sh.template_id = 42; sh.nonce = 10000; sh.extra_nonce = 3;
             sh.is_network_block = true; sh.worker = "rig1"; sh.address = "4AAAA";
             sink.on_accepted_share(sh);
-            FoundBlockEvent ev;
-            CHECK(q.pop(ev), "event drained");
+            const bool got = found.size() == 1;
+            const FoundBlockEvent ev = got ? found[0] : FoundBlockEvent{};
+            CHECK(got && sink.last_found().has_value() && sink.last_found()->block_id == ev.block_id, "the hook's event is last_found()");
             CHECK(ev.height == 1 && ev.block_id_hex() == GEN && ev.reward == c.expected_reward, "event carries height/bid/reward");
-            CHECK(ev.worker == "rig1" && ev.address == "4AAAA", "annotate() attached worker/address");
-            CHECK(!q.pop(ev), "queue empty after drain");
+            CHECK(ev.landed == Landed::Monerod && std::string(to_string(ev.landed)) == "monerod" &&
+                  describe(ev).find("landed=monerod") != std::string::npos, "the found line names landed=monerod");
+            CHECK(found.size() == 1 && sink.found() == 1 && sink.accepted_shares() == 1, "one found event after on_accepted_share");
             sink.submit_network_block(99, 1, 0);
-            CHECK(sink.stale_lookups() == 1 && q.size() == 0, "stale template -> nothing queued");
+            CHECK(sink.stale_lookups() == 1 && sink.found() == 1 && found.size() == 1, "stale template -> no found event");
             std::printf("    %s\n", describe(ev).c_str());
-            auto amt = single_key_amounts<std::map<std::array<std::uint8_t, 32>, long long>>(ev.block_id, ev.reward);
-            CHECK(amt.size() == 1 && amt.begin()->second == static_cast<long long>(c.expected_reward), "single_key_amounts");
         }
     }
 

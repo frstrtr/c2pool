@@ -22,11 +22,13 @@
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
 #include <core/hash.hpp>
+#include <core/bip152_shortid.hpp>
 #include <btclibs/crypto/siphash.h>
 
 #include <cstdint>
 #include <vector>
 #include <map>
+#include <tuple>
 
 namespace btc {
 namespace coin {
@@ -73,12 +75,10 @@ struct CompactBlock {
     std::vector<ShortTxID> short_ids;
     std::vector<PrefilledTransaction> prefilled_txns;
 
-    /// Compute SipHash keys from header hash and nonce.
+    /// BIP 152 SipHash keys: first two LE64 words of ONE SHA256(header || nonce_le)
+    /// (Core blockencodings.cpp FillShortTxIDSelector; core/bip152_shortid.hpp).
     void GetSipHashKeys(uint64_t& k0, uint64_t& k1) const {
-        auto packed = pack(header);
-        uint256 hdr_hash = Hash(packed.get_span());
-        k0 = hdr_hash.GetUint64(0) ^ nonce;
-        k1 = hdr_hash.GetUint64(1) ^ nonce;
+        std::tie(k0, k1) = bip152::siphash_keys(header, nonce);
     }
 
     /// Compute SipHash short ID for a txid using this block's key.

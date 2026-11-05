@@ -30,10 +30,15 @@
 #include <impl/dash/share_check.hpp>
 
 #include <core/address_utils.hpp>
+#include <core/hashing_elsewhere.hpp>
+#include <core/netaddress.hpp>
 #include <core/uint256.hpp>
+#include <core/web_server.hpp>   // MiningInterface session states (failback)
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -362,4 +367,116 @@ TEST(DashDashboardViews, FeeSharesAreMarkedByHash160)
     EXPECT_TRUE(w["shares"][0].contains("fee"));    // share 3
     EXPECT_FALSE(w["shares"][1].contains("fee"));   // share 2
     EXPECT_EQ(w["fee_hash160"].get<std::string>(), ctx.fee_hash160);
+}
+
+// ── Newest share per payout address (alert relay RETURNED rule) ─────────────
+// Cross-checked against the grid's own per-share address ("m") and time ("t").
+TEST(DashDashboardViews, NewestShareTimePerAddressMatchesTheWindow)
+{
+    ChainHarness h(50);
+    auto& tracker = h.node.tracker();
+    const auto w = dash::dashboard::build_window(tracker, h.ctx());
+    std::map<std::string, int64_t> expect;
+    for (const auto& c : w["shares"]) {
+        const std::string m = c["m"].get<std::string>();
+        const int64_t t = c["t"].get<int64_t>();
+        if (!expect.count(m) || t > expect[m]) expect[m] = t;
+    }
+    ASSERT_EQ(expect.size(), 2u);
+
+    auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    EXPECT_EQ(all, expect);
+
+    // Bounded walk: the tip alone names only the tip's miner.
+    auto tip_only = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 1);
+    ASSERT_EQ(tip_only.size(), 1u);
+    EXPECT_EQ(tip_only.begin()->second, static_cast<int64_t>(V_BASE_TIME + 49));
+
+    // Time filter: nothing at or after a time newer than every share.
+    EXPECT_TRUE(dash::dashboard::newest_share_time_by_address(
+        tracker, false, V_BASE_TIME + 1000, 4320).empty());
+    // ... and a filter inside the window keeps each address's newest share.
+    EXPECT_EQ(dash::dashboard::newest_share_time_by_address(tracker, false, V_BASE_TIME + 40, 4320),
+              expect);
+}
+
+// Only shares received from a pool peer count as "minted on another node": a
+// share minted here (or loaded from the local store) has no peer port.
+TEST(DashDashboardViews, NewestShareTimeCanCountPeerReceivedSharesOnly)
+{
+    dash::NodeImpl node;
+    uint256 prev = uint256::ZERO;
+    for (unsigned int i = 0; i < 20; ++i) {
+        auto* sh = make_view_share(i, prev, static_cast<unsigned char>(0xa0 + (i % 2)));
+        if (i % 2 == 0 && i < 10) sh->peer_addr = NetService("10.0.0.2", 8996);   // pkh 0xa0, from a peer
+        node.tracker().chain.add(sh);
+        prev = sh->m_hash;
+    }
+    auto& tracker = node.tracker();
+    auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    ASSERT_EQ(all.size(), 2u);
+    auto peers = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320,
+                                                               /*peer_received_only=*/true);
+    ASSERT_EQ(peers.size(), 1u) << "the 0xa1 miner's shares were all minted here";
+    EXPECT_EQ(peers.begin()->second, static_cast<int64_t>(V_BASE_TIME + 8))
+        << "newest PEER-received share, not the newest share of that address (n=18)";
+    EXPECT_EQ(all.at(peers.begin()->first), static_cast<int64_t>(V_BASE_TIME + 18));
+}
+
+// Failback evidence end to end: the peer-received walk (what main_dash feeds
+// the dashboard and the alert relay) into the session state. A rig whose
+// address has only shares minted HERE is stalled when it goes silent; one
+// whose address keeps getting shares from a pool peer is standby (hashing
+// elsewhere). FAIL WITHOUT THE FIX: both read "stalled".
+TEST(DashDashboardViews, SharesMintedHereOnlyLeaveASilentRigStalled)
+{
+    dash::NodeImpl node;
+    uint256 prev = uint256::ZERO;
+    for (unsigned int i = 0; i < 40; ++i) {
+        // pkh 0xa0: every share from a pool peer; pkh 0xa1: every share minted here.
+        auto* sh = make_view_share(i, prev, static_cast<unsigned char>(0xa0 + (i % 2)));
+        if (i % 2 == 0) sh->peer_addr = NetService("10.0.0.2", 8996);
+        node.tracker().chain.add(sh);
+        prev = sh->m_hash;
+    }
+    auto& tracker = node.tracker();
+    const auto all = dash::dashboard::newest_share_time_by_address(tracker, false, 0, 4320);
+    ASSERT_EQ(all.size(), 2u);
+    const auto peers = dash::dashboard::newest_share_time_by_address(
+        tracker, false, 0, 4320, /*peer_received_only=*/true);
+    ASSERT_EQ(peers.size(), 1u);
+    const std::string elsewhere_addr = peers.begin()->first;
+    std::string local_addr;
+    for (const auto& [a, t] : all)
+        if (a != elsewhere_addr) local_addr = a;
+    ASSERT_FALSE(local_addr.empty());
+
+    // Both rigs shared here an hour before the newest share and went silent.
+    const int64_t now = static_cast<int64_t>(V_BASE_TIME) + 60;
+    core::stratum::AddressActivity act;
+    act.valid = true;
+    act.built_at = now;
+    act.newest_elsewhere = peers;
+
+    using MI = core::MiningInterface;
+    const auto steady = std::chrono::steady_clock::now();
+    std::map<std::string, MI::WorkerInfo> workers;
+    std::map<std::string, MI::WorkerLiveness> lv;
+    for (const auto& [sid, addr] : {std::pair<std::string, std::string>{"s-local", local_addr},
+                                    std::pair<std::string, std::string>{"s-peer", elsewhere_addr}}) {
+        MI::WorkerInfo w;
+        w.username = addr;
+        w.worker_name = "rig";
+        w.accepted = 3;
+        w.difficulty = 1.0;
+        w.connected_at = steady - std::chrono::seconds(7200);
+        workers[sid] = w;
+        lv[sid] = MI::classify_worker_liveness(w, steady - std::chrono::seconds(3600), steady);
+    }
+    MI::mark_hashing_elsewhere(workers, lv, act, now);
+    EXPECT_STREQ(MI::session_state(lv.at("s-local")), "stalled")
+        << "shares minted on this node are no evidence of hashing elsewhere";
+    EXPECT_FALSE(lv.at("s-local").hashing_elsewhere);
+    EXPECT_STREQ(MI::session_state(lv.at("s-peer")), "standby");
+    EXPECT_TRUE(lv.at("s-peer").hashing_elsewhere);
 }

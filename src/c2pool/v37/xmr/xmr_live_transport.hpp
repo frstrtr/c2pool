@@ -55,12 +55,16 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -73,13 +77,70 @@
 
 namespace c2pool::v37n::xmr {
 
+// Node-local caps for the blocking monerod client. kLiveMaxResponseBytes and
+// kLiveSocketTimeoutMs equal the parity-arm transport's (xmr_monerod_http.hpp).
+// kLiveCallDeadlineMs bounds one whole request: connect + send + receive.
+inline constexpr std::size_t   kLiveMaxResponseBytes = 64u * 1024u * 1024u;
+inline constexpr std::uint32_t kLiveSocketTimeoutMs  = 5000;
+inline constexpr std::uint32_t kLiveCallDeadlineMs   = kLiveSocketTimeoutMs;
+inline constexpr std::size_t   kLiveMaxChunks        = 1u << 20;
+
+namespace detail {
+
+// One chunk-size field, in[b, e): hex digits only (no sign, space, "0x" or
+// chunk extension), value at most SIZE_MAX. Returns false otherwise.
+inline bool parse_chunk_size(const std::string& in, std::size_t b, std::size_t e, std::size_t& len) {
+    if (b >= e) return false;
+    std::size_t v = 0;
+    for (std::size_t i = b; i < e; ++i) {
+        const char h = in[i];
+        unsigned d;
+        if (h >= '0' && h <= '9')      d = static_cast<unsigned>(h - '0');
+        else if (h >= 'a' && h <= 'f') d = static_cast<unsigned>(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') d = static_cast<unsigned>(h - 'A' + 10);
+        else return false;
+        if (v > (SIZE_MAX >> 4)) return false;
+        v = (v << 4) | d;
+    }
+    len = v;
+    return true;
+}
+
+// De-chunk an HTTP/1.1 Transfer-Encoding: chunked body into `out`. Returns
+// true when the zero-length last chunk is reached. Returns false on a size
+// field that parse_chunk_size refuses, a chunk length past the end of the
+// input, a chunk not followed by CRLF, input that ends before the last chunk,
+// or more than max_chunks chunks; `out` then holds the chunks decoded so far.
+inline bool dechunk_chunked(const std::string& in, std::string& out,
+                            std::size_t max_chunks = kLiveMaxChunks) {
+    out.clear();
+    std::size_t p = 0, chunks = 0;
+    for (;;) {
+        const std::size_t nl = in.find("\r\n", p);
+        if (nl == std::string::npos) return false;
+        std::size_t len = 0;
+        if (!parse_chunk_size(in, p, nl, len)) return false;
+        p = nl + 2;
+        if (len == 0) return true;
+        if (len > in.size() - p) return false;
+        out.append(in, p, len);
+        p += len;
+        if (in.size() - p < 2 || in.compare(p, 2, "\r\n") != 0) return false;
+        p += 2;
+        if (++chunks > max_chunks) return false;
+    }
+}
+
+} // namespace detail
+
 class LiveMonerodTransport final : public c2pool::xmr::node::IMonerodTransport {
 public:
     using RpcResponse = c2pool::xmr::node::RpcResponse;
     using ZmqFrame    = c2pool::xmr::node::ZmqFrame;
 
-    explicit LiveMonerodTransport(c2pool::xmr::node::DaemonEndpoint ep)
-        : ep_(std::move(ep)) {}
+    explicit LiveMonerodTransport(c2pool::xmr::node::DaemonEndpoint ep,
+                                  std::uint32_t call_deadline_ms = kLiveCallDeadlineMs)
+        : ep_(std::move(ep)), call_deadline_ms_(call_deadline_ms) {}
 
     // Blocking HTTP/1.1 POST to monerod. `json_body` carries "method"; json_rpc
     // methods go to /json_rpc, the few direct endpoints to /<method>. on_done is
@@ -166,6 +227,8 @@ private:
     }
 
     std::string http_post_(const std::string& path, const std::string& body, std::string& out) {
+        out.clear();
+        const Clock::time_point deadline = Clock::now() + std::chrono::milliseconds(call_deadline_ms_);
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) return "live-transport: socket() failed";
         sockaddr_in a{};
@@ -183,7 +246,9 @@ private:
             a.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
             ::freeaddrinfo(res);
         }
-        if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0) {
+        // Non-blocking socket for the whole request: every wait is a poll()
+        // bounded by min(time to the deadline, kLiveSocketTimeoutMs).
+        if (connect_until(fd, a, deadline) != 0) {
             ::close(fd);
             return "live-transport: connect " + ep_.rpc_host + ":" + std::to_string(ep_.rpc_port) +
                    " failed (is monerod running with restricted RPC on this port?)";
@@ -193,53 +258,94 @@ private:
                           "Content-Type: application/json\r\n"
                           "Content-Length: " + std::to_string(body.size()) + "\r\n"
                           "Connection: close\r\n\r\n" + body;
-        if (send_all(fd, req) != 0) { ::close(fd); return "live-transport: send failed"; }
+        if (send_until(fd, req, deadline) != 0) { ::close(fd); return "live-transport: send failed/timed out"; }
         std::string raw;
         char buf[4096];
         for (;;) {
-            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
+            if (wait_io(fd, POLLIN, deadline) <= 0) { ::close(fd); return "live-transport: recv failed/timed out"; }
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n == 0) break;                                   // reply complete (Connection: close)
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                ::close(fd);
+                return "live-transport: recv failed/timed out";
+            }
             raw.append(buf, static_cast<std::size_t>(n));
+            if (raw.size() > kLiveMaxResponseBytes) { ::close(fd); return "live-transport: response too large"; }
         }
         ::close(fd);
         auto hdr_end = raw.find("\r\n\r\n");
         if (hdr_end == std::string::npos) return "live-transport: malformed HTTP response";
         std::string head = raw.substr(0, hdr_end);
-        std::string payload = raw.substr(hdr_end + 4);
+        std::string content = raw.substr(hdr_end + 4);
         if (head.find(" 200") == std::string::npos)
             return "live-transport: monerod HTTP status: " + head.substr(0, head.find("\r\n"));
         // De-chunk if Transfer-Encoding: chunked (monerod restricted RPC uses it).
-        if (head.find("chunked") != std::string::npos) payload = dechunk(payload);
-        out = std::move(payload);
+        if (head.find("chunked") != std::string::npos) {
+            std::string decoded;
+            if (!detail::dechunk_chunked(content, decoded)) return "live-transport: malformed chunked body";
+            content = std::move(decoded);
+        }
+        out = std::move(content);
         return "";
     }
 
-    static int send_all(int fd, const std::string& s) {
+    using Clock = std::chrono::steady_clock;
+
+    // Waits for `events` on fd until the deadline, each poll() at most
+    // kLiveSocketTimeoutMs. Returns 1 when ready, 0 at the deadline or on a
+    // poll() timeout, -1 on a poll() error.
+    static int wait_io(int fd, short events, Clock::time_point deadline) {
+        for (;;) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+            if (left <= 0) return 0;
+            const int ms = static_cast<int>(left < static_cast<long long>(kLiveSocketTimeoutMs) ? left : kLiveSocketTimeoutMs);
+            pollfd pfd{fd, events, 0};
+            const int r = ::poll(&pfd, 1, ms);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            return r == 0 ? 0 : 1;
+        }
+    }
+
+    // Non-blocking connect completed within the deadline. 0 on success.
+    static int connect_until(int fd, const sockaddr_in& a, Clock::time_point deadline) {
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0) return -1;
+        if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&a), sizeof(a)) == 0) return 0;
+        if (errno != EINPROGRESS) return -1;
+        if (wait_io(fd, POLLOUT, deadline) <= 0) return -1;
+        int err = 0; socklen_t el = sizeof(err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) return -1;
+        return 0;
+    }
+
+    // All of `s` written within the deadline. 0 on success.
+    static int send_until(int fd, const std::string& s, Clock::time_point deadline) {
+#if defined(MSG_NOSIGNAL)
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0;
+#endif
         std::size_t off = 0;
         while (off < s.size()) {
-            ssize_t n = ::send(fd, s.data() + off, s.size() - off, 0);
-            if (n <= 0) return -1;
+            if (wait_io(fd, POLLOUT, deadline) <= 0) return -1;
+            const ssize_t n = ::send(fd, s.data() + off, s.size() - off, kSendFlags);
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                return -1;
+            }
+            if (n == 0) return -1;
             off += static_cast<std::size_t>(n);
         }
         return 0;
     }
-    static std::string dechunk(const std::string& in) {
-        std::string out;
-        std::size_t p = 0;
-        while (p < in.size()) {
-            std::size_t nl = in.find("\r\n", p);
-            if (nl == std::string::npos) break;
-            std::size_t len = std::strtoul(in.substr(p, nl - p).c_str(), nullptr, 16);
-            if (len == 0) break;
-            p = nl + 2;
-            if (p + len > in.size()) break;
-            out.append(in, p, len);
-            p += len + 2;
-        }
-        return out;
-    }
 
     c2pool::xmr::node::DaemonEndpoint ep_;
+    std::uint32_t call_deadline_ms_ = kLiveCallDeadlineMs;
     std::unordered_map<std::string, std::vector<std::function<void(const ZmqFrame&)>>> subs_;
     // Atomic because the found-block submitter posts from its own thread while
     // the node loop is pumping; the counters are read on the status cadence.

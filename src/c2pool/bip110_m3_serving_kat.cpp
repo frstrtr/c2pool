@@ -356,7 +356,8 @@ int main() {
         expect("same child WITH confirmed parent-coin INCLUDED", index_of(rp.txs, H) != SIZE_MAX);
     }
 
-    // ── (11) GAP4 REORG: a rolled-back coin is not priced/included ───────────
+    // ── (11) GAP4 REORG: a rolled-back coin is not priced/included, a coin the
+    //         rolled-back block spent is back (#2059) ────────────────────────
     std::printf("--- (11) GAP4 reorg / disconnect ---\n");
     {
         std::string path = "/tmp/bip110_kat_reorg_" + std::to_string(::getpid());
@@ -364,7 +365,10 @@ int main() {
         core::coin::UTXOViewCache utxo(&db);
         auto txidfn = [](const MutableTransaction& tx) { return compute_txid(tx); };
 
-        // Connect a synthetic block at h=100 creating coin C1 (value 100000).
+        // Connect a synthetic block at h=100 creating coin C1 (value 100000)
+        // by spending the confirmed coin 0x33:0 (value 150000, h=90).
+        const core::coin::Outpoint S(h_of(0x33), 0);
+        utxo.add_coin(S, core::coin::Coin(150000, OPScript{}, 90, false));
         MutableTransaction cb = mk_tx(h_of(0x00), 0xffffffff, 5000000000);
         MutableTransaction t  = mk_tx(h_of(0x33), 0, 100000);
         BlockType blk; blk.m_txs = { cb, t };
@@ -374,6 +378,7 @@ int main() {
         core::coin::Outpoint C1(c1txid, 0);
         core::coin::Coin cc;
         expect("C1 present after connect_block", utxo.get_coin(C1, cc));
+        expect("0x33:0 spent by the block", !utxo.get_coin(S, cc));
 
         Mempool pool; pool.set_utxo(&utxo); pool.set_tip_height(200);
         MutableTransaction spend = mk_tx(c1txid, 0, 90000);   // fee 10000
@@ -384,6 +389,8 @@ int main() {
         pool.requarantine_all();
         pool.recompute_unknown_fees(&utxo);
         expect("C1 GONE after disconnect_from_undo", !utxo.get_coin(C1, cc));
+        expect("spent coin 0x33:0 RESTORED after disconnect",
+               utxo.get_coin(S, cc) && cc.value == 150000 && cc.height == 90 && !cc.coinbase);
         expect("mempool fees == 0 after re-price (spender unpriceable)", pool.total_fees() == 0);
         // Template excludes the spender: snapshot has no priced entries, and the
         // inclusion predicate now fails for C1.
@@ -406,6 +413,12 @@ int main() {
         // Fail-closed arm: undo for a never-stored height is absent.
         core::coin::BlockUndo missing;
         expect("get_block_undo(never-stored) == false (fail-closed)", !db.get_block_undo(9999, missing));
+        // Legacy (pre-#2059) record: no outpoints, cannot put 0x33:0 back.
+        db.put_block_undo_legacy(100, undo);
+        core::coin::BlockUndo legacy;
+        expect("legacy record read back (format 1, not restorable)",
+               db.get_block_undo(100, legacy) && legacy.format == 1 && !legacy.restorable());
+        expect("disconnect_from_undo(legacy) == false", !utxo.disconnect_from_undo(legacy));
 
         // Factored reorg_disconnect_to_fork over a mock header chain: roll the
         // view from an old-branch tip back to the common ancestor.
@@ -430,11 +443,13 @@ int main() {
             core::coin::UTXOViewDB db2(p2); db2.open();
             core::coin::UTXOViewCache cache2(&db2);
             uint256 hashG = h_of(0x60), hashO11 = h_of(0x61), hashN11 = h_of(0x62), hashN12 = h_of(0x63);
-            // Old-branch block O11 creates coin CO.
+            // Old-branch block O11 creates coin CO, spending the confirmed 0x44:0.
+            const core::coin::Outpoint SO(h_of(0x44), 0);
+            cache2.add_coin(SO, core::coin::Coin(80000, OPScript{}, 9, false));
             MutableTransaction cbO = mk_tx(h_of(0x00), 0xffffffff, 5000000000);
             MutableTransaction tO  = mk_tx(h_of(0x44), 0, 70000);
             BlockType blkO; blkO.m_txs = { cbO, tO };
-            auto undoO = cache2.connect_block(blkO, 11, txidfn);
+            auto undoO = cache2.connect_block(blkO, 11, txidfn, hashO11);
             db2.put_block_undo(11, undoO);
             cache2.flush(hashO11, 11);
             core::coin::Outpoint CO(compute_txid(tO), 0);
@@ -447,6 +462,37 @@ int main() {
             expect("reorg_disconnect_to_fork == OK", res == bip110::coin::ReorgResult::OK);
             expect("view rolled back to fork height 10", cache2.get_best_height() == 10);
             expect("CO removed by reorg disconnect", !cache2.get_coin(CO, co));
+            expect("0x44:0 (spent by O11) restored by reorg disconnect",
+                   cache2.get_coin(SO, co) && co.value == 80000 && co.height == 9);
+
+            // The same old branch over a legacy (pre-#2059) record: its output
+            // is still removed, but the coin it spent cannot be put back, so
+            // the walk reports UNDO_LEGACY (caller stays fail-closed).
+            std::string p3 = "/tmp/bip110_kat_legacy_" + std::to_string(::getpid());
+            core::coin::UTXOViewDB db3(p3); db3.open();
+            core::coin::UTXOViewCache cache3(&db3);
+            cache3.add_coin(SO, core::coin::Coin(80000, OPScript{}, 9, false));
+            auto undoL = cache3.connect_block(blkO, 11, txidfn);
+            db3.put_block_undo_legacy(11, undoL);
+            cache3.flush(hashO11, 11);
+            auto resL = bip110::coin::reorg_disconnect_to_fork(cache3, db3, mock, hashN12, 288);
+            expect("reorg over a legacy record == UNDO_LEGACY", resL == bip110::coin::ReorgResult::UNDO_LEGACY);
+            expect("UNDO_LEGACY: CO still removed", !cache3.get_coin(CO, co));
+            expect("UNDO_LEGACY: 0x44:0 not restored", !cache3.get_coin(SO, co));
+
+            // A record bound to another block than the one being rolled back
+            // (O11): never applied, the walk reports UNDO_MISMATCH.
+            std::string p4 = "/tmp/bip110_kat_mismatch_" + std::to_string(::getpid());
+            core::coin::UTXOViewDB db4(p4); db4.open();
+            core::coin::UTXOViewCache cache4(&db4);
+            cache4.add_coin(SO, core::coin::Coin(80000, OPScript{}, 9, false));
+            db4.put_block_undo(11, cache4.connect_block(blkO, 11, txidfn, h_of(0x64)));
+            cache4.flush(hashO11, 11);
+            auto resM = bip110::coin::reorg_disconnect_to_fork(cache4, db4, mock, hashN12, 288);
+            expect("reorg over another block's record == UNDO_MISMATCH",
+                   resM == bip110::coin::ReorgResult::UNDO_MISMATCH);
+            expect("UNDO_MISMATCH: CO untouched", cache4.get_coin(CO, co));
+            expect("UNDO_MISMATCH: 0x44:0 not restored", !cache4.get_coin(SO, co));
         }
     }
 

@@ -22,6 +22,15 @@
 // exists for); (b) a per-block dedupe in front of submitblock collapses both
 // callers onto one delivered request and replays its verdict.
 //
+// (c) Same-parent coalescing. The .234 arm D A/B (2026-10-03) still failed
+// IOC-LAT (131s) with (a)+(b) live: an easy-target regtest tip produced 288
+// DISTINCT won blocks on ONE parent, so the per-block dedupe never fired and
+// every sibling queued another submitblock behind cs_main. Only one child of a
+// parent can become the tip (first-seen wins on equal work), so once a sibling
+// on the same prev-hash is delivered and not rejected, later siblings skip the
+// RPC path. They still go out over P2P (the dual-path broadcaster is upstream
+// of this gate). A rejected sibling does not block the next one.
+//
 // Header-only, no I/O: this is the SSOT for both NodeRPC (coin/rpc.cpp) and the
 // submit_flood_gate KAT (test/submit_flood_gate_test.cpp).
 // ---------------------------------------------------------------------------
@@ -76,6 +85,16 @@ public:
         return block_hex.substr(0, 160);
     }
 
+    // The prev-hash field of the header key (header bytes 4..36). Empty when
+    // the key is too short to carry one; an empty parent never coalesces.
+    static std::string parent_of(const std::string& key)
+    {
+        constexpr std::size_t kOff = 8, kLen = 64;
+        if (key.size() < kOff + kLen)
+            return {};
+        return key.substr(kOff, kLen);
+    }
+
     // Prior verdict for this block, or nullopt if it was never delivered.
     std::optional<Verdict> lookup(const std::string& key) const
     {
@@ -83,6 +102,23 @@ public:
         if (it == m_entries.end())
             return std::nullopt;
         return it->second;
+    }
+
+    // Verdict of a DIFFERENT delivered block on the same parent that still
+    // holds the tip race (Accepted or DeliveredUnknown), or nullopt. Rejected
+    // siblings are skipped: a bad block must not shadow a good one.
+    std::optional<Verdict> lookup_sibling(const std::string& key) const
+    {
+        const auto parent = parent_of(key);
+        if (parent.empty())
+            return std::nullopt;
+        for (auto it = m_entries.rbegin(); it != m_entries.rend(); ++it) {
+            if (it->first == key || it->second == Verdict::Rejected)
+                continue;
+            if (parent_of(it->first) == parent)
+                return it->second;
+        }
+        return std::nullopt;
     }
 
     // Record a delivered submit. A later verdict for the same key overwrites

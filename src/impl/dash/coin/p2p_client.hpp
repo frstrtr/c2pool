@@ -2070,6 +2070,30 @@ public:
         return sent;
     }
 
+    /// Is `block_hash` already on the lost-body watchdog (requested, body not
+    /// yet landed)?
+    bool body_tracked(const uint256& block_hash) const
+    {
+        for (const auto& pb : m_pending_bodies)
+            if (pb.hash == block_hash) return true;
+        return false;
+    }
+
+    /// Ask for a body by hash ONCE: if the watchdog already tracks it (the inv
+    /// path, or another by-height feeder, asked first) leave the slot alone
+    /// and report it in flight; otherwise request_block_tracked(). For callers
+    /// that re-drive on their own clock (PayeeFoldFeeder): every
+    /// request_block_tracked() re-ask refreshes the slot's last_req, and a
+    /// caller re-asking faster than the watchdog's doubling stall window
+    /// (2 s .. 64 s) would keep that window from ever expiring — the staller
+    /// would never be struck. The watchdog owns re-asks of a tracked body;
+    /// the caller's clock only re-creates a slot that no longer exists.
+    bool request_block_if_untracked(const uint256& block_hash)
+    {
+        if (body_tracked(block_hash)) return true;
+        return request_block_tracked(block_hash);
+    }
+
     /// dashd nStallingSince: tag ONE block as the HEAD-OF-LINE (front-of-
     /// ordered-window) body and ensure it is tracked. Reuses
     /// request_block_tracked()'s slot + #138 ledger honesty; the ONLY addition

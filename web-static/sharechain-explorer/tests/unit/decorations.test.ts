@@ -42,7 +42,7 @@ function input(over: Partial<AnimationInput> = {}): AnimationInput {
 
 // ── CellFrame stroke (block borders) ──────────────────────────────
 
-test('LTC block hash → gold stroke, no fill override', () => {
+test('LTC block hash → dark core, gold ring, gold centre pip', () => {
   const plan = buildAnimationPlan(input({
     primaryBlockHashes: new Set(['b']),
   }));
@@ -50,7 +50,9 @@ test('LTC block hash → gold stroke, no fill override', () => {
   const f = plan.frameAt(plan.phase2Start + 200);
   const cellB = f.cells.find((c) => c.shareHash === 'b');
   assert.ok(cellB);
+  assert.equal(cellB?.color, '#1a1400');
   assert.deepEqual(cellB?.stroke, { color: '#ffd700', lineWidth: 2 });
+  assert.equal(cellB?.blockMark, '#ffd700');
 });
 
 test('DOGE block hash → cyan stroke', () => {
@@ -59,18 +61,21 @@ test('DOGE block hash → cyan stroke', () => {
   }));
   const f = plan.frameAt(plan.phase2Start + 200);
   const cellC = f.cells.find((c) => c.shareHash === 'c');
+  assert.equal(cellC?.color, '#001a1d');
   assert.deepEqual(cellC?.stroke, { color: '#00e5ff', lineWidth: 2 });
+  assert.equal(cellC?.blockMark, '#00e5ff');
 });
 
-test('twin LTC+DOGE → orange fill + darker orange stroke', () => {
+test('twin LTC+DOGE → dark core + orange ring + orange pip', () => {
   const plan = buildAnimationPlan(input({
     primaryBlockHashes: new Set(['a']),
     dogeBlockHashes: new Set(['a']),
   }));
   const f = plan.frameAt(plan.phase2Start + 200);
   const cellA = f.cells.find((c) => c.shareHash === 'a');
-  assert.equal(cellA?.color, '#ff8000');
+  assert.equal(cellA?.color, '#1d0e00');
   assert.deepEqual(cellA?.stroke, { color: '#ffaa00', lineWidth: 2 });
+  assert.equal(cellA?.blockMark, '#ffaa00');
 });
 
 test('non-block cells have no stroke', () => {
@@ -80,6 +85,7 @@ test('non-block cells have no stroke', () => {
   const f = plan.frameAt(plan.phase2Start + 200);
   const cellA = f.cells.find((c) => c.shareHash === 'a');
   assert.equal(cellA?.stroke, undefined);
+  assert.equal(cellA?.blockMark, undefined);
 });
 
 // ── tipMark ───────────────────────────────────────────────────────
@@ -122,6 +128,9 @@ test('buildAnimatedPaintProgram emits strokeRect after fillCell for blocks', () 
   const gold = strokes.find((c) =>
     c.op === 'strokeRect' && c.color === '#ffd700');
   assert.ok(gold, 'gold stroke for LTC block');
+  const pip = program.find((c) => c.op === 'fillCell' && c.color === '#ffd700');
+  assert.ok(pip, 'gold centre pip for LTC block');
+  assert.ok(pip.op === 'fillCell' && pip.w < f.cells[0]!.size, 'pip is smaller than the cell');
 });
 
 test('buildAnimatedPaintProgram emits fillTriangle for tipMark', () => {

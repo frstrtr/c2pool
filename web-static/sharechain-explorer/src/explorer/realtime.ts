@@ -55,7 +55,7 @@ import {
   type PaintCommand,
   type GridRenderer,
 } from './grid-paint.js';
-import { getColor } from './colors.js';
+import { blockCellStyle, getColor } from './colors.js';
 
 export interface LayoutParams {
   cellSize: number;
@@ -181,6 +181,8 @@ export interface RealtimeStats {
   fee: number;           // share.fee truthy
   v36native: number;     // share.V >= shareVersion threshold
   v36signaling: number;  // share.V < threshold && share.dv >= threshold
+  /** Shares IN THE WINDOW that solved a block (same scope as the other
+   *  counters), not the length of the server's found-block list. */
   primaryBlocks: number;
   dogeBlocks: number;
 }
@@ -333,10 +335,15 @@ export class RealtimeOrchestrator {
       fee: 0,
       v36native: 0,
       v36signaling: 0,
-      primaryBlocks: this.window.primaryBlocks?.length ?? 0,
-      dogeBlocks: this.window.dogeBlocks?.length ?? 0,
+      primaryBlocks: 0,
+      dogeBlocks: 0,
     };
+    const primarySet = new Set(this.window.primaryBlocks ?? []);
+    const dogeSet    = new Set(this.window.dogeBlocks ?? []);
     for (const share of this.window.shares) {
+      const h = this.config.hashOf(share);
+      if (primarySet.has(h) || share.blk === 1) s.primaryBlocks++;
+      if (dogeSet.has(h)) s.dogeBlocks++;
       if (share.s === 2) s.dead++;
       else if (share.s === 1) s.stale++;
       if (share.v) s.verified++;
@@ -414,15 +421,8 @@ export class RealtimeOrchestrator {
       const isLtc = primarySet.has(h) || s.blk === 1;
       const isDoge = dogeSet.has(h);
       let color = getColor(s, this._effectiveUserContext, this.config.palette);
-      let stroke: { color: string; lineWidth: number } | undefined;
-      if (isLtc && isDoge) {
-        color = '#ff8000';
-        stroke = { color: '#ffaa00', lineWidth: 2 };
-      } else if (isLtc) {
-        stroke = { color: '#ffd700', lineWidth: 2 };
-      } else if (isDoge) {
-        stroke = { color: '#00e5ff', lineWidth: 2 };
-      }
+      const mark = blockCellStyle(isLtc, isDoge);
+      if (mark) color = mark.color;
       const cell: CF = {
         shareHash: h,
         track: 'wave',
@@ -431,7 +431,7 @@ export class RealtimeOrchestrator {
         color,
         alpha: 1,
       };
-      if (stroke) cell.stroke = stroke;
+      if (mark) { cell.stroke = mark.stroke; cell.blockMark = mark.blockMark; }
       if (h === tipHash && !isLtc && !isDoge) cell.tipMark = true;
       return cell;
     });

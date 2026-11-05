@@ -23,8 +23,9 @@
 // bounded sibling burst. That is the residual of the #853 storm.
 //
 // The fix is a second flag: a request that loses the race is REMEMBERED, and
-// the owner of the cycle services it when it releases. These two free
-// functions are the whole protocol, so node.cpp and the KATs
+// the owner of the cycle services it when it releases. These free functions
+// plus ThinkSlotGuard (#857: release on every exit path) are the whole
+// protocol, so node.cpp and the KATs
 // (test_dash_stratum_notify_roundtrip) exercise literally the same code.
 //
 // ── THREADING ───────────────────────────────────────────────────────────────
@@ -97,6 +98,69 @@ inline bool release_think_slot(std::atomic<bool>& running,
     running.store(false);              // clear FIRST — see the ordering note
     return rethink_pending.exchange(false);
 }
+
+/// Scope guard for a HELD think slot (#857).
+///
+/// Every cycle has the shape "acquire the slot, then boost::asio::post() the
+/// work that will release it". If post() throws (allocation failure) after the
+/// slot was taken, nothing ever releases it: `running` stays true for the life
+/// of the process, every later run_think() is recorded as pending and never
+/// served, clean_tracker() is denied, and the node silently stops electing a
+/// best share.
+///
+/// The guard owns a slot the caller has ALREADY acquired. Leaving scope
+/// releases it unless commit() handed ownership to the posted work first, so
+/// the stall cannot be reached on any exit path, including unwinding. An
+/// unwinding release cannot re-post a queued re-think (the post is what
+/// failed); the next run_think() trigger is a full re-election, so only the
+/// cycle that never started is lost.
+///
+/// release() is release-ONCE: it reports whether a re-think is owed exactly as
+/// release_think_slot() does, and any later release() or the destructor is a
+/// no-op. That makes the "release in try, release again in catch" shape of the
+/// IO-phase epilogue safe by construction instead of by IO-thread confinement:
+/// a second release would otherwise clear a slot a NEW cycle may already own.
+///
+/// `clean_running` (optional) is the CLEAN cycle's re-entry flag. It is
+/// cleared on release, after the slot, matching the clean epilogue's order.
+///
+/// Same thread-confinement as the free functions: construct, commit and
+/// release on the IO thread only.
+class ThinkSlotGuard {
+public:
+    ThinkSlotGuard(std::atomic<bool>& running,
+                   std::atomic<bool>& rethink_pending,
+                   std::atomic<bool>* clean_running = nullptr) noexcept
+        : m_running(running), m_pending(rethink_pending), m_clean(clean_running) {}
+
+    ThinkSlotGuard(const ThinkSlotGuard&) = delete;
+    ThinkSlotGuard& operator=(const ThinkSlotGuard&) = delete;
+
+    ~ThinkSlotGuard() { (void)release(); }
+
+    /// The posted work now owns the slot and will release it itself.
+    void commit() noexcept { m_held = false; }
+
+    /// Release now, once. Returns true if a re-think is owed.
+    bool release() noexcept
+    {
+        if (!m_held)
+            return false;
+        m_held = false;
+        const bool owed = release_think_slot(m_running, m_pending);
+        if (m_clean)
+            m_clean->store(false);
+        return owed;
+    }
+
+    bool held() const noexcept { return m_held; }
+
+private:
+    std::atomic<bool>& m_running;
+    std::atomic<bool>& m_pending;
+    std::atomic<bool>* m_clean;
+    bool m_held = true;
+};
 
 /// Did the CLEAN cycle move the sharechain tip?
 ///

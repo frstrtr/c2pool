@@ -41,8 +41,11 @@ namespace dash
 // Extension point: additional chain-relative admission gates (timestamp
 // monotonicity, abswork progression, far_share_hash anchoring) compose HERE as
 // they are conformance-proven, keeping the node accept path a single call.
-template <typename ChainT>
-inline void admit_chain_relative(const DashShare& share, ChainT& chain,
+// Both live share types (DashShare, DashV36Share); verify_version_transition
+// overload-resolves on the share type.
+template <typename ShareT, typename ChainT>
+    requires is_live_share<ShareT>
+inline void admit_chain_relative(const ShareT& share, ChainT& chain,
                                  uint64_t chain_length)
 {
     verify_version_transition(share, chain, chain_length);
@@ -50,17 +53,20 @@ inline void admit_chain_relative(const DashShare& share, ChainT& chain,
 
 // admit_share — the canonical per-incoming-share admission a Dash node runs in
 // its accept path, composing BOTH steps in oracle order:
+//   step 0  check_share_type_admitted(...) the one wire type this chain speaks
 //   step 1  share_init_verify(...)        structural + X11 PoW, coin-param-relative
 //   step 2  admit_chain_relative(...)      version mint<->accept coupling, chain-relative
 // Returns the verified share hash (the value share_init_verify computes); throws
 // std::invalid_argument on any rejected share. Use this single-call form on the
 // serial accept path; use share_init_verify + admit_chain_relative separately
 // when the structural verify is hoisted into a parallel phase.
-template <typename ChainT>
-inline uint256 admit_share(const DashShare& share, ChainT& chain,
+template <typename ShareT, typename ChainT>
+    requires is_live_share<ShareT>
+inline uint256 admit_share(const ShareT& share, ChainT& chain,
                            const core::CoinParams& params, uint64_t chain_length,
                            bool check_pow = true)
 {
+    check_share_type_admitted(ShareT::version, params);
     uint256 hash = share_init_verify(share, params, check_pow);
     admit_chain_relative(share, chain, chain_length);
     return hash;

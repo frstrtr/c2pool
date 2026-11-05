@@ -64,7 +64,35 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
             [i, data, remaining, this, addr]()
             {
                 auto& share = data->m_items[i];
-                if (share.hash().IsNull())
+
+                // The one wire type this chain admits (public: v16; private/
+                // isolated v36 sharechain: the type it mints). A share of the
+                // other type is dropped here: hash forced null, phase 2 frees it.
+                bool admitted = true;
+                try
+                {
+                    share.ACTION({
+                        check_share_type_admitted(share_t::version, m_tracker.m_coin_params);
+                    });
+                }
+                catch (const std::exception& e)
+                {
+                    admitted = false;
+                    share.ACTION({ obj->m_hash.SetNull(); });
+                    static std::atomic<uint64_t> s_rejected{0};
+                    const uint64_t n_rej = ++s_rejected;
+                    if (n_rej <= 3 || n_rej % 100 == 0)
+                        LOG_WARNING << "[Pool] share from " << addr.to_string()
+                                    << " rejected: " << e.what()
+                                    << " (rejected_total=" << n_rej << ")";
+                    // #1829: graded on the DASH v36 network only (note_misbehaviour
+                    // filters by network). The scorer is IO-thread state.
+                    boost::asio::post(*m_context, [this, addr]() {
+                        note_misbehaviour(addr, misbehaviour::Offence::wrong_share_type);
+                    });
+                }
+
+                if (admitted && share.hash().IsNull())
                 {
                     try
                     {
@@ -72,9 +100,21 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                             obj->m_hash = share_init_verify(*obj, m_tracker.m_coin_params, true);
                         });
                     }
-                    catch (const std::exception&)
+                    catch (const std::exception& e)
                     {
-                        // leave hash null — phase 2 will skip this share
+                        // Leave hash null: phase 2 skips this share. #1829:
+                        // charge the sender by what failed (the one shared
+                        // rule, misbehaviour::classify_verify_failure):
+                        // invalid PoW / target and structural rejects on both
+                        // networks, any other verify failure on the DASH v36
+                        // network only, a future timestamp never. The scorer
+                        // is IO-thread state, so the charge is posted there.
+                        const auto offence = misbehaviour::classify_verify_failure(
+                            e, SharechainConfig::share_profile().full_misbehaviour_grading);
+                        if (offence)
+                            boost::asio::post(*m_context, [this, addr, o = *offence]() {
+                                note_misbehaviour(addr, o);
+                            });
                     }
                 }
 
@@ -89,6 +129,88 @@ void NodeImpl::processing_shares(HandleSharesData& data_ref, NetService addr)
                         });
                 }
             });
+    }
+}
+
+bool NodeImpl::precheck_raw_shares(std::vector<chain::RawShare>& shares,
+                                   precheck::Kind kind, const NetService& addr)
+{
+    const auto r = precheck::precheck_raw_shares(shares, kind, SharechainConfig::share_profile());
+    if (r.message_dropped)
+        m_precheck_dropped_messages.fetch_add(1, std::memory_order_relaxed);
+    if (r.shares_dropped)
+    {
+        m_precheck_dropped_shares.fetch_add(r.shares_dropped, std::memory_order_relaxed);
+        static std::atomic<uint64_t> s_dropped{0};
+        const uint64_t n = ++s_dropped;
+        if (n <= 3 || n % 100 == 0)
+            LOG_WARNING << "[Pool] " << precheck::kind_name(kind) << " from " << addr.to_string()
+                        << ": dropped " << r.shares_dropped
+                        << (r.message_dropped ? " shares (whole message): " : " shares: ")
+                        << r.reason << " (drop_events_total=" << n << ")";
+        // #1829: one charge per message, DASH v36 network only (the public
+        // caps are the oracle's own receive rule, which only skips the frame).
+        note_misbehaviour(addr, misbehaviour::Offence::precheck_drop);
+    }
+    return !r.message_dropped;
+}
+
+// #1829: charge one offence against `addr` (peer_misbehaviour.hpp has the
+// policy and the oracle citations). IO thread, same discipline as m_ban_list.
+//
+// KEYED BY IP, BANNED BY IP (LTC #1601 parity, ltc/node.cpp note_invalid_pow_share):
+// the score accumulates per source IP, so redialing from a new port does not
+// reset it, and the ban goes to m_ip_ban_list, which is_banned() consults for
+// any port: connected() refuses the inbound reconnect before the handshake and
+// the dialer skips the address. Every open connection from that IP is closed.
+// The run_think hard ban of think()'s bad_peer_addresses (IP:port) is separate
+// and unchanged.
+void NodeImpl::note_misbehaviour(const NetService& addr, misbehaviour::Offence offence)
+{
+    if (addr.port() == 0)          // db-load pseudo-peer, never a network peer
+        return;
+    if (is_whitelisted(addr))      // --addnode / --connect seeds are never scored
+        return;
+    if (!misbehaviour::applies(offence, SharechainConfig::share_profile().full_misbehaviour_grading))
+        return;
+    m_misbehaviour_notes[static_cast<std::size_t>(offence)].fetch_add(1, std::memory_order_relaxed);
+
+    const std::string ip = addr.address();
+    if (!m_misbehaviour.note(ip, misbehaviour::weight(offence), m_misbehaviour_now()))
+        return;   // below the threshold: no action, the score keeps decaying
+
+    using Scorer = misbehaviour::PeerMisbehaviourScorer<std::string>;
+    LOG_WARNING << "[MISBEHAVIOR] peer IP " << ip
+                << " crossed the misbehaviour threshold (" << Scorer::BAN_THRESHOLD
+                << ", " << Scorer::HALFLIFE_SECONDS << "s half-life), last offence "
+                << misbehaviour::name(offence) << " from " << addr.to_string()
+                << " - IP-banning for " << m_ban_duration.count() << "s and disconnecting";
+    m_ip_ban_list[ip] = std::chrono::steady_clock::now() + m_ban_duration;
+    m_misbehaviour_bans.fetch_add(1, std::memory_order_relaxed);
+    m_misbehaviour.clear(ip);
+    disconnect_ip(ip);
+}
+
+void NodeImpl::prune_misbehaviour()
+{
+    m_misbehaviour.prune(m_misbehaviour_now());
+}
+
+void NodeImpl::disconnect_ip(const std::string& ip)
+{
+    std::vector<NetService> to_close;
+    for (const auto& [service, peer] : m_connections)
+        if (service.address() == ip)
+            to_close.push_back(service);
+    // error(), not close_connection(): error() also drops the peer's nonce
+    // entry from m_peers, so a reconnect after the ban expires is not refused
+    // as a duplicate, and it cancels the peer's pending share requests.
+    for (const auto& service : to_close)
+        error("misbehaviour score crossed the ban threshold", service);
+    for (auto it = m_pending_outbound.begin(); it != m_pending_outbound.end(); )
+    {
+        if (it->address() == ip) it = m_pending_outbound.erase(it);
+        else ++it;
     }
 }
 
@@ -345,6 +467,12 @@ void NodeImpl::load_persisted_shares()
     // Only the newest window is loaded (LevelDB accumulates forever).
     const size_t keep = static_cast<size_t>(SharechainConfig::chain_length()) * 2 + 10;
     const size_t total_in_db = all_hashes.size();
+
+    // One store holds one share type: a private/isolated identity's subdir is
+    // keyed on the share version it mints (SharechainConfig::data_subdir,
+    // "dash_<id>_v36"), so the newest `keep` rows are all rows of the type the
+    // chain speaks — the window of master, unchanged. The per-row type check
+    // below stays as a cheap invariant.
     size_t skip = (total_in_db > keep) ? (total_in_db - keep) : 0;
 
     int loaded = 0, skipped = 0;
@@ -364,6 +492,18 @@ void NodeImpl::load_persisted_shares()
             chain::RawShare rshare(ver, PackStream(
                 std::vector<unsigned char>(data.begin() + 8, data.end())));
             auto share = dash::load_share(rshare, NetService{"database", 0});
+            // A row of a type this chain does not admit is skipped, never
+            // inserted (invariant; the version-keyed subdir already keeps
+            // other-type rows out of this store).
+            try {
+                check_share_type_admitted(share.version(), m_tracker.m_coin_params);
+            } catch (const std::exception& e) {
+                share.destroy();
+                ++skipped;
+                LOG_WARNING << "[Pool] skipped persisted share "
+                            << hash.GetHex().substr(0, 16) << ": " << e.what();
+                continue;
+            }
             // m_hash is not serialized — restore from the LevelDB key.
             share.ACTION({ obj->m_hash = hash; });
             if (m_chain->contains(share.hash())) {
@@ -471,18 +611,24 @@ void NodeImpl::apply_min_protocol_ratchet()
     const uint32_t target  = SharechainConfig::NEW_MINIMUM_PROTOCOL_VERSION;  // 3600
     const uint32_t current =
         m_runtime_min_protocol_version.load(std::memory_order_relaxed);
-    if (current >= target)                    // already ratcheted -> latched, no-op
+    // Already ratcheted -> latched, no-op. On the private/isolated DASH v36
+    // sharechain the floor is SEEDED at ISOLATED_V36_PROTOCOL_VERSION (3601,
+    // node.hpp, share_profile().ratchet_floor_protocol_version), above this
+    // target, so this returns on the first call there and never lowers it.
+    if (current >= target)
         return;
     if (m_best_share_hash.IsNull() || !m_tracker.chain.contains(m_best_share_hash))
         return;
 
     // DASH DIVERGENCE FROM dgb (flagged for integrator): dgb keys the ratchet on the
-    // best share's static TYPE version (35 -> 36 after the format switch). DASH has
-    // NO v36 share TYPE — DashShare is permanently wire-type 16 — so "the best share
-    // is v36" is expressed by its m_desired_version VOTE reaching 36, and that vote is
-    // what the work-weighted tally is keyed by. Using the static type here would check
-    // weights[16] (always ~100% pre-crossing) and FALSELY lift the floor; using the
-    // vote checks weights[36], which is ~0 until the crossing actually happens.
+    // best share's static TYPE version (35 -> 36 after the format switch). On the
+    // public network DASH has no v36 share TYPE — DashShare is permanently wire-type
+    // 16 (the v36 type, DashV36Share, exists only on the private/isolated v36
+    // sharechain) — so "the best share is v36" is expressed by its m_desired_version
+    // VOTE reaching 36, and that vote is what the work-weighted tally is keyed by.
+    // Using the static type here would check weights[16] (always ~100% pre-crossing)
+    // and FALSELY lift the floor; using the vote checks weights[36], which is ~0
+    // until the crossing actually happens.
     int64_t best_desired = 0;
     uint256 prev_hash;
     m_tracker.chain.get_share(m_best_share_hash).invoke([&](auto* obj) {
@@ -601,9 +747,10 @@ dash::SupersedeHint NodeImpl::gate_supersede_convergence(dash::SupersedeHint hin
 
 void NodeImpl::run_think()
 {
-    // THREAD-CONFINEMENT (enforced, not assumed — register_template_txs
-    // precedent): the think-slot flags (m_think_running / m_rethink_pending)
-    // are IO-thread-only. Every caller is on the single ioc.run() thread: the
+    // THREAD-CONFINEMENT (asserted in debug builds, not assumed —
+    // register_template_txs precedent; the assert compiles out in Release):
+    // the think-slot flags (m_think_running / m_rethink_pending) are
+    // IO-thread-only. Every caller is on the single ioc.run() thread: the
     // mint hook (add_local_share), the reception path (add_verified_shares,
     // which posts itself back to m_context after the verify pool), the 2 s
     // advert drain, and both cycles' IO-phase epilogues. The compute thread
@@ -628,10 +775,13 @@ void NodeImpl::run_think()
             LOG_INFO << "[ASYNC-THINK] skipped — compute thread busy (re-think queued)";
         return;
     }
+    // #857: from here every exit releases the slot unless commit() hands it
+    // to the posted cycle — a throwing post() can no longer leak it.
+    dash::think::ThinkSlotGuard slot(m_think_running, m_rethink_pending);
     if (!m_context) {
         // Rig-free (KAT/standalone) node: no IO context to hop back to, so
-        // there is nowhere to post a queued re-think either — drop it.
-        (void)dash::think::release_think_slot(m_think_running, m_rethink_pending);
+        // there is nowhere to post a queued re-think either — the guard
+        // releases and drops it.
         return;
     }
 
@@ -730,6 +880,13 @@ void NodeImpl::run_think()
           // escaping this handler would propagate out of ioc.run() and
           // TERMINATE the node (Exit 134) — e.g. a chain-walk throw over a
           // fragmented/unrooted restart chain. Catch, log, and keep serving.
+          //
+          // #857: this handler owns the slot the prologue committed to the
+          // cycle. The guard releases it exactly once — in the try below, in a
+          // catch, or on scope exit — so a throw anywhere here, including from
+          // the re-post after a successful release, cannot leak it or release
+          // it twice.
+          dash::think::ThinkSlotGuard io_slot(m_think_running, m_rethink_pending);
           try {
             // Ban peers that provided invalid/unverifiable shares (btc
             // node.cpp:1585-1603 port). Whitelisted bootstrap seeds are
@@ -753,7 +910,11 @@ void NodeImpl::run_think()
                     if (it->second <= now) it = m_ip_ban_list.erase(it);
                     else ++it;
                 }
+                // #1716 part B: forget self-nonce counts whose window passed.
+                prune_self_nonce_attempts();
             }
+            // #1829: forget misbehaviour scores that decayed to ~0.
+            prune_misbehaviour();
 
             // #754 share-download leg (p2pool node.py download loop; ltc
             // node.cpp:1600-1618 port): reset the per-cycle gate — p2pool
@@ -796,27 +957,27 @@ void NodeImpl::run_think()
 
             drain_pending_adds();
 
-            // #854: release_think_slot() reports whether a run_think() request
-            // was dropped while this cycle held the slot — e.g. the mint that
+            // #854: the release reports whether a run_think() request was
+            // dropped while this cycle held the slot — e.g. the mint that
             // drain_pending_adds()/add_local_share() just landed. Serve it, or
             // that share's election (and the miner notify it drives) is lost
             // until the next timer tick.
-            const bool rethink_owed =
-                dash::think::release_think_slot(m_think_running, m_rethink_pending);
+            const bool rethink_owed = io_slot.release();
 
             if (needs_continue || rethink_owed)
                 boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (const std::exception& e) {
             LOG_ERROR << "run_think() IO phase failed: " << e.what();
-            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+            if (io_slot.release())   // no-op if the try already released
                 boost::asio::post(*m_context, [this]() { run_think(); });
           } catch (...) {
             LOG_ERROR << "run_think() IO phase failed: unknown error";
-            if (dash::think::release_think_slot(m_think_running, m_rethink_pending))
+            if (io_slot.release())
                 boost::asio::post(*m_context, [this]() { run_think(); });
           }
         });
     });
+    slot.commit();   // the cycle's IO-phase now owns the slot
 }
 
 void NodeImpl::drain_pending_adds()
@@ -1132,6 +1293,10 @@ void NodeImpl::clean_tracker()
         m_clean_running.store(false);
         return;
     }
+    // #857: a throwing post() below releases both the slot and
+    // m_clean_running instead of denying every later think and clean.
+    dash::think::ThinkSlotGuard slot(m_think_running, m_rethink_pending,
+                                     &m_clean_running);
 
     // Post the entire body to the compute thread: chain modifications happen
     // under the exclusive lock, never concurrent with think() or IO reads.
@@ -1355,6 +1520,10 @@ void NodeImpl::clean_tracker()
       }
       // Lock released — IO-phase: work refresh + drain, no lock held.
       boost::asio::post(*m_context, [this, clean_best_changed]() {
+        // #857: owns the committed slot and m_clean_running; released once,
+        // below or on scope exit.
+        dash::think::ThinkSlotGuard io_slot(m_think_running, m_rethink_pending,
+                                            &m_clean_running);
         try {
             if (clean_best_changed) {
                 LOG_INFO << "[CLEAN] IO-phase: work refresh (best changed)";
@@ -1375,13 +1544,12 @@ void NodeImpl::clean_tracker()
         // #854: the clean cycle holds the think slot too, so run_think()
         // requests that arrived during it (a mint, a peer best-advert) were
         // queued rather than dropped — serve them now.
-        const bool rethink_owed =
-            dash::think::release_think_slot(m_think_running, m_rethink_pending);
-        m_clean_running.store(false);
+        const bool rethink_owed = io_slot.release();   // slot, then m_clean_running
         if (rethink_owed)
             boost::asio::post(*m_context, [this]() { run_think(); });
       });
     });
+    slot.commit();   // the clean cycle's IO-phase now owns the slot
 }
 
 uint256 NodeImpl::best_share_hash()
@@ -1528,12 +1696,16 @@ std::vector<uint256> NodeImpl::send_shares(peer_ptr peer,
 
     // Forward the txs the peer needs BEFORE the shares (p2pool remember_tx
     // protocol) — a share referencing unknown txs makes the receiving oracle
-    // node drop the connection.
+    // node drop the connection. A tx already in this peer's STANDING set is
+    // left out, as canonical leaves out mining_txs (p2p.py:377): the peer
+    // holds it already, a second remember disconnects us (p2p.py:474-477) and
+    // the closing forget_tx would erase the seed (#950).
     std::set<uint256> needed_txs;
     for (auto& share : shares) {
         share.invoke([&](auto* obj) {
             for (const auto& th : obj->m_new_transaction_hashes) {
-                if (!peer->m_remote_txs.count(th) && !peer->m_remembered_txs.count(th))
+                if (!peer->m_remote_txs.count(th) && !peer->m_remembered_txs.count(th)
+                    && !peer->m_standing_remembered.count(th))
                     needed_txs.insert(th);
             }
         });
@@ -1732,6 +1904,7 @@ void NodeImpl::send_standing_remember(const peer_ptr& peer)
     if (!peer)
         return;
     std::vector<coin::MutableTransaction> full_txs;
+    std::vector<uint256> seeded;
     {
         // try_to_lock, never block: mirrors advertise_known_txs — if the compute
         // thread is mid-cycle we skip; the next inbound handshake reseeds.
@@ -1742,11 +1915,14 @@ void NodeImpl::send_standing_remember(const peer_ptr& peer)
             m_known_txs, MAX_REMEMBERED_TXS_SIZE, &remembered_tx_size);
         full_txs.reserve(chosen.size());
         for (const auto& h : chosen)
-            if (auto it = m_known_txs.find(h); it != m_known_txs.end())
+            if (auto it = m_known_txs.find(h); it != m_known_txs.end()) {
                 full_txs.emplace_back(it->second);
+                seeded.push_back(h);
+            }
     }
     if (full_txs.empty())
         return;
+    peer->m_standing_remembered.insert(seeded.begin(), seeded.end());
     // Canonical p2p.py:269 sends tx_hashes=[] (all as bodies): at handshake we do
     // not yet know the peer's remote_tx_hashes.
     peer->write(dash::message_remember_tx::make_raw({}, full_txs));

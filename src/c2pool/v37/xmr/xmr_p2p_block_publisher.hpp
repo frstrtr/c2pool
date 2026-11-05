@@ -12,9 +12,9 @@
 //
 // LiveSubmitShareSink is the X5 IShareSink that turns a winning share into a
 // Monero block: look the candidate up, POST submit_block to monerod, and on OK
-// push a FoundBlockEvent for the finalize driver. Everything about that is
-// right except the middle step, which is an RPC to the thing this track exists
-// to remove.
+// count the block and hand its found event to the caller. Everything about
+// that is right except the middle step, which is an RPC to the thing this
+// track exists to remove.
 //
 // P2pBlockPublisher is the same sink with a different middle: the assembled
 // block goes out over levin as a 2008 NOTIFY_NEW_FLUFFY_BLOCK to every
@@ -33,19 +33,16 @@
 // for the same reason: nothing confirmed the height for us.
 //
 // That weakness is real and is not hidden. What backs the block instead is the
-// chain: if the network rejected it, the native index never sees it reach
-// D_conf burial on the best chain, the canonical test fails at maturity, and
-// the settlement is disposed as an orphan rather than finalized. The daemon's
-// synchronous yes is traded for the chain's asynchronous one, which is the
-// trade a daemonless node is FOR.
+// chain: the block's own coinbase pays its window, so a block the network
+// rejected pays nobody and nothing has to be undone. The daemon's synchronous
+// yes is traded for the chain's asynchronous one.
 //
 // FAIL-CLOSED, three ways:
 //   * enable_network_relay() defaults FALSE, exactly like LiveBlockSubmitter's
 //     network_submit_enabled -- a build with no RandomX relays nothing;
 //   * a candidate with no hashing blob has no verified id to attest to, and
 //     CandidateBlockRelay refuses an unattested push rather than trusting us;
-//   * a verdict that reached nobody pushes NO FoundBlockEvent. A block nobody
-//     received must never enter the settlement ledger as found.
+//   * a verdict that reached nobody is no found block (no found event).
 //
 // REACHED NOBODY IS NOT THE END OF THE BLOCK (parked re-announce). A find at
 // a moment with no reachable peer (every monerod restarting, every link just
@@ -54,11 +51,13 @@
 // it from the relay's retained book on a bounded backoff (2, 4, 8, 16, 30,
 // 30 ... s; at most RetryPolicy::max_attempts frames, and never past
 // RetryPolicy::window_ms -- two block times -- after the find). The first
-// re-announce that reaches a peer pushes THE FoundBlockEvent, exactly once;
-// a block our own best chain no longer carries (the height was lost) is
+// re-announce that reaches a peer hands THE found event to the caller, exactly
+// once; a block our own best chain no longer carries (the height was lost) is
 // dropped at once, and one that runs out of attempts or window is ABANDONED,
-// both at ERROR and counted. Nothing here books a block that reached nobody:
-// FOUND still means "a peer received it" (or --native-solo).
+// both at ERROR and counted. FOUND means "a peer received it"
+// (landed=peer) or, with --native-solo, "our own chain index accepted it"
+// (landed=own-index). Nothing is booked and no event is queued: the found
+// event goes to the found hook and the counters.
 //
 // THREADING: submit_network_block runs on the stratum listener thread. The
 // peer pool's IBroadcastPort is documented as called from exactly that thread
@@ -76,6 +75,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -109,9 +109,12 @@ public:
     // error == true lines are the never-silent-drop channel.
     using Log   = std::function<void(bool error, const std::string& line)>;
 
-    P2pBlockPublisher(nrelay::LevinBlockRelay& relay, sub::FoundBlockQueue& found,
-                      CandidateLookup lookup)
-        : m_relay(relay), m_found(found), m_lookup(std::move(lookup)) {}
+    P2pBlockPublisher(nrelay::LevinBlockRelay& relay, CandidateLookup lookup)
+        : m_relay(relay), m_lookup(std::move(lookup)) {}
+
+    // The found hook (call before serving): each found block, once, on the
+    // thread that delivered it (the listener thread, or tick()'s caller).
+    void set_found_hook(sub::FoundHook h) { m_hook = std::move(h); }
 
     // The RandomX fail-closed gate, mirroring LiveBlockSubmitter's. OFF until
     // the verifier is live, so a build that cannot check proof of work can
@@ -132,27 +135,24 @@ public:
     //
     // With this on, a block that reached nobody but that OUR OWN CHAIN INDEX
     // accepted (RelayConfig::submit_to_own_index, the D-14 PREFER-OWN push)
-    // still enters the settlement ledger as found. That is a genuinely weaker
-    // claim than monerod's "OK" or a peer's receipt, and it is counted and
-    // labelled separately everywhere so it cannot be read as the stronger one:
-    // solo_landed() is its own counter, and the FoundBlockEvent carries
-    // HeaderCheck::NotRun exactly as the relayed path does.
+    // counts as landed (landed=own-index). That is a genuinely weaker claim
+    // than monerod's "OK" or a peer's receipt, and it is counted and labelled
+    // separately everywhere so it cannot be read as the stronger one:
+    // solo_landed() is its own counter, and the found event carries
+    // HeaderCheck::NotRun exactly as the relayed path does. Nothing is booked.
     //
     // It is sound for the case it is for: on a private chain WE are the
-    // network, the index validated the block on the way in (parse, id, PoW at
-    // the template's difficulty, connect checks), and the canonical test that
-    // settlement matures against is that same index -- so a block the index did
-    // not take never finalizes, solo or not. It is not sound anywhere else,
-    // which is why it is a flag and not a fallback.
+    // network and the index validated the block on the way in (parse, id, PoW
+    // at the template's difficulty, connect checks). It is not sound anywhere
+    // else, which is why it is a flag and not a fallback.
     void enable_solo_own_index(bool on) { m_solo.store(on); }
     bool solo_own_index_enabled() const { return m_solo.load(); }
 
     void on_accepted_share(const strat::AcceptedShare& s) override {
         m_accepted.fetch_add(1);
         if (!s.is_network_block) return;
-        m_found.annotate(s.template_id, s.nonce, s.extra_nonce, s.worker, s.address);
-        // A parked block's event is not queued yet; it carries the attribution
-        // with it when (if) it is released.
+        // A parked block's event is not delivered yet; it carries the
+        // attribution with it when (if) it is released.
         std::lock_guard<std::mutex> lk(m_park_mx);
         for (Parked& p : m_parked) {
             if (p.ev.template_id == s.template_id && p.ev.nonce == s.nonce &&
@@ -238,10 +238,10 @@ public:
                 // Not retained means the relay REFUSED it before any arm fired
                 // (an invalid own block -- a tx already mined in the chain it
                 // extends, a spent key image, a duplicate -- or a structural
-                // fault): not relayed, not parked, not adopted, not booked.
+                // fault): not relayed, not parked, not adopted.
                 // Said out loud, never only in the status line.
                 say(true, "FOUND block " + hex_of(v.block_id) + " h=" + std::to_string(c.height) +
-                              " DROPPED (not relayed, not adopted, not booked): " + why);
+                              " DROPPED (not relayed, not adopted): " + why);
                 set_error("relay: block reached NO peer: " + why);
                 return;
             }
@@ -255,7 +255,9 @@ public:
         if (!solo_landing) m_relayed.fetch_add(1);
         m_peers.fetch_add(static_cast<std::uint64_t>(v.p2p_peers_sent));
         unpark(v.block_id);   // a re-submission that got through supersedes a parked copy
-        push_found(std::move(ev));
+        ev.landed = solo_landing ? sub::Landed::OwnIndex : sub::Landed::Peer;
+        ev.peers  = solo_landing ? 0 : static_cast<std::size_t>(v.p2p_peers_sent);
+        deliver(std::move(ev));
         // A solo landing keeps its explanation: clearing it here would leave the
         // status line claiming a clean relay for a block that reached nobody.
         if (!solo_landing) set_error({});
@@ -298,7 +300,7 @@ public:
             (void)m_relay.renotify(p.ev.block_id, &n);
             ++p.attempts;
             if (n > 0) {
-                // (iii) THE delivery: the one FoundBlockEvent for this block.
+                // (iii) THE delivery: the one found event for this block.
                 m_late_reached.fetch_add(1);
                 m_relayed.fetch_add(1);
                 m_peers.fetch_add(static_cast<std::uint64_t>(n));
@@ -306,7 +308,9 @@ public:
                                std::to_string(n) + " peer(s) on re-announce " +
                                std::to_string(p.attempts) + ", " + std::to_string(age / 1000) +
                                " s after the find");
-                push_found(std::move(p.ev));
+                p.ev.landed = sub::Landed::Peer;
+                p.ev.peers  = n;
+                deliver(std::move(p.ev));
                 set_error({});
                 continue;
             }
@@ -320,7 +324,7 @@ public:
                     std::to_string(age / 1000) + " s" +
                     (retained ? "" : " (no longer retained)") +
                     " -- it " + (own ? "IS" : "is NOT") +
-                    " on our own best chain; no peer received it, so it is not booked as found";
+                    " on our own best chain; no peer received it, so it is not a found block";
                 set_error("relay: " + msg);
                 say(true, msg);
                 continue;
@@ -353,9 +357,15 @@ public:
     std::uint64_t orphaned_unreached() const { return m_orphaned_unreached.load(); }
     std::uint64_t duplicate_found()    const { return m_dup_found.load(); }
     std::uint64_t relayed()  const { return m_relayed.load(); }
-    // Blocks booked on the strength of our own chain index alone (solo mode).
+    // Blocks landed on the strength of our own chain index alone (solo mode).
     // Kept OUT of relayed() so the two can never be added up by accident.
     std::uint64_t solo_landed() const { return m_solo_landed.load(); }
+    // Found events delivered to the hook (relayed() + solo_landed(), less duplicates).
+    std::uint64_t delivered() const { return m_delivered_n.load(); }
+    std::optional<sub::FoundBlockEvent> last_found() const {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        return m_last_found;
+    }
     std::uint64_t peers()    const { return m_peers.load(); }
     std::uint64_t refused()  const { return m_refused.load(); }
     std::uint64_t failed()   const { return m_failed.load(); }
@@ -427,7 +437,7 @@ private:
     }
 
     // EXACTLY ONCE per block id, whichever path delivers it.
-    void push_found(sub::FoundBlockEvent ev) {
+    void deliver(sub::FoundBlockEvent ev) {
         {
             std::lock_guard<std::mutex> lk(m_park_mx);
             if (std::find(m_delivered.begin(), m_delivered.end(), ev.block_id) !=
@@ -439,7 +449,12 @@ private:
             while (m_delivered.size() > 256) m_delivered.pop_front();
         }
         ev.at = std::chrono::steady_clock::now();
-        m_found.push(std::move(ev));
+        m_delivered_n.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_last_found = ev;
+        }
+        if (m_hook) m_hook(ev);
     }
 
     static std::string hex_of(const sub::Hash& h) {
@@ -454,8 +469,8 @@ private:
     }
 
     nrelay::LevinBlockRelay& m_relay;
-    sub::FoundBlockQueue&    m_found;
     CandidateLookup          m_lookup;
+    sub::FoundHook           m_hook;
     std::atomic<bool>        m_enabled{false};
     std::atomic<bool>        m_solo{false};
     std::atomic<std::uint64_t> m_calls{0}, m_relayed{0}, m_peers{0},
@@ -464,6 +479,8 @@ private:
     std::atomic<std::size_t>   m_accepted{0};
     mutable std::mutex         m_mtx;
     std::string                m_last_error;
+    std::optional<sub::FoundBlockEvent> m_last_found;   // guarded by m_mtx
+    std::atomic<std::uint64_t> m_delivered_n{0};
 
     Clock                      m_clock;
     Log                        m_log;

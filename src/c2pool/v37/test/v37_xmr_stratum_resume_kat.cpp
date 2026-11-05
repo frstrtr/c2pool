@@ -19,10 +19,11 @@
 //        error, however long it waits (base: "No job available" after the TTL);
 //   SR2  the first template (notify_new_template) completes that parked login
 //        with a real login result carrying a job (base: nothing, ever);
-//   SR3  the D3 shape: a miner mining before the suspension (disconnected on the
-//        suspend edge, reconnects) and a miner logging in DURING the suspension
-//        both wait parked, with no error, past the TTL;
-//   SR4  the RESUME edge hands BOTH of them a login result with a job;
+//   SR3  the D3 shape: a miner mining before the suspension (hold() rises:
+//        disconnected on the suspend edge, reconnects) and a miner logging in
+//        DURING the suspension both wait parked, with no error, past the TTL;
+//   SR4  the RESUME edge (hold() clears) hands BOTH of them a login result with
+//        a job;
 //   SR5  a template gap that ends WITHOUT a notify (same template id) still
 //        serves a parked login (the idle-tick re-probe);
 //   SR6  no job storm: the idle tick never re-pushes logged-in sessions, and one
@@ -46,6 +47,8 @@
 #include <string>
 #include <thread>
 
+#include "c2pool/v37/xmr/xmr_lane_resume_fresh.hpp"
+#include "c2pool/v37/xmr/xmr_lane_suspend_state.hpp"
 #include "c2pool/v37/xmr/xmr_stratum_listener.hpp"
 
 namespace strat = ::v37::xmr::stratum;
@@ -165,7 +168,14 @@ int main() {
           is_login_result(gotA), "after " + std::to_string(dA) + " ms: '" + gotA.substr(0, 90) + "'");
 
     // ── SR3/SR4: the D3 shape -- suspend, reconnect + fresh login, resume ──
-    L.set_lane_suspended(true);
+    // The serve loop's pass: hold() -> LaneSuspendState -> apply_lane_gate.
+    c2pool::v37n::xmr::LaneSuspendState lane;
+    auto hold_pass = [&](bool hold) {
+        const auto e = lane.update(hold, false);
+        (void)c2pool::v37n::xmr::apply_lane_gate(L, lane.suspended(), [] { return true; });
+        return e;
+    };
+    const bool held_edge = hold_pass(true).suspend_edge;
     const std::string dropA = read_all(a, 1000);
     ::close(a);
     const int a2 = connect_to(L.bound_port());   // the miner that was mining before: reconnects
@@ -174,18 +184,18 @@ int main() {
     send_line(b, kLogin);
     const std::string waitA2 = read_all(a2, 1000);
     const std::string waitB  = read_all(b, 1000);
-    check("SR3 while SUSPENDED the reconnected miner and the new miner wait PARKED -- no error, no job, connection open, past the TTL",
-          dropA.find("<EOF>") != std::string::npos && waitA2.empty() && waitB.empty(),
+    check("SR3 while SUSPENDED (hold) the reconnected miner and the new miner wait PARKED -- no error, no job, connection open, past the TTL",
+          held_edge && dropA.find("<EOF>") != std::string::npos && waitA2.empty() && waitB.empty(),
           "drop='" + first_line(dropA) + "' a2='" + first_line(waitA2) + "' b='" + first_line(waitB) + "'");
     tpl.tid = 2;
     t0 = Clock::now();
-    L.set_lane_suspended(false);                  // the resume edge
+    const bool resume_edge = hold_pass(false).resume_edge;   // the resume edge (hold cleared)
     const std::string gotA2 = read_line(a2, 3000);
     const long dA2 = ms_since(t0);
     const std::string gotB = read_line(b, 3000);
     const long dB = ms_since(t0);
-    check("SR4 the RESUME edge hands BOTH parked miners a login result + job (no reconnect needed)",
-          is_login_result(gotA2) && is_login_result(gotB),
+    check("SR4 the RESUME edge (hold cleared) hands BOTH parked miners a login result + job (no reconnect needed)",
+          resume_edge && is_login_result(gotA2) && is_login_result(gotB),
           "a2 " + std::to_string(dA2) + " ms '" + gotA2.substr(0, 60) + "' / b " + std::to_string(dB) + " ms '" +
               gotB.substr(0, 60) + "'");
 

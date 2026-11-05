@@ -39,9 +39,10 @@ OFFLINE = "offline"
 BACK_ONLINE = "back_online"
 HASHRATE_DROP = "hashrate_drop"
 DAILY_SUMMARY = "daily_summary"
+SILENT = "silent"   # #959: connected + authorized, no accepted share
 
 SEVERITY = {OFFLINE: "warn", BACK_ONLINE: "info",
-            HASHRATE_DROP: "warn", DAILY_SUMMARY: "info"}
+            HASHRATE_DROP: "warn", DAILY_SUMMARY: "info", SILENT: "warn"}
 
 # subscription defaults (operator can override per worker)
 DEF_OFFLINE_MIN = 15      # emit offline alert after this many minutes dark
@@ -91,6 +92,12 @@ def connect(db_path):
             detail   TEXT
         )""")
     con.execute("CREATE INDEX IF NOT EXISTS ix_notif ON notifications(worker, kind, ts)")
+    # #959 silent latch: a row means the current silent episode was alerted
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS silent_state (
+            worker   TEXT PRIMARY KEY,
+            since_ts INTEGER NOT NULL
+        )""")
     con.commit()
     return con
 
@@ -161,6 +168,43 @@ def evaluate(con, sub_for, at=None):
     return events
 
 
+def evaluate_silent(con):
+    """#959: one SILENT event per episode from the sampler's workers_silent
+    snapshots (the dashboard's own list, so the alert and the card agree).
+
+    Fires when a worker is listed in the newest poll that carried the field;
+    the latch re-arms when the worker leaves that list (it shared again, or
+    every connection closed). No such poll (sampler or node predates #959) ->
+    no events and no re-arm: missing data is never read as recovery.
+    """
+    try:
+        row = con.execute("SELECT MAX(ts) FROM silent_polls").fetchone()
+    except sqlite3.OperationalError:
+        return []
+    if not row or row[0] is None:
+        return []
+    ts = row[0]
+    listed = {w: rest for w, *rest in con.execute(
+        "SELECT worker,silent_seconds,threshold_seconds,has_shared,connections "
+        "FROM silent_samples WHERE ts=?", (ts,))}
+    fired = {w for (w,) in con.execute("SELECT worker FROM silent_state")}
+    events = []
+    for worker in sorted(listed):
+        if worker in fired:
+            continue
+        secs, thr, shared, conns = listed[worker]
+        what = "no accepted share" if shared else "no accepted share yet"
+        events.append({"worker": worker, "kind": SILENT, "ts": ts,
+                       "detail": f"{what} for {secs // 60}m (threshold "
+                                 f"{thr // 60}m), {conns} connection(s) open"})
+        con.execute("INSERT OR REPLACE INTO silent_state(worker,since_ts) "
+                    "VALUES(?,?)", (worker, ts))
+    for worker in fired - set(listed):
+        con.execute("DELETE FROM silent_state WHERE worker=?", (worker,))
+    con.commit()
+    return events
+
+
 # ---------------------------------------------------------------------------
 # seam 2: notification core — subscription / throttle / quiet-hours (no I/O)
 # ---------------------------------------------------------------------------
@@ -176,6 +220,16 @@ def get_sub(con, worker):
     return {"channels": [c for c in (ch or "").split(",") if c], "route": route,
             "quiet_hours": qh, "offline_min": omin, "drop_pct": drop,
             "throttle_s": thr, "enabled": en}
+
+
+def sub_for_event(con, worker):
+    """Subscriptions key by payout address (the miner_hash_rates key); a
+    silent alert names ADDRESS.worker, so an exact subscription wins and the
+    address's subscription is the fallback."""
+    sub = get_sub(con, worker)
+    if not sub["enabled"] and "." in worker:
+        sub = get_sub(con, worker.split(".", 1)[0])
+    return sub
 
 
 def in_quiet_hours(quiet_hours, ts):
@@ -271,10 +325,10 @@ def record(con, ev, status, route, severity):
 
 def run(con, args):
     deliver = make_transport(args)
-    events = evaluate(con, lambda w: get_sub(con, w))
+    events = evaluate(con, lambda w: get_sub(con, w)) + evaluate_silent(con)
     sent = held = 0
     for ev in events:
-        sub = get_sub(con, ev["worker"])
+        sub = sub_for_event(con, ev["worker"])
         decision = route_event(con, ev, sub)
         if decision is None:
             record(con, ev, "undelivered", None, SEVERITY.get(ev["kind"], "info"))
@@ -365,8 +419,10 @@ def selftest(_args=None):
            "offline_min": 15, "drop_pct": 50.0, "throttle_s": 3600, "enabled": 1}
     sub_for = lambda w: sub
     fails = []
+    ran = [0]
 
     def check(cond, msg):
+        ran[0] += 1
         if not cond:
             fails.append(msg)
 
@@ -573,13 +629,60 @@ def selftest(_args=None):
     check(make_transport(dry)("v36relay", "s", "b", "r") is True,
           "dry-run must short-circuit v36relay to logonly (no mesh, no raise)")
 
+    # 14) #959 silent kind: one alert per episode off the sampler's
+    #     workers_silent snapshots; the sampler owns these tables.
+    scon = connect(":memory:")
+    scon.execute("CREATE TABLE silent_polls (ts INTEGER NOT NULL PRIMARY KEY)")
+    scon.execute("CREATE TABLE silent_samples (ts INTEGER NOT NULL, "
+                 "worker TEXT NOT NULL, silent_seconds INTEGER NOT NULL, "
+                 "threshold_seconds INTEGER NOT NULL, has_shared INTEGER NOT NULL, "
+                 "connections INTEGER NOT NULL, PRIMARY KEY(ts,worker))")
+
+    def poll(ts, rows):
+        scon.execute("INSERT INTO silent_polls(ts) VALUES(?)", (ts,))
+        for w, secs in rows:
+            scon.execute("INSERT INTO silent_samples VALUES(?,?,?,?,?,?)",
+                         (ts, w, secs, 600, 1, 1))
+        scon.commit()
+
+    # 14a) no poll carried workers_silent (older node) -> nothing fires
+    check(evaluate_silent(scon) == [], "no silent poll must emit nothing")
+    # 14b) first listed -> exactly one SILENT, warn (bypasses quiet hours)
+    poll(t0, [("addrA.rig1", 900)])
+    e = evaluate_silent(scon)
+    check([(x["worker"], x["kind"]) for x in e] == [("addrA.rig1", SILENT)],
+          f"first silent poll must fire once, got {e}")
+    check(SEVERITY[SILENT] == "warn", "silent must be warn severity")
+    # 14c) still listed -> latched, no repeat within the episode
+    poll(t0 + 60, [("addrA.rig1", 960)])
+    check(evaluate_silent(scon) == [], "silent must not re-fire within an episode")
+    # 14d) leaves the list -> re-arms without an event; next episode fires once
+    poll(t0 + 120, [])
+    check(evaluate_silent(scon) == [], "leaving the silent list must not alert")
+    poll(t0 + 180, [("addrA.rig1", 600)])
+    e = evaluate_silent(scon)
+    check([x["kind"] for x in e] == [SILENT],
+          f"new episode after re-arm must fire once, got {e}")
+    # 14e) ADDRESS.worker falls back to the address's subscription; an
+    #      exact ADDRESS.worker subscription wins
+    scon.execute("INSERT INTO subscriptions(worker,channels,route,enabled) "
+                 "VALUES('addrA','logonly','a@route',1)")
+    s = sub_for_event(scon, "addrA.rig1")
+    check(s["enabled"] and s["route"] == "a@route",
+          f"silent alert must route to the address subscription, got {s}")
+    scon.execute("INSERT INTO subscriptions(worker,channels,route,enabled) "
+                 "VALUES('addrA.rig1','logonly','rig1@route',1)")
+    check(sub_for_event(scon, "addrA.rig1")["route"] == "rig1@route",
+          "exact worker subscription must win over the address")
+    scon.close()
+
     con.close()
     if fails:
         print("SELFTEST FAILED:")
         for f in fails:
             print("  -", f)
         return 1
-    print("SELFTEST OK (21/21)")
+    print(f"SELFTEST OK ({ran[0]}/{ran[0]})")
     return 0
 
 

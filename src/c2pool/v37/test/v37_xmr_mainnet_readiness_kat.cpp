@@ -149,11 +149,6 @@ XmrNodeConfig base_config() {
     c.network         = MoneroNetwork::Mainnet;
     c.template_source = TemplateSourceMode::Native;
     c.arm_order       = ArmOrderMode::P2PFirst;
-    // p2p-first is only coherent with option B: option As block IS monerods
-    // get_block_template, so a daemonless find of it is a contradiction and
-    // arm_order_refusal() says so. Set here so suite C attributes its verdict
-    // to the ADDRESS SOURCE and to nothing else.
-    c.coinbase        = cfgns::CoinbaseMode::V37Settlement;
     return c;
 }
 

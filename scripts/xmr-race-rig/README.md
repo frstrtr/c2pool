@@ -1,5 +1,10 @@
 # xmr-race-rig: race-heavy 3-node regtest + settlement-divergence classifier
 
+> Removed at the S4w flag day: this rig runs the old payout path. The current
+> `c2pool-v37-xmr` runs Path B and refuses the rig's flags ("removed at the S4w
+> flag day"); the rig needs a binary built before the flag day.
+
+
 REGTEST ONLY. Three `monerod --regtest --fixed-difficulty 1` wired only to each other (exclusive nodes on
 127.0.0.1) and three `c2pool-v37-xmr` nodes (native template, `--arm-order p2p-first`, relay ON, D_conf 10,
 flip 0 as built). Each node gets a paced stratum miner (`burst.py`, one nonce every LO..HI s). At

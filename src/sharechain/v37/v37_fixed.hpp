@@ -148,12 +148,13 @@ struct U256 {
     // untouched), so the golden decay table (d659c801) and the gate-OFF lane
     // digest (KAT-0, 2479d5b6) are byte-identical with or without them.
 
-    // (*this * m) as the LOW 256 bits — the mul_q limb loop WITHOUT the
-    // >> FRAC_BITS. This is the integer width-law numerator step
-    // (D_net * coverage_blocks, then * W_cur). Any carry out of bit 255 is
-    // dropped: a documented truncation that never fires for parent-chain-scale
-    // difficulty (D_net * coverage_blocks * W_cur stays far below 2^256),
-    // pinned by KAT-TW-INT.
+    // (*this * m) — the mul_q limb loop WITHOUT the >> FRAC_BITS. This is the
+    // integer width-law numerator step (D_net * coverage_blocks, then * span).
+    // SATURATES to 2^256 - 1 when the product passes 256 bits, never wraps: a
+    // wrapped numerator would be a tiny W_target that the damper and clamp
+    // would hide; a saturated one clamps to w_max, deterministically, the same
+    // discipline div_u128_to_u64 and work_from_target keep. Below 2^256 the
+    // result is the exact product, unchanged.
     U256 mul_small(u64 m) const {
         U256 out;
         u128 carry = 0;
@@ -162,7 +163,9 @@ struct U256 {
             out.v[i] = static_cast<u64>(p);
             carry = p >> 64;
         }
-        // carry (bits >= 256) intentionally dropped — see truncation note.
+        if (carry != 0) {                         // bits >= 256: saturate
+            for (int i = 0; i < 4; ++i) out.v[i] = ~u64(0);
+        }
         return out;
     }
 

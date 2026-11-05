@@ -755,6 +755,19 @@ private:
         ++tel_.frames_in;
         ++tel_.frames_by_cmd[h.command];
 
+        // The byte bucket is charged before the body is decoded; the
+        // per-command bucket is charged below with skip_bytes, so bytes are
+        // counted once.
+        DosFault byte_fault = DosFault::None;
+        const DosAction byte_act = p->dos.on_bytes(n, now, byte_fault);
+        if (byte_act != DosAction::Accept) {
+            ++tel_.frames_dropped_dos;
+            apply_action(key, byte_act, byte_fault, "inbound bytes");
+            return;
+        }
+        p = find(key);
+        if (!p) return;   // apply_action above may have closed us
+
         // Count transactions, not frames, for the 2002 bucket: a peer that
         // batches 500 txs into one frame has spent 500 tokens.
         std::size_t units = 1;
@@ -776,7 +789,8 @@ private:
         // (dandelionpp_fluff=false, see PeerDosGuard::on_frame) may spend the
         // 2010 credit, so a fluffed relay racing the answer cannot take it.
         const bool complement_shaped = is_tx && !txm.dandelionpp_fluff;
-        const DosAction act = p->dos.on_frame(h.command, n, units, now, fault, complement_shaped);
+        const DosAction act = p->dos.on_frame(h.command, n, units, now, fault, complement_shaped,
+                                              /*skip_bytes=*/true);
         if (p->dos.solicited_credits_used() != credits_before) ++tel_.frames_credited_fluffy;
         const bool complement = p->dos.complement_credits_used() != complement_before;
         if (act != DosAction::Accept) {

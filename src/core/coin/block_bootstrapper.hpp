@@ -29,6 +29,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace core {
@@ -43,6 +44,9 @@ struct BlockBootstrapState {
     uint32_t processed{0};
     uint32_t total{0};
     size_t peer_rotation{0};     // round-robin counter for peer assignment
+    // What the pipeline is doing, for its log lines ("Bootstrap" for the
+    // cold-start download; callers that reuse the pipeline name their own).
+    std::string phase{"Bootstrap"};
 
     // Buffer: height → (block, block_hash)
     // Blocks arrive out-of-order; we drain consecutive from next_height.
@@ -62,6 +66,10 @@ struct BlockBootstrapState {
     static constexpr int STALL_TIMEOUT_SEC = 30;
     static constexpr int STALL_CHECK_SEC = 10;
 
+    /// Requests kept in flight (ordered_refill). WINDOW_SIZE for every caller
+    /// that does not set it; a long fill (the DOGE full set's IBD) widens it.
+    size_t window{WINDOW_SIZE};
+
     /// Start periodic stall check timer. Calls request_fn(hash) to
     /// broadcast-request the stalled block.
     /// label: log prefix (e.g., "EMB-LTC")
@@ -71,6 +79,18 @@ struct BlockBootstrapState {
         const std::string& label)
     {
         stall_timer = std::make_unique<boost::asio::steady_timer>(ioc);
+        schedule_stall_check(std::move(re_request_fn), label);
+    }
+
+    /// The same timer on another executor (a fill drained on its own thread
+    /// pool: the timer's handler then runs on that pool, with the fill).
+    template <typename Executor>
+    void start_stall_timer_on(
+        const Executor& ex,
+        std::function<void(uint32_t height)> re_request_fn,
+        const std::string& label)
+    {
+        stall_timer = std::make_unique<boost::asio::steady_timer>(ex);
         schedule_stall_check(std::move(re_request_fn), label);
     }
 
@@ -94,7 +114,7 @@ private:
                 auto stall = std::chrono::duration_cast<std::chrono::seconds>(
                     now - last_drain_time).count();
                 if (stall >= STALL_TIMEOUT_SEC) {
-                    LOG_WARNING << "[" << lbl << "] Bootstrap stall h="
+                    LOG_WARNING << "[" << lbl << "] " << phase << " stall h="
                         << next_height << " (" << stall
                         << "s) — timer re-request";
                     fn(next_height);

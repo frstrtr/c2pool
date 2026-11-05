@@ -69,7 +69,6 @@ namespace cfgns = c2pool::v37n::xmr;
 namespace o2    = c2pool::v37n::xmr::o2;
 
 using cfgns::ArmOrderMode;
-using cfgns::CoinbaseMode;
 using cfgns::MoneroNetwork;
 using cfgns::TemplateSourceMode;
 using cfgns::XmrNodeConfig;
@@ -203,7 +202,6 @@ private:
 XmrNodeConfig base_cfg(ArmOrderMode order, std::uint16_t rpc_port) {
     XmrNodeConfig c;
     c.network         = MoneroNetwork::Regtest;
-    c.coinbase        = CoinbaseMode::V37Settlement;
     c.template_source = TemplateSourceMode::Native;
     c.arm_order       = order;
     c.monerod.rpc_host = "127.0.0.1";

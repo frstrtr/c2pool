@@ -713,6 +713,25 @@
         .worker-row.hidden {
             display: none;
         }
+
+        /* Stratum session states. All nodes are peers: a rig may keep a
+           failover (standby) connection here while it hashes on another node.
+           Standby is normal and muted; stalled (shared, then went silent) is
+           the one worth attention. */
+        .state-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                     margin-right: 6px; vertical-align: middle; }
+        .state-dot.hashing { background: var(--success); }
+        .state-dot.standby { border: 1px solid var(--text-muted); background: transparent; }
+        .state-dot.stalled { background: #f59e0b; }
+        tr.row-standby td { opacity: 0.55; }
+        tr.row-stalled { background: rgba(245, 158, 11, 0.08); }
+        tr.row-stalled td:first-child { box-shadow: inset 3px 0 0 #f59e0b; }
+        tr.standby-summary td { color: var(--text-muted); font-style: italic; cursor: pointer; }
+        .state-chips { display: inline-flex; gap: 6px; }
+        .state-chip { font-size: 12px; padding: 2px 8px; border-radius: 10px;
+                      border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap; }
+        .state-chip b { color: var(--text); }
+        .state-chip.stalled-hot { border-color: #f59e0b; color: #f59e0b; }
         
         .worker-count-badge {
             display: inline-block;
@@ -1299,6 +1318,12 @@
         
         @media (max-width: 900px) {
             .two-col { grid-template-columns: 1fr; }
+            /* Stacked panels have no neighbour column to align with, so the
+               fixed 660px height only leaves empty space under short tables.
+               Fit each panel to its rows and cap the scroll area so a long
+               table still scrolls in place (p2pool-dash adjustTableHeight). */
+            .table-panel { height: auto; }
+            .table-panel .table-scroll { flex: 0 1 auto; max-height: 400px; }
         }
         
         /* New Main Layout: 4 columns with graph spanning 2x3 */
@@ -1536,6 +1561,31 @@
             width: 12px;
             height: 12px;
             border-radius: 3px;
+        }
+
+        /* Key-only legend entry (not a series toggle): explains a marker. */
+        .legend-item.legend-key {
+            cursor: default;
+        }
+
+        .legend-item.legend-key:hover {
+            opacity: 1;
+        }
+
+        /* The orphaned-block marker: grey triangle-down, red outline. */
+        .legend-color.legend-orphan {
+            background: #ef4444;
+            border-radius: 0;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
+            position: relative;
+        }
+
+        .legend-color.legend-orphan::after {
+            content: "";
+            position: absolute;
+            inset: 2px 3px 4px 3px;
+            background: #6b7280;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
         }
         
         .graph-line-doa {
@@ -1934,6 +1984,7 @@
                         <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate"><span class="legend-color" style="background: #008de4;"></span><span>Good</span></div>
                         <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate"><span class="legend-color" style="background: #ff6b6b;"></span><span>DOA</span></div>
                         <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers"><span class="legend-color" style="background: #00ff88;"></span><span>Blocks</span></div>
+                        <div class="legend-item legend-key" title="Orphaned block: another block won its height"><span class="legend-color legend-orphan"></span><span>Orphaned</span></div>
                         <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections"><span class="legend-color" style="background: #9c27b0;"></span><span>Workers</span></div>
                         <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses"><span class="legend-color" style="background: #673ab7;"></span><span>Miners</span></div>
                         <div class="legend-item" data-series="connected" onclick="toggleSeries('connected', this)" title="Click to toggle connected miners (all connections)"><span class="legend-color" style="background: #e91e63;"></span><span>Connected</span></div>
@@ -1943,6 +1994,7 @@
                         <div class="legend-item disabled" data-series="localdoa" onclick="toggleSeries('localdoa', this)" title="Click to toggle this node's dead-on-arrival hashrate"><span class="legend-color" style="background: #ff8800;"></span><span>Local DOA</span></div>
                     </div>
                     <div class="graph-container compact" id="hashrate-graph"></div>
+                    <div class="graph-history-note" id="hashrate-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
                     <div class="graph-stats compact">
                         <div class="graph-stat"><div class="graph-stat-label">Current</div><div class="graph-stat-value" id="graph-current">-</div></div>
                         <div class="graph-stat"><div class="graph-stat-label">Average</div><div class="graph-stat-value" id="graph-average">-</div></div>
@@ -1969,6 +2021,7 @@
                     <div class="legend-item" data-series="good" onclick="toggleSeries('good', this)" title="Click to toggle Good hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #008de4; width: 14px; height: 14px;"></span><span>Good</span></div>
                     <div class="legend-item" data-series="doa" onclick="toggleSeries('doa', this)" title="Click to toggle DOA hashrate" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ff6b6b; width: 14px; height: 14px;"></span><span>DOA</span></div>
                     <div class="legend-item" data-series="blocks" onclick="toggleSeries('blocks', this)" title="Click to toggle block markers" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #00ff88; width: 14px; height: 14px;"></span><span>Blocks</span></div>
+                    <div class="legend-item legend-key" title="Orphaned block: another block won its height" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color legend-orphan" style="width: 14px; height: 14px;"></span><span>Orphaned</span></div>
                     <div class="legend-item disabled" data-series="workers" onclick="toggleSeries('workers', this)" title="Click to toggle worker connections" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #9c27b0; width: 14px; height: 14px;"></span><span>Workers</span></div>
                     <div class="legend-item" data-series="miners" onclick="toggleSeries('miners', this)" title="Click to toggle unique miner addresses" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #673ab7; width: 14px; height: 14px;"></span><span>Miners</span></div>
                     <div class="legend-item" data-series="lucktrend" onclick="toggleSeries('lucktrend', this)" title="Click to toggle luck trend line" style="font-size: 14px; padding: 6px 12px;"><span class="legend-color" style="background: #ffc107; width: 14px; height: 14px;"></span><span>Luck</span></div>
@@ -1979,6 +2032,7 @@
                 <button class="fullscreen-close" onclick="toggleGraphFullscreen()">✕ Close</button>
             </div>
             <div class="fullscreen-graph" id="fullscreen-graph"></div>
+            <div class="graph-history-note" id="fs-graph-note" style="display:none; font-size:12px; color: var(--text-muted); padding: 4px 8px;"></div>
             <div class="fullscreen-stats">
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Current</div><div class="fullscreen-stat-value" id="fs-graph-current">-</div></div>
                 <div class="fullscreen-stat"><div class="fullscreen-stat-label">Average</div><div class="fullscreen-stat-value" id="fs-graph-average">-</div></div>
@@ -1998,6 +2052,7 @@
                         <input type="checkbox" id="show_historical_miners" style="cursor: pointer;">
                         Show historical
                     </label>
+                    <span class="state-chips" id="miners_state_chips" style="display: none;"></span>
                     <span class="badge" id="active_miners_count">0</span>
                     <a href="miners.html" style="color: var(--primary); text-decoration: none; font-size: 14px;">View Details →</a>
                 </div>
@@ -2009,10 +2064,12 @@
                             <tr>
                                 <th>Address / Worker</th>
                                 <th title="Current hashrate based on pseudoshares">Hashrate</th>
+                                <th title="Mean of this node's last-24h hashrate samples for the worker, counting only samples where it was reporting (offline time is not averaged in as zero). Blank when the node has no samples for it.">24h Avg HR</th>
                                 <th title="Pseudoshare difficulty (local work)">Pseudo Diff</th>
                                 <th title="Estimated time to find a valid P2Pool share">Time to Share</th>
-                                <th title="Last pseudoshare received">Last Seen</th>
+                                <th id="miners_last_col" title="Time since this worker's last accepted share on this node; 'never' for a standby connection">Last Share</th>
                                 <th title="Dead on Arrival rate">DOA Rate</th>
+                                <th title="Dead-on-arrival hashrate (absolute): work that reached the node too late to count">DOA Hashrate</th>
                                 <th title="Predicted payout if block found now">Predicted Payout</th>
                                 <th class="merged-child-hint" title="Predicted merged mining payout if block found now">Merged Payout</th>
                             </tr>
@@ -2020,6 +2077,9 @@
                         <tbody></tbody>
                     </table>
                 </div>
+                <div id="workers_silent_note" style="display: none; color: var(--warning); margin: 8px 0;"></div>
+                <div id="stratum_state_note" style="display: none; color: var(--text-muted); margin: 8px 0;"></div>
+                <div id="node_role_note" style="display: none; color: var(--muted); margin: 8px 0;">Relay node: no Stratum acceptor runs here, so no miners can connect to it. An empty list is expected on this node, not a fault.</div>
                 <div class="loading" id="active_miners_loading">Loading miners</div>
             </div>
         </div>
@@ -2311,7 +2371,7 @@
                             <span class="value" id="defrag-v36sig" style="color:#0097a7">-</span>
                         </div>
                         <div class="defrag-stat-row">
-                            <span class="label">Blocks Found</span>
+                            <span class="label" id="defrag-blocks-label" title="Shares in this window that solved a block">Blocks in Window</span>
                             <span class="value" id="defrag-blocks" style="color:#ffd700">-</span>
                         </div>
                     </div>
@@ -2351,15 +2411,15 @@
                             <span>Node fee share</span>
                         </div>
                         <div class="legend-item">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #ffd700;box-shadow:0 0 3px rgba(255,215,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1a1400;border:2px solid #ffd700;box-shadow:0 0 5px rgba(255,215,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffd700"></div></div>
                             <span style="color:#0070dd;font-weight:600"><span class="symbol-small">COIN</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:#28a745;border:2px solid #00e5ff"></div>
+                            <div class="legend-swatch" style="background:#001a1d;border:2px solid #00e5ff;box-shadow:0 0 5px rgba(0,229,255,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#00e5ff"></div></div>
                             <span style="color:#a335ee;font-weight:600"><span class="merged-child-symbol-hint">DOGE</span> block</span>
                         </div>
                         <div class="legend-item merged-child-hint">
-                            <div class="legend-swatch" style="background:linear-gradient(135deg,#ff8000,#cc6600);border:2px solid #ffaa00;box-shadow:0 0 6px rgba(255,128,0,0.5)"></div>
+                            <div class="legend-swatch" style="background:#1d0e00;border:2px solid #ffaa00;box-shadow:0 0 5px rgba(255,170,0,0.8);position:relative;box-sizing:border-box"><div style="position:absolute;left:4px;top:4px;width:4px;height:4px;background:#ffaa00"></div></div>
                             <span style="color:#ff8000;font-weight:600">Twin block</span>
                         </div>
                         <div class="legend-item">
@@ -2458,6 +2518,42 @@
             return s;
         }
 
+        // Chart marker + tooltip lines for a /recent_blocks row by its on-chain
+        // status. An orphaned block (another block won its height) must not be
+        // drawn as a green "Block Found!" diamond: it gets its own marker and
+        // headline, and its status is shown in red rather than the pending
+        // amber. A stale block (submitted on a stale parent) gets a neutral
+        // grey one. The chart legend's "Orphaned" swatch names the orphan
+        // marker. Display only.
+        function block_is_orphaned(b) {
+            return !!b && b.status === 'orphaned';
+        }
+        function block_is_stale(b) {
+            return !!b && b.status === 'stale';
+        }
+        function block_marker_style(b, luckColor) {
+            if (block_is_orphaned(b))
+                return { fillColor: '#6b7280', lineColor: '#ef4444', symbol: 'triangle-down' };
+            if (block_is_stale(b))
+                return { fillColor: '#4b5563', lineColor: '#9ca3af', symbol: 'square' };
+            return { fillColor: luckColor, lineColor: '#00ff88', symbol: 'diamond' };
+        }
+        function block_headline_html(b) {
+            if (block_is_orphaned(b))
+                return '<span style="color:#ef4444">▼</span> <b>Block Orphaned</b><br/>';
+            if (block_is_stale(b))
+                return '<span style="color:#9ca3af">■</span> <b>Stale Block</b><br/>';
+            return '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+        }
+        function block_status_html(b) {
+            var st = (b && b.status) || 'unknown';
+            var color = st === 'confirmed' ? '#00ff88'
+                      : st === 'orphaned'  ? '#ff6b6b'
+                      : st === 'stale'     ? '#9ca3af'
+                      : '#ffc107';
+            return 'Status: <b style="color:' + color + '">' + st + '</b>';
+        }
+
         // Format percentage with big integer + small decimal parts
         // Format percentage with big bold integer + smaller decimal
         function format_pct_fancy(pct) {
@@ -2540,6 +2636,13 @@
             }
         }
 
+        // Each Active Miners render waits on three fetches before it draws, and
+        // a refresh, the "Show historical" toggle or a manual reload can start
+        // another while one is in flight. Only the newest render may draw:
+        // two overlapping renders both appended the table, so the same address
+        // showed up twice (one copy's toggle then hid the other's workers).
+        var _minersRenderGen = 0;
+
         function populateActiveMiners(local_stats, global_stats) {
             d3.select('#active_miners_loading').style('display', 'none');
             
@@ -2618,11 +2721,20 @@
                     
                     // Get hashrate: first try actual measured rate, then estimate from difficulty
                     var hashrate = workerData.hash_rate || 0;
-                    if (hashrate === 0 && local_stats.miner_hash_rates && local_stats.miner_hash_rates[workerName]) {
+                    // A stalled or standby connection has no live rate: the registry
+                    // value is frozen at its last share (or the authorize default).
+                    var noLiveRate = workerData.state === 'stalled' || workerData.state === 'standby';
+                    if (noLiveRate) hashrate = 0;
+                    if (!noLiveRate && hashrate === 0 && local_stats.miner_hash_rates && local_stats.miner_hash_rates[workerName]) {
                         hashrate = local_stats.miner_hash_rates[workerName];
                     }
-                    // If still no hashrate, estimate from difficulty
-                    var estimatedHashrate = estimateHashrate(difficulty);
+                    // Session state (hashing / standby / stalled); older nodes omit it.
+                    var state = workerData.state || null;
+                    var lastShareAge = (typeof workerData.last_share_age_s === 'number') ? workerData.last_share_age_s : null;
+                    // If still no hashrate, estimate from difficulty -- but never for a
+                    // standby (failover) connection: it has submitted nothing, so its
+                    // authorize-time difficulty says nothing about a hashrate.
+                    var estimatedHashrate = noLiveRate ? 0 : estimateHashrate(difficulty);
                     var isEstimated = (hashrate === 0 && estimatedHashrate > 0);
                     if (hashrate === 0) {
                         hashrate = estimatedHashrate;
@@ -2644,7 +2756,10 @@
                             maxDifficulty: 0,
                             totalConnections: 0,
                             lastSeen: 0,
-                            hasEstimatedHashrate: false
+                            hasEstimatedHashrate: false,
+                            stateCounts: { hashing: 0, standby: 0, stalled: 0 },
+                            stateKnown: false,
+                            lastShareAge: null
                         };
                     }
                     if (mergedAddr && !minerGroups[baseAddress].mergedAddress) {
@@ -2664,8 +2779,20 @@
                         accepted: workerData.accepted || 0,
                         rejected: workerData.rejected || 0,
                         connections: workerData.connections || 0,
-                        last_seen: workerData.last_seen || 0
+                        last_seen: workerData.last_seen || 0,
+                        state: state,
+                        // Standby whose payout address hashes through another node
+                        // (failback included); sharechain evidence, per address.
+                        elsewhere: workerData.hashing_elsewhere === true,
+                        last_share_age_s: lastShareAge
                     });
+                    if (state && minerGroups[baseAddress].stateCounts[state] !== undefined) {
+                        minerGroups[baseAddress].stateCounts[state]++;
+                        minerGroups[baseAddress].stateKnown = true;
+                    }
+                    if (lastShareAge !== null &&
+                        (minerGroups[baseAddress].lastShareAge === null || lastShareAge < minerGroups[baseAddress].lastShareAge))
+                        minerGroups[baseAddress].lastShareAge = lastShareAge;
                     minerGroups[baseAddress].totalHashrate += hashrate;
                     if (isEstimated) {
                         minerGroups[baseAddress].totalEstimatedHashrate += hashrate;
@@ -2687,8 +2814,15 @@
                 for (var addr in minerGroups) {
                     var group = minerGroups[addr];
                     group.doa_percent = group.totalHashrate > 0 ? group.totalDoa / group.totalHashrate : 0;
-                    // Sort workers within group by hashrate
-                    group.workers.sort(function(a, b) { return b.hashrate - a.hashrate; });
+                    // Sort workers within group: hashing, then stalled, then standby; then by hashrate
+                    var stateRank = { hashing: 0, stalled: 1, standby: 2 };
+                    group.workers.sort(function(a, b) {
+                        var ra = stateRank[a.state] !== undefined ? stateRank[a.state] : 0;
+                        var rb = stateRank[b.state] !== undefined ? stateRank[b.state] : 0;
+                        if (ra !== rb) return ra - rb;
+                        return b.hashrate - a.hashrate;
+                    });
+                    group.allStandby = group.stateKnown && group.stateCounts.standby === group.workers.length;
                     miners.push(group);
                 }
                 
@@ -2700,8 +2834,23 @@
                 
                 // Keep full miners list for toggling
                 var allMiners = miners;
+                // An older node reports no per-session state: its timestamp is the
+                // stats poll time, so label the column for what it is.
+                var anyStateKnown = allMiners.some(function(m) { return m.stateKnown; });
+                if (!anyStateKnown && allMiners.length > 0)
+                    d3.select('#miners_last_col').text('Last Seen').attr('title', 'Last stats poll for this worker');
+
+                function ageText(sec) {
+                    if (sec < 60) return Math.floor(sec) + 's ago';
+                    if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+                    if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+                    return Math.floor(sec / 86400) + 'd ago';
+                }
+                var STANDBY_TITLE = 'Standby: authorized and receiving work, but no share submitted on this connection. Usually a failover connection of a rig that mines on another node; a rig that never submits anywhere looks the same here.';
+                var ELSEWHERE_TITLE = 'Hashing on another node: no share on this connection now, but this payout address keeps getting sharechain shares minted by another node (within 15 min). Usually a rig that failed over here and back. The evidence is per address, not per rig.';
                 
                 function renderMinersTable(showHistorical) {
+                    var renderGen = ++_minersRenderGen;
                     var filtered = showHistorical ? allMiners : allMiners.filter(function(m) { return m.totalConnections > 0 || m.nonStratum; });
                 
                     // Update count badge: active count (/ total if showing historical)
@@ -2716,7 +2865,7 @@
                 
                 if (display.length === 0) {
                     d3.select('#active_miners tbody').append('tr').append('td')
-                        .attr('colspan', '8')
+                        .attr('colspan', '10')
                         .attr('style', 'text-align: center; color: #888;')
                         .text(showHistorical ? 'No miners found' : 'No miners currently connected via stratum');
                     return;
@@ -2725,6 +2874,29 @@
                 // Fetch payout data (both main chain and merged)
                 d3.json('../current_payouts', function(payouts_data) {
                 d3.json('../current_merged_payouts', function(merged_payouts_data) {
+                d3.json('../web/graph_data/miner_hash_rates/last_day', function(hr_day) {
+                // A newer render started while these fetches were in flight; it
+                // owns the table, so this one draws nothing.
+                if (renderGen !== _minersRenderGen) return;
+                d3.select('#active_miners tbody').selectAll('tr').remove();
+                // #1142 item 6: per-worker 24h average, same derivation as the
+                // miners.html card aggregate. A worker is averaged only over the
+                // samples it appears in; no samples means no average (shown '-').
+                var avg_24h = {};
+                if (hr_day && hr_day.length > 0) {
+                    var hr_tot = {}, hr_cnt = {};
+                    hr_day.forEach(function(point) {
+                        if (!point || !point[1]) return;
+                        for (var wn in point[1]) {
+                            var v = point[1][wn];
+                            if (typeof v !== 'number' || !isFinite(v)) continue;
+                            hr_tot[wn] = (hr_tot[wn] || 0) + v;
+                            hr_cnt[wn] = (hr_cnt[wn] || 0) + 1;
+                        }
+                    });
+                    for (var wn2 in hr_tot) avg_24h[wn2] = hr_tot[wn2] / hr_cnt[wn2];
+                }
+                function avgCellText(a) { return a === undefined ? '-' : format_hashrate(a); }
                 var payouts = {};
                 if (payouts_data) {
                     for (var addr in payouts_data) {
@@ -2752,6 +2924,11 @@
                             // Toggle worker rows
                             d3.selectAll('.worker-row[data-parent="' + minerId + '"]')
                                 .classed('hidden', newCollapsed);
+                            // Collapsing the miner also folds its expanded standby list
+                            if (newCollapsed) {
+                                d3.selectAll('tr[data-standby-of="' + minerId + '_standby"]').classed('hidden', true);
+                                d3.selectAll('.worker-row[data-parent="' + minerId + '"] .standby-toggle').text('\u25b8');
+                            }
                         });
                     
                     // Address column with folder icon and worker count
@@ -2819,10 +2996,22 @@
                             .attr('class', 'worker-count-badge')
                             .text(miner.workers.length + ' workers');
                     }
+                    if (miner.stateKnown && (miner.stateCounts.standby > 0 || miner.stateCounts.stalled > 0)) {
+                        var sc = miner.stateCounts, parts = [];
+                        if (sc.hashing) parts.push('<span class="state-dot hashing"></span>' + sc.hashing);
+                        if (sc.stalled) parts.push('<span class="state-dot stalled"></span>' + sc.stalled);
+                        if (sc.standby) parts.push('<span class="state-dot standby"></span>' + sc.standby);
+                        addressCell.append('span')
+                            .attr('style', 'margin-left: 8px; font-size: 0.75rem; color: var(--text-muted);')
+                            .attr('title', sc.hashing + ' hashing, ' + sc.stalled + ' stalled, ' + sc.standby + ' standby')
+                            .html(parts.join(' &nbsp;'));
+                    }
                     
                     // Hashrate - show estimated with ~ prefix if no measured rate
                     var hashrateCell = minerRow.append('td');
-                    if (miner.totalHashrate > 0) {
+                    if (miner.allStandby) {
+                        hashrateCell.attr('title', STANDBY_TITLE).text('\u2014');
+                    } else if (miner.totalHashrate > 0) {
                         var hashrateText = format_hashrate(miner.totalHashrate);
                         if (miner.hasEstimatedHashrate) {
                             hashrateText = '~' + hashrateText;
@@ -2832,9 +3021,16 @@
                     } else {
                         hashrateCell.text('Connecting...');
                     }
-                    
+
+                    // 24h Avg HR - sum of the workers' averages (miners.html card rule)
+                    var minerAvg;
+                    miner.workers.forEach(function(w) {
+                        if (avg_24h[w.name] !== undefined) minerAvg = (minerAvg || 0) + avg_24h[w.name];
+                    });
+                    minerRow.append('td').text(avgCellText(minerAvg));
+
                     // Pseudoshare Difficulty (max across workers)
-                    minerRow.append('td').text(d3.format('.2f')(miner.maxDifficulty));
+                    minerRow.append('td').text(miner.allStandby ? '\u2014' : d3.format('.2f')(miner.maxDifficulty));
                     
                     // Time to Share - calculated from hashrate and attempts_to_share
                     var timeToShare = '∞';
@@ -2843,7 +3039,9 @@
                         timeToShare = format_dt(seconds);
                     }
                     var timeCell = minerRow.append('td');
-                    if (miner.hasEstimatedHashrate) {
+                    if (miner.allStandby) {
+                        timeCell.text('\u2014');
+                    } else if (miner.hasEstimatedHashrate) {
                         timeCell.attr('title', 'Estimated (hashrate derived from difficulty)');
                         timeCell.text('~' + timeToShare);
                     } else {
@@ -2851,9 +3049,12 @@
                         timeCell.text(timeToShare);
                     }
                     
-                    // Last Seen - use actual timestamp from stratum stats
+                    // Last Share: time since the newest accepted share on this node
+                    // (older nodes: fall back to the stats timestamp)
                     var lastSeenText = 'Active';
-                    if (miner.lastSeen > 0) {
+                    if (miner.stateKnown) {
+                        lastSeenText = miner.lastShareAge !== null ? ageText(miner.lastShareAge) : 'never';
+                    } else if (miner.lastSeen > 0) {
                         var now = Date.now() / 1000;
                         var ago = now - miner.lastSeen;
                         if (ago < 60) lastSeenText = Math.floor(ago) + 's ago';
@@ -2864,7 +3065,8 @@
                     minerRow.append('td').text(lastSeenText);
                     
                     // DOA Rate
-                    minerRow.append('td').text(d3.format('.2%')(miner.doa_percent));
+                    minerRow.append('td').text(miner.allStandby ? '\u2014' : d3.format('.2%')(miner.doa_percent));
+                    minerRow.append('td').text(miner.allStandby ? '\u2014' : format_hashrate(miner.totalDoa));
                     
                     // Payout with symbol
                     var payout = payouts[miner.address] || 0;
@@ -2885,19 +3087,37 @@
                         mergedPayoutCell.style('color', '#666').text('0.0000 DOGE');
                     }
                     
-                    // Create worker rows (expanded for multi-worker, hidden for single)
+                    // Create worker rows (expanded for multi-worker, hidden for single).
+                    // Standby (failover) connections are collapsed behind one summary
+                    // row; stalled workers are highlighted in-row.
                     var startExpanded = miner.workers.length > 1;
-                    miner.workers.forEach(function(worker, widx) {
+                    var standbyWorkers = miner.workers.filter(function(w) { return w.state === 'standby'; });
+                    var otherWorkers = miner.workers.filter(function(w) { return w.state !== 'standby'; });
+
+                    function renderWorkerRow(worker, rowClass, attrName, attrVal) {
                         var workerRow = tbody.append('tr')
-                            .attr('class', 'worker-row' + (startExpanded ? '' : ' hidden'))
-                            .attr('data-parent', minerId);
-                        
+                            .attr('class', rowClass)
+                            .attr(attrName, attrVal);
+                        var isStandby = worker.state === 'standby';
+                        var standbyTitle = worker.elsewhere ? ELSEWHERE_TITLE : STANDBY_TITLE;
+
                         var shortName = worker.name.indexOf('.') >= 0 ? worker.name.substring(worker.name.lastIndexOf('.') + 1) : worker.name;
-                        workerRow.append('td').attr('title', worker.name).text('↳ ' + shortName);
-                        
+                        var nameCell = workerRow.append('td').attr('title', worker.name);
+                        nameCell.append('span').text('\u21b3 ');
+                        if (worker.state) {
+                            nameCell.append('span')
+                                .attr('class', 'state-dot ' + worker.state)
+                                .attr('title', isStandby ? standbyTitle
+                                    : worker.state === 'stalled' ? 'Stalled: shared on this connection, then stopped. Check the rig.'
+                                    : 'Hashing on this node');
+                        }
+                        nameCell.append('span').text(shortName);
+
                         // Worker hashrate with estimated indicator
                         var workerHashrateCell = workerRow.append('td');
-                        if (worker.hashrate > 0) {
+                        if (isStandby) {
+                            workerHashrateCell.attr('title', standbyTitle).text('\u2014');
+                        } else if (worker.hashrate > 0) {
                             var workerHashrateText = format_hashrate(worker.hashrate);
                             if (worker.isEstimated) {
                                 workerHashrateText = '~' + workerHashrateText;
@@ -2907,48 +3127,83 @@
                         } else {
                             workerHashrateCell.text('-');
                         }
-                        
-                        workerRow.append('td').text(d3.format('.2f')(worker.difficulty));
-                        
+                        workerRow.append('td').text(avgCellText(avg_24h[worker.name]));
+
+                        workerRow.append('td').text(isStandby ? '\u2014' : d3.format('.2f')(worker.difficulty));
+
                         // Time to share for this worker
-                        var workerTimeToShare = '∞';
-                        if (worker.hashrate > 0 && attempts_to_share > 0) {
-                            var workerSeconds = attempts_to_share / worker.hashrate;
-                            workerTimeToShare = format_dt(workerSeconds);
-                        }
                         var workerTimeCell = workerRow.append('td');
-                        if (worker.isEstimated && workerTimeToShare !== '∞') {
-                            workerTimeCell.text('~' + workerTimeToShare);
+                        if (isStandby) {
+                            workerTimeCell.text('\u2014');
                         } else {
-                            workerTimeCell.text(workerTimeToShare);
+                            var workerTimeToShare = '\u221e';
+                            if (worker.hashrate > 0 && attempts_to_share > 0) {
+                                workerTimeToShare = format_dt(attempts_to_share / worker.hashrate);
+                            }
+                            workerTimeCell.text(worker.isEstimated && workerTimeToShare !== '\u221e'
+                                ? '~' + workerTimeToShare : workerTimeToShare);
                         }
-                        
-                        // Worker last seen
+
+                        // Worker last share (older nodes: stats timestamp)
                         var workerLastSeen = 'Active';
-                        if (worker.last_seen > 0) {
-                            var now = Date.now() / 1000;
-                            var ago = now - worker.last_seen;
-                            if (ago < 60) workerLastSeen = Math.floor(ago) + 's ago';
-                            else if (ago < 3600) workerLastSeen = Math.floor(ago / 60) + 'm ago';
-                            else if (ago < 86400) workerLastSeen = Math.floor(ago / 3600) + 'h ago';
-                            else workerLastSeen = Math.floor(ago / 86400) + 'd ago';
+                        if (worker.state) {
+                            workerLastSeen = worker.last_share_age_s !== null && worker.last_share_age_s !== undefined
+                                ? ageText(worker.last_share_age_s) : 'never';
+                        } else if (worker.last_seen > 0) {
+                            workerLastSeen = ageText(Date.now() / 1000 - worker.last_seen);
                         }
                         workerRow.append('td').text(workerLastSeen);
-                        
+
                         var doaPercent = worker.hashrate > 0 ? worker.doa_hashrate / worker.hashrate : 0;
-                        workerRow.append('td').text(d3.format('.2%')(doaPercent));
+                        workerRow.append('td').text(isStandby ? '\u2014' : d3.format('.2%')(doaPercent));
+                        workerRow.append('td').text(isStandby ? '\u2014' : format_hashrate(worker.doa_hashrate));
                         workerRow.append('td').text('-');
                         // Merged-payout filler cell — hidden with its column on
                         // standalone parents (body.no-merged-child).
                         workerRow.append('td').attr('class', 'merged-child-hint').text('-');
+                    }
+
+                    otherWorkers.forEach(function(worker) {
+                        renderWorkerRow(worker,
+                            'worker-row' + (startExpanded ? '' : ' hidden') + (worker.state === 'stalled' ? ' row-stalled' : ''),
+                            'data-parent', minerId);
                     });
+
+                    if (standbyWorkers.length > 0) {
+                        var standbyId = minerId + '_standby';
+                        var nElsewhere = standbyWorkers.filter(function(w) { return w.elsewhere; }).length;
+                        var summary = tbody.append('tr')
+                            .attr('class', 'worker-row standby-summary' + (startExpanded ? '' : ' hidden'))
+                            .attr('data-parent', minerId)
+                            .attr('title', nElsewhere === standbyWorkers.length ? ELSEWHERE_TITLE : STANDBY_TITLE)
+                            .on('click', function() {
+                                var rows = d3.selectAll('tr[data-standby-of="' + standbyId + '"]');
+                                var open = !rows.empty() && !rows.classed('hidden');
+                                rows.classed('hidden', open);
+                                d3.select(this).select('.standby-toggle').text(open ? '\u25b8' : '\u25be');
+                            });
+                        var sumCell = summary.append('td').attr('colspan', '10');
+                        sumCell.append('span').attr('class', 'state-dot standby');
+                        sumCell.append('span').text(standbyWorkers.length + ' standby connection' +
+                            (standbyWorkers.length === 1 ? '' : 's') + ' \u2014 ' +
+                            (nElsewhere === standbyWorkers.length ? 'hashing on another node '
+                                : nElsewhere > 0 ? nElsewhere + ' hashing on another node, the rest never submitted here '
+                                : 'no share submitted here (usually a failover pool) '));
+                        sumCell.append('span').attr('class', 'standby-toggle').text('\u25b8');
+                        standbyWorkers.forEach(function(worker) {
+                            renderWorkerRow(worker, 'worker-row row-standby hidden', 'data-standby-of', standbyId);
+                        });
+                    }
+                });
                 });
                 });
                 });
                 } // end renderMinersTable
                 
-                // Initial render — show only currently connected (active) miners
-                renderMinersTable(false);
+                // Initial render follows the "Show historical" box, so a refresh
+                // does not drop historical rows while the box stays ticked.
+                var historicalBox = document.getElementById('show_historical_miners');
+                renderMinersTable(!!(historicalBox && historicalBox.checked));
                 
                 // Wire checkbox to toggle historical miners visibility
                 d3.select('#show_historical_miners').on('change', function() {
@@ -3473,8 +3728,79 @@
 
                 var local = d3.sum(values(local_stats.miner_hash_rates));
                 var local_dead = d3.sum(values(local_stats.miner_dead_hash_rates));
-                d3.select('#local_rate').text(format_hashrate(local));
-                d3.select('#local_doa').text(local > 0 ? d3.format('.2p')(local_dead/local) : '0%');
+                // #942: on a relay node (no Stratum acceptor) local hashrate is
+                // not applicable, not a measured 0. Older binaries omit
+                // node_role and keep the old rendering.
+                var _relayNode = local_stats.node_role === 'relay';
+                d3.select('#local_rate').text(_relayNode ? 'n/a (relay node)' : format_hashrate(local));
+                d3.select('#local_doa').text(_relayNode ? 'n/a' : (local > 0 ? d3.format('.2p')(local_dead/local) : '0%'));
+                d3.select('#node_role_note').style('display', _relayNode ? null : 'none');
+
+                // #959: an authorized session that stops sharing is SILENT. Nodes
+                // are peers, so a rig may keep a failover (standby) connection
+                // here while it hashes elsewhere: that is normal, shown as a muted
+                // chip. Only STALLED sessions (shared here, then stopped) are named
+                // as a warning. Older binaries omit the state fields; they keep
+                // the plain silent note.
+                var _ss = local_stats.stratum_sessions;
+                var _silentNote = d3.select('#workers_silent_note');
+                var _chips = d3.select('#miners_state_chips');
+                if (_ss && typeof _ss.hashing === 'number') {
+                    _chips.html('');
+                    _chips.append('span').attr('class', 'state-chip')
+                        .attr('title', 'Sessions with an accepted share on this node within the silence threshold')
+                        .html('<span class="state-dot hashing"></span><b>' + _ss.hashing + '</b> hashing');
+                    // Of the standby sessions, those whose payout address hashes
+                    // through another node (a rig that failed over here and back).
+                    var _elsewhere = typeof _ss.standby_elsewhere === 'number' ? _ss.standby_elsewhere : 0;
+                    if (_ss.standby > 0)
+                        _chips.append('span').attr('class', 'state-chip')
+                            .attr('title', 'Failover connections: authorized, receiving work, no share here now. The rigs mine on another node; normal.' +
+                                (_elsewhere > 0 ? ' "Hashing elsewhere": the payout address has sharechain shares minted by another node within 15 min (per address, not per rig).' : ''))
+                            .html('<span class="state-dot standby"></span><b>' + _ss.standby + '</b> standby' +
+                                (_elsewhere === 0 ? '' : _elsewhere === _ss.standby ? ' (hashing elsewhere)'
+                                    : ' (' + _elsewhere + ' hashing elsewhere)'));
+                    if (_ss.stalled > 0)
+                        _chips.append('span').attr('class', 'state-chip stalled-hot')
+                            .attr('title', 'Shared on this node, then stopped past the threshold. Check these rigs.')
+                            .html('<span class="state-dot stalled"></span><b>' + _ss.stalled + '</b> stalled');
+                    _chips.style('display', null);
+                    var _stateNote = d3.select('#stratum_state_note');
+                    if (_ss.hashing === 0 && _ss.stalled === 0 && _ss.standby > 0) {
+                        _stateNote.text('All ' + _ss.standby + ' Stratum session' + (_ss.standby === 1 ? ' is' : 's are') +
+                            (_elsewhere === _ss.standby
+                                ? ' standby: their payout address is hashing on another node, and this node is their failover pool.'
+                                : ' standby (no share submitted here): this node is usually a failover pool for these rigs.'));
+                        _stateNote.style('display', null);
+                    } else {
+                        _stateNote.style('display', 'none');
+                    }
+                    var _stalled = (local_stats.workers_silent || []).filter(function(sw) { return sw.state === 'stalled'; });
+                    if (_stalled.length > 0) {
+                        _silentNote.text('\u26a0 Stalled: ' + _stalled.map(function(sw) {
+                            return sw.worker + ' (no share for ' + format_dt(sw.silent_seconds) + ')';
+                        }).join(', '));
+                        _silentNote.style('display', null);
+                    } else {
+                        _silentNote.style('display', 'none');
+                    }
+                } else if (_ss && _ss.silent > 0) {
+                    _chips.style('display', 'none');
+                    d3.select('#stratum_state_note').style('display', 'none');
+                    var _names = (local_stats.workers_silent || []).map(function(sw) {
+                        return sw.worker + ' (silent ' + format_dt(sw.silent_seconds) +
+                            (sw.has_shared ? '' : ', no share since connect') + ')';
+                    });
+                    _silentNote.text('\u26a0 ' + _ss.active + ' of ' + _ss.total +
+                        ' Stratum sessions active; ' + _ss.silent +
+                        ' silent (authorized, no accepted share past the threshold)' +
+                        (_names.length ? ': ' + _names.join(', ') : ''));
+                    _silentNote.style('display', null);
+                } else {
+                    _chips.style('display', 'none');
+                    d3.select('#stratum_state_note').style('display', 'none');
+                    _silentNote.style('display', 'none');
+                }
                 
                 d3.select('#shares_total').text(local_stats.shares.total);
                 d3.select('#shares_orphan').text(local_stats.shares.orphan);
@@ -5022,6 +5348,28 @@
             }
         }
         
+        // #1142 item 9: page long peer lists (p2pool-dash parity). The shown
+        // count lives outside the loaders so an expanded list stays expanded
+        // across the periodic refresh.
+        var PEERS_PAGE = 10;
+        window.peerPageCounts = {};
+        function pagePeers(key, btnId, rows, reload) {
+            var shown = window.peerPageCounts[key] || PEERS_PAGE;
+            var remaining = rows.length - shown;
+            var btn = d3.select('#' + btnId);
+            if (remaining > 0) {
+                btn.style('display', 'block')
+                    .text('Show ' + Math.min(PEERS_PAGE, remaining) + ' more... (' + remaining + ' remaining)')
+                    .on('click', function() {
+                        window.peerPageCounts[key] = shown + PEERS_PAGE;
+                        reload();
+                    });
+            } else {
+                btn.style('display', 'none');
+            }
+            return rows.slice(0, shown);
+        }
+
         function loadPeers() {
             d3.json('../peer_list', function(peers) {
                 d3.select('#peers_loading').style('display', 'none');
@@ -5034,10 +5382,13 @@
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('No peers connected');
+                    d3.select('#p2pool_peers_show_more').style('display', 'none');
                     return;
                 }
 
-                var tr = d3.select('#peers_tbody').selectAll('tr').data(peers).enter().append('tr');
+                var tr = d3.select('#peers_tbody').selectAll('tr')
+                    .data(pagePeers('p2pool', 'p2pool_peers_show_more', peers, loadPeers))
+                    .enter().append('tr');
                 tr.append('td')
                     .style('font-family', 'monospace')
                     .style('font-size', '12px')
@@ -5078,6 +5429,7 @@
                         .style('text-align', 'center')
                         .style('color', 'var(--text-muted)')
                         .text('Embedded node not enabled');
+                    d3.select('#broadcaster_peers_show_more').style('display', 'none');
                     return;
                 }
 
@@ -5107,7 +5459,7 @@
                 }
 
                 var tr = d3.select('#broadcaster_peers_tbody').selectAll('tr')
-                    .data(connectedPeers)
+                    .data(pagePeers('broadcaster', 'broadcaster_peers_show_more', connectedPeers, loadBroadcasterStats))
                     .enter().append('tr');
 
                 tr.append('td')
@@ -5117,8 +5469,6 @@
                 tr.append('td').text(function(p) { return p.subver || '-'; });
                 tr.append('td').text(function(p) { return p.startingheight || '-'; });
                 tr.append('td').text(function(p) { return format_duration(p.conntime || 0); });
-
-                d3.select('#broadcaster_peers_show_more').style('display', 'none');
             });
         }
         
@@ -5341,6 +5691,41 @@
         // =============================================
         // Sharechain Defragmenter Viewer
         // =============================================
+
+        // A share that solved a block is drawn as a DARK cell with a bright
+        // glowing ring and a centre pip, so it differs from every share colour
+        // in fill and shape, not by hue alone. The old thin gold outline on a
+        // bright green cell was nearly invisible, and a plain gold fill would
+        // read as an orphan (amber). kind: 'primary' | 'child' | 'twin'.
+        var BLOCK_MARK = {
+            primary: { ring: '#ffd700', core: '#1a1400' },
+            child:   { ring: '#00e5ff', core: '#001a1d' },
+            twin:    { ring: '#ffaa00', core: '#1d0e00' }
+        };
+        function blockMarkKind(isPrimary, isChild) {
+            if (isPrimary && isChild) return 'twin';
+            if (isPrimary) return 'primary';
+            if (isChild) return 'child';
+            return null;
+        }
+        function drawBlockMark(ctx, x, y, size, kind) {
+            var m = BLOCK_MARK[kind];
+            var lw = size < 8 ? 1 : Math.max(2, Math.round(size * 0.18));
+            var pip = Math.max(1, Math.round(size * 0.3));
+            ctx.save();
+            ctx.fillStyle = m.core;
+            ctx.fillRect(x, y, size, size);
+            ctx.shadowColor = m.ring;
+            ctx.shadowBlur = Math.max(3, size * 0.5);
+            ctx.strokeStyle = m.ring;
+            ctx.lineWidth = lw;
+            ctx.strokeRect(x + lw / 2, y + lw / 2, size - lw, size - lw);
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = m.ring;
+            ctx.fillRect(x + (size - pip) / 2, y + (size - pip) / 2, pip, pip);
+            ctx.restore();
+        }
+
         var defrag = {
             canvas: null,
             ctx: null,
@@ -5679,25 +6064,8 @@
                     var isDogeBlock = !!this.dogeSet[share.h];
                     var isHead = !!this.headSet[share.h];
 
-                    // LTC block solution: gold border + inner fill
-                    if (isLtcBlock && isDogeBlock) {
-                        // Twin block — Legendary: orange glow
-                        ctx.fillStyle = '#ff8000';
-                        ctx.fillRect(x, y, cs, cs);
-                        ctx.strokeStyle = '#ffaa00';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isLtcBlock) {
-                        // LTC block only: gold border
-                        ctx.strokeStyle = '#ffd700';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    } else if (isDogeBlock) {
-                        // DOGE block only: cyan border
-                        ctx.strokeStyle = '#00e5ff';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x + 0.5, y + 0.5, cs - 1, cs - 1);
-                    }
+                    var markKind = blockMarkKind(isLtcBlock, isDogeBlock);
+                    if (markKind) drawBlockMark(ctx, x, y, cs, markKind);
 
                     // Chain head: only mark position 0 (actual tip)
                     if (i === 0 && !isLtcBlock && !isDogeBlock) {
@@ -6215,17 +6583,8 @@
 
                         var isLtc = !!animBlockSet[share.h];
                         var isDoge = !!animDogeSet[share.h];
-                        if (isLtc && isDoge) {
-                            ctx.fillStyle = '#ff8000'; ctx.fillRect(sx, sy, sw, sw);
-                            ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isLtc) {
-                            ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        } else if (isDoge) {
-                            ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 2;
-                            ctx.strokeRect(sx+0.5, sy+0.5, sw-1, sw-1);
-                        }
+                        var animMarkKind = blockMarkKind(isLtc, isDoge);
+                        if (animMarkKind) drawBlockMark(ctx, sx, sy, sw, animMarkKind);
 
                         // Head marker: only on tip share (position 0) after it has landed
                         if (i === 0 && !isNew && !isLtc && !isDoge && ctx.globalAlpha >= 1) {
@@ -6626,16 +6985,12 @@
                 // Block solution / head borders on the overlay
                 var isLtc = this.blockSet[share.h];
                 var isDoge = this.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    hc.style.background = 'linear-gradient(135deg, #ff8000, #cc6600)';
-                    hc.style.border = '2px solid #ffaa00';
-                    hc.style.boxShadow = '0 0 12px rgba(255,128,0,0.7)';
-                } else if (isLtc) {
-                    hc.style.border = '2px solid #ffd700';
-                    hc.style.boxShadow = '0 0 8px rgba(255,215,0,0.5)';
-                } else if (isDoge) {
-                    hc.style.border = '2px solid #00e5ff';
-                    hc.style.boxShadow = '0 0 8px rgba(0,229,255,0.5)';
+                var hcMark = blockMarkKind(isLtc, isDoge);
+                if (hcMark) {
+                    var hm = BLOCK_MARK[hcMark];
+                    hc.style.background = 'radial-gradient(' + hm.ring + ' 0 18%, ' + hm.core + ' 19%)';
+                    hc.style.border = '3px solid ' + hm.ring;
+                    hc.style.boxShadow = '0 0 12px ' + hm.ring;
                 }
 
                 // Trigger enlarge: remove shrinking, force reflow, add active
@@ -6947,7 +7302,15 @@
                     if (self.dogeSet[s.h]) dogeBlocks++;
                 });
 
-                document.getElementById('defrag-total').textContent = shares.length + ' / ' + (data.window_size || '-');
+                // A young sharechain is shorter than the PPLNS window: nothing has
+                // left the window yet, so no tail share dissolves. Say so instead
+                // of leaving an eviction-free tail unexplained.
+                var totalEl = document.getElementById('defrag-total');
+                var filling = data.window_size > 0 && shares.length < data.window_size;
+                totalEl.textContent = shares.length + ' / ' + (data.window_size || '-') + (filling ? ' (filling)' : '');
+                totalEl.title = filling
+                    ? 'The window is still filling: no share leaves it until ' + data.window_size + ' shares are in it.'
+                    : '';
                 document.getElementById('defrag-mine').textContent = mine;
                 document.getElementById('defrag-stale').textContent = stale;
                 document.getElementById('defrag-dead').textContent = dead;
@@ -6964,11 +7327,33 @@
                     blocksText += ' / ' + dogeBlocks + ' ' + ci.merged_child_symbol;
                 }
                 document.getElementById('defrag-blocks').textContent = blocksText;
+                setBlocksScopeTitle(shares);
                 document.getElementById('defrag-fee').textContent = fee;
                 document.getElementById('defrag-v36native').textContent = v36native;
                 document.getElementById('defrag-v36sig').textContent = v36sig;
             }
         };
+
+        // "Blocks in Window" counts the shares IN THE SHOWN WINDOW that solved
+        // a block — the same scope as Shares / Verified / Orphan above it, not
+        // the node's whole found-block history. The window covers the last
+        // window_size shares, so its time span depends on the share rate;
+        // the tooltip states the actual span.
+        function setBlocksScopeTitle(shares) {
+            var n = shares ? shares.length : 0;
+            var span = '';
+            if (n > 1 && shares[0].t && shares[n - 1].t) {
+                var hrs = Math.abs(shares[0].t - shares[n - 1].t) / 3600;
+                span = ' (spanning ' + (hrs >= 1 ? hrs.toFixed(1) + ' h' : Math.round(hrs * 60) + ' min') + ')';
+            }
+            var title = 'Shares that solved a block, counted over the ' + n
+                + ' shares in this window' + span + '. Blocks found before the'
+                + ' oldest share in the window are not counted.';
+            var l = document.getElementById('defrag-blocks-label');
+            var v = document.getElementById('defrag-blocks');
+            if (l) l.title = title;
+            if (v) v.title = title;
+        }
 
         // ── Phase B #9 feature flag ───────────────────────────────
         // Set ?new-explorer=1 in the URL (or localStorage.c2p_new_explorer=1)
@@ -7395,13 +7780,12 @@
             if (share) {
                 var isLtc = defrag.blockSet[share.h];
                 var isDoge = defrag.dogeSet[share.h];
-                if (isLtc && isDoge) {
-                    cell.classList.add('cell-legendary');
-                } else if (isLtc) {
-                    cell.style.border = '2px solid #ffd700';
-                    cell.style.boxShadow = '0 0 4px rgba(255,215,0,0.4)';
-                } else if (isDoge) {
-                    cell.style.border = '2px solid #00e5ff';
+                var cellMark = blockMarkKind(isLtc, isDoge);
+                if (cellMark) {
+                    var cm = BLOCK_MARK[cellMark];
+                    cell.style.background = cm.core;
+                    cell.style.border = '2px solid ' + cm.ring;
+                    cell.style.boxShadow = '0 0 4px ' + cm.ring;
                 }
             }
 
@@ -7567,6 +7951,7 @@
             d3.json(endpoints[currentGraphPeriod], function(data) {
                 hashrateData = data;
                 if (!data || data.length === 0) {
+                    setGraphHistoryNote('hashrate-graph-note', [], 0);
                     document.getElementById('hashrate-graph').innerHTML = 
                         '<div style="text-align:center; color: var(--text-muted); padding: 100px 0;">No data available for this period</div>';
                     return;
@@ -7858,6 +8243,32 @@
             return false;
         }
 
+        // #942: a period view ("last_day") only spans this node's recorded
+        // history. After a restart the 1D graph can cover 33 minutes, so every
+        // block found earlier in the period sits left of the x-axis and is
+        // silently dropped. Clamping those markers to the edge would misplace
+        // them in time; instead say how many are not plotted and where the
+        // recorded history begins.
+        var GRAPH_PERIOD_SECONDS = {hour: 3600, day: 86400, week: 604800, month: 2592000, year: 31536000};
+        function setGraphHistoryNote(noteId, blocks, minTime) {
+            var el = document.getElementById(noteId);
+            if (!el) return;
+            var periodStart = Date.now() - (GRAPH_PERIOD_SECONDS[currentGraphPeriod] || 0) * 1000;
+            var hidden = (blocks || []).filter(function(b) {
+                var t = b.ts * 1000;
+                return t >= periodStart && t < minTime;
+            }).length;
+            if (hidden === 0) {
+                el.style.display = 'none';
+                el.textContent = '';
+                return;
+            }
+            el.textContent = 'Graph history on this node starts ' + new Date(minTime).toLocaleString() +
+                '; ' + hidden + (hidden === 1 ? ' block' : ' blocks') + ' found earlier in this period ' +
+                (hidden === 1 ? 'is' : 'are') + ' not plotted (listed under Recent Blocks).';
+            el.style.display = '';
+        }
+
         function renderHashrateGraph(data, minerData, uniqueMinersData, connectedData, blocks, networkDiffSamples, localSamples, localDeadSamples) {
             var container = document.getElementById('hashrate-graph');
             blocks = blocks || [];
@@ -8033,11 +8444,13 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
             
+            setGraphHistoryNote('hashrate-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =
@@ -8367,7 +8780,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8405,7 +8818,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -8498,8 +8911,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -8510,7 +8924,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -8547,7 +8961,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -8792,11 +9206,13 @@
                         x: blockTime,
                         y: yVal,
                         block: b,
-                        color: color
+                        style: block_marker_style(b, color)
                     });
                 }
             });
             
+            setGraphHistoryNote('fs-graph-note', blocks, minTime);
+
             // Interpolate luck trend to align with hashrate time boundaries.
             // Ephemeral final point: live-extrapolate the IN-PROGRESS round to
             // the render wall-clock "now". luck-if-found-now =
@@ -9077,7 +9493,7 @@
                         if (this.point && this.point.block) {
                             var b = this.point.block;
                             var s = '<b>' + Highcharts.dateFormat('%b %e, %H:%M:%S', this.x) + '</b><br/>';
-                            s += '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            s += block_headline_html(b);
                             s += 'Height: <b>' + (b.number || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9116,7 +9532,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                         
@@ -9221,8 +9637,9 @@
                             y: m.y,
                             block: m.block,
                             marker: {
-                                fillColor: m.color || '#10b981',
-                                symbol: 'diamond',
+                                fillColor: m.style.fillColor || '#10b981',
+                                lineColor: m.style.lineColor,
+                                symbol: m.style.symbol,
                                 radius: 6
                             }
                         };
@@ -9233,7 +9650,7 @@
                     tooltip: {
                         pointFormatter: function() {
                             var b = this.block;
-                            var s = '<span style="color:#00ff88">◆</span> <b>Block Found!</b><br/>';
+                            var s = block_headline_html(b);
                             s += 'Height: <b>' + (b.number || b.block_height || '?') + '</b><br/>';
                             if (b.luck !== undefined && b.luck !== null) {
                                 var luckColor = b.luck >= 100 ? '#00ff88' : (b.luck >= 75 ? '#ffc107' : '#ff6b6b');
@@ -9270,7 +9687,7 @@
                                 s += '<br/>';
                             }
                             s += block_found_by_html(b);
-                            s += 'Status: <b style="color:' + (b.status === 'confirmed' ? '#00ff88' : '#ffc107') + '">' + (b.status || 'unknown') + '</b>';
+                            s += block_status_html(b);
                             return s;
                         }
                     }
@@ -9834,6 +10251,7 @@
                                 bt += ' / ' + s.dogeBlocks + ' ' + bci.merged_child_symbol;
                             }
                             statEls.blocks.textContent = bt;
+                            setBlocksScopeTitle(state.window.shares);
                         }
                     }
                     window.addEventListener('beforeunload', function() {

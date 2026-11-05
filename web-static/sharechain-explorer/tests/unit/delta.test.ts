@@ -260,3 +260,39 @@ test('invariant: no duplicate short-hashes after arbitrary merge sequence', () =
     assert.equal(hashes.length, new Set(hashes).size, `duplicates at iter ${i}`);
   }
 });
+
+// ── Fresh chain: window filling, then the crossing ──────────────
+// A freshly started sharechain is shorter than the PPLNS window, so no
+// share has left the window yet: every merge below the window length
+// must report zero evictions. The first share past the window evicts
+// exactly the oldest, and every share after that evicts exactly one.
+
+test('fresh chain: no evictions while filling, oldest evicted from window+1', () => {
+  const W = 20;
+  let window = { shares: [] as DeltaShare[] };
+  for (let n = 1; n <= W + 5; n++) {
+    const r = mergeDelta(window, { shares: [s(`h${n}`)] }, { windowSize: W });
+    if (n <= W) {
+      assert.deepEqual(r.evicted, [], `share ${n}: evicted before the window filled`);
+      assert.equal(r.shares.length, n);
+    } else {
+      assert.deepEqual(r.evicted, [`h${n - W}`], `share ${n}: wrong eviction`);
+      assert.equal(r.shares.length, W);
+    }
+    window = { shares: r.shares as DeltaShare[] };
+  }
+});
+
+test('crossing at the DASH window (8640): exactly-full evicts nothing, next evicts the tail', () => {
+  const W = 8640;
+  const shares: DeltaShare[] = [];
+  for (let i = W - 1; i >= 1; i--) shares.push(s(`h${i}`, { H: `full${i}` }));
+  // W - 1 shares held; the W-th fills the window exactly.
+  const full = mergeDelta({ shares }, { shares: [s(`h${W}`, { H: `full${W}` })] }, { windowSize: W });
+  assert.equal(full.shares.length, W);
+  assert.deepEqual(full.evicted, []);
+  // One past the window: the oldest share (full hash) leaves.
+  const past = mergeDelta(full, { shares: [s(`h${W + 1}`, { H: `full${W + 1}` })] }, { windowSize: W });
+  assert.equal(past.shares.length, W);
+  assert.deepEqual(past.evicted, ['full1']);
+});

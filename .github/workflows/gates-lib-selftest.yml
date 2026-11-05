@@ -1,0 +1,31 @@
+name: Gates lib selftest
+
+# tests/gates/lib/ holds the shared Conan remote helpers that every conan-backed
+# gate sources. No other workflow tests them in isolation. This job runs the
+# conan_install_resilient selftest (stub conan + local TCP listeners, no
+# network, about 2 s), which reproduces a remote that passes the probe and then
+# drops mid-install.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "tests/gates/lib/**"
+      - ".github/workflows/gates-lib-selftest.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "tests/gates/lib/**"
+      - ".github/workflows/gates-lib-selftest.yml"
+
+jobs:
+  selftest:
+    name: conan_install_resilient selftest
+    # Route to self-hosted for trusted events; fork PRs fall back to
+    # GitHub-hosted ubuntu-24.04 (never run untrusted fork code self-hosted).
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","c2pool-build"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run the conan_install_resilient selftest
+        run: bash tests/gates/lib/test_conan_install_resilient.sh

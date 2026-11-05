@@ -60,6 +60,19 @@ inline bool is_scorable_invalid_pow(const std::exception& e)
     return dynamic_cast<const SharePoWTargetMiss*>(&e) != nullptr;
 }
 
+// Version-switch weight gate, exactly as the p2pool oracle writes it
+// (p2pool-merged-v36 data.py):
+//   if counts.get(self.VERSION, 0) < sum(counts.itervalues())*60//100: raise
+// The threshold is FLOOR(total*60/100). Cross-multiplying (new*100 < total*60)
+// is NOT equivalent: when 60*total is not a multiple of 100 it rejects
+// new == floor(0.6*total), which the oracle accepts -- a share-validity split
+// at every version switch. Returns true when the switch must be REJECTED.
+inline bool version_switch_underweight(const uint288& new_ver_weight,
+                                       const uint288& total_weight)
+{
+    return new_ver_weight < (total_weight * uint32_t(60)) / uint288(100);
+}
+
 // P2Pool witness nonce: '[P2Pool]' repeated 4 times = 32 bytes
 // Used for witness commitment: SHA256d(wtxid_merkle_root || P2POOL_WITNESS_NONCE)
 static const unsigned char P2POOL_WITNESS_NONCE[32] = {
@@ -1825,7 +1838,7 @@ bool share_check(const ShareT& share,
                             new_ver_weight = new_ver_weight + w;
                     }
                     // Canonical: counts.get(self.VERSION,0) < sum(counts)*60//100
-                    if (new_ver_weight * uint32_t(100) < total_weight * uint32_t(60))
+                    if (version_switch_underweight(new_ver_weight, total_weight))
                         throw std::invalid_argument("switch without enough hash power upgraded");
                 }
                 else if (parent_version == share_ver + 1)
@@ -2017,35 +2030,15 @@ bool share_check(const ShareT& share,
 }
 
 // ============================================================================
-// verify_share()
+// derive_gentx_hash()
 //
-// Combined entry point: runs both init-phase and check-phase verification.
-// Returns the computed share hash.
+// Coinbase txid committed by a share: rebuilds ref_hash + hash_link_data and
+// resumes the hash_link. verify_share() uses it for the check phase; the
+// found-block explorer (#946) uses it to fill coinbase_txid on peer rows.
 // ============================================================================
-template <typename ShareT, typename TrackerT>
-uint256 verify_share(const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
+template <typename ShareT>
+uint256 derive_gentx_hash(const ShareT& share, const core::CoinParams& params)
 {
-    auto vt0 = std::chrono::steady_clock::now();
-    // share_init_verify computes gentx_hash along the way — we need it
-    // for the GenerateShareTransaction comparison in share_check.
-    // Skip scrypt PoW re-check when hash was already computed in Phase 1
-    // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
-    uint256 hash = share_init_verify(share, params, share.m_hash.IsNull());
-    auto vt1 = std::chrono::steady_clock::now();
-
-    // Verify recomputed hash matches stored hash (informational).
-    // For locally created shares the hash was set during create_local_share;
-    // a mismatch means the header reconstruction diverged (e.g., genesis PPLNS
-    // race). The share_check phase uses share.m_hash for chain lookups.
-    if (!share.m_hash.IsNull() && hash != share.m_hash) {
-        static int hash_mismatch_log = 0;
-        if (hash_mismatch_log++ < 10)
-            LOG_WARNING << "[verify_share] hash mismatch: recomputed="
-                        << hash.GetHex().substr(0, 16)
-                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
-    }
-
-    // Re-derive gentx_hash for the check phase
     constexpr int64_t ver = ShareT::version;
     auto gentx_before_refhash = compute_gentx_before_refhash(ver, params);
 
@@ -2164,7 +2157,41 @@ uint256 verify_share(const ShareT& share, TrackerT& tracker, const core::CoinPar
         hash_link_data.insert(hash_link_data.end(), z, z + 4);
     }
 
-    uint256 gentx_hash = check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
+    return check_hash_link(share.m_hash_link, hash_link_data, gentx_before_refhash);
+}
+
+// ============================================================================
+// verify_share()
+//
+// Combined entry point: runs both init-phase and check-phase verification.
+// Returns the computed share hash.
+// ============================================================================
+template <typename ShareT, typename TrackerT>
+uint256 verify_share(const ShareT& share, TrackerT& tracker, const core::CoinParams& params)
+{
+    auto vt0 = std::chrono::steady_clock::now();
+    // share_init_verify computes gentx_hash along the way — we need it
+    // for the GenerateShareTransaction comparison in share_check.
+    // Skip scrypt PoW re-check when hash was already computed in Phase 1
+    // (processing_shares offloads scrypt to m_verify_pool; no need to repeat).
+    uint256 hash = share_init_verify(share, params, share.m_hash.IsNull());
+    auto vt1 = std::chrono::steady_clock::now();
+
+    // Verify recomputed hash matches stored hash (informational).
+    // For locally created shares the hash was set during create_local_share;
+    // a mismatch means the header reconstruction diverged (e.g., genesis PPLNS
+    // race). The share_check phase uses share.m_hash for chain lookups.
+    if (!share.m_hash.IsNull() && hash != share.m_hash) {
+        static int hash_mismatch_log = 0;
+        if (hash_mismatch_log++ < 10)
+            LOG_WARNING << "[verify_share] hash mismatch: recomputed="
+                        << hash.GetHex().substr(0, 16)
+                        << " stored=" << share.m_hash.GetHex().substr(0, 16);
+    }
+
+    // Re-derive gentx_hash for the check phase
+    constexpr int64_t ver = ShareT::version;
+    uint256 gentx_hash = derive_gentx_hash(share, params);
 
     // V36+: Validate message_data (reject shares with invalid encrypted messages)
     if constexpr (ver >= 36)

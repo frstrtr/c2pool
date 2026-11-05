@@ -321,7 +321,11 @@ bool contains_ascii(const std::vector<std::uint8_t>& body, const char* needle) {
 // =============================================================================
 void test_handshake_happy_path() {
     Rig r;
-    r.build(fast_config());
+    // quiet_config: this test never answers TIMED_SYNC, and under fast_config
+    // (60 ms interval, 400 ms invoke timeout) the first unanswered TIMED_SYNC
+    // closed the link with InvokeTimeout ~10-20 ms before the 300 KiB cap-flip
+    // check on a loaded runner (1 in ~20-50 runs).
+    r.build(quiet_config());
     kat::check(r.wait_frames(1), "handshake: the request reached the peer");
     if (r.peer.frames.empty()) return;
 

@@ -16,16 +16,44 @@
 
 #include "../CollateralTx.hpp"
 #include "../DashAddress.hpp"
+#include "../DashInjectModel.hpp"
+#include "../InjectManifest.hpp"
 #include "../DashError.hpp"
 #include "../DashMessage.hpp"
 #include "../GovCollateral.hpp"
+#include "../InjectCaps.hpp"
 #include "../KeyScan.hpp"
+#include "../MessageModel.hpp"
+#include "../SweepTx.hpp"
+#include "../UtxoIntake.hpp"
+
+// std-only M5-A artifact headers: the loader-file format the inject KATs check
+// the emitted file against.
+#include "../../artifact/Digest.hpp"
+#include "../../artifact/TransferContainer.hpp"
+#include "../../artifact/TxIntrospect.hpp"
+
+// std-only hdkeys headers: the BIP38 overload, a WIF decode for the S2-K9 grep,
+// and the JSON reader the S2-K7 manifest round trip uses.
+#include "../../hdkeys/Bip38.hpp"
+#include "../../hdkeys/KeyImport.hpp"
+#include "../../hdkeys/MiniJson.hpp"
 
 #include "gov_vectors.hpp"
+#include "inject_vectors.hpp"
+#include "msg_vectors.hpp"
+#include "s2_vectors.hpp"
 
+#include <algorithm>
+#include <array>
+#include <climits>
 #include <cstdint>
+#include <exception>
+#include <initializer_list>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -222,30 +250,2197 @@ static void test_collateral_tx()
     CHECK(aborts([&] { plan_collateral(badexp); }), "expected-hash mismatch hard-aborts");
 }
 
-static void test_message()
+// ═══════════════════════════════════════════════════════════════════════════
+// Zero-fee INJECT builders (FeeMode::InjectOnlyZeroFee, SweepTx, UtxoIntake,
+// KeyScanRange) — KATs K1..K13 of the inject design. K11 (the node-cap
+// tripwire) is a set of static_asserts in test/test_dash_tx_inject.cpp.
+// ═══════════════════════════════════════════════════════════════════════════
+
+template <typename F>
+static bool aborts_with(F&& fn, const char* needle)
 {
-    std::printf("[message sign / verify — DarkCoin magic, recover-and-check]\n");
+    try { fn(); return false; }
+    catch (const DashAbort& e) {
+        if (std::strstr(e.what(), needle)) return true;
+        std::printf("    (aborted, but with: %s)\n", e.what());
+        return false;
+    }
+    catch (...) { return false; }
+}
+
+static bool contains(const std::string& hay, const char* needle) { return hay.find(needle) != std::string::npos; }
+
+static std::string spk_hex_of(const char* addr)
+{
+    auto spk = p2pkh_script(addr_to_h160(addr, false));
+    return hexstr(std::vector<uint8_t>(spk.begin(), spk.end()));
+}
+
+static Utxo mk_utxo(const std::string& txid, uint32_t vout, int64_t sats, int64_t conf,
+                    const std::string& spk_hex, std::optional<bool> coinbase = std::nullopt)
+{
+    Utxo u;
+    u.txid = txid;
+    u.vout = vout;
+    u.satoshis = sats;
+    u.confirmations = conf;
+    u.script_pubkey_hex = spk_hex;
+    u.coinbase = coinbase;
+    return u;
+}
+
+static std::string txid_of_byte(const char* two_hex) { std::string s; for (int i = 0; i < 32; ++i) s += two_hex; return s; }
+
+// The on-chain bytes with every scriptSig blanked (the unsigned form the
+// builder must reproduce). Independent of the library's own parser.
+static std::vector<uint8_t> blank_scriptsigs(const std::vector<uint8_t>& raw)
+{
+    std::vector<uint8_t> out(raw.begin(), raw.begin() + 5); // version + nin (< 0xfd here)
+    size_t off = 5;
+    for (uint8_t i = 0; i < raw[4]; ++i) {
+        out.insert(out.end(), raw.begin() + off, raw.begin() + off + 36); off += 36;
+        const size_t sl = raw[off]; off += 1 + sl;                    // scriptSig < 0xfd
+        out.push_back(0x00);
+        out.insert(out.end(), raw.begin() + off, raw.begin() + off + 4); off += 4;
+    }
+    out.insert(out.end(), raw.begin() + off, raw.end());              // outputs + locktime
+    return out;
+}
+
+// Input outpoints of a raw tx, display txid order, for order assertions.
+static std::vector<std::string> input_txids(const std::vector<uint8_t>& raw)
+{
+    std::vector<std::string> ids;
+    size_t off = 5;
+    for (uint8_t i = 0; i < raw[4]; ++i) {
+        std::vector<uint8_t> t(raw.begin() + off, raw.begin() + off + 32);
+        std::reverse(t.begin(), t.end());
+        ids.push_back(hexstr(t));
+        off += 36;
+        off += 1 + raw[off] + 4;
+    }
+    return ids;
+}
+
+// The default request for the inject collateral path.
+static CollateralRequest inject_request(const char* funding)
+{
+    CollateralRequest req;
+    req.funding_address = funding;
+    req.fee_mode = FeeMode::InjectOnlyZeroFee;
+    req.fee_rate = 0;
+    req.sweep_all = true;
+    req.gov_hash_display = testvec::kOnchainGovHash;
+    return req;
+}
+
+static CollateralRequest k1_request()
+{
+    CollateralRequest req = inject_request(testvec::kDonationAddress);
+    req.preserve_input_order = true;
+    // Legacy sighash commits no input amounts, so the unsigned skeleton does not
+    // depend on them. The chain tx itself paid a 1271-duff fee (inputs 101628946,
+    // Relay tool at 1000 duffs/kB). Here the amounts sum to its outputs
+    // (kOnchainSumOut), so the zero-fee inject planner lands on the identical
+    // skeleton: input order, OP_RETURN and change script. The per-input split
+    // is illustrative: four prior-change outputs, four coinbase donation slices.
+    const int64_t amounts[8] = {25000000, 25000000, 25000000, 25000000,
+                                406919, 406919, 406919, 406918};
+    for (int i = 0; i < 8; ++i) {
+        const auto& p = testvec::kOnchainCollateralPrevouts[i];
+        req.utxos.push_back(mk_utxo(p.txid, p.vout, amounts[i], 200, testvec::kDonationSpk));
+    }
+    return req;
+}
+
+static void test_k1_onchain_collateral()
+{
+    std::printf("[K1 on-chain collateral 3d8fd96e: inject planner reproduces its unsigned skeleton]\n");
+    const std::vector<uint8_t> raw = H(testvec::kOnchainCollateralHex);
+    CHECK(raw.size() == 1267, "pinned on-chain tx is 1267 bytes");
+    CHECK(c2w::artifact::sha256d_display(raw) == testvec::kOnchainCollateralTxid,
+          "pinned raw hex hashes to txid 3d8fd96e...");
+    const std::vector<uint8_t> blank = blank_scriptsigs(raw);
+    CHECK(blank.size() == 415, "blanked (unsigned) form is 415 bytes");
+
+    CollateralPlan plan = plan_collateral(k1_request());
+    CHECK(plan.unsigned_tx == blank, "plan.unsigned_tx == on-chain tx with scriptSigs blanked (byte-exact)");
+    CHECK(hexstr(plan.op_return_script) == testvec::kOnchainOpReturn, "OP_RETURN == 6a20 + reversed(display hash)");
+    CHECK(plan.gov_hash_display == testvec::kOnchainGovHash, "plan carries the direct display hash");
+    CHECK(plan.fee == 0 && plan.fee_mode == FeeMode::InjectOnlyZeroFee, "fee 0, inject-only");
+    CHECK(plan.total_in == testvec::kOnchainSumOut, "KAT inputs sum to the chain tx's outputs (101627675)");
+    CHECK(plan.change == testvec::kOnchainChange, "change = 1627675");
+    auto outs = parse_outputs(plan.unsigned_tx);
+    CHECK(outs.size() == 2 && outs[0].value == kCoin && hexstr(outs[1].script) == testvec::kDonationSpk,
+          "out1 = change -> XdgF P2PKH (dash::DONATION_SCRIPT)");
+    CHECK(plan.est_signed_bytes == 415 + 8 * (181 - 41), "est signed = worst case (Unknown => 181 B/input)");
+    CHECK(contains(plan.summary, "fee 0.00000000 (INJECT-ONLY: Dash Core peers will not relay; rides only a c2pool block)"),
+          "summary states INJECT-ONLY zero fee");
+    CHECK(contains(plan.summary, "est signed 1535/100000 B"), "summary states est signed N/100000 B");
+
+    CollateralRequest comp = k1_request();
+    comp.key_encoding = PubkeyEncoding::Compressed;
+    CHECK(plan_collateral(comp).est_signed_bytes >= raw.size(), "compressed estimate covers the real 1267 B");
+
+    // The switch is load-bearing: the default (txid, vout) order is not the chain's.
+    CollateralRequest sorted = k1_request();
+    sorted.preserve_input_order = false;
+    CollateralPlan sp = plan_collateral(sorted);
+    CHECK(sp.unsigned_tx != blank && sp.unsigned_tx.size() == blank.size(), "default sort reorders the on-chain inputs");
+
+    // The mainnet signatures themselves pass our independent re-verify.
+    CHECK(!aborts([&] { verify_signed_funding_tx(testvec::kOnchainCollateralHex, testvec::kDonationAddress, false); }),
+          "on-chain scriptSigs verify through verify_signed_funding_tx");
+}
+
+static void test_k2_fee_flags()
+{
+    std::printf("[K2 fee-mode flags]\n");
+    CollateralRequest relay0 = k1_request();
+    relay0.fee_mode = FeeMode::Relay; // fee_rate stays 0
+    CHECK(aborts_with([&] { plan_collateral(relay0); }, "zero fee is inject-only"), "Relay + fee 0 aborts (inject-only)");
+
+    CollateralRequest inj_fee = k1_request();
+    inj_fee.fee_rate = 1000;
+    CHECK(aborts_with([&] { plan_collateral(inj_fee); }, "needs fee_rate 0"), "Inject + fee_rate != 0 aborts");
+
+    CollateralRequest inj_nosweep = k1_request();
+    inj_nosweep.sweep_all = false;
+    CHECK(aborts_with([&] { plan_collateral(inj_nosweep); }, "needs sweep_all"), "Inject + !sweep_all aborts");
+
+    // The same rule at sign time, for a plan edited after review.
     FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, 0, 3, false);
-    const std::string msg = "c2wallet-qt dash proposal-ownership test";
+    CollateralRequest r = make_request(DUMMY_ADDR0);
+    CollateralPlan relay_plan = plan_collateral(r);
+    relay_plan.change += relay_plan.fee;
+    relay_plan.fee = 0;
+    CHECK(aborts_with([&] { sign_collateral(relay_plan, key, true); }, "zero fee is inject-only"),
+          "sign: a Relay plan forged to fee 0 aborts");
+    CollateralRequest ir = inject_request(DUMMY_ADDR0);
+    ir.utxos = make_request(DUMMY_ADDR0).utxos;
+    CollateralPlan inj_plan = plan_collateral(ir);
+    CollateralPlan fee_plan = inj_plan;
+    fee_plan.fee = 1000;
+    CHECK(aborts_with([&] { sign_collateral(fee_plan, key, true); }, "exactly 0"), "sign: an inject plan with a fee aborts");
 
-    std::string sig = sign_message(key.priv, msg, DUMMY_ADDR0, false);
-    CHECK(!sig.empty(), "signature produced");
-    CHECK(verify_message(DUMMY_ADDR0, msg, sig, false), "sign->verify roundtrip (recovers to address)");
+    // The inject collateral signs end to end: fee exactly 0, every input re-verifies.
+    SignedTx tx = sign_collateral(inj_plan, key, true);
+    auto outs = parse_outputs(H(tx.hex));
+    CHECK(outs.size() == 2 && outs[0].value == kCoin && hexstr(outs[0].script) == testvec::kOnchainOpReturn &&
+              outs[1].value == 10000000 && outs[0].value + outs[1].value == inj_plan.total_in,
+          "inject collateral: 1 DASH burn + change, fee 0");
+    CHECK(tx.size <= inj_plan.est_signed_bytes, "signed size within the estimate");
+    CHECK(!aborts([&] { verify_signed_funding_tx(tx.hex, DUMMY_ADDR0, false); }), "inject collateral re-verifies");
 
-    // RFC6979 determinism.
-    std::string sig2 = sign_message(key.priv, msg, DUMMY_ADDR0, false);
-    CHECK(sig == sig2, "recoverable signing is deterministic");
+    // The unsigned bytes carry no amounts, so an edited amount passes the bytes
+    // check; the sign-time sum identity is what refuses it.
+    CollateralPlan amt = inj_plan;
+    amt.selected[0].satoshis += 1;
+    CHECK(amt.unsigned_tx == inj_plan.unsigned_tx, "an amount edit leaves the unsigned bytes unchanged");
+    CHECK(aborts_with([&] { sign_collateral(amt, key, true); }, "does not balance"),
+          "sign: inputs != 1 DASH + change + fee aborts (inject)");
+    CollateralPlan relay_fee = plan_collateral(make_request(DUMMY_ADDR0));
+    relay_fee.fee += 1;
+    CHECK(aborts_with([&] { sign_collateral(relay_fee, key, true); }, "does not balance"),
+          "sign: inputs != 1 DASH + change + fee aborts (Relay)");
 
-    // Tampered message / wrong address / tampered sig all fail.
-    CHECK(!verify_message(DUMMY_ADDR0, msg + "!", sig, false), "tampered message fails");
-    CHECK(!verify_message(DUMMY_ADDR1, msg, sig, false), "wrong claimed address fails");
-    std::string bad = sig;
-    bad[0] = (bad[0] == 'A' ? 'B' : 'A'); // corrupt the leading base64 char
-    CHECK(!verify_message(DUMMY_ADDR0, msg, bad, false), "tampered signature fails");
+    CollateralPlan edited = inj_plan;
+    edited.unsigned_tx[edited.unsigned_tx.size() - 5] ^= 0x01;
+    CHECK(aborts_with([&] { sign_collateral(edited, key, true); }, "not the planned one"), "sign: edited plan bytes abort");
+    FoundKey forged = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR1, false, 0, 3, false);
+    forged.address = DUMMY_ADDR0; // claims the funding address, but its pubkey hashes elsewhere
+    CHECK(aborts_with([&] { sign_collateral(inj_plan, forged, true); }, "does not hash"), "sign: hash160(pub) != funding aborts");
+}
 
-    // Self-verify gate: signing while claiming the WRONG address must hard-abort
-    // (the recovered pubkey hashes to ADDR0, not ADDR1).
-    CHECK(aborts([&] { sign_message(key.priv, msg, DUMMY_ADDR1, false); }), "self-verify gate: wrong address hard-aborts");
+static void test_k3_sweep_all()
+{
+    std::printf("[K3 sweep-all: order, change, dust floor]\n");
+    const std::string spk = spk_hex_of(DUMMY_ADDR0);
+    CollateralRequest req = inject_request(DUMMY_ADDR0);
+    req.utxos = {mk_utxo(txid_of_byte("22"), 0, 1, 150, spk),
+                 mk_utxo(txid_of_byte("00"), 1, 100000000, 150, spk),
+                 mk_utxo(txid_of_byte("11"), 2, 5000000, 150, spk)};
+    CollateralPlan p = plan_collateral(req);
+    auto ids = input_txids(p.unsigned_tx);
+    CHECK(ids.size() == 3 && ids[0] == txid_of_byte("00") && ids[1] == txid_of_byte("11") && ids[2] == txid_of_byte("22"),
+          "default order is (txid, vout): 00, 11, 22");
+    CHECK(p.total_in == 105000001 && p.change == 5000001 && p.fee == 0, "total 105000001, change 5000001, fee 0");
+
+    CollateralRequest keep = req;
+    keep.preserve_input_order = true;
+    auto kids = input_txids(plan_collateral(keep).unsigned_tx);
+    CHECK(kids.size() == 3 && kids[0] == txid_of_byte("22") && kids[2] == txid_of_byte("11"), "preserve keeps request order");
+
+    CollateralRequest dust = req;
+    dust.dust_floor = 2;
+    CollateralPlan dp = plan_collateral(dust);
+    CHECK(dp.selected.size() == 2 && dp.skipped_dust == 1, "dust_floor=2: two selected, one skipped as dust");
+    CHECK(dp.total_in == 105000000 && dp.change == 5000000 && dp.fee == 0, "dust left out of the sums");
+    CHECK(contains(dp.summary, "skipped dust below 2 duffs (1)"), "summary lists the dust");
+
+    // Relay mode may sweep too: every input in, a real fee.
+    CollateralRequest rs = req;
+    rs.fee_mode = FeeMode::Relay;
+    rs.fee_rate = kDefaultFeeRate;
+    CollateralPlan rp = plan_collateral(rs);
+    CHECK(rp.selected.size() == 3 && rp.fee >= 1000, "Relay sweep: all inputs, fee paid");
+    CHECK(kCoin + rp.change + rp.fee == rp.total_in, "Relay sweep: value conservation");
+}
+
+static void test_k4_maturity()
+{
+    std::printf("[K4 maturity gate]\n");
+    const std::string spk = spk_hex_of(DUMMY_ADDR0);
+    CollateralRequest req = inject_request(DUMMY_ADDR0);
+    req.utxos = {mk_utxo(txid_of_byte("aa"), 0, 100000000, 100, spk),         // unknown: needs 101
+                 mk_utxo(txid_of_byte("bb"), 0, 60000000, 101, spk),          // exactly mature
+                 mk_utxo(txid_of_byte("cc"), 0, 50000000, 5, spk, false)};    // known non-coinbase
+    CollateralPlan p = plan_collateral(req);
+    CHECK(p.selected.size() == 2 && p.total_in == 110000000, "conf 101 and non-coinbase conf 5 included");
+    CHECK(p.skipped_immature.size() == 1 && p.skipped_immature[0].txid == txid_of_byte("aa"), "conf 100 excluded");
+    CHECK(contains(p.summary, "matures in 1 block"), "summary: matures in 1");
+    CHECK(contains(p.summary, "no follow-up tx"), "summary carries the perpetual-tail note");
+
+    Utxo cb = mk_utxo(txid_of_byte("dd"), 0, 1, 0, spk, true);
+    Utxo unk = mk_utxo(txid_of_byte("dd"), 0, 1, 0, spk);
+    Utxo nc = mk_utxo(txid_of_byte("dd"), 0, 1, 0, spk, false);
+    CHECK(confirmations_needed(cb, 50) == kCoinbaseMaturity && confirmations_needed(cb, 120) == 120,
+          "known coinbase: never below 100");
+    CHECK(confirmations_needed(unk, 50) == kCoinbaseMaturity && confirmations_needed(unk, 120) == 120,
+          "unknown (treated as coinbase): never below 100 either");
+    CHECK(confirmations_needed(nc, 101) == 1, "known non-coinbase: 1");
+
+    // A lowered min_confirmations cannot let a possibly-coinbase UTXO through.
+    CollateralRequest low = inject_request(DUMMY_ADDR0);
+    low.min_confirmations = 6;
+    low.utxos = {mk_utxo(txid_of_byte("e1"), 0, 50000000, 99, spk),           // unknown at 99
+                 mk_utxo(txid_of_byte("e2"), 0, 80000000, 100, spk),          // unknown at 100
+                 mk_utxo(txid_of_byte("e3"), 0, 30000000, 1, spk, false)};    // non-coinbase at 1
+    CollateralPlan lp = plan_collateral(low);
+    CHECK(lp.skipped_immature.size() == 1 && lp.skipped_immature[0].txid == txid_of_byte("e1"),
+          "min_conf 6: unknown at conf 99 excluded");
+    CHECK(lp.selected.size() == 2 && lp.selected[0].txid == txid_of_byte("e2") &&
+              lp.selected[1].txid == txid_of_byte("e3"),
+          "min_conf 6: unknown at conf 100 and known non-coinbase at conf 1 included");
+
+    CollateralRequest none = req;
+    for (Utxo& u : none.utxos) { u.confirmations = 3; u.coinbase = std::nullopt; }
+    CHECK(aborts_with([&] { plan_collateral(none); }, "every UTXO is immature"), "all immature aborts");
+}
+
+static SweepRequest sweep_of(size_t n, int64_t sats)
+{
+    SweepRequest req;
+    req.funding_address = DUMMY_ADDR0;
+    const std::string spk = spk_hex_of(DUMMY_ADDR0);
+    for (size_t i = 0; i < n; ++i) {
+        char id[65];
+        std::snprintf(id, sizeof id, "%064zx", i + 1);
+        req.utxos.push_back(mk_utxo(id, static_cast<uint32_t>(i % 3), sats, 150, spk));
+    }
+    return req;
+}
+
+static void test_k5_batch_split()
+{
+    std::printf("[K5 batch split under the node caps]\n");
+    SweepRequest req = sweep_of(1500, 1000);
+    req.key_encoding = PubkeyEncoding::Compressed;
+    SweepBatchPlan plan = plan_sweep(req);
+    size_t n_in = 0;
+    int64_t v_out = 0;
+    bool caps_ok = true, zero_fee = true;
+    for (const SweepTxPlan& tx : plan.txs) {
+        n_in += tx.inputs.size();
+        v_out += tx.value_out;
+        caps_ok = caps_ok && tx.inputs.size() <= caps::kMaxInjectInputs && tx.inputs.size() <= 670 &&
+                  tx.est_signed_bytes <= caps::kMaxInjectTxBytes;
+        int64_t s = 0;
+        for (const Utxo& u : tx.inputs) s += u.satoshis;
+        zero_fee = zero_fee && s == tx.value_out;
+    }
+    CHECK(plan.txs.size() == 3 && plan.txs[0].inputs.size() == 670 && plan.txs[2].inputs.size() == 160,
+          "1500 compressed inputs split 670 / 670 / 160");
+    CHECK(n_in == 1500 && v_out == 1500000 && plan.total_in == 1500000, "sum inputs 1500, sum value_out 1,500,000");
+    CHECK(caps_ok, "every batch <= 1000 inputs and <= 100000 est. bytes");
+    CHECK(zero_fee, "every batch is zero-fee");
+
+    SweepRequest unk = sweep_of(1500, 1000);
+    CHECK(plan_sweep(unk).txs[0].inputs.size() == 552, "Unknown encoding plans 181 B/input: 552 per batch");
+
+    CollateralRequest coll = inject_request(DUMMY_ADDR0);
+    coll.utxos = req.utxos;
+    CHECK(aborts([&] { plan_collateral(coll); }), "the same set as a collateral aborts");
+    CollateralRequest funded = inject_request(DUMMY_ADDR0);
+    funded.utxos = sweep_of(1500, 100000).utxos;
+    CHECK(aborts_with([&] { plan_collateral(funded); }, "never split"), "a funded 1500-input collateral aborts: never split");
+
+    // Under the input cap but over the size cap: refused at the worst-case
+    // (Unknown => 181 B) estimate, accepted once the key is known to be compressed.
+    CollateralRequest big = inject_request(DUMMY_ADDR0);
+    big.utxos = sweep_of(600, 200000).utxos;
+    CHECK(aborts_with([&] { plan_collateral(big); }, "estimated signed size"), "600 inputs at 181 B: est > 100000 aborts");
+    big.key_encoding = PubkeyEncoding::Compressed;
+    CHECK(!aborts([&] { plan_collateral(big); }), "the same 600 inputs at 149 B fit");
+
+    SweepRequest many = sweep_of(1500, 1000);
+    many.max_inputs_per_tx = 300;
+    SweepBatchPlan mp = plan_sweep(many);
+    CHECK(mp.txs.size() == 5 && contains(mp.summary, "WARNING: 5 txs"), "more than 4 batches is a WARNING, not a refusal");
+    SweepRequest wide = sweep_of(3, 1000);
+    wide.max_inputs_per_tx = caps::kMaxInjectInputs + 1;
+    CHECK(aborts([&] { plan_sweep(wide); }), "max_inputs_per_tx above the node cap aborts");
+    wide.max_inputs_per_tx = caps::kMaxInjectInputs;
+    wide.max_tx_bytes = caps::kMaxInjectTxBytes + 1;
+    CHECK(aborts([&] { plan_sweep(wide); }), "max_tx_bytes above the node cap aborts");
+
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, KeyScanRange{});
+    std::vector<SignedTx> signed_txs = sign_sweep(plan, key, true);
+    bool sizes_ok = signed_txs.size() == 3;
+    for (size_t i = 0; i < signed_txs.size(); ++i)
+        sizes_ok = sizes_ok && signed_txs[i].size <= caps::kMaxInjectTxBytes &&
+                   signed_txs[i].size <= plan.txs[i].est_signed_bytes;
+    CHECK(sizes_ok, "every signed batch <= 100000 B and <= its estimate");
+}
+
+static void test_k6_sign_verify()
+{
+    std::printf("[K6 sweep sign + self-verify]\n");
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, KeyScanRange{});
+    CHECK(key.path == "m/44'/5'/0'/0/0" && key.compressed && key.pub.size() == 33, "XoJA8q... = m/44'/5'/0'/0/0, compressed");
+    SweepRequest req = sweep_of(2, 70000);
+    SweepBatchPlan plan = plan_sweep(req);
+    CHECK(plan.txs.size() == 1 && plan.txs[0].inputs.size() == 2, "a 2-input sweep");
+
+    CHECK(aborts_with([&] { sign_sweep(plan, key, false); }, "not confirmed"), "confirm_spend=false aborts");
+    FoundKey other = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR1, false, KeyScanRange{});
+    CHECK(aborts_with([&] { sign_sweep(plan, other, true); }, "not the funding address"), "a key for another address aborts");
+    other.address = DUMMY_ADDR0; // claims the funding address, but its pubkey hashes elsewhere
+    CHECK(aborts_with([&] { sign_sweep(plan, other, true); }, "does not hash"), "hash160(pub) != funding aborts");
+
+    SweepBatchPlan fee_edit = plan;
+    fee_edit.txs[0].value_out -= 1;
+    CHECK(aborts_with([&] { sign_sweep(fee_edit, key, true); }, "not zero-fee"), "an edited (fee-paying) plan aborts");
+    SweepBatchPlan byte_edit = plan;
+    byte_edit.txs[0].unsigned_tx.back() ^= 0x01;
+    CHECK(aborts_with([&] { sign_sweep(byte_edit, key, true); }, "not the planned one"), "edited plan bytes abort");
+
+    std::vector<SignedTx> st = sign_sweep(plan, key, true);
+    CHECK(st.size() == 1 && st[0].txid.size() == 64 && st[0].size == st[0].hex.size() / 2, "2-input sweep finalizes");
+    CHECK(!aborts([&] { verify_signed_funding_tx(st[0].hex, DUMMY_ADDR0, false); }), "re-verify passes");
+    auto outs = parse_outputs(H(st[0].hex));
+    CHECK(outs.size() == 1 && outs[0].value == 140000 && hexstr(outs[0].script) == spk_hex_of(DUMMY_ADDR0),
+          "one output: everything back to the funding address, fee 0");
+
+    // Flip one byte inside input 0's DER signature: version 4 + nin 1 + outpoint
+    // 36 + script length 1 + push length 1, then 8 bytes into the signature.
+    std::vector<uint8_t> raw = H(st[0].hex);
+    raw[4 + 1 + 36 + 1 + 1 + 8] ^= 0x01;
+    CHECK(aborts_with([&] { verify_signed_funding_tx(hexstr(raw), DUMMY_ADDR0, false); }, "fails verification"),
+          "a flipped signature byte fails verify_input");
+}
+
+static void test_k7_python_parity()
+{
+    std::printf("[K7 python c2wallet.py parity (sign_external_unsigned + sign_sweep)]\n");
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, testvec::kPyParityPassphrase, testvec::kPyParityAddress,
+                                        false, KeyScanRange{});
+    CHECK(key.path == "m/44'/5'/0'/0/0" && key.compressed, "TREZOR key at m/44'/5'/0'/0/0");
+
+    std::vector<SignedTx> st = sign_external_unsigned({testvec::kPyParityUnsignedHex}, testvec::kPyParityAddress,
+                                                      false, key, true);
+    CHECK(st.size() == 1 && st[0].hex == testvec::kPyParitySignedHex, "signed hex == c2wallet.py, byte for byte");
+    CHECK(st.size() == 1 && st[0].txid == testvec::kPyParityTxid, "txid == c2wallet.py");
+
+    // The planner reaches the very same bytes from a UTXO list.
+    SweepRequest req;
+    req.funding_address = testvec::kPyParityAddress;
+    req.preserve_input_order = true;
+    const std::string spk = spk_hex_of(testvec::kPyParityAddress);
+    req.utxos = {mk_utxo(txid_of_byte("11"), 0, 60000, 150, spk), mk_utxo(txid_of_byte("22"), 1, 40000, 150, spk)};
+    SweepBatchPlan plan = plan_sweep(req);
+    CHECK(plan.txs.size() == 1 && hexstr(plan.txs[0].unsigned_tx) == testvec::kPyParityUnsignedHex,
+          "plan_sweep unsigned bytes == the python vector");
+    std::vector<SignedTx> st2 = sign_sweep(plan, key, true);
+    CHECK(st2.size() == 1 && st2[0].hex == testvec::kPyParitySignedHex, "sign_sweep == c2wallet.py too");
+
+    // External-hex refusals (rule 11) — every one before the key is touched.
+    const std::string u = testvec::kPyParityUnsignedHex;
+    CHECK(aborts_with([&] { sign_external_unsigned({testvec::kPyParitySignedHex}, testvec::kPyParityAddress, false, key, true); },
+                      "already carries a scriptSig"), "a scriptSig present aborts");
+    CHECK(aborts_with([&] { sign_external_unsigned({u + "00"}, testvec::kPyParityAddress, false, key, true); },
+                      "trailing"), "trailing bytes abort");
+    CHECK(aborts_with([&] { sign_external_unsigned({"020000000001" + u.substr(10)}, testvec::kPyParityAddress, false, key, true); },
+                      "segwit"), "a segwit marker aborts");
+    CHECK(aborts_with([&] { sign_external_unsigned({"01" + u.substr(2)}, testvec::kPyParityAddress, false, key, true); },
+                      "version 1"), "version 1 aborts");
+    CHECK(aborts_with([&] { sign_external_unsigned({"02000300" + u.substr(8)}, testvec::kPyParityAddress, false, key, true); },
+                      "special tx"), "a special-tx type aborts");
+    CHECK(aborts_with([&] { sign_external_unsigned({"zz"}, testvec::kPyParityAddress, false, key, true); }, "not hex"),
+          "non-hex aborts");
+    CHECK(aborts_with([&] { sign_external_unsigned({u}, testvec::kPyParityAddress, false, key, false); }, "not confirmed"),
+          "confirm_spend=false aborts");
+    // A wrong key AND a bad second blob: the blob is reported, so parsing ran first.
+    FoundKey wrong = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, KeyScanRange{});
+    CHECK(aborts_with([&] { sign_external_unsigned({u, u + "00"}, testvec::kPyParityAddress, false, wrong, true); },
+                      "unsigned tx 2"), "every blob is validated before the key is used");
+    CHECK(aborts_with([&] { sign_external_unsigned({u}, testvec::kPyParityAddress, false, wrong, true); },
+                      "not the funding address"), "a key for another address aborts");
+}
+
+static void test_k8_uncompressed_scan()
+{
+    std::printf("[K8 key scan: uncompressed + accounts]\n");
+    FoundKey k = find_key_for_address(DUMMY_MNEMONIC, "", testvec::kUncompressedAddr001, false, KeyScanRange{});
+    CHECK(k.pub.size() == 65 && !k.compressed, "uncompressed key found (pub65)");
+    CHECK(k.path == "m/44'/5'/0'/0/1 (uncompressed)", "path ends with (uncompressed)");
+    KeyScanRange comp_only;
+    comp_only.try_uncompressed = false;
+    CHECK(aborts([&] { find_key_for_address(DUMMY_MNEMONIC, "", testvec::kUncompressedAddr001, false, comp_only); }),
+          "try_uncompressed=false aborts");
+    CHECK(aborts([&] { find_key_for_address(DUMMY_MNEMONIC, "", testvec::kUncompressedAddr001, false, 0, 5, true); }),
+          "the original 7-arg scan stays compressed-only");
+
+    FoundKey a1 = find_key_for_address(DUMMY_MNEMONIC, "", testvec::kAccount1Addr000, false, KeyScanRange{});
+    CHECK(a1.path == "m/44'/5'/1'/0/0" && a1.compressed, "accounts=2 finds m/44'/5'/1'/0/0");
+    KeyScanRange one;
+    one.accounts = 1;
+    CHECK(aborts([&] { find_key_for_address(DUMMY_MNEMONIC, "", testvec::kAccount1Addr000, false, one); }),
+          "accounts=1 does not reach account 1");
+    KeyScanRange empty;
+    empty.indices = 0;
+    CHECK(aborts([&] { find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, empty); }), "an empty range aborts");
+
+    // An uncompressed key signs and verifies; the estimate covers it.
+    SweepRequest req;
+    req.funding_address = testvec::kUncompressedAddr001;
+    req.key_encoding = PubkeyEncoding::Uncompressed;
+    req.utxos = {mk_utxo(txid_of_byte("33"), 0, 50000, 150, spk_hex_of(testvec::kUncompressedAddr001))};
+    SweepBatchPlan plan = plan_sweep(req);
+    std::vector<SignedTx> st = sign_sweep(plan, k, true);
+    CHECK(st.size() == 1 && st[0].size <= plan.txs[0].est_signed_bytes, "uncompressed sweep signs within its estimate");
+    CHECK(!aborts([&] { verify_signed_funding_tx(st[0].hex, testvec::kUncompressedAddr001, false); }),
+          "uncompressed sweep re-verifies");
+
+    // A plan sized for a compressed key, signed with the uncompressed one: the
+    // first batch (670 inputs) signs to > 100000 B and is refused, nothing emitted.
+    SweepRequest wrong_enc;
+    wrong_enc.funding_address = testvec::kUncompressedAddr001;
+    wrong_enc.key_encoding = PubkeyEncoding::Compressed;
+    const std::string uspk = spk_hex_of(testvec::kUncompressedAddr001);
+    for (const Utxo& u : sweep_of(700, 1000).utxos)
+        wrong_enc.utxos.push_back(mk_utxo(u.txid, u.vout, u.satoshis, u.confirmations, uspk));
+    SweepBatchPlan wp = plan_sweep(wrong_enc);
+    CHECK(wp.txs.size() == 2 && wp.txs[0].inputs.size() == 670, "planned as 670 + 30 compressed inputs");
+    CHECK(aborts_with([&] { sign_sweep(wp, k, true); }, "oversize"), "signed size over the cap is refused after signing");
+}
+
+static void test_k9_emit_format()
+{
+    std::printf("[K9 inject file format == SignedContainer]\n");
+    SignedTx a, b;
+    a.hex = testvec::kPyParitySignedHex;
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, KeyScanRange{});
+    b = sign_sweep(plan_sweep(sweep_of(2, 70000)), key, true).at(0);
+    const std::string file = emit_inject_file({a, b});
+    CHECK(file == a.hex + "\n" + b.hex + "\n", "emit(2) == h1\\nh2\\n");
+    c2w::artifact::SignedContainer sc;
+    sc.tx_hexes = {a.hex, b.hex};
+    CHECK(sc.emit() == file, "== SignedContainer::emit");
+    std::string err;
+    auto parsed = c2w::artifact::SignedContainer::parse(file, err);
+    CHECK(parsed && parsed->tx_hexes == sc.tx_hexes, "round-trips through SignedContainer::parse");
+    std::string why;
+    CHECK(c2w::artifact::accept_as_signed(H(a.hex), why) && c2w::artifact::accept_as_signed(H(b.hex), why),
+          "accept_as_signed true for every line");
+    CHECK(!c2w::artifact::accept_as_signed(H(testvec::kPyParityUnsignedHex), why), "accept_as_signed false for unsigned bytes");
+    CHECK(emit_inject_file({b}) == b.hex + "\n", "a single tx is exactly one line");
+    CHECK(aborts([&] { emit_inject_file({}); }), "an empty list aborts");
+    SignedTx upper = a;
+    upper.hex[0] = 'A';
+    upper.hex[1] = 'B';
+    CHECK(aborts([&] { emit_inject_file({upper}); }), "non-lowercase hex aborts");
+}
+
+static void test_k10_bip68()
+{
+    std::printf("[K10 BIP68: every input needs sequence bit 31]\n");
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, testvec::kPyParityPassphrase, testvec::kPyParityAddress,
+                                        false, KeyScanRange{});
+    // input 0 sequence sits at 4 + 1 + 36 + 1 = byte 42 of the unsigned tx.
+    std::vector<uint8_t> raw = H(testvec::kPyParityUnsignedHex);
+    raw[42] = 0xff; raw[43] = 0xff; raw[44] = 0xff; raw[45] = 0x7f; // 0x7fffffff
+    CHECK(aborts_with([&] { sign_external_unsigned({hexstr(raw)}, testvec::kPyParityAddress, false, key, true); },
+                      "BIP68"), "sequence 0x7fffffff aborts");
+    raw[42] = 0xfe; raw[45] = 0xff;                                    // 0xfffffffe: bit 31 set
+    std::vector<SignedTx> st;
+    CHECK(!aborts([&] { st = sign_external_unsigned({hexstr(raw)}, testvec::kPyParityAddress, false, key, true); }) &&
+              st.size() == 1,
+          "sequence 0xfffffffe (bit 31 set) signs");
+    // Every tx this library builds uses the final sequence (the python vector's).
+    SweepRequest r;
+    r.funding_address = testvec::kPyParityAddress;
+    r.preserve_input_order = true;
+    const std::string spk = spk_hex_of(testvec::kPyParityAddress);
+    r.utxos.push_back(mk_utxo(txid_of_byte("11"), 0, 1, 150, spk));
+    r.utxos.push_back(mk_utxo(txid_of_byte("22"), 1, 99999, 150, spk));
+    CHECK(plan_sweep(r).txs.at(0).unsigned_tx == H(testvec::kPyParityUnsignedHex), "built inputs carry sequence ffffffff");
+}
+
+static void test_k12_refusals()
+{
+    std::printf("[K12 scriptPubKey + hash refusals]\n");
+    CollateralRequest foreign = k1_request();
+    foreign.utxos[3].script_pubkey_hex = "76a914" + std::string(40, '1') + "88ac";
+    CHECK(aborts_with([&] { plan_collateral(foreign); }, "does NOT pay"), "inject: foreign scriptPubKey aborts");
+    CollateralRequest missing = k1_request();
+    missing.utxos[5].script_pubkey_hex.clear();
+    CHECK(aborts_with([&] { plan_collateral(missing); }, "has no scriptPubKey"), "inject: missing scriptPubKey aborts");
+    CollateralRequest relay_missing = make_request(DUMMY_ADDR0);
+    relay_missing.utxos[0].script_pubkey_hex.clear();
+    CHECK(!aborts([&] { plan_collateral(relay_missing); }), "Relay keeps the optional scriptPubKey");
+    relay_missing.sweep_all = true;
+    CHECK(aborts_with([&] { plan_collateral(relay_missing); }, "has no scriptPubKey"),
+          "Relay sweep_all: missing scriptPubKey aborts");
+    CollateralRequest dup = k1_request();
+    dup.utxos.push_back(dup.utxos[0]);
+    CHECK(aborts_with([&] { plan_collateral(dup); }, "listed twice"), "inject: a duplicate outpoint aborts");
+    CollateralRequest relay_dup = make_request(DUMMY_ADDR0);
+    relay_dup.utxos.push_back(relay_dup.utxos[0]);
+    CHECK(aborts_with([&] { plan_collateral(relay_dup); }, "listed twice"),
+          "Relay select_coins: a duplicate outpoint aborts too");
+    CollateralRequest relay_dup_case = make_request(DUMMY_ADDR0);
+    relay_dup_case.utxos.push_back(relay_dup_case.utxos[0]);
+    relay_dup_case.utxos.back().txid = std::string(64, 'A'); // same outpoint, other hex case
+    CHECK(aborts_with([&] { plan_collateral(relay_dup_case); }, "listed twice"),
+          "a duplicate outpoint differing only in hex case aborts");
+
+    SweepRequest sw = sweep_of(3, 1000);
+    sw.utxos[1].script_pubkey_hex = spk_hex_of(DUMMY_ADDR1);
+    CHECK(aborts_with([&] { plan_sweep(sw); }, "does NOT pay"), "sweep: foreign scriptPubKey aborts");
+    sw.utxos[1].script_pubkey_hex.clear();
+    CHECK(aborts_with([&] { plan_sweep(sw); }, "has no scriptPubKey"), "sweep: missing scriptPubKey aborts");
+
+    CollateralRequest exp = k1_request();
+    exp.expected_hash_display = std::string(64, '0');
+    CHECK(aborts_with([&] { plan_collateral(exp); }, "WRONG object"), "expected-hash vs direct hash mismatch aborts");
+    exp.expected_hash_display = "FA758340F1BD2391D17BB43667F76C5D9070D737B68E018E42ED75B09C6BA631";
+    CHECK(!aborts([&] { plan_collateral(exp); }), "expected-hash equal to the direct hash passes");
+
+    // Direct hash + the object fields: the derived hash must equal it.
+    const auto& v0 = testvec::kMainnetGovVectors[0];
+    CollateralRequest both = k1_request();
+    both.time_ = v0.time_;
+    both.data_hex = v0.data_hex;
+    CHECK(aborts_with([&] { plan_collateral(both); }, "WRONG object"), "direct hash != derived-from-data aborts");
+    both.gov_hash_display = v0.expected_display;
+    CollateralPlan bp = plan_collateral(both);
+    CHECK(bp.gov_hash_display == v0.expected_display && hexstr(bp.op_return_script) == testvec::kVector0OpReturnScript,
+          "direct hash == derived-from-data passes, OP_RETURN as on chain");
+
+    CollateralRequest bad = k1_request();
+    bad.gov_hash_display = std::string(63, 'a');
+    CHECK(aborts_with([&] { plan_collateral(bad); }, "64 hex"), "a direct hash that is not 64 hex aborts");
+    CollateralRequest under = inject_request(DUMMY_ADDR0);
+    under.utxos = {mk_utxo(txid_of_byte("44"), 0, 99999999, 150, spk_hex_of(DUMMY_ADDR0))};
+    CHECK(aborts_with([&] { plan_collateral(under); }, "short 0.00000001 DASH"), "inject: < 1 DASH aborts with the shortfall");
+}
+
+static void test_k13_display_roundtrip()
+{
+    std::printf("[K13 gov_hash_from_display round trip]\n");
+    bool all = true;
+    for (int i = 0; i < testvec::kNumGovVectors; ++i) {
+        const auto& v = testvec::kMainnetGovVectors[i];
+        auto internal = gov_object_hash(std::string(64, '0'), 1, v.time_, v.data_hex);
+        all = all && gov_hash_from_display(gov_hash_display(internal)) == internal &&
+              gov_hash_display(gov_hash_from_display(v.expected_display)) == v.expected_display;
+    }
+    CHECK(all, "display -> internal -> display is the identity on every mainnet vector");
+    CHECK(hexstr(collateral_op_return_script(gov_hash_from_display(testvec::kOnchainGovHash))) == testvec::kOnchainOpReturn,
+          "6a20 + reversed(display) == the on-chain OP_RETURN");
+    CHECK(gov_hash_from_display("FA758340F1BD2391D17BB43667F76C5D9070D737B68E018E42ED75B09C6BA631") ==
+              gov_hash_from_display(testvec::kOnchainGovHash),
+          "upper-case display accepted");
+    CHECK(aborts([&] { gov_hash_from_display(std::string(62, 'a')); }), "short hash aborts");
+    CHECK(aborts([&] { gov_hash_from_display(std::string(64, 'g')); }), "non-hex hash aborts");
+    CHECK(aborts([&] { gov_hash_from_display(" " + std::string(testvec::kOnchainGovHash)); }), "padded hash aborts");
+}
+
+static void test_utxo_intake()
+{
+    std::printf("[UtxoIntake: insight JSON]\n");
+    // Three entries of the XdgF insight list (public data), plus a key order shuffle.
+    const std::string json = R"([
+      {"address":"XdgF55wEHBRWwbuBniNYH4GvvaoYMgL84u","txid":"8333b0ddadb460a06e0fb18977164ff17d0f0288422504b388f6770f1bd7184f",
+       "vout":3,"scriptPubKey":"76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac","amount":1e-08,"satoshis":1,
+       "height":2560084,"confirmations":26},
+      {"txid":"665710F4833E0D3B4C2CE93B971E5FE04315FE244D3C53C926DB511A8DDE1B9B","vout":7,"amount":0.0003649,
+       "satoshis":36490,"scriptPubKey":"76A91420CB5C22B1E4D5947E5C112C7696B51AD9AF3C6188AC","confirmations":32607},
+      {"txid":"a43bce9f9f8c34fe30b3873322c0b7592fd329507da1642232cef14f875ce9fb","vout":7,"satoshis":2500000000,
+       "scriptPubKey":"76a91420cb5c22b1e4d5947e5c112c7696b51ad9af3c6188ac"}
+    ])";
+    std::string err;
+    std::vector<Utxo> u = parse_insight_utxos(json, err);
+    CHECK(err.empty() && u.size() == 3, "three UTXOs parsed");
+    CHECK(u.size() == 3 && u[0].vout == 3 && u[0].satoshis == 1 && u[0].confirmations == 26, "integer fields");
+    CHECK(u.size() == 3 && u[1].txid == "665710f4833e0d3b4c2ce93b971e5fe04315fe244d3c53c926db511a8dde1b9b" &&
+              u[1].script_pubkey_hex == testvec::kDonationSpk && u[1].satoshis == 36490,
+          "hex lower-cased; satoshis taken, amount ignored");
+    CHECK(u.size() == 3 && u[2].confirmations == 0 && u[2].satoshis == 2500000000LL, "missing confirmations reads 0");
+    CHECK(u.size() == 3 && !u[0].coinbase.has_value() && !u[2].coinbase.has_value(), "no coinbase flag: unknown");
+
+    UtxoScreen scr = screen_utxos(u, addr_to_h160(testvec::kDonationAddress, false), kDefaultMinConf, 2, true);
+    CHECK(scr.spendable.size() == 1 && scr.dust.size() == 1 && scr.immature.size() == 1, "screen: 1 spendable, 1 dust, 1 immature");
+
+    CHECK(parse_insight_utxos(R"({"txid":"x"})", err).empty() && !err.empty(), "a non-array aborts");
+    CHECK(parse_insight_utxos(R"([{"txid":"8333","vout":0,"satoshis":1}])", err).empty() && !err.empty(), "a short txid aborts");
+    CHECK(parse_insight_utxos(R"([{"txid":")" + txid_of_byte("ab") + R"(","vout":0,"satoshis":1.5}])", err).empty() &&
+              !err.empty(), "fractional satoshis abort");
+    CHECK(parse_insight_utxos(R"([{"txid":")" + txid_of_byte("ab") + R"(","vout":0,"amount":0.1}])", err).empty() &&
+              !err.empty(), "amount without satoshis aborts");
+    CHECK(parse_insight_utxos(R"([{"txid":")" + txid_of_byte("ab") + R"(","vout":-1,"satoshis":1}])", err).empty() &&
+              !err.empty(), "a negative vout aborts");
+    CHECK(parse_insight_utxos("[1,", err).empty() && !err.empty(), "broken JSON aborts");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Slice 2 — PageDashInject's std-only model (DashInjectModel), the intake
+// formats an operator actually produces, the target-height re-screen, the
+// relay fee mode and the manifest. KATs S2-K1..K12 of the slice-2 design.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef C2W_DASH_FIXTURE_DIR
+#error "C2W_DASH_FIXTURE_DIR must point at tests/fixtures"
+#endif
+
+// The real XdgF UTXO set (dashd getaddressutxos on the tertiary at tip 2563986;
+// public data): 170 rows, 60963705 duffs, 42 of them 1-duff spam.
+static const char* kFixtureName = "xdgf-getaddressutxos-tip2563986.json";
+static const int64_t kFixtureTip = 2563986;
+
+static std::string read_file(const std::string& path)
+{
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+static std::string read_fixture(const char* name) { return read_file(std::string(C2W_DASH_FIXTURE_DIR) + "/" + name); }
+
+// Run `fn`, reporting a DashAbort as a failed check instead of ending the suite.
+template <typename F>
+static bool runs(F&& fn, const char* what)
+{
+    try { fn(); return true; }
+    catch (const DashAbort& e) { std::printf("    (%s aborted: %s)\n", what, e.what()); return false; }
+    catch (const std::exception& e) { std::printf("    (%s threw: %s)\n", what, e.what()); return false; }
+}
+
+static void test_s2_k2_getaddressutxos_fixture()
+{
+    std::printf("[S2-K2 dashd getaddressutxos intake on the real 170-row fixture]\n");
+    const std::string json = read_fixture(kFixtureName);
+    CHECK(json.size() > 40000, "fixture readable");
+
+    UtxoImport imp;
+    const bool parsed = runs([&] { imp = parse_utxo_json(json, kFixtureTip, false); }, "parse_utxo_json");
+    CHECK(parsed, "the dashd getaddressutxos shape parses");
+    CHECK(imp.source == UtxoSource::GetAddressUtxos, "auto-detected as getaddressutxos");
+    CHECK(imp.utxos.size() == 170, "170 rows");
+    CHECK(imp.total == 60963705, "sum 60963705 duffs");
+    CHECK(imp.address == testvec::kDonationAddress, "funding address derived from the scripts: XdgF...");
+    CHECK(imp.tip_height == kFixtureTip && !imp.coinbase_flags, "tip 2563986, no coinbase flags");
+    bool unknown_cb = true, conf_ok = true, spk_ok = true;
+    int64_t hmin = INT64_MAX, hmax = 0;
+    for (const Utxo& u : imp.utxos) {
+        unknown_cb = unknown_cb && !u.coinbase.has_value();
+        conf_ok = conf_ok && u.confirmations == kFixtureTip - u.height + 1;
+        spk_ok = spk_ok && u.script_pubkey_hex == testvec::kDonationSpk;
+        hmin = std::min(hmin, u.height);
+        hmax = std::max(hmax, u.height);
+    }
+    CHECK(unknown_cb, "every row: coinbase unknown (held to the coinbase rule)");
+    CHECK(conf_ok, "every row: confirmations = tip - height + 1");
+    CHECK(spk_ok, "every row: script = the XdgF P2PKH");
+    CHECK(hmin == 2527503 && hmax == 2563881, "heights 2527503 .. 2563881");
+    CHECK(!imp.utxos.empty() && imp.utxos[0].txid == "665710f4833e0d3b4c2ce93b971e5fe04315fe244d3c53c926db511a8dde1b9b" &&
+              imp.utxos[0].vout == 7 && imp.utxos[0].satoshis == 36490 && imp.utxos[0].confirmations == 36484,
+          "row 0: 665710f4...:7, 36490 duffs, 36484 conf (outputIndex -> vout)");
+
+    UtxoImport direct;
+    CHECK(runs([&] { direct = parse_getaddressutxos(json, kFixtureTip, false); }, "parse_getaddressutxos") &&
+              direct.utxos.size() == 170 && direct.total == imp.total,
+          "parse_getaddressutxos == the auto-detected import");
+
+    // The slice-1 insight parser alone cannot read this shape (why slice 2 adds it).
+    std::string err;
+    CHECK(parse_insight_utxos(json, err).empty() && contains(err, "vout"),
+          "parse_insight_utxos still refuses the dashd shape (no vout field)");
+
+    if (imp.utxos.size() == 170) {
+        UtxoScreen scr = screen_utxos(imp.utxos, addr_to_h160(testvec::kDonationAddress, false), kDefaultMinConf, 2, true);
+        CHECK(scr.spendable.size() == 128 && scr.immature.empty() && scr.dust.size() == 42,
+              "screen at the tip, dust_floor 2: 128 spendable / 0 immature / 42 dust");
+        SweepRequest sw;
+        sw.funding_address = testvec::kDonationAddress;
+        sw.utxos = imp.utxos;
+        sw.dust_floor = 2;
+        sw.key_encoding = PubkeyEncoding::Compressed;
+        SweepBatchPlan sp;
+        CHECK(runs([&] { sp = plan_sweep(sw); }, "plan_sweep") && sp.txs.size() == 1 &&
+                  sp.txs[0].inputs.size() == 128 && sp.txs[0].est_signed_bytes <= 19116 &&
+                  sp.total_in == 60963663,
+              "plan: one tx, 128 inputs, 60963663 duffs, est signed <= 19116 B");
+    }
+
+    // Refusals.
+    CHECK(aborts([&] { parse_getaddressutxos(json, 0, false); }), "bare array without a tip aborts");
+    CHECK(aborts_with([&] { parse_getaddressutxos(json, 2563880, false); }, "above the tip"),
+          "a tip below the youngest row (2563881) aborts");
+    CHECK(aborts([&] { parse_getaddressutxos(json, kFixtureTip, true); }), "testnet page, mainnet address aborts");
+    std::string foreign = json;
+    const size_t at = foreign.find(testvec::kDonationSpk, foreign.find(testvec::kDonationSpk) + 1);
+    foreign.replace(at, std::strlen(testvec::kDonationSpk), spk_hex_of(DUMMY_ADDR0));
+    CHECK(aborts_with([&] { parse_getaddressutxos(foreign, kFixtureTip, false); }, "pays"),
+          "a row paying another script aborts");
+    std::string dup = json;
+    const size_t open = dup.find('{'), close = dup.find('}');
+    dup.insert(dup.find('[') + 1, dup.substr(open, close - open + 1) + ",");
+    CHECK(aborts_with([&] { parse_getaddressutxos(dup, kFixtureTip, false); }, "listed twice"),
+          "a duplicated row aborts");
+
+    // The chainInfo object form carries its own tip.
+    const std::string chain_info = "{\"utxos\":" + json + ",\"hash\":\"" + std::string(64, 'c') +
+                                   "\",\"height\":2563986}";
+    UtxoImport ci;
+    CHECK(runs([&] { ci = parse_utxo_json(chain_info, 0, false); }, "chainInfo") && ci.utxos.size() == 170 &&
+              ci.tip_height == kFixtureTip && ci.source == UtxoSource::GetAddressUtxos,
+          "chainInfo form {utxos, hash, height}: tip taken from the object");
+    CHECK(aborts([&] { parse_utxo_json(chain_info, kFixtureTip + 1, false); }),
+          "chainInfo form with a different typed tip aborts");
+}
+
+// ── slice-2 helpers ─────────────────────────────────────────────────────────
+
+struct Row {
+    std::string txid;
+    uint32_t vout;
+    int64_t sats;
+    int64_t height;
+    std::optional<bool> coinbase;
+};
+
+static std::vector<Row> fixture_rows()
+{
+    std::vector<Row> rows;
+    for (const Utxo& u : parse_getaddressutxos(read_fixture(kFixtureName), kFixtureTip, false).utxos)
+        rows.push_back({u.txid, u.vout, u.satoshis, u.height, std::nullopt});
+    return rows;
+}
+
+// The fixture with the XdgF address and script swapped for a TEST address, so a
+// test key can sign the real 170-row shape. Txids, vouts, amounts and heights
+// stay the real ones.
+static std::string fixture_for(const char* addr)
+{
+    std::string j = read_fixture(kFixtureName);
+    const std::string from_a = testvec::kDonationAddress, from_s = testvec::kDonationSpk;
+    const std::string to_a = addr, to_s = spk_hex_of(addr);
+    for (size_t at = j.find(from_a); at != std::string::npos; at = j.find(from_a, at + to_a.size()))
+        j.replace(at, from_a.size(), to_a);
+    for (size_t at = j.find(from_s); at != std::string::npos; at = j.find(from_s, at + to_s.size()))
+        j.replace(at, from_s.size(), to_s);
+    return j;
+}
+
+static std::string gau_json(const char* addr, const std::vector<Row>& rows)
+{
+    std::string j = "[";
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const Row& r = rows[i];
+        j += std::string(i ? "," : "") + "{\"address\":\"" + addr + "\",\"txid\":\"" + r.txid +
+             "\",\"outputIndex\":" + std::to_string(r.vout) + ",\"script\":\"" + spk_hex_of(addr) +
+             "\",\"satoshis\":" + std::to_string(r.sats) + ",\"height\":" + std::to_string(r.height) + "}";
+    }
+    return j + "]";
+}
+
+// The export v1 shape tools/export_utxos.py writes.
+static std::string export_v1_json(const char* addr, int64_t tip, const std::vector<Row>& rows,
+                                  const char* schema = kUtxoExportSchema, const char* coin = "dash",
+                                  const char* network = "mainnet")
+{
+    std::string j = std::string("{\"schema\":\"") + schema + "\",\"coin\":\"" + coin + "\",\"network\":\"" +
+                    network + "\",\"address\":\"" + addr + "\",\"tip_height\":" + std::to_string(tip) +
+                    ",\"tip_hash\":\"" + std::string(64, 'b') + "\",\"utxos\":[";
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const Row& r = rows[i];
+        j += std::string(i ? "," : "") + "{\"txid\":\"" + r.txid + "\",\"vout\":" + std::to_string(r.vout) +
+             ",\"satoshis\":" + std::to_string(r.sats) + ",\"height\":" + std::to_string(r.height) +
+             ",\"confirmations\":" + std::to_string(tip - r.height + 1) +
+             (r.coinbase.has_value() ? std::string(",\"coinbase\":") + (*r.coinbase ? "true" : "false") : "") +
+             ",\"scriptPubKey\":\"" + spk_hex_of(addr) + "\"}";
+    }
+    return j + "]}";
+}
+
+static KeyInput key_of(KeySource src, const std::string& secret, const std::string& pass = {})
+{
+    KeyInput k;
+    k.source = src;
+    k.secret = secret;
+    k.passphrase = pass;
+    return k;
+}
+
+// The K7 funding set through the model: two synthetic UTXOs of the TREZOR key
+// (11..:0 60000, 22..:1 40000), consolidated to itself, zero fee. The plan's
+// unsigned bytes are kPyParityUnsignedHex.
+static std::string k7_json()
+{
+    return gau_json(testvec::kPyParityAddress, {{txid_of_byte("11"), 0, 60000, 100, std::nullopt},
+                                                {txid_of_byte("22"), 1, 40000, 200, std::nullopt}});
+}
+
+static bool drive_planned(DashInjectModel& m, const std::string& json, int64_t tip, const ScreenParams& sp,
+                          const PlanParams& pp)
+{
+    return runs([&] {
+        m.import_utxos(json, tip);
+        m.rescreen(sp);
+        m.plan(pp);
+    }, "drive to Planned");
+}
+
+static bool sign_with(DashInjectModel& m, const KeyInput& k, bool burn = false)
+{
+    return runs([&] {
+        m.load_key(k);
+        m.set_gate(true, burn, kSpendWord);
+        m.sign();
+    }, "load_key + sign");
+}
+
+static std::vector<std::string> card_texts(const DashInjectModel& m)
+{
+    return {m.import_card(), m.screen_card(), m.plan_summary(), m.key_card(), m.sign_card(),
+            m.manifest_json(), m.inject_file()};
+}
+
+namespace mj = c2w::hdkeys::mjson;
+
+static const mj::JVal* jpath(const mj::JVal& root, std::initializer_list<const char*> keys)
+{
+    const mj::JVal* v = &root;
+    for (const char* k : keys) {
+        if (!v) return nullptr;
+        v = v->find(k);
+    }
+    return v;
+}
+static int64_t jint(const mj::JVal* v) { return v && v->t == mj::JVal::T::Num ? static_cast<int64_t>(v->num) : -1; }
+static std::string jstr(const mj::JVal* v) { return v && v->is_str() ? v->str : std::string("<missing>"); }
+
+// ── S2-K1 export v1 ─────────────────────────────────────────────────────────
+
+static void test_s2_k1_export_v1()
+{
+    std::printf("[S2-K1 export v1 intake (tools/export_utxos.py shape)]\n");
+    std::vector<Row> rows = fixture_rows();
+    CHECK(rows.size() == 170, "fixture rows");
+    size_t n_false = 0;
+    for (Row& r : rows) {
+        r.coinbase = r.vout != 1; // the exporter's gettxout flags; the one vout-1 row is non-coinbase here
+        n_false += r.vout == 1;
+    }
+    const std::string good = export_v1_json(testvec::kDonationAddress, kFixtureTip, rows);
+    UtxoImport imp;
+    CHECK(runs([&] { imp = parse_utxo_json(good, 0, false); }, "export v1") && imp.source == UtxoSource::ExportV1,
+          "auto-detected as export v1");
+    CHECK(imp.utxos.size() == 170 && imp.total == 60963705 && imp.tip_height == kFixtureTip &&
+              imp.tip_hash == std::string(64, 'b') && imp.address == testvec::kDonationAddress,
+          "170 rows, 60963705 duffs, tip + hash, address");
+    size_t got_false = 0;
+    bool flags_known = true;
+    for (const Utxo& u : imp.utxos) {
+        flags_known = flags_known && u.coinbase.has_value();
+        got_false += u.coinbase.has_value() && !*u.coinbase;
+    }
+    CHECK(imp.coinbase_flags && flags_known && got_false == n_false && n_false == 1, "coinbase flags taken as given");
+
+    auto refuses = [&](const std::string& json, const char* needle, const char* what) {
+        CHECK(aborts_with([&] { parse_utxo_export_v1(json, false); }, needle), what);
+    };
+    refuses(export_v1_json(testvec::kDonationAddress, kFixtureTip, rows, "c2wallet-utxo-export/2"), "schema",
+            "another schema aborts");
+    refuses(export_v1_json(testvec::kDonationAddress, kFixtureTip, rows, kUtxoExportSchema, "btc"), "coin",
+            "coin != dash aborts");
+    refuses(export_v1_json(testvec::kDonationAddress, kFixtureTip, rows, kUtxoExportSchema, "dash", "testnet"),
+            "network", "network mismatch aborts");
+    std::string stated = export_v1_json(DUMMY_ADDR0, kFixtureTip, {{txid_of_byte("aa"), 0, 5000, 100, true}});
+    const std::string addr_field = std::string("\"address\":\"") + DUMMY_ADDR0 + "\"";
+    stated.replace(stated.find(addr_field), addr_field.size(), std::string("\"address\":\"") + DUMMY_ADDR1 + "\"");
+    refuses(stated, "not the address the scripts pay", "stated address != the scripts' address aborts");
+    refuses(export_v1_json(testvec::kDonationAddress, 0, {}), "tip_height", "tip_height 0 aborts");
+    std::string mixed = good;
+    const std::string c36484 = "\"confirmations\":36484";
+    mixed.replace(mixed.find(c36484), c36484.size(), "\"confirmations\":36485");
+    refuses(mixed, "two different tips", "confirmations != tip - height + 1 aborts (two tips mixed)");
+    CHECK(aborts_with([&] { parse_utxo_json(good, kFixtureTip, false); }, "own tip"),
+          "a typed tip with an export v1 aborts");
+
+    // A row without a coinbase flag is treated as coinbase, and the flags are no longer complete.
+    std::vector<Row> partial = rows;
+    partial[0].coinbase = std::nullopt;
+    UtxoImport pi = parse_utxo_export_v1(export_v1_json(testvec::kDonationAddress, kFixtureTip, partial), false);
+    CHECK(!pi.coinbase_flags && pi.utxos[0].coinbase == std::optional<bool>(true), "absent flag => coinbase");
+}
+
+// ── S2-K3 target-height re-screen ───────────────────────────────────────────
+
+static void test_s2_k3_rescreen()
+{
+    std::printf("[S2-K3 maturity at a target landing height]\n");
+    const auto h160 = addr_to_h160(DUMMY_ADDR0, false);
+    const std::string spk = spk_hex_of(DUMMY_ADDR0);
+    const int64_t tip = 2563900;
+    Utxo young = mk_utxo(txid_of_byte("a1"), 0, 50000, tip - 2563881 + 1, spk);
+    young.height = 2563881;
+
+    // Consensus floor (min_conf 100): spendable from h + 100.
+    TargetScreen at = rescreen_at_height({young}, h160, tip, 2563981, 100, 0, true);
+    CHECK(at.screen.spendable.size() == 1 && at.screen.immature.empty(), "h=2563881 spendable at H=2563981 (min_conf 100)");
+    TargetScreen before = rescreen_at_height({young}, h160, tip, 2563980, 100, 0, true);
+    CHECK(before.screen.immature.size() == 1 && matures_in(young, tip, 2563980, 100) == 1,
+          "H=2563980: immature, matures in 1");
+    CHECK(contains(describe_skipped(before.screen, 100, 0), "matures in 1 block"), "summary: matures in 1 block");
+    // The default min_conf 101 keeps one block of slack.
+    CHECK(rescreen_at_height({young}, h160, tip, 2563981, kDefaultMinConf, 0, true).screen.immature.size() == 1 &&
+              rescreen_at_height({young}, h160, tip, 2563982, kDefaultMinConf, 0, true).screen.spendable.size() == 1,
+          "min_conf 101: immature at 2563981, spendable at 2563982");
+    CHECK(at.safe_from_height == 2563981 && at.youngest_height == 2563881, "safe_from = max(h) + 100 = 2563981");
+
+    // Height unknown but the tip known: the same projection from confirmations.
+    Utxo no_h = young;
+    no_h.height = 0;
+    CHECK(confirmations_at(no_h, tip, 2563981) == confirmations_at(young, tip, 2563981) &&
+              confirmations_at(young, tip, 2563981) == 100,
+          "conf_at(H) = H - h, equal with or without the height (tip known)");
+    CHECK(effective_height(no_h, tip) == 2563881, "effective height = tip - conf + 1");
+    Utxo unconf = mk_utxo(txid_of_byte("a2"), 0, 50000, 0, spk);
+    CHECK(confirmations_at(unconf, tip, tip + 500) == 0, "an unconfirmed row is never projected");
+
+    // The immature list comes ordered by height.
+    Utxo b = young, c = young;
+    b.txid = txid_of_byte("b2"); b.height = 2563890; b.confirmations = tip - b.height + 1;
+    c.txid = txid_of_byte("c3"); c.height = 2563885; c.confirmations = tip - c.height + 1;
+    TargetScreen ord = rescreen_at_height({b, young, c}, h160, tip, tip + 2, kDefaultMinConf, 0, true);
+    CHECK(ord.screen.immature.size() == 3 && ord.screen.immature[0].height == 2563881 &&
+              ord.screen.immature[1].height == 2563885 && ord.screen.immature[2].height == 2563890,
+          "immature ordered by height");
+
+    // A known non-coinbase input needs one block.
+    Utxo nc = mk_utxo(txid_of_byte("d4"), 0, 50000, 1, spk, false);
+    nc.height = tip;
+    TargetScreen ncs = rescreen_at_height({young, nc}, h160, tip, 2563982, kDefaultMinConf, 0, true);
+    CHECK(ncs.screen.spendable.size() == 2 && ncs.safe_from_height == 2563981,
+          "known non-coinbase at the tip: spendable next block; safe_from stays max(h+100, h_nc+1)");
+
+    CHECK(aborts_with([&] { rescreen_at_height({young}, h160, tip, tip, 100, 0, true); }, "not above"),
+          "target <= tip aborts");
+
+    // The real fixture at the default target (tip + 2).
+    UtxoImport imp = parse_getaddressutxos(read_fixture(kFixtureName), kFixtureTip, false);
+    TargetScreen fx = rescreen_at_height(imp.utxos, addr_to_h160(testvec::kDonationAddress, false), kFixtureTip,
+                                         kFixtureTip + 2, kDefaultMinConf, 2, true);
+    CHECK(fx.screen.spendable.size() == 128 && fx.screen.immature.empty() && fx.screen.dust.size() == 42,
+          "fixture at tip+2: 128 / 0 / 42");
+    CHECK(fx.safe_from_height == 2563981 && fx.youngest_height == 2563881, "fixture: safe_from 2563981, youngest 2563881");
+}
+
+// ── S2-K4 state machine ─────────────────────────────────────────────────────
+
+static void test_s2_k4_state_machine()
+{
+    std::printf("[S2-K4 model state machine: no skipped stage, invalidation, the literal gate]\n");
+    DashInjectModel m;
+    const KeyInput wif = key_of(KeySource::Wif, testvec::kK7Wif);
+    CHECK(m.stage() == InjectStage::Empty && !m.armed(), "starts Empty, not armed");
+    CHECK(aborts_with([&] { m.rescreen({}); }, "no stage can be skipped"), "screen before import aborts");
+    CHECK(aborts_with([&] { m.plan({}); }, "no stage can be skipped"), "plan before screen aborts");
+    CHECK(aborts_with([&] { m.load_key(wif); }, "no stage can be skipped"), "key before plan aborts");
+    CHECK(aborts_with([&] { m.sign(); }, "no stage can be skipped"), "sign before key aborts");
+
+    m.import_utxos(k7_json(), 1000);
+    CHECK(m.stage() == InjectStage::Imported, "Imported");
+    CHECK(aborts([&] { m.plan({}); }), "plan before screen aborts (after import)");
+    m.rescreen({});
+    CHECK(m.stage() == InjectStage::Screened && m.target_screen().target_height == 1002, "Screened at tip + 2");
+    CHECK(aborts([&] { m.load_key(wif); }), "key before plan aborts (after screen)");
+    m.plan({});
+    CHECK(m.stage() == InjectStage::Planned && m.planned_tx_count() == 1, "Planned");
+    m.set_gate(true, false, kSpendWord);
+    CHECK(!m.armed() && aborts([&] { m.sign(); }), "no key: not armed, sign aborts");
+
+    m.load_key(wif);
+    CHECK(m.stage() == InjectStage::KeyBound && m.has_key() && m.keys_wiped() == 0, "KeyBound");
+    CHECK(!m.armed(), "a fresh key is not armed (gate cleared)");
+    m.set_gate(true, false, "spend");
+    CHECK(!m.armed(), "\"spend\" is not the literal SPEND");
+    m.set_gate(true, false, "SPEND ");
+    CHECK(!m.armed(), "\"SPEND \" is not the literal SPEND");
+    m.set_gate(false, false, kSpendWord);
+    CHECK(!m.armed(), "SPEND without \"reviewed\" is not armed");
+    CHECK(aborts_with([&] { m.sign(); }, "not armed"), "sign while not armed aborts");
+    CHECK(m.has_key(), "a refused (unarmed) sign attempt touched nothing");
+    m.set_gate(true, false, kSpendWord);
+    CHECK(m.armed(), "reviewed + SPEND arms a consolidation");
+
+    // A re-import after the plan invalidates the plan and wipes the key.
+    m.import_utxos(k7_json(), 1000);
+    CHECK(m.stage() == InjectStage::Imported && !m.has_key() && m.keys_wiped() == 1 && !m.sweep_plan() && !m.armed(),
+          "re-import: plan dropped, key wiped (sentinel 1)");
+    // A re-plan wipes the key too; a re-screen drops the plan.
+    m.rescreen({});
+    m.plan({});
+    m.load_key(wif);
+    m.plan({});
+    CHECK(m.stage() == InjectStage::Planned && !m.has_key() && m.keys_wiped() == 2, "re-plan: key wiped (sentinel 2)");
+    m.load_key(wif);
+    m.rescreen({});
+    CHECK(m.stage() == InjectStage::Screened && !m.has_key() && !m.sweep_plan() && m.keys_wiped() == 3,
+          "re-screen: plan dropped, key wiped (sentinel 3)");
+    // A refused import leaves the model empty.
+    CHECK(aborts([&] { m.import_utxos("[1,", 1000); }) && m.stage() == InjectStage::Empty, "a refused import -> Empty");
+    // A refused plan leaves Screened.
+    m.import_utxos(k7_json(), 1000);
+    m.rescreen({});
+    PlanParams bad;
+    bad.fee_mode = FeeMode::Relay; // rate 0
+    CHECK(aborts([&] { m.plan(bad); }) && m.stage() == InjectStage::Screened, "a refused plan -> Screened");
+    // A wrong expected address refuses the import.
+    CHECK(aborts_with([&] { m.import_utxos(k7_json(), 1000, DUMMY_ADDR0); }, "not the expected"),
+          "expected_address mismatch aborts");
+
+    // A sign that fails AFTER the key was taken still wipes it. Every
+    // legitimate post-key refusal is unreachable from the page (the plan is
+    // re-made for the bound key), so the plan is altered behind the model's
+    // back here: the case sign_sweep's "not the planned one" check exists for.
+    DashInjectModel t;
+    CHECK(drive_planned(t, k7_json(), 1000, {}, {}), "planned");
+    t.load_key(wif);
+    t.set_gate(true, false, kSpendWord);
+    const_cast<SweepBatchPlan*>(t.sweep_plan())->txs.at(0).unsigned_tx.back() ^= 0x01;
+    CHECK(aborts_with([&] { t.sign(); }, "not the planned one"), "a plan altered after review is refused at sign");
+    CHECK(!t.has_key() && t.keys_wiped() == 1 && t.stage() == InjectStage::Planned && t.inject_file().empty(),
+          "the failed sign wiped the key, emitted nothing, left the plan");
+
+    // The burn box gates a collateral (and only a collateral).
+    DashInjectModel u;
+    std::vector<Row> rows;
+    for (int i = 0; i < 10; ++i) rows.push_back({txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 100, std::nullopt});
+    PlanParams coll;
+    coll.mode = OutputMode::Collateral;
+    coll.gov_hash_display = testvec::kOnchainGovHash;
+    CHECK(drive_planned(u, gau_json(testvec::kUncompressedAddr001, rows), 1000, {}, coll), "collateral planned");
+    u.load_key(key_of(KeySource::Wif, testvec::kUncompWif));
+    u.set_gate(true, false, kSpendWord);
+    CHECK(!u.armed(), "collateral: not armed without the burn box");
+    u.set_gate(true, true, kSpendWord);
+    CHECK(u.armed(), "collateral: reviewed + burn box + SPEND arms");
+}
+
+// ── S2-F1 relay collateral fee follows the key encoding (VERIFY-S2 F1) ──────
+
+static void test_s2_f1_relay_collateral_fee()
+{
+    std::printf("[S2-F1 relay collateral: the fee follows the key encoding; min relay fee floors]\n");
+    const std::string uspk = spk_hex_of(testvec::kUncompressedAddr001);
+    CollateralRequest r;
+    r.funding_address = testvec::kUncompressedAddr001;
+    r.fee_mode = FeeMode::Relay;
+    r.fee_rate = 1000; // 1 duff/B
+    r.sweep_all = true;
+    r.gov_hash_display = testvec::kOnchainGovHash;
+    for (int i = 0; i < 10; ++i)
+        r.utxos.push_back(mk_utxo(txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 200, uspk));
+    const FoundKey uk = load_funding_key(key_of(KeySource::Wif, testvec::kUncompWif), testvec::kUncompressedAddr001, false);
+    CHECK(!uk.compressed && uk.pub.size() == 65, "the test key is uncompressed");
+
+    // Planned for an unknown key: the classic 148 B/input (compressed) estimate.
+    const int64_t est148 = 4 + 1 + 10 * 148 + 1 + 43 + 34 + 4; // 1567
+    const int64_t est180 = 4 + 1 + 10 * 180 + 1 + 43 + 34 + 4; // 1887
+    CollateralPlan p148 = plan_collateral(r);
+    CHECK(p148.fee == est148, "unknown encoding: fee 1567 = 1 duff/B x 148 B/input estimate");
+    CHECK(aborts_with([&] { sign_collateral(p148, uk, true); }, "re-plan"),
+          "an uncompressed key on that plan: refused BEFORE signing (1567 < 1887 worst case)");
+
+    // Planned for the uncompressed key: 180 B/input, and it signs above the floor.
+    r.key_encoding = PubkeyEncoding::Uncompressed;
+    CollateralPlan p180 = plan_collateral(r);
+    CHECK(p180.fee == est180 && p180.change == 2 * 100000000 - kCoin - est180,
+          "uncompressed: fee 1887 = 1 duff/B x 180 B/input estimate");
+    CHECK(contains(p180.summary, "est 1887 B at 180 B/input, uncompressed key"), "the summary names the fee basis");
+    SignedTx st;
+    CHECK(runs([&] { st = sign_collateral(p180, uk, true); }, "sign_collateral"), "signs");
+    CHECK(st.size > 0 && st.size <= static_cast<size_t>(est180) && p180.fee >= static_cast<int64_t>(st.size),
+          "signed size <= 1887 and fee >= 1 duff/B x actual size");
+    CHECK(!aborts([&] { verify_signed_funding_tx(st.hex, testvec::kUncompressedAddr001, false); }), "re-verifies");
+
+    // A rate that cannot meet the minimum relay fee is refused at plan time.
+    CollateralRequest low = r;
+    low.fee_rate = 100;
+    CHECK(aborts_with([&] { plan_collateral(low); }, "minimum relay fee"),
+          "100 duffs/kB on a 1887 B tx: refused at plan time");
+    CollateralRequest small = make_request(DUMMY_ADDR0);
+    small.fee_rate = 100;
+    CHECK(!aborts([&] { plan_collateral(small); }), "a 383 B tx at 100 duffs/kB still passes (the 1000-duff minimum covers it)");
+    // The compressed classic path is unchanged.
+    CHECK(plan_collateral(make_request(DUMMY_ADDR0)).fee == 1000, "classic compressed relay: fee 1000 (the 1000-duff minimum)");
+
+    // Through the model: an uncompressed key at 1 duff/B now builds a tx that
+    // meets the minimum relay fee (re-planned at bind for its encoding).
+    DashInjectModel m;
+    std::vector<Row> rows;
+    for (int i = 0; i < 10; ++i) rows.push_back({txid_of_byte(i < 5 ? "5a" : "5b"), static_cast<uint32_t>(i), 20000000, 100, std::nullopt});
+    PlanParams coll;
+    coll.mode = OutputMode::Collateral;
+    coll.fee_mode = FeeMode::Relay;
+    coll.fee_rate_per_byte = 1;
+    coll.gov_hash_display = testvec::kOnchainGovHash;
+    CHECK(drive_planned(m, gau_json(testvec::kUncompressedAddr001, rows), 1000, {}, coll), "model: relay collateral planned");
+    CHECK(m.planned_fee() == est148, "model before the key: fee on the 148 B/input estimate");
+    CHECK(sign_with(m, key_of(KeySource::Wif, testvec::kUncompWif), /*burn=*/true) && m.signed_txs().size() == 1,
+          "model: uncompressed key, relay collateral at 1 duff/B signs");
+    if (m.signed_txs().size() == 1) {
+        CHECK(m.planned_fee() == est180 && m.planned_fee() >= static_cast<int64_t>(m.signed_txs()[0].size),
+              "model: re-planned fee 1887 >= 1 duff/B x actual size");
+        CHECK(!m.has_key() && m.keys_wiped() == 1, "model: the key was wiped after signing");
+    }
+}
+
+// ── S2-K5 key paths ─────────────────────────────────────────────────────────
+
+static void test_s2_k5_key_paths()
+{
+    std::printf("[S2-K5 key paths: every format signs the K7 vector byte-exact]\n");
+    DashInjectModel m;
+    CHECK(drive_planned(m, k7_json(), 1000, {}, {}), "K7 set planned");
+    CHECK(m.sweep_plan() && hexstr(m.sweep_plan()->txs.at(0).unsigned_tx) == testvec::kPyParityUnsignedHex,
+          "model plan == the python unsigned vector");
+
+    struct Path {
+        const char* name;
+        KeyInput key;
+        const char* want_path;
+    };
+    KeyInput mn = key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase);
+    std::vector<Path> paths = {
+        {"mnemonic + passphrase", mn, "m/44'/5'/0'/0/0"},
+        {"WIF (compressed)", key_of(KeySource::Wif, std::string("  ") + testvec::kK7Wif + "\n"), "imported WIF key"},
+        {"BIP38 (DASH address hash)", key_of(KeySource::Bip38, testvec::kK7Bip38Dash, testvec::kBip38Pass),
+         "BIP38 key (address hash over the DASH address)"},
+        {"BIP38 (BTC address hash)", key_of(KeySource::Bip38, testvec::kK7Bip38BtcHash, testvec::kBip38Pass),
+         "BIP38 key (address hash over the BTC address)"},
+        {"descriptor pkh([fp/44'/5'/0']xprv/0/*)", key_of(KeySource::Descriptor, testvec::kK7Descriptor),
+         "[b4e3f5ed]m/44'/5'/0'/0/0"},
+        {"JSON keystore: WIF list with a decoy first",
+         key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\",\"" + testvec::kK7Wif + "\"]}"),
+         "keystore item 2 (keys)"},
+        {"JSON keystore: mnemonic + sibling passphrase",
+         key_of(KeySource::JsonKeystore, "{\"mnemonic\":\"" + DUMMY_MNEMONIC + "\",\"passphrase\":\"TREZOR\"}"),
+         "m/44'/5'/0'/0/0"},
+        {"JSON keystore: account xprv",
+         key_of(KeySource::JsonKeystore, std::string("{\"xprv\":\"") + testvec::kK7AccountXprv + "\"}"),
+         "keystore xprv (account key)/0/0"},
+    };
+    for (const Path& p : paths) {
+        const bool ok = sign_with(m, p.key);
+        std::printf("    %-44s %s\n", p.name, ok && m.signed_txs().size() == 1 && m.signed_txs()[0].hex == testvec::kPyParitySignedHex ? "byte-exact" : "MISMATCH");
+        CHECK(ok && m.signed_txs().size() == 1 && m.signed_txs()[0].hex == testvec::kPyParitySignedHex &&
+                  m.signed_txs()[0].txid == testvec::kPyParityTxid,
+              p.name);
+        CHECK(contains(m.manifest_json(), p.want_path), "manifest names the key path");
+    }
+
+    // The uncompressed WIF signs its own python vector byte-exact.
+    DashInjectModel u;
+    CHECK(drive_planned(u, gau_json(testvec::kUncompressedAddr001, {{txid_of_byte("33"), 0, 50000, 100, std::nullopt},
+                                                                     {txid_of_byte("44"), 2, 40000, 100, std::nullopt}}),
+                        1000, {}, {}),
+          "uncompressed set planned");
+    CHECK(u.sweep_plan() && hexstr(u.sweep_plan()->txs.at(0).unsigned_tx) == testvec::kUncompUnsignedHex,
+          "model plan == the python uncompressed unsigned vector");
+    CHECK(sign_with(u, key_of(KeySource::Wif, testvec::kUncompWif)) && u.signed_txs().size() == 1 &&
+              u.signed_txs()[0].hex == testvec::kUncompSignedHex && u.signed_txs()[0].txid == testvec::kUncompTxid,
+          "uncompressed WIF signs the python vector byte-exact (31-byte s edge)");
+    CHECK(contains(u.manifest_json(), "\"encoding\": \"uncompressed\""), "manifest: encoding uncompressed");
+
+    // Refusals: every one leaves the model without a key.
+    auto refused = [&](const KeyInput& k, const char* needle, const char* what) {
+        CHECK(aborts_with([&] { m.load_key(k); }, needle) && !m.has_key() && m.stage() == InjectStage::Planned, what);
+    };
+    refused(key_of(KeySource::Wif, testvec::kDecoyWif), "is for", "a WIF for another address aborts");
+    refused(key_of(KeySource::Wif, testvec::kK7WifBtcVersion), "version byte", "a non-DASH WIF version aborts");
+    refused(key_of(KeySource::Wif, std::string(testvec::kK7Wif).substr(1)), "does not decode", "a broken WIF aborts");
+    refused(key_of(KeySource::Bip38, testvec::kK7Bip38Dash, "wrong"), "wrong passphrase", "BIP38 wrong passphrase aborts");
+    // A public BIP38 vector decrypts (BTC address hash) but controls another address.
+    refused(key_of(KeySource::Bip38, "6PYNKZ1EAgYgmQfmNVamxyXVWHzK5s6DGhwP4J5o44cvXdoY7sRzhtpUeo", "TestingOneTwoThree"),
+            "is for", "the public BIP38 vector decrypts but binds elsewhere");
+    std::string bad_cs = testvec::kK7Descriptor;
+    bad_cs.back() = bad_cs.back() == 'c' ? 'd' : 'c';
+    refused(key_of(KeySource::Descriptor, bad_cs), "checksum", "a descriptor with a wrong checksum aborts");
+    refused(key_of(KeySource::Descriptor, "pkh([b4e3f5ed/44'/5'/0']xprv9zUwecf3TjfmaeR6LkfC8LhRUAHgddJ4UkuNDpLQyCxucM7SbvN7h6GDxkfW8Zwx6yGrvdAao4EvjJoMPM5ModJbcqR3AE5yUwEZoAZtVFd/1/*)"),
+            "produces", "a descriptor whose range misses the address aborts");
+    refused(key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\"]}"), "none of the",
+            "a keystore without the funding key aborts");
+    refused(key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, "not-trezor"), "REFUSING", "a mnemonic with the wrong passphrase aborts");
+
+    // The hdkeys BIP38 overload: the BIP38-specified BTC hash alone rejects a
+    // DASH-hashed key; naming the DASH version byte accepts it.
+    CHECK(!c2w::hdkeys::decode_bip38(testvec::kK7Bip38Dash, testvec::kBip38Pass).ok,
+          "decode_bip38 (BTC address hash only) refuses the DASH-hashed key");
+    c2w::hdkeys::Bip38Decode d38 = c2w::hdkeys::decode_bip38(testvec::kK7Bip38Dash, testvec::kBip38Pass, {0x4c});
+    CHECK(d38.ok && d38.address_version == 0x4c && d38.compressed, "decode_bip38 {0x4c} accepts it");
+
+    // bind_found_key: the address string alone is not enough.
+    FoundKey k = load_funding_key(key_of(KeySource::Wif, testvec::kK7Wif), testvec::kPyParityAddress, false);
+    FoundKey other = load_funding_key(key_of(KeySource::Wif, testvec::kDecoyWif), DUMMY_ADDR1, false);
+    other.address = testvec::kPyParityAddress;
+    CHECK(!aborts([&] { bind_found_key(k, testvec::kPyParityAddress, false); }) &&
+              aborts_with([&] { bind_found_key(other, testvec::kPyParityAddress, false); }, "does not hash"),
+          "bind: the pubkey must hash to the funding address");
+}
+
+// ── S2-K6 end to end on the real fixture with a TEST key ────────────────────
+
+static void test_s2_k6_end_to_end()
+{
+    std::printf("[S2-K6 end to end on the 170-row fixture (XdgF swapped for the TEST key's address)]\n");
+    DashInjectModel m;
+    ScreenParams sp;
+    sp.dust_floor = 2;
+    CHECK(drive_planned(m, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, {}), "fixture planned");
+    CHECK(m.target_screen().target_height == kFixtureTip + 2 && m.target_screen().screen.spendable.size() == 128 &&
+              m.target_screen().screen.dust.size() == 42 && m.target_screen().screen.immature.empty(),
+          "screen at tip+2: 128 / 0 / 42");
+    CHECK(m.sweep_plan() && m.sweep_plan()->txs.size() == 1 && m.sweep_plan()->txs[0].inputs.size() == 128 &&
+              m.sweep_plan()->txs[0].est_signed_bytes == 23212,
+          "plan before the key: 1 tx, 128 inputs, worst case 23212 B (181 B/input)");
+    m.load_key(key_of(KeySource::Wif, testvec::kK7Wif));
+    CHECK(m.sweep_plan()->txs[0].est_signed_bytes == 19116, "re-planned for the compressed key: est 19116 B");
+    m.set_gate(true, false, kSpendWord);
+    CHECK(runs([&] { m.sign(); }, "sign"), "signed");
+    CHECK(m.stage() == InjectStage::Signed && !m.has_key(), "Signed; key wiped");
+    if (m.signed_txs().size() != 1) { CHECK(false, "one signed tx"); return; }
+    const SignedTx& st = m.signed_txs()[0];
+    std::printf("    e2e zero-fee: %zu inputs, %zu B signed (est 19116), value %lld duffs, txid %s\n",
+                m.sweep_plan()->txs[0].inputs.size(), st.size, (long long)m.sweep_plan()->txs[0].value_out, st.txid.c_str());
+    CHECK(st.size <= 18988 && st.size == st.hex.size() / 2, "actual size <= 18988 (low-S compressed) <= estimate");
+    CHECK(!aborts([&] { verify_signed_funding_tx(st.hex, testvec::kPyParityAddress, false); }), "re-verifies");
+    auto outs = parse_outputs(H(st.hex));
+    CHECK(outs.size() == 1 && outs[0].value == 60963663 && hexstr(outs[0].script) == spk_hex_of(testvec::kPyParityAddress),
+          "one output, 60963663 duffs back to the funding address, fee 0");
+    std::string err;
+    auto parsed = c2w::artifact::SignedContainer::parse(m.inject_file(), err);
+    CHECK(m.inject_file() == st.hex + "\n" && parsed && parsed->tx_hexes.size() == 1 && parsed->tx_hexes[0] == st.hex,
+          "inject file = one line, round-trips through SignedContainer::parse");
+    std::string why;
+    CHECK(c2w::artifact::accept_as_signed(H(st.hex), why), "accept_as_signed (the PageAirGap confusion guard)");
+
+    // The same set through the RELAY (fee-paying) mode at 1 duff/B.
+    DashInjectModel r;
+    PlanParams rp;
+    rp.fee_mode = FeeMode::Relay;
+    rp.fee_rate_per_byte = 1;
+    CHECK(drive_planned(r, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, rp), "relay planned");
+    CHECK(sign_with(r, key_of(KeySource::Wif, testvec::kK7Wif)) && r.signed_txs().size() == 1, "relay signed");
+    if (r.signed_txs().size() == 1) {
+        const SweepTxPlan& t = r.sweep_plan()->txs[0];
+        std::printf("    e2e relay 1 duff/B: %zu inputs, %zu B signed, fee %lld duffs, value %lld duffs\n",
+                    t.inputs.size(), r.signed_txs()[0].size, (long long)t.fee, (long long)t.value_out);
+        CHECK(t.fee == 19116 && t.value_out == 60944547 && r.planned_fee() == 19116,
+              "relay fee = 1 x 19116 B = 19116 duffs; output 60944547");
+        CHECK(t.fee >= static_cast<int64_t>(r.signed_txs()[0].size), "real rate >= 1 duff/B");
+        auto ro = parse_outputs(H(r.signed_txs()[0].hex));
+        CHECK(ro.size() == 1 && ro[0].value + t.fee == 60963663, "inputs = output + fee");
+        CHECK(contains(r.manifest_json(), "\"fee_mode\": \"relay\"") &&
+                  contains(r.manifest_json(), "\"total_fee\": 19116") &&
+                  contains(r.manifest_json(), "sendrawtransaction"),
+              "relay manifest: fee mode, total fee, submit hint");
+        mj::ParseResult rm = mj::parse(r.manifest_json());
+        CHECK(rm.ok && jstr(jpath(rm.root, {"node_requirements", "submit"})).find("ONLY after the preflight") == 0 &&
+                  contains(jstr(jpath(rm.root, {"node_requirements", "preflight"})), "gettxout") &&
+                  contains(jstr(jpath(rm.root, {"node_requirements", "preflight"})), "value_out + fee"),
+              "relay manifest (VERIFY-S2 F4): submit requires the gettxout amount preflight first");
+    }
+}
+
+// ── S2-K7 manifest ──────────────────────────────────────────────────────────
+
+static void test_s2_k7_manifest()
+{
+    std::printf("[S2-K7 manifest: round trip, digests, maturity, no secrets, no clock]\n");
+    DashInjectModel m;
+    ScreenParams sp;
+    sp.dust_floor = 2;
+    if (!drive_planned(m, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, {}) ||
+        !sign_with(m, key_of(KeySource::Wif, testvec::kK7Wif))) {
+        CHECK(false, "manifest run");
+        return;
+    }
+    const std::string man = m.manifest_json();
+    mj::ParseResult pr = mj::parse(man);
+    CHECK(pr.ok && pr.root.is_obj(), "manifest parses (MiniJson)");
+    const mj::JVal& r = pr.root;
+    const std::string file = m.inject_file();
+    const std::vector<uint8_t> fb(file.begin(), file.end());
+    CHECK(jstr(r.find("schema")) == kInjectManifestSchema && jstr(r.find("coin")) == "dash" &&
+              jstr(r.find("network")) == "mainnet" && jstr(r.find("mode")) == "consolidate" &&
+              jstr(r.find("fee_mode")) == "inject-zero-fee",
+          "schema / coin / network / mode / fee_mode");
+    CHECK(jstr(r.find("hex_file_sha256d")) == c2w::artifact::sha256d_display(fb), "hex_file_sha256d == sha256d_display(file bytes)");
+    const auto h1 = c2w::artifact::sha256(fb);
+    CHECK(jstr(r.find("hex_file_sha256")) == hexstr(std::vector<uint8_t>(h1.begin(), h1.end())), "hex_file_sha256 == sha256sum");
+    CHECK(jint(r.find("tx_count")) == 1 && r.find("txs") && r.find("txs")->arr.size() == 1, "tx_count 1");
+    if (r.find("txs") && r.find("txs")->arr.size() == 1) {
+        const mj::JVal& t = r.find("txs")->arr[0];
+        CHECK(jstr(t.find("txid")) == m.signed_txs()[0].txid && jint(t.find("size")) == (int64_t)m.signed_txs()[0].size &&
+                  jint(t.find("vin")) == 128 && jint(t.find("vout")) == 1 && jint(t.find("value_out")) == 60963663 &&
+                  jint(t.find("fee")) == 0 && jint(t.find("est_signed_bytes")) == 19116,
+              "tx: txid, size, vin 128, vout 1, value_out, fee 0, est");
+        const mj::JVal* ins = t.find("inputs");
+        // Every input is a runtime-submit prevout claim (VERIFY-S2 F2):
+        // exactly {txid, vout, value, script_hex, height, coinbase}.
+        bool claim_shape = ins && ins->arr.size() == 128;
+        int64_t sum_in = 0;
+        const std::string spk = spk_hex_of(testvec::kPyParityAddress);
+        if (ins)
+            for (const mj::JVal& in : ins->arr) {
+                const char* keys[] = {"txid", "vout", "value", "script_hex", "height", "coinbase"};
+                claim_shape = claim_shape && in.obj.size() == 6;
+                for (size_t k = 0; k < 6 && claim_shape; ++k) claim_shape = in.obj[k].first == keys[k];
+                claim_shape = claim_shape && jstr(in.find("txid")).size() == 64 && jint(in.find("value")) > 0 &&
+                              jstr(in.find("script_hex")) == spk && jint(in.find("height")) > 0 &&
+                              in.find("coinbase")->t == mj::JVal::T::Bool && in.find("coinbase")->b;
+                sum_in += jint(in.find("value"));
+            }
+        CHECK(claim_shape, "inputs: 128 claims {txid, vout, value, script_hex, height, coinbase}; unknown coinbase claimed true");
+        CHECK(sum_in == jint(t.find("value_out")) + jint(t.find("fee")), "claims: sum(value) == value_out + fee");
+    }
+    CHECK(jint(jpath(r, {"maturity", "safe_from_height"})) == 2563881 + 100 &&
+              jint(jpath(r, {"maturity", "youngest_input_height"})) == 2563881 &&
+              jint(jpath(r, {"maturity", "screen_tip_height"})) == kFixtureTip &&
+              jint(jpath(r, {"maturity", "target_height"})) == kFixtureTip + 2 &&
+              jint(jpath(r, {"maturity", "min_confirmations"})) == kDefaultMinConf,
+          "maturity: safe_from = max(h) + 100 = 2563981, youngest, tip, target, min_conf");
+    CHECK(jstr(r.find("funding_script")) == spk_hex_of(testvec::kPyParityAddress) &&
+              jpath(r, {"maturity", "coinbase_flags_known"}) &&
+              jpath(r, {"maturity", "coinbase_flags_known"})->t == mj::JVal::T::Bool &&
+              !jpath(r, {"maturity", "coinbase_flags_known"})->b,
+          "funding_script; coinbase_flags_known false for a getaddressutxos intake");
+    CHECK(!contains(man, "\"satoshis\""), "no legacy satoshis field left");
+    CHECK(jint(jpath(r, {"skipped", "dust"})) == 42 && jint(jpath(r, {"skipped", "dust_floor"})) == 2 &&
+              jpath(r, {"skipped", "immature"}) && jpath(r, {"skipped", "immature"})->arr.empty(),
+          "skipped: 42 dust at floor 2, 0 immature");
+    CHECK(jstr(jpath(r, {"node_requirements", "lane"})).find("pin|inject") == 0 &&
+              jint(jpath(r, {"node_requirements", "max_tx_bytes"})) == 100000 &&
+              jint(jpath(r, {"node_requirements", "earliest_block_height"})) == 2563981,
+          "node_requirements: lane, cap, earliest height");
+    CHECK(jstr(jpath(r, {"key", "path"})) == "imported WIF key" && jstr(jpath(r, {"key", "encoding"})) == "compressed",
+          "key: public description only");
+    // No clock: no key anywhere in the document names a time.
+    bool clockless = true;
+    std::vector<const mj::JVal*> stack = {&r};
+    while (!stack.empty()) {
+        const mj::JVal* v = stack.back();
+        stack.pop_back();
+        for (const auto& kv : v->obj) {
+            if (contains(kv.first, "time") || contains(kv.first, "date") || contains(kv.first, "clock")) clockless = false;
+            stack.push_back(&kv.second);
+        }
+        for (const auto& e : v->arr) stack.push_back(&e);
+    }
+    CHECK(clockless, "no timestamp field");
+
+    // Deterministic: the same plan signed again gives the same bytes.
+    const std::string first = man;
+    CHECK(sign_with(m, key_of(KeySource::Wif, testvec::kK7Wif)) && m.manifest_json() == first, "manifest is deterministic");
+}
+
+// ── S2-K8 collateral ────────────────────────────────────────────────────────
+
+static void test_s2_k8_collateral()
+{
+    std::printf("[S2-K8 direct governance collateral: shortfall, then a funded plan]\n");
+    PlanParams pp;
+    pp.mode = OutputMode::Collateral;
+    pp.gov_hash_display = testvec::kOnchainGovHash;
+    ScreenParams all;
+    all.dust_floor = 0;
+    DashInjectModel m;
+    m.import_utxos(fixture_for(testvec::kPyParityAddress), kFixtureTip);
+    m.rescreen(all);
+    CHECK(aborts_with([&] { m.plan(pp); }, "short 0.39036295 DASH") && m.stage() == InjectStage::Screened,
+          "fixture (all 170 inputs, 0.60963705 DASH): refused, short 0.39036295 DASH to the 1-DASH burn");
+    PlanParams rp = pp;
+    rp.fee_mode = FeeMode::Relay;
+    rp.fee_rate_per_byte = 1;
+    CHECK(aborts_with([&] { m.plan(rp); }, "short 0.39036295 DASH"), "relay mode refuses the same shortfall");
+    PlanParams split = pp;
+    split.max_inputs_per_tx = 85;
+    CHECK(aborts_with([&] { m.plan(split); }, "never split"), "collateral + split knob aborts");
+
+    // +0.5 DASH of a KNOWN non-coinbase output at 1 confirmation (export v1 flags).
+    std::vector<Row> rows = fixture_rows();
+    for (Row& r : rows) r.coinbase = true;
+    rows.push_back({txid_of_byte("5e"), 0, 50000000, kFixtureTip, false});
+    DashInjectModel c;
+    ScreenParams sp;
+    sp.dust_floor = 2;
+    CHECK(drive_planned(c, export_v1_json(testvec::kPyParityAddress, kFixtureTip, rows), 0, sp, pp), "funded collateral planned");
+    const CollateralPlan* cp = c.collateral_plan();
+    CHECK(cp && cp->selected.size() == 129 && cp->total_in == 110963663 && cp->fee == 0 && cp->change == 10963663,
+          "129 inputs (128 + the 1-conf non-coinbase), 1.10963663 DASH, fee 0, change 0.10963663");
+    CHECK(cp && hexstr(cp->op_return_script) == testvec::kOnchainOpReturn, "OP_RETURN == 6a20 || reversed(display hash)");
+    CHECK(c.plan_safe_from_height() == kFixtureTip + 1, "safe_from = max(2563881 + 100, 2563986 + 1) = 2563987");
+    CHECK(!c.destination_is_external(), "change to the funding address (not EXTERNAL)");
+    c.load_key(key_of(KeySource::Wif, testvec::kK7Wif));
+    c.set_gate(true, false, kSpendWord);
+    CHECK(!c.armed(), "collateral: no burn box, not armed");
+    c.set_gate(true, true, kSpendWord);
+    CHECK(runs([&] { c.sign(); }, "collateral sign") && c.signed_txs().size() == 1, "collateral signed");
+    if (c.signed_txs().size() == 1) {
+        auto outs = parse_outputs(H(c.signed_txs()[0].hex));
+        CHECK(outs.size() == 2 && outs[0].value == kCoin && hexstr(outs[0].script) == testvec::kOnchainOpReturn &&
+                  outs[1].value == 10963663 && hexstr(outs[1].script) == spk_hex_of(testvec::kPyParityAddress),
+              "signed: 1 DASH OP_RETURN burn + change to the funding address");
+        std::printf("    collateral: %zu inputs, %zu B signed\n", cp->selected.size(), c.signed_txs()[0].size);
+        mj::ParseResult cm = mj::parse(c.manifest_json());
+        size_t n_false = 0, n_true = 0;
+        if (cm.ok && cm.root.find("txs") && !cm.root.find("txs")->arr.empty())
+            if (const mj::JVal* ins = cm.root.find("txs")->arr[0].find("inputs"))
+                for (const mj::JVal& in : ins->arr) {
+                    const mj::JVal* cb = in.find("coinbase");
+                    if (cb && cb->t == mj::JVal::T::Bool) (cb->b ? n_true : n_false)++;
+                    if (cb && !cb->b && jstr(in.find("txid")) != txid_of_byte("5e")) n_false += 100; // wrong row
+                }
+        CHECK(n_false == 1 && n_true == 128 && cm.ok && jpath(cm.root, {"maturity", "coinbase_flags_known"})->b,
+              "export v1 flags carried into the claims: 128 coinbase true, the 1-conf input false");
+        CHECK(contains(c.manifest_json(), "\"mode\": \"collateral\"") &&
+                  contains(c.manifest_json(), (std::string("\"gov_hash\": \"") + testvec::kOnchainGovHash + "\"").c_str()),
+              "manifest: mode collateral + gov hash");
+    }
+    PlanParams ext = pp;
+    ext.change_address = DUMMY_ADDR0;
+    c.rescreen(sp);
+    c.plan(ext);
+    CHECK(c.destination_is_external() && contains(c.plan_summary(), "EXTERNAL"), "change elsewhere: EXTERNAL");
+}
+
+// ── S2-K9 secret hygiene ────────────────────────────────────────────────────
+
+static void test_s2_k9_secret_hygiene()
+{
+    std::printf("[S2-K9 secret hygiene: no output carries a secret; the key dies at sign]\n");
+    c2w::hdkeys::WifDecode wd = c2w::hdkeys::decode_wif(testvec::kK7Wif);
+    const std::string scalar_hex = hexstr(std::vector<uint8_t>(wd.scalar.data(), wd.scalar.data() + wd.scalar.size()));
+    CHECK(wd.ok && scalar_hex.size() == 64, "test scalar decoded for the grep");
+    const std::vector<std::string> secrets = {
+        testvec::kK7Wif, testvec::kK7WifBtcVersion, testvec::kK7Bip38Dash, testvec::kK7Bip38BtcHash,
+        testvec::kK7AccountXprv, testvec::kDecoyWif, testvec::kUncompWif, testvec::kBip38Pass,
+        testvec::kPyParityPassphrase, "abandon", DUMMY_MNEMONIC, scalar_hex};
+    std::vector<std::string> outputs;
+
+    const std::vector<KeyInput> keys = {
+        key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase),
+        key_of(KeySource::Wif, testvec::kK7Wif),
+        key_of(KeySource::Bip38, testvec::kK7Bip38Dash, testvec::kBip38Pass),
+        key_of(KeySource::Descriptor, testvec::kK7Descriptor),
+        key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\",\"" + testvec::kK7Wif + "\"]}"),
+    };
+    for (const KeyInput& k : keys) {
+        DashInjectModel m;
+        ScreenParams sp;
+        sp.dust_floor = 2;
+        CHECK(drive_planned(m, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, {}), "planned");
+        m.load_key(k);
+        for (const std::string& t : card_texts(m)) outputs.push_back(t);
+        const size_t before = m.keys_wiped();
+        m.set_gate(true, false, kSpendWord);
+        CHECK(runs([&] { m.sign(); }, "sign"), "signed");
+        CHECK(!m.has_key() && m.keys_wiped() == before + 1 && contains(m.key_card(), "wiped"),
+              "sentinel: the key was destroyed by sign");
+        for (const std::string& t : card_texts(m)) outputs.push_back(t);
+    }
+    // Error messages of refused key inputs never quote them.
+    DashInjectModel m;
+    CHECK(drive_planned(m, k7_json(), 1000, {}, {}), "planned");
+    std::string broken_desc = testvec::kK7Descriptor;
+    broken_desc.replace(broken_desc.find("xprv9z") + 10, 1, "!");
+    std::string broken_wif = std::string(testvec::kK7Wif).substr(0, 40) + "0";
+    const std::vector<KeyInput> bad = {
+        key_of(KeySource::Descriptor, broken_desc),
+        key_of(KeySource::Wif, broken_wif),
+        key_of(KeySource::Wif, testvec::kK7WifBtcVersion),
+        key_of(KeySource::Bip38, testvec::kK7Bip38Dash, "wrong"),
+        key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\"]"),
+        key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, "x"),
+        key_of(KeySource::Mnemonic, std::string(DUMMY_MNEMONIC).replace(0, 7, "zzzzzzz"), ""),
+    };
+    size_t refused = 0;
+    for (const KeyInput& k : bad) {
+        try { m.load_key(k); }
+        catch (const DashAbort& e) { ++refused; outputs.push_back(e.what()); }
+    }
+    CHECK(refused == bad.size(), "every bad key input is refused");
+    bool clean = true;
+    for (const std::string& o : outputs)
+        for (const std::string& sec : secrets)
+            if (!sec.empty() && o.find(sec) != std::string::npos) {
+                clean = false;
+                std::printf("    LEAK of a test secret in: %.80s...\n", o.c_str());
+            }
+    for (const std::string& o : outputs)
+        if (o.find(broken_desc.substr(broken_desc.find("xprv9z"), 30)) != std::string::npos ||
+            o.find(broken_wif) != std::string::npos)
+            clean = false;
+    CHECK(clean, "no card, summary, manifest, hex file or error message contains a test secret");
+}
+
+// ── S2-F3 JSON nesting cap (VERIFY-S2 F3) ───────────────────────────────────
+
+static void test_s2_f3_json_depth()
+{
+    std::printf("[S2-F3 JSON nesting cap: hostile depth is refused by name, not a crash]\n");
+    const std::string deep_arr(200000, '[');
+    std::string deep_obj;
+    for (int i = 0; i < 100000; ++i) deep_obj += "{\"a\":";
+    mj::ParseResult a = mj::parse(deep_arr);
+    CHECK(!a.ok && contains(a.error, "too deep"), "200000 nested '[' -> \"nesting too deep\"");
+    mj::ParseResult o = mj::parse(deep_obj);
+    CHECK(!o.ok && contains(o.error, "too deep"), "100000 nested {\"a\": -> \"nesting too deep\"");
+    auto nest = [](int n) { return std::string(static_cast<size_t>(n), '[') + std::string(static_cast<size_t>(n), ']'); };
+    CHECK(mj::parse(nest(mj::kMaxNestingDepth)).ok, "64 levels parse");
+    CHECK(!mj::parse(nest(mj::kMaxNestingDepth + 1)).ok, "65 levels are refused");
+    // Through the model's two JSON inputs: the UTXO list and the keystore.
+    DashInjectModel m;
+    CHECK(aborts_with([&] { m.import_utxos(deep_arr, 1000); }, "too deep") && m.stage() == InjectStage::Empty,
+          "import refuses it by name");
+    CHECK(aborts_with([&] { m.import_utxos(deep_obj, 0); }, "too deep"), "import refuses a deep object too");
+    CHECK(aborts_with([&] { load_funding_key(key_of(KeySource::JsonKeystore, deep_obj), DUMMY_ADDR0, false); },
+                      "not valid JSON"),
+          "the keystore parser refuses it too");
+    CHECK(aborts_with([&] { load_funding_key(key_of(KeySource::JsonKeystore, deep_arr), DUMMY_ADDR0, false); },
+                      "not valid JSON"),
+          "the keystore parser refuses a deep array too");
+}
+
+// ── S2-K10 split knob ───────────────────────────────────────────────────────
+
+static void test_s2_k10_split()
+{
+    std::printf("[S2-K10 split knob: max_inputs_per_tx 85 on the fixture]\n");
+    DashInjectModel m;
+    ScreenParams sp;
+    sp.dust_floor = 2;
+    PlanParams pp;
+    pp.max_inputs_per_tx = 85;
+    CHECK(drive_planned(m, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, pp), "planned");
+    const SweepBatchPlan* p = m.sweep_plan();
+    CHECK(p && p->txs.size() == 2 && p->txs[0].inputs.size() == 85 && p->txs[1].inputs.size() == 43,
+          "two txs: 85 + 43 inputs");
+    CHECK(contains(m.plan_summary(), "SPLIT: 2 txs"), "the summary shows the split");
+    CHECK(sign_with(m, key_of(KeySource::Wif, testvec::kK7Wif)) && m.signed_txs().size() == 2, "both signed");
+    if (m.signed_txs().size() == 2) {
+        CHECK(m.signed_txs()[0].size <= caps::kMaxInjectTxBytes && m.signed_txs()[1].size <= caps::kMaxInjectTxBytes,
+              "both under the 100000 B cap");
+        CHECK(m.inject_file() == m.signed_txs()[0].hex + "\n" + m.signed_txs()[1].hex + "\n", "emitted as two lines");
+        CHECK(contains(m.manifest_json(), "\"tx_count\": 2"), "manifest tx_count 2");
+    }
+    // input_limit: the N oldest (the dry-run / tiny-landing knob of the test plan).
+    PlanParams five;
+    five.input_limit = 5;
+    m.rescreen(sp);
+    m.plan(five);
+    const SweepBatchPlan* fp = m.sweep_plan();
+    int64_t oldest_max = 0;
+    if (fp) for (const Utxo& u : fp->txs[0].inputs) oldest_max = std::max(oldest_max, u.height);
+    CHECK(fp && fp->txs.size() == 1 && fp->txs[0].inputs.size() == 5 && oldest_max < 2530000 &&
+              contains(m.plan_summary(), "not selected (input limit 5): 123"),
+          "input_limit 5: the five oldest, 123 left for later");
+}
+
+// ── S2-K11 node tripwires + S2-K13 relay fee mode ───────────────────────────
+
+static_assert(kDefaultMinConf == kCoinbaseMaturity + 1, "S2-K11: the builder keeps one block of slack over consensus");
+static_assert(caps::kMaxInjectTxBytes == 100000 && caps::kMaxInjectInputs == 1000, "S2-K11: node caps");
+static_assert(kMinRelayFeePerByte == 1 && kMaxRelayFeePerByte * 1000 == 100000,
+              "S2-K11: relay rate range == dashd min relay fee .. the collateral builder's ceiling");
+static_assert(kP2pkhDustDuffs == 546, "S2-K11: Dash Core P2PKH dust threshold");
+
+static void test_s2_k13_relay_fee_mode()
+{
+    std::printf("[S2-K13 relay (fee-paying) sweep: rate, money range, sign-time checks]\n");
+    SweepRequest req = sweep_of(3, 70000);
+    req.fee_mode = FeeMode::Relay;
+    req.fee_rate_per_byte = 0;
+    CHECK(aborts_with([&] { plan_sweep(req); }, "outside"), "relay rate 0 aborts");
+    req.fee_rate_per_byte = kMaxRelayFeePerByte + 1;
+    CHECK(aborts_with([&] { plan_sweep(req); }, "outside"), "relay rate 101 aborts");
+    SweepRequest inj = sweep_of(3, 70000);
+    inj.fee_rate_per_byte = 1;
+    CHECK(aborts_with([&] { plan_sweep(inj); }, "needs fee rate 0"), "zero-fee mode with a rate aborts");
+
+    req.fee_rate_per_byte = 2;
+    req.key_encoding = PubkeyEncoding::Compressed;
+    SweepBatchPlan p = plan_sweep(req);
+    const int64_t est = 4 + 1 + 3 * 149 + 1 + 34 + 4;
+    CHECK(p.txs.size() == 1 && p.txs[0].fee == 2 * est && p.txs[0].value_out == 210000 - 2 * est &&
+              p.total_fee == 2 * est && p.fee_mode == FeeMode::Relay,
+          "fee = rate x est signed bytes; output = inputs - fee");
+    CHECK(contains(p.summary, "RELAY") && contains(p.summary, "sendrawtransaction"), "summary names the relay lane");
+
+    FoundKey key = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, KeyScanRange{});
+    std::vector<SignedTx> st = sign_sweep(p, key, true);
+    CHECK(st.size() == 1 && p.txs[0].fee >= 2 * static_cast<int64_t>(st[0].size), "signed; real rate >= 2 duffs/B");
+    auto outs = parse_outputs(H(st[0].hex));
+    CHECK(outs.size() == 1 && outs[0].value == p.txs[0].value_out, "the signed output is the planned one");
+
+    SweepBatchPlan unbalanced = p;
+    unbalanced.txs[0].fee += 1;
+    CHECK(aborts_with([&] { sign_sweep(unbalanced, key, true); }, "does not balance"), "an edited fee aborts");
+    SweepBatchPlan greedy = p;
+    greedy.txs[0].fee = 101 * est;
+    greedy.txs[0].value_out = 210000 - 101 * est;
+    CHECK(aborts_with([&] { sign_sweep(greedy, key, true); }, "above"), "a fee above 100 duffs/B aborts at sign time");
+    SweepBatchPlan as_inject = p;
+    as_inject.fee_mode = FeeMode::InjectOnlyZeroFee;
+    CHECK(aborts_with([&] { sign_sweep(as_inject, key, true); }, "not zero-fee"), "a fee in an inject plan aborts");
+    SweepBatchPlan zero = p;
+    zero.txs[0].fee = 0;
+    zero.txs[0].value_out = 210000;
+    CHECK(aborts_with([&] { sign_sweep(zero, key, true); }, "does not balance"), "a relay plan with fee 0 aborts");
+
+    // Money range at plan time.
+    SweepRequest tiny = sweep_of(2, 300);
+    tiny.fee_mode = FeeMode::Relay;
+    tiny.fee_rate_per_byte = 1;
+    CHECK(aborts_with([&] { plan_sweep(tiny); }, "exceed"), "a fee above what the tx moves aborts");
+    SweepRequest dust_out = sweep_of(1, 500);
+    CHECK(aborts_with([&] { plan_sweep(dust_out); }, "dust threshold"), "an output below 546 duffs aborts (inject too)");
+    SweepRequest uneconomic = sweep_of(3, 70000);
+    uneconomic.utxos.push_back(mk_utxo(txid_of_byte("ee"), 0, 100, 150, spk_hex_of(DUMMY_ADDR0)));
+    uneconomic.fee_mode = FeeMode::Relay;
+    uneconomic.fee_rate_per_byte = 1;
+    CHECK(contains(plan_sweep(uneconomic).summary, "carry less than the fee"), "uneconomic inputs are warned about");
+    CHECK(contains(plan_sweep(sweep_of(2, 70000)).summary, "pin lane EXCLUDES"), "inject NOTE names the pin-lane outcome (nit 1)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sign / Verify Message (design A.7). The signatures are Dash Core v23.1.7
+// `signmessagewithprivkey` output for public throwaway keys (msg_vectors.hpp);
+// ours must equal them byte for byte, and Core's must verify here.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace mv = c2w::dash::msgvec;
+
+static std::vector<uint8_t> bytes_of(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+
+// An independent RFC 4648 base64 codec, so the KATs do not judge the library's
+// btclibs codec with itself.
+static const char* const kB64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string b64_encode(const std::vector<uint8_t>& v)
+{
+    std::string out;
+    size_t i = 0;
+    for (; i + 3 <= v.size(); i += 3) {
+        const uint32_t n = (uint32_t(v[i]) << 16) | (uint32_t(v[i + 1]) << 8) | v[i + 2];
+        for (int k = 3; k >= 0; --k) out += kB64Alphabet[(n >> (6 * k)) & 63];
+    }
+    const size_t rest = v.size() - i;
+    if (rest) {
+        const uint32_t n = (uint32_t(v[i]) << 16) | (rest == 2 ? uint32_t(v[i + 1]) << 8 : 0u);
+        out += kB64Alphabet[(n >> 18) & 63];
+        out += kB64Alphabet[(n >> 12) & 63];
+        out += rest == 2 ? kB64Alphabet[(n >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
+static std::vector<uint8_t> b64_decode(const std::string& s)
+{
+    std::vector<uint8_t> out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : s) {
+        if (c == '=') break;
+        const char* p = c ? std::strchr(kB64Alphabet, c) : nullptr;
+        if (!p) return {};
+        acc = (acc << 6) | uint32_t(p - kB64Alphabet);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(uint8_t((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+// The high-S twin of a compact signature: s' = n - s (secp256k1 order n) and
+// the recovery id's parity bit flipped (R' = -R); it recovers the same key.
+static std::vector<uint8_t> high_s_twin(std::vector<uint8_t> sig65)
+{
+    static const uint8_t N[32] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                  0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48,
+                                  0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41};
+    int borrow = 0;
+    for (int i = 31; i >= 0; --i) {
+        int d = int(N[i]) - int(sig65[33 + i]) - borrow;
+        borrow = d < 0 ? 1 : 0;
+        if (d < 0) d += 256;
+        sig65[33 + i] = uint8_t(d);
+    }
+    const int h = sig65[0] - 27;
+    sig65[0] = uint8_t(27 + ((h & 3) ^ 1) + (h & 4));
+    return sig65;
+}
+
+template <typename F>
+static std::string sig_or_empty(F&& fn, const char* what)
+{
+    try { return fn(); }
+    catch (const std::exception& e) { std::printf("    (%s threw: %s)\n", what, e.what()); return {}; }
+}
+
+static void test_message_kats()
+{
+    std::printf("[message KATs: Dash Core v23.1.7 signmessagewithprivkey vectors, byte-identical]\n");
+    const MessageCoin& dash = message_coin("DASH");
+    CHECK(std::string(dash.ticker) == "DASH" && std::string(dash.magic) == "DarkCoin Signed Message:\n" &&
+              dash.p2pkh_mainnet == kMainnetP2PKHVersion && dash.p2pkh_testnet == kTestnetP2PKHVersion && dash.kat_proven,
+          "DASH row: DarkCoin magic, 0x4c / 0x8c, proven by a node vector");
+    CHECK(&message_coins().front() == &dash, "DASH is the first row");
+    CHECK(message_coin("BTC").p2pkh_mainnet == 0x00 && message_coin("LTC").p2pkh_mainnet == 0x30 &&
+              message_coin("DOGE").p2pkh_mainnet == 0x1e && message_coin("DGB").p2pkh_mainnet == 0x1e,
+          "the other rows take their mainnet P2PKH byte from the CoinParams SSOT");
+    bool only_dash = true;
+    for (const MessageCoin& c : message_coins())
+        if (c.kat_proven != (std::string(c.ticker) == "DASH")) only_dash = false;
+    CHECK(only_dash, "only DASH is kat_proven");
+    CHECK(aborts([] { message_coin("XYZ"); }) && aborts([] { message_coin("dash"); }), "an unknown or lower-case ticker aborts");
+
+    // ── M1 digest layout ────────────────────────────────────────────────────
+    const std::string magic = "DarkCoin Signed Message:\n";
+    std::vector<uint8_t> pre = {0x19};
+    pre.insert(pre.end(), magic.begin(), magic.end());
+    std::vector<uint8_t> m1 = pre;
+    m1.insert(m1.end(), {0x02, 'a', 'b'});
+    CHECK(message_digest(dash, bytes_of("ab")) == c2w::artifact::sha256d(m1),
+          "M1: digest == dsha256(\"\\x19DarkCoin Signed Message:\\n\\x02ab\")");
+    const std::vector<uint8_t> lng = mv::message_bytes(mv::Msg::Long);
+    std::vector<uint8_t> m1b = pre;
+    m1b.insert(m1b.end(), {0xfd, 0x2c, 0x01});
+    m1b.insert(m1b.end(), lng.begin(), lng.end());
+    CHECK(lng.size() == 300 && lng.back() == ' ' && message_digest(dash, lng) == c2w::artifact::sha256d(m1b),
+          "M1b: the 300-byte message's varstr is fd 2c 01 + the bytes");
+    std::vector<uint8_t> m1c = pre;
+    m1c.push_back(0x00);
+    CHECK(message_digest(dash, {}) == c2w::artifact::sha256d(m1c), "M1c: the empty message's varstr is 00");
+
+    // ── the two keys, through the importers ────────────────────────────────
+    FoundKey kA, kA2, kU;
+    CHECK(runs([&] { kA = load_funding_key(key_of(KeySource::Wif, mv::kWifA), mv::kAddrA, false); }, "WIF A") &&
+              kA.compressed && kA.pub.size() == 33,
+          "key A via WIF: compressed, bound to Xn9K...");
+    CHECK(runs([&] { kA2 = find_key_for_address(DUMMY_MNEMONIC, testvec::kPyParityPassphrase, mv::kAddrA, false, KeyScanRange{}); },
+               "mnemonic A") &&
+              kA2.compressed && kA2.path == "m/44'/5'/0'/0/0",
+          "key A via mnemonic + TREZOR: m/44'/5'/0'/0/0, compressed");
+    CHECK(runs([&] { kU = load_funding_key(key_of(KeySource::Wif, mv::kWifU), mv::kAddrU, false); }, "WIF U") &&
+              !kU.compressed && hexstr(kU.pub) == mv::kPubUHex && kU.address == mv::kAddrU,
+          "key U via WIF: scalar 1, uncompressed pub == G, computed address == XoyDQ...");
+    SecureBytes one(32);
+    for (size_t i = 0; i < 32; ++i) one[i] = 0;
+    one[31] = 1;
+
+    // ── M2..M6 + negatives M7..M14 on every row ────────────────────────────
+    for (const mv::CoreMsgVector& v : mv::kCoreVectors) {
+        const std::string L = v.label;
+        const std::vector<uint8_t> msg = mv::message_bytes(v.msg);
+        const char* addr = v.key_a ? mv::kAddrA : mv::kAddrU;
+        const char* other = v.key_a ? mv::kAddrU : mv::kAddrA;
+        std::string s1, s2;
+        if (v.key_a) {
+            s1 = sig_or_empty([&] { return sign_message(dash, kA, msg, false); }, "sign A (WIF)");
+            s2 = sig_or_empty([&] { return sign_message(dash, kA2, msg, false); }, "sign A (mnemonic)");
+        } else {
+            s1 = sig_or_empty([&] { return sign_message(dash, kU, msg, false); }, "sign U (WIF)");
+            s2 = sig_or_empty([&] { return sign_message(dash, one, false, msg, addr, false); }, "sign U (scalar 1)");
+        }
+        const bool same = s1 == v.sig_b64 && s2 == v.sig_b64;
+        std::printf("    %-8s %s\n", v.label, same ? "byte-identical to Dash Core" : "MISMATCH");
+        CHECK(same, ("M2-M5 " + L + ": our signature == Dash Core's, through both importers").c_str());
+
+        VerifyReport r;
+        const std::vector<uint8_t> raw = b64_decode(v.sig_b64);
+        CHECK(raw.size() == 65 && b64_encode(raw) == v.sig_b64, ("independent base64 round trip " + L).c_str());
+        CHECK(verify_message(dash, addr, msg, v.sig_b64, false, &r) && r.valid && r.why.empty() &&
+                  r.header_compressed == v.key_a && r.recovered_address == addr && r.recid == ((raw.at(0) - 27) & 3),
+              ("M6 " + L + ": Core's signature verifies; header_compressed == key encoding").c_str());
+
+        std::vector<uint8_t> altered = msg;
+        altered.back() ^= 0x01;
+        CHECK(!verify_message(dash, addr, altered, v.sig_b64, false, &r) && !r.valid && contains(r.why, "recovers to"),
+              ("M7 " + L + ": one altered message byte is INVALID").c_str());
+        CHECK(!verify_message(dash, other, msg, v.sig_b64, false, &r) && contains(r.why, "recovers to"),
+              ("M8 " + L + ": the other address is INVALID").c_str());
+        std::vector<uint8_t> flip = raw; // the compressed bit of (header - 27)
+        flip[0] = uint8_t(27 + ((raw[0] - 27) ^ 4));
+        CHECK(!verify_message(dash, addr, msg, b64_encode(flip), false, &r) && r.header_compressed == !v.key_a &&
+                  contains(r.why, "recovers to"),
+              ("M9 " + L + ": the compressed flag flipped is INVALID").c_str());
+        std::vector<uint8_t> ts = raw;
+        ts[64] ^= 1;
+        CHECK(!verify_message(dash, addr, msg, b64_encode(ts), false, &r) && !r.why.empty(),
+              ("M10 " + L + ": the last byte of s altered is INVALID").c_str());
+        std::vector<uint8_t> h35 = raw;
+        h35[0] = 0x23;
+        CHECK(!verify_message(dash, addr, msg, b64_encode(h35), false, &r) && contains(r.why, "out of 27..34"),
+              ("M11 " + L + ": header 35 is out of range").c_str());
+        const std::vector<uint8_t> s64(raw.begin(), raw.begin() + 64);
+        CHECK(!verify_message(dash, addr, msg, b64_encode(s64), false, &r) && contains(r.why, "not 65 bytes"),
+              ("M12 " + L + ": a 64-byte signature is INVALID").c_str());
+        CHECK(!verify_message(dash, addr, msg, "not*base64!", false, &r) && r.why == "bad base64" &&
+                  !verify_message(dash, addr, msg, std::string(88, '!'), false, &r) && r.why == "bad base64",
+              ("M13 " + L + ": non-base64 input is INVALID").c_str());
+        CHECK(!verify_message(dash, addr, msg, "", false, &r) && r.why == "empty signature",
+              ("M14 " + L + ": an empty signature is INVALID").c_str());
+        const std::vector<uint8_t> twin = high_s_twin(raw);
+        CHECK(twin != raw && verify_message(dash, addr, msg, b64_encode(twin), false, &r) && r.recovered_address == addr,
+              ("M6b " + L + ": the high-S twin verifies, as Core's RecoverCompact accepts it").c_str());
+    }
+
+    const std::vector<uint8_t> shortm = mv::message_bytes(mv::Msg::Short);
+    const std::string a_short = mv::kCoreVectors[0].sig_b64, u_short = mv::kCoreVectors[2].sig_b64;
+
+    // ── M15 self-verify gate ────────────────────────────────────────────────
+    CHECK(aborts_with([&] { sign_message(dash, kA.priv, true, shortm, mv::kAddrU, false); }, "self-verify FAILED"),
+          "M15a: key A claiming XoyDQ... hard-aborts");
+    CHECK(aborts_with([&] { sign_message(dash, one, true, shortm, mv::kAddrU, false); }, "self-verify FAILED"),
+          "M15b: key U signed as compressed while claiming XoyDQ... hard-aborts (the flag is load-bearing)");
+    CHECK(aborts_with([&] { sign_message(dash, one, false, shortm, mv::kAddrA, false); }, "self-verify FAILED"),
+          "M15c: key U uncompressed claiming Xn9K... hard-aborts");
+    FoundKey bad;
+    bad.priv = kA.priv.copy();
+    bad.pub = kA.pub;
+    bad.compressed = false;
+    bad.address = mv::kAddrA;
+    CHECK(aborts_with([&] { sign_message(dash, bad, shortm, false); }, "malformed"),
+          "M15d: a FoundKey whose pubkey length contradicts its encoding is refused");
+    CHECK(aborts_with([&] { sign_message(dash, kA.priv, true, shortm, "Xn9KtWHuvMBuSbpzPFTzYG2bC9Wp2ZZJJH", false); }, "checksum"),
+          "M15e: a bad address checksum aborts before signing");
+
+    // ── M16 determinism ─────────────────────────────────────────────────────
+    CHECK(sig_or_empty([&] { return sign_message(dash, kA, shortm, false); }, "sign") ==
+              sig_or_empty([&] { return sign_message(dash, kA, shortm, false); }, "sign"),
+          "M16: two signs are equal (RFC6979)");
+
+    // ── M17 empty message: byte-identical to Core ──────────────────────────
+    for (const mv::CoreMsgVector& v : mv::kCoreEmptyVectors) {
+        const char* addr = v.key_a ? mv::kAddrA : mv::kAddrU;
+        const std::string s = sig_or_empty([&] { return sign_message(dash, v.key_a ? kA : kU, {}, false); }, "sign empty");
+        VerifyReport r;
+        CHECK(s == v.sig_b64 && verify_message(dash, addr, {}, v.sig_b64, false, &r) && r.header_compressed == v.key_a,
+              ("M17 " + std::string(v.label) + ": the empty message signs byte-identical to Core and verifies").c_str());
+    }
+
+    // ── M18 unproven coin ───────────────────────────────────────────────────
+    const MessageCoin& btc = message_coin("BTC");
+    CHECK(aborts_with([&] { sign_message(btc, kA.priv, true, shortm, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", false); },
+                      "no node vector"),
+          "M18: sign refuses a coin without a node vector");
+    VerifyReport r18;
+    CHECK(!verify_message(btc, "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", shortm, a_short, false, &r18) &&
+              contains(r18.why, "no node vector"),
+          "M18: verify refuses it with the reason");
+
+    // ── M19 the original wrappers ───────────────────────────────────────────
+    CHECK(sig_or_empty([&] { return sign_message(kA.priv, std::string(mv::kMsgShort), mv::kAddrA, false); }, "wrapper") == a_short,
+          "M19: the old sign wrapper still produces A-short exactly");
+    CHECK(verify_message(mv::kAddrA, mv::kMsgShort, a_short, false), "M19: the old verify wrapper accepts A-short");
+    CHECK(verify_message(mv::kAddrU, mv::kMsgShort, u_short, false),
+          "M19 / gap 2: the old verify wrapper now accepts an uncompressed-key Core signature");
+    // The pre-existing roundtrip checks, on a key and message off the vectors.
+    FoundKey k0 = find_key_for_address(DUMMY_MNEMONIC, "", DUMMY_ADDR0, false, 0, 3, false);
+    const std::string rt = "c2wallet-qt dash proposal-ownership test";
+    const std::string sig = sig_or_empty([&] { return sign_message(k0.priv, rt, DUMMY_ADDR0, false); }, "roundtrip");
+    std::string corrupt = sig;
+    if (!corrupt.empty()) corrupt[0] = (corrupt[0] == 'A' ? 'B' : 'A');
+    CHECK(!sig.empty() && verify_message(DUMMY_ADDR0, rt, sig, false) && !verify_message(DUMMY_ADDR0, rt + "!", sig, false) &&
+              !verify_message(DUMMY_ADDR1, rt, sig, false) && !verify_message(DUMMY_ADDR0, rt, corrupt, false),
+          "M19: wrapper roundtrip; tampered message / other address / tampered signature fail");
+    CHECK(aborts([&] { sign_message(k0.priv, rt, DUMMY_ADDR1, false); }), "M19: wrapper self-verify gate on the wrong address");
+
+    // ── network ─────────────────────────────────────────────────────────────
+    VerifyReport rn;
+    CHECK(!verify_message(dash, mv::kAddrA, shortm, a_short, true, &rn) && contains(rn.why, "wrong version byte"),
+          "a mainnet address under testnet is INVALID (wrong network)");
+    const std::string tA = h160_to_addr(addr_to_h160(mv::kAddrA, false), true);
+    const std::string st = sig_or_empty([&] { return sign_message(dash, kA.priv, true, shortm, tA, true); }, "testnet sign");
+    CHECK(tA[0] == 'y' && st == a_short && verify_message(dash, tA, shortm, st, true),
+          "testnet: key A's y-address signs and verifies; the address version is not part of the digest");
+}
+
+static void test_message_model()
+{
+    std::printf("[message model: target -> message -> key -> SIGN -> sign, verify, wipe]\n");
+    const MessageCoin& dash = message_coin("DASH");
+    const std::vector<uint8_t> shortm = mv::message_bytes(mv::Msg::Short);
+    const std::string a_short = mv::kCoreVectors[0].sig_b64;
+    auto drive = [](MessageModel& m, const char* addr, const std::vector<uint8_t>& msg, const KeyInput& k) {
+        return runs([&] {
+            m.set_target("DASH", addr);
+            m.set_message(msg);
+            m.load_key(k);
+            m.set_gate(true, kSignWord);
+            m.sign();
+        }, "drive the message model");
+    };
+    const std::array<uint8_t, 20> hA = addr_to_h160(mv::kAddrA, false);
+    const std::string hA_hex = hexstr(std::vector<uint8_t>(hA.begin(), hA.end()));
+
+    {
+        MessageModel m;
+        CHECK(m.stage() == MessageStage::Empty && !m.has_message() && m.export_text().empty() && !m.armed(),
+              "a fresh model is empty");
+        CHECK(runs([&] { m.set_target("DASH", mv::kAddrA); }, "target") && m.stage() == MessageStage::Targeted &&
+                  contains(m.target_card(), "0x4c") && contains(m.target_card(), hA_hex.c_str()) &&
+                  contains(m.target_card(), "DarkCoin Signed Message:\\n"),
+              "target card: magic, version byte, hash160");
+        m.set_message(shortm);
+        CHECK(runs([&] { m.load_key(key_of(KeySource::Wif, mv::kWifA)); }, "key") && m.stage() == MessageStage::KeyBound &&
+                  m.has_key() && contains(m.key_card(), "(compressed) via WIF"),
+              "WIF bound; key card names the encoding");
+        const size_t before = m.keys_wiped();
+        m.set_gate(true, kSignWord);
+        CHECK(m.armed() && runs([&] { m.sign(); }, "sign") && m.stage() == MessageStage::Signed, "signed");
+        CHECK(m.signature_b64() == a_short, "model (WIF) signature == Dash Core A-short");
+        const std::string want = std::string("address:   ") + mv::kAddrA +
+                                 "\nmessage:   dashcentral-proposal-1556\nsignature: " + a_short + "\n";
+        CHECK(m.export_text() == want, "export_text == the python stopgap's stdout, byte for byte");
+        CHECK(!m.has_key() && m.keys_wiped() == before + 1 && contains(m.key_card(), "wiped") && !m.armed(),
+              "sentinel: the key was destroyed by sign");
+        const std::string card = m.sign_card();
+        CHECK(contains(card, (std::string("self-verify: OK (recovered ") + mv::kAddrA + ", compressed, recid ").c_str()) &&
+                  contains(card, m.message_sha256_hex().c_str()) && contains(card, "25 bytes") &&
+                  contains(card, a_short.c_str()) && contains(card, "replayed as a transaction"),
+              "sign card: address, bytes, sha256, signature, self-verify line, domain note");
+        m.set_message(shortm);
+        CHECK(m.stage() == MessageStage::Targeted && m.signature_b64().empty() && m.export_text().empty() &&
+                  m.sign_card() == "not signed",
+              "a new message after signing drops the signature (back to Targeted)");
+    }
+
+    {
+        MessageModel m;
+        CHECK(drive(m, mv::kAddrA, shortm, key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase)) &&
+                  m.signature_b64() == a_short,
+              "model (mnemonic + TREZOR, default scan) == Dash Core A-short");
+    }
+    auto model_rows = [&](const mv::CoreMsgVector* rows, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            const mv::CoreMsgVector& v = rows[i];
+            MessageModel m;
+            const std::vector<uint8_t> msg = mv::message_bytes(v.msg);
+            const bool ok = drive(m, v.key_a ? mv::kAddrA : mv::kAddrU, msg, key_of(KeySource::Wif, v.key_a ? mv::kWifA : mv::kWifU));
+            std::string want = std::string("address:   ") + (v.key_a ? mv::kAddrA : mv::kAddrU) + "\nmessage:   ";
+            want.append(msg.begin(), msg.end());
+            want += std::string("\nsignature: ") + v.sig_b64 + "\n";
+            CHECK(ok && m.signature_b64() == v.sig_b64 && m.export_text() == want &&
+                      contains(m.sign_card(), v.key_a ? ", compressed, recid" : ", uncompressed, recid") &&
+                      contains(m.sign_card(), v.key_a ? "imported WIF key (compressed), wiped"
+                                                      : "imported WIF key (uncompressed), wiped"),
+                  ("model " + std::string(v.label) + " (WIF): byte-identical to Dash Core").c_str());
+        }
+    };
+    model_rows(mv::kCoreVectors, sizeof(mv::kCoreVectors) / sizeof(mv::kCoreVectors[0]));
+    model_rows(mv::kCoreEmptyVectors, sizeof(mv::kCoreEmptyVectors) / sizeof(mv::kCoreEmptyVectors[0]));
+
+    // ── refusals leave the stage untouched ──────────────────────────────────
+    {
+        MessageModel m;
+        const KeyInput wifA = key_of(KeySource::Wif, mv::kWifA);
+        CHECK(aborts_with([&] { m.load_key(wifA); }, "target") && m.stage() == MessageStage::Empty && !m.has_key(),
+              "load_key before the target aborts");
+        m.set_target("DASH", mv::kAddrA);
+        CHECK(aborts_with([&] { m.load_key(wifA); }, "set the message first") && m.stage() == MessageStage::Targeted &&
+                  !m.has_key(),
+              "load_key before the message aborts");
+        m.set_message(shortm);
+        CHECK(aborts_with([&] { m.sign(); }, "no key is bound") && m.stage() == MessageStage::Targeted,
+              "sign before the key aborts");
+        CHECK(aborts_with([&] { m.load_key(key_of(KeySource::Wif, testvec::kDecoyWif)); }, "is for") && !m.has_key() &&
+                  m.stage() == MessageStage::Targeted,
+              "a key for another address aborts; nothing is bound");
+        CHECK(aborts_with([&] { m.load_key(key_of(KeySource::Wif, testvec::kK7WifBtcVersion)); }, "version byte") &&
+                  !m.has_key(),
+              "a non-DASH WIF version aborts");
+        m.load_key(wifA);
+        m.set_gate(true, "SIGn");
+        CHECK(!m.armed() && aborts_with([&] { m.sign(); }, "not armed") && m.stage() == MessageStage::KeyBound && m.has_key(),
+              "\"SIGn\" does not arm; the refusal keeps the key and the stage");
+        m.set_gate(false, kSignWord);
+        CHECK(!m.armed() && aborts_with([&] { m.sign(); }, "not armed") && m.stage() == MessageStage::KeyBound && m.has_key(),
+              "the unticked review box does not arm");
+        m.set_gate(true, kSpendWord);
+        CHECK(!m.armed() && std::string(kSignWord) != kSpendWord, "the money word SPEND does not arm a message signature");
+        const std::string tA = h160_to_addr(hA, true);
+        CHECK(aborts_with([&] { m.set_target("DASH", tA); }, "wrong version byte") && m.stage() == MessageStage::KeyBound &&
+                  m.has_key() && m.address() == mv::kAddrA,
+              "a testnet address on a mainnet model is refused; nothing changes");
+        CHECK(aborts_with([&] { m.set_target("BTC", "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"); }, "no node vector") &&
+                  m.stage() == MessageStage::KeyBound && m.has_key() && m.ticker() == "DASH",
+              "an unproven coin is refused; nothing changes");
+        CHECK(aborts_with([&] { m.set_target("XYZ", mv::kAddrA); }, "unknown") && m.stage() == MessageStage::KeyBound,
+              "an unknown coin is refused");
+        CHECK(aborts_with([&] { m.set_target("DASH", "Xn9KtWHuvMBuSbpzPFTzYG2bC9Wp2ZZJJH"); }, "checksum") &&
+                  m.stage() == MessageStage::KeyBound && m.has_key(),
+              "a bad checksum is refused");
+
+        size_t w = m.keys_wiped();
+        m.set_message(shortm);
+        CHECK(m.stage() == MessageStage::Targeted && !m.has_key() && m.keys_wiped() == w + 1,
+              "re-set_message after KeyBound wipes the key (sentinel) and drops to Targeted");
+        m.load_key(wifA);
+        w = m.keys_wiped();
+        m.set_target("DASH", mv::kAddrU);
+        CHECK(m.stage() == MessageStage::Targeted && !m.has_key() && m.keys_wiped() == w + 1 && m.has_message() &&
+                  m.address() == mv::kAddrU,
+              "a re-target wipes the key and keeps the message");
+        m.set_target("DASH", mv::kAddrA);
+        m.load_key(wifA);
+        w = m.keys_wiped();
+        m.reset();
+        CHECK(m.stage() == MessageStage::Empty && !m.has_key() && m.keys_wiped() == w + 1 && !m.has_message() &&
+                  m.address().empty() && m.target_card() == "no target set",
+              "reset() wipes the key and everything else");
+    }
+    {
+        MessageModel t(true);
+        CHECK(t.testnet() && aborts_with([&] { t.set_target("DASH", mv::kAddrA); }, "wrong version byte") &&
+                  runs([&] { t.set_target("DASH", h160_to_addr(hA, true)); }, "testnet target") &&
+                  contains(t.target_card(), "0x8c") && contains(t.target_card(), "testnet"),
+              "a testnet model takes a y-address and refuses an X-address");
+    }
+
+    // ── message flags ───────────────────────────────────────────────────────
+    {
+        auto F = [](const std::string& s) { return message_flags(bytes_of(s)); };
+        const MessageFlags plain = F(mv::kMsgShort);
+        CHECK(plain.bytes == 25 && plain.lines == 1 && !plain.empty && !plain.leading_ws && !plain.trailing_ws &&
+                  !plain.trailing_newline && !plain.has_cr && !plain.invalid_utf8 && !plain.long_form,
+              "flags: the DashCentral claim raises nothing");
+        CHECK(F("abc\n").trailing_newline && !F("abc\n").trailing_ws && F("abc\n").lines == 2, "flags: trailing newline");
+        CHECK(F(" abc").leading_ws && !F(" abc").trailing_ws, "flags: leading whitespace");
+        CHECK(F("abc ").trailing_ws && F("abc\t").trailing_ws && !F("abc ").leading_ws, "flags: trailing whitespace");
+        CHECK(F("a\rb").has_cr && !F("a\nb").has_cr && F("a\nb").lines == 2, "flags: CR");
+        CHECK(F("").empty && F("").bytes == 0, "flags: empty");
+        CHECK(plain.non_ascii == 0 && F("a\xc2\xa0" "b").non_ascii == 2 && !F("a\xc2\xa0" "b").invalid_utf8 &&
+                  F("\xe2\x82\xac").non_ascii == 3 && message_flags({0xff}).non_ascii == 1,
+              "flags: non-ASCII byte count (a pasted no-break space is 2 bytes)");
+        CHECK(message_flags(mv::message_bytes(mv::Msg::Long)).long_form && !F(std::string(252, 'a')).long_form &&
+                  F(std::string(253, 'a')).long_form,
+              "flags: long form from 253 bytes (300 B is long)");
+        CHECK(!F("\xc3\xa9").invalid_utf8 && !F("\xe2\x82\xac").invalid_utf8 && !F("\xf0\x9f\x98\x80").invalid_utf8,
+              "flags: valid 2/3/4-byte UTF-8");
+        CHECK(message_flags({0xff}).invalid_utf8 && message_flags({0xc0, 0x80}).invalid_utf8 &&
+                  message_flags({0xed, 0xa0, 0x80}).invalid_utf8 && message_flags({0xe2, 0x82}).invalid_utf8 &&
+                  message_flags({0xf4, 0x90, 0x80, 0x80}).invalid_utf8,
+              "flags: invalid UTF-8 (0xff, overlong, surrogate, truncated, above U+10FFFF)");
+        CHECK(message_sha256_hex(bytes_of("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+              "sha256 fingerprint of the exact bytes");
+        MessageModel m;
+        const std::vector<uint8_t> ff = {0xff};
+        CHECK(drive(m, mv::kAddrA, ff, key_of(KeySource::Wif, mv::kWifA)) && m.flags().invalid_utf8 &&
+                  verify_message(dash, mv::kAddrA, ff, m.signature_b64(), false),
+              "invalid-UTF-8 bytes are still signed as-is and verify");
+    }
+
+    // ── secret hygiene (the S2-K9 pattern) ──────────────────────────────────
+    {
+        c2w::hdkeys::WifDecode wd = c2w::hdkeys::decode_wif(mv::kWifA);
+        const std::string scalar_hex = hexstr(std::vector<uint8_t>(wd.scalar.data(), wd.scalar.data() + wd.scalar.size()));
+        CHECK(wd.ok && scalar_hex.size() == 64, "test scalar decoded for the grep");
+        const std::vector<std::string> secrets = {
+            mv::kWifA, mv::kWifU, testvec::kK7WifBtcVersion, testvec::kK7Bip38Dash, testvec::kK7AccountXprv,
+            testvec::kDecoyWif, testvec::kBip38Pass, testvec::kPyParityPassphrase, "abandon", DUMMY_MNEMONIC, scalar_hex};
+        std::vector<std::string> outputs;
+        auto cards = [&](const MessageModel& m) {
+            for (const std::string& t : {m.target_card(), m.key_card(), m.sign_card(), m.export_text()}) outputs.push_back(t);
+        };
+        const std::vector<std::pair<const char*, KeyInput>> keys = {
+            {mv::kAddrA, key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, testvec::kPyParityPassphrase)},
+            {mv::kAddrA, key_of(KeySource::Wif, mv::kWifA)},
+            {mv::kAddrA, key_of(KeySource::Bip38, testvec::kK7Bip38Dash, testvec::kBip38Pass)},
+            {mv::kAddrA, key_of(KeySource::Descriptor, testvec::kK7Descriptor)},
+            {mv::kAddrA, key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\",\"" + mv::kWifA + "\"]}")},
+            {mv::kAddrA, key_of(KeySource::JsonKeystore, std::string("{\"xprv\":\"") + testvec::kK7AccountXprv + "\"}")},
+            {mv::kAddrU, key_of(KeySource::Wif, mv::kWifU)},
+        };
+        for (const auto& entry : keys) {
+            const char* addr = entry.first;
+            const KeyInput& k = entry.second;
+            MessageModel m;
+            m.set_target("DASH", addr);
+            m.set_message(shortm);
+            CHECK(runs([&] { m.load_key(k); }, "load_key"), "bound");
+            cards(m);
+            const size_t before = m.keys_wiped();
+            m.set_gate(true, kSignWord);
+            CHECK(runs([&] { m.sign(); }, "sign") && !m.has_key() && m.keys_wiped() == before + 1,
+                  "signed; the key died at sign");
+            cards(m);
+        }
+        MessageModel m;
+        m.set_target("DASH", mv::kAddrA);
+        m.set_message(shortm);
+        std::string broken_desc = testvec::kK7Descriptor;
+        broken_desc.replace(broken_desc.find("xprv9z") + 10, 1, "!");
+        const std::vector<KeyInput> bad = {
+            key_of(KeySource::Descriptor, broken_desc),
+            key_of(KeySource::Wif, std::string(mv::kWifA).substr(0, 40) + "0"),
+            key_of(KeySource::Wif, testvec::kK7WifBtcVersion),
+            key_of(KeySource::Wif, testvec::kDecoyWif),
+            key_of(KeySource::Bip38, testvec::kK7Bip38Dash, "wrong"),
+            key_of(KeySource::JsonKeystore, std::string("{\"keys\":[\"") + testvec::kDecoyWif + "\"]}"),
+            key_of(KeySource::Mnemonic, DUMMY_MNEMONIC, "x"),
+            key_of(KeySource::Mnemonic, std::string(DUMMY_MNEMONIC).replace(0, 7, "zzzzzzz"), ""),
+        };
+        size_t refused = 0;
+        for (const KeyInput& k : bad) {
+            try { m.load_key(k); }
+            catch (const DashAbort& e) { ++refused; outputs.push_back(e.what()); }
+        }
+        CHECK(refused == bad.size(), "every bad key input is refused");
+        cards(m);
+        bool clean = true;
+        for (const std::string& o : outputs)
+            for (const std::string& sec : secrets)
+                if (!sec.empty() && o.find(sec) != std::string::npos) {
+                    clean = false;
+                    std::printf("    LEAK of a test secret in: %.80s...\n", o.c_str());
+                }
+        CHECK(clean && outputs.size() > 50, "no card, export or error message carries a test secret");
+    }
 }
 
 int main(int argc, char** argv)
@@ -261,12 +2456,92 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    // ctest export_utxos_roundtrip hook: import a UTXO file through the model,
+    // screen it at the default target and print the two public cards.
+    if (argc >= 3 && std::strcmp(argv[1], "--import-file") == 0) {
+        try {
+            DashInjectModel m;
+            m.import_utxos(read_file(argv[2]), argc >= 4 ? std::atoll(argv[3]) : 0);
+            m.rescreen({});
+            std::printf("%s%s", m.import_card().c_str(), m.screen_card().c_str());
+            return 0;
+        } catch (const std::exception& e) {
+            std::printf("REFUSED: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    // Oracle hook: the slice-2 end-to-end txs on the fixture (test key), as
+    // "<label> <unsigned hex> <signed hex>" lines, so the python reference can
+    // re-sign the same unsigned bytes and compare byte for byte.
+    if (argc >= 2 && std::strcmp(argv[1], "--emit-s2-e2e") == 0) {
+        ScreenParams sp;
+        sp.dust_floor = 2;
+        PlanParams relay;
+        relay.fee_mode = FeeMode::Relay;
+        relay.fee_rate_per_byte = 1;
+        PlanParams split;
+        split.max_inputs_per_tx = 85;
+        const std::pair<const char*, PlanParams> runs_[] = {{"zero-fee", PlanParams{}}, {"relay-1", relay}, {"split-85", split}};
+        for (const auto& [label, pp] : runs_) {
+            DashInjectModel m;
+            if (!drive_planned(m, fixture_for(testvec::kPyParityAddress), kFixtureTip, sp, pp) ||
+                !sign_with(m, key_of(KeySource::Wif, testvec::kK7Wif)))
+                return 1;
+            for (size_t i = 0; i < m.signed_txs().size(); ++i)
+                std::printf("%s %s %s\n", label, hexstr(m.sweep_plan()->txs[i].unsigned_tx).c_str(),
+                            m.signed_txs()[i].hex.c_str());
+        }
+        return 0;
+    }
+
+    // Each section prints its own count, so a silent pass is still visible.
+#define RUN(fn)                                                                              \
+    do {                                                                                     \
+        const int p0_ = g_pass, f0_ = g_fail;                                                \
+        fn();                                                                                \
+        std::printf("    -> %s: %d passed, %d failed\n", #fn, g_pass - p0_, g_fail - f0_);   \
+    } while (0)
     std::printf("=== c2wallet-qt M3-A-DASH KATs ===\n");
-    test_gov_hash();
-    test_address();
-    test_key_scan();
-    test_collateral_tx();
-    test_message();
+    RUN(test_gov_hash);
+    RUN(test_address);
+    RUN(test_key_scan);
+    RUN(test_collateral_tx);
+
+    std::printf("\n=== zero-fee inject builders ===\n");
+    RUN(test_k1_onchain_collateral);
+    RUN(test_k2_fee_flags);
+    RUN(test_k3_sweep_all);
+    RUN(test_k4_maturity);
+    RUN(test_k5_batch_split);
+    RUN(test_k6_sign_verify);
+    RUN(test_k7_python_parity);
+    RUN(test_k8_uncompressed_scan);
+    RUN(test_k9_emit_format);
+    RUN(test_k10_bip68);
+    RUN(test_k12_refusals);
+    RUN(test_k13_display_roundtrip);
+    RUN(test_utxo_intake);
+
+    std::printf("\n=== slice 2: DashInjectModel / PageDashInject ===\n");
+    RUN(test_s2_k1_export_v1);
+    RUN(test_s2_k2_getaddressutxos_fixture);
+    RUN(test_s2_k3_rescreen);
+    RUN(test_s2_k4_state_machine);
+    RUN(test_s2_f1_relay_collateral_fee);
+    RUN(test_s2_k5_key_paths);
+    RUN(test_s2_k6_end_to_end);
+    RUN(test_s2_k7_manifest);
+    RUN(test_s2_k8_collateral);
+    RUN(test_s2_k9_secret_hygiene);
+    RUN(test_s2_k10_split);
+    RUN(test_s2_f3_json_depth);
+    RUN(test_s2_k13_relay_fee_mode);
+    CHECK(kDefaultMinConf == kCoinbaseMaturity + 1, "S2-K11: kDefaultMinConf == kCoinbaseMaturity + 1 (also static_assert)");
+
+    std::printf("\n=== Sign / Verify Message (design A.7) ===\n");
+    RUN(test_message_kats);
+    RUN(test_message_model);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
