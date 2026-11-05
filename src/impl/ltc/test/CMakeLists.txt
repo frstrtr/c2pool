@@ -265,6 +265,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # 3200601), one refusal per check, the source's /local_stats block. Same
     # folding rule.
     #
+    # mweb_ext_poller_test.cpp: its getblocktemplate poller (#2137 S3): the
+    # schedule (tip change, 5 s period, 0.5 s retry, error back-off), the
+    # worker thread, the fetch bounded by its timeout (a local JSON-RPC
+    # server, a silent one, a closed port). Same folding rule.
+    #
     # template_mweb_ext_merge_test.cpp: the extension merged into the REAL
     # TemplateBuilder (#2137 S3): none mode byte-identical to the S0+S1 head,
     # litecoind's peg-ins first and its HogEx last with the pool's selection
@@ -319,6 +324,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
         mweb_ext_import_test.cpp
+        mweb_ext_poller_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp

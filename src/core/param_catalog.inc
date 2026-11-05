@@ -541,6 +541,9 @@ C2P_PARAM("embedded.ltc_mweb_cmpct_provisional", Embedded, BOOL, RESTART, C_LTC,
 C2P_PARAM("embedded.template_tx_check", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "strict", ENUM_MEMBER, "LTC template transaction check: strict (refuse / HOLD) or warn (log and count only)")
   C2P_ALIAS("embedded.template_tx_check", BIN_LTC, "--template-tx-check", VALUE)
 
+C2P_PARAM("embedded.ltc_mweb_ext", Embedded, ENUM_STR, RESTART, C_LTC, LIT, "none", ENUM_MEMBER, "LTC MWEB extension source: none (empty body, daemonless) or litecoind (the local litecoind's, checked against c2pool's MWEB state; needs the LTC RPC settings)")
+  C2P_ALIAS("embedded.ltc_mweb_ext", BIN_LTC, "--ltc-mweb-ext", VALUE)
+
 C2P_PARAM("embedded.anchor", Embedded, STRING, RESTART, C_BCH, LIT, "", NONE, "BCH anchor H:HASH")
   C2P_ALIAS("embedded.anchor", BIN_BCH, "--anchor", VALUE)
 
