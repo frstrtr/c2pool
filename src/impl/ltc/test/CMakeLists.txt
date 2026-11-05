@@ -257,6 +257,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # depth and completeness of the UTXO view the template prices against
     # (sync state, else the anchor this process observed, else unknown) and
     # the admission counters of what it cannot price. Same folding rule.
+    #
+    # mweb_ext_import_test.cpp: the hybrid MWEB extension's import (#2137 S3):
+    # litecoind's getblocktemplate parsed and checked against c2pool's own
+    # MWEB state on REAL mainnet data (the 3200605 template on 3200604, block
+    # 3200601's peg-in and peg-out, block 3200603 on the state derived from
+    # 3200601), one refusal per check, the source's /local_stats block. Same
+    # folding rule.
+    #
+    # template_mweb_ext_merge_test.cpp: the extension merged into the REAL
+    # TemplateBuilder (#2137 S3): none mode byte-identical to the S0+S1 head,
+    # litecoind's peg-ins first and its HogEx last with the pool's selection
+    # in between (no double spend, no repeat, a child after its parent), the
+    # fees, every fallback the empty-body template, only full templates
+    # import, the selection budget. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -304,6 +318,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         merged_found_record_test.cpp
         merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
+        mweb_ext_import_test.cpp
         mweb_fetch_retry_test.cpp
         mweb_next_header_test.cpp
         mweb_state_hash_binding_test.cpp
@@ -319,6 +334,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_test.cpp
         template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
+        template_mweb_ext_merge_test.cpp
         template_topology_spend_test.cpp
         utxo_order_test.cpp
         utxo_view_stats_test.cpp

@@ -17,6 +17,7 @@
 #include "header_chain.hpp"
 #include "mempool.hpp"
 #include "mweb_builder.hpp"
+#include "mweb_ext_import.hpp"
 #include "rpc_data.hpp"
 #include "transaction.hpp"
 #include "block.hpp"
@@ -217,6 +218,17 @@ public:
     /// coinbasevalue == subsidy + listed fees (fee-reconcile); with
     /// template_tx_check_strict a failure refuses it like the shape check,
     /// otherwise it is logged only.
+    /// With `mweb_ext` in litecoind mode (#2137 S3) a full template -- the
+    /// pool cleaned for the tip, the UTXO view's best block the tip, the
+    /// tip's MWEB state present -- carries litecoind's MWEB extension when it
+    /// passes mweb_ext::check_extension against that state: coinbase,
+    /// litecoind's peg-ins (and their ancestors) in its order, the pool's
+    /// selection (never spending what they spend, never repeating them),
+    /// litecoind's HogEx, its mw::Block; coinbasevalue adds their listed
+    /// fees. On any failure, and when the merged template fails the checks
+    /// above, the template is the one built without it (the empty body and
+    /// c2pool's own HogEx); every outcome is reported to `mweb_ext`.
+    /// Without `mweb_ext` (none mode) nothing here changes.
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
@@ -224,8 +236,11 @@ public:
         const MWEBTracker* mweb_tracker = nullptr,
         uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
         std::optional<rpc::WorkData>* refused = nullptr,
-        bool               template_tx_check_strict = true)
+        bool               template_tx_check_strict = true,
+        mweb_ext::MwebExtSource* mweb_ext = nullptr)
     {
+        if (mweb_ext && !mweb_ext->enabled())
+            mweb_ext = nullptr;
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
 
@@ -308,21 +323,108 @@ public:
             }
         }
 
+        // ── The tip's MWEB state (the HogEx spends the tip's HogEx) ───────
+        // The HogEx spends the HogEx output of the block we build on. State
+        // from any other block (e.g. a late body that lands after the tip
+        // moved on) would spend an output the tip already spent and still
+        // pass the shape check, so it counts as no state: refused -> HOLD.
+        std::optional<MWEBState> mweb_state;
+        if (mweb_tracker) {
+            mweb_state = mweb_tracker->get_state();
+            if (mweb_state && (mweb_state->captured_at_height != tip.height
+                               || mweb_state->captured_block_hash != tip.block_hash)) {
+                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
+                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
+                                << ", tip is h=" << tip.height << " "
+                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
+                mweb_state.reset();
+            }
+        }
+
+        // ── litecoind's MWEB extension (#2137 S3) ─────────────────────────
+        // Only into a full template: the pool cleaned for the tip and the
+        // view's best block the tip (the gate's rule, also for an empty
+        // pool), and the tip's MWEB state to check it against. The empty
+        // template on the tip never imports.
+        std::shared_ptr<const mweb_ext::ExtensionBundle> ext;
+        mweb_ext::Outcome ext_outcome;
+        if (mweb_ext) {
+            bool view_at_tip = false;
+            if (const auto* view = pool.utxo()) {
+                const auto [best_hash, best_height] = view->get_best();
+                view_at_tip = best_hash == tip.block_hash && best_height == tip.height;
+            }
+            if (degraded || !view_at_tip || !pool.cleaned_for(tip.block_hash)) {
+                ext_outcome.kind = mweb_ext::Outcome::skipped;
+                ext_outcome.reason = mweb_ext::kSkipNotFull;
+            } else if (!mweb_state) {
+                ext_outcome.kind = mweb_ext::Outcome::skipped;
+                ext_outcome.reason = mweb_ext::kSkipNoMwebState;
+            } else {
+                auto cur = mweb_ext->current();
+                ext_outcome.g_age_ms = cur.age_ms;
+                std::optional<mweb_ext::Failure> why;
+                if (!cur.bundle)
+                    why = mweb_ext::Failure{cur.reason, cur.detail};
+                else
+                    why = mweb_ext::check_extension(*cur.bundle, *mweb_state, tip.block_hash, tip.height,
+                                                    static_cast<int64_t>(subsidy));
+                if (why) {
+                    ext_outcome.kind = mweb_ext::Outcome::fallback;
+                    ext_outcome.reason = why->reason;
+                    ext_outcome.detail = why->detail;
+                } else {
+                    ext = cur.bundle;
+                }
+            }
+        }
+
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         // Only txs final in this block and spendable in it: IsFinalTx and
         // coinbase maturity at next_h, the lock time against the tip's median
         // time past (litecoind BlockAssembler's nLockTimeCutoff).
+        // With litecoind's extension the selection starts from its txs: no
+        // pool tx spends what they spend or repeats one of them, and the
+        // budget leaves room for them and their HogEx.
+        std::optional<Mempool::SelectionSeed> seed;
+        uint32_t select_weight = max_weight;
+        if (ext) {
+            seed.emplace();
+            seed->consumed = ext->spent;
+            seed->in_template = ext->txids;
+            const uint64_t w = ext->weight();
+            select_weight = w < max_weight ? static_cast<uint32_t>(max_weight - w) : 0;
+        }
         auto [selected_txs, total_fees] = degraded == nullptr
-            ? pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp})
+            ? pool.get_sorted_txs_with_fees(select_weight, LockTimeCutoff{next_h, mtp},
+                                            seed ? &*seed : nullptr)
             : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
         // Matches litecoind's getblocktemplate coinbasevalue field.
         uint64_t coinbasevalue = subsidy + total_fees;
+        if (ext)
+            coinbasevalue += static_cast<uint64_t>(ext->txs_fee() + ext->fee_hogex());
 
         nlohmann::json         tx_array = nlohmann::json::array();
         std::vector<Transaction> tx_objects;
         std::vector<uint256>     tx_hashes;
+
+        // litecoind's peg-ins and their ancestors first, in its order: the
+        // HogEx spends their pegin outputs in block order, and the pool's
+        // txs never carry one.
+        if (ext) {
+            for (const auto& t : ext->txs) {
+                nlohmann::json entry;
+                entry["data"] = t.hex;
+                entry["txid"] = t.txid.GetHex();
+                entry["hash"] = t.wtxid.GetHex();
+                entry["fee"] = t.fee;
+                tx_array.push_back(std::move(entry));
+                tx_objects.push_back(Transaction(t.tx));
+                tx_hashes.push_back(t.txid);
+            }
+        }
 
         uint64_t selected_bytes = 0;  // wire bytes packed into this template (underfill guard)
         for (const auto& stx : selected_txs) {
@@ -382,20 +484,24 @@ public:
             || (mweb_activation != 0 && next_h >= mweb_activation);
 
         if (mweb_tracker) {
-            auto mweb_state = mweb_tracker->get_state();
-            // The HogEx spends the HogEx output of the block we build on. State
-            // from any other block (e.g. a late body that lands after the tip
-            // moved on) would spend an output the tip already spent and still
-            // pass the shape check, so it counts as no state: refused -> HOLD.
-            if (mweb_state && (mweb_state->captured_at_height != tip.height
-                               || mweb_state->captured_block_hash != tip.block_hash)) {
-                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
-                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
-                                << ", tip is h=" << tip.height << " "
-                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
-                mweb_state.reset();
-            }
-            if (mweb_state) {
+            if (ext) {
+                // litecoind's HogEx and mw::Block, checked against the tip's
+                // state (check_extension).
+                nlohmann::json hogex_entry;
+                hogex_entry["data"] = ext->hogex.hex;
+                hogex_entry["txid"] = ext->hogex.txid.GetHex();
+                hogex_entry["hash"] = ext->hogex.wtxid.GetHex();
+                hogex_entry["fee"] = ext->fee_hogex();  // the MWEB-only txs' kernel fees
+                tx_array.push_back(std::move(hogex_entry));
+                tx_objects.push_back(Transaction(ext->hogex_tx));
+                tx_hashes.push_back(ext->hogex.txid);
+                mweb_hex = ext->mweb_hex;
+                has_mweb = true;
+                LOG_INFO << "[EMB-LTC] MWEB: litecoind's extension: " << ext->n_pegins() << " peg-in(s), "
+                         << ext->txs.size() << " imported tx(s), " << ext->body.kernels.size()
+                         << " kernel(s), HogEx " << ext->hogex.txid.GetHex().substr(0, 16)
+                         << " last, mweb_hex=" << mweb_hex.size() / 2 << " bytes";
+            } else if (mweb_state) {
                 // Build HogEx transaction (last tx in block)
                 auto hogex = MWEBBuilder::build_hogex(*mweb_state, next_h);
                 std::string hogex_hex = MWEBBuilder::serialize_hogex_hex(hogex);
@@ -475,13 +581,41 @@ public:
                            + std::to_string(subsidy) + " + fees " + std::to_string(listed);
                 }
             }
-            if (code && template_tx_check_strict) {
+            if (code && ext) {
+                // The merged template fails a check: build it without the
+                // extension (below), whatever the check mode.
+                refusal = *code + " (" + *detail + ")";
+                ext_outcome.reason = std::string(mweb_ext::kMergedCheckPrefix) + *code;
+                ext_outcome.detail = *detail;
+            } else if (code && template_tx_check_strict) {
                 refusal = *code + " (" + *detail + ")";
                 data[core::coin::kTemplateRefusalKey] = *code;
             } else if (code) {
                 LOG_WARNING << "[EMB-LTC] TemplateBuilder: template-tx check " << *code
                             << " at height " << next_h << " (" << *detail << ") — warn mode, served";
             }
+        }
+        if (refusal && ext) {
+            // Never a template with litecoind's extension that fails a check:
+            // the same template without it (the empty body, c2pool's HogEx).
+            if (ext_outcome.reason.empty()) {
+                ext_outcome.reason = std::string(mweb_ext::kMergedCheckPrefix) + "shape";
+                ext_outcome.detail = *refusal;
+            }
+            ext_outcome.kind = mweb_ext::Outcome::fallback;
+            mweb_ext->note(next_h, ext_outcome);
+            return build_template(chain, pool, is_testnet, mweb_tracker, max_weight, refused,
+                                  template_tx_check_strict, nullptr);
+        }
+        if (mweb_ext) {
+            if (ext) {
+                ext_outcome.kind = mweb_ext::Outcome::imported;
+                ext_outcome.txs = ext->txs.size();
+                ext_outcome.pegins = ext->n_pegins();
+                ext_outcome.kernels = ext->body.kernels.size();
+                ext_outcome.fee_sat = ext->txs_fee() + ext->fee_hogex();
+            }
+            mweb_ext->note(next_h, ext_outcome);
         }
         if (refusal) {
             // Every refresh rebuilds the template; one ERROR per tip height.
@@ -505,6 +639,7 @@ public:
                  << " coinbasevalue=" << coinbasevalue << " sat"
                  << " txs=" << data["transactions"].size()
                  << " mweb=" << (has_mweb ? "yes" : "no")
+                 << (ext ? " mweb_ext=litecoind" : "")
                  << " tip_ts=" << tip.header.m_timestamp
                  << " now=" << now_ts
                  << " synced=" << chain.is_synced();
@@ -550,7 +685,7 @@ public:
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker, tx_weight_budget(), &refused,
-            m_template_tx_check_strict.load(std::memory_order_relaxed));
+            m_template_tx_check_strict.load(std::memory_order_relaxed), m_mweb_ext);
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet
             // (a pool or view not ready for the tip gives a served empty
@@ -622,6 +757,11 @@ public:
         m_template_tx_check_strict.store(strict, std::memory_order_relaxed);
     }
 
+    /// litecoind's MWEB extension for the templates (ltc_mweb_ext:
+    /// litecoind, #2137 S3); null or mode none: the empty body as before.
+    /// Set before the first getwork; it outlives this node.
+    void set_mweb_ext(mweb_ext::MwebExtSource* ext) { m_mweb_ext = ext; }
+
     bool is_synced() const override {
         if (!m_chain.is_synced()) return false;
         if (m_utxo_ready && !m_utxo_ready()) return false;
@@ -635,6 +775,7 @@ private:
     std::function<uint32_t()> m_coinbase_reserve;  // template budget (see set_coinbase_reserve_fn)
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
+    mweb_ext::MwebExtSource* m_mweb_ext{nullptr};
     std::atomic<bool> m_template_tx_check_strict{true};
 };
 
