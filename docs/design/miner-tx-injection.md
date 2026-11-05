@@ -276,6 +276,90 @@ This is the key reuse: **construct-and-broadcast-arbitrary-tx is already proven*
   reward split, or the payee queue — it can only add a consensus-valid body tx
   that survives the merkle-root cross-check, or fail closed.
 
+### 4.7 Read-only status API: `/api/tx-inject/ledger` and `bestchainlock` (S4)
+
+Two read-only surfaces let a wallet follow its own injects without a daemon.
+Both are mirrors of state the node already owns (`core::obs::inject_ledger()`
+and `core::obs::best_chainlock()`, `src/core/inject_ledger_obs.hpp`); nothing
+in template building, share validation or payout reads them, and the web
+thread takes no node lock to answer.
+
+**`GET /api/tx-inject/ledger`** (`src/core/http_session.cpp`). Loopback-only:
+the request must come straight from 127.0.0.1 / ::1 and carry none of
+`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`,
+`X-Forwarded-Proto`; otherwise `403 {"error":"tx-inject ledger is local-only"}`.
+A build that has the route always answers `200`, so a client feature-detects it
+by the `404` of an older build. Every field is present on every answer; absent
+values are explicit `null`s.
+
+| field | meaning |
+|---|---|
+| `wired` | `true` once the node's inject ledger has published (the first reconcile, i.e. the first tip or UTXO-lane event). It means "the publisher ran", not "the inject lane is armed": read `enabled` for that. `false` with an empty `entries` before that. |
+| `enabled` | `--embedded-tx-inject` is armed. |
+| `updated_at` | unix seconds of the last ledger write; `0` = never. |
+| `tip_height` | the tip height the last reconcile saw. |
+| `pool` | `{entries, bytes, max_entries, max_total_bytes}`, the counts of `/api/tx-inject-status`. They are a second mirror, published a few instructions before `entries`, so `pool.entries` and `entries.length` can differ by one for an instant: do not assert equality. |
+| `entries[]` | one object per inject the pool tracks, txid order (below). |
+| `overflow_dropped` | entries the mirror refused past its bound (1024, the pool's own entry cap); stays `0` in practice. |
+| `bestchainlock` | `null` until a ChainLock adoption is published, else `{height, blockhash, provenance, updated_at}` with the meaning given for `getblockchaininfo` below (no `known_block` here: the web layer holds no header chain). |
+
+Each entry: `txid` (hex), `submit_time` (unix seconds of the original
+admission; a rewind that puts the tx back keeps it), `expiry_height` (`0` =
+none; the inject leaves when the next block's height exceeds it), `byte_size`,
+`flags` (the wire flags), `in_mempool` (always `true`: the tracked set equals
+the injects in the mempool after every reconcile; kept for the client), and
+`last_build`: `null` until a template build has seen the inject, else
+`{height, verdict, cause, vin, fee}` for the LAST build, where `height` is the
+height of the template built, `verdict` is `RIDES` (in the body) or `HELD`,
+`cause` is `ok` on `RIDES` and `coinbase-only-template` or `not-selected` on
+`HELD`, and `vin` / `fee` (base fee, duffs) are filled on `RIDES` only (`0`
+otherwise). An inject leaves `entries` when it leaves the mempool: mined,
+conflict-evicted, expired, or refused at a re-track (§4.6).
+
+```json
+{ "wired": true, "enabled": true, "updated_at": 1762070000, "tip_height": 2565261,
+  "pool": { "entries": 1, "bytes": 27911, "max_entries": 1024, "max_total_bytes": 400000 },
+  "entries": [ { "txid": "539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28",
+                 "submit_time": 1762043087, "expiry_height": 0, "byte_size": 27911, "flags": 0,
+                 "in_mempool": true,
+                 "last_build": { "height": 2565247, "verdict": "HELD", "cause": "not-selected",
+                                 "vin": 0, "fee": 0 } } ],
+  "overflow_dropped": 0,
+  "bestchainlock": { "height": 2565260,
+                     "blockhash": "000000000000000af14ab13979fe0e7a6a73202d0a327403908d2133ebbb8b69",
+                     "provenance": "bls-verified", "updated_at": 1762069990 } }
+```
+
+**`bestchainlock` on `getblockchaininfo`** (the daemonless answer of the DASH
+node, `/api/explorer/getblockchaininfo`; `src/impl/dash/coin/chainlock_obs_json.hpp`,
+added in `main_dash.cpp`'s coin-chain-query hook). The shape of dashd's
+`getbestchainlock` without the signature:
+
+| field | meaning |
+|---|---|
+| `height` | the locked block's height. |
+| `blockhash` | the locked block's hash (hex), or `null` when the adoption did not name one (never a guess). |
+| `provenance` | `bls-verified`: a `clsig` off the wire that passed BLS verification against its signing quorum; `blockhash` is the clsig's. `chain-committed`: read from a connected block's coinbase CbTx (`bestCLHeightDiff`), which carries only the height; `blockhash` is the header chain's block at that height when the node has the height index wired, else `null`. A chain-committed adoption at the same height as a verified one replaces the provenance. |
+| `updated_at` | unix seconds of the adoption. |
+| `known_block` | `true`: the header chain holds exactly that block at that height; `false`: it holds another block there, or none; `null`: `blockhash` is `null` or no height index is available. |
+
+Before any adoption there is no `bestchainlock` key; the absence is named
+under `unavailable`, `chain_rpc`'s convention (never a zero, never a silent
+omission):
+
+```json
+{ "chain": "main", "blocks": 2565261, "bestblockhash": "0000…",
+  "bestchainlock": { "height": 2565260,
+                     "blockhash": "000000000000000af14ab13979fe0e7a6a73202d0a327403908d2133ebbb8b69",
+                     "provenance": "bls-verified", "updated_at": 1762069990, "known_block": true },
+  "unavailable": { "chainwork": "…", "verificationprogress": "…" } }
+```
+```json
+{ "chain": "main", "blocks": 2565261, "bestblockhash": "0000…",
+  "unavailable": { "bestchainlock": "no ChainLock adopted yet (verified clsig or chain-committed cbTx)",
+                   "chainwork": "…" } }
+```
+
 ---
 
 ## 5. Reward-safety analysis
@@ -498,6 +582,7 @@ means any signer suffices — so it is correctly deferred without blocking M1.
 | M2 (implemented) | submit sink seam (routes the peer path through the armed `NodeCoinState::submit_inject`) | `node.hpp` (`set_tx_inject_sink` / `handle_peer_tx_inject` / `relay_tx_inject`), `src/c2pool/main_dash.cpp` (wired next to the arm) |
 | M2 (implemented) | first-see fan-out + `register_template_txs` ride | `relay_tx_inject` (fan-out); an accepted inject is an ordinary body tx, so it rides `register_template_txs` unchanged (KAT-proven) |
 | M2 (implemented, #2121) | release on confirm / evict, re-track on rewind | `reconcile_inject_pool` wired to `UtxoLane::set_mempool_changed_fn` (block connect / rewind), `set_tip`, `submit_inject`; `TxInjectPool::release` / `retrack` / `still_wanted` |
+| S4 (implemented) | read-only per-inject ledger + best ChainLock (loopback `GET /api/tx-inject/ledger`; `bestchainlock` on daemonless `getblockchaininfo`) | `src/core/inject_ledger_obs.hpp` (mutex-guarded mirror), publishers in `node_coin_state.hpp` (admit / reconcile), `inject_ride_log.hpp` (per-build verdict), `coin_state_maintainer.hpp` (ChainLock adoption); route in `src/core/http_session.cpp`; `src/impl/dash/coin/chainlock_obs_json.hpp` |
 | **M3** | per-peer token buckets, misbehaviour score, capability advertisement | coin_peer_manager / handler |
 | M3 | `submitter_hint` rate-accounting | inject pool |
 | M3 | full sandboxed signer (§10) | new isolated build/sign module |

@@ -38,6 +38,7 @@
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+#include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
 #include <ctime>
 
@@ -828,6 +829,9 @@ public:
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
         publish_inject_status();
+        // S4: mirror the new entry into the read-only per-inject ledger.
+        if (const auto e = m_inject_pool.entry(r.txid))
+            core::obs::inject_ledger().upsert(to_ledger_entry(*e));
         r.ok = true;
         r.cause = "ok";
         return r;
@@ -884,6 +888,7 @@ public:
         for (const auto& id : live)
             if (!m_inject_pool.contains(id)) untracked.push_back(id);
         std::set<uint256> refused;
+        std::vector<uint256> retracked;
         for (const auto& id : inject_parents_first(untracked)) {
             const char* how = "rewind";
             std::string cause;
@@ -907,6 +912,7 @@ public:
             } else {
                 LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
                          << " cause=" << how;
+                retracked.push_back(id);
             }
         }
         // A tracked inject that spends a refused one (its child came back in an
@@ -928,6 +934,14 @@ public:
         if (m_prev_height != 0)
             m_inject_pool.prune_released(m_prev_height, Mempool::kConfirmedInjectDepth);
         publish_inject_status();
+        // S4: the read-only per-inject ledger follows the active set: the
+        // re-tracked / fresh entries are (re)inserted, everything else that
+        // is no longer tracked (released, reaped, refused) is dropped.
+        auto& ledger = core::obs::inject_ledger();
+        for (const auto& id : retracked)
+            if (const auto e = m_inject_pool.entry(id)) ledger.upsert(to_ledger_entry(*e));
+        ledger.retain(m_inject_pool.tracked_ids());
+        ledger.set_tip(m_prev_height);
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
@@ -2086,6 +2100,20 @@ private:
     /// no tip is known (the inject ledger then treats nothing as expired).
     int32_t next_block_height() const {
         return m_prev_height ? static_cast<int32_t>(m_prev_height + 1) : 0;
+    }
+
+    /// S4: the read-only ledger's copy of an active inject entry. in_mempool
+    /// is true by the reconcile invariant (the active set equals the injects
+    /// live in the mempool); last_build is left to the ride log.
+    static core::obs::InjectLedgerEntry to_ledger_entry(const InjectEntry& e) {
+        core::obs::InjectLedgerEntry le;
+        le.txid          = e.txid;
+        le.submit_time   = static_cast<int64_t>(e.submit_time);
+        le.expiry_height = e.expiry_height;
+        le.byte_size     = e.byte_size;
+        le.flags         = e.flags;
+        le.in_mempool    = true;
+        return le;
     }
 
     /// Whether the mempool tx `id` spends an output of a tx in `txids`.

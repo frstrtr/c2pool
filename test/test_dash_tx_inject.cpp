@@ -46,6 +46,9 @@
 #include <impl/dash/coin/good_citizen_defaults.hpp>
 #include <impl/dash/coin/checkscripts_policy.hpp>  // S3a: resolve_checkscripts_arm
 #include <impl/dash/coin/vendor/dashscript/c2pool_scriptcheck.h>
+#include <impl/dash/coin/inject_ride_log.hpp>     // S4: per-build verdict into the ledger
+#include <impl/dash/coin/chainlock_obs_json.hpp>  // S4: bestchainlock on getblockchaininfo
+#include <core/inject_ledger_obs.hpp>             // S4: read-only per-inject ledger
 
 // std-only: the c2wallet-qt mirror of the node caps, pinned below.
 #include "../ui/c2wallet-qt/src/family/bitcoin/dash/InjectCaps.hpp"
@@ -60,6 +63,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <optional>
+#include <string>
 #include <vector>
 
 using dash::coin::Mempool;
@@ -2216,6 +2222,251 @@ TEST(DashTxInject, ChildInjectWaitsForItsReorgedParent)
         EXPECT_EQ(dash_txid(selected[0].tx), idC) << "C rides on the confirmed P:0";
         EXPECT_EQ(fees, 0u);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S4 — the read-only per-inject ledger (core::obs::inject_ledger(), served by
+// the loopback GET /api/tx-inject/ledger) mirrors the inject pool's active set
+// and the ride log's per-build verdict; best_chainlock_json renders the
+// adopted ChainLock for getblockchaininfo.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The ledger's bound is the inject pool's entry cap.
+static_assert(core::obs::InjectLedger::kMaxEntries == TxInjectPool::INJECT_POOL_MAX_ENTRIES,
+              "the ledger mirror's bound != TxInjectPool::INJECT_POOL_MAX_ENTRIES");
+
+namespace {
+
+// By value: callers pass a temporary snapshot().
+std::optional<core::obs::InjectLedgerEntry> ledger_find(const std::vector<core::obs::InjectLedgerEntry>& v,
+                                                        const uint256& id) {
+    for (const auto& e : v)
+        if (e.txid == id) return e;
+    return std::nullopt;
+}
+
+} // namespace
+
+// (S4 B1) Admit puts the inject in the ledger with the pool's metadata; the
+// confirm that releases it from the pool removes it; a rewind that puts it
+// back brings it back with its original submit time.
+TEST(DashTxInject, LedgerMirrorsAdmitAndRelease)
+{
+    auto& ledger = core::obs::inject_ledger();
+    ledger.reset();
+    {
+        Key k(0xf1);
+        const uint256 prev = prevhash(0xb1);
+        const auto tx = make_signed_spend(k, prev, 100'000);
+        const uint256 id = dash_txid(tx);
+        UTXOViewCache utxo(nullptr);
+        utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+        NodeCoinState st; arm_ncs(st, utxo);
+        st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+        ASSERT_TRUE(st.submit_inject(tx, /*flags=*/0x1, /*expiry_height=*/150,
+                                     NodeCoinState::InjectOrigin::Local, 0).ok);
+        const auto snap = ledger.snapshot();
+        ASSERT_EQ(snap.size(), 1u);
+        EXPECT_EQ(snap[0].txid, id);
+        const auto pe = st.inject_entry(id);
+        ASSERT_TRUE(pe.has_value());
+        EXPECT_EQ(snap[0].submit_time, static_cast<int64_t>(pe->submit_time));
+        EXPECT_EQ(snap[0].expiry_height, 150);
+        EXPECT_EQ(snap[0].flags, 0x1u);
+        EXPECT_EQ(snap[0].byte_size, ser(tx).size());
+        EXPECT_TRUE(snap[0].in_mempool);
+        EXPECT_FALSE(snap[0].last_build.has_value()) << "no build has seen it yet";
+        EXPECT_EQ(ledger.tip(), 100u);
+        EXPECT_NE(ledger.updated_at(), 0);
+
+        dash::coin::BlockType b;
+        b.m_txs.push_back(tx);
+        st.mempool().remember_confirmed_injects(b, 101);
+        st.mempool().remove_for_block(b);
+        st.reconcile_inject_pool();
+        EXPECT_TRUE(ledger.snapshot().empty()) << "released from the pool, gone from the ledger";
+    }
+
+    // Rewind variant (the A3 fixture): back with the original submit time.
+    using namespace dash_utxo_full;
+    Key k(0xf2);
+    const uint256 prevA = prevhash(0xb2);
+    const auto standing = make_signed_spend(k, prevA, 100'000);
+    const uint256 id = dash_txid(standing);
+    constexpr uint32_t kB = 2000;
+    TempDir tmp("ledger-rewind");
+    dash::coin::UtxoLane lane;
+    SnapCoin a;
+    a.op = Outpoint(prevA, 0);
+    a.coin = Coin(100'000, to_script(k.spk), 500, false);
+    const BlockType base_block = block(fake_hash(1999), {coinbase(50, 1999)}, 1999);
+    const uint256 base_hash = hash_of(base_block);
+    ASSERT_TRUE(open_full_set(lane, tmp, {a}, kB, base_hash));
+    Chain chain;
+    chain.hashes[kB] = base_hash;
+    lane.set_hash_at_fn(chain.fn());
+    lane.set_request_block_fn([](uint32_t) { return true; });
+    NodeCoinState st;
+    arm_ncs(st, *lane.cache());
+    lane.attach(st.mempool());
+    lane.set_mempool_changed_fn([&st]() { st.reconcile_inject_pool(); });
+    lane.on_header_tip(kB);
+    st.set_tip(kB, base_hash, 0x1b104be3u, 1'700'000'000u, 76, 16);
+    ASSERT_TRUE(st.submit_inject(standing, 0, 0, NodeCoinState::InjectOrigin::Local, 0).ok);
+    ASSERT_EQ(ledger.snapshot().size(), 1u);
+    const int64_t t0 = ledger.snapshot()[0].submit_time;
+
+    const BlockType a1 = block(base_hash, {coinbase(50, 2601), standing}, 2601);
+    chain.hashes[kB + 1] = hash_of(a1);
+    lane.on_block_connected(a1, kB + 1);
+    ASSERT_EQ(lane.cache()->get_best_block(), hash_of(a1));
+    EXPECT_TRUE(ledger.snapshot().empty());
+
+    chain.hashes[kB + 1] = fake_hash(6601);
+    lane.on_header_tip(kB + 1);
+    ASSERT_EQ(lane.full_status().rewinds, 1u);
+    const auto back = ledger.snapshot();
+    ASSERT_EQ(back.size(), 1u) << "the put-back inject is in the ledger again";
+    EXPECT_EQ(back[0].txid, id);
+    EXPECT_EQ(back[0].submit_time, t0) << "with its original submit time";
+    EXPECT_TRUE(back[0].in_mempool);
+}
+
+// (S4 B2) Each build records the ride log's verdict in the ledger, before the
+// log's dedup: the ledger always holds the current verdict, while the log
+// stays quiet on a repeat (its dedup key is height + rides, unchanged).
+TEST(DashTxInject, LedgerVerdictMirrorsTheRideLogLine)
+{
+    auto& ledger = core::obs::inject_ledger();
+    ledger.reset();
+    Key k(0xf3);
+    const uint256 prev = prevhash(0xb3);
+    const auto tx = make_signed_spend(k, prev, 100'000);   // zero fee
+    const uint256 id = dash_txid(tx);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    st.set_tip(100, prevhash(0x10), 0x1d00ffff, 0, 76, 16);
+    ASSERT_TRUE(st.submit_inject(tx, 0, 0, NodeCoinState::InjectOrigin::Local, 0).ok);
+
+    constexpr uint32_t h = 101;
+    auto [sel, fees] = st.mempool().get_sorted_txs_with_fees(1u << 20, false, h, 0);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(fees, 0u);
+    auto lines = dash::coin::log_inject_rides(st.mempool(), sel, h, false);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find("inject RIDES h=" + std::to_string(h)), std::string::npos) << lines[0];
+    auto e = ledger_find(ledger.snapshot(), id);
+    ASSERT_TRUE(e.has_value());
+    ASSERT_TRUE(e->last_build.has_value());
+    EXPECT_EQ(*e->last_build, (core::obs::InjectLedgerBuild{h, true, "ok", 1, 0}));
+
+    // A coinbase-only build at h+1: HELD, and the ledger says why.
+    lines = dash::coin::log_inject_rides(st.mempool(), {}, h + 1, true);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find("inject HELD h=" + std::to_string(h + 1)), std::string::npos) << lines[0];
+    EXPECT_NE(lines[0].find("cause=coinbase-only-template"), std::string::npos) << lines[0];
+    e = ledger_find(ledger.snapshot(), id);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(*e->last_build, (core::obs::InjectLedgerBuild{h + 1, false, "coinbase-only-template", 0, 0}));
+
+    // Rebuilt at the same height without the coinbase-only gate: still HELD, so
+    // the log dedups (same height, same verdict) but the ledger has the cause.
+    lines = dash::coin::log_inject_rides(st.mempool(), {}, h + 1, false);
+    EXPECT_TRUE(lines.empty()) << "the ride log's dedup is unchanged";
+    e = ledger_find(ledger.snapshot(), id);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(*e->last_build, (core::obs::InjectLedgerBuild{h + 1, false, "not-selected", 0, 0}));
+
+    // Not selected at h+2: a line; the same build again: no line, same verdict.
+    lines = dash::coin::log_inject_rides(st.mempool(), {}, h + 2, false);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find("cause=not-selected"), std::string::npos) << lines[0];
+    lines = dash::coin::log_inject_rides(st.mempool(), {}, h + 2, false);
+    EXPECT_TRUE(lines.empty()) << "dedup";
+    e = ledger_find(ledger.snapshot(), id);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(*e->last_build, (core::obs::InjectLedgerBuild{h + 2, false, "not-selected", 0, 0}));
+}
+
+// (S4 B3) An inject the pool does not track gets no ledger entry from a build;
+// the reconcile that tracks it fresh (A9) creates the entry.
+TEST(DashTxInject, LedgerIgnoresUntrackedInjects)
+{
+    auto& ledger = core::obs::inject_ledger();
+    ledger.reset();
+    Key k(0xf4);
+    const uint256 prev = prevhash(0xb4);
+    const auto tx = make_signed_spend(k, prev, 100'000);
+    const uint256 id = dash_txid(tx);
+    UTXOViewCache utxo(nullptr);
+    utxo.add_coin(Outpoint(prev, 0), Coin(100'000, to_script(k.spk), 1, false));
+    NodeCoinState st; arm_ncs(st, utxo);
+    ASSERT_EQ(st.mempool().add_inject(tx, 0), Mempool::InjectGate::Ok);   // bare: no ledger entry
+
+    const auto lines = dash::coin::log_inject_rides(st.mempool(), {}, 101, false);
+    EXPECT_EQ(lines.size(), 1u) << "the log still names it";
+    EXPECT_FALSE(ledger_find(ledger.snapshot(), id).has_value()) << "but the ledger creates no entry";
+
+    st.reconcile_inject_pool();
+    const auto e = ledger_find(ledger.snapshot(), id);
+    ASSERT_TRUE(e.has_value()) << "tracked fresh, so mirrored";
+    EXPECT_EQ(e->expiry_height, 0);
+    EXPECT_EQ(e->byte_size, ser(tx).size());
+    EXPECT_FALSE(e->last_build.has_value());
+}
+
+// (S4) getblockchaininfo's bestchainlock: known_block true / false / null, and
+// the named absence before any adoption.
+TEST(DashTxInject, BestChainlockJsonKnownBlock)
+{
+    using core::obs::BestChainLock;
+    uint256 locked; std::memset(locked.begin(), 0x3c, 32);
+    uint256 other;  std::memset(other.begin(), 0x3d, 32);
+    std::map<uint32_t, uint256> chain{{2565260u, locked}};
+    const dash::coin::ChainHashAtHeightFn at = [&chain](uint32_t h) -> std::optional<uint256> {
+        auto it = chain.find(h);
+        if (it == chain.end()) return std::nullopt;
+        return it->second;
+    };
+
+    // Before any adoption: no field, a named absence.
+    nlohmann::json r = {{"chain", "main"}};
+    dash::coin::add_best_chainlock(r, std::nullopt, at);
+    EXPECT_FALSE(r.contains("bestchainlock"));
+    ASSERT_TRUE(r.contains("unavailable"));
+    EXPECT_TRUE(r["unavailable"]["bestchainlock"].is_string());
+    EXPECT_TRUE(dash::coin::best_chainlock_json(std::nullopt, at).is_null());
+
+    // On the chain we hold: known_block true.
+    BestChainLock cl{2565260, locked, "bls-verified", 1762069990};
+    nlohmann::json r2 = {{"chain", "main"}, {"unavailable", {{"chainwork", "x"}}}};
+    dash::coin::add_best_chainlock(r2, cl, at);
+    ASSERT_TRUE(r2.contains("bestchainlock"));
+    EXPECT_FALSE(r2["unavailable"].contains("bestchainlock"));
+    EXPECT_EQ(r2["bestchainlock"]["height"].get<int32_t>(), 2565260);
+    EXPECT_EQ(r2["bestchainlock"]["blockhash"].get<std::string>(), locked.GetHex());
+    EXPECT_EQ(r2["bestchainlock"]["provenance"].get<std::string>(), "bls-verified");
+    EXPECT_EQ(r2["bestchainlock"]["known_block"], true);
+
+    // A different block at that height: false.
+    cl.blockhash = other;
+    EXPECT_EQ(dash::coin::best_chainlock_json(cl, at)["known_block"], false);
+    // A height the chain does not hold: false.
+    cl.blockhash = locked; cl.height = 2565999;
+    EXPECT_EQ(dash::coin::best_chainlock_json(cl, at)["known_block"], false);
+    // A chain-committed adoption without a hash: blockhash and known_block null.
+    BestChainLock cc{2565260, uint256(), "chain-committed", 1762069990};
+    const auto jc = dash::coin::best_chainlock_json(cc, at);
+    EXPECT_TRUE(jc["blockhash"].is_null());
+    EXPECT_TRUE(jc["known_block"].is_null());
+    // No height index wired: known_block null, never a guess.
+    EXPECT_TRUE(dash::coin::best_chainlock_json(BestChainLock{2565260, locked, "bls-verified", 0},
+                                                dash::coin::ChainHashAtHeightFn{})["known_block"].is_null());
+    // A refusal (non-object) is left untouched.
+    nlohmann::json refusal = "no tip";
+    dash::coin::add_best_chainlock(refusal, cl, at);
+    EXPECT_TRUE(refusal.is_string());
 }
 
 // ── #2121 A-L2: re-tracking after a rewind is parent-first ─────────────────

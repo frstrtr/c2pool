@@ -94,6 +94,7 @@
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
+#include <impl/dash/coin/chainlock_obs_json.hpp> // dash::coin::add_best_chainlock (S4 bestchainlock on getblockchaininfo)
 #include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
 #include <impl/dash/alert_service.hpp>            // D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus)
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
@@ -5539,7 +5540,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         }
                     }
 
-                    return dash::coin::chain_rpc::chain_query(*hc, method, params);
+                    auto answer = dash::coin::chain_rpc::chain_query(*hc, method, params);
+                    // S4: getblockchaininfo carries the best ChainLock the node
+                    // adopted (read-only mirror; known_block from the header
+                    // chain's mutex-guarded height index), or names its absence.
+                    if (method == "getblockchaininfo")
+                        dash::coin::add_best_chainlock(
+                            answer, core::obs::best_chainlock().snapshot(),
+                            [hc](uint32_t h) -> std::optional<uint256> {
+                                if (auto e = hc->get_header_by_height(h)) return e->hash;
+                                return std::nullopt;
+                            });
+                    return answer;
                 });
             std::cout << "[run] daemonless chain queries ARMED "
                          "(getbestblockhash/getblockhash/getblockchaininfo "

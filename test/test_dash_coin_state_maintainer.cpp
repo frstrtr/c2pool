@@ -1305,6 +1305,98 @@ static BlockType make_cbtx_block(uint32_t height, int64_t credit_pool,
     return blk;
 }
 
+// S4: a CbTx block whose coinbase commits a ChainLock at (height-1-cl_diff).
+static BlockType make_cbtx_block_cl(uint32_t height, int64_t credit_pool,
+                                    uint32_t cl_diff, uint8_t sig_byte) {
+    dash::coin::vendor::CCbTx cb;
+    cb.nVersion = dash::coin::vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+    cb.nHeight  = static_cast<int32_t>(height);
+    cb.creditPoolBalance = credit_pool;
+    cb.bestCLHeightDiff = cl_diff;
+    cb.bestCLSignature.fill(sig_byte);
+    BlockType blk;
+    blk.m_txs.push_back(make_spend(raw256(0x91), 0, 500000000, height));
+    blk.m_txs[0].version = 3;
+    blk.m_txs[0].type = 5;
+    blk.m_txs[0].extra_payload = dash::coin::encode_cbtx(cb);
+    bind_block(blk);
+    return blk;
+}
+
+// (S4 B6) Every ChainLock adoption is mirrored into the read-only
+// core::obs::best_chainlock() store (served by /api/tx-inject/ledger and
+// getblockchaininfo): a BLS-verified clsig with its block hash; a refused or
+// stale clsig changes nothing; a chain-committed cbTx adoption with the hash
+// the current chain holds at that height, or a null hash when no height index
+// is wired (never a guessed one).
+TEST(DashCoinStateMaintainer, OnNewChainlockPublishesBestChainLock) {
+    auto& obs = core::obs::best_chainlock();
+    obs.reset();
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        const uint256 bh = raw256(0xC1);
+        std::array<uint8_t, 96> sig{}; sig[0] = 0x11;
+        m.on_new_chainlock(1500000, bh, sig);   // no verifier: fail closed
+        EXPECT_FALSE(obs.snapshot().has_value()) << "nothing adopted, nothing published";
+        m.set_chainlock_verify_fn(
+            [](int32_t, const uint256&, const std::array<uint8_t, 96>&) { return false; });
+        m.on_new_chainlock(1500000, bh, sig);
+        EXPECT_FALSE(obs.snapshot().has_value()) << "a refused clsig publishes nothing";
+
+        m.set_chainlock_verify_fn(
+            [](int32_t, const uint256&, const std::array<uint8_t, 96>&) { return true; });
+        m.on_new_chainlock(1500000, bh, sig);
+        auto s = obs.snapshot();
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->height, 1500000);
+        EXPECT_EQ(s->blockhash, bh);
+        EXPECT_EQ(s->provenance, "bls-verified");
+        EXPECT_NE(s->updated_at, 0);
+
+        m.on_new_chainlock(1499999, raw256(0xC2), sig);   // stale: not adopted
+        s = obs.snapshot();
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->height, 1500000);
+        EXPECT_EQ(s->blockhash, bh);
+    }
+
+    obs.reset();
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);
+        constexpr uint32_t diff = 2;
+        const int32_t best_h = static_cast<int32_t>(H) - 1 - static_cast<int32_t>(diff);
+        const uint256 at = raw256(0xC3);
+        m.set_chain_hash_at_height_fn([best_h, at](uint32_t h) -> std::optional<uint256> {
+            if (h == static_cast<uint32_t>(best_h)) return at;
+            return std::nullopt;
+        });
+        m.on_block_connected(make_cbtx_block_cl(H, 1'000LL, diff, 0x44), H);
+        ASSERT_EQ(st.best_cl_height(), best_h);
+        EXPECT_EQ(st.best_cl_provenance(), dash::coin::ClProvenance::ChainCommitted);
+        const auto s = obs.snapshot();
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->height, best_h);
+        EXPECT_EQ(s->blockhash, at) << "the hash the current chain holds at that height";
+        EXPECT_EQ(s->provenance, "chain-committed");
+    }
+
+    obs.reset();
+    {
+        NodeCoinState st;
+        CoinStateMaintainer m(st);   // no height index wired
+        m.on_block_connected(make_cbtx_block_cl(H, 1'000LL, 2, 0x45), H);
+        ASSERT_EQ(st.best_cl_height(), static_cast<int32_t>(H) - 3);
+        const auto s = obs.snapshot();
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->height, static_cast<int32_t>(H) - 3);
+        EXPECT_TRUE(s->blockhash.IsNull()) << "unknown hash stays null";
+        EXPECT_EQ(s->provenance, "chain-committed");
+    }
+    obs.reset();
+}
+
 // The external-collateral proof (Mempool::prove_chain_coin) remembers the
 // spends of recent connected blocks. A block the live lane refuses (dashd
 // rejects it) never feeds it, and on_sml_reorg forgets the blocks the switched
