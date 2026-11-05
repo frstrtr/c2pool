@@ -159,6 +159,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # is counted in /local_stats template_refresh; every session's job of a
     # generation shares one tx-hex vector (measured). Same fold-into-core_test
     # reasoning as every TU here.
+    # web_server_utxo_scan_test.cpp: GET /api/utxo/scan's web-server half (the
+    # dedicated scan thread, one at a time, the interval, the wait cap, the
+    # direct-local gate). Same fold-into-core_test reasoning as every TU here.
     # inject_ledger_obs_test.cpp: the S4 read-only per-inject ledger and
     # best-ChainLock mirrors behind GET /api/tx-inject/ledger (bound + overflow
     # count, retain self-heal, set_last_build no-op on an absent txid, ChainLock
@@ -222,6 +225,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_mweb_hogex_test.cpp
         web_server_relay_block_test.cpp
         web_server_submitblock_test.cpp
+        web_server_utxo_scan_test.cpp
         web_server_worker_liveness_test.cpp
         worker_pools_test.cpp
     )
