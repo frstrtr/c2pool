@@ -1237,7 +1237,8 @@ MiningInterface::build_connection_coinbase(
     // any callback that might acquire other mutexes.
 
     struct WorkStateSnapshot {
-        nlohmann::json tmpl;
+        std::shared_ptr<const nlohmann::json> tmpl;               // shared, one per generation
+        std::shared_ptr<const std::vector<std::string>> tx_data;  // shared, one per generation
         std::vector<std::pair<std::string, uint64_t>> pplns_outputs;
         uint256 pplns_best_share;
         bool raw_scripts{false};
@@ -1261,10 +1262,11 @@ MiningInterface::build_connection_coinbase(
     WorkStateSnapshot ws;
     {
         std::lock_guard<std::mutex> lock(m_work_mutex);
-        if (!m_work_valid || m_cached_template.is_null())
+        if (!m_work_valid || m_cached_template.is_null() || !m_cached_template_sp)
             return {};
 
-        ws.tmpl = m_cached_template;
+        ws.tmpl = m_cached_template_sp;
+        ws.tx_data = m_cached_tx_data;
         ws.pplns_outputs = m_cached_pplns_outputs;
         ws.pplns_best_share = m_cached_pplns_best_share;
         ws.raw_scripts = m_cached_raw_scripts;
@@ -1286,6 +1288,7 @@ MiningInterface::build_connection_coinbase(
             && ws.pplns_fn
             && prev_share_hash != ws.pplns_best_share;
     }
+    const nlohmann::json& tmpl = *ws.tmpl;  // shared and immutable: no per-session copy
     // ── m_work_mutex RELEASED ──
     // From here on, NO mutex is held. All callbacks (PPLNS, ref_hash, MM, addr_rates)
     // can freely acquire their own locks without deadlock risk.
@@ -1304,7 +1307,7 @@ MiningInterface::build_connection_coinbase(
     {
         // Genesis: no PPLNS walk possible. p2pool puts 100% of subsidy to donation.
         ws.pplns_outputs.clear();
-        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        uint64_t subsidy = tmpl.value("coinbasevalue", uint64_t(0));
         std::string donation_hex;
         for (unsigned char b : ws.donation_script) { donation_hex += HX[b >> 4]; donation_hex += HX[b & 0x0f]; }
         ws.pplns_outputs.push_back({donation_hex, subsidy});
@@ -1314,11 +1317,11 @@ MiningInterface::build_connection_coinbase(
     else if (ws.needs_pplns_recompute)
     {
         uint32_t nbits = 0;
-        if (ws.tmpl.contains("bits"))
+        if (tmpl.contains("bits"))
             nbits = static_cast<uint32_t>(std::stoul(
-                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+                tmpl["bits"].get<std::string>(), nullptr, 16));
         uint256 block_target = chain::bits_to_target(nbits);
-        uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        uint64_t subsidy = tmpl.value("coinbasevalue", uint64_t(0));
 
         auto expected = ws.pplns_fn(prev_share_hash, block_target, subsidy, ws.donation_script);
 
@@ -1357,7 +1360,7 @@ MiningInterface::build_connection_coinbase(
     // Reference: p2pool data.py lines 945-948
     if (ws.share_version < 36 && !ws.pplns_outputs.empty() && !payout_script.empty())
     {
-        uint64_t subsidy_for_fee = ws.tmpl.value("coinbasevalue", uint64_t(0));
+        uint64_t subsidy_for_fee = tmpl.value("coinbasevalue", uint64_t(0));
         uint64_t finder_fee = subsidy_for_fee / 200;
 
         if (finder_fee > 0) {
@@ -1453,7 +1456,7 @@ MiningInterface::build_connection_coinbase(
     // ── Phase 3: Pure computation from snapshot (NO locks held) ──
     LOG_TRACE << "[build_cb] Phase 3: building coinbase from snapshot...";
 
-    const int height = ws.tmpl.value("height", 1);
+    const int height = tmpl.value("height", 1);
     std::string height_hex = encode_height_pushdata(height);
 
     static const char* HEX = "0123456789abcdef";
@@ -1480,11 +1483,11 @@ MiningInterface::build_connection_coinbase(
     // THE state root
     std::string state_root_hex;
     {
-        uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
+        uint32_t tmpl_height = tmpl.value("height", uint32_t(0));
         uint32_t tmpl_bits = 0;
-        if (ws.tmpl.contains("bits"))
+        if (tmpl.contains("bits"))
             tmpl_bits = static_cast<uint32_t>(std::stoul(
-                ws.tmpl["bits"].get<std::string>(), nullptr, 16));
+                tmpl["bits"].get<std::string>(), nullptr, 16));
         uint256 the_root = compute_the_state_root(
             ws.pplns_outputs,
             static_cast<uint32_t>(ws.pplns_outputs.size()),
@@ -1520,12 +1523,12 @@ MiningInterface::build_connection_coinbase(
 
     LOG_TRACE << "[build_cb] scriptsig built, len=" << scriptsig_hex.size()/2;
 
-    uint64_t subsidy = ws.tmpl.value("coinbasevalue", uint64_t(0));
+    uint64_t subsidy = tmpl.value("coinbasevalue", uint64_t(0));
     uint32_t bits = 0;
-    if (ws.tmpl.contains("bits"))
+    if (tmpl.contains("bits"))
         bits = static_cast<uint32_t>(std::stoul(
-            ws.tmpl["bits"].get<std::string>(), nullptr, 16));
-    uint32_t timestamp = ws.tmpl.value("curtime", uint32_t(0));
+            tmpl["bits"].get<std::string>(), nullptr, 16));
+    uint32_t timestamp = tmpl.value("curtime", uint32_t(0));
 
     std::vector<uint256> branches_u256;
     branches_u256.reserve(ws.merkle_branches.size());
@@ -1546,10 +1549,10 @@ MiningInterface::build_connection_coinbase(
     // witness_root was genuinely never set (witness_commitment also empty).
     uint256 effective_witness_root = ws.witness_root;
     bool witness_root_set = !ws.witness_commitment.empty();  // commitment computed → root is valid
-    if (!witness_root_set && ws.segwit_active && ws.tmpl.contains("transactions")) {
+    if (!witness_root_set && ws.segwit_active && tmpl.contains("transactions")) {
         std::vector<uint256> wtxids;
         wtxids.push_back(uint256());  // coinbase wtxid = 0
-        for (auto& tx : ws.tmpl["transactions"]) {
+        for (auto& tx : tmpl["transactions"]) {
             uint256 wtxid;
             if (tx.is_object() && tx.contains("hash"))
                 wtxid.SetHex(tx["hash"].get<std::string>());
@@ -1560,7 +1563,7 @@ MiningInterface::build_connection_coinbase(
         effective_witness_root = compute_witness_merkle_root(std::move(wtxids));
         witness_root_set = true;
         LOG_INFO << "[build_cb] witness_root computed from "
-                 << ws.tmpl["transactions"].size() << " txs: "
+                 << tmpl["transactions"].size() << " txs: "
                  << effective_witness_root.GetHex();
     }
     auto rhr = ws.ref_hash_fn(
@@ -1581,10 +1584,10 @@ MiningInterface::build_connection_coinbase(
     }
 
     // THE state root for coinbase parts
-    uint32_t tmpl_height = ws.tmpl.value("height", uint32_t(0));
+    uint32_t tmpl_height = tmpl.value("height", uint32_t(0));
     uint32_t tmpl_bits = 0;
     {
-        auto bits_str = ws.tmpl.value("bits", std::string(""));
+        auto bits_str = tmpl.value("bits", std::string(""));
         if (bits_str.size() == 8)
             tmpl_bits = static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
     }
@@ -1610,7 +1613,7 @@ MiningInterface::build_connection_coinbase(
 
     LOG_TRACE << "[build_cb] calling build_coinbase_parts...";
     auto [cb1, cb2] = build_coinbase_parts(
-        ws.tmpl,
+        tmpl,
         subsidy,
         ws.pplns_outputs,
         ws.raw_scripts,
@@ -1646,13 +1649,9 @@ MiningInterface::build_connection_coinbase(
     // Freeze block body data atomically — prevents merkle root mismatch
     // when refresh_work() updates the template between separate reads.
     snap.merkle_branches = ws.merkle_branches;
-    if (ws.tmpl.contains("transactions")) {
-        auto txd = std::make_shared<std::vector<std::string>>();
-        for (const auto& tx : ws.tmpl["transactions"])
-            if (tx.contains("data"))
-                txd->push_back(tx["data"].get<std::string>());
-        snap.tx_data = std::move(txd);
-    }
+    // The generation's shared tx hex: every job of every session built on
+    // this template points at the same vector.
+    snap.tx_data = ws.tx_data;
     return {std::move(cb1), std::move(cb2), std::move(snap)};
 }
 
@@ -1696,6 +1695,12 @@ void MiningInterface::refresh_work()
                 ? static_cast<uint32_t>(wd.m_data["height"].get<int64_t>()) : 0;
             if (auto code = core::coin::template_refusal_code(wd.m_data))
                 note_template_tx_refusal(*code, tmpl_height, 0, "", "refused by the coin node", true);
+            // Served, valid, but without the pool's txs (the embedded LTC
+            // builder's empty template on the tip, #2136): counted by code.
+            if (auto code = core::coin::template_degraded_code(wd.m_data)) {
+                std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+                ++m_template_degraded_by_code[*code];
+            }
             if (!why && m_blockchain == Blockchain::LITECOIN) {
                 try {
                     size_t outliers = 0;
@@ -1922,9 +1927,43 @@ void MiningInterface::refresh_work()
         auto the_root = compute_the_state_root(pplns_outputs,
             static_cast<uint32_t>(pplns_outputs.size()), tmpl_h, tmpl_b);
 
+        // The tx hex every job of this generation shares, the template the
+        // connections' coinbases read, and what the template commits to.
+        auto tx_data = std::make_shared<std::vector<std::string>>();
+        if (wd.m_data.contains("transactions") && wd.m_data["transactions"].is_array()) {
+            tx_data->reserve(wd.m_data["transactions"].size());
+            for (const auto& tx : wd.m_data["transactions"])
+                if (tx.is_object() && tx.contains("data") && tx["data"].is_string())
+                    tx_data->push_back(tx["data"].get<std::string>());
+        }
+        auto template_sp = std::make_shared<const nlohmann::json>(wd.m_data);
+        uint256 content_key;
+        {
+            std::string k;
+            for (const char* f : {"previousblockhash", "version", "bits", "coinbasevalue", "height", "mweb",
+                                  core::coin::kTemplateDegradedKey, core::coin::kTemplateRefusalKey}) {
+                k += f;
+                k += '=';
+                if (wd.m_data.contains(f))
+                    k += wd.m_data[f].dump();
+                k += ';';
+            }
+            k += degraded ? "D;" : "-;";
+            for (const auto& h : wd.m_hashes)
+                k.append(reinterpret_cast<const char*>(h.data()), 32);
+            content_key = Hash(std::span<const unsigned char>(
+                reinterpret_cast<const unsigned char*>(k.data()), k.size()));
+        }
+
         // Commit to cache under mutex
         std::lock_guard<std::mutex> lock(m_work_mutex);
         m_cached_template         = wd.m_data;
+        m_cached_template_sp      = std::move(template_sp);
+        m_cached_tx_data          = std::move(tx_data);
+        if (content_key != m_template_content_key) {
+            m_template_content_key = content_key;
+            ++m_template_content_seq;
+        }
         m_cached_merkle_branches  = std::move(merkle_branches);
         m_cached_coinb1           = std::move(cb_parts.first);
         m_cached_coinb2           = std::move(cb_parts.second);
@@ -2067,6 +2106,38 @@ nlohmann::json MiningInterface::get_template_tx_refusals_json() const
                        {"txid", t.last_txid}, {"ago_s", (now_ms - t.last_ms) / 1000}};
     }
     return out;
+}
+
+void MiningInterface::note_template_refresh(core::RefreshCause cause, uint64_t took_ms,
+                                            uint64_t tx_changes, uint64_t tx_interval_ms,
+                                            uint64_t tx_unchanged)
+{
+    m_template_refresh_tx_unchanged.store(tx_unchanged, std::memory_order_relaxed);
+    const auto c = static_cast<size_t>(cause);
+    if (c < static_cast<size_t>(core::RefreshCause::count))
+        m_template_refresh_by_cause[c].fetch_add(1, std::memory_order_relaxed);
+    m_template_refresh_ms_last.store(took_ms, std::memory_order_relaxed);
+    m_template_refresh_last_cause.store(static_cast<int8_t>(c), std::memory_order_relaxed);
+    m_template_refresh_tx_changes.store(tx_changes, std::memory_order_relaxed);
+    m_template_refresh_tx_interval_ms.store(tx_interval_ms, std::memory_order_relaxed);
+}
+
+nlohmann::json MiningInterface::get_template_refresh_json() const
+{
+    nlohmann::json by_cause = nlohmann::json::object();
+    for (size_t c = 0; c < static_cast<size_t>(core::RefreshCause::count); ++c)
+        by_cause[core::refresh_cause_name(static_cast<core::RefreshCause>(c))] =
+            m_template_refresh_by_cause[c].load(std::memory_order_relaxed);
+    const int8_t last = m_template_refresh_last_cause.load(std::memory_order_relaxed);
+    return {
+        {"by_cause", std::move(by_cause)},
+        {"ms_last", m_template_refresh_ms_last.load(std::memory_order_relaxed)},
+        {"last_cause", last < 0 ? nlohmann::json(nullptr)
+                                : nlohmann::json(core::refresh_cause_name(static_cast<core::RefreshCause>(last)))},
+        {"tx_changes", m_template_refresh_tx_changes.load(std::memory_order_relaxed)},
+        {"tx_interval_ms", m_template_refresh_tx_interval_ms.load(std::memory_order_relaxed)},
+        {"tx_unchanged", m_template_refresh_tx_unchanged.load(std::memory_order_relaxed)},
+    };
 }
 
 nlohmann::json MiningInterface::get_mweb_refusals_by_code_json() const
@@ -5959,6 +6030,17 @@ nlohmann::json MiningInterface::rest_local_stats()
                                                            : nlohmann::json::object();
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
+    // Template rebuilds by cause (tx, share, block, mweb) and the last one's ms.
+    result["template_refresh"] = get_template_refresh_json();
+    // Templates the coin node built without the pool's txs, by code
+    // (embedded LTC: mempool-not-cleaned-for-tip, utxo-view-not-at-tip).
+    {
+        std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+        nlohmann::json d = nlohmann::json::object();
+        for (const auto& [code, n] : m_template_degraded_by_code)
+            d[code] = n;
+        result["template_degraded"] = std::move(d);
+    }
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
     // Merged (aux) templates fetched degraded (built before the tip's body
     // cleaned the mempool: coinbase only) and fetched again clean, per chain.
@@ -11512,8 +11594,18 @@ std::map<std::array<uint8_t, 20>, double> WebServer::get_local_addr_rates() cons
     return result;
 }
 
-void WebServer::trigger_work_refresh()
+void WebServer::trigger_work_refresh(core::RefreshCause cause)
 {
+    using namespace std::chrono;
+    // The mempool changes this rebuild reads (the tx-triggered pacing skips
+    // a rebuild for changes an earlier one already covered).
+    uint64_t changes_at_start = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        changes_at_start = m_tx_refresh.changes();
+    }
+    const auto t0 = steady_clock::now();
+    const uint64_t content_before = mining_interface_->get_template_content_seq();
     // Update local hashrate from stratum sessions (p2pool: get_local_addr_rates)
     if (stratum_server_)
         mining_interface_->set_local_hashrate(stratum_server_->get_total_hashrate());
@@ -11521,11 +11613,68 @@ void WebServer::trigger_work_refresh()
     // Push new work to all miners immediately (p2pool: new_work_event).
     // Old jobs stay valid — miner submits by job_id, which maps to frozen data.
     // Stale shares only occur when MAX_ACTIVE_JOBS (256) is exceeded.
-    if (stratum_server_)
-        stratum_server_->notify_all();
+    // A rebuild for new transactions on the same block does not force
+    // clean_jobs (as a VARDIFF push does not): it can come once a second.
+    // And it notifies nobody when the template it installed commits to the
+    // same content (a HOLD, the empty template on the tip, no tx priced in
+    // the end): a new job id per tick for the same work only fills the
+    // sessions' job stores.
+    const bool unchanged_tx = cause == core::RefreshCause::tx
+        && mining_interface_->get_template_content_seq() == content_before;
+    if (unchanged_tx)
+        m_tx_refresh_unchanged.fetch_add(1, std::memory_order_relaxed);
+    if (stratum_server_ && !unchanged_tx)
+        stratum_server_->notify_all(/*force_clean=*/cause != core::RefreshCause::tx);
+    const auto took = duration_cast<milliseconds>(steady_clock::now() - t0);
+    uint64_t tx_changes = 0, interval_ms = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        m_tx_refresh.on_rebuild(t0, took, changes_at_start);
+        tx_changes = m_tx_refresh.changes();
+        interval_ms = static_cast<uint64_t>(m_tx_refresh.interval().count());
+    }
+    mining_interface_->note_template_refresh(cause, static_cast<uint64_t>(took.count()),
+                                             tx_changes, interval_ms,
+                                             m_tx_refresh_unchanged.load(std::memory_order_relaxed));
 }
 
-void WebServer::execute_debounced_work_refresh()
+void WebServer::trigger_work_refresh_mempool()
+{
+    core::TxRefreshPacer::Plan plan;
+    {
+        std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+        plan = m_tx_refresh.on_change(core::TxRefreshPacer::clock::now());
+    }
+    if (plan.rebuild)
+        trigger_work_refresh(core::RefreshCause::tx);
+    else if (plan.schedule)
+        arm_tx_refresh_timer(plan.at);
+}
+
+void WebServer::arm_tx_refresh_timer(core::TxRefreshPacer::clock::time_point at)
+{
+    if (!m_tx_refresh_timer)
+        m_tx_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
+    m_tx_refresh_timer->expires_at(at);
+    m_tx_refresh_timer->async_wait([this](beast::error_code ec) {
+        // Cancelled only when the timer goes away with the server.
+        if (ec)
+            return;
+        core::TxRefreshPacer::Plan plan;
+        {
+            std::lock_guard<std::mutex> lk(m_tx_refresh_mutex);
+            plan = m_tx_refresh.on_timer(core::TxRefreshPacer::clock::now());
+        }
+        if (!running_)
+            return;
+        if (plan.rebuild)
+            trigger_work_refresh(core::RefreshCause::tx);
+        else if (plan.schedule)
+            arm_tx_refresh_timer(plan.at);
+    });
+}
+
+void WebServer::execute_debounced_work_refresh(core::RefreshCause cause)
 {
     // Capture previous tip hash BEFORE refresh updates it — needed for delta precompute.
     // Absent tip (fresh bootstrap, no shares yet) → empty prev_tip_hash, precompute_delta
@@ -11538,7 +11687,7 @@ void WebServer::execute_debounced_work_refresh()
     if (auto* mm = mining_interface_->get_mm_manager())
         mm->mark_pplns_dirty();
 
-    trigger_work_refresh();
+    trigger_work_refresh(cause);
 
     // Invalidate sharechain window cache (new share changed the tip)
     mining_interface_->invalidate_window_cache();
@@ -11562,7 +11711,7 @@ void WebServer::execute_debounced_work_refresh()
     m_last_refresh_tip_hash = refreshed_tip ? refreshed_tip->hash : std::string{};
 }
 
-void WebServer::trigger_work_refresh_debounced()
+void WebServer::trigger_work_refresh_debounced(core::RefreshCause cause)
 {
     // ── Notify debounce (interim hardening fix #3) ──
     // Share-arrival storms used to fan out into one full refresh_work() +
@@ -11585,7 +11734,7 @@ void WebServer::trigger_work_refresh_debounced()
                            && (now - m_last_work_refresh < DEBOUNCE_WINDOW);
 
     if (!in_window && !m_work_refresh_pending) {
-        execute_debounced_work_refresh();  // leading edge — immediate
+        execute_debounced_work_refresh(cause);  // leading edge — immediate
         return;
     }
 
@@ -11593,6 +11742,7 @@ void WebServer::trigger_work_refresh_debounced()
         return;  // trailing refresh already scheduled — this call coalesces
 
     m_work_refresh_pending = true;
+    m_work_refresh_pending_cause = cause;
     if (!m_work_refresh_timer)
         m_work_refresh_timer = std::make_shared<net::steady_timer>(ioc_);
     // Fire at the end of the window that opened with the leading-edge refresh.
@@ -11608,7 +11758,7 @@ void WebServer::trigger_work_refresh_debounced()
         std::string tip_hash = tip ? tip->hash : std::string{};
         if (tip_hash == m_last_refresh_tip_hash)
             return;
-        execute_debounced_work_refresh();
+        execute_debounced_work_refresh(m_work_refresh_pending_cause);
     });
 }
 

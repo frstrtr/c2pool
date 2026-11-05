@@ -259,6 +259,18 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
         std::filesystem::remove_all(dir, ec);
     }
 
+    // Not final in the next block (CheckFinalTx): locked to its height.
+    {
+        pool.set_lock_time_cutoff(1001, 1'600'000'000);
+        MutableTransaction locked = pay(0x0a, 1000);
+        locked.locktime = 1001;
+        locked.vin[0].sequence = 0xfffffffe;
+        r = pool.admit(locked, nullptr);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::non_final);
+        pool.set_lock_time_cutoff(0, 0);
+    }
+
     // The rules key on MWEB data only: an ordinary legacy tx (any coin
     // sharing this pool, e.g. DOGE) is admitted as before.
     MutableTransaction legacy = pay(0x07, 5000, {0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,

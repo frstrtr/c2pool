@@ -235,6 +235,28 @@ if (BUILD_TESTING AND GTest_FOUND)
     # h6101857) extends by the whole batch; an asked peer's answer cuts
     # nothing. Same folding rule.
     #
+    # template_gap_gate_test.cpp: the embedded LTC template takes the pool's
+    # txs only on a UTXO view at the tip, else it is coinbase + HogEx on the
+    # tip, served (#2136): back-to-back blocks, a reorg across a same-height
+    # sibling, a tx its parent confirmed relayed again, a stuck heal or a
+    # body nobody serves all yield work on the tip; without the tip's MWEB
+    # state the MWEB HOLD stays (REAL HeaderChain, Mempool,
+    # UTXOViewCache/UTXOViewDB, MWEBTracker), core::coin::template_pool_gate,
+    # and the 32-block cleaned_for window. Same folding rule.
+    #
+    # mempool_final_tx_test.cpp: the embedded LTC mempool and template take
+    # only txs final in the next block (litecoind IsFinalTx, #2137 S1):
+    # admission refuses non_final at the tip's height + 1 / MTP, the
+    # template selects at its own height / its parent's MTP (a child stays
+    # out with its parent), coinbase maturity at the template's height in the
+    # selection and at the next block's at admission, and priced_changes()
+    # moves exactly when a tx is priced (the tx-triggered refresh). Same
+    # folding rule.
+    #
+    # utxo_view_stats_test.cpp: /local_stats ltc_utxo (#2137): the anchor,
+    # depth and completeness of the UTXO view the template prices against
+    # (sync state, else the anchor this process observed, else unknown) and
+    # the admission counters of what it cannot price. Same folding rule.
     # hogaddr_spend_guard_test.cpp: only the next block's HogEx spends the
     # tip's HogAddr (HogEx output 0): the template's selection starts with the
     # HogEx's inputs spent and never spends a HogAddr coin, and admission
@@ -290,6 +312,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
+        mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
         merged_found_record_test.cpp
         merged_rebuild_payouts_test.cpp
@@ -307,10 +330,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         share_message_unpack_bounds_test.cpp
         share_remove_owns_data_test.cpp
         share_test.cpp
+        template_gap_gate_test.cpp
         template_hogex_survives_truncation_test.cpp
         template_sigop_budget_test.cpp
         template_topology_spend_test.cpp
         utxo_order_test.cpp
+        utxo_view_stats_test.cpp
         version_switch_floor_test.cpp
         wirecompat_runtime_test.cpp
     )

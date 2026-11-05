@@ -378,7 +378,7 @@ void StratumServer::record_pseudoshare(double work, const std::array<uint8_t, 20
     local_addr_rate_monitor_.add_datum(work, pubkey_hash, user, dead);
 }
 
-void StratumServer::notify_all()
+void StratumServer::notify_all(bool force_clean)
 {
     // ── Lock hierarchy: m_work_mutex (1) > sessions_mutex_ (2) ──
     // send_notify_work() acquires m_work_mutex internally.
@@ -416,7 +416,8 @@ void StratumServer::notify_all()
     for (auto& s : snapshot) {
         try {
             if (s->is_connected() && s->is_subscribed())
-                s->send_notify_work(true, &frozen_best);  // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
+                // clean_jobs=true: miner switches to new prev_share immediately (p2pool behavior)
+                s->send_notify_work(force_clean, &frozen_best);
         } catch (...) {}
     }
 }
