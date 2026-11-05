@@ -881,12 +881,28 @@ std::optional<uint32_t> MiningInterface::coinbase_sigops(const std::string& coin
     return core::coin::sigops::tx_hex_legacy_sigops(coinb1 + "0000000000000000" + coinb2);
 }
 
+std::optional<uint32_t> MiningInterface::coinbase_sigop_bound(const std::string& coinb1, const std::string& coinb2,
+                                                              bool has_state_root)
+{
+    // Appending the root after the scriptSig's pushes leaves the ops that
+    // start before it as they are, the same bound as counting it in place.
+    const auto ops = core::coin::sigops::tx_hex_legacy_sigops(coinb1 + "0000000000000000" + coinb2,
+                                                              has_state_root ? kCoinbaseRawScriptSigTail : 0);
+    if (!ops)
+        return std::nullopt;
+    const uint32_t root = has_state_root ? 0u
+        : static_cast<uint32_t>(kCoinbaseRawScriptSigTail * core::coin::sigops::MAX_PUBKEYS_PER_MULTISIG);
+    return *ops + root;
+}
+
 void MiningInterface::note_coinbase_built(const std::string& coinb1, const std::string& coinb2,
-                                          bool segwit, size_t branch_len, bool fresh_template) const
+                                          bool segwit, size_t branch_len, bool fresh_template,
+                                          bool has_state_root) const
 {
     const uint32_t w = coinbase_weight(coinb1, coinb2, segwit);
-    // A coinbase that does not parse counts as the worst case its size allows.
-    const uint32_t ops = coinbase_sigops(coinb1, coinb2).value_or(
+    // The bound over any state root; a coinbase that does not parse counts
+    // as the worst case its size allows.
+    const uint32_t ops = coinbase_sigop_bound(coinb1, coinb2, has_state_root).value_or(
         static_cast<uint32_t>(std::min<uint64_t>((coinb1.size() + coinb2.size()) / 2 * 20, UINT32_MAX)));
     if (fresh_template) {
         // A new template: start from its own coinbase; the per-connection
@@ -1605,7 +1621,8 @@ MiningInterface::build_connection_coinbase(
         the_root,
         ws.coinbase_text);
     LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
-    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false);
+    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false,
+                        /*has_state_root=*/!the_root.IsNull());
 
     // ── Phase 4: Write back updated PPLNS cache ──
     {
@@ -1896,7 +1913,7 @@ void MiningInterface::refresh_work()
         }
 
         note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
-                            /*fresh_template=*/true);
+                            /*fresh_template=*/true, /*has_state_root=*/false);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
