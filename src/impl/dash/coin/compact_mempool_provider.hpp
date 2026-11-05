@@ -23,9 +23,12 @@
 // A tx that matches by short id but is the wrong tx is not caught here. The
 // receiver's merkle bind catches it and fetches the full block (slice 1).
 //
-// LIFETIME: the provider holds `mp` by raw pointer. The Mempool must outlive
-// every CompactBlockReceiver (and every parked PartiallyDownloadedBlock) the
-// provider is installed into.
+// LIFETIME: the provider holds `mp` by raw pointer. Only InitData calls it
+// (vendor/blockencodings.cpp), and InitData runs inside on_cmpctblock, so a
+// parked PartiallyDownloadedBlock's copy is never called again. The Mempool
+// must outlive every receiver the provider is INSTALLED in. A client that
+// can outlive the Mempool is bound through CompactMempoolBinding (below),
+// which takes the provider out again before the Mempool goes.
 
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/vendor/shim.hpp>
@@ -52,6 +55,55 @@ inline vendor::MempoolShortIdProvider make_mempool_short_id_provider(const Mempo
         return snap;
     };
 }
+
+// #968a slice 3b: installs a Mempool's provider into a coin-P2P client and
+// takes it out again in the destructor.
+//
+// In run_node (main_dash.cpp) the client (coin_p2p) is declared before
+// node_coin_state, which owns the Mempool, so at scope exit the Mempool is
+// destroyed first. The client can also outlive the scope altogether:
+// set_lifetime pins it with a strong ref per in-flight async op. Without this
+// binding the client would be left holding a provider that points into a
+// freed Mempool. Declare the binding AFTER the Mempool's owner. It is then
+// destroyed BEFORE the owner, and the provider is gone from the client while
+// the Mempool is still alive.
+//
+// The client is held weakly. If it is already gone, there is nothing to take
+// out. Client needs set_compact_mempool_provider(MempoolShortIdProvider)
+// (CoinClient, p2p_client.hpp). bind/unbind/destructor run on the client's io
+// thread or after its io loop has stopped, the same rule as the setter.
+template <class Client>
+class CompactMempoolBinding
+{
+public:
+    CompactMempoolBinding() = default;
+    CompactMempoolBinding(const CompactMempoolBinding&) = delete;
+    CompactMempoolBinding& operator=(const CompactMempoolBinding&) = delete;
+    ~CompactMempoolBinding() { unbind(); }
+
+    // A null client leaves the binding unbound. A second bind replaces the
+    // first, after taking the first provider out.
+    void bind(const std::shared_ptr<Client>& client, const Mempool& mp)
+    {
+        unbind();
+        if (!client)
+            return;
+        client->set_compact_mempool_provider(make_mempool_short_id_provider(&mp));
+        m_client = client;
+    }
+
+    void unbind()
+    {
+        if (auto c = m_client.lock())
+            c->set_compact_mempool_provider(nullptr);
+        m_client.reset();
+    }
+
+    bool bound() const { return !m_client.expired(); }
+
+private:
+    std::weak_ptr<Client> m_client;
+};
 
 } // namespace coin
 } // namespace dash

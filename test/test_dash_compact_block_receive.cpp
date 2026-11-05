@@ -11,7 +11,8 @@
 //
 // DashCompactMempool (slice 3) drives the same receiver over a real Mempool
 // through make_mempool_short_id_provider; its revert-red arms are listed at
-// that section.
+// that section. DashCompactBinding (slice 3b) tears a bound client and its
+// Mempool owner down in run_node's declared order.
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,7 @@
 #include <impl/dash/coin/compact_negotiation.hpp>
 #include <impl/dash/coin/compact_mempool_provider.hpp>
 #include <impl/dash/coin/mempool.hpp>
+#include <impl/dash/coin/node_coin_state.hpp>
 #include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/vendor/blockencodings.hpp>
 #include <impl/dash/coin/block.hpp>
@@ -29,6 +31,7 @@
 #include <core/uint256.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -432,4 +435,111 @@ TEST(DashCompactMempool, SetterArmsAndClearsTheReceiver) {
     auto third = rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(45));
     ASSERT_EQ(third.kind, Kind::NeedTxn);
     EXPECT_EQ(third.request.indexes, (std::vector<uint16_t>{1, 2, 3}));
+}
+
+// ── DashCompactBinding (slice 3b): CompactMempoolBinding teardown ──────────
+// run_node (main_dash.cpp) declares coin_p2p, then node_coin_state (which owns
+// the Mempool), then cmpct_mempool_binding. Scope exit destroys them in reverse:
+// the binding, then node_coin_state, then the scope's coin_p2p ref. coin_p2p
+// can outlive the scope: set_lifetime pins it with a strong ref per in-flight
+// async op. `pin` below plays that ref. The client is a stand-in with the
+// CoinClient surface the binding calls, plus the receiver a cmpctblock reaches.
+// Revert-red arms (fresh binary per arm):
+//   E ~CompactMempoolBinding does not unbind   -> DeclaredOrderTeardown... red
+//     (fails the has_compact_mempool_provider check, then the late cmpctblock
+//     reads the freed Mempool: ASan heap-use-after-free, SIGSEGV in a plain
+//     build)
+//   F unbind does not clear the client         -> DeclaredOrderTeardown...
+//     (same use-after-free), UnbindClearsTheClient, RebindMovesTheProvider red
+//   G bind does not unbind the previous client -> RebindMovesTheProvider red
+
+namespace {
+
+struct BindingTestClient {
+    CompactBlockReceiver rx{nullptr, kMaxTx};
+    void set_compact_mempool_provider(v::MempoolShortIdProvider p)
+    { rx.set_mempool_provider(std::move(p)); }
+    bool has_compact_mempool_provider() const { return rx.has_mempool_provider(); }
+};
+
+using Binding = CompactMempoolBinding<BindingTestClient>;
+
+} // namespace
+
+TEST(DashCompactBinding, DeclaredOrderTeardownDetachesBeforeMempoolDies) {
+    const BlockType b = mk_block(4);
+    std::shared_ptr<BindingTestClient> pin;
+    {
+        auto coin_p2p = std::make_shared<BindingTestClient>();
+        auto node_coin_state = std::make_unique<NodeCoinState>();
+        add_block_txs(node_coin_state->mempool(), b, {1, 2, 3});
+        Binding cmpct_mempool_binding;
+        cmpct_mempool_binding.bind(coin_p2p, node_coin_state->mempool());
+        ASSERT_TRUE(cmpct_mempool_binding.bound());
+        ASSERT_TRUE(coin_p2p->has_compact_mempool_provider());
+
+        auto live = coin_p2p->rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(46));
+        ASSERT_EQ(live.kind, Kind::Complete) << live.reason;
+        expect_same(live.block, b);
+        pin = coin_p2p;
+    }
+    // The binding, node_coin_state and the scope's ref are gone, in that
+    // order. The pinned client must not reach the freed Mempool.
+    ASSERT_EQ(pin.use_count(), 1);
+    EXPECT_FALSE(pin->has_compact_mempool_provider());
+    auto late = pin->rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(47));
+    ASSERT_EQ(late.kind, Kind::NeedTxn);
+    EXPECT_EQ(late.request.indexes, (std::vector<uint16_t>{1, 2, 3}));
+}
+
+TEST(DashCompactBinding, UnbindClearsTheClient) {
+    const BlockType b = mk_block(3);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 2});
+    auto client = std::make_shared<BindingTestClient>();
+    Binding binding;
+    binding.bind(client, mp);
+    ASSERT_TRUE(client->has_compact_mempool_provider());
+
+    binding.unbind();
+    EXPECT_FALSE(binding.bound());
+    EXPECT_FALSE(client->has_compact_mempool_provider());
+    auto vd = client->rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(48));
+    ASSERT_EQ(vd.kind, Kind::NeedTxn);
+    EXPECT_EQ(vd.request.indexes, (std::vector<uint16_t>{1, 2}));
+}
+
+TEST(DashCompactBinding, RebindMovesTheProvider) {
+    const BlockType b = mk_block(3);
+    Mempool mp;
+    add_block_txs(mp, b, {1, 2});
+    auto first = std::make_shared<BindingTestClient>();
+    auto second = std::make_shared<BindingTestClient>();
+    Binding binding;
+    binding.bind(first, mp);
+    binding.bind(second, mp);
+    EXPECT_FALSE(first->has_compact_mempool_provider());
+    EXPECT_TRUE(second->has_compact_mempool_provider());
+    auto vd = second->rx.on_cmpctblock(kPeer, v::CBlockHeaderAndShortTxIDs(b), bhash(49));
+    ASSERT_EQ(vd.kind, Kind::Complete) << vd.reason;
+}
+
+TEST(DashCompactBinding, NullClientStaysUnbound) {
+    Mempool mp;
+    Binding binding;
+    binding.bind(nullptr, mp);
+    EXPECT_FALSE(binding.bound());
+}
+
+TEST(DashCompactBinding, ClientGoneFirstIsSafe) {
+    Mempool mp;
+    Binding binding;
+    {
+        auto client = std::make_shared<BindingTestClient>();
+        binding.bind(client, mp);
+        ASSERT_TRUE(binding.bound());
+    }
+    EXPECT_FALSE(binding.bound());
+    binding.unbind();   // nothing to take out; must not touch the freed client
+    EXPECT_FALSE(binding.bound());
 }
