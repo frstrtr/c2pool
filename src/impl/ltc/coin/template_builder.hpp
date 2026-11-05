@@ -274,9 +274,33 @@ public:
         // the tip or its MWEB state first.
         const bool pool_cleaned = pool.size() == 0 || pool.cleaned_for(tip.block_hash);
 
+        // ── The tip's MWEB state (the HogEx spends the tip's HogEx) ───────
+        // The HogEx spends the HogEx output of the block we build on. State
+        // from any other block (e.g. a late body that lands after the tip
+        // moved on) would spend an output the tip already spent and still
+        // pass the shape check, so it counts as no state: refused -> HOLD.
+        std::optional<MWEBState> mweb_state;
+        if (mweb_tracker) {
+            mweb_state = mweb_tracker->get_state();
+            if (mweb_state && (mweb_state->captured_at_height != tip.height
+                               || mweb_state->captured_block_hash != tip.block_hash)) {
+                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
+                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
+                                << ", tip is h=" << tip.height << " "
+                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
+                mweb_state.reset();
+            }
+        }
+
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
+        // The HogEx appended below spends the tip's HogEx output 0 (its
+        // vin[0]): the selection starts with that outpoint spent, so no pool
+        // tx spends it too (bad-txns-inputs-missingorspent).
+        Mempool::SelectionSeed seed;
+        if (mweb_state)
+            seed.consumed.emplace(mweb_state->prev_hogex_txid, mweb_state->prev_hogex_vout);
         auto [selected_txs, total_fees] =
-            pool.get_sorted_txs_with_fees(max_weight);
+            pool.get_sorted_txs_with_fees(max_weight, &seed);
 
         // coinbasevalue = block reward + included transaction fees
         // Matches litecoind's getblocktemplate coinbasevalue field.
@@ -343,19 +367,6 @@ public:
             || (mweb_activation != 0 && next_h >= mweb_activation);
 
         if (mweb_tracker) {
-            auto mweb_state = mweb_tracker->get_state();
-            // The HogEx spends the HogEx output of the block we build on. State
-            // from any other block (e.g. a late body that lands after the tip
-            // moved on) would spend an output the tip already spent and still
-            // pass the shape check, so it counts as no state: refused -> HOLD.
-            if (mweb_state && (mweb_state->captured_at_height != tip.height
-                               || mweb_state->captured_block_hash != tip.block_hash)) {
-                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
-                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
-                                << ", tip is h=" << tip.height << " "
-                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
-                mweb_state.reset();
-            }
             if (mweb_state) {
                 // Build HogEx transaction (last tx in block)
                 auto hogex = MWEBBuilder::build_hogex(*mweb_state, next_h);

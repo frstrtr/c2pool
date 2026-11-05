@@ -234,6 +234,12 @@ if (BUILD_TESTING AND GTest_FOUND)
     # captured witness-coinbase batches (h4715979, h5080796, h5641398,
     # h6101857) extends by the whole batch; an asked peer's answer cuts
     # nothing. Same folding rule.
+    #
+    # hogaddr_spend_guard_test.cpp: only the next block's HogEx spends the
+    # tip's HogAddr (HogEx output 0): the template's selection starts with the
+    # HogEx's inputs spent and never spends a HogAddr coin, and admission
+    # refuses a HogAddr input (hogaddr_spend). REAL tip 3200604 and its MWEB
+    # state, REAL Mempool and UTXOViewCache/UTXOViewDB. Same folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -269,6 +275,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
         head_retention_test.cpp
+        hogaddr_spend_guard_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp
         ingest_ownership_test.cpp

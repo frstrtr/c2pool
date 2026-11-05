@@ -171,6 +171,7 @@ public:
             duplicate,               // already in the pool
             inputs_invalid,          // premature coinbase/pegout spend, money range, outputs above inputs
             missing_inputs,          // an input in neither the set nor the pool: parked as an orphan
+            hogaddr_spend,           // spends a HogAddr (a HogEx output 0), which only the next HogEx spends
             count
         };
         Code     code{malformed};
@@ -194,6 +195,7 @@ public:
             case Reject::duplicate:              return "duplicate";
             case Reject::inputs_invalid:         return "inputs_invalid";
             case Reject::missing_inputs:         return "missing_inputs";
+            case Reject::hogaddr_spend:          return "hogaddr_spend";
             case Reject::count:                  break;
         }
         return "unknown";
@@ -220,9 +222,11 @@ public:
     /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
     /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
     /// pegin output without one (litecoind PreChecks refuses each of these);
-    /// then the pool's own duplicate check; then, with a view, the inputs
-    /// (inputs_invalid; missing_inputs parks the tx as an orphan when the
-    /// view is built from genesis). Fees are computed as add_tx does. An
+    /// then the pool's own duplicate check; then, with a view, the inputs:
+    /// a HogAddr input (hogaddr_spend: a HogEx output 0, which the next
+    /// block's HogEx spends as its vin[0]), then inputs_invalid;
+    /// missing_inputs parks the tx as an orphan when the view is built from
+    /// genesis. Fees are computed as add_tx does. An
     /// admitted tx admits the orphans waiting for it.
     std::optional<Reject> admit(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
         auto r = admit_one(tx, utxo, /*count=*/true);
@@ -281,6 +285,10 @@ private:
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_pool.count(r.txid))
                 return refuse(Reject::duplicate);
+            if (spends_hogaddr(tx, utxo)) {
+                erase_orphan_locked(r.txid);
+                return refuse(Reject::hogaddr_spend);
+            }
             std::vector<uint256> missing;
             switch (check_inputs_locked(tx, utxo, missing)) {
             case Inputs::Ok:
@@ -699,6 +707,35 @@ public:
         bool     fee_known{false};
     };
 
+    /// What a template already holds before the selection runs: the
+    /// outpoints it spends (no selected tx spends one again: the HogEx's own
+    /// inputs) and the txids it carries (never selected again; a pool tx
+    /// that spends one of their outputs may follow them).
+    struct SelectionSeed {
+        std::set<std::pair<uint256, uint32_t>> consumed;
+        std::set<uint256> in_template;
+    };
+
+    /// A coin with the HogAddr script (OP_8 PUSH32, a HogEx output 0): the
+    /// next block's HogEx spends it as its vin[0], and no other tx of a
+    /// valid block can.
+    static bool is_hogaddr_coin(const core::coin::Coin& coin) {
+        return mweb_wire::is_hogaddr(coin.scriptPubKey);
+    }
+
+    /// True when an input of `tx` is a HogAddr coin in `utxo`.
+    static bool spends_hogaddr(const MutableTransaction& tx, core::coin::UTXOViewCache* utxo) {
+        if (!utxo)
+            return false;
+        for (const auto& vin : tx.vin) {
+            core::coin::Coin coin;
+            if (utxo->get_coin(core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), coin)
+                && is_hogaddr_coin(coin))
+                return true;
+        }
+        return false;
+    }
+
     /// Return transactions sorted by feerate (highest first), up to max_weight.
     /// Only priced (fee_known) transactions are selected: with a view built
     /// from genesis an unpriced tx is an orphan, a premature spend or a
@@ -725,8 +762,12 @@ public:
     ///       both passes) refuses the second spender.
     /// Reward-neutral: total_fees sums only INCLUDED txs' known fees, so
     /// coinbasevalue tracks exactly the txs that ship.
+    /// With `seed` the selection starts from what the template already holds
+    /// (SelectionSeed: at least the HogEx's inputs); those txs are not in the
+    /// result, nor in total_fees. A HogAddr coin is never spent by a
+    /// selected tx.
     std::pair<std::vector<SelectedTx>, uint64_t>
-    get_sorted_txs_with_fees(uint32_t max_weight) const {
+    get_sorted_txs_with_fees(uint32_t max_weight, const SelectionSeed* seed = nullptr) const {
         std::lock_guard<std::mutex> lock(m_mutex);
 
         std::vector<SelectedTx> result;
@@ -736,6 +777,10 @@ public:
         // Per-template consumed outpoints: one entry per input of every
         // selected tx, so no outpoint is spent twice.
         std::set<std::pair<uint256, uint32_t>> consumed;
+        if (seed) {
+            selected = seed->in_template;
+            consumed = seed->consumed;
+        }
 
         auto* utxo = m_utxo.load();
         if (!utxo)
@@ -781,6 +826,8 @@ public:
                     core::coin::Coin coin;
                     if (!utxo->get_coin(uop, coin))
                         return false;  // absent from UTXO and mempool — stale
+                    if (is_hogaddr_coin(coin))
+                        return false;  // only the HogEx spends a HogAddr
                     // Not spendable in the block being built (height tip + 1).
                     if (m_tip_height > 0 && !coin.is_mature(m_tip_height + 1, m_limits))
                         return false;
