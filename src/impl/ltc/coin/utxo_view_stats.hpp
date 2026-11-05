@@ -16,7 +16,10 @@
 //   anchor_source     which of the three
 //   best_height / best_block, blocks_connected
 //   depth             best_height - anchor_height + 1 (null when unknown)
+//   behind            the header tip's height - best_height (0 at the tip)
 //   complete          built from genesis and its best block IS the tip
+//   (main_ltc adds "mode": "full" | "accrual", and "full": the full set's
+//   lane while it builds, --ltc-utxo-full)
 //   missing_inputs / inputs_invalid   admission refusals by those codes
 //                     (missing_inputs counts only with a set from genesis:
 //                     a partial view admits such a tx fee-unknown)
@@ -74,6 +77,7 @@ inline nlohmann::json utxo_view_json(const core::coin::UTXOViewCache* utxo,
     j["best_block"] = best_hash.GetHex();
     j["depth"] = (anchor && !best_hash.IsNull() && *anchor <= best_height)
         ? nlohmann::json(best_height - *anchor + 1) : nlohmann::json(nullptr);
+    j["behind"] = chain_height > best_height ? chain_height - best_height : 0;
     if (pool) {
         const auto& st = pool->reject_stats();
         j["missing_inputs"] = st.by_code[Mempool::Reject::missing_inputs].load(std::memory_order_relaxed);

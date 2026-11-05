@@ -37,7 +37,7 @@
 // picks its tip by chain work, so the new tip does not descend from the old
 // one: a reorg. The view must end on b2..b5 with a2 / a3 gone, not on
 // a1 a2 a3 + b5 with b2..b4 never connected.
-TEST(DogeUtxoOrder, TallerHeavierSiblingBranchIsAReorg)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), TallerHeavierSiblingBranchIsAReorg)
 {
     Lane l;
     const uint256 g = genesis(0x10);
@@ -73,7 +73,7 @@ TEST(DogeUtxoOrder, TallerHeavierSiblingBranchIsAReorg)
 // h+2 was connected over the gap and h+1 skipped as old for good: h+1's
 // outputs never existed in the view and the coin h+1 spent stayed
 // spendable (a double-spend the template could carry).
-TEST(DogeUtxoOrder, OutOfOrderBodiesConnectInOrder)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), OutOfOrderBodiesConnectInOrder)
 {
     Lane l;
     const uint256 g = genesis(0x30);
@@ -107,7 +107,7 @@ TEST(DogeUtxoOrder, OutOfOrderBodiesConnectInOrder)
 // A reorg onto a shorter but heavier branch, two blocks deep: a3..a5 go, b3
 // and b4 both come. Before, only the new tip was asked for and connected
 // over the fork, so b3 never reached the view.
-TEST(DogeUtxoOrder, MultiBlockReorgConnectsEveryNewBranchBlock)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), MultiBlockReorgConnectsEveryNewBranchBlock)
 {
     Lane l;
     const uint256 g = genesis(0x40);
@@ -146,7 +146,7 @@ TEST(DogeUtxoOrder, MultiBlockReorgConnectsEveryNewBranchBlock)
 // of the upgrade) cannot put the coins its block spent back. The lane must
 // not carry on with X missing: it wipes the set and rebuilds it from the
 // best chain.
-TEST(DogeUtxoOrder, LegacyUndoRecordRebuilds)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), LegacyUndoRecordRebuilds)
 {
     Lane l;
     const uint256 g = genesis(0x60);
@@ -186,10 +186,10 @@ TEST(DogeUtxoOrder, LegacyUndoRecordRebuilds)
 // without T, and the aux block is invalid (bad-txns-inputs-missingorspent).
 // After the reorg the view does not have T's output: C is never selected
 // without T; once T is relayed too, both are, T first.
-TEST(DogeUtxoOrder, OrphanedTxChildIsNotSelectedAfterReorg)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), OrphanedTxChildIsNotSelectedAfterReorg)
 {
     Lane l;
-    Mempool pool(core::coin::DOGE_LIMITS);
+    Mempool pool(C2_LANE_LIMITS);
     pool.set_utxo(l.t.cache.get());
     l.net.pool = &pool;
 
@@ -237,7 +237,7 @@ TEST(DogeUtxoOrder, OrphanedTxChildIsNotSelectedAfterReorg)
 // the body was dropped (not on the best chain yet), fetched again after the
 // header landed, and meanwhile the mempool pass evicted the children of its
 // txs.
-TEST(DogeUtxoOrder, BodyBeforeHeaderConnectsOnFirstDelivery)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), BodyBeforeHeaderConnectsOnFirstDelivery)
 {
     Lane l;
     const auto a = make_chain(genesis(0xe0), 1, 3, 0xe0);
@@ -276,12 +276,12 @@ TEST(DogeUtxoOrder, BodyBeforeHeaderConnectsOnFirstDelivery)
 // poll (another thread) may build the DOGE template on it right then. The
 // txs the block confirmed must already be out of the mempool: the pool is
 // cleaned for the block BEFORE its header goes in.
-TEST(DogeUtxoOrder, BodyBeforeHeaderCleansThePoolFirst)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), BodyBeforeHeaderCleansThePoolFirst)
 {
     Lane l;
     // No coinbase maturity: Q spends a coinbase of this 3-block chain, which
     // the pool's admission would refuse as premature at DOGE's 240.
-    Mempool pool(core::coin::ChainLimits{core::coin::DOGE_LIMITS.max_money, 0, 0});
+    Mempool pool(core::coin::ChainLimits{C2_LANE_LIMITS.max_money, 0, 0});
     pool.set_utxo(l.t.cache.get());
     l.net.pool = &pool;
     const auto a = make_chain(genesis(0xd5), 1, 3, 0xd5);
@@ -306,7 +306,7 @@ TEST(DogeUtxoOrder, BodyBeforeHeaderCleansThePoolFirst)
 // height when the drain reaches it (the header chain switched, its tip
 // change not handled yet): it is not connected; the fill restarts at the
 // set's real next height and fetches the best chain's block.
-TEST(DogeUtxoOrder, StaleBufferedBlockIsRefetched)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), StaleBufferedBlockIsRefetched)
 {
     Lane l;
     const auto a = make_chain(genesis(0xf0), 1, 4, 0xf0);   // a1..a4
@@ -331,7 +331,7 @@ TEST(DogeUtxoOrder, StaleBufferedBlockIsRefetched)
 // Each fill asks the way main_ltc's EMB-LTC lane does: a gap asks the peer
 // that delivered the block (it has its parents), a reorg fill one peer at a
 // time, the cold-start window every peer.
-TEST(DogeUtxoOrder, RequestKindsPerFill)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), RequestKindsPerFill)
 {
     {
         Lane l;
@@ -366,7 +366,7 @@ TEST(DogeUtxoOrder, RequestKindsPerFill)
 // A crash after a reorg's tip was persisted but before the UTXO side ran: on
 // restart no tip change fires. The startup check walks the set back and
 // refills; on a set already on the best chain it does nothing.
-TEST(DogeUtxoOrder, StartupHealsACrashBetweenTipAndDisconnect)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), StartupHealsACrashBetweenTipAndDisconnect)
 {
     Lane l;
     const auto a = make_chain(genesis(0xa0), 1, 3, 0xa0);
@@ -393,7 +393,7 @@ TEST(DogeUtxoOrder, StartupHealsACrashBetweenTipAndDisconnect)
 // and then extends the new one reports old = b3, new = b4, an extension.
 // The connect-point check finds the set's best (a3) is not b4's parent and
 // walks the set back to the best chain.
-TEST(DogeUtxoOrder, ParentMismatchTheTipChangeDidNotReportHeals)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), ParentMismatchTheTipChangeDidNotReportHeals)
 {
     Lane l;
     const auto a = make_chain(genesis(0xb0), 1, 3, 0xb0);
@@ -418,7 +418,7 @@ TEST(DogeUtxoOrder, ParentMismatchTheTipChangeDidNotReportHeals)
 
 // Controls the old lane passed too: the cold start fetches the last `keep`
 // blocks in order, a plain extension is no reorg.
-TEST(DogeUtxoOrder, ColdStartAndExtension)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), ColdStartAndExtension)
 {
     Lane l(4);
     const auto c = make_chain(genesis(0xc0), 1, 12, 0xc0);
@@ -439,7 +439,7 @@ TEST(DogeUtxoOrder, ColdStartAndExtension)
 }
 
 // The /local_stats "doge_utxo" counters.
-TEST(DogeUtxoOrder, StatsCountGapsReorgsHealsAndRebuilds)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), StatsCountGapsReorgsHealsAndRebuilds)
 {
     Lane l;
     const auto a = make_chain(genesis(0xd0), 1, 4, 0xd0);
@@ -477,9 +477,9 @@ TEST(DogeUtxoOrder, StatsCountGapsReorgsHealsAndRebuilds)
 // one peer twice, then from every peer; once h=4 is in, the tip's own body
 // (h=5) is asked after CHASE_TIP_LAG. Nothing is asked while chase_tip says
 // no (the header chain not synced, a fill running).
-TEST(DogeUtxoOrder, TheSetChasesATipItsAnnouncerNeverServes)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), TheSetChasesATipItsAnnouncerNeverServes)
 {
-    Lane l(core::coin::DOGE_MIN_BLOCKS_TO_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
+    Lane l(C2_LANE_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
     const uint256 g = genesis(0x60);
     const auto c = make_chain(g, 1, 5, 0x60);
     l.grow({c[0], c[1], c[2]});
@@ -530,9 +530,9 @@ TEST(DogeUtxoOrder, TheSetChasesATipItsAnnouncerNeverServes)
 // asks its own blocks; the chase stays out of it. The set at h=3, h=5's body
 // arrives ahead (a gap fill [4..5] is armed), chase_tip says yes: in 8 s no
 // request from the chase, tip_chases 0.
-TEST(DogeUtxoOrder, TheSetDoesNotChaseWhileAFillRuns)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), TheSetDoesNotChaseWhileAFillRuns)
 {
-    Lane l(core::coin::DOGE_MIN_BLOCKS_TO_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
+    Lane l(C2_LANE_KEEP, UtxoLane::Mode::Accrual, 0, /*download=*/true);
     const uint256 g = genesis(0x70);
     const auto c = make_chain(g, 1, 5, 0x70);
     l.grow({c[0], c[1], c[2]});
@@ -560,7 +560,7 @@ TEST(DogeUtxoOrder, TheSetDoesNotChaseWhileAFillRuns)
 // of the last `keep` blocks. Now the chase leaves such a set alone, and the
 // tip's body arms the Bootstrap at tip - keep. keep = 20, the set at h=3,
 // the header chain at h=33.
-TEST(DogeUtxoOrder, TheChaseLeavesASetFarBehindToTheBootstrap)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), TheChaseLeavesASetFarBehindToTheBootstrap)
 {
     Lane l(20, UtxoLane::Mode::Accrual, 0, /*download=*/true);
     const uint256 g = genesis(0x71);

@@ -62,12 +62,29 @@ struct UtxoStats {
     uint64_t    txouts{0};          // unspent outputs
     Amount128   total_amount;       // koinu
     uint64_t    bytes_serialized{0};
-    uint256     hash_serialized;    // GetHex() is gettxoutsetinfo's hash_serialized
+    uint64_t    bogosize{0};        // Litecoin Core 0.21's (utxo_stats_ltc)
+    uint256     hash_serialized;    // GetHex() is gettxoutsetinfo's hash_serialized (_2 for LTC)
     uint64_t    unspendable_skipped{0};  // records that IsUnspendable (the set never writes one)
 };
 
 /// `progress` (optional) is called every 10,000,000 records scanned.
 UtxoStats utxo_stats(UTXOViewDB& db, const std::function<void(uint64_t records)>& progress = {});
+
+/// gettxoutsetinfo as Litecoin Core 0.21.4 computes it (c2pool
+/// --ltc-utxo-stats <dir>, the LTC full set against litecoind at the same
+/// best block; #2137). node/coinstats.cpp GetUTXOStats (HASH_SERIALIZED):
+/// a CHashWriter (double SHA256) over the best block hash, then per txid in
+/// the coins DB's order (key 'C' + the txid's 32 bytes + VARINT(index): the
+/// txid bytewise, then the index numerically) ApplyStats: the txid,
+/// VARINT(nHeight * 2 + fCoinBase ? 1u : 0u) of the first output (the
+/// conditional binds last, so that is 1 for any height above 0 or any
+/// coinbase), then per output in index order VARINT(index + 1), the script
+/// with its CompactSize, VARINT(value) (NONNEGATIVE_SIGNED: the same bytes
+/// for a value >= 0), then VARINT(0). transactions / txouts count the txids
+/// and outputs, total_amount sums the values, bogosize is GetBogoSize per
+/// output (32 + 4 + 4 + 8 + 2 + the script's size). bytes_serialized is not
+/// Core 0.21's (it has none) and is left 0.
+UtxoStats utxo_stats_ltc(UTXOViewDB& db, const std::function<void(uint64_t records)>& progress = {});
 
 /// Core's ValueFromAmount for an arith_uint256: "Q.RRRRRRRR".
 std::string format_coin_amount(Amount128 koinu);

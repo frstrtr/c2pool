@@ -290,6 +290,10 @@ static void segfault_handler(int sig) {
 #include <impl/doge/coin/utxo_lane.hpp>
 #include <impl/doge/coin/hash_schedule.hpp>
 #include <impl/doge/coin/utxo_full_state.hpp>
+#include <impl/doge/coin/process_memory.hpp>
+#include <impl/doge/coin/store_fds.hpp>
+#include <core/coin/utxo_full_state.hpp>
+#include <core/coin/utxo_lane.hpp>
 #include <impl/doge/coin/header_sync.hpp>
 #include <impl/doge/coin/range_sync.hpp>
 #include <impl/doge/coin/schedule_anchors.hpp>
@@ -594,6 +598,12 @@ void print_help() {
     std::cout << "  --no-doge-utxo-full       Keep the DOGE UTXO set an accrual view (no full set from\n";
     std::cout << "                            genesis; YAML doge_utxo_full: false)\n";
     std::cout << "  --doge-utxo-full-dir PATH The full DOGE UTXO set's LevelDB\n";
+    std::cout << "  --ltc-utxo-full           Build the LTC UTXO set from genesis (strictly connected; the\n";
+    std::cout << "                            templates price against it once it reaches the tip, the\n";
+    std::cout << "                            accrual view until then). Its header chain starts at genesis\n";
+    std::cout << "                            (<data>/litecoin/embedded_headers_full; --header-checkpoint\n";
+    std::cout << "                            is not applied). YAML ltc_utxo_full (default off)\n";
+    std::cout << "  --ltc-utxo-full-dir PATH  The full LTC UTXO set's LevelDB\n";
     std::cout << "                            (default: <data>/dogecoin/utxo_full_leveldb)\n";
     std::cout << "  --dump-doge-schedule-anchors DIR [OUT]  Write the DOGE hash schedule's anchors (the .inc\n";
     std::cout << "                            for src/impl/doge/coin/doge_schedule_anchors.inc) from the DOGE\n";
@@ -604,6 +614,8 @@ void print_help() {
     std::cout << "                            its coins, sync state and best block) and exit\n";
     std::cout << "  --utxo-stats DIR          Print gettxoutsetinfo for the UTXO LevelDB at DIR (Dogecoin\n";
     std::cout << "                            Core 1.14.9's fields and hash_serialized) and exit\n";
+    std::cout << "  --ltc-utxo-stats DIR      Print gettxoutsetinfo for the UTXO LevelDB at DIR (Litecoin\n";
+    std::cout << "                            Core 0.21.4's fields and hash_serialized_2) and exit\n";
     std::cout << "  --ltc-connect IP[:PORT]   Dial only this LTC peer (repeatable): no peer DB, DNS /\n";
     std::cout << "                            fixed / HTTP seeds or addr gossip (Core's -connect)\n";
     std::cout << "  --doge-connect IP[:PORT]  Dial only this DOGE peer (repeatable), as --ltc-connect\n";
@@ -885,6 +897,12 @@ int main(int argc, char* argv[]) {
     //   doge_utxo_full_dir  its LevelDB (default <data>/dogecoin/utxo_full_leveldb)
     bool        doge_utxo_full = true;
     std::string doge_utxo_full_dir;
+    // The LTC UTXO set built from genesis and strictly connected (#2137 S2),
+    // the same lane and dual-DB transition as DOGE's (core/coin/utxo_lane.hpp):
+    //   ltc_utxo_full      false (default) / true
+    //   ltc_utxo_full_dir  its LevelDB (default <data>/litecoin/utxo_full_leveldb)
+    bool        ltc_utxo_full = false;
+    std::string ltc_utxo_full_dir;
     // Core's -connect for the coin P2P: the LTC / DOGE peers to dial and no
     // other (no peer DB, DNS / fixed / HTTP seeds, addr gossip). HOST[:PORT].
     std::vector<std::string> ltc_connect;
@@ -1253,6 +1271,18 @@ int main(int argc, char* argv[]) {
             doge_utxo_full_dir = argv[++i];
             cli_explicit.insert("doge_utxo_full_dir");
         }
+        else if (arg == "--ltc-utxo-full") {
+            ltc_utxo_full = true;
+            cli_explicit.insert("ltc_utxo_full");
+        }
+        else if (arg == "--no-ltc-utxo-full") {
+            ltc_utxo_full = false;
+            cli_explicit.insert("ltc_utxo_full");
+        }
+        else if (arg == "--ltc-utxo-full-dir" && i + 1 < argc) {
+            ltc_utxo_full_dir = argv[++i];
+            cli_explicit.insert("ltc_utxo_full_dir");
+        }
         else if (arg == "--ltc-connect" && i + 1 < argc) {
             ltc_connect.push_back(argv[++i]);
             cli_explicit.insert("ltc_connect");
@@ -1346,6 +1376,53 @@ int main(int argc, char* argv[]) {
             std::cout << "{\"height\":" << st.best_height << ",\"bestblock\":\"" << st.best_block.GetHex()
                       << "\",\"transactions\":" << st.transactions << ",\"txouts\":" << st.txouts
                       << ",\"bytes_serialized\":" << st.bytes_serialized << ",\"hash_serialized\":\""
+                      << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
+            return 0;
+        }
+        else if (arg == "--ltc-utxo-stats" && i + 1 < argc) {
+            // gettxoutsetinfo of a UTXO LevelDB, Litecoin Core 0.21.4's
+            // GetUTXOStats (hash_serialized_2; #2137): the LTC full set
+            // against litecoind at the same best block. No node is started.
+            const std::string dir = argv[++i];
+            if (!std::filesystem::exists(std::filesystem::path(dir) / "CURRENT")) {
+                std::cerr << "ltc-utxo-stats: no LevelDB at " << dir << "\n";
+                return 1;
+            }
+            core::coin::UTXOViewDB db(dir);
+            if (!db.open()) {
+                std::cerr << "ltc-utxo-stats: cannot open " << dir << " (in use by a running node?)\n";
+                return 1;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto st = core::coin::utxo_stats_ltc(db, [&t0](uint64_t records) {
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                std::cerr << "ltc-utxo-stats: " << records << " records scanned (" << secs << " s)\n";
+            });
+            if (!st.ok) {
+                std::cerr << "ltc-utxo-stats: scan error in " << dir << "\n";
+                return 1;
+            }
+            const std::string total = core::coin::format_coin_amount(st.total_amount);
+            std::cout << "ltc-utxo-stats " << dir << "\n"
+                      << "  height             " << st.best_height << "\n"
+                      << "  bestblock          " << st.best_block.GetHex() << "\n"
+                      << "  transactions       " << st.transactions << "\n"
+                      << "  txouts             " << st.txouts << "\n"
+                      << "  bogosize           " << st.bogosize << "\n"
+                      << "  hash_serialized_2  " << st.hash_serialized.GetHex() << "\n"
+                      << "  total_amount       " << total << "\n";
+            if (st.sync.tracked())
+                std::cout << "  sync               anchor=" << st.sync.anchor_height << " strict=" << int(st.sync.strict)
+                          << " synced=" << int(st.sync.synced) << " coins=" << st.sync.coins << "\n";
+            else
+                std::cout << "  sync               none (an accrual view: anchor unknown)\n";
+            if (st.unspendable_skipped)
+                std::cout << "  WARNING            " << st.unspendable_skipped
+                          << " unspendable records skipped (Core never stores one)\n";
+            std::cout << "{\"height\":" << st.best_height << ",\"bestblock\":\"" << st.best_block.GetHex()
+                      << "\",\"transactions\":" << st.transactions << ",\"txouts\":" << st.txouts
+                      << ",\"bogosize\":" << st.bogosize << ",\"hash_serialized_2\":\""
                       << st.hash_serialized.GetHex() << "\",\"total_amount\":" << total << "}\n";
             return 0;
         }
@@ -1714,6 +1791,10 @@ int main(int argc, char* argv[]) {
                 doge_utxo_full = cfg["doge_utxo_full"].as<bool>();
             if (!cli_explicit.count("doge_utxo_full_dir") && cfg["doge_utxo_full_dir"])
                 doge_utxo_full_dir = cfg["doge_utxo_full_dir"].as<std::string>();
+            if (!cli_explicit.count("ltc_utxo_full") && cfg["ltc_utxo_full"])
+                ltc_utxo_full = cfg["ltc_utxo_full"].as<bool>();
+            if (!cli_explicit.count("ltc_utxo_full_dir") && cfg["ltc_utxo_full_dir"])
+                ltc_utxo_full_dir = cfg["ltc_utxo_full_dir"].as<std::string>();
 
             // Embedded LTC block relay (see the declarations)
             if (!cli_explicit.count("ltc_cmpct_v3") && cfg["ltc_cmpct_v3"])
@@ -2173,6 +2254,13 @@ int main(int argc, char* argv[]) {
             // UTXO set for fee computation (block reward + mempool tx fees)
             std::unique_ptr<core::coin::UTXOViewDB>     ltc_utxo_db;
             std::unique_ptr<core::coin::UTXOViewCache>  ltc_utxo_cache;
+            // The full LTC UTXO set (--ltc-utxo-full, #2137 S2): its DB, its
+            // cache, its lane's thread and the state shared with its handlers.
+            std::unique_ptr<core::coin::UTXOViewDB>     ltc_full_db;
+            std::unique_ptr<core::coin::UTXOViewCache>  ltc_full_cache;
+            std::shared_ptr<boost::asio::thread_pool>   ltc_full_pool;
+            std::shared_ptr<core::coin::UtxoLane>       ltc_full_lane;
+            auto ltc_full = std::make_shared<core::coin::UtxoFullState>();
 
             // ── Timer heartbeat tracking ────────────────────────────────
             // Each recurring timer stores its last-fired timestamp (ms).
@@ -2231,6 +2319,7 @@ int main(int argc, char* argv[]) {
                     embedded_broadcaster->stop();
                 if (shutdown_stop_merged)
                     shutdown_stop_merged();
+                ltc_full->stopping = true;
                 // 2. The workers: the header pools and the DOGE full lane's
                 //    pool drop their queued tasks and are joined (the lanes end
                 //    a drain after the block being connected, each flushed when
@@ -2239,6 +2328,8 @@ int main(int argc, char* argv[]) {
                 std::vector<std::string> still_running = worker_pools.stop_and_join(POOLS_DEADLINE);
                 if (shutdown_join_lane && !shutdown_join_lane(POOLS_DEADLINE))
                     still_running.push_back("DOGE full set");
+                if (ltc_full_pool && !core::stop_and_join_within(ltc_full_pool, POOLS_DEADLINE))
+                    still_running.push_back("LTC full set");
                 if (shutdown_join_compute && !shutdown_join_compute(COMPUTE_DEADLINE))
                     still_running.push_back("sharechain compute");
                 if (!still_running.empty()) {
@@ -2253,6 +2344,9 @@ int main(int argc, char* argv[]) {
                 }
                 // 3. Flush, then the scope closes the stores.
                 web_server.get_mining_interface()->save_stat_log();
+                if (ltc_full_db)
+                    LOG_INFO << "[EMB-LTC] Full UTXO set at h=" << ltc_full_db->get_best_height()
+                             << " on shutdown (a restart resumes there)";
                 if (shutdown_flush)
                     shutdown_flush();
                 enhanced_node->shutdown();
@@ -2346,9 +2440,12 @@ int main(int argc, char* argv[]) {
 
                 // LevelDB-backed header chain for persistence across restarts
                 // Use absolute path under ~/.c2pool/ (matches sharechain + found_blocks)
+                // The full UTXO set (--ltc-utxo-full) places every height from
+                // genesis by the header chain: its own store, from genesis (no
+                // checkpoint), so turning it off returns to the checkpointed one.
                 std::string chain_db_path = (core::filesystem::config_path()
                     / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
-                    / "embedded_headers").string();
+                    / (ltc_utxo_full ? "embedded_headers_full" : "embedded_headers")).string();
                 LOG_INFO << "[EMB-LTC] Creating HeaderChain with DB at " << chain_db_path;
                 embedded_chain = std::make_unique<ltc::coin::HeaderChain>(ltc_params, chain_db_path);
                 // Retry init up to 5 times (previous process may still hold LevelDB lock)
@@ -2382,7 +2479,11 @@ int main(int argc, char* argv[]) {
                 constexpr uint32_t LTC_BLOCK_PERIOD = 150; // seconds
                 uint32_t score_backlog = 5 * ltc::PoolConfig::share_period()
                     * ltc::PoolConfig::chain_length() / LTC_BLOCK_PERIOD;
-                if (!header_checkpoint_str.empty()) {
+                if (ltc_utxo_full && !header_checkpoint_str.empty())
+                    LOG_INFO << "[EMB-LTC] Full UTXO set: the header chain starts at genesis"
+                             << " (--header-checkpoint " << header_checkpoint_str.substr(0, header_checkpoint_str.find(':'))
+                             << " not applied)";
+                if (!header_checkpoint_str.empty() && !ltc_utxo_full) {
                     auto colon = header_checkpoint_str.find(':');
                     if (colon != std::string::npos) {
                         uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
@@ -2478,6 +2579,81 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+                // The full LTC UTXO set (--ltc-utxo-full, #2137 S2), DOGE's dual DB:
+                // built from genesis and strictly connected by its own lane (below).
+                // At a start where it is built from genesis, synced and no more
+                // than LTC_MIN_BLOCKS_TO_KEEP behind the header tip it prices the
+                // templates at once; otherwise the accrual set prices while it
+                // catches up, and the pool switches when it completes. It places
+                // every height by the header chain, which therefore starts at
+                // genesis in this mode (embedded_headers_full).
+                if (ltc_utxo_full && !embedded_chain->get_header_by_height(0)) {
+                    LOG_ERROR << "[EMB-LTC] Full UTXO set: the header chain does not start at genesis"
+                              << " (its store holds a checkpointed chain) — the full set is off";
+                } else if (ltc_utxo_full) {
+                    const std::string full_path = !ltc_utxo_full_dir.empty()
+                        ? ltc_utxo_full_dir
+                        : (core::filesystem::config_path()
+                           / (settings->m_testnet ? "litecoin_testnet" : "litecoin")
+                           / "utxo_full_leveldb").string();
+                    // DOGE's full-set options: written once per block for millions
+                    // of blocks; tables read with pread in 32 MB files, one fd per
+                    // open table, drawn from the raised soft limit
+                    // (doge::coin::StoreFds); malloc arenas limited.
+                    core::LevelDBOptions full_opts;
+                    full_opts.write_buffer_size = 64 * 1024 * 1024;
+                    full_opts.block_cache_size = 128 * 1024 * 1024;
+                    full_opts.max_open_files = doge::coin::StoreFds::full_set(core::raise_nofile_limit(65536));
+                    full_opts.max_file_size = 32 * 1024 * 1024;
+                    full_opts.mmap_reads = false;
+                    doge::coin::ProcessMemory::limit_arenas();
+                    // A set another c2pool holds is waited for, 5 x 2 s; still
+                    // held, this node exits (the templates would otherwise price
+                    // against the accrual set for the whole run).
+                    for (int attempt = 1;; ++attempt) {
+                        ltc_full_db = std::make_unique<core::coin::UTXOViewDB>(full_path, full_opts);
+                        if (ltc_full_db->open())
+                            break;
+                        ltc_full_db.reset();
+                        core::LevelDBStore probe(full_path, full_opts);
+                        const bool held = !probe.open() && probe.lock_held();
+                        probe.close();
+                        if (!held)
+                            break;
+                        if (attempt >= 5) {
+                            const std::string msg = "the LTC full UTXO set " + full_path
+                                + " is held by another c2pool; " + core::LevelDBStore::held_advice() + ". Exiting";
+                            LOG_ERROR << "[EMB-LTC] " << msg;
+                            std::cerr << "c2pool: " << msg << std::endl;
+                            std::_Exit(EXIT_FAILURE);
+                        }
+                        LOG_WARNING << "[EMB-LTC] Full UTXO set at " << full_path << " is held by another open"
+                                    << " (attempt " << attempt << "/5): again in 2 s";
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                    }
+                    if (ltc_full_db) {
+                        ltc_full_cache = std::make_unique<core::coin::UTXOViewCache>(ltc_full_db.get());
+                        const auto full_ss = ltc_full_db->get_sync_state();
+                        const bool live = core::coin::UtxoFullState::start_live(
+                            full_ss, ltc_full_db->get_best_height(), embedded_chain->height(),
+                            core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                        ltc_full->schedule_ready.store(true);  // a header chain from genesis
+                        LOG_INFO << "[EMB-LTC] Full UTXO set at " << full_path << ": best_height="
+                                 << ltc_full_db->get_best_height() << " anchor="
+                                 << (full_ss.tracked() ? std::to_string(full_ss.anchor_height) : std::string("none"))
+                                 << " synced=" << int(full_ss.synced) << " coins=" << full_ss.coins
+                                 << " header_height=" << embedded_chain->height()
+                                 << (live ? " — the templates price against it"
+                                          : " — catching up; the accrual set prices meanwhile");
+                        if (live) {
+                            ltc_full->live.store(true);
+                            embedded_pool->set_utxo(ltc_full_cache.get());
+                        }
+                    } else {
+                        LOG_ERROR << "[EMB-LTC] Full UTXO set DB failed to open at " << full_path
+                                  << " — accrual set only";
+                    }
+                }
                 mweb_tracker    = std::make_unique<ltc::coin::MWEBTracker>();
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
@@ -2493,14 +2669,17 @@ int main(int argc, char* argv[]) {
                 // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100
-                if (ltc_utxo_cache) {
-                    auto* cache_ptr = ltc_utxo_cache.get();
+                // The view the pool prices against (the accrual set, or the full
+                // set once it completed).
+                if (ltc_utxo_cache || ltc_full_cache) {
+                    auto* pool_ptr = embedded_pool.get();
                     // Mining gate: coinbase_maturity + reorg_buffer
                     // LTC: 100 + 6 (pegout maturity) = 106
                     // Reference: litecoin/src/consensus/consensus.h
                     constexpr uint32_t LTC_GATE = core::coin::LTC_MINING_GATE_DEPTH; // 106
-                    embedded_node->set_utxo_ready_fn([cache_ptr, LTC_GATE]() {
-                        auto connected = cache_ptr->blocks_connected();
+                    embedded_node->set_utxo_ready_fn([pool_ptr, LTC_GATE]() {
+                        const auto* view = pool_ptr->utxo();
+                        auto connected = view ? view->blocks_connected() : 0u;
                         bool ready = connected >= LTC_GATE;
                         if (!ready) {
                             static int s_log_ctr = 0;
@@ -2576,7 +2755,10 @@ int main(int argc, char* argv[]) {
                                   const ltc::coin::Transaction& tx) {
                         ltc::coin::MutableTransaction mtx(tx);
                         const uint64_t priced_before = pool->priced_changes();
-                        auto reject = pool->admit(mtx, utxo);
+                        // Against the view the pool prices against (the full set
+                        // once it completed: an unknown input is an orphan there).
+                        (void)utxo;
+                        auto reject = pool->admit(mtx, pool->utxo());
                         if (pool->priced_changes() != priced_before)
                             web_server.trigger_work_refresh_mempool();
                         if (!reject) {
@@ -3146,7 +3328,8 @@ int main(int argc, char* argv[]) {
                             // the set refills; each drain's revalidate_inputs would
                             // evict them meanwhile (and nothing refetches them).
                             // Quarantined, they are re-priced by recompute_unknown_fees.
-                            if (pool) {
+                            // (Only while the pool prices against this set.)
+                            if (pool && pool->utxo() == utxo) {
                                 const int requarantined = pool->requarantine_all();
                                 LOG_INFO << "[EMB-LTC] UTXO rebuild: " << requarantined
                                          << " priced mempool txs quarantined until their inputs reconnect";
@@ -3336,6 +3519,141 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
+                // The full LTC UTXO set's lane (--ltc-utxo-full; core::coin::UtxoLane,
+                // Mode::Full, #2137 S2) on its own thread: its IBD (every block
+                // from height 1, strictly connected) never runs on the io_context.
+                // The accrual set keeps its lane and keeps pricing until the full
+                // set reaches the header tip; then host.completed swaps the pool's
+                // view (UtxoFullState::adopt) and the templates price against it.
+                // The accrual handlers stay on the block feed (MWEB state, the
+                // pool's cleanup, the explorer) and price against the pool's view.
+                if (ltc_full_cache && ltc_full_db && embedded_broadcaster) {
+                    ltc_full_pool = std::make_shared<boost::asio::thread_pool>(1);
+                    auto* fpool = ltc_full_pool.get();
+                    auto* lc = embedded_chain.get();
+                    auto* lb = embedded_broadcaster.get();
+                    auto* lp = embedded_pool.get();
+                    auto full = ltc_full;
+                    constexpr uint32_t LTC_KEEP = core::coin::LTC_MIN_BLOCKS_TO_KEEP;
+                    core::coin::UtxoLaneHost host;
+                    host.stopping = [full]() { return full->stopping.load(); };
+                    host.chain_height = [lc]() { return lc->height(); };
+                    host.chain_hash_at = [lc](uint32_t h) {
+                        auto e = lc->get_header_by_height(h);
+                        return e ? e->block_hash : uint256();
+                    };
+                    host.prev_of = [lc](const uint256& hh) -> std::optional<uint256> {
+                        auto e = lc->get_header(hh);
+                        if (!e)
+                            return std::nullopt;
+                        return e->prev_hash;
+                    };
+                    // Every request is recorded (hash -> height); every copy of
+                    // the answer is placed by it (UtxoFullState::place).
+                    host.request = [hash_at = host.chain_hash_at, chain_height = host.chain_height, lb, full,
+                                    rr = std::make_shared<size_t>(0)](uint32_t h, core::coin::UtxoAsk how) {
+                        const uint256 hash = hash_at(h);
+                        if (hash.IsNull()) {
+                            LOG_ERROR << "[EMB-LTC] [full] No best-chain hash for h=" << h << ": not requested";
+                            return;
+                        }
+                        full->note_request(hash, h);
+                        if (how != core::coin::UtxoAsk::Broadcast && lb->request_full_block_targeted(hash, (*rr)++))
+                            return;
+                        lb->request_full_block_peers(hash, core::coin::block_request_services(chain_height(), h));
+                    };
+                    // Block download (Core's): several blocks in flight per peer,
+                    // from peers that serve every block (NODE_NETWORK).
+                    host.download_peers = [lb]() { return lb->ready_peers(1 /* NODE_NETWORK */); };
+                    host.request_from = [hash_at = host.chain_hash_at, lb, full](const std::string& peer, uint32_t h) {
+                        const uint256 hash = hash_at(h);
+                        if (hash.IsNull())
+                            return false;
+                        full->note_request(hash, h);
+                        return lb->request_full_block_from(peer, hash);
+                    };
+                    host.wiped = [lp, full]() {
+                        if (!full->live.load())
+                            return;
+                        const int n = lp->requarantine_all();
+                        LOG_WARNING << "[EMB-LTC] UTXO rebuild of the full set: " << n
+                                    << " priced mempool txs quarantined until it completes";
+                    };
+                    // The set reached the header tip, built from genesis: the pool
+                    // prices against it from now on (every tx re-priced; one with an
+                    // input the set does not hold becomes an orphan).
+                    host.completed = [lp, full, full_cache = ltc_full_cache.get(), full_db = ltc_full_db.get(),
+                                      &ioc, &web_server]() {
+                        const auto a = full->adopt(*lp, full_cache, full_db);
+                        LOG_INFO << "[EMB-LTC] The LTC templates price against the full UTXO set ("
+                                 << a.requarantined << " txs re-priced: " << a.priced << " priced, " << a.evicted
+                                 << " evicted, " << a.orphans << " orphans)";
+                        boost::asio::post(ioc, [&web_server]() { web_server.trigger_work_refresh_debounced(); });
+                    };
+                    // The 30 s last resort (every peer asked), through host.request
+                    // so the answers are placed.
+                    host.fill_started = [fpool, req = host.request](core::coin::UtxoLaneHost::Fill& f) {
+                        f.start_stall_timer_on(fpool->get_executor(),
+                            [req](uint32_t h) { req(h, core::coin::UtxoAsk::Broadcast); }, "EMB-LTC full");
+                    };
+                    host.fill_stopped = [](core::coin::UtxoLaneHost::Fill& f) { f.stop_stall_timer(); };
+                    // A tip body that never came is asked again.
+                    host.chase_tip = [lc]() { return lc->is_synced(); };
+                    ltc_full_lane = std::make_shared<core::coin::UtxoLane>(
+                        *ltc_full_cache, *ltc_full_db, std::move(host), LTC_KEEP, core::coin::UtxoLaneMode::Full, 0,
+                        core::coin::LTC_UTXO_LANE);
+
+                    // The block download's clock (stalls, request timeouts, the
+                    // window refill, the rate) every second, and malloc pages given
+                    // back to the kernel, both on the lane's thread.
+                    auto tick_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto tick_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                    *tick_fn = [tick_fn, tick_timer, lane = std::weak_ptr<core::coin::UtxoLane>(ltc_full_lane)](
+                                   boost::system::error_code ec) {
+                        if (ec)
+                            return;
+                        tick_timer->expires_after(std::chrono::seconds(1));
+                        tick_timer->async_wait(*tick_fn);
+                        auto l = lane.lock();
+                        if (!l)
+                            return;
+                        try {
+                            l->tick();
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-LTC] Full UTXO lane tick error: " << e.what();
+                        }
+                    };
+                    tick_timer->expires_after(std::chrono::seconds(1));
+                    tick_timer->async_wait(*tick_fn);
+                    auto trim_fn = std::make_shared<std::function<void(boost::system::error_code)>>();
+                    auto trim_timer = std::make_shared<boost::asio::steady_timer>(fpool->get_executor());
+                    *trim_fn = [trim_fn, trim_timer, full](boost::system::error_code ec) {
+                        if (ec)
+                            return;
+                        trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                        trim_timer->async_wait(*trim_fn);
+                        if (doge::coin::ProcessMemory::trim())
+                            full->malloc_trims.fetch_add(1, std::memory_order_relaxed);
+                    };
+                    trim_timer->expires_after(doge::coin::ProcessMemory::TRIM_EVERY);
+                    trim_timer->async_wait(*trim_fn);
+
+                    // Once at startup (a reorg persisted without its UTXO side, a
+                    // set to resume): the lane's startup check, on its thread.
+                    boost::asio::post(*fpool, [lane = ltc_full_lane]() {
+                        try {
+                            lane->startup();
+                        } catch (const std::exception& e) {
+                            LOG_WARNING << "[EMB-LTC] Full UTXO set startup check error: " << e.what();
+                        }
+                    });
+                    // The IBD's historical bodies are logged at DEBUG.
+                    lb->set_block_log_quiet([full, lc](const uint256& hash) {
+                        const auto h = full->requested_height(hash);
+                        return h && *h + core::coin::LTC_MIN_BLOCKS_TO_KEEP < lc->height();
+                    });
+                }
+
                 // Coin-side metrics in /local_stats: "ltc_mweb" (the MWEB state
                 // window and relay counters, plus state_kernels: the kernel count
                 // of the block the MWEB state came from -- templates after a block
@@ -3348,7 +3666,9 @@ int main(int argc, char* argv[]) {
                 mi->set_coin_metrics_fn(
                     [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync, ltc_dl,
                      pool = embedded_pool.get(), tracker = mweb_tracker.get(),
-                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor]() {
+                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor,
+                     full_lane = std::weak_ptr<core::coin::UtxoLane>(ltc_full_lane),
+                     full_cache = ltc_full_cache.get(), full = ltc_full]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
                             {"cmpct_v3", ltc_cmpct_v3},
@@ -3365,9 +3685,37 @@ int main(int argc, char* argv[]) {
                             ? nlohmann::json(static_cast<int64_t>(std::time(nullptr) - cleaned))
                             : nlohmann::json(nullptr);
                         const auto tip = chain ? chain->tip() : std::nullopt;
+                        // The view the template prices against: the full set once it
+                        // completed ("full", anchor 0), else the accrual set.
+                        const auto* view = pool->utxo();
+                        const bool full_view = full_cache && view == full_cache;
                         nlohmann::json u = ltc::coin::utxo_view_json(
-                            utxo, ltc_view_anchor->load(std::memory_order_relaxed),
+                            view, full_view ? 0u : ltc_view_anchor->load(std::memory_order_relaxed),
                             tip ? tip->height : 0, tip ? tip->block_hash : uint256(), pool);
+                        u["mode"] = full_view ? "full" : "accrual";
+                        // The full set while it builds (or once it prices): its lane's
+                        // IBD counters, its best height and how far behind the tip.
+                        if (auto f = full_lane.lock(); f && full_cache) {
+                            nlohmann::json d = f->stats().to_json();
+                            const uint32_t best = full_cache->get_best_height();
+                            const uint32_t th = tip ? tip->height : 0;
+                            const auto ss = full_cache->sync_state();
+                            d["best_height"] = best;
+                            d["behind"] = th > best ? th - best : 0;
+                            d["blocks_connected"] = full_cache->blocks_connected();
+                            d["anchor_height"] = ss.tracked() ? nlohmann::json(ss.anchor_height)
+                                                              : nlohmann::json(nullptr);
+                            d["complete"] = tip && full_cache->complete(th, tip->block_hash);
+                            d["synced"] = ss.synced != 0;
+                            d["coins"] = ss.coins;
+                            d["stuck"] = f->stuck();
+                            d["live"] = full->live.load();
+                            d["adoptions"] = full->adoptions.load();
+                            d["queued_bytes"] = full->queued_bytes.load();
+                            d["queue_dropped"] = full->queue_dropped.load();
+                            d["malloc_trims"] = full->malloc_trims.load();
+                            u["full"] = std::move(d);
+                        }
                         return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
                                               {"ltc_utxo", std::move(u)},
                                               {"ltc_headers", ltc_hdr_sync->to_json()},
@@ -3401,6 +3749,7 @@ int main(int argc, char* argv[]) {
                          utxo_jump_from, utxo_heal, ltc_dl, ltc_cold_decided, ltc_stall_request,
                          ltc_view_anchor,
                          ltc_mweb_activation, self = std::weak_ptr<FullBlockFn>(full_block_fn),
+                         full_lane = ltc_full_lane, fpool = ltc_full_pool.get(), full = ltc_full,
                          &ioc, &web_server](
                             const std::string& peer,
                             const ltc::coin::BlockType& block,
@@ -3464,6 +3813,44 @@ int main(int argc, char* argv[]) {
                             if (entry) {
                                 auto at = chain->get_header_by_height(entry->height);
                                 on_best_chain = at && at->block_hash == block_hash;
+                            }
+                            // The full UTXO set's lane (--ltc-utxo-full), on its own
+                            // thread: every body, placed by the header chain (or by
+                            // the lane's request); the queue to it is bounded
+                            // (UtxoFullState::enqueue). A body only it asked for (deep,
+                            // not the tip's) runs none of the passes below. Once the
+                            // set prices the pool, a body it connected re-prices the
+                            // pool against it and rebuilds the template (the template
+                            // gate waits for the pool's view to reach the tip).
+                            if (full_lane && fpool) {
+                                uint256 tip_hash;
+                                if (const auto t = chain->tip())
+                                    tip_hash = t->block_hash;
+                                const auto placed = full->place(block_hash, height, chain->height(), tip_hash,
+                                                                core::coin::LTC_MIN_BLOCKS_TO_KEEP);
+                                const uint64_t body_bytes = core::coin::estimate_body_bytes(block);
+                                if (full->enqueue(placed, body_bytes)) {
+                                    boost::asio::post(*fpool, [full_lane, block, block_hash, at = placed.height, peer,
+                                                               pool, full, body_bytes, &web_server, &ioc]() {
+                                        full->dequeued(block_hash, body_bytes);
+                                        try {
+                                            const auto fed = full_lane->on_block(block, block_hash, at, peer);
+                                            if (!full->live.load() || fed.connected == 0)
+                                                return;
+                                            if (auto* view = pool->utxo()) {
+                                                pool->recompute_unknown_fees(view);
+                                                pool->revalidate_inputs(view);
+                                            }
+                                            boost::asio::post(ioc, [&web_server]() {
+                                                web_server.trigger_work_refresh_debounced();
+                                            });
+                                        } catch (const std::exception& e) {
+                                            LOG_WARNING << "[EMB-LTC] Full UTXO lane error: " << e.what();
+                                        }
+                                    });
+                                }
+                                if (placed.full_only)
+                                    return;
                             }
                             auto state_source = [&]() {
                                 switch (src) {
@@ -3690,9 +4077,10 @@ int main(int argc, char* argv[]) {
                                     // Fees and inputs once per drain, as the normal path does.
                                     // A mempool change: the paced rebuild (the debounced
                                     // one drops its trailing call on an unchanged sharechain).
-                                    if (drained.connected > 0 && pool && utxo) {
-                                        int resolved = pool->recompute_unknown_fees(utxo);
-                                        int evicted = pool->revalidate_inputs(utxo);
+                                    // Against the pool's view (the full set once it priced).
+                                    if (drained.connected > 0 && pool && pool->utxo()) {
+                                        int resolved = pool->recompute_unknown_fees(pool->utxo());
+                                        int evicted = pool->revalidate_inputs(pool->utxo());
                                         if (resolved > 0 || evicted > 0)
                                             web_server.trigger_work_refresh_mempool();
                                     }
@@ -3866,9 +4254,9 @@ int main(int argc, char* argv[]) {
                                 // branch's, an older copy's).
                                 pool->set_tip_height(utxo ? utxo->get_best_height() : height);
                                 pool->remove_for_block(block);
-                                if (utxo) {
-                                    int resolved = pool->recompute_unknown_fees(utxo);
-                                    int evicted = pool->revalidate_inputs(utxo);
+                                if (auto* view = pool->utxo()) {
+                                    int resolved = pool->recompute_unknown_fees(view);
+                                    int evicted = pool->revalidate_inputs(view);
                                     if (resolved > 0 || evicted > 0)
                                         web_server.trigger_work_refresh_mempool();
                                 }
@@ -4048,6 +4436,7 @@ int main(int argc, char* argv[]) {
                      pool = embedded_pool.get(), set_ltc_lock_time_cutoff,
                      mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
                      ltc_mweb_activation, ltc_mweb_fetch_retry,
+                     full_lane = ltc_full_lane, fpool = ltc_full_pool.get(),
                      &web_server, &ioc](
                         const uint256& old_tip, uint32_t old_height,
                         const uint256& new_tip, uint32_t new_height) {
@@ -4060,9 +4449,19 @@ int main(int argc, char* argv[]) {
                             [tracker, bcaster, chain, utxo, utxo_db, pool, set_ltc_lock_time_cutoff,
                              &web_server, &ioc,
                              mweb_stats, mweb_fetch_step, log_mweb_window, ltc_bs, utxo_heal,
-                             ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at,
+                             ltc_mweb_activation, ltc_mweb_fetch_retry, tip_seen_at, full_lane, fpool,
                              old_tip, old_height, new_tip, new_height]() {
                       try {
+                        // The full UTXO set's lane sees every tip change (on its
+                        // thread): a reorg walks it back by its undo records.
+                        if (full_lane && fpool)
+                            boost::asio::post(*fpool, [full_lane, old_tip, old_height, new_tip, new_height]() {
+                                try {
+                                    full_lane->on_tip_changed(old_tip, old_height, new_tip, new_height);
+                                } catch (const std::exception& e) {
+                                    LOG_WARNING << "[EMB-LTC] Full UTXO lane tip error: " << e.what();
+                                }
+                            });
                         // Relayed txs must be final in the block after this tip.
                         set_ltc_lock_time_cutoff(pool, chain, new_tip);
                         // A reorg is any switch to a tip that does not descend from
@@ -4249,7 +4648,7 @@ int main(int argc, char* argv[]) {
                                                   << utxo->get_best_height();
                                         return;
                                     }
-                                    if (pool)
+                                    if (pool && pool->utxo() == utxo)
                                         pool->requarantine_all();
                                 }
                                 arm(r->first, r->second, 0);

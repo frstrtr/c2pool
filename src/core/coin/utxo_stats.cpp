@@ -154,6 +154,91 @@ UtxoStats utxo_stats(UTXOViewDB& db, const std::function<void(uint64_t records)>
     return s;
 }
 
+UtxoStats utxo_stats_ltc(UTXOViewDB& db, const std::function<void(uint64_t records)>& progress)
+{
+    UtxoStats s;
+    s.best_height = db.get_best_height();
+    s.best_block = db.get_best_block();
+    s.sync = db.get_sync_state();
+
+    CSHA256 sha;
+    sha.Write(s.best_block.data(), 32);  // PrepareHash: ss << stats.hashBlock
+    std::vector<unsigned char> buf;
+    std::vector<Out> group;
+    std::string group_txid;
+    bool bad = false;
+    uint64_t records = 0;
+
+    auto finish_group = [&]() {
+        if (group.empty())
+            return;
+        std::sort(group.begin(), group.end(), [](const Out& a, const Out& b) { return a.index < b.index; });
+        group.erase(std::remove_if(group.begin(), group.end(),
+                                   [&s](const Out& o) {
+                                       if (!is_unspendable(o.coin.scriptPubKey))
+                                           return false;
+                                       ++s.unspendable_skipped;
+                                       return true;
+                                   }),
+                    group.end());
+        if (group.empty())
+            return;
+        ++s.transactions;
+        buf.clear();
+        buf.insert(buf.end(), group_txid.begin(), group_txid.end());
+        // VARINT(outputs.begin()->second.nHeight * 2 + outputs.begin()->second.fCoinBase ? 1u : 0u)
+        const uint64_t first = uint64_t(group.front().coin.height) * 2 + (group.front().coin.coinbase ? 1 : 0);
+        WriteVarInt(buf, first ? 1u : 0u);
+        for (const auto& o : group) {
+            WriteVarInt(buf, static_cast<uint64_t>(o.index) + 1);
+            const auto& script = o.coin.scriptPubKey.m_data;
+            WriteCompactSize(buf, script.size());
+            buf.insert(buf.end(), script.begin(), script.end());
+            const uint64_t v = static_cast<uint64_t>(o.coin.value);
+            WriteVarInt(buf, v);
+            ++s.txouts;
+            s.total_amount.add(v);
+            s.bogosize += 32 + 4 + 4 + 8 + 2 + script.size();
+        }
+        buf.push_back(0x00);  // VARINT(0u)
+        sha.Write(buf.data(), buf.size());
+        group.clear();
+    };
+
+    const bool scanned = db.for_each_record(std::string(1, 'C'),
+        [&](const std::string& key, const std::vector<uint8_t>& value) {
+            if (key.size() != 37) {
+                bad = true;
+                return false;
+            }
+            if (group_txid.size() != 32 || std::memcmp(group_txid.data(), key.data() + 1, 32) != 0) {
+                finish_group();
+                group_txid.assign(key.data() + 1, 32);
+            }
+            const auto* p = reinterpret_cast<const uint8_t*>(key.data() + 33);
+            Out o;
+            o.index = uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+            if (!deserialize_coin(value, o.coin)) {
+                bad = true;
+                return false;
+            }
+            group.push_back(std::move(o));
+            if (progress && (++records % 10000000) == 0)
+                progress(records);
+            return true;
+        });
+    if (!scanned || bad)
+        return s;
+    finish_group();
+
+    unsigned char first[CSHA256::OUTPUT_SIZE], second[CSHA256::OUTPUT_SIZE];
+    sha.Finalize(first);
+    CSHA256().Write(first, sizeof(first)).Finalize(second);
+    std::memcpy(s.hash_serialized.data(), second, 32);
+    s.ok = true;
+    return s;
+}
+
 namespace {
 
 /// x /= d, returning x % d, for d < 2^32 (32-bit limbs, 64-bit steps).

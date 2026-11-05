@@ -512,6 +512,16 @@ C2P_PARAM("embedded.doge_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_D
 C2P_PARAM("embedded.doge_utxo_full_dir", Embedded, PATH, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "the full DOGE UTXO set's LevelDB (default <data-dir>/dogecoin/utxo_full_leveldb)")
   C2P_ALIAS("embedded.doge_utxo_full_dir", BIN_LTC, "--doge-utxo-full-dir", VALUE)
 
+// The full LTC UTXO set (#2137 S2): built from genesis on its own header
+// chain from genesis; prices the LTC template once complete. Off (the
+// default) keeps the accrual view only.
+C2P_PARAM("embedded.ltc_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "embedded LTC full UTXO set built from genesis (default off)")
+  C2P_ALIAS("embedded.ltc_utxo_full", BIN_LTC, "--ltc-utxo-full", FLAG)
+  C2P_ALIAS("embedded.ltc_utxo_full", BIN_LTC, "--no-ltc-utxo-full", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.ltc_utxo_full_dir", Embedded, PATH, RESTART, C_LTC, LIT, "", NONE, "the full LTC UTXO set's LevelDB (default <data-dir>/litecoin/utxo_full_leveldb)")
+  C2P_ALIAS("embedded.ltc_utxo_full_dir", BIN_LTC, "--ltc-utxo-full-dir", VALUE)
+
 // One-shot LevelDB tools: run, print, exit; no node starts. Compile-time
 // readonly like the other print-and-exit rows (refused in a settings file,
 // never mirrored into the resolved config).
@@ -523,6 +533,9 @@ C2P_PARAM("utility.utxo_digest", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE
 
 C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print gettxoutsetinfo (Dogecoin Core 1.14.9 GetUTXOStats) for the UTXO LevelDB at DIR, then exit")
   C2P_ALIAS("utility.utxo_stats", BIN_LTC, "--utxo-stats", VALUE)
+
+C2P_PARAM("utility.ltc_utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC, LIT, "", NONE, "print gettxoutsetinfo (Litecoin Core 0.21.4 GetUTXOStats, hash_serialized_2) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.ltc_utxo_stats", BIN_LTC, "--ltc-utxo-stats", VALUE)
 
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
