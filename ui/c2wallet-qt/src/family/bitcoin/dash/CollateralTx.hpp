@@ -31,6 +31,7 @@
 // never split, when it would not fit one inject tx.
 
 #include "InjectCaps.hpp"
+#include "InjectMaturity.hpp"
 #include "KeyScan.hpp"
 
 #include <array>
@@ -48,7 +49,7 @@ inline constexpr int64_t kMaxMoney = 21000000 * kCoin; // Dash Core amount.h MAX
 inline constexpr int64_t kDustDuffs = 5460;
 inline constexpr int64_t kDefaultFeeRate = 1000; // duffs/kB (Dash min relay)
 inline constexpr int64_t kDefaultMinConf = 101;  // funding UTXOs are often coinbase
-inline constexpr int64_t kCoinbaseMaturity = 100; // consensus COINBASE_MATURITY
+inline constexpr int64_t kCoinbaseMaturity = maturity::kCoinbaseMaturity; // consensus COINBASE_MATURITY
 
 // Relay: a relayable tx paying fee_rate. InjectOnlyZeroFee: fee exactly 0, for
 // the c2pool inject / pin lane only (Dash Core peers will not relay it).
@@ -64,6 +65,9 @@ struct Utxo {
     // true or nullopt (unknown, treated as coinbase) => max(min_confirmations,
     // kCoinbaseMaturity) confirmations; false => one confirmation is enough.
     std::optional<bool> coinbase = std::nullopt;
+    // Block height that created the output; 0 = unknown. The target-height
+    // re-screen (rescreen_at_height) projects confirmations from it.
+    int64_t height = 0;
 };
 
 struct CollateralPlan {
@@ -138,7 +142,11 @@ CollateralPlan plan_collateral(const CollateralRequest& req);
 // about to be signed differ from plan.unsigned_tx, if a zero fee and
 // InjectOnlyZeroFee do not go together, if an inject plan is over the input
 // cap, or if any input fails self-verify. An inject plan's signed size is
-// re-checked against the node cap after signing.
+// re-checked against the node cap after signing. A Relay plan's fee must cover
+// dashd's 1 duff/B minimum relay fee: at plan time for the request's
+// key_encoding (148 B/input compressed or unknown, 180 uncompressed — the low-S
+// DER maxima), before signing for the encoding of the key actually given, and
+// after signing for the real size.
 SignedTx sign_collateral(const CollateralPlan& plan, const FoundKey& key, bool confirm_spend);
 
 } // namespace c2w::dash

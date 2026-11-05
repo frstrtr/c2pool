@@ -32,6 +32,12 @@ std::array<uint8_t, 20> addr_to_h160(const std::string& addr, bool testnet);
 // Encode a 20-byte hash160 as a DASH P2PKH address for the given network.
 std::string h160_to_addr(const std::array<uint8_t, 20>& h160, bool testnet);
 
+// The same two codecs over an explicit P2PKH version byte (the message signer's
+// coin table). addr_to_h160 / h160_to_addr above are exactly these with the
+// DASH version byte of the requested network; the error wording is shared.
+std::array<uint8_t, 20> p2pkh_to_h160(const std::string& addr, uint8_t version);
+std::string h160_to_p2pkh(const std::array<uint8_t, 20>& h160, uint8_t version);
+
 // The classic P2PKH scriptPubKey bytes for a hash160:
 //   OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
 std::array<uint8_t, 25> p2pkh_script(const std::array<uint8_t, 20>& h160);

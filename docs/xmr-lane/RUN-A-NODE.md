@@ -465,6 +465,7 @@ The lines to watch:
 | `[GATE-4] anchor confirmed: height ...` | a live peer served the anchor block and it hashed to the pinned id |
 | `status: up=... monero=<h> best pos=<n> id=... cum_work=... pending=... template=ok` | `monero` is the Monero tip, `best pos` the position of the best carrier, `pending` the receipts waiting for a carrier |
 | `time: t=<unix ms>` | the line after `status: up=`: the node's wall clock when it printed the status block, in Unix milliseconds |
+| `roots: tip=<16 hex>` | the line after `time: t=`: the tip of the current template; `window_root` and `mmr_root` on `status: up=` are that tip's (`-`: no template). The web view's `roots_tip` is the same tip. |
 | `template <n>: tip=... x=... h=... d=... R=... n_tx=...` | a new template: the carrier tip it builds on, the Monero height `h`, the pool's `d`, the reward `R`, the transactions |
 | `found h=... id=... landed=...` | a Monero block found on this node's job |
 | `relay: peers in= out= ready= ... hello ok= rej= ...` | relay links to other pool nodes. `ready` should equal your peer count. |

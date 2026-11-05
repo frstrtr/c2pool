@@ -46,6 +46,7 @@
 #include <impl/ltc/coin/rpc_data.hpp>
 #include <impl/ltc/coin/transaction.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
+#include <impl/ltc/test/mempool_test_view.hpp>
 
 #include <btclibs/util/strencodings.h>
 
@@ -246,6 +247,8 @@ TEST(LtcTemplateHogex, HogexSurvivesTruncation)
     ASSERT_TRUE(entry);
     const uint32_t one_tx_weight = entry->weight;
 
+    ltc_test::CoveringView view;
+    view.cover(pool);
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, tip_hdr);
     EXPECT_EQ(tracker.mweb_seen_height(), kTipHeight);
@@ -404,6 +407,8 @@ TEST(LtcTemplateHogex, MwebCarryingTxsNeverReachTheTemplate)
     pool.set_tx_fee(compute_txid(pegout), 2262);
     EXPECT_EQ(pool.size(), 3u);
 
+    ltc_test::CoveringView view;
+    view.cover(pool);
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, tip_hdr);
     clean_for(pool, tip_hdr);
@@ -450,6 +455,8 @@ TEST(LtcTemplateHogex, TxNoBlockCanCarryIsDroppedAndCounted)
     ASSERT_TRUE(pool.add_tx_unchecked(pegout));
     pool.set_tx_fee(compute_txid(pegout), 2262);  // selectable as far as fees go
 
+    ltc_test::CoveringView view;
+    view.cover(pool);
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, tip_hdr);
     clean_for(pool, tip_hdr);
@@ -475,6 +482,8 @@ TEST(LtcTemplateHogex, MempoolNotCleanedForTipRefuses)
     const MutableTransaction a = pay(FUND_A, 0, 100000);
     ASSERT_TRUE(pool.add_tx(a));
     pool.set_tx_fee(compute_txid(a), 1000);
+    ltc_test::CoveringView view;
+    view.cover(pool);
     MWEBTracker tracker;
     feed_tracker(tracker, kTipHeight, hdr_n);
 

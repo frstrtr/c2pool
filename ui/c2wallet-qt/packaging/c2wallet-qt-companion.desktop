@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=c2wallet-qt companion
+Comment=Online, key-free companion of the c2wallet-qt signer
+Exec=c2wallet-qt-companion
+Icon=c2wallet-qt-companion
+Categories=Utility;
+Terminal=false

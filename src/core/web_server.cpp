@@ -72,12 +72,26 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
 
 MiningInterface::~MiningInterface()
 {
-    // Stop and join the background graph-view seed thread (if it is still
-    // replaying the flat log). Never blocks shutdown for long: the flag is
-    // checked between entries.
+    // The UTXO scan thread first: its fn reads coin state the target owns.
+    stop_utxo_scan();
+    stop_background();
+}
+
+void MiningInterface::stop_background()
+{
+    // The background graph-view seed thread (if it is still replaying the
+    // flat log) and the PPLNS pre-computation. Neither blocks the shutdown
+    // for long: each checks its flag between entries / every 100 ms, and a
+    // running m_pplns_fn call is one share's walk. The pre-computation was
+    // detached: it woke every second and read m_pplns_fn on a freed
+    // MiningInterface after ~WebServer (ASan heap-use-after-free, a SIGTERM
+    // during the LTC sync, r16 live harness).
     m_views_seed_stop.store(true, std::memory_order_relaxed);
+    m_pplns_precompute_stop.store(true, std::memory_order_relaxed);
     if (m_views_seed_thread.joinable())
         m_views_seed_thread.join();
+    if (m_pplns_precompute_thread.joinable())
+        m_pplns_precompute_thread.join();
 }
 
 void MiningInterface::setup_methods()
@@ -96,6 +110,8 @@ void MiningInterface::setup_methods()
     
     Add("getblocktemplate", jsonrpccxx::MethodHandle([this](const nlohmann::json& params) -> nlohmann::json {
         nlohmann::json template_params = params.empty() ? nlohmann::json::array() : params;
+        if (aux_template_chain(template_params) && !t_direct_local_request)
+            throw jsonrpccxx::JsonRpcException(-1, "getblocktemplate for a merged chain is local-only");
         return getblocktemplate(template_params);
     }));
     
@@ -766,7 +782,8 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
     // still submitted: refusing a block on a false positive would lose it.
     if (m_blockchain == Blockchain::LITECOIN) {
         std::vector<std::string_view> views(txs_hex.begin(), txs_hex.end());
-        if (auto r = core::coin::check_tx_list(views, mweb_active)) {
+        std::vector<core::coin::TxShape> shapes;
+        if (auto r = core::coin::check_tx_list(views, mweb_active, &shapes)) {
             const bool strict = m_template_tx_check_strict.load(std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(m_template_tx_mutex);
@@ -781,6 +798,24 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
             }
             LOG_WARNING << "[MWEB] Block assembly: template-tx check " << r->code << " at tx "
                         << r->index << " (" << r->detail << ") — submitted anyway (warn mode)";
+        } else {
+            // litecoind refuses a block above 4,000,000 weight (bad-blk-weight,
+            // validation.cpp:3756): a full template plus a large PPLNS coinbase
+            // can get there. Such a block can never be accepted, so it is
+            // refused here and counted instead of submitted.
+            const size_t cb_bytes = coinbase_hex.size() / 2;
+            const uint64_t weight = core::coin::ltc_block_weight(cb_bytes, segwit, shapes);
+            if (weight > core::coin::kLtcMaxBlockWeight) {
+                m_mweb_block_refusals.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(m_template_tx_mutex);
+                    ++m_mweb_refusals_by_code["oversize"];
+                }
+                LOG_ERROR << "[BLOCK] Block assembly REFUSED: weight " << weight << " > "
+                          << core::coin::kLtcMaxBlockWeight << " (coinbase " << cb_bytes << " B, "
+                          << txs_hex.size() << " txs) — block not submitted";
+                return {};
+            }
         }
     }
 
@@ -828,6 +863,50 @@ MiningInterface::build_block_from_stratum(const std::string& extranonce1,
         block << "01" << mweb_data;
 
     return block.str();
+}
+
+// ─── Coinbase weight for the template budget ──────────────────────────────────
+// The weight of a coinbase coinb1 | extranonce1 | extranonce2 | coinb2 (the
+// extranonces at most kCoinbaseExtranonceBytes); segwit adds the one-item
+// 32-byte witness reserved value (marker, flag, count, length, 32 bytes).
+uint32_t MiningInterface::coinbase_weight(const std::string& coinb1, const std::string& coinb2,
+                                          bool segwit)
+{
+    const uint64_t stripped = (coinb1.size() + coinb2.size()) / 2 + kCoinbaseExtranonceBytes;
+    const uint64_t w = stripped * 4 + (segwit ? 2 + 1 + 1 + 32 : 0);
+    return static_cast<uint32_t>(std::min<uint64_t>(w, UINT32_MAX));
+}
+
+void MiningInterface::note_coinbase_built(const std::string& coinb1, const std::string& coinb2,
+                                          bool segwit, size_t branch_len, bool fresh_template) const
+{
+    const uint32_t w = coinbase_weight(coinb1, coinb2, segwit);
+    if (fresh_template) {
+        // A new template: start from its own coinbase; the per-connection
+        // coinbases built on it raise the mark.
+        m_coinbase_weight.store(w, std::memory_order_relaxed);
+    } else {
+        uint32_t cur = m_coinbase_weight.load(std::memory_order_relaxed);
+        while (w > cur && !m_coinbase_weight.compare_exchange_weak(cur, w, std::memory_order_relaxed)) {
+        }
+    }
+    // The merged blocks carry this coinbase (without witness) in their AuxPoW.
+    if (m_mm_manager) {
+        const uint32_t mark = m_coinbase_weight.load(std::memory_order_relaxed);
+        m_mm_manager->set_parent_coinbase_shape((mark + 3) / 4, static_cast<uint32_t>(branch_len));
+    }
+}
+
+uint32_t MiningInterface::coinbase_weight_reserve() const
+{
+    const uint32_t last = m_coinbase_weight.load(std::memory_order_relaxed);
+    if (last != 0)
+        return last + kCoinbaseWeightMargin;
+    // No coinbase built yet (the first template): the largest one the output
+    // cap allows, each output at most 8 + 1 + 34 bytes, plus the fixed parts.
+    const uint64_t outputs = m_stratum_config.max_coinbase_outputs + 4;
+    const uint64_t bound = (outputs * 43 + 1000) * 4 + kCoinbaseWeightMargin;
+    return static_cast<uint32_t>(std::min<uint64_t>(bound, core::coin::kLtcMaxBlockWeight));
 }
 
 // ─── Coinbase parts construction ─────────────────────────────────────────────
@@ -1289,6 +1368,20 @@ MiningInterface::build_connection_coinbase(
         atomic_mm_commitment = std::move(fresh_commit);
         ws.merged_header_infos.clear();
         ws.merged_header_infos.reserve(header_infos.size());
+        // The merged payouts must be the PPLNS split at THIS job's prev share:
+        // a V36 peer re-derives the merged coinbase from the share's
+        // previous_share_hash and rejects the share when it differs (p2pool
+        // data.py verify_merged_coinbase_commitment). A block split at
+        // another best share (the best moved after the rebuild) stays out of
+        // this job: no mm_data, no merged info.
+        bool other_best = false;
+        for (const auto& hi : header_infos)
+            other_best = other_best || (!hi.payout_basis.IsNull() && hi.payout_basis != prev_share_hash);
+        if (other_best) {
+            atomic_mm_commitment.clear();
+            header_infos.clear();
+            m_merged_basis_mismatch_jobs.fetch_add(1, std::memory_order_relaxed);
+        }
         for (auto& hi : header_infos) {
             CachedMergedHeaderInfo c;
             c.chain_id = hi.chain_id;
@@ -1298,14 +1391,20 @@ MiningInterface::build_connection_coinbase(
             c.coinbase_merkle_branches = std::move(hi.coinbase_merkle_branches);
             c.coinbase_script = std::move(hi.coinbase_script);
             c.coinbase_hex = std::move(hi.coinbase_hex);
+            c.payout_basis = hi.payout_basis;
             ws.merged_header_infos.push_back(std::move(c));
         }
     }
 
     // Write merged header infos so ref_hash_fn (which captures MiningInterface*)
-    // reads the FRESH infos from this MM build, not stale ones from last refresh_work.
+    // reads the infos of THIS cache read, not stale ones from an earlier build.
     // m_last_merged_header_infos is mutable and only consumed by ref_hash_fn (single caller).
-    if (!ws.merged_header_infos.empty()) {
+    // The share's merged_coinbase_info and the coinbase's mm_data come from the
+    // same read: an empty read (no buildable merged block: the commitment was
+    // dropped) clears the infos too. A V36 share with merged_coinbase_info but
+    // no mm_data in its coinbase is invalid to peers (share_check
+    // verify_merged_coinbase_commitment, p2pool data.py).
+    if (m_mm_manager) {
         auto& self = const_cast<MiningInterface&>(*this);
         self.m_last_merged_header_infos = ws.merged_header_infos;
     }
@@ -1326,8 +1425,10 @@ MiningInterface::build_connection_coinbase(
         tag_hex += HEX[b & 0x0f];
     }
 
-    const auto& mm_for_scriptsig = atomic_mm_commitment.empty()
-        ? ws.mm_commitment : atomic_mm_commitment;
+    // With a merged-mining manager wired, its cache read is the only source:
+    // the commitment refresh_work cached may be one the manager has since
+    // dropped (and the infos read above would not match it).
+    const auto& mm_for_scriptsig = m_mm_manager ? atomic_mm_commitment : ws.mm_commitment;
 
     std::string mm_hex;
     for (uint8_t b : mm_for_scriptsig) {
@@ -1478,6 +1579,7 @@ MiningInterface::build_connection_coinbase(
         the_root,
         ws.coinbase_text);
     LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
+    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false);
 
     // ── Phase 4: Write back updated PPLNS cache ──
     {
@@ -1764,6 +1866,9 @@ void MiningInterface::refresh_work()
             LOG_WARNING << "refresh_work: coinbase build failed: " << e.what();
             cb_parts = { "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff", "ffffffff0100f2052a01000000434104" };
         }
+
+        note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
+                            /*fresh_template=*/true);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
@@ -2188,9 +2293,43 @@ nlohmann::json MiningInterface::submitwork(const std::string& nonce, const std::
     }
 }
 
+std::optional<std::string> MiningInterface::aux_template_chain(const nlohmann::json& params) const
+{
+    const nlohmann::json* req = nullptr;
+    if (params.is_array() && !params.empty() && params[0].is_object())
+        req = &params[0];
+    else if (params.is_object())
+        req = &params;
+    if (!req || !req->contains("chain") || !(*req)["chain"].is_string())
+        return std::nullopt;
+    std::string chain = (*req)["chain"].get<std::string>();
+    std::string own = node_symbol();
+    auto upper = [](std::string v) {
+        for (auto& ch : v)
+            if (ch >= 'a' && ch <= 'z')
+                ch = static_cast<char>(ch - 32);
+        return v;
+    };
+    // The node's own chain, also in its testnet spelling (tLTC).
+    const bool own_chain = upper(chain) == upper(own)
+        || (chain.size() > 1 && (chain[0] == 't' || chain[0] == 'T')
+            && upper(chain.substr(1)) == upper(own));
+    if (chain.empty() || own_chain)
+        return std::nullopt;
+    return chain;
+}
+
 nlohmann::json MiningInterface::getblocktemplate(const nlohmann::json& params, const std::string& request_id)
 {
     LOG_INFO << "getblocktemplate request received";
+
+    // A merged chain's template (read-only, local cross-checks).
+    if (auto chain = aux_template_chain(params)) {
+        nlohmann::json j = m_mm_manager ? m_mm_manager->aux_template_json(*chain) : nlohmann::json();
+        if (j.is_null())
+            throw jsonrpccxx::JsonRpcException(-1, "no merged chain " + *chain + " on this node");
+        return j;
+    }
 
     // Return live template if available. A degraded template (MWEB-active,
     // no MWEB state yet) is never handed out: an external GBT miner would
@@ -3669,8 +3808,17 @@ void MiningInterface::start_pplns_precompute()
         // Wait for: PPLNS function + sharechain sync + valid work template
         uint256 block_target;
         uint64_t subsidy = 0;
-        for (int wait = 0; wait < 600; ++wait) {  // up to 10 minutes
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto stop = [this]() { return m_pplns_precompute_stop.load(std::memory_order_relaxed); };
+        // A sleep that ends at stop_background().
+        auto nap = [&stop](std::chrono::milliseconds d) {
+            const auto until = std::chrono::steady_clock::now() + d;
+            while (!stop() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        };
+        for (int wait = 0; wait < 600 && !stop(); ++wait) {  // up to 10 minutes
+            nap(std::chrono::seconds(1));
+            if (stop())
+                return;
             if (!m_pplns_fn || !m_sharechain_window_fn) continue;
 
             // Need meaningful chain
@@ -3701,6 +3849,8 @@ void MiningInterface::start_pplns_precompute()
             }
             if (!block_target.IsNull() && subsidy > 0) break;
         }
+        if (stop())
+            return;
 
         if (!m_pplns_fn || !m_sharechain_window_fn) {
             LOG_WARNING << "[PPLNS-Cache] No PPLNS function available, aborting pre-compute";
@@ -3738,10 +3888,10 @@ void MiningInterface::start_pplns_precompute()
         constexpr auto kPrecomputeBootSettle  = std::chrono::seconds(30);      // let boot backfill/think quiesce
         constexpr auto kPrecomputeBurstBudget = std::chrono::milliseconds(250); // ~160x under the 40s watchdog
         constexpr auto kPrecomputeYield       = std::chrono::milliseconds(50);  // hand the tracker lock back
-        std::this_thread::sleep_for(kPrecomputeBootSettle);
+        nap(kPrecomputeBootSettle);
         auto burst_start = std::chrono::steady_clock::now();
 
-        for (int i = 0; i < total; ++i) {
+        for (int i = 0; i < total && !stop(); ++i) {
             auto& s = shares[i];
             if (!s.contains("H") || !s.contains("h")) continue;
 
@@ -3815,6 +3965,8 @@ void MiningInterface::start_pplns_precompute()
                 continue;
             }
         }
+        if (stop())
+            return;
 
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start_time).count();
@@ -3892,7 +4044,8 @@ void MiningInterface::start_pplns_precompute()
                  << m_pplns_per_tip.size() << ")";
     });
 
-    m_pplns_precompute_thread.detach();
+    // Joined by stop_background() (not detached: it runs this object's
+    // callbacks).
 }
 
 void MiningInterface::cache_pplns_at_tip()
@@ -4690,6 +4843,21 @@ void MiningInterface::load_persisted_found_blocks()
     catch (const std::exception& e) {
         LOG_WARNING << "[Pool] Failed to load found blocks: " << e.what();
     }
+
+    // Rows still pending from before the restart were never given a verdict
+    // (their checks died with the process): check them again.
+    std::vector<std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_blocks_mutex);
+        for (const auto& b : m_found_blocks)
+            if (b.status == BlockStatus::pending)
+                pending.push_back(b.hash);
+    }
+    if (!pending.empty() && m_context) {
+        LOG_INFO << "[Pool] Re-checking " << pending.size() << " found blocks still pending";
+        for (const auto& h : pending)
+            schedule_block_verification(h);
+    }
 }
 
 void MiningInterface::seed_netdiff_history_from_found_blocks()
@@ -5048,7 +5216,9 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     //   DOGE: 1 min/block  → check at +10s, +60s, +120s, +180s, +360s, +600s
     //
     // After 6 confirmations the block is considered permanently accepted.
-    // If still pending after all checks, mark as orphaned.
+    // The coin's verifier gives the orphan verdict (another block at the
+    // height, the chain 6 deep); a row pending after the last check is one
+    // the chain could not judge, and stays pending rather than be called lost.
     std::string chain_name;
     {
         std::lock_guard<std::mutex> lock(m_blocks_mutex);
@@ -5074,8 +5244,11 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
     else if (cn == "DGB")  block_time_sec = 15;    // ~15 s
     else                   block_time_sec = 60;    // safe fallback
 
-    // Check at: first_check, then every block_time for 6 blocks,
-    // then one final check at 10 blocks
+    // Check at: first_check, then every block_time for 6 blocks, at 10
+    // blocks, then while still pending (a verdict needs the chain 6 deep
+    // from the block's height, which can take longer than 10 block times)
+    // at 15, 20, 30, 45, 60, 90 and 120 block times. A check of a row that
+    // already has its verdict is a no-op.
     auto& ioc = *m_context;
     std::vector<int> delays = {
         block_time_sec / 5,         // quick first check
@@ -5083,7 +5256,14 @@ void MiningInterface::schedule_block_verification(const std::string& block_hash)
         block_time_sec * 2,         // ~2 confs
         block_time_sec * 3,         // ~3 confs
         block_time_sec * 5,         // ~5 confs
-        block_time_sec * 10,        // ~10 confs (final)
+        block_time_sec * 10,        // ~10 confs
+        block_time_sec * 15,
+        block_time_sec * 20,
+        block_time_sec * 30,
+        block_time_sec * 45,
+        block_time_sec * 60,
+        block_time_sec * 90,
+        block_time_sec * 120,
     };
 
     // Each check finds the row by its HASH when it fires. The list is kept
@@ -5430,6 +5610,9 @@ nlohmann::json MiningInterface::rest_local_stats()
             // absent for every other coin.
             if (css.is_object() && css.contains("dml_fold") && css["dml_fold"].is_object())
                 result["dml_fold"] = css["dml_fold"];
+            // The coin's UTXO set (DASH: full / accrual, assumeutxo state).
+            if (css.is_object() && css.contains("utxo") && css["utxo"].is_object())
+                result["utxo"] = css["utxo"];
         }
 
         // 1. Coin block-source contact check (issue #1482).
@@ -5729,9 +5912,22 @@ nlohmann::json MiningInterface::rest_local_stats()
     result["mweb_hold_seconds"] = get_mweb_hold_seconds();
     result["mweb_degraded"] = is_work_degraded();
     result["mweb_refusals_by_code"] = get_mweb_refusals_by_code_json();
+    // Merged (aux) blocks refused at assembly, e.g. DOGE above 1,000,000 bytes.
+    result["merged_block_refusals_by_code"] = m_mm_manager ? m_mm_manager->get_block_refusals_json()
+                                                           : nlohmann::json::object();
     result["template_tx_refusals"] = get_template_tx_refusals_json();
     result["template_fee_outliers"] = get_template_fee_outliers();
     result["template_tx_check"] = template_tx_check_strict() ? "strict" : "warn";
+    // Merged (aux) templates fetched degraded (built before the tip's body
+    // cleaned the mempool: coinbase only) and fetched again clean, per chain.
+    if (m_mm_manager)
+        result["merged_template_gate"] = m_mm_manager->get_template_gate_json();
+    // Merged-work rebuilds that got no payouts, by reason, and what they did
+    // with the chain's commitment (kept the last block / dropped it).
+    if (m_mm_manager) {
+        result["merged_rebuild"] = m_mm_manager->get_rebuild_stats_json();
+        result["merged_rebuild"]["jobs_merged_other_best"] = m_merged_basis_mismatch_jobs.load();
+    }
 
     // Coin-side metrics (LTC embedded: "ltc_mweb" — the MWEB state window,
     // compact-block and full-block fetch counters).
@@ -6552,6 +6748,130 @@ nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
     return nlohmann::json{{"armed", false},
         {"error", "tx-inject submit not wired"},
         {"http_status", 503}};
+}
+
+nlohmann::json MiningInterface::rest_tx_inject_validate(const std::string& body)
+{
+    // N3: the installed fn runs NodeCoinState::validate_inject on the node
+    // io_context (thread_safe_wrap), like the submit; nothing is admitted.
+    if (m_tx_inject_validate_fn) {
+        auto j = m_tx_inject_validate_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"ok", false},
+        {"error", "tx-inject validate not wired"},
+        {"http_status", 503}};
+}
+
+// ── GET /api/utxo/scan: the dedicated scan thread ─────────────────────────────
+
+void MiningInterface::set_utxo_scan_fn(utxo_scan_fn_t fn)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    if (m_utxo_scan_stopping)
+        return;
+    m_utxo_scan_fn = std::move(fn);
+    if (m_utxo_scan_fn && !m_utxo_scan_thread.joinable())
+        m_utxo_scan_thread = std::thread([this] { utxo_scan_worker(); });
+}
+
+bool MiningInterface::has_utxo_scan_fn() const
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    return static_cast<bool>(m_utxo_scan_fn) && !m_utxo_scan_stopping;
+}
+
+void MiningInterface::set_utxo_scan_timeout(std::chrono::milliseconds t)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    m_utxo_scan_timeout = t;
+}
+
+void MiningInterface::utxo_scan_worker()
+{
+    std::unique_lock<std::mutex> lk(m_utxo_scan_mu);
+    for (;;) {
+        m_utxo_scan_cv.wait(lk, [this] { return m_utxo_scan_stopping || m_utxo_scan_job.has_value(); });
+        if (!m_utxo_scan_job)
+            return;   // stopping, nothing queued
+        UtxoScanJob job = std::move(*m_utxo_scan_job);
+        m_utxo_scan_job.reset();
+        const utxo_scan_fn_t fn = m_utxo_scan_fn;
+        lk.unlock();
+        nlohmann::json j;
+        try {
+            j = fn ? fn(job.query, m_utxo_scan_cancel)
+                   : nlohmann::json{{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[utxo-scan] scan failed: " << e.what();
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"detail", e.what()}, {"http_status", 500}};
+        } catch (...) {
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"http_status", 500}};
+        }
+        lk.lock();
+        m_utxo_scan_busy = false;   // before the answer: a caller that has it may scan again
+        lk.unlock();
+        job.done->set_value(std::move(j));
+        lk.lock();
+    }
+}
+
+nlohmann::json MiningInterface::rest_utxo_scan(const std::string& query)
+{
+    using Clock = std::chrono::steady_clock;
+    std::future<nlohmann::json> fut;
+    std::optional<Clock::time_point> prev_start;
+    Clock::time_point start;
+    std::chrono::milliseconds timeout;
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (!m_utxo_scan_fn || m_utxo_scan_stopping)
+            return {{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        if (m_utxo_scan_busy)
+            return {{"ok", false}, {"error", "utxo-scan-busy"},
+                    {"detail", "one scan at a time"}, {"http_status", 409}};
+        start = Clock::now();
+        if (m_utxo_scan_last_start && start - *m_utxo_scan_last_start < kUtxoScanMinInterval) {
+            const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+                kUtxoScanMinInterval - (start - *m_utxo_scan_last_start));
+            return {{"ok", false}, {"error", "utxo-scan-rate"},
+                    {"detail", "one scan per " + std::to_string(kUtxoScanMinInterval.count()) + " s"},
+                    {"retry_after_ms", wait.count()}, {"http_status", 429}};
+        }
+        prev_start = m_utxo_scan_last_start;
+        m_utxo_scan_last_start = start;
+        m_utxo_scan_busy = true;
+        auto done = std::make_shared<std::promise<nlohmann::json>>();
+        fut = done->get_future();
+        m_utxo_scan_job = UtxoScanJob{query, std::move(done)};
+        timeout = m_utxo_scan_timeout;
+    }
+    m_utxo_scan_cv.notify_one();
+    if (fut.wait_for(timeout) != std::future_status::ready)
+        return {{"ok", false}, {"error", "utxo-scan-timeout"},
+                {"detail", "the scan did not finish in time; it still runs and its result is dropped"},
+                {"http_status", 504}};
+    nlohmann::json j = fut.get();
+    if (!j.is_object() || !j.contains("scanned")) {
+        // Refused before the pass: the interval stays free.
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (m_utxo_scan_last_start == start)
+            m_utxo_scan_last_start = prev_start;
+    }
+    return j;
+}
+
+void MiningInterface::stop_utxo_scan()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        m_utxo_scan_stopping = true;
+    }
+    m_utxo_scan_cancel.store(true);
+    m_utxo_scan_cv.notify_all();
+    if (m_utxo_scan_thread.joinable() && m_utxo_scan_thread.get_id() != std::this_thread::get_id())
+        m_utxo_scan_thread.join();
 }
 
 nlohmann::json MiningInterface::rest_node_topology()
@@ -11341,6 +11661,11 @@ void WebServer::stop()
     if (running_) {
         try {
             running_ = false;
+            // The UTXO scan first: an HTTP handler waiting for a pass returns
+            // as soon as the pass sees the cancel, so the join below never
+            // waits out a pass.
+            if (mining_interface_)
+                mining_interface_->stop_utxo_scan();
             acceptor_.close();
             // Stop the dedicated HTTP event loop and join its thread
             http_ioc_.stop();

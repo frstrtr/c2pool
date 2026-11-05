@@ -25,6 +25,7 @@
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
 #include <impl/dash/coin/inject_sandbox.hpp>     // #157 M3: InjectSandbox (bounded-work script-verify guard)
 #include <impl/dash/coin/inject_rate_limiter.hpp> // #157 M3: InjectRateLimiter (node-wide count+byte cap)
+#include <impl/dash/coin/inject_dry_run_causes.hpp> // N3: the causes only the dry run answers
 #include <impl/dash/coin/rpc_data.hpp>           // DashWorkData
 #include <impl/dash/coin/quorum_manager.hpp>     // QuorumManager (merkleRootQuorums source)
 #include <impl/dash/coin/quorum_root.hpp>        // compute_merkle_root_quorums (pre-emit recompute)
@@ -38,13 +39,17 @@
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
+#include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
 #include <ctime>
 
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -189,7 +194,20 @@ inline std::string discriminating_hash_tail(const uint256& h, size_t n = 12)
 /// through select_work().
 class NodeCoinState {
 public:
-    NodeCoinState() = default;
+    NodeCoinState() {
+        // VERIFY-S2b S-B / #2121: a rewind puts back only the injects this
+        // ledger still wants. The ledger releases an inject when it leaves the
+        // mempool (reconcile_inject_pool) but keeps its record in the released
+        // ledger as deep as the mempool's confirmed keep, so a confirmed inject
+        // a rewind takes out is put back and re-tracked with its original
+        // metadata. One whose expiry_height the next block passes, or one the
+        // active caps have no room for, stays out instead of coming back
+        // untracked. Called inside Mempool::readmit_disconnected_injects on the
+        // io thread (the lane's rewind).
+        m_mempool.set_inject_still_wanted_fn([this](const uint256& txid) {
+            return m_inject_pool.still_wanted(txid, next_block_height());
+        });
+    }
     NodeCoinState(const NodeCoinState&) = delete;
     NodeCoinState& operator=(const NodeCoinState&) = delete;
 
@@ -554,6 +572,10 @@ public:
         m_curtime              = curtime;
         m_version              = version;
         m_populated            = true;
+        // S2: an inject whose expiry_height the new tip reached leaves the pool
+        // and the mempool now, not at the next submit. #2121: so does one that
+        // left the mempool (the lane's hook usually released it already).
+        reconcile_inject_pool();
     }
 
     /// Invalidate the bundle (reorg / mempool flush / MN list gap) so the next
@@ -688,10 +710,15 @@ public:
     /// finality / double-spend) runs at template build and DROPS an invalid
     /// inject there — it is never served. `flags` and `expiry_height` are the
     /// design's wire fields (carried for M2/M3). io-thread only.
+    /// `max_fee` (S2): the highest fee the submitter allows; a priced fee above
+    /// it refuses inject-fee-above-max. The library default is no cap; the
+    /// operator entry points in main_dash pass 0 (the zero-fee sweep) unless
+    /// the submit body names one.
     InjectSubmitResult submit_inject(const MutableTransaction& tx,
                                      uint32_t flags = 0,
                                      int32_t expiry_height = 0,
-                                     InjectOrigin origin = InjectOrigin::Local) {
+                                     InjectOrigin origin = InjectOrigin::Local,
+                                     uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         InjectSubmitResult r;
         r.txid = dash::coin::dash_txid(tx);
         if (!m_tx_inject_enabled) { r.cause = "inject-disabled"; return r; }
@@ -784,8 +811,8 @@ public:
                 r.cause = sb.name(); return r;
             }
         }
-        // Lazily reconcile the pool with the mempool before admitting: forget
-        // any tracked inject no longer in the mempool (confirmed / evicted) and
+        // Reconcile the pool with the mempool before admitting: release any
+        // tracked inject no longer in the mempool (confirmed / evicted) and
         // reap expired ones, so the caps reflect what is actually live.
         reconcile_inject_pool();
         // DoS caps FIRST (cheap, no consensus work): a full / over-cap pool
@@ -796,35 +823,223 @@ public:
         }
         // Mempool admission with priority (runs the validity/dedup/script-armed
         // gate). Priority = offered first, NOT a guard bypass.
-        auto gv = m_mempool.add_inject(tx);
+        auto gv = m_mempool.add_inject(tx, max_fee);
         if (gv != dash::coin::Mempool::InjectGate::Ok) {
             r.cause = dash::coin::Mempool::inject_gate_name(gv); return r;
         }
         // Track it for DoS accounting + expiry.
         m_inject_pool.admit(r.txid, flags, expiry_height, byte_size);
         publish_inject_status();
+        // S4: mirror the new entry into the read-only per-inject ledger.
+        if (const auto e = m_inject_pool.entry(r.txid))
+            core::obs::inject_ledger().upsert(to_ledger_entry(*e));
         r.ok = true;
         r.cause = "ok";
         return r;
     }
 
-    /// Reconcile the inject ledger with the live mempool + tip: drop tracked
-    /// injects that have left the mempool (confirmed / conflict-evicted) or have
-    /// expired, evicting the expired ones from the mempool too. Called lazily
-    /// from submit_inject and exposed for a block-connect wiring in a later PR.
+    /// Outcome of validate_inject (POST /api/tx-inject/validate).
+    struct InjectValidateResult {
+        bool        ok{false};           // would_admit, a known tip, no input immature at
+                                         // next_height, no other pool tx spending an input
+        bool        would_admit{false};  // submit_inject would answer "ok" now (its rate
+                                         // limiter aside: the dry run does not charge it)
+        std::string cause;               // the first refusal in submit order, then
+                                         // the dry-run-only causes
+                                         // (inject_dry_run_causes.hpp); else "ok"
+        std::string gate;                // Mempool::add_inject's verdict ("" when a
+                                         // structural check refused before it)
+        uint256     txid;
+        bool        armed{false};
+        uint32_t    next_height{0};      // 0: tip unknown
+        uint32_t    immature_at_next_height{0};
+        bool        analysed{false};     // the mempool dry run ran (inputs / fee below)
+        Mempool::InjectDryRun dry;
+    };
+
+    /// Dash coinbase maturity (consensus.h COINBASE_MATURITY).
+    static constexpr uint32_t kCoinbaseMaturity = 100;
+
+    /// The dry run of submit_inject (c2wallet Scan & Plan N3): the same gate
+    /// in the same order, answered without admitting anything — the inject
+    /// ledger, the mempool, the fee deltas, the submit rate windows and the
+    /// status counters are left exactly as they were (no reconcile, no
+    /// admission; Mempool::validate_inject prices on a scratch entry). Its
+    /// one write is its own budget: like a submit it is charged on attempt
+    /// (after the charge-free type and size checks, before the sandbox and
+    /// the script verify, armed or not) to m_inject_rate_validate, a local
+    /// window of its own, so a preflight loop cannot hold the io thread and
+    /// cannot spend the operator's submit budget. It adds what admission does
+    /// not check: each input's coin, its maturity at the next height (a
+    /// coinbase input needs height + 100 <= next_height; the template build
+    /// would drop an immature inject silently), and any other pool tx
+    /// spending an input. A tx the structural checks refuse (type, size,
+    /// sandbox) or the budget refuses is not analysed. io-thread only, like
+    /// submit_inject (it reads the inject ledger and the tip).
+    InjectValidateResult validate_inject(const MutableTransaction& tx,
+                                         uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectValidateResult r;
+        r.txid = dash::coin::dash_txid(tx);
+        r.armed = m_tx_inject_enabled;
+        r.next_height = m_prev_height != 0 ? m_prev_height + 1 : 0;
+        std::string structural;
+        const uint32_t byte_size = static_cast<uint32_t>(::pack(tx).get_span().size());
+        if (tx.type != 0 || tx.vin.empty() || tx.vout.empty()) {
+            structural = "inject-type-unsupported";
+        } else if (byte_size > dash::coin::TxInjectPool::kMaxInjectTxBytes) {
+            structural = dash::coin::TxInjectPool::admit_name(dash::coin::TxInjectPool::Admit::TooLarge);
+        }
+        if (structural.empty()) {
+            const auto rl = m_inject_rate_validate.try_consume(byte_size, std::time(nullptr));
+            if (!rl.ok()) {
+                r.cause = rl.name();   // the dry run itself was refused, armed or not
+                return r;
+            }
+            const auto sb = dash::coin::InjectSandbox::vet(tx);
+            if (!sb.ok()) structural = sb.name();
+        }
+        if (!structural.empty()) {
+            r.cause = r.armed ? structural : "inject-disabled";
+            return r;
+        }
+        r.dry = m_mempool.validate_inject(tx, max_fee);
+        r.analysed = true;
+        r.gate = dash::coin::Mempool::inject_gate_name(r.dry.gate);
+        const auto pv = m_inject_pool.would_admit(r.txid, byte_size);
+        bool conflict = false;
+        for (const auto& in : r.dry.inputs) {
+            if (in.pool_spender) conflict = true;
+            if (r.next_height != 0 && in.resolved && in.coinbase &&
+                static_cast<uint64_t>(in.height) + kCoinbaseMaturity > r.next_height)
+                ++r.immature_at_next_height;
+        }
+        r.would_admit = r.armed && pv == dash::coin::TxInjectPool::Admit::Ok &&
+                        r.dry.gate == dash::coin::Mempool::InjectGate::Ok;
+        if (!r.armed) r.cause = "inject-disabled";
+        else if (pv != dash::coin::TxInjectPool::Admit::Ok) r.cause = dash::coin::TxInjectPool::admit_name(pv);
+        else if (r.dry.gate != dash::coin::Mempool::InjectGate::Ok) r.cause = r.gate;
+        else if (r.next_height == 0) r.cause = inject_dry_run_cause::kTipUnknown;
+        else if (r.immature_at_next_height != 0) r.cause = inject_dry_run_cause::kImmatureCoinbaseInput;
+        else if (conflict) r.cause = inject_dry_run_cause::kInputSpentInMempool;
+        else r.cause = "ok";
+        r.ok = r.cause == "ok";
+        return r;
+    }
+
+    /// Reconcile the inject ledger with the live mempool + tip (#2121). After
+    /// it, the active set equals Mempool::inject_txids_in_pool(): nothing that
+    /// left the mempool counts against the caps, and every inject in the
+    /// mempool is tracked. Five steps, io thread:
+    ///   1. expiry: reap the injects the next block passes (expiry_height != 0
+    ///      && next height > expiry_height) and evict them from the mempool;
+    ///   2. read the injects live in the mempool;
+    ///   3. release every tracked inject that is not live (confirmed or
+    ///      conflict-evicted by a block); its record stays in the released
+    ///      ledger for a rewind;
+    ///   4. re-track every live inject that is not tracked: a rewind put it
+    ///      back (original metadata from the released ledger), or it has no
+    ///      record (tracked fresh: flags 0, expiry 0, its mempool size). A
+    ///      refusal by the caps evicts it from the mempool again by name;
+    ///   5. prune released records the undo-keep depth no longer reaches.
+    /// Then the status mirror is published. Called from submit_inject (before
+    /// the caps check), set_tip (every tip advance), and the UTXO lane's
+    /// mempool-changed hook (main_dash: after every block connect / rewind the
+    /// lane runs, so a confirm releases before the next promotion).
+    /// Rate-limiter windows are never refunded here.
     void reconcile_inject_pool() {
-        if (m_inject_pool.empty()) return;
-        // Expiry against our own tip.
+        const int32_t next_h = next_block_height();
+        // (1) Expiry against our own tip.
         if (m_prev_height != 0) {
-            for (const auto& id : m_inject_pool.reap_expired(
-                     static_cast<int32_t>(m_prev_height + 1))) {
+            for (const auto& id : m_inject_pool.reap_expired(next_h)) {
                 m_mempool.remove_tx(id);
             }
         }
+        // (2) The injects live in the mempool.
+        const std::vector<uint256> live = m_mempool.inject_txids_in_pool();
+        const std::set<uint256> live_set(live.begin(), live.end());
+        // (3) Release what left the mempool.
+        for (const auto& id : m_inject_pool.tracked_ids()) {
+            if (live_set.count(id)) continue;
+            m_inject_pool.release(id, m_prev_height);
+            LOG_INFO << "[MEMPOOL] inject released txid=" << id.GetHex().substr(0, 16)
+                     << " cause=left-mempool height=" << m_prev_height;
+        }
+        // (4) Re-track what came back (or was never tracked), PARENTS FIRST. A
+        //     rewind can put back a parent and its child together while the
+        //     caps have room for only part of the set (still_wanted checked
+        //     each one against the same active set, before any of them came
+        //     back). In txid order the parent could be the one refused, leaving
+        //     the child live and tracked with an input that is neither in the
+        //     view nor in the pool. In topological order the parent takes the
+        //     room first, and a refused inject takes its live descendants with
+        //     it: an untracked one is refused by name, a tracked one evicted.
+        std::vector<uint256> untracked;
+        for (const auto& id : live)
+            if (!m_inject_pool.contains(id)) untracked.push_back(id);
+        std::set<uint256> refused;
+        std::vector<uint256> retracked;
+        for (const auto& id : inject_parents_first(untracked)) {
+            const char* how = "rewind";
+            std::string cause;
+            if (spends_one_of(id, refused)) {
+                cause = "inject-pool-parent-refused";
+            } else {
+                auto v = m_inject_pool.retrack(id);
+                if (v == TxInjectPool::Admit::NotTracked) {
+                    how = "untracked";
+                    const auto e = m_mempool.get_entry(id);
+                    v = m_inject_pool.admit(id, 0, 0, e ? e->base_size : 0u);
+                }
+                if (v != TxInjectPool::Admit::Ok) cause = TxInjectPool::admit_name(v);
+            }
+            if (!cause.empty()) {
+                refused.insert(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject readmit refused txid=" << id.GetHex().substr(0, 16)
+                            << " cause=" << cause
+                            << "; evicted from the mempool, resubmit it if it is still wanted";
+            } else {
+                LOG_INFO << "[MEMPOOL] inject re-tracked txid=" << id.GetHex().substr(0, 16)
+                         << " cause=" << how;
+                retracked.push_back(id);
+            }
+        }
+        // A tracked inject that spends a refused one (its child came back in an
+        // earlier rewind) cannot ride without it: evict it too, transitively.
+        for (bool more = !refused.empty(); more;) {
+            more = false;
+            for (const auto& id : m_inject_pool.tracked_ids()) {
+                if (!spends_one_of(id, refused)) continue;
+                refused.insert(id);
+                m_inject_pool.forget(id);
+                m_mempool.remove_tx(id);
+                LOG_WARNING << "[MEMPOOL] inject evicted txid=" << id.GetHex().substr(0, 16)
+                            << " cause=inject-pool-parent-refused"
+                            << "; resubmit it with its parent if it is still wanted";
+                more = true;
+            }
+        }
+        // (5) Released records a rewind can no longer reach.
+        if (m_prev_height != 0)
+            m_inject_pool.prune_released(m_prev_height, Mempool::kConfirmedInjectDepth);
         publish_inject_status();
+        // S4: the read-only per-inject ledger follows the active set: the
+        // re-tracked / fresh entries are (re)inserted, everything else that
+        // is no longer tracked (released, reaped, refused) is dropped.
+        auto& ledger = core::obs::inject_ledger();
+        for (const auto& id : retracked)
+            if (const auto e = m_inject_pool.entry(id)) ledger.upsert(to_ledger_entry(*e));
+        ledger.retain(m_inject_pool.tracked_ids());
+        ledger.set_tip(m_prev_height);
     }
 
     size_t inject_pool_size() const { return m_inject_pool.size(); }
+    /// Bytes the active inject set counts against kMaxInjectTotalBytes.
+    size_t inject_pool_bytes() const { return m_inject_pool.total_bytes(); }
+    /// The active ledger entry for `txid` (nullopt when it is not tracked).
+    std::optional<InjectEntry> inject_entry(const uint256& txid) const {
+        return m_inject_pool.entry(txid);
+    }
 
     /// Publish the current tx-inject lane state into the process-global
     /// read-only observability snapshot (core::obs::inject_status()),
@@ -865,6 +1080,8 @@ public:
     size_t inject_rate_count() const { return m_inject_rate.count_in_window(); }
     // #157 M3: same, for the aggregate-PEER rate limiter.
     size_t inject_rate_count_peer() const { return m_inject_rate_peer.count_in_window(); }
+    // N3: dry runs (validate_inject) the dry-run budget still counts in its window.
+    size_t inject_validate_rate_count() const { return m_inject_rate_validate.count_in_window(); }
     // #157 M3: bytes the LOCAL rate limiter still counts in its window — proves
     // an oversize blob was refused BEFORE the byte-window was charged.
     uint64_t inject_rate_bytes() const { return m_inject_rate.bytes_in_window; }
@@ -1970,6 +2187,76 @@ public:
     }
 
 private:
+    /// The height of the block the next template builds (tip + 1), or 0 while
+    /// no tip is known (the inject ledger then treats nothing as expired).
+    int32_t next_block_height() const {
+        return m_prev_height ? static_cast<int32_t>(m_prev_height + 1) : 0;
+    }
+
+    /// S4: the read-only ledger's copy of an active inject entry. in_mempool
+    /// is true by the reconcile invariant (the active set equals the injects
+    /// live in the mempool); last_build is left to the ride log.
+    static core::obs::InjectLedgerEntry to_ledger_entry(const InjectEntry& e) {
+        core::obs::InjectLedgerEntry le;
+        le.txid          = e.txid;
+        le.submit_time   = static_cast<int64_t>(e.submit_time);
+        le.expiry_height = e.expiry_height;
+        le.byte_size     = e.byte_size;
+        le.flags         = e.flags;
+        le.in_mempool    = true;
+        return le;
+    }
+
+    /// Whether the mempool tx `id` spends an output of a tx in `txids`.
+    bool spends_one_of(const uint256& id, const std::set<uint256>& txids) const {
+        if (txids.empty()) return false;
+        const auto e = m_mempool.get_entry(id);
+        if (!e) return false;
+        for (const auto& in : e->tx.vin)
+            if (txids.count(in.prevout.hash)) return true;
+        return false;
+    }
+
+    /// `ids` (mempool txids) reordered so every tx comes after the txs of
+    /// `ids` it spends; otherwise the given order is kept.
+    std::vector<uint256> inject_parents_first(const std::vector<uint256>& ids) const {
+        const std::set<uint256> in_set(ids.begin(), ids.end());
+        std::map<uint256, std::vector<uint256>> parents;
+        for (const auto& id : ids) {
+            const auto e = m_mempool.get_entry(id);
+            if (!e) continue;
+            for (const auto& vin : e->tx.vin)
+                if (vin.prevout.hash != id && in_set.count(vin.prevout.hash))
+                    parents[id].push_back(vin.prevout.hash);
+        }
+        std::vector<uint256> out;
+        out.reserve(ids.size());
+        std::set<uint256> placed;
+        // Iterative post-order walk (a chain of injects can be long).
+        for (const auto& root : ids) {
+            if (placed.count(root)) continue;
+            std::vector<std::pair<uint256, size_t>> stack{{root, 0}};
+            std::set<uint256> on_stack{root};
+            while (!stack.empty()) {
+                auto& [cur, next] = stack.back();
+                const auto it = parents.find(cur);
+                if (it != parents.end() && next < it->second.size()) {
+                    const uint256 p = it->second[next++];
+                    if (!placed.count(p) && !on_stack.count(p)) {
+                        on_stack.insert(p);
+                        stack.emplace_back(p, 0);
+                    }
+                    continue;
+                }
+                placed.insert(cur);
+                out.push_back(cur);
+                on_stack.erase(cur);
+                stack.pop_back();
+            }
+        }
+        return out;
+    }
+
     /// THE clause list. The ONLY transcription of embedded-arm viability:
     /// make_embedded_work_inputs() derives has_state from `.viable`, and
     /// describe_decline()/classify_decline() read the very same object, so the
@@ -2377,6 +2664,11 @@ private:
     // inject. The per-peer half remains dash::PeerInjectGuard (tx_inject_relay.hpp).
     dash::coin::InjectRateLimiter m_inject_rate_peer{
         dash::coin::InjectRateLimiter::Scope::Peers};
+    // N3: the LOCAL budget of the dry run (validate_inject). Same caps and
+    // the same local cause names as m_inject_rate, but its own window, so a
+    // preflight loop is throttled without spending the operator's submit
+    // budget (the split the peer budget already has).
+    dash::coin::InjectRateLimiter m_inject_rate_validate;
     // #107 PHASE 2 (--embedded-accrue-asset-locks): DEFAULT OFF — accrue the
     // pending type-8 asset-lock term into the CbTx creditPoolBalance. See
     // set_accrue_pending_asset_locks. Consumed by make_embedded_work_inputs

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <string>
@@ -38,6 +39,7 @@
 #include <core/config_endpoint.hpp>
 #include <core/settings_file.hpp>
 #include <core/param_catalog.hpp>
+#include <core/inject_ledger_obs.hpp>   // S4: GET /api/tx-inject/ledger
 
 namespace {
 
@@ -811,6 +813,99 @@ TEST(ConfigEndpointHttp, SliceBSubmitTimeoutIs5xxNotHang) {
     ce::clear_control_token();
 }
 
+// N3 (c2wallet Scan & Plan): POST /api/tx-inject/validate, the dry run of the
+// submit. Unwired: 503. Wired: the submit's rules — direct-local only (a
+// forwarded header is refused), the control token (403, the fn untouched) —
+// the body passed verbatim, the http_status hint mapped and stripped, and the
+// fn run on the producer io_context thread (thread_safe_wrap) like the submit.
+TEST(ConfigEndpointHttp, N3ValidateRouteGatesLikeTheSubmit) {
+    reset_apply_state();
+    ce::publish_resolved(dash_snapshot(), c2pool::catalog::C_DASH, "/tmp/x.toml");
+    {
+        net::io_context ioc;
+        auto ws = make_wired_server(ioc);
+        int status = 0;
+        auto body = do_request(ws->bound_port(), http::verb::post, "/api/tx-inject/validate",
+                               status, nlohmann::json{{"raw_tx", "00"}}.dump());
+        EXPECT_EQ(status, 503) << body;
+        EXPECT_NE(body.find("not wired"), std::string::npos) << body;
+    }
+
+    net::io_context ioc;
+    net::io_context producer;
+    auto guard = net::make_work_guard(producer);
+    auto ws = std::make_unique<core::WebServer>(ioc, "127.0.0.1", 0, false);
+    ws->set_stratum_port(0);
+    auto* mi = ws->get_mining_interface();
+    std::promise<std::thread::id> ready;
+    std::thread producer_thread([&]() {
+        mi->set_io_context(&producer);
+        ready.set_value(std::this_thread::get_id());
+        producer.run();
+    });
+    const std::thread::id producer_tid = ready.get_future().get();
+    std::atomic<int> calls{0};
+    std::thread::id fn_tid{};
+    std::string seen;
+    mi->set_tx_inject_validate_fn([&](const std::string& body) -> nlohmann::json {
+        ++calls;
+        fn_tid = std::this_thread::get_id();
+        seen = body;
+        return nlohmann::json{{"ok", false}, {"dry_run", true}, {"cause", "inject-immature-input"},
+                              {"would_admit", true}, {"http_status", 422}};
+    });
+    EXPECT_FALSE(mi->has_tx_inject_submit_fn()) << "the dry run needs no submit fn";
+    ws->start();
+    const uint16_t port = ws->bound_port();
+
+    int status = 0;
+    const nlohmann::json no_token = {{"raw_tx", "0100000000"}};
+    auto body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, no_token.dump());
+    EXPECT_EQ(status, 403) << body;
+    ce::set_control_token("tok-val");
+    const nlohmann::json wrong = {{"control_token", "nope"}, {"raw_tx", "0100000000"}};
+    body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, wrong.dump());
+    EXPECT_EQ(status, 403) << body;
+    EXPECT_EQ(calls.load(), 0) << "no token, no dry run";
+
+    const nlohmann::json good = {{"control_token", "tok-val"}, {"raw_tx", "0100000000"}, {"max_fee", 0}};
+    {
+        // A same-host reverse proxy adds a forwarded header: refused.
+        net::io_context c;
+        tcp::socket sock(c);
+        sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port));
+        http::request<http::string_body> req{http::verb::post, "/api/tx-inject/validate", 11};
+        req.set(http::field::host, "127.0.0.1");
+        req.set("X-Forwarded-For", "203.0.113.7");
+        req.set(http::field::content_type, "application/json");
+        req.body() = good.dump();
+        req.prepare_payload();
+        http::write(sock, req);
+        beast::flat_buffer buf;
+        http::response<http::string_body> res;
+        http::read(sock, buf, res);
+        EXPECT_EQ(res.result_int(), 403) << res.body();
+        beast::error_code ec;
+        sock.shutdown(tcp::socket::shutdown_both, ec);
+    }
+    EXPECT_EQ(calls.load(), 0) << "a proxied request never reaches the dry run";
+
+    body = do_request(port, http::verb::post, "/api/tx-inject/validate", status, good.dump());
+    EXPECT_EQ(status, 422) << body;
+    const auto j = nlohmann::json::parse(body);
+    EXPECT_EQ(j.value("cause", std::string()), "inject-immature-input");
+    EXPECT_FALSE(j.contains("http_status"));
+    EXPECT_EQ(calls.load(), 1);
+    EXPECT_EQ(seen, good.dump()) << "the body reaches the fn verbatim";
+    EXPECT_EQ(fn_tid, producer_tid) << "the dry run runs on the node io thread, like the submit";
+
+    ws->stop();
+    guard.reset();
+    producer.stop();
+    if (producer_thread.joinable()) producer_thread.join();
+    ce::clear_control_token();
+}
+
 // A RESTART-class key has no registered runtime applier, so applying it like a
 // LIVE key would swap the reporting mirror while the running process keeps the
 // OLD value (a mirror-vs-runtime lie). The apply path must REFUSE it by a named
@@ -882,4 +977,101 @@ TEST(ConfigEndpointHttp, PostApplyRefusesKeyWithNoRuntimeSetter) {
     // money-path write attempt without a nonce).
     EXPECT_EQ(ce::tripwire_state().count, 0u);
     ce::clear_control_token();
+}
+
+// ── S4: GET /api/tx-inject/ledger — read-only per-inject ledger ────────────
+// Through the REAL http_session dispatch: a build with the route always answers
+// 200 from loopback (wired:false + an empty entries array before the lane ever
+// published, so a wallet can feature-detect it by 404), renders the published
+// entries / verdicts / best ChainLock, and refuses any forwarded request (403,
+// is_direct_local_request).
+namespace {
+
+std::string get_with_header(uint16_t port, const std::string& target, int& status_out,
+                            const std::string& header_name, const std::string& header_value) {
+    net::io_context ioc;
+    tcp::socket sock(ioc);
+    sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), port));
+    http::request<http::string_body> req{http::verb::get, target, 11};
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::user_agent, "s4-ledger-check");
+    if (!header_name.empty()) req.set(header_name, header_value);
+    http::write(sock, req);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(sock, buffer, res);
+    status_out = res.result_int();
+    beast::error_code ec;
+    sock.shutdown(tcp::socket::shutdown_both, ec);
+    return res.body();
+}
+
+} // namespace
+
+TEST(ConfigEndpointHttp, TxInjectLedgerIsLoopbackOnlyAndReadOnly) {
+    auto& ledger = core::obs::inject_ledger();
+    auto& cl = core::obs::best_chainlock();
+    ledger.reset();
+    cl.reset();
+    net::io_context ioc;
+    auto ws = make_wired_server(ioc);
+
+    // Never published: 200, wired:false, empty entries, bestchainlock null.
+    int status = 0;
+    auto body = do_request(ws->bound_port(), http::verb::get, "/api/tx-inject/ledger", status);
+    EXPECT_EQ(status, 200) << body;
+    auto j = nlohmann::json::parse(body);
+    EXPECT_FALSE(j.value("wired", true));
+    ASSERT_TRUE(j.contains("entries"));
+    EXPECT_TRUE(j["entries"].is_array());
+    EXPECT_TRUE(j["entries"].empty());
+    ASSERT_TRUE(j.contains("bestchainlock"));
+    EXPECT_TRUE(j["bestchainlock"].is_null());
+    ASSERT_TRUE(j.contains("pool"));
+
+    // Published: one entry with a HELD verdict, and a best ChainLock.
+    core::obs::InjectLedgerEntry e;
+    std::memset(e.txid.begin(), 0x5c, 32);
+    e.submit_time = 1'762'043'087;
+    e.byte_size = 27'911;
+    ledger.upsert(e);
+    core::obs::InjectLedgerBuild b;
+    b.height = 2'565'247; b.rides = false; b.cause = "not-selected";
+    ledger.set_last_build(e.txid, b);
+    ledger.set_tip(2'565'261);
+    core::obs::BestChainLock lock;
+    lock.height = 2'565'260;
+    std::memset(lock.blockhash.begin(), 0x2d, 32);
+    lock.provenance = "bls-verified";
+    lock.updated_at = 1'762'069'990;
+    cl.publish(lock);
+
+    body = do_request(ws->bound_port(), http::verb::get, "/api/tx-inject/ledger", status);
+    EXPECT_EQ(status, 200) << body;
+    j = nlohmann::json::parse(body);
+    EXPECT_TRUE(j.value("wired", false));
+    EXPECT_EQ(j.value("tip_height", 0u), 2'565'261u);
+    ASSERT_EQ(j["entries"].size(), 1u);
+    const auto& je = j["entries"][0];
+    EXPECT_EQ(je.value("txid", std::string()), e.txid.GetHex());
+    EXPECT_EQ(je.value("byte_size", 0u), 27'911u);
+    EXPECT_EQ(je.value("expiry_height", -1), 0);
+    EXPECT_TRUE(je.value("in_mempool", false));
+    ASSERT_TRUE(je["last_build"].is_object());
+    EXPECT_EQ(je["last_build"].value("verdict", std::string()), "HELD");
+    EXPECT_EQ(je["last_build"].value("cause", std::string()), "not-selected");
+    EXPECT_EQ(je["last_build"].value("height", 0u), 2'565'247u);
+    ASSERT_TRUE(j["bestchainlock"].is_object());
+    EXPECT_EQ(j["bestchainlock"].value("height", 0), 2'565'260);
+    EXPECT_EQ(j["bestchainlock"].value("blockhash", std::string()), lock.blockhash.GetHex());
+    EXPECT_EQ(j["bestchainlock"].value("provenance", std::string()), "bls-verified");
+    EXPECT_EQ(j.value("overflow_dropped", 99u), 0u);
+
+    // A forwarded request is not local: refused.
+    get_with_header(ws->bound_port(), "/api/tx-inject/ledger", status,
+                    "X-Forwarded-For", "203.0.113.7");
+    EXPECT_EQ(status, 403);
+
+    ledger.reset();
+    cl.reset();
 }

@@ -258,7 +258,9 @@ void Socket::do_write()
 
 void Socket::read_prefix(std::shared_ptr<Packet> packet)
 {
-    ASYNC_READ(boost::asio::buffer(&packet->prefix[0], packet->prefix.size()),
+    // data(), not &prefix[0]: operator[] on an empty vector (a node whose
+    // prefix is empty) is undefined; data() with size 0 is an empty buffer.
+    ASYNC_READ(boost::asio::buffer(packet->prefix.data(), packet->prefix.size()),
         {
             if (ec)
             {

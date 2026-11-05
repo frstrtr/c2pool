@@ -31,6 +31,19 @@
 
 namespace c2w::dash {
 
+// FeeMode::Relay for a sweep (slice 2): a FEE-PAYING consolidation for plain
+// relay through dashd `sendrawtransaction`, for when no node can resolve the
+// inputs of a zero-fee pin. The rate is explicit, in duffs per byte, and must
+// lie in [kMinRelayFeePerByte, kMaxRelayFeePerByte]: 1 duff/B is Dash Core's
+// default minimum relay fee (1000 duffs/kB), 100 duffs/B the same ceiling the
+// collateral builder applies (100000 duffs/kB). Each tx pays rate x its
+// worst-case signed size, so the real rate is never below the one asked for.
+inline constexpr int64_t kMinRelayFeePerByte = 1;
+inline constexpr int64_t kMaxRelayFeePerByte = 100;
+// Dash Core's dust threshold for a P2PKH output: (34 + 148) B at the 3000
+// duffs/kB dust relay fee. No sweep output is built below it, in either mode.
+inline constexpr int64_t kP2pkhDustDuffs = 546;
+
 struct SweepRequest {
     std::string funding_address;
     std::string destination_address;    // empty => the funding address
@@ -42,11 +55,17 @@ struct SweepRequest {
     size_t max_inputs_per_tx = caps::kMaxInjectInputs;  // may only tighten the cap
     size_t max_tx_bytes = caps::kMaxInjectTxBytes;      // may only tighten the cap
     PubkeyEncoding key_encoding = PubkeyEncoding::Unknown;
+    // InjectOnlyZeroFee (default): fee exactly 0, fee_rate_per_byte must be 0.
+    // Relay: fee = fee_rate_per_byte x est signed bytes, rate in [1, 100].
+    FeeMode fee_mode = FeeMode::InjectOnlyZeroFee;
+    int64_t fee_rate_per_byte = 0;
 };
 
 struct SweepTxPlan {
     std::vector<Utxo> inputs;
-    int64_t value_out = 0;               // == sum of inputs: the fee is 0 by construction
+    int64_t value_out = 0;               // inject: == sum of inputs (fee 0 by construction);
+                                         // relay: sum of inputs - fee
+    int64_t fee = 0;                     // inject: 0; relay: rate x est_signed_bytes
     std::vector<uint8_t> dest_spk;
     std::vector<uint8_t> unsigned_tx;    // the exact bytes sign_sweep signs
     size_t est_signed_bytes = 0;
@@ -61,6 +80,9 @@ struct SweepBatchPlan {
     std::string destination_address;
     bool testnet = false;
     std::string summary;                 // dry-run summary (public data only)
+    FeeMode fee_mode = FeeMode::InjectOnlyZeroFee;
+    int64_t fee_rate_per_byte = 0;       // Relay only
+    int64_t total_fee = 0;               // sum of the txs' fees (0 for inject)
 };
 
 // Screen the UTXOs (strict: scriptPubKey required and must pay the funding
@@ -68,13 +90,19 @@ struct SweepBatchPlan {
 // summary), order them, and split greedily so every tx stays within
 // min(max_inputs_per_tx, kMaxInjectInputs) inputs and min(max_tx_bytes,
 // kMaxInjectTxBytes) estimated signed bytes. More txs than one node's inject
-// pool holds at once is a WARNING in the summary, not a refusal.
+// pool holds at once is a WARNING in the summary, not a refusal. Relay mode
+// refuses a rate outside [1, 100] duffs/B, and a tx whose output after the fee
+// would be below kP2pkhDustDuffs or below its own fee; inject mode refuses a
+// non-zero rate. No mode builds an output below kP2pkhDustDuffs.
 SweepBatchPlan plan_sweep(const SweepRequest& req);
 
 // Sign every planned tx with ONE key, self-verify every input (finalize), and
 // re-check the signed size against the node cap. Refuses unless confirm_spend,
-// if the key is not the funding key, if a planned tx is not zero-fee or its
-// bytes are not the planned ones.
+// if the key is not the funding key, if a planned tx's bytes are not the
+// planned ones, or if its amounts do not balance: inject mode needs a fee of
+// exactly 0 (inputs == output); relay mode needs inputs == output + fee with a
+// fee in (0, kMaxRelayFeePerByte x the worst-case signed size for this key] and,
+// after signing, at least kMinRelayFeePerByte x the actual signed size.
 std::vector<SignedTx> sign_sweep(const SweepBatchPlan& plan, const FoundKey& key,
                                  bool confirm_spend);
 

@@ -259,6 +259,14 @@ C2P_PARAM("coin_p2p.doge_port", CoinP2P, INT64, RESTART, C_LTC|C_DOGE|C_DGB, LIT
 C2P_PARAM("coin_p2p.address", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "coind P2P address")
   C2P_ALIAS("coin_p2p.address", BIN_LTC, "--coind-p2p-address", VALUE)
 
+// Core's -connect for the embedded coin P2P: these peers and no other (no
+// peer DB, DNS / fixed / HTTP seeds, getpeerinfo or addr gossip). Repeatable.
+C2P_PARAM("coin_p2p.ltc_connect", CoinP2P, STRING, RESTART, C_LTC, LIT, "", NONE, "dial only this LTC peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.ltc_connect", BIN_LTC, "--ltc-connect", VALUE)
+
+C2P_PARAM("coin_p2p.doge_connect", CoinP2P, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "dial only this DOGE peer IP[:PORT] (repeatable; Core -connect; no names)")
+  C2P_ALIAS("coin_p2p.doge_connect", BIN_LTC, "--doge-connect", VALUE)
+
 C2P_PARAM("coin_p2p.port", CoinP2P, INT64, RESTART, C_LTC|C_DGB, LIT, "-1", NONE, "coind P2P port (-1 auto,0 off)")
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--coind-p2p-port", VALUE)
   C2P_ALIAS("coin_p2p.port", BIN_LTC, "--bitcoind-p2p-port", VALUE)
@@ -495,6 +503,27 @@ C2P_PARAM("embedded.header_checkpoint", Embedded, STRING, RESTART, C_LTC, LIT, "
 C2P_PARAM("embedded.doge_header_checkpoint", Embedded, STRING, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "DOGE header checkpoint H:HASH")
   C2P_ALIAS("embedded.doge_header_checkpoint", BIN_LTC, "--doge-header-checkpoint", VALUE)
 
+// The full DOGE UTXO set (built from genesis; prices the DOGE template once
+// complete). Off keeps the accrual view only (the rollback).
+C2P_PARAM("embedded.doge_utxo_full", Embedded, TRISTATE_BOOL, RESTART, C_LTC|C_DOGE, NONE, "", NONE, "embedded DOGE full UTXO set built from genesis (default on)")
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--doge-utxo-full", FLAG)
+  C2P_ALIAS("embedded.doge_utxo_full", BIN_LTC, "--no-doge-utxo-full", FLAG_NO_PREFIX)
+
+C2P_PARAM("embedded.doge_utxo_full_dir", Embedded, PATH, RESTART, C_LTC|C_DOGE, LIT, "", NONE, "the full DOGE UTXO set's LevelDB (default <data-dir>/dogecoin/utxo_full_leveldb)")
+  C2P_ALIAS("embedded.doge_utxo_full_dir", BIN_LTC, "--doge-utxo-full-dir", VALUE)
+
+// One-shot LevelDB tools: run, print, exit; no node starts. Compile-time
+// readonly like the other print-and-exit rows (refused in a settings file,
+// never mirrored into the resolved config).
+C2P_PARAM("utility.dump_doge_schedule_anchors", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "write the DOGE hash schedule's anchors from the header LevelDB DIR (to OUT, else stdout), then exit")
+  C2P_ALIAS("utility.dump_doge_schedule_anchors", BIN_LTC, "--dump-doge-schedule-anchors", VALUE)
+
+C2P_PARAM("utility.utxo_digest", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print the digest of the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_digest", BIN_LTC, "--utxo-digest", VALUE)
+
+C2P_PARAM("utility.utxo_stats", Meta, PATH, COMPILE_TIME_READONLY, C_LTC|C_DOGE, LIT, "", NONE, "print gettxoutsetinfo (Dogecoin Core 1.14.9 GetUTXOStats) for the UTXO LevelDB at DIR, then exit")
+  C2P_ALIAS("utility.utxo_stats", BIN_LTC, "--utxo-stats", VALUE)
+
 C2P_PARAM("embedded.ltc_cmpct_v3", Embedded, TRISTATE_BOOL, RESTART, C_LTC, NONE, "", NONE, "ask LTC MWEB peers for v3 compact blocks (default on)")
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--ltc-cmpct-v3", FLAG)
   C2P_ALIAS("embedded.ltc_cmpct_v3", BIN_LTC, "--no-ltc-cmpct-v3", FLAG_NO_PREFIX)
@@ -523,6 +552,17 @@ C2P_PARAM("embedded.utxo", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, 
 
 C2P_PARAM("embedded.utxo_immature_serve_empty", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "serve coinbase-only until mature")
   C2P_ALIAS("embedded.utxo_immature_serve_empty", BIN_DASH, "--embedded-utxo-immature-serve-empty", FLAG)
+
+// S2: the DASH full UTXO set from a pinned dumptxoutset snapshot. RESTART: the
+// import runs at start into <net>/utxo_full_leveldb (a present set is never
+// re-imported); the pin is the built-in .inc unless a pin file is given.
+C2P_PARAM("embedded.utxo_snapshot", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import this pinned dumptxoutset snapshot into the full UTXO set at start (comma-separated parts)")
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--embedded-utxo-snapshot", VALUE)
+  C2P_ALIAS("embedded.utxo_snapshot", BIN_DASH, "--utxo-snapshot", VALUE)
+C2P_PARAM("embedded.utxo_snapshot_pin", Embedded, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: digest-gated pin file for a snapshot newer than the built-in pin")
+  C2P_ALIAS("embedded.utxo_snapshot_pin", BIN_DASH, "--embedded-utxo-snapshot-pin", VALUE)
+C2P_PARAM("replay.utxo_import", Replay, PATH, RESTART, C_DASH, LIT, "", NONE, "S2: import a pinned dumptxoutset snapshot into <datadir>/<net>/utxo_full_leveldb and exit (beside a running node)")
+  C2P_ALIAS("replay.utxo_import", BIN_DASH, "--utxo-import", VALUE)
 
 C2P_PARAM("embedded.superblock", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "daemonless superblock payee sourcing")
   C2P_ALIAS("embedded.superblock", BIN_DASH, "--embedded-superblock", FLAG)

@@ -50,20 +50,65 @@ v36 network has no public peers.
 
 ## Governance
 
-Daemonless-Dash finalization has a funding proposal in Dash on-chain governance.
-The c2pool-daemonless-finalize proposal is in its voting phase; masternode
-operators can vote on it before the next superblock.
+Daemonless-Dash finalization has a funding proposal in Dash on-chain governance:
+c2pool-daemonless-delivered, 252 DASH, paid once at superblock 2575480 (around
+2026-11-20). The voting cutoff is around 2026-11-17.
 
-- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-finalize
-- Governance object: fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631
+- DashCentral: https://www.dashcentral.org/p/c2pool-daemonless-delivered
+- Governance object: c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247
+- Collateral: 639a53cfa9f19f16414a9dd679ebfdc930633e18eedd8cd5f06ff4a90925b705, mined
+  in block 2565421 by this pool through runtime transaction injection (below)
 - Vote from a masternode:
 
   ```
-  dash-cli gobject vote-many fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631 funding yes
+  dash-cli gobject vote-many c7b462b7c8d81df10ce34ebd4436afd715f288c25a7c949835f889015248b247 funding yes
   ```
 
 Funding requires net yes votes equal to 10 percent of enabled masternodes by the
-next superblock.
+superblock.
+
+The earlier proposal, c2pool-daemonless-finalize
+(fa758340f1bd2391d17bb43667f76c5d9070d737b68e018e42ed75b09c6ba631, 2 x 125.5 DASH),
+reached the threshold only after the last superblock inside its window (2558864)
+had passed. Its window ends on 2026-11-04, before superblock 2575480, so it will
+never be paid. The new amount is its 251 DASH plus the 1 DASH collateral it burned.
+Votes do not carry over to the new hash.
+
+## Runtime transaction injection and the offline signer
+
+A running c2pool-dash node can carry an already-signed transaction in its own block
+template, with no restart. This includes zero-fee transactions that ordinary nodes do
+not relay. The node never holds keys; transactions are signed on an offline machine.
+
+- **Control plane.** Start the node once with `--control-plane-token-file FILE`
+  (mode 0600, owned by the node user, 32 to 128 printable characters). Without it
+  `/api/config/apply` answers `503 {"armed":false}` and `/api/tx-inject/submit` refuses
+  with 403.
+- **Arm at runtime.** `POST /api/config/apply` with `embedded.tx_inject=true`. This is a
+  money-path key, so it needs the control token plus a two-phase nonce bound to the
+  exact change. `--embedded-tx-inject` arms it at start-up instead and survives
+  restarts.
+- **Submit.** `POST /api/tx-inject/submit` with `{"control_token": ..., "raw_tx": ...}`.
+  Status: `GET /api/tx-inject-status`. All three endpoints answer only direct loopback
+  requests; forwarded requests are refused. A remote node is reached through an SSH
+  port-forward.
+- **What to expect.** A transaction without an InstantSend lock waits 10 minutes before
+  it is selected (the same rule as Dash Core), then rides every template until the pool
+  finds a block. A coinbase input must be mature in the block being built.
+- **Examples on mainnet.** Block 2565253 carries a zero-fee consolidation of 189 outputs
+  (539aa4b7aeceeb17c302cd51f402f3371f527ef73178466b5e3c2f80b9b40a28). Block 2565421
+  carries the collateral of the proposal above.
+
+Tools in this repository, under `ui/c2wallet-qt/` (see its README):
+
+- **c2wallet-qt-signer**, the air-gapped signer. It is built with no network code, and
+  a link guard checks this. It builds and signs zero-fee consolidations and governance
+  collaterals (PageDashInject) and exports the signed hex. A Sign / Verify Message page
+  at Dash Core parity is in review (#2127).
+- **The inject scheduler** in the key-free companion. It queues signed transactions and
+  submits them when their inputs mature, at a height or time, or after a parent
+  transaction is ChainLocked. The core is merged (#2120). The headless daemon
+  `c2wallet-qt-schedd` is in review (#2123).
 
 ## Daemonless BIP-110
 
@@ -252,8 +297,8 @@ and does not yet exist, so the work can be judged on what it actually is.
   the Linux x86_64 and ASan/UBSan legs and the other CI lanes are not required
   checks; the CI badge above shows the state of the latest master run. The
   RandomX-dependent XMR checks run CI-gated in light mode, and the CodeQL
-  security scan is a non-gating job. Three v37 relay KATs have known timing
-  flakes (#1885, #1889, #1890) and are retried up to 3 times; CI reports every
+  security scan is a non-gating job. Two v37 relay KATs have known timing
+  flakes (#1885, #1890) and are retried up to 3 times; CI reports every
   retry as a warning. `v37_convergence_soak` is an undiagnosed safety pin
   (#1905) and is not retried.
 
@@ -912,7 +957,8 @@ dashd-attached default OFF)
 
 | Flag | Meaning |
 |------|---------|
-| `--embedded-tx-inject`, `--embedded-tx-inject-hex FILE` | Opt-in miner/user tx injection (#157), default OFF. |
+| `--embedded-tx-inject`, `--embedded-tx-inject-hex FILE` | Opt-in miner/user tx injection (#157), default OFF. Runtime arming and submit: see *Runtime transaction injection* above. |
+| `--control-plane-token-file FILE` | Registers the loopback control token (0600, owner-only, 32-128 chars) that unlocks `/api/config/apply` and `/api/tx-inject/submit`. Absent: apply answers 503, submit 403. |
 | `--pin-local-tx-hex FILE`, `--pin-splice-xcheck-arm`, `--pin-splice-block-budget` | Pin a zero-fee self-mined tx (e.g. donation consolidation) into served templates; splice policy knobs default OFF. |
 | `--replay-bulk`, `--replay-bulk-capture DIR`, `--replay-bulk-start H` | Full-history bulk block-fetch lane from DIP3 (1028160); capture caches bodies. |
 | `--replay-fold-prestate FILE`, `--replay-fold-quorums`, `--replay-fold-qsnapshot FILE`, `--replay-fold-worklists FILE` | Anchor-seeded DML fold driven by the bulk lane, with derived quorum member sets. |

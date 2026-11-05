@@ -760,15 +760,20 @@ if (BUILD_TESTING AND GTest_FOUND)
         test_dash_tx_inject.cpp           # #157: miner/user tx-injection (priority + validity + DoS)
         test_dash_fold_fee_source.cpp     # W5-A: fold-backed fee pricing source
         test_dash_tx_version_rules.cpp    # Dash Core v23.1.9 A: negative nVersion + payload-gate parity (vs the vendored dashd codec)
-        test_dash_protx_mempool_eviction.cpp)  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
+        test_dash_protx_mempool_eviction.cpp  # Dash Core v23.1.8 B.8: block-connect ProTx eviction
+        test_dash_utxo_full.cpp           # S2: full UTXO set from a pinned snapshot (lane, open rule, pin, status)
+        test_dash_utxo_scan.cpp)          # N1: GET /api/utxo/scan over the full set (rows, posture, tip moved, mempool)
     target_link_libraries(test_dash_mempool PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_x11 core core_utxo
         dash_scriptcheck ${SECP256K1_LIBRARIES}   # PR-C4: dashcore VerifyScript .so + secp256k1 (KAT signs a real P2PKH spend)
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )
     target_link_libraries(test_dash_mempool PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # N1 K9: the tenant payout address's real getaddressutxos capture (170 rows).
+    target_compile_definitions(test_dash_mempool PRIVATE
+        XDGF_GETADDRESSUTXOS_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../ui/c2wallet-qt/src/family/bitcoin/dash/tests/fixtures/xdgf-getaddressutxos-tip2563986.json")
     gtest_add_tests(test_dash_mempool "" AUTO)
 
     # DASH SimplifiedMNList (DIP-0004, S7 leaf): vendored CSimplifiedMNListEntry /

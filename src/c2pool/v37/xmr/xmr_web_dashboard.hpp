@@ -65,6 +65,7 @@ struct XmrWebPathb {
     std::uint32_t epoch_cur = 0;
     std::uint64_t h_hold = 0;
     std::string   window_root_hex, mmr_root_hex;
+    std::string   roots_tip_hex;          // the current template's tip: window_root and mmr_root are its ("": none)
     std::uint64_t leaf_count = 0;
     std::uint64_t pending = 0, deferred = 0;
     std::vector<std::string> pending_ids;  // the first 64 pending receipt ids, 12 hex digits each
