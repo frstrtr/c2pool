@@ -4173,16 +4173,17 @@ int main(int argc, char* argv[]) {
                 // full_block callback above — same as Litecoin Core, which
                 // runs removeForBlock() identically for both normal advances
                 // and reorgs (no clear()).
-                // Admission's finality check (Mempool::set_lock_time_cutoff):
-                // the next block after the header tip, set now and on every
-                // tip change below.
+                // Admission's finality and BIP68 checks
+                // (Mempool::set_lock_time_cutoff): the next block after the
+                // header tip, set now and on every tip change below.
                 auto set_ltc_lock_time_cutoff = [](ltc::coin::Mempool* pool, const ltc::coin::HeaderChain* chain,
                                                    const uint256& tip_hash) {
                     if (!pool || !chain)
                         return;
                     if (auto e = chain->get_header(tip_hash))
                         pool->set_lock_time_cutoff(
-                            e->height + 1, ltc::coin::TemplateBuilder::median_time_past(*chain, *e));
+                            e->height + 1, ltc::coin::TemplateBuilder::median_time_past(*chain, *e),
+                            [chain](uint32_t h) { return ltc::coin::TemplateBuilder::median_time_past_at(*chain, h); });
                 };
                 if (auto t = embedded_chain->tip())
                     set_ltc_lock_time_cutoff(embedded_pool.get(), embedded_chain.get(), t->block_hash);

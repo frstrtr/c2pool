@@ -196,6 +196,57 @@ public:
         return times[times.size() / 2];
     }
 
+    /// The median time past of the best chain's block at height `h`, for
+    /// BIP68's coin times (LockTimeCutoff::mtp_at): exact when the 11 blocks
+    /// ending at `h` are known, or the chain's history from genesis is. Below
+    /// that (a fast-start checkpoint is a root without history) the first
+    /// exact value above `h`, which is no lower: each block's time is above
+    /// its parent's median time past, so the median never decreases along a
+    /// chain. nullopt when the chain holds no block at or above `h`.
+    static std::optional<int64_t> median_time_past_at(const HeaderChain& chain, uint32_t h)
+    {
+        auto exact = [&chain](uint32_t height) -> std::optional<int64_t> {
+            std::optional<IndexEntry> cur = chain.get_header_by_height(height);
+            if (!cur)
+                return std::nullopt;
+            std::vector<int64_t> times;
+            times.reserve(11);
+            for (;;) {
+                // A root above genesis (a fast-start checkpoint): its header
+                // and history are not known.
+                if (cur->height != 0 && cur->prev_hash.IsNull())
+                    return std::nullopt;
+                times.push_back(static_cast<int64_t>(cur->header.m_timestamp));
+                if (times.size() == 11 || cur->height == 0)
+                    break;
+                cur = chain.get_header(cur->prev_hash);
+                if (!cur)
+                    return std::nullopt;
+            }
+            std::sort(times.begin(), times.end());
+            return times[times.size() / 2];
+        };
+        if (auto m = exact(h))
+            return m;
+        const auto tip = chain.tip();
+        if (!tip || tip->height < h)
+            return std::nullopt;
+        // The lowest height at or above h the best chain holds (its heights
+        // run from its root to the tip), then the first exact value from it.
+        uint32_t lo = h, hi = tip->height;
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            if (chain.get_header_by_height(mid))
+                hi = mid;
+            else
+                lo = mid + 1;
+        }
+        for (uint32_t k = lo; k <= tip->height && k - lo <= 11; ++k)  // a root's first exact value is 11 above it
+            if (auto m = exact(k))
+                return m;
+        return std::nullopt;
+    }
+
     /// Build a WorkData template from the current chain tip + mempool.
     /// When mweb_tracker is provided and has state, the template includes
     /// a HogEx transaction (last tx) and MWEB block data.
@@ -385,6 +436,39 @@ public:
                     why = mweb_ext::check_extension(
                         *cur.bundle, *mweb_state, tip.block_hash, tip.height, static_cast<int64_t>(subsidy),
                         coin_of);
+                // BIP68 in the template's block, as for the pool's txs (on a
+                // chain that enforces it, Mempool::bip68): an imported tx's
+                // input from the view counts at its coin's height, one from an
+                // earlier imported tx at the template's (litecoind
+                // ConnectBlock's SequenceLocks). A lock the block does not
+                // satisfy falls back.
+                if (!why && pool.bip68()) {
+                    const LockTimeCutoff block{next_h, mtp, [&chain](uint32_t h) {
+                        return median_time_past_at(chain, h);
+                    }};
+                    std::set<uint256> earlier;
+                    for (const auto& t : cur.bundle->txs) {
+                        if (has_sequence_locks(t.tx)) {
+                            const auto l = calculate_sequence_locks(t.tx, [&](size_t i) -> std::optional<uint32_t> {
+                                const auto& op = t.tx.vin[i].prevout;
+                                if (earlier.count(op.hash))
+                                    return next_h;
+                                core::coin::Coin c;
+                                if (coin_of && coin_of(mweb_ext::Outpoint{op.hash, op.index}, c))
+                                    return c.height;
+                                return std::nullopt;
+                            }, block);
+                            if (!l || !evaluate_sequence_locks(block, *l)) {
+                                why = mweb_ext::Failure{mweb_ext::kImportedNonBip68Final,
+                                                        "entry " + std::to_string(t.g_index)
+                                                        + ": relative lock-times not satisfied at h="
+                                                        + std::to_string(next_h)};
+                                break;
+                            }
+                        }
+                        earlier.insert(t.txid);
+                    }
+                }
                 // The imported txs and litecoind's HogEx count against the
                 // block's sigop limit with the coinbase: imports that alone
                 // pass it fall back.
@@ -412,7 +496,8 @@ public:
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         // Only txs final in this block and spendable in it: IsFinalTx and
         // coinbase maturity at next_h, the lock time against the tip's median
-        // time past (litecoind BlockAssembler's nLockTimeCutoff).
+        // time past (litecoind BlockAssembler's nLockTimeCutoff), and BIP68's
+        // relative lock-times at next_h and that median time past.
         // The HogEx appended below spends the tip's HogEx output 0 (its
         // vin[0]): the selection starts with that outpoint spent, so no pool
         // tx spends it too (bad-txns-inputs-missingorspent).
@@ -437,7 +522,9 @@ public:
             select_weight = w < max_weight ? static_cast<uint32_t>(max_weight - w) : 0;
         }
         auto [selected_txs, total_fees] = degraded == nullptr
-            ? pool.get_sorted_txs_with_fees(select_weight, LockTimeCutoff{next_h, mtp}, &seed)
+            ? pool.get_sorted_txs_with_fees(select_weight, LockTimeCutoff{next_h, mtp, [&chain](uint32_t h) {
+                  return median_time_past_at(chain, h);
+              }}, &seed)
             : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees

@@ -703,3 +703,35 @@ TEST(LtcTemplateMwebExtMerge, ImportedSigopsCountAgainstTheBudget)
         EXPECT_LE(used, 80'000);
     }
 }
+
+// BIP68 applies to litecoind's imported txs as to the pool's: the peg-in
+// spends P, an earlier imported tx, so its coin counts at the template's
+// height (3200605) and only a zero relative lock passes; a lock of one
+// block falls back to the empty-body template.
+TEST(LtcTemplateMwebExtMerge, ImportedTxsPassBip68AtTheTemplateHeight)
+{
+    for (const uint32_t seq : {0u, 1u}) {
+        Tip t;
+        LitecoindG g;
+        fill(t, g);
+        ASSERT_EQ(g.pegin.version, 2);
+        g.pegin.vin[0].sequence = seq;  // a height lock of `seq` blocks on P's output
+        g.hogex.vin[1].prevout.hash = compute_txid(g.pegin);
+        mx::MwebExtSource src("litecoind");
+        auto parsed = mx::parse_extension(g.json());
+        ASSERT_TRUE(parsed.bundle) << parsed.reason;
+        src.set_parsed(std::move(parsed), mx::MwebExtSource::clock::now());
+        auto with = t.build(&src);
+        auto without = t.build(nullptr);
+        ASSERT_TRUE(with && without);
+        if (seq == 0) {
+            EXPECT_EQ(src.templates_imported(), 1u) << "a zero lock";
+            const auto ids = txids_of(*with);
+            EXPECT_NE(std::find(ids.begin(), ids.end(), compute_txid(g.pegin).GetHex()), ids.end());
+        } else {
+            EXPECT_EQ(src.templates_imported(), 0u);
+            EXPECT_EQ(src.fallback_count(mx::kImportedNonBip68Final), 1u);
+            EXPECT_EQ(template_dump(*with), template_dump(*without)) << "the empty-body template";
+        }
+    }
+}

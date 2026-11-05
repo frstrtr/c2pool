@@ -253,6 +253,15 @@ if (BUILD_TESTING AND GTest_FOUND)
     # moves exactly when a tx is priced (the tx-triggered refresh). Same
     # folding rule.
     #
+    # mempool_bip68_test.cpp: BIP68 relative lock-times (Litecoin Core
+    # CalculateSequenceLocks / EvaluateSequenceLocks / CheckSequenceLocks,
+    # #2138): the lock pair at its height and 512 s boundaries, the disable
+    # flag, version 1; admission refuses non_bip68_final at the next block
+    # (an in-pool parent at its height); the REAL TemplateBuilder selects at
+    # its own height and its parent's MTP and re-evaluates on the next tip;
+    # none on DOGE (its CSV deployment never activated); the median time
+    # past by height after a fast-start checkpoint. Same folding rule.
+    #
     # utxo_view_stats_test.cpp: /local_stats ltc_utxo (#2137): the anchor,
     # depth and completeness of the UTXO view the template prices against
     # (sync state, else the anchor this process observed, else unknown) and
@@ -332,6 +341,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         legacy_addrme_self_probe_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
+        mempool_bip68_test.cpp
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
         merged_found_record_test.cpp

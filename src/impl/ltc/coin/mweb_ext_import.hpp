@@ -124,6 +124,9 @@ inline constexpr const char* kImportedInputHogaddr = "imported-input-hogaddr";
 inline constexpr const char* kImportedInputsBelowOutputs = "imported-inputs-below-outputs";
 inline constexpr const char* kImportedFeeMismatch = "imported-fee-mismatch";
 inline constexpr const char* kImportedSigopsOverLimit = "imported-sigops-over-limit";
+// An imported tx's relative lock-times (BIP68) are not satisfied in the
+// template's block (TemplateBuilder, as the pool's txs).
+inline constexpr const char* kImportedNonBip68Final = "imported-non-bip68-final";
 inline constexpr const char* kCarriedStateMismatch = "carried-state-mismatch";
 inline constexpr const char* kTxoCountMismatch = "txo-count-mismatch";
 // The merged template failed core::coin::check_template_txs / fee-reconcile

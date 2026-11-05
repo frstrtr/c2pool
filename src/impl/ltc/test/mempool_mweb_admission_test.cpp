@@ -272,6 +272,24 @@ TEST(LtcMempoolMwebAdmission, EveryRefusalCode)
         pool.set_lock_time_cutoff(0, 0);
     }
 
+    // Relative lock-times the next block does not satisfy (CheckSequenceLocks):
+    // a height lock of 2 on a coin at the tip's height.
+    {
+        core::coin::UTXOViewCache view(nullptr);
+        core::coin::Coin coin;
+        coin.value = 5000;
+        coin.scriptPubKey.m_data = {0x51};
+        coin.height = 1000;
+        MutableTransaction locked = pay(0x0b, 1000);
+        locked.vin[0].sequence = 2;
+        view.add_coin(core::coin::Outpoint(locked.vin[0].prevout.hash, 0), coin);
+        pool.set_lock_time_cutoff(1001, 1'600'000'000);
+        r = pool.admit(locked, &view);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(r->code, Code::non_bip68_final);
+        pool.set_lock_time_cutoff(0, 0);
+    }
+
     // The rules key on MWEB data only: an ordinary legacy tx (any coin
     // sharing this pool, e.g. DOGE) is admitted as before.
     MutableTransaction legacy = pay(0x07, 5000, {0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
