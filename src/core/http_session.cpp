@@ -649,6 +649,36 @@ void HttpSession::process_request()
                 }
                 rest_result = build_tx_inject_status_json();
             }
+            else if (target == "/api/utxo/scan") {
+                // c2wallet Scan & Plan (N1): read-only scan of the full UTXO
+                // set for a few scripts. Direct-local only: a loopback peer
+                // with no forwarded header, so a same-host reverse proxy
+                // (whose requests come from 127.0.0.1) never reaches it. The
+                // scan runs on the MiningInterface's scan thread; this thread
+                // waits for it (bounded, rest_utxo_scan).
+                auto answer = [&](int status, const nlohmann::json& j) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = j.dump();
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, {{"ok", false}, {"error", "utxo-scan-local-only"}});
+                    return;
+                }
+                if (!mining_interface_->has_utxo_scan_fn()) {
+                    answer(404, {{"ok", false}, {"error", "utxo-scan-not-wired"}});
+                    return;
+                }
+                const auto qp = raw_target.find('?');
+                auto j = mining_interface_->rest_utxo_scan(
+                    qp == std::string::npos ? std::string() : raw_target.substr(qp + 1));
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j);
+                return;
+            }
             else if (target == "/api/tx-inject/ledger") {
                 // Read-only per-inject ledger (S4). Loopback-only, same posture
                 // as /api/tx-inject-status: it names the txids this node is
@@ -1395,6 +1425,54 @@ void HttpSession::process_request()
                 response.body() = j.dump();
                 response.prepare_payload();
                 send_response(std::move(response));
+                return;
+            }
+            // ── c2wallet Scan & Plan (N3): POST /api/tx-inject/validate ──────
+            // The dry run of /api/tx-inject/submit: the same body, the same
+            // direct-local and control-token rules, the same io-thread
+            // dispatch; NodeCoinState::validate_inject answers the submit's
+            // verdict plus per-input maturity and pool conflicts, and changes
+            // nothing (no admission, no rate charge, no fee delta). A dispatch
+            // timeout is a plain 504: a dry run has nothing to take back.
+            if (std::string(request_.target()) == "/api/tx-inject/validate") {
+                auto answer = [&](int status, const std::string& body) {
+                    response.result(static_cast<http::status>(status));
+                    response.body() = body;
+                    response.prepare_payload();
+                    send_response(std::move(response));
+                };
+                if (!is_direct_local()) {
+                    answer(403, R"({"error":"tx-inject API is local-only"})");
+                    return;
+                }
+                if (!mining_interface_->has_tx_inject_validate_fn()) {
+                    answer(503, R"({"ok":false,"error":"tx-inject validate not wired"})");
+                    return;
+                }
+                {
+                    std::string presented;
+                    auto body_j = nlohmann::json::parse(request_.body(), nullptr,
+                                                        /*allow_exceptions=*/false);
+                    if (body_j.is_object() && body_j.contains("control_token") &&
+                        body_j["control_token"].is_string())
+                        presented = body_j["control_token"].get<std::string>();
+                    if (!c2pool::config_endpoint::check_control_token(presented)) {
+                        answer(403, R"({"ok":false,"cause":"missing or invalid control token"})");
+                        return;
+                    }
+                }
+                nlohmann::json j;
+                try {
+                    j = mining_interface_->rest_tx_inject_validate(request_.body());
+                } catch (const std::exception& e) {
+                    LOG_WARNING << "[tx-inject] validate dispatch failed: " << e.what();
+                    answer(504, R"({"ok":false,"timed_out":true,"cause":"validate dispatch timed out"})");
+                    return;
+                }
+                int st = j.is_object() ? j.value("http_status", 200) : 200;
+                if (st < 100 || st > 599) st = 200;
+                if (j.is_object()) j.erase("http_status");
+                answer(st, j.dump());
                 return;
             }
             // Handle JSON-RPC POST request.

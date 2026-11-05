@@ -30,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace core {
@@ -164,6 +165,16 @@ public:
     /// One raw record (false: absent).
     bool get_record(const std::string& key, std::vector<uint8_t>& value) {
         return m_store.get(key, value);
+    }
+
+    /// A read view of the store at one instant (LevelDBStore::snapshot).
+    LevelDBStore::Snapshot snapshot() { return m_store.snapshot(); }
+
+    /// The raw records under `prefix` as `at` holds them, in key order, the
+    /// bytes in place (false: scan error).
+    bool for_each_record_at(const LevelDBStore::Snapshot& at, const std::string& prefix,
+                            const std::function<bool(std::string_view, std::string_view)>& fn) {
+        return m_store.for_each_prefix_at(at, prefix, fn);
     }
 
     // ── Batch write (atomic block connection) ───────────────────────────
