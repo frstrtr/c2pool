@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <deque>
 #include <chrono>
 #include <future>
@@ -674,6 +675,40 @@ public:
     bool has_tx_inject_submit_fn() const { return static_cast<bool>(m_tx_inject_submit_fn); }
     nlohmann::json rest_tx_inject_submit(const std::string& body);  // POST /api/tx-inject/submit
 
+    // POST /api/tx-inject/validate (c2wallet Scan & Plan, N3): the dry run of
+    // the submit — same body, same control-token rule, same io-thread
+    // marshalling (thread_safe_wrap) — answered without admitting anything
+    // (NodeCoinState::validate_inject). UNWIRED by default: 503.
+    using tx_inject_validate_fn_t = std::function<nlohmann::json(const std::string& body)>;
+    void set_tx_inject_validate_fn(tx_inject_validate_fn_t fn) { m_tx_inject_validate_fn = thread_safe_wrap(std::move(fn)); }
+    bool has_tx_inject_validate_fn() const { return static_cast<bool>(m_tx_inject_validate_fn); }
+    nlohmann::json rest_tx_inject_validate(const std::string& body);  // POST /api/tx-inject/validate
+
+    // GET /api/utxo/scan (c2wallet Scan & Plan, N1): a read-only scan of the
+    // coin's full UTXO set for a few scripts. The fn takes the raw query
+    // string and answers the reply JSON with an "http_status" hint; `cancel`
+    // turns true when the scan must stop (shutdown). It runs on a DEDICATED
+    // scan thread owned here — never on the node io thread (a multi-second
+    // pass there would delay block connection and template serving) and
+    // never through thread_safe_wrap (its 10 s dispatch timeout cannot carry
+    // a multi-million-row pass). rest_utxo_scan waits for it up to the scan
+    // timeout (120 s, then 504 utxo-scan-timeout; the pass still finishes and
+    // its result is dropped). One scan at a time (409 utxo-scan-busy) and one
+    // started per kUtxoScanMinInterval (429 utxo-scan-rate); a reply without
+    // "scanned" (refused before the pass: bad request, set not serving) does
+    // not use the interval. UNWIRED by default: the route answers 404.
+    using utxo_scan_fn_t = std::function<nlohmann::json(const std::string& query,
+                                                        const std::atomic<bool>& cancel)>;
+    static constexpr std::chrono::seconds kUtxoScanMinInterval{10};
+    void set_utxo_scan_fn(utxo_scan_fn_t fn);
+    bool has_utxo_scan_fn() const;
+    nlohmann::json rest_utxo_scan(const std::string& query);   // GET /api/utxo/scan
+    /// Refuse new scans, cancel a running one and join the scan thread
+    /// (idempotent; the destructor calls it).
+    void stop_utxo_scan();
+    /// The wait cap of rest_utxo_scan (tests shorten it).
+    void set_utxo_scan_timeout(std::chrono::milliseconds t);
+
     // Sharechain stats callback — returns live tracker data for the /sharechain/stats endpoint
     using sharechain_stats_fn_t = std::function<nlohmann::json()>;
     void set_sharechain_stats_fn(sharechain_stats_fn_t fn) { m_sharechain_stats_fn = thread_safe_wrap(std::move(fn)); }
@@ -959,6 +994,30 @@ public:
     static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
     uint32_t coinbase_weight_reserve() const;
     static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
+
+    // Sigop budget (LTC): the legacy sigops (GetLegacySigOpCount; a coinbase
+    // has no other kind) the template's coinbase can carry -- the bound
+    // (coinbase_sigop_bound) of the largest coinbase built for the current
+    // template plus kCoinbaseSigopMargin for a few new payees; before the
+    // first coinbase, one per output max_coinbase_outputs allows plus the
+    // scriptSig's worst case. The embedded template builder keeps the block's
+    // sigop cost within the limit with this reserved.
+    static constexpr uint32_t kCoinbaseSigopMargin = 20;
+    // The per-connection coinbase's scriptSig ends with the 32-byte state
+    // root, not pushed: its bytes parse as opcodes and change with every
+    // template.
+    static constexpr size_t kCoinbaseRawScriptSigTail = 32;
+    uint32_t coinbase_sigop_reserve() const;
+    /// The legacy sigops of coinb1 | extranonce1 | extranonce2 | coinb2
+    /// (the extranonces, 8 bytes in the OP_RETURN push, as zeros: no
+    /// opcode); nullopt when that does not parse as a transaction.
+    static std::optional<uint32_t> coinbase_sigops(const std::string& coinb1, const std::string& coinb2);
+    /// The same with the state root at its worst case, 20 per byte: an upper
+    /// bound for this coinbase whatever its root. With has_state_root the
+    /// scriptSig's last 32 bytes are the root; without (the template's own
+    /// coinbase) the 32 x 20 are added for the root its connections append.
+    static std::optional<uint32_t> coinbase_sigop_bound(const std::string& coinb1, const std::string& coinb2,
+                                                        bool has_state_root);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -1521,9 +1580,11 @@ private:
     void note_mweb_degraded_template(const std::string& why);
     void note_mweb_template_accepted();
     // A coinbase was built (refresh_work: fresh_template; per connection:
-    // raises the mark): records its weight for coinbase_weight_reserve().
+    // raises the mark): records its weight for coinbase_weight_reserve() and
+    // its sigop bound for coinbase_sigop_reserve(); has_state_root when the
+    // scriptSig ends with the root.
     void note_coinbase_built(const std::string& coinb1, const std::string& coinb2, bool segwit,
-                             size_t branch_len, bool fresh_template) const;
+                             size_t branch_len, bool fresh_template, bool has_state_root) const;
     void close_mweb_hold_window(const char* reason);
     // Template-tx check bookkeeping: count `code` (ingress), one ERROR per
     // (height, code).
@@ -1673,6 +1734,23 @@ private:
     config_json_fn_t m_config_schema_fn;  // GET /api/config/schema — catalog schema (optional)
     config_apply_fn_t m_config_apply_fn;  // POST /api/config/apply — Slice A gated apply (optional; unwired => 503)
     tx_inject_submit_fn_t m_tx_inject_submit_fn;  // POST /api/tx-inject/submit — Slice B raw-tx submit (optional; unwired => 503)
+    tx_inject_validate_fn_t m_tx_inject_validate_fn;  // POST /api/tx-inject/validate — N3 dry run (optional; unwired => 503)
+    // GET /api/utxo/scan: the scan fn, its thread and the one job slot.
+    struct UtxoScanJob {
+        std::string query;
+        std::shared_ptr<std::promise<nlohmann::json>> done;
+    };
+    void utxo_scan_worker();
+    mutable std::mutex                          m_utxo_scan_mu;
+    std::condition_variable                     m_utxo_scan_cv;
+    utxo_scan_fn_t                              m_utxo_scan_fn;
+    std::optional<UtxoScanJob>                  m_utxo_scan_job;
+    bool                                        m_utxo_scan_busy{false};
+    bool                                        m_utxo_scan_stopping{false};
+    std::atomic<bool>                           m_utxo_scan_cancel{false};
+    std::optional<std::chrono::steady_clock::time_point> m_utxo_scan_last_start;
+    std::chrono::milliseconds                   m_utxo_scan_timeout{std::chrono::seconds(120)};
+    std::thread                                 m_utxo_scan_thread;
     // Rate limiter for /api/coin_peers: IP → last request time
     std::map<std::string, std::chrono::steady_clock::time_point> m_coin_peers_rate_limit;
     sharechain_window_fn_t m_sharechain_window_fn;
@@ -1805,6 +1883,8 @@ private:
     // and the per-connection ones built on it): the next template leaves room
     // for it (coinbase_weight_reserve). 0 = none built yet.
     mutable std::atomic<uint32_t> m_coinbase_weight{0};
+    mutable std::atomic<uint32_t> m_coinbase_sigops{0};
+    mutable std::atomic<bool>     m_coinbase_sigops_known{false};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;

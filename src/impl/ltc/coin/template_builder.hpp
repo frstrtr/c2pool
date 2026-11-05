@@ -164,6 +164,10 @@ public:
     static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;   // weight reserved for coinbase tx
+    // Sigop cost reserved for the coinbase when the caller does not know it
+    // (EmbeddedCoinNode passes the built coinbase's own): 4,200 legacy
+    // sigops -- 4,000 P2PKH payees and a margin -- at Litecoin's scale.
+    static constexpr int64_t  COINBASE_SIGOP_RESERVE = 4'200 * 4;
 
     // ── Underfill guard (v36 cutover deploy path) ──────────────────────────
     // Detects the "near-empty template on a non-empty mempool" regression:
@@ -224,7 +228,8 @@ public:
         const MWEBTracker* mweb_tracker = nullptr,
         uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
         std::optional<rpc::WorkData>* refused = nullptr,
-        bool               template_tx_check_strict = true)
+        bool               template_tx_check_strict = true,
+        int64_t            coinbase_sigop_cost = COINBASE_SIGOP_RESERVE)
     {
         (void)is_testnet;  // reserved for future per-network rules
         auto t0 = std::chrono::steady_clock::now();
@@ -308,12 +313,41 @@ public:
             }
         }
 
+        // ── The tip's MWEB state (the HogEx spends the tip's HogEx) ───────
+        // The HogEx spends the HogEx output of the block we build on. State
+        // from any other block (e.g. a late body that lands after the tip
+        // moved on) would spend an output the tip already spent and still
+        // pass the shape check, so it counts as no state: refused -> HOLD.
+        std::optional<MWEBState> mweb_state;
+        if (mweb_tracker) {
+            mweb_state = mweb_tracker->get_state();
+            if (mweb_state && (mweb_state->captured_at_height != tip.height
+                               || mweb_state->captured_block_hash != tip.block_hash)) {
+                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
+                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
+                                << ", tip is h=" << tip.height << " "
+                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
+                mweb_state.reset();
+            }
+        }
+
         // ── Transactions from mempool (fee-sorted when UTXO available) ────
         // Only txs final in this block and spendable in it: IsFinalTx and
         // coinbase maturity at next_h, the lock time against the tip's median
         // time past (litecoind BlockAssembler's nLockTimeCutoff).
+        // The HogEx appended below spends the tip's HogEx output 0 (its
+        // vin[0]): the selection starts with that outpoint spent, so no pool
+        // tx spends it too (bad-txns-inputs-missingorspent).
+        Mempool::SelectionSeed seed;
+        if (mweb_state)
+            seed.consumed.emplace(mweb_state->prev_hogex_txid, mweb_state->prev_hogex_vout);
+        // The block's sigop cost (bad-blk-sigops): the coinbase's is the
+        // caller's (the built coinbase's own, under the pool's rules); the
+        // HogEx built below has none (its only output is the HogAddr, its
+        // only input spends one: no legacy, P2SH or v0 witness sigop).
+        seed.sigop_cost = std::max<int64_t>(coinbase_sigop_cost, 0);
         auto [selected_txs, total_fees] = degraded == nullptr
-            ? pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp})
+            ? pool.get_sorted_txs_with_fees(max_weight, LockTimeCutoff{next_h, mtp}, &seed)
             : std::pair<std::vector<Mempool::SelectedTx>, uint64_t>{};
 
         // coinbasevalue = block reward + included transaction fees
@@ -382,19 +416,6 @@ public:
             || (mweb_activation != 0 && next_h >= mweb_activation);
 
         if (mweb_tracker) {
-            auto mweb_state = mweb_tracker->get_state();
-            // The HogEx spends the HogEx output of the block we build on. State
-            // from any other block (e.g. a late body that lands after the tip
-            // moved on) would spend an output the tip already spent and still
-            // pass the shape check, so it counts as no state: refused -> HOLD.
-            if (mweb_state && (mweb_state->captured_at_height != tip.height
-                               || mweb_state->captured_block_hash != tip.block_hash)) {
-                LOG_DEBUG_COIND << "[EMB-LTC] MWEB state is for h=" << mweb_state->captured_at_height
-                                << " " << mweb_state->captured_block_hash.GetHex().substr(0, 16)
-                                << ", tip is h=" << tip.height << " "
-                                << tip.block_hash.GetHex().substr(0, 16) << " — not used";
-                mweb_state.reset();
-            }
             if (mweb_state) {
                 // Build HogEx transaction (last tx in block)
                 auto hogex = MWEBBuilder::build_hogex(*mweb_state, next_h);
@@ -550,7 +571,7 @@ public:
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker, tx_weight_budget(), &refused,
-            m_template_tx_check_strict.load(std::memory_order_relaxed));
+            m_template_tx_check_strict.load(std::memory_order_relaxed), coinbase_sigop_cost());
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet
             // (a pool or view not ready for the tip gives a served empty
@@ -608,6 +629,19 @@ public:
     /// litecoind's 4,000,000 (bad-blk-weight). Unset: COINBASE_RESERVE.
     void set_coinbase_reserve_fn(std::function<uint32_t()> fn) { m_coinbase_reserve = std::move(fn); }
 
+    /// The legacy sigops the next coinbase carries
+    /// (MiningInterface::coinbase_sigop_reserve). Unset:
+    /// TemplateBuilder::COINBASE_SIGOP_RESERVE.
+    void set_coinbase_sigop_reserve_fn(std::function<uint32_t()> fn) { m_coinbase_sigops = std::move(fn); }
+
+    /// The coinbase's sigop cost under the pool's rules (a coinbase has
+    /// only legacy sigops, x scale).
+    int64_t coinbase_sigop_cost() const {
+        if (!m_coinbase_sigops)
+            return TemplateBuilder::COINBASE_SIGOP_RESERVE;
+        return static_cast<int64_t>(m_coinbase_sigops()) * m_pool.sigop_rules().scale;
+    }
+
     /// The weight the mempool selection may use (never more than
     /// MAX_BLOCK_WEIGHT - COINBASE_RESERVE).
     uint32_t tx_weight_budget() const {
@@ -633,6 +667,7 @@ private:
     Mempool&     m_pool;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     std::function<uint32_t()> m_coinbase_reserve;  // template budget (see set_coinbase_reserve_fn)
+    std::function<uint32_t()> m_coinbase_sigops;   // the coinbase's legacy sigops (see set_coinbase_sigop_reserve_fn)
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
     std::atomic<bool> m_template_tx_check_strict{true};

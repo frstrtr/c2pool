@@ -145,6 +145,10 @@ public:
     // (aux_block_reserve_bytes): a backend that builds its own template keeps
     // its transactions within the rest. A daemon's template cannot be told.
     virtual void set_block_size_reserve(uint32_t /*bytes*/) {}
+    // Legacy sigops of the next aux block's coinbase (block_sigop_reserve):
+    // a backend that builds its own template keeps the block's sigops within
+    // the chain's limit with this reserved.
+    virtual void set_block_sigop_reserve(uint32_t /*sigops*/) {}
 };
 
 // ─── RPC client for one auxiliary chain daemon ───────────────────────────────
@@ -583,6 +587,11 @@ private:
     // Aux blocks refused at assembly (guarded by m_mutex).
     std::map<std::string, uint64_t> m_block_refusals_by_code;
     uint32_t block_size_reserve_locked(const ChainState& chain) const;
+    // The legacy sigops of the chain's frozen coinbase plus a margin for a
+    // few new payees; with none frozen yet, kAuxCoinbaseSigopsUnknown.
+    uint32_t block_sigop_reserve_locked(const ChainState& chain) const;
+    static constexpr uint32_t kAuxCoinbaseSigopMargin = 20;
+    static constexpr uint32_t kAuxCoinbaseSigopsUnknown = 4'200;  // 4,000 P2PKH payees and a margin
 
     // Discovered merged blocks history
     std::vector<DiscoveredMergedBlock> m_discovered_blocks;

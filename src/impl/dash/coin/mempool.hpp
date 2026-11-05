@@ -772,55 +772,9 @@ public:
     InjectGate add_inject(const MutableTransaction& tx,
                           uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        // (1) size — cheapest, chain-state-independent.
-        if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
-            return InjectGate::TooLarge;
-        // (1a) ContextualCheckTransaction — add_tx_locked refuses it too, but
-        //     that refusal would surface here as AlreadyConfirmed; name it.
-        if (contextual_tx_check(tx, /*is_coinbase=*/false))
-            return InjectGate::BadVersionOrType;
-        // (2) new-seam script-verify requirement (fail-closed).
-        if (!m_script_check)
-            return InjectGate::ScriptCheckUnarmed;
-        // (2a) GAP-1 — BIP68 relative-locktime FAIL-CLOSED. This is a NEW
-        //     ingestion seam, so the sole-ingestion-path invariant's argument
-        //     that bad-txns-nonfinal is N/A ("relay-admitted txs are final at
-        //     admission") no longer holds: a directly-injected tx never passed a
-        //     relaying dashd's SequenceLocks. We port absolute-locktime finality
-        //     (is_final_tx, run in the selector), but NOT relative BIP68
-        //     SequenceLocks (that is M2). Until then, refuse any tx that OPTS IN
-        //     to a relative lock — nVersion >= 2 with an input whose nSequence
-        //     leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — rather than risk
-        //     selecting a bad-txns-nonfinal tx into a template. Chain-state
-        //     independent, so it sits with the other cheap pre-admission gates.
-        if (tx.version >= 2) {
-            for (const auto& vin : tx.vin) {
-                if ((vin.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0)
-                    return InjectGate::Bip68Unsupported;
-            }
-        }
-        // (2b) GAP-2 — CheckTransaction output value-range (bad-txns-vout-*).
-        //     dashcore CheckTransaction / CTransaction::GetValueOut reject any
-        //     vout outside MoneyRange and any running-sum overflow BEFORE the tx
-        //     is priced. compute_fee_locked casts vout.value to uint64 for
-        //     out_sum, so an out-of-range value (e.g. INT64_MIN) would wrap the
-        //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
-        //     Refuse by name here, ahead of admission/pricing. No-op for any
-        //     valid tx (every vout already in range).
-        //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
-        //     scriptPubKey is refused too (inject-spent-shaped-output): it is
-        //     consensus-valid (the full set keeps it as dashd does) but
-        //     non-standard in dashd, so no dashd-built block carries it.
-        {
-            int64_t vout_running = 0;
-            for (const auto& vout : tx.vout) {
-                if (!money_range(vout.value) || !money_range(vout_running + vout.value))
-                    return InjectGate::BadVoutRange;
-                if (vout.value == 0 && vout.scriptPubKey.m_data.empty())
-                    return InjectGate::SpentShapedOutput;
-                vout_running += vout.value;
-            }
-        }
+        // (1) .. (2b): the chain-state-independent checks (inject_shape_gate_locked).
+        if (const auto g = inject_shape_gate_locked(tx))
+            return *g;
         const uint256 txid = dash_txid(tx);
         // (3) dedup against our own pool.
         if (m_pool.count(txid))
@@ -856,33 +810,44 @@ public:
         }
         // (8) S3a admission-time script verify (consensus-exact, every input).
         {
-            std::vector<uint8_t> tx_bytes;
-            {
-                auto ps = ::pack(tx);
-                auto sp = ps.get_span();
-                const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
-                tx_bytes.assign(b, b + sp.size());
-            }
-            const uint32_t sflags = script_flags_for_height(0);
-            for (uint32_t vi = 0; vi < tx.vin.size(); ++vi) {
-                ::core::coin::Outpoint op(tx.vin[vi].prevout.hash, tx.vin[vi].prevout.index);
-                std::vector<uint8_t> spk;
-                const bool resolved = resolve_input_spk_locked(op, spk);
-                if (!resolved || !m_script_check(tx_bytes, vi, spk, sflags)) {
-                    LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
-                                << " input " << vi << (resolved ? " fails VerifyScript"
-                                                                : " has no resolvable scriptPubKey")
-                                << " (inject-script-invalid)";
-                    remove_tx_locked(txid);
-                    m_fee_deltas.erase(txid);
-                    return InjectGate::ScriptInvalid;
-                }
+            uint32_t vi = 0;
+            bool resolved = true;
+            if (!inject_scripts_ok_locked(tx, vi, resolved)) {
+                LOG_WARNING << "[MEMPOOL] inject refused txid=" << txid.GetHex().substr(0, 16)
+                            << " input " << vi << (resolved ? " fails VerifyScript"
+                                                            : " has no resolvable scriptPubKey")
+                            << " (inject-script-invalid)";
+                remove_tx_locked(txid);
+                m_fee_deltas.erase(txid);
+                return InjectGate::ScriptInvalid;
             }
         }
         LOG_INFO << "[MEMPOOL] inject admitted txid=" << txid.GetHex().substr(0, 16)
                  << " base_fee=" << it->second.fee << " max_fee=" << max_fee
                  << " scripts=ok prioritised (delta=" << INJECT_FEE_DELTA << " duffs, scoring-only)";
         return InjectGate::Ok;
+    }
+
+    /// Which of `ops` a pool entry spends, each with the spending txid (one
+    /// pair per spender, in pool order). Read-only, any thread. Every entry's
+    /// inputs are read: m_spent_outputs keeps one spender per outpoint and
+    /// loses the outpoint when one of two pool txs spending it leaves. Used by
+    /// GET /api/utxo/scan (mempool_spent).
+    std::vector<std::pair<::core::coin::Outpoint, uint256>>
+    pool_spenders(const std::vector<::core::coin::Outpoint>& ops) const {
+        std::vector<std::pair<::core::coin::Outpoint, uint256>> out;
+        if (ops.empty()) return out;
+        std::vector<std::pair<uint256, uint32_t>> want;
+        want.reserve(ops.size());
+        for (const auto& op : ops) want.emplace_back(op.txid, op.index);
+        std::sort(want.begin(), want.end());
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& [txid, e] : m_pool)
+            for (const auto& vin : e.tx.vin)
+                if (std::binary_search(want.begin(), want.end(),
+                                       std::make_pair(vin.prevout.hash, vin.prevout.index)))
+                    out.emplace_back(::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), txid);
+        return out;
     }
 
     /// The injects in the pool (the txids carrying INJECT_FEE_DELTA), for the
@@ -979,6 +944,110 @@ public:
     size_t confirmed_injects_kept() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_confirmed_injects.size();
+    }
+
+    // ── Inject dry run (POST /api/tx-inject/validate, c2wallet N3) ─────────
+    /// One input of a dry-run tx as the pool resolves it: the forward/full
+    /// view, an in-pool parent, the at-tip fold, the fee fold (the order
+    /// compute_fee_locked prices in).
+    struct InjectInput {
+        ::core::coin::Outpoint op;
+        bool        resolved{false};
+        const char* source{"none"};   // "utxo" | "mempool" | "fold" | "fee-fold" | "none"
+        int64_t     value{0};
+        uint32_t    height{0};        // 0 for "mempool": unconfirmed
+        bool        coinbase{false};
+        std::optional<uint256> pool_spender;   // another pool tx spending the same coin
+    };
+    struct InjectDryRun {
+        InjectGate gate{InjectGate::Ok};
+        uint256    txid;
+        bool       priced{false};     // every input resolved and in >= out
+        uint64_t   fee{0};
+        std::optional<uint32_t> script_failed_input;   // gate ScriptInvalid: the first failing input
+        std::vector<InjectInput> inputs;
+    };
+
+    /// add_inject's verdict for `tx` against the pool as it is now, with
+    /// NOTHING changed: the same checks in the same order (the shape checks,
+    /// dedup, add_tx_locked's #125 already-confirmed check, pricing, max_fee,
+    /// the admission script verify), but the tx is priced on a scratch entry
+    /// and never inserted, no fee delta is recorded, nothing is logged as
+    /// admitted. It also reports every input's coin and any other pool tx
+    /// spending it (add_inject admits such a conflict; the selector then
+    /// keeps one of the two). The one thing it cannot see: a real admission
+    /// into a FULL pool first evicts the oldest entries, which could include
+    /// an in-pool parent of `tx`.
+    InjectDryRun validate_inject(const MutableTransaction& tx,
+                                 uint64_t max_fee = std::numeric_limits<uint64_t>::max()) {
+        InjectDryRun r;
+        r.txid = dash_txid(tx);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto* utxo = m_utxo.load();
+        std::map<std::pair<uint256, uint32_t>, size_t> index;
+        for (const auto& vin : tx.vin) {
+            InjectInput in;
+            in.op = ::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index);
+            ::core::coin::Coin c;
+            if (utxo && utxo->get_coin(in.op, c)) {
+                in.source = "utxo";
+            } else if (auto pit = m_pool.find(in.op.txid);
+                       pit != m_pool.end() && in.op.index < pit->second.tx.vout.size()) {
+                in.source = "mempool";
+                c = ::core::coin::Coin(pit->second.tx.vout[in.op.index].value,
+                                       pit->second.tx.vout[in.op.index].scriptPubKey, 0, false);
+            } else if (fold_resolve(in.op, c)) {
+                in.source = "fold";
+            } else if (m_fee_coin_lookup && m_fee_coin_lookup(in.op, c) && !c.is_spent()) {
+                in.source = "fee-fold";
+            }
+            in.resolved = std::string(in.source) != "none";
+            if (in.resolved) {
+                in.value = c.value;
+                in.height = c.height;
+                in.coinbase = c.coinbase;
+            }
+            index.emplace(std::make_pair(in.op.txid, in.op.index), r.inputs.size());
+            r.inputs.push_back(in);
+        }
+        for (const auto& [txid, e] : m_pool) {
+            if (txid == r.txid) continue;
+            for (const auto& vin : e.tx.vin) {
+                auto it = index.find(std::make_pair(vin.prevout.hash, vin.prevout.index));
+                if (it != index.end() && !r.inputs[it->second].pool_spender)
+                    r.inputs[it->second].pool_spender = txid;
+            }
+        }
+        // (1) .. (2b)
+        if (const auto g = inject_shape_gate_locked(tx)) { r.gate = *g; return r; }
+        // (3) dedup
+        if (m_pool.count(r.txid)) { r.gate = InjectGate::AlreadyKnown; return r; }
+        // (5) add_tx_locked: its contextual and spent-shaped refusals are in
+        //     the shape gate above; what is left is the #125 check.
+        if (own_output_already_a_coin_locked(tx, r.txid, utxo)) {
+            r.gate = InjectGate::AlreadyConfirmed;
+            return r;
+        }
+        // (6) priced on a scratch entry (compute_fee_locked writes only it).
+        MempoolEntry scratch;
+        scratch.tx = tx;
+        scratch.txid = r.txid;
+        compute_fee_locked(scratch, utxo);
+        r.priced = scratch.fee_fold_proven;
+        r.fee = scratch.fee;
+        if (!scratch.fee_fold_proven) { r.gate = InjectGate::Unpriceable; return r; }
+        // (7)
+        if (scratch.fee > max_fee) { r.gate = InjectGate::FeeAboveMax; return r; }
+        // (8)
+        uint32_t vi = 0;
+        bool resolved = true;
+        if (!inject_scripts_ok_locked(tx, vi, resolved)) {
+            r.gate = InjectGate::ScriptInvalid;
+            r.script_failed_input = vi;
+            return r;
+        }
+        r.gate = InjectGate::Ok;
+        return r;
     }
 
 private:
@@ -2627,6 +2696,108 @@ private:
         }
         ::core::coin::Coin fc;
         if (fold_resolve(op, fc)) { spk_out = fc.scriptPubKey.m_data; return true; }
+        return false;
+    }
+
+    // add_inject (1) .. (2b): the chain-state-independent checks, shared with
+    // the dry run (validate_inject). nullopt = passed. Caller holds m_mutex.
+    std::optional<InjectGate> inject_shape_gate_locked(const MutableTransaction& tx) const {
+        // (1) size — cheapest, chain-state-independent.
+        if (::pack(tx).get_span().size() > kMaxInjectTxBytes)
+            return InjectGate::TooLarge;
+        // (1a) ContextualCheckTransaction — add_tx_locked refuses it too, but
+        //     that refusal would surface here as AlreadyConfirmed; name it.
+        if (contextual_tx_check(tx, /*is_coinbase=*/false))
+            return InjectGate::BadVersionOrType;
+        // (2) new-seam script-verify requirement (fail-closed).
+        if (!m_script_check)
+            return InjectGate::ScriptCheckUnarmed;
+        // (2a) GAP-1 — BIP68 relative-locktime FAIL-CLOSED. This is a NEW
+        //     ingestion seam, so the sole-ingestion-path invariant's argument
+        //     that bad-txns-nonfinal is N/A ("relay-admitted txs are final at
+        //     admission") no longer holds: a directly-injected tx never passed a
+        //     relaying dashd's SequenceLocks. We port absolute-locktime finality
+        //     (is_final_tx, run in the selector), but NOT relative BIP68
+        //     SequenceLocks (that is M2). Until then, refuse any tx that OPTS IN
+        //     to a relative lock — nVersion >= 2 with an input whose nSequence
+        //     leaves SEQUENCE_LOCKTIME_DISABLE_FLAG clear — rather than risk
+        //     selecting a bad-txns-nonfinal tx into a template. Chain-state
+        //     independent, so it sits with the other cheap pre-admission gates.
+        if (tx.version >= 2) {
+            for (const auto& vin : tx.vin) {
+                if ((vin.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG) == 0)
+                    return InjectGate::Bip68Unsupported;
+            }
+        }
+        // (2b) GAP-2 — CheckTransaction output value-range (bad-txns-vout-*).
+        //     dashcore CheckTransaction / CTransaction::GetValueOut reject any
+        //     vout outside MoneyRange and any running-sum overflow BEFORE the tx
+        //     is priced. compute_fee_locked casts vout.value to uint64 for
+        //     out_sum, so an out-of-range value (e.g. INT64_MIN) would wrap the
+        //     sum and inflate in_sum - out_sum → total_fees → the coinbase.
+        //     Refuse by name here, ahead of admission/pricing. No-op for any
+        //     valid tx (every vout already in range).
+        //     VERIFY-S2 Must-Fix 1: an output with value 0 and an empty
+        //     scriptPubKey is refused too (inject-spent-shaped-output): it is
+        //     consensus-valid (the full set keeps it as dashd does) but
+        //     non-standard in dashd, so no dashd-built block carries it.
+        {
+            int64_t vout_running = 0;
+            for (const auto& vout : tx.vout) {
+                if (!money_range(vout.value) || !money_range(vout_running + vout.value))
+                    return InjectGate::BadVoutRange;
+                if (vout.value == 0 && vout.scriptPubKey.m_data.empty())
+                    return InjectGate::SpentShapedOutput;
+                vout_running += vout.value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // add_inject (8): every input's scriptSig against its resolved
+    // scriptPubKey with the full buried flag set. False at the first input
+    // that fails (`failed_vin`; `resolved` false when no at-tip source has its
+    // scriptPubKey). Shared with the dry run. Caller holds m_mutex.
+    bool inject_scripts_ok_locked(const MutableTransaction& tx, uint32_t& failed_vin,
+                                  bool& resolved) const {
+        std::vector<uint8_t> tx_bytes;
+        {
+            auto ps = ::pack(tx);
+            auto sp = ps.get_span();
+            const auto* b = reinterpret_cast<const uint8_t*>(sp.data());
+            tx_bytes.assign(b, b + sp.size());
+        }
+        const uint32_t sflags = script_flags_for_height(0);
+        for (uint32_t vi = 0; vi < tx.vin.size(); ++vi) {
+            ::core::coin::Outpoint op(tx.vin[vi].prevout.hash, tx.vin[vi].prevout.index);
+            std::vector<uint8_t> spk;
+            resolved = resolve_input_spk_locked(op, spk);
+            if (!resolved || !m_script_check(tx_bytes, vi, spk, sflags)) {
+                failed_vin = vi;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // add_tx_locked's #125 predicate for the dry run: an input is missing
+    // from the view while one of the tx's own outputs is already a coin, so
+    // the identical tx is mined. Same predicate as the block in
+    // add_tx_locked (kept in step by the dry-run parity KAT).
+    bool own_output_already_a_coin_locked(const MutableTransaction& tx, const uint256& txid,
+                                          ::core::coin::UTXOViewCache* utxo) const {
+        if (utxo == nullptr) return false;
+        bool any_input_missing = false;
+        for (const auto& vin : tx.vin) {
+            if (!utxo->have_coin(::core::coin::Outpoint(vin.prevout.hash, vin.prevout.index))) {
+                any_input_missing = true;
+                break;
+            }
+        }
+        if (!any_input_missing) return false;
+        for (size_t out = 0; out < tx.vout.size(); ++out)
+            if (utxo->have_coin(::core::coin::Outpoint(txid, static_cast<uint32_t>(out))))
+                return true;
         return false;
     }
 

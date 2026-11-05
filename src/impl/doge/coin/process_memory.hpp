@@ -33,6 +33,7 @@ struct ProcessMemory {
     long rss_kb{0};   // VmRSS
     long anon_kb{0};  // RssAnon: heap, arenas, anonymous mappings
     long file_kb{0};  // RssFile: mapped files (LevelDB tables read through mmap)
+    long shmem_kb{0}; // RssShmem: shared and tmpfs pages (a LevelDB on tmpfs read through mmap)
 
     /// /proc/self/status (Linux); zeros elsewhere.
     static ProcessMemory read()
@@ -48,6 +49,8 @@ struct ProcessMemory {
                     m.anon_kb = v;
                 else if (std::sscanf(line, "RssFile: %ld kB", &v) == 1)
                     m.file_kb = v;
+                else if (std::sscanf(line, "RssShmem: %ld kB", &v) == 1)
+                    m.shmem_kb = v;
             }
             std::fclose(f);
         }

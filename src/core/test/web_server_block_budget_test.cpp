@@ -17,6 +17,15 @@
 //   LtcBlockWeight.OversizeBlockIsRefusedAtAssembly: a job whose block would
 //     weigh more than 4,000,000 never reaches the daemon; it is counted under
 //     "oversize". One just under the limit is submitted.
+//   LtcTemplateBudget.CoinbaseSigopsAreReservedAndTheBlockStaysWithinTheLimit:
+//     MiningInterface::coinbase_sigop_reserve is the built coinbase's legacy
+//     sigops plus a margin; a template over it and a pool of sigop-heavy txs
+//     yields a block whose sigop cost, counted from its bytes, is within
+//     litecoind's 80,000 (bad-blk-sigops) and filled to within one tx; with
+//     the coinbase's raw state root set to 32 x 0xae it is still within.
+//   LtcTemplateBudget.CoinbaseSigopBoundCoversAnyStateRoot: the coinbase's
+//     bound counts the raw 32-byte state root at its worst case (640), the
+//     same for any root; the exact count varies with the root.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -108,8 +117,10 @@ std::string find_nonce(const std::string& prev_hex, const uint256& merkle_root)
 }
 
 /// A legacy tx: one input (`tag`, `index` make it distinct) and `outputs`
-/// P2PKH outputs, about 34 bytes each.
-ltc::coin::MutableTransaction big_tx(uint8_t tag, uint32_t index, size_t outputs)
+/// outputs, P2PKH (about 34 bytes each), or with `p2sh` P2SH (about 32
+/// bytes, no sigop: a template of them is bound by its weight, not by the
+/// 80,000 sigop cost; sigop_tx below carries sigops).
+ltc::coin::MutableTransaction big_tx(uint8_t tag, uint32_t index, size_t outputs, bool p2sh = false)
 {
     ltc::coin::MutableTransaction tx;
     tx.version = 1;
@@ -123,14 +134,81 @@ ltc::coin::MutableTransaction big_tx(uint8_t tag, uint32_t index, size_t outputs
     for (size_t k = 0; k < outputs; ++k) {
         ltc::coin::TxOut out;
         out.value = 1000 + static_cast<int64_t>(k);
-        out.scriptPubKey.m_data = {0x76, 0xa9, 0x14};
-        for (int i = 0; i < 20; ++i)
-            out.scriptPubKey.m_data.push_back(static_cast<unsigned char>(k + i));
-        out.scriptPubKey.m_data.push_back(0x88);
-        out.scriptPubKey.m_data.push_back(0xac);
+        if (p2sh) {
+            out.scriptPubKey.m_data = {0xa9, 0x14};
+            for (int i = 0; i < 20; ++i)
+                out.scriptPubKey.m_data.push_back(static_cast<unsigned char>(k + i));
+            out.scriptPubKey.m_data.push_back(0x87);
+        } else {
+            out.scriptPubKey.m_data = {0x76, 0xa9, 0x14};
+            for (int i = 0; i < 20; ++i)
+                out.scriptPubKey.m_data.push_back(static_cast<unsigned char>(k + i));
+            out.scriptPubKey.m_data.push_back(0x88);
+            out.scriptPubKey.m_data.push_back(0xac);
+        }
         tx.vout.push_back(out);
     }
     return tx;
+}
+
+/// One input, one output of 100 OP_CHECKSIG: 100 legacy sigops, cost 400.
+ltc::coin::MutableTransaction sigop_tx(uint8_t tag, uint32_t index)
+{
+    ltc::coin::MutableTransaction tx = big_tx(tag, index, 1);
+    tx.vout[0].scriptPubKey.m_data.assign(100, 0xac);
+    return tx;
+}
+
+/// coinb1 with the coinbase scriptSig's last 32 bytes (the raw state root)
+/// set to `b`: version 4 | input count 1 | prevout 36 | scriptSig length 1.
+std::string with_root_bytes(const std::string& coinb1, unsigned char b)
+{
+    const size_t len_at = (4 + 1 + 36) * 2;
+    const size_t len = std::stoul(coinb1.substr(len_at, 2), nullptr, 16);
+    const size_t root_at = len_at + 2 + (len - 32) * 2;
+    char buf[3];
+    std::snprintf(buf, sizeof(buf), "%02x", b);
+    std::string out = coinb1;
+    for (size_t i = 0; i < 32; ++i)
+        out.replace(root_at + 2 * i, 2, buf);
+    return out;
+}
+
+/// The raw state root of coinb1 (the coinbase scriptSig's last 32 bytes), hex.
+std::string root_bytes_hex(const std::string& coinb1)
+{
+    const size_t len_at = (4 + 1 + 36) * 2;
+    const size_t len = std::stoul(coinb1.substr(len_at, 2), nullptr, 16);
+    return coinb1.substr(len_at + 2 + (len - 32) * 2, 64);
+}
+
+/// The block's sigop cost, counted independently of production code from
+/// its bytes: every scriptSig and scriptPubKey (inaccurate CHECKSIG /
+/// CHECKMULTISIG count) x 4. Every input here spends an OP_TRUE coin, so no
+/// P2SH or witness sigop.
+int64_t block_sigop_cost(const std::string& block_hex)
+{
+    auto bytes = ParseHex(block_hex);
+    PackStream ps(bytes);
+    ltc::coin::BlockType b;
+    ps >> b;
+    auto count = [](const std::vector<unsigned char>& s) {
+        int64_t n = 0;
+        for (size_t i = 0; i < s.size();) {
+            const unsigned char op = s[i++];
+            if (op >= 0x01 && op <= 0x4b) { i += op; continue; }
+            if (op == 0x4c) { if (i < s.size()) i += 1 + s[i]; continue; }
+            if (op == 0xac || op == 0xad) ++n;
+            if (op == 0xae || op == 0xaf) n += 20;
+        }
+        return n;
+    };
+    int64_t n = 0;
+    for (const auto& tx : b.m_txs) {
+        for (const auto& in : tx.vin) n += count(in.scriptSig.m_data);
+        for (const auto& out : tx.vout) n += count(out.scriptPubKey.m_data);
+    }
+    return n * 4;
 }
 
 std::string tx_hex(const ltc::coin::MutableTransaction& tx)
@@ -270,7 +348,7 @@ TEST(LtcTemplateBudget, FullTemplateWithLargeCoinbaseStaysUnder4MWU)
     // A mempool holding more than 4 MWU, every tx priced.
     ltc::coin::Mempool pool;
     for (uint32_t i = 0; i < 420; ++i) {
-        auto tx = big_tx(static_cast<uint8_t>(i), i, 290);   // ~9.9 kB, ~39.5 kWU
+        auto tx = big_tx(static_cast<uint8_t>(i), i, 300, /*p2sh=*/true);   // ~9.6 kB, ~38.5 kWU, no sigop
         ASSERT_TRUE(pool.add_tx_unchecked(tx));
         pool.set_tx_fee(ltc::coin::compute_txid(tx), 10000 + i);
     }
@@ -345,4 +423,149 @@ TEST(LtcBlockWeight, OversizeBlockIsRefusedAtAssembly)
     run(100, submits, oversize);
     EXPECT_EQ(submits, 1) << "under the limit: submitted";
     EXPECT_EQ(oversize, 0u);
+}
+
+// The coinbase's sigops are reserved for the template's sigop budget
+// (bad-blk-sigops, validation.cpp:2236-2239): before any coinbase, one per
+// output the cap allows plus the scriptSig's worst case; once built, the
+// coinbase's own legacy count (4,000 P2PKH payees) plus
+// kCoinbaseSigopMargin. A REAL template over that reserve and a pool of
+// sigop-heavy txs (cost 400 each, 100,000 in all): the block found on it,
+// counted from the submitted bytes, is within 80,000 and the selection
+// filled it to within one tx of the limit.
+TEST(LtcTemplateBudget, CoinbaseSigopsAreReservedAndTheBlockStaysWithinTheLimit)
+{
+    MiningInterface mi{/*testnet=*/true};
+    MockCoinNode node;
+    mi.set_coin_node(&node);
+    stub_ref_hash(mi);
+    uint256 best;
+    best.SetHex(std::string(63, '0') + "7");
+    mi.set_best_share_hash_fn([best]() { return best; });
+    mi.set_pplns_fn(pplns_of(4000));
+    EXPECT_GE(mi.coinbase_sigop_reserve(), 4000u) << "before any coinbase: the bound";
+
+    ltc::coin::HeaderChain chain(ltc::coin::make_ltc_chain_params_testnet());
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(ltc_testnet_genesis()));
+    const std::string prev = chain.tip()->block_hash.GetHex();
+    node.work_data = {
+        {"previousblockhash", prev}, {"version", kVersion}, {"height", 1},
+        {"bits", kBits}, {"curtime", 1600000000}, {"coinbasevalue", 5000000000LL},
+        {"transactions", nlohmann::json::array()}, {"rules", nlohmann::json::array({"segwit"})},
+    };
+    mi.refresh_work();
+    const uint32_t reserve = mi.coinbase_sigop_reserve();
+    // The 4,000 P2PKH payees, and the scriptSig's raw 32-byte state root at
+    // its worst case (32 x 20), whatever this template's root is.
+    EXPECT_GE(reserve, 4000u + 640u + MiningInterface::kCoinbaseSigopMargin);
+    EXPECT_LE(reserve, 4010u + 640u + MiningInterface::kCoinbaseSigopMargin);
+
+    ltc::coin::Mempool pool;
+    for (uint32_t i = 0; i < 250; ++i) {
+        auto tx = sigop_tx(static_cast<uint8_t>(i), i);
+        ASSERT_TRUE(pool.add_tx_unchecked(tx));
+        pool.set_tx_fee(ltc::coin::compute_txid(tx), 10000 + i);
+    }
+    ltc_test::CoveringView view;
+    view.cover(pool);
+    {
+        ltc::coin::BlockType g;
+        static_cast<ltc::coin::BlockHeaderType&>(g) = ltc_testnet_genesis();
+        pool.remove_for_block(g);
+    }
+    ltc::coin::EmbeddedCoinNode embedded(chain, pool, /*testnet=*/true);
+    embedded.set_coinbase_reserve_fn([&mi]() { return mi.coinbase_weight_reserve(); });
+    embedded.set_coinbase_sigop_reserve_fn([&mi]() { return mi.coinbase_sigop_reserve(); });
+    EXPECT_EQ(embedded.coinbase_sigop_cost(), static_cast<int64_t>(reserve) * 4);
+    std::optional<ltc::coin::rpc::WorkData> refused;
+    auto wd = ltc::coin::TemplateBuilder::build_template(
+        chain, pool, /*is_testnet=*/true, nullptr, embedded.tx_weight_budget(), &refused, true,
+        embedded.coinbase_sigop_cost());
+    ASSERT_TRUE(wd.has_value());
+    const size_t n = wd->m_data["transactions"].size();
+    EXPECT_EQ(n, static_cast<size_t>((80000 - static_cast<int64_t>(reserve) * 4) / 400));
+
+    node.work_data = wd->m_data;
+    node.hashes = wd->m_hashes;
+    mi.refresh_work();
+    auto j = freeze(mi, best, prev);
+    mi.mining_submit("sigop-kat-miner", "j1", kEn1, kEn2, kNtime, j.nonce, "1", {}, &j.snap);
+    ASSERT_EQ(node.submit_calls, 1);
+    const int64_t cost = block_sigop_cost(node.last_submitted_hex);
+    EXPECT_LE(cost, 80000) << "bad-blk-sigops";
+    EXPECT_GT(cost, 80000 - 400 - 4 * static_cast<int64_t>(MiningInterface::kCoinbaseSigopMargin + 640))
+        << "filled to within one tx of the limit and the root's worst case";
+
+    // The same block with the coinbase's state root all 0xae (CHECKMULTISIG:
+    // 20 each, the most 32 bytes can count), counted from its bytes: still
+    // within 80,000.
+    const std::string root_hex = root_bytes_hex(j.snap.coinb1);
+    ASSERT_EQ(root_hex.size(), 64u);
+    std::string worst_block_hex = node.last_submitted_hex;
+    const size_t at = worst_block_hex.find(root_hex);
+    ASSERT_NE(at, std::string::npos);
+    ASSERT_EQ(at % 2, 0u);
+    ASSERT_EQ(worst_block_hex.find(root_hex, at + 1), std::string::npos) << "the root occurs once";
+    std::string worst_root;
+    for (int i = 0; i < 32; ++i)
+        worst_root += "ae";
+    worst_block_hex.replace(at, root_hex.size(), worst_root);
+    const int64_t worst_cost = block_sigop_cost(worst_block_hex);
+    EXPECT_GE(worst_cost, cost);
+    EXPECT_LE(worst_cost, 80000) << "bad-blk-sigops with the worst root";
+    const auto worst = MiningInterface::coinbase_sigops(with_root_bytes(j.snap.coinb1, 0xae), j.snap.coinb2);
+    ASSERT_TRUE(worst.has_value());
+    EXPECT_LE(*worst, reserve) << "the reserve covers the worst root";
+}
+
+// The coinbase's sigop bound covers any state root: the scriptSig ends with
+// the 32-byte root, appended raw, so its bytes parse as opcodes (Core's
+// GetSigOpCount: CHECKMULTISIG counts 20). A root of 32 x 0xae counts 640,
+// 32 x 0xaf 640, all zeros 0, a root starting with PUSHDATA1 a little; the
+// bound is the same for each: the prefix's count plus 640, and so is the
+// bound of the coinbase without a root (the template's own).
+TEST(LtcTemplateBudget, CoinbaseSigopBoundCoversAnyStateRoot)
+{
+    // version | 1 input (null prevout) | scriptSig: height push, tag push,
+    // 32 raw root bytes | sequence | 3 P2PKH payees + OP_RETURN 6a28 <32
+    // ref> <8 nonce> | locktime. coinb1 stops before the nonce.
+    auto coinb1_with_root = [](const std::vector<unsigned char>& root) {
+        std::string ss = "03" "5dd630" "04" "2f633270";  // height push, a 4-byte tag push
+        for (unsigned char c : root) {
+            char buf[3];
+            std::snprintf(buf, sizeof(buf), "%02x", c);
+            ss += buf;
+        }
+        char len[3];
+        std::snprintf(len, sizeof(len), "%02x", static_cast<unsigned>(ss.size() / 2));
+        std::string cb = "01000000" "01" + std::string(64, '0') + "ffffffff" + len + ss + "ffffffff" "04";
+        for (int k = 0; k < 3; ++k)
+            cb += "00f2052a01000000" "1976a914" + std::string(40, 'a') + "88ac";
+        cb += "0000000000000000" "2a6a28" + std::string(64, 'b');
+        return cb;
+    };
+    const std::string coinb2 = "00000000";
+    struct Case { std::vector<unsigned char> root; unsigned exact; };
+    std::vector<unsigned char> pushdata1(32, 0x00);
+    pushdata1[0] = 0x4c;
+    pushdata1[1] = 0x05;  // PUSHDATA1 5: swallows 5 bytes, then zeros
+    pushdata1[31] = 0xac;
+    const std::vector<Case> cases = {
+        {std::vector<unsigned char>(32, 0xae), 3 + 640},
+        {std::vector<unsigned char>(32, 0xaf), 3 + 640},
+        {std::vector<unsigned char>(32, 0x00), 3},
+        {pushdata1, 3 + 1},
+    };
+    for (const auto& k : cases) {
+        const std::string c1 = coinb1_with_root(k.root);
+        EXPECT_EQ(MiningInterface::coinbase_sigops(c1, coinb2), std::optional<uint32_t>(k.exact));
+        EXPECT_EQ(MiningInterface::coinbase_sigop_bound(c1, coinb2, true), std::optional<uint32_t>(3 + 640))
+            << "the same bound, whatever the root";
+    }
+    // The template's own coinbase has no root yet: the bound adds the 640
+    // for the one its connections append.
+    const std::string rootless = coinb1_with_root({});
+    EXPECT_EQ(MiningInterface::coinbase_sigops(rootless, coinb2), std::optional<uint32_t>(3));
+    EXPECT_EQ(MiningInterface::coinbase_sigop_bound(rootless, coinb2, false), std::optional<uint32_t>(3 + 640));
 }

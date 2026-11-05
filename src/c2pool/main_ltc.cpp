@@ -2487,6 +2487,9 @@ int main(int argc, char* argv[]) {
                 // last one's weight plus a margin, not a fixed 2,000.
                 embedded_node->set_coinbase_reserve_fn(
                     [mi = web_server.get_mining_interface()]() { return mi->coinbase_weight_reserve(); });
+                // And the coinbase's sigops, for the block's sigop limit.
+                embedded_node->set_coinbase_sigop_reserve_fn(
+                    [mi = web_server.get_mining_interface()]() { return mi->coinbase_sigop_reserve(); });
                 // Gate mining until UTXO has coinbase maturity depth (100 blocks for LTC).
                 // Without this, block templates may include TXs spending immature coinbase outputs.
                 // Reference: litecoin/src/consensus/consensus.h COINBASE_MATURITY = 100

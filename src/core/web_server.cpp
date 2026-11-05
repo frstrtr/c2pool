@@ -17,6 +17,7 @@
 #include <core/coin/node_iface.hpp>
 #include <core/coin/mweb_shape.hpp>
 #include <core/coin/template_txs_check.hpp>
+#include <core/coin/sigop_cost.hpp>
 // Phase 4: embedded coin node interface
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/share_messages.hpp>
@@ -72,6 +73,8 @@ MiningInterface::MiningInterface(bool testnet, std::shared_ptr<IMiningNode> node
 
 MiningInterface::~MiningInterface()
 {
+    // The UTXO scan thread first: its fn reads coin state the target owns.
+    stop_utxo_scan();
     stop_background();
 }
 
@@ -875,24 +878,64 @@ uint32_t MiningInterface::coinbase_weight(const std::string& coinb1, const std::
     return static_cast<uint32_t>(std::min<uint64_t>(w, UINT32_MAX));
 }
 
+std::optional<uint32_t> MiningInterface::coinbase_sigops(const std::string& coinb1, const std::string& coinb2)
+{
+    return core::coin::sigops::tx_hex_legacy_sigops(coinb1 + "0000000000000000" + coinb2);
+}
+
+std::optional<uint32_t> MiningInterface::coinbase_sigop_bound(const std::string& coinb1, const std::string& coinb2,
+                                                              bool has_state_root)
+{
+    // Appending the root after the scriptSig's pushes leaves the ops that
+    // start before it as they are, the same bound as counting it in place.
+    const auto ops = core::coin::sigops::tx_hex_legacy_sigops(coinb1 + "0000000000000000" + coinb2,
+                                                              has_state_root ? kCoinbaseRawScriptSigTail : 0);
+    if (!ops)
+        return std::nullopt;
+    const uint32_t root = has_state_root ? 0u
+        : static_cast<uint32_t>(kCoinbaseRawScriptSigTail * core::coin::sigops::MAX_PUBKEYS_PER_MULTISIG);
+    return *ops + root;
+}
+
 void MiningInterface::note_coinbase_built(const std::string& coinb1, const std::string& coinb2,
-                                          bool segwit, size_t branch_len, bool fresh_template) const
+                                          bool segwit, size_t branch_len, bool fresh_template,
+                                          bool has_state_root) const
 {
     const uint32_t w = coinbase_weight(coinb1, coinb2, segwit);
+    // The bound over any state root; a coinbase that does not parse counts
+    // as the worst case its size allows.
+    const uint32_t ops = coinbase_sigop_bound(coinb1, coinb2, has_state_root).value_or(
+        static_cast<uint32_t>(std::min<uint64_t>((coinb1.size() + coinb2.size()) / 2 * 20, UINT32_MAX)));
     if (fresh_template) {
         // A new template: start from its own coinbase; the per-connection
         // coinbases built on it raise the mark.
         m_coinbase_weight.store(w, std::memory_order_relaxed);
+        m_coinbase_sigops.store(ops, std::memory_order_relaxed);
     } else {
         uint32_t cur = m_coinbase_weight.load(std::memory_order_relaxed);
         while (w > cur && !m_coinbase_weight.compare_exchange_weak(cur, w, std::memory_order_relaxed)) {
         }
+        uint32_t cur_ops = m_coinbase_sigops.load(std::memory_order_relaxed);
+        while (ops > cur_ops && !m_coinbase_sigops.compare_exchange_weak(cur_ops, ops, std::memory_order_relaxed)) {
+        }
     }
+    m_coinbase_sigops_known.store(true, std::memory_order_relaxed);
     // The merged blocks carry this coinbase (without witness) in their AuxPoW.
     if (m_mm_manager) {
         const uint32_t mark = m_coinbase_weight.load(std::memory_order_relaxed);
         m_mm_manager->set_parent_coinbase_shape((mark + 3) / 4, static_cast<uint32_t>(branch_len));
     }
+}
+
+uint32_t MiningInterface::coinbase_sigop_reserve() const
+{
+    if (m_coinbase_sigops_known.load(std::memory_order_relaxed))
+        return m_coinbase_sigops.load(std::memory_order_relaxed) + kCoinbaseSigopMargin;
+    // No coinbase built yet (the first template): one sigop per output the
+    // cap allows (an address payee has at most one), plus a 64-byte scriptSig
+    // whose every byte were CHECKMULTISIG.
+    const uint64_t outputs = m_stratum_config.max_coinbase_outputs + 4;
+    return static_cast<uint32_t>(std::min<uint64_t>(outputs + 64 * 20 + kCoinbaseSigopMargin, UINT32_MAX));
 }
 
 uint32_t MiningInterface::coinbase_weight_reserve() const
@@ -1580,7 +1623,8 @@ MiningInterface::build_connection_coinbase(
         the_root,
         ws.coinbase_text);
     LOG_TRACE << "[build_cb] coinbase_parts built, cb1_len=" << cb1.size();
-    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false);
+    note_coinbase_built(cb1, cb2, ws.segwit_active, ws.merkle_branches.size(), /*fresh_template=*/false,
+                        /*has_state_root=*/!the_root.IsNull());
 
     // ── Phase 4: Write back updated PPLNS cache ──
     {
@@ -1871,7 +1915,7 @@ void MiningInterface::refresh_work()
         }
 
         note_coinbase_built(cb_parts.first, cb_parts.second, segwit_active, merkle_branches.size(),
-                            /*fresh_template=*/true);
+                            /*fresh_template=*/true, /*has_state_root=*/false);
 
         // Compute THE state root for sharechain anchoring (both LTC and merged coinbases)
         uint32_t tmpl_h = wd.m_data.value("height", 0);
@@ -6830,6 +6874,130 @@ nlohmann::json MiningInterface::rest_tx_inject_submit(const std::string& body)
         {"http_status", 503}};
 }
 
+nlohmann::json MiningInterface::rest_tx_inject_validate(const std::string& body)
+{
+    // N3: the installed fn runs NodeCoinState::validate_inject on the node
+    // io_context (thread_safe_wrap), like the submit; nothing is admitted.
+    if (m_tx_inject_validate_fn) {
+        auto j = m_tx_inject_validate_fn(body);
+        if (!j.is_null())
+            return j;
+    }
+    return nlohmann::json{{"ok", false},
+        {"error", "tx-inject validate not wired"},
+        {"http_status", 503}};
+}
+
+// ── GET /api/utxo/scan: the dedicated scan thread ─────────────────────────────
+
+void MiningInterface::set_utxo_scan_fn(utxo_scan_fn_t fn)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    if (m_utxo_scan_stopping)
+        return;
+    m_utxo_scan_fn = std::move(fn);
+    if (m_utxo_scan_fn && !m_utxo_scan_thread.joinable())
+        m_utxo_scan_thread = std::thread([this] { utxo_scan_worker(); });
+}
+
+bool MiningInterface::has_utxo_scan_fn() const
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    return static_cast<bool>(m_utxo_scan_fn) && !m_utxo_scan_stopping;
+}
+
+void MiningInterface::set_utxo_scan_timeout(std::chrono::milliseconds t)
+{
+    std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+    m_utxo_scan_timeout = t;
+}
+
+void MiningInterface::utxo_scan_worker()
+{
+    std::unique_lock<std::mutex> lk(m_utxo_scan_mu);
+    for (;;) {
+        m_utxo_scan_cv.wait(lk, [this] { return m_utxo_scan_stopping || m_utxo_scan_job.has_value(); });
+        if (!m_utxo_scan_job)
+            return;   // stopping, nothing queued
+        UtxoScanJob job = std::move(*m_utxo_scan_job);
+        m_utxo_scan_job.reset();
+        const utxo_scan_fn_t fn = m_utxo_scan_fn;
+        lk.unlock();
+        nlohmann::json j;
+        try {
+            j = fn ? fn(job.query, m_utxo_scan_cancel)
+                   : nlohmann::json{{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        } catch (const std::exception& e) {
+            LOG_WARNING << "[utxo-scan] scan failed: " << e.what();
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"detail", e.what()}, {"http_status", 500}};
+        } catch (...) {
+            j = {{"ok", false}, {"error", "utxo-scan-failed"}, {"http_status", 500}};
+        }
+        lk.lock();
+        m_utxo_scan_busy = false;   // before the answer: a caller that has it may scan again
+        lk.unlock();
+        job.done->set_value(std::move(j));
+        lk.lock();
+    }
+}
+
+nlohmann::json MiningInterface::rest_utxo_scan(const std::string& query)
+{
+    using Clock = std::chrono::steady_clock;
+    std::future<nlohmann::json> fut;
+    std::optional<Clock::time_point> prev_start;
+    Clock::time_point start;
+    std::chrono::milliseconds timeout;
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (!m_utxo_scan_fn || m_utxo_scan_stopping)
+            return {{"ok", false}, {"error", "utxo-scan-not-wired"}, {"http_status", 404}};
+        if (m_utxo_scan_busy)
+            return {{"ok", false}, {"error", "utxo-scan-busy"},
+                    {"detail", "one scan at a time"}, {"http_status", 409}};
+        start = Clock::now();
+        if (m_utxo_scan_last_start && start - *m_utxo_scan_last_start < kUtxoScanMinInterval) {
+            const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+                kUtxoScanMinInterval - (start - *m_utxo_scan_last_start));
+            return {{"ok", false}, {"error", "utxo-scan-rate"},
+                    {"detail", "one scan per " + std::to_string(kUtxoScanMinInterval.count()) + " s"},
+                    {"retry_after_ms", wait.count()}, {"http_status", 429}};
+        }
+        prev_start = m_utxo_scan_last_start;
+        m_utxo_scan_last_start = start;
+        m_utxo_scan_busy = true;
+        auto done = std::make_shared<std::promise<nlohmann::json>>();
+        fut = done->get_future();
+        m_utxo_scan_job = UtxoScanJob{query, std::move(done)};
+        timeout = m_utxo_scan_timeout;
+    }
+    m_utxo_scan_cv.notify_one();
+    if (fut.wait_for(timeout) != std::future_status::ready)
+        return {{"ok", false}, {"error", "utxo-scan-timeout"},
+                {"detail", "the scan did not finish in time; it still runs and its result is dropped"},
+                {"http_status", 504}};
+    nlohmann::json j = fut.get();
+    if (!j.is_object() || !j.contains("scanned")) {
+        // Refused before the pass: the interval stays free.
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        if (m_utxo_scan_last_start == start)
+            m_utxo_scan_last_start = prev_start;
+    }
+    return j;
+}
+
+void MiningInterface::stop_utxo_scan()
+{
+    {
+        std::lock_guard<std::mutex> lk(m_utxo_scan_mu);
+        m_utxo_scan_stopping = true;
+    }
+    m_utxo_scan_cancel.store(true);
+    m_utxo_scan_cv.notify_all();
+    if (m_utxo_scan_thread.joinable() && m_utxo_scan_thread.get_id() != std::this_thread::get_id())
+        m_utxo_scan_thread.join();
+}
+
 nlohmann::json MiningInterface::rest_node_topology()
 {
     // D0.3 seam: prefer the per-coin StatsProvider hook when the wiring layer
@@ -11685,6 +11853,11 @@ void WebServer::stop()
     if (running_) {
         try {
             running_ = false;
+            // The UTXO scan first: an HTTP handler waiting for a pass returns
+            // as soon as the pass sees the cancel, so the join below never
+            // waits out a pass.
+            if (mining_interface_)
+                mining_interface_->stop_utxo_scan();
             acceptor_.close();
             // Stop the dedicated HTTP event loop and join its thread
             http_ioc_.stop();

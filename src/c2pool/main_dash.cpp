@@ -91,9 +91,12 @@
 #include <impl/dash/coin/utxo_lane.hpp>    // dash::coin::UtxoLane — embedded UTXO/fee lane (E2b, #738)
 #include <impl/dash/coin/utxo_snapshot_import.hpp>  // S2: the full UTXO set from a pinned dumptxoutset snapshot
 #include <impl/dash/coin/utxo_status.hpp>            // S2: /local_stats utxo + [EMBED-STATUS] utxo=
+#include <impl/dash/coin/utxo_scan.hpp>              // N1: GET /api/utxo/scan (full-set script scan)
+#include <impl/dash/coin/inject_validate.hpp>        // N3: POST /api/tx-inject/validate reply
 #include <impl/dash/coin/header_chain.hpp>       // dash::coin::HeaderChain — SPV header/tip authority (E2a)
 #include <impl/dash/coin/block_confirm.hpp>      // dash::coin::block_confirm — post-broadcast confirm/orphan verdict
 #include <impl/dash/coin/chain_rpc.hpp>          // dash::coin::chain_rpc — daemonless getbestblockhash/getblockhash/getblockchaininfo
+#include <impl/dash/coin/chainlock_obs_json.hpp> // dash::coin::add_best_chainlock (S4 bestchainlock on getblockchaininfo)
 #include <impl/dash/coin/block_json.hpp>         // dash::coin::block_to_explorer_json — /api/explorer getblock body decode
 #include <impl/dash/alert_service.hpp>            // D-MINER.7 miner-offline alert relay over the sharechain p2p (non-consensus)
 #include <impl/dash/coin/bestblock_diag.hpp>     // #1046 bestblock out=0 diagnostic classifier (RpcNotString/BadHexLen/Ok)
@@ -408,6 +411,57 @@ static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
     }
     out = static_cast<int64_t>(v);
     return true;
+}
+
+// The body POST /api/tx-inject/submit and /api/tx-inject/validate share:
+// {raw_tx, flags?, expiry_height?, max_fee?}. A bad body answers its 400
+// reply (returned); nullopt = parsed into `out`.
+struct TxInjectBody {
+    dash::coin::MutableTransaction tx;
+    uint32_t flags{0};
+    int32_t  expiry{0};
+    uint64_t max_fee{0};
+};
+static std::optional<nlohmann::json> parse_tx_inject_body(const std::string& body, TxInjectBody& out)
+{
+    nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
+        return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
+                              {"http_status", 400}};
+    std::string hex = req["raw_tx"].get<std::string>();
+    hex.erase(std::remove_if(hex.begin(), hex.end(),
+                  [](unsigned char c) { return std::isspace(c); }), hex.end());
+    if (hex.empty() || hex.size() % 2 != 0 ||
+        !std::all_of(hex.begin(), hex.end(),
+                     [](unsigned char c) { return std::isxdigit(c) != 0; }))
+        return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
+                              {"http_status", 400}};
+    out.flags  = 0;
+    out.expiry = 0;
+    if (req.contains("flags") && req["flags"].is_number_unsigned())
+        out.flags = req["flags"].get<uint32_t>();
+    if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
+        out.expiry = req["expiry_height"].get<int32_t>();
+    // S2: the fee the operator allows (duffs). Default 0: the
+    // zero-fee sweep; a fee-paying tx the operator did not ask for
+    // refuses inject-fee-above-max.
+    out.max_fee = 0;
+    if (req.contains("max_fee")) {
+        if (!req["max_fee"].is_number_unsigned())
+            return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
+                                  {"http_status", 400}};
+        out.max_fee = req["max_fee"].get<uint64_t>();
+    }
+    try {
+        auto raw = ParseHex(hex);
+        PackStream ps(raw);
+        ps >> out.tx;
+    } catch (const std::exception& e) {
+        return nlohmann::json{{"ok", false},
+                              {"cause", std::string("tx parse failed: ") + e.what()},
+                              {"http_status", 400}};
+    }
+    return std::nullopt;
 }
 
 // ── PR-2 FORWARD: mined-commitment index arming flags ─────────────────────
@@ -3285,50 +3339,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 "marshals onto the node strand and never races m_inject_pool");
         web_server->get_mining_interface()->set_tx_inject_submit_fn(
             [&node_coin_state](const std::string& body) -> nlohmann::json {
-                nlohmann::json req = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
-                if (!req.is_object() || !req.contains("raw_tx") || !req["raw_tx"].is_string())
-                    return nlohmann::json{{"ok", false}, {"cause", "missing raw_tx hex"},
-                                          {"http_status", 400}};
-                std::string hex = req["raw_tx"].get<std::string>();
-                hex.erase(std::remove_if(hex.begin(), hex.end(),
-                              [](unsigned char c) { return std::isspace(c); }), hex.end());
-                if (hex.empty() || hex.size() % 2 != 0 ||
-                    !std::all_of(hex.begin(), hex.end(),
-                                 [](unsigned char c) { return std::isxdigit(c) != 0; }))
-                    return nlohmann::json{{"ok", false}, {"cause", "raw_tx must be even-length hex"},
-                                          {"http_status", 400}};
-                uint32_t flags  = 0;
-                int32_t  expiry = 0;
-                if (req.contains("flags") && req["flags"].is_number_unsigned())
-                    flags = req["flags"].get<uint32_t>();
-                if (req.contains("expiry_height") && req["expiry_height"].is_number_integer())
-                    expiry = req["expiry_height"].get<int32_t>();
-                // S2: the fee the operator allows (duffs). Default 0: the
-                // zero-fee sweep; a fee-paying tx the operator did not ask for
-                // refuses inject-fee-above-max.
-                uint64_t max_fee = 0;
-                if (req.contains("max_fee")) {
-                    if (!req["max_fee"].is_number_unsigned())
-                        return nlohmann::json{{"ok", false}, {"cause", "max_fee must be an unsigned integer (duffs)"},
-                                              {"http_status", 400}};
-                    max_fee = req["max_fee"].get<uint64_t>();
-                }
-                dash::coin::MutableTransaction tx;
-                try {
-                    auto raw = ParseHex(hex);
-                    PackStream ps(raw);
-                    ps >> tx;
-                } catch (const std::exception& e) {
-                    return nlohmann::json{{"ok", false},
-                                          {"cause", std::string("tx parse failed: ") + e.what()},
-                                          {"http_status", 400}};
-                }
+                TxInjectBody b;
+                if (auto bad = parse_tx_inject_body(body, b))
+                    return *bad;
                 // #157 Slice B: an operator's own loopback submit draws on the
                 // LOCAL inject budget (InjectOrigin::Local) -- its own reserved
                 // rate, never the aggregate-peer budget a flood can exhaust.
                 auto r = node_coin_state.submit_inject(
-                    tx, flags, expiry,
-                    dash::coin::NodeCoinState::InjectOrigin::Local, max_fee);
+                    b.tx, b.flags, b.expiry,
+                    dash::coin::NodeCoinState::InjectOrigin::Local, b.max_fee);
                 // inject-disabled (arm OFF) -> 409; other named refusals -> 422.
                 const int http = r.ok ? 200 : (r.cause == "inject-disabled" ? 409 : 422);
                 return nlohmann::json{
@@ -3338,6 +3357,41 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     {"armed",       node_coin_state.tx_inject_enabled()},
                     {"http_status", http},
                 };
+            });
+        // c2wallet Scan & Plan (N3): POST /api/tx-inject/validate -- the dry
+        // run of the submit above (same body, same io-thread dispatch). It
+        // admits nothing and charges no rate budget; it adds each input's
+        // maturity at the next height and any pool tx spending an input.
+        web_server->get_mining_interface()->set_tx_inject_validate_fn(
+            [&node_coin_state](const std::string& body) -> nlohmann::json {
+                TxInjectBody b;
+                if (auto bad = parse_tx_inject_body(body, b))
+                    return *bad;
+                return dash::coin::inject_validate_json(
+                    node_coin_state.validate_inject(b.tx, b.max_fee));
+            });
+    }
+    // c2wallet Scan & Plan (N1): GET /api/utxo/scan -- read-only scan of the
+    // full UTXO set for a few scripts, direct-local only. The pass runs on the
+    // web server's scan thread (never the io thread) and reads the lane's set
+    // (refused unless it is full and serving) and the mempool's spends; it
+    // changes neither. The detach guard is declared after utxo_lane and
+    // node_coin_state, so on every way out of run_node it cancels a running
+    // pass and waits for it before either is destroyed.
+    auto utxo_scan_source = std::make_shared<dash::coin::UtxoScanSource>(
+        utxo_lane,
+        [&node_coin_state](const std::vector<::core::coin::Outpoint>& ops) {
+            return node_coin_state.mempool().pool_spenders(ops);
+        },
+        testnet);
+    struct UtxoScanDetach {
+        std::shared_ptr<dash::coin::UtxoScanSource> source;
+        ~UtxoScanDetach() { source->detach(); }
+    } utxo_scan_detach{utxo_scan_source};
+    if (web_server) {
+        web_server->get_mining_interface()->set_utxo_scan_fn(
+            [source = utxo_scan_source](const std::string& query, const std::atomic<bool>& cancel) {
+                return source->handle(query, cancel);
             });
     }
     // ── IS/CL MINING-SAFETY HOLD arming (dashd TestPackageTransactions) ─────
@@ -3671,6 +3725,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             / net_subdir / "utxo_leveldb").string();
         if (utxo_lane.full() || utxo_lane.open(utxo_path)) {
             utxo_lane.attach(node_coin_state.mempool());
+            // #2121: the inject ledger follows every mempool change the lane
+            // makes. Fired when a lane entry point returns (block connect,
+            // header-tip rewind), on this same io thread, after its
+            // remove_for_block / put_back_injects: a mined or evicted inject
+            // leaves the inject pool's caps at once, and one a rewind puts back
+            // is re-tracked with its original metadata. set_tip and
+            // submit_inject keep their own reconcile calls.
+            utxo_lane.set_mempool_changed_fn(
+                [&node_coin_state]() { node_coin_state.reconcile_inject_pool(); });
             // Mining gate: coinbase_maturity + reorg buffer = 100 + 6 = 106
             // (DASH_MINING_GATE_DEPTH, utxo_adapter.hpp; mirrors the LTC
             // set_utxo_ready_fn gate) -- embedded templates stay off until
@@ -5530,7 +5593,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         }
                     }
 
-                    return dash::coin::chain_rpc::chain_query(*hc, method, params);
+                    auto answer = dash::coin::chain_rpc::chain_query(*hc, method, params);
+                    // S4: getblockchaininfo carries the best ChainLock the node
+                    // adopted (read-only mirror; known_block from the header
+                    // chain's mutex-guarded height index), or names its absence.
+                    if (method == "getblockchaininfo")
+                        dash::coin::add_best_chainlock(
+                            answer, core::obs::best_chainlock().snapshot(),
+                            [hc](uint32_t h) -> std::optional<uint256> {
+                                if (auto e = hc->get_header_by_height(h)) return e->hash;
+                                return std::nullopt;
+                            });
+                    return answer;
                 });
             std::cout << "[run] daemonless chain queries ARMED "
                          "(getbestblockhash/getblockhash/getblockchaininfo "
