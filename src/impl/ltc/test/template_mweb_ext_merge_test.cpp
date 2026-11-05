@@ -195,7 +195,8 @@ struct Tip {
                                        std::optional<rpc::WorkData>* refused = nullptr,
                                        const MWEBTracker* t = nullptr)
     {
-        return TemplateBuilder::build_template(*chain, pool, false, t ? t : &tracker, budget, refused, true, src);
+        return TemplateBuilder::build_template(*chain, pool, false, t ? t : &tracker, budget, refused, true,
+                                               TemplateBuilder::COINBASE_SIGOP_RESERVE, src);
     }
 };
 

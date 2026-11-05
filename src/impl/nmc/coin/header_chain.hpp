@@ -48,6 +48,7 @@
 #include "block.hpp"
 #include "transaction.hpp"
 #include "aux_id.hpp"        // NMC_AUXPOW_CHAIN_ID SSOT
+#include "aux_expected_index.hpp"  // aux_expected_index (CAuxPow::getExpectedIndex)
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -184,20 +185,6 @@ inline uint32_t read_le32(const unsigned char* p) {
          | (static_cast<uint32_t>(p[1]) << 8)
          | (static_cast<uint32_t>(p[2]) << 16)
          | (static_cast<uint32_t>(p[3]) << 24);
-}
-
-/// Deterministic chain-merkle slot for a (nonce, chain_id, height) triple.
-/// Byte-faithful port of Namecoin/Bitcoin CAuxPow::getExpectedIndex: pins each
-/// aux chain to a pseudo-random-but-fixed slot so the same parent work cannot be
-/// replayed for two chains and inter-chain slot clashes are minimised. The
-/// arithmetic is intentionally wrap-around uint32 (LCG constants 1103515245 /
-/// 12345) to match the reference bit-for-bit.
-inline uint32_t aux_expected_index(uint32_t nonce, int32_t chain_id, unsigned height) {
-    uint32_t rnd = nonce;
-    rnd = rnd * 1103515245u + 12345u;
-    rnd += static_cast<uint32_t>(chain_id);
-    rnd = rnd * 1103515245u + 12345u;
-    return rnd % (1u << height);
 }
 
 /// Result of scanning a parent coinbase scriptSig for the merged-mining

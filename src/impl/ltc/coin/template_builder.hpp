@@ -165,6 +165,10 @@ public:
     static constexpr uint32_t BIP9_BASE_VERSION = 0x20000000u;
     static constexpr uint32_t MAX_BLOCK_WEIGHT  = 4'000'000u;
     static constexpr uint32_t COINBASE_RESERVE  = 2'000u;   // weight reserved for coinbase tx
+    // Sigop cost reserved for the coinbase when the caller does not know it
+    // (EmbeddedCoinNode passes the built coinbase's own): 4,200 legacy
+    // sigops -- 4,000 P2PKH payees and a margin -- at Litecoin's scale.
+    static constexpr int64_t  COINBASE_SIGOP_RESERVE = 4'200 * 4;
 
     // ── Underfill guard (v36 cutover deploy path) ──────────────────────────
     // Detects the "near-empty template on a non-empty mempool" regression:
@@ -237,6 +241,7 @@ public:
         uint32_t           max_weight = MAX_BLOCK_WEIGHT - COINBASE_RESERVE,
         std::optional<rpc::WorkData>* refused = nullptr,
         bool               template_tx_check_strict = true,
+        int64_t            coinbase_sigop_cost = COINBASE_SIGOP_RESERVE,
         mweb_ext::MwebExtSource* mweb_ext = nullptr)
     {
         if (mweb_ext && !mweb_ext->enabled())
@@ -392,6 +397,11 @@ public:
         Mempool::SelectionSeed seed;
         if (mweb_state)
             seed.consumed.emplace(mweb_state->prev_hogex_txid, mweb_state->prev_hogex_vout);
+        // The block's sigop cost (bad-blk-sigops): the coinbase's is the
+        // caller's (the built coinbase's own, under the pool's rules); the
+        // HogEx built below has none (its only output is the HogAddr, its
+        // only input spends one: no legacy, P2SH or v0 witness sigop).
+        seed.sigop_cost = std::max<int64_t>(coinbase_sigop_cost, 0);
         // With litecoind's extension the selection also starts from its txs
         // and its HogEx's inputs: no pool tx spends what they spend or repeats
         // one of them, and the budget leaves room for them and their HogEx.
@@ -615,7 +625,7 @@ public:
                 ext_outcome.detail = *refusal;
             }
             auto without = build_template(chain, pool, is_testnet, mweb_tracker, max_weight, refused,
-                                          template_tx_check_strict, nullptr);
+                                          template_tx_check_strict, coinbase_sigop_cost, nullptr);
             if (!without)
                 ext_outcome.reason = std::string(mweb_ext::kOwnCheckPrefix)
                                    + ext_outcome.reason.substr(std::string(mweb_ext::kMergedCheckPrefix).size());
@@ -701,7 +711,7 @@ public:
         std::optional<rpc::WorkData> refused;
         auto result = TemplateBuilder::build_template(
             m_chain, m_pool, m_testnet, m_mweb_tracker, tx_weight_budget(), &refused,
-            m_template_tx_check_strict.load(std::memory_order_relaxed), m_mweb_ext);
+            m_template_tx_check_strict.load(std::memory_order_relaxed), coinbase_sigop_cost(), m_mweb_ext);
         if (!result && refused) {
             // MWEB is active but there is no MWEB state for the next block yet
             // (a pool or view not ready for the tip gives a served empty
@@ -759,6 +769,19 @@ public:
     /// litecoind's 4,000,000 (bad-blk-weight). Unset: COINBASE_RESERVE.
     void set_coinbase_reserve_fn(std::function<uint32_t()> fn) { m_coinbase_reserve = std::move(fn); }
 
+    /// The legacy sigops the next coinbase carries
+    /// (MiningInterface::coinbase_sigop_reserve). Unset:
+    /// TemplateBuilder::COINBASE_SIGOP_RESERVE.
+    void set_coinbase_sigop_reserve_fn(std::function<uint32_t()> fn) { m_coinbase_sigops = std::move(fn); }
+
+    /// The coinbase's sigop cost under the pool's rules (a coinbase has
+    /// only legacy sigops, x scale).
+    int64_t coinbase_sigop_cost() const {
+        if (!m_coinbase_sigops)
+            return TemplateBuilder::COINBASE_SIGOP_RESERVE;
+        return static_cast<int64_t>(m_coinbase_sigops()) * m_pool.sigop_rules().scale;
+    }
+
     /// The weight the mempool selection may use (never more than
     /// MAX_BLOCK_WEIGHT - COINBASE_RESERVE).
     uint32_t tx_weight_budget() const {
@@ -789,6 +812,7 @@ private:
     Mempool&     m_pool;
     std::function<bool()> m_utxo_ready;  // coinbase maturity gate
     std::function<uint32_t()> m_coinbase_reserve;  // template budget (see set_coinbase_reserve_fn)
+    std::function<uint32_t()> m_coinbase_sigops;   // the coinbase's legacy sigops (see set_coinbase_sigop_reserve_fn)
     bool         m_testnet;
     MWEBTracker* m_mweb_tracker{nullptr};
     mweb_ext::MwebExtSource* m_mweb_ext{nullptr};

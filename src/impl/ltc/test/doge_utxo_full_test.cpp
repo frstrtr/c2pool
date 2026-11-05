@@ -1343,6 +1343,8 @@ TEST(DogeUtxoBootstrap, ASlowPeerDoesNotStallTheBootstrap)
 // 32 MB table files over 2 MB ones.
 TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
 {
+    if (doge::coin::ProcessMemory::read().rss_kb == 0)
+        GTEST_SKIP() << "no /proc/self/status: process residency cannot be read on this platform";
     constexpr int KEYS = 400000;
     auto key = [](int i) {
         char k[16];
@@ -1374,6 +1376,13 @@ TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
             ASSERT_TRUE(b.commit());
         }
     }
+    // Pages of a mapped file count in RssFile, except on tmpfs (a /tmp on
+    // tmpfs is common on CI runners), where they count in RssShmem (proc(5)).
+    // The sum is the mapped-file residency on either.
+    auto mapped_kb = [] {
+        const auto m = doge::coin::ProcessMemory::read();
+        return m.file_kb + m.shmem_kb;
+    };
     auto read_all = [&](bool mmap_reads, size_t file_size, long& file_kb_delta) {
         core::LevelDBOptions o;
         o.mmap_reads = mmap_reads;
@@ -1382,7 +1391,7 @@ TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
         core::LevelDBStore db(dir.string(), o);
         if (!db.open())
             return false;
-        const long before = doge::coin::ProcessMemory::read().file_kb;
+        const long before = mapped_kb();
         std::mt19937 pick(7);
         std::vector<uint8_t> v;
         bool ok = true;
@@ -1390,14 +1399,14 @@ TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
             const int i = static_cast<int>(pick() % KEYS);
             ok = db.get(key(i), v) && v == value(i);
         }
-        file_kb_delta = doge::coin::ProcessMemory::read().file_kb - before;
+        file_kb_delta = mapped_kb() - before;
         return ok;
     };
     long via_mmap = 0, via_pread = 0, reopened = 0;
     EXPECT_TRUE(read_all(true, 2 << 20, via_mmap)) << "mmap reads";
     EXPECT_TRUE(read_all(false, 32 << 20, via_pread)) << "pread reads";
     EXPECT_TRUE(read_all(false, 2 << 20, reopened)) << "pread reads after a reopen";
-    std::cout << "  RssFile grown by a random read of a 48 MB DB: mmap " << via_mmap / 1024 << " MB, pread "
+    std::cout << "  RssFile+RssShmem grown by a random read of a 48 MB DB: mmap " << via_mmap / 1024 << " MB, pread "
               << via_pread / 1024 << " MB\n";
     EXPECT_GT(via_mmap, 16 * 1024) << "the mmap baseline did not show (no /proc/self/status?)";
     EXPECT_LT(via_pread, 4 * 1024);

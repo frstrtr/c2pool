@@ -959,6 +959,19 @@ public:
     static constexpr uint32_t kCoinbaseExtranonceBytes = 16;
     uint32_t coinbase_weight_reserve() const;
     static uint32_t coinbase_weight(const std::string& coinb1, const std::string& coinb2, bool segwit);
+
+    // Sigop budget (LTC): the legacy sigops (GetLegacySigOpCount; a coinbase
+    // has no other kind) the template's coinbase carries -- the largest built
+    // for the current template plus kCoinbaseSigopMargin for a few new
+    // payees; before the first coinbase, one per output max_coinbase_outputs
+    // allows plus the scriptSig's worst case. The embedded template builder
+    // keeps the block's sigop cost within the limit with this reserved.
+    static constexpr uint32_t kCoinbaseSigopMargin = 20;
+    uint32_t coinbase_sigop_reserve() const;
+    /// The legacy sigops of coinb1 | extranonce1 | extranonce2 | coinb2
+    /// (the extranonces, 8 bytes in the OP_RETURN push, as zeros: no
+    /// opcode); nullopt when that does not parse as a transaction.
+    static std::optional<uint32_t> coinbase_sigops(const std::string& coinb1, const std::string& coinb2);
     uint64_t get_mweb_template_refusals() const { return m_mweb_template_refusals.load(std::memory_order_relaxed); }
     double get_mweb_hold_seconds() const;
     // True while the cached template failed the MWEB shape check and was
@@ -1805,6 +1818,8 @@ private:
     // and the per-connection ones built on it): the next template leaves room
     // for it (coinbase_weight_reserve). 0 = none built yet.
     mutable std::atomic<uint32_t> m_coinbase_weight{0};
+    mutable std::atomic<uint32_t> m_coinbase_sigops{0};
+    mutable std::atomic<bool>     m_coinbase_sigops_known{false};
     // Coin-side metrics for /local_stats (see set_coin_metrics_fn).
     mutable std::mutex    m_coin_metrics_mutex;
     coin_metrics_fn_t     m_coin_metrics_fn;

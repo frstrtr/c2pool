@@ -45,6 +45,7 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/log.hpp>
+#include <core/coin/sigop_cost.hpp>
 #include <core/coin/utxo_view_cache.hpp>
 
 #include <nlohmann/json.hpp>
@@ -75,6 +76,7 @@ struct MempoolEntry {
     uint64_t fee{0};            // satoshi (computed from UTXO when available)
     bool     fee_known{false};  // true when fee was computed from UTXO lookups
     time_t   time_added{0};
+    int64_t  sigop_cost{-1};    // GetTransactionSigOpCost under the pool's rules (-1: not known yet)
 
     double feerate() const {
         uint32_t vsize = (weight + 3) / 4;  // ceil(weight/4)
@@ -154,6 +156,44 @@ inline bool is_final_tx(const MutableTransaction& tx, uint32_t block_height, int
     return true;
 }
 
+/// GetTransactionSigOpCost (Litecoin Core 0.21.4 / Dogecoin Core 1.14.9
+/// consensus/tx_verify.cpp) of `tx` under `rules`: the legacy sigops of every
+/// scriptSig and scriptPubKey (GetLegacySigOpCount) x scale; for a non-coinbase
+/// tx also the P2SH sigops (GetP2SHSigOpCount) x scale and the witness sigops
+/// (CountWitnessSigOps), as `rules` enables them. `prevout_spk(i)` is the
+/// scriptPubKey of input i's coin (nullptr: unknown, and so is the cost). A
+/// block tx carries no MWEB data, so litecoind's extra count of an MWEB part's
+/// peg-out scripts never applies.
+template <typename PrevoutSpk>
+inline std::optional<int64_t> tx_sigop_cost(const MutableTransaction& tx,
+                                             const core::coin::sigops::SigopRules& rules,
+                                             PrevoutSpk&& prevout_spk)
+{
+    namespace sg = core::coin::sigops;
+    auto bytes = [](const std::vector<unsigned char>& v) { return sg::Bytes(v.data(), v.size()); };
+    int64_t legacy = 0;
+    for (const auto& in : tx.vin)
+        legacy += sg::script_sigops(bytes(in.scriptSig.m_data), false);
+    for (const auto& out : tx.vout)
+        legacy += sg::script_sigops(bytes(out.scriptPubKey.m_data), false);
+    int64_t cost = legacy * rules.scale;
+    const bool coinbase = tx.vin.size() == 1 && tx.vin[0].prevout.hash.IsNull()
+                       && tx.vin[0].prevout.index == 0xffffffff;
+    if (coinbase)
+        return cost;
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        const std::vector<unsigned char>* spk = prevout_spk(i);
+        if (!spk)
+            return std::nullopt;
+        const auto& in = tx.vin[i];
+        if (rules.p2sh && sg::is_p2sh(bytes(*spk)))
+            cost += static_cast<int64_t>(sg::p2sh_sigops(bytes(*spk), bytes(in.scriptSig.m_data))) * rules.scale;
+        if (rules.witness)
+            cost += sg::witness_sigops(bytes(in.scriptSig.m_data), bytes(*spk), in.scriptWitness.stack);
+    }
+    return cost;
+}
+
 // ─── Mempool ─────────────────────────────────────────────────────────────────
 
 class Mempool {
@@ -164,13 +204,28 @@ public:
     /// Transaction expiry window.
     static constexpr time_t DEFAULT_EXPIRY_SECS = 14 * 24 * 3600;  // 14 days
 
+    /// The block sigop rules of the chain these limits are: DOGE (no
+    /// segwit, 20,000 sigops) for DOGE_LIMITS, else Litecoin's.
+    static core::coin::sigops::SigopRules sigop_rules_for(const core::coin::ChainLimits& l) {
+        const auto& d = core::coin::DOGE_LIMITS;
+        if (l.max_money == d.max_money && l.coinbase_maturity == d.coinbase_maturity
+            && l.pegout_maturity == d.pegout_maturity)
+            return core::coin::sigops::DOGE_SIGOP_RULES;
+        return core::coin::sigops::LTC_SIGOP_RULES;
+    }
+
     explicit Mempool(core::coin::ChainLimits limits = core::coin::LTC_LIMITS,
                      size_t max_bytes  = DEFAULT_MAX_BYTES,
-                     time_t expiry_sec = DEFAULT_EXPIRY_SECS)
+                     time_t expiry_sec = DEFAULT_EXPIRY_SECS,
+                     std::optional<core::coin::sigops::SigopRules> sigop_rules = std::nullopt)
         : m_limits(limits)
+        , m_sigop_rules(sigop_rules.value_or(sigop_rules_for(limits)))
         , m_max_bytes(max_bytes)
         , m_expiry_sec(expiry_sec)
     {}
+
+    /// The block sigop rules the selection keeps to.
+    const core::coin::sigops::SigopRules& sigop_rules() const { return m_sigop_rules; }
 
     /// Update the current chain tip height (for coinbase maturity checks).
     /// Call after each block connection.
@@ -271,6 +326,8 @@ public:
         std::atomic<uint64_t> pegins_seen{0};           // peg-in kernels among them
         std::atomic<uint64_t> pegouts_seen{0};          // peg-out coins among them
         std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
+        std::atomic<uint64_t> template_sigop_skipped{0}; // selections that left a tx out: its sigop cost would pass the block limit
+        std::atomic<int64_t>  template_sigop_cost{0};    // the last selection's block sigop cost (the seed's included)
         std::atomic<uint64_t> orphans_promoted{0};      // orphans admitted once their parent was
         std::atomic<uint64_t> orphans_dropped{0};       // orphans expired, evicted or too large
         std::atomic<uint64_t> admitted_unpriced{0};     // admitted with a view but fee unknown (an input the partial view lacks)
@@ -483,7 +540,8 @@ public:
 
     /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
     ///  "mweb_txs_seen_distinct", "mweb_fee_skipped_distinct_sat",
-    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped", "orphans",
+    ///  "pegins_seen", "pegouts_seen", "template_tx_dropped",
+    ///  "template_sigop_skipped", "template_sigop_cost", "sigop_limit", "orphans",
     ///  "orphans_promoted", "orphans_dropped", "admitted_unpriced",
     ///  "still_unknown"}
     nlohmann::json reject_stats_json() const {
@@ -501,6 +559,9 @@ public:
             {"pegins_seen", m_stats.pegins_seen.load(std::memory_order_relaxed)},
             {"pegouts_seen", m_stats.pegouts_seen.load(std::memory_order_relaxed)},
             {"template_tx_dropped", m_stats.template_tx_dropped.load(std::memory_order_relaxed)},
+            {"template_sigop_skipped", m_stats.template_sigop_skipped.load(std::memory_order_relaxed)},
+            {"template_sigop_cost", m_stats.template_sigop_cost.load(std::memory_order_relaxed)},
+            {"sigop_limit", m_sigop_rules.max_block_cost},
             {"orphans", orphan_count()},
             {"orphans_promoted", m_stats.orphans_promoted.load(std::memory_order_relaxed)},
             {"orphans_dropped", m_stats.orphans_dropped.load(std::memory_order_relaxed)},
@@ -835,6 +896,10 @@ public:
     struct SelectionSeed {
         std::set<std::pair<uint256, uint32_t>> consumed;
         std::set<uint256> in_template;
+        // Sigop cost the block already has outside the selection (the
+        // coinbase, the HogEx, txs already in the template), under the
+        // pool's rules: the selection keeps the total within the limit.
+        int64_t sigop_cost{0};
     };
 
     /// A coin with the HogAddr script (OP_8 PUSH32, a HogEx output 0): the
@@ -904,10 +969,16 @@ public:
         // Per-template consumed outpoints: one entry per input of every
         // selected tx, so no outpoint is spent twice.
         std::set<std::pair<uint256, uint32_t>> consumed;
+        // The block's sigop cost so far (what the template holds outside the
+        // selection) and its limit under the pool's rules.
+        int64_t sigop_used = 0;
         if (seed) {
             selected = seed->in_template;
             consumed = seed->consumed;
+            sigop_used = std::max<int64_t>(seed->sigop_cost, 0);
         }
+        const int64_t sigop_limit = m_sigop_rules.max_block_cost;
+        std::set<uint256> sigop_left_out;  // txs the sigop limit kept out of this selection
 
         auto* utxo = m_utxo.load();
         if (!utxo)
@@ -989,7 +1060,18 @@ public:
                 if (!entry.fee_known) continue;
                 if (total_weight + entry.weight > max_weight) continue;
                 if (!admissible(entry)) continue;
+                // The block's sigop cost stays within the chain's limit
+                // (litecoind / dogecoind ConnectBlock: bad-blk-sigops); a tx
+                // whose cost is not known is left out.
+                const std::optional<int64_t> cost = entry.sigop_cost >= 0
+                    ? std::optional<int64_t>(entry.sigop_cost) : entry_sigop_cost_locked(entry, utxo);
+                if (!cost || sigop_used + *cost > sigop_limit) {
+                    sigop_left_out.insert(entry.txid);
+                    continue;
+                }
 
+                sigop_used += *cost;
+                sigop_left_out.erase(entry.txid);
                 total_weight += entry.weight;
                 total_fees += entry.fee;
                 result.push_back({entry.tx, entry.fee, true});
@@ -999,6 +1081,9 @@ public:
                 progress = true;
             }
         }
+        if (!sigop_left_out.empty())
+            m_stats.template_sigop_skipped.fetch_add(sigop_left_out.size(), std::memory_order_relaxed);
+        m_stats.template_sigop_cost.store(sigop_used, std::memory_order_relaxed);
 
         return {std::move(result), total_fees};
     }
@@ -1557,7 +1642,34 @@ private:
 
         entry.fee = static_cast<uint64_t>(fee);
         entry.fee_known = true;
+        // Every prevout is known now: the sigop cost under the pool's rules.
+        entry.sigop_cost = entry_sigop_cost_locked(entry, utxo).value_or(-1);
         return true;
+    }
+
+    /// The sigop cost of `entry` under the pool's rules, its prevout scripts
+    /// from the view or from in-pool parents (nullopt: one is in neither).
+    std::optional<int64_t> entry_sigop_cost_locked(const MempoolEntry& entry,
+                                                   core::coin::UTXOViewCache* utxo) const {
+        std::vector<std::vector<unsigned char>> spks(entry.tx.vin.size());
+        std::vector<bool> found(entry.tx.vin.size(), false);
+        for (size_t i = 0; i < entry.tx.vin.size(); ++i) {
+            const auto& vin = entry.tx.vin[i];
+            core::coin::Coin coin;
+            if (utxo && utxo->get_coin(core::coin::Outpoint(vin.prevout.hash, vin.prevout.index), coin)) {
+                spks[i] = coin.scriptPubKey.m_data;
+                found[i] = true;
+                continue;
+            }
+            auto parent = m_pool.find(vin.prevout.hash);
+            if (parent != m_pool.end() && vin.prevout.index < parent->second.tx.vout.size()) {
+                spks[i] = parent->second.tx.vout[vin.prevout.index].scriptPubKey.m_data;
+                found[i] = true;
+            }
+        }
+        return tx_sigop_cost(entry.tx, m_sigop_rules, [&](size_t i) -> const std::vector<unsigned char>* {
+            return found[i] ? &spks[i] : nullptr;
+        });
     }
 
     void remove_tx_locked(const uint256& txid) {
@@ -1657,6 +1769,7 @@ private:
     size_t m_max_bytes;
     time_t m_expiry_sec;
     core::coin::ChainLimits m_limits;   // MoneyRange + maturity constants
+    core::coin::sigops::SigopRules m_sigop_rules;  // the block sigop limit and what counts towards it
     std::atomic<uint32_t> m_tip_height{0};  // current chain tip (maturity); set from the io_context and the DOGE full set's thread
     std::atomic<core::coin::UTXOViewCache*> m_utxo{nullptr};  // for template-time input validation
     LockTimeCutoff m_lock_time_cutoff;          // the next block, for admission's finality check (m_mutex)
