@@ -233,6 +233,11 @@ public:
     /// above, the template is the one built without it (the empty body and
     /// c2pool's own HogEx); every outcome is reported to `mweb_ext`.
     /// Without `mweb_ext` (none mode) nothing here changes.
+    /// coinbase_sigop_cost is the coinbase's sigop cost under the pool's
+    /// rules: the block's total (the coinbase, the HogEx, litecoind's imported
+    /// txs, the selection) stays within the chain's limit, and an extension
+    /// whose imports alone would pass it falls back
+    /// (imported-sigops-over-limit).
     static std::optional<rpc::WorkData> build_template(
         const HeaderChain& chain,
         const Mempool&     pool,
@@ -353,6 +358,7 @@ public:
         // template on the tip never imports.
         std::shared_ptr<const mweb_ext::ExtensionBundle> ext;
         mweb_ext::Outcome ext_outcome;
+        int64_t ext_sigops = 0;  // the imported txs' and litecoind's HogEx's sigop cost
         if (mweb_ext) {
             bool view_at_tip = false;
             if (const auto* view = pool.utxo()) {
@@ -368,15 +374,31 @@ public:
             } else {
                 auto cur = mweb_ext->current();
                 ext_outcome.g_age_ms = cur.age_ms;
+                const mweb_ext::CoinLookup coin_of =
+                    [view = pool.utxo()](const mweb_ext::Outpoint& op, core::coin::Coin& coin) {
+                        return view && view->get_coin(core::coin::Outpoint(op.first, op.second), coin);
+                    };
                 std::optional<mweb_ext::Failure> why;
                 if (!cur.bundle)
                     why = mweb_ext::Failure{cur.reason, cur.detail};
                 else
                     why = mweb_ext::check_extension(
                         *cur.bundle, *mweb_state, tip.block_hash, tip.height, static_cast<int64_t>(subsidy),
-                        [view = pool.utxo()](const mweb_ext::Outpoint& op, core::coin::Coin& coin) {
-                            return view && view->get_coin(core::coin::Outpoint(op.first, op.second), coin);
-                        });
+                        coin_of);
+                // The imported txs and litecoind's HogEx count against the
+                // block's sigop limit with the coinbase: imports that alone
+                // pass it fall back.
+                if (!why) {
+                    const auto c = mweb_ext::extension_sigop_cost(*cur.bundle, coin_of, pool.sigop_rules());
+                    const int64_t limit = pool.sigop_rules().max_block_cost;
+                    if (!c || std::max<int64_t>(coinbase_sigop_cost, 0) + *c > limit)
+                        why = mweb_ext::Failure{mweb_ext::kImportedSigopsOverLimit,
+                                                "imported sigop cost " + (c ? std::to_string(*c) : std::string("unknown"))
+                                                + " + coinbase " + std::to_string(coinbase_sigop_cost)
+                                                + " > " + std::to_string(limit)};
+                    else
+                        ext_sigops = *c;
+                }
                 if (why) {
                     ext_outcome.kind = mweb_ext::Outcome::fallback;
                     ext_outcome.reason = why->reason;
@@ -398,10 +420,11 @@ public:
         if (mweb_state)
             seed.consumed.emplace(mweb_state->prev_hogex_txid, mweb_state->prev_hogex_vout);
         // The block's sigop cost (bad-blk-sigops): the coinbase's is the
-        // caller's (the built coinbase's own, under the pool's rules); the
-        // HogEx built below has none (its only output is the HogAddr, its
-        // only input spends one: no legacy, P2SH or v0 witness sigop).
-        seed.sigop_cost = std::max<int64_t>(coinbase_sigop_cost, 0);
+        // caller's (the built coinbase's own, under the pool's rules);
+        // c2pool's own HogEx has none (its only output is the HogAddr, its
+        // only input spends one: no legacy, P2SH or v0 witness sigop);
+        // litecoind's imported txs and HogEx count with theirs (ext_sigops).
+        seed.sigop_cost = std::max<int64_t>(coinbase_sigop_cost, 0) + ext_sigops;
         // With litecoind's extension the selection also starts from its txs
         // and its HogEx's inputs: no pool tx spends what they spend or repeats
         // one of them, and the budget leaves room for them and their HogEx.

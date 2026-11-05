@@ -56,6 +56,7 @@
 /// Header-only and pure apart from MwebExtSource, the thread-safe holder of
 /// the latest G and of the /local_stats counters.
 
+#include "mempool.hpp"
 #include "mweb_builder.hpp"
 #include "mweb_tx_wire.hpp"
 #include "transaction.hpp"
@@ -122,6 +123,7 @@ inline constexpr const char* kImportedInputImmature = "imported-input-immature";
 inline constexpr const char* kImportedInputHogaddr = "imported-input-hogaddr";
 inline constexpr const char* kImportedInputsBelowOutputs = "imported-inputs-below-outputs";
 inline constexpr const char* kImportedFeeMismatch = "imported-fee-mismatch";
+inline constexpr const char* kImportedSigopsOverLimit = "imported-sigops-over-limit";
 inline constexpr const char* kCarriedStateMismatch = "carried-state-mismatch";
 inline constexpr const char* kTxoCountMismatch = "txo-count-mismatch";
 // The merged template failed core::coin::check_template_txs / fee-reconcile
@@ -706,6 +708,57 @@ inline std::optional<Failure> check_extension(const ExtensionBundle& x, const MW
             return fail(kCarriedStateMismatch, "leafset root moved without an input or an output");
     }
     return std::nullopt;
+}
+
+/// The block sigop cost (GetTransactionSigOpCost under `rules`) of what the
+/// extension adds to the canonical block: the imported txs, their inputs'
+/// prevout scripts from the view or an earlier imported tx, and litecoind's
+/// HogEx, whose inputs spend the tip's HogAddr (witness v8) and the imported
+/// pegin outputs (v9): neither P2SH nor v0, so only its outputs' legacy
+/// sigops count (the peg-outs). nullopt when a prevout is in neither.
+inline std::optional<int64_t> extension_sigop_cost(const ExtensionBundle& x, const CoinLookup& coin_of,
+                                                   const core::coin::sigops::SigopRules& rules)
+{
+    std::map<Outpoint, std::vector<unsigned char>> created;
+    int64_t total = 0;
+    for (const auto& t : x.txs) {
+        std::vector<std::vector<unsigned char>> spks(t.tx.vin.size());
+        std::vector<bool> known(t.tx.vin.size(), false);
+        for (size_t i = 0; i < t.tx.vin.size(); ++i) {
+            const Outpoint op{t.tx.vin[i].prevout.hash, t.tx.vin[i].prevout.index};
+            if (auto c = created.find(op); c != created.end()) {
+                spks[i] = c->second;
+                known[i] = true;
+            } else if (core::coin::Coin coin; coin_of && coin_of(op, coin)) {
+                spks[i] = coin.scriptPubKey.m_data;
+                known[i] = true;
+            }
+        }
+        const auto cost = tx_sigop_cost(t.tx, rules, [&](size_t i) -> const std::vector<unsigned char>* {
+            return known[i] ? &spks[i] : nullptr;
+        });
+        if (!cost)
+            return std::nullopt;
+        total += *cost;
+        for (uint32_t n = 0; n < t.tx.vout.size(); ++n)
+            created[{t.txid, n}] = t.tx.vout[n].scriptPubKey.m_data;
+    }
+    static const std::vector<unsigned char> kHogaddrSpk = [] {
+        std::vector<unsigned char> s(34, 0);
+        s[0] = 0x58;
+        s[1] = 0x20;
+        return s;
+    }();
+    const auto& hog = x.hogex_tx;
+    const auto cost = tx_sigop_cost(hog, rules, [&](size_t i) -> const std::vector<unsigned char>* {
+        if (i == 0)
+            return &kHogaddrSpk;
+        auto c = created.find({hog.vin[i].prevout.hash, hog.vin[i].prevout.index});
+        return c == created.end() ? nullptr : &c->second;
+    });
+    if (!cost)
+        return std::nullopt;
+    return total + *cost;
 }
 
 // ─── The holder: the latest G and the counters ──────────────────────────────

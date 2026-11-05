@@ -652,3 +652,54 @@ TEST(LtcTemplateMwebExtMerge, ImportedParentsShipFirstWithoutDepends)
     ASSERT_TRUE(cf.nfees) << cf.why;
     EXPECT_EQ(wd->m_data["coinbasevalue"].get<int64_t>() - kSubsidy, *cf.nfees);
 }
+
+// litecoind's imported txs and HogEx count against the block's sigop limit
+// with the coinbase: here only the HogEx's peg-out output (P2PKH, legacy 1:
+// cost 4). Imports that fit exactly are taken and leave the selection the
+// rest -- a pool tx of cost 400 fits exactly or is left out by 1; imports
+// that alone pass the limit give the empty-body template
+// (imported-sigops-over-limit), the same as without the source.
+TEST(LtcTemplateMwebExtMerge, ImportedSigopsCountAgainstTheBudget)
+{
+    const LitecoindG g;
+    auto x = mx::parse_extension(g.json()).bundle;
+    ASSERT_TRUE(x);
+    Tip probe;
+    fill(probe, g);
+    const mx::CoinLookup coin_of = [&probe](const mx::Outpoint& op, core::coin::Coin& c) {
+        return probe.view.cache->get_coin(core::coin::Outpoint(op.first, op.second), c);
+    };
+    EXPECT_EQ(mx::extension_sigop_cost(*x, coin_of, probe.pool.sigop_rules()), std::optional<int64_t>(4))
+        << "the HogEx's P2PKH peg-out; P, the peg-in and their inputs carry none";
+
+    struct Case { int64_t coinbase; bool imported; bool heavy_in; };
+    for (const auto& k : {Case{80'000 - 4 - 400, true, true}, Case{80'000 - 4 - 399, true, false},
+                          Case{80'000 - 4, true, false}, Case{80'000 - 3, false, false}}) {
+        Tip t;
+        fill(t, g);
+        // A pool tx of 100 OP_CHECKSIG: cost 400.
+        t.view.add(fund(13), 0, 100'000);
+        const MutableTransaction heavy = spend(fund(13), 0, 90'000, 40);
+        MutableTransaction h = heavy;
+        h.vout[0].scriptPubKey.m_data.assign(100, 0xac);
+        ASSERT_FALSE(t.pool.admit(h, t.view.cache.get()));
+        mx::MwebExtSource src("litecoind");
+        src.set_parsed(mx::parse_extension(g.json()), mx::MwebExtSource::clock::now());
+        std::optional<rpc::WorkData> refused;
+        auto with = TemplateBuilder::build_template(*t.chain, t.pool, false, &t.tracker, kBudget, &refused, true,
+                                                    k.coinbase, &src);
+        auto without = TemplateBuilder::build_template(*t.chain, t.pool, false, &t.tracker, kBudget, &refused, true,
+                                                       k.coinbase);
+        ASSERT_TRUE(with && without);
+        EXPECT_EQ(src.templates_imported(), k.imported ? 1u : 0u) << k.coinbase;
+        const auto ids = txids_of(*with);
+        const bool has_heavy = std::find(ids.begin(), ids.end(), compute_txid(h).GetHex()) != ids.end();
+        EXPECT_EQ(has_heavy, k.heavy_in) << k.coinbase;
+        if (!k.imported) {
+            EXPECT_EQ(src.fallback_count(mx::kImportedSigopsOverLimit), 1u);
+            EXPECT_EQ(template_dump(*with), template_dump(*without));
+        }
+        const int64_t used = t.pool.reject_stats_json()["template_sigop_cost"].get<int64_t>();
+        EXPECT_LE(used, 80'000);
+    }
+}
