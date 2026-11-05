@@ -1886,8 +1886,9 @@ int main(int argc, char* argv[]) {
     }
     // Its getblocktemplate poller connects to an IP address: a name would
     // need a DNS query no timeout bounds (the LAN-only runs allow none).
-    // "localhost" is 127.0.0.1.
-    if (ltc_mweb_ext == "litecoind") {
+    // "localhost" is 127.0.0.1. Only the embedded node runs the poller: in
+    // RPC mode --rpchost is used as before, a name included.
+    if (ltc_mweb_ext == "litecoind" && embedded_ltc) {
         if (rpc_host == "localhost")
             rpc_host = "127.0.0.1";
         boost::system::error_code ec;
