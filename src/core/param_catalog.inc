@@ -812,5 +812,16 @@ C2P_PARAM("utility.max_nonce", Meta, INT64, RESTART, C_DASH, LIT, "4294967295", 
 C2P_PARAM("bls.allow_stub", Gate, BOOL, RESTART, C_DASH, LIT, "false", NONE, "knowingly run a bls=stub (BLS-dark) build in a BLS-relying config")
   C2P_ALIAS("bls.allow_stub", BIN_DASH, "--allow-stub-bls", FLAG)
 
+// #866: staged stratum drain (opt-in, SIGUSR1). RESTART: the SIGUSR1 handler
+// and the ramp-down scheduler are set up once at start, and only when one of
+// these flags is given. Either value flag also arms the drain. The 1..1000
+// bounds live in dash::drain::validate() (impl/dash/drain_controller.hpp).
+C2P_PARAM("stratum.drain_on_sigusr1", Stratum, BOOL, RESTART, C_DASH, LIT, "false", NONE, "#866: arm the staged stratum drain on SIGUSR1 (default 4 steps x 25 share periods)")
+  C2P_ALIAS("stratum.drain_on_sigusr1", BIN_DASH, "--drain-on-sigusr1", FLAG)
+C2P_PARAM("stratum.drain_steps", Stratum, INT64, RESTART, C_DASH, LIT, "4", NONE, "#866: equal ramp-down steps for the drain, 1..1000 (arms the drain)")
+  C2P_ALIAS("stratum.drain_steps", BIN_DASH, "--drain-steps", VALUE)
+C2P_PARAM("stratum.drain_step_share_periods", Stratum, INT64, RESTART, C_DASH, LIT, "25", NONE, "#866: share periods between drain steps, 1..1000 (arms the drain)")
+  C2P_ALIAS("stratum.drain_step_share_periods", BIN_DASH, "--drain-step-share-periods", VALUE)
+
 #undef C2P_PARAM
 #undef C2P_ALIAS

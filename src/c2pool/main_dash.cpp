@@ -151,6 +151,7 @@
 #include <impl/dash/dashboard_pplns.hpp>       // PPLNS payout read-model (pool-wide + per-share)
 
 #include <core/stratum_server.hpp>             // core::StratumServer — miner-facing accept-loop (run-path caller)
+#include <impl/dash/drain_controller.hpp>      // #866 staged stratum drain (SIGUSR1, opt-in)
 #include <impl/dash/stratum/work_source.hpp>   // dash::stratum::DASHWorkSource — concrete core::stratum::IWorkSource
 #include <impl/dash/mint_runloop.hpp>          // dash::mint — run-loop share minting (slice 3/3)
 #include <impl/dash/coin/v36_work_policy.hpp>    // dash::coin::resolve_v36_work_policy (DASH v36 network: work source)
@@ -412,6 +413,89 @@ static bool parse_alert_relay_int(const char* flag, const char* s, int64_t& out)
     out = static_cast<int64_t>(v);
     return true;
 }
+
+// ── #866 action 2: staged stratum drain (opt-in, SIGUSR1) ──────────────────
+// --drain-on-sigusr1 arms it with the defaults (4 steps x 25 share periods).
+// --drain-steps N and --drain-step-share-periods N arm it with that value.
+// Unarmed (the default) installs no SIGUSR1 handler, so the signal keeps its
+// default action and run_node behaves exactly as before. Same file-scope
+// posture as g_mn_bridge_max_blocks: written once during argument parsing,
+// read afterwards. The policy lives in impl/dash/drain_controller.hpp.
+struct DrainCli {
+    dash::drain::DrainConfig cfg;
+    bool armed = false;
+};
+DrainCli g_drain;
+
+// One argv entry. Returns 0 = not a drain flag, 1 = consumed (i moved past
+// any value), 2 = bad value (message printed, main exits 2). The value must
+// be a plain decimal; validate() then applies the bounds.
+static int parse_drain_flag(int argc, char** argv, int& i)
+{
+    if (std::strcmp(argv[i], "--drain-on-sigusr1") == 0) {
+        g_drain.armed = true;
+        return 1;
+    }
+    const bool steps   = std::strcmp(argv[i], "--drain-steps") == 0;
+    const bool periods = std::strcmp(argv[i], "--drain-step-share-periods") == 0;
+    if (!steps && !periods) return 0;
+    const char* flag = argv[i];
+    if (i + 1 >= argc) {
+        std::cerr << "error: " << flag << " requires a value\n";
+        return 2;
+    }
+    const char* s = argv[++i];
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || *s == '-' || *s == '+'
+        || v > 0xFFFFFFFFull) {   // fits uint32_t; validate() bounds it
+        std::cerr << "error: " << flag << " expects a positive integer, got '" << s << "'\n";
+        return 2;
+    }
+    (steps ? g_drain.cfg.steps : g_drain.cfg.step_share_periods) = static_cast<uint32_t>(v);
+    const std::string why = dash::drain::validate(g_drain.cfg);
+    if (!why.empty()) {
+        std::cerr << "error: " << flag << " " << s << ": " << why << "\n";
+        return 2;
+    }
+    g_drain.armed = true;
+    return 1;
+}
+
+// What /api/stratum-drain/status reads. The HTTP thread reads it; the run
+// thread publishes the controller once, after the stratum acceptor is up.
+// This object OWNS the controller, so the route's reads stay valid for as long
+// as the route lambda holds it, whatever order run_node unwinds in. status()
+// reads only the controller's atomics, never the StratumServer.
+struct DrainRoute {
+    using Ctl = dash::drain::RampDownController<core::StratumServer>;
+    std::unique_ptr<Ctl> owned;      // run thread only, set once before publish
+    std::atomic<Ctl*>    ctl{nullptr};
+
+    nlohmann::json json() const
+    {
+        nlohmann::json j;
+        j["armed"]              = true;
+        j["steps"]              = g_drain.cfg.steps;
+        j["step_share_periods"] = g_drain.cfg.step_share_periods;
+        const Ctl* c = ctl.load(std::memory_order_acquire);
+        if (!c) {
+            j["state"]  = "unavailable";
+            j["reason"] = "no stratum acceptor, or no SIGUSR1 on this platform";
+            return j;
+        }
+        const dash::drain::DrainStatus s = c->status();
+        j["state"]                  = dash::drain::to_string(s.state);
+        j["step"]                   = s.step;
+        j["initial_sessions"]       = s.initial_sessions;
+        j["target_sessions"]        = s.target_sessions;
+        j["dropped_total"]          = s.dropped_total;
+        j["refused_while_draining"] = s.refused_while_draining;
+        j["off_thread_rejects"]     = s.off_thread_rejects;
+        return j;
+    }
+};
 
 // The body POST /api/tx-inject/submit and /api/tx-inject/validate share:
 // {raw_tx, flags?, expiry_height?, max_fee?}. A bad body answers its 400
@@ -864,6 +948,12 @@ void print_banner(const char* argv0)
         << "        also embedded into the message_data of locally minted v36 shares\n"
         << "        when it validates against that chain's authority key (else not\n"
         << "        embedded, logged). The public v16 wire has no message_data field.\n"
+        << "        --drain-on-sigusr1 [--drain-steps N] [--drain-step-share-periods N]\n"
+        << "        (#866, opt-in) arms a staged stratum drain: kill -USR1 <pid>\n"
+        << "        refuses new miner connections, then sheds the live sessions in\n"
+        << "        N equal steps (default 4) of M share periods each (default 25)\n"
+        << "        down to 0. The node keeps relaying shares and blocks; SIGTERM\n"
+        << "        still stops it. Status: GET /api/stratum-drain/status.\n"
         << "Consensus: X11 PoW + block identity; 2.5 min spacing; 5 DASH post-V20\n"
         << "        base, -1/14 per 210240; masternode payment 3/4 of block value.\n";
 }
@@ -1798,6 +1888,11 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                " alert addressed to this node will be refused";
         }
     }
+
+    // #866: the drain's dashboard route state. Null unless a --drain-* flag
+    // armed it; the controller itself is attached after the stratum start.
+    const std::shared_ptr<DrainRoute> drain_route =
+        g_drain.armed ? std::make_shared<DrainRoute>() : nullptr;
 
     std::unique_ptr<core::WebServer> web_server;
     auto enhanced_node = std::make_shared<dash::EnhancedDashNode>(testnet);
@@ -2841,10 +2936,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         // detector state). Installed BEFORE web_server->start() so the web
         // thread never races the std::function write; the lambda only reads
         // the snapshot the IO thread publishes under the service's mutex.
-        if (alert_relay) {
+        // #866: the stratum drain status shares this one override slot (a
+        // second set_rest_override_fn would replace the first). Read-only;
+        // DrainRoute::json() reads atomics only.
+        if (alert_relay || drain_route) {
             mi->set_rest_override_fn(
-                [ar = alert_relay](const std::string& path) -> std::optional<nlohmann::json> {
-                    if (path == "/api/alert-relay/status") return ar->status_json();
+                [ar = alert_relay, dr = drain_route](const std::string& path) -> std::optional<nlohmann::json> {
+                    if (ar && path == "/api/alert-relay/status") return ar->status_json();
+                    if (dr && path == "/api/stratum-drain/status") return dr->json();
                     return std::nullopt;
                 });
         }
@@ -5246,6 +5345,57 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                      "a coin-P2P feed for embedded templates)\n";
     } else {
         std::cout << "[run] stratum disabled (no --stratum flag)\n";
+    }
+
+    // ── #866 action 2: staged stratum drain on SIGUSR1 (opt-in) ───────────
+    // kill -USR1 <pid> starts it: refuse new stratum connections, then shed
+    // the live sessions in g_drain.cfg.steps equal steps, one step every
+    // step_share_periods share periods, down to 0. The node keeps running as
+    // a share/block relay, and SIGTERM stops it as before, during a drain or
+    // after one. The signal handler and the step timer both run on ioc, the
+    // one thread drop_sessions() allows. The controller checks that at
+    // runtime (running_in_this_thread) instead of assuming it. src/core stays
+    // policy-free: this block only calls the #1870 hooks and polls
+    // get_refused_draining().
+    //
+    // Lifetime: drain_sched and drain_signal are declared after ioc and
+    // stratum_server, so they are destroyed before both. Nothing re-runs ioc
+    // after ioc.run() returns, so a pending step is dropped, never run, once
+    // stratum_server is reset. The controller lives in drain_route.
+    std::unique_ptr<dash::drain::RampDownScheduler<core::StratumServer>> drain_sched;
+#if defined(SIGUSR1)
+    std::unique_ptr<io::signal_set> drain_signal;
+#endif
+    if (drain_route) {
+#if defined(SIGUSR1)
+        if (stratum_server) {
+            drain_route->owned = std::make_unique<DrainRoute::Ctl>(
+                *stratum_server, g_drain.cfg,
+                [&ioc]() { return ioc.get_executor().running_in_this_thread(); });
+            const std::chrono::seconds period = dash::drain::step_period(
+                g_drain.cfg, dash::SharechainConfig::share_period());
+            drain_sched = std::make_unique<dash::drain::RampDownScheduler<core::StratumServer>>(
+                ioc, *drain_route->owned, period);
+            drain_route->ctl.store(drain_route->owned.get(), std::memory_order_release);
+            drain_signal = std::make_unique<io::signal_set>(ioc, SIGUSR1);
+            // One-shot: a later SIGUSR1 queues on this set and is ignored
+            // instead of taking the default (terminate) action.
+            drain_signal->async_wait(
+                [sched = drain_sched.get()](const boost::system::error_code& ec, int) {
+                    if (ec) return;
+                    std::cout << "[run] SIGUSR1: starting the staged stratum drain\n";
+                    sched->start();
+                });
+            std::cout << "[run] stratum drain ARMED (#866): kill -USR1 <pid> sheds miners over "
+                      << g_drain.cfg.steps << " step(s) of " << g_drain.cfg.step_share_periods
+                      << " share period(s) (" << period.count() << " s each);"
+                      << " status at /api/stratum-drain/status\n";
+        } else {
+            std::cout << "[run] stratum drain NOT armed: no stratum acceptor\n";
+        }
+#else
+        std::cout << "[run] stratum drain NOT armed: this platform has no SIGUSR1\n";
+#endif
     }
 
     // ── Think loop: initial election + 15 s keep-fresh tick ───────────────
@@ -11987,6 +12137,12 @@ int main(int argc, char** argv)
     std::string embedded_utxo_fold_fees_db;   // --embedded-utxo-fold-fees PATH
     std::string embedded_utxo_fold_expect;    // --embedded-utxo-fold-expect HEX
     for (int i = 1; i < argc; ++i) {
+        // #866: the --drain-* flags are parsed in parse_drain_flag, ahead of
+        // the chains below, so they add no else-if nesting.
+        if (const int drain_rc = parse_drain_flag(argc, argv, i)) {
+            if (drain_rc == 2) return 2;
+            continue;
+        }
         // The flags are matched by three consecutive else-if chains, because a
         // single chain over all of them nests deeper than MSVC allows (C1061,
         // "blocks nested too deeply"). The first two chains end in

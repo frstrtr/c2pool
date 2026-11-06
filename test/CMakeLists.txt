@@ -1856,6 +1856,19 @@ if (BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(test_dash_stratum_notify_roundtrip PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
     gtest_add_tests(test_dash_stratum_notify_roundtrip "" AUTO)
 
+    # #866 action 2, coin side: the DASH staged ramp-down controller over the
+    # core drain hooks (#1870). Header-only; links core for StratumServer
+    # because the KAT instantiates the controller against it.
+    add_executable(test_dash_drain_controller test_dash_drain_controller.cpp)
+    target_link_libraries(test_dash_drain_controller PRIVATE
+        GTest::gtest_main GTest::gtest
+        dash_x11 core
+        nlohmann_json::nlohmann_json
+        ${Boost_LIBRARIES}
+    )
+    target_link_libraries(test_dash_drain_controller PRIVATE c2pool_payout c2pool_hashrate c2pool_merged_mining)  # OBJECT-lib SCC direct-naming (#22/#39)
+    gtest_add_tests(test_dash_drain_controller "" AUTO)
+
     add_executable(test_dash_stratum_extranonce_split test_dash_stratum_extranonce_split.cpp)
     target_link_libraries(test_dash_stratum_extranonce_split PRIVATE
         GTest::gtest_main GTest::gtest
