@@ -67,13 +67,17 @@ class StratumServer;
 /// HTTP Session handler for incoming connections
 class HttpSession : public std::enable_shared_from_this<HttpSession>
 {
+    // The session's place under WebServer's HTTP cap: declared first, so it
+    // is released after the socket is closed.
+    std::shared_ptr<void> slot_;
     tcp::socket socket_;
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     std::shared_ptr<MiningInterface> mining_interface_;
 
 public:
-    explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface);
+    explicit HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                         std::shared_ptr<void> slot = {});
     void run();
 
 private:
@@ -2589,6 +2593,10 @@ class WebServer
     bool running_;
     bool testnet_;
     Blockchain blockchain_;
+    // Live HTTP sessions and their cap (0: unlimited), from the node's fd
+    // plan: an accept beyond it is closed at once.
+    std::shared_ptr<std::atomic<size_t>> http_live_ = std::make_shared<std::atomic<size_t>>(0);
+    std::atomic<size_t> max_http_connections_{0};
     std::thread server_thread_;
     std::unique_ptr<StratumServer> stratum_server_;
 
@@ -2654,6 +2662,10 @@ public:
     bool is_stratum_running() const;
     void set_stratum_port(uint16_t port);
     uint16_t get_stratum_port() const;
+    /// At most n HTTP sessions at once (0: unlimited); one beyond is closed
+    /// on accept.
+    void set_max_http_connections(size_t n) { max_http_connections_ = n; }
+    size_t http_sessions() const { return http_live_->load(); }
 
     // Dashboard directory for static file serving
     void set_dashboard_dir(const std::string& dir);

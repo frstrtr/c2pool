@@ -267,6 +267,13 @@ if (BUILD_TESTING AND GTest_FOUND)
     # moves exactly when a tx is priced (the tx-triggered refresh). Same
     # folding rule.
     #
+    # ltc_fd_plan_test.cpp: the fd limit split between the stores and the
+    # sockets (doge::coin::FdPlan, #2137): the caps fit at every limit and keep
+    # their floors, nothing changes at 65536, the tables are mapped and the
+    # caps lowered at 256, and at a 256 soft limit the stores under reads and
+    # compaction beside every socket the plan allows stay under it. Same
+    # folding rule.
+    #
     # ltc_full_view_prices_old_inputs_test.cpp: the full LTC UTXO view (#2137
     # S2): a coin from block 1 priced and selected with it, left unpriced by
     # the accrual view; utxo_stats_ltc is litecoind 0.21.4's gettxoutsetinfo
@@ -364,6 +371,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        ltc_fd_plan_test.cpp
         ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp

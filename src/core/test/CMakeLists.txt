@@ -115,6 +115,9 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
     # new tails are pure appends with null-not-zero unknowns, update_coinbase
     # reaches past 1000 records, and find_by_hash needs the full hash. Folded
     # into core_test for the same #769 reason.
+    # web_server_http_cap_test.cpp: the HTTP session cap (the HTTP share of
+    # the node's fd plan): a connection beyond it closed at once, a slot freed
+    # when its connection ends. Same fold-into-core_test reasoning.
     # web_server_ip_mask_test.cpp: issue #1985 miner/peer IP masking for web
     # viewers that are not direct local (/stratum_stats, peer views,
     # /ban_stats). Same fold-into-core_test reasoning as every TU here.
@@ -217,6 +220,7 @@ if (BUILD_TESTING AND (GTest_FOUND OR GTEST_FOUND))
         web_server_daemonless_graph_feed_test.cpp
         web_server_dashboard_data_test.cpp
         web_server_frozen_pool_rate_guard_test.cpp
+        web_server_http_cap_test.cpp
         web_server_ip_mask_test.cpp
         web_server_local_hashps_test.cpp
         web_server_local_only_test.cpp

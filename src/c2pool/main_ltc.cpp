@@ -827,8 +827,12 @@ int main(int argc, char* argv[]) {
     // Interim hardening fix #4: raise RLIMIT_NOFILE to 65536 at startup.
     // One fd per stratum session + HTTP + RPC + P2P + LevelDB — distro-default
     // 1024 starves the accept loop under miner churn. Log the effective limit.
+    // The raise is capped by the hard limit (and on macOS by
+    // kern.maxfilesperproc); a refused raise asks again for half as much.
     {
-        const uint64_t nofile = core::raise_nofile_limit(65536);
+        const core::NofileLimit lim = core::raise_nofile_limit_report(65536);
+        const uint64_t nofile = lim.after;
+        const auto num = [](uint64_t v) { return v == UINT64_MAX ? std::string("unlimited") : std::to_string(v); };
         if (nofile == 0)
 #ifdef _WIN32
             // Windows has no RLIMIT_NOFILE; emit on stdout so the --help smoke
@@ -839,10 +843,12 @@ int main(int argc, char* argv[]) {
             LOG_WARNING << "RLIMIT_NOFILE: unsupported on this platform (or query failed)";
 #endif
         else if (nofile < 65536)
-            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << nofile
-                        << " (< 65536; hard limit too low — raise with ulimit -Hn / limits.conf)";
+            LOG_WARNING << "RLIMIT_NOFILE soft limit is " << num(nofile) << " (was " << num(lim.before)
+                        << "; hard " << num(lim.hard) << ", highest admitted " << num(lim.ceiling)
+                        << "; < 65536: raise with ulimit -Hn / limits.conf / launchctl limit maxfiles)";
         else
-            LOG_INFO << "RLIMIT_NOFILE soft limit: " << nofile;
+            LOG_INFO << "RLIMIT_NOFILE soft limit: " << num(nofile) << " (was " << num(lim.before)
+                     << ", hard " << num(lim.hard) << ")";
     }
 
 
@@ -2173,6 +2179,53 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // The fd limit split between the stores and the sockets
+    // (doge::coin::FdPlan): under a tight limit (a hard limit near macOS's
+    // 256) the stores' tables are mapped, then the peer, stratum and HTTP
+    // caps lowered, so that no store or accept runs out of fds at run time.
+    const uint64_t fd_limit = core::raise_nofile_limit(65536);   // already raised: the limit in effect
+    const bool fd_limit_known = fd_limit != 0 && fd_limit != UINT64_MAX;
+    doge::coin::FdPlan fd_plan;
+    {
+        doge::coin::FdWants w;
+        w.doge_headers = embedded_doge;
+        w.doge_full = embedded_doge && doge_utxo_full;
+        w.ltc_full = embedded_ltc && ltc_utxo_full;
+        int other_merged = 0;
+        for (const auto& spec : merged_chain_specs)
+            if (spec.substr(0, 4) != "DOGE" && spec.substr(0, 4) != "doge")
+                ++other_merged;
+        // The sharechain and found-block stores; LTC's header store and
+        // accrual set; DOGE's accrual set; a header store per other merged chain.
+        w.other_dbs = 2 + (embedded_ltc ? 2 : 0) + (embedded_doge ? 1 : 0) + other_merged;
+        w.merged_chains = static_cast<int>(merged_chain_specs.size());
+        w.sharechain_peers = p2p_max_peers;
+        w.stratum = stratum_config.max_stratum_connections;
+        fd_plan = doge::coin::FdPlan::make(fd_limit, w);
+        if (fd_limit_known) {
+            if (!fd_plan.fits) {
+                LOG_ERROR << "RLIMIT_NOFILE soft limit " << fd_limit << " cannot hold the stores (" << fd_plan.stores
+                          << " fds at most) and the fewest sockets the node runs with (" << fd_plan.sockets
+                          << "): raise it (ulimit -n; launchctl limit maxfiles on macOS)";
+                return 1;
+            }
+            if (fd_plan.mapped)
+                LOG_WARNING << "RLIMIT_NOFILE " << fd_limit << ": tables mapped (no fd kept per table, more"
+                            << " resident memory): DOGE header store " << (fd_plan.doge_headers.mmap_reads ? "yes" : "no")
+                            << ", DOGE full set " << (fd_plan.doge_full.mmap_reads ? "yes" : "no")
+                            << ", LTC full set " << (fd_plan.ltc_full.mmap_reads ? "yes" : "no");
+            if (fd_plan.trimmed)
+                LOG_WARNING << "RLIMIT_NOFILE " << fd_limit << " is too low for the configured socket caps beside the"
+                            << " stores (" << fd_plan.stores << " fds at most): LTC peers " << w.ltc_peers << " -> "
+                            << fd_plan.ltc_peers << ", merged peers " << w.merged_peers << " -> " << fd_plan.merged_peers
+                            << " per chain, sharechain peers " << w.sharechain_peers << " -> " << fd_plan.sharechain_peers
+                            << ", max_stratum_connections " << w.stratum << " -> " << fd_plan.stratum
+                            << ", HTTP sessions " << fd_plan.http << "; raise the limit (ulimit -n) for the full caps";
+            stratum_config.max_stratum_connections = fd_plan.stratum;
+            p2p_max_peers = fd_plan.sharechain_peers;
+        }
+    }
+
     // If --address was given without --node-owner-address, use it for node owner too
     if (!payout_address.empty() && node_owner_address.empty() && node_owner_fee > 0.0)
         node_owner_address = payout_address;
@@ -2444,6 +2497,8 @@ int main(int argc, char* argv[]) {
                 stratum_config.payout_bech32_hrps    = acc.bech32_hrps;
             }
             web_server.get_mining_interface()->set_stratum_config(stratum_config);
+            if (fd_limit_known)
+                web_server.set_max_http_connections(fd_plan.http);
             // Template-tx check mode (template ingress and block assembly).
             if (template_tx_check != "strict" && template_tx_check != "warn") {
                 LOG_WARNING << "[Config] template_tx_check \"" << template_tx_check
@@ -2668,9 +2723,9 @@ int main(int argc, char* argv[]) {
                     full_opts.write_buffer_size = 64 * 1024 * 1024;
                     full_opts.block_cache_size = 128 * 1024 * 1024;
                     // Its own share of the fd budget beside DOGE's header store and
-                    // full set (StoreFds::ltc_full_set): pread while it fits in
-                    // half the limit, else mapped tables (no fd kept per table).
-                    const auto fd_share = doge::coin::StoreFds::ltc_full_set(core::raise_nofile_limit(65536));
+                    // full set (StoreFds::ltc_full_set, as FdPlan planned it): pread
+                    // while it fits, else mapped tables (no fd kept per table).
+                    const auto fd_share = fd_plan.ltc_full;
                     full_opts.max_open_files = fd_share.max_open_files;
                     full_opts.max_file_size = 32 * 1024 * 1024;
                     full_opts.mmap_reads = fd_share.mmap_reads;
@@ -2868,6 +2923,8 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 c2pool::merged::PeerManagerConfig ltc_pm_cfg;
+                ltc_pm_cfg.max_peers = fd_plan.ltc_peers;   // FdPlan: 20 unless the fd limit is tight
+                ltc_pm_cfg.min_peers = std::min(ltc_pm_cfg.min_peers, ltc_pm_cfg.max_peers);
                 ltc_pm_cfg.connect_only = connect_only_peers(
                     ltc_connect, static_cast<uint16_t>(coind_p2p_port > 0 ? coind_p2p_port : 9333), "EMB-LTC");
                 embedded_broadcaster = std::make_unique<c2pool::merged::CoinBroadcaster>(
@@ -7702,6 +7759,7 @@ int main(int argc, char* argv[]) {
                         std::string doge_db = (core::filesystem::config_path()
                             / doge_net_dir / "embedded_headers").string();
                         doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                        doge_chain->set_store_share(fd_plan.doge_headers);
                         {
                             bool doge_ok = false;
                             for (int attempt = 1; attempt <= 5; ++attempt) {
@@ -7710,6 +7768,7 @@ int main(int argc, char* argv[]) {
                                             << attempt << "/5) — retrying in 2s...";
                                 std::this_thread::sleep_for(std::chrono::seconds(2));
                                 doge_chain = std::make_unique<doge::coin::HeaderChain>(*doge_params_ptr, doge_db);
+                                doge_chain->set_store_share(fd_plan.doge_headers);
                             }
                             if (!doge_ok)
                                 LOG_WARNING << "DOGE HeaderChain LevelDB init failed after 5 attempts — in-memory only";
@@ -7751,9 +7810,11 @@ int main(int argc, char* argv[]) {
                             core::LevelDBOptions full_opts;
                             full_opts.write_buffer_size = 64 * 1024 * 1024;
                             full_opts.block_cache_size = 128 * 1024 * 1024;
-                            full_opts.max_open_files = doge::coin::StoreFds::full_set(core::raise_nofile_limit(65536));
+                            // The share the node planned (FdPlan): pread, or mapped tables
+                            // under a tight fd limit.
+                            full_opts.max_open_files = fd_plan.doge_full.max_open_files;
                             full_opts.max_file_size = 32 * 1024 * 1024;
-                            full_opts.mmap_reads = false;
+                            full_opts.mmap_reads = fd_plan.doge_full.mmap_reads;
                             // malloc's thread arenas (813 MB of anonymous mappings there).
                             doge::coin::ProcessMemory::limit_arenas();
                             // A set another c2pool holds (the same --data-dir) is waited
@@ -8036,8 +8097,8 @@ int main(int argc, char* argv[]) {
                                 pm_cfg.min_peers = 1;
                                 pm_cfg.disable_discovery = true;
                             } else {
-                                pm_cfg.max_peers = 20;
-                                pm_cfg.min_peers = 4;
+                                pm_cfg.max_peers = fd_plan.merged_peers;   // FdPlan: 20 unless the fd limit is tight
+                                pm_cfg.min_peers = std::min(4, pm_cfg.max_peers);
                             }
                             if (cfg.symbol == "DOGE" || cfg.symbol == "doge")
                                 pm_cfg.connect_only = connect_only_peers(

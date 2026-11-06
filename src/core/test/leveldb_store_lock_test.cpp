@@ -15,7 +15,9 @@
 //     prefix: a sharing violation on <dir>/LOCK);
 //   * open_waiting takes the DB once its holder closes;
 //   * a sharechain store another c2pool holds exits the node with what to do;
-//   * a LOCK file nobody holds (a crash leaves one): open() opens.
+//   * a LOCK file nobody holds (a crash leaves one): open() opens;
+//   * a Snapshot may outlive close() and the store: close() releases it
+//     while the DB exists, and a scan through one of an earlier open fails.
 
 #include <gtest/gtest.h>
 
@@ -29,8 +31,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -277,3 +281,66 @@ TEST(LevelDBStoreLock, AHeldSharechainStoreExitsTheNode)
                 "stop the other c2pool using this --data-dir");
 }
 #endif
+
+// A LevelDBStore::Snapshot may outlive close() and the store: close()
+// releases the snapshots still held while its DB exists, and a copy dropped
+// afterwards releases nothing (it used to release through the DB close()
+// had deleted).
+TEST(LevelDBStoreSnapshot, ASnapshotDroppedAfterCloseTouchesNoDb)
+{
+    TempDir t;
+    auto db = std::make_unique<core::LevelDBStore>(t.dir.string(), core::LevelDBOptions{});
+    ASSERT_TRUE(db->open());
+    ASSERT_TRUE(db->put("k", bytes("one")));
+    auto snap = db->snapshot();
+    ASSERT_TRUE(snap);
+    auto copy = snap;
+    ASSERT_TRUE(db->put("k", bytes("two")));
+    db->close();
+    EXPECT_FALSE(db->snapshot()) << "a closed store has no snapshot";
+    EXPECT_FALSE(db->for_each_prefix_at(snap, "k", [](std::string_view, std::string_view) { return true; }));
+    snap.reset();
+
+    // The store itself destroyed while a copy is held.
+    ASSERT_TRUE(db->open());
+    auto held = db->snapshot();
+    ASSERT_TRUE(held);
+    db.reset();
+    held.reset();
+    copy.reset();
+}
+
+// A snapshot of an earlier open is refused by a scan of the reopened store,
+// and dropping it releases none of the new open's snapshots.
+TEST(LevelDBStoreSnapshot, ASnapshotOfAnEarlierOpenIsRefused)
+{
+    TempDir t;
+    core::LevelDBStore db(t.dir.string(), core::LevelDBOptions{});
+    ASSERT_TRUE(db.open());
+    ASSERT_TRUE(db.put("k", bytes("one")));
+    auto stale = db.snapshot();
+    ASSERT_TRUE(stale);
+    db.close();
+
+    ASSERT_TRUE(db.open());
+    ASSERT_TRUE(db.put("k", bytes("two")));
+    auto fresh = db.snapshot();
+    ASSERT_TRUE(fresh);
+    ASSERT_TRUE(db.put("k", bytes("three")));
+    std::string seen;
+    const auto scan = [&](const core::LevelDBStore::Snapshot& at) {
+        seen.clear();
+        return db.for_each_prefix_at(at, "k", [&](std::string_view, std::string_view v) {
+            seen.assign(v.data(), v.size());
+            return true;
+        });
+    };
+    if (stale.get() != fresh.get())   // the same address reused is the new open's own
+        EXPECT_FALSE(scan(stale));
+    stale.reset();
+    EXPECT_TRUE(scan(fresh));
+    EXPECT_EQ(seen, "two") << "the new open's snapshot keeps its view";
+    fresh.reset();
+    EXPECT_TRUE(scan(nullptr));
+    EXPECT_EQ(seen, "three");
+}

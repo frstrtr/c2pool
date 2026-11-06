@@ -311,8 +311,10 @@ static bool is_valid_graph_param(const std::string& s)
 }
 
 /// HttpSession Implementation
-HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface)
-    : socket_(std::move(socket))
+HttpSession::HttpSession(tcp::socket socket, std::shared_ptr<MiningInterface> mining_interface,
+                         std::shared_ptr<void> slot)
+    : slot_(std::move(slot))
+    , socket_(std::move(socket))
     , mining_interface_(mining_interface)
 {
 }
