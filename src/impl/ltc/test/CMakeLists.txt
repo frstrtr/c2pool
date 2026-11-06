@@ -357,6 +357,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        listen_port_guard_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
         mempool_bip68_test.cpp
