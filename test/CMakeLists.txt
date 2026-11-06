@@ -792,9 +792,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # DASH_FIXTURE_DIR: the golden reads the real testnet mnlistdiff captures.
     add_executable(test_dash_simplifiedmns test_dash_simplifiedmns.cpp
         test_dash_v24_protx_codecs.cpp)
+    # dash_bls_verify: Core's BLS key / signature decoding in the v24 payload
+    # rules (vendor/bls_canonical.hpp; a fail-closed stub without dashbls).
     target_link_libraries(test_dash_simplifiedmns PRIVATE
         GTest::gtest_main GTest::gtest
-        dash_x11 core
+        dash_bls_verify dash_x11 core
         nlohmann_json::nlohmann_json
         ${Boost_LIBRARIES}
     )

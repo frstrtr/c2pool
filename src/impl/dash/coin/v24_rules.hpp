@@ -21,9 +21,10 @@
 /// state alone, i.e. every check Core runs BEFORE its first check that needs
 /// the masternode list, the UTXO set, the inputs hash or a signature. It
 /// stops there, so for a payload that passes it Core may still reject the
-/// transaction on state. Not ported: those stateful checks. BLS operator-key
-/// validity is approximated by "not all zero bytes" (a real point check
-/// needs the BLS backend).
+/// transaction on state. Not ported: those stateful checks. BLS operator keys
+/// and the type-2/4 signatures are checked with the dashbls backend exactly
+/// as Core decodes them (vendor/bls_canonical.hpp); a build without the
+/// backend refuses such payloads as unverifiable instead of accepting them.
 ///
 /// Wiring. The folds trust chainlocked blocks for ProTx validity (design
 /// §3.3.4); nothing here is called by a fold yet. The fold-side rule S2 does
@@ -99,6 +100,9 @@ struct ProviderTxRules
     bool evo_shares_active{false};   ///< DEPLOYMENT_EVO_SHARES: not signed by v24.0.0 masternodes
     bool ipv4_optional{false};       ///< DEPLOYMENT_IPV4_OPTIONAL: never on mainnet/regtest, always on testnet/devnet
     vendor::NetInfoRules net{vendor::NetInfoRules::mainnet()};
+    /// Core's BLS key / signature encoding rules: the dashbls backend
+    /// (vendor/bls_canonical.hpp). Only tests replace it.
+    vendor::BlsEncodingChecks bls{};
 
     static ProviderTxRules for_block(DashNetwork n, uint32_t height)
     {
@@ -160,10 +164,16 @@ inline bool pays_key(const OPScript& s, const uint160& key)
     return h && *h == key;
 }
 
-/// CBLSLazyPublicKey::Get().IsValid(), approximated (see the file comment).
-inline bool opkey_plausible(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& k)
+/// CBLSLazyPublicKey::Get().IsValid() under the payload's scheme
+/// (vendor::bls_pubkey_core_valid). Without a BLS backend the key cannot be
+/// checked and the payload is refused, never accepted.
+inline Refusal opkey_refusal(const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& k, bool legacy,
+                             const vendor::BlsEncodingChecks& bls)
 {
-    return std::any_of(k.begin(), k.end(), [](uint8_t b) { return b != 0; });
+    const auto valid = bls.pubkey_valid(k, legacy);
+    if (!valid) return std::string("unverifiable-operator-key (no BLS backend in this build)");
+    if (!*valid) return std::string("bad-protx-key-null");
+    return std::nullopt;
 }
 
 } // namespace provider_rules_detail
@@ -251,7 +261,7 @@ share_list_refusal(const vendor::CollateralShares& shares, uint32_t early_period
 
 // ── IsTriviallyValid, per payload ──────────────────────────────────────────
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProRegTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProRegTx& p, const vendor::BlsEncodingChecks& bls = {})
 {
     using namespace provider_rules_detail;
     if (!vendor::ProTxVersion::is_known(p.nVersion)) return "bad-protx-version";
@@ -266,7 +276,10 @@ inline std::optional<std::string> trivial_refusal(const vendor::CProRegTx& p)
         if (p.nEarlyPeriodBlocks != 0 || p.nEarlyPenalty != 0) return "bad-protx-shares-empty-fields";
         if (p.keyIDOwner.IsNull()) return "bad-protx-key-null";
     }
-    if (!opkey_plausible(p.pubKeyOperator) || p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    // Core: !pubKeyOperator.Get().IsValid() || keyIDVoting.IsNull(), one code.
+    // The voting key first, so a build without BLS still names it.
+    if (p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    if (auto why = opkey_refusal(p.pubKeyOperator, p.nVersion == vendor::ProTxVersion::LEGACY_BLS, bls)) return why;
     if (p.IsShared()) {
         if (auto why = share_list_refusal(p.shares, p.nEarlyPeriodBlocks, p.nEarlyPenalty,
                                           collateral_amount(p.nType), p.keyIDVoting))
@@ -282,7 +295,7 @@ inline std::optional<std::string> trivial_refusal(const vendor::CProRegTx& p)
     return std::nullopt;
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProUpServTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProUpServTx& p, const vendor::BlsEncodingChecks& = {})
 {
     using namespace provider_rules_detail;
     if (!vendor::ProTxVersion::is_known(p.nVersion)) return "bad-protx-version";
@@ -294,30 +307,33 @@ inline std::optional<std::string> trivial_refusal(const vendor::CProUpServTx& p)
     return vendor::netinfo_trivial_refusal(ni, p.nType);
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProUpRegTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProUpRegTx& p, const vendor::BlsEncodingChecks& bls = {})
 {
     using namespace provider_rules_detail;
     if (!vendor::ProTxVersion::is_known(p.nVersion)) return "bad-protx-version";
     if (p.nMode != 0) return "bad-protx-mode";
-    if (!opkey_plausible(p.pubKeyOperator) || p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    // Core: !pubKeyOperator.Get().IsValid() || keyIDVoting.IsNull(), one code.
+    // The voting key first, so a build without BLS still names it.
+    if (p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    if (auto why = opkey_refusal(p.pubKeyOperator, p.nVersion == vendor::ProTxVersion::LEGACY_BLS, bls)) return why;
     return payout_list_refusal(p.owner_payouts(), uint160{}, p.keyIDVoting);
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProUpRevTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProUpRevTx& p, const vendor::BlsEncodingChecks& = {})
 {
     if (!vendor::ProTxVersion::is_known(p.nVersion)) return "bad-protx-version";
     if (p.nReason > vendor::CProUpRevTx::REASON_LAST) return "bad-protx-reason";
     return std::nullopt;
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProDisTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProDisTx& p, const vendor::BlsEncodingChecks& = {})
 {
     if (p.nVersion == 0 || p.nVersion > vendor::CProDisTx::CURRENT_VERSION) return "bad-prodis-version";
     if (p.vchSigs.empty() || p.vchSigs.size() > vendor::CProRegTx::MAX_SHARES) return "bad-prodis-sig-count";
     return std::nullopt;
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProUpShareTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProUpShareTx& p, const vendor::BlsEncodingChecks& = {})
 {
     using namespace provider_rules_detail;
     if (p.nVersion == 0 || p.nVersion > vendor::CProUpShareTx::CURRENT_VERSION) return "bad-proupshare-version";
@@ -326,12 +342,13 @@ inline std::optional<std::string> trivial_refusal(const vendor::CProUpShareTx& p
     return std::nullopt;
 }
 
-inline std::optional<std::string> trivial_refusal(const vendor::CProUpSharedRegTx& p)
+inline std::optional<std::string> trivial_refusal(const vendor::CProUpSharedRegTx& p, const vendor::BlsEncodingChecks& bls = {})
 {
     using namespace provider_rules_detail;
     if (p.nVersion == 0 || p.nVersion > vendor::CProUpSharedRegTx::CURRENT_VERSION)
         return "bad-proupsharedreg-version";
-    if (!opkey_plausible(p.pubKeyOperator) || p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    if (p.keyIDVoting.IsNull()) return "bad-protx-key-null";
+    if (auto why = opkey_refusal(p.pubKeyOperator, /*legacy=*/false, bls)) return why;   // always basic
     // (pubKeyOperator.IsLegacy(): the payload is always read in the basic
     // scheme, so this check cannot fire on a decoded payload.)
     if (p.vchSigs.empty() || p.vchSigs.size() > vendor::CProRegTx::MAX_SHARES)
@@ -347,9 +364,13 @@ namespace provider_rules_detail {
 template <typename T>
 inline Refusal validated_payload(const std::vector<uint8_t>& payload, const ProviderTxRules& rules, T& out)
 {
-    if (!vendor::decode_special_payload(payload, out)) return "bad-protx-payload";
+    if (!vendor::decode_payload_structure(payload, out)) return "bad-protx-payload";
+    // GetTxPayload also fails on a type-2/4 BLS signature Core cannot decode.
+    const auto sig_ok = vendor::payload_bls_objects_decode(out, rules.bls);
+    if (!sig_ok) return std::string("unverifiable-bls-signature (no BLS backend in this build)");
+    if (!*sig_ok) return "bad-protx-payload";
     if (out.nVersion > protx_max_version(rules.v19_active, rules.v24_active)) return "bad-protx-version";
-    return trivial_refusal(out);
+    return trivial_refusal(out, rules.bls);
 }
 
 } // namespace provider_rules_detail

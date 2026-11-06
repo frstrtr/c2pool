@@ -55,6 +55,7 @@
 
 #include <impl/dash/coin/vendor/shim.hpp>
 #include <impl/dash/coin/vendor/netinfo.hpp>
+#include <impl/dash/coin/vendor/bls_canonical.hpp>
 
 #include <core/uint256.hpp>
 #include <core/hash.hpp>
@@ -677,12 +678,12 @@ protx_operator_sign_hash(const std::vector<uint8_t>& payload)
 
 // ── Payload decoding ──────────────────────────────────────────────────────
 
-/// Core's GetTxPayload<T>: decode and require the payload to be consumed
-/// exactly. No version gate: a payload that is only an unknown nVersion
-/// decodes (to an object carrying just that version), as in Core, so the
-/// rule checks can name the reject reason.
+/// The payload's structure: decode and require it to be consumed exactly.
+/// No version gate (a payload that is only an unknown nVersion decodes to an
+/// object carrying just that version, as in Core) and no BLS math, so the
+/// folds' reading of v1/v2 payloads stays exactly the pre-v24 one.
 template <typename T>
-inline bool decode_special_payload(const std::vector<uint8_t>& payload, T& out)
+inline bool decode_payload_structure(const std::vector<uint8_t>& payload, T& out)
 {
     if (payload.empty()) return false;
     try {
@@ -694,16 +695,53 @@ inline bool decode_special_payload(const std::vector<uint8_t>& payload, T& out)
     }
 }
 
+/// The BLS signature a type-2 / type-4 payload carries is a plain
+/// CBLSSignature in Core (not a lazy wrapper): its unserializer throws on an
+/// encoding that is canonical under neither scheme, so GetTxPayload fails.
+/// nullopt: no BLS backend, cannot decide. true for every other payload type.
+template <typename T>
+inline constexpr bool payload_has_bls_sig =
+    std::is_same_v<T, CProUpServTx> || std::is_same_v<T, CProUpRevTx>;
+
+template <typename T>
+inline std::optional<bool> payload_bls_objects_decode(const T& p, const BlsEncodingChecks& bls)
+{
+    if constexpr (payload_has_bls_sig<T>) {
+        if (!p.version_known()) return true;   // Core read nothing after nVersion
+        return bls.sig_decodes(p.sig, p.nVersion == ProTxVersion::LEGACY_BLS);
+    } else {
+        (void)p; (void)bls;
+        return true;
+    }
+}
+
+/// Core's GetTxPayload<T>: the structure, plus the BLS signature encoding
+/// rule of types 2 and 4 (an undecidable signature, without a BLS backend,
+/// counts as a failure). The folds use parse_protx_payload instead. Only the
+/// types 2 and 4 instantiations reference the BLS backend (dash_bls_verify).
+template <typename T>
+inline bool decode_special_payload(const std::vector<uint8_t>& payload, T& out)
+{
+    if (!decode_payload_structure(payload, out)) return false;
+    if constexpr (payload_has_bls_sig<T>) {
+        const auto sig_ok = payload_bls_objects_decode(out, BlsEncodingChecks{});
+        return sig_ok.has_value() && *sig_ok;
+    } else {
+        return true;
+    }
+}
+
 /// The fold-facing parse. True only when the payload decodes exactly AND
 /// its version is one this codec knows (ProTx 1..3, types 10-12 version 1):
 /// an unknown version FAILS here and never yields a partially read object.
 /// Callers fail closed on false (refuse the block or the fold, never skip).
 /// Whether the version is VALID at a given height is a separate rule
-/// (coin/v24_rules.hpp).
+/// (coin/v24_rules.hpp). No BLS math: chainlocked blocks carry decodable
+/// signatures, and the fold must work without a BLS backend.
 template <typename T>
 inline bool parse_protx_payload(const std::vector<uint8_t>& payload, T& out)
 {
-    if (!decode_special_payload(payload, out)) return false;
+    if (!decode_payload_structure(payload, out)) return false;
     return out.version_known();
 }
 
