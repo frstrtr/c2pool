@@ -21,6 +21,11 @@
 //                           contiguous, starting at anchor+1
 //   C2POOL_REPLAY_MEMBERS   optional quorum-member sets, format below
 //   C2POOL_REPLAY_STOP      optional height to stop at (default: end of file)
+//   C2POOL_REPLAY_NETWORK   optional "testnet" (FoldGates::testnet())
+//   C2POOL_REPLAY_DUMP      optional path: the final list, one line per MN
+//                           (proTxHash nVersion payouts shares early-terms),
+//                           to compare with dashd's `protx list` -- the v24
+//                           fields no SML root commits
 //
 // ── Trust posture, stated plainly ─────────────────────────────────────────
 //
@@ -147,6 +152,10 @@ TEST(DashReplayRun, AnchorToTipRootChain)
 
     FoldConfig cfg;
     cfg.enabled = true;
+    // C2POOL_REPLAY_NETWORK=testnet: testnet chain parameters (Dash Core v24
+    // active from 1,578,000); mainnet otherwise.
+    if (const char* n = env_or_null("C2POOL_REPLAY_NETWORK"); n && std::string(n) == "testnet")
+        cfg.gates = dash::coin::replay::FoldGates::testnet();
     DmlFoldEngine engine(cfg);
     const std::string seed_err =
         dash::coin::replay::seed_engine_from_prestate(engine, ps);
@@ -188,6 +197,9 @@ TEST(DashReplayRun, AnchorToTipRootChain)
 
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t folded = 0, matched = 0, bytes = 0;
+    // Transition and payee-check totals (diagnostics, not the proof).
+    uint64_t n_reg = 0, n_upd = 0, n_rev = 0, n_spent = 0, n_banned = 0, n_revived = 0;
+    uint64_t n_payee_verified = 0, n_payee_unchecked = 0;
     uint32_t first_h = 0, last_h = 0;
     uint32_t diverged_at = 0;
     std::string diverge_reason, diverge_computed, diverge_committed;
@@ -235,6 +247,9 @@ TEST(DashReplayRun, AnchorToTipRootChain)
         }
         if (folded == 0) first_h = h;
         ++folded; ++matched; last_h = h;
+        n_reg += r.registered; n_upd += r.updated; n_rev += r.revoked;
+        n_spent += r.collateral_spent; n_banned += r.banned; n_revived += r.revived;
+        if (r.payee_paid_verified) ++n_payee_verified; else ++n_payee_unchecked;
 
         if (h % 500 == 0) {
             const double secs = std::chrono::duration<double>(
@@ -260,7 +275,12 @@ TEST(DashReplayRun, AnchorToTipRootChain)
               << "  wall clock        " << secs << " s\n"
               << "  fold rate         " << (folded / std::max(secs, 1e-9)) << " blocks/s\n"
               << "  member lookups    " << member_lookups
-              << " (misses " << member_misses << ")\n";
+              << " (misses " << member_misses << ")\n"
+              << "  transitions       registered=" << n_reg << " updated=" << n_upd
+              << " revoked=" << n_rev << " collateral_spent=" << n_spent
+              << " banned=" << n_banned << " revived=" << n_revived << "\n"
+              << "  payee checks      verified=" << n_payee_verified
+              << " not checked=" << n_payee_unchecked << "\n";
     if (diverged_at)
         std::cout << "  *** FIRST DIVERGENCE at h=" << diverged_at << "\n"
                   << "      computed  " << diverge_computed << "\n"
@@ -269,6 +289,33 @@ TEST(DashReplayRun, AnchorToTipRootChain)
     else
         std::cout << "  DIVERGENCE        none\n";
     std::cout << "=============================\n";
+
+    if (const char* dump = env_or_null("C2POOL_REPLAY_DUMP")) {
+        std::ofstream out(dump);
+        auto hx = [](const std::vector<unsigned char>& b) {
+            static const char* d = "0123456789abcdef";
+            std::string s;
+            for (unsigned char c : b) { s += d[c >> 4]; s += d[c & 15]; }
+            return s.empty() ? std::string("-") : s;
+        };
+        for (const auto& [protx, st] : engine.entries()) {
+            out << protx.GetHex() << " " << st.nVersion << " payouts=";
+            if (st.v24.payouts.empty()) out << hx(st.scriptPayout.m_data) << ":legacy";
+            for (size_t i = 0; i < st.v24.payouts.size(); ++i)
+                out << (i ? "," : "") << hx(st.v24.payouts[i].scriptPayout.m_data) << ":"
+                    << st.v24.payouts[i].reward;
+            out << " shares=";
+            for (size_t i = 0; i < st.v24.shares.size(); ++i) {
+                const auto& sh = st.v24.shares[i];
+                out << (i ? "," : "") << sh.amount << ":" << hx(sh.scriptRefund.m_data) << ":"
+                    << hx(sh.scriptReward.m_data);
+            }
+            if (st.v24.shares.empty()) out << "-";
+            out << " early=" << st.v24.nEarlyPeriodBlocks << ":" << st.v24.nEarlyPenalty
+                << " banned=" << (st.IsBanned() ? 1 : 0) << "\n";
+        }
+        std::cout << "  final list dumped to " << dump << "\n";
+    }
 
     EXPECT_EQ(diverged_at, 0u)
         << "replay diverged at h=" << diverged_at << ": " << diverge_reason
