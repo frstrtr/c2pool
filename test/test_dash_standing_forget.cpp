@@ -35,6 +35,12 @@
 // the control: it must still get the full transient bracket, so the fix cannot
 // pass by suppressing the bracket wholesale.
 //
+// #950 F1 reshaped the control, not the property: the standing set now follows
+// the CURRENT template, so a tx that ARRIVES in a later template becomes standing
+// itself (test_dash_standing_current_template.cpp). The control is therefore a tx
+// from an OLDER template — still retained in m_known_txs, so send_shares can
+// back it, but no longer current, so it is not standing and must be bracketed.
+//
 // Real types throughout (NodeImpl, dash::Peer, core::Socket, message codecs);
 // the only stub is the ICommunicator error sink the harness hands core::Socket.
 // The share is hand-built (not mined): send_shares packs it and reads only
@@ -123,7 +129,13 @@ TEST(DashStandingForget, ShareBroadcastDoesNotForgetStandingSeededTx)
 
     dash::NodeImpl node(&pair.ioc_node, &cfg);
 
-    // Template 1 is current when the peer connects: its tx becomes the standing
+    // An OLDER template: its tx stays retained in m_known_txs (backable) but is
+    // no longer current once template 2 lands, so it is never standing.
+    const auto old = make_tx(0x52);
+    const uint256 h_old = txid(old);
+    node.register_template_txs({dash::coin::Transaction(old)}, {h_old});
+
+    // Template 2 is current when the peer connects: its tx becomes the standing
     // seed.
     const auto standing = make_tx(0x51);
     const uint256 h_standing = txid(standing);
@@ -131,6 +143,14 @@ TEST(DashStandingForget, ShareBroadcastDoesNotForgetStandingSeededTx)
 
     auto peer = make_socket_peer(pair, stub);
     IoThread io(pair.ioc_node);
+    // Stop the io thread on EVERY exit, including an ASSERT_* early return: the
+    // shared IoThread does not join on destruction, so a failing assertion would
+    // otherwise std::terminate the whole test binary. stop() is idempotent.
+    struct StopOnExit {
+        IoThread& io;
+        boost::asio::io_context& ioc;
+        ~StopOnExit() { io.stop(ioc); }
+    } stop_on_exit{io, pair.ioc_node};
 
     const auto type = node.handle_version(
         make_version(0x950F'0A6E'7000'0001ull, "c2pool-dash-standing-forget-kat"), peer);
@@ -142,18 +162,15 @@ TEST(DashStandingForget, ShareBroadcastDoesNotForgetStandingSeededTx)
         << "harness sanity: handle_version must emit the #1167 standing seed";
     ASSERT_TRUE(payload_contains(*seed, tx_bytes(standing)))
         << "harness sanity: the standing seed must carry the template tx body";
+    EXPECT_FALSE(payload_contains(*seed, tx_bytes(old)))
+        << "#950 F1: the standing seed carried a tx of an OLDER template — the seed "
+           "must be the current template only (canonical p2p.py:267-269)";
 
-    // Template 2 adds a tx the peer was NOT seeded with. A share referencing
-    // both is what a local mint on the current tip looks like.
-    const auto fresh = make_tx(0x52);
-    const uint256 h_fresh = txid(fresh);
-    node.register_template_txs(
-        {dash::coin::Transaction(standing), dash::coin::Transaction(fresh)},
-        {h_standing, h_fresh});
-
+    // A share referencing both: a local mint on a job built just before the
+    // template rotated (the stale-solve case the retention window serves).
     auto* share = new dash::DashShare();
     share->m_hash = uint256(0x950950u);
-    share->m_new_transaction_hashes = {h_standing, h_fresh};
+    share->m_new_transaction_hashes = {h_standing, h_old};
     dash::ShareType st;
     st = share;
     node.tracker().add(st);
@@ -172,11 +189,11 @@ TEST(DashStandingForget, ShareBroadcastDoesNotForgetStandingSeededTx)
     const Frame* remember = find_frame(bracket, "remember_tx");
     ASSERT_NE(remember, nullptr)
         << "control: the non-standing tx must still be remembered before the share";
-    EXPECT_TRUE(payload_contains(*remember, tx_bytes(fresh)));
+    EXPECT_TRUE(payload_contains(*remember, tx_bytes(old)));
     const Frame* forget = find_frame(bracket, "forget_tx");
     ASSERT_NE(forget, nullptr)
         << "control: the non-standing tx must still be forgotten after the share";
-    EXPECT_TRUE(payload_contains(*forget, h_fresh));
+    EXPECT_TRUE(payload_contains(*forget, h_old));
 
     // The #950 defect: the standing-seeded tx must be outside the bracket.
     EXPECT_FALSE(payload_contains(*forget, h_standing))
