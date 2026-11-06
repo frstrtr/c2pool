@@ -382,9 +382,14 @@ protected:
     }
     /// Compute thread, exclusive tracker lock held, right after
     /// m_best_share_hash is set (publish_snapshot, and clean_tracker before
-    /// its prune).
+    /// its prune). Publishes the decision: best_share_hash()'s busy fallback
+    /// first, then the hook's consumers (the merged payout weights), so both
+    /// move to the new best share together -- clean_tracker then prunes under
+    /// the same lock for a long time, and readers must not get the old best
+    /// share while the merged weights are already the new one's.
     void run_locked_best_hook()
     {
+        (void)best_share_hash_and_publish();
         std::lock_guard<std::mutex> hook_lock(m_locked_best_hook_mutex);
         if (m_locked_best_hook) {
             try {
@@ -396,6 +401,17 @@ protected:
     }
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
+    // The last VERIFIED best share best_share_hash() computed under the
+    // tracker lock (the compute thread at each best-share decision,
+    // run_locked_best_hook, or a reader under the shared lock); null when the
+    // last answer was not a verified head.
+    // What best_share_hash() returns while the lock is busy. Guarded by
+    // m_snapshot_mutex.
+    uint256 m_published_best;
+    // m_peers is IO-thread-owned and not under the tracker lock; this mirror
+    // lets best_share_hash() (any thread) ask "any peers?" without touching
+    // the map. Stored after every m_peers insert/erase (node.cpp).
+    std::atomic<size_t> m_peer_count{0};
     std::mutex m_locked_best_hook_mutex;
     std::function<void(ShareTracker&, const uint256&)> m_locked_best_hook;
 
@@ -409,7 +425,8 @@ protected:
     // (publish_peer_info_snapshot, at every peer add/remove + the think
     // IO-phase for uptime freshness) and get_peer_info_json returns this copy
     // lock-free — it NEVER touches the live maps. Guarded by the existing
-    // m_snapshot_mutex (held only for the swap; never nested with the tracker).
+    // m_snapshot_mutex (held only for the swap; a leaf: it may be taken under
+    // the tracker lock, never the other way round).
     nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
 
     // Identity of the compute thread (m_think_pool's single thread).
@@ -792,13 +809,26 @@ public:
     /// per second. IO thread only.
     void schedule_desired_drain();
 
-    /// Return the hash of our tallest chain head, or uint256::ZERO if empty.
+    /// The best share to build work on: think()'s best when it is verified,
+    /// else the best verified head by work, else ZERO (peers connected, no
+    /// verified chain yet) or the tallest raw head (genesis, no peers).
+    /// It reads the tracker, so it keeps the reader discipline of
+    /// m_tracker_mutex: on the compute thread directly (the exclusive lock is
+    /// held), elsewhere under a shared try-lock; while the lock is busy, the
+    /// last verified best share published under the lock (ZERO if none). It
+    /// used to read the tracker with no lock from the merged-mining RPC
+    /// thread, the IO thread and the HTTP thread, racing think()'s
+    /// verified.add / chain.remove.
     uint256 best_share_hash();
+    /// The same for a caller that already holds the tracker lock through
+    /// `held` (a std::shared_mutex must not be locked twice by one thread).
+    uint256 best_share_hash(const TrackerReadGuard& held);
 
     /// Peer-facing advertisement of our head (version handshake + timer
     /// re-announce ONLY — never work creation).  Returns the verified head
     /// when we have one, otherwise the tallest RAW head so a fresh peer can
-    /// begin download_shares() before our verified chain exists.  ROOT-2: on a
+    /// begin download_shares() before our verified chain exists (read under
+    /// the tracker lock; ZERO while it is busy and nothing is verified).  ROOT-2: on a
     /// --genesis node whose verified chain is still empty at handshake,
     /// best_share_hash() advertises NULL and the peer never downloads;
     /// advertising the raw head breaks that deadlock.
@@ -1200,8 +1230,21 @@ protected:
     // Block depth function for chain scoring (set via set_block_rel_height_fn)
     block_rel_height_fn_t m_block_rel_height_fn;
 
-    // Cached best share hash from the most recent think() cycle
+    // Cached best share hash from the most recent think() cycle (written by
+    // the compute thread under the exclusive tracker lock)
     uint256 m_best_share_hash;
+
+    // best_share_hash()'s election; the tracker lock is held (either mode).
+    // `verified`: the answer is a verified head.
+    uint256 best_share_hash_locked(bool& verified);
+    // best_share_hash_locked(), publishing a verified answer (or clearing the
+    // published value) for the busy fallback; the tracker lock is held.
+    uint256 best_share_hash_and_publish();
+    uint256 published_best_share() const
+    {
+        std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+        return m_published_best;
+    }
 
     // ROOT-2: fire exactly one delayed re-advert when the verified chain first
     // transitions from empty to non-empty (peers that handshook during the

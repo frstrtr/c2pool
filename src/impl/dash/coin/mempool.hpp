@@ -59,6 +59,7 @@
 #include "vendor/providertx.hpp"  // B.8: ProTx payloads for block-connect eviction
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
+#include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -405,6 +406,7 @@ public:
         ImmatureCoinbaseInput,  // a coinbase-output input below 100 confs
         FeeNotZero,             // sum(in) - sum(out) != 0: snapshot drift
         TooLarge,               // serialized size exceeds the consensus cap
+        SpecialTx,              // type != 0: never pinnable (see below)
     };
     /// Dash rejects an oversize transaction at CONSENSUS, not merely policy —
     /// CheckTransaction() returns "bad-txns-oversize", so a block carrying one
@@ -450,6 +452,7 @@ public:
             case PinnedTxGate::ImmatureCoinbaseInput: return "immature-coinbase-input";
             case PinnedTxGate::TooLarge:              return "tx-too-large";
             case PinnedTxGate::FeeNotZero:            return "fee-not-zero";
+            case PinnedTxGate::SpecialTx:             return "special-tx-not-pinnable";
         }
         return "ok";
     }
@@ -546,6 +549,18 @@ public:
         // coin lookups also stops us paying for a verdict we already know.
         if (::pack(tx).get_span().size() > kMaxPinnedTxBytes)
             return PinnedTxGate::TooLarge;
+        // SPECIAL TXS NEVER PIN. A pin is appended to a template whose
+        // coinbase is already built, and the selection gates (the type-8
+        // CheckAssetLockTx port, the special-tx mask, the MN-list fold) never
+        // see it. An asset lock (type 8) changes the CbTx creditPoolBalance the
+        // coinbase commits to, so even a lock Dash Core accepts would make the
+        // block invalid (bad-cbtx-assetlocked-amount), and an invalid one
+        // (CheckAssetLockTx) is invalid on its own; ProTx types change the
+        // committed MN-list root. The pin lane is plain zero-fee
+        // consolidation: refuse every special tx by name. Chain-state
+        // independent, so it runs before the coin lookups.
+        if (tx.type != 0)
+            return PinnedTxGate::SpecialTx;
         auto* utxo = m_utxo.load();
         if (utxo == nullptr && !m_external_coin_lookup)
             return PinnedTxGate::UtxoViewUnset;
@@ -721,6 +736,9 @@ public:
                              // full set, but non-standard in dashd (IsStandardTx:
                              // scriptpubkey), which never relays or mines it; c2pool
                              // admits nothing dashd would refuse to relay here.
+        BadAssetLock,        // a type-8 asset lock that fails CheckAssetLockTx
+                             // (asset_lock_fold.hpp, Dash Core's reject reason).
+                             // The selector would drop it anyway; refuse by name.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -736,6 +754,7 @@ public:
             case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
             case InjectGate::ScriptInvalid:      return "inject-script-invalid";
             case InjectGate::SpentShapedOutput:  return "inject-spent-shaped-output";
+            case InjectGate::BadAssetLock:       return "inject-bad-assetlocktx";
         }
         return "inject-unknown";
     }
@@ -1407,11 +1426,9 @@ public:
         using bitcoin_family::coin::TxPrevOut;
         using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
         auto service_of = [](const vendor::LegacyNetService& n) -> std::optional<Service> {
-            if (n.port_be == 0) {
-                bool zero = true;
-                for (uint8_t b : n.ip) if (b != 0) { zero = false; break; }
-                if (zero) return std::nullopt;     // empty netInfo carries no entry
-            }
+            // Dash Core: an invalid service is an empty netInfo, which carries
+            // no entry (whatever its port), so it conflicts with nothing.
+            if (n.IsEmpty()) return std::nullopt;
             return Service{n.ip, n.port_be};
         };
         auto same_out = [](const TxPrevOut& a, const TxPrevOut& b) {
@@ -1941,7 +1958,9 @@ public:
     //     when allow_mn_types (the template folds them into merkleRootMNList,
     //     sml_special_fold.hpp);
     //   * type 8 (AssetLock) — admitted when allow_locks (the template accrues
-    //     the credit-pool lock term from the SELECTED body, asset_lock_fold.hpp);
+    //     the credit-pool lock term from the SELECTED body, asset_lock_fold.hpp)
+    //     AND the lock passes check_asset_lock_tx (applied in selection, on
+    //     every path, so a lock the fold refuses never rides the body);
     //   * types 5/6/7/9 — NEVER admitted through selection: type-5 is the
     //     coinbase itself, type-6 quorum commitments are builder-generated
     //     (dkg_commitments), type-9 AssetUnlock is admission-path-only
@@ -2268,6 +2287,17 @@ public:
                 // for every type!=0; the partial embedded mask admits types
                 // 1-4 and/or 8 only, and 5/6/7/9 are never selected.
                 if (!special_mask.admits(e->tx.type)) { ok = false; break; }
+                // A type-8 lock rides only when it is a valid block member:
+                // the CheckAssetLockTx port of asset_lock_fold.hpp (version 1,
+                // P2PKH credit outputs, one `6a 00` marker equal to the
+                // credits). The CbTx creditPoolBalance fold applies the same
+                // check, so before this gate a lock it refused (a version-2
+                // lock, a non-P2PKH credit output) still rode the body: an
+                // invalid block before Dash Core v24, a wrong committed
+                // creditPoolBalance after it. Dropping the member drops its
+                // package, and any descendant fails the parent check.
+                if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
+                    && !check_asset_lock_tx(e->tx)) { ok = false; break; }
                 // Belt for the admission gate (add_tx_locked): a pool entry
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /
@@ -2709,6 +2739,10 @@ private:
         //     that refusal would surface here as AlreadyConfirmed; name it.
         if (contextual_tx_check(tx, /*is_coinbase=*/false))
             return InjectGate::BadVersionOrType;
+        // (1b) CheckAssetLockTx for a type-8 inject, pre-v24 rules as the
+        //     template applies them (the selection gate is the belt).
+        if (tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE && !check_asset_lock_tx(tx))
+            return InjectGate::BadAssetLock;
         // (2) new-seam script-verify requirement (fail-closed).
         if (!m_script_check)
             return InjectGate::ScriptCheckUnarmed;
