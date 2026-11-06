@@ -1162,8 +1162,17 @@ public:
                 // No list action (ApplyTxToList): the masternode leaves the
                 // list when its collateral is spent, in pass 4.
                 vendor::CProDisTx dp;
-                if (!vendor::parse_protx_payload(tx.extra_payload, dp))
+                if (!vendor::parse_protx_payload(tx.extra_payload, dp)) {
                     err = "unparseable ProDisTx payload";
+                } else if (const ReplayMNState* t = find(dp.proTxHash); t == nullptr) {
+                    // CheckProDisTxForList: the masternode must exist ...
+                    err = "ProDisTx names masternode " + dp.proTxHash.GetHex().substr(0, 16)
+                        + " this list does not hold (bad-prodis-hash)";
+                } else if (t->v24.shares.empty()) {
+                    // ... and be a shared masternode.
+                    err = "ProDisTx names masternode " + dp.proTxHash.GetHex().substr(0, 16)
+                        + " which is not shared (bad-prodis-not-shared)";
+                }
                 break;
             }
             case vendor::CProUpShareTx::SPECIALTX_TYPE:

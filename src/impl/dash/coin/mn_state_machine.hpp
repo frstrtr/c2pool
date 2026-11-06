@@ -2379,7 +2379,7 @@ private:
             if (it == m_entries.end()) return;
             auto& e = it->second;
             const auto in = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
-            const auto t = v24::apply_proupreg(e, p, e.nType, e.pubKeyOperator != in, in, m_netinfo_rules);
+            const auto t = v24::apply_proupreg(e, p, e.nType, !stored_opkey_is_point(e, in), in, m_netinfo_rules);
             log_error("ProUpRegTx", t);
             if (t.ban) ban_if_not_banned(e, height);
             ++r.updated;
@@ -2414,7 +2414,7 @@ private:
             if (it == m_entries.end()) return;
             auto& e = it->second;
             const auto in = vendor::opkey_to_basic(p.pubKeyOperator, false);
-            const auto t = v24::apply_proupsharedreg(e, p, e.nType, e.pubKeyOperator != in, in, m_netinfo_rules);
+            const auto t = v24::apply_proupsharedreg(e, p, e.nType, !stored_opkey_is_point(e, in), in, m_netinfo_rules);
             log_error("ProUpSharedRegTx", t);
             if (t.ban) ban_if_not_banned(e, height);
             ++r.updated;
@@ -2497,9 +2497,23 @@ private:
             return std::optional<std::string>{std::string("unfoldable: ") + what
                                               + " payload does not parse - fail closed, never skipped"};
         };
-        auto dry = [&](const uint256& pro, auto&& run) -> std::optional<std::string> {
+        // `refuse_unknown`: Core rejects an update naming a masternode the
+        // pre-block list does not hold (bad-protx-hash), so on a mined block
+        // that means OUR set drifted -- refuse (fail closed) instead of
+        // silently skipping. A ProUpServTx keeps the pre-v24 tolerance (the
+        // apply counts it as revive_dropped_unknown).
+        auto dry = [&](const uint256& pro, auto&& run, bool refuse_unknown = true) -> std::optional<std::string> {
             auto it = m_entries.find(pro);
-            if (it == m_entries.end()) return std::nullopt;   // the apply's own unknown-MN paths
+            if (it == m_entries.end()) {
+                if (!refuse_unknown) return std::nullopt;
+                const char* name = tx.type == 3 ? "ProUpRegTx" : tx.type == 4 ? "ProUpRevTx"
+                                 : tx.type == tx_type::PROVIDER_UPDATE_SHARE ? "ProUpShareTx"
+                                 : tx.type == tx_type::PROVIDER_UPDATE_SHARED_REGISTRAR ? "ProUpSharedRegTx"
+                                 : "provider tx";
+                return std::string("unfoldable: ") + name + " names masternode "
+                     + pro.GetHex().substr(0, 16)
+                     + " this set does not hold (Core: bad-protx-hash) - fail closed, never skipped";
+            }
             MNState copy = it->second;
             const v24::Transition t = run(copy);
             if (t.error) return "unfoldable: " + *t.error;
@@ -2516,14 +2530,15 @@ private:
         case 2: {
             vendor::CProUpServTx p;
             if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpServTx");
-            return dry(p.proTxHash, [&](MNState& c) { return v24::apply_proupserv(c, p, c.nType, m_netinfo_rules); });
+            return dry(p.proTxHash, [&](MNState& c) { return v24::apply_proupserv(c, p, c.nType, m_netinfo_rules); },
+                       /*refuse_unknown=*/false);
         }
         case 3: {
             vendor::CProUpRegTx p;
             if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpRegTx");
             return dry(p.proTxHash, [&](MNState& c) {
                 const auto in = vendor::opkey_to_basic(p.pubKeyOperator, p.nVersion < vendor::ProTxVersion::BASIC_BLS);
-                return v24::apply_proupreg(c, p, c.nType, c.pubKeyOperator != in, in, m_netinfo_rules);
+                return v24::apply_proupreg(c, p, c.nType, !stored_opkey_is_point(c, in), in, m_netinfo_rules);
             });
         }
         case 4: {
@@ -2534,6 +2549,14 @@ private:
         case tx_type::PROVIDER_DISSOLVE: {
             vendor::CProDisTx p;
             if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProDisTx");
+            // CheckProDisTxForList: an existing, shared masternode.
+            auto it = m_entries.find(p.proTxHash);
+            if (it == m_entries.end())
+                return "bad-prodis-hash (ProDisTx names masternode "
+                     + p.proTxHash.GetHex().substr(0, 16) + " this set does not hold)";
+            if (it->second.v24.shares.empty())
+                return "bad-prodis-not-shared (ProDisTx names masternode "
+                     + p.proTxHash.GetHex().substr(0, 16) + ")";
             return std::nullopt;
         }
         case tx_type::PROVIDER_UPDATE_SHARE: {
@@ -2546,7 +2569,7 @@ private:
             if (!vendor::parse_protx_payload(tx.extra_payload, p)) return unparsed("ProUpSharedRegTx");
             return dry(p.proTxHash, [&](MNState& c) {
                 const auto in = vendor::opkey_to_basic(p.pubKeyOperator, false);
-                return v24::apply_proupsharedreg(c, p, c.nType, c.pubKeyOperator != in, in, m_netinfo_rules);
+                return v24::apply_proupsharedreg(c, p, c.nType, !stored_opkey_is_point(c, in), in, m_netinfo_rules);
             });
         }
         }
