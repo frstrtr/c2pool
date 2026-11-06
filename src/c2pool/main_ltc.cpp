@@ -2382,23 +2382,18 @@ int main(int argc, char* argv[]) {
                 constexpr uint32_t LTC_BLOCK_PERIOD = 150; // seconds
                 uint32_t score_backlog = 5 * ltc::PoolConfig::share_period()
                     * ltc::PoolConfig::chain_length() / LTC_BLOCK_PERIOD;
-                if (!header_checkpoint_str.empty()) {
-                    auto colon = header_checkpoint_str.find(':');
-                    if (colon != std::string::npos) {
-                        uint32_t cp_height = static_cast<uint32_t>(std::stoul(header_checkpoint_str.substr(0, colon)));
-                        uint256 cp_hash;
-                        cp_hash.SetHex(header_checkpoint_str.substr(colon + 1));
-                        if (!cp_hash.IsNull()) {
-                            embedded_chain->set_dynamic_checkpoint(cp_height, cp_hash);
-                            // Warn if checkpoint doesn't provide enough backlog
-                            // for accurate share chain scoring.  Operators should
-                            // set the checkpoint at least score_backlog blocks
-                            // before the current network tip.
-                            LOG_INFO << "[EMB-LTC] Score backlog needed: " << score_backlog
-                                     << " blocks before network tip"
-                                     << " (checkpoint at height " << cp_height << ")";
-                        }
-                    }
+                // After init() (which loaded the store and verified the PoW of
+                // any header it held unverified): the checkpoint pinned, and
+                // seeded as the root when above the tip.
+                if (const auto cp = ltc::coin::parse_header_checkpoint(header_checkpoint_str)) {
+                    embedded_chain->set_dynamic_checkpoint(cp->first, cp->second);
+                    // Warn if checkpoint doesn't provide enough backlog
+                    // for accurate share chain scoring.  Operators should
+                    // set the checkpoint at least score_backlog blocks
+                    // before the current network tip.
+                    LOG_INFO << "[EMB-LTC] Score backlog needed: " << score_backlog
+                             << " blocks before network tip"
+                             << " (checkpoint at height " << cp->first << ")";
                 }
 
                 // If chain is still empty after checkpoint, seed the genesis block.
@@ -7158,49 +7153,12 @@ int main(int argc, char* argv[]) {
                                 LOG_WARNING << "DOGE HeaderChain LevelDB init failed after 5 attempts — in-memory only";
                         }
 
-                        // Apply DOGE checkpoint if provided
-                        if (!doge_header_checkpoint_str.empty()) {
-                            auto colon = doge_header_checkpoint_str.find(':');
-                            if (colon != std::string::npos) {
-                                uint32_t cp_h = static_cast<uint32_t>(std::stoul(
-                                    doge_header_checkpoint_str.substr(0, colon)));
-                                uint256 cp_hash;
-                                cp_hash.SetHex(doge_header_checkpoint_str.substr(colon + 1));
-                                if (!cp_hash.IsNull())
-                                    doge_chain->set_dynamic_checkpoint(cp_h, cp_hash);
-                            }
-                        }
-
-                        // Seed genesis if empty (same pattern as LTC genesis seeding).
-                        // Reference: dogecoin/src/chainparams.cpp CreateGenesisBlock()
-                        //   All networks: merkle_root=5b2a3f53..., version=1, bits=0x1e0ffff0
-                        //   Mainnet:       nTime=1386325540, nNonce=99943
-                        //   Testnet:       nTime=1391503289, nNonce=997879
-                        //   Testnet4alpha: nTime=1737907200, nNonce=1812121
-                        if (doge_chain->size() == 0) {
-                            ltc::coin::BlockHeaderType genesis;
-                            genesis.m_previous_block.SetNull();
-                            genesis.m_version = 1;
-                            genesis.m_merkle_root.SetHex("5b2a3f53f605d62c53e62932dac6925e3d74afa5a4b459745c36d42d0ed26a69");
-                            genesis.m_bits = 0x1e0ffff0;
-                            if (doge_testnet4alpha) {
-                                genesis.m_timestamp = 1737907200;
-                                genesis.m_nonce     = 1812121;
-                            } else if (settings->m_testnet) {
-                                genesis.m_timestamp = 1391503289;
-                                genesis.m_nonce     = 997879;
-                            } else {
-                                genesis.m_timestamp = 1386325540;
-                                genesis.m_nonce     = 99943;
-                            }
-                            if (doge_chain->add_header(genesis))
-                                LOG_INFO << "[DOGE] HeaderChain: genesis block seeded (height 0)";
-                            else
-                                LOG_WARNING << "[DOGE] HeaderChain: genesis seed rejected — wrong genesis hash?";
-                        } else {
-                            LOG_INFO << "DOGE HeaderChain: loaded " << doge_chain->size()
-                                     << " headers (height=" << doge_chain->height() << ")";
-                        }
+                        // The checkpoint applied (pinned; the root when above the
+                        // tip), then genesis when empty: the same start the tests
+                        // drive (doge::coin::start_doge_chain). init() above has
+                        // already re-rooted an older store format.
+                        doge::coin::start_doge_chain(*doge_chain, doge_header_checkpoint_str,
+                                                     doge::coin::doge_genesis_header(settings->m_testnet, doge_testnet4alpha));
 
                         if (!doge_pool)
                             doge_pool = std::make_unique<ltc::coin::Mempool>(core::coin::DOGE_LIMITS);
@@ -7581,25 +7539,19 @@ int main(int argc, char* argv[]) {
                                 });
                             }
                             // Phase 5.8: wire the AuxPoW header/block parser for
-                            // DOGE P2P. The parser only reads the AuxPoW proof and
-                            // hands it to the header chain (stash_auxpow_proof); the
-                            // chain checks it (CAuxPow::check) when the header is
-                            // added, on the DOGE header pool, not here on the io
-                            // thread. A header the chain adds without a verified
-                            // proof is refused there.
+                            // DOGE P2P. A 'headers' message's proofs go with its
+                            // headers (message_proofs_slot -> on_doge_headers ->
+                            // HeaderChain::add_headers), and the chain checks each
+                            // header against its own copy (CAuxPow::check) on the
+                            // DOGE header pool, not here on the io thread. A block's
+                            // proof is checked as it is parsed.
                             if (cfg.symbol == "DOGE" && doge_chain) {
-                                auto* dc = doge_chain.get();
-                                broadcaster->set_raw_headers_parser([dc](const uint8_t* d, size_t n) {
-                                    doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
-                                        dc->stash_auxpow_proof(h, a);
-                                    };
-                                    return doge::coin::parse_doge_headers_message(d, n, nullptr, &sink);
+                                const auto rules = doge::coin::auxpow_rules(*doge_params_ptr);
+                                broadcaster->set_raw_headers_parser([](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_headers_message_with_proofs(d, n);
                                 });
-                                broadcaster->set_raw_block_parser([dc](const uint8_t* d, size_t n) {
-                                    doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
-                                        dc->stash_auxpow_proof(h, a);
-                                    };
-                                    return doge::coin::parse_doge_block(d, n, nullptr, &sink);
+                                broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_block(d, n, &rules);
                                 });
                             }
 
@@ -7758,8 +7710,13 @@ int main(int argc, char* argv[]) {
                                             LOG_INFO << "[EMB-DOGE] Received " << hdrs.size()
                                                      << " headers from P2P";
                                         auto batch = std::make_shared<std::vector<ltc::coin::BlockHeaderType>>(hdrs);
+                                        // This message's own AuxPoW proofs, aligned with
+                                        // its headers (taken here, in the same call as the
+                                        // parse, before the batch leaves the io thread).
+                                        auto proofs = std::make_shared<std::vector<std::optional<doge::coin::CAuxPow<>>>>(
+                                            doge::coin::take_message_proofs(hdrs.size()));
                                         boost::asio::post(*doge_hdr_pool,
-                                            [batch, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
+                                            [batch, proofs, dc, bcaster_ptr, &ioc, sched, sched_sync, range_sync, send_sched_ask,
                                              full, key, doge_hdr_asks, doge_hdr_from, truncated_at]() {
                                                 // Below the checkpoint: an anchored range, or the
                                                 // sequential schedule's batch (doge::coin::route_headers);
@@ -7797,7 +7754,7 @@ int main(int argc, char* argv[]) {
                                                     return;
                                                 }
                                                 doge_hdr_from->set(key);
-                                                int accepted = dc->add_headers(*batch);
+                                                int accepted = dc->add_headers(*batch, proofs.get());
                                                 doge_hdr_from->clear();
                                                 if (accepted > 0)
                                                     LOG_INFO << "[EMB-DOGE] add_headers: "

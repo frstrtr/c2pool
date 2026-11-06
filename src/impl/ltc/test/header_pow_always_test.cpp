@@ -13,6 +13,9 @@
 //   - a store written before this check holds headers whose PoW hash is the
 //     placeholder (the block hash): each is verified at load, one that fails
 //     dropped with its descendants;
+//   - main_ltc's start order (init, then the parsed --header-checkpoint):
+//     the store's unverified headers are verified in init whatever the
+//     checkpoint, and the checkpoint is pinned after;
 //   - the scrypt cost per header, printed (the sync's price).
 // ---------------------------------------------------------------------------
 
@@ -269,4 +272,56 @@ TEST(LtcHeaderPow, ScryptCostPerHeader)
     std::cout << "[ltc-header-pow] scrypt " << us << " us/header: 120,000 headers " << us * 120000 / 1e6
               << " s, 3,200,000 headers " << us * 3200000 / 1e6 << " s (one thread)" << std::endl;
     EXPECT_FALSE(acc.IsNull());
+}
+
+
+// main_ltc's start order: HeaderChain::init() (load; the PoW of any header
+// stored unverified is verified there, independent of the checkpoint), then
+// the --header-checkpoint parsed by parse_header_checkpoint and applied with
+// set_dynamic_checkpoint, as main_ltc does.
+TEST(LtcHeaderPow, StartOrderVerifiesStoredHeadersThenPinsTheCheckpoint)
+{
+    TempDir t;
+    const auto c = mined_chain(4);
+    {
+        HeaderChain chain(easy_testnet_params(), t.dir.string());
+        ASSERT_TRUE(chain.init());
+        ASSERT_TRUE(chain.add_header(easy_testnet_genesis()));
+        for (const auto& h : c)
+            ASSERT_TRUE(chain.add_header(h));
+    }
+    // A header stored unverified on top (its PoW fails), as an older store.
+    BlockHeaderType bad = child(hash_of(c[3]), 5);
+    ltc_test::unmine(bad);
+    {
+        core::LevelDBStore db(t.dir.string(), core::LevelDBOptions{});
+        ASSERT_TRUE(db.open());
+        IndexEntry e;
+        e.header = bad;
+        e.block_hash = hash_of(bad);
+        e.hash = e.block_hash;  // the placeholder
+        e.height = 5;
+        e.chain_work.SetHex("ffff");
+        e.prev_hash = bad.m_previous_block;
+        e.status = HEADER_VALID_CHAIN;
+        auto packed = pack(e);
+        std::vector<uint8_t> data(reinterpret_cast<const uint8_t*>(packed.data()),
+                                  reinterpret_cast<const uint8_t*>(packed.data()) + packed.size());
+        std::string key = "h";
+        key.append(reinterpret_cast<const char*>(e.block_hash.data()), 32);
+        ASSERT_TRUE(db.put(key, data));
+        ASSERT_TRUE(db.put("tip", std::vector<uint8_t>(e.block_hash.data(), e.block_hash.data() + 32)));
+    }
+    HeaderChain chain(easy_testnet_params(), t.dir.string());
+    ASSERT_TRUE(chain.init());
+    const auto cp = ltc::coin::parse_header_checkpoint("2:" + hash_of(c[1]).GetHex());
+    ASSERT_TRUE(cp);
+    chain.set_dynamic_checkpoint(cp->first, cp->second);
+    EXPECT_FALSE(chain.has_header(hash_of(bad))) << "verified at load: dropped";
+    EXPECT_EQ(chain.height(), 4u);
+    BlockHeaderType sibling = child(hash_of(c[0]), 2, 1);
+    ltc_test::mine(sibling);
+    EXPECT_FALSE(chain.add_header(sibling)) << "the checkpoint is pinned";
+    EXPECT_FALSE(ltc::coin::parse_header_checkpoint("nonsense"));
+    EXPECT_FALSE(ltc::coin::parse_header_checkpoint("12:" + std::string(64, '0')));
 }
