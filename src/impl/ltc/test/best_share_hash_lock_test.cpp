@@ -18,10 +18,15 @@
 //     share, best_share_hash() returns the published one (RED before: it
 //     read the half-updated tracker and returned the new one);
 //   - a failed guard gets the published value; a held guard elects under it;
+//   - clean_tracker's best-share decision (Step 1, run_locked_best_hook,
+//     before its long prune under the same lock) moves the busy fallback
+//     with the merged weights: a reader during the prune gets the new best
+//     share, the one the hook published weights for (RED before: the old);
 //   - readers on three threads against a compute thread adding verified
-//     shares and moving the best share only ever see null or a share that was
-//     a verified head, and end on the compute thread's last best share.
-//     ThreadSanitizer-clean (RED before: the unlocked verified / best reads).
+//     shares and moving the best share only ever see null or a share already
+//     verified when they look, and end on the compute thread's last best
+//     share. ThreadSanitizer-clean (RED before: the unlocked verified / best
+//     reads).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -53,6 +58,7 @@ struct BestNode : public ltc::NodeImpl
     using ltc::NodeImpl::m_tracker;
     using ltc::NodeImpl::m_best_share_hash;
     using ltc::NodeImpl::publish_snapshot;
+    using ltc::NodeImpl::run_locked_best_hook;
 
     /// A share on `prev`, in the raw chain and (optionally) verified.
     void add(const uint256& hash, const uint256& prev, bool verified = true)
@@ -142,6 +148,55 @@ TEST(LtcBestShareHash, NothingPublishedYetGivesZeroWhileBusy)
     EXPECT_EQ(node.best_share_hash(), H(1)) << "genesis, no peers: the raw head, under the lock";
 }
 
+// clean_tracker Step 1 (node.cpp, compute thread, exclusive lock): think()
+// picks a new best share, run_locked_best_hook() publishes the merged payout
+// weights for it, then the prune runs under the same lock for a long time
+// before Step 4's publish_snapshot. A reader in that window must get the best
+// share the merged weights were published for, not the previous one.
+TEST(LtcBestShareHash, CleanTrackerDecisionPublishesTheNewBest)
+{
+    QuietLog quiet;
+    BestNode node;
+    for (uint64_t i = 1; i <= 10; ++i)
+        node.add(H(i), i == 1 ? uint256() : H(i - 1));
+    std::mutex hook_mtx;
+    uint256 hook_saw;
+    node.set_locked_best_hook([&](ltc::ShareTracker&, const uint256& b) {
+        std::lock_guard<std::mutex> lk(hook_mtx);
+        hook_saw = b;
+    });
+    node.m_best_share_hash = H(10);
+    node.publish_snapshot();   // run_think: best 10 decided and published
+    ASSERT_EQ(node.best_share_hash(), H(10));
+
+    std::atomic<bool> in_prune{false}, release{false};
+    std::thread compute([&] {
+        std::unique_lock<std::shared_mutex> lk(node.tracker_mutex());
+        node.add(H(11), H(10));          // Step 1: think() picks 11
+        node.m_best_share_hash = H(11);
+        node.run_locked_best_hook();     // the decision is published
+        in_prune = true;                 // Steps 2-3: the prune, lock held
+        while (!release.load())
+            std::this_thread::yield();
+        node.publish_snapshot();         // Step 4
+    });
+    while (!in_prune.load())
+        std::this_thread::yield();
+    const uint256 during = node.best_share_hash();
+    uint256 hooked;
+    {
+        std::lock_guard<std::mutex> lk(hook_mtx);
+        hooked = hook_saw;
+    }
+    release = true;
+    compute.join();
+
+    EXPECT_EQ(hooked, H(11));
+    EXPECT_EQ(during, H(11))
+        << "during the prune the jobs' best share lagged the merged weights' best share";
+    EXPECT_EQ(node.best_share_hash(), H(11));
+}
+
 // Three reader threads (the merged-mining RPC thread, the IO thread, the HTTP
 // thread) against the compute thread adding verified shares and moving the
 // best share, sometimes onto a share not verified yet (the fallback walks the
@@ -155,10 +210,18 @@ TEST(LtcBestShareHash, ReadersAgainstTheComputeThread)
         node.add(H(i), i == 1 ? uint256() : H(i - 1));
     node.m_best_share_hash = H(kInitial);
 
-    // Every share that is ever verified (read-only once the threads run).
-    std::set<uint256> ever_verified;
-    for (uint64_t i = 1; i <= kInitial + kRounds; ++i)
-        ever_verified.insert(H(i));
+    // The shares verified so far, kept by the compute thread as it verifies
+    // (under the exclusive lock, before it releases it). A best share a
+    // reader gets must already be in it when the reader looks.
+    std::mutex vmtx;
+    std::set<uint256> verified_now;
+    for (uint64_t i = 1; i <= kInitial; ++i)
+        verified_now.insert(H(i));
+    auto mark_verified = [&](const uint256& h) {
+        node.m_tracker.verified.add(node.m_tracker.chain.get_share(h));
+        std::lock_guard<std::mutex> lk(vmtx);
+        verified_now.insert(h);
+    };
 
     std::atomic<bool> done{false};
     std::atomic<bool> writer_waiting{false};
@@ -174,9 +237,9 @@ TEST(LtcBestShareHash, ReadersAgainstTheComputeThread)
             node.add(H(h), H(h - 1), /*verified=*/false);
             node.m_best_share_hash = H(h);
             if (r % 3 == 1 && r > 1)   // last round's share, parent first
-                node.m_tracker.verified.add(node.m_tracker.chain.get_share(H(h - 1)));
+                mark_verified(H(h - 1));
             if (r % 3 != 0)
-                node.m_tracker.verified.add(node.m_tracker.chain.get_share(H(h)));
+                mark_verified(H(h));
             node.publish_snapshot();
             (void)node.best_share_hash();   // the compute thread reads directly
             lk.unlock();
@@ -186,7 +249,7 @@ TEST(LtcBestShareHash, ReadersAgainstTheComputeThread)
         std::unique_lock<std::shared_mutex> lk(node.tracker_mutex());
         for (uint64_t i = kInitial + 1; i <= kInitial + kRounds; ++i)
             if (!node.m_tracker.verified.contains(H(i)))
-                node.m_tracker.verified.add(node.m_tracker.chain.get_share(H(i)));
+                mark_verified(H(i));
         node.publish_snapshot();
         lk.unlock();
         done = true;
@@ -209,7 +272,8 @@ TEST(LtcBestShareHash, ReadersAgainstTheComputeThread)
             ++calls;
             if (!b.IsNull()) {
                 ++nonnull;
-                if (!ever_verified.contains(b))
+                std::lock_guard<std::mutex> lk(vmtx);
+                if (!verified_now.contains(b))
                     ++bad;
             }
         }
@@ -220,7 +284,7 @@ TEST(LtcBestShareHash, ReadersAgainstTheComputeThread)
     io.join();
     http.join();
 
-    EXPECT_EQ(bad.load(), 0) << "a best share that was never a verified head";
+    EXPECT_EQ(bad.load(), 0) << "a best share that was not verified yet";
     EXPECT_GT(nonnull.load(), 0);
     EXPECT_GT(calls.load(), 0);
     EXPECT_EQ(node.best_share_hash(), H(kInitial + kRounds));

@@ -1856,9 +1856,15 @@ public:
         if (start.IsNull())
             return {};
 
-        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
-        ensure_weights_skiplist();
-        auto sl_result = m_weights_skiplist->query(start, max_shares, desired_weight);
+        // The lock covers the lazy skip list only; its own mutex serializes
+        // the walk (see m_weights_cache_mutex).
+        chain::WeightsSkipList* sl = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            ensure_weights_skiplist();
+            sl = &*m_weights_skiplist;
+        }
+        auto sl_result = sl->query(start, max_shares, desired_weight);
         return CumulativeWeights{
             std::move(sl_result.weights),
             sl_result.total_weight,
@@ -2352,11 +2358,12 @@ public:
         if (start.IsNull())
             return {};
 
-        chain::CumulativeWeightsResult result;
+        chain::WeightsSkipList* sl = nullptr;
         {
             std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
-            result = ensure_merged_skiplist(target_chain_id).query(start, max_shares, desired_weight);
+            sl = &ensure_merged_skiplist(target_chain_id);
         }
+        auto result = sl->query(start, max_shares, desired_weight);
 
         // [DOGE-PPLNS] Per-address breakdown — shows whether autoconverted
         // addresses appear in merged PPLNS weights.  Log once per new height.
@@ -2427,9 +2434,13 @@ public:
         if (start.IsNull())
             return {};
 
-        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
-        ensure_v36_skiplist();
-        auto result = m_v36_weights_skiplist->query(start, max_shares, desired_weight);
+        chain::WeightsSkipList* sl = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            ensure_v36_skiplist();
+            sl = &*m_v36_weights_skiplist;
+        }
+        auto result = sl->query(start, max_shares, desired_weight);
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
@@ -2855,7 +2866,14 @@ private:
     // both in get_merged_payout_weights (SIGSEGV in WeightsSkipList::query on
     // the LTC+DOGE canary, 2026-11-06). Every access to these caches holds
     // m_weights_cache_mutex; writers (forget on removal, the skip-list reset
-    // on a new merged address, the cache priming) take it as well.
+    // on a new merged address, the cache priming) take it as well. A walk
+    // (WeightsSkipList::query) runs under the skip list's OWN mutex only, so
+    // a cold walk of one skip list does not hold up a warm query of another:
+    // the reader takes the skip list's address under m_weights_cache_mutex
+    // and keeps it valid by holding the tracker lock, because a skip list is
+    // only ever dropped (try_register_merged_addr, under add) while the
+    // tracker lock is held exclusively. The decayed cache's walk stays under
+    // m_weights_cache_mutex (one entry, read at the top, written at the end).
     // Lock order: tracker lock -> m_weights_cache_mutex -> the skip list's own
     // mutex. The skip lists' delta / previous callbacks read the chain only
     // and never take it; no function holding it calls another that does.

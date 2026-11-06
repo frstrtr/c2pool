@@ -282,9 +282,6 @@ protected:
         int64_t pool_hashrate_ts{0};
     };
     void publish_snapshot() {
-        // best_share_hash()'s answer while the lock is busy (compute thread,
-        // exclusive lock held: computed and published here).
-        (void)best_share_hash_and_publish();
         TrackerSnapshot s;
         s.chain_count = static_cast<int>(m_tracker.chain.size());
         s.verified_count = static_cast<int>(m_tracker.verified.size());
@@ -385,9 +382,14 @@ protected:
     }
     /// Compute thread, exclusive tracker lock held, right after
     /// m_best_share_hash is set (publish_snapshot, and clean_tracker before
-    /// its prune).
+    /// its prune). Publishes the decision: best_share_hash()'s busy fallback
+    /// first, then the hook's consumers (the merged payout weights), so both
+    /// move to the new best share together -- clean_tracker then prunes under
+    /// the same lock for a long time, and readers must not get the old best
+    /// share while the merged weights are already the new one's.
     void run_locked_best_hook()
     {
+        (void)best_share_hash_and_publish();
         std::lock_guard<std::mutex> hook_lock(m_locked_best_hook_mutex);
         if (m_locked_best_hook) {
             try {
@@ -400,8 +402,9 @@ protected:
     mutable std::mutex m_snapshot_mutex;
     TrackerSnapshot m_snapshot;
     // The last VERIFIED best share best_share_hash() computed under the
-    // tracker lock (the compute thread at each snapshot, or a reader under
-    // the shared lock); null when the last answer was not a verified head.
+    // tracker lock (the compute thread at each best-share decision,
+    // run_locked_best_hook, or a reader under the shared lock); null when the
+    // last answer was not a verified head.
     // What best_share_hash() returns while the lock is busy. Guarded by
     // m_snapshot_mutex.
     uint256 m_published_best;
@@ -422,7 +425,8 @@ protected:
     // (publish_peer_info_snapshot, at every peer add/remove + the think
     // IO-phase for uptime freshness) and get_peer_info_json returns this copy
     // lock-free — it NEVER touches the live maps. Guarded by the existing
-    // m_snapshot_mutex (held only for the swap; never nested with the tracker).
+    // m_snapshot_mutex (held only for the swap; a leaf: it may be taken under
+    // the tracker lock, never the other way round).
     nlohmann::json m_peer_info_snapshot = nlohmann::json::array();
 
     // Identity of the compute thread (m_think_pool's single thread).
