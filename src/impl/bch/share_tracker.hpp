@@ -73,6 +73,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -1276,6 +1277,7 @@ public:
         if (start.IsNull())
             return {};
 
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         ensure_weights_skiplist();
         auto sl_result = m_weights_skiplist->query(start, max_shares, desired_weight);
         return CumulativeWeights{
@@ -1299,6 +1301,9 @@ public:
     {
         if (start.IsNull())
             return {};
+
+        // The result cache below is read here and written at the end.
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
 
         // Cache: keyed by (start_hash, max_shares, desired_weight).
         // Same inputs always produce same outputs (deterministic walk).
@@ -1585,6 +1590,7 @@ private:
     // skiplists (standalone SHA256d parent). Wired to chain.on_removed in ctor.
     void invalidate_weight_caches(const uint256& hash)
     {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         if (m_weights_skiplist) m_weights_skiplist->forget(hash);
         m_decayed_cache_valid = false; // chain changed — decayed cache stale
     }
@@ -1596,6 +1602,7 @@ private:
     void prime_pplns_cache(const uint256& start, int32_t max_shares,
                            const CumulativeWeights& weights)
     {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         m_decayed_cache_start = start;
         m_decayed_cache_shares = max_shares;
         // Verification always uses an unlimited desired_weight.
@@ -1643,6 +1650,24 @@ private:
     // BCH is a standalone parent so m_merged_coinbase_info is empty at runtime and these
     // never get a real chain_id; carried so verify_merged_coinbase_commitment compiles.
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
+
+    // -- Lock for the lazily-filled weight caches --
+    // The skip lists above and the decayed-walk result cache below are memo
+    // caches that READERS fill: get_cumulative_weights,
+    // get_v36_decayed_cumulative_weights, get_merged_cumulative_weights and
+    // get_v36_merged_weights (with everything built on them: the merged payout
+    // weights, compute_merged_payout_hash's per-chain log, the expected
+    // payouts) are called under the SHARED tracker lock (read_tracker), so two
+    // threads can fill the same cache at once -- the merged-mining RPC thread
+    // rebuilding the merged block and the IO thread caching the tip payouts,
+    // both in get_merged_payout_weights (SIGSEGV in WeightsSkipList::query on
+    // the LTC+DOGE canary, 2026-11-06). Every access to these caches holds
+    // m_weights_cache_mutex; writers (forget on removal, the skip-list reset
+    // on a new merged address, the cache priming) take it as well.
+    // Lock order: tracker lock -> m_weights_cache_mutex -> the skip list's own
+    // mutex. The skip lists' delta / previous callbacks read the chain only
+    // and never take it; no function holding it calls another that does.
+    mutable std::mutex m_weights_cache_mutex;
 
     // -- Decayed weights result cache --
     // Avoids recomputing the O(chain_length) walk when the same
@@ -2093,8 +2118,11 @@ public:
         if (start.IsNull())
             return {};
 
-        auto& sl = ensure_merged_skiplist(target_chain_id);
-        auto result = sl.query(start, max_shares, desired_weight);
+        chain::CumulativeWeightsResult result;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            result = ensure_merged_skiplist(target_chain_id).query(start, max_shares, desired_weight);
+        }
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
     }
 
@@ -2226,9 +2254,9 @@ public:
         auto hash_result = Hash(span);
 
         {
-            static int32_t s_last_log_height = -1;
-            if (static_cast<int32_t>(height) != s_last_log_height) {
-                s_last_log_height = static_cast<int32_t>(height);
+            static std::atomic<int32_t> s_last_log_height{-1};
+            if (s_last_log_height.exchange(static_cast<int32_t>(height))
+                != static_cast<int32_t>(height)) {
                 LOG_INFO << "[MERGED-PPLNS] height=" << height
                          << " chain_len=" << chain_len
                          << " addrs=" << sorted_by_script.size()

@@ -47,6 +47,7 @@ inline uint64_t mul128_shift(uint64_t a, uint64_t b, unsigned shift) {
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <vector>
@@ -1855,6 +1856,7 @@ public:
         if (start.IsNull())
             return {};
 
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         ensure_weights_skiplist();
         auto sl_result = m_weights_skiplist->query(start, max_shares, desired_weight);
         return CumulativeWeights{
@@ -1878,6 +1880,9 @@ public:
     {
         if (start.IsNull())
             return {};
+
+        // The result cache below is read here and written at the end.
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
 
         // Cache: keyed by (start_hash, max_shares, desired_weight).
         // Same inputs always produce same outputs (deterministic walk).
@@ -2347,16 +2352,18 @@ public:
         if (start.IsNull())
             return {};
 
-        auto& sl = ensure_merged_skiplist(target_chain_id);
-        auto result = sl.query(start, max_shares, desired_weight);
+        chain::CumulativeWeightsResult result;
+        {
+            std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+            result = ensure_merged_skiplist(target_chain_id).query(start, max_shares, desired_weight);
+        }
 
         // [DOGE-PPLNS] Per-address breakdown — shows whether autoconverted
         // addresses appear in merged PPLNS weights.  Log once per new height.
         {
-            static int32_t s_last_doge_height = -1;
+            static std::atomic<int32_t> s_last_doge_height{-1};
             auto h = chain.get_height(start);
-            if (h != s_last_doge_height) {
-                s_last_doge_height = h;
+            if (s_last_doge_height.exchange(h) != h) {
                 auto to_dec = [](const uint288& val) -> std::string {
                     if (val.IsNull()) return "0";
                     uint288 tmp = val; std::string r;
@@ -2420,6 +2427,7 @@ public:
         if (start.IsNull())
             return {};
 
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         ensure_v36_skiplist();
         auto result = m_v36_weights_skiplist->query(start, max_shares, desired_weight);
         return {std::move(result.weights), result.total_weight, result.total_donation_weight};
@@ -2645,9 +2653,8 @@ public:
         // Per-address merged PPLNS breakdown — log once per new chain height
         // for death valley comparison between p2pool and c2pool.
         {
-            static int32_t s_last_log_height = -1;
-            if (height != s_last_log_height) {
-                s_last_log_height = height;
+            static std::atomic<int32_t> s_last_log_height{-1};
+            if (s_last_log_height.exchange(height) != height) {
                 LOG_INFO << "[MERGED-PPLNS] height=" << height
                          << " chain_len=" << chain_len
                          << " addrs=" << sorted_by_script.size()
@@ -2836,6 +2843,24 @@ private:
     std::optional<chain::WeightsSkipList> m_v36_weights_skiplist;
     std::unordered_map<uint32_t, chain::WeightsSkipList> m_merged_skiplists;
 
+    // -- Lock for the lazily-filled weight caches --
+    // The skip lists above and the decayed-walk result cache below are memo
+    // caches that READERS fill: get_cumulative_weights,
+    // get_v36_decayed_cumulative_weights, get_merged_cumulative_weights and
+    // get_v36_merged_weights (with everything built on them: the merged payout
+    // weights, compute_merged_payout_hash's per-chain log, the expected
+    // payouts) are called under the SHARED tracker lock (read_tracker), so two
+    // threads can fill the same cache at once -- the merged-mining RPC thread
+    // rebuilding the merged block and the IO thread caching the tip payouts,
+    // both in get_merged_payout_weights (SIGSEGV in WeightsSkipList::query on
+    // the LTC+DOGE canary, 2026-11-06). Every access to these caches holds
+    // m_weights_cache_mutex; writers (forget on removal, the skip-list reset
+    // on a new merged address, the cache priming) take it as well.
+    // Lock order: tracker lock -> m_weights_cache_mutex -> the skip list's own
+    // mutex. The skip lists' delta / previous callbacks read the chain only
+    // and never take it; no function holding it calls another that does.
+    mutable std::mutex m_weights_cache_mutex;
+
     // -- Retroactive merged address lookup table --
     // Maps (chain_id) → (parent_script → explicit_merged_script).
     // Populated incrementally as V36 shares with explicit merged_addresses
@@ -2878,7 +2903,10 @@ private:
                 {
                     // New mapping — stale skip list entries used auto-convert
                     // for this miner; recreate to use the explicit address.
-                    m_merged_skiplists.erase(entry.m_chain_id);
+                    {
+                        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
+                        m_merged_skiplists.erase(entry.m_chain_id);
+                    }
                     auto to_hex_short = [](const std::vector<unsigned char>& s, size_t n = 20) {
                         static const char* H = "0123456789abcdef";
                         std::string r; for (size_t i = 0; i < std::min(s.size(), n); ++i) { r += H[s[i]>>4]; r += H[s[i]&0xf]; }
@@ -2971,6 +2999,7 @@ private:
 
     void invalidate_weight_caches(const uint256& hash)
     {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         if (m_weights_skiplist) m_weights_skiplist->forget(hash);
         if (m_v36_weights_skiplist) m_v36_weights_skiplist->forget(hash);
         for (auto& [_, sl] : m_merged_skiplists) sl.forget(hash);
@@ -2988,6 +3017,7 @@ private:
     // an approximation — it produces identical CumulativeWeights.
     void prime_pplns_cache(const uint256& start, int32_t max_shares,
                            const CumulativeWeights& weights) {
+        std::lock_guard<std::mutex> cache_lock(m_weights_cache_mutex);
         m_decayed_cache_start = start;
         m_decayed_cache_shares = max_shares;
         // Verification always uses unlimited desired_weight

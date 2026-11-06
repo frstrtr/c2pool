@@ -298,6 +298,17 @@ if (BUILD_TESTING AND GTest_FOUND)
     # litecoind's per-entry "sigops" on its REAL 3200605 template, the
     # selection's boundary (exactly the limit, 1 over), the coinbase
     # reservation, DOGE's own rules and 20,000 limit. Same folding rule.
+    #
+    # merged_weights_threads_test.cpp: the PPLNS weight caches under
+    # concurrent readers (the merged-mining RPC thread and the IO thread both
+    # in get_merged_payout_weights under the shared tracker lock: SIGSEGV in
+    # WeightsSkipList::query, 2026-11-06). The skip lists serialize their
+    # queries; the DOGE-sync reproducer (refresh_aux_work -> rebuild ->
+    # payout weights against the tip-payout cache, ref_hash and the
+    # think/share-add path) equals a single-threaded replay and is
+    # ThreadSanitizer-clean; the weights and the merged coinbase are pinned
+    # to the pre-fix bytes; every tracker copy takes the cache lock. Same
+    # folding rule.
     # One source per line, sorted: concurrent PRs then edit different lines and stop conflicting (#908).
     add_executable(share_test
         auto_ratchet_blocked_by_test.cpp
@@ -347,6 +358,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         merged_found_record_test.cpp
         merged_rebuild_payouts_test.cpp
         merged_refresh_request_test.cpp
+        merged_weights_threads_test.cpp
         mweb_ext_import_test.cpp
         mweb_ext_poller_test.cpp
         mweb_fetch_retry_test.cpp
