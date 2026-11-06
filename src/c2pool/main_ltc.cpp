@@ -2605,14 +2605,14 @@ int main(int argc, char* argv[]) {
                         }
                     });
 
-                // Wire peer height callback for fast-sync: skip scrypt PoW on old headers.
-                // No anchor checkpoint needed — header sync is fast (headers are 80 bytes,
-                // old ones skip scrypt PoW). Use --header-checkpoint as optional speedup.
+                // A peer's reported tip height: the sync progress line and the
+                // header batch sizing only (core::coin::PeerHeightGate). Every
+                // header above the checkpoint has its proof of work verified
+                // regardless of it.
                 embedded_broadcaster->set_on_peer_height(
                     [chain = embedded_chain.get()](uint32_t h) {
                         chain->set_peer_tip_height(h);
-                        LOG_INFO << "[LTC] Peer reports chain height " << h
-                                 << " — fast-sync: scrypt skip below " << (h > 2100 ? h - 2100 : 0);
+                        LOG_INFO << "[LTC] Peer reports chain height " << h;
                     });
 
                 // Block relay (set before start(): applied per connection).
@@ -7580,17 +7580,26 @@ int main(int argc, char* argv[]) {
                                     return rpc_ptr->getpeerinfo();
                                 });
                             }
-                            // Phase 5.8: wire AuxPoW header parser for DOGE P2P
-                            // Each header's and block's proof of work (the AuxPoW
-                            // proof) is verified as it is parsed.
-                            if (cfg.symbol == "DOGE") {
-                                const auto rules = doge::coin::auxpow_rules(
-                                    doge_params_ptr ? *doge_params_ptr : doge::coin::DOGEChainParams::mainnet());
-                                broadcaster->set_raw_headers_parser([rules](const uint8_t* d, size_t n) {
-                                    return doge::coin::parse_doge_headers_message(d, n, &rules);
+                            // Phase 5.8: wire the AuxPoW header/block parser for
+                            // DOGE P2P. The parser only reads the AuxPoW proof and
+                            // hands it to the header chain (stash_auxpow_proof); the
+                            // chain checks it (CAuxPow::check) when the header is
+                            // added, on the DOGE header pool, not here on the io
+                            // thread. A header the chain adds without a verified
+                            // proof is refused there.
+                            if (cfg.symbol == "DOGE" && doge_chain) {
+                                auto* dc = doge_chain.get();
+                                broadcaster->set_raw_headers_parser([dc](const uint8_t* d, size_t n) {
+                                    doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
+                                        dc->stash_auxpow_proof(h, a);
+                                    };
+                                    return doge::coin::parse_doge_headers_message(d, n, nullptr, &sink);
                                 });
-                                broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
-                                    return doge::coin::parse_doge_block(d, n, &rules);
+                                broadcaster->set_raw_block_parser([dc](const uint8_t* d, size_t n) {
+                                    doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
+                                        dc->stash_auxpow_proof(h, a);
+                                    };
+                                    return doge::coin::parse_doge_block(d, n, nullptr, &sink);
                                 });
                             }
 
@@ -7609,7 +7618,8 @@ int main(int argc, char* argv[]) {
                                 // The peer whose headers move the tip (the tip handler asks it).
                                 auto doge_hdr_from = std::make_shared<doge::coin::HeadersFrom>();
 
-                                // Wire peer tip height for fast-sync scrypt skip
+                                // A peer's reported tip height: progress and batch
+                                // sizing only; every header's proof is verified.
                                 broadcaster->set_on_peer_height(
                                     [dc = doge_chain.get()](uint32_t h) {
                                         dc->set_peer_tip_height(h);

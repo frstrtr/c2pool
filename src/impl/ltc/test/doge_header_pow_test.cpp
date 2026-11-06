@@ -12,6 +12,12 @@
 //     header before AuxPoW, and one without the AuxPoW flag after it, that
 //     fails its own scrypt PoW is refused; the reported height is bounded;
 //   - a pinned checkpoint's height takes only the checkpoint's block;
+//   - the chain refuses a flagged header unless its AuxPoW proof was stashed
+//     and verifies (CAuxPow::check); with a valid stashed proof it accepts;
+//   - Core's early-auxpow rule: a flagged header below the activation height
+//     is refused;
+//   - the checkpoint pin drops a conflicting block at the checkpoint height;
+//   - a store from an older format re-roots at the checkpoint on load;
 //   - the cost of the parent-PoW check per AuxPoW header, printed.
 // ---------------------------------------------------------------------------
 
@@ -31,6 +37,10 @@
 #include <impl/doge/coin/auxpow_header.hpp>
 #include <impl/doge/coin/chain_params.hpp>
 #include <impl/doge/coin/header_chain.hpp>
+
+#include <core/leveldb_store.hpp>
+#include <filesystem>
+#include <random>
 
 namespace {
 
@@ -316,4 +326,125 @@ TEST(DogeHeaderPow, AuxPowCheckCostPerHeader)
     std::cout << "[doge-header-pow] AuxPoW check " << us << " us/header: 285,000 headers " << us * 285000 / 1e6
               << " s (one thread)" << std::endl;
     EXPECT_EQ(ok, N);
+}
+
+
+// The chain refuses a flagged header unless its AuxPoW proof was stashed and
+// verifies; a valid stashed proof is accepted (Dogecoin Core
+// CheckAuxPowProofOfWork, enforced inside the header chain so no ingest path
+// bypasses it).
+TEST(DogeHeaderPow, ChainRequiresAVerifiedAuxPowProofForAFlaggedHeader)
+{
+    EasyDoge d(1);  // AuxPoW from height 1
+    doge::coin::HeaderChain chain(d.params);
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(d.genesis));
+
+    Aux a(sha256d(d.genesis), 1);
+    const uint256 h = sha256d(a.child);
+    ASSERT_EQ(doge::coin::check_auxpow_header(a.child, &a.aux, rules()), std::nullopt);
+
+    // No stashed proof: refused (the flag alone is not trusted).
+    EXPECT_FALSE(chain.add_header(a.child)) << "a flagged header with no verified proof";
+    EXPECT_EQ(chain.height(), 0u);
+
+    // A tampered proof: refused. The parent's merkle root no longer commits to
+    // the parent coinbase, so the proof fails CAuxPow::check (or, if the new
+    // parent hash misses the bits, the parent proof-of-work check first).
+    doge::coin::CAuxPow<> bad = a.aux;
+    bad.m_parent_block_header.m_merkle_root.SetHex("1");
+    ASSERT_TRUE(doge::coin::check_auxpow_header(a.child, &bad, rules()).has_value());
+    chain.stash_auxpow_proof(h, bad);
+    EXPECT_FALSE(chain.add_header(a.child)) << "a tampered proof";
+    EXPECT_EQ(chain.height(), 0u);
+
+    // The valid proof: accepted.
+    chain.stash_auxpow_proof(h, a.aux);
+    EXPECT_TRUE(chain.add_header(a.child));
+    EXPECT_EQ(chain.height(), 1u);
+}
+
+// Core's early-auxpow rule: a flagged header below the activation height is
+// refused.
+TEST(DogeHeaderPow, EarlyAuxPowHeaderIsRefused)
+{
+    EasyDoge d(1000);  // AuxPoW from height 1000
+    doge::coin::HeaderChain chain(d.params);
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(d.genesis));
+    BlockHeaderType flagged = d.child(sha256d(d.genesis), 1, 0x00620104);  // the flag, below activation
+    d.mine(flagged);  // even with its own PoW
+    EXPECT_FALSE(chain.add_header(flagged)) << "Core: auxpow block before activation (early-auxpow-block)";
+    EXPECT_EQ(chain.height(), 0u);
+}
+
+// The checkpoint pin drops a conflicting block already at the checkpoint
+// height (Core assume-valid / bad-fork-prior-to-checkpoint).
+TEST(DogeHeaderPow, PinDropsAConflictingBlockAtTheCheckpointHeight)
+{
+    EasyDoge d(1000);
+    doge::coin::HeaderChain chain(d.params);
+    ASSERT_TRUE(chain.init());
+    ASSERT_TRUE(chain.add_header(d.genesis));
+    std::vector<BlockHeaderType> c;
+    uint256 prev = sha256d(d.genesis);
+    for (uint32_t hh = 1; hh <= 3; ++hh) {
+        BlockHeaderType x = d.child(prev, hh);
+        d.mine(x);
+        ASSERT_TRUE(chain.add_header(x));
+        prev = sha256d(x);
+        c.push_back(x);
+    }
+    uint256 other;
+    other.SetHex("00000000000000000000000000000000000000000000000000000000000d0e99");
+    chain.set_dynamic_checkpoint(2, other);  // not the block the chain holds at height 2
+    EXPECT_FALSE(chain.has_header(sha256d(c[1]))) << "the conflicting block is dropped";
+    EXPECT_FALSE(chain.has_header(sha256d(c[2]))) << "and its descendant";
+    EXPECT_TRUE(chain.has_header(sha256d(c[0])));
+    EXPECT_EQ(chain.tip()->block_hash, other) << "the checkpoint, seeded above the surviving tip";
+}
+
+// A store written in an older format (no format marker) re-roots at the
+// checkpoint on load: the headers above it are dropped and re-fetched (their
+// AuxPoW proofs cannot be re-checked from the stored base headers).
+TEST(DogeHeaderPow, StoreRerootsAtTheCheckpointOnAnOlderFormat)
+{
+    std::mt19937_64 rng(std::random_device{}());
+    const auto dir = std::filesystem::temp_directory_path() / ("doge_hdr_reroot_" + std::to_string(rng()));
+    EasyDoge d(1000);
+    doge::coin::DOGEChainParams::Checkpoint cp;
+    cp.height = 1000;
+    cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000d1000");
+    d.params.fast_start_checkpoint = cp;
+
+    std::vector<uint256> above;
+    {
+        doge::coin::HeaderChain chain(d.params, dir.string());
+        ASSERT_TRUE(chain.init());  // seeds at the checkpoint (height 1000)
+        chain.set_require_auxpow_proof(false);  // persist some above-checkpoint headers
+        uint256 prev = cp.hash;
+        for (uint32_t k = 1; k <= 3; ++k) {
+            BlockHeaderType x = d.child(prev, 1000 + k);
+            x.m_version = 0x00620104;
+            ASSERT_TRUE(chain.add_header(x));
+            prev = sha256d(x);
+            above.push_back(sha256d(x));
+        }
+        ASSERT_EQ(chain.height(), 1003u);
+    }
+    // Simulate an older store: remove the format marker this build writes.
+    {
+        core::LevelDBStore db(dir.string(), core::LevelDBOptions{});
+        ASSERT_TRUE(db.open());
+        db.remove("fmt");
+    }
+    {
+        doge::coin::HeaderChain chain(d.params, dir.string());
+        ASSERT_TRUE(chain.init());  // re-roots on load
+        EXPECT_EQ(chain.height(), 1000u) << "dropped back to the checkpoint";
+        for (const auto& h : above)
+            EXPECT_FALSE(chain.has_header(h)) << "an above-checkpoint header was kept";
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

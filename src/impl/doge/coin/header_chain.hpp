@@ -25,12 +25,15 @@
 #include <btclibs/crypto/scrypt.h>
 #include <core/coin/peer_height_gate.hpp>
 #include <impl/doge/coin/auxpow.hpp>
+#include <impl/doge/coin/auxpow_check.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <deque>
+#include <set>
 #include <thread>
 #include <functional>
 #include <iomanip>
@@ -205,6 +208,10 @@ public:
             if (!m_db->open())
                 return false;
             load_from_db();
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                maybe_reroot_locked();
+            }
         }
         if (m_params.fast_start_checkpoint.has_value()) {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -335,6 +342,27 @@ public:
     /// This allows an accessible daemon to provide a more recent starting point.
     /// The checkpoint is pinned whether or not it seeds the chain: a header
     /// at its height must be it.
+    /// The AuxPoW proof the P2P parser read for the block `block_hash` (its
+    /// 80-byte base header's SHA256d), kept until add_header_internal checks
+    /// it (CAuxPow::check off the io thread). Bounded FIFO.
+    void stash_auxpow_proof(const uint256& block_hash, const CAuxPow<>& aux) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_pending_proofs.emplace(block_hash, aux).second) {
+            m_pending_order.push_back(block_hash);
+            while (m_pending_order.size() > MAX_PENDING_PROOFS) {
+                m_pending_proofs.erase(m_pending_order.front());
+                m_pending_order.pop_front();
+            }
+        }
+    }
+
+    /// Whether a flagged header needs a verified AuxPoW proof (on in
+    /// production; a test not exercising this rule turns it off).
+    void set_require_auxpow_proof(bool on) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_require_auxpow_proof = on;
+    }
+
     void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
         std::lock_guard<std::mutex> lock(m_mutex);
         pin_checkpoint_locked(height, hash);
@@ -502,20 +530,50 @@ private:
             }
         }
 
-        // The header's own scrypt PoW, whatever height a peer reported:
-        // every header before AuxPoW, and after it every header without the
-        // AuxPoW version flag (Dogecoin Core CheckAuxPowProofOfWork: a block
-        // without a proof meets its bits itself). A flagged header's PoW is
-        // on its parent: the P2P parsers verify its AuxPoW proof as they read
-        // it (auxpow_check.hpp), and only the 80-byte base header is stored
-        // (its SHA256d as the placeholder PoW hash).
-        uint256 pow_hash;
-        if (m_params.is_auxpow(new_height) && is_auxpow_version(static_cast<int32_t>(header.m_version))) {
-            pow_hash = block_hash(header);
-        } else {
-            pow_hash = scrypt_hash(header);
-            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
+        // Dogecoin Core ContextualCheckBlockHeader (validation.cpp): after
+        // merge-mining activation a legacy block is refused (late-legacy),
+        // and before it an AuxPoW block is refused (early-auxpow). IsLegacy:
+        // version 1, or version 2 with chain id 0.
+        const int32_t version = static_cast<int32_t>(header.m_version);
+        const bool is_legacy = version == 1 || (version == 2 && (version >> 16) == 0);
+        const bool flagged = is_auxpow_version(version);
+        if (m_params.is_auxpow(new_height)) {
+            if (is_legacy) {
+                LOG_WARNING << "[EMB-DOGE] REJECT late-legacy header at h=" << new_height;
                 return false;
+            }
+        } else if (flagged) {
+            LOG_WARNING << "[EMB-DOGE] REJECT early-auxpow header at h=" << new_height;
+            return false;
+        }
+
+        // Proof of work (Dogecoin Core CheckAuxPowProofOfWork):
+        //   - a header without the AuxPoW flag meets its own bits (scrypt);
+        //   - a flagged header's work is on its parent, demonstrated by its
+        //     AuxPoW proof. The chain stores only the 80-byte base header, so
+        //     the proof the P2P parser read is stashed by block hash
+        //     (stash_auxpow_proof) and checked here, off the io thread
+        //     (CAuxPow::check). A flagged header with no verified proof is
+        //     refused; m_require_auxpow_proof is on in production and off only
+        //     in tests not exercising this rule.
+        uint256 pow_hash = block_hash(header);
+        if (flagged && m_params.is_auxpow(new_height)) {
+            if (m_require_auxpow_proof) {
+                auto it = m_pending_proofs.find(bhash);
+                std::optional<std::string> why = it == m_pending_proofs.end()
+                    ? std::optional<std::string>("no verified AuxPoW proof for this header")
+                    : check_auxpow_header(header, &it->second, auxpow_rules(m_params));
+                if (it != m_pending_proofs.end())
+                    drop_pending_proof_locked(bhash);
+                if (why) {
+                    LOG_WARNING << "[EMB-DOGE] REJECT flagged header at h=" << new_height << ": " << *why;
+                    return false;
+                }
+            }
+        } else {
+            if (!check_pow(scrypt_hash(header), header.m_bits, m_params.pow_limit))
+                return false;
+            pow_hash = scrypt_hash(header);
         }
 
         // Validate difficulty
@@ -779,10 +837,100 @@ private:
         if (std::find(m_pins.begin(), m_pins.end(), std::make_pair(height, hash)) == m_pins.end())
             m_pins.emplace_back(height, hash);
         auto at = m_height_index.find(height);
-        if (at != m_height_index.end() && at->second != hash)
+        if (at != m_height_index.end() && at->second != hash) {
             LOG_ERROR << "[EMB-DOGE] The header chain holds " << at->second.GetHex().substr(0, 16)
                       << " at the checkpoint height " << height << ", not the checkpoint "
-                      << hash.GetHex().substr(0, 16) << " (a new header there must be the checkpoint)";
+                      << hash.GetHex().substr(0, 16) << ": it and its descendants are dropped";
+            drop_branches_locked({at->second});
+        }
+    }
+
+    /// Drop `roots` and every descendant from the index and the store; a tip
+    /// among them moves to its nearest remaining ancestor.
+    void drop_branches_locked(const std::set<uint256>& roots) {
+        if (roots.empty())
+            return;
+        std::vector<std::pair<uint32_t, uint256>> by_height;
+        by_height.reserve(m_headers.size());
+        for (const auto& [h, e] : m_headers)
+            by_height.emplace_back(e.height, h);
+        std::sort(by_height.begin(), by_height.end());
+        std::set<uint256> bad;
+        for (const auto& [height, h] : by_height) {
+            const auto& e = m_headers.at(h);
+            if (roots.count(h) || bad.count(e.prev_hash))
+                bad.insert(h);
+        }
+        uint256 tip = m_tip;
+        while (!tip.IsNull() && bad.count(tip)) {
+            auto it = m_headers.find(tip);
+            tip = it == m_headers.end() ? uint256() : it->second.prev_hash;
+        }
+        for (const auto& h : bad) {
+            m_headers.erase(h);
+            if (m_db && m_db->is_open()) {
+                std::string key = "h";
+                key.append(reinterpret_cast<const char*>(h.data()), 32);
+                m_db->remove(key);
+            }
+        }
+        m_tip = tip;
+        if (auto it = m_headers.find(m_tip); it != m_headers.end()) {
+            m_tip_height = it->second.height;
+            m_best_work = it->second.chain_work;
+        } else {
+            m_tip.SetNull();
+            m_tip_height = 0;
+            m_best_work = uint256();
+        }
+        rebuild_height_index(m_tip);
+        persist_tip();
+        LOG_WARNING << "[EMB-DOGE] Dropped " << bad.size() << " headers; tip h=" << m_tip_height;
+    }
+
+    // AuxPoW proofs the P2P parser read, by block hash, awaiting the chain's
+    // own check in add_header_internal (bounded FIFO).
+    static constexpr size_t MAX_PENDING_PROOFS = 8192;
+    std::map<uint256, CAuxPow<>> m_pending_proofs;
+    std::deque<uint256>          m_pending_order;
+    bool                         m_require_auxpow_proof{true};
+
+    // The store format this build writes. A store from an older format kept
+    // base headers that were accepted before their AuxPoW proof was checked
+    // and cannot be re-checked (the proof is not stored), so the headers
+    // above the checkpoint are dropped once and re-fetched, their proofs
+    // checked on the way back in. The schedule ('H') below the checkpoint is
+    // kept (it is pinned by the checkpoint hash).
+    static constexpr uint32_t STORE_FORMAT = 2;
+
+    void maybe_reroot_locked() {
+        if (!m_db || !m_db->is_open() || !m_params.fast_start_checkpoint.has_value())
+            return;
+        uint32_t fmt = 0;
+        std::vector<uint8_t> v;
+        if (m_db->get("fmt", v) && v.size() == 4)
+            fmt = (uint32_t(v[0]) << 24) | (uint32_t(v[1]) << 16) | (uint32_t(v[2]) << 8) | v[3];
+        if (fmt >= STORE_FORMAT)
+            return;
+        const uint32_t cp = m_params.fast_start_checkpoint->height;
+        std::set<uint256> above;
+        for (const auto& [h, e] : m_headers)
+            if (e.height > cp)
+                above.insert(h);
+        if (!above.empty()) {
+            LOG_WARNING << "[EMB-DOGE] Header store format " << fmt << " < " << STORE_FORMAT
+                        << ": re-rooting at the checkpoint " << cp << " (" << above.size()
+                        << " headers re-fetched and their AuxPoW proofs checked on the way back)";
+            drop_branches_locked(above);
+        }
+        const uint32_t f = STORE_FORMAT;
+        m_db->put("fmt", std::vector<uint8_t>{uint8_t(f >> 24), uint8_t(f >> 16), uint8_t(f >> 8), uint8_t(f)});
+    }
+
+    void drop_pending_proof_locked(const uint256& hash) {
+        m_pending_proofs.erase(hash);
+        // m_pending_order drains lazily in stash_auxpow_proof (a stale hash
+        // there erases nothing).
     }
 
     uint32_t bounded_peer_tip_locked() const {

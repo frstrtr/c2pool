@@ -34,6 +34,7 @@
 #include <core/pack.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -108,7 +109,14 @@ struct DogeHeadersParse
 /// With `rules` each header's proof of work is checked as it is parsed
 /// (check_auxpow_header: the AuxPoW proof against the header): one that
 /// fails ends the batch as an entry that does not parse.
-inline DogeHeadersParse parse_doge_headers(const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr)
+/// The AuxPoW-proof sink: called with each flagged header's block hash and
+/// its parsed proof. For the embedded node the header chain stashes it
+/// (HeaderChain::stash_auxpow_proof) and checks it when the header is added,
+/// off the io thread; the parser itself does no proof-of-work work then.
+using AuxProofSink = std::function<void(const uint256&, const CAuxPow<>&)>;
+
+inline DogeHeadersParse parse_doge_headers(const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr,
+                                           const AuxProofSink* on_proof = nullptr)
 {
     DogeHeadersParse r;
     if (data == nullptr || len == 0)
@@ -143,6 +151,8 @@ inline DogeHeadersParse parse_doge_headers(const uint8_t* data, size_t len, cons
             if (rules)
                 if (auto why = check_auxpow_header(hdr, has_aux ? &aux : nullptr, *rules))
                     throw std::runtime_error("proof of work: " + *why);
+            if (on_proof && has_aux)
+                (*on_proof)(Hash(pack(hdr).get_span()), aux);
             r.headers.push_back(hdr);
         } catch (const std::exception& e) {
             failed = true;
@@ -180,9 +190,9 @@ inline DogeHeadersParse parse_doge_headers(const uint8_t* data, size_t len, cons
 /// The headers of parse_doge_headers: the clean prefix (the raw headers
 /// parser seam of CoinBroadcaster / NodeP2P).
 inline std::vector<BlockHeaderType> parse_doge_headers_message(
-    const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr)
+    const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr, const AuxProofSink* on_proof = nullptr)
 {
-    return parse_doge_headers(data, len, rules).headers;
+    return parse_doge_headers(data, len, rules, on_proof).headers;
 }
 
 /// Parse a DOGE full block from raw P2P bytes.
@@ -191,7 +201,8 @@ inline std::vector<BlockHeaderType> parse_doge_headers_message(
 /// Throws on parse failure.
 /// With `rules` the block's proof of work is checked as it is parsed
 /// (check_auxpow_header); one that fails throws.
-inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr)
+inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len, const AuxPowRules* rules = nullptr,
+                                             const AuxProofSink* on_proof = nullptr)
 {
     using ltc::coin::BlockType;
 
@@ -204,6 +215,8 @@ inline ltc::coin::BlockType parse_doge_block(const uint8_t* data, size_t len, co
     if (rules)
         if (auto why = check_auxpow_header(hdr, has_aux ? &aux : nullptr, *rules))
             throw std::runtime_error("DOGE block: proof of work: " + *why);
+    if (on_proof && has_aux)
+        (*on_proof)(Hash(pack(hdr).get_span()), aux);
 
     BlockType block;
     static_cast<BlockHeaderType&>(block) = hdr;
