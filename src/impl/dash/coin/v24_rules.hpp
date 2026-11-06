@@ -26,11 +26,20 @@
 /// as Core decodes them (vendor/bls_canonical.hpp); a build without the
 /// backend refuses such payloads as unverifiable instead of accepting them.
 ///
-/// Wiring. The folds trust chainlocked blocks for ProTx validity (design
-/// §3.3.4); nothing here is called by a fold yet. The fold-side rule S2 does
-/// enforce is fail-closed parsing (vendor::parse_protx_payload and the
-/// refusals in mn_state_machine.hpp, replay_fold_engine.hpp and
-/// sml_special_fold.hpp). These checks are the reference for the S3
+/// Wiring: TEMPLATE SELECTION ONLY. These rules may refuse a tx we would
+/// otherwise put in a block; they must never sit on a path that has to
+/// ACCEPT a mined (chainlocked) block. Two reasons: a build without the BLS
+/// backend refuses every real operator key and type-2/4 signature here as
+/// unverifiable, and a mined block is valid by Core's verdict, not ours. The
+/// folds of mined blocks -- the replay fold (replay_fold_engine.hpp), the
+/// payee projection (mn_state_machine.hpp) and the v24 transitions
+/// (v24_state.hpp) -- read payloads structurally (vendor::parse_protx_payload,
+/// no BLS math) and prove themselves against the committed merkleRootMNList.
+/// v24_state.hpp's shared-collateral check calls decode_special_payload for
+/// type 1 only, which carries no signature rule. KATs:
+/// DashReplayFoldV24.MinedBlockFoldNeverRunsTheBlsPayloadRules and
+/// DashMnState.V24MinedBlockFoldNeverRunsTheBlsPayloadRules fold payloads
+/// these rules refuse. These checks are also the reference for the S3
 /// transitions and the S9 regtest KATs.
 
 #include <impl/dash/coin/tx_version_rules.hpp>
