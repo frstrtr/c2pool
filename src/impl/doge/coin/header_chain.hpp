@@ -184,6 +184,10 @@ public:
 
     ~HeaderChain() = default;
 
+    /// The store's fd share (FdPlan::doge_headers), before init(). Unset:
+    /// StoreFds::header_store of the raised limit, read with pread.
+    void set_store_share(const StoreFds::Share& share) { m_store_share = share; }
+
     // Disable copy
     HeaderChain(const HeaderChain&) = delete;
     HeaderChain& operator=(const HeaderChain&) = delete;
@@ -202,8 +206,13 @@ public:
             opts.mmap_reads = false;
             // One fd per open table with pread (no mmap to close it after),
             // drawn from the process's fd limit with the full set's DB
-            // (doge::coin::StoreFds; VERIFY7 B3, VERIFY8 C2).
+            // (doge::coin::StoreFds; VERIFY7 B3, VERIFY8 C2), or the share
+            // the node planned (FdPlan: mapped tables under a tight limit).
             opts.max_open_files = StoreFds::header_store(core::raise_nofile_limit(65536));
+            if (m_store_share.max_open_files > 0) {
+                opts.max_open_files = m_store_share.max_open_files;
+                opts.mmap_reads = m_store_share.mmap_reads;
+            }
             m_db = std::make_unique<core::LevelDBStore>(m_db_path, opts);
             if (!m_db->open())
                 return false;
@@ -807,6 +816,7 @@ private:
 
     DOGEChainParams m_params;
     std::string    m_db_path;
+    StoreFds::Share m_store_share{0, false};   // set_store_share; 0: unset
 
     mutable std::mutex m_mutex;
 

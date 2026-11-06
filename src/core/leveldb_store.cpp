@@ -68,6 +68,12 @@ LevelDBStore::LevelDBStore(const std::string& db_path, const LevelDBOptions& opt
 {
 }
 
+struct LevelDBStore::SnapshotRegistry {
+    std::mutex mu;
+    leveldb::DB* db = nullptr;   // null once the store closed
+    std::set<const leveldb::Snapshot*> live;
+};
+
 LevelDBStore::~LevelDBStore()
 {
     close();
@@ -163,6 +169,8 @@ bool LevelDBStore::open()
         }
 
         m_db.reset(db_ptr);
+        m_snapshots = std::make_shared<SnapshotRegistry>();
+        m_snapshots->db = db_ptr;
         LOG_INFO << "LevelDB store opened successfully at: " << m_db_path;
         return true;
 
@@ -189,6 +197,16 @@ bool LevelDBStore::open_waiting(int attempts, std::chrono::milliseconds wait)
 
 void LevelDBStore::close()
 {
+    if (m_snapshots) {
+        // Snapshots still held are released here, while the DB exists; their
+        // copies then release nothing.
+        std::lock_guard<std::mutex> lock(m_snapshots->mu);
+        for (const leveldb::Snapshot* s : m_snapshots->live)
+            m_snapshots->db->ReleaseSnapshot(s);
+        m_snapshots->live.clear();
+        m_snapshots->db = nullptr;
+    }
+    m_snapshots.reset();
     if (m_db) {
         LOG_INFO << "Closing LevelDB store at: " << m_db_path;
         m_db.reset();
@@ -375,11 +393,17 @@ bool LevelDBStore::for_each_prefix(const std::string& prefix,
 
 LevelDBStore::Snapshot LevelDBStore::snapshot()
 {
-    if (!m_db)
+    if (!m_db || !m_snapshots)
         return nullptr;
-    leveldb::DB* db = m_db.get();
-    return Snapshot(db->GetSnapshot(),
-                    [db](const leveldb::Snapshot* s) { db->ReleaseSnapshot(s); });
+    std::shared_ptr<SnapshotRegistry> reg = m_snapshots;
+    std::lock_guard<std::mutex> lock(reg->mu);
+    const leveldb::Snapshot* snap = reg->db->GetSnapshot();
+    reg->live.insert(snap);
+    return Snapshot(snap, [reg](const leveldb::Snapshot* s) {
+        std::lock_guard<std::mutex> l(reg->mu);
+        if (reg->db && reg->live.erase(s) != 0)
+            reg->db->ReleaseSnapshot(s);
+    });
 }
 
 bool LevelDBStore::for_each_prefix_at(const Snapshot& at, const std::string& prefix,
@@ -389,6 +413,14 @@ bool LevelDBStore::for_each_prefix_at(const Snapshot& at, const std::string& pre
     if (!m_db) {
         LOG_ERROR << "LevelDB store not open";
         return false;
+    }
+    if (at) {
+        // A snapshot of an earlier open was released by its close().
+        std::lock_guard<std::mutex> lock(m_snapshots->mu);
+        if (m_snapshots->live.count(at.get()) == 0) {
+            LOG_ERROR << "LevelDB snapshot is not of this open of " << m_db_path;
+            return false;
+        }
     }
     leveldb::ReadOptions ro;
     ro.snapshot = at.get();

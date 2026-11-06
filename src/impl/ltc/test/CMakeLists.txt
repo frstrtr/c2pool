@@ -267,6 +267,21 @@ if (BUILD_TESTING AND GTest_FOUND)
     # moves exactly when a tx is priced (the tx-triggered refresh). Same
     # folding rule.
     #
+    # ltc_fd_plan_test.cpp: the fd limit split between the stores and the
+    # sockets (doge::coin::FdPlan, #2137): the caps fit at every limit and keep
+    # their floors, nothing changes at 65536, the tables are mapped and the
+    # caps lowered at 256, and at a 256 soft limit the stores under reads and
+    # compaction beside every socket the plan allows stay under it. Same
+    # folding rule.
+    #
+    # ltc_full_view_prices_old_inputs_test.cpp: the full LTC UTXO view (#2137
+    # S2): a coin from block 1 priced and selected with it, left unpriced by
+    # the accrual view; utxo_stats_ltc is litecoind 0.21.4's gettxoutsetinfo
+    # (and, with C2POOL_LTC_REGTEST_UTXO, matches litecoind's on its chain).
+    # ltc_utxo_lane_rerun_test.cpp / ltc_utxo_full_rerun_test.cpp: the DOGE
+    # lane suites run again on LTC's keep, limits and tags (the lane is
+    # core::coin's). Same folding rule.
+    #
     # mempool_bip68_test.cpp: BIP68 relative lock-times (Litecoin Core
     # CalculateSequenceLocks / EvaluateSequenceLocks / CheckSequenceLocks,
     # #2138): the lock pair at its height and 512 s boundaries, the disable
@@ -374,8 +389,12 @@ if (BUILD_TESTING AND GTest_FOUND)
         ingest_ownership_test.cpp
         invalid_pow_score_test.cpp
         legacy_addrme_self_probe_test.cpp
+        ltc_fd_plan_test.cpp
+        ltc_full_view_prices_old_inputs_test.cpp
         ltc_gentx_golden_kat_test.cpp
         ltc_template_time_test.cpp
+        ltc_utxo_full_rerun_test.cpp
+        ltc_utxo_lane_rerun_test.cpp
         mempool_bip68_test.cpp
         mempool_final_tx_test.cpp
         mempool_mweb_admission_test.cpp
@@ -413,6 +432,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         core ltc
     )
     target_link_libraries(share_test PRIVATE c2pool_payout c2pool_merged_mining c2pool_hashrate c2pool_storage ltc_coin pool)  # OBJECT-lib SCC direct-naming (#22/#39)
+    # core_utxo: gettxoutsetinfo (utxo_stats_ltc) for the full LTC view's KAT (#2137 S2).
+    target_link_libraries(share_test PRIVATE core_utxo)
     # #1131 source-structural KAT: verified.remove(bad) must borrow (owns_data=false),
     # not own — folded into this EXISTING allowlisted target (no new executable).
     target_compile_definitions(share_test PRIVATE

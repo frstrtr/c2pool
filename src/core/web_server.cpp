@@ -11932,8 +11932,29 @@ void WebServer::handle_accept(beast::error_code ec, tcp::socket socket)
 {
 
     if (!ec) {
-        // Create and run HTTP session
-        std::make_shared<HttpSession>(std::move(socket), mining_interface_)->run();
+        const size_t cap = max_http_connections_.load();
+        if (cap > 0 && http_live_->load() >= cap) {
+            // At the cap the node's fd plan gives HTTP: closed at once.
+            LOG_WARNING << "HTTP connection refused: " << http_live_->load() << "/" << cap
+                        << " sessions (the fd limit's HTTP share)";
+            beast::error_code ignore;
+            socket.shutdown(tcp::socket::shutdown_both, ignore);
+            socket.close(ignore);
+        } else {
+            struct Slot {
+                std::shared_ptr<std::atomic<size_t>> live;
+                explicit Slot(std::shared_ptr<std::atomic<size_t>> l) : live(std::move(l)) { live->fetch_add(1); }
+                Slot(const Slot&) = delete;
+                Slot& operator=(const Slot&) = delete;
+                ~Slot() { live->fetch_sub(1); }
+            };
+            auto slot = std::make_shared<Slot>(http_live_);
+            // Create and run HTTP session
+            std::make_shared<HttpSession>(std::move(socket), mining_interface_, std::move(slot),
+                                          std::chrono::milliseconds(http_idle_timeout_ms_.load()),
+                                          std::chrono::milliseconds(http_request_timeout_ms_.load()))
+                ->run();
+        }
     } else {
         LOG_ERROR << "HTTP accept error: " << ec.message();
     }

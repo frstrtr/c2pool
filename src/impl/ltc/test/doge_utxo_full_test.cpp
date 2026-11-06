@@ -96,7 +96,7 @@ std::vector<BlockType> chain_with(const uint256& g, uint32_t n,
 // tip (60). With keep = 20 the accrual lane armed at 60 - 20 = 40 and never
 // asked for 1..39: the coins at 3..39 were unknown, the fee unknown, the tx
 // excluded.
-TEST(DogeUtxoFull, DeepInputConsolidationIsPricedAndSelected)
+TEST(C2_LANE_SUITE(DogeUtxoFull), DeepInputConsolidationIsPricedAndSelected)
 {
     constexpr uint32_t KEEP = 20, N = 60, FIRST = 3, LAST = 40, COINS = 499, WINDOW = 16;
     constexpr int64_t FEE = 3'669'950'000LL;
@@ -175,7 +175,7 @@ TEST(DogeUtxoFull, DeepInputConsolidationIsPricedAndSelected)
     const uint256 txid = txid_of(tx);
 
     DogeTip tip(chain[N - 1], N);
-    Mempool pool(core::coin::DOGE_LIMITS);
+    Mempool pool(C2_LANE_LIMITS);
     pool.set_utxo(l.t.cache.get());
     pool.set_tip_height(N);
     EXPECT_FALSE(pool.admit(tx, l.t.cache.get()).has_value());
@@ -200,7 +200,7 @@ TEST(DogeUtxoFull, DeepInputConsolidationIsPricedAndSelected)
 // accrual rule jumped to 35 - keep = 15: 11..14 were never connected, coin A
 // (created at 5, spent at 13) stayed "unspent", coin B (created at 12)
 // was unknown.
-TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
+TEST(C2_LANE_SUITE(DogeUtxoFull), RestartBehindByMoreThanKeepConnectsEveryBlock)
 {
     constexpr uint32_t KEEP = 20, BEST = 10, TIP_H = BEST + KEEP + 5;
     const uint256 g = genesis(0x52);
@@ -217,7 +217,7 @@ TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
     net.set_chain(std::vector<BlockType>(chain.begin(), chain.begin() + BEST), 1);
     net.best[0] = g;
     {
-        UtxoLane lane(*t.cache, *t.db, net.host(), KEEP, Mode::Full, 16);
+        UtxoLane lane(*t.cache, *t.db, net.host(), KEEP, Mode::Full, 16, C2_LANE_CHAIN);
         lane.on_block(chain[BEST - 1], hash_of(chain[BEST - 1]), BEST);
         serve(lane, net, chain);
         ASSERT_EQ(t.cache->get_best_height(), BEST);
@@ -231,7 +231,7 @@ TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
     net.set_chain(chain, 1);
     net.best[0] = g;
     net.requested.clear();
-    UtxoLane lane(*t.cache, *t.db, net.host(), KEEP, Mode::Full, 16);
+    UtxoLane lane(*t.cache, *t.db, net.host(), KEEP, Mode::Full, 16, C2_LANE_CHAIN);
     lane.startup();
     lane.on_block(chain[TIP_H - 1], hash_of(chain[TIP_H - 1]), TIP_H);
     serve(lane, net, chain);
@@ -246,7 +246,7 @@ TEST(DogeUtxoFull, RestartBehindByMoreThanKeepConnectsEveryBlock)
 // KAT 3. A DB at best 1,000 holding coins from 900 only. The old gate read
 // blocks_connected(), initialised to the DB's best height on a restart:
 // 1,000 >= 250, open.
-TEST(DogeUtxoFull, MiningGateClosedUntilSetComplete)
+TEST(C2_LANE_SUITE(DogeUtxoFull), MiningGateClosedUntilSetComplete)
 {
     constexpr uint32_t TIP = 5'000'001;
     TempDb t;
@@ -262,7 +262,7 @@ TEST(DogeUtxoFull, MiningGateClosedUntilSetComplete)
 
     DogeTip tip(DogeTip::header_at(TIP), TIP);
     ASSERT_TRUE(tip.chain.is_synced());
-    Mempool pool(core::coin::DOGE_LIMITS);
+    Mempool pool(C2_LANE_LIMITS);
     pool.set_utxo(t.cache.get());
     const Outpoint x(genesis(0x53), 0);
     const auto tx = spend(x.txid, 0, 500000000, 0x53);
@@ -303,7 +303,7 @@ TEST(DogeUtxoFull, MiningGateClosedUntilSetComplete)
 
 // KAT 4. A best-chain body spending an outpoint the set does not hold. The
 // non-strict connect recorded the input as unknown and connected the block.
-TEST(DogeUtxoFull, StrictConnectRefusesUnknownInput)
+TEST(C2_LANE_SUITE(DogeUtxoFull), StrictConnectRefusesUnknownInput)
 {
     const uint256 g = genesis(0x55);
     Lane l(20, Mode::Full, 16);
@@ -350,7 +350,7 @@ TEST(DogeUtxoFull, StrictConnectRefusesUnknownInput)
 
 // The strict connect itself: an input spent twice in one block, or one the
 // view does not hold, refuses the block and leaves the view untouched.
-TEST(DogeUtxoFull, StrictConnectIsAllOrNothing)
+TEST(C2_LANE_SUITE(DogeUtxoFull), StrictConnectIsAllOrNothing)
 {
     TempDb t;
     const auto chain = chain_with(genesis(0x57), 2);
@@ -382,7 +382,7 @@ TEST(DogeUtxoFull, StrictConnectIsAllOrNothing)
 // unspendable script is left out); a block spending one connects. The
 // accrual connect drops zero-value outputs: a full set built that way would
 // refuse a valid block.
-TEST(DogeUtxoFull, ZeroValueOutputIsACoin)
+TEST(C2_LANE_SUITE(DogeUtxoFull), ZeroValueOutputIsACoin)
 {
     const uint256 g = genesis(0x5b);
     const auto pre = chain_with(g, 1);
@@ -443,7 +443,7 @@ struct SpentShapedChains {
 // without the coin, and the new branch spending it again was refused for
 // good (the set stuck, templates coinbase-only). The full set's rewind puts
 // back every coin of its strict records.
-TEST(DogeUtxoFull, SpentShapedCoinIsRestoredByARewind)
+TEST(C2_LANE_SUITE(DogeUtxoFull), SpentShapedCoinIsRestoredByARewind)
 {
     const uint256 g = genesis(0x61);
     const SpentShapedChains c(g);
@@ -492,7 +492,7 @@ TEST(DogeUtxoFull, SpentShapedCoinIsRestoredByARewind)
 
 // The digest counts a (0, empty) coin like any other: it is a 'C' record of
 // the full set's DB from its block until a block spends it.
-TEST(DogeUtxoFull, SpentShapedCoinIsARecordOfTheSet)
+TEST(C2_LANE_SUITE(DogeUtxoFull), SpentShapedCoinIsARecordOfTheSet)
 {
     const uint256 g = genesis(0x65);
     const SpentShapedChains c(g);
@@ -516,7 +516,7 @@ TEST(DogeUtxoFull, SpentShapedCoinIsARecordOfTheSet)
 // does not hold is recorded as unknown, never refused). The same chains,
 // reorg included, connect to b5 without a refusal or a stuck set, and the
 // coin is never held.
-TEST(DogeUtxoOrder, AccrualViewPassesASpentShapedCoinThroughAReorg)
+TEST(C2_LANE_SUITE(DogeUtxoOrder), AccrualViewPassesASpentShapedCoinThroughAReorg)
 {
     const uint256 g = genesis(0x66);
     const SpentShapedChains c(g);
@@ -541,7 +541,7 @@ TEST(DogeUtxoOrder, AccrualViewPassesASpentShapedCoinThroughAReorg)
 // the full lane's drain ends after the block it is connecting and takes no
 // new body, so its pool joins at once, before the stores close; the set is
 // at its last flush and a restart resumes from it to the tip.
-TEST(DogeUtxoFull, AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
+TEST(C2_LANE_SUITE(DogeUtxoFull), AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
 {
     constexpr uint32_t N = 20000;
     const uint256 g = genesis(0x67);
@@ -578,7 +578,7 @@ TEST(DogeUtxoFull, AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
     ASSERT_EQ(l.t.db->get_best_height(), connected);
     l.net.stopping = false;
     l.net.requested.clear();
-    UtxoLane again(*l.t.cache, *l.t.db, l.net.host(), 20, Mode::Full, N);
+    UtxoLane again(*l.t.cache, *l.t.db, l.net.host(), 20, Mode::Full, N, C2_LANE_CHAIN);
     again.on_block(chain[N - 1], hash_of(chain[N - 1]), N);
     ASSERT_FALSE(l.net.requested.empty());
     EXPECT_EQ(l.net.requested.front(), connected + 1) << "not resumed from the flushed height";
@@ -589,7 +589,7 @@ TEST(DogeUtxoFull, AStoppingFullLaneJoinsAtOnceAndResumesFromItsLastFlush)
 
 // A body whose transactions are not the ones its header commits to (Merkle
 // root) is not connected; the height is fetched again.
-TEST(DogeUtxoFull, BodyNotMatchingItsHeaderIsRefetched)
+TEST(C2_LANE_SUITE(DogeUtxoFull), BodyNotMatchingItsHeaderIsRefetched)
 {
     const uint256 g = genesis(0x5e);
     const auto chain = chain_with(g, 4);
@@ -612,7 +612,7 @@ TEST(DogeUtxoFull, BodyNotMatchingItsHeaderIsRefetched)
 
 // The sync state is written in the same batch as the best block: a reopened
 // DB has them agree; a wipe removes it.
-TEST(DogeUtxoFull, SyncStateTravelsWithTheBestBlock)
+TEST(C2_LANE_SUITE(DogeUtxoFull), SyncStateTravelsWithTheBestBlock)
 {
     const uint256 g = genesis(0x5f);
     const auto chain = chain_with(g, 6);
@@ -635,7 +635,7 @@ TEST(DogeUtxoFull, SyncStateTravelsWithTheBestBlock)
 
 // The digest (c2pool --utxo-digest): equal for the same set built twice,
 // different once one more block is connected; counts the coins.
-TEST(DogeUtxoFull, DigestPinsTheSet)
+TEST(C2_LANE_SUITE(DogeUtxoFull), DigestPinsTheSet)
 {
     const uint256 g = genesis(0x60);
     const auto chain = chain_with(g, 8);
@@ -667,7 +667,7 @@ TEST(DogeUtxoFull, DigestPinsTheSet)
 // The set at the tip's height but on a sibling (the tip changed to B, the
 // set still holds A): the template prices against A's coins, and a child of
 // a tx only A confirmed is invalid on B. It must be coinbase-only.
-TEST(DogeUtxoFull, SiblingAtTheTipHeightDoesNotPrice)
+TEST(C2_LANE_SUITE(DogeUtxoFull), SiblingAtTheTipHeightDoesNotPrice)
 {
     constexpr uint32_t TIP = 5'000'001;
     TempDb t;
@@ -681,7 +681,7 @@ TEST(DogeUtxoFull, SiblingAtTheTipHeightDoesNotPrice)
     s.strict = 1;
     s.synced = 1;
     ASSERT_TRUE(t.cache->set_sync_state(s));
-    Mempool pool(core::coin::DOGE_LIMITS);
+    Mempool pool(C2_LANE_LIMITS);
     pool.set_utxo(t.cache.get());
     pool.set_tip_height(TIP);
     EXPECT_FALSE(pool.admit(spend(x.txid, 0, 500000000, 0x61), t.cache.get()).has_value());
@@ -733,7 +733,7 @@ uint32_t serve_peers(Lane& l, const std::vector<BlockType>& chain, const std::st
 
 // Several blocks in flight per peer (16), within the window, from every
 // peer; every height asked once; the set reaches the tip.
-TEST(DogeUtxoDownload, ManyBlocksInFlightPerPeerWithinTheWindow)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), ManyBlocksInFlightPerPeerWithinTheWindow)
 {
     const uint256 g = genesis(0x62);
     const auto chain = chain_with(g, 200);
@@ -766,7 +766,7 @@ TEST(DogeUtxoDownload, ManyBlocksInFlightPerPeerWithinTheWindow)
 // deliver. Past the stall timeout (2 s) it is rotated out, its requests go
 // to the other peers, the set moves on (Core's stalling-peer rule). Before,
 // one silent peer held the in-order drain for 30 s per height.
-TEST(DogeUtxoDownload, StallingPeerIsRotatedOutAndItsRequestsReassigned)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), StallingPeerIsRotatedOutAndItsRequestsReassigned)
 {
     const uint256 g = genesis(0x63);
     const auto chain = chain_with(g, 120);
@@ -797,7 +797,7 @@ TEST(DogeUtxoDownload, StallingPeerIsRotatedOutAndItsRequestsReassigned)
 }
 
 // A request unanswered for REQUEST_TIMEOUT goes to another peer.
-TEST(DogeUtxoDownload, RequestTimeoutGoesToAnotherPeer)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), RequestTimeoutGoesToAnotherPeer)
 {
     const uint256 g = genesis(0x64);
     const auto chain = chain_with(g, 40);
@@ -822,7 +822,7 @@ TEST(DogeUtxoDownload, RequestTimeoutGoesToAnotherPeer)
 // The reorder buffer's memory bound: while the received-but-unconnected
 // bodies hold the bound, nothing new is asked; once the gap fills and they
 // connect, requests resume.
-TEST(DogeUtxoDownload, ReorderBufferMemoryBoundStopsRequests)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), ReorderBufferMemoryBoundStopsRequests)
 {
     const uint256 g = genesis(0x65);
     const auto chain = chain_with(g, 60);
@@ -904,7 +904,7 @@ struct DownloadSim {
 // is in flight to some peer every second, the buffer stays within the bound
 // (+ the heights the drain waits for), the stall timeout decays, and the set
 // reaches the tip. Before: stuck at 0 after the rotation, buffer over bound.
-TEST(DogeUtxoDownload, TheNextHeightIsAlwaysInFlightAtTheByteBound)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), TheNextHeightIsAlwaysInFlightAtTheByteBound)
 {
     constexpr uint32_t N = 600;
     constexpr uint64_t MB = 1u << 20;
@@ -936,7 +936,7 @@ TEST(DogeUtxoDownload, TheNextHeightIsAlwaysInFlightAtTheByteBound)
 // bodies, eight peers throttling historic blocks (four at 1 a second, two
 // at 3, one at 6) and one never answering. The set keeps the peers' pace
 // (16 a second), the next height is always asked, memory stays bounded.
-TEST(DogeUtxoDownload, OneMegabyteBlocksFromSlowThrottlingPeers)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), OneMegabyteBlocksFromSlowThrottlingPeers)
 {
     constexpr uint32_t N = 3000;
     constexpr uint64_t MB = 1u << 20;
@@ -968,7 +968,7 @@ TEST(DogeUtxoDownload, OneMegabyteBlocksFromSlowThrottlingPeers)
 
 // Cooling never leaves the download with nobody to ask: with every peer
 // rotated out (none answers), the next height is still asked, of them.
-TEST(DogeUtxoDownload, CoolingNeverLeavesNoPeerToAsk)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), CoolingNeverLeavesNoPeerToAsk)
 {
     const uint256 g = genesis(0x6a);
     const auto chain = chain_with(g, 100);
@@ -986,7 +986,7 @@ TEST(DogeUtxoDownload, CoolingNeverLeavesNoPeerToAsk)
 
 // Only a peer advertising NODE_NETWORK serves the IBD (a pruned node does
 // not keep old blocks).
-TEST(DogeUtxoDownload, FullBlockPeerNeedsNodeNetwork)
+TEST(C2_LANE_SUITE(DogeUtxoDownload), FullBlockPeerNeedsNodeNetwork)
 {
     EXPECT_TRUE(doge::coin::full_block_peer(1));
     EXPECT_TRUE(doge::coin::full_block_peer(1 | 4 | 8));
@@ -999,7 +999,7 @@ TEST(DogeUtxoDownload, FullBlockPeerNeedsNodeNetwork)
 // [cb, t1, t2, t2] has the Merkle root of [cb, t1, t2] (CVE-2012-2459): it is
 // a bad body from that peer (bad_bodies), fetched again, never counted as a
 // strict refusal of the set.
-TEST(DogeUtxoFull, MutatedBodyIsABadBodyNotARefusal)
+TEST(C2_LANE_SUITE(DogeUtxoFull), MutatedBodyIsABadBodyNotARefusal)
 {
     const uint256 g = genesis(0x66);
     auto chain = chain_with(g, 5);
@@ -1029,7 +1029,7 @@ TEST(DogeUtxoFull, MutatedBodyIsABadBodyNotARefusal)
 
 // A height refused REFUSALS_MAX times is left alone for STUCK_RETRY, then
 // fetched again (not only at a restart).
-TEST(DogeUtxoFull, StuckHeightIsRetried)
+TEST(C2_LANE_SUITE(DogeUtxoFull), StuckHeightIsRetried)
 {
     const uint256 g = genesis(0x69);
     auto chain = chain_with(g, 5);
@@ -1072,7 +1072,7 @@ TEST(DogeUtxoFull, StuckHeightIsRetried)
 
 // Every height of the Bootstrap window is asked of one peer, once; nothing is
 // broadcast; the set reaches the tip in order.
-TEST(DogeUtxoBootstrap, TheBootstrapAsksOnePeerPerBlockNotEveryPeer)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), TheBootstrapAsksOnePeerPerBlockNotEveryPeer)
 {
     const uint256 g = genesis(0x70);
     const auto chain = chain_with(g, 30);
@@ -1104,7 +1104,7 @@ TEST(DogeUtxoBootstrap, TheBootstrapAsksOnePeerPerBlockNotEveryPeer)
 // within one tick of the host's word it asks, and the peers it asks are the
 // ones peers_in_use() names (the ranges go elsewhere). On 91e5f87d9 the
 // Bootstrap asked at once.
-TEST(DogeUtxoBootstrap, BodiesWaitForHeaders)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), BodiesWaitForHeaders)
 {
     const uint256 g = genesis(0x73);
     const auto chain = chain_with(g, 30);
@@ -1145,7 +1145,7 @@ TEST(DogeUtxoBootstrap, BodiesWaitForHeaders)
 // run 6: armed at a 20-h-old tip, 2,652 blocks instead of 1,441). Bodies
 // before that are not taken into the set; then the Bootstrap arms with the
 // cold start's window (256).
-TEST(DogeUtxoBootstrap, TheColdStartWaitsForACaughtUpChain)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), TheColdStartWaitsForACaughtUpChain)
 {
     const uint256 g = genesis(0x74);
     const auto chain = chain_with(g, 30);
@@ -1180,7 +1180,7 @@ TEST(DogeUtxoBootstrap, TheColdStartWaitsForACaughtUpChain)
 // A restart near the tip (10 behind, keep 10) whose tip is over 2 h old: the
 // cold start is not decided and its gate skips every body above keep, so
 // the chase asks for none; decided (a fresh tip), it chases (VERIFY9 S3).
-TEST(DogeUtxoBootstrap, TheChaseWaitsForTheColdStartDecision)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), TheChaseWaitsForTheColdStartDecision)
 {
     const uint256 g = genesis(0x75);
     const auto chain = chain_with(g, 25);
@@ -1217,7 +1217,7 @@ TEST(DogeUtxoBootstrap, TheChaseWaitsForTheColdStartDecision)
 // the window is not held in memory. One inside the range is asked again in
 // its turn; one above the range (a block mined meanwhile) extends it
 // (VERIFY9 S2, M-R3: the bound in full mode only).
-TEST(DogeUtxoBootstrap, ABodyBeyondTheWindowExtendsTheRangeInsteadOfWaitingInMemory)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), ABodyBeyondTheWindowExtendsTheRangeInsteadOfWaitingInMemory)
 {
     const uint256 g = genesis(0x76);
     const auto chain = chain_with(g, 62);
@@ -1250,7 +1250,7 @@ TEST(DogeUtxoBootstrap, ABodyBeyondTheWindowExtendsTheRangeInsteadOfWaitingInMem
 // timeouts and staller rule. 31 s without a drain sends no broadcast beside
 // it, and the body that came resets the stall clock the host's 30-s timer
 // reads (VERIFY9 S2, M-R4: the 30-s broadcast beside the download).
-TEST(DogeUtxoBootstrap, NoBroadcastBesideTheBootstrapsDownload)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), NoBroadcastBesideTheBootstrapsDownload)
 {
     const uint256 g = genesis(0x77);
     const auto chain = chain_with(g, 60);
@@ -1279,7 +1279,7 @@ TEST(DogeUtxoBootstrap, NoBroadcastBesideTheBootstrapsDownload)
 }
 
 // A Bootstrap request unanswered for REQUEST_TIMEOUT goes to another peer.
-TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), ABootstrapRequestTimesOutAndIsReassigned)
 {
     const uint256 g = genesis(0x71);
     const auto chain = chain_with(g, 30);
@@ -1305,7 +1305,7 @@ TEST(DogeUtxoBootstrap, ABootstrapRequestTimesOutAndIsReassigned)
 // A peer holding the window's first height while the others deliver is
 // rotated out past the stall timeout; its heights go to the other peers and
 // the Bootstrap completes (before: 30 s per height, then a broadcast).
-TEST(DogeUtxoBootstrap, ASlowPeerDoesNotStallTheBootstrap)
+TEST(C2_LANE_SUITE(DogeUtxoBootstrap), ASlowPeerDoesNotStallTheBootstrap)
 {
     const uint256 g = genesis(0x72);
     const auto chain = chain_with(g, 60);
@@ -1341,7 +1341,7 @@ TEST(DogeUtxoBootstrap, ASlowPeerDoesNotStallTheBootstrap)
 // 48 MB DB read at random adds tens of MB of RssFile through mmap and next to
 // nothing through pread; both read back every key, also after a reopen with
 // 32 MB table files over 2 MB ones.
-TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
+TEST(C2_LANE_SUITE(DogeUtxoFull), TheFullSetsDbReadsTablesWithoutMmap)
 {
     if (doge::coin::ProcessMemory::read().rss_kb == 0)
         GTEST_SKIP() << "no /proc/self/status: process residency cannot be read on this platform";
@@ -1420,7 +1420,7 @@ TEST(DogeUtxoFull, TheFullSetsDbReadsTablesWithoutMmap)
 // (LevelDB keeps max_open_files - 10, at least 64), not the old fixed 256 +
 // 64; at 1,024 (a service whose hard limit is 1,024) 128 + 256; at 65,536
 // 256 + 512; unknown (Windows: HANDLEs, no pread) 256 + 512.
-TEST(DogeUtxoFull, TheStoresTableBudgetFitsTheFdLimit)
+TEST(C2_LANE_SUITE(DogeUtxoFull), TheStoresTableBudgetFitsTheFdLimit)
 {
     using doge::coin::StoreFds;
     auto tables = [](int max_open_files) { return std::max(max_open_files, 74) - 10; };
