@@ -23,6 +23,8 @@
 #include <core/coin/work_view.hpp>
 #include <core/coin/mweb_shape.hpp>
 #include <impl/ltc/coin/block.hpp>
+#include <impl/ltc/test/ltc_mweb_ext_fixtures.hpp>
+#include <impl/ltc/test/ltc_mweb_tx_fixtures.hpp>
 #include <btclibs/util/strencodings.h>
 #include <crypto/scrypt.h>
 
@@ -48,6 +50,11 @@
 // template (cold/warm start before the first MWEB state) it is served
 // DEGRADED: work is valid for shares and merged mining, and block assembly
 // refuses every LTC block from it.
+//
+// N4 (#2137 S3): a job frozen from a template that carried litecoind's MWEB
+// extension -- a peg-in, a HogEx with the peg-in's output as its second
+// input, the mw::Block -- assembles its block from that frozen data after
+// the template moved on to another (REAL mainnet 3200601 bytes).
 //
 // The template-tx check (core::coin::check_template_txs) rides the same HOLD
 // at ingress and refuses at assembly: a tx without inputs (the old MWEB
@@ -906,4 +913,64 @@ TEST(LtcMwebHogex, CoinMetricsMergedIntoLocalStats)
     f.mi.set_coin_metrics_fn([]() -> nlohmann::json { throw std::runtime_error("boom"); });
     stats = f.mi.rest_local_stats();
     EXPECT_TRUE(stats.contains("mweb_hold_seconds")) << "a failing provider never breaks the payload";
+}
+
+// N4 (#2137 S3, ltc_mweb_ext litecoind): the job frozen from a template with
+// litecoind's extension (REAL 3200601: the peg-in 92dd3109.., the HogEx
+// spending the previous HogEx and the pegin output, the 2-kernel mw::Block)
+// assembles header | coinbase | peg-in | HogEx | 01 mw::Block from its own
+// frozen data after the template moved on to the empty body, and the
+// sessions of one generation share one tx-data vector (S1 fold).
+TEST(LtcMwebHogex, N4_FrozenJobWithLitecoindsExtensionAssemblesItsOwnBlock)
+{
+    namespace xf = ltc_mweb_ext_fixture;
+    namespace tf = ltc_mweb_tx_fixture;
+    Fixture f;
+    stub_ref_hash(f.mi);
+    const std::string pegin = xf::kPeginTx3200601Hex;
+    const std::string hogex = tf::kBlock3200601HogexHex;
+    const std::string mweb = tf::kBlock3200601MwebRawHex;
+    auto with_ext = mweb_template({{pegin, xf::kPeginTx3200601Txid}, {hogex, tf::kBlock3200601HogexTxid}}, mweb);
+    with_ext["transactions"][0]["hash"] = xf::kPeginTx3200601Wtxid;
+    f.node.work_data = with_ext;
+    f.mi.refresh_work();
+    ASSERT_FALSE(f.mi.is_work_degraded());
+    ASSERT_EQ(f.mi.get_cached_mweb(), mweb) << "the 2-input HogEx passes the ingress checks (rule 7)";
+    FrozenJob a = freeze_cached_job(f.mi, kPrev);
+    FrozenJob a2 = freeze_cached_job(f.mi, kPrev);
+    ASSERT_TRUE(a.snap.tx_data && a2.snap.tx_data);
+    EXPECT_EQ(a.snap.tx_data.get(), a2.snap.tx_data.get()) << "one tx-data vector per generation";
+    ASSERT_EQ(a.snap.tx_data->size(), 2u);
+    EXPECT_EQ(a.snap.mweb, mweb);
+
+    // The template moves on: the empty body, c2pool's own HogEx.
+    const std::string t1 = txid_hex(kTx1), th = txid_hex(kHogexStripped);
+    f.node.work_data = mweb_template({{kTx1, t1}, {kHogex, th}}, kMweb);
+    f.mi.refresh_work();
+    ASSERT_EQ(f.mi.get_cached_mweb(), kMweb);
+    FrozenJob b = freeze_cached_job(f.mi, kPrev);
+    EXPECT_NE(a.snap.tx_data.get(), b.snap.tx_data.get());
+
+    f.mi.mining_submit("mweb-kat-miner", "j1", kEn1, kEn2, kNtime, a.nonce, "1", {}, &a.snap);
+    ASSERT_EQ(f.node.submit_calls, 1);
+    const std::string& hex = f.node.last_submitted_hex;
+    EXPECT_TRUE(ends_with(hex, "01" + mweb)) << "the job's own mw::Block, not the current template's";
+    auto blk = parse_block(hex);
+    ASSERT_EQ(blk.m_txs.size(), 3u) << "coinbase | peg-in | HogEx";
+    EXPECT_EQ(HexStr(pack(ltc::coin::TX_WITH_WITNESS(blk.m_txs[1])).get_span()), pegin);
+    const auto& hog = blk.m_txs.back();
+    ASSERT_TRUE(hog.m_hogEx);
+    ASSERT_EQ(hog.vin.size(), 2u);
+    EXPECT_EQ(hog.vin[1].prevout.hash.GetHex(), xf::kPeginTx3200601Txid);
+    EXPECT_EQ(hog.vin[1].prevout.index, 0u);
+    EXPECT_EQ(hog.vout.size(), 2u) << "the HogAddr and the peg-out";
+    EXPECT_EQ(HexStr(std::span<const unsigned char>(blk.m_mweb_raw.data(), blk.m_mweb_raw.size())), mweb);
+    EXPECT_EQ(f.relay_hex, hex);
+    EXPECT_EQ(f.mi.get_mweb_refusals(), 0u);
+
+    // And the current job still gets its own block.
+    f.mi.mining_submit("mweb-kat-miner", "j2", kEn1, kEn2, kNtime, b.nonce, "1", {}, &b.snap);
+    ASSERT_EQ(f.node.submit_calls, 2);
+    EXPECT_TRUE(ends_with(f.node.last_submitted_hex, "01" + kMweb));
+    EXPECT_EQ(parse_block(f.node.last_submitted_hex).m_txs.size(), 3u);
 }
