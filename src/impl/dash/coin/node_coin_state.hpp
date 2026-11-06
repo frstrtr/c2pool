@@ -48,6 +48,7 @@
 #include <ctime>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -487,6 +488,12 @@ public:
         uint32_t height, const uint256& prev_hash,
         const std::vector<MutableTransaction>& candidates, const QuorumManager& qmgr)>;
     void set_asset_unlock_admit_fn(AssetUnlockAdmitFn fn) { m_asset_unlock_admit_fn = std::move(fn); }
+
+    /// Heights the embedded arm declined because the scheduled payee is paid
+    /// through a v24 payout list (cause mn-payee-v24-payout-list), and the
+    /// last such height. Counted once per height (templates rebuild).
+    uint64_t v24_payout_list_declines() const { return m_v24_payout_list_declines.load(); }
+    uint32_t v24_payout_list_last_height() const { return m_v24_payout_list_last_h.load(); }
     V24State v24_state_for(uint32_t height) const
     {
         return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
@@ -2512,6 +2519,17 @@ private:
                            "protx=" + protx->GetHex().substr(0, 12),
                            "payout-set-known");
         }
+        // Dash Core v24: a payee paid through a payout list the builder
+        // cannot build yet (S4). Explicit, and counted per height.
+        if (d.viable && m_require_resolvable_payee) {
+            if (auto protx = mn_payee_unpayable_at_tip()) {
+                d = refuse("mn-payee-v24-payout-list",
+                           "protx=" + protx->GetHex().substr(0, 12),
+                           "v24-payee-builder");
+                if (m_v24_payout_list_last_h.exchange(next_h) != next_h)
+                    m_v24_payout_list_declines.fetch_add(1);
+            }
+        }
 
         if (d.viable) return d;
 
@@ -2624,6 +2642,36 @@ private:
         if (!expected) return false;              // #996: nullopt while payment due
         return m_mnstates.entries().find(*expected) != m_mnstates.entries().end();
     }
+
+    /// The safety net for the masternode payee builder: the scheduled payee
+    /// must be payable, i.e. every output Dash Core's GetBlockTxOuts expects
+    /// for it (v24::expected_mn_outputs: the v3 payout list, a shared
+    /// masternode's share split, or scriptPayout, then the operator) has a
+    /// script. A payee with no payout data at all would be paid to an empty
+    /// script (bad-cb-payee). Returns the scheduled proRegTxHash when the
+    /// height must be REFUSED (cause=mn-payee-v24-payout-list), nullopt when
+    /// serving is safe. Same no-payment-due carve-outs as
+    /// mn_payee_resolvable_at_tip(). (Testnet shadow h=1586594, VM504 dashd
+    /// 24.0.0: before the v24 payee builder, an Evo masternode with a v3
+    /// payout list was paid to an empty scriptPayout.)
+    std::optional<uint256> mn_payee_unpayable_at_tip() const {
+        if (m_mnstates.entries().empty()) return std::nullopt;
+        const uint32_t next_h = m_prev_height + 1;
+        const int64_t reward = compute_dash_block_reward_post_v20(next_h);
+        const int64_t platform_reward =
+            compute_dash_platform_reward_post_v20_mn_rr(next_h, m_mn_rr_height);
+        if (compute_dash_mn_payment_post_v20(reward) - platform_reward <= 0) return std::nullopt;
+        const auto expected = m_mnstates.find_expected_payee();
+        if (!expected) return std::nullopt;   // payee-unresolvable owns this
+        const auto it = m_mnstates.entries().find(*expected);
+        if (it == m_mnstates.entries().end()) return std::nullopt;
+        const auto due = v24::expected_mn_outputs(it->second, int64_t{1'000'000'000'000});
+        bool payable = !due.empty();
+        for (const auto& o : due) payable = payable && !o.script.empty();
+        if (payable) return std::nullopt;
+        return *expected;
+    }
+
 
     // Incident h=2516595 (bad-cb-payee): the scheduled payee's operator-
     // reward split must be PROVEN before the embedded arm may build the
@@ -2822,6 +2870,8 @@ private:
     V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
     DashNetwork m_v24_net{DashNetwork::MAINNET};
     AssetUnlockAdmitFn m_asset_unlock_admit_fn;   // #143 credit-pool follower admission
+    mutable std::atomic<uint64_t> m_v24_payout_list_declines{0};
+    mutable std::atomic<uint32_t> m_v24_payout_list_last_h{0};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
