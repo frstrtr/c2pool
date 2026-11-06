@@ -1136,6 +1136,7 @@ if (BUILD_TESTING AND GTest_FOUND)
     add_executable(test_dash_embedded_gbt
         test_dash_embedded_gbt.cpp
         test_dash_embedded_cbtx_byte_parity.cpp
+        test_dash_v24_cbtx.cpp            # Dash Core v24 CbTx version 4 (S1)
         test_dash_mnlistdiff_root_parity.cpp
         test_dash_qrinfo.cpp
         test_dash_rotated_quorum_members.cpp

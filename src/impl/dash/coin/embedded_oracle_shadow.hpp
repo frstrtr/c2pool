@@ -110,7 +110,8 @@ namespace coin {
 inline constexpr uint32_t kOracleComparatorVersion = 1;
 // Highest CbTx payload version this comparator models. A connected/observed
 // CbTx with a higher nVersion is a chain-drift sentinel (§6 cond. 5).
-inline constexpr uint16_t kMaxKnownCbTxVersion = vendor::CCbTx::VERSION_CLSIG_AND_BALANCE;
+// Dash Core v24 CbTx version 4 is modelled (vendor/cbtx.hpp).
+inline constexpr uint16_t kMaxKnownCbTxVersion = vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Height-class taxonomy. A single height can belong to MULTIPLE classes;

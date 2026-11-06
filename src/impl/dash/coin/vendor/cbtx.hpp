@@ -3,6 +3,8 @@
 
 // Vendored from dashcore/src/evo/cbtx.h @ develop cfad414
 // (Dash Core v23.1-dev, current `develop` branch as of 2026-04-23).
+// Version 4 (merkleRootAssetUnlocks) added from Dash Core v24.0.0
+// src/evo/cbtx.h.
 //
 // Adaptations from upstream:
 //   1. CCbTx::Version is an `enum class` upstream, kept serializable via
@@ -46,6 +48,8 @@ struct CCbTx
     static constexpr uint16_t VERSION_MERKLE_ROOT_MNLIST  = 1;
     static constexpr uint16_t VERSION_MERKLE_ROOT_QUORUMS = 2;
     static constexpr uint16_t VERSION_CLSIG_AND_BALANCE   = 3;
+    /// Dash Core v24 (DEPLOYMENT_V24): appends merkleRootAssetUnlocks.
+    static constexpr uint16_t VERSION_MERKLE_ROOT_ASSETUNLOCKS = 4;
 
     static constexpr size_t BLS_SIG_SIZE = 96;
 
@@ -56,6 +60,9 @@ struct CCbTx
     uint32_t                          bestCLHeightDiff{0};
     std::array<uint8_t, BLS_SIG_SIZE> bestCLSignature{};
     int64_t                           creditPoolBalance{0};
+    /// Version 4: merkle root over the instance hashes of the block's
+    /// version-2+ asset unlocks, in block order; null when there are none.
+    uint256                           merkleRootAssetUnlocks;
 
     C2POOL_SERIALIZE_METHODS(CCbTx)
     {
@@ -66,6 +73,8 @@ struct CCbTx
                 READWRITE(VarInt(obj.bestCLHeightDiff));
                 READWRITE(Using<RawBytesFormat<BLS_SIG_SIZE>>(obj.bestCLSignature));
                 READWRITE(obj.creditPoolBalance);
+                if (obj.nVersion >= VERSION_MERKLE_ROOT_ASSETUNLOCKS)
+                    READWRITE(obj.merkleRootAssetUnlocks);
             }
         }
     }
@@ -92,6 +101,8 @@ struct CCbTx
                << " clSig=" << (has_best_cl_signature() ? "set" : "null")
                << " creditPool=" << creditPoolBalance;
         }
+        if (nVersion >= VERSION_MERKLE_ROOT_ASSETUNLOCKS)
+            os << " assetUnlocks=" << merkleRootAssetUnlocks.GetHex().substr(0, 16);
         return os.str();
     }
 };

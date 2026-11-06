@@ -33,6 +33,7 @@
 #include <impl/dash/coin/vendor/simplifiedmns.hpp> // vendor::CSimplifiedMNList (merkleRootMNList source)
 #include <impl/dash/coin/sml_projection.hpp>     // confirmedHash rollover projection + collateral-spend predicate
 #include <impl/dash/coin/vendor/cbtx.hpp>        // vendor::parse_cbtx (pre-emit CbTx self-check)
+#include <impl/dash/coin/cbtx_asset_unlocks.hpp> // Dash Core v24: required CbTx version + unlock root
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
@@ -1805,6 +1806,27 @@ public:
         if (cb.nHeight != static_cast<int32_t>(next_h))
             return reject("emit-cbtx-height-drift", std::to_string(cb.nHeight),
                           std::to_string(next_h));
+        // Dash Core v24 CheckCbTx: version 4 exactly when v24 is active for
+        // this block (bad-cbtx-version otherwise), committing the asset-unlock
+        // root of THIS body (bad-cbtx-assetunlockmerkleroot).
+        {
+            const V24State v24 = m_v24_state_fn ? m_v24_state_fn(next_h) : V24State::INACTIVE;
+            if (v24 == V24State::UNKNOWN)
+                return reject("emit-v24-state-unknown", "h=" + std::to_string(next_h),
+                              "ehf-scan-or-pin");
+            const uint16_t want = required_cbtx_version(/*v20_active=*/true,
+                                                        v24 == V24State::ACTIVE);
+            if (cb.nVersion != want)
+                return reject("emit-cbtx-version", std::to_string(cb.nVersion),
+                              std::to_string(want));
+            if (cb.nVersion >= vendor::CCbTx::VERSION_MERKLE_ROOT_ASSETUNLOCKS) {
+                const uint256 root = compute_merkle_root_asset_unlocks(w.m_txs);
+                if (cb.merkleRootAssetUnlocks != root)
+                    return reject("emit-asset-unlock-root-drift",
+                                  cb.merkleRootAssetUnlocks.GetHex().substr(0, 16),
+                                  root.GetHex().substr(0, 16));
+            }
+        }
         // FINDING-1: the root block next_h must commit is the tip SML with the
         // verifier's height-driven confirmation pass applied (specialtxman.cpp
         // :206-215 — see sml_projection.hpp). Comparing against the RAW tip

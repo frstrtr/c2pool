@@ -342,7 +342,9 @@ inline WorkSelection select_dash_work(
                 emb.qc_pose_members, emb.qc_pose_oracle,
                 // B.9: ProUpServTx / ProUpRevTx operator-signature verifier
                 // (null => those types are refused by the fold).
-                emb.protx_sig_verifier);
+                emb.protx_sig_verifier,
+                // Dash Core v24: CbTx version 4 when v24 is active for the block.
+                emb.v24_active);
         },
         dashd_fallback);
 }
