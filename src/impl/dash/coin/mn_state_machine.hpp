@@ -1389,7 +1389,15 @@ public:
                 st.keyIDVoting       = ptx.keyIDVoting;
                 st.nOperatorReward   = ptx.nOperatorReward;
                 st.scriptPayout.m_data = ptx.scriptPayout.m_data;
-                st.netInfo           = ptx.netInfo;
+                // Dash Core: a service whose address is not valid is an
+                // EMPTY MnNetInfo, and a registration with an empty netInfo
+                // starts BANNED until a ProUpServTx (specialtxman.cpp
+                // BuildNewListFromBlock; v23.1.7 and v24.0.0).
+                st.netInfo           = ptx.netInfo.canonical();
+                if (ptx.netInfo.IsEmpty()) {
+                    st.nPoSeBanHeight = height;
+                    st.isValid        = false;
+                }
                 // The ProRegTx IS the split's registration: nOperatorReward
                 // is immutable from here on and scriptOperatorPayout is
                 // provably unset until a ProUpServTx (which we also parse)
@@ -1445,7 +1453,7 @@ public:
                            " registered-set checkpoint anchor.";
                     break;
                 }
-                it->second.netInfo = ptx.netInfo;
+                it->second.netInfo = ptx.netInfo.canonical();
                 it->second.scriptOperatorPayout.m_data =
                     ptx.scriptOperatorPayout.m_data;
                 // Consensus (bad-protx-operator-payee) only ACCEPTS a

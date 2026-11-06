@@ -97,15 +97,16 @@ enum class MnFoldOutcome {
 
 namespace detail {
 
-// Is a legacy 18-byte CService "empty" (no address AND no port)? dashd
-// registers/keeps a masternode BANNED while its netInfo is empty; the SML
-// leaf reflects that as isValid=false.
-inline bool net_service_empty(const std::array<uint8_t, vendor::NETADDR_SIZE>& ip,
-                              uint16_t port_be)
+// Is a legacy 18-byte CService "empty"? dashd registers/keeps a masternode
+// BANNED while its netInfo is empty; the SML leaf reflects that as
+// isValid=false. Empty is Dash Core's rule (MnNetInfo::IsEmpty): ANY service
+// whose address is not valid (::ffff:0.0.0.0, ::, ::ffff:255.255.255.255,
+// TORv2- or internal-in-IPv6, 2001:db8::/32), whatever its port -- not just
+// the all-zero bytes. Such a service is held and hashed as 16 zero bytes and
+// port 0 (LegacyNetService::canonical()).
+inline bool net_service_empty(const vendor::LegacyNetService& n)
 {
-    if (port_be != 0) return false;
-    for (uint8_t b : ip) if (b != 0) return false;
-    return true;
+    return n.IsEmpty();
 }
 
 // Find the SML entry for a proRegTxHash. Returns nullptr when absent.
@@ -184,8 +185,8 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         e.nVersion       = pl.nVersion;               // 1=legacy,2=basic,3=extaddr
         e.proRegTxHash   = pro;
         e.confirmedHash  = uint256::ZERO;             // registered here, not yet confirmed
-        e.netAddress     = pl.netInfo.ip;
-        e.netPort        = pl.netInfo.port_be;
+        e.netAddress     = pl.netInfo.canonical().ip;
+        e.netPort        = pl.netInfo.canonical().port_be;
         // The ProReg payload's operator key is ALREADY encoded in the scheme
         // its nVersion dictates (legacy iff nVersion < BASIC_BLS), which is
         // exactly the scheme the SML leaf hashes for that nVersion — copy the
@@ -193,7 +194,7 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         e.pubKeyOperator = pl.pubKeyOperator;
         e.keyIDVoting    = pl.keyIDVoting;
         // Empty netInfo ⇒ registers BANNED (isValid=false), else valid.
-        e.isValid        = !detail::net_service_empty(pl.netInfo.ip, pl.netInfo.port_be);
+        e.isValid        = !detail::net_service_empty(pl.netInfo);
         e.nType          = pl.nType;
         e.platformHTTPPort = pl.platformHTTPPort;
         e.platformNodeID   = pl.platformNodeID;
@@ -208,8 +209,8 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
             return MnFoldOutcome::Refused;
         auto* e = detail::find_entry(list, pl.proTxHash);
         if (e == nullptr) return MnFoldOutcome::Refused;
-        e->netAddress = pl.netInfo.ip;
-        e->netPort    = pl.netInfo.port_be;
+        e->netAddress = pl.netInfo.canonical().ip;
+        e->netPort    = pl.netInfo.canonical().port_be;
         if (e->nType == vendor::CSimplifiedMNListEntry::TYPE_EVO) {
             e->platformHTTPPort = pl.platformHTTPPort;
             e->platformNodeID   = pl.platformNodeID;
@@ -217,7 +218,7 @@ inline MnFoldOutcome apply_mn_special_tx_to_sml(
         // dashd revives a banned masternode on a ProUpServTx once its service
         // is set again (BuildNewListFromBlock Revive). A non-empty netInfo is
         // the revive trigger the SML leaf can see.
-        if (!detail::net_service_empty(pl.netInfo.ip, pl.netInfo.port_be))
+        if (!detail::net_service_empty(pl.netInfo))
             e->isValid = true;
         return MnFoldOutcome::Applied;
     }
@@ -382,7 +383,7 @@ struct MnFoldContext
                         u.owner_or_platform_ids.emplace(st.keyIDOwner, pro);
                     if (st.nType == vendor::MnType::EVO && !st.platformNodeID.IsNull())
                         u.owner_or_platform_ids.emplace(st.platformNodeID, pro);
-                    if (!detail::net_service_empty(st.netInfo.ip, st.netInfo.port_be))
+                    if (!detail::net_service_empty(st.netInfo))
                         u.services.emplace(Service{st.netInfo.ip, st.netInfo.port_be}, pro);
                 }
             }
@@ -522,7 +523,7 @@ inline bool held_by_other(const Key& k, const BaseMap& base, const AddedMap& add
 inline std::optional<MnFoldContext::Service>
 service_of(const vendor::LegacyNetService& n)
 {
-    if (net_service_empty(n.ip, n.port_be)) return std::nullopt;
+    if (net_service_empty(n)) return std::nullopt;
     return MnFoldContext::Service{n.ip, n.port_be};
 }
 
@@ -700,6 +701,10 @@ inline FoldVerdict fold_one_with_ctx(vendor::CSimplifiedMNList& folded,
             return refuse("bad-protx-type (nType=" + std::to_string(pl.nType) + ")");
         if (pl.nType == vendor::MnType::EVO && pl.nVersion < vendor::ProTxVersion::BASIC_BLS)
             return refuse("bad-protx-evo-version");
+        // CProUpServTx::IsTriviallyValid (providertx.cpp:177 v23.1.7, :471
+        // v24.0.0): an empty netInfo -- any invalid service, whatever its
+        // port -- makes the tx, and a block carrying it, invalid.
+        if (pl.netInfo.IsEmpty()) return refuse("bad-protx-netinfo-empty");
         const vendor::CSimplifiedMNListEntry* be = nullptr;
         if (auto why = update_target_refusal(base, list, ov, pl.proTxHash, be))
             return refuse(*why);
