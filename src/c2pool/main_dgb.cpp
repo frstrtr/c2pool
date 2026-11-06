@@ -631,8 +631,18 @@ int run_node(const core::CoinParams& params, bool testnet,
                     // so the resident IndexEntry is HEADERS-ONLY (no AuxPow blob
                     // residency — the OOM-residency requirement is satisfied at the
                     // parse boundary, mirroring #1414's post-persist blob drop).
-                    broadcaster->set_raw_headers_parser(doge::coin::parse_doge_headers_message);
-                    broadcaster->set_raw_block_parser(doge::coin::parse_doge_block);
+                    // Each header's and block's proof of work (the AuxPoW
+                    // proof) is verified as it is parsed.
+                    {
+                        const auto rules = doge::coin::auxpow_rules(
+                            doge_aux_params ? *doge_aux_params : doge::coin::DOGEChainParams::mainnet());
+                        broadcaster->set_raw_headers_parser([rules](const uint8_t* d, size_t n) {
+                            return doge::coin::parse_doge_headers_message(d, n, &rules);
+                        });
+                        broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
+                            return doge::coin::parse_doge_block(d, n, &rules);
+                        });
+                    }
 
                     auto* bcaster_ptr = broadcaster.get();
                     auto doge_hdr_pool = std::make_shared<boost::asio::thread_pool>(1);
