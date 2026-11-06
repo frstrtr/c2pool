@@ -7,20 +7,31 @@
 ///                     1,578,000): 8 ProRegTx v3 (Evo with core_p2p /
 ///                     platform_p2p / platform_https, and regular), 8
 ///                     ProUpServTx v3 (Evo and regular, incl. v2->v3 raises)
-///                     and 1 ProUpRevTx v3. Each raw tx was rebuilt from the
-///                     Insight JSON and checked against its txid by the
-///                     generator; here the tx codec re-derives the txid, the
-///                     payload decodes to the fields Insight reported and
-///                     re-encodes byte for byte, and Core's payload-only
-///                     checks accept it under testnet rules at its height.
+///                     and 1 ProUpRevTx v3. Each raw tx was rebuilt from its
+///                     verbose JSON (dashd 24.0.0 getrawtransaction) and
+///                     checked against its txid by the generator; here the
+///                     tx codec re-derives the txid, the payload decodes to
+///                     the fields the JSON reported and re-encodes byte for
+///                     byte, and Core's payload-only checks accept it under
+///                     testnet rules at its height.
 ///   DashV24CbTx*      The first CbTx v4 (height 1,578,000): what the probe
 ///                     captured (payload size 207, first 4 bytes) and the v3
 ///                     codec's refusal of a v4 payload (B1, fixed by S1).
 ///   DashV24Synthetic* Shapes testnet does not carry yet (shared masternodes,
 ///                     multi-entry payout lists, types 10-12, every ADDRv2
 ///                     network, domains): encoded by the generator from Dash
-///                     Core v24.0.0's SERIALIZE_METHODS, decoded here, and the
-///                     same objects built in C++ re-encode to the same bytes.
+///                     Core v24.0.0's SERIALIZE_METHODS with real BLS operator
+///                     keys and signatures, every payload decoded by dashd
+///                     24.0.0 with the same key; decoded here, and the same
+///                     objects built in C++ re-encode to the same bytes.
+///   DashV24Bls*       Core's BLS decoding: an operator key must decode under
+///                     the payload's scheme, not be the identity and
+///                     re-encode exactly (else bad-protx-key-null); a type-2/4
+///                     signature canonical under neither scheme fails
+///                     GetTxPayload (bad-protx-payload). Facts confirmed by
+///                     dashd and dashbls (kBlsKeyFacts / kBlsSigFacts). A
+///                     build without BLS refuses what it cannot decide; its
+///                     rule tests run against those facts instead.
 ///   DashV24Sml*       SML entry v3 wire bytes and leaf hashes (vs the same
 ///                     masternode at v2), an mnlistdiff carrying v3 entries
 ///                     whose root matches its CbTx, unknown entry versions.
@@ -46,6 +57,8 @@
 #include <impl/dash/coin/transaction.hpp>
 #include <impl/dash/coin/tx_version_rules.hpp>
 #include <impl/dash/coin/v24_rules.hpp>
+#include <impl/dash/coin/vendor/bls_canonical.hpp>
+#include <impl/dash/coin/vendor/bls_verify.hpp>
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/netinfo.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
@@ -141,6 +154,15 @@ template <size_t N> std::array<uint8_t, N> pat_arr(uint8_t seed)
     return a;
 }
 
+template <size_t N> std::array<uint8_t, N> arr(const char* hex_str)
+{
+    const Bytes b = unhex(hex_str);
+    EXPECT_EQ(b.size(), N);
+    std::array<uint8_t, N> a{};
+    std::copy_n(b.begin(), std::min(N, b.size()), a.begin());
+    return a;
+}
+
 OPScript script(const Bytes& b) { OPScript s; s.m_data = b; return s; }
 OPScript p2pkh(const uint160& h)
 {
@@ -188,13 +210,59 @@ MutableTransaction parse_tx(const Bytes& raw)
     return tx;
 }
 
+// ── Core's BLS decoding in the rules ────────────────────────────────────────
+// With the dashbls backend the rules use it, as in production. A build
+// without it refuses every payload whose BLS key or signature it cannot
+// check ("unverifiable-..."); to keep the rest of the rule logic covered
+// there, the tests hand such a build an oracle of the answers dashd and
+// dashbls gave for each encoding the tests use (kBlsKeyFacts/kBlsSigFacts,
+// gen_s2_vectors.py). Unknown encodings stay undecidable. The real backend
+// is checked against the same facts in DashV24Bls.
+
+/// Signatures of mined (chainlocked) transactions: Core decoded them.
+std::vector<std::array<uint8_t, 96>>& mined_sigs()
+{
+    static std::vector<std::array<uint8_t, 96>> v;
+    return v;
+}
+
+std::optional<bool> oracle_pubkey_valid(const std::array<uint8_t, 48>& k, bool legacy)
+{
+    for (const auto& f : kBlsKeyFacts)
+        if (f.legacy == legacy && unhex(f.bytes) == Bytes(k.begin(), k.end())) return f.core_ok;
+    return v::bls_pubkey_core_valid(k, legacy);   // the all-zero answer, else nullopt
+}
+
+std::optional<bool> oracle_sig_decodes(const std::array<uint8_t, 96>& s, bool legacy)
+{
+    for (const auto& f : kBlsSigFacts)
+        if (f.legacy == legacy && unhex(f.bytes) == Bytes(s.begin(), s.end())) return f.core_ok;
+    for (const auto& m : mined_sigs())
+        if (m == s) return true;
+    return v::bls_sig_core_decodes(s, legacy);
+}
+
+ProviderTxRules with_bls(ProviderTxRules r)
+{
+    if (!v::bls_backend_available()) {
+        r.bls.pubkey_valid = &oracle_pubkey_valid;
+        r.bls.sig_decodes  = &oracle_sig_decodes;
+    }
+    return r;
+}
+
+ProviderTxRules rules_for(DashNetwork n, uint32_t height)
+{
+    return with_bls(ProviderTxRules::for_block(n, height));
+}
+
 ProviderTxRules mainnet_v24()
 {
-    auto r = ProviderTxRules::for_block(DashNetwork::MAINNET, 2'600'000);
+    auto r = rules_for(DashNetwork::MAINNET, 2'600'000);
     r.v24_active = true;   // the S0 hook says "not yet" for mainnet; force the post-activation rules
     return r;
 }
-ProviderTxRules mainnet_pre_v24() { return ProviderTxRules::for_block(DashNetwork::MAINNET, 2'570'000); }
+ProviderTxRules mainnet_pre_v24() { return rules_for(DashNetwork::MAINNET, 2'570'000); }
 
 template <typename T>
 std::optional<std::string> refusal(const T& p, const ProviderTxRules& r)
@@ -345,11 +413,11 @@ TEST(DashV24Testnet, MinedPayloadsPassCorePayloadChecksOnlyOnceV24IsActive)
     for (const auto& f : kTestnetProTx) {
         SCOPED_TRACE(f.txid);
         const Bytes payload = unhex(f.payload);
-        const auto at = ProviderTxRules::for_block(DashNetwork::TESTNET, f.height);
+        const auto at = rules_for(DashNetwork::TESTNET, f.height);
         ASSERT_TRUE(at.v24_active);
         EXPECT_EQ(provider_payload_refusal(f.txtype, payload, at), std::nullopt);
         // The same bytes one block before activation: GetMax(v19, !v24) = 2.
-        const auto before = ProviderTxRules::for_block(DashNetwork::TESTNET, 1'577'999);
+        const auto before = rules_for(DashNetwork::TESTNET, 1'577'999);
         EXPECT_EQ(provider_payload_refusal(f.txtype, payload, before),
                   std::optional<std::string>{"bad-protx-version"});
         EXPECT_EQ(provider_payload_refusal(f.txtype, payload, mainnet_pre_v24()),
@@ -419,7 +487,7 @@ v::CProRegTx make_shared_reg()
     p.nType = v::MnType::REGULAR;
     p.collateralOutpoint.index = 0;                       // hash null: internal collateral
     p.extNetInfo = ext({{0, {svc4(1, 2, 3, 4, 9999)}}});
-    p.pubKeyOperator = pat_arr<48>(0x05);
+    p.pubKeyOperator = arr<48>(kOpKey_proreg_shared);
     p.keyIDVoting = pat160(0x06);
     p.nOperatorReward = 500;
     const int64_t COIN = v::CCollateralShare::COIN;
@@ -447,7 +515,7 @@ v::CProRegTx make_multipayout_reg()
     p.extNetInfo = ext({{0, {svc4(5, 6, 7, 8, 9999),
                              v::NetInfoEntry{v::NetService::make(v::NetService::IPV6, v6, 9999)}}}});
     p.keyIDOwner = pat160(0x62);
-    p.pubKeyOperator = pat_arr<48>(0x63);
+    p.pubKeyOperator = arr<48>(kOpKey_proreg_multipayout);
     p.keyIDVoting = pat160(0x64);
     v::MasternodePayoutShare x, y, z;
     x.scriptPayout = p2pkh(pat160(0x51)); x.reward = 5000;
@@ -475,7 +543,7 @@ v::CProRegTx make_evo_reg()
                         {1, {svc4(9, 9, 9, 9, 26656)}},
                         {2, {svc4(9, 9, 9, 9, 443), v::NetInfoEntry{d}}}});
     p.keyIDOwner = pat160(0x72);
-    p.pubKeyOperator = pat_arr<48>(0x73);
+    p.pubKeyOperator = arr<48>(kOpKey_proreg_evo);
     p.keyIDVoting = pat160(0x74);
     p.nOperatorReward = 1000;
     v::MasternodePayoutShare x;
@@ -493,7 +561,7 @@ v::CProUpRegTx make_upreg_v3()
     v::CProUpRegTx p;
     p.nVersion = 3;
     p.proTxHash = pat256(0x81);
-    p.pubKeyOperator = pat_arr<48>(0x82);
+    p.pubKeyOperator = arr<48>(kOpKey_proupreg);
     p.keyIDVoting = pat160(0x83);
     v::MasternodePayoutShare x, y;
     x.scriptPayout = p2pkh(pat160(0x84)); x.reward = 6000;
@@ -519,7 +587,7 @@ v::CProUpServTx make_upserv_v3()
                              v::NetInfoEntry{v::NetService::make(v::NetService::I2P, pat(32, 0x93), 0)}}}});
     p.scriptOperatorPayout = p2pkh(pat160(0x94));
     p.inputsHash = pat256(0x95);
-    p.sig = pat_arr<96>(0x96);
+    p.sig = arr<96>(kSig_proupserv);
     return p;
 }
 
@@ -530,7 +598,7 @@ v::CProUpRevTx make_rev_v3()
     p.proTxHash = pat256(0x9a);
     p.nReason = v::CProUpRevTx::REASON_CHANGE_OF_KEYS;
     p.inputsHash = pat256(0x9b);
-    p.sig = pat_arr<96>(0x9c);
+    p.sig = arr<96>(kSig_prouprev);
     return p;
 }
 
@@ -564,7 +632,7 @@ v::CProUpSharedRegTx make_upsharedreg()
 {
     v::CProUpSharedRegTx p;
     p.proTxHash = pat256(0xc1);
-    p.pubKeyOperator = pat_arr<48>(0xc2);
+    p.pubKeyOperator = arr<48>(kOpKey_proupsharedreg);
     p.keyIDVoting = pat160(0xc3);
     p.inputsHash = pat256(0xc4);
     for (uint8_t i = 0; i < 3; ++i) p.vchSigs.push_back(pat_arr<65>(static_cast<uint8_t>(0xc5 + i)));
@@ -674,6 +742,7 @@ TEST(DashV24Synthetic, ProUpServTxV3WithCjdnsAndI2P)
 TEST(DashV24Synthetic, ProUpRevTxV3KeepsTheV2Layout)
 {
     const auto p = make_rev_v3();
+    expect_vector(kSyn_prouprev, p);
     const auto b = v::serialize_special_payload(p);
     EXPECT_EQ(b.size(), 164u);
     v::CProUpRevTx q;
@@ -932,11 +1001,12 @@ v::CProRegTx make_v1_reg()
     v::CProRegTx p;
     p.nVersion = 1;
     p.collateralOutpoint.hash = pat256(0x01);
+    p.collateralOutpoint.index = 0;   // the outpoint index has no default
     p.netInfo.ip[10] = 0xff; p.netInfo.ip[11] = 0xff;
     p.netInfo.ip[12] = 1; p.netInfo.ip[13] = 2; p.netInfo.ip[14] = 3; p.netInfo.ip[15] = 4;
     p.netInfo.port_be = 9999;
     p.keyIDOwner = pat160(0x02);
-    p.pubKeyOperator = pat_arr<48>(0x03);
+    p.pubKeyOperator = arr<48>(kOpKey_proreg_v1);   // legacy scheme (v1)
     p.keyIDVoting = pat160(0x04);
     p.scriptPayout = p2pkh(pat160(0x05));
     p.inputsHash = pat256(0x06);
@@ -948,6 +1018,7 @@ v::CProRegTx make_v2_evo_reg()
     auto p = make_v1_reg();
     p.nVersion = 2;
     p.nType = v::MnType::EVO;
+    p.pubKeyOperator = arr<48>(kOpKey_proreg_v2_evo);   // the same secret, basic scheme
     p.platformNodeID = pat160(0x07);
     p.platformP2PPort = 26656;
     p.platformHTTPPort = 443;
@@ -987,6 +1058,155 @@ TEST(DashV24Reject, BasesAreValid)
     rs.evo_shares_active = true;
     EXPECT_EQ(refusal(se, rs), std::nullopt) << "valid once evo_shares is active";
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Core's BLS decoding of operator keys and signatures
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(DashV24Synthetic, LegacyRegistrationsCarryTheirVersionsScheme)
+{
+    expect_vector(kSyn_proreg_v1, make_v1_reg());
+    expect_vector(kSyn_proreg_v2_evo, make_v2_evo_reg());
+    // One secret, two encodings: a v1 payload carries the legacy one.
+    EXPECT_NE(std::string(kOpKey_proreg_v1), std::string(kOpKey_proreg_v2_evo));
+}
+
+// CBLSLazyPublicKey::Get().IsValid() fails (bad-protx-key-null) for every
+// invalid encoding, in every payload with an operator key, under the
+// payload's scheme.
+TEST(DashV24Bls, InvalidOperatorKeysAreKeyNull)
+{
+    const auto r = mainnet_v24();
+    size_t invalid = 0;
+    for (const auto& f : kBlsKeyFacts) {
+        SCOPED_TRACE(f.what);
+        const Code want = f.core_ok ? std::nullopt : C("bad-protx-key-null");
+        invalid += !f.core_ok;
+        const auto k = arr<48>(f.bytes);
+        if (f.legacy) {
+            auto a = make_v1_reg();
+            a.pubKeyOperator = k;
+            EXPECT_EQ(refusal(a, mainnet_pre_v24()), want);
+            continue;
+        }
+        auto a = make_upreg_v3();
+        a.pubKeyOperator = k;
+        EXPECT_EQ(refusal(a, r), want);
+        auto b = make_multipayout_reg();
+        b.pubKeyOperator = k;
+        EXPECT_EQ(refusal(b, r), want);
+        auto c = make_upsharedreg();
+        c.pubKeyOperator = k;
+        EXPECT_EQ(refusal(c, r), want);
+        auto d = make_v2_evo_reg();
+        d.pubKeyOperator = k;
+        EXPECT_EQ(refusal(d, mainnet_pre_v24()), want);
+    }
+    EXPECT_GE(invalid, 6u);
+    // A legacy-scheme encoding is not the same key in a basic payload.
+    auto w = make_upreg_v3();
+    w.pubKeyOperator = arr<48>(kOpKey_proreg_v1);
+    EXPECT_EQ(refusal(w, r), C("bad-protx-key-null"));
+    auto z = make_upreg_v3();
+    z.pubKeyOperator = {};
+    EXPECT_EQ(refusal(z, r), C("bad-protx-key-null"));
+}
+
+// CBLSSignature::Unserialize throws ("malleable BLS object") on a type-2/4
+// signature canonical under neither scheme: GetTxPayload fails.
+TEST(DashV24Bls, UndecodableSignaturesAreBadPayload)
+{
+    const auto r = mainnet_v24();
+    size_t bad = 0;
+    for (const auto& f : kBlsSigFacts) {
+        SCOPED_TRACE(f.what);
+        const Code want = f.core_ok ? std::nullopt : C("bad-protx-payload");
+        bad += !f.core_ok;
+        auto a = make_upserv_v3();
+        a.sig = arr<96>(f.bytes);
+        EXPECT_EQ(refusal(a, r), want);
+        auto b = make_rev_v3();
+        b.sig = arr<96>(f.bytes);
+        EXPECT_EQ(refusal(b, r), want);
+    }
+    EXPECT_GE(bad, 3u);
+}
+
+// The fold codec reads the structure only (no BLS math, byte-identical to
+// master for v1/v2); GetTxPayload's signature rule lives in the rules and in
+// decode_special_payload.
+TEST(DashV24Bls, TheFoldCodecDoesNoBlsMath)
+{
+    auto a = make_upserv_v3();
+    a.sig.fill(0xff);
+    const auto b = v::serialize_special_payload(a);
+    v::CProUpServTx q;
+    EXPECT_TRUE(v::parse_protx_payload(b, q));
+    EXPECT_FALSE(v::decode_special_payload(b, q));
+    a.sig = {};
+    EXPECT_TRUE(v::decode_special_payload(v::serialize_special_payload(a), q)) << "a null signature decodes";
+}
+
+#ifdef C2POOL_DASH_BLS
+// The dashbls backend agrees with dashd on every fact.
+TEST(DashV24Bls, BackendMatchesDashdOnEveryFact)
+{
+    ASSERT_TRUE(v::bls_backend_available());
+    for (const auto& f : kBlsKeyFacts)
+        EXPECT_EQ(v::bls_pubkey_core_valid(arr<48>(f.bytes), f.legacy), std::optional<bool>{f.core_ok}) << f.what;
+    for (const auto& f : kBlsSigFacts)
+        EXPECT_EQ(v::bls_sig_core_decodes(arr<96>(f.bytes), f.legacy), std::optional<bool>{f.core_ok}) << f.what;
+}
+
+// The generated signatures are the operator secret's over our sign hash.
+TEST(DashV24Bls, GeneratedSignaturesVerifyAgainstTheirKeys)
+{
+    const auto hs = v::protx_operator_sign_hash(unhex(kSyn_proupserv));
+    const auto hr = v::protx_operator_sign_hash(unhex(kSyn_prouprev));
+    ASSERT_TRUE(hs && hr);
+    EXPECT_TRUE(v::verify_protx_operator_sig(arr<48>(kOpKey_proupserv), false, *hs, arr<96>(kSig_proupserv), false));
+    EXPECT_TRUE(v::verify_protx_operator_sig(arr<48>(kOpKey_prouprev), false, *hr, arr<96>(kSig_prouprev), false));
+    EXPECT_FALSE(v::verify_protx_operator_sig(arr<48>(kOpKey_prouprev), false, *hs, arr<96>(kSig_proupserv), false));
+}
+
+// Production rules (no oracle) decide with the backend.
+TEST(DashV24Bls, ProductionRulesUseTheBackend)
+{
+    auto r = ProviderTxRules::for_block(DashNetwork::MAINNET, 2'600'000);
+    r.v24_active = true;
+    EXPECT_EQ(refusal(make_upreg_v3(), r), std::nullopt);
+    EXPECT_EQ(refusal(make_shared_reg(), r), std::nullopt);
+    EXPECT_EQ(refusal(make_upserv_v3(), r), std::nullopt);
+    EXPECT_EQ(refusal(make_rev_v3(), r), std::nullopt);
+    EXPECT_EQ(refusal(make_upsharedreg(), r), std::nullopt);
+    auto bad = make_upreg_v3();
+    bad.pubKeyOperator = pat_arr<48>(0x82);
+    EXPECT_EQ(refusal(bad, r), C("bad-protx-key-null"));
+}
+#else
+// Without the backend the production rules refuse every payload whose BLS
+// key or signature they cannot decide; only all-zero bytes need no math.
+TEST(DashV24Bls, StubBuildRefusesWhatItCannotDecide)
+{
+    ASSERT_FALSE(v::bls_backend_available());
+    auto r = ProviderTxRules::for_block(DashNetwork::MAINNET, 2'600'000);
+    r.v24_active = true;
+    const Code key = C("unverifiable-operator-key (no BLS backend in this build)");
+    const Code sig = C("unverifiable-bls-signature (no BLS backend in this build)");
+    EXPECT_EQ(refusal(make_upreg_v3(), r), key);
+    EXPECT_EQ(refusal(make_shared_reg(), r), key);
+    EXPECT_EQ(refusal(make_upsharedreg(), r), key);
+    EXPECT_EQ(refusal(make_upserv_v3(), r), sig);
+    EXPECT_EQ(refusal(make_rev_v3(), r), sig);
+    auto z = make_upreg_v3();
+    z.pubKeyOperator = {};
+    EXPECT_EQ(refusal(z, r), C("bad-protx-key-null"));
+    auto n = make_rev_v3();
+    n.sig = {};
+    EXPECT_EQ(refusal(n, r), std::nullopt);
+    EXPECT_EQ(refusal(make_dis(false), r), std::nullopt) << "no BLS object";
+}
+#endif
 
 TEST(DashV24Reject, PayloadAndVersionCodes)
 {
@@ -1138,7 +1358,7 @@ TEST(DashV24Reject, NetworkFieldCodes)
     // CheckIPv4Primaries (mainnet only: ipv4_optional on testnet/devnet).
     const auto v6 = v::NetInfoEntry{v::NetService::make(v::NetService::IPV6, unhex("2a0104f8000000000000000000000001"), 9999)};
     EXPECT_EQ(refusal(reg(ext({{0, {v6}}})), r), C("bad-protx-netinfo-addr-type")) << "first core entry not IPv4";
-    auto tn = ProviderTxRules::for_block(DashNetwork::TESTNET, 1'600'000);
+    auto tn = rules_for(DashNetwork::TESTNET, 1'600'000);
     {
         auto p = reg(ext({{0, {v::NetInfoEntry{v::NetService::make(v::NetService::IPV6, unhex("2a0104f8000000000000000000000001"), 19999)}}}}));
         EXPECT_EQ(refusal(p, tn), std::nullopt) << "IPv4 primaries are optional on testnet";
@@ -1166,7 +1386,7 @@ TEST(DashV24Reject, NetworkFieldCodes)
         t.netInfo.port_be = 19999;
         t.platformP2PPort = 22000;
         t.platformHTTPPort = 22000;
-        EXPECT_EQ(refusal(t, ProviderTxRules::for_block(DashNetwork::TESTNET, 1'500'000)),
+        EXPECT_EQ(refusal(t, rules_for(DashNetwork::TESTNET, 1'500'000)),
                   C("bad-protx-platform-dup-ports"));
     }
     // MnNetInfo (v1/v2) rules.
@@ -1175,7 +1395,7 @@ TEST(DashV24Reject, NetworkFieldCodes)
         p.netInfo.port_be = 19999;
         EXPECT_EQ(refusal(p, mainnet_pre_v24()), C("bad-protx-netinfo-port")) << "mainnet must use 9999";
         auto q = make_v1_reg();
-        EXPECT_EQ(refusal(q, ProviderTxRules::for_block(DashNetwork::TESTNET, 1'500'000)),
+        EXPECT_EQ(refusal(q, rules_for(DashNetwork::TESTNET, 1'500'000)),
                   C("bad-protx-netinfo-port")) << "other networks must NOT use 9999";
         auto s6 = make_v1_reg();
         s6.netInfo.ip = {0x2a, 0x01, 0x04, 0xf8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
@@ -1196,7 +1416,7 @@ TEST(DashV24Reject, NetworkFieldCodes)
     }
     // Regtest does not require routable addresses.
     {
-        auto rt = ProviderTxRules::for_block(DashNetwork::REGTEST, 1000);
+        auto rt = rules_for(DashNetwork::REGTEST, 1000);
         rt.v24_active = true;
         auto p = reg(ext({{0, {svc4(10, 0, 0, 1, 19899)}}}));
         EXPECT_EQ(refusal(p, rt), std::nullopt);
@@ -1463,6 +1683,9 @@ TEST(DashV24Golden, RealMainnetV2ProUpServTxDecodeIdenticallyToMaster)
         EXPECT_EQ(pack_bytes(tx), raw);
         const Bytes payload(tx.extra_payload.begin(), tx.extra_payload.end());
         agree(2, payload, a);
+        std::array<uint8_t, 96> sig{};
+        std::copy(payload.end() - 96, payload.end(), sig.begin());
+        mined_sigs().push_back(sig);   // mined on mainnet: Core decoded it
         // And the full mainnet payload-only checks accept them before v24.
         EXPECT_EQ(provider_payload_refusal(2, payload, mainnet_pre_v24()), std::nullopt);
     }
