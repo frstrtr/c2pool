@@ -1586,6 +1586,19 @@ private:
     // ── Special-tx folds. Return "" on success, an error sentence on the ─
     // ── fail-closed paths (unparseable payload, ExtAddr, missing MN).    ─
 
+    /// A held state at version 3 (ExtAddr, e.g. seeded from a v24 SML
+    /// anchor) cannot take a v1/v2 update the way Core does after v24
+    /// (target version max(state, tx) with SetStateVersion netInfo
+    /// conversion); that transition is not implemented, so fail closed.
+    static std::optional<std::string> ext_addr_state_refusal(const char* what, const uint256& pro,
+                                                             const ReplayMNState& st)
+    {
+        if (st.nVersion < vendor::ProTxVersion::EXT_ADDR) return std::nullopt;
+        return std::string(what) + " for MN " + pro.GetHex().substr(0, 16)
+             + " whose state is nVersion=" + std::to_string(st.nVersion)
+             + " (ExtAddr) — v24 transition not implemented, failing closed";
+    }
+
     std::string fold_proreg(const MutableTransaction& tx, int32_t H,
                             FoldResult& r)
     {
@@ -1698,6 +1711,7 @@ private:
                  + " this list does not hold — state divergence "
                    "(an accepted block cannot reference a missing MN)";
         auto& st = it->second;
+        if (auto why = ext_addr_state_refusal("ProUpServTx", p.proTxHash, st)) return *why;
         if (p.nType != st.nType)
             return "ProUpServTx nType mismatch for "
                  + p.proTxHash.GetHex().substr(0, 16);
@@ -1769,6 +1783,9 @@ private:
         vendor::CProUpRegTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRegTx payload";
+        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+            return "ProUpRegTx nVersion=" + std::to_string(p.nVersion)
+                 + " (ExtAddr) — payout-list branch not implemented, failing closed";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1776,6 +1793,7 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        if (auto why = ext_addr_state_refusal("ProUpRegTx", p.proTxHash, st)) return *why;
         // UpdateMN -> UpdateUniqueProperty(pubKeyOperator): a key another MN
         // holds makes the update throw (bad-protx-dup-key).
         if (const uint256* h = opkey_holder(p.pubKeyOperator, p.proTxHash))
@@ -1827,6 +1845,11 @@ private:
         vendor::CProUpRevTx p;
         if (!vendor::parse_protx_payload(tx.extra_payload, p))
             return "unparseable ProUpRevTx payload";
+        // v3 has the v2 layout, but after DEPLOYMENT_V24 a revocation keeps
+        // the state version (SetStateVersion) instead of dropping it to 1.
+        if (p.nVersion >= vendor::ProTxVersion::EXT_ADDR)
+            return "ProUpRevTx nVersion=" + std::to_string(p.nVersion)
+                 + " (ExtAddr) — v24 revocation branch not implemented, failing closed";
 
         auto it = m_entries.find(p.proTxHash);
         if (it == m_entries.end())
@@ -1834,6 +1857,7 @@ private:
                  + p.proTxHash.GetHex().substr(0, 16)
                  + " this list does not hold — state divergence";
         auto& st = it->second;
+        if (auto why = ext_addr_state_refusal("ProUpRevTx", p.proTxHash, st)) return *why;
         const bool was_banned = st.IsBanned();
         st.ResetOperatorFields();
         st.BanIfNotBanned(H);
