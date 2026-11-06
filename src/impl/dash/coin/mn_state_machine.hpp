@@ -588,12 +588,23 @@ public:
         return st.pubKeyOperator == point_basic;
     }
 
+    // The owner-side script a coinbase output is matched against: below v3
+    // scriptPayout, exactly as before; a v3 or shared state (Dash Core v24)
+    // has no scriptPayout and is paid at its payout list / share split, of
+    // which v24::guaranteed_payout_script is always present.
+    static const std::vector<unsigned char>& owner_match_script(const MNState& st)
+    {
+        if (st.nVersion >= vendor::ProTxVersion::EXT_ADDR || !st.v24.shares.empty())
+            return v24::guaranteed_payout_script(st);
+        return st.scriptPayout.m_data;
+    }
+
     std::optional<uint256> find_by_payout_script(
         const std::vector<unsigned char>& script) const
     {
         if (script.empty()) return std::nullopt;
         for (const auto& [h, st] : m_entries) {
-            if (st.scriptPayout.m_data == script) return h;
+            if (owner_match_script(st) == script) return h;
         }
         return std::nullopt;
     }
@@ -653,7 +664,7 @@ public:
                          << " (divergent snapshot) -- excluded from selection";
                 continue;
             }
-            if (st.scriptPayout.m_data != script) continue;
+            if (owner_match_script(st) != script) continue;
             const int h = payee_score(st);
             bool better = !best.has_value()
                        || payee_order_before(h, hash, best_h, *best);

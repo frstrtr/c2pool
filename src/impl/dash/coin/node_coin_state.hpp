@@ -43,6 +43,7 @@
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
 #include <core/inject_ledger_obs.hpp>    // core::obs::inject_ledger (S4 per-inject read-only mirror)
 
+#include <algorithm>
 #include <ctime>
 
 #include <array>
@@ -1764,44 +1765,46 @@ public:
                 if (it != m_mnstates.entries().end()) {
                     const int64_t mn_payment =
                         static_cast<int64_t>(w.m_payment_amount);
-                    const int64_t op_due =
-                        it->second.operator_payment_of(mn_payment);
-                    if (op_due > 0) {
-                        // Occurrence-counted so a 50/50 split (owner amount
-                        // == operator amount) needs TWO outputs, not one
-                        // double-matched.
-                        //
-                        // dashd masternode/payments.cpp:74-79 emits each
-                        // output only when its amount is > 0. The operator
-                        // amount is > 0 here by construction, so it is always
-                        // required; the owner amount is 0 exactly when
-                        // bps == 10000 (the whole share goes to the operator)
-                        // and then dashd emits NO owner output — requiring one
-                        // rejected every correct full-operator template
-                        // (owner=0-MISSING, 2026-10-28).
-                        const uint64_t own_amt =
-                            static_cast<uint64_t>(mn_payment - op_due);
-                        const uint64_t op_amt = static_cast<uint64_t>(op_due);
-                        size_t own_n = 0, op_n = 0;
-                        for (const auto& p : w.m_packed_payments) {
-                            if (p.payee == "!6a") continue;
-                            if (p.amount == own_amt) ++own_n;
-                            if (p.amount == op_amt)  ++op_n;
+                    // The payout SET dashd's GetBlockTxOuts derives for this
+                    // payee (v24::expected_mn_outputs: owner payouts / share
+                    // split, then the operator; each only when > 0; a full
+                    // 10000-bps operator share has NO owner output). Checked
+                    // whenever more than one output, or an operator output,
+                    // is due -- the h=2516595 class and every v24 multi-
+                    // output payee. Occurrence-counted (Dash Core v24 strict
+                    // multiplicity: each expected output consumes a distinct
+                    // coinbase output), so a 50/50 split needs two outputs.
+                    // Amounts only: the packed payee is an address token; the
+                    // builder KATs pin script identity.
+                    const auto due = v24::expected_mn_outputs(it->second, mn_payment);
+                    const bool op_due = it->second.operator_payment_of(mn_payment) > 0;
+                    if (due.size() >= 2 || op_due) {
+                        std::vector<uint64_t> have;
+                        for (const auto& p : w.m_packed_payments)
+                            if (p.payee != "!6a") have.push_back(p.amount);
+                        const auto& st = it->second;
+                        const bool multi = !st.v24.shares.empty()
+                            || st.nVersion >= vendor::ProTxVersion::EXT_ADDR;
+                        const char* owner_role = !st.v24.shares.empty() ? "share" : "payout";
+                        std::string report;
+                        bool all_present = true;
+                        for (size_t i = 0; i < due.size(); ++i) {
+                            const bool is_op = op_due && i + 1 == due.size();
+                            const std::string role = is_op ? std::string("operator")
+                                : multi ? owner_role + std::to_string(i)
+                                        : std::string("owner");
+                            auto f = std::find(have.begin(), have.end(),
+                                               static_cast<uint64_t>(due[i].amount));
+                            const bool present = f != have.end();
+                            if (present) have.erase(f);
+                            all_present = all_present && present;
+                            report += (report.empty() ? "" : ",") + role + "="
+                                    + std::to_string(due[i].amount)
+                                    + (present ? "-present" : "-MISSING");
                         }
-                        const bool owner_ok =
-                            own_amt == 0
-                                ? true
-                                : (own_amt == op_amt ? own_n >= 2 : own_n >= 1);
-                        const bool op_ok =
-                            own_amt == op_amt ? op_n >= 2 : op_n >= 1;
-                        if (!owner_ok || !op_ok)
-                            return reject(
-                                "emit-mn-payout-split-drift",
-                                "owner=" + std::to_string(mn_payment - op_due)
-                                    + (owner_ok ? "-present" : "-MISSING")
-                                    + ",operator=" + std::to_string(op_due)
-                                    + (op_ok ? "-present" : "-MISSING"),
-                                "both-split-amounts-in-template");
+                        if (!all_present)
+                            return reject("emit-mn-payout-split-drift", report,
+                                          "every-payout-set-amount-in-template");
                     }
                 }
             }

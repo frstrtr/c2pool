@@ -1177,16 +1177,6 @@ inline DashWorkData build_embedded_workdata(
                     " overstate; a valid block beats no block)";
     }
 
-    // Platform Credit Pool burn (DIP-0027): emit OP_RETURN payment
-    // FIRST (matches dashcore GetBlockTxOuts ordering at payments.cpp:55).
-    // Payee uses the "!hex" raw-script convention; OP_RETURN single byte = 0x6a.
-    if (platform_reward > 0) {
-        PackedPayment burn;
-        burn.payee  = "!6a";
-        burn.amount = static_cast<uint64_t>(platform_reward);
-        w.m_packed_payments.push_back(std::move(burn));
-    }
-
     // MN payee → packed_payment(s). dashcore GBT returns "payee" as a
     // base58 address. We use script_to_address() to produce the same
     // wire form for standard P2PKH/P2SH scripts. Unrecognized script
@@ -1211,39 +1201,38 @@ inline DashWorkData build_embedded_workdata(
         }
         return hex_script;
     };
-    auto expected = mnstates.find_expected_payee();
-    if (expected) {
-        auto it = mnstates.entries().find(*expected);
-        if (it != mnstates.entries().end() && mn_payment > 0) {
-            const auto& st = it->second;
-            // ── Operator-reward split (incident h=2516595 bad-cb-payee) ──
-            // dashd masternode/payments.cpp GetBlockTxOuts pays the MN
-            // share as a SET: when the scheduled MN registered an operator
-            // share (nOperatorReward bps, ProRegTx) AND its operator set a
-            // payout script (ProUpServTx), the coinbase carries
-            //   owner   : mnShare - floor(mnShare * bps / 10000)
-            //   operator: floor(mnShare * bps / 10000)
-            // in that order, and CheckMasternodePayments validates scripts
-            // AND amounts. h=2516595 (mn 0037c2c5…, bps=800) was rejected
-            // bad-cb-payee precisely because this builder paid the whole
-            // share to the owner. The truncating division is dashd's own;
-            // do NOT "fix" the rounding.
-            const int64_t operator_payment = st.operator_payment_of(mn_payment);
-            const int64_t owner_payment    = mn_payment - operator_payment;
-            if (owner_payment > 0) {
-                PackedPayment pp;
-                pp.payee  = script_to_payee_token(st.scriptPayout.m_data);
-                pp.amount = static_cast<uint64_t>(owner_payment);
-                w.m_packed_payments.push_back(std::move(pp));
-            }
-            // dashd: `if (operatorReward > 0) emplace_back(...)` — a split
-            // whose floor rounds to zero emits NO operator output.
-            if (operator_payment > 0) {
-                PackedPayment pp;
-                pp.payee  = script_to_payee_token(st.scriptOperatorPayout.m_data);
-                pp.amount = static_cast<uint64_t>(operator_payment);
-                w.m_packed_payments.push_back(std::move(pp));
-            }
+    // dashd masternode/payments.cpp CMNPaymentsProcessor::GetBlockTxOuts,
+    // through the verbatim Core v24.0.0 port (vendor/masternode_payments.hpp
+    // GetBlockTxOutsForPayee): the platform credit-pool burn (DIP-0027)
+    // OP_RETURN FIRST in the EvoReward era, then the scheduled payee's owner
+    // payouts -- a v3 payout list, a shared masternode's share split, or
+    // scriptPayout below v3 -- then the operator output (incident
+    // h=2516595: the operator share is dashd's own truncation; do NOT "fix"
+    // the rounding). Each output only when > 0, one packed payment each,
+    // never merged: from v24 every expected output consumes a distinct
+    // coinbase output. Payee SELECTION is the projection's (GetMNPayee is
+    // unchanged in v24). For a v1/v2 payee this is byte for byte the
+    // burn/owner/operator list emitted before v24.
+    {
+        std::optional<vendor::payments::DmnPayee> dmn_payee;
+        if (auto expected = mnstates.find_expected_payee()) {
+            auto it = mnstates.entries().find(*expected);
+            if (it != mnstates.entries().end())
+                dmn_payee = vendor::payments::dmn_payee_of(it->second);
+        }
+        std::vector<vendor::payments::CTxOut> vout;
+        vendor::payments::GetBlockTxOutsForPayee(
+            dmn_payee ? &*dmn_payee : nullptr,
+            /*masternodeReward=*/mn_payment + platform_reward,   // GetMasternodePayment(h, subsidy + fees)
+            /*platformReward=*/platform_reward,                   // PlatformShare(GetMasternodePayment(h, subsidy))
+            /*evo_reward_era=*/platform_reward > 0,
+            vout);
+        for (const auto& out : vout) {
+            if (out.nValue <= 0) continue;
+            PackedPayment pp;
+            pp.payee  = script_to_payee_token(out.scriptPubKey);   // OP_RETURN -> "!6a"
+            pp.amount = static_cast<uint64_t>(out.nValue);
+            w.m_packed_payments.push_back(std::move(pp));
         }
     }
 

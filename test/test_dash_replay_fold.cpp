@@ -762,7 +762,22 @@ static BlockType make_block(uint32_t height, const uint256& prev_hash,
     b.m_bits           = 0x1e0fffff;
     b.m_nonce          = height;
     auto cb = make_coinbase(height, committed_root);
+    // Dash Core v24: a v3 or shared payee is paid its whole payout set
+    // (v24::expected_mn_outputs), which the fold checks exactly.
+    const ReplayMNState* v24_payee = nullptr;
     if (pay_from) {
+        if (const auto pp = pay_from->project_payee(static_cast<int32_t>(height)))
+            if (const ReplayMNState* st = pay_from->find(*pp))
+                if (st->nVersion >= ProTxVersion::EXT_ADDR || !st->v24.shares.empty()) v24_payee = st;
+    }
+    if (v24_payee) {
+        for (const auto& o : dash::coin::v24::expected_mn_outputs(*v24_payee, 100'000'000)) {
+            TxOut out;
+            out.value = o.amount;
+            out.scriptPubKey.m_data = o.script;
+            cb.vout.push_back(std::move(out));
+        }
+    } else if (pay_from) {
         auto script = projected_payout_script(*pay_from,
                                               static_cast<int32_t>(height));
         if (!script.empty()) {
