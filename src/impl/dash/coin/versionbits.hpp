@@ -20,9 +20,14 @@
 ///     it once per query from GetSignalsStage(pindexPrev) and so do we.
 ///   * Every result is optional: a header the chain view cannot supply makes
 ///     the answer unknown (nullopt) instead of a guess.
-///   * The per-period-end cache is validated against the block hash and the
-///     signal height it was computed with, so a reorg or a newly found signal
-///     can never serve a stale state.
+///   * The per-period-end cache is validated against the block hash, so a
+///     reorg can never serve a stale state. It is keyed by the period end and
+///     the EFFECTIVE signal height for it: the state at period end E depends
+///     on SignalHeight S only through the comparisons E' >= S for period ends
+///     E' <= E, so every S above E is the same as "no signal" (INT_MAX). That
+///     is also what Core's per-ancestor SignalHeight gives, and it keeps a
+///     query below the signal (which sees no signal) from evicting an entry a
+///     later query walks back into.
 
 #include <impl/dash/coin/dash_deployments.hpp>
 
@@ -35,6 +40,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace dash {
@@ -111,7 +117,9 @@ public:
 
     /// GetStateStatisticsFor(pindex): signalling statistics of the period
     /// that contains `height` (pindex), as Core reports for
-    /// getdeploymentinfo / getblockchaininfo.
+    /// getdeploymentinfo / getblockchaininfo. `signal_height` is the signal
+    /// height as of the period's parent (end_prev below); any value as of a
+    /// later block in the period gives the same answer (see the cache note).
     std::optional<VbStats> statistics(int64_t height, int64_t signal_height)
     {
         std::lock_guard<std::mutex> lk(m_mutex);
@@ -154,13 +162,30 @@ public:
         m_cache.clear();
     }
 
+    size_t cache_size() const
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return m_cache.size();
+    }
+
+    /// The signal height that decides the state at period end `pe`: S itself
+    /// when S <= pe, otherwise "no signal" (see the cache note above).
+    static int64_t effective_signal_height(int64_t pe, int64_t signal_height)
+    {
+        return signal_height <= pe ? signal_height : kNoSignalHeight;
+    }
+
+    /// Entries above this are dropped wholesale (signal heights that changed
+    /// with reorgs leave unreachable keys behind; recomputing is cheap).
+    static constexpr size_t kMaxCacheEntries = 8192;
+
 private:
     struct CacheEntry
     {
         uint256        hash;
-        int64_t        signal_height{0};
         ThresholdState state{ThresholdState::DEFINED};
     };
+    using CacheKey = std::pair<int64_t, int64_t>;   // {period end, effective signal height}
 
     std::optional<int64_t> since_locked(int64_t prev_height, int64_t signal_height)
     {
@@ -187,9 +212,8 @@ private:
     /// Cached state of the period end at `h`, if it is still valid.
     std::optional<ThresholdState> cached(int64_t h, int64_t signal_height)
     {
-        auto it = m_cache.find(h);
+        auto it = m_cache.find(CacheKey{h, effective_signal_height(h, signal_height)});
         if (it == m_cache.end()) return std::nullopt;
-        if (it->second.signal_height != signal_height) return std::nullopt;
         if (h >= 0) {
             auto b = m_chain(static_cast<uint32_t>(h));
             if (!b || b->hash != it->second.hash) return std::nullopt;
@@ -200,26 +224,44 @@ private:
     bool put(int64_t h, int64_t signal_height, ThresholdState s)
     {
         CacheEntry e;
-        e.signal_height = signal_height;
         e.state = s;
         if (h >= 0) {
             auto b = m_chain(static_cast<uint32_t>(h));
             if (!b) return false;
             e.hash = b->hash;
         }
-        m_cache[h] = e;
+        m_cache[CacheKey{h, effective_signal_height(h, signal_height)}] = e;
         return true;
     }
 
     std::optional<ThresholdState> state_for_locked(int64_t prev_height, int64_t signal_height)
+    {
+        if (m_cache.size() > kMaxCacheEntries) m_cache.clear();
+        auto r = state_for_once(prev_height, signal_height);
+        if (!r.missing_start) return r.state;
+        // calculateStartHeight met a STARTED entry whose predecessor is not
+        // cached (Core asserts this cannot happen; here an entry can be
+        // evicted or replaced after a reorg). Recompute from scratch rather
+        // than report an unknown state.
+        m_cache.clear();
+        return state_for_once(prev_height, signal_height).state;
+    }
+
+    struct Once
+    {
+        std::optional<ThresholdState> state;
+        bool missing_start{false};
+    };
+
+    Once state_for_once(int64_t prev_height, int64_t signal_height)
     {
         const int64_t P = period();
         const int64_t start = m_dep.nStartTime;
         const int64_t timeout = m_dep.nTimeout;
         const int64_t min_activation_height = m_dep.min_activation_height;
 
-        if (start == Bip9Deployment::ALWAYS_ACTIVE) return ThresholdState::ACTIVE;
-        if (start == Bip9Deployment::NEVER_ACTIVE) return ThresholdState::FAILED;
+        if (start == Bip9Deployment::ALWAYS_ACTIVE) return {ThresholdState::ACTIVE};
+        if (start == Bip9Deployment::NEVER_ACTIVE) return {ThresholdState::FAILED};
 
         // A block's state is that of the first block of its period, computed
         // from the period end (height multiple of P, minus 1).
@@ -238,14 +280,14 @@ private:
                 break;
             }
             if (prev < m_params.min_bip9_warning_height) {
-                if (!put(prev, signal_height, ThresholdState::DEFINED)) return std::nullopt;
+                if (!put(prev, signal_height, ThresholdState::DEFINED)) return {};
                 state = ThresholdState::DEFINED;
                 break;
             }
             const auto mtp = vb_median_time_past(m_chain, prev);
-            if (!mtp) return std::nullopt;
+            if (!mtp) return {};
             if (*mtp < start || prev < signal_height) {
-                if (!put(prev, signal_height, ThresholdState::DEFINED)) return std::nullopt;
+                if (!put(prev, signal_height, ThresholdState::DEFINED)) return {};
                 state = ThresholdState::DEFINED;
                 break;
             }
@@ -253,7 +295,7 @@ private:
             prev -= P;
         }
 
-        if (to_compute.empty()) return state;
+        if (to_compute.empty()) return {state};
 
         // calculateStartHeight: walk back over cached STARTED period ends.
         int64_t nStartHeight = std::numeric_limits<int>::max();
@@ -264,7 +306,7 @@ private:
                 nStartHeight = std::min<int64_t>(p + 1, nStartHeight);
                 p -= P;
                 auto c = cached(p, signal_height);
-                if (!c) return std::nullopt;   // Core asserts the entry exists
+                if (!c) return {std::nullopt, true};   // Core asserts the entry exists
                 s = *c;
             }
         }
@@ -277,7 +319,7 @@ private:
             switch (state) {
             case ThresholdState::DEFINED: {
                 const auto mtp = vb_median_time_past(m_chain, pe);
-                if (!mtp) return std::nullopt;
+                if (!mtp) return {};
                 if (*mtp >= start && pe >= signal_height) {
                     next = ThresholdState::STARTED;
                     nStartHeight = pe + 1;
@@ -291,7 +333,7 @@ private:
                 int64_t cur = pe;
                 for (int64_t i = 0; count + (P - i) >= thr && i < P; ++i) {
                     auto b = m_chain(static_cast<uint32_t>(cur));
-                    if (!b) return std::nullopt;
+                    if (!b) return {};
                     if (vb_signals(b->nVersion, m_dep)) ++count;
                     --cur;
                 }
@@ -299,7 +341,7 @@ private:
                     next = ThresholdState::LOCKED_IN;
                 } else {
                     const auto mtp = vb_median_time_past(m_chain, pe);
-                    if (!mtp) return std::nullopt;
+                    if (!mtp) return {};
                     if (*mtp >= timeout) next = ThresholdState::FAILED;
                 }
                 break;
@@ -311,17 +353,17 @@ private:
             case ThresholdState::ACTIVE:
                 break;
             }
-            if (!put(pe, signal_height, next)) return std::nullopt;
+            if (!put(pe, signal_height, next)) return {};
             state = next;
         }
-        return state;
+        return {state};
     }
 
     const DashDeploymentParams& m_params;
     Bip9Deployment              m_dep;
     VbChainFn                   m_chain;
-    std::mutex                  m_mutex;
-    std::map<int64_t, CacheEntry> m_cache;
+    mutable std::mutex          m_mutex;
+    std::map<CacheKey, CacheEntry> m_cache;
 };
 
 } // namespace coin

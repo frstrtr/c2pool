@@ -14,9 +14,18 @@
 ///
 /// How a height is decided, in order:
 ///   1. Buried height (testnet 1,578,000: history, proven by the replay KAT).
-///   2. Exact: the EHF tracker has scanned every body from its anchor to the
-///      parent, so SignalHeight is known and the versionbits machine runs on
-///      real data.
+///   2. Exact: SignalHeight(parent) is decided by the scanned bodies, so the
+///      versionbits machine runs on real data. That holds when the tracker
+///      covers the parent, but also when it covers less: c = the verified
+///      coverage (every body in [anchor, c] scanned and still on the chain).
+///        - A signal for the bit at or below c is final: a later one cannot be
+///          lower, and Core refuses a second one (bad-mnhf-duplicate).
+///        - With no signal at or below c, S > c. The state of a block depends
+///          on S only at period ends (E >= S), so if no period end lies in
+///          (c, parent], S is "no signal" for it.
+///      So the state of the block after the tip is decided before the tip's
+///      own body is scanned (after activation always; before it, except for
+///      the first block of a period). VERIFY-H0-S0-S1 M3.
 ///   3. Bound: bodies are missing, but the headers alone bound the answer. An
 ///      earlier EHF signal can only bring activation earlier (a lower attempt
 ///      number means a higher threshold), so the machine run with the signal
@@ -33,6 +42,21 @@
 /// pins activation at N (a period boundary). It decides only where the
 /// computation is UNKNOWN; where the computation is decided and disagrees
 /// with the pin, the answer is UNKNOWN (fail closed, logged once).
+///
+/// Live cross-check (design §3.1 item 8; VERIFY-H0-S0-S1 M2): Dash Core v24
+/// requires CbTx version 4 exactly when v24 is active, so every block on our
+/// chain states the switch. cross_check_cbtx_version() compares it with our
+/// answer for that block. A contradiction latches the status:
+///   - our exact (tracker-derived) answer was refuted: from then on only the
+///     header-only bound (proven INACTIVE) is trusted, everything else is
+///     UNKNOWN;
+///   - the bound itself was refuted: everything but a buried height is
+///     UNKNOWN;
+///   - the pin was the answer refuted: the pin is ignored.
+/// The embedded arm then declines (v24-state-unknown) and the dashd v24 arm or
+/// a correct pin serves. The latch clears only on restart, or when a later
+/// cross-check finds the recomputed answer agreeing with the chain both at
+/// the latched block and at the new one.
 
 #include <impl/dash/coin/dash_deployments.hpp>
 #include <impl/dash/coin/ehf_tracker.hpp>
@@ -69,8 +93,19 @@ struct DeploymentResolution
 {
     std::optional<ThresholdState> state;   ///< exact state, when known
     V24State active{V24State::UNKNOWN};    ///< ACTIVE / INACTIVE / UNKNOWN
-    const char* basis{"unknown"};          ///< buried / exact / bound / override / unknown
+    const char* basis{"unknown"};          ///< buried / exact / bound / override / unknown / ...
 };
+
+/// Outcome of one live cross-check.
+enum class V24CrossCheck : uint8_t
+{
+    AGREE,         ///< our decided answer matches the chain's CbTx version
+    CONTRADICTS,   ///< it does not: the status is latched (see above)
+    UNDECIDED,     ///< nothing to compare (UNKNOWN, or not our chain's block)
+};
+
+/// What a contradiction refuted (the latch level).
+enum class V24Latch : uint8_t { NONE, EXACT, BOUND };
 
 /// Validate an operator activation pin: it must be a period boundary (Core
 /// activates only at the first block of a period) and not below the earliest
@@ -116,15 +151,140 @@ public:
     DashNetwork network() const { return m_params.network; }
     const DashDeploymentParams& params() const { return m_params; }
 
-    void set_v24_activation_override(std::optional<uint32_t> pin) { m_pin = pin; }
-    std::optional<uint32_t> v24_activation_override() const { return m_pin; }
+    void set_v24_activation_override(std::optional<uint32_t> pin)
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        m_pin = pin;
+        m_pin_refuted = false;
+    }
+    std::optional<uint32_t> v24_activation_override() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return m_pin;
+    }
+
+    /// Stop answering from the chain view (teardown: the header chain the
+    /// chain function reads may be gone). Every answer is UNKNOWN after this.
+    void shutdown() { m_closed.store(true); }
 
     /// Resolve a deployment for the block at `height` (parent height - 1).
     DeploymentResolution resolve(uint32_t height, DashDeployment dep)
     {
+        if (m_closed.load()) return DeploymentResolution{std::nullopt, V24State::UNKNOWN, "shutdown"};
+        V24Latch latch;
+        std::optional<uint32_t> pin;
+        {
+            std::lock_guard<std::mutex> lk(m_latch_mutex);
+            latch = m_latch;
+            if (!m_pin_refuted) pin = m_pin;
+        }
         DeploymentResolution r = compute(height, dep);
-        if (dep != DashDeployment::V24 || !m_pin) return r;
-        const V24State pinned = height >= *m_pin ? V24State::ACTIVE : V24State::INACTIVE;
+        if (dep == DashDeployment::V24) r = apply_latch(height, dep, r, latch);
+        if (dep != DashDeployment::V24 || !pin) return r;
+        return apply_pin(r, height, *pin);
+    }
+
+    /// The live cross-check for the block at `height` whose hash is
+    /// `block_hash` and whose CbTx payload version is `cbtx_version` (Dash
+    /// Core v24 CheckCbTx: 4 exactly when v24 is active). Only a block the
+    /// chain view holds at that height is compared.
+    V24CrossCheck cross_check_cbtx_version(uint32_t height, const uint256& block_hash,
+                                           uint16_t cbtx_version)
+    {
+        if (m_closed.load()) return V24CrossCheck::UNDECIDED;
+        if (m_params.v24_buried_height) return V24CrossCheck::UNDECIDED;   // history
+        {
+            auto b = m_chain(height);
+            if (!b || b->hash != block_hash) return V24CrossCheck::UNDECIDED;
+        }
+        const bool chain_active = cbtx_version >= 4;
+        maybe_clear_latch(height, chain_active);
+        DeploymentResolution r = resolve(height, DashDeployment::V24);
+        if (r.active == V24State::UNKNOWN) return V24CrossCheck::UNDECIDED;
+        if ((r.active == V24State::ACTIVE) == chain_active) return V24CrossCheck::AGREE;
+        // Contradiction. Latch what was refuted, then re-resolve: the answer
+        // the latch falls back to may be refuted by the same block (the bound
+        // under a refuted exact answer), so escalate until nothing decided
+        // contradicts this block.
+        uint64_t n = 0;
+        for (int round = 0; round < 3; ++round) {
+            const std::string basis = r.basis;
+            V24Latch level = V24Latch::NONE;
+            bool pin_refuted = false;
+            if (basis == "override") pin_refuted = true;
+            else if (basis == "bound" || basis == "beyond-tip") level = V24Latch::BOUND;
+            else level = V24Latch::EXACT;   // exact (or anything tracker-derived)
+            {
+                std::lock_guard<std::mutex> lk(m_latch_mutex);
+                if (pin_refuted) m_pin_refuted = true;
+                if (level > m_latch) m_latch = level;
+                if (level != V24Latch::NONE) {
+                    m_latch_height = height;
+                    m_latch_chain_active = chain_active;
+                }
+                if (round == 0) n = ++m_contradictions;
+            }
+            if (n <= 3 || (n % 100) == 0)
+                LOG_ERROR << "[DASH-V24] CROSS-CHECK FAILED h=" << height << " "
+                          << block_hash.GetHex().substr(0, 16) << ": our v24 state is "
+                          << v24_state_name(r.active) << " (" << basis
+                          << ") but the chain's CbTx version is " << cbtx_version
+                          << " (Dash Core v24 requires 4 exactly when v24 is active) -- "
+                          << (pin_refuted ? "the --dash-v24-activation-height pin is wrong and is now IGNORED"
+                                          : level == V24Latch::BOUND
+                                                ? "even the header-only bound is wrong: v24 state LATCHED UNKNOWN"
+                                                : "the EHF-derived state is wrong: v24 state LATCHED to the header-only bound")
+                          << "; the embedded arm fails closed (v24-state-unknown). contradictions=" << n;
+            r = resolve(height, DashDeployment::V24);
+            if (r.active == V24State::UNKNOWN || (r.active == V24State::ACTIVE) == chain_active) break;
+        }
+        return V24CrossCheck::CONTRADICTS;
+    }
+
+    V24Latch latch() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return m_latch;
+    }
+    bool pin_refuted() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return m_pin_refuted;
+    }
+    uint64_t contradictions() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return m_contradictions;
+    }
+
+private:
+    /// The answer under a cross-check latch: a buried height stands; with
+    /// the exact path refuted, only the header-only bound (proven INACTIVE)
+    /// stands; with the bound refuted too, nothing does.
+    DeploymentResolution apply_latch(uint32_t height, DashDeployment dep,
+                                     const DeploymentResolution& r, V24Latch latch)
+    {
+        if (latch == V24Latch::NONE || std::string(r.basis) == "buried") return r;
+        DeploymentResolution out;
+        out.basis = "cross-check-latch";
+        if (latch == V24Latch::EXACT) {
+            const auto tip = m_tip();
+            const int64_t prev = static_cast<int64_t>(height) - 1;
+            if (tip && prev <= static_cast<int64_t>(*tip)) {
+                const auto earliest = m_bound[static_cast<int>(dep)].state_for(prev, 0);
+                if (earliest && (*earliest == ThresholdState::DEFINED || *earliest == ThresholdState::STARTED
+                                 || *earliest == ThresholdState::LOCKED_IN)) {
+                    out.active = V24State::INACTIVE;
+                    out.basis = "bound";
+                }
+            }
+        }
+        return out;
+    }
+
+    DeploymentResolution apply_pin(DeploymentResolution r, uint32_t height, uint32_t pin)
+    {
+        const V24State pinned = height >= pin ? V24State::ACTIVE : V24State::INACTIVE;
         if (r.active == V24State::UNKNOWN) {
             r.active = pinned;
             r.basis = "override";
@@ -132,7 +292,7 @@ public:
         }
         if (r.active != pinned) {
             if (!m_pin_conflict_logged.exchange(true))
-                LOG_ERROR << "[DASH-V24] --dash-v24-activation-height=" << *m_pin
+                LOG_ERROR << "[DASH-V24] --dash-v24-activation-height=" << pin
                           << " CONTRADICTS the computed v24 state at h=" << height
                           << " (" << v24_state_name(r.active) << ", " << r.basis
                           << "): v24 state is UNKNOWN, the embedded arm fails closed";
@@ -142,6 +302,34 @@ public:
         return r;
     }
 
+    /// A latch clears when the recomputed (unlatched) answer agrees with the
+    /// chain both at the latched block and at the block just checked (the
+    /// tracker caught up or rewound, e.g. after a reorg).
+    void maybe_clear_latch(uint32_t height, bool chain_active_here)
+    {
+        uint32_t lh;
+        bool lactive;
+        {
+            std::lock_guard<std::mutex> lk(m_latch_mutex);
+            if (m_latch == V24Latch::NONE) return;
+            lh = m_latch_height;
+            lactive = m_latch_chain_active;
+        }
+        const auto then = compute(lh, DashDeployment::V24);
+        const auto now  = compute(height, DashDeployment::V24);
+        if (then.active == V24State::UNKNOWN || now.active == V24State::UNKNOWN) return;
+        if ((then.active == V24State::ACTIVE) != lactive) return;
+        if ((now.active == V24State::ACTIVE) != chain_active_here) return;
+        {
+            std::lock_guard<std::mutex> lk(m_latch_mutex);
+            m_latch = V24Latch::NONE;
+        }
+        LOG_WARNING << "[DASH-V24] cross-check latch CLEARED at h=" << height
+                    << ": the recomputed v24 state agrees with the chain at h=" << lh
+                    << " and h=" << height;
+    }
+
+public:
     V24State v24_state(uint32_t height) { return resolve(height, DashDeployment::V24).active; }
     bool v24_active(uint32_t height) { return v24_state(height) == V24State::ACTIVE; }
 
@@ -149,10 +337,14 @@ public:
     /// bit of every deployment that is STARTED or LOCKED_IN for it (both have
     /// gbt_force, so Core's GBT keeps them). A deployment whose state is not
     /// known exactly contributes no bit: signalling is not consensus, and an
-    /// unproven signal is simply omitted (design §3.1 item 7).
+    /// unproven signal is simply omitted (design §3.1 item 7). The state is
+    /// exact before the tip's own body is scanned once the signal is known
+    /// (header note, item 2), so the header tip-change callback signals while
+    /// STARTED / LOCKED_IN (VERIFY-H0-S0-S1 SF1).
     uint32_t block_version(uint32_t height)
     {
         uint32_t v = static_cast<uint32_t>(kVersionBitsTopBits);
+        if (m_closed.load() || latch() != V24Latch::NONE) return v;   // nothing known exactly
         for (int i = 0; i < kDashDeploymentCount; ++i) {
             const auto dep = static_cast<DashDeployment>(i);
             const auto r = compute(height, dep);
@@ -167,6 +359,7 @@ public:
     std::optional<uint32_t> activation_height(DashDeployment dep)
     {
         if (dep == DashDeployment::V24 && m_params.v24_buried_height) return m_params.v24_buried_height;
+        if (m_closed.load() || (dep == DashDeployment::V24 && latch() != V24Latch::NONE)) return std::nullopt;
         const auto tip = m_tip();
         if (!tip) return std::nullopt;
         const auto r = compute(*tip + 1, dep);
@@ -178,36 +371,48 @@ public:
             return static_cast<uint32_t>(period_start + P);
         }
         if (*r.state == ThresholdState::ACTIVE) {
-            const int64_t sh = signal_height_for(dep, prev);
-            auto since = m_exact[static_cast<int>(dep)].state_since_height(prev, sh);
+            const auto sh = decided_signal_height(dep, prev);
+            if (!sh) return std::nullopt;
+            auto since = m_exact[static_cast<int>(dep)].state_since_height(prev, *sh);
             if (since) return static_cast<uint32_t>(*since);
         }
         return std::nullopt;
     }
 
     /// Signalling statistics of the period containing `height` (exact only).
+    /// Core: GetStateStatisticsFor(pindex) runs the machine on the end of the
+    /// previous period, so the signal height is the one as of that block.
     std::optional<VbStats> statistics(uint32_t height, DashDeployment dep)
     {
-        if (!exact_known(static_cast<int64_t>(height))) return std::nullopt;
-        return m_exact[static_cast<int>(dep)].statistics(height, signal_height_for(dep, height));
+        if (m_closed.load()) return std::nullopt;
+        const int64_t P = vb_period(m_params, m_params.dep(dep));
+        const int64_t h = static_cast<int64_t>(height);
+        const int64_t end_prev = h - ((h + 1) % P);
+        const auto sh = decided_signal_height(dep, end_prev);
+        if (!sh) return std::nullopt;
+        return m_exact[static_cast<int>(dep)].statistics(h, *sh);
     }
 
 private:
-    bool exact_known(int64_t prev_height) const
-    {
-        const bool use_ehf = true;   // both deployments are EHF
-        if (!use_ehf) return true;
-        return m_ehf && m_ehf->covers(prev_height);
-    }
-
-    int64_t signal_height_for(DashDeployment dep, int64_t prev_height) const
+    /// SignalHeight(prev) when the scanned bodies decide it (see the header
+    /// note, item 2), nullopt otherwise.
+    std::optional<int64_t> decided_signal_height(DashDeployment dep, int64_t prev_height) const
     {
         const auto& d = m_params.dep(dep);
         if (!d.useEHF) return 0;
         // GetSignalsStage is empty before V20.
         if (prev_height + 1 < static_cast<int64_t>(m_params.v20_height)) return kNoSignalHeight;
-        if (!m_ehf) return kNoSignalHeight;
-        return m_ehf->signal_height(static_cast<uint8_t>(d.bit), prev_height);
+        if (!m_ehf) return std::nullopt;
+        const uint8_t bit = static_cast<uint8_t>(d.bit);
+        const int64_t c = m_ehf->verified_coverage();
+        if (prev_height <= c) return m_ehf->signal_height(bit, prev_height);
+        // Bodies (c, prev] are not scanned (yet).
+        const int64_t s = m_ehf->signal_height(bit, c);
+        if (s != kNoSignalHeight) return s;   // final: a later signal cannot be lower
+        const int64_t P = vb_period(m_params, d);
+        const int64_t pe = prev_height - ((prev_height + 1) % P);
+        if (pe <= c) return kNoSignalHeight;   // no period end in (c, prev] can read S
+        return std::nullopt;
     }
 
     static V24State from_state(ThresholdState s)
@@ -236,8 +441,8 @@ private:
             return r;
         }
 
-        if (exact_known(prev)) {
-            const auto s = m_exact[idx].state_for(prev, signal_height_for(dep, prev));
+        if (const auto sh = decided_signal_height(dep, prev)) {
+            const auto s = m_exact[idx].state_for(prev, *sh);
             if (s) {
                 r.state = s;
                 r.active = from_state(*s);
@@ -308,8 +513,16 @@ private:
     std::shared_ptr<const EhfSignalTracker> m_ehf;
     std::array<VersionBitsChecker, kDashDeploymentCount> m_exact;
     std::array<VersionBitsChecker, kDashDeploymentCount> m_bound;
-    std::optional<uint32_t> m_pin;
     std::atomic<bool> m_pin_conflict_logged{false};
+    std::atomic<bool> m_closed{false};
+    // Pin and cross-check latch (m_latch_mutex).
+    mutable std::mutex m_latch_mutex;
+    std::optional<uint32_t> m_pin;
+    bool     m_pin_refuted{false};
+    V24Latch m_latch{V24Latch::NONE};
+    uint32_t m_latch_height{0};
+    bool     m_latch_chain_active{false};
+    uint64_t m_contradictions{0};
 };
 
 // ── Process-wide registry and the S2 hook ───────────────────────────────────

@@ -2538,3 +2538,36 @@ TEST(DashNodeCoinState, V24StateSeamDecidesForTheBlockBeingBuilt) {
         EXPECT_EQ(sel.decline.cause, "v24-state-unknown");
     }
 }
+
+// VERIFY-H0-S0-S1 N2: an unwired seam does not mean "pre-v24". It falls back
+// to the process-wide answer for the network: mainnet without an installed
+// status is INACTIVE only below the earliest possible activation (2,580,480)
+// and UNKNOWN from it on, so the arm fails closed instead of building a
+// pre-v24 block on a chain that may be v24.
+TEST(DashNodeCoinState, V24UnsetSeamFallsBackToTheNetworkAnswer) {
+    UTXOViewCache utxo(nullptr);
+    NodeCoinState st;
+    seed_single_mn(st, p2pkh_script(0x30));
+    st.mempool().set_utxo(&utxo);
+    const uint32_t bits = 0x1b104be3u, mtp = 1'700'000'000u;
+    st.set_tip(2'580'478, raw256(0xB1), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    ASSERT_TRUE(st.populated());
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,479
+        EXPECT_TRUE(e.viable());
+        EXPECT_FALSE(e.v24_active);
+    }
+    st.set_tip(2'580'479, raw256(0xB2), bits, mtp, DASH_PUBKEY_VER, DASH_P2SH_VER, mtp + 60, 0x20000000u);
+    {
+        auto e = st.make_embedded_work_inputs();   // builds 2,580,480
+        EXPECT_FALSE(e.viable());
+        EXPECT_EQ(e.decline.cause, "v24-state-unknown");
+    }
+    // Testnet: the buried height (1,578,000) decides.
+    st.set_v24_network(dash::coin::DashNetwork::TESTNET);
+    {
+        auto e = st.make_embedded_work_inputs();
+        EXPECT_TRUE(e.viable());
+        EXPECT_TRUE(e.v24_active);
+    }
+}

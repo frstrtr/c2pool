@@ -28,10 +28,14 @@
 ///
 /// Persistence: a small text file (ehf_signals.v1) in the coin data dir.
 
+#include <impl/dash/coin/block_producer.hpp>   // block_body_binds_to_header
 #include <impl/dash/coin/dash_deployments.hpp>
 #include <impl/dash/coin/versionbits.hpp>
 #include <impl/dash/coin/vendor/mnhftx.hpp>
+#include <impl/dash/crypto/hash_x11.hpp>
 
+#include <core/log.hpp>
+#include <core/pack.hpp>
 #include <core/uint256.hpp>
 
 #include <cstdint>
@@ -39,6 +43,7 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <map>
 #include <mutex>
@@ -103,6 +108,23 @@ public:
         std::lock_guard<std::mutex> lk(m_mutex);
         if (prev_height < static_cast<int64_t>(m_params.ehf_anchor_height)) return true;
         return m_scanned_to && static_cast<int64_t>(*m_scanned_to) >= prev_height;
+    }
+
+    /// The highest height c such that every body in [anchor, c] was scanned
+    /// AND is still on the chain view: the deepest recorded hash at or below
+    /// the high-water mark that matches the chain (a header-chain switch that
+    /// has not yet delivered a body of the new branch cuts it back here, not
+    /// only when the next body arrives). anchor - 1 when nothing counts.
+    int64_t verified_coverage() const
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        const int64_t none = static_cast<int64_t>(m_params.ehf_anchor_height) - 1;
+        if (!m_scanned_to) return none;
+        for (auto it = m_hashes.rbegin(); it != m_hashes.rend(); ++it) {
+            auto b = m_chain(it->first);
+            if (b && b->hash == it->second) return it->first;
+        }
+        return none;
     }
 
     /// Feed one active-chain block body. Returns true when it extended
@@ -363,8 +385,26 @@ private:
     bool                        m_dirty{false};
 };
 
+/// The binding every rescan body must pass before it can reach the tracker:
+/// the X11 hash of its header is the hash we asked for (so the header is the
+/// one on our PoW/DGW-validated chain, prev link included) and its merkle
+/// root commits to exactly this tx set (block_body_binds_to_header, the same
+/// check the live path runs before block_connected, live_feed.hpp). Without
+/// it one peer could omit or plant an MNHF signal and so decide the v24
+/// state (VERIFY-H0-S0-S1 M1).
+inline bool ehf_rescan_body_binds(const uint256& want_hash, const BlockType& block)
+{
+    if (!block_body_binds_to_header(block)) return false;
+    auto packed = ::pack(static_cast<const BlockHeaderType&>(block));
+    return dash::crypto::hash_x11(packed.get_span()) == want_hash;
+}
+
 /// Cold-start rescan of the EHF tracker from its anchor (operator decision
 /// O7), over the coin P2P network (the LAN core node is one of its peers).
+///
+/// Every body is bound to the header we asked for (ehf_rescan_body_binds)
+/// before it is kept; a body that fails is dropped and its height re-asked
+/// at the next tick (the request function rotates peers).
 ///
 /// The live feed (block_connected) covers heights from the live floor up: the
 /// lowest height the tip-follow path still needs (the payee cursor + 1). The
@@ -385,10 +425,15 @@ public:
     /// the lane stays idle).
     using FloorFn = std::function<std::optional<uint32_t>()>;
 
+    /// Body binding check (tests may inject one; production uses the real
+    /// binding, ehf_rescan_body_binds).
+    using BodyCheckFn = std::function<bool(const uint256& want_hash, const BlockType&)>;
+
     EhfRescanLane(std::shared_ptr<EhfSignalTracker> tracker, VbChainFn chain, FloorFn live_floor,
-                  RequestFn request)
+                  RequestFn request, BodyCheckFn check = ehf_rescan_body_binds)
         : m_tracker(std::move(tracker)), m_chain(std::move(chain)),
-          m_floor(std::move(live_floor)), m_request(std::move(request))
+          m_floor(std::move(live_floor)), m_request(std::move(request)),
+          m_check(check ? std::move(check) : BodyCheckFn(ehf_rescan_body_binds))
     {}
 
     /// Periodic drive (the 3 s service tick): drain what arrived, then keep
@@ -430,13 +475,27 @@ public:
     }
 
     /// The coin client's body filter: true when this lane asked for the body
-    /// (it is then consumed here and never reaches the live path).
+    /// (it is then consumed here and never reaches the live path). `hash` is
+    /// the X11 hash the coin client computed from the received header; the
+    /// body is bound to the requested hash again here before it is kept.
     bool on_body(const uint256& hash, const BlockType& block)
     {
         std::lock_guard<std::mutex> lk(m_mutex);
         for (auto it = m_inflight.begin(); it != m_inflight.end(); ++it) {
             if (it->second.hash != hash) continue;
-            m_arrived[it->first] = block;
+            if (!m_check(it->second.hash, block)) {
+                // Forged, mutated or mislabelled: never kept. Re-ask at the
+                // next tick (from the next peer of the rotation).
+                ++m_rejected;
+                if (m_rejected <= 3 || (m_rejected % 100) == 0)
+                    LOG_WARNING << "[DASH-V24] EHF rescan body for h=" << it->first << " "
+                                << hash.GetHex().substr(0, 16)
+                                << " does not bind to its header (merkle root / header hash)"
+                                   " -- dropped, re-asking (rejected so far: " << m_rejected << ")";
+                it->second.sent_ms = kReaskNow;
+                return true;
+            }
+            m_arrived[it->first] = Arrived{it->second.hash, block};
             m_inflight.erase(it);
             drain_locked();
             return true;
@@ -450,11 +509,25 @@ public:
         return m_inflight.size();
     }
 
+    /// Bodies refused by the binding check since start.
+    uint64_t rejected() const
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return m_rejected;
+    }
+
 private:
+    static constexpr int64_t kReaskNow = std::numeric_limits<int64_t>::min() / 2;
+
     struct InFlight
     {
         uint256 hash;
         int64_t sent_ms{0};
+    };
+    struct Arrived
+    {
+        uint256   hash;    ///< the hash it was requested (and bound) under
+        BlockType block;
     };
 
     void drain_locked()
@@ -464,9 +537,12 @@ private:
             auto it = m_arrived.find(need);
             if (it == m_arrived.end()) break;
             auto b = m_chain(need);
-            BlockType blk = std::move(it->second);
+            Arrived a = std::move(it->second);
             m_arrived.erase(it);
-            if (!b || !m_tracker->connect_block(blk, need, b->hash)) break;
+            // The chain may have switched since the ask: only a body bound to
+            // the block the chain holds at this height counts.
+            if (!b || b->hash != a.hash) break;
+            if (!m_tracker->connect_block(a.block, need, b->hash)) break;
         }
         const uint32_t need = m_tracker->next_needed_height();
         for (auto it = m_arrived.begin(); it != m_arrived.end();) {
@@ -479,9 +555,11 @@ private:
     VbChainFn                         m_chain;
     FloorFn                           m_floor;
     RequestFn                         m_request;
+    BodyCheckFn                       m_check;
     mutable std::mutex                m_mutex;
     std::map<uint32_t, InFlight>      m_inflight;
-    std::map<uint32_t, BlockType>     m_arrived;
+    std::map<uint32_t, Arrived>       m_arrived;
+    uint64_t                          m_rejected{0};
 };
 
 } // namespace coin

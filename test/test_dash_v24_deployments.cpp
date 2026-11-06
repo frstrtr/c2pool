@@ -16,7 +16,11 @@
 #include <impl/dash/coin/versionbits.hpp>
 #include <impl/dash/coin/vendor/mnhftx.hpp>
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/block_producer.hpp>
+#include <impl/dash/coin/header_chain.hpp>
+#include <impl/dash/crypto/hash_x11.hpp>
 
+#include <core/hash.hpp>
 #include <core/pack.hpp>
 
 #include <gtest/gtest.h>
@@ -24,6 +28,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -105,6 +110,19 @@ MutableTransaction mnhf_tx(uint8_t bit)
     return tx;
 }
 
+/// Commit the header's merkle root to the body's tx set (a bound body).
+void bind_body(BlockType& b)
+{
+    std::vector<uint256> ids;
+    for (const auto& tx : b.m_txs) {
+        auto ps = ::pack(tx);
+        ids.push_back(::Hash(ps.get_span()));
+    }
+    b.m_merkle_root = compute_merkle_root(ids);
+}
+
+/// A bound body on the synthetic chain (the header's merkle root commits to
+/// its txs; the synthetic chain hash is not an X11 hash, see X11Chain).
 BlockType block_at(const SynthChain& c, uint32_t h, std::vector<MutableTransaction> extra = {})
 {
     BlockType b;
@@ -114,8 +132,59 @@ BlockType block_at(const SynthChain& c, uint32_t h, std::vector<MutableTransacti
     cb.type = 5;
     b.m_txs.push_back(cb);
     for (auto& t : extra) b.m_txs.push_back(std::move(t));
+    bind_body(b);
     return b;
 }
+
+/// Lane check for the synthetic chain: the merkle binding only (its hashes
+/// are labels, not X11 hashes of the bodies' headers).
+bool merkle_bound_only(const uint256&, const BlockType& b) { return block_body_binds_to_header(b); }
+
+uint256 x11_header_hash(const BlockType& b)
+{
+    auto packed = ::pack(static_cast<const BlockHeaderType&>(b));
+    return dash::crypto::hash_x11(packed.get_span());
+}
+
+/// A chain of real bodies whose hashes ARE the X11 hashes of their headers,
+/// for the production binding check (ehf_rescan_body_binds).
+struct X11Chain
+{
+    std::vector<BlockType> blocks;
+    std::vector<uint256>   hashes;
+    void build(uint32_t tip, const std::map<uint32_t, std::vector<MutableTransaction>>& extra)
+    {
+        for (uint32_t h = 0; h <= tip; ++h) {
+            BlockType b;
+            b.m_version = static_cast<uint32_t>(kVersionBitsTopBits);
+            b.m_previous_block = h ? hashes[h - 1] : uint256();
+            b.m_timestamp = 1'800'000'000 + 150 * h;
+            b.m_bits = 0x207fffff;
+            b.m_nonce = h;
+            MutableTransaction cb;
+            cb.version = 3;
+            cb.type = 5;
+            cb.locktime = h;   // distinct coinbases
+            b.m_txs.push_back(cb);
+            auto it = extra.find(h);
+            if (it != extra.end()) for (const auto& t : it->second) b.m_txs.push_back(t);
+            bind_body(b);
+            hashes.push_back(x11_header_hash(b));
+            blocks.push_back(b);
+        }
+    }
+    VbChainFn fn() const
+    {
+        return [this](uint32_t h) -> std::optional<VbBlockInfo> {
+            if (h >= blocks.size()) return std::nullopt;
+            VbBlockInfo i;
+            i.nVersion = static_cast<int32_t>(blocks[h].m_version);
+            i.nTime = blocks[h].m_timestamp;
+            i.hash = hashes[h];
+            return i;
+        };
+    }
+};
 
 } // namespace
 
@@ -401,7 +470,9 @@ TEST(DashV24Deployments, TestnetReplayActivatesAt1578000)
     // [1,559,509, 1,577,199]). Every admissible signal height must give the
     // measured switch: earliest (first block with MTP >= start), the middle,
     // and the last one that still starts by 1,577,200.
-    for (int64_t signal : {int64_t{1'559'509}, int64_t{1'567'000}, int64_t{1'577'150}, int64_t{1'577'199}}) {
+    // The real signal (VM504 getdeploymentinfo ehf_height) is 1,565,132.
+    for (int64_t signal : {int64_t{1'559'509}, int64_t{1'565'132}, int64_t{1'567'000},
+                           int64_t{1'577'150}, int64_t{1'577'199}}) {
         VersionBitsChecker vb(p, DashDeployment::V24, tc.fn());
         SCOPED_TRACE("signal=" + std::to_string(signal));
         EXPECT_EQ(vb.state_for(1'577'798, signal), ThresholdState::STARTED);
@@ -415,6 +486,30 @@ TEST(DashV24Deployments, TestnetReplayActivatesAt1578000)
         // The 1,567,1xx pre-release signalling (17, 53, 39 per window) never
         // reaches a threshold.
         EXPECT_NE(vb.state_for(1'567'399, signal), ThresholdState::LOCKED_IN);
+    }
+    // The real signal height, as Core reports it (VM504 getdeploymentinfo):
+    // STARTED since 1,565,200, LOCKED_IN since 1,577,900, ACTIVE since
+    // 1,578,000; the signal's own period stays DEFINED.
+    {
+        const int64_t S = 1'565'132;
+        auto sig = [S](int64_t prev) { return prev >= S ? S : kNoSignalHeight; };
+        VersionBitsChecker vb(p, DashDeployment::V24, tc.fn());
+        EXPECT_EQ(vb.state_for(1'565'131, sig(1'565'131)), ThresholdState::DEFINED);
+        EXPECT_EQ(vb.state_for(1'565'198, sig(1'565'198)), ThresholdState::DEFINED);
+        EXPECT_EQ(vb.state_for(1'565'199, sig(1'565'199)), ThresholdState::STARTED);
+        EXPECT_EQ(vb.state_since_height(1'565'199, S), std::optional<int64_t>(1'565'200));
+        EXPECT_EQ(vb.state_since_height(1'577'898, S), std::optional<int64_t>(1'565'200));
+        EXPECT_EQ(vb.state_since_height(1'577'899, S), std::optional<int64_t>(1'577'900));
+        EXPECT_EQ(vb.state_since_height(1'577'999, S), std::optional<int64_t>(1'578'000));
+        // getdeploymentinfo statistics at 1,577,898 / 1,577,899.
+        auto st = vb.statistics(1'577'898, S);
+        ASSERT_TRUE(st);
+        EXPECT_EQ(st->elapsed, 99); EXPECT_EQ(st->count, 72); EXPECT_EQ(st->threshold, 60);
+        EXPECT_TRUE(st->possible);
+        st = vb.statistics(1'577'899, S);
+        ASSERT_TRUE(st);
+        EXPECT_EQ(st->elapsed, 100); EXPECT_EQ(st->count, 73); EXPECT_EQ(st->threshold, 80);
+        EXPECT_FALSE(st->possible);
     }
     // 73 of 100 in 1,577,800..1,577,899 is exactly Threshold(6): STARTED must
     // be at or before 1,577,200. A signal one period later (STARTED at
@@ -459,6 +554,21 @@ TEST(DashV24Deployments, TestnetBoundWithoutBodiesAndBlockVersion)
     // A pin that contradicts a decided height fails closed.
     st.set_v24_activation_override(1'577'900);
     EXPECT_EQ(st.v24_state(1'577'950), V24State::UNKNOWN) << "computed inactive, pin says active";
+}
+
+// VERIFY-H0-S0-S1 N5: the mainnet versionbits walk-back reads headers down to
+// 2,564,341 (the period end 2,564,351, whose MTP is still before the v24 start
+// time, minus the 10 extra headers of its median time past), and the EHF
+// tracker scans bodies from its anchor. A header fast-start checkpoint above
+// either would leave no headers to walk back over: every mainnet height would
+// read UNKNOWN, before activation as well as after.
+TEST(DashV24Deployments, FastStartCheckpointLeavesTheV24WalkBack)
+{
+    const auto cp = dash::coin::make_dash_chain_params_mainnet();
+    ASSERT_TRUE(cp.fast_start_checkpoint.has_value());
+    EXPECT_LE(cp.fast_start_checkpoint->height, 2'564'341u);
+    EXPECT_LE(cp.fast_start_checkpoint->height,
+              dash_deployment_params(DashNetwork::MAINNET).ehf_anchor_height);
 }
 
 TEST(DashV24Deployments, TestnetBuriedHeightIsTheS2Hook)
@@ -586,7 +696,12 @@ TEST(DashV24Deployments, StatusExactBoundAndBlockVersion)
     EXPECT_EQ(st.v24_state(49), V24State::INACTIVE);
     EXPECT_EQ(st.v24_state(50), V24State::ACTIVE);
     EXPECT_TRUE(st.v24_active(61)) << "parent 60 is covered";
-    EXPECT_EQ(st.v24_state(62), V24State::UNKNOWN) << "parent 61 not scanned; bound says ACTIVE possible";
+    // Parent 61 is not scanned, but the signal at 23 is final (a later one
+    // cannot be lower), so SignalHeight is decided for every later parent:
+    // the state after the tip does not wait for the tip's own body (M3).
+    EXPECT_EQ(st.v24_state(62), V24State::ACTIVE);
+    EXPECT_EQ(st.resolve(62, DashDeployment::V24).basis, std::string("exact"));
+    EXPECT_EQ(st.v24_state(150), V24State::ACTIVE);
 
     // Block version: bit 13 while STARTED or LOCKED_IN (Core GBT, gbt_force).
     EXPECT_EQ(st.block_version(25), 0x20000000u) << "DEFINED";
@@ -643,7 +758,8 @@ TEST(DashV24Deployments, RescanLaneFillsFromAnchorBelowTheLiveFloor)
     std::optional<uint32_t> floor;   // live path not ready yet
     std::vector<std::vector<uint256>> sent;
     EhfRescanLane lane(t, c.fn(), [&] { return floor; },
-                       [&](const std::vector<uint256>& hs) { sent.push_back(hs); return true; });
+                       [&](const std::vector<uint256>& hs) { sent.push_back(hs); return true; },
+                       merkle_bound_only);
     EXPECT_EQ(lane.tick(0), 0u) << "idle without a live floor";
 
     floor = 120;   // the payee cursor sits at 119
@@ -680,4 +796,598 @@ TEST(DashV24Deployments, RescanLaneFillsFromAnchorBelowTheLiveFloor)
     EXPECT_TRUE(sent.empty());
     // From here the live feed extends coverage contiguously.
     EXPECT_TRUE(t->connect_block(block_at(c, 120), 120, c.at(120)->hash));
+}
+
+// ── Rescan bodies are bound to their headers (VERIFY-H0-S0-S1 M1) ────────────
+
+TEST(DashV24Deployments, RescanLaneBindsEveryBodyToItsHeader)
+{
+    auto p = fast_params(0);
+    X11Chain xc;
+    xc.build(40, {{25, {mnhf_tx(13)}}});
+    auto t = std::make_shared<EhfSignalTracker>(p, xc.fn());
+    std::vector<uint256> asked;
+    EhfRescanLane lane(t, xc.fn(), [] { return std::optional<uint32_t>(30); },
+                       [&](const std::vector<uint256>& hs) {
+                           asked.insert(asked.end(), hs.begin(), hs.end());
+                           return true;
+                       });   // production check: ehf_rescan_body_binds
+    lane.tick(0);
+    ASSERT_EQ(asked.size(), 30u);
+
+    // The real body binds (merkle root and header hash).
+    EXPECT_TRUE(ehf_rescan_body_binds(xc.hashes[0], xc.blocks[0]));
+    EXPECT_TRUE(lane.on_body(xc.hashes[0], xc.blocks[0]));
+    EXPECT_EQ(t->scanned_to(), std::optional<uint32_t>(0));
+
+    // Body 1 with a planted MNHF tx under the real header: merkle mismatch.
+    BlockType planted = xc.blocks[1];
+    planted.m_txs.push_back(mnhf_tx(13));
+    EXPECT_FALSE(ehf_rescan_body_binds(xc.hashes[1], planted));
+    EXPECT_TRUE(lane.on_body(xc.hashes[1], planted)) << "claimed (we asked for it), not kept";
+    EXPECT_EQ(lane.rejected(), 1u);
+    EXPECT_EQ(t->scanned_to(), std::optional<uint32_t>(0));
+    EXPECT_TRUE(t->signals().empty());
+
+    // A self-consistent forged block (its own header commits its txs) under
+    // the requested hash: the header is not ours.
+    BlockType forged = xc.blocks[1];
+    forged.m_txs.push_back(mnhf_tx(13));
+    bind_body(forged);
+    EXPECT_FALSE(ehf_rescan_body_binds(xc.hashes[1], forged));
+    EXPECT_TRUE(lane.on_body(xc.hashes[1], forged));
+    EXPECT_EQ(lane.rejected(), 2u);
+    EXPECT_EQ(t->scanned_to(), std::optional<uint32_t>(0));
+
+    // Body 25 WITHOUT its signal tx under the real header: refused, so the
+    // tracker can never be told "no signal here".
+    BlockType omitted = xc.blocks[25];
+    omitted.m_txs.pop_back();
+    EXPECT_FALSE(ehf_rescan_body_binds(xc.hashes[25], omitted));
+
+    // A refused height is re-asked at the very next tick (not after 20 s).
+    asked.clear();
+    lane.tick(1);
+    EXPECT_EQ(asked.size(), 1u);
+    EXPECT_EQ(asked.front(), xc.hashes[1]);
+
+    // The real bodies fill the range and the real signal is found.
+    for (uint32_t h = 1; h < 30; ++h) EXPECT_TRUE(lane.on_body(xc.hashes[h], xc.blocks[h]));
+    EXPECT_EQ(t->scanned_to(), std::optional<uint32_t>(29));
+    EXPECT_EQ(t->signal_height(13, 29), 25);
+    EXPECT_EQ(lane.rejected(), 2u);
+}
+
+// ── Coverage is checked against the chain view ──────────────────────────────
+
+TEST(DashV24Deployments, VerifiedCoverageFollowsAHeaderReorgBeforeAnyBody)
+{
+    SynthChain c; c.tip = 60;
+    auto p = fast_params(0);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 40; ++h) {
+        std::vector<MutableTransaction> extra;
+        if (h == 33) extra.push_back(mnhf_tx(13));
+        ASSERT_TRUE(t->connect_block(block_at(c, h, extra), h, c.at(h)->hash));
+    }
+    EXPECT_EQ(t->verified_coverage(), 40);
+    // The header chain switches at 30 (no body of the new branch yet): the
+    // recorded bodies above 29 are not on the chain any more, and neither is
+    // the signal at 33.
+    for (uint32_t h = 30; h <= 60; ++h) c.salt[h] = 9;
+    EXPECT_EQ(t->verified_coverage(), 29);
+    uint32_t tip = 60;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_NE(st.resolve(50, DashDeployment::V24).basis, std::string("exact"))
+        << "the old branch's signal must not decide the new branch";
+    // Nothing scanned at all: anchor - 1.
+    auto t2 = std::make_shared<EhfSignalTracker>(p, c.fn());
+    EXPECT_EQ(t2->verified_coverage(), -1);
+}
+
+// ── The real testnet MNHF transaction (block 1,565,132) ─────────────────────
+
+TEST(DashV24Deployments, RealTestnetMnhfSignalTx)
+{
+    // VM504 getrawtransaction 46a47fe6..., mined in testnet block 1,565,132.
+    const std::string hex =
+        "0300070000000000000082010dfab03beecae3ec79691a966f8a37a836dab21a409f1ee39bfe98a26f"
+        "03000000a3520c90ae1a3aa2b750be245cb9eaa1c4be78f0ee43f46b56a0d319cae9e76a87c5ce23d9"
+        "3e24b7484b93288bdbc7e70610d04c7d9ba4f30dc3b71b58baf6436752ffbace4c79da3e4d6de8764"
+        "6610a8cff9001b51d768c4b6d8a4ddda6f01c";
+    std::vector<unsigned char> raw;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+        raw.push_back(static_cast<unsigned char>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    MutableTransaction tx;
+    ::PackStream ps(raw);
+    ps >> tx;
+    EXPECT_TRUE(ps.empty());
+    EXPECT_EQ(tx.type, 7);
+    EXPECT_EQ(extract_ehf_signal(tx), std::optional<uint8_t>(13));
+    auto packed = ::pack(tx);
+    EXPECT_EQ(::Hash(packed.get_span()).GetHex().substr(0, 16), "46a47fe65c9fd29e");
+}
+
+// ── Live cross-check latch (VERIFY-H0-S0-S1 M2) ─────────────────────────────
+
+namespace {
+// Chain with bit-13 signalling 30..39 and the MNHF signal at 25: Core is
+// STARTED 30, LOCKED_IN 40, ACTIVE 50.
+struct LatchFixture
+{
+    SynthChain c;
+    DashDeploymentParams p = fast_params(0);
+    std::shared_ptr<EhfSignalTracker> t;
+    uint32_t tip{120};
+    std::unique_ptr<DashDeploymentStatus> st;
+    explicit LatchFixture(bool with_signal)
+    {
+        c.tip = 120;
+        c.signal_range(30, 39);
+        t = std::make_shared<EhfSignalTracker>(p, c.fn());
+        for (uint32_t h = 0; h <= 120; ++h) {
+            std::vector<MutableTransaction> x;
+            if (with_signal && h == 25) x.push_back(mnhf_tx(13));
+            t->connect_block(block_at(c, h, x), h, c.at(h)->hash);
+        }
+        st = std::make_unique<DashDeploymentStatus>(
+            p, c.fn(), [this] { return std::optional<uint32_t>(tip); }, t);
+    }
+};
+} // namespace
+
+TEST(DashV24Deployments, CrossCheckAgreesWithTheChain)
+{
+    LatchFixture f(true);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(45, f.c.at(45)->hash, 3), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    // A block that is not our chain's block at that height is not compared.
+    EXPECT_EQ(f.st->cross_check_cbtx_version(55, height_hash(55, 7), 3), V24CrossCheck::UNDECIDED);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->contradictions(), 0u);
+}
+
+TEST(DashV24Deployments, CrossCheckContradictionLatchesFailClosed)
+{
+    // The tracker missed the signal (as a forged rescan body could make it):
+    // decided INACTIVE where the chain says v4 (ACTIVE).
+    LatchFixture f(false);
+    ASSERT_EQ(f.st->v24_state(55), V24State::INACTIVE);
+    EXPECT_EQ(f.st->resolve(55, DashDeployment::V24).basis, std::string("exact"));
+    EXPECT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::CONTRADICTS);
+    EXPECT_EQ(f.st->latch(), V24Latch::EXACT);
+    // Fail closed: no tracker-derived answer any more. The header-only bound
+    // (signal at 0: STARTED 10, LOCKED_IN 40, ACTIVE 50) still proves 45 and
+    // below inactive; 50 on is UNKNOWN.
+    EXPECT_EQ(f.st->v24_state(55), V24State::UNKNOWN);
+    EXPECT_EQ(f.st->resolve(55, DashDeployment::V24).basis, std::string("cross-check-latch"));
+    EXPECT_EQ(f.st->v24_state(100), V24State::UNKNOWN);
+    EXPECT_EQ(f.st->v24_state(45), V24State::INACTIVE);
+    EXPECT_EQ(f.st->resolve(45, DashDeployment::V24).basis, std::string("bound"));
+    EXPECT_EQ(f.st->block_version(45), 0x20000000u) << "no signalling from a refuted state";
+    EXPECT_EQ(f.st->activation_height(DashDeployment::V24), std::nullopt);
+    // Further v4 blocks: still latched (the recomputed state still disagrees).
+    EXPECT_EQ(f.st->cross_check_cbtx_version(56, f.c.at(56)->hash, 4), V24CrossCheck::UNDECIDED);
+    EXPECT_EQ(f.st->latch(), V24Latch::EXACT);
+    // The operator pin decides under the latch.
+    f.st->set_v24_activation_override(50);
+    EXPECT_EQ(f.st->v24_state(55), V24State::ACTIVE);
+    EXPECT_EQ(f.st->resolve(55, DashDeployment::V24).basis, std::string("override"));
+    EXPECT_EQ(f.st->cross_check_cbtx_version(57, f.c.at(57)->hash, 4), V24CrossCheck::AGREE);
+}
+
+TEST(DashV24Deployments, CrossCheckRefutingTheBoundLatchesEverything)
+{
+    // No tracker at all (bound only): the bound says 45 is INACTIVE. A v4
+    // block at 45 refutes the bound itself.
+    SynthChain c; c.tip = 120;
+    c.signal_range(30, 39);
+    auto p = fast_params(0);
+    uint32_t tip = 120;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, nullptr);
+    ASSERT_EQ(st.v24_state(45), V24State::INACTIVE);
+    EXPECT_EQ(st.cross_check_cbtx_version(45, c.at(45)->hash, 4), V24CrossCheck::CONTRADICTS);
+    EXPECT_EQ(st.latch(), V24Latch::BOUND);
+    EXPECT_EQ(st.v24_state(45), V24State::UNKNOWN);
+    EXPECT_EQ(st.v24_state(20), V24State::UNKNOWN);
+}
+
+TEST(DashV24Deployments, CrossCheckEscalatesWhenTheFallbackIsRefutedToo)
+{
+    // Tracker without the signal says INACTIVE at 45 (exact); the bound says
+    // INACTIVE at 45 too. A v4 block at 45 refutes both in one check.
+    LatchFixture f(false);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(45, f.c.at(45)->hash, 4), V24CrossCheck::CONTRADICTS);
+    EXPECT_EQ(f.st->latch(), V24Latch::BOUND);
+    EXPECT_EQ(f.st->v24_state(45), V24State::UNKNOWN);
+}
+
+TEST(DashV24Deployments, CrossCheckRefutedPinIsIgnored)
+{
+    SynthChain c; c.tip = 120;
+    auto p = fast_params(0);
+    uint32_t tip = 120;
+    // Bound only, with signalling the bound cannot rule out (ACTIVE possible
+    // from 50), so the pin decides 60.
+    c.signal_range(30, 39);
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, nullptr);
+    ASSERT_EQ(st.v24_state(60), V24State::UNKNOWN);
+    st.set_v24_activation_override(60);
+    ASSERT_EQ(st.v24_state(60), V24State::ACTIVE);
+    // The chain says v3 at 60: the pin is wrong.
+    EXPECT_EQ(st.cross_check_cbtx_version(60, c.at(60)->hash, 3), V24CrossCheck::CONTRADICTS);
+    EXPECT_TRUE(st.pin_refuted());
+    EXPECT_EQ(st.v24_state(60), V24State::UNKNOWN);
+    // Setting a pin again (operator action) re-arms it.
+    st.set_v24_activation_override(70);
+    EXPECT_FALSE(st.pin_refuted());
+    EXPECT_EQ(st.v24_state(60), V24State::INACTIVE);
+}
+
+TEST(DashV24Deployments, CrossCheckLatchClearsWhenTheRecomputedStateAgrees)
+{
+    // The tracker held a stale branch without the signal; the chain says v4.
+    LatchFixture f(false);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::CONTRADICTS);
+    ASSERT_EQ(f.st->latch(), V24Latch::EXACT);
+    // The tracker is corrected: block 25 with its signal on a new branch
+    // (the chain view switches at 25 and the bodies are re-fed).
+    for (uint32_t h = 25; h <= 120; ++h) f.c.salt[h] = 3;
+    for (uint32_t h = 25; h <= 120; ++h) {
+        std::vector<MutableTransaction> x;
+        if (h == 25) x.push_back(mnhf_tx(13));
+        f.t->connect_block(block_at(f.c, h, x), h, f.c.at(h)->hash);
+    }
+    ASSERT_EQ(f.t->signal_height(13, 120), 25);
+    // The next block agrees, and the latched height recomputes to what the
+    // chain said there: the latch clears.
+    EXPECT_EQ(f.st->cross_check_cbtx_version(56, f.c.at(56)->hash, 4), V24CrossCheck::AGREE);
+    EXPECT_EQ(f.st->latch(), V24Latch::NONE);
+    EXPECT_EQ(f.st->v24_state(55), V24State::ACTIVE);
+}
+
+TEST(DashV24Deployments, ShutdownStopsReadingTheChain)
+{
+    LatchFixture f(true);
+    ASSERT_EQ(f.st->v24_state(55), V24State::ACTIVE);
+    f.st->shutdown();
+    EXPECT_EQ(f.st->v24_state(55), V24State::UNKNOWN);
+    EXPECT_EQ(f.st->block_version(35), 0x20000000u);
+    EXPECT_EQ(f.st->cross_check_cbtx_version(55, f.c.at(55)->hash, 4), V24CrossCheck::UNDECIDED);
+}
+
+// ── Decidability before the tip body (VERIFY-H0-S0-S1 M3) ───────────────────
+
+TEST(DashV24Deployments, StateBeforeTheSignalIsFoundDecidedOffPeriodEnds)
+{
+    // No signal yet anywhere; tracker covers 0..34, header tip 35. Block 36
+    // (parent 35) has no period end in (34, 35]: the signal height is "none"
+    // for it and the state is exact. Block 41 (parent 40) has the period end
+    // 39 in (34, 40]: a signal in 35..39 would matter -> not exact.
+    SynthChain c; c.tip = 60;
+    auto p = fast_params(0);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 34; ++h) ASSERT_TRUE(t->connect_block(block_at(c, h), h, c.at(h)->hash));
+    uint32_t tip = 60;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_EQ(st.resolve(36, DashDeployment::V24).basis, std::string("exact"));
+    EXPECT_EQ(st.resolve(36, DashDeployment::V24).state, ThresholdState::DEFINED);
+    EXPECT_NE(st.resolve(41, DashDeployment::V24).basis, std::string("exact"));
+    EXPECT_EQ(st.v24_state(41), V24State::INACTIVE) << "bound";
+}
+
+// ═════ The verifier's adversarial KATs (VERIFY-H0-S0-S1 §6): the seven that
+// failed on the S1 head, now passing. Expectations are Dash Core v24.0.0's
+// answers (versionbits.cpp, mnhftx.cpp) or an independent pure reference.
+
+namespace {
+
+uint256 hh(uint32_t h, uint32_t salt = 0)
+{
+    uint256 x;
+    for (int i = 0; i < 4; ++i) x.data()[i] = static_cast<uint8_t>(h >> (8 * i));
+    for (int i = 0; i < 4; ++i) x.data()[4 + i] = static_cast<uint8_t>(salt >> (8 * i));
+    x.data()[31] = 0xa5;
+    return x;
+}
+
+// Synthetic chain (one block every 150 s, or explicit times).
+struct Synth
+{
+    uint32_t t0{1'800'000'000};
+    std::map<uint32_t, int32_t> ver;
+    std::map<uint32_t, uint32_t> salt;
+    std::map<uint32_t, uint32_t> tm;
+    uint32_t tip{0};
+    std::optional<VbBlockInfo> at(uint32_t h) const
+    {
+        if (h > tip) return std::nullopt;
+        VbBlockInfo i;
+        auto v = ver.find(h);
+        i.nVersion = v == ver.end() ? kVersionBitsTopBits : v->second;
+        auto t = tm.find(h);
+        i.nTime = t == tm.end() ? t0 + 150 * h : t->second;
+        auto s = salt.find(h);
+        i.hash = hh(h, s == salt.end() ? 0 : s->second);
+        return i;
+    }
+    VbChainFn fn() const { return [this](uint32_t h) { return at(h); }; }
+    void sig(uint32_t a, uint32_t z) { for (uint32_t h = a; h <= z; ++h) ver[h] = 0x20002000; }
+};
+
+DashDeploymentParams fast(int64_t start, int64_t P = 10, int64_t thr = 8, int64_t thrmin = 6)
+{
+    DashDeploymentParams p = dash_deployment_params(DashNetwork::REGTEST);
+    for (auto& d : p.deployments) {
+        d.nStartTime = start;
+        d.nTimeout = Bip9Deployment::NO_TIMEOUT;
+        d.nWindowSize = P;
+        d.nThresholdStart = thr;
+        d.nThresholdMin = thrmin;
+        d.nFalloffCoeff = 5;
+    }
+    p.min_bip9_warning_height = 0;
+    p.v20_height = 0;
+    p.ehf_anchor_height = 0;
+    p.v24_buried_height.reset();
+    return p;
+}
+
+MutableTransaction mnhf(uint8_t bit) { return mnhf_tx(bit); }
+
+// An UNBOUND body (header merkle root zero), as a lying peer would serve it.
+BlockType body(const Synth& c, uint32_t h, std::vector<MutableTransaction> extra = {})
+{
+    BlockType b;
+    if (h > 0) b.m_previous_block = c.at(h - 1)->hash;
+    MutableTransaction cb;
+    cb.version = 3;
+    cb.type = 5;
+    b.m_txs.push_back(cb);
+    for (auto& t : extra) b.m_txs.push_back(std::move(t));
+    return b;
+}
+
+// Independent reference: Core GetStateFor as a pure forward function. No
+// cache. SignalHeight from the stage at the query's pindexPrev; a period end
+// E leaves DEFINED when MTP(E) >= start && E >= S; nAttempt = (E - nStart)/P.
+struct RefVb
+{
+    const DashDeploymentParams& p;
+    const Bip9Deployment& d;
+    VbChainFn chain;
+    std::optional<int64_t> mtp(int64_t h) const { return vb_median_time_past(chain, h); }
+    std::optional<ThresholdState> state(int64_t prev, int64_t S) const
+    {
+        const int64_t P = vb_period(p, d);
+        if (prev < 0) return ThresholdState::DEFINED;
+        const int64_t top = prev - ((prev + 1) % P);
+        ThresholdState s = ThresholdState::DEFINED;
+        int64_t nStart = -1;
+        for (int64_t E = P - 1; E <= top; E += P) {
+            if (E < p.min_bip9_warning_height) { s = ThresholdState::DEFINED; continue; }
+            auto m = mtp(E);
+            if (!m) return std::nullopt;
+            switch (s) {
+            case ThresholdState::DEFINED:
+                if (*m >= d.nStartTime && E >= S) { s = ThresholdState::STARTED; nStart = E + 1; }
+                break;
+            case ThresholdState::STARTED: {
+                int64_t cnt = 0;
+                for (int64_t h = E - P + 1; h <= E; ++h) {
+                    auto bi = chain(static_cast<uint32_t>(h));
+                    if (!bi) return std::nullopt;
+                    if (vb_signals(bi->nVersion, d)) ++cnt;
+                }
+                const int64_t thr = vb_threshold(p, d, (E - nStart) / P);
+                if (cnt >= thr) s = ThresholdState::LOCKED_IN;
+                else if (*m >= d.nTimeout) s = ThresholdState::FAILED;
+                break;
+            }
+            case ThresholdState::LOCKED_IN:
+                if (E + 1 >= d.min_activation_height) s = ThresholdState::ACTIVE;
+                break;
+            default: break;
+            }
+        }
+        return s;
+    }
+};
+
+} // namespace
+
+// M4: signal at 25 (mid-period 20..29). Core: STARTED 30, LOCKED_IN 40,
+// ACTIVE 50. A query for block 23 (prev 22 < S: the tracker answers "no
+// signal") after a query that cached the STARTED run must not change any
+// later answer.
+TEST(DashV24VerifyFold, CacheMustNotBePoisonedByAQueryBelowTheSignal)
+{
+    Synth c; c.tip = 120;
+    auto p = fast(0);
+    c.sig(30, 39);
+    VersionBitsChecker vb(p, DashDeployment::V24, c.fn());
+    const int64_t S = 25;
+    EXPECT_EQ(vb.state_for(35, S), ThresholdState::STARTED);
+    EXPECT_EQ(vb.state_for(22, kNoSignalHeight), ThresholdState::DEFINED);   // block 23
+    EXPECT_EQ(vb.state_for(45, S), ThresholdState::LOCKED_IN) << "poisoned cache => nullopt";
+    EXPECT_EQ(vb.state_for(55, S), ThresholdState::ACTIVE) << "poisoned cache => nullopt";
+}
+
+// M4 through DashDeploymentStatus + tracker.
+TEST(DashV24VerifyFold, StatusStaysDecidableAfterAHistoricalQuery)
+{
+    Synth c; c.tip = 120;
+    auto p = fast(0);
+    c.sig(30, 39);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 120; ++h) {
+        std::vector<MutableTransaction> x;
+        if (h == 25) x.push_back(mnhf(13));
+        ASSERT_TRUE(t->connect_block(body(c, h, x), h, c.at(h)->hash));
+    }
+    uint32_t tip = 120;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_EQ(st.v24_state(36), V24State::INACTIVE);
+    EXPECT_EQ(st.v24_state(23), V24State::INACTIVE);
+    EXPECT_EQ(st.v24_state(50), V24State::ACTIVE);
+    EXPECT_EQ(st.v24_state(100), V24State::ACTIVE);
+}
+
+// M3: with the tracker covering T-1 (body T not yet in), v24 is still
+// exactly ACTIVE for T+1.
+TEST(DashV24VerifyFold, ActiveIsDecidableBeforeTheTipBodyArrives)
+{
+    Synth c; c.tip = 100;
+    auto p = fast(0);
+    c.sig(30, 39);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 99; ++h) {   // body 100 not yet connected
+        std::vector<MutableTransaction> x;
+        if (h == 25) x.push_back(mnhf(13));
+        ASSERT_TRUE(t->connect_block(body(c, h, x), h, c.at(h)->hash));
+    }
+    uint32_t tip = 100;   // header 100 is in
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_EQ(st.v24_state(100), V24State::ACTIVE) << "parent 99 covered";
+    EXPECT_EQ(st.v24_state(101), V24State::ACTIVE)
+        << "post-activation every new header tip must not read UNKNOWN until its body is scanned";
+}
+
+// SF1: block_version at the header tip, before the tip body reaches the
+// tracker: STARTED must still set bit 13.
+TEST(DashV24VerifyFold, BlockVersionSignalsAtHeaderTipBeforeBody)
+{
+    Synth c; c.tip = 35;
+    auto p = fast(0);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    for (uint32_t h = 0; h <= 34; ++h) {   // header 35 in, body not yet
+        std::vector<MutableTransaction> x;
+        if (h == 25) x.push_back(mnhf(13));
+        ASSERT_TRUE(t->connect_block(body(c, h, x), h, c.at(h)->hash));
+    }
+    uint32_t tip = 35;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_EQ(st.block_version(35), 0x20002000u) << "covered parent";
+    EXPECT_EQ(st.block_version(36), 0x20002000u)
+        << "main_dash tip-advance: ta->version = block_version(tip+1) before body(tip) is scanned";
+}
+
+// M1: a forged rescan body with a fake signal is refused.
+TEST(DashV24VerifyFold, RescanLaneRefusesAForgedBodyWithAFakeSignal)
+{
+    Synth c; c.tip = 200;
+    auto p = fast(0);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    std::vector<uint256> asked;
+    EhfRescanLane lane(t, c.fn(), [] { return std::optional<uint32_t>(150); },
+                       [&](const std::vector<uint256>& hs) { asked.insert(asked.end(), hs.begin(), hs.end()); return true; });
+    lane.tick(0);
+    ASSERT_FALSE(asked.empty());
+    BlockType forged = body(c, 0, {mnhf(13)});
+    ASSERT_FALSE(block_body_binds_to_header(forged));
+    lane.on_body(c.at(0)->hash, forged);
+    EXPECT_TRUE(t->signals().empty()) << "a forged body planted an EHF signal at h=0";
+    EXPECT_FALSE(t->scanned_to().has_value()) << "a forged body extended coverage";
+}
+
+// M1: bodies that omit the real signal cannot decide INACTIVE.
+TEST(DashV24VerifyFold, RescanLaneRefusesABodyThatOmitsTheRealSignal)
+{
+    Synth c; c.tip = 200;
+    auto p = fast(0);
+    c.sig(30, 39);
+    auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+    std::vector<uint256> asked;
+    EhfRescanLane lane(t, c.fn(), [] { return std::optional<uint32_t>(120); },
+                       [&](const std::vector<uint256>& hs) { asked.insert(asked.end(), hs.begin(), hs.end()); return true; });
+    for (int round = 0; round < 4; ++round) {
+        lane.tick(round * 100'000);
+        const uint32_t from = t->next_needed_height();
+        for (uint32_t h = from; h < from + EhfRescanLane::kWindow && h < 120; ++h)
+            lane.on_body(c.at(h)->hash, body(c, h));   // never carries the signal; unbound
+    }
+    uint32_t tip = 119;
+    DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+    EXPECT_NE(st.v24_state(60), V24State::INACTIVE)
+        << "unbound rescan bodies -> decided INACTIVE after Core activation (v3 CbTx on a v24 chain)";
+}
+
+// M4: randomized differential against the pure reference, non-monotone
+// queries; no wrong decided state and no unknown on a fully known chain.
+TEST(DashV24VerifyFold, DifferentialFuzzAgainstPureReference)
+{
+    std::mt19937_64 rng(0xD45A24);
+    int checked = 0, mismatches = 0, unknown = 0;
+    for (int iter = 0; iter < 300; ++iter) {
+        Synth c; c.tip = 400;
+        uint32_t t = 1'800'000'000;
+        for (uint32_t h = 0; h <= c.tip; ++h) { t += 30 + rng() % 400; c.tm[h] = t; }
+        const int64_t P = 10 + rng() % 3 * 5;   // 10, 15, 20
+        const int64_t thr = P * 8 / 10, thrmin = P * 6 / 10;
+        const int64_t start = c.tm[20 + rng() % 60];
+        auto p = fast(start, P, thr, thrmin);
+        if (rng() % 4 == 0) for (auto& d : p.deployments) d.nTimeout = c.tm[200 + rng() % 150];
+        const double dens = (rng() % 100) / 100.0;
+        for (uint32_t h = 0; h <= c.tip; ++h) if ((rng() % 1000) / 1000.0 < dens) c.ver[h] = 0x20002000;
+        const int64_t S = rng() % 3 == 0 ? kNoSignalHeight : static_cast<int64_t>(rng() % 300);
+        auto sigq = [S](int64_t prev) { return prev >= S ? S : kNoSignalHeight; };
+        VersionBitsChecker vb(p, DashDeployment::V24, c.fn());
+        RefVb ref{p, p.dep(DashDeployment::V24), c.fn()};
+        for (int q = 0; q < 60; ++q) {
+            const int64_t prev = rng() % (c.tip + 1);
+            auto a = vb.state_for(prev, sigq(prev));
+            auto b = ref.state(prev, sigq(prev));
+            ++checked;
+            if (!a) { ++unknown; continue; }
+            if (*a != *b) ++mismatches;
+        }
+    }
+    EXPECT_EQ(mismatches, 0) << "wrong decided states vs Core reference";
+    EXPECT_EQ(unknown, 0) << "nullopt from a fully known chain (cache poisoning) out of " << checked;
+}
+
+// The status (tracker + exact/bound + decided-before-body rule) against the
+// pure reference with the tracker lagging the header tip by 0..25 blocks and
+// random query order: a decided answer is never wrong.
+TEST(DashV24VerifyFold, StatusDecidedAnswersMatchTheReferenceUnderTrackerLag)
+{
+    std::mt19937_64 rng(0x24E4F);
+    int decided = 0, wrong = 0;
+    for (int iter = 0; iter < 150; ++iter) {
+        Synth c; c.tip = 300;
+        const int64_t P = 10;
+        auto p = fast(c.t0 + 150 * (5 + rng() % 40), P, 8, 6);
+        const double dens = (rng() % 100) / 100.0;
+        for (uint32_t h = 0; h <= c.tip; ++h) if ((rng() % 1000) / 1000.0 < dens) c.ver[h] = 0x20002000;
+        const bool mined = rng() % 4 != 0;
+        const uint32_t S = static_cast<uint32_t>(rng() % 250);
+        // GetSignalsStage drops a signal whose block MTP is before the start.
+        const bool has_signal = mined && *vb_median_time_past(c.fn(), S) >= p.dep(DashDeployment::V24).nStartTime;
+        auto t = std::make_shared<EhfSignalTracker>(p, c.fn());
+        const uint32_t covered = static_cast<uint32_t>(rng() % 300);
+        for (uint32_t h = 0; h <= covered; ++h) {
+            std::vector<MutableTransaction> x;
+            if (mined && h == S) x.push_back(mnhf(13));
+            ASSERT_TRUE(t->connect_block(body(c, h, x), h, c.at(h)->hash));
+        }
+        uint32_t tip = std::min<uint32_t>(c.tip, covered + static_cast<uint32_t>(rng() % 26));
+        DashDeploymentStatus st(p, c.fn(), [&tip] { return std::optional<uint32_t>(tip); }, t);
+        RefVb ref{p, p.dep(DashDeployment::V24), c.fn()};
+        for (int q = 0; q < 40; ++q) {
+            const uint32_t h = 1 + static_cast<uint32_t>(rng() % (tip + 1));
+            const int64_t prev = static_cast<int64_t>(h) - 1;
+            const int64_t sq = (has_signal && prev >= S) ? S : kNoSignalHeight;
+            const auto truth = ref.state(prev, sq);
+            ASSERT_TRUE(truth);
+            const V24State want = *truth == ThresholdState::ACTIVE ? V24State::ACTIVE : V24State::INACTIVE;
+            const auto r = st.resolve(h, DashDeployment::V24);
+            if (r.active == V24State::UNKNOWN) continue;
+            ++decided;
+            if (r.active != want) ++wrong;
+            if (r.state) EXPECT_EQ(*r.state, *truth) << "h=" << h << " basis " << r.basis;
+        }
+    }
+    EXPECT_EQ(wrong, 0);
+    EXPECT_GT(decided, 1000);
 }

@@ -280,7 +280,16 @@ TEST(DashV24CbTx, EmitGateRequiresVersion4ExactlyWhenV24IsActive)
     const auto w4 = make(true, uint256::ZERO);
     dash::coin::DeclineReport why;
 
-    // Seam unset: pre-v24, version 3 passes, version 4 is refused.
+    // Seam unset: the network answer. Mainnet with no status installed is
+    // UNKNOWN from the earliest possible activation (2,580,480): nothing
+    // emits (VERIFY-H0-S0-S1 N2, no fail-open default).
+    EXPECT_FALSE(st.embedded_template_emit_ok(w3, &why));
+    EXPECT_EQ(why.cause, "emit-v24-state-unknown");
+    EXPECT_FALSE(st.embedded_template_emit_ok(w4, &why));
+    EXPECT_EQ(why.cause, "emit-v24-state-unknown");
+
+    // Inactive: version 3 passes, version 4 is refused.
+    st.set_v24_state_fn([](uint32_t) { return V24State::INACTIVE; });
     EXPECT_TRUE(st.embedded_template_emit_ok(w3, &why)) << why.one_line();
     EXPECT_FALSE(st.embedded_template_emit_ok(w4, &why));
     EXPECT_EQ(why.cause, "emit-cbtx-version");

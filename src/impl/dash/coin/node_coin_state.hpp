@@ -461,12 +461,20 @@ public:
     int mn_rr_height() const { return m_mn_rr_height; }
 
     /// Dash Core v24: DeploymentActiveAfter(prev, DEPLOYMENT_V24) for the
-    /// block at a height (deployment_status.hpp). Unset => INACTIVE, the
-    /// pre-v24 template, byte-identical to before the seam. UNKNOWN refuses
-    /// the embedded template (cause v24-state-unknown): every v24 rule of the
-    /// block being built depends on it.
+    /// block at a height (deployment_status.hpp). Unset => the process-wide
+    /// answer for the network (dash::coin::v24_state(net, h): the installed
+    /// status, else INACTIVE only below the earliest possible activation and
+    /// UNKNOWN from it on), so an unwired caller fails closed past the
+    /// earliest v24 height instead of building pre-v24 blocks. UNKNOWN
+    /// refuses the embedded template (cause v24-state-unknown): every v24 rule
+    /// of the block being built depends on it.
     using V24StateFn = std::function<V24State(uint32_t height)>;
     void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
+    void set_v24_network(DashNetwork net) { m_v24_net = net; }
+    V24State v24_state_for(uint32_t height) const
+    {
+        return m_v24_state_fn ? m_v24_state_fn(height) : dash::coin::v24_state(m_v24_net, height);
+    }
 
     /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
     /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
@@ -1810,7 +1818,7 @@ public:
         // this block (bad-cbtx-version otherwise), committing the asset-unlock
         // root of THIS body (bad-cbtx-assetunlockmerkleroot).
         {
-            const V24State v24 = m_v24_state_fn ? m_v24_state_fn(next_h) : V24State::INACTIVE;
+            const V24State v24 = v24_state_for(next_h);
             if (v24 == V24State::UNKNOWN)
                 return reject("emit-v24-state-unknown", "h=" + std::to_string(next_h),
                               "ehf-scan-or-pin");
@@ -2079,8 +2087,7 @@ public:
         // tip). Never served on UNKNOWN; the dashd fallback (a v24 dashd)
         // serves instead.
         {
-            const V24State v24 = m_v24_state_fn ? m_v24_state_fn(m_prev_height + 1)
-                                                : V24State::INACTIVE;
+            const V24State v24 = v24_state_for(m_prev_height + 1);
             e.v24_active = v24 == V24State::ACTIVE;
             if (e.has_state && v24 == V24State::UNKNOWN) {
                 e.decline.viable    = false;
@@ -2770,7 +2777,8 @@ private:
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
-    V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => INACTIVE)
+    V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
+    DashNetwork m_v24_net{DashNetwork::MAINNET};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)

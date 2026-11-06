@@ -107,7 +107,9 @@ namespace coin {
 
 // Bump on ANY change to the field-comparison / graduation semantics so a new
 // comparator does NOT inherit an old comparator's clean streak (§6 cond. 4).
-inline constexpr uint32_t kOracleComparatorVersion = 1;
+// 2: Dash Core v24 -- CbTx version 4 is a known version, not a drift
+//    sentinel (kMaxKnownCbTxVersion below), so the graduation semantics changed.
+inline constexpr uint32_t kOracleComparatorVersion = 2;
 // Highest CbTx payload version this comparator models. A connected/observed
 // CbTx with a higher nVersion is a chain-drift sentinel (§6 cond. 5).
 // Dash Core v24 CbTx version 4 is modelled (vendor/cbtx.hpp).
