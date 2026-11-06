@@ -187,6 +187,7 @@ void NodeImpl::error(const message_error_type& err, const NetService& service, c
         else
             ++it;
     }
+    m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
 
     // Clean outbound tracking before base removes the peer
     m_pending_outbound.erase(service);
@@ -243,6 +244,7 @@ void NodeImpl::close_connection(const NetService& service)
         else
             ++it;
     }
+    m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
 
     // Cancel pending share requests for this peer (same as in error())
     {
@@ -345,12 +347,14 @@ std::optional<pool::PeerConnectionType> NodeImpl::handle_version(std::unique_ptr
                          << " (nonce match): closing previous " << old_addr.to_string()
                          << ", accepting new " << peer->addr().to_string();
                 m_peers.erase(dup);
+                m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
                 if (old_addr != peer->addr())
                         close_connection(old_addr);
         }
 
         peer->m_nonce = msg->m_nonce;
         m_peers[peer->m_nonce] = peer;
+        m_peer_count.store(m_peers.size(), std::memory_order_relaxed);
         publish_peer_info_snapshot();   // IO thread: refresh the display snapshot
 
         // Request peers from the newly established connection
@@ -1520,6 +1524,35 @@ void NodeImpl::notify_local_share(const uint256& share_hash)
 
 uint256 NodeImpl::best_share_hash()
 {
+    // Reader discipline (m_tracker_mutex, node.hpp): never block, never read
+    // the tracker unlocked. The compute thread already holds the lock.
+    if (is_compute_thread())
+        return best_share_hash_and_publish();
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        return published_best_share();
+    return best_share_hash_and_publish();
+}
+
+uint256 NodeImpl::best_share_hash(const TrackerReadGuard& held)
+{
+    if (!held)
+        return published_best_share();
+    return best_share_hash_and_publish();
+}
+
+uint256 NodeImpl::best_share_hash_and_publish()
+{
+    bool verified = false;
+    const uint256 best = best_share_hash_locked(verified);
+    std::lock_guard<std::mutex> lock(m_snapshot_mutex);
+    m_published_best = verified ? best : uint256();
+    return best;
+}
+
+uint256 NodeImpl::best_share_hash_locked(bool& verified)
+{
+    verified = false;
     // p2pool's think() returns the best VERIFIED head — not the raw chain tip.
     // This ensures shares are built on a chain that all peers agree on.
     // Use think().best ONLY if it's on the VERIFIED chain.
@@ -1529,23 +1562,24 @@ uint256 NodeImpl::best_share_hash()
     // This prevents building a self-reinforcing fork that never joins
     // the main chain.
     if (!m_best_share_hash.IsNull() && m_tracker.verified.contains(m_best_share_hash)) {
-        static int log_count = 0;
-        if (log_count++ % 60 == 0) {
+        static std::atomic<int> log_count{0};
+        if (log_count.fetch_add(1, std::memory_order_relaxed) % 60 == 0) {
             auto h = m_tracker.verified.get_height(m_best_share_hash);
             LOG_INFO << "[best_share] using think() result height=" << h
                      << " verified=" << m_tracker.verified.size()
                      << " raw=" << (m_chain ? m_chain->size() : 0);
         }
+        verified = true;
         return m_best_share_hash;
     }
     // Fallback: if think() hasn't run yet, pick best verified head by work
-    auto& verified = m_tracker.verified;
-    if (verified.size() > 0) {
+    auto& verified_chain = m_tracker.verified;
+    if (verified_chain.size() > 0) {
         uint256 best;
         uint288 best_work;
         bool first = true;
-        for (const auto& [head_hash, tail_hash] : verified.get_heads()) {
-            auto* idx = verified.get_index(head_hash);
+        for (const auto& [head_hash, tail_hash] : verified_chain.get_heads()) {
+            auto* idx = verified_chain.get_index(head_hash);
             if (idx && (first || idx->work > best_work)) {
                 best = head_hash;
                 best_work = idx->work;
@@ -1553,13 +1587,14 @@ uint256 NodeImpl::best_share_hash()
             }
         }
         if (!best.IsNull()) {
-            static int log_count2 = 0;
-            auto best_height = verified.get_height(best);
-            if (log_count2++ % 60 == 0)
+            static std::atomic<int> log_count2{0};
+            auto best_height = verified_chain.get_height(best);
+            if (log_count2.fetch_add(1, std::memory_order_relaxed) % 60 == 0)
                 LOG_INFO << "[best_share] fallback VERIFIED head height=" << best_height
                          << " work=" << best_work.GetHex().substr(0, 16)
-                         << " verified=" << verified.size()
+                         << " verified=" << verified_chain.size()
                          << " raw=" << (m_chain ? m_chain->size() : 0);
+            verified = true;
             return best;
         }
     }
@@ -1571,11 +1606,12 @@ uint256 NodeImpl::best_share_hash()
     //
     // On a genesis node (no peers, fresh chain), this returns ZERO which
     // triggers genesis share creation with 100% donation payout.
-    if (!m_peers.empty()) {
-        static int wait_log = 0;
-        if (wait_log++ % 12 == 0)
+    const size_t peers = m_peer_count.load(std::memory_order_relaxed);
+    if (peers > 0) {
+        static std::atomic<int> wait_log{0};
+        if (wait_log.fetch_add(1, std::memory_order_relaxed) % 12 == 0)
             LOG_INFO << "[best_share] waiting for verified chain (peers="
-                     << m_peers.size() << " raw="
+                     << peers << " raw="
                      << (m_chain ? m_chain->size() : 0) << ")";
         return uint256::ZERO;
     }
@@ -1593,8 +1629,8 @@ uint256 NodeImpl::best_share_hash()
             best_height = h;
         }
     }
-    static int raw_log = 0;
-    if (raw_log++ % 60 == 0)
+    static std::atomic<int> raw_log{0};
+    if (raw_log.fetch_add(1, std::memory_order_relaxed) % 60 == 0)
         LOG_INFO << "[best_share] using RAW head (genesis, no peers) height=" << best_height;
     return best;
 }
@@ -1616,6 +1652,13 @@ uint256 NodeImpl::advertised_best_share()
         return v;
 
     // Verified chain still empty — advertise our tallest RAW head instead.
+    // The raw chain is the tracker's too: read it like any reader (the
+    // compute thread holds the lock; elsewhere a shared try-lock). Busy:
+    // nothing to advertise yet; the re-advert timer and the next best-share
+    // change push the head once the lock is free.
+    std::shared_lock<std::shared_mutex> lock(m_tracker_mutex, std::defer_lock);
+    if (!is_compute_thread() && !lock.try_lock())
+        return uint256::ZERO;
     if (m_chain && m_chain->size() > 0) {
         uint256 best;
         int32_t best_height = -1;
