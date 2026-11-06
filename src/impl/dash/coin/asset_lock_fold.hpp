@@ -48,6 +48,7 @@
 #include <impl/dash/coin/vendor/assetlock.hpp>
 
 #include <core/log.hpp>
+#include <core/pack.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -172,6 +173,24 @@ template <typename Tx>
 inline bool check_asset_lock_tx(const Tx& tx)
 {
     return !asset_lock_refusal(tx, /*v24_active=*/false).has_value();
+}
+
+/// Dash Core v24 IsStandardSpecialTx (src/evo/specialtxman.cpp) for an asset
+/// lock: the reason a standard-relaying node refuses it, or nullopt. More than
+/// MAX_STANDARD_ASSET_LOCK_INPUTS (100) inputs or a serialization over 20480
+/// bytes exceeds what Platform's funding state transition can carry; a version
+/// 2 payload is not yet standard. Policy, not consensus: the template leaves
+/// such a lock out (good citizen), dashd's own miner would never see it.
+template <typename Tx>
+inline std::optional<std::string> asset_lock_standard_refusal(const Tx& tx)
+{
+    if (tx.type != vendor::CAssetLockPayload::SPECIALTX_TYPE) return std::nullopt;
+    if (tx.vin.size() > 100) return std::string("assetlocktx-too-many-inputs");
+    if (::pack(tx).get_span().size() > 20480) return std::string("assetlocktx-too-big");
+    vendor::CAssetLockPayload pl;
+    if (vendor::parse_assetlock_payload(tx.extra_payload, pl) && pl.nVersion >= 2)
+        return std::string("assetlocktx-version-2");
+    return std::nullopt;
 }
 
 /// Result of folding the pending type-8 locks a template would carry.

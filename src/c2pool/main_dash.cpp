@@ -3461,6 +3461,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // builder drops any special tx the SML fold cannot apply exactly and the
     // emit gate re-folds and rejects on root drift.
     node_coin_state.set_include_mn_special_txs(embedded_include_mn_special_txs);
+    // Dash Core v24 MIN_STANDARD_TX_SIZE (65 bytes, CVE-2017-12842 shape):
+    // never admitted, never mined. Policy; Core refuses these too.
+    node_coin_state.mempool().set_min_standard_tx_size(65);
     // B.9 (Dash Core v23.1.8 delta): the types 1-4 fold verifies the BLS
     // operator signature of every ProUpServTx / ProUpRevTx against the
     // pre-block operator key (dashd CheckProUpServTx / CheckProUpRevTx ->

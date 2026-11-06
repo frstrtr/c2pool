@@ -1054,3 +1054,77 @@ TEST(DashAssetLockCheck, MarkerAndValueRulesInCoreOrder)
     // Control: the same lock with a matching marker passes.
     EXPECT_EQ(dash::coin::asset_lock_refusal(lock_with(pl, 9'000)), std::nullopt);
 }
+
+// ─── S8: Dash Core v24 policy (MIN_STANDARD_TX_SIZE, asset-lock standardness) ─
+
+TEST(DashV24Policy, MinStandardTxSizeAtAdmissionAndSelection)
+{
+    using dash::coin::Mempool;
+    ::core::coin::UTXOViewCache utxo(nullptr);
+    Mempool pool;
+    pool.set_utxo(&utxo);
+    auto spend = [&](uint8_t tag, size_t script_len) {
+        uint256 prev;
+        prev.data()[0] = tag;
+        utxo.add_coin(::core::coin::Outpoint(prev, 0), ::core::coin::Coin(100'000, {}, 1, false));
+        dash::coin::MutableTransaction tx;
+        tx.version = 2;
+        bitcoin_family::coin::TxIn in;
+        in.prevout.hash = prev;
+        in.prevout.index = 0;
+        in.sequence = 0xffffffffu;
+        tx.vin.push_back(in);
+        TxOut o;
+        o.value = 90'000;
+        o.scriptPubKey.m_data.assign(script_len, 0x51);
+        tx.vout.push_back(o);
+        return tx;
+    };
+    // 4 + 1 + 41 + 1 + 8 + 1 + n + 4 = 60 + n bytes.
+    const auto t64 = spend(1, 4);
+    const auto t65 = spend(2, 5);
+    ASSERT_EQ(::pack(t64).get_span().size(), 64u);
+    ASSERT_EQ(::pack(t65).get_span().size(), 65u);
+    EXPECT_EQ(pool.min_standard_tx_size(), 0u) << "off by default (unit tests, legacy callers)";
+    // An entry admitted before the knob is armed never rides after it.
+    const auto early = spend(3, 1);
+    ASSERT_TRUE(pool.add_tx(early));
+    pool.set_min_standard_tx_size(65);
+    EXPECT_FALSE(pool.add_tx(t64)) << "tx-size-small";
+    EXPECT_TRUE(pool.add_tx(t65));
+    auto [sel, fees] = pool.get_sorted_txs_with_fees(1'000'000, false, 4, 0);
+    ASSERT_EQ(sel.size(), 1u);
+    EXPECT_EQ(dash::coin::dash_txid(sel[0].tx), dash::coin::dash_txid(t65));
+}
+
+TEST(DashV24Policy, AssetLockStandardness)
+{
+    using R = std::optional<std::string>;
+    dash::coin::vendor::CAssetLockPayload pl;
+    pl.nVersion = 1;
+    pl.creditOutputs.push_back(p2pkh_credit(9'000));
+    auto lock = lock_with(pl, 9'000);
+    EXPECT_EQ(dash::coin::asset_lock_standard_refusal(lock), std::nullopt);
+    auto many = lock;
+    for (int i = 0; i < 101; ++i) {
+        bitcoin_family::coin::TxIn in;
+        in.prevout.hash.data()[0] = static_cast<uint8_t>(i);
+        in.prevout.index = static_cast<uint32_t>(i);
+        many.vin.push_back(in);
+    }
+    EXPECT_EQ(dash::coin::asset_lock_standard_refusal(many), R("assetlocktx-too-many-inputs"));
+    auto big = lock;
+    for (int i = 0; i < 100; ++i) {
+        bitcoin_family::coin::TxIn in;
+        in.prevout.index = static_cast<uint32_t>(i);
+        in.scriptSig.m_data.assign(200, 0x01);
+        big.vin.push_back(in);
+    }
+    EXPECT_EQ(dash::coin::asset_lock_standard_refusal(big), R("assetlocktx-too-big"));
+    auto v2 = pl;
+    v2.nVersion = 2;
+    EXPECT_EQ(dash::coin::asset_lock_standard_refusal(lock_with(v2, 9'000)), R("assetlocktx-version-2"));
+    // Not an asset lock: not this rule's business.
+    EXPECT_EQ(dash::coin::asset_lock_standard_refusal(make_plain()), std::nullopt);
+}
+
