@@ -8205,6 +8205,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             node_coin_state.set_v24_state_fn(
                 [st = v24_status](uint32_t h) { return st->v24_state(h); });
             node_coin_state.set_v24_network(v24_net);
+            // Testnet min-difficulty rules (Dash Core DarkGravityWave with
+            // fPowAllowMinDifficultyBlocks): bits follow the template's time.
+            if (testnet)
+                node_coin_state.set_bits_at_time_fn(
+                    [hc = header_chain.get()](const uint256& prev, uint32_t t) -> std::optional<uint32_t> {
+                        const uint32_t b = hc->next_work_required_at(prev, t);
+                        if (b == 0) return std::nullopt;
+                        return b;
+                    });
             const auto scanned = ehf_tracker->scanned_to();
             std::cout << "[run] Dash Core v24 deployment tracking: EHF anchor h="
                       << ehf_tracker->anchor() << ", bodies scanned to "
