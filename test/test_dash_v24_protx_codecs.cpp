@@ -469,9 +469,17 @@ TEST(DashV24CbTx, FirstV4CoinbaseLayoutAndTheV3CodecRefusal)
     v4.insert(v4.end(), 32, 0x00);                 // merkleRootAssetUnlocks = null
     EXPECT_EQ(v4.size(), 207u) << "the captured payload size";
     EXPECT_TRUE(std::equal(prefix.begin(), prefix.end(), v4.begin()));
-    // B1: the v3 codec refuses it (32 trailing bytes) -- fail closed until S1.
+    // B1 is closed by S1's version-4 codec: the payload reads, the v3 fields
+    // are unchanged and the unlock root is the 32 appended bytes.
     v::CCbTx out;
-    EXPECT_FALSE(v::parse_cbtx(std::vector<unsigned char>(v4.begin(), v4.end()), out));
+    ASSERT_TRUE(v::parse_cbtx(std::vector<unsigned char>(v4.begin(), v4.end()), out));
+    EXPECT_EQ(out.nVersion, 4);
+    EXPECT_EQ(out.nHeight, 1'578'000);
+    EXPECT_EQ(out.creditPoolBalance, 37'642'249'077'902);
+    EXPECT_TRUE(out.merkleRootAssetUnlocks.IsNull());
+    EXPECT_EQ(pack_bytes(out), v4);
+    v4.push_back(0x00);
+    EXPECT_FALSE(v::parse_cbtx(std::vector<unsigned char>(v4.begin(), v4.end()), out)) << "trailing byte";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
