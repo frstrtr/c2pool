@@ -489,6 +489,12 @@ public:
         const std::vector<MutableTransaction>& candidates, const QuorumManager& qmgr)>;
     void set_asset_unlock_admit_fn(AssetUnlockAdmitFn fn) { m_asset_unlock_admit_fn = std::move(fn); }
 
+    /// Testnet (Dash Core fPowAllowMinDifficultyBlocks): bits for a block at a
+    /// given time on top of a given parent (HeaderChain::next_work_required_at).
+    /// Passed to the work source, which applies it at the template's curtime.
+    using BitsAtTimeFn = std::function<std::optional<uint32_t>(const uint256& prev_hash, uint32_t block_time)>;
+    void set_bits_at_time_fn(BitsAtTimeFn fn) { m_bits_at_time_fn = std::move(fn); }
+
     /// Heights the embedded arm declined because the scheduled payee is paid
     /// through a v24 payout list (cause mn-payee-v24-payout-list), and the
     /// last such height. Counted once per height (templates rebuild).
@@ -2195,6 +2201,7 @@ public:
         e.mnstates             = &m_mnstates;
         e.mempool              = &m_mempool;
         e.bits_for_next        = m_bits_for_next;
+        e.bits_at_time         = m_bits_at_time_fn;
         e.mtp_at_tip           = m_mtp_at_tip;
         e.address_version      = m_address_version;
         e.address_p2sh_version = m_address_p2sh_version;
@@ -2870,6 +2877,7 @@ private:
     V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => registry for m_v24_net)
     DashNetwork m_v24_net{DashNetwork::MAINNET};
     AssetUnlockAdmitFn m_asset_unlock_admit_fn;   // #143 credit-pool follower admission
+    BitsAtTimeFn m_bits_at_time_fn;               // testnet min-difficulty bits (unset on mainnet)
     mutable std::atomic<uint64_t> m_v24_payout_list_declines{0};
     mutable std::atomic<uint32_t> m_v24_payout_list_last_h{0};
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
