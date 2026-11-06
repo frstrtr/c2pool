@@ -186,6 +186,7 @@
 #include <utility>      // std::as_const (qc-plan lambda: read-only qmgr access)
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <map>
 #include <set>          // PoSe oracle consultation log (one line per tip x MN)
@@ -8165,6 +8166,18 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 },
                 ehf_tracker);
             v24_status->set_v24_activation_override(g_v24_activation_pin);
+            // The cross-check latch survives a restart (<net>/v24_latch.v1).
+            const std::string latch_path =
+                (core::filesystem::config_path() / net_subdir / "v24_latch.v1").string();
+            {
+                std::ifstream lf(latch_path);
+                std::stringstream ss;
+                if (lf) ss << lf.rdbuf();
+                if (lf && v24_status->deserialize_latch(ss.str())
+                    && v24_status->latch() != dash::coin::V24Latch::NONE)
+                    LOG_WARNING << "[DASH-V24] cross-check latch RESTORED from " << latch_path
+                                << ": " << ss.str();
+            }
             dash::coin::install_dash_deployment_status(v24_net, v24_status);
             // The embedded template is decided for the block it builds; an
             // UNKNOWN state refuses it (cause v24-state-unknown).
@@ -8189,7 +8202,8 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // fail closed on a contradiction (design §3.1 item 8; the version
             // word is read directly, no CbTx codec needed).
             ehf_ordered_sink =
-                [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane](
+                [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane, latch_path,
+                 latch_seen = std::make_shared<uint64_t>(v24_status->latch_version())](
                     const dash::interfaces::BlockConnected& bc) {
                     auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(bc.block));
                     const uint256 h = dash::crypto::hash_x11(packed.get_span());
@@ -8203,6 +8217,17 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         const auto& pl = bc.block.m_txs[0].extra_payload;
                         const uint16_t cbv = static_cast<uint16_t>(pl[0] | (pl[1] << 8));
                         st->cross_check_cbtx_version(bc.height, h, cbv);
+                        // Persist a latch change (set, escalate, clear).
+                        const uint64_t lv = st->latch_version();
+                        if (lv != *latch_seen) {
+                            const std::string tmp = latch_path + ".tmp";
+                            {
+                                std::ofstream lf(tmp, std::ios::trunc);
+                                lf << st->serialize_latch();
+                            }
+                            if (std::rename(tmp.c_str(), latch_path.c_str()) == 0) *latch_seen = lv;
+                            else LOG_WARNING << "[DASH-V24] could not persist " << latch_path;
+                        }
                     }
                     if (t->signals().size() != before)
                         LOG_INFO << "[DASH-V24] MNHF signal mined at h=" << bc.height

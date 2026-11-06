@@ -71,6 +71,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 
 namespace dash {
@@ -218,6 +219,7 @@ public:
                 std::lock_guard<std::mutex> lk(m_latch_mutex);
                 if (pin_refuted) m_pin_refuted = true;
                 if (level > m_latch) m_latch = level;
+                ++m_latch_version;
                 if (level != V24Latch::NONE) {
                     m_latch_height = height;
                     m_latch_chain_active = chain_active;
@@ -255,6 +257,47 @@ public:
     {
         std::lock_guard<std::mutex> lk(m_latch_mutex);
         return m_contradictions;
+    }
+
+    /// Bumped on every latch change (set, escalate, clear): the node persists
+    /// the latch when this moves (VERIFY-H0-S0-S1 N6).
+    uint64_t latch_version() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return m_latch_version;
+    }
+
+    /// The latch as a small text record (v24_latch.v1), and back. A restart
+    /// keeps a refuted state refuted instead of serving it again until the
+    /// next connected block re-latches it. Only for the same network.
+    std::string serialize_latch() const
+    {
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        return "v24_latch v1 " + std::to_string(static_cast<int>(m_params.network)) + " "
+             + std::to_string(static_cast<int>(m_latch)) + " " + std::to_string(m_latch_height) + " "
+             + (m_latch_chain_active ? "1" : "0") + " " + (m_pin_refuted ? "1" : "0") + " "
+             + std::to_string(m_pin.value_or(0)) + " " + std::to_string(m_contradictions) + "\n";
+    }
+    bool deserialize_latch(const std::string& text)
+    {
+        std::istringstream in(text);
+        std::string tag, ver;
+        int net = -1, level = -1, active = 0, pin = 0;
+        uint32_t h = 0, pin_height = 0;
+        uint64_t n = 0;
+        if (!(in >> tag >> ver >> net >> level >> h >> active >> pin >> pin_height >> n)) return false;
+        if (tag != "v24_latch" || ver != "v1" || net != static_cast<int>(m_params.network)) return false;
+        if (level < 0 || level > static_cast<int>(V24Latch::BOUND)) return false;
+        std::lock_guard<std::mutex> lk(m_latch_mutex);
+        m_latch = static_cast<V24Latch>(level);
+        m_latch_height = h;
+        m_latch_chain_active = active != 0;
+        // A refuted pin stays refuted only while it is the same pin: the node
+        // sets the pin before loading, and a changed pin is a new operator
+        // decision.
+        m_pin_refuted = pin != 0 && m_pin && *m_pin == pin_height;
+        m_contradictions = n;
+        return true;
     }
 
 private:
@@ -323,6 +366,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(m_latch_mutex);
             m_latch = V24Latch::NONE;
+            ++m_latch_version;
         }
         LOG_WARNING << "[DASH-V24] cross-check latch CLEARED at h=" << height
                     << ": the recomputed v24 state agrees with the chain at h=" << lh
@@ -523,6 +567,7 @@ private:
     uint32_t m_latch_height{0};
     bool     m_latch_chain_active{false};
     uint64_t m_contradictions{0};
+    uint64_t m_latch_version{0};
 };
 
 // ── Process-wide registry and the S2 hook ───────────────────────────────────
