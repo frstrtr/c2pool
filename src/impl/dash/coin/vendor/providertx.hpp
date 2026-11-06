@@ -70,6 +70,7 @@
 #include <core/opscript.hpp>
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -101,12 +102,51 @@ inline constexpr size_t BLS_PUBKEY_SIZE = 48;
 inline constexpr size_t BLS_SIG_SIZE    = 96;
 inline constexpr size_t NETADDR_SIZE    = 16;
 
+/// Does the 16-byte address of a legacy CService survive Dash Core's reading
+/// of it (CNetAddr::SetLegacyIPv6 + CNetAddr::IsValid, src/netaddress.cpp,
+/// identical in v23.1.7 and v24.0.0)? Core turns a service whose address is
+/// not valid into an EMPTY MnNetInfo (src/evo/netinfo.h MnNetInfo::Unserialize
+/// -> NetInfoEntry(CService) leaves the entry invalid), whatever its port:
+///   * IPv4-mapped (::ffff:a.b.c.d): invalid iff 0.0.0.0 or 255.255.255.255;
+///   * TORv2-in-IPv6 (fd87:d87e:eb43::/48): read as the null IPv6, invalid;
+///   * internal-in-IPv6 (fd6b:88c0:8724::/48): NET_INTERNAL, invalid;
+///   * IPv6: invalid iff all zero (::) or documentation (2001:db8::/32).
+inline bool legacy_service_address_valid(const std::array<uint8_t, NETADDR_SIZE>& ip)
+{
+    static constexpr std::array<uint8_t, 12> kIPv4{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    static constexpr std::array<uint8_t, 6>  kTorV2{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43};
+    static constexpr std::array<uint8_t, 6>  kInternal{0xfd, 0x6b, 0x88, 0xc0, 0x87, 0x24};
+    if (std::equal(kIPv4.begin(), kIPv4.end(), ip.begin())) {
+        const uint32_t a = (uint32_t(ip[12]) << 24) | (uint32_t(ip[13]) << 16)
+                         | (uint32_t(ip[14]) << 8) | uint32_t(ip[15]);
+        return a != 0x00000000u && a != 0xFFFFFFFFu;   // INADDR_ANY / INADDR_NONE
+    }
+    if (std::equal(kTorV2.begin(), kTorV2.end(), ip.begin())) return false;
+    if (std::equal(kInternal.begin(), kInternal.end(), ip.begin())) return false;
+    bool all_zero = true;
+    for (uint8_t b : ip) if (b != 0) { all_zero = false; break; }
+    if (all_zero) return false;                          // :: (unspecified)
+    if (ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8) return false;   // RFC 3849
+    return true;
+}
+
 // Legacy 18-byte CService inline-serializer. See landmine note in
 // simplifiedmns.hpp for the same pattern.
 struct LegacyNetService
 {
     std::array<uint8_t, NETADDR_SIZE> ip{};
     uint16_t                          port_be{0};
+
+    /// Core's MnNetInfo::IsEmpty() for this service (see
+    /// legacy_service_address_valid): the port plays no part.
+    bool IsEmpty() const { return !legacy_service_address_valid(ip); }
+
+    /// The service as Core holds and re-serializes it: an empty MnNetInfo is
+    /// written as CService{} -- 16 zero bytes and port 0 -- which is also what
+    /// the SML leaf of such a masternode hashes. Unchanged when not empty.
+    LegacyNetService canonical() const { return IsEmpty() ? LegacyNetService{} : *this; }
+
+    bool operator==(const LegacyNetService&) const = default;
 
     template <typename Stream>
     void Serialize(Stream& s) const

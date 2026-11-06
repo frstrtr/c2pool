@@ -1305,6 +1305,10 @@ MutableTransaction pro_up_serv_tx(const char* protx)
     p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
     p.nType     = dash::coin::vendor::MnType::REGULAR;
     p.proTxHash = uint256S(protx);
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;
@@ -1342,6 +1346,10 @@ MutableTransaction pro_reg_tx(const std::vector<unsigned char>& payout,
     p.nType    = dash::coin::vendor::MnType::REGULAR;
     p.collateralOutpoint.hash  = uint256{};
     p.collateralOutpoint.index = nonce;
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be          = 0x2334;
     p.scriptPayout.m_data      = payout;
 
@@ -4744,6 +4752,10 @@ MutableTransaction pro_up_serv_tx_for(const uint256& protx)
     p.nVersion  = dash::coin::vendor::ProTxVersion::BASIC_BLS;
     p.nType     = dash::coin::vendor::MnType::REGULAR;
     p.proTxHash = protx;
+    // A non-empty service (::ffff:1.2.3.4). In Dash Core [::]:9012 is EMPTY (the
+    // address is invalid, whatever the port): a ProRegTx with it registers
+    // banned and a ProUpServTx with it is an invalid tx.
+    p.netInfo.ip = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4};
     p.netInfo.port_be = 0x2334;
 
     MutableTransaction tx;

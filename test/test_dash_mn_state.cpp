@@ -715,6 +715,69 @@ TEST(DashMnState, NegativeVersionBeforeDip3IsOutsideTheRule) {
     EXPECT_EQ(m.last_applied_height(), 2400051u);
 }
 
+// The legacy services Dash Core reads as an EMPTY MnNetInfo although their
+// bytes are not all zero (CNetAddr::SetLegacyIPv6 + IsValid; confirmed with
+// dashd 24.0.0 decoderawtransaction: `addresses` is {} for each).
+static std::vector<std::pair<const char*, dash::coin::vendor::LegacyNetService>> core_empty_services()
+{
+    using L = dash::coin::vendor::LegacyNetService;
+    auto mk = [](std::array<uint8_t, 16> ip, uint16_t port) { L l; l.ip = ip; l.port_be = port; return l; };
+    std::array<uint8_t, 16> m4{};
+    m4[10] = 0xff; m4[11] = 0xff;
+    auto none = m4; none[12] = none[13] = none[14] = none[15] = 0xff;
+    std::array<uint8_t, 16> tor{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> internal{0xfd, 0x6b, 0x88, 0xc0, 0x87, 0x24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> doc{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return {{"::ffff:0.0.0.0:9999", mk(m4, 9999)},
+            {"::ffff:255.255.255.255:9999", mk(none, 9999)},
+            {"[::]:9999", mk({}, 9999)},
+            {"TORv2-in-IPv6", mk(tor, 9999)},
+            {"internal-in-IPv6", mk(internal, 9999)},
+            {"[2001:db8::1]:9999", mk(doc, 9999)}};
+}
+
+// P-1: Dash Core's empty-service rule in the payee projection. A registration
+// whose address is invalid (non-zero bytes included) starts BANNED with an
+// empty service, as in Core; a valid one is unchanged.
+TEST(DashMnState, InvalidNonZeroServiceRegistersBanned) {
+    for (const auto& [name, svc] : core_empty_services()) {
+        SCOPED_TRACE(name);
+        auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
+        reg.netInfo = svc;
+        auto regtx = special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg));
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xD7)}));
+        b.m_txs.push_back(regtx);
+        MnStateMachine m;
+        auto r = m.apply_block(b, 2400200);
+        ASSERT_EQ(r.registered, 1u);
+        const auto& e = m.entries().at(tx_hash(regtx));
+        EXPECT_FALSE(e.isValid);
+        EXPECT_EQ(e.nPoSeBanHeight, 2400200u);
+        EXPECT_EQ(e.netInfo, dash::coin::vendor::LegacyNetService{});
+    }
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400210);
+    EXPECT_TRUE(m.entries().at(h).isValid) << "a valid address registers valid, unchanged";
+    EXPECT_EQ(m.entries().at(h).nPoSeBanHeight, 0u);
+}
+
+// The predicate itself, against the forms Core reads.
+TEST(DashMnState, LegacyServiceAddressValidityMatchesCore) {
+    using dash::coin::vendor::legacy_service_address_valid;
+    for (const auto& [name, svc] : core_empty_services())
+        EXPECT_FALSE(legacy_service_address_valid(svc.ip)) << name;
+    std::array<uint8_t, 16> v4{};
+    v4[10] = 0xff; v4[11] = 0xff; v4[12] = 1; v4[13] = 2; v4[14] = 3; v4[15] = 4;
+    EXPECT_TRUE(legacy_service_address_valid(v4));
+    std::array<uint8_t, 16> v6{0x2a, 0x01, 0x04, 0xf8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    EXPECT_TRUE(legacy_service_address_valid(v6));
+    dash::coin::vendor::LegacyNetService port0;
+    port0.ip = v4;
+    port0.port_be = 0;
+    EXPECT_FALSE(port0.IsEmpty()) << "the port plays no part in Core's emptiness";
+}
+
 TEST(DashMnState, CollateralSpendRemovesMN) {
     auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);
     // external collateral (non-null hash) so we can spend it precisely.

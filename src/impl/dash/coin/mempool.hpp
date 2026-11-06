@@ -1407,11 +1407,9 @@ public:
         using bitcoin_family::coin::TxPrevOut;
         using Service = std::pair<std::array<uint8_t, vendor::NETADDR_SIZE>, uint16_t>;
         auto service_of = [](const vendor::LegacyNetService& n) -> std::optional<Service> {
-            if (n.port_be == 0) {
-                bool zero = true;
-                for (uint8_t b : n.ip) if (b != 0) { zero = false; break; }
-                if (zero) return std::nullopt;     // empty netInfo carries no entry
-            }
+            // Dash Core: an invalid service is an empty netInfo, which carries
+            // no entry (whatever its port), so it conflicts with nothing.
+            if (n.IsEmpty()) return std::nullopt;
             return Service{n.ip, n.port_be};
         };
         auto same_out = [](const TxPrevOut& a, const TxPrevOut& b) {

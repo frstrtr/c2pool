@@ -334,12 +334,9 @@ struct ReplayMNState
         return true;
     }
 
-    bool netinfo_empty() const
-    {
-        if (netInfo.port_be != 0) return false;
-        for (auto b : netInfo.ip) if (b != 0) return false;
-        return true;
-    }
+    /// Dash Core's MnNetInfo::IsEmpty(): an address that is not valid,
+    /// whatever its port (LegacyNetService::IsEmpty).
+    bool netinfo_empty() const { return netInfo.IsEmpty(); }
 
     /// dashd CDeterministicMN::to_sml_entry (deterministicmns.cpp:45-52):
     /// the DIP-4 entry whose CalcHash feeds the committed merkleRootMNList.
@@ -351,8 +348,9 @@ struct ReplayMNState
         e.nVersion         = nVersion;
         e.proRegTxHash     = proTxHash;
         e.confirmedHash    = confirmedHash;
-        e.netAddress       = netInfo.ip;
-        e.netPort          = netInfo.port_be;
+        // An empty MnNetInfo is hashed as CService{}: 16 zero bytes, port 0.
+        e.netAddress       = netInfo.canonical().ip;
+        e.netPort          = netInfo.canonical().port_be;
         // dashd serializes the SML leaf's operator key in the scheme the entry
         // nVersion dictates (legacy iff nVersion < BasicBLS). We store canonical
         // BASIC, so re-encode per nVersion here (opkey_for_leaf) — otherwise a
@@ -1657,7 +1655,7 @@ private:
         st.keyIDOwner        = p.keyIDOwner;
         st.pubKeyOperator    = op_basic;
         st.keyIDVoting       = p.keyIDVoting;
-        st.netInfo           = p.netInfo;
+        st.netInfo           = p.netInfo.canonical();   // Core holds an empty MnNetInfo
         st.scriptPayout      = p.scriptPayout;
         st.platformNodeID    = p.platformNodeID;
         st.platformP2PPort   = p.platformP2PPort;
@@ -1721,7 +1719,7 @@ private:
 
         // v24-only: nVersion update from the payload — DEAD on mainnet
         // (fold refuses when v24_active; branch kept for the record).
-        st.netInfo              = p.netInfo;
+        st.netInfo              = p.netInfo.canonical();
         st.scriptOperatorPayout = p.scriptOperatorPayout;
         if (p.nType == vendor::MnType::EVO) {
             st.platformNodeID   = p.platformNodeID;

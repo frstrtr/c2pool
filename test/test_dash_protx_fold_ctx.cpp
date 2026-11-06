@@ -292,6 +292,71 @@ TEST(DashSupersetSpecialTx, ProRegTxReusingLiveCollateralReplacesMnAndRefusesPen
               root_of({w.mns[1].leaf, leaf_of(reg, dash_txid(regtx))}));
 }
 
+// The legacy services Dash Core reads as an EMPTY MnNetInfo although their
+// bytes are not all zero (CNetAddr::SetLegacyIPv6 + IsValid; confirmed with
+// dashd 24.0.0 decoderawtransaction: `addresses` is {} for each).
+static std::vector<std::pair<const char*, dash::coin::vendor::LegacyNetService>> core_empty_services()
+{
+    using L = dash::coin::vendor::LegacyNetService;
+    auto mk = [](std::array<uint8_t, 16> ip, uint16_t port) { L l; l.ip = ip; l.port_be = port; return l; };
+    std::array<uint8_t, 16> m4{};
+    m4[10] = 0xff; m4[11] = 0xff;
+    auto none = m4; none[12] = none[13] = none[14] = none[15] = 0xff;
+    std::array<uint8_t, 16> tor{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> internal{0xfd, 0x6b, 0x88, 0xc0, 0x87, 0x24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> doc{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return {{"::ffff:0.0.0.0:9999", mk(m4, 9999)},
+            {"::ffff:255.255.255.255:9999", mk(none, 9999)},
+            {"[::]:9999", mk({}, 9999)},
+            {"TORv2-in-IPv6", mk(tor, 9999)},
+            {"internal-in-IPv6", mk(internal, 9999)},
+            {"[2001:db8::1]:9999", mk(doc, 9999)}};
+}
+
+// P-1: the template fold folds a registration with an invalid, non-zero
+// service the way Core does: banned (isValid=false), leaf service 16 zero
+// bytes and port 0, so the projected merkleRootMNList is Core's.
+TEST(DashSupersetSpecialTx, InvalidNonZeroServiceFoldsAsCoreEmpty)
+{
+    for (const auto& [name, svc] : core_empty_services()) {
+        SCOPED_TRACE(name);
+        World w({make_mn(1)});
+        const auto ctx = MnFoldContext::from(w.sm, {}, accept_all());
+        auto reg = proreg(2);
+        reg.netInfo = svc;
+        auto regtx = special(1, reg, 0x01);
+        const auto f = fold(w, {regtx}, ctx);
+        ASSERT_FALSE(refused(f, regtx)) << (f.refused_reasons.empty() ? "" : f.refused_reasons.front());
+        auto want = leaf_of(reg, dash_txid(regtx));
+        want.netAddress = {};
+        want.netPort = 0;
+        want.isValid = false;
+        EXPECT_EQ(f.sml.CalcMerkleRoot(), root_of({w.mns[0].leaf, want}));
+    }
+}
+
+// Core CProUpServTx::IsTriviallyValid: `if (netInfo->IsEmpty()) return
+// bad-protx-netinfo-empty` (providertx.cpp:177 v23.1.7 / :471 v24.0.0). A
+// ProUpServTx with ANY empty service is consensus-invalid, so the template
+// fold must REFUSE it (7 forms, [::]:0 included).
+TEST(DashSupersetSpecialTx, ProUpServTxWithEmptyServiceIsRefused)
+{
+    auto cases = core_empty_services();
+    cases.push_back({"[::]:0 (all zero)", dash::coin::vendor::LegacyNetService{}});
+    ASSERT_EQ(cases.size(), 7u);
+    for (const auto& [name, svc] : cases) {
+        SCOPED_TRACE(name);
+        World w({make_mn(1)});
+        const auto ctx = MnFoldContext::from(w.sm, {}, accept_all());
+        auto pl = proupserv(w.mns[0], 1);
+        pl.netInfo = svc;
+        auto tx = special(2, pl, 0x01);
+        const auto f = fold(w, {tx}, ctx);
+        EXPECT_TRUE(refused(f, tx)) << "dashd: bad-protx-netinfo-empty -- the block would be invalid";
+        EXPECT_EQ(f.applied, 0u);
+    }
+}
+
 // B4 (#7846): keyIDOwner and platformNodeID are one namespace.
 TEST(DashSupersetSpecialTx, OwnerKeyCollidingWithPlatformNodeIdIsRefused)
 {

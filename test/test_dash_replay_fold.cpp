@@ -901,6 +901,61 @@ TEST(DashReplayFoldSynthetic, RegisterFoldsPayloadAndAssignsInternalIds)
     EXPECT_EQ(eng.find(mn1)->collateralOutpoint.hash, p1.collateralOutpoint.hash);
 }
 
+// The legacy services Dash Core reads as an EMPTY MnNetInfo although their
+// bytes are not all zero (CNetAddr::SetLegacyIPv6 + IsValid; confirmed with
+// dashd 24.0.0 decoderawtransaction: `addresses` is {} for each).
+static std::vector<std::pair<const char*, dash::coin::vendor::LegacyNetService>> core_empty_services()
+{
+    using L = dash::coin::vendor::LegacyNetService;
+    auto mk = [](std::array<uint8_t, 16> ip, uint16_t port) { L l; l.ip = ip; l.port_be = port; return l; };
+    std::array<uint8_t, 16> m4{};
+    m4[10] = 0xff; m4[11] = 0xff;
+    auto none = m4; none[12] = none[13] = none[14] = none[15] = 0xff;
+    std::array<uint8_t, 16> tor{0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> internal{0xfd, 0x6b, 0x88, 0xc0, 0x87, 0x24, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    std::array<uint8_t, 16> doc{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return {{"::ffff:0.0.0.0:9999", mk(m4, 9999)},
+            {"::ffff:255.255.255.255:9999", mk(none, 9999)},
+            {"[::]:9999", mk({}, 9999)},
+            {"TORv2-in-IPv6", mk(tor, 9999)},
+            {"internal-in-IPv6", mk(internal, 9999)},
+            {"[2001:db8::1]:9999", mk(doc, 9999)}};
+}
+
+// P-1: Core hashes and bans a registration whose service address is invalid
+// exactly as an empty one. The fold must commit the same root (the old code
+// copied the raw bytes, kept the MN valid, and diverged).
+TEST(DashReplayFoldSynthetic, InvalidNonZeroServiceRegistersAsCoreEmpty)
+{
+    for (const auto& [name, svc] : core_empty_services()) {
+        SCOPED_TRACE(name);
+        ASSERT_TRUE(svc.IsEmpty());
+        DmlFoldEngine eng(synth_cfg());
+        eng.seed({}, 0, 100, raw256(9));
+        auto p = make_proreg(1);
+        p.netInfo = svc;
+        auto tx = make_special_tx(1, p, 1);
+        const uint256 mn = tx_hash_of(tx);
+        auto e = expected_entry_of(p, mn, /*valid=*/false);
+        e.netAddress = {};
+        e.netPort    = 0;
+        auto r = eng.fold_block(make_block(101, raw256(9), root_of({e}), {tx}), 101);
+        ASSERT_TRUE(r.ok) << r.error;
+        EXPECT_EQ(r.banned, 1u);
+        EXPECT_TRUE(eng.find(mn)->IsBanned());
+        EXPECT_EQ(eng.find(mn)->netInfo, dash::coin::vendor::LegacyNetService{});
+    }
+    // A valid address is untouched (byte-identical leaf, not banned).
+    DmlFoldEngine eng(synth_cfg());
+    eng.seed({}, 0, 100, raw256(9));
+    auto p = make_proreg(1);
+    auto tx = make_special_tx(1, p, 1);
+    ASSERT_FALSE(p.netInfo.IsEmpty());
+    auto r = eng.fold_block(make_block(101, raw256(9), root_of({expected_entry_of(p, tx_hash_of(tx))}), {tx}), 101);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.banned, 0u);
+}
+
 TEST(DashReplayFoldSynthetic, EmptyNetInfoRegistersBannedThenProUpServRevives)
 {
     DmlFoldEngine eng(synth_cfg());
