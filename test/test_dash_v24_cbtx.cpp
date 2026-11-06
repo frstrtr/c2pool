@@ -7,8 +7,12 @@
 
 #include <gtest/gtest.h>
 
+#include <impl/dash/coin/asset_unlock_verify.hpp>
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/block_producer.hpp>
 #include <impl/dash/coin/cbtx_asset_unlocks.hpp>
+#include <impl/dash/coin/dash_txid.hpp>
+#include <impl/dash/coin/vendor/assetlock.hpp>
 #include <impl/dash/coin/deployment_status.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
 #include <impl/dash/coin/node_coin_state.hpp>
@@ -16,6 +20,7 @@
 #include <impl/dash/coin/vendor/cbtx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
 
+#include <core/hash.hpp>
 #include <core/pack.hpp>
 #include <core/uint256.hpp>
 
@@ -428,3 +433,172 @@ TEST(DashV24CbTx, TestnetBlockWithV1UnlockCommitsANullRoot)
     EXPECT_EQ(dash::coin::tx_full_serialization_hash(blk.m_txs[0]), want);
 }
 
+
+// ═══ Stable txid (Dash Core v24 IsAssetUnlockWithStableTxid; S5) ═══════════
+// Cases from Dash Core v24.0.0 src/test/evo_assetlocks_tests.cpp (the
+// "txid of a version 2 payload is invariant" block and the DIP-0027 worked
+// examples).
+
+namespace {
+
+uint256 u256_one()
+{
+    uint256 x;
+    x.data()[0] = 1;
+    return x;
+}
+uint256 u256_two()
+{
+    uint256 x;
+    x.data()[0] = 2;
+    return x;
+}
+
+/// A type-9 asset unlock: one 1-DASH P2PKH output (pubkey hash 0x11 x 20, as
+/// DIP-0027's worked example) and the given payload.
+MutableTransaction stable_unlock(uint8_t version, uint64_t index, uint32_t fee,
+                                 uint32_t requested_height, const uint256& quorum_hash,
+                                 uint8_t sig_byte = 0)
+{
+    dash::coin::vendor::CAssetUnlockPayload pl;
+    pl.nVersion = version;
+    pl.index = index;
+    pl.fee = fee;
+    pl.requestedHeight = requested_height;
+    pl.quorumHash = quorum_hash;
+    pl.quorumSig.fill(sig_byte);
+    auto ps = ::pack(pl);
+    auto sp = ps.get_span();
+    MutableTransaction tx;
+    tx.version = 3;
+    tx.type = 9;
+    bitcoin_family::coin::TxOut o;
+    o.value = 100'000'000;
+    o.scriptPubKey.m_data = {0x76, 0xa9, 0x14};
+    o.scriptPubKey.m_data.resize(23, 0x11);
+    o.scriptPubKey.m_data.push_back(0x88);
+    o.scriptPubKey.m_data.push_back(0xac);
+    tx.vout.push_back(o);
+    tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                            reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+    return tx;
+}
+
+uint256 plain_sha256d(const MutableTransaction& tx)
+{
+    auto ps = ::pack(tx);
+    return ::Hash(ps.get_span());
+}
+
+} // namespace
+
+TEST(DashV24StableTxid, Version1TxidIsTheFullHash)
+{
+    const auto v1 = stable_unlock(1, 0x11, 2000, 500, u256_one());
+    ASSERT_EQ(v1.extra_payload.size(), dash::coin::kAssetUnlockPayloadSize);
+    EXPECT_FALSE(dash::coin::is_asset_unlock_with_stable_txid(v1));
+    EXPECT_EQ(dash::coin::dash_txid(v1), dash::coin::dash_instance_hash(v1));
+    EXPECT_EQ(dash::coin::dash_txid(v1), plain_sha256d(v1));
+    // Version 1 commits to the signature in the txid.
+    EXPECT_NE(dash::coin::dash_txid(stable_unlock(1, 0x11, 2000, 500, u256_one(), 0xab)),
+              dash::coin::dash_txid(v1));
+}
+
+TEST(DashV24StableTxid, Version2TxidIgnoresTheSigningInfoOnly)
+{
+    const auto v2 = stable_unlock(2, 0x11, 2000, 500, u256_one());
+    EXPECT_TRUE(dash::coin::is_asset_unlock_with_stable_txid(v2));
+    EXPECT_NE(dash::coin::dash_txid(v2), dash::coin::dash_instance_hash(v2));
+    EXPECT_EQ(dash::coin::dash_instance_hash(v2), plain_sha256d(v2));
+    // Re-signing changes requestedHeight and quorumHash, not the txid.
+    const auto resigned = stable_unlock(2, 0x11, 2000, 700, u256_two());
+    EXPECT_EQ(dash::coin::dash_txid(resigned), dash::coin::dash_txid(v2));
+    EXPECT_NE(dash::coin::dash_instance_hash(resigned), dash::coin::dash_instance_hash(v2));
+    // ...and so does a different quorumSig on its own.
+    const auto sig_a = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0xa1);
+    const auto sig_b = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0xb2);
+    EXPECT_EQ(dash::coin::dash_txid(sig_a), dash::coin::dash_txid(v2));
+    EXPECT_EQ(dash::coin::dash_txid(sig_b), dash::coin::dash_txid(v2));
+    EXPECT_NE(dash::coin::dash_instance_hash(sig_a), dash::coin::dash_instance_hash(v2));
+    EXPECT_NE(dash::coin::dash_instance_hash(sig_a), dash::coin::dash_instance_hash(sig_b));
+    // A different withdrawal (index or fee) has a different txid.
+    EXPECT_NE(dash::coin::dash_txid(stable_unlock(2, 0x12, 2000, 500, u256_one())), dash::coin::dash_txid(v2));
+    EXPECT_NE(dash::coin::dash_txid(stable_unlock(2, 0x11, 3000, 500, u256_one())), dash::coin::dash_txid(v2));
+    // The txid equals the full hash with the signing info zeroed.
+    EXPECT_EQ(plain_sha256d(stable_unlock(2, 0x11, 2000, 0, uint256())), dash::coin::dash_txid(v2));
+    // The same rule through the Transaction type (the template's txs).
+    EXPECT_EQ(dash::coin::dash_txid(MutableTransaction(dash::coin::Transaction(v2))),
+              dash::coin::dash_txid(v2));
+}
+
+TEST(DashV24StableTxid, OnlyA145BytePayloadIsStable)
+{
+    auto short_v2 = stable_unlock(2, 0x11, 2000, 500, u256_one());
+    short_v2.extra_payload.pop_back();
+    EXPECT_FALSE(dash::coin::is_asset_unlock_with_stable_txid(short_v2));
+    EXPECT_EQ(dash::coin::dash_txid(short_v2), plain_sha256d(short_v2));
+    auto not_special = stable_unlock(2, 0x11, 2000, 500, u256_one());
+    not_special.version = 2;
+    EXPECT_FALSE(dash::coin::is_asset_unlock_with_stable_txid(not_special));
+}
+
+// DIP-0027 dip-0027-txid-calc.py, as Dash Core v24 pins them.
+TEST(DashV24StableTxid, Dip0027WorkedExamples)
+{
+    EXPECT_EQ(dash::coin::dash_txid(stable_unlock(2, 101, 70000, 500, u256_one())).GetHex(),
+              "3c4db73c8356407a5d7c78df5045bd280f2dc4fd644b06c4bfbdead3d5ae41cf");
+    EXPECT_EQ(dash::coin::dash_txid(stable_unlock(2, 123456789, 70000, 500, u256_one())).GetHex(),
+              "a67e1107ae6e04b813bc8e81348266f5206d1ca93d305dc4323940e18cdbaf34");
+}
+
+// CheckAssetUnlockTx: the signed message is the FULL serialization with only
+// quorumSig zeroed, so it commits to requestedHeight and quorumHash (which the
+// version-2 txid excludes) and must never be the txid.
+TEST(DashV24StableTxid, SignedMessageCommitsToTheSigningInfo)
+{
+    namespace uv = dash::coin::unlockverify;
+    auto msg = [](const MutableTransaction& t) {
+        dash::coin::vendor::CAssetUnlockPayload pl;
+        EXPECT_TRUE(dash::coin::vendor::parse_assetunlock_payload(t.extra_payload, pl));
+        return uv::unlock_msg_hash(t, pl);
+    };
+    const auto v2 = stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x33);
+    EXPECT_EQ(msg(v2), plain_sha256d(stable_unlock(2, 0x11, 2000, 500, u256_one(), 0)));
+    EXPECT_NE(msg(v2), msg(stable_unlock(2, 0x11, 2000, 700, u256_two(), 0x33)));
+    EXPECT_NE(msg(v2), dash::coin::dash_txid(v2));
+    EXPECT_EQ(msg(stable_unlock(2, 0x11, 2000, 500, u256_one(), 0xa1)),
+              msg(stable_unlock(2, 0x11, 2000, 500, u256_one(), 0xb2)));
+}
+
+// The block merkle root commits the txid (BlockMerkleRoot: GetHash), so a
+// block with a version-2 unlock binds through the stable txid; the CbTx v4
+// root commits the instance hash.
+TEST(DashV24StableTxid, BlockBindingUsesTheStableTxid)
+{
+    dash::coin::BlockType b;
+    MutableTransaction cb;
+    cb.version = 3;
+    cb.type = 5;
+    b.m_txs.push_back(cb);
+    b.m_txs.push_back(stable_unlock(2, 0x11, 2000, 500, u256_one(), 0x44));
+    const uint256 id0 = dash::coin::dash_txid(b.m_txs[0]);
+    b.m_merkle_root = dash::coin::compute_merkle_root({id0, dash::coin::dash_txid(b.m_txs[1])});
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(b));
+    b.m_merkle_root = dash::coin::compute_merkle_root({id0, dash::coin::dash_instance_hash(b.m_txs[1])});
+    EXPECT_FALSE(dash::coin::block_body_binds_to_header(b));
+    // CbTx v4 root: the single leaf is the instance hash.
+    EXPECT_EQ(dash::coin::compute_merkle_root_asset_unlocks(b.m_txs),
+              dash::coin::dash_instance_hash(b.m_txs[1]));
+}
+
+TEST(DashV24StableTxid, RealTestnetBlock1578005StillBinds)
+{
+    const auto raw = v24_unhex(kTn1578005Block);
+    dash::coin::BlockType blk;
+    ::PackStream s(raw);
+    s >> blk;
+    ASSERT_TRUE(s.empty());
+    EXPECT_TRUE(dash::coin::block_body_binds_to_header(blk));
+    EXPECT_EQ(dash::coin::dash_txid(blk.m_txs[1]), dash::coin::dash_instance_hash(blk.m_txs[1]))
+        << "a version-1 unlock keeps its full-hash txid";
+}

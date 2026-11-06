@@ -64,8 +64,9 @@ using CBlock       = ::dash::coin::BlockType;
 //
 // Replaces the raw `CTxMemPool*` dashcore threads through
 // PartiallyDownloadedBlock. The provider returns a snapshot of
-// (txid, tx) pairs for the reassembler to try matching against the
-// compact block's short IDs. Dashcore iterates `pool->vTxHashes`
+// (instance hash, tx) pairs for the reassembler to try matching against the
+// compact block's short IDs (Dash Core v24 vTxHashes: GetInstanceHash, which
+// equals the txid for every tx but a version-2 asset unlock). Dashcore iterates `pool->vTxHashes`
 // directly under its mempool lock; we ask the caller for a vector so
 // the mempool-lock policy stays on their side.
 //

@@ -92,7 +92,8 @@ using dash::coin::kCpIdxNeverActive;
 using dash::coin::kCpLimitAmountHigh;
 using dash::coin::kCpLimitAmountLow;
 using dash::coin::kCpLimitAmountV22;
-using dash::coin::kCpLimitAmountV24;
+using dash::coin::cp_unlock_limit_v24;
+using dash::coin::cp_idx_v24_active_at;
 using dash::coin::kLlmq100_67;
 using dash::coin::vendor::CAssetLockPayload;
 using dash::coin::vendor::CAssetUnlockPayload;
@@ -182,9 +183,9 @@ static MutableTransaction make_lock_tx(int64_t amount) {
 static MutableTransaction make_unlock_tx(
     uint64_t index, uint32_t fee, int64_t vout_value,
     uint32_t requested_height, const uint256& quorum_hash,
-    const std::array<uint8_t, 96>& sig = {}) {
+    const std::array<uint8_t, 96>& sig = {}, uint8_t payload_version = 1) {
     CAssetUnlockPayload p;
-    p.nVersion = 1;
+    p.nVersion = payload_version;
     p.index = index;
     p.fee = fee;
     p.requestedHeight = requested_height;
@@ -391,12 +392,15 @@ TEST(DashCreditPoolIdx, UnlockRequestIdPreimageByteExact) {
 }
 
 TEST(DashCreditPoolIdx, EraLadderLimitArithmetic) {
-    // V24: max(0, min(pool, 4000 − lately))
-    EXPECT_EQ(*cp_idx_current_limit(10'000 * COIN_SAT, 500 * COIN_SAT, CpIdxEra::V24),
-              kCpLimitAmountV24 - 500 * COIN_SAT);
-    EXPECT_EQ(*cp_idx_current_limit(10'000 * COIN_SAT, 5000 * COIN_SAT, CpIdxEra::V24),
-              0);                                            // clamped, not negative
-    EXPECT_EQ(*cp_idx_current_limit(100 * COIN_SAT, 0, CpIdxEra::V24),
+    // V24 (Dash Core v24.0.0 UnlockLimitV24): the net rule on the balance at
+    // the window start; latelyUnlocked plays no part.
+    EXPECT_EQ(*cp_idx_current_limit(10'000 * COIN_SAT, 500 * COIN_SAT, CpIdxEra::V24,
+                                    10'000 * COIN_SAT),
+              2000 * COIN_SAT);                              // floor of 2000 DASH
+    EXPECT_EQ(*cp_idx_current_limit(12'000 * COIN_SAT, 5000 * COIN_SAT, CpIdxEra::V24,
+                                    15'000 * COIN_SAT),
+              0);                                            // drop taken: clamped, not negative
+    EXPECT_EQ(*cp_idx_current_limit(100 * COIN_SAT, 0, CpIdxEra::V24, 100 * COIN_SAT),
               100 * COIN_SAT);                               // pool-bound
     // V22: min(pool, 2000) — no lately subtraction in this arm (creditpool.cpp:197)
     EXPECT_EQ(*cp_idx_current_limit(10'000 * COIN_SAT, 1500 * COIN_SAT, CpIdxEra::V22),
@@ -422,6 +426,73 @@ TEST(DashCreditPoolIdx, EraLadderLimitArithmetic) {
     EXPECT_EQ(cp_idx_era_at(s, 500), CpIdxEra::V22);
     EXPECT_EQ(cp_idx_era_at(s, 900), CpIdxEra::V24);
 }
+
+// Dash Core v24.0.0 src/test/evo_assetlocks_tests.cpp credit_pool_unlock_limit_v24.
+TEST(DashCreditPoolIdx, UnlockLimitV24MatchesDashCoreVectors) {
+    constexpr int64_t COIN = COIN_SAT;
+    constexpr int64_t MAX_MONEY = 21'000'000 * COIN;
+    const auto limit = [](int64_t b, int64_t s) { return cp_unlock_limit_v24(b, s); };
+    EXPECT_EQ(limit(15000 * COIN, 15000 * COIN), 3000 * COIN);
+    EXPECT_EQ(limit(5000 * COIN, 5000 * COIN), 2000 * COIN);
+    EXPECT_EQ(limit(40000 * COIN, 40000 * COIN), 8000 * COIN);
+    // The drop already taken inside the window comes out of the allowance
+    EXPECT_EQ(limit(14000 * COIN, 15000 * COIN), 2000 * COIN);
+    EXPECT_EQ(limit(12000 * COIN + 1, 15000 * COIN), 1);
+    EXPECT_EQ(limit(12000 * COIN, 15000 * COIN), 0);
+    EXPECT_EQ(limit(11000 * COIN, 15000 * COIN), 0);
+    // The floor covers small pools entirely
+    EXPECT_EQ(limit(100 * COIN, 100 * COIN), 100 * COIN);
+    // Growth inside the window is withdrawable on top of the allowed drop
+    EXPECT_EQ(limit(16000 * COIN, 15000 * COIN), 4000 * COIN);
+    EXPECT_EQ(limit(45000 * COIN, 40000 * COIN), 13000 * COIN);
+    // Never more than the pool holds
+    EXPECT_EQ(limit(500 * COIN, 500 * COIN), 500 * COIN);
+    EXPECT_EQ(limit(0, 5000 * COIN), 0);
+    // No balance at the window start
+    EXPECT_EQ(limit(123 * COIN, 0), 123 * COIN);
+    EXPECT_EQ(limit(0, 0), 0);
+    // Integer truncation only ever rounds the allowance down
+    EXPECT_EQ(limit(10000 * COIN + 4, 10000 * COIN + 4), 2000 * COIN);
+    EXPECT_EQ(limit(10000 * COIN + 5, 10000 * COIN + 5), 2000 * COIN + 1);
+    EXPECT_EQ(limit(MAX_MONEY, MAX_MONEY), MAX_MONEY * 20 / 100);
+    // The era ladder passes the window-start balance through unchanged.
+    EXPECT_EQ(*cp_idx_current_limit(45000 * COIN, 7 * COIN, CpIdxEra::V24, 40000 * COIN),
+              13000 * COIN);
+    // ...and the v24 rule can be STRICTER than the v22 cap: treating an
+    // active era as v22 would admit what Dash Core v24 rejects.
+    EXPECT_LT(*cp_idx_current_limit(12000 * COIN, 0, CpIdxEra::V24, 15000 * COIN),
+              *cp_idx_current_limit(12000 * COIN, 0, CpIdxEra::V22));
+}
+
+// With no explicit height the era comes from the deployment status for the
+// schedule's network; without one installed, mainnet is v24-INACTIVE only
+// below the earliest possible activation (2,580,480) and UNKNOWN from it on,
+// and an unknown era refuses every unlock (exclude-all).
+TEST(DashCreditPoolIdx, V24EraUnknownFailsClosed) {
+    CpIdxDeploySchedule s{100, 0, kCpIdxNeverActive, 576};
+    EXPECT_EQ(cp_idx_era_at(s, 2'580'479), CpIdxEra::V22);
+    EXPECT_FALSE(cp_idx_era_at(s, 2'580'480).has_value());
+    EXPECT_EQ(cp_idx_v24_active_at(s, 2'580'479), std::optional<bool>(false));
+    EXPECT_FALSE(cp_idx_v24_active_at(s, 2'580'480).has_value());
+    // Testnet: the buried height decides.
+    CpIdxDeploySchedule t{100, 0, kCpIdxNeverActive, 576, dash::coin::DashNetwork::TESTNET};
+    EXPECT_EQ(cp_idx_era_at(t, 1'577'999), CpIdxEra::V22);
+    EXPECT_EQ(cp_idx_era_at(t, 1'578'000), CpIdxEra::V24);
+
+    // A follower past the earliest activation with no status: exclude-all.
+    const uint32_t HH = 2'600'000;
+    const uint256 tip_hash = raw256(0x5C);
+    CreditPoolIdxFollower f(CpIdxDeploySchedule{HH - 6, 0u, kCpIdxNeverActive, 576u});
+    fold_synthetic_chain(f, HH - 6, HH - 1, tip_hash);
+    ASSERT_TRUE(f.proven_complete());
+    AssetUnlockAdmission adm;
+    EXPECT_FALSE(f.try_admit_unlocks(true, HH, tip_hash, {}, {}, kLlmq100_67, adm));
+    EXPECT_TRUE(adm.empty());
+    // An explicit activation height decides it.
+    f.set_v24_height(HH - 1000);
+    EXPECT_TRUE(f.try_admit_unlocks(true, HH, tip_hash, {}, {}, kLlmq100_67, adm));
+}
+
 
 // ════════════════════════════════════════════════════════════════════════
 // Follower fold: cross-check, dedup hard-fail, window slide.
@@ -842,6 +913,52 @@ TEST(DashCreditPoolIdx, Kat4b_LimitBindsEvenWithValidSig) {
                                     {too_big.quorum}, kLlmq100_67, adm));
     EXPECT_TRUE(adm.empty());
 }
+
+// Dash Core v24 bad-assetunlocktx-version-2: a version-2 unlock (stable txid)
+// rides only when DEPLOYMENT_V24 is active for the block being built.
+TEST(DashCreditPoolIdx, V2UnlockNeedsV24ForTheBlock) {
+    GbtFixture gbt;
+    CreditPoolIdxFollower f(test_schedule(H - 6));
+    fold_synthetic_chain(f, H - 6, H - 1, gbt.prev_hash);
+    ASSERT_TRUE(f.proven_complete());
+    ASSERT_TRUE(vendor_backend_sanity());
+
+    // A really signed version-2 unlock: same construction, payload version 2
+    // (msgHash = the full serialization with the signature zeroed).
+    auto su = make_signed_unlock(21, 200, 2 * COIN_SAT, H - 2);
+    {
+        bls::BasicSchemeMPL scheme;
+        std::vector<uint8_t> seed(32, 0x5A);
+        bls::PrivateKey sk = scheme.KeyGen(seed);
+        auto tx2 = make_unlock_tx(21, 200, 2 * COIN_SAT, H - 2, su.quorum.quorum_hash, {}, 2);
+        CAssetUnlockPayload pl;
+        ASSERT_TRUE(dash::coin::vendor::parse_assetunlock_payload(tx2.extra_payload, pl));
+        const uint256 sign_hash = dash::coin::chainlock::build_sign_hash(
+            kLlmq100_67.type, su.quorum.quorum_hash, unlockverify::unlock_request_id(21),
+            unlockverify::unlock_msg_hash(tx2, pl));
+        bls::G2Element sig = scheme.Sign(sk, bls::Bytes(sign_hash.data(), 32));
+        auto sigraw = sig.Serialize(false);
+        std::array<uint8_t, 96> sigarr{};
+        std::memcpy(sigarr.data(), sigraw.data(), 96);
+        su.tx = make_unlock_tx(21, 200, 2 * COIN_SAT, H - 2, su.quorum.quorum_hash, sigarr, 2);
+    }
+    // v24 not active for H (mainnet, no status, below 2,580,480): refused.
+    AssetUnlockAdmission before;
+    EXPECT_TRUE(f.try_admit_unlocks(true, H, gbt.prev_hash, {su.tx}, {su.quorum}, kLlmq100_67, before));
+    EXPECT_TRUE(before.empty()) << "bad-assetunlocktx-version-2";
+    // v24 active from H: admitted (the pool at H-1 is still on the v22 rule).
+    f.set_v24_height(H);
+    AssetUnlockAdmission after;
+    EXPECT_TRUE(f.try_admit_unlocks(true, H, gbt.prev_hash, {su.tx}, {su.quorum}, kLlmq100_67, after));
+    ASSERT_EQ(after.txs.size(), 1u);
+    EXPECT_EQ(after.gross_unlocked, su.gross);
+    // Version 3 is never valid.
+    auto v3 = su.tx;
+    v3.extra_payload[0] = 3;
+    AssetUnlockAdmission bad;
+    EXPECT_TRUE(f.try_admit_unlocks(true, H, gbt.prev_hash, {v3}, {su.quorum}, kLlmq100_67, bad));
+    EXPECT_TRUE(bad.empty());
+}
 #endif  // C2POOL_DASH_BLS
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1018,6 +1135,51 @@ TEST(DashCreditPoolIdxDb, FailClosedWipesTheNamespace) {
         CreditPoolIdxFollower g(test_schedule(1000));
         g.attach_db(&db);
         EXPECT_FALSE(g.try_restore()) << "wiped namespace must not restore";
+        db.close();
+    }
+    std::filesystem::remove_all(path);
+}
+
+// The window rows carry the pool balance (schema 2), so the balance at the
+// window start survives a restart.
+TEST(DashCreditPoolIdxDb, WindowRowsCarryTheBalanceAcrossRestore) {
+    CpIdxWindowRowRec r;
+    r.gross_unlocked = 7;
+    r.n_type9 = 1;
+    r.balance = 0x0102030405060708LL;
+    const auto enc = CreditPoolIdxDb::encode_row(r);
+    ASSERT_EQ(enc.size(), 20u);
+    EXPECT_EQ(enc[12], 0x08);
+    EXPECT_EQ(enc[19], 0x01);
+
+    const std::string path = temp_db_path("balance");
+    CpIdxDeploySchedule s{1000, 0, kCpIdxNeverActive, 3};
+    {
+        CreditPoolIdxDb db(path);
+        ASSERT_TRUE(db.open());
+        CreditPoolIdxFollower f(s);
+        f.set_reward_fn([](uint32_t) { return 0; });
+        f.attach_db(&db);
+        f.arm(chain_hash(1000), 0);
+        int64_t bal = 1000 * COIN_SAT;
+        ASSERT_TRUE(f.apply_block(1001, chain_hash(1001),
+            make_block(chain_hash(1000), {make_cbtx_coinbase(1001, bal), make_lock_tx(bal)})));
+        for (uint32_t h = 1002; h <= 1004; ++h)
+            ASSERT_TRUE(f.apply_block(h, chain_hash(h),
+                make_block(chain_hash(h - 1), {make_cbtx_coinbase(h, bal)})));
+        EXPECT_EQ(f.balance_at_window_start(), std::optional<int64_t>(bal)) << "row 1001";
+        db.close();
+    }
+    {
+        CreditPoolIdxDb db(path);
+        ASSERT_TRUE(db.open());
+        CreditPoolIdxFollower f(s);
+        f.set_reward_fn([](uint32_t) { return 0; });
+        f.attach_db(&db);
+        ASSERT_TRUE(f.try_restore());
+        EXPECT_EQ(f.height(), 1004u);
+        EXPECT_EQ(f.balance_at_window_start(), std::optional<int64_t>(1000 * COIN_SAT))
+            << "the window-start row is restored with its balance";
         db.close();
     }
     std::filesystem::remove_all(path);

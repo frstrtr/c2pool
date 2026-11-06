@@ -112,7 +112,11 @@ inline uint256 unlock_msg_hash(const MutableTransaction& tx,
     copy.extra_payload.assign(
         reinterpret_cast<const unsigned char*>(sp.data()),
         reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
-    return dash_txid(copy);
+    // Dash Core v24 CheckAssetUnlockTx: ::SerializeHash(tx_copy), the FULL
+    // serialization. The signed message commits to requestedHeight and
+    // quorumHash even though the version-2 txid excludes them, so this is
+    // never the (stable) txid.
+    return dash_instance_hash(copy);
 }
 
 /// The platform-quorum LLMQ params for a network (chainparams llmqTypePlatform:
