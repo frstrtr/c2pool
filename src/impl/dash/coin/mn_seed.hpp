@@ -69,6 +69,7 @@
 
 #include <impl/dash/coin/mn_state_db.hpp>        // MNState
 #include <impl/dash/coin/vendor/providertx.hpp>  // MnType / ProTxVersion / BLS_PUBKEY_SIZE
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // opkey_canonical_from_own_scheme (P-3)
 
 #include <core/address_utils.hpp>  // base58check_to_hash160 / is_address_for_chain / hash160_to_merged_script
 #include <core/log.hpp>
@@ -351,6 +352,20 @@ inline std::vector<std::pair<uint256, MNState>> parse_protx_list_seed(
             ::core::base58check_to_hash160(s.value("votingAddress", "")));
         mn.pubKeyOperator =
             detail::parse_bls_pubkey_hex(s.value("pubKeyOperator", ""));
+        // dashd prints the key in the entry's own scheme (LEGACY for v1);
+        // the store holds canonical BASIC (P-3). Strict: a v1 key that is
+        // not a canonical legacy encoding aborts the seed.
+        if (const auto canon = vendor::opkey_canonical_from_own_scheme(
+                mn.pubKeyOperator, mn.nVersion)) {
+            mn.pubKeyOperator = *canon;
+        } else {
+            ++st.malformed;
+            LOG_WARNING << "[MN-SEED] proTx " << proTxHash.GetHex().substr(0, 16)
+                        << " (v" << mn.nVersion << "): pubKeyOperator is not a canonical"
+                           " legacy BLS key -- seed aborted";
+            if (stats) *stats = st;
+            return {};
+        }
 
         out.emplace_back(proTxHash, std::move(mn));
         ++st.seeded;

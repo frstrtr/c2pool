@@ -556,6 +556,22 @@ public:
     // and by Phase C-PAY step 5 (`[PAY]` log-only verification). At
     // ~3000 active MNs and a typical 10-output coinbase that's ~30k
     // memcmp comparisons per block (microseconds). Acceptable.
+    /// Does `st` hold the operator key whose canonical BASIC bytes are
+    /// `point_basic`? Core compares the deserialized points
+    /// (CBLSLazyPublicKey). The store holds every key as canonical basic
+    /// bytes -- keys this projection writes (opkey_to_basic) and every seed
+    /// source, converted at ingest (vendor::opkey_canonical_from_own_scheme;
+    /// MnStateDb format 3 clears the older mixed stores) -- so equal bytes
+    /// ARE an equal point. No reinterpretation of the stored bytes: legacy
+    /// and basic forms overlap (L(P) can equal B(-P)), so any byte rule
+    /// accepting both would read a rotation to the negated key as unchanged.
+    static bool stored_opkey_is_point(
+        const MNState& st,
+        const std::array<uint8_t, vendor::BLS_PUBKEY_SIZE>& point_basic)
+    {
+        return st.pubKeyOperator == point_basic;
+    }
+
     std::optional<uint256> find_by_payout_script(
         const std::vector<unsigned char>& script) const
     {
@@ -1561,8 +1577,14 @@ public:
                 // scheme-faithful equivalent (canonical serialization is injective).
                 const auto incoming_opkey_basic = vendor::opkey_to_basic(
                     ptx.pubKeyOperator, ptx.nVersion < vendor::ProTxVersion::BASIC_BLS);
-                bool key_changed = (it->second.pubKeyOperator
-                                  != incoming_opkey_basic);
+                // Seeded masternodes used to carry their key as dashd prints
+                // it (LEGACY bytes for a v1 state), so this compare turned an
+                // unchanged key into an operator change: reset, ban and a
+                // cleared operator payout Core never applies (a wrong payee /
+                // operator split, an invalid block). Every ingest now stores
+                // canonical basic bytes; compare those (stored_opkey_is_point).
+                const bool key_changed =
+                    !stored_opkey_is_point(it->second, incoming_opkey_basic);
                 it->second.pubKeyOperator   = incoming_opkey_basic;
                 it->second.keyIDVoting      = ptx.keyIDVoting;
                 it->second.scriptPayout.m_data = ptx.scriptPayout.m_data;

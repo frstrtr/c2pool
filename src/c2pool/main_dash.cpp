@@ -6453,12 +6453,15 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                                 dash::coin::gov_mn_by_collateral(
                                     ncs->mnstates(), op);
                             if (!mn) return false;           // MN not in DMN list
-                            const bool legacy =
-                                (mn->nVersion ==
-                                 dash::coin::vendor::ProTxVersion::LEGACY_BLS);
+                            // The projection store holds every operator key
+                            // as canonical BASIC bytes (P-3): decode them as
+                            // basic, with no scheme fallback -- read as
+                            // legacy they can decode to -P and accept a vote
+                            // signed with -sk that dashd rejects.
                             return dash::coin::vendor::verify_govvote_operator_sig(
-                                mn->pubKeyOperator, legacy,
-                                v.vote_hash, v.vch_sig);
+                                mn->pubKeyOperator, /*key_legacy_scheme=*/false,
+                                v.vote_hash, v.vch_sig,
+                                /*pubkey_scheme_fallback=*/false);
                         });
 
                     // Vote-weight + membership-at-tally — dashcore

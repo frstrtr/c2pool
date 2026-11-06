@@ -33,6 +33,12 @@
 #include <gtest/gtest.h>
 
 #include <impl/dash/coin/mn_state_machine.hpp>
+#include <impl/dash/coin/mn_seed.hpp>
+#include <impl/dash/coin/mn_checkpoint.hpp>
+#include <nlohmann/json.hpp>
+#ifdef C2POOL_DASH_BLS
+#include <dashbls/bls.hpp>
+#endif
 #include <impl/dash/coin/mn_state_db.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
 #include <impl/dash/coin/vendor/simplifiedmns.hpp>
@@ -777,6 +783,225 @@ TEST(DashMnState, LegacyServiceAddressValidityMatchesCore) {
     port0.port_be = 0;
     EXPECT_FALSE(port0.IsEmpty()) << "the port plays no part in Core's emptiness";
 }
+
+// ── P-3: operator keys are canonical BASIC at every ingest ──────────────────
+// dashd prints a v1 key in the LEGACY scheme (protx list JSON, the checkpoint
+// rows). A projection that stored those bytes saw a ProUpRegTx carrying the
+// SAME point as an operator change (reset, ban, cleared operator payout --
+// Core changes nothing). A byte rule accepting both forms is no fix: legacy
+// and basic encodings overlap, so a rotation to the NEGATED key -P reads as
+// "unchanged" for half of all keys (Core: changed, reset, ban). The fix:
+// every ingest converts to canonical basic; the compare is on those bytes.
+// Keys: secret {8, 0, ..., 0} in both encodings, and secret 1.
+namespace p3 {
+using Key = std::array<uint8_t, 48>;
+using OptKey = std::optional<Key>;
+std::array<uint8_t, 48> kh48(const char* h)
+{
+    std::array<uint8_t, 48> a{};
+    for (size_t i = 0; i < 48; ++i) a[i] = static_cast<uint8_t>(std::stoul(std::string(h + 2 * i, 2), nullptr, 16));
+    return a;
+}
+const char* K8L = "16f73d53f6a4f1239713e45716f347dba9566937430c21b849f5e1fa028e5d0bad2bd7b65719356ece764dad57fdabe4";
+const char* K8B = "96f73d53f6a4f1239713e45716f347dba9566937430c21b849f5e1fa028e5d0bad2bd7b65719356ece764dad57fdabe4";
+const char* K1B = "a1fc56c400756e2f053ea015d7a61606f668a10f5ee0808f86df9443778021b802174b1d9cdb0cde3c3a4fe5803d02b5";
+
+MNState v1_mn(const std::array<uint8_t, 48>& stored_key)
+{
+    MNState st;
+    st.nVersion = ProTxVersion::LEGACY_BLS;
+    st.nType = MnType::REGULAR;
+    st.collateralOutpoint.hash = raw256(0x41);
+    st.collateralOutpoint.index = 1;
+    st.keyIDOwner = raw160(0x21);
+    st.keyIDVoting = raw160(0x51);
+    st.pubKeyOperator = stored_key;
+    st.nOperatorReward = 500;
+    st.scriptPayout.m_data = script_bytes(0x61);
+    st.scriptOperatorPayout.m_data = script_bytes(0x62);
+    st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    st.netInfo.ip = seq_array<16>(0x11);
+    st.netInfo.ip[10] = 0xff; st.netInfo.ip[11] = 0xff;
+    st.netInfo.port_be = 9999;
+    st.nRegisteredHeight = 2000000;
+    st.isValid = true;
+    return st;
+}
+
+// The store a dashd `protx list` row seeds for a v1 masternode whose key
+// dashd prints as `printed` (the seed path, mn_seed.hpp).
+std::optional<std::array<uint8_t, 48>> seeded_key(const std::string& printed)
+{
+    const std::string row =
+        "[{\"type\":\"Regular\",\"proTxHash\":\"" + std::string(64, 'a') + "\","
+        "\"collateralHash\":\"" + std::string(64, 'b') + "\",\"collateralIndex\":1,"
+        "\"operatorReward\":0,\"state\":{\"version\":1,\"service\":\"1.2.3.4:9999\","
+        "\"registeredHeight\":100,\"lastPaidHeight\":0,\"consecutivePayments\":0,\"PoSePenalty\":0,"
+        "\"PoSeRevivedHeight\":-1,\"PoSeBanHeight\":-1,\"revocationReason\":0,"
+        "\"ownerAddress\":\"yQxgY6sdiHRWmi8STNftizktwqy4zhndfS\","
+        "\"votingAddress\":\"yQxgY6sdiHRWmi8STNftizktwqy4zhndfS\","
+        "\"payoutAddress\":\"yVXDAM73Tg6A44Bm3qduXsMCYxzuqBCT48\","
+        "\"pubKeyOperator\":\"" + printed + "\"}}]";
+    const auto seed = dash::coin::parse_protx_list_seed(nlohmann::json::parse(row), 140, 19);
+    if (seed.size() != 1) return std::nullopt;
+    return seed[0].second.pubKeyOperator;
+}
+
+// Applies a ProUpRegTx (payload version, key) to a one-MN set whose store
+// holds `stored` (canonical basic, as every ingest now writes it).
+MNState apply_upreg(const std::array<uint8_t, 48>& stored, uint16_t payload_version,
+                    const std::array<uint8_t, 48>& payload_key)
+{
+    MnStateMachine m;
+    const uint256 pro = raw256(0x31);
+    m.load({{pro, v1_mn(stored)}}, 2400110);
+    CProUpRegTx ur;
+    ur.nVersion = payload_version;
+    ur.proTxHash = pro;
+    ur.pubKeyOperator = payload_key;
+    ur.keyIDVoting = raw160(0x51);
+    ur.scriptPayout.m_data = script_bytes(0x63);
+    BlockType b;
+    b.m_txs.push_back(coinbase_tx({script_bytes(0xC9)}));
+    b.m_txs.push_back(special_tx(CProUpRegTx::SPECIALTX_TYPE, protx_payload(ur)));
+    m.apply_block(b, 2400111);
+    return m.entries().at(pro);
+}
+
+void expect_unchanged(const MNState& e)
+{
+    EXPECT_EQ(e.nPoSeBanHeight, 0u) << "Core: same point, not an operator change -> no ban";
+    EXPECT_TRUE(e.isValid);
+    EXPECT_EQ(e.scriptOperatorPayout.m_data, script_bytes(0x62)) << "Core keeps the operator payout";
+    EXPECT_EQ(e.netInfo, v1_mn(kh48(K8B)).netInfo) << "Core keeps the service";
+    EXPECT_EQ(e.scriptPayout.m_data, script_bytes(0x63));
+}
+
+void expect_changed(const MNState& e)
+{
+    EXPECT_EQ(e.nPoSeBanHeight, 2400111u);
+    EXPECT_FALSE(e.isValid);
+    EXPECT_TRUE(e.scriptOperatorPayout.m_data.empty());
+    EXPECT_EQ(e.netInfo, dash::coin::vendor::LegacyNetService{});
+}
+} // namespace p3
+
+// Same point in a v2 payload (basic bytes) against the canonical store.
+TEST(DashMnState, SameOperatorPointV2PayloadIsNoOperatorChange) {
+    p3::expect_unchanged(p3::apply_upreg(p3::kh48(p3::K8B), ProTxVersion::BASIC_BLS, p3::kh48(p3::K8B)));
+}
+
+// Control: a different point IS an operator change: reset and ban.
+TEST(DashMnState, DifferentOperatorKeyStillResetsAndBans) {
+    p3::expect_changed(p3::apply_upreg(p3::kh48(p3::K8B), ProTxVersion::BASIC_BLS, p3::kh48(p3::K1B)));
+}
+
+#ifdef C2POOL_DASH_BLS
+// The seed path stores a v1 row's LEGACY key as canonical BASIC bytes, keeps
+// a null key null, and refuses (aborts the seed on) a v1 key that is not a
+// canonical legacy encoding -- no fallback.
+TEST(DashMnState, SeedStoresAV1OperatorKeyAsCanonicalBasic) {
+    EXPECT_EQ(p3::seeded_key(p3::K8L), p3::OptKey{p3::kh48(p3::K8B)});
+    EXPECT_EQ(p3::seeded_key(std::string(96, '0')), p3::OptKey{p3::Key{}});
+    EXPECT_EQ(p3::seeded_key(std::string(96, 'f')), std::nullopt) << "not a point: seed aborted";
+}
+
+// The ingest helpers the seed and the checkpoint parser share: a v1 key in
+// dashd's (legacy) form -> the canonical basic store, null stays null, v2+
+// keys pass through, a v1 key that is not canonical legacy is refused; and
+// the canonical-basic check self-derived checkpoints and the cursor use.
+TEST(DashMnState, OperatorKeyIngestCanonicalization) {
+    namespace vv = dash::coin::vendor;
+    const auto L = p3::kh48(p3::K8L), B = p3::kh48(p3::K8B);
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(L, 1), p3::OptKey{B});
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(B, 2), p3::OptKey{B});
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(p3::Key{}, 1),
+              p3::OptKey{p3::Key{}});
+    std::array<uint8_t, 48> junk;
+    junk.fill(0xff);
+    EXPECT_EQ(vv::opkey_canonical_from_own_scheme(junk, 1), std::nullopt);
+    EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(B));
+    EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(p3::Key{}));
+    EXPECT_FALSE(vv::opkey_is_canonical_basic_or_null(junk));
+}
+
+// Checkpoints: the key encoding follows the producer named by the `source`
+// line. The compiled mainnet anchor is self-derived (c2pool's dumper): its
+// keys are canonical basic and are kept. The testnet fixture is dashd-
+// derived (gen_mn_checkpoint.py): its v1 keys are legacy and are converted.
+// Either way the store ends up canonical basic.
+TEST(DashMnState, CheckpointKeysEndCanonicalBasicWhateverTheProducer) {
+    namespace vv = dash::coin::vendor;
+    static const char* const kMainnet =
+#include <impl/dash/coin/checkpoints/dash_mn_checkpoint_mainnet.inc>
+    ;
+    static const char* const kTestnetFixture =
+#include "dash_mn_checkpoint_testnet_1519543.inc"
+    ;
+    const auto m = dash::coin::parse_mn_checkpoint(kMainnet, "mainnet");
+    ASSERT_TRUE(m.ok) << m.error;
+    ASSERT_EQ(m.source.rfind("self-derived", 0), 0u);
+    size_t v1 = 0;
+    for (const auto& [h, st] : m.entries) {
+        EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(st.pubKeyOperator)) << h.GetHex();
+        v1 += st.nVersion == 1;
+    }
+    EXPECT_GT(v1, 1000u) << "the anchor carries v1 masternodes";
+    const auto t = dash::coin::parse_mn_checkpoint(kTestnetFixture, "testnet");
+    ASSERT_TRUE(t.ok) << t.error;
+    ASSERT_NE(t.source.rfind("self-derived", 0), 0u);
+    for (const auto& [h, st] : t.entries)
+        EXPECT_TRUE(vv::opkey_is_canonical_basic_or_null(st.pubKeyOperator)) << h.GetHex();
+}
+
+// End to end: a dashd-seeded v1 masternode and a ProUpRegTx carrying the
+// same point, in a v1 payload (legacy bytes) and in a v2 payload (basic):
+// no operator change (the live mainnet case, a3296ab3 / cf5649c6).
+TEST(DashMnState, SeededV1KeySamePointIsNoOperatorChange) {
+    const auto stored = p3::seeded_key(p3::K8L);
+    ASSERT_TRUE(stored.has_value());
+    p3::expect_unchanged(p3::apply_upreg(*stored, ProTxVersion::LEGACY_BLS, p3::kh48(p3::K8L)));
+    p3::expect_unchanged(p3::apply_upreg(*stored, ProTxVersion::BASIC_BLS, p3::kh48(p3::K8B)));
+}
+
+// VERIFY-P3: a deliberate rotation to the NEGATED key -P is an operator
+// change (Core: reset + ban) for every key, whichever way the key entered
+// the store (the dashd seed path, or written by the projection) and in
+// either payload version. Secrets {s, 0, ..., 0}, s = 1..64.
+TEST(DashMnState, NegatedKeyRotationIsAnOperatorChange) {
+    for (const bool via_seed : {true, false})
+        for (const uint16_t pv : {ProTxVersion::LEGACY_BLS, ProTxVersion::BASIC_BLS}) {
+            size_t wrong = 0;
+            for (int sk = 1; sk <= 64; ++sk) {
+                std::vector<uint8_t> skb(32, 0);
+                skb[0] = static_cast<uint8_t>(sk);
+                const auto priv = bls::PrivateKey::FromBytes(bls::Bytes(skb.data(), skb.size()));
+                const bls::G1Element P = priv.GetG1Element();
+                const bls::G1Element N = P.Negate();
+                auto arr = [](const std::vector<uint8_t>& v) {
+                    std::array<uint8_t, 48> a{};
+                    std::copy_n(v.begin(), 48, a.begin());
+                    return a;
+                };
+                std::array<uint8_t, 48> stored = arr(P.Serialize(/*legacy=*/false));
+                if (via_seed) {
+                    std::string hex;
+                    for (uint8_t c : P.Serialize(/*legacy=*/true)) {
+                        static const char* d = "0123456789abcdef";
+                        hex += d[c >> 4];
+                        hex += d[c & 15];
+                    }
+                    const auto s = p3::seeded_key(hex);
+                    ASSERT_TRUE(s.has_value()) << sk;
+                    stored = *s;
+                }
+                const auto e = p3::apply_upreg(stored, pv, arr(N.Serialize(pv == ProTxVersion::LEGACY_BLS)));
+                if (e.nPoSeBanHeight == 0) ++wrong;
+            }
+            EXPECT_EQ(wrong, 0u) << (via_seed ? "seeded" : "projection-written") << " store, payload v" << pv;
+        }
+}
+#endif
 
 TEST(DashMnState, CollateralSpendRemovesMN) {
     auto reg = make_proreg(ProTxVersion::BASIC_BLS, MnType::REGULAR);

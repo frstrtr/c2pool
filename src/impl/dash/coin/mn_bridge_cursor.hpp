@@ -187,7 +187,15 @@ public:
     /// coinbase that also pays a miner). The encoding is unchanged; v1 is
     /// refused so the bridge starts COLD from the compiled anchor and
     /// re-folds with the corrected detector.
-    static constexpr uint32_t kFormatVersion = 2;
+    ///
+    /// v2 -> v3 (P-3, operator keys canonical BASIC): a v2 record is a copy
+    /// of a projection store that MIXED dashd's LEGACY bytes for v1 keys with
+    /// basic bytes it wrote itself. Legacy and basic G1 encodings overlap, so
+    /// no reader can sort them: resuming one brings back the phantom
+    /// operator changes and the negated-key ambiguity. The encoding is
+    /// unchanged; v2 is refused so the bridge starts COLD from the compiled
+    /// anchor, whose keys the checkpoint parser converts strictly.
+    static constexpr uint32_t kFormatVersion = 3;
 
     explicit MnBridgeCursorStore(std::string path) : m_path(std::move(path)) {}
 
