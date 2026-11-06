@@ -1106,5 +1106,22 @@ private:
     PendingTipChange m_pending_tip_change;
 };
 
+/// --header-checkpoint "HEIGHT:HASH" (nullopt: empty, malformed, or a null hash).
+inline std::optional<std::pair<uint32_t, uint256>> parse_header_checkpoint(const std::string& s)
+{
+    const auto colon = s.find(':');
+    if (s.empty() || colon == std::string::npos)
+        return std::nullopt;
+    uint256 hash;
+    hash.SetHex(s.substr(colon + 1));
+    if (hash.IsNull())
+        return std::nullopt;
+    try {
+        return std::make_pair(static_cast<uint32_t>(std::stoul(s.substr(0, colon))), hash);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 } // namespace coin
 } // namespace ltc
