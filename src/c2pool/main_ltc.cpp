@@ -276,6 +276,7 @@ static void segfault_handler(int sig) {
 #include <c2pool/merged/payout_source.hpp>
 #include <c2pool/merged/coin_broadcaster.hpp>
 #include <impl/ltc/coin/mweb_fetch_retry.hpp>
+#include <impl/ltc/coin/mweb_ext_poller.hpp>
 #include <impl/ltc/coin/utxo_order.hpp>
 #include <impl/ltc/coin/utxo_view_stats.hpp>
 #include <impl/ltc/coin/found_block_verify.hpp>
@@ -613,7 +614,10 @@ void print_help() {
     std::cout << "                            (pre-retry behaviour) instead of the tip's block once\n";
     std::cout << "  --ltc-mweb-cmpct-provisional  Reserved; not implemented in this build\n";
     std::cout << "  --template-tx-check MODE  LTC template transaction check: strict (refuse /\n";
-    std::cout << "                            HOLD, default) or warn (log and count only)\n\n";
+    std::cout << "                            HOLD, default) or warn (log and count only)\n";
+    std::cout << "  --ltc-mweb-ext MODE       LTC MWEB extension: none (default: empty body, no daemon)\n";
+    std::cout << "                            or litecoind (the local litecoind's mw::Block, HogEx and\n";
+    std::cout << "                            peg-ins, checked; needs --rpcuser / --rpcpassword)\n\n";
 
     std::cout << "COINBASE CUSTOMIZATION:\n";
     std::cout << "  --coinbase-text TEXT       Custom text in coinbase scriptSig (replaces /c2pool/ tag)\n";
@@ -909,6 +913,13 @@ int main(int argc, char* argv[]) {
     // "strict" refuses (HOLD at ingress, no block at assembly), "warn" logs
     // and counts only (rollback should litecoind's own template trip a rule).
     std::string template_tx_check = "strict";  // --template-tx-check MODE
+    // Where the embedded LTC template's MWEB extension comes from (#2137 S3):
+    // "none" (default): the empty body, c2pool's own HogEx -- daemonless;
+    // "litecoind": the local litecoind's getblocktemplate extension (its
+    // mw::Block, HogEx and peg-ins), checked against c2pool's own MWEB state
+    // and replaced by the empty body on any mismatch. Needs the LTC RPC
+    // settings (--rpcuser / --rpcpassword, ltc_rpc_user / ltc_rpc_password).
+    std::string ltc_mweb_ext = "none";         // --ltc-mweb-ext MODE
     Blockchain blockchain = Blockchain::LITECOIN;  // Default to Litecoin
     std::string blockchain_label = "ltc";  // Raw coin string -> web layer node_symbol() fallback (config-driven labeling)
 
@@ -1232,6 +1243,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--template-tx-check" && i + 1 < argc) {
             template_tx_check = argv[++i];
             cli_explicit.insert("template_tx_check");
+        }
+        else if (arg == "--ltc-mweb-ext" && i + 1 < argc) {
+            ltc_mweb_ext = argv[++i];
+            cli_explicit.insert("ltc_mweb_ext");
         }
         else if (arg == "--doge-p2p-address" && i + 1 < argc) {
             doge_p2p_address = argv[++i];
@@ -1728,6 +1743,9 @@ int main(int argc, char* argv[]) {
             // Template-tx check mode (see the declaration)
             if (!cli_explicit.count("template_tx_check") && cfg["template_tx_check"])
                 template_tx_check = cfg["template_tx_check"].as<std::string>();
+            // MWEB extension source (see the declaration)
+            if (!cli_explicit.count("ltc_mweb_ext") && cfg["ltc_mweb_ext"])
+                ltc_mweb_ext = cfg["ltc_mweb_ext"].as<std::string>();
 
             // Coin daemon P2P broadcaster
             if (!cli_explicit.count("coind_p2p_port") && cfg["coind_p2p_port"])
@@ -1846,6 +1864,41 @@ int main(int argc, char* argv[]) {
                 std::cerr << "c2pool: " << msg << std::endl;
                 return 1;
             }
+        }
+    }
+
+    // ltc_mweb_ext: none | litecoind. litecoind needs the LTC RPC settings
+    // (the user and password; the host defaults to 127.0.0.1 and the port to
+    // the network's). Refused here, before anything starts.
+    if (ltc_mweb_ext != "none" && ltc_mweb_ext != "litecoind") {
+        const std::string msg = "ltc_mweb_ext \"" + ltc_mweb_ext + "\": must be none or litecoind";
+        LOG_ERROR << msg;
+        std::cerr << "c2pool: " << msg << std::endl;
+        return 1;
+    }
+    if (ltc_mweb_ext == "litecoind" && (rpc_user.empty() || rpc_pass.empty())) {
+        const std::string msg = "ltc_mweb_ext litecoind needs the LTC RPC settings: --rpcuser and"
+                                " --rpcpassword (config ltc_rpc_user / ltc_rpc_password), and --rpchost /"
+                                " --rpcport unless litecoind listens on 127.0.0.1 at the network's port";
+        LOG_ERROR << msg;
+        std::cerr << "c2pool: " << msg << std::endl;
+        return 1;
+    }
+    // Its getblocktemplate poller connects to an IP address: a name would
+    // need a DNS query no timeout bounds (the LAN-only runs allow none).
+    // "localhost" is 127.0.0.1. Only the embedded node runs the poller: in
+    // RPC mode --rpchost is used as before, a name included.
+    if (ltc_mweb_ext == "litecoind" && embedded_ltc) {
+        if (rpc_host == "localhost")
+            rpc_host = "127.0.0.1";
+        boost::system::error_code ec;
+        boost::asio::ip::make_address(rpc_host, ec);
+        if (ec) {
+            const std::string msg = "ltc_mweb_ext litecoind: --rpchost " + rpc_host
+                + " is not an IP address (an IPv4 or IPv6 literal; a name is not resolved)";
+            LOG_ERROR << msg;
+            std::cerr << "c2pool: " << msg << std::endl;
+            return 1;
         }
     }
 
@@ -2164,6 +2217,14 @@ int main(int argc, char* argv[]) {
             std::unique_ptr<ltc::coin::HeaderChain>     embedded_chain;
             std::unique_ptr<ltc::coin::Mempool>         embedded_pool;
             std::unique_ptr<c2pool::merged::CoinBroadcaster> embedded_broadcaster;
+            // The MWEB extension's source and its getblocktemplate poller
+            // (ltc_mweb_ext, #2137 S3). The source exists in every mode (its
+            // /local_stats block); the poller only with litecoind, and the
+            // ordered shutdown stops it first. Declared before the embedded
+            // node, which holds the source: it outlives the node.
+            auto ltc_mweb_ext_src = std::make_unique<ltc::coin::mweb_ext::MwebExtSource>(ltc_mweb_ext);
+            std::unique_ptr<ltc::coin::mweb_ext::MwebExtPoller> ltc_mweb_ext_poller;
+            auto ltc_mweb_ext_alive = std::make_shared<std::atomic<bool>>(true);
             std::unique_ptr<ltc::coin::MWEBTracker>     mweb_tracker;
             std::unique_ptr<ltc::coin::EmbeddedCoinNode> embedded_node;
             // The header-validation pools (LTC, DOGE, NMC): their tasks use the
@@ -2221,7 +2282,11 @@ int main(int argc, char* argv[]) {
                 log_shutdown_signal();
                 start_shutdown_watchdog();
                 // 1. No new work: the HTTP API and stratum, the coin peers (no
-                //    more blocks, headers or txs), the merged-mining poll.
+                //    more blocks, headers or txs), the merged-mining poll, the
+                //    MWEB extension's getblocktemplate poller.
+                ltc_mweb_ext_alive->store(false);
+                if (ltc_mweb_ext_poller)
+                    ltc_mweb_ext_poller->stop();
                 web_server.stop();
                 // The mining interface's background threads run this scope's
                 // callbacks (the PPLNS walk: a detached thread read a freed
@@ -2482,6 +2547,81 @@ int main(int argc, char* argv[]) {
                 embedded_node   = std::make_unique<ltc::coin::EmbeddedCoinNode>(
                     *embedded_chain, *embedded_pool, settings->m_testnet, mweb_tracker.get());
                 embedded_node->set_template_tx_check_strict(template_tx_check_strict);
+                // ltc_mweb_ext litecoind (#2137 S3): the templates take the
+                // local litecoind's MWEB extension when it checks out against
+                // the tip's MWEB state. Its getblocktemplate is polled on a
+                // worker thread (every tip change, every 5 s while it is for
+                // the tip, 3 s timeout); the builder reads only the last one.
+                if (ltc_mweb_ext_src->enabled()) {
+                    embedded_node->set_mweb_ext(ltc_mweb_ext_src.get());
+                    const int ext_rpc_port = rpc_port > 0 ? rpc_port : (settings->m_testnet ? 19332 : 9332);
+                    const ltc::coin::mweb_ext::RpcEndpoint ext_ep{
+                        rpc_host, static_cast<uint16_t>(ext_rpc_port), rpc_user + ":" + rpc_pass};
+                    // Worker-thread state of the deliver callback.
+                    struct ExtDeliverState {
+                        std::pair<uint256, uint256> last_key;  // (prev, HogEx txid) of the last G
+                        bool failing{false};
+                        std::chrono::steady_clock::time_point last_warn{};
+                    };
+                    auto ext_state = std::make_shared<ExtDeliverState>();
+                    ltc_mweb_ext_poller = std::make_unique<ltc::coin::mweb_ext::MwebExtPoller>(
+                        [ext_ep]() {
+                            return ltc::coin::mweb_ext::fetch_gbt(ext_ep, std::chrono::milliseconds(3000));
+                        },
+                        [src = ltc_mweb_ext_src.get(), ext_state, alive = ltc_mweb_ext_alive,
+                         chain = embedded_chain.get(), ext_ep, &web_server, &ioc](
+                            ltc::coin::mweb_ext::FetchResult&& r, const uint256&) {
+                            src->note_fetch(r.ok, r.timeout, r.ms, r.error);
+                            const auto now = std::chrono::steady_clock::now();
+                            if (!r.ok) {
+                                if (!ext_state->failing || now - ext_state->last_warn > std::chrono::minutes(5)) {
+                                    LOG_WARNING << "[EMB-LTC] MWEB extension: getblocktemplate from litecoind at "
+                                                << ext_ep.host << ":" << ext_ep.port << " failed ("
+                                                << (r.timeout ? "timeout: " : "") << r.error << ", " << r.ms
+                                                << " ms); templates keep the last G only while it is for the tip";
+                                    ext_state->last_warn = now;
+                                }
+                                ext_state->failing = true;
+                                return;
+                            }
+                            if (ext_state->failing)
+                                LOG_INFO << "[EMB-LTC] MWEB extension: litecoind answers again (" << r.ms << " ms)";
+                            ext_state->failing = false;
+                            auto parsed = ltc::coin::mweb_ext::parse_extension(r.result);
+                            bool changed = false;
+                            uint256 prev;
+                            if (parsed.bundle) {
+                                const std::pair<uint256, uint256> key{parsed.bundle->prev, parsed.bundle->hogex.txid};
+                                changed = key != ext_state->last_key;
+                                ext_state->last_key = key;
+                                prev = parsed.bundle->prev;
+                            } else {
+                                // The stored G is now the failure: the next good
+                                // one is a change, whatever came before.
+                                ext_state->last_key = {};
+                            }
+                            src->set_parsed(std::move(parsed), r.at);
+                            if (!changed)
+                                return;
+                            // A new extension for the tip: rebuild (paced like a
+                            // tx refresh, no clean_jobs).
+                            boost::asio::post(ioc, [alive, chain, prev, &web_server]() {
+                                if (!alive->load())
+                                    return;
+                                const auto t = chain->tip();
+                                if (t && t->block_hash == prev)
+                                    web_server.trigger_work_refresh_mempool();
+                            });
+                        });
+                    if (auto t = embedded_chain->tip())
+                        ltc_mweb_ext_poller->notify_tip(t->block_hash);
+                    ltc_mweb_ext_poller->start();
+                    LOG_INFO << "[EMB-LTC] MWEB extension: litecoind at " << ext_ep.host << ":" << ext_ep.port
+                             << " (ltc_mweb_ext=litecoind: getblocktemplate on every tip change and every 5 s,"
+                             << " 3 s timeout; checked against c2pool's MWEB state, empty body on any mismatch)";
+                } else {
+                    LOG_INFO << "[EMB-LTC] MWEB extension: none (empty MWEB body, c2pool's own HogEx)";
+                }
                 // Leave room for the PPLNS coinbase the web server builds on
                 // each template (up to max_coinbase_outputs outputs): the
                 // last one's weight plus a margin, not a fixed 2,000.
@@ -2641,6 +2781,9 @@ int main(int argc, char* argv[]) {
 
             } else {
                 // Legacy RPC mode
+                if (ltc_mweb_ext == "litecoind")
+                    LOG_INFO << "[LTC] ltc_mweb_ext=litecoind has no effect in RPC mode: the whole template"
+                             << " comes from litecoind";
                 node_rpc = std::make_unique<ltc::coin::NodeRPC>(&ioc, &coin_node, settings->m_testnet);
 
                 // Adjust default RPC port based on testnet flag when user didn't override
@@ -3345,10 +3488,14 @@ int main(int argc, char* argv[]) {
                 // pool was cleaned for).
                 // "ltc_utxo" is the depth of the UTXO view the template prices
                 // against and what it cannot price (utxo_view_stats.hpp).
+                // "ltc_mweb_ext" is the MWEB extension's source (#2137 S3): its
+                // mode, what the last template imported, the fallbacks by
+                // reason, the age of litecoind's last template.
                 mi->set_coin_metrics_fn(
                     [mweb_stats, ltc_cmpct_v3, ltc_cmpct_hb_peers, ltc_mweb_fetch_retry, ltc_hdr_sync, ltc_dl,
                      pool = embedded_pool.get(), tracker = mweb_tracker.get(),
-                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor]() {
+                     utxo = ltc_utxo_cache.get(), chain = embedded_chain.get(), ltc_view_anchor,
+                     ext = ltc_mweb_ext_src.get()]() {
                         nlohmann::json j = mweb_stats->to_json();
                         j["config"] = {
                             {"cmpct_v3", ltc_cmpct_v3},
@@ -3370,6 +3517,7 @@ int main(int argc, char* argv[]) {
                             tip ? tip->height : 0, tip ? tip->block_hash : uint256(), pool);
                         return nlohmann::json{{"ltc_mweb", j}, {"ltc_mempool", std::move(mp)},
                                               {"ltc_utxo", std::move(u)},
+                                              {"ltc_mweb_ext", ext->to_json()},
                                               {"ltc_headers", ltc_hdr_sync->to_json()},
                                               {"ltc_bootstrap", ltc_dl->to_json()}};
                     });
@@ -4041,6 +4189,7 @@ int main(int argc, char* argv[]) {
                     set_ltc_lock_time_cutoff(embedded_pool.get(), embedded_chain.get(), t->block_hash);
                 embedded_chain->set_on_tip_changed(
                     [tracker = mweb_tracker.get(),
+                     ext_poller = ltc_mweb_ext_poller.get(),
                      bcaster = embedded_broadcaster.get(),
                      chain = embedded_chain.get(),
                      utxo = ltc_utxo_cache.get(),
@@ -4056,6 +4205,9 @@ int main(int argc, char* argv[]) {
                         // Post all work to ioc to avoid cross-thread access to
                         // bcaster/web_server/UTXO which are ioc-thread objects.
                         const auto tip_seen_at = std::chrono::steady_clock::now();
+                        // litecoind's template for the new tip (thread-safe).
+                        if (ext_poller)
+                            ext_poller->notify_tip(new_tip);
                         boost::asio::post(ioc,
                             [tracker, bcaster, chain, utxo, utxo_db, pool, set_ltc_lock_time_cutoff,
                              &web_server, &ioc,

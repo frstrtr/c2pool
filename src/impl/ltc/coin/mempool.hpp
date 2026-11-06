@@ -429,6 +429,12 @@ public:
         std::atomic<uint64_t> admitted{0};
         std::atomic<uint64_t> mweb_txs_seen{0};         // deliveries of txs with an MWEB part
         std::atomic<uint64_t> mweb_fee_skipped_sat{0};  // their kernel fees
+        // The same, once per MWEB tx: a refused tx is fetched again from
+        // every peer that announces it, so the delivery counts above repeat
+        // it. Keyed by its first kernel id over the last
+        // MWEB_SEEN_DISTINCT_KEPT distinct txs (DESIGN 9.3: class C per block).
+        std::atomic<uint64_t> mweb_txs_seen_distinct{0};
+        std::atomic<uint64_t> mweb_fee_skipped_distinct_sat{0};
         std::atomic<uint64_t> pegins_seen{0};           // peg-in kernels among them
         std::atomic<uint64_t> pegouts_seen{0};          // peg-out coins among them
         std::atomic<uint64_t> template_tx_dropped{0};   // admitted txs a template still refused
@@ -444,6 +450,8 @@ public:
     static constexpr size_t   MAX_ORPHANS = 100;              // DEFAULT_MAX_ORPHAN_TRANSACTIONS
     static constexpr time_t   ORPHAN_EXPIRE_SECS = 20 * 60;   // ORPHAN_TX_EXPIRE_TIME
     static constexpr uint32_t MAX_ORPHAN_WEIGHT = 400'000;    // MAX_STANDARD_TX_WEIGHT
+    /// Kernel ids remembered for mweb_txs_seen_distinct.
+    static constexpr size_t   MWEB_SEEN_DISTINCT_KEPT = 4096;
 
     /// Admit `tx` (nullopt) or say why not, checking in this order: empty vin
     /// or vout unless MWEB-only (CheckTransaction), a HogEx, an MWEB part, a
@@ -500,6 +508,11 @@ private:
             r.n_pegins = mw->n_pegins();
             m_stats.mweb_fee_skipped_sat.fetch_add(static_cast<uint64_t>(r.mweb_fee),
                                                    std::memory_order_relaxed);
+            if (note_mweb_kernel_seen(r.kernel_id)) {
+                m_stats.mweb_txs_seen_distinct.fetch_add(1, std::memory_order_relaxed);
+                m_stats.mweb_fee_skipped_distinct_sat.fetch_add(static_cast<uint64_t>(r.mweb_fee),
+                                                                std::memory_order_relaxed);
+            }
             m_stats.pegins_seen.fetch_add(r.n_pegins, std::memory_order_relaxed);
             m_stats.pegouts_seen.fetch_add(mw->n_pegouts(), std::memory_order_relaxed);
             if (mw->has_pegin() || pegin_output)
@@ -564,6 +577,20 @@ private:
         if (utxo)
             reprice_children(r.txid, utxo);
         return std::nullopt;
+    }
+
+    /// True the first time `kernel_id` is seen among the last
+    /// MWEB_SEEN_DISTINCT_KEPT distinct ones (the oldest is forgotten).
+    bool note_mweb_kernel_seen(const uint256& kernel_id) {
+        std::lock_guard<std::mutex> lock(m_mweb_seen_mutex);
+        if (!m_mweb_seen.insert(kernel_id).second)
+            return false;
+        m_mweb_seen_order.push_back(kernel_id);
+        if (m_mweb_seen_order.size() > MWEB_SEEN_DISTINCT_KEPT) {
+            m_mweb_seen.erase(m_mweb_seen_order.front());
+            m_mweb_seen_order.pop_front();
+        }
+        return true;
     }
 
     /// The pool's unpriced children of `parent` (admitted before it) are
@@ -636,6 +663,7 @@ public:
     }
 
     /// {"admitted", "rejected": {code: n}, "mweb_txs_seen", "mweb_fee_skipped_sat",
+    ///  "mweb_txs_seen_distinct", "mweb_fee_skipped_distinct_sat",
     ///  "pegins_seen", "pegouts_seen", "template_tx_dropped",
     ///  "template_sigop_skipped", "template_sigop_cost", "template_bip68_skipped",
     ///  "sigop_limit", "orphans",
@@ -651,6 +679,8 @@ public:
             {"rejected", std::move(rejected)},
             {"mweb_txs_seen", m_stats.mweb_txs_seen.load(std::memory_order_relaxed)},
             {"mweb_fee_skipped_sat", m_stats.mweb_fee_skipped_sat.load(std::memory_order_relaxed)},
+            {"mweb_txs_seen_distinct", m_stats.mweb_txs_seen_distinct.load(std::memory_order_relaxed)},
+            {"mweb_fee_skipped_distinct_sat", m_stats.mweb_fee_skipped_distinct_sat.load(std::memory_order_relaxed)},
             {"pegins_seen", m_stats.pegins_seen.load(std::memory_order_relaxed)},
             {"pegouts_seen", m_stats.pegouts_seen.load(std::memory_order_relaxed)},
             {"template_tx_dropped", m_stats.template_tx_dropped.load(std::memory_order_relaxed)},
@@ -1940,6 +1970,11 @@ private:
     time_t  m_last_cleaned_time{0};
 
     mutable RejectStats m_stats;   // template_tx_dropped counts in const selection
+
+    // Kernel ids of the MWEB txs refused lately (note_mweb_kernel_seen).
+    std::mutex m_mweb_seen_mutex;
+    std::set<uint256> m_mweb_seen;
+    std::deque<uint256> m_mweb_seen_order;
 };
 
 } // namespace coin
