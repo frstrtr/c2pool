@@ -423,6 +423,7 @@ struct DogeTip {
     DogeTip(const BlockType& tip, uint32_t height)
         : body(tip)
     {
+        chain.set_require_auxpow_proof(false);  // the lane tests drive UTXO ordering, not AuxPoW
         chain.set_dynamic_checkpoint(height - 1, tip.m_previous_block);
         EXPECT_TRUE(chain.add_header(static_cast<const BlockHeaderType&>(tip)));
         EXPECT_EQ(chain.height(), height);

@@ -244,6 +244,11 @@ if (BUILD_TESTING AND GTest_FOUND)
     # UTXOViewCache/UTXOViewDB, MWEBTracker), core::coin::template_pool_gate,
     # and the 32-block cleaned_for window. Same folding rule.
     #
+    # doge_header_pow_conformance_test.cpp: the DOGE header chain's conformance
+    # to Dogecoin Core 1.14.9 through the real P2P paths (a compact block is
+    # fetched whole on an AuxPoW chain; the checked parser; real mainnet
+    # headers; the late-legacy rule). Same folding rule.
+    #
     # header_pow_always_test.cpp / doge_header_pow_test.cpp: every header's
     # proof of work above the checkpoint is verified whatever height a peer
     # reports (LTC scrypt; DOGE scrypt before AuxPoW and for unflagged
@@ -335,6 +340,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         doge_auxpow_witness_test.cpp
         doge_hash_schedule_test.cpp
         doge_header_pow_test.cpp
+        doge_header_pow_conformance_test.cpp
         doge_headers_parse_test.cpp
         doge_mempool_validity_test.cpp
         doge_p2p_raw_parser_test.cpp

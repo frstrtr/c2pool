@@ -61,6 +61,7 @@ struct DogeChain {
         uint256 root;
         root.SetHex("00000000000000000000000000000000000000000000000000000000000d0e01");
         chain.set_dynamic_checkpoint(root_height, root);
+        chain.set_require_auxpow_proof(false);  // this test drives the sigop budget, not AuxPoW
         uint256 prev = root;
         for (size_t i = 0; i < timestamps.size(); ++i) {
             ltc::coin::BlockHeaderType h;

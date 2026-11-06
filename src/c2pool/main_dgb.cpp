@@ -631,16 +631,22 @@ int run_node(const core::CoinParams& params, bool testnet,
                     // so the resident IndexEntry is HEADERS-ONLY (no AuxPow blob
                     // residency — the OOM-residency requirement is satisfied at the
                     // parse boundary, mirroring #1414's post-persist blob drop).
-                    // Each header's and block's proof of work (the AuxPoW
-                    // proof) is verified as it is parsed.
+                    // The parser reads each AuxPoW proof and hands it to the
+                    // header chain (stash_auxpow_proof); the chain checks it
+                    // (CAuxPow::check) when the header is added, off the io thread.
                     {
-                        const auto rules = doge::coin::auxpow_rules(
-                            doge_aux_params ? *doge_aux_params : doge::coin::DOGEChainParams::mainnet());
-                        broadcaster->set_raw_headers_parser([rules](const uint8_t* d, size_t n) {
-                            return doge::coin::parse_doge_headers_message(d, n, &rules);
+                        auto* dc = doge_aux_chain.get();
+                        broadcaster->set_raw_headers_parser([dc](const uint8_t* d, size_t n) {
+                            doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
+                                dc->stash_auxpow_proof(h, a);
+                            };
+                            return doge::coin::parse_doge_headers_message(d, n, nullptr, &sink);
                         });
-                        broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
-                            return doge::coin::parse_doge_block(d, n, &rules);
+                        broadcaster->set_raw_block_parser([dc](const uint8_t* d, size_t n) {
+                            doge::coin::AuxProofSink sink = [dc](const uint256& h, const doge::coin::CAuxPow<>& a) {
+                                dc->stash_auxpow_proof(h, a);
+                            };
+                            return doge::coin::parse_doge_block(d, n, nullptr, &sink);
                         });
                     }
 
