@@ -23,7 +23,10 @@
 #include <core/hash.hpp>
 
 #include <btclibs/crypto/scrypt.h>
+#include <core/coin/peer_height_gate.hpp>
+#include <impl/doge/coin/auxpow.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -203,6 +206,10 @@ public:
                 return false;
             load_from_db();
         }
+        if (m_params.fast_start_checkpoint.has_value()) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pin_checkpoint_locked(m_params.fast_start_checkpoint->height, m_params.fast_start_checkpoint->hash);
+        }
         // Fast-start checkpoint: if chain is empty and a checkpoint is configured,
         // seed it as the starting point.  All headers before this height are
         // implicitly trusted.  The chain will sync forward from this point.
@@ -310,18 +317,27 @@ public:
         return true;
     }
 
-    /// Set the estimated network tip height (from peer's version message).
-    /// Used to skip scrypt PoW validation for old headers during initial sync.
-    /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
-    /// only (prev_hash linkage + difficulty retarget), making bulk sync ~100x faster.
-    /// Set the estimated network tip height (from peer's version message).
-    void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+    /// A network tip height a peer reported (its version message). It
+    /// switches no check (a pre-AuxPoW header's scrypt is always verified;
+    /// an AuxPoW header's proof is verified where it is parsed,
+    /// auxpow_check.hpp); it sizes the header batches and the progress line
+    /// (core::coin::PeerHeightGate: the median of the reports, bounded by the
+    /// growth our tip allows).
+    void set_peer_tip_height(uint32_t height) { m_peer_heights.report(height); }
+
+    uint32_t peer_tip_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return bounded_peer_tip_locked();
+    }
 
     /// Dynamically seed a checkpoint at runtime (e.g., from RPC getblockhash).
     /// Only applied if the chain is still at or below the hardcoded checkpoint.
     /// This allows an accessible daemon to provide a more recent starting point.
+    /// The checkpoint is pinned whether or not it seeds the chain: a header
+    /// at its height must be it.
     void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        pin_checkpoint_locked(height, hash);
         if (height > m_tip_height) {
             IndexEntry entry;
             entry.block_hash = hash;
@@ -349,9 +365,8 @@ public:
     /// is microseconds per header, so large batches are fine.  Near the tip
     /// (scrypt active), each header takes ~20ms, so we use smaller batches.
     int add_headers(const std::vector<BlockHeaderType>& headers) {
-        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
-        // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
-        size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
+        // The batch is sized by the headers' own checks, not a peer's claim.
+        const size_t BATCH_SIZE = 100;
         int accepted = 0;
         PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
@@ -369,17 +384,14 @@ public:
             }
             // Yield between batches so ioc-thread callers (get_height,
             // is_synced, get_tip) can acquire the mutex.
-            if (offset + BATCH_SIZE < headers.size()) {
-                // Short yield during fast-sync (structural only), longer near tip (scrypt)
-                auto ms = (BATCH_SIZE >= 500) ? 1 : 10;
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-            }
+            if (offset + BATCH_SIZE < headers.size())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);
             persist_tip();
             // Progress indicator for header sync
-            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+            uint32_t peer_tip = bounded_peer_tip_locked();
             if (peer_tip > 0 && m_tip_height > 0) {
                 double pct = 100.0 * m_tip_height / peer_tip;
                 // Log every 1% or every 2000 blocks
@@ -480,32 +492,30 @@ private:
         const auto& prev = prev_it->second;
         uint32_t new_height = prev.height + 1;
 
-        // AuxPoW blocks (DOGE after auxpow_height): PoW is on the PARENT block
-        // header (e.g. LTC), not on the 80-byte DOGE base header.  Since we only
-        // store the base header (AuxPoW proof stripped during parsing), we cannot
-        // validate PoW from the base header alone.  For AuxPoW blocks, rely on
-        // structural validation (prev_hash linkage + difficulty retarget) only.
-        //
-        // Non-AuxPoW blocks (pre-auxpow_height): validate scrypt PoW normally,
-        // with fast-sync skip for old headers during initial sync.
-        bool is_auxpow = m_params.is_auxpow(new_height);
+        // A pinned checkpoint's height takes only the checkpoint's block.
+        for (const auto& [pin_height, pin_hash] : m_pins) {
+            if (new_height == pin_height && bhash != pin_hash) {
+                LOG_WARNING << "[EMB-DOGE] REJECT header at the checkpoint height " << new_height
+                            << ": hash=" << bhash.GetHex().substr(0, 16)
+                            << " checkpoint=" << pin_hash.GetHex().substr(0, 16);
+                return false;
+            }
+        }
+
+        // The header's own scrypt PoW, whatever height a peer reported:
+        // every header before AuxPoW, and after it every header without the
+        // AuxPoW version flag (Dogecoin Core CheckAuxPowProofOfWork: a block
+        // without a proof meets its bits itself). A flagged header's PoW is
+        // on its parent: the P2P parsers verify its AuxPoW proof as they read
+        // it (auxpow_check.hpp), and only the 80-byte base header is stored
+        // (its SHA256d as the placeholder PoW hash).
         uint256 pow_hash;
-        if (is_auxpow) {
-            // AuxPoW: trust PoW (validated by parent chain), store SHA256d placeholder
+        if (m_params.is_auxpow(new_height) && is_auxpow_version(static_cast<int32_t>(header.m_version))) {
             pow_hash = block_hash(header);
         } else {
-            // Non-AuxPoW: scrypt PoW validation (with fast-sync skip for old headers)
-            static constexpr uint32_t SCRYPT_VALIDATION_DEPTH = 2100;
-            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
-            bool need_scrypt = (peer_tip == 0)
-                            || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
-            if (need_scrypt) {
-                pow_hash = scrypt_hash(header);
-                if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
-                    return false;
-            } else {
-                pow_hash = block_hash(header);
-            }
+            pow_hash = scrypt_hash(header);
+            if (!check_pow(pow_hash, header.m_bits, m_params.pow_limit))
+                return false;
         }
 
         // Validate difficulty
@@ -759,9 +769,29 @@ private:
     uint32_t   m_tip_height{0};
     uint256    m_best_work;
 
-    // Peer-reported tip height for fast-sync scrypt skip.
-    // Set from version message; headers below (tip - 2100) skip scrypt PoW.
-    std::atomic<uint32_t> m_peer_tip_height{0};
+    // Peer-reported tip heights: batch sizing and the progress line only.
+    core::coin::PeerHeightGate m_peer_heights;
+
+    // Pinned checkpoints (height, hash): a header at the height must be it.
+    std::vector<std::pair<uint32_t, uint256>> m_pins;
+
+    void pin_checkpoint_locked(uint32_t height, const uint256& hash) {
+        if (std::find(m_pins.begin(), m_pins.end(), std::make_pair(height, hash)) == m_pins.end())
+            m_pins.emplace_back(height, hash);
+        auto at = m_height_index.find(height);
+        if (at != m_height_index.end() && at->second != hash)
+            LOG_ERROR << "[EMB-DOGE] The header chain holds " << at->second.GetHex().substr(0, 16)
+                      << " at the checkpoint height " << height << ", not the checkpoint "
+                      << hash.GetHex().substr(0, 16) << " (a new header there must be the checkpoint)";
+    }
+
+    uint32_t bounded_peer_tip_locked() const {
+        uint64_t tip_time = 0;
+        if (auto it = m_headers.find(m_tip); it != m_headers.end())
+            tip_time = it->second.header.m_timestamp;
+        return m_peer_heights.bounded(m_tip_height, tip_time, static_cast<uint64_t>(std::time(nullptr)),
+                                      static_cast<uint64_t>(DOGEChainParams::TARGET_SPACING));
+    }
 
     std::unique_ptr<core::LevelDBStore> m_db;
 

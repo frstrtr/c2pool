@@ -8132,11 +8132,17 @@ int main(int argc, char* argv[]) {
                                 });
                             }
                             // Phase 5.8: wire AuxPoW header parser for DOGE P2P
+                            // Each header's and block's proof of work (the AuxPoW
+                            // proof) is verified as it is parsed.
                             if (cfg.symbol == "DOGE") {
-                                broadcaster->set_raw_headers_parser(
-                                    doge::coin::parse_doge_headers_message);
-                                broadcaster->set_raw_block_parser(
-                                    doge::coin::parse_doge_block);
+                                const auto rules = doge::coin::auxpow_rules(
+                                    doge_params_ptr ? *doge_params_ptr : doge::coin::DOGEChainParams::mainnet());
+                                broadcaster->set_raw_headers_parser([rules](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_headers_message(d, n, &rules);
+                                });
+                                broadcaster->set_raw_block_parser([rules](const uint8_t* d, size_t n) {
+                                    return doge::coin::parse_doge_block(d, n, &rules);
+                                });
                             }
 
                             // Step 4: wire DOGE header sync via AuxPoW parser.

@@ -55,21 +55,13 @@
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/test/mempool_test_view.hpp>
 
+#include <impl/ltc/test/ltc_mined_headers.hpp>
+
 namespace {
 
 using namespace ltc::coin;
 
-BlockHeaderType testnet_genesis()
-{
-    BlockHeaderType g;
-    g.m_version = 1;
-    g.m_previous_block.SetNull();
-    g.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
-    g.m_timestamp = 1486949366;
-    g.m_bits = 0x1e0ffff0;
-    g.m_nonce = 293345;
-    return g;
-}
+BlockHeaderType testnet_genesis() { return ltc_test::easy_testnet_genesis(); }
 
 uint256 hash_of(const BlockHeaderType& hdr)
 {
@@ -83,22 +75,21 @@ BlockHeaderType child_of(const uint256& prev, uint32_t tag)
     h.m_previous_block = prev;
     h.m_merkle_root.SetHex(std::to_string(700 + tag));
     h.m_timestamp = 1486949366 + 150 * (tag + 1);
-    h.m_bits = 0x1e0ffff0;
-    h.m_nonce = tag;
+    h.m_bits = ltc_test::kEasyBits;
+    h.m_nonce = tag << 16;
+    ltc_test::mine(h);
     return h;
 }
 
 // genesis (h0) - T0 (h1) - T1 (h2) - T2 (h3), and S1 (h2), a sibling of T1
-// seen after it (equal work: T1 stays on the best chain). Old enough below
-// the peer's tip that the header chain checks them structurally.
+// seen after it (equal work: T1 stays on the best chain). Mined.
 struct Chain {
-    HeaderChain chain{make_ltc_chain_params_testnet()};
+    HeaderChain chain{ltc_test::easy_testnet_params()};
     BlockHeaderType t0, t1, t2, s1;
     Chain()
     {
         EXPECT_TRUE(chain.init());
         EXPECT_TRUE(chain.add_header(testnet_genesis()));
-        chain.set_peer_tip_height(10'000'000);
         t0 = child_of(hash_of(testnet_genesis()), 0);
         t1 = child_of(hash_of(t0), 1);
         s1 = child_of(hash_of(t0), 2);
