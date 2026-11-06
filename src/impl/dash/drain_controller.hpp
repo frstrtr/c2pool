@@ -173,7 +173,17 @@ public:
 
         const uint32_t k = step_.load() + 1;
         const uint64_t target = target_after_step(initial_.load(), cfg_.steps, k);
-        const uint64_t live = server_.get_session_count();
+        // core's get_session_count() is sessions_.size(), and sessions_ is
+        // pruned lazily (in notify_all and at the miner cap), so right after
+        // a drop it still counts the sessions just closed. Accept is off
+        // from begin(), so the live count can only fall: initial minus what
+        // this drain closed is a hard ceiling. Without the cap, a stale
+        // count makes a middle step close more than its share.
+        const uint64_t initial  = initial_.load();
+        const uint64_t dropped  = dropped_total_.load();
+        const uint64_t ceiling  = initial > dropped ? initial - dropped : 0;
+        const uint64_t reported = server_.get_session_count();
+        const uint64_t live     = reported < ceiling ? reported : ceiling;
         const size_t closed =
             live > target ? server_.drop_sessions(static_cast<size_t>(live - target)) : 0;
 

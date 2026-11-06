@@ -63,6 +63,28 @@ struct FakeServer {
     }
 };
 
+// core::StratumServer's real count semantics: get_session_count() is
+// sessions_.size(), and a closed session stays in sessions_ until a lazy
+// prune (notify_all, miner cap). drop_sessions only closes connected ones.
+struct LazyPruneServer {
+    size_t   connected{0};
+    size_t   listed{0};               // what get_session_count() reports
+    uint64_t refused{0};
+    std::vector<size_t> drop_calls;
+
+    void set_accepting(bool) {}
+    size_t get_session_count() const { return listed; }
+    uint64_t get_refused_draining() const { return refused; }
+    size_t drop_sessions(size_t n)
+    {
+        drop_calls.push_back(n);
+        const size_t k = n < connected ? n : connected;
+        connected -= k;               // listed stays until a prune
+        return k;
+    }
+    void prune() { listed = connected; }
+};
+
 auto on_io = [] { return true; };
 auto off_io = [] { return false; };
 
@@ -181,6 +203,37 @@ TEST(DashDrainController, SessionsThatLeaveOnTheirOwnAreNotDoubleCounted)
     EXPECT_TRUE(srv.drop_calls.empty());
     EXPECT_EQ(ctl.step(), 1u);        // target 4
     EXPECT_EQ(srv.live, 4u);
+}
+
+TEST(DashDrainController, UnprunedClosedSessionsDoNotInflateTheNextStep)
+{
+    // Seen live on c2pool-dash 2026-11-06: with no notify_all between steps
+    // the core count still held the sessions step 1 closed. Each step must
+    // still close only its share: 8 -> 6 -> 4 -> 2 -> 0, never 8 -> 6 -> 2.
+    LazyPruneServer srv;
+    srv.connected = srv.listed = 8;
+    RampDownController<LazyPruneServer> ctl(srv, {4, 25}, on_io);
+    ASSERT_TRUE(ctl.begin());
+    const size_t want[] = {6, 4, 2, 0};
+    for (size_t k = 0; k < 4; ++k) {
+        EXPECT_EQ(ctl.step(), 2u) << "step " << k + 1;
+        EXPECT_EQ(srv.connected, want[k]) << "step " << k + 1;
+        EXPECT_EQ(srv.listed, 8u) << "no prune happened";
+    }
+    EXPECT_EQ(srv.drop_calls, (std::vector<size_t>{2, 2, 2, 2}));
+    EXPECT_TRUE(ctl.done());
+    EXPECT_EQ(ctl.status().dropped_total, 8u);
+
+    // A prune in between changes nothing: the count is then exact.
+    LazyPruneServer p;
+    p.connected = p.listed = 8;
+    RampDownController<LazyPruneServer> c2(p, {4, 25}, on_io);
+    ASSERT_TRUE(c2.begin());
+    for (size_t k = 0; k < 4; ++k) {
+        EXPECT_EQ(c2.step(), 2u);
+        p.prune();
+        EXPECT_EQ(p.connected, want[k]);
+    }
 }
 
 // ── 3. Refusal metric ───────────────────────────────────────────────────────
