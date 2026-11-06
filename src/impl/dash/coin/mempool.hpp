@@ -406,6 +406,7 @@ public:
         ImmatureCoinbaseInput,  // a coinbase-output input below 100 confs
         FeeNotZero,             // sum(in) - sum(out) != 0: snapshot drift
         TooLarge,               // serialized size exceeds the consensus cap
+        SpecialTx,              // type != 0: never pinnable (see below)
     };
     /// Dash rejects an oversize transaction at CONSENSUS, not merely policy —
     /// CheckTransaction() returns "bad-txns-oversize", so a block carrying one
@@ -451,6 +452,7 @@ public:
             case PinnedTxGate::ImmatureCoinbaseInput: return "immature-coinbase-input";
             case PinnedTxGate::TooLarge:              return "tx-too-large";
             case PinnedTxGate::FeeNotZero:            return "fee-not-zero";
+            case PinnedTxGate::SpecialTx:             return "special-tx-not-pinnable";
         }
         return "ok";
     }
@@ -547,6 +549,18 @@ public:
         // coin lookups also stops us paying for a verdict we already know.
         if (::pack(tx).get_span().size() > kMaxPinnedTxBytes)
             return PinnedTxGate::TooLarge;
+        // SPECIAL TXS NEVER PIN. A pin is appended to a template whose
+        // coinbase is already built, and the selection gates (the type-8
+        // CheckAssetLockTx port, the special-tx mask, the MN-list fold) never
+        // see it. An asset lock (type 8) changes the CbTx creditPoolBalance the
+        // coinbase commits to, so even a lock Dash Core accepts would make the
+        // block invalid (bad-cbtx-assetlocked-amount), and an invalid one
+        // (CheckAssetLockTx) is invalid on its own; ProTx types change the
+        // committed MN-list root. The pin lane is plain zero-fee
+        // consolidation: refuse every special tx by name. Chain-state
+        // independent, so it runs before the coin lookups.
+        if (tx.type != 0)
+            return PinnedTxGate::SpecialTx;
         auto* utxo = m_utxo.load();
         if (utxo == nullptr && !m_external_coin_lookup)
             return PinnedTxGate::UtxoViewUnset;
@@ -722,6 +736,9 @@ public:
                              // full set, but non-standard in dashd (IsStandardTx:
                              // scriptpubkey), which never relays or mines it; c2pool
                              // admits nothing dashd would refuse to relay here.
+        BadAssetLock,        // a type-8 asset lock that fails CheckAssetLockTx
+                             // (asset_lock_fold.hpp, Dash Core's reject reason).
+                             // The selector would drop it anyway; refuse by name.
     };
     static const char* inject_gate_name(InjectGate g) {
         switch (g) {
@@ -737,6 +754,7 @@ public:
             case InjectGate::FeeAboveMax:        return "inject-fee-above-max";
             case InjectGate::ScriptInvalid:      return "inject-script-invalid";
             case InjectGate::SpentShapedOutput:  return "inject-spent-shaped-output";
+            case InjectGate::BadAssetLock:       return "inject-bad-assetlocktx";
         }
         return "inject-unknown";
     }
@@ -2721,6 +2739,10 @@ private:
         //     that refusal would surface here as AlreadyConfirmed; name it.
         if (contextual_tx_check(tx, /*is_coinbase=*/false))
             return InjectGate::BadVersionOrType;
+        // (1b) CheckAssetLockTx for a type-8 inject, pre-v24 rules as the
+        //     template applies them (the selection gate is the belt).
+        if (tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE && !check_asset_lock_tx(tx))
+            return InjectGate::BadAssetLock;
         // (2) new-seam script-verify requirement (fail-closed).
         if (!m_script_check)
             return InjectGate::ScriptCheckUnarmed;

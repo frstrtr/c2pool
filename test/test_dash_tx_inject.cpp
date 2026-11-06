@@ -1433,6 +1433,54 @@ TEST(DashTxInject, SpentShapedOutputRefusedAtAdmissionByName)
 // (VERIFY-S2 Must-Fix 1, the relay seam) A peer that is not a dashd can relay
 // the same shape (dashd itself never does). add_tx refuses it too, so no path
 // serves a tx whose block our own full set would refuse.
+// H0 (VERIFY-H0-S0-S1 N-H0-1): an injected type-8 asset lock that fails
+// CheckAssetLockTx is refused at admission by name (the selector's type-8
+// gate is the belt). The check is chain-state independent, so it answers
+// before the script-check requirement; a lock Dash Core accepts goes on to the
+// next gates.
+TEST(DashTxInject, InvalidAssetLockRefusedAtAdmissionByName)
+{
+    Mempool mp;   // no script check armed: the shape gates answer first
+    auto lock = [](uint8_t payload_version, bool p2sh_credit) {
+        MutableTransaction tx;
+        tx.version = 3; tx.type = 8;
+        TxIn in; in.prevout.hash = prevhash(0xa8); in.prevout.index = 0;
+        in.sequence = 0xffffffffu; tx.vin.push_back(in);
+        TxOut marker; marker.value = 50'000; marker.scriptPubKey = to_script({0x6a, 0x00});
+        tx.vout.push_back(marker);
+        dash::coin::vendor::CAssetLockPayload pl; pl.nVersion = payload_version;
+        TxOut credit; credit.value = 50'000;
+        if (p2sh_credit) {
+            std::vector<uint8_t> spk{0xa9, 0x14};
+            spk.resize(22, 0x42);
+            spk.push_back(0x87);
+            credit.scriptPubKey = to_script(spk);
+        } else {
+            std::vector<uint8_t> spk{0x76, 0xa9, 0x14};
+            spk.resize(23, 0x42);
+            spk.push_back(0x88); spk.push_back(0xac);
+            credit.scriptPubKey = to_script(spk);
+        }
+        pl.creditOutputs.push_back(credit);
+        auto ps = ::pack(pl); auto sp = ps.get_span();
+        tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                                reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+        return tx;
+    };
+    const auto v2 = lock(2, false);
+    const auto p2sh = lock(1, true);
+    ASSERT_FALSE(dash::coin::check_asset_lock_tx(v2));
+    ASSERT_FALSE(dash::coin::check_asset_lock_tx(p2sh));
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(v2)), "inject-bad-assetlocktx");
+    EXPECT_STREQ(Mempool::inject_gate_name(mp.add_inject(p2sh)), "inject-bad-assetlocktx");
+    EXPECT_FALSE(mp.get_entry(dash_txid(v2)).has_value());
+    EXPECT_TRUE(mp.inject_txids_in_pool().empty());
+    // Control: a valid lock passes this gate (and stops at the next one).
+    const auto good = lock(1, false);
+    ASSERT_TRUE(dash::coin::check_asset_lock_tx(good));
+    EXPECT_EQ(mp.add_inject(good), Mempool::InjectGate::ScriptCheckUnarmed);
+}
+
 TEST(DashMempool, RelaySeamNeverAdmitsASpentShapedOutput)
 {
     Key k(0x5c);

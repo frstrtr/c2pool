@@ -2139,6 +2139,58 @@ TEST(DashSupersetSpecialTx, H0InvalidType8LocksNeverRideTheBody) {
     EXPECT_EQ(cb.creditPoolBalance, SEED + platform + LOCK);
 }
 
+// H0 (VERIFY-H0-S0-S1 N-H0-1): a pinned tx is spliced after the coinbase is
+// built, past every selection gate. A type-8 asset lock there is invalid on its
+// own when it fails CheckAssetLockTx, and even a valid one changes the
+// creditPoolBalance the coinbase already committed (bad-cbtx-assetlocked-
+// amount). Every special tx is refused by name, before any coin lookup. The
+// locks below pass every other face (unspent, mature, fee exactly zero, small),
+// as the plain-tx control over the same coin shows.
+TEST(DashPinGate, SpecialTxIsNeverPinnable) {
+    UTXOViewCache utxo(nullptr);
+    Mempool mp; mp.set_utxo(&utxo);
+    auto mnstates = single_mn(p2pkh_script(0x30));
+    const int64_t LOCK = 70'000;
+    auto zero_fee_lock = [&](uint8_t seed, uint8_t payload_version) {
+        const uint256 pv = mint_hash(seed);
+        utxo.add_coin(Outpoint(pv, 0), Coin(LOCK, {}, H - 5'000, /*cb=*/false));
+        auto tx = make_asset_lock_tx(pv, LOCK, /*salt=*/seed);   // in == out: fee 0
+        if (payload_version != 1) {
+            dash::coin::vendor::CAssetLockPayload pl; pl.nVersion = payload_version;
+            TxOut credit; credit.value = LOCK; credit.scriptPubKey.m_data = p2pkh_script(0x30);
+            pl.creditOutputs.push_back(credit);
+            auto ps = ::pack(pl); auto sp = ps.get_span();
+            tx.extra_payload.assign(reinterpret_cast<const unsigned char*>(sp.data()),
+                                    reinterpret_cast<const unsigned char*>(sp.data()) + sp.size());
+        }
+        return tx;
+    };
+    // (a) fails CheckAssetLockTx (version 2 before v24).
+    const auto bad_lock = zero_fee_lock(0xD1, 2);
+    ASSERT_FALSE(dash::coin::check_asset_lock_tx(bad_lock));
+    // (b) a lock Dash Core accepts, still unpinnable (the committed pool).
+    const auto good_lock = zero_fee_lock(0xD2, 1);
+    ASSERT_TRUE(dash::coin::check_asset_lock_tx(good_lock));
+    for (const auto* pin : {&bad_lock, &good_lock}) {
+        EXPECT_EQ(mp.pinned_tx_admissible(*pin, H), dash::coin::Mempool::PinnedTxGate::SpecialTx);
+        const auto v = dash::coin::pin_gate_verdict(*pin, mp, mnstates, H);
+        EXPECT_FALSE(v.ok);
+        EXPECT_STREQ(v.cause, "special-tx-not-pinnable");
+    }
+    // The splice leaves the template untouched.
+    DashWorkData w;
+    w.m_height = H;
+    const auto rep = dash::coin::splice_pinned_txs(w, {bad_lock, good_lock}, mp, mnstates, "GBT-EMB");
+    EXPECT_EQ(rep.included, 0u);
+    EXPECT_TRUE(w.m_tx_hashes.empty());
+    // Control: the same coin spent by a plain zero-fee tx is admissible.
+    MutableTransaction plain;
+    plain.version = 2; plain.type = 0;
+    { TxIn i; i.prevout.hash = mint_hash(0xD2); i.prevout.index = 0; i.sequence = 0xffffffffu; plain.vin.push_back(i); }
+    { TxOut o; o.value = LOCK; o.scriptPubKey.m_data = p2pkh_script(0x31); plain.vout.push_back(o); }
+    EXPECT_EQ(mp.pinned_tx_admissible(plain, H), dash::coin::Mempool::PinnedTxGate::Ok);
+}
+
 // H0 hotfix (design §4 item 2): curtime is clamped to at least mintime, as
 // Dash Core's UpdateTime does (nTime = max(MTP(prev) + 1, now)). A clock at or
 // past mintime is unchanged (the G1 golden above pins that side).
