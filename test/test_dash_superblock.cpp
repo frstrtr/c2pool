@@ -1233,3 +1233,71 @@ TEST(DashSuperblock, MainnetSuperblock2542248DerivedAndSelected) {
     ASSERT_TRUE(flipbest.has_value());
     EXPECT_EQ(flipbest->object_hash, hash_of(0x4553));   // winner changed with the tally
 }
+
+// ── Dash Core v24 (S4): payee multiplicity at a superblock ──────────────────
+// From v24 each expected masternode output consumes a DISTINCT coinbase output
+// (payments.cpp FindUnmatchedMasternodePayment, strict) and each superblock
+// payment is matched from the output after the previous match
+// (superblock.cpp CSuperblock::IsValid, is_v24). A v3 payee whose operator
+// takes 50% at the payout script (two equal MN outputs at one script) and a
+// superblock with two identical payments: the template's packed payments --
+// emitted one output each by every builder (compute_dash_payouts,
+// build_v36_gentx) -- satisfy both checks.
+TEST(DashSuperblock, V24PayoutSetAndDuplicateSuperblockPaymentsUnderStrictMultiplicity) {
+    MNState st;
+    st.isValid = true;
+    st.nRegisteredHeight = 1;
+    st.nVersion = 3;
+    vendor::MasternodePayoutShare p;
+    p.scriptPayout.m_data = kScriptYcn2;
+    p.reward = 10000;
+    st.v24.payouts = {p};
+    st.nOperatorReward = 5000;
+    st.scriptOperatorPayout.m_data = kScriptYcn2;
+    st.payoutSplitProvenance = MNState::SPLIT_KNOWN;
+    MnStateMachine mn;
+    uint256 pro;
+    pro.SetHex("51238bb9e2b68fc8000000000000000000000000000000000000000000000001");
+    mn.load(std::vector<std::pair<uint256, MNState>>{{pro, st}});
+    Mempool mp;
+    std::vector<SuperblockPayment> sched = {{kScriptYeRZ, 500'000'000LL}, {kScriptYeRZ, 500'000'000LL}};
+    DashWorkData w = build_embedded_workdata(
+        1519824 - 1, uint256::ZERO, mn, mp,
+        0x1e0ffff0, 1'700'000'000u, 140, 19,
+        1'700'000'100u, 0x20000000u,
+        nullptr, nullptr, nullptr, 0, k_zero_cl_sig, 0,
+        nullptr, nullptr, DASH_MN_RR_HEIGHT_TESTNET, &sched);
+
+    struct Out { int64_t value; OPScript scriptPubKey; };
+    std::vector<Out> vout;
+    vout.push_back({1, {}});                                   // the miners' output(s)
+    vout.back().scriptPubKey.m_data = kScriptYcn2;             // even at a payee's script
+    for (const auto& pp : w.m_packed_payments) {
+        Out o;
+        o.value = static_cast<int64_t>(pp.amount);
+        o.scriptPubKey.m_data = pp.payee == "!6a" ? std::vector<unsigned char>{0x6a}
+                                                  : ::core::address_to_script(pp.payee);
+        ASSERT_FALSE(o.scriptPubKey.m_data.empty()) << pp.payee;
+        vout.push_back(o);
+    }
+    // Strict masternode match: both equal halves need their own output.
+    const auto R = v24::match_mn_payment(st, vout);
+    ASSERT_TRUE(R.has_value());
+    EXPECT_EQ(*R, static_cast<int64_t>(w.m_payment_amount));
+    const auto due = v24::expected_mn_outputs(st, *R);
+    ASSERT_EQ(due.size(), 2u);
+    EXPECT_EQ(due[0], due[1]) << "two equal outputs at one script";
+    // The v24 superblock scan: each payment past the previous match.
+    int idx = -1;
+    for (const auto& sp : sched) {
+        bool found = false;
+        for (int j = idx + 1; j < static_cast<int>(vout.size()); ++j) {
+            if (vout[j].scriptPubKey.m_data == sp.script && vout[j].value == sp.amount) {
+                idx = j;
+                found = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "superblock payment not matched past index " << idx;
+    }
+}

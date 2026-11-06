@@ -3212,8 +3212,16 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     // netInfo chain parameters. Testnet activated at 1,578,000; on mainnet
     // the height stays "never" until S0's versionbits tracker supplies it.
     if (dash::SharechainConfig::is_testnet) {
-        node_coin_state.mnstates().set_v24_height(dash::coin::v24::kTestnetActivationHeight);
-        node_coin_state.mnstates().set_netinfo_rules(dash::coin::vendor::NetInfoRules::testnet());
+        // The projection's chain heights from the same testnet gates the
+        // replay engines use (FoldGates::testnet()): DIP3 activation for its
+        // ContextualCheckTransaction pre-scan (the mainnet default 1,028,160
+        // left testnet blocks 7,000..1,028,159 unchecked). Its payee selection
+        // assumes MN_RR active (no Evo 4-in-a-row bonus), true on testnet from
+        // 1,066,900.
+        const auto tg = dash::coin::replay::FoldGates::testnet();
+        node_coin_state.mnstates().set_dip0003_height(static_cast<uint32_t>(tg.dip0003_height));
+        node_coin_state.mnstates().set_v24_height(static_cast<uint32_t>(tg.v24_height));
+        node_coin_state.mnstates().set_netinfo_rules(tg.netinfo_rules);
     }
     if (!fold_live_db.empty()) {
         fold_live = std::make_shared<dash::coin::replay::ReplayUtxoFold>();

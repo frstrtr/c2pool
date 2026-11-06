@@ -160,12 +160,11 @@ struct MNState
     /// projected?") must test THIS script, never scriptPayout alone and never
     /// "any script of this masternode". Mainnet, 2026-10-28: four anchor rows
     /// carry bps=10000 with the operator script equal to the owner script.
+    /// Dash Core v24: a v3 state pays its payout list (the first entry is the
+    /// guaranteed one) and a shared state its shares (v24::guaranteed_payout_script).
     const std::vector<unsigned char>& first_payout_script() const
     {
-        return (nOperatorReward == 10000
-                && !scriptOperatorPayout.m_data.empty())
-            ? scriptOperatorPayout.m_data
-            : scriptPayout.m_data;
+        return v24::guaranteed_payout_script(*this);
     }
 
     // Row codec (format 3). The pre-v24 fields keep their exact format-2

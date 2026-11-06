@@ -22,6 +22,9 @@
 //   C2POOL_REPLAY_MEMBERS   optional quorum-member sets, format below
 //   C2POOL_REPLAY_STOP      optional height to stop at (default: end of file)
 //   C2POOL_REPLAY_NETWORK   optional "testnet" (FoldGates::testnet())
+//   C2POOL_REPLAY_GBT       optional dashd getblocktemplate JSON taken at the
+//                           corpus tip: its masternode[] must equal our
+//                           payout set for the next block's payee (S4)
 //   C2POOL_REPLAY_DUMP      optional path: the final list, one line per MN
 //                           (proTxHash nVersion payouts shares early-terms),
 //                           to compare with dashd's `protx list` -- the v24
@@ -54,6 +57,9 @@
 #include <impl/dash/coin/replay_fold_consumer.hpp>
 #include <impl/dash/coin/replay_prestate.hpp>
 #include <impl/dash/coin/block.hpp>
+#include <impl/dash/coin/v24_state.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -199,7 +205,12 @@ TEST(DashReplayRun, AnchorToTipRootChain)
     uint64_t folded = 0, matched = 0, bytes = 0;
     // Transition and payee-check totals (diagnostics, not the proof).
     uint64_t n_reg = 0, n_upd = 0, n_rev = 0, n_spent = 0, n_banned = 0, n_revived = 0;
-    uint64_t n_payee_verified = 0, n_payee_unchecked = 0;
+    uint64_t n_payee_verified = 0, n_payee_unchecked = 0, n_payee_exact = 0;
+    // S4: the whole payout set of EVERY block's payee, recomputed with the
+    // Core v24 port and matched against the mined coinbase (strict
+    // multiplicity, exact amounts) -- v1/v2 payees included.
+    uint64_t n_port_exact = 0, n_port_mismatch = 0;
+    std::string first_port_mismatch;
     uint32_t first_h = 0, last_h = 0;
     uint32_t diverged_at = 0;
     std::string diverge_reason, diverge_computed, diverge_committed;
@@ -228,7 +239,18 @@ TEST(DashReplayRun, AnchorToTipRootChain)
             FAIL() << "unparseable block at h=" << h << ": " << ex.what();
         }
 
+        std::optional<dash::coin::replay::ReplayMNState> payee_pre;
+        if (const auto pp = engine.project_payee(static_cast<int32_t>(h)))
+            if (const auto* st = engine.find(*pp)) payee_pre = *st;
         const auto r = engine.fold_block(block, h);
+        if (r.ok && payee_pre && !block.m_txs.empty()) {
+            if (dash::coin::v24::match_mn_payment(*payee_pre, block.m_txs[0].vout)) {
+                ++n_port_exact;
+            } else {
+                ++n_port_mismatch;
+                if (first_port_mismatch.empty()) first_port_mismatch = std::to_string(h);
+            }
+        }
         if (!r.ok) {
             diverged_at       = h;
             diverge_reason    = r.error;
@@ -250,6 +272,7 @@ TEST(DashReplayRun, AnchorToTipRootChain)
         n_reg += r.registered; n_upd += r.updated; n_rev += r.revoked;
         n_spent += r.collateral_spent; n_banned += r.banned; n_revived += r.revived;
         if (r.payee_paid_verified) ++n_payee_verified; else ++n_payee_unchecked;
+        if (r.payee_amounts_verified) ++n_payee_exact;
 
         if (h % 500 == 0) {
             const double secs = std::chrono::duration<double>(
@@ -280,7 +303,10 @@ TEST(DashReplayRun, AnchorToTipRootChain)
               << " revoked=" << n_rev << " collateral_spent=" << n_spent
               << " banned=" << n_banned << " revived=" << n_revived << "\n"
               << "  payee checks      verified=" << n_payee_verified
-              << " not checked=" << n_payee_unchecked << "\n";
+              << " not checked=" << n_payee_unchecked
+              << " (exact v24 payout set: " << n_payee_exact << ")\n"
+              << "  port payout set   exact=" << n_port_exact << " mismatch=" << n_port_mismatch
+              << (first_port_mismatch.empty() ? std::string() : " first=" + first_port_mismatch) << "\n";
     if (diverged_at)
         std::cout << "  *** FIRST DIVERGENCE at h=" << diverged_at << "\n"
                   << "      computed  " << diverge_computed << "\n"
@@ -315,6 +341,37 @@ TEST(DashReplayRun, AnchorToTipRootChain)
                 << " banned=" << (st.IsBanned() ? 1 : 0) << "\n";
         }
         std::cout << "  final list dumped to " << dump << "\n";
+    }
+
+    EXPECT_EQ(n_port_mismatch, 0u) << "a mined coinbase does not carry the ported payout set (first h="
+                                   << first_port_mismatch << ")";
+
+    // S4 differential against dashd's own template for the next block.
+    if (const char* gp = env_or_null("C2POOL_REPLAY_GBT"); gp && !diverged_at) {
+        std::ifstream gf(gp);
+        ASSERT_TRUE(gf.good()) << "cannot open " << gp;
+        const auto gbt = nlohmann::json::parse(gf);
+        ASSERT_EQ(gbt.value("height", 0u), last_h + 1) << "GBT is not for the block after the corpus tip";
+        const auto pp = engine.project_payee(static_cast<int32_t>(last_h + 1));
+        ASSERT_TRUE(pp.has_value());
+        const auto* st = engine.find(*pp);
+        ASSERT_NE(st, nullptr);
+        std::vector<dash::coin::v24::MnPayout> theirs;
+        int64_t reward = 0;
+        for (const auto& m : gbt.at("masternode")) {
+            const std::string sh = m.value("script", "");
+            if (sh == "6a") continue;   // the platform burn
+            std::vector<unsigned char> sc;
+            for (size_t i = 0; i + 1 < sh.size(); i += 2)
+                sc.push_back(static_cast<unsigned char>(std::stoul(sh.substr(i, 2), nullptr, 16)));
+            theirs.push_back({sc, m.at("amount").get<int64_t>()});
+            reward += m.at("amount").get<int64_t>();
+        }
+        const auto ours = dash::coin::v24::expected_mn_outputs(*st, reward);
+        std::cout << "  GBT differential  h=" << last_h + 1 << " payee=" << pp->GetHex().substr(0, 16)
+                  << " outputs dashd=" << theirs.size() << " ours=" << ours.size()
+                  << (ours == theirs ? " IDENTICAL" : " DIFFER") << "\n";
+        EXPECT_EQ(ours, theirs) << "our payout set differs from dashd's getblocktemplate masternode[]";
     }
 
     EXPECT_EQ(diverged_at, 0u)

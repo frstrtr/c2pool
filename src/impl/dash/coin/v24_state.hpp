@@ -39,6 +39,7 @@
 #include <impl/dash/coin/v24_rules.hpp>
 #include <impl/dash/coin/vendor/netinfo.hpp>
 #include <impl/dash/coin/vendor/providertx.hpp>
+#include <impl/dash/coin/vendor/masternode_payments.hpp>   // Core v24 payments.cpp / providertx_util.cpp port
 #include <impl/bitcoin_family/coin/base_transaction.hpp>
 
 #include <algorithm>
@@ -125,9 +126,7 @@ inline bool share_list_voting_key_safe(const vendor::CollateralShares& shares, c
 inline int64_t pro_rata_floor(int64_t total, int64_t weight, int64_t weight_total)
 {
     if (weight_total <= 0) return 0;
-    const unsigned __int128 v = static_cast<unsigned __int128>(static_cast<uint64_t>(total))
-                              * static_cast<uint64_t>(weight) / static_cast<uint64_t>(weight_total);
-    return static_cast<int64_t>(static_cast<uint64_t>(v));
+    return vendor::payments::ProRataFloor(total, weight, weight_total);
 }
 
 /// The current netInfo of a state, as a NetInfoRef. `is_ext` is the kind of
@@ -482,6 +481,113 @@ template <typename Tx>
 std::optional<std::string_view> contextual_tx_check_at(const Tx& tx, bool is_coinbase, bool v24_active_)
 {
     return v24_active_ ? contextual_tx_check_v24(tx, is_coinbase) : contextual_tx_check(tx, is_coinbase);
+}
+
+// ── Masternode payment outputs ───────────────────────────────────────────────
+// Thin wrappers over the verbatim port of Dash Core v24.0.0's
+// GetBlockTxOuts / SplitAmountByShares / GetOwnerPayouts /
+// FindUnmatchedMasternodePayment (vendor/masternode_payments.hpp), in the
+// shapes our producer and checkers use. Payee SELECTION (GetMNPayee) is
+// unchanged in v24 and stays the projection's / the fold's own.
+
+struct MnPayout
+{
+    std::vector<unsigned char> script;
+    int64_t                    amount{0};
+    bool operator==(const MnPayout&) const = default;
+};
+
+inline std::vector<int64_t> split_amount_by_shares(int64_t total, const vendor::CollateralShares& shares)
+{
+    return vendor::payments::SplitAmountByShares(total, shares);
+}
+
+template <typename S>
+vendor::MasternodePayoutShares owner_payouts(const S& st)
+{
+    return vendor::payments::dmn_payee_of(st).owner_payouts;
+}
+
+/// GetBlockTxOuts' masternode outputs for this payee, in Core's order,
+/// after the platform burn: `mn_reward` is the masternode reward with the
+/// platform share already taken (what the producer calls mn_payment).
+template <typename S>
+std::vector<MnPayout> expected_mn_outputs(const S& st, int64_t mn_reward)
+{
+    std::vector<MnPayout> out;
+    if (mn_reward <= 0) return out;
+    const auto payee = vendor::payments::dmn_payee_of(st);
+    std::vector<vendor::payments::CTxOut> vout;
+    vendor::payments::GetBlockTxOutsForPayee(&payee, mn_reward, /*platformReward=*/0,
+                                             /*evo_reward_era=*/false, vout);
+    out.reserve(vout.size());
+    for (auto& o : vout) out.push_back({std::move(o.scriptPubKey), o.nValue});
+    return out;
+}
+
+/// The one script every coinbase paying this masternode carries, whatever
+/// the reward: the operator's when it takes the whole reward (10000 bps),
+/// else the first owner output -- the first share's reward script, the first
+/// v3 payout, or scriptPayout below v3. (Each of those is > 0 for any
+/// reward above a few duffs: a payout weighs >= 100 bps, a share >= 100 DASH
+/// of at most 8.)
+template <typename S>
+const std::vector<unsigned char>& guaranteed_payout_script(const S& st)
+{
+    if (st.nOperatorReward == 10000 && !st.scriptOperatorPayout.m_data.empty())
+        return st.scriptOperatorPayout.m_data;
+    if (!st.v24.shares.empty()) return st.v24.shares.front().RewardScript().m_data;
+    if (st.nVersion >= vendor::ProTxVersion::EXT_ADDR && !st.v24.payouts.empty())
+        return st.v24.payouts.front().scriptPayout.m_data;
+    return st.scriptPayout.m_data;
+}
+
+/// IsTransactionValid's payee check against a MINED coinbase whose
+/// masternode reward is not known to the caller (it includes the block's
+/// fees): every candidate reward R implied by an assignment of distinct
+/// coinbase outputs to this payee's expected scripts is tested with Core's
+/// own FindUnmatchedMasternodePayment(expected(R), coinbase, strict) -- the
+/// v24 rule (strict multiplicity). Returns the R that matches, or nullopt.
+/// The candidate search is bounded (`max_leaves`); a payee has at most 9
+/// outputs.
+template <typename S, typename TxOut>
+std::optional<int64_t> match_mn_payment(const S& st, const std::vector<TxOut>& vout,
+                                        size_t max_leaves = 4096)
+{
+    // The scripts in Core's order, at a reward large enough that every entry
+    // is non-zero (the amounts are re-derived per candidate below).
+    const auto shape = expected_mn_outputs(st, int64_t{1'000'000'000'000});
+    if (shape.empty()) return std::nullopt;
+    std::vector<vendor::payments::CTxOut> actual;
+    actual.reserve(vout.size());
+    for (const auto& o : vout) actual.emplace_back(o.value, o.scriptPubKey.m_data);
+    std::vector<size_t> pick(shape.size());
+    std::vector<bool> used(vout.size(), false);
+    size_t leaves = 0;
+    std::optional<int64_t> found;
+    auto dfs = [&](auto&& self, size_t i) -> void {
+        if (found || leaves >= max_leaves) return;
+        if (i == shape.size()) {
+            ++leaves;
+            int64_t total = 0;
+            for (size_t k : pick) total += vout[k].value;
+            std::vector<vendor::payments::CTxOut> expected;
+            for (auto& o : expected_mn_outputs(st, total)) expected.emplace_back(o.amount, std::move(o.script));
+            if (expected.size() == shape.size()
+                && vendor::payments::FindUnmatchedMasternodePayment(expected, actual, /*strict_multiplicity=*/true) == -1)
+                found = total;
+            return;
+        }
+        for (size_t j = 0; j < vout.size(); ++j) {
+            if (used[j] || vout[j].scriptPubKey.m_data != shape[i].script) continue;
+            used[j] = true;
+            pick[i] = j;
+            self(self, i + 1);
+            used[j] = false;
+        }
+    };
+    dfs(dfs, 0);
+    return found;
 }
 
 } // namespace v24

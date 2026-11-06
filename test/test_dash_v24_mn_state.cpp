@@ -866,3 +866,223 @@ TEST(DashV24Formats, ReplayPrestateFormat2CarriesAV3State)
     t1 += "\n";
     EXPECT_FALSE(dash::coin::replay::parse_prestate_text(t1).ok);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S4: the masternode payout set (Dash Core v24.0.0 masternode/payments.cpp
+// GetBlockTxOuts, providertx_util.cpp SplitAmountByShares)
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+std::vector<unsigned char> pkh_script(uint8_t b) { return p2pkh(h160(b)).m_data; }
+
+std::vector<unsigned char> unhex(const std::string& h)
+{
+    std::vector<unsigned char> b;
+    for (size_t i = 0; i + 1 < h.size(); i += 2) b.push_back(static_cast<unsigned char>(std::stoi(h.substr(i, 2), nullptr, 16)));
+    return b;
+}
+
+v::MasternodePayoutShare payout(uint8_t b, uint16_t reward)
+{
+    v::MasternodePayoutShare x;
+    x.scriptPayout.m_data = pkh_script(b);
+    x.reward = reward;
+    return x;
+}
+
+struct Out { int64_t value; OPScript scriptPubKey; };
+Out out(int64_t v, const std::vector<unsigned char>& s) { Out o; o.value = v; o.scriptPubKey.m_data = s; return o; }
+
+std::vector<v24::MnPayout> outs_of(std::initializer_list<std::pair<std::vector<unsigned char>, int64_t>> l)
+{
+    std::vector<v24::MnPayout> r;
+    for (const auto& [s, a] : l) r.push_back({s, a});
+    return r;
+}
+} // namespace
+
+// SplitAmountByShares: ProRataFloor for all but the last; the last takes the
+// remainder; the split always sums to the total (Core's DIP-0026 convention).
+TEST(DashV24Payees, SplitAmountBySharesRoundsLikeCore)
+{
+    auto sh = two_shares();                          // 600 + 400 DASH
+    auto a = v24::split_amount_by_shares(1'000'000'001, sh);
+    ASSERT_EQ(a.size(), 2u);
+    EXPECT_EQ(a[0], 600'000'000);                    // floor(1e9+1 * 600/1000)
+    EXPECT_EQ(a[1], 400'000'001);                    // the remainder
+    // 8 uneven shares: every entry but the last is a floor, the sum is exact.
+    v::CollateralShares eight;
+    const int64_t amts[8] = {101, 102, 103, 104, 105, 106, 107, 272};
+    int64_t wt = 0;
+    for (int i = 0; i < 8; ++i) {
+        v::CCollateralShare x;
+        x.amount = amts[i] * v::CCollateralShare::COIN;
+        wt += x.amount;
+        eight.push_back(x);
+    }
+    const int64_t total = 77'049'999;
+    auto e = v24::split_amount_by_shares(total, eight);
+    int64_t sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (i < 7)
+            EXPECT_EQ(e[i], static_cast<int64_t>(static_cast<__int128>(total) * eight[i].amount / wt)) << i;
+        sum += e[i];
+    }
+    EXPECT_EQ(sum, total);
+    // 128-bit intermediate: total * amount overflows int64.
+    v::CollateralShares big(2);
+    big[0].amount = 2'000'000'000'000'000'000;       // 2e18
+    big[1].amount = 2'000'000'000'000'000'000;
+    auto b = v24::split_amount_by_shares(9'000'000'000'000'000'000, big);
+    EXPECT_EQ(b[0], 4'500'000'000'000'000'000);
+    EXPECT_EQ(b[1], 4'500'000'000'000'000'000);
+}
+
+// GetBlockTxOuts below v3: exactly the owner/operator pair the pre-v24
+// builder emitted (the operator split floors, the owner keeps the rest; a
+// full operator share has no owner output; no script means no split).
+TEST(DashV24Payees, LegacyStatesPayTheOwnerOperatorPairUnchanged)
+{
+    MNState st;
+    st.nVersion = 2;
+    st.scriptPayout.m_data = pkh_script(0x10);
+    const int64_t R = 77'049'999;
+    EXPECT_EQ(v24::expected_mn_outputs(st, R), outs_of({{pkh_script(0x10), R}}));
+    st.nOperatorReward = 800;
+    EXPECT_EQ(v24::expected_mn_outputs(st, R), outs_of({{pkh_script(0x10), R}}))
+        << "bps without an operator script: no split";
+    st.scriptOperatorPayout.m_data = pkh_script(0x20);
+    const int64_t op = R * 800 / 10000;
+    EXPECT_EQ(v24::expected_mn_outputs(st, R),
+              outs_of({{pkh_script(0x10), R - op}, {pkh_script(0x20), op}}));
+    EXPECT_EQ(st.operator_payment_of(R), op) << "the pre-v24 formula agrees";
+    st.nOperatorReward = 10000;
+    EXPECT_EQ(v24::expected_mn_outputs(st, R), outs_of({{pkh_script(0x20), R}}));
+    EXPECT_EQ(v24::guaranteed_payout_script(st), pkh_script(0x20));
+    st.nOperatorReward = 5000;                       // 50/50 to one script: two outputs
+    st.scriptOperatorPayout.m_data = pkh_script(0x10);
+    EXPECT_EQ(v24::expected_mn_outputs(st, 100), outs_of({{pkh_script(0x10), 50}, {pkh_script(0x10), 50}}));
+    EXPECT_TRUE(v24::expected_mn_outputs(st, 0).empty());
+}
+
+// A v3 payout list: every entry but the last gets reward * bps / 10000, the
+// last the remainder; the operator output comes after the owner outputs.
+TEST(DashV24Payees, PayoutListSplitsWithTheRemainderLast)
+{
+    MNState st;
+    st.nVersion = 3;
+    st.v24.payouts = {payout(0x31, 6000), payout(0x32, 4000)};
+    st.nOperatorReward = 1000;
+    st.scriptOperatorPayout.m_data = pkh_script(0x3f);
+    const int64_t R = 77'049'999;
+    const int64_t op = R * 1000 / 10000;             // 7'704'999
+    const int64_t own = R - op;                      // 69'345'000
+    const int64_t p0 = own * 6000 / 10000;
+    EXPECT_EQ(v24::expected_mn_outputs(st, R),
+              outs_of({{pkh_script(0x31), p0}, {pkh_script(0x32), own - p0}, {pkh_script(0x3f), op}}));
+    EXPECT_EQ(v24::guaranteed_payout_script(st), pkh_script(0x31));
+    // 8 entries, seven at the 100-bps minimum: the last carries the rest.
+    st.nOperatorReward = 0;
+    st.v24.payouts.clear();
+    for (uint8_t i = 0; i < 7; ++i) st.v24.payouts.push_back(payout(0x40 + i, 100));
+    st.v24.payouts.push_back(payout(0x47, 9300));
+    const auto e = v24::expected_mn_outputs(st, 12'345);
+    ASSERT_EQ(e.size(), 8u);
+    for (size_t i = 0; i < 7; ++i) EXPECT_EQ(e[i].amount, 123) << i;   // floor(12345 * 100 / 10000)
+    EXPECT_EQ(e[7].amount, 12'345 - 7 * 123);
+    // A tiny reward floors entries to zero: Core emits only the > 0 ones.
+    const auto t = v24::expected_mn_outputs(st, 50);
+    ASSERT_EQ(t.size(), 1u);
+    EXPECT_EQ(t[0], (v24::MnPayout{pkh_script(0x47), 50}));
+}
+
+// A shared masternode: the owner reward split by collateral share, each to
+// its reward script or, when that is empty, its refund script; then the
+// operator.
+TEST(DashV24Payees, SharedMasternodeSplitsByShareToTheRewardScript)
+{
+    MNState st;
+    st.nVersion = 3;
+    st.v24.shares = two_shares();
+    st.v24.shares[0].scriptReward.m_data.clear();    // pays the refund script
+    st.nOperatorReward = 500;
+    st.scriptOperatorPayout.m_data = pkh_script(0x5f);
+    const int64_t R = 100'000'003;
+    const int64_t op = R * 500 / 10000;
+    const auto split = v24::split_amount_by_shares(R - op, st.v24.shares);
+    EXPECT_EQ(v24::expected_mn_outputs(st, R),
+              outs_of({{st.v24.shares[0].scriptRefund.m_data, split[0]},
+                       {st.v24.shares[1].RewardScript().m_data, split[1]},
+                       {pkh_script(0x5f), op}}));
+    EXPECT_EQ(v24::guaranteed_payout_script(st), st.v24.shares[0].scriptRefund.m_data);
+}
+
+// The strict-multiplicity match against a coinbase: each expected output
+// consumes a DISTINCT output, the amounts are the split of their sum; a
+// missing output, a one-duff drift or a doubled script with one output fail.
+TEST(DashV24Payees, MatchFindsTheExactPayoutSetWithDistinctOutputs)
+{
+    MNState st;
+    st.nVersion = 3;
+    st.v24.payouts = {payout(0x31, 6000), payout(0x32, 4000)};
+    st.nOperatorReward = 5000;
+    st.scriptOperatorPayout.m_data = pkh_script(0x31);   // the operator paid to payout #0's script
+    const int64_t R = 80'000'001;
+    const auto e = v24::expected_mn_outputs(st, R);
+    ASSERT_EQ(e.size(), 3u);
+    std::vector<Out> cb = {out(1'000, pkh_script(0x31)),          // a miner output at the same script
+                           out(66'966'830, {0x6a}),               // the platform burn
+                           out(e[0].amount, e[0].script),
+                           out(e[1].amount, e[1].script),
+                           out(e[2].amount, e[2].script),
+                           out(5, pkh_script(0x99))};
+    EXPECT_EQ(v24::match_mn_payment(st, cb), std::optional<int64_t>{R});
+    auto missing = cb;
+    missing.erase(missing.begin() + 4);                            // the operator output gone
+    EXPECT_EQ(v24::match_mn_payment(st, missing), std::nullopt);
+    auto drift = cb;
+    drift[3].value += 1;
+    EXPECT_EQ(v24::match_mn_payment(st, drift), std::nullopt);
+    // Equal amounts at one script need two outputs (strict multiplicity).
+    st.v24.payouts = {payout(0x31, 10000)};
+    const auto f = v24::expected_mn_outputs(st, 100);
+    ASSERT_EQ(f.size(), 2u);
+    EXPECT_EQ(v24::match_mn_payment(st, std::vector<Out>{out(50, pkh_script(0x31))}), std::nullopt);
+    EXPECT_EQ(v24::match_mn_payment(st, std::vector<Out>{out(50, pkh_script(0x31)), out(50, pkh_script(0x31))}),
+              std::optional<int64_t>{100});
+}
+
+// Real testnet coinbases after activation (VM504 dashd 24.0.0): blocks paying
+// v3 masternodes. 1,585,943 pays 51238bb9 (v3, 10% operator reward but no
+// operator script: no split); 1,585,982 pays deededf9 (v3, registered after
+// activation). Each coinbase: miner, platform burn, the payee's one output.
+TEST(DashV24Payees, RealTestnetV3PayeeCoinbases)
+{
+    struct Case { const char* cb; const char* script; uint16_t bps; int64_t paid; };
+    const Case cases[] = {
+        {"03000500010000000000000000000000000000000000000000000000000000000000000000ffffffff016affffffff039b5d8c03000000001976a914b489115851ca07a26a5ad8bac3cec3c7dbebd83188ac2ed5fd0300000000016aa143a706000000001976a914288e0340106fb37e4cba12e21c2af87e965ebb8b88ac00000000cf040017331800ab71bc14ab55fa24f37af5de586d4277ef561bbca203842ac95efcc9b45d7a896cc41520d4315fc828ace1c164bb186e6fdbc37750c0b7fe786bb44d1316e7520086fdb34fdd28130a4da0d38b4d06bee3eadfd4d3955882823a245d61de3a83e09c8f64c5488578b1106662a6e0288df300a74c7dcc9bc2b4cc1cb8e6ad94394523aaf2161f57c23b68bd108ddb71b9bbb5610525a848440309c0e18822ce7f9dfa805523982200000000000000000000000000000000000000000000000000000000000000000000",
+         "76a914288e0340106fb37e4cba12e21c2af87e965ebb8b88ac", 1000, 111'625'121},
+        {"03000500010000000000000000000000000000000000000000000000000000000000000000ffffffff016affffffff03b4558c03000000001976a914b489115851ca07a26a5ad8bac3cec3c7dbebd83188ac2ed5fd0300000000016aed2ba706000000001976a914482551fcc51ba10000202e7d6a7938cba1cd28ef88ac00000000cf04003e331800ab71bc14ab55fa24f37af5de586d4277ef561bbca203842ac95efcc9b45d7a89912f37905454b425ec10007a2718f5a055959f75d58ed8c6c41353a30e81766d008e66b50f91a9b5e31ffb30cd23d853a16c129cd3c383c1e4ca685d32f49dbfdafab1950d2b48406b7c2f873d943096fa08509a59aa42d693d6f9ab76f4889a24a3934202551ad8ab33725a5912975f7e1c57e2cdc3e9d3586f0e0483bed1cd11197eef8d982200000000000000000000000000000000000000000000000000000000000000000000",
+         "76a914482551fcc51ba10000202e7d6a7938cba1cd28ef88ac", 0, 111'619'053},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.script);
+        ::PackStream ps(unhex(c.cb));
+        dash::coin::MutableTransaction cb;
+        ps >> cb;
+        ASSERT_TRUE(ps.empty());
+        MNState st;
+        st.nVersion = 3;
+        v::MasternodePayoutShare p;
+        p.scriptPayout.m_data = unhex(c.script);
+        p.reward = 10000;
+        st.v24.payouts = {p};
+        st.nOperatorReward = c.bps;                  // no operator script: no operator output
+        EXPECT_EQ(v24::guaranteed_payout_script(st), unhex(c.script));
+        const auto R = v24::match_mn_payment(st, cb.vout);
+        ASSERT_EQ(R, std::optional<int64_t>{c.paid});
+        EXPECT_EQ(v24::expected_mn_outputs(st, *R), outs_of({{unhex(c.script), c.paid}}));
+        // The pre-S4 check read scriptPayout, which a v3 state no longer has.
+        EXPECT_TRUE(st.scriptPayout.m_data.empty());
+    }
+}
