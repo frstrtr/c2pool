@@ -5953,6 +5953,37 @@ TEST(DashMnBridgeCursor, AFormatV1RecordFromTheFalseSplitDetectorIsRefusedAndRep
     EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
 }
 
+// ── 6c. A v2 record is REFUSED (P-3): it copies a projection store that mixed
+//     dashd's LEGACY bytes for v1 operator keys with basic bytes the
+//     projection wrote. Legacy and basic encodings overlap, so a resume
+//     would bring back the phantom operator changes (a same-point ProUpRegTx
+//     read as a key change: reset + ban) and the negated-key ambiguity. The
+//     bridge starts COLD from the compiled anchor, whose keys the checkpoint
+//     parser converts strictly.
+TEST(DashMnBridgeCursor, AFormatV2RecordWithMixedOperatorKeysIsRefusedAndReplayedCold)
+{
+    EXPECT_GE(MnBridgeCursorStore::kFormatVersion, 3u)
+        << "a v2 cursor carries mixed legacy/basic operator keys";
+    TempCursorStore cs("fmtv2");
+    { CursorRun a(&cs.store, 1519545); a.run(); ASSERT_TRUE(a.h.published); }
+    auto b = cs.raw();
+    ASSERT_GT(b.size(), 28u);
+    b[24] = 2; b[25] = 0; b[26] = 0; b[27] = 0;   // byte for byte what a v2 build wrote
+    cs.write_raw(b);
+    std::string why;
+    EXPECT_FALSE(cs.store.load(why).has_value()) << "a v2 record must never be resumed into: " << why;
+    EXPECT_NE(why.find("format v2"), std::string::npos) << why;
+    CursorRun r(&cs.store, 1519546);
+    r.run();
+    EXPECT_FALSE(r.h.lane.cursor_restored());
+    EXPECT_NE(r.h.lane.restore_verdict().find("COLD"), std::string::npos) << r.h.lane.restore_verdict();
+    ASSERT_TRUE(r.h.published) << r.h.lane.status();
+    EXPECT_EQ(r.h.lane.replay_applied(), 3u) << "a refused v2 record must produce a FULL cold replay from the anchor";
+    const auto after = cs.raw();
+    ASSERT_GT(after.size(), 28u);
+    EXPECT_EQ(after[24], static_cast<uint8_t>(MnBridgeCursorStore::kFormatVersion));
+}
+
 // ── 7. A fail-closed bridge must not be resumable ──────────────────────────
 TEST(DashMnBridgeCursor, FailClosedErasesTheRecordSoARestartCannotResumeIntoIt)
 {

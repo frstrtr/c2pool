@@ -2731,6 +2731,25 @@ private:
             return true;
         }
 
+        // R5 -- the operator-key guard (P-3). The store holds every key as
+        // canonical BASIC bytes (or null). The format bump (v3) is what keeps
+        // a mixed-encoding record out; this re-checks the record anyway: a
+        // key that is not a canonical basic encoding of a valid point cannot
+        // have been written by this build, so the record is refused. (It
+        // cannot catch a legacy encoding that happens to also be a canonical
+        // basic one -- the two forms overlap -- which is why the bump, not
+        // this check, is the fix.)
+        for (const auto& [protx, st] : rec.entries) {
+            if (!vendor::opkey_is_canonical_basic_or_null(st.pubKeyOperator)) {
+                restore_cold(
+                    "R5 operator-key",
+                    "masternode " + protx.GetHex().substr(0, 16)
+                        + " carries an operator key that is not canonical basic"
+                          " bytes -- not a record this build wrote");
+                return true;
+            }
+        }
+
         // ── ACCEPTED. Adopt the record wholesale: the set, the height it is
         // as-of, and every budget the previous process already spent.
         //

@@ -127,6 +127,7 @@
 
 #include <impl/dash/coin/mn_state_db.hpp>        // MNState
 #include <impl/dash/coin/vendor/providertx.hpp>  // MnType / ProTxVersion / BLS_PUBKEY_SIZE
+#include <impl/dash/coin/vendor/bls_verify.hpp>  // opkey_canonical_from_own_scheme (P-3)
 
 #include <core/log.hpp>
 #include <core/uint256.hpp>
@@ -502,6 +503,33 @@ inline MnCheckpoint parse_mn_checkpoint(const std::string& payload,
                                 + ": bad pubKeyOperator '" + f[16] + "'");
                 for (size_t i = 0; i < vendor::BLS_PUBKEY_SIZE; ++i)
                     mn.pubKeyOperator[i] = pk[i];
+                // The key encoding follows the PRODUCER, which the digest-
+                // committed `source` line names (P-3; the store holds
+                // canonical BASIC):
+                //  * c2pool's own dumpers ("self-derived ...", e.g. the
+                //    compiled mainnet anchor) write the replay / projection
+                //    store's canonical BASIC bytes -- kept, after checking
+                //    they are exactly that;
+                //  * anything else is dashd-derived (gen_mn_checkpoint.py:
+                //    "dashd ... RPC", "offline capture", fixtures) and holds
+                //    the key as dashd prints it, LEGACY for v1 -- converted.
+                // Strict either way: no fallback, a key in the wrong form
+                // refuses the checkpoint (the two forms overlap, so guessing
+                // per row could turn a key into its negation).
+                if (cp.source.rfind("self-derived", 0) == 0) {
+                    if (!vendor::opkey_is_canonical_basic_or_null(mn.pubKeyOperator))
+                        return fail("mn line " + std::to_string(lineno)
+                                    + ": pubKeyOperator is not canonical basic bytes in a"
+                                      " self-derived checkpoint");
+                } else {
+                    const auto canon = vendor::opkey_canonical_from_own_scheme(
+                        mn.pubKeyOperator, mn.nVersion);
+                    if (!canon)
+                        return fail("mn line " + std::to_string(lineno)
+                                    + ": pubKeyOperator is not a canonical legacy BLS key"
+                                      " for a v1 entry of a dashd-derived checkpoint");
+                    mn.pubKeyOperator = *canon;
+                }
             }
 
             // DERIVED, never stored — same projection mn_seed.hpp makes.

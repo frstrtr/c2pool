@@ -226,7 +226,11 @@ public:
     // migration explicit instead: on format mismatch wipe the store and
     // let the normal checkpoint/seed reseed rebuild it (the same
     // fail-closed path a payee desync takes).
-    static constexpr uint32_t kFormatVersion = 2;
+    // v3 (P-3): every operator key is canonical BASIC bytes. A v2 store
+    // mixes dashd-seeded LEGACY bytes with projection-written basic ones,
+    // which no byte rule can tell apart; it is cleared and reseeded through
+    // the canonicalizing seed paths (a one-time cold start).
+    static constexpr uint32_t kFormatVersion = 3;
 
     bool open()
     {
@@ -238,9 +242,9 @@ public:
             if (had_rows || stored != 0) {
                 LOG_INFO << "[MNS-DB] format v" << stored << " -> v"
                          << kFormatVersion
-                         << " migration: clearing store (payout-split "
-                            "provenance added); the checkpoint/seed reseed "
-                            "rebuilds it";
+                         << " migration: clearing store (v2: payout-split "
+                            "provenance; v3: canonical operator keys); the "
+                            "checkpoint/seed reseed rebuilds it";
                 if (!clear()) return false;
             }
             store_format_version();
