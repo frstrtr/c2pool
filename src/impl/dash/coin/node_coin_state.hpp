@@ -449,6 +449,12 @@ public:
         m_protx_sig_verifier = std::move(fn);
     }
 
+    /// Dash Core's full CheckPro*Tx for template selection (protx_check.hpp):
+    /// the network and the ECDSA verifier. The builder and the emit gate run
+    /// it on every provider tx they fold. UNSET (default) => no provider tx is
+    /// checkable, so none rides the template (fail closed).
+    void set_protx_check_env(ProTxCheckEnv env) { m_protx_check_env = std::move(env); }
+
     /// Network MN_RR activation height (dashcore Params().GetConsensus()
     /// .MN_RRHeight — per-chainparams). Gates the DIP-0027 platform-share
     /// credit-pool accrual in the template build, the pre-emit value re-check,
@@ -1907,7 +1913,9 @@ public:
             // operator-signature verifier.
             const MnFoldContext fold_ctx = make_template_fold_context(
                 m_mnstates, m_mempool,
-                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr);
+                m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr,
+                m_protx_check_env ? &*m_protx_check_env : nullptr, next_h,
+                v24_state_for(next_h) == V24State::ACTIVE);
             auto fold = fold_mn_special_txs(
                 proj.sml, w.m_txs,
                 [](const Transaction& t) {
@@ -2195,6 +2203,7 @@ public:
         e.qc_pose_oracle  = &m_qc_pose_oracle;
         // B.9: same verifier the emit gate folds with (unset => refused).
         e.protx_sig_verifier = m_protx_sig_verifier ? &m_protx_sig_verifier : nullptr;
+        e.protx_check_env = m_protx_check_env ? &*m_protx_check_env : nullptr;
         return e;
     }
 
@@ -2735,6 +2744,7 @@ private:
     // embedded_template_emit_ok (matching folded-root emit-gate re-derivation).
     bool m_include_mn_special_txs{false};
     MnFoldContext::OperatorSigFn m_protx_sig_verifier;   // B.9 (unset => refuse types 2/4)
+    std::optional<ProTxCheckEnv> m_protx_check_env;      // Core CheckPro*Tx (unset => no provider tx rides)
     // Pinned local tx (set_pinned_local_tx): held by value for the lifetime of
     // this state; the bundle exposes a pointer only when the flag is set.
     // MULTIPLE pins: the donation consolidation had to be SPLIT after

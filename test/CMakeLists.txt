@@ -1002,7 +1002,8 @@ if (BUILD_TESTING AND GTest_FOUND)
     # ProUpServTx / ProUpRevTx operator-signature check against real dashbls
     # keys — rides this BLS-backend target because it signs.
     add_executable(test_dash_govvote_bls test_dash_govvote_bls.cpp
-        test_dash_protx_sig_bls.cpp)
+        test_dash_protx_sig_bls.cpp
+        test_dash_v24_protx_check.cpp)   # S6: Dash Core CheckPro*Tx before a provider tx rides a template
     target_link_libraries(test_dash_govvote_bls PRIVATE
         GTest::gtest_main GTest::gtest
         dash_bls_verify

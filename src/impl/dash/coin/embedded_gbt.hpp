@@ -31,6 +31,7 @@
 #include <impl/dash/coin/mn_state_machine.hpp>
 #include <impl/dash/coin/sml_projection.hpp>    // confirmedHash rollover pass + collateral-spend predicate
 #include <impl/dash/coin/sml_special_fold.hpp>  // template-side types 1-4 MN-list fold (merkleRootMNList parity)
+#include <impl/dash/coin/protx_check.hpp>       // Dash Core CheckPro*Tx for template selection
 #include <impl/dash/coin/sml_pose_fold.hpp>     // serve-time PoSe pass over the body's type-6 commitments
 #include <impl/dash/coin/mempool.hpp>
 #include <impl/dash/coin/inject_ride_log.hpp>  // S2: per-build inject RIDES / HELD lines
@@ -391,9 +392,16 @@ inline PinSpliceReport splice_pinned_txs(DashWorkData& w,
 /// MnStateMachine, external-collateral proofs from the same chain views the
 /// selector priced from (Mempool::prove_chain_coin), and the BLS operator-
 /// signature verifier (nullptr/empty ⇒ ProUpServTx / ProUpRevTx refused).
+///
+/// Every provider tx must also pass Dash Core's full CheckPro*Tx for the block
+/// being built (protx_check.hpp, `next_height`, `v24_active`): without a
+/// ProTxCheckEnv no provider tx is checkable, so none rides (fail closed).
 inline MnFoldContext make_template_fold_context(
     const MnStateMachine& mnstates, const Mempool& mempool,
-    const MnFoldContext::OperatorSigFn* protx_sig_verifier)
+    const MnFoldContext::OperatorSigFn* protx_sig_verifier,
+    const ProTxCheckEnv* protx_check_env = nullptr,
+    uint32_t next_height = 0,
+    bool v24_active = false)
 {
     MnFoldContext::CollateralCoinFn coin =
         [&mempool](const MnFoldContext::Outpoint& op, int64_t& value) {
@@ -409,10 +417,37 @@ inline MnFoldContext make_template_fold_context(
             }
             return MnFoldContext::CollateralProof::Unknown;
         };
-    return MnFoldContext::from(
+    MnFoldContext ctx = MnFoldContext::from(
         mnstates, std::move(coin),
         protx_sig_verifier != nullptr ? *protx_sig_verifier
                                       : MnFoldContext::OperatorSigFn{});
+    ctx.require_core_check = true;
+    if (protx_check_env != nullptr && protx_check_env->check_override) {
+        ctx.core_check = protx_check_env->check_override;
+    } else if (protx_check_env != nullptr) {
+        const ProTxCheckRules rules = protx_rules_for(*protx_check_env, next_height, v24_active);
+        ProTxCoinFn script_coin =
+            [&mempool](const bitcoin_family::coin::TxPrevOut& op, int64_t& value,
+                       std::vector<uint8_t>& script) {
+                ::core::coin::Coin c;
+                switch (mempool.prove_chain_coin(::core::coin::Outpoint(op.hash, op.index), c)) {
+                case Mempool::CoinProof::Unspent:
+                    value = c.value;
+                    script = c.scriptPubKey.m_data;
+                    return ProTxCoinProof::Unspent;
+                case Mempool::CoinProof::Absent:
+                    return ProTxCoinProof::Absent;
+                case Mempool::CoinProof::Unknown:
+                    break;
+                }
+                return ProTxCoinProof::Unknown;
+            };
+        ctx.core_check = [&mnstates, rules, script_coin = std::move(script_coin),
+                          ecdsa = protx_check_env->ecdsa](const MutableTransaction& tx) {
+            return protx_core_refusal(tx, mnstates, rules, script_coin, ecdsa);
+        };
+    }
+    return ctx;
 }
 
 inline DashWorkData build_embedded_workdata(
@@ -597,7 +632,10 @@ inline DashWorkData build_embedded_workdata(
     // Dash Core v24: DEPLOYMENT_V24 is active for this block, so the CbTx is
     // version 4 and commits merkleRootAssetUnlocks over this body. Default
     // false => version 3, byte-identical for every existing caller.
-    bool v24_active = false)
+    bool v24_active = false,
+    // Dash Core's full provider-tx checks (protx_check.hpp) for the types 1-4
+    // the template folds. nullptr => no provider tx is checkable, none rides.
+    const ProTxCheckEnv* protx_check_env = nullptr)
 {
     DashWorkData w;
     w.m_height          = prev_height + 1;
@@ -819,7 +857,8 @@ inline DashWorkData build_embedded_workdata(
         if (proj_for_fold.ok) {
             // The SAME context the emit gate folds with (B10 parity).
             const MnFoldContext fold_ctx =
-                make_template_fold_context(mnstates, mempool, protx_sig_verifier);
+                make_template_fold_context(mnstates, mempool, protx_sig_verifier,
+                                           protx_check_env, w.m_height, v24_active);
             // Fold, drop what it refused (fee follows the tx out), and repeat
             // while a drop also takes an in-body DESCENDANT with it: a child of
             // a dropped tx would spend an output the block no longer creates

@@ -60,6 +60,7 @@
 #include "sigops.hpp"             // G2: bad-blk-sigops accounting during selection
 #include "vendor/assetlock.hpp"   // DIP-0027 CAssetUnlockPayload (type-9 fee source)
 #include "asset_lock_fold.hpp"    // check_asset_lock_tx: type-8 selection gate
+#include "shared_collateral.hpp"  // Dash Core v24 shared-collateral template script
 
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -2298,6 +2299,16 @@ public:
                 // package, and any descendant fails the parent check.
                 if (e->tx.type == vendor::CAssetLockPayload::SPECIALTX_TYPE
                     && !check_asset_lock_tx(e->tx)) { ok = false; break; }
+                // Dash Core v24 shared-collateral template (04445348437551):
+                // a tx paying it never rides, at any height
+                // (shared_collateral.hpp). A tx spending it is caught where
+                // the stale-input guard resolves each input's coin below.
+                {
+                    bool pays_template = false;
+                    for (const auto& out : e->tx.vout)
+                        if (is_shared_collateral_script(out.scriptPubKey.m_data)) { pays_template = true; break; }
+                    if (pays_template) { ok = false; break; }
+                }
                 // Belt for the admission gate (add_tx_locked): a pool entry
                 // that predates it (or any future seam that bypasses it) must
                 // never ride — dashd rejects the block (bad-txns-version /
@@ -2391,6 +2402,9 @@ public:
                         }
                         const auto& pscript = parent->second.tx
                             .vout[vin.prevout.index].scriptPubKey.m_data;
+                        // Shared-collateral template spend (unreachable: a
+                        // parent paying it never rides), kept for symmetry.
+                        if (is_shared_collateral_script(pscript)) { ok = false; break; }
                         if (is_p2sh_script(pscript)) {
                             tx_sigops += count_p2sh_sigops(
                                 vin.scriptSig.m_data);
@@ -2433,6 +2447,12 @@ public:
                         if (!have) {
                             // Stale input: not a selected parent, and neither the
                             // forward UTXO view nor (when armed) either fold has it.
+                            ok = false;
+                            break;
+                        }
+                        // Dash Core v24: only a ProDisTx may spend a coin locked
+                        // to the shared-collateral template, and none rides.
+                        if (is_shared_collateral_script(coin.scriptPubKey.m_data)) {
                             ok = false;
                             break;
                         }
