@@ -527,6 +527,25 @@ TEST(DashSupersetSpecialTx, ExtAddrPayloadIsRefusedByName)
     EXPECT_EQ(f.sml.CalcMerkleRoot(), w.base.CalcMerkleRoot());
 }
 
+// Dash Core v24: a v2 update of a masternode whose SML leaf is version 3
+// (ExtAddr) goes through SetStateVersion (target version, netInfo
+// conversion), which this fold does not port: refused by name, never applied
+// with the v2 leaf layout.
+TEST(DashSupersetSpecialTx, UpdateOfAnExtAddrLeafIsRefusedByName)
+{
+    auto mn = make_mn(1);
+    mn.leaf.nVersion = CSimplifiedMNListEntry::VER_EXT_ADDR;
+    mn.leaf.extNetInfo.set(v::NetInfoPurpose::CORE_P2P,
+                           {v::NetInfoEntry{v::NetService::ipv4(1, 2, 3, 4, 9999)}});
+    World w({mn});
+    const auto ctx = MnFoldContext::from(w.sm, {}, accept_all());
+    const auto f = fold(w, {special(2, proupserv(w.mns[0], 2), 0x02)}, ctx);
+    ASSERT_EQ(f.refused, 1u);
+    ASSERT_EQ(f.refused_reasons.size(), 1u);
+    EXPECT_NE(f.refused_reasons.front().find("ExtAddr"), std::string::npos) << f.refused_reasons.front();
+    EXPECT_EQ(f.sml.CalcMerkleRoot(), w.base.CalcMerkleRoot());
+}
+
 // B.9 plumbing: ProUpServTx / ProUpRevTx are verified against the PRE-block
 // operator key, over the payload minus its trailing signature, with the
 // payload's scheme; a false verdict refuses, and no verifier at all refuses.

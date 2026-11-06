@@ -721,6 +721,85 @@ TEST(DashMnState, NegativeVersionBeforeDip3IsOutsideTheRule) {
     EXPECT_EQ(m.last_applied_height(), 2400051u);
 }
 
+// ── Dash Core v24 fail-closed rule (the B4 hotfix of the v24 design) ──
+// A provider tx the payee state model cannot fold exactly refuses the WHOLE
+// block, before any mutation, instead of being logged and skipped (which let
+// the payee set drift from dashd's): a v3 (ExtAddr) payload, a payload that
+// does not parse or has an unknown version, a ProTx naming a v3 state, and a
+// v24 type 10-12. A valid v2 update of the same masternode still folds.
+TEST(DashMnState, V24UnfoldableProviderTxRefusesTheBlockNeverSkips) {
+    namespace vv = dash::coin::vendor;
+    uint256 h;
+    MnStateMachine m = v2319_one_regular_mn(h, 2400060);
+    const MNState before = m.entries().at(h);
+    auto apply_with = [&](MnStateMachine& sm, MutableTransaction tx, uint32_t at) {
+        BlockType b;
+        b.m_txs.push_back(coinbase_tx({script_bytes(0xD5)}));
+        b.m_txs.push_back(std::move(tx));
+        return sm.apply_block(b, at);
+    };
+    auto expect_refused = [&](MnStateMachine& sm, MutableTransaction tx, uint32_t at,
+                              const char* why) {
+        const uint32_t cursor = sm.last_applied_height();
+        auto r = apply_with(sm, std::move(tx), at);
+        EXPECT_NE(r.refused.find(why), std::string::npos) << r.refused;
+        EXPECT_EQ(r.registered + r.updated, 0u) << "nothing of the refused block is applied";
+        EXPECT_EQ(sm.last_applied_height(), cursor);
+    };
+
+    // (a) ProRegTx v3: a payout list this MNState cannot hold.
+    auto reg3 = make_proreg(ProTxVersion::EXT_ADDR, MnType::REGULAR);
+    reg3.collateralOutpoint.hash = raw256(0x11);
+    vv::MasternodePayoutShare po;
+    po.scriptPayout.m_data = script_bytes(0x76, 25);
+    reg3.payouts = {po};
+    expect_refused(m, special_tx(CProRegTx::SPECIALTX_TYPE, protx_payload(reg3)), 2400061,
+                   "unfoldable: ProRegTx nVersion=3");
+    // (b) An unparseable ProUpRegTx (truncated payload): refused, not skipped.
+    CProUpRegTx upreg;
+    upreg.nVersion = ProTxVersion::BASIC_BLS;
+    upreg.proTxHash = h;
+    auto bad = protx_payload(upreg);
+    bad.pop_back();
+    expect_refused(m, special_tx(CProUpRegTx::SPECIALTX_TYPE, bad), 2400061,
+                   "unfoldable: ProUpRegTx payload does not parse");
+    // (c) A ProUpRevTx with a version no codec knows (4).
+    CProUpRevTx rev;
+    rev.nVersion = 4;
+    rev.proTxHash = h;
+    expect_refused(m, special_tx(CProUpRevTx::SPECIALTX_TYPE, protx_payload(rev)), 2400061,
+                   "unfoldable: ProUpRevTx payload does not parse");
+    // (d) A v24 type 10 ProDisTx: bad-txns-type at DIP3 heights (v23.1.9
+    //     whitelist), and still refused below DIP3.
+    vv::CProDisTx dis;
+    dis.proTxHash = h;
+    dis.vchSigs.resize(1);
+    expect_refused(m, special_tx(10, protx_payload(dis)), 2400061, "bad-txns-type");
+    {
+        MnStateMachine pre;
+        pre.set_dip0003_height(3'000'000);
+        expect_refused(pre, special_tx(10, protx_payload(dis)), 2400061,
+                       "unfoldable: v24 provider tx type 10");
+    }
+    EXPECT_EQ(m.entries().at(h), before);
+    // (e) A v2 ProUpServTx for a masternode whose state is v3.
+    {
+        MNState st3 = before;
+        st3.nVersion = ProTxVersion::EXT_ADDR;
+        MnStateMachine m3;
+        m3.load({{h, st3}}, 2400060);
+        expect_refused(m3, special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                      protx_payload(v2319_serv(h, MnType::REGULAR))),
+                       2400061, "whose state is nVersion=3");
+    }
+    // Control: the valid v2 update of the same masternode folds.
+    auto ok = apply_with(m, special_tx(CProUpServTx::SPECIALTX_TYPE,
+                                       protx_payload(v2319_serv(h, MnType::REGULAR))), 2400061);
+    EXPECT_TRUE(ok.refused.empty()) << ok.refused;
+    EXPECT_EQ(ok.updated, 1u);
+    EXPECT_EQ(m.last_applied_height(), 2400061u);
+}
+
 // The legacy services Dash Core reads as an EMPTY MnNetInfo although their
 // bytes are not all zero (CNetAddr::SetLegacyIPv6 + IsValid; confirmed with
 // dashd 24.0.0 decoderawtransaction: `addresses` is {} for each).
