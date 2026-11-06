@@ -29,6 +29,7 @@
 #include <ctime>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -184,6 +185,12 @@ struct EmbeddedWorkInputs {
     // NodeCoinState::make_embedded_work_inputs from set_include_mn_special_txs.
     bool                             include_mn_special_txs{false};
 
+    // #143 / Dash Core v24: the type-9 asset unlocks the credit-pool follower
+    // admitted for this template (credit_pool_lane.hpp admit: version-2 gate,
+    // UnlockLimitV24, quorum signatures). Null => every unlock is excluded.
+    // Set by NodeCoinState::make_embedded_work_inputs from its admit hook.
+    std::shared_ptr<const AssetUnlockAdmission> asset_unlocks;
+
     // PoSe pass seams (sml_pose_fold.hpp): the member proTxHash source and
     // the penalty oracle for the builder's own HandleQuorumCommitment pass
     // over qc_commitments. Point into NodeCoinState (same lifetime discipline
@@ -334,9 +341,9 @@ inline WorkSelection select_dash_work(
                 // #107 phase 2: accrue pending type-8 asset-lock term into the
                 // CbTx creditPoolBalance (default false => byte-unchanged).
                 emb.accrue_pending_asset_locks,
-                // #143 verified type-9 unlocks: not wired through this arm yet
-                // (admission-path-only; default nullptr => byte-unchanged).
-                /*admitted_asset_unlocks=*/nullptr,
+                // #143 verified type-9 unlocks (credit-pool follower admission;
+                // null => every unlock excluded, byte-unchanged).
+                emb.asset_unlocks.get(),
                 // SUPERSET: include provider special txs (types 1-4) + fold
                 // them into merkleRootMNList (default false => byte-unchanged).
                 emb.include_mn_special_txs,

@@ -324,6 +324,7 @@ public:
              int64_t seed_wallclock = 0)
     {
         wipe_memory();
+        m_full_history = true;
         m_height = m_sched.v20_floor_height;
         m_hash   = floor_hash;
         m_floor_balance = floor_balance;
@@ -343,6 +344,39 @@ public:
                  << " hash=" << floor_hash.GetHex().substr(0, 16)
                  << " balance=" << floor_balance << " (empty set, lately=0)";
     }
+
+    /// ARM a WINDOW seed at `height`, a recent block whose committed CbTx
+    /// creditPoolBalance is `balance`. From there the balance, latelyUnlocked
+    /// and the window-start balance (Dash Core v24 UnlockLimitV24) are exact
+    /// once CreditPoolPeriodBlocks + 1 blocks have been applied. The unlock
+    /// INDEX set is not: a duplicate-index check (CheckAssetUnlockTx
+    /// bad-assetunlock-duplicated-index) needs every unlock since v20, so a
+    /// window-seeded follower never permits admission (accrual_permitted).
+    /// Memory only: never attach a store to a window seed.
+    void arm_window(uint32_t height, const uint256& hash, int64_t balance)
+    {
+        wipe_memory();
+        m_full_history = false;
+        m_window_floor = height;
+        m_height = height;
+        m_hash = hash;
+        m_floor_balance = balance;
+        m_scalar.seed(balance, height);
+        m_armed = true;
+        m_proven_complete = false;
+        m_fail_cause.clear();
+        LOG_INFO << "[CP-IDX] armed a WINDOW seed at h=" << height << " "
+                 << hash.GetHex().substr(0, 16) << " balance=" << balance
+                 << " (balance history and limit only; unlock admission needs the full"
+                    " seed from the v20 floor)";
+    }
+
+    /// Forget everything (in memory; a store is left to the next arm()).
+    void reset() { wipe_memory(); }
+
+    /// True when the follower was seeded from the v20 floor (the index set is
+    /// complete); false for a window seed.
+    bool full_history() const { return m_full_history; }
 
     /// Resume from the persisted namespace. Returns true when a complete,
     /// well-formed state was restored (cursor NOT yet bridged to the live
@@ -500,7 +534,7 @@ public:
         int64_t out_gross = 0;
         if (height > m_sched.window_blocks) {
             const uint32_t out_h = height - m_sched.window_blocks;
-            if (out_h > m_sched.v20_floor_height) {
+            if (out_h > floor_height()) {
                 auto it = m_window.find(out_h);
                 if (it == m_window.end()) {
                     return fail_closed(height, "window row missing at h="
@@ -568,6 +602,7 @@ public:
         if (!flag_on) return false;                                    // (a)
         if (!vendor::bls_backend_available()) return false;            // (b)
         if (!m_armed || !m_proven_complete) return false;              // (c,d,e latch)
+        if (!m_full_history) return false;   // window seed: the index set is incomplete
         if (m_height != template_height - 1) return false;             // (c) fresh
         if (m_hash != template_prev_hash) return false;                // (c) exact parent
         return true;
@@ -711,6 +746,64 @@ public:
     const std::string& fail_cause() const { return m_fail_cause; }
     const CpIdxDeploySchedule& schedule() const { return m_sched; }
 
+    /// The withdrawal limit the pool at the cursor gives the NEXT block
+    /// (Dash Core ConstructCreditPool currentLimit), nullopt when the era or
+    /// the window-start balance is not known or the limit would be negative.
+    std::optional<int64_t> current_limit() const
+    {
+        if (!m_armed) return std::nullopt;
+        const auto era = cp_idx_era_at(m_sched, m_height);
+        if (!era) return std::nullopt;
+        const auto start = balance_at_window_start();
+        if (*era == CpIdxEra::V24 && !start) return std::nullopt;
+        return cp_idx_current_limit(m_scalar.balance(), m_lately_unlocked, *era, start.value_or(0));
+    }
+
+    /// The in-memory ledger after a block, for a shallow reorg rewind
+    /// (credit_pool_lane.hpp keeps the last few).
+    struct State
+    {
+        CRangesSet                    indexes;
+        std::map<uint32_t, WindowRow> window;
+        int64_t                       lately_unlocked{0};
+        CreditPool                    scalar;
+        uint32_t                      height{0};
+        uint256                       hash;
+        bool                          proven_complete{false};
+    };
+    State snapshot() const
+    {
+        return State{m_indexes, m_window, m_lately_unlocked, m_scalar, m_height, m_hash,
+                     m_proven_complete};
+    }
+    /// Rewind to a state this follower produced on the active chain (the
+    /// lane checks the lineage) and persist it: the full ranges, the cursor
+    /// and the cursor's own window row are rewritten; rows above the cursor
+    /// are never loaded (restore reads up to the cursor) and are overwritten
+    /// as the new branch applies.
+    void restore_snapshot(const State& s)
+    {
+        if (!m_armed) return;
+        m_indexes = s.indexes;
+        m_window = s.window;
+        m_lately_unlocked = s.lately_unlocked;
+        m_scalar = s.scalar;
+        m_height = s.height;
+        m_hash = s.hash;
+        m_proven_complete = s.proven_complete;
+        if (m_db != nullptr) {
+            auto it = m_window.find(m_height);
+            CpIdxWindowRowRec row;
+            if (it != m_window.end())
+                row = CpIdxWindowRowRec{it->second.gross_unlocked, it->second.n_type9, it->second.balance};
+            const uint32_t prune_below = m_height > m_sched.window_blocks
+                                       ? m_height - m_sched.window_blocks : 0;
+            m_db->write_apply(m_indexes.export_ranges(), m_height, row, make_cursor(), prune_below);
+        }
+        LOG_WARNING << "[CP-IDX] rewound to h=" << m_height << " " << m_hash.GetHex().substr(0, 16)
+                    << " (reorg) balance=" << m_scalar.balance();
+    }
+
     /// An explicit DEPLOYMENT_V24 height (tests, or a known activation).
     /// kCpIdxNeverActive (the default) asks the deployment status for the
     /// schedule's network instead, and an UNKNOWN state refuses all unlocks.
@@ -723,8 +816,13 @@ public:
     {
         if (m_height < m_sched.window_blocks) return int64_t{0};
         const uint32_t h = m_height - m_sched.window_blocks;
-        if (h < m_sched.v20_floor_height) return int64_t{0};
-        if (h == m_sched.v20_floor_height && m_floor_balance) return *m_floor_balance;
+        if (h < floor_height()) {
+            // Below the v20 floor there is no credit pool (Core: 0). Below a
+            // window seed's floor the balance is simply not known.
+            if (!m_full_history) return std::nullopt;
+            return int64_t{0};
+        }
+        if (h == floor_height() && m_floor_balance) return *m_floor_balance;
         auto it = m_window.find(h);
         if (it == m_window.end()) return std::nullopt;
         return it->second.balance;
@@ -732,7 +830,11 @@ public:
 
 private:
     CpIdxDeploySchedule m_sched;
-    std::optional<int64_t> m_floor_balance;   // the v20 floor block's balance (set by arm)
+    std::optional<int64_t> m_floor_balance;   // the floor block's balance (set by arm / arm_window)
+    bool                m_full_history{true};  // seeded from the v20 floor
+    uint32_t            m_window_floor{0};     // arm_window's floor height
+
+    uint32_t floor_height() const { return m_full_history ? m_sched.v20_floor_height : m_window_floor; }
     RewardFn            m_reward_fn;
     CreditPoolIdxDb*    m_db{nullptr};      // borrowed, optional
 

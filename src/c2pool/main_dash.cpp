@@ -108,6 +108,7 @@
 #include <impl/dash/coin/mempool_ingest.hpp>     // wire_mempool_ingest (leg 1)
 #include <impl/dash/coin/tip_ingest.hpp>         // wire_tip_ingest (leg 2)
 #include <impl/dash/coin/deployment_status.hpp>  // Dash Core v24 deployment tracking (EHF + versionbits)
+#include <impl/dash/coin/credit_pool_lane.hpp>   // Dash Core v24 credit-pool follower (UnlockLimitV24, unlock admission)
 #include <impl/dash/coin/protx_ecdsa.hpp>        // CHashSigner::VerifyHash for the provider-tx checks
 #include <impl/dash/coin/embedded_oracle_shadow.hpp> // dash::coin::EmbeddedOracleShadow — per-block dashd cross-check (OBSERVE-only)
 #include <impl/dash/coin/embedded_shadow_compare.hpp> // dash::coin::EmbeddedShadowCompare — serve-vs-dashd template diff (OBSERVE-only, NOT a gate)
@@ -204,6 +205,13 @@ namespace {
 // run_node; see coin/deployment_status.hpp for how it combines with the
 // computed state.
 std::optional<uint32_t> g_v24_activation_pin;
+// --embedded-credit-pool-seed: seed the credit-pool follower from the v20
+// floor (every block since v20 over coin P2P, mainnet ~580k blocks, kept in
+// <net>/credit_pool_idx). The only seed that admits asset unlocks: Dash Core
+// refuses a duplicate unlock index against every unlock since v20. Off (the
+// default): a window seed (~584 blocks) tracks the balance history and the
+// Dash Core v24 limit, and every unlock stays excluded.
+bool g_credit_pool_seed = false;
 
 // -- Sharechain (pool-to-pool) peering CONTRACT (launcher-peering-cli slice) --
 // The DASH dual-pool G2 ratchet (LIVE rows C1-C4) needs main_dash to accept the
@@ -3499,20 +3507,20 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                         "txs in the served body -- #125/tx-serving)"
                       : "OFF (default: creditPool = seed + platform reward only)")
               << "\n";
-    // #143 Variant B (--embedded-accrue-asset-unlocks): DEFAULT OFF. The
-    // template-side seam (build_embedded_workdata admitted_asset_unlocks)
-    // stays nullptr unless the CreditPool INDEX follower reports
-    // accrual_permitted() — which additionally requires a completed, proven
-    // gap-free seed from the v20 floor (a follow-up soak arms that lane).
-    // Until then the flag documents intent and the posture below names the
-    // state; the served template is exclude-all either way.
+    // #143 Variant B (--embedded-accrue-asset-unlocks): the template-side
+    // seam (build_embedded_workdata admitted_asset_unlocks) stays nullptr
+    // unless the credit-pool follower lane (credit_pool_lane.hpp, wired with
+    // the Dash Core v24 block below) reports accrual_permitted(): a complete
+    // FULL seed from the v20 floor (--embedded-credit-pool-seed), real BLS,
+    // fresh at the template's parent. The default WINDOW seed never admits.
     std::cout << "[run] embedded #143 asset-UNLOCK (type-9) accrual: "
               << (embedded_accrue_asset_unlocks
                       ? "ARMED (--embedded-accrue-asset-unlocks: admission "
-                        "still gated on the CreditPool INDEX follower's "
-                        "fail-closed predicate — proven-complete seed + real "
-                        "BLS + fresh-at-parent; NO follower lane is seeded in "
-                        "this build, so templates remain exclude-all)"
+                        "gated on the credit-pool follower's fail-closed "
+                        "predicate -- a complete FULL seed from the v20 floor "
+                        "(--embedded-credit-pool-seed) + real BLS + "
+                        "fresh-at-parent; otherwise templates exclude every "
+                        "unlock)"
                       : "OFF (default: templates exclude ALL type-9 — "
                         "today's proven-valid behavior)")
               << "\n";
@@ -5551,6 +5559,10 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
     std::shared_ptr<dash::coin::DashDeploymentStatus> v24_status;
     std::unique_ptr<dash::coin::EhfRescanLane>        ehf_rescan;
     std::string                                       ehf_path;
+    // Credit-pool follower (#143 / Dash Core v24 UnlockLimitV24): the store
+    // outlives the lane that writes it (declared first, destroyed last).
+    std::unique_ptr<dash::coin::CreditPoolIdxDb>      cp_db;
+    std::unique_ptr<dash::coin::CreditPoolLane>       cp_lane;
     // Teardown: the status stops reading the header chain (shutdown) and
     // leaves the registry before the header chain is destroyed. The node's
     // v24 state function (node_coin_state outlives header_chain) then answers
@@ -5955,7 +5967,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             web_server->get_mining_interface()->set_coin_sync_status_fn(
                 [hc = header_chain.get(), cp = coin_p2p.get(),
                  lanes = dml_lanes, &utxo_lane, &utxo_full_refusal,
-                 &utxo_import_seconds, &v24_status, &ehf_tracker]() -> nlohmann::json {
+                 &utxo_import_seconds, &v24_status, &ehf_tracker, &cp_lane]() -> nlohmann::json {
                     nlohmann::json s = nlohmann::json::object();
                     const uint32_t hh = hc ? hc->height() : 0;
                     uint32_t th = cp ? cp->best_peer_height() : 0;
@@ -6034,6 +6046,24 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                             {"pin_refuted", v24_status->pin_refuted()},
                             {"contradictions", v24_status->contradictions()},
                         };
+                    }
+                    // Credit-pool follower: the balance history and the limit
+                    // the next block's unlocks are held to.
+                    if (cp_lane) {
+                        const auto c = cp_lane->status();
+                        nlohmann::json j = {
+                            {"seed", c.mode == dash::coin::CreditPoolLane::SeedMode::FULL ? "full" : "window"},
+                            {"full_history", c.full_history},
+                            {"armed", c.armed}, {"proven_complete", c.proven_complete},
+                            {"floor", c.floor}, {"height", c.height},
+                            {"balance", c.balance}, {"lately_unlocked", c.lately_unlocked},
+                            {"applied", c.applied}, {"rejected_bodies", c.rejected_bodies},
+                            {"rewinds", c.rewinds}, {"failures", c.failures},
+                            {"fail_cause", c.fail_cause}, {"in_flight", c.in_flight},
+                        };
+                        if (c.limit) j["limit_next_block"] = *c.limit;
+                        if (c.window_start_balance) j["window_start_balance"] = *c.window_start_balance;
+                        s["credit_pool"] = j;
                     }
                     return s;
                 });
@@ -8159,10 +8189,13 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
             // fail closed on a contradiction (design §3.1 item 8; the version
             // word is read directly, no CbTx codec needed).
             ehf_ordered_sink =
-                [t = ehf_tracker, st = v24_status, path = ehf_path](
+                [t = ehf_tracker, st = v24_status, path = ehf_path, &cp_lane](
                     const dash::interfaces::BlockConnected& bc) {
                     auto packed = ::pack(static_cast<const dash::coin::BlockHeaderType&>(bc.block));
                     const uint256 h = dash::crypto::hash_x11(packed.get_span());
+                    // The credit-pool follower takes the same bound, ordered
+                    // body (it ignores heights it cannot apply contiguously).
+                    if (cp_lane) cp_lane->on_ordered_block(bc.height, h, bc.block);
                     const size_t before = t->signals().size();
                     t->connect_block(bc.block, bc.height, h);
                     if (!bc.block.m_txs.empty() && bc.block.m_txs[0].type == 5
@@ -8199,9 +8232,98 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     }
                     return cp->request_blocks_from(keys[(*rr)++ % keys.size()], hashes);
                 });
+            // Credit-pool follower (#143 / Dash Core v24). Armed with the
+            // type-9 accrual lever; it seeds only with
+            // --embedded-credit-pool-seed (the whole chain since v20).
+            if (embedded_accrue_asset_unlocks) {
+                const auto sched = testnet ? dash::coin::kCpIdxScheduleTestnet
+                                           : dash::coin::kCpIdxScheduleMainnet;
+                dash::coin::CreditPoolLane::Seams cs;
+                cs.hash_at = [hc = header_chain.get()](uint32_t h) -> std::optional<uint256> {
+                    auto e = hc->get_header_by_height(h);
+                    if (!e) return std::nullopt;
+                    return e->hash;
+                };
+                cs.tip = [hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    if (!hc->tip()) return std::nullopt;
+                    return hc->height();
+                };
+                cs.live_floor = [m = maintainer.get(), hc = header_chain.get()]() -> std::optional<uint32_t> {
+                    const uint32_t cursor = m ? m->payee_fold_cursor() : 0;
+                    if (cursor > 0) return cursor + 1;
+                    if (!hc->tip() || hc->height() < 6) return std::nullopt;
+                    return hc->height() - 6;
+                };
+                cs.request = [cp = coin_p2p.get(), rr = std::make_shared<size_t>(0)](
+                    const std::vector<uint256>& hashes) {
+                    auto keys = cp->eligible_bulk_peer_keys();
+                    if (keys.empty()) {
+                        const std::string pk = cp->primary_peer_key();
+                        if (pk.empty()) return false;
+                        keys.push_back(pk);
+                    }
+                    return cp->request_blocks_from(keys[(*rr)++ % keys.size()], hashes);
+                };
+                using CpMode = dash::coin::CreditPoolLane::SeedMode;
+                cp_lane = std::make_unique<dash::coin::CreditPoolLane>(
+                    sched, testnet ? dash::coin::DASH_MN_RR_HEIGHT_TESTNET
+                                   : dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+                    std::move(cs), g_credit_pool_seed ? CpMode::FULL : CpMode::WINDOW);
+                if (g_credit_pool_seed) {
+                    cp_db = std::make_unique<dash::coin::CreditPoolIdxDb>(
+                        (core::filesystem::config_path() / net_subdir / "credit_pool_idx").string());
+                    if (!cp_db->open()) {
+                        LOG_WARNING << "[CP-LANE] could not open the credit-pool store; the"
+                                       " follower runs in memory only";
+                        cp_db.reset();
+                    }
+                }
+                cp_lane->start(cp_db.get());
+                const auto cps = cp_lane->status();
+                std::cout << "[run] credit-pool follower (Dash Core v24 UnlockLimitV24, unlock"
+                             " admission): floor h=" << cps.floor
+                          << (cps.armed ? ", resumed at h=" + std::to_string(cps.height)
+                                        : std::string(", arms at the floor"))
+                          << (g_credit_pool_seed
+                                  ? ", FULL seed from the v20 floor (admits unlocks once complete)"
+                                  : ", WINDOW seed (~584 blocks: balance history and limit; every"
+                                    " unlock stays excluded -- --embedded-credit-pool-seed admits them)")
+                          << "\n";
+                // Template admission: platform-quorum candidates from the
+                // active quorum set, base heights from the header chain.
+                node_coin_state.set_asset_unlock_admit_fn(
+                    [ln = cp_lane.get(), hc = header_chain.get(), testnet](
+                        uint32_t height, const uint256& prev_hash,
+                        const std::vector<dash::coin::MutableTransaction>& cands,
+                        const dash::coin::QuorumManager& qmgr)
+                        -> std::shared_ptr<const dash::coin::AssetUnlockAdmission> {
+                        const auto* p = dash::coin::unlockverify::platform_llmq_params(
+                            testnet ? dash::coin::LlmqNetwork::Testnet
+                                    : dash::coin::LlmqNetwork::Mainnet);
+                        if (p == nullptr) return nullptr;
+                        std::vector<dash::coin::chainlock::QuorumCandidate> quorums;
+                        for (const auto& e : qmgr.active_entries()) {
+                            if (e.key.llmqType != p->type) continue;
+                            auto hdr = hc->get_header(e.key.quorumHash);
+                            if (!hdr) continue;
+                            dash::coin::chainlock::QuorumCandidate c;
+                            c.quorum_hash       = e.key.quorumHash;
+                            c.base_height       = hdr->height;
+                            c.quorum_public_key = e.commitment.quorumPublicKey;
+                            quorums.push_back(c);
+                        }
+                        auto adm = ln->admit(true, height, prev_hash, cands, quorums, *p);
+                        if (!adm) return nullptr;
+                        return std::make_shared<const dash::coin::AssetUnlockAdmission>(std::move(*adm));
+                    });
+            }
             coin_p2p->set_block_body_filter(
-                [lane = ehf_rescan.get()](const uint256& h, const dash::coin::BlockType& blk) {
-                    return lane->on_body(h, blk);
+                [lane = ehf_rescan.get(), cpl = cp_lane.get()](
+                    const uint256& h, const dash::coin::BlockType& blk) {
+                    // Each lane claims only the bodies it asked for; both may.
+                    const bool a = lane->on_body(h, blk);
+                    const bool b = cpl && cpl->on_body(h, blk);
+                    return a || b;
                 });
         }
 
@@ -10526,10 +10648,14 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                     return ln->on_headers(key, b);
                 });
             coin_p2p->set_block_body_filter(
-                [ln = replay_lane.get(), ehf = ehf_rescan.get()](
+                [ln = replay_lane.get(), ehf = ehf_rescan.get(), cpl = cp_lane.get()](
                     const uint256& h, const dash::coin::BlockType& blk) {
-                    // The EHF rescan only claims bodies it asked for.
-                    return ln->on_block_body(h, blk) || (ehf && ehf->on_body(h, blk));
+                    // The EHF rescan and the credit-pool seed only claim
+                    // bodies they asked for.
+                    if (ln->on_block_body(h, blk)) return true;
+                    const bool a = ehf && ehf->on_body(h, blk);
+                    const bool b = cpl && cpl->on_body(h, blk);
+                    return a || b;
                 });
             coin_p2p->set_on_block_notfound(
                 [ln = replay_lane.get()](const uint256& h) {
@@ -11457,7 +11583,7 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
         std::make_shared<std::function<void(const boost::system::error_code&)>>();
     *mn_service_tick =
         [&mn_service_timer, mn_service_tick, &mn_ckpt_lane, &payee_feeder,
-         &ehf_rescan, &ehf_tracker, &ehf_path](
+         &ehf_rescan, &ehf_tracker, &ehf_path, &cp_lane](
             const boost::system::error_code& ec) {
             if (ec) return;   // cancelled at shutdown
             if (mn_ckpt_lane) mn_ckpt_lane->service_tick();
@@ -11470,6 +11596,9 @@ int run_node(bool testnet, const std::string& rpc_endpoint,
                 const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 ehf_rescan->tick(now_ms);
+                // Credit-pool follower: arm, seed below the live floor, and
+                // mark complete at the header tip.
+                if (cp_lane) cp_lane->tick(now_ms);
             }
             if (ehf_tracker && ehf_tracker->dirty() && !ehf_tracker->save(ehf_path))
                 LOG_WARNING << "[DASH-V24] could not persist " << ehf_path;
@@ -12438,6 +12567,8 @@ int main(int argc, char** argv)
             }
             g_v24_activation_pin = static_cast<uint32_t>(v);
         }
+        else if (std::strcmp(argv[i], "--embedded-credit-pool-seed") == 0)
+            g_credit_pool_seed = true;   // credit-pool follower seed from the v20 floor
         else if (std::strcmp(argv[i], "--embedded-tx-inject") == 0)
             embedded_tx_inject = true;   // #157: opt-in miner/user tx-injection (default OFF)
         else if (std::strcmp(argv[i], "--embedded-tx-inject-hex") == 0 && i + 1 < argc)

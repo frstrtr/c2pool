@@ -39,6 +39,7 @@
 
 #include <impl/dash/coin/credit_pool_idx.hpp>
 #include <impl/dash/coin/credit_pool_idx_db.hpp>
+#include <impl/dash/coin/credit_pool_lane.hpp>
 #include <impl/dash/coin/asset_unlock_verify.hpp>
 #include <impl/dash/coin/asset_unlock_admission.hpp>
 #include <impl/dash/coin/embedded_gbt.hpp>
@@ -57,6 +58,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1183,4 +1185,345 @@ TEST(DashCreditPoolIdxDb, WindowRowsCarryTheBalanceAcrossRestore) {
         db.close();
     }
     std::filesystem::remove_all(path);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// The follower on REAL testnet data, and the lane that runs it in the node.
+// ════════════════════════════════════════════════════════════════════════
+
+#include "dash_v24_testnet_credit_pool.inc"
+
+namespace {
+std::vector<unsigned char> cp_unhex(const std::string& h) {
+    std::vector<unsigned char> out;
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        out.push_back(static_cast<unsigned char>(std::stoul(h.substr(i, 2), nullptr, 16)));
+    return out;
+}
+std::vector<MutableTransaction> cp_special_txs(const char* list) {
+    std::vector<MutableTransaction> out;
+    std::string s(list), tok;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == ' ') {
+            if (!tok.empty()) {
+                const auto raw = cp_unhex(tok);
+                MutableTransaction tx;
+                ::PackStream ps(raw);
+                ps >> tx;
+                EXPECT_TRUE(ps.empty());
+                out.push_back(tx);
+                tok.clear();
+            }
+        } else {
+            tok.push_back(s[i]);
+        }
+    }
+    return out;
+}
+uint256 cp_hash(const char* hex) { uint256 h; h.SetHex(hex); return h; }
+}  // namespace
+
+// The real testnet chain 1,581,800..1,582,439 (Dash Core v24 active since
+// 1,578,000): the follower recomputes every block's pool balance (platform
+// reward + locks - unlocks) and must land on the CbTx creditPoolBalance the
+// chain committed, 639 blocks in a row with 38 unlocks and 8 locks. After 576
+// blocks the window-start balance is the committed balance 576 blocks back,
+// latelyUnlocked is the window's gross unlocks, and the limit is Dash Core
+// v24's UnlockLimitV24 of the two.
+TEST(DashCreditPoolIdx, RealTestnetBalancesFollowTheCbTx) {
+    const size_t N = sizeof(kTnCreditPool) / sizeof(kTnCreditPool[0]);
+    ASSERT_GE(N, 600u);
+    CpIdxDeploySchedule s{kTnCreditPool[0].height, 1'148'500u, 1'578'000u, 576u,
+                          dash::coin::DashNetwork::TESTNET};
+    CreditPoolIdxFollower f(s);
+    f.set_reward_fn([](uint32_t h) {
+        return dash::coin::compute_dash_platform_reward_post_v20_mn_rr(
+            h, dash::coin::DASH_MN_RR_HEIGHT_TESTNET);
+    });
+    f.arm(cp_hash(kTnCreditPool[0].hash), kTnCreditPool[0].balance);
+    int locks = 0, unlocks = 0;
+    std::vector<int64_t> gross(N, 0);
+    for (size_t i = 1; i < N; ++i) {
+        const auto& r = kTnCreditPool[i];
+        std::vector<MutableTransaction> txs{make_cbtx_coinbase(r.height, r.balance)};
+        for (auto& t : cp_special_txs(r.special_txs)) {
+            if (t.type == 8) ++locks;
+            if (t.type == 9) {
+                ++unlocks;
+                CAssetUnlockPayload pl;
+                ASSERT_TRUE(dash::coin::vendor::parse_assetunlock_payload(t.extra_payload, pl));
+                gross[i] += static_cast<int64_t>(pl.fee);
+                for (const auto& o : t.vout) gross[i] += o.value;
+            }
+            txs.push_back(std::move(t));
+        }
+        ASSERT_TRUE(f.apply_block(r.height, cp_hash(r.hash),
+                                  make_block(cp_hash(kTnCreditPool[i - 1].hash), std::move(txs))))
+            << "h=" << r.height << ": " << f.fail_cause();
+        ASSERT_EQ(f.balance(), r.balance) << "h=" << r.height;
+    }
+    EXPECT_EQ(unlocks, 38);
+    EXPECT_EQ(locks, 8);
+    const size_t L = N - 1;
+    EXPECT_EQ(f.balance_at_window_start(), std::optional<int64_t>(kTnCreditPool[L - 576].balance));
+    int64_t lately = 0;
+    for (size_t i = L - 575; i <= L; ++i) lately += gross[i];
+    EXPECT_EQ(f.lately_unlocked(), lately);
+    EXPECT_GT(lately, 0);
+    EXPECT_EQ(f.current_limit(),
+              std::optional<int64_t>(cp_unlock_limit_v24(kTnCreditPool[L].balance,
+                                                         kTnCreditPool[L - 576].balance)));
+}
+
+namespace {
+// A synthetic chain for the lane: height -> hash, with a switchable branch.
+struct LaneChain {
+    std::map<uint32_t, uint256> hash;
+    uint32_t tip{0};
+    BlockType body(uint32_t h) const {
+        return make_block(hash.at(h - 1), {make_cbtx_coinbase(h, 0)});
+    }
+};
+dash::coin::CreditPoolLane make_lane(LaneChain& c, uint32_t live_floor,
+                                     std::vector<uint256>& asked,
+                                     dash::coin::CreditPoolLane::BodyCheckFn check) {
+    dash::coin::CreditPoolLane::Seams s;
+    s.hash_at = [&c](uint32_t h) -> std::optional<uint256> {
+        auto it = c.hash.find(h);
+        if (it == c.hash.end() || h > c.tip) return std::nullopt;
+        return it->second;
+    };
+    s.tip = [&c]() -> std::optional<uint32_t> { return c.tip; };
+    s.live_floor = [live_floor]() -> std::optional<uint32_t> { return live_floor; };
+    s.request = [&asked](const std::vector<uint256>& hs) {
+        asked.insert(asked.end(), hs.begin(), hs.end());
+        return true;
+    };
+    s.check = std::move(check);
+    return dash::coin::CreditPoolLane(CpIdxDeploySchedule{1000, 0u, kCpIdxNeverActive, 576u},
+                                      dash::coin::DASH_MN_RR_HEIGHT_MAINNET, std::move(s),
+                                      dash::coin::CreditPoolLane::SeedMode::FULL);
+}
+}  // namespace
+
+// Seed below the live floor, follow the tip, complete at the header tip,
+// rewind a tip reorg, re-arm on a reorg below the journal.
+TEST(DashCreditPoolLane, SeedsFollowsCompletesAndRewinds) {
+    LaneChain c;
+    for (uint32_t h = 999; h <= 1100; ++h) c.hash[h] = chain_hash(h);
+    c.tip = 1060;
+    std::vector<uint256> asked;
+    auto accept = [](const uint256&, const BlockType&) { return true; };
+    auto lane = make_lane(c, /*live_floor=*/1050, asked, accept);
+    lane.start(nullptr);
+    EXPECT_EQ(lane.tick(0), 49u) << "arms at the floor and asks 1001..1049";
+    ASSERT_TRUE(lane.status().armed);
+    EXPECT_EQ(asked.front(), c.hash[1001]);
+    // Seed bodies arrive out of order; they apply contiguously.
+    for (uint32_t h = 1049; h >= 1001; --h) EXPECT_TRUE(lane.on_body(c.hash[h], c.body(h)));
+    EXPECT_EQ(lane.status().height, 1049u);
+    EXPECT_FALSE(lane.status().proven_complete) << "below the header tip";
+    EXPECT_FALSE(lane.on_body(c.hash[1055], c.body(1055))) << "never asked for";
+    // The tip lane continues contiguously.
+    for (uint32_t h = 1050; h <= 1060; ++h) lane.on_ordered_block(h, c.hash[h], c.body(h));
+    EXPECT_EQ(lane.status().height, 1060u);
+    EXPECT_TRUE(lane.status().proven_complete) << "cursor met the header tip";
+    lane.tick(1000);
+    EXPECT_TRUE(lane.status().proven_complete);
+    // A tip reorg of two blocks: rewind to 1058 and apply the new branch.
+    c.hash[1059] = raw256(0x59);
+    c.hash[1060] = raw256(0x60);
+    lane.on_ordered_block(1059, c.hash[1059], c.body(1059));
+    lane.on_ordered_block(1060, c.hash[1060], c.body(1060));
+    auto st = lane.status();
+    EXPECT_EQ(st.height, 1060u);
+    EXPECT_EQ(st.rewinds, 1u);
+    EXPECT_EQ(st.failures, 0u);
+    EXPECT_TRUE(st.proven_complete);
+    EXPECT_EQ(lane.with_follower([](const CreditPoolIdxFollower& f) { return f.block_hash(); }),
+              c.hash[1060]);
+    // A replayed body of the active chain is ignored, at the cursor and
+    // well below the journal (the payee replay re-delivers old bodies).
+    lane.on_ordered_block(1060, c.hash[1060], c.body(1060));
+    lane.on_ordered_block(1005, c.hash[1005], c.body(1005));
+    EXPECT_EQ(lane.status().applied, 49u + 11u + 2u);
+    EXPECT_EQ(lane.status().height, 1060u) << "not re-armed by an old active-chain body";
+    EXPECT_TRUE(lane.status().proven_complete);
+    // A reorg below the journal: re-armed at the floor.
+    for (uint32_t h = 1001; h <= 1100; ++h) c.hash[h] = raw256(static_cast<uint8_t>(h)) ;
+    c.hash[1010] = chain_hash(5010);
+    c.hash[1009] = chain_hash(5009);
+    lane.on_ordered_block(1010, c.hash[1010], make_block(c.hash[1009], {make_cbtx_coinbase(1010, 0)}));
+    st = lane.status();
+    EXPECT_TRUE(st.armed);
+    EXPECT_EQ(st.height, 1000u) << "re-armed at the v20 floor";
+    EXPECT_FALSE(st.proven_complete);
+}
+
+// Seed bodies that do not bind are dropped and re-asked at once; a follower
+// that fails closed is re-armed only after the back-off.
+TEST(DashCreditPoolLane, UnboundBodiesAndFailClosed) {
+    LaneChain c;
+    for (uint32_t h = 999; h <= 1100; ++h) c.hash[h] = chain_hash(h);
+    c.tip = 1100;
+    std::vector<uint256> asked;
+    const uint256 bad = chain_hash(1003);
+    auto check = [bad](const uint256& want, const BlockType&) { return want != bad; };
+    auto lane = make_lane(c, 1010, asked, check);
+    lane.start(nullptr);
+    lane.tick(0);
+    EXPECT_TRUE(lane.on_body(c.hash[1003], c.body(1003)));
+    EXPECT_EQ(lane.status().rejected_bodies, 1u);
+    for (uint32_t h = 1001; h <= 1009; ++h) lane.on_body(c.hash[h], c.body(h));
+    EXPECT_EQ(lane.status().height, 1002u) << "stops below the refused body";
+    // A body whose committed balance is wrong: the follower fails closed.
+    auto lane2 = make_lane(c, 1010, asked, [](const uint256&, const BlockType&) { return true; });
+    lane2.start(nullptr);
+    lane2.tick(0);
+    EXPECT_TRUE(lane2.on_body(c.hash[1001],
+                              make_block(c.hash[1000], {make_cbtx_coinbase(1001, 777)})));
+    auto st = lane2.status();
+    EXPECT_FALSE(st.armed);
+    EXPECT_EQ(st.failures, 1u);
+    EXPECT_NE(st.fail_cause.find("cross-check"), std::string::npos) << st.fail_cause;
+    EXPECT_EQ(lane2.tick(1000), 0u) << "back-off: not re-armed yet";
+    EXPECT_FALSE(lane2.status().armed);
+    lane2.tick(1000 + dash::coin::CreditPoolLane::kRearmBackoffMs);
+    EXPECT_TRUE(lane2.status().armed) << "re-armed after the back-off";
+}
+
+#ifdef C2POOL_DASH_BLS
+// Admission runs only through a complete, fresh follower.
+TEST(DashCreditPoolLane, AdmitNeedsACompleteFreshFollower) {
+    LaneChain c;
+    for (uint32_t h = 999; h <= 1100; ++h) c.hash[h] = chain_hash(h);
+    c.tip = 1020;
+    std::vector<uint256> asked;
+    auto lane = make_lane(c, 1021, asked, [](const uint256&, const BlockType&) { return true; });
+    lane.start(nullptr);
+    lane.tick(0);
+    EXPECT_FALSE(lane.admit(true, 1011, c.hash[1010], {}, {}, kLlmq100_67).has_value())
+        << "not seeded";
+    for (uint32_t h = 1001; h <= 1020; ++h) lane.on_body(c.hash[h], c.body(h));
+    lane.tick(1);
+    ASSERT_TRUE(lane.status().proven_complete);
+    EXPECT_TRUE(lane.admit(true, 1021, c.hash[1020], {}, {}, kLlmq100_67).has_value());
+    EXPECT_FALSE(lane.admit(true, 1022, c.hash[1020], {}, {}, kLlmq100_67).has_value())
+        << "not fresh at the template's parent";
+    EXPECT_FALSE(lane.admit(false, 1021, c.hash[1020], {}, {}, kLlmq100_67).has_value())
+        << "flag off";
+}
+#endif  // C2POOL_DASH_BLS
+
+// The default WINDOW seed: armed from a recent block's own CbTx balance, it
+// tracks the balance, latelyUnlocked and the window-start balance exactly
+// (Dash Core v24 UnlockLimitV24), but never admits an unlock: Dash Core
+// refuses a duplicate unlock index against every unlock since v20, which only
+// a full seed from the v20 floor knows.
+TEST(DashCreditPoolLane, WindowSeedTracksTheLimitButNeverAdmits) {
+    LaneChain c;
+    for (uint32_t h = 999; h <= 2100; ++h) c.hash[h] = chain_hash(h);
+    c.tip = 2000;
+    const int64_t B = 9'000 * COIN_SAT;
+    const int64_t G = 10 * COIN_SAT + 190;            // the unlock at 1500, gross
+    auto balance_at = [&](uint32_t h) { return h >= 1500 ? B - G : B; };
+    auto body = [&](uint32_t h) {
+        std::vector<MutableTransaction> txs{make_cbtx_coinbase(h, balance_at(h))};
+        if (h == 1500) txs.push_back(make_unlock_tx(5, 190, 10 * COIN_SAT, 1499, raw256(0x77)));
+        return make_block(c.hash.at(h - 1), std::move(txs));
+    };
+    std::vector<uint256> asked;
+    dash::coin::CreditPoolLane::Seams s;
+    s.hash_at = [&c](uint32_t h) -> std::optional<uint256> {
+        if (h > c.tip || !c.hash.count(h)) return std::nullopt;
+        return c.hash.at(h);
+    };
+    s.tip = [&c]() -> std::optional<uint32_t> { return c.tip; };
+    s.live_floor = []() -> std::optional<uint32_t> { return 1990u; };
+    s.request = [&asked](const std::vector<uint256>& hs) {
+        asked.insert(asked.end(), hs.begin(), hs.end());
+        return true;
+    };
+    s.check = [](const uint256&, const BlockType&) { return true; };
+    dash::coin::CreditPoolLane lane(CpIdxDeploySchedule{1000, 0u, /*v24=*/1100u, 576u},
+                                    dash::coin::DASH_MN_RR_HEIGHT_MAINNET, std::move(s),
+                                    dash::coin::CreditPoolLane::SeedMode::WINDOW);
+    lane.start(nullptr);
+    EXPECT_EQ(lane.tick(0), 0u);
+    ASSERT_EQ(asked.size(), 1u) << "asks for the window floor block only";
+    const uint32_t floor = 1990 - 576 - 8;
+    EXPECT_EQ(asked[0], c.hash[floor]);
+    EXPECT_FALSE(lane.status().armed);
+    // The floor body arms it with its own committed balance.
+    EXPECT_TRUE(lane.on_body(c.hash[floor], body(floor)));
+    auto st = lane.status();
+    ASSERT_TRUE(st.armed);
+    EXPECT_FALSE(st.full_history);
+    EXPECT_EQ(st.height, floor);
+    EXPECT_EQ(st.balance, B);
+    // Seed up to the live floor, then the tip lane.
+    for (int round = 0; round < 40 && lane.status().height < 1989; ++round) {
+        const uint32_t from = lane.status().height + 1;
+        for (uint32_t h = from; h < from + 64 && h < 1990; ++h) lane.on_body(c.hash[h], body(h));
+        lane.tick(1000 + round);
+    }
+    ASSERT_EQ(lane.status().height, 1989u);
+    for (uint32_t h = 1990; h <= 2000; ++h) lane.on_ordered_block(h, c.hash[h], body(h));
+    st = lane.status();
+    EXPECT_EQ(st.height, 2000u);
+    EXPECT_TRUE(st.proven_complete);
+    EXPECT_EQ(st.balance, B - G);
+    EXPECT_EQ(st.lately_unlocked, G) << "1500 is inside (1424, 2000]";
+    EXPECT_EQ(st.window_start_balance, std::optional<int64_t>(B)) << "the balance at 1424";
+    EXPECT_EQ(st.limit, std::optional<int64_t>(cp_unlock_limit_v24(B - G, B)));
+    // Complete and fresh, but a window seed never admits.
+    EXPECT_FALSE(lane.admit(true, 2001, c.hash[2000], {}, {}, kLlmq100_67).has_value());
+}
+
+// The coordinator's opt-in conditions, pinned:
+//  (a) an unseeded (or window-seeded) follower admits nothing, so a template
+//      excludes every type-9 unlock in the pool: only their fees are lost;
+//  (b) the CbTx v4 creditPoolBalance and merkleRootAssetUnlocks do not depend
+//      on the follower at all: with no admission the template is
+//      byte-identical to one built with no follower, and the balance is the
+//      tip balance + this block's platform reward (+ selected locks).
+TEST(DashCreditPoolLane, UnseededFollowerLeavesTheTemplateUnchanged) {
+    GbtFixture gbt;
+    // A version-2 and a version-1 unlock wait in the pool.
+    auto u2 = make_unlock_tx(31, 400, 3 * COIN_SAT, H - 2, raw256(0x77), {}, 2);
+    auto u1 = make_unlock_tx(32, 300, 2 * COIN_SAT, H - 2, raw256(0x77));
+    ASSERT_TRUE(gbt.mp.add_tx(u2));
+    ASSERT_TRUE(gbt.mp.add_tx(u1));
+    ASSERT_EQ(gbt.mp.asset_unlock_candidates().size(), 2u);
+    const int64_t POOL = 5'000 * COIN_SAT;
+    auto build = [&](const AssetUnlockAdmission* adm) {
+        return build_embedded_workdata(
+            H - 1, gbt.prev_hash, gbt.mnstates, gbt.mp, 0x1b104be3u, 1'700'000'000u,
+            DASH_PUBKEY_VER, DASH_P2SH_VER, 1'700'000'123u, 0x20000000u, nullptr,
+            &gbt.sml, &gbt.qmgr, 0, dash::coin::k_zero_cl_sig, POOL, nullptr, nullptr,
+            dash::coin::DASH_MN_RR_HEIGHT_MAINNET, nullptr,
+            dash::coin::DASH_MN_MIN_CONFIRMATIONS_MAINNET, false, "utxo-immature-serving",
+            nullptr, /*accrue_pending_asset_locks=*/false, adm,
+            /*include_mn_special_txs=*/false, nullptr, nullptr, nullptr, /*v24_active=*/true);
+    };
+    const auto none = build(nullptr);
+    // Unseeded lanes, window and full: admission refuses (fail closed).
+    for (auto mode : {dash::coin::CreditPoolLane::SeedMode::WINDOW,
+                      dash::coin::CreditPoolLane::SeedMode::FULL}) {
+        dash::coin::CreditPoolLane lane(test_schedule(H - 6), dash::coin::DASH_MN_RR_HEIGHT_MAINNET,
+                                        dash::coin::CreditPoolLane::Seams{}, mode);
+        lane.start(nullptr);
+        const auto adm = lane.admit(true, H, gbt.prev_hash, gbt.mp.asset_unlock_candidates(), {},
+                                    kLlmq100_67);
+        EXPECT_FALSE(adm.has_value());
+        const auto w = build(adm ? &*adm : nullptr);
+        expect_workdata_identical(none, w);
+    }
+    for (const auto& t : none.m_txs) EXPECT_NE(t.type, 9) << "no unlock rides";
+    CCbTx cb;
+    ASSERT_TRUE(parse_cbtx(none.m_coinbase_payload, cb));
+    EXPECT_EQ(cb.nVersion, 4);
+    EXPECT_EQ(cb.merkleRootAssetUnlocks, uint256::ZERO);
+    EXPECT_EQ(cb.creditPoolBalance,
+              POOL + dash::coin::compute_dash_platform_reward_post_v20_mn_rr(H));
 }

@@ -1797,6 +1797,19 @@ public:
         return sum;
     }
 
+    /// The type-9 asset unlocks in the pool, in txid order. Selection never
+    /// takes them; the credit-pool follower's admission does
+    /// (credit_pool_lane.hpp), so this is its candidate list.
+    std::vector<MutableTransaction> asset_unlock_candidates() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<MutableTransaction> out;
+        for (const auto& kv : m_pool)
+            if (kv.second.tx.type == vendor::CAssetUnlockPayload::SPECIALTX_TYPE)
+                out.push_back(kv.second.tx);
+        return out;
+    }
+
     std::optional<MempoolEntry> get_entry(const uint256& txid) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
