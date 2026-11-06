@@ -17,7 +17,9 @@
 #include <core/pack.hpp>
 #include <core/hash.hpp>
 #include <core/pow.hpp>
+#include <core/coin/peer_height_gate.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -324,6 +326,10 @@ public:
             LOG_INFO << "[EMB-LTC] HeaderChain LevelDB opened at " << m_db_path;
             load_from_db();
         }
+        if (m_params.fast_start_checkpoint.has_value()) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            pin_checkpoint_locked(m_params.fast_start_checkpoint->height, m_params.fast_start_checkpoint->hash);
+        }
         // Fast-start checkpoint: if chain is empty and a checkpoint is configured,
         // seed it as the starting point.  All headers before this height are
         // implicitly trusted.  The chain will sync forward from this point.
@@ -445,18 +451,27 @@ public:
         return validate_difficulty(header, new_height);
     }
 
-    /// Set the estimated network tip height (from peer's version message).
-    /// Used to skip scrypt PoW validation for old headers during initial sync.
-    /// Headers below (tip - SCRYPT_VALIDATION_DEPTH) are validated structurally
-    /// only (prev_hash linkage + difficulty retarget), making bulk sync ~100x faster.
-    /// Set the estimated network tip height (from peer's version message).
-    void set_peer_tip_height(uint32_t height) { m_peer_tip_height.store(height); }
+    /// A network tip height a peer reported (its version message). It
+    /// switches no check: every header above the checkpoint has its PoW
+    /// verified whatever a peer claims. It only sizes the header batches
+    /// and the sync progress line (core::coin::PeerHeightGate).
+    void set_peer_tip_height(uint32_t height) { m_peer_heights.report(height); }
+
+    /// The peers' reported height: the median of the last reports, at most
+    /// what the chain can have grown to since our best-work tip.
+    uint32_t peer_tip_height() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return bounded_peer_tip_locked();
+    }
 
     /// Dynamically seed a checkpoint at runtime (e.g., from RPC getblockhash).
     /// Only applied if the chain is still at or below the hardcoded checkpoint.
     /// This allows an accessible daemon to provide a more recent starting point.
+    /// The checkpoint is pinned whether or not it seeds the chain: a header
+    /// at its height must be it (pin_checkpoint_locked).
     void set_dynamic_checkpoint(uint32_t height, const uint256& hash) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        pin_checkpoint_locked(height, hash);
         if (height > m_tip_height) {
             IndexEntry entry;
             entry.block_hash = hash;
@@ -496,9 +511,9 @@ public:
             if (m_headers.count(last_hash))
                 return 0;
         }
-        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
-        // Large batches during fast-sync (no scrypt), small near tip (scrypt active)
-        size_t BATCH_SIZE = (peer_tip > 0 && m_tip_height + 2100 < peer_tip) ? 500 : 50;
+        // Every header's PoW is verified (scrypt, under the lock): batches of
+        // HEADER_BATCH, a 1 ms yield between them for the readers.
+        const size_t BATCH_SIZE = HEADER_BATCH;
         int accepted = 0;
         PendingTipChange last_ptc;
         for (size_t offset = 0; offset < headers.size(); offset += BATCH_SIZE) {
@@ -520,17 +535,14 @@ public:
             // is_synced, get_tip) can acquire the mutex. Only after a
             // sub-batch that accepted headers: a run of known ones held the
             // lock for look-ups only.
-            if (sub_accepted > 0 && offset + BATCH_SIZE < headers.size()) {
-                // Short yield during fast-sync (structural only), longer near tip (scrypt)
-                auto ms = (BATCH_SIZE >= 500) ? 1 : 10;
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-            }
+            if (sub_accepted > 0 && offset + BATCH_SIZE < headers.size())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (accepted > 0) {
             std::lock_guard<std::mutex> lock(m_mutex);
             persist_tip();
             // Progress indicator for header sync
-            uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
+            const uint32_t peer_tip = bounded_peer_tip_locked();
             if (peer_tip > 0 && m_tip_height > 0) {
                 double pct = 100.0 * m_tip_height / peer_tip;
                 // Log every 1% or every 2000 blocks
@@ -643,29 +655,25 @@ private:
         const auto& prev = prev_it->second;
         uint32_t new_height = prev.height + 1;
 
-        // Validate PoW — skip expensive scrypt for old headers during initial sync.
-        // Headers below (peer_tip - SCRYPT_VALIDATION_DEPTH) are validated
-        // structurally only (prev_hash + difficulty retarget).  This makes bulk
-        // sync ~100x faster: 170k headers × 0.01ms vs 170k × 20ms.
-        // The depth threshold (2100) covers: 1 difficulty retarget interval (2016)
-        // + margin for block_rel_height scoring (~72 blocks).
-        static constexpr uint32_t SCRYPT_VALIDATION_DEPTH = 2100;
-        uint32_t peer_tip = m_peer_tip_height.load(std::memory_order_relaxed);
-        bool need_scrypt = (peer_tip == 0) // unknown tip → validate everything
-                        || (new_height + SCRYPT_VALIDATION_DEPTH >= peer_tip);
-        uint256 pow_hash_val;
-        if (need_scrypt) {
-            pow_hash_val = pow_hash(header, m_params.pow_func);
-            if (!check_pow(pow_hash_val, header.m_bits, m_params.pow_limit)) {
-                LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
-                            << " hash=" << bhash.GetHex().substr(0, 16)
-                            << " pow=" << pow_hash_val.GetHex().substr(0, 16)
-                            << " bits=0x" << std::hex << header.m_bits << std::dec;
+        // A pinned checkpoint's height takes only the checkpoint's block.
+        for (const auto& [pin_height, pin_hash] : m_pins) {
+            if (new_height == pin_height && bhash != pin_hash) {
+                LOG_WARNING << "[EMB-LTC] REJECT header at the checkpoint height " << new_height
+                            << ": hash=" << bhash.GetHex().substr(0, 16)
+                            << " checkpoint=" << pin_hash.GetHex().substr(0, 16);
                 return false;
             }
-        } else {
-            // Structural-only: trust PoW, store zero hash (not needed for old blocks)
-            pow_hash_val = block_hash(header); // SHA256d — cheap placeholder for fast-sync
+        }
+
+        // PoW (scrypt) for every header above the checkpoint, whatever
+        // height a peer reported.
+        const uint256 pow_hash_val = pow_hash(header, m_params.pow_func);
+        if (!check_pow(pow_hash_val, header.m_bits, m_params.pow_limit)) {
+            LOG_WARNING << "[EMB-LTC] PoW FAIL at height=" << new_height
+                        << " hash=" << bhash.GetHex().substr(0, 16)
+                        << " pow=" << pow_hash_val.GetHex().substr(0, 16)
+                        << " bits=0x" << std::hex << header.m_bits << std::dec;
+            return false;
         }
 
         // Validate difficulty
@@ -786,6 +794,107 @@ private:
     }
 
     /// Rebuild height index from a new tip back to genesis.
+    /// Pin a checkpoint: a header at `height` must be `hash` (add_header
+    /// refuses any other). A best chain already holding another block there
+    /// loses it and its descendants (drop_branches_locked).
+    void pin_checkpoint_locked(uint32_t height, const uint256& hash) {
+        if (std::find(m_pins.begin(), m_pins.end(), std::make_pair(height, hash)) == m_pins.end())
+            m_pins.emplace_back(height, hash);
+        auto at = m_height_index.find(height);
+        if (at != m_height_index.end() && at->second != hash) {
+            LOG_ERROR << "[EMB-LTC] The header chain holds " << at->second.GetHex().substr(0, 16)
+                      << " at the checkpoint height " << height << ", not the checkpoint "
+                      << hash.GetHex().substr(0, 16) << ": it and its descendants are dropped";
+            drop_branches_locked({at->second});
+        }
+    }
+
+    /// The peer-reported height, bounded by the growth our best-work tip
+    /// allows (caller holds the mutex).
+    uint32_t bounded_peer_tip_locked() const {
+        uint64_t tip_time = 0;
+        if (auto it = m_headers.find(m_tip); it != m_headers.end())
+            tip_time = it->second.header.m_timestamp;
+        return m_peer_heights.bounded(m_tip_height, tip_time, static_cast<uint64_t>(std::time(nullptr)),
+                                      static_cast<uint64_t>(m_params.target_spacing));
+    }
+
+    /// Drop the headers `roots` and every descendant from the index and the
+    /// store; a tip among them moves to its nearest remaining ancestor.
+    void drop_branches_locked(const std::set<uint256>& roots) {
+        if (roots.empty())
+            return;
+        std::vector<std::pair<uint32_t, uint256>> by_height;
+        by_height.reserve(m_headers.size());
+        for (const auto& [h, e] : m_headers)
+            by_height.emplace_back(e.height, h);
+        std::sort(by_height.begin(), by_height.end());
+        std::set<uint256> bad;
+        for (const auto& [height, h] : by_height) {
+            const auto& e = m_headers.at(h);
+            if (roots.count(h) || bad.count(e.prev_hash))
+                bad.insert(h);
+        }
+        uint256 tip = m_tip;
+        while (!tip.IsNull() && bad.count(tip)) {
+            auto it = m_headers.find(tip);
+            tip = it == m_headers.end() ? uint256() : it->second.prev_hash;
+        }
+        for (const auto& h : bad) {
+            m_headers.erase(h);
+            m_dirty_headers.erase(h);
+            if (m_db && m_db->is_open()) {
+                std::string key = "h";
+                key.append(reinterpret_cast<const char*>(h.data()), 32);
+                m_db->remove(key);
+            }
+        }
+        m_tip = tip;
+        if (auto it = m_headers.find(m_tip); it != m_headers.end()) {
+            m_tip_height = it->second.height;
+            m_best_work = it->second.chain_work;
+        } else {
+            m_tip.SetNull();
+            m_tip_height = 0;
+            m_best_work = uint256();
+        }
+        rebuild_height_index(m_tip);
+        persist_tip();
+        LOG_WARNING << "[EMB-LTC] Dropped " << bad.size() << " headers; tip h=" << m_tip_height;
+    }
+
+    /// Headers a store written before every header's PoW was verified holds
+    /// unverified: their stored PoW hash is the placeholder (the block hash).
+    /// Each is verified once at load; one that fails is dropped with its
+    /// descendants, one that passes is stored with its scrypt hash.
+    void verify_loaded_pow_locked() {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::set<uint256> failed;
+        size_t verified = 0;
+        for (auto& [h, e] : m_headers) {
+            if (e.height == 0 || e.prev_hash.IsNull() || e.hash != e.block_hash)
+                continue;  // genesis, a checkpoint root, or verified when added
+            const uint256 p = pow_hash(e.header, m_params.pow_func);
+            if (!check_pow(p, e.header.m_bits, m_params.pow_limit)) {
+                failed.insert(h);
+                continue;
+            }
+            e.hash = p;
+            m_dirty_headers.insert(h);
+            ++verified;
+        }
+        if (verified == 0 && failed.empty())
+            return;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        LOG_INFO << "[EMB-LTC] load_from_db: PoW verified for " << verified << " headers stored unverified ("
+                 << ms << " ms); " << failed.size() << " failed";
+        if (!failed.empty())
+            drop_branches_locked(failed);
+        else
+            persist_tip();
+    }
+
     void rebuild_height_index(const uint256& new_tip) {
         m_height_index.clear();
         uint256 current = new_tip;
@@ -928,6 +1037,7 @@ private:
                 m_tip.SetNull();
             }
         }
+        verify_loaded_pow_locked();
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
@@ -952,9 +1062,18 @@ private:
     uint32_t   m_tip_height{0};
     uint256    m_best_work;
 
-    // Peer-reported tip height for fast-sync scrypt skip.
-    // Set from version message; headers below (tip - 2100) skip scrypt PoW.
-    std::atomic<uint32_t> m_peer_tip_height{0};
+    // Peer-reported tip heights (version messages): batch sizing and the
+    // progress line only, bounded (bounded_peer_tip_locked); no check.
+    core::coin::PeerHeightGate m_peer_heights;
+
+    // Pinned checkpoints (height, hash): a header at the height must be it.
+    std::vector<std::pair<uint32_t, uint256>> m_pins;
+
+public:
+    /// Headers added per lock hold in add_headers (each runs scrypt).
+    static constexpr size_t HEADER_BATCH = 100;
+
+private:
 
     std::unique_ptr<core::LevelDBStore> m_db;
 
@@ -972,6 +1091,23 @@ private:
     };
     PendingTipChange m_pending_tip_change;
 };
+
+/// --header-checkpoint "HEIGHT:HASH" (nullopt: empty, malformed, or a null hash).
+inline std::optional<std::pair<uint32_t, uint256>> parse_header_checkpoint(const std::string& s)
+{
+    const auto colon = s.find(':');
+    if (s.empty() || colon == std::string::npos)
+        return std::nullopt;
+    uint256 hash;
+    hash.SetHex(s.substr(colon + 1));
+    if (hash.IsNull())
+        return std::nullopt;
+    try {
+        return std::make_pair(static_cast<uint32_t>(std::stoul(s.substr(0, colon))), hash);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
 
 } // namespace coin
 } // namespace ltc

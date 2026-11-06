@@ -961,6 +961,14 @@ private:
         // Standard 80-byte header chains only.
         if (standard_header_chain())
             m_coin->new_headers.happened(std::vector<BlockHeaderType>{cb.header});
+        // An AuxPoW chain's header carries its proof, which a compact block's
+        // 80-byte header does not: the block is fetched whole, so its header
+        // goes through the chain's block parser (which reads and checks the
+        // proof). Nothing is reconstructed or delivered from the compact one.
+        else {
+            request_block_body(blockhash);
+            return;
+        }
 
         // Coin-side decision: duplicate, unknown parent, or a compact block
         // that cannot carry the MWEB state (fetch the full block instead).
@@ -1071,6 +1079,14 @@ private:
         // never reaches the UTXO cache) and carry the v3 MWEB field.
         const CompactBlock cb = std::move(*m_pending_cmpct);
         const uint256 blockhash = m_pending_cmpct_hash;
+        if (!standard_header_chain()) {
+            // Never pending on an AuxPoW chain (cmpctblock fetches the block
+            // whole); a stale one is dropped the same way.
+            m_pending_cmpct.reset();
+            m_pending_partial = CompactBlockReconstructionResult{};
+            request_block_body(blockhash);
+            return;
+        }
         auto result = FillBlockFromBlocktxn(cb, m_pending_partial, resp.txs);
         m_pending_cmpct.reset();
         m_pending_partial = CompactBlockReconstructionResult{};

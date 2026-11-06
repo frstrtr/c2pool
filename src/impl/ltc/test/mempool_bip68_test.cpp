@@ -42,6 +42,7 @@
 #include <impl/ltc/coin/header_chain.hpp>
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
+#include <impl/ltc/test/ltc_mined_headers.hpp>
 
 namespace {
 
@@ -121,17 +122,7 @@ int64_t median_of(std::vector<int64_t> v)
     return v[v.size() / 2];
 }
 
-BlockHeaderType testnet_genesis()
-{
-    BlockHeaderType g;
-    g.m_version = 1;
-    g.m_previous_block.SetNull();
-    g.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
-    g.m_timestamp = 1486949366;
-    g.m_bits = 0x1e0ffff0;
-    g.m_nonce = 293345;
-    return g;
-}
+BlockHeaderType testnet_genesis() { return ltc_test::easy_testnet_genesis(); }
 
 BlockHeaderType next_header(const uint256& prev, uint32_t ts, uint32_t n)
 {
@@ -140,8 +131,9 @@ BlockHeaderType next_header(const uint256& prev, uint32_t ts, uint32_t n)
     h.m_previous_block = prev;
     h.m_merkle_root.SetHex(std::to_string(7000 + n));
     h.m_timestamp = ts;
-    h.m_bits = 0x1e0ffff0;
-    h.m_nonce = n;
+    h.m_bits = ltc_test::kEasyBits;
+    h.m_nonce = n << 16;
+    ltc_test::mine(h);
     return h;
 }
 
@@ -149,7 +141,7 @@ uint256 hash_of(const BlockHeaderType& h) { return Hash(pack(h).get_span()); }
 
 // Genesis then `n` headers 600 s apart; times[h] is height h's timestamp.
 struct Chain {
-    HeaderChain chain{make_ltc_chain_params_testnet()};
+    HeaderChain chain{ltc_test::easy_testnet_params()};
     std::vector<int64_t> times;
     BlockHeaderType tip;
 
@@ -157,7 +149,6 @@ struct Chain {
     {
         EXPECT_TRUE(chain.init());
         EXPECT_TRUE(chain.add_header(testnet_genesis()));
-        chain.set_peer_tip_height(10'000'000);
         times.push_back(testnet_genesis().m_timestamp);
         tip = testnet_genesis();
         for (uint32_t i = 0; i < n; ++i)
@@ -468,14 +459,13 @@ TEST(LtcMempoolBip68, MedianTimePastAtIsExactOrNoLower)
 
     // After a fast-start checkpoint at 1000 (a root: no header, no history):
     // exact from 1011 (11 known blocks), and below it that value.
-    auto p = make_ltc_chain_params_testnet();
+    auto p = ltc_test::easy_testnet_params();
     LTCChainParams::Checkpoint cp;
     cp.height = 1000;
     cp.hash.SetHex("00000000000000000000000000000000000000000000000000000000000a1000");
     p.fast_start_checkpoint = cp;
     HeaderChain chain(p);
     ASSERT_TRUE(chain.init());
-    chain.set_peer_tip_height(10'000'000);
     std::map<uint32_t, int64_t> ts;
     uint256 prev = cp.hash;
     for (uint32_t h = 1001; h <= 1030; ++h) {

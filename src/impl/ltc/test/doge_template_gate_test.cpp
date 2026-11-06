@@ -63,6 +63,7 @@ struct DogeChain {
         uint256 root;
         root.SetHex("00000000000000000000000000000000000000000000000000000000000d0e02");
         chain.set_dynamic_checkpoint(5'000'000, root);
+        chain.set_require_auxpow_proof(false);  // this test drives template gating, not AuxPoW
         const uint32_t now = static_cast<uint32_t>(std::time(nullptr));
         tip = header(root, now - 30, 1);
         sibling = header(root, now - 20, 2);

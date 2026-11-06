@@ -244,6 +244,20 @@ if (BUILD_TESTING AND GTest_FOUND)
     # UTXOViewCache/UTXOViewDB, MWEBTracker), core::coin::template_pool_gate,
     # and the 32-block cleaned_for window. Same folding rule.
     #
+    # doge_header_pow_conformance_test.cpp: the DOGE header chain's conformance
+    # to Dogecoin Core 1.14.9 through the real P2P paths (a compact block is
+    # fetched whole on an AuxPoW chain; the checked parser; real mainnet
+    # headers; the late-legacy rule). Same folding rule.
+    #
+    # header_pow_always_test.cpp / doge_header_pow_test.cpp: every header's
+    # proof of work above the checkpoint is verified whatever height a peer
+    # reports (LTC scrypt; DOGE scrypt before AuxPoW and for unflagged
+    # headers, the AuxPoW proof where the P2P parsers read it), a pinned
+    # checkpoint height takes only its block, the reported height is bounded
+    # (core::coin::PeerHeightGate), headers a store holds unverified are
+    # verified at load (LTC), and the check's cost per header. Mined test
+    # headers: ltc_mined_headers.hpp. Same folding rule.
+    #
     # mempool_final_tx_test.cpp: the embedded LTC mempool and template take
     # only txs final in the next block (litecoind IsFinalTx, #2137 S1):
     # admission refuses non_final at the tip's height + 1 / MTP, the
@@ -335,6 +349,8 @@ if (BUILD_TESTING AND GTest_FOUND)
         desired_version_tally_test.cpp
         doge_auxpow_witness_test.cpp
         doge_hash_schedule_test.cpp
+        doge_header_pow_test.cpp
+        doge_header_pow_conformance_test.cpp
         doge_headers_parse_test.cpp
         doge_mempool_validity_test.cpp
         doge_p2p_raw_parser_test.cpp
@@ -351,6 +367,7 @@ if (BUILD_TESTING AND GTest_FOUND)
         found_block_peer_txid_test.cpp
         found_block_verify_test.cpp
         head_retention_test.cpp
+        header_pow_always_test.cpp
         hogaddr_spend_guard_test.cpp
         ingest_bounds_test.cpp
         ingest_convergence_test.cpp

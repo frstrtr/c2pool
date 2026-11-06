@@ -36,6 +36,7 @@
 #include <impl/ltc/coin/mempool.hpp>
 #include <impl/ltc/coin/template_builder.hpp>
 #include <impl/ltc/test/mempool_test_view.hpp>
+#include <impl/ltc/test/ltc_mined_headers.hpp>
 
 namespace {
 
@@ -70,24 +71,13 @@ MutableTransaction tx_with(uint32_t locktime, uint32_t sequence, const uint256& 
     return tx;
 }
 
-BlockHeaderType testnet_genesis()
-{
-    BlockHeaderType g;
-    g.m_version = 1;
-    g.m_previous_block.SetNull();
-    g.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
-    g.m_timestamp = 1486949366;
-    g.m_bits = 0x1e0ffff0;
-    g.m_nonce = 293345;
-    return g;
-}
+BlockHeaderType testnet_genesis() { return ltc_test::easy_testnet_genesis(); }
 
-// Genesis then three headers 150 s apart: tip at height 3, next block 4.
+// Genesis then three mined headers 150 s apart: tip at height 3, next block 4.
 BlockHeaderType grow(HeaderChain& chain)
 {
     EXPECT_TRUE(chain.init());
     EXPECT_TRUE(chain.add_header(testnet_genesis()));
-    chain.set_peer_tip_height(10'000'000);
     uint256 prev = Hash(pack(testnet_genesis()).get_span());
     BlockHeaderType h;
     for (uint32_t i = 0; i < 3; ++i) {
@@ -96,8 +86,9 @@ BlockHeaderType grow(HeaderChain& chain)
         h.m_previous_block = prev;
         h.m_merkle_root.SetHex(std::to_string(900 + i));
         h.m_timestamp = 1486949366 + 150 * (i + 1);
-        h.m_bits = 0x1e0ffff0;
-        h.m_nonce = i;
+        h.m_bits = ltc_test::kEasyBits;
+        h.m_nonce = i << 16;
+        ltc_test::mine(h);
         EXPECT_TRUE(chain.add_header(h));
         prev = Hash(pack(h).get_span());
     }
@@ -183,7 +174,7 @@ TEST(LtcMempoolFinalTx, AdmissionRefusesNonFinal)
 // ships. The pool took them past admission (a reorg lowered the next height).
 TEST(LtcMempoolFinalTx, TemplateSelectsOnlyTxsFinalInItsBlock)
 {
-    HeaderChain chain(make_ltc_chain_params_testnet());
+    HeaderChain chain(ltc_test::easy_testnet_params());
     const BlockHeaderType tip = grow(chain);
     Mempool pool;
     const MutableTransaction locked = tx_with(4, kNotFinal, fund(1));

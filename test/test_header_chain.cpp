@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <impl/ltc/coin/header_chain.hpp>
+#include <impl/ltc/test/ltc_mined_headers.hpp>   // easy-limit testnet parameters, mine()
 #include <impl/ltc/coin/block.hpp>
 #include <core/uint256.hpp>
 #include <core/pack.hpp>
@@ -580,21 +581,30 @@ TEST(PoWFunctionsTest, MainnetGenesisScryptValid) {
 
 // ─── Fast-Sync Scrypt Skip Tests ────────────────────────────────────────────
 
-TEST_F(HeaderChainTest, FastSyncSkipsScryptForOldHeaders) {
-    // When peer_tip_height is set, headers below (tip - 2100) should
-    // skip scrypt PoW validation and use structural checks only.
-    // We verify this indirectly: with a high peer_tip_height, adding
-    // the genesis block should still work (scrypt validation skipped
-    // for old blocks, but genesis is special-cased anyway).
-    HeaderChain chain(params);
+// Every header above the checkpoint has its scrypt PoW checked (Litecoin
+// Core's CheckBlockHeader), however far ahead a peer says its tip is: the
+// reported height only paces the sync.
+TEST_F(HeaderChainTest, APeerTipFarAheadDoesNotSkipThePowCheck) {
+    const auto easy = ltc_test::easy_testnet_params();
+    HeaderChain chain(easy);
     EXPECT_TRUE(chain.init());
-
-    // Set peer tip very high — all headers will skip scrypt
     chain.set_peer_tip_height(1000000);
 
-    auto genesis = make_testnet_genesis();
-    EXPECT_TRUE(chain.add_header(genesis));
+    const auto genesis = ltc_test::easy_testnet_genesis();
+    ASSERT_TRUE(chain.add_header(genesis));
+    BlockHeaderType h;
+    h.m_version = 0x20000000;
+    h.m_previous_block = block_hash(genesis);
+    h.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
+    h.m_timestamp = genesis.m_timestamp + 150;
+    h.m_bits = genesis.m_bits;
+    h.m_nonce = 0;
+    ltc_test::unmine(h, easy);
+    EXPECT_FALSE(chain.add_header(h)) << "a header failing its PoW is refused";
     EXPECT_EQ(chain.height(), 0u);
+    ltc_test::mine(h, easy);
+    EXPECT_TRUE(chain.add_header(h));
+    EXPECT_EQ(chain.height(), 1u);
 }
 
 TEST_F(HeaderChainTest, FastSyncDefaultIsZeroPeerTip) {
@@ -626,14 +636,15 @@ TEST_F(HeaderChainTest, PeerTipHeightIsAtomic) {
 }
 // ─── Known headers cost no yield (FRESH-NODE §3) ────────────────────────────
 
-/// `n` headers linked on top of the testnet genesis, 150 s apart, the
-/// genesis bits. With the peer tip far ahead they are accepted without
-/// scrypt (fast sync), and below interval + 10 headers the difficulty is not
-/// checked.
+/// `n` headers linked on top of the easy-limit testnet genesis
+/// (ltc_mined_headers.hpp), 150 s apart, the genesis bits, each mined: every
+/// header's PoW is checked. Below interval + 10 headers the difficulty is
+/// not checked.
 static std::vector<BlockHeaderType> make_linked_headers(size_t n) {
+    const auto easy = ltc_test::easy_testnet_params();
     std::vector<BlockHeaderType> out;
     out.reserve(n);
-    BlockHeaderType prev = make_testnet_genesis();
+    BlockHeaderType prev = ltc_test::easy_testnet_genesis();
     uint256 prev_hash = block_hash(prev);
     for (size_t i = 0; i < n; ++i) {
         BlockHeaderType h;
@@ -642,7 +653,8 @@ static std::vector<BlockHeaderType> make_linked_headers(size_t n) {
         h.m_merkle_root.SetHex("97ddfbbae6be97fd6cdf3e7ca13232a3afff2353e29badfab7f73011edd4ced9");
         h.m_timestamp = prev.m_timestamp + 150;
         h.m_bits = prev.m_bits;
-        h.m_nonce = static_cast<uint32_t>(i);
+        h.m_nonce = static_cast<uint32_t>(i) << 8;   // a distinct start per header
+        ltc_test::mine(h, easy);
         prev_hash = block_hash(h);
         prev = h;
         out.push_back(h);
@@ -655,10 +667,10 @@ static std::vector<BlockHeaderType> make_linked_headers(size_t n) {
 // which let 20 peers' duplicates queue up faster than the header thread
 // drained them (the fresh node's 2.5 GB).
 TEST_F(HeaderChainTest, ADuplicateBatchCostsNoYield) {
-    HeaderChain chain(params);
+    HeaderChain chain(ltc_test::easy_testnet_params());
     ASSERT_TRUE(chain.init());
     chain.set_peer_tip_height(1000000);
-    ASSERT_TRUE(chain.add_header(make_testnet_genesis()));
+    ASSERT_TRUE(chain.add_header(ltc_test::easy_testnet_genesis()));
     const auto batch = make_linked_headers(2000);
     ASSERT_EQ(chain.add_headers(batch), 2000);
     ASSERT_EQ(chain.height(), 2000u);
@@ -674,10 +686,10 @@ TEST_F(HeaderChainTest, ADuplicateBatchCostsNoYield) {
 // The early return is for a known LAST header only: a batch whose head the
 // chain has and whose tail is new still connects the tail.
 TEST_F(HeaderChainTest, AKnownPrefixStillConnectsTheNewTail) {
-    HeaderChain chain(params);
+    HeaderChain chain(ltc_test::easy_testnet_params());
     ASSERT_TRUE(chain.init());
     chain.set_peer_tip_height(1000000);
-    ASSERT_TRUE(chain.add_header(make_testnet_genesis()));
+    ASSERT_TRUE(chain.add_header(ltc_test::easy_testnet_genesis()));
     const auto batch = make_linked_headers(2000);
     const std::vector<BlockHeaderType> head(batch.begin(), batch.begin() + 1500);
     ASSERT_EQ(chain.add_headers(head), 1500);
