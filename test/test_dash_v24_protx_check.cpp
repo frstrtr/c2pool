@@ -382,7 +382,11 @@ TEST(DashV24ProTxCheck, ProRegTxPayloadRules)
     World w;
     auto base = reg_internal(w);
     auto mut = [&](auto f) { auto p = base.p; f(p); return rewrap(base.tx, p); };
-    EXPECT_CODE(w.check(mut([](auto& p) { p.nVersion = 0; })), "bad-protx-version");
+    // Version 0: Core's CProRegTx deserializer bails out after the version
+    // field, the rest of the payload is left unread and GetTxPayload fails,
+    // so CheckProRegTx answers bad-protx-payload before IsTriviallyValid's
+    // bad-protx-version (the S2 codec reads it the same way).
+    EXPECT_CODE(w.check(mut([](auto& p) { p.nVersion = 0; })), "bad-protx-payload");
     EXPECT_CODE(w.check(mut([](auto& p) { p.nVersion = 3; })), "bad-protx-version");
     EXPECT_CODE(w.check(mut([](auto& p) { p.nVersion = 1; p.nType = v::MnType::EVO; })), "bad-protx-evo-version");
     EXPECT_CODE(w.check(mut([](auto& p) { p.nType = 2; })), "bad-protx-type");
