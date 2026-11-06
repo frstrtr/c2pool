@@ -20,6 +20,7 @@
 /// == false always routes there, and it remains the [GBT-XCHECK] cross-check.
 
 #include <impl/dash/coin/work_source.hpp>        // EmbeddedWorkInputs, select_dash_work, WorkSelection
+#include <core/address_utils.hpp>                // script_to_address (emit gate payee tokens)
 #include <impl/dash/coin/mn_state_machine.hpp>   // MnStateMachine
 #include <impl/dash/coin/mempool.hpp>            // Mempool
 #include <impl/dash/coin/tx_inject_pool.hpp>     // TxInjectPool (#157 miner/user tx-injection)
@@ -1766,22 +1767,34 @@ public:
                     const int64_t mn_payment =
                         static_cast<int64_t>(w.m_payment_amount);
                     // The payout SET dashd's GetBlockTxOuts derives for this
-                    // payee (v24::expected_mn_outputs: owner payouts / share
-                    // split, then the operator; each only when > 0; a full
-                    // 10000-bps operator share has NO owner output). Checked
-                    // whenever more than one output, or an operator output,
-                    // is due -- the h=2516595 class and every v24 multi-
-                    // output payee. Occurrence-counted (Dash Core v24 strict
-                    // multiplicity: each expected output consumes a distinct
-                    // coinbase output), so a 50/50 split needs two outputs.
-                    // Amounts only: the packed payee is an address token; the
-                    // builder KATs pin script identity.
+                    // payee (v24::expected_mn_outputs, the Core v24 port:
+                    // owner payouts / share split, then the operator; each
+                    // only when > 0; a full 10000-bps operator share has NO
+                    // owner output). Checked whenever more than one output,
+                    // or an operator output, is due -- the h=2516595 class
+                    // and every v24 multi-output payee -- as (payee, amount)
+                    // pairs: the template must carry each due output at its
+                    // script (as the packed-payment token the builder
+                    // writes) AND amount, occurrence-counted (Dash Core v24
+                    // strict multiplicity: each expected output consumes a
+                    // distinct coinbase output), so a 50/50 split needs two
+                    // outputs and a same-amount payment at another script
+                    // (a superblock entry) cannot stand in for a missing one.
                     const auto due = v24::expected_mn_outputs(it->second, mn_payment);
                     const bool op_due = it->second.operator_payment_of(mn_payment) > 0;
                     if (due.size() >= 2 || op_due) {
-                        std::vector<uint64_t> have;
+                        auto token_of = [&](const std::vector<unsigned char>& script) {
+                            std::string addr = ::core::script_to_address(
+                                script, /*bech32_hrp=*/"", m_address_version, m_address_p2sh_version);
+                            if (!addr.empty()) return addr;
+                            static const char* digits = "0123456789abcdef";
+                            std::string hx = "!";
+                            for (uint8_t b : script) { hx += digits[b >> 4]; hx += digits[b & 0xF]; }
+                            return hx;
+                        };
+                        std::vector<std::pair<std::string, uint64_t>> have;
                         for (const auto& p : w.m_packed_payments)
-                            if (p.payee != "!6a") have.push_back(p.amount);
+                            if (p.payee != "!6a") have.emplace_back(p.payee, p.amount);
                         const auto& st = it->second;
                         const bool multi = !st.v24.shares.empty()
                             || st.nVersion >= vendor::ProTxVersion::EXT_ADDR;
@@ -1793,8 +1806,9 @@ public:
                             const std::string role = is_op ? std::string("operator")
                                 : multi ? owner_role + std::to_string(i)
                                         : std::string("owner");
-                            auto f = std::find(have.begin(), have.end(),
-                                               static_cast<uint64_t>(due[i].amount));
+                            const std::pair<std::string, uint64_t> want{
+                                token_of(due[i].script), static_cast<uint64_t>(due[i].amount)};
+                            auto f = std::find(have.begin(), have.end(), want);
                             const bool present = f != have.end();
                             if (present) have.erase(f);
                             all_present = all_present && present;
@@ -1804,7 +1818,7 @@ public:
                         }
                         if (!all_present)
                             return reject("emit-mn-payout-split-drift", report,
-                                          "every-payout-set-amount-in-template");
+                                          "every-payout-set-output-in-template");
                     }
                 }
             }
