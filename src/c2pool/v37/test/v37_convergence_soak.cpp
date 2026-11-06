@@ -826,10 +826,17 @@ int main() {
                 else ++it;
             }
         }
-        // let every executor catch up with what it was handed
+        // let every executor catch up with what it was handed, and also wait
+        // until its latest snapshot's cut is in the ring: the engine publishes
+        // the snapshot before it appends that cut to the ring
         for (int i = 0; i < cfg.nodes; ++i) {
             const u64 want = N[i]->fed;
-            (void)wait_until([&] { return N[i]->next_pos() >= want; }, 4000);
+            (void)wait_until([&] {
+                auto s = N[i]->node->engine().snapshot(CH);
+                if (!s) return want == 0;
+                return s->next_pos >= want
+                    && N[i]->node->engine().settlement_view_by_cut(CH, s->next_pos, s->digest) != nullptr;
+            }, 4000);
         }
 
         // (3) A BLOCK WIN.
