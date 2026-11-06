@@ -36,6 +36,7 @@
 #include <impl/dash/coin/subsidy.hpp>            // compute_dash_platform_reward_post_v20_mn_rr (creditPool re-check)
 
 #include <impl/dash/coin/governance_object.hpp>  // SuperblockPayment (daemonless superblock schedule)
+#include <impl/dash/coin/deployment_status.hpp> // V24State (Dash Core v24 deployment state)
 
 #include <core/uint256.hpp>
 #include <core/p2p_message_stats.hpp>    // core::obs::inject_status (#157 read-only status mirror)
@@ -457,6 +458,14 @@ public:
     /// exactly one block's platform reward (constant 66,966,830 duffs).
     void set_mn_rr_height(int h) { m_mn_rr_height = h; }
     int mn_rr_height() const { return m_mn_rr_height; }
+
+    /// Dash Core v24: DeploymentActiveAfter(prev, DEPLOYMENT_V24) for the
+    /// block at a height (deployment_status.hpp). Unset => INACTIVE, the
+    /// pre-v24 template, byte-identical to before the seam. UNKNOWN refuses
+    /// the embedded template (cause v24-state-unknown): every v24 rule of the
+    /// block being built depends on it.
+    using V24StateFn = std::function<V24State(uint32_t height)>;
+    void set_v24_state_fn(V24StateFn fn) { m_v24_state_fn = std::move(fn); }
 
     /// Network nMasternodeMinimumConfirmations (dashcore Params().GetConsensus()
     /// .nMasternodeMinimumConfirmations — per-chainparams: mainnet 15, testnet/
@@ -2044,6 +2053,21 @@ public:
                                          utxo_immature,
                                          qc_pose ? &*qc_pose : nullptr);
         e.has_state = e.decline.viable;
+        // Dash Core v24: decided for the block being built (its parent is our
+        // tip). Never served on UNKNOWN; the dashd fallback (a v24 dashd)
+        // serves instead.
+        {
+            const V24State v24 = m_v24_state_fn ? m_v24_state_fn(m_prev_height + 1)
+                                                : V24State::INACTIVE;
+            e.v24_active = v24 == V24State::ACTIVE;
+            if (e.has_state && v24 == V24State::UNKNOWN) {
+                e.decline.viable    = false;
+                e.decline.cause     = "v24-state-unknown";
+                e.decline.value     = "h=" + std::to_string(m_prev_height + 1);
+                e.decline.threshold = "ehf-scan-or-pin";
+                e.has_state         = false;
+            }
+        }
         // NAME THE STATE: while the UTXO lane is immature under the OPT-IN
         // serving policy we DO serve, but only a coinbase-only body. The
         // builder marks the template (m_txset_empty_cause) and logs the
@@ -2724,6 +2748,7 @@ private:
     bool     m_require_resolvable_payee{true};   // refuse embedded when a due MN payee is unresolvable (#996)
     bool     m_require_provable_payout_split{true}; // refuse embedded when the scheduled MN's operator-reward split is unproven (h=2516595 bad-cb-payee)
     int      m_mn_rr_height{DASH_MN_RR_HEIGHT_MAINNET}; // network MN_RR activation height (platform-share gate)
+    V24StateFn m_v24_state_fn;   // Dash Core v24 deployment state (unset => INACTIVE)
     int      m_mn_min_confirmations{DASH_MN_MIN_CONFIRMATIONS_MAINNET}; // network nMasternodeMinimumConfirmations (rollover projection)
     uint256  m_credit_pool_current_hash;     // block hash the credit-pool seed is current at
     int32_t  m_credit_pool_height{-1};       // seed cbTx's OWN height (-1 = never seeded)
