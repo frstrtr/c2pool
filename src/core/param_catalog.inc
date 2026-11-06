@@ -610,9 +610,6 @@ C2P_PARAM("embedded.accrue_asset_locks", Embedded, BOOL, RESTART, C_DASH, LIT, "
 C2P_PARAM("embedded.accrue_asset_unlocks", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "type-9 asset-unlock fold")
   C2P_ALIAS("embedded.accrue_asset_unlocks", BIN_DASH, "--embedded-accrue-asset-unlocks", FLAG)
 
-C2P_PARAM("embedded.credit_pool_seed", Embedded, BOOL, RESTART, C_DASH, LIT, "false", NONE, "seed the credit-pool follower from the v20 floor (needed to admit asset unlocks)")
-  C2P_ALIAS("embedded.credit_pool_seed", BIN_DASH, "--embedded-credit-pool-seed", FLAG)
-
 C2P_PARAM("embedded.null_arm", Embedded, TRISTATE_BOOL, MONEY_RESTART, C_DASH, NONE, "", NONE, "optimistic null commitment (money/consensus)")
   C2P_ALIAS("embedded.null_arm", BIN_DASH, "--embedded-null-arm", FLAG_OPT_EQFALSE)
 
